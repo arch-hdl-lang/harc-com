@@ -982,8 +982,10 @@ This is where the "wide" scope decision pays off. Each UVM role becomes a langua
 - `let drv : MyDriver` default-constructs the struct; the user assigns DUT pointers and other field values explicitly afterward (`drv.dut = dut`).
 - `on event_field(arg) ... end on` inside a driver / agent / sequencer body → registers a `[&]`-capturing closure into the corresponding event vector at `let drv : T` time. Event payloads typed `event<MyTxn>` round-trip as the `MyTxn` C++ struct (transactions and enums get their bare name; integer-typed payloads still widen). `emit drv.req(t)` fires every registered subscriber synchronously — the on-handler body runs inside the test's tick scope (so `wait`, `dut.x = ...`, etc. all work).
 - `on dut.signal ... end on` inside a monitor body → per-cycle bool checker (existing behavior, unchanged).
+- `connect a -> b ... end connect` inside an `env` body → at `let env : E` time, installs a generic-lambda bridge subscriber on `<env>.<a>` that fans out to every subscriber of `<env>.<b>`. Lets a sequencer's `out event` drive a driver's `in event` without the test scope manually re-emitting. Edge endpoints are field-access chains (`sub.event_name`); the bridge uses `auto` for the payload so the connect site doesn't have to look up the event's type.
+- `TSeq<T>` as a hookable parameter type → `const std::vector<T>&` (pass-by-reference, so iterating a tseq result inside a sequencer's `dispatch` method doesn't copy each transaction).
 
-Out of v0 scope, deferred to a follow-up PR: protocol-typed bus binding (`bound to T` / `bus.aw.send(...)`), `pre`/`post` hooks via `on drv.send pre`, and `connect` blocks (cross-component event wiring — today users emit manually). The current path is "components are stateful structs with methods you call directly, plus event-driven on-handlers"; the protocol-bus story layers on top.
+Out of v0 scope, deferred to a follow-up PR: protocol-typed bus binding (`bound to T` / `bus.aw.send(...)`) and `pre`/`post` hooks via `on drv.send pre`. The current path is "components are stateful structs with methods you call directly, plus event-driven on-handlers wired together by `connect`"; the protocol-bus story layers on top.
 
 ### 8.1 `agent`
 
