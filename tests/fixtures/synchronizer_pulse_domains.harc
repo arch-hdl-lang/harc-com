@@ -1,0 +1,10 @@
+// Domain decls mirroring arch-com/examples/synchronizer_pulse.arch.
+// SrcDomain @ 100 MHz, DstDomain @ 200 MHz.
+
+domain SrcDomain
+  freq_mhz: 100
+end domain SrcDomain
+
+domain DstDomain
+  freq_mhz: 200
+end domain DstDomain

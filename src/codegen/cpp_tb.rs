@@ -248,6 +248,7 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
         event_types: std::collections::HashMap::new(),
         field_subs: std::collections::HashMap::new(),
         covers: Vec::new(),
+        clock_names: clocks.iter().map(|c| c.name.name.clone()).collect(),
     };
 
     // Header.
@@ -387,7 +388,7 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
         // the primary clock (first-declared) so existing log lines remain
         // meaningful.
         writeln!(e.out, "{INDENT}long long now_ps = 0;").ok();
-        writeln!(e.out, "{INDENT}struct ClockState {{ const char* name; long long half_period_ps; long long next_edge_ps; int level; }};").ok();
+        writeln!(e.out, "{INDENT}struct ClockState {{ const char* name; long long half_period_ps; long long next_edge_ps; int level; long long rising_count; }};").ok();
         writeln!(e.out, "{INDENT}std::vector<ClockState> clocks_;").ok();
         for c in &clocks {
             // Period source: time literal `5ns` OR domain reference `FastDomain`
@@ -405,7 +406,7 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
             };
             let half = period_ps / 2;
             // First edge fires at half_period (rising) so initial state is 0.
-            writeln!(e.out, "{INDENT}clocks_.push_back(ClockState{{\"{}\", {half}, {half}, 0}});",
+            writeln!(e.out, "{INDENT}clocks_.push_back(ClockState{{\"{}\", {half}, {half}, 0, 0}});",
                 c.name.name).ok();
             writeln!(e.out, "{INDENT}dut->{} = 0;", c.name.name).ok();
         }
@@ -425,6 +426,8 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
                 c.name.name).ok();
         }
         writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}c.next_edge_ps += c.half_period_ps;").ok();
+        // Per-clock rising-edge count (consumed by `wait N cycles on <clock>`).
+        writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (c.level == 1) c.rising_count++;").ok();
         // Primary clock rising edge bumps cycle_count.
         writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (i == 0 && c.level == 1) cycle_count++;").ok();
         writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}}}").ok();
@@ -649,6 +652,10 @@ struct Emitter {
     /// emitting `let e : event<T>`; consulted when emitting `emit e(arg)`
     /// and `on e(arg) ... end on` so the lambda gets the right param type.
     event_types: std::collections::HashMap<String, String>,
+    /// Names of declared clocks in declaration order. Empty under
+    /// single-clock backward-compat. Used by `wait N cycles on <clock>`
+    /// to look up the clock's index in the runtime `clocks_` vector.
+    clock_names: Vec<String>,
 }
 
 impl Emitter {
@@ -1708,8 +1715,37 @@ impl Emitter {
                     writeln!(self.out, "}}").ok();
                 }
             }
-            StmtKind::Wait { duration, .. } => {
+            StmtKind::Wait { duration, clock, .. } => {
                 self.pad(depth);
+                // `wait N cycles on <clock>` — advance simulated time
+                // until the named clock has seen N more rising edges.
+                // Other clocks continue ticking at their natural rate.
+                // Useful for cycle-relative reasoning in multi-clock
+                // tests (e.g. "after 2 dst_clk cycles, X should hold").
+                if let Some(c) = clock {
+                    let idx = match self.clock_names.iter().position(|n| n == &c.name) {
+                        Some(i) => i,
+                        None => {
+                            self.errors.push(format!(
+                                "wait ... on {}: no clock named `{}` declared in this test",
+                                c.name, c.name
+                            ));
+                            return;
+                        }
+                    };
+                    write!(self.out, "{{ long long _target = clocks_[{idx}].rising_count + (long long)(").ok();
+                    self.emit_expr(duration);
+                    writeln!(self.out, "); while (clocks_[{idx}].rising_count < _target) {{").ok();
+                    self.pad(depth + 1);
+                    writeln!(self.out, "long long _next = clocks_[0].next_edge_ps;").ok();
+                    self.pad(depth + 1);
+                    writeln!(self.out, "for (auto& _ck : clocks_) if (_ck.next_edge_ps < _next) _next = _ck.next_edge_ps;").ok();
+                    self.pad(depth + 1);
+                    writeln!(self.out, "eval_clocks_until(_next);").ok();
+                    self.pad(depth);
+                    writeln!(self.out, "}} for (auto& _c : _checkers) _c(); }}").ok();
+                    return;
+                }
                 // Wall-clock duration (e.g. `wait 100ns`) advances absolute
                 // time when multi-clock; under single-clock backward compat
                 // we don't have absolute time, so fall back to a comment +
