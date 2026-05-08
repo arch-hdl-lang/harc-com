@@ -591,6 +591,10 @@ struct CoverInfo {
 struct TxnFieldInfo {
     name: String,
     width: u32,
+    /// `!` prefix on a transaction field — non-random; carried for future
+    /// solver use. Not yet consulted by the lowering, but kept so the field
+    /// info round-trips through codegen.
+    #[allow(dead_code)]
     non_random: bool,
 }
 
@@ -737,7 +741,7 @@ impl Emitter {
         self.pad(depth);
         writeln!(self.out, "_checkers.push_back([&]() {{").ok();
         // Static slots for delay state — survive across closure calls.
-        for (i, t) in temporals.iter().enumerate() {
+        for (i, _t) in temporals.iter().enumerate() {
             self.pad(depth + 1);
             writeln!(self.out, "static int64_t {tag}_ps{i} = 0;").ok();
         }

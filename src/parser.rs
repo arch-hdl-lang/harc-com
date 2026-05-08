@@ -831,7 +831,10 @@ impl Parser {
                 }
                 ExtendBody::Test(items)
             }
-            Some(TokenKind::Connect) | Some(TokenKind::On) | Some(TokenKind::Hookable) => {
+            // `On` would be reachable here too, but the test-body arm above
+            // already claims it (the dispatcher disambiguates structurally,
+            // not by target-kind lookup). Keep the component-only tokens.
+            Some(TokenKind::Connect) | Some(TokenKind::Hookable) => {
                 let mut items = Vec::new();
                 while !self.check_end_keyword() {
                     items.push(self.parse_component_item()?);
