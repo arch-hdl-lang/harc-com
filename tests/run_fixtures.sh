@@ -46,6 +46,8 @@ axilite_env_test        | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_seqdrv_test     | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_connect_test    | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_hooks_test      | AxiLiteRegs    | AxiLiteRegs.sv         |
+axilite_bus_test        | AxiLiteRegs    | AxiLiteRegs.sv         |
+axilite_bus_extern_test | AxiLiteRegs    | AxiLiteRegs.sv         |
 pkt_queue_test          | PacketQueue    | pkt_queue.sv           |
 linklist_basic_test     | TaskQueue      | linklist_basic.sv      |
 cam_basic_test          | Mshr_Addr_Cam  | cam_basic.sv           |

@@ -56,6 +56,13 @@ pub enum Item {
     ExternalModule(ExternalModuleDecl),
     Function(FunctionDecl),
     Apply(ApplyDecl),
+    /// `bus Name { signals + handshake_channels }` — protocol-typed
+    /// bundle of DUT signals. v0 carries flat signals + named
+    /// handshake_channel groupings; `credit_channel` and `tlm_method`
+    /// are parser-recognized but currently no-ops at the codegen
+    /// layer. Mirrors arch-com's §19 bus construct so HARC tests can
+    /// `use BusAxiLite;` against arch-built DUTs.
+    Bus(BusDecl),
 }
 
 // ── Use / Package ─────────────────────────────────────────────────────────────
@@ -455,6 +462,62 @@ pub struct CoverSequenceDecl {
     pub pattern: Expr,
     pub span: Span,
     pub doc: Option<String>,
+}
+
+// ── Bus (§19 — protocol-typed signal bundle) ──────────────────────────────────
+
+/// `bus Name { ... }` — protocol-typed bundle of DUT signals. Mirrors
+/// arch-com's §19. v0 carries:
+/// - plain signals (`name: in|out Type`) — flat fields
+/// - `handshake_channel` groupings — directionally-flipped valid/ready
+///   plus payload signals; flatten to `<chan>_valid`, `<chan>_ready`,
+///   `<chan>_<sig>` per spec §19.2.2
+/// - parameter list (`param NAME: const = default`)
+///
+/// `credit_channel` and `tlm_method` blocks parse but don't yet take
+/// part in HARC's signal-access lowering (they're scaffold-only —
+/// covered by future PRs).
+#[derive(Debug, Clone)]
+pub struct BusDecl {
+    pub name: Ident,
+    pub params: Vec<Param>,
+    pub signals: Vec<BusSignal>,
+    pub handshakes: Vec<HandshakeChannel>,
+    pub span: Span,
+    pub doc: Option<String>,
+}
+
+/// One plain signal inside a `bus` body. Direction is from the
+/// initiator's perspective — the use-site `target Bus` keyword flips it.
+#[derive(Debug, Clone)]
+pub struct BusSignal {
+    pub name: Ident,
+    pub direction: Direction,
+    pub ty: TypeExpr,
+    pub span: Span,
+}
+
+/// `handshake_channel <name>: send|receive kind: valid_ready` — a
+/// grouping of payload signals plus the implicit valid/ready pair.
+/// Flattens to `<name>_valid`, `<name>_ready`, and `<name>_<sig>` per
+/// payload signal at lowering time.
+#[derive(Debug, Clone)]
+pub struct HandshakeChannel {
+    pub name: Ident,
+    /// `send` (initiator drives valid + payload) or `receive`
+    /// (initiator drives ready, target drives valid + payload).
+    pub role: HandshakeRole,
+    /// `valid_ready` for now; `req_ack_4phase` and others are parsed
+    /// but not lowered.
+    pub variant: Ident,
+    pub payload: Vec<BusSignal>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakeRole {
+    Send,
+    Receive,
 }
 
 // ── External (Verilator-bound) module (§10.5) ─────────────────────────────────

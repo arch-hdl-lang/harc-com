@@ -1,0 +1,53 @@
+// AXI4-Lite memory-mapped bus — simplified AXI4 for control/status registers.
+//
+// Five channels, each an independent valid/ready handshake:
+//   aw — write address
+//   w  — write data
+//   b  — write response
+//   ar — read address
+//   r  — read data
+//
+// Matches the ARM AMBA AXI4-Lite spec: no burst, no ID, fixed data widths of
+// 32 or 64 bits (DATA_W defaults to 32, but the bus is structurally
+// parameterizable).
+//
+// Example:
+//   use BusAxiLite;
+//   module CsrBank
+//     port s_axi: target BusAxiLite<ADDR_W=12, DATA_W=32>;
+//     ...
+//   end module CsrBank
+
+bus BusAxiLite
+  param ADDR_W: const = 32;
+  param DATA_W: const = 32;
+
+  // Write address channel.
+  handshake_channel aw: send kind: valid_ready
+    addr: UInt<ADDR_W>;
+    prot: UInt<3>;
+  end handshake_channel aw
+
+  // Write data channel.
+  handshake_channel w: send kind: valid_ready
+    data: UInt<DATA_W>;
+    strb: UInt<DATA_W / 8>;
+  end handshake_channel w
+
+  // Write response channel (target → initiator).
+  handshake_channel b: receive kind: valid_ready
+    resp: UInt<2>;
+  end handshake_channel b
+
+  // Read address channel.
+  handshake_channel ar: send kind: valid_ready
+    addr: UInt<ADDR_W>;
+    prot: UInt<3>;
+  end handshake_channel ar
+
+  // Read data channel (target → initiator).
+  handshake_channel r: receive kind: valid_ready
+    data: UInt<DATA_W>;
+    resp: UInt<2>;
+  end handshake_channel r
+end bus BusAxiLite

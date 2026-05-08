@@ -286,6 +286,44 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
             print_path(out, &a.path);
             writeln!(out).ok();
         }
+        Item::Bus(b) => {
+            print_doc(out, &b.doc, depth);
+            pad(out, depth);
+            write!(out, "bus {}", b.name.name).ok();
+            if !b.params.is_empty() {
+                print_paren_params(out, &b.params);
+            }
+            writeln!(out).ok();
+            for s in &b.signals {
+                pad(out, depth + 1);
+                let dir = match s.direction {
+                    Direction::In => "in",
+                    Direction::Out => "out",
+                    Direction::InOut => "inout",
+                };
+                write!(out, "{}: {} ", s.name.name, dir).ok();
+                print_type(out, &s.ty);
+                writeln!(out).ok();
+            }
+            for h in &b.handshakes {
+                pad(out, depth + 1);
+                let role = match h.role {
+                    HandshakeRole::Send => "send",
+                    HandshakeRole::Receive => "receive",
+                };
+                writeln!(out, "handshake_channel {}: {} kind: {}", h.name.name, role, h.variant.name).ok();
+                for s in &h.payload {
+                    pad(out, depth + 2);
+                    write!(out, "{}: ", s.name.name).ok();
+                    print_type(out, &s.ty);
+                    writeln!(out).ok();
+                }
+                pad(out, depth + 1);
+                writeln!(out, "end handshake_channel {}", h.name.name).ok();
+            }
+            pad(out, depth);
+            writeln!(out, "end bus {}", b.name.name).ok();
+        }
     }
 }
 
