@@ -984,8 +984,9 @@ This is where the "wide" scope decision pays off. Each UVM role becomes a langua
 - `on dut.signal ... end on` inside a monitor body → per-cycle bool checker (existing behavior, unchanged).
 - `connect a -> b ... end connect` inside an `env` body → at `let env : E` time, installs a generic-lambda bridge subscriber on `<env>.<a>` that fans out to every subscriber of `<env>.<b>`. Lets a sequencer's `out event` drive a driver's `in event` without the test scope manually re-emitting. Edge endpoints are field-access chains (`sub.event_name`); the bridge uses `auto` for the payload so the connect site doesn't have to look up the event's type.
 - `TSeq<T>` as a hookable parameter type → `const std::vector<T>&` (pass-by-reference, so iterating a tseq result inside a sequencer's `dispatch` method doesn't copy each transaction).
+- `on obj.method pre/post ... end on` (or `on env.sub.method pre/post`) → registers a `[&]`-capturing closure into a per-`(Type, method)` hook vector. Each hookable method's body is wrapped with `for (auto& _h : <Type>_<method>_<side>) _h(args);` before/after the body. Pre and post hooks see the same arg list as the method; both can read and mutate test-scope locals via the lambda capture (e.g. counters, scoreboards). Hooks cannot replace the body — only observe and instrument.
 
-Out of v0 scope, deferred to a follow-up PR: protocol-typed bus binding (`bound to T` / `bus.aw.send(...)`) and `pre`/`post` hooks via `on drv.send pre`. The current path is "components are stateful structs with methods you call directly, plus event-driven on-handlers wired together by `connect`"; the protocol-bus story layers on top.
+Out of v0 scope, deferred to a follow-up PR: protocol-typed bus binding (`bound to T` / `bus.aw.send(...)`). The current path is "components are stateful structs with methods you call directly, plus event-driven on-handlers wired together by `connect`, plus pre/post hooks for instrumentation"; the protocol-bus story layers on top.
 
 ### 8.1 `agent`
 
