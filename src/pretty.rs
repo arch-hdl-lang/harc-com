@@ -1004,6 +1004,13 @@ pub fn print_expr(out: &mut String, e: &Expr) {
             write!(out, " {} ", binary_op_str(*op)).ok();
             print_expr(out, rhs);
         }
+        ExprKind::Ternary { cond, then_branch, else_branch } => {
+            print_expr(out, cond);
+            write!(out, " ? ").ok();
+            print_expr(out, then_branch);
+            write!(out, " : ").ok();
+            print_expr(out, else_branch);
+        }
         ExprKind::HashHash { count, expr } => {
             write!(out, "##").ok();
             print_hash_count(out, count);

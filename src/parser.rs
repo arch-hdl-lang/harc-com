@@ -1776,6 +1776,27 @@ impl Parser {
                 );
                 continue;
             }
+            // Ternary `cond ? then : else`. Right-associative, lower
+            // precedence than every other operator except implication.
+            // The `then` branch is parsed with bp=0 — `:` doesn't appear
+            // as an infix operator in expression context, so it cleanly
+            // terminates the inner parse.
+            if op == TokenKind::Question {
+                self.advance();
+                let then_branch = self.parse_expr_bp(0)?;
+                self.expect(TokenKind::Colon)?;
+                let else_branch = self.parse_expr_bp(r_bp)?;
+                let span = lhs.span.merge(else_branch.span);
+                lhs = Expr::new(
+                    ExprKind::Ternary {
+                        cond: lhs,
+                        then_branch,
+                        else_branch,
+                    },
+                    span,
+                );
+                continue;
+            }
             self.advance();
             // Special handling for `##N expr` and `##[m:n] expr` — treat ## as a
             // binary connector with N as a "count" rather than a normal RHS.
@@ -2077,12 +2098,6 @@ impl Parser {
                 let id = Ident { name: name.into(), span };
                 Ok(Expr::new(ExprKind::Ident(id), span))
             }
-            Some(TokenKind::Question) => Err(CompileError::unsupported_syntax(
-                "ternary `?:` operator is not supported",
-                "split into a separate `if cond ... else ... end if` statement; \
-                 HARC does not have ternary expressions",
-                span0,
-            )),
             Some(TokenKind::Semi) => Err(CompileError::unsupported_syntax(
                 "`;` is not a statement separator",
                 "statements are separated by newlines; put each on its own line",
@@ -2202,6 +2217,10 @@ fn infix_bp(t: &TokenKind) -> Option<(u8, u8, InfixOp)> {
         // Implication (lowest), right-associative.
         TokenKind::PipeImplies => (5, 4, B(PipeImplies)),
         TokenKind::PipeImpliesNext => (5, 4, B(PipeImpliesNext)),
+        // Ternary `?:` — right-associative, just above implication. The
+        // op_kind here is a placeholder; parse_expr_bp special-cases
+        // `?` and never looks at the BinaryOp tag.
+        TokenKind::Question => (7, 6, B(BitAnd)),
         // Logical or
         TokenKind::PipePipe | TokenKind::Or => (10, 11, B(if matches!(t, TokenKind::Or) { OrKw } else { OrOr })),
         // Logical and
