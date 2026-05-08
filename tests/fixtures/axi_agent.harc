@@ -1,0 +1,105 @@
+// Worked example from spec §11 — AXI Read+Write agent.
+// Round-trip target for the MVP parser + pretty-printer.
+
+use arc.stdlib.BusAxi4
+use arc.dut.AxiSlave
+
+transaction AxiTxn
+    op    : AxiOp
+    addr  : uint<64>
+    len   : uint<8>
+    size  : uint<3>
+    burst : BurstType
+    id    : uint<4>
+
+    when op == WRITE
+        data : Vec<bits<64>, 256>
+        strb : Vec<bits<8>, 256>
+    end when
+    when op == READ
+        expected_data : Vec<bits<64>, 256>
+    end when
+
+    keep op in {READ, WRITE}
+    keep len in [1..256]
+    keep burst != WRAP || (len in {2, 4, 8, 16})
+    keep addr % (1 << size) == 0
+    keep len * (1 << size) <= 4096 - (addr % 4096)
+end transaction AxiTxn
+
+tseq RandomTxns(n: int) -> TSeq<AxiTxn>
+    for _ in 0 .. n
+        let t : AxiTxn
+        randomize(t)
+        yield t
+    end for
+end tseq RandomTxns
+
+package ShortBursts
+    extend AxiTxn
+        keep len < 16
+        keep burst == INCR
+    end extend AxiTxn
+end package ShortBursts
+
+scoreboard AxiSb
+    expected : queue<AxiTxn>
+    on env.agent.sequencer.dispatched(t)
+        expected.push(t)
+    end on
+    on env.agent.monitor.txn(t_obs)
+        let t_exp = expected.pop()
+        assert t_obs == t_exp else fail("mismatch")
+    end on
+end scoreboard AxiSb
+
+covergroup AxiOps @(posedge dut.s_axi.aclk)
+    cp_op    : cover dut.s_axi.aw.payload.op
+    cp_burst : cover dut.s_axi.aw.payload.burst
+    cp_len   : cover dut.s_axi.aw.payload.len
+        bins
+            single = {1}
+            short  = [2..8]
+            long   = [9..256]
+        end bins
+    cross cp_op, cp_burst, cp_len
+end covergroup AxiOps
+
+env AxiTbEnv
+    agent : AxiAgent bound to BusAxi4#(ADDR_W=32, DATA_W=64, ID_W=4)
+    sb    : AxiSb
+    cov   : AxiOps
+end env AxiTbEnv
+
+test SmokeTest
+    let dut : AxiSlave#(AW=32, DW=64, IDW=4)
+    let env : AxiTbEnv = bind dut.s_axi
+
+    scope sim
+        run
+            env.agent.sequencer.run(RandomTxns(1000))
+        end run
+        check
+            assert env.cov.cp_op.coverage > 95.0
+            assert env.sb.errors == 0
+        end check
+    end scope sim
+end test SmokeTest
+
+use tests.aspects.short_bursts
+
+test ShortBurstSmoke
+    apply ShortBursts
+
+    let dut : AxiSlave#(AW=32, DW=64, IDW=4)
+    let env : AxiTbEnv = bind dut.s_axi
+
+    scope sim
+        run
+            env.agent.sequencer.run(RandomTxns(500))
+        end run
+        check
+            assert env.sb.errors == 0
+        end check
+    end scope sim
+end test ShortBurstSmoke

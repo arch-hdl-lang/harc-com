@@ -1,0 +1,72 @@
+// HARC TB for arch-com/examples/bus_arbiter.arch — 4-requester
+// round-robin arbiter. Mirrors arch-com/examples/arbiter_tb.cpp.
+//
+// Three scenarios: single requester at slot 0, single requester at slot 2,
+// no request. The arbiter is purely combinational here — outputs reflect
+// inputs in the same `eval()` (no clock edge needed between drive and
+// check).
+
+// Coverage: which requester slots actually got granted, and did we
+// exercise the no-grant case?
+covergroup ArbCov @(posedge dut.clk)
+    cp_grant : cover dut.grant_requester
+        bins
+            r0 = {0}
+            r1 = {1}
+            r2 = {2}
+            r3 = {3}
+        end bins
+    cp_valid : cover dut.grant_valid
+        bins
+            granted    = {1}
+            no_request = {0}
+        end bins
+end covergroup ArbCov
+
+test BusArbiterTest
+    let dut : BusArbiter
+    let cov : ArbCov
+
+    scope sim
+        run
+            // Reset
+            dut.rst = 1
+            dut.request_valid = 0
+            wait 2 cycles
+            dut.rst = 0
+
+            // ── Test 1: single requester 0 ───────────────────────────────
+            dut.request_valid = 1     // 0b0001
+            wait 1 cycle
+            assert dut.grant_valid == 1
+                else fail("single req0: grant_valid should be 1")
+            assert dut.grant_requester == 0
+                else fail("single req0: got grant_requester=${dut.grant_requester}")
+            log(info, "PASS: single requester 0 granted")
+
+            // ── Test 2: single requester 2 ───────────────────────────────
+            dut.request_valid = 4     // 0b0100
+            wait 1 cycle
+            assert dut.grant_valid == 1
+                else fail("single req2: grant_valid should be 1")
+            assert dut.grant_requester == 2
+                else fail("single req2: got grant_requester=${dut.grant_requester}")
+            log(info, "PASS: single requester 2 granted")
+
+            // ── Test 3: no request ───────────────────────────────────────
+            dut.request_valid = 0
+            wait 1 cycle
+            assert dut.grant_valid == 0
+                else fail("no request: grant_valid should be 0")
+            log(info, "PASS: no grant when no request")
+        end run
+
+        check
+            cov.report()
+            assert cov.cp_grant.r0 > 0       else fail("R0 grant coverage hole")
+            assert cov.cp_grant.r2 > 0       else fail("R2 grant coverage hole")
+            assert cov.cp_valid.granted    > 0 else fail("granted coverage hole")
+            assert cov.cp_valid.no_request > 0 else fail("no-request coverage hole")
+        end check
+    end scope sim
+end test BusArbiterTest

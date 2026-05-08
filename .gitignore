@@ -1,0 +1,6 @@
+/target
+/harc_sim_build
+Cargo.lock
+*.swp
+*.log
+.DS_Store

@@ -1,0 +1,14 @@
+// Mirrors the domain declarations from
+// arch-com/examples/async_fifo.arch — kept in a separate file so the test
+// fixture and the design source declare the same frequencies in one place.
+//
+// Once HARC and ARCH share a real frontend (spec §1.1), `use arc.dut.AsyncBridge`
+// will pull these in automatically and this file can go away.
+
+domain FastDomain
+  freq_mhz: 200
+end domain FastDomain
+
+domain SlowDomain
+  freq_mhz: 50
+end domain SlowDomain

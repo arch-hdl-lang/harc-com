@@ -1,0 +1,32 @@
+// Functional coverage demo. Pairs naturally with the random-stimulus
+// pattern: fuzz, then see what bins actually got hit. Spec §6.
+//
+// `covergroup G @(posedge clk)` declares a sample trigger; each
+// cover-point's expression is evaluated on the trigger and the matching
+// bin's hit counter increments. End-of-test report prints per-bin counts
+// and a coverage percentage.
+
+covergroup AxiCov @(posedge dut.clk)
+    // Which register address got written.
+    cp_addr : cover dut.axil_aw_addr
+        bins
+            dmacr  = {0}              // MM2S_DMACR  (RS bit, etc.)
+            sa     = {24}             // MM2S_SA     (source addr — the RW
+                                      //              register the fuzz hits)
+            length = {40}             // MM2S_LENGTH
+            other  = [1..23]
+        end bins
+
+    // Data magnitude — small / medium / large.
+    cp_data : cover dut.axil_w_data
+        bins
+            tiny     = [0..255]
+            small    = [256..65535]
+            medium   = [65536..16777215]
+            large    = [16777216..4294967295]
+        end bins
+end covergroup AxiCov
+
+test AxiLiteCovTest
+    let dut : AxiLiteRegs
+end test AxiLiteCovTest

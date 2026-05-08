@@ -1,0 +1,63 @@
+// Counter property assertions — concurrent (every-cycle) checks.
+// Each `assert property` registers a closure into the runtime's
+// `_checkers` vector; tick() invokes the whole list after each
+// `eval()`. Failures land in sim.log with the property name and
+// increment the test's `errors` counter.
+//
+// Pass this file BEFORE counter_test_sim.harc so the checkers are
+// registered before the test's scope sim/run begins:
+//
+//   harc sim --dut wrap_counter.arch
+//     counter_test.harc counter_test_props.harc counter_test_sim.harc
+
+// ── Same-cycle invariants ─────────────────────────────────────────────
+// `value` always fits in 4 bits.
+property value_in_range
+    dut.value <= 15
+end property value_in_range
+
+// `at_max` only asserts when value is the configured max.
+property at_max_means_max
+    dut.at_max |-> dut.value == 15
+end property at_max_means_max
+
+// ── Temporal operators ────────────────────────────────────────────────
+// Wrap behaviour: when value is the maximum and inc is high this cycle,
+// the next cycle's value must be 0.
+property wrap_on_max
+    (dut.value == 15) && dut.inc |=> dut.value == 0
+end property wrap_on_max
+
+// `stable(value)` — when reset is high (stays high for 2 cycles in our
+// TB), value must be stable from the previous cycle (=0 throughout).
+property value_stable_under_reset
+    dut.rst |-> stable(dut.value)
+end property value_stable_under_reset
+
+// `past` — every cycle that wraps must have had at_max=1 last cycle.
+// "Wrapped this cycle" is detected by `past(at_max) && past(inc)`;
+// the consequent requires `value == 0`.
+property wrap_implies_zero
+    past(dut.at_max) && past(dut.inc) && !dut.rst
+        |-> dut.value == 0
+end property wrap_implies_zero
+
+// `rose(at_max)` — every transition from at_max=0 to at_max=1 must
+// happen at value=15 (the rising edge of the at_max signal).
+property rose_at_max_means_15
+    rose(dut.at_max) |-> dut.value == 15
+end property rose_at_max_means_15
+
+// Spec §2 LL(1) table: `assert <ident>` followed by newline / `;` is a
+// named property reference. No `property` keyword needed at the assert
+// site (matches ARCH's `assert <expr>;` style). The codegen detects:
+// bare property name → concurrent; expression with temporal ops →
+// concurrent; plain bool expression → immediate.
+extend CounterTest
+    assert value_in_range
+    assert at_max_means_max
+    assert wrap_on_max
+    assert value_stable_under_reset
+    assert wrap_implies_zero
+    assert rose_at_max_means_15
+end extend CounterTest

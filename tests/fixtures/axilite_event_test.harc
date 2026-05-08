@@ -1,0 +1,28 @@
+// Event-based scoreboard wiring — like UVM's analysis-port + imp_decl
+// pattern, but with first-class `event<T>` and `on event(arg) ... end on`
+// handlers instead of TLM machinery.
+//
+//   producer (test body) ─emit─▶ event ──▶ on-handler ──▶ scoreboard
+//
+// Spec §3.4: `event<T>` is a typed event channel; `emit name(t)` publishes;
+// `on name(t) ... end on` subscribes. Multiple subscribers fan out at
+// compile time (we just push lambdas into a vector).
+//
+// Demo: a transaction `RegOp { addr, value }` flows through two events
+// (`reg_writes`, `reg_reads`). The scoreboard's two `on` handlers:
+//   - on reg_writes(t) — push expected
+//   - on reg_reads(t)  — pop, compare via transaction `==` (item 2)
+
+transaction RegOp
+    addr  : uint<8>
+    value : uint<32>
+end transaction RegOp
+
+scoreboard EvSb
+    expected : queue<uint<32>>     // we compare values; addr is already in event flow
+    pairs : uint<32> default 0
+end scoreboard EvSb
+
+test AxiLiteEventTest
+    let dut : AxiLiteRegs
+end test AxiLiteEventTest

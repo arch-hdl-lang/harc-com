@@ -1,0 +1,74 @@
+// Sim scope of AxiLiteRegsTest — minimal AXI4-Lite write+read on MM2S_DMACR.
+// Mirrors `test_mm2s_register_rw` from arch-com/tests/axi_dma/tb_axilite_regs.cpp.
+// Exercises the log feature:
+//   - severities: info / debug / warn
+//   - ${expr:fmt} string interpolation (decimal / hex / zero-padded hex)
+//   - logf("path.log", ...) per-file streams. Relative paths are anchored
+//     to HARC_LOG_DIR (set by `harc sim` to the build outdir), so the files
+//     land next to sim.log.
+
+extend AxiLiteRegsTest
+    scope sim
+        run
+            log(info, "starting AxiLiteRegs test")
+
+            // ── Reset ─────────────────────────────────────────────────────
+            log(debug, "asserting reset")
+            dut.rst = 1
+            dut.axil_aw_addr = 0
+            dut.axil_aw_valid = 0
+            dut.axil_w_data = 0
+            dut.axil_w_strb = 15
+            dut.axil_w_valid = 0
+            dut.axil_b_ready = 1
+            dut.axil_ar_addr = 0
+            dut.axil_ar_valid = 0
+            dut.axil_r_ready = 1
+            dut.mm2s_done = 0
+            dut.mm2s_halted = 1
+            dut.mm2s_idle = 1
+            dut.s2mm_done = 0
+            dut.s2mm_halted = 1
+            dut.s2mm_idle = 1
+            dut.mm2s_sg_done = 0
+            dut.s2mm_sg_done = 0
+            dut.mm2s_sg_active = 0
+            dut.s2mm_sg_active = 0
+            wait 2 cycles
+            dut.rst = 0
+            wait 1 cycle
+            log(debug, "reset deasserted")
+
+            // ── Set MM2S_DMACR.RS ─────────────────────────────────────────
+            // logf streams the AXI master traffic to its own file.
+            logf("axi_master.log", info, "AW addr=0x${0:08x} data=0x${1:08x}")
+            axil_write(dut, 0, 1)
+            let dmacr = axil_read(dut, 0)
+            logf("axi_master.log", info, "AR addr=0x${0:08x} -> data=0x${dmacr:08x}")
+            log(debug, "DMACR readback = ${dmacr} (decimal), 0x${dmacr:x} (hex)")
+            assert (dmacr & 1) == 1 else fail("MM2S_DMACR.RS readback got ${dmacr}, want bit0=1")
+
+            // ── Set MM2S_SA, read it back ─────────────────────────────────
+            logf("axi_master.log", info, "AW addr=0x${24:08x} data=0x${4096:08x}")
+            axil_write(dut, 24, 4096)
+            let sa = axil_read(dut, 24)
+            logf("axi_master.log", info, "AR addr=0x${24:08x} -> data=0x${sa:08x}")
+            assert sa == 4096 else fail("MM2S_SA readback got 0x${sa:08x}, want 0x00001000")
+
+            // ── Set MM2S_LENGTH, read it back ─────────────────────────────
+            logf("axi_master.log", info, "AW addr=0x${40:08x} data=0x${16:08x}")
+            axil_write(dut, 40, 16)
+            let len = axil_read(dut, 40)
+            logf("axi_master.log", info, "AR addr=0x${40:08x} -> data=0x${len:08x}")
+            assert len == 16 else fail("MM2S_LENGTH readback got ${len}, want 16")
+
+            // ── Negative test (warn): unmapped offset ─────────────────────
+            let unmapped = axil_read(dut, 200)
+            if unmapped != 0
+                logf("axi_master.log", warn, "unmapped read returned 0x${unmapped:08x}")
+            end if
+
+            log(info, "all 3 register R/W operations passed")
+        end run
+    end scope sim
+end extend AxiLiteRegsTest

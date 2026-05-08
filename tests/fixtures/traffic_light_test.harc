@@ -1,0 +1,81 @@
+// HARC TB for arch-com/examples/traffic_light.arch — 3-state FSM
+// (Red → Green → Yellow → Red) with timer-driven transitions.
+// Mirrors arch-com/examples/traffic_light_tb.cpp.
+
+// Helper: advance one cycle holding a specific timer value.
+function tick_timer(dut: TrafficLight, t: uint<8>)
+    dut.timer = t
+    wait 1 cycle
+end function tick_timer
+
+// Coverage: did we visit each state and observe a transition trigger?
+covergroup LightCov @(posedge dut.clk)
+    cp_red    : cover dut.red    bins lit={1} dark={0} end bins
+    cp_yellow : cover dut.yellow bins lit={1} dark={0} end bins
+    cp_green  : cover dut.green  bins lit={1} dark={0} end bins
+end covergroup LightCov
+
+test TrafficLightTest
+    let dut : TrafficLight
+    let cov : LightCov
+
+    scope sim
+        run
+            // Reset: hold timer=1 so the FSM doesn't try to leave Red
+            // before rst deasserts.
+            dut.rst = 1
+            dut.timer = 1
+            wait 2 cycles
+
+            assert dut.red == 1 && dut.yellow == 0 && dut.green == 0
+                else fail("after reset not in Red (r=${dut.red} y=${dut.yellow} g=${dut.green})")
+            log(info, "PASS: reset → Red state")
+
+            dut.rst = 0
+
+            // Red holds while timer != 0.
+            for _ in 0 .. 3
+                tick_timer(dut, 1)
+            end for
+            assert dut.red == 1 && dut.yellow == 0 && dut.green == 0
+                else fail("Red did not hold with timer!=0")
+            log(info, "PASS: Red holds while timer != 0")
+
+            // Red → Green: pulse timer=0 then resume timer=1 to latch.
+            tick_timer(dut, 0)
+            tick_timer(dut, 1)
+            assert dut.red == 0 && dut.yellow == 0 && dut.green == 1
+                else fail("Red did not transition to Green (r=${dut.red} y=${dut.yellow} g=${dut.green})")
+            log(info, "PASS: Red → Green")
+
+            // Green holds.
+            for _ in 0 .. 3
+                tick_timer(dut, 1)
+            end for
+            assert dut.red == 0 && dut.yellow == 0 && dut.green == 1
+                else fail("Green did not hold")
+            log(info, "PASS: Green holds")
+
+            // Green → Yellow.
+            tick_timer(dut, 0)
+            tick_timer(dut, 1)
+            assert dut.red == 0 && dut.yellow == 1 && dut.green == 0
+                else fail("Green did not transition to Yellow (r=${dut.red} y=${dut.yellow} g=${dut.green})")
+            log(info, "PASS: Green → Yellow")
+
+            // Yellow → Red.
+            tick_timer(dut, 0)
+            tick_timer(dut, 1)
+            assert dut.red == 1 && dut.yellow == 0 && dut.green == 0
+                else fail("Yellow did not transition back to Red (r=${dut.red} y=${dut.yellow} g=${dut.green})")
+            log(info, "PASS: Yellow → Red")
+        end run
+
+        check
+            cov.report()
+            assert cov.cp_red.lit    > 0 else fail("Red    state coverage hole")
+            assert cov.cp_yellow.lit > 0 else fail("Yellow state coverage hole")
+            assert cov.cp_green.lit  > 0 else fail("Green  state coverage hole")
+        end check
+    end scope sim
+end test TrafficLightTest

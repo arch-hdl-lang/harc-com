@@ -1,0 +1,78 @@
+// HARC TB for arch-com/examples/single_port_ram.arch — single-port
+// synchronous RAM with `no_change` read semantics: rdata_r updates only
+// on enabled read cycles (access_en && !access_wen). Mirrors
+// arch-com/examples/ram_tb.cpp.
+
+function ram_write(dut: SimpleMem, addr: uint<8>, data: uint<8>)
+    dut.access_en = 1
+    dut.access_wen = 1
+    dut.access_addr = addr
+    dut.access_wdata = data
+    wait 1 cycle
+end function ram_write
+
+function ram_read(dut: SimpleMem, addr: uint<8>) -> uint<8>
+    dut.access_en = 1
+    dut.access_wen = 0
+    dut.access_addr = addr
+    wait 1 cycle
+    return dut.access_rdata
+end function ram_read
+
+test SinglePortRamTest
+    let dut : SimpleMem
+
+    scope sim
+        run
+            // Idle init.
+            dut.access_en = 0
+            dut.access_wen = 0
+            dut.access_addr = 0
+            dut.access_wdata = 0
+            wait 1 cycle
+
+            // Write 8 values: addr i -> (i*7+3) & 0xFF.
+            for i in 0 .. 8
+                ram_write(dut, i, (i * 7 + 3) & 255)
+            end for
+            dut.access_en = 0
+            dut.access_wen = 0
+            wait 1 cycle
+
+            // Read them back.
+            for i in 0 .. 8
+                let got = ram_read(dut, i)
+                let expected = (i * 7 + 3) & 255
+                assert got == expected
+                    else fail("read addr ${i}: got=${got} expected=${expected}")
+            end for
+            log(info, "PASS: 8 values read correctly (no_change sync)")
+
+            // Write 0xAB to addr 10 then read back.
+            ram_write(dut, 10, 171)
+            let v_ab = ram_read(dut, 10)
+            assert v_ab == 171
+                else fail("write-enable test: got ${v_ab}, expected 0xAB")
+            log(info, "PASS: 0xAB read correctly")
+
+            // no_change: a write to addr 10 with wen=1 must NOT update
+            // rdata_r. After the cycle below, rdata should still be 0xAB.
+            dut.access_en = 1
+            dut.access_wen = 1
+            dut.access_addr = 10
+            dut.access_wdata = 205      // 0xCD
+            wait 1 cycle
+            assert dut.access_rdata == 171
+                else fail("no_change violated: rdata=${dut.access_rdata}, expected 0xAB")
+            log(info, "PASS: no_change — rdata stable during write cycle")
+
+            // Confirm the 0xCD write actually committed.
+            let v_cd = ram_read(dut, 10)
+            assert v_cd == 205
+                else fail("write committed: got=${v_cd}, expected 0xCD")
+            log(info, "PASS: write committed — 0xCD verified")
+
+            dut.access_en = 0
+        end run
+    end scope sim
+end test SinglePortRamTest

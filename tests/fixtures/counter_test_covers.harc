@@ -1,0 +1,32 @@
+// Property-cover demo for the counter. `cover <expr>` registers a witness
+// counter — every cycle the expression is true bumps the count. End-of-test
+// report shows hits per cover point and `*NOT HIT*` for any that never
+// fired. Useful for "did the test reach this state?" sanity checks.
+//
+// Run with:
+//   harc sim --dut wrap_counter.arch
+//     counter_test.harc counter_test_covers.harc counter_test_sim.harc
+
+// Named property covers — same syntax / dispatch as `assert <name>`,
+// just records witnesses instead of asserting.
+property hit_zero
+    dut.value == 0
+end property hit_zero
+
+property hit_max
+    dut.value == 15
+end property hit_max
+
+property at_max_pulse
+    dut.at_max
+end property at_max_pulse
+
+extend CounterTest
+    cover hit_zero
+    cover hit_max
+    cover at_max_pulse
+
+    // Inline anonymous cover — labeled by source span. Useful for ad-hoc
+    // "did we see this midpoint?" checks without a property declaration.
+    cover dut.value == 7
+end extend CounterTest

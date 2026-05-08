@@ -1,0 +1,54 @@
+// Sim scope for AsyncFifoTest.
+// Push 8 items on the fast side, let synchronizers settle, pop on the
+// slow side, verify ordering and values. Mirrors the hand-written
+// arch-com/examples/async_fifo_tb.cpp end-to-end.
+
+extend AsyncFifoTest
+    scope sim
+        run
+            log(info, "starting AsyncBridge multi-clock test")
+
+            // ── Reset ─────────────────────────────────────────────────────
+            dut.rst = 1
+            dut.push_valid = 0
+            dut.push_data = 0
+            dut.pop_ready = 0
+            wait 80ns
+            dut.rst = 0
+            wait 40ns
+
+            // ── Push 8 items on wr_clk (fast side) ────────────────────────
+            log(info, "pushing 8 items on wr_clk")
+            for i in 0 .. 8
+                dut.push_valid = 1
+                dut.push_data = i + 1
+                wait 5ns
+            end for
+            dut.push_valid = 0
+
+            // Let gray-code synchronizers settle across the CDC.
+            log(debug, "letting CDC synchronizers settle")
+            wait 200ns
+
+            // ── Pop 8 items on rd_clk (slow side) ─────────────────────────
+            // Standard handshake pattern: read pop_data while pop_valid is
+            // high, then pulse pop_ready for one rd_clk cycle to advance
+            // the pointer. Holding pop_ready high through the whole loop
+            // causes us to read item 1 instead of item 0 (the FIFO has
+            // already advanced).
+            log(info, "popping 8 items on rd_clk")
+            for i in 0 .. 8
+                assert dut.pop_valid else fail("pop_valid low on item ${i}")
+                let got = dut.pop_data
+                let want = i + 1
+                logf("async_fifo.log", info, "pop[${i}] got=${got:08x} want=${want:08x}")
+                assert got == want else fail("data mismatch at pop[${i}]: got ${got}, want ${want}")
+                dut.pop_ready = 1
+                wait 20ns
+                dut.pop_ready = 0
+            end for
+
+            log(info, "PASS: 8/8 items round-tripped through async FIFO")
+        end run
+    end scope sim
+end extend AsyncFifoTest

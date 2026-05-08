@@ -1,0 +1,17 @@
+// Fuzz test for AxiLiteRegs — random write/read of a 32-bit register.
+// Demonstrates `transaction` + `randomize()` (Phase 1a, no SMT solver).
+// Reuses axil_write / axil_read helpers from axilite_regs_test.harc.
+//
+// Run with: harc sim --sv AxiLiteRegs.sv --seed 42
+//   axilite_regs_test.harc       # base + helpers
+//   axilite_fuzz_test.harc       # this file (fuzz base)
+//   axilite_fuzz_test_sim.harc   # fuzz scope sim
+
+transaction RegData
+    value : uint<32>                          // random 32-bit write payload
+    !mode : uint<8>  default 0                // non-random; reserved for future
+end transaction RegData
+
+test AxiLiteFuzzTest
+    let dut : AxiLiteRegs
+end test AxiLiteFuzzTest

@@ -1,0 +1,45 @@
+// AxiLiteRegs test base — DUT lives in arch-com/tests/axi_dma/AxiLiteRegs.arch
+// (PG021 register map). Per-backend scopes split via `extend AxiLiteRegsTest`.
+//
+// `=` is blocking assignment (matches ARCH); used for raw DUT signal drives
+// and locals. `<-` is reserved for channel/event/state sends per spec §17.2.
+// `wait N cycles` is the single-statement suspend.
+
+function axil_write(dut: AxiLiteRegs, addr: uint<8>, data: uint<32>)
+    dut.axil_aw_addr = addr
+    dut.axil_aw_valid = 1
+    dut.axil_w_data = data
+    dut.axil_w_strb = 15
+    dut.axil_w_valid = 1
+    wait 10 cycles
+    dut.axil_aw_valid = 0
+    dut.axil_w_valid = 0
+    wait 2 cycles
+end function axil_write
+
+function axil_read(dut: AxiLiteRegs, addr: uint<8>) -> uint<32>
+    let val = 0
+    let saw = 0    // single-shot capture flag (no `break` in v0)
+    dut.axil_ar_addr = addr
+    dut.axil_ar_valid = 1
+    // Walk a fixed-cycle budget; on the first observed r_valid, capture
+    // the data and immediately deassert AR so the slave doesn't see a
+    // sustained AR-valid and start a NEW transaction next cycle.
+    for _ in 0 .. 10
+        wait 1 cycle
+        if dut.axil_r_valid
+            if saw == 0
+                val = dut.axil_r_data
+                dut.axil_ar_valid = 0
+                saw = 1
+            end if
+        end if
+    end for
+    dut.axil_ar_valid = 0
+    wait 1 cycle
+    return val
+end function axil_read
+
+test AxiLiteRegsTest
+    let dut : AxiLiteRegs
+end test AxiLiteRegsTest

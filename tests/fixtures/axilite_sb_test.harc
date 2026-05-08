@@ -1,0 +1,23 @@
+// Scoreboard demo on AxiLiteRegs. Fuzz writes random values to MM2S_SA;
+// each randomized value is pushed onto a `queue<uint<32>>` in a
+// `scoreboard`. After each axil_read, pop the next expected value from
+// the queue and compare. End-of-test: queue must be empty.
+//
+// Spec §8.5: scoreboards are the natural place to compare DUT-observed
+// transactions against test-produced expectations. v0 lowers the
+// declaration to a C++ struct; the user pushes/pops directly. `on`-
+// handlers attached to monitors are deferred (need event registration).
+
+scoreboard FuzzSb
+    expected : queue<uint<32>>
+    writes : uint<32> default 0    // count of writes pushed
+    reads  : uint<32> default 0    // count of reads compared
+end scoreboard FuzzSb
+
+transaction FuzzReg
+    value : uint<32>
+end transaction FuzzReg
+
+test AxiLiteSbTest
+    let dut : AxiLiteRegs
+end test AxiLiteSbTest

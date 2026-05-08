@@ -1,0 +1,16 @@
+// AsyncBridge multi-clock TB.
+// DUT lives at arch-com/examples/async_fifo.arch — dual-clock async FIFO,
+// 200 MHz write side ↔ 50 MHz read side. Demonstrates HARC's multi-clock
+// support: clocks reference ARCH-style `domain` declarations (see
+// async_fifo_domains.harc) so the period is derived from `freq_mhz`
+// instead of duplicated as a time literal.
+
+test AsyncFifoTest
+    let dut : AsyncBridge
+
+    // First-declared clock (wr_clk) is the primary — `wait N cycles` (no
+    // name) advances by N wr_clk cycles, and the cycle counter in log
+    // lines tracks wr_clk rising edges.
+    clock wr_clk = FastDomain    // 200 MHz → 5 ns period
+    clock rd_clk = SlowDomain    // 50 MHz  → 20 ns period
+end test AsyncFifoTest

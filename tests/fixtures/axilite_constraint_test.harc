@@ -1,0 +1,17 @@
+// Constraint-fuzz test for AxiLiteRegs. Demonstrates `randomize(t) with`
+// — cross-field constraints solved by Z3. Reuses axil_write / axil_read
+// from axilite_regs_test.harc.
+//
+// Run with: harc sim --sv AxiLiteRegs.sv --seed 42
+//   axilite_regs_test.harc            # base + helpers
+//   axilite_constraint_test.harc      # this file
+//   axilite_constraint_test_sim.harc  # scope sim
+
+transaction RegPair
+    addr  : uint<8>
+    value : uint<32>
+end transaction RegPair
+
+test AxiLiteConstraintTest
+    let dut : AxiLiteRegs
+end test AxiLiteConstraintTest

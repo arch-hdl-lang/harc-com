@@ -1,0 +1,11 @@
+// Counter test base — shared lets and helpers.
+//
+// Per-backend scopes live in sibling files (counter_test_sim.harc, etc.) and
+// are merged in via `extend test CounterTest` blocks (spec §3.6 + §7.2).
+//
+//   harc sim   counter_test.harc counter_test_sim.harc   --dut wrap_counter.arch
+//   harc formal counter_test.harc counter_test_formal.harc      (future)
+
+test CounterTest
+    let dut : WrapCounter
+end test CounterTest
