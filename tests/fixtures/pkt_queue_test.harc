@@ -7,8 +7,14 @@
 // pop_data, for pop).
 
 function pq_push(dut: PacketQueue, data: uint<32>)
+    // Wait until the queue is ready, up to a small budget.
+    let _w = 0
+    while !dut.push_ready && _w < 16
+        wait 1 cycle
+        _w = _w + 1
+    end while
     assert dut.push_ready
-        else fail("push_ready low when push attempted")
+        else fail("push_ready never asserted within 16 cycles")
     dut.push_valid = 1
     dut.push_data = data
     wait 1 cycle              // cycle 1 — req accepted
@@ -19,8 +25,13 @@ function pq_push(dut: PacketQueue, data: uint<32>)
 end function pq_push
 
 function pq_pop(dut: PacketQueue) -> uint<32>
+    let _w = 0
+    while !dut.pop_ready && _w < 16
+        wait 1 cycle
+        _w = _w + 1
+    end while
     assert dut.pop_ready
-        else fail("pop_ready low when pop attempted")
+        else fail("pop_ready never asserted within 16 cycles")
     dut.pop_valid = 1
     wait 1 cycle              // cycle 1 — req accepted
     dut.pop_valid = 0

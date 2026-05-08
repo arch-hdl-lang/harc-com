@@ -809,6 +809,26 @@ Compiles to one coroutine per branch with explicit suspend points at each cycle 
 
 `after N cycles ... end after` is the suspend primitive; wall-clock units (`100ns`) lower against the bound clock domain. `fork ... join_none` exists for fire-and-forget patterns and lowers to a coroutine without a join barrier.
 
+**Loops.** Four loop forms cover the common cases:
+
+- `for i in lo .. hi ... end for` — bounded count; `i` available in the body, or `_` when unused.
+- `repeat <expr> ... end repeat` — fixed iteration count; no induction variable.
+- `while <cond> ... end while` — pre-tested loop; the body re-checks `cond` on each iteration.
+- `loop ... end loop` — infinite; exit via `break` (typically inside an `if`).
+
+`break` exits the innermost enclosing loop; `continue` skips to its next iteration. Both are statements in their own right and lower to C++ `break` / `continue`, so they also work inside `for` / `repeat` / `loop` bodies.
+
+```
+let _w = 0
+while !dut.ready && _w < 16
+    wait 1 cycle
+    _w = _w + 1
+end while
+if _w == 16
+    fail("ready never asserted")
+end if
+```
+
 The single-statement form `wait N cycles` is the common shorthand. Under multi-clock it advances by N rising edges of the **primary clock** (the first-declared clock in the test). To advance relative to a non-primary clock, use the optional `on <clock>` clause:
 
 ```
@@ -822,7 +842,6 @@ wait 2 cycles on slow_clk        // 2 slow_clk rising edges; fast_clk
 ```
 
 Cycle counts in `on <clock>` are real-time–correct: every other clock keeps ticking at its declared frequency. Use this form when an assertion is naturally phrased in the destination domain ("after 2 dst cycles, X holds"); use the bare form when reasoning is in the primary domain or when there's only one clock.
-
 ### 7.5 Multi-clock domain spanning
 
 Each `on` block has a primary clock domain inferred from its trigger. Reads of signals or events from another domain are allowed but **not silent**: the compiler synthesizes a synchronizer (default 2-FF) and the read evaluates to a typed value with explicit latency.
