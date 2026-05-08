@@ -741,10 +741,13 @@ pub enum StmtKind {
     Expr(Expr),
     /// `after N cycles ... end after` — suspend primitive (§7.4) with a body.
     After { duration: Expr, body: Block, span: Span },
-    /// `wait <expr> cycles` — single-statement suspend, ARCH-shape sugar
-    /// for `after N cycles ... end after` with an empty body. The trailing
-    /// `cycles` / `cycle` keyword is decorative and optional.
-    Wait { duration: Expr, span: Span },
+    /// `wait <expr> cycles [on <clock>]` — single-statement suspend,
+    /// ARCH-shape sugar for `after N cycles ... end after` with an empty
+    /// body. The trailing `cycles` / `cycle` keyword is decorative and
+    /// optional. When `clock` is set, advances simulated time so the
+    /// named clock sees `<expr>` more rising edges (other clocks
+    /// continue ticking at their natural rate).
+    Wait { duration: Expr, clock: Option<Ident>, span: Span },
 }
 
 #[derive(Debug, Clone)]
