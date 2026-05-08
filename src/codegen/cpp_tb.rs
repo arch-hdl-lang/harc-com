@@ -1685,6 +1685,23 @@ impl Emitter {
                 self.pad(depth);
                 writeln!(self.out, "}}").ok();
             }
+            StmtKind::While { cond, body, .. } => {
+                self.pad(depth);
+                write!(self.out, "while (").ok();
+                self.emit_expr(cond);
+                writeln!(self.out, ") {{").ok();
+                self.emit_block(body, depth + 1);
+                self.pad(depth);
+                writeln!(self.out, "}}").ok();
+            }
+            StmtKind::Break { .. } => {
+                self.pad(depth);
+                writeln!(self.out, "break;").ok();
+            }
+            StmtKind::Continue { .. } => {
+                self.pad(depth);
+                writeln!(self.out, "continue;").ok();
+            }
             StmtKind::If(i) => {
                 self.pad(depth);
                 write!(self.out, "if (").ok();
@@ -2174,6 +2191,7 @@ fn file_uses_constraint_solver(file: &SourceFile) -> bool {
             StmtKind::For(f) => block(&f.body),
             StmtKind::Repeat(r) => block(&r.body),
             StmtKind::Loop(b) => block(b),
+            StmtKind::While { body, .. } => block(body),
             StmtKind::If(i) =>
                 block(&i.then_block)
                 || i.else_block.as_ref().map_or(false, block)

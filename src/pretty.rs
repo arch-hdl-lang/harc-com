@@ -699,6 +699,23 @@ fn print_stmt(out: &mut String, s: &Stmt, depth: usize) {
             pad(out, depth);
             writeln!(out, "end loop").ok();
         }
+        StmtKind::While { cond, body, .. } => {
+            pad(out, depth);
+            write!(out, "while ").ok();
+            print_expr(out, cond);
+            writeln!(out).ok();
+            print_block_inner(out, body, depth + 1);
+            pad(out, depth);
+            writeln!(out, "end while").ok();
+        }
+        StmtKind::Break { .. } => {
+            pad(out, depth);
+            writeln!(out, "break").ok();
+        }
+        StmtKind::Continue { .. } => {
+            pad(out, depth);
+            writeln!(out, "continue").ok();
+        }
         StmtKind::If(i) => {
             pad(out, depth);
             write!(out, "if ").ok();
