@@ -1,0 +1,96 @@
+// HARC TB for arch-com/examples/synchronizer_wide.arch — 3-stage FF
+// synchronizer for an 8-bit data bus crossing SrcDomain (100 MHz)
+// → DstDomain (133 MHz). Data appears at the output after 3 dst_clk
+// rising edges. Mirrors arch-com/examples/synchronizer_wide_tb.cpp.
+
+domain SrcDomain
+  freq_mhz: 100
+end domain SrcDomain
+
+domain DstDomain
+  freq_mhz: 133
+end domain DstDomain
+
+test DataSyncTest
+    let dut : DataSync
+
+    clock dst_clk = DstDomain
+    clock src_clk = SrcDomain
+
+    scope sim
+        run
+            // Reset.
+            dut.rst = 1
+            dut.data_in = 0
+            wait 1 cycle on dst_clk
+            dut.rst = 0
+
+            // ── Test 1: 3-stage propagation ────────────────────────────
+            // Drive 0xAB at the input. Cycles 1-2: output still 0.
+            // Cycle 3: 0xAB reaches the last stage.
+            dut.data_in = 171               // 0xAB
+
+            wait 1 cycle on dst_clk
+            assert dut.data_out == 0
+                else fail("cycle 1: data_out=${dut.data_out:02x}, expected 0x00")
+
+            wait 1 cycle on dst_clk
+            assert dut.data_out == 0
+                else fail("cycle 2: data_out=${dut.data_out:02x}, expected 0x00")
+
+            wait 1 cycle on dst_clk
+            assert dut.data_out == 171
+                else fail("cycle 3: data_out=${dut.data_out:02x}, expected 0xAB")
+
+            wait 1 cycle on dst_clk
+            assert dut.data_out == 171
+                else fail("cycle 4: data_out=${dut.data_out:02x}, expected 0xAB (held)")
+            log(info, "PASS: 0xAB reached output after 3 dst cycles")
+
+            // ── Test 2: pipelined data stream ──────────────────────────
+            // After cycle 4 of test 1, the chain is [0xAB, 0xAB, 0xAB].
+            // Push a new sequence; each new value reaches the output 2
+            // additional cycles later (since 1 cycle has already
+            // happened with the previous value latched into stage 0).
+            //
+            // i=0: drive 0x11 → wait 1 → out = 0xAB (from saturated chain)
+            // i=1: drive 0x22 → wait 1 → out = 0xAB (still — only 0x11
+            //                                        has reached stage 1)
+            // i=2: drive 0x33 → wait 1 → out = 0x11
+            // i=3: drive 0x44 → wait 1 → out = 0x22
+            // i=4: drive 0x55 → wait 1 → out = 0x33
+
+            let vals0 = 17                  // 0x11
+            let vals1 = 34                  // 0x22
+            let vals2 = 51                  // 0x33
+            let vals3 = 68                  // 0x44
+            let vals4 = 85                  // 0x55
+
+            dut.data_in = vals0
+            wait 1 cycle on dst_clk
+            assert dut.data_out == 171      // 0xAB still
+                else fail("stream i=0: data_out=${dut.data_out:02x}, expected 0xAB")
+
+            dut.data_in = vals1
+            wait 1 cycle on dst_clk
+            assert dut.data_out == 171
+                else fail("stream i=1: data_out=${dut.data_out:02x}, expected 0xAB")
+
+            dut.data_in = vals2
+            wait 1 cycle on dst_clk
+            assert dut.data_out == vals0
+                else fail("stream i=2: data_out=${dut.data_out:02x}, expected 0x11")
+
+            dut.data_in = vals3
+            wait 1 cycle on dst_clk
+            assert dut.data_out == vals1
+                else fail("stream i=3: data_out=${dut.data_out:02x}, expected 0x22")
+
+            dut.data_in = vals4
+            wait 1 cycle on dst_clk
+            assert dut.data_out == vals2
+                else fail("stream i=4: data_out=${dut.data_out:02x}, expected 0x33")
+            log(info, "PASS: data stream propagates with 3-cycle delay")
+        end run
+    end scope sim
+end test DataSyncTest

@@ -1,0 +1,62 @@
+// HARC TB for arch-com/examples/top_counter.arch — `Top` instantiates
+// an 8-bit `Counter` sub-module with sync reset and enable. Mirrors
+// arch-com/examples/top_counter_tb.cpp.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+test TopCounterTest
+    let dut : Top
+
+    clock clk = SysDomain        // 100 MHz
+
+    scope sim
+        run
+            // Reset for 3 cycles.
+            dut.rst = 1
+            dut.en = 0
+            wait 3 cycles
+            assert dut.count_out == 0
+                else fail("after reset: count_out=${dut.count_out}, expected 0")
+            log(info, "PASS: count=0 after reset")
+
+            // Deassert reset, enable, count 1..10.
+            dut.rst = 0
+            dut.en = 1
+            for i in 1 .. 11
+                wait 1 cycle
+                assert dut.count_out == i
+                    else fail("cycle ${i}: count_out=${dut.count_out}, expected ${i}")
+            end for
+            log(info, "PASS: counter incremented 1..10 correctly")
+
+            // Hold: en=0 → count must not change.
+            dut.en = 0
+            let held = dut.count_out
+            for _ in 0 .. 5
+                wait 1 cycle
+                assert dut.count_out == held
+                    else fail("en=0: count changed from ${held} to ${dut.count_out}")
+            end for
+            log(info, "PASS: counter holds at ${held} when en=0")
+
+            // Resume: en=1 → counts from held value.
+            dut.en = 1
+            for i in 1 .. 6
+                wait 1 cycle
+                let expected = held + i
+                assert dut.count_out == expected
+                    else fail("resume cycle ${i}: count_out=${dut.count_out}, expected ${expected}")
+            end for
+            log(info, "PASS: counter resumes correctly after re-enable")
+
+            // Mid-count reset.
+            dut.rst = 1
+            wait 1 cycle
+            assert dut.count_out == 0
+                else fail("mid-count reset: count_out=${dut.count_out}, expected 0")
+            log(info, "PASS: mid-count reset works")
+        end run
+    end scope sim
+end test TopCounterTest
