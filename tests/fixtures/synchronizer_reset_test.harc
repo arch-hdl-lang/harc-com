@@ -1,0 +1,81 @@
+// HARC TB for arch-com/examples/synchronizer_reset.arch — async-assert,
+// sync-deassert reset synchronizer crossing SrcDomain → DstDomain.
+// Asserting `data_in` propagates to `data_out` immediately (combinational
+// async path); deasserting requires 2 dst_clk rising edges to propagate
+// through the 2-stage chain. Mirrors
+// arch-com/examples/synchronizer_reset_tb.cpp.
+
+domain SrcDomain
+  freq_mhz: 100
+end domain SrcDomain
+
+domain DstDomain
+  freq_mhz: 200
+end domain DstDomain
+
+test RstSyncTest
+    let dut : RstSync
+
+    clock dst_clk = DstDomain    // 200 MHz — primary, drives the sync chain
+    clock src_clk = SrcDomain    // 100 MHz — unused inside DUT
+
+    scope sim
+        run
+            // Initialize.
+            dut.data_in = 0
+            wait 1 cycle on dst_clk
+
+            // ── Test 1: async assert ──────────────────────────────────
+            // data_in=1 should immediately drive data_out=1 with no clock.
+            // The DUT's `posedge data_in` clause forces the chain high.
+            dut.data_in = 1
+            // Note: HARC's wait advances by N edges, but the
+            // posedge data_in trigger has already fired by the time we
+            // sample on the next dst edge (via the level-1 gate in the
+            // always_ff). One dst tick is enough for the chain to
+            // observe data_in==1 and load all stages.
+            wait 1 cycle on dst_clk
+            assert dut.data_out == 1
+                else fail("async assert: data_out=${dut.data_out}, expected 1")
+            log(info, "PASS: async assert")
+
+            // ── Test 2: sync deassert (2 stages) ──────────────────────
+            // After the assert pulse propagated, drop data_in.
+            // Cycle 1: stage0=0, stage1 still 1 → out=1
+            // Cycle 2: stage1=0 → out=0
+            dut.data_in = 0
+
+            wait 1 cycle on dst_clk
+            assert dut.data_out == 1
+                else fail("after 1 dst cycle: data_out=${dut.data_out}, expected 1")
+
+            wait 1 cycle on dst_clk
+            assert dut.data_out == 0
+                else fail("after 2 dst cycles: data_out=${dut.data_out}, expected 0")
+            log(info, "PASS: sync deassert (2-stage)")
+
+            // ── Test 3: re-assert mid-deassert ────────────────────────
+            dut.data_in = 1
+            wait 1 cycle on dst_clk
+            assert dut.data_out == 1
+                else fail("re-assert: data_out=${dut.data_out}, expected 1")
+
+            // One dst cycle while asserted — output stays 1.
+            wait 1 cycle on dst_clk
+            assert dut.data_out == 1
+                else fail("during assert: data_out=${dut.data_out}, expected 1")
+
+            // Deassert + 1 dst cycle → out still 1
+            dut.data_in = 0
+            wait 1 cycle on dst_clk
+            assert dut.data_out == 1
+                else fail("1 cycle after deassert: data_out=${dut.data_out}, expected 1")
+
+            // Deassert + 2 dst cycles → out=0
+            wait 1 cycle on dst_clk
+            assert dut.data_out == 0
+                else fail("2 cycles after deassert: data_out=${dut.data_out}, expected 0")
+            log(info, "PASS: re-assert then deassert")
+        end run
+    end scope sim
+end test RstSyncTest

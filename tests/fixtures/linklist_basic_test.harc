@@ -1,0 +1,226 @@
+// HARC TB for arch-com/examples/linklist_basic.arch — `TaskQueue`, a
+// linklist-backed FIFO with a free-slot pool and per-slot read/write
+// data ports. Mirrors arch-com/examples/linklist_basic_tb.cpp.
+//
+// Each operation is a 2-cycle req/resp: drive *_valid for one cycle,
+// deassert, observe *_resp_valid on the next cycle. read_data is a
+// 1-cycle latency variant (resp valid on the same cycle the FSM
+// latches the output register).
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+// Helpers — same shape as the C++ TB, just expressed in HARC.
+
+function alloc_one(dut: TaskQueue) -> uint<32>
+    dut.alloc_req_valid = 1
+    wait 1 cycle
+    dut.alloc_req_valid = 0
+    assert dut.alloc_resp_valid else fail("alloc: resp did not fire")
+    let h = dut.alloc_resp_handle
+    wait 1 cycle
+    return h
+end function alloc_one
+
+function free_one(dut: TaskQueue, handle: uint<32>)
+    dut.free_req_valid = 1
+    dut.free_req_handle = handle
+    wait 1 cycle
+    dut.free_req_valid = 0
+    dut.free_req_handle = 0
+    wait 1 cycle
+end function free_one
+
+function insert_tail_one(dut: TaskQueue, data: uint<32>) -> uint<32>
+    dut.insert_tail_req_valid = 1
+    dut.insert_tail_req_data = data
+    wait 1 cycle
+    dut.insert_tail_req_valid = 0
+    dut.insert_tail_req_data = 0
+    wait 1 cycle
+    assert dut.insert_tail_resp_valid else fail("insert_tail: resp did not fire")
+    let h = dut.insert_tail_resp_handle
+    wait 1 cycle
+    return h
+end function insert_tail_one
+
+function delete_head_one(dut: TaskQueue) -> uint<32>
+    dut.delete_head_req_valid = 1
+    wait 1 cycle
+    dut.delete_head_req_valid = 0
+    wait 1 cycle
+    assert dut.delete_head_resp_valid else fail("delete_head: resp did not fire")
+    let d = dut.delete_head_resp_data
+    wait 1 cycle
+    return d
+end function delete_head_one
+
+function read_data_one(dut: TaskQueue, handle: uint<32>) -> uint<32>
+    dut.read_data_req_valid = 1
+    dut.read_data_req_handle = handle
+    wait 1 cycle
+    assert dut.read_data_resp_valid else fail("read_data: resp did not fire")
+    let data = dut.read_data_resp_data
+    dut.read_data_req_valid = 0
+    dut.read_data_req_handle = 0
+    wait 1 cycle
+    return data
+end function read_data_one
+
+function write_data_one(dut: TaskQueue, handle: uint<32>, data: uint<32>)
+    dut.write_data_req_valid = 1
+    dut.write_data_req_handle = handle
+    dut.write_data_req_data = data
+    wait 1 cycle
+    dut.write_data_req_valid = 0
+    dut.write_data_req_handle = 0
+    dut.write_data_req_data = 0
+    wait 1 cycle
+end function write_data_one
+
+function reset_dut(dut: TaskQueue)
+    dut.rst = 1
+    dut.alloc_req_valid = 0
+    dut.free_req_valid = 0
+    dut.free_req_handle = 0
+    dut.insert_tail_req_valid = 0
+    dut.insert_tail_req_data = 0
+    dut.delete_head_req_valid = 0
+    dut.read_data_req_valid = 0
+    dut.read_data_req_handle = 0
+    dut.write_data_req_valid = 0
+    dut.write_data_req_handle = 0
+    dut.write_data_req_data = 0
+    wait 2 cycles
+    dut.rst = 0
+end function reset_dut
+
+test LinklistBasicTest
+    let dut : TaskQueue
+
+    clock clk = SysDomain        // 100 MHz
+
+    scope sim
+        run
+            // ── Test 1: initial state ─────────────────────────────────
+            reset_dut(dut)
+            assert dut.empty == 1
+                else fail("empty=${dut.empty} after reset, expected 1")
+            assert dut.full == 0
+                else fail("full=${dut.full} after reset, expected 0")
+            assert dut.length == 0
+                else fail("length=${dut.length} after reset, expected 0")
+            assert dut.alloc_req_ready == 1
+                else fail("alloc_req_ready=${dut.alloc_req_ready} after reset, expected 1")
+            log(info, "PASS: initial state")
+
+            // ── Test 2: alloc + free ──────────────────────────────────
+            reset_dut(dut)
+            let h = alloc_one(dut)
+            assert h != 255 else fail("alloc returned no handle")
+            assert dut.length == 1 else fail("length=${dut.length} after alloc, expected 1")
+            assert dut.empty == 0 else fail("empty after alloc")
+            free_one(dut, h)
+            assert dut.empty == 1
+                else fail("empty=${dut.empty} after free, expected 1")
+            log(info, "PASS: alloc + free")
+
+            // ── Test 3: insert + delete single ────────────────────────
+            reset_dut(dut)
+            let h2 = insert_tail_one(dut, 2882400052)         // 0xABCD1234
+            assert h2 != 255 else fail("insert_tail got no handle")
+            assert dut.length == 1 else fail("length after insert")
+            let v3 = delete_head_one(dut)
+            assert v3 == 2882400052
+                else fail("delete_head got=${v3:08x}, expected 0xABCD1234")
+            assert dut.empty == 1 else fail("empty after delete")
+            log(info, "PASS: insert + delete single")
+
+            // ── Test 4: FIFO ordering across 4 inserts ────────────────
+            reset_dut(dut)
+            insert_tail_one(dut, 10)
+            insert_tail_one(dut, 20)
+            insert_tail_one(dut, 30)
+            insert_tail_one(dut, 40)
+            assert dut.length == 4 else fail("length=${dut.length} after 4 inserts")
+            assert delete_head_one(dut) == 10 else fail("FIFO[0]")
+            assert delete_head_one(dut) == 20 else fail("FIFO[1]")
+            assert delete_head_one(dut) == 30 else fail("FIFO[2]")
+            assert delete_head_one(dut) == 40 else fail("FIFO[3]")
+            assert dut.empty == 1 else fail("empty after 4-drain")
+            log(info, "PASS: FIFO order across 4 inserts")
+
+            // ── Test 5: fill to DEPTH=8 ───────────────────────────────
+            reset_dut(dut)
+            for i in 0 .. 8
+                insert_tail_one(dut, 256 + i)        // 0x100 + i
+            end for
+            assert dut.full == 1 else fail("full after 8 inserts")
+            assert dut.length == 8 else fail("length=${dut.length}, expected 8")
+            assert dut.insert_tail_req_ready == 0
+                else fail("insert_tail_req_ready should be 0 when full")
+            for i in 0 .. 8
+                let want = 256 + i
+                let got = delete_head_one(dut)
+                assert got == want
+                    else fail("drain[${i}]: got=${got:08x} expected=${want:08x}")
+            end for
+            assert dut.empty == 1 else fail("empty after full drain")
+            log(info, "PASS: fill to capacity + ordered drain")
+
+            // ── Test 6: read/write data ───────────────────────────────
+            reset_dut(dut)
+            let h6 = insert_tail_one(dut, 3735928559)         // 0xDEADBEEF
+            let r1 = read_data_one(dut, h6)
+            assert r1 == 3735928559
+                else fail("read_data initial: got=${r1:08x}, expected 0xDEADBEEF")
+            write_data_one(dut, h6, 3405691582)               // 0xCAFEBABE
+            let r2 = read_data_one(dut, h6)
+            assert r2 == 3405691582
+                else fail("read_data after write: got=${r2:08x}, expected 0xCAFEBABE")
+            delete_head_one(dut)            // cleanup
+            log(info, "PASS: read/write data")
+
+            // ── Test 7: alloc/free cycle (no inserts) ─────────────────
+            reset_dut(dut)
+            let a0 = alloc_one(dut)
+            let a1 = alloc_one(dut)
+            let a2 = alloc_one(dut)
+            let a3 = alloc_one(dut)
+            let a4 = alloc_one(dut)
+            let a5 = alloc_one(dut)
+            let a6 = alloc_one(dut)
+            let a7 = alloc_one(dut)
+            assert dut.alloc_req_ready == 0
+                else fail("alloc_req_ready should be 0 with no free slots")
+            assert dut.length == 8 else fail("length=${dut.length} when all allocated")
+            free_one(dut, a0)
+            free_one(dut, a1)
+            free_one(dut, a2)
+            free_one(dut, a3)
+            free_one(dut, a4)
+            free_one(dut, a5)
+            free_one(dut, a6)
+            free_one(dut, a7)
+            assert dut.alloc_req_ready == 1
+                else fail("alloc_req_ready should restore to 1 after frees")
+            log(info, "PASS: alloc/free cycle")
+
+            // ── Test 8: interleaved insert/delete ─────────────────────
+            reset_dut(dut)
+            insert_tail_one(dut, 1)
+            insert_tail_one(dut, 2)
+            insert_tail_one(dut, 3)
+            assert delete_head_one(dut) == 1 else fail("interleaved[0]")
+            insert_tail_one(dut, 4)
+            insert_tail_one(dut, 5)
+            assert delete_head_one(dut) == 2 else fail("interleaved[1]")
+            assert delete_head_one(dut) == 3 else fail("interleaved[2]")
+            assert delete_head_one(dut) == 4 else fail("interleaved[3]")
+            assert delete_head_one(dut) == 5 else fail("interleaved[4]")
+            assert dut.empty == 1 else fail("empty after interleaved")
+            log(info, "PASS: interleaved insert/delete")
+        end run
+    end scope sim
+end test LinklistBasicTest

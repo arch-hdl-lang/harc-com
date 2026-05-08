@@ -1,0 +1,59 @@
+// HARC TB for arch-com/examples/synchronizer_gray.arch — gray-code
+// 2-stage synchronizer crossing SrcDomain (100 MHz) → DstDomain (133 MHz).
+// `data_in` is binary-encoded; the DUT bin→gray-encodes it on the src
+// side, syncs the gray code through 2 dst-side flops, then decodes back
+// to binary. After 2 dst rising edges, `data_out` should match `data_in`.
+//
+// Mirrors arch-com/examples/synchronizer_gray_tb.cpp.
+
+domain SrcDomain
+  freq_mhz: 100
+end domain SrcDomain
+
+domain DstDomain
+  freq_mhz: 133
+end domain DstDomain
+
+test PtrSyncTest
+    let dut : PtrSync
+
+    clock dst_clk = DstDomain    // 133 MHz — primary, drives the sync chain
+    clock src_clk = SrcDomain    // 100 MHz — unused inside DUT, just for completeness
+
+    scope sim
+        run
+            // Reset.
+            dut.rst = 1
+            dut.data_in = 0
+            wait 1 cycle on dst_clk
+            dut.rst = 0
+            wait 1 cycle on dst_clk
+
+            assert dut.data_out == 0
+                else fail("after reset: data_out=${dut.data_out}, expected 0")
+
+            // Sequential 0..15 through the 2-stage chain.
+            for v in 0 .. 16
+                dut.data_in = v
+                wait 2 cycles on dst_clk
+                assert dut.data_out == v
+                    else fail("v=${v}: data_out=${dut.data_out}")
+            end for
+            log(info, "PASS: 0..15 propagated through 2-stage gray sync")
+
+            // Reset mid-stream and verify clean restart.
+            dut.rst = 1
+            wait 1 cycle on dst_clk
+            dut.rst = 0
+            wait 1 cycle on dst_clk
+            assert dut.data_out == 0
+                else fail("after second reset: data_out=${dut.data_out}, expected 0")
+
+            dut.data_in = 5
+            wait 2 cycles on dst_clk
+            assert dut.data_out == 5
+                else fail("v=5 after reset: data_out=${dut.data_out}")
+            log(info, "PASS: clean restart after mid-stream reset")
+        end run
+    end scope sim
+end test PtrSyncTest
