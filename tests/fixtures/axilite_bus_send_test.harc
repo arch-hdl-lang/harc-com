@@ -1,0 +1,75 @@
+// AxiLiteRegs test using `bus.<channel>.send(...)` and
+// `bus.<channel>.recv()` for auto-generated valid/ready handshakes.
+// Scope B of bus typing: drivers no longer hand-code the v/r dance —
+// the compiler synthesizes it from the `handshake_channel` payload
+// signature.
+//
+// Compare with axilite_bus_test.harc (Scope A): same DUT, same
+// behavior, but the test body shrinks from ~25 lines of explicit
+// signal drives down to a handful of `axil.aw.send` /
+// `axil.w.send` / `axil.r.recv` calls.
+
+use BusAxiLite
+
+test AxiLiteBusSendTest
+    let dut : AxiLiteRegs
+    let axil : BusAxiLite = bind dut
+
+    scope sim
+        run
+            // Reset.
+            dut.rst = 1
+            axil.aw.valid = 0
+            axil.w.valid = 0
+            axil.b.ready = 1
+            axil.ar.valid = 0
+            axil.r.ready = 1
+            dut.mm2s_done = 0
+            dut.mm2s_halted = 1
+            dut.mm2s_idle = 1
+            dut.s2mm_done = 0
+            dut.s2mm_halted = 1
+            dut.s2mm_idle = 1
+            dut.mm2s_sg_done = 0
+            dut.s2mm_sg_done = 0
+            dut.mm2s_sg_active = 0
+            dut.s2mm_sg_active = 0
+            wait 2 cycles
+            dut.rst = 0
+            wait 1 cycle
+
+            // Write 0xCAFEBABE to MM2S_SA (offset 0x18). Each `send` is
+            // a one-line auto-handshake: drive payload, raise valid,
+            // wait for ready (16-cycle budget), tick, drop valid.
+            //
+            // BusAxiLite's `aw` channel has payload (addr, prot); the
+            // `w` channel has (data, strb). Args map positionally.
+            // Note: this DUT was elaborated without `prot` — passing 0
+            // for it would lower to `dut->axil_aw_prot` which doesn't
+            // exist. So we still hand-drive the addr-only path; once
+            // we support payload sub-selection or DUT-introspection,
+            // the full `axil.aw.send(addr, prot)` shape will work.
+            //
+            // For now, demo `send` on the data channel where all
+            // payload signals exist on the DUT.
+            axil.aw.addr = 24
+            axil.aw.valid = 1
+            axil.w.send(3405691582, 15)        // data, strb
+            axil.aw.valid = 0
+            wait 2 cycles
+
+            // Read back through ar/r. AR has just (addr, prot) so
+            // again we drive `addr` directly, then use `recv` on the
+            // r channel to capture the data with auto-handshake.
+            axil.ar.addr = 24
+            axil.ar.valid = 1
+            let val = axil.r.recv()
+            axil.ar.valid = 0
+            wait 1 cycle
+
+            assert val == 3405691582
+                else fail("read got 0x${val:08x}, expected 0xCAFEBABE")
+            log(info, "PASS: bus.send/recv auto-handshake round-trip")
+        end run
+    end scope sim
+end test AxiLiteBusSendTest
