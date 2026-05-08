@@ -2156,6 +2156,18 @@ impl Emitter {
                 write!(self.out, " {s} ").ok();
                 self.emit_expr(rhs);
             }
+            ExprKind::Ternary { cond, then_branch, else_branch } => {
+                // Wrap in parens so the ternary doesn't bind into a
+                // surrounding higher-precedence operator on the C++
+                // side (e.g. `a + (cond ? x : y)` lowers correctly).
+                write!(self.out, "(").ok();
+                self.emit_expr(cond);
+                write!(self.out, " ? ").ok();
+                self.emit_expr(then_branch);
+                write!(self.out, " : ").ok();
+                self.emit_expr(else_branch);
+                write!(self.out, ")").ok();
+            }
             ExprKind::Paren(inner) => {
                 write!(self.out, "(").ok();
                 self.emit_expr(inner);

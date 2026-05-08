@@ -594,6 +594,10 @@ pub enum ExprKind {
     /// Assignment `lhs = rhs` (statement-level only — see Stmt::Assign).
     Unary { op: UnaryOp, expr: Expr },
     Binary { op: BinaryOp, lhs: Expr, rhs: Expr },
+    /// `cond ? then_branch : else_branch` — conditional (ternary) expression.
+    /// Right-associative; lower precedence than every other operator
+    /// except assignment (which isn't an expression in HARC).
+    Ternary { cond: Expr, then_branch: Expr, else_branch: Expr },
     /// SVA delay `##N expr` and `##[m:n] expr` — unary in expression position.
     HashHash { count: HashCount, expr: Expr },
     /// `e [*N]` / `e [*m:n]` — sequence repetition.
