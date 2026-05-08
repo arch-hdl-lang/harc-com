@@ -33,13 +33,17 @@ extend AxiLiteFuzzTest
             wait 1 cycle
 
             // ── 5 random write/read iterations on MM2S_SA ─────────────────
-            for i in 0 .. 5
-                let t : RegData
-                randomize(t)
+            // `RandomRegs(5)` is a `tseq` that returns a vector of
+            // randomized `RegData` values; iterate it with the
+            // sequence-form for-loop.
+            let txns = RandomRegs(5)
+            let i = 0
+            for t in txns
                 axil_write(dut, 24, t.value)
                 let got = axil_read(dut, 24)
                 logf("axi_master.log", info, "fuzz[${i}] wrote=0x${t.value:08x} got=0x${got:08x}")
                 assert got == t.value else fail("fuzz[${i}] mismatch: wrote ${t.value:08x} got ${got:08x}")
+                i = i + 1
             end for
 
             log(info, "PASS: 5 random round-trips on MM2S_SA")

@@ -1,0 +1,120 @@
+// AxiLiteRegs test using the v0 named-construct shape: a `driver`
+// component with `hookable` methods replaces the inline
+// `function axil_write` / `axil_read` helpers from
+// axilite_regs_test.harc, and a `tseq` generates the random stimulus.
+//
+// Lowering:
+//   driver D
+//     dut: T
+//     hookable f(args)  → free `[&]`-capturing lambda named `D_f`
+//   end driver D       → C++ struct `D` holding `T* dut;`
+//
+//   let drv : D
+//   drv.dut = dut       → struct field assignment
+//   drv.f(args)         → rewritten to D_f(drv, args)
+//
+// DUT lives at arch-com/tests/axi_dma/AxiLiteRegs.sv (PG021 register map).
+
+transaction AxilTxn
+    addr  : uint<8>  with [range(0, 64)]
+    value : uint<32>
+    !mode : uint<8>  default 0
+end transaction AxilTxn
+
+driver AxilDrv
+    dut : AxiLiteRegs
+
+    hookable axil_write(addr: uint<8>, data: uint<32>)
+        dut.axil_aw_addr = addr
+        dut.axil_aw_valid = 1
+        dut.axil_w_data = data
+        dut.axil_w_strb = 15
+        dut.axil_w_valid = 1
+        wait 10 cycles
+        dut.axil_aw_valid = 0
+        dut.axil_w_valid = 0
+        wait 2 cycles
+    end axil_write
+
+    hookable axil_read(addr: uint<8>) -> uint<32>
+        let val = 0
+        let saw = 0
+        dut.axil_ar_addr = addr
+        dut.axil_ar_valid = 1
+        for _ in 0 .. 10
+            wait 1 cycle
+            if dut.axil_r_valid
+                if saw == 0
+                    val = dut.axil_r_data
+                    dut.axil_ar_valid = 0
+                    saw = 1
+                end if
+            end if
+        end for
+        dut.axil_ar_valid = 0
+        wait 1 cycle
+        return val
+    end axil_read
+end driver AxilDrv
+
+// Stimulus: 5 random write/read pairs targeting MM2S_SA (offset 24).
+tseq RandomTxns(n: int) -> TSeq<AxilTxn>
+    for _ in 0 .. n
+        let t : AxilTxn
+        randomize(t)
+        t.addr = 24
+        yield t
+    end for
+end tseq RandomTxns
+
+test AxiLiteDriverTest
+    let dut : AxiLiteRegs
+    let drv : AxilDrv
+
+    scope sim
+        run
+            log(info, "AxiLiteRegs driver-named-construct test")
+
+            // Wire the driver's DUT field after default-construction.
+            drv.dut = dut
+
+            // Reset.
+            dut.rst = 1
+            dut.axil_aw_addr = 0
+            dut.axil_aw_valid = 0
+            dut.axil_w_data = 0
+            dut.axil_w_strb = 15
+            dut.axil_w_valid = 0
+            dut.axil_b_ready = 1
+            dut.axil_ar_addr = 0
+            dut.axil_ar_valid = 0
+            dut.axil_r_ready = 1
+            dut.mm2s_done = 0
+            dut.mm2s_halted = 1
+            dut.mm2s_idle = 1
+            dut.s2mm_done = 0
+            dut.s2mm_halted = 1
+            dut.s2mm_idle = 1
+            dut.mm2s_sg_done = 0
+            dut.s2mm_sg_done = 0
+            dut.mm2s_sg_active = 0
+            dut.s2mm_sg_active = 0
+            wait 2 cycles
+            dut.rst = 0
+            wait 1 cycle
+
+            let txns = RandomTxns(5)
+            let i = 0
+            for t in txns
+                drv.axil_write(t.addr, t.value)
+                let got = drv.axil_read(t.addr)
+                logf("axi_master.log", info, "drv[${i}] addr=0x${t.addr:02x} wrote=0x${t.value:08x} got=0x${got:08x}")
+                assert got == t.value
+                    else fail("drv[${i}] mismatch: wrote 0x${t.value:08x} got 0x${got:08x}")
+                i = i + 1
+            end for
+
+            log(info, "PASS: 5 driver round-trips through AxilDrv methods")
+        end run
+    end scope sim
+end test AxiLiteDriverTest

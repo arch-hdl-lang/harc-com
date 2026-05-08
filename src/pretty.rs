@@ -347,6 +347,10 @@ fn print_component_item(out: &mut String, it: &ComponentItem, depth: usize) {
             pad(out, depth);
             write!(out, "hookable {}", h.name.name).ok();
             print_paren_params(out, &h.params);
+            if let Some(rt) = &h.return_ty {
+                write!(out, " -> ").ok();
+                print_type(out, rt);
+            }
             writeln!(out).ok();
             print_block_inner(out, &h.body, depth + 1);
             pad(out, depth);

@@ -79,6 +79,14 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
         _ => None,
     }).collect();
 
+    // Collect `tseq` declarations — same hoisting strategy as functions,
+    // emitted as `std::function`-shaped lambdas returning `std::vector<T>`
+    // built up via `yield`.
+    let tseqs: Vec<&TseqDecl> = file.items.iter().filter_map(|it| match it {
+        Item::Tseq(t) => Some(t),
+        _ => None,
+    }).collect();
+
     // Index `domain Foo freq_mhz: N end domain Foo` decls so a `clock X =
     // Foo` reference can resolve N to a wall-clock period (1/N µs → ps).
     let mut domains: std::collections::HashMap<String, i64> =
@@ -150,6 +158,8 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
     let mut scoreboards = std::collections::HashSet::new();
     let mut monitors: std::collections::HashMap<String, ComponentDecl> =
         std::collections::HashMap::new();
+    let mut components: std::collections::HashMap<String, ComponentDecl> =
+        std::collections::HashMap::new();
     let mut covergroups: std::collections::HashMap<String, CovergroupDecl> =
         std::collections::HashMap::new();
     let mut txn_fields: std::collections::HashMap<String, Vec<TxnFieldInfo>> =
@@ -157,8 +167,14 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
     let mut enums = std::collections::HashMap::new();
     for it in &file.items {
         match it {
-            Item::Scoreboard(c) => { scoreboards.insert(c.name.name.clone()); }
+            Item::Scoreboard(c) => {
+                scoreboards.insert(c.name.name.clone());
+                components.insert(c.name.name.clone(), c.clone());
+            }
             Item::Monitor(c) => { monitors.insert(c.name.name.clone(), c.clone()); }
+            Item::Driver(c) | Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) => {
+                components.insert(c.name.name.clone(), c.clone());
+            }
             Item::Covergroup(g) => { covergroups.insert(g.name.name.clone(), g.clone()); }
             _ => {}
         }
@@ -214,6 +230,7 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
             if transactions.contains(simple)
                 || scoreboards.contains(simple)
                 || monitors.contains_key(simple)
+                || components.contains_key(simple)
                 || covergroups.contains_key(simple)
             {
                 continue;
@@ -240,6 +257,7 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
         transactions,
         scoreboards,
         monitors,
+        components,
         covergroups,
         txn_fields,
         enums,
@@ -249,6 +267,8 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
         field_subs: std::collections::HashMap::new(),
         covers: Vec::new(),
         clock_names: clocks.iter().map(|c| c.name.name.clone()).collect(),
+        current_yield_target: None,
+        tseq_names: tseqs.iter().map(|t| t.name.name.clone()).collect(),
     };
 
     // Header.
@@ -336,6 +356,21 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
     for it in &file.items {
         if let Item::Monitor(m) = it {
             e.emit_monitor_struct(m);
+        }
+    }
+
+    // ── Component structs (driver / agent / env / sequencer).
+    // Scoreboards have their own dedicated path above; the rest are
+    // plain field-bearing structs. `hookable` methods are emitted
+    // separately as free `[&]`-capturing lambdas (below) so the
+    // method body sees `dut` / `tick` / `_checkers` from the test scope.
+    for it in &file.items {
+        match it {
+            Item::Driver(c) | Item::Agent(c) | Item::Env(c)
+            | Item::Sequencer(c) => {
+                e.emit_component_struct(c);
+            }
+            _ => {}
         }
     }
 
@@ -512,6 +547,36 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
     if !funcs.is_empty() {
         writeln!(e.out, "").ok();
     }
+    // Tseqs lower to lambdas returning `std::vector<T>`; emitted alongside
+    // functions so the run-block can invoke them and consume the result.
+    for t in &tseqs {
+        e.emit_tseq(t, 1);
+    }
+    if !tseqs.is_empty() {
+        writeln!(e.out, "").ok();
+    }
+    // Hookable methods on driver / agent / env / sequencer / scoreboard
+    // become free `[&]`-capturing lambdas named `<Type>_<method>`. The
+    // method-call site rewrites `obj.method(args)` to
+    // `<Type>_<method>(obj, args)` so the body sees `tick` / `_checkers`
+    // / etc. from the test scope.
+    let mut emitted_any_method = false;
+    for it in &file.items {
+        let c = match it {
+            Item::Driver(c) | Item::Agent(c) | Item::Env(c)
+            | Item::Sequencer(c) | Item::Scoreboard(c) => c,
+            _ => continue,
+        };
+        for ci in &c.items {
+            if let ComponentItem::Hookable(h) = ci {
+                e.emit_component_method(c, h, 1);
+                emitted_any_method = true;
+            }
+        }
+    }
+    if emitted_any_method {
+        writeln!(e.out, "").ok();
+    }
 
     // Other lets get hoisted up front.
     for l in &other_lets {
@@ -660,6 +725,22 @@ struct Emitter {
     /// single-clock backward-compat. Used by `wait N cycles on <clock>`
     /// to look up the clock's index in the runtime `clocks_` vector.
     clock_names: Vec<String>,
+    /// Name of the C++ `std::vector` accumulator collecting `yield`-ed
+    /// values inside the current `tseq` body. `Some("_result")` while
+    /// emitting a tseq; `None` everywhere else (so a stray `yield`
+    /// outside a tseq surfaces as a compile error rather than silently
+    /// pushing into nothing).
+    current_yield_target: Option<String>,
+    /// Set of declared tseq names. Used by `let x = TseqName(...)` to
+    /// pick `auto` over `int64_t` for the local's type — a tseq call
+    /// returns `std::vector<T>`, not an integer.
+    tseq_names: std::collections::HashSet<String>,
+    /// Component declarations indexed by name. Covers `driver`,
+    /// `agent`, `env`, `sequencer`, `scoreboard` — anything with
+    /// fields + `hookable` methods. Scoreboards are also registered
+    /// here (in addition to the legacy `scoreboards` set) so method
+    /// dispatch and field-substitution work uniformly.
+    components: std::collections::HashMap<String, ComponentDecl>,
 }
 
 impl Emitter {
@@ -1093,6 +1174,207 @@ impl Emitter {
     /// scoreboard body would need event registration that's not in scope.
     /// Each field default-initialises (queues to empty, ints to 0). The
     /// user drives push/pop/etc. directly from test code.
+    /// If `callee` is a method call on a known component, return the
+    /// triple `(<component_type>, <self_expr>, <method>)` so the caller
+    /// can lower to `<component_type>_<method>(<self_expr>, args)`.
+    /// Returns `None` when the call is not a method-on-component (so the
+    /// generic plain-call path runs).
+    ///
+    /// Handles two shapes:
+    /// - `<var>.<method>` — `var` is a let-bound component instance.
+    /// - `<env>.<sub>.<method>` — `env` is a let-bound env-style
+    ///   component, `<sub>` is one of its sub-component fields, and
+    ///   `<method>` is a `hookable` on the sub-component's type.
+    fn resolve_component_method_call(&self, callee: &Expr) -> Option<(String, String, String)> {
+        let ExprKind::Field { target, name: method } = &*callee.kind else { return None; };
+        let comp_has_method = |c: &ComponentDecl, m: &str| -> bool {
+            c.items.iter().any(|it| matches!(
+                it, ComponentItem::Hookable(h) if h.name.name == m
+            ))
+        };
+
+        // <ident>.<method>
+        if let ExprKind::Ident(id) = &*target.kind {
+            let comp_ty = self.let_types.get(&id.name)?;
+            let comp = self.components.get(comp_ty)?;
+            if comp_has_method(comp, &method.name) {
+                return Some((comp_ty.clone(), id.name.clone(), method.name.clone()));
+            }
+            return None;
+        }
+
+        // <ident>.<sub>.<method>
+        if let ExprKind::Field { target: outer, name: sub } = &*target.kind {
+            let ExprKind::Ident(id) = &*outer.kind else { return None; };
+            let outer_ty = self.let_types.get(&id.name)?;
+            let outer_comp = self.components.get(outer_ty)?;
+            let sub_ty = outer_comp.items.iter().find_map(|it| {
+                if let ComponentItem::Field(f) = it {
+                    if f.name.name == sub.name {
+                        return type_simple_name(Some(&f.ty));
+                    }
+                }
+                None
+            })?;
+            let sub_comp = self.components.get(sub_ty)?;
+            if comp_has_method(sub_comp, &method.name) {
+                return Some((
+                    sub_ty.to_string(),
+                    format!("{}.{}", id.name, sub.name),
+                    method.name.clone(),
+                ));
+            }
+        }
+        None
+    }
+
+    /// Emit a single `hookable` method on a component as a free
+    /// `[&]`-capturing lambda named `<Type>_<method>`. The first
+    /// parameter is `<Type>& self`; subsequent parameters mirror the
+    /// HARC declaration. Inside the body, bare references to component
+    /// fields are rewritten to `self.<field>` via `field_subs`. DUT
+    /// pointer fields stay arrow-accessed: `self.dut->aw_addr = ...`.
+    fn emit_component_method(
+        &mut self,
+        c: &ComponentDecl,
+        h: &HookableMethod,
+        depth: usize,
+    ) {
+        let comp_ty = &c.name.name;
+        let m_name = &h.name.name;
+        let ret = h.return_ty.as_ref()
+            .map(c_type_for)
+            .unwrap_or_else(|| "void".to_string());
+        self.pad(depth);
+        write!(
+            self.out,
+            "auto {comp_ty}_{m_name} = [&]({comp_ty}& self"
+        ).ok();
+        // Track Named-typed params as pointers so dut.field rewrites
+        // properly in the body. Restore on exit.
+        let mut added: Vec<String> = Vec::new();
+        for p in &h.params {
+            let pty = p.ty.as_ref()
+                .map(c_type_for)
+                .unwrap_or_else(|| "int64_t".to_string());
+            write!(self.out, ", {pty} {}", p.name.name).ok();
+            if matches!(&p.ty, Some(TypeExpr::Named { .. })) {
+                if self.pointer_vars.insert(p.name.name.clone()) {
+                    added.push(p.name.name.clone());
+                }
+            }
+        }
+        writeln!(self.out, ") -> {ret} {{").ok();
+        // Build field-name substitution: bare `count` inside the body
+        // resolves to `self.count`. Dut-pointer fields also get a
+        // pointer_vars entry so `dut.field` lowers to `dut->field`.
+        let mut subs = std::collections::HashMap::new();
+        let mut added_pointer_fields: Vec<String> = Vec::new();
+        for ci in &c.items {
+            if let ComponentItem::Field(f) = ci {
+                subs.insert(f.name.name.clone(), format!("self.{}", f.name.name));
+                if self.is_dut_pointer_field_type(&f.ty) {
+                    if self.pointer_vars.insert(f.name.name.clone()) {
+                        added_pointer_fields.push(f.name.name.clone());
+                    }
+                }
+            }
+        }
+        let prev_subs = std::mem::replace(&mut self.field_subs, subs);
+        self.emit_block(&h.body, depth + 1);
+        // Restore state.
+        self.field_subs = prev_subs;
+        for k in added_pointer_fields { self.pointer_vars.remove(&k); }
+        for k in added { self.pointer_vars.remove(&k); }
+        self.pad(depth);
+        writeln!(self.out, "}};").ok();
+    }
+
+    /// Emit a `driver` / `agent` / `env` / `sequencer` body as a C++
+    /// struct. Field types are resolved through `component_field_c_type`,
+    /// which recognizes:
+    ///
+    /// - `event<T>` → `std::vector<std::function<void(T)>>`
+    /// - `queue<T>` → `HarcQueue<T>` (when scoreboards are also present)
+    /// - Named DUT module → `V<Name>*` pointer (the same shape the
+    ///   test-level `let dut : T` already uses)
+    /// - Named sub-component → that struct directly (for `env` composing
+    ///   `agent` / `driver` / etc. by-value)
+    /// - Builtins → uint64_t / int64_t / bool
+    ///
+    /// `hookable` methods are emitted separately as free `[&]`-capturing
+    /// lambdas (see `emit_component_methods`); the struct body holds
+    /// data only.
+    fn emit_component_struct(&mut self, c: &ComponentDecl) {
+        writeln!(self.out, "struct {} {{", c.name.name).ok();
+        for it in &c.items {
+            if let ComponentItem::Field(f) = it {
+                let cty = self.component_field_c_type(&f.ty);
+                let init = if let Some(d) = &f.default {
+                    format!(" = {}", format_simple_expr(d))
+                } else if matches!(&f.ty, TypeExpr::Named { .. })
+                          && self.is_dut_pointer_field_type(&f.ty)
+                {
+                    // Pointer fields default to nullptr — caller assigns
+                    // via `drv.dut = dut` after construction.
+                    " = nullptr".into()
+                } else {
+                    "".into()
+                };
+                writeln!(self.out, "{INDENT}{cty} {}{};", f.name.name, init).ok();
+            }
+        }
+        writeln!(self.out, "}};").ok();
+        writeln!(self.out, "").ok();
+    }
+
+    /// True if a Named-type field on a component refers to a DUT module
+    /// (i.e. nothing the codegen knows about other than that it's a
+    /// Verilator-compiled module type). Sub-components / scoreboards /
+    /// monitors / covergroups are excluded — they're held by-value.
+    fn is_dut_pointer_field_type(&self, t: &TypeExpr) -> bool {
+        if let Some(name) = type_simple_name(Some(t)) {
+            return !self.transactions.contains(name)
+                && !self.scoreboards.contains(name)
+                && !self.monitors.contains_key(name)
+                && !self.covergroups.contains_key(name)
+                && !self.components.contains_key(name)
+                && !self.enums.contains_key(name);
+        }
+        false
+    }
+
+    /// Field-type lowering for `driver`/`agent`/`env`/`sequencer` bodies.
+    fn component_field_c_type(&self, t: &TypeExpr) -> String {
+        match t {
+            TypeExpr::Builtin { name: BuiltinTy::Event, args, .. } => {
+                let inner = args.first().map(|a| match a {
+                    TypeArg::Type(ty) => txn_field_c_type(ty),
+                    _ => "uint64_t".into(),
+                }).unwrap_or_else(|| "uint64_t".into());
+                format!("std::vector<std::function<void({inner})>>")
+            }
+            TypeExpr::Builtin { name: BuiltinTy::Queue, args, .. } => {
+                let inner = args.first().map(|a| match a {
+                    TypeArg::Type(ty) => txn_field_c_type(ty),
+                    _ => "uint64_t".into(),
+                }).unwrap_or_else(|| "uint64_t".into());
+                format!("HarcQueue<{inner}>")
+            }
+            TypeExpr::Named { name, .. } => {
+                let last = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+                if self.is_dut_pointer_field_type(t) {
+                    // DUT module → Verilator pointer.
+                    format!("V{last}*")
+                } else {
+                    // Sub-component / scoreboard / transaction → by-value.
+                    last.to_string()
+                }
+            }
+            _ => txn_field_c_type(t),
+        }
+    }
+
     fn emit_scoreboard(&mut self, s: &ComponentDecl) {
         writeln!(self.out, "struct {} {{", s.name.name).ok();
         for it in &s.items {
@@ -1604,6 +1886,41 @@ impl Emitter {
     /// parameters are recognised as DUT pointers (`VName*`); their field
     /// access in the body uses `->`. Capture-all (`[&]`) so the body can
     /// still see `tick` and any test-level state.
+    /// Emit a `tseq` declaration as a `[&]`-capturing lambda that returns
+    /// a `std::vector<T>` filled in by `yield` statements. The inner type
+    /// `T` is the argument of `TSeq<T>` in the return-type slot.
+    fn emit_tseq(&mut self, t: &TseqDecl, depth: usize) {
+        // Inner type: pull T out of `TSeq<T>`. Default to `int64_t` if
+        // the user wrote a bare `tseq`-as-block without a return clause.
+        let inner = t.return_ty.as_ref()
+            .and_then(tseq_inner_type)
+            .unwrap_or_else(|| "int64_t".to_string());
+        self.pad(depth);
+        write!(self.out, "auto {} = [&](", t.name.name).ok();
+        let mut added: Vec<String> = Vec::new();
+        for (i, p) in t.params.iter().enumerate() {
+            if i > 0 { write!(self.out, ", ").ok(); }
+            let pty = p.ty.as_ref().map(c_type_for).unwrap_or("int64_t".to_string());
+            write!(self.out, "{pty} {}", p.name.name).ok();
+            if matches!(&p.ty, Some(TypeExpr::Named { .. })) {
+                if self.pointer_vars.insert(p.name.name.clone()) {
+                    added.push(p.name.name.clone());
+                }
+            }
+        }
+        writeln!(self.out, ") -> std::vector<{inner}> {{").ok();
+        self.pad(depth + 1);
+        writeln!(self.out, "std::vector<{inner}> _result;").ok();
+        let prev = self.current_yield_target.replace("_result".to_string());
+        self.emit_block(&t.body, depth + 1);
+        self.current_yield_target = prev;
+        self.pad(depth + 1);
+        writeln!(self.out, "return _result;").ok();
+        for k in added { self.pointer_vars.remove(&k); }
+        self.pad(depth);
+        writeln!(self.out, "}};").ok();
+    }
+
     fn emit_function(&mut self, f: &FunctionDecl, depth: usize) {
         self.pad(depth);
         let ret = f.return_ty.as_ref().map(c_type_for).unwrap_or("void".to_string());
@@ -1655,8 +1972,8 @@ impl Emitter {
             StmtKind::For(f) => {
                 self.pad(depth);
                 let var = &f.var.name;
-                // Expect `lo .. hi` range; bail otherwise for v0.
                 if let ExprKind::RangeLit { lo: Some(lo), hi: Some(hi) } = &*f.iter.kind {
+                    // `for i in lo .. hi` — emit as an indexed C++ for loop.
                     write!(self.out, "for (int64_t {var} = ").ok();
                     self.emit_expr(lo);
                     write!(self.out, "; {var} < ").ok();
@@ -1666,7 +1983,17 @@ impl Emitter {
                     self.pad(depth);
                     writeln!(self.out, "}}").ok();
                 } else {
-                    self.errors.push("for-iter must be a range `lo .. hi` in v0 cpp_tb".into());
+                    // `for x in <seq-expression>` — assume the rhs evaluates
+                    // to something C++ can range-iterate over (e.g. a
+                    // `std::vector<T>` returned by a `tseq`). The bound
+                    // variable is `auto&` so transactions don't get copied
+                    // on each iteration.
+                    write!(self.out, "for (auto& {var} : ").ok();
+                    self.emit_expr(&f.iter);
+                    writeln!(self.out, ") {{").ok();
+                    self.emit_block(&f.body, depth + 1);
+                    self.pad(depth);
+                    writeln!(self.out, "}}").ok();
                 }
             }
             StmtKind::Repeat(r) => {
@@ -1891,6 +2218,18 @@ impl Emitter {
                     writeln!(self.out, "return;").ok();
                 }
             }
+            StmtKind::Yield(e) => {
+                self.pad(depth);
+                if let Some(target) = self.current_yield_target.clone() {
+                    write!(self.out, "{target}.push_back(").ok();
+                    self.emit_expr(e);
+                    writeln!(self.out, ");").ok();
+                } else {
+                    self.errors.push(
+                        "`yield` outside a `tseq` body is not supported in v0 cpp_tb".into(),
+                    );
+                }
+            }
             StmtKind::Emit { name, args, .. } => {
                 // `emit e(v)` → call every subscriber. Bare-name lookup
                 // first checks field_subs (so `emit write_e(...)` inside a
@@ -2023,12 +2362,15 @@ impl Emitter {
         }
         self.pad(depth);
         if let Some(v) = &l.value {
-            // `int64_t` (rather than `auto`) so 32-bit DUT signals zero-
-            // extend on assignment into the local instead of going through
-            // a narrower `int` and sign-extending on later widening. v0
-            // assumes lets hold integer-shaped values; non-integer lets
-            // need an explicit `let x : <Type> = ...`.
-            write!(self.out, "int64_t {} = ", l.name.name).ok();
+            // Default to `int64_t` for integer-shaped lets so 32-bit
+            // DUT signals zero-extend on assignment (matters for the
+            // `assert got == expected` pattern when comparing widened
+            // C++ ints against narrow Verilator outputs). Switch to
+            // `auto` when the rhs is a call — function/tseq/method
+            // returns can be `std::vector<T>` or a transaction value,
+            // neither of which fit in int64_t.
+            let ty = if rhs_wants_auto(v, &self.tseq_names) { "auto" } else { "int64_t" };
+            write!(self.out, "{ty} {} = ", l.name.name).ok();
             self.emit_expr(v);
             writeln!(self.out, ";").ok();
         } else if let Some(t) = &l.ty {
@@ -2045,6 +2387,13 @@ impl Emitter {
                 if let Some(mon) = self.monitors.get(name).cloned() {
                     writeln!(self.out, "{name} {};", l.name.name).ok();
                     self.emit_monitor_handler_registrations(&mon, &l.name.name, depth);
+                    return;
+                }
+                if self.components.contains_key(name) {
+                    // driver / agent / env / sequencer → default-construct
+                    // the struct. The user assigns DUT pointers and other
+                    // field values explicitly afterward (`drv.dut = dut;`).
+                    writeln!(self.out, "{name} {};", l.name.name).ok();
                     return;
                 }
                 if let Some(g) = self.covergroups.get(name).cloned() {
@@ -2127,6 +2476,25 @@ impl Emitter {
                 write!(self.out, "]").ok();
             }
             ExprKind::Call { callee, args } => {
+                // Method-call rewrite: `obj.method(args)` where `obj`'s
+                // type is a known component with a `hookable method`
+                // lowers to `<Type>_method(obj, args)`. Falls through to
+                // the generic call shape when no method match is found,
+                // so plain free-function calls keep working.
+                if let Some((comp_ty, instance, method)) =
+                    self.resolve_component_method_call(callee)
+                {
+                    write!(self.out, "{comp_ty}_{method}({instance}").ok();
+                    for a in args.iter() {
+                        write!(self.out, ", ").ok();
+                        match a {
+                            CallArg::Expr(ex) => self.emit_expr(ex),
+                            CallArg::Named { value, .. } => self.emit_expr(value),
+                        }
+                    }
+                    write!(self.out, ")").ok();
+                    return;
+                }
                 self.emit_expr(callee);
                 write!(self.out, "(").ok();
                 for (i, a) in args.iter().enumerate() {
@@ -2322,6 +2690,40 @@ fn type_arg_width(args: &[TypeArg]) -> Option<u32> {
 /// Verilator side is determined by the DUT port type and we just shovel
 /// values through. Bool stays bool. Unknown named types emit the bare
 /// identifier (likely won't compile — surfaces the gap to the user).
+/// True when `let x = EXPR` should use `auto` rather than `int64_t`
+/// for the local's declared type. Picks `auto` whenever the rhs is a
+/// call (which can return `std::vector<T>` from a tseq, or a
+/// transaction by value from `queue<T>::pop()`, etc.) and falls back
+/// to `int64_t` for everything else (DUT signal reads, plain numeric
+/// expressions — `int64_t` zero-extends them safely for comparisons
+/// against int literals). The `tseq_names` arg is kept for future use
+/// but the current decision is broader than tseq alone.
+fn rhs_wants_auto(e: &Expr, _tseq_names: &std::collections::HashSet<String>) -> bool {
+    matches!(&*e.kind, ExprKind::Call { .. })
+}
+
+/// Extract `T` from `TSeq<T>`. Returns the C++ rendering of the inner
+/// type. The TSeq builtin always carries exactly one type-arg in
+/// well-formed source; if missing or malformed, returns `None` so the
+/// caller can fall back to a sentinel type (the user already wrote
+/// something well-formed in practice — this guards against synth from
+/// degenerate ASTs).
+fn tseq_inner_type(t: &TypeExpr) -> Option<String> {
+    if let TypeExpr::Builtin { name: BuiltinTy::TSeq, args, .. } = t {
+        if let Some(TypeArg::Type(inner)) = args.first() {
+            return Some(c_type_for(inner));
+        }
+        if let Some(TypeArg::Expr(e)) = args.first() {
+            // `TSeq<MyTxn>` parses as Expr(Ident) at the type level — if
+            // the path is a single identifier, treat it as a Named type.
+            if let ExprKind::Ident(id) = &*e.kind {
+                return Some(id.name.clone());
+            }
+        }
+    }
+    None
+}
+
 fn c_type_for(t: &TypeExpr) -> String {
     match t {
         TypeExpr::Builtin { name, .. } => match name {
