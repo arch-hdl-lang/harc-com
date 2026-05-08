@@ -163,6 +163,15 @@ end for
 
 A bare `wait N cycles` (§7.4) is the cleaner form when the loop body is *only* the wait. Use a real loop variable name (`for i in 0..N`) when the body actually consumes the index; use `_` when the body does not. Borrowed from Rust and Python.
 
+**Ternary `cond ? then : else`.** A C/SystemVerilog-style conditional expression. Right-associative; precedence is just above implication (`|->`, `|=>`) and below every other operator, so `a + b ? x : y` parses as `(a + b) ? x : y` and `a ? b : c ? d : e` parses as `a ? b : (c ? d : e)`. There is no `if`-as-expression in HARC; for value selection inside an expression context, use ternary.
+
+```
+let h = dut.alloc_resp_valid ? dut.alloc_resp_handle : 255
+let bound = i < hi ? i : hi - 1
+```
+
+Lowers to a parenthesized C++ ternary in the generated TB.
+
 ---
 
 ## 3. Type System Extensions

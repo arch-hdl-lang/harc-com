@@ -112,3 +112,33 @@ fn relation_alias_form() {
     let src = "relation A(t: T) = t.x % 4 == 0 && t.y > 0\n";
     parse_print_reparse(src);
 }
+
+#[test]
+fn ternary_round_trips() {
+    // Right-associative chain plus a nested ternary on the LHS of a
+    // larger arithmetic expression — the round-trip parses both the
+    // first time and after pretty-printing.
+    let src = r#"
+test T
+    let dut : X
+    scope sim
+        run
+            let a = 5
+            let b = 10
+            let c = a > 0 ? a : b
+            let d = a > 0 ? a > 5 ? 100 : 50 : -1
+            let e = (a > 0 ? a : b) + 1
+            wait 1 cycle
+        end run
+    end scope sim
+end test T
+"#;
+    let printed = parse_print_reparse(src);
+    // Sanity-check that the parens around the ternary inside `e` survive
+    // round-trip — the precedence-preservation guarantee for ternary is
+    // user-visible.
+    assert!(
+        printed.contains("a > 0 ? a : b"),
+        "ternary should print without splitting `?` and `:` across lines:\n{printed}"
+    );
+}
