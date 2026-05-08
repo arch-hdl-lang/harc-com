@@ -481,6 +481,34 @@ impl Parser {
         self.expect_ident()
     }
 
+    /// Accept any keyword or identifier as a covergroup bin name.
+    /// Bin names live inside a covergroup's own namespace and never
+    /// resolve to a regular identifier in expression context — so even
+    /// reserved tokens like `on`, `event`, `if`, etc. are safe to use
+    /// as bin labels. Numeric/string literals and punctuation are
+    /// rejected.
+    fn expect_bin_name(&mut self) -> Result<Ident, CompileError> {
+        let span = self.peek_span();
+        let tok = self.advance().ok_or(CompileError::UnexpectedEof)?;
+        let name = match &tok.kind {
+            TokenKind::Ident(s) => s.clone(),
+            other => {
+                let s = other.to_string();
+                let first = s.chars().next();
+                if matches!(first, Some(c) if c.is_alphabetic() || c == '_') {
+                    s
+                } else {
+                    return Err(CompileError::unexpected_token(
+                        "bin name",
+                        &s,
+                        span,
+                    ));
+                }
+            }
+        };
+        Ok(Ident { name, span })
+    }
+
     fn expect_ident_or_kw(&mut self) -> Result<Ident, CompileError> {
         // For attribute names, allow keywords-as-identifiers (e.g. `unique`, `dist`, `range`).
         let span = self.peek_span();
@@ -918,7 +946,12 @@ impl Parser {
             if self.check(TokenKind::Bins) {
                 self.advance();
                 while !self.check_end_keyword() {
-                    let bn = self.expect_ident()?;
+                    // Bin names live inside a covergroup namespace and never
+                    // appear as expression-position identifiers, so accept
+                    // any keyword (`on`, `event`, `state`, `default`, ...)
+                    // as a bin name verbatim — its source form becomes the
+                    // string identifier.
+                    let bn = self.expect_bin_name()?;
                     self.expect(TokenKind::Eq)?;
                     let spec = self.parse_expr()?;
                     let span = bn.span.merge(spec.span);
@@ -2044,6 +2077,17 @@ impl Parser {
                 let id = Ident { name: name.into(), span };
                 Ok(Expr::new(ExprKind::Ident(id), span))
             }
+            Some(TokenKind::Question) => Err(CompileError::unsupported_syntax(
+                "ternary `?:` operator is not supported",
+                "split into a separate `if cond ... else ... end if` statement; \
+                 HARC does not have ternary expressions",
+                span0,
+            )),
+            Some(TokenKind::Semi) => Err(CompileError::unsupported_syntax(
+                "`;` is not a statement separator",
+                "statements are separated by newlines; put each on its own line",
+                span0,
+            )),
             Some(other) => Err(CompileError::unexpected_token(
                 "expression",
                 &other.to_string(),
