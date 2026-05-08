@@ -95,3 +95,32 @@ jobs:
             fi
           done
           exit $fail
+
+  run-fixtures:
+    # End-to-end: build harc + Verilator-compile each vendored DUT +
+    # run the matching .harc fixture, asserting "ALL TESTS PASSED".
+    # This is what catches codegen regressions that parse-only CI misses.
+    name: harc sim fixtures
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Z3 + Verilator
+        run: sudo apt-get update && sudo apt-get install -y libz3-dev verilator
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build harc
+        run: cargo build --release --bin harc
+
+      - name: Run all fixtures end-to-end
+        run: ./tests/run_fixtures.sh
