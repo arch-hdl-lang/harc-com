@@ -263,6 +263,7 @@ impl Parser {
             Some(TokenKind::Module) => self.parse_external_module(doc).map(Item::ExternalModule),
             Some(TokenKind::Function) => self.parse_function(doc).map(Item::Function),
             Some(TokenKind::Apply) => self.parse_apply().map(Item::Apply),
+            Some(TokenKind::Bus) => self.parse_bus(doc).map(Item::Bus),
             Some(other) => Err(CompileError::unexpected_token(
                 "use, package, const, struct, enum, transaction, relation, tseq, agent, driver, monitor, env, scoreboard, sequencer, test, extend, covergroup, property, pseq, cover sequence, module, function, or apply",
                 &other.to_string(),
@@ -1019,6 +1020,108 @@ impl Parser {
     }
 
     // ── External (Verilator-bound) module ─────────────────────────────────────
+
+    /// Parse a `bus Name ... end bus Name` declaration. v0 surface:
+    /// plain signals (`name: in|out Type;`) and `handshake_channel`
+    /// groupings (`handshake_channel ch: send kind: valid_ready { ... }
+    /// end handshake_channel ch`). Bus parameters,
+    /// `credit_channel`, and `tlm_method` blocks are explicitly out
+    /// of scope for v0 — those will need their own follow-up PRs.
+    fn parse_bus(&mut self, doc: Option<String>) -> Result<BusDecl, CompileError> {
+        let start = self.expect(TokenKind::Bus)?.span;
+        let name = self.expect_ident()?;
+        let mut signals = Vec::new();
+        let mut handshakes = Vec::new();
+        while !self.check_end_keyword() {
+            // `param NAME: const = default;` — bus-level parameter.
+            // Parsed but ignored at the AST level for v0; the stdlib
+            // bus types (BusAxiLite, BusApb, BusAxiStream) all ship
+            // with these and we want extern-import to succeed.
+            if self.check(TokenKind::Param) {
+                self.advance();
+                self.expect_ident()?;          // param name
+                self.expect(TokenKind::Colon)?;
+                if self.check(TokenKind::Const) { self.advance(); }
+                else if self.check(TokenKind::Type) { self.advance(); }
+                if self.check(TokenKind::Eq) {
+                    self.advance();
+                    let _default = self.parse_expr()?;
+                }
+                if self.check(TokenKind::Semi) { self.advance(); }
+                continue;
+            }
+            // `handshake_channel <name>: send|receive kind: <variant>`.
+            if self.check_ident("handshake_channel") {
+                self.advance();
+                let h_name = self.expect_ident()?;
+                self.expect(TokenKind::Colon)?;
+                let role = if self.check_ident("send") {
+                    self.advance(); HandshakeRole::Send
+                } else if self.check_ident("receive") {
+                    self.advance(); HandshakeRole::Receive
+                } else {
+                    return Err(CompileError::unexpected_token(
+                        "`send` or `receive`",
+                        &self.peek_kind().map(|k| k.to_string()).unwrap_or_default(),
+                        self.peek_span(),
+                    ));
+                };
+                // `kind: <variant>` per arch §19.2. `kind` is a
+                // reserved HARC keyword (token), not a soft ident, so
+                // match the token directly.
+                if self.check(TokenKind::Kind) {
+                    self.advance();
+                    self.expect(TokenKind::Colon)?;
+                }
+                let variant = self.expect_ident()?;
+                let mut payload = Vec::new();
+                while !self.check_end_keyword() {
+                    let s_name = self.expect_ident()?;
+                    self.expect(TokenKind::Colon)?;
+                    let ty = self.parse_type_expr()?;
+                    if self.check(TokenKind::Semi) { self.advance(); }
+                    let span = s_name.span.merge(ty.span());
+                    payload.push(BusSignal {
+                        name: s_name,
+                        direction: Direction::Out,  // role flips at lower-time
+                        ty,
+                        span,
+                    });
+                }
+                self.expect(TokenKind::End)?;
+                if self.check_ident("handshake_channel") { self.advance(); }
+                if self.check_ident(&h_name.name) { self.advance(); }
+                let span = h_name.span;
+                handshakes.push(HandshakeChannel {
+                    name: h_name, role, variant, payload, span,
+                });
+                continue;
+            }
+            // Plain signal: `name: in|out Type;`
+            let s_name = self.expect_ident()?;
+            self.expect(TokenKind::Colon)?;
+            let direction = if self.check_ident("in") {
+                self.advance(); Direction::In
+            } else if self.check_ident("out") {
+                self.advance(); Direction::Out
+            } else {
+                return Err(CompileError::unexpected_token(
+                    "`in` or `out`",
+                    &self.peek_kind().map(|k| k.to_string()).unwrap_or_default(),
+                    self.peek_span(),
+                ));
+            };
+            let ty = self.parse_type_expr()?;
+            if self.check(TokenKind::Semi) { self.advance(); }
+            let span = s_name.span.merge(ty.span());
+            signals.push(BusSignal { name: s_name, direction, ty, span });
+        }
+        let end = self.expect_end(TokenKind::Bus, &name.name)?;
+        Ok(BusDecl {
+            name, params: Vec::new(), signals, handshakes,
+            span: start.merge(end), doc,
+        })
+    }
 
     fn parse_external_module(&mut self, doc: Option<String>) -> Result<ExternalModuleDecl, CompileError> {
         let start = self.expect(TokenKind::Module)?.span;

@@ -162,6 +162,8 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
         std::collections::HashMap::new();
     let mut covergroups: std::collections::HashMap<String, CovergroupDecl> =
         std::collections::HashMap::new();
+    let mut buses: std::collections::HashMap<String, BusDecl> =
+        std::collections::HashMap::new();
     let mut txn_fields: std::collections::HashMap<String, Vec<TxnFieldInfo>> =
         std::collections::HashMap::new();
     let mut enums = std::collections::HashMap::new();
@@ -176,6 +178,7 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
                 components.insert(c.name.name.clone(), c.clone());
             }
             Item::Covergroup(g) => { covergroups.insert(g.name.name.clone(), g.clone()); }
+            Item::Bus(b) => { buses.insert(b.name.name.clone(), b.clone()); }
             _ => {}
         }
     }
@@ -232,6 +235,7 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
                 || monitors.contains_key(simple)
                 || components.contains_key(simple)
                 || covergroups.contains_key(simple)
+                || buses.contains_key(simple)
             {
                 continue;
             }
@@ -269,6 +273,8 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
         clock_names: clocks.iter().map(|c| c.name.name.clone()).collect(),
         current_yield_target: None,
         tseq_names: tseqs.iter().map(|t| t.name.name.clone()).collect(),
+        buses,
+        bus_bindings: std::collections::HashMap::new(),
     };
 
     // Header.
@@ -757,6 +763,17 @@ struct Emitter {
     /// here (in addition to the legacy `scoreboards` set) so method
     /// dispatch and field-substitution work uniformly.
     components: std::collections::HashMap<String, ComponentDecl>,
+    /// Bus declarations indexed by name. Populated from inline
+    /// `bus Name { ... }` items + (future) `use Name` extern import.
+    /// Consulted at let-time for `let var : BusName = bind <dut-expr>`
+    /// to track the bus binding, and at expression-emit time for
+    /// `var.signal` and `var.channel.signal` flat-naming.
+    buses: std::collections::HashMap<String, BusDecl>,
+    /// Active bus bindings in the current emit context. Each entry
+    /// maps a let-bound variable name to `(bus_decl, dut_root_expr)`
+    /// — the bus type and the C++ expression text of the DUT root
+    /// (typically `dut`). Used by the field-access lowerer.
+    bus_bindings: std::collections::HashMap<String, (BusDecl, String)>,
 }
 
 impl Emitter {
@@ -1233,6 +1250,83 @@ impl Emitter {
     /// scoreboard body would need event registration that's not in scope.
     /// Each field default-initialises (queues to empty, ints to 0). The
     /// user drives push/pop/etc. directly from test code.
+    /// Resolve a bus-bound field access. Returns `Some(c++_string)`
+    /// when `target.name` (or `target.ch.name`) names a signal under
+    /// a known bus binding; `None` otherwise (caller falls back to
+    /// generic field-access lowering).
+    ///
+    /// Naming convention mirrors arch-com §19.6: each plain bus
+    /// signal flattens to `<binding>_<signal>` on the DUT pointer,
+    /// each handshake_channel signal flattens to
+    /// `<binding>_<channel>_<signal>` (and the implicit `valid` /
+    /// `ready` signals flatten the same way).
+    fn try_emit_bus_field_access(&mut self, target: &Expr, name: &Ident) -> Option<String> {
+        // <binding>.<signal>
+        if let ExprKind::Ident(id) = &*target.kind {
+            if let Some((bus, root)) = self.bus_bindings.get(&id.name).cloned() {
+                if bus.signals.iter().any(|s| s.name.name == name.name) {
+                    return Some(format!("{root}->{}_{}", id.name, name.name));
+                }
+                // Already-flattened `<chan>_<sig>` form (or `<chan>_valid`
+                // / `<chan>_ready`).
+                for h in &bus.handshakes {
+                    let prefix = format!("{}_", h.name.name);
+                    if name.name.starts_with(&prefix) {
+                        let tail = &name.name[prefix.len()..];
+                        if tail == "valid" || tail == "ready"
+                            || h.payload.iter().any(|s| s.name.name == tail)
+                        {
+                            return Some(format!("{root}->{}_{}", id.name, name.name));
+                        }
+                    }
+                }
+                // Channel-name itself (used as a leaf in the two-level
+                // form `bus.ch.sig`) — defer to the field-access path.
+                if bus.handshakes.iter().any(|h| h.name.name == name.name) {
+                    return None;
+                }
+                self.errors.push(format!(
+                    "bus `{}` (binding `{}`) has no signal or channel named `{}`",
+                    bus.name.name, id.name, name.name,
+                ));
+                return Some(format!("/* unresolved: {}.{} */ 0", id.name, name.name));
+            }
+        }
+        // <binding>.<channel>.<signal>
+        if let ExprKind::Field { target: outer, name: ch } = &*target.kind {
+            if let ExprKind::Ident(id) = &*outer.kind {
+                if let Some((bus, root)) = self.bus_bindings.get(&id.name).cloned() {
+                    if let Some(h) = bus.handshakes.iter().find(|h| h.name.name == ch.name) {
+                        if name.name == "valid" || name.name == "ready"
+                            || h.payload.iter().any(|s| s.name.name == name.name)
+                        {
+                            return Some(format!(
+                                "{root}->{}_{}_{}",
+                                id.name, ch.name, name.name,
+                            ));
+                        }
+                        let valid_options: Vec<&str> = std::iter::once("valid")
+                            .chain(std::iter::once("ready"))
+                            .chain(h.payload.iter().map(|s| s.name.name.as_str()))
+                            .collect();
+                        self.errors.push(format!(
+                            "bus `{}` channel `{}` has no signal `{}` (valid: {})",
+                            bus.name.name, ch.name, name.name,
+                            valid_options.join(", "),
+                        ));
+                        return Some(format!("/* unresolved: {}.{}.{} */ 0", id.name, ch.name, name.name));
+                    }
+                    self.errors.push(format!(
+                        "bus `{}` (binding `{}`) has no channel `{}`",
+                        bus.name.name, id.name, ch.name,
+                    ));
+                    return Some(format!("/* unresolved: {}.{}.{} */ 0", id.name, ch.name, name.name));
+                }
+            }
+        }
+        None
+    }
+
     /// If `event` is the trigger of an `on obj.method pre/post`
     /// handler, resolve `obj.method` to a known hookable on a known
     /// component type. Returns `(component_type_name, method_name,
@@ -2587,6 +2681,25 @@ impl Emitter {
         if let Some(s) = type_simple_name(l.ty.as_ref()) {
             self.let_types.insert(l.name.name.clone(), s.to_string());
         }
+        // Bus binding: `let axil : BusAxiLite = bind dut`. Track the
+        // (bus, dut-root) pair so subsequent `axil.signal` accesses
+        // can lower to flat DUT signals (`dut->axil_signal`). The
+        // binding itself emits no C++ — it's purely a typing
+        // assertion and a name-prefix declaration.
+        if let Some(simple) = type_simple_name(l.ty.as_ref()) {
+            if let Some(bus) = self.buses.get(simple).cloned() {
+                if let Some(v) = &l.value {
+                    // Capture the bind expression as a string. For the
+                    // common case of `bind dut`, that's just "dut".
+                    let mut buf = String::new();
+                    std::mem::swap(&mut self.out, &mut buf);
+                    self.emit_expr(v);
+                    std::mem::swap(&mut self.out, &mut buf);
+                    self.bus_bindings.insert(l.name.name.clone(), (bus, buf));
+                    return;
+                }
+            }
+        }
         // Skip the `let dut : T` decl — already emitted at main() prelude.
         if l.name.name == "dut" {
             return;
@@ -2745,6 +2858,16 @@ impl Emitter {
             }
             ExprKind::ImplicitSelf => {}
             ExprKind::Field { target, name } => {
+                // Bus-bound binding lowering. If `target` is an Ident
+                // bound to a bus (`let axil : BusAxiLite = bind dut`),
+                // resolve `axil.signal` to `<root>-><axil>_<signal>`.
+                // Two-level form (`axil.aw.addr`) walks into the bus's
+                // handshake_channel groupings and emits
+                // `<root>-><axil>_aw_addr`.
+                if let Some(s) = self.try_emit_bus_field_access(target, name) {
+                    write!(self.out, "{s}").ok();
+                    return;
+                }
                 // Pointer-typed identifiers (DUTs, threaded as Named-type
                 // params) use `->`. Everything else uses `.`. Tracked in
                 // `pointer_vars` — populated from `let x : <NamedType>` and

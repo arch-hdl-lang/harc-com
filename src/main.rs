@@ -97,6 +97,103 @@ fn main() -> Result<()> {
     }
 }
 
+/// Resolve `use Name;` items in the parsed test files against a small
+/// set of search paths and return any extra parsed `SourceFile`s
+/// containing the imported items (currently `bus` decls). Search
+/// order:
+///
+/// 1. `$HARC_LIB_PATH` (colon-separated, like `PATH`).
+/// 2. The repo's own `stdlib/` directory (relative to the first
+///    input file, then to the working directory).
+/// 3. Sibling `../arch-com/stdlib/` and `../arch-com/examples/`
+///    (relative to the input file's directory).
+///
+/// Each resolved file is parsed; only `Item::Bus` items survive (the
+/// rest are dropped — HARC isn't a full ARCH compiler). Unresolved
+/// `use` paths silently no-op so existing fixtures with
+/// `use arc.stdlib.BusAxi4` lines that don't yet match anything keep
+/// parsing.
+fn resolve_use_imports(
+    files: &[harc::ast::SourceFile],
+    first_input: Option<&PathBuf>,
+) -> Vec<harc::ast::SourceFile> {
+    use harc::ast::Item;
+
+    let mut wanted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for f in files {
+        for it in &f.items {
+            if let Item::Use(u) = it {
+                if let Some(last) = u.path.segments.last() {
+                    wanted.insert(last.name.clone());
+                }
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+
+    // Build search-path list.
+    let mut search: Vec<PathBuf> = Vec::new();
+    if let Ok(envp) = std::env::var("HARC_LIB_PATH") {
+        for p in envp.split(':') {
+            if !p.is_empty() { search.push(PathBuf::from(p)); }
+        }
+    }
+    let input_dir = first_input
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    search.push(input_dir.join("stdlib"));
+    search.push(PathBuf::from("stdlib"));
+    search.push(input_dir.join("../arch-com/stdlib"));
+    search.push(input_dir.join("../arch-com/examples"));
+    search.push(PathBuf::from("../arch-com/stdlib"));
+    search.push(PathBuf::from("../arch-com/examples"));
+
+    let mut imported: Vec<harc::ast::SourceFile> = Vec::new();
+    let mut already: std::collections::HashSet<String> = files.iter()
+        .flat_map(|f| f.items.iter().filter_map(|it| match it {
+            Item::Bus(b) => Some(b.name.name.clone()),
+            _ => None,
+        }))
+        .collect();
+
+    for name in &wanted {
+        if already.contains(name) { continue; }
+        let mut found_path: Option<PathBuf> = None;
+        for dir in &search {
+            for ext in &["arch", "harc"] {
+                let candidate = dir.join(format!("{name}.{ext}"));
+                if candidate.exists() { found_path = Some(candidate); break; }
+            }
+            if found_path.is_some() { break; }
+        }
+        let Some(path) = found_path else { continue; };
+
+        let src = match fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let parsed = match harc::parser::parse_source(&src) {
+            Ok(p) => p,
+            Err(_) => continue,  // skip files we can't parse
+        };
+        let bus_only: Vec<Item> = parsed.items.into_iter()
+            .filter(|it| matches!(it, Item::Bus(_)))
+            .collect();
+        if !bus_only.is_empty() {
+            for it in &bus_only {
+                if let Item::Bus(b) = it { already.insert(b.name.name.clone()); }
+            }
+            imported.push(harc::ast::SourceFile {
+                items: bus_only,
+                inner_doc: None,
+            });
+        }
+    }
+    imported
+}
+
 fn parse_file(path: &PathBuf) -> Result<harc::ast::SourceFile> {
     let src = fs::read_to_string(path).into_diagnostic()?;
     harc::parser::parse_source(&src).map_err(|e| {
@@ -245,7 +342,18 @@ fn cmd_sim(
     for f in &files {
         parsed_files.push(parse_file(f)?);
     }
-    let merged = harc::codegen::merge::merge_for_sim(&parsed_files, test.as_deref())
+    // Resolve `use Name` declarations against the search path. For each
+    // unresolved `use`, look for `<Name>.arch` (or `<Name>.harc`) in
+    // a small set of conventional locations, parse it, and append any
+    // `bus` items it declares to the synthetic file list. Unresolved
+    // uses silently no-op (back-compat — many existing fixtures
+    // include `use arc.stdlib.X` lines that don't resolve to anything
+    // yet).
+    let extra_files = resolve_use_imports(&parsed_files, files.first());
+    let mut all_files = parsed_files;
+    all_files.extend(extra_files);
+
+    let merged = harc::codegen::merge::merge_for_sim(&all_files, test.as_deref())
         .map_err(|e| miette::miette!("{}", e))?;
 
     let cpp = harc::codegen::cpp_tb::emit(&merged)

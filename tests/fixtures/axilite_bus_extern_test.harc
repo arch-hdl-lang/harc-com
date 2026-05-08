@@ -1,0 +1,89 @@
+// AxiLiteRegs test using `use BusAxiLite;` to extern-import the bus
+// declaration from arch-com's stdlib (or any local search path).
+// Demonstrates Scope A's "real" use case: HARC tests don't redeclare
+// bus types — they pick them up from the arch source of truth.
+//
+// Search path used by `harc sim`:
+//   $HARC_LIB_PATH (colon-separated)
+//   <input>/stdlib/, ./stdlib/
+//   ../arch-com/stdlib/, ../arch-com/examples/
+//
+// With harc-com checked out next to arch-com, `use BusAxiLite;`
+// resolves to `arch-com/stdlib/BusAxiLite.arch`.
+
+use BusAxiLite
+
+test AxiLiteBusExternTest
+    let dut : AxiLiteRegs
+
+    // BusAxiLite (from arch-com/stdlib) declares 5 channels:
+    // aw / w / b / ar / r — each a handshake_channel with the AXI-Lite
+    // payload signals. The binding name `axil` is the prefix on
+    // `dut`'s flat signals (matches arch-com's port naming).
+    let axil : BusAxiLite = bind dut
+
+    scope sim
+        run
+            // Reset.
+            dut.rst = 1
+            axil.aw.valid = 0
+            axil.w.valid = 0
+            axil.b.ready = 1
+            axil.ar.valid = 0
+            axil.r.ready = 1
+            dut.mm2s_done = 0
+            dut.mm2s_halted = 1
+            dut.mm2s_idle = 1
+            dut.s2mm_done = 0
+            dut.s2mm_halted = 1
+            dut.s2mm_idle = 1
+            dut.mm2s_sg_done = 0
+            dut.s2mm_sg_done = 0
+            dut.mm2s_sg_active = 0
+            dut.s2mm_sg_active = 0
+            wait 2 cycles
+            dut.rst = 0
+            wait 1 cycle
+
+            // Write 0xDEADBEEF to MM2S_SA (offset 0x18). NOTE: arch's
+            // BusAxiLite includes `prot` signals per the AXI4-Lite
+            // spec, but the DUT (AxiLiteRegs) was elaborated without
+            // them — common when the implementation doesn't need
+            // protection bits. Driving `axil.aw.prot` would lower to
+            // `dut->axil_aw_prot`, which doesn't exist; skip it. A
+            // future enhancement would introspect Verilator's
+            // generated DUT to flag missing-on-DUT signals.
+            axil.aw.addr = 24
+            axil.aw.valid = 1
+            axil.w.data = 3735928559
+            axil.w.strb = 15
+            axil.w.valid = 1
+            wait 10 cycles
+            axil.aw.valid = 0
+            axil.w.valid = 0
+            wait 2 cycles
+
+            // Read it back.
+            let val = 0
+            let saw = 0
+            axil.ar.addr = 24
+            axil.ar.valid = 1
+            for _ in 0 .. 10
+                wait 1 cycle
+                if axil.r.valid
+                    if saw == 0
+                        val = axil.r.data
+                        axil.ar.valid = 0
+                        saw = 1
+                    end if
+                end if
+            end for
+            axil.ar.valid = 0
+            wait 1 cycle
+
+            assert val == 3735928559
+                else fail("read got 0x${val:08x}, expected 0xDEADBEEF")
+            log(info, "PASS: BusAxiLite (extern-imported) round-trip")
+        end run
+    end scope sim
+end test AxiLiteBusExternTest
