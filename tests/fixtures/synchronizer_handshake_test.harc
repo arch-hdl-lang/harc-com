@@ -1,0 +1,72 @@
+// HARC TB for arch-com/examples/synchronizer_handshake.arch — req/ack
+// handshake synchronizer crossing SrcDomain (100 MHz) → DstDomain (250 MHz).
+// Source latches data and toggles req when input changes; ack syncs back
+// to release the next transfer. Mirrors
+// arch-com/examples/synchronizer_handshake_tb.cpp.
+
+domain SrcDomain
+  freq_mhz: 100
+end domain SrcDomain
+
+domain DstDomain
+  freq_mhz: 250
+end domain DstDomain
+
+test BusSyncTest
+    let dut : BusSync
+
+    clock src_clk = SrcDomain    // 100 MHz — primary
+    clock dst_clk = DstDomain    // 250 MHz
+
+    scope sim
+        run
+            // Reset.
+            dut.rst = 1
+            dut.data_in = 0
+            wait 1 cycle
+            dut.rst = 0
+
+            // ── Test 1: single transfer ────────────────────────────────
+            // Source captures data + toggles req: 1 src cycle.
+            // req syncs to dst: 2 dst cycles.
+            // ack syncs back to src: 2 src cycles.
+            // Total bound ~5 src cycles; give 10 for slack.
+            dut.data_in = 3735928559        // 0xDEADBEEF
+            wait 10 cycles
+            assert dut.data_out == 3735928559
+                else fail("test 1: data_out=${dut.data_out:08x}, expected 0xDEADBEEF")
+            log(info, "PASS: 0xDEADBEEF transferred through handshake sync")
+
+            // ── Test 2: a sequence of values ───────────────────────────
+            dut.data_in = 305419896          // 0x12345678
+            wait 10 cycles
+            assert dut.data_out == 305419896
+                else fail("test 2[0]: data_out=${dut.data_out:08x}, expected 0x12345678")
+
+            dut.data_in = 3405691582         // 0xCAFEBABE
+            wait 10 cycles
+            assert dut.data_out == 3405691582
+                else fail("test 2[1]: data_out=${dut.data_out:08x}, expected 0xCAFEBABE")
+
+            dut.data_in = 1
+            wait 10 cycles
+            assert dut.data_out == 1
+                else fail("test 2[2]: data_out=${dut.data_out:08x}, expected 1")
+
+            dut.data_in = 4294967295         // 0xFFFFFFFF
+            wait 10 cycles
+            assert dut.data_out == 4294967295
+                else fail("test 2[3]: data_out=${dut.data_out:08x}, expected 0xFFFFFFFF")
+
+            log(info, "PASS: 4 sequential values transferred correctly")
+
+            // ── Test 3: reset clears data_reg ──────────────────────────
+            dut.rst = 1
+            wait 1 cycle
+            dut.rst = 0
+            assert dut.data_out == 0
+                else fail("after reset: data_out=${dut.data_out:08x}, expected 0")
+            log(info, "PASS: reset clears state")
+        end run
+    end scope sim
+end test BusSyncTest

@@ -1,0 +1,64 @@
+// HARC TB for arch-com/examples/fsm_counter.arch — small FSM with a
+// datapath counter. States: IDLE → COUNTING → DONE → IDLE. The
+// COUNTING state increments `cnt_r` each cycle until it equals `tgt_r`,
+// then transitions to DONE for one cycle. Mirrors
+// arch-com/examples/fsm_counter_tb.cpp.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+// Helper: run the FSM with a target and wait for done (with a small
+// budget). Asserts the final count matches the expected pattern.
+function run_count(dut: FsmCounter, target: uint<8>, expected_count: uint<8>)
+    dut.go = 1
+    dut.target = target
+    wait 1 cycle               // IDLE → COUNTING (with cnt_r=0, tgt_r=target)
+    dut.go = 0
+
+    let _w = 0
+    while !dut.done && _w < 20
+        wait 1 cycle
+        _w = _w + 1
+    end while
+    assert dut.done
+        else fail("done never asserted within 20 cycles for target=${target}")
+    assert dut.count == expected_count
+        else fail("target=${target}: count=${dut.count} expected=${expected_count}")
+    wait 1 cycle               // DONE → IDLE
+    assert !dut.done
+        else fail("done should clear when FSM returns to IDLE")
+end function run_count
+
+test FsmCounterTest
+    let dut : FsmCounter
+
+    clock clk = SysDomain        // 100 MHz
+
+    scope sim
+        run
+            // Reset.
+            dut.rst = 1
+            dut.go = 0
+            dut.target = 0
+            wait 3 cycles
+            dut.rst = 0
+            wait 1 cycle
+
+            // Test 1: target=3 → expect done with count=4 (cnt_r races
+            // one cycle past tgt_r before the DONE transition latches).
+            run_count(dut, 3, 4)
+            log(info, "PASS: target=3 → count=4")
+
+            // Test 2: target=1 → count=2.
+            run_count(dut, 1, 2)
+            log(info, "PASS: target=1 → count=2")
+
+            // Test 3: target=0 — IDLE→COUNTING with cnt_r=0==tgt_r=0,
+            // so DONE asserts after exactly 1 counting cycle. cnt_r
+            // still increments during that cycle → count=1.
+            run_count(dut, 0, 1)
+            log(info, "PASS: target=0 → count=1 (immediate done)")
+        end run
+    end scope sim
+end test FsmCounterTest
