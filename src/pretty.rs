@@ -208,7 +208,7 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
             write!(out, "covergroup {}", g.name.name).ok();
             if let Some(c) = &g.clocking {
                 write!(out, " @(").ok();
-                print_expr(out, c);
+                print_clocking_expr(out, c);
                 write!(out, ")").ok();
             }
             writeln!(out).ok();
@@ -699,6 +699,23 @@ fn print_stmt(out: &mut String, s: &Stmt, depth: usize) {
             pad(out, depth);
             writeln!(out, "end loop").ok();
         }
+        StmtKind::While { cond, body, .. } => {
+            pad(out, depth);
+            write!(out, "while ").ok();
+            print_expr(out, cond);
+            writeln!(out).ok();
+            print_block_inner(out, body, depth + 1);
+            pad(out, depth);
+            writeln!(out, "end while").ok();
+        }
+        StmtKind::Break { .. } => {
+            pad(out, depth);
+            writeln!(out, "break").ok();
+        }
+        StmtKind::Continue { .. } => {
+            pad(out, depth);
+            writeln!(out, "continue").ok();
+        }
         StmtKind::If(i) => {
             pad(out, depth);
             write!(out, "if ").ok();
@@ -900,6 +917,25 @@ fn print_let(out: &mut String, l: &LetStmt, depth: usize) {
         print_expr(out, v);
     }
     writeln!(out).ok();
+}
+
+/// Pretty-print an expression appearing inside a clocking spec `@(...)`.
+/// `posedge`/`negedge` are parsed as `Call(<edge>, [arg])` for AST
+/// uniformity but must be rendered SVA-style (`posedge clk`, no parens
+/// on the arg) so `harc fmt` is idempotent.
+fn print_clocking_expr(out: &mut String, e: &Expr) {
+    if let ExprKind::Call { callee, args } = &*e.kind {
+        if let ExprKind::Ident(id) = &*callee.kind {
+            if (id.name == "posedge" || id.name == "negedge") && args.len() == 1 {
+                if let CallArg::Expr(inner) = &args[0] {
+                    write!(out, "{} ", id.name).ok();
+                    print_expr(out, inner);
+                    return;
+                }
+            }
+        }
+    }
+    print_expr(out, e);
 }
 
 pub fn print_expr(out: &mut String, e: &Expr) {
