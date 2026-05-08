@@ -43,6 +43,18 @@ pub enum CompileError {
         #[label("here")]
         span: SourceSpan,
     },
+
+    /// Construct that has a known-not-yet-supported analogue in HARC.
+    /// Use this instead of a generic `unexpected token` so the user
+    /// gets a one-line hint about the right shape.
+    #[error("{message}")]
+    #[diagnostic(help("{help}"))]
+    UnsupportedSyntax {
+        message: String,
+        help: String,
+        #[label("here")]
+        span: SourceSpan,
+    },
 }
 
 pub fn span_to_source_span(span: Span) -> SourceSpan {
@@ -77,6 +89,14 @@ impl CompileError {
     pub fn general(message: &str, span: Span) -> Self {
         CompileError::General {
             message: message.to_string(),
+            span: span_to_source_span(span),
+        }
+    }
+
+    pub fn unsupported_syntax(message: &str, help: &str, span: Span) -> Self {
+        CompileError::UnsupportedSyntax {
+            message: message.to_string(),
+            help: help.to_string(),
             span: span_to_source_span(span),
         }
     }
