@@ -983,27 +983,52 @@ impl Emitter {
         instance: &str,
         depth: usize,
     ) {
-        // Build field-name substitution map for the body.
+        self.emit_component_handler_registrations(mon, instance, depth, "_m_");
+    }
+
+    /// Generic on-handler registration for any component (monitor /
+    /// driver / agent / sequencer / scoreboard). Dispatches each
+    /// handler by the shape of its trigger expression:
+    ///
+    /// - `on event_field(arg) ... end on` (a `Call` expression) →
+    ///   register a `[&]`-capturing closure into the corresponding
+    ///   event vector. Used for drivers' `on req(t)`, sequencers'
+    ///   subscriptions, etc.
+    /// - `on <bool-expr> ... end on` (any other shape) → register a
+    ///   per-cycle checker closure with the requested edge mode
+    ///   (rising/falling/level). Used for monitors' `on dut.x && y`.
+    ///
+    /// `tag_prefix` distinguishes the static cycle-trigger state
+    /// across invocations so concurrent components at the same source
+    /// span don't collide. Inside both paths, body bare-references to
+    /// component fields rewrite to `<instance>.<field>` via
+    /// `field_subs`.
+    fn emit_component_handler_registrations(
+        &mut self,
+        comp: &ComponentDecl,
+        instance: &str,
+        depth: usize,
+        tag_prefix: &str,
+    ) {
+        // Build field-name substitution map for the body. Component
+        // fields visible by bare name inside the handler body get
+        // prefixed with the instance path.
         let mut subs = std::collections::HashMap::new();
         let mut local_event_types = Vec::new();
-        for it in &mon.items {
+        let mut event_field_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for it in &comp.items {
             if let ComponentItem::Field(f) = it {
                 subs.insert(f.name.name.clone(), format!("{instance}.{}", f.name.name));
-                // If field is event<T>, register its inner type so emit
-                // codegen inside the body can use it.
                 if let TypeExpr::Builtin { name: BuiltinTy::Event, args, .. } = &f.ty {
-                    let inner = args.first().map(|a| match a {
-                        TypeArg::Type(t) => txn_field_c_type(t),
-                        _ => "uint64_t".into(),
-                    }).unwrap_or_else(|| "uint64_t".into());
+                    event_field_names.insert(f.name.name.clone());
+                    let inner = self.payload_type_for_arg(args.first());
                     local_event_types.push((f.name.name.clone(), inner));
                 }
             }
         }
 
         let prev_subs = std::mem::replace(&mut self.field_subs, subs);
-        // Add monitor field event types to event_types, so `on field(arg)`
-        // inside the body resolves the arg type. Save/restore.
         let mut added_events = Vec::new();
         for (name, ty) in &local_event_types {
             if self.event_types.insert(name.clone(), ty.clone()).is_none() {
@@ -1011,13 +1036,31 @@ impl Emitter {
             }
         }
 
-        for it in &mon.items {
+        for it in &comp.items {
             if let ComponentItem::OnHandler(h) = it {
-                self.emit_cycle_trigger(h, depth, "_m_");
+                if let Some((event_name, arg_name)) =
+                    extract_event_subscription(&h.event)
+                {
+                    if event_field_names.contains(&event_name) {
+                        // Subscriber to a component event field.
+                        let arg_ty = self.event_types.get(&event_name).cloned()
+                            .unwrap_or_else(|| "int64_t".into());
+                        self.pad(depth);
+                        writeln!(
+                            self.out,
+                            "{instance}.{event_name}.push_back([&]({arg_ty} {arg_name}) {{",
+                        ).ok();
+                        self.emit_block(&h.body, depth + 1);
+                        self.pad(depth);
+                        writeln!(self.out, "}});").ok();
+                        continue;
+                    }
+                }
+                // Fallback: bool-expression cycle trigger (monitors).
+                self.emit_cycle_trigger(h, depth, tag_prefix);
             }
         }
 
-        // Restore state.
         self.field_subs = prev_subs;
         for n in added_events { self.event_types.remove(&n); }
     }
@@ -1348,17 +1391,11 @@ impl Emitter {
     fn component_field_c_type(&self, t: &TypeExpr) -> String {
         match t {
             TypeExpr::Builtin { name: BuiltinTy::Event, args, .. } => {
-                let inner = args.first().map(|a| match a {
-                    TypeArg::Type(ty) => txn_field_c_type(ty),
-                    _ => "uint64_t".into(),
-                }).unwrap_or_else(|| "uint64_t".into());
+                let inner = self.payload_type_for_arg(args.first());
                 format!("std::vector<std::function<void({inner})>>")
             }
             TypeExpr::Builtin { name: BuiltinTy::Queue, args, .. } => {
-                let inner = args.first().map(|a| match a {
-                    TypeArg::Type(ty) => txn_field_c_type(ty),
-                    _ => "uint64_t".into(),
-                }).unwrap_or_else(|| "uint64_t".into());
+                let inner = self.payload_type_for_arg(args.first());
                 format!("HarcQueue<{inner}>")
             }
             TypeExpr::Named { name, .. } => {
@@ -1372,6 +1409,37 @@ impl Emitter {
                 }
             }
             _ => txn_field_c_type(t),
+        }
+    }
+
+    /// Resolve a `<T>` payload arg (the inside of `event<T>`,
+    /// `queue<T>`, etc.) to a C++ type name. User-declared
+    /// transactions and enums get their bare name (so payloads
+    /// round-trip through C++ as the struct/enum directly);
+    /// everything else falls back to `txn_field_c_type` which
+    /// widens narrow ints into `int64_t`/`uint64_t`.
+    fn payload_type_for_arg(&self, arg: Option<&TypeArg>) -> String {
+        match arg {
+            Some(TypeArg::Type(ty)) => {
+                if let Some(name) = type_simple_name(Some(ty)) {
+                    if self.transactions.contains(name) || self.enums.contains_key(name) {
+                        return name.to_string();
+                    }
+                }
+                txn_field_c_type(ty)
+            }
+            Some(TypeArg::Expr(e)) => {
+                // `event<RegOp>` parses as TypeArg::Expr(Ident) at the
+                // type-arg layer — the parser doesn't always know the
+                // arg's a type until the user actually references it.
+                if let ExprKind::Ident(id) = &*e.kind {
+                    if self.transactions.contains(&id.name) || self.enums.contains_key(&id.name) {
+                        return id.name.clone();
+                    }
+                }
+                "uint64_t".into()
+            }
+            _ => "uint64_t".into(),
         }
     }
 
@@ -2231,13 +2299,24 @@ impl Emitter {
                 }
             }
             StmtKind::Emit { name, args, .. } => {
-                // `emit e(v)` → call every subscriber. Bare-name lookup
-                // first checks field_subs (so `emit write_e(...)` inside a
-                // monitor body resolves to `mon.write_e`).
-                let raw = name.segments.last()
-                    .map(|s| s.name.clone())
-                    .unwrap_or_default();
-                let event_name = self.field_subs.get(&raw).cloned().unwrap_or(raw);
+                // `emit e(v)` → call every subscriber.
+                //   - Multi-segment path (`emit drv.req(t)`) → emit
+                //     verbatim as `drv.req`.
+                //   - Single segment (`emit write_seen(...)` inside a
+                //     monitor body) → check field_subs to resolve the
+                //     bare name to the instance-qualified field
+                //     (`mon.write_seen`).
+                let event_name = if name.segments.len() > 1 {
+                    name.segments.iter()
+                        .map(|s| s.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".")
+                } else {
+                    let raw = name.segments.last()
+                        .map(|s| s.name.clone())
+                        .unwrap_or_default();
+                    self.field_subs.get(&raw).cloned().unwrap_or(raw)
+                };
                 let arg = args.first();
                 self.pad(depth);
                 write!(self.out, "for (auto& _s : {event_name}) _s(").ok();
@@ -2389,11 +2468,33 @@ impl Emitter {
                     self.emit_monitor_handler_registrations(&mon, &l.name.name, depth);
                     return;
                 }
-                if self.components.contains_key(name) {
+                if let Some(comp) = self.components.get(name).cloned() {
                     // driver / agent / env / sequencer → default-construct
                     // the struct. The user assigns DUT pointers and other
                     // field values explicitly afterward (`drv.dut = dut;`).
                     writeln!(self.out, "{name} {};", l.name.name).ok();
+                    // Register on-handlers in the body the same way
+                    // monitors do — events get subscriber closures,
+                    // bool exprs get cycle-trigger checkers. Tag prefix
+                    // is the kind keyword so concurrent components at
+                    // the same source span don't collide.
+                    let tag = format!("_{}_", comp.kind.keyword());
+                    self.emit_component_handler_registrations(&comp, &l.name.name, depth, &tag);
+                    // Also register handlers for sub-component fields
+                    // (e.g. an `env` whose fields are `drv : MyDriver` —
+                    // each sub-component's on-handlers wire to the
+                    // sub-instance's path).
+                    for ci in &comp.items {
+                        if let ComponentItem::Field(f) = ci {
+                            if let Some(field_ty) = type_simple_name(Some(&f.ty)) {
+                                if let Some(sub) = self.components.get(field_ty).cloned() {
+                                    let sub_inst = format!("{}.{}", l.name.name, f.name.name);
+                                    let sub_tag = format!("_{}_{}_", comp.kind.keyword(), f.name.name);
+                                    self.emit_component_handler_registrations(&sub, &sub_inst, depth, &sub_tag);
+                                }
+                            }
+                        }
+                    }
                     return;
                 }
                 if let Some(g) = self.covergroups.get(name).cloned() {
@@ -2690,6 +2791,27 @@ fn type_arg_width(args: &[TypeArg]) -> Option<u32> {
 /// Verilator side is determined by the DUT port type and we just shovel
 /// values through. Bool stays bool. Unknown named types emit the bare
 /// identifier (likely won't compile — surfaces the gap to the user).
+/// If `event` is the trigger of an `on event_name(arg)` handler,
+/// returns `(event_name, arg_binding_name)`. Anything else (a bool
+/// expression like `on dut.x && y`, or a malformed call) returns
+/// `None`. The binding name falls back to `_v` when the user wrote
+/// `on event(_)` or omitted the arg.
+fn extract_event_subscription(event: &Expr) -> Option<(String, String)> {
+    let ExprKind::Call { callee, args } = &*event.kind else { return None; };
+    let event_name = match &*callee.kind {
+        ExprKind::Ident(id) => id.name.clone(),
+        _ => return None,
+    };
+    let arg_name = match args.first() {
+        Some(CallArg::Expr(e)) => match &*e.kind {
+            ExprKind::Ident(id) => id.name.clone(),
+            _ => "_v".into(),
+        },
+        _ => "_v".into(),
+    };
+    Some((event_name, arg_name))
+}
+
 /// True when `let x = EXPR` should use `auto` rather than `int64_t`
 /// for the local's declared type. Picks `auto` whenever the rhs is a
 /// call (which can return `std::vector<T>` from a tseq, or a

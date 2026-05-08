@@ -980,8 +980,10 @@ This is where the "wide" scope decision pays off. Each UVM role becomes a langua
 - `hookable name(args) -> T ... end name` on any of the above → free `[&]`-capturing lambda named `<Type>_<name>`. Inside the body, bare references to component fields rewrite to `self.<field>`. `dut.<port>` keeps the arrow-access form.
 - `obj.method(args)` and `env.sub.method(args)` rewrite to `<Type>_<method>(<self>, args)` (the call-site dispatcher resolves up to two levels of field-access chain).
 - `let drv : MyDriver` default-constructs the struct; the user assigns DUT pointers and other field values explicitly afterward (`drv.dut = dut`).
+- `on event_field(arg) ... end on` inside a driver / agent / sequencer body → registers a `[&]`-capturing closure into the corresponding event vector at `let drv : T` time. Event payloads typed `event<MyTxn>` round-trip as the `MyTxn` C++ struct (transactions and enums get their bare name; integer-typed payloads still widen). `emit drv.req(t)` fires every registered subscriber synchronously — the on-handler body runs inside the test's tick scope (so `wait`, `dut.x = ...`, etc. all work).
+- `on dut.signal ... end on` inside a monitor body → per-cycle bool checker (existing behavior, unchanged).
 
-Out of v0 scope, deferred to a follow-up PR: protocol-typed bus binding (`bound to T` / `bus.aw.send(...)`), `pre`/`post` hooks via `on drv.send pre`, automatic sequencer dispatch into a driver via events. The current path is "components are stateful structs with methods you call directly"; the protocol-bus story layers on top.
+Out of v0 scope, deferred to a follow-up PR: protocol-typed bus binding (`bound to T` / `bus.aw.send(...)`), `pre`/`post` hooks via `on drv.send pre`, and `connect` blocks (cross-component event wiring — today users emit manually). The current path is "components are stateful structs with methods you call directly, plus event-driven on-handlers"; the protocol-bus story layers on top.
 
 ### 8.1 `agent`
 
