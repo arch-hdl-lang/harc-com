@@ -973,6 +973,16 @@ end component AxiDriver
 
 This is where the "wide" scope decision pays off. Each UVM role becomes a language construct with a typed contract.
 
+**v0 lowering status.** The component constructs below all parse and round-trip through `harc fmt`. The cpp_tb backend lowers a useful subset:
+
+- `tseq T -> TSeq<X>` → `[&]`-lambda returning `std::vector<X>`. `yield e` pushes to the implicit `_result` accumulator. Iterate the result with `for x in seq`.
+- `driver` / `agent` / `env` / `sequencer` → plain C++ struct of fields. DUT-typed fields lower to Verilator pointers (`V<Name>*`); sub-component fields are by-value structs.
+- `hookable name(args) -> T ... end name` on any of the above → free `[&]`-capturing lambda named `<Type>_<name>`. Inside the body, bare references to component fields rewrite to `self.<field>`. `dut.<port>` keeps the arrow-access form.
+- `obj.method(args)` and `env.sub.method(args)` rewrite to `<Type>_<method>(<self>, args)` (the call-site dispatcher resolves up to two levels of field-access chain).
+- `let drv : MyDriver` default-constructs the struct; the user assigns DUT pointers and other field values explicitly afterward (`drv.dut = dut`).
+
+Out of v0 scope, deferred to a follow-up PR: protocol-typed bus binding (`bound to T` / `bus.aw.send(...)`), `pre`/`post` hooks via `on drv.send pre`, automatic sequencer dispatch into a driver via events. The current path is "components are stateful structs with methods you call directly"; the protocol-bus story layers on top.
+
 ### 8.1 `agent`
 
 ```
