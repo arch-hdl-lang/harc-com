@@ -1,0 +1,90 @@
+// HARC TB for arch-com/tests/cam_basic.arch — `Mshr_Addr_Cam`, a small
+// content-addressable memory (32 entries × 10-bit keys). Mirrors
+// arch-com/tests/cam_basic_tb.cpp.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+function cam_write(dut: Mshr_Addr_Cam, idx: uint<5>, key: uint<10>, set: bool)
+    dut.write_valid = 1
+    dut.write_idx = idx
+    dut.write_key = key
+    dut.write_set = set
+    wait 1 cycle
+    dut.write_valid = 0
+end function cam_write
+
+test CamBasicTest
+    let dut : Mshr_Addr_Cam
+
+    clock clk = SysDomain
+
+    scope sim
+        run
+            // Reset.
+            dut.rst = 1
+            dut.write_valid = 0
+            dut.search_key = 0
+            wait 2 cycles
+            dut.rst = 0
+            wait 1 cycle
+
+            // Initially empty: any search returns no match.
+            dut.search_key = 291                  // 0x123
+            wait 1 cycle
+            assert dut.search_any == 0
+                else fail("post-reset: search_any=${dut.search_any}, expected 0")
+            assert dut.search_mask == 0
+                else fail("post-reset: search_mask=${dut.search_mask}, expected 0")
+            log(info, "PASS: empty CAM rejects all searches")
+
+            // Insert (idx 3 → 0x55), (idx 5 → 0x77), (idx 7 → 0x55).
+            // Two entries share key 0x55 at different indices.
+            cam_write(dut, 3, 85, true)            // 0x55
+            cam_write(dut, 5, 119, true)           // 0x77
+            cam_write(dut, 7, 85, true)            // 0x55 (dup)
+
+            // Search for 0x77 → only idx 5 matches.
+            dut.search_key = 119
+            wait 1 cycle
+            assert dut.search_any == 1
+                else fail("search 0x77: search_any=${dut.search_any}, expected 1")
+            assert dut.search_mask == 32          // 1 << 5
+                else fail("search 0x77: mask=${dut.search_mask}, expected 0x20")
+            assert dut.search_first == 5
+                else fail("search 0x77: first=${dut.search_first}, expected 5")
+            log(info, "PASS: search 0x77 → idx 5")
+
+            // Search for 0x55 → idx 3 and idx 7 match; first = 3 (LSB).
+            dut.search_key = 85
+            wait 1 cycle
+            assert dut.search_any == 1
+                else fail("search 0x55: search_any=${dut.search_any}, expected 1")
+            assert dut.search_mask == 136         // (1<<3) | (1<<7)
+                else fail("search 0x55: mask=${dut.search_mask}, expected 0x88")
+            assert dut.search_first == 3
+                else fail("search 0x55: first=${dut.search_first}, expected 3")
+            log(info, "PASS: search 0x55 → idx 3 (first), idx 7 (also)")
+
+            // Search for 0xAB → no match.
+            dut.search_key = 171
+            wait 1 cycle
+            assert dut.search_any == 0
+                else fail("search 0xAB: search_any=${dut.search_any}, expected 0")
+            assert dut.search_mask == 0
+                else fail("search 0xAB: mask=${dut.search_mask}, expected 0")
+            log(info, "PASS: search 0xAB → no match")
+
+            // Clear idx 3; search 0x55 → only idx 7 left.
+            cam_write(dut, 3, 0, false)
+            dut.search_key = 85
+            wait 1 cycle
+            assert dut.search_mask == 128         // 1 << 7
+                else fail("post-clear: mask=${dut.search_mask}, expected 0x80")
+            assert dut.search_first == 7
+                else fail("post-clear: first=${dut.search_first}, expected 7")
+            log(info, "PASS: clear idx 3 → search 0x55 finds only idx 7")
+        end run
+    end scope sim
+end test CamBasicTest

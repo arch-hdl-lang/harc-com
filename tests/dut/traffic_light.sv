@@ -1,0 +1,88 @@
+//! ---
+//! tags: [fsm, traffic_light, tutorial]
+//! ---
+//!
+//! Classic traffic-light FSM tutorial — three-state Red → Green → Yellow
+//! → Red rotation, advances when an external `timer` reaches 0.
+// domain SysDomain
+//   freq_mhz: 100
+
+/// Three-state traffic-light FSM (Red → Green → Yellow → Red).
+///
+/// State advances when the external `timer` input hits 0. Output ports
+/// (`red` / `yellow` / `green`) default to `false` and are asserted from
+/// the matching state's comb block.
+module TrafficLight #(
+  parameter int TIMER_W = 8
+) (
+  input logic clk,
+  input logic rst,
+  input logic [TIMER_W-1:0] timer,
+  output logic red,
+  output logic yellow,
+  output logic green
+);
+
+  typedef enum logic [1:0] {
+    RED = 2'd0,
+    YELLOW = 2'd1,
+    GREEN = 2'd2
+  } TrafficLight_state_t;
+  
+  TrafficLight_state_t state_r, state_next;
+  
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      state_r <= RED;
+    end else begin
+      state_r <= state_next;
+    end
+  end
+  
+  always_comb begin
+    state_next = state_r; // hold by default
+    case (state_r)
+      RED: begin
+        if (timer == 0) state_next = GREEN;
+      end
+      GREEN: begin
+        if (timer == 0) state_next = YELLOW;
+      end
+      YELLOW: begin
+        if (timer == 0) state_next = RED;
+      end
+      default: state_next = state_r;
+    endcase
+  end
+  
+  always_comb begin
+    red = 1'b0;
+    yellow = 1'b0;
+    green = 1'b0;
+    case (state_r)
+      RED: begin
+        red = 1'b1;
+      end
+      GREEN: begin
+        green = 1'b1;
+      end
+      YELLOW: begin
+        yellow = 1'b1;
+      end
+      default: ;
+    endcase
+  end
+  
+  // synopsys translate_off
+  _auto_legal_state: assert property (@(posedge clk) !rst |-> state_r < 3)
+    else $fatal(1, "FSM ILLEGAL STATE: TrafficLight.state_r = %0d", state_r);
+  _auto_reach_Red: cover property (@(posedge clk) state_r == RED);
+  _auto_reach_Yellow: cover property (@(posedge clk) state_r == YELLOW);
+  _auto_reach_Green: cover property (@(posedge clk) state_r == GREEN);
+  _auto_tr_RED_to_GREEN: cover property (@(posedge clk) state_r == RED && state_next == GREEN);
+  _auto_tr_GREEN_to_YELLOW: cover property (@(posedge clk) state_r == GREEN && state_next == YELLOW);
+  _auto_tr_YELLOW_to_RED: cover property (@(posedge clk) state_r == YELLOW && state_next == RED);
+  // synopsys translate_on
+
+endmodule
+

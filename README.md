@@ -121,11 +121,25 @@ src/
 
 tests/
   fixtures/        Runnable HARC tests targeting arch-com DUTs
+  dut/             Vendored .sv DUT snapshots (refreshable from arch-com)
   snapshots/       insta snapshots for round-trip parser tests
   round_trip.rs    Snapshot-test driver
+  run_fixtures.sh  End-to-end fixture runner (used in CI)
 
 spec.md            Language reference
 ```
+
+## Running the test suite locally
+
+```sh
+cargo test --release          # 32 cargo tests
+./tests/run_fixtures.sh       # 23 fixtures end-to-end via Verilator
+```
+
+The fixture runner builds harc, then for each entry in its manifest:
+runs Verilator on the vendored `.sv` DUT, links it against the HARC-
+generated C++ testbench, and asserts the binary prints `ALL TESTS
+PASSED`. CI runs the same script on every push and PR.
 
 ## Relationship to ARCH
 
