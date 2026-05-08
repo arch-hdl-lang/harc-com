@@ -560,7 +560,23 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
     // method-call site rewrites `obj.method(args)` to
     // `<Type>_<method>(obj, args)` so the body sees `tick` / `_checkers`
     // / etc. from the test scope.
+    //
+    // Pre/post hook vectors emit FIRST so the method bodies (and the
+    // test-scope `on obj.method pre/post` registrations) can `[&]`-
+    // capture them. Empty vectors are no-ops; the wrap is unconditional.
     let mut emitted_any_method = false;
+    for it in &file.items {
+        let c = match it {
+            Item::Driver(c) | Item::Agent(c) | Item::Env(c)
+            | Item::Sequencer(c) | Item::Scoreboard(c) => c,
+            _ => continue,
+        };
+        for ci in &c.items {
+            if let ComponentItem::Hookable(h) = ci {
+                e.emit_hook_vectors(c, h, 1);
+            }
+        }
+    }
     for it in &file.items {
         let c = match it {
             Item::Driver(c) | Item::Agent(c) | Item::Env(c)
@@ -1217,6 +1233,50 @@ impl Emitter {
     /// scoreboard body would need event registration that's not in scope.
     /// Each field default-initialises (queues to empty, ints to 0). The
     /// user drives push/pop/etc. directly from test code.
+    /// If `event` is the trigger of an `on obj.method pre/post`
+    /// handler, resolve `obj.method` to a known hookable on a known
+    /// component type. Returns `(component_type_name, method_name,
+    /// params)`. Walks one or two levels of field-access chain
+    /// (covers `<var>.<method>` and `<env>.<sub>.<method>`).
+    fn resolve_component_hookable(&self, event: &Expr) -> Option<(String, String, Vec<Param>)> {
+        let ExprKind::Field { target, name: method } = &*event.kind else { return None; };
+        let find_method = |c: &ComponentDecl, m: &str| -> Option<Vec<Param>> {
+            for it in &c.items {
+                if let ComponentItem::Hookable(h) = it {
+                    if h.name.name == m { return Some(h.params.clone()); }
+                }
+            }
+            None
+        };
+
+        // <ident>.<method>
+        if let ExprKind::Ident(id) = &*target.kind {
+            let comp_ty = self.let_types.get(&id.name)?;
+            let comp = self.components.get(comp_ty)?;
+            let params = find_method(comp, &method.name)?;
+            return Some((comp_ty.clone(), method.name.clone(), params));
+        }
+
+        // <ident>.<sub>.<method>
+        if let ExprKind::Field { target: outer, name: sub } = &*target.kind {
+            let ExprKind::Ident(id) = &*outer.kind else { return None; };
+            let outer_ty = self.let_types.get(&id.name)?;
+            let outer_comp = self.components.get(outer_ty)?;
+            let sub_ty = outer_comp.items.iter().find_map(|it| {
+                if let ComponentItem::Field(f) = it {
+                    if f.name.name == sub.name {
+                        return type_simple_name(Some(&f.ty));
+                    }
+                }
+                None
+            })?;
+            let sub_comp = self.components.get(sub_ty)?;
+            let params = find_method(sub_comp, &method.name)?;
+            return Some((sub_ty.to_string(), method.name.clone(), params));
+        }
+        None
+    }
+
     /// If `callee` is a method call on a known component, return the
     /// triple `(<component_type>, <self_expr>, <method>)` so the caller
     /// can lower to `<component_type>_<method>(<self_expr>, args)`.
@@ -1277,6 +1337,59 @@ impl Emitter {
     /// HARC declaration. Inside the body, bare references to component
     /// fields are rewritten to `self.<field>` via `field_subs`. DUT
     /// pointer fields stay arrow-accessed: `self.dut->aw_addr = ...`.
+    /// Component-aware C++ type rendering for a HARC `TypeExpr`.
+    /// Wraps `c_type_for` with awareness of declared transactions /
+    /// enums / sub-components: those Named types lower to their bare
+    /// struct/enum name rather than the default `V<Name>*` pointer.
+    /// Used by hookable-method param types and other component-body
+    /// contexts where DUT vs. value-type ambiguity would otherwise
+    /// produce wrong code.
+    fn c_type_for_param(&self, t: &TypeExpr) -> String {
+        if let TypeExpr::Named { name, .. } = t {
+            if let Some(last) = name.segments.last() {
+                let n = &last.name;
+                if self.transactions.contains(n) || self.enums.contains_key(n)
+                    || self.components.contains_key(n) || self.scoreboards.contains(n)
+                    || self.monitors.contains_key(n) || self.covergroups.contains_key(n)
+                {
+                    return n.clone();
+                }
+            }
+        }
+        c_type_for(t)
+    }
+
+    /// Emit the two `<Type>_<method>_pre` and `<Type>_<method>_post`
+    /// `std::vector<std::function<void(args)>>` declarations that
+    /// hold the registered hook subscribers for one hookable method.
+    /// Empty by default; users push closures via `on obj.method pre`
+    /// / `on obj.method post` at test scope.
+    fn emit_hook_vectors(
+        &mut self,
+        c: &ComponentDecl,
+        h: &HookableMethod,
+        depth: usize,
+    ) {
+        let comp_ty = &c.name.name;
+        let m_name = &h.name.name;
+        let arg_tys: Vec<String> = h.params.iter()
+            .map(|p| p.ty.as_ref()
+                .map(|t| self.c_type_for_param(t))
+                .unwrap_or_else(|| "int64_t".to_string()))
+            .collect();
+        let arg_csv = arg_tys.join(", ");
+        self.pad(depth);
+        writeln!(
+            self.out,
+            "std::vector<std::function<void({arg_csv})>> {comp_ty}_{m_name}_pre;",
+        ).ok();
+        self.pad(depth);
+        writeln!(
+            self.out,
+            "std::vector<std::function<void({arg_csv})>> {comp_ty}_{m_name}_post;",
+        ).ok();
+    }
+
     fn emit_component_method(
         &mut self,
         c: &ComponentDecl,
@@ -1294,14 +1407,17 @@ impl Emitter {
             "auto {comp_ty}_{m_name} = [&]({comp_ty}& self"
         ).ok();
         // Track Named-typed params as pointers so dut.field rewrites
-        // properly in the body. Restore on exit.
+        // properly in the body. Restore on exit. Transaction / enum /
+        // sub-component params are by-value (not pointer-shaped).
         let mut added: Vec<String> = Vec::new();
         for p in &h.params {
             let pty = p.ty.as_ref()
-                .map(c_type_for)
+                .map(|t| self.c_type_for_param(t))
                 .unwrap_or_else(|| "int64_t".to_string());
             write!(self.out, ", {pty} {}", p.name.name).ok();
-            if matches!(&p.ty, Some(TypeExpr::Named { .. })) {
+            if matches!(&p.ty, Some(TypeExpr::Named { .. }))
+               && self.is_dut_pointer_field_type(p.ty.as_ref().unwrap())
+            {
                 if self.pointer_vars.insert(p.name.name.clone()) {
                     added.push(p.name.name.clone());
                 }
@@ -1324,7 +1440,22 @@ impl Emitter {
             }
         }
         let prev_subs = std::mem::replace(&mut self.field_subs, subs);
+
+        // Pre-hooks: fire `<Type>_<method>_pre` subscribers before the
+        // body. The hook closures see the same args as the method —
+        // empty vectors are a no-op so the wrap is always safe to
+        // emit.
+        let arg_list: Vec<String> = h.params.iter()
+            .map(|p| p.name.name.clone())
+            .collect();
+        let arg_csv = arg_list.join(", ");
+        self.pad(depth + 1);
+        writeln!(self.out, "for (auto& _h : {comp_ty}_{m_name}_pre) _h({arg_csv});").ok();
+
         self.emit_block(&h.body, depth + 1);
+
+        self.pad(depth + 1);
+        writeln!(self.out, "for (auto& _h : {comp_ty}_{m_name}_post) _h({arg_csv});").ok();
         // Restore state.
         self.field_subs = prev_subs;
         for k in added_pointer_fields { self.pointer_vars.remove(&k); }
@@ -2329,12 +2460,46 @@ impl Emitter {
                 writeln!(self.out, ");").ok();
             }
             StmtKind::On(h) => {
-                // Two shapes:
+                // Three shapes:
+                //   `on obj.method pre/post ... end on` — pre/post hook
+                //       on a hookable method. Resolves obj to a known
+                //       component-typed binding, then pushes the body
+                //       closure into the global `<Type>_<method>_<side>`
+                //       vector. The method's body wrap fires hooks
+                //       around the body each call.
                 //   `on event_name(arg) ... end on` — event subscription.
-                //       Event must be a bare ident or `<obj>.<event>`;
-                //       arg is the lambda parameter name.
-                //   `on <bool-expr> ... end on`     — cycle trigger; body
-                //       runs every cycle the expression is true.
+                //   `on <bool-expr> ... end on`     — cycle trigger.
+                if let Some(side) = h.hook {
+                    if let Some((comp_ty, method_name, params)) =
+                        self.resolve_component_hookable(&h.event)
+                    {
+                        let side_str = match side {
+                            HookSide::Pre => "pre",
+                            HookSide::Post => "post",
+                        };
+                        let arg_decls: Vec<String> = params.iter().map(|p| {
+                            let ty = p.ty.as_ref()
+                                .map(|t| self.c_type_for_param(t))
+                                .unwrap_or_else(|| "int64_t".to_string());
+                            format!("{ty} {}", p.name.name)
+                        }).collect();
+                        self.pad(depth);
+                        writeln!(
+                            self.out,
+                            "{comp_ty}_{method_name}_{side_str}.push_back([&]({}) {{",
+                            arg_decls.join(", "),
+                        ).ok();
+                        self.emit_block(&h.body, depth + 1);
+                        self.pad(depth);
+                        writeln!(self.out, "}});").ok();
+                        return;
+                    } else {
+                        self.errors.push(
+                            "on <obj>.<method> pre/post: obj.method must resolve to a `hookable` on a known component type".into()
+                        );
+                        return;
+                    }
+                }
                 if let ExprKind::Call { callee, args } = &*h.event.kind {
                     // Event-subscription path.
                     let raw = match &*callee.kind {
