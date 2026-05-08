@@ -2495,6 +2495,31 @@ impl Emitter {
                             }
                         }
                     }
+                    // Wire `connect a -> b` edges. Each edge installs a
+                    // bridge subscriber on `<env>.<a>` that fans out to
+                    // every subscriber of `<env>.<b>`. Generic-lambda
+                    // payload (`auto`) so we don't need to look up the
+                    // event's type at the connect site.
+                    for ci in &comp.items {
+                        if let ComponentItem::Connect(cb) = ci {
+                            for edge in &cb.edges {
+                                let from = expr_path_str(&edge.from);
+                                let to = expr_path_str(&edge.to);
+                                if let (Some(from), Some(to)) = (from, to) {
+                                    self.pad(depth);
+                                    writeln!(
+                                        self.out,
+                                        "{}.{}.push_back([&](auto _t) {{ for (auto& _s : {}.{}) _s(_t); }});",
+                                        l.name.name, from, l.name.name, to,
+                                    ).ok();
+                                } else {
+                                    self.errors.push(format!(
+                                        "connect: edge endpoints must be plain field paths in v0 cpp_tb"
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     return;
                 }
                 if let Some(g) = self.covergroups.get(name).cloned() {
@@ -2791,6 +2816,21 @@ fn type_arg_width(args: &[TypeArg]) -> Option<u32> {
 /// Verilator side is determined by the DUT port type and we just shovel
 /// values through. Bool stays bool. Unknown named types emit the bare
 /// identifier (likely won't compile — surfaces the gap to the user).
+/// Render a field-access chain like `seq.dispatched` or just `req`
+/// as a dot-separated string. Returns `None` for shapes the connect
+/// codegen can't handle in v0 (anything other than nested
+/// `Field { Field { Ident, _ }, _ }` chains rooted at a bare ident).
+fn expr_path_str(e: &Expr) -> Option<String> {
+    match &*e.kind {
+        ExprKind::Ident(id) => Some(id.name.clone()),
+        ExprKind::Field { target, name } => {
+            let head = expr_path_str(target)?;
+            Some(format!("{head}.{}", name.name))
+        }
+        _ => None,
+    }
+}
+
 /// If `event` is the trigger of an `on event_name(arg)` handler,
 /// returns `(event_name, arg_binding_name)`. Anything else (a bool
 /// expression like `on dut.x && y`, or a malformed call) returns
@@ -2848,12 +2888,36 @@ fn tseq_inner_type(t: &TypeExpr) -> Option<String> {
 
 fn c_type_for(t: &TypeExpr) -> String {
     match t {
-        TypeExpr::Builtin { name, .. } => match name {
+        TypeExpr::Builtin { name, args, .. } => match name {
             BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => "uint64_t".into(),
             BuiltinTy::SInt | BuiltinTy::SIntCap => "int64_t".into(),
             BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => "bool".into(),
             BuiltinTy::String => "const char*".into(),
             BuiltinTy::Time => "uint64_t".into(),
+            BuiltinTy::TSeq => {
+                // `TSeq<T>` → `const std::vector<T>&` for params (pass-
+                // by-reference avoids copying every transaction across
+                // method calls). Matches the tseq lowering — a tseq
+                // emits a `std::vector<T>` accumulator filled by
+                // `yield`. Outside param context this is also a sane
+                // local-variable type.
+                let inner = tseq_inner_type(t).unwrap_or_else(|| "uint64_t".into());
+                format!("const std::vector<{inner}>&")
+            }
+            BuiltinTy::Queue => {
+                // `queue<T>` as a function param — pass by reference to
+                // avoid copying the runtime queue. Mirrors the field-type
+                // lowering.
+                let inner = args.first().map(|a| match a {
+                    TypeArg::Type(ty) => txn_field_c_type(ty),
+                    TypeArg::Expr(e) => match &*e.kind {
+                        ExprKind::Ident(id) => id.name.clone(),
+                        _ => "uint64_t".into(),
+                    },
+                    _ => "uint64_t".into(),
+                }).unwrap_or_else(|| "uint64_t".into());
+                format!("HarcQueue<{inner}>&")
+            }
             // Aggregates / verification-only types fall back to the spelling
             // — caller will get a compile error pointing at the gap.
             _ => format!("/* TODO: type {:?} */ uint64_t", name),
