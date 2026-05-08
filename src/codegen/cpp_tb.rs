@@ -1260,6 +1260,115 @@ impl Emitter {
     /// each handshake_channel signal flattens to
     /// `<binding>_<channel>_<signal>` (and the implicit `valid` /
     /// `ready` signals flatten the same way).
+    /// Detect `<bus>.<channel>.send(args)` / `<bus>.<channel>.recv()`
+    /// calls and emit the auto-generated valid/ready handshake. The
+    /// channel must be a `handshake_channel` on the bus the binding
+    /// names; the call's arity (for `send`) must match the channel's
+    /// payload signal count.
+    ///
+    /// `let_name = Some("x")` for the let-rhs form (`let x = bus.r.recv()`):
+    /// the captured payload is assigned into `auto x = ...;`. With
+    /// `None` the call is a discarded statement (drives the dance,
+    /// throws away any received data).
+    ///
+    /// Returns `true` when the call was a recognized bus handshake
+    /// and was emitted; `false` to fall through to plain Call lowering.
+    fn try_emit_bus_handshake(
+        &mut self,
+        e: &Expr,
+        let_name: Option<&str>,
+        depth: usize,
+    ) -> bool {
+        let ExprKind::Call { callee, args } = &*e.kind else { return false; };
+        let ExprKind::Field { target, name: method } = &*callee.kind else { return false; };
+        let ExprKind::Field { target: outer, name: ch } = &*target.kind else { return false; };
+        let ExprKind::Ident(id) = &*outer.kind else { return false; };
+        let Some((bus, root)) = self.bus_bindings.get(&id.name).cloned() else { return false; };
+        let Some(h) = bus.handshakes.iter().find(|h| h.name.name == ch.name).cloned() else {
+            return false;
+        };
+        let prefix = format!("{}_{}", id.name, ch.name);  // axil_aw
+
+        match method.name.as_str() {
+            "send" => {
+                if args.len() != h.payload.len() {
+                    self.errors.push(format!(
+                        "bus.{}.send: expected {} payload arg(s), got {}",
+                        ch.name, h.payload.len(), args.len(),
+                    ));
+                    return true;
+                }
+                if let_name.is_some() {
+                    self.errors.push(format!(
+                        "bus.{}.send returns no value; use it as a statement",
+                        ch.name,
+                    ));
+                    return true;
+                }
+                self.pad(depth);
+                writeln!(self.out, "// bus.{}.send", ch.name).ok();
+                // Drive payload signals.
+                for (sig, arg) in h.payload.iter().zip(args.iter()) {
+                    self.pad(depth);
+                    write!(self.out, "{root}->{prefix}_{} = ", sig.name.name).ok();
+                    match arg {
+                        CallArg::Expr(e) => self.emit_expr(e),
+                        CallArg::Named { value, .. } => self.emit_expr(value),
+                    }
+                    writeln!(self.out, ";").ok();
+                }
+                self.pad(depth);
+                writeln!(self.out, "{root}->{prefix}_valid = 1;").ok();
+                self.pad(depth);
+                writeln!(self.out, "{{ int _b = 16; while (!{root}->{prefix}_ready && _b > 0) {{ tick(); _b--; }} }}").ok();
+                self.pad(depth);
+                writeln!(self.out, "tick();").ok();
+                self.pad(depth);
+                writeln!(self.out, "{root}->{prefix}_valid = 0;").ok();
+                true
+            }
+            "recv" => {
+                if !args.is_empty() {
+                    self.errors.push(format!(
+                        "bus.{}.recv: expected 0 args, got {}",
+                        ch.name, args.len(),
+                    ));
+                    return true;
+                }
+                if h.payload.is_empty() {
+                    self.errors.push(format!(
+                        "bus.{}.recv: channel has no payload signals to receive",
+                        ch.name,
+                    ));
+                    return true;
+                }
+                // Multi-payload receive returns only the first signal's
+                // value via the let-rhs form; users wanting the full
+                // payload still have manual access via
+                // `bus.<ch>.<sig>` after the dance fires.
+                let cap_sig = &h.payload[0].name.name;
+                self.pad(depth);
+                writeln!(self.out, "// bus.{}.recv", ch.name).ok();
+                self.pad(depth);
+                writeln!(self.out, "{root}->{prefix}_ready = 1;").ok();
+                self.pad(depth);
+                writeln!(self.out, "{{ int _b = 16; while (!{root}->{prefix}_valid && _b > 0) {{ tick(); _b--; }} }}").ok();
+                // Capture BEFORE tick(): the destination signals are
+                // valid in the same cycle as `valid` is high.
+                if let Some(name) = let_name {
+                    self.pad(depth);
+                    writeln!(self.out, "auto {name} = {root}->{prefix}_{cap_sig};").ok();
+                }
+                self.pad(depth);
+                writeln!(self.out, "tick();").ok();
+                self.pad(depth);
+                writeln!(self.out, "{root}->{prefix}_ready = 0;").ok();
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn try_emit_bus_field_access(&mut self, target: &Expr, name: &Ident) -> Option<String> {
         // <binding>.<signal>
         if let ExprKind::Ident(id) = &*target.kind {
@@ -2497,6 +2606,12 @@ impl Emitter {
                 self.emit_log(&collected, path, depth);
             }
             StmtKind::Expr(e) => {
+                // `bus.<channel>.send(args)` and `bus.<channel>.recv()`
+                // expand into a multi-statement v/r handshake. When
+                // it's a discarded-result `recv()`, just run the dance.
+                if self.try_emit_bus_handshake(e, None, depth) {
+                    return;
+                }
                 self.pad(depth);
                 self.emit_expr(e);
                 writeln!(self.out, ";").ok();
@@ -2717,8 +2832,15 @@ impl Emitter {
             self.event_types.insert(l.name.name.clone(), inner);
             return;
         }
-        self.pad(depth);
         if let Some(v) = &l.value {
+            // `bus.<ch>.recv()` on the rhs expands the handshake +
+            // captures the payload signal directly into the let.
+            // Defer pad emission so the handshake helper can write its
+            // own indentation.
+            if self.try_emit_bus_handshake(v, Some(&l.name.name), depth) {
+                return;
+            }
+            self.pad(depth);
             // Default to `int64_t` for integer-shaped lets so 32-bit
             // DUT signals zero-extend on assignment (matters for the
             // `assert got == expected` pattern when comparing widened
@@ -2731,6 +2853,7 @@ impl Emitter {
             self.emit_expr(v);
             writeln!(self.out, ";").ok();
         } else if let Some(t) = &l.ty {
+            self.pad(depth);
             // No initializer. Transactions / scoreboards / monitors all
             // default-construct (their struct field defaults run). Monitors
             // additionally trigger `on`-handler registration into _checkers
@@ -2814,6 +2937,7 @@ impl Emitter {
             }
             writeln!(self.out, "int64_t {} = 0;", l.name.name).ok();
         } else {
+            self.pad(depth);
             writeln!(self.out, "// let {} (no type / no value)", l.name.name).ok();
         }
     }
