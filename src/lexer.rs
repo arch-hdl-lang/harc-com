@@ -128,6 +128,12 @@ pub enum TokenKind {
     In,
     #[token("loop")]
     Loop,
+    #[token("while")]
+    While,
+    #[token("break")]
+    Break,
+    #[token("continue")]
+    Continue,
     #[token("return")]
     Return,
     #[token("yield")]
@@ -500,6 +506,9 @@ impl fmt::Display for TokenKind {
             For => write!(f, "for"),
             In => write!(f, "in"),
             Loop => write!(f, "loop"),
+            While => write!(f, "while"),
+            Break => write!(f, "break"),
+            Continue => write!(f, "continue"),
             Return => write!(f, "return"),
             Yield => write!(f, "yield"),
             True => write!(f, "true"),

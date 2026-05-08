@@ -823,6 +823,7 @@ impl Parser {
             | Some(TokenKind::Assert) | Some(TokenKind::Assume) | Some(TokenKind::Cover)
             | Some(TokenKind::Log) | Some(TokenKind::LogF) | Some(TokenKind::Wait)
             | Some(TokenKind::For) | Some(TokenKind::Repeat) | Some(TokenKind::Loop)
+            | Some(TokenKind::While) | Some(TokenKind::Break) | Some(TokenKind::Continue)
             | Some(TokenKind::If) | Some(TokenKind::Fork) | Some(TokenKind::Randomize)
             | Some(TokenKind::On) | Some(TokenKind::Emit) => {
                 let mut items = Vec::new();
@@ -831,7 +832,10 @@ impl Parser {
                 }
                 ExtendBody::Test(items)
             }
-            Some(TokenKind::Connect) | Some(TokenKind::On) | Some(TokenKind::Hookable) => {
+            // `On` would be reachable here too, but the test-body arm above
+            // already claims it (the dispatcher disambiguates structurally,
+            // not by target-kind lookup). Keep the component-only tokens.
+            Some(TokenKind::Connect) | Some(TokenKind::Hookable) => {
                 let mut items = Vec::new();
                 while !self.check_end_keyword() {
                     items.push(self.parse_component_item()?);
@@ -1271,6 +1275,30 @@ impl Parser {
                     kind: StmtKind::Loop(Block { stmts, span: body_start.merge(end) }),
                     span: start.merge(end),
                 })
+            }
+            Some(TokenKind::While) => {
+                self.advance();
+                let cond = self.parse_expr()?;
+                let body_start = self.peek_span();
+                let stmts = self.parse_stmt_list_until_end()?;
+                let end = self.expect_end_anon(TokenKind::While)?;
+                let span = start.merge(end);
+                Ok(Stmt {
+                    kind: StmtKind::While {
+                        cond,
+                        body: Block { stmts, span: body_start.merge(end) },
+                        span,
+                    },
+                    span,
+                })
+            }
+            Some(TokenKind::Break) => {
+                let s = self.expect(TokenKind::Break)?.span;
+                Ok(Stmt { kind: StmtKind::Break { span: s }, span: s })
+            }
+            Some(TokenKind::Continue) => {
+                let s = self.expect(TokenKind::Continue)?.span;
+                Ok(Stmt { kind: StmtKind::Continue { span: s }, span: s })
             }
             Some(TokenKind::If) => {
                 let s = self.parse_if_stmt()?;

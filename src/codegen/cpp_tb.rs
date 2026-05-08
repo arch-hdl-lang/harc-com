@@ -591,6 +591,10 @@ struct CoverInfo {
 struct TxnFieldInfo {
     name: String,
     width: u32,
+    /// `!` prefix on a transaction field — non-random; carried for future
+    /// solver use. Not yet consulted by the lowering, but kept so the field
+    /// info round-trips through codegen.
+    #[allow(dead_code)]
     non_random: bool,
 }
 
@@ -737,7 +741,7 @@ impl Emitter {
         self.pad(depth);
         writeln!(self.out, "_checkers.push_back([&]() {{").ok();
         // Static slots for delay state — survive across closure calls.
-        for (i, t) in temporals.iter().enumerate() {
+        for (i, _t) in temporals.iter().enumerate() {
             self.pad(depth + 1);
             writeln!(self.out, "static int64_t {tag}_ps{i} = 0;").ok();
         }
@@ -1681,6 +1685,23 @@ impl Emitter {
                 self.pad(depth);
                 writeln!(self.out, "}}").ok();
             }
+            StmtKind::While { cond, body, .. } => {
+                self.pad(depth);
+                write!(self.out, "while (").ok();
+                self.emit_expr(cond);
+                writeln!(self.out, ") {{").ok();
+                self.emit_block(body, depth + 1);
+                self.pad(depth);
+                writeln!(self.out, "}}").ok();
+            }
+            StmtKind::Break { .. } => {
+                self.pad(depth);
+                writeln!(self.out, "break;").ok();
+            }
+            StmtKind::Continue { .. } => {
+                self.pad(depth);
+                writeln!(self.out, "continue;").ok();
+            }
             StmtKind::If(i) => {
                 self.pad(depth);
                 write!(self.out, "if (").ok();
@@ -2170,6 +2191,7 @@ fn file_uses_constraint_solver(file: &SourceFile) -> bool {
             StmtKind::For(f) => block(&f.body),
             StmtKind::Repeat(r) => block(&r.body),
             StmtKind::Loop(b) => block(b),
+            StmtKind::While { body, .. } => block(body),
             StmtKind::If(i) =>
                 block(&i.then_block)
                 || i.else_block.as_ref().map_or(false, block)

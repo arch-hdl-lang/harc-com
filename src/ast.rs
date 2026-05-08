@@ -713,6 +713,14 @@ pub enum StmtKind {
     For(ForStmt),
     Repeat(RepeatStmt),
     Loop(Block),
+    /// `while <cond> ... end while` — pre-tested loop.
+    While { cond: Expr, body: Block, span: Span },
+    /// `break` — exit innermost enclosing loop (`while` / `loop` / `for` /
+    /// `repeat`). Type-checked at codegen: a `break` outside a loop is a
+    /// hard error.
+    Break { span: Span },
+    /// `continue` — skip to next iteration of innermost enclosing loop.
+    Continue { span: Span },
     If(IfStmt),
     Fork(ForkStmt),
     Parallel(Vec<Block>),
