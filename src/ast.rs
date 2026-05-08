@@ -303,6 +303,8 @@ pub struct ConnectEdge {
 pub struct HookableMethod {
     pub name: Ident,
     pub params: Vec<Param>,
+    /// Optional `-> Type` clause. `None` for void methods.
+    pub return_ty: Option<TypeExpr>,
     pub body: Block,
     pub span: Span,
 }

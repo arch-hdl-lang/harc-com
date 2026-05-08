@@ -12,6 +12,16 @@ transaction RegData
     !mode : uint<8>  default 0                // non-random; reserved for future
 end transaction RegData
 
+// Stimulus generator: yields N randomized RegData values. The run-block
+// iterates the resulting `std::vector<RegData>` with `for t in txns`.
+tseq RandomRegs(n: int) -> TSeq<RegData>
+    for _ in 0 .. n
+        let t : RegData
+        randomize(t)
+        yield t
+    end for
+end tseq RandomRegs
+
 test AxiLiteFuzzTest
     let dut : AxiLiteRegs
 end test AxiLiteFuzzTest

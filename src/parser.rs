@@ -731,13 +731,25 @@ impl Parser {
         let start = self.expect(TokenKind::Hookable)?.span;
         let name = self.expect_ident()?;
         let params = self.parse_paren_params()?;
+        let return_ty = if self.check(TokenKind::RArrow) {
+            self.advance();
+            Some(self.parse_type_expr()?)
+        } else {
+            None
+        };
         let body_start = self.peek_span();
         let stmts = self.parse_stmt_list_until_end()?;
         let end = self.expect_end(TokenKind::End, &name.name).or_else(|_| {
             // Allow `end <ident>` form (no specific keyword) — rare.
             Ok::<Span, CompileError>(body_start)
         })?;
-        Ok(HookableMethod { name, params, body: Block { stmts, span: body_start.merge(end) }, span: start.merge(end) })
+        Ok(HookableMethod {
+            name,
+            params,
+            return_ty,
+            body: Block { stmts, span: body_start.merge(end) },
+            span: start.merge(end),
+        })
     }
 
     // ── Test ──────────────────────────────────────────────────────────────────
