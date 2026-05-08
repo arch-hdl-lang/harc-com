@@ -1457,8 +1457,19 @@ impl Parser {
                 if self.check_ident("cycles") || self.check_ident("cycle") {
                     self.advance();
                 }
-                let span = start.merge(dur.span);
-                Ok(Stmt { kind: StmtKind::Wait { duration: dur, span }, span })
+                // Optional `on <clock>` clause — advances time so the named
+                // clock sees N more rising edges (other clocks tick at
+                // their natural rate). Useful for multi-clock CDC tests
+                // where the assertion is "after N dst_clk cycles, X holds".
+                let clock = if self.check(TokenKind::On) {
+                    self.advance();
+                    Some(self.expect_ident()?)
+                } else {
+                    None
+                };
+                let end_span = clock.as_ref().map(|c| c.span).unwrap_or(dur.span);
+                let span = start.merge(end_span);
+                Ok(Stmt { kind: StmtKind::Wait { duration: dur, clock, span }, span })
             }
             _ => {
                 // Expression-or-assignment statement.

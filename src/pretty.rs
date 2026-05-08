@@ -852,11 +852,15 @@ fn print_stmt(out: &mut String, s: &Stmt, depth: usize) {
             pad(out, depth);
             writeln!(out, "end after").ok();
         }
-        StmtKind::Wait { duration, .. } => {
+        StmtKind::Wait { duration, clock, .. } => {
             pad(out, depth);
             write!(out, "wait ").ok();
             print_expr(out, duration);
-            writeln!(out, " cycles").ok();
+            write!(out, " cycles").ok();
+            if let Some(c) = clock {
+                write!(out, " on {}", c.name).ok();
+            }
+            writeln!(out).ok();
         }
     }
 }
