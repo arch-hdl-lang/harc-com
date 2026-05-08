@@ -43,6 +43,7 @@ multi_clock_test        | MultiClockSync | multi_clock.sv         | async_fifo_d
 async_fifo_test         | AsyncBridge    | async_fifo.sv          | async_fifo_test_sim.harc async_fifo_domains.harc
 axilite_driver_test     | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_env_test        | AxiLiteRegs    | AxiLiteRegs.sv         |
+axilite_seqdrv_test     | AxiLiteRegs    | AxiLiteRegs.sv         |
 pkt_queue_test          | PacketQueue    | pkt_queue.sv           |
 linklist_basic_test     | TaskQueue      | linklist_basic.sv      |
 cam_basic_test          | Mshr_Addr_Cam  | cam_basic.sv           |
