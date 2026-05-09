@@ -1440,6 +1440,117 @@ impl Emitter {
         self.emit_component_handler_registrations_bound(comp, instance, depth, tag_prefix, None);
     }
 
+    /// Recursively walk a component's `Field`s and register handlers
+    /// for each sub-component or sub-transactor. Mode flows down the
+    /// inheritance chain via `inherited_mode`:
+    ///
+    /// ```text
+    ///   let topenv : OuterEnv passive
+    ///                ^^^^^^^^^^^^^^^^^
+    ///                root inherited_mode = Some(Passive)
+    ///
+    ///   env OuterEnv { ag : MyAgent }      → ag inherits Passive
+    ///   agent MyAgent { drv : T }          → drv inherits Passive
+    /// ```
+    ///
+    /// At each sub-field, the **field-level explicit mode** (e.g. `drv
+    /// : T active`) wins; only when the field has no mode does the
+    /// inherited mode apply. If a transactor sub-field ends up with no
+    /// mode (neither field-level nor inherited), it's a clear error.
+    ///
+    /// Sub-component connect edges are emitted here too — paths like
+    /// `sequencer.dispatched -> drv.req` inside an agent get prefixed
+    /// with the agent's instance path so they wire correctly when the
+    /// agent is composed into a parent env.
+    fn emit_subcomponent_handler_registrations(
+        &mut self,
+        comp: &ComponentDecl,
+        instance_path: &str,
+        inherited_mode: Option<TransactorMode>,
+        depth: usize,
+    ) {
+        for ci in &comp.items {
+            let f = match ci {
+                ComponentItem::Field(f) => f,
+                _ => continue,
+            };
+            let field_ty = match type_simple_name(Some(&f.ty)) {
+                Some(t) => t,
+                None => continue,
+            };
+            // Resolve effective mode: field-explicit wins over inherited.
+            let field_mode = match &f.ty {
+                TypeExpr::Named { mode: Some(m), .. } => Some(*m),
+                _ => None,
+            };
+            let effective_mode = field_mode.or(inherited_mode);
+
+            // Sub-component (driver/agent/env/sequencer/scoreboard).
+            if let Some(sub_comp) = self.components.get(field_ty).cloned() {
+                let sub_inst = format!("{}.{}", instance_path, f.name.name);
+                let sub_tag = format!("_{}_{}_", sub_comp.kind.keyword(), f.name.name);
+                self.emit_component_handler_registrations(&sub_comp, &sub_inst, depth, &sub_tag);
+                // Recurse into the sub-component's own sub-fields.
+                self.emit_subcomponent_handler_registrations(
+                    &sub_comp, &sub_inst, effective_mode, depth,
+                );
+                // Emit the sub-component's connect edges, prefixed
+                // with its instance path. Without this, an agent's
+                // `connect sequencer.dispatched -> drv.req` would
+                // never wire when the agent is composed into a parent
+                // env.
+                for sub_ci in &sub_comp.items {
+                    if let ComponentItem::Connect(cb) = sub_ci {
+                        for edge in &cb.edges {
+                            let from = expr_path_str(&edge.from);
+                            let to = expr_path_str(&edge.to);
+                            if let (Some(from), Some(to)) = (from, to) {
+                                self.pad(depth);
+                                writeln!(
+                                    self.out,
+                                    "{}.{}.push_back([&](auto _t) {{ for (auto& _s : {}.{}) _s(_t); }});",
+                                    sub_inst, from, sub_inst, to,
+                                ).ok();
+                            } else {
+                                self.errors.push(format!(
+                                    "connect: edge endpoints must be plain field paths in v0 cpp_tb"
+                                ));
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Transactor sub-field. Resolve mode and emit handlers
+            // through the synth ComponentDecl path.
+            if let Some(t) = self.transactors.get(field_ty).cloned() {
+                if t.bound_to.is_some() {
+                    self.errors.push(format!(
+                        "transactor field `{}.{} : {}` has a `bound to` clause; bound sub-components inside an env/agent are out of v0 scope",
+                        instance_path, f.name.name, field_ty,
+                    ));
+                    continue;
+                }
+                let mode = match effective_mode {
+                    Some(m) => m,
+                    None => {
+                        self.errors.push(format!(
+                            "transactor field `{}.{} : {}` has no mode and no parent specifies one; annotate the field or one of its parent let/field sites with `active`/`passive`",
+                            instance_path, f.name.name, field_ty,
+                        ));
+                        continue;
+                    }
+                };
+                let include_active = matches!(mode, TransactorMode::Active);
+                let synth = synth_component_from_transactor(&t, include_active);
+                let sub_inst = format!("{}.{}", instance_path, f.name.name);
+                let sub_tag = format!("_xactor_{}_", sub_inst.replace('.', "_"));
+                self.emit_component_handler_registrations(&synth, &sub_inst, depth, &sub_tag);
+            }
+        }
+    }
+
     /// Phase 2c: emit each `on bus.<ch>.handshake(arg)` handler in a
     /// `bound to BusType` monitor as an independent coroutine actor:
     ///
@@ -2281,57 +2392,74 @@ impl Emitter {
     /// (covers `<var>.<method>` and `<env>.<sub>.<method>`).
     fn resolve_component_hookable(&self, event: &Expr) -> Option<(String, String, Vec<Param>)> {
         let ExprKind::Field { target, name: method } = &*event.kind else { return None; };
-        let find_method = |c: &ComponentDecl, m: &str| -> Option<Vec<Param>> {
-            for it in &c.items {
+        // Walk the field-access chain, collecting path segments. Same
+        // shape as `resolve_component_method_call` — see that function
+        // for the rationale (env→agent→transactor.method requires
+        // arbitrary-depth chain resolution, not just two levels).
+        let mut path: Vec<String> = Vec::new();
+        let mut cur: &Expr = target;
+        loop {
+            match &*cur.kind {
+                ExprKind::Field { target: inner, name } => {
+                    path.push(name.name.clone());
+                    cur = inner;
+                }
+                ExprKind::Ident(id) => {
+                    path.push(id.name.clone());
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        path.reverse();
+
+        // Resolve type at each step.
+        let root = path.first()?;
+        let mut cur_ty: String = self.let_types.get(root)?.clone();
+        for seg in path.iter().skip(1) {
+            let next_ty = if let Some(comp) = self.components.get(&cur_ty) {
+                comp.items.iter().find_map(|it| {
+                    if let ComponentItem::Field(f) = it {
+                        if &f.name.name == seg {
+                            return type_simple_name(Some(&f.ty)).map(String::from);
+                        }
+                    }
+                    None
+                })
+            } else if let Some(t) = self.transactors.get(&cur_ty) {
+                let synth = synth_component_from_transactor(t, /*include_active*/true);
+                synth.items.iter().find_map(|it| {
+                    if let ComponentItem::Field(f) = it {
+                        if &f.name.name == seg {
+                            return type_simple_name(Some(&f.ty)).map(String::from);
+                        }
+                    }
+                    None
+                })
+            } else {
+                None
+            };
+            cur_ty = next_ty?;
+        }
+
+        // Find the hookable on cur_ty (component or transactor).
+        let find_method = |items: &[ComponentItem], m: &str| -> Option<Vec<Param>> {
+            for it in items {
                 if let ComponentItem::Hookable(h) = it {
                     if h.name.name == m { return Some(h.params.clone()); }
                 }
             }
             None
         };
-        let find_method_in_transactor = |t: &TransactorDecl, m: &str| -> Option<Vec<Param>> {
+        let params = if let Some(comp) = self.components.get(&cur_ty) {
+            find_method(&comp.items, &method.name)?
+        } else if let Some(t) = self.transactors.get(&cur_ty) {
             let synth = synth_component_from_transactor(t, /*include_active*/true);
-            find_method(&synth, m)
+            find_method(&synth.items, &method.name)?
+        } else {
+            return None;
         };
-
-        // <ident>.<method>
-        if let ExprKind::Ident(id) = &*target.kind {
-            let ty_name = self.let_types.get(&id.name)?;
-            if let Some(comp) = self.components.get(ty_name) {
-                let params = find_method(comp, &method.name)?;
-                return Some((ty_name.clone(), method.name.clone(), params));
-            }
-            if let Some(t) = self.transactors.get(ty_name) {
-                let params = find_method_in_transactor(t, &method.name)?;
-                return Some((ty_name.clone(), method.name.clone(), params));
-            }
-            return None;
-        }
-
-        // <ident>.<sub>.<method>
-        if let ExprKind::Field { target: outer, name: sub } = &*target.kind {
-            let ExprKind::Ident(id) = &*outer.kind else { return None; };
-            let outer_ty = self.let_types.get(&id.name)?;
-            let outer_comp = self.components.get(outer_ty)?;
-            let sub_ty = outer_comp.items.iter().find_map(|it| {
-                if let ComponentItem::Field(f) = it {
-                    if f.name.name == sub.name {
-                        return type_simple_name(Some(&f.ty));
-                    }
-                }
-                None
-            })?;
-            if let Some(sub_comp) = self.components.get(sub_ty) {
-                let params = find_method(sub_comp, &method.name)?;
-                return Some((sub_ty.to_string(), method.name.clone(), params));
-            }
-            if let Some(t) = self.transactors.get(sub_ty) {
-                let params = find_method_in_transactor(t, &method.name)?;
-                return Some((sub_ty.to_string(), method.name.clone(), params));
-            }
-            return None;
-        }
-        None
+        Some((cur_ty, method.name.clone(), params))
     }
 
     /// If `callee` is a method call on a known component, return the
@@ -2347,65 +2475,77 @@ impl Emitter {
     ///   `<method>` is a `hookable` on the sub-component's type.
     fn resolve_component_method_call(&self, callee: &Expr) -> Option<(String, String, String)> {
         let ExprKind::Field { target, name: method } = &*callee.kind else { return None; };
-        let comp_has_method = |c: &ComponentDecl, m: &str| -> bool {
-            c.items.iter().any(|it| matches!(
-                it, ComponentItem::Hookable(h) if h.name.name == m
+        // Walk the field-access chain to its root, collecting the path
+        // segments. `topenv.ag.sequencer.dispatch` produces
+        // path = ["topenv", "ag", "sequencer"] with method = "dispatch".
+        // The root must be an `Ident` (a let-bound name); inner
+        // segments are field names we resolve through the type chain.
+        let mut path: Vec<String> = Vec::new();
+        let mut cur: &Expr = target;
+        loop {
+            match &*cur.kind {
+                ExprKind::Field { target: inner, name } => {
+                    path.push(name.name.clone());
+                    cur = inner;
+                }
+                ExprKind::Ident(id) => {
+                    path.push(id.name.clone());
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        path.reverse();
+
+        // Resolve the type chain. Start from let_types[root]; walk
+        // remaining path segments looking each up as a Field on the
+        // current type.
+        let root = path.first()?;
+        let mut cur_ty: String = self.let_types.get(root)?.clone();
+        for seg in path.iter().skip(1) {
+            let next_ty = if let Some(comp) = self.components.get(&cur_ty) {
+                comp.items.iter().find_map(|it| {
+                    if let ComponentItem::Field(f) = it {
+                        if &f.name.name == seg {
+                            return type_simple_name(Some(&f.ty)).map(String::from);
+                        }
+                    }
+                    None
+                })
+            } else if let Some(t) = self.transactors.get(&cur_ty) {
+                let synth = synth_component_from_transactor(t, /*include_active*/true);
+                synth.items.iter().find_map(|it| {
+                    if let ComponentItem::Field(f) = it {
+                        if &f.name.name == seg {
+                            return type_simple_name(Some(&f.ty)).map(String::from);
+                        }
+                    }
+                    None
+                })
+            } else {
+                None
+            };
+            cur_ty = next_ty?;
+        }
+
+        // Does cur_ty (component or transactor) have a `hookable
+        // <method>`?
+        let has_method = |items: &[ComponentItem]| -> bool {
+            items.iter().any(|it| matches!(
+                it, ComponentItem::Hookable(h) if h.name.name == method.name
             ))
         };
-        let xact_has_method = |t: &TransactorDecl, m: &str| -> bool {
+        let found = if let Some(comp) = self.components.get(&cur_ty) {
+            has_method(&comp.items)
+        } else if let Some(t) = self.transactors.get(&cur_ty) {
             let synth = synth_component_from_transactor(t, /*include_active*/true);
-            comp_has_method(&synth, m)
+            has_method(&synth.items)
+        } else {
+            false
         };
+        if !found { return None; }
 
-        // <ident>.<method>
-        if let ExprKind::Ident(id) = &*target.kind {
-            let ty_name = self.let_types.get(&id.name)?;
-            if let Some(comp) = self.components.get(ty_name) {
-                if comp_has_method(comp, &method.name) {
-                    return Some((ty_name.clone(), id.name.clone(), method.name.clone()));
-                }
-            }
-            if let Some(t) = self.transactors.get(ty_name) {
-                if xact_has_method(t, &method.name) {
-                    return Some((ty_name.clone(), id.name.clone(), method.name.clone()));
-                }
-            }
-            return None;
-        }
-
-        // <ident>.<sub>.<method>
-        if let ExprKind::Field { target: outer, name: sub } = &*target.kind {
-            let ExprKind::Ident(id) = &*outer.kind else { return None; };
-            let outer_ty = self.let_types.get(&id.name)?;
-            let outer_comp = self.components.get(outer_ty)?;
-            let sub_ty = outer_comp.items.iter().find_map(|it| {
-                if let ComponentItem::Field(f) = it {
-                    if f.name.name == sub.name {
-                        return type_simple_name(Some(&f.ty));
-                    }
-                }
-                None
-            })?;
-            if let Some(sub_comp) = self.components.get(sub_ty) {
-                if comp_has_method(sub_comp, &method.name) {
-                    return Some((
-                        sub_ty.to_string(),
-                        format!("{}.{}", id.name, sub.name),
-                        method.name.clone(),
-                    ));
-                }
-            }
-            if let Some(t) = self.transactors.get(sub_ty) {
-                if xact_has_method(t, &method.name) {
-                    return Some((
-                        sub_ty.to_string(),
-                        format!("{}.{}", id.name, sub.name),
-                        method.name.clone(),
-                    ));
-                }
-            }
-        }
-        None
+        Some((cur_ty, path.join("."), method.name.clone()))
     }
 
     /// Emit a single `hookable` method on a component as a free
@@ -4059,79 +4199,29 @@ impl Emitter {
                     // the same source span don't collide.
                     let tag = format!("_{}_", comp.kind.keyword());
                     self.emit_component_handler_registrations(&comp, &l.name.name, depth, &tag);
-                    // Also register handlers for sub-component fields
-                    // (e.g. an `env` whose fields are `drv : MyDriver` —
-                    // each sub-component's on-handlers wire to the
-                    // sub-instance's path).
-                    for ci in &comp.items {
-                        if let ComponentItem::Field(f) = ci {
-                            if let Some(field_ty) = type_simple_name(Some(&f.ty)) {
-                                if let Some(sub) = self.components.get(field_ty).cloned() {
-                                    let sub_inst = format!("{}.{}", l.name.name, f.name.name);
-                                    let sub_tag = format!("_{}_{}_", comp.kind.keyword(), f.name.name);
-                                    self.emit_component_handler_registrations(&sub, &sub_inst, depth, &sub_tag);
-                                }
-                            }
-                        }
-                    }
-                    // Transactor sub-fields (e.g. `agent A { drv : T }`).
-                    // The transactor's mode is resolved from the field's
-                    // own annotation if present, else inherited from the
-                    // parent let's instantiation mode. This is how the
-                    // same agent declaration can be reused as both active
-                    // and passive: `agent A { drv : T }` + `let a : A
-                    // active` makes `a.drv` active; `let a : A passive`
-                    // makes it passive. An explicit field-level mode
-                    // (`drv : T active`) overrides the parent.
+                    // Recurse through sub-component / sub-transactor
+                    // fields with mode propagation. The let-instance's
+                    // mode is the root of the inheritance chain:
                     //
-                    // Bound transactor sub-fields are out of v0 scope
-                    // (spec §8 / line 1017) — only top-level `let xact :
-                    // T mode = bind axil` is supported today.
-                    let parent_mode = match l.ty.as_ref() {
+                    //   let topenv : OuterEnv passive
+                    //                ^^^^^^^^^^^^^^^^^
+                    //   propagates →  env's agent fields         (no mode → passive)
+                    //   propagates →    agent's transactor fields (no mode → passive)
+                    //
+                    // At each level a field-level explicit mode wins
+                    // over the inherited mode. See
+                    // `emit_subcomponent_handler_registrations`.
+                    let root_mode = match l.ty.as_ref() {
                         Some(TypeExpr::Named { mode: Some(m), .. }) => Some(*m),
                         _ => None,
                     };
-                    for ci in &comp.items {
-                        if let ComponentItem::Field(f) = ci {
-                            if let Some(field_ty) = type_simple_name(Some(&f.ty)) {
-                                if let Some(t) = self.transactors.get(field_ty).cloned() {
-                                    if t.bound_to.is_some() {
-                                        self.errors.push(format!(
-                                            "let {} : {}: transactor field `{}.{} : {}` has a `bound to` clause; bound sub-components inside an env/agent are out of v0 scope",
-                                            l.name.name, name, name, f.name.name, field_ty,
-                                        ));
-                                        continue;
-                                    }
-                                    let field_mode = match &f.ty {
-                                        TypeExpr::Named { mode: Some(m), .. } => Some(*m),
-                                        _ => None,
-                                    };
-                                    let mode = match field_mode.or(parent_mode) {
-                                        Some(m) => m,
-                                        None => {
-                                            self.errors.push(format!(
-                                                "let {} : {}: transactor field `{}.{} : {}` has no mode and parent has no mode either; specify `let {} : {} active|passive` or annotate the field",
-                                                l.name.name, name, name, f.name.name, field_ty, l.name.name, name,
-                                            ));
-                                            continue;
-                                        }
-                                    };
-                                    let include_active = matches!(mode, TransactorMode::Active);
-                                    let synth = synth_component_from_transactor(&t, include_active);
-                                    let sub_inst = format!("{}.{}", l.name.name, f.name.name);
-                                    let sub_tag = format!("_xactor_{}_{}_", l.name.name, f.name.name);
-                                    self.emit_component_handler_registrations(
-                                        &synth, &sub_inst, depth, &sub_tag,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    // Wire `connect a -> b` edges. Each edge installs a
-                    // bridge subscriber on `<env>.<a>` that fans out to
-                    // every subscriber of `<env>.<b>`. Generic-lambda
-                    // payload (`auto`) so we don't need to look up the
-                    // event's type at the connect site.
+                    self.emit_subcomponent_handler_registrations(
+                        &comp, &l.name.name, root_mode, depth,
+                    );
+                    // Top-level connect edges (the let's own component's
+                    // connect block, if any). Nested sub-component
+                    // connects are emitted inside the recursive helper
+                    // above so they're prefixed by the sub-instance path.
                     for ci in &comp.items {
                         if let ComponentItem::Connect(cb) = ci {
                             for edge in &cb.edges {
