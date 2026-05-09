@@ -71,6 +71,52 @@ end test T"#,
     assert!(err.0.contains("let dut"));
 }
 
+/// `dut.<signal> = <expr>` and `dut.<signal>` accesses lower through
+/// `harc_rt::harc_assign(...)` and `harc_rt::harc_read(...)` so wide
+/// signals (Verilator's `VlWide<N>` for >64-bit ports) work without
+/// the test author having to think about word-level decomposition.
+/// Narrow signals see the same wrapper, which `if constexpr`-folds
+/// to a plain assignment / cast.
+#[test]
+fn pointer_rooted_signal_access_uses_wide_helpers() {
+    let parsed = parse_source(
+        r#"test T
+    let dut : DummyDut
+    scope sim
+        run
+            dut.wide_in = 305419896
+            dut.narrow_in = 5
+            assert dut.wide_out == 305419896
+                else fail("wide read")
+            let v = dut.wide_out + 1
+        end run
+    end scope sim
+end test T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+
+    // Writes lower as harc_assign(...).
+    assert!(cpp.contains("harc_rt::harc_assign(dut->wide_in,"),
+        "expected `harc_rt::harc_assign(dut->wide_in, ...)` in:\n{}", cpp);
+    assert!(cpp.contains("harc_rt::harc_assign(dut->narrow_in,"),
+        "expected `harc_rt::harc_assign(dut->narrow_in, ...)` in:\n{}", cpp);
+
+    // Reads lower as harc_read(...).
+    assert!(cpp.contains("harc_rt::harc_read(dut->wide_out)"),
+        "expected `harc_rt::harc_read(dut->wide_out)` in:\n{}", cpp);
+
+    // L-value path must NOT wrap with harc_read — the assignment
+    // target stays a plain L-value reference passed to harc_assign.
+    // Spot-check: the assignment line should contain the field as
+    // an L-value, not `harc_read(dut->wide_in)`.
+    let assign_line = cpp.lines()
+        .find(|l| l.contains("harc_assign(dut->wide_in,"))
+        .expect("expected assign line");
+    assert!(!assign_line.contains("harc_read(dut->wide_in"),
+        "L-value position must not be wrapped with harc_read:\n{}", assign_line);
+}
+
 /// `const NAME : Ty = expr` lowers to a file-scope `static constexpr`
 /// so it's available inside `main()`, hookable lambdas, tseq lambdas,
 /// and on-handler closures.

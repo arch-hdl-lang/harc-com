@@ -3441,17 +3441,38 @@ impl Emitter {
             StmtKind::Let(l) => self.emit_let(l, depth),
             StmtKind::Send { target, value } => {
                 self.pad(depth);
-                self.emit_lvalue(target);
-                write!(self.out, " = ").ok();
-                self.emit_expr(value);
-                writeln!(self.out, ";").ok();
+                if self.is_pointer_rooted_signal_lvalue(target) {
+                    // Wrap as harc_assign(lvalue, rhs) so wide signals
+                    // (VlWide<N> from Verilator for >64-bit ports) get
+                    // per-word writes. Narrow signals see a plain
+                    // assignment via the template's `if constexpr`
+                    // branch.
+                    write!(self.out, "harc_rt::harc_assign(").ok();
+                    self.emit_lvalue(target);
+                    write!(self.out, ", ").ok();
+                    self.emit_expr(value);
+                    writeln!(self.out, ");").ok();
+                } else {
+                    self.emit_lvalue(target);
+                    write!(self.out, " = ").ok();
+                    self.emit_expr(value);
+                    writeln!(self.out, ";").ok();
+                }
             }
             StmtKind::Assign { target, value } => {
                 self.pad(depth);
-                self.emit_lvalue(target);
-                write!(self.out, " = ").ok();
-                self.emit_expr(value);
-                writeln!(self.out, ";").ok();
+                if self.is_pointer_rooted_signal_lvalue(target) {
+                    write!(self.out, "harc_rt::harc_assign(").ok();
+                    self.emit_lvalue(target);
+                    write!(self.out, ", ").ok();
+                    self.emit_expr(value);
+                    writeln!(self.out, ");").ok();
+                } else {
+                    self.emit_lvalue(target);
+                    write!(self.out, " = ").ok();
+                    self.emit_expr(value);
+                    writeln!(self.out, ";").ok();
+                }
             }
             StmtKind::For(f) => {
                 self.pad(depth);
@@ -4294,7 +4315,29 @@ impl Emitter {
         self.emit_expr_with_arrow(e, false);
     }
 
-    fn emit_expr_with_arrow(&mut self, e: &Expr, _lvalue: bool) {
+    /// Returns true if `e` is an L-value that ultimately lowers to a
+    /// `<root>-><field>...` access chain (where `<root>` is a DUT pointer
+    /// or bus-binding root). These are the cases where Verilator may
+    /// have given the leaf signal a wide type (`VlWide<N>` for >64-bit
+    /// ports), so plain `lhs = rhs` won't compile and we instead emit
+    /// a `harc_rt::harc_assign(lhs, rhs);` call.
+    fn is_pointer_rooted_signal_lvalue(&self, e: &Expr) -> bool {
+        // Walk down field-access chain; root must be Ident in either
+        // pointer_vars (e.g. `dut`) or bus_bindings (e.g. `axil`).
+        let mut cur: &Expr = e;
+        loop {
+            match &*cur.kind {
+                ExprKind::Field { target, .. } => cur = target,
+                ExprKind::Ident(id) => {
+                    return self.pointer_vars.contains(&id.name)
+                        || self.bus_bindings.contains_key(&id.name);
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    fn emit_expr_with_arrow(&mut self, e: &Expr, lvalue: bool) {
         // Property-time substitutions for temporal SystemCall expressions.
         // `emit_property_check` populates `prop_subs` with span → snippet for
         // each `$past`/`$rose`/`$fell`/`$stable` occurrence; if we encounter
@@ -4332,7 +4375,15 @@ impl Emitter {
                 // handshake_channel groupings and emits
                 // `<root>-><axil>_aw_addr`.
                 if let Some(s) = self.try_emit_bus_field_access(target, name) {
-                    write!(self.out, "{s}").ok();
+                    if lvalue {
+                        write!(self.out, "{s}").ok();
+                    } else {
+                        // Wrap reads with harc_rt::harc_read so wide
+                        // signals (Verilator's VlWide<N> for >64-bit
+                        // ports) implicitly convert to uint64_t. For
+                        // narrow signals it's a no-op cast.
+                        write!(self.out, "harc_rt::harc_read({s})").ok();
+                    }
                     return;
                 }
                 // Pointer-typed identifiers (DUTs, threaded as Named-type
@@ -4342,6 +4393,10 @@ impl Emitter {
                 let is_pointer_root = matches!(&*target.kind,
                     ExprKind::Ident(id) if self.pointer_vars.contains(&id.name)
                 );
+                let wrap_read = is_pointer_root && !lvalue;
+                if wrap_read {
+                    write!(self.out, "harc_rt::harc_read(").ok();
+                }
                 self.emit_expr(target);
                 if is_pointer_root {
                     write!(self.out, "->").ok();
@@ -4349,6 +4404,9 @@ impl Emitter {
                     write!(self.out, ".").ok();
                 }
                 write!(self.out, "{}", name.name).ok();
+                if wrap_read {
+                    write!(self.out, ")").ok();
+                }
             }
             ExprKind::Index { target, index } => {
                 self.emit_expr(target);
