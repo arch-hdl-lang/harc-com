@@ -41,7 +41,6 @@ synchronizer_wide_test  | DataSync       | synchronizer_wide.sv   |
 synchronizer_pulse_test | EventSync      | synchronizer_pulse.sv  | synchronizer_pulse_domains.harc
 multi_clock_test        | MultiClockSync | multi_clock.sv         | async_fifo_domains.harc
 async_fifo_test         | AsyncBridge    | async_fifo.sv          | async_fifo_test_sim.harc async_fifo_domains.harc
-axilite_driver_test     | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_env_test        | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_seqdrv_test     | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_connect_test    | AxiLiteRegs    | AxiLiteRegs.sv         |
@@ -49,7 +48,6 @@ axilite_hooks_test      | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_bus_test        | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_bus_extern_test | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_bus_send_test   | AxiLiteRegs    | AxiLiteRegs.sv         |
-axilite_bound_drv_test  | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_bound_mon_test  | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_multi_payload_test | AxiLiteRegs | AxiLiteRegs.sv         |
 axilite_regs_full_test  | AxiLiteRegs    | AxiLiteRegs.sv         |

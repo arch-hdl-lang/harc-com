@@ -1,16 +1,22 @@
-// AxiLiteRegs test using `env` to compose a `driver` and a
-// `scoreboard` into a single named environment. Demonstrates Tier C's
-// composite-component shape end-to-end:
+// AxiLiteRegs test using `env` to compose a transactor (helper-method
+// flavor) and a `scoreboard` into a single named environment.
+// Demonstrates the composite-component shape end-to-end:
 //
 //   env E
-//       drv : D
+//       drv : Drv passive
 //       sb  : S
 //   end env E
 //
-// lowers to `struct E { D drv; S sb; };`. Method calls compose:
-// `env.drv.send(args)` rewrites to `D_send(env.drv, args)`. The
-// scoreboard's `expected.push(...)` works through ordinary struct
+// lowers to `struct E { Drv drv; S sb; };`. Method calls compose:
+// `env.drv.axil_write(args)` rewrites to `Drv_axil_write(env.drv, args)`.
+// The scoreboard's `expected.push(...)` works through ordinary struct
 // field access.
+//
+// The transactor here uses only the always-on body — no `when active`
+// half — because the methods are called directly from the test scope
+// (no event-driven dispatch). Mode `passive` at the field site
+// suppresses the active-half codegen, matching the methods-only
+// shape.
 
 transaction AxilTxn
     addr  : uint<8>  with [range(0, 64)]
@@ -18,7 +24,7 @@ transaction AxilTxn
     !mode : uint<8>  default 0
 end transaction AxilTxn
 
-driver AxilDrv
+transactor AxilXactor
     dut : AxiLiteRegs
 
     hookable axil_write(addr: uint<8>, data: uint<32>)
@@ -52,19 +58,15 @@ driver AxilDrv
         wait 1 cycle
         return val
     end axil_read
-end driver AxilDrv
+end transactor AxilXactor
 
 scoreboard AxilSb
-    // Track expected payload values only — `queue<uint32_t>` keeps the
-    // codegen path straightforward (queue<TxnType> would require the
-    // queue's type-arg to round-trip user-defined struct types, which
-    // is a separate v0 lowering hole).
     expected : queue<uint<32>>
     errors   : uint<32> default 0
 end scoreboard AxilSb
 
 env AxilEnv
-    drv : AxilDrv
+    drv : AxilXactor passive
     sb  : AxilSb
 end env AxilEnv
 

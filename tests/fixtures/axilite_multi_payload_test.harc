@@ -1,10 +1,12 @@
-// Bound coroutine monitor exercising multi-payload `bus.<ch>.handshake(t)`
-// captures. AXI-Lite's `r` channel carries both `data` and `resp` —
-// the monitor pushes both into the scoreboard so the test can assert
-// each round-trip's resp == OKAY (0).
+// Multi-payload transactor exercising:
+//   - active: `let beat = bus.r.recv()` returning the full payload
+//     struct (`beat.data`, `beat.resp`)
+//   - passive: `on bus.r.handshake(beat)` capturing the full
+//     payload struct on the observation side
 //
-// Same pattern works for `let beat = bus.r.recv(); beat.data; beat.resp`
-// — the auto-handshake also captures the full payload.
+// Replaces the legacy `driver AxilDrv bound to BusAxiLite` +
+// `monitor AxilMon bound to BusAxiLite` split. One transactor with
+// both halves; two instances at the test scope (active + passive).
 
 use BusAxiLite
 
@@ -13,48 +15,47 @@ transaction RegOp
     value : uint<32>
 end transaction RegOp
 
-driver AxilDrv bound to BusAxiLite
-    req       : in event<RegOp>
-    last_data : uint<32> default 0
-    last_resp : uint<32> default 99   // sentinel: 99 = "not yet observed"
-
-    on req(t)
-        bus.aw.addr = t.addr
-        bus.aw.valid = 1
-        bus.w.send(t.value, 15)
-        bus.aw.valid = 0
-        wait 2 cycles
-        bus.ar.addr = t.addr
-        bus.ar.valid = 1
-
-        // recv() now returns the full payload struct. `.data` and
-        // `.resp` are both available; legacy scalar use still works
-        // via the implicit-conversion operator (e.g. `last_data = beat`
-        // would assign the first payload field, `data`).
-        let beat = bus.r.recv()
-        bus.ar.valid = 0
-        wait 1 cycle
-        last_data = beat.data
-        last_resp = beat.resp
-    end on
-end driver AxilDrv
-
 scoreboard AxilSb
     r_data : queue<uint<32>>
     r_resp : queue<uint<32>>
 end scoreboard AxilSb
 
-// Bound monitor with multi-payload handler. `beat.data` and
-// `beat.resp` access work because the on-handler's `arg` is now
-// bound to the channel's full payload struct.
-monitor AxilMon bound to BusAxiLite
-    sb : AxilSb
+transactor AxilXactor bound to BusAxiLite
+    sb        : AxilSb
+    last_data : uint<32> default 0
+    last_resp : uint<32> default 99   // sentinel: 99 = "not yet observed"
 
+    // Always-on multi-payload observation. `beat.data` and
+    // `beat.resp` resolve through the channel's full payload
+    // struct.
     on bus.r.handshake(beat)
         sb.r_data.push(beat.data)
         sb.r_resp.push(beat.resp)
     end on
-end monitor AxilMon
+
+    when active
+        req : in event<RegOp>
+
+        on req(t)
+            bus.aw.addr = t.addr
+            bus.aw.valid = 1
+            bus.w.send(t.value, 15)
+            bus.aw.valid = 0
+            wait 2 cycles
+            bus.ar.addr = t.addr
+            bus.ar.valid = 1
+
+            // recv() returns the full payload struct. `.data` and
+            // `.resp` are both available; legacy scalar use still
+            // works via the implicit-conversion operator.
+            let beat = bus.r.recv()
+            bus.ar.valid = 0
+            wait 1 cycle
+            last_data = beat.data
+            last_resp = beat.resp
+        end on
+    end when
+end transactor AxilXactor
 
 tseq RandomTxns(n: int) -> TSeq<RegOp>
     for _ in 0 .. n
@@ -68,12 +69,12 @@ end tseq RandomTxns
 test AxiLiteMultiPayloadTest
     let dut  : AxiLiteRegs
     let axil : BusAxiLite = bind dut
-    let drv  : AxilDrv    = bind axil
-    let mon  : AxilMon    = bind axil
+    let drv  : AxilXactor active  = bind axil
+    let mon  : AxilXactor passive = bind axil
 
     scope sim
         run
-            log(info, "AxiLiteRegs multi-payload bus.r.recv / handshake test")
+            log(info, "AxiLiteRegs multi-payload transactor test")
 
             dut.rst = 1
             axil.aw.valid = 0
@@ -101,13 +102,13 @@ test AxiLiteMultiPayloadTest
             end for
             wait 60 cycles
 
-            // Driver populated last_data and last_resp from the FINAL
-            // round-trip. The DUT (AxiLiteRegs) returns OKAY (resp=0)
+            // Active populated last_data and last_resp from the
+            // FINAL round-trip. AxiLiteRegs returns OKAY (resp=0)
             // for valid register-bank reads.
             assert drv.last_resp == 0
                 else fail("expected OKAY (resp=0) on final read, got resp=${drv.last_resp}")
 
-            // Monitor pushed (data, resp) for each of 5 reads.
+            // Passive pushed (data, resp) for each of 5 reads.
             assert mon.sb.r_data.size() == 5
                 else fail("expected 5 r_data observations, got ${mon.sb.r_data.size()}")
             assert mon.sb.r_resp.size() == 5
@@ -117,7 +118,7 @@ test AxiLiteMultiPayloadTest
             for _ in 0 .. 5
                 let r = mon.sb.r_resp.pop()
                 assert r == 0
-                    else fail("monitor saw non-OKAY resp: ${r}")
+                    else fail("passive observer saw non-OKAY resp: ${r}")
             end for
 
             log(info, "PASS: multi-payload recv() + handshake() captured data + resp on 5 round-trips")
