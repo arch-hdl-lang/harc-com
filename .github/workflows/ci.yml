@@ -106,8 +106,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Z3 + Verilator
-        run: sudo apt-get update && sudo apt-get install -y libz3-dev verilator
+      - name: Install Z3 + Verilator + clang
+        # clang is needed because the emitted test `.cpp` uses
+        # `#pragma clang optimize off` to work around a C++20
+        # lambda-coroutine miscompile at `-Os` (verilator default)
+        # that affects both clang and GCC. GCC's equivalent pragma
+        # doesn't propagate through coroutine codegen, so we use
+        # clang on both platforms. See `run_verilator` in
+        # src/main.rs and the prelude in src/codegen/cpp_tb.rs
+        # for the full rationale.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libz3-dev verilator clang
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -123,4 +133,9 @@ jobs:
         run: cargo build --release --bin harc
 
       - name: Run all fixtures end-to-end
+        env:
+          # Force the verilator build to use clang++ — see comment
+          # on `CXX=` in src/main.rs's run_verilator(). HARC_CXX
+          # propagates via -MAKEFLAGS into the verilator makefile.
+          HARC_CXX: clang++
         run: ./tests/run_fixtures.sh
