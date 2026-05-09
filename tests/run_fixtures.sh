@@ -58,6 +58,7 @@ pkt_queue_test          | PacketQueue    | pkt_queue.sv           |
 linklist_basic_test     | TaskQueue      | linklist_basic.sv      |
 cam_basic_test          | Mshr_Addr_Cam  | cam_basic.sv           |
 cpu_pipeline_test       | CpuPipe        | cpu_pipeline.sv        |
+linklist_doubly_test    | SchedList      | linklist_doubly.sv     |
 EOF
 
 PASS=0
