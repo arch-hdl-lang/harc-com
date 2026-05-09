@@ -70,3 +70,58 @@ end test T"#,
     let err = cpp_tb::emit(&parsed).unwrap_err();
     assert!(err.0.contains("let dut"));
 }
+
+/// Spec §7.7: `log(error, ...)` increments the failure counter, and
+/// `log(fatal, ...)` additionally sets a flag so the main simulation
+/// loop aborts at end of the current cycle. `info` / `warn` / `debug`
+/// have no test-result effect.
+#[test]
+fn log_severity_test_result_semantics() {
+    // We need a `let dut : SomeModule` to satisfy the emit prelude;
+    // the actual lowering doesn't depend on it.
+    let parsed = parse_source(
+        r#"test T
+    let dut : DummyDut
+    scope sim
+        run
+            log(info,  "info: no effect")
+            log(warn,  "warn: no effect")
+            log(debug, "debug: no effect")
+            log(error, "error: should bump counter")
+            log(fatal, "fatal: should abort")
+        end run
+    end scope sim
+end test T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+
+    // Sanity: the test-result flag is declared.
+    assert!(cpp.contains("bool _fatal = false;"),
+        "expected `_fatal` flag declaration in main()");
+
+    // The main simulation loop guard checks _fatal so the test instance
+    // exits at end of current cycle when fatal is set.
+    assert!(cpp.contains("&& !_fatal"),
+        "expected main loop to check `!_fatal`");
+
+    // `log(info|warn|debug, ...)` must not bump errors. We grep for
+    // `sim_log_line(\"INFO\"`, ... and verify the line that follows is
+    // NOT `errors++`. Easier: count `errors++;` occurrences and confirm
+    // exactly the right number.
+    //
+    // Each line starts a printf-call. After the closing `);`, the next
+    // statement is either nothing (info/warn/debug) or `errors++;`
+    // (error) or `errors++; _fatal = true;` (fatal).
+    let errors_inc_count = cpp.matches("errors++;").count();
+    // From-source: 2 (one for log(error), one for log(fatal)).
+    // Plus existing `errors++;` from assert/fail paths: 0 here (no
+    // asserts in the fixture).
+    assert_eq!(errors_inc_count, 2,
+        "expected exactly 2 `errors++;` lines (one for ERROR, one for FATAL); \
+         got {} in:\n{}", errors_inc_count, cpp);
+
+    // `log(fatal, ...)` additionally sets `_fatal = true`.
+    assert!(cpp.contains("_fatal = true;"),
+        "expected `_fatal = true;` in FATAL lowering");
+}
