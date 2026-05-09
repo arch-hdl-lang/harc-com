@@ -178,6 +178,23 @@ pub enum TokenKind {
     Driver,
     #[token("monitor")]
     Monitor,
+    /// Transactor — synthesizable BFM combining driver + monitor under
+    /// one roof (spec §8.1). Distinct from `driver`/`monitor` so the
+    /// parser can dispatch the right body grammar (which permits a
+    /// `when active` block) and the codegen knows to emit the SCE-MI
+    /// pipe surface + ARCH-side module rather than a plain SW lambda.
+    #[token("transactor")]
+    Transactor,
+    /// Mode tokens for transactor instantiation (`let xact : T active
+    /// = bind axil`) and for the in-body `when active` block. Both
+    /// `active` and `passive` reserve as hard keywords — neither is
+    /// used as an identifier in any existing fixture, and the
+    /// alternative (soft-ident matching) would mean two extra
+    /// `check_ident` sites per parser path. v0 fixtures don't break.
+    #[token("active")]
+    Active,
+    #[token("passive")]
+    Passive,
     #[token("sequencer")]
     Sequencer,
     #[token("tseq")]
@@ -530,6 +547,9 @@ impl fmt::Display for TokenKind {
             Env => write!(f, "env"),
             Driver => write!(f, "driver"),
             Monitor => write!(f, "monitor"),
+            Transactor => write!(f, "transactor"),
+            Active => write!(f, "active"),
+            Passive => write!(f, "passive"),
             Sequencer => write!(f, "sequencer"),
             Tseq => write!(f, "tseq"),
             Scoreboard => write!(f, "scoreboard"),
