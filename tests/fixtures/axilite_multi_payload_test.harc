@@ -1,0 +1,126 @@
+// Bound coroutine monitor exercising multi-payload `bus.<ch>.handshake(t)`
+// captures. AXI-Lite's `r` channel carries both `data` and `resp` —
+// the monitor pushes both into the scoreboard so the test can assert
+// each round-trip's resp == OKAY (0).
+//
+// Same pattern works for `let beat = bus.r.recv(); beat.data; beat.resp`
+// — the auto-handshake also captures the full payload.
+
+use BusAxiLite
+
+transaction RegOp
+    addr  : uint<8>  with [range(0, 64)]
+    value : uint<32>
+end transaction RegOp
+
+driver AxilDrv bound to BusAxiLite
+    req       : in event<RegOp>
+    last_data : uint<32> default 0
+    last_resp : uint<32> default 99   // sentinel: 99 = "not yet observed"
+
+    on req(t)
+        bus.aw.addr = t.addr
+        bus.aw.valid = 1
+        bus.w.send(t.value, 15)
+        bus.aw.valid = 0
+        wait 2 cycles
+        bus.ar.addr = t.addr
+        bus.ar.valid = 1
+
+        // recv() now returns the full payload struct. `.data` and
+        // `.resp` are both available; legacy scalar use still works
+        // via the implicit-conversion operator (e.g. `last_data = beat`
+        // would assign the first payload field, `data`).
+        let beat = bus.r.recv()
+        bus.ar.valid = 0
+        wait 1 cycle
+        last_data = beat.data
+        last_resp = beat.resp
+    end on
+end driver AxilDrv
+
+scoreboard AxilSb
+    r_data : queue<uint<32>>
+    r_resp : queue<uint<32>>
+end scoreboard AxilSb
+
+// Bound monitor with multi-payload handler. `beat.data` and
+// `beat.resp` access work because the on-handler's `arg` is now
+// bound to the channel's full payload struct.
+monitor AxilMon bound to BusAxiLite
+    sb : AxilSb
+
+    on bus.r.handshake(beat)
+        sb.r_data.push(beat.data)
+        sb.r_resp.push(beat.resp)
+    end on
+end monitor AxilMon
+
+tseq RandomTxns(n: int) -> TSeq<RegOp>
+    for _ in 0 .. n
+        let t : RegOp
+        randomize(t)
+        t.addr = 24
+        yield t
+    end for
+end tseq RandomTxns
+
+test AxiLiteMultiPayloadTest
+    let dut  : AxiLiteRegs
+    let axil : BusAxiLite = bind dut
+    let drv  : AxilDrv    = bind axil
+    let mon  : AxilMon    = bind axil
+
+    scope sim
+        run
+            log(info, "AxiLiteRegs multi-payload bus.r.recv / handshake test")
+
+            dut.rst = 1
+            axil.aw.valid = 0
+            axil.w.valid = 0
+            axil.b.ready = 1
+            axil.ar.valid = 0
+            axil.r.ready = 1
+            dut.mm2s_done = 0
+            dut.mm2s_halted = 1
+            dut.mm2s_idle = 1
+            dut.s2mm_done = 0
+            dut.s2mm_halted = 1
+            dut.s2mm_idle = 1
+            dut.mm2s_sg_done = 0
+            dut.s2mm_sg_done = 0
+            dut.mm2s_sg_active = 0
+            dut.s2mm_sg_active = 0
+            wait 2 cycles
+            dut.rst = 0
+            wait 1 cycle
+
+            let txns = RandomTxns(5)
+            for t in txns
+                emit drv.req(t)
+            end for
+            wait 60 cycles
+
+            // Driver populated last_data and last_resp from the FINAL
+            // round-trip. The DUT (AxiLiteRegs) returns OKAY (resp=0)
+            // for valid register-bank reads.
+            assert drv.last_resp == 0
+                else fail("expected OKAY (resp=0) on final read, got resp=${drv.last_resp}")
+
+            // Monitor pushed (data, resp) for each of 5 reads.
+            assert mon.sb.r_data.size() == 5
+                else fail("expected 5 r_data observations, got ${mon.sb.r_data.size()}")
+            assert mon.sb.r_resp.size() == 5
+                else fail("expected 5 r_resp observations, got ${mon.sb.r_resp.size()}")
+
+            // Drain the resp queue; every entry should be 0 (OKAY).
+            for _ in 0 .. 5
+                let r = mon.sb.r_resp.pop()
+                assert r == 0
+                    else fail("monitor saw non-OKAY resp: ${r}")
+            end for
+
+            log(info, "PASS: multi-payload recv() + handshake() captured data + resp on 5 round-trips")
+        end run
+    end scope sim
+end test AxiLiteMultiPayloadTest
