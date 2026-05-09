@@ -88,23 +88,6 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
 }
 
 pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitError> {
-    // T-1 stop: transactor codegen is not yet implemented. Source
-    // text using `transactor` parses and round-trips through harc
-    // fmt, but `harc sim` errors clearly until the SW-side codegen
-    // (T-2) lands. The same goes for the active/passive mode
-    // annotation at let sites — if no transactor decl exists in
-    // the file, a stray `T active` annotation likely indicates the
-    // user expected a transactor; we reject early with the same
-    // diagnostic. See spec §8.1 for the implementation roadmap.
-    for it in &file.items {
-        if let Item::Transactor(t) = it {
-            return Err(EmitError(format!(
-                "`transactor {}` codegen is not yet implemented (spec §8.1, scheduled for v0+ phase T-2). Today's fixtures use `driver` / `monitor` / `agent` (spec §8.3) which compile end-to-end. The transactor's source surface parses and `harc fmt`-round-trips today; `harc check` accepts it; `harc sim` will pick it up once T-2 ships SW-side codegen against the SCE-MI pipe surface.",
-                t.name.name,
-            )));
-        }
-    }
-
     // Find a single `test` item — the entry point.
     let test = file.items.iter().find_map(|it| match it {
         Item::Test(t) => Some(t),
@@ -203,6 +186,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         std::collections::HashMap::new();
     let mut buses: std::collections::HashMap<String, BusDecl> =
         std::collections::HashMap::new();
+    let mut transactors: std::collections::HashMap<String, TransactorDecl> =
+        std::collections::HashMap::new();
     let mut txn_fields: std::collections::HashMap<String, Vec<TxnFieldInfo>> =
         std::collections::HashMap::new();
     let mut enums = std::collections::HashMap::new();
@@ -218,6 +203,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             }
             Item::Covergroup(g) => { covergroups.insert(g.name.name.clone(), g.clone()); }
             Item::Bus(b) => { buses.insert(b.name.name.clone(), b.clone()); }
+            Item::Transactor(t) => { transactors.insert(t.name.name.clone(), t.clone()); }
             _ => {}
         }
     }
@@ -275,6 +261,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                 || components.contains_key(simple)
                 || covergroups.contains_key(simple)
                 || buses.contains_key(simple)
+                || transactors.contains_key(simple)
             {
                 continue;
             }
@@ -318,6 +305,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         actor_threads: Vec::new(),
         mt: opts.mt,
         driver_bus_for_hookables: std::collections::HashMap::new(),
+        transactors,
     };
 
     // Header.
@@ -488,6 +476,17 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             Item::Driver(c) | Item::Agent(c) | Item::Env(c)
             | Item::Sequencer(c) => {
                 e.emit_component_struct(c);
+            }
+            Item::Transactor(t) => {
+                // Compose a synthetic ComponentDecl with the union of
+                // always-present body items + active body items, and
+                // emit a single struct. Both modes get the same C++
+                // class layout — passive instances simply don't
+                // subscribe to / spawn actors against the active
+                // fields. Mode-specific elision lives in the lowering
+                // at instantiation, not in the struct shape.
+                let synth = synth_component_from_transactor(t, /*include_active*/true);
+                e.emit_component_struct(&synth);
             }
             _ => {}
         }
@@ -960,6 +959,38 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     Ok(e.out)
 }
 
+/// Build a synthetic `ComponentDecl` view of a transactor for codegen
+/// reuse. The transactor's always-present `items` + (optionally) its
+/// `when_active` items become a single component-shaped item list that
+/// existing emit paths (`emit_component_struct`,
+/// `emit_bound_monitor_actors`, `try_emit_bound_driver_actor`) can
+/// consume without modification. `include_active = false` produces the
+/// passive view: only the always-present body, no `when active` fields
+/// or handlers — which is what gets used for `let xact : T passive`
+/// instantiations so passive instances don't even attempt to spawn the
+/// active driver actor.
+///
+/// `kind: ComponentKind::Driver` is a placeholder — the existing
+/// component codegen paths only consult `kind` for the tag prefix in
+/// diagnostic strings; correctness doesn't depend on the choice.
+fn synth_component_from_transactor(t: &TransactorDecl, include_active: bool) -> ComponentDecl {
+    let mut items = t.items.clone();
+    if include_active {
+        if let Some(active) = &t.when_active {
+            items.extend(active.clone());
+        }
+    }
+    ComponentDecl {
+        kind: ComponentKind::Driver,
+        name: t.name.clone(),
+        params: t.params.clone(),
+        bound_to: t.bound_to.clone(),
+        items,
+        span: t.span,
+        doc: t.doc.clone(),
+    }
+}
+
 fn type_simple_name(t: Option<&TypeExpr>) -> Option<&str> {
     match t? {
         TypeExpr::Named { name, .. } => name.segments.last().map(|s| s.name.as_str()),
@@ -1130,6 +1161,12 @@ struct Emitter {
     /// multi-instance support requires per-instance hookable
     /// emission and is deferred.
     driver_bus_for_hookables: std::collections::HashMap<String, (BusDecl, String, String)>,
+    /// Transactor declarations indexed by name (spec §8.1). Looked
+    /// up at `let xact : T mode = bind axil` time; codegen
+    /// composes a synthetic ComponentDecl from `T.items` plus
+    /// `T.when_active` (only when mode == Active) and reuses the
+    /// existing bound-driver-actor + bound-monitor-actor lowering.
+    transactors: std::collections::HashMap<String, TransactorDecl>,
 }
 
 impl Emitter {
@@ -3702,6 +3739,100 @@ impl Emitter {
         // with the bus binding pushed for the duration of each body.
         if l.bind {
             if let Some(simple) = type_simple_name(l.ty.as_ref()) {
+                // Bound transactor: `let xact : T mode = bind axil`
+                // for a `transactor T bound to BusType`. Compose a
+                // synthetic ComponentDecl from the transactor body —
+                // including or excluding the `when active` items
+                // based on the instantiation's mode — and route
+                // through the existing bound-driver-actor +
+                // bound-monitor-actor paths. (Spec §8.1, T-2 in the
+                // implementation roadmap.)
+                if let Some(t) = self.transactors.get(simple).cloned() {
+                    // Mode is mandatory at the binding site for
+                    // transactors. We read it from the let's
+                    // TypeExpr::Named.mode field, populated by
+                    // parse_let_stmt.
+                    let mode = match l.ty.as_ref() {
+                        Some(TypeExpr::Named { mode: Some(m), .. }) => *m,
+                        _ => {
+                            self.errors.push(format!(
+                                "let {} : {} = bind ...: transactor instantiation requires a mode annotation (`{} active` or `{} passive`)",
+                                l.name.name, simple, simple, simple,
+                            ));
+                            return;
+                        }
+                    };
+                    let bus_ty = match &t.bound_to {
+                        Some(b) => b.clone(),
+                        None => {
+                            self.errors.push(format!(
+                                "transactor `{}` has no `bound to BusType` clause; cannot instantiate",
+                                simple,
+                            ));
+                            return;
+                        }
+                    };
+                    if let Some(v) = &l.value {
+                        if let ExprKind::Ident(rhs) = &*v.kind {
+                            if let Some(binding) = self.bus_bindings.get(&rhs.name).cloned() {
+                                let want = type_simple_name(Some(&bus_ty));
+                                if want != Some(binding.0.name.name.as_str()) {
+                                    self.errors.push(format!(
+                                        "let {} : {} = bind {}: transactor is bound to `{}`, but `{}` is a `{}`",
+                                        l.name.name, simple, rhs.name,
+                                        want.unwrap_or("?"),
+                                        rhs.name, binding.0.name.name,
+                                    ));
+                                }
+                                self.pad(depth);
+                                writeln!(self.out, "{simple} {};", l.name.name).ok();
+
+                                // Synthesize a ComponentDecl. For
+                                // `active`, include the `when active`
+                                // items so the existing driver-actor
+                                // path finds the input event +
+                                // matching `on req(t)` handler. For
+                                // `passive`, only the always-present
+                                // items — no driver actor spawns,
+                                // emit/connect to `req` becomes a
+                                // no-op (no subscriber registered).
+                                let include_active = matches!(mode, TransactorMode::Active);
+                                let synth = synth_component_from_transactor(&t, include_active);
+
+                                // Driver-actor path only fires for
+                                // active mode (passive synth has no
+                                // input event field, so it would
+                                // bail anyway — but skipping the
+                                // call is cleaner).
+                                if include_active {
+                                    self.try_emit_bound_driver_actor(
+                                        &synth, &l.name.name, depth, &binding,
+                                    );
+                                }
+                                // Monitor-actor path: handshake
+                                // handlers in the always-present
+                                // body always fire, regardless of
+                                // mode. This is the observation
+                                // half of the transactor.
+                                self.emit_bound_monitor_actors(
+                                    &synth, &l.name.name, depth, &binding,
+                                );
+                                return;
+                            } else {
+                                self.errors.push(format!(
+                                    "let {} : {} = bind {}: `{}` is not a known bus binding",
+                                    l.name.name, simple, rhs.name, rhs.name,
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                    self.errors.push(format!(
+                        "let {} : {} = bind <expr>: rhs must be a bare bus-binding name in v0",
+                        l.name.name, simple,
+                    ));
+                    return;
+                }
                 // Bound monitor: `let mon : MonName = bind axil` for a
                 // `monitor MonName bound to BusType`. Each `on
                 // bus.<ch>.handshake(arg)` handler in the monitor
