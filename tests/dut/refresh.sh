@@ -46,6 +46,8 @@ copy examples/fsm_counter.sv           fsm_counter.sv
 copy examples/int_regs.sv              int_regs.sv
 copy examples/pkt_queue.sv             pkt_queue.sv
 copy examples/linklist_basic.sv        linklist_basic.sv
+copy examples/dma_engine.sv            dma_engine.sv
+copy examples/cpu_pipeline.sv          cpu_pipeline.sv
 copy tests/cam_basic.sv                cam_basic.sv
 copy tests/axi_dma/AxiLiteRegs.sv      AxiLiteRegs.sv
 
