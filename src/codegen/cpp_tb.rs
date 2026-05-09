@@ -493,6 +493,28 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         }
     }
 
+    // ── Top-level `const` items ─────────────────────────────────────────
+    // `const NAME : Ty = expr` lowers to a file-scope
+    // `static constexpr <c_type> NAME = <expr>;` so the value is
+    // available everywhere — inside `main()`, hookable lambdas (which
+    // can't capture across translation-unit boundaries but can use
+    // file-scope constants directly), `tseq` lambdas, and on-handler
+    // closures. constexpr also folds into expressions used at struct
+    // field defaults if any future fixture goes there.
+    let mut emitted_const = false;
+    for it in &file.items {
+        if let Item::Const(c) = it {
+            let cty = c.ty.as_ref().map(c_type_for).unwrap_or_else(|| "int64_t".to_string());
+            write!(e.out, "static constexpr {cty} {} = ", c.name.name).ok();
+            e.emit_expr(&c.value);
+            writeln!(e.out, ";").ok();
+            emitted_const = true;
+        }
+    }
+    if emitted_const {
+        writeln!(e.out, "").ok();
+    }
+
     writeln!(e.out, "int main(int argc, char** argv) {{").ok();
     writeln!(e.out, "{INDENT}Verilated::commandArgs(argc, argv);").ok();
     writeln!(e.out, "{INDENT}V{dut_type}* dut = new V{dut_type};").ok();

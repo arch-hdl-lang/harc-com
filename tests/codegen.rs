@@ -71,6 +71,43 @@ end test T"#,
     assert!(err.0.contains("let dut"));
 }
 
+/// `const NAME : Ty = expr` lowers to a file-scope `static constexpr`
+/// so it's available inside `main()`, hookable lambdas, tseq lambdas,
+/// and on-handler closures.
+#[test]
+fn top_level_const_lowers_to_static_constexpr() {
+    let parsed = parse_source(
+        r#"const MSHR_SIZE : uint<32> = 32
+const HALF      : uint<32> = MSHR_SIZE / 2
+test T
+    let dut : DummyDut
+    scope sim
+        run
+            assert MSHR_SIZE == 32
+                else fail("MSHR_SIZE wrong")
+            assert HALF == 16
+                else fail("HALF wrong")
+        end run
+    end scope sim
+end test T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+
+    // Both consts emitted at file scope, before main().
+    assert!(cpp.contains("static constexpr uint64_t MSHR_SIZE = 32;"),
+        "expected `static constexpr uint64_t MSHR_SIZE = 32;` in:\n{}", cpp);
+    assert!(cpp.contains("static constexpr uint64_t HALF ="),
+        "expected `static constexpr uint64_t HALF` in:\n{}", cpp);
+
+    // Order matters — both should appear BEFORE `int main`.
+    let main_pos = cpp.find("int main").expect("expected `int main` in output");
+    let mshr_pos = cpp.find("static constexpr uint64_t MSHR_SIZE").unwrap();
+    let half_pos = cpp.find("static constexpr uint64_t HALF").unwrap();
+    assert!(mshr_pos < main_pos, "MSHR_SIZE should be emitted before main()");
+    assert!(half_pos < main_pos, "HALF should be emitted before main()");
+}
+
 /// Spec §7.7: `log(error, ...)` increments the failure counter, and
 /// `log(fatal, ...)` additionally sets a flag so the main simulation
 /// loop aborts at end of the current cycle. `info` / `warn` / `debug`
