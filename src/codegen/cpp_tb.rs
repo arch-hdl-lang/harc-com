@@ -20,8 +20,16 @@
 //! - `assert expr [else fail("msg")]` lowers to a runtime check that
 //!   increments an `errors` counter; per-test failure reporting and exit
 //!   code mirror the hand-written `examples/counter_tb.cpp` shape.
-//! - `log(info, "...")` lowers to `printf` (severity dropped for v0; full
-//!   severity / verbosity / id machinery from §7.7 is deferred).
+//! - `log(<severity>, "...")` lowers to a `sim_log_line(<SEV>, ...)` call
+//!   that writes `[cycle:N <SEV>] <msg>` to both stdout and `sim.log`.
+//!   Test-result semantics from §7.7 are honored:
+//!     - `error` increments the `errors` counter (test fails at end of run).
+//!     - `fatal` increments + sets `_fatal`, and the main simulation loop
+//!       exits at end of the current cycle (this test instance aborts).
+//!     - `warn` / `info` / `debug` have no test-result effect.
+//!   Verbosity flags, component IDs, and per-component overrides are
+//!   spec'd in §7.7 but deferred — the runtime currently prints all
+//!   severities unconditionally.
 //!
 //! Out of scope here:
 //! - `tseq`, randomization, properties, coverage groups, fork/join, env/
@@ -489,6 +497,10 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     writeln!(e.out, "{INDENT}Verilated::commandArgs(argc, argv);").ok();
     writeln!(e.out, "{INDENT}V{dut_type}* dut = new V{dut_type};").ok();
     writeln!(e.out, "{INDENT}int errors = 0;").ok();
+    // Per spec §7.7: `log(fatal, ...)` aborts this test instance at
+    // the end of the current cycle. The flag is checked by the
+    // main simulation-loop guard below.
+    writeln!(e.out, "{INDENT}bool _fatal = false;").ok();
     writeln!(e.out, "{INDENT}int cycle_count = 0;").ok();
     writeln!(e.out, "").ok();
     // Seed PRNG from HARC_SEED env (or 1 if unset). Logged after sim_log_line
@@ -899,7 +911,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "{INDENT}// BEFORE eval → no race on signal state at posedge.").ok();
     }
     if clocks.is_empty() {
-        writeln!(e.out, "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done) {{").ok();
+        writeln!(e.out, "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {{").ok();
         writeln!(e.out, "{INDENT}{INDENT}sched.tick();").ok();
         if mt {
             writeln!(e.out, "{INDENT}{INDENT}_start_barrier.wait();").ok();
@@ -911,7 +923,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
         writeln!(e.out, "{INDENT}}}").ok();
     } else {
-        writeln!(e.out, "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done) {{").ok();
+        writeln!(e.out, "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {{").ok();
         writeln!(e.out, "{INDENT}{INDENT}sched.tick();").ok();
         if mt {
             writeln!(e.out, "{INDENT}{INDENT}_start_barrier.wait();").ok();
@@ -3155,6 +3167,26 @@ impl Emitter {
             self.emit_interp_arg(c);
         }
         writeln!(self.out, ");").ok();
+
+        // Spec §7.7 test-result semantics:
+        //   `log(error, ...)` increments the failure counter; the test
+        //                     fails at end of run if any error logged.
+        //   `log(fatal, ...)` increments + sets `_fatal` so the main
+        //                     simulation loop exits at end of the
+        //                     current cycle (this test instance aborts;
+        //                     others in a regression continue).
+        // `warn` / `info` / `debug` have no test-result effect.
+        match sev.as_str() {
+            "ERROR" => {
+                self.pad(depth);
+                writeln!(self.out, "errors++;").ok();
+            }
+            "FATAL" => {
+                self.pad(depth);
+                writeln!(self.out, "errors++; _fatal = true;").ok();
+            }
+            _ => {}
+        }
     }
 
     /// Emit one captured `${expr}` value as a printf argument. Routes the
