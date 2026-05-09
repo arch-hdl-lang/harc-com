@@ -300,6 +300,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         in_coroutine: false,
         actor_threads: Vec::new(),
         mt: opts.mt,
+        driver_bus_for_hookables: std::collections::HashMap::new(),
     };
 
     // Header.
@@ -672,6 +673,56 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             }
         }
     }
+    // Pre-scan: register test-scope bus bindings (`let axil :
+    // BusAxiLite = bind dut`) and driver-type → binding mappings
+    // BEFORE hookable methods emit. Hookables on `bound to BusType`
+    // drivers need the binding active so `bus.<ch>.send/recv` and
+    // `bus.<ch>.<sig>` resolve correctly. emit_let later re-registers
+    // the bus bindings (idempotent — same key, same value).
+    for it in &test.items {
+        if let TestItem::Let(l) = it {
+            if l.bind {
+                if let Some(simple) = type_simple_name(l.ty.as_ref()) {
+                    if let Some(bus_decl) = e.buses.get(simple).cloned() {
+                        if let Some(v) = &l.value {
+                            let mut buf = String::new();
+                            std::mem::swap(&mut e.out, &mut buf);
+                            e.emit_expr(v);
+                            std::mem::swap(&mut e.out, &mut buf);
+                            let prefix = l.name.name.clone();
+                            e.bus_bindings.insert(
+                                l.name.name.clone(),
+                                (bus_decl, buf, prefix),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for it in &test.items {
+        if let TestItem::Let(l) = it {
+            if l.bind {
+                if let Some(simple) = type_simple_name(l.ty.as_ref()) {
+                    if let Some(comp) = e.components.get(simple).cloned() {
+                        if comp.bound_to.is_some() {
+                            if let Some(v) = &l.value {
+                                if let ExprKind::Ident(rhs) = &*v.kind {
+                                    if let Some(binding) = e.bus_bindings.get(&rhs.name).cloned() {
+                                        // First binding wins; multi-instance is deferred.
+                                        e.driver_bus_for_hookables
+                                            .entry(simple.to_string())
+                                            .or_insert(binding);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     for it in &file.items {
         let c = match it {
             Item::Driver(c) | Item::Agent(c) | Item::Env(c)
@@ -1047,6 +1098,15 @@ struct Emitter {
     /// work on Apple Silicon — see the bench measurements in PR
     /// #16's commit message).
     mt: bool,
+    /// Driver/agent type name → bus binding to use when emitting
+    /// hookable method bodies on that type. Populated by a pre-scan
+    /// of the test's `let X : Drv = bind axil` statements before
+    /// hookable emission, so `bus.<ch>.send/recv` inside a hookable
+    /// body resolves to the parent driver's bound bus. Single-
+    /// instance per driver type (the first binding encountered);
+    /// multi-instance support requires per-instance hookable
+    /// emission and is deferred.
+    driver_bus_for_hookables: std::collections::HashMap<String, (BusDecl, String, String)>,
 }
 
 impl Emitter {
@@ -2378,6 +2438,26 @@ impl Emitter {
         }
         let prev_subs = std::mem::replace(&mut self.field_subs, subs);
 
+        // For a `bound to BusType` driver, the parent's bus binding
+        // (resolved at codegen time from the test's `let drv : Drv =
+        // bind axil` statement) propagates into hookable method
+        // bodies. Inside the body, the bare identifier `bus` resolves
+        // to the same `(BusDecl, root, prefix)` tuple as the
+        // test-scope binding, so `bus.<ch>.send(...)`, `bus.<ch>.recv()`,
+        // and `bus.<ch>.<sig>` all work identically to the patterns
+        // available inside `on T t` handlers.
+        //
+        // Restriction (single-instance): we use the FIRST binding
+        // discovered for this driver type. If the test instantiates
+        // two `let A : Drv = bind X` and `let B : Drv = bind Y` with
+        // different buses, both share A's binding inside the
+        // hookable body. v0 doesn't have a use case for
+        // multi-instance bound drivers; per-instance hookable
+        // emission is a follow-up.
+        let pushed_bus = self.driver_bus_for_hookables.get(comp_ty).cloned();
+        let prior_bus = pushed_bus.as_ref()
+            .and_then(|b| self.bus_bindings.insert("bus".into(), b.clone()));
+
         // Pre-hooks: fire `<Type>_<method>_pre` subscribers before the
         // body. The hook closures see the same args as the method —
         // empty vectors are a no-op so the wrap is always safe to
@@ -2394,6 +2474,12 @@ impl Emitter {
         self.pad(depth + 1);
         writeln!(self.out, "for (auto& _h : {comp_ty}_{m_name}_post) _h({arg_csv});").ok();
         // Restore state.
+        if pushed_bus.is_some() {
+            match prior_bus {
+                Some(prev) => { self.bus_bindings.insert("bus".into(), prev); }
+                None       => { self.bus_bindings.remove("bus"); }
+            }
+        }
         self.field_subs = prev_subs;
         for k in added_pointer_fields { self.pointer_vars.remove(&k); }
         for k in added { self.pointer_vars.remove(&k); }

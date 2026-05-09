@@ -52,6 +52,7 @@ axilite_bus_send_test   | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_bound_drv_test  | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_bound_mon_test  | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_multi_payload_test | AxiLiteRegs | AxiLiteRegs.sv         |
+axilite_regs_full_test  | AxiLiteRegs    | AxiLiteRegs.sv         |
 pkt_queue_test          | PacketQueue    | pkt_queue.sv           |
 linklist_basic_test     | TaskQueue      | linklist_basic.sv      |
 cam_basic_test          | Mshr_Addr_Cam  | cam_basic.sv           |
