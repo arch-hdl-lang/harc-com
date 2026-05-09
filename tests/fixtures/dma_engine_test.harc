@@ -1,0 +1,184 @@
+// HARC port of arch-com/examples/dma_engine_tb.cpp.
+//
+// The DmaEngine DUT has three external interfaces:
+//   - APB slave (apb_sel/enable/write/addr/wdata/rdata) for control regs
+//   - mem_rd master (valid/ready + addr/data) — DUT issues read requests
+//   - mem_wr master (valid/ready + addr/data) — DUT issues write beats
+// plus an `irq` pulse on transfer completion.
+//
+// The C++ TB is 180 lines with hand-rolled `apb_write` / `apb_read`
+// helpers and an inline event loop that watches mem_rd/mem_wr
+// handshakes + drives mem_rd_data with the echoed addr.
+//
+// This HARC version uses:
+//   - `driver ApbDrv` with hookable `write` / `read` methods that
+//     drive the 2-phase APB sequence — call sites become a single
+//     line each (`apb.write(addr, data)` / `apb.read(addr)`).
+//   - `monitor MemMon` with edge-trigger `on dut.<v> && dut.<r>`
+//     handlers per channel, pushing observed addresses + write
+//     data into a scoreboard for cross-checking. (DmaEngine's
+//     mem_rd/mem_wr signals don't follow arch's bus-flattening
+//     convention, so we can't use the typed `bus.<ch>.handshake(beat)`
+//     form — that requires `<binding>_<chan>_<sig>` prefixed names.
+//     The cycle-trigger fallback is still a clean expression.)
+//   - A level-trigger handler that combinationally drives
+//     `mem_rd_data = mem_rd_addr` whenever the DUT asserts
+//     `mem_rd_valid`. Replaces the inline `if (dut->mem_rd_valid)
+//     { dut->mem_rd_data = dut->mem_rd_addr; dut->eval(); }` pattern
+//     in the C++.
+
+scoreboard MemSb
+    read_addrs  : queue<uint<32>>
+    write_addrs : queue<uint<32>>
+    write_data  : queue<uint<32>>
+end scoreboard MemSb
+
+monitor MemMon
+    on dut.mem_rd_valid && dut.mem_rd_ready
+        sb_ref.read_addrs.push(dut.mem_rd_addr)
+    end on
+
+    on dut.mem_wr_valid && dut.mem_wr_ready
+        sb_ref.write_addrs.push(dut.mem_wr_addr)
+        sb_ref.write_data.push(dut.mem_wr_data)
+    end on
+
+    // Combinational memory model: echo addr → data whenever the DUT
+    // asserts a read-valid. `level` mode fires every cycle the
+    // condition holds, matching the C++ `if (dut->mem_rd_valid)
+    // { dut->mem_rd_data = dut->mem_rd_addr; }` pattern.
+    on dut.mem_rd_valid level
+        dut.mem_rd_data = dut.mem_rd_addr
+    end on
+
+    sb_ref : MemSb         // populated by the test scope
+end monitor MemMon
+
+// APB is two-phase (setup → access) — not the canonical valid/ready
+// shape, so it's expressed via raw `dut.apb_*` signal access. The
+// helper driver still cuts each APB call site to a single line.
+driver ApbDrv
+    dut : DmaEngine
+
+    hookable write(addr: uint<8>, data: uint<32>)
+        // Phase 1: setup
+        dut.apb_sel    = 1
+        dut.apb_enable = 0
+        dut.apb_write  = 1
+        dut.apb_addr   = addr
+        dut.apb_wdata  = data
+        wait 1 cycle
+        // Phase 2: access
+        dut.apb_enable = 1
+        wait 1 cycle
+        // Deassert
+        dut.apb_sel    = 0
+        dut.apb_enable = 0
+        dut.apb_write  = 0
+    end write
+
+    hookable read(addr: uint<8>) -> uint<32>
+        dut.apb_sel    = 1
+        dut.apb_enable = 0
+        dut.apb_write  = 0
+        dut.apb_addr   = addr
+        wait 1 cycle
+        dut.apb_enable = 1
+        wait 1 cycle
+        let val = dut.apb_rdata
+        dut.apb_sel    = 0
+        dut.apb_enable = 0
+        return val
+    end read
+end driver ApbDrv
+
+test DmaEngineTest
+    let dut : DmaEngine
+    let mon : MemMon
+    let apb : ApbDrv
+
+    scope sim
+        run
+            log(info, "DmaEngine test — APB config + mem_rd/mem_wr handshake observation")
+
+            // Wire scoreboard sharing — assigning struct-typed locals
+            // gives mon its own per-instance scoreboard (HARC v0
+            // structs are by-value; the test reads via mon.sb_ref).
+            apb.dut = dut
+
+            // Reset.
+            dut.rst = 1
+            dut.apb_sel = 0
+            dut.apb_enable = 0
+            dut.apb_write = 0
+            dut.apb_addr = 0
+            dut.apb_wdata = 0
+            dut.mem_rd_ready = 1     // memory always ready
+            dut.mem_wr_ready = 1
+            dut.mem_rd_data = 0
+            wait 4 cycles
+            dut.rst = 0
+            wait 1 cycle
+
+            // ── APB configuration ────────────────────────────────────
+            // src=0x1000, dst=0x2000, len=3 (4 beats), start=1
+            apb.write(0, 4096)
+            apb.write(1, 8192)
+            apb.write(2, 3)
+            apb.write(3, 1)
+
+            log(info, "Config written; waiting for transfer + IRQ")
+
+            // ── Run transfer ─────────────────────────────────────────
+            // Watch for IRQ; bail out as soon as it fires.
+            let irq_seen = 0
+            for _ in 0 .. 50
+                wait 1 cycle
+                if dut.irq
+                    irq_seen = 1
+                end if
+            end for
+
+            assert irq_seen == 1
+                else fail("IRQ never fired within 50 cycles")
+
+            // ── Cross-check observed handshakes ──────────────────────
+            assert mon.sb_ref.read_addrs.size() == 4
+                else fail("expected 4 read beats, observed ${mon.sb_ref.read_addrs.size()}")
+            assert mon.sb_ref.write_addrs.size() == 4
+                else fail("expected 4 write beats, observed ${mon.sb_ref.write_addrs.size()}")
+            assert mon.sb_ref.write_data.size() == 4
+                else fail("expected 4 write-data observations")
+
+            for i in 0 .. 4
+                let exp_rd_addr = 4096 + i        // SRC + i
+                let exp_wr_addr = 8192 + i        // DST + i
+                let exp_wr_data = 4096 + i        // echoed from earlier read
+
+                let got_rd_addr = mon.sb_ref.read_addrs.pop()
+                let got_wr_addr = mon.sb_ref.write_addrs.pop()
+                let got_wr_data = mon.sb_ref.write_data.pop()
+
+                assert got_rd_addr == exp_rd_addr
+                    else fail("read beat ${i}: got 0x${got_rd_addr:08x}, expected 0x${exp_rd_addr:08x}")
+                assert got_wr_addr == exp_wr_addr
+                    else fail("write beat ${i}: got 0x${got_wr_addr:08x}, expected 0x${exp_wr_addr:08x}")
+                assert got_wr_data == exp_wr_data
+                    else fail("write beat ${i}: data 0x${got_wr_data:08x}, expected 0x${exp_wr_data:08x}")
+            end for
+
+            // ── APB readback ─────────────────────────────────────────
+            let rb_src = apb.read(0)
+            assert rb_src == 4096
+                else fail("APB src readback 0x${rb_src:08x}, expected 0x1000")
+            let rb_dst = apb.read(1)
+            assert rb_dst == 8192
+                else fail("APB dst readback 0x${rb_dst:08x}, expected 0x2000")
+            let rb_beat = apb.read(2)
+            assert rb_beat == 0
+                else fail("APB beat readback ${rb_beat}, expected 0 after completion")
+
+            log(info, "PASS: 4 r/w beats observed via monitor handlers, IRQ fired, APB readback correct")
+        end run
+    end scope sim
+end test DmaEngineTest
