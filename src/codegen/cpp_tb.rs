@@ -1081,7 +1081,14 @@ impl Emitter {
         writeln!(self.out, "struct {} {{", m.name.name).ok();
         for it in &m.items {
             if let ComponentItem::Field(f) = it {
-                let cty = monitor_field_c_type(&f.ty);
+                // Resolve via `component_field_c_type` so named
+                // sub-components (scoreboards, transactions, enums)
+                // get their proper C++ type rather than falling back
+                // to `int64_t`. Necessary for bound monitors
+                // (Phase 2c) that hold a `sb : AxilSb` scoreboard
+                // and access `mon.sb.<queue>.size()` from outside
+                // the monitor body.
+                let cty = self.component_field_c_type(&f.ty);
                 writeln!(self.out, "{INDENT}{cty} {};", f.name.name).ok();
             }
         }
@@ -1182,6 +1189,154 @@ impl Emitter {
         tag_prefix: &str,
     ) {
         self.emit_component_handler_registrations_bound(comp, instance, depth, tag_prefix, None);
+    }
+
+    /// Phase 2c: emit each `on bus.<ch>.handshake(arg)` handler in a
+    /// `bound to BusType` monitor as an independent coroutine actor:
+    ///
+    ///     while (true) {
+    ///         co_await wait_until(_slot, [&]{ return valid && ready; });
+    ///         auto <arg> = <first payload signal>;
+    ///         <body — bus.<ch>.<sig> resolves through the bus binding>
+    ///         co_await wait_cycles(_slot, 1);   // skip past this handshake
+    ///     }
+    ///
+    /// Non-handshake on-handlers in the monitor (event subscribers,
+    /// cycle triggers on bool expressions) fall through to the
+    /// existing sync `_checkers`-based path. A monitor can mix both —
+    /// each handler is independently classified.
+    ///
+    /// The trailing `wait_cycles(1)` matters: a handshake completes
+    /// in exactly one cycle (valid && ready both high at the posedge),
+    /// but the producer/consumer may keep the signals high across
+    /// multiple cycles for back-to-back handshakes. Skipping forward
+    /// one cycle ensures we don't re-fire on the same handshake.
+    /// Back-to-back handshakes with no idle gap will fire on every
+    /// cycle, which is exactly what arch §19 specifies.
+    fn emit_bound_monitor_actors(
+        &mut self,
+        mon: &ComponentDecl,
+        instance: &str,
+        depth: usize,
+        binding: &(BusDecl, String, String),
+    ) {
+        // Build field substitution map (same shape as
+        // emit_component_handler_registrations) so bare names inside
+        // the handler body resolve to `instance.field`.
+        let mut subs = std::collections::HashMap::new();
+        let mut local_event_types: Vec<(String, String)> = Vec::new();
+        for it in &mon.items {
+            if let ComponentItem::Field(f) = it {
+                subs.insert(f.name.name.clone(), format!("{instance}.{}", f.name.name));
+                if let TypeExpr::Builtin { name: BuiltinTy::Event, args, .. } = &f.ty {
+                    let inner = self.payload_type_for_arg(args.first());
+                    local_event_types.push((f.name.name.clone(), inner));
+                }
+            }
+        }
+
+        // Walk handlers, classify each as handshake-actor vs sync.
+        let mut sync_handlers: Vec<&OnHandler> = Vec::new();
+        for it in &mon.items {
+            if let ComponentItem::OnHandler(h) = it {
+                if let Some((ch_name, arg_name)) = extract_bus_handshake_event(&h.event, "bus") {
+                    // Resolve the channel in the bound bus.
+                    let channel = match binding.0.handshakes.iter()
+                        .find(|hs| hs.name.name == ch_name)
+                    {
+                        Some(c) => c.clone(),
+                        None => {
+                            self.errors.push(format!(
+                                "monitor {instance}: bus has no channel `{ch_name}`"
+                            ));
+                            continue;
+                        }
+                    };
+                    if channel.payload.is_empty() {
+                        self.errors.push(format!(
+                            "monitor {instance}: channel `{ch_name}` has no payload signals to capture"
+                        ));
+                        continue;
+                    }
+                    let cap_sig = channel.payload[0].name.name.clone();
+                    let (_bus_decl, root, sig_prefix) = binding;
+                    let chan_prefix = format!("{}_{}", sig_prefix, ch_name);
+                    let slot_var = format!("_{instance}_{ch_name}_slot");
+
+                    self.pad(depth);
+                    writeln!(self.out, "harc_rt::ThreadSlot {slot_var};").ok();
+                    self.pad(depth);
+                    writeln!(self.out, "sched.slots.push_back(&{slot_var});").ok();
+                    self.pad(depth);
+                    writeln!(
+                        self.out,
+                        "{slot_var}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{",
+                    ).ok();
+                    self.pad(depth + 1);
+                    writeln!(self.out, "while (true) {{").ok();
+                    self.pad(depth + 2);
+                    writeln!(
+                        self.out,
+                        "co_await harc_rt::wait_until(_slot, [&]{{ return {root}->{chan_prefix}_valid && {root}->{chan_prefix}_ready; }});",
+                    ).ok();
+                    self.pad(depth + 2);
+                    writeln!(self.out, "auto {arg_name} = {root}->{chan_prefix}_{cap_sig};").ok();
+
+                    // Body: install field subs + bus binding, mark
+                    // coroutine context, emit, restore state.
+                    let prev_subs = std::mem::replace(&mut self.field_subs, subs.clone());
+                    let mut added_events = Vec::new();
+                    for (name, ty) in &local_event_types {
+                        if self.event_types.insert(name.clone(), ty.clone()).is_none() {
+                            added_events.push(name.clone());
+                        }
+                    }
+                    let prior_bus = self.bus_bindings.insert("bus".into(), binding.clone());
+                    let prior_corout = self.in_coroutine;
+                    self.in_coroutine = true;
+
+                    self.emit_block(&h.body, depth + 2);
+
+                    self.in_coroutine = prior_corout;
+                    match prior_bus {
+                        Some(prev) => { self.bus_bindings.insert("bus".into(), prev); }
+                        None       => { self.bus_bindings.remove("bus"); }
+                    }
+                    for n in added_events { self.event_types.remove(&n); }
+                    self.field_subs = prev_subs;
+
+                    // Skip past this handshake before re-arming.
+                    self.pad(depth + 2);
+                    writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
+                    self.pad(depth + 1);
+                    writeln!(self.out, "}}").ok();
+                    self.pad(depth + 1);
+                    writeln!(self.out, "co_return;").ok();
+                    self.pad(depth);
+                    writeln!(self.out, "}}(&{slot_var});").ok();
+                } else {
+                    sync_handlers.push(h);
+                }
+            }
+        }
+
+        // Other on-handlers fall through to the existing sync
+        // registration. We do this by emitting a temporary clone of
+        // the monitor whose `items` contain only the leftover
+        // handlers + the original fields, so existing field-sub /
+        // event-subscription paths run unchanged.
+        if !sync_handlers.is_empty() {
+            let mut sync_view = mon.clone();
+            sync_view.items.retain(|it| match it {
+                ComponentItem::OnHandler(h) => {
+                    extract_bus_handshake_event(&h.event, "bus").is_none()
+                }
+                _ => true,
+            });
+            self.emit_component_handler_registrations_bound(
+                &sync_view, instance, depth, "_m_", Some(binding.clone()),
+            );
+        }
     }
 
     /// Phase 2b: if `comp` is a `bound to BusType` driver/agent with
@@ -3238,6 +3393,49 @@ impl Emitter {
         // with the bus binding pushed for the duration of each body.
         if l.bind {
             if let Some(simple) = type_simple_name(l.ty.as_ref()) {
+                // Bound monitor: `let mon : MonName = bind axil` for a
+                // `monitor MonName bound to BusType`. Each `on
+                // bus.<ch>.handshake(arg)` handler in the monitor
+                // becomes its own coroutine actor that fires once per
+                // valid+ready cycle on the channel. Other handler
+                // shapes (event subscribers, cycle triggers) fall
+                // through to the existing sync path.
+                if let Some(mon) = self.monitors.get(simple).cloned() {
+                    if let Some(bus_ty) = &mon.bound_to {
+                        if let Some(v) = &l.value {
+                            if let ExprKind::Ident(rhs) = &*v.kind {
+                                if let Some(binding) = self.bus_bindings.get(&rhs.name).cloned() {
+                                    let want = type_simple_name(Some(bus_ty));
+                                    if want != Some(binding.0.name.name.as_str()) {
+                                        self.errors.push(format!(
+                                            "let {} : {} = bind {}: monitor is bound to `{}`, but `{}` is a `{}`",
+                                            l.name.name, simple, rhs.name,
+                                            want.unwrap_or("?"),
+                                            rhs.name, binding.0.name.name,
+                                        ));
+                                    }
+                                    self.pad(depth);
+                                    writeln!(self.out, "{simple} {};", l.name.name).ok();
+                                    self.emit_bound_monitor_actors(
+                                        &mon, &l.name.name, depth, &binding,
+                                    );
+                                    return;
+                                } else {
+                                    self.errors.push(format!(
+                                        "let {} : {} = bind {}: `{}` is not a known bus binding",
+                                        l.name.name, simple, rhs.name, rhs.name,
+                                    ));
+                                    return;
+                                }
+                            }
+                        }
+                        self.errors.push(format!(
+                            "let {} : {} = bind <expr>: rhs must be a bare bus-binding name in v0",
+                            l.name.name, simple,
+                        ));
+                        return;
+                    }
+                }
                 if let Some(comp) = self.components.get(simple).cloned() {
                     if let Some(bus_ty) = &comp.bound_to {
                         // The rhs must name an existing bus binding (a
@@ -3623,20 +3821,6 @@ fn file_uses_constraint_solver(file: &SourceFile) -> bool {
     })
 }
 
-/// Pick a C++ representation for a monitor field. `event<T>` (with or
-/// without an `out` direction marker — we don't enforce direction in v0)
-/// lowers to a vector of subscriber closures.
-fn monitor_field_c_type(t: &TypeExpr) -> String {
-    if let TypeExpr::Builtin { name: BuiltinTy::Event, args, .. } = t {
-        let inner = args.first().map(|a| match a {
-            TypeArg::Type(ty) => txn_field_c_type(ty),
-            _ => "uint64_t".into(),
-        }).unwrap_or_else(|| "uint64_t".into());
-        return format!("std::vector<std::function<void({inner})>>");
-    }
-    scoreboard_field_c_type(t)
-}
-
 /// Pick a C++ representation for a scoreboard field. Mostly the same as
 /// `txn_field_c_type` but supports `queue<T>` → `HarcQueue<T>` (the small
 /// runtime template emitted at file scope when scoreboards are present).
@@ -3734,6 +3918,33 @@ fn expr_path_str(e: &Expr) -> Option<String> {
 /// expression like `on dut.x && y`, or a malformed call) returns
 /// `None`. The binding name falls back to `_v` when the user wrote
 /// `on event(_)` or omitted the arg.
+/// Detect the `<bus>.<channel>.handshake(<arg>)` form used by bound
+/// monitors (Phase 2c). Returns `Some((channel_name, arg_name))`
+/// when the expression matches AND the outer `<bus>` ident matches
+/// the expected binding name (typically `"bus"`); `None` otherwise.
+///
+/// The expression is a 3-level tree:
+///   ExprKind::Call {
+///     callee: Field { target: Field { target: Ident(bus), name: ch },
+///                     name: "handshake" },
+///     args:   [Expr::Ident(arg)] }
+fn extract_bus_handshake_event(event: &Expr, bus_ident: &str) -> Option<(String, String)> {
+    let ExprKind::Call { callee, args } = &*event.kind else { return None; };
+    let ExprKind::Field { target, name: method } = &*callee.kind else { return None; };
+    if method.name != "handshake" { return None; }
+    let ExprKind::Field { target: outer, name: ch } = &*target.kind else { return None; };
+    let ExprKind::Ident(id) = &*outer.kind else { return None; };
+    if id.name != bus_ident { return None; }
+    let arg_name = match args.first() {
+        Some(CallArg::Expr(e)) => match &*e.kind {
+            ExprKind::Ident(id) => id.name.clone(),
+            _ => "_v".into(),
+        },
+        _ => "_v".into(),
+    };
+    Some((ch.name.clone(), arg_name))
+}
+
 fn extract_event_subscription(event: &Expr) -> Option<(String, String)> {
     let ExprKind::Call { callee, args } = &*event.kind else { return None; };
     let event_name = match &*callee.kind {

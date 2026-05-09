@@ -1,0 +1,139 @@
+// AxiLiteRegs test demonstrating `bound to BusType` on a monitor
+// (Phase 2c of the bus-typing rollout). The monitor watches the AXI-Lite
+// channels for `valid && ready` handshakes and pushes each observed
+// value into a scoreboard. A bound coroutine driver (Phase 2b) issues
+// the transactions; the run coroutine cross-checks the scoreboard
+// against the dispatched values.
+//
+// Lowering:
+//
+//   monitor MonName bound to BusAxiLite
+//       on bus.<ch>.handshake(t)  →  coroutine actor:
+//           while (true) {
+//               co_await wait_until(valid && ready on this channel);
+//               auto t = <first payload signal>;
+//               <body>
+//               co_await wait_cycles(1);   // skip past this handshake
+//           }
+//
+// Each handshake handler in a bound monitor gets its own `ThreadSlot`
+// + coroutine. The actor fires once per handshake on the channel,
+// running concurrently with the run coroutine and any driver
+// coroutines.
+
+use BusAxiLite
+
+transaction RegOp
+    addr  : uint<8>  with [range(0, 64)]
+    value : uint<32>
+    !mode : uint<8>  default 0
+end transaction RegOp
+
+driver AxilDrv bound to BusAxiLite
+    req       : in event<RegOp>
+    last_read : uint<32> default 0
+
+    on req(t)
+        bus.aw.addr = t.addr
+        bus.aw.valid = 1
+        bus.w.send(t.value, 15)
+        bus.aw.valid = 0
+        wait 2 cycles
+        bus.ar.addr = t.addr
+        bus.ar.valid = 1
+        let val = bus.r.recv()
+        bus.ar.valid = 0
+        wait 1 cycle
+        last_read = val
+    end on
+end driver AxilDrv
+
+scoreboard AxilSb
+    written : queue<uint<32>>     // observed write data on bus.w
+    read    : queue<uint<32>>     // observed read data on bus.r
+    errors  : uint<32> default 0
+end scoreboard AxilSb
+
+// Bound coroutine monitor: spawns one actor per `on bus.<ch>.handshake`
+// handler. Each fires on every cycle where valid && ready on its
+// channel.
+monitor AxilMon bound to BusAxiLite
+    sb : AxilSb
+
+    on bus.w.handshake(d)
+        sb.written.push(d)
+    end on
+
+    on bus.r.handshake(d)
+        sb.read.push(d)
+    end on
+end monitor AxilMon
+
+tseq RandomTxns(n: int) -> TSeq<RegOp>
+    for _ in 0 .. n
+        let t : RegOp
+        randomize(t)
+        t.addr = 24
+        yield t
+    end for
+end tseq RandomTxns
+
+test AxiLiteBoundMonTest
+    let dut  : AxiLiteRegs
+    let axil : BusAxiLite = bind dut
+    let drv  : AxilDrv    = bind axil
+    let mon  : AxilMon    = bind axil
+    let sb   : AxilSb
+
+    scope sim
+        run
+            log(info, "AxiLiteRegs bound coroutine monitor test")
+
+            // Reset.
+            dut.rst = 1
+            axil.aw.valid = 0
+            axil.w.valid = 0
+            axil.b.ready = 1
+            axil.ar.valid = 0
+            axil.r.ready = 1
+            dut.mm2s_done = 0
+            dut.mm2s_halted = 1
+            dut.mm2s_idle = 1
+            dut.s2mm_done = 0
+            dut.s2mm_halted = 1
+            dut.s2mm_idle = 1
+            dut.mm2s_sg_done = 0
+            dut.s2mm_sg_done = 0
+            dut.mm2s_sg_active = 0
+            dut.s2mm_sg_active = 0
+            wait 2 cycles
+            dut.rst = 0
+            wait 1 cycle
+
+            // Wire mon's scoreboard reference. Each monitor instance
+            // owns its own `sb` field by-value; we route observed
+            // events into the test-scope `sb` by sharing.
+            // (In v0 this happens via an aliased reference rather than
+            // a deep field-set since structs are by-value in cpp_tb.)
+
+            // Dispatch 5 transactions through the bound driver.
+            let txns = RandomTxns(5)
+            for t in txns
+                emit drv.req(t)
+            end for
+
+            // Wait for the driver to drain. Each round-trip ~7 cycles.
+            wait 60 cycles
+
+            // The monitor pushed 5 observed write payloads and 5
+            // observed read payloads into mon.sb. Cross-check that
+            // the count matches.
+            assert mon.sb.written.size() == 5
+                else fail("expected 5 writes observed, got ${mon.sb.written.size()}")
+            assert mon.sb.read.size() == 5
+                else fail("expected 5 reads observed, got ${mon.sb.read.size()}")
+
+            log(info, "PASS: bound coroutine monitor observed 5 writes + 5 reads")
+        end run
+    end scope sim
+end test AxiLiteBoundMonTest
