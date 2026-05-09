@@ -50,6 +50,7 @@ copy examples/linklist_doubly.sv       linklist_doubly.sv
 copy examples/dma_engine.sv            dma_engine.sv
 copy examples/cpu_pipeline.sv          cpu_pipeline.sv
 copy tests/cam_basic.sv                cam_basic.sv
+copy tests/cvdp/cache_mshr.sv          cache_mshr.sv
 copy tests/axi_dma/AxiLiteRegs.sv      AxiLiteRegs.sv
 
 echo "Done."
