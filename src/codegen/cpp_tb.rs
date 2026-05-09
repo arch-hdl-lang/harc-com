@@ -72,7 +72,22 @@ pub fn dut_type_name(file: &SourceFile) -> Option<String> {
 }
 
 /// Emit a C++ Verilator TB for the single `test` declaration in this file.
+/// Per-emit options. Currently just the `--mt` opt-in for Phase 3a's
+/// per-actor OS thread topology; defaults to cooperative
+/// (single-OS-thread, faster on real fixtures).
+#[derive(Default, Clone, Copy)]
+pub struct EmitOpts {
+    /// Spawn one `std::thread` per bound coroutine actor with dual-
+    /// barrier sync per posedge. Off → all coroutines share `sched`
+    /// and tick cooperatively in the main thread.
+    pub mt: bool,
+}
+
 pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
+    emit_with_opts(file, EmitOpts::default())
+}
+
+pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitError> {
     // Find a single `test` item — the entry point.
     let test = file.items.iter().find_map(|it| match it {
         Item::Test(t) => Some(t),
@@ -284,6 +299,7 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
         bus_bindings: std::collections::HashMap::new(),
         in_coroutine: false,
         actor_threads: Vec::new(),
+        mt: opts.mt,
     };
 
     // Header.
@@ -692,8 +708,15 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
     writeln!(e.out, "{INDENT}}}(&_run_slot);").ok();
     writeln!(e.out, "").ok();
 
+    // `actor_threads` is populated only when `--mt` is set (cooperative
+    // mode pushes actor slots into the global `sched` instead). So
+    // `mt` here means "we have per-actor schedulers needing barrier
+    // sync"; cooperative mode skips the worker spawn / barrier dance
+    // entirely even when actors are present.
     let n_actors = e.actor_threads.len();
     let mt = n_actors > 0;
+    debug_assert!(mt == (e.mt && !e.actor_threads.is_empty()));
+    let _ = e.mt; // suppress unused warning when no actors
 
     // ── Bootstrap ──────────────────────────────────────────────────────
     // Single-threaded — workers haven't started yet. Each scheduler
@@ -975,9 +998,17 @@ struct Emitter {
     /// `_start_barrier` / `_end_barrier` (sized to `1 + len`) plus
     /// one `std::thread` per actor running the actor's
     /// per-os-thread `ThreadScheduler::tick()` between the barriers.
-    /// Sub-component instances composed inside an `env` are out of
-    /// scope (Phase 3b).
+    /// Only populated when `mt = true`; in cooperative mode actor
+    /// slots are pushed directly into the global `sched`.
     actor_threads: Vec<(String, String)>,
+    /// True when `--mt` opt-in is set: emit per-actor schedulers,
+    /// dual barriers, and worker thread spawns. False (default):
+    /// actors join the global `sched` and tick cooperatively on
+    /// the main thread. The cooperative path is faster on typical
+    /// fixtures (per-cycle barrier sync exceeds per-cycle actor
+    /// work on Apple Silicon — see the bench measurements in PR
+    /// #16's commit message).
+    mt: bool,
 }
 
 impl Emitter {
@@ -1342,13 +1373,19 @@ impl Emitter {
                     let slot_var  = format!("_{instance}_{ch_name}_slot");
                     let sched_var = format!("_{instance}_{ch_name}_sched");
 
-                    self.pad(depth);
-                    writeln!(self.out, "harc_rt::ThreadScheduler {sched_var};").ok();
+                    if self.mt {
+                        self.pad(depth);
+                        writeln!(self.out, "harc_rt::ThreadScheduler {sched_var};").ok();
+                    }
                     self.pad(depth);
                     writeln!(self.out, "harc_rt::ThreadSlot {slot_var};").ok();
                     self.pad(depth);
-                    writeln!(self.out, "{sched_var}.slots.push_back(&{slot_var});").ok();
-                    self.actor_threads.push((sched_var.clone(), slot_var.clone()));
+                    if self.mt {
+                        writeln!(self.out, "{sched_var}.slots.push_back(&{slot_var});").ok();
+                        self.actor_threads.push((sched_var.clone(), slot_var.clone()));
+                    } else {
+                        writeln!(self.out, "sched.slots.push_back(&{slot_var});").ok();
+                    }
                     self.pad(depth);
                     writeln!(
                         self.out,
@@ -1505,24 +1542,34 @@ impl Emitter {
         };
 
         // ── Emit the actor topology ─────────────────────────────────
-        // Each actor gets its OWN ThreadScheduler instance — Phase 3a
-        // runs each actor on a dedicated OS thread, and `tick()` is
-        // not internally MT-safe, so per-actor schedulers avoid the
-        // need for locks. Single-thread (no actors at all) skips the
-        // worker spawn and runs everything on `sched`.
+        // Cooperative mode (default): all actor slots go into the
+        // single `sched` and tick together with `_run_slot` on the
+        // main thread. This is faster than MT on typical fixtures
+        // because there's no barrier overhead.
+        //
+        // MT mode (`--mt`, Phase 3a): each actor gets its own
+        // `ThreadScheduler` and lives on a dedicated OS thread,
+        // synchronized via dual barriers per posedge. `tick()`
+        // itself is not MT-safe so per-actor schedulers avoid locks.
         let queue_var = format!("_{instance}_q");
         let slot_var  = format!("_{instance}_slot");
         let sched_var = format!("_{instance}_sched");
 
         self.pad(depth);
         writeln!(self.out, "std::deque<{payload_ty}> {queue_var};").ok();
-        self.pad(depth);
-        writeln!(self.out, "harc_rt::ThreadScheduler {sched_var};").ok();
+        if self.mt {
+            self.pad(depth);
+            writeln!(self.out, "harc_rt::ThreadScheduler {sched_var};").ok();
+        }
         self.pad(depth);
         writeln!(self.out, "harc_rt::ThreadSlot {slot_var};").ok();
         self.pad(depth);
-        writeln!(self.out, "{sched_var}.slots.push_back(&{slot_var});").ok();
-        self.actor_threads.push((sched_var.clone(), slot_var.clone()));
+        if self.mt {
+            writeln!(self.out, "{sched_var}.slots.push_back(&{slot_var});").ok();
+            self.actor_threads.push((sched_var.clone(), slot_var.clone()));
+        } else {
+            writeln!(self.out, "sched.slots.push_back(&{slot_var});").ok();
+        }
 
         // Pusher subscriber on the input event. Replaces the sync
         // body-callback; emit/connect bridges that fan out to this

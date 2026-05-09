@@ -81,6 +81,15 @@ enum Cmd {
         /// `cargo run --bin arch --manifest-path ../arch-com/Cargo.toml`).
         #[arg(long)]
         arch_bin: Option<PathBuf>,
+        /// Run bound-driver/bound-monitor coroutine actors on dedicated
+        /// OS threads with dual-barrier sync (Phase 3a). Default is the
+        /// cooperative single-OS-thread model — typically faster on
+        /// real fixtures because per-cycle barrier overhead exceeds
+        /// per-cycle actor work. Use `--mt` for correctness validation
+        /// of the multi-actor model, or for fixtures with substantial
+        /// per-cycle compute that genuinely benefit from parallelism.
+        #[arg(long)]
+        mt: bool,
     },
     // Future, mirroring ARCH:
     //   Build  — transpile to SystemVerilog + UVM (spec §10.2, phase 5)
@@ -92,8 +101,8 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Check { files, ast } => cmd_check(files, ast),
         Cmd::Fmt { file, write } => cmd_fmt(file, write),
-        Cmd::Sim { files, dut, sv, top, test, outdir, seed, emit_only, arch_bin } =>
-            cmd_sim(files, dut, sv, top, test, outdir, seed, emit_only, arch_bin),
+        Cmd::Sim { files, dut, sv, top, test, outdir, seed, emit_only, arch_bin, mt } =>
+            cmd_sim(files, dut, sv, top, test, outdir, seed, emit_only, arch_bin, mt),
     }
 }
 
@@ -356,6 +365,7 @@ fn cmd_sim(
     seed: Option<u64>,
     emit_only: bool,
     arch_bin: Option<PathBuf>,
+    mt: bool,
 ) -> Result<()> {
     if dut.is_empty() && sv.is_empty() {
         return Err(miette::miette!("pass either --dut <file.arch> or --sv <file.sv>"));
@@ -381,7 +391,7 @@ fn cmd_sim(
     let merged = harc::codegen::merge::merge_for_sim(&all_files, test.as_deref())
         .map_err(|e| miette::miette!("{}", e))?;
 
-    let cpp = harc::codegen::cpp_tb::emit(&merged)
+    let cpp = harc::codegen::cpp_tb::emit_with_opts(&merged, harc::codegen::cpp_tb::EmitOpts { mt })
         .map_err(|e| miette::miette!("{}", e))?;
 
     let outdir = outdir.unwrap_or_else(|| PathBuf::from("harc_sim_build"));
