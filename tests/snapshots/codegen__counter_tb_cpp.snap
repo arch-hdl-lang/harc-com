@@ -17,6 +17,7 @@ expression: cpp
 #include <unordered_map>
 #include <vector>
 #include <functional>
+#include "harc_thread_rt.h"
 
 static uint64_t harc_rng_state = 0;
 static inline uint64_t harc_rng_next() {
@@ -107,37 +108,62 @@ int main(int argc, char** argv) {
 
     sim_log_line("INFO", "seed=%llu", (long long)harc_rng_state);
 
-    dut->rst = 1;
-    dut->inc = 0;
-    dut->max = 15;
-    for (int _w = 0; _w < 2; _w++) tick();
-    dut->rst = 0;
-    for (int64_t i = 0; i < 16; i++) {
-        if (!(dut->value == i)) {
-            sim_log_line("FAIL", "count mismatch");
-            errors++;
-        }
-        if (i == 15) {
-            if (!(dut->at_max)) {
-                sim_log_line("FAIL", "at_max should be 1 at 15");
+    harc_rt::ThreadScheduler sched;
+    harc_rt::ThreadSlot _run_slot;
+    sched.slots.push_back(&_run_slot);
+    _run_slot.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
+        dut->rst = 1;
+        dut->inc = 0;
+        dut->max = 15;
+        co_await harc_rt::wait_cycles(_slot, (uint32_t)(2));
+        dut->rst = 0;
+        for (int64_t i = 0; i < 16; i++) {
+            if (!(dut->value == i)) {
+                sim_log_line("FAIL", "count mismatch");
                 errors++;
             }
+            if (i == 15) {
+                if (!(dut->at_max)) {
+                    sim_log_line("FAIL", "at_max should be 1 at 15");
+                    errors++;
+                }
+            }
+            dut->inc = 1;
+            co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
         }
-        dut->inc = 1;
-        for (int _w = 0; _w < 1; _w++) tick();
+        if (!(dut->value == 0)) {
+            sim_log_line("FAIL", "wrap failed");
+            errors++;
+        }
+        sim_log_line("INFO", "PASS: wrap at MAX=15");
+        dut->inc = 0;
+        co_await harc_rt::wait_cycles(_slot, (uint32_t)(2));
+        if (!(dut->value == 0)) {
+            sim_log_line("FAIL", "hold failed");
+            errors++;
+        }
+        sim_log_line("INFO", "PASS: hold when inc=0");
+        co_return;
+    }(&_run_slot);
+
+    // Resume the coroutine once so initial-setup statements run
+    // before the first clock edge (matching the pre-coroutine
+    // straight-line emission semantics).
+    sched.bootstrap();
+
+    // Drive the clock until the coroutine completes. Each
+    // iteration is one primary-clock posedge; the scheduler's
+    // `tick()` resumes any coroutines whose wait condition is
+    // satisfied (cycle counter expired or `wait_until` predicate
+    // fires).
+    while (!sched.all_done()) {
+        dut->clk = 0; dut->eval();
+        dut->clk = 1; dut->eval();
+        cycle_count++;
+        for (auto& _c : _checkers) _c();
+        sched.tick();
     }
-    if (!(dut->value == 0)) {
-        sim_log_line("FAIL", "wrap failed");
-        errors++;
-    }
-    sim_log_line("INFO", "PASS: wrap at MAX=15");
-    dut->inc = 0;
-    for (int _w = 0; _w < 2; _w++) tick();
-    if (!(dut->value == 0)) {
-        sim_log_line("FAIL", "hold failed");
-        errors++;
-    }
-    sim_log_line("INFO", "PASS: hold when inc=0");
+
 
     dut->final();
     delete dut;

@@ -33,6 +33,13 @@ use crate::ast::*;
 use crate::lexer::Span;
 use std::fmt::Write;
 
+/// HARC's coroutine runtime header. Baked into the binary at build
+/// time via `include_str!` and dropped into the test build dir by
+/// `harc sim` so the emitted `.cpp` can `#include "harc_thread_rt.h"`
+/// without a separate file dependency.
+pub const THREAD_RT_HEADER: &str =
+    include_str!("../../runtime/harc_thread_rt.h");
+
 const INDENT: &str = "    ";
 
 #[derive(Debug)]
@@ -275,6 +282,7 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
         tseq_names: tseqs.iter().map(|t| t.name.name.clone()).collect(),
         buses,
         bus_bindings: std::collections::HashMap::new(),
+        in_coroutine: false,
     };
 
     // Header.
@@ -292,6 +300,13 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
     writeln!(e.out, "#include <unordered_map>").ok();
     writeln!(e.out, "#include <vector>").ok();
     writeln!(e.out, "#include <functional>").ok();
+    // HARC's coroutine runtime — drives the test's `run` block as a
+    // C++20 coroutine via `harc_rt::ThreadScheduler`. Hookable methods
+    // and `on`-handler closures still run synchronously between the
+    // run coroutine's co_awaits; only the run body itself yields.
+    // Multi-actor parallelism (driver + monitor coroutines on the same
+    // bus) lands in Phase 2 on top of the same runtime.
+    writeln!(e.out, "#include \"harc_thread_rt.h\"").ok();
     let uses_solver = file_uses_constraint_solver(file);
     if uses_solver {
         writeln!(e.out, "#include <z3++.h>   // randomize(t) with <constraints>").ok();
@@ -605,21 +620,78 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
         e.emit_let(l, 1);
     }
 
-    // Walk all test items in declaration order. Bare stmts and scope sim/run
-    // both contribute to the test body; lets are hoisted (handled above);
-    // applies/uses/clocks have no runtime effect here.
+    // ── Coroutine wrap for the test body ───────────────────────────────
+    //
+    // The whole test body (bare stmts + scope sim/{setup,run,check,
+    // teardown}) becomes a single C++20 coroutine driven by
+    // `harc_rt::ThreadScheduler`. Setting `in_coroutine = true` flips
+    // the wait/tick lowering inside this scope to emit
+    // `co_await harc_rt::wait_cycles(_slot, N)` instead of the
+    // synchronous `for (...) tick();` form.
+    //
+    // The lambda captures by reference (`[&]`) so it sees `dut`,
+    // `tick`, `cycle_count`, `_checkers`, hookable-method lambdas,
+    // and any hoisted lets defined above in `main`'s scope.
+    //
+    // After the coroutine is constructed, `sched.bootstrap()` resumes
+    // it once (running statements until the first co_await — i.e. the
+    // initial reset / signal-default block runs before any clock
+    // edge). The main loop then drives the clock until the coroutine
+    // is `Done`.
+    writeln!(e.out, "{INDENT}harc_rt::ThreadScheduler sched;").ok();
+    writeln!(e.out, "{INDENT}harc_rt::ThreadSlot _run_slot;").ok();
+    writeln!(e.out, "{INDENT}sched.slots.push_back(&_run_slot);").ok();
+    writeln!(e.out, "{INDENT}_run_slot.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{").ok();
+
+    e.in_coroutine = true;
     for it in &test.items {
         match it {
-            TestItem::Stmt(s) => e.emit_stmt(s, 1),
+            TestItem::Stmt(s) => e.emit_stmt(s, 2),
             TestItem::Scope(s) => {
-                if let Some(b) = &s.setup { e.emit_block(b, 1); }
-                if let Some(b) = &s.run   { e.emit_block(b, 1); }
-                if let Some(b) = &s.check { e.emit_block(b, 1); }
-                if let Some(b) = &s.teardown { e.emit_block(b, 1); }
+                if let Some(b) = &s.setup    { e.emit_block(b, 2); }
+                if let Some(b) = &s.run      { e.emit_block(b, 2); }
+                if let Some(b) = &s.check    { e.emit_block(b, 2); }
+                if let Some(b) = &s.teardown { e.emit_block(b, 2); }
             }
             _ => {}
         }
     }
+    e.in_coroutine = false;
+
+    writeln!(e.out, "{INDENT}{INDENT}co_return;").ok();
+    writeln!(e.out, "{INDENT}}}(&_run_slot);").ok();
+    writeln!(e.out, "").ok();
+    writeln!(e.out, "{INDENT}// Resume the coroutine once so initial-setup statements run").ok();
+    writeln!(e.out, "{INDENT}// before the first clock edge (matching the pre-coroutine").ok();
+    writeln!(e.out, "{INDENT}// straight-line emission semantics).").ok();
+    writeln!(e.out, "{INDENT}sched.bootstrap();").ok();
+    writeln!(e.out, "").ok();
+    writeln!(e.out, "{INDENT}// Drive the clock until the coroutine completes. Each").ok();
+    writeln!(e.out, "{INDENT}// iteration is one primary-clock posedge; the scheduler's").ok();
+    writeln!(e.out, "{INDENT}// `tick()` resumes any coroutines whose wait condition is").ok();
+    writeln!(e.out, "{INDENT}// satisfied (cycle counter expired or `wait_until` predicate").ok();
+    writeln!(e.out, "{INDENT}// fires).").ok();
+    if clocks.is_empty() {
+        writeln!(e.out, "{INDENT}while (!sched.all_done()) {{").ok();
+        writeln!(e.out, "{INDENT}{INDENT}dut->clk = 0; dut->eval();").ok();
+        writeln!(e.out, "{INDENT}{INDENT}dut->clk = 1; dut->eval();").ok();
+        writeln!(e.out, "{INDENT}{INDENT}cycle_count++;").ok();
+        writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
+        writeln!(e.out, "{INDENT}{INDENT}sched.tick();").ok();
+        writeln!(e.out, "{INDENT}}}").ok();
+    } else {
+        // Multi-clock: advance simulated time to the next primary-clock
+        // posedge per iteration. Other clocks tick at their natural rate
+        // during the span; per-clock rising-edge counters keep updating
+        // so `wait N cycles on <clk>` predicates can resolve.
+        writeln!(e.out, "{INDENT}while (!sched.all_done()) {{").ok();
+        writeln!(e.out, "{INDENT}{INDENT}long long _target = now_ps + clocks_[0].half_period_ps * 2;").ok();
+        writeln!(e.out, "{INDENT}{INDENT}eval_clocks_until(_target);").ok();
+        writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
+        writeln!(e.out, "{INDENT}{INDENT}sched.tick();").ok();
+        writeln!(e.out, "{INDENT}}}").ok();
+    }
+    writeln!(e.out, "").ok();
 
     // Final + return.
     writeln!(e.out, "").ok();
@@ -774,6 +846,20 @@ struct Emitter {
     /// — the bus type and the C++ expression text of the DUT root
     /// (typically `dut`). Used by the field-access lowerer.
     bus_bindings: std::collections::HashMap<String, (BusDecl, String)>,
+    /// True while emitting statements *directly inside the test's run
+    /// coroutine body* (the `scope sim/run` block plus bare test-level
+    /// stmts). When set, `wait N cycles`, bare `tick()` (the bus
+    /// handshake spin loops), and bus.send/recv lowerings emit
+    /// `co_await harc_rt::wait_cycles(_slot, ...)` instead of the
+    /// synchronous `for (...) tick();` form.
+    ///
+    /// Component method bodies, `on`-event-handler closures, tseq
+    /// lambdas, and free functions all run synchronously between
+    /// coroutine yields — they keep the sync `tick()` lowering. This
+    /// works because they only execute while the run coroutine is
+    /// "running" (between its co_awaits), so a sync `tick()` from
+    /// inside a method does not race the scheduler.
+    in_coroutine: bool,
 }
 
 impl Emitter {
@@ -1320,9 +1406,18 @@ impl Emitter {
                 self.pad(depth);
                 writeln!(self.out, "{root}->{prefix}_valid = 1;").ok();
                 self.pad(depth);
-                writeln!(self.out, "{{ int _b = 16; while (!{root}->{prefix}_ready && _b > 0) {{ tick(); _b--; }} }}").ok();
-                self.pad(depth);
-                writeln!(self.out, "tick();").ok();
+                if self.in_coroutine {
+                    // Coroutine path: yield until ready=1 (bounded). The
+                    // bound matches the sync 16-cycle budget so a stuck
+                    // DUT still terminates the test rather than hanging.
+                    writeln!(self.out, "{{ int _b = 16; while (!{root}->{prefix}_ready && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}").ok();
+                    self.pad(depth);
+                    writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
+                } else {
+                    writeln!(self.out, "{{ int _b = 16; while (!{root}->{prefix}_ready && _b > 0) {{ tick(); _b--; }} }}").ok();
+                    self.pad(depth);
+                    writeln!(self.out, "tick();").ok();
+                }
                 self.pad(depth);
                 writeln!(self.out, "{root}->{prefix}_valid = 0;").ok();
                 true
@@ -1352,15 +1447,23 @@ impl Emitter {
                 self.pad(depth);
                 writeln!(self.out, "{root}->{prefix}_ready = 1;").ok();
                 self.pad(depth);
-                writeln!(self.out, "{{ int _b = 16; while (!{root}->{prefix}_valid && _b > 0) {{ tick(); _b--; }} }}").ok();
-                // Capture BEFORE tick(): the destination signals are
-                // valid in the same cycle as `valid` is high.
+                if self.in_coroutine {
+                    writeln!(self.out, "{{ int _b = 16; while (!{root}->{prefix}_valid && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}").ok();
+                } else {
+                    writeln!(self.out, "{{ int _b = 16; while (!{root}->{prefix}_valid && _b > 0) {{ tick(); _b--; }} }}").ok();
+                }
+                // Capture BEFORE the trailing tick: the destination signals
+                // are valid in the same cycle as `valid` is high.
                 if let Some(name) = let_name {
                     self.pad(depth);
                     writeln!(self.out, "auto {name} = {root}->{prefix}_{cap_sig};").ok();
                 }
                 self.pad(depth);
-                writeln!(self.out, "tick();").ok();
+                if self.in_coroutine {
+                    writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
+                } else {
+                    writeln!(self.out, "tick();").ok();
+                }
                 self.pad(depth);
                 writeln!(self.out, "{root}->{prefix}_ready = 0;").ok();
                 true
@@ -2454,9 +2557,17 @@ impl Emitter {
             }
             StmtKind::After { duration, body, .. } => {
                 self.pad(depth);
-                write!(self.out, "for (int _ck = 0; _ck < ").ok();
-                self.emit_expr(duration);
-                writeln!(self.out, "; _ck++) tick();").ok();
+                if self.in_coroutine {
+                    // Coroutine path: yield to the scheduler so other
+                    // coroutines can advance during the wait.
+                    write!(self.out, "co_await harc_rt::wait_cycles(_slot, (uint32_t)(").ok();
+                    self.emit_expr(duration);
+                    writeln!(self.out, "));").ok();
+                } else {
+                    write!(self.out, "for (int _ck = 0; _ck < ").ok();
+                    self.emit_expr(duration);
+                    writeln!(self.out, "; _ck++) tick();").ok();
+                }
                 if !body.stmts.is_empty() {
                     self.pad(depth);
                     writeln!(self.out, "{{").ok();
@@ -2483,6 +2594,24 @@ impl Emitter {
                             return;
                         }
                     };
+                    // `wait N cycles on <named-clock>` always lowers to
+                    // an inline `eval_clocks_until` loop, regardless of
+                    // coroutine context. The main loop's
+                    // `eval_clocks_until(next_primary_posedge)` advances
+                    // by a FULL primary period per iteration, which is
+                    // too coarse when the named clock runs faster than
+                    // the primary (e.g. `wait 1 cycle on dst_clk` where
+                    // dst is 2× src would skip past the target). The
+                    // sync path advances to whichever clock's next edge
+                    // is sooner, preserving sub-primary-cycle precision.
+                    //
+                    // Phase 1 is single-actor anyway (only the run
+                    // coroutine exists), so not yielding to the
+                    // scheduler during this wait is harmless. When
+                    // multi-actor lands and named-clock waits need to
+                    // cooperate with other coroutines, the main loop
+                    // gets reworked to advance by next-edge-of-any-clock
+                    // and the coroutine path resumes.
                     write!(self.out, "{{ long long _target = clocks_[{idx}].rising_count + (long long)(").ok();
                     self.emit_expr(duration);
                     writeln!(self.out, "); while (clocks_[{idx}].rising_count < _target) {{").ok();
@@ -2508,6 +2637,10 @@ impl Emitter {
                         }
                         Err(e) => self.errors.push(e),
                     }
+                } else if self.in_coroutine {
+                    write!(self.out, "co_await harc_rt::wait_cycles(_slot, (uint32_t)(").ok();
+                    self.emit_expr(duration);
+                    writeln!(self.out, "));").ok();
                 } else {
                     write!(self.out, "for (int _w = 0; _w < ").ok();
                     self.emit_expr(duration);

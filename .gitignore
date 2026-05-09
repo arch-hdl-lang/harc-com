@@ -5,3 +5,4 @@ Cargo.lock
 *.log
 .DS_Store
 HANDOFF.md
+.claude/
