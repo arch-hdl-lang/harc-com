@@ -1,12 +1,12 @@
 # HARC
 
-**HARC** (*Harness of ARCh*) is a verification language compiler — sister to **ARCH**, the hardware description language at [`arch-hdl-lang/arch-com`](https://github.com/arch-hdl-lang/arch-com). HARC produces a Verilator-driven C++ testbench from a high-level test description, with first-class support for transactions, constraint-randomized stimulus, monitors, scoreboards, covergroups, and concurrent assertions.
+**HARC** (*Harness of ARCh*) is a verification language compiler — sister to **ARCH**, the hardware description language at [`arch-hdl-lang/arch-com`](https://github.com/arch-hdl-lang/arch-com). HARC produces a Verilator-driven C++ testbench from a high-level test description, with first-class support for transactions, constraint-randomized stimulus, transactors (synthesizable BFMs), scoreboards, covergroups, and concurrent assertions.
 
 The full language reference is in [`spec.md`](spec.md).
 
 ## Status
 
-Pre-1.0. Phases 1a + 1b + 2 + 3 + 4 of the spec roadmap are usable end-to-end (stimulus → monitor → scoreboard → properties/coverage). 12 example fixtures from `arch-com/examples/` pass against the real Verilator-compiled SystemVerilog.
+Pre-1.0. Phases 1a + 1b + 2 + 3 + 4 of the spec roadmap are usable end-to-end (stimulus → observation → scoreboard → properties/coverage). 12 example fixtures from `arch-com/examples/` pass against the real Verilator-compiled SystemVerilog.
 
 ## Install
 
@@ -100,7 +100,7 @@ Common flags:
 | `pkt_queue_test.harc` | `pkt_queue.sv` | 2-cycle req/resp protocol |
 | `synchronizer_basic_test.harc` | `synchronizer_basic.sv` | 2-clock CDC |
 | `async_fifo_test*.harc` | `async_fifo.sv` | dual-clock FIFO, multi-file scope split |
-| `axilite_*_test*.harc` | `axilite_regs.sv` | drivers, monitors, scoreboards, randomize-with, events |
+| `axilite_*_test*.harc` | `axilite_regs.sv` | transactors (active+passive), scoreboards, randomize-with, events |
 | `counter_test*.harc` | `wrap_counter.sv` | properties, cover properties, multi-file split |
 
 See [`spec.md`](spec.md) for the language reference and [`HANDOFF.md`](HANDOFF.md) (locally generated) for the latest session-level state.
