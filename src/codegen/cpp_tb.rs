@@ -842,10 +842,24 @@ struct Emitter {
     /// `var.signal` and `var.channel.signal` flat-naming.
     buses: std::collections::HashMap<String, BusDecl>,
     /// Active bus bindings in the current emit context. Each entry
-    /// maps a let-bound variable name to `(bus_decl, dut_root_expr)`
-    /// — the bus type and the C++ expression text of the DUT root
-    /// (typically `dut`). Used by the field-access lowerer.
-    bus_bindings: std::collections::HashMap<String, (BusDecl, String)>,
+    /// maps a source-level identifier to `(bus_decl, dut_root_expr,
+    /// signal_prefix)`:
+    ///   * `bus_decl`     — bus declaration whose `signals` /
+    ///                      `handshakes` constrain typed access
+    ///   * `dut_root_expr` — C++ expression text for the DUT root
+    ///                       (typically `"dut"`)
+    ///   * `signal_prefix` — name used for flat signal lookup on the
+    ///                       DUT (e.g. `"axil"` for `dut->axil_aw_addr`)
+    ///
+    /// For the test-scope `let axil : BusAxiLite = bind dut`, the
+    /// identifier and prefix are both `"axil"`. For the driver-bound
+    /// alias `let drv = bind axil` (Phase 2), inside the driver's
+    /// on-handler body the bare identifier `"bus"` maps to the same
+    /// `(bus_decl, root, prefix)` tuple as `"axil"` — the prefix stays
+    /// `"axil"` so signal access still resolves to the DUT-level flat
+    /// names. Distinguishing the lookup key from the prefix is what
+    /// makes the alias work.
+    bus_bindings: std::collections::HashMap<String, (BusDecl, String, String)>,
     /// True while emitting statements *directly inside the test's run
     /// coroutine body* (the `scope sim/run` block plus bare test-level
     /// stmts). When set, `wait N cycles`, bare `tick()` (the bus
@@ -1122,12 +1136,33 @@ impl Emitter {
     /// span don't collide. Inside both paths, body bare-references to
     /// component fields rewrite to `<instance>.<field>` via
     /// `field_subs`.
+    /// Emit `on`-handler subscriber closures for a component instance.
+    ///
+    /// `bound_bus = Some((BusDecl, root))` is set when the component is
+    /// declared `bound to BusType` and the user instantiated it via
+    /// `let drv : Drv = bind <bus_binding>`. While each handler body is
+    /// emitted, `bus_bindings["bus"]` is temporarily set to this binding
+    /// so `bus.<ch>.send(t.addr, …)` and `bus.<ch>.<sig>` inside the
+    /// body resolve to flat DUT signals through the existing bus-typing
+    /// lowerers. The temporary entry is popped after each body so it
+    /// doesn't leak across components.
     fn emit_component_handler_registrations(
         &mut self,
         comp: &ComponentDecl,
         instance: &str,
         depth: usize,
         tag_prefix: &str,
+    ) {
+        self.emit_component_handler_registrations_bound(comp, instance, depth, tag_prefix, None);
+    }
+
+    fn emit_component_handler_registrations_bound(
+        &mut self,
+        comp: &ComponentDecl,
+        instance: &str,
+        depth: usize,
+        tag_prefix: &str,
+        bound_bus: Option<(BusDecl, String, String)>,
     ) {
         // Build field-name substitution map for the body. Component
         // fields visible by bare name inside the handler body get
@@ -1169,7 +1204,22 @@ impl Emitter {
                             self.out,
                             "{instance}.{event_name}.push_back([&]({arg_ty} {arg_name}) {{",
                         ).ok();
+                        // For `bound to BusType` components, expose the
+                        // driver's bus binding inside the handler body
+                        // as the bare identifier `bus`. Same root +
+                        // BusDecl as the test-scope binding it was
+                        // bound from, so `bus.<ch>.send/recv` and
+                        // `bus.<ch>.<sig>` lower through the existing
+                        // bus_handshake / bus_field_access paths.
+                        let prior_bus = bound_bus.as_ref()
+                            .and_then(|b| self.bus_bindings.insert("bus".into(), b.clone()));
                         self.emit_block(&h.body, depth + 1);
+                        if bound_bus.is_some() {
+                            match prior_bus {
+                                Some(prev) => { self.bus_bindings.insert("bus".into(), prev); }
+                                None       => { self.bus_bindings.remove("bus"); }
+                            }
+                        }
                         self.pad(depth);
                         writeln!(self.out, "}});").ok();
                         continue;
@@ -1369,11 +1419,11 @@ impl Emitter {
         let ExprKind::Field { target, name: method } = &*callee.kind else { return false; };
         let ExprKind::Field { target: outer, name: ch } = &*target.kind else { return false; };
         let ExprKind::Ident(id) = &*outer.kind else { return false; };
-        let Some((bus, root)) = self.bus_bindings.get(&id.name).cloned() else { return false; };
+        let Some((bus, root, sig_prefix)) = self.bus_bindings.get(&id.name).cloned() else { return false; };
         let Some(h) = bus.handshakes.iter().find(|h| h.name.name == ch.name).cloned() else {
             return false;
         };
-        let prefix = format!("{}_{}", id.name, ch.name);  // axil_aw
+        let prefix = format!("{}_{}", sig_prefix, ch.name);  // axil_aw
 
         match method.name.as_str() {
             "send" => {
@@ -1475,20 +1525,20 @@ impl Emitter {
     fn try_emit_bus_field_access(&mut self, target: &Expr, name: &Ident) -> Option<String> {
         // <binding>.<signal>
         if let ExprKind::Ident(id) = &*target.kind {
-            if let Some((bus, root)) = self.bus_bindings.get(&id.name).cloned() {
+            if let Some((bus, root, sig_prefix)) = self.bus_bindings.get(&id.name).cloned() {
                 if bus.signals.iter().any(|s| s.name.name == name.name) {
-                    return Some(format!("{root}->{}_{}", id.name, name.name));
+                    return Some(format!("{root}->{}_{}", sig_prefix, name.name));
                 }
                 // Already-flattened `<chan>_<sig>` form (or `<chan>_valid`
                 // / `<chan>_ready`).
                 for h in &bus.handshakes {
-                    let prefix = format!("{}_", h.name.name);
-                    if name.name.starts_with(&prefix) {
-                        let tail = &name.name[prefix.len()..];
+                    let chprefix = format!("{}_", h.name.name);
+                    if name.name.starts_with(&chprefix) {
+                        let tail = &name.name[chprefix.len()..];
                         if tail == "valid" || tail == "ready"
                             || h.payload.iter().any(|s| s.name.name == tail)
                         {
-                            return Some(format!("{root}->{}_{}", id.name, name.name));
+                            return Some(format!("{root}->{}_{}", sig_prefix, name.name));
                         }
                     }
                 }
@@ -1507,14 +1557,14 @@ impl Emitter {
         // <binding>.<channel>.<signal>
         if let ExprKind::Field { target: outer, name: ch } = &*target.kind {
             if let ExprKind::Ident(id) = &*outer.kind {
-                if let Some((bus, root)) = self.bus_bindings.get(&id.name).cloned() {
+                if let Some((bus, root, sig_prefix)) = self.bus_bindings.get(&id.name).cloned() {
                     if let Some(h) = bus.handshakes.iter().find(|h| h.name.name == ch.name) {
                         if name.name == "valid" || name.name == "ready"
                             || h.payload.iter().any(|s| s.name.name == name.name)
                         {
                             return Some(format!(
                                 "{root}->{}_{}_{}",
-                                id.name, ch.name, name.name,
+                                sig_prefix, ch.name, name.name,
                             ));
                         }
                         let valid_options: Vec<&str> = std::iter::once("valid")
@@ -2943,8 +2993,67 @@ impl Emitter {
                     std::mem::swap(&mut self.out, &mut buf);
                     self.emit_expr(v);
                     std::mem::swap(&mut self.out, &mut buf);
-                    self.bus_bindings.insert(l.name.name.clone(), (bus, buf));
+                    // Test-scope binding: identifier and prefix are
+                    // the same. Aliases (e.g. driver's `bus`) reuse
+                    // this prefix when registering — see
+                    // `emit_component_handler_registrations_bound`.
+                    let prefix = l.name.name.clone();
+                    self.bus_bindings.insert(l.name.name.clone(), (bus, buf, prefix));
                     return;
+                }
+            }
+        }
+        // Component binding: `let drv : AxilDrv = bind axil` for a
+        // `driver` / `agent` / `monitor` declared `bound to BusType`.
+        // The binding ties this driver instance to the named bus
+        // binding so its on-handlers can use the bare `bus` identifier
+        // for typed signal/handshake access. Emits the struct exactly
+        // as the no-value path would, plus on-handler registrations
+        // with the bus binding pushed for the duration of each body.
+        if l.bind {
+            if let Some(simple) = type_simple_name(l.ty.as_ref()) {
+                if let Some(comp) = self.components.get(simple).cloned() {
+                    if let Some(bus_ty) = &comp.bound_to {
+                        // The rhs must name an existing bus binding (a
+                        // previous `let X : BusType = bind dut`). Plain
+                        // ident only in v0; richer expressions deferred.
+                        if let Some(v) = &l.value {
+                            if let ExprKind::Ident(rhs) = &*v.kind {
+                                if let Some(binding) = self.bus_bindings.get(&rhs.name).cloned() {
+                                    // Type-check: the bus binding's
+                                    // BusDecl name must match the
+                                    // driver's `bound to <BusType>`.
+                                    let want = type_simple_name(Some(bus_ty));
+                                    if want != Some(binding.0.name.name.as_str()) {
+                                        self.errors.push(format!(
+                                            "let {} : {} = bind {}: driver is bound to `{}`, but `{}` is a `{}`",
+                                            l.name.name, simple, rhs.name,
+                                            want.unwrap_or("?"),
+                                            rhs.name, binding.0.name.name,
+                                        ));
+                                    }
+                                    self.pad(depth);
+                                    writeln!(self.out, "{simple} {};", l.name.name).ok();
+                                    let tag = format!("_{}_", comp.kind.keyword());
+                                    self.emit_component_handler_registrations_bound(
+                                        &comp, &l.name.name, depth, &tag, Some(binding),
+                                    );
+                                    return;
+                                } else {
+                                    self.errors.push(format!(
+                                        "let {} : {} = bind {}: `{}` is not a known bus binding (declare it first via `let {} : <BusType> = bind dut`)",
+                                        l.name.name, simple, rhs.name, rhs.name, rhs.name,
+                                    ));
+                                    return;
+                                }
+                            }
+                        }
+                        self.errors.push(format!(
+                            "let {} : {} = bind <expr>: rhs must be a bare bus-binding name in v0",
+                            l.name.name, simple,
+                        ));
+                        return;
+                    }
                 }
             }
         }
