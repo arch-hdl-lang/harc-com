@@ -1,0 +1,136 @@
+// HARC port of arch-com/tests/cam_value_basic_tb.cpp.
+//
+// Tag_Value_Cam is a CAM variant that stores an optional value-payload
+// alongside each (valid, key) entry. Each slot now holds (valid, key,
+// value); the read side returns the value at search_first directly.
+//
+// The C++ TB pokes signals directly with no events, so the HARC port
+// uses a passive transactor with hookable methods — one per logical
+// operation (write, reset). Search is just a combinational read so it
+// stays inline as `dut.search_key = X; wait 1 cycle`.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor CamValueXactor
+    dut : Tag_Value_Cam
+
+    // Drive a single-cycle write with explicit value payload.
+    hookable write(idx: uint<3>, key: uint<16>, value: uint<32>, set: bool)
+        dut.write_valid = 1
+        dut.write_idx = idx
+        dut.write_key = key
+        dut.write_value = value
+        dut.write_set = set
+        wait 1 cycle
+        dut.write_valid = 0
+    end write
+
+    // Reset pulse — matches the C++ TB's do_reset(): two ticks asserted,
+    // one tick deasserted.
+    hookable reset_dut()
+        dut.rst = 1
+        dut.write_valid = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+    end reset_dut
+end transactor CamValueXactor
+
+test CamValueBasicTest
+    let dut  : Tag_Value_Cam
+    let xact : CamValueXactor passive
+
+    clock clk = SysDomain
+
+    scope sim
+        run
+            log(info, "Tag_Value_Cam value-payload CAM test")
+            xact.dut = dut
+
+            // ── Reset ─────────────────────────────────────────────
+            xact.reset_dut()
+            // Yield once so the scheduler has a suspension point before
+            // any comb-input-then-assert sequence below — otherwise the
+            // first such assert would read a stale eval (the hookable's
+            // internal `wait` calls advance the clock synchronously and
+            // don't suspend the run coroutine).
+            wait 1 cycle
+
+            // ── Empty CAM: no match ───────────────────────────────
+            dut.search_key = 256                    // 0x100
+            wait 1 cycle
+            assert dut.search_any == 0
+                else fail("empty: search_any=${dut.search_any}, expected 0")
+            log(info, "PASS: empty CAM rejects all searches")
+
+            // ── Insert 3 entries with distinct (key, value) ───────
+            xact.write(0, 256,  3735879680, true)   // 0x100 → 0xDEAD0000
+            xact.write(1, 512,  3735879681, true)   // 0x200 → 0xDEAD0001
+            xact.write(2, 768,  3735879682, true)   // 0x300 → 0xDEAD0002
+
+            // ── Lookup each: hit + correct value ──────────────────
+            dut.search_key = 256
+            wait 1 cycle
+            assert dut.search_any == 1
+                else fail("key=0x100: search_any=${dut.search_any}, expected 1")
+            assert dut.search_first == 0
+                else fail("key=0x100: first=${dut.search_first}, expected 0")
+            assert dut.read_value == 3735879680
+                else fail("key=0x100: read_value=${dut.read_value}, expected 0xDEAD0000")
+            log(info, "PASS: key=0x100 → idx 0, value 0xDEAD0000")
+
+            dut.search_key = 512
+            wait 1 cycle
+            assert dut.search_any == 1
+                else fail("key=0x200: search_any=${dut.search_any}, expected 1")
+            assert dut.search_first == 1
+                else fail("key=0x200: first=${dut.search_first}, expected 1")
+            assert dut.read_value == 3735879681
+                else fail("key=0x200: read_value=${dut.read_value}, expected 0xDEAD0001")
+            log(info, "PASS: key=0x200 → idx 1, value 0xDEAD0001")
+
+            dut.search_key = 768
+            wait 1 cycle
+            assert dut.search_any == 1
+                else fail("key=0x300: search_any=${dut.search_any}, expected 1")
+            assert dut.search_first == 2
+                else fail("key=0x300: first=${dut.search_first}, expected 2")
+            assert dut.read_value == 3735879682
+                else fail("key=0x300: read_value=${dut.read_value}, expected 0xDEAD0002")
+            log(info, "PASS: key=0x300 → idx 2, value 0xDEAD0002")
+
+            // ── Unknown key: search_any=0 (read_value undefined) ──
+            dut.search_key = 2457                   // 0x999
+            wait 1 cycle
+            assert dut.search_any == 0
+                else fail("unknown key: search_any=${dut.search_any}, expected 0")
+            log(info, "PASS: unknown key → search_any == 0")
+
+            // ── Update value at existing slot — overwrite with set=true ──
+            xact.write(1, 512, 3405939234, true)    // 0x200 → 0xCAFE2222
+            dut.search_key = 512
+            wait 1 cycle
+            assert dut.read_value == 3405939234
+                else fail("update slot 1: read_value=${dut.read_value}, expected 0xCAFE2222")
+            log(info, "PASS: update slot 1 value to 0xCAFE2222")
+
+            // ── Clear slot 0 — same key now misses ────────────────
+            xact.write(0, 0, 0, false)
+            dut.search_key = 256
+            wait 1 cycle
+            assert dut.search_any == 0
+                else fail("post-clear: key 0x100 search_any=${dut.search_any}, expected 0")
+            log(info, "PASS: post-clear: key 0x100 misses")
+
+            // ── Reset wipes everything ────────────────────────────
+            xact.reset_dut()
+            dut.search_key = 512
+            wait 1 cycle
+            assert dut.search_any == 0
+                else fail("post-reset: search_any=${dut.search_any}, expected 0")
+            log(info, "PASS: post-reset: empty")
+        end run
+    end scope sim
+end test CamValueBasicTest
