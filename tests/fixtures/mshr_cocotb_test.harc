@@ -1,0 +1,181 @@
+// HARC port of arch-com/tests/cvdp/test_mshr_cocotb.py — cache_mshr,
+// the Miss Status Handling Register at the heart of a non-blocking
+// cache. The original cocotb test runs 4 sub-tests under 10
+// different clock periods (2 to 20 ns); HARC's runtime is cycle-
+// based so clock period doesn't change behavior — we run once with
+// the default MSHR_SIZE=32.
+//
+// Sub-tests (matching the cocotb structure exactly):
+//
+//   1. Fill: allocate until ready goes low; cycles must equal
+//      MSHR_SIZE.
+//   2. Linked list: allocate same addr MSHR_SIZE times;
+//      allocate_previd chains 0 → 1 → ... → MSHR_SIZE-1.
+//   3. Allocate + finalize reuse: alloc → finalize → alloc; second
+//      alloc reuses the first slot's id.
+//   4. Simultaneous allocate + finalize: same-cycle assertion of
+//      both; allocate_id rolls forward to slot 1.
+//
+// Helpers live on a passive transactor (`MshrXactor`) — same
+// pattern as cpu_pipeline_test and linklist_doubly_test. Each
+// hookable mirrors a cocotb sequence.
+
+// MSHR_SIZE = 32 (DUT default). Inlined as a literal in the test
+// body below — `const` items parse in HARC but aren't yet emitted
+// by cpp_tb codegen, so referencing `MSHR_SIZE` from C++ would fail
+// to link. Tracked as a follow-up codegen item.
+
+transactor MshrXactor
+    dut : cache_mshr
+
+    // Reset pulse (matches cocotb reset_dut helper). Three half-
+    // cycles wide, mirroring the duration_ns=10 ns pattern.
+    hookable reset_dut()
+        dut.reset = 0
+        wait 1 cycle
+        dut.reset = 1
+        wait 2 cycles
+        dut.reset = 0
+        wait 1 cycle
+    end reset_dut
+
+    hookable init_dut()
+        dut.reset = 0
+        dut.allocate_valid = 0
+        dut.allocate_addr = 0
+        dut.allocate_rw = 0
+        dut.allocate_data = 0
+        dut.finalize_valid = 0
+        dut.finalize_id = 0
+        dut.fill_valid = 0
+        dut.fill_id = 0
+        dut.dequeue_ready = 0
+    end init
+
+    // Drive a single allocate request for one cycle and capture the
+    // assigned id.
+    hookable allocate_one(addr: uint<10>, rw: uint<1>, data: uint<32>) -> uint<5>
+        dut.allocate_valid = 1
+        dut.allocate_addr = addr
+        dut.allocate_rw = rw
+        dut.allocate_data = data
+        wait 1 cycle
+        let id = dut.allocate_id
+        dut.allocate_valid = 0
+        dut.allocate_addr = 0
+        dut.allocate_rw = 0
+        dut.allocate_data = 0
+        return id
+    end allocate_one
+
+    hookable finalize_one(id: uint<5>)
+        dut.finalize_valid = 1
+        dut.finalize_id = id
+        wait 1 cycle
+        dut.finalize_valid = 0
+        dut.finalize_id = 0
+    end finalize_one
+end transactor MshrXactor
+
+test MshrCocotbTest
+    let dut  : cache_mshr
+    let xact : MshrXactor passive
+
+    scope sim
+        run
+            log(info, "cache_mshr cocotb-style port — 4 sub-tests")
+            xact.dut = dut
+
+            // Init + reset (cocotb's `dut_init` + `reset_dut`).
+            xact.init_dut()
+            xact.reset_dut()
+            wait 2 cycles
+
+            assert dut.allocate_id == 0
+                else fail("init: allocate_id=${dut.allocate_id}, expected 0")
+            assert dut.allocate_ready == 1
+                else fail("init: allocate_ready=${dut.allocate_ready}, expected 1")
+
+            // ── Test 1: Fill — allocate until ready goes low ───
+            dut.allocate_valid = 1
+            let cycles = 0
+            // Bound: 2 * MSHR_SIZE is plenty.
+            for _ in 0 .. 64
+                if dut.allocate_ready == 1
+                    wait 1 cycle
+                    cycles = cycles + 1
+                end if
+            end for
+            dut.allocate_valid = 0
+            assert cycles == 32
+                else fail("Test 1: fill cycles=${cycles}, expected MSHR_SIZE=32")
+            log(info, "Test 1 PASS: fill exhausts in ${cycles} cycles")
+
+            xact.reset_dut()
+
+            // ── Test 2: Linked list — same addr, chain through ─
+            // After reset, allocate MSHR_SIZE entries with the same
+            // addr (0x42, picked deterministically vs cocotb's
+            // randint). Each new alloc should set previd = i-1 and
+            // pending = 1.
+            dut.allocate_valid = 1
+            dut.allocate_addr = 66           // 0x42
+            dut.finalize_valid = 0
+            for i in 0 .. 32
+                dut.allocate_rw = i & 1
+                dut.allocate_data = i * 17
+                wait 1 cycle
+                assert dut.allocate_id == i
+                    else fail("Test 2: at i=${i}, allocate_id=${dut.allocate_id}, expected ${i}")
+                if i != 0
+                    assert dut.allocate_pending == 1
+                        else fail("Test 2: at i=${i}, allocate_pending=${dut.allocate_pending}, expected 1")
+                    assert dut.allocate_previd == i - 1
+                        else fail("Test 2: at i=${i}, allocate_previd=${dut.allocate_previd}, expected ${i - 1}")
+                end if
+            end for
+            dut.allocate_valid = 0
+            log(info, "Test 2 PASS: linked-list chains 0..31")
+
+            xact.reset_dut()
+
+            // ── Test 3: allocate + finalize → alloc reuses id ───
+            let id1 = xact.allocate_one(66, 1, 0x1111)
+            xact.finalize_one(id1)
+            wait 1 cycle
+            let id2 = xact.allocate_one(99, 0, 0x2222)
+            assert id2 == id1
+                else fail("Test 3: id2=${id2}, expected reuse id1=${id1}")
+            log(info, "Test 3 PASS: alloc(${id1}) → finalize → alloc reuses id ${id2}")
+
+            xact.reset_dut()
+
+            // ── Test 4: simultaneous allocate + finalize ───────
+            // Allocate slot 0, then on the next cycle allocate AGAIN
+            // while finalizing slot 0. After the dust settles, the
+            // ALLOCATE side wins and assigns slot 1.
+            dut.allocate_valid = 1
+            dut.allocate_addr = 33
+            dut.allocate_rw = 1
+            dut.allocate_data = 0xAAAA
+            wait 1 cycle
+            let id_first = dut.allocate_id
+
+            dut.allocate_valid = 1
+            dut.allocate_addr = id_first & 3
+            dut.allocate_rw = 0
+            dut.allocate_data = 0xBBBB
+            dut.finalize_valid = 1
+            dut.finalize_id = id_first
+            wait 1 cycle
+            dut.allocate_valid = 0
+            dut.finalize_valid = 0
+
+            assert dut.allocate_id == 1
+                else fail("Test 4: allocate_id=${dut.allocate_id}, expected 1 (rolled forward)")
+            log(info, "Test 4 PASS: simultaneous alloc+finalize, allocate_id rolled to 1")
+
+            log(info, "ALL 4 SUB-TESTS PASSED — cache_mshr cocotb-port coverage")
+        end run
+    end scope sim
+end test MshrCocotbTest
