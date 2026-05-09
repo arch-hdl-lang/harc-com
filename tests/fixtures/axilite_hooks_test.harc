@@ -1,13 +1,13 @@
 // AxiLiteRegs test demonstrating pre/post hooks on a hookable
-// driver method (spec §7.3). Hooks observe and instrument without
-// replacing the body — `pre` fires before the method body, `post`
-// fires after, both in the same call. Both see the same args as
-// the method.
+// transactor method (spec §7.3). Hooks observe and instrument
+// without replacing the body — `pre` fires before the method body,
+// `post` fires after, both in the same call. Both see the same
+// args as the method.
 //
 // Pattern:
-//   driver D
+//   transactor T
 //       hookable send(t: T) ... end send
-//   end driver D
+//   end transactor T
 //
 //   on drv.send pre   ... end on    // log / count incoming txns
 //   on drv.send post  ... end on    // bump per-call counters
@@ -17,7 +17,7 @@ transaction RegOp
     value : uint<32>
 end transaction RegOp
 
-driver HookDrv
+transactor HookXactor
     dut       : AxiLiteRegs
     last_read : uint<32> default 0
 
@@ -52,11 +52,11 @@ driver HookDrv
         wait 1 cycle
         last_read = val
     end send
-end driver HookDrv
+end transactor HookXactor
 
 test AxiLiteHooksTest
     let dut : AxiLiteRegs
-    let drv : HookDrv
+    let drv : HookXactor passive
 
     // Pre/post hook counters live at test scope so the hook bodies
     // can mutate them by-reference via [&] capture.

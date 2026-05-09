@@ -1,28 +1,30 @@
-// AxiLiteRegs test demonstrating `connect` blocks: an `env` composes
-// a sequencer + driver; a connect edge wires the sequencer's
-// `dispatched` event to the driver's `req` event. Calling
-// `env.sequencer.run(...)` indirectly drives the bus through the connect
-// bridge — no `emit env.drv.req(...)` from the test scope.
+// AxiLiteRegs test demonstrating `connect` blocks inside `env`: a
+// `connect` edge wires the sequencer's `dispatched` event to the
+// transactor's `req` event. Calling `env.sequencer.dispatch(...)`
+// indirectly drives the bus through the connect bridge — no
+// `emit env.drv.req(...)` from the test scope.
 //
 // Pattern (mirrors spec §8.1):
 //
 //   sequencer Seq
 //       dispatched : out event<RegOp>
-//       hookable run(seq: TSeq<RegOp>)
+//       hookable dispatch(seq: TSeq<RegOp>)
 //           for t in seq emit dispatched(t) end for
 //       end run
 //   end sequencer Seq
 //
-//   driver Drv
-//       req : in event<RegOp>
-//       on req(t) ...drive bus... end on
-//   end driver Drv
+//   transactor Drv
+//       when active
+//           req : in event<RegOp>
+//           on req(t) ...drive bus... end on
+//       end when
+//   end transactor Drv
 //
 //   env E
-//       seq : Seq
-//       drv : Drv
+//       sequencer : Seq
+//       drv       : Drv  active
 //       connect
-//           seq.dispatched -> drv.req
+//           sequencer.dispatched -> drv.req
 //       end connect
 //   end env E
 
@@ -45,43 +47,46 @@ sequencer AxilSeq
     end dispatch
 end sequencer AxilSeq
 
-driver AxilDrv
-    req       : in event<RegOp>
+transactor AxilXactor
     dut       : AxiLiteRegs
     last_read : uint<32> default 0
 
-    on req(t)
-        // Write phase
-        dut.axil_aw_addr = t.addr
-        dut.axil_aw_valid = 1
-        dut.axil_w_data = t.value
-        dut.axil_w_strb = 15
-        dut.axil_w_valid = 1
-        wait 10 cycles
-        dut.axil_aw_valid = 0
-        dut.axil_w_valid = 0
-        wait 2 cycles
+    when active
+        req : in event<RegOp>
 
-        // Read phase
-        let val = 0
-        let saw = 0
-        dut.axil_ar_addr = t.addr
-        dut.axil_ar_valid = 1
-        for _ in 0 .. 10
-            wait 1 cycle
-            if dut.axil_r_valid
-                if saw == 0
-                    val = dut.axil_r_data
-                    dut.axil_ar_valid = 0
-                    saw = 1
+        on req(t)
+            // Write phase
+            dut.axil_aw_addr = t.addr
+            dut.axil_aw_valid = 1
+            dut.axil_w_data = t.value
+            dut.axil_w_strb = 15
+            dut.axil_w_valid = 1
+            wait 10 cycles
+            dut.axil_aw_valid = 0
+            dut.axil_w_valid = 0
+            wait 2 cycles
+
+            // Read phase
+            let val = 0
+            let saw = 0
+            dut.axil_ar_addr = t.addr
+            dut.axil_ar_valid = 1
+            for _ in 0 .. 10
+                wait 1 cycle
+                if dut.axil_r_valid
+                    if saw == 0
+                        val = dut.axil_r_data
+                        dut.axil_ar_valid = 0
+                        saw = 1
+                    end if
                 end if
-            end if
-        end for
-        dut.axil_ar_valid = 0
-        wait 1 cycle
-        last_read = val
-    end on
-end driver AxilDrv
+            end for
+            dut.axil_ar_valid = 0
+            wait 1 cycle
+            last_read = val
+        end on
+    end when
+end transactor AxilXactor
 
 scoreboard AxilSb
     expected : queue<uint<32>>
@@ -90,7 +95,7 @@ end scoreboard AxilSb
 
 env AxilEnv
     sequencer : AxilSeq
-    drv       : AxilDrv
+    drv       : AxilXactor active
     sb        : AxilSb
 
     connect
@@ -113,7 +118,7 @@ test AxiLiteConnectTest
 
     scope sim
         run
-            log(info, "AxiLiteRegs env+connect test (sequencer→driver via event bridge)")
+            log(info, "AxiLiteRegs env+connect test (sequencer→transactor via event bridge)")
             env.drv.dut = dut
 
             // Reset.
@@ -143,10 +148,10 @@ test AxiLiteConnectTest
 
             // Pre-seed expected values into the scoreboard, then let the
             // sequencer dispatch each transaction. The connect bridge
-            // forwards every emit on env.sequencer.dispatched into the driver's
-            // req event, which fires the driver's on-handler. After the
-            // run, walk the queue and assert each driver round-trip
-            // matched.
+            // forwards every emit on env.sequencer.dispatched into the
+            // transactor's req event, which fires the active driver
+            // body. After the run, walk the queue and assert each
+            // round-trip matched.
             let txns = RandomTxns(5)
             for t in txns
                 env.sb.expected.push(t.value)
@@ -163,7 +168,7 @@ test AxiLiteConnectTest
             assert env.sb.errors > 0 || env.sb.expected.empty()
                 else fail("scoreboard not drained")
 
-            log(info, "PASS: 5 sequencer→driver round-trips via `connect` event bridge")
+            log(info, "PASS: 5 sequencer→transactor round-trips via `connect` event bridge")
         end run
     end scope sim
 end test AxiLiteConnectTest

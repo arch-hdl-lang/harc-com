@@ -5,10 +5,12 @@
 // the same coverage in HARC using:
 //
 //   - BusAxiLite typed bus access (`use BusAxiLite` from the stdlib)
-//   - A small `AxilHelper` driver `bound to BusAxiLite` with two
+//   - A small `AxilHelper` transactor `bound to BusAxiLite` with two
 //     hookable methods (`write` and `read`). `bus` inside the
-//     hookable bodies resolves to the parent driver's bus binding,
-//     so the helper looks like an HVL register agent.
+//     hookable bodies resolves to the parent's bus binding, so the
+//     helper looks like an HVL register agent. Instantiated as
+//     `passive` since the test scope calls the methods directly —
+//     no active driver coroutine.
 //   - `bus.<ch>.send` for the write data channel + multi-payload
 //     `bus.<ch>.recv()` returning a struct so `r.data` cross-checks
 //     register readbacks.
@@ -18,11 +20,11 @@
 
 use BusAxiLite
 
-// ─── Helper driver — wraps the AXI-Lite write/read dance ─────────
+// ─── Helper transactor — wraps the AXI-Lite write/read dance ────
 // `bound to BusAxiLite` so `bus.aw / bus.w / bus.ar / bus.r / bus.b`
 // inside the hookable bodies resolve to the parent's bus binding
 // (see PR #18). Two methods replace ~30 lines of C++ helpers.
-driver AxilHelper bound to BusAxiLite
+transactor AxilHelper bound to BusAxiLite
     hookable write(addr: uint<8>, data: uint<32>)
         bus.aw.addr = addr
         bus.aw.valid = 1
@@ -39,12 +41,12 @@ driver AxilHelper bound to BusAxiLite
         wait 1 cycle
         return r.data
     end read
-end driver AxilHelper
+end transactor AxilHelper
 
 test AxiLiteRegsFullTest
     let dut    : AxiLiteRegs
     let axil   : BusAxiLite = bind dut
-    let helper : AxilHelper = bind axil
+    let helper : AxilHelper passive = bind axil
 
     scope sim
         run
