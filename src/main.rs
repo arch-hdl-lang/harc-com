@@ -264,7 +264,23 @@ fn run_verilator(
         "-Wno-fatal".into(), "-Wno-WIDTH".into(),
         "--top-module".into(), top.into(),
         "--Mdir".into(), mdir.display().to_string(),
+        // Force C++20 by overriding verilator's default
+        // `CFG_CXXFLAGS_STD = -std=gnu++17` Makefile variable. Done
+        // via `-MAKEFLAGS` (forwarded to `make`) rather than user
+        // CFLAGS because verilator's own CFLAGS append AFTER user
+        // ones, so user `-std=c++20` gets overridden by `-std=gnu++17`
+        // at the end of the compiler command line.
+        //
+        // C++20 is required by `harc_thread_rt.h`'s `<coroutine>`
+        // includes and our `co_await`-based `wait_cycles` /
+        // `wait_until` lowerings.
+        "-MAKEFLAGS".into(), "CFG_CXXFLAGS_STD=-std=gnu++20".into(),
     ];
+    // Make the build dir an include path so the emitted `.cpp`'s
+    // `#include "harc_thread_rt.h"` resolves — verilator builds in
+    // `obj_dir/` (cwd at compile time) and the header lives one level up.
+    args.push("-CFLAGS".into());
+    args.push(format!("-I{}", outdir_abs.display()));
     if let Some(inc) = &z3_inc {
         args.push("-CFLAGS".into());
         args.push(format!("-I{}", inc.display()));
@@ -365,6 +381,16 @@ fn cmd_sim(
     let cpp_path = outdir.join(format!("{stem}.cpp"));
     fs::write(&cpp_path, &cpp).into_diagnostic()?;
     eprintln!("emitted {}", cpp_path.display());
+
+    // Drop the coroutine runtime header alongside the emitted .cpp so
+    // verilator's standard `--Mdir`-relative include search picks it up
+    // without needing an extra `-I` flag. The .cpp file `#include`s
+    // it as `"harc_thread_rt.h"`. Bundled as a baked-in string via
+    // `include_str!` so a binary install of `harc` ships the runtime
+    // without a separate file dependency.
+    let rt_header_path = outdir.join("harc_thread_rt.h");
+    fs::write(&rt_header_path, harc::codegen::cpp_tb::THREAD_RT_HEADER)
+        .into_diagnostic()?;
 
     if emit_only {
         return Ok(());
