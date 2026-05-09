@@ -119,33 +119,33 @@ int main(int argc, char** argv) {
     harc_rt::ThreadSlot _run_slot;
     sched.slots.push_back(&_run_slot);
     _run_slot.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
-        dut->rst = 1;
-        dut->inc = 0;
-        dut->max = 15;
+        harc_rt::harc_assign(dut->rst, 1);
+        harc_rt::harc_assign(dut->inc, 0);
+        harc_rt::harc_assign(dut->max, 15);
         co_await harc_rt::wait_cycles(_slot, (uint32_t)(2));
-        dut->rst = 0;
+        harc_rt::harc_assign(dut->rst, 0);
         for (int64_t i = 0; i < 16; i++) {
-            if (!(dut->value == i)) {
+            if (!(harc_rt::harc_read(dut->value) == i)) {
                 sim_log_line("FAIL", "count mismatch");
                 errors++;
             }
             if (i == 15) {
-                if (!(dut->at_max)) {
+                if (!(harc_rt::harc_read(dut->at_max))) {
                     sim_log_line("FAIL", "at_max should be 1 at 15");
                     errors++;
                 }
             }
-            dut->inc = 1;
+            harc_rt::harc_assign(dut->inc, 1);
             co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
         }
-        if (!(dut->value == 0)) {
+        if (!(harc_rt::harc_read(dut->value) == 0)) {
             sim_log_line("FAIL", "wrap failed");
             errors++;
         }
         sim_log_line("INFO", "PASS: wrap at MAX=15");
-        dut->inc = 0;
+        harc_rt::harc_assign(dut->inc, 0);
         co_await harc_rt::wait_cycles(_slot, (uint32_t)(2));
-        if (!(dut->value == 0)) {
+        if (!(harc_rt::harc_read(dut->value) == 0)) {
             sim_log_line("FAIL", "hold failed");
             errors++;
         }

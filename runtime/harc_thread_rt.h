@@ -34,11 +34,61 @@
 #include <coroutine>
 #include <functional>
 #include <cstdint>
+#include <type_traits>
 #include <vector>
 #include <atomic>
 #include <thread>
 
 namespace harc_rt {
+
+// ── Verilator wide-signal interop ───────────────────────────────────────────
+//
+// Verilator lowers SystemVerilog ports based on bit-width:
+//   1..32 bits   → uint8_t / uint16_t / uint32_t
+//   33..64 bits  → uint64_t
+//   >64 bits     → VlWide<N>  (an array of N uint32_t words, N=ceil(W/32))
+//
+// HARC codegen emits direct C++ accesses for `dut.signal` and `dut.signal =
+// expr`. For the narrow cases that's a plain integer assignment / read; for
+// the wide case `VlWide<N>` has no implicit conversion to/from integer
+// types, so the same source pattern fails to compile. The helpers below
+// bridge that gap with a single template that resolves at compile time:
+// narrow signals get plain assignment, wide signals get per-word writes /
+// composed reads. v0 only handles values that fit in 64 bits — sufficient
+// for the test patterns in arch-com fixtures (handles up to AXI4 256-bit
+// data ports, where each beat is a 64-bit literal in the test). Wider
+// values would need the user to split into multiple calls.
+
+template<typename Sig, typename Val>
+inline void harc_assign(Sig& sig, Val val) {
+    if constexpr (std::is_arithmetic_v<Sig>) {
+        sig = static_cast<Sig>(val);
+    } else {
+        // VlWide<N>: write low 64 bits via the first two words, zero the
+        // rest. `sizeof(Sig) / sizeof(uint32_t)` resolves to N because
+        // VlWide is `final` with a single uint32_t[N] member — no vtable,
+        // no padding under any standard ABI we target.
+        constexpr std::size_t N = sizeof(Sig) / sizeof(uint32_t);
+        const uint64_t v = static_cast<uint64_t>(val);
+        sig[0] = static_cast<uint32_t>(v);
+        if constexpr (N >= 2) sig[1] = static_cast<uint32_t>(v >> 32);
+        for (std::size_t i = 2; i < N; ++i) sig[i] = 0;
+    }
+}
+
+template<typename Sig>
+inline uint64_t harc_read(const Sig& sig) {
+    if constexpr (std::is_arithmetic_v<Sig>) {
+        return static_cast<uint64_t>(sig);
+    } else {
+        // VlWide<N>: combine low two words into a uint64_t. Upper words
+        // (if N > 2) are dropped — see the harc_assign comment.
+        constexpr std::size_t N = sizeof(Sig) / sizeof(uint32_t);
+        uint64_t v = static_cast<uint32_t>(sig[0]);
+        if constexpr (N >= 2) v |= (static_cast<uint64_t>(static_cast<uint32_t>(sig[1])) << 32);
+        return v;
+    }
+}
 
 struct ThreadScheduler;
 
