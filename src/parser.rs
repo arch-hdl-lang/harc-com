@@ -725,7 +725,29 @@ impl Parser {
             Some(TokenKind::Ident(s)) if s == "inout" => { self.advance(); Some(Direction::InOut) }
             _ => None,
         };
-        let ty = self.parse_type_expr()?;
+        let mut ty = self.parse_type_expr()?;
+        // Optional transactor mode annotation on a component field
+        // (env / agent / sequencer body):
+        //     drv : AxilXactor active
+        //     mon : AxilXactor passive
+        // Same shape as the let-statement form (parse_let_stmt). Only
+        // valid on a Named type; codegen validates the referenced type
+        // is a `transactor`.
+        let mode = match self.peek_kind() {
+            Some(TokenKind::Active)  => { self.advance(); Some(TransactorMode::Active)  }
+            Some(TokenKind::Passive) => { self.advance(); Some(TransactorMode::Passive) }
+            _ => None,
+        };
+        if let Some(m) = mode {
+            if let TypeExpr::Named { mode: existing_mode, .. } = &mut ty {
+                *existing_mode = Some(m);
+            } else {
+                return Err(CompileError::general(
+                    "active/passive mode annotation only applies to a named (transactor) type".into(),
+                    self.peek_span(),
+                ));
+            }
+        }
         let bound_to = if self.check(TokenKind::Bound) {
             self.advance();
             self.expect(TokenKind::To)?;

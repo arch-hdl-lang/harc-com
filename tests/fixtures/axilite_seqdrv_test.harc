@@ -1,28 +1,23 @@
-// AxiLiteRegs test demonstrating sequencer → driver dispatch through
-// events. Replaces the "method-call" shape from axilite_driver_test
-// with the "event-driven" shape the spec actually mandates for
-// drivers (§8.2).
+// Sequencer → transactor event dispatch, *unbound* form. The
+// transactor has no `bound to BusType` clause — it pokes raw DUT
+// signals directly. Useful when there's no canonical bus type in
+// scope, or when the active half also needs to drive sideband
+// signals that aren't part of the bus.
 //
 // Pattern:
-//   sequencer Seq
-//       dispatched : out event<RegOp>
-//       hookable run(seq: TSeq<RegOp>)  // iterates the tseq, emits each
-//   end sequencer Seq
-//
-//   driver Drv
-//       req : in event<RegOp>             // input event
+//   transactor SeqXactor          // no `bound to`
 //       dut : DUT
-//       on req(t)                         // fires on each emit
-//           ...drive dut signals...
-//       end on
-//   end driver Drv
+//       when active
+//           req : in event<RegOp>
+//           on req(t) ...drive dut signals... end on
+//       end when
+//   end transactor SeqXactor
 //
-//   test
-//       env.seq.dispatched is wired to env.drv.req via an explicit
-//       emit chain in the test body (full `connect` block is a
-//       follow-up; for now the test wires manually through the
-//       sequencer's run method, which emits to dispatched, which
-//       the test re-emits to drv.req — same shape, just visible).
+//   let drv : SeqXactor active    // no `= bind ...`
+//
+// The test scope iterates a tseq and emits each transaction onto
+// `drv.req`; the active driver coroutine fires synchronously per
+// emit.
 
 transaction RegOp
     addr  : uint<8>  with [range(0, 64)]
@@ -30,51 +25,51 @@ transaction RegOp
     !mode : uint<8>  default 0
 end transaction RegOp
 
-driver SeqDrv
-    req : in event<RegOp>
+transactor SeqXactor
     dut : AxiLiteRegs
-    // `last_read` is a shared field that the on-handler writes and
-    // the test reads — demonstrates that field assignment inside an
-    // on-handler closure flows back to the struct.
     last_read : uint<32> default 0
 
-    // Each `emit drv.req(t)` fires this body once. The body drives
-    // the AXI-Lite write/read cycle synchronously. Calling `wait` is
-    // legal inside the body — the surrounding `tick()` from the test
-    // scope is captured via `[&]` by the registered closure.
-    on req(t)
-        // Write phase
-        dut.axil_aw_addr = t.addr
-        dut.axil_aw_valid = 1
-        dut.axil_w_data = t.value
-        dut.axil_w_strb = 15
-        dut.axil_w_valid = 1
-        wait 10 cycles
-        dut.axil_aw_valid = 0
-        dut.axil_w_valid = 0
-        wait 2 cycles
+    when active
+        req : in event<RegOp>
 
-        // Read phase — store result in `last_read` so the test can
-        // observe the round-trip.
-        let val = 0
-        let saw = 0
-        dut.axil_ar_addr = t.addr
-        dut.axil_ar_valid = 1
-        for _ in 0 .. 10
-            wait 1 cycle
-            if dut.axil_r_valid
-                if saw == 0
-                    val = dut.axil_r_data
-                    dut.axil_ar_valid = 0
-                    saw = 1
+        // Each `emit drv.req(t)` fires this body once. The body
+        // drives the AXI-Lite write/read cycle synchronously
+        // through raw DUT signals (no bus type — this transactor
+        // is unbound).
+        on req(t)
+            // Write phase
+            dut.axil_aw_addr = t.addr
+            dut.axil_aw_valid = 1
+            dut.axil_w_data = t.value
+            dut.axil_w_strb = 15
+            dut.axil_w_valid = 1
+            wait 10 cycles
+            dut.axil_aw_valid = 0
+            dut.axil_w_valid = 0
+            wait 2 cycles
+
+            // Read phase — store result in `last_read` so the test
+            // can observe the round-trip.
+            let val = 0
+            let saw = 0
+            dut.axil_ar_addr = t.addr
+            dut.axil_ar_valid = 1
+            for _ in 0 .. 10
+                wait 1 cycle
+                if dut.axil_r_valid
+                    if saw == 0
+                        val = dut.axil_r_data
+                        dut.axil_ar_valid = 0
+                        saw = 1
+                    end if
                 end if
-            end if
-        end for
-        dut.axil_ar_valid = 0
-        wait 1 cycle
-        last_read = val
-    end on
-end driver SeqDrv
+            end for
+            dut.axil_ar_valid = 0
+            wait 1 cycle
+            last_read = val
+        end on
+    end when
+end transactor SeqXactor
 
 tseq RandomTxns(n: int) -> TSeq<RegOp>
     for _ in 0 .. n
@@ -87,11 +82,11 @@ end tseq RandomTxns
 
 test AxiLiteSeqDrvTest
     let dut : AxiLiteRegs
-    let drv : SeqDrv
+    let drv : SeqXactor active
 
     scope sim
         run
-            log(info, "AxiLiteRegs sequencer → driver event-driven test")
+            log(info, "AxiLiteRegs sequencer → transactor (unbound) event-driven test")
             drv.dut = dut
 
             // Reset.
@@ -120,8 +115,8 @@ test AxiLiteSeqDrvTest
             wait 1 cycle
 
             // Iterate the tseq, emitting each transaction onto the
-            // driver's req event. The driver's `on req(t)` handler
-            // fires synchronously, drives the bus, and stashes the
+            // transactor's req event. The active half fires
+            // synchronously, drives the bus, and stashes the
             // observed read into drv.last_read.
             let txns = RandomTxns(5)
             let i = 0
@@ -134,7 +129,7 @@ test AxiLiteSeqDrvTest
                 i = i + 1
             end for
 
-            log(info, "PASS: 5 sequencer→driver round-trips via event dispatch")
+            log(info, "PASS: 5 sequencer→transactor round-trips via event dispatch")
         end run
     end scope sim
 end test AxiLiteSeqDrvTest

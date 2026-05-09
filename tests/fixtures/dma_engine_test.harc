@@ -10,22 +10,20 @@
 // helpers and an inline event loop that watches mem_rd/mem_wr
 // handshakes + drives mem_rd_data with the echoed addr.
 //
-// This HARC version uses:
-//   - `driver ApbDrv` with hookable `write` / `read` methods that
-//     drive the 2-phase APB sequence — call sites become a single
-//     line each (`apb.write(addr, data)` / `apb.read(addr)`).
-//   - `monitor MemMon` with edge-trigger `on dut.<v> && dut.<r>`
-//     handlers per channel, pushing observed addresses + write
-//     data into a scoreboard for cross-checking. (DmaEngine's
-//     mem_rd/mem_wr signals don't follow arch's bus-flattening
-//     convention, so we can't use the typed `bus.<ch>.handshake(beat)`
-//     form — that requires `<binding>_<chan>_<sig>` prefixed names.
-//     The cycle-trigger fallback is still a clean expression.)
-//   - A level-trigger handler that combinationally drives
-//     `mem_rd_data = mem_rd_addr` whenever the DUT asserts
-//     `mem_rd_valid`. Replaces the inline `if (dut->mem_rd_valid)
-//     { dut->mem_rd_data = dut->mem_rd_addr; dut->eval(); }` pattern
-//     in the C++.
+// This HARC version uses two unbound transactors:
+//   - `MemXactor passive` — observation half only. `on dut.<v> &&
+//     dut.<r>` cycle-trigger handlers per channel push observed
+//     addresses + write data into a scoreboard. A `level` handler
+//     combinationally drives `mem_rd_data = mem_rd_addr` whenever
+//     the DUT asserts `mem_rd_valid`. (DmaEngine's mem_rd/mem_wr
+//     signals don't follow the bus-flattening convention, so we
+//     can't use the typed `bus.<ch>.handshake(beat)` form — that
+//     requires `<binding>_<chan>_<sig>` prefixed names. The cycle-
+//     trigger fallback is still a clean expression.)
+//   - `ApbXactor passive` — helper transactor with hookable
+//     `write` / `read` methods that drive the 2-phase APB sequence.
+//     Call sites become a single line each (`apb.write(addr,
+//     data)`).
 
 scoreboard MemSb
     read_addrs  : queue<uint<32>>
@@ -33,7 +31,9 @@ scoreboard MemSb
     write_data  : queue<uint<32>>
 end scoreboard MemSb
 
-monitor MemMon
+transactor MemXactor
+    sb_ref : MemSb         // populated by the test scope
+
     on dut.mem_rd_valid && dut.mem_rd_ready
         sb_ref.read_addrs.push(dut.mem_rd_addr)
     end on
@@ -50,14 +50,12 @@ monitor MemMon
     on dut.mem_rd_valid level
         dut.mem_rd_data = dut.mem_rd_addr
     end on
-
-    sb_ref : MemSb         // populated by the test scope
-end monitor MemMon
+end transactor MemXactor
 
 // APB is two-phase (setup → access) — not the canonical valid/ready
 // shape, so it's expressed via raw `dut.apb_*` signal access. The
-// helper driver still cuts each APB call site to a single line.
-driver ApbDrv
+// helper transactor still cuts each APB call site to a single line.
+transactor ApbXactor
     dut : DmaEngine
 
     hookable write(addr: uint<8>, data: uint<32>)
@@ -90,12 +88,12 @@ driver ApbDrv
         dut.apb_enable = 0
         return val
     end read
-end driver ApbDrv
+end transactor ApbXactor
 
 test DmaEngineTest
     let dut : DmaEngine
-    let mon : MemMon
-    let apb : ApbDrv
+    let mon : MemXactor passive
+    let apb : ApbXactor passive
 
     scope sim
         run
@@ -178,7 +176,7 @@ test DmaEngineTest
             assert rb_beat == 0
                 else fail("APB beat readback ${rb_beat}, expected 0 after completion")
 
-            log(info, "PASS: 4 r/w beats observed via monitor handlers, IRQ fired, APB readback correct")
+            log(info, "PASS: 4 r/w beats observed via transactor handlers, IRQ fired, APB readback correct")
         end run
     end scope sim
 end test DmaEngineTest
