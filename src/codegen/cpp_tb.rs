@@ -72,7 +72,22 @@ pub fn dut_type_name(file: &SourceFile) -> Option<String> {
 }
 
 /// Emit a C++ Verilator TB for the single `test` declaration in this file.
+/// Per-emit options. Currently just the `--mt` opt-in for Phase 3a's
+/// per-actor OS thread topology; defaults to cooperative
+/// (single-OS-thread, faster on real fixtures).
+#[derive(Default, Clone, Copy)]
+pub struct EmitOpts {
+    /// Spawn one `std::thread` per bound coroutine actor with dual-
+    /// barrier sync per posedge. Off → all coroutines share `sched`
+    /// and tick cooperatively in the main thread.
+    pub mt: bool,
+}
+
 pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
+    emit_with_opts(file, EmitOpts::default())
+}
+
+pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitError> {
     // Find a single `test` item — the entry point.
     let test = file.items.iter().find_map(|it| match it {
         Item::Test(t) => Some(t),
@@ -283,6 +298,8 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
         buses,
         bus_bindings: std::collections::HashMap::new(),
         in_coroutine: false,
+        actor_threads: Vec::new(),
+        mt: opts.mt,
     };
 
     // Header.
@@ -314,6 +331,11 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
     writeln!(e.out, "#include <vector>").ok();
     writeln!(e.out, "#include <deque>").ok();
     writeln!(e.out, "#include <functional>").ok();
+    // Phase 3a: per-actor OS threads + barrier sync. Pulled in
+    // unconditionally — `<atomic>` is also indirectly available via
+    // `harc_thread_rt.h` but the explicit include keeps intent clear.
+    writeln!(e.out, "#include <thread>").ok();
+    writeln!(e.out, "#include <atomic>").ok();
     // HARC's coroutine runtime — drives the test's `run` block as a
     // C++20 coroutine via `harc_rt::ThreadScheduler`. Hookable methods
     // and `on`-handler closures still run synchronously between the
@@ -685,39 +707,106 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
     writeln!(e.out, "{INDENT}{INDENT}co_return;").ok();
     writeln!(e.out, "{INDENT}}}(&_run_slot);").ok();
     writeln!(e.out, "").ok();
-    writeln!(e.out, "{INDENT}// Resume the coroutine once so initial-setup statements run").ok();
-    writeln!(e.out, "{INDENT}// before the first clock edge (matching the pre-coroutine").ok();
-    writeln!(e.out, "{INDENT}// straight-line emission semantics).").ok();
+
+    // `actor_threads` is populated only when `--mt` is set (cooperative
+    // mode pushes actor slots into the global `sched` instead). So
+    // `mt` here means "we have per-actor schedulers needing barrier
+    // sync"; cooperative mode skips the worker spawn / barrier dance
+    // entirely even when actors are present.
+    let n_actors = e.actor_threads.len();
+    let mt = n_actors > 0;
+    debug_assert!(mt == (e.mt && !e.actor_threads.is_empty()));
+    let _ = e.mt; // suppress unused warning when no actors
+
+    // ── Bootstrap ──────────────────────────────────────────────────────
+    // Single-threaded — workers haven't started yet. Each scheduler
+    // (main + per-actor) runs its initially-Ready slots once until
+    // they hit their first co_await.
+    writeln!(e.out, "{INDENT}// Resume each coroutine once so initial-setup statements run").ok();
+    writeln!(e.out, "{INDENT}// before the first clock edge. Single-threaded — workers").ok();
+    writeln!(e.out, "{INDENT}// haven't been spawned yet.").ok();
     writeln!(e.out, "{INDENT}sched.bootstrap();").ok();
+    if mt {
+        for (sched_var, _) in &e.actor_threads {
+            writeln!(e.out, "{INDENT}{sched_var}.bootstrap();").ok();
+        }
+    }
     writeln!(e.out, "").ok();
-    writeln!(e.out, "{INDENT}// Drive the clock until the coroutine completes. Each").ok();
-    writeln!(e.out, "{INDENT}// iteration is one primary-clock posedge; the scheduler's").ok();
-    writeln!(e.out, "{INDENT}// `tick()` resumes any coroutines whose wait condition is").ok();
-    writeln!(e.out, "{INDENT}// satisfied (cycle counter expired or `wait_until` predicate").ok();
-    writeln!(e.out, "{INDENT}// fires).").ok();
-    // Loop while the *run* coroutine is unfinished. Auxiliary
-    // coroutines (bound-driver actors, future monitors) may still be
-    // in `WaitUntil { queue.empty() }` when the run coroutine
-    // finishes; that's intentional — the test is over, drivers retire.
+
+    if mt {
+        // ── Phase 3a multi-thread topology ──────────────────────────
+        // Each actor coroutine runs on its own `std::thread`. Per
+        // posedge: main runs the run-coroutine, two atomic-spin
+        // barriers synchronize main with N worker threads, each
+        // worker runs `_<n>_sched.tick()` once. Then main does
+        // `dut->eval()` (single-threaded — Verilator-generated DUT
+        // code is not MT-safe) and runs `_checkers`. The dual
+        // barrier mirrors arch-com's Phase 3 design (`Barrier` class
+        // shared in `harc_thread_rt.h`); cycle batching to amortize
+        // barrier cost is Phase 3b.
+        writeln!(e.out, "{INDENT}// Phase 3a: per-actor OS threads with dual barrier sync.").ok();
+        writeln!(e.out, "{INDENT}// {} actor(s) → {} barrier participants (main + workers).",
+            n_actors, n_actors + 1).ok();
+        writeln!(e.out, "{INDENT}std::atomic<bool> _shutdown{{false}};").ok();
+        writeln!(e.out, "{INDENT}harc_rt::Barrier _start_barrier({});", n_actors + 1).ok();
+        writeln!(e.out, "{INDENT}harc_rt::Barrier _end_barrier({});",   n_actors + 1).ok();
+        writeln!(e.out, "{INDENT}std::vector<std::thread> _workers;").ok();
+        for (sched_var, _) in &e.actor_threads {
+            writeln!(e.out, "{INDENT}_workers.emplace_back([&]() {{").ok();
+            writeln!(e.out, "{INDENT}{INDENT}while (true) {{").ok();
+            writeln!(e.out, "{INDENT}{INDENT}{INDENT}_start_barrier.wait();").ok();
+            writeln!(e.out, "{INDENT}{INDENT}{INDENT}if (_shutdown.load(std::memory_order_acquire)) break;").ok();
+            writeln!(e.out, "{INDENT}{INDENT}{INDENT}{sched_var}.tick();").ok();
+            writeln!(e.out, "{INDENT}{INDENT}{INDENT}_end_barrier.wait();").ok();
+            writeln!(e.out, "{INDENT}{INDENT}}}").ok();
+            writeln!(e.out, "{INDENT}}});").ok();
+        }
+        writeln!(e.out, "").ok();
+    }
+
+    writeln!(e.out, "{INDENT}// Drive the clock until the run coroutine completes.").ok();
+    if mt {
+        writeln!(e.out, "{INDENT}// Per-cycle order: run-tick (may push to actor queues) →").ok();
+        writeln!(e.out, "{INDENT}// _start_barrier (release workers) → workers run their").ok();
+        writeln!(e.out, "{INDENT}// schedulers → _end_barrier (main waits) → eval + checkers.").ok();
+        writeln!(e.out, "{INDENT}// Run-coroutine writes complete BEFORE workers wake → no").ok();
+        writeln!(e.out, "{INDENT}// race on shared queues. Workers' DUT-input writes complete").ok();
+        writeln!(e.out, "{INDENT}// BEFORE eval → no race on signal state at posedge.").ok();
+    }
     if clocks.is_empty() {
         writeln!(e.out, "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done) {{").ok();
+        writeln!(e.out, "{INDENT}{INDENT}sched.tick();").ok();
+        if mt {
+            writeln!(e.out, "{INDENT}{INDENT}_start_barrier.wait();").ok();
+            writeln!(e.out, "{INDENT}{INDENT}_end_barrier.wait();").ok();
+        }
         writeln!(e.out, "{INDENT}{INDENT}dut->clk = 0; dut->eval();").ok();
         writeln!(e.out, "{INDENT}{INDENT}dut->clk = 1; dut->eval();").ok();
         writeln!(e.out, "{INDENT}{INDENT}cycle_count++;").ok();
         writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
-        writeln!(e.out, "{INDENT}{INDENT}sched.tick();").ok();
         writeln!(e.out, "{INDENT}}}").ok();
     } else {
-        // Multi-clock: advance simulated time to the next primary-clock
-        // posedge per iteration. Other clocks tick at their natural rate
-        // during the span; per-clock rising-edge counters keep updating
-        // so `wait N cycles on <clk>` predicates can resolve.
         writeln!(e.out, "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done) {{").ok();
+        writeln!(e.out, "{INDENT}{INDENT}sched.tick();").ok();
+        if mt {
+            writeln!(e.out, "{INDENT}{INDENT}_start_barrier.wait();").ok();
+            writeln!(e.out, "{INDENT}{INDENT}_end_barrier.wait();").ok();
+        }
         writeln!(e.out, "{INDENT}{INDENT}long long _target = now_ps + clocks_[0].half_period_ps * 2;").ok();
         writeln!(e.out, "{INDENT}{INDENT}eval_clocks_until(_target);").ok();
         writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
-        writeln!(e.out, "{INDENT}{INDENT}sched.tick();").ok();
         writeln!(e.out, "{INDENT}}}").ok();
+    }
+
+    if mt {
+        // Shutdown sequence: workers are blocked on _start_barrier
+        // (their next iteration). Set _shutdown, wake them via the
+        // start barrier; they observe the flag and break out of their
+        // loop without reaching _end_barrier. Then join.
+        writeln!(e.out, "").ok();
+        writeln!(e.out, "{INDENT}_shutdown.store(true, std::memory_order_release);").ok();
+        writeln!(e.out, "{INDENT}_start_barrier.wait();").ok();
+        writeln!(e.out, "{INDENT}for (auto& _w : _workers) _w.join();").ok();
     }
     writeln!(e.out, "").ok();
 
@@ -902,6 +991,24 @@ struct Emitter {
     /// "running" (between its co_awaits), so a sync `tick()` from
     /// inside a method does not race the scheduler.
     in_coroutine: bool,
+    /// Phase 3a: list of `(scheduler_var, slot_var)` pairs for every
+    /// actor coroutine that should run on its own OS thread. Each
+    /// entry corresponds to a bound-driver or bound-monitor actor.
+    /// At main-loop emission time, if non-empty, we wire up
+    /// `_start_barrier` / `_end_barrier` (sized to `1 + len`) plus
+    /// one `std::thread` per actor running the actor's
+    /// per-os-thread `ThreadScheduler::tick()` between the barriers.
+    /// Only populated when `mt = true`; in cooperative mode actor
+    /// slots are pushed directly into the global `sched`.
+    actor_threads: Vec<(String, String)>,
+    /// True when `--mt` opt-in is set: emit per-actor schedulers,
+    /// dual barriers, and worker thread spawns. False (default):
+    /// actors join the global `sched` and tick cooperatively on
+    /// the main thread. The cooperative path is faster on typical
+    /// fixtures (per-cycle barrier sync exceeds per-cycle actor
+    /// work on Apple Silicon — see the bench measurements in PR
+    /// #16's commit message).
+    mt: bool,
 }
 
 impl Emitter {
@@ -1194,12 +1301,14 @@ impl Emitter {
     /// Phase 2c: emit each `on bus.<ch>.handshake(arg)` handler in a
     /// `bound to BusType` monitor as an independent coroutine actor:
     ///
+    /// ```text
     ///     while (true) {
     ///         co_await wait_until(_slot, [&]{ return valid && ready; });
     ///         auto <arg> = <first payload signal>;
     ///         <body — bus.<ch>.<sig> resolves through the bus binding>
     ///         co_await wait_cycles(_slot, 1);   // skip past this handshake
     ///     }
+    /// ```
     ///
     /// Non-handshake on-handlers in the monitor (event subscribers,
     /// cycle triggers on bool expressions) fall through to the
@@ -1261,12 +1370,22 @@ impl Emitter {
                     let cap_sig = channel.payload[0].name.name.clone();
                     let (_bus_decl, root, sig_prefix) = binding;
                     let chan_prefix = format!("{}_{}", sig_prefix, ch_name);
-                    let slot_var = format!("_{instance}_{ch_name}_slot");
+                    let slot_var  = format!("_{instance}_{ch_name}_slot");
+                    let sched_var = format!("_{instance}_{ch_name}_sched");
 
+                    if self.mt {
+                        self.pad(depth);
+                        writeln!(self.out, "harc_rt::ThreadScheduler {sched_var};").ok();
+                    }
                     self.pad(depth);
                     writeln!(self.out, "harc_rt::ThreadSlot {slot_var};").ok();
                     self.pad(depth);
-                    writeln!(self.out, "sched.slots.push_back(&{slot_var});").ok();
+                    if self.mt {
+                        writeln!(self.out, "{sched_var}.slots.push_back(&{slot_var});").ok();
+                        self.actor_threads.push((sched_var.clone(), slot_var.clone()));
+                    } else {
+                        writeln!(self.out, "sched.slots.push_back(&{slot_var});").ok();
+                    }
                     self.pad(depth);
                     writeln!(
                         self.out,
@@ -1423,15 +1542,34 @@ impl Emitter {
         };
 
         // ── Emit the actor topology ─────────────────────────────────
+        // Cooperative mode (default): all actor slots go into the
+        // single `sched` and tick together with `_run_slot` on the
+        // main thread. This is faster than MT on typical fixtures
+        // because there's no barrier overhead.
+        //
+        // MT mode (`--mt`, Phase 3a): each actor gets its own
+        // `ThreadScheduler` and lives on a dedicated OS thread,
+        // synchronized via dual barriers per posedge. `tick()`
+        // itself is not MT-safe so per-actor schedulers avoid locks.
         let queue_var = format!("_{instance}_q");
         let slot_var  = format!("_{instance}_slot");
+        let sched_var = format!("_{instance}_sched");
 
         self.pad(depth);
         writeln!(self.out, "std::deque<{payload_ty}> {queue_var};").ok();
+        if self.mt {
+            self.pad(depth);
+            writeln!(self.out, "harc_rt::ThreadScheduler {sched_var};").ok();
+        }
         self.pad(depth);
         writeln!(self.out, "harc_rt::ThreadSlot {slot_var};").ok();
         self.pad(depth);
-        writeln!(self.out, "sched.slots.push_back(&{slot_var});").ok();
+        if self.mt {
+            writeln!(self.out, "{sched_var}.slots.push_back(&{slot_var});").ok();
+            self.actor_threads.push((sched_var.clone(), slot_var.clone()));
+        } else {
+            writeln!(self.out, "sched.slots.push_back(&{slot_var});").ok();
+        }
 
         // Pusher subscriber on the input event. Replaces the sync
         // body-callback; emit/connect bridges that fan out to this
