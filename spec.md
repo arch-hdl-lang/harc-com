@@ -13,7 +13,7 @@
 - Compositional formal contracts (assume/guarantee at module boundaries)
 - Constrained-random stimulus with relational constraints
 - Functional coverage — type-derived and explicit
-- UVM-equivalent testbench architecture as native language constructs (env, agent, driver, monitor, sequencer, tseq, scoreboard)
+- UVM-equivalent testbench architecture as native language constructs (env, agent, transactor, sequencer, tseq, scoreboard)
 - Reference model embedding (ARCH functional modules, C functions, Sail-imported semantics)
 - Native cycle-based simulator runtime, co-compiled with ARCH (Verilator-class throughput)
 - **DUT backend abstraction** — HARC TB binds to ARCH-compiled DUTs (primary, fastest path) *or* SV-via-Verilator-compiled DUTs (interop path; raw signal access in v1)
@@ -46,7 +46,7 @@ The language inherits five constraints from being a sister to ARCH; everything e
 3. **Co-elaboration.** A parameterized port and the assertions / coverage on it are emitted in the same elaboration pass, by the same type substitution. The April-15 verification-co-generated-with-ports problem becomes structural rather than aspirational.
 4. **One coherent semantics.** Properties have one meaning across simulation, formal, and the synthesizable subset. The backend chooses *which* meaning is realized — never *what* is meant.
 5. **Constructs over framework.** Anything UVM achieves through library convention (factory, config DB, phase macros, field macros, virtual interfaces) is either a first-class language construct or eliminated as unnecessary given a real type system.
-6. **Ride on ARCH primitives, don't parallel them.** Where ARCH already provides a primitive, HARC reuses it as the lowering target rather than reinventing one. Sequences lower to ARCH `thread`s. Drivers and monitors bind to ARCH `bus` declarations and dispatch through the existing `handshake_channel` / `credit_channel` / `tlm_method` machinery. Tests lower to ARCH `testbench`. Properties extend ARCH's `assert` / `cover` / `assume` plus the planned temporal sugar (`a |=> b`, `past(e, N)`, `rose(a)`, `##N e`). HARC adds the missing verification-side abstractions (transactions, constraints, coverage, env/agent/scoreboard, aspects) on top — it does not duplicate the primitives ARCH already ships. See §16 for the lowering map.
+6. **Ride on ARCH primitives, don't parallel them.** Where ARCH already provides a primitive, HARC reuses it as the lowering target rather than reinventing one. Sequences lower to ARCH `thread`s. Transactors bind to ARCH `bus` declarations and dispatch through the existing `handshake_channel` / `credit_channel` / `tlm_method` machinery. Tests lower to ARCH `testbench`. Properties extend ARCH's `assert` / `cover` / `assume` plus the planned temporal sugar (`a |=> b`, `past(e, N)`, `rose(a)`, `##N e`). HARC adds the missing verification-side abstractions (transactions, constraints, coverage, env/agent/scoreboard, aspects) on top — it does not duplicate the primitives ARCH already ships. See §16 for the lowering map.
 7. **LL(1) grammar.** HARC inherits ARCH's LL(1) commitment (ARCH §2.4): every production is decidable from one token of lookahead, no backtracking. This is what makes both languages tractable for AI codegen — a parser can commit to a parse tree from the leading token of every construct, which is the same property that lets an LLM emit syntactically valid code without seeing the trailing context. Every HARC keyword has a distinct FIRST set in every position it can appear; ambiguous compound forms like `cover sequence` vs `cover property` vs `cover propname` resolve by single-token lookahead after the leading keyword. New language features must preserve LL(1); see §2 for the disambiguation rules at potentially-ambiguous sites.
 
 ---
@@ -99,15 +99,15 @@ The cycle-based runtime (§7.1, §10.1) calls `dut.eval_domain(D)` on every cycl
 - Clock-domain types
 - Protocol-typed interfaces (AXI / AXIS / etc. with handshake sequencing in the type)
 
-**Shared elaboration.** Generics, traits, type-level naturals — same machinery. A protocol type's handshake sequencing is what the HARC driver/monitor are *derived from*; you do not re-author the protocol.
+**Shared elaboration.** Generics, traits, type-level naturals — same machinery. A protocol type's handshake sequencing is what the HARC transactor is *derived from*; you do not re-author the protocol.
 
 **What HARC adds, lexically.** New keywords, reserved only in `.harc` files (so existing ARCH code is unaffected):
 
 ```
 assert assume cover property pseq
 solve_before solve_after dist
-transaction agent env driver monitor
-sequencer tseq scoreboard ref phase weight
+transaction agent env transactor
+sequencer tseq scoreboard ref phase weight active passive
 on after fork join_any join_all join_none emit
 scope setup run check teardown test
 blocking comb across with default
@@ -140,7 +140,7 @@ And `use` is the ARCH-style namespace import (§3.6), distinct from `apply` whic
 |---|---|
 | `cover` | `sequence` → behavioral sequence (§17.3); `property` → property cover; IDENT → cover named property |
 | `module Name` | `#(` → parameters first; `kind` → external backend variant (§10.5); newline → ARCH-source body opens directly |
-| `agent Name` (and `driver`/`monitor`/`env`) | `#(` → parameters; `bound` → bound-to clause; newline → body opens |
+| `agent Name` (and `transactor`/`env`) | `#(` → parameters; `bound` → bound-to clause; newline → body opens |
 | `name : type` (field decl) | `default` → default clause; `with` → attributes; newline / `,` → end of field |
 | `on event-expr` | `pre` → pre-hook; `post` → post-hook; newline → main handler body |
 | `assert`/`assume` | IDENT (followed by `;` or end-of-line) → named property; expression → inline boolean or temporal property (the temporal operators `|=>`, `##N`, etc. are part of the expression grammar, not separate productions) |
@@ -450,7 +450,7 @@ The "chain" lives at activation sites. `grep -n "apply"` recovers the entire com
 **What can be extended.**
 - `transaction` — add fields, `keep` constraints, `when` subtypes
 - `struct` — same
-- `agent` / `env` / `driver` / `monitor` / `scoreboard` — add fields, `connect` clauses, `on` handlers
+- `agent` / `env` / `transactor` / `scoreboard` — add fields, `connect` clauses, `on` handlers
 - `ref module` — not extendable (refs are spec-derived; extension would defeat the purpose)
 - ARCH design modules — not extendable from HARC (design-side extensions require ARCH-side changes)
 - Other aspect packages — not extendable (the depth-1 rule above)
@@ -483,10 +483,10 @@ end relation AxiBurstLegal
 is used in three contexts, regardless of which form declared it:
 
 1. **Stimulus generation** — `randomize(t) with AxiBurstLegal(t)` — the solver finds satisfying values.
-2. **Monitor checking** — `assume AxiBurstLegal(t_obs)` checks the DUT honored the protocol; `assert AxiBurstLegal(t_gen)` checks legality of generated stimulus.
+2. **Observation checking** — `assume AxiBurstLegal(t_obs)` checks the DUT honored the protocol; `assert AxiBurstLegal(t_gen)` checks legality of generated stimulus.
 3. **Formal** — exported to SMT-LIB2 directly; participates in compositional contracts.
 
-No driver/monitor duplication. No inheritance ladder to add a constraint.
+No stimulus/observation duplication. No inheritance ladder to add a constraint.
 
 ### 4.1 Solve hints, distributions, and auto-lowering
 
@@ -926,9 +926,9 @@ log(info, "...", id="AXI_DRV", verbosity=HIGH)
 | `info` | MEDIUM | yes |
 | `debug` | HIGH | no — must opt in via `--verbosity HIGH` or higher |
 
-The runtime exposes verbosity as a flag (`harc sim --verbosity HIGH`) and per-component overrides (`--verbosity-of env.agent.driver=DEBUG`). Verbosity levels are LOW / MEDIUM / HIGH / DEBUG / FULL — only messages whose verbosity ≤ the runtime threshold print. `error` and `fatal` always print regardless of threshold (they're test-result-bearing).
+The runtime exposes verbosity as a flag (`harc sim --verbosity HIGH`) and per-component overrides (`--verbosity-of env.agent.xact=DEBUG`). Verbosity levels are LOW / MEDIUM / HIGH / DEBUG / FULL — only messages whose verbosity ≤ the runtime threshold print. `error` and `fatal` always print regardless of threshold (they're test-result-bearing).
 
-**Component IDs are implicit** from the enclosing TB component context. A `log(info, ...)` call inside `env.agent.driver` gets `id="env.agent.driver"` automatically. The explicit `id=` override is for cases where the call is in a free function or shared utility.
+**Component IDs are implicit** from the enclosing TB component context. A `log(info, ...)` call inside `env.agent.xact` gets `id="env.agent.xact"` automatically. The explicit `id=` override is for cases where the call is in a free function or shared utility.
 
 **Behavioral semantics by severity:**
 
@@ -945,7 +945,7 @@ This means `log(error, ...)` is the test-failure signal that pairs with `assert`
 **Output format:**
 
 ```
-[ 1247 ns | tb_clk:412 | env.agent.driver | INFO ] dispatching AxiTxn { addr=0x..., len=8, ... }
+[ 1247 ns | tb_clk:412 | env.agent.xact | INFO ] dispatching AxiTxn { addr=0x..., len=8, ... }
 ```
 
 Timestamp + cycle in the relevant clock domain + component ID + severity + interpolated message. Structured for grep / awk consumption; a `--log-format json` flag emits one JSON object per line for tooling.
@@ -983,42 +983,42 @@ This is where the "wide" scope decision pays off. Each verification role becomes
 | Glue | `agent` | Optional sugar: bundles a sequencer + transactor + their connect bridge as a reusable unit. | Only when the same `(sequencer, transactor, wiring)` triple is reused across tests |
 | Top | `test` | Test entry — instantiates the DUT, the env, picks the stimulus, asserts final outcomes. | Always |
 
-**Why the transactor is primary, agent is optional.** UVM made `agent` the mandatory bundling layer because the SW-only world had no place to put driver+monitor as a unit; the DUT-touching code lived in two SW components by tradition. HARC takes a different approach: the BFM is a **single synthesizable unit** — the transactor — that absorbs driver and monitor under one roof, with `when active|passive` mode subtyping replacing UVM's runtime `is_active` flag. The `agent` then becomes pure SW-side composition sugar; it's useful when you want to package stimulus + BFM + wiring for reuse, but a one-off test should skip it. UVM users coming from `uvm_agent`-mandatory environments will recognize the layering; HARC users starting fresh shouldn't be obligated to it.
+**Why the transactor is primary, agent is optional.** UVM made `agent` the mandatory bundling layer because the SW-only world had no place to put driver+monitor as a unit; the DUT-touching code lived in two SW components by tradition. HARC takes a different approach: the BFM is a **single synthesizable unit** — the transactor — that absorbs the active stimulus and passive observation halves under one roof, with `when active|passive` mode subtyping replacing UVM's runtime `is_active` flag. The `agent` then becomes pure SW-side composition sugar; it's useful when you want to package stimulus + BFM + wiring for reuse, but a one-off test should skip it. UVM users coming from `uvm_agent`-mandatory environments will recognize the layering; HARC users starting fresh shouldn't be obligated to it.
 
 **SW/HW boundary.** The transactor is the seam. Everything below it (DUT pins, the protocol BFM threads inside the transactor, possibly the DUT itself) compiles to RTL and runs at HW speed. Everything above it (sequencer, scoreboard, env, test, run coroutine) stays SW. The two sides communicate over **transaction-level pipes** following the Accellera SCE-MI 2.4 standard: input pipes carry transactions from sequencer/test → transactor; output pipes carry observations from transactor → scoreboard/test. Same source-level constructs work in `harc sim` (pipes are shared memory + DPI-C, near-zero overhead) and on emulator backends (pipes are vendor DMA channels). See §8.1 for the lowering.
 
-**v0 lowering status.** The legacy `driver` / `monitor` / `agent` / `env` / `sequencer` constructs all parse, round-trip through `harc fmt`, and are end-to-end lowered by the cpp_tb backend (32+ fixtures pass). The `transactor` construct (§8.1) is **design-committed but not yet implemented in v0 codegen** — language-level acceptance, AST nodes, and ARCH-side lowering are scheduled for a v0+ phase; today's fixtures use the legacy SW-only forms. The bullets below describe what cpp_tb actually emits for the legacy forms; §8.1 describes the transactor target.
+**v0 lowering status.** `transactor` (§8.1) is the canonical BFM construct. SW-side codegen is complete (T-1 + T-2: parse, AST, pretty-print round-trip, end-to-end lowered by cpp_tb). The legacy `driver`/`monitor` constructs that predated `transactor` have been removed from the language; existing TBs ported their drivers and monitors to transactor form. ARCH-side `generate_if ACTIVE` lowering (T-3) and emulator transport (T-4) remain scheduled for post-v0. The bullets below describe what cpp_tb actually emits.
 
 - `tseq T -> TSeq<X>` → `[&]`-lambda returning `std::vector<X>`. `yield e` pushes to the implicit `_result` accumulator. Iterate the result with `for x in seq`.
-- `driver` / `agent` / `env` / `sequencer` → plain C++ struct of fields. DUT-typed fields lower to Verilator pointers (`V<Name>*`); sub-component fields are by-value structs.
-- `hookable name(args) -> T ... end name` on any of the above → free `[&]`-capturing lambda named `<Type>_<name>`. Inside the body, bare references to component fields rewrite to `self.<field>`. `dut.<port>` keeps the arrow-access form. **For a `bound to BusType` driver/agent**, the parent's bus binding (resolved at codegen from the test's `let drv : Drv = bind axil` statement) propagates into hookable bodies under the alias `bus`, so `bus.<ch>.send(...)`, `bus.<ch>.recv()`, and `bus.<ch>.<sig>` all resolve identically to the patterns available inside `on T t` handlers. Single-instance per driver type in v0; multi-instance support requires per-instance hookable emission.
+- `transactor` / `agent` / `env` / `sequencer` → plain C++ struct of fields. DUT-typed fields lower to Verilator pointers (`V<Name>*`); sub-component fields are by-value structs.
+- `hookable name(args) -> T ... end name` on any of the above → free `[&]`-capturing lambda named `<Type>_<name>`. Inside the body, bare references to component fields rewrite to `self.<field>`. `dut.<port>` keeps the arrow-access form. **For a `bound to BusType` transactor/agent**, the parent's bus binding (resolved at codegen from the test's `let drv : T = bind axil` statement) propagates into hookable bodies under the alias `bus`, so `bus.<ch>.send(...)`, `bus.<ch>.recv()`, and `bus.<ch>.<sig>` all resolve identically to the patterns available inside `on T t` handlers. Single-instance per type in v0; multi-instance support requires per-instance hookable emission.
 - `obj.method(args)` and `env.sub.method(args)` rewrite to `<Type>_<method>(<self>, args)` (the call-site dispatcher resolves up to two levels of field-access chain).
-- `let drv : MyDriver` default-constructs the struct; the user assigns DUT pointers and other field values explicitly afterward (`drv.dut = dut`).
-- `on event_field(arg) ... end on` inside a driver / agent / sequencer body → registers a `[&]`-capturing closure into the corresponding event vector at `let drv : T` time. Event payloads typed `event<MyTxn>` round-trip as the `MyTxn` C++ struct (transactions and enums get their bare name; integer-typed payloads still widen). `emit drv.req(t)` fires every registered subscriber synchronously — the on-handler body runs inside the test's tick scope (so `wait`, `dut.x = ...`, etc. all work).
-- `on dut.signal ... end on` inside a monitor body → per-cycle bool checker (existing behavior, unchanged).
-- `connect a -> b ... end connect` inside an `env` body → at `let env : E` time, installs a generic-lambda bridge subscriber on `<env>.<a>` that fans out to every subscriber of `<env>.<b>`. Lets a sequencer's `out event` drive a driver's `in event` without the test scope manually re-emitting. Edge endpoints are field-access chains (`sub.event_name`); the bridge uses `auto` for the payload so the connect site doesn't have to look up the event's type.
+- `let drv : T mode` default-constructs the struct; the user assigns DUT pointers and other field values explicitly afterward (`drv.dut = dut`). The mode annotation (`active`/`passive`) selects which body halves get codegen-instantiated.
+- `on event_field(arg) ... end on` inside a transactor / agent / sequencer body → registers a `[&]`-capturing closure into the corresponding event vector at `let drv : T` time. Event payloads typed `event<MyTxn>` round-trip as the `MyTxn` C++ struct (transactions and enums get their bare name; integer-typed payloads still widen). `emit drv.req(t)` fires every registered subscriber synchronously — the on-handler body runs inside the test's tick scope (so `wait`, `dut.x = ...`, etc. all work).
+- `on dut.signal ... end on` (cycle-trigger form) inside any component body → per-cycle bool checker. Used for the observation half of an unbound transactor.
+- `connect a -> b ... end connect` inside an `env` body → at `let env : E` time, installs a generic-lambda bridge subscriber on `<env>.<a>` that fans out to every subscriber of `<env>.<b>`. Lets a sequencer's `out event` drive a transactor's `in event` without the test scope manually re-emitting. Edge endpoints are field-access chains (`sub.event_name`); the bridge uses `auto` for the payload so the connect site doesn't have to look up the event's type.
 - `TSeq<T>` as a hookable parameter type → `const std::vector<T>&` (pass-by-reference, so iterating a tseq result inside a sequencer's `dispatch` method doesn't copy each transaction).
 - `on obj.method pre/post ... end on` (or `on env.sub.method pre/post`) → registers a `[&]`-capturing closure into a per-`(Type, method)` hook vector. Each hookable method's body is wrapped with `for (auto& _h : <Type>_<method>_<side>) _h(args);` before/after the body. Pre and post hooks see the same arg list as the method; both can read and mutate test-scope locals via the lambda capture (e.g. counters, scoreboards). Hooks cannot replace the body — only observe and instrument.
 - `bus Name { ... } end bus Name` (mirrors arch-com §19) → protocol-typed bundle of DUT signals. v0 surface: plain signals (`name: in|out Type`) and `handshake_channel ch: send|receive kind: valid_ready { payload signals } end handshake_channel ch`. `param`, `credit_channel`, and `tlm_method` blocks parse but don't yet contribute to typed access — those follow.
 - `let var : BusName = bind <dut-expr>` → bus binding. `var` is a virtual binding (no C++ instance is emitted); subsequent `var.signal` and `var.channel.signal` accesses lower to flat DUT-pointer paths matching arch's port-flattening convention: `<dut>-><var>_<signal>` and `<dut>-><var>_<channel>_<signal>`. Unknown signal/channel names produce a clear HARC-level error before C++ codegen.
 - `use BusName;` (or `use foo.bar.BusName;`) → extern import. `harc sim` walks search paths (`$HARC_LIB_PATH` colon-separated; then `<input>/stdlib/`, `./stdlib/`, `<input>/../arch-com/stdlib/`, `<input>/../arch-com/examples/`) for `<BusName>.arch` (or `.harc`) and parses any `bus` items it contains. Unresolved imports silently no-op — the same `use arc.stdlib.X` lines already in pre-bus-typing fixtures keep parsing without behavioral change.
-- `driver Foo bound to BusType` (and the matching `agent` / `monitor` form) declares the component's protocol-typed binding. Instantiation pairs with `let drv : Foo = bind <bus_binding>` where `<bus_binding>` is a previously-declared `let X : BusType = bind dut`-style variable. The `bind` clause is type-checked at codegen: passing a `BusBar` binding to a driver `bound to BusFoo` produces a clear HARC-level error. Inside the driver's `on T t` handlers, the bare identifier `bus` resolves to the bound binding so `bus.<ch>.send(t.addr, …)` and `bus.<ch>.<sig>` lower through the same paths as test-scope bus access — flat names use the original binding's prefix, not `"bus"` (e.g. `dut->axil_aw_addr`, not `dut->bus_aw_addr`).
-- A `bound to BusType` driver/agent with a single `in event<T>` field plus a matching `on <event_name>(t)` handler additionally lowers as an **independent coroutine actor**: the driver gets its own `harc_rt::ThreadSlot` registered with the test's scheduler plus a per-instance `std::deque<T>` transaction queue. The actor coroutine loops `co_await wait_until(!queue.empty())` → pop t → run the on-handler body in coroutine context (so internal `wait N cycles` and `bus.<ch>.send/recv` lower to `co_await`) → repeat. `emit drv.req(t)` from the run coroutine just enqueues the transaction (non-blocking); the driver coroutine processes it in parallel with the run coroutine. The main loop terminates when the *run* coroutine finishes — driver coroutines parked in `WaitUntil { queue.empty() }` are abandoned at process exit (intentional: the test is over). Drivers without `bound to`, drivers with no input event, or drivers with multiple matching handlers fall back to the synchronous subscriber-callback model (existing fixtures unchanged).
-- A `bound to BusType` monitor with `on bus.<ch>.handshake(arg) ... end on` handlers lowers each handler as a **per-channel coroutine actor**: own `ThreadSlot`, registered with the scheduler, and a coroutine that loops `co_await wait_until(<chan>_valid && <chan>_ready)` → captures the channel's first payload signal into `arg` → runs the body in coroutine context → `co_await wait_cycles(1)` to skip past this handshake before re-arming. Multiple handlers on different channels become independent actors that run concurrently. Non-handshake handlers in the same monitor (event subscribers, cycle triggers on bool expressions) fall through to the existing sync `_checkers`-based path.
+- `transactor T bound to BusType` declares the component's protocol-typed binding. Instantiation pairs with `let drv : T mode = bind <bus_binding>` where `<bus_binding>` is a previously-declared `let X : BusType = bind dut`-style variable. The `bind` clause is type-checked at codegen: passing a `BusBar` binding to a transactor `bound to BusFoo` produces a clear HARC-level error. Inside the transactor's `on T t` handlers, the bare identifier `bus` resolves to the bound binding so `bus.<ch>.send(t.addr, …)` and `bus.<ch>.<sig>` lower through the same paths as test-scope bus access — flat names use the original binding's prefix, not `"bus"` (e.g. `dut->axil_aw_addr`, not `dut->bus_aw_addr`).
+- A `bound to BusType` **active** transactor with a single `in event<T>` field (in the `when active` body) plus a matching `on <event_name>(t)` handler additionally lowers as an **independent coroutine actor**: the transactor gets its own `harc_rt::ThreadSlot` registered with the test's scheduler plus a per-instance `std::deque<T>` transaction queue. The actor coroutine loops `co_await wait_until(!queue.empty())` → pop t → run the on-handler body in coroutine context (so internal `wait N cycles` and `bus.<ch>.send/recv` lower to `co_await`) → repeat. `emit drv.req(t)` from the run coroutine just enqueues the transaction (non-blocking); the actor coroutine processes it in parallel with the run coroutine. The main loop terminates when the *run* coroutine finishes — actor coroutines parked in `WaitUntil { queue.empty() }` are abandoned at process exit (intentional: the test is over).
+- A `bound to BusType` transactor with `on bus.<ch>.handshake(arg) ... end on` handlers in its always-on body lowers each handler as a **per-channel coroutine actor**: own `ThreadSlot`, registered with the scheduler, and a coroutine that loops `co_await wait_until(<chan>_valid && <chan>_ready)` → captures the channel's first payload signal into `arg` → runs the body in coroutine context → `co_await wait_cycles(1)` to skip past this handshake before re-arming. Multiple handlers on different channels become independent actors that run concurrently. Non-handshake handlers in the same body (event subscribers, cycle triggers on bool expressions) fall through to the existing sync `_checkers`-based path.
 - `bus.<ch>.send(p1, …, pN)` → auto valid/ready handshake. Lowers to: drive each payload signal from the matching positional arg, raise `valid`, spin on `ready` (bounded budget of 16 cycles, each cycle = `co_await harc_rt::wait_cycles(_slot, 1)` in run-coroutine context, plain `tick()` in sync method/handler context), final cycle wait, drop `valid`. Arg arity must match the channel's payload signal count; mismatch is a clear HARC-level error.
-- `let v = bus.<ch>.recv()` (or bare `bus.<ch>.recv()`) → auto valid/ready handshake. Lowers to: raise `ready`, spin on `valid` (16-cycle budget, same coroutine/sync split as send), capture the **full payload** into `v` as a `<BusName>_<chan>_payload` struct (one field per payload signal), final cycle wait, drop `ready`. Field access: `v.data`, `v.resp`, etc. The struct exposes an implicit conversion to the first payload field's type, so legacy scalar use (`assert v == 0xCAFE`, `field = v`) still compiles without source changes — `v` decays to its first field. Single-payload channels emit a one-field struct (the conversion makes them indistinguishable from a scalar at the use site). Same struct binds the `arg` of `on bus.<ch>.handshake(arg)` in bound monitors.
+- `let v = bus.<ch>.recv()` (or bare `bus.<ch>.recv()`) → auto valid/ready handshake. Lowers to: raise `ready`, spin on `valid` (16-cycle budget, same coroutine/sync split as send), capture the **full payload** into `v` as a `<BusName>_<chan>_payload` struct (one field per payload signal), final cycle wait, drop `ready`. Field access: `v.data`, `v.resp`, etc. The struct exposes an implicit conversion to the first payload field's type, so legacy scalar use (`assert v == 0xCAFE`, `field = v`) still compiles without source changes — `v` decays to its first field. Single-payload channels emit a one-field struct (the conversion makes them indistinguishable from a scalar at the use site). Same struct binds the `arg` of `on bus.<ch>.handshake(arg)` in passive transactor bodies.
 
 **Coroutine runtime (Phase 1, single-actor).** The test's `run` block lowers to a C++20 coroutine driven by `harc_rt::ThreadScheduler` (slim sister of arch-com's `arch_thread_rt.h`). `wait N cycles` and the bus.send/recv spin loops emit `co_await harc_rt::wait_cycles(_slot, N)`; the main loop drives one primary-clock posedge per iteration, calls `_checkers`, then resumes any coroutine whose wait condition is satisfied. Hookable methods, `on`-event-handler closures, tseq lambdas, and free functions stay synchronous — they only execute while the run coroutine is "running" between `co_await`s, so a sync `tick()` from inside a method does not race the scheduler. Multi-clock `wait N cycles on <named-clock>` keeps its sync `eval_clocks_until` path even in coroutine context: the main loop's full-primary-period granularity is too coarse for sub-primary-cycle waits when the named clock runs faster than primary.
 
-**Multi-OS-thread runtime (Phase 3a, opt-in via `harc sim --mt`).** **Default is the cooperative single-OS-thread model.** Pass `--mt` to spawn one `std::thread` per bound-driver/bound-monitor coroutine actor, each with its own `harc_rt::ThreadScheduler` (the per-thread cooperative scheduler is MT-unaware internally; serialization happens between threads via dual atomic-spin `harc_rt::Barrier` instances sized to `1 + N_actors` participants). Per-cycle order under `--mt`: main runs the run-coroutine's `sched.tick()` (any `emit drv.req(t)` calls push to actor queues here) → `_start_barrier.wait()` releases workers → workers each run their actor's `sched.tick()` → `_end_barrier.wait()` blocks main until all workers complete → main calls `dut->eval()` (single-threaded — Verilator-generated DUT is not MT-safe) and runs `_checkers`. Run-coroutine writes precede worker reads; worker DUT-input writes precede eval. No locks; no races on shared queues or signal state.
+**Multi-OS-thread runtime (Phase 3a, opt-in via `harc sim --mt`).** **Default is the cooperative single-OS-thread model.** Pass `--mt` to spawn one `std::thread` per bound-transactor coroutine actor, each with its own `harc_rt::ThreadScheduler` (the per-thread cooperative scheduler is MT-unaware internally; serialization happens between threads via dual atomic-spin `harc_rt::Barrier` instances sized to `1 + N_actors` participants). Per-cycle order under `--mt`: main runs the run-coroutine's `sched.tick()` (any `emit drv.req(t)` calls push to actor queues here) → `_start_barrier.wait()` releases workers → workers each run their actor's `sched.tick()` → `_end_barrier.wait()` blocks main until all workers complete → main calls `dut->eval()` (single-threaded — Verilator-generated DUT is not MT-safe) and runs `_checkers`. Run-coroutine writes precede worker reads; worker DUT-input writes precede eval. No locks; no races on shared queues or signal state.
 
-**Why opt-in.** Per-cycle barrier sync on Apple Silicon costs tens of µs round-trip due to P/E-core scheduling jitter. With sub-µs per-cycle actor work in typical fixtures, `--mt` is *13× slower* than cooperative on the bound-driver+monitor benchmark (cooperative ~0.02s, `--mt` ~0.27s for 30 000 cycles + 3 actors). The runtime topology is shipped for: (1) correctness validation of the multi-actor model — drivers and monitors genuinely run in parallel under `--mt`, surfacing any latent race that the cooperative model would have hidden; (2) future workloads (large per-cycle compute, or DUT-side parallel eval) where the parallelism win exceeds the barrier cost; (3) structural mirror with arch-com's Phase 3 — when the two runtimes converge, this is the model both sides converge on. Cycle batching (`run_cycles(K)`) to amortize barrier cost — useful for fast-forwarding through long idle drains where actors are quiet — is **Phase 3b** (deferred). Phase 3a ships the runtime topology + correctness argument; perf comes when there's a workload to justify it.
+**Why opt-in.** Per-cycle barrier sync on Apple Silicon costs tens of µs round-trip due to P/E-core scheduling jitter. With sub-µs per-cycle actor work in typical fixtures, `--mt` is *13× slower* than cooperative on the bound-transactor benchmark (cooperative ~0.02s, `--mt` ~0.27s for 30 000 cycles + 3 actors). The runtime topology is shipped for: (1) correctness validation of the multi-actor model — active and passive transactor halves genuinely run in parallel under `--mt`, surfacing any latent race that the cooperative model would have hidden; (2) future workloads (large per-cycle compute, or DUT-side parallel eval) where the parallelism win exceeds the barrier cost; (3) structural mirror with arch-com's Phase 3 — when the two runtimes converge, this is the model both sides converge on. Cycle batching (`run_cycles(K)`) to amortize barrier cost — useful for fast-forwarding through long idle drains where actors are quiet — is **Phase 3b** (deferred). Phase 3a ships the runtime topology + correctness argument; perf comes when there's a workload to justify it.
 
-Out of v0 scope: `tlm_method` lowering, `credit_channel` lowering (parser accepts; codegen no-ops), DUT-side introspection to flag bus signals that the actual SV doesn't expose, env-composed `bound` sub-components (only top-level `let drv/mon : T = bind axil` is supported; bound components nested inside an `env` follow), multi-input-event drivers (drivers with multiple `in event<T>` fields fall back to the synchronous subscriber-callback path), and OS-thread parallelism beyond the opt-in `--mt` flag (Phase 3b cycle batching).
+Out of v0 scope: `tlm_method` lowering, `credit_channel` lowering (parser accepts; codegen no-ops), DUT-side introspection to flag bus signals that the actual SV doesn't expose, env-composed `bound` sub-components (only top-level `let xact : T mode = bind axil` is supported; bound components nested inside an `env` follow), multi-input-event transactors (active transactors with multiple `in event<T>` fields fall back to the synchronous subscriber-callback path), and OS-thread parallelism beyond the opt-in `--mt` flag (Phase 3b cycle batching).
 
 ### 8.1 `transactor`
 
-The transactor is the **bus boundary unit** — the synthesizable BFM that touches DUT pins. Drivers and monitors collapse into it (one SV module, one set of pin connections, two threads inside). `when active|passive` mode subtyping selects whether the active stimulus thread is synthesized into the bitstream.
+The transactor is the **bus boundary unit** — the synthesizable BFM that touches DUT pins. The historical UVM split of "driver + monitor as separate components" collapses into one transactor: one SV module, one set of pin connections, two threads inside. `when active|passive` mode subtyping selects whether the active stimulus thread is synthesized into the bitstream.
 
 ```
 transactor AxiXactor#(P: AxiParams) bound to AxiBus#(P)
@@ -1152,50 +1152,7 @@ The agent's mode follows its inner transactor. If the agent itself is `agent Axi
 
 If you find yourself writing the same three lines (`let seq : ...; let xact : ...; connect seq -> xact`) in multiple tests, lift them into an agent. Otherwise skip the layer.
 
-### 8.3 `driver` / `monitor` (legacy SW-only forms)
-
-`driver` and `monitor` predate `transactor` and remain in the language for two reasons:
-
-1. **SW-only DUTs and quick tests** that don't need synthesizable BFMs. Verilator simulation can drive pins directly from a coroutine; for a small fixture, a `driver bound to BusType` with an `on T t` handler is the lightest construct that still gets typed bus access. No transactor wrap, no SCE-MI pipe, no synthesizability subset.
-2. **Composition inside a transactor body** — the merged transactor body internally has both stimulus and observation halves. Source can use plain `on req(t)` for the stimulus half and `on bus.<ch>.handshake(arg)` for the observation half; or, for code organization, can name the halves with `driver` / `monitor` field syntax inside the transactor. (v1+ feature; not needed for v0 transactor codegen.)
-
-The SW-only `driver` form:
-
-```
-driver AxiDriver#(P: AxiParams) bound to AxiBus#(P)
-    req: in event<AxiWrite>
-
-    on req(t)
-        bus.aw.send(t.addr, t.len, t.burst, t.id)
-        for beat in 0 .. t.len
-            bus.w.send(t.data[beat], t.strb[beat], beat == t.len - 1)
-        end for
-        let resp = bus.b.recv()
-        assert resp.id == t.id
-    end on
-end driver AxiDriver
-```
-
-`bus.aw.send(...)` is *derived* from the protocol type's handshake spec — the driver does not hand-code the valid/ready dance.
-
-The SW-only `monitor` form:
-
-```
-monitor AxiMonitor#(P: AxiParams) bound to AxiBus#(P)
-    txn: out event<AxiWrite>
-
-    on bus.aw.handshake(aw)
-        let t = AxiWrite { addr: aw.addr, len: aw.len, burst: aw.burst, id: aw.id, ... }
-        emit txn(t)
-    end on
-end monitor AxiMonitor
-```
-
-Monitors are passive *by type* — `bound to T` does not include any output-driving permission. The compiler rejects a monitor that tries to drive.
-
-**When to use which.** A new TB targeting `harc sim` only and not planning to scale to emulation can use `driver` + `monitor` directly — they're simpler and the v0 codegen has shipped them since PR #14/#15. A TB that wants to be emulator-portable, or wants to share BFM code between SW-sim and HW-sim, should use `transactor` from the start. The two forms can mix in one TB: nothing prevents a `transactor` for the AXI bus next to a sync `monitor` for sideband signal coverage.
-
-### 8.4 `sequencer` and `tseq`
+### 8.3 `sequencer` and `tseq`
 
 ```
 tseq RandomWrites(n: int) -> TSeq<AxiWrite>
@@ -1226,7 +1183,7 @@ tseq Mixed = RandomWrites(100) >> BackToBackBursts >> RandomWrites(100)
 
 The sequencer is a generic component; users do not normally subclass one.
 
-### 8.5 `scoreboard`
+### 8.4 `scoreboard`
 
 ```
 scoreboard AxiSb
@@ -1235,7 +1192,7 @@ scoreboard AxiSb
     on env.agent.sequencer.dispatched(t)
         expected.push(t)
     end on
-    on env.agent.monitor.txn(t_obs)
+    on env.agent.xact.txn(t_obs)
         let t_exp = expected.pop()
         assert t_obs == t_exp
             else fail("mismatch: expected ${t_exp} got ${t_obs}")
@@ -1245,7 +1202,7 @@ end scoreboard AxiSb
 
 Equality on transactions is structural and free; `==` does the right thing without `do_compare` boilerplate.
 
-### 8.6 `env`
+### 8.5 `env`
 
 `env` is the multi-transactor composition unit. It holds shared scoreboards and cross-bus connect bridges. Its members are typically `transactor`s directly (preferred) or `agent`s when a sequencer + transactor + wiring bundle is being reused. Same single source of truth for mode subtyping: each contained transactor / agent declares its own mode.
 
@@ -1309,7 +1266,7 @@ ISA-spec embedding: a Sail model compiles to a `ref module` via the C-emulator p
 
 Compilation produces a single C++ binary linking:
 - ARCH design → C++ via the existing ARCH backend (Verilator-class)
-- HARC testbench → C++ via the HARC backend; the test `run` block is a C++20 coroutine driven by a cooperative `harc_rt::ThreadScheduler` (sister to arch-com's `arch_thread_rt.h`). v0 ships single-actor (only `run` is a coroutine; methods and `on`-handlers stay synchronous between yields); v1 adds independent coroutines per driver/monitor, then OS-thread parallelism for performance scaling. Notably **not** lowered to FSMs — coroutine-direct simulation preserves source-level coverage legibility and keeps the door open for true multi-actor parallelism.
+- HARC testbench → C++ via the HARC backend; the test `run` block is a C++20 coroutine driven by a cooperative `harc_rt::ThreadScheduler` (sister to arch-com's `arch_thread_rt.h`). v0 ships single-actor (only `run` is a coroutine; methods and `on`-handlers stay synchronous between yields); v1 adds independent coroutines per transactor, then OS-thread parallelism for performance scaling. Notably **not** lowered to FSMs — coroutine-direct simulation preserves source-level coverage legibility and keeps the door open for true multi-actor parallelism.
 - Z3 / Bitwuzla — linked as the off-cycle solver pool serving queued `randomize` requests (§4.4)
 - Coverage / wave runtime — emits UCDB / FSDB / VCD via standard formats
 
@@ -1384,7 +1341,7 @@ v1: assertion-synthesizable subset (no temporal-unbounded operators; bounded `[*
 
 The HARC TB compiler is backend-agnostic at the cycle-loop level — `tb_step(D)` and `dut.eval_domain(D)` are an interface, not a specific implementation. Two DUT backends ship in v1:
 
-**ARCH-compiled DUT (default, fastest path).** ARCH source compiles to C++ via the existing ARCH backend (Verilator-class). HARC and ARCH share the same IR, the same compiler invocation, and the same C++ output object — single binary, single cache footprint, single optimizer pass. Typed cross-references (`dut.axi_s.aw.payload`) resolve directly against ARCH IR. This is the only path that gives co-elaboration (HARC TB and ARCH design parameters elaborate in the same pass) and protocol-typed interface binding (HARC drivers bind to ARCH `bus` declarations and dispatch through `handshake_channel` / `credit_channel` / `tlm_method`).
+**ARCH-compiled DUT (default, fastest path).** ARCH source compiles to C++ via the existing ARCH backend (Verilator-class). HARC and ARCH share the same IR, the same compiler invocation, and the same C++ output object — single binary, single cache footprint, single optimizer pass. Typed cross-references (`dut.axi_s.aw.payload`) resolve directly against ARCH IR. This is the only path that gives co-elaboration (HARC TB and ARCH design parameters elaborate in the same pass) and protocol-typed interface binding (HARC transactors bind to ARCH `bus` declarations and dispatch through `handshake_channel` / `credit_channel` / `tlm_method`).
 
 **Verilator-compiled SV DUT (interop path).** Existing SystemVerilog DUTs are linked through Verilator's standard C++ output. The HARC compiler:
 
@@ -1417,7 +1374,7 @@ The implicit default is `kind arch` — an ordinary `module Foo ... end module F
 
 **v1 limitations of the Verilator path:**
 
-- **Raw signal access only.** No automatic protocol grouping in v1 — `dut.s_axi_awvalid` is a raw signal, not part of a typed `bus BusAxi4`. This means HARC drivers/monitors that are written against ARCH `bus` types cannot be reused directly against SV DUTs without adapter code. v1.1 will add convention-based grouping (`<prefix>_<channel>_<signal>` patterns) and explicit binding stubs for protocol-typed access.
+- **Raw signal access only.** No automatic protocol grouping in v1 — `dut.s_axi_awvalid` is a raw signal, not part of a typed `bus BusAxi4`. This means HARC transactors that are written against ARCH `bus` types cannot be reused directly against SV DUTs without adapter code. v1.1 will add convention-based grouping (`<prefix>_<channel>_<signal>` patterns) and explicit binding stubs for protocol-typed access.
 - **No `internal` access** to SV module internals beyond what Verilator's public accessors expose. Verilator can be coerced into exposing more via `/* verilator public */` annotations, but HARC v1 doesn't depend on this.
 - **No co-elaboration.** SV parameters are baked at Verilator compile time; HARC parameters can't be propagated into the SV DUT. Mixed-parameter designs need the ARCH-DUT path.
 - **No SVA on internal SV signals.** HARC `assert` / `cover` / `assume` work fine on the DUT boundary signals; reaching internal SV signals for property checking requires Verilator hierarchical access (currently limited).
@@ -1427,7 +1384,7 @@ The implicit default is `kind arch` — an ordinary `module Foo ... end module F
 **v1.1+ DUT backends:**
 - **Commercial-simulator co-sim (VCS / Xcelium / Questa).** HARC TB process talks to the vendor sim through DPI-C (HARC TB compiled as a shared library that the vendor sim loads). Slower than co-compiled Verilator (one cycle = one DPI roundtrip) but covers proprietary HDL flows and unmodifiable encrypted IP.
 - **VHDL DUTs.** Via GHDL co-sim or Verilator's experimental VHDL frontend. Same DUT abstraction layer; just a different eval shim.
-- **Protocol-typed grouping for raw SV signals.** Convention-based default (`<prefix>_<channel>_<signal>` auto-groups into protocol types) with explicit binding stubs as override. Lets HARC drivers/monitors written against `bus BusAxi4` work against SV DUTs without adapter code.
+- **Protocol-typed grouping for raw SV signals.** Convention-based default (`<prefix>_<channel>_<signal>` auto-groups into protocol types) with explicit binding stubs as override. Lets HARC transactors written against `bus BusAxi4` work against SV DUTs without adapter code.
 
 The DUT backend abstraction makes all three v1.1+ paths straightforward additions, not architectural rewrites.
 
@@ -1435,7 +1392,7 @@ The DUT backend abstraction makes all three v1.1+ paths straightforward addition
 
 ## 11. Worked Example: AXI Read+Write Agent
 
-End-to-end. ~80 lines of HARC replaces ~700 lines of UVM. Uses ARCH stdlib `BusAxi4` (per ARCH §18e) — driver and monitor bind to the bus and dispatch through its handshake channels.
+End-to-end. ~80 lines of HARC replaces ~700 lines of UVM. Uses ARCH stdlib `BusAxi4` (per ARCH §18e) — the transactor binds to the bus and dispatches through its handshake channels.
 
 ```
 use arc.stdlib.BusAxi4         // ARCH stdlib bus definition
@@ -1482,9 +1439,11 @@ package ShortBursts
     end extend AxiTxn
 end package ShortBursts
 
-// --- Driver, Monitor, Sequencer (per §8) reused as-is.
-// Driver lowers to an ARCH `thread` that drives the bus's handshake_channel methods;
-// Monitor lowers to a passive `thread` that observes them.
+// --- Transactor + Sequencer (per §8) reused as-is.
+// Active transactor lowers to an ARCH `thread` that drives the bus's
+// handshake_channel methods; passive transactor lowers to a passive
+// `thread` that observes them. `when active` selects which half is
+// synthesized into the bitstream (post-v0).
 
 // --- Scoreboard
 scoreboard AxiSb
@@ -1492,7 +1451,7 @@ scoreboard AxiSb
     on env.agent.sequencer.dispatched(t)
         expected.push(t)
     end on
-    on env.agent.monitor.txn(t_obs)
+    on env.agent.xact.txn(t_obs)
         let t_exp = expected.pop()
         assert t_obs == t_exp else fail("mismatch")
     end on
@@ -1609,15 +1568,15 @@ Honest about what is not pinned down:
 
 ## 14. Implementation Phasing
 
-Build order matches the data path of a working testbench: stimulus generates traffic, monitor observes it, checker verifies it. Properties and coverage are *additions* to a working TB, not the foundation — they're useful only once stimulus exists to exercise the DUT. Each phase delivers user-visible value standalone — no big-bang.
+Build order matches the data path of a working testbench: stimulus generates traffic, observer reconstructs it, checker verifies it. Properties and coverage are *additions* to a working TB, not the foundation — they're useful only once stimulus exists to exercise the DUT. Each phase delivers user-visible value standalone — no big-bang.
 
-- **Phase 1a — Per-field stimulus, no constraint solver.** Transactions with default-rand fields and per-field attributes: `[range(...)]`, `[dist {...}]` (per-field weighted distribution), `[cyclic]`, `[unique]`, `[weighted(...)]`. `when` subtypes — discriminator-based variant selection plus per-field randomization within a variant. `tseq` with composition operators (`parallel`, `schedule`, `select`, `repeat` — §17.1), `sequencer`, `driver` bound to ARCH `bus` and dispatching through `handshake_channel` / `credit_channel` / `tlm_method`, `buffer<T>` flow object (§17.2), basic `test` and `scope sim` with `run` block, **logging with severity / verbosity / component IDs** (§7.7 — rides on the ARCH `log` primitive), **DUT backend abstraction with both ARCH co-compiled and Verilator-linked SV paths** (§10.5 — raw signal access on the SV path; protocol-typed binding deferred to v1.1). Static checker rejects any `keep` or `relation` referencing more than one field, with a clear error pointing to Phase 1b. **No SMT solver linked** — runtime is a standard PRNG library (xoshiro / PCG / Mersenne) with weighted-sample and cyclic-enumeration support. **Demo:** random valid AXI traffic drives a slave DUT through a HARC-compiled binary, against either an ARCH-native AXI slave or an existing SV AXI slave linked via Verilator; expressivity equivalent to SystemVerilog `$urandom_range` plus distributions and cyclic enumeration, with HARC's clean type system on top.
+- **Phase 1a — Per-field stimulus, no constraint solver.** Transactions with default-rand fields and per-field attributes: `[range(...)]`, `[dist {...}]` (per-field weighted distribution), `[cyclic]`, `[unique]`, `[weighted(...)]`. `when` subtypes — discriminator-based variant selection plus per-field randomization within a variant. `tseq` with composition operators (`parallel`, `schedule`, `select`, `repeat` — §17.1), `sequencer`, active `transactor` bound to ARCH `bus` and dispatching through `handshake_channel` / `credit_channel` / `tlm_method`, `buffer<T>` flow object (§17.2), basic `test` and `scope sim` with `run` block, **logging with severity / verbosity / component IDs** (§7.7 — rides on the ARCH `log` primitive), **DUT backend abstraction with both ARCH co-compiled and Verilator-linked SV paths** (§10.5 — raw signal access on the SV path; protocol-typed binding deferred to v1.1). Static checker rejects any `keep` or `relation` referencing more than one field, with a clear error pointing to Phase 1b. **No SMT solver linked** — runtime is a standard PRNG library (xoshiro / PCG / Mersenne) with weighted-sample and cyclic-enumeration support. **Demo:** random valid AXI traffic drives a slave DUT through a HARC-compiled binary, against either an ARCH-native AXI slave or an existing SV AXI slave linked via Verilator; expressivity equivalent to SystemVerilog `$urandom_range` plus distributions and cyclic enumeration, with HARC's clean type system on top.
 
 - **Phase 1b — Constraint solver, queued randomize, full CRV.** Z3 integration (linked as off-cycle solver pool — §4.4), cross-field `keep` constraints in transactions, free-standing `relation` declarations (§4), `solve_before` / `solve_after` hints, the `dist` directive inside `randomize ... with { ... }` for cross-field weighted distributions, queued `randomize` with implicit single-shot result channel, `blocking randomize` semantics with compile-time enforcement when constraint references runtime DUT state, tagged-ADT encoding of `when` subtypes for solver pruning (§3.3 — `(declare-datatypes)` per-variant subproblems). Phase 1a code keeps working unchanged — Phase 1b lifts the cross-field restriction on the static checker and enables the solver path. **Demo:** classic AXI burst-legal generation with relational constraints (`len * size <= 4096 - addr % 4096`); solver pool sustains throughput against cycle-based simulation.
 
-- **Phase 2 — Monitor.** `monitor` bound to ARCH `bus` (passive — type system enforces no-driving), transaction reconstruction from observed bus signals, `agent` as the driver+monitor+sequencer composition. Multi-clock domain spanning (`across`, cross-domain channels — §7.5) lands here, lowering to ARCH `synchronizer` and async `fifo`. **Demo:** observe and reconstruct the transactions the DUT actually emitted; agent groups everything per protocol.
+- **Phase 2 — Observation.** Passive `transactor` bound to ARCH `bus` (type system enforces no-driving on a `passive` instance), transaction reconstruction from observed bus signals, `agent` as the (sequencer + active transactor + passive transactor) composition. Multi-clock domain spanning (`across`, cross-domain channels — §7.5) lands here, lowering to ARCH `synchronizer` and async `fifo`. **Demo:** observe and reconstruct the transactions the DUT actually emitted; agent groups everything per protocol.
 
-- **Phase 3 — Checker.** `scoreboard` construct with structural equality on transactions, `env` as the static composition root, `state<T>` flow object (§17.2) for shared scoreboard slots. **Demo:** closed-loop functional verification — random stim → DUT → monitor → scoreboard catches mismatches end-to-end. This is the milestone that makes HARC a working testbench language.
+- **Phase 3 — Checker.** `scoreboard` construct with structural equality on transactions, `env` as the static composition root, `state<T>` flow object (§17.2) for shared scoreboard slots. **Demo:** closed-loop functional verification — random stim → DUT → passive observer → scoreboard catches mismatches end-to-end. This is the milestone that makes HARC a working testbench language.
 
 - **Phase 4 — Properties, coverage, formal export.** `assert` / `assume` / `cover property`, `pseq` (§3.4, §5), module `contract` blocks for compositional formal (§5.1), `covergroup` (§6), `cover sequence` for behavioral coverage (§17.3), BTOR2 / SMT-LIB2 export (§10.3). **Demo:** SVA-equivalent property checking layered onto the working TB; formal proof export for the property subset; coverage closure on existing stimulus.
 
@@ -1633,7 +1592,7 @@ Build order matches the data path of a working testbench: stimulus generates tra
 
 **Why split Phase 1.** Phase 1a is meaningful without an SMT dependency — most real CRV stimulus is per-field random within a range, and SystemVerilog projects routinely ship valuable testbenches built on `$urandom_range` alone. Pulling Z3 integration, queued/blocking randomize, and tagged-ADT encoding into Phase 1b lets the early demo land months sooner: a working stimulus → DUT path with no constraint solver to integrate, no solver-pool tuning, no compile-time runtime-state-dependence analysis. Phase 1a code transparently upgrades to Phase 1b — the static checker simply lifts the cross-field restriction. The split also gives a clean static-vs-dynamic boundary for the implementation: Phase 1a is pure runtime PRNG; Phase 1b adds the static-elaboration / dynamic-solver pipeline.
 
-**Why this order, not "properties first":** an earlier draft put properties + coverage at Phase 1, on the reasoning that they form "the smallest viable language" and could ship as an SVA replacement on day one. The reordering above rejects that framing. Properties without stimulus assert against silence; coverage without stimulus measures empty space. The data path stim → monitor → checker is what makes a testbench *work*; properties are a refinement layered on top of working stimulus, not a substitute for it. Building the foundation first means each phase delivers something usable, and the property machinery (Phase 4) rides on the same event/sample plumbing the TB already has from Phases 1-3.
+**Why this order, not "properties first":** an earlier draft put properties + coverage at Phase 1, on the reasoning that they form "the smallest viable language" and could ship as an SVA replacement on day one. The reordering above rejects that framing. Properties without stimulus assert against silence; coverage without stimulus measures empty space. The data path stim → observer → checker is what makes a testbench *work*; properties are a refinement layered on top of working stimulus, not a substitute for it. Building the foundation first means each phase delivers something usable, and the property machinery (Phase 4) rides on the same event/sample plumbing the TB already has from Phases 1-3.
 
 ---
 
@@ -1668,9 +1627,9 @@ Every HARC construct has a direct lowering to an ARCH primitive — HARC adds th
 | `event comb<T>` (same-cycle)    | `let` binding + `comb` block                         | Comb-cycle detection at elaboration                    |
 | `on event(t) ... end on`        | `seq on clk rising` block guarded by event valid     | One handler per subscriber; resolved at compile time   |
 | `agent` / `env`                 | ARCH `module` with composed children                 | Static composition root                                |
-| `driver`                        | ARCH `thread` driving a `bus` port's send-side methods (handshake_channel send, credit_channel send, tlm_method initiator) | One driver = one thread per protocol channel |
-| `monitor`                       | ARCH `thread` reading bus port's receive-side state (passive: cannot drive) | Type system enforces passivity            |
-| `sequencer`                     | `fifo<T>` of transactions + a thread that pops and emits to the driver event | Standard producer/consumer pattern |
+| `transactor` (active half)      | ARCH `thread` driving a `bus` port's send-side methods (handshake_channel send, credit_channel send, tlm_method initiator), gated by `generate_if ACTIVE` | One active half = one thread per protocol channel |
+| `transactor` (passive half)     | ARCH `thread` reading bus port's receive-side state (no driving permitted) | Type system enforces passivity on `passive` instances |
+| `sequencer`                     | `fifo<T>` of transactions + a thread that pops and emits to the transactor's input event | Standard producer/consumer pattern |
 | `scoreboard`                    | ARCH `module` with `queue` + `seq` block + `assert`  | Comparison logic compiles to ARCH assertions           |
 | `transaction` (flat)            | ARCH `struct`                                        | Structural equality from ARCH's struct support         |
 | `transaction` (with `when`)     | ARCH `enum` discriminator + `struct` per variant     | Tagged ADT, lowered to SMT datatype for solver         |
@@ -1800,7 +1759,7 @@ type state<T>                // persistent shared state with R/W sequencing
 
 **When to use which:**
 
-- **`event<T>`** for transient notifications that may have many listeners. Example: "transaction observed by monitor."
+- **`event<T>`** for transient notifications that may have many listeners. Example: "transaction observed by passive transactor."
 - **`buffer<T>`** for queued producer/consumer pipelines where ordering and finite depth matter. Example: "transactions waiting to be driven into the bus."
 - **`stream<T>`** for continuous reference output. Example: "ref model emits one expected sample per cycle, scoreboard reads on every cycle."
 - **`state<T>`** for shared scoreboard slots — the most common new use case. Example: "expected status register value after the last write."
@@ -1810,13 +1769,13 @@ type state<T>                // persistent shared state with R/W sequencing
 ```
 state<uint<32>> expected_status
 
-on env.agent.monitor.write(t)
+on env.agent.xact.write(t)
     if t.addr == STATUS_REG
         expected_status <- t.data           // sequenced write
     end if
 end on
 
-on env.agent.monitor.read(t)
+on env.agent.xact.read(t)
     if t.addr == STATUS_REG
         assert t.data == expected_status    // read after write, same cycle or later
     end if

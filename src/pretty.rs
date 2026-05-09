@@ -156,8 +156,7 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
             pad(out, depth);
             writeln!(out, "end tseq {}", t.name.name).ok();
         }
-        Item::Agent(c) | Item::Driver(c) | Item::Monitor(c) | Item::Env(c)
-        | Item::Scoreboard(c) | Item::Sequencer(c) => {
+        Item::Agent(c) | Item::Env(c) | Item::Scoreboard(c) | Item::Sequencer(c) => {
             print_component(out, c, depth);
         }
         Item::Test(t) => {
