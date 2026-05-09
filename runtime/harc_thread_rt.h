@@ -35,6 +35,8 @@
 #include <functional>
 #include <cstdint>
 #include <vector>
+#include <atomic>
+#include <thread>
 
 namespace harc_rt {
 
@@ -188,5 +190,57 @@ struct ThreadScheduler {
 // the awaiter can write its suspend state.
 inline WaitUntilAwaiter  wait_until (ThreadSlot* s, std::function<bool()> p) { return {std::move(p), s}; }
 inline WaitCyclesAwaiter wait_cycles(ThreadSlot* s, uint32_t n)              { return {n, s}; }
+
+// ─── Multi-OS-thread support (Phase 3a) ───────────────────────────────
+//
+// Atomic spin-wait barrier. ~10–30 ns per round-trip vs ~µs for
+// std::condition_variable. Used by emit_main's per-cycle barrier
+// dance to synchronize the main thread with N worker threads (one
+// per bound-driver/bound-monitor coroutine actor).
+//
+// Mirrors arch-com's `arch_rt::Barrier` exactly so the two runtimes
+// can later be merged. Dual cache-line padding avoids false sharing
+// with neighbouring fields — Apple Silicon's strong cache-line
+// bouncing penalty makes alignment matter much more than on x86.
+//
+// Construct with `target` = number of participating threads. Each
+// thread calls `wait()` at the synchronization point; all participants
+// advance together.
+//
+// Caveat (matches arch-com's ThreadSimPerf measurements): per-cycle
+// barrier sync on Apple Silicon costs ~10s of µs round-trip due to
+// P/E core scheduling jitter. With ~µs of per-cycle actor work,
+// multi-thread mode is *slower* than single-thread cooperative mode.
+// Cycle batching (`run_cycles(K)` API, Phase 3b) is required for
+// wall-clock wins. Phase 3a delivers the runtime topology and
+// validates correctness against the cooperative baseline; perf comes
+// next.
+struct alignas(64) Barrier {
+    alignas(64) std::atomic<uint32_t> count{0};
+    alignas(64) std::atomic<uint32_t> generation{0};
+    uint32_t target;
+    explicit Barrier(uint32_t target) : target(target) {}
+    void wait() {
+        uint32_t gen = generation.load(std::memory_order_acquire);
+        if (count.fetch_add(1, std::memory_order_acq_rel) + 1 == target) {
+            count.store(0, std::memory_order_release);
+            generation.fetch_add(1, std::memory_order_release);
+        } else {
+            // Spin briefly, then yield to avoid pegging a core when
+            // other participants are slow (oversubscribed). Long spin
+            // window: per-cycle sim work is often sub-µs so a low
+            // budget would trigger OS context switches every cycle.
+            // ~100k iters ≈ 30–100 µs on modern CPUs — well over
+            // typical per-cycle work.
+            uint32_t spins = 0;
+            while (generation.load(std::memory_order_acquire) == gen) {
+                if (++spins > 100000) {
+                    std::this_thread::yield();
+                    spins = 0;
+                }
+            }
+        }
+    }
+};
 
 } // namespace harc_rt
