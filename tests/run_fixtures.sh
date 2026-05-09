@@ -63,6 +63,8 @@ cam_basic_test          | Mshr_Addr_Cam  | cam_basic.sv           |
 mshr_cocotb_test        | cache_mshr     | cache_mshr.sv          |
 cpu_pipeline_test       | CpuPipe        | cpu_pipeline.sv        |
 linklist_doubly_test    | SchedList      | linklist_doubly.sv     |
+mac_table_test          | mac_table      | mac_table.sv           |
+noc_credit_test         | NocCreditTop   | noc_credit.sv          |
 EOF
 
 PASS=0
