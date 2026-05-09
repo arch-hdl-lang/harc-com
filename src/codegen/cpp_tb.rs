@@ -384,6 +384,44 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
         }
     }
 
+    // ── Per-channel payload structs ──────────────────────────────────────
+    // `bus.<ch>.recv()` and `on bus.<ch>.handshake(arg)` capture the
+    // channel's full payload — for multi-payload channels (e.g. AXI's
+    // `r` carrying both `data` and `resp`) users need `arg.data` /
+    // `arg.resp`. We emit one struct per `handshake_channel`, named
+    // `<BusName>_<chan>_payload`, with one field per payload signal.
+    //
+    // The struct also exposes `operator uint64_t() const` returning
+    // the first field — backward compatible with the previous v0
+    // behaviour (`recv()` returning a scalar). Existing fixtures that
+    // do `assert val == 0xCAFEBABE` keep working without change;
+    // multi-payload access just becomes available.
+    for it in &file.items {
+        if let Item::Bus(b) = it {
+            for h in &b.handshakes {
+                if h.payload.is_empty() { continue; }
+                let struct_name = format!("{}_{}_payload", b.name.name, h.name.name);
+                writeln!(e.out, "struct {struct_name} {{").ok();
+                for sig in &h.payload {
+                    let cty = txn_field_c_type(&sig.ty);
+                    writeln!(e.out, "{INDENT}{cty} {};", sig.name.name).ok();
+                }
+                // Implicit conversion to the first payload field — keeps
+                // single-field-style usage (`val == N`, `last_read = val`)
+                // compiling against the new struct type.
+                let first_sig = &h.payload[0];
+                let first_cty = txn_field_c_type(&first_sig.ty);
+                writeln!(
+                    e.out,
+                    "{INDENT}operator {first_cty}() const {{ return {}; }}",
+                    first_sig.name.name,
+                ).ok();
+                writeln!(e.out, "}};").ok();
+                writeln!(e.out, "").ok();
+            }
+        }
+    }
+
     // ── Monitor structs ──────────────────────────────────────────────────
     // Same shape as scoreboards; output `event<T>` fields lower to
     // std::vector<std::function<void(T)>>. The on-handlers don't go in
@@ -1194,12 +1232,14 @@ impl Emitter {
     /// Phase 2c: emit each `on bus.<ch>.handshake(arg)` handler in a
     /// `bound to BusType` monitor as an independent coroutine actor:
     ///
+    /// ```text
     ///     while (true) {
     ///         co_await wait_until(_slot, [&]{ return valid && ready; });
     ///         auto <arg> = <first payload signal>;
     ///         <body — bus.<ch>.<sig> resolves through the bus binding>
     ///         co_await wait_cycles(_slot, 1);   // skip past this handshake
     ///     }
+    /// ```
     ///
     /// Non-handshake on-handlers in the monitor (event subscribers,
     /// cycle triggers on bool expressions) fall through to the
@@ -1258,8 +1298,7 @@ impl Emitter {
                         ));
                         continue;
                     }
-                    let cap_sig = channel.payload[0].name.name.clone();
-                    let (_bus_decl, root, sig_prefix) = binding;
+                    let (bus_decl, root, sig_prefix) = binding;
                     let chan_prefix = format!("{}_{}", sig_prefix, ch_name);
                     let slot_var = format!("_{instance}_{ch_name}_slot");
 
@@ -1279,8 +1318,22 @@ impl Emitter {
                         self.out,
                         "co_await harc_rt::wait_until(_slot, [&]{{ return {root}->{chan_prefix}_valid && {root}->{chan_prefix}_ready; }});",
                     ).ok();
+                    // Bind `arg` to the per-channel payload struct so the
+                    // body can use `arg.data`, `arg.resp`, etc. The
+                    // struct's implicit-conversion-to-first-field
+                    // operator means scalar use (`sb.queue.push(arg)`)
+                    // also keeps working — push receives the first
+                    // payload value, matching pre-multi-payload behaviour.
                     self.pad(depth + 2);
-                    writeln!(self.out, "auto {arg_name} = {root}->{chan_prefix}_{cap_sig};").ok();
+                    let struct_name = format!("{}_{}_payload", bus_decl.name.name, ch_name);
+                    write!(self.out, "{struct_name} {arg_name} = {{").ok();
+                    let mut first = true;
+                    for sig in &channel.payload {
+                        if !first { write!(self.out, ", ").ok(); }
+                        first = false;
+                        write!(self.out, "{root}->{chan_prefix}_{}", sig.name.name).ok();
+                    }
+                    writeln!(self.out, "}};").ok();
 
                     // Body: install field subs + bus binding, mark
                     // coroutine context, emit, restore state.
@@ -1868,11 +1921,14 @@ impl Emitter {
                     ));
                     return true;
                 }
-                // Multi-payload receive returns only the first signal's
-                // value via the let-rhs form; users wanting the full
-                // payload still have manual access via
-                // `bus.<ch>.<sig>` after the dance fires.
-                let cap_sig = &h.payload[0].name.name;
+                // Multi-payload receive captures the full payload into
+                // a per-channel struct (`<BusName>_<chan>_payload`),
+                // emitted at file scope. The struct exposes an implicit
+                // conversion to the first payload field's C++ type so
+                // pre-existing scalar usage (`assert val == 0xCAFE`,
+                // `field = val`) keeps compiling without change. Users
+                // who want named field access write `val.data`,
+                // `val.resp`, etc.
                 self.pad(depth);
                 writeln!(self.out, "// bus.{}.recv", ch.name).ok();
                 self.pad(depth);
@@ -1887,7 +1943,15 @@ impl Emitter {
                 // are valid in the same cycle as `valid` is high.
                 if let Some(name) = let_name {
                     self.pad(depth);
-                    writeln!(self.out, "auto {name} = {root}->{prefix}_{cap_sig};").ok();
+                    let struct_name = format!("{}_{}_payload", bus.name.name, ch.name);
+                    write!(self.out, "{struct_name} {name} = {{").ok();
+                    let mut first = true;
+                    for sig in &h.payload {
+                        if !first { write!(self.out, ", ").ok(); }
+                        first = false;
+                        write!(self.out, "{root}->{prefix}_{}", sig.name.name).ok();
+                    }
+                    writeln!(self.out, "}};").ok();
                 }
                 self.pad(depth);
                 if self.in_coroutine {
