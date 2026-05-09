@@ -20,10 +20,9 @@
 // pattern as cpu_pipeline_test and linklist_doubly_test. Each
 // hookable mirrors a cocotb sequence.
 
-// MSHR_SIZE = 32 (DUT default). Inlined as a literal in the test
-// body below — `const` items parse in HARC but aren't yet emitted
-// by cpp_tb codegen, so referencing `MSHR_SIZE` from C++ would fail
-// to link. Tracked as a follow-up codegen item.
+// Mirrors the DUT's default `parameter int MSHR_SIZE = 32`. Lowered
+// as `static constexpr int64_t MSHR_SIZE = 32;` at file scope.
+const MSHR_SIZE : uint<32> = 32
 
 transactor MshrXactor
     dut : cache_mshr
@@ -107,8 +106,8 @@ test MshrCocotbTest
                 end if
             end for
             dut.allocate_valid = 0
-            assert cycles == 32
-                else fail("Test 1: fill cycles=${cycles}, expected MSHR_SIZE=32")
+            assert cycles == MSHR_SIZE
+                else fail("Test 1: fill cycles=${cycles}, expected MSHR_SIZE=${MSHR_SIZE}")
             log(info, "Test 1 PASS: fill exhausts in ${cycles} cycles")
 
             xact.reset_dut()
@@ -121,7 +120,7 @@ test MshrCocotbTest
             dut.allocate_valid = 1
             dut.allocate_addr = 66           // 0x42
             dut.finalize_valid = 0
-            for i in 0 .. 32
+            for i in 0 .. MSHR_SIZE
                 dut.allocate_rw = i & 1
                 dut.allocate_data = i * 17
                 wait 1 cycle
@@ -135,7 +134,7 @@ test MshrCocotbTest
                 end if
             end for
             dut.allocate_valid = 0
-            log(info, "Test 2 PASS: linked-list chains 0..31")
+            log(info, "Test 2 PASS: linked-list chains 0..${MSHR_SIZE - 1}")
 
             xact.reset_dut()
 
