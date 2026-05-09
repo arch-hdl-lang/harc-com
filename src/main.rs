@@ -274,25 +274,45 @@ fn run_verilator(
         "--top-module".into(), top.into(),
         "--Mdir".into(), mdir.display().to_string(),
         // Force C++20 by overriding verilator's default
-        // `CFG_CXXFLAGS_STD = -std=gnu++17` Makefile variable. Done
-        // via `-MAKEFLAGS` (forwarded to `make`) rather than user
-        // CFLAGS because verilator's own CFLAGS append AFTER user
-        // ones, so user `-std=c++20` gets overridden by `-std=gnu++17`
-        // at the end of the compiler command line.
+        // `CFG_CXXFLAGS_STD = -std=gnu++17` Makefile variable, so
+        // `<coroutine>` and our `co_await`-based wait primitives
+        // compile. Verilator's own CFLAGS append AFTER user CFLAGS
+        // on the compile command line, so user `-std=c++20` would
+        // be overridden — `-MAKEFLAGS` is forwarded to `make` and
+        // replaces the variable cleanly.
         //
-        // C++20 is required by `harc_thread_rt.h`'s `<coroutine>`
-        // includes and our `co_await`-based `wait_cycles` /
-        // `wait_until` lowerings.
+        // Optimization stays at verilator's default `-Os`. The
+        // emitted test `.cpp` opts out via `#pragma clang optimize
+        // off` (see cpp_tb.rs's emit prelude) — clang 17+ on Apple
+        // Silicon and Linux x86_64 mis-optimizes our `[&]`-capturing
+        // C++20 lambda coroutines at `-Os` / `-O2` (closure reference
+        // members fold against a freed stack frame after suspension,
+        // SEGV on resume). The pragma is per-file so the verilator-
+        // generated DUT code (in separate .cpp files) keeps `-Os`
+        // for fast simulation.
         //
-        // Optimization level stays at verilator's `-Os` default for
-        // the DUT (fast simulation). The emitted test `.cpp` opts
-        // out via `#pragma clang optimize off` at the top of the
-        // file — clang 17 on Apple Silicon mis-optimizes our lambda
-        // coroutines at `-Os` / `-O2` (closure reference members fold
-        // against a freed stack frame after suspension, SEGV on
-        // resume). Per-file pragma keeps DUT eval fast.
+        // GCC has the same class of miscompile, but its
+        // `#pragma optimize` doesn't propagate correctly through
+        // C++20 coroutine codegen (`-O0`-pragma SEGVs trivial
+        // tests; `-O1`-pragma still SEGVs the bound-actor tests).
+        // CI sets `CXX=clang++-15` for the verilator build so the
+        // clang pragma applies on both platforms; see
+        // `.github/workflows/ci.yml`.
         "-MAKEFLAGS".into(),
-        "CFG_CXXFLAGS_STD=-std=gnu++20".into(),
+        // `CXX=${HARC_CXX:-c++}` lets CI override the compiler
+        // without changing harc-com source. On macOS, `c++` aliases
+        // clang and the existing `#pragma clang optimize off` does
+        // its thing. On Linux GitHub runners, `c++` would alias
+        // g++ — and GCC's pragma-equivalent doesn't propagate
+        // through C++20 coroutine codegen — so CI sets
+        // `HARC_CXX=clang++` explicitly. Local Linux users without
+        // the env var get the system `c++` (g++ on most distros);
+        // they can `export HARC_CXX=clang++` if they want the
+        // clang fix.
+        format!(
+            "CFG_CXXFLAGS_STD=-std=gnu++20 CXX={}",
+            std::env::var("HARC_CXX").unwrap_or_else(|_| "c++".to_string())
+        ),
     ];
     // Make the build dir an include path so the emitted `.cpp`'s
     // `#include "harc_thread_rt.h"` resolves — verilator builds in
