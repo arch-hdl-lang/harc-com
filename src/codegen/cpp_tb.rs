@@ -178,8 +178,6 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // emission.
     let mut transactions = std::collections::HashSet::new();
     let mut scoreboards = std::collections::HashSet::new();
-    let mut monitors: std::collections::HashMap<String, ComponentDecl> =
-        std::collections::HashMap::new();
     let mut components: std::collections::HashMap<String, ComponentDecl> =
         std::collections::HashMap::new();
     let mut covergroups: std::collections::HashMap<String, CovergroupDecl> =
@@ -197,8 +195,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                 scoreboards.insert(c.name.name.clone());
                 components.insert(c.name.name.clone(), c.clone());
             }
-            Item::Monitor(c) => { monitors.insert(c.name.name.clone(), c.clone()); }
-            Item::Driver(c) | Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) => {
+            Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) => {
                 components.insert(c.name.name.clone(), c.clone());
             }
             Item::Covergroup(g) => { covergroups.insert(g.name.name.clone(), g.clone()); }
@@ -257,7 +254,6 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         if let Some(simple) = type_simple_name(l.ty.as_ref()) {
             if transactions.contains(simple)
                 || scoreboards.contains(simple)
-                || monitors.contains_key(simple)
                 || components.contains_key(simple)
                 || covergroups.contains_key(simple)
                 || buses.contains_key(simple)
@@ -286,7 +282,6 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         let_types,
         transactions,
         scoreboards,
-        monitors,
         components,
         covergroups,
         txn_fields,
@@ -458,23 +453,14 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
 
     // ── Monitor structs ──────────────────────────────────────────────────
     // Same shape as scoreboards; output `event<T>` fields lower to
-    // std::vector<std::function<void(T)>>. The on-handlers don't go in
-    // the struct — they're emitted at `let mon : MonName` time.
-    for it in &file.items {
-        if let Item::Monitor(m) = it {
-            e.emit_monitor_struct(m);
-        }
-    }
-
-    // ── Component structs (driver / agent / env / sequencer).
+    // ── Component structs (agent / env / sequencer).
     // Scoreboards have their own dedicated path above; the rest are
     // plain field-bearing structs. `hookable` methods are emitted
     // separately as free `[&]`-capturing lambdas (below) so the
     // method body sees `dut` / `tick` / `_checkers` from the test scope.
     for it in &file.items {
         match it {
-            Item::Driver(c) | Item::Agent(c) | Item::Env(c)
-            | Item::Sequencer(c) => {
+            Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) => {
                 e.emit_component_struct(c);
             }
             Item::Transactor(t) => {
@@ -685,7 +671,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     let mut emitted_any_method = false;
     for it in &file.items {
         match it {
-            Item::Driver(c) | Item::Agent(c) | Item::Env(c)
+            Item::Agent(c) | Item::Env(c)
             | Item::Sequencer(c) | Item::Scoreboard(c) => {
                 for ci in &c.items {
                     if let ComponentItem::Hookable(h) = ci {
@@ -755,13 +741,13 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         }
     }
 
-    // Hookable methods on regular components (driver/agent/env/
-    // sequencer/scoreboard) plus transactors. Transactor hookables
+    // Hookable methods on regular components (agent / env /
+    // sequencer / scoreboard) plus transactors. Transactor hookables
     // are emitted via the synth ComponentDecl so the existing
     // emit_component_method path finds the same struct shape.
     for it in &file.items {
         match it {
-            Item::Driver(c) | Item::Agent(c) | Item::Env(c)
+            Item::Agent(c) | Item::Env(c)
             | Item::Sequencer(c) | Item::Scoreboard(c) => {
                 for ci in &c.items {
                     if let ComponentItem::Hookable(h) = ci {
@@ -1009,7 +995,7 @@ fn synth_component_from_transactor(t: &TransactorDecl, include_active: bool) -> 
         }
     }
     ComponentDecl {
-        kind: ComponentKind::Driver,
+        kind: ComponentKind::Transactor,
         name: t.name.clone(),
         params: t.params.clone(),
         bound_to: t.bound_to.clone(),
@@ -1074,11 +1060,6 @@ struct Emitter {
     /// closure on the primary clock. Bin counters live as `uint64_t` fields
     /// inside the struct; user-side access is `cov.cp_name.bin_name`.
     covergroups: std::collections::HashMap<String, CovergroupDecl>,
-    /// Monitor declarations indexed by name. When `let mon : MonName` is
-    /// encountered, we emit the struct instance + register each `on`
-    /// handler from the declaration as a `_checkers` closure (with field-
-    /// name substitution so `emit write_e(...)` resolves to `mon.write_e`).
-    monitors: std::collections::HashMap<String, ComponentDecl>,
     /// Per-test list of registered `cover <expr>` points. Each entry pairs
     /// a unique tag (used to name the static hit counter in C++) with a
     /// human label for the report. Aggregated end-of-main report iterates
@@ -1366,29 +1347,6 @@ impl Emitter {
         writeln!(self.out, "}});").ok();
     }
 
-    /// Emit a monitor declaration's data layout — just the fields. Each
-    /// `out event<T>` becomes `std::vector<std::function<void(T)>>`. The
-    /// on-handlers in the monitor body are NOT emitted here — they live
-    /// at the `let mon : MonName` site, registered into `_checkers`.
-    fn emit_monitor_struct(&mut self, m: &ComponentDecl) {
-        writeln!(self.out, "struct {} {{", m.name.name).ok();
-        for it in &m.items {
-            if let ComponentItem::Field(f) = it {
-                // Resolve via `component_field_c_type` so named
-                // sub-components (scoreboards, transactions, enums)
-                // get their proper C++ type rather than falling back
-                // to `int64_t`. Necessary for bound monitors
-                // (Phase 2c) that hold a `sb : AxilSb` scoreboard
-                // and access `mon.sb.<queue>.size()` from outside
-                // the monitor body.
-                let cty = self.component_field_c_type(&f.ty);
-                writeln!(self.out, "{INDENT}{cty} {};", f.name.name).ok();
-            }
-        }
-        writeln!(self.out, "}};").ok();
-        writeln!(self.out, "").ok();
-    }
-
     /// Emit a cycle-trigger `on <bool-expr>` handler — registers a closure
     /// that fires per the handler's `edge` mode (rising / falling / level).
     /// Used by both the test-scope `on` form and monitor body handlers; the
@@ -1433,23 +1391,9 @@ impl Emitter {
         writeln!(self.out, "}});").ok();
     }
 
-    /// At a `let mon : MonName` site, emit the registrations for each
-    /// on-handler in the monitor's declaration. Each handler becomes a
-    /// `_checkers` closure with `[&]` capture; the body's bare references
-    /// to the monitor's own fields get prefixed with `<instance>.` via
-    /// the `field_subs` rewrite map.
-    fn emit_monitor_handler_registrations(
-        &mut self,
-        mon: &ComponentDecl,
-        instance: &str,
-        depth: usize,
-    ) {
-        self.emit_component_handler_registrations(mon, instance, depth, "_m_");
-    }
-
-    /// Generic on-handler registration for any component (monitor /
-    /// driver / agent / sequencer / scoreboard). Dispatches each
-    /// handler by the shape of its trigger expression:
+    /// Generic on-handler registration for any component (agent /
+    /// transactor / sequencer / scoreboard). Dispatches each handler
+    /// by the shape of its trigger expression:
     ///
     /// - `on event_field(arg) ... end on` (a `Call` expression) →
     ///   register a `[&]`-capturing closure into the corresponding
@@ -1684,10 +1628,10 @@ impl Emitter {
         depth: usize,
         binding: &(BusDecl, String, String),
     ) -> bool {
-        // Only `driver` and `agent` are eligible — monitors observe
-        // signals, not transaction queues; envs / sequencers /
+        // Only `agent` and `transactor` (synth ComponentDecl from a
+        // bound active transactor) are eligible — envs / sequencers /
         // scoreboards aren't actor-shaped at all.
-        if !matches!(comp.kind, ComponentKind::Driver | ComponentKind::Agent) {
+        if !matches!(comp.kind, ComponentKind::Agent | ComponentKind::Transactor) {
             return false;
         }
 
@@ -2471,7 +2415,7 @@ impl Emitter {
                 let n = &last.name;
                 if self.transactions.contains(n) || self.enums.contains_key(n)
                     || self.components.contains_key(n) || self.scoreboards.contains(n)
-                    || self.monitors.contains_key(n) || self.covergroups.contains_key(n)
+                    || self.transactors.contains_key(n) || self.covergroups.contains_key(n)
                 {
                     return n.clone();
                 }
@@ -2652,12 +2596,11 @@ impl Emitter {
     /// True if a Named-type field on a component refers to a DUT module
     /// (i.e. nothing the codegen knows about other than that it's a
     /// Verilator-compiled module type). Sub-components / scoreboards /
-    /// monitors / covergroups are excluded — they're held by-value.
+    /// transactors / covergroups are excluded — they're held by-value.
     fn is_dut_pointer_field_type(&self, t: &TypeExpr) -> bool {
         if let Some(name) = type_simple_name(Some(t)) {
             return !self.transactions.contains(name)
                 && !self.scoreboards.contains(name)
-                && !self.monitors.contains_key(name)
                 && !self.covergroups.contains_key(name)
                 && !self.components.contains_key(name)
                 && !self.transactors.contains_key(name)
@@ -3920,49 +3863,11 @@ impl Emitter {
                     ));
                     return;
                 }
-                // Bound monitor: `let mon : MonName = bind axil` for a
-                // `monitor MonName bound to BusType`. Each `on
-                // bus.<ch>.handshake(arg)` handler in the monitor
-                // becomes its own coroutine actor that fires once per
-                // valid+ready cycle on the channel. Other handler
-                // shapes (event subscribers, cycle triggers) fall
-                // through to the existing sync path.
-                if let Some(mon) = self.monitors.get(simple).cloned() {
-                    if let Some(bus_ty) = &mon.bound_to {
-                        if let Some(v) = &l.value {
-                            if let ExprKind::Ident(rhs) = &*v.kind {
-                                if let Some(binding) = self.bus_bindings.get(&rhs.name).cloned() {
-                                    let want = type_simple_name(Some(bus_ty));
-                                    if want != Some(binding.0.name.name.as_str()) {
-                                        self.errors.push(format!(
-                                            "let {} : {} = bind {}: monitor is bound to `{}`, but `{}` is a `{}`",
-                                            l.name.name, simple, rhs.name,
-                                            want.unwrap_or("?"),
-                                            rhs.name, binding.0.name.name,
-                                        ));
-                                    }
-                                    self.pad(depth);
-                                    writeln!(self.out, "{simple} {};", l.name.name).ok();
-                                    self.emit_bound_monitor_actors(
-                                        &mon, &l.name.name, depth, &binding,
-                                    );
-                                    return;
-                                } else {
-                                    self.errors.push(format!(
-                                        "let {} : {} = bind {}: `{}` is not a known bus binding",
-                                        l.name.name, simple, rhs.name, rhs.name,
-                                    ));
-                                    return;
-                                }
-                            }
-                        }
-                        self.errors.push(format!(
-                            "let {} : {} = bind <expr>: rhs must be a bare bus-binding name in v0",
-                            l.name.name, simple,
-                        ));
-                        return;
-                    }
-                }
+                // (Legacy bound `monitor MonName` instantiation path
+                // is removed — `monitor` construct retired in PR-B.
+                // Observation handlers live in transactor always-on
+                // bodies, lowered via the synth ComponentDecl path
+                // above.)
                 if let Some(comp) = self.components.get(simple).cloned() {
                     if let Some(bus_ty) = &comp.bound_to {
                         // The rhs must name an existing bus binding (a
@@ -4065,19 +3970,14 @@ impl Emitter {
             writeln!(self.out, ";").ok();
         } else if let Some(t) = &l.ty {
             self.pad(depth);
-            // No initializer. Transactions / scoreboards / monitors all
-            // default-construct (their struct field defaults run). Monitors
-            // additionally trigger `on`-handler registration into _checkers
-            // — see emit_monitor_handler_registrations.
+            // No initializer. Transactions / scoreboards default-
+            // construct (their struct field defaults run). Transactors
+            // additionally register `on`-handlers (see the unbound-
+            // transactor arm below).
             let simple = type_simple_name(Some(t));
             if let Some(name) = simple {
                 if self.transactions.contains(name) || self.scoreboards.contains(name) {
                     writeln!(self.out, "{name} {};", l.name.name).ok();
-                    return;
-                }
-                if let Some(mon) = self.monitors.get(name).cloned() {
-                    writeln!(self.out, "{name} {};", l.name.name).ok();
-                    self.emit_monitor_handler_registrations(&mon, &l.name.name, depth);
                     return;
                 }
                 // Unbound transactor: `let xact : T mode` for a
