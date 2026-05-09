@@ -58,5 +58,12 @@ copy tests/mac_table.sv                mac_table.sv
 copy tests/noc_credit/noc_credit.sv    noc_credit.sv
 copy tests/if_wait_for_in_then.sv      if_wait_for_in_then.sv
 copy tests/inst_vec_port_regression.sv inst_vec_port_regression.sv
+copy tests/buf_mgr_sm/buf_mgr_sm.sv         buf_mgr_sm.sv
+copy tests/buf_mgr_sm/data_mem_sm.sv        data_mem_sm.sv
+copy tests/buf_mgr_sm/free_list_mem_sm.sv   free_list_mem_sm.sv
+copy tests/buf_mgr_sm/next_ptr_mem_sm.sv    next_ptr_mem_sm.sv
+copy tests/aes/aes_cipher_top.sv       aes_cipher_top.sv
+copy tests/aes/aes_key_expand_128.sv   aes_key_expand_128.sv
+copy tests/aes/xtime.sv                xtime.sv
 
 echo "Done."
