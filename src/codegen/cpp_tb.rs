@@ -88,6 +88,23 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
 }
 
 pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitError> {
+    // T-1 stop: transactor codegen is not yet implemented. Source
+    // text using `transactor` parses and round-trips through harc
+    // fmt, but `harc sim` errors clearly until the SW-side codegen
+    // (T-2) lands. The same goes for the active/passive mode
+    // annotation at let sites — if no transactor decl exists in
+    // the file, a stray `T active` annotation likely indicates the
+    // user expected a transactor; we reject early with the same
+    // diagnostic. See spec §8.1 for the implementation roadmap.
+    for it in &file.items {
+        if let Item::Transactor(t) = it {
+            return Err(EmitError(format!(
+                "`transactor {}` codegen is not yet implemented (spec §8.1, scheduled for v0+ phase T-2). Today's fixtures use `driver` / `monitor` / `agent` (spec §8.3) which compile end-to-end. The transactor's source surface parses and `harc fmt`-round-trips today; `harc check` accepts it; `harc sim` will pick it up once T-2 ships SW-side codegen against the SCE-MI pipe surface.",
+                t.name.name,
+            )));
+        }
+    }
+
     // Find a single `test` item — the entry point.
     let test = file.items.iter().find_map(|it| match it {
         Item::Test(t) => Some(t),

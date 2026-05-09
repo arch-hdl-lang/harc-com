@@ -1,0 +1,64 @@
+// Round-trip parse fixture for `transactor` (T-1). Codegen
+// stops with a clear "not yet implemented" error from `harc sim`
+// — that's deliberate. This fixture only exists to validate that
+// the source surface from spec §8.1 parses cleanly and round-
+// trips through `harc fmt`. T-2 lands the SW-side codegen.
+//
+// NOT in tests/run_fixtures.sh — `harc check` (parse-only) covers
+// it; `harc sim` would error.
+
+use BusAxiLite
+
+transaction RegOp
+    addr  : uint<8>
+    value : uint<32>
+end transaction RegOp
+
+transaction Completion
+    resp : uint<2>
+end transaction Completion
+
+transactor AxilXactor bound to BusAxiLite
+    // Always-present body — synthesized in both modes.
+    completed : out event<Completion>
+
+    on bus.b.handshake(b)
+        let c : Completion
+        c.resp = b.resp
+        emit completed(c)
+    end on
+
+    on bus.r.handshake(r)
+        let c : Completion
+        c.resp = r.resp
+        emit completed(c)
+    end on
+
+    // Active-only body — synthesized when ACTIVE=1.
+    when active
+        req : in event<RegOp>
+
+        on req(t)
+            bus.aw.addr = t.addr
+            bus.aw.valid = 1
+            bus.w.send(t.value, 15)
+            bus.aw.valid = 0
+            wait 2 cycles
+        end on
+    end when
+end transactor AxilXactor
+
+test TransactorParseTest
+    let dut  : AxiLiteRegs
+    let axil : BusAxiLite = bind dut
+    let drv  : AxilXactor active  = bind axil
+    let obs  : AxilXactor passive = bind axil
+
+    scope sim
+        run
+            // Body intentionally minimal — codegen errors before this
+            // point in T-1, so the run body just needs to parse.
+            wait 1 cycle
+        end run
+    end scope sim
+end test TransactorParseTest
