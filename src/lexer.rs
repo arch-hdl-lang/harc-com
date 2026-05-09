@@ -174,15 +174,13 @@ pub enum TokenKind {
     Agent,
     #[token("env")]
     Env,
-    #[token("driver")]
-    Driver,
-    #[token("monitor")]
-    Monitor,
-    /// Transactor — synthesizable BFM combining driver + monitor under
-    /// one roof (spec §8.1). Distinct from `driver`/`monitor` so the
-    /// parser can dispatch the right body grammar (which permits a
-    /// `when active` block) and the codegen knows to emit the SCE-MI
-    /// pipe surface + ARCH-side module rather than a plain SW lambda.
+    /// Transactor — synthesizable BFM declaration (spec §8.1).
+    /// Subsumes the legacy `driver`/`monitor` constructs (removed in
+    /// PR-B): the always-present body holds the observation half plus
+    /// shared protocol state, the optional `when active` block holds
+    /// the stimulus half. Mode subtyping at instantiation
+    /// (`let xact : T active = bind axil`) selects which body is
+    /// synthesized.
     #[token("transactor")]
     Transactor,
     /// Mode tokens for transactor instantiation (`let xact : T active
@@ -545,8 +543,6 @@ impl fmt::Display for TokenKind {
             Transaction => write!(f, "transaction"),
             Agent => write!(f, "agent"),
             Env => write!(f, "env"),
-            Driver => write!(f, "driver"),
-            Monitor => write!(f, "monitor"),
             Transactor => write!(f, "transactor"),
             Active => write!(f, "active"),
             Passive => write!(f, "passive"),
@@ -706,16 +702,15 @@ mod tests {
 
     #[test]
     fn keywords_lex() {
-        let src = "transaction agent env driver monitor scoreboard tseq pseq";
+        let src = "transaction agent env transactor scoreboard tseq pseq";
         let toks = tokenize(src).unwrap();
         assert_eq!(toks[0].kind, TokenKind::Transaction);
         assert_eq!(toks[1].kind, TokenKind::Agent);
         assert_eq!(toks[2].kind, TokenKind::Env);
-        assert_eq!(toks[3].kind, TokenKind::Driver);
-        assert_eq!(toks[4].kind, TokenKind::Monitor);
-        assert_eq!(toks[5].kind, TokenKind::Scoreboard);
-        assert_eq!(toks[6].kind, TokenKind::Tseq);
-        assert_eq!(toks[7].kind, TokenKind::Pseq);
+        assert_eq!(toks[3].kind, TokenKind::Transactor);
+        assert_eq!(toks[4].kind, TokenKind::Scoreboard);
+        assert_eq!(toks[5].kind, TokenKind::Tseq);
+        assert_eq!(toks[6].kind, TokenKind::Pseq);
     }
 
     #[test]

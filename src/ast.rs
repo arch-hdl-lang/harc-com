@@ -42,8 +42,6 @@ pub enum Item {
     Relation(RelationDecl),
     Tseq(TseqDecl),
     Agent(ComponentDecl),
-    Driver(ComponentDecl),
-    Monitor(ComponentDecl),
     Env(ComponentDecl),
     Scoreboard(ComponentDecl),
     Sequencer(ComponentDecl),
@@ -243,27 +241,35 @@ pub struct TseqDecl {
     pub doc: Option<String>,
 }
 
-// ── Component declarations (agent, driver, monitor, env, scoreboard, sequencer)
+// ── Component declarations (agent, env, scoreboard, sequencer)
+//
+// `transactor` (spec §8.1) is a sibling top-level Item but lowers
+// through ComponentDecl-shaped structures internally; the synthetic
+// ComponentDecl carries `ComponentKind::Transactor` so existing
+// component codegen paths can still discriminate when needed (e.g.
+// for tag prefixes in registration sites).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComponentKind {
     Agent,
-    Driver,
-    Monitor,
     Env,
     Scoreboard,
     Sequencer,
+    /// Synthesizable BFM unit. No top-level `Item::Transactor`-style
+    /// parsing path uses this directly; instead, the codegen layer
+    /// tags a synth ComponentDecl built from a `TransactorDecl` with
+    /// this kind so the rest of the pipeline can identify it.
+    Transactor,
 }
 
 impl ComponentKind {
     pub fn keyword(self) -> &'static str {
         match self {
             ComponentKind::Agent => "agent",
-            ComponentKind::Driver => "driver",
-            ComponentKind::Monitor => "monitor",
             ComponentKind::Env => "env",
             ComponentKind::Scoreboard => "scoreboard",
             ComponentKind::Sequencer => "sequencer",
+            ComponentKind::Transactor => "transactor",
         }
     }
 }

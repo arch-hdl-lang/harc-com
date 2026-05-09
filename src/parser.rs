@@ -237,8 +237,6 @@ impl Parser {
             Some(TokenKind::Relation) => self.parse_relation(doc).map(Item::Relation),
             Some(TokenKind::Tseq) => self.parse_tseq(doc).map(Item::Tseq),
             Some(TokenKind::Agent) => self.parse_component(ComponentKind::Agent, doc).map(Item::Agent),
-            Some(TokenKind::Driver) => self.parse_component(ComponentKind::Driver, doc).map(Item::Driver),
-            Some(TokenKind::Monitor) => self.parse_component(ComponentKind::Monitor, doc).map(Item::Monitor),
             Some(TokenKind::Env) => self.parse_component(ComponentKind::Env, doc).map(Item::Env),
             Some(TokenKind::Scoreboard) => self.parse_component(ComponentKind::Scoreboard, doc).map(Item::Scoreboard),
             Some(TokenKind::Sequencer) => self.parse_component(ComponentKind::Sequencer, doc).map(Item::Sequencer),
@@ -266,7 +264,7 @@ impl Parser {
             Some(TokenKind::Apply) => self.parse_apply().map(Item::Apply),
             Some(TokenKind::Bus) => self.parse_bus(doc).map(Item::Bus),
             Some(other) => Err(CompileError::unexpected_token(
-                "use, package, const, struct, enum, transaction, relation, tseq, agent, driver, monitor, env, scoreboard, sequencer, test, extend, covergroup, property, pseq, cover sequence, module, function, or apply",
+                "use, package, const, struct, enum, transaction, relation, tseq, agent, env, scoreboard, sequencer, transactor, test, extend, covergroup, property, pseq, cover sequence, module, function, or apply",
                 &other.to_string(),
                 self.peek_span(),
             )),
@@ -618,11 +616,13 @@ impl Parser {
     fn parse_component(&mut self, kind: ComponentKind, doc: Option<String>) -> Result<ComponentDecl, CompileError> {
         let start_kw = match kind {
             ComponentKind::Agent => TokenKind::Agent,
-            ComponentKind::Driver => TokenKind::Driver,
-            ComponentKind::Monitor => TokenKind::Monitor,
             ComponentKind::Env => TokenKind::Env,
             ComponentKind::Scoreboard => TokenKind::Scoreboard,
             ComponentKind::Sequencer => TokenKind::Sequencer,
+            ComponentKind::Transactor => unreachable!(
+                "ComponentKind::Transactor is a synthetic codegen-only kind; \
+                 transactors enter the parser via parse_transactor, not parse_component"
+            ),
         };
         let start = self.expect(start_kw.clone())?.span;
         let name = self.expect_ident()?;
@@ -2397,8 +2397,6 @@ fn soft_keyword_to_ident(t: &TokenKind) -> Option<&'static str> {
     Some(match t {
         TokenKind::Env => "env",
         TokenKind::Agent => "agent",
-        TokenKind::Driver => "driver",
-        TokenKind::Monitor => "monitor",
         TokenKind::Sequencer => "sequencer",
         TokenKind::Scoreboard => "scoreboard",
         TokenKind::Bus => "bus",
