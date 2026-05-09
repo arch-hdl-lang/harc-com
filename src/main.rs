@@ -274,7 +274,16 @@ fn run_verilator(
         // C++20 is required by `harc_thread_rt.h`'s `<coroutine>`
         // includes and our `co_await`-based `wait_cycles` /
         // `wait_until` lowerings.
-        "-MAKEFLAGS".into(), "CFG_CXXFLAGS_STD=-std=gnu++20".into(),
+        //
+        // Optimization level stays at verilator's `-Os` default for
+        // the DUT (fast simulation). The emitted test `.cpp` opts
+        // out via `#pragma clang optimize off` at the top of the
+        // file — clang 17 on Apple Silicon mis-optimizes our lambda
+        // coroutines at `-Os` / `-O2` (closure reference members fold
+        // against a freed stack frame after suspension, SEGV on
+        // resume). Per-file pragma keeps DUT eval fast.
+        "-MAKEFLAGS".into(),
+        "CFG_CXXFLAGS_STD=-std=gnu++20".into(),
     ];
     // Make the build dir an include path so the emitted `.cpp`'s
     // `#include "harc_thread_rt.h"` resolves — verilator builds in
