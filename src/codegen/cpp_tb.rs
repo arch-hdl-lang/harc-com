@@ -684,15 +684,24 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // capture them. Empty vectors are no-ops; the wrap is unconditional.
     let mut emitted_any_method = false;
     for it in &file.items {
-        let c = match it {
+        match it {
             Item::Driver(c) | Item::Agent(c) | Item::Env(c)
-            | Item::Sequencer(c) | Item::Scoreboard(c) => c,
-            _ => continue,
-        };
-        for ci in &c.items {
-            if let ComponentItem::Hookable(h) = ci {
-                e.emit_hook_vectors(c, h, 1);
+            | Item::Sequencer(c) | Item::Scoreboard(c) => {
+                for ci in &c.items {
+                    if let ComponentItem::Hookable(h) = ci {
+                        e.emit_hook_vectors(c, h, 1);
+                    }
+                }
             }
+            Item::Transactor(t) => {
+                let synth = synth_component_from_transactor(t, /*include_active*/true);
+                for ci in &synth.items {
+                    if let ComponentItem::Hookable(h) = ci {
+                        e.emit_hook_vectors(&synth, h, 1);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     // Pre-scan: register test-scope bus bindings (`let axil :
@@ -726,16 +735,17 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         if let TestItem::Let(l) = it {
             if l.bind {
                 if let Some(simple) = type_simple_name(l.ty.as_ref()) {
-                    if let Some(comp) = e.components.get(simple).cloned() {
-                        if comp.bound_to.is_some() {
-                            if let Some(v) = &l.value {
-                                if let ExprKind::Ident(rhs) = &*v.kind {
-                                    if let Some(binding) = e.bus_bindings.get(&rhs.name).cloned() {
-                                        // First binding wins; multi-instance is deferred.
-                                        e.driver_bus_for_hookables
-                                            .entry(simple.to_string())
-                                            .or_insert(binding);
-                                    }
+                    let bound_decl_to_bus =
+                        e.components.get(simple).and_then(|c| c.bound_to.as_ref().map(|_| ())).is_some()
+                        || e.transactors.get(simple).and_then(|t| t.bound_to.as_ref().map(|_| ())).is_some();
+                    if bound_decl_to_bus {
+                        if let Some(v) = &l.value {
+                            if let ExprKind::Ident(rhs) = &*v.kind {
+                                if let Some(binding) = e.bus_bindings.get(&rhs.name).cloned() {
+                                    // First binding wins; multi-instance is deferred.
+                                    e.driver_bus_for_hookables
+                                        .entry(simple.to_string())
+                                        .or_insert(binding);
                                 }
                             }
                         }
@@ -745,17 +755,35 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         }
     }
 
+    // Hookable methods on regular components (driver/agent/env/
+    // sequencer/scoreboard) plus transactors. Transactor hookables
+    // are emitted via the synth ComponentDecl so the existing
+    // emit_component_method path finds the same struct shape.
     for it in &file.items {
-        let c = match it {
+        match it {
             Item::Driver(c) | Item::Agent(c) | Item::Env(c)
-            | Item::Sequencer(c) | Item::Scoreboard(c) => c,
-            _ => continue,
-        };
-        for ci in &c.items {
-            if let ComponentItem::Hookable(h) = ci {
-                e.emit_component_method(c, h, 1);
-                emitted_any_method = true;
+            | Item::Sequencer(c) | Item::Scoreboard(c) => {
+                for ci in &c.items {
+                    if let ComponentItem::Hookable(h) = ci {
+                        e.emit_component_method(c, h, 1);
+                        emitted_any_method = true;
+                    }
+                }
             }
+            Item::Transactor(t) => {
+                // include_active = true so any hookable inside `when
+                // active` is also emitted. Active-only hookables on a
+                // passive instance still compile but won't be invoked
+                // at runtime (no input event firing).
+                let synth = synth_component_from_transactor(t, /*include_active*/true);
+                for ci in &synth.items {
+                    if let ComponentItem::Hookable(h) = ci {
+                        e.emit_component_method(&synth, h, 1);
+                        emitted_any_method = true;
+                    }
+                }
+            }
+            _ => {}
         }
     }
     if emitted_any_method {
@@ -2305,13 +2333,23 @@ impl Emitter {
             }
             None
         };
+        let find_method_in_transactor = |t: &TransactorDecl, m: &str| -> Option<Vec<Param>> {
+            let synth = synth_component_from_transactor(t, /*include_active*/true);
+            find_method(&synth, m)
+        };
 
         // <ident>.<method>
         if let ExprKind::Ident(id) = &*target.kind {
-            let comp_ty = self.let_types.get(&id.name)?;
-            let comp = self.components.get(comp_ty)?;
-            let params = find_method(comp, &method.name)?;
-            return Some((comp_ty.clone(), method.name.clone(), params));
+            let ty_name = self.let_types.get(&id.name)?;
+            if let Some(comp) = self.components.get(ty_name) {
+                let params = find_method(comp, &method.name)?;
+                return Some((ty_name.clone(), method.name.clone(), params));
+            }
+            if let Some(t) = self.transactors.get(ty_name) {
+                let params = find_method_in_transactor(t, &method.name)?;
+                return Some((ty_name.clone(), method.name.clone(), params));
+            }
+            return None;
         }
 
         // <ident>.<sub>.<method>
@@ -2327,9 +2365,15 @@ impl Emitter {
                 }
                 None
             })?;
-            let sub_comp = self.components.get(sub_ty)?;
-            let params = find_method(sub_comp, &method.name)?;
-            return Some((sub_ty.to_string(), method.name.clone(), params));
+            if let Some(sub_comp) = self.components.get(sub_ty) {
+                let params = find_method(sub_comp, &method.name)?;
+                return Some((sub_ty.to_string(), method.name.clone(), params));
+            }
+            if let Some(t) = self.transactors.get(sub_ty) {
+                let params = find_method_in_transactor(t, &method.name)?;
+                return Some((sub_ty.to_string(), method.name.clone(), params));
+            }
+            return None;
         }
         None
     }
@@ -2352,13 +2396,23 @@ impl Emitter {
                 it, ComponentItem::Hookable(h) if h.name.name == m
             ))
         };
+        let xact_has_method = |t: &TransactorDecl, m: &str| -> bool {
+            let synth = synth_component_from_transactor(t, /*include_active*/true);
+            comp_has_method(&synth, m)
+        };
 
         // <ident>.<method>
         if let ExprKind::Ident(id) = &*target.kind {
-            let comp_ty = self.let_types.get(&id.name)?;
-            let comp = self.components.get(comp_ty)?;
-            if comp_has_method(comp, &method.name) {
-                return Some((comp_ty.clone(), id.name.clone(), method.name.clone()));
+            let ty_name = self.let_types.get(&id.name)?;
+            if let Some(comp) = self.components.get(ty_name) {
+                if comp_has_method(comp, &method.name) {
+                    return Some((ty_name.clone(), id.name.clone(), method.name.clone()));
+                }
+            }
+            if let Some(t) = self.transactors.get(ty_name) {
+                if xact_has_method(t, &method.name) {
+                    return Some((ty_name.clone(), id.name.clone(), method.name.clone()));
+                }
             }
             return None;
         }
@@ -2376,13 +2430,23 @@ impl Emitter {
                 }
                 None
             })?;
-            let sub_comp = self.components.get(sub_ty)?;
-            if comp_has_method(sub_comp, &method.name) {
-                return Some((
-                    sub_ty.to_string(),
-                    format!("{}.{}", id.name, sub.name),
-                    method.name.clone(),
-                ));
+            if let Some(sub_comp) = self.components.get(sub_ty) {
+                if comp_has_method(sub_comp, &method.name) {
+                    return Some((
+                        sub_ty.to_string(),
+                        format!("{}.{}", id.name, sub.name),
+                        method.name.clone(),
+                    ));
+                }
+            }
+            if let Some(t) = self.transactors.get(sub_ty) {
+                if xact_has_method(t, &method.name) {
+                    return Some((
+                        sub_ty.to_string(),
+                        format!("{}.{}", id.name, sub.name),
+                        method.name.clone(),
+                    ));
+                }
             }
         }
         None
@@ -2596,6 +2660,7 @@ impl Emitter {
                 && !self.monitors.contains_key(name)
                 && !self.covergroups.contains_key(name)
                 && !self.components.contains_key(name)
+                && !self.transactors.contains_key(name)
                 && !self.enums.contains_key(name);
         }
         false
@@ -3756,75 +3821,97 @@ impl Emitter {
                         Some(TypeExpr::Named { mode: Some(m), .. }) => *m,
                         _ => {
                             self.errors.push(format!(
-                                "let {} : {} = bind ...: transactor instantiation requires a mode annotation (`{} active` or `{} passive`)",
-                                l.name.name, simple, simple, simple,
+                                "let {}: transactor instantiation requires a mode annotation (`{} active` or `{} passive`)",
+                                l.name.name, simple, simple,
                             ));
                             return;
                         }
                     };
-                    let bus_ty = match &t.bound_to {
-                        Some(b) => b.clone(),
-                        None => {
-                            self.errors.push(format!(
-                                "transactor `{}` has no `bound to BusType` clause; cannot instantiate",
-                                simple,
-                            ));
-                            return;
-                        }
-                    };
-                    if let Some(v) = &l.value {
-                        if let ExprKind::Ident(rhs) = &*v.kind {
-                            if let Some(binding) = self.bus_bindings.get(&rhs.name).cloned() {
-                                let want = type_simple_name(Some(&bus_ty));
-                                if want != Some(binding.0.name.name.as_str()) {
-                                    self.errors.push(format!(
-                                        "let {} : {} = bind {}: transactor is bound to `{}`, but `{}` is a `{}`",
-                                        l.name.name, simple, rhs.name,
-                                        want.unwrap_or("?"),
-                                        rhs.name, binding.0.name.name,
-                                    ));
-                                }
-                                self.pad(depth);
-                                writeln!(self.out, "{simple} {};", l.name.name).ok();
+                    let include_active = matches!(mode, TransactorMode::Active);
+                    let synth = synth_component_from_transactor(&t, include_active);
 
-                                // Synthesize a ComponentDecl. For
-                                // `active`, include the `when active`
-                                // items so the existing driver-actor
-                                // path finds the input event +
-                                // matching `on req(t)` handler. For
-                                // `passive`, only the always-present
-                                // items — no driver actor spawns,
-                                // emit/connect to `req` becomes a
-                                // no-op (no subscriber registered).
-                                let include_active = matches!(mode, TransactorMode::Active);
-                                let synth = synth_component_from_transactor(&t, include_active);
+                    // Four shapes:
+                    //   bound transactor + `= bind axil`  → bus-actor path
+                    //   bound transactor + no value       → error
+                    //   unbound transactor + no value     → handler-registration path (same as plain driver/agent)
+                    //   unbound transactor + `= bind axil`→ error
+                    match (&t.bound_to, &l.value) {
+                        (Some(bus_ty), Some(v)) => {
+                            if let ExprKind::Ident(rhs) = &*v.kind {
+                                if let Some(binding) = self.bus_bindings.get(&rhs.name).cloned() {
+                                    let want = type_simple_name(Some(bus_ty));
+                                    if want != Some(binding.0.name.name.as_str()) {
+                                        self.errors.push(format!(
+                                            "let {} : {} = bind {}: transactor is bound to `{}`, but `{}` is a `{}`",
+                                            l.name.name, simple, rhs.name,
+                                            want.unwrap_or("?"),
+                                            rhs.name, binding.0.name.name,
+                                        ));
+                                    }
+                                    self.pad(depth);
+                                    writeln!(self.out, "{simple} {};", l.name.name).ok();
 
-                                // Driver-actor path only fires for
-                                // active mode (passive synth has no
-                                // input event field, so it would
-                                // bail anyway — but skipping the
-                                // call is cleaner).
-                                if include_active {
-                                    self.try_emit_bound_driver_actor(
+                                    // Driver-actor path only fires for
+                                    // active mode (passive synth has no
+                                    // input event field, so it would
+                                    // bail anyway — but skipping the
+                                    // call is cleaner).
+                                    if include_active {
+                                        self.try_emit_bound_driver_actor(
+                                            &synth, &l.name.name, depth, &binding,
+                                        );
+                                    }
+                                    // Monitor-actor path: handshake
+                                    // handlers in the always-present
+                                    // body always fire, regardless of
+                                    // mode. This is the observation
+                                    // half of the transactor.
+                                    self.emit_bound_monitor_actors(
                                         &synth, &l.name.name, depth, &binding,
                                     );
+                                    return;
+                                } else {
+                                    self.errors.push(format!(
+                                        "let {} : {} = bind {}: `{}` is not a known bus binding",
+                                        l.name.name, simple, rhs.name, rhs.name,
+                                    ));
+                                    return;
                                 }
-                                // Monitor-actor path: handshake
-                                // handlers in the always-present
-                                // body always fire, regardless of
-                                // mode. This is the observation
-                                // half of the transactor.
-                                self.emit_bound_monitor_actors(
-                                    &synth, &l.name.name, depth, &binding,
-                                );
-                                return;
-                            } else {
-                                self.errors.push(format!(
-                                    "let {} : {} = bind {}: `{}` is not a known bus binding",
-                                    l.name.name, simple, rhs.name, rhs.name,
-                                ));
-                                return;
                             }
+                        }
+                        (None, None) => {
+                            // Unbound transactor: default-construct
+                            // the struct, then walk the synth
+                            // ComponentDecl to wire up `on`-handler
+                            // subscribers. Same path as plain
+                            // `driver`/`agent` instantiation. No bus
+                            // actor coroutines spawn — the active
+                            // half drives raw DUT signals (or
+                            // sideband), reacting to `emit
+                            // xact.req(t)` events from the test
+                            // scope. The passive half observes via
+                            // event-typed `on` handlers if present.
+                            self.pad(depth);
+                            writeln!(self.out, "{simple} {};", l.name.name).ok();
+                            let tag = format!("_xactor_{}_", l.name.name);
+                            self.emit_component_handler_registrations(
+                                &synth, &l.name.name, depth, &tag,
+                            );
+                            return;
+                        }
+                        (Some(_), None) => {
+                            self.errors.push(format!(
+                                "let {} : {}: transactor `{}` has a `bound to` clause; instantiation requires `= bind <bus>`",
+                                l.name.name, simple, simple,
+                            ));
+                            return;
+                        }
+                        (None, Some(_)) => {
+                            self.errors.push(format!(
+                                "let {} : {} = bind ...: transactor `{}` has no `bound to` clause; remove the `= bind` clause",
+                                l.name.name, simple, simple,
+                            ));
+                            return;
                         }
                     }
                     self.errors.push(format!(
@@ -3991,6 +4078,41 @@ impl Emitter {
                 if let Some(mon) = self.monitors.get(name).cloned() {
                     writeln!(self.out, "{name} {};", l.name.name).ok();
                     self.emit_monitor_handler_registrations(&mon, &l.name.name, depth);
+                    return;
+                }
+                // Unbound transactor: `let xact : T mode` for a
+                // `transactor T` declared without `bound to BusType`.
+                // Same lowering as plain `driver`/`agent` instantiation —
+                // default-construct the struct, then walk the synth
+                // ComponentDecl to register `on`-handler subscribers.
+                // The active half drives raw DUT signals (or sideband)
+                // reacting to `emit xact.req(t)`; the passive half (if
+                // present) observes via event-typed `on` handlers.
+                if let Some(t) = self.transactors.get(name).cloned() {
+                    let mode = match l.ty.as_ref() {
+                        Some(TypeExpr::Named { mode: Some(m), .. }) => *m,
+                        _ => {
+                            self.errors.push(format!(
+                                "let {}: transactor instantiation requires a mode annotation (`{} active` or `{} passive`)",
+                                l.name.name, name, name,
+                            ));
+                            return;
+                        }
+                    };
+                    if t.bound_to.is_some() {
+                        self.errors.push(format!(
+                            "let {} : {}: transactor `{}` has a `bound to` clause; instantiation requires `= bind <bus>`",
+                            l.name.name, name, name,
+                        ));
+                        return;
+                    }
+                    let include_active = matches!(mode, TransactorMode::Active);
+                    let synth = synth_component_from_transactor(&t, include_active);
+                    writeln!(self.out, "{name} {};", l.name.name).ok();
+                    let tag = format!("_xactor_{}_", l.name.name);
+                    self.emit_component_handler_registrations(
+                        &synth, &l.name.name, depth, &tag,
+                    );
                     return;
                 }
                 if let Some(comp) = self.components.get(name).cloned() {
