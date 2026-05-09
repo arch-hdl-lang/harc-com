@@ -1,0 +1,168 @@
+// HARC port of arch-com/tests/cam_dual_basic_tb.cpp.
+//
+// Mshr_Addr_Cam_Dual is a CAM variant with two write ports. Both can
+// fire in the same cycle; if they target the same index, port 2 wins
+// (last-write semantics). The C++ TB exercises the four interesting
+// port-2 scenarios plus reset clearing.
+//
+// The C++ TB pokes signals directly with no events, so the HARC port
+// uses a passive transactor with hookable methods — write1, write2,
+// write_both for the two-port concurrency cases, plus reset_dut.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor CamDualXactor
+    dut : Mshr_Addr_Cam_Dual
+
+    // Drive a single-cycle write on port 1 only.
+    hookable write1(idx: uint<4>, key: uint<8>, set: bool)
+        dut.write_valid = 1
+        dut.write_idx = idx
+        dut.write_key = key
+        dut.write_set = set
+        dut.write2_valid = 0
+        wait 1 cycle
+        dut.write_valid = 0
+        dut.write2_valid = 0
+    end write1
+
+    // Drive a single-cycle write on port 2 only.
+    hookable write2(idx: uint<4>, key: uint<8>, set: bool)
+        dut.write_valid = 0
+        dut.write2_valid = 1
+        dut.write2_idx = idx
+        dut.write2_key = key
+        dut.write2_set = set
+        wait 1 cycle
+        dut.write_valid = 0
+        dut.write2_valid = 0
+    end write2
+
+    // Drive both ports in the same cycle (concurrency / conflict cases).
+    hookable write_both(idx1: uint<4>, key1: uint<8>, set1: bool,
+                        idx2: uint<4>, key2: uint<8>, set2: bool)
+        dut.write_valid = 1
+        dut.write_idx = idx1
+        dut.write_key = key1
+        dut.write_set = set1
+        dut.write2_valid = 1
+        dut.write2_idx = idx2
+        dut.write2_key = key2
+        dut.write2_set = set2
+        wait 1 cycle
+        dut.write_valid = 0
+        dut.write2_valid = 0
+    end write_both
+
+    // Reset pulse — matches the C++ TB's do_reset(): two ticks asserted,
+    // one tick deasserted.
+    hookable reset_dut()
+        dut.rst = 1
+        dut.write_valid = 0
+        dut.write2_valid = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+    end reset_dut
+end transactor CamDualXactor
+
+test CamDualBasicTest
+    let dut  : Mshr_Addr_Cam_Dual
+    let xact : CamDualXactor passive
+
+    clock clk = SysDomain
+
+    scope sim
+        run
+            log(info, "Mshr_Addr_Cam_Dual dual-write port CAM test")
+            xact.dut = dut
+
+            // ── Reset ─────────────────────────────────────────────
+            xact.reset_dut()
+            // Yield once so the scheduler has a suspension point before
+            // any comb-input-then-assert sequence below — otherwise the
+            // first such assert would read a stale eval (the hookable's
+            // internal `wait` calls advance the clock synchronously and
+            // don't suspend the run coroutine).
+            wait 1 cycle
+
+            // ── 1. Only port 1: insert (idx 2, key 0x11) ──────────
+            xact.write1(2, 17, true)                // 0x11
+            dut.search_key = 17
+            wait 1 cycle
+            assert dut.search_any == 1
+                else fail("port1-only: search_any=${dut.search_any}, expected 1")
+            assert dut.search_first == 2
+                else fail("port1-only: first=${dut.search_first}, expected 2")
+            log(info, "PASS: port1-only insert at idx 2")
+
+            // ── 2. Only port 2: insert (idx 5, key 0x22) ──────────
+            xact.write2(5, 34, true)                // 0x22
+            dut.search_key = 34
+            wait 1 cycle
+            assert dut.search_any == 1
+                else fail("port2-only: search_any=${dut.search_any}, expected 1")
+            assert dut.search_first == 5
+                else fail("port2-only: first=${dut.search_first}, expected 5")
+            log(info, "PASS: port2-only insert at idx 5")
+
+            // ── 3. Both fire, different indices: both commit ──────
+            // p1: (idx 7, 0x33), p2: (idx 9, 0x44)
+            xact.write_both(7, 51, true, 9, 68, true)
+            dut.search_key = 51                     // 0x33
+            wait 1 cycle
+            assert dut.search_any == 1
+                else fail("concurrent w1: search_any=${dut.search_any}, expected 1")
+            assert dut.search_first == 7
+                else fail("concurrent w1: first=${dut.search_first}, expected 7")
+
+            dut.search_key = 68                     // 0x44
+            wait 1 cycle
+            assert dut.search_any == 1
+                else fail("concurrent w2: search_any=${dut.search_any}, expected 1")
+            assert dut.search_first == 9
+                else fail("concurrent w2: first=${dut.search_first}, expected 9")
+            log(info, "PASS: concurrent writes at different indices both commit")
+
+            // ── 4. Both fire, SAME index: port 2 wins ─────────────
+            // p1: idx 12 ← 0xAA, p2: idx 12 ← 0xBB. Search 0xBB hits,
+            // search 0xAA misses.
+            xact.write_both(12, 170, true, 12, 187, true)
+            dut.search_key = 187                    // 0xBB
+            wait 1 cycle
+            assert dut.search_any == 1
+                else fail("same-idx conflict (BB): search_any=${dut.search_any}, expected 1")
+            assert dut.search_first == 12
+                else fail("same-idx conflict (BB): first=${dut.search_first}, expected 12")
+
+            dut.search_key = 170                    // 0xAA
+            wait 1 cycle
+            assert dut.search_any == 0
+                else fail("same-idx conflict (AA): search_any=${dut.search_any}, expected 0")
+            log(info, "PASS: same-idx conflict: port 2 (0xBB) wins, port 1 (0xAA) loses")
+
+            // ── 5. Same-idx, p1 sets / p2 clears: clear wins ──────
+            // First plant a valid entry at idx 4 with key 0x55.
+            xact.write1(4, 85, true)                // 0x55
+            // Now p1 tries to re-set 0x66 at idx 4, p2 clears idx 4.
+            xact.write_both(4, 102, true, 4, 0, false)
+            dut.search_key = 102                    // 0x66
+            wait 1 cycle
+            assert dut.search_any == 0
+                else fail("same-idx set/clear: search_any=${dut.search_any}, expected 0 (clear wins)")
+            log(info, "PASS: same-idx set/clear: clear (port 2) wins")
+
+            // ── 6. Reset clears everything ────────────────────────
+            xact.reset_dut()
+            dut.search_key = 17                     // 0x11
+            wait 1 cycle
+            assert dut.search_any == 0
+                else fail("post-reset: search_any=${dut.search_any}, expected 0")
+            assert dut.search_mask == 0
+                else fail("post-reset: search_mask=${dut.search_mask}, expected 0")
+            log(info, "PASS: reset clears all valid bits")
+        end run
+    end scope sim
+end test CamDualBasicTest
