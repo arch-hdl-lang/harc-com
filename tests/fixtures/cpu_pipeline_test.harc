@@ -1,0 +1,272 @@
+// HARC port of arch-com/examples/cpu_pipeline_tb.cpp.
+//
+// CpuPipe is a 4-stage RISC-V-style pipeline:
+//   Fetch → Decode → Execute → Writeback
+//
+// Timing: an instruction fed at cycle N hits Writeback at N+3.
+//   Cycle N:   Fetch captures imem_data, latches pc=branch_target
+//   Cycle N+1: Decode reads Fetch.instr (opcode, rd) AND rs1_data/rs2_data
+//              ports — rs1_data/rs2_data must be valid through this cycle
+//   Cycle N+2: Execute computes alu_result = rs1_val + rs2_val,
+//              we = (opcode != 0)
+//   Cycle N+3: Writeback exposes wb_data, wb_rd, wb_we
+//
+// Stall: load-use hazard suppresses Decode advance when
+//   execute_we && execute_rd == fetch_instr[11:7] && execute_rd != 0
+// Tests use rd=0 throughout to avoid this.
+//
+// The HARC version groups the per-cycle signal poking into a small
+// passive transactor with two hookable methods (`feed` and
+// `feed_nop`), so each test reads as a sequence of intent-named
+// calls rather than 4 lines of `dut.* = ...` per cycle.
+
+transactor PipeXactor
+    dut : CpuPipe
+
+    // Drive a single-cycle instruction into Fetch + present register
+    // data. Caller still manages timing — this just sets the inputs
+    // for the upcoming cycle.
+    hookable feed(imem: uint<32>, rs1: uint<32>, rs2: uint<32>, target: uint<32>)
+        dut.imem_data = imem
+        dut.rs1_data = rs1
+        dut.rs2_data = rs2
+        dut.branch_target = target
+    end feed
+
+    // Bubble — drive zeros so any in-flight instruction in Decode/
+    // Execute keeps using its own latched data while Fetch sees a
+    // NOP.
+    hookable feed_nop()
+        dut.imem_data = 0
+        dut.rs1_data = 0
+        dut.rs2_data = 0
+    end feed_nop
+
+    // Hold register data without changing imem (e.g. across the
+    // Decode-read-rs1/rs2 cycle).
+    hookable feed_regs(rs1: uint<32>, rs2: uint<32>)
+        dut.rs1_data = rs1
+        dut.rs2_data = rs2
+    end feed_regs
+end transactor PipeXactor
+
+test CpuPipelineTest
+    let dut  : CpuPipe
+    let pipe : PipeXactor passive
+
+    scope sim
+        run
+            log(info, "CpuPipe 4-stage pipeline test")
+            pipe.dut = dut
+
+            // ── Test 1: Reset ──────────────────────────────────────
+            dut.rst = 1
+            dut.imem_valid = 1
+            dut.branch_taken = 0
+            dut.branch_target = 0
+            pipe.feed_nop()
+            wait 3 cycles
+            assert dut.wb_data == 0
+                else fail("Test 1: wb_data=0 expected, got 0x${dut.wb_data:08x}")
+            assert dut.wb_we == 0
+                else fail("Test 1: wb_we=0 expected, got ${dut.wb_we}")
+            assert dut.pc_out == 0
+                else fail("Test 1: pc_out=0 expected, got 0x${dut.pc_out:08x}")
+            log(info, "Test 1 PASS: reset")
+
+            // ── Test 2: Single instruction through pipeline ────────
+            // Instruction 0x60 → opcode=0x60, rd=0 (no decode stall).
+            dut.rst = 0
+
+            // Cycle N: Fetch captures instr=0x60, pc=0x1000
+            pipe.feed(96, 100, 200, 4096)
+            wait 1 cycle
+
+            // Cycle N+1: Decode reads opcode/rs1/rs2. Feed NOP on imem,
+            // hold rs1/rs2.
+            dut.imem_data = 0
+            wait 1 cycle
+
+            // Cycle N+2: Execute computes 100+200=300, we=1
+            pipe.feed_regs(0, 0)
+            wait 1 cycle
+
+            // Cycle N+3: Writeback
+            wait 1 cycle
+
+            assert dut.wb_data == 300
+                else fail("Test 2: wb_data=300 expected, got ${dut.wb_data}")
+            assert dut.wb_we == 1
+                else fail("Test 2: wb_we=1 expected, got ${dut.wb_we}")
+            assert dut.wb_rd == 0
+                else fail("Test 2: wb_rd=0 expected, got ${dut.wb_rd}")
+            assert dut.pc_out == 4096
+                else fail("Test 2: pc_out=0x1000 expected, got 0x${dut.pc_out:08x}")
+            log(info, "Test 2 PASS: single instruction")
+
+            // Drain pipeline.
+            pipe.feed_nop()
+            wait 4 cycles
+
+            // ── Test 3: Two back-to-back instructions ──────────────
+            // A: imem=0x60, rs1=10, rs2=20  → wb_data=30
+            // B: imem=0x40, rs1=50, rs2=60  → wb_data=110
+            // Both have rd=0 ⇒ no hazard stall.
+
+            // Cycle N: Fetch A. rs1/rs2 don't matter (Decode has the
+            // drain NOP).
+            pipe.feed(96, 0, 0, 8192)
+            wait 1 cycle
+
+            // Cycle N+1: Fetch B; present A's reg data for Decode A.
+            pipe.feed(64, 10, 20, 8196)
+            wait 1 cycle
+
+            // Cycle N+2: Fetch NOP; present B's reg data for Decode B;
+            // Execute A.
+            pipe.feed(0, 50, 60, 8196)
+            wait 1 cycle
+
+            // Cycle N+3: Execute B; Writeback A.
+            pipe.feed_regs(0, 0)
+            wait 1 cycle
+
+            assert dut.wb_data == 30
+                else fail("Test 3: A wb_data=30 expected, got ${dut.wb_data}")
+            assert dut.wb_we == 1
+                else fail("Test 3: A wb_we=1 expected, got ${dut.wb_we}")
+
+            // Cycle N+4: Writeback B.
+            wait 1 cycle
+
+            assert dut.wb_data == 110
+                else fail("Test 3: B wb_data=110 expected, got ${dut.wb_data}")
+            assert dut.wb_we == 1
+                else fail("Test 3: B wb_we=1 expected, got ${dut.wb_we}")
+            log(info, "Test 3 PASS: back-to-back instructions")
+
+            // Drain.
+            pipe.feed_nop()
+            wait 4 cycles
+
+            // ── Test 4: Fetch stall (imem_valid=0) ─────────────────
+            // Feed instruction, then deassert imem_valid. The
+            // captured instr propagates through but the bubble
+            // suppresses wb_we.
+
+            dut.imem_valid = 1
+            pipe.feed(96, 50, 25, 12288)
+            wait 1 cycle
+
+            // Stall Fetch; Decode latches data but valid_r=0 (bubble).
+            dut.imem_valid = 0
+            wait 1 cycle
+
+            // Bubble propagates through Execute → Writeback.
+            wait 1 cycle
+            wait 1 cycle
+
+            assert dut.wb_data == 75
+                else fail("Test 4: wb_data=75 expected, got ${dut.wb_data}")
+            assert dut.wb_we == 0
+                else fail("Test 4: wb_we=0 expected (bubble), got ${dut.wb_we}")
+            log(info, "Test 4 PASS: fetch stall bubble")
+
+            dut.imem_valid = 1
+            pipe.feed_nop()
+            wait 4 cycles
+
+            // ── Test 5: Flush on branch_taken ──────────────────────
+            // Feed instruction A through to Writeback, then trigger
+            // flush. A still completes; Fetch+Decode are cleared.
+            // Then feed B at branch target.
+
+            dut.rst = 1
+            wait 2 cycles
+            dut.rst = 0
+
+            // Feed A.
+            dut.branch_taken = 0
+            pipe.feed(96, 10, 20, 16384)
+            wait 1 cycle
+
+            // Hold for Decode A.
+            dut.imem_data = 0
+            wait 1 cycle
+
+            // Execute A.
+            pipe.feed_regs(0, 0)
+            wait 1 cycle
+
+            // Writeback A; trigger flush.
+            dut.branch_taken = 1
+            wait 1 cycle
+
+            assert dut.wb_data == 30
+                else fail("Test 5: A wb_data=30 (survives flush) expected, got ${dut.wb_data}")
+            assert dut.wb_we == 1
+                else fail("Test 5: A wb_we=1 expected, got ${dut.wb_we}")
+
+            // Feed B at branch target.
+            dut.branch_taken = 0
+            pipe.feed(96, 500, 600, 32768)
+            wait 1 cycle
+
+            dut.imem_data = 0
+            wait 1 cycle
+
+            pipe.feed_regs(0, 0)
+            wait 1 cycle
+
+            wait 1 cycle
+
+            assert dut.wb_data == 1100
+                else fail("Test 5: B wb_data=1100 expected, got ${dut.wb_data}")
+            assert dut.wb_we == 1
+                else fail("Test 5: B wb_we=1 expected, got ${dut.wb_we}")
+            log(info, "Test 5 PASS: flush on branch_taken")
+
+            // ── Test 6: Zero opcode → wb_we=0 ──────────────────────
+
+            // Drain.
+            pipe.feed_nop()
+            wait 4 cycles
+
+            // Opcode 0 — ALU still computes but Execute clears we.
+            pipe.feed(0, 42, 58, 36864)
+            wait 1 cycle
+
+            dut.imem_data = 0
+            wait 1 cycle
+
+            pipe.feed_regs(0, 0)
+            wait 1 cycle
+
+            wait 1 cycle
+
+            assert dut.wb_we == 0
+                else fail("Test 6: wb_we=0 (zero opcode) expected, got ${dut.wb_we}")
+            assert dut.wb_data == 100
+                else fail("Test 6: wb_data=100 (ALU still computes) expected, got ${dut.wb_data}")
+            log(info, "Test 6 PASS: zero opcode suppresses wb_we")
+
+            // ── Test 7: Mid-operation reset ────────────────────────
+            pipe.feed(96, 999, 1, 40960)
+            wait 1 cycle
+            wait 1 cycle
+
+            dut.rst = 1
+            wait 2 cycles
+
+            assert dut.wb_data == 0
+                else fail("Test 7: wb_data=0 after reset expected, got ${dut.wb_data}")
+            assert dut.wb_we == 0
+                else fail("Test 7: wb_we=0 after reset expected, got ${dut.wb_we}")
+            assert dut.pc_out == 0
+                else fail("Test 7: pc_out=0 after reset expected, got 0x${dut.pc_out:08x}")
+            log(info, "Test 7 PASS: mid-operation reset")
+
+            log(info, "ALL 7 SUB-TESTS PASSED — CpuPipe pipeline coverage")
+        end run
+    end scope sim
+end test CpuPipelineTest
