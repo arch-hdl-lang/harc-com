@@ -971,9 +971,23 @@ end component AxiDriver
 
 ## 8. Testbench Architecture — Native Constructs
 
-This is where the "wide" scope decision pays off. Each UVM role becomes a language construct with a typed contract.
+This is where the "wide" scope decision pays off. Each verification role becomes a language construct with a typed contract.
 
-**v0 lowering status.** The component constructs below all parse and round-trip through `harc fmt`. The cpp_tb backend lowers a useful subset:
+**Architecture overview.** HARC's testbench layering, from the DUT outward:
+
+| Layer | Construct | Role | Mandatory? |
+|---|---|---|---|
+| Bus boundary | `transactor` | Pin-touching BFM. Drives + observes the protocol. Synthesizable to RTL — runs in-process under `harc sim`, in the FPGA bitstream under emulation. | Yes for any bus-interfaced DUT |
+| Stimulus generation | `sequencer` + `tseq` | Generates transactions. SW-only — `randomize`, file I/O, etc. allowed. | When stimulus is non-trivial |
+| Composition | `env` | Multi-transactor composition unit. Holds shared scoreboards, cross-bus checks. | When the DUT has more than one bus / when state is shared across transactors |
+| Glue | `agent` | Optional sugar: bundles a sequencer + transactor + their connect bridge as a reusable unit. | Only when the same `(sequencer, transactor, wiring)` triple is reused across tests |
+| Top | `test` | Test entry — instantiates the DUT, the env, picks the stimulus, asserts final outcomes. | Always |
+
+**Why the transactor is primary, agent is optional.** UVM made `agent` the mandatory bundling layer because the SW-only world had no place to put driver+monitor as a unit; the DUT-touching code lived in two SW components by tradition. HARC takes a different approach: the BFM is a **single synthesizable unit** — the transactor — that absorbs driver and monitor under one roof, with `when active|passive` mode subtyping replacing UVM's runtime `is_active` flag. The `agent` then becomes pure SW-side composition sugar; it's useful when you want to package stimulus + BFM + wiring for reuse, but a one-off test should skip it. UVM users coming from `uvm_agent`-mandatory environments will recognize the layering; HARC users starting fresh shouldn't be obligated to it.
+
+**SW/HW boundary.** The transactor is the seam. Everything below it (DUT pins, the protocol BFM threads inside the transactor, possibly the DUT itself) compiles to RTL and runs at HW speed. Everything above it (sequencer, scoreboard, env, test, run coroutine) stays SW. The two sides communicate over **transaction-level pipes** following the Accellera SCE-MI 2.4 standard: input pipes carry transactions from sequencer/test → transactor; output pipes carry observations from transactor → scoreboard/test. Same source-level constructs work in `harc sim` (pipes are shared memory + DPI-C, near-zero overhead) and on emulator backends (pipes are vendor DMA channels). See §8.1 for the lowering.
+
+**v0 lowering status.** The legacy `driver` / `monitor` / `agent` / `env` / `sequencer` constructs all parse, round-trip through `harc fmt`, and are end-to-end lowered by the cpp_tb backend (32+ fixtures pass). The `transactor` construct (§8.1) is **design-committed but not yet implemented in v0 codegen** — language-level acceptance, AST nodes, and ARCH-side lowering are scheduled for a v0+ phase; today's fixtures use the legacy SW-only forms. The bullets below describe what cpp_tb actually emits for the legacy forms; §8.1 describes the transactor target.
 
 - `tseq T -> TSeq<X>` → `[&]`-lambda returning `std::vector<X>`. `yield e` pushes to the implicit `_result` accumulator. Iterate the result with `for x in seq`.
 - `driver` / `agent` / `env` / `sequencer` → plain C++ struct of fields. DUT-typed fields lower to Verilator pointers (`V<Name>*`); sub-component fields are by-value structs.
@@ -1002,30 +1016,156 @@ This is where the "wide" scope decision pays off. Each UVM role becomes a langua
 
 Out of v0 scope: `tlm_method` lowering, `credit_channel` lowering (parser accepts; codegen no-ops), DUT-side introspection to flag bus signals that the actual SV doesn't expose, env-composed `bound` sub-components (only top-level `let drv/mon : T = bind axil` is supported; bound components nested inside an `env` follow), multi-input-event drivers (drivers with multiple `in event<T>` fields fall back to the synchronous subscriber-callback path), and OS-thread parallelism beyond the opt-in `--mt` flag (Phase 3b cycle batching).
 
-### 8.1 `agent`
+### 8.1 `transactor`
+
+The transactor is the **bus boundary unit** — the synthesizable BFM that touches DUT pins. Drivers and monitors collapse into it (one SV module, one set of pin connections, two threads inside). `when active|passive` mode subtyping selects whether the active stimulus thread is synthesized into the bitstream.
 
 ```
-agent AxiAgent#(P: AxiParams) bound to AxiBus#(P)
-    driver    : AxiDriver#(P)
-    monitor   : AxiMonitor#(P)
+transactor AxiXactor#(P: AxiParams) bound to AxiBus#(P)
+    // ── Always-present body (synthesized in both modes) ─────
+    completed: out event<AxiResp>
+
+    on bus.b.handshake(b)
+        emit completed(AxiResp { id: b.id, resp: b.resp })
+    end on
+    on bus.r.handshake(r)
+        emit completed(AxiResp { id: r.id, resp: r.resp })
+    end on
+
+    // ── Active-only body (synthesized only when ACTIVE=1) ──
+    when active
+        req: in event<AxiWrite>
+
+        on req(t)
+            bus.aw.send(t.addr, t.len, t.burst, t.id)
+            for beat in 0 .. t.len
+                bus.w.send(t.data[beat], t.strb[beat], beat == t.len - 1)
+            end for
+        end on
+    end when active
+end transactor AxiXactor
+```
+
+**Mode at instantiation.** Mode is part of the type — `AxiXactor active` and `AxiXactor passive` are distinct elaboration-time types over the same source:
+
+```
+let xact_a : AxiXactor active  = bind axi   // drives + observes
+let xact_p : AxiXactor passive = bind axi   // observe only
+```
+
+No default — mode is mandatory at the let site. Forces every reuse to declare its role explicitly.
+
+**Type checking with mode.** Field access is mode-sensitive at the binding site. `emit xact.req(t)` is an error when `xact` is passive (the `req` field doesn't exist in passive mode). `connect seq.dispatched -> xact.req` likewise errors at elaboration when `xact` is passive. `xact.completed` works on both — the field is in the always-present body.
+
+**Lowering — synthesizable ARCH module.** Each transactor compiles to an ARCH module with `param ACTIVE: const = 1` and the `when active` body wrapped in `generate_if ACTIVE`:
+
+```
+module AxiXactor_RTL
+    param ACTIVE: const = 1
+
+    port bus: AxiBus
+
+    pipe completed: output scemi_pipe<AxiResp>
+
+    thread mon_b
+        loop
+            wait (bus.b.valid && bus.b.ready)
+            completed.send(AxiResp { id: bus.b.id, resp: bus.b.resp })
+        end loop
+    end thread
+
+    thread mon_r
+        loop
+            wait (bus.r.valid && bus.r.ready)
+            completed.send(AxiResp { id: bus.r.id, resp: bus.r.resp })
+        end loop
+    end thread
+
+    generate_if ACTIVE
+        pipe req: input scemi_pipe<AxiWrite>
+
+        thread drv_main
+            loop
+                let t = req.recv()
+                bus.aw.addr  <= t.addr
+                bus.aw.valid <= 1
+                ...
+            end loop
+        end thread
+    end generate_if
+end module
+```
+
+The `generate_if ACTIVE` is an architectural guarantee, not a runtime flag: passive instances literally do not synthesize the `req` pipe or the `drv_main` thread. The FPGA bitstream is right-sized; the SCE-MI pipe topology shrinks (one fewer host-side pipe per passive transactor); there is no possibility of stray active behavior in a passive instance.
+
+**SCE-MI pipe transport (Accellera SCE-MI 2.4 pipe-based interface).** The transactor's `in event<T>` fields lower to **input pipes** — SW-side `emit xact.req(t)` writes a serialized transaction; the RTL-side `req.recv()` reads it. The `out event<T>` fields lower to **output pipes** — RTL-side `emit completed(...)` writes a transaction; SW-side `on xact.completed(c) ... end on` is a subscriber pulled from the pipe each time a message arrives.
+
+Pipe transport varies by backend; the source surface does not:
+
+- `harc sim` (Verilator) — pipes are in-process `std::deque<T>` + DPI-C trampolines. Near-zero overhead.
+- Emulator (HAPS / ZeBu / Veloce) — pipes use the vendor's DMA-mapped FIFO transport. A backend-specific shim lives behind the same `harc_rt::scemi_*` runtime API; the HARC compiler emits identical source.
+
+**Per-cycle traffic vs transactional traffic.** The boundary moves from "SW pokes a signal every cycle" to "SW sends a transaction once per request, reads observations once per beat." For a typical AXI burst this is hundreds of pin events compressed into one `req` message + one `completed` message. The host↔emulator link bandwidth, which is the bottleneck on real designs, drops by the same ratio.
+
+**Reuse: the point of mode subtyping.** A block-level test instantiates a transactor active to drive that block. When the block is folded into a larger SoC, the same transactor is reused passive — observing for coverage and scoreboarding while the SoC's own master drives the block:
+
+```
+test BlockLevelT
+    let dut  : AxiLiteRegs
+    let axil : BusAxiLite = bind dut
+    let xact : AxiXactor active = bind axil   // drives the block
+    ...
+end test
+
+test SoCLevelT
+    let soc        : Soc
+    let cpu_xact   : CpuMaster active = bind soc.cpu_axi
+    let regs_xact  : AxiXactor passive = bind soc.regs_axi  // observe
+    // CPU drives regs through the SoC; regs_xact watches for coverage.
+end test
+```
+
+Same source for `AxiXactor`. Different elaboration. Different bitstream.
+
+### 8.2 `agent` (optional)
+
+`agent` is a SW-side bundling unit that packages a sequencer + transactor + their connect bridge as a reusable triple. It is **not mandatory** — for a one-off test a transactor + sequencer at test scope works fine. Use `agent` only when the same `(sequencer, transactor, wiring)` bundle is reused across tests.
+
+```
+agent AxiAgent#(P: AxiParams)
     sequencer : Sequencer<AxiWrite>
+    xact      : AxiXactor#(P) active
 
     connect
-        sequencer.req -> driver.req
+        sequencer.dispatched -> xact.req
     end connect
 end agent AxiAgent
 ```
 
-`bound to T` ties the agent to a protocol-typed interface. The agent cannot be instantiated without a matching interface — checked at elaboration. Inside the agent body, `bus` refers to the bound interface.
+The agent's mode follows its inner transactor. If the agent itself is `agent AxiAgent active|passive`, all contained transactors take that mode. UVM-style `is_active` toggles map to this annotation.
 
-### 8.2 `driver`
+**What agent does NOT do** (vs UVM):
+
+- It does **not** group "driver + monitor" as separate components — that's the transactor's job.
+- It is **not** the active/passive boundary — that's `when active` on the transactor.
+- It is **not** mandatory — wiring a sequencer to a transactor at test scope (`connect seq.dispatched -> xact.req`) is fully equivalent and often cleaner for one-off tests.
+
+If you find yourself writing the same three lines (`let seq : ...; let xact : ...; connect seq -> xact`) in multiple tests, lift them into an agent. Otherwise skip the layer.
+
+### 8.3 `driver` / `monitor` (legacy SW-only forms)
+
+`driver` and `monitor` predate `transactor` and remain in the language for two reasons:
+
+1. **SW-only DUTs and quick tests** that don't need synthesizable BFMs. Verilator simulation can drive pins directly from a coroutine; for a small fixture, a `driver bound to BusType` with an `on T t` handler is the lightest construct that still gets typed bus access. No transactor wrap, no SCE-MI pipe, no synthesizability subset.
+2. **Composition inside a transactor body** — the merged transactor body internally has both stimulus and observation halves. Source can use plain `on req(t)` for the stimulus half and `on bus.<ch>.handshake(arg)` for the observation half; or, for code organization, can name the halves with `driver` / `monitor` field syntax inside the transactor. (v1+ feature; not needed for v0 transactor codegen.)
+
+The SW-only `driver` form:
 
 ```
 driver AxiDriver#(P: AxiParams) bound to AxiBus#(P)
     req: in event<AxiWrite>
 
     on req(t)
-        // protocol contract supplies handshake sequencing automatically
         bus.aw.send(t.addr, t.len, t.burst, t.id)
         for beat in 0 .. t.len
             bus.w.send(t.data[beat], t.strb[beat], beat == t.len - 1)
@@ -1036,9 +1176,9 @@ driver AxiDriver#(P: AxiParams) bound to AxiBus#(P)
 end driver AxiDriver
 ```
 
-`bus.aw.send(...)` is *derived* from the protocol type's handshake spec — the driver does not hand-code the valid/ready dance. This is the same skip-the-middle-layer move ARCH already makes for `arch formal`.
+`bus.aw.send(...)` is *derived* from the protocol type's handshake spec — the driver does not hand-code the valid/ready dance.
 
-### 8.3 `monitor`
+The SW-only `monitor` form:
 
 ```
 monitor AxiMonitor#(P: AxiParams) bound to AxiBus#(P)
@@ -1046,17 +1186,14 @@ monitor AxiMonitor#(P: AxiParams) bound to AxiBus#(P)
 
     on bus.aw.handshake(aw)
         let t = AxiWrite { addr: aw.addr, len: aw.len, burst: aw.burst, id: aw.id, ... }
-        for beat in 0 .. aw.len
-            let w = bus.w.handshake.next()
-            t.data[beat] = w.data
-            t.strb[beat] = w.strb
-        end for
         emit txn(t)
     end on
 end monitor AxiMonitor
 ```
 
 Monitors are passive *by type* — `bound to T` does not include any output-driving permission. The compiler rejects a monitor that tries to drive.
+
+**When to use which.** A new TB targeting `harc sim` only and not planning to scale to emulation can use `driver` + `monitor` directly — they're simpler and the v0 codegen has shipped them since PR #14/#15. A TB that wants to be emulator-portable, or wants to share BFM code between SW-sim and HW-sim, should use `transactor` from the start. The two forms can mix in one TB: nothing prevents a `transactor` for the AXI bus next to a sync `monitor` for sideband signal coverage.
 
 ### 8.4 `sequencer` and `tseq`
 
@@ -1110,19 +1247,37 @@ Equality on transactions is structural and free; `==` does the right thing witho
 
 ### 8.6 `env`
 
+`env` is the multi-transactor composition unit. It holds shared scoreboards and cross-bus connect bridges. Its members are typically `transactor`s directly (preferred) or `agent`s when a sequencer + transactor + wiring bundle is being reused. Same single source of truth for mode subtyping: each contained transactor / agent declares its own mode.
+
 ```
 env AxiTbEnv#(P: AxiParams)
-    agent : AxiAgent#(P)
-    sb    : AxiSb
-    cov   : AxiOps
+    cmd_xact  : AxiXactor#(P) active     // drives the bus directly
+    obs_xact  : AxiXactor#(P) passive    // observes a sibling bus
+    sb        : AxiSb
+    cov       : AxiOps
 
     connect
-        agent.monitor.txn -> sb.observed
+        cmd_xact.completed -> sb.observed
+        obs_xact.completed -> sb.observed
     end connect
 end env AxiTbEnv
 ```
 
-`env` is the static composition root. No factory, no `uvm_config_db.set(this, "*", "agent", ...)`.
+`env` is the static composition root. No factory, no `uvm_config_db.set(this, "*", "agent", ...)`. When the same env is reused at a higher level of integration, the env's contained transactors keep their per-instance mode — there is no env-wide "is_active" override; mode is per transactor and chosen at the binding site.
+
+**Mixing transactors and agents inside env.** Both work; pick whichever reads better:
+
+```
+env Mixed
+    cpu_a    : CpuAgent active        // agent: reuses a sequencer bundle
+    regs_x   : AxilXactor passive     // transactor: standalone observer
+    irq_x    : IrqXactor passive
+    sb       : SocSb
+    ...
+end env Mixed
+```
+
+The agent's value-add over a bare transactor is bundling reusable stimulus; the env's value-add over a flat test scope is multi-bus coordination. Both layers are optional but address different problems.
 
 ---
 
