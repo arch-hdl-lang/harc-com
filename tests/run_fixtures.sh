@@ -67,6 +67,8 @@ cpu_pipeline_test       | CpuPipe        | cpu_pipeline.sv        |
 linklist_doubly_test    | SchedList      | linklist_doubly.sv     |
 mac_table_test          | mac_table      | mac_table.sv           |
 noc_credit_test         | NocCreditTop   | noc_credit.sv          |
+inst_vec_port_regression_test | Top      | inst_vec_port_regression.sv |
+if_wait_for_in_then_test | M             | if_wait_for_in_then.sv |
 EOF
 
 PASS=0
