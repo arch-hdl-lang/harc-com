@@ -992,11 +992,14 @@ This is where the "wide" scope decision pays off. Each verification role becomes
 - `tseq T -> TSeq<X>` → `[&]`-lambda returning `std::vector<X>`. `yield e` pushes to the implicit `_result` accumulator. Iterate the result with `for x in seq`.
 - `transactor` / `agent` / `env` / `sequencer` → plain C++ struct of fields. DUT-typed fields lower to Verilator pointers (`V<Name>*`); sub-component fields are by-value structs.
 - `hookable name(args) -> T ... end name` on any of the above → free `[&]`-capturing lambda named `<Type>_<name>`. Inside the body, bare references to component fields rewrite to `self.<field>`. `dut.<port>` keeps the arrow-access form. **For a `bound to BusType` transactor/agent**, the parent's bus binding (resolved at codegen from the test's `let drv : T = bind axil` statement) propagates into hookable bodies under the alias `bus`, so `bus.<ch>.send(...)`, `bus.<ch>.recv()`, and `bus.<ch>.<sig>` all resolve identically to the patterns available inside `on T t` handlers. Single-instance per type in v0; multi-instance support requires per-instance hookable emission.
-- `obj.method(args)` and `env.sub.method(args)` rewrite to `<Type>_<method>(<self>, args)` (the call-site dispatcher resolves up to two levels of field-access chain).
+- `obj.method(args)` and arbitrarily-deep field chains like `env.ag.seq.method(args)` rewrite to `<Type>_<method>(<self>, args)`. The call-site dispatcher walks the field-access chain from its leaf to the root, resolving the type at each step against the let-binding's declared type, and looks up the hookable on the leaf type.
 - `let drv : T mode` default-constructs the struct; the user assigns DUT pointers and other field values explicitly afterward (`drv.dut = dut`). The mode annotation (`active`/`passive`) selects which body halves get codegen-instantiated.
+- **Mode inheritance through agent and env composition.** A transactor field nested inside an `agent` or `env` (e.g. `agent A { drv : T }`) without an explicit mode inherits its mode from the parent's let-instantiation. Same agent declaration + `let act : A active` makes `act.drv` active; `let pas : A passive` makes it passive. Inheritance cascades through any number of nesting layers — `env E { ag : Agent { drv : T } }` flows mode from `let topenv : E passive` all the way down to `topenv.ag.drv`. A field-level explicit mode (e.g. `drv : T active`) wins over the inherited mode at any depth.
+- `const NAME : Ty = expr` lowers to a file-scope `static constexpr <c_type> NAME = <expr>;` — visible everywhere (main, hookable lambdas, on-handler closures, struct field defaults).
+- **`log` severity test-result semantics** (§7.7) are honored: `log(error, ...)` increments the failure counter so the test fails at end of run; `log(fatal, ...)` additionally aborts this test instance at end of the current cycle. `info` / `warn` / `debug` have no test-result effect. Verbosity filtering, component IDs, and per-component overrides remain deferred — the runtime currently prints all severities unconditionally.
 - `on event_field(arg) ... end on` inside a transactor / agent / sequencer body → registers a `[&]`-capturing closure into the corresponding event vector at `let drv : T` time. Event payloads typed `event<MyTxn>` round-trip as the `MyTxn` C++ struct (transactions and enums get their bare name; integer-typed payloads still widen). `emit drv.req(t)` fires every registered subscriber synchronously — the on-handler body runs inside the test's tick scope (so `wait`, `dut.x = ...`, etc. all work).
 - `on dut.signal ... end on` (cycle-trigger form) inside any component body → per-cycle bool checker. Used for the observation half of an unbound transactor.
-- `connect a -> b ... end connect` inside an `env` body → at `let env : E` time, installs a generic-lambda bridge subscriber on `<env>.<a>` that fans out to every subscriber of `<env>.<b>`. Lets a sequencer's `out event` drive a transactor's `in event` without the test scope manually re-emitting. Edge endpoints are field-access chains (`sub.event_name`); the bridge uses `auto` for the payload so the connect site doesn't have to look up the event's type.
+- `connect a -> b ... end connect` inside an `env` or `agent` body → at the enclosing let-instantiation time, installs a generic-lambda bridge subscriber on the appropriately-prefixed path that fans out to every subscriber of the destination path. Connects nested any number of levels deep (e.g. an `agent`'s connect block inside an `env`-composed agent) get prefixed with the sub-instance path — `connect sequencer.dispatched -> drv.req` inside an agent that's a field of `topenv` lowers as `topenv.ag.sequencer.dispatched.push_back([&](auto _t) { for (auto& _s : topenv.ag.drv.req) _s(_t); })`. Edge endpoints are field-access chains; the bridge uses `auto` for the payload so the connect site doesn't have to look up the event's type.
 - `TSeq<T>` as a hookable parameter type → `const std::vector<T>&` (pass-by-reference, so iterating a tseq result inside a sequencer's `dispatch` method doesn't copy each transaction).
 - `on obj.method pre/post ... end on` (or `on env.sub.method pre/post`) → registers a `[&]`-capturing closure into a per-`(Type, method)` hook vector. Each hookable method's body is wrapped with `for (auto& _h : <Type>_<method>_<side>) _h(args);` before/after the body. Pre and post hooks see the same arg list as the method; both can read and mutate test-scope locals via the lambda capture (e.g. counters, scoreboards). Hooks cannot replace the body — only observe and instrument.
 - `bus Name { ... } end bus Name` (mirrors arch-com §19) → protocol-typed bundle of DUT signals. v0 surface: plain signals (`name: in|out Type`) and `handshake_channel ch: send|receive kind: valid_ready { payload signals } end handshake_channel ch`. `param`, `credit_channel`, and `tlm_method` blocks parse but don't yet contribute to typed access — those follow.
@@ -1134,7 +1137,7 @@ Same source for `AxiXactor`. Different elaboration. Different bitstream.
 ```
 agent AxiAgent#(P: AxiParams)
     sequencer : Sequencer<AxiWrite>
-    xact      : AxiXactor#(P) active
+    xact      : AxiXactor#(P)        // no mode — inherits from instantiation
 
     connect
         sequencer.dispatched -> xact.req
@@ -1142,7 +1145,25 @@ agent AxiAgent#(P: AxiParams)
 end agent AxiAgent
 ```
 
-The agent's mode follows its inner transactor. If the agent itself is `agent AxiAgent active|passive`, all contained transactors take that mode. UVM-style `is_active` toggles map to this annotation.
+**Mode inheritance.** The transactor field `xact : AxiXactor#(P)` has no explicit mode. Its mode is determined at the agent's instantiation:
+
+```
+let stim : AxiAgent#(P) active     // stim.xact is active   (sequencer drives)
+let obs  : AxiAgent#(P) passive    // obs.xact is passive   (observation only)
+```
+
+Same agent declaration, two instantiations, mode flows from the `let` to the inner transactor. A passive agent's sequencer is structurally present but never dispatched — no stimulus generated.
+
+**Field-level explicit modes still win.** If a particular field needs a fixed mode regardless of the parent's instantiation:
+
+```
+agent MixedAgent
+    cmd_x : AxiXactor active        // always active
+    irq_x : IrqXactor                // inherits from MixedAgent's mode
+end agent MixedAgent
+```
+
+`MixedAgent passive` makes `irq_x` passive but leaves `cmd_x` active. UVM-style `is_active` toggles map to the inheritance annotation.
 
 **What agent does NOT do** (vs UVM):
 
@@ -1204,12 +1225,12 @@ Equality on transactions is structural and free; `==` does the right thing witho
 
 ### 8.5 `env`
 
-`env` is the multi-transactor composition unit. It holds shared scoreboards and cross-bus connect bridges. Its members are typically `transactor`s directly (preferred) or `agent`s when a sequencer + transactor + wiring bundle is being reused. Same single source of truth for mode subtyping: each contained transactor / agent declares its own mode.
+`env` is the multi-transactor composition unit. It holds shared scoreboards and cross-bus connect bridges. Its members are typically `transactor`s directly (preferred) or `agent`s when a sequencer + transactor + wiring bundle is being reused.
 
 ```
 env AxiTbEnv#(P: AxiParams)
-    cmd_xact  : AxiXactor#(P) active     // drives the bus directly
-    obs_xact  : AxiXactor#(P) passive    // observes a sibling bus
+    cmd_xact  : AxiXactor#(P) active     // explicit: always active
+    obs_xact  : AxiXactor#(P) passive    // explicit: always passive
     sb        : AxiSb
     cov       : AxiOps
 
@@ -1220,15 +1241,33 @@ env AxiTbEnv#(P: AxiParams)
 end env AxiTbEnv
 ```
 
-`env` is the static composition root. No factory, no `uvm_config_db.set(this, "*", "agent", ...)`. When the same env is reused at a higher level of integration, the env's contained transactors keep their per-instance mode — there is no env-wide "is_active" override; mode is per transactor and chosen at the binding site.
+`env` is the static composition root. No factory, no `uvm_config_db.set(this, "*", "agent", ...)`. The mode of each contained transactor / agent comes from one of three places, with this precedence:
+
+1. **Field-level explicit mode** (e.g. `cmd_xact : AxiXactor active` above). Wins over everything below.
+2. **Inherited from the env's instantiation mode** (e.g. `let topenv : E passive` makes any unannotated field passive). Cascades through any number of nesting layers — `env { ag : Agent { drv : T } }` flows mode from the env's `let` all the way down to `drv`.
+3. **Error** if the field has no explicit mode and no parent specifies one.
+
+**Reusing an env at multiple modes.** Because mode flows from the `let`, the same env declaration covers multiple test scenarios:
+
+```
+env AxiSubsystem
+    ag : AxiAgent                     // no mode — inherits
+    sb : AxiSb
+end env AxiSubsystem
+
+let drive_env  : AxiSubsystem active   // ag → ag.xact → all active
+let observe_env : AxiSubsystem passive // ag → ag.xact → all passive
+```
+
+The same `AxiAgent` definition, the same `AxiSubsystem` definition — two instantiations, mode flows two levels deep without explicit annotations.
 
 **Mixing transactors and agents inside env.** Both work; pick whichever reads better:
 
 ```
 env Mixed
-    cpu_a    : CpuAgent active        // agent: reuses a sequencer bundle
+    cpu_a    : CpuAgent active        // agent: reuses a sequencer bundle, always active
     regs_x   : AxilXactor passive     // transactor: standalone observer
-    irq_x    : IrqXactor passive
+    irq_x    : IrqXactor               // inherits from Mixed's instantiation mode
     sb       : SocSb
     ...
 end env Mixed
