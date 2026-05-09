@@ -52,5 +52,7 @@ copy examples/cpu_pipeline.sv          cpu_pipeline.sv
 copy tests/cam_basic.sv                cam_basic.sv
 copy tests/cvdp/cache_mshr.sv          cache_mshr.sv
 copy tests/axi_dma/AxiLiteRegs.sv      AxiLiteRegs.sv
+copy tests/mac_table.sv                mac_table.sv
+copy tests/noc_credit/noc_credit.sv    noc_credit.sv
 
 echo "Done."
