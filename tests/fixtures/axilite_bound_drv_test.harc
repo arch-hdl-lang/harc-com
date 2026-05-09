@@ -1,22 +1,27 @@
 // AxiLiteRegs test demonstrating `bound to BusType` on a driver
-// (Phase 2 of the bus-typing rollout). The driver no longer holds a
-// raw `dut : AxiLiteRegs` field — it declares `bound to BusAxiLite`
-// and the test instantiates it with `let drv : AxilDrv = bind axil`,
-// where `axil : BusAxiLite = bind dut` is a separate test-level bus
-// binding. Inside the driver's `on req(t)` handler, the bare
-// identifier `bus` resolves to `axil`, so `bus.aw.send(t.addr, 0)` /
-// `bus.w.send(t.value, 15)` / `let val = bus.r.recv()` work
-// identically to the test-scope bus access from Scope A/B.
+// running as an independent coroutine actor (Phase 2b of the
+// bus-typing rollout).
 //
-// Type checking: a `bound to <BusType>` clause type-checks the rhs of
-// `bind` at codegen — binding to a `BusFoo` when the driver is
-// `bound to BusBar` is a clear HARC-level error.
+// The driver declares `bound to BusAxiLite`; instantiation pairs
+// with `let drv : AxilDrv = bind axil`. At codegen, the driver gets:
+//   - a per-instance `std::deque<RegOp>` transaction queue
+//   - its own `harc_rt::ThreadSlot` registered with the scheduler
+//   - a coroutine that loops:
+//       co_await wait_until(!queue.empty());
+//       pop t;
+//       <on req(t) body — bus.<ch>.send/recv lower to co_await>
 //
-// Phase 2b will make `bound` drivers run as independent coroutines
-// with their own slot, fed by a per-driver transaction queue. This
-// PR keeps drivers synchronous (called from the run coroutine via
-// `emit drv.req(t)`) — the runtime topology change happens on top
-// of this typing surface.
+// `emit drv.req(t)` from the run coroutine just enqueues the
+// transaction (non-blocking). The driver coroutine processes
+// transactions in parallel with the run coroutine — they're both
+// scheduled by `harc_rt::ThreadScheduler` from the same OS thread
+// (Phase 3 will add OS-thread parallelism on top of the same actor
+// model).
+//
+// Compared to Phase 2a's sync model: the run coroutine no longer
+// blocks for ~7 cycles per dispatch waiting for the bus dance to
+// finish. It queues all 5 transactions in 0 cycles; verification
+// then waits for the queue to drain.
 
 use BusAxiLite
 
@@ -99,33 +104,40 @@ test AxiLiteBoundDrvTest
             dut.rst = 0
             wait 1 cycle
 
-            // Drive 5 random write/read pairs through the bound driver
-            // by emitting on its `req` event. Each emit fires the
-            // driver's on-handler synchronously (Phase 2 keeps drivers
-            // sync; Phase 2b makes them coroutines).
+            // Drive 5 random write/read pairs through the bound
+            // driver by emitting on its `req` event. Each emit
+            // queues a transaction non-blockingly; the driver
+            // coroutine pulls them off and runs the bus dance in
+            // parallel with the run coroutine.
             let txns = RandomTxns(5)
-            for t in txns
-                sb.expected.push(t.value)
-            end for
-
             for t in txns
                 emit drv.req(t)
             end for
 
-            // Walk the scoreboard. Driver's `last_read` only holds the
-            // most recent read, so this checks the FINAL value matches
-            // the FINAL expected; the per-iteration round-trips are
-            // implicit in completion order.
-            for t in txns
-                let exp = sb.expected.pop()
-                if drv.last_read != exp && t.value == exp
-                    sb.errors = sb.errors + 1
-                end if
-            end for
-            assert sb.expected.empty()
-                else fail("scoreboard not drained")
+            // Wait long enough for the driver to process all 5
+            // transactions. Each round-trip is ~7 cycles (write
+            // dance ~3, gap 2, read dance ~2). Some slack on top
+            // for safety.
+            wait 50 cycles
 
-            log(info, "PASS: 5 round-trips through `bound to BusAxiLite` driver")
+            // After the queue drains, the driver's `last_read` holds
+            // the result of the FINAL read. Push the final expected
+            // value to the scoreboard for comparison — the most we
+            // can check without per-transaction history (a monitor
+            // coroutine pushing each completed read into the
+            // scoreboard would catch every value, but that's Phase 2c).
+            let final_idx = 4
+            for t in txns
+                if final_idx == 0
+                    sb.expected.push(t.value)
+                end if
+                final_idx = final_idx - 1
+            end for
+            let exp = sb.expected.pop()
+            assert drv.last_read == exp
+                else fail("driver final read=0x${drv.last_read:08x}, expected 0x${exp:08x}")
+
+            log(info, "PASS: 5 transactions processed by `bound to BusAxiLite` actor coroutine")
         end run
     end scope sim
 end test AxiLiteBoundDrvTest
