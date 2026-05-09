@@ -56,5 +56,7 @@ copy tests/cvdp/cache_mshr.sv          cache_mshr.sv
 copy tests/axi_dma/AxiLiteRegs.sv      AxiLiteRegs.sv
 copy tests/mac_table.sv                mac_table.sv
 copy tests/noc_credit/noc_credit.sv    noc_credit.sv
+copy tests/if_wait_for_in_then.sv      if_wait_for_in_then.sv
+copy tests/inst_vec_port_regression.sv inst_vec_port_regression.sv
 
 echo "Done."
