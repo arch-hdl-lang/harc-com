@@ -242,6 +242,7 @@ impl Parser {
             Some(TokenKind::Env) => self.parse_component(ComponentKind::Env, doc).map(Item::Env),
             Some(TokenKind::Scoreboard) => self.parse_component(ComponentKind::Scoreboard, doc).map(Item::Scoreboard),
             Some(TokenKind::Sequencer) => self.parse_component(ComponentKind::Sequencer, doc).map(Item::Sequencer),
+            Some(TokenKind::Transactor) => self.parse_transactor(doc).map(Item::Transactor),
             Some(TokenKind::Test) => self.parse_test(doc).map(Item::Test),
             Some(TokenKind::Extend) => self.parse_extend(doc).map(Item::Extend),
             Some(TokenKind::Covergroup) => self.parse_covergroup(doc).map(Item::Covergroup),
@@ -650,6 +651,67 @@ impl Parser {
             Some(TokenKind::Apply) => Ok(ComponentItem::Apply(self.parse_apply()?)),
             _ => Ok(ComponentItem::Field(self.parse_component_field(doc)?)),
         }
+    }
+
+    /// Parse `transactor T#(generics) bound to BusType { items;
+    /// when active { items } end when } end transactor T`. Same body
+    /// shape as parse_component (driver/agent/monitor) but with an
+    /// optional `when active` block separating active-only items
+    /// from the always-present body. See spec §8.1.
+    fn parse_transactor(&mut self, doc: Option<String>) -> Result<TransactorDecl, CompileError> {
+        let start = self.expect(TokenKind::Transactor)?.span;
+        let name = self.expect_ident()?;
+        let params = self.parse_optional_generic_params()?;
+        let bound_to = if self.check(TokenKind::Bound) {
+            self.advance();
+            self.expect(TokenKind::To)?;
+            Some(self.parse_type_expr()?)
+        } else {
+            None
+        };
+
+        // Body: items in any order; at most one `when active` block.
+        // Active-block items are collected separately so codegen can
+        // emit them under `generate_if ACTIVE`.
+        let mut items: Vec<ComponentItem> = Vec::new();
+        let mut when_active: Option<Vec<ComponentItem>> = None;
+        while !self.check_end_keyword() {
+            // Recognize `when active` as a special block delimiter.
+            // Plain `when` (already in HARC for transaction subtype
+            // matching, etc.) keeps its existing meaning everywhere
+            // else; here we peek for `When + Active` specifically.
+            if self.check(TokenKind::When) && self.peek2_kind() == Some(&TokenKind::Active) {
+                if when_active.is_some() {
+                    return Err(CompileError::general(
+                        "transactor body has more than one `when active` block; only one is allowed".into(),
+                        self.peek_span(),
+                    ));
+                }
+                self.advance();  // consume `when`
+                self.advance();  // consume `active`
+                let mut active_items: Vec<ComponentItem> = Vec::new();
+                while !(self.check(TokenKind::End)
+                        && self.peek2_kind() == Some(&TokenKind::When))
+                {
+                    active_items.push(self.parse_component_item()?);
+                }
+                self.expect(TokenKind::End)?;
+                self.expect(TokenKind::When)?;
+                when_active = Some(active_items);
+            } else {
+                items.push(self.parse_component_item()?);
+            }
+        }
+        let end = self.expect_end(TokenKind::Transactor, &name.name)?;
+        Ok(TransactorDecl {
+            name,
+            params,
+            bound_to,
+            items,
+            when_active,
+            span: start.merge(end),
+            doc,
+        })
     }
 
     fn parse_component_field(&mut self, doc: Option<String>) -> Result<ComponentField, CompileError> {
@@ -1272,7 +1334,7 @@ impl Parser {
                     generics = g;
                     span = span.merge(last);
                 }
-                Ok(TypeExpr::Named { name: path, generics, span })
+                Ok(TypeExpr::Named { name: path, generics, mode: None, span })
             }
             Some(other) => Err(CompileError::unexpected_token("type", &other.to_string(), span0)),
             None => Err(CompileError::UnexpectedEof),
@@ -1681,7 +1743,30 @@ impl Parser {
         let name = self.expect_field_name()?;
         let ty = if self.check(TokenKind::Colon) {
             self.advance();
-            Some(self.parse_type_expr()?)
+            let mut t = self.parse_type_expr()?;
+            // Optional transactor mode annotation:
+            //     let xact : AxilXactor active  = bind axil
+            //     let obs  : AxilXactor passive = bind axil
+            // Only valid on a Named type at the let-instantiation
+            // grammar slot. The codegen later validates that the
+            // referenced type is actually a `transactor` decl;
+            // mode-on-non-transactor is a clear error there.
+            let mode = match self.peek_kind() {
+                Some(TokenKind::Active)  => { self.advance(); Some(TransactorMode::Active)  }
+                Some(TokenKind::Passive) => { self.advance(); Some(TransactorMode::Passive) }
+                _ => None,
+            };
+            if let Some(m) = mode {
+                if let TypeExpr::Named { mode: existing_mode, .. } = &mut t {
+                    *existing_mode = Some(m);
+                } else {
+                    return Err(CompileError::general(
+                        "active/passive mode annotation only applies to a named (transactor) type".into(),
+                        self.peek_span(),
+                    ));
+                }
+            }
+            Some(t)
         } else {
             None
         };
