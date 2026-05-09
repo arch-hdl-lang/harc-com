@@ -4074,6 +4074,59 @@ impl Emitter {
                             }
                         }
                     }
+                    // Transactor sub-fields (e.g. `agent A { drv : T }`).
+                    // The transactor's mode is resolved from the field's
+                    // own annotation if present, else inherited from the
+                    // parent let's instantiation mode. This is how the
+                    // same agent declaration can be reused as both active
+                    // and passive: `agent A { drv : T }` + `let a : A
+                    // active` makes `a.drv` active; `let a : A passive`
+                    // makes it passive. An explicit field-level mode
+                    // (`drv : T active`) overrides the parent.
+                    //
+                    // Bound transactor sub-fields are out of v0 scope
+                    // (spec §8 / line 1017) — only top-level `let xact :
+                    // T mode = bind axil` is supported today.
+                    let parent_mode = match l.ty.as_ref() {
+                        Some(TypeExpr::Named { mode: Some(m), .. }) => Some(*m),
+                        _ => None,
+                    };
+                    for ci in &comp.items {
+                        if let ComponentItem::Field(f) = ci {
+                            if let Some(field_ty) = type_simple_name(Some(&f.ty)) {
+                                if let Some(t) = self.transactors.get(field_ty).cloned() {
+                                    if t.bound_to.is_some() {
+                                        self.errors.push(format!(
+                                            "let {} : {}: transactor field `{}.{} : {}` has a `bound to` clause; bound sub-components inside an env/agent are out of v0 scope",
+                                            l.name.name, name, name, f.name.name, field_ty,
+                                        ));
+                                        continue;
+                                    }
+                                    let field_mode = match &f.ty {
+                                        TypeExpr::Named { mode: Some(m), .. } => Some(*m),
+                                        _ => None,
+                                    };
+                                    let mode = match field_mode.or(parent_mode) {
+                                        Some(m) => m,
+                                        None => {
+                                            self.errors.push(format!(
+                                                "let {} : {}: transactor field `{}.{} : {}` has no mode and parent has no mode either; specify `let {} : {} active|passive` or annotate the field",
+                                                l.name.name, name, name, f.name.name, field_ty, l.name.name, name,
+                                            ));
+                                            continue;
+                                        }
+                                    };
+                                    let include_active = matches!(mode, TransactorMode::Active);
+                                    let synth = synth_component_from_transactor(&t, include_active);
+                                    let sub_inst = format!("{}.{}", l.name.name, f.name.name);
+                                    let sub_tag = format!("_xactor_{}_{}_", l.name.name, f.name.name);
+                                    self.emit_component_handler_registrations(
+                                        &synth, &sub_inst, depth, &sub_tag,
+                                    );
+                                }
+                            }
+                        }
+                    }
                     // Wire `connect a -> b` edges. Each edge installs a
                     // bridge subscriber on `<env>.<a>` that fans out to
                     // every subscriber of `<env>.<b>`. Generic-lambda
