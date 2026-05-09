@@ -1,0 +1,133 @@
+// Regression: a transactor declared with BOTH halves
+// (always-on observation body + `when active` stimulus body) is
+// instantiated only as `passive`. No active companion exists in
+// the test. The passive instance must:
+//
+//   1. Observe bus traffic correctly via its `on bus.<ch>.handshake`
+//      handlers (the always-on body fires).
+//   2. NOT spawn a driver-actor coroutine for `req` (the active half
+//      is elided at the let site — `mode = passive`).
+//   3. NOT subscribe to its own `req` event from any registered
+//      handler (the `on req(t)` body lives only in `when active`).
+//
+// Bus traffic is driven directly from the test scope using the
+// same low-level signal poking the active body would have done.
+// This decouples the stimulus from any transactor coroutine, so
+// any observation seen by the passive instance must come purely
+// from the always-on handshake handlers — proving (1) end-to-end.
+// Points (2) and (3) are codegen guarantees: if the active half
+// were not elided, the `req` field would have a registered
+// handler that fires on `emit drv.req(...)` — but no such emit
+// happens in this test, so there's no positive signal for those.
+// The cargo codegen test suite (PR #28) covers the codegen-side
+// elision; this fixture covers the runtime-observable correctness
+// of the passive-only path.
+
+use BusAxiLite
+
+transaction RegOp
+    addr  : uint<8>  with [range(0, 64)]
+    value : uint<32>
+end transaction RegOp
+
+scoreboard ObsSb
+    written : queue<uint<32>>      // observed write data on bus.w
+    read    : queue<uint<32>>      // observed read data on bus.r
+end scoreboard ObsSb
+
+// Same shape as `axilite_bound_mon_test`'s AxilXactor — both halves
+// declared. The passive instantiation in the test below must elide
+// the `when active` body cleanly.
+transactor AxilXactor bound to BusAxiLite
+    sb : ObsSb
+
+    // Always-on observation half — fires on every handshake.
+    on bus.w.handshake(d)
+        sb.written.push(d)
+    end on
+
+    on bus.r.handshake(d)
+        sb.read.push(d)
+    end on
+
+    when active
+        req : in event<RegOp>
+
+        on req(t)
+            bus.aw.addr = t.addr
+            bus.aw.valid = 1
+            bus.w.send(t.value, 15)
+            bus.aw.valid = 0
+            wait 2 cycles
+            bus.ar.addr = t.addr
+            bus.ar.valid = 1
+            let val = bus.r.recv()
+            bus.ar.valid = 0
+            wait 1 cycle
+        end on
+    end when
+end transactor AxilXactor
+
+test TransactorPassiveOnlyTest
+    let dut  : AxiLiteRegs
+    let axil : BusAxiLite = bind dut
+    // Single passive instance — no `active` companion exists.
+    let mon  : AxilXactor passive = bind axil
+
+    scope sim
+        run
+            log(info, "passive-only transactor regression: monitor sees test-scope bus traffic")
+
+            // Reset.
+            dut.rst = 1
+            axil.aw.valid = 0
+            axil.w.valid = 0
+            axil.b.ready = 1
+            axil.ar.valid = 0
+            axil.r.ready = 1
+            dut.mm2s_done = 0
+            dut.mm2s_halted = 1
+            dut.mm2s_idle = 1
+            dut.s2mm_done = 0
+            dut.s2mm_halted = 1
+            dut.s2mm_idle = 1
+            dut.mm2s_sg_done = 0
+            dut.s2mm_sg_done = 0
+            dut.mm2s_sg_active = 0
+            dut.s2mm_sg_active = 0
+            wait 2 cycles
+            dut.rst = 0
+            wait 1 cycle
+
+            // Drive 3 write+read round-trips directly from the test
+            // scope via the bus binding. These look exactly like what
+            // the active half would have generated — the passive
+            // observer's handshake handlers fire on every bus.<ch>
+            // valid+ready event, regardless of who drove the bus.
+            for i in 0 .. 3
+                axil.aw.addr = 24
+                axil.aw.valid = 1
+                axil.w.send(1000 + i, 15)
+                axil.aw.valid = 0
+                wait 2 cycles
+                axil.ar.addr = 24
+                axil.ar.valid = 1
+                let beat = axil.r.recv()
+                axil.ar.valid = 0
+                wait 1 cycle
+            end for
+
+            // Drain so the final handshakes settle.
+            wait 10 cycles
+
+            // The passive observer must have captured 3 writes and
+            // 3 reads — purely via the always-on handshake handlers.
+            assert mon.sb.written.size() == 3
+                else fail("passive: written queue size=${mon.sb.written.size()}, expected 3")
+            assert mon.sb.read.size() == 3
+                else fail("passive: read queue size=${mon.sb.read.size()}, expected 3")
+
+            log(info, "PASS: passive-only transactor observed 3 writes + 3 reads, active half cleanly elided")
+        end run
+    end scope sim
+end test TransactorPassiveOnlyTest
