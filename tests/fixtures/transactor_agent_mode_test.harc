@@ -1,0 +1,212 @@
+// Spec §8.2 demonstration: one `agent` declaration reused as both
+// active and passive at instantiation, with the inner transactor's
+// mode INHERITED from the parent agent's mode.
+//
+// Pattern:
+//   agent A { sequencer : Seq; drv : T; sb : Sb; connect ... }
+//
+// At instantiation:
+//   let act : A active   // drv becomes active   (sequencer drives)
+//   let pas : A passive  // drv becomes passive  (observation only)
+//
+// Both instances share the same `agent A` declaration. The
+// transactor field `drv : T` carries no explicit mode — it
+// inherits from the parent `let` site. An active agent's drv
+// gets the `when active` body wired (on req fires); a passive
+// agent's drv gets only the always-on body (handshake observers
+// fire). The sequencer in a passive agent is structurally
+// present but never dispatched — no stimulus generated.
+//
+// In this fixture the active agent drives 5 transactions through
+// its sequencer→connect→transactor.req chain; the passive agent
+// observes the same DUT bus traffic via its always-on cycle-
+// trigger handlers and tallies into its own scoreboard. Both
+// scoreboards see the 5 writes + 5 reads — proving:
+//
+//   1. Mode inheritance works:    `act.drv` was active, `pas.drv`
+//                                 was passive, from the same decl.
+//   2. Active half elides on pas: pas's sequencer was never
+//                                 dispatched (no traffic from
+//                                 pas), yet pas's observers fired
+//                                 on the bus traffic that act
+//                                 generated.
+//   3. Always-on body fires on both modes: act's own observers
+//                                 also tallied (act drives AND
+//                                 watches itself).
+
+transaction RegOp
+    addr  : uint<8>  with [range(0, 64)]
+    value : uint<32>
+end transaction RegOp
+
+scoreboard ObsSb
+    writes : uint<32> default 0
+    reads  : uint<32> default 0
+end scoreboard ObsSb
+
+sequencer AxilSeq
+    dispatched : out event<RegOp>
+
+    hookable dispatch(txns: TSeq<RegOp>)
+        for t in txns
+            emit dispatched(t)
+        end for
+    end dispatch
+end sequencer AxilSeq
+
+// Unbound transactor (raw signal access) so it can compose inside
+// an env/agent — bound sub-components inside agents are out of v0
+// scope (spec line 1017).
+transactor AxilXactor
+    dut : AxiLiteRegs
+    sb  : ObsSb
+    last_read : uint<32> default 0
+
+    // Always-on observation half — fires on every cycle the
+    // condition holds. Present on BOTH active and passive
+    // instances.
+    on dut.axil_w_valid && dut.axil_w_ready
+        sb.writes = sb.writes + 1
+    end on
+
+    on dut.axil_r_valid && dut.axil_r_ready
+        sb.reads = sb.reads + 1
+    end on
+
+    // `when active` half — present only on active instances.
+    when active
+        req : in event<RegOp>
+
+        on req(t)
+            // Write phase
+            dut.axil_aw_addr = t.addr
+            dut.axil_aw_valid = 1
+            dut.axil_w_data = t.value
+            dut.axil_w_strb = 15
+            dut.axil_w_valid = 1
+            wait 10 cycles
+            dut.axil_aw_valid = 0
+            dut.axil_w_valid = 0
+            wait 2 cycles
+
+            // Read phase
+            let val = 0
+            let saw = 0
+            dut.axil_ar_addr = t.addr
+            dut.axil_ar_valid = 1
+            for _ in 0 .. 10
+                wait 1 cycle
+                if dut.axil_r_valid
+                    if saw == 0
+                        val = dut.axil_r_data
+                        dut.axil_ar_valid = 0
+                        saw = 1
+                    end if
+                end if
+            end for
+            dut.axil_ar_valid = 0
+            wait 1 cycle
+            last_read = val
+        end on
+    end when
+end transactor AxilXactor
+
+// The agent declaration. `drv : AxilXactor` has no explicit mode —
+// it inherits from the parent let's instantiation mode. The
+// `connect` edge wires sequencer.dispatched → drv.req for active
+// instances; for passive instances drv.req has no `on` handlers
+// (active body elided), so the connect bridge fans out into an
+// empty subscriber list — harmless, but also why we never call
+// dispatch on a passive instance.
+agent AxilAgent
+    sequencer : AxilSeq
+    drv       : AxilXactor
+    sb        : ObsSb
+
+    connect
+        sequencer.dispatched -> drv.req
+    end connect
+end agent AxilAgent
+
+tseq RandomTxns(n: int) -> TSeq<RegOp>
+    for _ in 0 .. n
+        let t : RegOp
+        randomize(t)
+        t.addr = 24
+        yield t
+    end for
+end tseq RandomTxns
+
+test TransactorAgentModeTest
+    let dut : AxiLiteRegs
+
+    // Same `AxilAgent` declaration, two instantiations with
+    // different modes. Mode flows through to `drv` automatically.
+    let act : AxilAgent active
+    let pas : AxilAgent passive
+
+    scope sim
+        run
+            log(info, "agent declaration reused as active + passive")
+
+            // Both transactors point at the same DUT.
+            act.drv.dut = dut
+            pas.drv.dut = dut
+
+            // Reset.
+            dut.rst = 1
+            dut.axil_aw_addr = 0
+            dut.axil_aw_valid = 0
+            dut.axil_w_data = 0
+            dut.axil_w_strb = 15
+            dut.axil_w_valid = 0
+            dut.axil_b_ready = 1
+            dut.axil_ar_addr = 0
+            dut.axil_ar_valid = 0
+            dut.axil_r_ready = 1
+            dut.mm2s_done = 0
+            dut.mm2s_halted = 1
+            dut.mm2s_idle = 1
+            dut.s2mm_done = 0
+            dut.s2mm_halted = 1
+            dut.s2mm_idle = 1
+            dut.mm2s_sg_done = 0
+            dut.s2mm_sg_done = 0
+            dut.mm2s_sg_active = 0
+            dut.s2mm_sg_active = 0
+            wait 2 cycles
+            dut.rst = 0
+            wait 1 cycle
+
+            // Drive 5 transactions through the ACTIVE agent's
+            // sequencer. Connect bridge forwards to act.drv.req →
+            // act's `on req(t)` body drives the DUT bus.
+            //
+            // We never call pas.sequencer.dispatch — the passive
+            // agent's sequencer is dormant, no stimulus from it.
+            let txns = RandomTxns(5)
+            act.sequencer.dispatch(txns)
+
+            // Drain.
+            wait 10 cycles
+
+            // Both agents' always-on observers fired on every
+            // valid+ready handshake on the AXI-Lite write/read
+            // channels. Each round-trip = 1 write handshake + 1
+            // read handshake; 5 round-trips = 5 of each.
+            assert pas.drv.sb.writes == 5
+                else fail("passive agent: writes observed = ${pas.drv.sb.writes}, expected 5")
+            assert pas.drv.sb.reads == 5
+                else fail("passive agent: reads observed = ${pas.drv.sb.reads}, expected 5")
+
+            // Active agent's own observer also tallied (always-on
+            // body fires regardless of mode).
+            assert act.drv.sb.writes == 5
+                else fail("active agent: writes observed = ${act.drv.sb.writes}, expected 5")
+            assert act.drv.sb.reads == 5
+                else fail("active agent: reads observed = ${act.drv.sb.reads}, expected 5")
+
+            log(info, "PASS: same agent decl, mode inherited — active drove, passive observed")
+        end run
+    end scope sim
+end test TransactorAgentModeTest
