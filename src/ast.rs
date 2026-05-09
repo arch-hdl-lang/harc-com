@@ -63,6 +63,22 @@ pub enum Item {
     /// layer. Mirrors arch-com's §19 bus construct so HARC tests can
     /// `use BusAxiLite;` against arch-built DUTs.
     Bus(BusDecl),
+    /// `transactor T bound to BusType { ... when active { ... } }` —
+    /// synthesizable BFM unit (spec §8.1). Combines driver and
+    /// monitor under one roof; the always-present body holds the
+    /// observation half plus shared protocol state, the optional
+    /// `when active` block holds the stimulus half. Mode subtyping
+    /// at instantiation (`let xact : T active = bind axil`) selects
+    /// which body is synthesized — `passive` instances literally do
+    /// not include the active block in the lowered ARCH module
+    /// (`generate_if ACTIVE`).
+    ///
+    /// Codegen scheduling: AST + parser + pretty-print land in T-1;
+    /// SW-side codegen targeting the SCE-MI pipe surface (with
+    /// in-process `std::deque` transport) is T-2; ARCH-side
+    /// `generate_if ACTIVE` lowering is T-3; emulator transport is
+    /// out-of-v0.
+    Transactor(TransactorDecl),
 }
 
 // ── Use / Package ─────────────────────────────────────────────────────────────
@@ -316,6 +332,47 @@ pub struct HookableMethod {
     pub span: Span,
 }
 
+// ── Transactor (§8.1) ──────────────────────────────────────────────────────
+
+/// Active/passive role of a transactor instance. Determined at the
+/// instantiation site (`let xact : T active = bind axil`) — same
+/// transactor source emits two distinct elaboration-time types,
+/// differing only in whether the `when active` block is synthesized.
+/// In ARCH lowering this drives `param ACTIVE: const = 0|1` plus
+/// `generate_if ACTIVE` around the active body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactorMode {
+    Active,
+    Passive,
+}
+
+/// `transactor T#(generics) bound to BusType { ... when active { ... } end when }`
+/// — synthesizable BFM. Parses + round-trips through `harc fmt` from
+/// T-1; codegen lands in T-2 onward (see spec §8.1 for the staging).
+#[derive(Debug, Clone)]
+pub struct TransactorDecl {
+    pub name: Ident,
+    pub params: Vec<Param>,
+    /// `bound to BusType` clause — mandatory for transactors (a
+    /// transactor without a bus binding would have nothing to drive
+    /// or observe). Parser allows omission for forward-compat /
+    /// better diagnostics; the type-checker rejects unbound
+    /// transactors.
+    pub bound_to: Option<TypeExpr>,
+    /// Always-present body items: fields, observation handlers
+    /// (`on bus.<ch>.handshake(...)`), shared hookables, and shared
+    /// protocol state. Compiled in both active and passive modes.
+    pub items: Vec<ComponentItem>,
+    /// Optional `when active { ... } end when` body — the active-
+    /// only stimulus half. Items inside are synthesized only when
+    /// the instance is `active`. v1+ may add `when passive` for
+    /// observe-only-augmenting bodies; for now `passive` = "active
+    /// block omitted at this elaboration."
+    pub when_active: Option<Vec<ComponentItem>>,
+    pub span: Span,
+    pub doc: Option<String>,
+}
+
 // ── Test and scope (§7.2) ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -566,9 +623,19 @@ pub struct Param {
 #[derive(Debug, Clone)]
 pub enum TypeExpr {
     /// Named type, optionally generic-applied: `AxiBus#(P=8, Q=4)` or `Foo`.
+    ///
+    /// `mode` annotates the type with a transactor active/passive
+    /// role at the binding site (`let xact : T active = bind axil`).
+    /// `None` for non-transactor types and for transactor decl
+    /// references that aren't at an instantiation site (e.g.
+    /// `bound to T` clauses, struct field types other than at
+    /// `let .. = bind ..`). The type-checker rejects mode
+    /// annotations on non-transactor types and missing-mode on
+    /// transactor instantiations.
     Named {
         name: Path,
         generics: Vec<TypeArg>,
+        mode: Option<TransactorMode>,
         span: Span,
     },
     /// `uint<N>`, `sint<N>`, `bits<N>`, `Vec<T, N>`, `event<T>`, `event comb<T>`,

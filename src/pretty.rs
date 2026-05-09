@@ -324,7 +324,38 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
             pad(out, depth);
             writeln!(out, "end bus {}", b.name.name).ok();
         }
+        Item::Transactor(t) => {
+            print_transactor(out, t, depth);
+        }
     }
+}
+
+fn print_transactor(out: &mut String, t: &TransactorDecl, depth: usize) {
+    print_doc(out, &t.doc, depth);
+    pad(out, depth);
+    write!(out, "transactor {}", t.name.name).ok();
+    if !t.params.is_empty() {
+        print_paren_params(out, &t.params);
+    }
+    if let Some(b) = &t.bound_to {
+        write!(out, " bound to ").ok();
+        print_type(out, b);
+    }
+    writeln!(out).ok();
+    for it in &t.items {
+        print_component_item(out, it, depth + 1);
+    }
+    if let Some(active_items) = &t.when_active {
+        pad(out, depth + 1);
+        writeln!(out, "when active").ok();
+        for it in active_items {
+            print_component_item(out, it, depth + 2);
+        }
+        pad(out, depth + 1);
+        writeln!(out, "end when").ok();
+    }
+    pad(out, depth);
+    writeln!(out, "end transactor {}", t.name.name).ok();
 }
 
 fn print_component(out: &mut String, c: &ComponentDecl, depth: usize) {
@@ -629,12 +660,22 @@ fn print_paren_params(out: &mut String, ps: &[Param]) {
 
 fn print_type(out: &mut String, t: &TypeExpr) {
     match t {
-        TypeExpr::Named { name, generics, .. } => {
+        TypeExpr::Named { name, generics, mode, .. } => {
             print_path(out, name);
             if !generics.is_empty() {
                 write!(out, "#(").ok();
                 print_type_args(out, generics);
                 write!(out, ")").ok();
+            }
+            // Transactor mode annotation: `T active` / `T passive`
+            // (see ast::TransactorMode). Only set at instantiation
+            // sites; round-trips through fmt → reparse.
+            if let Some(m) = mode {
+                let s = match m {
+                    TransactorMode::Active => "active",
+                    TransactorMode::Passive => "passive",
+                };
+                write!(out, " {s}").ok();
             }
         }
         TypeExpr::Builtin { name, args, .. } => {
