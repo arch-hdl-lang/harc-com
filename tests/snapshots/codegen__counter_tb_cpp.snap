@@ -159,10 +159,27 @@ int main(int argc, char** argv) {
     sched.bootstrap();
 
     // Drive the clock until the run coroutine completes.
+    //
+    // `wait N cycles` matches Verilog's `@(posedge clk)` semantic:
+    // values set in the segment BEFORE the wait are sampled at the
+    // next posedge. Per loop iteration:
+    //   1. Posedge (clk 0→1, eval) — DUT FFs latch the current input
+    //      values (set in the previous segment, or in bootstrap on
+    //      the first iteration).
+    //   2. `sched.tick()` — advance the run coroutine to its next
+    //      wait, setting the inputs for the NEXT cycle's posedge.
+    //   3. Falling edge (clk 1→0, eval) — comb re-settles with the
+    //      newly-set inputs.
+    //   4. Cycle counter + checkers.
+    // One initial `eval(clk=0)` before the loop settles combinational
+    // logic with the bootstrap inputs — same role as `initial`-block
+    // settle in Verilog. Each `wait 1 cycle` then maps to exactly
+    // one posedge that observes the just-set values.
+    dut->clk = 0; dut->eval();
     while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {
+        dut->clk = 1; dut->eval();
         sched.tick();
         dut->clk = 0; dut->eval();
-        dut->clk = 1; dut->eval();
         cycle_count++;
         for (auto& _c : _checkers) _c();
     }
