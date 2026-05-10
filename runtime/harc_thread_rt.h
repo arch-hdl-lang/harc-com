@@ -34,6 +34,7 @@
 #include <coroutine>
 #include <functional>
 #include <cstdint>
+#include <initializer_list>
 #include <type_traits>
 #include <vector>
 #include <atomic>
@@ -102,6 +103,67 @@ inline _harc_u128 harc_read(const Sig& sig) {
         if constexpr (N >= 3) v |= (static_cast<_harc_u128>(static_cast<uint32_t>(sig[2])) << 64);
         if constexpr (N >= 4) v |= (static_cast<_harc_u128>(static_cast<uint32_t>(sig[3])) << 96);
         return v;
+    }
+}
+
+// ── Wider-than-128-bit support ───────────────────────────────────────
+// 65–128b values flow through `_harc_u128` (above). For wider signals
+// (256, 512, 1024, … up to arbitrary `VlWide<N>`), the natural surface
+// is a word-array literal: `dut.wdata = 0x<N hex digits>` lowers in
+// the codegen to a word-array initializer-list and routes through
+// these helpers. Words are LSB-first to match Verilator's `VlWide`
+// layout (word 0 = bits[31:0], word 1 = bits[63:32], …).
+//
+// `harc_assign_words` writes the literal into the signal, padding any
+// extra signal words with zero. `harc_eq_words` compares word-by-word,
+// treating any unspecified words as zero on both sides.
+
+template<typename Sig>
+inline void harc_assign_words(Sig& sig, std::initializer_list<uint32_t> words) {
+    if constexpr (std::is_arithmetic_v<Sig>) {
+        // Narrow signal — pack the low 1–2 words into a uint64.
+        auto it = words.begin();
+        uint64_t v = 0;
+        if (it != words.end()) v  = static_cast<uint64_t>(*it++);
+        if (it != words.end()) v |= static_cast<uint64_t>(*it++) << 32;
+        // Extra words beyond uint64 capacity are dropped (would set
+        // bits the signal can't hold anyway).
+        sig = static_cast<Sig>(v);
+    } else {
+        constexpr std::size_t N = sizeof(Sig) / sizeof(uint32_t);
+        std::size_t i = 0;
+        for (auto w : words) {
+            if (i < N) sig[i] = w;
+            ++i;
+        }
+        for (std::size_t j = i; j < N; ++j) sig[j] = 0;
+    }
+}
+
+template<typename Sig>
+inline bool harc_eq_words(const Sig& sig, std::initializer_list<uint32_t> words) {
+    if constexpr (std::is_arithmetic_v<Sig>) {
+        // Pack the literal's low 64 bits.
+        auto it = words.begin();
+        uint64_t expected = 0;
+        if (it != words.end()) expected  = static_cast<uint64_t>(*it++);
+        if (it != words.end()) expected |= static_cast<uint64_t>(*it++) << 32;
+        // Any further literal words must be zero for equality.
+        while (it != words.end()) { if (*it++ != 0) return false; }
+        return static_cast<uint64_t>(sig) == expected;
+    } else {
+        constexpr std::size_t N = sizeof(Sig) / sizeof(uint32_t);
+        std::size_t i = 0;
+        for (auto w : words) {
+            uint32_t s = (i < N) ? static_cast<uint32_t>(sig[i]) : 0u;
+            if (s != w) return false;
+            ++i;
+        }
+        // Any remaining signal words must be zero for equality.
+        for (std::size_t j = i; j < N; ++j) {
+            if (sig[j] != 0) return false;
+        }
+        return true;
     }
 }
 
