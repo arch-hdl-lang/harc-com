@@ -3390,13 +3390,35 @@ impl Emitter {
     /// machinery, rather than the literal source text. Falls back to raw
     /// text if the fragment doesn't parse — preserves whatever the user
     /// wrote so they get a meaningful C++ error rather than a hidden one.
-    fn emit_interp_arg(&mut self, capture: &str) {
-        write!(self.out, ", (long long)(").ok();
-        match crate::parser::parse_expr_fragment(capture) {
-            Ok(e) => self.emit_expr(&e),
-            Err(_) => { write!(self.out, "{capture}").ok(); }
+    fn emit_interp_arg(&mut self, cap: &InterpCap) {
+        write!(self.out, ", ").ok();
+        match cap.wide_hex {
+            Some((width, upper)) => {
+                // Wide-hex: route through HarcHexBuf128 so the full
+                // 128-bit value prints (printf with `%s`). The
+                // constructor takes `_harc_u128`; pointer-rooted
+                // Field accesses already wrap with `harc_read` in
+                // emit_expr (returning `_harc_u128`), and bare local
+                // ints widen via implicit conversion. No extra
+                // wrap needed here.
+                let upper_str = if upper { "true" } else { "false" };
+                write!(self.out, "(const char*)harc_rt::HarcHexBuf128(").ok();
+                match crate::parser::parse_expr_fragment(&cap.expr) {
+                    Ok(e) => self.emit_expr(&e),
+                    Err(_) => { write!(self.out, "{}", cap.expr).ok(); }
+                }
+                write!(self.out, ", {width}, {upper_str})").ok();
+            }
+            None => {
+                // Narrow / decimal path: cast to long long for printf.
+                write!(self.out, "(long long)(").ok();
+                match crate::parser::parse_expr_fragment(&cap.expr) {
+                    Ok(e) => self.emit_expr(&e),
+                    Err(_) => { write!(self.out, "{}", cap.expr).ok(); }
+                }
+                write!(self.out, ")").ok();
+            }
         }
-        write!(self.out, ")").ok();
     }
 
     /// Emit a top-level `function` as a `[&]`-captured lambda. Named-typed
@@ -5031,9 +5053,20 @@ fn is_wide_int_literal(e: &Expr) -> Option<Vec<String>> {
 /// `long long` at the call site. v0 limitations: bit-slice `a[7:0]` cannot
 /// appear inside `${...}` (the format separator is `:`); strings and chars
 /// are not yet supported as interpolation targets — hoist into a let.
-fn process_interp(s: &str) -> (String, Vec<String>) {
+/// One captured `${expr:spec}` from a HARC interpolated string.
+/// `wide_hex` is `Some((width_hex_digits, upper_case))` when the spec
+/// is `:WWx` or `:WWX` with WW > 16 — those route through the
+/// `HarcHexBuf128` runtime helper at codegen time so values up to 128
+/// bits print in full instead of being truncated to a `long long`.
+/// All other specs use the legacy `(long long)(...)` cast.
+struct InterpCap {
+    expr: String,
+    wide_hex: Option<(usize, bool)>,
+}
+
+fn process_interp(s: &str) -> (String, Vec<InterpCap>) {
     let mut fmt = String::with_capacity(s.len());
-    let mut captures = Vec::new();
+    let mut captures: Vec<InterpCap> = Vec::new();
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -5048,8 +5081,9 @@ fn process_interp(s: &str) -> (String, Vec<String>) {
                 Some(idx) => (inner[..idx].trim(), inner[idx + 1..].trim()),
                 None => (inner, ""),
             };
-            captures.push(expr_src.to_string());
-            fmt.push_str(&translate_fmt_spec(spec));
+            let (fmt_token, wide_hex) = translate_fmt_spec(spec);
+            captures.push(InterpCap { expr: expr_src.to_string(), wide_hex });
+            fmt.push_str(&fmt_token);
             i = j + 1;
         } else if bytes[i] == b'%' {
             fmt.push_str("%%");
@@ -5062,19 +5096,38 @@ fn process_interp(s: &str) -> (String, Vec<String>) {
     (fmt, captures)
 }
 
-/// Translate a HARC format spec (Python/Rust f-string subset) to a printf
-/// conversion specifier. Supports flags + width + integer type; falls back
-/// to `%lld` for unrecognised specs.
-fn translate_fmt_spec(spec: &str) -> String {
-    if spec.is_empty() { return "%lld".to_string(); }
+/// Translate a HARC format spec (Python/Rust f-string subset) to a
+/// printf conversion specifier. Returns `(token, wide_hex_info)`:
+/// - `token` is the printf format substring (e.g. `%08llx` or `%s`).
+/// - `wide_hex_info` is `Some((width, upper))` when the spec is hex
+///   wider than 16 digits — the caller must emit the value via
+///   `HarcHexBuf128` so it prints in full 128-bit precision.
+fn translate_fmt_spec(spec: &str) -> (String, Option<(usize, bool)>) {
+    if spec.is_empty() { return ("%lld".to_string(), None); }
     let last = spec.chars().last().unwrap();
     let prefix = &spec[..spec.len() - last.len_utf8()];
+
+    // Pull the leading width digits (after an optional `0` flag) so we
+    // can decide whether to route through the wide-hex helper. Examples:
+    //   "032x" → width 32, hex. "8d" → width 8, decimal. "x" → width 0.
+    let width: usize = {
+        let trimmed = prefix.trim_start_matches('0');
+        trimmed.chars().take_while(|c| c.is_ascii_digit()).collect::<String>()
+            .parse::<usize>().unwrap_or(0)
+    };
+
     match last {
-        'd' => format!("%{prefix}lld"),
-        'x' => format!("%{prefix}llx"),
-        'X' => format!("%{prefix}llX"),
-        'o' => format!("%{prefix}llo"),
-        _   => "%lld".to_string(),
+        'd' => (format!("%{prefix}lld"), None),
+        'o' => (format!("%{prefix}llo"), None),
+        'x' | 'X' if width > 16 => {
+            // Wide-hex: use `%s` and let the runtime helper format
+            // into a stack buffer. Width-pad and zero-pad both come
+            // from the helper itself.
+            ("%s".to_string(), Some((width, last == 'X')))
+        }
+        'x' => (format!("%{prefix}llx"), None),
+        'X' => (format!("%{prefix}llX"), None),
+        _   => ("%lld".to_string(), None),
     }
 }
 

@@ -71,6 +71,51 @@ end test T"#,
     assert!(err.0.contains("let dut"));
 }
 
+/// `${expr:WWx}` and `${expr:WWX}` format specs with WW > 16 route
+/// through the `HarcHexBuf128` runtime helper (printf `%s`) so the
+/// full ≤128-bit value prints. The current-default narrow path
+/// `(long long)(...)` would truncate to the lower 64 bits — fine
+/// for register dumps that fit in a uint64, useless for AES blocks.
+/// Specs with width ≤ 16 stay on the legacy `%llx` / `(long long)`
+/// path.
+#[test]
+fn wide_hex_format_spec_routes_through_hexbuf128() {
+    let parsed = parse_source(
+        r#"test T
+    let dut : DummyDut
+    scope sim
+        run
+            // Wide-hex spec — width 32 hex digits = 128 bits.
+            log(info, "ct=0x${dut.text_out:032x}")
+            // Narrow-hex spec — width 8 hex digits = stays on long long.
+            log(info, "narrow=0x${dut.x:08x}")
+            // Uppercase wide spec.
+            log(info, "CT=0x${dut.text_out:032X}")
+        end run
+    end scope sim
+end test T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+
+    // Wide-hex lowercase — printf `%s` + HarcHexBuf128 with upper=false.
+    assert!(cpp.contains("\"ct=0x%s\""),
+        "expected `%s` format token for wide-hex spec:\n{}", cpp);
+    assert!(cpp.contains("(const char*)harc_rt::HarcHexBuf128(harc_rt::harc_read(dut->text_out), 32, false)"),
+        "expected HarcHexBuf128 lowering for `:032x`:\n{}", cpp);
+
+    // Wide-hex uppercase — same shape, upper=true.
+    assert!(cpp.contains("(const char*)harc_rt::HarcHexBuf128(harc_rt::harc_read(dut->text_out), 32, true)"),
+        "expected HarcHexBuf128 lowering for `:032X`:\n{}", cpp);
+
+    // Narrow-hex stays on the legacy path.
+    assert!(cpp.contains("\"narrow=0x%08llx\""),
+        "expected `%08llx` for narrow `:08x` spec:\n{}", cpp);
+    assert!(!cpp.contains("HarcHexBuf128(harc_rt::harc_read(dut->x)") &&
+            !cpp.contains("HarcHexBuf128(dut->x"),
+        "narrow-hex spec must NOT route through HarcHexBuf128:\n{}", cpp);
+}
+
 /// Hex literals wider than 128 bits (>32 hex digits) overflow
 /// `_harc_u128` and route through the `harc_assign_words` /
 /// `harc_eq_words` runtime helpers — taking an

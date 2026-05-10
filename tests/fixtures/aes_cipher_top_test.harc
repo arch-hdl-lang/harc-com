@@ -79,7 +79,7 @@ test AesCipherTopTest
             assert dut.done == 1
                 else fail("Test 1: done never asserted within 14 cycles")
             assert dut.text_out == 0x69c4e0d86a7b0430d8cdb78070b4c55a
-                else fail("Test 1: text_out mismatch (expected 0x69c4e0d8_6a7b0430_d8cdb780_70b4c55a)")
+                else fail("Test 1: text_out=0x${dut.text_out:032x}, expected 0x69c4e0d86a7b0430d8cdb78070b4c55a")
             log(info, "Test 1 PASS: ciphertext = 69c4e0d8_6a7b0430_d8cdb780_70b4c55a")
 
             // ── Test 2: zero key, zero plaintext ──────────────────
@@ -91,7 +91,7 @@ test AesCipherTopTest
                 else fail("Test 2: done never asserted within 14 cycles")
             // AES-128(key=0, pt=0) = 0x66e94bd4ef8a2c3b884cfa59ca342b2e
             assert dut.text_out == 0x66e94bd4ef8a2c3b884cfa59ca342b2e
-                else fail("Test 2: text_out mismatch (expected 0x66e94bd4_ef8a2c3b_884cfa59_ca342b2e)")
+                else fail("Test 2: text_out=0x${dut.text_out:032x}, expected 0x66e94bd4ef8a2c3b884cfa59ca342b2e")
             log(info, "Test 2 PASS: ciphertext = 66e94bd4_ef8a2c3b_884cfa59_ca342b2e")
 
             log(info, "ALL 2 SUB-TESTS PASSED — AES-128 cipher")
