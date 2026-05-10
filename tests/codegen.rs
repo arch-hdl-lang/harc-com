@@ -71,6 +71,49 @@ end test T"#,
     assert!(err.0.contains("let dut"));
 }
 
+/// Hex literals wider than 64 bits (>16 hex digits) lower to a
+/// composite `_harc_u128` shifted-OR expression so they fit C++'s
+/// integer-literal grammar and flow through `harc_assign` /
+/// `harc_read` at full 128-bit precision. Mirrors arch-com's
+/// `_arch_u128` model (arch-com src/sim_codegen/mod.rs:767).
+#[test]
+fn wide_hex_literal_lowers_to_harc_u128_composite() {
+    let parsed = parse_source(
+        r#"test T
+    let dut : DummyDut
+    scope sim
+        run
+            dut.x = 0x000102030405060708090a0b0c0d0e0f
+            assert dut.y == 0x66e94bd4ef8a2c3b884cfa59ca342b2e
+                else fail("nope")
+        end run
+    end scope sim
+end test T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+
+    // The 128-bit literal `0x000102030405060708090a0b0c0d0e0f` should
+    // emit as `((_harc_u128)0x0001020304050607ULL << 64) |
+    //         (_harc_u128)0x08090a0b0c0d0e0fULL`.
+    assert!(
+        cpp.contains("(_harc_u128)0x0001020304050607ULL << 64") &&
+        cpp.contains("(_harc_u128)0x08090a0b0c0d0e0fULL"),
+        "expected composite _harc_u128 lowering for the assigned literal:\n{}", cpp,
+    );
+    assert!(
+        cpp.contains("(_harc_u128)0x66e94bd4ef8a2c3bULL << 64") &&
+        cpp.contains("(_harc_u128)0x884cfa59ca342b2eULL"),
+        "expected composite _harc_u128 lowering for the compared literal:\n{}", cpp,
+    );
+
+    // Narrow literals (<= 16 hex digits) stay as plain hex —
+    // no composite, no _harc_u128 cast.
+    assert!(!cpp.contains("(_harc_u128)0xDEADBEEF") &&
+            !cpp.contains("(_harc_u128)0xdeadbeef"),
+        "narrow hex shouldn't be wrapped:\n{}", cpp);
+}
+
 /// `wait N cycles` matches Verilog's `@(posedge clk)` semantic: values
 /// set in the segment BEFORE the wait are sampled at the next posedge.
 /// To honor this — including for the FIRST segment (set during
