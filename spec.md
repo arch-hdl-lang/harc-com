@@ -1035,7 +1035,7 @@ codegen-instantiated.
 
 ```mermaid
 flowchart TB
-    subgraph Test["test SimpleTest · scope sim · run"]
+    subgraph Test["test SimpleTest · impl sim for SimpleTest · run"]
         subgraph Env["env Env"]
             subgraph Agent["agent AxilAgent (active)"]
                 Seq["sequencer<br/>tseq RandomTxns<br/>→ dispatched"]
