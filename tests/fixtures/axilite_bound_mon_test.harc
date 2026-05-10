@@ -78,51 +78,52 @@ test AxiLiteBoundMonTest
     let axil : BusAxiLite = bind dut
     let drv  : AxilXactor active  = bind axil
     let mon  : AxilXactor passive = bind axil
-
-    scope sim
-        run
-            log(info, "AxiLiteRegs transactor passive-observer test")
-
-            // Reset.
-            dut.rst = 1
-            axil.aw.valid = 0
-            axil.w.valid = 0
-            axil.b.ready = 1
-            axil.ar.valid = 0
-            axil.r.ready = 1
-            dut.mm2s_done = 0
-            dut.mm2s_halted = 1
-            dut.mm2s_idle = 1
-            dut.s2mm_done = 0
-            dut.s2mm_halted = 1
-            dut.s2mm_idle = 1
-            dut.mm2s_sg_done = 0
-            dut.s2mm_sg_done = 0
-            dut.mm2s_sg_active = 0
-            dut.s2mm_sg_active = 0
-            wait 2 cycles
-            dut.rst = 0
-            wait 1 cycle
-
-            // Dispatch 5 transactions through the active transactor.
-            let txns = RandomTxns(5)
-            for t in txns
-                emit drv.req(t)
-            end for
-
-            // Wait for the driver to drain. Each round-trip ~7 cycles.
-            wait 60 cycles
-
-            // The passive instance pushed 5 observed write payloads
-            // and 5 observed read payloads into mon.sb. The active
-            // instance also has its own observation half firing into
-            // drv.sb, but the test only checks mon for clarity.
-            assert mon.sb.written.size() == 5
-                else fail("expected 5 writes observed, got ${mon.sb.written.size()}")
-            assert mon.sb.read.size() == 5
-                else fail("expected 5 reads observed, got ${mon.sb.read.size()}")
-
-            log(info, "PASS: passive transactor observed 5 writes + 5 reads")
-        end run
-    end scope sim
 end test AxiLiteBoundMonTest
+
+impl sim for AxiLiteBoundMonTest
+    run
+        log(info, "AxiLiteRegs transactor passive-observer test")
+
+        // Reset.
+        dut.rst = 1
+        axil.aw.valid = 0
+        axil.w.valid = 0
+        axil.b.ready = 1
+        axil.ar.valid = 0
+        axil.r.ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Dispatch 5 transactions through the active transactor.
+        let txns = RandomTxns(5)
+        for t in txns
+            emit drv.req(t)
+        end for
+
+        // Wait for the driver to drain. Each round-trip ~7 cycles.
+        wait 60 cycles
+
+        // The passive instance pushed 5 observed write payloads
+        // and 5 observed read payloads into mon.sb. The active
+        // instance also has its own observation half firing into
+        // drv.sb, but the test only checks mon for clarity.
+        assert mon.sb.written.size() == 5
+            else fail("expected 5 writes observed, got ${mon.sb.written.size()}")
+        assert mon.sb.read.size() == 5
+            else fail("expected 5 reads observed, got ${mon.sb.read.size()}")
+
+        log(info, "PASS: passive transactor observed 5 writes + 5 reads")
+    end run
+end impl AxiLiteBoundMonTest
+

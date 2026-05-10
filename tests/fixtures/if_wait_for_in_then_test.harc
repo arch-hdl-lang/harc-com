@@ -17,54 +17,55 @@ test IfWaitForInThenTest
     let done_pulses : uint<32> = 0
     let prev_done   : uint<32> = 0
     let cycles_since_last_done : uint<32> = 0
-
-    scope sim
-        run
-            log(info, "if_wait_for_in_then sim")
-
-            // Reset (active-low async): hold rst=0 for two cycles, then
-            // deassert. Mirrors the C++ TB's `tick(); tick();` under
-            // rst=0 followed by `rst=1; tick();`.
-            dut.rst = 0
-            dut.go = 0
-            dut.doit = 0
-            dut.ack = 0
-            dut.burst = 4
-            wait 2 cycles
-            dut.rst = 1
-            wait 1 cycle
-
-            // Trigger: pulse go=1 with doit=1 → take the then-branch
-            // and enter the for-loop.
-            dut.go = 1
-            dut.doit = 1
-            wait 1 cycle
-            dut.go = 0
-
-            // Strobe ack every third cycle and count `done` rising
-            // edges. The expected count is `burst = 4`. Bound the loop
-            // at 100 cycles so a stuck DUT doesn't hang the sim.
-            for c in 0 .. 100
-                if c % 3 == 0
-                    dut.ack = 1
-                else
-                    dut.ack = 0
-                end if
-                wait 1 cycle
-
-                if dut.done == 1 && prev_done == 0
-                    done_pulses = done_pulses + 1
-                    cycles_since_last_done = 0
-                else
-                    cycles_since_last_done = cycles_since_last_done + 1
-                end if
-                prev_done = dut.done
-            end for
-
-            log(info, "done_pulses=${done_pulses} (expected 4)")
-            assert done_pulses == 4
-                else fail("for-loop did not iterate the expected number of times: got ${done_pulses}, expected 4")
-            log(info, "PASS: for-loop iterated ${done_pulses} times correctly")
-        end run
-    end scope sim
 end test IfWaitForInThenTest
+
+impl sim for IfWaitForInThenTest
+    run
+        log(info, "if_wait_for_in_then sim")
+
+        // Reset (active-low async): hold rst=0 for two cycles, then
+        // deassert. Mirrors the C++ TB's `tick(); tick();` under
+        // rst=0 followed by `rst=1; tick();`.
+        dut.rst = 0
+        dut.go = 0
+        dut.doit = 0
+        dut.ack = 0
+        dut.burst = 4
+        wait 2 cycles
+        dut.rst = 1
+        wait 1 cycle
+
+        // Trigger: pulse go=1 with doit=1 → take the then-branch
+        // and enter the for-loop.
+        dut.go = 1
+        dut.doit = 1
+        wait 1 cycle
+        dut.go = 0
+
+        // Strobe ack every third cycle and count `done` rising
+        // edges. The expected count is `burst = 4`. Bound the loop
+        // at 100 cycles so a stuck DUT doesn't hang the sim.
+        for c in 0 .. 100
+            if c % 3 == 0
+                dut.ack = 1
+            else
+                dut.ack = 0
+            end if
+            wait 1 cycle
+
+            if dut.done == 1 && prev_done == 0
+                done_pulses = done_pulses + 1
+                cycles_since_last_done = 0
+            else
+                cycles_since_last_done = cycles_since_last_done + 1
+            end if
+            prev_done = dut.done
+        end for
+
+        log(info, "done_pulses=${done_pulses} (expected 4)")
+        assert done_pulses == 4
+            else fail("for-loop did not iterate the expected number of times: got ${done_pulses}, expected 4")
+        log(info, "PASS: for-loop iterated ${done_pulses} times correctly")
+    end run
+end impl IfWaitForInThenTest
+

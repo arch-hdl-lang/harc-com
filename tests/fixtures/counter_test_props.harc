@@ -5,7 +5,7 @@
 // increment the test's `errors` counter.
 //
 // Pass this file BEFORE counter_test_sim.harc so the checkers are
-// registered before the test's scope sim/run begins:
+// registered before the test's impl sim run begins:
 //
 //   harc sim --dut wrap_counter.arch
 //     counter_test.harc counter_test_props.harc counter_test_sim.harc

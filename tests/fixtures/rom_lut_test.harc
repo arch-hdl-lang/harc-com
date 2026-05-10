@@ -30,32 +30,33 @@ end covergroup RomCov
 test RomLutTest
     let dut : RomLut
     let cov : RomCov
-
-    scope sim
-        run
-            // Init inputs.
-            dut.rd_addr = 0
-            dut.rd_en = 0
-            wait 1 cycle
-
-            // Sweep all 8 addresses; values come from the inline-init
-            // array `[0x00, 0x31, 0x5A, 0x76, 0x7F, 0x76, 0x5A, 0x31]`.
-            assert read_addr(dut, 0) == 0   else fail("addr 0: got 0x${dut.rd_data:02x}")
-            assert read_addr(dut, 1) == 49  else fail("addr 1: got 0x${dut.rd_data:02x}")
-            assert read_addr(dut, 2) == 90  else fail("addr 2: got 0x${dut.rd_data:02x}")
-            assert read_addr(dut, 3) == 118 else fail("addr 3: got 0x${dut.rd_data:02x}")
-            assert read_addr(dut, 4) == 127 else fail("addr 4: got 0x${dut.rd_data:02x}")
-            assert read_addr(dut, 5) == 118 else fail("addr 5: got 0x${dut.rd_data:02x}")
-            assert read_addr(dut, 6) == 90  else fail("addr 6: got 0x${dut.rd_data:02x}")
-            assert read_addr(dut, 7) == 49  else fail("addr 7: got 0x${dut.rd_data:02x}")
-
-            log(info, "PASS: 8 ROM entries match the inline-init pattern")
-        end run
-
-        check
-            cov.report()
-            assert cov.cp_addr.a0 > 0 else fail("addr 0 coverage hole")
-            assert cov.cp_addr.a7 > 0 else fail("addr 7 coverage hole")
-        end check
-    end scope sim
 end test RomLutTest
+
+impl sim for RomLutTest
+    run
+        // Init inputs.
+        dut.rd_addr = 0
+        dut.rd_en = 0
+        wait 1 cycle
+
+        // Sweep all 8 addresses; values come from the inline-init
+        // array `[0x00, 0x31, 0x5A, 0x76, 0x7F, 0x76, 0x5A, 0x31]`.
+        assert read_addr(dut, 0) == 0   else fail("addr 0: got 0x${dut.rd_data:02x}")
+        assert read_addr(dut, 1) == 49  else fail("addr 1: got 0x${dut.rd_data:02x}")
+        assert read_addr(dut, 2) == 90  else fail("addr 2: got 0x${dut.rd_data:02x}")
+        assert read_addr(dut, 3) == 118 else fail("addr 3: got 0x${dut.rd_data:02x}")
+        assert read_addr(dut, 4) == 127 else fail("addr 4: got 0x${dut.rd_data:02x}")
+        assert read_addr(dut, 5) == 118 else fail("addr 5: got 0x${dut.rd_data:02x}")
+        assert read_addr(dut, 6) == 90  else fail("addr 6: got 0x${dut.rd_data:02x}")
+        assert read_addr(dut, 7) == 49  else fail("addr 7: got 0x${dut.rd_data:02x}")
+
+        log(info, "PASS: 8 ROM entries match the inline-init pattern")
+    end run
+
+    check
+        cov.report()
+        assert cov.cp_addr.a0 > 0 else fail("addr 0 coverage hole")
+        assert cov.cp_addr.a7 > 0 else fail("addr 7 coverage hole")
+    end check
+end impl RomLutTest
+

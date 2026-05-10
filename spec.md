@@ -738,10 +738,17 @@ for each cycle of domain D:
 
 This is the same execution shape as `arch sim`, extended with TB state. Co-compilation with the DUT means a single binary, single cache footprint, single optimizer pass.
 
-### 7.2 Lifecycle scope
+### 7.2 Lifecycle — `impl <target> for <Test>`
+
+A test declares its data — DUT pointer, transactor instances, scoreboards — inside its `test` block. Per-target *behavior* (what to drive at the pins, what to check, what to tear down) lives in a separate `impl <target> for <Test>` item. The shape mirrors Rust's `impl Trait for Type`:
 
 ```
-scope sim
+test SimpleTest
+    let dut  : Dut
+    let xact : T passive
+end test SimpleTest
+
+impl sim for SimpleTest
     setup
         ...                     // build connections; runs once before clocks start
     end setup
@@ -754,10 +761,41 @@ scope sim
     teardown
         ...                     // close handles
     end teardown
-end scope sim
+end impl SimpleTest
 ```
 
-`setup` / `run` / `check` / `teardown` are *blocks*, not virtual methods. No `super.build_phase()` ceremony, no objection counting, no end-of-test deadlock. `run` ends when its body completes (or when a `stop` is signalled); `check` runs after.
+`sim` is the native-simulator target; `emu` (post-v0) is the emulator target. The same `test SimpleTest` declaration can be implemented for both — `impl sim for SimpleTest` and `impl emu for SimpleTest` coexist as orthogonal top-level items, possibly in separate files. There is no inheritance / no `super` chain — each impl stands alone.
+
+`setup` / `run` / `check` / `teardown` are *blocks*, not virtual methods. No `super.build_phase()` ceremony, no objection counting, no end-of-test deadlock. `run` ends when its body completes (or when a `stop` is signalled); `check` runs after. **In v0 only `run` actually lowers** — `setup` / `check` / `teardown` parse and reserve the keyword but emit nothing yet (the surface is locked so fixtures don't need migration when codegen catches up).
+
+#### Custom phases — `phase <name>`
+
+A `run` body that gets long can be broken up into named helper blocks scoped to the impl:
+
+```
+impl sim for AesCipherTopTest
+    phase reset_dut
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+    end phase reset_dut
+
+    phase load_block
+        ...
+    end phase load_block
+
+    run
+        reset_dut()
+        load_block()
+        wait 14 cycles
+        assert dut.text_out == 0x69c4e0d8...
+    end run
+end impl AesCipherTopTest
+```
+
+Custom phases are **not auto-fired** by the runtime — only `run` is the runtime entry point. Phases are pure code-organization helpers: the user calls them explicitly by bare name from `run` (or from each other). They lower as `[&]`-capturing void-returning lambdas at main() scope alongside free functions, so `wait N cycles` inside a phase takes the synchronous `tick()` path (cooperative-scheduler safe — same model as `hookable` methods on transactors).
+
+This deliberately stops short of UVM-style phase ordering (`phase X before run`, `phase Y after check`). The named-block surface gets you readability without re-importing the phase-objection deadlocks UVM is famous for; if a test genuinely needs ordered hook firing, attach it via the existing `on <method> pre/post` machinery (§7.3).
 
 ### 7.3 Events as cycle-aligned channels
 
@@ -1520,17 +1558,17 @@ end env AxiTbEnv
 test SmokeTest
     let dut: AxiSlave#(AW=32, DW=64, IDW=4)
     let env: AxiTbEnv = bind dut.s_axi
-
-    scope sim
-        run
-            env.agent.sequencer.run(RandomTxns(1000))
-        end run
-        check
-            assert env.cov.cp_op.coverage > 95.0
-            assert env.sb.errors == 0
-        end check
-    end scope sim
 end test SmokeTest
+
+impl sim for SmokeTest
+    run
+        env.agent.sequencer.run(RandomTxns(1000))
+    end run
+    check
+        assert env.cov.cp_op.coverage > 95.0
+        assert env.sb.errors == 0
+    end check
+end impl SmokeTest
 
 // --- Test (short-burst regression — uses + applies the ShortBursts aspect)
 use tests.aspects.short_bursts        // makes the package visible
@@ -1540,16 +1578,16 @@ test ShortBurstSmoke
 
     let dut: AxiSlave#(AW=32, DW=64, IDW=4)
     let env: AxiTbEnv = bind dut.s_axi
-
-    scope sim
-        run
-            env.agent.sequencer.run(RandomTxns(500))   // ShortBursts constraints active
-        end run
-        check
-            assert env.sb.errors == 0
-        end check
-    end scope sim
 end test ShortBurstSmoke
+
+impl sim for ShortBurstSmoke
+    run
+        env.agent.sequencer.run(RandomTxns(500))   // ShortBursts constraints active
+    end run
+    check
+        assert env.sb.errors == 0
+    end check
+end impl ShortBurstSmoke
 ```
 
 This compiles to:
@@ -1566,7 +1604,7 @@ Carrying forward the April-13 list, with rationale specific to the sister-langua
 - **Class hierarchies for transactions.** ADTs with structural equality, `when` subtypes (§3.3), and `extend` aspects (§3.6) cover every `extends` use case more cleanly.
 - **`uvm_config_db`.** Static composition + generic parameters cover every legitimate use; the rest were UVM workarounds for SV's missing module-system features ARCH already has.
 - **Virtual interfaces.** `bound to ProtocolType` with typed cross-module references replaces the entire `vif` indirection.
-- **Phase macros (`build_phase`, `connect_phase`, etc.).** Replaced by `scope sim` with `setup` / `run` / `check` / `teardown` blocks.
+- **Phase macros (`build_phase`, `connect_phase`, etc.).** Replaced by `impl sim for <Test>` (§7.2) with `setup` / `run` / `check` / `teardown` blocks plus optional `phase <name>` user helpers. No phase-objection model — only `run` is a runtime entry point.
 - **Factory registration.** Generic parameters and explicit instantiation. No `uvm_object_utils`.
 - **Field automation (`uvm_field_*`).** ADT-derived deep equality, pack/unpack, and pretty-printing.
 - **TLM as a separate type hierarchy.** TLM is `event<T>` and `TSeq<T>` over typed values.
@@ -1609,7 +1647,7 @@ Honest about what is not pinned down:
 
 Build order matches the data path of a working testbench: stimulus generates traffic, observer reconstructs it, checker verifies it. Properties and coverage are *additions* to a working TB, not the foundation — they're useful only once stimulus exists to exercise the DUT. Each phase delivers user-visible value standalone — no big-bang.
 
-- **Phase 1a — Per-field stimulus, no constraint solver.** Transactions with default-rand fields and per-field attributes: `[range(...)]`, `[dist {...}]` (per-field weighted distribution), `[cyclic]`, `[unique]`, `[weighted(...)]`. `when` subtypes — discriminator-based variant selection plus per-field randomization within a variant. `tseq` with composition operators (`parallel`, `schedule`, `select`, `repeat` — §17.1), `sequencer`, active `transactor` bound to ARCH `bus` and dispatching through `handshake_channel` / `credit_channel` / `tlm_method`, `buffer<T>` flow object (§17.2), basic `test` and `scope sim` with `run` block, **logging with severity / verbosity / component IDs** (§7.7 — rides on the ARCH `log` primitive), **DUT backend abstraction with both ARCH co-compiled and Verilator-linked SV paths** (§10.5 — raw signal access on the SV path; protocol-typed binding deferred to v1.1). Static checker rejects any `keep` or `relation` referencing more than one field, with a clear error pointing to Phase 1b. **No SMT solver linked** — runtime is a standard PRNG library (xoshiro / PCG / Mersenne) with weighted-sample and cyclic-enumeration support. **Demo:** random valid AXI traffic drives a slave DUT through a HARC-compiled binary, against either an ARCH-native AXI slave or an existing SV AXI slave linked via Verilator; expressivity equivalent to SystemVerilog `$urandom_range` plus distributions and cyclic enumeration, with HARC's clean type system on top.
+- **Phase 1a — Per-field stimulus, no constraint solver.** Transactions with default-rand fields and per-field attributes: `[range(...)]`, `[dist {...}]` (per-field weighted distribution), `[cyclic]`, `[unique]`, `[weighted(...)]`. `when` subtypes — discriminator-based variant selection plus per-field randomization within a variant. `tseq` with composition operators (`parallel`, `schedule`, `select`, `repeat` — §17.1), `sequencer`, active `transactor` bound to ARCH `bus` and dispatching through `handshake_channel` / `credit_channel` / `tlm_method`, `buffer<T>` flow object (§17.2), basic `test` and `impl sim for <Test>` with `run` block, **logging with severity / verbosity / component IDs** (§7.7 — rides on the ARCH `log` primitive), **DUT backend abstraction with both ARCH co-compiled and Verilator-linked SV paths** (§10.5 — raw signal access on the SV path; protocol-typed binding deferred to v1.1). Static checker rejects any `keep` or `relation` referencing more than one field, with a clear error pointing to Phase 1b. **No SMT solver linked** — runtime is a standard PRNG library (xoshiro / PCG / Mersenne) with weighted-sample and cyclic-enumeration support. **Demo:** random valid AXI traffic drives a slave DUT through a HARC-compiled binary, against either an ARCH-native AXI slave or an existing SV AXI slave linked via Verilator; expressivity equivalent to SystemVerilog `$urandom_range` plus distributions and cyclic enumeration, with HARC's clean type system on top.
 
 - **Phase 1b — Constraint solver, queued randomize, full CRV.** Z3 integration (linked as off-cycle solver pool — §4.4), cross-field `keep` constraints in transactions, free-standing `relation` declarations (§4), `solve_before` / `solve_after` hints, the `dist` directive inside `randomize ... with { ... }` for cross-field weighted distributions, queued `randomize` with implicit single-shot result channel, `blocking randomize` semantics with compile-time enforcement when constraint references runtime DUT state, tagged-ADT encoding of `when` subtypes for solver pruning (§3.3 — `(declare-datatypes)` per-variant subproblems). Phase 1a code keeps working unchanged — Phase 1b lifts the cross-field restriction on the static checker and enables the solver path. **Demo:** classic AXI burst-legal generation with relational constraints (`len * size <= 4096 - addr % 4096`); solver pool sustains throughput against cycle-based simulation.
 
@@ -1678,8 +1716,8 @@ Every HARC construct has a direct lowering to an ARCH primitive — HARC adds th
 | `pseq` (temporal sequence)      | Inlined into the consuming property; same ARCH sugar | First-class only for composition / parameterization; no separate emission |
 | Module `contract` (assume/guarantee) | ARCH `bind` + assertions at boundaries           | Compositional formal scales via this                   |
 | `covergroup`                    | Generated coverage tracking module + ARCH `cover` properties | Coverage data is a typed value queryable from HARC |
-| `test`                          | ARCH `testbench` block                               | `scope sim` maps to testbench `init` / main / final    |
-| `scope sim` (with `setup`/`run`/`check`/`teardown` blocks) | testbench `init` + `sequence main` + post-run check task + cleanup task | Phase-block mapping |
+| `test`                          | ARCH `testbench` block                               | Holds DUT pointer + component instances; behavior lives in `impl sim for <Test>` |
+| `impl sim for <Test>` (with `setup`/`run`/`check`/`teardown` + custom `phase <name>` blocks) | testbench `init` + `sequence main` + post-run check task + cleanup task | Per-target test implementation; only `run` lowers in v0, others reserve the surface for emu / future codegen |
 | `ref module`                    | ARCH module with C function body via DPI             | Same as ARCH §22 reference modules                     |
 | `bus` port type                 | ARCH `bus` with `target` perspective                 | Per ARCH §24                                           |
 | ARCH DUT bind (`let dut: ArchModule = bind ...`) | Direct typed reference into ARCH IR; co-elaborated, single binary | Default fastest path                  |

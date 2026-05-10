@@ -8,62 +8,60 @@
 // Z3's random_seed is taken from harc_rng each call, so different `--seed`s
 // produce different satisfying solutions.
 
-extend AxiLiteConstraintTest
-    scope sim
-        run
-            log(info, "starting AxiLiteRegs constraint-solver fuzz test")
+impl sim for AxiLiteConstraintTest
+    run
+        log(info, "starting AxiLiteRegs constraint-solver fuzz test")
 
-            // ── Reset ─────────────────────────────────────────────────────
-            dut.rst = 1
-            dut.axil_aw_addr = 0
-            dut.axil_aw_valid = 0
-            dut.axil_w_data = 0
-            dut.axil_w_strb = 15
-            dut.axil_w_valid = 0
-            dut.axil_b_ready = 1
-            dut.axil_ar_addr = 0
-            dut.axil_ar_valid = 0
-            dut.axil_r_ready = 1
-            dut.mm2s_done = 0
-            dut.mm2s_halted = 1
-            dut.mm2s_idle = 1
-            dut.s2mm_done = 0
-            dut.s2mm_halted = 1
-            dut.s2mm_idle = 1
-            dut.mm2s_sg_done = 0
-            dut.s2mm_sg_done = 0
-            dut.mm2s_sg_active = 0
-            dut.s2mm_sg_active = 0
-            wait 2 cycles
-            dut.rst = 0
-            wait 1 cycle
+        // ── Reset ─────────────────────────────────────────────────────
+        dut.rst = 1
+        dut.axil_aw_addr = 0
+        dut.axil_aw_valid = 0
+        dut.axil_w_data = 0
+        dut.axil_w_strb = 15
+        dut.axil_w_valid = 0
+        dut.axil_b_ready = 1
+        dut.axil_ar_addr = 0
+        dut.axil_ar_valid = 0
+        dut.axil_r_ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
 
-            // ── 4 constrained-random iterations ───────────────────────────
-            // Constraints:
-            //   - addr is pinned to 0x18 (MM2S_SA, a known RW register)
-            //   - value > 0x10000   (large enough to exercise non-zero bits)
-            //   - value < 0x80000000  (fits comfortably in 32 bits)
-            //   - value % 4 == 0    (cache-line-style alignment)
-            // The solution space is large; Z3's soft preferences (one per
-            // field, target = harc_rng_next()) yield a diverse stream of
-            // satisfying assignments across iterations.
-            for i in 0 .. 4
-                let p : RegPair
-                randomize(p) with
-                    p.addr == 24
-                    p.value > 65536
-                    p.value < 2147483648
-                    (p.value & 3) == 0
-                end randomize
+        // ── 4 constrained-random iterations ───────────────────────────
+        // Constraints:
+        //   - addr is pinned to 0x18 (MM2S_SA, a known RW register)
+        //   - value > 0x10000   (large enough to exercise non-zero bits)
+        //   - value < 0x80000000  (fits comfortably in 32 bits)
+        //   - value % 4 == 0    (cache-line-style alignment)
+        // The solution space is large; Z3's soft preferences (one per
+        // field, target = harc_rng_next()) yield a diverse stream of
+        // satisfying assignments across iterations.
+        for i in 0 .. 4
+            let p : RegPair
+            randomize(p) with
+                p.addr == 24
+                p.value > 65536
+                p.value < 2147483648
+                (p.value & 3) == 0
+            end randomize
 
-                logf("axi_master.log", info,
-                     "constrained[${i}] addr=0x${p.addr:02x} value=0x${p.value:08x}")
-                axil_write(dut, p.addr, p.value)
-                let got = axil_read(dut, p.addr)
-                assert got == p.value else fail("constrained[${i}] mismatch: wrote 0x${p.value:08x}, got 0x${got:08x}")
-            end for
+            logf("axi_master.log", info,
+                 "constrained[${i}] addr=0x${p.addr:02x} value=0x${p.value:08x}")
+            axil_write(dut, p.addr, p.value)
+            let got = axil_read(dut, p.addr)
+            assert got == p.value else fail("constrained[${i}] mismatch: wrote 0x${p.value:08x}, got 0x${got:08x}")
+        end for
 
-            log(info, "PASS: 4 constraint-solved iterations on MM2S_SA")
-        end run
-    end scope sim
-end extend AxiLiteConstraintTest
+        log(info, "PASS: 4 constraint-solved iterations on MM2S_SA")
+    end run
+end impl AxiLiteConstraintTest

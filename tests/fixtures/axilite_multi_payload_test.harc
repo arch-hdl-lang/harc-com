@@ -71,57 +71,58 @@ test AxiLiteMultiPayloadTest
     let axil : BusAxiLite = bind dut
     let drv  : AxilXactor active  = bind axil
     let mon  : AxilXactor passive = bind axil
-
-    scope sim
-        run
-            log(info, "AxiLiteRegs multi-payload transactor test")
-
-            dut.rst = 1
-            axil.aw.valid = 0
-            axil.w.valid = 0
-            axil.b.ready = 1
-            axil.ar.valid = 0
-            axil.r.ready = 1
-            dut.mm2s_done = 0
-            dut.mm2s_halted = 1
-            dut.mm2s_idle = 1
-            dut.s2mm_done = 0
-            dut.s2mm_halted = 1
-            dut.s2mm_idle = 1
-            dut.mm2s_sg_done = 0
-            dut.s2mm_sg_done = 0
-            dut.mm2s_sg_active = 0
-            dut.s2mm_sg_active = 0
-            wait 2 cycles
-            dut.rst = 0
-            wait 1 cycle
-
-            let txns = RandomTxns(5)
-            for t in txns
-                emit drv.req(t)
-            end for
-            wait 60 cycles
-
-            // Active populated last_data and last_resp from the
-            // FINAL round-trip. AxiLiteRegs returns OKAY (resp=0)
-            // for valid register-bank reads.
-            assert drv.last_resp == 0
-                else fail("expected OKAY (resp=0) on final read, got resp=${drv.last_resp}")
-
-            // Passive pushed (data, resp) for each of 5 reads.
-            assert mon.sb.r_data.size() == 5
-                else fail("expected 5 r_data observations, got ${mon.sb.r_data.size()}")
-            assert mon.sb.r_resp.size() == 5
-                else fail("expected 5 r_resp observations, got ${mon.sb.r_resp.size()}")
-
-            // Drain the resp queue; every entry should be 0 (OKAY).
-            for _ in 0 .. 5
-                let r = mon.sb.r_resp.pop()
-                assert r == 0
-                    else fail("passive observer saw non-OKAY resp: ${r}")
-            end for
-
-            log(info, "PASS: multi-payload recv() + handshake() captured data + resp on 5 round-trips")
-        end run
-    end scope sim
 end test AxiLiteMultiPayloadTest
+
+impl sim for AxiLiteMultiPayloadTest
+    run
+        log(info, "AxiLiteRegs multi-payload transactor test")
+
+        dut.rst = 1
+        axil.aw.valid = 0
+        axil.w.valid = 0
+        axil.b.ready = 1
+        axil.ar.valid = 0
+        axil.r.ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        let txns = RandomTxns(5)
+        for t in txns
+            emit drv.req(t)
+        end for
+        wait 60 cycles
+
+        // Active populated last_data and last_resp from the
+        // FINAL round-trip. AxiLiteRegs returns OKAY (resp=0)
+        // for valid register-bank reads.
+        assert drv.last_resp == 0
+            else fail("expected OKAY (resp=0) on final read, got resp=${drv.last_resp}")
+
+        // Passive pushed (data, resp) for each of 5 reads.
+        assert mon.sb.r_data.size() == 5
+            else fail("expected 5 r_data observations, got ${mon.sb.r_data.size()}")
+        assert mon.sb.r_resp.size() == 5
+            else fail("expected 5 r_resp observations, got ${mon.sb.r_resp.size()}")
+
+        // Drain the resp queue; every entry should be 0 (OKAY).
+        for _ in 0 .. 5
+            let r = mon.sb.r_resp.pop()
+            assert r == 0
+                else fail("passive observer saw non-OKAY resp: ${r}")
+        end for
+
+        log(info, "PASS: multi-payload recv() + handshake() captured data + resp on 5 round-trips")
+    end run
+end impl AxiLiteMultiPayloadTest
+

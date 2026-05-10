@@ -121,17 +121,18 @@ fn ternary_round_trips() {
     let src = r#"
 test T
     let dut : X
-    scope sim
-        run
-            let a = 5
-            let b = 10
-            let c = a > 0 ? a : b
-            let d = a > 0 ? a > 5 ? 100 : 50 : -1
-            let e = (a > 0 ? a : b) + 1
-            wait 1 cycle
-        end run
-    end scope sim
 end test T
+
+impl sim for T
+    run
+        let a = 5
+        let b = 10
+        let c = a > 0 ? a : b
+        let d = a > 0 ? a > 5 ? 100 : 50 : -1
+        let e = (a > 0 ? a : b) + 1
+        wait 1 cycle
+    end run
+end impl T
 "#;
     let printed = parse_print_reparse(src);
     // Sanity-check that the parens around the ternary inside `e` survive
