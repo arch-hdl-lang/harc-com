@@ -924,35 +924,68 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     }
 
     writeln!(e.out, "{INDENT}// Drive the clock until the run coroutine completes.").ok();
+    writeln!(e.out, "{INDENT}//").ok();
+    writeln!(e.out, "{INDENT}// `wait N cycles` matches Verilog's `@(posedge clk)` semantic:").ok();
+    writeln!(e.out, "{INDENT}// values set in the segment BEFORE the wait are sampled at the").ok();
+    writeln!(e.out, "{INDENT}// next posedge. Per loop iteration:").ok();
+    writeln!(e.out, "{INDENT}//   1. Posedge (clk 0→1, eval) — DUT FFs latch the current input").ok();
+    writeln!(e.out, "{INDENT}//      values (set in the previous segment, or in bootstrap on").ok();
+    writeln!(e.out, "{INDENT}//      the first iteration).").ok();
+    writeln!(e.out, "{INDENT}//   2. `sched.tick()` — advance the run coroutine to its next").ok();
+    writeln!(e.out, "{INDENT}//      wait, setting the inputs for the NEXT cycle's posedge.").ok();
+    writeln!(e.out, "{INDENT}//   3. Falling edge (clk 1→0, eval) — comb re-settles with the").ok();
+    writeln!(e.out, "{INDENT}//      newly-set inputs.").ok();
+    writeln!(e.out, "{INDENT}//   4. Cycle counter + checkers.").ok();
+    writeln!(e.out, "{INDENT}// One initial `eval(clk=0)` before the loop settles combinational").ok();
+    writeln!(e.out, "{INDENT}// logic with the bootstrap inputs — same role as `initial`-block").ok();
+    writeln!(e.out, "{INDENT}// settle in Verilog. Each `wait 1 cycle` then maps to exactly").ok();
+    writeln!(e.out, "{INDENT}// one posedge that observes the just-set values.").ok();
     if mt {
-        writeln!(e.out, "{INDENT}// Per-cycle order: run-tick (may push to actor queues) →").ok();
-        writeln!(e.out, "{INDENT}// _start_barrier (release workers) → workers run their").ok();
-        writeln!(e.out, "{INDENT}// schedulers → _end_barrier (main waits) → eval + checkers.").ok();
-        writeln!(e.out, "{INDENT}// Run-coroutine writes complete BEFORE workers wake → no").ok();
-        writeln!(e.out, "{INDENT}// race on shared queues. Workers' DUT-input writes complete").ok();
-        writeln!(e.out, "{INDENT}// BEFORE eval → no race on signal state at posedge.").ok();
+        writeln!(e.out, "{INDENT}//").ok();
+        writeln!(e.out, "{INDENT}// MT mode: workers run between tick() and the falling edge,").ok();
+        writeln!(e.out, "{INDENT}// gated by _start_barrier / _end_barrier. Run-coroutine writes").ok();
+        writeln!(e.out, "{INDENT}// complete BEFORE workers wake → no race on shared queues.").ok();
+        writeln!(e.out, "{INDENT}// Workers' DUT-input writes complete BEFORE the falling-edge").ok();
+        writeln!(e.out, "{INDENT}// eval → no race on signal state.").ok();
     }
     if clocks.is_empty() {
+        // Initial comb settle — bootstrap's inputs propagate through
+        // combinational logic before the first posedge.
+        writeln!(e.out, "{INDENT}dut->clk = 0; dut->eval();").ok();
         writeln!(e.out, "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {{").ok();
+        // Posedge first — latches current input values.
+        writeln!(e.out, "{INDENT}{INDENT}dut->clk = 1; dut->eval();").ok();
+        // Then advance the run coroutine for the next cycle's inputs.
         writeln!(e.out, "{INDENT}{INDENT}sched.tick();").ok();
         if mt {
             writeln!(e.out, "{INDENT}{INDENT}_start_barrier.wait();").ok();
             writeln!(e.out, "{INDENT}{INDENT}_end_barrier.wait();").ok();
         }
+        // Falling edge + comb resettle with the new inputs.
         writeln!(e.out, "{INDENT}{INDENT}dut->clk = 0; dut->eval();").ok();
-        writeln!(e.out, "{INDENT}{INDENT}dut->clk = 1; dut->eval();").ok();
         writeln!(e.out, "{INDENT}{INDENT}cycle_count++;").ok();
         writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
         writeln!(e.out, "{INDENT}}}").ok();
     } else {
+        // Multi-clock: initial bare eval() to settle combinational
+        // logic with bootstrap inputs (no clock advancement). The
+        // loop's eval_clocks_until then advances time by one full
+        // primary-clock period per iteration. Posedge-vs-tick ordering
+        // is constrained by eval_clocks_until's atomic per-edge eval
+        // — we tick AFTER eval_clocks_until so the run coroutine
+        // observes the just-completed cycle's outputs and sets the
+        // next cycle's inputs in time for the following iteration's
+        // first edge. Same effect as the single-clock branch, just
+        // with the clock toggling factored into eval_clocks_until.
+        writeln!(e.out, "{INDENT}dut->eval();").ok();
         writeln!(e.out, "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {{").ok();
+        writeln!(e.out, "{INDENT}{INDENT}long long _target = now_ps + clocks_[0].half_period_ps * 2;").ok();
+        writeln!(e.out, "{INDENT}{INDENT}eval_clocks_until(_target);").ok();
         writeln!(e.out, "{INDENT}{INDENT}sched.tick();").ok();
         if mt {
             writeln!(e.out, "{INDENT}{INDENT}_start_barrier.wait();").ok();
             writeln!(e.out, "{INDENT}{INDENT}_end_barrier.wait();").ok();
         }
-        writeln!(e.out, "{INDENT}{INDENT}long long _target = now_ps + clocks_[0].half_period_ps * 2;").ok();
-        writeln!(e.out, "{INDENT}{INDENT}eval_clocks_until(_target);").ok();
         writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
         writeln!(e.out, "{INDENT}}}").ok();
     }

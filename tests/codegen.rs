@@ -71,6 +71,70 @@ end test T"#,
     assert!(err.0.contains("let dut"));
 }
 
+/// `wait N cycles` matches Verilog's `@(posedge clk)` semantic: values
+/// set in the segment BEFORE the wait are sampled at the next posedge.
+/// To honor this — including for the FIRST segment (set during
+/// `bootstrap()` before the loop) — the emitted main loop must:
+///
+/// 1. Do an initial `dut->eval()` with `clk=0` before the loop, so
+///    bootstrap's combinational outputs settle without advancing time.
+/// 2. Per loop iteration, do the posedge FIRST (clk 0→1, eval), then
+///    `sched.tick()` (advance run coroutine for next cycle's inputs),
+///    then the falling edge (clk 1→0, eval) for comb resettle.
+///
+/// Otherwise — if `tick()` happened first as it did pre-fix — the first
+/// iteration's tick would decrement the bootstrap slot's WaitCycles to
+/// 0 and run the next segment immediately, overwriting the bootstrap
+/// segment's outputs before any posedge could sample them.
+#[test]
+fn main_loop_settles_comb_before_first_posedge_then_posedge_before_tick() {
+    let parsed = parse_source(
+        r#"test T
+    let dut : DummyDut
+    scope sim
+        run
+            dut.x = 1
+            wait 1 cycle
+            dut.x = 2
+            wait 1 cycle
+        end run
+    end scope sim
+end test T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+
+    // Initial comb settle: `dut->clk = 0; dut->eval();` BEFORE the loop
+    // opens. There must be NO `clk = 1; eval();` between bootstrap and
+    // the loop (no posedge before loop).
+    let bootstrap_pos = cpp.find("sched.bootstrap()")
+        .expect("expected sched.bootstrap() call");
+    let loop_pos = cpp.find("while (_run_slot.kind != harc_rt::WaitKind::Done")
+        .expect("expected main run loop");
+    assert!(bootstrap_pos < loop_pos);
+    let between = &cpp[bootstrap_pos..loop_pos];
+    assert!(between.contains("dut->clk = 0; dut->eval();"),
+        "expected initial `dut->clk = 0; dut->eval();` between bootstrap and loop:\n{}", between);
+    assert!(!between.contains("dut->clk = 1; dut->eval();"),
+        "no posedge should appear between bootstrap and loop:\n{}", between);
+
+    // Inside the loop body, the order must be: clk=1 eval (posedge)
+    // FIRST, then sched.tick(), then clk=0 eval (falling).
+    let loop_body_end = cpp[loop_pos..].find("\n    }\n").map(|p| loop_pos + p)
+        .expect("expected loop close");
+    let body = &cpp[loop_pos..loop_body_end];
+    let posedge_pos = body.find("dut->clk = 1; dut->eval();")
+        .expect("expected posedge inside loop");
+    let tick_pos = body.find("sched.tick();")
+        .expect("expected sched.tick() inside loop");
+    let falling_pos = body.find("dut->clk = 0; dut->eval();")
+        .expect("expected falling edge inside loop");
+    assert!(posedge_pos < tick_pos && tick_pos < falling_pos,
+        "expected loop order: posedge → tick → falling. \
+         got posedge@{posedge_pos}, tick@{tick_pos}, falling@{falling_pos}\n\
+         body:\n{}", body);
+}
+
 /// `dut.<signal> = <expr>` and `dut.<signal>` accesses lower through
 /// `harc_rt::harc_assign(...)` and `harc_rt::harc_read(...)` so wide
 /// signals (Verilator's `VlWide<N>` for >64-bit ports) work without
