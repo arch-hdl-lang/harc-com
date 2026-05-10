@@ -213,8 +213,18 @@ module BufMgr #(
   // ══════════════════════════════════════════════════════════════════════════
   always_ff @(posedge clk) begin
     if (rst) begin
+      // ── Local edit vs the arch-com vendored copy ───────────────
+      // The three reset for-loops below use `=` (blocking) instead
+      // of `<=` (non-blocking). Functionally identical: rst is held
+      // for multiple cycles in every test, every array element is
+      // assigned exactly once, no inter-element dependencies. The
+      // change is needed because Verilator 5.020 (Ubuntu's apt
+      // package) rejects `<=` array assignment inside a for loop
+      // with a BLKLOOPINIT error; Verilator 5.034+ (current macOS
+      // Homebrew) accepts both. CI runs on Linux. See PR #41/#42
+      // for the rationale.
       for (int __ri0 = 0; __ri0 < 256; __ri0++) begin
-        count_arr[__ri0] <= 0;
+        count_arr[__ri0] = 0;
       end
       dq1_old_head <= 0;
       dq1_qn <= 0;
@@ -243,11 +253,11 @@ module BufMgr #(
       fl_buf_wr <= 0;
       free_count <= 0;
       for (int __ri0 = 0; __ri0 < 256; __ri0++) begin
-        head_arr[__ri0] <= 0;
+        head_arr[__ri0] = 0;
       end
       setup_done <= 0;
       for (int __ri0 = 0; __ri0 < 256; __ri0++) begin
-        tail_arr[__ri0] <= 0;
+        tail_arr[__ri0] = 0;
       end
     end else begin
       // ── Init: counter fills free-list banks; at_max signals completion ──

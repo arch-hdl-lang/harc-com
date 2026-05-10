@@ -65,7 +65,18 @@ copy tests/buf_mgr_sm/next_ptr_mem_sm.sv    next_ptr_mem_sm.sv
 copy tests/aes/aes_cipher_top.sv       aes_cipher_top.sv
 copy tests/aes/aes_key_expand_128.sv   aes_key_expand_128.sv
 copy tests/aes/xtime.sv                xtime.sv
+# NOTE: the vendored buf_mgr.sv has a small local patch for
+# Verilator-5.020 (Ubuntu apt) compatibility — three reset for-
+# loops use `=` instead of `<=`. Re-running this script overwrites
+# the patch; reapply by re-running the patching block below or by
+# diffing against an arch-com PR that lands the same fix upstream.
+# See the comment at line ~217 in buf_mgr.sv.
 copy tests/buf_mgr/buf_mgr.sv          buf_mgr.sv
+sed -i.bak \
+    -e 's/count_arr\[__ri0\] <= 0;/count_arr[__ri0] = 0;/' \
+    -e 's/head_arr\[__ri0\] <= 0;/head_arr[__ri0] = 0;/' \
+    -e 's/tail_arr\[__ri0\] <= 0;/tail_arr[__ri0] = 0;/' \
+    "$DST_DIR/buf_mgr.sv" && rm -f "$DST_DIR/buf_mgr.sv.bak"
 copy tests/buf_mgr/data_mem.sv         data_mem.sv
 copy tests/buf_mgr/next_ptr_mem.sv     next_ptr_mem.sv
 copy tests/buf_mgr/free_list_bank.sv   free_list_bank.sv
