@@ -987,6 +987,65 @@ This is where the "wide" scope decision pays off. Each verification role becomes
 
 **SW/HW boundary.** The transactor is the seam. Everything below it (DUT pins, the protocol BFM threads inside the transactor, possibly the DUT itself) compiles to RTL and runs at HW speed. Everything above it (sequencer, scoreboard, env, test, run coroutine) stays SW. The two sides communicate over **transaction-level pipes** following the Accellera SCE-MI 2.4 standard: input pipes carry transactions from sequencer/test → transactor; output pipes carry observations from transactor → scoreboard/test. Same source-level constructs work in `harc sim` (pipes are shared memory + DPI-C, near-zero overhead) and on emulator backends (pipes are vendor DMA channels). See §8.1 for the lowering.
 
+**Topology at a glance.** A canonical bound-bus test composes as below: the
+test holds a bus binding and an env; the env holds an agent and a scoreboard;
+the agent bundles a sequencer with its transactor and the connect bridge
+between them. Stimulus flows out through the transactor's active half;
+observation flows in through its passive half. Both halves share the same
+transactor declaration — `when active|passive` selects which body is
+codegen-instantiated.
+
+```mermaid
+flowchart TB
+    subgraph Test["test SimpleTest · scope sim · run"]
+        subgraph Env["env Env"]
+            subgraph Agent["agent AxilAgent (active)"]
+                Seq["sequencer<br/>tseq RandomTxns<br/>→ dispatched"]
+                Xact["transactor xact<br/>when active<br/>req : in event&lt;T&gt;<br/>on req(t) → bus.aw.send(...)"]
+                Seq -- "connect dispatched → req" --> Xact
+            end
+            SB["scoreboard<br/>expected : queue&lt;T&gt;<br/>on bus.&lt;ch&gt;.handshake<br/>assert observed == expected"]
+            Xact -. "connect xact.completed → sb.observed" .-> SB
+        end
+        Bus[/"bus axil : BusAxiLite = bind dut"/]
+    end
+    DUT[("DUT<br/>Verilator-compiled SystemVerilog<br/>V&lt;TopModule&gt;*")]
+
+    Xact ==> |"stimulus<br/>(active half)"| Bus
+    Bus ==> DUT
+    DUT -. "observation<br/>(passive half)" .-> Bus
+    Bus -. observe .-> SB
+
+    classDef testStyle fill:#fafafa,stroke:#333,stroke-width:2px,stroke-dasharray:4 3;
+    classDef envStyle fill:#f0f4f8,stroke:#335577;
+    classDef agentStyle fill:#f4ece0,stroke:#8a5a1a;
+    classDef seqStyle fill:#fff7e0,stroke:#8a6a1a;
+    classDef xactStyle fill:#e8f0fe,stroke:#1a4a8a;
+    classDef sbStyle fill:#e8f8ec,stroke:#1a7a3a;
+    classDef dutStyle fill:#f7e8e8,stroke:#8a1a1a,stroke-width:2px;
+    classDef busStyle fill:#f0f4f8,stroke:#335577;
+
+    class Test testStyle;
+    class Env envStyle;
+    class Agent agentStyle;
+    class Seq seqStyle;
+    class Xact xactStyle;
+    class SB sbStyle;
+    class DUT dutStyle;
+    class Bus busStyle;
+```
+
+**Mode reuse.** The same transactor declaration covers active and passive
+contexts via mode inheritance from the let-instantiation:
+
+```harc
+let act : E active     // act.ag.xact gets active body
+let pas : E passive    // pas.ag.xact gets passive body — same decl
+```
+
+Mode flows all the way down: env → agent → transactor field. Field-level
+explicit modes (`drv : T active`) win over inherited ones at any depth.
+
 **v0 lowering status.** `transactor` (§8.1) is the canonical BFM construct. SW-side codegen is complete (T-1 + T-2: parse, AST, pretty-print round-trip, end-to-end lowered by cpp_tb). The legacy `driver`/`monitor` constructs that predated `transactor` have been removed from the language; existing TBs ported their drivers and monitors to transactor form. ARCH-side `generate_if ACTIVE` lowering (T-3) and emulator transport (T-4) remain scheduled for post-v0. The bullets below describe what cpp_tb actually emits.
 
 - `tseq T -> TSeq<X>` → `[&]`-lambda returning `std::vector<X>`. `yield e` pushes to the implicit `_result` accumulator. Iterate the result with `for x in seq`.
@@ -1307,6 +1366,55 @@ ISA-spec embedding: a Sail model compiles to a `ref module` via the C-emulator p
 ### 10.1 Native simulator — `harc sim`
 
 **Cycle-based, statically scheduled, co-compiled with ARCH.** No event-driven kernel.
+
+**v0 toolchain.** `harc sim --sv <dut.sv> <test.harc> --top <TopModule>` parses
+the HARC source, lowers it to a single `.cpp` testbench plus the runtime
+header, and chains through Verilator to produce a self-contained binary. Run
+the binary to see `ALL TESTS PASSED` or `N TESTS FAILED`.
+
+```mermaid
+flowchart TB
+    Harc["HARC source<br/>tests/fixtures/*.harc<br/>tests, transactors, agents,<br/>scoreboards"]
+    Sv["SystemVerilog DUT<br/>tests/dut/*.sv"]
+    Rt["Runtime header<br/>runtime/harc_thread_rt.h<br/>scheduler + helpers"]
+    Manifest["Manifest (sweep only)<br/>tests/run_fixtures.sh<br/>name | top | sv files | extras"]
+
+    Cli["harc CLI (Rust)<br/>harc sim --sv ... --top ... &lt;harc files&gt;<br/>parser (LL(1)) → AST → cpp_tb codegen<br/>+ writes harc_thread_rt.h alongside the .cpp"]
+
+    Cpp["Generated testbench<br/>harc_sim_build/&lt;test&gt;.cpp<br/>main() drives clock<br/>sched.bootstrap() → eval(clk=0)<br/>loop: posedge → tick → falling"]
+    RtGen["Generated runtime + glue<br/>harc_sim_build/harc_thread_rt.h<br/>_harc_u128, harc_assign/read,<br/>harc_assign_words/eq_words,<br/>HarcHexBuf128, ThreadScheduler"]
+
+    Vrl["Verilator<br/>--cc --exe --build<br/>CFG_CXXFLAGS_STD=-std=gnu++20<br/>CXX=clang++ via MAKEFLAGS"]
+
+    Bin(["V&lt;TopModule&gt; test binary"])
+    Out[/"stdout + sim.log<br/>cycle-stamped log<br/>ALL TESTS PASSED / N TESTS FAILED<br/>exit 0/1"/]
+
+    Harc --> Cli
+    Sv --> Cli
+    Sv -. SV inputs .-> Vrl
+    Cli --> Cpp
+    Cli --> RtGen
+    Rt -. baked in .-> Cli
+    Cpp --> Vrl
+    RtGen --> Vrl
+    Vrl --> Bin
+    Bin -- run --> Out
+    Manifest -. drives sweep .-> Cli
+
+    classDef src fill:#fff7e0,stroke:#8a6a1a;
+    classDef tool fill:#e8f0fe,stroke:#1a4a8a,stroke-width:2px;
+    classDef gen fill:#f0f4f8,stroke:#335577;
+    classDef vrl fill:#f4ece0,stroke:#8a5a1a,stroke-width:2px;
+    classDef bin fill:#e8f8ec,stroke:#1a7a3a,stroke-width:2px;
+    classDef out fill:#f7e8e8,stroke:#8a1a1a;
+
+    class Harc,Sv,Rt,Manifest src;
+    class Cli tool;
+    class Cpp,RtGen gen;
+    class Vrl vrl;
+    class Bin bin;
+    class Out out;
+```
 
 Compilation produces a single C++ binary linking:
 - ARCH design → C++ via the existing ARCH backend (Verilator-class)
