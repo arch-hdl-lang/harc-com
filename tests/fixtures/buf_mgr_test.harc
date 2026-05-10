@@ -138,127 +138,128 @@ end transactor BufMgrXactor
 test BufMgrTest
     let dut  : BufMgr
     let xact : BufMgrXactor passive
-
-    scope sim
-        run
-            log(info, "BufMgr: 256-queue shared buffer manager — 7 sub-tests")
-            xact.dut = dut
-
-            // ── Test 1: Reset + Init ────────────────────────────────
-            xact.init_dut()
-            xact.reset_dut()
-            assert dut.init_done == 0
-                else fail("Test 1: init_done=${dut.init_done} after reset, expected 0")
-
-            let init_cycles = xact.wait_init()
-            assert dut.init_done == 1
-                else fail("Test 1: init_done not asserted after ${init_cycles} cycles")
-            assert dut.free_count_out == 16384
-                else fail("Test 1: free_count=${dut.free_count_out}, expected 16384")
-            log(info, "Test 1 PASS: init_done after ${init_cycles} cycles, free_count=16384")
-
-            // ── Test 2: Single enqueue + dequeue (queue 0) ─────────
-            xact.enqueue(0, 0xDEADBEEF)
-            xact.idle(4)
-
-            let v2 = xact.dequeue(0)
-            assert v2 == 0xDEADBEEF
-                else fail("Test 2: dequeue(q=0)=0x${v2:08x}, expected 0xDEADBEEF")
-            xact.idle(4)
-            log(info, "Test 2 PASS: single enqueue/dequeue queue 0")
-
-            // ── Test 3: Multi-queue ────────────────────────────────
-            xact.enqueue(0, 0x100)
-            xact.enqueue(1, 0x200)
-            xact.enqueue(2, 0x300)
-            xact.idle(6)
-
-            let v3a = xact.dequeue(0)
-            assert v3a == 0x100
-                else fail("Test 3: dequeue(q=0)=0x${v3a:08x}, expected 0x00000100")
-            xact.idle(2)
-            let v3b = xact.dequeue(1)
-            assert v3b == 0x200
-                else fail("Test 3: dequeue(q=1)=0x${v3b:08x}, expected 0x00000200")
-            xact.idle(2)
-            let v3c = xact.dequeue(2)
-            assert v3c == 0x300
-                else fail("Test 3: dequeue(q=2)=0x${v3c:08x}, expected 0x00000300")
-            xact.idle(4)
-            log(info, "Test 3 PASS: multi-queue enqueue/dequeue (q0,q1,q2)")
-
-            // ── Test 4: FIFO order — 4 items to queue 5 ────────────
-            xact.enqueue(5, 0xA0)
-            xact.enqueue(5, 0xA1)
-            xact.enqueue(5, 0xA2)
-            xact.enqueue(5, 0xA3)
-            xact.idle(6)
-
-            for i in 0 .. 4
-                let v4 = xact.dequeue(5)
-                let expect4 = 0xA0 + i
-                assert v4 == expect4
-                    else fail("Test 4: dequeue(q=5)[${i}]=0x${v4:08x}, expected 0x${expect4:08x}")
-                xact.idle(2)
-            end for
-            log(info, "Test 4 PASS: FIFO order on queue 5 (4 items)")
-
-            // ── Test 5: Back-to-back enqueue same queue ───────────
-            // valid held high across 3 cycles with changing data. The
-            // 3-cycle valid-held sequence runs inside the transactor so
-            // `wait 1 cycle` lowers to a synchronous `tick()` (see
-            // method-level comment for why this matters).
-            xact.enqueue_b2b3(10, 0xB0, 0xB1, 0xB2)
-            xact.idle(6)
-
-            let v5a = xact.dequeue(10)
-            assert v5a == 0xB0
-                else fail("Test 5: dequeue(q=10)[0]=0x${v5a:08x}, expected 0x000000B0")
-            xact.idle(2)
-            let v5b = xact.dequeue(10)
-            assert v5b == 0xB1
-                else fail("Test 5: dequeue(q=10)[1]=0x${v5b:08x}, expected 0x000000B1")
-            xact.idle(2)
-            let v5c = xact.dequeue(10)
-            assert v5c == 0xB2
-                else fail("Test 5: dequeue(q=10)[2]=0x${v5c:08x}, expected 0x000000B2")
-            xact.idle(4)
-            log(info, "Test 5 PASS: back-to-back enqueue queue 10 (3 cycles)")
-
-            // ── Test 6: Simultaneous enqueue + dequeue (diff queues) ─
-            xact.enqueue(20, 0xC0)
-            xact.idle(6)
-
-            // Same-cycle enqueue(q=21, 0xC1) + dequeue(q=20). Runs in
-            // the transactor for the same wait-1-cycle reason as Test 5.
-            xact.enqueue_dequeue_simul(21, 0xC1, 20)
-
-            assert dut.dequeue_resp_valid == 1
-                else fail("Test 6: simul deq resp_valid=${dut.dequeue_resp_valid}, expected 1")
-            assert dut.dequeue_data == 0xC0
-                else fail("Test 6: simul deq(q=20)=0x${dut.dequeue_data:08x}, expected 0x000000C0")
-            xact.idle(6)
-
-            let v6 = xact.dequeue(21)
-            assert v6 == 0xC1
-                else fail("Test 6: dequeue(q=21) after simul=0x${v6:08x}, expected 0x000000C1")
-            log(info, "Test 6 PASS: simultaneous enqueue(q=21) + dequeue(q=20)")
-
-            // ── Test 7: High queue numbers — stress 256-queue array ─
-            xact.enqueue(255, 0xFF00)
-            xact.enqueue(128, 0x8000)
-            xact.idle(6)
-
-            let v7a = xact.dequeue(255)
-            assert v7a == 0xFF00
-                else fail("Test 7: dequeue(q=255)=0x${v7a:08x}, expected 0x0000FF00")
-            xact.idle(2)
-            let v7b = xact.dequeue(128)
-            assert v7b == 0x8000
-                else fail("Test 7: dequeue(q=128)=0x${v7b:08x}, expected 0x00008000")
-            log(info, "Test 7 PASS: high queue numbers (q=255, q=128)")
-
-            log(info, "ALL 7 SUB-TESTS PASSED — BufMgr 256-queue buffer manager coverage")
-        end run
-    end scope sim
 end test BufMgrTest
+
+impl sim for BufMgrTest
+    run
+        log(info, "BufMgr: 256-queue shared buffer manager — 7 sub-tests")
+        xact.dut = dut
+
+        // ── Test 1: Reset + Init ────────────────────────────────
+        xact.init_dut()
+        xact.reset_dut()
+        assert dut.init_done == 0
+            else fail("Test 1: init_done=${dut.init_done} after reset, expected 0")
+
+        let init_cycles = xact.wait_init()
+        assert dut.init_done == 1
+            else fail("Test 1: init_done not asserted after ${init_cycles} cycles")
+        assert dut.free_count_out == 16384
+            else fail("Test 1: free_count=${dut.free_count_out}, expected 16384")
+        log(info, "Test 1 PASS: init_done after ${init_cycles} cycles, free_count=16384")
+
+        // ── Test 2: Single enqueue + dequeue (queue 0) ─────────
+        xact.enqueue(0, 0xDEADBEEF)
+        xact.idle(4)
+
+        let v2 = xact.dequeue(0)
+        assert v2 == 0xDEADBEEF
+            else fail("Test 2: dequeue(q=0)=0x${v2:08x}, expected 0xDEADBEEF")
+        xact.idle(4)
+        log(info, "Test 2 PASS: single enqueue/dequeue queue 0")
+
+        // ── Test 3: Multi-queue ────────────────────────────────
+        xact.enqueue(0, 0x100)
+        xact.enqueue(1, 0x200)
+        xact.enqueue(2, 0x300)
+        xact.idle(6)
+
+        let v3a = xact.dequeue(0)
+        assert v3a == 0x100
+            else fail("Test 3: dequeue(q=0)=0x${v3a:08x}, expected 0x00000100")
+        xact.idle(2)
+        let v3b = xact.dequeue(1)
+        assert v3b == 0x200
+            else fail("Test 3: dequeue(q=1)=0x${v3b:08x}, expected 0x00000200")
+        xact.idle(2)
+        let v3c = xact.dequeue(2)
+        assert v3c == 0x300
+            else fail("Test 3: dequeue(q=2)=0x${v3c:08x}, expected 0x00000300")
+        xact.idle(4)
+        log(info, "Test 3 PASS: multi-queue enqueue/dequeue (q0,q1,q2)")
+
+        // ── Test 4: FIFO order — 4 items to queue 5 ────────────
+        xact.enqueue(5, 0xA0)
+        xact.enqueue(5, 0xA1)
+        xact.enqueue(5, 0xA2)
+        xact.enqueue(5, 0xA3)
+        xact.idle(6)
+
+        for i in 0 .. 4
+            let v4 = xact.dequeue(5)
+            let expect4 = 0xA0 + i
+            assert v4 == expect4
+                else fail("Test 4: dequeue(q=5)[${i}]=0x${v4:08x}, expected 0x${expect4:08x}")
+            xact.idle(2)
+        end for
+        log(info, "Test 4 PASS: FIFO order on queue 5 (4 items)")
+
+        // ── Test 5: Back-to-back enqueue same queue ───────────
+        // valid held high across 3 cycles with changing data. The
+        // 3-cycle valid-held sequence runs inside the transactor so
+        // `wait 1 cycle` lowers to a synchronous `tick()` (see
+        // method-level comment for why this matters).
+        xact.enqueue_b2b3(10, 0xB0, 0xB1, 0xB2)
+        xact.idle(6)
+
+        let v5a = xact.dequeue(10)
+        assert v5a == 0xB0
+            else fail("Test 5: dequeue(q=10)[0]=0x${v5a:08x}, expected 0x000000B0")
+        xact.idle(2)
+        let v5b = xact.dequeue(10)
+        assert v5b == 0xB1
+            else fail("Test 5: dequeue(q=10)[1]=0x${v5b:08x}, expected 0x000000B1")
+        xact.idle(2)
+        let v5c = xact.dequeue(10)
+        assert v5c == 0xB2
+            else fail("Test 5: dequeue(q=10)[2]=0x${v5c:08x}, expected 0x000000B2")
+        xact.idle(4)
+        log(info, "Test 5 PASS: back-to-back enqueue queue 10 (3 cycles)")
+
+        // ── Test 6: Simultaneous enqueue + dequeue (diff queues) ─
+        xact.enqueue(20, 0xC0)
+        xact.idle(6)
+
+        // Same-cycle enqueue(q=21, 0xC1) + dequeue(q=20). Runs in
+        // the transactor for the same wait-1-cycle reason as Test 5.
+        xact.enqueue_dequeue_simul(21, 0xC1, 20)
+
+        assert dut.dequeue_resp_valid == 1
+            else fail("Test 6: simul deq resp_valid=${dut.dequeue_resp_valid}, expected 1")
+        assert dut.dequeue_data == 0xC0
+            else fail("Test 6: simul deq(q=20)=0x${dut.dequeue_data:08x}, expected 0x000000C0")
+        xact.idle(6)
+
+        let v6 = xact.dequeue(21)
+        assert v6 == 0xC1
+            else fail("Test 6: dequeue(q=21) after simul=0x${v6:08x}, expected 0x000000C1")
+        log(info, "Test 6 PASS: simultaneous enqueue(q=21) + dequeue(q=20)")
+
+        // ── Test 7: High queue numbers — stress 256-queue array ─
+        xact.enqueue(255, 0xFF00)
+        xact.enqueue(128, 0x8000)
+        xact.idle(6)
+
+        let v7a = xact.dequeue(255)
+        assert v7a == 0xFF00
+            else fail("Test 7: dequeue(q=255)=0x${v7a:08x}, expected 0x0000FF00")
+        xact.idle(2)
+        let v7b = xact.dequeue(128)
+        assert v7b == 0x8000
+            else fail("Test 7: dequeue(q=128)=0x${v7b:08x}, expected 0x00008000")
+        log(info, "Test 7 PASS: high queue numbers (q=255, q=128)")
+
+        log(info, "ALL 7 SUB-TESTS PASSED — BufMgr 256-queue buffer manager coverage")
+    end run
+end impl BufMgrTest
+

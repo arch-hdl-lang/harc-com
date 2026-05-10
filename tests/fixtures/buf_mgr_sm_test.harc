@@ -115,128 +115,129 @@ end transactor BufMgrXactor
 test BufMgrSmTest
     let dut  : BufMgrSm
     let xact : BufMgrXactor passive
-
-    scope sim
-        run
-            log(info, "BufMgrSm small-variant test (16x32, 4 queues)")
-            xact.dut = dut
-
-            // ── Test 1: Reset + Init ────────────────────────────
-            xact.reset_dut()
-            assert dut.init_done == 0
-                else fail("Test 1: init_done=${dut.init_done} expected 0 right after reset")
-
-            xact.wait_init()
-            assert dut.init_done == 1
-                else fail("Test 1: init_done=${dut.init_done} expected 1 after init")
-            assert dut.free_count_out == 16
-                else fail("Test 1: free_count=${dut.free_count_out} expected 16 after init")
-            log(info, "Test 1 PASS: reset + init_done + free_count==16")
-
-            // ── Test 2: Single enqueue + dequeue (queue 0) ──────
-            xact.enqueue(0, 0xDEAD)
-            xact.idle_n(4)
-
-            let v2 = xact.dequeue_one(0)
-            assert dut.dequeue_resp_valid == 1
-                else fail("Test 2: dequeue_resp_valid=${dut.dequeue_resp_valid} expected 1")
-            assert v2 == 0xDEAD
-                else fail("Test 2: dequeue(q=0) got 0x${v2:08x} expected 0x0000DEAD")
-            xact.idle_n(4)
-            assert dut.free_count_out == 16
-                else fail("Test 2: free_count=${dut.free_count_out} expected 16 after dequeue")
-            log(info, "Test 2 PASS: single enqueue/dequeue queue 0")
-
-            // ── Test 3: Multi-queue (q0,q1,q2) ──────────────────
-            xact.enqueue(0, 0x100)
-            xact.enqueue(1, 0x200)
-            xact.enqueue(2, 0x300)
-            xact.idle_n(6)
-            assert dut.free_count_out == 13
-                else fail("Test 3: free_count=${dut.free_count_out} expected 13 after 3 enqueues")
-
-            let v3a = xact.dequeue_one(0)
-            assert v3a == 0x100
-                else fail("Test 3: dequeue(q=0) got 0x${v3a:08x} expected 0x100")
-            xact.idle_n(2)
-            let v3b = xact.dequeue_one(1)
-            assert v3b == 0x200
-                else fail("Test 3: dequeue(q=1) got 0x${v3b:08x} expected 0x200")
-            xact.idle_n(2)
-            let v3c = xact.dequeue_one(2)
-            assert v3c == 0x300
-                else fail("Test 3: dequeue(q=2) got 0x${v3c:08x} expected 0x300")
-            xact.idle_n(4)
-            assert dut.free_count_out == 16
-                else fail("Test 3: free_count=${dut.free_count_out} expected 16 after 3 dequeues")
-            log(info, "Test 3 PASS: multi-queue independence (q0,q1,q2)")
-
-            // ── Test 4: FIFO order, 4 items to queue 3 ─────────
-            xact.enqueue(3, 0xA0)
-            xact.enqueue(3, 0xA1)
-            xact.enqueue(3, 0xA2)
-            xact.enqueue(3, 0xA3)
-            xact.idle_n(6)
-            assert dut.free_count_out == 12
-                else fail("Test 4: free_count=${dut.free_count_out} expected 12 after 4 enqueues")
-
-            for i in 0 .. 4
-                let vi = xact.dequeue_one(3)
-                let expected = 0xA0 + i
-                assert vi == expected
-                    else fail("Test 4: dequeue(q=3)[${i}] got 0x${vi:08x} expected 0x${expected:08x}")
-                xact.idle_n(2)
-            end for
-            assert dut.free_count_out == 16
-                else fail("Test 4: free_count=${dut.free_count_out} expected 16 after 4 dequeues")
-            log(info, "Test 4 PASS: FIFO order on queue 3")
-
-            // ── Test 5: Back-to-back enqueue queue 1 ────────────
-            // Hold enqueue_valid high across 3 cycles, varying data.
-            xact.enqueue_b2b3(1, 0xB0, 0xB1, 0xB2)
-            xact.idle_n(6)
-            assert dut.free_count_out == 13
-                else fail("Test 5: free_count=${dut.free_count_out} expected 13 after 3 b2b enqueues")
-
-            let v5a = xact.dequeue_one(1)
-            assert v5a == 0xB0
-                else fail("Test 5: dequeue(q=1)[0] got 0x${v5a:08x} expected 0xB0")
-            xact.idle_n(2)
-            let v5b = xact.dequeue_one(1)
-            assert v5b == 0xB1
-                else fail("Test 5: dequeue(q=1)[1] got 0x${v5b:08x} expected 0xB1")
-            xact.idle_n(2)
-            let v5c = xact.dequeue_one(1)
-            assert v5c == 0xB2
-                else fail("Test 5: dequeue(q=1)[2] got 0x${v5c:08x} expected 0xB2")
-            xact.idle_n(4)
-            assert dut.free_count_out == 16
-                else fail("Test 5: free_count=${dut.free_count_out} expected 16 after b2b drain")
-            log(info, "Test 5 PASS: back-to-back enqueue holds valid")
-
-            // ── Test 6: Simultaneous enqueue(q3) + dequeue(q2) ──
-            xact.enqueue(2, 0xC0)
-            xact.idle_n(6)
-
-            // Same-cycle assertion of both valids targeting different
-            // queues. The C++ TB drives both for one cycle, then
-            // deasserts and waits one more for the dequeue response.
-            xact.enqueue_dequeue_simul(3, 0xC1, 2)
-            assert dut.dequeue_resp_valid == 1
-                else fail("Test 6: simul dequeue resp_valid=${dut.dequeue_resp_valid} expected 1")
-            assert dut.dequeue_data == 0xC0
-                else fail("Test 6: simul dequeue(q=2) got 0x${dut.dequeue_data:08x} expected 0xC0")
-            xact.idle_n(6)
-
-            let v6 = xact.dequeue_one(3)
-            assert v6 == 0xC1
-                else fail("Test 6: dequeue(q=3) after simul-enq got 0x${v6:08x} expected 0xC1")
-            xact.idle_n(4)
-            assert dut.free_count_out == 16
-                else fail("Test 6: free_count=${dut.free_count_out} expected 16 after simul test")
-            log(info, "Test 6 PASS: simultaneous enqueue + dequeue (different queues)")
-
-            log(info, "ALL 6 SUB-TESTS PASSED — BufMgrSm coverage")
-        end run
-    end scope sim
 end test BufMgrSmTest
+
+impl sim for BufMgrSmTest
+    run
+        log(info, "BufMgrSm small-variant test (16x32, 4 queues)")
+        xact.dut = dut
+
+        // ── Test 1: Reset + Init ────────────────────────────
+        xact.reset_dut()
+        assert dut.init_done == 0
+            else fail("Test 1: init_done=${dut.init_done} expected 0 right after reset")
+
+        xact.wait_init()
+        assert dut.init_done == 1
+            else fail("Test 1: init_done=${dut.init_done} expected 1 after init")
+        assert dut.free_count_out == 16
+            else fail("Test 1: free_count=${dut.free_count_out} expected 16 after init")
+        log(info, "Test 1 PASS: reset + init_done + free_count==16")
+
+        // ── Test 2: Single enqueue + dequeue (queue 0) ──────
+        xact.enqueue(0, 0xDEAD)
+        xact.idle_n(4)
+
+        let v2 = xact.dequeue_one(0)
+        assert dut.dequeue_resp_valid == 1
+            else fail("Test 2: dequeue_resp_valid=${dut.dequeue_resp_valid} expected 1")
+        assert v2 == 0xDEAD
+            else fail("Test 2: dequeue(q=0) got 0x${v2:08x} expected 0x0000DEAD")
+        xact.idle_n(4)
+        assert dut.free_count_out == 16
+            else fail("Test 2: free_count=${dut.free_count_out} expected 16 after dequeue")
+        log(info, "Test 2 PASS: single enqueue/dequeue queue 0")
+
+        // ── Test 3: Multi-queue (q0,q1,q2) ──────────────────
+        xact.enqueue(0, 0x100)
+        xact.enqueue(1, 0x200)
+        xact.enqueue(2, 0x300)
+        xact.idle_n(6)
+        assert dut.free_count_out == 13
+            else fail("Test 3: free_count=${dut.free_count_out} expected 13 after 3 enqueues")
+
+        let v3a = xact.dequeue_one(0)
+        assert v3a == 0x100
+            else fail("Test 3: dequeue(q=0) got 0x${v3a:08x} expected 0x100")
+        xact.idle_n(2)
+        let v3b = xact.dequeue_one(1)
+        assert v3b == 0x200
+            else fail("Test 3: dequeue(q=1) got 0x${v3b:08x} expected 0x200")
+        xact.idle_n(2)
+        let v3c = xact.dequeue_one(2)
+        assert v3c == 0x300
+            else fail("Test 3: dequeue(q=2) got 0x${v3c:08x} expected 0x300")
+        xact.idle_n(4)
+        assert dut.free_count_out == 16
+            else fail("Test 3: free_count=${dut.free_count_out} expected 16 after 3 dequeues")
+        log(info, "Test 3 PASS: multi-queue independence (q0,q1,q2)")
+
+        // ── Test 4: FIFO order, 4 items to queue 3 ─────────
+        xact.enqueue(3, 0xA0)
+        xact.enqueue(3, 0xA1)
+        xact.enqueue(3, 0xA2)
+        xact.enqueue(3, 0xA3)
+        xact.idle_n(6)
+        assert dut.free_count_out == 12
+            else fail("Test 4: free_count=${dut.free_count_out} expected 12 after 4 enqueues")
+
+        for i in 0 .. 4
+            let vi = xact.dequeue_one(3)
+            let expected = 0xA0 + i
+            assert vi == expected
+                else fail("Test 4: dequeue(q=3)[${i}] got 0x${vi:08x} expected 0x${expected:08x}")
+            xact.idle_n(2)
+        end for
+        assert dut.free_count_out == 16
+            else fail("Test 4: free_count=${dut.free_count_out} expected 16 after 4 dequeues")
+        log(info, "Test 4 PASS: FIFO order on queue 3")
+
+        // ── Test 5: Back-to-back enqueue queue 1 ────────────
+        // Hold enqueue_valid high across 3 cycles, varying data.
+        xact.enqueue_b2b3(1, 0xB0, 0xB1, 0xB2)
+        xact.idle_n(6)
+        assert dut.free_count_out == 13
+            else fail("Test 5: free_count=${dut.free_count_out} expected 13 after 3 b2b enqueues")
+
+        let v5a = xact.dequeue_one(1)
+        assert v5a == 0xB0
+            else fail("Test 5: dequeue(q=1)[0] got 0x${v5a:08x} expected 0xB0")
+        xact.idle_n(2)
+        let v5b = xact.dequeue_one(1)
+        assert v5b == 0xB1
+            else fail("Test 5: dequeue(q=1)[1] got 0x${v5b:08x} expected 0xB1")
+        xact.idle_n(2)
+        let v5c = xact.dequeue_one(1)
+        assert v5c == 0xB2
+            else fail("Test 5: dequeue(q=1)[2] got 0x${v5c:08x} expected 0xB2")
+        xact.idle_n(4)
+        assert dut.free_count_out == 16
+            else fail("Test 5: free_count=${dut.free_count_out} expected 16 after b2b drain")
+        log(info, "Test 5 PASS: back-to-back enqueue holds valid")
+
+        // ── Test 6: Simultaneous enqueue(q3) + dequeue(q2) ──
+        xact.enqueue(2, 0xC0)
+        xact.idle_n(6)
+
+        // Same-cycle assertion of both valids targeting different
+        // queues. The C++ TB drives both for one cycle, then
+        // deasserts and waits one more for the dequeue response.
+        xact.enqueue_dequeue_simul(3, 0xC1, 2)
+        assert dut.dequeue_resp_valid == 1
+            else fail("Test 6: simul dequeue resp_valid=${dut.dequeue_resp_valid} expected 1")
+        assert dut.dequeue_data == 0xC0
+            else fail("Test 6: simul dequeue(q=2) got 0x${dut.dequeue_data:08x} expected 0xC0")
+        xact.idle_n(6)
+
+        let v6 = xact.dequeue_one(3)
+        assert v6 == 0xC1
+            else fail("Test 6: dequeue(q=3) after simul-enq got 0x${v6:08x} expected 0xC1")
+        xact.idle_n(4)
+        assert dut.free_count_out == 16
+            else fail("Test 6: free_count=${dut.free_count_out} expected 16 after simul test")
+        log(info, "Test 6 PASS: simultaneous enqueue + dequeue (different queues)")
+
+        log(info, "ALL 6 SUB-TESTS PASSED — BufMgrSm coverage")
+    end run
+end impl BufMgrSmTest
+

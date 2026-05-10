@@ -16,46 +16,47 @@
 
 test InstVecPortRegressionTest
     let dut : Top
-
-    scope sim
-        run
-            log(info, "inst_vec_port_regression sim")
-
-            // Reset (matches the C++ TB's two-tick assert / one-tick
-            // deassert sequence).
-            dut.rst = 1
-            wait 2 cycles
-            dut.rst = 0
-            wait 1 cycle
-
-            // Drive each element of `src` to a distinct value; expect
-            // `dst` to mirror element-by-element. Pack the 8 bytes into
-            // one 64-bit word: byte i lives at bits [8*i +: 8].
-            //   src[7..0] = 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11
-            dut.src = 0x8877665544332211
-            wait 1 cycle
-
-            // Mirror is `always_comb`, so dst should match src after a
-            // single eval. Assert each lane independently to mirror the
-            // C++ TB's per-element CHECKs.
-            assert ((dut.dst >> 0)  & 0xFF) == 0x11
-                else fail("dst[0] = 0x11 (got 0x${(dut.dst >> 0)  & 0xFF:02x})")
-            assert ((dut.dst >> 8)  & 0xFF) == 0x22
-                else fail("dst[1] = 0x22 (got 0x${(dut.dst >> 8)  & 0xFF:02x})")
-            assert ((dut.dst >> 16) & 0xFF) == 0x33
-                else fail("dst[2] = 0x33 (got 0x${(dut.dst >> 16) & 0xFF:02x})")
-            assert ((dut.dst >> 24) & 0xFF) == 0x44
-                else fail("dst[3] = 0x44 (got 0x${(dut.dst >> 24) & 0xFF:02x})")
-            assert ((dut.dst >> 32) & 0xFF) == 0x55
-                else fail("dst[4] = 0x55 (got 0x${(dut.dst >> 32) & 0xFF:02x})")
-            assert ((dut.dst >> 40) & 0xFF) == 0x66
-                else fail("dst[5] = 0x66 (got 0x${(dut.dst >> 40) & 0xFF:02x})")
-            assert ((dut.dst >> 48) & 0xFF) == 0x77
-                else fail("dst[6] = 0x77 (got 0x${(dut.dst >> 48) & 0xFF:02x})")
-            assert ((dut.dst >> 56) & 0xFF) == 0x88
-                else fail("dst[7] = 0x88 (got 0x${(dut.dst >> 56) & 0xFF:02x})")
-
-            log(info, "PASS: 8 vec lanes mirror end-to-end")
-        end run
-    end scope sim
 end test InstVecPortRegressionTest
+
+impl sim for InstVecPortRegressionTest
+    run
+        log(info, "inst_vec_port_regression sim")
+
+        // Reset (matches the C++ TB's two-tick assert / one-tick
+        // deassert sequence).
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Drive each element of `src` to a distinct value; expect
+        // `dst` to mirror element-by-element. Pack the 8 bytes into
+        // one 64-bit word: byte i lives at bits [8*i +: 8].
+        //   src[7..0] = 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11
+        dut.src = 0x8877665544332211
+        wait 1 cycle
+
+        // Mirror is `always_comb`, so dst should match src after a
+        // single eval. Assert each lane independently to mirror the
+        // C++ TB's per-element CHECKs.
+        assert ((dut.dst >> 0)  & 0xFF) == 0x11
+            else fail("dst[0] = 0x11 (got 0x${(dut.dst >> 0)  & 0xFF:02x})")
+        assert ((dut.dst >> 8)  & 0xFF) == 0x22
+            else fail("dst[1] = 0x22 (got 0x${(dut.dst >> 8)  & 0xFF:02x})")
+        assert ((dut.dst >> 16) & 0xFF) == 0x33
+            else fail("dst[2] = 0x33 (got 0x${(dut.dst >> 16) & 0xFF:02x})")
+        assert ((dut.dst >> 24) & 0xFF) == 0x44
+            else fail("dst[3] = 0x44 (got 0x${(dut.dst >> 24) & 0xFF:02x})")
+        assert ((dut.dst >> 32) & 0xFF) == 0x55
+            else fail("dst[4] = 0x55 (got 0x${(dut.dst >> 32) & 0xFF:02x})")
+        assert ((dut.dst >> 40) & 0xFF) == 0x66
+            else fail("dst[5] = 0x66 (got 0x${(dut.dst >> 40) & 0xFF:02x})")
+        assert ((dut.dst >> 48) & 0xFF) == 0x77
+            else fail("dst[6] = 0x77 (got 0x${(dut.dst >> 48) & 0xFF:02x})")
+        assert ((dut.dst >> 56) & 0xFF) == 0x88
+            else fail("dst[7] = 0x88 (got 0x${(dut.dst >> 56) & 0xFF:02x})")
+
+        log(info, "PASS: 8 vec lanes mirror end-to-end")
+    end run
+end impl InstVecPortRegressionTest
+

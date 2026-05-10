@@ -54,80 +54,81 @@ end transactor MacTableXactor
 test MacTableTest
     let dut  : mac_table
     let xact : MacTableXactor passive
-
-    scope sim
-        run
-            log(info, "mac_table CAM-backed MAC learning test")
-            xact.dut = dut
-
-            xact.init_dut()
-
-            // ── Test 1: Cold lookup misses ──────────────────────────
-            dut.lookup_mac = 0xDEADBEEFCAFE
-            wait 1 cycle
-            assert dut.lookup_hit == 0
-                else fail("Test 1: cold lookup_hit=${dut.lookup_hit}, expected 0")
-            log(info, "Test 1 PASS: cold lookup misses")
-
-            // ── Test 2: Learn one entry, look it up ─────────────────
-            xact.learn(0xAABBCCDDEEFF, 2, 0)
-            dut.lookup_mac = 0xAABBCCDDEEFF
-            wait 1 cycle
-            assert dut.lookup_hit == 1
-                else fail("Test 2: post-learn lookup_hit=${dut.lookup_hit}, expected 1")
-            assert dut.lookup_port == 2
-                else fail("Test 2: lookup_port=${dut.lookup_port}, expected 2")
-            log(info, "Test 2 PASS: post-learn lookup hits, routed to port 2")
-
-            // ── Test 3: Multiple distinct entries → distinct ports ──
-            xact.learn(0x111111111111, 1, 1)
-            xact.learn(0x222222222222, 3, 2)
-            xact.learn(0x333333333333, 0, 3)
-
-            dut.lookup_mac = 0x111111111111
-            wait 1 cycle
-            assert dut.lookup_hit == 1
-                else fail("Test 3a: lookup_hit=${dut.lookup_hit}, expected 1 for mac1")
-            assert dut.lookup_port == 1
-                else fail("Test 3a: lookup_port=${dut.lookup_port}, expected 1 for mac1")
-
-            dut.lookup_mac = 0x222222222222
-            wait 1 cycle
-            assert dut.lookup_hit == 1
-                else fail("Test 3b: lookup_hit=${dut.lookup_hit}, expected 1 for mac2")
-            assert dut.lookup_port == 3
-                else fail("Test 3b: lookup_port=${dut.lookup_port}, expected 3 for mac2")
-
-            dut.lookup_mac = 0x333333333333
-            wait 1 cycle
-            assert dut.lookup_hit == 1
-                else fail("Test 3c: lookup_hit=${dut.lookup_hit}, expected 1 for mac3")
-            assert dut.lookup_port == 0
-                else fail("Test 3c: lookup_port=${dut.lookup_port}, expected 0 for mac3")
-            log(info, "Test 3 PASS: 3 distinct MACs route to distinct ports")
-
-            // ── Test 4: Unknown MAC misses (broadcast path) ─────────
-            dut.lookup_mac = 0x999999999999
-            wait 1 cycle
-            assert dut.lookup_hit == 0
-                else fail("Test 4: unknown lookup_hit=${dut.lookup_hit}, expected 0")
-            log(info, "Test 4 PASS: unknown MAC misses")
-
-            // ── Test 5: Re-learn same MAC at new slot+port ──────────
-            // Both entries match; cam.search_first returns the LSB-
-            // priority slot, so the OLDER entry (slot 0, port 2) still
-            // wins. Caller-controlled slot semantics — out-of-scope
-            // migration would clear the old slot first.
-            xact.learn(0xAABBCCDDEEFF, 3, 5)
-            dut.lookup_mac = 0xAABBCCDDEEFF
-            wait 1 cycle
-            assert dut.lookup_hit == 1
-                else fail("Test 5: re-learn lookup_hit=${dut.lookup_hit}, expected 1")
-            assert dut.lookup_port == 2
-                else fail("Test 5: lookup_port=${dut.lookup_port}, expected 2 (LSB-priority oldest wins)")
-            log(info, "Test 5 PASS: re-learn, LSB-priority oldest slot wins")
-
-            log(info, "ALL 5 SUB-TESTS PASSED — mac_table coverage")
-        end run
-    end scope sim
 end test MacTableTest
+
+impl sim for MacTableTest
+    run
+        log(info, "mac_table CAM-backed MAC learning test")
+        xact.dut = dut
+
+        xact.init_dut()
+
+        // ── Test 1: Cold lookup misses ──────────────────────────
+        dut.lookup_mac = 0xDEADBEEFCAFE
+        wait 1 cycle
+        assert dut.lookup_hit == 0
+            else fail("Test 1: cold lookup_hit=${dut.lookup_hit}, expected 0")
+        log(info, "Test 1 PASS: cold lookup misses")
+
+        // ── Test 2: Learn one entry, look it up ─────────────────
+        xact.learn(0xAABBCCDDEEFF, 2, 0)
+        dut.lookup_mac = 0xAABBCCDDEEFF
+        wait 1 cycle
+        assert dut.lookup_hit == 1
+            else fail("Test 2: post-learn lookup_hit=${dut.lookup_hit}, expected 1")
+        assert dut.lookup_port == 2
+            else fail("Test 2: lookup_port=${dut.lookup_port}, expected 2")
+        log(info, "Test 2 PASS: post-learn lookup hits, routed to port 2")
+
+        // ── Test 3: Multiple distinct entries → distinct ports ──
+        xact.learn(0x111111111111, 1, 1)
+        xact.learn(0x222222222222, 3, 2)
+        xact.learn(0x333333333333, 0, 3)
+
+        dut.lookup_mac = 0x111111111111
+        wait 1 cycle
+        assert dut.lookup_hit == 1
+            else fail("Test 3a: lookup_hit=${dut.lookup_hit}, expected 1 for mac1")
+        assert dut.lookup_port == 1
+            else fail("Test 3a: lookup_port=${dut.lookup_port}, expected 1 for mac1")
+
+        dut.lookup_mac = 0x222222222222
+        wait 1 cycle
+        assert dut.lookup_hit == 1
+            else fail("Test 3b: lookup_hit=${dut.lookup_hit}, expected 1 for mac2")
+        assert dut.lookup_port == 3
+            else fail("Test 3b: lookup_port=${dut.lookup_port}, expected 3 for mac2")
+
+        dut.lookup_mac = 0x333333333333
+        wait 1 cycle
+        assert dut.lookup_hit == 1
+            else fail("Test 3c: lookup_hit=${dut.lookup_hit}, expected 1 for mac3")
+        assert dut.lookup_port == 0
+            else fail("Test 3c: lookup_port=${dut.lookup_port}, expected 0 for mac3")
+        log(info, "Test 3 PASS: 3 distinct MACs route to distinct ports")
+
+        // ── Test 4: Unknown MAC misses (broadcast path) ─────────
+        dut.lookup_mac = 0x999999999999
+        wait 1 cycle
+        assert dut.lookup_hit == 0
+            else fail("Test 4: unknown lookup_hit=${dut.lookup_hit}, expected 0")
+        log(info, "Test 4 PASS: unknown MAC misses")
+
+        // ── Test 5: Re-learn same MAC at new slot+port ──────────
+        // Both entries match; cam.search_first returns the LSB-
+        // priority slot, so the OLDER entry (slot 0, port 2) still
+        // wins. Caller-controlled slot semantics — out-of-scope
+        // migration would clear the old slot first.
+        xact.learn(0xAABBCCDDEEFF, 3, 5)
+        dut.lookup_mac = 0xAABBCCDDEEFF
+        wait 1 cycle
+        assert dut.lookup_hit == 1
+            else fail("Test 5: re-learn lookup_hit=${dut.lookup_hit}, expected 1")
+        assert dut.lookup_port == 2
+            else fail("Test 5: lookup_port=${dut.lookup_port}, expected 2 (LSB-priority oldest wins)")
+        log(info, "Test 5 PASS: re-learn, LSB-priority oldest slot wins")
+
+        log(info, "ALL 5 SUB-TESTS PASSED — mac_table coverage")
+    end run
+end impl MacTableTest
+

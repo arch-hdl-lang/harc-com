@@ -18,64 +18,65 @@ end covergroup LightCov
 test TrafficLightTest
     let dut : TrafficLight
     let cov : LightCov
-
-    scope sim
-        run
-            // Reset: hold timer=1 so the FSM doesn't try to leave Red
-            // before rst deasserts.
-            dut.rst = 1
-            dut.timer = 1
-            wait 2 cycles
-
-            assert dut.red == 1 && dut.yellow == 0 && dut.green == 0
-                else fail("after reset not in Red (r=${dut.red} y=${dut.yellow} g=${dut.green})")
-            log(info, "PASS: reset → Red state")
-
-            dut.rst = 0
-
-            // Red holds while timer != 0.
-            for _ in 0 .. 3
-                tick_timer(dut, 1)
-            end for
-            assert dut.red == 1 && dut.yellow == 0 && dut.green == 0
-                else fail("Red did not hold with timer!=0")
-            log(info, "PASS: Red holds while timer != 0")
-
-            // Red → Green: pulse timer=0 then resume timer=1 to latch.
-            tick_timer(dut, 0)
-            tick_timer(dut, 1)
-            assert dut.red == 0 && dut.yellow == 0 && dut.green == 1
-                else fail("Red did not transition to Green (r=${dut.red} y=${dut.yellow} g=${dut.green})")
-            log(info, "PASS: Red → Green")
-
-            // Green holds.
-            for _ in 0 .. 3
-                tick_timer(dut, 1)
-            end for
-            assert dut.red == 0 && dut.yellow == 0 && dut.green == 1
-                else fail("Green did not hold")
-            log(info, "PASS: Green holds")
-
-            // Green → Yellow.
-            tick_timer(dut, 0)
-            tick_timer(dut, 1)
-            assert dut.red == 0 && dut.yellow == 1 && dut.green == 0
-                else fail("Green did not transition to Yellow (r=${dut.red} y=${dut.yellow} g=${dut.green})")
-            log(info, "PASS: Green → Yellow")
-
-            // Yellow → Red.
-            tick_timer(dut, 0)
-            tick_timer(dut, 1)
-            assert dut.red == 1 && dut.yellow == 0 && dut.green == 0
-                else fail("Yellow did not transition back to Red (r=${dut.red} y=${dut.yellow} g=${dut.green})")
-            log(info, "PASS: Yellow → Red")
-        end run
-
-        check
-            cov.report()
-            assert cov.cp_red.lit    > 0 else fail("Red    state coverage hole")
-            assert cov.cp_yellow.lit > 0 else fail("Yellow state coverage hole")
-            assert cov.cp_green.lit  > 0 else fail("Green  state coverage hole")
-        end check
-    end scope sim
 end test TrafficLightTest
+
+impl sim for TrafficLightTest
+    run
+        // Reset: hold timer=1 so the FSM doesn't try to leave Red
+        // before rst deasserts.
+        dut.rst = 1
+        dut.timer = 1
+        wait 2 cycles
+
+        assert dut.red == 1 && dut.yellow == 0 && dut.green == 0
+            else fail("after reset not in Red (r=${dut.red} y=${dut.yellow} g=${dut.green})")
+        log(info, "PASS: reset → Red state")
+
+        dut.rst = 0
+
+        // Red holds while timer != 0.
+        for _ in 0 .. 3
+            tick_timer(dut, 1)
+        end for
+        assert dut.red == 1 && dut.yellow == 0 && dut.green == 0
+            else fail("Red did not hold with timer!=0")
+        log(info, "PASS: Red holds while timer != 0")
+
+        // Red → Green: pulse timer=0 then resume timer=1 to latch.
+        tick_timer(dut, 0)
+        tick_timer(dut, 1)
+        assert dut.red == 0 && dut.yellow == 0 && dut.green == 1
+            else fail("Red did not transition to Green (r=${dut.red} y=${dut.yellow} g=${dut.green})")
+        log(info, "PASS: Red → Green")
+
+        // Green holds.
+        for _ in 0 .. 3
+            tick_timer(dut, 1)
+        end for
+        assert dut.red == 0 && dut.yellow == 0 && dut.green == 1
+            else fail("Green did not hold")
+        log(info, "PASS: Green holds")
+
+        // Green → Yellow.
+        tick_timer(dut, 0)
+        tick_timer(dut, 1)
+        assert dut.red == 0 && dut.yellow == 1 && dut.green == 0
+            else fail("Green did not transition to Yellow (r=${dut.red} y=${dut.yellow} g=${dut.green})")
+        log(info, "PASS: Green → Yellow")
+
+        // Yellow → Red.
+        tick_timer(dut, 0)
+        tick_timer(dut, 1)
+        assert dut.red == 1 && dut.yellow == 0 && dut.green == 0
+            else fail("Yellow did not transition back to Red (r=${dut.red} y=${dut.yellow} g=${dut.green})")
+        log(info, "PASS: Yellow → Red")
+    end run
+
+    check
+        cov.report()
+        assert cov.cp_red.lit    > 0 else fail("Red    state coverage hole")
+        assert cov.cp_yellow.lit > 0 else fail("Yellow state coverage hole")
+        assert cov.cp_green.lit  > 0 else fail("Green  state coverage hole")
+    end check
+end impl TrafficLightTest
+

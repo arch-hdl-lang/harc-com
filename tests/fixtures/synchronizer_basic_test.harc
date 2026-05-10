@@ -10,56 +10,57 @@ test FlagSyncTest
     // cycle` advances dst_clk (matches the original C++ TB).
     clock dst_clk = SlowDomain    // 50 MHz  → 20 ns period
     clock src_clk = FastDomain    // 200 MHz → 5  ns period
-
-    scope sim
-        run
-            // Async reset.
-            dut.rst = 0
-            dut.data_in = 0
-            wait 1 cycle
-            dut.rst = 1
-            wait 1 cycle
-            dut.rst = 0
-
-            assert dut.data_out == 0
-                else fail("data_out=${dut.data_out} after reset, expected 0")
-
-            // ── Test 1: 2-stage propagation ─────────────────────────────
-            dut.data_in = 1
-
-            // Cycle 1: data_in enters stage0; data_out (=stage1) is still 0.
-            wait 1 cycle
-            assert dut.data_out == 0
-                else fail("after 1 cycle: data_out=${dut.data_out}, expected 0")
-
-            // Cycle 2: stage0 → stage1; data_out is now 1.
-            wait 1 cycle
-            assert dut.data_out == 1
-                else fail("after 2 cycles: data_out=${dut.data_out}, expected 1")
-            log(info, "PASS: 2-stage propagation")
-
-            // ── Test 2: data_in change propagates with 2-cycle latency ──
-            dut.data_in = 0
-
-            wait 1 cycle
-            assert dut.data_out == 1
-                else fail("after data_in→0, cycle 1: data_out=${dut.data_out}, expected 1 (old)")
-
-            wait 1 cycle
-            assert dut.data_out == 0
-                else fail("after data_in→0, cycle 2: data_out=${dut.data_out}, expected 0")
-            log(info, "PASS: data change propagates with 2-cycle latency")
-
-            // ── Test 3: mid-operation reset clears the chain ────────────
-            dut.data_in = 1
-            wait 1 cycle
-            // stage0=1, stage1=0 at this point.
-            dut.rst = 1
-            wait 1 cycle
-            assert dut.data_out == 0
-                else fail("after mid-op reset: data_out=${dut.data_out}, expected 0")
-            dut.rst = 0
-            log(info, "PASS: mid-operation reset clears chain")
-        end run
-    end scope sim
 end test FlagSyncTest
+
+impl sim for FlagSyncTest
+    run
+        // Async reset.
+        dut.rst = 0
+        dut.data_in = 0
+        wait 1 cycle
+        dut.rst = 1
+        wait 1 cycle
+        dut.rst = 0
+
+        assert dut.data_out == 0
+            else fail("data_out=${dut.data_out} after reset, expected 0")
+
+        // ── Test 1: 2-stage propagation ─────────────────────────────
+        dut.data_in = 1
+
+        // Cycle 1: data_in enters stage0; data_out (=stage1) is still 0.
+        wait 1 cycle
+        assert dut.data_out == 0
+            else fail("after 1 cycle: data_out=${dut.data_out}, expected 0")
+
+        // Cycle 2: stage0 → stage1; data_out is now 1.
+        wait 1 cycle
+        assert dut.data_out == 1
+            else fail("after 2 cycles: data_out=${dut.data_out}, expected 1")
+        log(info, "PASS: 2-stage propagation")
+
+        // ── Test 2: data_in change propagates with 2-cycle latency ──
+        dut.data_in = 0
+
+        wait 1 cycle
+        assert dut.data_out == 1
+            else fail("after data_in→0, cycle 1: data_out=${dut.data_out}, expected 1 (old)")
+
+        wait 1 cycle
+        assert dut.data_out == 0
+            else fail("after data_in→0, cycle 2: data_out=${dut.data_out}, expected 0")
+        log(info, "PASS: data change propagates with 2-cycle latency")
+
+        // ── Test 3: mid-operation reset clears the chain ────────────
+        dut.data_in = 1
+        wait 1 cycle
+        // stage0=1, stage1=0 at this point.
+        dut.rst = 1
+        wait 1 cycle
+        assert dut.data_out == 0
+            else fail("after mid-op reset: data_out=${dut.data_out}, expected 0")
+        dut.rst = 0
+        log(info, "PASS: mid-operation reset clears chain")
+    end run
+end impl FlagSyncTest
+

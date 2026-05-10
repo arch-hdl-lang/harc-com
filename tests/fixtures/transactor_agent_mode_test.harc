@@ -144,69 +144,70 @@ test TransactorAgentModeTest
     // different modes. Mode flows through to `drv` automatically.
     let act : AxilAgent active
     let pas : AxilAgent passive
-
-    scope sim
-        run
-            log(info, "agent declaration reused as active + passive")
-
-            // Both transactors point at the same DUT.
-            act.drv.dut = dut
-            pas.drv.dut = dut
-
-            // Reset.
-            dut.rst = 1
-            dut.axil_aw_addr = 0
-            dut.axil_aw_valid = 0
-            dut.axil_w_data = 0
-            dut.axil_w_strb = 15
-            dut.axil_w_valid = 0
-            dut.axil_b_ready = 1
-            dut.axil_ar_addr = 0
-            dut.axil_ar_valid = 0
-            dut.axil_r_ready = 1
-            dut.mm2s_done = 0
-            dut.mm2s_halted = 1
-            dut.mm2s_idle = 1
-            dut.s2mm_done = 0
-            dut.s2mm_halted = 1
-            dut.s2mm_idle = 1
-            dut.mm2s_sg_done = 0
-            dut.s2mm_sg_done = 0
-            dut.mm2s_sg_active = 0
-            dut.s2mm_sg_active = 0
-            wait 2 cycles
-            dut.rst = 0
-            wait 1 cycle
-
-            // Drive 5 transactions through the ACTIVE agent's
-            // sequencer. Connect bridge forwards to act.drv.req →
-            // act's `on req(t)` body drives the DUT bus.
-            //
-            // We never call pas.sequencer.dispatch — the passive
-            // agent's sequencer is dormant, no stimulus from it.
-            let txns = RandomTxns(5)
-            act.sequencer.dispatch(txns)
-
-            // Drain.
-            wait 10 cycles
-
-            // Both agents' always-on observers fired on every
-            // valid+ready handshake on the AXI-Lite write/read
-            // channels. Each round-trip = 1 write handshake + 1
-            // read handshake; 5 round-trips = 5 of each.
-            assert pas.drv.sb.writes == 5
-                else fail("passive agent: writes observed = ${pas.drv.sb.writes}, expected 5")
-            assert pas.drv.sb.reads == 5
-                else fail("passive agent: reads observed = ${pas.drv.sb.reads}, expected 5")
-
-            // Active agent's own observer also tallied (always-on
-            // body fires regardless of mode).
-            assert act.drv.sb.writes == 5
-                else fail("active agent: writes observed = ${act.drv.sb.writes}, expected 5")
-            assert act.drv.sb.reads == 5
-                else fail("active agent: reads observed = ${act.drv.sb.reads}, expected 5")
-
-            log(info, "PASS: same agent decl, mode inherited — active drove, passive observed")
-        end run
-    end scope sim
 end test TransactorAgentModeTest
+
+impl sim for TransactorAgentModeTest
+    run
+        log(info, "agent declaration reused as active + passive")
+
+        // Both transactors point at the same DUT.
+        act.drv.dut = dut
+        pas.drv.dut = dut
+
+        // Reset.
+        dut.rst = 1
+        dut.axil_aw_addr = 0
+        dut.axil_aw_valid = 0
+        dut.axil_w_data = 0
+        dut.axil_w_strb = 15
+        dut.axil_w_valid = 0
+        dut.axil_b_ready = 1
+        dut.axil_ar_addr = 0
+        dut.axil_ar_valid = 0
+        dut.axil_r_ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Drive 5 transactions through the ACTIVE agent's
+        // sequencer. Connect bridge forwards to act.drv.req →
+        // act's `on req(t)` body drives the DUT bus.
+        //
+        // We never call pas.sequencer.dispatch — the passive
+        // agent's sequencer is dormant, no stimulus from it.
+        let txns = RandomTxns(5)
+        act.sequencer.dispatch(txns)
+
+        // Drain.
+        wait 10 cycles
+
+        // Both agents' always-on observers fired on every
+        // valid+ready handshake on the AXI-Lite write/read
+        // channels. Each round-trip = 1 write handshake + 1
+        // read handshake; 5 round-trips = 5 of each.
+        assert pas.drv.sb.writes == 5
+            else fail("passive agent: writes observed = ${pas.drv.sb.writes}, expected 5")
+        assert pas.drv.sb.reads == 5
+            else fail("passive agent: reads observed = ${pas.drv.sb.reads}, expected 5")
+
+        // Active agent's own observer also tallied (always-on
+        // body fires regardless of mode).
+        assert act.drv.sb.writes == 5
+            else fail("active agent: writes observed = ${act.drv.sb.writes}, expected 5")
+        assert act.drv.sb.reads == 5
+            else fail("active agent: reads observed = ${act.drv.sb.reads}, expected 5")
+
+        log(info, "PASS: same agent decl, mode inherited — active drove, passive observed")
+    end run
+end impl TransactorAgentModeTest
+

@@ -159,6 +159,52 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
         Item::Agent(c) | Item::Env(c) | Item::Scoreboard(c) | Item::Sequencer(c) => {
             print_component(out, c, depth);
         }
+        Item::Impl(i) => {
+            print_doc(out, &i.doc, depth);
+            pad(out, depth);
+            writeln!(out, "impl {} for {}", i.target.name, i.test_name.name).ok();
+            for it in &i.items {
+                match it {
+                    ImplItem::Setup(b) => {
+                        pad(out, depth + 1);
+                        writeln!(out, "setup").ok();
+                        print_block_inner(out, b, depth + 2);
+                        pad(out, depth + 1);
+                        writeln!(out, "end setup").ok();
+                    }
+                    ImplItem::Run(b) => {
+                        pad(out, depth + 1);
+                        writeln!(out, "run").ok();
+                        print_block_inner(out, b, depth + 2);
+                        pad(out, depth + 1);
+                        writeln!(out, "end run").ok();
+                    }
+                    ImplItem::Check(b) => {
+                        pad(out, depth + 1);
+                        writeln!(out, "check").ok();
+                        print_block_inner(out, b, depth + 2);
+                        pad(out, depth + 1);
+                        writeln!(out, "end check").ok();
+                    }
+                    ImplItem::Teardown(b) => {
+                        pad(out, depth + 1);
+                        writeln!(out, "teardown").ok();
+                        print_block_inner(out, b, depth + 2);
+                        pad(out, depth + 1);
+                        writeln!(out, "end teardown").ok();
+                    }
+                    ImplItem::Phase(name, b) => {
+                        pad(out, depth + 1);
+                        writeln!(out, "phase {}", name.name).ok();
+                        print_block_inner(out, b, depth + 2);
+                        pad(out, depth + 1);
+                        writeln!(out, "end phase {}", name.name).ok();
+                    }
+                }
+            }
+            pad(out, depth);
+            writeln!(out, "end impl {}", i.test_name.name).ok();
+        }
         Item::Test(t) => {
             print_doc(out, &t.doc, depth);
             pad(out, depth);

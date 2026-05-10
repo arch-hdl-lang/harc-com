@@ -16,31 +16,32 @@ test ClkDivCounterTest
     let dut : ClkDivCounter
 
     clock clk = ClkDomain        // 100 MHz → 10 ns period
-
-    scope sim
-        run
-            // Active-low reset: hold rst_n=0 for 3 full cycles.
-            dut.rst_n = 0
-            wait 3 cycles
-            dut.rst_n = 1
-
-            // Settle one cycle. The first fast posedge after rst_n=1
-            // toggles the divider (clk_slow rises 0→1) and the counter
-            // increments to 1.
-            wait 1 cycle
-            assert dut.count == 1
-                else fail("count=${dut.count} after reset+settle, expected 1")
-            log(info, "PASS: count=1 after reset+settle (first div_clk rising edge already fired)")
-
-            // After N more fast cycles the counter is at (N+2)/2 with
-            // integer division — odd N holds, even N increments.
-            for i in 1 .. 9
-                wait 1 cycle
-                let expected = (i + 2) / 2
-                assert dut.count == expected
-                    else fail("after cycle ${i}: count=${dut.count} expected=${expected}")
-            end for
-            log(info, "PASS: counter tracks div_clk rising edges over 8 fast cycles")
-        end run
-    end scope sim
 end test ClkDivCounterTest
+
+impl sim for ClkDivCounterTest
+    run
+        // Active-low reset: hold rst_n=0 for 3 full cycles.
+        dut.rst_n = 0
+        wait 3 cycles
+        dut.rst_n = 1
+
+        // Settle one cycle. The first fast posedge after rst_n=1
+        // toggles the divider (clk_slow rises 0→1) and the counter
+        // increments to 1.
+        wait 1 cycle
+        assert dut.count == 1
+            else fail("count=${dut.count} after reset+settle, expected 1")
+        log(info, "PASS: count=1 after reset+settle (first div_clk rising edge already fired)")
+
+        // After N more fast cycles the counter is at (N+2)/2 with
+        // integer division — odd N holds, even N increments.
+        for i in 1 .. 9
+            wait 1 cycle
+            let expected = (i + 2) / 2
+            assert dut.count == expected
+                else fail("after cycle ${i}: count=${dut.count} expected=${expected}")
+        end for
+        log(info, "PASS: counter tracks div_clk rising edges over 8 fast cycles")
+    end run
+end impl ClkDivCounterTest
+

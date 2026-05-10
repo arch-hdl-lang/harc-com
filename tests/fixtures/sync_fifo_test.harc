@@ -19,62 +19,63 @@ end covergroup FifoCov
 test SyncFifoTest
     let dut : TxQueue
     let cov : FifoCov
-
-    scope sim
-        run
-            // Reset
-            dut.rst = 1
-            dut.push_valid = 0
-            dut.pop_ready = 0
-            dut.push_data = 0
-            wait 2 cycles
-
-            assert dut.empty == 1 else fail("after reset, empty should be 1")
-            assert dut.full == 0  else fail("after reset, full should be 0")
-            log(info, "PASS: reset → empty FIFO")
-
-            dut.rst = 0
-
-            // Push 16 items (fill to capacity).
-            for i in 0 .. 16
-                dut.push_valid = 1
-                dut.push_data = i + 1
-                dut.pop_ready = 0
-                assert dut.push_ready == 1
-                    else fail("FIFO unexpectedly full at push ${i}")
-                wait 1 cycle
-            end for
-            dut.push_valid = 0
-            wait 1 cycle
-
-            assert dut.full == 1
-                else fail("FIFO should be full after 16 pushes")
-            assert dut.push_ready == 0
-                else fail("push_ready should be 0 when full")
-            log(info, "PASS: FIFO full after 16 pushes")
-
-            // Pop all 16 items and verify FIFO order.
-            for i in 0 .. 16
-                dut.pop_ready = 1
-                assert dut.pop_valid == 1
-                    else fail("pop_valid unexpectedly low at pop ${i}")
-                let expected = i + 1
-                assert dut.pop_data == expected
-                    else fail("pop ${i}: got ${dut.pop_data}, expected ${expected}")
-                wait 1 cycle
-            end for
-            dut.pop_ready = 0
-            wait 1 cycle
-
-            assert dut.empty == 1
-                else fail("FIFO should be empty after popping all items")
-            log(info, "PASS: 16 items popped in FIFO order, empty after drain")
-        end run
-
-        check
-            cov.report()
-            assert cov.cp_empty.yes > 0 else fail("empty=1 coverage hole")
-            assert cov.cp_full.yes  > 0 else fail("full=1  coverage hole")
-        end check
-    end scope sim
 end test SyncFifoTest
+
+impl sim for SyncFifoTest
+    run
+        // Reset
+        dut.rst = 1
+        dut.push_valid = 0
+        dut.pop_ready = 0
+        dut.push_data = 0
+        wait 2 cycles
+
+        assert dut.empty == 1 else fail("after reset, empty should be 1")
+        assert dut.full == 0  else fail("after reset, full should be 0")
+        log(info, "PASS: reset → empty FIFO")
+
+        dut.rst = 0
+
+        // Push 16 items (fill to capacity).
+        for i in 0 .. 16
+            dut.push_valid = 1
+            dut.push_data = i + 1
+            dut.pop_ready = 0
+            assert dut.push_ready == 1
+                else fail("FIFO unexpectedly full at push ${i}")
+            wait 1 cycle
+        end for
+        dut.push_valid = 0
+        wait 1 cycle
+
+        assert dut.full == 1
+            else fail("FIFO should be full after 16 pushes")
+        assert dut.push_ready == 0
+            else fail("push_ready should be 0 when full")
+        log(info, "PASS: FIFO full after 16 pushes")
+
+        // Pop all 16 items and verify FIFO order.
+        for i in 0 .. 16
+            dut.pop_ready = 1
+            assert dut.pop_valid == 1
+                else fail("pop_valid unexpectedly low at pop ${i}")
+            let expected = i + 1
+            assert dut.pop_data == expected
+                else fail("pop ${i}: got ${dut.pop_data}, expected ${expected}")
+            wait 1 cycle
+        end for
+        dut.pop_ready = 0
+        wait 1 cycle
+
+        assert dut.empty == 1
+            else fail("FIFO should be empty after popping all items")
+        log(info, "PASS: 16 items popped in FIFO order, empty after drain")
+    end run
+
+    check
+        cov.report()
+        assert cov.cp_empty.yes > 0 else fail("empty=1 coverage hole")
+        assert cov.cp_full.yes  > 0 else fail("full=1  coverage hole")
+    end check
+end impl SyncFifoTest
+

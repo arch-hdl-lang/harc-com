@@ -43,67 +43,68 @@ end function pq_pop
 
 test PacketQueueTest
     let dut : PacketQueue
-
-    scope sim
-        run
-            // Reset.
-            dut.rst = 1
-            dut.push_valid = 0
-            dut.pop_valid = 0
-            wait 2 cycles
-            dut.rst = 0
-            wait 1 cycle
-
-            assert dut.empty  == 1 else fail("empty should be 1 after reset")
-            assert dut.full   == 0 else fail("full should be 0 after reset")
-            assert dut.length == 0 else fail("length should be 0 after reset")
-
-            // Single push/pop round-trip.
-            pq_push(dut, 57005)               // 0xDEAD
-            assert dut.empty  == 0 else fail("not empty after push")
-            assert dut.length == 1 else fail("length=${dut.length} after push, expected 1")
-
-            let v = pq_pop(dut)
-            assert v == 57005
-                else fail("single pop: got=${v:08x}, expected 0xDEAD")
-            assert dut.empty  == 1 else fail("empty after pop")
-            assert dut.length == 0 else fail("length=${dut.length} after pop, expected 0")
-            log(info, "PASS: single push/pop round-trip")
-
-            // Fill to DEPTH=8 then check full.
-            for i in 0 .. 8
-                pq_push(dut, 256 + i)         // 0x100 + i
-            end for
-            assert dut.full   == 1 else fail("full should be 1 after 8 pushes")
-            assert dut.length == 8 else fail("length=${dut.length} after 8 pushes, expected 8")
-            log(info, "PASS: queue full after 8 pushes")
-
-            // Drain and verify FIFO order.
-            for i in 0 .. 8
-                let got = pq_pop(dut)
-                let want = 256 + i
-                assert got == want
-                    else fail("FIFO order pop[${i}]: got=${got:08x} expected=${want:08x}")
-            end for
-            assert dut.empty  == 1 else fail("empty after drain")
-            assert dut.full   == 0 else fail("full after drain")
-            log(info, "PASS: 8 items drained in FIFO order")
-
-            // Interleaved push/pop.
-            pq_push(dut, 43707)               // 0xAABB
-            pq_push(dut, 52445)               // 0xCCDD
-            let i0 = pq_pop(dut)
-            assert i0 == 43707
-                else fail("interleaved pop[0]: got=${i0:08x}, expected 0xAABB")
-            pq_push(dut, 61183)               // 0xEEFF
-            let i1 = pq_pop(dut)
-            assert i1 == 52445
-                else fail("interleaved pop[1]: got=${i1:08x}, expected 0xCCDD")
-            let i2 = pq_pop(dut)
-            assert i2 == 61183
-                else fail("interleaved pop[2]: got=${i2:08x}, expected 0xEEFF")
-            assert dut.empty == 1 else fail("empty after interleaved")
-            log(info, "PASS: interleaved push/pop ordering preserved")
-        end run
-    end scope sim
 end test PacketQueueTest
+
+impl sim for PacketQueueTest
+    run
+        // Reset.
+        dut.rst = 1
+        dut.push_valid = 0
+        dut.pop_valid = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        assert dut.empty  == 1 else fail("empty should be 1 after reset")
+        assert dut.full   == 0 else fail("full should be 0 after reset")
+        assert dut.length == 0 else fail("length should be 0 after reset")
+
+        // Single push/pop round-trip.
+        pq_push(dut, 57005)               // 0xDEAD
+        assert dut.empty  == 0 else fail("not empty after push")
+        assert dut.length == 1 else fail("length=${dut.length} after push, expected 1")
+
+        let v = pq_pop(dut)
+        assert v == 57005
+            else fail("single pop: got=${v:08x}, expected 0xDEAD")
+        assert dut.empty  == 1 else fail("empty after pop")
+        assert dut.length == 0 else fail("length=${dut.length} after pop, expected 0")
+        log(info, "PASS: single push/pop round-trip")
+
+        // Fill to DEPTH=8 then check full.
+        for i in 0 .. 8
+            pq_push(dut, 256 + i)         // 0x100 + i
+        end for
+        assert dut.full   == 1 else fail("full should be 1 after 8 pushes")
+        assert dut.length == 8 else fail("length=${dut.length} after 8 pushes, expected 8")
+        log(info, "PASS: queue full after 8 pushes")
+
+        // Drain and verify FIFO order.
+        for i in 0 .. 8
+            let got = pq_pop(dut)
+            let want = 256 + i
+            assert got == want
+                else fail("FIFO order pop[${i}]: got=${got:08x} expected=${want:08x}")
+        end for
+        assert dut.empty  == 1 else fail("empty after drain")
+        assert dut.full   == 0 else fail("full after drain")
+        log(info, "PASS: 8 items drained in FIFO order")
+
+        // Interleaved push/pop.
+        pq_push(dut, 43707)               // 0xAABB
+        pq_push(dut, 52445)               // 0xCCDD
+        let i0 = pq_pop(dut)
+        assert i0 == 43707
+            else fail("interleaved pop[0]: got=${i0:08x}, expected 0xAABB")
+        pq_push(dut, 61183)               // 0xEEFF
+        let i1 = pq_pop(dut)
+        assert i1 == 52445
+            else fail("interleaved pop[1]: got=${i1:08x}, expected 0xCCDD")
+        let i2 = pq_pop(dut)
+        assert i2 == 61183
+            else fail("interleaved pop[2]: got=${i2:08x}, expected 0xEEFF")
+        assert dut.empty == 1 else fail("empty after interleaved")
+        log(info, "PASS: interleaved push/pop ordering preserved")
+    end run
+end impl PacketQueueTest
+
