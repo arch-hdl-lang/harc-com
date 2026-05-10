@@ -48,67 +48,68 @@ end transactor NocCreditXactor
 test NocCreditTest
     let dut  : NocCreditTop
     let xact : NocCreditXactor passive
-
-    scope sim
-        run
-            log(info, "NocCreditTop credit-channel test")
-            xact.dut = dut
-
-            xact.init_dut()
-
-            // ── Test 1: Idle ────────────────────────────────────────
-            let baseline_idle = dut.popped_count
-            xact.run_window(0, 0, 200)
-            let popped_idle = dut.popped_count - baseline_idle
-            assert popped_idle == 0
-                else fail("Test 1: idle popped=${popped_idle}, expected 0")
-            assert dut.in_order == 1
-                else fail("Test 1: in_order=${dut.in_order} after idle, expected 1")
-            log(info, "Test 1 PASS: idle (gen=0, pop=0) produces 0 pops")
-
-            // ── Test 2: Balanced 50/50 ──────────────────────────────
-            let baseline_bal = dut.popped_count
-            xact.run_window(128, 128, 1000)
-            let popped_bal = dut.popped_count - baseline_bal
-            assert popped_bal >= 200
-                else fail("Test 2: balanced popped=${popped_bal}, expected >= 200")
-            assert dut.in_order == 1
-                else fail("Test 2: in_order=${dut.in_order} after balanced, expected 1")
-            log(info, "Test 2 PASS: balanced (gen=128, pop=128) popped=${popped_bal}, last_seq=${dut.last_seq}")
-
-            // ── Test 3: Producer fast, consumer slow ────────────────
-            let baseline_bp = dut.popped_count
-            xact.run_window(255, 32, 2000)
-            let popped_bp = dut.popped_count - baseline_bp
-            assert popped_bp > 100
-                else fail("Test 3: backpressure popped=${popped_bp}, expected > 100")
-            // Consumer-bounded; loose upper bound.
-            assert popped_bp < 600
-                else fail("Test 3: backpressure popped=${popped_bp}, expected < 600 (consumer-bounded)")
-            assert dut.in_order == 1
-                else fail("Test 3: in_order=${dut.in_order} after backpressure, expected 1")
-            log(info, "Test 3 PASS: backpressure (gen=255, pop=32) popped=${popped_bp}")
-
-            // ── Test 4: Recovery — both sides fast ──────────────────
-            let baseline_rec = dut.popped_count
-            xact.run_window(255, 255, 1000)
-            let popped_rec = dut.popped_count - baseline_rec
-            assert popped_rec >= 300
-                else fail("Test 4: recovery popped=${popped_rec}, expected >= 300")
-            assert dut.in_order == 1
-                else fail("Test 4: in_order=${dut.in_order} after recovery, expected 1")
-            log(info, "Test 4 PASS: recovery (gen=255, pop=255) popped=${popped_rec}, cumulative=${dut.popped_count}")
-
-            // ── Test 5: Monotonic seq_no invariant ──────────────────
-            // Every popped flit increments seq_no by 1; once we've seen
-            // any flit, last_seq == popped_count - 1.
-            if dut.saw_any == 1
-                assert dut.last_seq == dut.popped_count - 1
-                    else fail("Test 5: last_seq=${dut.last_seq} != popped_count-1=${dut.popped_count - 1}")
-                log(info, "Test 5 PASS: monotonic seq_no (last_seq=${dut.last_seq}, popped_count=${dut.popped_count})")
-            end if
-
-            log(info, "ALL 5 SUB-TESTS PASSED — NocCreditTop credit-channel coverage")
-        end run
-    end scope sim
 end test NocCreditTest
+
+impl sim for NocCreditTest
+    run
+        log(info, "NocCreditTop credit-channel test")
+        xact.dut = dut
+
+        xact.init_dut()
+
+        // ── Test 1: Idle ────────────────────────────────────────
+        let baseline_idle = dut.popped_count
+        xact.run_window(0, 0, 200)
+        let popped_idle = dut.popped_count - baseline_idle
+        assert popped_idle == 0
+            else fail("Test 1: idle popped=${popped_idle}, expected 0")
+        assert dut.in_order == 1
+            else fail("Test 1: in_order=${dut.in_order} after idle, expected 1")
+        log(info, "Test 1 PASS: idle (gen=0, pop=0) produces 0 pops")
+
+        // ── Test 2: Balanced 50/50 ──────────────────────────────
+        let baseline_bal = dut.popped_count
+        xact.run_window(128, 128, 1000)
+        let popped_bal = dut.popped_count - baseline_bal
+        assert popped_bal >= 200
+            else fail("Test 2: balanced popped=${popped_bal}, expected >= 200")
+        assert dut.in_order == 1
+            else fail("Test 2: in_order=${dut.in_order} after balanced, expected 1")
+        log(info, "Test 2 PASS: balanced (gen=128, pop=128) popped=${popped_bal}, last_seq=${dut.last_seq}")
+
+        // ── Test 3: Producer fast, consumer slow ────────────────
+        let baseline_bp = dut.popped_count
+        xact.run_window(255, 32, 2000)
+        let popped_bp = dut.popped_count - baseline_bp
+        assert popped_bp > 100
+            else fail("Test 3: backpressure popped=${popped_bp}, expected > 100")
+        // Consumer-bounded; loose upper bound.
+        assert popped_bp < 600
+            else fail("Test 3: backpressure popped=${popped_bp}, expected < 600 (consumer-bounded)")
+        assert dut.in_order == 1
+            else fail("Test 3: in_order=${dut.in_order} after backpressure, expected 1")
+        log(info, "Test 3 PASS: backpressure (gen=255, pop=32) popped=${popped_bp}")
+
+        // ── Test 4: Recovery — both sides fast ──────────────────
+        let baseline_rec = dut.popped_count
+        xact.run_window(255, 255, 1000)
+        let popped_rec = dut.popped_count - baseline_rec
+        assert popped_rec >= 300
+            else fail("Test 4: recovery popped=${popped_rec}, expected >= 300")
+        assert dut.in_order == 1
+            else fail("Test 4: in_order=${dut.in_order} after recovery, expected 1")
+        log(info, "Test 4 PASS: recovery (gen=255, pop=255) popped=${popped_rec}, cumulative=${dut.popped_count}")
+
+        // ── Test 5: Monotonic seq_no invariant ──────────────────
+        // Every popped flit increments seq_no by 1; once we've seen
+        // any flit, last_seq == popped_count - 1.
+        if dut.saw_any == 1
+            assert dut.last_seq == dut.popped_count - 1
+                else fail("Test 5: last_seq=${dut.last_seq} != popped_count-1=${dut.popped_count - 1}")
+            log(info, "Test 5 PASS: monotonic seq_no (last_seq=${dut.last_seq}, popped_count=${dut.popped_count})")
+        end if
+
+        log(info, "ALL 5 SUB-TESTS PASSED — NocCreditTop credit-channel coverage")
+    end run
+end impl NocCreditTest
+

@@ -2,63 +2,59 @@
 // `sb` is at test scope so the `check { ... }` phase can see it after
 // `run { ... }` finishes.
 
-extend AxiLiteSbTest
-    let sb : FuzzSb
+impl sim for AxiLiteSbTest
+    run
+        log(info, "starting AxiLiteRegs scoreboard fuzz test")
 
-    scope sim
-        run
-            log(info, "starting AxiLiteRegs scoreboard fuzz test")
+        // ── Reset (same as axilite_regs_test_sim.harc) ────────────────
+        dut.rst = 1
+        dut.axil_aw_addr = 0
+        dut.axil_aw_valid = 0
+        dut.axil_w_data = 0
+        dut.axil_w_strb = 15
+        dut.axil_w_valid = 0
+        dut.axil_b_ready = 1
+        dut.axil_ar_addr = 0
+        dut.axil_ar_valid = 0
+        dut.axil_r_ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
 
-            // ── Reset (same as axilite_regs_test_sim.harc) ────────────────
-            dut.rst = 1
-            dut.axil_aw_addr = 0
-            dut.axil_aw_valid = 0
-            dut.axil_w_data = 0
-            dut.axil_w_strb = 15
-            dut.axil_w_valid = 0
-            dut.axil_b_ready = 1
-            dut.axil_ar_addr = 0
-            dut.axil_ar_valid = 0
-            dut.axil_r_ready = 1
-            dut.mm2s_done = 0
-            dut.mm2s_halted = 1
-            dut.mm2s_idle = 1
-            dut.s2mm_done = 0
-            dut.s2mm_halted = 1
-            dut.s2mm_idle = 1
-            dut.mm2s_sg_done = 0
-            dut.s2mm_sg_done = 0
-            dut.mm2s_sg_active = 0
-            dut.s2mm_sg_active = 0
-            wait 2 cycles
-            dut.rst = 0
-            wait 1 cycle
+        // ── 5 write/read pairs through the scoreboard ────────────────
+        for i in 0 .. 5
+            let t : FuzzReg
+            randomize(t)
 
-            // ── 5 write/read pairs through the scoreboard ────────────────
-            for i in 0 .. 5
-                let t : FuzzReg
-                randomize(t)
+            sb.expected.push(t.value)
+            sb.writes = sb.writes + 1
 
-                sb.expected.push(t.value)
-                sb.writes = sb.writes + 1
+            axil_write(dut, 24, t.value)
+            let got = axil_read(dut, 24)
 
-                axil_write(dut, 24, t.value)
-                let got = axil_read(dut, 24)
+            let want = sb.expected.pop()
+            sb.reads = sb.reads + 1
+            logf("axi_master.log", info,
+                 "sb[${i}] wrote=0x${t.value:08x} read=0x${got:08x} expected=0x${want:08x}")
+            assert got == want else fail("scoreboard[${i}] mismatch: read 0x${got:08x}, expected 0x${want:08x}")
+        end for
+    end run
 
-                let want = sb.expected.pop()
-                sb.reads = sb.reads + 1
-                logf("axi_master.log", info,
-                     "sb[${i}] wrote=0x${t.value:08x} read=0x${got:08x} expected=0x${want:08x}")
-                assert got == want else fail("scoreboard[${i}] mismatch: read 0x${got:08x}, expected 0x${want:08x}")
-            end for
-        end run
-
-        // ── End-of-test invariants — auto-fire after `run`. UVM-equivalent
-        //    of `check_phase`. Spec §7.2 + §10.2 phase mapping.
-        check
-            assert sb.expected.empty() else fail("scoreboard left ${sb.expected.size()} expected value(s) un-checked")
-            assert sb.writes == sb.reads else fail("scoreboard counter drift: writes=${sb.writes} reads=${sb.reads}")
-            log(info, "PASS: scoreboard drained, ${sb.reads} reads matched ${sb.writes} writes")
-        end check
-    end scope sim
-end extend AxiLiteSbTest
+    // ── End-of-test invariants — auto-fire after `run`. UVM-equivalent
+    //    of `check_phase`. Spec §7.2 + §10.2 phase mapping.
+    check
+        assert sb.expected.empty() else fail("scoreboard left ${sb.expected.size()} expected value(s) un-checked")
+        assert sb.writes == sb.reads else fail("scoreboard counter drift: writes=${sb.writes} reads=${sb.reads}")
+        log(info, "PASS: scoreboard drained, ${sb.reads} reads matched ${sb.writes} writes")
+    end check
+end impl AxiLiteSbTest

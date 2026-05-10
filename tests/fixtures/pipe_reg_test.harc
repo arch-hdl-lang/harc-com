@@ -12,45 +12,46 @@ end property pipe_depth_3
 
 test PipeRegTest
     let dut : PipeRegTest
-
-    scope sim
-        run
-            // Reset for 2 cycles.
-            dut.rst = 1
-            dut.data_in = 0
-            wait 2 cycles
-            dut.rst = 0
-
-            // Drive 0x42 — after XOR, w = 0xBD enters stage 1.
-            dut.data_in = 66
-            wait 1 cycle
-            assert dut.data_out == 0
-                else fail("cycle 1: data_out=${dut.data_out} expected 0x00")
-
-            wait 1 cycle
-            assert dut.data_out == 0
-                else fail("cycle 2: data_out=${dut.data_out} expected 0x00")
-
-            wait 1 cycle
-            assert dut.data_out == 189
-                else fail("cycle 3: data_out=${dut.data_out} expected 0xBD")
-
-            // Change input to 0x00 (w = 0xFF). Old value should hold for
-            // 2 more cycles, then the new value emerges.
-            dut.data_in = 0
-            wait 1 cycle
-            assert dut.data_out == 189
-                else fail("cycle 4: data_out=${dut.data_out} expected 0xBD")
-
-            wait 1 cycle
-            assert dut.data_out == 189
-                else fail("cycle 5: data_out=${dut.data_out} expected 0xBD")
-
-            wait 1 cycle
-            assert dut.data_out == 255
-                else fail("cycle 6: data_out=${dut.data_out} expected 0xFF")
-
-            log(info, "PASS: 3-stage pipeline propagates with correct delay")
-        end run
-    end scope sim
 end test PipeRegTest
+
+impl sim for PipeRegTest
+    run
+        // Reset for 2 cycles.
+        dut.rst = 1
+        dut.data_in = 0
+        wait 2 cycles
+        dut.rst = 0
+
+        // Drive 0x42 — after XOR, w = 0xBD enters stage 1.
+        dut.data_in = 66
+        wait 1 cycle
+        assert dut.data_out == 0
+            else fail("cycle 1: data_out=${dut.data_out} expected 0x00")
+
+        wait 1 cycle
+        assert dut.data_out == 0
+            else fail("cycle 2: data_out=${dut.data_out} expected 0x00")
+
+        wait 1 cycle
+        assert dut.data_out == 189
+            else fail("cycle 3: data_out=${dut.data_out} expected 0xBD")
+
+        // Change input to 0x00 (w = 0xFF). Old value should hold for
+        // 2 more cycles, then the new value emerges.
+        dut.data_in = 0
+        wait 1 cycle
+        assert dut.data_out == 189
+            else fail("cycle 4: data_out=${dut.data_out} expected 0xBD")
+
+        wait 1 cycle
+        assert dut.data_out == 189
+            else fail("cycle 5: data_out=${dut.data_out} expected 0xBD")
+
+        wait 1 cycle
+        assert dut.data_out == 255
+            else fail("cycle 6: data_out=${dut.data_out} expected 0xFF")
+
+        log(info, "PASS: 3-stage pipeline propagates with correct delay")
+    end run
+end impl PipeRegTest
+

@@ -14,54 +14,55 @@ test EventSyncTest
 
     clock src_clk = SrcDomain    // 100 MHz → 10 ns period
     clock dst_clk = DstDomain    // 200 MHz → 5  ns period
-
-    scope sim
-        run
-            // Reset.
-            dut.rst = 1
-            dut.data_in = 0
-            wait 1 cycle on src_clk
-            dut.rst = 0
-            wait 2 cycles on dst_clk
-
-            // ── Test 1: single pulse ──────────────────────────────────────
-            // Hold data_in=1 across one src rising edge → toggle_src flips.
-            // Then the toggle propagates through the 2-FF chain on dst_clk.
-            dut.data_in = 1
-            wait 1 cycle on src_clk     // toggle_src flips here
-            dut.data_in = 0
-
-            // First dst rising edge after the toggle: sync_chain[0] = 1,
-            // sync_chain[1] = 0 (old). data_out = XOR = 1.
-            wait 1 cycle on dst_clk
-            assert dut.data_out == 1
-                else fail("expected data_out=1 first dst edge after toggle, got ${dut.data_out}")
-
-            // Next dst rising edge: sync_chain[1] catches up. XOR = 0.
-            wait 1 cycle on dst_clk
-            assert dut.data_out == 0
-                else fail("expected data_out=0 second dst edge, got ${dut.data_out}")
-            log(info, "PASS: single pulse — 1-dst-cycle wide on output")
-
-            // ── Test 2: a second pulse ────────────────────────────────────
-            dut.data_in = 1
-            wait 1 cycle on src_clk
-            dut.data_in = 0
-            wait 1 cycle on dst_clk
-            assert dut.data_out == 1
-                else fail("pulse 2: data_out=${dut.data_out}, expected 1")
-            wait 1 cycle on dst_clk
-            assert dut.data_out == 0
-                else fail("pulse 2 cleared: data_out=${dut.data_out}, expected 0")
-            log(info, "PASS: second pulse propagated correctly")
-
-            // ── Test 3: idle → no spurious pulses ─────────────────────────
-            for _ in 0 .. 5
-                wait 1 cycle on src_clk
-                assert dut.data_out == 0
-                    else fail("spurious data_out=${dut.data_out} during idle")
-            end for
-            log(info, "PASS: no spurious pulses during idle")
-        end run
-    end scope sim
 end test EventSyncTest
+
+impl sim for EventSyncTest
+    run
+        // Reset.
+        dut.rst = 1
+        dut.data_in = 0
+        wait 1 cycle on src_clk
+        dut.rst = 0
+        wait 2 cycles on dst_clk
+
+        // ── Test 1: single pulse ──────────────────────────────────────
+        // Hold data_in=1 across one src rising edge → toggle_src flips.
+        // Then the toggle propagates through the 2-FF chain on dst_clk.
+        dut.data_in = 1
+        wait 1 cycle on src_clk     // toggle_src flips here
+        dut.data_in = 0
+
+        // First dst rising edge after the toggle: sync_chain[0] = 1,
+        // sync_chain[1] = 0 (old). data_out = XOR = 1.
+        wait 1 cycle on dst_clk
+        assert dut.data_out == 1
+            else fail("expected data_out=1 first dst edge after toggle, got ${dut.data_out}")
+
+        // Next dst rising edge: sync_chain[1] catches up. XOR = 0.
+        wait 1 cycle on dst_clk
+        assert dut.data_out == 0
+            else fail("expected data_out=0 second dst edge, got ${dut.data_out}")
+        log(info, "PASS: single pulse — 1-dst-cycle wide on output")
+
+        // ── Test 2: a second pulse ────────────────────────────────────
+        dut.data_in = 1
+        wait 1 cycle on src_clk
+        dut.data_in = 0
+        wait 1 cycle on dst_clk
+        assert dut.data_out == 1
+            else fail("pulse 2: data_out=${dut.data_out}, expected 1")
+        wait 1 cycle on dst_clk
+        assert dut.data_out == 0
+            else fail("pulse 2 cleared: data_out=${dut.data_out}, expected 0")
+        log(info, "PASS: second pulse propagated correctly")
+
+        // ── Test 3: idle → no spurious pulses ─────────────────────────
+        for _ in 0 .. 5
+            wait 1 cycle on src_clk
+            assert dut.data_out == 0
+                else fail("spurious data_out=${dut.data_out} during idle")
+        end for
+        log(info, "PASS: no spurious pulses during idle")
+    end run
+end impl EventSyncTest
+

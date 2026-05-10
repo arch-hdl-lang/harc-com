@@ -33,12 +33,15 @@ fn split_test_via_extend_round_trips_to_same_cpp() {
 }
 
 #[test]
-fn extend_test_with_no_base_errors_clearly() {
-    let only_extend = parse_source(
-        "extend Missing\n  scope sim\n    run\n    end run\n  end scope sim\nend extend Missing",
+fn impl_with_no_base_test_errors_clearly() {
+    let only_impl = parse_source(
+        "impl sim for Missing\n    run\n    end run\nend impl Missing",
     ).unwrap();
-    let err = merge::merge_for_sim(&[only_extend], None).unwrap_err();
-    assert!(err.contains("no matching base") && err.contains("Missing"));
+    // `merge_for_sim` requires a base test; an `impl` referencing
+    // an unknown test name surfaces at codegen time, not merge time.
+    let err = merge::merge_for_sim(&[only_impl], None).unwrap_err();
+    assert!(err.contains("no `test` declaration"),
+        "expected 'no `test` declaration' error, got: {}", err);
 }
 
 #[test]
@@ -60,11 +63,12 @@ end test B
 fn missing_dut_let_is_a_clean_error() {
     let parsed = parse_source(
         r#"test T
-    scope sim
-        run
-        end run
-    end scope sim
-end test T"#,
+end test T
+
+impl sim for T
+    run
+    end run
+end impl T"#,
     )
     .unwrap();
     let err = cpp_tb::emit(&parsed).unwrap_err();
@@ -83,17 +87,18 @@ fn wide_hex_format_spec_routes_through_hexbuf128() {
     let parsed = parse_source(
         r#"test T
     let dut : DummyDut
-    scope sim
-        run
-            // Wide-hex spec — width 32 hex digits = 128 bits.
-            log(info, "ct=0x${dut.text_out:032x}")
-            // Narrow-hex spec — width 8 hex digits = stays on long long.
-            log(info, "narrow=0x${dut.x:08x}")
-            // Uppercase wide spec.
-            log(info, "CT=0x${dut.text_out:032X}")
-        end run
-    end scope sim
-end test T"#,
+end test T
+
+impl sim for T
+    run
+        // Wide-hex spec — width 32 hex digits = 128 bits.
+        log(info, "ct=0x${dut.text_out:032x}")
+        // Narrow-hex spec — width 8 hex digits = stays on long long.
+        log(info, "narrow=0x${dut.x:08x}")
+        // Uppercase wide spec.
+        log(info, "CT=0x${dut.text_out:032X}")
+    end run
+end impl T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -128,17 +133,18 @@ fn wide_hex_literal_routes_assign_and_eq_through_word_helpers() {
     let parsed = parse_source(
         r#"test T
     let dut : DummyDut
-    scope sim
-        run
-            // 256-bit literal — 64 hex digits — must split into 8
-            // words and route through harc_assign_words for the write
-            // and harc_eq_words for the compare.
-            dut.data = 0x0123456789abcdef_fedcba9876543210_aabbccddeeff0011_2233445566778899
-            assert dut.data == 0xffffffffffffffff_0000000000000000_aabbccddeeff0011_2233445566778899
-                else fail("nope")
-        end run
-    end scope sim
-end test T"#,
+end test T
+
+impl sim for T
+    run
+        // 256-bit literal — 64 hex digits — must split into 8
+        // words and route through harc_assign_words for the write
+        // and harc_eq_words for the compare.
+        dut.data = 0x0123456789abcdef_fedcba9876543210_aabbccddeeff0011_2233445566778899
+        assert dut.data == 0xffffffffffffffff_0000000000000000_aabbccddeeff0011_2233445566778899
+            else fail("nope")
+    end run
+end impl T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -163,14 +169,15 @@ fn wide_hex_literal_lowers_to_harc_u128_composite() {
     let parsed = parse_source(
         r#"test T
     let dut : DummyDut
-    scope sim
-        run
-            dut.x = 0x000102030405060708090a0b0c0d0e0f
-            assert dut.y == 0x66e94bd4ef8a2c3b884cfa59ca342b2e
-                else fail("nope")
-        end run
-    end scope sim
-end test T"#,
+end test T
+
+impl sim for T
+    run
+        dut.x = 0x000102030405060708090a0b0c0d0e0f
+        assert dut.y == 0x66e94bd4ef8a2c3b884cfa59ca342b2e
+            else fail("nope")
+    end run
+end impl T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -216,15 +223,16 @@ fn main_loop_settles_comb_before_first_posedge_then_posedge_before_tick() {
     let parsed = parse_source(
         r#"test T
     let dut : DummyDut
-    scope sim
-        run
-            dut.x = 1
-            wait 1 cycle
-            dut.x = 2
-            wait 1 cycle
-        end run
-    end scope sim
-end test T"#,
+end test T
+
+impl sim for T
+    run
+        dut.x = 1
+        wait 1 cycle
+        dut.x = 2
+        wait 1 cycle
+    end run
+end impl T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -271,16 +279,17 @@ fn pointer_rooted_signal_access_uses_wide_helpers() {
     let parsed = parse_source(
         r#"test T
     let dut : DummyDut
-    scope sim
-        run
-            dut.wide_in = 305419896
-            dut.narrow_in = 5
-            assert dut.wide_out == 305419896
-                else fail("wide read")
-            let v = dut.wide_out + 1
-        end run
-    end scope sim
-end test T"#,
+end test T
+
+impl sim for T
+    run
+        dut.wide_in = 305419896
+        dut.narrow_in = 5
+        assert dut.wide_out == 305419896
+            else fail("wide read")
+        let v = dut.wide_out + 1
+    end run
+end impl T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -316,15 +325,16 @@ fn top_level_const_lowers_to_static_constexpr() {
 const HALF      : uint<32> = MSHR_SIZE / 2
 test T
     let dut : DummyDut
-    scope sim
-        run
-            assert MSHR_SIZE == 32
-                else fail("MSHR_SIZE wrong")
-            assert HALF == 16
-                else fail("HALF wrong")
-        end run
-    end scope sim
-end test T"#,
+end test T
+
+impl sim for T
+    run
+        assert MSHR_SIZE == 32
+            else fail("MSHR_SIZE wrong")
+        assert HALF == 16
+            else fail("HALF wrong")
+    end run
+end impl T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -354,16 +364,17 @@ fn log_severity_test_result_semantics() {
     let parsed = parse_source(
         r#"test T
     let dut : DummyDut
-    scope sim
-        run
-            log(info,  "info: no effect")
-            log(warn,  "warn: no effect")
-            log(debug, "debug: no effect")
-            log(error, "error: should bump counter")
-            log(fatal, "fatal: should abort")
-        end run
-    end scope sim
-end test T"#,
+end test T
+
+impl sim for T
+    run
+        log(info,  "info: no effect")
+        log(warn,  "warn: no effect")
+        log(debug, "debug: no effect")
+        log(error, "error: should bump counter")
+        log(fatal, "fatal: should abort")
+    end run
+end impl T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -397,3 +408,69 @@ end test T"#,
     assert!(cpp.contains("_fatal = true;"),
         "expected `_fatal = true;` in FATAL lowering");
 }
+
+/// Custom `phase <name> ... end phase <name>` blocks inside an
+/// `impl sim for X` lower as `[&]`-capturing void-returning lambdas
+/// at main() scope, callable by name from `run` (or from each other).
+/// Spec §7.2: phases are pure code-organization helpers — not
+/// auto-fired by the runtime, only invoked by explicit user calls.
+#[test]
+fn impl_sim_custom_phase_lowers_as_named_lambda() {
+    let parsed = parse_source(
+        r#"test T
+    let dut : DummyDut
+end test T
+
+impl sim for T
+    phase warmup
+        log(info, "warmup phase")
+    end phase warmup
+
+    run
+        warmup()
+        wait 1 cycle
+    end run
+end impl T"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+
+    // Phase emits as `auto warmup = [&]() -> void { ... };`
+    assert!(cpp.contains("auto warmup = [&]() -> void {"),
+        "expected `auto warmup = [&]() -> void {{` in:\n{cpp}");
+    // Body of the phase contains the log line.
+    assert!(cpp.contains("warmup phase"),
+        "phase body should contain its log message; got:\n{cpp}");
+    // Run-coroutine body invokes the phase by name.
+    assert!(cpp.contains("warmup();"),
+        "run body should call `warmup();` to invoke the phase; got:\n{cpp}");
+
+    // Phase lambda emits BEFORE the run-coroutine bootstrap so the
+    // capture-by-reference closure is in scope when run calls it.
+    let phase_pos = cpp.find("auto warmup = [&]()").unwrap();
+    let bootstrap_pos = cpp.find("sched.bootstrap()").unwrap();
+    assert!(phase_pos < bootstrap_pos,
+        "custom phase lambda must be emitted before sched.bootstrap()");
+}
+
+/// v0 only emits codegen for `impl sim for ...`. A test with only
+/// non-sim impls (e.g. `impl emu for ...`) errors clearly rather than
+/// silently producing an empty binary — emu transport is post-v0.
+#[test]
+fn impl_emu_only_test_errors_clearly() {
+    let parsed = parse_source(
+        r#"test T
+    let dut : DummyDut
+end test T
+
+impl emu for T
+    run
+        log(info, "emu run body")
+    end run
+end impl T"#,
+    ).unwrap();
+
+    let err = cpp_tb::emit(&parsed).unwrap_err();
+    assert!(err.0.contains("only non-sim impls") && err.0.contains("emu"),
+        "expected clear error mentioning non-sim impls; got: {}", err.0);
+}
+

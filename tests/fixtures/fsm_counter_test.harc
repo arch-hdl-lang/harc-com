@@ -34,31 +34,32 @@ test FsmCounterTest
     let dut : FsmCounter
 
     clock clk = SysDomain        // 100 MHz
-
-    scope sim
-        run
-            // Reset.
-            dut.rst = 1
-            dut.go = 0
-            dut.target = 0
-            wait 3 cycles
-            dut.rst = 0
-            wait 1 cycle
-
-            // Test 1: target=3 → expect done with count=4 (cnt_r races
-            // one cycle past tgt_r before the DONE transition latches).
-            run_count(dut, 3, 4)
-            log(info, "PASS: target=3 → count=4")
-
-            // Test 2: target=1 → count=2.
-            run_count(dut, 1, 2)
-            log(info, "PASS: target=1 → count=2")
-
-            // Test 3: target=0 — IDLE→COUNTING with cnt_r=0==tgt_r=0,
-            // so DONE asserts after exactly 1 counting cycle. cnt_r
-            // still increments during that cycle → count=1.
-            run_count(dut, 0, 1)
-            log(info, "PASS: target=0 → count=1 (immediate done)")
-        end run
-    end scope sim
 end test FsmCounterTest
+
+impl sim for FsmCounterTest
+    run
+        // Reset.
+        dut.rst = 1
+        dut.go = 0
+        dut.target = 0
+        wait 3 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Test 1: target=3 → expect done with count=4 (cnt_r races
+        // one cycle past tgt_r before the DONE transition latches).
+        run_count(dut, 3, 4)
+        log(info, "PASS: target=3 → count=4")
+
+        // Test 2: target=1 → count=2.
+        run_count(dut, 1, 2)
+        log(info, "PASS: target=1 → count=2")
+
+        // Test 3: target=0 — IDLE→COUNTING with cnt_r=0==tgt_r=0,
+        // so DONE asserts after exactly 1 counting cycle. cnt_r
+        // still increments during that cycle → count=1.
+        run_count(dut, 0, 1)
+        log(info, "PASS: target=0 → count=1 (immediate done)")
+    end run
+end impl FsmCounterTest
+

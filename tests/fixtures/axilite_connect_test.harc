@@ -115,60 +115,61 @@ end tseq RandomTxns
 test AxiLiteConnectTest
     let dut : AxiLiteRegs
     let env : AxilEnv
-
-    scope sim
-        run
-            log(info, "AxiLiteRegs env+connect test (sequencer→transactor via event bridge)")
-            env.drv.dut = dut
-
-            // Reset.
-            dut.rst = 1
-            dut.axil_aw_addr = 0
-            dut.axil_aw_valid = 0
-            dut.axil_w_data = 0
-            dut.axil_w_strb = 15
-            dut.axil_w_valid = 0
-            dut.axil_b_ready = 1
-            dut.axil_ar_addr = 0
-            dut.axil_ar_valid = 0
-            dut.axil_r_ready = 1
-            dut.mm2s_done = 0
-            dut.mm2s_halted = 1
-            dut.mm2s_idle = 1
-            dut.s2mm_done = 0
-            dut.s2mm_halted = 1
-            dut.s2mm_idle = 1
-            dut.mm2s_sg_done = 0
-            dut.s2mm_sg_done = 0
-            dut.mm2s_sg_active = 0
-            dut.s2mm_sg_active = 0
-            wait 2 cycles
-            dut.rst = 0
-            wait 1 cycle
-
-            // Pre-seed expected values into the scoreboard, then let the
-            // sequencer dispatch each transaction. The connect bridge
-            // forwards every emit on env.sequencer.dispatched into the
-            // transactor's req event, which fires the active driver
-            // body. After the run, walk the queue and assert each
-            // round-trip matched.
-            let txns = RandomTxns(5)
-            for t in txns
-                env.sb.expected.push(t.value)
-            end for
-
-            env.sequencer.dispatch(txns)
-
-            for t in txns
-                let exp = env.sb.expected.pop()
-                if env.drv.last_read != exp
-                    env.sb.errors = env.sb.errors + 1
-                end if
-            end for
-            assert env.sb.errors > 0 || env.sb.expected.empty()
-                else fail("scoreboard not drained")
-
-            log(info, "PASS: 5 sequencer→transactor round-trips via `connect` event bridge")
-        end run
-    end scope sim
 end test AxiLiteConnectTest
+
+impl sim for AxiLiteConnectTest
+    run
+        log(info, "AxiLiteRegs env+connect test (sequencer→transactor via event bridge)")
+        env.drv.dut = dut
+
+        // Reset.
+        dut.rst = 1
+        dut.axil_aw_addr = 0
+        dut.axil_aw_valid = 0
+        dut.axil_w_data = 0
+        dut.axil_w_strb = 15
+        dut.axil_w_valid = 0
+        dut.axil_b_ready = 1
+        dut.axil_ar_addr = 0
+        dut.axil_ar_valid = 0
+        dut.axil_r_ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Pre-seed expected values into the scoreboard, then let the
+        // sequencer dispatch each transaction. The connect bridge
+        // forwards every emit on env.sequencer.dispatched into the
+        // transactor's req event, which fires the active driver
+        // body. After the run, walk the queue and assert each
+        // round-trip matched.
+        let txns = RandomTxns(5)
+        for t in txns
+            env.sb.expected.push(t.value)
+        end for
+
+        env.sequencer.dispatch(txns)
+
+        for t in txns
+            let exp = env.sb.expected.pop()
+            if env.drv.last_read != exp
+                env.sb.errors = env.sb.errors + 1
+            end if
+        end for
+        assert env.sb.errors > 0 || env.sb.expected.empty()
+            else fail("scoreboard not drained")
+
+        log(info, "PASS: 5 sequencer→transactor round-trips via `connect` event bridge")
+    end run
+end impl AxiLiteConnectTest
+
