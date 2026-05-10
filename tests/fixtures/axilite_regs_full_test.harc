@@ -47,196 +47,197 @@ test AxiLiteRegsFullTest
     let dut    : AxiLiteRegs
     let axil   : BusAxiLite = bind dut
     let helper : AxilHelper passive = bind axil
-
-    scope sim
-        run
-            // ── Reset ────────────────────────────────────────────────
-            dut.rst = 1
-            axil.aw.valid = 0
-            axil.w.valid = 0
-            axil.b.ready = 1
-            axil.ar.valid = 0
-            axil.r.ready = 1
-            dut.mm2s_done = 0
-            dut.mm2s_halted = 1
-            dut.mm2s_idle = 1
-            dut.s2mm_done = 0
-            dut.s2mm_halted = 1
-            dut.s2mm_idle = 1
-            dut.mm2s_sg_done = 0
-            dut.s2mm_sg_done = 0
-            dut.mm2s_sg_active = 0
-            dut.s2mm_sg_active = 0
-            wait 2 cycles
-            dut.rst = 0
-            wait 1 cycle
-
-            // ════════════════════════════════════════════════════════
-            // Test 1: MM2S register R/W
-            // ════════════════════════════════════════════════════════
-            helper.write(0, 1)                     // DMACR.RS=1
-            assert (helper.read(0) & 1) == 1
-                else fail("MM2S_DMACR.RS readback")
-
-            helper.write(24, 3735879680)           // SA = 0xDEAD1000
-            assert helper.read(24) == 3735879680
-                else fail("MM2S_SA readback")
-
-            helper.write(40, 16)                   // LENGTH = 16 bytes
-            assert helper.read(40) == 16
-                else fail("MM2S_LENGTH readback")
-
-            log(info, "Test 1 PASS: MM2S register R/W")
-
-            // ════════════════════════════════════════════════════════
-            // Test 2: MM2S start pulse on LENGTH write when RS=1
-            // ════════════════════════════════════════════════════════
-            helper.write(0, 1)                     // RS=1
-            helper.write(24, 4096)                 // SA = 0x1000
-
-            // Drive LENGTH write manually — we need to catch the
-            // mm2s_start pulse mid-handshake.
-            axil.aw.addr = 40
-            axil.aw.valid = 1
-            axil.w.data = 16
-            axil.w.strb = 15
-            axil.w.valid = 1
-
-            let start_seen = 0
-            for _ in 0 .. 10
-                wait 1 cycle
-                if dut.mm2s_start
-                    start_seen = 1
-                end if
-                if dut.axil_b_valid
-                    axil.aw.valid = 0
-                    axil.w.valid = 0
-                end if
-            end for
-
-            assert start_seen == 1
-                else fail("mm2s_start did not pulse on LENGTH write")
-            assert dut.mm2s_src_addr == 4096
-                else fail("mm2s_src_addr: got=${dut.mm2s_src_addr}, expected=0x1000")
-            assert dut.mm2s_num_beats == 4
-                else fail("mm2s_num_beats: got=${dut.mm2s_num_beats}, expected=4 (16/4)")
-
-            wait 1 cycle
-            assert dut.mm2s_start == 0
-                else fail("mm2s_start did not clear after 1 cycle")
-
-            log(info, "Test 2 PASS: MM2S start pulse")
-
-            // ════════════════════════════════════════════════════════
-            // Test 3: DMASR status bits + W1C
-            // ════════════════════════════════════════════════════════
-            dut.mm2s_halted = 1
-            dut.mm2s_idle = 1
-            wait 1 cycle
-            let sr = helper.read(4)
-            assert (sr & 1) == 1
-                else fail("DMASR.Halted should be 1 when halted=1")
-            assert ((sr >> 1) & 1) == 1
-                else fail("DMASR.Idle should be 1 when idle=1")
-
-            dut.mm2s_halted = 0
-            dut.mm2s_idle = 0
-            wait 1 cycle
-            assert (helper.read(4) & 1) == 0
-                else fail("DMASR.Halted should clear when halted=0")
-
-            // Done pulse → IOC_Irq sticks.
-            dut.mm2s_done = 1
-            wait 1 cycle
-            dut.mm2s_done = 0
-            wait 1 cycle
-            assert ((helper.read(4) >> 12) & 1) == 1
-                else fail("DMASR.IOC_Irq should set after done pulse")
-
-            // W1C: write 1 to bit 12 → clears IOC_Irq.
-            helper.write(4, 4096)                  // 0x1000 = bit 12
-            assert ((helper.read(4) >> 12) & 1) == 0
-                else fail("DMASR.IOC_Irq should clear after W1C")
-
-            log(info, "Test 3 PASS: DMASR status + W1C")
-
-            // ════════════════════════════════════════════════════════
-            // Test 4: Interrupt output
-            // ════════════════════════════════════════════════════════
-            helper.write(0, 4097)                  // (1 << 12) | 1
-            assert dut.mm2s_introut == 0
-                else fail("interrupt asserted before any done pulse")
-
-            dut.mm2s_done = 1
-            wait 1 cycle
-            dut.mm2s_done = 0
-            wait 1 cycle
-            assert dut.mm2s_introut == 1
-                else fail("interrupt should fire after done with IRQ enabled")
-
-            helper.write(4, 4096)                  // W1C
-            assert dut.mm2s_introut == 0
-                else fail("interrupt should clear after W1C")
-
-            log(info, "Test 4 PASS: interrupt generation")
-
-            // ════════════════════════════════════════════════════════
-            // Test 5: S2MM registers
-            // ════════════════════════════════════════════════════════
-            helper.write(48, 1)                    // S2MM DMACR.RS=1
-            helper.write(72, 3203379200)           // S2MM DA = 0xBEEF2000
-            helper.write(88, 32)                   // S2MM LENGTH = 32 bytes
-
-            assert (helper.read(48) & 1) == 1
-                else fail("S2MM_DMACR.RS")
-            assert helper.read(72) == 3203379200
-                else fail("S2MM_DA readback")
-            assert dut.s2mm_dst_addr == 3203379200
-                else fail("s2mm_dst_addr")
-            assert dut.s2mm_num_beats == 8
-                else fail("s2mm_num_beats: expected 8 (32/4)")
-
-            log(info, "Test 5 PASS: S2MM registers")
-
-            // ════════════════════════════════════════════════════════
-            // Test 6: SG registers — CURDESC/TAILDESC R/W + sg_start
-            // ════════════════════════════════════════════════════════
-            helper.write(0, 1)                     // DMACR.RS=1
-            helper.write(8, 4096)                  // CURDESC = 0x1000
-            assert helper.read(8) == 4096
-                else fail("MM2S_CURDESC readback")
-
-            // TAILDESC write — drive manually to catch sg_start pulse.
-            axil.aw.addr = 16
-            axil.aw.valid = 1
-            axil.w.data = 4144                     // 0x1030
-            axil.w.strb = 15
-            axil.w.valid = 1
-
-            let sg_start_seen = 0
-            for _ in 0 .. 10
-                wait 1 cycle
-                if dut.mm2s_sg_start
-                    sg_start_seen = 1
-                end if
-                if dut.axil_b_valid
-                    axil.aw.valid = 0
-                    axil.w.valid = 0
-                end if
-            end for
-
-            assert sg_start_seen == 1
-                else fail("mm2s_sg_start did not pulse on TAILDESC write")
-            assert dut.mm2s_curdesc_o == 4096
-                else fail("mm2s_curdesc_o")
-            assert dut.mm2s_taildesc_o == 4144
-                else fail("mm2s_taildesc_o")
-            assert helper.read(16) == 4144
-                else fail("MM2S_TAILDESC readback")
-
-            log(info, "Test 6 PASS: SG registers")
-
-            log(info, "ALL 6 SUB-TESTS PASSED — register-level coverage of AxiLiteRegs")
-        end run
-    end scope sim
 end test AxiLiteRegsFullTest
+
+impl sim for AxiLiteRegsFullTest
+    run
+        // ── Reset ────────────────────────────────────────────────
+        dut.rst = 1
+        axil.aw.valid = 0
+        axil.w.valid = 0
+        axil.b.ready = 1
+        axil.ar.valid = 0
+        axil.r.ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // ════════════════════════════════════════════════════════
+        // Test 1: MM2S register R/W
+        // ════════════════════════════════════════════════════════
+        helper.write(0, 1)                     // DMACR.RS=1
+        assert (helper.read(0) & 1) == 1
+            else fail("MM2S_DMACR.RS readback")
+
+        helper.write(24, 3735879680)           // SA = 0xDEAD1000
+        assert helper.read(24) == 3735879680
+            else fail("MM2S_SA readback")
+
+        helper.write(40, 16)                   // LENGTH = 16 bytes
+        assert helper.read(40) == 16
+            else fail("MM2S_LENGTH readback")
+
+        log(info, "Test 1 PASS: MM2S register R/W")
+
+        // ════════════════════════════════════════════════════════
+        // Test 2: MM2S start pulse on LENGTH write when RS=1
+        // ════════════════════════════════════════════════════════
+        helper.write(0, 1)                     // RS=1
+        helper.write(24, 4096)                 // SA = 0x1000
+
+        // Drive LENGTH write manually — we need to catch the
+        // mm2s_start pulse mid-handshake.
+        axil.aw.addr = 40
+        axil.aw.valid = 1
+        axil.w.data = 16
+        axil.w.strb = 15
+        axil.w.valid = 1
+
+        let start_seen = 0
+        for _ in 0 .. 10
+            wait 1 cycle
+            if dut.mm2s_start
+                start_seen = 1
+            end if
+            if dut.axil_b_valid
+                axil.aw.valid = 0
+                axil.w.valid = 0
+            end if
+        end for
+
+        assert start_seen == 1
+            else fail("mm2s_start did not pulse on LENGTH write")
+        assert dut.mm2s_src_addr == 4096
+            else fail("mm2s_src_addr: got=${dut.mm2s_src_addr}, expected=0x1000")
+        assert dut.mm2s_num_beats == 4
+            else fail("mm2s_num_beats: got=${dut.mm2s_num_beats}, expected=4 (16/4)")
+
+        wait 1 cycle
+        assert dut.mm2s_start == 0
+            else fail("mm2s_start did not clear after 1 cycle")
+
+        log(info, "Test 2 PASS: MM2S start pulse")
+
+        // ════════════════════════════════════════════════════════
+        // Test 3: DMASR status bits + W1C
+        // ════════════════════════════════════════════════════════
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        wait 1 cycle
+        let sr = helper.read(4)
+        assert (sr & 1) == 1
+            else fail("DMASR.Halted should be 1 when halted=1")
+        assert ((sr >> 1) & 1) == 1
+            else fail("DMASR.Idle should be 1 when idle=1")
+
+        dut.mm2s_halted = 0
+        dut.mm2s_idle = 0
+        wait 1 cycle
+        assert (helper.read(4) & 1) == 0
+            else fail("DMASR.Halted should clear when halted=0")
+
+        // Done pulse → IOC_Irq sticks.
+        dut.mm2s_done = 1
+        wait 1 cycle
+        dut.mm2s_done = 0
+        wait 1 cycle
+        assert ((helper.read(4) >> 12) & 1) == 1
+            else fail("DMASR.IOC_Irq should set after done pulse")
+
+        // W1C: write 1 to bit 12 → clears IOC_Irq.
+        helper.write(4, 4096)                  // 0x1000 = bit 12
+        assert ((helper.read(4) >> 12) & 1) == 0
+            else fail("DMASR.IOC_Irq should clear after W1C")
+
+        log(info, "Test 3 PASS: DMASR status + W1C")
+
+        // ════════════════════════════════════════════════════════
+        // Test 4: Interrupt output
+        // ════════════════════════════════════════════════════════
+        helper.write(0, 4097)                  // (1 << 12) | 1
+        assert dut.mm2s_introut == 0
+            else fail("interrupt asserted before any done pulse")
+
+        dut.mm2s_done = 1
+        wait 1 cycle
+        dut.mm2s_done = 0
+        wait 1 cycle
+        assert dut.mm2s_introut == 1
+            else fail("interrupt should fire after done with IRQ enabled")
+
+        helper.write(4, 4096)                  // W1C
+        assert dut.mm2s_introut == 0
+            else fail("interrupt should clear after W1C")
+
+        log(info, "Test 4 PASS: interrupt generation")
+
+        // ════════════════════════════════════════════════════════
+        // Test 5: S2MM registers
+        // ════════════════════════════════════════════════════════
+        helper.write(48, 1)                    // S2MM DMACR.RS=1
+        helper.write(72, 3203379200)           // S2MM DA = 0xBEEF2000
+        helper.write(88, 32)                   // S2MM LENGTH = 32 bytes
+
+        assert (helper.read(48) & 1) == 1
+            else fail("S2MM_DMACR.RS")
+        assert helper.read(72) == 3203379200
+            else fail("S2MM_DA readback")
+        assert dut.s2mm_dst_addr == 3203379200
+            else fail("s2mm_dst_addr")
+        assert dut.s2mm_num_beats == 8
+            else fail("s2mm_num_beats: expected 8 (32/4)")
+
+        log(info, "Test 5 PASS: S2MM registers")
+
+        // ════════════════════════════════════════════════════════
+        // Test 6: SG registers — CURDESC/TAILDESC R/W + sg_start
+        // ════════════════════════════════════════════════════════
+        helper.write(0, 1)                     // DMACR.RS=1
+        helper.write(8, 4096)                  // CURDESC = 0x1000
+        assert helper.read(8) == 4096
+            else fail("MM2S_CURDESC readback")
+
+        // TAILDESC write — drive manually to catch sg_start pulse.
+        axil.aw.addr = 16
+        axil.aw.valid = 1
+        axil.w.data = 4144                     // 0x1030
+        axil.w.strb = 15
+        axil.w.valid = 1
+
+        let sg_start_seen = 0
+        for _ in 0 .. 10
+            wait 1 cycle
+            if dut.mm2s_sg_start
+                sg_start_seen = 1
+            end if
+            if dut.axil_b_valid
+                axil.aw.valid = 0
+                axil.w.valid = 0
+            end if
+        end for
+
+        assert sg_start_seen == 1
+            else fail("mm2s_sg_start did not pulse on TAILDESC write")
+        assert dut.mm2s_curdesc_o == 4096
+            else fail("mm2s_curdesc_o")
+        assert dut.mm2s_taildesc_o == 4144
+            else fail("mm2s_taildesc_o")
+        assert helper.read(16) == 4144
+            else fail("MM2S_TAILDESC readback")
+
+        log(info, "Test 6 PASS: SG registers")
+
+        log(info, "ALL 6 SUB-TESTS PASSED — register-level coverage of AxiLiteRegs")
+    end run
+end impl AxiLiteRegsFullTest
+

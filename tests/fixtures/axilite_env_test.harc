@@ -82,51 +82,52 @@ end tseq RandomTxns
 test AxiLiteEnvTest
     let dut : AxiLiteRegs
     let env : AxilEnv
-
-    scope sim
-        run
-            log(info, "AxiLiteRegs env-composite test")
-            env.drv.dut = dut
-
-            // Reset.
-            dut.rst = 1
-            dut.axil_aw_addr = 0
-            dut.axil_aw_valid = 0
-            dut.axil_w_data = 0
-            dut.axil_w_strb = 15
-            dut.axil_w_valid = 0
-            dut.axil_b_ready = 1
-            dut.axil_ar_addr = 0
-            dut.axil_ar_valid = 0
-            dut.axil_r_ready = 1
-            dut.mm2s_done = 0
-            dut.mm2s_halted = 1
-            dut.mm2s_idle = 1
-            dut.s2mm_done = 0
-            dut.s2mm_halted = 1
-            dut.s2mm_idle = 1
-            dut.mm2s_sg_done = 0
-            dut.s2mm_sg_done = 0
-            dut.mm2s_sg_active = 0
-            dut.s2mm_sg_active = 0
-            wait 2 cycles
-            dut.rst = 0
-            wait 1 cycle
-
-            let txns = RandomTxns(5)
-            for t in txns
-                env.sb.expected.push(t.value)
-                env.drv.axil_write(t.addr, t.value)
-                let got = env.drv.axil_read(t.addr)
-                let exp = env.sb.expected.pop()
-                if got != exp
-                    env.sb.errors = env.sb.errors + 1
-                end if
-            end for
-            assert env.sb.errors == 0
-                else fail("env.sb.errors = ${env.sb.errors}")
-
-            log(info, "PASS: 5 round-trips through env.drv with env.sb scoreboard")
-        end run
-    end scope sim
 end test AxiLiteEnvTest
+
+impl sim for AxiLiteEnvTest
+    run
+        log(info, "AxiLiteRegs env-composite test")
+        env.drv.dut = dut
+
+        // Reset.
+        dut.rst = 1
+        dut.axil_aw_addr = 0
+        dut.axil_aw_valid = 0
+        dut.axil_w_data = 0
+        dut.axil_w_strb = 15
+        dut.axil_w_valid = 0
+        dut.axil_b_ready = 1
+        dut.axil_ar_addr = 0
+        dut.axil_ar_valid = 0
+        dut.axil_r_ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        let txns = RandomTxns(5)
+        for t in txns
+            env.sb.expected.push(t.value)
+            env.drv.axil_write(t.addr, t.value)
+            let got = env.drv.axil_read(t.addr)
+            let exp = env.sb.expected.pop()
+            if got != exp
+                env.sb.errors = env.sb.errors + 1
+            end if
+        end for
+        assert env.sb.errors == 0
+            else fail("env.sb.errors = ${env.sb.errors}")
+
+        log(info, "PASS: 5 round-trips through env.drv with env.sb scoreboard")
+    end run
+end impl AxiLiteEnvTest
+

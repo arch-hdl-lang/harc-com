@@ -11,50 +11,51 @@ test MultiClockSyncTest
 
     clock fast_clk = FastDomain    // 200 MHz → 5  ns period
     clock slow_clk = SlowDomain    //  50 MHz → 20 ns period
-
-    scope sim
-        run
-            // Reset on both domains.
-            dut.rst = 1
-            dut.data_in = 0
-            wait 2 cycles on slow_clk     // gives fast_clk plenty of edges too
-            dut.rst = 0
-
-            // ── fast_count increments once per fast_clk cycle ──────────────
-            // We're at fast_count == 0 right after reset deasserts. Walk
-            // 10 fast cycles, checking the count after each.
-            for i in 1 .. 11
-                wait 1 cycle on fast_clk
-                assert dut.fast_count == i
-                    else fail("fast_count after ${i} fast cycles: got ${dut.fast_count}, expected ${i}")
-            end for
-            log(info, "PASS: fast_count tracks fast_clk rising edges")
-
-            // ── slow_clk latches data_in into data_out ─────────────────────
-            // Drive data_in to a known value, wait at least one slow_clk
-            // rising edge, observe data_out updates.
-            dut.data_in = 42
-            wait 2 cycles on slow_clk
-            assert dut.data_out == 42
-                else fail("after slow latch: data_out=${dut.data_out}, expected 42")
-            log(info, "PASS: slow_clk latched data_in=42 into data_out")
-
-            // Change data_in; data_out should update on the next slow edge.
-            dut.data_in = 137
-            wait 2 cycles on slow_clk
-            assert dut.data_out == 137
-                else fail("after slow re-latch: data_out=${dut.data_out}, expected 137")
-            log(info, "PASS: slow domain re-latches new data_in")
-
-            // ── Independence: fast_count keeps advancing while we wait
-            //                  on slow_clk (proves the two domains are
-            //                  scheduled independently in real time) ────────
-            let prev_fast = dut.fast_count
-            wait 1 cycle on slow_clk      // 20 ns → 4 fast cycles elapse
-            let now_fast = dut.fast_count
-            assert now_fast == prev_fast + 4
-                else fail("fast advanced ${now_fast - prev_fast} during 1 slow cycle, expected 4")
-            log(info, "PASS: independent clock domains advance in real time (4:1 ratio observed)")
-        end run
-    end scope sim
 end test MultiClockSyncTest
+
+impl sim for MultiClockSyncTest
+    run
+        // Reset on both domains.
+        dut.rst = 1
+        dut.data_in = 0
+        wait 2 cycles on slow_clk     // gives fast_clk plenty of edges too
+        dut.rst = 0
+
+        // ── fast_count increments once per fast_clk cycle ──────────────
+        // We're at fast_count == 0 right after reset deasserts. Walk
+        // 10 fast cycles, checking the count after each.
+        for i in 1 .. 11
+            wait 1 cycle on fast_clk
+            assert dut.fast_count == i
+                else fail("fast_count after ${i} fast cycles: got ${dut.fast_count}, expected ${i}")
+        end for
+        log(info, "PASS: fast_count tracks fast_clk rising edges")
+
+        // ── slow_clk latches data_in into data_out ─────────────────────
+        // Drive data_in to a known value, wait at least one slow_clk
+        // rising edge, observe data_out updates.
+        dut.data_in = 42
+        wait 2 cycles on slow_clk
+        assert dut.data_out == 42
+            else fail("after slow latch: data_out=${dut.data_out}, expected 42")
+        log(info, "PASS: slow_clk latched data_in=42 into data_out")
+
+        // Change data_in; data_out should update on the next slow edge.
+        dut.data_in = 137
+        wait 2 cycles on slow_clk
+        assert dut.data_out == 137
+            else fail("after slow re-latch: data_out=${dut.data_out}, expected 137")
+        log(info, "PASS: slow domain re-latches new data_in")
+
+        // ── Independence: fast_count keeps advancing while we wait
+        //                  on slow_clk (proves the two domains are
+        //                  scheduled independently in real time) ────────
+        let prev_fast = dut.fast_count
+        wait 1 cycle on slow_clk      // 20 ns → 4 fast cycles elapse
+        let now_fast = dut.fast_count
+        assert now_fast == prev_fast + 4
+            else fail("fast advanced ${now_fast - prev_fast} during 1 slow cycle, expected 4")
+        log(info, "PASS: independent clock domains advance in real time (4:1 ratio observed)")
+    end run
+end impl MultiClockSyncTest
+

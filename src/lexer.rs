@@ -221,6 +221,8 @@ pub enum TokenKind {
     Emit,
     #[token("scope")]
     Scope,
+    #[token("impl")]
+    Impl,
     #[token("setup")]
     Setup,
     #[token("run")]
@@ -560,6 +562,7 @@ impl fmt::Display for TokenKind {
             JoinNone => write!(f, "join_none"),
             Emit => write!(f, "emit"),
             Scope => write!(f, "scope"),
+            Impl => write!(f, "impl"),
             Setup => write!(f, "setup"),
             Run => write!(f, "run"),
             Check => write!(f, "check"),

@@ -97,10 +97,83 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
 
 pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitError> {
     // Find a single `test` item — the entry point.
-    let test = file.items.iter().find_map(|it| match it {
+    let test_decl = file.items.iter().find_map(|it| match it {
         Item::Test(t) => Some(t),
         _ => None,
     }).ok_or_else(|| EmitError("no `test` declaration found".into()))?;
+
+    // Per-target test impl blocks (spec §7.2). `impl sim for <Test>`
+    // contributes its reserved phase blocks (setup/run/check/teardown)
+    // back into the test as a synthesized `ScopeDecl`, reusing the
+    // existing scope-sim codegen path byte-for-byte. Custom `phase
+    // <name>` blocks are pulled out as named [&]-lambdas emitted at
+    // main() scope alongside free functions, callable by name from
+    // `run` (and from each other) with sync `tick()` semantics. v0
+    // only emits codegen for `sim`; if a test has impls only for
+    // non-sim targets (e.g. `impl emu for ...`) we fail with a clear
+    // "not yet implemented" error rather than silently producing an
+    // empty binary.
+    let impls_for_test: Vec<&ImplDecl> = file.items.iter().filter_map(|it| match it {
+        Item::Impl(i) if i.test_name.name == test_decl.name.name => Some(i),
+        _ => None,
+    }).collect();
+
+    let sim_impl: Option<&ImplDecl> = impls_for_test.iter()
+        .copied()
+        .find(|i| i.target.name == "sim");
+
+    if !impls_for_test.is_empty() && sim_impl.is_none() {
+        let targets: Vec<&str> = impls_for_test.iter()
+            .map(|i| i.target.name.as_str()).collect();
+        return Err(EmitError(format!(
+            "test `{}` has only non-sim impls (targets: {}); v0 codegen \
+             only supports `impl sim for ...` — `emu` and other targets \
+             follow.",
+            test_decl.name.name,
+            targets.join(", "),
+        )));
+    }
+
+    // Synthesize the effective test by merging the sim impl's reserved
+    // phases into a `TestItem::Scope` appended to the test's items.
+    // Hold the owned clone for the lifetime of this emission and
+    // re-borrow it as `test` so downstream code is unchanged.
+    let mut custom_phases: Vec<(Ident, Block)> = Vec::new();
+    let test_owned: TestDecl = {
+        let mut t = test_decl.clone();
+        if let Some(im) = sim_impl {
+            let mut setup = None;
+            let mut run = None;
+            let mut check = None;
+            let mut teardown = None;
+            for it in &im.items {
+                match it {
+                    ImplItem::Setup(b) => setup = Some(b.clone()),
+                    ImplItem::Run(b) => run = Some(b.clone()),
+                    ImplItem::Check(b) => check = Some(b.clone()),
+                    ImplItem::Teardown(b) => teardown = Some(b.clone()),
+                    ImplItem::Phase(name, b) => {
+                        custom_phases.push((name.clone(), b.clone()));
+                    }
+                }
+            }
+            // Only synthesize the Scope if at least one reserved phase
+            // is present — empty impl blocks (only custom phases) leave
+            // the test's existing scope/bare-stmt items untouched.
+            if setup.is_some() || run.is_some()
+                || check.is_some() || teardown.is_some()
+            {
+                let scope = ScopeDecl {
+                    name: Ident { name: "sim".into(), span: im.span },
+                    setup, run, check, teardown,
+                    span: im.span,
+                };
+                t.items.push(TestItem::Scope(scope));
+            }
+        }
+        t
+    };
+    let test = &test_owned;
 
     // Collect top-level functions — emitted as lambdas inside main() so they
     // can capture `dut` and `tick` lexically.
@@ -683,6 +756,25 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         e.emit_function(f, 1);
     }
     if !funcs.is_empty() {
+        writeln!(e.out, "").ok();
+    }
+    // Custom `phase <name> ... end phase <name>` blocks from
+    // `impl sim for <Test>` (spec §7.2). Emitted as `[&]`-capturing
+    // void-returning lambdas at main() scope, identical shape to free
+    // functions — calls of the form `<name>()` from inside `run` (or
+    // any other phase) lower as plain C++ function calls, with `wait`
+    // inside the body taking the sync `tick()` path because the lambda
+    // body emits with `in_coroutine = false`. v0 places phases AFTER
+    // `funcs` so a phase can call free functions but a free function
+    // cannot call a phase (phases are conceptually test-scoped).
+    if !custom_phases.is_empty() {
+        for (name, body) in &custom_phases {
+            e.pad(1);
+            writeln!(e.out, "auto {} = [&]() -> void {{", name.name).ok();
+            e.emit_block(body, 2);
+            e.pad(1);
+            writeln!(e.out, "}};").ok();
+        }
         writeln!(e.out, "").ok();
     }
     // Tseqs lower to lambdas returning `std::vector<T>`; emitted alongside

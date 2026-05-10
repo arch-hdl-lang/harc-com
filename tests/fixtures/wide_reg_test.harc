@@ -9,63 +9,64 @@
 
 test WideRegTest
     let dut : WideReg
-
-    scope sim
-        run
-            log(info, "wide-bit-vector test: 256-bit signal whole-signal access")
-
-            // Reset.
-            dut.rst = 1
-            dut.we = 0
-            dut.data_in = 0
-            wait 2 cycles
-            dut.rst = 0
-            wait 1 cycle
-
-            // ── Test 1: write a 256-bit pattern, read it back ──────
-            // 64 hex digits = 256 bits. The codegen lowers this to
-            // `harc_assign_words(dut->data_in, {w0, w1, ..., w7})`.
-            dut.data_in = 0x0123456789abcdef_fedcba9876543210_aabbccddeeff0011_2233445566778899
-            dut.we = 1
-            wait 1 cycle
-            dut.we = 0
-            dut.data_in = 0
-            wait 1 cycle
-
-            // The == here lowers to `harc_eq_words(dut->data_out,
-            // {w0, ..., w7})`. Comparing all 256 bits, not just the
-            // low 128.
-            assert dut.data_out == 0x0123456789abcdef_fedcba9876543210_aabbccddeeff0011_2233445566778899
-                else fail("Test 1: 256-bit readback mismatch")
-            log(info, "Test 1 PASS: 256-bit pattern round-trips")
-
-            // ── Test 2: change all 8 words, confirm change ────────
-            // Sanity check that `harc_eq_words` actually compares
-            // the high words too — if it didn't, swapping just the
-            // top half (the upper 128 bits) wouldn't be detected.
-            dut.data_in = 0xffffffffffffffff_0000000000000000_aabbccddeeff0011_2233445566778899
-            dut.we = 1
-            wait 1 cycle
-            dut.we = 0
-            dut.data_in = 0
-            wait 1 cycle
-
-            // The OLD value would still match the low 128b but
-            // differ in the high 128b. If `==` were narrow this
-            // assert would falsely report equality.
-            assert dut.data_out == 0xffffffffffffffff_0000000000000000_aabbccddeeff0011_2233445566778899
-                else fail("Test 2: high-128b change not observed")
-            log(info, "Test 2 PASS: high 128 bits genuinely compared")
-
-            // ── Test 3: not-equal on the upper bits ────────────────
-            // Sanity check the != path. Same low 128 bits as the
-            // current value, different upper 128 bits — must be
-            // reported as not-equal.
-            assert dut.data_out != 0x0000000000000000_0000000000000000_aabbccddeeff0011_2233445566778899
-                else fail("Test 3: != failed to spot upper-bit difference")
-            log(info, "Test 3 PASS: != routes through harc_eq_words too")
-
-            log(info, "ALL 3 SUB-TESTS PASSED — wide bit-vector codegen")
-        end run
-    end scope sim
 end test WideRegTest
+
+impl sim for WideRegTest
+    run
+        log(info, "wide-bit-vector test: 256-bit signal whole-signal access")
+
+        // Reset.
+        dut.rst = 1
+        dut.we = 0
+        dut.data_in = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // ── Test 1: write a 256-bit pattern, read it back ──────
+        // 64 hex digits = 256 bits. The codegen lowers this to
+        // `harc_assign_words(dut->data_in, {w0, w1, ..., w7})`.
+        dut.data_in = 0x0123456789abcdef_fedcba9876543210_aabbccddeeff0011_2233445566778899
+        dut.we = 1
+        wait 1 cycle
+        dut.we = 0
+        dut.data_in = 0
+        wait 1 cycle
+
+        // The == here lowers to `harc_eq_words(dut->data_out,
+        // {w0, ..., w7})`. Comparing all 256 bits, not just the
+        // low 128.
+        assert dut.data_out == 0x0123456789abcdef_fedcba9876543210_aabbccddeeff0011_2233445566778899
+            else fail("Test 1: 256-bit readback mismatch")
+        log(info, "Test 1 PASS: 256-bit pattern round-trips")
+
+        // ── Test 2: change all 8 words, confirm change ────────
+        // Sanity check that `harc_eq_words` actually compares
+        // the high words too — if it didn't, swapping just the
+        // top half (the upper 128 bits) wouldn't be detected.
+        dut.data_in = 0xffffffffffffffff_0000000000000000_aabbccddeeff0011_2233445566778899
+        dut.we = 1
+        wait 1 cycle
+        dut.we = 0
+        dut.data_in = 0
+        wait 1 cycle
+
+        // The OLD value would still match the low 128b but
+        // differ in the high 128b. If `==` were narrow this
+        // assert would falsely report equality.
+        assert dut.data_out == 0xffffffffffffffff_0000000000000000_aabbccddeeff0011_2233445566778899
+            else fail("Test 2: high-128b change not observed")
+        log(info, "Test 2 PASS: high 128 bits genuinely compared")
+
+        // ── Test 3: not-equal on the upper bits ────────────────
+        // Sanity check the != path. Same low 128 bits as the
+        // current value, different upper 128 bits — must be
+        // reported as not-equal.
+        assert dut.data_out != 0x0000000000000000_0000000000000000_aabbccddeeff0011_2233445566778899
+            else fail("Test 3: != failed to spot upper-bit difference")
+        log(info, "Test 3 PASS: != routes through harc_eq_words too")
+
+        log(info, "ALL 3 SUB-TESTS PASSED — wide bit-vector codegen")
+    end run
+end impl WideRegTest
+

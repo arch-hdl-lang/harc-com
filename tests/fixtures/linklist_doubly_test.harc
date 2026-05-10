@@ -119,125 +119,126 @@ end transactor SchedXactor
 test LinklistDoublyTest
     let dut  : SchedList
     let xact : SchedXactor passive
-
-    scope sim
-        run
-            log(info, "SchedList doubly-linked list test")
-            xact.dut = dut
-
-            // ── Test 1: insert_tail x3 + next/prev traversal ──────
-            xact.reset_dut()
-            let h0 = xact.insert_tail(100)
-            let h1 = xact.insert_tail(200)
-            let h2 = xact.insert_tail(300)
-            assert h0 != 255 else fail("Test 1: h0 = no-handle")
-            assert h1 != 255 else fail("Test 1: h1 = no-handle")
-            assert h2 != 255 else fail("Test 1: h2 = no-handle")
-
-            // Forward chain: h0 → h1 → h2
-            let n0 = xact.next(h0)
-            assert n0 == h1
-                else fail("Test 1: next(h0)=${n0}, expected h1=${h1}")
-            let n1 = xact.next(h1)
-            assert n1 == h2
-                else fail("Test 1: next(h1)=${n1}, expected h2=${h2}")
-
-            // Backward chain: h2 → h1 → h0
-            let p2 = xact.prev(h2)
-            assert p2 == h1
-                else fail("Test 1: prev(h2)=${p2}, expected h1=${h1}")
-            let p1 = xact.prev(h1)
-            assert p1 == h0
-                else fail("Test 1: prev(h1)=${p1}, expected h0=${h0}")
-            log(info, "Test 1 PASS: insert_tail x3 + next/prev traversal")
-
-            // ── Test 2: insert_head x3 + next/prev traversal ──────
-            xact.reset_dut()
-            let a = xact.insert_head(10)
-            let b = xact.insert_head(20)        // list: 20 → 10
-            let c = xact.insert_head(30)        // list: 30 → 20 → 10
-            assert a != 255 else fail("Test 2: a = no-handle")
-            assert b != 255 else fail("Test 2: b = no-handle")
-            assert c != 255 else fail("Test 2: c = no-handle")
-
-            // Forward: c → b → a
-            let nc = xact.next(c)
-            assert nc == b
-                else fail("Test 2: next(c)=${nc}, expected b=${b}")
-            let nb = xact.next(b)
-            assert nb == a
-                else fail("Test 2: next(b)=${nb}, expected a=${a}")
-
-            // Backward: a → b → c
-            let pa = xact.prev(a)
-            assert pa == b
-                else fail("Test 2: prev(a)=${pa}, expected b=${b}")
-            let pb = xact.prev(b)
-            assert pb == c
-                else fail("Test 2: prev(b)=${pb}, expected c=${c}")
-            log(info, "Test 2 PASS: insert_head x3 + next/prev traversal")
-
-            // ── Test 3: delete_head, traversal still consistent ───
-            xact.reset_dut()
-            let p = xact.insert_tail(1)
-            let q = xact.insert_tail(2)
-            let r = xact.insert_tail(3)
-            let popped = xact.delete_head()
-            assert popped == 1
-                else fail("Test 3: delete_head=${popped}, expected 1")
-
-            // q is now the head; next(q) should still be r.
-            let nq = xact.next(q)
-            assert nq == r
-                else fail("Test 3: next(q)=${nq}, expected r=${r}")
-            log(info, "Test 3 PASS: delete_head preserves chain on new head")
-
-            // ── Test 4: insert_after ──────────────────────────────
-            xact.reset_dut()
-            let x = xact.insert_tail(1)            // list: x(1)
-            let y = xact.insert_tail(3)            // list: x(1) → y(3)
-            let z = xact.insert_after(x, 2)        // list: x(1) → z(2) → y(3)
-            assert z != 255 else fail("Test 4: insert_after returned no handle")
-
-            // Forward: x → z → y
-            let nx = xact.next(x)
-            assert nx == z
-                else fail("Test 4: next(x)=${nx}, expected z=${z}")
-            let nz = xact.next(z)
-            assert nz == y
-                else fail("Test 4: next(z)=${nz}, expected y=${y}")
-
-            // Backward: y → z → x
-            let py = xact.prev(y)
-            assert py == z
-                else fail("Test 4: prev(y)=${py}, expected z=${z}")
-            let pz = xact.prev(z)
-            assert pz == x
-                else fail("Test 4: prev(z)=${pz}, expected x=${x}")
-            log(info, "Test 4 PASS: insert_after splices into chain")
-
-            // ── Test 5: mixed insert_head + insert_tail ───────────
-            xact.reset_dut()
-            let m1 = xact.insert_tail(5)
-            let m2 = xact.insert_head(1)           // list: m2(1) → m1(5)
-            let m3 = xact.insert_tail(9)           // list: m2(1) → m1(5) → m3(9)
-
-            let nm2 = xact.next(m2)
-            assert nm2 == m1
-                else fail("Test 5: next(m2)=${nm2}, expected m1=${m1}")
-            let nm1 = xact.next(m1)
-            assert nm1 == m3
-                else fail("Test 5: next(m1)=${nm1}, expected m3=${m3}")
-
-            let pm3 = xact.prev(m3)
-            assert pm3 == m1
-                else fail("Test 5: prev(m3)=${pm3}, expected m1=${m1}")
-            let pm1 = xact.prev(m1)
-            assert pm1 == m2
-                else fail("Test 5: prev(m1)=${pm1}, expected m2=${m2}")
-            log(info, "Test 5 PASS: mixed head/tail inserts maintain chain")
-
-            log(info, "ALL 5 SUB-TESTS PASSED — SchedList doubly-linked list coverage")
-        end run
-    end scope sim
 end test LinklistDoublyTest
+
+impl sim for LinklistDoublyTest
+    run
+        log(info, "SchedList doubly-linked list test")
+        xact.dut = dut
+
+        // ── Test 1: insert_tail x3 + next/prev traversal ──────
+        xact.reset_dut()
+        let h0 = xact.insert_tail(100)
+        let h1 = xact.insert_tail(200)
+        let h2 = xact.insert_tail(300)
+        assert h0 != 255 else fail("Test 1: h0 = no-handle")
+        assert h1 != 255 else fail("Test 1: h1 = no-handle")
+        assert h2 != 255 else fail("Test 1: h2 = no-handle")
+
+        // Forward chain: h0 → h1 → h2
+        let n0 = xact.next(h0)
+        assert n0 == h1
+            else fail("Test 1: next(h0)=${n0}, expected h1=${h1}")
+        let n1 = xact.next(h1)
+        assert n1 == h2
+            else fail("Test 1: next(h1)=${n1}, expected h2=${h2}")
+
+        // Backward chain: h2 → h1 → h0
+        let p2 = xact.prev(h2)
+        assert p2 == h1
+            else fail("Test 1: prev(h2)=${p2}, expected h1=${h1}")
+        let p1 = xact.prev(h1)
+        assert p1 == h0
+            else fail("Test 1: prev(h1)=${p1}, expected h0=${h0}")
+        log(info, "Test 1 PASS: insert_tail x3 + next/prev traversal")
+
+        // ── Test 2: insert_head x3 + next/prev traversal ──────
+        xact.reset_dut()
+        let a = xact.insert_head(10)
+        let b = xact.insert_head(20)        // list: 20 → 10
+        let c = xact.insert_head(30)        // list: 30 → 20 → 10
+        assert a != 255 else fail("Test 2: a = no-handle")
+        assert b != 255 else fail("Test 2: b = no-handle")
+        assert c != 255 else fail("Test 2: c = no-handle")
+
+        // Forward: c → b → a
+        let nc = xact.next(c)
+        assert nc == b
+            else fail("Test 2: next(c)=${nc}, expected b=${b}")
+        let nb = xact.next(b)
+        assert nb == a
+            else fail("Test 2: next(b)=${nb}, expected a=${a}")
+
+        // Backward: a → b → c
+        let pa = xact.prev(a)
+        assert pa == b
+            else fail("Test 2: prev(a)=${pa}, expected b=${b}")
+        let pb = xact.prev(b)
+        assert pb == c
+            else fail("Test 2: prev(b)=${pb}, expected c=${c}")
+        log(info, "Test 2 PASS: insert_head x3 + next/prev traversal")
+
+        // ── Test 3: delete_head, traversal still consistent ───
+        xact.reset_dut()
+        let p = xact.insert_tail(1)
+        let q = xact.insert_tail(2)
+        let r = xact.insert_tail(3)
+        let popped = xact.delete_head()
+        assert popped == 1
+            else fail("Test 3: delete_head=${popped}, expected 1")
+
+        // q is now the head; next(q) should still be r.
+        let nq = xact.next(q)
+        assert nq == r
+            else fail("Test 3: next(q)=${nq}, expected r=${r}")
+        log(info, "Test 3 PASS: delete_head preserves chain on new head")
+
+        // ── Test 4: insert_after ──────────────────────────────
+        xact.reset_dut()
+        let x = xact.insert_tail(1)            // list: x(1)
+        let y = xact.insert_tail(3)            // list: x(1) → y(3)
+        let z = xact.insert_after(x, 2)        // list: x(1) → z(2) → y(3)
+        assert z != 255 else fail("Test 4: insert_after returned no handle")
+
+        // Forward: x → z → y
+        let nx = xact.next(x)
+        assert nx == z
+            else fail("Test 4: next(x)=${nx}, expected z=${z}")
+        let nz = xact.next(z)
+        assert nz == y
+            else fail("Test 4: next(z)=${nz}, expected y=${y}")
+
+        // Backward: y → z → x
+        let py = xact.prev(y)
+        assert py == z
+            else fail("Test 4: prev(y)=${py}, expected z=${z}")
+        let pz = xact.prev(z)
+        assert pz == x
+            else fail("Test 4: prev(z)=${pz}, expected x=${x}")
+        log(info, "Test 4 PASS: insert_after splices into chain")
+
+        // ── Test 5: mixed insert_head + insert_tail ───────────
+        xact.reset_dut()
+        let m1 = xact.insert_tail(5)
+        let m2 = xact.insert_head(1)           // list: m2(1) → m1(5)
+        let m3 = xact.insert_tail(9)           // list: m2(1) → m1(5) → m3(9)
+
+        let nm2 = xact.next(m2)
+        assert nm2 == m1
+            else fail("Test 5: next(m2)=${nm2}, expected m1=${m1}")
+        let nm1 = xact.next(m1)
+        assert nm1 == m3
+            else fail("Test 5: next(m1)=${nm1}, expected m3=${m3}")
+
+        let pm3 = xact.prev(m3)
+        assert pm3 == m1
+            else fail("Test 5: prev(m3)=${pm3}, expected m1=${m1}")
+        let pm1 = xact.prev(m1)
+        assert pm1 == m2
+            else fail("Test 5: prev(m1)=${pm1}, expected m2=${m2}")
+        log(info, "Test 5 PASS: mixed head/tail inserts maintain chain")
+
+        log(info, "ALL 5 SUB-TESTS PASSED — SchedList doubly-linked list coverage")
+    end run
+end impl LinklistDoublyTest
+

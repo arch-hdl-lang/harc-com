@@ -263,8 +263,9 @@ impl Parser {
             Some(TokenKind::Function) => self.parse_function(doc).map(Item::Function),
             Some(TokenKind::Apply) => self.parse_apply().map(Item::Apply),
             Some(TokenKind::Bus) => self.parse_bus(doc).map(Item::Bus),
+            Some(TokenKind::Impl) => self.parse_impl(doc).map(Item::Impl),
             Some(other) => Err(CompileError::unexpected_token(
-                "use, package, const, struct, enum, transaction, relation, tseq, agent, env, scoreboard, sequencer, transactor, test, extend, covergroup, property, pseq, cover sequence, module, function, or apply",
+                "use, package, const, struct, enum, transaction, relation, tseq, agent, env, scoreboard, sequencer, transactor, test, extend, impl, covergroup, property, pseq, cover sequence, module, function, or apply",
                 &other.to_string(),
                 self.peek_span(),
             )),
@@ -859,9 +860,21 @@ impl Parser {
         match self.peek_kind() {
             Some(TokenKind::Apply) => Ok(TestItem::Apply(self.parse_apply()?)),
             Some(TokenKind::Let) => Ok(TestItem::Let(self.parse_let_stmt()?)),
-            Some(TokenKind::Scope) => Ok(TestItem::Scope(self.parse_scope()?)),
             Some(TokenKind::Use) => Ok(TestItem::Use(self.parse_use(None)?)),
             Some(TokenKind::ClockGen) => Ok(TestItem::Clock(self.parse_clock_decl()?)),
+            // `scope sim` was the legacy lifecycle wrapper. It's been
+            // replaced by the top-level `impl sim for <Test>` item
+            // (spec §7.2). The token still lexes; we surface a clear
+            // error pointing the user at the new syntax rather than
+            // accept it silently.
+            Some(TokenKind::Scope) => Err(CompileError::unexpected_token(
+                "`impl sim for <TestName> ... end impl <TestName>` \
+                 at top level (the legacy `scope sim` block was \
+                 removed in favor of per-target test impls — see \
+                 spec §7.2)",
+                "scope",
+                self.peek_span(),
+            )),
             // Anything else: a bare statement, treated as implicit `run`.
             Some(_) => Ok(TestItem::Stmt(self.parse_stmt()?)),
             None => Err(CompileError::UnexpectedEof),
@@ -884,42 +897,65 @@ impl Parser {
         Ok(ApplyDecl { path, span })
     }
 
-    fn parse_scope(&mut self) -> Result<ScopeDecl, CompileError> {
-        let start = self.expect(TokenKind::Scope)?.span;
-        let name = self.expect_ident()?;
-        let mut setup = None;
-        let mut run = None;
-        let mut check = None;
-        let mut teardown = None;
+    // `parse_scope` was the parser path for the legacy `scope sim ...
+    // end scope sim` block. It's been removed in favor of `impl <target>
+    // for <Test>` (parsed by `parse_impl` above; spec §7.2). The
+    // `ScopeDecl` AST node + `TestItem::Scope` variant are kept as the
+    // internal IR shape that codegen synthesizes from a matching
+    // `Item::Impl`, so the existing emit pipeline reuses byte-for-byte.
+
+    /// Parse `impl <target> for <TestName> ... end impl <TestName>` —
+    /// per-target test implementation block (spec §7.2).
+    ///
+    /// Body items are the four reserved phase keywords (`setup` / `run` /
+    /// `check` / `teardown`) plus any number of `phase <name> ... end
+    /// phase <name>` user-defined named-phase blocks. Items appear in
+    /// any order; reserved phases may appear at most once each.
+    fn parse_impl(&mut self, doc: Option<String>) -> Result<ImplDecl, CompileError> {
+        let start = self.expect(TokenKind::Impl)?.span;
+        let target = self.expect_ident()?;
+        self.expect(TokenKind::For)?;
+        let test_name = self.expect_ident()?;
+        let mut items = Vec::new();
         while !self.check_end_keyword() {
             match self.peek_kind() {
                 Some(TokenKind::Setup) => {
                     self.advance();
                     let stmts = self.parse_stmt_list_until_end()?;
                     let end = self.expect_end_anon(TokenKind::Setup)?;
-                    setup = Some(Block { stmts, span: end });
+                    items.push(ImplItem::Setup(Block { stmts, span: end }));
                 }
                 Some(TokenKind::Run) => {
                     self.advance();
                     let stmts = self.parse_stmt_list_until_end()?;
                     let end = self.expect_end_anon(TokenKind::Run)?;
-                    run = Some(Block { stmts, span: end });
+                    items.push(ImplItem::Run(Block { stmts, span: end }));
                 }
                 Some(TokenKind::Check) => {
                     self.advance();
                     let stmts = self.parse_stmt_list_until_end()?;
                     let end = self.expect_end_anon(TokenKind::Check)?;
-                    check = Some(Block { stmts, span: end });
+                    items.push(ImplItem::Check(Block { stmts, span: end }));
                 }
                 Some(TokenKind::Teardown) => {
                     self.advance();
                     let stmts = self.parse_stmt_list_until_end()?;
                     let end = self.expect_end_anon(TokenKind::Teardown)?;
-                    teardown = Some(Block { stmts, span: end });
+                    items.push(ImplItem::Teardown(Block { stmts, span: end }));
+                }
+                Some(TokenKind::Phase) => {
+                    self.advance();
+                    let phase_name = self.expect_ident()?;
+                    let stmts = self.parse_stmt_list_until_end()?;
+                    let end = self.expect_end(TokenKind::Phase, &phase_name.name)?;
+                    items.push(ImplItem::Phase(
+                        phase_name,
+                        Block { stmts, span: end },
+                    ));
                 }
                 Some(other) => {
                     return Err(CompileError::unexpected_token(
-                        "setup, run, check, or teardown",
+                        "setup, run, check, teardown, or phase <name>",
                         &other.to_string(),
                         self.peek_span(),
                     ));
@@ -927,8 +963,14 @@ impl Parser {
                 None => return Err(CompileError::UnexpectedEof),
             }
         }
-        let end = self.expect_end(TokenKind::Scope, &name.name)?;
-        Ok(ScopeDecl { name, setup, run, check, teardown, span: start.merge(end) })
+        let end = self.expect_end(TokenKind::Impl, &test_name.name)?;
+        Ok(ImplDecl {
+            target,
+            test_name,
+            items,
+            span: start.merge(end),
+            doc,
+        })
     }
 
     // ── Extend ────────────────────────────────────────────────────────────────

@@ -77,58 +77,59 @@ test AxiLiteHooksTest
         post_value_sum = post_value_sum + t.value
         logf("axi_master.log", debug, "post drv.send last_read=0x${drv.last_read:08x}")
     end on
-
-    scope sim
-        run
-            log(info, "AxiLiteRegs pre/post hooks test")
-            drv.dut = dut
-
-            // Reset.
-            dut.rst = 1
-            dut.axil_aw_addr = 0
-            dut.axil_aw_valid = 0
-            dut.axil_w_data = 0
-            dut.axil_w_strb = 15
-            dut.axil_w_valid = 0
-            dut.axil_b_ready = 1
-            dut.axil_ar_addr = 0
-            dut.axil_ar_valid = 0
-            dut.axil_r_ready = 1
-            dut.mm2s_done = 0
-            dut.mm2s_halted = 1
-            dut.mm2s_idle = 1
-            dut.s2mm_done = 0
-            dut.s2mm_halted = 1
-            dut.s2mm_idle = 1
-            dut.mm2s_sg_done = 0
-            dut.s2mm_sg_done = 0
-            dut.mm2s_sg_active = 0
-            dut.s2mm_sg_active = 0
-            wait 2 cycles
-            dut.rst = 0
-            wait 1 cycle
-
-            // Issue 4 calls. Each fires the pre-hook, then the body,
-            // then the post-hook. Counters should land at 4/4 with
-            // post_value_sum equal to the sum of all sent payloads.
-            let total = 0
-            for i in 0 .. 4
-                let t : RegOp
-                t.addr = 24
-                t.value = (i + 1) * 1000000
-                drv.send(t)
-                total = total + t.value
-                assert drv.last_read == t.value
-                    else fail("call ${i}: drv.last_read=0x${drv.last_read:08x} != 0x${t.value:08x}")
-            end for
-
-            assert pre_count == 4
-                else fail("pre_count=${pre_count}, expected 4")
-            assert post_count == 4
-                else fail("post_count=${post_count}, expected 4")
-            assert post_value_sum == total
-                else fail("post_value_sum=${post_value_sum}, expected ${total}")
-            log(info, "PASS: pre_count=${pre_count}, post_count=${post_count}, sum matches")
-        end run
-    end scope sim
 end test AxiLiteHooksTest
+
+impl sim for AxiLiteHooksTest
+    run
+        log(info, "AxiLiteRegs pre/post hooks test")
+        drv.dut = dut
+
+        // Reset.
+        dut.rst = 1
+        dut.axil_aw_addr = 0
+        dut.axil_aw_valid = 0
+        dut.axil_w_data = 0
+        dut.axil_w_strb = 15
+        dut.axil_w_valid = 0
+        dut.axil_b_ready = 1
+        dut.axil_ar_addr = 0
+        dut.axil_ar_valid = 0
+        dut.axil_r_ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Issue 4 calls. Each fires the pre-hook, then the body,
+        // then the post-hook. Counters should land at 4/4 with
+        // post_value_sum equal to the sum of all sent payloads.
+        let total = 0
+        for i in 0 .. 4
+            let t : RegOp
+            t.addr = 24
+            t.value = (i + 1) * 1000000
+            drv.send(t)
+            total = total + t.value
+            assert drv.last_read == t.value
+                else fail("call ${i}: drv.last_read=0x${drv.last_read:08x} != 0x${t.value:08x}")
+        end for
+
+        assert pre_count == 4
+            else fail("pre_count=${pre_count}, expected 4")
+        assert post_count == 4
+            else fail("post_count=${post_count}, expected 4")
+        assert post_value_sum == total
+            else fail("post_value_sum=${post_value_sum}, expected ${total}")
+        log(info, "PASS: pre_count=${pre_count}, post_count=${post_count}, sum matches")
+    end run
+end impl AxiLiteHooksTest
+
