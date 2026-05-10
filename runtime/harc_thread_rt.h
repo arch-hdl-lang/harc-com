@@ -140,6 +140,37 @@ inline void harc_assign_words(Sig& sig, std::initializer_list<uint32_t> words) {
     }
 }
 
+// Inline hex formatter for 65–128-bit values used by the printf-style
+// interpolation lowering. Constructed as a temporary in the printf
+// arg list:
+//
+//   sim_log_line("INFO", "ct=0x%s",
+//                (const char*)HarcHexBuf128(harc_read(dut->x), 32, false));
+//
+// The temporary's lifetime extends through the full surrounding
+// expression (the printf call), so the returned `const char*` is
+// valid for the duration of the printf. Each call site instantiates
+// its own temporary, so multiple wide-hex args in one printf don't
+// clobber each other (each has its own on-stack buffer).
+//
+// `_harc_u128` is up to 32 hex digits; `width` is clamped to that
+// range. Narrower than 1 is also clamped (to 1) so no zero-length
+// formatting.
+struct HarcHexBuf128 {
+    char buf[40];
+    HarcHexBuf128(_harc_u128 v, int width, bool upper) {
+        const char* hex = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+        if (width < 1) width = 1;
+        if (width > 32) width = 32;
+        for (int i = width - 1; i >= 0; --i) {
+            buf[i] = hex[(uint32_t)(v & 0xf)];
+            v >>= 4;
+        }
+        buf[width] = '\0';
+    }
+    operator const char*() const { return buf; }
+};
+
 template<typename Sig>
 inline bool harc_eq_words(const Sig& sig, std::initializer_list<uint32_t> words) {
     if constexpr (std::is_arithmetic_v<Sig>) {
