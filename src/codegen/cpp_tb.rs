@@ -3474,38 +3474,11 @@ impl Emitter {
             StmtKind::Let(l) => self.emit_let(l, depth),
             StmtKind::Send { target, value } => {
                 self.pad(depth);
-                if self.is_pointer_rooted_signal_lvalue(target) {
-                    // Wrap as harc_assign(lvalue, rhs) so wide signals
-                    // (VlWide<N> from Verilator for >64-bit ports) get
-                    // per-word writes. Narrow signals see a plain
-                    // assignment via the template's `if constexpr`
-                    // branch.
-                    write!(self.out, "harc_rt::harc_assign(").ok();
-                    self.emit_lvalue(target);
-                    write!(self.out, ", ").ok();
-                    self.emit_expr(value);
-                    writeln!(self.out, ");").ok();
-                } else {
-                    self.emit_lvalue(target);
-                    write!(self.out, " = ").ok();
-                    self.emit_expr(value);
-                    writeln!(self.out, ";").ok();
-                }
+                self.emit_signal_assignment(target, value);
             }
             StmtKind::Assign { target, value } => {
                 self.pad(depth);
-                if self.is_pointer_rooted_signal_lvalue(target) {
-                    write!(self.out, "harc_rt::harc_assign(").ok();
-                    self.emit_lvalue(target);
-                    write!(self.out, ", ").ok();
-                    self.emit_expr(value);
-                    writeln!(self.out, ");").ok();
-                } else {
-                    self.emit_lvalue(target);
-                    write!(self.out, " = ").ok();
-                    self.emit_expr(value);
-                    writeln!(self.out, ";").ok();
-                }
+                self.emit_signal_assignment(target, value);
             }
             StmtKind::For(f) => {
                 self.pad(depth);
@@ -4348,6 +4321,54 @@ impl Emitter {
         self.emit_expr_with_arrow(e, false);
     }
 
+    /// Emit a single-line `<lhs> = <rhs>` style statement, dispatching
+    /// on three orthogonal axes:
+    ///   1. Pointer-rooted signal target → wrap with the
+    ///      `harc_rt::harc_*` template helpers so `VlWide<N>` ports
+    ///      compile against integer values.
+    ///   2. Plain local target → bare `lhs = rhs;`.
+    ///   3. RHS is a > 128-bit hex literal → route through
+    ///      `harc_rt::harc_assign_words` with an
+    ///      `std::initializer_list<uint32_t>`. Without this, the
+    ///      literal would clamp at 128 bits in `c_int_literal`'s
+    ///      composite path and silently lose the high bits.
+    fn emit_signal_assignment(&mut self, target: &Expr, value: &Expr) {
+        let pointer_rooted = self.is_pointer_rooted_signal_lvalue(target);
+        let wide_words = is_wide_int_literal(value);
+
+        match (pointer_rooted, wide_words) {
+            (true, Some(words)) => {
+                // > 128-bit literal into a wide signal — word-list path.
+                write!(self.out, "harc_rt::harc_assign_words(").ok();
+                self.emit_lvalue(target);
+                write!(self.out, ", {{").ok();
+                for (i, w) in words.iter().enumerate() {
+                    if i > 0 { write!(self.out, ", ").ok(); }
+                    write!(self.out, "{w}").ok();
+                }
+                writeln!(self.out, "}});").ok();
+            }
+            (true, None) => {
+                // Pointer-rooted signal, ≤128b RHS — uniform helper path.
+                write!(self.out, "harc_rt::harc_assign(").ok();
+                self.emit_lvalue(target);
+                write!(self.out, ", ").ok();
+                self.emit_expr(value);
+                writeln!(self.out, ");").ok();
+            }
+            (false, _) => {
+                // Plain local — bare assignment. (If RHS happens to be
+                // a > 128-bit literal here it'll clamp via
+                // `c_int_literal`'s fallback; locals aren't wide
+                // today so this is a corner that doesn't show up.)
+                self.emit_lvalue(target);
+                write!(self.out, " = ").ok();
+                self.emit_expr(value);
+                writeln!(self.out, ";").ok();
+            }
+        }
+    }
+
     /// Returns true if `e` is an L-value that ultimately lowers to a
     /// `<root>-><field>...` access chain (where `<root>` is a DUT pointer
     /// or bus-binding root). These are the cases where Verilator may
@@ -4499,6 +4520,41 @@ impl Emitter {
                 self.emit_expr(expr);
             }
             ExprKind::Binary { op, lhs, rhs } => {
+                // Wide-literal == / != routing: when either operand is
+                // a > 128-bit hex literal, route through
+                // `harc_rt::harc_eq_words(sig, {w0, w1, ...})` so the
+                // comparison happens word-by-word instead of through
+                // `_harc_u128` (which would silently truncate the
+                // literal to 128 bits and produce wrong matches).
+                if matches!(op, BinaryOp::Eq | BinaryOp::Ne) {
+                    let lhs_words = is_wide_int_literal(lhs);
+                    let rhs_is_wide = is_wide_int_literal(rhs).is_some();
+                    let words = lhs_words.or_else(|| is_wide_int_literal(rhs));
+                    if let Some(words) = words {
+                        // The signal side is whichever operand is not the
+                        // wide literal. Prefer rhs if both happen to be
+                        // (which won't normally happen — rejected by
+                        // typechecking — but keeps codegen total).
+                        let sig_side = if rhs_is_wide { lhs } else { rhs };
+                        if matches!(op, BinaryOp::Ne) {
+                            write!(self.out, "(!").ok();
+                        }
+                        write!(self.out, "harc_rt::harc_eq_words(").ok();
+                        // The signal side: pass as L-value (no harc_read
+                        // wrap) so the helper sees the raw VlWide<N>.
+                        self.emit_expr_with_arrow(sig_side, /*lvalue*/ true);
+                        write!(self.out, ", {{").ok();
+                        for (i, w) in words.iter().enumerate() {
+                            if i > 0 { write!(self.out, ", ").ok(); }
+                            write!(self.out, "{w}").ok();
+                        }
+                        write!(self.out, "}})").ok();
+                        if matches!(op, BinaryOp::Ne) {
+                            write!(self.out, ")").ok();
+                        }
+                        return;
+                    }
+                }
                 self.emit_expr(lhs);
                 let s = c_binary_op(*op);
                 write!(self.out, " {s} ").ok();
@@ -4886,21 +4942,77 @@ fn c_int_literal(s: &str) -> String {
     } else {
         ("", normalized.as_str())
     };
-    if !prefix.is_empty() && digits.len() > 16 {
-        // Split off the low 16 hex digits (low 64 bits); the rest are
-        // the high bits. Clamp to the high 16 hex digits (low 128 bits
-        // overall) since `_harc_u128` is 128b.
+    if !prefix.is_empty() && digits.len() > 16 && digits.len() <= 32 {
+        // 65..128 bits — fits in `_harc_u128`. Split into two 64-bit
+        // halves and emit the composite shifted-OR.
         let hex_lo_start = digits.len() - 16;
         let lo = &digits[hex_lo_start..];
-        let hi_full = &digits[..hex_lo_start];
-        let hi = if hi_full.len() > 16 {
-            &hi_full[hi_full.len() - 16..]
-        } else {
-            hi_full
-        };
+        let hi = &digits[..hex_lo_start];
+        return format!("(((_harc_u128)0x{hi}ULL << 64) | (_harc_u128)0x{lo}ULL)");
+    }
+    // > 128 bits: handled by `c_wide_lit_words` at the assign / equality
+    // call sites — they emit `harc_assign_words` / `harc_eq_words` with
+    // an `std::initializer_list<uint32_t>` instead. If we got here with
+    // a > 128b literal it means the literal escaped into a context that
+    // can't take a word-list (e.g. used as an arithmetic operand);
+    // fall back to a clamped composite to keep the output compilable
+    // with a clear narrowing warning rather than a crash.
+    if !prefix.is_empty() && digits.len() > 32 {
+        let lo = &digits[digits.len() - 16..];
+        let hi = &digits[digits.len() - 32..digits.len() - 16];
         return format!("(((_harc_u128)0x{hi}ULL << 64) | (_harc_u128)0x{lo}ULL)");
     }
     normalized
+}
+
+/// If the integer literal `s` is hex with > 32 hex digits (i.e. >
+/// 128 bits), return its decomposition into 32-bit words in LSB-
+/// first order — `vec!["0x...", "0x...", ...]`. Each string is a
+/// `uint32_t` hex literal. Returns `None` for narrower or non-hex
+/// literals; callers fall back to `c_int_literal` for those.
+///
+/// Used by the assign and equality lowering paths: a literal that
+/// can't fit in `_harc_u128` flows through `harc_assign_words` /
+/// `harc_eq_words` instead, which take `std::initializer_list<uint32_t>`.
+fn c_wide_lit_words(s: &str) -> Option<Vec<String>> {
+    let normalized = if let Some(idx) = s.find('\'') {
+        let (_, tail) = s.split_at(idx + 1);
+        let kind = tail.chars().next().unwrap_or('d');
+        let digits: String = tail[1..].chars().filter(|c| *c != '_').collect();
+        match kind {
+            'h' | 'H' => format!("0x{digits}"),
+            _ => return None,
+        }
+    } else {
+        s.replace('_', "")
+    };
+    let hex = normalized.strip_prefix("0x").or_else(|| normalized.strip_prefix("0X"))?;
+    if hex.len() <= 32 {
+        return None;
+    }
+    // Split into 8-hex-digit (32-bit) chunks, LSB-first.
+    let mut words = Vec::new();
+    let mut remaining = hex.len();
+    while remaining > 0 {
+        let start = remaining.saturating_sub(8);
+        let chunk = &hex[start..remaining];
+        words.push(format!("0x{chunk}u"));
+        remaining = start;
+    }
+    Some(words)
+}
+
+/// Returns true if `e` is an `Int` literal whose value is wider than
+/// 128 bits — i.e. the assign / equality call site should route
+/// through `harc_assign_words` / `harc_eq_words` with the word-list
+/// from `c_wide_lit_words` rather than the `_harc_u128` composite
+/// from `c_int_literal`.
+fn is_wide_int_literal(e: &Expr) -> Option<Vec<String>> {
+    if let ExprKind::Int(s) = &*e.kind {
+        c_wide_lit_words(s)
+    } else {
+        None
+    }
 }
 
 /// Parse a HARC-style interpolated string into a printf format string and

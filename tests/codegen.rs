@@ -71,6 +71,43 @@ end test T"#,
     assert!(err.0.contains("let dut"));
 }
 
+/// Hex literals wider than 128 bits (>32 hex digits) overflow
+/// `_harc_u128` and route through the `harc_assign_words` /
+/// `harc_eq_words` runtime helpers — taking an
+/// `std::initializer_list<uint32_t>` of the literal split into
+/// LSB-first 32-bit words. This is what makes wide DATA buses
+/// (AXI 256/512/1024-bit, vector lanes, etc.) drivable as
+/// whole-signal hex literals.
+#[test]
+fn wide_hex_literal_routes_assign_and_eq_through_word_helpers() {
+    let parsed = parse_source(
+        r#"test T
+    let dut : DummyDut
+    scope sim
+        run
+            // 256-bit literal — 64 hex digits — must split into 8
+            // words and route through harc_assign_words for the write
+            // and harc_eq_words for the compare.
+            dut.data = 0x0123456789abcdef_fedcba9876543210_aabbccddeeff0011_2233445566778899
+            assert dut.data == 0xffffffffffffffff_0000000000000000_aabbccddeeff0011_2233445566778899
+                else fail("nope")
+        end run
+    end scope sim
+end test T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+
+    // Assignment: harc_assign_words with 8 LSB-first words.
+    assert!(cpp.contains("harc_rt::harc_assign_words(dut->data, {0x66778899u, 0x22334455u, 0xeeff0011u, 0xaabbccddu, 0x76543210u, 0xfedcba98u, 0x89abcdefu, 0x01234567u})"),
+        "expected harc_assign_words call with LSB-first words:\n{}", cpp);
+
+    // Equality: harc_eq_words with 8 LSB-first words from the
+    // compared literal.
+    assert!(cpp.contains("harc_rt::harc_eq_words(dut->data, {0x66778899u, 0x22334455u, 0xeeff0011u, 0xaabbccddu, 0x00000000u, 0x00000000u, 0xffffffffu, 0xffffffffu})"),
+        "expected harc_eq_words call with LSB-first words:\n{}", cpp);
+}
+
 /// Hex literals wider than 64 bits (>16 hex digits) lower to a
 /// composite `_harc_u128` shifted-OR expression so they fit C++'s
 /// integer-literal grammar and flow through `harc_assign` /
