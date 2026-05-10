@@ -987,6 +987,65 @@ This is where the "wide" scope decision pays off. Each verification role becomes
 
 **SW/HW boundary.** The transactor is the seam. Everything below it (DUT pins, the protocol BFM threads inside the transactor, possibly the DUT itself) compiles to RTL and runs at HW speed. Everything above it (sequencer, scoreboard, env, test, run coroutine) stays SW. The two sides communicate over **transaction-level pipes** following the Accellera SCE-MI 2.4 standard: input pipes carry transactions from sequencer/test → transactor; output pipes carry observations from transactor → scoreboard/test. Same source-level constructs work in `harc sim` (pipes are shared memory + DPI-C, near-zero overhead) and on emulator backends (pipes are vendor DMA channels). See §8.1 for the lowering.
 
+**Topology at a glance.** A canonical bound-bus test composes as below: the
+test holds a bus binding and an env; the env holds an agent and a scoreboard;
+the agent bundles a sequencer with its transactor and the connect bridge
+between them. Stimulus flows out through the transactor's active half;
+observation flows in through its passive half. Both halves share the same
+transactor declaration — `when active|passive` selects which body is
+codegen-instantiated.
+
+```mermaid
+flowchart TB
+    subgraph Test["test SimpleTest · scope sim · run"]
+        subgraph Env["env Env"]
+            subgraph Agent["agent AxilAgent (active)"]
+                Seq["sequencer<br/>tseq RandomTxns<br/>→ dispatched"]
+                Xact["transactor xact<br/>when active<br/>req : in event&lt;T&gt;<br/>on req(t) → bus.aw.send(...)"]
+                Seq -- "connect dispatched → req" --> Xact
+            end
+            SB["scoreboard<br/>expected : queue&lt;T&gt;<br/>on bus.&lt;ch&gt;.handshake<br/>assert observed == expected"]
+            Xact -. "connect xact.completed → sb.observed" .-> SB
+        end
+        Bus[/"bus axil : BusAxiLite = bind dut"/]
+    end
+    DUT[("DUT<br/>Verilator-compiled SystemVerilog<br/>V&lt;TopModule&gt;*")]
+
+    Xact ==> |"stimulus<br/>(active half)"| Bus
+    Bus ==> DUT
+    DUT -. "observation<br/>(passive half)" .-> Bus
+    Bus -. observe .-> SB
+
+    classDef testStyle fill:#fafafa,stroke:#333,stroke-width:2px,stroke-dasharray:4 3;
+    classDef envStyle fill:#f0f4f8,stroke:#335577;
+    classDef agentStyle fill:#f4ece0,stroke:#8a5a1a;
+    classDef seqStyle fill:#fff7e0,stroke:#8a6a1a;
+    classDef xactStyle fill:#e8f0fe,stroke:#1a4a8a;
+    classDef sbStyle fill:#e8f8ec,stroke:#1a7a3a;
+    classDef dutStyle fill:#f7e8e8,stroke:#8a1a1a,stroke-width:2px;
+    classDef busStyle fill:#f0f4f8,stroke:#335577;
+
+    class Test testStyle;
+    class Env envStyle;
+    class Agent agentStyle;
+    class Seq seqStyle;
+    class Xact xactStyle;
+    class SB sbStyle;
+    class DUT dutStyle;
+    class Bus busStyle;
+```
+
+**Mode reuse.** The same transactor declaration covers active and passive
+contexts via mode inheritance from the let-instantiation:
+
+```harc
+let act : E active     // act.ag.xact gets active body
+let pas : E passive    // pas.ag.xact gets passive body — same decl
+```
+
+Mode flows all the way down: env → agent → transactor field. Field-level
+explicit modes (`drv : T active`) win over inherited ones at any depth.
+
 **v0 lowering status.** `transactor` (§8.1) is the canonical BFM construct. SW-side codegen is complete (T-1 + T-2: parse, AST, pretty-print round-trip, end-to-end lowered by cpp_tb). The legacy `driver`/`monitor` constructs that predated `transactor` have been removed from the language; existing TBs ported their drivers and monitors to transactor form. ARCH-side `generate_if ACTIVE` lowering (T-3) and emulator transport (T-4) remain scheduled for post-v0. The bullets below describe what cpp_tb actually emits.
 
 - `tseq T -> TSeq<X>` → `[&]`-lambda returning `std::vector<X>`. `yield e` pushes to the implicit `_result` accumulator. Iterate the result with `for x in seq`.
@@ -997,6 +1056,11 @@ This is where the "wide" scope decision pays off. Each verification role becomes
 - **Mode inheritance through agent and env composition.** A transactor field nested inside an `agent` or `env` (e.g. `agent A { drv : T }`) without an explicit mode inherits its mode from the parent's let-instantiation. Same agent declaration + `let act : A active` makes `act.drv` active; `let pas : A passive` makes it passive. Inheritance cascades through any number of nesting layers — `env E { ag : Agent { drv : T } }` flows mode from `let topenv : E passive` all the way down to `topenv.ag.drv`. A field-level explicit mode (e.g. `drv : T active`) wins over the inherited mode at any depth.
 - `const NAME : Ty = expr` lowers to a file-scope `static constexpr <c_type> NAME = <expr>;` — visible everywhere (main, hookable lambdas, on-handler closures, struct field defaults).
 - **`log` severity test-result semantics** (§7.7) are honored: `log(error, ...)` increments the failure counter so the test fails at end of run; `log(fatal, ...)` additionally aborts this test instance at end of the current cycle. `info` / `warn` / `debug` have no test-result effect. Verbosity filtering, component IDs, and per-component overrides remain deferred — the runtime currently prints all severities unconditionally.
+- **Wide bit-vector value type.** Any HARC unsigned integer type wider than 64 bits — `uint<128>`, `bits<256>`, etc. — lowers to `_harc_u128` (= `unsigned __int128`) for arithmetic and storage. Mirrors arch-com's `_arch_u128` (arch-com `src/sim_codegen/mod.rs:767`). Native on x86_64 and ARM64; folds to ordinary cast/compare for narrow operands via `if constexpr`. Applies uniformly to `let` locals, hookable parameters, and transaction fields. Beyond 128 bits, value-typed locals still lower to `_harc_u128` (silently truncating the upper bits) — for full > 128b precision, work with the signal directly via `dut.field` whole-signal access (next bullets).
+- **Whole-signal access for wide DUT ports.** Verilator lowers ports >64 bits to `VlWide<N>` (an array of N uint32_t words). HARC's runtime helpers — `harc_rt::harc_assign(sig, val)` for writes and `harc_rt::harc_read(sig)` for reads — `if constexpr`-dispatch on the signal's type: narrow integers cast directly; `VlWide<N>` writes/reads the low 128 bits via the four-word path (zero-extended on write, dropping upper words on read for N > 4). The codegen emits these helpers around every `dut.x = expr` and every `dut.x` R-value access, so wide signals look identical to narrow ones at the HARC source level. Indexed access (`dut.x[i]`) bypasses the wrap and reaches `VlWide`'s `operator[]` directly — used as the escape hatch for >128b signals where the user wants per-word writes / reads.
+- **Hex literals at any width.** `0x<≤16 hex digits>` lowers to a plain C++ integer literal. `0x<17..32 hex digits>` lowers to a composite `_harc_u128` shifted-OR (`((_harc_u128)<hi>ULL << 64) | (_harc_u128)<lo>ULL`) so 65..128b values flow through the same arithmetic types as smaller ones. `0x<>32 hex digits>` is split into 32-bit words and routed through `harc_rt::harc_assign_words` (for `dut.x = lit`) or `harc_rt::harc_eq_words` (for `dut.x == lit` / `!=`) so the full literal participates word-by-word — matching wide DATA buses (AXI4 256/512/1024-bit, vector lanes, SHA-512 blocks). The assign/eq helpers take `std::initializer_list<uint32_t>` LSB-first; missing high words are treated as zero on both sides.
+- **Wide-hex printf interpolation.** `${expr:WWx}` and `${expr:WWX}` with WW > 16 hex digits route through `harc_rt::HarcHexBuf128` — a stack-temporary buffer whose lifetime is the printf's full expression — printed via `%s`. The full ≤128b value renders, no upper-bit truncation. Specs with WW ≤ 16 stay on the legacy `%llx` / `(long long)(...)` path. Decimal `${val:d}` for >64b and per-word printing for >128b values are deferred.
+- **Run-coroutine bootstrap semantic** (matches Verilog `@(posedge clk)`): each `wait N cycles` corresponds to N posedges that observe the values set in the segment ending at the wait. After `sched.bootstrap()` runs the first segment to its first wait, the main loop does an initial `dut->eval()` with `clk=0` (combinational settle, no time advance) and then per iteration runs **posedge → `sched.tick()` → falling edge** in that order. The first iteration's posedge therefore samples bootstrap's outputs; subsequent iterations sample the previous tick's segment. Without this ordering, bootstrap's segment would be overwritten by the first tick before any posedge could see it.
 - `on event_field(arg) ... end on` inside a transactor / agent / sequencer body → registers a `[&]`-capturing closure into the corresponding event vector at `let drv : T` time. Event payloads typed `event<MyTxn>` round-trip as the `MyTxn` C++ struct (transactions and enums get their bare name; integer-typed payloads still widen). `emit drv.req(t)` fires every registered subscriber synchronously — the on-handler body runs inside the test's tick scope (so `wait`, `dut.x = ...`, etc. all work).
 - `on dut.signal ... end on` (cycle-trigger form) inside any component body → per-cycle bool checker. Used for the observation half of an unbound transactor.
 - `connect a -> b ... end connect` inside an `env` or `agent` body → at the enclosing let-instantiation time, installs a generic-lambda bridge subscriber on the appropriately-prefixed path that fans out to every subscriber of the destination path. Connects nested any number of levels deep (e.g. an `agent`'s connect block inside an `env`-composed agent) get prefixed with the sub-instance path — `connect sequencer.dispatched -> drv.req` inside an agent that's a field of `topenv` lowers as `topenv.ag.sequencer.dispatched.push_back([&](auto _t) { for (auto& _s : topenv.ag.drv.req) _s(_t); })`. Edge endpoints are field-access chains; the bridge uses `auto` for the payload so the connect site doesn't have to look up the event's type.
@@ -1017,7 +1081,7 @@ This is where the "wide" scope decision pays off. Each verification role becomes
 
 **Why opt-in.** Per-cycle barrier sync on Apple Silicon costs tens of µs round-trip due to P/E-core scheduling jitter. With sub-µs per-cycle actor work in typical fixtures, `--mt` is *13× slower* than cooperative on the bound-transactor benchmark (cooperative ~0.02s, `--mt` ~0.27s for 30 000 cycles + 3 actors). The runtime topology is shipped for: (1) correctness validation of the multi-actor model — active and passive transactor halves genuinely run in parallel under `--mt`, surfacing any latent race that the cooperative model would have hidden; (2) future workloads (large per-cycle compute, or DUT-side parallel eval) where the parallelism win exceeds the barrier cost; (3) structural mirror with arch-com's Phase 3 — when the two runtimes converge, this is the model both sides converge on. Cycle batching (`run_cycles(K)`) to amortize barrier cost — useful for fast-forwarding through long idle drains where actors are quiet — is **Phase 3b** (deferred). Phase 3a ships the runtime topology + correctness argument; perf comes when there's a workload to justify it.
 
-Out of v0 scope: `tlm_method` lowering, `credit_channel` lowering (parser accepts; codegen no-ops), DUT-side introspection to flag bus signals that the actual SV doesn't expose, env-composed `bound` sub-components (only top-level `let xact : T mode = bind axil` is supported; bound components nested inside an `env` follow), multi-input-event transactors (active transactors with multiple `in event<T>` fields fall back to the synchronous subscriber-callback path), and OS-thread parallelism beyond the opt-in `--mt` flag (Phase 3b cycle batching).
+Out of v0 scope: `tlm_method` lowering, `credit_channel` lowering (parser accepts; codegen no-ops), DUT-side introspection to flag bus signals that the actual SV doesn't expose, env-composed `bound` sub-components (only top-level `let xact : T mode = bind axil` is supported; bound components nested inside an `env` follow), multi-input-event transactors (active transactors with multiple `in event<T>` fields fall back to the synchronous subscriber-callback path), OS-thread parallelism beyond the opt-in `--mt` flag (Phase 3b cycle batching), decimal printf for >64-bit values (`__int128` lacks native printf support), and per-word printing of >128-bit signals (would need a word-array variant of `HarcHexBuf128`).
 
 ### 8.1 `transactor`
 
@@ -1302,6 +1366,55 @@ ISA-spec embedding: a Sail model compiles to a `ref module` via the C-emulator p
 ### 10.1 Native simulator — `harc sim`
 
 **Cycle-based, statically scheduled, co-compiled with ARCH.** No event-driven kernel.
+
+**v0 toolchain.** `harc sim --sv <dut.sv> <test.harc> --top <TopModule>` parses
+the HARC source, lowers it to a single `.cpp` testbench plus the runtime
+header, and chains through Verilator to produce a self-contained binary. Run
+the binary to see `ALL TESTS PASSED` or `N TESTS FAILED`.
+
+```mermaid
+flowchart TB
+    Harc["HARC source<br/>tests/fixtures/*.harc<br/>tests, transactors, agents,<br/>scoreboards"]
+    Sv["SystemVerilog DUT<br/>tests/dut/*.sv"]
+    Rt["Runtime header<br/>runtime/harc_thread_rt.h<br/>scheduler + helpers"]
+    Manifest["Manifest (sweep only)<br/>tests/run_fixtures.sh<br/>name | top | sv files | extras"]
+
+    Cli["harc CLI (Rust)<br/>harc sim --sv ... --top ... &lt;harc files&gt;<br/>parser (LL(1)) → AST → cpp_tb codegen<br/>+ writes harc_thread_rt.h alongside the .cpp"]
+
+    Cpp["Generated testbench<br/>harc_sim_build/&lt;test&gt;.cpp<br/>main() drives clock<br/>sched.bootstrap() → eval(clk=0)<br/>loop: posedge → tick → falling"]
+    RtGen["Generated runtime + glue<br/>harc_sim_build/harc_thread_rt.h<br/>_harc_u128, harc_assign/read,<br/>harc_assign_words/eq_words,<br/>HarcHexBuf128, ThreadScheduler"]
+
+    Vrl["Verilator<br/>--cc --exe --build<br/>CFG_CXXFLAGS_STD=-std=gnu++20<br/>CXX=clang++ via MAKEFLAGS"]
+
+    Bin(["V&lt;TopModule&gt; test binary"])
+    Out[/"stdout + sim.log<br/>cycle-stamped log<br/>ALL TESTS PASSED / N TESTS FAILED<br/>exit 0/1"/]
+
+    Harc --> Cli
+    Sv --> Cli
+    Sv -. SV inputs .-> Vrl
+    Cli --> Cpp
+    Cli --> RtGen
+    Rt -. baked in .-> Cli
+    Cpp --> Vrl
+    RtGen --> Vrl
+    Vrl --> Bin
+    Bin -- run --> Out
+    Manifest -. drives sweep .-> Cli
+
+    classDef src fill:#fff7e0,stroke:#8a6a1a;
+    classDef tool fill:#e8f0fe,stroke:#1a4a8a,stroke-width:2px;
+    classDef gen fill:#f0f4f8,stroke:#335577;
+    classDef vrl fill:#f4ece0,stroke:#8a5a1a,stroke-width:2px;
+    classDef bin fill:#e8f8ec,stroke:#1a7a3a,stroke-width:2px;
+    classDef out fill:#f7e8e8,stroke:#8a1a1a;
+
+    class Harc,Sv,Rt,Manifest src;
+    class Cli tool;
+    class Cpp,RtGen gen;
+    class Vrl vrl;
+    class Bin bin;
+    class Out out;
+```
 
 Compilation produces a single C++ binary linking:
 - ARCH design → C++ via the existing ARCH backend (Verilator-class)
