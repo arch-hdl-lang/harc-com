@@ -4,58 +4,44 @@
 // after `ld` (1 latency cycle for the load + 1 init cycle + 10
 // rounds; `done` rises at the final-round write-back).
 //
-// The DUT's natural ports are 128-bit (`key`, `text_in`,
-// `text_out`); HARC v0's testbench codegen only addresses scalar
-// ports (≤64-bit). To stay inside that envelope without compiler
-// changes, this fixture targets `AesCipherTopWrap` — a structural
-// wrapper that splits each 128-bit port into 4 x 32-bit MSB-first
-// words. AesCipherTop's encryption pipeline is unchanged.
+// Drives the DUT's 128-bit ports (`key`, `text_in`, `text_out`)
+// directly with whole-signal assignment + comparison. HARC's
+// runtime helpers (`harc_assign` / `harc_read` from
+// `harc_thread_rt.h`) flow values through `_harc_u128` (= GCC/
+// clang's `__uint128_t`), and >64-bit hex literals lower to a
+// composite `(_harc_u128)hi << 64 | lo` expression at codegen
+// time. Mirrors arch-com's `_arch_u128` model.
 //
 // Test vectors (matching the C++ TB):
 //
 //   Test 1: NIST FIPS-197 Appendix B
-//     key  = 000102030405060708090a0b0c0d0e0f
-//     pt   = 00112233445566778899aabbccddeeff
-//     ct   = 69c4e0d86a7b0430d8cdb78070b4c55a
+//     key = 0x000102030405060708090a0b0c0d0e0f
+//     pt  = 0x00112233445566778899aabbccddeeff
+//     ct  = 0x69c4e0d86a7b0430d8cdb78070b4c55a
 //
 //   Test 2: zero key, zero plaintext
-//     ct   = 66e94bd4ef8a2c3b884cfa59ca342b2e
+//     ct  = 0x66e94bd4ef8a2c3b884cfa59ca342b2e
 //
-// Helpers live on a passive transactor (`AesXactor`) so each test
-// reads as a sequence of intent-named calls. Like every other
-// fixture, the synchronous `tick()` lambda used inside transactor
-// methods latches the values driven on the same statement.
+// Helpers live on a passive transactor (`AesXactor`).
 
 transactor AesXactor
-    dut : AesCipherTopWrap
+    dut : AesCipherTop
 
     hookable reset_dut()
         dut.rst = 1
         dut.ld = 0
-        dut.key3 = 0
-        dut.key2 = 0
-        dut.key1 = 0
-        dut.key0 = 0
-        dut.text_in3 = 0
-        dut.text_in2 = 0
-        dut.text_in1 = 0
-        dut.text_in0 = 0
+        dut.key = 0
+        dut.text_in = 0
         wait 2 cycles
         dut.rst = 0
         wait 1 cycle
     end reset_dut
 
-    // Drive key/plaintext, pulse ld for one cycle.
-    hookable load_block(k3: uint<32>, k2: uint<32>, k1: uint<32>, k0: uint<32>,
-                       p3: uint<32>, p2: uint<32>, p1: uint<32>, p0: uint<32>)
-        dut.key3 = k3
-        dut.key2 = k2
-        dut.key1 = k1
-        dut.key0 = k0
-        dut.text_in3 = p3
-        dut.text_in2 = p2
-        dut.text_in1 = p1
-        dut.text_in0 = p0
+    // Drive key + plaintext as whole 128-bit values, pulse `ld`
+    // for one cycle.
+    hookable load_block(key: uint<128>, text_in: uint<128>)
+        dut.key = key
+        dut.text_in = text_in
         dut.ld = 1
         wait 1 cycle
         dut.ld = 0
@@ -74,7 +60,7 @@ transactor AesXactor
 end transactor AesXactor
 
 test AesCipherTopTest
-    let dut  : AesCipherTopWrap
+    let dut  : AesCipherTop
     let xact : AesXactor passive
 
     scope sim
@@ -85,39 +71,27 @@ test AesCipherTopTest
             // ── Test 1: NIST FIPS-197 Appendix B ──────────────────
             xact.reset_dut()
             xact.load_block(
-                0x00010203, 0x04050607, 0x08090a0b, 0x0c0d0e0f,
-                0x00112233, 0x44556677, 0x8899aabb, 0xccddeeff
+                0x000102030405060708090a0b0c0d0e0f,
+                0x00112233445566778899aabbccddeeff
             )
             xact.wait_for_done()
 
             assert dut.done == 1
                 else fail("Test 1: done never asserted within 14 cycles")
-            assert dut.text_out3 == 0x69c4e0d8
-                else fail("Test 1: text_out3=0x${dut.text_out3:08x} expected 0x69c4e0d8")
-            assert dut.text_out2 == 0x6a7b0430
-                else fail("Test 1: text_out2=0x${dut.text_out2:08x} expected 0x6a7b0430")
-            assert dut.text_out1 == 0xd8cdb780
-                else fail("Test 1: text_out1=0x${dut.text_out1:08x} expected 0xd8cdb780")
-            assert dut.text_out0 == 0x70b4c55a
-                else fail("Test 1: text_out0=0x${dut.text_out0:08x} expected 0x70b4c55a")
+            assert dut.text_out == 0x69c4e0d86a7b0430d8cdb78070b4c55a
+                else fail("Test 1: text_out mismatch (expected 0x69c4e0d8_6a7b0430_d8cdb780_70b4c55a)")
             log(info, "Test 1 PASS: ciphertext = 69c4e0d8_6a7b0430_d8cdb780_70b4c55a")
 
             // ── Test 2: zero key, zero plaintext ──────────────────
             xact.reset_dut()
-            xact.load_block(0, 0, 0, 0, 0, 0, 0, 0)
+            xact.load_block(0, 0)
             xact.wait_for_done()
 
             assert dut.done == 1
                 else fail("Test 2: done never asserted within 14 cycles")
-            // AES-128(key=0, pt=0) = 66e94bd4ef8a2c3b884cfa59ca342b2e
-            assert dut.text_out3 == 0x66e94bd4
-                else fail("Test 2: text_out3=0x${dut.text_out3:08x} expected 0x66e94bd4")
-            assert dut.text_out2 == 0xef8a2c3b
-                else fail("Test 2: text_out2=0x${dut.text_out2:08x} expected 0xef8a2c3b")
-            assert dut.text_out1 == 0x884cfa59
-                else fail("Test 2: text_out1=0x${dut.text_out1:08x} expected 0x884cfa59")
-            assert dut.text_out0 == 0xca342b2e
-                else fail("Test 2: text_out0=0x${dut.text_out0:08x} expected 0xca342b2e")
+            // AES-128(key=0, pt=0) = 0x66e94bd4ef8a2c3b884cfa59ca342b2e
+            assert dut.text_out == 0x66e94bd4ef8a2c3b884cfa59ca342b2e
+                else fail("Test 2: text_out mismatch (expected 0x66e94bd4_ef8a2c3b_884cfa59_ca342b2e)")
             log(info, "Test 2 PASS: ciphertext = 66e94bd4_ef8a2c3b_884cfa59_ca342b2e")
 
             log(info, "ALL 2 SUB-TESTS PASSED — AES-128 cipher")

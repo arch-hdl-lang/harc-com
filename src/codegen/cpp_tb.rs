@@ -4442,7 +4442,15 @@ impl Emitter {
                 }
             }
             ExprKind::Index { target, index } => {
-                self.emit_expr(target);
+                // Pass `lvalue=true` to suppress the `harc_rt::harc_read`
+                // wrap on a pointer-rooted Field target. Indexing a
+                // wide signal (VlWide<N>) needs the raw `dut->field`
+                // expression so VlWide's `operator[]` is reachable;
+                // wrapping with `harc_read` would yield a `uint64_t`
+                // which can't be indexed. Narrow signals shouldn't be
+                // indexed in the first place — that path errors at
+                // C++ compile, which is the desired outcome.
+                self.emit_expr_with_arrow(target, /*lvalue*/ true);
                 write!(self.out, "[").ok();
                 self.emit_expr(index);
                 write!(self.out, "]").ok();
@@ -4590,9 +4598,11 @@ fn scoreboard_field_c_type(t: &TypeExpr) -> String {
 /// types get the bare name (likely an enum which is `int64_t` in v0).
 fn txn_field_c_type(t: &TypeExpr) -> String {
     match t {
-        TypeExpr::Builtin { name, .. } => match name {
-            BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => "uint64_t".into(),
-            BuiltinTy::SInt | BuiltinTy::SIntCap => "int64_t".into(),
+        TypeExpr::Builtin { name, args, .. } => match name {
+            BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {
+                cpp_uint_for_width(int_width_from_args(args)).into()
+            }
+            BuiltinTy::SInt | BuiltinTy::SIntCap => cpp_sint_for_width(int_width_from_args(args)).into(),
             BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => "bool".into(),
             _ => "uint64_t".into(),
         },
@@ -4745,11 +4755,51 @@ fn tseq_inner_type(t: &TypeExpr) -> Option<String> {
     None
 }
 
+/// Pull the bit-width literal out of a builtin integer's args list
+/// (`uint<N>`, `bits<N>`, etc.). Returns `None` if the args don't have
+/// a recognizable integer literal — caller falls back to a default
+/// (typically 64).
+fn int_width_from_args(args: &[TypeArg]) -> Option<u32> {
+    args.first().and_then(|a| match a {
+        TypeArg::Expr(e) => match &*e.kind {
+            ExprKind::Int(s) => s.replace('_', "").parse().ok(),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+/// Pick the C++ value-type for a HARC unsigned integer of the given
+/// bit-width:
+///   1..64    → uint64_t       (every narrow case widens; native ops)
+///   65..128  → _harc_u128     (typedef of __uint128_t; mirrors arch-com)
+///   >128     → _harc_u128     (truncates to low 128; whole-signal access
+///                              beyond 128b is rare; per-word indexing
+///                              via `dut.field[i]` covers the gap)
+fn cpp_uint_for_width(w: Option<u32>) -> &'static str {
+    match w {
+        Some(n) if n > 64 => "_harc_u128",
+        _ => "uint64_t",
+    }
+}
+
+fn cpp_sint_for_width(w: Option<u32>) -> &'static str {
+    match w {
+        // No native __int128 signed in C++ portably — but unsigned
+        // ops bit-wise emulate signed for the common ops we care
+        // about. Cast at use sites if signedness matters above 64b.
+        Some(n) if n > 64 => "_harc_u128",
+        _ => "int64_t",
+    }
+}
+
 fn c_type_for(t: &TypeExpr) -> String {
     match t {
         TypeExpr::Builtin { name, args, .. } => match name {
-            BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => "uint64_t".into(),
-            BuiltinTy::SInt | BuiltinTy::SIntCap => "int64_t".into(),
+            BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {
+                cpp_uint_for_width(int_width_from_args(args)).into()
+            }
+            BuiltinTy::SInt | BuiltinTy::SIntCap => cpp_sint_for_width(int_width_from_args(args)).into(),
             BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => "bool".into(),
             BuiltinTy::String => "const char*".into(),
             BuiltinTy::Time => "uint64_t".into(),
@@ -4809,18 +4859,48 @@ fn c_binary_op(op: BinaryOp) -> &'static str {
 }
 
 fn c_int_literal(s: &str) -> String {
-    // ARCH-style sized literals (`8'hAB`) → C++ `0xAB`.
-    if let Some(idx) = s.find('\'') {
+    // ARCH-style sized literals (`8'hAB`) → C++ `0xAB`. Then the
+    // unsized-literal post-pass below catches any >64-bit cases.
+    let normalized = if let Some(idx) = s.find('\'') {
         let (_, tail) = s.split_at(idx + 1);
         let kind = tail.chars().next().unwrap_or('d');
         let digits: String = tail[1..].chars().filter(|c| *c != '_').collect();
-        return match kind {
+        match kind {
             'h' | 'H' => format!("0x{digits}"),
             'b' | 'B' => format!("0b{digits}"),
             _ => digits,
+        }
+    } else {
+        s.replace('_', "")
+    };
+
+    // Hex literals wider than 64 bits (>16 hex digits) overflow C++'s
+    // unsigned long long. Lower as a composite `_harc_u128` shifted-OR
+    // so the value flows through `harc_assign` / `harc_read` and 128-
+    // bit comparisons. Two halves are sufficient for the v0 cap of
+    // 128 bits; literals above that are clamped to the low 128 bits.
+    let (prefix, digits) = if let Some(d) = normalized.strip_prefix("0x") {
+        ("0x", d)
+    } else if let Some(d) = normalized.strip_prefix("0X") {
+        ("0x", d)
+    } else {
+        ("", normalized.as_str())
+    };
+    if !prefix.is_empty() && digits.len() > 16 {
+        // Split off the low 16 hex digits (low 64 bits); the rest are
+        // the high bits. Clamp to the high 16 hex digits (low 128 bits
+        // overall) since `_harc_u128` is 128b.
+        let hex_lo_start = digits.len() - 16;
+        let lo = &digits[hex_lo_start..];
+        let hi_full = &digits[..hex_lo_start];
+        let hi = if hi_full.len() > 16 {
+            &hi_full[hi_full.len() - 16..]
+        } else {
+            hi_full
         };
+        return format!("(((_harc_u128)0x{hi}ULL << 64) | (_harc_u128)0x{lo}ULL)");
     }
-    s.replace('_', "")
+    normalized
 }
 
 /// Parse a HARC-style interpolated string into a printf format string and

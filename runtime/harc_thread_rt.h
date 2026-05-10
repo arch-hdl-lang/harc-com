@@ -39,53 +39,68 @@
 #include <atomic>
 #include <thread>
 
+// 65–128-bit integer type for whole-signal arithmetic and >64-bit
+// hex literals. File-scope (not inside `harc_rt::`) so emitted code
+// can reference it bare. Mirrors arch-com's `_arch_u128` (see
+// arch-com/src/sim_codegen/mod.rs:767).
+typedef unsigned __int128 _harc_u128;
+
 namespace harc_rt {
 
-// ── Verilator wide-signal interop ───────────────────────────────────────────
+// ── Wide-vector interop ─────────────────────────────────────────────────────
 //
-// Verilator lowers SystemVerilog ports based on bit-width:
+// Verilator lowers SystemVerilog ports by bit-width:
 //   1..32 bits   → uint8_t / uint16_t / uint32_t
 //   33..64 bits  → uint64_t
-//   >64 bits     → VlWide<N>  (an array of N uint32_t words, N=ceil(W/32))
+//   >64 bits     → VlWide<N>  (array of N uint32_t words, N=ceil(W/32))
 //
-// HARC codegen emits direct C++ accesses for `dut.signal` and `dut.signal =
-// expr`. For the narrow cases that's a plain integer assignment / read; for
-// the wide case `VlWide<N>` has no implicit conversion to/from integer
-// types, so the same source pattern fails to compile. The helpers below
-// bridge that gap with a single template that resolves at compile time:
-// narrow signals get plain assignment, wide signals get per-word writes /
-// composed reads. v0 only handles values that fit in 64 bits — sufficient
-// for the test patterns in arch-com fixtures (handles up to AXI4 256-bit
-// data ports, where each beat is a 64-bit literal in the test). Wider
-// values would need the user to split into multiple calls.
+// HARC's testbench source language doesn't have separate "narrow"/"wide"
+// types — every integer expression flows through the same shape. To make
+// that uniform we use a single 128-bit value type for whole-signal
+// reads, and accept any integer value (cast up to 128 bits) on whole-
+// signal writes. 128 bits covers every arch-com DUT we vendor today
+// (AES blocks, AXI4 data lanes up to 128b). Wider signals (>128b)
+// fall back to per-word access via VlWide indexing — they round-trip
+// at the L-value level via Verilator's `operator[]`.
+//
+// Mirrors arch-com's `_arch_u128` design (see arch-com src/sim_codegen/
+// mod.rs:767 for the equivalent typedef and conversion helpers). The
+// `_harc_u128` typedef is at file scope above; the helpers below use
+// it for the value type so codegen can emit `_harc_u128` literals
+// without namespace qualification.
 
 template<typename Sig, typename Val>
 inline void harc_assign(Sig& sig, Val val) {
     if constexpr (std::is_arithmetic_v<Sig>) {
         sig = static_cast<Sig>(val);
     } else {
-        // VlWide<N>: write low 64 bits via the first two words, zero the
-        // rest. `sizeof(Sig) / sizeof(uint32_t)` resolves to N because
-        // VlWide is `final` with a single uint32_t[N] member — no vtable,
-        // no padding under any standard ABI we target.
+        // VlWide<N>: write low 128 bits via the first four words; zero
+        // anything beyond. `sizeof(Sig) / sizeof(uint32_t)` resolves to
+        // N because VlWide is `final` with a single uint32_t[N] member —
+        // no vtable, no padding under any standard ABI we target.
         constexpr std::size_t N = sizeof(Sig) / sizeof(uint32_t);
-        const uint64_t v = static_cast<uint64_t>(val);
+        const _harc_u128 v = static_cast<_harc_u128>(val);
         sig[0] = static_cast<uint32_t>(v);
         if constexpr (N >= 2) sig[1] = static_cast<uint32_t>(v >> 32);
-        for (std::size_t i = 2; i < N; ++i) sig[i] = 0;
+        if constexpr (N >= 3) sig[2] = static_cast<uint32_t>(v >> 64);
+        if constexpr (N >= 4) sig[3] = static_cast<uint32_t>(v >> 96);
+        for (std::size_t i = 4; i < N; ++i) sig[i] = 0;
     }
 }
 
 template<typename Sig>
-inline uint64_t harc_read(const Sig& sig) {
+inline _harc_u128 harc_read(const Sig& sig) {
     if constexpr (std::is_arithmetic_v<Sig>) {
-        return static_cast<uint64_t>(sig);
+        return static_cast<_harc_u128>(sig);
     } else {
-        // VlWide<N>: combine low two words into a uint64_t. Upper words
-        // (if N > 2) are dropped — see the harc_assign comment.
+        // VlWide<N>: combine the low four words into a 128-bit value.
+        // Upper words (if N > 4) are dropped — caller can use indexed
+        // access (`dut.field[i]`) for those.
         constexpr std::size_t N = sizeof(Sig) / sizeof(uint32_t);
-        uint64_t v = static_cast<uint32_t>(sig[0]);
-        if constexpr (N >= 2) v |= (static_cast<uint64_t>(static_cast<uint32_t>(sig[1])) << 32);
+        _harc_u128 v = static_cast<uint32_t>(sig[0]);
+        if constexpr (N >= 2) v |= (static_cast<_harc_u128>(static_cast<uint32_t>(sig[1])) << 32);
+        if constexpr (N >= 3) v |= (static_cast<_harc_u128>(static_cast<uint32_t>(sig[2])) << 64);
+        if constexpr (N >= 4) v |= (static_cast<_harc_u128>(static_cast<uint32_t>(sig[3])) << 96);
         return v;
     }
 }

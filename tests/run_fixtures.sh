@@ -70,7 +70,7 @@ noc_credit_test         | NocCreditTop   | noc_credit.sv          |
 inst_vec_port_regression_test | Top      | inst_vec_port_regression.sv |
 if_wait_for_in_then_test | M             | if_wait_for_in_then.sv |
 buf_mgr_sm_test         | BufMgrSm       | buf_mgr_sm.sv data_mem_sm.sv free_list_mem_sm.sv next_ptr_mem_sm.sv |
-aes_cipher_top_test     | AesCipherTopWrap | aes_cipher_top_wrap.sv aes_cipher_top.sv aes_key_expand_128.sv xtime.sv |
+aes_cipher_top_test     | AesCipherTop   | aes_cipher_top.sv aes_key_expand_128.sv xtime.sv |
 buf_mgr_test            | BufMgr         | buf_mgr.sv data_mem.sv next_ptr_mem.sv free_list_bank.sv setup_counter.sv |
 EOF
 
