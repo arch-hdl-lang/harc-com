@@ -106,7 +106,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Z3 + Verilator + clang
+      - name: Install Z3 + clang
         # clang is needed because the emitted test `.cpp` uses
         # `#pragma clang optimize off` to work around a C++20
         # lambda-coroutine miscompile at `-Os` (verilator default)
@@ -117,7 +117,40 @@ jobs:
         # for the full rationale.
         run: |
           sudo apt-get update
-          sudo apt-get install -y libz3-dev verilator clang
+          sudo apt-get install -y libz3-dev clang \
+                                  git make autoconf flex bison g++ help2man perl python3 \
+                                  numactl perl-doc libfl2 libfl-dev zlib1g zlib1g-dev
+
+      # Verilator: install from source. Ubuntu's apt package is
+      # 5.020 which rejects `<=` array assignment inside `for`
+      # loops (BLKLOOPINIT) — used in several arch-com DUTs we
+      # vendor (e.g. buf_mgr's reset for-loops over head/tail/count
+      # arrays, which legitimately need non-blocking assignment per
+      # always_ff convention). Verilator 5.034 fixes this; we pin
+      # to the v5.034 tag for reproducibility. Cached across runs
+      # so this only pays the build cost on cache miss.
+      - name: Cache Verilator
+        id: cache-verilator
+        uses: actions/cache@v4
+        with:
+          path: /opt/verilator
+          key: verilator-v5.034-ubuntu-${{ runner.os }}
+
+      - name: Build Verilator from source (cache miss)
+        if: steps.cache-verilator.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --branch v5.034 --depth 1 https://github.com/verilator/verilator.git /tmp/verilator-src
+          cd /tmp/verilator-src
+          autoconf
+          ./configure --prefix=/opt/verilator
+          make -j"$(nproc)"
+          sudo make install
+
+      - name: Add Verilator to PATH
+        run: |
+          echo "/opt/verilator/bin" >> "$GITHUB_PATH"
+          /opt/verilator/bin/verilator --version
 
       - name: Cache cargo
         uses: actions/cache@v4
