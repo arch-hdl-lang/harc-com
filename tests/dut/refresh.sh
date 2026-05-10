@@ -65,5 +65,10 @@ copy tests/buf_mgr_sm/next_ptr_mem_sm.sv    next_ptr_mem_sm.sv
 copy tests/aes/aes_cipher_top.sv       aes_cipher_top.sv
 copy tests/aes/aes_key_expand_128.sv   aes_key_expand_128.sv
 copy tests/aes/xtime.sv                xtime.sv
+copy tests/buf_mgr/buf_mgr.sv          buf_mgr.sv
+copy tests/buf_mgr/data_mem.sv         data_mem.sv
+copy tests/buf_mgr/next_ptr_mem.sv     next_ptr_mem.sv
+copy tests/buf_mgr/free_list_bank.sv   free_list_bank.sv
+copy tests/buf_mgr/setup_counter.sv    setup_counter.sv
 
 echo "Done."
