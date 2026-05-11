@@ -1,0 +1,14 @@
+{
+  "id": "cvdp_copilot_word_reducer_0012",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "Bit_Difference_Counter_top",
+  "dut_module": "Bit_Difference_Counter",
+  "target_coverage": 100,
+  "auto_wrapper": "Bit_Difference_Counter_top.sv",
+  "n_ports": 3,
+  "clock_inputs": [],
+  "multi_clock": false
+}

@@ -1,0 +1,92 @@
+Write a SystemVerilog testbench to only generate stimulus for a `csr_apb_interface` module, which is responsible for data transactions over the Advanced Peripheral Bus (APB) interface.
+
+## Interface: **csr_using_apb**
+
+**Clock & Reset**:
+`pclk`: APB clock input for synchronous operations.
+`presetn`: Active-low asynchronous reset signal, used to initialize the system.
+
+**Inputs & Outputs Ports**:
+**APB Signals:**
+`paddr` (input, 32 bits): Address bus to access the internal CSR registers.
+`pselx` (input): APB select signal, indicates CSR selection.
+`penable` (input): APB enable signal, signals transaction progression.
+`pwrite` (input): Write enable signal, differentiating read and write operations.
+`pwdata` (input, 32 bits): Write data bus to send data to CSR registers.
+`pready` (output, reg): Ready signal indicating transaction completion.
+`prdata` (output, reg, 32 bits): Read data bus for CSR data retrieval.
+`pslverr` (output, reg): Error signal for invalid addresses or unsupported operations.
+
+**Internal Registers**:
+
+`DATA_REG (0x10)`: Stores two 10-bit values, data1 and data2, and a 12-bit reserved section.
+`CONTROL_REG (0x14)`: Contains a control enable bit, mode bit, and 30 reserved bits.
+`INTERRUPT_REG (0x18)`: Holds interrupt enable flags for various conditions and 28 reserved bits.
+
+## Specifications
+
+**Read Operations**:
+
+- During the READ_STATE, assert pready and load prdata with the register value based on paddr.
+
+- Return to IDLE after asserting pready for one cycle.
+
+**Write Operations**:
+
+- During the WRITE_STATE, assert pready and update the register selected by paddr with pwdata.
+
+- For DATA_REG, split pwdata into fields for data1, data2, and the reserved section.
+
+- For CONTROL_REG and INTERRUPT_REG, update only specified bits.
+
+- Return to IDLE after asserting pready for one cycle.
+
+**Reset Behavior**:
+
+- On presetn deassertion, reset all outputs and internal registers to their default values:
+
+- Set pready and pslverr to 0.
+
+- Clear prdata.
+
+- Initialize data1, data2, overflow_ie, sign_ie, parity_ie, and zero_ie to 0.
+
+---
+
+## **Testbench Requirements**
+### **Instantiation**
+- **Module Instance:** The **csr_apb_interface** module is instantiated as `uut`, with all input and output signals connected.
+
+---
+
+### **Input Generation**
+#### **1. Writing to `DATA_REG`**
+- The testbench writes a **random 32-bit value** to `DATA_REG`.
+
+#### **2. Reading from `DATA_REG`**
+- A read operation is performed from `DATA_REG`.
+
+#### **3. Writing and Reading from `CONTROL_REG`**
+- A **random 32-bit value** is written to `CONTROL_REG`.
+- The value is read back.
+
+#### **4. Writing and Reading from `INTERRUPT_REG`**
+- A **random 32-bit value** is written to `INTERRUPT_REG`.
+- The value is read back.
+
+#### **5. Invalid Address Access**
+- A write is attempted to an **unknown address (`0x20`)**.
+
+#### **6. Read Transaction Without `pselx` Asserted**
+- A read is attempted from `DATA_REG` **without asserting `pselx`**.
+
+#### **7. Write Transaction Without `penable` Asserted**
+- A write is performed to `CONTROL_REG` **without `penable` assertion**.
+
+#### **8. Corner Cases for Write Data**
+- **All 1s (`0xFFFFFFFF`)** and **all 0s (`0x00000000`)** are written to `DATA_REG`.
+
+#### **9. Reset Behavior**
+- The reset signal (`presetn = 0`) is applied in the middle of operations.
+
+---

@@ -1,0 +1,102 @@
+Create a SystemVerilog testbench module named **`tb_token_ring_fsm`** that instantiates the `token_ring_fsm` module as the Unit Under Test (UUT). The testbench must include a **stimulus generator** that systematically drives various input conditions to achieve **100% code and functional coverage** for the `token_ring_fsm`. The `token_ring_fsm` implements a **Finite State Machine (FSM)-based token-passing mechanism** in a four-node ring network, ensuring controlled data transmission between nodes. The stimulus should cover **all state transitions, token passing, data transmission scenarios, and asynchronous reset conditions** while logging outputs for debugging and verification.  
+
+---
+
+## **Description**  
+
+### **Inputs**  
+
+- **Clock Signal**:  
+  - `clk`: Positive edge-triggered clock signal driving the FSM.  
+
+- **Reset Signal**:  
+  - `rst`: Asynchronous active-high reset signal that initializes the FSM.  
+
+- **Data and Control Inputs**:  
+  - `data_in [3:0]`: A 4-bit input representing binary data for transmission by the current node.  
+  - `has_data_to_send`: A 1-bit signal indicating whether the current node has data to send.  
+
+### **Outputs**  
+
+- **Data and Token Outputs**:  
+  - `data_out [3:0]`: A 4-bit output representing the data transmitted by the current node.  
+  - `token_received [3:0]`: A 4-bit one-hot encoded signal indicating which node currently holds the token.  
+  - `token [3:0]`: A 4-bit one-hot encoded signal representing the token being passed to the next node.  
+
+---
+
+## **Input Generation**  
+
+### **State Transitions and Token Passing**  
+
+- Drive the FSM through all four states:  
+  - `NODE0 to NODE1 to NODE2 to NODE3 to NODE0` in a cyclic manner.  
+  - Ensure that `token_received` correctly identifies the node holding the token.  
+
+- Simulate token passing by shifting the `token` signal across nodes and verifying correct cycling.  
+
+### **Data Transmission Stimulus**  
+
+- Generate various patterns for `data_in` and toggle `has_data_to_send` to simulate:  
+  - Nodes transmitting data when they hold the token.  
+  - Nodes idling when `has_data_to_send` is LOW.  
+  - Different data values being sent across nodes.  
+
+### **Edge Case Testing**  
+
+- **Reset Behavior**:  
+  - Apply `rst` at different states to ensure FSM returns to `NODE0`.  
+  - Verify that `token_received` is set to `4'b0001` and `data_out`, `token` are cleared.  
+
+- **Token Handling**:  
+  - Simulate idle conditions where no node is ready to send data.  
+  - Inject forced token values using `force` and `release` commands to verify FSM recovery.  
+
+- **Overlapping Data Transmission**:  
+  - Test scenarios where multiple nodes attempt to send data consecutively.  
+  - Ensure only the node holding the token transmits data.  
+  
+---
+
+## **Instantiation**  
+
+- The instance of the RTL should be named **`uut`**.  
+
+---
+
+## **Module Interface**  
+
+### **Inputs**  
+
+- `clk`: Clock signal.  
+- `rst`: Asynchronous active-high reset signal.  
+- `data_in [3:0]`: Data input for transmission.  
+- `has_data_to_send`: Indicates whether the node has data to send.  
+
+### **Outputs**  
+
+- `data_out [3:0]`: Transmitted data output.  
+- `token_received [3:0]`: Indicates the node currently holding the token.  
+- `token [3:0]`: Indicates the token being passed to the next node.  
+
+---
+
+## **Module Functionality**  
+
+1. **Token Passing Mechanism**:  
+   - The FSM cycles through the four nodes, passing the token sequentially.  
+   - The node with the token is allowed to transmit data if `has_data_to_send` is HIGH.  
+
+2. **Data Transmission**:  
+   - When a node holds the token and `has_data_to_send` is HIGH, `data_out` reflects `data_in`.  
+   - If no node is ready to send, `data_out` remains `4'b0000`.  
+
+3. **Reset Behavior**:  
+   - When `rst` is asserted HIGH, the FSM resets to `NODE0`, `token_received` is set to `4'b0001`, and other outputs are cleared.  
+
+4. **Edge Cases**:  
+   - Idle conditions where no node transmits data.  
+   - Forced invalid states and token values to test FSM recovery.  
+   - Multiple data transmissions in consecutive cycles.  
+
+---

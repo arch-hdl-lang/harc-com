@@ -1,0 +1,14 @@
+{
+  "id": "cvdp_copilot_gf_multiplier_0047",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "gf_mac_top",
+  "dut_module": "gf_mac",
+  "target_coverage": 95,
+  "auto_wrapper": "gf_mac_top.sv",
+  "n_ports": 9,
+  "clock_inputs": [],
+  "multi_clock": false
+}

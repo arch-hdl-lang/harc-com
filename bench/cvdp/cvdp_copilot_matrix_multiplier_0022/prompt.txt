@@ -1,0 +1,101 @@
+Write a testbench for the `matrix_multiplier` module, which performs matrix multiplication for configurable dimensions. The testbench should focus only on generating stimuli to exercise all key features of the module.
+
+---
+
+## Design Details
+
+### **Parameterization**
+1. **ROW_A**: Number of rows in Matrix A. (Default=4)
+2. **COL_A**: Number of columns in Matrix A. (Default=4)
+3. **ROW_B**: Number of rows in Matrix B. (Default=4)
+4. **COL_B**: Number of columns in Matrix B. (Default=4)
+5. **INPUT_DATA_WIDTH**: Bit-width of the input matrix elements. (Default=8)
+6. **OUTPUT_DATA_WIDTH**: Bit-width of the output matrix elements, calculated as `(INPUT_DATA_WIDTH * 2) + $clog2(COL_A)`.
+
+### **Inputs and Outputs**
+- **Inputs**:
+  - `clk`: Clock signal (positive edge-triggered).
+  - `srst`: Active-high synchronous reset signal.
+  - `valid_in`: Active high signal, indicates that `matrix_a` and `matrix_b` contain valid inputs.
+  - `[(ROW_A*COL_A*INPUT_DATA_WIDTH)-1:0] matrix_a`: Flattened 1D representation of input Matrix A.
+  - `[(ROW_B*COL_B*INPUT_DATA_WIDTH)-1:0] matrix_b`: Flattened 1D representation of input Matrix B.
+- **Outputs**:
+  - `valid_out`: Active high signal, indicates that the output matrix `matrix_c` is valid.
+  - `[(ROW_A*COL_B*OUTPUT_DATA_WIDTH)-1:0] matrix_c`: Flattened 1D representation of the result Matrix C.
+
+### Example of Matrix Flattening:
+
+Suppose you have two input matrices A and B to multiply:
+
+- **Matrix A (2x3)**:
+
+```text
+| a11  a12  a13 |
+| a21  a22  a23 |
+```
+
+- **Matrix B (3x2)**:
+
+```text
+| b11  b12 |
+| b21  b22 |
+| b31  b32 |
+```
+
+The resulting output matrix from the multiplication of the above matrices would be:
+
+- **Matrix C (2x2)**:
+
+```text
+| c11  c12 |
+| c21  c22 |
+```
+
+The flattened representation of these matrices will be as follows:
+
+- **Flattened Matrix A (2x3)**:
+
+```text
+matrix_a = {a23, a22, a21, a13, a12, a11}
+```
+
+- **Flattened Matrix B (3x2)**:
+
+```text
+matrix_b = {b32, b31, b22, b21, b12, b11}
+```
+
+- **Flattened Matrix C (2x2)**:
+
+```text
+matrix_c = {c22, c21, c12, c11}
+```
+
+- **Note** : The design enables the processing of a new input set (matrix_a, matrix_b, and valid_in) in every clock cycle while maintaining a latency of $clog2(COL_A) + 2 clock cycles from valid_in to valid_out.
+---
+
+### Testbench Requirements
+
+#### Instantiation
+
+- Instantiate the `matrix_multiplier` module as `matrix_multiplier_inst`, connecting all input and output signals.
+- Support configurable matrix sizes using defines:
+  - **`MATRIX_MULT_2x2`**: Sets `ROW_A = 2`, `COL_A = 2`, `ROW_B = 2`, `COL_B = 2`.
+  - **`MATRIX_MULT_3x3`**: Sets `ROW_A = 3`, `COL_A = 3`, `ROW_B = 3`, `COL_B = 3`.
+  - **`NON_SQUARE_MATRIX_MULT`**: Sets `ROW_A = 2`, `COL_A = 3`, `ROW_B = 3`, `COL_B = 2`.
+  - **`MATRIX_MULT_1x1`**: Sets `ROW_A = 1`, `COL_A = 1`, `ROW_B = 1`, `COL_B = 1`.
+  - **Default Configuration**: If no define is enabled, use `ROW_A = 4`, `COL_A = 4`, `ROW_B = 4`, `COL_B = 4`.
+
+---
+
+### **Stimulus Generation**
+1. **Randomized Inputs**:
+   - Generate random values for `matrix_a` and `matrix_b` based on their respective dimensions (`ROW_A x COL_A` for Matrix A and `ROW_B x COL_B` for Matrix B).
+   - Randomly toggle the `valid_in` signal to mimic varying input availability.
+
+2. **Control Signals**:
+   - Assert `srst` at the start of the simulation to reset the pipeline and output.
+   - Randomly toggle `valid_in` during operation to simulate intermittent valid input availability.
+
+3. **Continuous Stimulus**:
+   - Continuously provide randomized `matrix_a` and `matrix_b` inputs for the duration of the simulation to ensure complete coverage of the RTL.

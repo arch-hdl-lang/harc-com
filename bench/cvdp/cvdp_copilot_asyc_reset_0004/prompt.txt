@@ -1,0 +1,82 @@
+Create a **testbench** to apply **stimulus** to the `async_reset` module. This module implements an asynchronous reset mechanism along with a countdown counter. The counter initializes to `5'h1F` upon reset and decrements on each clock cycle until reaching zero. The module also provides gated clock and reset release signals based on specific counter thresholds.
+
+---
+
+### **Inputs:**
+
+- `clk`: **Clock input** for driving the module’s sequential logic.
+- `reset`: **Active-high, asynchronous reset signal**. When asserted, the counter resets to `5'h1F`.
+
+### **Outputs:**
+
+- `cnt_q [4:0]`: **5-bit counter output**, representing the current counter value.
+- `gate_clk_o`: **Gated clock output**, enabled when the counter is greater than zero and less than `5'hE`.
+- `release_reset_o`: **Reset release output**, active when the counter is less than `5'h8`.
+
+---
+
+### **Instantiation**
+
+The testbench must instantiate a single instance of the `async_reset` module:
+
+- **Asynchronous Reset Module (`dut`)**: Instantiated with its default configuration to verify correct counter behavior and reset handling.
+
+---
+
+### **Testbench Requirements**
+
+The testbench must apply a **wide range of test patterns** to verify the module’s response to various reset and counter conditions:
+
+1. **Clock Generation:**
+   - `clk` must toggle every **5 time units**, ensuring a **10 ns clock period**.
+
+2. **Reset Handling:**
+   - `reset` must be **asserted for multiple clock cycles** before being de-asserted.
+   - The module must correctly initialize `cnt_q` to `5'h1F` when `reset` is de-asserted.
+
+3. **Stimulus Generation Strategy:**
+   - The testbench **must not verify outputs** (only generate inputs).
+   - The following test sequences must be executed:
+     - **Counter decrement sequence**: Verify decrement from `5'h1F` to `0`.
+     - **Mid-count reset**: Apply reset when `cnt_q = 5'hF` and ensure re-initialization.
+     - **Gate clock boundary**: Ensure `gate_clk_o` transitions correctly when `cnt_q` moves from `5'hE` to `5'hD`.
+     - **Release reset boundary**: Validate `release_reset_o` activation when `cnt_q` moves below `5'h8`.
+     - **Counter stability at zero**: Ensure `cnt_q` holds at `0` after reaching the minimum value.
+     - **Reset during critical transitions**: Apply reset at `cnt_q = 5'hE` and `cnt_q = 5'h8`.
+
+4. **Handling Continuous and Edge Cases:**
+   - The testbench must ensure a **full countdown cycle** occurs correctly.
+   - **Edge case transitions** must be included to verify correct signal toggling.
+
+5. **Waveform Generation:**
+   - The testbench must generate a `.vcd` waveform file to allow waveform analysis.
+
+---
+
+### **Coverage and Compliance**
+
+- The testbench must ensure **high coverage** across all counter states and transitions.
+- The **DUT instance name `dut` must be explicitly used** for instantiation.
+
+---
+
+### **Test Plan Overview**
+
+The testbench must ensure **comprehensive RTL coverage** by applying:
+
+- **Full counter sequence testing** (from `5'h1F` to `0`).
+- **Timing-based reset checks** (handling valid reset during key transitions).
+- **Mid-count resets** to ensure proper re-initialization.
+- **Boundary conditions** for `gate_clk_o` and `release_reset_o`.
+- **Reset handling** to verify asynchronous behavior and re-initialization integrity.
+
+This testbench will provide a **comprehensive input stimulus environment** for `async_reset`, ensuring correct operation under various test conditions.
+
+---
+
+### **Note:**
+- The testbench **must only generate stimulus** without verifying outputs.
+- The **DUT instance name `dut` must be explicitly used** for instantiation.
+- **Ensure the maximum possible input coverage** without adding assertions or comparisons.
+
+Can you implement a **SystemVerilog testbench** with the above stimulus requirements?

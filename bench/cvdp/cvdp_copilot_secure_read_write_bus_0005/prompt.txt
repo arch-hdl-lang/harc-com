@@ -1,0 +1,151 @@
+Create a test bench in SystemVerilog for a Verilog module named `secure_read_write_bus_interface`. It support both read and write operations, with authorization based on a comparison between the input key and an internal parameterized key. The test bench should systematically generate input vectors, apply them to the module under test (MUT) and aim to achieve 100% or the maximum possible coverage.
+
+---
+## Instantiation
+
+Name the instance of the RTL as **dut**.
+
+## **RTL Parameters, Inputs - Outputs and Functional behavior**
+
+### Functional Requirements
+1. **Read and Write Operations**:
+   - The bus performs read or write actions based on an enable signal.
+   - Access is authorized only if the provided key matches an internal key, with errors flagged otherwise.
+
+### Inputs
+- `i_addr` (`p_addr_width bit`): Specifies the target address for read or write operations.
+- `i_data_in` (`p_data_width` bit): Data to be written during a write operation.
+- `i_key_in` (`8-bit`): Key provided by the initiator for operation authorization.
+- `i_read_write_enable` (`1-bit`): Specifies the requested operation; `1` for read, `0` for write.
+- `i_capture_pulse` (`1-bit`): Qualifies input capture for `i_addr`, `i_data_in`, `i_key_in`, and `i_read_write_enable`.
+- `i_reset_bar` (`1-bit`): Asynchronous, active-low reset to initialize internal states and registers.
+
+### Outputs
+- `o_data_out` (`p_data_width` bit): Data output during a read operation, valid only if the input key matches the internal key.
+- `o_error` (`1-bit`): Asserted if the input key is incorrect and dessert if input key is correct.
+
+### Behavioral Requirements
+
+#### Write Operation
+- If `i_read_write_enable` is **0**, the bus interprets the operation as a write request.
+- At the rising edge of `i_capture_pulse`:
+  - If `i_key_in` matches the internal 8-bit configurable key, `i_data_in` is written to the address specified by `i_addr`.
+  - If `i_key_in` does not match the internal key:
+    - `o_error` is set to **1**.
+    - `o_data_out` is set to **0** (default).
+
+#### Read Operation
+- If `i_read_write_enable` is **1**, the bus interprets the operation as a read request.
+- At the rising edge of `i_capture_pulse`:
+  - If `i_key_in` matches the internal key, data from address `i_addr` is output on `o_data_out`, and `o_error` is **0**.
+  - If `i_key_in` does not match:
+    - `o_error` is set to **1**.
+    - `o_data_out` remains **0**.
+
+### Parameterization Requirements
+- `p_configurable_key`: Internal 8-bit key, default value `8'hAA`.
+- `p_data_width`: Configurable data width, default is **8 bits**.
+- `p_addr_width`: Configurable address width, default is **8 bits**.
+
+### Additional Requirements
+1. **Edge Case Handling**:
+   - `i_reset_bar` reset signal should clear all internal registers and outputs when asserted low.
+   - Ensure that outputs default to `0` upon reset or when unauthorized access occurs.
+2. **Clocking and Timing**:
+   - Operations are gated by the positive edge of `i_capture_pulse` for both read and write actions.
+   - Timing for signal latching and error assertions should align with rising edges of `i_capture_pulse`.
+
+### Assumptions
+  - Assume all the inputs are synchronous to the `i_capture_pulse`
+
+## Test Bench Requirements
+
+### Stimulus Generation
+
+## **1. Reset Behavior**
+- The system should be tested under reset conditions.  
+- Reset is released.
+
+---
+
+## **2. Write Operations**
+### **2.1 Writing Data Under Normal Conditions**
+- A write operation should be performed when the interface is enabled for writing.  
+
+### **2.2 Unauthorized Write Attempt**
+- An attempt should be made to write data while using an incorrect authentication key.  
+
+### **2.3 Writing at the Lower Address Boundary**
+- A write operation should be performed at the smallest possible address in the addressable range.  
+
+### **2.4 Writing at the Upper Address Boundary**
+- A write operation should be performed at the largest possible address in the addressable range.
+
+### **2.5 Randomized Write Operations**
+- Multiple write operations should be performed at various random addresses with different data values.  
+
+---
+
+## **3. Read Operations**
+### **3.1 Reading Data Under Normal Conditions**
+- A read operation is requested, and the correct authentication key is provided.
+
+### **3.2 Unauthorized Read Attempt**
+- A read request should be made using an incorrect authentication key.
+
+### **3.3 Reading from an Uninitialized Memory Location**
+- An attempt should be made to read from an address where no data has been written, ensuring predictable behavior.
+
+### **3.4 Reading at the Lower Address Boundary**
+- A read operation should be performed at the smallest possible address.
+
+### **3.5 Reading at the Upper Address Boundary**
+- A read operation should be performed at the largest possible address in the addressable range to ensure boundary handling.
+
+---
+
+## **4. Error Handling & Corner Cases**
+### **4.1 Switching Between Correct and Incorrect Authentication Keys**
+- The system should be tested by performing multiple read and write operations while alternating between valid and invalid authentication keys.
+
+### **4.2 Writing Without Initiating the Operation**
+- An attempt should be made to write data without properly triggering the operation.
+
+### **4.3 Reading Without Initiating the Operation**
+- A read request should be simulated without properly triggering the operation.
+
+### **4.4 Unauthorized Read Followed by an Authorized Write**
+- An unauthorized read should be performed first, followed by an attempt to write data using the correct authentication key.
+
+### **4.5 Unauthorized Write Followed by an Authorized Read**
+- An unauthorized write should be attempted first, followed by an authorized read to ensure no incorrect data modifications occur.
+
+### **4.6 Rapid Switching Between Read and Write**
+- The interface should be tested with rapid consecutive read and write operations to check for any inconsistencies or race conditions.
+
+---
+
+## **5. Reset and System Initialization**
+### **5.1 System Behavior During Reset**
+- The system should be reset in the middle of operations.
+
+### **5.2 Operations After Reset**
+- Once reset is deactivated, read and write operations resumes.
+
+---
+
+## **6. Stress Testing**
+### **6.1 Consecutive Writes**
+- A series of consecutive write operations should be performed to different addresses.
+
+### **6.2 Consecutive Reads**
+- Multiple read operations should be executed in succession.
+
+### **6.3 Immediate Read After Write**
+- Data should be written to a location, and an immediate read request should be performed at the same address.
+
+### **6.4 Frequent Changes in Authentication Key**
+- Successive read and write operations should be tested while frequently changing the authentication key.
+
+### **6.5 Combining Edge Cases**
+- A complex test scenario should be created by combining multiple conditions, such as alternating between valid and invalid keys, performing reads and writes at boundary addresses, and introducing reset signals.

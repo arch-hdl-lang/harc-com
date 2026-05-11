@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_hebbian_rule_0020",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "hebb_gates",
+  "dut_module": "hebb_gates",
+  "target_coverage": 95,
+  "auto_wrapper": null,
+  "n_ports": 12,
+  "clock_inputs": [
+    "clk"
+  ],
+  "multi_clock": false
+}

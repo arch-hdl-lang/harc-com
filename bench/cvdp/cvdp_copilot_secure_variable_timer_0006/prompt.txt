@@ -1,0 +1,110 @@
+Create a self-checking test bench in SystemVerilog for a Verilog module named `secure_variable_timer`. The test bench should systematically generate input vectors, apply them to the module under test (MUT) and aim to achieve 100% or the maximum possible coverage.
+
+---
+## Instantiation
+
+Name the instance of the RTL as **dut**.
+
+## **RTL Parameters, Inputs - Outputs and Functional behavior**
+
+| **Port Name**      | **Direction** | **Width** | **Description**                                                              |
+|--------------------|---------------|-----------|------------------------------------------------------------------------------|
+| `i_clk`            | Input         | 1         | Clock signal, rising-edge triggered.                                         |
+| `i_rst_n`          | Input         | 1         | Active-low synchronous reset signal.                                         |
+| `i_data_in`        | Input         | 1         | Serial data input for detecting the start pattern and configuring the delay. |
+| `o_time_left`      | Output        | 4         | 4-bit output showing remaining time during the counting phase.               |
+| `o_processing`     | Output        | 1         | Asserted high when the timer is actively counting.                           |
+| `o_completed`      | Output        | 1         | Asserted high when the timer completes its delay cycle.                      |
+| `i_ack`            | Input         | 1         | Acknowledgment signal from the user to reset the timer after completion.     |
+
+---
+
+### Functional Requirements
+
+The module operates as a timer with the following behavior:
+
+1. **Start Sequence Detection**:
+   - The timer begins when the serial data input (`i_data_in`) detects the bit sequence `1101` in the incoming stream.
+
+2. **Delay Duration Configuration**:
+   - After detecting the `1101` sequence, the module reads the next 4 bits (most significant bit first) from the `i_data_in` input.
+   - These 4 bits define the delay value (`delay[3:0]`), which determines the timer duration.
+
+3. **Counting Phase**:
+   - The timer counts for exactly ((delay[3:0] + 1) * 1000) clock cycles:
+     - Example: If `delay = 0`, the timer counts for 1000 cycles; if `delay = 5`, the timer counts for 6000 cycles.
+   - During this phase:
+     - The `o_processing` output is asserted high.
+     - The `o_time_left` output decrements as follows:
+       - Starts at `delay` for the first 1000 cycles.
+       - Decrements by 1 every subsequent 1000 cycles until reaching 0.
+
+4. **Completion and Reset**:
+   - Once the counting phase completes:
+     - The `o_completed` signal is asserted high to notify the user.
+     - The module waits for the `i_ack` signal to reset itself and begin searching for the next `1101` sequence.
+
+5. **Idle State**:
+   - When not actively counting:
+     - The `o_time_left` output is a don't-care value.
+     - The module resumes searching the `i_data_in` input for the `1101` sequence.
+
+---
+
+### Design Constraints
+
+- **Clock and Reset**:
+  - On reset, the module enters the idle state, ready to search for the `1101` sequence.
+
+- **Input Handling**:
+  - The `i_data_in` input is ignored during the counting phase.
+  - Only transitions to the configuration phase when the `1101` sequence is detected.
+
+- **Output Behavior**:
+  - The `o_time_left` output is only valid during the counting phase and must correctly represent the remaining time as described.
+
+---
+
+### Implementation Notes
+
+1. **State Machine Design**:
+   - Implement a finite state machine (FSM) to manage the following states:
+     - **Idle**: Search for the `1101` pattern in the `i_data_in` input.
+     - **Configure Delay**: Shift in the next 4 bits to set the delay value (`delay[3:0]`).
+     - **Counting**: Count for \((\text{delay[3:0]} + 1) \times 1000\) clock cycles.
+     - **Done**: Assert the `o_completed` output and wait for `i_ack` before resetting.
+     
+2. **Counting Logic**:
+   - Use a counter to count the total clock cycles required for the delay.
+   - Maintain a decrementing `o_time_left` output to reflect the remaining time.
+
+---
+## Stimulus generation
+1. **Reset & Idle**
+   - Assert `i_rst_n=0`, then drive high.
+
+2. **No Start Sequence**
+   - Feed random bits avoiding `1101`.
+
+3. **Start Sequence Detection**
+   - Provide `1101` immediately, then incomplete 4-bit delay.
+
+4. **Various Delay Values**
+   - After `1101`, supply 4-bit delays from `0000` to `1111`.
+
+5. **Completion & Acknowledgment**
+   - Feed `1101 + valid_delay`; wait for `o_completed=1`.
+   - Assert `i_ack`; 
+
+6. **Overlapping Start Sequence**
+   - Input bit patterns like `11101` or `1101101`.
+
+7. **Spurious Input During Count**
+   - Once counting, feed random `i_data_in`.
+
+8. **Reset Mid-Count**
+   - While counting, assert `i_rst_n=0`.
+   - 
+
+9. **Consecutive Timers**
+   - Drive multiple `1101 + 4-bit` sequences back-to-back.

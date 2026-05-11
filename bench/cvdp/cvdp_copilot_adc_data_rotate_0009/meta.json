@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_adc_data_rotate_0009",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "adc_data_rotate_top",
+  "dut_module": "adc_data_rotate",
+  "target_coverage": 92,
+  "auto_wrapper": "adc_data_rotate_top.sv",
+  "n_ports": 7,
+  "clock_inputs": [
+    "i_clk"
+  ],
+  "multi_clock": false
+}

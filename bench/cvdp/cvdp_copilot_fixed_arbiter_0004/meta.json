@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_fixed_arbiter_0004",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "fixed_priority_arbiter",
+  "dut_module": "fixed_priority_arbiter",
+  "target_coverage": 95,
+  "auto_wrapper": null,
+  "n_ports": 4,
+  "clock_inputs": [
+    "clk"
+  ],
+  "multi_clock": false
+}

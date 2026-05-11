@@ -1,0 +1,53 @@
+Write a testbench to generate stimulus only for the `restoring_division` module, which performs restoring division on two unsigned positive integer inputs. The module generates the output `quotient`, `remainder`, and `valid` once the computation is completed for the given `dividend` and `divisor` when the `start` signal is asserted.
+
+## **Design Details**
+
+### **Parameterization**
+- **WIDTH**: Specifies the bit-width of the dividend and divisor.
+  - **Default**: 6 bits
+
+### **Functionality**
+The **restoring_division** module implements division using a shift-subtract approach:
+- The division process must finish within WIDTH clock cycles if WIDTH is a power of 2 (2^n) to ensure all data is processed; otherwise (if WIDTH is not a power of 2), it will take WIDTH+1 clock cycles.
+- The FSM governs the state transitions and ensures proper computation.
+- The division process begins when `start` is asserted and completes when `valid` is high.
+
+## **Signal Behavior**
+
+### Inputs:
+- **`clk`**: 1-bit clock signal, toggles every 5 time units.
+- **`rst`**: Active-low reset signal to initialize the module.
+- **`start`**: Start signal to begin the division process.
+- **`dividend`**: `WIDTH`-bit input representing the dividend.
+- **`divisor`**: `WIDTH`-bit input representing the divisor.
+
+### Outputs:
+- **`quotient`**: `WIDTH`-bit result of the division operation.
+- **`remainder`**: `WIDTH`-bit remainder of the division operation.
+- **`valid`**: 1-bit signal indicating completion of division.
+
+---  
+
+## **Testbench Requirements**
+
+### **Instantiation**
+- **Module Instance**: The **restoring_division** module should be instantiated as `uut`, with all inputs and outputs properly connected.
+
+### **Input Generation and Validation**
+1. **Clock Generation**:  
+   - The testbench must generate a clock signal with a 10 ns period.
+   - The clock should toggle every **5 time units**.
+
+2. **Reset Behavior**:  
+   - The reset signal should be asserted low initially.
+   - After 10 ns, reset should be de-asserted (set high) to allow normal operation.
+
+3. **Division Test Cases**:  
+   - A **task** named `run_test` should be used to apply test cases dynamically.
+   - The testbench should generate **random** values for `dividend` and `divisor`.
+   - The **divisor should never be zero** (handled by ensuring divisor ≥ 1).
+   - The division process should be started by asserting `start` high for one cycle.
+   - The testbench must **wait for `valid`** to be asserted before capturing the results.
+   - The computed **quotient and remainder** should be displayed for debugging.
+
+---

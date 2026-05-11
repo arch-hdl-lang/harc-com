@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_thermostat_0003",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "thermostat_top",
+  "dut_module": "thermostat",
+  "target_coverage": 100,
+  "auto_wrapper": "thermostat_top.sv",
+  "n_ports": 15,
+  "clock_inputs": [
+    "i_clk"
+  ],
+  "multi_clock": false
+}

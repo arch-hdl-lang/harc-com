@@ -1,0 +1,235 @@
+Create a test bench in SystemVerilog for a Verilog module named `APBGlobalHistoryRegister`. The register updates synchronously on every gated rising edge of the `history_shift_valid` clock, shifting in predicted outcomes or restoring history on mispredictions. The test bench should systematically generate input vectors, apply them to the module under test (MUT) and aim to achieve 100% or the maximum possible coverage.
+
+---
+## Instantiation
+
+Name the instance of the RTL as **dut**.
+
+## **RTL Parameters, Inputs - Outputs and Functional behavior**
+
+---
+
+### 1. Interface
+
+#### 1.1 Clock & Reset Signals
+- **`pclk`** (input): APB clock input used for all synchronous operations.  
+- **`presetn`** (input, active-low): Asynchronous reset for system initialization.
+
+#### 1.2 APB Signals
+- **`paddr`** (input, 10 bits): Address bus for accessing internal CSR registers.  
+- **`pselx`** (input): APB select signal, indicates CSR/memory selection.  
+- **`penable`** (input): APB enable signal, marks transaction progression.  
+- **`pwrite`** (input): Write-enable signal. High for writes, low for reads.  
+- **`pwdata`** (input, 8 bits): Write data bus for sending data to CSR registers or memory.  
+- **`pready`** (output, reg): Ready signal, driven high to indicate the end of a transaction.  
+- **`prdata`** (output, reg, 8 bits): Read data bus for retrieving data from the module.  
+- **`pslverr`** (output, reg): Error signal, asserted on invalid addresses.
+
+#### 1.3 History Shift Interface
+- **`history_shift_valid`** (input): On the rising edge of this signal, the values in `control_register` and `train_history` are considered valid and will trigger an update of the predict_history register.
+#### 1.4 Clock Gating Enable
+- **`clk_gate_en`** (input): Signal in domain of `pclk`, which will be toggle only on negative edge of `pclk` to avoid glitches. Assertion of this signal will gate the `pclk` internally to minimize switching power.
+#### 1.4 Status & Interrupt Signals
+- **`history_full`** (output): Indicates if the 8-bit shift register is full (all bits set to 1).
+- **`history_empty`** (output): Indicates if the 8-bit shift register is empty (all bits cleared to 0).
+- **`error_flag`** (output): Indicates detected errors for invalid address.
+- **`interrupt_full`** (output): Asserted high to signal an interrupt when history_full is set.
+- **`interrupt_error`** (output): Asserted high to signal an interrupt when error_flag is set.
+---
+
+### 2. Register Descriptions
+
+1. **`control_register`**  
+   - **Address:** `0x0`  
+   - Bit fields (from LSB to MSB):
+     - `predict_valid` (control_register[0]): Indicates a valid branch prediction.  
+     - `predict_taken` (control_register[1]): Predicted direction of the branch (1 = taken, 0 = not taken).  
+     - `train_mispredicted` (control_register[2]): Indicates a branch misprediction occurred.  
+     - `train_taken` (control_register[3]): Actual direction of the mispredicted branch (1 = taken, 0 = not taken).  
+     - control_register[7:4]: Reserved and will be read 0.
+     - Read and write register.
+2. **`train_history`**  
+   - **Address:** `0x1`  
+   - 7 bits (`train_history[6:0]`) representing the recorded branch history prior to the mispredicted branch.
+   - train_history[7]: Reserved and will be read 0.
+   - Read and write register.
+
+3. **`predict_history`**  
+   - **Address:** `0x2`  
+   - 8-bit register representing the current state of the branch history shift register.
+   - Updated only on the rising edge of `history_shift_valid`.
+   - Can be read via the APB interface (using `prdata`).
+   - Can't be written via APB interface.
+
+---
+
+### 3. Functional Description
+
+#### 3.1 APB Protocol
+
+1. **Read Operations**  
+   - In the **READ_STATE**:  
+     - Drive `prdata` with the register value corresponding to `paddr`.  
+   - After the read completes, return to **IDLE**.
+
+2. **Write Operations**  
+   - In the **WRITE_STATE**:  
+     - Update the register selected by `paddr` with `pwdata`.  
+   - After the write completes, return to **IDLE**.
+
+3. **Reset Behavior**  
+   - When `presetn` is deasserted (active-low):  
+     - Reset `pready` and `pslverr` to 0.  
+     - Clear `prdata`.  
+     - Initialize `control_register` and `train_history` to 0.  
+     - Reset the shift register to zero (`predict_history = 8'b0`).
+
+#### 3.2 APB Interface Control
+
+1. **Basics**  
+   - Registers are accessed via the APB interface using `paddr`.  
+   - To read the computed prediction history, use address **0x2**; the data is returned on `prdata`.
+
+2. **Error Handling**  
+   - If `paddr` does not correspond to a valid register, assert `pslverr` (`1'b1`).
+
+3. **Wait States**  
+   - This design does not support wait states. All read/write operations complete in two clock cycles, and `pready` is always driven high (`1'b1`).
+
+---
+
+### 4. Prediction Update Logic
+
+1. **Normal Update**  
+   - If `predict_valid = 1` and no misprediction occurs (`train_mispredicted = 0`), the shift register updates by shifting in `predict_taken` from the least significant bit (LSB). The youngest branch direction is stored in `predict_history[0]`.
+
+2. **Misprediction Handling**  
+   - If `train_mispredicted = 1`, the shift register is updated synchronously with `history_shift_valid` to load the concatenation of `train_history` (7 bits) with `train_taken` (1 bit). This restores the history state before the mispredicted branch while incorporating the actual outcome of the mispredicted branch.
+
+
+3. **Priority**  
+   - If both `predict_valid` and `train_mispredicted` are asserted simultaneously, `train_mispredicted` takes precedence. The misprediction state overrides any prediction to ensure correct recovery of the pipeline state.
+
+4. **Output Behavior**  
+   - `predict_history` (the shift register) is updated only on the rising edge of `history_shift_valid`.
+   - `history_full` is asserted if predict_history contains all ones (8'hFF) else it will be deasserted.
+   - `history_empty` is asserted if predict_history contains all zeros (8'h00)  else it will be deasserted.
+   - `interrupt_full` is directly driven by history_full.
+   - `interrupt_error` is directly driven by error_flag.
+
+Note: Need not to worry about mixing synchronous (pclk) and asynchronous (history_shift_valid) control which can lead to metastability and timing issues. The history_shift_valid will trigger only in absense of pclk.
+
+## Test Bench Requirements
+
+### Stimulus Generation
+
+## 1. **Reset & Initialization Stimuli**
+
+- **Apply and Release Reset**  
+  1. Deassert the active-low reset (`presetn`) after a certain period while the clock toggles, ensuring all internal registers begin at default states.  
+  2. Keep clock transitions valid during reset deassertion.
+
+---
+
+## 2. **APB Interface Stimuli**
+
+### 2.1 **Valid Register Accesses**
+
+- **Write to Control Register**  
+  1. Present the address corresponding to `control_register` on `paddr`.  
+  2. Drive APB signals (`pselx`, `penable`, `pwrite`) for a valid write transaction.  
+  3. Provide varied data patterns on `pwdata` that affect bits `[3:0]` of `control_register`.
+
+- **Write to Train History Register**  
+  1. Present the address corresponding to `train_history` on `paddr`.  
+  2. Drive valid APB write signals.  
+  3. Send multiple data patterns that affect bits `[6:0]`.
+
+- **Read from Control/Register/Train History/Predict History**  
+  1. Present each valid address in turn (`0x0`, `0x1`, `0x2`).  
+  2. Drive APB signals for read transactions.  
+
+### 2.2 **Invalid Register Access**
+
+- **Access Addresses Beyond Valid Range**  
+  1. Set `paddr` to a value beyond the defined valid set (greater than `0x2`).  
+  2. Drive an APB read or write cycle.  
+
+---
+
+## 3. **Clock Gating Stimuli**
+
+- **Toggle `clk_gate_en`**  
+  1. Drive `clk_gate_en` active and inactive at different moments, including while issuing valid APB transactions.  
+  2. Ensure transitions occur on safe clock edges, demonstrating partial or no internal updates under gating.
+
+---
+
+## 4. **Shift Register Update Stimuli**
+
+### 4.1 **No Update Condition**
+
+- **Drive Control Bits for No-Action**  
+  1. Set `predict_valid` and `train_mispredicted` to inactive states.  
+  2. Pulse the `history_shift_valid` signal.
+
+### 4.2 **Normal Prediction Updates**
+
+- **Drive Valid Prediction**  
+  1. Set `predict_valid` active in `control_register`.  
+  2. Alternate the predicted direction bit (`predict_taken`) across multiple pulses of `history_shift_valid`.  
+  3. Repeat for various patterns of taken/not-taken.
+
+### 4.3 **Misprediction Handling**
+
+- **Restore from Train History**  
+  1. Write desired values into `train_history`.  
+  2. Set `train_mispredicted` active, along with a chosen `train_taken` bit.  
+  3. Drive `history_shift_valid` to force the restore path.
+
+- **Simultaneous Valid Prediction & Misprediction**  
+  1. Set both `predict_valid` and `train_mispredicted` active in the same cycle.  
+  2. Pulse `history_shift_valid`.
+
+---
+
+## 5. **Edge Conditions for the Shift Register**
+
+- **All-Zero to All-One Transitions**  
+  1. Repeatedly provide inputs (via normal prediction or misprediction) so that the shift register transitions from all zeros to all ones.  
+  2. Similarly, drive it back from all ones to all zeros with a series of stimuli.
+
+---
+
+## 6. **Error & Interrupt Stimuli**
+
+- **Trigger Invalid APB Transactions**  
+  1. Provide out-of-range addresses and drive write or read cycles.  
+
+- **Generate Interrupt Conditions**  
+  1. Fill the shift register to all ones (to drive any “full” interrupt).  
+  2. Cause invalid address access (to drive error interrupt).
+
+---
+
+## 7. **Combined Complex Sequences**
+
+- **Integrated Flow**  
+  1. Begin with reset cycling.  
+  2. Perform valid reads and writes to internal registers.  
+  3. Toggle `clk_gate_en`.  
+  4. Issue valid predictions and a series of mispredictions.  
+  5. Drive the shift register from empty to full.  
+  6. Include at least one invalid address access mid-sequence.  
+
+## 8. **Additional Test Scenarios**  
+
+- **Reset During Operation** – Ensures the system can reinitialize correctly when reset is asserted dynamically, not just at startup.  
+
+- **Reserved Bit Handling** – Toggles unused register fields to confirm they remain stable and do not interfere with functionality.  
+
+- **Expanded Address Access** – Interacts with a broader address range to verify correct handling of both valid and invalid accesses.  
+
+- **Repeated Prediction History Reads** – Ensures the stored history updates correctly and all bits are exercised across different states.  
+
+- **Response Signal Validation** – Checks readiness and status transitions across reset, transactions, and different operating conditions.  

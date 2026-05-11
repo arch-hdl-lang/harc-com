@@ -1,0 +1,19 @@
+// Smoke-test TB template — used by bench/cvdp/smoke.py to verify
+// each extracted problem's harness layout works end-to-end. The TB
+// instantiates the DUT, drives no inputs, and exits cleanly. Coverage
+// will be near zero; the point is to confirm the build + run pipeline
+// works for each problem before any real authoring happens.
+//
+// The harness substitutes `{TOP_MODULE}` with each problem's actual
+// top module name at smoke time.
+
+test SmokeTest
+    let dut : {TOP_MODULE}
+end test SmokeTest
+
+impl sim for SmokeTest
+    run
+        wait 1 cycle
+        log(info, "smoke: DUT alive")
+    end run
+end impl SmokeTest

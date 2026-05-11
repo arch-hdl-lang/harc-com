@@ -1,4 +1,4 @@
-# CVDP × HARC verification benchmark — Phase 1
+# CVDP × HARC verification benchmark — Phase 2a complete
 
 A HARC-flavored re-implementation of NVIDIA's CVDP cid012 (testbench-generation)
 scoring loop, using Verilator branch coverage in place of Cadence IMC. The
@@ -22,23 +22,38 @@ license + the `harc -emit sv-uvm` transpile target (v1+, not implemented),
 or a separate Verilator-coverage calibration pass against the gold SV TBs in
 the CVDP example set.
 
+## Strict no-gold-TB policy
+
+Every CVDP record in the HF dataset contains a reference TB at
+`output.context["verif/*_tb.sv"]`. The extractor MUST NEVER copy that
+to disk — looking at it would contaminate the agent's TB authoring
+task. `extract.py::_verify_record_shape_without_reading_gold` is the
+only place we touch `record["output"]`, and only to confirm the gold
+exists; the content is never returned, written, or stored. **There is
+no `gold/` directory under `bench/cvdp/<id>/` by design.**
+
 ## Layout
 
 ```
 bench/cvdp/
 ├── README.md                                  ← this file
-├── score.py                                   ← the scoring loop
-└── cid012_gf_multiplier/                      ← one problem directory
-    ├── meta.json                              ← top_module + dut_module + target_coverage
-    ├── prompt.txt                             ← original CVDP prompt (English)
+├── extract.py                                 ← HF dataset → problem-dir extractor
+├── score.py                                   ← per-problem PASS/FAIL scorer
+├── smoke.py                                   ← sanity-check the harness layout
+├── _smoke_tb.harc                             ← trivial smoke-test TB template
+├── cid012_gf_multiplier/                      ← Phase 1 hand-authored proof-of-concept
+│   └── ... (DUT + manually-written HARC TB)
+├── cid012_gf_multiplier_thin/                 ← regression: scorer rejects under-coverage
+│   └── ...
+└── cvdp_copilot_<id>/                         ← 67 extracted cid012 problems (one each)
+    ├── meta.json                              ← top_module, dut_module, target_coverage, clock_inputs[]
+    ├── prompt.txt                             ← original CVDP English prompt (NOT the gold TB)
     ├── dut/
-    │   ├── gf_multiplier.sv                   ← CVDP-provided DUT (unmodified)
-    │   └── gf_multiplier_top.sv               ← clocked wrapper for HARC's posedge loop
+    │   ├── <dut>.sv                           ← CVDP-provided DUT, unmodified
+    │   └── <dut>_top.sv                       ← (auto-generated) clocked wrapper, when needed
     ├── tb/
-    │   └── gf_multiplier_tb.harc              ← candidate HARC testbench
-    ├── gold/
-    │   └── gf_multiplier_tb.sv                ← original CVDP gold SV TB (reference)
-    └── build/                                 ← scorer output (coverage.dat, coverage.info, logs)
+    │   └── (empty until a HARC TB is authored)
+    └── build/                                 ← scorer output (gitignored)
 ```
 
 ## Loop semantics — what the scorer does
@@ -64,7 +79,7 @@ Branch coverage discriminates: each `if (cond)` produces 4 Verilator-tracked
 branches, and only TBs that exercise the condition both ways hit all of them.
 This matches the spirit of Xcelium IMC's branch/expression metrics.
 
-## Validation: gf_multiplier (CVDP cid012, example dataset)
+## Phase 1 validation: gf_multiplier (hand-authored)
 
 The DUT is a GF(2⁴) polynomial multiplier mod x⁴+x+1 — 4 inputs × 4 inputs,
 purely combinational. Two HARC TBs:
@@ -74,53 +89,102 @@ purely combinational. Two HARC TBs:
 | `cid012_gf_multiplier/`        | Exhaustive 16×16 sweep + inline software model assertion | 30/33 = **90.91%** | **PASS** (≥90%) |
 | `cid012_gf_multiplier_thin/`   | Single A=1,B=1 input — sanity-check the scorer rejects under-coverage | 16/33 = **48.48%** | **FAIL** |
 
-The thorough TB clears the bar exactly where it should; the thin TB fails
-cleanly. The scorer discriminates. Phase 1 plumbing validates.
+The thorough TB clears the bar; the thin TB fails cleanly. The scorer
+discriminates. Phase 1 plumbing validates.
 
-## Known limits + Phase 2 work
+## Phase 2a: full cid012 set extracted (this PR)
 
-- **Clockless DUTs.** HARC codegen unconditionally drives `dut->clk` in the
-  main loop. The CVDP gf_multiplier DUT has no clock; we wrap it in a thin
-  `gf_multiplier_top.sv` that exposes a phantom `clk`. Generalizing to all
-  cid012 DUTs means either (a) per-problem wrapper generation, or (b) a
-  HARC codegen change to detect clockless DUTs at Verilator-header probe
-  time and skip the posedge loop. (b) is cleaner; punted to Phase 2.
-- **Module-name → file-name discovery.** The scorer currently assumes
-  the DUT file is named `<dut_module>.sv` (matching CVDP's convention).
-  Robust would parse the SV file's `module <name>` line and match by
-  parsed name. Fine for now; revisit if violated.
-- **Coverage-point parity with IMC.** Verilator doesn't implement
-  SystemVerilog covergroups or cross-coverage. For the
-  combinational-DUT subset of cid012 this doesn't matter much (branch
-  coverage already discriminates well), but problems that genuinely
-  want covergroup-level scoring won't have a faithful equivalent.
+Pulled all 67 cid012 problems from
+[`nvidia/cvdp-benchmark-dataset`](https://huggingface.co/datasets/nvidia/cvdp-benchmark-dataset)
+v1.1.0. Per-problem layout via `extract.py`. DUT topology breakdown:
 
-## Phase 2 plan (next session)
+| Topology | Count | Wrapper |
+|---|---:|---|
+| `clk`-native (canonical) | 31 | none |
+| Clock-shaped port under another name (`i_clk`, `clk_i`, `clk_in`, `clock`, `PCLK`) | 16 | wrapper renames it to HARC's hardcoded `clk` |
+| Combinational (no clock) | 16 | wrapper adds a phantom `clk` (no-op for DUT, drives HARC's posedge loop) |
+| Multi-clock (multiple clock-shaped ports — `wr_clk`/`rd_clk`, `clk_dsp`/`PCLK`, etc.) | 4 | flagged `multi_clock=true` in meta; needs manual TB authoring |
+| **Total** | **67** | |
 
-1. Pull the full `cid012` set from
-   `https://huggingface.co/datasets/nvidia/cvdp-benchmark-dataset`
-   (no auth required) → ~Cid012 problem count TBD from HF.
-2. For each problem, programmatically lay out a `bench/cvdp/<id>/`
-   directory in the same shape as `cid012_gf_multiplier/`.
-3. Probe each DUT's port list (parse `module <name>(...)` or use
-   Verilator's `--xml-only` output) to decide whether a `_top` wrapper
-   is needed. Auto-generate the wrapper when so.
-4. Rewrite each problem's prompt: "Develop a SystemVerilog testbench
-   for X" → "Develop a HARC testbench for X. Reference: <link to
-   spec.md §7.2 + §8>. Output should be a single `.harc` file at
-   `tb/<name>_tb.harc`."
-5. Run the prompt through an LLM (gpt-5? claude-sonnet?), score
-   Pass@1, log results.
+Smoke-tested with a trivial `wait 1 cycle; log(info, "...")` TB on every
+problem: all 67 build + run cleanly through `harc sim`. The harness
+layout is sound; what remains is the actual TB authoring work.
 
-## Quick reference — manual run
+### HARC compiler tweaks landed for this phase (`harc sim`)
+
+- `--coverage` flag (was Phase 1) — pass-through to Verilator + write
+  `coverage.dat` at clean shutdown
+- `-Wno-BLKANDNBLK` + `-Wno-UNOPTFLAT` — tolerate SV quirks Xcelium
+  accepts but Verilator escalates (common in CVDP DUTs that mix `=`
+  and `<=` to the same reg)
+- `--no-timing` — cycle-based TBs don't need delay semantics; tell
+  Verilator to elide `#N` rather than refusing to elaborate
+
+All three are net-additive to the existing 50-fixture sweep
+(verified green post-change).
+
+## Phase 2b: TB authoring (next)
+
+**Model: I'm the LLM.** Per the user, Claude authors each HARC TB
+working only from the prompt + DUT source, never reading the gold
+SV TB (there's no on-disk copy of it).
+
+Per-problem cycle:
+
+  1. Read `prompt.txt` + `dut/<dut>.sv`
+  2. Author `tb/<dut>_tb.harc` directly
+  3. Run `bench/cvdp/score.py <problem-dir>`
+  4. If FAIL: iterate (broaden inputs, fix bugs); if PASS, move on
+  5. Cap iteration count per problem so the run terminates
+
+Authoring all 67 is many sessions of work. Reasonable midpoints:
+
+  - **Phase 2b-pilot** (next): pick a representative sample — 1
+    combinational, 1 simple sequential, 1 multi-clock — and author
+    TBs to validate the loop with non-cheating inputs
+  - **Phase 2b-scale**: batch the remainder
+  - **Phase 2c-analysis**: aggregate Pass@1, identify systematic
+    failure modes, decide whether to (a) tighten the prompt
+    formulation, (b) extend the HARC language, or (c) accept the
+    floor and report.
+
+## Known limits
+
+- **Verilator coverage ≠ Xcelium IMC.** Different metric models;
+  the 90% threshold is calibrated for IMC. Our branch-coverage
+  numbers are directionally aligned but not strictly comparable
+  to CVDP paper Pass@k. The README is explicit about this.
+- **Multi-clock DUTs need HARC-side clock declarations.** Today
+  HARC's primary clock is `clk` only; CVDP problems with `wr_clk` +
+  `rd_clk` need either multi-clock TB authoring (HARC supports
+  this via `clock <name> = <period>` decls — see `multi_clock_test`)
+  or a richer wrapper. Phase 2a flags these 4 problems in meta but
+  doesn't auto-resolve.
+- **Coverage holes from constant assignments.** Verilator counts
+  one-time initial assignments (`reg [4:0] poly = 5'b10011`) as
+  "toggle never happened" → they show as uncovered. Mostly cosmetic;
+  flat-out unwinnable for the TB to drive a constant.
+
+## Quick reference
 
 ```bash
 # Build harc with --coverage support
 cargo build --release --bin harc
 
-# Score one problem
-python3 bench/cvdp/score.py bench/cvdp/cid012_gf_multiplier
+# Pull the HF dataset locally (one-time, ~60 MB)
+pip3 install huggingface_hub
+python3 -c "from huggingface_hub import snapshot_download; \
+    snapshot_download(repo_id='nvidia/cvdp-benchmark-dataset', \
+                      repo_type='dataset', local_dir='/tmp/cvdp_hf')"
 
-# To author a new TB by hand: drop a .harc file into <problem>/tb/
-# and rerun the scorer.
+# Extract all cid012 problems into bench/cvdp/cvdp_copilot_*
+python3 bench/cvdp/extract.py \
+    --jsonl /tmp/cvdp_hf/cvdp_v1.1.0_nonagentic_code_generation_commercial.jsonl \
+    --category cid012 --out bench/cvdp [--force]
+
+# Smoke-test all extracted problems (trivial TB; pass=harness layout OK)
+python3 bench/cvdp/smoke.py
+
+# Author a HARC TB: drop a .harc file into <problem-dir>/tb/, then score
+python3 bench/cvdp/score.py bench/cvdp/<problem-dir>
 ```

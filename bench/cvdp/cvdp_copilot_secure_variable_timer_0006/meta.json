@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_secure_variable_timer_0006",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "secure_variable_timer_top",
+  "dut_module": "secure_variable_timer",
+  "target_coverage": 98,
+  "auto_wrapper": "secure_variable_timer_top.sv",
+  "n_ports": 7,
+  "clock_inputs": [
+    "i_clk"
+  ],
+  "multi_clock": false
+}

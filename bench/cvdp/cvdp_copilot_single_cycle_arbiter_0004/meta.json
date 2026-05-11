@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_single_cycle_arbiter_0004",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "single_cycle_arbiter",
+  "dut_module": "single_cycle_arbiter",
+  "target_coverage": 96,
+  "auto_wrapper": null,
+  "n_ports": 4,
+  "clock_inputs": [
+    "clk"
+  ],
+  "multi_clock": false
+}

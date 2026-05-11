@@ -1,0 +1,14 @@
+{
+  "id": "cvdp_copilot_secure_read_write_register_bank_0006",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "secure_read_write_register_bank_top",
+  "dut_module": "secure_read_write_register_bank",
+  "target_coverage": 96,
+  "auto_wrapper": "secure_read_write_register_bank_top.sv",
+  "n_ports": 6,
+  "clock_inputs": [],
+  "multi_clock": false
+}

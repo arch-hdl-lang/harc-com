@@ -1,0 +1,18 @@
+{
+  "id": "cvdp_copilot_apb_dsp_op_0006",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "apb_dsp_op_top",
+  "dut_module": "apb_dsp_op",
+  "target_coverage": 100,
+  "auto_wrapper": "apb_dsp_op_top.sv",
+  "n_ports": 12,
+  "clock_inputs": [
+    "clk_dsp",
+    "en_clk_dsp",
+    "PCLK"
+  ],
+  "multi_clock": true
+}

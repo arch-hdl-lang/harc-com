@@ -1,0 +1,118 @@
+Complete the given SystemVerilog testbench for the `top_manchester` module. The testbench currently instantiates the UUT and should include stimulus generation logic that dynamically produces a wide range of test scenarios to ensure 100% functional and code coverage. The stimulus generation logic should drive the design under various conditions, including the module functionality below.
+
+---
+
+## Description
+
+### Parameter
+- **`N`**: Input Parameter Value, Default value is 8.
+
+### Inputs
+
+- **`clk_in`**: Clock signal driving the design (positive edge triggered).
+- **`rst_in`**: Asynchronous reset signal (active high) to reset the encoder and decoder.
+- **`enc_valid_in`**: 1-bit Input valid signal for the encoder.
+- **`enc_data_in[N-1:0]`**: N-bit input data for the encoder.
+- **`dec_valid_in`**: 1-bit Input valid signal for the decoder.
+- **`dec_data_in[2*N-1:0]`**: 2N-bit input data for the decoder.
+
+### Outputs
+
+- **`enc_valid_out`**: 1-bit Output valid signal for the encoder.
+- **`enc_data_out[2*N-1:0]`**: 2N-bit Manchester-encoded output data from the encoder.
+- **`dec_valid_out`**: 1-bit Output valid signal for the decoder.
+- **`dec_data_out[N-1:0]`**: N-bit decoded output data from the decoder.
+
+---
+
+## Input Generation
+
+### Input Generation
+
+- **Clock and Reset**:
+  - Generate a clock signal (`clk_in`) with a configurable period.
+  - Apply reset (`rst_in`) at the beginning and during random intervals to test reset behavior.
+
+- **Encoder Inputs**:
+  - Generate diverse patterns for `enc_data_in`, such as:
+    - Incremental data (e.g., 0, 1, 2, ...).
+    - Random data patterns.
+    - Edge cases (e.g., all zeros, all ones, alternating patterns).
+  - Toggle `enc_valid_in` to test valid and invalid input scenarios.
+
+- **Decoder Inputs**:
+  - Generate diverse patterns for `dec_data_in`, such as:
+    - Valid Manchester-encoded data (e.g., 0x5AA5, 0xC33C).
+    - Invalid Manchester-encoded data (e.g., 0xFFFF, 0x0000).
+    - Incremental data (e.g., 0, 1, 2, ...).
+    - Random data patterns.
+  - Toggle `dec_valid_in` to test valid and invalid input scenarios.
+
+## **Instantiation**  
+
+- The instance of the RTL should be named **`uut`**.  
+
+---
+
+Follows the specification for building the RTL of the module, use it as a reference for the verification environment too: 
+## Module Functionality
+
+1. **Encoder Functionality**:
+   - The encoder converts N-bit input data (`enc_data_in`) into 2N-bit Manchester-encoded data (`enc_data_out`).
+   - The encoding logic follows the Manchester encoding scheme:
+     - `1` is encoded as `01`.
+     - `0` is encoded as `10`.
+
+2. **Decoder Functionality**:
+   - The decoder converts 2N-bit Manchester-encoded data (`dec_data_in`) into N-bit decoded data (`dec_data_out`).
+   - The decoding logic follows the Manchester decoding scheme:
+     - `01` is decoded as `1`.
+     - `10` is decoded as `0`.
+     - Invalid patterns (e.g., `00` or `11`) are decoded as `0`.
+
+3. **Reset Behavior**:
+   - When `rst_in` is asserted, all outputs (`enc_data_out`, `enc_valid_out`, `dec_data_out`, `dec_valid_out`) are cleared to zero.
+
+---
+
+```verilog
+module tb_top_manchester;
+
+    parameter N = 8;  // Width of input and output data
+    parameter CLK_PERIOD = 10;  // Clock period in ns
+
+    // Testbench signals
+    logic clk_in;
+    logic rst_in;
+    logic enc_valid_in;
+    logic [N-1:0] enc_data_in;
+    logic dec_valid_out;
+    logic dec_valid_in;
+    logic [N-1:0] dec_data_out;
+    logic [2*N-1:0] enc_data_out; // 2N-bit Manchester encoded data
+    logic [2*N-1:0] dec_data_in; // 2N-bit Manchester encoded data
+    logic enc_valid_out;          // Encoded data valid signal
+
+    // Instantiate the top module
+    top_manchester #(
+        .N(N)
+    ) uut (
+        .clk_in(clk_in),
+        .rst_in(rst_in),
+        
+        .enc_valid_in(enc_valid_in),
+        .enc_data_in(enc_data_in),
+        .enc_valid_out(enc_valid_out),
+        .enc_data_out(enc_data_out),
+        
+        .dec_valid_in(dec_valid_in),
+        .dec_data_in(dec_data_in),
+        .dec_valid_out(dec_valid_out),
+        .dec_data_out(dec_data_out)
+        
+    );
+
+    // Insert the code here to generate stimulus generation logic
+
+endmodule
+```

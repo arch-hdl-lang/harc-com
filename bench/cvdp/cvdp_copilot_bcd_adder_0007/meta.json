@@ -1,0 +1,14 @@
+{
+  "id": "cvdp_copilot_bcd_adder_0007",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "bcd_adder_top",
+  "dut_module": "bcd_adder",
+  "target_coverage": 95,
+  "auto_wrapper": "bcd_adder_top.sv",
+  "n_ports": 4,
+  "clock_inputs": [],
+  "multi_clock": false
+}

@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_microcode_sequencer_0028",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "microcode_sequencer",
+  "dut_module": "microcode_sequencer",
+  "target_coverage": 90,
+  "auto_wrapper": null,
+  "n_ports": 18,
+  "clock_inputs": [
+    "clk"
+  ],
+  "multi_clock": false
+}

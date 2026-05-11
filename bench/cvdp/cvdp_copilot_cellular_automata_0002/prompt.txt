@@ -1,0 +1,127 @@
+Complete the given partial System Verilog testbench `tb_pseudoRandGenerator_ca`.The testbench must instantiate the `pseudoRandGenerator_ca`  RTL module and provide input stimulus for it, focusing exclusively on generating test vectors rather than building a full testbench.
+The `pseudoRandGenerator_ca` module simulates a simple pseudo-random number generator using a cellular automata algorithm with a 16-bit seed input.
+
+## Description:
+### **Inputs** :
+
+Registers :
+`CA_out` (16-bit,[15:0]): 16-bit pseudo-random output received from the **DUT**.
+
+### **Outputs** :
+
+Registers :
+`clock (1-bit)`: Posedge Clock signal that toggles every 10ns (100 MHz) supplied to the **DUT** 
+`reset (1-bit)`: Active-high synchronous reset signal that resets the output  of **DUT** to the initial seed value
+`CA_seed` (16-bit,[15:0]): 16-bit seed value for initializing the cellular automata **DUT**.
+
+## **Instantiation**:
+The testbench instantiates the `pseudoRandGenerator_ca` module as dut and connects the signals between the module and the testbench. Each input and output from the **DUT** is connected to its corresponding signal in the testbench.
+
+## **Input Generation and Validation**:
+**Clock Generation**: 
+The clock signal clock is generated using an always block that toggles the clock every 10ns.
+
+**Reset**: 
+The reset signal reset is asserted at the beginning of the simulation to ensure the DUT initializes to the correct seed. After a short period (150ns), the reset is de-asserted.
+
+**Stimulus**: 
+Multiple test cases are applied to simulate various initial seed values for the Cellular Automata algorithm. The output from the DUT is monitored to ensure the proper sequence of pseudo-random numbers is generated.
+ 
+-  **Test Case 1:**
+         **CA_Seed**: 16'hA5A5
+         This case tests the cellular automata algorithm with a specific seed to observe the random output.
+-  **Test Case 2:**
+         **CA_Seed**: 16'h3C3C
+         This case tests a different seed to ensure the correct random sequence is generated.
+-  **Test Case 3:**
+          **CA_Seed**: 16'h1234
+          This case checks the behavior of the generator with a hexadecimal seed value.
+-  **Test Case 4:**
+          **CA_Seed**: 16'h4444
+           This case evaluates the algorithm with another specific seed.
+-  **Test Case 5:**
+           **CA_Seed**: 16'h5BEF
+           Testing with a random 16-bit seed value to observe variation in the random output.
+-  **Test Case 6:**
+           **CA_Seed**: 16'h0001
+           Verifies edge case where the seed is the smallest non-zero value.
+-  **Test Case 7:**
+          **CA_Seed**: 16'hFFFF
+          Verifies the upper boundary seed to ensure the algorithm handles high values correctly.
+-  **Test Case 8:**
+           CA_Seed: 16'hAAAA
+           Verifies the cellular automata's ability to handle seeds with alternating bits.
+-  **Test Case 9:**
+            **CA_Seed**: 16'h5555
+            Similar to the previous case, but with alternating low/high bits.
+
+
+## **Reset Handling**:
+After running the test cases, a reset is asserted again to ensure the generator is properly reset to its initial seed state and the output is as expected.
+
+**Partial Test Stimulus Generator Code** :
+```verilog
+module tb_pseudoRandGenerator_ca;
+
+logic clk;
+logic reset;
+logic [15:0] CA_seed;      // 16-bit seed input
+logic [15:0] CA_out;       // 16-bit output for Cellular Automata
+
+
+pseudoRandGenerator_ca dut (
+    .clock(clk),       
+    .reset(reset),     
+    .CA_seed(CA_seed), 
+    .CA_out(CA_out)    
+);
+
+
+always begin
+    #10 clk = ~clk; 
+end
+
+
+task initialization();
+    begin
+        clk = 1'b0;
+        reset = 1'b1;  
+        CA_seed = 16'hA5A5;  
+    end
+endtask
+
+
+task drive_reset();
+    begin
+        reset = 1'b1;  
+    end
+endtask
+
+
+task clear_reset();
+    begin
+        reset = 1'b0;  
+    end
+endtask
+
+
+task run_test_case(input [15:0] test_seed);
+    begin
+        CA_seed = test_seed;  
+        #1000;                
+        $display("Test case with seed %h finished", test_seed);
+    end
+endtask
+
+
+initial begin
+    $dumpfile("tb_pseudoRandGenerator_ca.vcd");
+    $dumpvars(0, tb_pseudoRandGenerator_ca);  
+
+    initialization();  
+    #150;
+    clear_reset();
+    run_test_case(16'hA5A5);  
+    // Insert the code for the remaining test cases here
+```    
+

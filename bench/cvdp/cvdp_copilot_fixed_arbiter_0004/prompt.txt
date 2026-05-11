@@ -1,0 +1,48 @@
+Write a SystemVerilog testbench to generate stimulus for the `fixed_priority_arbiter` module. The testbench should validate the priority-based grant mechanism by applying different request patterns, including single, multiple, and no request scenarios. Additionally, it should verify the reset functionality and ensure the grant signal is correctly assigned based on priority.
+
+
+## Design Details
+
+1. **Inputs**:  
+   - `clk`: 1-bit clock signal for synchronization.  
+   - `reset`: 1-bit active-high reset signal to initialize the arbiter.  
+   - `req`: 8-bit request signal, where each bit represents a request from a unique source.  
+
+2. **Output**:  
+   - `grant`: 8-bit grant signal, where one bit is set high to indicate the granted request based on a **fixed priority scheme**.  
+
+3. **Module Functionality**:  
+  
+    - **Single Request Handling**:  
+         - Assert one request bit at a time in `req` and verify the corresponding bit in `grant` is set high.  
+    - **Multiple Requests Handling**:  
+        - Simultaneously assert multiple request bits and verify that the arbiter grants access to the **highest-priority request**.  
+    - **No Requests**:  
+        - Assert `req = 8'b00000000` and verify that `grant` is cleared to `8'b00000000`.  
+    - **Reset Behavior**:  
+        - Apply an active reset (`reset = 1`) during active requests and verify that `grant` is cleared to `8'b00000000`.  
+
+---
+
+## **Testbench Requirements**
+
+### **Instantiation**
+The testbench must instantiate the **fixed_priority_arbiter** module as **dut** with proper connections for all signals.
+
+### **Input Generation**
+The testbench should generate different request patterns to verify correct priority handling, including:
+- Single Requests: Apply requests one at a time to check correct grant assignment.
+- Multiple Requests: Apply overlapping requests to ensure the arbiter always grants the highest-priority request.
+- No Requests: Ensure the grant signal remains `00000000` when no requests are present.
+- Reset Behavior: Apply reset during active requests to verify that `grant` is cleared.
+
+### **Tasks for Test Stimulus**
+- Apply Reset (`apply_reset`)  
+  - A task to assert `reset`, wait for a few clock cycles, and deassert it to verify correct initialization.
+- Drive Request (`drive_request`)  
+  - A task to apply a specific request pattern, hold it for a few cycles, and check the corresponding grant output.
+
+---
+
+This testbench will validate the **fixed_priority_arbiter** functionality and ensure its behavior under various input conditions.
+

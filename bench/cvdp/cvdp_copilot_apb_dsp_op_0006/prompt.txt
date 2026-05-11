@@ -1,0 +1,124 @@
+Create a SystemVerilog test bench for a module named `apb_dsp_op`. The test bench should systematically generate input vectors, apply them to the design under test (DUT), and aim to achieve 100% coverage.
+
+---
+## Instantiation
+
+Name the instance of the RTL as **apb_dsp_op_dut**.
+
+## **RTL Interface and Parameters**
+
+| Signal     | Width | Samples | In/Out | Description                              |
+|------------|-------|---------|--------|------------------------------------------|
+| clk_dsp    | 1     | 1       | Input  | Faster clock of 500 MHz to DSP operation |
+| en_clk_dsp | 1     | 1       | Input  | Enable faster DSP clock                  |
+| PCLK       | 1     | 1       | Input  | APB clock of 50 MHz                      |
+| PRESETn    | 1     | 1       | Input  | Active low asynchronous APB Reset        |
+| PADDR      | 6     | 1       | Input  | APB address                              |
+| PWRITE     | 1     | 1       | Input  | Write/Read enable                        |
+| PWDATA     | 32    | 1       | Input  | Write data                               |
+| PSEL       | 1     | 1       | Input  | DSP selector                             |
+| PENABLE    | 1     | 1       | Input  | APB enable                               |
+| PRDATA     | 32    | 1       | Output | Read data                                |
+| PREADY     | 1     | 1       | Output | Ready signal                             |
+| PSLVERR    | 1     | 1       | Output | Error signal                             |
+
+### Parameters
+- **ADDR_WIDTH**: Width of the address (6 bits).
+- **DATA_WIDTH**: Width of the data (32 bits).
+
+---
+### Functional Behavior
+
+**Internal Blocks**
+
+1. **Control Unit**: 
+   - Is responsible for controlling the APB interface, internal registers, SRAM operations and DSP behavior.
+2. **DSP Processing**: 
+   - Can operate with the APB interface clock or with an alternative clock 10 times higher and performs the following operation: O = A * B + C.
+3. **SRAM Memory**: 
+   - Has 64 addresses of 32 bits each.
+ 
+### Register Bank
+| Register       | Address | Default Value | Permission | Description                                              |
+|----------------|---------|---------------|------------|----------------------------------------------------------|
+| REG_OPERAND_A  | 0x00    | 32'h0         | W/R        | Holds the SRAM address to read the value for operand A   |
+| REG_OPERAND_B  | 0x01    | 32'h0         | W/R        | Holds the SRAM address to read the value for operand B   |
+| REG_OPERAND_C  | 0x02    | 32'h0         | W/R        | Holds the SRAM address to read the value for operand C   |
+| REG_OPERAND_O  | 0x03    | 32'h0         | W/R        | Holds the SRAM address to write the value for operand O  |
+| REG_CONTROL    | 0x04    | 32'h0         | W/R        | Holds the value equivalent to the operation control mode |
+| REG_WDATA_SRAM | 0x05    | 32'h0         | W/R        | Holds the data to be written to SRAM                     |
+| REG_ADDR_SRAM  | 0x06    | 32'h0         | W/R        | Holds the address to be read or written to SRAM          |
+
+### Control Modes
+
+The module's operation has control modes configured according to the value in the internal register ```reg_control```. The operating modes are described below:
+   - 32'd1: Enables writing to SRAM.
+   - 32'd2: Enables reading from SRAM.
+   - 32'd3: Enables reading the A operand.
+   - 32'd4: Enables reading the B operand.
+   - 32'd5: Enables reading the C operand.
+   - 32'd6: Enables writing the O operand.
+   - Other values: Only performs write and read operations on internal registers.
+
+---
+### TB Implementation Notes
+
+1. **APB Interface**
+
+Implement simple APB driver tasks that does the following:
+- Drives PADDR, PWDATA, PWRITE when PSEL is asserted.
+- Asserts PENABLE for the second phase of the transfer.
+- Ensure the testbench stimulates correct read data at the right cycle.
+- Ensure the testbench stimulates out-of-range access.
+
+2. **SRAM Operations**
+
+Implement simple SRAM driver tasks configured by the APB registers:
+- Ensure the testbench stimulates correct read data at the right cycle.
+- Ensure the testbench stimulates out-of-range access.
+- Wait for clock synchronization after writing to SRAM.
+- Waiting for multiple PCLK cycles after SRAM requests.
+
+3. **DSP Processing**
+
+The testbench ensures proper synchronization between PCLK and clk_dsp by:
+- Waiting for multiple PCLK cycles after DSP control registers are set.
+- Introducing additional @(posedge PCLK); waits before reading computed values.
+- Set different address values for REG_OPERAND_A, REG_OPERAND_B, REG_OPERAND_C, and REG_OPERAND_O before DSP execution.
+
+4. **Invalid Transactions**
+
+The testbench ensures testing of invalid transactions by:
+- Creating a task for accessing invalid APB register addresses.
+- Creating a task for operating the SRAM at invalid addresses.
+- Creating a task for performing DSP operations using an invalid address.
+
+---
+### Stimulus Generation
+
+The testbench writes to the following APB registers before initiating DSP operations:
+REG_OPERAND_A (0x00): Stores operand A address.
+REG_OPERAND_B (0x01): Stores operand B address.
+REG_OPERAND_C (0x02): Stores operand C address.
+REG_OPERAND_O (0x03): Stores operand O (result) address.
+REG_CONTROL (0x04): Triggers DSP operations and sets control modes.
+REG_WDATA_SRAM (0x05): Writes a value to SRAM.
+REG_ADDR_SRAM (0x06): Sets the SRAM address for reads and writes.
+
+1. **Basic scripts:**
+- Write to control registers.
+- Write to SRAM address & data registers.
+- Trigger DSP operation.
+- Read back final result.
+
+2. **Invalid Address Stimulus:**
+The test bench stimulates invalid address by:
+- Writing and reading from an invalid APB register address.
+- Writing and reading from an invalid SRAM address.
+- Performing a DSP operation with an invalid REG_OPERAND_O address.
+
+3. **Signals Stimulus:**
+- Randomize signals when it makes sense.
+- Randomize valid and invalid stimuli across different tasks.
+- Wait for PCLK rising edge after reset deassertion.
+- Wait for CDC synchronization (insert some delay or additional posedge clocks commands in the test).

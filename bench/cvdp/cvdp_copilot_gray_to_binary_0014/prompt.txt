@@ -1,0 +1,50 @@
+Create a testbench for the `gray_to_binary` module, which converts an N-bit Gray code input into its N-bit binary equivalent using combinational logic. The testbench must have the instantiation of RTL module and generate stimulus for various test conditions.
+
+### Interface of gray_to_binary RTL Module
+
+**Parameter:**
+  - `WIDTH`: Width of the Gray code(`Default: 4`)
+
+**Inputs:**
+  - `gray_in [WIDTH-1:0]`: The Gray code input that needs to be converted into binary.
+
+**Outputs:**
+  - `binary_out [WIDTH-1:0]`: The corresponding binary output derived from the Gray code input.
+
+## 
+### Input Generation and Validation
+
+1. Fixed Test Cases
+    - Test a variety of Gray code inputs, including:
+      - Boundary values (0, `max value`)
+      - Alternating bit patterns (`0101`, `1010`)
+      - Power-of-two values to check conversion correctness.
+    - Example test values:
+      - `0000`, `0001`, `0011`, `0110`, `1111`, `1000`, `1100`, `1010`.
+
+2. Randomized Testing
+    - Generate random Gray code values and compare them against a reference binary conversion function.
+
+3. Edge Cases
+    - Minimum Input (`gray_in = 0`) → Expected Binary Output: `0000`
+    - Maximum Input (`gray_in = 1111`) → Expected Binary Output: `1000`
+    - One-bit change transitions:
+      - `0001 → 0000`
+      - `0011 → 0010`
+      - `0111 → 0100`
+    - Ensures that only one bit changes at a time.
+___
+### Instantiation
+Instantiate the RTL module inside the testbench and name the instance as `uut`.
+
+##
+### Module Functionality
+
+1. XOR-Based Conversion Logic
+    - The MSB of `binary_out` is directly assigned from gray_in's MSB.
+    - Each subsequent bit is computed as:
+                `B[i]=B[i+1] XOR G[I]`
+
+2. Test One-Bit Change Property
+    - Ensure that each successive Gray code value only changes one bit when converted back to binary.
+   
