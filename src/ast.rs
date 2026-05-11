@@ -958,6 +958,16 @@ pub enum StmtKind {
     /// named clock sees `<expr>` more rising edges (other clocks
     /// continue ticking at their natural rate).
     Wait { duration: Expr, clock: Option<Ident>, span: Span },
+    /// `fail("...")` as a standalone statement (also accepted inside
+    /// `assert ... else fail(...)` via the existing `Verify.else_fail`
+    /// channel). Lowering: unconditional `sim_log_line("FAIL", msg);
+    /// errors++;` — same shape as the failure arm of an inline assert,
+    /// just without the surrounding `if (!cond)` guard. Useful when a
+    /// failure is triggered by control flow rather than a boolean
+    /// predicate (e.g. inside an `if`/`for` body where the failure
+    /// condition is structural rather than expressible as one
+    /// expression).
+    Fail { msg: Expr, span: Span },
 }
 
 #[derive(Debug, Clone)]

@@ -3798,6 +3798,25 @@ impl Emitter {
                     }
                 }
             }
+            StmtKind::Fail { msg, .. } => {
+                // Standalone `fail("...")` — unconditional failure log
+                // + error counter bump. Same emission as the failure
+                // arm of an inline assert, just without the surrounding
+                // `if (!cond)` guard.
+                let raw = match &*msg.kind {
+                    ExprKind::String(s) => s.clone(),
+                    _ => "fail() with non-string arg".to_string(),
+                };
+                let (fmt, caps) = process_interp(&raw);
+                self.pad(depth);
+                write!(self.out, "sim_log_line(\"FAIL\", \"{}\"", escape_c(&fmt)).ok();
+                for c in &caps {
+                    self.emit_interp_arg(c);
+                }
+                writeln!(self.out, ");").ok();
+                self.pad(depth);
+                writeln!(self.out, "errors++;").ok();
+            }
             StmtKind::Assume(v) => {
                 if let Some(expr) = &v.expr {
                     if is_concurrent_assertion(expr, &self.properties) {
