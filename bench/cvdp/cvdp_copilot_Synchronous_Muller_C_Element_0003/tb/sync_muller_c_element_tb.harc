@@ -1,0 +1,98 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_Synchronous_Muller_C_Element_0003`.
+//
+// DUT: synchronous Muller C-element with configurable pipeline depth.
+// Holds its output unless all inputs are 1 (output goes high) or all
+// inputs are 0 (output goes low). Default NUM_INPUT=2, PIPE_DEPTH=1.
+//
+// Control surface to exercise for full coverage:
+//   - `srst`  (sync reset, active high)
+//   - `clr`   (clear, active high) — same effect as srst
+//   - `clk_en` (clock enable; gates pipeline updates)
+//   - `inp[1:0]` — 2-bit input vector (default param)
+//   - `out` — the C-element output
+//
+// Strategy: drive every combination of (srst, clr, clk_en) crossed with
+// each `inp` pattern (00, 01, 10, 11), with cycles to let the 1-stage
+// pipeline propagate. Reset/clear get separate dedicated coverage.
+
+test SyncMullerCTest
+    let dut : sync_muller_c_element_top
+end test SyncMullerCTest
+
+impl sim for SyncMullerCTest
+    run
+        log(info, "sync_muller_c_element: exhaustive control + input sweep")
+
+        // ── Reset path (srst) ──────────────────────────────────────
+        dut.srst = 1
+        dut.clr = 0
+        dut.clk_en = 1
+        dut.inp = 0b11
+        wait 2 cycles
+        assert dut.out == 0
+            else fail("post-srst: out=${dut.out}, expected 0")
+        dut.srst = 0
+
+        // ── Drive all-1s with clk_en, wait for pipeline (depth 1) ──
+        dut.inp = 0b11
+        wait 2 cycles
+        assert dut.out == 1
+            else fail("inp=11, clk_en=1: out=${dut.out}, expected 1")
+
+        // ── Drive all-0s with clk_en, output should clear ──────────
+        dut.inp = 0b00
+        wait 2 cycles
+        assert dut.out == 0
+            else fail("inp=00, clk_en=1: out=${dut.out}, expected 0")
+
+        // ── Mixed inputs (01, 10): output should HOLD prior state ──
+        dut.inp = 0b00
+        wait 2 cycles  // prime: out=0
+        dut.inp = 0b01
+        wait 2 cycles
+        assert dut.out == 0
+            else fail("inp=01 after 00: out=${dut.out}, expected hold 0")
+        dut.inp = 0b10
+        wait 2 cycles
+        assert dut.out == 0
+            else fail("inp=10 after 00: out=${dut.out}, expected hold 0")
+
+        // Now flip prior state to 1, then mixed should hold 1.
+        dut.inp = 0b11
+        wait 2 cycles
+        assert dut.out == 1
+            else fail("inp=11 (prime hold-1): out=${dut.out}")
+        dut.inp = 0b01
+        wait 2 cycles
+        assert dut.out == 1
+            else fail("inp=01 after 11: out=${dut.out}, expected hold 1")
+        dut.inp = 0b10
+        wait 2 cycles
+        assert dut.out == 1
+            else fail("inp=10 after 11: out=${dut.out}, expected hold 1")
+
+        // ── clk_en=0: pipeline should freeze regardless of inp ─────
+        dut.inp = 0b00         // would normally drag out to 0
+        dut.clk_en = 0
+        wait 3 cycles
+        assert dut.out == 1
+            else fail("clk_en=0 with inp=00: out=${dut.out}, expected frozen at 1")
+        dut.clk_en = 1
+        wait 2 cycles
+        assert dut.out == 0
+            else fail("clk_en re-enabled with inp=00: out=${dut.out}, expected 0")
+
+        // ── clr path (separate branch from srst) ───────────────────
+        dut.inp = 0b11
+        wait 2 cycles
+        assert dut.out == 1   // back to 1
+            else fail("priming for clr test: out=${dut.out}")
+        dut.clr = 1
+        wait 1 cycle
+        assert dut.out == 0
+            else fail("clr asserted: out=${dut.out}, expected 0")
+        dut.clr = 0
+
+        log(info, "ALL CHECKS PASSED — sync_muller_c_element")
+    end run
+end impl SyncMullerCTest

@@ -301,12 +301,21 @@ fn run_verilator(
         "--Mdir".into(), mdir.display().to_string(),
     ];
     if coverage {
-        // Enable Verilator's line + toggle + expression coverage on the
-        // DUT. `--coverage` is the umbrella switch; emitted TB writes
-        // `coverage.dat` at clean shutdown (see cpp_tb.rs main()
-        // emission). `verilator_coverage` post-processes the .dat into
-        // per-instance metrics that the CVDP-style scorer reads.
-        args.push("--coverage".into());
+        // Enable Verilator coverage on the DUT — line + expression
+        // only, deliberately NOT toggle. Toggle coverage is per-bit
+        // and unreachable on internal signals wider than the input
+        // space (e.g. a 20-bit `shift_reg` whose top bits never
+        // toggle because the 8-bit input bounds the register's
+        // value to 0..255). Cadence IMC's default branch-coverage
+        // metric — what CVDP cid012 scoring targets — doesn't
+        // include bit-toggle either. Match that.
+        //
+        // Emitted TB writes `coverage.dat` at clean shutdown (see
+        // cpp_tb.rs main() emission). `verilator_coverage`
+        // post-processes the .dat into per-instance metrics that
+        // the CVDP-style scorer reads.
+        args.push("--coverage-line".into());
+        args.push("--coverage-expr".into());
     }
     args.extend([
         // Force C++20 by overriding verilator's default
