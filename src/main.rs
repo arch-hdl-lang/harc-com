@@ -99,6 +99,50 @@ enum Cmd {
         #[arg(long)]
         coverage: bool,
     },
+    // ── Learning store (sister to `arch advise` and friends, port of
+    // arch-com/src/learn.rs). Every `harc check` / `harc sim` records
+    // its failure→fix pairs into `~/.harc/learn/events.jsonl`; the
+    // subcommands below let users (and agents) interact with the store
+    // and retrieve past fixes. All on-device, no network. ─────────────
+    /// Retrieve past error→fix pairs matching the query (BM25).
+    Advise {
+        /// Free-text query (matched against error codes, messages, diffs).
+        /// May be omitted when `--from-stderr` is set.
+        query: Vec<String>,
+        /// Number of top results to print.
+        #[arg(short = 'k', long, default_value_t = 3)]
+        top: usize,
+        /// Read the query from stdin (e.g.
+        /// `harc check foo.harc 2>&1 | harc advise --from-stderr`).
+        #[arg(long)]
+        from_stderr: bool,
+    },
+    /// Rebuild the BM25 retrieval index over `~/.harc/learn/events.jsonl`.
+    /// Run this after a batch of new error→fix pairs; `harc advise`
+    /// works without an explicit index but a freshly-built one gives
+    /// better IDF weighting.
+    LearnIndex,
+    /// Show stats about the local learning store (event counts by
+    /// error_code, total store size).
+    LearnStats,
+    /// Delete the entire local learning store at `~/.harc/learn/`.
+    LearnClear,
+    /// Remove individual events from the learning store by filter.
+    /// Combine filters freely; an event is removed if ANY filter matches.
+    LearnPrune {
+        /// Remove events whose error_code equals this string.
+        #[arg(long)]
+        code: Option<String>,
+        /// Remove events whose diff/message/file_path contains this substring.
+        #[arg(long)]
+        contains: Option<String>,
+        /// Remove events older than this many days.
+        #[arg(long)]
+        older_than_days: Option<u64>,
+        /// Report what would be removed without modifying the store.
+        #[arg(long)]
+        dry_run: bool,
+    },
     // Future, mirroring ARCH:
     //   Build  — transpile to SystemVerilog + UVM (spec §10.2, phase 5)
     //   Formal — emit BTOR2 / SMT-LIB2 (spec §10.3, phase 4)
@@ -107,11 +151,138 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Check { files, ast } => cmd_check(files, ast),
+        Cmd::Check { files, ast } => learn_wrap(&files, || cmd_check(files.clone(), ast)),
         Cmd::Fmt { file, write } => cmd_fmt(file, write),
-        Cmd::Sim { files, dut, sv, top, test, outdir, seed, emit_only, arch_bin, mt, coverage } =>
-            cmd_sim(files, dut, sv, top, test, outdir, seed, emit_only, arch_bin, mt, coverage),
+        Cmd::Sim { files, dut, sv, top, test, outdir, seed, emit_only, arch_bin, mt, coverage } => {
+            let captured = files.clone();
+            learn_wrap(&captured, || cmd_sim(
+                files.clone(), dut.clone(), sv.clone(), top.clone(), test.clone(),
+                outdir.clone(), seed, emit_only, arch_bin.clone(), mt, coverage,
+            ))
+        }
+        Cmd::Advise { query, top, from_stderr } => cmd_advise(query, top, from_stderr),
+        Cmd::LearnIndex => {
+            let n = harc::learn::build_index().map_err(|e| miette::miette!("{}", e))?;
+            eprintln!("Indexed {n} events.");
+            Ok(())
+        }
+        Cmd::LearnStats => {
+            harc::learn::print_stats().map_err(|e| miette::miette!("{}", e))?;
+            Ok(())
+        }
+        Cmd::LearnClear => {
+            harc::learn::clear_store().map_err(|e| miette::miette!("{}", e))?;
+            eprintln!("Cleared ~/.harc/learn/");
+            Ok(())
+        }
+        Cmd::LearnPrune { code, contains, older_than_days, dry_run } => {
+            let (kept, removed) = harc::learn::prune(
+                code.as_deref(),
+                contains.as_deref(),
+                older_than_days,
+                dry_run,
+            ).map_err(|e| miette::miette!("{}", e))?;
+            if dry_run {
+                eprintln!("[dry-run] would remove {removed} event(s); {kept} would remain.");
+            } else {
+                eprintln!("Removed {removed} event(s); {kept} remain.");
+            }
+            Ok(())
+        }
     }
+}
+
+/// Wrap a `harc check` / `harc sim` invocation with learning capture.
+/// Honors `HARC_NO_LEARN=1` opt-out. On failure, stashes a pending
+/// record per input file; on success, pairs with any prior pending
+/// record to emit an `error_fix` event. Also prints an inline
+/// `💡 harc advise found N similar past fixes` hint when the store
+/// has past matches for the failing message.
+fn learn_wrap<F>(files: &[PathBuf], f: F) -> miette::Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let enabled = harc::learn::is_enabled();
+    if enabled {
+        let _ = harc::learn::maybe_print_first_run_notice();
+    }
+    let result = f();
+    if !enabled {
+        return result;
+    }
+    match &result {
+        Ok(()) => {
+            for file in files {
+                let path_str = file.display().to_string();
+                if let Ok(src) = fs::read_to_string(file) {
+                    if let Ok(Some(ev)) = harc::learn::record_success_if_pending(&path_str, &src) {
+                        eprintln!("📚 Learned: [{}] {}", ev.error_code, ev.diff_summary);
+                    }
+                }
+            }
+        }
+        Err(report) => {
+            let msg = format!("{report:?}");
+            let code = harc::learn::classify_error(&msg);
+            for file in files {
+                let path_str = file.display().to_string();
+                if let Ok(src) = fs::read_to_string(file) {
+                    let _ = harc::learn::record_failure(&path_str, &code, &msg, &src);
+                }
+            }
+            // Inline hint: if the local store has similar past fixes,
+            // tell the user. `peek` doesn't bump retrieval counters.
+            let query = format!("{code} {msg}");
+            if let Ok(hits) = harc::learn::peek(&query, 3) {
+                if !hits.is_empty() {
+                    let suggest = hits[0].event.error_code.clone();
+                    eprintln!(
+                        "💡 harc advise found {} similar past fix{} — run `harc advise \"{}\"` to see them.",
+                        hits.len(),
+                        if hits.len() == 1 { "" } else { "es" },
+                        suggest,
+                    );
+                }
+            }
+        }
+    }
+    result
+}
+
+/// `harc advise <query>` — retrieve top-K past error→fix pairs.
+fn cmd_advise(query: Vec<String>, top: usize, from_stderr: bool) -> Result<()> {
+    let mut q = query.join(" ");
+    if from_stderr {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf).into_diagnostic()?;
+        if !buf.trim().is_empty() {
+            if !q.is_empty() { q.push(' '); }
+            q.push_str(buf.trim());
+        }
+    }
+    if q.trim().is_empty() {
+        return Err(miette::miette!(
+            "empty query — pass a query string or pipe via --from-stderr"
+        ));
+    }
+    let matches = harc::learn::advise(&q, top).map_err(|e| miette::miette!("{}", e))?;
+    if matches.is_empty() {
+        eprintln!("No matches.");
+        return Ok(());
+    }
+    for (i, m) in matches.iter().enumerate() {
+        println!(
+            "── match #{} (score {:.3}, retrieved {}×) ──────────────────────",
+            i + 1, m.score, m.retrieved_count
+        );
+        println!("  code:    {}", m.event.error_code);
+        println!("  message: {}", m.event.error_message);
+        println!("  file:    {}", m.event.file_path);
+        println!("  diff:    {}", m.event.diff_summary);
+        println!();
+    }
+    Ok(())
 }
 
 /// Resolve `use Name;` items in the parsed test files against a small
