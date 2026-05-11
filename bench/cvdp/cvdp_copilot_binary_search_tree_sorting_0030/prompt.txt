@@ -1,0 +1,51 @@
+Implement a System Verilog testbench named `binary_search_tree_search_node_tb` to generate stimuli for a `search_binary_search_tree` module that performs a search for a given key in a binary search tree (BST). 
+
+## Design Specification:
+
+The BST is a structure formed where each node contains a key, with its `left_child` containing `keys` less than or equal to the node, and its `right_child` containing `keys` greater than the node. The module locates the position of the `search_key` in the array sorted with the constructed BST. The position where the `search_key` is located is based on its **position in the sorted array** (sorted such that the smallest element is at index 0 and the largest element is at index `ARRAY_SIZE`-1). The array is not sorted in this module. However, the BST is constructed in a way that traversing to the nodes results in a sorted array. The module doesn't wait for the complete BST to be traversed. As soon as the `search_key` is found and its position is located, the module stops its search and transitions to the final state. 
+
+**Parameterization**
+
+- **ARRAY_SIZE**: Specifies the number of elements in the input array.
+  - Default: 15
+- **DATA_WIDTH**: Specifies the bit-width of each array element.
+  - Default: 16
+
+### Inputs:
+- `[ARRAY_SIZE*DATA_WIDTH-1:0] keys`: A packed array containing the node values of the BST.
+- `[ARRAY_SIZE*($clog2(ARRAY_SIZE)+1)-1:0] left_child`: A packed array containing the left child pointers for each node in the BST.
+- `[ARRAY_SIZE*($clog2(ARRAY_SIZE)+1)-1:0] right_child`: A packed array containing the right child pointers for each node in the BST.
+- `[$clog2(ARRAY_SIZE):0] root`: The index of the root node (always 0 except for an empty BST, assuming the BST is constructed such that the first element in the arrays corresponds to the root node).  For an empty BST, `root` is assigned an invalid index where all bits are set to 1; Eg: 15 (for ARRAY_SIZE = 7) 
+- `[DATA_WIDTH-1:0] search_key`: The key to search for in the BST.
+- `start`: 1-Bit active high signal to initiate the search (1 clock cycle in duration).
+- `clk`: Clock Signal. The design is synchronized to the positive edge of this clock.
+- `reset`: Asynchronous active high reset to reset all control signal outputs to zero and `key_position` to null pointer (all 1s).
+
+### Outputs
+- `[$clog2(ARRAY_SIZE):0] key_position`: The position of the `search_key` in the BST with respect to its sorted position. Updated at the same time when the `complete_found` is asserted.  If the `search_key` is not found in the constructed BST or if the tree is empty (indicated by all entries in `left_child`, `right_child` being null pointers, and all `keys` being zero) the module sets all the bits of `key_position` to 1 (null position)
+- `complete_found`: 1-Bit active high signal that is asserted once the search is complete, indicating that the key was found (1 clock cycle in duration). If the `search_key` is not found in the constructed BST or if the tree is empty `complete_found` remains at 0.
+- `search_invalid`: 1-bit Active high signal that is asserted when the BST is empty or when the `search_key` doesn't exist in the given BST (1 clock cycle in duration). 
+
+### Testbench Requirements:
+
+**Instantiation**
+
+- **Module Instance**: The module `search_binary_search_tree` should be instantiated as `dut`, with all input and output signals connected for testing.
+
+**Input Generation**
+
+- **BST Generation**: 
+    - The testbench must generate multiple test cases with different random values for `keys`, `left_child`, and `right_child` which abides by the structure of the BST where each node contains a key, with its `left_child` containing `keys` less than the node, and its `right_child` containing `keys` greater than the node. 
+    - To accurately construct a BST including `keys`, `left_child`, and `right_child`, create a separate submodule that generates different BSTs based on the input array provided. 
+    - To generate a BST, different input arrays can be provided as input to the new submodule responsible for constructing the BST.
+    - Test with all possible combinations to achieve maximum coverage. Include the corner cases, such as input arrays with all values equal and already sorted arrays in ascending or descending order.
+    - Testbench must also include a scenario with an empty tree where all bits of `root`, `left_child`, and `right_child` are set to one, and `keys` are set to 0.
+ 
+- **Search Key (`search_key`) Generation**: 
+    - The testbench must generate different random values of `search_key` where the random values generated must be one of the values in the `keys` for a given BST input. To be able to traverse the tree in worst-case scenarios, tests should include `search_key` generation for the smallest, largest value in the given BST. 
+    - To handle the invalid case (`search_invalid`), the testbench must generate `search_key`, which is not present within the given BST. 
+  
+**Control Signal Handling**:
+
+- The `start` signal should be asserted to trigger the searching process, and the testbench must wait until the `complete_found` signal is asserted (to wait for the searching to be completed) when the search is valid or wait until the `search_invalid` is asserted when the `search_key` is not found within the tree or when the tree is empty. 
+- The new inputs `keys`, `left_child`,  `right_child`, and `search_key`  along with the `start` signal must only be asserted after the `complete_found` or `search_invalid` signal for the previous input array is asserted to high. This process must be repeated to cover different sequences of input array, which means different BSTs will be generated. It must be noted that while the `complete_found` or `search_invalid` signal is high, the new input `keys`, `left_child`, `right_child`, `search_key`, and `start` must not be asserted to avoid loss of `start` and new inputs. 

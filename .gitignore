@@ -11,3 +11,4 @@ HANDOFF.html
 # CVDP benchmark scorer outputs — coverage.dat, obj_dir, build logs.
 # Sources stay tracked (dut/, tb/, meta.json, prompt.txt, gold/).
 bench/cvdp/*/build/
+bench/cvdp/*/build_smoke/

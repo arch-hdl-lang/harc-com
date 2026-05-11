@@ -1,0 +1,191 @@
+Complete the given partial System Verilog Testbench `tb_ddm_cache`.The testbench must instantiate the `ddm_cache` RTL module and provide input stimulus for it, focusing exclusively on generating comprehensive test vectors rather than building a full testbench. The data cache handles read and write operations from the CPU, along with memory access operations. The module supports both cached memory accesses and uncached I/O port accesses.
+
+## Module Interface
+## 1. Inputs:
+
+- `clk(1-bit)`: Clock signal. The module operates on the rising edge of `clk`. It synchronizes the operations within the cache logic.
+
+- `rst_n(1-bit)`: 1-bit asynchronous, active-low reset signal. This is triggered on a negedge (falling edge) of the reset signal. When rst_n is asserted (`rst_n` = 0), all the cache locations are invalidated
+
+- `cpu_addr (32-bit,[31:0])`: A 32-bit input representing the memory address issued by the CPU for a read or write operation. This address is used by the cache to determine if a cache hit or miss occurs.
+
+- `cpu_dout (32-bit,[31:0])`: A 32-bit input that carries data emitted by the CPU when writing to memory.
+
+- `cpu_strobe(1-bit)`: A ACTIVE HIGH signal indicating that the CPU wants to perform a read or write operation.
+
+- `cpu_rw:(1-bit)` A control signal indicating the type of operation to be performed by the CPU. cpu_rw = 1 represents a memory write operation, while cpu_rw = 0 represents a memory read operation.
+
+- `uncached(1-bit)`: A control signal where uncached = 1 indicates that the operation is accessing an uncached I/O port (instead of memory). When uncached = 0, a regular memory operation is performed.
+
+- `mem_dout(32-bit, [31:0])`: A 32-bit input that carries data from memory. This data is provided to the cache when there is a cache miss and is forwarded to the CPU if it is a read operation.
+
+- `mem_ready(1-bit)`: A signal indicating that memory is ready with the data to be provided to the cache
+
+## 2. Outputs:
+
+- `cpu_din (32-bit, [31:0])`: A 32-bit output that carries data to the CPU during a read operation. This can either be data from the cache or from memory in the event of a cache miss.
+
+- `mem_din(32-bit, [31:0])`: A 32-bit output carrying data from the CPU to memory when via cache during a write operation
+
+- `cpu_ready(1-bit)`: A signal indication from the cache that data is ready for the CPU to be read.
+
+- `mem_strobe(1-bit)`: A signal that indicates that the memory is going to be accessed by the cache for a read or write operation
+
+- `mem_rw`: The read/write control signal for memory. It reflects the cpu_rw signal, indicating whether the operation is a read (0) or write (1) to memory.
+
+- `mem_addr(32-bit ,[31:0])`: A 32-bit output representing the memory address sent to the memory during the read/write operation from the cache.
+
+- `cache_hit(1-bit)` - A ACTIVE HIGH signal indicating memory location is available in Cache.
+
+- `cache_miss(1-bit)` - A ACTIVE HIGH signal indicating memory location is not available in Cache.
+
+- `d_data_out(32-bit,[31:0])` - Data at a particular index(location) of the cache.
+
+
+## Instantiation :
+The testbench instantiates the `ddm_cache` module as dut and connects the signals between the module and the testbench. Each input and output from the DUT is connected to its corresponding signal in the testbench.
+
+## Input Generation and Validation:
+
+- Clock Generation: The clock signal `clk` is generated using an always block that toggles the clock every 5 time units.
+
+- Reset: The reset signal `rst_n` is asserted at the beginning of the simulation to ensure the cache is initialized in a known state. After a short period (10 time units), the reset is deasserted.
+
+- Stimulus: Several test cases are applied to simulate various operations of the cache. These test cases cover a range of scenarios such as cache misses, cache writes, and uncached accesses. For each case, the relevant signals (address, data, control signals) are set, followed by a brief wait period to allow the DUT to respond.
+
+  - Test Case 1: A cache read miss occurs when the CPU accesses address 0x00000000. The memory provides data (0x11111111), and the CPU reads this data from memory after the cache miss.
+
+  - Test Case 2: A cache write occurs when the CPU accesses address 0x00000004 and writes data (0xAABBCCDD) into the cache.
+
+  - Test Case 3: A cache read hit occurs when the CPU accesses address 0x00000000. The cache provides the previously cached data (0x11111111) without needing to access memory.
+
+  - Test Case 4: A cache write and read after reset occur when the CPU writes to address 0x00000010 and then reads the data back from the cache after a reset.
+
+  - Test Case 5: An edge case occurs when the CPU writes to address 0x00000014 with two different values (0xDEADBEEF and 0xFACEFEED), followed by a read operation. The cache should return the most recent value (0xFACEFEED).
+
+   - Test Case 6: A cache miss and cache write with different memory delays occur when the CPU performs a write operation at address 0x00000018 while memory readiness (`mem_ready`) changes. The cache should handle these delays properly.
+
+   - Test Case 7: An uncached IO port access occurs when the CPU writes to IO port address 0xF0000000. This access bypasses the cache and directly interacts with the IO port.
+
+   - Test Case 8: Cache read and write operations with randomized addresses occur when the CPU performs random read and write operations. The cache should handle these operations correctly.
+
+   - Test Case 9: A cache invalidation occurs when the CPU writes data (0xDEADBEAF) to address 0x00000020, and then performs a read, resulting in a cache miss. The cache fetches new data (0xBBBBBBBB) from memory.
+
+   - Test Case 10: Boundary address tests occur when the CPU accesses the first (0x00000000) and last (0xFFFFFFFC) cacheable addresses. These boundary cases are tested to ensure correct cache handling at the limits of the address space.
+   
+   - Test Case 11: Multiple cache misses and hits in sequence occur when the CPU performs operations at sequential addresses (0x00000024, 0x00000028). The cache should handle the misses and hits correctly.
+
+   - Test Case 12: A memory read with a cache miss and delayed memory readiness occurs when the CPU reads from address 0x00000050. The memory is initially not ready (`mem_ready` = 0), causing a delay before the CPU can read the data after the cache miss. The memory readiness flag is toggled to allow the read after a short delay.
+
+## Module Functionality:
+- Asynchronous Reset: When `rst_n` is asserted (`rst_n = 0`), all cache locations are invalidated This ensures the cache is reset to a known state.
+
+- Cache Operation: On each rising edge of clk, the cache processes the incoming requests from the CPU:
+
+   - Cache Read: If the CPU issues a read request and the address is present in the cache (`cache hit`), the corresponding data is returned to the CPU without accessing memory.
+
+  - Cache Miss: If the CPU accesses a memory address that is not cached (`cache miss`), the cache issues a memory read request to the memory. Once the data is retrieved from memory, it is stored in the cache for future accesses.
+
+ - Cache Write: If the CPU writes data, the cache writes the data into the cache entry corresponding to the address. If the operation is not cached (i.e., `uncached = 1`), the data is written directly to memory instead of the cache.
+
+ - Cache Management: Each cache entry has a valid bit, a tag, and data. The tag is used to determine whether a cache entry matches the requested address, and the valid bit indicates whether the entry contains valid data. When a write operation occurs, the corresponding cache entry is updated with the new tag and data.
+
+ - Memory Read/Write: If a cache miss occurs, the module performs a memory read operation (if `cpu_rw = 0`), waits for the memory to become ready (`mem_ready`), and then forwards the data to the CPU. Similarly, for write operations (`cpu_rw = 1`), the data is written to memory after it is cached.
+
+ - Cache Write Signal: The cache write signal (`cache_write`) is asserted when a write operation occurs, either because the CPU is performing a write or because the cache is updating its contents after a cache miss.
+
+**Partial Test Stimulus Generator Code :**
+``` verilog
+module tb_ddm_cache;
+
+  logic clk;
+  logic rst_n;
+  logic [31:0] cpu_addr;
+  logic [31:0] cpu_dout;
+  logic cpu_strobe;
+  logic cpu_rw;
+  logic uncached;
+  logic [31:0] mem_dout;
+  logic mem_ready;
+  logic [31:0] cpu_din;
+  logic [31:0] mem_din;
+  logic cpu_ready;
+  logic mem_strobe;
+  logic mem_rw;
+  logic [31:0] mem_addr;
+  logic cache_hit;
+  logic cache_miss;
+  logic [31:0] d_data_dout;
+
+  ddm_cache dut (
+    .clk(clk),
+    .rst_n(rst_n),
+    .cpu_addr(cpu_addr),
+    .cpu_dout(cpu_dout),
+    .cpu_strobe(cpu_strobe),
+    .cpu_rw(cpu_rw),
+    .uncached(uncached),
+    .mem_dout(mem_dout),
+    .mem_ready(mem_ready),
+    .cpu_din(cpu_din),
+    .mem_din(mem_din),
+    .cpu_ready(cpu_ready),
+    .mem_strobe(mem_strobe),
+    .mem_rw(mem_rw),
+    .mem_addr(mem_addr),
+    .cache_hit(cache_hit),
+    .cache_miss(cache_miss),
+    .d_data_dout(d_data_dout)
+  );
+
+  always begin
+    #5 clk = ~clk;
+  end
+
+  
+  initial begin
+    clk = 0;
+    rst_n = 0;
+    cpu_addr = 32'h00000000;
+    cpu_dout = 32'h12345678;
+    cpu_strobe = 0;
+    cpu_rw = 0;
+    uncached = 0;
+    mem_dout = 32'h00000000;
+    mem_ready = 1;
+
+    #10 rst_n = 1;
+    #10;
+
+    $display("Test case 1: Cache Read Miss (CPU address 0x00000000)");
+    cpu_addr = 32'h00000000;
+    cpu_dout = 32'h12345678;
+    cpu_strobe = 1;
+    cpu_rw = 0;
+    uncached = 0;
+    mem_dout = 32'h11111111;
+    #10;
+    cpu_strobe = 0;
+    #50;
+    
+    $display("Test case 2: Cache Write (CPU address 0x00000004)");
+    cpu_addr = 32'h00000004;
+    cpu_dout = 32'hAABBCCDD;
+    cpu_strobe = 1;
+    cpu_rw = 1;
+    uncached = 0;
+    #10;
+    cpu_strobe = 0;
+    #10;
+    
+    $display("Test case 3: Cache Read Hit (CPU address 0x00000000, should hit cached data)");
+    cpu_addr = 32'h00000000;
+    cpu_strobe = 1;
+    cpu_rw = 0;
+    uncached = 0;
+    #10;
+    cpu_strobe = 0;
+    #10;
+        
+    // Insert the code for the remaining test cases here
+   ```

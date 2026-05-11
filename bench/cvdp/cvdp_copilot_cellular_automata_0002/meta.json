@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_cellular_automata_0002",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "pseudoRandGenerator_ca_top",
+  "dut_module": "pseudoRandGenerator_ca",
+  "target_coverage": 100,
+  "auto_wrapper": "pseudoRandGenerator_ca_top.sv",
+  "n_ports": 4,
+  "clock_inputs": [
+    "clock"
+  ],
+  "multi_clock": false
+}

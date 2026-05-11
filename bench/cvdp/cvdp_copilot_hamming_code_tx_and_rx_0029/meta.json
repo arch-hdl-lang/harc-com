@@ -1,0 +1,14 @@
+{
+  "id": "cvdp_copilot_hamming_code_tx_and_rx_0029",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "hamming_code_tx_for_4bit_top",
+  "dut_module": "hamming_code_tx_for_4bit",
+  "target_coverage": 91,
+  "auto_wrapper": "hamming_code_tx_for_4bit_top.sv",
+  "n_ports": 2,
+  "clock_inputs": [],
+  "multi_clock": false
+}

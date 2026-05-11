@@ -1,0 +1,50 @@
+Create a testbench that only supplies stimulus to a `hamming_code_tx_for_4bit` module, which encodes 4-bit input data `data_in` into an 8-bit output `data_out` using Hamming code principles for error detection and correction. Hamming code helps generate parity bits, which are combined with the original data to detect and correct single-bit errors.
+
+
+---
+## **Testbench Description**
+
+**Inputs**
+
+- Registers: `data_in` is a 4-bit register that provides binary inputs to the module.
+
+**Outputs**
+
+- Wire: An 8-bit wire, `data_out`, with 4 data bits, 3 parity bits and an extra redundant bit added to pad the output to 8 bits.
+
+---
+
+## **Instantiation**
+
+- Module Instance: The `hamming_code_tx_for_4bit` module should be instantiated as **uut_transmitter**, with the input and output signals connected for testing.
+
+---
+
+## **Input Generation and Validation**
+
+- Input Generation: The testbench must generate pairs of 4-bit binary values for `data_in` to cover all possibilities, including corner cases.
+- Corner cases Input Generation: The testbench must generate pairs of 4-bit binary values from minimum value 0 to maximum 2<sup>4</sup> - 1
+- Stabilization Period: After setting each pair of inputs, the testbench waits 10 time units to ensure the outputs have stabilized before asserting new values.
+
+---
+
+## **RTL Specification:**
+
+1. **Module interface:** 
+
+- Input:
+     `data_in[3:0]`: A 4-bit input signal representing the original data to be transmitted.
+- Output:
+     `data_out[7:0]`: An 8-bit output signal representing the encoded data.
+
+
+2. **Module Functionality**:
+
+The module encodes the data based on the following steps:
+
+1. `data_out[0]`: This bit is fixed to 0 as a redundant bit.
+2. `data_out[1]`, `data_out[2]` `data_out[4]`: Parity bits , calculated using the XOR operation to ensure even parity of specific input bits.
+3. `data_out[3]`, `data_out[5]`, `data_out[6]`, `data_out[7]`: These are assigned `data_in[0]`, `data_in[1]`, `data_in[2]`, `data_in[3]` respectively, preserving the order of the input data.
+   
+3 **Timing and Synchronization:**
+- This design is purely combinational. The output must be immediately updated with a change in the input.

@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_encoder_8b10b_0026",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "encoder_8b10b_top",
+  "dut_module": "encoder_8b10b",
+  "target_coverage": 100,
+  "auto_wrapper": "encoder_8b10b_top.sv",
+  "n_ports": 7,
+  "clock_inputs": [
+    "clk_in"
+  ],
+  "multi_clock": false
+}

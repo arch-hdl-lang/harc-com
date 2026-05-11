@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_IIR_filter_0016",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "iir_filter",
+  "dut_module": "iir_filter",
+  "target_coverage": 95,
+  "auto_wrapper": null,
+  "n_ports": 4,
+  "clock_inputs": [
+    "clk"
+  ],
+  "multi_clock": false
+}

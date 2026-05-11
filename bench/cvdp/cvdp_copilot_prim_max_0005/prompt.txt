@@ -1,0 +1,87 @@
+Create a **testbench** to apply **stimulus** to the `prim_max_find` module. This module implements a **binary tree-based maximum value finder** that determines the highest value from multiple input sources and provides the corresponding index. The testbench must apply a range of test cases to validate correct maximum value selection, index resolution, and handling of various input conditions.
+
+---
+
+### **Inputs:**
+
+- `clk_i`: **Clock signal with a 10ns period.**
+- `rst_ni`: **Active-low reset signal.**
+- `values_i`: **Flattened `NumSrc * Width`-bit wide input containing all values.**
+- `valid_i`: **`NumSrc`-bit wide signal indicating which inputs are valid.**
+
+### **Outputs:**
+
+- `max_value_o`: **`Width`-bit output representing the maximum value among valid inputs.**
+- `max_idx_o`: **`SrcWidth`-bit output indicating the index of the maximum value.**
+- `max_valid_o`: **Indicates whether any valid inputs were provided.**
+
+---
+
+### **Instantiation**
+
+The testbench must instantiate a single instance of the `prim_max_find` module:
+
+- **Maximum Finder Module (`dut`)**: Instantiated with `NumSrc=8` and `Width=8` to test typical input conditions.
+
+---
+
+### **Testbench Requirements**
+
+The testbench must apply a **wide range of test patterns** to ensure correct operation under all input conditions:
+
+1. **Clock Generation:**
+   - `clk_i` must toggle every **5 time units**, ensuring a **10 ns clock period**.
+
+2. **Reset Handling:**
+   - `rst_ni` must be **asserted for multiple cycles** before deasserting.
+   - The module must correctly initialize outputs when `rst_ni` is released.
+
+3. **Stimulus Generation Strategy:**
+   - The testbench **must not verify outputs** (only generate inputs).
+   - The following test sequences must be executed:
+     - **All Invalid Inputs**: Assign `valid_i = 0` for all inputs.
+     - **Single Valid Input**: One valid source with all others invalid.
+     - **Multiple Valid Inputs (Distinct Values)**: Various active sources with different values.
+     - **Multiple Valid Inputs (Duplicate Maximums)**: Multiple sources with the same highest value.
+     - **Maximum Value at First and Last Index**: Ensures correct tie-breaking at input boundaries.
+     - **Sequentially Increasing and Decreasing Values**: Tests proper priority handling.
+     - **Alternating Valid Input Patterns**: Exercises irregular valid signal transitions.
+     - **Extended Randomized Testing**: Generates **20 iterations** of randomized valid inputs and values.
+
+4. **Handling Continuous and Edge Cases:**
+   - The testbench must ensure **robust performance** under all valid/invalid input conditions.
+   - **Pipeline behavior** must be properly exercised through random valid signal transitions.
+   - **Valid input bursts and sporadic input toggling** must be tested.
+
+5. **Waveform Generation:**
+   - The testbench must generate a `.vcd` waveform file to allow waveform analysis.
+
+---
+
+### **Coverage and Compliance**
+
+- The testbench must ensure **high coverage** across all possible input combinations.
+- The **DUT instance name `dut` must be explicitly used** for instantiation.
+
+---
+
+### **Test Plan Overview**
+
+The testbench must ensure **96%+ input stimulus coverage** by applying:
+
+- **Valid data selection** across different test cases.
+- **Edge case handling** for minimum, maximum, and undefined values.
+- **Randomized input variations** to ensure robustness.
+- **Pipeline behavior verification** to confirm proper propagation of results.
+- **Handling of multiple maximum values** to ensure correct index selection.
+
+This testbench will provide a **comprehensive input stimulus environment** for `prim_max_find`, ensuring correct operation under various test conditions.
+
+---
+
+### **Note:**
+- The testbench **must only generate stimulus** without verifying outputs.
+- The **DUT instance name `dut` must be explicitly used** for instantiation.
+- **Ensure the maximum possible input coverage** without adding assertions or comparisons.
+
+Can you implement a **SystemVerilog testbench** with the above stimulus requirements?

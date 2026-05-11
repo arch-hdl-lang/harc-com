@@ -1,0 +1,14 @@
+{
+  "id": "cvdp_copilot_binary_to_BCD_0030",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "binary_to_bcd_top",
+  "dut_module": "binary_to_bcd",
+  "target_coverage": 90,
+  "auto_wrapper": "binary_to_bcd_top.sv",
+  "n_ports": 2,
+  "clock_inputs": [],
+  "multi_clock": false
+}

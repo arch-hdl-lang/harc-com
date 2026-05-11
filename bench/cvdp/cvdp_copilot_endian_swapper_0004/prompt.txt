@@ -1,0 +1,93 @@
+Develop a **SystemVerilog testbench** to generate **input stimulus** for the **`endian_swapper`** module with **DATA_BYTES = 8** (64-bit data). The testbench must systematically **apply input sequences** to exercise different functional behaviors of the DUT, ensuring that **all edge cases, control signals, and buffering mechanisms are triggered**. The testbench **must not include any checker logic or pass/fail criteria**—it is purely **stimulus-driven**.
+
+---
+
+## **Design Details**  
+
+### **1. Functional Behavior**  
+
+The endian swapper module processes input data and optionally swaps byte order based on control register settings. It follows an AXI Stream-based handshake mechanism to handle input and output transactions while maintaining buffering for flow control.
+
+#### **1.1 Parameters**  
+- **`DATA_BYTES = 8`** → Defines the **byte width** of the data stream (`64 bits`).  
+- **`CLK_PERIOD = 10 ns`** → The system runs at **100 MHz** (`clk` toggles every `5 ns`).  
+- **`TIMEOUT = 1000`** → Defines the **maximum wait cycles** for handshake events.  
+
+#### **1.2 Input Ports**  
+- `clk` → **100 MHz clock** controlling data transfer.  
+- `reset_n` → **Active-low reset** for DUT initialization.  
+- `stream_in_data [63:0]` → **64-bit input data bus**.  
+- `stream_in_empty [2:0]` → **Indicates number of unused bytes** in input.  
+- `stream_in_valid` → **Asserted when input data is valid**.  
+- `stream_in_startofpacket` → **Marks start of packet** in input stream.  
+- `stream_in_endofpacket` → **Marks end of packet** in input stream.  
+- `stream_out_ready` → **Downstream ready signal** for output transfer.  
+- `csr_address [1:0]` → **CSR register address**.  
+- `csr_read` → **CSR read enable**.  
+- `csr_write` → **CSR write enable**.  
+- `csr_writedata [31:0]` → **32-bit CSR write data**.  
+
+#### **1.3 Output Ports**  
+- `stream_in_ready` → **DUT ready to accept input data**.  
+- `stream_out_data [63:0]` → **64-bit output data bus**.  
+- `stream_out_empty [2:0]` → **Number of unused bytes** in output.  
+- `stream_out_valid` → **Asserted when output data is valid**.  
+- `stream_out_startofpacket` → **Start of packet in output stream**.  
+- `stream_out_endofpacket` → **End of packet in output stream**.  
+- `csr_readdata [31:0]` → **CSR readback value**.  
+- `csr_readdatavalid` → **Indicates valid CSR read response**.  
+- `csr_waitrequest` → **Indicates CSR access is stalled**.  
+
+---
+
+## **Testbench Structure**  
+
+### **1. Clock Generation**  
+- Generate a **100 MHz clock** (`clk`) by toggling it **every 5 ns** (`CLK_PERIOD/2`).  
+
+### **2. Reset Sequencing**  
+- Assert `reset_n = 0` for a few clock cycles, then deassert it to **initialize the DUT**.  
+
+### **3. DUT Instantiation**  
+- Instantiate the `endian_swapper` module with **DATA_BYTES = 8** and connect all required input/output signals.  
+
+### **4. Stimulus Sequences**  
+The testbench must **apply a variety of test cases** to exercise input conditions, buffer behavior, and CSR interactions.
+
+#### **4.1 AXI Stream Data Transfers**  
+- **Basic Operation (No Swap)** → Send a **64-bit word** with byte-swapping disabled.  
+- **Byte Swapping Enabled** → Enable byte-swapping via CSR and resend test data.  
+- **Packet Boundary Handling** → Send **multi-word packets** with `startofpacket` and `endofpacket` signals toggling.  
+
+#### **4.2 Flow Control and Buffering**  
+- **Flow Control Handling** → Deassert `stream_out_ready` while sending data, then re-enable it to test backpressure handling.  
+- **Buffering Mechanism** → Send **multiple packets** while `stream_out_ready` is **low**, then assert it to drain data.  
+
+#### **4.3 CSR Operations**  
+- **CSR Read/Write** → Perform CSR **write and readback** operations to configure DUT settings.  
+- **CSR Access in Middle of Packet** → Issue a **CSR read while data transfer is ongoing**, ensuring the DUT handles CSR operations correctly.  
+
+#### **4.4 Edge Cases**  
+- **Zero Data Handling** → Send an **all-zero 64-bit word** and observe behavior.  
+- **Maximum Data Handling** → Send an **all-ones 64-bit word** (`0xFFFFFFFFFFFFFFFF`).  
+- **Partial Empty Bytes** → Vary `stream_in_empty` values and observe how the DUT processes incomplete words.  
+
+---
+
+## **Simulation Requirements**  
+
+### **1. Waveform Generation**  
+- Generate a **VCD waveform file** (`endian_swapper_tb.vcd`) for **post-simulation analysis**.  
+
+### **2. AXI Stream transactions**  
+- Ensure **proper handshake mechanisms** (`valid`-`ready` interactions) during **data transfer sequences**.  
+
+### **3. CSR and Data Processing Interactions**  
+- The testbench should **issue CSR commands mid-packet** and observe how the DUT handles **simultaneous control and data operations**.  
+
+---
+
+Develop a **testbench** that:  
+- **Generates stimulus** to exercise `endian_swapper` across multiple functional scenarios.  
+- **Ensures input variations cover** normal operation, byte-swapping, packet boundaries, flow control, and CSR interactions.  
+- **Executes all predefined stimulus sequences** without assertions, output verification, or pass/fail conditions.  

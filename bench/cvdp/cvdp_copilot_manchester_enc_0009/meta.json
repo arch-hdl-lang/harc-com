@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_manchester_enc_0009",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "top_manchester_top",
+  "dut_module": "top_manchester",
+  "target_coverage": 100,
+  "auto_wrapper": "top_manchester_top.sv",
+  "n_ports": 10,
+  "clock_inputs": [
+    "clk_in"
+  ],
+  "multi_clock": false
+}

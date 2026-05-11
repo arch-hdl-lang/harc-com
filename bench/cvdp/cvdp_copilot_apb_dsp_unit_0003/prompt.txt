@@ -1,0 +1,197 @@
+Create a test bench in SystemVerilog for a Verilog module named `apb_dsp_unit`. The module serves as an APB interface for configuring internal registers. These registers specify which memory addresses are used for arithmetic operations (addition or multiplication). The computed result is then made available through a designated register. The test bench should systematically generate input vectors, apply them to the module under test (MUT) and aim to achieve 100% or the maximum possible coverage.
+
+---
+## Instantiation
+
+Name the instance of the RTL as **dut**.
+
+## **RTL Parameters, Inputs - Outputs and Functional behavior**
+
+
+---
+
+### Register Descriptions
+
+1. **`r_operand_1`**  
+   - **Address:** 0x0  
+   - **Function:** Holds the memory address of the first operand.
+
+2. **`r_operand_2`**  
+   - **Address:** 0x1  
+   - **Function:** Holds the memory address of the second operand.
+
+3. **`r_Enable`**  
+   - **Address:** 0x2  
+   - **Values:**  
+     - `0`: DSP disabled  
+     - `1`: Addition mode  
+     - `2`: Multiplication mode  
+     - `3`: Data Writing mode  
+
+4. **`r_write_address`**  
+   - **Address:** 0x3  
+   - **Function:** Specifies the address in memory where data will be written.  
+   - **Default Value:** 0x00000000  
+   - **Usage:** If `r_Enable` = 3, the data in the `r_write_data` register is written to the address specified by this register.
+
+5. **`r_write_data`**  
+   - **Address:** 0x4  
+   - **Function:** Specifies the data to be written into memory.  
+   - **Default Value:** 0x00000000  
+   - **Usage:** If `r_Enable` = 3, the data in this register is written to the address specified by `r_write_address`.
+
+---
+
+### APB Interface: 
+#### Clock & Reset Signals
+- `pclk`: APB clock input for synchronous operations.  
+- `presetn`: Active-low asynchronous reset signal for system initialization.
+
+#### APB Signals
+- `paddr` (input, 10 bits): Address bus for accessing internal CSR registers and Memory.  
+- `pselx` (input): APB select signal, indicating CSR and Memory selection.  
+- `penable` (input): APB enable signal, marking transaction progression.  
+- `pwrite` (input): Write-enable signal, distinguishing read from write operations, high for write and low for read operation.
+- `pwdata` (input, 8 bits): Write data bus for sending data to CSR registers and Memory.  
+- `pready` (output, reg): Ready signal, indicating the completion of a transaction.  
+- `prdata` (output, reg, 8 bits): Read data bus for retrieving data.  
+- `pslverr` (output, reg): Error signal for invalid addresses or unsupported operations.
+
+### SRAM Interface:
+- `sram_valid`: At positive edge of this signal, data in `r_write_data` is latched to address in `r_write_address`.
+
+---
+
+### APB Protocol
+
+1. **Read Operations**  
+   - In the **READ_STATE**, drive `prdata` with the register value corresponding to `paddr`.
+   - After operation, return to **IDLE**.
+
+2. **Write Operations**  
+   - In the **WRITE_STATE**, update the register selected by `paddr` with `pwdata`.  
+   - After updating the register, return to **IDLE**.
+
+3. **Reset Behavior**  
+   - When `presetn` is deasserted (active-low), reset all outputs and internal registers to their default values:
+     - Set `pready` and `pslverr` to 0.  
+     - Clear `prdata`.  
+     - Initialize `r_operand_1`, `r_operand_2`, `r_Enable`, `r_write_address`, and `r_write_data` to 0.
+
+---
+
+### Functional Behavior
+
+1. **APB Interface Control**  
+   - Memory is accessed via the APB interface.  
+   - The operational mode is controlled by **`r_Enable`**:
+     - **Default (0x0):** DSP is disabled.  
+     - **Write Mode (0x3):** Data can be written to memory.  
+     - **Addition Mode (0x1):** Values at the addresses specified by **`r_operand_1`** and **`r_operand_2`** are added. The result is stored at address **0x5**.  
+     - **Multiplication Mode (0x2):** Values at the addresses specified by **`r_operand_1`** and **`r_operand_2`** are multiplied. The result is stored at address **0x5**.  
+   - To read computed data directly via APB, use address **0x5** and retrieve it through **`PRDATA`**.
+
+2. **Error Handling**  
+   - If a read or write operation is attempted on an address outside the defined registers, **`PSLVERR`** is driven high (`1'b1`).
+
+3. **Wait States**  
+   - This design does not support wait states. All APB read/write operations complete in two clock cycles, with **`PREADY`** always driven high (`1'b1`).
+
+4. **Memory Interface**  
+   - A 1 KB SRAM module serves as the memory.
+
+**Note:** Addresses from **0x00** to **0x05** are reserved for configuration registers.
+
+## Test Bench Requirements
+
+### Stimulus Generation
+
+#### 1. **Reset and Initialization**
+
+1. Drive `presetn` low for a defined interval.
+2. Drive `presetn` high to release reset.
+
+#### 2. **APB Write Stimulus**
+
+1. Access each **valid register** address (`0x0` to `0x4`) with:
+   - `pselx` = 1
+   - `penable` toggled appropriately
+   - `pwrite` = 1
+   - Various `pwdata` patterns (e.g., minimum, maximum, random).
+2. Perform **consecutive writes** to different registers in rapid succession.
+3. Issue a **write** to an **invalid address** (greater than `0x5`).
+4. Attempt memory writes under various `r_Enable` states, including values outside the valid range of modes.
+
+#### 3. **APB Read Stimulus**
+
+1. Read from **each valid register** address (`0x0` to `0x5`) with:
+   - `pselx` = 1
+   - `penable` toggled appropriately
+   - `pwrite` = 0
+2. Perform **back-to-back** reads of the same register and different registers.
+3. Issue a **read** to an **invalid address** (greater than `0x5`).
+4. Vary APB handshake signals, including cases with missing or incorrect enable signals.
+
+#### 4. **DSP Arithmetic Stimulus**
+
+### 4.1 **Addition Mode**
+1. Set `r_Enable` to indicate addition mode.
+2. Provide valid addresses in `r_operand_1` and `r_operand_2` that point to memory locations.
+3. Use data-writing transactions to load different data patterns into those memory addresses.
+4. Include minimal, maximal, and intermediate values to explore potential overflow and boundary conditions.
+
+##### 4.2 **Multiplication Mode**
+1. Set `r_Enable` to indicate multiplication mode.
+2. Provide valid addresses in `r_operand_1` and `r_operand_2`.
+3. Use memory transactions to populate these locations with a variety of patterns.
+4. Include edge cases that might trigger overflow scenarios.
+
+#### 5. **Memory Write Stimulus**
+
+1. Set `r_Enable` to indicate write mode.
+2. Vary `r_write_address` and `r_write_data` across:
+   - Low, high, and random valid addresses.
+   - Low, high, and random data values.
+3. Drive `sram_valid` high to trigger the memory-write mechanism.
+4. Attempt writing beyond the valid memory range.
+
+#### 6. **Error Condition Stimulus**
+
+1. Drive **invalid `r_Enable`** values beyond the defined modes.
+2. Perform APB **read/write operations** without correctly asserting `penable` or `pselx`.
+3. Access invalid or out-of-range addresses with and without proper handshake signals.
+
+#### 7. **Stress and Concurrency Stimulus**
+
+1. Issue **rapid sequences** of APB transactions (reads and writes) to valid and invalid addresses.
+2. Continuously switch `r_Enable` among different modes (addition, multiplication, write, disabled, and any invalid code).
+3. Randomize APB signals (within protocol constraints) to test corner cases of back-to-back operations.
+
+#### 8. **Full Coverage Stimulus**
+
+1. Stimulate **every register** in both read and write directions.
+2. Exercise **all operational modes** defined in the design, plus invalid ones.
+3. Drive memory addresses across the **entire valid range** and some out-of-range values.
+4. Include data patterns that explore arithmetic boundary conditions (such as overflow scenarios).
+
+#### 9. Additional Test Cases for Complete Coverage
+
+##### 9.1. Full Bit Toggling on Registers
+- Write `0xFF` and `0x00` to:
+  - `r_operand_1`
+  - `r_operand_2`
+  - `r_enable`
+  - `r_write_address`
+  - `r_write_data`
+
+##### 9.2. Memory Boundary Testing
+- Write to the **maximum valid memory address** (`10'h3FF` = 1023).
+- Attempt an **out-of-range write** (`10'h401` = 1025) when `r_enable = MODE_WRITE`.
+
+##### 9.3. Repeated Reset to Toggle Related Signals
+- Assert and deassert `presetn` **mid-test** to toggle:
+  - `pready`
+  - `pslverr`
+
+##### 9.4. Out-of-Range Address Read
+- **Read from `10'h401`** after an out-of-range write to verify `PSLVERR`.

@@ -1,0 +1,81 @@
+Develop a SystemVerilog module named `tb_image_stego` that generates input stimulus to verify the `image_stego` module. The `image_stego` module embeds bits of data into an image. Each pixel is 8 bits, and up to 4 bits can be embedded according to a `mask` control. The data bits are first XOR-encrypted by an 8-bit key. The purpose of `tb_image_stego` is to thoroughly test all features of the `image_stego` module, achieving complete functional and toggle coverage.
+
+---
+
+## Module Interface
+
+### **Parameters**
+- **`row`** *(default = 2)*  
+  Number of rows in the image.
+
+- **`col`** *(default = 2)*  
+  Number of columns in the image.
+
+- **`EMBED_COUNT_WIDTH`** *(default = 3)*  
+  Width of the `embedded_pixel_count` output.
+
+*(Each pixel is 8 bits, so total bits in `img_in` and `img_out` is `row * col * 8`.)*
+
+---
+
+## Port List
+
+| **Port Name**                                | **Direction** | **Width**                     | **Description**                                                                                                                      |
+|----------------------------------------------|---------------|-------------------------------|--------------------------------------------------------------------------------------------------------------------------------------|
+| `img_in[(row*col*8)-1:0]`                    | **Input**     | `row*col*8` bits              | Contains the original image data, 8 bits per pixel.                                                                                  |
+| `data_in[(row*col*4)-1:0]`                   | **Input**     | `row*col*4` bits              | Data bits to be embedded, allowing up to 4 bits per pixel.                                                                           |
+| `bpp[2:0]`                                   | **Input**     | 3 bits                        | Indicates how many bits per pixel to embed: `000=1`, `001=2`, `010=3`, `011=4`. Other values are invalid and result in no embedding. |
+| `encryption_key[7:0]`                        | **Input**     | 8 bits                        | Key used for XOR encryption of `data_in`.                                                                                            |
+| `mask[(row*col)-1:0]`                        | **Input**     | `row*col` bits                | Pixel-wise mask enabling embedding: `1=embed`, `0=pass-through`.                                                                     |
+| `img_out[(row*col*8)-1:0]`                   | **Output**    | `row*col*8` bits              | Image data after embedding the specified bits into some (or none) of the pixels.                                                     |
+| `error_out`                                  | **Output**    | 1 bit                         | Indicates odd parity in `data_in`.                                                                                                   |
+| `embedded_pixel_count[EMBED_COUNT_WIDTH-1:0]`| **Output**    | `EMBED_COUNT_WIDTH` bits      | Holds the total count of pixels in which data was actually embedded.                                                                 |
+| `embedding_done[1:0]`                        | **Output**    | 2 bits                        | Reflects the embedding status: `00=Idle`, `01=In-progress`, `10=Done`, `11=No-embed`.                                                |
+
+---
+
+## Functional Description
+
+1. **Parity Checking**  
+   - The module calculates the XOR of all bits in `data_in`. If an **odd** number of bits in `data_in` is set to 1, `error_out` is driven high (`1`).  
+   - This ensures the system can detect if the embedded data has non-even parity.
+
+2. **Encryption**  
+   - The bits of `data_in` are split into 8-bit blocks. Each block is XORed with the 8-bit `encryption_key`.  
+   - This process creates an **encrypted** data stream, referred to internally as `data_in_encrypted`.
+
+3. **Embedding**  
+   - The image has `(row * col)` pixels, each indexed by `i` ranging from `0` to `row * col - 1`.  
+   - For each pixel `i`, if `mask[i]` is `1`, the module replaces the **lowest** bits (based on `bpp`) in `img_in[i*8 +: 8]` with bits from `data_in_encrypted`.  
+   - **Incrementing Embedded Pixel Count**:  
+     - Each time a pixel is modified, `embedded_pixel_count` is incremented by `1`.  
+   - **`embedding_done` Transitions**:  
+     - **`2'b01` (In-progress)**: Once embedding starts (i.e., at least one `mask[i] == 1` pixel is encountered).  
+     - **`2'b10` (Done)**: Set when at least one pixel has been embedded successfully.  
+     - **`2'b11` (No-embed)**: If `mask != 0` but no bits actually get embedded (e.g., because `bpp` is invalid).
+
+4. **Idle vs. Non-Idle**  
+   - **Idle**: If `mask == 0`, the module does not modify any pixels, so `img_out` equals `img_in`.  
+   - **Non-Idle**: If `mask != 0`, embedding logic attempts to modify pixels. However, if it results in no modified pixels for some reason (e.g., `bpp` is invalid), `embedding_done` becomes `2'b11`.
+
+---
+
+## Instantiation
+
+Use an instance of `image_stego` named `uut` within the testbench `tb_image_stego`.
+
+---
+
+## Required Stimulus Description
+
+The objective is to achieve **100% code and toggle coverage** for the `image_stego` module by systematically exercising its functionality. The stimulus should ensure that all key features, edge cases, and status transitions of the design are thoroughly tested to maintain coverage goals.
+
+| **Test Condition**          | **Purpose**                                                                                                                                                                            |
+|-----------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **BPP Variations**          | Embedding for `bpp = 000, 001, 010, 011`, ensuring the correct number of bits are replaced in each pixel. Other `bpp` values should result in no embedding to cover the `2'b11` state. |
+| **Mask Patterns**           | Embedding for different mask patterns (e.g., all zeros, all ones, partial patterns).                                                                                                   |
+| **Encryption Keys**         | Ensure the XOR process covers various `encryption_key` values (0x00, 0xFF, random, etc.).                                                                                              |
+| **Parity Checks**           | Provide even and odd `data_in` to check proper assertion of `error_out`.                                                                                                               |
+| **Pixel Count**             | `embedded_pixel_count` increments only for pixels that are actually embedded.                                                                                                          |
+| **Embedding Done States**   | Test `embedding_done` transitions: `00 (Idle)` → `01 (In-progress)` → `10 (Done)` or `11 (No-embed)`.                                                                                  |
+| **Randomized Scenarios**    | Randomize `img_in`, `data_in`, `bpp`, `encryption_key`, and `mask` to cover unexpected corner cases.                                                                                   |

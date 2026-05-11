@@ -1,0 +1,76 @@
+Write a SystemVerilog testbench to only generate stimulus for a `cmprs_afi_mux_ptr_tb` module is responsible for managing pointer updates for multiple channels in a memory compression system. It handles resetting pointers, arbitrating between competing channels, and updating pointers based on increments while ensuring correct rollover behavior. 
+
+## **Design Specification**
+
+The **cmprs_afi_mux_ptr** module is responsible for managing pointer updates for multiple channels in a memory compression system. It handles resetting pointers, arbitrating between competing channels, and updating pointers based on increments while ensuring correct rollover behavior. 
+
+The testbench **cmprs_afi_mux_ptr_tb** must generate stimuli to validate the FSM transitions, pointer updates, reset behavior, and interaction with the busy signal for arbitration.
+
+### **Inputs:**
+- `hclk` (1-bit): **Clock signal**, used for synchronous operations.
+- `reset` (1-bit): **Active-high reset**, initializes the system state.
+- `sa_len_di` (27-bit): **Write data** for the `sa_len_ram`.
+- `sa_len_wa` (3-bit): **Write address** for the `sa_len_ram`.
+- `sa_len_we` (1-bit): **Write enable** for `sa_len_ram`.
+- `en` (1-bit): **Enable signal**, determines whether the module is active.
+- `reset_pointers` (4-bit): **Per-channel reset** control for pointers.
+- `pre_busy_w` (1-bit): **Indicates if a write operation is occurring**.
+- `pre_winner_channel` (2-bit): **Channel ID that won arbitration**.
+- `need_to_bother` (1-bit): **Indicates whether an update is required**.
+- `chunk_inc_want_m1` (2-bit): **Increment request value (minus one)**.
+- `last_burst_in_frame` (1-bit): **Indicates the last burst in a frame**.
+- `busy` (4-bit): **Busy flags for different channels**.
+
+### **Outputs:**
+- `ptr_resetting` (1-bit): **Indicates if pointers are resetting**.
+- `chunk_addr` (27-bit): **Computed chunk address**.
+- `max_wlen` (3-bit): **Maximum write length per channel**.
+
+## **FSM States & Behavior**
+- **IDLE**: Waits for reset pointers or arbitration start (`pre_busy_w`).
+- **RESETTING**: Resets the requested channel pointers to zero.
+- **ARBITRATION**: Determines if a pointer update is needed (`need_to_bother`).
+- **UPDATE**: Updates the selected pointer, handling overflow conditions.
+
+---
+
+## **Testbench Requirements**
+
+### **Instantiation**
+- Module Instance: The module **cmprs_afi_mux_ptr** should be instantiated as **uut**, with all input and output signals connected for testing.
+
+### **Input Generation**
+
+#### **1. sa_len_ram Writing**
+- The testbench must write values to all `sa_len_ram` entries.
+- Verify that each entry is correctly stored.
+
+#### **2. Pointer Resetting**
+- The testbench should initiate pointer resets (`reset_pointers`).
+- Verify that only the selected pointers are reset.
+
+#### **3. Arbitration and Pointer Increment**
+- Set `pre_busy_w` to initiate arbitration.
+- Assign a channel (`pre_winner_channel`) and increment (`chunk_inc_want_m1`).
+- Verify that the pointer updates correctly.
+
+#### **4. Rollover Condition Testing**
+- Initialize a pointer close to its maximum value.
+- Assign an increment that causes rollover.
+- Verify that the pointer wraps around correctly.
+
+#### **5. FSM Transition Verification**
+- Ensure that transitions between **IDLE**, **RESETTING**, **ARBITRATION**, and **UPDATE** follow expected conditions.
+- Confirm that after `pre_busy_w` is deasserted, the FSM returns to **IDLE**.
+
+#### **6. Reset During Active Update**
+- Apply `reset` while in the **UPDATE** state.
+- Verify that all registers return to their default values.
+
+---
+
+## **Control Signal Handling**
+- The testbench must ensure that inputs such as `pre_busy_w`, `pre_winner_channel`, `chunk_inc_want_m1`, and `reset_pointers` are asserted at the correct moments.
+- The FSM must be given enough cycles to transition and perform pointer updates before moving to the next test case.
+
+This testbench will ensure the **cmprs_afi_mux_ptr** module functions correctly under various conditions, including normal operation, pointer resets, and overflow scenarios.

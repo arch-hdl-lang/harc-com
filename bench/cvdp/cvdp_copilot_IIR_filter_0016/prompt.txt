@@ -1,0 +1,105 @@
+Create a SystemVerilog testbench module named **`iir_filter_tb`** that instantiates the `iir_filter` module and applies stimulus to the instantiated module for different test scenarios. 
+
+---
+### **Inputs**  
+
+- **Clock Signal**:  
+  - `clk`: Positive edge-triggered clock signal driving the IIR filter.  
+
+- **Reset Signal**:  
+  - `rst`: Asynchronous active-high reset signal to initialize the module.  
+
+- **Input Sample**:  
+  - `x[15:0]`: A signed **16-bit input signal** representing the input samples to the filter.  
+
+### **Outputs**  
+
+- **Filtered Output**:  
+  - `y[15:0]`: A signed **16-bit output signal** representing the filter's processed output.  
+
+---
+
+## **Input Generation**  
+
+### **Test Stimulus**  
+
+The testbench systematically has to apply various input waveforms to the IIR filter under different conditions:  
+
+1. **Impulse  Test**  
+   - Apply a single nonzero value (`16'h4000`) followed by zeros.  
+
+2. **Step Test**  
+   - Apply a **constant step input** (`16'h3000`) for a duration.  
+   - filter stabilization and steady-state.  
+
+3. **Sinusoidal Input Test**  
+   - Apply a **sine wave signal** at different frequencies and amplitudes.  
+   - Evaluates frequency and phase shift characteristics.  
+
+4. **Ramp Input Test**  
+   - Apply a **gradually increasing input** from a negative to positive value.  
+   - Observes filter behavior in linear input variations.  
+
+5. **Noise Test**  
+   - Apply **random noise samples** within a predefined amplitude range.  
+   - Ensures the filter does not amplify undesired noise excessively.  
+
+6. **Stability Test**  
+   - Apply a **constant DC input** and monitor output over an extended period.  
+   - Ensures no instability, drift, or oscillations occur.  
+
+7. **Overflow Test**  
+   - Apply **maximum and minimum possible values** (`16'h7FFF` and `16'h8000`).  
+   - saturation handling and prevents wraparound errors.  
+
+8. **Frequency Sweep Test**  
+   - Apply a **gradual frequency sweep** from a low to high frequency.  
+   - Analyzes frequency over the full spectrum.  
+
+9. **Alternating Step Test**  
+   - Alternates between two amplitude levels (`16'h3000` and `-16'h3000`).  
+   - Checks transient to abrupt changes in input.
+      
+10. **Double Impulse Test**  
+    - Sends **two impulses** separated by a specific delay.  
+    - Evaluates filter behavior when multiple transient events occur.
+     
+11. **Max Amplitude Test**  
+    - Continuously apply **maximum amplitude samples** (`16'h7FFF` and `16'h8000`).  
+    - Ensures the filter does not produce unstable behavior.  
+
+---
+
+## **Instantiation**  
+
+- The **`iir_filter`** instance in the testbench is named **`dut`**.  
+
+---
+
+## **Module Interface**  
+
+### **Inputs**  
+
+- `clk`: Clock signal.  
+- `rst`: Asynchronous active-high reset.  
+- `x[15:0]`: 16-bit signed input sample.  
+
+### **Outputs**  
+
+- `y[15:0]`: 16-bit signed output sample.  
+
+---
+
+## **Module Functionality**  
+
+1. **Filter Processing**  
+   - The `iir_filter` processes the input sample `x` and produces a filtered output `y`.  
+
+2. **Reset Behavior**  
+   - When `rst` is HIGH, the filter resets internal states, and `y` is cleared to `0`.  
+
+3. **Edge Cases**  
+   - Handling of large amplitude signals without overflow.  
+   - Stability under constant or repetitive input patterns.  
+
+---

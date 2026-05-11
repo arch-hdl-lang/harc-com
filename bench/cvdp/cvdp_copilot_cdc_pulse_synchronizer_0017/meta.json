@@ -1,0 +1,14 @@
+{
+  "id": "cvdp_copilot_cdc_pulse_synchronizer_0017",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "cdc_pulse_synchronizer_top",
+  "dut_module": "cdc_pulse_synchronizer",
+  "target_coverage": 100,
+  "auto_wrapper": "cdc_pulse_synchronizer_top.sv",
+  "n_ports": 5,
+  "clock_inputs": [],
+  "multi_clock": false
+}

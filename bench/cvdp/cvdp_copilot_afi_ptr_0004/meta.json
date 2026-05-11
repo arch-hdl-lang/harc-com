@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_afi_ptr_0004",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "cmprs_afi_mux_ptr_top",
+  "dut_module": "cmprs_afi_mux_ptr",
+  "target_coverage": 80,
+  "auto_wrapper": "cmprs_afi_mux_ptr_top.sv",
+  "n_ports": 16,
+  "clock_inputs": [
+    "hclk"
+  ],
+  "multi_clock": false
+}

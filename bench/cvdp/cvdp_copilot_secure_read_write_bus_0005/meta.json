@@ -1,0 +1,14 @@
+{
+  "id": "cvdp_copilot_secure_read_write_bus_0005",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "secure_read_write_bus_interface_top",
+  "dut_module": "secure_read_write_bus_interface",
+  "target_coverage": 100,
+  "auto_wrapper": "secure_read_write_bus_interface_top.sv",
+  "n_ports": 8,
+  "clock_inputs": [],
+  "multi_clock": false
+}

@@ -1,0 +1,150 @@
+Complete the Given Partial SystemVerilog Testbench `iir_filt_tb`. The testbench must instantiate the `iir_filt` RTL module and provide input stimulus for it, focusing exclusively on generating comprehensive test vectors rather than building a full testbench. The IIR filter processes three input signals and outputs three corresponding filtered signals based on a selectable filter configuration.
+
+---
+
+## **Module Interface**
+### **1. Inputs:**
+- **`clk (1-bit)`**: Active high Clock signal that synchronizes operations within the filter logic.
+- **` reset (1-bit)`**: Active-high Asynchronous reset signal that clears the internal states of the filter.
+- **`in_1 [15:0] (16-bit, signed)`**: First input signal to the filter.
+- **`in_2  [15:0] (16-bit, signed)`**: Second input signal to the filter.
+- **`in_3  [15:0] (16-bit, signed)`**: Third input signal to the filter.
+- **`filter_select [1:0] (2-bit, unsigned)`**: Filter selection signal that determines which filter coefficients are applied.
+
+### **2. Outputs:**
+- **`out_1  [15:0] (16-bit, signed)`**: Filtered output corresponding to `in_1`.
+- **`out_2  [15:0] (16-bit, signed)`**: Filtered output corresponding to `in_2`.
+- **`out_3  [15:0] (16-bit, signed)`**: Filtered output corresponding to `in_3`.
+
+---
+
+## **Instantiation:**
+The testbench instantiates the `iir_filt` module as `uut` and connects the signals between the module and the testbench. Each input and output from the DUT is connected to its corresponding signal in the testbench.
+
+---
+
+## **Input Generation and:**
+- **Clock Generation:** Active high clock signal `clk` toggles every 5 time units to simulate a 100 MHz clock.
+- **Reset:** The reset signal `reset` is asserted at the beginning of the simulation to initialize the filter to a known state. After 20 time units, the reset is deasserted.
+- **Stimulus:** Several test cases are applied to different filtering operations. These test cases, edge cases, stress conditions, dynamic switching, invalid input handling, to filter coefficient changes.
+
+---
+
+## **Test Cases:**
+### **1. Edge Case Testing**
+- Test extreme values such as maximum (`16'h7FFF`), minimum (`16'h8000`), alternating patterns (`16'hAAAA`), and zero (`16'h0000`).
+
+### **2. Stress Testing**
+- Apply 500 cycles of randomized input signals and `filter_select` values.
+
+### **3. Dynamic Switching Test**
+- Randomly change `filter_select` every 10 cycles while continuously providing input data.
+- Ensure the filter transitions smoothly without abrupt artifacts.
+
+### **4. Invalid `filter_select` Test**
+- Iterate through all possible `filter_select` values (0 to 3), including out-of-range values.
+
+### **5. Step Test**
+- Apply a step input (`16'h1000`) and observe how the filter responds over multiple cycles.
+- Reset input to zero and monitor the settling behavior.
+
+### **6. Coefficient Transition Test**
+- Apply a constant input and cycle through different `filter_select` values to test filter coefficient switching behavior.
+
+### **7. Single Channel Test**
+- Provide input to one channel at a time (`in_1`, `in_2`, `in_3`) while keeping the others zero.
+
+### **8. All-Zero Input Test**
+- Feed all-zero inputs and ensure that outputs remain zero across different filter selections.
+
+### **9. Post-Reset Behavior Test**
+- Apply input after reset, if the filter starts processing correctly.
+
+### **10. Arithmetic Overflow Test**
+- Test filter behavior when inputs are at saturation limits (`16'h7FFF` and `16'h8000`).
+
+### **11. Filter Coefficient Combinations Test**
+- Apply known values to the inputs and cycle through filter selections.
+
+---
+
+## **Module Functionality:**
+- **Reset Handling:** The filter should correctly initialize all internal states upon reset.
+- **Filter Processing:** The selected filter should be applied to the inputs, and the outputs should reflect the processed values.
+- **Coefficient Switching:** Changing `filter_select` should update the filter behavior smoothly.
+- **Input Dependency:** Each output should primarily depend on its respective input (`out_1` on `in_1`, `out_2` on `in_2`, etc.).
+- **Saturation and Stability:** The filter should handle extreme values without causing instability.
+
+---
+```verilog
+module iir_filt_tb();
+
+    // DUT Inputs
+    reg clk;
+    reg reset;
+    reg signed [15:0] in_1;
+    reg signed [15:0] in_2;
+    reg signed [15:0] in_3;
+    reg [1:0] filter_select;
+
+    // DUT Outputs
+    wire signed [15:0] out_1;
+    wire signed [15:0] out_2;
+    wire signed [15:0] out_3;
+
+    // Instantiate the DUT
+    iir_filt #(.WIDTH(16)) uut (
+        .clk(clk),
+        .reset(reset),
+        .in_1(in_1),
+        .in_2(in_2),
+        .in_3(in_3),
+        .filter_select(filter_select),
+        .out_1(out_1),
+        .out_2(out_2),
+        .out_3(out_3)
+    );
+
+    // Clock generation
+    initial clk = 0;
+    always #5 clk = ~clk; // 100 MHz clock
+
+    // Test procedure
+    initial begin
+        // Initialize inputs
+        reset = 1;
+        #20;
+        reset = 0;
+        $display("[%0t] DUT reset completed", $time);
+
+        // Edge case testing
+        $display("[%0t] Starting edge case testing", $time);
+        in_1 = 16'h7FFF; in_2 = 16'h8000; in_3 = 16'h7FFF; filter_select = 2'b00; #20;
+        in_1 = -16'h8000; in_2 = -16'h7FFF; in_3 = 16'h7FFF; filter_select = 2'b01; #20;
+        in_1 = 16'hAAAA; in_2 = 16'h5555; in_3 = 16'hAAAA; filter_select = 2'b10; #20;
+        in_1 = 16'h0000; in_2 = 16'h0000; in_3 = 16'h0000; filter_select = 2'b11; #20;
+        in_1 = 16'h1234; in_2 = 16'h5678; in_3 = 16'h9ABC; filter_select = 2'b00; #20;
+        $display("[%0t] Edge case testing completed", $time);
+
+        // Stress testing
+        $display("[%0t] Starting stress testing", $time);
+        reset = 1; #20; reset = 0;
+        repeat (500) begin
+            filter_select = $random % 4;
+            in_1 = $random;
+            in_2 = $random;
+            in_3 = $random;
+            #20;
+        end
+        $display("[%0t] Stress testing completed", $time);
+
+        // Insert the code for the remaining test cases here
+
+
+        // Finish simulation
+        $display("[%0t] Testbench simulation completed", $time);
+        $finish;
+    end
+
+endmodule
+```

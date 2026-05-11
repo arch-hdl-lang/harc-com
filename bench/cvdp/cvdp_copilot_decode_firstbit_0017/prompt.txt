@@ -1,0 +1,108 @@
+Create a **testbench** to apply **stimulus** to the `cvdp_copilot_decode_firstbit` module. This module detects the first set bit in a **32-bit binary input** and outputs its position in either **binary or one-hot encoding**. The testbench must generate a diverse set of input patterns while ensuring compliance with the module’s **clocking, reset, and pipeline behavior**.
+
+---
+
+### **Inputs:**
+
+- `Clk`: **1-bit clock signal**, toggling every **5 time units** (100MHz operation).
+- `Rst`: **Active-high reset signal** to initialize the module.
+- `In_Data`: **32-bit input bus** for data values.
+- `In_Valid`: **Signal indicating valid input data**.
+
+### **Outputs:**
+
+- `Out_FirstBit`: **Position of the first set bit** (Binary or One-Hot encoded).
+- `Out_Found`: **Indicates if a set bit was found**.
+- `Out_Valid`: **Indicates valid output data**.
+
+---
+
+### **Module Specifications for Stimulus Generation**
+
+The `cvdp_copilot_decode_firstbit` module supports configurable first-bit detection with the following key parameters:
+
+- **Input Processing:**
+  - Detects **first set bit** from LSB to MSB.
+  - Supports **optional input registers (`InReg_g`)**.
+- **Output Processing:**
+  - Provides index in **Binary or One-Hot encoding (`OutputFormat_g`)**.
+  - Supports **optional output registers (`OutReg_g`)**.
+- **Pipeline Stages:**
+  - Configurable **pipeline registers (`PlRegs_g`)** for adjustable latency.
+- **Clock and Reset Behavior:**
+  - Operates on the **rising edge** of `Clk`.
+  - Initializes internal registers upon `Rst` assertion.
+
+---
+
+### **Instantiation**
+
+The testbench must instantiate a single instance of the `cvdp_copilot_decode_firstbit` module with instantiation name `dut`:
+
+- **Decode First Bit Module (`dut`)**: Instantiated with the following parameter values:
+  - `InWidth_g = 32`
+  - `InReg_g = 0`
+  - `OutReg_g = 0`
+  - `PlRegs_g = 0`
+  - `OutputFormat_g = 0` (Binary Encoding)
+
+---
+
+### **Testbench Requirements**
+
+The testbench must apply a **wide range of test patterns** covering various input scenarios:
+
+1. **Clock Generation:**
+   - `Clk` must toggle every **5 time units**, ensuring a **100MHz clock period**.
+
+2. **Reset Handling:**
+   - `Rst` must be **asserted at the beginning** of the simulation for **three cycles**.
+   - The module must be **initialized properly** before input stimulus is applied.
+
+3. **Stimulus Generation Strategy:**
+   - The testbench **must not verify outputs** (only generate inputs).
+   - Generate input patterns covering:
+     - **Single-bit set inputs**.
+     - **All-zero inputs**.
+     - **Multiple-bit patterns**.
+     - **Random bit patterns**.
+     - **First-bit at different positions**.
+     - **First and last bit set**.
+     - **Changing valid input sequences**.
+     - **Pipeline latency variations**.
+
+4. **Handling Consecutive and Random Inputs:**
+   - The testbench must ensure **continuous valid input scenarios** are covered.
+   - Include **randomized sequences** to simulate realistic DUT behavior.
+
+5. **Reset in Mid-Operation:**
+   - The testbench should **toggle reset during execution** to ensure the module properly re-initializes.
+
+---
+
+### **Coverage and Compliance**
+
+- The testbench must ensure **high coverage** across all input variations.
+- The **DUT instance name `dut` must be explicitly used** for instantiation.
+- The **RTL should not be in context** but will be provided in `/harness/<issue number>/src/`.
+
+---
+
+### **Test Plan Overview**
+
+- **Basic input cases** (all zeros, single-bit set, multiple bits set).
+- **Timing-based tests** (handling valid input over consecutive cycles).
+- **Randomized patterns** to ensure robustness.
+- **Pipeline configuration tests** to validate latency effects.
+- **Reset handling** to verify re-initialization integrity.
+
+This testbench should provide a **comprehensive input stimulus environment** for `cvdp_copilot_decode_firstbit`, ensuring correct operation across multiple configurations.
+
+---
+
+### **Note:**
+- The testbench **must only generate stimulus** without verifying outputs.
+- The **DUT instance name `dut` must be explicitly used** for instantiation.
+- **Ensure the maximum possible input coverage** without adding assertions or comparisons.
+
+Can you implement a **SystemVerilog testbench** with the above stimulus requirements?

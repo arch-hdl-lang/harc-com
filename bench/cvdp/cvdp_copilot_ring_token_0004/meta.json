@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_ring_token_0004",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "token_ring_fsm",
+  "dut_module": "token_ring_fsm",
+  "target_coverage": 100,
+  "auto_wrapper": null,
+  "n_ports": 7,
+  "clock_inputs": [
+    "clk"
+  ],
+  "multi_clock": false
+}

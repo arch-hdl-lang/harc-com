@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_csr_using_apb_0005",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "csr_apb_interface_top",
+  "dut_module": "csr_apb_interface",
+  "target_coverage": 90,
+  "auto_wrapper": "csr_apb_interface_top.sv",
+  "n_ports": 10,
+  "clock_inputs": [
+    "pclk"
+  ],
+  "multi_clock": false
+}

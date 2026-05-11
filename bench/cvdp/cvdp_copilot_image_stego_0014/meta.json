@@ -1,0 +1,14 @@
+{
+  "id": "cvdp_copilot_image_stego_0014",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "image_stego_top",
+  "dut_module": "image_stego",
+  "target_coverage": 100,
+  "auto_wrapper": "image_stego_top.sv",
+  "n_ports": 9,
+  "clock_inputs": [],
+  "multi_clock": false
+}

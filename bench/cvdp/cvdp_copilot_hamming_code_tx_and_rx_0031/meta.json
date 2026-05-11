@@ -1,0 +1,14 @@
+{
+  "id": "cvdp_copilot_hamming_code_tx_and_rx_0031",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "hamming_code_receiver_top",
+  "dut_module": "hamming_code_receiver",
+  "target_coverage": 100,
+  "auto_wrapper": "hamming_code_receiver_top.sv",
+  "n_ports": 2,
+  "clock_inputs": [],
+  "multi_clock": false
+}
