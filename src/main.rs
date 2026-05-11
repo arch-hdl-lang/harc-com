@@ -116,6 +116,12 @@ enum Cmd {
         /// `harc check foo.harc 2>&1 | harc advise --from-stderr`).
         #[arg(long)]
         from_stderr: bool,
+        /// Restrict the search to `kind: "feature"` events (the
+        /// spec→source provenance from `///` / `//!` / `//! ---`
+        /// doc comments harvested on successful compiles).
+        /// Default is to return only error→fix events.
+        #[arg(long)]
+        feature: bool,
     },
     /// Rebuild the BM25 retrieval index over `~/.harc/learn/events.jsonl`.
     /// Run this after a batch of new error→fix pairs; `harc advise`
@@ -127,6 +133,20 @@ enum Cmd {
     LearnStats,
     /// Delete the entire local learning store at `~/.harc/learn/`.
     LearnClear,
+    /// Seed the local learning store with feature events harvested
+    /// from a directory of `.harc` files. Walks the path recursively,
+    /// parses each file, and emits one feature event per top-level
+    /// construct that carries `///` / `//!` / `//! ---` content.
+    /// Silently skips files that fail to parse. Re-running replaces
+    /// the existing feature events for each harvested file — safe to
+    /// run repeatedly. Build the BM25 index afterwards with
+    /// `harc learn-index`.
+    LearnBootstrap {
+        /// Directory to walk (default: `tests/fixtures` under the
+        /// current working directory). Recurses into subdirectories.
+        #[arg(default_value = "tests/fixtures")]
+        path: PathBuf,
+    },
     /// Remove individual events from the learning store by filter.
     /// Combine filters freely; an event is removed if ANY filter matches.
     LearnPrune {
@@ -160,7 +180,9 @@ fn main() -> Result<()> {
                 outdir.clone(), seed, emit_only, arch_bin.clone(), mt, coverage,
             ))
         }
-        Cmd::Advise { query, top, from_stderr } => cmd_advise(query, top, from_stderr),
+        Cmd::Advise { query, top, from_stderr, feature } =>
+            cmd_advise(query, top, from_stderr, feature),
+        Cmd::LearnBootstrap { path } => cmd_learn_bootstrap(&path),
         Cmd::LearnIndex => {
             let n = harc::learn::build_index().map_err(|e| miette::miette!("{}", e))?;
             eprintln!("Indexed {n} events.");
@@ -218,6 +240,18 @@ where
                     if let Ok(Some(ev)) = harc::learn::record_success_if_pending(&path_str, &src) {
                         eprintln!("📚 Learned: [{}] {}", ev.error_code, ev.diff_summary);
                     }
+                    // Feature harvest: emit one `kind: "feature"` event
+                    // per top-level construct that carries doc text.
+                    // Re-running on the same source replaces those
+                    // events (idempotent). Silently skipped if the
+                    // file fails to parse — error_fix capture above
+                    // covered that case.
+                    if let Ok(ast) = harc::parser::parse_source(&src) {
+                        let file_path = path_str.clone();
+                        let _ = harc::learn::harvest_features(&ast, |_item| {
+                            file_path.clone()
+                        });
+                    }
                 }
             }
         }
@@ -250,7 +284,9 @@ where
 }
 
 /// `harc advise <query>` — retrieve top-K past error→fix pairs.
-fn cmd_advise(query: Vec<String>, top: usize, from_stderr: bool) -> Result<()> {
+/// With `--feature`, retrieves `kind: "feature"` events instead
+/// (spec→source provenance from harvested doc-comments).
+fn cmd_advise(query: Vec<String>, top: usize, from_stderr: bool, feature: bool) -> Result<()> {
     let mut q = query.join(" ");
     if from_stderr {
         use std::io::Read;
@@ -266,7 +302,15 @@ fn cmd_advise(query: Vec<String>, top: usize, from_stderr: bool) -> Result<()> {
             "empty query — pass a query string or pipe via --from-stderr"
         ));
     }
-    let matches = harc::learn::advise(&q, top).map_err(|e| miette::miette!("{}", e))?;
+    // Pull a deeper pool when `--feature` is set so filtering doesn't
+    // starve the result set.
+    let pool_size = if feature { top.max(1) * 8 } else { top };
+    let matches = harc::learn::advise(&q, pool_size).map_err(|e| miette::miette!("{}", e))?;
+    let matches: Vec<_> = if feature {
+        matches.into_iter().filter(|m| m.event.kind == "feature").take(top).collect()
+    } else {
+        matches.into_iter().filter(|m| m.event.kind != "feature").take(top).collect()
+    };
     if matches.is_empty() {
         eprintln!("No matches.");
         return Ok(());
@@ -276,12 +320,85 @@ fn cmd_advise(query: Vec<String>, top: usize, from_stderr: bool) -> Result<()> {
             "── match #{} (score {:.3}, retrieved {}×) ──────────────────────",
             i + 1, m.score, m.retrieved_count
         );
-        println!("  code:    {}", m.event.error_code);
-        println!("  message: {}", m.event.error_message);
-        println!("  file:    {}", m.event.file_path);
-        println!("  diff:    {}", m.event.diff_summary);
+        if m.event.kind == "feature" {
+            // Feature event: file::construct + doc snippet.
+            println!("  kind:      {}", m.event.error_code);
+            println!("  construct: {}", m.event.diff_summary);
+            println!("  file:      {}", m.event.file_path);
+            let snippet: String = m.event.error_message.chars().take(240).collect();
+            let truncated = m.event.error_message.chars().count() > 240;
+            println!(
+                "  doc:       {}{}",
+                snippet.replace('\n', " "),
+                if truncated { " …" } else { "" }
+            );
+        } else {
+            println!("  code:    {}", m.event.error_code);
+            println!("  message: {}", m.event.error_message);
+            println!("  file:    {}", m.event.file_path);
+            println!("  diff:    {}", m.event.diff_summary);
+        }
         println!();
     }
+    Ok(())
+}
+
+/// `harc learn-bootstrap <dir>` — recursively walk a directory of
+/// `.harc` files, parse each, and call `harvest_features` on every
+/// successful parse. Idempotent: re-running replaces existing feature
+/// events for each file. Files that fail to parse are skipped
+/// silently.
+fn cmd_learn_bootstrap(path: &std::path::Path) -> Result<()> {
+    if std::env::var("HARC_NO_LEARN").is_ok_and(|v| v != "0") {
+        eprintln!("HARC_NO_LEARN is set — bootstrap skipped.");
+        return Ok(());
+    }
+    if !path.exists() {
+        return Err(miette::miette!("path does not exist: {}", path.display()));
+    }
+    let mut harc_files: Vec<PathBuf> = Vec::new();
+    fn walk(p: &std::path::Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        if p.is_dir() {
+            for entry in fs::read_dir(p)? {
+                let entry = entry?;
+                walk(&entry.path(), out)?;
+            }
+        } else if p.is_file() {
+            if p.extension().and_then(|e| e.to_str()) == Some("harc") {
+                out.push(p.to_path_buf());
+            }
+        }
+        Ok(())
+    }
+    walk(path, &mut harc_files).into_diagnostic()?;
+    harc_files.sort();
+    let mut total = 0usize;
+    let mut parsed_ok = 0usize;
+    let mut parse_skipped = 0usize;
+    for f in &harc_files {
+        let src = match fs::read_to_string(f) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let parsed = match harc::parser::parse_source(&src) {
+            Ok(p) => p,
+            Err(_) => {
+                parse_skipped += 1;
+                continue;
+            }
+        };
+        parsed_ok += 1;
+        let file_path = f.display().to_string();
+        let n = harc::learn::harvest_features(&parsed, |_item| file_path.clone())
+            .map_err(|e| miette::miette!("{}", e))?;
+        total += n;
+    }
+    eprintln!(
+        "Bootstrap: parsed {parsed_ok}/{} files ({} skipped); harvested {total} feature event(s).",
+        harc_files.len(),
+        parse_skipped,
+    );
+    eprintln!("Run `harc learn-index` to rebuild the BM25 index.");
     Ok(())
 }
 

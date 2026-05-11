@@ -1083,3 +1083,224 @@ pub struct Verify {
     pub property_kw: bool,
     pub span: Span,
 }
+
+// ── Construct trait ───────────────────────────────────────────────────────────
+
+/// Centralizing trait for every top-level `Item::*` variant. Ports the
+/// shape from arch-com's `ast::Construct`: a uniform accessor surface
+/// so the learning-store feature-harvester (and future passes that
+/// want a single dispatch point) can walk items without N-arm matches.
+///
+/// v0 covers the five always-applicable accessors —
+/// `kind_label` / `name` / `span` / `doc` / `inner_doc`. HARC's
+/// per-construct inner doc isn't captured yet (only `SourceFile.inner_doc`
+/// is populated by the parser), so `inner_doc()` returns `None` for
+/// every concrete impl today; the slot is in place so adding it later
+/// is a parser-level change with no Construct churn.
+pub trait Construct {
+    /// The lowercase keyword introducing this construct in source
+    /// (`"transactor"`, `"test"`, `"impl"`, `"struct"`, …). Used as
+    /// the `error_code` field on `kind: "feature"` events so BM25
+    /// can rank by construct kind.
+    fn kind_label(&self) -> &'static str;
+
+    /// The construct's name as declared. For `impl <target> for
+    /// <TestName>`, returns `test_name` (the item that the impl
+    /// hangs off of); for `extend X { ... }`, returns the last
+    /// segment of `target`. `use foo.bar.Baz` returns `Baz`.
+    fn name(&self) -> &Ident;
+
+    /// Source span covering the construct.
+    fn span(&self) -> Span;
+
+    /// Outer doc-comment text (`///` lines immediately preceding the
+    /// construct). `None` if no run was attached.
+    fn doc(&self) -> Option<&str>;
+
+    /// Inner doc-comment text (`//!` lines immediately after the
+    /// opening keyword and name). Reserved for the per-construct inner
+    /// doc surface described in spec §2.5.2 — none of HARC's
+    /// concrete `*Decl` types carry the field yet, so this returns
+    /// `None` uniformly today.
+    fn inner_doc(&self) -> Option<&str> {
+        None
+    }
+}
+
+// ── Construct impls ──────────────────────────────────────────────────────────
+//
+// One `impl Construct for $ty` per `Item::*` variant. Most pull
+// `name` / `span` / `doc` directly off the `*Decl` struct;
+// `UseDecl` / `ExtendDecl` / `ApplyDecl` / `ImplDecl` carry a `path`
+// or different field names and need slim shim accessors.
+
+/// Implement `Construct` for a `*Decl` with the canonical
+/// `name: Ident`, `span: Span`, `doc: Option<String>` fields.
+macro_rules! impl_construct_direct {
+    ($ty:ty, $label:expr) => {
+        impl Construct for $ty {
+            fn kind_label(&self) -> &'static str { $label }
+            fn name(&self) -> &Ident { &self.name }
+            fn span(&self) -> Span { self.span }
+            fn doc(&self) -> Option<&str> { self.doc.as_deref() }
+        }
+    };
+}
+
+impl_construct_direct!(PackageDecl, "package");
+impl_construct_direct!(ConstDecl, "const");
+impl_construct_direct!(DomainDecl, "domain");
+impl_construct_direct!(StructDecl, "struct");
+impl_construct_direct!(EnumDecl, "enum");
+impl_construct_direct!(TransactionDecl, "transaction");
+impl_construct_direct!(RelationDecl, "relation");
+impl_construct_direct!(TseqDecl, "tseq");
+impl_construct_direct!(TransactorDecl, "transactor");
+impl_construct_direct!(TestDecl, "test");
+impl_construct_direct!(CovergroupDecl, "covergroup");
+impl_construct_direct!(PropertyDecl, "property");
+impl_construct_direct!(PseqDecl, "pseq");
+impl_construct_direct!(CoverSequenceDecl, "cover_sequence");
+impl_construct_direct!(BusDecl, "bus");
+impl_construct_direct!(ExternalModuleDecl, "module");
+impl_construct_direct!(FunctionDecl, "function");
+
+// `agent` / `env` / `scoreboard` / `sequencer` share `ComponentDecl`;
+// the kind_label varies. Implemented manually so `kind` selects the
+// right keyword string.
+impl Construct for ComponentDecl {
+    fn kind_label(&self) -> &'static str {
+        match self.kind {
+            ComponentKind::Agent => "agent",
+            ComponentKind::Env => "env",
+            ComponentKind::Scoreboard => "scoreboard",
+            ComponentKind::Sequencer => "sequencer",
+            // Transactor lives in the AST as a separate `TransactorDecl`
+            // (not a `ComponentDecl`), but the `ComponentKind` enum
+            // includes the variant for historical reasons. If a
+            // `ComponentDecl` with this kind ever shows up at runtime,
+            // surface it under the same label as the dedicated
+            // transactor.
+            ComponentKind::Transactor => "transactor",
+        }
+    }
+    fn name(&self) -> &Ident { &self.name }
+    fn span(&self) -> Span { self.span }
+    fn doc(&self) -> Option<&str> { self.doc.as_deref() }
+}
+
+// `use foo.bar.Baz` — Construct uses the last path segment as the
+// "name" so the feature event lands under `Baz`. A self-owned `Ident`
+// would be cleaner but UseDecl doesn't store one; cache via a
+// thread-local'd cell to keep the borrow lifetime aligned with
+// `&self`. Simpler approach: synthesize the Ident on the fly via a
+// `OnceCell` per UseDecl. For v0 we just return the last segment's
+// Ident directly — `Path.segments` already owns the Idents.
+impl Construct for UseDecl {
+    fn kind_label(&self) -> &'static str { "use" }
+    fn name(&self) -> &Ident {
+        // Return the last segment's Ident; falls back to a static
+        // synthetic name when the path is empty (shouldn't happen
+        // post-parse but the borrow surface needs something to point
+        // at).
+        self.path
+            .segments
+            .last()
+            .map(|s| s)
+            .unwrap_or_else(|| {
+                static EMPTY: std::sync::OnceLock<Ident> = std::sync::OnceLock::new();
+                EMPTY.get_or_init(|| Ident {
+                    name: "<empty-use>".into(),
+                    span: Span::new(0, 0),
+                })
+            })
+    }
+    fn span(&self) -> Span { self.span }
+    fn doc(&self) -> Option<&str> { self.doc.as_deref() }
+}
+
+// `extend X { ... }` — name is the last segment of `target`.
+impl Construct for ExtendDecl {
+    fn kind_label(&self) -> &'static str { "extend" }
+    fn name(&self) -> &Ident {
+        self.target
+            .segments
+            .last()
+            .unwrap_or_else(|| {
+                static EMPTY: std::sync::OnceLock<Ident> = std::sync::OnceLock::new();
+                EMPTY.get_or_init(|| Ident {
+                    name: "<empty-extend>".into(),
+                    span: Span::new(0, 0),
+                })
+            })
+    }
+    fn span(&self) -> Span { self.span }
+    fn doc(&self) -> Option<&str> { self.doc.as_deref() }
+}
+
+// `apply Foo.Bar` — no name, no doc. Synthesize an empty name and
+// return None for doc. Apply isn't a real construct that ever
+// produces a useful feature event, but Construct must be exhaustive
+// so `as_construct` covers every Item variant.
+impl Construct for ApplyDecl {
+    fn kind_label(&self) -> &'static str { "apply" }
+    fn name(&self) -> &Ident {
+        self.path
+            .segments
+            .last()
+            .unwrap_or_else(|| {
+                static EMPTY: std::sync::OnceLock<Ident> = std::sync::OnceLock::new();
+                EMPTY.get_or_init(|| Ident {
+                    name: "<empty-apply>".into(),
+                    span: Span::new(0, 0),
+                })
+            })
+    }
+    fn span(&self) -> Span { self.span }
+    fn doc(&self) -> Option<&str> { None }
+}
+
+// `impl <target> for <TestName>` — "name" is the TestName (which
+// is what the impl hangs off of); kind_label is "impl".
+impl Construct for ImplDecl {
+    fn kind_label(&self) -> &'static str { "impl" }
+    fn name(&self) -> &Ident { &self.test_name }
+    fn span(&self) -> Span { self.span }
+    fn doc(&self) -> Option<&str> { self.doc.as_deref() }
+}
+
+impl Item {
+    /// Single dispatch point covering every `Item::*` variant. Lets
+    /// the learning-store feature harvester (and future passes)
+    /// access the common `Construct` accessors without an N-arm
+    /// match at every call site.
+    pub fn as_construct(&self) -> &dyn Construct {
+        match self {
+            Item::Use(u) => u,
+            Item::Package(p) => p,
+            Item::Const(c) => c,
+            Item::Domain(d) => d,
+            Item::Struct(s) => s,
+            Item::Enum(e) => e,
+            Item::Transaction(t) => t,
+            Item::Relation(r) => r,
+            Item::Tseq(t) => t,
+            Item::Agent(c) => c,
+            Item::Env(c) => c,
+            Item::Scoreboard(c) => c,
+            Item::Sequencer(c) => c,
+            Item::Test(t) => t,
+            Item::Extend(e) => e,
+            Item::Covergroup(g) => g,
+            Item::Property(p) => p,
+            Item::Pseq(p) => p,
+            Item::CoverSequence(c) => c,
+            Item::ExternalModule(m) => m,
+            Item::Function(f) => f,
+            Item::Apply(a) => a,
+            Item::Bus(b) => b,
+            Item::Transactor(t) => t,
+            Item::Impl(i) => i,
+        }
+    }
+}
