@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_generic_nbit_counter_0013",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "generic_counter_top",
+  "dut_module": "generic_counter",
+  "target_coverage": 100,
+  "auto_wrapper": "generic_counter_top.sv",
+  "n_ports": 6,
+  "clock_inputs": [
+    "clk_in"
+  ],
+  "multi_clock": false
+}

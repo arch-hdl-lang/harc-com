@@ -1,0 +1,89 @@
+Create a **testbench** to apply **stimulus** to the `single_cycle_arbiter` module. This module implements a **fixed-priority, single-cycle arbitration** mechanism that grants exactly one request per cycle based on a priority scheme where **Port 0 has the highest priority** and **Port N-1 has the lowest priority**. The testbench must validate arbitration logic and priority enforcement and ensure proper handling of various request patterns, including edge cases.
+
+---
+
+### **Inputs:**
+
+- `clk`: **Clock signal with a 10ns period.**
+- `reset`: **Active-high reset signal.**
+- `req_i`: **Request signal, `N`-bit wide, where each bit represents a request from a different source.**
+
+### **Outputs:**
+
+- `gnt_o`: **Grant signal, `N`-bit wide, indicating which request has been granted.**
+
+---
+
+### **Instantiation**
+
+The testbench must instantiate a single instance of the `single_cycle_arbiter` module:
+
+- **Primary Arbiter Module (`uut`)**: Instantiated with `N=8` to test typical request/grant scenarios.
+
+---
+
+### **Testbench Requirements**
+
+The testbench must apply a **wide range of test patterns** covering various arbitration conditions:
+
+1. **Clock Generation:**
+   - `clk` must toggle every **5 time units**, ensuring a **10 ns clock period**.
+
+2. **Reset Handling:**
+   - `reset` must be **asserted for multiple cycles** before deasserting.
+   - The module must correctly initialize its outputs upon reset.
+
+3. **Stimulus Generation Strategy:**
+   - The testbench **must not verify outputs** (only generate inputs).
+   - The following test sequences must be executed:
+     - **No Requests**: Ensure `gnt_o` remains inactive.
+     - **Single Request Activation**: Apply requests to individual ports one at a time.
+     - **Simultaneous Requests**: Apply multiple requests and observe prioritization.
+     - **Sequential Requests**: Shift requests sequentially over cycles to verify shifting behavior.
+     - **Randomized Testing**: Generate **50 iterations** of randomized request patterns.
+     - **Edge Cases**:
+       - **Simultaneous Multiple-Level Requests**: Activate requests at non-adjacent positions (e.g., `8'b11000110`).
+       - **Even-Indexed Requests Active**: Ensure correct arbitration for `8'b10101010`.
+       - **Odd-Indexed Requests Active**: Ensure correct arbitration for `8'b01010101`.
+       - **Alternating Request Patterns**: Exercise `8'b10011001`.
+       - **Back-to-Back Requests Across Cycles**: Apply requests in consecutive cycles while ensuring arbitration propagates.
+     - **Mid-Run Reset Handling**:
+       - Apply reset **during an ongoing arbitration sequence**.
+       - Apply new requests after reset to verify proper reinitialization.
+
+4. **Handling Continuous and Edge Cases:**
+   - The testbench must ensure arbitration operates **correctly across all request patterns**.
+   - **High-frequency toggling** of requests must be exercised.
+
+5. **Waveform Generation:**
+   - The testbench must generate a `.vcd` waveform file to allow waveform analysis.
+
+---
+
+### **Coverage and Compliance**
+
+- The testbench must ensure **high coverage** across all possible arbitration conditions.
+- The **DUT instance name `uut` must be explicitly used** for instantiation.
+
+---
+
+### **Test Plan Overview**
+
+The testbench must ensure **96%+ input stimulus coverage** by applying:
+
+- **Request arbitration testing** across different scenarios.
+- **Edge case handling** for alternating and simultaneous requests.
+- **Randomized input variations** to ensure robustness.
+- **Pipeline behavior verification** to confirm proper priority enforcement.
+- **Handling of multiple active requests** to validate correct grant selection.
+
+This testbench will provide a **comprehensive input stimulus environment** for `single_cycle_arbiter`, ensuring correct operation under various test conditions.
+
+---
+
+### **Note:**
+- The testbench **must only generate stimulus** without verifying outputs.
+- The **DUT instance name `uut` must be explicitly used** for instantiation.
+- **Ensure the maximum possible input coverage** without adding assertions or comparisons.
+
+Can you implement a **SystemVerilog testbench** with the above stimulus requirements?

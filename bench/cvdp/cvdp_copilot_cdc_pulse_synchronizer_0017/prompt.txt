@@ -1,0 +1,78 @@
+Complete the given SystemVerilog testbench for the `cdc_pulse_synchronizer` module. The testbench currently instantiates the UUT and should include a stimulus generator (`stimulus_generator`) that dynamically produces a wide range of test scenarios to ensure 100% functional and code coverage. The stimulus generator should validate the design under various conditions, including the below module functionality.
+
+---
+## Description
+
+### Inputs
+
+  - `src_clock`: Source clock signal driving the source domain(positive edge triggered). 
+  - `des_clock`: The destination clock signal drives the destination domain(positive edge triggered).
+  - `rst_in`: The Asynchronous reset signal (active high) to reset the synchronizer.
+  - `src_pulse`: The input pulse signal is generated in the source clock domain. High for one clock cycle.
+
+### Outputs
+
+  - `des_pulse`: Synchronized pulse output in the destination clock domain. High for one des_clock cycle.
+
+
+## Input Generation
+
+### Input Generation
+
+- **Clock Frequencies**:
+  - Generate random frequencies for `src_clock` and `des_clock` to cover a wide range, including:
+    - Low frequencies (e.g., 1 MHz).
+    - High frequencies (e.g., 250 MHz).
+    - Closely matched frequencies (e.g., 90 MHz vs. 100 MHz).
+    - Extreme frequency disparities (e.g., 1 MHz vs. 100 MHz).
+
+- **Random Scenarios**:
+  - Create diverse patterns for `src_pulse`, such as:
+    - Random Frequencies.
+
+- **Reset Behavior**:
+  - Apply resets during various states, including:
+    - Idle state.
+    - Active pulse synchronization.
+    - Clock alignment and misalignment scenarios.
+
+---
+
+Follows the specification for building the RTL of the module, use it as a reference for the verification environment too:
+
+## Module Functionality
+
+1. **Pulse Synchronization**:
+   - The module uses a toggle flip-flop mechanism in the source domain and a double flip-flop synchronizer in the destination domain to synchronize `src_pulse` with `des_clock`.
+
+2. **Reset Behavior**:
+   - When `rst_in` is asserted, all internal states (`pls_toggle`, `pls_toggle_synca`, `pls_toggle_syncb`, and `pls_toggle_syncc`) are cleared to zero, ensuring proper initialization.
+
+3. **Edge Cases**:
+   - Correct synchronization under extreme clock frequency mismatches.
+   - Reset during pulse synchronization and at random intervals.
+
+---
+```verilog
+module tb_cdc_pulse_synchronizer;
+
+    // Testbench signals
+    logic src_clock;
+    logic des_clock;
+    logic rst_in;
+    logic src_pulse;
+    logic des_pulse;
+
+    // Instantiate the DUT
+    cdc_pulse_synchronizer uut (
+        .src_clock(src_clock),
+        .des_clock(des_clock),
+        .rst_in(rst_in),
+        .src_pulse(src_pulse),
+        .des_pulse(des_pulse)
+    );
+
+    // Insert the code here to generate stimulus generation logic
+
+endmodule
+```

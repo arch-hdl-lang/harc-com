@@ -1,0 +1,70 @@
+Write a SystemVerilog testbench for a `nbit_swizzling` module that performs bitwise operations on input data based on a selection signal(`sel`). The testbench should only provide a sequence of test cases to the instantiated RTL module for nbit-swizzling transformations based on the selection signal and ensure proper synchronization of different input signals.
+
+## Description
+**Parameters:**
+
+- `DATA_WIDTH`: Defines the data width of the input and output signals. (default: 16)
+
+**Inputs:**
+
+  - `data_in ([DATA_WIDTH-1:0])`: The input data to be swizzled.
+  - `sel ([1:0])`: Selection signal controlling the swizzling mode.
+
+**Outputs:**
+
+  - `data_out([DATA_WIDTH-1:0])`: The swizzled output data.
+
+## Module Description
+
+The `nbit_swizzling` module takes an N-bit input (`data_in`) and performs different bit-swizzling transformations based on the selection signal (`sel`).
+
+The behavior of `nbit_swizzling` is controlled by `sel`:   
+
+- **`sel = 2'b00`**: Complete bitwise reversal of `data_in`.  
+- **`sel = 2'b01`**:  Swap upper and lower halves of `data_in`.  
+- **`sel = 2'b10`**:  Swap quarter sections of `data_in`.  
+- **`sel = 2'b11`**:  Swap eighth sections of `data_in`.  
+- **`Default:`** `data_out` equals to `data_in`.
+
+**Edge Cases:**
+
+- `DATA_WIDTH` must be at least 16 and a multiple of 8.
+- The design(`nbit_swizzling`) must be implemented as combinational logic.
+
+## Testbench Requirements
+
+### Module Instantiation:
+
+- The `nbit_swizzling` module should be instantiated as uut, with all input and output signals properly connected. The testbench must achieve **100% coverage** by covering all input cases.
+
+### Input Stimulus Generation
+The testbench implements six test cases, each designed to validate a specific functionality:
+
+**Test 1: full_reverse**
+- Repeat 1000 times. Set `sel` = 2'b00.
+- Apply random values of `data_in` value in the range 0 to (2**`DATA_WIDTH`)-1.
+
+**Test 2: half_reverse**
+- Repeat 1000 times. Set `sel` = 2'b01.
+- Apply random values of `data_in` value in the range 0 to (2**`DATA_WIDTH`)-1.
+
+**Test 3: quarter_reverse**
+- Repeat 1000 times. Set `sel` = 2'b10.
+- Apply random values of `data_in` value in the range 0 to (2**`DATA_WIDTH`)-1.
+
+**Test 4: eighth_reverse**
+- Repeat 1000 times. Set `sel` = 2'b11.
+- Apply random values of `data_in` value in the range 0 to (2**`DATA_WIDTH`)-1.
+
+**Test 5: unknown_test**
+- Repeat 1000 times. Randomize `data_in`. Set `sel` = 2'bxx.
+- Validate the module's stability across different input patterns.
+
+**Test 6: random_test**
+- Repeat 1000 times. Randomize `sel` and `data_in`.
+- Validate the module's stability across different input patterns.
+
+**Synchronization**
+- After applying the new randomized inputs(`data_in` and `sel`), wait for **#10ns** before checking the outputs.
+
+Can you implement a SystemVerilog testbench with the above specifications to thoroughly validate all test cases?

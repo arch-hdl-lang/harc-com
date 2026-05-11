@@ -1,0 +1,131 @@
+Create a testbench to generate stimuli for the `gf_mac` module, which computes a byte-wide Galois Field (2<sup>8</sup>) multiply-accumulate function over two `WIDTH`-bit inputs (`a` and `b`). The module also supports a passthrough mode and provides status signals for validity, readiness, and error indication.
+
+---
+## Description
+
+The `gf_mac` module processes two input values by breaking them into 8-bit segments and multiplies each corresponding segment in GF(2<sup>8</sup>). The partial products are then XORed together to form an 8-bit accumulation result (`result`). A passthrough mode is included, allowing direct output of `a[7:0]` instead of the GF multiply-accumulate result. The module provides the `valid_result` and `ready` signals to indicate when the output can be sampled, and sets `error_flag` if the specified `WIDTH` is not a multiple of 8.
+
+---
+## Inputs
+
+### **1. Parameters**
+- **`WIDTH`**  
+  - **Type**: Integer parameter  
+  - **Default / Typical**: 32  
+  - **Purpose**: Defines the bit width of inputs `a` and `b`. Must be a multiple of 8 for proper GF(2<sup>8</sup>) segmentation.  
+  - **Impact**: If `WIDTH` is not divisible by 8, the module asserts `error_flag` and forces the result output to `8'b0`.  
+
+### **2. Registers / Signals for Stimulus**
+- **`reset`**  
+  - **Bit Width**: 1  
+  - **Purpose**: Asynchronous reset signal. When asserted, internal registers and outputs are forced to their default state.  
+  - **Usage**: Drives the module to initialize or clear state before applying new inputs.
+
+- **`enable`**  
+  - **Bit Width**: 1  
+  - **Purpose**: Activation signal to start the multiply-accumulate process. When low, the outputs remain at default values.  
+  - **Usage**: Driven high for normal operation or low to hold outputs in an inactive state.
+
+- **`pass_through`**  
+  - **Bit Width**: 1  
+  - **Purpose**: Mode selector. When set, the module outputs `a[7:0]` directly, bypassing the GF multiply-accumulate logic.  
+  - **Usage**: Driven high or low to test both normal GF MAC operation and pass-through behavior.
+
+- **`a [WIDTH-1:0]`**  
+  - **Bit Width**: `WIDTH` (e.g., 32 bits by default)  
+  - **Purpose**: First input operand for the GF MAC calculation or direct source (when `pass_through` is set).  
+  - **Usage**: Driven with a variety of patterns (random, edge, corner cases) to exercise the internal GF segments.
+
+- **`b [WIDTH-1:0]`**  
+  - **Bit Width**: `WIDTH` (e.g., 32 bits by default)  
+  - **Purpose**: Second input operand for the GF MAC calculation, partitioned into 8-bit segments for multiplication.  
+  - **Usage**: Driven alongside `a` to cover different multiply-accumulate scenarios in GF(2<sup>8</sup>).
+
+---
+## Outputs
+
+- **`result [7:0]`**  
+  - **Bit Width**: 8  
+  - **Purpose**: Final 8-bit accumulation of GF(2<sup>8</sup>) partial products or direct pass-through from `a[7:0]` when `pass_through` is set.  
+  - **Usage**: Observed after applying stimulus to determine the outcome of the GF MAC or pass-through operation.
+
+- **`valid_result`**  
+  - **Bit Width**: 1  
+  - **Purpose**: Indicates that `result` is valid when `enable` is asserted and `WIDTH` is a multiple of 8.  
+  - **Usage**: Sampled to confirm that the output is ready and valid in the current cycle.
+
+- **`ready`**  
+  - **Bit Width**: 1  
+  - **Purpose**: Mirrors `valid_result` in this design. Signals the environment that the module has produced the final output.  
+  - **Usage**: Observed to coordinate data flow, especially if additional handshake logic is applied.
+
+- **`error_flag`**  
+  - **Bit Width**: 1  
+  - **Purpose**: Asserts high when `WIDTH` is not divisible by 8. Remains low if `WIDTH` is valid.  
+  - **Usage**: Checked to detect or log configuration errors or unsupported widths during stimulus application.
+
+---
+## Instantiation
+
+A single instance of the `gf_mac` module can be created, supplying `reset`, `enable`, `pass_through`, `a`, and `b` as stimulus inputs and capturing `result`, `valid_result`, `ready`, and `error_flag` as outputs. The parameter `WIDTH` can be set to 32 or other multiples of 8 to explore different valid configurations, or to a non-multiple of 8 to observe the `error_flag` behavior.
+
+---
+## Input Generation and Observations
+
+1. **Deterministic Stimuli**  
+   - **Zero Inputs**: Apply `a=0`, `b=0` with `enable=1`, checking if the module outputs `0x00`.  
+   - **Simple Patterns**: Use known 8-bit segments repeated across `a` and `b` (e.g., `0x00000001`, `0xFFFFFFFF`) to observe repeated partial multiplications.  
+   - **Pass-Through Mode**: Set `pass_through=1` and apply different values to `a` to confirm that `result` matches `a[7:0]`.
+
+2. **Toggle Reset**  
+   - Assert `reset` for a period before releasing it, ensuring the module clears its outputs to default and deasserts `error_flag` unless `WIDTH` is invalid.
+
+3. **Valid and Invalid `WIDTH` Tests**  
+   - Use a `WIDTH` multiple of 8 (e.g., 32) to keep `error_flag` low and observe proper GF MAC operation.  
+   - Optionally modify `WIDTH` to a non-multiple of 8 in a separate simulation run to observe `error_flag` assertion and forced zero output.
+
+4. **Random Stimuli**  
+   - Generate random patterns for `a` and `b` to stress the partial products across the 8-bit segments.  
+   - Randomly switch `enable` and `pass_through` to exercise state transitions while capturing the resultant behavior.
+
+5. **Timing Intervals**  
+   - Change inputs at defined or random time steps (e.g., 5–10 time units) to capture the module’s combinational output.  
+   - Log and compare results after each stimulus to observe the correlation with input patterns.
+
+---
+## Module Interface
+
+### **Inputs**
+- **`reset` (1 bit)**: Active-high reset for the internal state.
+- **`enable` (1 bit)**: Activates the GF MAC operation when high.
+- **`pass_through` (1 bit)**: Selects direct pass of `a[7:0]` vs. GF MAC accumulation.
+- **`a [WIDTH-1:0]`**: First operand for the GF(2<sup>8</sup>) accumulate or pass-through data.
+- **`b [WIDTH-1:0]`**: Second operand for the GF(2<sup>8</sup>) accumulate.
+
+### **Outputs**
+- **`result [7:0]`**: 8-bit GF MAC output or direct pass of `a[7:0]`.
+- **`valid_result` (1 bit)**: Indicates a valid `result` when `enable` is high and `WIDTH` is valid.
+- **`ready` (1 bit)**: Mirrors the `valid_result` signal.
+- **`error_flag` (1 bit)**: High if `WIDTH` is invalid (not multiple of 8), otherwise low.
+
+---
+## Module Functionality
+
+- **GF MAC Calculation**  
+  - When `enable` is high and `pass_through` is low, the module slices `a` and `b` into 8-bit segments and multiplies each pair using a GF(2<sup>8</sup>) multiplier. The partial products are XORed to produce `result`.
+
+- **Pass-Through Mode**  
+  - When `pass_through` is high and `enable` is high, the 8-bit portion `a[7:0]` is directly mapped to `result`. 
+
+- **Readiness & Validity**  
+  - The signals `valid_result` and `ready` both indicate that the output is finalized and stable under valid conditions (`WIDTH % 8 == 0`).
+
+- **Error Indication**  
+  - The signal `error_flag` is asserted if `WIDTH` is not divisible by 8. In that case, `result` is forced to `8'b0`, and `valid_result` remains low.
+
+---
+## Additional Notes
+
+- **GF Multiplier Usage**: Internally, the module instantiates multiple `gf_multiplier` blocks (one per 8-bit segment of `a` and `b`) to compute partial products.
+- **Coverage of Corner Cases**: Stimuli can include values with alternating bits, large or small decimal representations, and identical inputs for both `a` and `b` to exercise the reduction logic in the GF multipliers.
+- **Scalability**: The parameterizable `WIDTH` allows the environment to explore larger or smaller inputs, provided the requirement (`WIDTH % 8 == 0`) is satisfied.

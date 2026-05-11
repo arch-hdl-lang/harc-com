@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_events_to_apb_0021",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "apb_controller",
+  "dut_module": "apb_controller",
+  "target_coverage": 99,
+  "auto_wrapper": null,
+  "n_ports": 17,
+  "clock_inputs": [
+    "clk"
+  ],
+  "multi_clock": false
+}

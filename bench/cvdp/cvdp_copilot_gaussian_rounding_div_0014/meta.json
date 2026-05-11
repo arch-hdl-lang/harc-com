@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_gaussian_rounding_div_0014",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "divider",
+  "dut_module": "divider",
+  "target_coverage": 99,
+  "auto_wrapper": null,
+  "n_ports": 8,
+  "clock_inputs": [
+    "clk"
+  ],
+  "multi_clock": false
+}

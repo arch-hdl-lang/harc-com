@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_restoring_division_0034",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "restoring_division",
+  "dut_module": "restoring_division",
+  "target_coverage": 95,
+  "auto_wrapper": null,
+  "n_ports": 9,
+  "clock_inputs": [
+    "clk"
+  ],
+  "multi_clock": false
+}

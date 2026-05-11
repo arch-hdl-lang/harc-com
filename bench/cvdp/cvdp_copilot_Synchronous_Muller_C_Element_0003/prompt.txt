@@ -1,0 +1,55 @@
+Write a SystemVerilog testbench to only generate stimulus for a `sync_muller_c_element` design with configurable inputs and pipeline depth. This design processes input signals through a configurable pipeline and produces a single-bit output based on the state of the inputs in the final pipeline stage, outputting 1 only when all inputs are 1 and 0 only when all inputs are 0, while maintaining its state otherwise. 
+
+---
+
+## Design Details
+
+### **Parameterization**
+1. **NUM_INPUT**: Specifies the number of input signals.
+   - Default: 2
+2. **PIPE_DEPTH**: Defines the number of pipeline stages.
+   - Default: 1
+
+### **Functional Behavior**
+1. **Pipeline Operation**:
+   - The pipeline captures and shifts the input states through `PIPE_DEPTH` stages.
+   - Inputs propagate stage by stage until they reach the final stage.
+2. **Output Logic**:
+   - The output signal is set based on the status of propagated input signals at the last pipeline stage.
+3. **Control Signal Behavior**:
+   - **Reset (`srst`)**: Active-high synchronous reset that clears the pipeline and output.
+   - **Clear (`clr`)**: Clears the pipeline and output without resetting.
+   - **Clock Enable (`clk_en`)**: Controls whether the pipeline registers update on the rising edge of the clock.
+
+### **Inputs and Outputs**
+- **Inputs**:
+  - `clk`: Clock signal.
+  - `srst`: Synchronous reset signal (active high).
+  - `clr`: Active high clear signal.
+  - `clk_en`: Active high clock enable signal.
+  - `inp[NUM_INPUT-1:0]`: NUM_INPUT-width vector representing the input signals.
+- **Outputs**:
+  - `out`: Output signal based on the logical state of the inputs in the last pipeline stage.
+
+---
+
+### Testbench Requirements:
+
+#### Instantiation
+
+- **Module Instance**: The `sync_muller_c_element` module must be instantiated as `sync_muller_c_element_inst`, with all input and output signals connected for testing.
+
+---
+
+#### Input Generation
+
+- **Input Patterns**: The testbench should continuously drive various input patterns to `inp` to cover all possibilities including:
+  - All `0`s, all `1`s, alternating patterns, and other corner cases.
+  - Randomized input patterns to exercise pipeline behavior.
+
+- **Control Signals**:
+  - Assert `srst` at the start of the simulation to reset the pipeline and output.
+  - Toggle `clr` during operation to clear the pipeline and output.
+  - Drive `clk_en` high and low during operation to test its effect on pipeline propagation.
+
+- **Output Latency**: Outputs will reflect the processed state of the inputs after a latency of `PIPE_DEPTH + 1` clock cycles. New inputs do not have to wait for this latency and can continue to be applied every clock cycle.

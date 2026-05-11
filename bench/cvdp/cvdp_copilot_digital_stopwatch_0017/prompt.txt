@@ -1,0 +1,108 @@
+Complete the given partial SystemVerilog testbench`dig_stopwatch_tb`. The testbench must instantiate the `dig_stopwatch` RTL module and provide input stimulus to observe its behavior. This module implements a parameterized stopwatch with seconds, minutes, and hour tracking functionality. The testbench should include different input scenarios like start, stop, and reset operations.
+
+## **Description**
+
+The `dig_stopwatch` module is a stopwatch that tracks elapsed time with inputs for clock, reset, and a start/stop control signal. It provides outputs for seconds, minutes, and hours, with appropriate rollovers and tracking behavior. The module operates based on a parameterized clock frequency (`CLK_FREQ`), which determines the timebase of the stopwatch.
+
+## **Parameters**
+- **CLK_FREQ**: Defines the input clock frequency in Hz, with a default value of 200 Hz. This frequency should be an integer value in Hz greater than the minimum value of 1 Hz. The clock divider within the module uses this parameter to generate a one-second pulse (`one_sec_pulse`).
+
+---
+
+## **Inputs**
+- **`clk`**: Clock signal for synchronizing operations. The design is synchronized to the positive edge of this clock.
+- **`reset`**: Asynchronous active-high reset signal to reset all counters to zero.
+- **`start_stop`**: Start/stop is a 1 bit control signal that controls if the stopwatch is running or paused. 
+
+---
+
+## **Outputs**
+- **`seconds [5:0] `**: 6-bit output representing seconds (range: 0–59).
+- **`minutes [5:0]`**: 6-bit output representing minutes (range: 0–59).
+- **`hour`**: Represents a one-bit signal that updates to 1 when one hour has passed.
+
+---
+### **PERIOD Calculation**
+The `PERIOD` is calculated using the formula `PERIOD = (1_000_000_000 / CLK_FREQ)`, where:
+- `1_000_000_000` represents 1 second in nanoseconds.
+- `CLK_FREQ` is the input clock frequency in Hz.
+- For `CLK_FREQ = 200`, the resulting `PERIOD = 5_000_000` nanoseconds (5 ms per clock cycle).
+
+## **Testbench Verification Features**
+
+### **Instantiation**
+The `dig_stopwatch` module is instantiated as `uut`, with its inputs and outputs connected to corresponding testbench signals. The parameter `CLK_FREQ` is set explicitly for the testbench to validate the module under different clock frequency conditions.
+
+
+### **Clock Generation**:
+   - A clock signal is generated with a period of `PERIOD`, ensuring a frequency of `CLK_FREQ`.
+
+### **Reset Operation**:
+   - `reset` is asserted at the beginning to initialize the stopwatch and deasserted after 100 nanoseconds.
+
+### **Start and Stop Operations**:
+   - The stopwatch starts with `start_stop = 1` and stops with `start_stop = 0`.
+
+### **Wait for Specific Duration**:
+   - The testbench uses the one-second pulse from the stopwatch to simulate precise elapsed time durations.
+
+### **Test Sequences**:
+   - **Run for 1000 seconds**: The stopwatch runs with `start_stop = 1`.
+   - **Pause for 200 clock cycles**: The stopwatch is paused with `start_stop = 0`.
+   - **Run for 3000 seconds**: The stopwatch resumes operation.
+   - **Pause for 500 clock cycles**: The stopwatch is paused again.
+   - **Reset during operation**: The `reset` signal is asserted for 5 clock cycles to reset the counters.
+   - **Run for 100 seconds**: After the reset, the stopwatch resumes.
+
+### **Waveform Dumping**:
+   - Simulation data is saved to a `.vcd` file for waveform analysis.
+
+### Partial Test Stimulus Generator Code :
+``` verilog
+module dig_stopwatch_tb;
+
+    // Parameters
+    parameter  CLK_FREQ = 200;              //  200 Hz clock 
+    localparam PERIOD = (1_000_000_000 / CLK_FREQ);
+
+    // Testbench Signals
+    reg clk;
+    reg reset;
+    reg start_stop;
+    wire [5:0] seconds;
+    wire [5:0] minutes;
+    wire hour;
+
+    // Clock generation
+    initial begin
+        clk = 0;
+        forever #(PERIOD/2) clk = ~clk;
+    end
+
+    // Instantiate the stopwatch module
+    dig_stopwatch #(
+        .CLK_FREQ(CLK_FREQ)
+    ) uut (
+        .clk(clk),
+        .reset(reset),
+        .start_stop(start_stop),
+        .seconds(seconds),
+        .minutes(minutes),
+        .hour(hour)
+    );
+
+    // Task to wait for a specific number of seconds
+    task wait_seconds(input integer num_seconds);
+        integer i;
+        begin
+            for (i = 0; i < num_seconds; i = i + 1) begin
+                @(posedge uut.one_sec_pulse);  
+                $display("Hour = %0d, Minutes = %0d , Seconds= %0d ", hour,minutes,seconds);
+            end
+        end
+    endtask
+    
+    // Insert the code for the remaining test stimulus here
+
+endmodule
+```

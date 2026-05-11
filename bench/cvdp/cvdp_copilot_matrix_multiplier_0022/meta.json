@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_matrix_multiplier_0022",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "matrix_multiplier",
+  "dut_module": "matrix_multiplier",
+  "target_coverage": 100,
+  "auto_wrapper": null,
+  "n_ports": 7,
+  "clock_inputs": [
+    "clk"
+  ],
+  "multi_clock": false
+}

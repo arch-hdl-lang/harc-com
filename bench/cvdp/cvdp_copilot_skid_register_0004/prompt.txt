@@ -1,0 +1,90 @@
+Create a **testbench** to apply **stimulus** to the `skid_register` module. This module serves as a pipeline register with a skid buffer to handle backpressure. The testbench must simulate various scenarios to verify data flow, handshake mechanisms, and buffer operations.
+
+---
+
+### **Inputs:**
+
+- `clk`: **1-bit clock signal**, toggling every **5 time units** (100MHz operation).
+- `rst`: **Active-high reset signal** to initialize the module.
+- `up_bus`: **8-bit data input from upstream**.
+- `up_val`: **Valid signal from upstream indicating data presence**.
+- `dn_rdy`: **Ready signal from downstream indicating it can accept data**.
+
+### **Outputs:**
+
+- `up_rdy`: **Ready signal from the module for upstream communication**.
+- `dn_bus`: **8-bit data output to the downstream**.
+- `dn_val`: **Valid signal for downstream data**.
+
+---
+
+### **Instantiation**
+
+The testbench must instantiate a single instance of the `skid_register` module:
+
+- **Skid Register Module (`dut`)**: Instantiated with its default configuration to verify data buffering and pipeline behavior.
+
+---
+
+### **Testbench Requirements**
+
+The testbench must apply a **wide range of test patterns** covering various operating conditions of the `skid_register` module:
+
+1. **Clock Generation:**
+   - `clk` must toggle every **5 time units**, ensuring a **10 ns clock period**.
+
+2. **Reset Handling:**
+   - `rst` must be **asserted at the beginning** of the simulation for **three cycles**.
+   - The module must correctly initialize internal registers when `rst` is de-asserted.
+
+3. **Stimulus Generation Strategy:**
+   - The testbench **must not verify outputs** (only generate inputs).
+   - The following test sequences must be executed:
+     - **No Backpressure (50 cycles)**: `dn_rdy` asserted while `up_val` and `up_bus` receive random values.
+     - **Full Backpressure (20 cycles)**: `dn_rdy` de-asserted to stall downstream data flow.
+     - **Random Backpressure (100 cycles)**: `dn_rdy` toggles randomly while `up_val` sends variable data.
+     - **Pipeline Flush (20 cycles)**: Ensure buffered data is correctly forwarded when `dn_rdy` remains asserted.
+     - **Multiple Data Transactions**: Apply various input patterns to check how the module buffers and forwards data.
+     - **Randomized Data Sequences**: Generate multiple upstream and downstream handshake variations.
+     - **Continuous Streaming Mode**: Test without stalls to check smooth data flow.
+     - **Pipeline Stall and Restart**: Temporarily hold `dn_rdy` low and later assert it to observe how the module resumes.
+     - **Edge Case Timing Conditions**: Stress test with fast-changing `up_val` and `dn_rdy` transitions.
+
+4. **Handling Continuous and Edge Cases:**
+   - The testbench must ensure a **full range of data transactions** occur correctly.
+   - **Edge cases of data buffering** must be exercised to verify stall and release conditions.
+
+5. **Waveform Generation:**
+   - The testbench must generate a `.vcd` waveform file to allow waveform analysis.
+
+---
+
+### **Coverage and Compliance**
+
+- The testbench must ensure **high coverage** across all pipeline behaviors and backpressure conditions.
+- The **DUT instance name `dut` must be explicitly used** for instantiation.
+
+---
+
+### **Test Plan Overview**
+
+The testbench must ensure **comprehensive RTL coverage** by applying:
+
+- **Valid data transfers** under continuous downstream availability.
+- **Stall conditions** when downstream is blocked.
+- **Randomized test scenarios** for data and handshake signals.
+- **Buffer management validation** under varied input sequences.
+- **Reset handling** to verify asynchronous initialization integrity.
+- **High-frequency toggling of control signals** to test robustness.
+- **Back-to-back input bursts and sporadic handshakes** to assess real-world performance.
+
+This testbench should provide a **comprehensive input stimulus environment** for `skid_register`, ensuring correct operation under various test conditions.
+
+---
+
+### **Note:**
+- The testbench **must only generate stimulus** without verifying outputs.
+- The **DUT instance name `dut` must be explicitly used** for instantiation.
+- **Ensure the maximum possible input coverage** without adding assertions or comparisons.
+
+Can you implement a **SystemVerilog testbench** with the above stimulus requirements?

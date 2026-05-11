@@ -1,0 +1,36 @@
+Write a SystemVerilog testbench for a Sobel filter module named `sobel_filter` that performs edge detection on a stream of pixel data. The Sobel filter calculates the gradient magnitude using a 3x3 pixel window and determines whether the edge strength exceeds a predefined threshold `THRESHOLD`. The testbench should only provide stimuli for the design across various input scenarios, including edge cases, and ensure proper synchronization of different input signals.
+
+#### Inputs:
+- `clk`: Clock signal for synchronization. The design is synchronized to the positive edge of this clock.
+- `rst_n`: Active-low asynchronous reset. Clears internal buffers, counters, and outputs.
+- `pixel_in [7:0]`: 8-bit input pixel data.
+- `valid_in`: An active-high signal that indicates the validity of the `pixel_in` data.
+
+#### Outputs:
+- `edge_out [7:0]`: 8-bit output indicating the presence of an edge (255 for an edge, 0 otherwise).
+- `valid_out`: An active-high signal that indicates when `edge_out` is valid.
+
+### Overview of the Design:
+
+The Sobel filter detects edges in an image by first computing the gradients in the horizontal (`Gx`) and vertical (`Gy`) directions, then calculating the gradient magnitude (`|Gx| + |Gy|`) and comparing it to a threshold to determine whether a pixel is part of an edge. The `THRESHOLD` is set to a default value of 128, which defines the threshold for edge detection. Pixels with gradient magnitudes greater than this value are classified as edges.  
+
+A 3x3 window of pixels is sent as a continuous stream of inputs through `pixel_in`, and `valid_in` remains high while pixels are supplied. The module uses a 3x3 buffer to store pixel data, ensuring it only outputs valid results (`valid_out` and `edge_out`) once the buffer is fully populated with 9 pixels. Pixels are shifted sequentially to store new incoming pixels. (The input is sent row by row, left to right. Starting from the top row, the traversal proceeds to the bottom row.) The filter performs convolution when the buffer is fully populated and outputs the result. After processing each window, the module clears the buffer and waits for the next set of 9 pixels. The buffer is also cleared when reset is asserted. Assume that the handling of overlapping windows is handled externally, and this design processes each window as a new one (no storing of pixels from the previous window).
+
+---
+
+### Testbench Requirements:
+
+#### Module Instantiation:
+- The Sobel filter module should be instantiated as `dut`, with all input and output signals properly connected. The testbench must cover all possible input scenarios to achieve 100% coverage. 
+
+#### Input Stimulus Generation:
+1. **Pixel Stream Generation:**
+   - The testbench should generate a stream of 8-bit pixel values (`pixel_in`) and assert `valid_in` when pixel data is valid.
+   - Include edge cases like:
+     - Uniform pixel values (all zeros, all maximum values).
+     - Pixel gradients (e.g., increasing or decreasing values across the 3x3 window).
+     - Random pixel values to simulate real-world scenarios.
+2. **Synchronization:**
+   - The RTL design maintains a continuous stream of valid pixels by monitoring the assertion of `valid_in`. When `valid_in` remains consistently asserted after a full window is completed, the module resets the count and begins loading a new set of pixels. Therefore, the test case must be designed to reset `valid_in` after loading a 3×3 block of pixels and also to continuously assert `valid_in` for multiple input windows. Additionally, it should be capable of resetting `valid_in` mid-stream to cover all possible scenarios.
+3. Reset Testing:
+- Set the reset (`rst_n`) to clear all internal states (e.g., pixel buffer, counters, outputs) between input windows to create a scenario where the module receives inputs after the reset is de-asserted.

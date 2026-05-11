@@ -1,0 +1,105 @@
+Create a SystemVerilog testbench module named `tb_hebb_gates` that instantiates the `hebb_gates` module as the Unit Under Test (UUT). The testbench must include a stimulus generator that systematically drives various input conditions to achieve a minimum of 95% code and functional coverage for the `hebb_gates` module. The `hebb_gates` implements a Moore Finite State Machine (FSM) to train a Hebbian learning model. The module takes signed 4-bit inputs (`a` and `b`), a 2-bit gate selector, and control signals for starting the FSM and resetting the system. It sequentially performs training steps such as weight initialization, target selection, weight/bias updates, and convergence checks using the Hebbian learning rule. The module outputs the updated weights (`w1` and `w2`), bias, and the FSM's current and next state. The system uses a gate selection module to determine the target outputs based on logical gate operations for training.
+
+## Design Specifications:
+- Hebbian rule is a type of unsupervised neural network learning algorithm
+
+## Abstract Algorithm:
+- The hebbian or hebb rule works based on the following algorithm
+
+-  **Step 1**: Initialize all the weights and bias to zero.
+                                  w<sub>I</sub> = 0 for i = 1 to n, n is the number of input vectors
+
+- **Step 2**: For each input training vector and target output pair, do the following:
+
+    - **Step 2a**: Set activation for input units
+                         x<sub>i</sub>=s<sub>i</sub>, x is a register to store the input vector, where x is a register to store the input vector
+
+    -  **Step 2b**: Set activation for output unit
+                            y = t, where t is the target vector and y is the output vector
+
+    -  **Step 2c**: Adjust the weights and bias
+                         w<sub>i</sub>(new) = w<sub>i</sub>(old) + delta_w
+                         bias(new) = bias(old) + delta_b
+                          Where:
+                            delta_w = x<sub>I</sub> * t
+                            delta_b = t
+                   
+## Inputs and Outputs:
+## Inputs:
+- `clk` (1-bit): Posedge Clock signal.
+- `rst` (1-bit): Asynchronous Negedge Reset signal. When asserted LOW , the FSM is initialized to State_0 and iteration counter is initialized to 0.
+- `start `(1-bit): Active HIGH Signal to initiate the FSM.
+- `a`, `b` (4-bit each, [3:0], signed): Bipolar input signals [-1 ,1]. Only -1 and 1 have to be considered as valid inputs
+- `target_select`(2-bit,[1:0]): Selector to specify the target for a given gate.
+- `gate_select` (2-bit,[1:0]): Selector to specify the given gate
+## Outputs:
+- `w1`, `w2` (4-bit each,[3:0], signed): Trained weights for the inputs.
+- `bias` (4-bit, signed,[3:0]): Trained bias value.
+- `present_state`, `next_state` (4-bit each,[3:0]): Current and next states of the Training FSM.
+
+**Instantiation** :
+The testbench instantiates the `hebb_gates` module as uut and connects the signals between the module and the testbench. Each input and output from the uut is connected to its corresponding signal in the testbench.
+
+## **Input Generation and Validation**:
+**Stimulus**: The test bench should employ multiple tasks to simulate training epochs for different gate selections, each applying a sequence of input stimuli. Each task should correspond to one epoch for a given gate configuration and varies the input combinations of signals' a and `b`, along with control signals `gate_select` and `target_select`.
+
+**Gate 00 (gate_select = 2’b00) Epochs**:
+
+**Test Case 1: First Epoch for Gate 00**:
+- Control: `gate_select` should be set to 00, `target_select` should be set to 00, and `start` should be asserted HIGH.
+- Inputs: A sequence where (a, b) takes on values: (1, 1) → (1, –1) → (–1, 1) → (–1, –1).
+
+**Test Case 2: Second Epoch for Gate 00**:
+- Control: `gate_select` should be set to 00, and `target_select` should be set to 01.
+- Inputs: The sequence is modified to start with (–1, –1) and then vary through (–1, 1), (1, –1), and (1, 1).
+
+**Test Case 3: Third Epoch for Gate 00**:
+- Control: `gate_select` should be set to 00, `target_select` should be set to 10.
+- Inputs: Similar to previous epochs but with a different ordering of input polarity to test consistency in weight and state transitions.
+
+**Test Case 4: Fourth Epoch for Gate 00**:
+- Control: `gate_select` should be set to 00, `target_select` should be set to 11.
+- Inputs: Another permutation of input values is applied to verify module behavior further.
+
+**Test Case 5: Fifth Epoch for Gate 00 (Invalid Target)**:
+- Control: `gate_select` should be set to 00, `target_select` should be set to an unknown value (2’bxx).
+- Inputs: Standard sequence similar to the first epoch.
+
+**Gate 01 (gate_select = 2’b01), Gate 10 (gate_select = 2’b10), and Gate 11 (gate_select = 2’b11) Epochs**:
+- For each valid gate (01, 10, 11), the testbench defines four epochs with explicitly defined target selections (00, 01, 10, 11) and a fifth epoch using an unknown target (2’bxx).
+- In each epoch, the tasks apply a similar method: a sequence of input combinations is applied to a and b with specific delays (#60, #70, #80, etc.) to mimic realistic timing conditions.
+
+**Invalid Gate Epochs**:
+ **Test Case: Invalid Epochs 1–5**
+- Control: `gate_select` should be set to an unknown value (2’bxx), with target selections both valid (00–11) and completely unknown (2’bxx).
+Inputs: A variety of input patterns (including zeros and mixed values) are applied.
+
+## Learning Logic:
+- Weights (w1, w2) and bias are updated incrementally based on the input values and a computed error:
+    delta_w1 = x1 * target
+    delta_w2 = x2 * target
+    delta_b = target 
+    w1 = w1 + delta_w1
+    w2 = w2 + delta_w2
+    bias = bias + delta_b
+
+- Target values are determined using a `gate_target` submodule based on `gate_select`:
+  - gate_select = 2'b00: AND gate behavior.
+  - gate_select = 2'b01: OR gate behavior.
+  - gate_select = 2'b10: NAND gate behavior.
+  - gate_select = 2'b11: NOR gate behavior.
+
+## FSM Design:
+There are 11 states handled by Moore FSM.
+- State_0: Reset state.
+- State_1: Capture inputs.
+- State_2-State_6: Assign targets based on the selected gate.
+- State_7: Compute deltas for weights and bias.
+- State_8: Update weights and bias.
+- State_9: Loop through training iterations.
+- State_10: Return to the initial state.
+
+## Functional Requirements:
+- Weight adjustment must follow the Hebbian learning rule.
+- The FSM must support multiple training iterations for every possible input combination of a two-input logic gate.
+- Outputs (`w1`, `w2`, `bias`) should reflect trained values at the end of the process.

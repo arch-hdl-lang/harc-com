@@ -1,0 +1,14 @@
+{
+  "id": "cvdp_copilot_gray_to_binary_0014",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "gray_to_binary_top",
+  "dut_module": "gray_to_binary",
+  "target_coverage": 95,
+  "auto_wrapper": "gray_to_binary_top.sv",
+  "n_ports": 2,
+  "clock_inputs": [],
+  "multi_clock": false
+}

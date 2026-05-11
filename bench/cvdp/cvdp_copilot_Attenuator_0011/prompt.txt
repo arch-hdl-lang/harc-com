@@ -1,0 +1,79 @@
+Create a testbench for the `Attenuator` module, which takes a 5-bit input (`data`) and shifts it out serially after detecting changes, finally latching with `ATTN_LE`.
+
+---
+
+## Description
+
+### Inputs
+
+- **Registers**:
+  - `clk (1 bit)`: Clock signal driving the state machine and internal half-rate clock generation (`clk_div2`).
+  - `reset (1 bit)`: Active-high, synchronous reset. When asserted, all state registers and outputs (`ATTN_CLK`, `ATTN_DATA`, `ATTN_LE`) are forced zero.
+  - `data (5 bits)`: An input register. Any change from the previous value triggers a **LOAD** phase, followed by serial shifting and a final latch.
+
+### Outputs
+
+- **Wires**:
+  - `ATTN_CLK (1 bit)`: A clock-like output pulsed high during the **SHIFT** state to shift bits from the internal register.
+  - `ATTN_DATA (1 bit)`: Serial data output, sending the shifted 5-bit pattern bit by bit.
+  - `ATTN_LE (1 bit)`: Latch enable signal pulsed high for one cycle after shifting completes.
+
+---
+
+## Input Generation
+
+- **Random Input Generation**:  
+  The testbench drives random 5-bit values on `data` to ensure the module sees a range of patterns:
+  - Different bit combinations (e.g., `5'b00000`, `5'b11111`, random).
+  - Consecutive changes that repeatedly trigger LOAD → SHIFT → LATCH sequences.
+  - Long intervals without change, remaining in the **IDLE** state.
+
+- **Edge Cases**:  
+  The testbench should also drive specific sequences:
+  - Repeated identical data, ensuring the module stays in **IDLE** (no SHIFT or LATCH).
+  - Patterns that confirm each bit is shifted correctly in order (`ATTN_DATA`) while toggling `ATTN_CLK`.
+  - Observing `ATTN_LE` pulses for one cycle when shifting completes.
+
+---
+
+## Stabilization Period
+
+- The testbench waits a few clock cycles (e.g., 2–4 cycles of `clk`) after driving each new `data` value to allow the FSM to step from **LOAD** into **SHIFT** and eventually **LATCH** if 5 bits are shifted.
+
+---
+
+## Instantiation
+
+Name the instance of the module as `uut`.
+
+---
+
+Follows the specification for building the RTL of the module, use it as reference for the verification environment too:
+
+### Module Interface
+
+1. **Inputs**:
+   - `clk`: 1-bit clock signal.  
+   - `reset`: 1-bit active-high reset.  
+   - `data [4:0]`: 5-bit register whose changes trigger loading and shifting.
+
+2. **Outputs**:
+   - `ATTN_CLK` (1 bit): Pulsed during SHIFT to clock out each bit.  
+   - `ATTN_DATA` (1 bit): Serial data output from the shift register.  
+   - `ATTN_LE` (1 bit): Asserted for one cycle after all 5 bits shift out, latching the final result externally.
+
+### Module Functionality
+
+- **Clock Division**:  
+  An internal `clk_div2` toggles on every rising edge of `clk`, creating a slower clock domain for shifting.
+
+- **Finite State Machine**:
+  - **IDLE**: Waits if `data == old_data`. On detecting `data != old_data`, transitions to **LOAD**.
+  - **LOAD**: Captures `data` into `shift_reg`, outputs the MSB on `ATTN_DATA`, and prepares for shifting.
+  - **SHIFT**: Toggles `ATTN_CLK` high and left-shifts the remaining bits, decreasing a bit counter until 0.
+  - **LATCH**: Pulses `ATTN_LE` high for one cycle, then returns to **IDLE**.
+
+- **Reset Conditions**:  
+  - While `reset=1`, `current_state` = **IDLE**, `shift_reg` = `5'b00000`, `ATTN_CLK=0`, `ATTN_DATA=0`, `ATTN_LE=0`.
+
+---

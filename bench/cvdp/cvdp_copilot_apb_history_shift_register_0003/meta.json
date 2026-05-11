@@ -1,0 +1,17 @@
+{
+  "id": "cvdp_copilot_apb_history_shift_register_0003",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "APBGlobalHistoryRegister_top",
+  "dut_module": "APBGlobalHistoryRegister",
+  "target_coverage": 98,
+  "auto_wrapper": "APBGlobalHistoryRegister_top.sv",
+  "n_ports": 17,
+  "clock_inputs": [
+    "pclk",
+    "clk_gate_en"
+  ],
+  "multi_clock": true
+}

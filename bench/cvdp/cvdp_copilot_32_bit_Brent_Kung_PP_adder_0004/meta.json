@@ -1,0 +1,14 @@
+{
+  "id": "cvdp_copilot_32_bit_Brent_Kung_PP_adder_0004",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "brent_kung_adder_top",
+  "dut_module": "brent_kung_adder",
+  "target_coverage": 80,
+  "auto_wrapper": "brent_kung_adder_top.sv",
+  "n_ports": 5,
+  "clock_inputs": [],
+  "multi_clock": false
+}

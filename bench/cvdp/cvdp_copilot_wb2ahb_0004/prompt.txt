@@ -1,0 +1,98 @@
+Write a System Verilog testbench to generate stimulus for a `wishbone_to_ahb_bridge_tb` module, which is responsible for bridging transactions between a Wishbone master and an AHB slave. 
+
+## **Design Specification**
+The `wishbone_to_ahb_bridge` module serves as a bridge between the Wishbone bus and the AMBA AHB bus, facilitating data transfers between a Wishbone master and an AHB slave. The bridge is responsible for handling address alignment, transfer size selection, and acknowledgment signaling, ensuring compatibility between the two protocols.
+
+### **Functionality**
+- The bridge takes Wishbone signals (`cyc_i`, `stb_i`, `we_i`, `sel_i`, `addr_i`, `data_i`) as inputs and converts them into AHB-compatible signals (`haddr`, `hwrite`, `hsize`, `htrans`, `hwdata`).
+- The bridge properly aligns **Wishbone byte enables (`sel_i`)** to the corresponding **AHB address and data phase transactions**.
+- Acknowledgment (`ack_o`) is generated when the **AHB slave is ready (`hready`)**, ensuring correct transaction completion.
+- Supports **single transfers** with **variable transfer sizes** (`byte`, `half-word`, `word`).
+- Includes **address holding logic** to maintain proper transactions in case of stalled AHB responses.
+
+---
+
+### Inputs
+- **Wishbone Ports (from WB Master):**
+  - `clk_i`: Clock signal for Wishbone operations.
+  - `rst_i`: Active-low reset signal to initialize the bridge.
+  - `cyc_i`: Indicates a valid Wishbone transaction cycle.
+  - `stb_i`: Strobe signal for valid data on the Wishbone interface.
+  - `sel_i[3:0]`: Byte enables to select which bytes are active.
+  - `we_i`: Write enable signal.
+  - `addr_i[31:0]`: Address for the Wishbone transaction.
+  - `data_i[31:0]`: Write data from the Wishbone master.
+- **AHB Ports (from AHB Slave):**
+  - `hclk`: Clock signal for AHB operations.
+  - `hreset_n`: Active-low reset signal for the AHB interface.
+  - `hrdata[31:0]`: Read data from the AHB slave.
+  - `hresp[1:0]`: AHB response signal.
+  - `hready`: Indicates when the AHB slave is ready.
+
+### Outputs
+- **Wishbone Outputs:**
+  - `data_o[31:0]`: Read data back to the Wishbone master.
+  - `ack_o`: Acknowledge signal for Wishbone operations.
+- **AHB Outputs:**
+  - `htrans[1:0]`: AHB transaction type.
+  - `hsize[2:0]`: Size of the AHB transfer.
+  - `hburst[2:0]`: Burst type (always single in this design).
+  - `hwrite`: Write enable signal for AHB transactions.
+  - `haddr[31:0]`: Address for the AHB transaction.
+  - `hwdata[31:0]`: Write data to the AHB slave.
+
+---
+
+## **Testbench Requirements**
+### **Instantiation**
+- The `wishbone_to_ahb_bridge` module must be instantiated as **DUT (Device Under Test)**.
+- All input and output signals should be properly connected for functional verification.
+
+### **Test Scenarios**
+#### **Clock and Reset Generation**
+- Generate two separate clocks:
+  - `clk_i` for the Wishbone interface.
+  - `hclk` for the AHB interface.
+- Implement an asynchronous reset (`rst_i` for Wishbone, `hreset_n` for AHB) at the start of the test.
+
+#### **Wishbone Transactions**
+##### **Write Transactions**
+- Perform multiple write operations using different addresses, data values, and byte enable (`sel_i`) configurations.
+- Validate the correct Wishbone to AHB conversion by checking:
+  - Address alignment
+  - Transfer size selection (`hsize`)
+  - Data transfer correctness (`hwdata`)
+  - Acknowledgment (`ack_o`)
+- Include test cases for:
+  - Byte writes (`sel_i = 4'b0001, 4'b0010, 4'b0100, 4'b1000`)
+  - Half-word writes (`sel_i = 4'b0011, 4'b1100`)
+  - Word writes (`sel_i = 4'b1111`)
+
+##### **Read Transactions**
+- Perform read operations using different addresses.
+- Ensure correct data retrieval from the AHB slave (`hrdata` → `data_o`).
+- Verify acknowledgment timing.
+
+#### **Address Alignment and Endianness Handling**
+- Check how the bridge modifies Wishbone addresses to match AHB alignment rules.
+- Ensure that byte and half-word transfers properly align data in `hwdata` and `data_o`.
+
+#### **AHB Protocol Compliance**
+- Validate the AHB transaction type (`htrans`) for different Wishbone operations:
+  - Idle (2'b00)
+  - Non-sequential (2'b10)
+  - Sequential (2'b11) – if burst support is added in the future
+- Verify proper operation of:
+  - AHB Ready Handling (`hready`):
+    - Ensure bridge correctly waits for `hready` before transferring data.
+  - AHB Response Handling (`hresp`):
+    - Include test cases where the AHB slave returns an error response (`hresp = 2'b01`).
+    - Check whether the bridge correctly stalls and recovers from such conditions.
+
+#### **Error and Recovery Handling**
+- AHB Error (`hresp = 2'b01`)
+  - Ensure the bridge correctly halts and resets the transaction.
+- AHB Busy Handling (`hready = 0`)
+  - Verify that the bridge waits and resumes when `hready` becomes `1`.
+
+---

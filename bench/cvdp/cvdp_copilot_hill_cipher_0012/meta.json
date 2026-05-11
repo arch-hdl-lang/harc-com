@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_hill_cipher_0012",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "hill_cipher",
+  "dut_module": "hill_cipher",
+  "target_coverage": 90,
+  "auto_wrapper": null,
+  "n_ports": 7,
+  "clock_inputs": [
+    "clk"
+  ],
+  "multi_clock": false
+}

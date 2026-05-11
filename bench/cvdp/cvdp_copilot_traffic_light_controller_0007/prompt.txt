@@ -1,0 +1,98 @@
+Create a test bench in SystemVerilog for a Verilog module named `traffic_controller_fsm`. Based on sensor inputs and timing signals, the FSM manages the traffic lights for both a main road and a side road. The test bench should systematically generate input vectors, apply them to the module under test (MUT) and aim to achieve 100% or the maximum possible coverage.
+
+---
+## Instantiation
+
+Name the instance of the RTL as **dut**.
+
+## **RTL Parameter Inputs - Outputs and Functional behaviour**
+
+---
+### Inputs and Outputs
+
+| Signal                       | Direction | Bit Width | Active Level | Description                                                                             |
+|------------------------------|-----------|-----------|--------------|-----------------------------------------------------------------------------------------|
+| **`i_clk`**                  | Input     | 1         | —            | System clock signal, with FSM transitions occurring on the rising edge.                 |
+| **`i_rst_b`**                | Input     | 1         | Active-low   | Asynchronous reset signal. When asserted (`0`), FSM resets to its initial state.        |
+| **`i_vehicle_sensor_input`** | Input     | 1         | Active-high  | Detects vehicle presence on the side road. High (`1`) when a vehicle is detected.       |
+| **`i_short_timer`**          | Input     | 1         | Active-high  | Indicates the expiration of the short timer. High (`1`) when the short timer expires.   |
+| **`i_long_timer`**           | Input     | 1         | Active-high  | Indicates the expiration of the long timer. High (`1`) when the long timer expires.     |
+| **`o_short_trigger`**        | Output    | 1         | Active-high  | Initiates the short timer. Set to high (`1`) to start the short timer.                  |
+| **`o_long_trigger`**         | Output    | 1         | Active-high  | Initiates the long timer. Set to high (`1`) to start the long timer.                    |
+| **`o_main[2:0]`**            | Output    | 3         | —            | Controls main road traffic lights: Red (`3'b100`), Yellow (`3'b010`), Green (`3'b001`). |
+| **`o_side[2:0]`**            | Output    | 3         | —            | Controls side road traffic lights: Red (`3'b100`), Yellow (`3'b010`), Green (`3'b001`). |
+
+### FSM Output Table
+
+| State | Description                           | `o_main`          | `o_side`          | `o_short_trigger` | `o_long_trigger` |
+|-------|---------------------------------------|-------------------|-------------------|-------------------|------------------|
+| **S1** | Main road green, side road red       | `3'b001` (Green)  | `3'b100` (Red)    | 0                 | 1                |
+| **S2** | Main road yellow, side road red      | `3'b010` (Yellow) | `3'b100` (Red)    | 1                 | 0                |
+| **S3** | Main road red, side road green       | `3'b100` (Red)    | `3'b001` (Green)  | 0                 | 1                |
+| **S4** | Main road red, side road yellow      | `3'b100` (Red)    | `3'b010` (Yellow) | 1                 | 0                |
+
+### FSM Transition Logic
+- **S1 → S2**: Transition when a vehicle is detected (`i_vehicle_sensor_input = 1`) and the long timer expires (`i_long_timer = 1`).
+- **S2 → S3**: Transition upon short timer expiration (`i_short_timer = 1`).
+- **S3 → S4**: Transition when either vehicle is detected (`i_vehicle_sensor_input = 1`) or the long timer expires (`i_long_timer = 1`).
+- **S4 → S1**: Transition upon short timer expiration (`i_short_timer = 1`).
+
+### Requirements
+1. **Reset Behavior**: When the reset signal is active (`i_rst_b = 0`), the FSM should reset to **State S1** with the following initial values:
+   - **`o_main`** set to `3'b000` (main road lights off).
+   - **`o_side`** set to `3'b000` (side road lights off).
+   - **`o_long_trigger`** set to `1'b0` (long timer trigger reset).
+   - **`o_short_trigger`** set to `1'b0` (short timer trigger reset).
+2. **Clocked Transitions**: The FSM should transition between states on the rising edge of the clock (`i_clk`).
+3. **Synchronized Outputs**: Ensure the traffic light outputs (`o_main` and `o_side`) and the timer triggers (`o_long_trigger`, `o_short_trigger`) are properly synchronized with state transitions.
+
+
+## 4. Test Bench Requirements
+
+### 4.1 Stimulus Generation
+1. **Reset and Initialization Stimulus**  
+   1.1. Assert the asynchronous reset by driving the active-low reset signal to its active state for several clock cycles while keeping all other inputs inactive.  
+   1.2. Deassert the reset by returning the active-low reset signal to its inactive state and wait one clock cycle for system initialization.
+
+2. **Stimulus for the State with Main Road Green and Side Road Red (S1)**  
+   2.1. **No Transition Conditions:**  
+     2.1.1. Apply stimulus with the sensor input inactive and the long timer signal inactive for several clock cycles.  
+     2.1.2. Apply stimulus with the sensor input active and the long timer signal inactive for several clock cycles.  
+     2.1.3. Apply stimulus with the sensor input inactive and the long timer signal active for several clock cycles.  
+   2.2. **Transition Condition:**  
+     2.2.1. Apply stimulus with both the sensor input and the long timer signal active for one clock cycle.
+
+3. **Stimulus for the State with Main Road Yellow and Side Road Red (S2)**  
+   3.1. **No Transition Condition:**  
+     3.1.1. Maintain the short timer signal inactive for several clock cycles.  
+   3.2. **Transition Condition:**  
+     3.2.1. Provide a one-clock-cycle pulse on the short timer signal.
+
+4. **Stimulus for the State with Main Road Red and Side Road Green (S3)**  
+   4.1. **No Transition Condition:**  
+     4.1.1. Apply stimulus with the sensor input active and the long timer signal inactive for several clock cycles.  
+   4.2. **Transition Conditions:**  
+     4.2.1. Transition Branch A: Apply stimulus with the sensor input inactive (with the long timer signal inactive) for one clock cycle.  
+     4.2.2. Transition Branch B: Alternatively, apply stimulus with the sensor input active and the long timer signal active for one clock cycle.
+
+5. **Stimulus for the State with Main Road Red and Side Road Yellow (S4)**  
+   5.1. **No Transition Condition:**  
+     5.1.1. Maintain the short timer signal inactive for several clock cycles.  
+   5.2. **Transition Condition:**  
+     5.2.1. Provide a one-clock-cycle pulse on the short timer signal.
+
+6. **Clock and Synchronization Stimulus**  
+   6.1. Generate a continuous clock signal.  
+   6.2. Ensure that any changes to the input signals are applied between clock edges so that state transitions occur on the rising edge of the clock.
+
+7. **Timer Pulse Width Stimulus**  
+   7.1. Apply one-clock-cycle pulses to the short timer and long timer signals to simulate timer expiration events.  
+   7.2. In separate scenarios, hold the short timer and long timer signals active for multiple clock cycles.
+
+8. **Comprehensive Sequence Stimulus**  
+   8.1. Start with the reset sequence as described in section 1.  
+   8.2. Progress through the full state cycle by sequentially applying stimulus to:  
+     8.2.1. The state with main road green and side road red (S1), including both no transition and transition conditions.  
+     8.2.2. The state with main road yellow and side road red (S2), including both no transition and transition conditions.  
+     8.2.3. The state with main road red and side road green (S3), including both no transition and transition conditions using both branches.  
+     8.2.4. The state with main road red and side road yellow (S4), including both no transition and transition conditions.

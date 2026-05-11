@@ -1,0 +1,89 @@
+Create a testbench to generate the stimuli for the `hill_cipher` module, which applies a 3×3 key matrix to a 3-letter (15-bit) plaintext vector, computing the ciphertext (also 3 letters, 15 bits) modulo 26.
+
+---
+
+## Description
+
+### Inputs
+
+- **Registers**:
+  - `clk (1 bit)`: Clock signal that drives the internal finite state machine (FSM) and arithmetic logic.
+  - `reset (1 bit)`: Active-high, synchronous reset that clears all registers and returns the module to the `IDLE` state.
+  - `start (1 bit)`: A strobe signal indicating the module should begin computing the ciphertext for the provided `plaintext` and `key`.
+  - `plaintext (15 bits)`: Three letters, each 5 bits, forming the message to encrypt.
+  - `key (45 bits)`: A 3×3 matrix of 9 elements, each 5 bits, used to multiply the plaintext vector in the Hill Cipher algorithm.
+
+### Outputs
+
+- **Wires**:
+  - `ciphertext (15 bits)`: The resulting 3-letter (5 bits per letter) encrypted output.
+  - `done (1 bit)`: Goes high for one cycle when the module finishes encryption, signaling the `ciphertext` is valid.
+
+---
+
+## Input Generation
+
+- **Random Input Generation**:  
+  The testbench provides random 15-bit values for `plaintext` (covering possible 3-letter combinations) and 45-bit values for `key` (covering random 3×3 matrices). These random tests help uncover boundary issues and verify the FSM’s transitions.
+
+- **Directed Patterns**:  
+  The testbench also applies specific edge-case values for `plaintext` and `key`, such as:
+  - `plaintext = 15'h0000` (all zeros).
+  - `key = 45'h0000000000` (all zeros).
+  - Maximal or near-maximal values to ensure the modulo operations function correctly.
+  - Sequences that check if multiple consecutive encryption requests work as intended.
+
+---
+
+## Stabilization Period
+
+- The testbench asserts `start` for **one clock cycle** after setting `plaintext` and `key`.  
+- It then waits until `done` goes high, indicating the FSM has advanced through `COMPUTE`, `COMPUTE_MOD`, and finally `DONE`.  
+- Once `done=1`, the testbench samples `ciphertext` and logs the result.
+
+---
+
+## Instantiation
+
+Name the instance of the module as `uut`.
+
+---
+
+Follows the specification for building the RTL of the module, use it as reference for the verification environment too:
+
+### Module Interface
+
+1. **Inputs**:
+   - `clk (1 bit)`
+   - `reset (1 bit)`
+   - `start (1 bit)`
+   - `plaintext [14:0]`
+   - `key [44:0]`
+
+2. **Outputs**:
+   - `ciphertext [14:0]`
+   - `done`
+
+### Module Functionality
+
+Instead of viewing the key as a matrix, consider it as **9 separate 5-bit key elements**, grouped in **3 sets** (each set has 3 elements). The `plaintext` is **3 letters**, each 5 bits. The module computes each output letter as follows:
+
+1. **Multiply & Sum**:  
+   For one of the 3 output letters, the module multiplies each of the 3 plaintext letters (5 bits each) by the corresponding key element in that set. It then adds these 3 products together.
+
+2. **Modulo Operation**:  
+   Because we want each letter to stay in the range `0–25` (the alphabet size), the module takes the sum **modulo 26**. This final value (0–25) becomes one letter of the encrypted output.
+
+3. **Three Times**:  
+   The module repeats Steps 1 and 2 for each of the **3 sets** of key elements, creating **3 encrypted letters**.  
+
+4. **Finite State Machine**:  
+   - **IDLE**: Waits until `start` is asserted.  
+   - **COMPUTE**: Calculates partial sums (multiply-and-add) for each of the 3 output letters.  
+   - **COMPUTE_MOD**: Finalizes each sum modulo 26, storing the results in internal registers for `ciphertext`.  
+   - **DONE**: Pulses `done=1` for one clock cycle to signal the `ciphertext` is valid, then returns to IDLE.
+
+5. **Reset**:  
+     When `reset` is asserted, the FSM returns to `IDLE`, and internal registers are cleared. The outputs (`ciphertext`, `done`) remain in their initial states (zeros) until the next valid compute cycle. 
+
+---

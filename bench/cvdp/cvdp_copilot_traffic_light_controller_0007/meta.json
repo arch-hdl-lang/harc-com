@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_traffic_light_controller_0007",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "traffic_controller_fsm_top",
+  "dut_module": "traffic_controller_fsm",
+  "target_coverage": 97,
+  "auto_wrapper": "traffic_controller_fsm_top.sv",
+  "n_ports": 9,
+  "clock_inputs": [
+    "i_clk"
+  ],
+  "multi_clock": false
+}

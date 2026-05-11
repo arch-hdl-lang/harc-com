@@ -1,0 +1,128 @@
+Complete the given partial SystemVerilog testbench `morse_encoder_tb`. The testbench must instantiate the `morse_encoder` **RTL** module and provide input stimulus for it, focusing exclusively on generating test vectors rather than building a full testbench.  
+
+The `morse_encoder` module converts an **8-bit ASCII input** into a **6-bit Morse code output** along with the **length** of the Morse representation.
+
+---
+
+## **Description:**
+### **Inputs**:
+
+Registers:  
+- `ascii_in` (8-bit, `[7:0]`): ASCII character input supplied to the **DUT**.  
+
+### **Outputs**:
+
+Registers:  
+- `morse_out` (6-bit, `[5:0]`): Encoded Morse representation received from the **DUT**.  
+- `morse_length` (4-bit, `[3:0]`): Length of the Morse code sequence for the given input character.
+
+---
+
+## **Instantiation:**  
+The testbench instantiates the `morse_encoder` module as **dut** and connects the signals between the module and the testbench.  
+Each input and output from the **DUT** is connected to its corresponding signal in the testbench.
+
+---
+
+## **Input Generation and Validation:**  
+### **Stimulus Generation:**  
+Multiple test cases are applied to verify Morse encoding for different ASCII characters. The output from the **DUT** is monitored using `$display`.
+
+### **Test Cases:**  
+
+- **Alphabet (Uppercase)**  
+  - `ascii_in = 8'h41;` // 'A'  
+  - `ascii_in = 8'h42;` // 'B'  
+  - `ascii_in = 8'h43;` // 'C'  
+  - `ascii_in = 8'h44;` // 'D'  
+  - `ascii_in = 8'h45;` // 'E'  
+  - `ascii_in = 8'h46;` // 'F'  
+  - `ascii_in = 8'h47;` // 'G'  
+  - `ascii_in = 8'h48;` // 'H'  
+  - `ascii_in = 8'h49;` // 'I'  
+  - `ascii_in = 8'h4A;` // 'J'  
+  - `ascii_in = 8'h4B;` // 'K'  
+  - `ascii_in = 8'h4C;` // 'L'  
+  - `ascii_in = 8'h4D;` // 'M'  
+  - `ascii_in = 8'h4E;` // 'N'  
+  - `ascii_in = 8'h4F;` // 'O'  
+  - `ascii_in = 8'h50;` // 'P'  
+  - `ascii_in = 8'h51;` // 'Q'  
+  - `ascii_in = 8'h52;` // 'R'  
+  - `ascii_in = 8'h53;` // 'S'  
+  - `ascii_in = 8'h54;` // 'T'  
+  - `ascii_in = 8'h55;` // 'U'  
+  - `ascii_in = 8'h56;` // 'V'  
+  - `ascii_in = 8'h57;` // 'W'  
+  - `ascii_in = 8'h58;` // 'X'  
+  - `ascii_in = 8'h59;` // 'Y'  
+  - `ascii_in = 8'h5A;` // 'Z'  
+
+- **Numbers (0-9)**  
+  - `ascii_in = 8'h30;` // '0'  
+  - `ascii_in = 8'h31;` // '1'  
+  - `ascii_in = 8'h32;` // '2'  
+  - `ascii_in = 8'h33;` // '3'  
+  - `ascii_in = 8'h34;` // '4'  
+  - `ascii_in = 8'h35;` // '5'  
+  - `ascii_in = 8'h36;` // '6'  
+  - `ascii_in = 8'h37;` // '7'  
+  - `ascii_in = 8'h38;` // '8'  
+  - `ascii_in = 8'h39;` // '9'  
+
+- **Punctuation and Special Characters**  
+  - `ascii_in = 8'h2E;` // '.'  
+  - `ascii_in = 8'h2C;` // ','  
+  - `ascii_in = 8'h3F;` // '?'  
+  - `ascii_in = 8'h27;` // "'"  
+  - `ascii_in = 8'h21;` // '!'  
+  - `ascii_in = 8'h2F;` // '/'  
+  - `ascii_in = 8'h28;` // '('  
+  - `ascii_in = 8'h29;` // ')'  
+  - `ascii_in = 8'h26;` // '&'  
+  - `ascii_in = 8'h3A;` // ':'  
+  - `ascii_in = 8'h3B;` // ';'  
+  - `ascii_in = 8'h3D;` // '='  
+  - `ascii_in = 8'h2B;` // '+'  
+  - `ascii_in = 8'h2D;` // '-'  
+  - `ascii_in = 8'h22;` // '"'  
+  - `ascii_in = 8'h40;` // '@'  
+
+- **Edge Cases and Invalid Inputs**  
+  - `ascii_in = 8'h00;` // NULL  
+  - `ascii_in = 8'hFF;` // Maximum 8-bit value  
+  - `ascii_in = 8'h7B;` // '{'  
+  - `ascii_in = 8'h7F;` // DEL  
+  - `ascii_in = 8'h5D;` // ']'  
+  - `ascii_in = 8'h5B;` // '['  
+  - `ascii_in = 8'h7A;` // 'z' (Lowercase)  
+  - `ascii_in = 8'h7C;` // '|'  
+
+---
+
+## **Reset Handling:**  
+At the beginning of the test, an **initial condition** is set to ensure the **DUT** starts in a known state. The testbench then applies each test case sequentially.  
+
+---
+
+```verilog
+module morse_encoder_tb;
+
+    reg [7:0] ascii_in;
+    wire [5:0] morse_out; 
+    wire [3:0] morse_length;
+
+    morse_encoder dut (
+        .ascii_in(ascii_in),
+        .morse_out(morse_out),
+        .morse_length(morse_length)
+    );
+
+    initial begin
+        $display("Starting Testbench...");
+
+       // Insert code here for Test bench 
+
+endmodule
+```
+

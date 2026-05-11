@@ -1,0 +1,113 @@
+Write a SystemVerilog testbench named `tb_apb_controller` that only generates stimuli for an `apb_controller` module. The testbench should generate input stimuli for different operating conditions and sequences, including the handling of multiple simultaneous events (Event A, Event B, and Event C), proper prioritization, and the built-in timeout mechanism.
+
+---
+
+### Module Overview
+
+The `apb_controller` is an Advanced Peripheral Bus (APB) write controller that manages write transactions triggered by three independent events (A, B, and C). Each event carries its 32-bit address and 32-bit data input. The controller follows the APB protocol with a three-phase state machine consisting of **IDLE**, **SETUP**, and **ACCESS** phases. Events are triggered by  `select_a_i`, `select_b_i`, and `select_c_i` signals for events A, B, and C respectively. Additionally, it implements a timeout mechanism to prevent indefinite stalling if the peripheral fails to respond within a specified period. it supports multiple event queuing and prioritization, ensuring that events are processed in order while dynamically adjusting their priority based on previous transactions.
+
+---
+
+#### Inputs:
+- **`clk`**: System clock. The design is synchronized to the positive edge of this clock.
+- **`reset_n`**: Active-low asynchronous reset signal that resets the controller to the `IDLE` state, clears the timeout counter, and sets all registers and outputs to 0.
+- **`select_a_i`**: Active-high control signal to initiate a transaction for Event A.
+- **`select_b_i`**: Active-high control signal to initiate a transaction for Event B.
+- **`select_c_i`**: Active-high control signal to initiate a transaction for Event C.
+- **`addr_a_i [31:0]`**: Address input for Event A.
+- **`data_a_i [31:0]`**: Data input for Event A.
+- **`addr_b_i [31:0]`**: Address input for Event B.
+- **`data_b_i [31:0]`**: Data input for Event B.
+- **`addr_c_i [31:0]`**: Address input for Event C.
+- **`data_c_i [31:0]`**: Data input for Event C.
+- **`apb_pready_i`**:  Ready signal from the peripheral, active high. It indicates when the peripheral is ready to complete the transaction. The controller checks this signal in the `ACCESS` phase to determine transaction completion.
+
+#### Outputs:
+- **`apb_psel_o`**: An active-high signal, asserted during `SETUP`, to select the peripheral for an APB transaction.
+- **`apb_penable_o`**: An active-high signal, asserted during the `ACCESS` phase, indicating the transaction is in progress.
+- **`apb_pwrite_o`**: An active-high signal indicating a write operation, asserted during the `SETUP` and maintained in the `ACCESS` phase.
+- **`apb_paddr_o [31:0]`**: 32-bit address output for the transaction, determined by the selected event's address input (`addr_a_i`, `addr_b_i`, or `addr_c_i`). Defaults to 0 in the `IDLE` state.
+- **`apb_pwdata_o [31:0]`**: 32-bit data output for the write operation, based on the selected event's data input (`data_a_i`, `data_b_i`, or `data_c_i`). Defaults to 0 in the `IDLE` state.
+
+### Multiple Simultaneous Behaviour Handling:
+
+#### **1. Event Queuing**
+- The module can track multiple simultaneous events (select_a_i, select_b_i, select_c_i) in an event queue. 
+- Once a transaction for a higher-priority event is granted, it gets the lowest priority if triggered again before the queue is emptied.
+
+#### **2. Event Processing**
+- The module processes **one event at a time** from the queue.
+- After completing an event's APB transaction, it is removed from the queue and then the module proceeds to the next event. 
+
+#### Transaction Flow and Timing:
+
+The transactions follow a three-state flow:
+
+1. **IDLE**:
+     - If multiple select signals are asserted simultaneously, the controller prioritizes them as `select_a_i` (highest priority), followed by `select_b_i`, and then `select_c_i` (lowest priority).
+     - Evaluates the event queue to determine the next event to process.
+     - Transition to the `SETUP` state when an event is available.
+     - The **IDLE** phase lasts for one clock cycle when the queue is not empty. 
+     - The default state is **IDLE** state, which it enters after a reset and remains in when no transactions are active   
+
+2. **SETUP**:
+   - After the **IDLE** phase, the controller transitions to the **SETUP** phase.
+   - in the **SETUP** phase the controller asserts `apb_psel_o`, and `apb_pwrite_o` and set up `apb_paddr_o` and `apb_pwdata_o` with the selected address and data.
+   - In this phase, `apb_penable_o` remains de-asserted.
+   - The **SETUP** phase lasts for one clock cycle.
+
+3. **ACCESS**:
+   - After the **SETUP** phase, the controller transitions to the **ACCESS** phase.
+   - In **ACCESS**, `apb_penable_o` is asserted high to signal that the data transfer is in progress.
+   - The controller remains in this phase, waiting for `apb_pready_i` from the peripheral to be asserted high.
+   - In **ACCESS** phase, the signals `apb_psel_o`, `apb_pwrite_o`, `apb_paddr_o`, and `apb_pwdata_o` remains stable.
+   - **Write Transfer with Wait**: If `apb_pready_i` is delayed, the controller stays in **ACCESS** until `apb_pready_i` goes high.
+   - **Write Transfer without Wait**: If  `apb_pready_i` goes high in the same clock cycle that the controller enters the **ACCESS** phase, the controller completes the transaction within the same cycle.
+   - **Timeout Mechanism**:
+       - In the **ACCESS** phase, a 4-bit timeout counter increments each clock cycle if `apb_pready_i` remains low.
+       - If `apb_pready_i` is not asserted within 15 cycles after entering the **ACCESS** state, the timeout counter resets the controller to the **IDLE** state and sets all outputs to 0 at the next positive edge, effectively aborting the transaction and preventing indefinite stalling.
+       - The timeout counter resets to zero after a successful transaction or when the controller returns to the **IDLE** state.
+   - After a successful transaction (when `apb_pready_i` is asserted), the controller returns to the **IDLE** state, with both `apb_psel_o` and `apb_penable_o` getting deasserted.
+   - After returning to the IDLE state after the APB transaction of a specific event gets completed (timeout or assertion of `apb_pready_i` to 1) the design processes the next event in the queue in case of multiple simultaneous events and the queue is not empty. If the queue is empty, a new transaction can only start by asserting a select signal (`select_a_i`, `select_b_i`, or `select_c_i`) while both `apb_psel_o` and `apb_penable_o` are low.
+
+### Total Latency for the Transaction:
+
+- **Minimum Latency**: From the triggering of an event when the queue is empty, the latency from the event assertion to the `apb_psel_o` assertion is **3 clock cycles**. (1 cycle each for latching the event signal, updating the queue, and asserting `apb_psel_o` for the triggered event).
+- However, when the queue is not empty, the latency for the `apb_psel_o` assertion for the next event to be processed is **1 clock cycle** after the completion of the first transaction (after de-assertion of all output signals).
+- When an event is retriggered after the completion of its previous APB transaction while the last event in the queue has just started, the latency for asserting `apb_psel_o` for the next event to be processed is 2. This is because the event signal is latched previously (at trigger) and only updating the queue and asserting `apb_psel_o` is required. 
+- Signals `apb_pwrite_o`, `apb_paddr_o` and `apb_pwdata_o` are asserted in **SETUP** phase along with `apb_psel_o` and thus have similar latency as `apb_psel_o`.
+- Signal `apb_penable_o` takes one additional clock cycle than `apb_psel_o` as ` apb_penable_o` is asserted one clock cycle later (in the **ACCESS** state).
+- When the event queue is not empty, each STATE requires one cycle except if `apb_pready_i` is delayed, additional cycles are spent in the `ACCESS` state until the peripheral is ready or a timeout occurs
+- After an APB Transaction is completed, it takes 1 cycle to de-assert signals and to return to `IDLE`.
+
+### Constraints:
+- Assume that event signals `select_a_i`, `select_b_i`, and `select_c_i` are pulse signals high for one clock cycle and are synchronous to the clock.
+- Assume that input data and addresses will be stable inputs when the events are triggered.
+- If multiple events are triggered simultaneously, the highest-priority event will be processed first, followed by the other events based on their priority.
+- If any event (`select_a_i`, `select_b_i`, `select_c_i`) is asserted, the same input will not reassert until at least one clock cycle after its previous APB transaction is completed. Once the previous event from a specific input is completed, the next event from the same input can trigger at any time and will be added to the queue for execution after all previously queued events.
+
+---
+
+### Stimulus Generation Requirements:
+
+Instantiate the `apb_controller` module as the `dut` with all required ports connected. The testbench must cover all possible scenarios to achieve 100% coverage.
+
+#### 1. Clock and Reset:
+- Generate a continuous `clk` signal.
+- Drive an active-low asynchronous reset signal to initialize the `dut` in the **IDLE** state.
+
+#### 2. Event Triggering and Priority:
+- Create pulse stimuli for the event select inputs (`select_a_i`, `select_b_i`, and `select_c_i`) that are one clock cycle wide.
+- Generate random stimuli for different scenarios, including simultaneous assertion of multiple event signals (for internal prioritization) and isolated single-event activations (for one event at a time).
+- Generate stimuli for the 32-bit address and data signals for each event (`addr_a_i`, `data_a_i`, `addr_b_i`, `data_b_i`, `addr_c_i`, and `data_c_i`) with fixed or varying values.
+
+#### 3. APB Peripheral Ready Signal:
+- Generate stimuli of the `apb_pready_i` input for:
+    - When `apb_pready_i` is asserted quickly (immediate response) to mimic minimum transaction latency.
+    - When `apb_pready_i` is delayed, causing the `dut` to remain longer in the **ACCESS** state and eventually leading to the timeout mechanism.
+
+---
+
+**Deliverables:**
+
+A SystemVerilog testbench that generates varied input stimuli for the `apb_controller` module according to the above specifications and allows different corner cases for extended testing scenarios.

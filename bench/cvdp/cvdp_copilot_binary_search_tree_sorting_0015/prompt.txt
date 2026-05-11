@@ -1,0 +1,57 @@
+Write a SystemVerilog testbench named `bst_sort_tb` that generates only stimulus for a binary search tree (BST) based sorting algorithm design `binary_search_tree_sort` that processes an array of unsigned integers with a parameterizable size, ARRAY_SIZE (number of elements in the array, will be greater than 0).  The stimulus should be generated for a design that sorts an input array in ascending order using the BST insertion and in-order traversal logic. The sorting process should be driven by control signals and should be tested for various input arrays. 
+
+A BST is a data structure where each node has a key, and its left child contains keys less than or equal to the node, while its right child contains keys greater than the node and thereby constructs a tree. The algorithm organizes the integers into a binary search tree and traverses the tree to produce a sorted output array.
+
+### Design Details
+
+**Parameterization**
+
+- **ARRAY_SIZE**: Specifies the number of elements in the input array.
+  - Default: 7
+- **DATA_WIDTH**: Specifies the bit-width of each array element.
+  - Default: 8
+
+**Functionality**
+
+- **Array Processing**:
+ The design takes an unsorted array and constructs a binary search tree (BST). It then performs an in-order tree traversal to produce a sorted array. The sorting process is controlled using the start and done signals. The input array, **data_in**, should remain unchanged once the sorting process begins. Any changes to the input during the sorting operation would not be considered.
+
+- **Control Signals**: 
+  - **start**: An active-high signal indicating the start of the sorting operation. When asserted, the sorting begins.
+  - **done**: An active-high signal that indicates the sorting operation has been completed. It is asserted after the sorting process is finished.
+  
+**Inputs and Outputs**
+
+**Inputs:**
+
+- **clk**: Clock signal for synchronization. The design is synchronized to the positive edge of this clock.
+- **reset**: Active-high asynchronous reset.When asserted, it immediately resets all outputs (**sorted_out** array and **done**) to zero.
+- **start**: Active-high signal for 1 clock cycle to initiate the sorting process.
+- **data_in [ARRAY_SIZE*DATA_WIDTH-1:0]**: The unsorted input array that will be sorted by the BST-based algorithm.
+
+**Outputs:**
+
+- **done**: An active high signal for 1 clock cycle indicates when the sorting operation is complete.
+- **sorted_out [ARRAY_SIZE*DATA_WIDTH-1:0]**: The sorted array output in ascending order, such that the smallest element is at index 0 and the largest element is at index ARRAY_SIZE-1.
+
+### Requirements:
+
+**Instantiation**
+
+- **Module Instance**: The BST-based sorting module should be instantiated as `dut`, with all input and output signals connected for testing.
+
+**Input Generation and Validation**
+
+- **Array Generation**: The testbench must generate multiple test cases with different values for **data_in**, including edge cases such as an array with all elements the same, an already sorted array, and a reverse-sorted array.
+  
+**Control Signal Handling**:
+
+- The **start** signal should be asserted to trigger the sorting process, and the testbench must wait until the **done** signal is asserted (to wait for the sorting to be completed).
+- The new input **data_in** along with the start signal must only be asserted after the **done**  signal for the previous input array is asserted to high (after **done** asserts and deasserts). This process must be repeated to cover different sequences of input_data. It must be noted that while the done signal is high, the new input **data_in**  and **start** must not be asserted to avoid loss of **start** and new input **data_in**. 
+
+**Test Coverage**
+
+- Test with all possible combinations of elements within input array **data_in** via randomization as well as corner cases such as :
+  - **data_in** with all values equal.
+  - **data_in** that is already sorted.
+  - **data_in** in descending order.

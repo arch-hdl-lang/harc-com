@@ -1,0 +1,133 @@
+Generate a SystemVerilog testbench named `cvdp_sram_fd_tb` that only generates stimulus, to systematically drive input signals to a **cvdp_sram_fd** module. The stimulus should comprehensively cover all valid read and write operations with constraints as mentioned below. 
+
+---
+
+## Module Overview:
+The **cvdp_sram_fd** module is a full-duplex, dual-port static RAM (SRAM) with independent read and write access on two separate ports (**Port A** and **Port B**). The memory has a configurable data width (`DATA_WIDTH`) and address width (`ADDR_WIDTH`). 
+
+**Key Features:**
+- **Dual-port architecture**: Supports concurrent read/write operations on both ports.
+- **Synchronous operation**: Inputs are sampled on the rising edge of `clk`.
+- **Read-First behavior**: If a read and write happens at the same address in the same cycle, the read returns the old data before the write updates it.
+
+--- 
+
+### **Parameters:**
+- `DATA_WIDTH (default: 8)`: Width of the data bus.
+- `ADDR_WIDTH (default: 4)`: Width of the address bus.
+- `RAM_DEPTH`: Determines the depth of the memory. It is derived using the `ADDR_WIDTH` parameter to match the full range of unique addresses possible with the given address width.
+
+### **Ports:**
+
+#### 1. Clock and Control Signal Inputs:
+- `clk`: System clock. All input transitions are synchronized to the **rising edge** of `clk`.  
+- `ce`: Chip enable (active high).
+   -  When `ce` is **low**, the memory ignores all inputs and does not perform read or write operations (`a_rdata` and `b_rdata` are set to zero).
+   -  When `ce` is **high**, the memory operates normally.
+
+#### 2. Port A:
+**Inputs:**
+- `a_we`: Write enable (active high).
+- `a_oe`: Read enable (active high).
+- `a_addr [ADDR_WIDTH-1:0]`: Address bus.
+- `a_wdata [DATA_WIDTH-1:0]`: Write data.
+
+**Output:**
+- `a_rdata [DATA_WIDTH-1:0]`: Read data output.
+
+#### 3. Port B:
+**Inputs:**
+- `b_we`: Write enable (active high).
+- `b_oe`: Read enable (active high).
+- `b_addr [ADDR_WIDTH-1:0]`: Address bus.
+- `b_wdata [DATA_WIDTH-1:0]`: Write data.
+
+**Output:**
+- `b_rdata [DATA_WIDTH-1:0]`: Read data output.
+
+
+#### 4.  Memory Array:
+   - The module consist of an internal memory array `mem` with depth `RAM_DEPTH` and width `DATA_WIDTH`.
+
+#### 5. Operational Behavior:
+
+   - **Port A Operations:**
+     - **Write Operation:**
+       - Occurs when `ce` and `a_we` are high.
+       - The data on `a_wdata` is written to the memory location specified by `a_addr`.
+     - **Read Operation:**
+       - Occurs when `ce` is high,  and `a_oe` is high.
+       - The data from the memory location specified by `a_addr` is loaded into `a_rdata`.
+       - `a_rdata` retains its previous value if `a_oe` is low while `ce` is high
+     - **Priority:**
+       - If both `a_we` and `a_oe` are high, the read operation takes precedence, where data previously stored at the address appears on the output while the input data is being stored in memory.
+     - **Timing:**
+       - **Write Latency:** 1 clock cycle.
+       - **Read Latency:** 1 clock cycle.
+
+   - **Port B Operations:**
+     - This port behaves same as Port A. The signals controlling this port are `b_we`, `b_oe`, `b_addr`, `b_wdata` and the output is driven on `b_rdata`.
+
+#### 6. Simultaneous Access Handling:
+   - The memory supports simultaneous operations on both ports, including:
+     - Reads on both ports.
+     - Writes on both ports.
+     - A read on one port and a write on the other.
+   - **Same Address Access:**
+     - **If both ports access the same address:**
+       - Read and write: Follow a "read-first" approach which means that if a write and read occur at the same address simultaneously, data previously stored at the address appears on the output while the input data is being stored in memory.
+       - Reads on both ports: Should be supported with both ports providing the same output data.
+       - It is assumed that the write access will not occur for the same address on both ports together. Such a collision is not handled. 
+
+#### 7. Assumptions and Constraints:
+   - All inputs are synchronous and are sampled on the rising edge of `clk`.
+   - Input addresses (`a_addr`, `b_addr`) are within the valid range (`0` to `RAM_DEPTH - 1`).
+   - Data inputs (`a_wdata`, `b_wdata`) are valid when write enables (`a_we`, `b_we`) are high.
+   - If neither read nor write is enabled for a port during a clock cycle (with `ce` high), the port maintains its previous output state.
+
+#### 8. Boundary Conditions:
+ - `DATA_WIDTH` and `ADDR_WIDTH` must be positive integers greater than zero.
+
+--- 
+
+## **Testbench Requirements:**
+
+### **Module Instantiation:**
+The **cvdp_sram_fd** module should be instantiated as `DUT`, with all input and output signals properly connected. The testbench must cover all possible scenarios to achieve 100% coverage.
+
+
+### **Stimuli Generation for Dual-Port SRAM Testbench:**  
+
+#### 1. Clock and Enable Control:
+- Generate a continuous clock signal with a period of 10 time units.  
+- Toggle `ce` periodically to simulate active/inactive states.  
+
+#### 2. Address and Data Generation:
+- **Address Sequences**  
+  - Use randomized or structured address sequences for `a_addr` and `b_addr`  for read and write operations.  
+
+- **Data Sequences**  
+  - Generate randomized `a_wdata` and `b_wdata` values.  
+  - Drive valid data only when write enable (`a_we`, `b_we`) is high.  
+
+#### 3. Different Scenarios:
+
+- **A.Independent Operations**
+  - **Single Port Write-Read:** Generate stimuli for Port A to write to a given address and read from the same address after the write is complete. Perform the same operation on port B
+
+- **B. Simultaneous Operations**  
+  - **Simultaneous Writes:** 
+      - Generate stimuli to simultaneously write and read from the same port and from the same address.  
+      - Generate stimuli to simultaneously write from one port and read from the other at the same address.  
+      - Generate stimuli to simultaneously write from one port and read from the other at different addresses. 
+
+- **C. Special Cases**  
+  - **Boundary Testing:** Generate stimuli to write at minimum (`0`) and maximum (`RAM_DEPTH-1`) addresses.  
+  - **Chip Enable Disabled:** Generate stimuli for `ce = 0`.  
+  - **Chip Enabled with no operation:** Generate stimuli for `ce = 1` with no read/write operations on either port. 
+
+---
+
+**Expected Output:** 
+
+A SystemVerilog testbench that generates varied input stimuli for the **cvdp_sram_fd** module according to the above specifications and allows different corner cases for extended testing scenarios. 

@@ -1,0 +1,31 @@
+Create a testbench named `tb_Bit_Difference_Counter` using SystemVerilog to generate stimulus for the `Bit_Difference_Counter` module, which calculates the hamming distance (bitwise difference) between two inputs of equal bit width. The testbench should apply edge-case scenarios and random input patterns to thoroughly exercise the module. The testbench should only contain stimulus generator.
+
+## Module: `Bit_Difference_Counter`
+
+### Parameters:
+- **BIT_WIDTH**: Defines the width of the input vectors, with a default value of 3. This parameter must be a positive integer greater than or equal to 1.
+- **COUNT_WIDTH**: The expression calculates $clog2(BIT_WIDTH + 1), which is the width required to represent the maximum possible number of differing bits.
+### Inputs
+1. **`[BIT_WIDTH-1:0] input_A`**:  A binary input signal.
+2. **`[BIT_WIDTH-1:0] input_B`**:  A binary input signal of the same width as `input_A`.
+
+### Output
+1. **`[COUNT_WIDTH-1:0] bit_difference_count`**: The output indicates the Hamming distance between `input_A` and `input_B`. The Hamming distance is the number of differing bits between the two inputs.
+
+## Testbench Design
+
+### Instantiation
+The `Bit_Difference_Counter` module is instantiated as `dut`, with the following connections:
+- **Inputs**: `input_A` and `input_B`
+- **Output**: `bit_difference_count`
+
+## Input Generation 
+
+### Edge Case Testing
+1. **All Zero Inputs**:  Generate a test case where both inputs are composed entirely of zeros (0).
+2. **All One Inputs**:  Generate a test case where both inputs are composed entirely of ones (1).
+3. **Completely Different Inputs**:  Generate a test case where one input is all zeros and the other is all ones.
+4. **Single Bit Differences**:  For each bit position in the input, generate test cases where the inputs differ by only that single bit.
+
+### Randomized Testing
+- Randomly generates 100 test cases for `input_A` and `input_B`, covering various combinations of differing bits.

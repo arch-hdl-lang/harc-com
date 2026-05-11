@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_simple_spi_0003",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "spi_fsm_top",
+  "dut_module": "spi_fsm",
+  "target_coverage": 94,
+  "auto_wrapper": "spi_fsm_top.sv",
+  "n_ports": 12,
+  "clock_inputs": [
+    "i_clk"
+  ],
+  "multi_clock": false
+}

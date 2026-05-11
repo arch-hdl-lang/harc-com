@@ -1,0 +1,134 @@
+Complete the Ping-Pong Buffer Testbench in SystemVerilog. The testbench must instantiate the `ping_pong_buffer` RTL module and provide input stimulus for it, focusing exclusively on generating test vectors rather than building a full testbench.  
+The `ping_pong_buffer` module simulates a dual-buffer system that allows concurrent read/write operations while alternating between two buffers.
+
+---
+
+## **Description**:
+### **Inputs** :
+
+- **Registers**:
+  - `clk` (1-bit): Active high Clock signal that toggles every **10 ns** (100 MHz) and is supplied to the **DUT**.
+  - `rst_n` (1-bit): **Active-low** asynchronous reset signal that resets the buffer and control logic of the **DUT**.
+  - `write_enable` (1-bit): Enables writing of data into the buffer.
+  - `read_enable` (1-bit): Enables reading of data from the buffer.
+  - `data_in` (8-bit, `[7:0]`): 8-bit input data that is written into the buffer.
+
+### **Outputs** :
+
+- **Registers**:
+  - `data_out` (8-bit, `[7:0]`): 8-bit output data read from the buffer.
+  - `buffer_full` (1-bit): Indicates whether the buffer is full.
+  - `buffer_empty` (1-bit): Indicates whether the buffer is empty.
+  - `buffer_select` (1-bit): Indicates the currently active buffer.
+
+---
+
+## **Instantiation**:
+The testbench instantiates the `ping_pong_buffer` module as `dut` and connects the signals between the module and the testbench. Each input and output from the **DUT** is connected to its corresponding signal in the testbench.
+
+---
+
+## **Input Generation and Validation**:
+### **Clock Generation**:  
+The Active high clock signal `clk` is generated using an `always` block that toggles every **10 ns**.
+
+### **Reset**:  
+The Asynchronous reset signal `rst_n` is **asserted** at the beginning of the simulation to ensure the **DUT** initializes correctly. After a short period (**150 ns**), the reset is **de-asserted**.
+
+### **Stimulus**:  
+Multiple test cases are applied to simulate various buffer conditions and validate the correct behavior of the **ping-pong buffer**:
+
+- **Test Case 1: Basic Write and Read**
+  - **Write** values sequentially into the buffer.
+  - **Read** them back to verify correct data storage and retrieval.
+
+- **Test Case 2: Buffer Alternation**
+  - Write `DEPTH` elements to trigger **buffer switch**.
+  - Ensure correct alternation between ping and pong buffers.
+
+- **Test Case 3: Writing to Full Buffer**
+  - Fill the buffer.
+  - Attempt an extra write and verify **buffer_full** signal.
+
+- **Test Case 4: Reading from Empty Buffer**
+  - Ensure `buffer_empty` is asserted when reading beyond available data.
+
+- **Test Case 5: Reset Handling**
+  - Apply **reset** during active operations.
+  - Ensure buffer returns to **initial state**.
+
+- **Test Case 6: Edge Case - Minimum Data**
+  - Write and read a **single byte**.
+  - Ensure correct behavior in minimal operation scenarios.
+
+- **Test Case 7: Edge Case - Maximum Data**
+  - Write **DEPTH** elements.
+  - Read all data and verify **buffer alternation**.
+
+---
+
+## **Reset Handling**:
+After running the test cases, a **reset is asserted again** to verify that the buffer properly resets and returns to the **initial state**, with `buffer_empty` asserted.
+
+---
+
+```systemverilog
+module tb_ping_pong_buffer;
+
+    localparam DEPTH = 256;
+
+    logic clk;
+    logic rst_n;
+    logic write_enable;
+    logic read_enable;
+    logic [7:0] data_in;
+    logic [7:0] data_out;
+    logic buffer_full;
+    logic buffer_empty;
+    logic buffer_select;
+
+    // Instantiate the DUT
+    ping_pong_buffer dut (
+        .clk(clk),
+        .rst_n(rst_n),
+        .write_enable(write_enable),
+        .read_enable(read_enable),
+        .data_in(data_in),
+        .data_out(data_out),
+        .buffer_full(buffer_full),
+        .buffer_empty(buffer_empty),
+        .buffer_select(buffer_select)
+    );
+
+    // Clock generation
+    always #5 clk = ~clk;
+
+    initial begin
+        // Initialize signals
+        clk = 0;
+        rst_n = 0;
+        write_enable = 0;
+        read_enable = 0;
+        data_in = 0;
+
+        $display("Applying Reset...");
+        #10 rst_n = 1;
+
+        $display("Testing Basic Write and Read Operations...");
+        for (int i = 0; i < 10; i++) begin
+            @(posedge clk);
+            write_enable = 1;
+            data_in = i;
+            @(posedge clk);
+            write_enable = 0;
+            @(posedge clk);
+            read_enable = 1;
+            @(posedge clk);
+            read_enable = 0;
+            @(posedge clk);
+        end
+
+        // Insert code here to complete the Testbench
+
+endmodule
+```

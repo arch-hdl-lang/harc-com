@@ -1,0 +1,173 @@
+Create a test bench in SystemVerilog for a Verilog module named `enhanced_fsm_signal_processor` module by applying exhaustive test scenarios. The module uses a finite state machine (FSM) to manage signal processing operations, handle fault conditions, and report the FSM's current status. The test bench should systematically generate input vectors, apply them to the module under test (MUT) and aim to achieve 100% or the maximum possible coverage. The testbench should not create checkers to verify the MUT.
+
+---
+## Instantiation
+
+Name the instance of the RTL as **dut**.
+
+## **RTL Parameter Inputs - Outputs and Functional behaviour**
+
+### **Inputs**  
+- `i_clk`: Clock signal for sequential operation.  
+- `i_rst_n`: Active-low reset signal that resets the FSM and clears outputs.  
+- `i_enable`(1 bit): Enable signal to start processing; when low, the FSM remains in IDLE.  
+- `i_clear`(1 bit): Signal to clear outputs and reset the fault state.  
+- `i_ack`(1 bit): Acknowledgment signal to transition the FSM from READY to IDLE after processing is complete. It will be a pulse of 1 clock cycle. 
+- `i_fault`(1 bit): Signal indicating a fault condition during operation.  
+- `i_vector_1`: 5-bit input vector.  
+- `i_vector_2`: 5-bit input vector.  
+- `i_vector_3`: 5-bit input vector.  
+- `i_vector_4`: 5-bit input vector.  
+- `i_vector_5`: 5-bit input vector.  
+- `i_vector_6`: 5-bit input vector.  
+
+### **Outputs**  
+- `o_ready`(1 bit): Signal that indicates when outputs are valid and processing is complete. Default 0.
+- `o_error`(1 bit): Signal that asserts when a fault condition is detected. Default 0.
+- `o_fsm_status`(2 bits): Current FSM state, encoded as a 2-bit signal, representing one of the FSM states: IDLE(00), PROCESS(01), READY(10), or FAULT(11). Default is IDLE.
+- `o_vector_1`: 8-bit output vector. Default 0.
+- `o_vector_2`: 8-bit output vector. Default 0.
+- `o_vector_3`: 8-bit output vector. Default 0.
+- `o_vector_4`: 8-bit output vector. Default 0.
+
+---
+
+### **FSM States and Functionality**  
+
+#### **States**  
+1. **IDLE**:  
+   - Default state. 
+   - FSM waits for `i_enable` to assert high to transition to PROCESS. 
+   - If `i_fault` is detected, FSM transitions to FAULT.  
+
+2. **PROCESS**:  
+   - Concatenates six 5-bit input vectors into a single 30-bit bus, appends two `1` bits at the LSB to form a 32-bit bus, and splits it into four 8-bit output vectors.  
+   - `o_vector_1` to `o_vector_4` maps from MSB to LSB of concatenation bus.
+   - If `i_fault` is detected during this state, FSM transitions to FAULT.  
+
+3. **READY**:  
+   - Indicates processing is complete by asserting `o_ready`.  
+   - FSM waits for `i_ack` to transition back to IDLE.  
+   - If `i_fault` is detected, FSM transitions to FAULT.  
+
+4. **FAULT**:  
+   - Asserts `o_error` to indicate a fault condition.  
+   - Outputs are set to default.
+   - FSM transitions to IDLE only when `i_clear` is asserted and `i_fault` is deasserted.
+
+---
+
+### **Operational Rules**  
+- The FSM must progress through states sequentially, synchronized to `i_clk`.  
+- When `i_rst_n` is low, FSM resets to IDLE, clears outputs, and resets the fault state.  
+- When in FAULT, the `i_clear` signal must clear the fault condition and reset the FSM to IDLE.  
+- Outputs (`o_vector_1`, `o_vector_2`, `o_vector_3`, `o_vector_4`) must strictly adhere to the concatenation and splitting logic specified.  
+- Fault handling (`o_error` and FAULT state) must take precedence over other operations.  
+- All the outputs are synchronous to `i_clk`.
+- `i_fault` always take precedence over any other input except `i_clk` and `i_rst_n`.
+- All the input are synchronous to `i_clk`.
+
+## Stimulus Generation
+
+### **Test Case 1: Reset and Idle Check**
+
+- **Stimulus**  
+  1. `i_rst_n=0` (active-low reset), `i_enable=0`, `i_clear=0`, `i_ack=0`, `i_fault=0`  
+  2. Release reset: `i_rst_n=1`
+
+---
+
+### **Test Case 2: Basic Enable → Process → Ready → Acknowledge → Idle**
+
+- **Stimulus**  
+  1. From IDLE, set example inputs (five-bit vectors).  
+     - For instance:
+       - `i_vector_1 = 5'b00111`
+       - `i_vector_2 = 5'b01010`
+       - `i_vector_3 = 5'b10101`
+       - `i_vector_4 = 5'b11100`
+       - `i_vector_5 = 5'b00001`
+       - `i_vector_6 = 5'b11000`
+  2. `i_enable=1` → transitions to PROCESS.  
+  3. After one PROCESS cycle, FSM moves to READY (`o_ready=1`).  
+  4. Pulse `i_ack=1` → returns FSM to IDLE.
+
+---
+
+### **Test Case 3: Fault in IDLE State**
+
+- **Stimulus**  
+  1. FSM in IDLE (`i_enable=0`, etc.).  
+  2. Assert `i_fault=1`.
+
+- **Sample Input Vectors**  
+  - Can be any values;
+
+---
+
+### **Test Case 4: Fault in PROCESS State**
+
+- **Stimulus**  
+  1. From IDLE, assert `i_enable=1` to enter PROCESS.  
+  2. While in PROCESS, assert `i_fault=1`.
+
+- **Sample Input Vectors**  
+  - Similar to Test Case 2 or any other 5-bit patterns;
+
+
+---
+
+### **Test Case 5: Fault in READY State**
+
+- **Stimulus**  
+  1. Complete a normal PROCESS → READY cycle.  
+  2. While `o_ready=1`, assert `i_fault=1`.
+  3. Hold the FSM is explicitly in the READY state by not asserting i_ack immediately, then i_fault is pulsed. This ensures that the READY -> FAULT transition is covered.
+
+- **Sample Input Vectors**  
+  - Use any 5-bit patterns leading into READY. Then trigger fault.
+
+
+---
+
+### **Test Case 6: Clear from FAULT State**
+
+- **Stimulus**  
+  1. Enter FAULT (any prior scenario).  
+  2. Assert `i_clear=1` but keep `i_fault=1` → still in FAULT.  
+  3. Deassert `i_fault=0` (with `i_clear=1`) → FSM → IDLE.
+
+- **Sample Input Vectors**  
+  - Irrelevant once in FAULT; 
+
+---
+
+### **Test Case 7: Repeated Enable Pulses**
+
+- **Stimulus**  
+  1. Rapidly toggle `i_enable` (1→0→1→0) starting from IDLE.  
+  2. Check FSM behavior in PROCESS or READY; it should ignore extra enables.
+
+- **Sample Input Vectors**  
+  - Use any stable 5-bit inputs;
+---
+
+### **Test Case 8: Repeated Fault Pulses**
+
+- **Stimulus**  
+  1. Cause a FAULT (any state).  
+  2. Rapidly toggle `i_fault` high/low without clearing.
+
+- **Sample Input Vectors**  
+  - Not critical here;
+---
+
+### **Test Case 9: Data Path Validation**
+
+- **Stimulus**  
+  1. Vary each `i_vector_n` (5 bits) across these patterns:
+     - **All-zero**: `5'b00000`
+     - **All-ones**: `5'b11111`
+     - **Mixed**: e.g. `5'b10101`, `5'b01010`
+     - **Boundary**: e.g. `5'b00001`, `5'b10000`
+  2. For each pattern, do IDLE → PROCESS → READY cycle.

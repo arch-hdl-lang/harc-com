@@ -1,0 +1,51 @@
+Write a testbench to only generate stimulus for a `gcd_3_ip` that calculates the greatest common divisor (GCD) for three signed inputs, using the Euclidean algorithm, and generates the output `OUT` and `done` sequentially when `go` is asserted and inputs `A`, `B` and `C` are applied. In this design, the `OUT` output is generated over multiple clock cycles, and the output is considered valid when `done` is asserted.
+
+The Euclidean algorithm calculates the GCD by iteratively replacing the larger of two numbers with the difference between the two numbers. This process is repeated, reducing the larger number each time, until the two numbers become equal. At this point, the value of either number is the GCD of the original inputs.
+
+## Design Details
+
+**Parameterization**  
+- `WIDTH` (Default 32, must be greater than 0 and less than 33): Bit-width of `A`, `B`, `C` and `OUT `.
+- `SIGNED_EN` (Default 1):  Enable (SIGNED_EN=1) or disable (SIGNED_EN=0) signed input handling.
+
+**Functionality**  
+1. **Computation, Accumulation, and Output Stage**
+   - Computes the GCD of the three inputs and assigns to `OUT`, making it available as the final output.
+
+2. **Done Signal Behavior**
+   - The `done` signal goes high after the `OUT` is fully computed and valid.
+
+3. **Reset Behavior**
+   - `rst`: Active-high synchronous reset. When asserted high, it immediately clears all registers and outputs to 0, including `OUT`, `done`.
+
+### Inputs and Outputs
+- **Inputs**:
+  - `clk`: Clock signal. The design should be synchronized to the positive edge of this clock signal..
+  - `rst`: Active high synchronous reset signal.
+  - `A [WIDTH-1:0]`: Input value A.
+  - `B [WIDTH-1:0]`: Input value B.
+  - `C [WIDTH-1:0]`: Input value C.
+  - `go`: Start signal to initiate GCD calculation. Active high.
+
+- **Outputs**:
+  - `OUT [WIDTH-1:0]`: Output for the calculated GCD.
+  - `done`: Active high signal that indicates when the computation is complete. 
+
+### Additional Details
+
+- **Control Signal Behavior**:
+  - Both `go` and `done` are asserted high for one cycle.
+  - Once `done` is asserted, new inputs will be fed to the system on the current rising edge of `clk` following this assertion. 
+
+
+## Testbench requirements:
+
+**Instantiation**
+
+- Module Instance: The gcd_3_ip module should be instantiated as `dut`, with the input and output signals connected for testing.
+---
+
+**Input Generation**
+
+- Input Generation: The testbench must generate inputs of WIDTH-bit binary values for `A`, `B` and `C` and 1-bit `go`  to cover all possibilities, including the corner cases. Include negative values if SIGNED_EN is 1. Also test for input value 0.
+- Computation Period: After setting each pair of inputs, the testbench should wait till assertion of `done` to ensure the outputs have stabilized, before asserting new values.

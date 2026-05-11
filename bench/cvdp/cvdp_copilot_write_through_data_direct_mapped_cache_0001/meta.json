@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_write_through_data_direct_mapped_cache_0001",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "ddm_cache",
+  "dut_module": "ddm_cache",
+  "target_coverage": 85,
+  "auto_wrapper": null,
+  "n_ports": 18,
+  "clock_inputs": [
+    "clk"
+  ],
+  "multi_clock": false
+}
