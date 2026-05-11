@@ -1,0 +1,43 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_gray_to_binary_0014`.
+//
+// DUT: 4-bit Gray-code → binary converter. binary[N-1] = gray[N-1];
+// binary[i] = binary[i+1] ^ gray[i] for i = N-2 .. 0.
+//
+// Strategy: exhaustive 16-input sweep + inline software model.
+// At 4 bits this is trivially exhaustive; coverage holes can only
+// come from structurally unreachable code in the DUT.
+
+function gray_to_binary_ref(g: uint<4>) -> uint<4>
+    let b3 : uint<1> = (g >> 3) & 1
+    let b2 : uint<1> = b3 ^ ((g >> 2) & 1)
+    let b1 : uint<1> = b2 ^ ((g >> 1) & 1)
+    let b0 : uint<1> = b1 ^ (g & 1)
+    return (b3 << 3) | (b2 << 2) | (b1 << 1) | b0
+end function gray_to_binary_ref
+
+test GrayToBinaryTest
+    let dut : gray_to_binary_top
+end test GrayToBinaryTest
+
+impl sim for GrayToBinaryTest
+    run
+        log(info, "gray_to_binary: exhaustive 0..15 sweep vs sw model")
+        dut.gray_in = 0
+        wait 1 cycle
+
+        let errors : uint<32> = 0
+        for g in 0 .. 16
+            dut.gray_in = g
+            wait 1 cycle
+            let expected = gray_to_binary_ref(g)
+            if dut.binary_out != expected
+                log(error, "MISMATCH g=${g:1x} got=${dut.binary_out:1x} expected=${expected:1x}")
+                errors = errors + 1
+            end if
+        end for
+
+        assert errors == 0
+            else fail("gray_to_binary sweep: ${errors} mismatches out of 16")
+        log(info, "PASS: all 16 gray inputs converted correctly")
+    end run
+end impl GrayToBinaryTest

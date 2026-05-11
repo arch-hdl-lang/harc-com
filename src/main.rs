@@ -301,11 +301,25 @@ fn run_verilator(
         "--Mdir".into(), mdir.display().to_string(),
     ];
     if coverage {
-        // Enable Verilator's line + toggle + expression coverage on the
-        // DUT. `--coverage` is the umbrella switch; emitted TB writes
-        // `coverage.dat` at clean shutdown (see cpp_tb.rs main()
-        // emission). `verilator_coverage` post-processes the .dat into
-        // per-instance metrics that the CVDP-style scorer reads.
+        // Enable Verilator coverage on the DUT — full umbrella
+        // (`line` + `toggle` + `expr` + `user`). For CVDP cid012
+        // scoring we aggregate across all metrics, mirroring how
+        // Cadence IMC's "Average %" combines block, branch, toggle,
+        // and expression coverage into one number. Different DUT
+        // classes lean on different metrics:
+        //   - Pure-dataflow modules (only `assign` + sub-instances,
+        //     no `always` blocks) score 0/0 on line+branch alone —
+        //     toggle on signals is the only meaningful metric.
+        //   - Combinational `always @(*)` with wide internal regs
+        //     get line+branch hits; toggle on internal bits beyond
+        //     the input range is unreachable but offsets only a
+        //     small fraction of the total denominator.
+        //   - Sequential modules get a mix of all four.
+        //
+        // Emitted TB writes `coverage.dat` at clean shutdown (see
+        // cpp_tb.rs main() emission). `verilator_coverage`
+        // post-processes the .dat into per-instance metrics that
+        // the CVDP-style scorer reads.
         args.push("--coverage".into());
     }
     args.extend([

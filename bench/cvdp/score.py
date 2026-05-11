@@ -42,35 +42,48 @@ import json, os, subprocess, sys, shutil
 from pathlib import Path
 
 
-def parse_lcov(info_path: Path) -> dict[str, tuple[int, int]]:
-    """Parse LCOV info file → { sourcefile: (branches_hit, branches_total) }.
+def parse_lcov(info_path: Path) -> dict[str, dict[str, tuple[int, int]]]:
+    """Parse LCOV info file → { sourcefile: { metric: (hit, total) } }
+    with metrics = "line" and "branch".
 
-    We score on **branch coverage (BRDA)** rather than line coverage (DA).
-    For purely combinational DUTs — every CVDP cid012 problem we've
-    seen is one — line coverage is degenerate: an `always @(*)` block
-    executes every line on every input change, so any TB that toggles
-    even one input scores 100% line. Branch coverage discriminates:
-    each `if (cond)` produces 4 branches (cond=0/1 × two columns of
-    Verilator's expression-coverage matrix), and only TBs that actually
-    exercise the condition along both edges hit all four. That's the
-    metric Xcelium-side IMC reports as "branch coverage" too, so the
-    bar maps the right way.
+    - **Line coverage** (DA records). Forgiving for combinational DUTs
+      where one `always @(*)` block covers many lines on any input;
+      meaningful for sequential DUTs where unexercised cases show up
+      as unhit lines.
+    - **Branch coverage** (BRDA records). Counts each `if`-branch
+      independently. The closest open-source analog to Cadence IMC's
+      branch-coverage report that CVDP cid012 nominally targets, but
+      Verilator counts structurally-unreachable branches in the
+      denominator (e.g. `if (i != 0)` in a `genvar` loop with size 1,
+      or an over-wide condition the input range can't satisfy), so the
+      branch percentage has a per-DUT ceiling that may sit below the
+      problem's nominal target.
+
+    The score command reports both; the user decides which to gate on.
     """
-    out: dict[str, tuple[int, int]] = {}
+    out: dict[str, dict[str, tuple[int, int]]] = {}
     cur_file = None
-    hit = total = 0
+    line_hit = line_total = 0
+    br_hit = br_total = 0
     for line in info_path.read_text().splitlines():
         if line.startswith("SF:"):
             cur_file = line[3:]
-            hit = total = 0
+            line_hit = line_total = br_hit = br_total = 0
+        elif line.startswith("DA:"):
+            _, count = line[3:].split(",", 1)
+            line_total += 1
+            if int(count) > 0:
+                line_hit += 1
         elif line.startswith("BRDA:"):
-            # BRDA:<line>,<block>,<branch>,<count>
             count = line.split(",")[-1]
-            total += 1
+            br_total += 1
             if count != "-" and int(count) > 0:
-                hit += 1
+                br_hit += 1
         elif line.startswith("end_of_record") and cur_file:
-            out[cur_file] = (hit, total)
+            out[cur_file] = {
+                "line": (line_hit, line_total),
+                "branch": (br_hit, br_total),
+            }
             cur_file = None
     return out
 
@@ -156,24 +169,45 @@ def score(problem_dir: Path) -> int:
         print(f"[score] FAIL (no coverage points found in {info_path})")
         return 1
 
-    print(f"[score] per-file branch coverage:")
-    for sf, (h, t) in sorted(per_file.items()):
-        pct = 100.0 * h / t if t else 0.0
+    def pct(h: int, t: int) -> str:
+        return f"{100.0*h/t:6.2f}%" if t else "  n/a "
+
+    print(f"[score] per-file coverage (line  /  branch):")
+    for sf, m in sorted(per_file.items()):
+        lh, lt = m["line"]
+        bh, bt = m["branch"]
         marker = "  ←  DUT" if Path(sf).name == dut_sv.name else ""
-        print(f"           {pct:6.2f}%  ({h}/{t})  {Path(sf).name}{marker}")
+        print(f"           {pct(lh,lt)} ({lh}/{lt})  /  "
+              f"{pct(bh,bt)} ({bh}/{bt})    {Path(sf).name}{marker}")
 
     dut_key = next((k for k in per_file if Path(k).name == dut_sv.name), None)
     if not dut_key:
         print(f"[score] FAIL (no coverage record for {dut_sv.name} — was the DUT linked?)")
         return 1
-    dut_hit, dut_total = per_file[dut_key]
-    dut_pct = 100.0 * dut_hit / dut_total if dut_total else 0.0
 
-    # ── 5. Compare to threshold ──────────────────────────────────────
-    passed = dut_pct >= target
+    dut_line_hit, dut_line_total = per_file[dut_key]["line"]
+    dut_br_hit, dut_br_total = per_file[dut_key]["branch"]
+    dut_line_pct = 100.0 * dut_line_hit / dut_line_total if dut_line_total else 0.0
+    dut_br_pct = 100.0 * dut_br_hit / dut_br_total if dut_br_total else 0.0
+
+    # ── 5. Verdict ───────────────────────────────────────────────────
+    # Score on **branch coverage** as the primary metric (closest analog
+    # to Cadence IMC's branch report that CVDP targets). Line coverage
+    # is reported alongside as a sanity check — a TB that's 100% line
+    # but well below target on branch is doing something interesting
+    # (DUT has structurally unreachable branches; ceiling reached).
+    passed = dut_br_pct >= target
     verdict = "PASS" if passed else "FAIL"
-    print(f"[score] {verdict}: DUT coverage {dut_pct:.2f}% "
-          f"({dut_hit}/{dut_total})  threshold ≥{target}%")
+    ceiling_note = ""
+    if not passed and dut_line_pct >= 99.0:
+        ceiling_note = (
+            "  [note: 100% line cov reached — the missing branches are "
+            "likely structurally unreachable under default DUT params]"
+        )
+    print(f"[score] {verdict}: branch coverage {dut_br_pct:.2f}% "
+          f"({dut_br_hit}/{dut_br_total})  line {dut_line_pct:.2f}% "
+          f"({dut_line_hit}/{dut_line_total})  threshold ≥{target}%"
+          f"{ceiling_note}")
     return 0 if passed else 1
 
 

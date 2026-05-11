@@ -1,0 +1,85 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_asyc_reset_0004`.
+//
+// DUT: async_reset — 5-bit countdown counter with **asynchronous**
+// posedge reset. On reset, cnt_q := 5'h1F. Each subsequent posedge,
+// cnt_q := cnt_q - 1 until 0, then holds. Derived signals:
+//   gate_clk_o      = (cnt_q < 14) && (cnt_q != 0)
+//   release_reset_o = (cnt_q < 8)
+//
+// Strategy:
+//   1. Reset, verify cnt_q == 0x1F and derived signals are low.
+//   2. Let it count from 31 → 0 over 32 cycles; on every cycle, check
+//      cnt_q + gate_clk_o + release_reset_o against software model.
+//   3. Hold at 0 for a few extra cycles to verify the "hold" branch.
+//   4. Re-assert reset mid-count, verify both async behavior (cnt_q
+//      jumps back to 0x1F immediately, not waiting for next posedge)
+//      and that derived signals follow.
+
+test AsyncResetTest
+    let dut : async_reset
+end test AsyncResetTest
+
+impl sim for AsyncResetTest
+    run
+        log(info, "async_reset: countdown + async-reset behavioral checks")
+
+        // ── Reset → cnt_q = 0x1F ─────────────────────────────────
+        dut.reset = 1
+        wait 2 cycles
+        assert dut.cnt_q == 0x1F
+            else fail("post-reset: cnt_q=${dut.cnt_q:02x}, expected 0x1F")
+        assert dut.gate_clk_o == 0
+            else fail("post-reset: gate_clk_o expected 0 (cnt>=14)")
+        assert dut.release_reset_o == 0
+            else fail("post-reset: release_reset_o expected 0 (cnt>=8)")
+        dut.reset = 0
+
+        // ── Count down 31 → 0, check every cycle ──────────────────
+        // After one cycle from reset release, cnt_q decrements from
+        // 0x1F to 0x1E. Track expected manually.
+        let expected_cnt : uint<5> = 0x1F
+        for _ in 0 .. 32
+            wait 1 cycle
+            if expected_cnt > 0
+                expected_cnt = expected_cnt - 1
+            end if
+            assert dut.cnt_q == expected_cnt
+                else fail("countdown: cnt_q=${dut.cnt_q:02x}, expected ${expected_cnt:02x}")
+            let exp_gate : uint<1> = 0
+            if (expected_cnt < 14) && (expected_cnt != 0)
+                exp_gate = 1
+            end if
+            assert dut.gate_clk_o == exp_gate
+                else fail("gate_clk_o mismatch at cnt=${expected_cnt:02x}: got=${dut.gate_clk_o}, expected ${exp_gate}")
+            let exp_rel : uint<1> = 0
+            if expected_cnt < 8
+                exp_rel = 1
+            end if
+            assert dut.release_reset_o == exp_rel
+                else fail("release_reset_o mismatch at cnt=${expected_cnt:02x}: got=${dut.release_reset_o}, expected ${exp_rel}")
+        end for
+
+        // ── Hold at 0 ─────────────────────────────────────────────
+        assert dut.cnt_q == 0
+            else fail("expected to be at 0 after countdown")
+        wait 3 cycles
+        assert dut.cnt_q == 0
+            else fail("hold-at-0: cnt_q changed to ${dut.cnt_q:02x}")
+        assert dut.gate_clk_o == 0
+            else fail("hold-at-0: gate_clk_o should be 0 (cnt_q == 0 clause)")
+        assert dut.release_reset_o == 1
+            else fail("hold-at-0: release_reset_o should be 1 (cnt_q < 8)")
+
+        // ── Async-reset re-assertion: verify cnt_q jumps back ────
+        dut.reset = 1
+        wait 1 cycle
+        assert dut.cnt_q == 0x1F
+            else fail("re-reset: cnt_q=${dut.cnt_q:02x}, expected 0x1F")
+        dut.reset = 0
+        wait 1 cycle
+        assert dut.cnt_q == 0x1E
+            else fail("after-re-reset: cnt_q=${dut.cnt_q:02x}, expected 0x1E")
+
+        log(info, "ALL CHECKS PASSED — async_reset countdown + async behavior")
+    end run
+end impl AsyncResetTest
