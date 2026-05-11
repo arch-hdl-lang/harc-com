@@ -185,11 +185,17 @@ unreachable-branch-exclusion semantics that Verilator doesn't share.
   Toggle coverage on wide internal regs needs *explicit* walking
   patterns; just exercising functional modes is insufficient.
 
-### HARC language friction surfaced
+### HARC language ergonomics
 
-- **No inline type cast.** `(1: uint<32>) << i` is rejected; works
-  via `let one32 : uint<32> = 1; one32 << i` instead. Not a
-  blocker; idiom is clear.
+- **Inline type cast = `expr as Type`** (matches arch-com's grammar
+  at `doc/arch.ebnf:764` — postfix operator, binds tighter than
+  every binary op). Round-2 originally hit a parse error by writing
+  `(1: uint<32>)` — that's not the HARC syntax; the right form has
+  always been `1 as uint<32>`. The earlier README claim of "no
+  inline type cast" was wrong (corrected here). A small follow-up
+  also tightened the cast codegen so width-widening casts emit a
+  real C++ cast `((uint64_t)(1)) << 31` (was a silent no-op before;
+  mattered for shift-by-≥31 against `int` literals).
 - **No standalone `fail()` outside `assert ... else fail`.** Pilot
   hit this; `assert false else fail(...)` is the workaround. Consider
   promoting `fail` to a standalone statement in a future PR.
