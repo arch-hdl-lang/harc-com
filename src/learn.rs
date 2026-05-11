@@ -263,6 +263,148 @@ fn append_event(e: &Event) -> std::io::Result<()> {
     Ok(())
 }
 
+// ── Feature harvester ────────────────────────────────────────────────────────
+//
+// On a successful `harc check` / `harc sim` (after the error-fix
+// path), walk the post-parse AST and emit a `kind: "feature"` event
+// per top-level construct that carries any `///` / `//!` / `//! ---`
+// doc text. The event reuses the `Event` schema by repurposing
+// fields (kept stable for forward compatibility):
+//
+//   - kind          = "feature"
+//   - error_code    = construct kind ("transactor", "test", "impl", …) —
+//                     used by BM25 as a faceted token
+//   - error_message = concatenated doc text (outer + inner + file
+//                     inner_doc + frontmatter) — the bulk of the
+//                     indexed content
+//   - file_path     = source file path
+//   - diff_summary  = construct's identifier name
+//   - src_before    = file frontmatter (verbatim, for tooling that
+//                     wants to parse the YAML separately)
+//   - src_after     = construct inner_doc (separated for downstream
+//                     tooling that distinguishes outer vs inner doc)
+//
+// Re-harvesting a file replaces its existing feature events
+// (idempotent: re-running on the same source = no net change).
+
+/// Walk the post-parse AST and emit feature events for every top-level
+/// construct that carries doc text. `file_path_for` maps an item to
+/// its originating file path. Honors `HARC_NO_LEARN` and the
+/// store-size cap, same as error-fix events.
+///
+/// Returns the number of feature events emitted.
+pub fn harvest_features<F>(
+    ast: &crate::ast::SourceFile,
+    file_path_for: F,
+) -> std::io::Result<usize>
+where
+    F: Fn(&crate::ast::Item) -> String,
+{
+    if !is_enabled() || !check_capacity() {
+        return Ok(0);
+    }
+
+    // Collect new feature events first so we can purge per-file in one pass.
+    let mut new_events: Vec<Event> = Vec::new();
+    let frontmatter = ast.frontmatter.clone().unwrap_or_default();
+    let file_inner = ast.inner_doc.clone().unwrap_or_default();
+    for item in &ast.items {
+        let (kind, name, doc, inner_doc) = match extract_doc(item) {
+            Some(t) => t,
+            None => continue,
+        };
+        // Skip when there's nothing useful to retrieve.
+        if doc.is_empty()
+            && inner_doc.is_empty()
+            && frontmatter.is_empty()
+            && file_inner.is_empty()
+        {
+            continue;
+        }
+        let file = file_path_for(item);
+        let combined = [
+            doc.as_str(),
+            inner_doc.as_str(),
+            file_inner.as_str(),
+            frontmatter.as_str(),
+        ]
+        .iter()
+        .filter(|s| !s.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+        new_events.push(Event {
+            ts: iso8601_now(),
+            kind: "feature".to_string(),
+            error_code: kind.to_string(),
+            error_message: combined,
+            file_path: file,
+            src_before: frontmatter.clone(),
+            src_after: inner_doc,
+            diff_summary: name,
+        });
+    }
+
+    if new_events.is_empty() {
+        return Ok(0);
+    }
+
+    // Replace any existing feature events for the files we're harvesting.
+    let touched_files: std::collections::HashSet<String> =
+        new_events.iter().map(|e| e.file_path.clone()).collect();
+    purge_features_for_files(&touched_files)?;
+
+    let mut count = 0;
+    for e in &new_events {
+        append_event(e)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Pull `(construct_kind_str, name, outer_doc, inner_doc)` from an
+/// `Item` via the central `Construct` trait.
+fn extract_doc(item: &crate::ast::Item) -> Option<(&'static str, String, String, String)> {
+    let c = item.as_construct();
+    Some((
+        c.kind_label(),
+        c.name().name.clone(),
+        c.doc().unwrap_or("").to_string(),
+        c.inner_doc().unwrap_or("").to_string(),
+    ))
+}
+
+/// Remove all feature events whose `file_path` matches any of `files`.
+/// Rewrites `events.jsonl` by line-filtering. O(N) per call.
+fn purge_features_for_files(files: &std::collections::HashSet<String>) -> std::io::Result<()> {
+    let dir = learn_dir()?;
+    let path = dir.join("events.jsonl");
+    if !path.exists() {
+        return Ok(());
+    }
+    let raw = fs::read_to_string(&path)?;
+    let mut kept: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Cheap filter: only drop lines that carry both
+        // `kind=feature` AND a `file_path` matching one of the targets.
+        let drop = line.contains("\"kind\":\"feature\"")
+            && files
+                .iter()
+                .any(|f| line.contains(&format!("\"file_path\":\"{}\"", escape_json_string(f))));
+        if !drop {
+            kept.push(line.to_string());
+        }
+    }
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    fs::write(&path, out)
+}
+
 /// Build / rebuild the BM25 index over events.jsonl. Writes index.json.
 pub fn build_index() -> std::io::Result<usize> {
     let dir = learn_dir()?;
@@ -1045,5 +1187,52 @@ mod tests {
         );
         assert!(s.contains("let b = 2") && s.contains("let b = 3"));
         assert!(s.contains("→"));
+    }
+
+    #[test]
+    fn extract_doc_returns_construct_kind_name_and_doc() {
+        // Use a HARC source with a struct that has an outer doc comment.
+        let src = r#"
+/// Per-channel beat counter — counts AXI transfers.
+struct BeatCounter
+    count : uint<8>
+end struct BeatCounter
+"#;
+        let parsed = crate::parser::parse_source(src).expect("parse");
+        let item = &parsed.items[0];
+        let (kind, name, doc, inner) = extract_doc(item).expect("extract");
+        assert_eq!(kind, "struct");
+        assert_eq!(name, "BeatCounter");
+        assert!(doc.contains("Per-channel beat counter"),
+            "outer doc captured; got: {doc:?}");
+        assert_eq!(inner, "", "no per-construct inner doc in HARC today");
+    }
+
+    #[test]
+    fn purge_features_only_drops_matching_kind_and_file() {
+        // String-level test of the LCOV-line filter — doesn't touch
+        // ~/.harc/learn, keeps CI hermetic.
+        let lines = [
+            r#"{"ts":"t","kind":"error_fix","error_code":"missing_test","error_message":"x","file_path":"a.harc","src_before":"","src_after":"","diff_summary":"d"}"#,
+            r#"{"ts":"t","kind":"feature","error_code":"transaction","error_message":"m","file_path":"target.harc","src_before":"","src_after":"","diff_summary":"M"}"#,
+            r#"{"ts":"t","kind":"feature","error_code":"test","error_message":"m","file_path":"other.harc","src_before":"","src_after":"","diff_summary":"O"}"#,
+        ];
+        let mut to_drop = std::collections::HashSet::new();
+        to_drop.insert("target.harc".to_string());
+        let mut kept: Vec<&str> = Vec::new();
+        for line in &lines {
+            let drop = line.contains("\"kind\":\"feature\"")
+                && to_drop.iter().any(|f: &String| {
+                    line.contains(&format!("\"file_path\":\"{}\"", escape_json_string(f)))
+                });
+            if !drop {
+                kept.push(*line);
+            }
+        }
+        assert_eq!(kept.len(), 2);
+        assert!(kept[0].contains("\"kind\":\"error_fix\""),
+            "error_fix events should not be dropped by feature-purge");
+        assert!(kept[1].contains("\"file_path\":\"other.harc\""),
+            "feature events for non-targeted files should be retained");
     }
 }

@@ -309,11 +309,38 @@ frequently-cited fixes float up.
 | Command | Effect |
 |---|---|
 | `harc advise <query> [-k N]` | top-K past fixes ranked by BM25 |
+| `harc advise --feature <query>` | top-K **feature** events (spec→source provenance from `///` / `//!` / `//! ---`) instead of error→fix pairs |
 | `harc advise --from-stderr` | read query from stdin (pipe `harc sim … 2>&1` into it) |
 | `harc learn-index` | rebuild the BM25 index over `events.jsonl` |
 | `harc learn-stats` | event count + breakdown by error_code |
 | `harc learn-clear` | wipe `~/.harc/learn/` |
 | `harc learn-prune --code C \| --contains S \| --older-than-days D [--dry-run]` | remove matching events |
+| `harc learn-bootstrap <dir>` | recursively parse `*.harc` under `<dir>`, harvest one feature event per top-level construct that carries `///` / `//!` / `//! ---` doc text. Idempotent: re-running replaces existing feature events for each file. Build the index afterwards with `harc learn-index`. |
+
+**Feature events** (harvested automatically on every successful
+`harc check` / `harc sim`, or bulk-seeded via `harc learn-bootstrap`):
+
+Each top-level construct that carries any doc-comment text (outer
+`///`, file-level `//!`, or `//! ---` frontmatter) emits one
+`kind: "feature"` event. Schema repurposes the `Event` fields:
+
+  - `error_code` = construct kind label (`"transactor"`, `"test"`,
+    `"impl"`, `"struct"`, `"transaction"`, …) — used by BM25 as a
+    faceted token
+  - `error_message` = concatenated doc text (construct outer + file
+    inner_doc + frontmatter) — the bulk of the indexed content
+  - `diff_summary` = construct's identifier name (so `advise --feature`
+    surfaces it as `construct:` in the result)
+  - `src_before` = file frontmatter (verbatim, for tooling that
+    parses the YAML)
+  - `src_after` = construct inner_doc (currently empty; reserved for
+    when HARC adds per-construct inner-doc parsing)
+
+This is the **spec → source** retrieval surface: agents looking for
+"how do I build X" can pull annotated examples from the local corpus
+without ever leaving the machine. Pairs naturally with PR A's
+frontmatter: `///` + `//! ---` make the spec-link explicit; the
+harvester makes it retrievable.
 
 **Privacy + opt-out**: all data stays on-device under `~/.harc/learn/`.
 `HARC_NO_LEARN=1` disables capture and retrieval. `HARC_LEARN_MAX_MB`
