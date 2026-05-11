@@ -196,9 +196,12 @@ unreachable-branch-exclusion semantics that Verilator doesn't share.
   also tightened the cast codegen so width-widening casts emit a
   real C++ cast `((uint64_t)(1)) << 31` (was a silent no-op before;
   mattered for shift-by-≥31 against `int` literals).
-- **No standalone `fail()` outside `assert ... else fail`.** Pilot
-  hit this; `assert false else fail(...)` is the workaround. Consider
-  promoting `fail` to a standalone statement in a future PR.
+- **Standalone `fail("...")`** is now a first-class statement
+  (landed after round-2). Same emission as the failure arm of
+  `assert ... else fail(...)` minus the `if (!cond)` guard — useful
+  when the failure trigger is structural (inside `if`/`for`) rather
+  than a single boolean predicate. The earlier workaround
+  `assert false else fail(...)` is no longer needed.
 
 ## Phase 2b-scale (next, NOT in this PR)
 
