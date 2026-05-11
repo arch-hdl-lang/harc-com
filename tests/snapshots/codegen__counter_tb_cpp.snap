@@ -11,6 +11,9 @@ expression: cpp
 
 #include "VWrapCounter.h"
 #include "verilated.h"
+#if VM_COVERAGE
+#include "verilated_cov.h"
+#endif
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -186,6 +189,13 @@ int main(int argc, char** argv) {
 
 
     dut->final();
+#if VM_COVERAGE
+    {
+        const char* _cov_dir = std::getenv("HARC_LOG_DIR");
+        std::string _cov_path = _cov_dir ? std::string(_cov_dir) + "/coverage.dat" : std::string("coverage.dat");
+        Verilated::threadContextp()->coveragep()->write(_cov_path.c_str());
+    }
+#endif
     delete dut;
     if (sim_log) std::fclose(sim_log);
     for (auto& kv : log_files) { if (kv.second) std::fclose(kv.second); }

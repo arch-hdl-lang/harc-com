@@ -90,6 +90,14 @@ enum Cmd {
         /// per-cycle compute that genuinely benefit from parallelism.
         #[arg(long)]
         mt: bool,
+        /// Enable Verilator coverage collection (`--coverage`). The
+        /// emitted TB writes `coverage.dat` next to the simulation
+        /// log on clean shutdown; `verilator_coverage` can then
+        /// post-process it. Used by the CVDP-style scorer at
+        /// `bench/cvdp/score.py` to measure DUT coverage achieved by
+        /// the TB. Off by default (small compile/runtime cost).
+        #[arg(long)]
+        coverage: bool,
     },
     // Future, mirroring ARCH:
     //   Build  — transpile to SystemVerilog + UVM (spec §10.2, phase 5)
@@ -101,8 +109,8 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Check { files, ast } => cmd_check(files, ast),
         Cmd::Fmt { file, write } => cmd_fmt(file, write),
-        Cmd::Sim { files, dut, sv, top, test, outdir, seed, emit_only, arch_bin, mt } =>
-            cmd_sim(files, dut, sv, top, test, outdir, seed, emit_only, arch_bin, mt),
+        Cmd::Sim { files, dut, sv, top, test, outdir, seed, emit_only, arch_bin, mt, coverage } =>
+            cmd_sim(files, dut, sv, top, test, outdir, seed, emit_only, arch_bin, mt, coverage),
     }
 }
 
@@ -251,6 +259,7 @@ fn run_verilator(
     outdir_abs: &PathBuf,
     sim_log_path: &PathBuf,
     seed: Option<u64>,
+    coverage: bool,
 ) -> Result<()> {
     let mdir = outdir_abs.join("obj_dir");
     let _ = fs::remove_dir_all(&mdir); // start clean — stale .o's bite us
@@ -273,6 +282,16 @@ fn run_verilator(
         "-Wno-fatal".into(), "-Wno-WIDTH".into(),
         "--top-module".into(), top.into(),
         "--Mdir".into(), mdir.display().to_string(),
+    ];
+    if coverage {
+        // Enable Verilator's line + toggle + expression coverage on the
+        // DUT. `--coverage` is the umbrella switch; emitted TB writes
+        // `coverage.dat` at clean shutdown (see cpp_tb.rs main()
+        // emission). `verilator_coverage` post-processes the .dat into
+        // per-instance metrics that the CVDP-style scorer reads.
+        args.push("--coverage".into());
+    }
+    args.extend([
         // Force C++20 by overriding verilator's default
         // `CFG_CXXFLAGS_STD = -std=gnu++17` Makefile variable, so
         // `<coroutine>` and our `co_await`-based wait primitives
@@ -313,7 +332,7 @@ fn run_verilator(
             "CFG_CXXFLAGS_STD=-std=gnu++20 CXX={}",
             std::env::var("HARC_CXX").unwrap_or_else(|_| "c++".to_string())
         ),
-    ];
+    ]);
     // Make the build dir an include path so the emitted `.cpp`'s
     // `#include "harc_thread_rt.h"` resolves — verilator builds in
     // `obj_dir/` (cwd at compile time) and the header lives one level up.
@@ -386,6 +405,7 @@ fn cmd_sim(
     emit_only: bool,
     arch_bin: Option<PathBuf>,
     mt: bool,
+    coverage: bool,
 ) -> Result<()> {
     if dut.is_empty() && sv.is_empty() {
         return Err(miette::miette!("pass either --dut <file.arch> or --sv <file.sv>"));
@@ -450,7 +470,7 @@ fn cmd_sim(
         for s in &sv {
             sv_abs.push(fs::canonicalize(s).into_diagnostic()?);
         }
-        return run_verilator(&top_name, &sv_abs, &cpp_abs, &outdir_abs, &sim_log_path, seed);
+        return run_verilator(&top_name, &sv_abs, &cpp_abs, &outdir_abs, &sim_log_path, seed, coverage);
     }
 
     // ARCH path: run `arch sim <dut...> --tb <cpp_path>`.
