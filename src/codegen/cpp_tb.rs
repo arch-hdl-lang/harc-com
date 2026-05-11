@@ -4637,9 +4637,28 @@ impl Emitter {
                 }
                 write!(self.out, ")").ok();
             }
-            ExprKind::Cast { expr, .. } => {
-                // C++ TB drops casts for v0 — the underlying integer math is the same.
-                self.emit_expr(expr);
+            ExprKind::Cast { expr, ty } => {
+                // Emit `((<c_type>)(<inner>))` when the target type
+                // maps to a known C++ integer type — mirrors arch-com's
+                // postfix `expr as Type` lowering. Width-widening
+                // casts MATTER in C++: `1 << 31` against a `int`
+                // literal is undefined behavior, while
+                // `((uint64_t)1) << 31` is well-defined. Bool↔UInt
+                // narrowing also flows through here, with C++'s
+                // implicit conversions handling the no-op cases.
+                //
+                // For non-Builtin target types (struct, named type),
+                // drop the cast and emit just the inner expression —
+                // those are usually identity casts at the type-system
+                // level that don't need a C++ representation.
+                if matches!(ty, TypeExpr::Builtin { .. }) {
+                    let cty = c_type_for(ty);
+                    write!(self.out, "(({cty})(").ok();
+                    self.emit_expr(expr);
+                    write!(self.out, "))").ok();
+                } else {
+                    self.emit_expr(expr);
+                }
             }
             ExprKind::Unary { op, expr } => {
                 let s = match op {

@@ -474,3 +474,71 @@ end impl T"#,
         "expected clear error mentioning non-sim impls; got: {}", err.0);
 }
 
+/// `expr as Type` (postfix cast, same shape as arch-com's grammar)
+/// emits a C++ cast `((<c_type>)(<inner>))` when the target is a
+/// builtin numeric type. Critical for width-widening cases like
+/// `1 as uint<32> << 31` — without the cast, C++'s `int` literal
+/// shift-by-31 hits sign-bit UB; with the cast, the shift operates
+/// on `uint64_t` and is well-defined.
+#[test]
+fn cast_to_builtin_emits_cpp_cast() {
+    let parsed = parse_source(
+        r#"test T
+    let dut : DummyDut
+end test T
+
+impl sim for T
+    run
+        // Walk-1 pattern that needs cast-widened source: `(1 as
+        // uint<32>) << 31` would otherwise be `1 << 31` against a
+        // 32-bit int literal — UB in C++.
+        let mask : uint<32> = (1 as uint<32>) << 31
+        dut.X = mask
+    end run
+end impl T"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+
+    // Cast emits as `((uint64_t)(1))` — HARC's c_type_for maps
+    // uint<32> to uint64_t (the C++ widening covers all ≤64-bit
+    // unsigned ints uniformly).
+    assert!(cpp.contains("((uint64_t)(1))"),
+        "expected `((uint64_t)(1))` from `1 as uint<32>`; got:\n{cpp}");
+    // And the shift uses that cast result, not a bare `1 << 31`.
+    assert!(cpp.contains("((uint64_t)(1))) << 31") ||
+            cpp.contains("((uint64_t)(1)) << 31"),
+        "expected shift to operate on the cast result; got:\n{cpp}");
+}
+
+/// Casts to non-Builtin types (struct, named) drop to identity at
+/// codegen time. The cast is purely a HARC-level type assertion;
+/// the C++ representation doesn't change.
+#[test]
+fn cast_to_named_type_is_identity_in_cpp() {
+    let parsed = parse_source(
+        r#"struct Pkt
+    addr : uint<32>
+    data : uint<32>
+end struct Pkt
+
+test T
+    let dut : DummyDut
+end test T
+
+impl sim for T
+    run
+        let raw : uint<64> = 0xDEAD_BEEF_CAFE_BABE
+        let pkt = raw as Pkt
+        dut.X = pkt.addr
+    end run
+end impl T"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+
+    // No `(Pkt)` C++ cast should appear — the user-level cast to a
+    // struct is identity at the HARC C++ TB layer (struct field
+    // access still uses `.addr`, which works on the underlying value).
+    assert!(!cpp.contains("(Pkt)("),
+        "expected NO `(Pkt)(...)` C++ cast for struct-targeted `as`; got:\n{cpp}");
+}
+
