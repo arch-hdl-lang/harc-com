@@ -1007,6 +1007,12 @@ fn print_stmt(out: &mut String, s: &Stmt, depth: usize) {
             }
             writeln!(out).ok();
         }
+        StmtKind::Fail { msg, .. } => {
+            pad(out, depth);
+            write!(out, "fail(").ok();
+            print_expr(out, msg);
+            writeln!(out, ")").ok();
+        }
     }
 }
 
