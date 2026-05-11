@@ -1669,6 +1669,19 @@ impl Parser {
                 let span = start.merge(v.span);
                 Ok(Stmt { kind: StmtKind::Assert(v), span })
             }
+            Some(TokenKind::Fail) => {
+                // `fail("...")` standalone statement. Same message slot
+                // as the `else fail("...")` clause of `assert`, just
+                // unconditional. Useful when the failure trigger is
+                // structural (inside `if`/`for` flow control) rather
+                // than expressible as a single boolean predicate.
+                self.advance();
+                self.expect(TokenKind::LParen)?;
+                let msg = self.parse_expr()?;
+                let close = self.expect(TokenKind::RParen)?.span;
+                let span = start.merge(close);
+                Ok(Stmt { kind: StmtKind::Fail { msg, span }, span })
+            }
             Some(TokenKind::Assume) => {
                 self.advance();
                 let v = self.parse_verify(true)?;

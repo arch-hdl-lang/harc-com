@@ -510,6 +510,39 @@ end impl T"#,
         "expected shift to operate on the cast result; got:\n{cpp}");
 }
 
+/// Standalone `fail("...")` lowers to the same emission as the
+/// failure arm of an `assert ... else fail(...)`: a `sim_log_line`
+/// + `errors++;`. Without the surrounding `if (!cond)` guard, it
+/// is an unconditional failure — useful when the failure trigger
+/// is control-flow-structural rather than a single boolean
+/// predicate.
+#[test]
+fn standalone_fail_emits_sim_log_and_errors_bump() {
+    let parsed = parse_source(
+        r#"test T
+    let dut : DummyDut
+end test T
+
+impl sim for T
+    run
+        for i in 0 .. 4
+            if i == 3
+                fail("loop reached unreachable branch at i=${i}")
+            end if
+        end for
+    end run
+end impl T"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+
+    // The standalone fail emits a sim_log_line + errors++ inline,
+    // no surrounding `if (!...)` guard.
+    assert!(cpp.contains("sim_log_line(\"FAIL\", \"loop reached unreachable branch at i=%lld\""),
+        "expected sim_log_line(\"FAIL\", ...) for standalone fail; got:\n{cpp}");
+    assert!(cpp.contains("errors++"),
+        "expected `errors++;` after standalone fail; got:\n{cpp}");
+}
+
 /// Casts to non-Builtin types (struct, named) drop to identity at
 /// codegen time. The cast is purely a HARC-level type assertion;
 /// the C++ representation doesn't change.
