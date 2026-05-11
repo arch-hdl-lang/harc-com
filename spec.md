@@ -273,6 +273,71 @@ Mirrors arch-com's `plan_arch_doc_comments.md` lexical design — same
 attachment rules, same field conventions — so HARC and ARCH sources
 can be indexed by the same harvester.
 
+## 2.6 Local learning store — `harc advise`
+
+HARC ships an always-on, on-device store of error→fix pairs. Every
+`harc check` / `harc sim` invocation records its outcome; over time,
+the store accumulates examples of "thing that failed → diff that
+fixed it" that can be retrieved by the user (or an LLM agent) on a
+later compile failure. Ports arch-com's `src/learn.rs` (sister
+implementation; see `arch-com/doc/plan_arch_learning_system.md`).
+
+**Capture loop** (automatic, no flag):
+
+  1. **On failure** of `harc check` / `harc sim`: classify the error
+     message into a short `error_code` (`parse_error`,
+     `missing_test`, `missing_dut`, `width_mismatch`, …), stash
+     `(error_code, error_message, src)` in
+     `~/.harc/learn/pending/<file_hash>.json`.
+  2. **On the next success** for the same file: diff `src` against
+     the now-successful source, append an `error_fix` event to
+     `~/.harc/learn/events.jsonl`, delete the pending record, print
+     `📚 Learned: [<code>] <one-line diff>`.
+  3. **On every failure**, also `peek` the store for similar past
+     fixes (zero-side-effect, doesn't bump retrieval counts) and
+     print `💡 harc advise found N similar past fixes — run 'harc
+     advise "<code>"' to see them.` when the store has matches.
+
+**Retrieval**: `harc advise <query>` returns top-K matches via BM25
+scoring over `(error_code, error_message, diff_summary)`. Build the
+index once with `harc learn-index`; subsequent `advise` calls reuse
+it. Each match's `retrieved_count` increments on retrieval so
+frequently-cited fixes float up.
+
+**Subcommands:**
+
+| Command | Effect |
+|---|---|
+| `harc advise <query> [-k N]` | top-K past fixes ranked by BM25 |
+| `harc advise --from-stderr` | read query from stdin (pipe `harc sim … 2>&1` into it) |
+| `harc learn-index` | rebuild the BM25 index over `events.jsonl` |
+| `harc learn-stats` | event count + breakdown by error_code |
+| `harc learn-clear` | wipe `~/.harc/learn/` |
+| `harc learn-prune --code C \| --contains S \| --older-than-days D [--dry-run]` | remove matching events |
+
+**Privacy + opt-out**: all data stays on-device under `~/.harc/learn/`.
+`HARC_NO_LEARN=1` disables capture and retrieval. `HARC_LEARN_MAX_MB`
+caps the store (default 100 MB; warns at 90%, hard-skips writes at
+100%). One-time privacy notice prints on the first capture-enabled
+invocation.
+
+**Data layout:**
+
+```
+~/.harc/learn/
+  ├── events.jsonl            append-only capture stream
+  ├── index.json              BM25 index (built by `harc learn-index`)
+  ├── pending/<hash>.json     in-flight failure per source file
+  ├── retrieval_counts.json   per-event retrieval counter
+  └── .first_run_notice       marker file for one-time privacy notice
+```
+
+Designed deliberately minimal: hand-written JSONL serde, pure-Rust
+BM25, no embeddings, no network, no sharing mechanism. Embedding-
+backed semantic retrieval is a planned upgrade (arch-com's plan §v2
+is the reference); the BM25 baseline already discriminates well
+across the kinds of error/diff text the HARC compiler produces.
+
 ---
 
 ## 3. Type System Extensions
