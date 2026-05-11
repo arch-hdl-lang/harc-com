@@ -1,0 +1,46 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_binary_to_BCD_0030`.
+//
+// DUT: 8-bit binary → 12-bit packed BCD via Double-Dabble.
+// Output format: { hundreds[3:0], tens[3:0], ones[3:0] }, each nibble
+// holding one decimal digit (0..9).
+//
+// Strategy: exhaustive sweep of all 256 input values, comparing against
+// a straight-arithmetic software reference model. At 256 inputs this is
+// cheap and guarantees coverage of every branch in the double-dabble
+// loop body. The wrapper exposes `binary_in` and `bcd_out` from the
+// inner `binary_to_bcd` module; we drive the wrapper through the
+// auto-generated `_top` shim.
+
+function bcd_ref(n: uint<8>) -> uint<12>
+    let ones      : uint<4> = n % 10
+    let tens      : uint<4> = (n / 10) % 10
+    let hundreds  : uint<4> = (n / 100) % 10
+    return (hundreds << 8) | (tens << 4) | ones
+end function bcd_ref
+
+test BinaryToBcdTest
+    let dut : binary_to_bcd_top
+end test BinaryToBcdTest
+
+impl sim for BinaryToBcdTest
+    run
+        log(info, "binary_to_bcd: exhaustive 0..255 sweep vs sw model")
+        dut.binary_in = 0
+        wait 1 cycle
+
+        let errors : uint<32> = 0
+        for n in 0 .. 256
+            dut.binary_in = n
+            wait 1 cycle
+            let expected = bcd_ref(n)
+            if dut.bcd_out != expected
+                log(error, "MISMATCH n=${n:3} got=${dut.bcd_out:03x} expected=${expected:03x}")
+                errors = errors + 1
+            end if
+        end for
+
+        assert errors == 0
+            else fail("binary_to_bcd sweep: ${errors} mismatches out of 256")
+        log(info, "PASS: all 256 binary→BCD values match software reference")
+    end run
+end impl BinaryToBcdTest
