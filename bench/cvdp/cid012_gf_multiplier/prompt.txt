@@ -1,0 +1,40 @@
+Develop a testbench to generate stimuli for the gf_multiplier module, which performs polynomial multiplication in GF(2<sup>4</sup>) for two 4-bit inputs (`A` and `B`).
+
+---
+## Description
+
+---
+## Inputs
+
+- **Registers**: `A` and `B` are 4-bit registers that provide binary inputs to the module.
+
+---
+## Outputs
+
+- **GF(2<sup>4</sup>) Product Output**: A 4-bit register, `result`, which indicates the polynomial multiplication result over GF(2<sup>4</sup>).
+
+---
+## Instantiation
+
+- **Module Instance**: The `gf_multiplier` module is instantiated as `uut`, with the input and output signals connected for testing.
+
+---
+## Input Generation and Validation
+
+- **Random Input Generation**: The testbench must generate pairs of 4-bit binary values for `A` and `B` to cover all possibilities, including corner cases.
+- **Stabilization Period**: After setting each pair of inputs, the testbench waits 10 time units to ensure the outputs have stabilized before applying new values.
+
+---
+
+Follows the specification for building the RTL of the module, use it as reference for the verification environment too:
+
+### Module interface
+
+1. **Inputs**:
+   - `A [3:0]` and `B [3:0]`: These are the 4-bit data inputs for the GF(2<sup>4</sup>) multiplication.
+
+2. **Output**:
+   - `result [3:0]`: This 4-bit output holds the product of `A` and `B` under GF(2<sup>4</sup>) using the irreducible polynomial \( x<sup>4</sup> + x + 1 \).
+
+3. **Module Functionality**:
+   - **Polynomial Multiplication**: For each bit of `B`, the partial product is formed by `A` and reduced modulo the irreducible polynomial if overflow occurs. The final XOR-based accumulation provides the 4-bit `result`.
