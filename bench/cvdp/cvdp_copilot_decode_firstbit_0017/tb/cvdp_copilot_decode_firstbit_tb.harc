@@ -1,0 +1,125 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_decode_firstbit_0017`.
+//
+// DUT: cvdp_copilot_decode_firstbit — pipelined first-set-bit finder
+// for a 32-bit input. Default params: InWidth_g=32, InReg_g=1,
+// OutReg_g=1, PlRegs_g=1, OutputFormat_g=0 (binary index).
+//
+// Total pipeline latency from In to Out (defaults):
+//   input_reg(1) + Stage0(1) + PlRegs=1 + output_reg(1) = 4 cycles
+//
+// Outputs:
+//   Out_FirstBit  = binary index of lowest set bit (0..31), zero-extended
+//                   to 32 bits. 0 when no bit set OR when bit 0 set.
+//   Out_Found     = 1 iff any bit of In_Data was set
+//   Out_Valid     = pipelined In_Valid
+//
+// Strategy:
+//   1. Reset; verify all outputs are 0.
+//   2. Walk-1: drive In_Data = 1<<i for i in 0..32 with In_Valid=1,
+//      wait pipeline latency, verify Out_FirstBit==i, Out_Found==1.
+//   3. All-zeros In_Data: verify Out_Found==0, Out_FirstBit==0.
+//   4. In_Valid=0 path: verify Out_Valid drops after pipeline.
+//   5. Toggle-sweep: drive In_Data through 0xFFFFFFFF, 0x55555555,
+//      0xAAAAAAAA to toggle every input bit in both directions.
+
+test FirstBitTest
+    let dut : cvdp_copilot_decode_firstbit_top
+end test FirstBitTest
+
+impl sim for FirstBitTest
+    run
+        log(info, "decode_firstbit: walk-1 sweep through 32 bit positions")
+
+        // ── Reset ─────────────────────────────────────────────────
+        dut.Rst = 1
+        dut.In_Data = 0
+        dut.In_Valid = 0
+        wait 4 cycles
+        assert dut.Out_Valid == 0
+            else fail("post-reset Out_Valid=${dut.Out_Valid}, expected 0")
+        assert dut.Out_Found == 0
+            else fail("post-reset Out_Found=${dut.Out_Found}, expected 0")
+        assert dut.Out_FirstBit == 0
+            else fail("post-reset Out_FirstBit=${dut.Out_FirstBit:08x}, expected 0")
+        dut.Rst = 0
+
+        // ── Walk-1: 1<<i for i in 0..32 ──────────────────────────
+        // The pipeline is 4 deep. Pipelining lets us pump inputs one
+        // per cycle and observe outputs offset by 4 cycles. To keep
+        // the TB simple, we drive each input, wait 4 cycles for it
+        // to drain, then check. (Not pipelined-densely, but correct.)
+        dut.In_Valid = 1
+        let errors : uint<32> = 0
+        for i in 0 .. 32
+            dut.In_Data = 1 << i
+            wait 4 cycles
+            if dut.Out_Found != 1
+                log(error, "i=${i} Out_Found=${dut.Out_Found}, expected 1")
+                errors = errors + 1
+            end if
+            if dut.Out_FirstBit != i
+                log(error, "i=${i} Out_FirstBit=${dut.Out_FirstBit:08x}, expected ${i:08x}")
+                errors = errors + 1
+            end if
+            if dut.Out_Valid != 1
+                log(error, "i=${i} Out_Valid=${dut.Out_Valid}, expected 1")
+                errors = errors + 1
+            end if
+        end for
+        assert errors == 0
+            else fail("walk-1 sweep: ${errors} errors")
+        log(info, "walk-1 PASS: 32 single-bit positions produce correct index")
+
+        // ── No-bits-set case ─────────────────────────────────────
+        dut.In_Data = 0
+        wait 4 cycles
+        assert dut.Out_Found == 0
+            else fail("zero-input: Out_Found=${dut.Out_Found}, expected 0")
+        assert dut.Out_FirstBit == 0
+            else fail("zero-input: Out_FirstBit=${dut.Out_FirstBit:08x}, expected 0")
+
+        // ── In_Valid=0: Out_Valid should fall after pipeline ─────
+        dut.In_Valid = 0
+        dut.In_Data = 0xDEADBEEF
+        wait 4 cycles
+        assert dut.Out_Valid == 0
+            else fail("In_Valid=0 propagated: Out_Valid=${dut.Out_Valid}, expected 0")
+        dut.In_Valid = 1
+
+        // ── Toggle-coverage sweep: drive In_Data through all-ones,
+        // alternating, mid-pattern values so every bit toggles both
+        // 0→1 and 1→0 ───────────────────────────────────────────
+        dut.In_Data = 0xFFFFFFFF
+        wait 4 cycles
+        assert dut.Out_FirstBit == 0   // bit 0 set, index 0
+            else fail("0xFFFFFFFF: Out_FirstBit=${dut.Out_FirstBit:08x}, expected 0")
+        dut.In_Data = 0x55555555
+        wait 4 cycles
+        dut.In_Data = 0xAAAAAAAA
+        wait 4 cycles
+        // bit 0 is 0, bit 1 set → index 1
+        assert dut.Out_FirstBit == 1
+            else fail("0xAAAAAAAA: Out_FirstBit=${dut.Out_FirstBit:08x}, expected 1")
+        dut.In_Data = 0
+        wait 4 cycles
+
+        // ── Toggle-sweep tail: walking-0 + a few mixed patterns to
+        // hit every bit-direction transition on In_Data. Walking-1
+        // already did most; this completes the picture.
+        let one32 : uint<32> = 1
+        for i in 0 .. 32
+            dut.In_Data = (one32 << i) ^ 0xFFFFFFFF   // walking-0
+            wait 1 cycle
+        end for
+        dut.In_Data = 0x12345678
+        wait 1 cycle
+        dut.In_Data = 0xEDCBA987   // ~0x12345678
+        wait 1 cycle
+        dut.In_Data = 0xFFFFFFFF
+        wait 1 cycle
+        dut.In_Data = 0x00000000
+        wait 4 cycles
+
+        log(info, "ALL CHECKS PASSED — decode_firstbit")
+    end run
+end impl FirstBitTest
