@@ -1,0 +1,15 @@
+// Intentionally thin TB to verify the scorer rejects under-coverage.
+// Only drives a single (A=1, B=1) pair — most DUT branches go unhit.
+
+test GfMultiplierThinTest
+    let dut : gf_multiplier_top
+end test GfMultiplierThinTest
+
+impl sim for GfMultiplierThinTest
+    run
+        dut.A = 1
+        dut.B = 1
+        wait 1 cycle
+        log(info, "thin TB: A=1 B=1 result=${dut.result:1x}")
+    end run
+end impl GfMultiplierThinTest

@@ -1,0 +1,10 @@
+{
+  "id": "cvdp_copilot_gf_multiplier_0039",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "gf_multiplier_top",
+  "dut_module": "gf_multiplier",
+  "target_coverage": 90
+}

@@ -409,6 +409,9 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     writeln!(e.out, "").ok();
     writeln!(e.out, "#include \"V{dut_type}.h\"").ok();
     writeln!(e.out, "#include \"verilated.h\"").ok();
+    writeln!(e.out, "#if VM_COVERAGE").ok();
+    writeln!(e.out, "#include \"verilated_cov.h\"").ok();
+    writeln!(e.out, "#endif").ok();
     writeln!(e.out, "#include <cstdio>").ok();
     writeln!(e.out, "#include <cstdint>").ok();
     writeln!(e.out, "#include <cstdlib>").ok();
@@ -1118,6 +1121,19 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "{INDENT}}}").ok();
     }
     writeln!(e.out, "{INDENT}dut->final();").ok();
+    // Verilator coverage write — only does anything when the TB was
+    // built with `harc sim --coverage` (which sets `--coverage` on
+    // verilator → defines `VM_COVERAGE=1`). The .dat file lands in
+    // $HARC_LOG_DIR (set by `harc sim`) so the CVDP-style scorer can
+    // post-process it with `verilator_coverage`. Always-emitted-but-
+    // ifdef'd so a coverage-built TB is the only difference.
+    writeln!(e.out, "#if VM_COVERAGE").ok();
+    writeln!(e.out, "{INDENT}{{").ok();
+    writeln!(e.out, "{INDENT}{INDENT}const char* _cov_dir = std::getenv(\"HARC_LOG_DIR\");").ok();
+    writeln!(e.out, "{INDENT}{INDENT}std::string _cov_path = _cov_dir ? std::string(_cov_dir) + \"/coverage.dat\" : std::string(\"coverage.dat\");").ok();
+    writeln!(e.out, "{INDENT}{INDENT}Verilated::threadContextp()->coveragep()->write(_cov_path.c_str());").ok();
+    writeln!(e.out, "{INDENT}}}").ok();
+    writeln!(e.out, "#endif").ok();
     writeln!(e.out, "{INDENT}delete dut;").ok();
     writeln!(e.out, "{INDENT}if (sim_log) std::fclose(sim_log);").ok();
     writeln!(e.out, "{INDENT}for (auto& kv : log_files) {{ if (kv.second) std::fclose(kv.second); }}").ok();
