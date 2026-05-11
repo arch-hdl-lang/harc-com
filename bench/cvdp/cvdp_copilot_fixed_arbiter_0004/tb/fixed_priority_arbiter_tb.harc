@@ -1,0 +1,74 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_fixed_arbiter_0004`.
+//
+// DUT: 8-bit fixed-priority arbiter. On posedge clk, sets `grant` to a
+// one-hot vector indicating the lowest-indexed asserted bit of `req`.
+// Active-high asynchronous reset clears `grant` to all zeros.
+//
+// Strategy:
+//   1. Reset, verify grant=0.
+//   2. Exhaustively sweep req ∈ [0..255] — for each value, verify
+//      grant matches the priority-encoder reference. This hits every
+//      `else if (req[i])` branch (i=0 wins over higher bits; isolated
+//      single-bit values exercise each branch individually).
+//   3. Reset mid-stream, verify it overrides the requested grant.
+
+// Software reference: priority-encode req's lowest set bit into a
+// one-hot grant. Returns 0 when req is all-zero.
+function priority_grant(req: uint<8>) -> uint<8>
+    for i in 0 .. 8
+        if ((req >> i) & 1) == 1
+            return 1 << i
+        end if
+    end for
+    return 0
+end function priority_grant
+
+test FixedPriorityArbiterTest
+    let dut : fixed_priority_arbiter
+end test FixedPriorityArbiterTest
+
+impl sim for FixedPriorityArbiterTest
+    run
+        log(info, "fixed_priority_arbiter: reset + exhaustive req sweep")
+
+        // ── Reset ──────────────────────────────────────────────────
+        dut.reset = 1
+        dut.req = 0
+        wait 2 cycles
+        assert dut.grant == 0
+            else fail("post-reset: grant=${dut.grant:02x}, expected 0")
+        dut.reset = 0
+        wait 1 cycle
+
+        // ── Exhaustive sweep ─────────────────────────────────────
+        let errors : uint<32> = 0
+        for r in 0 .. 256
+            dut.req = r
+            wait 1 cycle
+            let expected = priority_grant(r)
+            if dut.grant != expected
+                log(error, "MISMATCH req=${r:02x} grant=${dut.grant:02x} expected=${expected:02x}")
+                errors = errors + 1
+            end if
+        end for
+        assert errors == 0
+            else fail("sweep produced ${errors} mismatches out of 256")
+        log(info, "sweep PASS: all 256 req patterns produce correct grant")
+
+        // ── Reset mid-stream ─────────────────────────────────────
+        dut.req = 0xff   // ask for everything
+        wait 1 cycle
+        assert dut.grant == 0x01
+            else fail("pre-reset-mid: grant=${dut.grant:02x}, expected 0x01")
+        dut.reset = 1
+        wait 1 cycle
+        assert dut.grant == 0
+            else fail("reset-mid: grant=${dut.grant:02x}, expected 0")
+        dut.reset = 0
+        wait 1 cycle
+        assert dut.grant == 0x01
+            else fail("post-reset-mid: grant=${dut.grant:02x}, expected 0x01")
+
+        log(info, "ALL CHECKS PASSED — fixed_priority_arbiter")
+    end run
+end impl FixedPriorityArbiterTest

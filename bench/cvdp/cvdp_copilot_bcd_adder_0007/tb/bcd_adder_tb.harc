@@ -1,0 +1,60 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_bcd_adder_0007`.
+//
+// DUT: BCD adder. Inputs a, b ∈ {0..9} (valid BCD digits). Output is
+// (sum, cout) where `cout * 10 + sum == a + b`. Internally: a binary
+// 4-bit add followed by a BCD correction (+6 when binary sum ≥ 10).
+//
+// Strategy: exhaustive sweep over the valid BCD input space — 10×10 =
+// 100 (a, b) pairs. Hits both the no-correction path (a+b ≤ 9) and the
+// correction path (a+b ≥ 10). Compares against an inline software model.
+
+function bcd_sum(a: uint<4>, b: uint<4>) -> uint<4>
+    let total = a + b
+    if total >= 10
+        return total - 10
+    end if
+    return total
+end function bcd_sum
+
+function bcd_cout(a: uint<4>, b: uint<4>) -> uint<1>
+    if (a + b) >= 10
+        return 1
+    end if
+    return 0
+end function bcd_cout
+
+test BcdAdderTest
+    let dut : bcd_adder_top
+end test BcdAdderTest
+
+impl sim for BcdAdderTest
+    run
+        log(info, "bcd_adder: exhaustive 10×10 BCD-digit sweep")
+        dut.a = 0
+        dut.b = 0
+        wait 1 cycle
+
+        let errors : uint<32> = 0
+        for a in 0 .. 10
+            for b in 0 .. 10
+                dut.a = a
+                dut.b = b
+                wait 1 cycle
+                let exp_sum = bcd_sum(a, b)
+                let exp_cout = bcd_cout(a, b)
+                if dut.sum != exp_sum
+                    log(error, "SUM MISMATCH a=${a} b=${b} got=${dut.sum} expected=${exp_sum}")
+                    errors = errors + 1
+                end if
+                if dut.cout != exp_cout
+                    log(error, "COUT MISMATCH a=${a} b=${b} got=${dut.cout} expected=${exp_cout}")
+                    errors = errors + 1
+                end if
+            end for
+        end for
+
+        assert errors == 0
+            else fail("bcd_adder sweep: ${errors} mismatches")
+        log(info, "PASS: all 100 BCD digit-pair additions match software model")
+    end run
+end impl BcdAdderTest
