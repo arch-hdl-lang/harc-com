@@ -205,6 +205,7 @@ fn resolve_use_imports(
             imported.push(harc::ast::SourceFile {
                 items: bus_only,
                 inner_doc: None,
+                frontmatter: None,
             });
         }
     }

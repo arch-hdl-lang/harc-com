@@ -143,3 +143,105 @@ end impl T
         "ternary should print without splitting `?` and `:` across lines:\n{printed}"
     );
 }
+
+/// `///` outer doc comments attach to the next construct, populate
+/// `doc: Option<String>` on the AST node, and round-trip through the
+/// pretty-printer. Mirrors arch-com's `plan_arch_doc_comments.md` §2.1.
+#[test]
+fn outer_doc_attaches_and_round_trips() {
+    let src = r#"
+/// 4-channel round-robin AXI write arbiter.
+///
+/// Picks among threads holding the lock using a rotating priority pointer.
+struct AxiTxn
+    addr : uint<32>
+    data : uint<32>
+end struct AxiTxn
+"#;
+    let parsed = parse_source(src).expect("parse");
+    let s = match &parsed.items[0] {
+        harc::ast::Item::Struct(s) => s,
+        _ => panic!("expected struct"),
+    };
+    let doc = s.doc.as_ref().expect("expected doc attached to struct");
+    assert!(doc.contains("4-channel round-robin"),
+        "first line should be in doc; got: {doc:?}");
+    assert!(doc.contains("rotating priority pointer"),
+        "third line should be in doc; got: {doc:?}");
+
+    let printed = print(&parsed);
+    let _ = parse_source(&printed).expect("re-parse");
+    assert!(printed.contains("/// 4-channel round-robin"),
+        "pretty output should emit `///` outer-doc lines:\n{printed}");
+}
+
+/// File-top `//!` block populates `SourceFile.inner_doc`. The
+/// `//! ---` … `//! ---` YAML frontmatter sub-block also populates
+/// `SourceFile.frontmatter`, while remaining inside `inner_doc` for
+/// fidelity. Compiler doesn't interpret the YAML — downstream tooling
+/// (RAG indexer, doc generator) does.
+#[test]
+fn file_frontmatter_extracted_and_round_trips() {
+    let src = r#"//! ---
+//! spec_md: doc/specs/axi_wr_arb.md#round-robin
+//! tags: [arbitration, axi, axi4]
+//! refs:
+//!   - "AXI4 spec §A3.3.1"
+//! ---
+//!
+//! 4-channel round-robin AXI write arbiter, used by all DMA channels
+//! in the SoC. See `spec_md` above for the authoritative behavior.
+
+struct AxiTxn
+    addr : uint<32>
+end struct AxiTxn
+"#;
+    let parsed = parse_source(src).expect("parse");
+
+    // inner_doc has the full leading //! block, with prefix stripped.
+    let inner = parsed.inner_doc.as_ref().expect("expected inner_doc");
+    assert!(inner.starts_with("---\n"),
+        "inner_doc should keep the opening `---` line; got first line: {:?}",
+        inner.lines().next());
+    assert!(inner.contains("spec_md: doc/specs/axi_wr_arb.md#round-robin"),
+        "inner_doc should contain the spec_md field; got:\n{inner}");
+    assert!(inner.contains("4-channel round-robin"),
+        "inner_doc should also keep the prose below the fence");
+
+    // frontmatter is the YAML between the fences.
+    let fm = parsed.frontmatter.as_ref().expect("expected frontmatter");
+    assert!(fm.contains("spec_md: doc/specs/axi_wr_arb.md#round-robin"),
+        "frontmatter should include the spec_md key; got:\n{fm}");
+    assert!(fm.contains("tags: [arbitration, axi, axi4]"),
+        "frontmatter should include the tags key; got:\n{fm}");
+    assert!(!fm.contains("4-channel round-robin"),
+        "frontmatter should NOT include the prose after the closing fence; got:\n{fm}");
+    assert!(!fm.contains("\n---\n") && !fm.starts_with("---") && !fm.ends_with("---"),
+        "frontmatter should not include the fence lines themselves; got:\n{fm}");
+
+    let printed = print(&parsed);
+    // Pretty-print emits the leading `//!` block verbatim; round-trip
+    // re-parse should recover both fields.
+    let reparsed = parse_source(&printed).expect("re-parse");
+    assert_eq!(reparsed.frontmatter.as_deref(),
+        parsed.frontmatter.as_deref(),
+        "frontmatter should round-trip identically");
+}
+
+/// A leading `//!` block with no `---` fence has no frontmatter.
+/// The compiler should not invent a frontmatter from arbitrary text.
+#[test]
+fn inner_doc_without_fence_has_no_frontmatter() {
+    let src = r#"//! Free-form inner doc, no YAML.
+//! Spans multiple lines, no `---` fence anywhere.
+
+struct X
+    a : uint<8>
+end struct X
+"#;
+    let parsed = parse_source(src).expect("parse");
+    assert!(parsed.inner_doc.as_deref().is_some_and(|d| d.contains("Free-form inner doc")),
+        "expected inner_doc to capture the //! prose");
+    assert!(parsed.frontmatter.is_none(),
+        "expected no frontmatter when there's no `---` fence");
+}
