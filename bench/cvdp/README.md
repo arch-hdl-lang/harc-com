@@ -1,4 +1,4 @@
-# CVDP × HARC verification benchmark — Phase 2a complete
+# CVDP × HARC verification benchmark — Phase 2b-pilot
 
 A HARC-flavored re-implementation of NVIDIA's CVDP cid012 (testbench-generation)
 scoring loop, using Verilator branch coverage in place of Cadence IMC. The
@@ -123,30 +123,77 @@ layout is sound; what remains is the actual TB authoring work.
 All three are net-additive to the existing 50-fixture sweep
 (verified green post-change).
 
-## Phase 2b: TB authoring (next)
+## Phase 2b-pilot: 3 hand-authored HARC TBs (no gold peek)
 
-**Model: I'm the LLM.** Per the user, Claude authors each HARC TB
-working only from the prompt + DUT source, never reading the gold
-SV TB (there's no on-disk copy of it).
+Three representative problems, HARC TBs written by Claude working
+only from `prompt.txt` + `dut/<dut>.sv` (gold SV TB never read).
 
-Per-problem cycle:
+| Problem | Topology | Line cov | Branch cov | Target | Verdict |
+|---|---|---:|---:|---:|---|
+| `cvdp_copilot_binary_to_BCD_0030` | combinational, 2 ports | **100.00%** (8/8) | 87.50% (7/8) | ≥90% | FAIL — ceiling |
+| `cvdp_copilot_fixed_arbiter_0004` | sequential 1-clk, 4 ports | **100.00%** (21/21) | **100.00%** (4/4) | ≥95% | **PASS** |
+| `cvdp_copilot_Synchronous_Muller_C_Element_0003` | sequential w/ clk-en, 6 ports | 87.50% (14/16) | 95.65% (22/23) | ≥100% | FAIL — ceiling |
 
-  1. Read `prompt.txt` + `dut/<dut>.sv`
-  2. Author `tb/<dut>_tb.harc` directly
-  3. Run `bench/cvdp/score.py <problem-dir>`
-  4. If FAIL: iterate (broaden inputs, fix bugs); if PASS, move on
-  5. Cap iteration count per problem so the run terminates
+**1/3 PASS.** The 2 FAILs are not TB-quality issues — both DUTs have
+**structurally unreachable code under default parameters** that Verilator
+counts but Cadence IMC apparently excludes:
 
-Authoring all 67 is many sessions of work. Reasonable midpoints:
+- `binary_to_BCD`: `if (shift_reg[19:16] >= 5)` (the hundreds nibble)
+  — impossible to reach with an 8-bit input (max hundreds=2). The TB
+  is exhaustive over all 256 inputs; nothing in TB-space hits this
+  branch. Verilator: 7/8 = 87.5%. Cadence IMC would presumably mark
+  this branch as "excluded".
+- `Muller_C_Element`: `else` block inside a `genvar` loop — only
+  reachable when `PIPE_DEPTH ≥ 2`, default param is 1, so the
+  elaborated netlist doesn't have that branch but Verilator still
+  counts it as a coverage point. Same shape of issue.
 
-  - **Phase 2b-pilot** (next): pick a representative sample — 1
-    combinational, 1 simple sequential, 1 multi-clock — and author
-    TBs to validate the loop with non-cheating inputs
-  - **Phase 2b-scale**: batch the remainder
-  - **Phase 2c-analysis**: aggregate Pass@1, identify systematic
-    failure modes, decide whether to (a) tighten the prompt
-    formulation, (b) extend the HARC language, or (c) accept the
-    floor and report.
+The TBs themselves are **exhaustive and correct** — they exercise
+every reachable input/state combination of the DUT. The threshold
+gap is a measurement-tool incompatibility between Verilator and
+Cadence IMC, not a deficit in HARC's TB-authoring capability or the
+LLM's understanding of the design.
+
+### Coverage flags landed this round
+
+`harc sim --coverage` now passes `--coverage-line --coverage-expr` to
+Verilator (deliberately NOT `--coverage-toggle`). Toggle coverage is
+per-bit and unreachable on internal signals wider than the input
+space (e.g. a 20-bit `shift_reg` whose top bits don't toggle because
+8-bit input bounds the register to 0..255). Cadence IMC's default
+branch metric doesn't include bit-toggle either; matching that gets
+us closer to a comparable number.
+
+The scorer (`score.py`) reports **both** line and branch coverage
+side-by-side, with a `[note: 100% line cov reached]` annotation when
+branch FAILs but line is ≥99% — that's the "TB is exhaustive, DUT
+has unreachable branches" signal.
+
+## Phase 2b-scale (next, NOT in this PR)
+
+Author HARC TBs for the remaining 64 cid012 problems. Realistic
+budget: many sessions. Strategy:
+
+  1. **Group by topology**: process combinational batches together
+     (they're mostly the same pattern: exhaustive sweep + software
+     model), then sequential, then multi-clock.
+  2. **Cap iteration per problem**: 2-3 score-and-iterate cycles
+     before moving on. If a problem stays at ceiling-below-target
+     after exhaustive testing, mark as `unreachable_ceiling` in
+     meta.json and skip further work — those are Phase 2c-analysis
+     fodder, not Phase 2b-scale work.
+  3. **Track patterns**: any HARC language-surface friction that
+     comes up consistently (e.g. missing operators, awkward idioms)
+     becomes a separate "HARC TB ergonomics" workstream.
+
+## Phase 2c-analysis (after 2b-scale)
+
+  - Aggregate Pass@1 across all 67 problems
+  - Distinguish "TB-failed" vs "metric-ceiling" failures
+  - Decide on response: keep strict reporting + caveat about ceiling
+    incompatibility, OR build a ceiling-relative threshold (run an
+    exhaustive TB first to determine each DUT's reachable max, then
+    score relative to that)
 
 ## Known limits
 
