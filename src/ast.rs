@@ -27,7 +27,25 @@ pub struct Path {
 #[derive(Debug, Clone)]
 pub struct SourceFile {
     pub items: Vec<Item>,
+    /// Raw text of the leading `//!` block (prefixes stripped, lines
+    /// joined by `\n`). Captures both free-form inner-doc prose AND a
+    /// `---`-fenced YAML frontmatter block verbatim. None when the
+    /// file has no leading `//!` block.
     pub inner_doc: Option<String>,
+    /// Raw text of the `---` … `---` YAML-frontmatter sub-block at
+    /// the very top of `inner_doc`, with the fence lines stripped.
+    /// Stored separately for downstream tooling (RAG indexer, doc
+    /// generator) that wants the structured part without re-scanning.
+    /// Always a substring of `inner_doc` when both are present. None
+    /// when the file has no frontmatter block. Mirrors arch-com's
+    /// `plan_arch_doc_comments.md` v1 design.
+    ///
+    /// Compiler does NOT interpret the YAML in v0 — it stores the raw
+    /// text and passes it through. Conventional fields downstream
+    /// tooling will look for: `spec_md` (path to authoritative
+    /// markdown spec, with optional `#anchor`), `tags` (list of
+    /// retrieval tags), `refs` (list of citations / ticket IDs / URLs).
+    pub frontmatter: Option<String>,
 }
 
 #[derive(Debug, Clone)]

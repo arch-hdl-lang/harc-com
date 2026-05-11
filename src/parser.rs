@@ -217,11 +217,19 @@ impl Parser {
 
     pub fn parse_source_file(&mut self) -> Result<SourceFile, CompileError> {
         let inner_doc = self.consume_inner_doc();
+        // Extract the `---` … `---` YAML frontmatter sub-block (if any)
+        // from `inner_doc`. Frontmatter is the contiguous block at the
+        // very top of inner_doc: first line is exactly `---`, and the
+        // closing `---` line ends the block. Anything before the first
+        // `---` (free-form prose) disqualifies the file from having a
+        // frontmatter — matches arch-com's behavior. The frontmatter
+        // text retains the inside of the fences (no `---` lines).
+        let frontmatter = inner_doc.as_ref().and_then(|d| extract_frontmatter(d));
         let mut items = Vec::new();
         while !self.at_end() {
             items.push(self.parse_item()?);
         }
-        Ok(SourceFile { items, inner_doc })
+        Ok(SourceFile { items, inner_doc, frontmatter })
     }
 
     fn parse_item(&mut self) -> Result<Item, CompileError> {
@@ -2426,6 +2434,39 @@ impl Parser {
 }
 
 // ── Helpers outside impl ──────────────────────────────────────────────────────
+
+/// Extract the `---` … `---` YAML frontmatter sub-block from an
+/// inner-doc string (the line-joined post-prefix-stripped text of a
+/// leading `//!` block).
+///
+/// Returns the text *between* the fences with newlines preserved (no
+/// trailing `\n`), or `None` if the inner-doc doesn't open with `---`.
+/// The fence detection is line-exact: the first content line must be
+/// exactly `---`, and the closing fence must be a line that's exactly
+/// `---`. Anything before the opening fence (e.g. free-form prose)
+/// disqualifies the inner-doc from having a frontmatter — matches
+/// arch-com's lexical rule from `plan_arch_doc_comments.md` §2.3.
+///
+/// Empty body (`---` immediately followed by `---`) returns
+/// `Some(String::new())` — distinct from "no frontmatter" via the
+/// `None` return.
+fn extract_frontmatter(inner_doc: &str) -> Option<String> {
+    let mut lines = inner_doc.split('\n');
+    let first = lines.next()?;
+    if first.trim_end() != "---" {
+        return None;
+    }
+    let mut body_lines = Vec::new();
+    for line in lines {
+        if line.trim_end() == "---" {
+            return Some(body_lines.join("\n"));
+        }
+        body_lines.push(line);
+    }
+    // No closing fence — treat as malformed; return None rather than
+    // assuming the rest of the doc is frontmatter.
+    None
+}
 
 impl TypeExpr {
     pub fn span(&self) -> Span {

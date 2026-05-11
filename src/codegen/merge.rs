@@ -77,5 +77,5 @@ pub fn merge_for_sim(files: &[SourceFile], pick: Option<&str>) -> Result<SourceF
     // Synthetic file: chosen test plus all other items, in stable order.
     let mut items = other_items;
     items.push(Item::Test(chosen));
-    Ok(SourceFile { items, inner_doc: None })
+    Ok(SourceFile { items, inner_doc: None, frontmatter: None })
 }
