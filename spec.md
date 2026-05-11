@@ -174,6 +174,107 @@ Lowers to a parenthesized C++ ternary in the generated TB.
 
 ---
 
+## 2.5 Source-level documentation comments
+
+Three lexical surfaces attach natural-language design intent to HARC
+source. The compiler reads these into the AST verbatim — no
+interpretation — so downstream tooling (RAG indexer, doc generator,
+spec-link checker) can consume them.
+
+### 2.5.1 `///` outer doc comments
+
+A run of `///` lines attaches to the **next construct** in the file:
+
+```harc
+/// AXI4 write arbiter, round-robin priority.
+///
+/// Picks among threads holding the lock using a rotating priority pointer.
+transactor AxiWrXactor
+    ...
+end transactor AxiWrXactor
+```
+
+Attachment rule: accumulated `///` lines (consecutive, prefix-stripped
+text joined by `\n`) attach to the next syntactic item — top-level
+declarations (`use`, `package`, `const`, `domain`, `struct`, `enum`,
+`transaction`, `tseq`, `agent`, `env`, `scoreboard`, `sequencer`,
+`transactor`, `test`, `impl`, `extend`, `covergroup`, `property`,
+`pseq`, `cover sequence`, `module`, `function`, `bus`). `////` (four
+or more slashes) is a regular line comment, not a doc comment —
+matches Rust's escape hatch for ASCII art / banners.
+
+Stored on each construct's AST node as `doc: Option<String>`.
+
+### 2.5.2 `//!` inner doc comments
+
+A `//!` block at the **top of a file**, before any item, documents the
+file as a whole — stored on `SourceFile.inner_doc`:
+
+```harc
+//! AXI4 write-arbitration utilities.
+//!
+//! All arbiters in this file use round-robin scheduling unless
+//! explicitly marked priority.
+
+transactor AxiWrXactor
+    ...
+end transactor AxiWrXactor
+```
+
+(Per-construct inner-doc — `//!` immediately after the opening
+keyword + name — is reserved syntax in v0; not yet captured by
+codegen. Use `///` outside the construct for now.)
+
+### 2.5.3 `//! ---` YAML frontmatter
+
+A `---`-fenced block at the top of the `//!` run carries structured
+metadata that's awkward to express as prose:
+
+```harc
+//! ---
+//! spec_md: doc/specs/axi_wr_arb.md#round-robin
+//! tags: [arbitration, axi, axi4]
+//! refs:
+//!   - "AXI4 spec §A3.3.1"
+//!   - "TICKET-1234"
+//! ---
+//!
+//! 4-channel round-robin AXI write arbiter, used by all DMA channels
+//! in the SoC. See `spec_md` above for the authoritative behavior.
+
+transactor AxiWrXactor
+    ...
+```
+
+Rules:
+- The opening fence is a line whose `//!`-prefix-stripped content is
+  exactly `---`. The closing fence is the next such line.
+- The block must be at the very top of the `//!` run — any prose
+  before the opening fence disqualifies the file from having a
+  frontmatter.
+- The compiler does **not** parse the YAML body in v0. It stores the
+  raw text on `SourceFile.frontmatter: Option<String>`. Downstream
+  tooling (RAG indexer, doc generator) interprets it.
+- The frontmatter is also retained inside `SourceFile.inner_doc` for
+  fidelity (raw inner-doc round-trips byte-perfect).
+
+Conventional fields downstream tooling looks for:
+
+| Field      | Type             | Meaning |
+|------------|------------------|---------|
+| `spec_md`  | string           | Relative path to authoritative markdown spec, with optional `#anchor` |
+| `tags`     | list of strings  | Feature tags for retrieval |
+| `refs`     | list of strings  | Citations / ticket IDs / URLs |
+
+Tooling may add fields; the compiler is forwards-compatible by virtue
+of not interpreting them.
+
+Mirrors arch-com's `plan_arch_doc_comments.md` lexical design — same
+attachment rules, same field conventions — so HARC and ARCH sources
+can be indexed by the same harvester.
+
+---
+
 ## 3. Type System Extensions
 
 HARC adds a small set of types on top of ARCH's:
