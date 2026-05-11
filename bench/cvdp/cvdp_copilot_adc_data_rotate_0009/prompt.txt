@@ -1,0 +1,68 @@
+Create a test bench in SystemVerilog for a Verilog module named  `adc_data_rotate` module by applying exhaustive test scenarios. The test bench should systematically generate input vectors, apply them to the module under test (MUT) and aim to achieve 100% or the maximum possible coverage. The testbench should not create checkers to verify the MUT.
+
+
+---
+## **Instantiation**
+Name the instance of the RTL as `dut`.
+
+## **RTL Parameter Inputs - Outputs and Functional behaviour**
+
+### Parameterization
+- The module supports parameterized data width, `DATA_WIDTH`, with a default value of 8 bits. This allows the module to handle various input data sizes.
+
+### Inputs
+- **`i_clk`** (logic): Clock signal to synchronize the module’s operation.
+- **`i_rst_n`** (logic): Active-low reset signal. When asserted (`i_rst_n = 0`), all outputs reset to their idle state.
+- **`i_adc_data_in`** (logic [`DATA_WIDTH`-1:0]): Input data to be rotated.
+- **`i_shift_count`** (logic [3:0]): Specifies the number of bits to rotate. Supports up to 15-bit rotation.
+- **`i_shift_direction`** (logic): Controls the rotation direction:
+  - `0`: Left Rotate
+  - `1`: Right Rotate
+
+### Outputs
+- **`o_processed_data`** (logic [`DATA_WIDTH`-1:0]): The rotated result of the input `i_adc_data_in`.
+- **`o_operation_status`** (logic): Indicates the operation state:
+  - `0`: Reset state
+  - `1`: Active rotation
+
+### Reset Behavior
+- When `i_rst_n` is asserted (`i_rst_n = 0`):
+  - `o_processed_data` resets to `0`.
+  - `o_operation_status` resets to `0`.
+
+### Rotation Behavior
+- On the rising edge of `i_clk` and when `i_rst_n = 1`, the module performs:
+  - **Left Rotate** (`i_shift_direction = 0`): Bits shifted out from the left re-enter on the right.
+  - **Right Rotate** (`i_shift_direction = 1`): Bits shifted out from the right re-enter on the left.
+
+### Operation Status
+- During rotation, `o_operation_status` is set to `1` to indicate an active state.
+## Constraints and Edge Cases
+
+### **Edge Cases**:
+  - Handle rotation amounts of 0 and `DATA_WIDTH` effectively (e.g., rotation by `0` bits should result in no change).
+  - Ensure correct behavior when `i_shift_count` exceeds `DATA_WIDTH`. This means any shift count above **DATA_WIDTH** automatically wraps to the equivalent smaller shift.
+---
+## Stimulus generation
+
+1. Reset and Initialization
+- **Reset Assert/Deassert**: Set `i_rst_n = 0`, then `1`.
+- **Repeated Resets**: Assert/deassert `i_rst_n` multiple times quickly.
+ 
+ 2. No Shift (Shift Count = 0)
+- **Left and Right Directions**: `i_shift_count = 0`, both directions.
+- **Data Patterns**: All-0s, all-1s, and alternating bits (e.g., `10101010`).
+
+3. Single-Bit Shifts
+- **Left Shift by 1**: `i_shift_count = 1`, `i_shift_direction = 0`. 
+- **Right Shift by 1**: `i_shift_count = 1`, `i_shift_direction = 1.
+
+4. Multiple Bit Shifts
+- **Mid-Range Counts**: For `i_shift_count` like `3`, `4`, and `7`, apply various `i_adc_data_in` values.
+- **Full-Range Counts**: Sweep `i_shift_count` from `0` to `15`. 
+
+5. Special Edge Cases
+- **Shift = Data Width** (e.g., 8): complete rotation.
+- **Shift = 15**: Highest valid count. Wrap-around for both directions.
+- **All 1s / All 0s**: Rotation uniform bit patterns.
+- **Alternating Bits**: Wrap-around (`10101010`, `01010101`) under all shift counts/directions.

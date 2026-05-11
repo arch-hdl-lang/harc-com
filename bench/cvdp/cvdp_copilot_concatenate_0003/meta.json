@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_concatenate_0003",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "enhanced_fsm_signal_processor_top",
+  "dut_module": "enhanced_fsm_signal_processor",
+  "target_coverage": 99,
+  "auto_wrapper": "enhanced_fsm_signal_processor_top.sv",
+  "n_ports": 19,
+  "clock_inputs": [
+    "i_clk"
+  ],
+  "multi_clock": false
+}

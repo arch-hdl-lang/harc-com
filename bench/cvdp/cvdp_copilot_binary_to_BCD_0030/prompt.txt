@@ -1,0 +1,40 @@
+Create a testbench for `binary_to_bcd` module, which converts an 8-bit binary input into a 12-bit BCD output using the Double Dabble algorithm, ensuring correct shifting, adjustment, and final conversion while validating that each BCD digit remains within the valid range (0-9). The testbench must have the instantiation of RTL module and generate stimulus for various test conditions.
+
+___
+The interface of `binary_to_bcd` RTL module is given below:
+
+**Input:**
+  - `binary_in` [7:0] [8-Bit]: The binary number to be converted into BCD.
+  
+**Output:**
+  - `bcd_out` [11:0] [12-Bit]: The corresponding BCD output where each 4-bit group represents a decimal digit.
+
+___
+
+### Input Generation and Validation
+**Input Generation:**
+
+1. Fixed Test Cases:
+    - Test a variety of binary inputs, including boundary values, random values, and power-of-two values to validate correct behavior.
+    - Example test values: `0`, `1`,`9`, `10`, `15`, `45`, `99`, `123`, `200`, `255`.
+2. Randomized Testing:
+    - Generate random binary values within the range `0–255` and compare against a reference function.
+
+3. Edge Cases:
+    - Minimum input (`binary_in = 0`):  BCD output `0000 0000 0000` (0).
+    - Maximum input (`binary_in = 255`):  BCD output `0010 0101 0101` (255).
+    - Near-boundary conditions (`binary_in` = `9`, `10`, `99`, `100`, `199`) to verify correct BCD adjustments.
+
+___
+### Instantiation
+Name the instance of RTL as `uut`.
+
+##
+### Module Functionality
+**Shift and Adjust Logic:**
+  - Shift Register:
+    - The module uses a 20-bit shift register where the lower 8 bits hold the binary input, and the upper 12 bits store the BCD result.
+  - Adjustment Condition (`>= 5`):
+    - Before each shift, BCD digits are checked; if `≥ 5`, `+3` is added to prevent invalid values.
+  - Final Output Extraction:
+    - After 8 shifts, the upper 12 bits of the shift register (`shift_reg[19:8]`) contain the final BCD result.

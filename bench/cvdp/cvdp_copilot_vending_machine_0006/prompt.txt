@@ -1,0 +1,171 @@
+Complete the given partial SystemVerilog testbench `serial_line_code_converter_tb`. The testbench must instantiate the `serial_line_code_converter` RTL module and provide input stimulus for various testcases. This testbench simulates a vending machine that processes item selection, coin insertion, item dispensing, change return, and purchase cancellation. 
+## Description
+The vending machine operates using a finite state machine (FSM) with distinct states to ensure a structured transaction flow. It begins in the IDLE state, awaiting item selection before allowing coin insertion. The machine validates inserted coins, dispenses the item upon sufficient payment, and returns change if necessary. Errors trigger the RETURN_MONEY state, ensuring incorrect transactions are handled properly, and a reset clears all internal states, preparing the machine for a new transaction.
+
+## **Interface**
+
+### **Inputs**
+- **clk:** Clock signal for timing and synchronizing state transitions, operating on the rising edge.
+- **rst:** Asynchronous, active-high reset signal that resets all internal states, outputs, and accumulated values, returning the machine to the `IDLE` state.
+- **item_button(1-bit):** Signal indicating that the user has pressed the button to initiate item selection (active high). This acts as a toggle signal and should only register on the rising edge.
+- **item_selected (3-bits, [2:0]):** This input represents the item chosen by the user, with valid values corresponding to the four available items (valid values: `3'b001` to `3'b100`).
+- **coin_input(4-bits, [3:0]):** This input represents the value of the coin inserted, with valid values of 1, 2, 5, or 10 units.
+- **cancel (1-bit):** Signal allowing the user to cancel the current transaction before the item is dispensed (active high).
+
+### **Outputs**
+- **dispense_item(1-bit):** Indicates that the selected item is ready for dispensing after the required amount is met. Active high for one clock cycle when the item is being dispensed.
+- **return_change(1-bit):** Signal that excess coins are being returned as change. Active high for one clock cycle when change is being returned.
+- **item_price(5-bits,[4:0]):** Output displaying the price of the currently selected item.
+- **change_amount(5-bits,[4:0]):** Output representing the amount of change to be returned if excess coins were inserted.
+- **dispense_item_id(3-bits,[2:0]):** Output indicating the ID of the item being dispensed.
+- **error(1-bit):** Indicates that an invalid operation has occurred, such as inserting coins without selecting an item or entering invalid coin values. Active high for one clock cycle during an error condition.
+- **return_money(1-bit):** Indicates that all inserted money should be returned due to cancellation or an error. Active high for one clock cycle when returning money.
+
+## Instantiation
+
+The testbench instantiates the `vending_machine` module as `uut` (unit under test) and connects the signals accordingly.
+
+### Input Generation and Validation
+
+#### Clock Generation
+The `clk` signal should toggle every 5 time units, simulating a 100MHz clock.
+
+#### Reset Handling
+The `rst` signal should be high at the beginning of the simulation for at least three clock cycles. 
+
+### Test Scenarios
+
+The testbench should generate multiple real-world scenarios involving purchases, cancellations, and error handling.
+
+#### 1. System Initialization
+-  Generate a clock signal and assert the reset signal for multiple cycles to initialize the system in a defined state.e.
+
+#### 2. Selecting an Item
+-  Assert and de-assert the selection button within a clock cycle while setting the selected item ID.
+
+#### 3. Inserting Coins
+- A value representing the coin input is assigned, and after a clock cycle, it is reset to zero.
+
+#### 4. Cancelling a Purchase
+ - The cancel button is asserted and de-asserted within one clock cycle.
+
+#### 5. Purchasing an Item with Exact Coins
+- Select an item 1 and insert the exact required amount (5) in a single step.
+
+#### 6. Purchasing an Item with Multiple Coin Insertions
+- Select item 2 and insert a partial amount (5), followed by the remaining balance (5) in subsequent cycles.
+
+#### 7. Purchasing an Item with Extra Coins and Getting Change
+- Select item 2 and insert more than the required amount and ensure a change is computed.
+
+#### 8. Cancelling a Purchase After Inserting Some Coins
+- Select an item, insert partial coins, then assert cancel.
+
+#### 9. Cancelling Immediately After Selecting an Item
+- Select an item and immediately trigger cancellation.
+
+#### 10. Purchasing an Expensive Item with Multiple Small Coin Insertions
+- Insert small denominations over multiple steps to accumulate the required price.
+
+#### 11. Inserting Coins Without Selecting an Item
+- Insert money without item selection.
+
+#### 12. Resetting the System After Inserting Coins or Selecting an Item
+- Initiate a transaction, assert reset, and verify system restart.
+
+#### 13. Rapid Successive Coin Insertions
+- Insert multiple small denominations in quick succession.
+
+#### 14. Rapid Coin Insertion Handling
+ - The same coin value is inserted multiple times in quick succession.
+
+#### 15. Selecting an Invalid Item ID
+ - A non-existent item ID is chosen.
+
+#### 16. Returning Money When No Item Is Selected
+- Insert money and verify refund without selection.
+
+#### 17. Transition from Dispensing an Item to Returning Change
+- Overpay and verify that dispensing occurs before change return.
+
+#### 18. Transition from Returning Change Back to Idle
+-  Complete a purchase with a change return and verify system readiness.
+
+#### 19. Cancelling After Pressing the Item Selection Button
+- Select an item and cancel before inserting money.
+
+### Final Steps
+
+- **Simulation End**: After all tests, wait for a few cycles and call `$finish`.
+- **Waveform Dump**: Generate a VCD file for offline analysis.
+
+### Partial Test Stimulus Generator Code:
+
+```verilog
+module vending_machine_tb;
+
+    reg clk;                    // Clock signal
+    reg rst;                    // Reset signal
+    reg item_button;            // Signal for item selection button press
+    reg [2:0] item_selected;    // Input to select one of 4 items
+    reg [3:0] coin_input;       // Coin input
+    reg cancel;                 // Cancel button signal
+
+    wire dispense_item;         // Signal to dispense item
+    wire return_change;         // Signal to return change
+    wire error;                 // Error signal if any invalid operation occurs
+    wire return_money;          // Signal to return all money if operation is cancelled
+    wire [4:0] item_price;      // Price of the selected item
+    wire [4:0] change_amount;   // Amount of change to return
+    wire [2:0] dispense_item_id;// ID of item being dispensed
+
+    // Instantiate the vending machine module
+    vending_machine uut (
+        .clk(clk),
+        .rst(rst),
+        .item_button(item_button),
+        .item_selected(item_selected),
+        .coin_input(coin_input),
+        .dispense_item(dispense_item),
+        .return_change(return_change),
+        .item_price(item_price),
+        .change_amount(change_amount),
+        .dispense_item_id(dispense_item_id),
+        .error(error),
+        .cancel(cancel),
+        .return_money(return_money)
+    );
+
+    // Clock generator: Clock signal toggles every 5 time units
+    always #5 clk = ~clk;
+
+    // Task to initialize the testbench (reset and initial conditions)
+    task initialize;
+    begin
+        clk = 0;
+        rst = 1;              
+        item_button = 0;
+        item_selected = 3'b000;
+        coin_input = 0;
+        cancel = 0;
+        @(posedge clk) rst = 0;          
+    end
+    endtask
+
+    // Task to select an item
+    task select_item(input [2:0] item);
+    begin
+        @(posedge clk)
+        item_button = 1;     
+        @(posedge clk) item_button = 0;
+        item_selected = item;
+        @(posedge clk);
+    end
+    endtask
+
+    // Insert the code for the remaining test stimulus here
+
+endmodule
+
+
+```

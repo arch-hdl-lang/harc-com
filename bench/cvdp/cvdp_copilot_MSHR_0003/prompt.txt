@@ -1,0 +1,85 @@
+Develop a SystemVerilog module named `tb_cache_mshr` that only generates input stimulus to a `cache_mshr` module. `cache_mshr` module implements Miss Status Handling Registers (MSHR). The MSHR is a critical component of a **non-blocking cache architecture**, enabling the system to handle multiple outstanding cache misses concurrently. 
+
+---
+
+## RTL Specification
+
+### **Parameters**
+- **`INSTANCE_ID`** *(default = "mo_mshr")*:  
+  A string identifier for the MSHR instance. This parameter allows users to assign a unique name to each instance of the MSHR module.
+
+- **`MSHR_SIZE`** *(default = 32)*:  
+  Specifies the total number of entries available in the MSHR. This defines how many pending requests can be tracked simultaneously.
+
+- **`CS_LINE_ADDR_WIDTH`** *(default = 10)*:  
+  The bit-width required to represent the cache line address. This parameter determines the number of unique cache lines that can be indexed.
+
+- **`WORD_SEL_WIDTH`** *(default = 4)*:  
+  Specifies the number of bits needed to select a specific word within a cache line. For example, with a cache line containing 16 words, ( log<sub>2</sub>(16) = 4 ) bits are required.
+
+- **`WORD_SIZE`** *(default = 4)*:  
+  Word size in **bytes**. It represents the number of bits in the byte enable signal for a word. This indicates which bytes within the word are active during a write operation.
+
+---
+
+### **Derived Parameters**
+- **`TAG_WIDTH`**:  
+  The bit-width of the tag portion of the address. It is calculated as:
+ 32 - `CS_LINE_ADDR_WIDTH`+ log2(`WORD_SIZE`) + `WORD_SEL_WIDTH` 
+
+- **`CS_WORD_WIDTH`**: 
+   word width in bits . It is calculated as WORD_SIZE * 8 
+    
+- **`DATA_WIDTH`**:  
+  Defines the total data width for each MSHR entry. It is calculated as:
+ `WORD_SEL_WIDTH` + `WORD_SIZE` + `CS_WORD_WIDTH` + `TAG_WIDTH` 
+
+- **`MSHR_ADDR_WIDTH`**:  
+  Defines the number of bits required to address all entries in the MSHR. It is calculated as:
+ `$clog2(MSHR_SIZE)` 
+---
+
+### Port List
+
+| **Port Name**                           | **Direction** | **Description**                                                                                |
+|-----------------------------------------|---------------|------------------------------------------------------------------------------------------------|
+| `clk`                                   | Input         | Clock signal.  The design registers are triggered on its positive edge.                        |
+| `reset`                                 | Input         | Active high synchronous reset signal                                                           |
+| `allocate_valid`                        | Input         | Active high signal indicating a new core request for allocation.                               |
+| `allocate_addr[CS_LINE_ADDR_WIDTH-1:0]` | Input         | Cache line address of the new request.                                                         |
+| `allocate_data[DATA_WIDTH-1:0]`         | Input         | Request data containing the word address, byte enable signal, write data, and tag information. |
+| `allocate_rw`                           | Input         | Read/write operation type for the new request. 1'b1 = write request, 1'b0 = read request       | 
+| `allocate_id[MSHR_ADDR_WIDTH-1:0]`      | Output        | ID of the allocated slot.                                                                      |
+| `allocate_pending`                      | Output        | Active high signal indicating if a new request is for a cache line that is already pending.    |
+| `allocate_previd[MSHR_ADDR_WIDTH-1:0]`  | Output        | ID of the previous entry for the same cache line if `allocate_pending` asserted.               |
+| `allocate_ready`                        | Output        | Active high signal indicating if a new request can be allocated. If MSHR isn't full            |
+| `finalize_valid`                        | Input         | Active high signal indicating a finalize operation is being requested.                         |
+| `finalize_id[MSHR_ADDR_WIDTH-1:0]`      | Input         | ID of the entry being finalized.                                                               |
+
+
+### Functional description:
+This design should integrate seamlessly into a non-blocking cache system with a 32-bit address system, where tag access and MSHR access occur in parallel.
+- On core request, `allocate_valid`, the MSHR allocates an entry for the incoming core request, regardless of whether it is a hit or miss. `allocate_valid` could only be asserted when `allocate_ready` is asserted, indicating there is an available MSHR entry
+- In the subsequent cycle, the cache tag access determines if the request is a hit or miss. If the request is a cache hit, the allocated MSHR entry is immediately marked invalid. `finalize_valid` will be asserted only on cache hit, `finalize_id` should be one of the allocated indexes.
+
+---
+## Testbench Requirements
+
+### Instantiation
+
+Name the instance of the RTL as `dut`.
+
+### Required Stimulus Description:
+The objective is to achieve **100% code and toggle coverage** for the `cache_mshr` module by systematically exercising its functionality. The stimulus should ensure that all key features and transitions of the module are exercised while maintaining coverage goals.
+- Use a `cache_mshr` instance named `dut` in the testbench. 
+- Supply stimulus to ensure that all MSHR entries are allocated during simulation, randomly asserting  `allocate_valid` at random clock negative edges and randomize input signals: `allocate_addr`, `allocate_data`, and `allocate_rw`.
+- Supply stimulus to ensure that all MSHR entries are finalized during simulation, randomly asserting  `finalize_valid` at random clock negative with `finalize_id` one of the allocated slots.
+- Fully exercise state transitions for every entry, including toggling between **write** and **read** operations.
+- Fully exercise cases where each entry points to the next request for the same cache line ( eg: use a fixed cache line)
+- Cover the module’s behavior when the MSHR reaches full capacity, including the deassertion of `allocate_ready`.
+- Cover that `allocate_ready` is reasserted when entries are finalized and space becomes available.
+- Generate stimuli for both cache hit and miss scenarios randomly to ensure proper entry finalization and release.
+
+### Latency:
+- Allocation Requests: The module introduces a latency of 1 clock cycle for each allocation request.
+- Finalize Requests: The module introduces a latency of 1 clock cycle for each finalize release request.

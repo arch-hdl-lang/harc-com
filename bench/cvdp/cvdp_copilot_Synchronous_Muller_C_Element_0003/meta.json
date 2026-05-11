@@ -1,0 +1,17 @@
+{
+  "id": "cvdp_copilot_Synchronous_Muller_C_Element_0003",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "sync_muller_c_element_top",
+  "dut_module": "sync_muller_c_element",
+  "target_coverage": 100,
+  "auto_wrapper": "sync_muller_c_element_top.sv",
+  "n_ports": 6,
+  "clock_inputs": [
+    "clk",
+    "clk_en"
+  ],
+  "multi_clock": true
+}

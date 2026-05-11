@@ -1,0 +1,104 @@
+Create a `tb_generic_counter` module that serves as the top-level testbench. This module should instantiate and include a `stimulus_generator` module, which must be developed to systematically drive different input conditions to the `generic_counter` module. The `stimulus_generator` should be designed to achieve 100% functional and code coverage by exercising all counting modes implemented in the `generic_counter`. These counting modes include binary up/down counting, modulo-N counting, Johnson counting, Gray code counting, and Ring counting. The counter operates based on an enable signal, a mode signal, and a configurable reference modulo value.
+
+---
+
+Follows the interface description of the RTL module.
+
+## **Inputs** 
+ 
+- **Parameter**:  
+  - `N`: A configurable Parameter Value. The default Value is 8. 
+
+- **Control Signals**:  
+  - `mode_in [2:0]`: A 3-bit register selecting the counter mode.  
+  - `enable_in`: A 1-bit register enabling the counter operation.  
+
+- **Clock Signal**:  
+  - `clk_in`: The counter updates its value on the rising edge of this clock signal.  
+
+- **Reset Signal**:  
+  - `rst_in`: A 1-bit asynchronous, active-high reset signal. When asserted HIGH, the counter resets to zero.  
+
+- **Reference Modulo Value**:  
+  - `ref_modulo [N-1:0]`: A configurable N-bit reference value used for modulo-N counting.  
+
+
+## **Outputs**  
+
+- **Registers**:  
+  - `o_count [N-1:0]`: An N-bit output representing the current counter value.  
+
+---
+
+## **Instantiation**  
+
+- **Module Instance**:  
+  - The `generic_counter` module is instantiated as `uut` in the testbench, with its inputs and outputs connected for testing.  
+
+---
+
+## **Input Generation**  
+
+1. **Mode Coverage**:  
+   - The testbench must ensure that all counting modes are exercised:  
+     - `BINARY_UP`: Counts up sequentially.  
+     - `BINARY_DOWN`: Counts down sequentially.  
+     - `MODULO_256`: Resets when `o_count == ref_modulo`.  
+     - `JOHNSON`: Implements Johnson's counter behavior.  
+     - `GRAY`: Converts binary count to Gray code.  
+     - `RING`: Implements a rotating one-hot sequence.  
+
+2. **Enable Behavior**:  
+   - Toggle `enable_in` dynamically and ensure that counting stops when `enable_in = 0`.  
+
+3. **Modulo-N Counting**:  
+   - Provide various `ref_modulo` values to the module.  
+
+4. **Reset Behavior**:  
+   - Test asynchronous reset by asserting `rst_in` during different counter states.  
+   - Ensure that `o_count` resets to zero when `rst_in` is active.  
+
+5. **Edge Cases**:  
+   - There will be a random transition between different counting modes during operation.  
+   - Initialize the RTL `count` register to a random value and run it in different modes.
+
+6. **Timing Requirements**:  
+   - After applying inputs, the testbench waits for a stabilization period of **300 clock cycles** before asserting new values.
+
+7. **Stimulus Generator IO Ports**:  
+
+- **`clk` (input, 1-bit)**: Clock signal synchronizes the stimulus generation process.
+- **`rst` (output, 1-bit)**: Active-high reset signal that initializes the `generic_counter` module.
+- **`mode` (output, 3-bit)**: Specifies the counting mode for the `generic_counter`. Different values correspond to different counting modes such as binary up/down, modulo-N, Johnson, Gray code, and Ring counting.
+- **`enable` (output, 1-bit)**: Enables the `generic_counter` operation when asserted high.
+- **`check_sync` (output, 1-bit)**: Indicates when to check the correctness of the counter output.
+- **`ref_modulo` (output, N-bit)**: Configurable modulo value, primarily used in modulo-N counting mode to define the counting range.
+
+---
+
+## **Module Functionality**  
+
+1. **Asynchronous Reset**:  
+   - When `rst_in` is asserted HIGH, `o_count` is reset to `0`.  
+
+2. **Counting Modes**:  
+   - The counter updates `o_count` based on `mode_in`:  
+     - **Binary Up/Down Counting**: Increments or decrements the counter.  
+     - **Modulo Counting**: Resets `o_count` when reaching `ref_modulo`.  
+     - **Johnson Counter**: Implements shift-and-invert behavior.  
+     - **Gray Code Counter**: Converts binary count to Gray code.  
+     - **Ring Counter**: Circulates a single `1` through the bit positions.  
+
+3. **Enable Control**:  
+   - If `enable_in = 0`, `o_count` remains unchanged.  
+
+---
+
+## **Testbench Features**  
+
+- **Input Scenarios**:  
+  - Cover all possible counter modes.  
+  - Randomize `mode_in`, `enable_in`, and `ref_modulo` to simulate diverse use cases.  
+
+- **Simulation Observations**:  
+  - Use `$monitor` to log counter transitions, mode changes, and reset events for debugging.  

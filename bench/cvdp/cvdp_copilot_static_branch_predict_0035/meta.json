@@ -1,0 +1,14 @@
+{
+  "id": "cvdp_copilot_static_branch_predict_0035",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "static_branch_predict_top",
+  "dut_module": "static_branch_predict",
+  "target_coverage": 95,
+  "auto_wrapper": "static_branch_predict_top.sv",
+  "n_ports": 6,
+  "clock_inputs": [],
+  "multi_clock": false
+}

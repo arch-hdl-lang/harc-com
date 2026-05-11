@@ -1,0 +1,153 @@
+
+Complete the Given Partial System Verilog Testbench `tb_Word_Change_Pulse`.  The testbench must instantiate the `Word_Change_Pulse` RTL module and provide input stimulus to validate its behavior. This module detects word changes and pattern matches in a DATA_WIDTH-bit data stream based on a specified mask and pattern.
+
+## Description
+
+**Parameters:**
+- `DATA_WIDTH`: Specifies the bit width of the input data word `data_in`. Default is 8. It must be a positive integer greater than or equal to 1.
+
+**Inputs:**
+- `clk`: Clock signal for synchronizing operations. The design is synchronized to the positive edge of this clock.
+- `reset`:Active-high asynchronous reset signal to initialize the module.
+- `data_in [DATA_WIDTH-1:0]`: Input data word whose changes are to be detected.
+- `mask [DATA_WIDTH-1:0]`: Mask signal to enable/disable change detection per bit (1 = detect changes, 0 = ignore changes)
+- `match_pattern [DATA_WIDTH-1:0]`: Pattern to compare against the (masked) input data word.
+- `enable`: Active-high signal, which enables the module’s operation.
+- `latch_pattern`: When high, latches the current match_pattern into an internal register.
+
+**Outputs:**
+- `word_change_pulse`: Output signal that pulses high one clock cycle after any bit in data_in changes.
+- `pattern_match_pulse`: Pulses high to indicate the masked input data word matches the latched pattern.
+- `latched_pattern [DATA_WIDTH-1:0]`: Register that holds the latched pattern for comparison
+
+## Module Functionality
+The Word_Change_Pulse module should perform the following:
+- **Pattern Latching**: When latch_pattern is asserted, match_pattern should be stored in latched_pattern.
+- **Word Change Detection**: The word_change_pulse should be asserted if any masked bit in data_in differs from data_in_prev.
+- **Pattern Match Detection**: The pattern_match_pulse should be asserted if the masked bits of data_in match latched_pattern.
+- **Enable Control**: If enable = 0, pulses should not be generated.
+- **Reset Behavior**: Upon assertion of reset, all outputs should be initialized to zero.
+
+## Instantiation
+The testbench should instantiate the Word_Change_Pulse module as `uut` and connect the signals accordingly.
+
+## Input Generation 
+
+### Clock Generation
+The clk signal should toggle every 5 time units, resulting in a 100MHz operation.
+
+### Reset Handling
+The reset signal should be asserted at the beginning of the simulation for three cycles. It should then be de-asserted, ensuring the DUT starts in a known state.
+
+### Stimulus 
+Several test cases are applied to simulate different operations of the Word_Change_Pulse module. These cases cover a range of scenarios, including detecting word changes, pattern matching, masking behavior, enable-based operations, and edge cases.
+
+### Test Phases
+The testbench should consist of multiple test phases, each targeting different behaviors of the module:
+
+#### Phase 1: Default Pattern Latching
+Latch a pattern of all zeros (00000000).  
+
+#### Phase 2: Word Change Pulse Tests
+- All bits transition from 0 → 1.
+- All bits transition from 1 → 0.
+- Single-bit flips (LSB, MSB).
+- Alternating bit patterns.
+- No changes in data_in (pulse should not be triggered).
+
+#### Phase 3: Pattern Match Pulse Tests
+Latch a specific pattern. 
+Apply data_in values that:
+- Match the pattern with the full mask.
+- Mismatch with full mask.
+- Partial match with partial mask.
+
+#### Phase 4: Masking Behavior
+- **Full Mask**: mask = 8'b11111111
+- **No Mask**: mask = 8'b00000000 (should suppress pulses).
+- **Random Mask Values**: Generate correct selective comparison.
+
+#### Phase 5: Enable Control
+Run tests with enable = 0 to ensure no pulses are generated.
+
+#### Phase 6: Generate Word Change and Pattern Match Pulses with Masking
+- No Change Scenario.
+- Single-Bit Transitions.
+-  Multiple-Bit Transitions.
+- Fully Masked Changes.
+- Pattern Match Case Without Changes.
+- Partial Mask and Upper Bits Transition.
+
+#### Phase 7: Stress Testing
+- Apply randomized data sequences over 100 cycles.
+- Introduce delays and glitches.
+
+### Final Steps 
+- Waveform Dump: Generate a VCD file (Word_Change_Pulse.vcd) for visualization.
+
+### Partial Test Stimulus Generator Code :
+
+
+```verilog
+module tb_Word_Change_Pulse;
+
+    // Parameters
+    parameter DATA_WIDTH = 8;
+
+    // Testbench Signals
+    reg clk;
+    reg reset;
+    reg enable;
+    reg latch_pattern;
+    reg [DATA_WIDTH-1:0] data_in;
+    reg [DATA_WIDTH-1:0] mask;
+    reg [DATA_WIDTH-1:0] match_pattern;
+    reg [DATA_WIDTH-1:0] data_in_prev;
+    wire word_change_pulse;
+    wire pattern_match_pulse;
+    wire [DATA_WIDTH-1:0] latched_pattern;
+
+
+    // Instantiate the DUT
+    Word_Change_Pulse #(
+        .DATA_WIDTH(DATA_WIDTH)
+    ) dut (
+        .clk(clk),
+        .reset(reset),
+        .enable(enable),
+        .latch_pattern(latch_pattern),
+        .data_in(data_in),
+        .mask(mask),
+        .match_pattern(match_pattern),
+        .word_change_pulse(word_change_pulse),
+        .pattern_match_pulse(pattern_match_pulse),
+        .latched_pattern(latched_pattern)
+    );
+
+    // Clock Generation
+    initial clk = 0;
+    always #5 clk = ~clk;
+
+    task run_test(
+        input [DATA_WIDTH-1:0] test_data,
+        input [DATA_WIDTH-1:0] test_mask,
+        input [DATA_WIDTH-1:0] test_pattern,
+        input string testcase_name,
+        input reg test_enabled
+    );
+        begin
+            @(posedge clk);
+            data_in = test_data;
+            mask = test_mask;
+            match_pattern = test_pattern;
+            enable = test_enabled;
+            @(posedge clk);
+            $display("%s: data_in=%b, mask=%b, enable=%b -> word change pulse=%b", 
+                         testcase_name, test_data, test_mask, enable, word_change_pulse);
+        end
+    endtask
+
+    // Insert the code for the remaining test stimulus here
+
+endmodule
+```

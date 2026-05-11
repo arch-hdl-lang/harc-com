@@ -1,0 +1,65 @@
+Write a testbench to only generate stimulus for a `divider` that performs non-restoring division for two unsigned positive integer inputs, and generates the output `quotient`, `remainder` and `valid` when computation is completed for the inputs `dividend` and `divisor` when `start` is asserted. In this design, the outputs are generated after WIDTH + 2 clock cycles and the output is considered valid when `valid` is asserted.
+
+The non-restoring division is a division technique for unsigned binary values that simplifies the procedure by eliminating the restoring phase.
+
+## Design Details
+
+### Parameters
+
+- **`WIDTH`**  
+  - *Default*: 32
+  - *Constraint*: Must be greater than 1  
+  - *Description*: Bit-width of the `dividend` and `divisor`, and thus of the `quotient` and `remainder`.
+
+---
+
+### Port List
+
+| **Port Name**  | **Direction** | **Width**       | **Description and Constraints**                                                                                                                                                             |
+|----------------|---------------|-----------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **`clk`**      | input         | 1 bit           | Main clock input. All operations occur on the rising edge of this signal.                                                                                                                   |
+| **`rst_n`**    | input         | 1 bit           | Active-low asynchronous reset. When asserted (0), resets the internal state machine, outputs and registers to their initial states.                                                         |
+| **`start`**    | input         | 1 bit           | When asserted high, it indicates that valid inputs (`dividend` and `divisor`) are available and a new division operation should begin on the next rising clock edge.                        |
+| **`dividend`** | input         | `WIDTH` bits    | Dividend (the numerator) for the division operation. Must be greater than or equal to 0 and Less than 2<sup>(WIDTH)</sup>-1                                                                 |
+| **`divisor`**  | input         | `WIDTH` bits    | Divisor (the denominator) for the division operation. Must be greater than 0 and Less than 2<sup>(WIDTH-1)</sup>-1.                                                                         |
+| **`quotient`** | output        | `WIDTH` bits    | The integer division result, valid once the module completes the division and `valid` is asserted. The output value is held till the computation of the next set of inputs is completed.    |
+| **`remainder`**| output        | `WIDTH` bits    | The remainder from the division, valid once the module completes the division and `valid` is asserted. The output value is held till the computation of the next set of inputs is completed.|
+| **`valid`**    | output        | 1 bit           | Asserted high when the output (`quotient` and `remainder`) is valid. Remains asserted after the calculation is completed till the `start` input is driven low.                              |
+
+---
+
+## The design follows the following Finite-State Machine (FSM) for division
+
+1. **IDLE**  
+   - **Default/Reset state**.  
+   - Waits for `start` to be asserted.  
+   - On `start`, loads the `dividend` and `divisor` into internal registers, resets the `quotient` and `remainder` registers, and transitions to **BUSY**.
+
+2. **BUSY**  
+   - Performs the **non-restoring** algorithm for `WIDTH` clock cycles.  
+
+3. **DONE**  
+   - Asserts `valid` to indicate outputs are ready.  
+   - Stays in **DONE** until `start` is de-asserted, then returns to **IDLE**.
+
+---
+
+### Latency Considerations of the DUT
+Total Latency = WIDTH + 2 cycles
+
+### Notes:
+- Division by 0 is not handled in this design
+- When `start` signal is is asserted, the design latches the input `dividend` and `divisor` at the next clock edge.
+- Inputs `dividend` and `divisor` will remain stable until the calculation is complete.
+ 
+## Testbench requirements:
+
+### Instantiation
+
+- Module Instance: The `divider` module is instantiated as `dut`, with the input and output signals connected for testing.
+---
+
+### Input Generation
+
+- Input Generation: The testbench must generate inputs of WIDTH-bit binary values for `dividend` and `divisor` and 1-bit `start` to cover all possibilities, including the corner cases.
+- Computation Period: After setting each pair of inputs, the testbench waits till assertion of `valid` to ensure the outputs have stabilized, before asserting new values.

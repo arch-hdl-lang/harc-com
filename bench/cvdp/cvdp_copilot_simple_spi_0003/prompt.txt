@@ -1,0 +1,103 @@
+Create a test bench in SystemVerilog for a Verilog module named `spi_fsm`. The module handles data transmission in a serial format from a 16-bit input vector (`i_data_in`) using an SPI protocol. The design includes proper state transitions, signal handling, and timing synchronization to ensure accurate data transmission. The test bench should systematically generate input vectors, apply them to the module under test (MUT) and aim to achieve 100% or the maximum possible coverage.
+
+---
+## Instantiation
+
+Name the instance of the RTL as **dut**.
+
+## **RTL Parameters, Inputs - Outputs and Functional behavior**
+
+
+### Inputs
+1. **`i_clk`** (1-bit, Input):  
+   - System clock signal for synchronous operations.  
+
+2. **`i_rst_b`** (1-bit, Input):  
+   - Active-low asynchronous reset. Upon activation, the system must reset all internal states and outputs.  
+
+3. **`i_data_in`** (16-bit, Input):  
+   - Input data vector to be serialized and transmitted through the SPI bus.  
+
+4. **`i_enable`** (1-bit, Input):  
+   - Control signal to enable or disable the block.  
+     - High (`1`): The block operates normally, and data transmission occurs.  
+     - Low (`0`): The block resets to the idle state, disabling transmission.  
+
+5. **`i_fault`** (1-bit, Input):  
+   - Indicates a fault condition. If asserted, the FSM transitions to an error state, halts all activity, and drives outputs to safe defaults.  
+
+6. **`i_clear`** (1-bit, Input):  
+   - Forces the FSM to immediately clear the current transaction, clear counters, and transition to the idle state.  
+
+---
+
+### Outputs
+1. **`o_spi_cs_b`** (1-bit, Output):  
+   - Active-low SPI chip select signal to indicate the start and end of a transmission. Default is logic high when idle.  
+
+2. **`o_spi_clk`** (1-bit, Output):  
+   - SPI clock signal for synchronizing data transfers. The clock signal toggles during transmission. Default is logic low when idle or disabled.  
+
+3. **`o_spi_data`** (1-bit, Output):  
+   - Serialized SPI data output derived from the `i_data_in` input vector. Default is logic low when idle or disabled.  
+
+4. **`o_bits_left`** (5-bit, Output):  
+   - Tracks the number of bits remaining to be transmitted during the SPI session. Default is `0x10` (all bits remaining).  
+
+5. **`o_done`** (1-bit, Output):  
+   - Pulses high for exactly one clock cycle when a transaction is successfully completed or the FSM transitions to an error state.  
+
+6. **`o_fsm_state`** (2-bit, Output):  
+   - Reflects the internal FSM state for external monitoring:  
+     - `00` = Idle  
+     - `01` = Transmit  
+     - `10` = Clock Toggle  
+     - `11` = Error 
+
+---
+
+### Behavioral Requirements
+
+1. **FSM States**:  
+   - **Idle** (`00`): Initialize SPI signals (`o_spi_cs_b = 1`, `o_spi_clk = 0`) and wait for `i_enable = 1` to begin transmission.  
+   - **Transmit** (`01`): Activate SPI signals (`o_spi_cs_b = 0`), load the MSB of `i_data_in` into `o_spi_data`, and start shifting the bits out sequentially.  
+   - **Clock Toggle** (`10`): Toggle `o_spi_clk` to latch `o_spi_data` externally, decrement `o_bits_left`, and determine if more bits remain to be transmitted. If all bits are sent, assert `o_done` and transition to Idle.  
+   - **Error** (`11`): Entered upon assertion of `i_fault`. All SPI outputs are driven to safe values (`o_spi_cs_b = 1`, `o_spi_clk = 0`, `o_spi_data = 0`,`o_done`=0,`o_bits_left=10`), and the FSM remains here until cleared or reset.  
+
+2. **Control Signals**:  
+   - **Enable (`i_enable`)**:  
+     - If asserted (`1`): FSM proceeds through normal transmission states (`Transmit` and `Clock Toggle`).  
+     - If deasserted (`0`): FSM immediately transitions to Idle and resets all active outputs.  
+   - **Clear (`i_clear`)**:  
+     - When asserted, FSM immediately transitions to Idle, resetting all counters and outputs regardless of the current state.  
+
+3. **Done Signal (`o_done`)**:  
+   - Asserted (high) for one clock cycle upon successful completion of transmission.
+
+4. **FSM State Output (`o_fsm_state`)**:  
+   - Reflects the current FSM state in real-time for external monitoring.  
+
+## Test Bench Requirements
+
+### Stimulus Generation
+
+**1. Reset and Initialization**
+- Apply the reset is applied.
+
+**2. Normal SPI Transmission**
+- Enable the FSM and provide a valid data input to initiate a transmission. 
+- Introduce multiple consecutive transmissions without disabling the FSM to check if data is continuously processed as expected.
+- Attempt to modify the input data while transmission is ongoing to ensure that changes do not interfere with the current operation.
+
+**3. Control Signal Handling**
+- Disable the FSM while a transmission is in progress.
+- Force the FSM to clear its current operation while actively transmitting to confirm that it returns to idle without completing the remaining shifts.
+
+**4. Error Handling**
+- Introduce an error condition during transmission.
+- Attempt to recover from the error by applying a reset-like condition.
+
+**5. Clock and Edge Case Behavior**
+- Make the FSM to properly toggle the SPI clock signal during transmission, synchronizing data shifts.
+- Test the handling of extreme data values, including cases where only a single bit is set.
+- Execute back-to-back transmissions with varying data patterns.

@@ -1,0 +1,69 @@
+Create a testbench to only supply stimulus to a `hamming_code_receiver` module. This module decodes an 8-bit input signal and detects single-bit errors using Hamming code principles. The receiver performs "even parity checks" to identify single-bit errors in `data_in` and provides corrected 4-bit data through the output port `data_out[3:0]`.
+
+---
+
+### **RTL Specification**
+
+#### 1. **Module Interface**
+
+**Inputs:**  
+- `data_in[7:0]` – An 8-bit input signal containing 4 data bits, 3 parity bits, and 1 redundant bit.
+
+**Output:**  
+- `data_out[3:0]` – A 4-bit output signal containing the corrected data if an error is detected. If no error is detected, the output mirrors the data bits in the input (`data_in`).
+
+#### 2. **Module Functionality**
+
+The module uses Hamming code principles to detect and correct single-bit errors in the 8-bit input (`data_in`). The organization of bits in the input is as follows:  
+- **Parity Bits:** Placed at positions that are powers of 2 in `data_in`:
+  - `data_in[1]` (2<sup>0</sup> = 1),  
+  - `data_in[2]` (2<sup>1</sup> = 2),  
+  - `data_in[4]` (2<sup>2</sup> = 4).  
+- **Data Bits:** Placed sequentially in positions that are not powers of 2:
+  - `data_in[3]`, `data_in[5]`, `data_in[6]`, and `data_in[7]`.
+
+#### 2.1. **Error Detection and Correction**
+
+- The module calculates three syndrome bits (`c1`, `c2`, `c3`) using XOR operations on specific data and parity bits from `data_in`. These syndrome bits indicate the position of any error within the 7 most significant bits (`data_in[7:1]`).
+- If an error is detected, the incorrect bit is corrected.  
+
+#### 2.2. **Output Assignment**
+
+- After error correction, the module retrieves the 4 data bits from the corrected input and assigns them to the output port `data_out[3:0]`.  
+- The positions of the data bits in the input correspond to:
+  - `data_in[3]`, `data_in[5]`, `data_in[6]`, and `data_in[7]`.
+
+#### 3. **Timing and Synchronization**
+
+- The design is purely combinational, meaning the output is updated immediately after any change in the input.
+
+
+
+---
+
+### **Testbench Requirements**
+
+- **Module Instance:** The `hamming_code_receiver` module should be instantiated as **`uut_receiver`**, with input and output signals connected for testing.
+
+---
+
+### **Input Generation and Validation**
+
+1. **Input Generation:**  
+   - The testbench should generate all possible 4-bit binary values for input data (ranging from the minimum value (0) to the maximum value (2<sup>4</sup> - 1)) and extend it to include encoding bits before supplying the stimulus to the design, ensuring coverage of both typical cases and edge cases.  
+
+3. **Golden Encoder Logic:**  
+   - Inputs provided to the module should follow a specific pattern similar to data generated from a transmitter following hamming code principles. It should also ensure that erroneous input data is supplied with only single-bit errors (as the RTL is capable of correcting only single-bit errors)
+   - The testbench should encode the generated 4-bit data into an 8-bit data (golden encoded data) using Hamming code principles for error detection.  
+   - The encoding process based on Hamming code principles is as follows:  (Assume the 4-bit data generated internally is `data_in` and it is extended to `golden_data_out`)
+     1. **`golden_data_out[0]`**: A redundant bit, fixed at 0.  
+     2. **`golden_data_out[1]`**: Parity bit ensuring even parity (XOR) for the input bits at positions `data_in[0]`, `data_in[1]`, and `data_in[3]`.  
+     3. **`golden_data_out[2]`**: Parity bit ensuring even parity (XOR) for the input bits at positions `data_in[0]`, `data_in[2]`, and `data_in[3]`.  
+     4. **`golden_data_out[4]`**: Parity bit ensuring even parity (XOR) for the input bits at positions `data_in[1]`, `data_in[2]`, and `data_in[3]`.  
+     5. **`golden_data_out[3]`, `golden_data_out[5]`, `golden_data_out[6]`, `golden_data_out[7]`**: These are the data bits `data[0]`, `data[1]`, `data[2]`, and `data[3]` respectively, in the same order.  
+   - To simulate errors, a single bit in the **golden encoded data** must be randomly modified. This modified data should then be assigned to the input of the design under test (**`uut_receiver`**).  
+
+4. **Stabilization Period:**  
+   - After assigning each input value, the testbench must wait for 10 time units to ensure that the outputs have stabilized before asserting new values.  
+
+---

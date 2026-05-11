@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_prim_max_0005",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "prim_max_find_top",
+  "dut_module": "prim_max_find",
+  "target_coverage": 96,
+  "auto_wrapper": "prim_max_find_top.sv",
+  "n_ports": 7,
+  "clock_inputs": [
+    "clk_i"
+  ],
+  "multi_clock": false
+}

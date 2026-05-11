@@ -1,0 +1,53 @@
+Write a testbench to generate stimulus only for the `restoring_division` module, which performs restoring division on two unsigned positive integer inputs. The module produces the `quotient`, `remainder`, and asserts the `valid` signal upon computation completion. Additionally, it sets the `divisor_valid_result` flag to indicate whether the divisor was valid (nonzero) when the `start` signal is asserted with the `dividend` and `divisor` inputs.
+
+---
+
+## **Design Details**
+### **Parameterization**
+- **WIDTH**: Specifies the bit-width of the dividend and divisor.
+  - **Default**: 6
+
+### **Functionality**
+The **restoring_division** module performs unsigned integer division using a sequential **restoring division algorithm**. The quotient and remainder are computed iteratively over multiple clock cycles.
+
+#### **Division Process and Output Behavior**
+- The computation is **iterative** and progresses bit-by-bit over **WIDTH** clock cycles.
+- The division process must finish within WIDTH clock cycles if WIDTH is a power of 2 (2^n) to ensuring all data is processed; otherwise (if WIDTH is not a power of 2), it will take WIDTH+1 clock cycles.
+- Once the computation is complete, the **valid** signal is asserted high to indicate that the **quotient** and **remainder** outputs are stable and valid.
+- The **divisor_valid_result** signal ensures that valid results are only produced when the divisor is nonzero.
+
+### **Inputs:**  
+- `clk` (1-bit): Clock signal, toggles every 5 time units (**100MHz operation**).  
+- `rst` (1-bit): **Active-low** reset signal to initialize the module.  
+- `start` (1-bit): Start signal to begin the division process.  
+- `dividend` (6-bit): Dividend input value.  
+- `divisor` (6-bit): Divisor input value.  
+
+### **Outputs:**  
+- `quotient` (6-bit): Computed quotient output.  
+- `remainder` (6-bit): Computed remainder output.  
+- `valid` (1-bit): Signal indicating division completion.  
+- `divisor_valid_result` (1-bit): Signal indicating if divisor was valid (not zero).  
+
+---
+
+## **Testbench Requirements**
+### **Instantiation**
+- The **restoring_division** module should be instantiated as **uut** (Unit Under Test), with all input and output signals connected.
+
+### **Input Generation and Validation**
+- **Randomized Inputs**: The testbench must generate multiple test cases, covering:
+  - **Random dividend & random nonzero divisor**
+  - **Dividend = 0** (Edge case)
+  - **Divisor = 0** (Edge case, division by zero)
+  - **Dividend < Divisor** (Ensuring the quotient is 0 and remainder = dividend)
+- **Stabilization Period**: After applying inputs, the testbench must wait until the **valid** signal is asserted before checking outputs.
+
+### **Control Signal Behavior**
+- The **start** signal should be asserted high for **one clock cycle** before being de-asserted.
+- The testbench must ensure that **valid** is asserted only after the computation is complete.
+
+
+---
+
+This testbench will verify the **correctness, stability, and edge-case behavior** of the **restoring_division** module. It ensures that the division process adheres to the restoring division algorithm and produces accurate results across all test scenarios.

@@ -1,0 +1,144 @@
+Complete the given partial SystemVerilog testbench `serial_line_code_converter_tb`. The testbench must instantiate the `serial_line_code_converter` RTL module and provide input stimulus to validate its functionality. This module implements various serial line coding techniques. The testbench should include different input scenarios, such as different encoding schemes, edge cases, and invalid input handling. 
+
+---
+
+## Description
+
+The serial_line_code_converter module is a Verilog-based design that converts serial input data into different encoding formats based on the selected mode. The module utilizes clock division, edge detection, and various encoding techniques to modify the serial input and produce the corresponding encoded serial output.
+
+### Encoding Implementations
+1. **NRZ (Non-Return-to-Zero)**: Direct pass-through of `serial_in`.
+2. **RZ (Return-to-Zero)**: Outputs high only during the first half of the clock cycle when `serial_in` is high.
+3. **Differential Encoding**: Outputs the XOR of the current and previous serial input.
+4. **Inverted NRZ**: Outputs the inverted value of `serial_in`.
+5. **NRZ with Alternating Bit Inversion**: Inverts every alternate bit of `serial_in`.
+6. **Parity Bit Output (Odd Parity)**: Generates an odd parity bit based on the serial input.
+7. **Scrambled NRZ**: XORs `serial_in` with the least significant bit of the clock counter for scrambling.
+8. **Edge-Triggered NRZ**: Detects rising edges of `serial_in` and outputs accordingly.
+
+### Parameters
+- **`CLK_DIV`**: Specifies the clock divider for generating clk_pulse. The default value is 16. It must be a positive integer greater than or equal to 2.
+
+### Inputs:
+- **clk**: System clock signal. The design operates synchronously with the rising edge of `clk`.
+- **reset_n**:  Active-low asynchronous reset signal. When asserted low, it resets all internal states and outputs.
+- **serial_in**:  1-bit Input signal carrying the serial data stream to be encoded according to the selected mode.
+- **mode [2:0]**: A 3-bit input that determines the encoding mode. Possible values:
+  - `000`: NRZ (Non-Return-to-Zero).
+  - `001`: RZ (Return-to-Zero).
+  - `010`: Differential Encoding.
+  - `011`: Inverted NRZ.
+  - `100`: NRZ with Alternating Bit Inversion.
+  - `101`: Parity Bit Output (Odd Parity).
+  - `110`: Scrambled NRZ.
+  - `111`: Edge-Triggered NRZ.
+
+### Outputs:
+- **serial_out**: Encoded  1-bit output signal. The encoding applied to `serial_in` is determined by the value of the `mode` input. The output updates on every clock cycle based on the selected encoding method.
+
+---
+
+## Testbench Setup
+
+### Clock Generation:
+- Generate a clock with a period of 10ns using an `always` block.
+
+### Reset Signal:
+- Apply an active-low reset signal at the beginning of the simulation to initialize the DUT.
+
+### Signal Initialization:
+- Initialize all testbench signals, including registers and tracking signals for the DUT behavior.
+
+### Feature Mode Identification:
+- Maintain an array of strings to define and identify the different encoding techniques implemented in the DUT.
+
+### DUT Instantiation:
+- Create an instance of the `serial_line_code_converter` module with appropriate connections for inputs and outputs.
+
+---
+
+## Behavioral Logic
+
+### Clock Division:
+- Simulate clock division logic in the testbench to mimic DUT timing for certain modes like RZ.
+
+### Previous State Tracking:
+- Track previous input values and states to validate encoding techniques like Differential and Edge-Triggered NRZ.
+
+### Special Mode Handling:
+- Implement specific logic for modes such as Alternate Inversion, Parity-Added, and Scrambled NRZ.
+
+---
+
+## Input Generation 
+
+### Stimulus Generation:
+- Randomly generate serial input values (`serial_in`) for each encoding mode.
+- Iterate through all 8 modes, applying input stimuli and observing DUT behavior.
+
+---
+
+## Waveform Analysis
+- Generate a VCD file (`serial_line_code_converter.vcd`) to enable waveform analysis for debugging and verification.
+
+---
+
+## Test Scenarios
+
+### Test All Modes:
+- Test all 8 encoding modes in sequence.
+- For each mode, generate multiple input patterns.
+
+### Edge Case Validation:
+- Generate the inputs for edge cases such as alternating inputs, random noise, and reset behavior.
+
+### Partial Test Stimulus Generator Code :
+
+```verilog
+module serial_line_code_converter_tb;
+    parameter CLK_DIV = 6; // Clock division parameter for timing
+
+    // Testbench signals
+    logic clk, reset_n, serial_in, serial_out;
+    logic [2:0] mode;
+
+    // Tracking signals to mimic DUT behavior
+    logic [3:0] tb_counter;
+    logic tb_clk_pulse, tb_prev_serial_in, tb_alt_invert_state, tb_parity_out, tb_prev_value;
+
+    // Instantiate the Device Under Test
+    serial_line_code_converter #(CLK_DIV) dut (
+        .clk(clk),
+        .reset_n(reset_n),
+        .serial_in(serial_in),
+        .mode(mode),
+        .serial_out(serial_out)
+    );
+
+    // Clock generation
+    initial begin
+        clk = 0;
+        forever #5 clk = ~clk; // Clock period of 10ns
+    end
+
+    // Initialize signals
+    initial begin
+        tb_counter = 0;
+        tb_clk_pulse = 0;
+        tb_prev_serial_in = 0;
+        tb_prev_value = 0;
+        tb_alt_invert_state = 0;
+        tb_parity_out = 0;
+        reset_n = 0;
+        serial_in = 0;
+        mode = 3'b000;
+
+        // Apply reset
+        @(negedge clk) reset_n = 1;
+        @(posedge clk);
+    end
+
+    // Insert the code for the remaining test stimulus here
+
+endmodule
+```

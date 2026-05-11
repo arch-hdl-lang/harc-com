@@ -1,0 +1,175 @@
+Create a stimulus generating test bench in SystemVerilog for a Verilog module named `signedadder` that add or subtract two signed 2's complement numbers, controlled by input signals and a state machine. The test bench should systematically generate input vectors, apply them to the module under test (MUT) and aim to achieve 100% or the maximum possible coverage.
+ 
+## 1. Instantiation
+
+Name the instance of the RTL as dut.
+
+## 2. DESIGN UNDER TEST (DUT)
+
+The DUT is a **signed 2’s complement adder/subtractor** with a built-in state machine. It can:
+
+- **Add** (`i_mode = 0`) or **Subtract** (`i_mode = 1`) two `DATA_WIDTH`-bit signed operands.  
+- **Detect Overflow** for signed operations.  
+- Operate in a **four-state** machine (IDLE → LOAD → COMPUTE → OUTPUT).  
+- **Parameter**: `DATA_WIDTH` (e.g., 8 bits)  
+
+### High-Level Data Flow
+
+1. **IDLE**: Waits for `i_enable` and `i_start`.  
+2. **LOAD**: Latches `i_operand_a` and `i_operand_b`.  
+3. **COMPUTE**: Performs the requested arithmetic operation.  
+4. **OUTPUT**: Updates the outputs, asserts `o_ready`, then returns to **IDLE**.
+
+---
+
+## 3. INPUT AND OUTPUT EXPLANATION
+
+### Inputs
+
+1. **`i_clk`**  
+   - **Function**: Clock for synchronous logic.  
+   - **Usage**: Triggers all state transitions.
+
+2. **`i_rst_n`** (Active-Low Reset)  
+   - **Function**: Asynchronously resets the design.  
+   - **Usage**: Forces module to **IDLE** state, clears registers, and zeroes outputs.
+
+3. **`i_start`**  
+   - **Function**: Triggers loading of operands when high (if `i_enable` is also asserted).  
+   - **Usage**: Must be pulsed high while in **IDLE** to move the state machine to **LOAD**.
+
+4. **`i_enable`**  
+   - **Function**: Global enable for the module.  
+   - **Usage**: If deasserted, the design will ignore `i_start` and revert or stay in **IDLE**.
+
+5. **`i_mode`**  
+   - **Function**: Selects the arithmetic operation.  
+   - **Usage**:  
+     - `0` → Addition (`o_resultant_sum = i_operand_a + i_operand_b`)  
+     - `1` → Subtraction (`o_resultant_sum = i_operand_a - i_operand_b`)
+
+6. **`i_clear`**  
+   - **Function**: Immediately clears outputs and resets the state machine to **IDLE**.  
+   - **Usage**: When high, forces result to 0 and moves to **IDLE**.
+
+7. **`i_operand_a`, `i_operand_b`**  
+   - **Function**: Signed 2’s complement inputs.  
+   - **Usage**: Values to be added or subtracted.
+
+### Outputs
+
+1. **`o_resultant_sum`**  
+   - **Function**: Provides the computed result (in signed 2’s complement).  
+   - **Usage**: Valid only in **OUTPUT** state or once `o_ready` is high.
+
+2. **`o_overflow`**  
+   - **Function**: High if a **signed overflow** is detected.  
+   - **Usage**: Check this after the **COMPUTE** cycle completes.
+
+3. **`o_ready`**  
+   - **Function**: Indicates that `o_resultant_sum` and `o_overflow` are valid.  
+   - **Usage**: High in **OUTPUT** state, then returns low in **IDLE**.
+
+4. **`o_status`** (2 bits)  
+   - **Function**: Encodes the current state of the module.  
+   - **Usage**:
+     - `00`: IDLE  
+     - `01`: LOAD  
+     - `10`: COMPUTE  
+     - `11`: OUTPUT  
+
+---
+
+## 4. BEHAVIOR EXPLANATION
+
+1. **Reset Behavior**  
+   - When `i_rst_n` is deasserted (low), internal registers and outputs are cleared, and the module returns to the **IDLE** state.  
+   - The reset is asynchronous: the design responds immediately to `i_rst_n`.
+
+2. **State Machine Flow**  
+   - **IDLE (00)**: Default/wait state. The design transitions to **LOAD** if `i_enable` and `i_start` are high.  
+   - **LOAD (01)**: Latches `i_operand_a` and `i_operand_b` into internal registers, preparing for computation.  
+   - **COMPUTE (10)**: Performs addition or subtraction based on `i_mode`. Internal overflow logic is used to set `o_overflow`.  
+   - **OUTPUT (11)**: Updates `o_resultant_sum` and `o_overflow`, asserts `o_ready`, and then goes back to **IDLE**.
+
+3. **Overflow Detection**  
+   - Triggered when the sign of the result indicates a signed overflow:  
+     - Both operands positive, result negative.  
+     - Both operands negative, result positive.  
+   - `o_overflow` goes high if either condition is met.
+
+4. **Clear Behavior**  
+   - When `i_clear` is high, the design resets outputs and returns to **IDLE** no matter the current state.
+
+---
+
+## 5. STIMULUS LIST FOR 100% COVERAGE
+
+Below is an outline of test scenarios and input sequences to exhaustively check each design feature, state, and boundary condition. **No actual code is provided**; only the conceptual approach to drive and observe the design is described.
+
+### A. Reset and Basic State Transition Coverage
+
+1. **Asserting `i_rst_n = 0` During Operation**  
+   - **Objective**: Immediate reset to **IDLE**. 
+   - **Process**:  
+     - Start in **IDLE**.  
+     - Assert `i_start` and `i_enable` to move to **LOAD**.  
+     - While in **LOAD** or **COMPUTE**, drive `i_rst_n` low.  
+     - 
+2. **Using `i_clear`**  
+   - **Objective**: Immediate clear function at each state.  
+   - **Process**:  
+     - Begin in **IDLE** with `i_enable = 1`.  
+     - Assert `i_start`, capture some operands in **LOAD**.  
+     - Deassert `i_start`, go to **COMPUTE**, then drive `i_clear` high.  
+
+### B. Normal Addition Operations
+
+3. **Simple Positive Addition**  
+   - **Objective**: Correct addition for small positive numbers.  
+   - **Process**:  
+     - `i_operand_a = 5`, `i_operand_b = 10`, `i_mode = 0`, `i_start = 1`, `i_enable = 1`.  
+
+4. **Positive + Negative (No Overflow)**  
+   - **Objective**: Sign handling when operands have opposite signs.  
+   - **Process**:  
+     - `i_operand_a = 15`, `i_operand_b = -5`, `i_mode = 0`.  
+5. **Boundaries with No Overflow**  
+   - **Objective**: Approach boundary without triggering overflow.  
+   - **Process**:  
+     - For an 8-bit example: `i_operand_a = 127`, `i_operand_b = 0`, `i_mode = 0`.  
+
+### C. Overflow in Addition
+
+6. **Positive Overflow**  
+   - **Objective**: Detect overflow when adding two large positive numbers.  
+   - **Process**:  
+     - For 8-bit: `i_operand_a = 127`, `i_operand_b = 1`, `i_mode = 0`.  
+
+7. **Negative Overflow**  
+   - **Objective**: Detect overflow with large negative numbers.  
+   - **Process**:  
+     - For 8-bit: `i_operand_a = -128` (0x80), `i_operand_b = -1`, `i_mode = 0`.  
+
+### D. Subtraction Operations
+
+8. **Basic Positive Subtraction**  
+   - **Objective**: standard subtraction.  
+   - **Process**:  
+     - `i_operand_a = 20`, `i_operand_b = 5`, `i_mode = 1`.  
+
+9. **Negative Result Subtraction**  
+   - **Objective**: Check correct negative outcome.  
+   - **Process**:  
+     - `i_operand_a = 5`, `i_operand_b = 20`, `i_mode = 1`.  
+
+10. **Overflow in Subtraction**  
+    - **Objective**: Trigger overflow from subtracting.  
+    - **Process**:  
+      - For 8-bit: `i_operand_a = 127`, `i_operand_b = -1`, `i_mode = 1`.  
+
+11. **No-Operation Cases**  
+    - **Objective**:  `i_enable = 0`, no transitions occur.  
+    - **Process**:  
+      - Keep `i_enable = 0`, pulse `i_start`.
+

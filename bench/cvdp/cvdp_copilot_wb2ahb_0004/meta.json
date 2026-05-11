@@ -1,0 +1,17 @@
+{
+  "id": "cvdp_copilot_wb2ahb_0004",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "wishbone_to_ahb_bridge_top",
+  "dut_module": "wishbone_to_ahb_bridge",
+  "target_coverage": 95,
+  "auto_wrapper": "wishbone_to_ahb_bridge_top.sv",
+  "n_ports": 21,
+  "clock_inputs": [
+    "clk_i",
+    "hclk"
+  ],
+  "multi_clock": true
+}

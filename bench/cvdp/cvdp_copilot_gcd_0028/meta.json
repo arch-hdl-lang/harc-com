@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_gcd_0028",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "gcd_3_ip",
+  "dut_module": "gcd_3_ip",
+  "target_coverage": 100,
+  "auto_wrapper": null,
+  "n_ports": 8,
+  "clock_inputs": [
+    "clk"
+  ],
+  "multi_clock": false
+}

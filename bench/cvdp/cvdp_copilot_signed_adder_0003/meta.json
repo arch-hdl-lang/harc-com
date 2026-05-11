@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_signed_adder_0003",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "signedadder_top",
+  "dut_module": "signedadder",
+  "target_coverage": 99,
+  "auto_wrapper": "signedadder_top.sv",
+  "n_ports": 12,
+  "clock_inputs": [
+    "i_clk"
+  ],
+  "multi_clock": false
+}

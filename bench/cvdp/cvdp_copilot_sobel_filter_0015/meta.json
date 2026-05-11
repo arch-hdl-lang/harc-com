@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_sobel_filter_0015",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "sobel_filter",
+  "dut_module": "sobel_filter",
+  "target_coverage": 100,
+  "auto_wrapper": null,
+  "n_ports": 6,
+  "clock_inputs": [
+    "clk"
+  ],
+  "multi_clock": false
+}

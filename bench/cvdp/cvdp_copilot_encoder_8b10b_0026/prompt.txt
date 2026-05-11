@@ -1,0 +1,119 @@
+Create a SystemVerilog testbench module named `tb_encoder_8b10b` that instantiates the `encoder_8b10b` module as the Unit Under test (UUT). This testbench module must include the `stimulus generation` logic only, which systematically drives different input conditions to the `encoder_8b10b` module to achieve **100% functional and code coverage**.  The `encoder_8b10b` module supports encoding of control and data symbols as given in the below functionality.
+
+---
+## **Input Stimulus Generation**
+
+### **Encoder Inputs**
+- Generate diverse patterns for `encoder_in`, including:
+  - Standard **control symbols** (`8'h1C`, `8'h3C`, `8'h5C`, `8'h7C`, etc.).
+  - Random **valid data symbols** (`8'h00` to `8'hFF`).
+  - Repeated control symbols.
+  - Invalid control inputs.
+  - **Imbalanced** control symbols to check running disparity handling.
+  - **Continuous data symbols** covering the entire range.
+  - **Sequential and random data symbols**.
+
+### **Edge Case Testing**
+- Drive encoder inputs with:
+  - **Repeated** control symbol sequences.
+  - **Back-to-back** transitions between control and data symbols.
+  - **Random invalid 8-bit values** fed into the encoder.
+
+### **Stabilization Period**
+- **Wait 1 clock cycle** after each input change before checking `encoder_out` and `disparity_out` to ensure stable results.
+
+---
+
+## **Instantiation**
+- The instance of the **RTL module** should be named **`uut`**.
+
+Following the RTL specification for building the RTL of the module, and using it as a reference for the testbench environment too:
+
+---
+
+## **Module Interface**
+
+### **Inputs**
+- `clk_in`: **Rising-edge triggered clock** signal with a 50% duty cycle.
+- `reset_in`: **Active-HIGH asynchronous reset**.
+- `control_in`: **1-bit input**, HIGH for control symbols, LOW for data symbols.
+- `encoder_in[7:0]`: **8-bit input symbol** to be encoded.
+- `disparity_data_in`: **1-bit input**, representing the current running disparity.
+
+### **Outputs**
+- `encoder_out[9:0]`: **10-bit encoded output**.
+- `disparity_out`: **1-bit output**, representing the running disparity after encoding.
+
+---
+
+## **Module Functionality**  
+
+An 8b10b encoder is a digital circuit that converts an 8-bit word into a 10-bit encoded codeword, used in telecommunications to maintain Digital Control (DC) balance (equal number of 1s and 0s) and provide error detection capabilities. The encoder is extended to support **data symbols**, which are standard data inputs distinct from control symbols.
+
+1. **Control and Data Symbol Encoding**:
+   - When `control_in` is HIGH: Encode `encoder_in` as a control character based on predefined control symbols and update the running disparity for control encoding.
+   - When `control_in` is LOW: Encode `encoder_in` as a data symbol based on the 8b/10b data encoding scheme. Use `disparity_data_in` to run disparity tracking and generate a valid 10-bit encoded data symbol while updating the running disparity.
+
+2. **Latency**:
+   - Ensure the module introduces a single clock cycle latency for control or data symbol encoding.
+
+3. **Control Encoding Compatibility**:
+   - Maintain compatibility with existing control symbol encoding implementation.
+   - Use modular components to handle control and data symbol encoding separately for maintainability.
+
+Below are the 5b/6b and 3b/4b encoding tables used for encoding data symbols in the design.
+
+### **5b/6b Encoding Table**
+
+The lower 5 bits of the 8-bit input are mapped to 6 bits based on the current running disparity (`RD`).
+
+| Input 5-bit(LSB) | RD = 0 | RD = 1  |
+|------------------|--------|---------|
+| 00000            | 100111 | 011000  |
+| 00001            | 011101 | 100010  |
+| 00010            | 101101 | 010010  |
+| 00011            | 110001 | 110001  |
+| 00100            | 110101 | 001010  |
+| 00101            | 101001 | 101001  |
+| 00110            | 011001 | 011001  |
+| 00111            | 111000 | 000111  |
+| 01000            | 111001 | 000110  |
+| 01001            | 100101 | 100101  |
+| 01010            | 010101 | 010101  |
+| 01011            | 110100 | 110100  |
+| 01100            | 001101 | 001101  |
+| 01101            | 101100 | 101100  |
+| 01110            | 011100 | 011100  |
+| 01111            | 010111 | 101000  |
+| 10000            | 011011 | 100100  |
+| 10001            | 100011 | 100011  |
+| 10010            | 010011 | 010011  |
+| 10011            | 110010 | 110010  |
+| 10100            | 001011 | 001011  |
+| 10101            | 101010 | 101010  |
+| 10110            | 011010 | 011010  |
+| 10111            | 111010 | 000101  |
+| 11000            | 110011 | 001100  |
+| 11001            | 100110 | 100110  |
+| 11010            | 010110 | 010110  |
+| 11011            | 110110 | 001001  |
+| 11100            | 001110 | 001110  |
+| 11101            | 101110 | 010001  |
+| 11110            | 011110 | 100001  |
+| 11111            | 101011 | 010100  |
+
+### **3b/4b Encoding Table**
+
+The upper 3 bits of the 8-bit input are mapped to 4 bits based on the current running disparity (`RD`).
+
+| Input (MSB) | RD = 0  | RD = 1  |
+|-------------|---------|---------|
+| 000         | 0100    | 1011    |
+| 001         | 1001    | 1001    |
+| 010         | 0101    | 0101    |
+| 011         | 0011    | 1100    |
+| 100         | 0010    | 1101    |
+| 101         | 1010    | 1010    |
+| 110         | 0110    | 0110    |
+| 111         | 1110    | 0001    |
+

@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_binary_search_tree_sorting_0030",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "search_binary_search_tree",
+  "dut_module": "search_binary_search_tree",
+  "target_coverage": 96,
+  "auto_wrapper": null,
+  "n_ports": 11,
+  "clock_inputs": [
+    "clk"
+  ],
+  "multi_clock": false
+}

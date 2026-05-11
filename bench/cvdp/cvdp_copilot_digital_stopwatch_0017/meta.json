@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_digital_stopwatch_0017",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "dig_stopwatch",
+  "dut_module": "dig_stopwatch",
+  "target_coverage": 85,
+  "auto_wrapper": null,
+  "n_ports": 6,
+  "clock_inputs": [
+    "clk"
+  ],
+  "multi_clock": false
+}

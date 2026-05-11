@@ -1,0 +1,383 @@
+Create a SystemVerilog testbench module named `tb_static_branch_predict` that instantiates the `static_branch_predict` module as the Unit Under Test (UUT). The testbench must include a stimulus generator that systematically drives various input conditions to achieve a minimum of 95% code and functional coverage for the `static_branch_predict` module.  The `static_branch_predict` takes a 32-bit branch or jump RISC-V instruction as input and predicts whether that branch will occur based on the conditions indicated in the instruction.
+
+## Design Specification:
+The `static_branch_predict` module takes in a 32-bit RV32I (RISC V 32-bit base Integer ISA) conditional branch and unconditional jump instructions as input. This module generally exists as part of the Instruction Fetch Stage of a pipelined processor. The branch and jump instruction can be either from the RV32I Instruction Set or from the RV32C Instruction Set. The branch and jump instructions as part of the RV32I Instruction Set are 32-bit in width, whereas those belonging to the RV32C Instruction Set are 16-bit in width. The 16-bit RV32C branch and jump instructions are converted into an equivalent 32-bit RV32I instruction using a specialized circuit called Instruction Decompresser before being applied to this module. For the module to recognize the 32-bit equivalent of the 16-bit branch and jump instructions, the inputs are properly formatted into a 32-bit value and applied. The Instruction Decompresser is not instantiated into the branch predictor module. Based on the instruction's offset in the case of the branch instruction and based on instruction in the case of a jump instruction, the branch predictor outputs two signals (i) a 1-bit signal to indicate whether the branching will occur for a given instruction or not (ii) If branching occurs, to which 32-bit address it has to get branched.
+
+## Key Assumptions and Constraints:
+- Only uncompressed 32-bit instructions are applied as input to this module.
+- The module operates in a purely combinational manner without requiring any state elements such as registers.
+- The Instruction Decompressor is outside the scope of this module, and the equivalent 32-bit uncompressed instruction is 
+  given as input.
+
+### Introduction to RISC V:
+RISC-V is a royalty-free open-source instruction set architecture, which anyone can utilize to implement a processor microarchitecture (i.e. processor hardware). The RISC-V ISA consists of three variants of Integer ISA namely RV32I (32-bit instructions to handle 32-bit data), RV64I (32-bit instructions to handle 64-bit data), and RV128I (32-bit instructions to handle 128-bit data). In addition to these, there are 14 extensions. One of the extensions that will be considered in this module is RV32C (16-bit ISA called Compressed RISC-V ISA)
+
+## RV32I Branch and Jump Instructions
+The RISC-V RV32I instruction set includes both unconditional jump and conditional branch instructions. Below, we describe the encodings and behaviors for these types of instructions.
+### Unconditional Jump Instructions(JAL and JALR)
+`JAL` (Jump and Link instruction):
+    -  Branches to an address obtained by adding the 32-bit program counter (pc) to a sign-extended 20-bit offset encoded in the instruction.
+    -  Returns to resume execution from the address stored in the 32-bit link register (x1 or x5) after completing the branched subroutine. A link register (also called a return address register) is the one that holds the address from where the processor has to resume its execution after returning from a subroutine. 
+**Instruction Encoding**:
+
+**|   31 -  imm[20]   |    30:21 - imm[10:1]    |     20 - imm[11]       |       19 : 12 - imm[19:12]      | 11 : 7 - rd   | 6 : 0  - 7'h6F   |**
+
+            
+Assembler syntax for JAL instruction :  jal  rd ,  imm[20:1]
+           
+Target Address  calculated for this instruction : 
+
+rd <--- pc + {{12{instr[31]}}, instr[19:12], instr[20], instr[30:21], 1'b0 };
+
+where {{12{instr[31]}}, instr[19:12], instr[20], instr[30:21], 1'b0 } - 32-bit sign extended offset or immediate. 
+Here, `rd` is a 5-bit number to identify the 32-bit destination register; `pc` - 32-bit program counter.
+  
+`JALR` (Jump and Link Register instruction): 
+ - Branches to an address obtained by adding the 32-bit program counter to a sign-extended 12-bit offset present in a register specified in the instruction.
+
+The instruction encoding for 32-bit uncompressed JALR instruction 
+**Instruction Encoding**:
+ 
+**|   31 :20 -  imm[11:0]   |    19:15 - rs1   |     14:12 - 000      |      11 : 7 - rd      | 11 : 7 - rd   | 6 : 0  - 7'h67   |**             
+            
+Assembler syntax for JAL instruction:  jalr  rd,  rs1, imm[11:0]  
+
+Target address calculated for this instruction : 
+rd <-pc + {{20{instr[31]}}, instr[31:20]} + rs1
+                           
+where 
+ {{20{instr[31]}}, instr[31:20]} + rs1 - 32-bit sign extended offset or immediate                          
+Here `rd` is the 5-bit number to identify a 32-bit destination register; `rs1` is the 5-bit number to identify the 32-bit source register; `pc` - 32-bit program counter
+                           
+### Conditional Branch Instructions (BXXX) :
+  - Takes in two operands (rs1 and rs2), compares them, and branches based on the comparison result.
+  - The target address is obtained by adding the pc to a sign-extended 12-bit offset encoded in the instruction.
+
+ The instruction encoding for the 32-bit uncompressed Branch instruction
+
+**Instruction Encoding**:
+ 
+**| 31 -  imm[12]|30:25 - imm[10:5]|24:20 - rs2 | 14 : 12 - func3| 11 : 8 -  imm[4:1]|7 - imm[11]| 6 : 0  - 7'h63   |**          
+      
+Assembler syntax for Branch instruction:  bxxx rs1, rs2, offset
+        
+Here `rs1` and `rs2`  are the 5-bit numbers to identify the 32-bit source registers which will be used for comparison
+        
+Target address calculated for this instruction : 
+pc + { {19{instr[31]}}, instr[31], instr[7], instr[30:25], instr[11:8], 1'b0 };
+
+where,
+{ {19{instr[31]}}, instr[31], instr[7], instr[30:25], instr[11:8], 1'b0 } - 32-bit sign extended offset or immediate; `pc` - 32-bit program counter
+
+The different types of branch instruction :
+- beq       rd , rs1 , rs2 , imm[12:1]  (func3 = 3'b000)
+- bne       rd , rs1 , rs2 , imm[12:1]  (func3 = 3'b001)
+- blt         rd , rs1 , rs2 , imm[12:1]  (func3 = 3'b100)
+- bltu       rd , rs1 , rs2 , imm[12:1]  (func3 = 3'b110)
+- bge       rd , rs1 , rs2 , imm[12:1]  (func3 = 3'b101)
+- bgeu     rd , rs1 , rs2 , imm[12:1]  (func3 = 3'b111)
+                               
+ ## RV32C Branch and Jump Instructions :
+ The RV32C compressed instructions are 16-bit wide, but before applying them to this module, they are converted to their equivalent 32-bit uncompressed form using an external decompressor circuit. The following sections describe how these instructions are handled.
+ 
+   
+ ### C.J / C.JAL Instructions: 
+  - Equivalent to the RV32I JAL instruction, with different function codes.
+    
+The instruction encoding for the 16-bit compressed jump instruction is given below:
+**Instruction Encoding**:
+**| 15 : 13 - func3 | 12:2- imm[11:1]| 1 : 0 - 01 |**              
+  
+Assembler syntax for C.J  instruction:   c.j offset[11:1]
+Assembler syntax for C.JAL instruction:  c.jal offset [11:1]
+             
+`func3` is a 3-bit code that differentiates between C.J and C.JAL instruction.
+The 3-bit function code for C.J is 101 and C.JAL is 001.
+  
+Its equivalent 32-bit uncompressed instruction encoding is given by :
+**Instruction Encoding**:
+ 
+**| 31  -  instr_c[12] | 30 -instr_c[8] | 29 : 28 - instr_c[10:9]| 27 -  instr_c[6]| 26-  instr_c[7]| 25 - instr_c[2] | 24- instr_c[11]|**
+
+**| 23 :  21 -  instr_c[5:3]  | 20 : 12  - {9{instr_c[12]}}| 11 : 8 - 4'b0000 | 7 - ~instr_c[15] | 6 : 0 - 7'h6F   |**              
+   
+   Only C.J and C.JAL instructions are supported by this module.
+   
+   Other Compressed Jump Instructions that RV32C supports are C.JR and C.JALR, but these are not being tested by the module.
+   
+### C.BEQZ / C.BNEZ Instructions:
+
+Equivalent to the RV32I BXXX instructions but check whether the content of the specified register(rs1') is zero or not.
+                                               
+The instruction encoding for the 16-bit compressed branch instruction is given below:
+**Instruction Encoding**:
+**| 15 : 13 - func3 | 12 : 10 - imm[8:6]    | 9 : 7 - rs1'  | 6 : 3 -  imm[4:1]| 2 -  imm[5]| 1 : 0 - 01  |**
+
+- func3 is a 3-bit code that differentiates between C.BEQZ and C.BNEZ instruction
+- The 3-bit function code for Compressed Branch EQual Zero (C.BEQZ) is 110 and that of Compressed Branch Not 
+   Equal Zero (C.BNEZ) is 111
+ 
+ Assembler syntax for C.BEQZ instruction:  c.beqz rs1' , offset[8:1]
+ Assembler syntax for C.BNEZ instruction:  c.bnez rs1', offset[8:1]
+          
+ Its equivalent 32-bit uncompressed instruction encoding is given by :
+**Instruction Encoding**:
+**| 31 : 28 - {4{instr_c[12]}} | 27 : 26 - instr_c[6:5] | 25 - instr_c[2]| 24 : 20 - 5'b00000 | 19 : 18 - 2'b01 | 17 : 15 - instr_c[9:7] |**
+
+**| 14 :  13 - 2'b00  | 12  - instr_c[13] | 11 : 10 -  instr_c[11:10] | 9 : 8 - instr_c[4:3] | 7 -  instr_c[12]  | 6 : 0 - 7'h63  |**
+
+### Only Supported Instructions
+- The following instructions are supported by this module:
+
+  - Uncompressed Instructions: JAL, JALR, BXXX.
+  - Compressed Instructions: C.J, C.JAL, C.BEQZ, C.BNEZ.
+  - For all other instructions, fetch_valid_i will be 0, indicating that they will not be predicted as taken.
+
+
+ 
+### Concept of Sign Extension of Immediate(or Offset) in the RISC V Control Transfer Instruction :
+
+Sign extension refers to identifying the sign bit of an operand and replicating it at the higher significant positions to increase the operand width to the desired value.
+Illustration :
+Suppose there is 8-bit data, data[7:0], say 8'b0110_1110. Suppose this has to be stored in a 32-bit register rd.
+
+
+| Bit Position : Bit Value    | 7 : 0  | 6 : 1  | 5 : 1  | 4: 0  | 3 : 1  | 2 : 1  | 1 : 1 | 0 : 0 |
+                
+Here the bit at position 7 is called sign-bit; Since it is 0, it indicates that it is a positive value. Hence, will be replicated in the higher 24-bit positions (i.e. from bit position 8 to bit position 31) to form a 32-bit value. This is represented in shorthand as
+                                                      rd <---  {{24{0}} , data_i[7:0]};
+                                                      
+### Static Branch Prediction Algorithm :
+### For Branch Instruction:
+- Immediate Extraction:
+    Extract the immediate value from the branch instruction.
+- Sign Extension:
+    Sign extend the immediate to 32 bits.
+- Prediction Logic and Target Address Calculation:
+   If the sign bit of the immediate is 1, the branch is predicted to be taken.
+   Otherwise, it is predicted as not taken.
+   The 32-bit program counter is added to the sign-extended offset or sign-extended immediate to form the target address
+
+### For Jump Instruction:
+- Immediate Extraction:
+   Extract the immediate value from the jump instruction.
+- Sign Extension:
+  Sign extend the immediate to 32 bits.
+- Prediction Logic and Target Address Calculation:
+   Always predict jumps (JAL, JALR, C.J, C.JAL) as taken.
+   The 32-bit program counter is added to the sign-extended offset or sign-extended immediate to form the target address
+
+## What do the words `taken` and `not-taken` signify in case of branch prediction :
+- Taken: The branch will occur, and execution will continue at the target address.   
+- Not-Taken: The branch will not occur, and execution continues sequentially.
+
+### Interface :
+
+#### Inputs:
+- `fetch_rdata_i` ([31:0], 32-bit): The fetched instruction data from the instruction memory or pipeline.
+- `fetch_pc_i` ([31:0], 32-bit): Program counter (PC) value of the fetched instruction.
+- `fetch_valid_i` (1-bit): Active HIGH Indicates the validity of the fetched instruction.
+
+#### Outputs:
+- `predict_branch_taken_o` (1-bit): Active HIGH indicates whether the branch or jump is predicted as taken.
+- `predict_branch_pc_o` ([31:0], 32-bit): Predicted target address for a taken branch or jump instruction
+
+### Internal registers and parameters:
+
+#### Localparams :
+ -  OPCODE_BRANCH = 7'h63
+ -  OPCODE_JAL          = 7'h6F;
+ -  OPCODE_JALR       = 7'h67;
+
+#### Immediate:
+- `imm_j_type` ([31:0], 32-bit): Immediate for uncompressed jump (JAL) instructions, sign-extended.
+- `imm_b_type` ([31:0], 32-bit): Immediate for uncompressed branch instructions, sign-extended.
+- `imm_cj_type` ([31:0], 32-bit): Immediate for compressed jump instructions, sign-extended.
+- `imm_cb_type` ([31:0], 32-bit): Immediate for compressed branch instructions, sign-extended.
+- `branch_imm` ([31:0], 32-bit): One of the immediate values: `imm_j_type` or `imm_b_type` or `imm_cj_type` or `imm_cb_type`.
+
+### Signals and Logic :
+#### Control Signals:
+- `instr` ([31:0], 32-bit): Alias for the input `fetch_rdata_i` to simplify the code.
+- `instr_j`, `instr_b`, `instr_cj`, `instr_cb` (1-bit each): Signals to identify specific branch or jump types in compressed and uncompressed formats.
+- `instr_b_taken` (1-bit): Indicates whether an uncompressed or compressed branch offset is negative, implying that the branch is taken.
+
+**Instantiation** :
+The testbench instantiates the `static_branch_predict` module as `uut` and connects the signals between the module and the testbench. Each input and output from the `uut` is connected to its corresponding signal in the testbench.
+
+## **Input Generation and Validation**:
+- Stimulus: Several test cases must be applied to simulate various operations of the static branch predictor. These test cases should cover a range of scenarios, including branch instructions with positive and negative offsets, jump instructions (both JAL and JALR), compressed jump and branch instructions, as well as invalid fetch conditions and non‐branch operations. For each case, the relevant signals (`predict_branch_taken_o`, `predict_branch_pc_o`) have to be displayed immediately after the application of inputs (`fetch_rdata_i`, `fetch_pc_i`, `register_addr_i`, `fetch_valid_i`).
+
+- **Test Case 1: Branch taken, PC offset negative (B-type) [BEQ]**
+Test a BEQ instruction with a negative offset, expecting the branch to be taken with the target PC computed accordingly.
+
+- **Test Case 2: Branch taken, PC offset positive (B-type) [BEQ]**
+Test a BEQ instruction with a positive offset, ensuring correct branch prediction and target PC calculation for a forward branch.
+
+- **Test Case 3: Jump taken (J-type) with negative offset [JAL]**
+Apply a JAL instruction with a negative offset to validate that the jump is correctly predicted and the computed PC reflects a backward jump.
+
+- **Test Case 4: Jump taken (J-type) with positive offset [JAL]**
+Use a JAL instruction with a positive offset to verify the proper prediction of a forward jump with the correct target PC.
+
+- **Test Case 5: Jump with valid false (JAL)**
+Apply a JAL instruction with fetch_valid_i deasserted, ensuring that no branch prediction is produced.
+
+- **Test Case 6: Jump Register (JALR) taken with negative offset (reg = 0) [JALR]**
+Test a JALR instruction with a negative offset using a zero register operand to confirm correct target PC computation.
+
+- **Test Case 7: Jump Register (JALR) taken with positive offset (reg = 0) [JALR]**
+Test a JALR instruction with a positive offset using a zero register operand.
+
+- **Test Case 8: Jump Register (JALR) taken with negative offset (nonzero reg) [JALR]**
+Apply a JALR instruction with a negative offset using a nonzero register operand to exercise immediate addition.
+
+- **Test Case 9: Jump Register (JALR) taken with positive offset (nonzero reg) [JALR]**
+Apply a JALR instruction with a positive offset using a nonzero register operand to verify proper computation.
+
+- **Test Case 10: Jump Register (JALR) with valid false [JALR]**
+Test a JALR instruction with fetch_valid_i deasserted, ensuring no prediction is produced.
+
+- **Test Case 11: Compressed Jump taken (C.J) with positive offset [C.J]**
+Test a compressed jump instruction with encoding 3'b101 and bit12 = 0, yielding a positive immediate for jump target calculation.
+
+- **Test Case 12: Compressed Jump taken (C.J) with negative offset [C.J]**
+Test a compressed jump instruction with encoding 3'b001 and bit12 = 1, producing a negative immediate for a backward jump.
+
+- **Test Case 13: Compressed Branch not taken (C.BEQZ) with 3'b110 encoding [C.BEQZ]**
+Test a compressed branch instruction with encoding 3'b110 and bit12 = 0, expecting the branch not to be taken.
+
+- **Test Case 14: Compressed Branch taken (C.BEQZ) with 3'b110 encoding [C.BEQZ]**
+Test a compressed branch instruction with encoding 3'b110 and bit12 = 1, expecting the branch to be taken.
+
+- **Test Case 15: Compressed Branch not taken (C.BEQZ) with 3'b111 encoding [C.BEQZ]**
+Test a compressed branch instruction with encoding 3'b111 and bit12 = 0, ensuring the branch is not taken.
+
+- **Test Case 16: Compressed Branch taken (C.BEQZ) with 3'b111 encoding [C.BEQZ]**
+Test a compressed branch instruction with encoding 3'b111 and bit12 = 1, expecting the branch to be taken.
+
+- **Test Case 17: Default non‐branch (zero instruction)**
+Apply an all‑zeros instruction to verify that no branch or jump is predicted.
+
+- **Test Case 18: Default non‐branch (random instruction)**
+Apply a random non‑branch instruction, confirming that the predictor remains inactive.
+
+- **Test Case 19: Default non‐branch with valid false**
+Apply a non‑branch instruction with 1fetch_valid_i1 deasserted, ensuring no prediction occurs.
+
+- **Test Case 20: Default non‐branch (all ones)**
+Apply an instruction of all ones, verifying default non‑branch behavior.
+
+- **Test Case 21: Default non‐branch (instruction with lower 2 bits ≠ 01)**
+Test an instruction that does not meet the compressed instruction format, confirming non‑branch operation.
+
+- **Test Case 22: Default non‐branch (random pattern)**
+Apply a random instruction that does not correspond to any branch or jump, ensuring default behavior.
+
+- **Test Case 23: Default non‐branch (random pattern with valid false)**
+Apply a random non‑branch instruction with fetch_valid_i deasserted.
+
+- **Test Case 24: Custom JAL with positive immediate [JAL custom]**
+Test a custom JAL instruction with a positive immediate (with instr[31] = 0) to verify proper immediate generation.
+
+- **Test Case 25: Custom JAL with negative immediate [JAL custom]**
+Test a custom JAL instruction with a negative immediate (with instr[31] = 1).
+
+- **Test Case 26: Custom JALR with positive immediate [JALR custom]**
+Test a custom JALR instruction with a positive immediate (with instr[31] = 0).
+
+- **Test Case 27: Custom JALR with negative immediate [JALR custom]**
+Test a custom JALR instruction with a negative immediate (with instr[31] = 1).
+
+- **Test Case 28: Custom BEQ with positive offset [BEQ custom]**
+Test a custom BEQ instruction with a positive offset (with instr[31] = 0) to verify correct prediction.
+
+- **Test Case 29: Custom BEQ with negative offset [BEQ custom]**
+Test a custom BEQ instruction with a negative offset (with instr[31] = 1).
+
+- **Test Case 30: Custom Compressed Jump with varied immediate [CJ custom]**
+Test a custom compressed jump instruction (CJ) with varied immediate fields (using encoding 3'b101).
+
+- **Test Case 31: Custom Compressed Branch taken [CB custom]**
+Test a custom compressed branch instruction (CB) with encoding 3'b110 and bit12 = 1, expecting the branch to be taken.
+
+- **Test Case 32: Custom Compressed Branch not taken [CB custom]**
+Test a custom compressed branch instruction (CB) with encoding 3'b110 and bit12 = 0, expecting the branch not to be taken.
+
+- **Test Case 33: JALR with large register operand**
+Test a JALR instruction with a large register operand to exercise potential arithmetic overflow in immediate addition.
+
+- **Test Case 34: Default non‐branch (pattern with lower 2 bits ≠ 01)**
+Apply a default instruction pattern where the lower two bits are not 01, confirming non‑branch operation.
+
+- **Test Case 35: JALR with nonzero register and valid false**
+Test a JALR instruction with a nonzero register operand but with fetch_valid_i deasserted, ensuring no prediction is produced.
+
+- **Test Case 36: Default case with non‑matching compressed encoding**
+Apply an instruction with lower 2 bits equal to 01 and bits [15:13] that do not match any CJ or CB encoding, thereby exercising the default branch in the case statement.
+
+- **Test Case 37: JALR with register operand causing potential overflow**
+Test a JALR instruction with a register operand that may cause arithmetic overflow during the immediate addition.
+
+- **Test Case 38: JALR with positive offset and register causing overflow**
+Test a JALR instruction with a positive offset and a register value that leads to overflow in addition.
+
+- **Test Case 39: Custom JAL with varied immediate fields**
+Test a custom JAL instruction specifically constructed to exercise the full concatenation of the JAL immediate fields.
+
+- **Test Case 40: JALR with negative register operand**
+Test a JALR instruction with a negative (two’s complement) register operand to further verify the immediate addition in JALR.
+
+- **Test Case 41: BEQ with valid false**
+Apply a BEQ instruction with fetch_valid_i deasserted to ensure that even a branch instruction is suppressed.
+
+- **Test Case 42: Compressed Branch with valid false**
+Apply a compressed branch instruction (CB) with fetch_valid_i deasserted, ensuring no branch prediction is produced.
+
+- **Test Case 43: Default branch (non‑matching compressed encoding)**
+Test an instruction with lower 2 bits equal to 01 and bits [15:13] equal to 000—which does not match any CJ or CB encoding—ensuring that the default branch in the case statement is exercised.
+
+- **Test Case 44: JALR with minimal nonzero register operand**
+Test a JALR instruction with a minimal nonzero register operand to confirm proper handling of small register values.
+
+- **Test Case 45: Compressed Jump taken (C.J) with negative offset [C.J]**
+Test a compressed jump instruction with encoding 3'b101 and bit12 = 1, forcing a negative immediate for a backward jump.
+
+- **Test Case 46: Custom Compressed Branch with unique immediate fields**
+Test a custom compressed branch (CB) instruction with unique immediate field settings to exercise additional bit slices in CB decoding.
+
+- **Test Case 47: Custom Compressed Jump with unique immediate fields**
+Test a custom compressed jump (CJ) instruction with unique immediate field values to cover remaining combinational logic in CJ decoding.
+
+- **Test Case 48: Custom Compressed Jump with unique immediate fields (CJ)**
+Test a custom compressed jump (CJ) instruction—crafted from a 16‐bit pattern (0x2D6D extended to 32 bits)—that specifically sets the lower 2 bits to 01, bits [15:13] to 001, and forces distinct values in bits [12], [11], [10:9], [8], and the lower nibble.
+
+
+## Module Functionality: 
+#### Combinational Logic
+- `Immediate Extraction`: The immediate branches and jumps are extracted from the instruction, with an appropriate sign extension based on the instruction type.
+- `Instruction Type Decoding`: Decodes whether the instruction is an uncompressed branch (instr_b), an uncompressed jump (instr_j), a compressed branch (instr_cb), or a compressed jump (instr_cj) based on opcode and bit patterns.
+- `Target Address Calculation`: Determines the branch offset and computes the target PC for the predicted branch or jump.
+
+#### Branch Prediction:
+
+-  `Uncompressed Branch/Jump Detection`: Detection of uncompressed instructions (JAL, JALR, BXXX) uses opcode
+   matching to identify the instruction type.
+
+- `Compressed Branch/Jump Detection`: Compressed branch/jump instructions (C.J, C.JAL, C.BEQZ, C.BNEZ) are provided
+  in their 32-bit uncompressed form. This module directly uses opcodes and fields from the uncompressed equivalent
+  to determine the offset and perform the prediction.
+  
+- `Offset-Based Prediction ': Branches are predicted as taken if the offset is negative. These predictions are assigned to 
+   the signal `instr_b_taken`.
+
+
+#### Branch or Jump Prediction:
+
+- For jumps (`instr_j`, `instr_cj`), the module always predicts the instruction as taken.
+- For branches, the module uses the `instr_b_taken` signal to decide.
+
+#### Output Prediction Logic:
+
+- `predict_branch_taken_o` is asserted(active-high) if the instruction is predicted to be taken.
+- `predict_branch_pc_o` is calculated by adding `fetch_pc_i` to `branch_imm`, giving the predicted target address.

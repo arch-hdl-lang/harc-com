@@ -1,0 +1,35 @@
+Create a testbench to generate stimulus for the `bcd_adder` module, which performs Binary Coded Decimal (BCD) addition on two 4-bit inputs, a and b. 
+
+## Testbench Description
+
+### Inputs
+- Registers: a and b are 4-bit registers that provide the two BCD numbers to be added.
+
+### Outputs
+- The outputs from the BCD adder include a 4-bit sum (`sum`) and a carry-out signal (`cout`).
+
+### Instantiation
+- The bcd_adder module is instantiated as uut, with the input and output signals connected for testing.
+
+## Input Generation 
+- Input Data Generation: The testbench generates all possible combinations of a and b in the range from 0 to 9 (since the inputs are BCD digits).
+
+---
+Follows the specification for building the RTL of the module, use it as a reference for the verification environment too:
+
+### Inputs
+- [3:0] a: 4-bit input representing a BCD value.
+- [3:0] b: 4-bit input representing another BCD value.
+
+### Outputs
+- [3:0] sum: 4-bit output representing the BCD-corrected sum of `a` and `b`.
+- cout: Single-bit output indicating if a carry is generated during the BCD addition.
+
+---
+### Design Description
+The `bcd_adder` module performs Binary Coded Decimal (BCD) addition. It consists of three primary blocks:
+
+1. **Binary Adder:** A 4-bit binary adder calculates the intermediate sum (`binary_sum`) and carry (`binary_cout`).
+2. **Logic Block:** Detects whether BCD correction is needed based on the upper bits of the intermediate binary sum.
+3. **BCD Correction:** If correction is required, adds 6 to the intermediate sum to produce the final BCD-corrected output.
+

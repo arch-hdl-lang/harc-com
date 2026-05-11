@@ -1,0 +1,16 @@
+{
+  "id": "cvdp_copilot_decode_firstbit_0017",
+  "categories": [
+    "cid012",
+    "medium"
+  ],
+  "top_module": "cvdp_copilot_decode_firstbit_top",
+  "dut_module": "cvdp_copilot_decode_firstbit",
+  "target_coverage": 90,
+  "auto_wrapper": "cvdp_copilot_decode_firstbit_top.sv",
+  "n_ports": 7,
+  "clock_inputs": [
+    "Clk"
+  ],
+  "multi_clock": false
+}

@@ -1,0 +1,14 @@
+{
+  "id": "cvdp_copilot_nbit_swizzling_0009",
+  "categories": [
+    "cid012",
+    "easy"
+  ],
+  "top_module": "nbit_swizzling_top",
+  "dut_module": "nbit_swizzling",
+  "target_coverage": 100,
+  "auto_wrapper": "nbit_swizzling_top.sv",
+  "n_ports": 3,
+  "clock_inputs": [],
+  "multi_clock": false
+}

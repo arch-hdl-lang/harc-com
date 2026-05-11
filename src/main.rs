@@ -280,6 +280,23 @@ fn run_verilator(
     let mut args: Vec<String> = vec![
         "--cc".into(), "--exe".into(), "--build".into(),
         "-Wno-fatal".into(), "-Wno-WIDTH".into(),
+        // Tolerate SV quirks Xcelium accepts but Verilator escalates:
+        //   BLKANDNBLK — same variable written by `=` in one block
+        //                and `<=` in another. Common in CVDP DUTs
+        //                (e.g. resets via `=` + clocked updates via
+        //                `<=` on the same reg).
+        //   UNOPTFLAT  — combinational signal in an `always_comb`
+        //                that Verilator's optimizer flags as
+        //                potentially looped (false positive on most
+        //                CVDP DUTs).
+        "-Wno-BLKANDNBLK".into(), "-Wno-UNOPTFLAT".into(),
+        // Cycle-based TBs don't need delay semantics; tell Verilator
+        // to elide `#N` delay statements rather than refusing to
+        // elaborate. HARC's `wait N cycles` is always cycle-based
+        // (handled by the runtime scheduler) — delays inside a DUT
+        // are a property of the DUT author, not the TB, and CVDP
+        // coverage scoring ignores delay semantics too.
+        "--no-timing".into(),
         "--top-module".into(), top.into(),
         "--Mdir".into(), mdir.display().to_string(),
     ];
