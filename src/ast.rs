@@ -124,6 +124,7 @@ pub struct PackageDecl {
     pub items: Vec<Item>,
     pub span: Span,
     pub doc: Option<String>,
+    pub inner_doc: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +165,10 @@ pub struct StructDecl {
     pub fields: Vec<Field>,
     pub span: Span,
     pub doc: Option<String>,
+    /// `//!` lines immediately after the opening `struct <Name>` and
+    /// before the first field. Documents the struct from the inside —
+    /// useful for type-level invariants or spec-link annotations.
+    pub inner_doc: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +188,7 @@ pub struct TransactionDecl {
     pub body: Vec<TxnBodyItem>,
     pub span: Span,
     pub doc: Option<String>,
+    pub inner_doc: Option<String>,
 }
 
 /// Items that may appear inside a transaction body or an `extend` block.
@@ -269,6 +275,7 @@ pub struct TseqDecl {
     pub body: Block,
     pub span: Span,
     pub doc: Option<String>,
+    pub inner_doc: Option<String>,
 }
 
 // ── Component declarations (agent, env, scoreboard, sequencer)
@@ -313,6 +320,7 @@ pub struct ComponentDecl {
     pub items: Vec<ComponentItem>,
     pub span: Span,
     pub doc: Option<String>,
+    pub inner_doc: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -407,6 +415,7 @@ pub struct TransactorDecl {
     pub when_active: Option<Vec<ComponentItem>>,
     pub span: Span,
     pub doc: Option<String>,
+    pub inner_doc: Option<String>,
 }
 
 // ── Test and scope (§7.2) ─────────────────────────────────────────────────────
@@ -418,6 +427,7 @@ pub struct TestDecl {
     pub items: Vec<TestItem>,
     pub span: Span,
     pub doc: Option<String>,
+    pub inner_doc: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -488,6 +498,7 @@ pub struct ImplDecl {
     pub items: Vec<ImplItem>,
     pub span: Span,
     pub doc: Option<String>,
+    pub inner_doc: Option<String>,
 }
 
 /// A single body item inside an `impl <target> for <TestName>` block.
@@ -520,6 +531,7 @@ pub struct ExtendDecl {
     pub body: ExtendBody,
     pub span: Span,
     pub doc: Option<String>,
+    pub inner_doc: Option<String>,
 }
 
 /// Body of an `extend` block. The shape depends on what's being extended.
@@ -548,6 +560,7 @@ pub struct CovergroupDecl {
     pub items: Vec<CoverItem>,
     pub span: Span,
     pub doc: Option<String>,
+    pub inner_doc: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -586,6 +599,7 @@ pub struct PropertyDecl {
     pub body: Expr,
     pub span: Span,
     pub doc: Option<String>,
+    pub inner_doc: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -595,6 +609,7 @@ pub struct PseqDecl {
     pub body: Expr,
     pub span: Span,
     pub doc: Option<String>,
+    pub inner_doc: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -603,6 +618,7 @@ pub struct CoverSequenceDecl {
     pub pattern: Expr,
     pub span: Span,
     pub doc: Option<String>,
+    pub inner_doc: Option<String>,
 }
 
 // ── Bus (§19 — protocol-typed signal bundle) ──────────────────────────────────
@@ -626,6 +642,7 @@ pub struct BusDecl {
     pub handshakes: Vec<HandshakeChannel>,
     pub span: Span,
     pub doc: Option<String>,
+    pub inner_doc: Option<String>,
 }
 
 /// One plain signal inside a `bus` body. Direction is from the
@@ -689,6 +706,7 @@ pub struct FunctionDecl {
     pub body: Block,
     pub span: Span,
     pub doc: Option<String>,
+    pub inner_doc: Option<String>,
 }
 
 // ── Generic parameters / function parameters ──────────────────────────────────
@@ -1136,6 +1154,9 @@ pub trait Construct {
 
 /// Implement `Construct` for a `*Decl` with the canonical
 /// `name: Ident`, `span: Span`, `doc: Option<String>` fields.
+/// Pass `+inner` when the `*Decl` also carries
+/// `pub inner_doc: Option<String>`; omit otherwise and the slot
+/// returns `None` via the trait default.
 macro_rules! impl_construct_direct {
     ($ty:ty, $label:expr) => {
         impl Construct for $ty {
@@ -1145,25 +1166,34 @@ macro_rules! impl_construct_direct {
             fn doc(&self) -> Option<&str> { self.doc.as_deref() }
         }
     };
+    ($ty:ty, $label:expr, +inner) => {
+        impl Construct for $ty {
+            fn kind_label(&self) -> &'static str { $label }
+            fn name(&self) -> &Ident { &self.name }
+            fn span(&self) -> Span { self.span }
+            fn doc(&self) -> Option<&str> { self.doc.as_deref() }
+            fn inner_doc(&self) -> Option<&str> { self.inner_doc.as_deref() }
+        }
+    };
 }
 
-impl_construct_direct!(PackageDecl, "package");
+impl_construct_direct!(PackageDecl, "package", +inner);
 impl_construct_direct!(ConstDecl, "const");
 impl_construct_direct!(DomainDecl, "domain");
-impl_construct_direct!(StructDecl, "struct");
+impl_construct_direct!(StructDecl, "struct", +inner);
 impl_construct_direct!(EnumDecl, "enum");
-impl_construct_direct!(TransactionDecl, "transaction");
+impl_construct_direct!(TransactionDecl, "transaction", +inner);
 impl_construct_direct!(RelationDecl, "relation");
-impl_construct_direct!(TseqDecl, "tseq");
-impl_construct_direct!(TransactorDecl, "transactor");
-impl_construct_direct!(TestDecl, "test");
-impl_construct_direct!(CovergroupDecl, "covergroup");
-impl_construct_direct!(PropertyDecl, "property");
-impl_construct_direct!(PseqDecl, "pseq");
-impl_construct_direct!(CoverSequenceDecl, "cover_sequence");
-impl_construct_direct!(BusDecl, "bus");
+impl_construct_direct!(TseqDecl, "tseq", +inner);
+impl_construct_direct!(TransactorDecl, "transactor", +inner);
+impl_construct_direct!(TestDecl, "test", +inner);
+impl_construct_direct!(CovergroupDecl, "covergroup", +inner);
+impl_construct_direct!(PropertyDecl, "property", +inner);
+impl_construct_direct!(PseqDecl, "pseq", +inner);
+impl_construct_direct!(CoverSequenceDecl, "cover_sequence", +inner);
+impl_construct_direct!(BusDecl, "bus", +inner);
 impl_construct_direct!(ExternalModuleDecl, "module");
-impl_construct_direct!(FunctionDecl, "function");
+impl_construct_direct!(FunctionDecl, "function", +inner);
 
 // `agent` / `env` / `scoreboard` / `sequencer` share `ComponentDecl`;
 // the kind_label varies. Implemented manually so `kind` selects the
@@ -1187,6 +1217,7 @@ impl Construct for ComponentDecl {
     fn name(&self) -> &Ident { &self.name }
     fn span(&self) -> Span { self.span }
     fn doc(&self) -> Option<&str> { self.doc.as_deref() }
+    fn inner_doc(&self) -> Option<&str> { self.inner_doc.as_deref() }
 }
 
 // `use foo.bar.Baz` — Construct uses the last path segment as the
@@ -1236,6 +1267,7 @@ impl Construct for ExtendDecl {
     }
     fn span(&self) -> Span { self.span }
     fn doc(&self) -> Option<&str> { self.doc.as_deref() }
+    fn inner_doc(&self) -> Option<&str> { self.inner_doc.as_deref() }
 }
 
 // `apply Foo.Bar` — no name, no doc. Synthesize an empty name and
@@ -1267,6 +1299,7 @@ impl Construct for ImplDecl {
     fn name(&self) -> &Ident { &self.test_name }
     fn span(&self) -> Span { self.span }
     fn doc(&self) -> Option<&str> { self.doc.as_deref() }
+    fn inner_doc(&self) -> Option<&str> { self.inner_doc.as_deref() }
 }
 
 impl Item {

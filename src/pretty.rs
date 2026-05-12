@@ -40,6 +40,18 @@ fn print_doc(out: &mut String, doc: &Option<String>, depth: usize) {
     }
 }
 
+/// Print a per-construct `inner_doc` block — `//!` lines that came in
+/// after the opening keyword + name and before the first body item.
+/// Round-trips against `consume_inner_doc` in the parser.
+fn print_inner_doc(out: &mut String, doc: &Option<String>, depth: usize) {
+    if let Some(d) = doc {
+        for line in d.split('\n') {
+            pad(out, depth);
+            writeln!(out, "//! {line}").ok();
+        }
+    }
+}
+
 fn print_item(out: &mut String, item: &Item, depth: usize) {
     match item {
         Item::Use(u) => {
@@ -53,6 +65,7 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
             print_doc(out, &p.doc, depth);
             pad(out, depth);
             writeln!(out, "package {}", p.name.name).ok();
+            print_inner_doc(out, &p.inner_doc, depth + 1);
             for (i, it) in p.items.iter().enumerate() {
                 if i > 0 { writeln!(out).ok(); }
                 print_item(out, it, depth + 1);
@@ -89,6 +102,7 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
             print_doc(out, &s.doc, depth);
             pad(out, depth);
             writeln!(out, "struct {}", s.name.name).ok();
+            print_inner_doc(out, &s.inner_doc, depth + 1);
             for f in &s.fields {
                 print_field(out, f, depth + 1);
             }
@@ -111,6 +125,7 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
             write!(out, "transaction {}", t.name.name).ok();
             print_generic_params(out, &t.params);
             writeln!(out).ok();
+            print_inner_doc(out, &t.inner_doc, depth + 1);
             for it in &t.body {
                 print_txn_body_item(out, it, depth + 1);
             }
@@ -152,6 +167,7 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
                 print_type(out, rt);
             }
             writeln!(out).ok();
+            print_inner_doc(out, &t.inner_doc, depth + 1);
             print_block_inner(out, &t.body, depth + 1);
             pad(out, depth);
             writeln!(out, "end tseq {}", t.name.name).ok();
@@ -163,6 +179,7 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
             print_doc(out, &i.doc, depth);
             pad(out, depth);
             writeln!(out, "impl {} for {}", i.target.name, i.test_name.name).ok();
+            print_inner_doc(out, &i.inner_doc, depth + 1);
             for it in &i.items {
                 match it {
                     ImplItem::Setup(b) => {
@@ -213,6 +230,7 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
                 print_paren_params(out, &t.params);
             }
             writeln!(out).ok();
+            print_inner_doc(out, &t.inner_doc, depth + 1);
             for it in &t.items {
                 print_test_item(out, it, depth + 1);
             }
@@ -225,6 +243,7 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
             write!(out, "extend ").ok();
             print_path(out, &e.target);
             writeln!(out).ok();
+            print_inner_doc(out, &e.inner_doc, depth + 1);
             match &e.body {
                 ExtendBody::TxnLike(items) => {
                     for it in items {
@@ -257,6 +276,7 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
                 write!(out, ")").ok();
             }
             writeln!(out).ok();
+            print_inner_doc(out, &g.inner_doc, depth + 1);
             for it in &g.items {
                 print_cover_item(out, it, depth + 1);
             }
@@ -271,6 +291,7 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
                 print_paren_params(out, &p.params);
             }
             writeln!(out).ok();
+            print_inner_doc(out, &p.inner_doc, depth + 1);
             pad(out, depth + 1);
             print_expr(out, &p.body);
             writeln!(out).ok();
@@ -285,6 +306,7 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
                 print_paren_params(out, &p.params);
             }
             writeln!(out).ok();
+            print_inner_doc(out, &p.inner_doc, depth + 1);
             pad(out, depth + 1);
             print_expr(out, &p.body);
             writeln!(out).ok();
@@ -292,11 +314,26 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
             writeln!(out, "end pseq {}", p.name.name).ok();
         }
         Item::CoverSequence(c) => {
+            // `cover sequence Name = expr` is a single-line construct.
+            // When `inner_doc` is present, split onto a multi-line form
+            // (`cover sequence Name\n  //! ...\n  = expr`) so the
+            // parser can re-attach the `//!` to its `consume_inner_doc()`
+            // slot between Name and `=`.
             print_doc(out, &c.doc, depth);
-            pad(out, depth);
-            write!(out, "cover sequence {} = ", c.name.name).ok();
-            print_expr(out, &c.pattern);
-            writeln!(out).ok();
+            if c.inner_doc.is_some() {
+                pad(out, depth);
+                writeln!(out, "cover sequence {}", c.name.name).ok();
+                print_inner_doc(out, &c.inner_doc, depth + 1);
+                pad(out, depth + 1);
+                write!(out, "= ").ok();
+                print_expr(out, &c.pattern);
+                writeln!(out).ok();
+            } else {
+                pad(out, depth);
+                write!(out, "cover sequence {} = ", c.name.name).ok();
+                print_expr(out, &c.pattern);
+                writeln!(out).ok();
+            }
         }
         Item::ExternalModule(m) => {
             print_doc(out, &m.doc, depth);
@@ -321,6 +358,7 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
                 print_type(out, rt);
             }
             writeln!(out).ok();
+            print_inner_doc(out, &f.inner_doc, depth + 1);
             print_block_inner(out, &f.body, depth + 1);
             pad(out, depth);
             writeln!(out, "end function {}", f.name.name).ok();
@@ -339,6 +377,7 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
                 print_paren_params(out, &b.params);
             }
             writeln!(out).ok();
+            print_inner_doc(out, &b.inner_doc, depth + 1);
             for s in &b.signals {
                 pad(out, depth + 1);
                 let dir = match s.direction {
@@ -387,6 +426,7 @@ fn print_transactor(out: &mut String, t: &TransactorDecl, depth: usize) {
         print_type(out, b);
     }
     writeln!(out).ok();
+    print_inner_doc(out, &t.inner_doc, depth + 1);
     for it in &t.items {
         print_component_item(out, it, depth + 1);
     }
@@ -413,6 +453,7 @@ fn print_component(out: &mut String, c: &ComponentDecl, depth: usize) {
         print_type(out, b);
     }
     writeln!(out).ok();
+    print_inner_doc(out, &c.inner_doc, depth + 1);
     for it in &c.items {
         print_component_item(out, it, depth + 1);
     }

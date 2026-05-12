@@ -221,9 +221,33 @@ transactor AxiWrXactor
 end transactor AxiWrXactor
 ```
 
-(Per-construct inner-doc — `//!` immediately after the opening
-keyword + name — is reserved syntax in v0; not yet captured by
-codegen. Use `///` outside the construct for now.)
+**Per-construct inner doc.** A `//!` run **immediately after** a
+construct's opening keyword (+ name + params + `bound to` clause,
+where applicable) and **before** the first body item attaches to that
+construct's `inner_doc` field. Documents the construct *from the
+inside* — useful for invariants, internal-state notes, or spec
+references that wouldn't sensibly hang off the opening line:
+
+```harc
+transactor AxiWrXactor
+    //! Active half drives the AW/W/B handshake; passive half
+    //! observes for the scoreboard. Both halves share the
+    //! pending-id queue declared below.
+    dut : AxiSlave
+    pending : queue<uint<4>>
+    ...
+end transactor AxiWrXactor
+```
+
+Covered constructs (any `Item::*` variant with a body):
+`package` / `struct` / `transaction` / `tseq` / `agent` / `env` /
+`scoreboard` / `sequencer` / `transactor` / `test` / `impl` /
+`extend` / `covergroup` / `property` / `pseq` / `cover sequence` /
+`bus` / `function`.
+
+Inner-doc text shows up under `Construct::inner_doc()` and feeds the
+feature harvester's `src_after` field, so `harc advise --feature
+<query>` finds it.
 
 ### 2.5.3 `//! ---` YAML frontmatter
 
