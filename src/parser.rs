@@ -307,12 +307,13 @@ impl Parser {
     fn parse_package(&mut self, doc: Option<String>) -> Result<PackageDecl, CompileError> {
         let start = self.expect(TokenKind::Package)?.span;
         let name = self.expect_ident()?;
+        let inner_doc = self.consume_inner_doc();
         let mut items = Vec::new();
         while !self.check_end_keyword() {
             items.push(self.parse_item()?);
         }
         let end = self.expect_end(TokenKind::Package, &name.name)?;
-        Ok(PackageDecl { name, items, span: start.merge(end), doc })
+        Ok(PackageDecl { name, items, span: start.merge(end), doc, inner_doc })
     }
 
     fn parse_domain(&mut self, doc: Option<String>) -> Result<DomainDecl, CompileError> {
@@ -349,13 +350,14 @@ impl Parser {
     fn parse_struct(&mut self, doc: Option<String>) -> Result<StructDecl, CompileError> {
         let start = self.expect(TokenKind::Struct)?.span;
         let name = self.expect_ident()?;
+        let inner_doc = self.consume_inner_doc();
         let mut fields = Vec::new();
         while !self.check_end_keyword() {
             let f_doc = self.consume_outer_doc();
             fields.push(self.parse_field(f_doc)?);
         }
         let end = self.expect_end(TokenKind::Struct, &name.name)?;
-        Ok(StructDecl { name, fields, span: start.merge(end), doc })
+        Ok(StructDecl { name, fields, span: start.merge(end), doc, inner_doc })
     }
 
     fn parse_enum(&mut self, doc: Option<String>) -> Result<EnumDecl, CompileError> {
@@ -381,9 +383,10 @@ impl Parser {
         let start = self.expect(TokenKind::Transaction)?.span;
         let name = self.expect_ident()?;
         let params = self.parse_optional_generic_params()?;
+        let inner_doc = self.consume_inner_doc();
         let body = self.parse_txn_body_until_end()?;
         let end = self.expect_end(TokenKind::Transaction, &name.name)?;
-        Ok(TransactionDecl { name, params, body, span: start.merge(end), doc })
+        Ok(TransactionDecl { name, params, body, span: start.merge(end), doc, inner_doc })
     }
 
     fn parse_txn_body_until_end(&mut self) -> Result<Vec<TxnBodyItem>, CompileError> {
@@ -612,12 +615,13 @@ impl Parser {
         } else {
             None
         };
+        let inner_doc = self.consume_inner_doc();
         // Body is a normal block, terminated by `end tseq Name`.
         let body_start = self.peek_span();
         let stmts = self.parse_stmt_list_until_end()?;
         let end = self.expect_end(TokenKind::Tseq, &name.name)?;
         let body = Block { stmts, span: body_start.merge(end) };
-        Ok(TseqDecl { name, params, return_ty, body, span: start.merge(end), doc })
+        Ok(TseqDecl { name, params, return_ty, body, span: start.merge(end), doc, inner_doc })
     }
 
     // ── Component declarations ────────────────────────────────────────────────
@@ -643,12 +647,13 @@ impl Parser {
         } else {
             None
         };
+        let inner_doc = self.consume_inner_doc();
         let mut items = Vec::new();
         while !self.check_end_keyword() {
             items.push(self.parse_component_item()?);
         }
         let end = self.expect_end(start_kw, &name.name)?;
-        Ok(ComponentDecl { kind, name, params, bound_to, items, span: start.merge(end), doc })
+        Ok(ComponentDecl { kind, name, params, bound_to, items, span: start.merge(end), doc, inner_doc })
     }
 
     fn parse_component_item(&mut self) -> Result<ComponentItem, CompileError> {
@@ -678,6 +683,7 @@ impl Parser {
         } else {
             None
         };
+        let inner_doc = self.consume_inner_doc();
 
         // Body: items in any order; at most one `when active` block.
         // Active-block items are collected separately so codegen can
@@ -720,6 +726,7 @@ impl Parser {
             when_active,
             span: start.merge(end),
             doc,
+            inner_doc,
         })
     }
 
@@ -856,12 +863,13 @@ impl Parser {
         } else {
             Vec::new()
         };
+        let inner_doc = self.consume_inner_doc();
         let mut items = Vec::new();
         while !self.check_end_keyword() {
             items.push(self.parse_test_item()?);
         }
         let end = self.expect_end(TokenKind::Test, &name.name)?;
-        Ok(TestDecl { name, params, items, span: start.merge(end), doc })
+        Ok(TestDecl { name, params, items, span: start.merge(end), doc, inner_doc })
     }
 
     fn parse_test_item(&mut self) -> Result<TestItem, CompileError> {
@@ -924,6 +932,7 @@ impl Parser {
         let target = self.expect_ident()?;
         self.expect(TokenKind::For)?;
         let test_name = self.expect_ident()?;
+        let inner_doc = self.consume_inner_doc();
         let mut items = Vec::new();
         while !self.check_end_keyword() {
             match self.peek_kind() {
@@ -978,6 +987,7 @@ impl Parser {
             items,
             span: start.merge(end),
             doc,
+            inner_doc,
         })
     }
 
@@ -986,6 +996,7 @@ impl Parser {
     fn parse_extend(&mut self, doc: Option<String>) -> Result<ExtendDecl, CompileError> {
         let start = self.expect(TokenKind::Extend)?.span;
         let target = self.parse_dotted_path()?;
+        let inner_doc = self.consume_inner_doc();
         // Pick the body grammar from the first body token. Test-style extends
         // start with `scope`/`apply`/`use`; component-style start with
         // `connect`/`on`/`hookable`; everything else is txn/struct-style. All
@@ -1033,7 +1044,7 @@ impl Parser {
         }
         let _close_path = self.parse_dotted_path()?;
         let span = start.merge(end_tok.span);
-        Ok(ExtendDecl { target, body, span, doc })
+        Ok(ExtendDecl { target, body, span, doc, inner_doc })
     }
 
     // ── Covergroup ────────────────────────────────────────────────────────────
@@ -1063,12 +1074,13 @@ impl Parser {
         } else {
             None
         };
+        let inner_doc = self.consume_inner_doc();
         let mut items = Vec::new();
         while !self.check_end_keyword() {
             items.push(self.parse_cover_item()?);
         }
         let end = self.expect_end(TokenKind::Covergroup, &name.name)?;
-        Ok(CovergroupDecl { name, clocking, items, span: start.merge(end), doc })
+        Ok(CovergroupDecl { name, clocking, items, span: start.merge(end), doc, inner_doc })
     }
 
     fn parse_cover_item(&mut self) -> Result<CoverItem, CompileError> {
@@ -1124,9 +1136,10 @@ impl Parser {
         } else {
             Vec::new()
         };
+        let inner_doc = self.consume_inner_doc();
         let body = self.parse_expr()?;
         let end = self.expect_end(TokenKind::Property, &name.name)?;
-        Ok(PropertyDecl { name, params, body, span: start.merge(end), doc })
+        Ok(PropertyDecl { name, params, body, span: start.merge(end), doc, inner_doc })
     }
 
     fn parse_pseq(&mut self, doc: Option<String>) -> Result<PseqDecl, CompileError> {
@@ -1138,19 +1151,21 @@ impl Parser {
         } else {
             Vec::new()
         };
+        let inner_doc = self.consume_inner_doc();
         let body = self.parse_expr()?;
         let end = self.expect_end(TokenKind::Pseq, &name.name)?;
-        Ok(PseqDecl { name, params, body, span: start.merge(end), doc })
+        Ok(PseqDecl { name, params, body, span: start.merge(end), doc, inner_doc })
     }
 
     fn parse_cover_sequence(&mut self, doc: Option<String>) -> Result<CoverSequenceDecl, CompileError> {
         let start = self.expect(TokenKind::Cover)?.span;
         self.expect(TokenKind::Sequence)?;
         let name = self.expect_ident()?;
+        let inner_doc = self.consume_inner_doc();
         self.expect(TokenKind::Eq)?;
         let pattern = self.parse_expr()?;
         let span = start.merge(pattern.span);
-        Ok(CoverSequenceDecl { name, pattern, span, doc })
+        Ok(CoverSequenceDecl { name, pattern, span, doc, inner_doc })
     }
 
     // ── External (Verilator-bound) module ─────────────────────────────────────
@@ -1164,6 +1179,7 @@ impl Parser {
     fn parse_bus(&mut self, doc: Option<String>) -> Result<BusDecl, CompileError> {
         let start = self.expect(TokenKind::Bus)?.span;
         let name = self.expect_ident()?;
+        let inner_doc = self.consume_inner_doc();
         let mut signals = Vec::new();
         let mut handshakes = Vec::new();
         while !self.check_end_keyword() {
@@ -1253,7 +1269,7 @@ impl Parser {
         let end = self.expect_end(TokenKind::Bus, &name.name)?;
         Ok(BusDecl {
             name, params: Vec::new(), signals, handshakes,
-            span: start.merge(end), doc,
+            span: start.merge(end), doc, inner_doc,
         })
     }
 
@@ -1286,10 +1302,11 @@ impl Parser {
         } else {
             None
         };
+        let inner_doc = self.consume_inner_doc();
         let body_start = self.peek_span();
         let stmts = self.parse_stmt_list_until_end()?;
         let end = self.expect_end(TokenKind::Function, &name.name)?;
-        Ok(FunctionDecl { name, params, return_ty, body: Block { stmts, span: body_start.merge(end) }, span: start.merge(end), doc })
+        Ok(FunctionDecl { name, params, return_ty, body: Block { stmts, span: body_start.merge(end) }, span: start.merge(end), doc, inner_doc })
     }
 
     // ── Generic / function parameters ─────────────────────────────────────────

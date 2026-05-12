@@ -245,3 +245,71 @@ end struct X
     assert!(parsed.frontmatter.is_none(),
         "expected no frontmatter when there's no `---` fence");
 }
+
+/// Per-construct inner doc (`//!` immediately after the opening
+/// keyword + name) attaches to the right `*Decl` AST field. Verified
+/// across construct kinds: struct, test, impl, transactor. Round-trips
+/// through the pretty-printer; the feature-harvester sees the prose
+/// via `Construct::inner_doc()`.
+#[test]
+fn per_construct_inner_doc_attaches_and_round_trips() {
+    let src = r#"
+struct AxiTxn
+    //! Per-bus AXI4 transaction — minimal subset.
+    //! Used by the AxiWrXactor active half.
+    addr : uint<32>
+end struct AxiTxn
+
+transactor AxiWrXactor
+    //! Active half drives valid/ready handshake; passive half
+    //! observes for the scoreboard.
+    dut : AxiSlave
+end transactor AxiWrXactor
+
+test SmokeTest
+    //! Smoke test — runs once and exits.
+    let dut : DummyDut
+end test SmokeTest
+
+impl sim for SmokeTest
+    //! Sim implementation — emits one log line.
+    run
+        log(info, "ok")
+    end run
+end impl SmokeTest
+"#;
+    let parsed = parse_source(src).expect("parse");
+    for item in &parsed.items {
+        let c = item.as_construct();
+        match c.kind_label() {
+            "struct" => {
+                let inner = c.inner_doc().expect("struct inner_doc populated");
+                assert!(inner.contains("Per-bus AXI4 transaction"));
+                assert!(inner.contains("AxiWrXactor active half"));
+            }
+            "transactor" => {
+                let inner = c.inner_doc().expect("transactor inner_doc populated");
+                assert!(inner.contains("Active half drives"));
+            }
+            "test" => {
+                let inner = c.inner_doc().expect("test inner_doc populated");
+                assert!(inner.contains("Smoke test"));
+            }
+            "impl" => {
+                let inner = c.inner_doc().expect("impl inner_doc populated");
+                assert!(inner.contains("Sim implementation"));
+            }
+            other => panic!("unexpected construct kind in test fixture: {other}"),
+        }
+    }
+    let printed = print(&parsed);
+    let reparsed = parse_source(&printed).expect("re-parse");
+    assert_eq!(parsed.items.len(), reparsed.items.len());
+    for (orig, again) in parsed.items.iter().zip(reparsed.items.iter()) {
+        assert_eq!(
+            orig.as_construct().inner_doc(),
+            again.as_construct().inner_doc(),
+            "inner_doc must round-trip identically"
+        );
+    }
+}
