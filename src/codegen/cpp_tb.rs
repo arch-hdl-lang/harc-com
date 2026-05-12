@@ -1177,6 +1177,7 @@ fn synth_component_from_transactor(t: &TransactorDecl, include_active: bool) -> 
         items,
         span: t.span,
         doc: t.doc.clone(),
+        inner_doc: t.inner_doc.clone(),
     }
 }
 
