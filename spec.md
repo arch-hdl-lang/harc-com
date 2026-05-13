@@ -1224,6 +1224,27 @@ end component AxiDriver
 
 ### 7.8 Activity tracking and idle predicates
 
+**The net win over UVM.** The single biggest improvement HARC ships over UVM is the test-termination diagnostic. When a UVM test hangs, the log says:
+
+```
+Drain time expired with 17 objections still raised.
+```
+
+…and the engineer starts a multi-hour archaeology dig through `raise_objection` / `drop_objection` calls scattered across the testbench source. When a HARC test hangs, the log says:
+
+```
+[cycle:10000 FAIL] watchdog: AxiDriver has been idle for >= 5000 cycles
+```
+
+— component name, the exact threshold, the cycle it tripped. No counter accounting to reconstruct. **That single line is the net win.** Sections 7.8–7.10 and 8.6 are the layered mechanism that produces it. The four sections, top to bottom:
+
+| Layer | Section | Contract |
+|---|---|---|
+| Foundation | **§7.8** (this section) | Every component carries auto-bumped `_last_in_cycle` / `_last_out_cycle` fields; `idle(N)` predicates read them |
+| User-facing wait | **§7.9** | `wait until <expr> [timeout N cycles fail("…")]` blocks until a positive predicate holds, fails with per-sub-predicate attribution on timeout |
+| Primitive | **§7.10** | `on <N> cycles … end on` periodic trigger — the low-frequency monitor pattern |
+| Declarative | **§8.6** | `watchdog` agent body item — one-line decl wires together periodic firing + idle check + diagnostic message |
+
 UVM's *objection mechanism* asks every component to vote on when the test is done. Components that forget to drop their objection hang the test; components that drop too eagerly truncate stimulus. The accounting is distributed across the test source, hidden behind macros, and only debuggable by tracing `set_drain_time` / `raise_objection` / `drop_objection` calls in execution order. HARC takes the opposite stance: instead of asking "has every component voted to stop?", it asks "has every component made progress recently?" — a positive predicate the framework can evaluate on demand.
 
 Every `transactor` / `agent` / `env` / `sequencer` / `scoreboard` carries two auto-injected fields:
@@ -1845,7 +1866,7 @@ This lets a tracing/profiling layer instrument every agent's watchdog without mo
 [cycle:10000 FAIL] watchdog: AxiDriver has been idle for >= 5000 cycles
 ```
 
-Combined with `wait until` per-predicate diagnostics (§7.9), a hung test surfaces with full attribution: which component, what threshold, exactly when. Compare with UVM's *"Drain time expired with N objections still raised"* and the multi-hour git-blame archaeology that follows it.
+Combined with `wait until` per-predicate diagnostics (§7.9), a hung test surfaces with full attribution: which component, what threshold, exactly when. This is the §7.8 *net win* materialized — the single log line that replaces UVM's `Drain time expired with N objections still raised` and the multi-hour archaeology that follows it. Where UVM tells you "something didn't drop its objection, figure it out," HARC names the component, the threshold, and the cycle.
 
 ---
 
