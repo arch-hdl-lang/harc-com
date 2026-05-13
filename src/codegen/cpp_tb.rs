@@ -269,7 +269,23 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         std::collections::HashMap::new();
     let mut txn_fields: std::collections::HashMap<String, Vec<TxnFieldInfo>> =
         std::collections::HashMap::new();
+    // Per-transaction `keep` constraints (spec §4 — "constraints are
+    // relations, not directives"). Collected here so `randomize(t)`
+    // and `randomize(t) with …` both route them through the Z3 solver
+    // path. Without this collection the keep blocks parse but emit
+    // zero C++, a silent footgun: `keep len in [1..256]` would
+    // randomize freely up to the field's full width.
+    let mut txn_keeps: std::collections::HashMap<String, Vec<Expr>> =
+        std::collections::HashMap::new();
     let mut enums = std::collections::HashMap::new();
+    // Global variant-name → index map. Used by the Z3 constraint
+    // translator to resolve bare `WRAP` / `INCR` / etc. into their
+    // numeric encoding. v0 assumes variant names are globally
+    // unique; collisions take the first-declared mapping (warned
+    // about in the parser if we add that). Maps to i64 so negative
+    // signed values fit naturally; the solver widens at use site.
+    let mut enum_variants: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
     for it in &file.items {
         match it {
             Item::Scoreboard(c) => {
@@ -310,8 +326,24 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                     _ => None,
                 }).collect();
                 txn_fields.insert(t.name.name.clone(), fields);
+                // Collect transaction-level `keep` constraints. v0
+                // ignores keeps nested inside `when subtype { ... }`
+                // — those need discriminated-subtype lowering that
+                // doesn't exist yet (see TODO in spec §3.3 / §4).
+                let keeps: Vec<Expr> = t.body.iter().filter_map(|it| match it {
+                    TxnBodyItem::Keep(k) => Some(k.expr.clone()),
+                    _ => None,
+                }).collect();
+                if !keeps.is_empty() {
+                    txn_keeps.insert(t.name.name.clone(), keeps);
+                }
             }
-            Item::Enum(e) => { enums.insert(e.name.name.clone(), e.variants.len()); }
+            Item::Enum(e) => {
+                enums.insert(e.name.name.clone(), e.variants.len());
+                for (i, v) in e.variants.iter().enumerate() {
+                    enum_variants.entry(v.name.clone()).or_insert(i as i64);
+                }
+            }
             _ => {}
         }
     }
@@ -367,6 +399,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         covergroups,
         txn_fields,
         enums,
+        enum_variants,
         properties,
         prop_subs: std::collections::HashMap::new(),
         event_types: std::collections::HashMap::new(),
@@ -383,6 +416,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         driver_bus_for_hookables: std::collections::HashMap::new(),
         transactors,
         current_component_instance: None,
+        txn_keeps,
     };
 
     // Header.
@@ -1232,6 +1266,12 @@ struct Emitter {
     /// before main-body emission so the solver block can declare Z3 vars
     /// of the right widths and walk only the fields it should write back.
     txn_fields: std::collections::HashMap<String, Vec<TxnFieldInfo>>,
+    /// Per-transaction `keep` constraints (spec §4). `randomize(t)`
+    /// — bare or with `with …` — merges these into the Z3 solver
+    /// block so the constraints are enforced. Empty entry / missing
+    /// key means the transaction has no `keep`s; bare `randomize(t)`
+    /// stays on the fast PRNG path.
+    txn_keeps: std::collections::HashMap<String, Vec<Expr>>,
     /// Identifiers that are emitted as Verilator-class pointers (`VFoo*`).
     /// Field access on these uses `->` instead of `.`. Populated from
     /// `let x : <NamedType>` declarations and from function parameters
@@ -1266,6 +1306,10 @@ struct Emitter {
     field_subs: std::collections::HashMap<String, String>,
     /// Enum name → variant count; used when randomizing enum-typed fields.
     enums: std::collections::HashMap<String, usize>,
+    /// Global enum-variant-name → numeric index. Used by the Z3
+    /// constraint translator to resolve bare references to enum
+    /// variants (e.g. `keep op != WRAP`) into their numeric encoding.
+    enum_variants: std::collections::HashMap<String, i64>,
     /// Property name → body expression. Populated up-front from
     /// `Item::Property` declarations so `assert property NAME` can be
     /// resolved at the call site without a separate pass.
@@ -3921,9 +3965,13 @@ impl Emitter {
                 }
             }
             ExprKind::Ident(id) => {
-                // Bare ident treated as field shorthand.
+                // Bare ident: try fields first, then enum variants.
+                // Lets a constraint like `keep op != WRAP` work — the
+                // RHS isn't a field, it's the enum variant `WRAP`.
                 if field_set.contains(&id.name) {
                     write!(self.out, "_z_{}", id.name).ok();
+                } else if let Some(idx) = self.enum_variants.get(&id.name).copied() {
+                    write!(self.out, "_ctx.bv_val((uint64_t){}, {})", idx, width).ok();
                 } else {
                     self.errors.push(format!(
                         "constraint references unknown name `{}`", id.name
@@ -3951,21 +3999,45 @@ impl Emitter {
                 write!(self.out, "{s}").ok();
                 self.emit_constraint_expr_w(expr, field_set, width);
             }
+            // `e in <range-or-set>` parses as ExprKind::Membership
+            // (not Binary(In, …) — the `in` keyword is lexed as
+            // TokenKind::In and lowered structurally). Expand to an
+            // OR-chain of equality / range-comparison sub-expressions
+            // the solver handles natively.
+            ExprKind::Membership { expr, set } => {
+                self.emit_constraint_membership(expr, set, field_set, width);
+            }
             ExprKind::Binary { op, lhs, rhs } => {
                 use BinaryOp::*;
-                // Comparisons / equality return Bool in z3; arithmetic stays bv.
-                let (sep, ucmp) = match op {
+                // Defensive: BinaryOp::In/Inside isn't produced by the
+                // current parser (Membership is used instead) but the
+                // op variants exist, so keep the handler in case
+                // future parser paths emit them.
+                if matches!(op, In | Inside) {
+                    self.emit_constraint_membership(lhs, rhs, field_set, width);
+                    return;
+                }
+                // Z3's operator overloads on `z3::expr` default to
+                // *signed* semantics for `<`, `>`, `<=`, `>=`, `/`,
+                // `%`. HARC fields are unsigned (uint<N> / bits<N>),
+                // so we explicitly route those through the
+                // unsigned-named functions: ult/ule/ugt/uge for
+                // comparisons, udiv for division, urem for modulus.
+                // C++ has no `%%` infix — the old `" %% "` mapping was
+                // a half-finished placeholder. Equality (`==`, `!=`),
+                // logical / bitwise / shift use the natural overloads.
+                let (sep, fname) = match op {
                     Add => (" + ", None),
                     Sub => (" - ", None),
                     Mul => (" * ", None),
-                    Div => (" / ", None),
-                    Mod => (" %% ", None),  // in printf, %% — actually z3 has urem; prefer that
+                    Div => ("",    Some("udiv")),
+                    Mod => ("",    Some("urem")),
                     Eq => (" == ", None),
                     Ne => (" != ", None),
-                    Lt => (" < ", Some("ult")),
-                    Le => (" <= ", Some("ule")),
-                    Gt => (" > ", Some("ugt")),
-                    Ge => (" >= ", Some("uge")),
+                    Lt => ("",     Some("ult")),
+                    Le => ("",     Some("ule")),
+                    Gt => ("",     Some("ugt")),
+                    Ge => ("",     Some("uge")),
                     AndAnd | AndKw => (" && ", None),
                     OrOr | OrKw => (" || ", None),
                     BitAnd => (" & ", None),
@@ -3982,10 +4054,8 @@ impl Emitter {
                         return;
                     }
                 };
-                if let Some(fn_name) = ucmp {
-                    // Unsigned comparison — use z3::ult/ule/ugt/uge to match
-                    // HARC's uint semantics. The default `<` on z3::expr is
-                    // signed, which doesn't match HARC `uint<N>` fields.
+                if let Some(fn_name) = fname {
+                    // Unsigned op via z3::<fn>(lhs, rhs).
                     write!(self.out, "z3::{fn_name}(").ok();
                     self.emit_constraint_expr_w(lhs, field_set, width);
                     write!(self.out, ", ").ok();
@@ -4002,6 +4072,90 @@ impl Emitter {
                     "constraint expression not supported in v0 solver path"
                 ));
                 write!(self.out, "_ctx.bool_val(true)").ok();
+            }
+        }
+    }
+
+    /// Translate `<lhs> in <rhs>` (and `inside`) for the Z3 constraint
+    /// path. Rhs shapes:
+    ///   * `[lo..hi]` (RangeLit) → `lhs >= lo && lhs <= hi`
+    ///   * `{a, b, c}` (SetLit)  → `lhs == a || lhs == b || lhs == c`
+    ///   * Anything else         → falls back to `lhs == rhs`
+    ///                              (treats rhs as a singleton).
+    ///
+    /// Open and unbounded sides on RangeLit (`[..hi]`, `[lo..]`)
+    /// collapse the missing comparison. Set elements that are
+    /// themselves RangeLits recurse (so `{[0..3], 7}` expands to
+    /// `(_z>=0 && _z<=3) || _z==7`).
+    fn emit_constraint_membership(
+        &mut self,
+        lhs: &Expr,
+        rhs: &Expr,
+        field_set: &std::collections::HashSet<String>,
+        width: u32,
+    ) {
+        match &*rhs.kind {
+            ExprKind::RangeLit { lo, hi } => {
+                write!(self.out, "(").ok();
+                let mut has_any = false;
+                if let Some(l) = lo {
+                    write!(self.out, "z3::uge(").ok();
+                    self.emit_constraint_expr_w(lhs, field_set, width);
+                    write!(self.out, ", ").ok();
+                    self.emit_constraint_expr_w(l, field_set, width);
+                    write!(self.out, ")").ok();
+                    has_any = true;
+                }
+                if let Some(h) = hi {
+                    if has_any { write!(self.out, " && ").ok(); }
+                    write!(self.out, "z3::ule(").ok();
+                    self.emit_constraint_expr_w(lhs, field_set, width);
+                    write!(self.out, ", ").ok();
+                    self.emit_constraint_expr_w(h, field_set, width);
+                    write!(self.out, ")").ok();
+                    has_any = true;
+                }
+                if !has_any {
+                    // Open-ended on both sides — vacuously true.
+                    write!(self.out, "_ctx.bool_val(true)").ok();
+                }
+                write!(self.out, ")").ok();
+            }
+            ExprKind::SetLit(items) => {
+                write!(self.out, "(").ok();
+                if items.is_empty() {
+                    write!(self.out, "_ctx.bool_val(false)").ok();
+                } else {
+                    for (i, it) in items.iter().enumerate() {
+                        if i > 0 { write!(self.out, " || ").ok(); }
+                        // Recurse so `{[0..3], 7}` expands correctly.
+                        match &*it.kind {
+                            ExprKind::RangeLit { .. } | ExprKind::SetLit(_) => {
+                                self.emit_constraint_membership(lhs, it, field_set, width);
+                            }
+                            ExprKind::Paren(inner) => {
+                                self.emit_constraint_membership(lhs, inner, field_set, width);
+                            }
+                            _ => {
+                                // Singleton element — equality test.
+                                self.emit_constraint_expr_w(lhs, field_set, width);
+                                write!(self.out, " == ").ok();
+                                self.emit_constraint_expr_w(it, field_set, width);
+                            }
+                        }
+                    }
+                }
+                write!(self.out, ")").ok();
+            }
+            ExprKind::Paren(inner) => {
+                self.emit_constraint_membership(lhs, inner, field_set, width);
+            }
+            _ => {
+                // Fallback: treat rhs as a singleton — `a in b` becomes
+                // `a == b`. Same shape `emit_bin_membership` uses.
+                self.emit_constraint_expr_w(lhs, field_set, width);
+                write!(self.out, " == ").ok();
+                self.emit_constraint_expr_w(rhs, field_set, width);
             }
         }
     }
@@ -4640,15 +4794,26 @@ impl Emitter {
                         return;
                     }
                 };
-                if with_body.is_empty() {
-                    // No cross-field constraints: simple field-by-field PRNG path.
+                // Spec §4: transaction-level `keep` constraints are
+                // semantically part of every `randomize(t)` of that
+                // type. Merge them with any user-supplied `with …`
+                // body before handing to the solver. Without this
+                // merge, `keep` would silently parse but emit zero
+                // C++ — a correctness footgun (caught while auditing
+                // §4 implementation status).
+                let txn_keeps = self.txn_keeps.get(&ty).cloned().unwrap_or_default();
+                let mut combined: Vec<Expr> = Vec::with_capacity(txn_keeps.len() + with_body.len());
+                combined.extend(txn_keeps);
+                combined.extend(with_body.iter().cloned());
+                if combined.is_empty() {
+                    // No constraints anywhere: simple field-by-field PRNG path.
                     self.pad(depth);
                     write!(self.out, "randomize_{ty}(&").ok();
                     self.emit_expr(target);
                     writeln!(self.out, ");").ok();
                 } else {
                     // Constraint-solving path via Z3.
-                    self.emit_constraint_solver_block(&ty, target, with_body, depth);
+                    self.emit_constraint_solver_block(&ty, target, &combined, depth);
                 }
             }
             other => {
@@ -5398,39 +5563,75 @@ impl Emitter {
     }
 }
 
-/// True if any `randomize(t) with <constraints>` exists anywhere in the
-/// merged AST. Drives the `<z3++.h>` include + Z3 link flags.
+/// True if any code path will emit the Z3 solver block. Drives the
+/// `<z3++.h>` include + Z3 link flags. The check needs to mirror the
+/// codegen's actual decision:
+///   * `randomize(t) with <body>` — always solver (user wrote constraints)
+///   * bare `randomize(t)` where `t`'s transaction has `keep` items —
+///     also solver (the keeps merge into a solver block at the call site)
 fn file_uses_constraint_solver(file: &SourceFile) -> bool {
-    fn block(b: &Block) -> bool { b.stmts.iter().any(stmt) }
-    fn stmt(s: &Stmt) -> bool {
+    // First pass: collect names of transactions that declare any
+    // `keep` items. Any bare `randomize(t)` against one of these
+    // routes through Z3 after the §4 keep-merge.
+    let keep_bearing: std::collections::HashSet<&str> = file.items.iter()
+        .filter_map(|it| match it {
+            Item::Transaction(t) => {
+                let has_keep = t.body.iter().any(|b| matches!(b, TxnBodyItem::Keep(_)));
+                if has_keep { Some(t.name.name.as_str()) } else { None }
+            }
+            _ => None,
+        })
+        .collect();
+
+    fn block(b: &Block, kb: &std::collections::HashSet<&str>) -> bool {
+        b.stmts.iter().any(|s| stmt(s, kb))
+    }
+    fn stmt(s: &Stmt, kb: &std::collections::HashSet<&str>) -> bool {
         match &s.kind {
-            StmtKind::Randomize { with_body, .. } => !with_body.is_empty(),
-            StmtKind::For(f) => block(&f.body),
-            StmtKind::Repeat(r) => block(&r.body),
-            StmtKind::Loop(b) => block(b),
-            StmtKind::While { body, .. } => block(body),
+            // `with <body>` always solves; bare randomize solves when
+            // the target's transaction carries keeps. The target's
+            // type isn't on the AST node directly here — we conservatively
+            // return `true` for bare randomize when the file has ANY
+            // keep-bearing transaction. False positives are cheap
+            // (an unused include); false negatives are compile failures.
+            StmtKind::Randomize { with_body, .. } => !with_body.is_empty() || !kb.is_empty(),
+            StmtKind::For(f) => block(&f.body, kb),
+            StmtKind::Repeat(r) => block(&r.body, kb),
+            StmtKind::Loop(b) => block(b, kb),
+            StmtKind::While { body, .. } => block(body, kb),
             StmtKind::If(i) =>
-                block(&i.then_block)
-                || i.else_block.as_ref().map_or(false, block)
-                || i.elsifs.iter().any(|(_, b)| block(b)),
-            StmtKind::Fork(f) => f.branches.iter().any(block),
-            StmtKind::Parallel(bs) | StmtKind::Schedule(bs) => bs.iter().any(block),
-            StmtKind::Select(arms) => arms.iter().any(|a| block(&a.action)),
-            StmtKind::On(h) => block(&h.body),
-            StmtKind::After { body, .. } => block(body),
+                block(&i.then_block, kb)
+                || i.else_block.as_ref().map_or(false, |b| block(b, kb))
+                || i.elsifs.iter().any(|(_, b)| block(b, kb)),
+            StmtKind::Fork(f) => f.branches.iter().any(|b| block(b, kb)),
+            StmtKind::Parallel(bs) | StmtKind::Schedule(bs) => bs.iter().any(|b| block(b, kb)),
+            StmtKind::Select(arms) => arms.iter().any(|a| block(&a.action, kb)),
+            StmtKind::On(h) => block(&h.body, kb),
+            StmtKind::After { body, .. } => block(body, kb),
             _ => false,
         }
     }
     file.items.iter().any(|it| match it {
-        Item::Function(f) => block(&f.body),
+        Item::Function(f) => block(&f.body, &keep_bearing),
         Item::Test(t) => t.items.iter().any(|ti| match ti {
-            TestItem::Stmt(s) => stmt(s),
+            TestItem::Stmt(s) => stmt(s, &keep_bearing),
             TestItem::Scope(sc) =>
-                sc.setup.as_ref().map_or(false, block)
-                || sc.run.as_ref().map_or(false, block)
-                || sc.check.as_ref().map_or(false, block)
-                || sc.teardown.as_ref().map_or(false, block),
+                sc.setup.as_ref().map_or(false, |b| block(b, &keep_bearing))
+                || sc.run.as_ref().map_or(false, |b| block(b, &keep_bearing))
+                || sc.check.as_ref().map_or(false, |b| block(b, &keep_bearing))
+                || sc.teardown.as_ref().map_or(false, |b| block(b, &keep_bearing)),
             _ => false,
+        }),
+        // `impl sim for T` body items aren't folded into the Test by
+        // merge — they pass through as separate Item::Impl entries.
+        // Walk their `run` / phase / setup / etc. blocks too so
+        // `randomize(...)` inside an impl run-body is detected.
+        Item::Impl(i) => i.items.iter().any(|ii| match ii {
+            ImplItem::Setup(b)
+            | ImplItem::Run(b)
+            | ImplItem::Check(b)
+            | ImplItem::Teardown(b)
+            | ImplItem::Phase(_, b) => block(b, &keep_bearing),
         }),
         _ => false,
     })
