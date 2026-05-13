@@ -254,35 +254,18 @@ codegen is unchanged.
 
 ## 5. Backend selection
 
-With `impl sim for T` gone, how does HARC know a test is sim vs emu?
-
-**Recommended:** CLI flag selects the backend; tests carry no backend
-annotation.
+With `impl sim for T` gone, backend choice moves to the CLI. Tests carry
+no backend annotation in the source.
 
 ```sh
-harc sim my_file.harc --top Foo      # invokes the sim backend (today's default)
-harc emu my_file.harc --top Foo      # invokes the emu backend (post-v0)
+harc sim my_file.harc --top Foo      # sim backend (today's default)
+harc emu my_file.harc --top Foo      # emu backend (post-v0)
 ```
 
-Rationale:
-
-- A test file is sim-only or emu-only in practice. Mixing both kinds in
-  one file is rare enough that a per-test annotation isn't worth the
-  syntactic weight.
-- When users do want both, they keep two files (`foo_sim.harc`,
-  `foo_emu.harc`) and pick the backend at invocation time.
-- This matches how `harc sim --sv` / `harc sim --dut` already work:
-  backend choice lives at the CLI, not in the source.
-
-**Considered and rejected:**
-
-- Per-test `target sim` / `target emu` attribute. Adds a token to every
-  test for a property that's almost always uniform across a file.
-- File-name convention (`*_emu.harc` → emu backend). Magic, easy to
-  miss.
-
-The future `emu` story is its own RFC; this doc only commits to *not
-needing per-test backend annotations in the source*.
+This matches how `harc sim --sv` / `harc sim --dut` already select
+DUT-side flavor at the CLI rather than in the source. The future `emu`
+story is its own RFC; this doc only commits to *not needing per-test
+backend annotations in the source*.
 
 ## 6. Lowering
 
