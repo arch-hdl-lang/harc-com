@@ -36,6 +36,7 @@ wait_until_quiesce_test | Top            | top_counter.sv         |
 watchdog_quiesce_test   | Top            | top_counter.sv         |
 keep_constraints_test   | Top            | top_counter.sv         |
 extern_fn_ref_test      | Top            | top_counter.sv         |     | extern_fn_ref.cpp
+relation_inlining_test  | Top            | top_counter.sv         |
 fsm_counter_test        | FsmCounter     | fsm_counter.sv         |
 clk_div_counter_test    | ClkDivCounter  | clk_div_counter.sv clk_divider.sv |
 synchronizer_basic_test | FlagSync       | synchronizer_basic.sv  | async_fifo_domains.harc

@@ -1,0 +1,77 @@
+// End-to-end demo of `relation` inlining (spec §4.2): free-standing
+// relations are reusable, parameterized constraint sets. A
+// `randomize(t) with R(t)` call inlines R's body into the Z3 solver
+// block at the call site, with the formal parameter substituted by
+// the actual randomize target.
+//
+// Before this fix, `relation` declarations parsed cleanly and round-
+// tripped, but `randomize(t) with R(t)` errored at codegen with
+// "constraint expression not supported in v0 solver path" — R's
+// body never reached the solver. This fixture exercises:
+//
+//   1. A block-form relation called from `randomize ... with`
+//      (multiple body expressions, each becomes its own constraint)
+//   2. An alias-form relation that itself calls another relation
+//      (recursive expansion — relations-of-relations flatten)
+//   3. Random values driven by inlined constraints, asserted at
+//      runtime
+//
+// The DUT is `Top` (counter), used as an incidental clock source.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Req
+    addr : uint<32>
+    len  : uint<8>
+end transaction Req
+
+// Block-form relation: two independent constraints. Each contributes
+// a separate _s.add(...) call when inlined.
+relation Bounded(r: Req)
+    r.len in [1..16]
+    r.addr % 4 == 0
+end relation Bounded
+
+// Alias-form relation: a single expression.
+relation HighAddr(r: Req) = r.addr >= 0x10000
+
+// Alias-form relation that calls two other relations. Recursive
+// expansion flattens all three relations into the same solver block.
+relation BoundedAndHigh(r: Req) = Bounded(r) && HighAddr(r)
+
+test RelationInliningTest
+    let dut : Top
+
+    clock clk = SysDomain
+end test RelationInliningTest
+
+impl sim for RelationInliningTest
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // 20 randomize calls through the composite relation. Z3
+        // sees Bounded's two constraints AND HighAddr's one,
+        // satisfying all three simultaneously. The asserts mirror
+        // the constraints — they'd fail if any of the three weren't
+        // enforced.
+        for i in 0 .. 20
+            let r : Req
+            randomize(r) with BoundedAndHigh(r) end randomize
+
+            assert r.len >= 1 && r.len <= 16
+                else fail("iter ${i}: len=${r.len} violates `r.len in [1..16]`")
+            assert r.addr % 4 == 0
+                else fail("iter ${i}: addr=0x${r.addr:08x} not 4-aligned")
+            assert r.addr >= 0x10000
+                else fail("iter ${i}: addr=0x${r.addr:08x} below 0x10000")
+        end for
+
+        log(info, "PASS: 20 randomize-with-relation calls satisfied all 3 inlined constraints")
+    end run
+end impl RelationInliningTest

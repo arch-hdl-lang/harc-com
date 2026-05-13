@@ -1194,6 +1194,126 @@ end impl EnumKeepTest"#,
         "expected `burst != WRAP` to lower with WRAP resolved to index 2; got:\n{cpp}");
 }
 
+/// `randomize(t) with R(t)` inlines `R`'s body into the Z3 solver
+/// block (spec §4.2). Block-form relations contribute one constraint
+/// per body expression; the formal parameter substitutes for the
+/// actual call argument so the constraints reference the right
+/// fields.
+#[test]
+fn block_relation_inlines_into_randomize_with() {
+    let parsed = parse_source(
+        r#"transaction T
+    addr : uint<32>
+    len  : uint<8>
+end transaction T
+
+relation Bounded(x: T)
+    x.len in [1..16]
+    x.addr % 4 == 0
+end relation Bounded
+
+test BlockRelTest
+    let dut : DummyDut
+end test BlockRelTest
+
+impl sim for BlockRelTest
+    run
+        let t : T
+        randomize(t) with Bounded(t) end randomize
+    end run
+end impl BlockRelTest"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    // Both relation body expressions reach the solver.
+    assert!(cpp.contains("z3::uge(_z_len") && cpp.contains("z3::ule(_z_len"),
+        "expected `x.len in [1..16]` to lower to uge/ule pair after inlining; got:\n{cpp}");
+    assert!(cpp.contains("z3::urem(_z_addr"),
+        "expected `x.addr % 4 == 0` to lower with urem after inlining; got:\n{cpp}");
+}
+
+/// Alias-form relations (`relation A(t) = expr`) contribute their
+/// single expression as one constraint, with parameter substitution.
+/// Also exercises recursive expansion when the alias body itself
+/// calls another relation.
+#[test]
+fn alias_relation_inlines_and_recurses_through_other_relations() {
+    let parsed = parse_source(
+        r#"transaction T
+    addr : uint<32>
+end transaction T
+
+relation Aligned(x: T) = x.addr % 4 == 0
+relation HighHalf(x: T) = x.addr >= 0x80000000
+relation BothAlignedAndHigh(x: T) = Aligned(x) && HighHalf(x)
+
+test AliasRelTest
+    let dut : DummyDut
+end test AliasRelTest
+
+impl sim for AliasRelTest
+    run
+        let t : T
+        randomize(t) with BothAlignedAndHigh(t) end randomize
+    end run
+end impl AliasRelTest"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    // The alias `BothAlignedAndHigh(t)` should expand to
+    // `(Aligned(t) && HighHalf(t))`, then each sub-relation expands
+    // to its body. The Aligned check uses urem; HighHalf uses uge.
+    // Both should reach the solver in the same _s.add call (since
+    // the alias produces ONE constraint expression that is the &&
+    // of the two sub-relation bodies).
+    assert!(cpp.contains("z3::urem(_z_addr"),
+        "expected recursively-inlined `Aligned(x)` to add urem; got:\n{cpp}");
+    assert!(cpp.contains("z3::uge(_z_addr"),
+        "expected recursively-inlined `HighHalf(x)` to add uge; got:\n{cpp}");
+    // The inlined alias still appears as a single constraint joined
+    // by &&, not two separate ones — that's the alias-form
+    // contract (Block form would produce two _s.add calls).
+    let urem_count = cpp.matches("z3::urem(_z_addr").count();
+    assert_eq!(urem_count, 1,
+        "expected exactly one urem from the alias-form `Aligned`; got {urem_count} in:\n{cpp}");
+}
+
+/// Parameter substitution works when the relation's formal parameter
+/// has a different name than the randomize target. `randomize(pkt) with
+/// Bounded(pkt)` — inside `Bounded`, the parameter is `x`, and
+/// references to `x.<field>` should substitute to `pkt.<field>` …
+/// which, after the substitution, the constraint translator handles
+/// like any other field access on the randomize target.
+#[test]
+fn relation_inlining_substitutes_formal_param_for_argument() {
+    let parsed = parse_source(
+        r#"transaction Pkt
+    size : uint<8>
+end transaction Pkt
+
+relation Small(x: Pkt)
+    x.size <= 4
+end relation Small
+
+test SubstTest
+    let dut : DummyDut
+end test SubstTest
+
+impl sim for SubstTest
+    run
+        let pkt : Pkt
+        randomize(pkt) with Small(pkt) end randomize
+    end run
+end impl SubstTest"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    // After substitution, `x.size` becomes `pkt.size`, which the
+    // constraint translator lowers to `_z_size` (the Z3 var of the
+    // transaction's size field). No spurious `_z_x_size` symbol.
+    assert!(cpp.contains("z3::ule(_z_size,"),
+        "expected substituted-then-translated `size <= 4` constraint; got:\n{cpp}");
+    assert!(!cpp.contains("_z_x"),
+        "no Z3 var named after the formal param should appear; got:\n{cpp}");
+}
+
 /// `extern function name(params) -> ret` (spec §9) emits a C-linkage
 /// forward declaration at file scope wrapped in `extern "C" { ... }`,
 /// so the user's `--ref-src <file>` implementation links against it.

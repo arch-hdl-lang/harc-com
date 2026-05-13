@@ -805,6 +805,14 @@ relation AxiAlignedBurst(t: AxiWrite) = AxiBurstLegal(t) && t.addr % 64 == 0
 
 Relations are values. They can be passed, intersected (`&&`), unioned (`||`), and parameterized.
 
+**Implementation status (v0 codegen).** A relation call `R(args)` inside a `randomize(t) with …` body (or inside a transaction's `keep` block, via the merge from §4.1) is inlined at codegen time: the formal parameters substitute for the actual arguments, and each body expression is added to the Z3 solver block as its own constraint. Recursive — relations of relations (`relation A(t) = B(t) && t.x == 0`) flatten in one pass before reaching the solver.
+
+The two body forms expand differently:
+- `relation R(p) <e1> <e2> … <eN> end relation` — block form. Each `e_i` becomes one constraint at the call's position; nesting a block-form call inside a `Binary &&` expression joins them with `&&` so the embedding still type-checks as one expression.
+- `relation R(p) = <e>` — alias form. The single expression substitutes into the body; one constraint contributed per call.
+
+A relation called with a target whose type doesn't match the formal parameter is not currently rejected at elaboration — the downstream solver path produces a constraint-translator error if the substituted body references unknown fields. v0 leans on that error rather than adding a type-check pass.
+
 ### 4.3 Solver
 
 Z3 by default; Bitwuzla available for pure-bitvector workloads (per April-13). Solution diversity is via blocking clauses + stratified sampling — implementation detail, not user-facing.
