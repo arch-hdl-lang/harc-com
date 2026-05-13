@@ -158,7 +158,7 @@ Common `harc sim` flags:
 - `--outdir <dir>` — build artifact directory (default `harc_sim_build/`)
 - `--emit-only` — emit C++ but don't compile/run
 - `--ref-src <file>` (repeatable) — C/C++ source file(s) providing implementations for `extern function` reference models (spec §9.1)
-- `--coverage` — enable Verilator coverage collection (writes `coverage.dat`)
+- `--coverage` — enable DUT coverage collection. Works on both DUT paths: `--sv` passes `--coverage` to Verilator; `--dut` passes `--coverage` + `--coverage-dat=<outdir>/coverage.dat` to `arch sim`. The Verilator-compatible `coverage.dat` lands in `<outdir>/` on both paths so downstream tools (`verilator_coverage`, the CVDP scorer) see a uniform shape
 - `--mt` — opt into the per-actor multi-OS-thread runtime (default is cooperative single-thread, typically faster on real fixtures)
 
 ## Examples
