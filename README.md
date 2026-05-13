@@ -1,12 +1,12 @@
 # HARC
 
-**HARC** (*Harness of ARCh*) is a verification language compiler — sister to **ARCH**, the hardware description language at [`arch-hdl-lang/arch-com`](https://github.com/arch-hdl-lang/arch-com). HARC produces a Verilator-driven C++ testbench from a high-level test description, with first-class support for transactions, constraint-randomized stimulus, transactors (synthesizable BFMs), scoreboards, covergroups, and concurrent assertions.
+**HARC** (*Harness of ARCh*) is a verification language compiler — sister to **ARCH**, the hardware description language at [`arch-hdl-lang/arch-com`](https://github.com/arch-hdl-lang/arch-com). HARC produces a Verilator-driven C++ testbench from a high-level test description, with first-class support for transactions, constraint-randomized stimulus, transactors (synthesizable BFMs), scoreboards, covergroups, concurrent assertions, `extern function` references to C/C++ reference models, and a heartbeat-based replacement for UVM's objection mechanism (per-agent `watchdog` + `wait until` with per-predicate timeout diagnostics).
 
 The full language reference is in [`spec.md`](spec.md).
 
 ## Status
 
-Pre-1.0. Phases 1a + 1b + 2 + 3 + 4 of the spec roadmap are usable end-to-end (stimulus → observation → scoreboard → properties/coverage). 12 example fixtures from `arch-com/examples/` pass against the real Verilator-compiled SystemVerilog.
+Pre-1.0. Stimulus → observation → scoreboard → properties/coverage → reference-model comparison → watchdog termination are all usable end-to-end. 56 fixtures pass against real Verilator-compiled SystemVerilog DUTs.
 
 ## Install
 
@@ -28,43 +28,75 @@ The binary lands at `target/release/harc`. Add it to your `PATH` or invoke via `
 
 ## A first test
 
-Given a SystemVerilog DUT — e.g. `arch-com/examples/sync_fifo.sv` — write a HARC test:
+Given a SystemVerilog DUT — `tests/dut/sync_fifo.sv`, a 16-deep single-clock FIFO — write a HARC test:
 
 ```harc
+covergroup FifoCov @(posedge dut.clk)
+    cp_empty : cover dut.empty
+        bins
+            yes = {1}
+            no  = {0}
+        end bins
+    cp_full : cover dut.full
+        bins
+            yes = {1}
+            no  = {0}
+        end bins
+end covergroup FifoCov
+
 test SyncFifoTest
     let dut : TxQueue
-
-    scope sim
-        run
-            dut.rst = 1
-            dut.push_valid = 0
-            dut.pop_ready = 0
-            wait 2 cycles
-            dut.rst = 0
-
-            for i in 0 .. 16
-                dut.push_valid = 1
-                dut.push_data = i + 1
-                wait 1 cycle
-            end for
-            dut.push_valid = 0
-
-            for i in 0 .. 16
-                dut.pop_ready = 1
-                assert dut.pop_data == i + 1
-                    else fail("pop ${i}: got ${dut.pop_data}")
-                wait 1 cycle
-            end for
-            log(info, "PASS")
-        end run
-    end scope sim
+    let cov : FifoCov
 end test SyncFifoTest
+
+impl sim for SyncFifoTest
+    run
+        // Reset.
+        dut.rst = 1
+        dut.push_valid = 0
+        dut.pop_ready = 0
+        wait 2 cycles
+        assert dut.empty == 1 else fail("after reset, empty should be 1")
+        dut.rst = 0
+
+        // Push 16 items (fill to capacity).
+        for i in 0 .. 16
+            dut.push_valid = 1
+            dut.push_data = i + 1
+            wait 1 cycle
+        end for
+        dut.push_valid = 0
+        wait 1 cycle
+        assert dut.full == 1 else fail("FIFO should be full after 16 pushes")
+
+        // Pop all 16 items and verify FIFO order.
+        for i in 0 .. 16
+            dut.pop_ready = 1
+            let expected = i + 1
+            assert dut.pop_data == expected
+                else fail("pop ${i}: got ${dut.pop_data}, expected ${expected}")
+            wait 1 cycle
+        end for
+        log(info, "PASS: 16 items round-tripped in FIFO order")
+    end run
+
+    check
+        cov.report()
+        assert cov.cp_empty.yes > 0 else fail("empty=1 coverage hole")
+        assert cov.cp_full.yes  > 0 else fail("full=1 coverage hole")
+    end check
+end impl SyncFifoTest
 ```
+
+Two top-level constructs:
+
+- **`test SyncFifoTest`** declares the test's lets (DUT pointer, covergroup instance, env, etc.) — what to *instantiate*.
+- **`impl sim for SyncFifoTest`** declares the per-target phases (`run`, `check`, `setup`, `teardown`, user `phase <name>`) — what to *do*. Multiple impls per test can target different backends (`impl sim`, `impl emu`, `impl formal` — only `sim` lowered today). The split lets the same instantiation feed different backends without rewriting the body.
 
 Run it:
 
 ```sh
-harc sim --sv path/to/sync_fifo.sv path/to/sync_fifo_test.harc --top TxQueue
+harc sim --sv tests/dut/sync_fifo.sv tests/fixtures/sync_fifo_test.harc --top TxQueue
 ```
 
 HARC compiles the test to C++, links Verilator's compiled DUT, runs the binary, and prints cycle-stamped log lines plus a coverage report.
@@ -73,73 +105,82 @@ HARC compiles the test to C++, links Verilator's compiled DUT, runs the binary, 
 
 | Command | What it does |
 |---|---|
-| `harc check <files…>` | Type-check, lint, and report problems. No output. |
+| `harc check <files…>` | Parse + lint; reports problems. No output on success. |
 | `harc fmt <file>` | Pretty-print to stdout (round-trip target — output re-parses to a structurally equivalent AST). |
 | `harc sim --dut <arch-source> [--top T] [--test N] <test-files…>` | Build the DUT through `arch sim` (uses ARCH's cpp simulation model), then run. |
 | `harc sim --sv <verilog-files…> [--top T] [--test N] <test-files…>` | Run Verilator on the SV directly, then run. |
+| `harc advise <query>` | Retrieve past error→fix pairs from the local learning store. |
 
-Common flags:
+Common `harc sim` flags:
 
-- `--seed N` — PRNG seed (env: `HARC_SEED`)
+- `--seed N` — PRNG seed for `randomize` calls (env: `HARC_SEED`)
 - `--outdir <dir>` — build artifact directory (default `harc_sim_build/`)
 - `--emit-only` — emit C++ but don't compile/run
+- `--ref-src <file>` (repeatable) — C/C++ source file(s) providing implementations for `extern function` reference models (spec §9.1)
+- `--coverage` — enable Verilator coverage collection (writes `coverage.dat`)
+- `--mt` — opt into the per-actor multi-OS-thread runtime (default is cooperative single-thread, typically faster on real fixtures)
 
 ## Examples
 
-[`tests/fixtures/`](tests/fixtures/) holds runnable HARC TBs targeting DUTs in [`arch-com/examples/`](https://github.com/arch-hdl-lang/arch-com/tree/main/examples). Quick reference:
+[`tests/fixtures/`](tests/fixtures/) holds 56 runnable HARC TBs targeting DUTs vendored under [`tests/dut/`](tests/dut/). Each fixture compiles, runs through Verilator, and asserts `ALL TESTS PASSED`. A non-exhaustive tour:
 
 | Fixture | DUT | Demonstrates |
 |---|---|---|
 | `rom_lut_test.harc` | `rom_lut.sv` | covergroup + helper functions |
-| `bus_arbiter_test.harc` | `bus_arbiter.sv` | round-robin arbiter, named bins |
-| `int_regs_test.harc` | `int_regs.sv` | regfile with hardwired addr 0 |
-| `traffic_light_test.harc` | `traffic_light.sv` | FSM, `for _ in 0..N` |
 | `sync_fifo_test.harc` | `sync_fifo.sv` | single-clock FIFO, full/empty asserts |
-| `pipe_reg_test.harc` | `pipe_reg_test.sv` | concurrent property with `past(...)` |
-| `single_port_ram_test.harc` | `single_port_ram.sv` | helper functions returning values |
-| `pkt_queue_test.harc` | `pkt_queue.sv` | 2-cycle req/resp protocol |
-| `synchronizer_basic_test.harc` | `synchronizer_basic.sv` | 2-clock CDC |
 | `async_fifo_test*.harc` | `async_fifo.sv` | dual-clock FIFO, multi-file scope split |
-| `axilite_*_test*.harc` | `axilite_regs.sv` | transactors (active+passive), scoreboards, randomize-with, events |
-| `counter_test*.harc` | `wrap_counter.sv` | properties, cover properties, multi-file split |
+| `axilite_seqdrv_test.harc` | `AxiLiteRegs.sv` | unbound transactor with `on event(t)` handler |
+| `axilite_env_test.harc` | `AxiLiteRegs.sv` | `env` composing a transactor + scoreboard |
+| `axilite_bus_send_test.harc` | `AxiLiteRegs.sv` | typed bus binding + `bus.<ch>.send/recv` |
+| `axilite_bound_mon_test.harc` | `AxiLiteRegs.sv` | bound monitor (`on bus.<ch>.handshake(t)`) |
+| `axilite_constraint_test.harc` | `AxiLiteRegs.sv` | `randomize(t) with …` through Z3 |
+| `keep_constraints_test.harc` | `top_counter.sv` | transaction `keep` constraints (range, modulus, enum exclusion) |
+| `relation_inlining_test.harc` | `top_counter.sv` | `relation` inlining — block + alias + composite forms |
+| `heartbeat_idle_test.harc` | `top_counter.sv` | per-agent `_last_in_cycle` heartbeats + `idle(N)` predicate |
+| `wait_until_quiesce_test.harc` | `top_counter.sv` | `wait until all of …, … timeout N cycles fail("…")` |
+| `watchdog_quiesce_test.harc` | `top_counter.sv` | built-in `watchdog` block (period / max_idle / debug body) |
+| `extern_fn_ref_test.harc` | `top_counter.sv` | `extern function` calling a C/C++ reference model (CRC-8) |
+| `aes_cipher_top_test.harc` | `aes_cipher_top.sv` | wide-bus (128b) signal access + multi-file SV DUT |
 
-See [`spec.md`](spec.md) for the language reference and [`HANDOFF.md`](HANDOFF.md) (locally generated) for the latest session-level state.
+See [`spec.md`](spec.md) for the full language reference and [`tests/run_fixtures.sh`](tests/run_fixtures.sh) for the complete fixture manifest.
 
 ## Layout
 
 ```
 src/
-  ast.rs           AST types
-  lexer.rs         Logos-based tokenizer
-  parser.rs        Recursive-descent LL(1) parser
-  pretty.rs        Pretty-printer (round-trip target)
-  diagnostics.rs   miette-based error reporting
+  ast.rs                  AST types
+  lexer.rs                Logos-based tokenizer
+  parser.rs               Recursive-descent LL(1) parser
+  pretty.rs               Pretty-printer (round-trip target)
+  diagnostics.rs          miette-based error reporting
+  learn/                  Local learning store (`harc advise`)
   codegen/
-    cpp_tb.rs      Verilator C++ TB emitter (single file)
-    merge.rs       Multi-file `extend test T` merging
-  main.rs          CLI
+    cpp_tb.rs             Verilator C++ TB emitter (single file)
+    merge.rs              Multi-file `extend test T` merging
+  main.rs                 CLI
+
+runtime/
+  harc_thread_rt.h        Coroutine scheduler header; baked into each emit
 
 tests/
-  fixtures/        Runnable HARC tests targeting arch-com DUTs
-  dut/             Vendored .sv DUT snapshots (refreshable from arch-com)
-  snapshots/       insta snapshots for round-trip parser tests
-  round_trip.rs    Snapshot-test driver
-  run_fixtures.sh  End-to-end fixture runner (used in CI)
+  fixtures/               Runnable HARC tests
+  dut/                    Vendored .sv DUTs + .cpp reference models
+  snapshots/              insta snapshots for round-trip / codegen tests
+  round_trip.rs           Parse → pretty-print → reparse equivalence tests
+  codegen.rs              Codegen pin-tests (asserts emitted C++ shape)
+  run_fixtures.sh         End-to-end fixture runner (used in CI)
 
-spec.md            Language reference
+spec.md                   Language reference
 ```
 
 ## Running the test suite locally
 
 ```sh
-cargo test --release          # 32 cargo tests
-./tests/run_fixtures.sh       # 23 fixtures end-to-end via Verilator
+cargo test --release          # 80 cargo tests (lib + codegen + round-trip)
+./tests/run_fixtures.sh       # 56 fixtures end-to-end via Verilator
 ```
 
-The fixture runner builds harc, then for each entry in its manifest:
-runs Verilator on the vendored `.sv` DUT, links it against the HARC-
-generated C++ testbench, and asserts the binary prints `ALL TESTS
-PASSED`. CI runs the same script on every push and PR.
+The fixture runner builds harc, then for each entry in its manifest: runs Verilator on the vendored `.sv` DUT (linking any `--ref-src` C/C++ files), builds against the HARC-generated C++ testbench, and asserts the binary prints `ALL TESTS PASSED`. CI runs the same script on every push and PR.
 
 ## Relationship to ARCH
 
