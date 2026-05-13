@@ -90,12 +90,17 @@ enum Cmd {
         /// per-cycle compute that genuinely benefit from parallelism.
         #[arg(long)]
         mt: bool,
-        /// Enable Verilator coverage collection (`--coverage`). The
-        /// emitted TB writes `coverage.dat` next to the simulation
-        /// log on clean shutdown; `verilator_coverage` can then
-        /// post-process it. Used by the CVDP-style scorer at
-        /// `bench/cvdp/score.py` to measure DUT coverage achieved by
-        /// the TB. Off by default (small compile/runtime cost).
+        /// Enable DUT coverage collection. Works on both DUT paths:
+        ///   * `--sv` (Verilator): passes `--coverage` to verilator;
+        ///     the emitted TB writes `coverage.dat` next to sim.log
+        ///     at clean shutdown.
+        ///   * `--dut` (ARCH sim): passes `--coverage` +
+        ///     `--coverage-dat=<outdir>/coverage.dat` to `arch sim`,
+        ///     which dumps both a `coverage.txt` keyed to .arch
+        ///     source lines AND a Verilator-compatible `coverage.dat`.
+        /// Output is consumed by `verilator_coverage` and by the
+        /// CVDP-style scorer at `bench/cvdp/score.py`. Off by default
+        /// (small compile/runtime cost).
         #[arg(long)]
         coverage: bool,
         /// Reference-model C / C++ source file(s) — implementations
@@ -859,6 +864,19 @@ fn cmd_sim(
     prefix_args.push(cpp_abs.display().to_string());
     prefix_args.push("--outdir".into());
     prefix_args.push(outdir_abs.display().to_string());
+    // Coverage passthrough: `arch sim` supports both `--coverage`
+    // (dumps `coverage.txt` keyed to .arch source lines) and
+    // `--coverage-dat=<path>` (Verilator-compatible `coverage.dat`).
+    // Pin the .dat output to `<outdir>/coverage.dat` so it lands
+    // next to sim.log — same location the `--sv` Verilator path
+    // writes its coverage.dat. Without this, --coverage on --dut
+    // was silently a no-op (the existing `coverage: bool` was
+    // consumed only inside run_verilator()).
+    if coverage {
+        prefix_args.push("--coverage".into());
+        let cov_dat_path = outdir_abs.join("coverage.dat");
+        prefix_args.push(format!("--coverage-dat={}", cov_dat_path.display()));
+    }
 
     eprintln!("running: {} {}", program.display(), prefix_args.join(" "));
     let mut cmd = Command::new(&program);
