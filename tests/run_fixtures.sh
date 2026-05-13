@@ -34,6 +34,7 @@ top_counter_test        | Top            | top_counter.sv         |
 heartbeat_idle_test     | Top            | top_counter.sv         |
 wait_until_quiesce_test | Top            | top_counter.sv         |
 watchdog_quiesce_test   | Top            | top_counter.sv         |
+env_quiesced_phase_test | Top            | top_counter.sv         |
 keep_constraints_test   | Top            | top_counter.sv         |
 extern_fn_ref_test      | Top            | top_counter.sv         |     | extern_fn_ref.cpp
 relation_inlining_test  | Top            | top_counter.sv         |
