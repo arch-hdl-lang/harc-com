@@ -626,6 +626,35 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "").ok();
     }
 
+    // `extern function name(params) -> ret` (spec §9) — emit C-linkage
+    // forward declarations at file scope so the user's `--ref-src
+    // <file>.cpp` can satisfy the linker without HARC needing to know
+    // its implementation. Wrap in a single `extern "C" { … }` block
+    // so even C++ source files that don't add their own `extern "C"`
+    // get the right calling convention.
+    let extern_fns: Vec<&ExternFnDecl> = file.items.iter().filter_map(|it| match it {
+        Item::ExternFn(f) => Some(f),
+        _ => None,
+    }).collect();
+    if !extern_fns.is_empty() {
+        writeln!(e.out, "// extern reference functions (spec §9) — implementations").ok();
+        writeln!(e.out, "// supplied via `harc sim --ref-src <file>` and linked into the").ok();
+        writeln!(e.out, "// verilator-built binary.").ok();
+        writeln!(e.out, "extern \"C\" {{").ok();
+        for f in &extern_fns {
+            let ret = f.return_ty.as_ref().map(c_type_for).unwrap_or_else(|| "void".to_string());
+            write!(e.out, "{INDENT}{ret} {}(", f.name.name).ok();
+            for (i, p) in f.params.iter().enumerate() {
+                if i > 0 { write!(e.out, ", ").ok(); }
+                let pty = p.ty.as_ref().map(c_type_for).unwrap_or_else(|| "int64_t".to_string());
+                write!(e.out, "{pty} {}", p.name.name).ok();
+            }
+            writeln!(e.out, ");").ok();
+        }
+        writeln!(e.out, "}}").ok();
+        writeln!(e.out, "").ok();
+    }
+
     writeln!(e.out, "int main(int argc, char** argv) {{").ok();
     writeln!(e.out, "{INDENT}Verilated::commandArgs(argc, argv);").ok();
     writeln!(e.out, "{INDENT}V{dut_type}* dut = new V{dut_type};").ok();

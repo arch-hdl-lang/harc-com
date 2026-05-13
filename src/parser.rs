@@ -269,6 +269,7 @@ impl Parser {
             }
             Some(TokenKind::Module) => self.parse_external_module(doc).map(Item::ExternalModule),
             Some(TokenKind::Function) => self.parse_function(doc).map(Item::Function),
+            Some(TokenKind::Extern) => self.parse_extern_fn(doc).map(Item::ExternFn),
             Some(TokenKind::Apply) => self.parse_apply().map(Item::Apply),
             Some(TokenKind::Bus) => self.parse_bus(doc).map(Item::Bus),
             Some(TokenKind::Impl) => self.parse_impl(doc).map(Item::Impl),
@@ -1384,6 +1385,38 @@ impl Parser {
         let stmts = self.parse_stmt_list_until_end()?;
         let end = self.expect_end(TokenKind::Function, &name.name)?;
         Ok(FunctionDecl { name, params, return_ty, body: Block { stmts, span: body_start.merge(end) }, span: start.merge(end), doc, inner_doc })
+    }
+
+    /// `extern function <name>(<params>) [-> <ret>]` — forward-declares
+    /// a C / C++ reference function (spec §9). No body, no
+    /// `end function` — the declaration terminates at the return type
+    /// (or after the param list, for a void function). The
+    /// implementation lives in a separate source file passed via
+    /// `harc sim --ref-src <file>`.
+    fn parse_extern_fn(&mut self, doc: Option<String>) -> Result<ExternFnDecl, CompileError> {
+        let start = self.expect(TokenKind::Extern)?.span;
+        // `extern` is only valid as a prefix to `function` in v0.
+        // Reject anything else with a clear error.
+        if !self.check(TokenKind::Function) {
+            return Err(CompileError::unexpected_token(
+                "`function` after `extern`",
+                &self.peek_kind().map(|k| k.to_string()).unwrap_or_else(|| "EOF".into()),
+                self.peek_span(),
+            ));
+        }
+        self.advance();
+        let name = self.expect_ident()?;
+        let params = self.parse_paren_params()?;
+        let return_ty = if self.check(TokenKind::RArrow) {
+            self.advance();
+            Some(self.parse_type_expr()?)
+        } else {
+            None
+        };
+        let end_span = return_ty.as_ref()
+            .map(|t| t.span())
+            .unwrap_or_else(|| params.last().map(|p| p.span).unwrap_or(name.span));
+        Ok(ExternFnDecl { name, params, return_ty, span: start.merge(end_span), doc })
     }
 
     // ── Generic / function parameters ─────────────────────────────────────────

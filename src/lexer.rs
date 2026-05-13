@@ -76,6 +76,8 @@ pub enum TokenKind {
     Use,
     #[token("function")]
     Function,
+    #[token("extern")]
+    Extern,
     #[token("package")]
     Package,
     #[token("domain")]
@@ -499,6 +501,7 @@ impl fmt::Display for TokenKind {
             Seq => write!(f, "seq"),
             Use => write!(f, "use"),
             Function => write!(f, "function"),
+            Extern => write!(f, "extern"),
             Package => write!(f, "package"),
             Domain => write!(f, "domain"),
             Clock => write!(f, "Clock"),
