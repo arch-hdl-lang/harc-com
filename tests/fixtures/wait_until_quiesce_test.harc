@@ -1,0 +1,75 @@
+// End-to-end demo of `wait until …` + `timeout … fail("…")` —
+// spec §7.9. Builds on the heartbeat foundation from §7.8: instead
+// of hand-rolling a `while !prod.idle_in(8) && waited < N` loop,
+// the test expresses the termination condition directly:
+//
+//   wait until all of prod.idle_in(8), prod.seen == 3
+//       timeout 200 cycles fail("agent did not quiesce")
+//
+// On timeout, the codegen emits a per-sub-predicate diagnostic
+// identifying which condition(s) were still false (e.g.
+// "not yet true: prod.seen == 3"). The user gets exact attribution
+// of why the wait expired — the thing UVM's objection mechanism
+// never could.
+//
+// The DUT is `Top` (the counter from top_counter_test) acting as a
+// noop background clock source. The test logic exercises the
+// heartbeat path: emit 3 events into `prod.in_ev` spaced 3 cycles
+// apart, then wait until both
+//   1) prod has been idle on input for ≥ 8 cycles since last emit
+//   2) the agent has handled all 3 events
+// hold simultaneously. The budget (200 cycles) is much larger than
+// the actual quiesce time (≈ 5 cycles after the last emit) so the
+// timeout arm should NOT fire in steady state.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction TinyTxn
+    tag : uint<8>
+end transaction TinyTxn
+
+agent Producer
+    in_ev : event<TinyTxn>
+    seen  : uint<32> default 0
+
+    on in_ev(t)
+        seen = seen + 1
+    end on
+end agent Producer
+
+test WaitUntilQuiesceTest
+    let dut : Top
+
+    clock clk = SysDomain
+
+    let prod : Producer
+end test WaitUntilQuiesceTest
+
+impl sim for WaitUntilQuiesceTest
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Emit 3 transactions spaced 3 cycles apart.
+        for i in 0 .. 3
+            let t : TinyTxn
+            t.tag = i
+            emit prod.in_ev(t)
+            wait 3 cycles
+        end for
+
+        // The end-of-test predicate: agent has been idle for ≥ 8
+        // cycles AND has handled exactly 3 events. With a 200-cycle
+        // budget the wait should complete in ≈ 5 cycles; the
+        // timeout arm is a safety net.
+        wait until all of prod.idle_in(8), prod.seen == 3
+            timeout 200 cycles fail("agent did not quiesce within 200 cycles")
+
+        log(info, "PASS: wait until quiesced after seen=${prod.seen}")
+    end run
+end impl WaitUntilQuiesceTest
