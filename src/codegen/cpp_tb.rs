@@ -45,8 +45,7 @@ use std::fmt::Write;
 /// time via `include_str!` and dropped into the test build dir by
 /// `harc sim` so the emitted `.cpp` can `#include "harc_thread_rt.h"`
 /// without a separate file dependency.
-pub const THREAD_RT_HEADER: &str =
-    include_str!("../../runtime/harc_thread_rt.h");
+pub const THREAD_RT_HEADER: &str = include_str!("../../runtime/harc_thread_rt.h");
 
 const INDENT: &str = "    ";
 
@@ -97,10 +96,14 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
 
 pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitError> {
     // Find a single `test` item — the entry point.
-    let test_decl = file.items.iter().find_map(|it| match it {
-        Item::Test(t) => Some(t),
-        _ => None,
-    }).ok_or_else(|| EmitError("no `test` declaration found".into()))?;
+    let test_decl = file
+        .items
+        .iter()
+        .find_map(|it| match it {
+            Item::Test(t) => Some(t),
+            _ => None,
+        })
+        .ok_or_else(|| EmitError("no `test` declaration found".into()))?;
 
     // Per-target test impl blocks (spec §7.2). `impl sim for <Test>`
     // contributes its reserved phase blocks (setup/run/check/teardown)
@@ -113,18 +116,25 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // non-sim targets (e.g. `impl emu for ...`) we fail with a clear
     // "not yet implemented" error rather than silently producing an
     // empty binary.
-    let impls_for_test: Vec<&ImplDecl> = file.items.iter().filter_map(|it| match it {
-        Item::Impl(i) if i.test_name.name == test_decl.name.name => Some(i),
-        _ => None,
-    }).collect();
+    let impls_for_test: Vec<&ImplDecl> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Impl(i) if i.test_name.name == test_decl.name.name => Some(i),
+            _ => None,
+        })
+        .collect();
 
-    let sim_impl: Option<&ImplDecl> = impls_for_test.iter()
+    let sim_impl: Option<&ImplDecl> = impls_for_test
+        .iter()
         .copied()
         .find(|i| i.target.name == "sim");
 
     if !impls_for_test.is_empty() && sim_impl.is_none() {
-        let targets: Vec<&str> = impls_for_test.iter()
-            .map(|i| i.target.name.as_str()).collect();
+        let targets: Vec<&str> = impls_for_test
+            .iter()
+            .map(|i| i.target.name.as_str())
+            .collect();
         return Err(EmitError(format!(
             "test `{}` has only non-sim impls (targets: {}); v0 codegen \
              only supports `impl sim for ...` — `emu` and other targets \
@@ -160,12 +170,16 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             // Only synthesize the Scope if at least one reserved phase
             // is present — empty impl blocks (only custom phases) leave
             // the test's existing scope/bare-stmt items untouched.
-            if setup.is_some() || run.is_some()
-                || check.is_some() || teardown.is_some()
-            {
+            if setup.is_some() || run.is_some() || check.is_some() || teardown.is_some() {
                 let scope = ScopeDecl {
-                    name: Ident { name: "sim".into(), span: im.span },
-                    setup, run, check, teardown,
+                    name: Ident {
+                        name: "sim".into(),
+                        span: im.span,
+                    },
+                    setup,
+                    run,
+                    check,
+                    teardown,
                     span: im.span,
                 };
                 t.items.push(TestItem::Scope(scope));
@@ -177,23 +191,30 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
 
     // Collect top-level functions — emitted as lambdas inside main() so they
     // can capture `dut` and `tick` lexically.
-    let funcs: Vec<&FunctionDecl> = file.items.iter().filter_map(|it| match it {
-        Item::Function(f) => Some(f),
-        _ => None,
-    }).collect();
+    let funcs: Vec<&FunctionDecl> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Function(f) => Some(f),
+            _ => None,
+        })
+        .collect();
 
     // Collect `tseq` declarations — same hoisting strategy as functions,
     // emitted as `std::function`-shaped lambdas returning `std::vector<T>`
     // built up via `yield`.
-    let tseqs: Vec<&TseqDecl> = file.items.iter().filter_map(|it| match it {
-        Item::Tseq(t) => Some(t),
-        _ => None,
-    }).collect();
+    let tseqs: Vec<&TseqDecl> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Tseq(t) => Some(t),
+            _ => None,
+        })
+        .collect();
 
     // Index `domain Foo freq_mhz: N end domain Foo` decls so a `clock X =
     // Foo` reference can resolve N to a wall-clock period (1/N µs → ps).
-    let mut domains: std::collections::HashMap<String, i64> =
-        std::collections::HashMap::new();
+    let mut domains: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for it in &file.items {
         if let Item::Domain(d) = it {
             for f in &d.fields {
@@ -240,9 +261,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             _ => {}
         }
     }
-    let dut_type = dut_type.ok_or_else(|| EmitError(
-        "expected `let dut : <Type>` declaration in test body".into()
-    ))?;
+    let dut_type = dut_type
+        .ok_or_else(|| EmitError("expected `let dut : <Type>` declaration in test body".into()))?;
 
     // Mixing rule was previously "pick one of scope sim or bare statements";
     // relaxed now to "items emit in declaration order" so a property-extend
@@ -263,8 +283,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         std::collections::HashMap::new();
     let mut covergroups: std::collections::HashMap<String, CovergroupDecl> =
         std::collections::HashMap::new();
-    let mut buses: std::collections::HashMap<String, BusDecl> =
-        std::collections::HashMap::new();
+    let mut buses: std::collections::HashMap<String, BusDecl> = std::collections::HashMap::new();
     let mut transactors: std::collections::HashMap<String, TransactorDecl> =
         std::collections::HashMap::new();
     let mut txn_fields: std::collections::HashMap<String, Vec<TxnFieldInfo>> =
@@ -308,9 +327,15 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) => {
                 components.insert(c.name.name.clone(), c.clone());
             }
-            Item::Covergroup(g) => { covergroups.insert(g.name.name.clone(), g.clone()); }
-            Item::Bus(b) => { buses.insert(b.name.name.clone(), b.clone()); }
-            Item::Transactor(t) => { transactors.insert(t.name.name.clone(), t.clone()); }
+            Item::Covergroup(g) => {
+                covergroups.insert(g.name.name.clone(), g.clone());
+            }
+            Item::Bus(b) => {
+                buses.insert(b.name.name.clone(), b.clone());
+            }
+            Item::Transactor(t) => {
+                transactors.insert(t.name.name.clone(), t.clone());
+            }
             _ => {}
         }
     }
@@ -318,35 +343,45 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         match it {
             Item::Transaction(t) => {
                 transactions.insert(t.name.name.clone());
-                let fields = t.body.iter().filter_map(|it| match it {
-                    TxnBodyItem::Field(f) => {
-                        let width = match &f.ty {
-                            TypeExpr::Builtin { name, args, .. } => match name {
-                                BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits
-                                | BuiltinTy::UIntCap | BuiltinTy::SIntCap =>
-                                    type_arg_width(args).unwrap_or(64),
-                                BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => 1,
+                let fields = t
+                    .body
+                    .iter()
+                    .filter_map(|it| match it {
+                        TxnBodyItem::Field(f) => {
+                            let width = match &f.ty {
+                                TypeExpr::Builtin { name, args, .. } => match name {
+                                    BuiltinTy::UInt
+                                    | BuiltinTy::SInt
+                                    | BuiltinTy::Bits
+                                    | BuiltinTy::UIntCap
+                                    | BuiltinTy::SIntCap => type_arg_width(args).unwrap_or(64),
+                                    BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => 1,
+                                    _ => 64,
+                                },
                                 _ => 64,
-                            },
-                            _ => 64,
-                        };
-                        Some(TxnFieldInfo {
-                            name: f.name.name.clone(),
-                            width,
-                            non_random: f.non_random,
-                        })
-                    }
-                    _ => None,
-                }).collect();
+                            };
+                            Some(TxnFieldInfo {
+                                name: f.name.name.clone(),
+                                width,
+                                non_random: f.non_random,
+                            })
+                        }
+                        _ => None,
+                    })
+                    .collect();
                 txn_fields.insert(t.name.name.clone(), fields);
                 // Collect transaction-level `keep` constraints. v0
                 // ignores keeps nested inside `when subtype { ... }`
                 // — those need discriminated-subtype lowering that
                 // doesn't exist yet (see TODO in spec §3.3 / §4).
-                let keeps: Vec<Expr> = t.body.iter().filter_map(|it| match it {
-                    TxnBodyItem::Keep(k) => Some(k.expr.clone()),
-                    _ => None,
-                }).collect();
+                let keeps: Vec<Expr> = t
+                    .body
+                    .iter()
+                    .filter_map(|it| match it {
+                        TxnBodyItem::Keep(k) => Some(k.expr.clone()),
+                        _ => None,
+                    })
+                    .collect();
                 if !keeps.is_empty() {
                     txn_keeps.insert(t.name.name.clone(), keeps);
                 }
@@ -485,7 +520,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     writeln!(e.out, "#include \"harc_thread_rt.h\"").ok();
     let uses_solver = file_uses_constraint_solver(file);
     if uses_solver {
-        writeln!(e.out, "#include <z3++.h>   // randomize(t) with <constraints>").ok();
+        writeln!(
+            e.out,
+            "#include <z3++.h>   // randomize(t) with <constraints>"
+        )
+        .ok();
     }
     writeln!(e.out, "").ok();
 
@@ -493,23 +532,59 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // SplitMix64 — small, fast, pure stdlib. Seed loaded from HARC_SEED.
     writeln!(e.out, "static uint64_t harc_rng_state = 0;").ok();
     writeln!(e.out, "static inline uint64_t harc_rng_next() {{").ok();
-    writeln!(e.out, "{INDENT}uint64_t z = (harc_rng_state += 0x9E3779B97F4A7C15ULL);").ok();
-    writeln!(e.out, "{INDENT}z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;").ok();
-    writeln!(e.out, "{INDENT}z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;").ok();
+    writeln!(
+        e.out,
+        "{INDENT}uint64_t z = (harc_rng_state += 0x9E3779B97F4A7C15ULL);"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}return z ^ (z >> 31);").ok();
     writeln!(e.out, "}}").ok();
-    writeln!(e.out, "static inline int64_t harc_rng_range(int64_t lo, int64_t hi) {{").ok();
+    writeln!(
+        e.out,
+        "static inline int64_t harc_rng_range(int64_t lo, int64_t hi) {{"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}if (hi <= lo) return lo;").ok();
-    writeln!(e.out, "{INDENT}return lo + (int64_t)(harc_rng_next() % (uint64_t)(hi - lo + 1));").ok();
+    writeln!(
+        e.out,
+        "{INDENT}return lo + (int64_t)(harc_rng_next() % (uint64_t)(hi - lo + 1));"
+    )
+    .ok();
     writeln!(e.out, "}}").ok();
-    writeln!(e.out, "static inline uint64_t harc_rng_uint(unsigned width) {{").ok();
+    writeln!(
+        e.out,
+        "static inline uint64_t harc_rng_uint(unsigned width) {{"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}if (width >= 64) return harc_rng_next();").ok();
-    writeln!(e.out, "{INDENT}return harc_rng_next() & ((1ULL << width) - 1);").ok();
+    writeln!(
+        e.out,
+        "{INDENT}return harc_rng_next() & ((1ULL << width) - 1);"
+    )
+    .ok();
     writeln!(e.out, "}}").ok();
     writeln!(e.out, "static inline int64_t harc_rng_dist(const std::vector<std::tuple<int64_t,int64_t,int64_t>>& bins) {{").ok();
-    writeln!(e.out, "{INDENT}int64_t total = 0; for (auto& b : bins) total += std::get<2>(b);").ok();
+    writeln!(
+        e.out,
+        "{INDENT}int64_t total = 0; for (auto& b : bins) total += std::get<2>(b);"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}if (total <= 0) return 0;").ok();
-    writeln!(e.out, "{INDENT}int64_t pick = (int64_t)(harc_rng_next() % (uint64_t)total);").ok();
+    writeln!(
+        e.out,
+        "{INDENT}int64_t pick = (int64_t)(harc_rng_next() % (uint64_t)total);"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}int64_t acc = 0;").ok();
     writeln!(e.out, "{INDENT}for (auto& b : bins) {{ acc += std::get<2>(b); if (pick < acc) return harc_rng_range(std::get<0>(b), std::get<1>(b)); }}").ok();
     writeln!(e.out, "{INDENT}return std::get<0>(bins.front());").ok();
@@ -519,13 +594,20 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // Tiny FIFO wrapper for `queue<T>` scoreboard fields. Provides pop()
     // returning the front element (std::queue separates front/pop), and
     // empty()/size(). Emitted only when scoreboards exist.
-    let any_scoreboard = file.items.iter().any(|it| matches!(it, Item::Scoreboard(_)));
+    let any_scoreboard = file
+        .items
+        .iter()
+        .any(|it| matches!(it, Item::Scoreboard(_)));
     if any_scoreboard {
         writeln!(e.out, "#include <deque>").ok();
         writeln!(e.out, "template<typename T> struct HarcQueue {{").ok();
         writeln!(e.out, "{INDENT}std::deque<T> _d;").ok();
         writeln!(e.out, "{INDENT}void push(T v) {{ _d.push_back(v); }}").ok();
-        writeln!(e.out, "{INDENT}T pop() {{ T v = _d.front(); _d.pop_front(); return v; }}").ok();
+        writeln!(
+            e.out,
+            "{INDENT}T pop() {{ T v = _d.front(); _d.pop_front(); return v; }}"
+        )
+        .ok();
         writeln!(e.out, "{INDENT}bool empty() const {{ return _d.empty(); }}").ok();
         writeln!(e.out, "{INDENT}size_t size() const {{ return _d.size(); }}").ok();
         writeln!(e.out, "}};").ok();
@@ -561,7 +643,9 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     for it in &file.items {
         if let Item::Bus(b) = it {
             for h in &b.handshakes {
-                if h.payload.is_empty() { continue; }
+                if h.payload.is_empty() {
+                    continue;
+                }
                 let struct_name = format!("{}_{}_payload", b.name.name, h.name.name);
                 writeln!(e.out, "struct {struct_name} {{").ok();
                 for sig in &h.payload {
@@ -577,7 +661,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                     e.out,
                     "{INDENT}operator {first_cty}() const {{ return {}; }}",
                     first_sig.name.name,
-                ).ok();
+                )
+                .ok();
                 writeln!(e.out, "}};").ok();
                 writeln!(e.out, "").ok();
             }
@@ -604,7 +689,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                 // subscribe to / spawn actors against the active
                 // fields. Mode-specific elision lives in the lowering
                 // at instantiation, not in the struct shape.
-                let synth = synth_component_from_transactor(t, /*include_active*/true);
+                let synth = synth_component_from_transactor(t, /*include_active*/ true);
                 e.emit_component_struct(&synth);
             }
             _ => {}
@@ -629,7 +714,10 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     let mut emitted_const = false;
     for it in &file.items {
         if let Item::Const(c) = it {
-            let cty = c.ty.as_ref().map(c_type_for).unwrap_or_else(|| "int64_t".to_string());
+            let cty =
+                c.ty.as_ref()
+                    .map(c_type_for)
+                    .unwrap_or_else(|| "int64_t".to_string());
             write!(e.out, "static constexpr {cty} {} = ", c.name.name).ok();
             e.emit_expr(&c.value);
             writeln!(e.out, ";").ok();
@@ -686,15 +774,31 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // sim.log captures every log()/assert/fail line with cycle + severity
     // prefix. Path is configurable via the HARC_SIM_LOG env var (so the
     // outer harness can put it in the build dir); default `sim.log` in cwd.
-    writeln!(e.out, "{INDENT}const char* sim_log_path = std::getenv(\"HARC_SIM_LOG\");").ok();
-    writeln!(e.out, "{INDENT}if (!sim_log_path) sim_log_path = \"sim.log\";").ok();
-    writeln!(e.out, "{INDENT}FILE* sim_log = std::fopen(sim_log_path, \"w\");").ok();
+    writeln!(
+        e.out,
+        "{INDENT}const char* sim_log_path = std::getenv(\"HARC_SIM_LOG\");"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}if (!sim_log_path) sim_log_path = \"sim.log\";"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}FILE* sim_log = std::fopen(sim_log_path, \"w\");"
+    )
+    .ok();
     writeln!(e.out, "").ok();
     // Concurrent assertion hook — every `assert property <expr>` /
     // `assert property NAME` registers a closure here; tick() invokes the
     // whole list after each `eval()`. Same-cycle (`|->`) and one-cycle
     // (`|=>`) properties run on every primary-clock edge.
-    writeln!(e.out, "{INDENT}std::vector<std::function<void()>> _checkers;").ok();
+    writeln!(
+        e.out,
+        "{INDENT}std::vector<std::function<void()>> _checkers;"
+    )
+    .ok();
     writeln!(e.out, "").ok();
 
     if clocks.is_empty() {
@@ -733,30 +837,70 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             };
             let half = period_ps / 2;
             // First edge fires at half_period (rising) so initial state is 0.
-            writeln!(e.out, "{INDENT}clocks_.push_back(ClockState{{\"{}\", {half}, {half}, 0, 0}});",
-                c.name.name).ok();
+            writeln!(
+                e.out,
+                "{INDENT}clocks_.push_back(ClockState{{\"{}\", {half}, {half}, 0, 0}});",
+                c.name.name
+            )
+            .ok();
             writeln!(e.out, "{INDENT}dut->{} = 0;", c.name.name).ok();
         }
         writeln!(e.out, "").ok();
-        writeln!(e.out, "{INDENT}auto eval_clocks_until = [&](long long t_ps) {{").ok();
+        writeln!(
+            e.out,
+            "{INDENT}auto eval_clocks_until = [&](long long t_ps) {{"
+        )
+        .ok();
         writeln!(e.out, "{INDENT}{INDENT}while (now_ps < t_ps) {{").ok();
         writeln!(e.out, "{INDENT}{INDENT}{INDENT}long long next = t_ps;").ok();
         writeln!(e.out, "{INDENT}{INDENT}{INDENT}for (auto& c : clocks_) if (c.next_edge_ps < next) next = c.next_edge_ps;").ok();
         writeln!(e.out, "{INDENT}{INDENT}{INDENT}now_ps = next;").ok();
-        writeln!(e.out, "{INDENT}{INDENT}{INDENT}for (size_t i = 0; i < clocks_.size(); i++) {{").ok();
-        writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}auto& c = clocks_[i];").ok();
-        writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}if (c.next_edge_ps == now_ps) {{").ok();
-        writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}c.level = !c.level;").ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}{INDENT}for (size_t i = 0; i < clocks_.size(); i++) {{"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}{INDENT}{INDENT}auto& c = clocks_[i];"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}{INDENT}{INDENT}if (c.next_edge_ps == now_ps) {{"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}c.level = !c.level;"
+        )
+        .ok();
         // Per-clock signal write — done by name lookup.
         for (idx, c) in clocks.iter().enumerate() {
-            writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (i == {idx}) dut->{} = c.level;",
-                c.name.name).ok();
+            writeln!(
+                e.out,
+                "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (i == {idx}) dut->{} = c.level;",
+                c.name.name
+            )
+            .ok();
         }
-        writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}c.next_edge_ps += c.half_period_ps;").ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}c.next_edge_ps += c.half_period_ps;"
+        )
+        .ok();
         // Per-clock rising-edge count (consumed by `wait N cycles on <clock>`).
-        writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (c.level == 1) c.rising_count++;").ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (c.level == 1) c.rising_count++;"
+        )
+        .ok();
         // Primary clock rising edge bumps cycle_count.
-        writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (i == 0 && c.level == 1) cycle_count++;").ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (i == 0 && c.level == 1) cycle_count++;"
+        )
+        .ok();
         writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}}}").ok();
         writeln!(e.out, "{INDENT}{INDENT}{INDENT}}}").ok();
         writeln!(e.out, "{INDENT}{INDENT}{INDENT}dut->eval();").ok();
@@ -766,7 +910,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         // `tick()` advances by one full primary clock period (one rising
         // edge). Other clocks tick at their natural rate during this span.
         writeln!(e.out, "{INDENT}auto tick = [&]() {{").ok();
-        writeln!(e.out, "{INDENT}{INDENT}long long target = now_ps + clocks_[0].half_period_ps * 2;").ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}long long target = now_ps + clocks_[0].half_period_ps * 2;"
+        )
+        .ok();
         writeln!(e.out, "{INDENT}{INDENT}eval_clocks_until(target);").ok();
         writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
         writeln!(e.out, "{INDENT}}};").ok();
@@ -778,30 +926,86 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // Per-file log handles, opened on first reference, closed at exit.
     // Relative paths are anchored to HARC_LOG_DIR (set by `harc sim` to the
     // outdir) so per-component files land next to sim.log.
-    writeln!(e.out, "{INDENT}std::unordered_map<std::string, FILE*> log_files;").ok();
-    writeln!(e.out, "{INDENT}auto resolve_log_path = [&](const char* path) -> std::string {{").ok();
-    writeln!(e.out, "{INDENT}{INDENT}if (path[0] == '/') return std::string(path);").ok();
-    writeln!(e.out, "{INDENT}{INDENT}const char* base = std::getenv(\"HARC_LOG_DIR\");").ok();
-    writeln!(e.out, "{INDENT}{INDENT}if (base) return std::string(base) + \"/\" + path;").ok();
+    writeln!(
+        e.out,
+        "{INDENT}std::unordered_map<std::string, FILE*> log_files;"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}auto resolve_log_path = [&](const char* path) -> std::string {{"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}if (path[0] == '/') return std::string(path);"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}const char* base = std::getenv(\"HARC_LOG_DIR\");"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}if (base) return std::string(base) + \"/\" + path;"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}{INDENT}return std::string(path);").ok();
     writeln!(e.out, "{INDENT}}};").ok();
-    writeln!(e.out, "{INDENT}auto get_log_file = [&](const char* path) -> FILE* {{").ok();
-    writeln!(e.out, "{INDENT}{INDENT}std::string resolved = resolve_log_path(path);").ok();
+    writeln!(
+        e.out,
+        "{INDENT}auto get_log_file = [&](const char* path) -> FILE* {{"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}std::string resolved = resolve_log_path(path);"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}{INDENT}auto it = log_files.find(resolved);").ok();
-    writeln!(e.out, "{INDENT}{INDENT}if (it != log_files.end()) return it->second;").ok();
-    writeln!(e.out, "{INDENT}{INDENT}FILE* f = std::fopen(resolved.c_str(), \"w\");").ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}if (it != log_files.end()) return it->second;"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}FILE* f = std::fopen(resolved.c_str(), \"w\");"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}{INDENT}log_files[resolved] = f;").ok();
     writeln!(e.out, "{INDENT}{INDENT}return f;").ok();
     writeln!(e.out, "{INDENT}}};").ok();
     writeln!(e.out, "").ok();
-    writeln!(e.out, "{INDENT}auto sim_logf_line = [&](FILE* f, const char* sev, const char* fmt, ...) {{").ok();
+    writeln!(
+        e.out,
+        "{INDENT}auto sim_logf_line = [&](FILE* f, const char* sev, const char* fmt, ...) {{"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}{INDENT}va_list ap;").ok();
-    writeln!(e.out, "{INDENT}{INDENT}std::printf(\"[cycle:%d %s] \", cycle_count, sev);").ok();
-    writeln!(e.out, "{INDENT}{INDENT}va_start(ap, fmt); std::vprintf(fmt, ap); va_end(ap);").ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}std::printf(\"[cycle:%d %s] \", cycle_count, sev);"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}va_start(ap, fmt); std::vprintf(fmt, ap); va_end(ap);"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}{INDENT}std::printf(\"\\n\");").ok();
     writeln!(e.out, "{INDENT}{INDENT}if (f) {{").ok();
-    writeln!(e.out, "{INDENT}{INDENT}{INDENT}std::fprintf(f, \"[cycle:%d %s] \", cycle_count, sev);").ok();
-    writeln!(e.out, "{INDENT}{INDENT}{INDENT}va_start(ap, fmt); std::vfprintf(f, fmt, ap); va_end(ap);").ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}{INDENT}std::fprintf(f, \"[cycle:%d %s] \", cycle_count, sev);"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}{INDENT}va_start(ap, fmt); std::vfprintf(f, fmt, ap); va_end(ap);"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}{INDENT}{INDENT}std::fprintf(f, \"\\n\");").ok();
     writeln!(e.out, "{INDENT}{INDENT}{INDENT}std::fflush(f);").ok();
     writeln!(e.out, "{INDENT}{INDENT}}}").ok();
@@ -811,22 +1015,50 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // in sim.log on every run — required for reproducing failures.
     let log_seed = true;
 
-    writeln!(e.out, "{INDENT}auto sim_log_line = [&](const char* sev, const char* fmt, ...) {{").ok();
+    writeln!(
+        e.out,
+        "{INDENT}auto sim_log_line = [&](const char* sev, const char* fmt, ...) {{"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}{INDENT}va_list ap;").ok();
-    writeln!(e.out, "{INDENT}{INDENT}std::printf(\"[cycle:%d %s] \", cycle_count, sev);").ok();
-    writeln!(e.out, "{INDENT}{INDENT}va_start(ap, fmt); std::vprintf(fmt, ap); va_end(ap);").ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}std::printf(\"[cycle:%d %s] \", cycle_count, sev);"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}va_start(ap, fmt); std::vprintf(fmt, ap); va_end(ap);"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}{INDENT}std::printf(\"\\n\");").ok();
     writeln!(e.out, "{INDENT}{INDENT}if (sim_log) {{").ok();
-    writeln!(e.out, "{INDENT}{INDENT}{INDENT}std::fprintf(sim_log, \"[cycle:%d %s] \", cycle_count, sev);").ok();
-    writeln!(e.out, "{INDENT}{INDENT}{INDENT}va_start(ap, fmt); std::vfprintf(sim_log, fmt, ap); va_end(ap);").ok();
-    writeln!(e.out, "{INDENT}{INDENT}{INDENT}std::fprintf(sim_log, \"\\n\");").ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}{INDENT}std::fprintf(sim_log, \"[cycle:%d %s] \", cycle_count, sev);"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}{INDENT}va_start(ap, fmt); std::vfprintf(sim_log, fmt, ap); va_end(ap);"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}{INDENT}std::fprintf(sim_log, \"\\n\");"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}{INDENT}{INDENT}std::fflush(sim_log);").ok();
     writeln!(e.out, "{INDENT}{INDENT}}}").ok();
     writeln!(e.out, "{INDENT}}};").ok();
     writeln!(e.out, "").ok();
 
     if log_seed {
-        writeln!(e.out, "{INDENT}sim_log_line(\"INFO\", \"seed=%llu\", (long long)harc_rng_state);").ok();
+        writeln!(
+            e.out,
+            "{INDENT}sim_log_line(\"INFO\", \"seed=%llu\", (long long)harc_rng_state);"
+        )
+        .ok();
         writeln!(e.out, "").ok();
     }
 
@@ -837,25 +1069,6 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         e.emit_function(f, 1);
     }
     if !funcs.is_empty() {
-        writeln!(e.out, "").ok();
-    }
-    // Custom `phase <name> ... end phase <name>` blocks from
-    // `impl sim for <Test>` (spec §7.2). Emitted as `[&]`-capturing
-    // void-returning lambdas at main() scope, identical shape to free
-    // functions — calls of the form `<name>()` from inside `run` (or
-    // any other phase) lower as plain C++ function calls, with `wait`
-    // inside the body taking the sync `tick()` path because the lambda
-    // body emits with `in_coroutine = false`. v0 places phases AFTER
-    // `funcs` so a phase can call free functions but a free function
-    // cannot call a phase (phases are conceptually test-scoped).
-    if !custom_phases.is_empty() {
-        for (name, body) in &custom_phases {
-            e.pad(1);
-            writeln!(e.out, "auto {} = [&]() -> void {{", name.name).ok();
-            e.emit_block(body, 2);
-            e.pad(1);
-            writeln!(e.out, "}};").ok();
-        }
         writeln!(e.out, "").ok();
     }
     // Tseqs lower to lambdas returning `std::vector<T>`; emitted alongside
@@ -878,8 +1091,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     let mut emitted_any_method = false;
     for it in &file.items {
         match it {
-            Item::Agent(c) | Item::Env(c)
-            | Item::Sequencer(c) | Item::Scoreboard(c) => {
+            Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c) => {
                 for ci in &c.items {
                     if let ComponentItem::Hookable(h) = ci {
                         e.emit_hook_vectors(c, h, 1);
@@ -887,7 +1099,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                 }
             }
             Item::Transactor(t) => {
-                let synth = synth_component_from_transactor(t, /*include_active*/true);
+                let synth = synth_component_from_transactor(t, /*include_active*/ true);
                 for ci in &synth.items {
                     if let ComponentItem::Hookable(h) = ci {
                         e.emit_hook_vectors(&synth, h, 1);
@@ -923,10 +1135,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                             e.emit_expr(v);
                             std::mem::swap(&mut e.out, &mut buf);
                             let prefix = l.name.name.clone();
-                            e.bus_bindings.insert(
-                                l.name.name.clone(),
-                                (bus_decl, buf, prefix),
-                            );
+                            e.bus_bindings
+                                .insert(l.name.name.clone(), (bus_decl, buf, prefix));
                         }
                     }
                 }
@@ -937,9 +1147,15 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         if let TestItem::Let(l) = it {
             if l.bind {
                 if let Some(simple) = type_simple_name(l.ty.as_ref()) {
-                    let bound_decl_to_bus =
-                        e.components.get(simple).and_then(|c| c.bound_to.as_ref().map(|_| ())).is_some()
-                        || e.transactors.get(simple).and_then(|t| t.bound_to.as_ref().map(|_| ())).is_some();
+                    let bound_decl_to_bus = e
+                        .components
+                        .get(simple)
+                        .and_then(|c| c.bound_to.as_ref().map(|_| ()))
+                        .is_some()
+                        || e.transactors
+                            .get(simple)
+                            .and_then(|t| t.bound_to.as_ref().map(|_| ()))
+                            .is_some();
                     if bound_decl_to_bus {
                         if let Some(v) = &l.value {
                             if let ExprKind::Ident(rhs) = &*v.kind {
@@ -963,8 +1179,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // emit_component_method path finds the same struct shape.
     for it in &file.items {
         match it {
-            Item::Agent(c) | Item::Env(c)
-            | Item::Sequencer(c) | Item::Scoreboard(c) => {
+            Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c) => {
                 for ci in &c.items {
                     if let ComponentItem::Hookable(h) = ci {
                         e.emit_component_method(c, h, 1);
@@ -981,7 +1196,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                 // active` is also emitted. Active-only hookables on a
                 // passive instance still compile but won't be invoked
                 // at runtime (no input event firing).
-                let synth = synth_component_from_transactor(t, /*include_active*/true);
+                let synth = synth_component_from_transactor(t, /*include_active*/ true);
                 for ci in &synth.items {
                     if let ComponentItem::Hookable(h) = ci {
                         e.emit_component_method(&synth, h, 1);
@@ -1014,6 +1229,24 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         e.emit_let(l, 1);
     }
 
+    // Custom `phase <name> ... end phase <name>` blocks from
+    // `impl sim for <Test>` (spec §7.2). Emitted after hoisted lets so
+    // phase bodies can reference test-level env/agent/scoreboard
+    // instances. Calls of the form `<name>()` from inside `run` lower as
+    // plain C++ function calls; `wait` inside the phase takes the sync
+    // `tick()` path because the lambda body emits with `in_coroutine =
+    // false`.
+    if !custom_phases.is_empty() {
+        for (name, body) in &custom_phases {
+            e.pad(1);
+            writeln!(e.out, "auto {} = [&]() -> void {{", name.name).ok();
+            e.emit_block(body, 2);
+            e.pad(1);
+            writeln!(e.out, "}};").ok();
+        }
+        writeln!(e.out, "").ok();
+    }
+
     // ── Coroutine wrap for the test body ───────────────────────────────
     //
     // The whole test body (bare stmts + scope sim/{setup,run,check,
@@ -1036,17 +1269,29 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // since the test is over.
     writeln!(e.out, "{INDENT}harc_rt::ThreadSlot _run_slot;").ok();
     writeln!(e.out, "{INDENT}sched.slots.push_back(&_run_slot);").ok();
-    writeln!(e.out, "{INDENT}_run_slot.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{").ok();
+    writeln!(
+        e.out,
+        "{INDENT}_run_slot.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+    )
+    .ok();
 
     e.in_coroutine = true;
     for it in &test.items {
         match it {
             TestItem::Stmt(s) => e.emit_stmt(s, 2),
             TestItem::Scope(s) => {
-                if let Some(b) = &s.setup    { e.emit_block(b, 2); }
-                if let Some(b) = &s.run      { e.emit_block(b, 2); }
-                if let Some(b) = &s.check    { e.emit_block(b, 2); }
-                if let Some(b) = &s.teardown { e.emit_block(b, 2); }
+                if let Some(b) = &s.setup {
+                    e.emit_block(b, 2);
+                }
+                if let Some(b) = &s.run {
+                    e.emit_block(b, 2);
+                }
+                if let Some(b) = &s.check {
+                    e.emit_block(b, 2);
+                }
+                if let Some(b) = &s.teardown {
+                    e.emit_block(b, 2);
+                }
             }
             _ => {}
         }
@@ -1071,8 +1316,16 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // Single-threaded — workers haven't started yet. Each scheduler
     // (main + per-actor) runs its initially-Ready slots once until
     // they hit their first co_await.
-    writeln!(e.out, "{INDENT}// Resume each coroutine once so initial-setup statements run").ok();
-    writeln!(e.out, "{INDENT}// before the first clock edge. Single-threaded — workers").ok();
+    writeln!(
+        e.out,
+        "{INDENT}// Resume each coroutine once so initial-setup statements run"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}// before the first clock edge. Single-threaded — workers"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}// haven't been spawned yet.").ok();
     writeln!(e.out, "{INDENT}sched.bootstrap();").ok();
     if mt {
@@ -1093,18 +1346,41 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         // barrier mirrors arch-com's Phase 3 design (`Barrier` class
         // shared in `harc_thread_rt.h`); cycle batching to amortize
         // barrier cost is Phase 3b.
-        writeln!(e.out, "{INDENT}// Phase 3a: per-actor OS threads with dual barrier sync.").ok();
-        writeln!(e.out, "{INDENT}// {} actor(s) → {} barrier participants (main + workers).",
-            n_actors, n_actors + 1).ok();
+        writeln!(
+            e.out,
+            "{INDENT}// Phase 3a: per-actor OS threads with dual barrier sync."
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}// {} actor(s) → {} barrier participants (main + workers).",
+            n_actors,
+            n_actors + 1
+        )
+        .ok();
         writeln!(e.out, "{INDENT}std::atomic<bool> _shutdown{{false}};").ok();
-        writeln!(e.out, "{INDENT}harc_rt::Barrier _start_barrier({});", n_actors + 1).ok();
-        writeln!(e.out, "{INDENT}harc_rt::Barrier _end_barrier({});",   n_actors + 1).ok();
+        writeln!(
+            e.out,
+            "{INDENT}harc_rt::Barrier _start_barrier({});",
+            n_actors + 1
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}harc_rt::Barrier _end_barrier({});",
+            n_actors + 1
+        )
+        .ok();
         writeln!(e.out, "{INDENT}std::vector<std::thread> _workers;").ok();
         for (sched_var, _) in &e.actor_threads {
             writeln!(e.out, "{INDENT}_workers.emplace_back([&]() {{").ok();
             writeln!(e.out, "{INDENT}{INDENT}while (true) {{").ok();
             writeln!(e.out, "{INDENT}{INDENT}{INDENT}_start_barrier.wait();").ok();
-            writeln!(e.out, "{INDENT}{INDENT}{INDENT}if (_shutdown.load(std::memory_order_acquire)) break;").ok();
+            writeln!(
+                e.out,
+                "{INDENT}{INDENT}{INDENT}if (_shutdown.load(std::memory_order_acquire)) break;"
+            )
+            .ok();
             writeln!(e.out, "{INDENT}{INDENT}{INDENT}{sched_var}.tick();").ok();
             writeln!(e.out, "{INDENT}{INDENT}{INDENT}_end_barrier.wait();").ok();
             writeln!(e.out, "{INDENT}{INDENT}}}").ok();
@@ -1113,36 +1389,104 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "").ok();
     }
 
-    writeln!(e.out, "{INDENT}// Drive the clock until the run coroutine completes.").ok();
+    writeln!(
+        e.out,
+        "{INDENT}// Drive the clock until the run coroutine completes."
+    )
+    .ok();
     writeln!(e.out, "{INDENT}//").ok();
-    writeln!(e.out, "{INDENT}// `wait N cycles` matches Verilog's `@(posedge clk)` semantic:").ok();
-    writeln!(e.out, "{INDENT}// values set in the segment BEFORE the wait are sampled at the").ok();
+    writeln!(
+        e.out,
+        "{INDENT}// `wait N cycles` matches Verilog's `@(posedge clk)` semantic:"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}// values set in the segment BEFORE the wait are sampled at the"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}// next posedge. Per loop iteration:").ok();
-    writeln!(e.out, "{INDENT}//   1. Posedge (clk 0→1, eval) — DUT FFs latch the current input").ok();
-    writeln!(e.out, "{INDENT}//      values (set in the previous segment, or in bootstrap on").ok();
+    writeln!(
+        e.out,
+        "{INDENT}//   1. Posedge (clk 0→1, eval) — DUT FFs latch the current input"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}//      values (set in the previous segment, or in bootstrap on"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}//      the first iteration).").ok();
-    writeln!(e.out, "{INDENT}//   2. `sched.tick()` — advance the run coroutine to its next").ok();
-    writeln!(e.out, "{INDENT}//      wait, setting the inputs for the NEXT cycle's posedge.").ok();
-    writeln!(e.out, "{INDENT}//   3. Falling edge (clk 1→0, eval) — comb re-settles with the").ok();
+    writeln!(
+        e.out,
+        "{INDENT}//   2. `sched.tick()` — advance the run coroutine to its next"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}//      wait, setting the inputs for the NEXT cycle's posedge."
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}//   3. Falling edge (clk 1→0, eval) — comb re-settles with the"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}//      newly-set inputs.").ok();
     writeln!(e.out, "{INDENT}//   4. Cycle counter + checkers.").ok();
-    writeln!(e.out, "{INDENT}// One initial `eval(clk=0)` before the loop settles combinational").ok();
-    writeln!(e.out, "{INDENT}// logic with the bootstrap inputs — same role as `initial`-block").ok();
-    writeln!(e.out, "{INDENT}// settle in Verilog. Each `wait 1 cycle` then maps to exactly").ok();
-    writeln!(e.out, "{INDENT}// one posedge that observes the just-set values.").ok();
+    writeln!(
+        e.out,
+        "{INDENT}// One initial `eval(clk=0)` before the loop settles combinational"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}// logic with the bootstrap inputs — same role as `initial`-block"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}// settle in Verilog. Each `wait 1 cycle` then maps to exactly"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}// one posedge that observes the just-set values."
+    )
+    .ok();
     if mt {
         writeln!(e.out, "{INDENT}//").ok();
-        writeln!(e.out, "{INDENT}// MT mode: workers run between tick() and the falling edge,").ok();
-        writeln!(e.out, "{INDENT}// gated by _start_barrier / _end_barrier. Run-coroutine writes").ok();
-        writeln!(e.out, "{INDENT}// complete BEFORE workers wake → no race on shared queues.").ok();
-        writeln!(e.out, "{INDENT}// Workers' DUT-input writes complete BEFORE the falling-edge").ok();
+        writeln!(
+            e.out,
+            "{INDENT}// MT mode: workers run between tick() and the falling edge,"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}// gated by _start_barrier / _end_barrier. Run-coroutine writes"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}// complete BEFORE workers wake → no race on shared queues."
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}// Workers' DUT-input writes complete BEFORE the falling-edge"
+        )
+        .ok();
         writeln!(e.out, "{INDENT}// eval → no race on signal state.").ok();
     }
     if clocks.is_empty() {
         // Initial comb settle — bootstrap's inputs propagate through
         // combinational logic before the first posedge.
         writeln!(e.out, "{INDENT}dut->clk = 0; dut->eval();").ok();
-        writeln!(e.out, "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {{").ok();
+        writeln!(
+            e.out,
+            "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {{"
+        )
+        .ok();
         // Posedge first — latches current input values.
         writeln!(e.out, "{INDENT}{INDENT}dut->clk = 1; dut->eval();").ok();
         // Then advance the run coroutine for the next cycle's inputs.
@@ -1168,8 +1512,16 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         // first edge. Same effect as the single-clock branch, just
         // with the clock toggling factored into eval_clocks_until.
         writeln!(e.out, "{INDENT}dut->eval();").ok();
-        writeln!(e.out, "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {{").ok();
-        writeln!(e.out, "{INDENT}{INDENT}long long _target = now_ps + clocks_[0].half_period_ps * 2;").ok();
+        writeln!(
+            e.out,
+            "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {{"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}long long _target = now_ps + clocks_[0].half_period_ps * 2;"
+        )
+        .ok();
         writeln!(e.out, "{INDENT}{INDENT}eval_clocks_until(_target);").ok();
         writeln!(e.out, "{INDENT}{INDENT}sched.tick();").ok();
         if mt {
@@ -1186,7 +1538,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         // start barrier; they observe the flag and break out of their
         // loop without reaching _end_barrier. Then join.
         writeln!(e.out, "").ok();
-        writeln!(e.out, "{INDENT}_shutdown.store(true, std::memory_order_release);").ok();
+        writeln!(
+            e.out,
+            "{INDENT}_shutdown.store(true, std::memory_order_release);"
+        )
+        .ok();
         writeln!(e.out, "{INDENT}_start_barrier.wait();").ok();
         writeln!(e.out, "{INDENT}for (auto& _w : _workers) _w.join();").ok();
     }
@@ -1204,8 +1560,12 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "{INDENT}{INDENT}uint64_t _cov_hit = 0;").ok();
         let covers_clone = e.covers.clone();
         for c in &covers_clone {
-            writeln!(e.out, "{INDENT}{INDENT}if (_cov_{tag}_hits > 0) _cov_hit++;",
-                tag = c.tag).ok();
+            writeln!(
+                e.out,
+                "{INDENT}{INDENT}if (_cov_{tag}_hits > 0) _cov_hit++;",
+                tag = c.tag
+            )
+            .ok();
         }
         writeln!(e.out, "{INDENT}{INDENT}std::printf(\"[cover] %llu/%llu hit (%.1f%%)\\n\", (unsigned long long)_cov_hit, (unsigned long long)_cov_total, _cov_total ? (100.0 * _cov_hit / _cov_total) : 0.0);").ok();
         for c in &covers_clone {
@@ -1224,17 +1584,37 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // ifdef'd so a coverage-built TB is the only difference.
     writeln!(e.out, "#if VM_COVERAGE").ok();
     writeln!(e.out, "{INDENT}{{").ok();
-    writeln!(e.out, "{INDENT}{INDENT}const char* _cov_dir = std::getenv(\"HARC_LOG_DIR\");").ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}const char* _cov_dir = std::getenv(\"HARC_LOG_DIR\");"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}{INDENT}std::string _cov_path = _cov_dir ? std::string(_cov_dir) + \"/coverage.dat\" : std::string(\"coverage.dat\");").ok();
-    writeln!(e.out, "{INDENT}{INDENT}Verilated::threadContextp()->coveragep()->write(_cov_path.c_str());").ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}Verilated::threadContextp()->coveragep()->write(_cov_path.c_str());"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}}}").ok();
     writeln!(e.out, "#endif").ok();
     writeln!(e.out, "{INDENT}delete dut;").ok();
     writeln!(e.out, "{INDENT}if (sim_log) std::fclose(sim_log);").ok();
-    writeln!(e.out, "{INDENT}for (auto& kv : log_files) {{ if (kv.second) std::fclose(kv.second); }}").ok();
+    writeln!(
+        e.out,
+        "{INDENT}for (auto& kv : log_files) {{ if (kv.second) std::fclose(kv.second); }}"
+    )
+    .ok();
     writeln!(e.out, "").ok();
-    writeln!(e.out, "{INDENT}if (errors == 0) {{ std::printf(\"\\nALL TESTS PASSED\\n\"); return 0; }}").ok();
-    writeln!(e.out, "{INDENT}else             {{ std::printf(\"\\n%d TESTS FAILED\\n\", errors); return 1; }}").ok();
+    writeln!(
+        e.out,
+        "{INDENT}if (errors == 0) {{ std::printf(\"\\nALL TESTS PASSED\\n\"); return 0; }}"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}else             {{ std::printf(\"\\n%d TESTS FAILED\\n\", errors); return 1; }}"
+    )
+    .ok();
     writeln!(e.out, "}}").ok();
 
     if !e.errors.is_empty() {
@@ -1288,6 +1668,31 @@ fn type_simple_name(t: Option<&TypeExpr>) -> Option<&str> {
 struct CoverInfo {
     tag: String,
     label: String,
+}
+
+enum WaitCondition<'a> {
+    Expr(&'a Expr),
+    Idle { instance: String, cycles: &'a Expr },
+}
+
+impl<'a> WaitCondition<'a> {
+    fn label(&self) -> String {
+        match self {
+            WaitCondition::Expr(e) => expr_source_str(e),
+            WaitCondition::Idle { instance, cycles } => {
+                format!("{instance}.idle({})", expr_source_str(cycles))
+            }
+        }
+    }
+
+    fn emit(&self, e: &mut Emitter) {
+        match self {
+            WaitCondition::Expr(expr) => e.emit_expr(expr),
+            WaitCondition::Idle { instance, cycles } => {
+                e.emit_idle_predicate(instance, "idle", cycles);
+            }
+        }
+    }
 }
 
 /// Width-typed transaction field info used by the Z3 solver lowering.
@@ -1485,7 +1890,9 @@ struct Emitter {
 
 impl Emitter {
     fn pad(&mut self, depth: usize) {
-        for _ in 0..depth { self.out.push_str(INDENT); }
+        for _ in 0..depth {
+            self.out.push_str(INDENT);
+        }
     }
 
     /// Emit `assert <expr> [else fail("msg")]` as an immediate, point-in-
@@ -1498,7 +1905,9 @@ impl Emitter {
         self.emit_expr(expr);
         writeln!(self.out, ")) {{").ok();
         self.pad(depth + 1);
-        let msg = v.else_fail.as_ref()
+        let msg = v
+            .else_fail
+            .as_ref()
             .and_then(|e| match &*e.kind {
                 ExprKind::String(s) => Some(s.clone()),
                 _ => None,
@@ -1539,9 +1948,11 @@ impl Emitter {
         depth: usize,
     ) {
         if conditions.is_empty() {
-            self.errors.push("wait until: at least one condition required".into());
+            self.errors
+                .push("wait until: at least one condition required".into());
             return;
         }
+        let expanded_conditions = self.expand_wait_conditions(conditions);
         // Combine conditions into one predicate expression in C++.
         // `Single` uses the bare expression; `AllOf` / `AnyOf` are
         // emitted as parenthesized `&&` / `||` chains.
@@ -1550,14 +1961,16 @@ impl Emitter {
             WaitUntilMode::AnyOf => "||",
         };
         let emit_overall_cond = |this: &mut Self| {
-            if conditions.len() == 1 {
-                this.emit_expr(&conditions[0]);
+            if expanded_conditions.len() == 1 {
+                expanded_conditions[0].emit(this);
                 return;
             }
-            for (i, c) in conditions.iter().enumerate() {
-                if i > 0 { write!(this.out, " {joiner} ").ok(); }
+            for (i, c) in expanded_conditions.iter().enumerate() {
+                if i > 0 {
+                    write!(this.out, " {joiner} ").ok();
+                }
                 write!(this.out, "(").ok();
-                this.emit_expr(c);
+                c.emit(this);
                 write!(this.out, ")").ok();
             }
         };
@@ -1568,7 +1981,11 @@ impl Emitter {
                 // scheduler; sync context: a synchronous polling loop.
                 self.pad(depth);
                 if self.in_coroutine {
-                    write!(self.out, "co_await harc_rt::wait_until(_slot, [&]{{ return ").ok();
+                    write!(
+                        self.out,
+                        "co_await harc_rt::wait_until(_slot, [&]{{ return "
+                    )
+                    .ok();
                     emit_overall_cond(self);
                     writeln!(self.out, "; }});").ok();
                 } else {
@@ -1615,7 +2032,11 @@ impl Emitter {
                     self.pad(depth + 1);
                     write!(self.out, "while (!(").ok();
                     emit_overall_cond(self);
-                    writeln!(self.out, ") && ((int64_t)cycle_count - _wu_start) < _wu_budget) {{").ok();
+                    writeln!(
+                        self.out,
+                        ") && ((int64_t)cycle_count - _wu_start) < _wu_budget) {{"
+                    )
+                    .ok();
                     self.pad(depth + 2);
                     writeln!(self.out, "tick();").ok();
                     self.pad(depth + 1);
@@ -1637,13 +2058,15 @@ impl Emitter {
                 if let Some(raw) = header {
                     let (fmt, caps) = process_interp(&raw);
                     write!(self.out, "sim_log_line(\"FAIL\", \"{}\"", escape_c(&fmt)).ok();
-                    for c in &caps { self.emit_interp_arg(c); }
+                    for c in &caps {
+                        self.emit_interp_arg(c);
+                    }
                     writeln!(self.out, ");").ok();
                 } else {
                     let label = match mode {
                         WaitUntilMode::Single => "wait until",
-                        WaitUntilMode::AllOf  => "wait until all of",
-                        WaitUntilMode::AnyOf  => "wait until any of",
+                        WaitUntilMode::AllOf => "wait until all of",
+                        WaitUntilMode::AnyOf => "wait until any of",
                     };
                     writeln!(self.out,
                         "sim_log_line(\"FAIL\", \"{label} timed out after %lld cycles\", (long long)_wu_budget);"
@@ -1652,13 +2075,16 @@ impl Emitter {
                 // Per-sub-predicate breakdown.
                 match mode {
                     WaitUntilMode::Single | WaitUntilMode::AllOf => {
-                        for c in conditions {
-                            let src = expr_source_str(c);
-                            let escaped = escape_c(&src);
+                        for c in &expanded_conditions {
+                            let escaped = escape_c(&c.label());
                             self.pad(depth + 2);
                             write!(self.out, "if (!(").ok();
-                            self.emit_expr(c);
-                            writeln!(self.out, ")) sim_log_line(\"FAIL\", \"  not yet true: {escaped}\");").ok();
+                            c.emit(self);
+                            writeln!(
+                                self.out,
+                                ")) sim_log_line(\"FAIL\", \"  not yet true: {escaped}\");"
+                            )
+                            .ok();
                         }
                     }
                     WaitUntilMode::AnyOf => {
@@ -1666,15 +2092,19 @@ impl Emitter {
                         // being waited on so the user can spot the
                         // expected-firing condition that never fired.
                         let mut joined = String::new();
-                        for (i, c) in conditions.iter().enumerate() {
-                            if i > 0 { joined.push_str(", "); }
-                            joined.push_str(&expr_source_str(c));
+                        for (i, c) in expanded_conditions.iter().enumerate() {
+                            if i > 0 {
+                                joined.push_str(", ");
+                            }
+                            joined.push_str(&c.label());
                         }
                         let escaped = escape_c(&joined);
                         self.pad(depth + 2);
-                        writeln!(self.out,
+                        writeln!(
+                            self.out,
                             "sim_log_line(\"FAIL\", \"  none of: {escaped}\");"
-                        ).ok();
+                        )
+                        .ok();
                     }
                 }
                 self.pad(depth + 2);
@@ -1695,7 +2125,11 @@ impl Emitter {
         let expr = v.expr.as_ref().expect("assume without expr");
         write!(self.out, "if (!(").ok();
         self.emit_expr(expr);
-        writeln!(self.out, ")) sim_log_line(\"ASSUME\", \"assumption failed\");").ok();
+        writeln!(
+            self.out,
+            ")) sim_log_line(\"ASSUME\", \"assumption failed\");"
+        )
+        .ok();
     }
 
     /// Register a concurrent (every-primary-clock-edge) property check.
@@ -1706,18 +2140,16 @@ impl Emitter {
     fn emit_property_check(&mut self, severity: &str, v: &Verify, depth: usize) {
         let raw = v.expr.as_ref().expect("assert property without body");
         let body: Expr = match &*raw.kind {
-            ExprKind::Ident(id) => {
-                match self.properties.get(&id.name).cloned() {
-                    Some(b) => b,
-                    None => {
-                        self.errors.push(format!(
-                            "assert property `{}`: no property declaration with that name",
-                            id.name
-                        ));
-                        return;
-                    }
+            ExprKind::Ident(id) => match self.properties.get(&id.name).cloned() {
+                Some(b) => b,
+                None => {
+                    self.errors.push(format!(
+                        "assert property `{}`: no property declaration with that name",
+                        id.name
+                    ));
+                    return;
                 }
-            }
+            },
             _ => raw.clone(),
         };
 
@@ -1744,17 +2176,22 @@ impl Emitter {
             self.emit_expr(&t.inner);
             writeln!(self.out, ");").ok();
             let sub = match t.kind {
-                SystemFn::Past   => format!("{tag}_ps{i}"),
-                SystemFn::Rose   => format!("(!{tag}_ps{i} && {tag}_cur{i})"),
-                SystemFn::Fell   => format!("({tag}_ps{i} && !{tag}_cur{i})"),
+                SystemFn::Past => format!("{tag}_ps{i}"),
+                SystemFn::Rose => format!("(!{tag}_ps{i} && {tag}_cur{i})"),
+                SystemFn::Fell => format!("({tag}_ps{i} && !{tag}_cur{i})"),
                 SystemFn::Stable => format!("({tag}_ps{i} == {tag}_cur{i})"),
-                SystemFn::Clog2  => continue, // not temporal — skip
+                SystemFn::Clog2 => continue, // not temporal — skip
             };
-            self.prop_subs.insert((t.call_span.start, t.call_span.end), sub);
+            self.prop_subs
+                .insert((t.call_span.start, t.call_span.end), sub);
         }
         match &*body.kind {
             // a |=> b — one-cycle-delayed implication. State: prev_a.
-            ExprKind::Binary { op: BinaryOp::PipeImpliesNext, lhs, rhs } => {
+            ExprKind::Binary {
+                op: BinaryOp::PipeImpliesNext,
+                lhs,
+                rhs,
+            } => {
                 self.pad(depth + 1);
                 writeln!(self.out, "static bool {tag}_prev = false;").ok();
                 self.pad(depth + 1);
@@ -1768,7 +2205,12 @@ impl Emitter {
                 self.pad(depth + 1);
                 writeln!(self.out, "if ({tag}_prev && !_curr_b) {{").ok();
                 self.pad(depth + 2);
-                writeln!(self.out, "sim_log_line(\"{severity}\", \"property `{}` failed (|=>)\");", escape_c(&label)).ok();
+                writeln!(
+                    self.out,
+                    "sim_log_line(\"{severity}\", \"property `{}` failed (|=>)\");",
+                    escape_c(&label)
+                )
+                .ok();
                 if severity == "FAIL" {
                     self.pad(depth + 2);
                     writeln!(self.out, "errors++;").ok();
@@ -1779,7 +2221,11 @@ impl Emitter {
                 writeln!(self.out, "{tag}_prev = _curr_a;").ok();
             }
             // a |-> b — same-cycle implication.
-            ExprKind::Binary { op: BinaryOp::PipeImplies, lhs, rhs } => {
+            ExprKind::Binary {
+                op: BinaryOp::PipeImplies,
+                lhs,
+                rhs,
+            } => {
                 self.pad(depth + 1);
                 write!(self.out, "if ((bool)(").ok();
                 self.emit_expr(lhs);
@@ -1787,7 +2233,12 @@ impl Emitter {
                 self.emit_expr(rhs);
                 writeln!(self.out, ")) {{").ok();
                 self.pad(depth + 2);
-                writeln!(self.out, "sim_log_line(\"{severity}\", \"property `{}` failed (|->)\");", escape_c(&label)).ok();
+                writeln!(
+                    self.out,
+                    "sim_log_line(\"{severity}\", \"property `{}` failed (|->)\");",
+                    escape_c(&label)
+                )
+                .ok();
                 if severity == "FAIL" {
                     self.pad(depth + 2);
                     writeln!(self.out, "errors++;").ok();
@@ -1802,7 +2253,12 @@ impl Emitter {
                 self.emit_expr(&body);
                 writeln!(self.out, ")) {{").ok();
                 self.pad(depth + 2);
-                writeln!(self.out, "sim_log_line(\"{severity}\", \"property `{}` failed\");", escape_c(&label)).ok();
+                writeln!(
+                    self.out,
+                    "sim_log_line(\"{severity}\", \"property `{}` failed\");",
+                    escape_c(&label)
+                )
+                .ok();
                 if severity == "FAIL" {
                     self.pad(depth + 2);
                     writeln!(self.out, "errors++;").ok();
@@ -1853,9 +2309,11 @@ impl Emitter {
             // otherwise spin-fire every cycle (negative) or every cycle
             // forever (zero). Treat as no-op.
             self.pad(depth + 1);
-            writeln!(self.out,
+            writeln!(
+                self.out,
                 "if ({tag}_period > 0 && (int64_t)cycle_count - {tag}_last >= {tag}_period) {{"
-            ).ok();
+            )
+            .ok();
             self.pad(depth + 2);
             writeln!(self.out, "{tag}_last = (int64_t)cycle_count;").ok();
             self.emit_block(&h.body, depth + 2);
@@ -1998,7 +2456,10 @@ impl Emitter {
                 }
                 // Recurse into the sub-component's own sub-fields.
                 self.emit_subcomponent_handler_registrations(
-                    &sub_comp, &sub_inst, effective_mode, depth,
+                    &sub_comp,
+                    &sub_inst,
+                    effective_mode,
+                    depth,
                 );
                 // Emit the sub-component's connect edges, prefixed
                 // with its instance path. Without this, an agent's
@@ -2096,7 +2557,12 @@ impl Emitter {
         for it in &mon.items {
             if let ComponentItem::Field(f) = it {
                 subs.insert(f.name.name.clone(), format!("{instance}.{}", f.name.name));
-                if let TypeExpr::Builtin { name: BuiltinTy::Event, args, .. } = &f.ty {
+                if let TypeExpr::Builtin {
+                    name: BuiltinTy::Event,
+                    args,
+                    ..
+                } = &f.ty
+                {
                     let inner = self.payload_type_for_arg(args.first());
                     local_event_types.push((f.name.name.clone(), inner));
                 }
@@ -2109,7 +2575,10 @@ impl Emitter {
             if let ComponentItem::OnHandler(h) = it {
                 if let Some((ch_name, arg_name)) = extract_bus_handshake_event(&h.event, "bus") {
                     // Resolve the channel in the bound bus.
-                    let channel = match binding.0.handshakes.iter()
+                    let channel = match binding
+                        .0
+                        .handshakes
+                        .iter()
                         .find(|hs| hs.name.name == ch_name)
                     {
                         Some(c) => c.clone(),
@@ -2128,7 +2597,7 @@ impl Emitter {
                     }
                     let (bus_decl, root, sig_prefix) = binding;
                     let chan_prefix = format!("{}_{}", sig_prefix, ch_name);
-                    let slot_var  = format!("_{instance}_{ch_name}_slot");
+                    let slot_var = format!("_{instance}_{ch_name}_slot");
                     let sched_var = format!("_{instance}_{ch_name}_sched");
 
                     if self.mt {
@@ -2140,7 +2609,8 @@ impl Emitter {
                     self.pad(depth);
                     if self.mt {
                         writeln!(self.out, "{sched_var}.slots.push_back(&{slot_var});").ok();
-                        self.actor_threads.push((sched_var.clone(), slot_var.clone()));
+                        self.actor_threads
+                            .push((sched_var.clone(), slot_var.clone()));
                     } else {
                         writeln!(self.out, "sched.slots.push_back(&{slot_var});").ok();
                     }
@@ -2167,7 +2637,9 @@ impl Emitter {
                     write!(self.out, "{struct_name} {arg_name} = {{").ok();
                     let mut first = true;
                     for sig in &channel.payload {
-                        if !first { write!(self.out, ", ").ok(); }
+                        if !first {
+                            write!(self.out, ", ").ok();
+                        }
                         first = false;
                         write!(self.out, "{root}->{chan_prefix}_{}", sig.name.name).ok();
                     }
@@ -2176,7 +2648,11 @@ impl Emitter {
                     // handshake counts as an "in" for this monitor
                     // instance.
                     self.pad(depth + 2);
-                    writeln!(self.out, "{instance}._last_in_cycle = (uint64_t)cycle_count;").ok();
+                    writeln!(
+                        self.out,
+                        "{instance}._last_in_cycle = (uint64_t)cycle_count;"
+                    )
+                    .ok();
 
                     // Body: install field subs + bus binding, mark
                     // coroutine context, emit, restore state.
@@ -2200,10 +2676,16 @@ impl Emitter {
                     self.current_component_instance = prior_inst;
                     self.in_coroutine = prior_corout;
                     match prior_bus {
-                        Some(prev) => { self.bus_bindings.insert("bus".into(), prev); }
-                        None       => { self.bus_bindings.remove("bus"); }
+                        Some(prev) => {
+                            self.bus_bindings.insert("bus".into(), prev);
+                        }
+                        None => {
+                            self.bus_bindings.remove("bus");
+                        }
                     }
-                    for n in added_events { self.event_types.remove(&n); }
+                    for n in added_events {
+                        self.event_types.remove(&n);
+                    }
                     self.field_subs = prev_subs;
 
                     // Skip past this handshake before re-arming.
@@ -2235,7 +2717,11 @@ impl Emitter {
                 _ => true,
             });
             self.emit_component_handler_registrations_bound(
-                &sync_view, instance, depth, "_m_", Some(binding.clone()),
+                &sync_view,
+                instance,
+                depth,
+                "_m_",
+                Some(binding.clone()),
             );
         }
     }
@@ -2281,7 +2767,12 @@ impl Emitter {
         for it in &comp.items {
             if let ComponentItem::Field(f) = it {
                 if matches!(f.direction, Some(Direction::In)) {
-                    if let TypeExpr::Builtin { name: BuiltinTy::Event, args, .. } = &f.ty {
+                    if let TypeExpr::Builtin {
+                        name: BuiltinTy::Event,
+                        args,
+                        ..
+                    } = &f.ty
+                    {
                         let payload = self.payload_type_for_arg(args.first());
                         if input_event.is_some() {
                             return false; // multi-input — bail out
@@ -2334,7 +2825,7 @@ impl Emitter {
         // synchronized via dual barriers per posedge. `tick()`
         // itself is not MT-safe so per-actor schedulers avoid locks.
         let queue_var = format!("_{instance}_q");
-        let slot_var  = format!("_{instance}_slot");
+        let slot_var = format!("_{instance}_slot");
         let sched_var = format!("_{instance}_sched");
 
         self.pad(depth);
@@ -2348,7 +2839,8 @@ impl Emitter {
         self.pad(depth);
         if self.mt {
             writeln!(self.out, "{sched_var}.slots.push_back(&{slot_var});").ok();
-            self.actor_threads.push((sched_var.clone(), slot_var.clone()));
+            self.actor_threads
+                .push((sched_var.clone(), slot_var.clone()));
         } else {
             writeln!(self.out, "sched.slots.push_back(&{slot_var});").ok();
         }
@@ -2369,14 +2861,16 @@ impl Emitter {
         writeln!(
             self.out,
             "{slot_var}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{",
-        ).ok();
+        )
+        .ok();
         self.pad(depth + 1);
         writeln!(self.out, "while (true) {{").ok();
         self.pad(depth + 2);
         writeln!(
             self.out,
             "co_await harc_rt::wait_until(_slot, [&]{{ return !{queue_var}.empty(); }});",
-        ).ok();
+        )
+        .ok();
         self.pad(depth + 2);
         writeln!(self.out, "auto {arg_name} = {queue_var}.front();").ok();
         self.pad(depth + 2);
@@ -2384,7 +2878,11 @@ impl Emitter {
         // Activity tracking (spec §7.x): popping a transaction off
         // the per-actor queue counts as an "in" for this instance.
         self.pad(depth + 2);
-        writeln!(self.out, "{instance}._last_in_cycle = (uint64_t)cycle_count;").ok();
+        writeln!(
+            self.out,
+            "{instance}._last_in_cycle = (uint64_t)cycle_count;"
+        )
+        .ok();
 
         // Build field-name substitution map: bare names inside the
         // handler body resolve to `instance.field`. Event-typed
@@ -2395,7 +2893,12 @@ impl Emitter {
         for it in &comp.items {
             if let ComponentItem::Field(f) = it {
                 subs.insert(f.name.name.clone(), format!("{instance}.{}", f.name.name));
-                if let TypeExpr::Builtin { name: BuiltinTy::Event, args, .. } = &f.ty {
+                if let TypeExpr::Builtin {
+                    name: BuiltinTy::Event,
+                    args,
+                    ..
+                } = &f.ty
+                {
                     let inner = self.payload_type_for_arg(args.first());
                     local_event_types.push((f.name.name.clone(), inner));
                 }
@@ -2430,14 +2933,20 @@ impl Emitter {
         self.current_component_instance = prior_inst;
         self.in_coroutine = prior_corout;
         match prior_bus {
-            Some(prev) => { self.bus_bindings.insert("bus".into(), prev); }
-            None       => { self.bus_bindings.remove("bus"); }
+            Some(prev) => {
+                self.bus_bindings.insert("bus".into(), prev);
+            }
+            None => {
+                self.bus_bindings.remove("bus");
+            }
         }
         self.field_subs = prev_subs;
-        for n in added_events { self.event_types.remove(&n); }
+        for n in added_events {
+            self.event_types.remove(&n);
+        }
 
         self.pad(depth + 1);
-        writeln!(self.out, "}}").ok();          // close while(true)
+        writeln!(self.out, "}}").ok(); // close while(true)
         self.pad(depth + 1);
         writeln!(self.out, "co_return;").ok(); // unreachable but required
         self.pad(depth);
@@ -2454,15 +2963,17 @@ impl Emitter {
             // items list. Simpler: filter manually here.
             let mut filtered = comp.clone();
             filtered.items.retain(|it| match it {
-                ComponentItem::OnHandler(h) => {
-                    extract_event_subscription(&h.event)
-                        .map(|(ev, _)| ev != event_name)
-                        .unwrap_or(true)
-                }
+                ComponentItem::OnHandler(h) => extract_event_subscription(&h.event)
+                    .map(|(ev, _)| ev != event_name)
+                    .unwrap_or(true),
                 _ => true,
             });
             self.emit_component_handler_registrations_bound(
-                &filtered, instance, depth, &tag, Some(binding.clone()),
+                &filtered,
+                instance,
+                depth,
+                &tag,
+                Some(binding.clone()),
             );
         }
 
@@ -2487,7 +2998,12 @@ impl Emitter {
         for it in &comp.items {
             if let ComponentItem::Field(f) = it {
                 subs.insert(f.name.name.clone(), format!("{instance}.{}", f.name.name));
-                if let TypeExpr::Builtin { name: BuiltinTy::Event, args, .. } = &f.ty {
+                if let TypeExpr::Builtin {
+                    name: BuiltinTy::Event,
+                    args,
+                    ..
+                } = &f.ty
+                {
                     event_field_names.insert(f.name.name.clone());
                     let inner = self.payload_type_for_arg(args.first());
                     local_event_types.push((f.name.name.clone(), inner));
@@ -2505,18 +3021,20 @@ impl Emitter {
 
         for it in &comp.items {
             if let ComponentItem::OnHandler(h) = it {
-                if let Some((event_name, arg_name)) =
-                    extract_event_subscription(&h.event)
-                {
+                if let Some((event_name, arg_name)) = extract_event_subscription(&h.event) {
                     if event_field_names.contains(&event_name) {
                         // Subscriber to a component event field.
-                        let arg_ty = self.event_types.get(&event_name).cloned()
+                        let arg_ty = self
+                            .event_types
+                            .get(&event_name)
+                            .cloned()
                             .unwrap_or_else(|| "int64_t".into());
                         self.pad(depth);
                         writeln!(
                             self.out,
                             "{instance}.{event_name}.push_back([&]({arg_ty} {arg_name}) {{",
-                        ).ok();
+                        )
+                        .ok();
                         // Activity tracking (spec §7.x): an incoming event
                         // counts as an "in" for the component instance —
                         // bump _last_in_cycle to the current cycle. The
@@ -2526,7 +3044,11 @@ impl Emitter {
                         // _last_out_cycle (those sites can't see the
                         // static `instance` parameter directly).
                         self.pad(depth + 1);
-                        writeln!(self.out, "{instance}._last_in_cycle = (uint64_t)cycle_count;").ok();
+                        writeln!(
+                            self.out,
+                            "{instance}._last_in_cycle = (uint64_t)cycle_count;"
+                        )
+                        .ok();
                         let prior_inst = std::mem::replace(
                             &mut self.current_component_instance,
                             Some(instance.to_string()),
@@ -2538,13 +3060,18 @@ impl Emitter {
                         // bound from, so `bus.<ch>.send/recv` and
                         // `bus.<ch>.<sig>` lower through the existing
                         // bus_handshake / bus_field_access paths.
-                        let prior_bus = bound_bus.as_ref()
+                        let prior_bus = bound_bus
+                            .as_ref()
                             .and_then(|b| self.bus_bindings.insert("bus".into(), b.clone()));
                         self.emit_block(&h.body, depth + 1);
                         if bound_bus.is_some() {
                             match prior_bus {
-                                Some(prev) => { self.bus_bindings.insert("bus".into(), prev); }
-                                None       => { self.bus_bindings.remove("bus"); }
+                                Some(prev) => {
+                                    self.bus_bindings.insert("bus".into(), prev);
+                                }
+                                None => {
+                                    self.bus_bindings.remove("bus");
+                                }
                             }
                         }
                         self.current_component_instance = prior_inst;
@@ -2559,7 +3086,9 @@ impl Emitter {
         }
 
         self.field_subs = prev_subs;
-        for n in added_events { self.event_types.remove(&n); }
+        for n in added_events {
+            self.event_types.remove(&n);
+        }
     }
 
     /// Emit the C++ boolean expression for "is `_v` in this bin?".
@@ -2576,7 +3105,9 @@ impl Emitter {
                     write!(self.out, "false").ok();
                 } else {
                     for (i, it) in items.iter().enumerate() {
-                        if i > 0 { write!(self.out, " || ").ok(); }
+                        if i > 0 {
+                            write!(self.out, " || ").ok();
+                        }
                         // Recurse — set-of-ranges (`{[1..3], 7}`) works.
                         self.emit_bin_membership(it);
                     }
@@ -2588,7 +3119,9 @@ impl Emitter {
                 if let Some(l) = lo {
                     write!(self.out, "_v >= ").ok();
                     self.emit_expr(l);
-                    if hi.is_some() { write!(self.out, " && ").ok(); }
+                    if hi.is_some() {
+                        write!(self.out, " && ").ok();
+                    }
                 }
                 if let Some(h) = hi {
                     write!(self.out, "_v <= ").ok();
@@ -2642,13 +3175,21 @@ impl Emitter {
         // there too). ARCH writes to stderr because in ARCH-sim, stdout
         // belongs to the user's test program — that distinction doesn't
         // apply to a HARC-emitted TB.
-        let total_bins: usize = g.items.iter().map(|it| match it {
-            CoverItem::Point(p) => p.bins.len(),
-            _ => 0,
-        }).sum();
+        let total_bins: usize = g
+            .items
+            .iter()
+            .map(|it| match it {
+                CoverItem::Point(p) => p.bins.len(),
+                _ => 0,
+            })
+            .sum();
         writeln!(self.out, "{INDENT}void report() const {{").ok();
         self.pad(2);
-        writeln!(self.out, "uint64_t _total = {total_bins}; uint64_t _hit = 0;").ok();
+        writeln!(
+            self.out,
+            "uint64_t _total = {total_bins}; uint64_t _hit = 0;"
+        )
+        .ok();
         for it in &g.items {
             if let CoverItem::Point(p) = it {
                 for b in &p.bins {
@@ -2737,28 +3278,48 @@ impl Emitter {
     ///
     /// Returns `true` when the call was a recognized bus handshake
     /// and was emitted; `false` to fall through to plain Call lowering.
-    fn try_emit_bus_handshake(
-        &mut self,
-        e: &Expr,
-        let_name: Option<&str>,
-        depth: usize,
-    ) -> bool {
-        let ExprKind::Call { callee, args } = &*e.kind else { return false; };
-        let ExprKind::Field { target, name: method } = &*callee.kind else { return false; };
-        let ExprKind::Field { target: outer, name: ch } = &*target.kind else { return false; };
-        let ExprKind::Ident(id) = &*outer.kind else { return false; };
-        let Some((bus, root, sig_prefix)) = self.bus_bindings.get(&id.name).cloned() else { return false; };
-        let Some(h) = bus.handshakes.iter().find(|h| h.name.name == ch.name).cloned() else {
+    fn try_emit_bus_handshake(&mut self, e: &Expr, let_name: Option<&str>, depth: usize) -> bool {
+        let ExprKind::Call { callee, args } = &*e.kind else {
             return false;
         };
-        let prefix = format!("{}_{}", sig_prefix, ch.name);  // axil_aw
+        let ExprKind::Field {
+            target,
+            name: method,
+        } = &*callee.kind
+        else {
+            return false;
+        };
+        let ExprKind::Field {
+            target: outer,
+            name: ch,
+        } = &*target.kind
+        else {
+            return false;
+        };
+        let ExprKind::Ident(id) = &*outer.kind else {
+            return false;
+        };
+        let Some((bus, root, sig_prefix)) = self.bus_bindings.get(&id.name).cloned() else {
+            return false;
+        };
+        let Some(h) = bus
+            .handshakes
+            .iter()
+            .find(|h| h.name.name == ch.name)
+            .cloned()
+        else {
+            return false;
+        };
+        let prefix = format!("{}_{}", sig_prefix, ch.name); // axil_aw
 
         match method.name.as_str() {
             "send" => {
                 if args.len() != h.payload.len() {
                     self.errors.push(format!(
                         "bus.{}.send: expected {} payload arg(s), got {}",
-                        ch.name, h.payload.len(), args.len(),
+                        ch.name,
+                        h.payload.len(),
+                        args.len(),
                     ));
                     return true;
                 }
@@ -2813,7 +3374,8 @@ impl Emitter {
                 if !args.is_empty() {
                     self.errors.push(format!(
                         "bus.{}.recv: expected 0 args, got {}",
-                        ch.name, args.len(),
+                        ch.name,
+                        args.len(),
                     ));
                     return true;
                 }
@@ -2850,7 +3412,9 @@ impl Emitter {
                     write!(self.out, "{struct_name} {name} = {{").ok();
                     let mut first = true;
                     for sig in &h.payload {
-                        if !first { write!(self.out, ", ").ok(); }
+                        if !first {
+                            write!(self.out, ", ").ok();
+                        }
                         first = false;
                         write!(self.out, "{root}->{prefix}_{}", sig.name.name).ok();
                     }
@@ -2890,7 +3454,8 @@ impl Emitter {
                     let chprefix = format!("{}_", h.name.name);
                     if name.name.starts_with(&chprefix) {
                         let tail = &name.name[chprefix.len()..];
-                        if tail == "valid" || tail == "ready"
+                        if tail == "valid"
+                            || tail == "ready"
                             || h.payload.iter().any(|s| s.name.name == tail)
                         {
                             return Some(format!("{root}->{}_{}", sig_prefix, name.name));
@@ -2910,11 +3475,16 @@ impl Emitter {
             }
         }
         // <binding>.<channel>.<signal>
-        if let ExprKind::Field { target: outer, name: ch } = &*target.kind {
+        if let ExprKind::Field {
+            target: outer,
+            name: ch,
+        } = &*target.kind
+        {
             if let ExprKind::Ident(id) = &*outer.kind {
                 if let Some((bus, root, sig_prefix)) = self.bus_bindings.get(&id.name).cloned() {
                     if let Some(h) = bus.handshakes.iter().find(|h| h.name.name == ch.name) {
-                        if name.name == "valid" || name.name == "ready"
+                        if name.name == "valid"
+                            || name.name == "ready"
                             || h.payload.iter().any(|s| s.name.name == name.name)
                         {
                             return Some(format!(
@@ -2928,16 +3498,24 @@ impl Emitter {
                             .collect();
                         self.errors.push(format!(
                             "bus `{}` channel `{}` has no signal `{}` (valid: {})",
-                            bus.name.name, ch.name, name.name,
+                            bus.name.name,
+                            ch.name,
+                            name.name,
                             valid_options.join(", "),
                         ));
-                        return Some(format!("/* unresolved: {}.{}.{} */ 0", id.name, ch.name, name.name));
+                        return Some(format!(
+                            "/* unresolved: {}.{}.{} */ 0",
+                            id.name, ch.name, name.name
+                        ));
                     }
                     self.errors.push(format!(
                         "bus `{}` (binding `{}`) has no channel `{}`",
                         bus.name.name, id.name, ch.name,
                     ));
-                    return Some(format!("/* unresolved: {}.{}.{} */ 0", id.name, ch.name, name.name));
+                    return Some(format!(
+                        "/* unresolved: {}.{}.{} */ 0",
+                        id.name, ch.name, name.name
+                    ));
                 }
             }
         }
@@ -2950,7 +3528,13 @@ impl Emitter {
     /// params)`. Walks one or two levels of field-access chain
     /// (covers `<var>.<method>` and `<env>.<sub>.<method>`).
     fn resolve_component_hookable(&self, event: &Expr) -> Option<(String, String, Vec<Param>)> {
-        let ExprKind::Field { target, name: method } = &*event.kind else { return None; };
+        let ExprKind::Field {
+            target,
+            name: method,
+        } = &*event.kind
+        else {
+            return None;
+        };
         // Walk the field-access chain, collecting path segments. Same
         // shape as `resolve_component_method_call` — see that function
         // for the rationale (env→agent→transactor.method requires
@@ -2959,7 +3543,10 @@ impl Emitter {
         let mut cur: &Expr = target;
         loop {
             match &*cur.kind {
-                ExprKind::Field { target: inner, name } => {
+                ExprKind::Field {
+                    target: inner,
+                    name,
+                } => {
                     path.push(name.name.clone());
                     cur = inner;
                 }
@@ -2986,7 +3573,7 @@ impl Emitter {
                     None
                 })
             } else if let Some(t) = self.transactors.get(&cur_ty) {
-                let synth = synth_component_from_transactor(t, /*include_active*/true);
+                let synth = synth_component_from_transactor(t, /*include_active*/ true);
                 synth.items.iter().find_map(|it| {
                     if let ComponentItem::Field(f) = it {
                         if &f.name.name == seg {
@@ -3005,7 +3592,9 @@ impl Emitter {
         let find_method = |items: &[ComponentItem], m: &str| -> Option<Vec<Param>> {
             for it in items {
                 if let ComponentItem::Hookable(h) = it {
-                    if h.name.name == m { return Some(h.params.clone()); }
+                    if h.name.name == m {
+                        return Some(h.params.clone());
+                    }
                 }
             }
             None
@@ -3013,7 +3602,7 @@ impl Emitter {
         let params = if let Some(comp) = self.components.get(&cur_ty) {
             find_method(&comp.items, &method.name)?
         } else if let Some(t) = self.transactors.get(&cur_ty) {
-            let synth = synth_component_from_transactor(t, /*include_active*/true);
+            let synth = synth_component_from_transactor(t, /*include_active*/ true);
             find_method(&synth.items, &method.name)?
         } else {
             return None;
@@ -3050,7 +3639,13 @@ impl Emitter {
     /// effectively a *default* — users override by declaring the
     /// method themselves.
     fn resolve_component_idle_predicate(&self, callee: &Expr) -> Option<(String, String)> {
-        let ExprKind::Field { target, name: method } = &*callee.kind else { return None; };
+        let ExprKind::Field {
+            target,
+            name: method,
+        } = &*callee.kind
+        else {
+            return None;
+        };
         match method.name.as_str() {
             "idle" | "idle_in" | "idle_out" => {}
             _ => return None,
@@ -3059,7 +3654,10 @@ impl Emitter {
         let mut cur: &Expr = target;
         loop {
             match &*cur.kind {
-                ExprKind::Field { target: inner, name } => {
+                ExprKind::Field {
+                    target: inner,
+                    name,
+                } => {
                     path.push(name.name.clone());
                     cur = inner;
                 }
@@ -3085,7 +3683,7 @@ impl Emitter {
                     None
                 })
             } else if let Some(t) = self.transactors.get(&cur_ty) {
-                let synth = synth_component_from_transactor(t, /*include_active*/true);
+                let synth = synth_component_from_transactor(t, /*include_active*/ true);
                 synth.items.iter().find_map(|it| {
                     if let ComponentItem::Field(f) = it {
                         if &f.name.name == seg {
@@ -3102,14 +3700,16 @@ impl Emitter {
         // The target must resolve to a known component or transactor
         // type — those are what get the auto-injected heartbeat fields.
         let has_hookable_override = |items: &[ComponentItem]| -> bool {
-            items.iter().any(|it| matches!(
-                it, ComponentItem::Hookable(h) if h.name.name == method.name
-            ))
+            items.iter().any(|it| {
+                matches!(
+                    it, ComponentItem::Hookable(h) if h.name.name == method.name
+                )
+            })
         };
         let user_overrides = if let Some(comp) = self.components.get(&cur_ty) {
             has_hookable_override(&comp.items)
         } else if let Some(t) = self.transactors.get(&cur_ty) {
-            let synth = synth_component_from_transactor(t, /*include_active*/true);
+            let synth = synth_component_from_transactor(t, /*include_active*/ true);
             has_hookable_override(&synth.items)
         } else {
             return None;
@@ -3122,8 +3722,235 @@ impl Emitter {
         Some((path.join("."), method.name.clone()))
     }
 
+    fn resolve_component_path(&self, target: &Expr) -> Option<(Vec<String>, String)> {
+        let mut path: Vec<String> = Vec::new();
+        let mut cur: &Expr = target;
+        loop {
+            match &*cur.kind {
+                ExprKind::Field {
+                    target: inner,
+                    name,
+                } => {
+                    path.push(name.name.clone());
+                    cur = inner;
+                }
+                ExprKind::Ident(id) => {
+                    path.push(id.name.clone());
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        path.reverse();
+
+        let root = path.first()?;
+        let mut cur_ty: String = self.let_types.get(root)?.clone();
+        for seg in path.iter().skip(1) {
+            let next_ty = if let Some(comp) = self.components.get(&cur_ty) {
+                comp.items.iter().find_map(|it| {
+                    if let ComponentItem::Field(f) = it {
+                        if &f.name.name == seg {
+                            return type_simple_name(Some(&f.ty)).map(String::from);
+                        }
+                    }
+                    None
+                })
+            } else if let Some(t) = self.transactors.get(&cur_ty) {
+                let synth = synth_component_from_transactor(t, /*include_active*/ true);
+                synth.items.iter().find_map(|it| {
+                    if let ComponentItem::Field(f) = it {
+                        if &f.name.name == seg {
+                            return type_simple_name(Some(&f.ty)).map(String::from);
+                        }
+                    }
+                    None
+                })
+            } else {
+                None
+            };
+            cur_ty = next_ty?;
+        }
+
+        if self.components.contains_key(&cur_ty) || self.transactors.contains_key(&cur_ty) {
+            Some((path, cur_ty))
+        } else {
+            None
+        }
+    }
+
+    fn component_has_hookable(&self, ty: &str, method: &str) -> bool {
+        let has = |items: &[ComponentItem]| -> bool {
+            items.iter().any(|it| {
+                matches!(
+                    it, ComponentItem::Hookable(h) if h.name.name == method
+                )
+            })
+        };
+        if let Some(comp) = self.components.get(ty) {
+            has(&comp.items)
+        } else if let Some(t) = self.transactors.get(ty) {
+            let synth = synth_component_from_transactor(t, /*include_active*/ true);
+            has(&synth.items)
+        } else {
+            false
+        }
+    }
+
+    fn collect_quiesced_paths(
+        &self,
+        ty: &str,
+        instance: &str,
+        stack: &mut std::collections::HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        if !stack.insert(ty.to_string()) {
+            out.push(instance.to_string());
+            return;
+        }
+
+        let mut found_subcomponent = false;
+        if let Some(comp) = self.components.get(ty) {
+            for it in &comp.items {
+                if let ComponentItem::Field(f) = it {
+                    let Some(field_ty) = type_simple_name(Some(&f.ty)) else {
+                        continue;
+                    };
+                    if self.components.contains_key(field_ty)
+                        || self.transactors.contains_key(field_ty)
+                    {
+                        found_subcomponent = true;
+                        let sub_instance = format!("{instance}.{}", f.name.name);
+                        self.collect_quiesced_paths(field_ty, &sub_instance, stack, out);
+                    }
+                }
+            }
+        } else if let Some(t) = self.transactors.get(ty) {
+            let synth = synth_component_from_transactor(t, /*include_active*/ true);
+            for it in &synth.items {
+                if let ComponentItem::Field(f) = it {
+                    let Some(field_ty) = type_simple_name(Some(&f.ty)) else {
+                        continue;
+                    };
+                    if self.components.contains_key(field_ty)
+                        || self.transactors.contains_key(field_ty)
+                    {
+                        found_subcomponent = true;
+                        let sub_instance = format!("{instance}.{}", f.name.name);
+                        self.collect_quiesced_paths(field_ty, &sub_instance, stack, out);
+                    }
+                }
+            }
+        }
+
+        if !found_subcomponent {
+            out.push(instance.to_string());
+        }
+        stack.remove(ty);
+    }
+
+    fn resolve_component_quiesced_predicate<'a>(
+        &self,
+        callee: &Expr,
+        args: &'a [CallArg],
+    ) -> Option<(Vec<String>, &'a Expr)> {
+        let ExprKind::Field {
+            target,
+            name: method,
+        } = &*callee.kind
+        else {
+            return None;
+        };
+        if method.name != "quiesced" {
+            return None;
+        }
+        let (path, ty) = self.resolve_component_path(target)?;
+        if self.component_has_hookable(&ty, "quiesced") {
+            return None;
+        }
+        if args.len() != 1 {
+            return None;
+        }
+        let n_expr = match &args[0] {
+            CallArg::Expr(e) => e,
+            CallArg::Named { value, .. } => value,
+        };
+        let mut paths = Vec::new();
+        self.collect_quiesced_paths(
+            &ty,
+            &path.join("."),
+            &mut std::collections::HashSet::new(),
+            &mut paths,
+        );
+        Some((paths, n_expr))
+    }
+
+    fn emit_idle_predicate(&mut self, instance: &str, kind: &str, n_expr: &Expr) {
+        match kind {
+            "idle_in" => {
+                write!(
+                    self.out,
+                    "(((uint64_t)cycle_count - {instance}._last_in_cycle) >= (uint64_t)("
+                )
+                .ok();
+                self.emit_expr(n_expr);
+                write!(self.out, "))").ok();
+            }
+            "idle_out" => {
+                write!(
+                    self.out,
+                    "(((uint64_t)cycle_count - {instance}._last_out_cycle) >= (uint64_t)("
+                )
+                .ok();
+                self.emit_expr(n_expr);
+                write!(self.out, "))").ok();
+            }
+            "idle" => {
+                write!(
+                    self.out,
+                    "((((uint64_t)cycle_count - {instance}._last_in_cycle) >= (uint64_t)("
+                )
+                .ok();
+                self.emit_expr(n_expr);
+                write!(
+                    self.out,
+                    ")) && (((uint64_t)cycle_count - {instance}._last_out_cycle) >= (uint64_t)("
+                )
+                .ok();
+                self.emit_expr(n_expr);
+                write!(self.out, ")))").ok();
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn expand_wait_conditions<'a>(&self, conditions: &'a [Expr]) -> Vec<WaitCondition<'a>> {
+        let mut out = Vec::new();
+        for c in conditions {
+            if let ExprKind::Call { callee, args } = &*c.kind {
+                if let Some((paths, cycles)) =
+                    self.resolve_component_quiesced_predicate(callee, args)
+                {
+                    out.extend(
+                        paths
+                            .into_iter()
+                            .map(|instance| WaitCondition::Idle { instance, cycles }),
+                    );
+                    continue;
+                }
+            }
+            out.push(WaitCondition::Expr(c));
+        }
+        out
+    }
+
     fn resolve_component_method_call(&self, callee: &Expr) -> Option<(String, String, String)> {
-        let ExprKind::Field { target, name: method } = &*callee.kind else { return None; };
+        let ExprKind::Field {
+            target,
+            name: method,
+        } = &*callee.kind
+        else {
+            return None;
+        };
         // Walk the field-access chain to its root, collecting the path
         // segments. `topenv.ag.sequencer.dispatch` produces
         // path = ["topenv", "ag", "sequencer"] with method = "dispatch".
@@ -3133,7 +3960,10 @@ impl Emitter {
         let mut cur: &Expr = target;
         loop {
             match &*cur.kind {
-                ExprKind::Field { target: inner, name } => {
+                ExprKind::Field {
+                    target: inner,
+                    name,
+                } => {
                     path.push(name.name.clone());
                     cur = inner;
                 }
@@ -3162,7 +3992,7 @@ impl Emitter {
                     None
                 })
             } else if let Some(t) = self.transactors.get(&cur_ty) {
-                let synth = synth_component_from_transactor(t, /*include_active*/true);
+                let synth = synth_component_from_transactor(t, /*include_active*/ true);
                 synth.items.iter().find_map(|it| {
                     if let ComponentItem::Field(f) = it {
                         if &f.name.name == seg {
@@ -3180,19 +4010,23 @@ impl Emitter {
         // Does cur_ty (component or transactor) have a `hookable
         // <method>`?
         let has_method = |items: &[ComponentItem]| -> bool {
-            items.iter().any(|it| matches!(
-                it, ComponentItem::Hookable(h) if h.name.name == method.name
-            ))
+            items.iter().any(|it| {
+                matches!(
+                    it, ComponentItem::Hookable(h) if h.name.name == method.name
+                )
+            })
         };
         let found = if let Some(comp) = self.components.get(&cur_ty) {
             has_method(&comp.items)
         } else if let Some(t) = self.transactors.get(&cur_ty) {
-            let synth = synth_component_from_transactor(t, /*include_active*/true);
+            let synth = synth_component_from_transactor(t, /*include_active*/ true);
             has_method(&synth.items)
         } else {
             false
         };
-        if !found { return None; }
+        if !found {
+            return None;
+        }
 
         Some((cur_ty, path.join("."), method.name.clone()))
     }
@@ -3214,9 +4048,12 @@ impl Emitter {
         if let TypeExpr::Named { name, .. } = t {
             if let Some(last) = name.segments.last() {
                 let n = &last.name;
-                if self.transactions.contains(n) || self.enums.contains_key(n)
-                    || self.components.contains_key(n) || self.scoreboards.contains(n)
-                    || self.transactors.contains_key(n) || self.covergroups.contains_key(n)
+                if self.transactions.contains(n)
+                    || self.enums.contains_key(n)
+                    || self.components.contains_key(n)
+                    || self.scoreboards.contains(n)
+                    || self.transactors.contains_key(n)
+                    || self.covergroups.contains_key(n)
                 {
                     return n.clone();
                 }
@@ -3230,59 +4067,55 @@ impl Emitter {
     /// hold the registered hook subscribers for one hookable method.
     /// Empty by default; users push closures via `on obj.method pre`
     /// / `on obj.method post` at test scope.
-    fn emit_hook_vectors(
-        &mut self,
-        c: &ComponentDecl,
-        h: &HookableMethod,
-        depth: usize,
-    ) {
+    fn emit_hook_vectors(&mut self, c: &ComponentDecl, h: &HookableMethod, depth: usize) {
         let comp_ty = &c.name.name;
         let m_name = &h.name.name;
-        let arg_tys: Vec<String> = h.params.iter()
-            .map(|p| p.ty.as_ref()
-                .map(|t| self.c_type_for_param(t))
-                .unwrap_or_else(|| "int64_t".to_string()))
+        let arg_tys: Vec<String> = h
+            .params
+            .iter()
+            .map(|p| {
+                p.ty.as_ref()
+                    .map(|t| self.c_type_for_param(t))
+                    .unwrap_or_else(|| "int64_t".to_string())
+            })
             .collect();
         let arg_csv = arg_tys.join(", ");
         self.pad(depth);
         writeln!(
             self.out,
             "std::vector<std::function<void({arg_csv})>> {comp_ty}_{m_name}_pre;",
-        ).ok();
+        )
+        .ok();
         self.pad(depth);
         writeln!(
             self.out,
             "std::vector<std::function<void({arg_csv})>> {comp_ty}_{m_name}_post;",
-        ).ok();
+        )
+        .ok();
     }
 
-    fn emit_component_method(
-        &mut self,
-        c: &ComponentDecl,
-        h: &HookableMethod,
-        depth: usize,
-    ) {
+    fn emit_component_method(&mut self, c: &ComponentDecl, h: &HookableMethod, depth: usize) {
         let comp_ty = &c.name.name;
         let m_name = &h.name.name;
-        let ret = h.return_ty.as_ref()
+        let ret = h
+            .return_ty
+            .as_ref()
             .map(c_type_for)
             .unwrap_or_else(|| "void".to_string());
         self.pad(depth);
-        write!(
-            self.out,
-            "auto {comp_ty}_{m_name} = [&]({comp_ty}& self"
-        ).ok();
+        write!(self.out, "auto {comp_ty}_{m_name} = [&]({comp_ty}& self").ok();
         // Track Named-typed params as pointers so dut.field rewrites
         // properly in the body. Restore on exit. Transaction / enum /
         // sub-component params are by-value (not pointer-shaped).
         let mut added: Vec<String> = Vec::new();
         for p in &h.params {
-            let pty = p.ty.as_ref()
-                .map(|t| self.c_type_for_param(t))
-                .unwrap_or_else(|| "int64_t".to_string());
+            let pty =
+                p.ty.as_ref()
+                    .map(|t| self.c_type_for_param(t))
+                    .unwrap_or_else(|| "int64_t".to_string());
             write!(self.out, ", {pty} {}", p.name.name).ok();
             if matches!(&p.ty, Some(TypeExpr::Named { .. }))
-               && self.is_dut_pointer_field_type(p.ty.as_ref().unwrap())
+                && self.is_dut_pointer_field_type(p.ty.as_ref().unwrap())
             {
                 if self.pointer_vars.insert(p.name.name.clone()) {
                     added.push(p.name.name.clone());
@@ -3324,34 +4157,49 @@ impl Emitter {
         // multi-instance bound drivers; per-instance hookable
         // emission is a follow-up.
         let pushed_bus = self.driver_bus_for_hookables.get(comp_ty).cloned();
-        let prior_bus = pushed_bus.as_ref()
+        let prior_bus = pushed_bus
+            .as_ref()
             .and_then(|b| self.bus_bindings.insert("bus".into(), b.clone()));
 
         // Pre-hooks: fire `<Type>_<method>_pre` subscribers before the
         // body. The hook closures see the same args as the method —
         // empty vectors are a no-op so the wrap is always safe to
         // emit.
-        let arg_list: Vec<String> = h.params.iter()
-            .map(|p| p.name.name.clone())
-            .collect();
+        let arg_list: Vec<String> = h.params.iter().map(|p| p.name.name.clone()).collect();
         let arg_csv = arg_list.join(", ");
         self.pad(depth + 1);
-        writeln!(self.out, "for (auto& _h : {comp_ty}_{m_name}_pre) _h({arg_csv});").ok();
+        writeln!(
+            self.out,
+            "for (auto& _h : {comp_ty}_{m_name}_pre) _h({arg_csv});"
+        )
+        .ok();
 
         self.emit_block(&h.body, depth + 1);
 
         self.pad(depth + 1);
-        writeln!(self.out, "for (auto& _h : {comp_ty}_{m_name}_post) _h({arg_csv});").ok();
+        writeln!(
+            self.out,
+            "for (auto& _h : {comp_ty}_{m_name}_post) _h({arg_csv});"
+        )
+        .ok();
         // Restore state.
         if pushed_bus.is_some() {
             match prior_bus {
-                Some(prev) => { self.bus_bindings.insert("bus".into(), prev); }
-                None       => { self.bus_bindings.remove("bus"); }
+                Some(prev) => {
+                    self.bus_bindings.insert("bus".into(), prev);
+                }
+                None => {
+                    self.bus_bindings.remove("bus");
+                }
             }
         }
         self.field_subs = prev_subs;
-        for k in added_pointer_fields { self.pointer_vars.remove(&k); }
-        for k in added { self.pointer_vars.remove(&k); }
+        for k in added_pointer_fields {
+            self.pointer_vars.remove(&k);
+        }
+        for k in added {
+            self.pointer_vars.remove(&k);
+        }
         self.pad(depth);
         writeln!(self.out, "}};").ok();
     }
@@ -3385,18 +4233,32 @@ impl Emitter {
     /// has no target. (Reasonable people who turned the watchdog
     /// off will know to remove their hooks.)
     fn emit_watchdog(&mut self, c: &ComponentDecl, w: &WatchdogDecl, depth: usize) {
-        if w.disabled { return; }
+        if w.disabled {
+            return;
+        }
         let comp_ty = &c.name.name;
         // Hook vectors — `watchdog` takes no args, so `void()` signature.
         self.pad(depth);
-        writeln!(self.out, "std::vector<std::function<void()>> {comp_ty}_watchdog_pre;").ok();
+        writeln!(
+            self.out,
+            "std::vector<std::function<void()>> {comp_ty}_watchdog_pre;"
+        )
+        .ok();
         self.pad(depth);
-        writeln!(self.out, "std::vector<std::function<void()>> {comp_ty}_watchdog_post;").ok();
+        writeln!(
+            self.out,
+            "std::vector<std::function<void()>> {comp_ty}_watchdog_post;"
+        )
+        .ok();
         // The method itself: a `[&]`-capturing lambda parallelling the
         // shape of `emit_component_method` so the hookable-dispatch
         // path (`<Type>_<method>(obj, args)`) finds the same symbol.
         self.pad(depth);
-        writeln!(self.out, "auto {comp_ty}_watchdog = [&]({comp_ty}& self) -> void {{").ok();
+        writeln!(
+            self.out,
+            "auto {comp_ty}_watchdog = [&]({comp_ty}& self) -> void {{"
+        )
+        .ok();
         // Field substitution: bare `wdog_max_idle` inside the user body
         // resolves to `self.wdog_max_idle`. Same shape as
         // emit_component_method's `subs` setup.
@@ -3436,16 +4298,20 @@ impl Emitter {
         }
         writeln!(self.out, ");").ok();
         self.pad(depth + 1);
-        writeln!(self.out,
+        writeln!(
+            self.out,
             "if (_wdog_max_idle > 0 \
              && (int64_t)((uint64_t)cycle_count - self._last_in_cycle) >= _wdog_max_idle \
              && (int64_t)((uint64_t)cycle_count - self._last_out_cycle) >= _wdog_max_idle) {{"
-        ).ok();
+        )
+        .ok();
         self.pad(depth + 2);
-        writeln!(self.out,
+        writeln!(
+            self.out,
             "sim_log_line(\"FAIL\", \"watchdog: {comp_ty} has been idle for >= %lld cycles\", \
              (long long)_wdog_max_idle);"
-        ).ok();
+        )
+        .ok();
         self.pad(depth + 2);
         writeln!(self.out, "errors++;").ok();
         self.pad(depth + 1);
@@ -3457,7 +4323,9 @@ impl Emitter {
 
         // Restore state.
         self.field_subs = prev_subs;
-        for k in added_pointer_fields { self.pointer_vars.remove(&k); }
+        for k in added_pointer_fields {
+            self.pointer_vars.remove(&k);
+        }
         self.pad(depth);
         writeln!(self.out, "}};").ok();
     }
@@ -3474,7 +4342,9 @@ impl Emitter {
         instance: &str,
         depth: usize,
     ) {
-        if w.disabled { return; }
+        if w.disabled {
+            return;
+        }
         let comp_ty = &c.name.name;
         // The instance path may contain dots (`env.agent`); the static
         // tag needs to be a valid C++ identifier, so flatten dots to
@@ -3504,10 +4374,12 @@ impl Emitter {
         }
         writeln!(self.out, ");").ok();
         self.pad(depth + 1);
-        writeln!(self.out,
+        writeln!(
+            self.out,
             "if (_wdog_{inst_tag}_period > 0 \
              && (int64_t)cycle_count - _wdog_{inst_tag}_last >= _wdog_{inst_tag}_period) {{"
-        ).ok();
+        )
+        .ok();
         self.pad(depth + 2);
         writeln!(self.out, "_wdog_{inst_tag}_last = (int64_t)cycle_count;").ok();
         self.pad(depth + 2);
@@ -3543,7 +4415,7 @@ impl Emitter {
                 let init = if let Some(d) = &f.default {
                     format!(" = {}", format_simple_expr(d))
                 } else if matches!(&f.ty, TypeExpr::Named { .. })
-                          && self.is_dut_pointer_field_type(&f.ty)
+                    && self.is_dut_pointer_field_type(&f.ty)
                 {
                     // Pointer fields default to nullptr — caller assigns
                     // via `drv.dut = dut` after construction.
@@ -3587,11 +4459,19 @@ impl Emitter {
     /// Field-type lowering for `driver`/`agent`/`env`/`sequencer` bodies.
     fn component_field_c_type(&self, t: &TypeExpr) -> String {
         match t {
-            TypeExpr::Builtin { name: BuiltinTy::Event, args, .. } => {
+            TypeExpr::Builtin {
+                name: BuiltinTy::Event,
+                args,
+                ..
+            } => {
                 let inner = self.payload_type_for_arg(args.first());
                 format!("std::vector<std::function<void({inner})>>")
             }
-            TypeExpr::Builtin { name: BuiltinTy::Queue, args, .. } => {
+            TypeExpr::Builtin {
+                name: BuiltinTy::Queue,
+                args,
+                ..
+            } => {
                 let inner = self.payload_type_for_arg(args.first());
                 format!("HarcQueue<{inner}>")
             }
@@ -3682,27 +4562,47 @@ impl Emitter {
         // Structural equality (spec §3.3) — transactions are value records
         // with built-in deep-equal semantics. UVM's `t.compare(exp)` boils
         // down to this for free. `!=` follows by negation.
-        let field_names: Vec<&str> = t.body.iter().filter_map(|it| match it {
-            TxnBodyItem::Field(f) => Some(f.name.name.as_str()),
-            _ => None,
-        }).collect();
+        let field_names: Vec<&str> = t
+            .body
+            .iter()
+            .filter_map(|it| match it {
+                TxnBodyItem::Field(f) => Some(f.name.name.as_str()),
+                _ => None,
+            })
+            .collect();
         if field_names.is_empty() {
             writeln!(self.out, "inline bool operator==(const {0}& a, const {0}& b) {{ (void)a; (void)b; return true; }}",
                 t.name.name).ok();
         } else {
-            write!(self.out, "inline bool operator==(const {0}& a, const {0}& b) {{ return ", t.name.name).ok();
+            write!(
+                self.out,
+                "inline bool operator==(const {0}& a, const {0}& b) {{ return ",
+                t.name.name
+            )
+            .ok();
             for (i, fname) in field_names.iter().enumerate() {
-                if i > 0 { write!(self.out, " && ").ok(); }
+                if i > 0 {
+                    write!(self.out, " && ").ok();
+                }
                 write!(self.out, "a.{fname} == b.{fname}").ok();
             }
             writeln!(self.out, "; }}").ok();
         }
-        writeln!(self.out, "inline bool operator!=(const {0}& a, const {0}& b) {{ return !(a == b); }}",
-            t.name.name).ok();
+        writeln!(
+            self.out,
+            "inline bool operator!=(const {0}& a, const {0}& b) {{ return !(a == b); }}",
+            t.name.name
+        )
+        .ok();
         writeln!(self.out, "").ok();
 
         // randomize_T(t) function.
-        writeln!(self.out, "static void randomize_{}({}* t) {{", t.name.name, t.name.name).ok();
+        writeln!(
+            self.out,
+            "static void randomize_{}({}* t) {{",
+            t.name.name, t.name.name
+        )
+        .ok();
         for it in &t.body {
             if let TxnBodyItem::Field(f) = it {
                 if f.non_random {
@@ -3748,12 +4648,17 @@ impl Emitter {
                     if let Some(entries) = dist_args {
                         write!(self.out, "{INDENT}t->{} = harc_rng_dist({{", f.name.name).ok();
                         for (i, e) in entries.iter().enumerate() {
-                            if i > 0 { write!(self.out, ", ").ok(); }
+                            if i > 0 {
+                                write!(self.out, ", ").ok();
+                            }
                             // Each dist entry: (lo, hi, weight). The `value`
                             // expression is either a RangeLit (use lo/hi) or
                             // a scalar (use as both lo and hi).
                             match &*e.value.kind {
-                                ExprKind::RangeLit { lo: Some(lo), hi: Some(hi) } => {
+                                ExprKind::RangeLit {
+                                    lo: Some(lo),
+                                    hi: Some(hi),
+                                } => {
                                     write!(self.out, "{{(int64_t)(").ok();
                                     self.emit_expr(lo);
                                     write!(self.out, "), (int64_t)(").ok();
@@ -3779,9 +4684,13 @@ impl Emitter {
                 }
                 _ => {}
             }
-            if handled { break; }
+            if handled {
+                break;
+            }
         }
-        if handled { return; }
+        if handled {
+            return;
+        }
 
         // Fallback: type-driven uniform sampling.
         match &f.ty {
@@ -3789,23 +4698,48 @@ impl Emitter {
                 let width = type_arg_width(args);
                 match name {
                     BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => {
-                        writeln!(self.out, "{INDENT}t->{} = harc_rng_uint({});",
-                            f.name.name, width.unwrap_or(32)).ok();
+                        writeln!(
+                            self.out,
+                            "{INDENT}t->{} = harc_rng_uint({});",
+                            f.name.name,
+                            width.unwrap_or(32)
+                        )
+                        .ok();
                     }
                     BuiltinTy::SInt | BuiltinTy::SIntCap => {
                         let w = width.unwrap_or(32);
-                        writeln!(self.out, "{INDENT}t->{} = harc_rng_range(-(1LL << {}), (1LL << {}) - 1);",
-                            f.name.name, w - 1, w - 1).ok();
+                        writeln!(
+                            self.out,
+                            "{INDENT}t->{} = harc_rng_range(-(1LL << {}), (1LL << {}) - 1);",
+                            f.name.name,
+                            w - 1,
+                            w - 1
+                        )
+                        .ok();
                     }
                     BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => {
-                        writeln!(self.out, "{INDENT}t->{} = harc_rng_range(0, 1);", f.name.name).ok();
+                        writeln!(
+                            self.out,
+                            "{INDENT}t->{} = harc_rng_range(0, 1);",
+                            f.name.name
+                        )
+                        .ok();
                     }
                     BuiltinTy::Int => {
-                        writeln!(self.out, "{INDENT}t->{} = harc_rng_range(0, 0x7FFFFFFF);", f.name.name).ok();
+                        writeln!(
+                            self.out,
+                            "{INDENT}t->{} = harc_rng_range(0, 0x7FFFFFFF);",
+                            f.name.name
+                        )
+                        .ok();
                     }
                     _ => {
-                        writeln!(self.out, "{INDENT}// {} : <unsupported type for v0 randomize>",
-                            f.name.name).ok();
+                        writeln!(
+                            self.out,
+                            "{INDENT}// {} : <unsupported type for v0 randomize>",
+                            f.name.name
+                        )
+                        .ok();
                     }
                 }
             }
@@ -3813,10 +4747,19 @@ impl Emitter {
                 let last = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
                 if let Some(&n) = self.enums.get(last) {
                     let hi = if n == 0 { 0 } else { (n - 1) as i64 };
-                    writeln!(self.out, "{INDENT}t->{} = harc_rng_range(0, {});", f.name.name, hi).ok();
+                    writeln!(
+                        self.out,
+                        "{INDENT}t->{} = harc_rng_range(0, {});",
+                        f.name.name, hi
+                    )
+                    .ok();
                 } else {
-                    writeln!(self.out, "{INDENT}// {} : {} (named, not yet supported)",
-                        f.name.name, last).ok();
+                    writeln!(
+                        self.out,
+                        "{INDENT}// {} : {} (named, not yet supported)",
+                        f.name.name, last
+                    )
+                    .ok();
                 }
             }
         }
@@ -3986,7 +4929,8 @@ impl Emitter {
         let fields = match self.txn_fields.get(ty).cloned() {
             Some(f) => f,
             None => {
-                self.errors.push(format!("internal: no field info for transaction `{ty}`"));
+                self.errors
+                    .push(format!("internal: no field info for transaction `{ty}`"));
                 return;
             }
         };
@@ -4013,13 +4957,20 @@ impl Emitter {
         // emission, no zext bookkeeping.
         for f in &fields {
             self.pad(depth + 1);
-            writeln!(self.out, "z3::expr _z_{} = _ctx.bv_const(\"{}\", 64);",
-                f.name, f.name).ok();
+            writeln!(
+                self.out,
+                "z3::expr _z_{} = _ctx.bv_const(\"{}\", 64);",
+                f.name, f.name
+            )
+            .ok();
             if f.width < 64 {
                 self.pad(depth + 1);
-                writeln!(self.out,
+                writeln!(
+                    self.out,
                     "_s.add(z3::ult(_z_{}, _ctx.bv_val((uint64_t)1ULL << {}, 64)));",
-                    f.name, f.width).ok();
+                    f.name, f.width
+                )
+                .ok();
             }
         }
 
@@ -4036,24 +4987,35 @@ impl Emitter {
         // clause for them makes the whole problem UNSAT after the first
         // call. We block only the *free* fields. Diversity then comes from
         // the free-field cache.
-        let pinned: std::collections::HashSet<String> = with_body.iter().filter_map(|e| {
-            if let ExprKind::Binary { op: BinaryOp::Eq, lhs, rhs } = &*e.kind {
-                let pin_from = |side: &Expr, other: &Expr| -> Option<String> {
-                    if let ExprKind::Field { target, name } = &*side.kind {
-                        if matches!(&*target.kind, ExprKind::Ident(_)) {
-                            if matches!(&*other.kind, ExprKind::Int(_)) {
-                                return Some(name.name.clone());
+        let pinned: std::collections::HashSet<String> = with_body
+            .iter()
+            .filter_map(|e| {
+                if let ExprKind::Binary {
+                    op: BinaryOp::Eq,
+                    lhs,
+                    rhs,
+                } = &*e.kind
+                {
+                    let pin_from = |side: &Expr, other: &Expr| -> Option<String> {
+                        if let ExprKind::Field { target, name } = &*side.kind {
+                            if matches!(&*target.kind, ExprKind::Ident(_)) {
+                                if matches!(&*other.kind, ExprKind::Int(_)) {
+                                    return Some(name.name.clone());
+                                }
                             }
                         }
-                    }
+                        None
+                    };
+                    pin_from(lhs, rhs).or_else(|| pin_from(rhs, lhs))
+                } else {
                     None
-                };
-                pin_from(lhs, rhs).or_else(|| pin_from(rhs, lhs))
-            } else { None }
-        }).collect();
+                }
+            })
+            .collect();
 
         let cache_tag = format!("_div_cache_{}", target.span.start);
-        let free_fields: Vec<&TxnFieldInfo> = fields.iter()
+        let free_fields: Vec<&TxnFieldInfo> = fields
+            .iter()
             .filter(|f| !pinned.contains(&f.name))
             .collect();
 
@@ -4061,21 +5023,34 @@ impl Emitter {
         // iterations to push the solver away from previously-seen answers.
         for f in &free_fields {
             self.pad(depth + 1);
-            writeln!(self.out,
+            writeln!(
+                self.out,
                 "static std::vector<uint64_t> {cache_tag}_{};",
-                f.name).ok();
+                f.name
+            )
+            .ok();
         }
         self.pad(depth + 1);
-        writeln!(self.out, "_s.push();   // diversity-blocking clauses (free fields only)").ok();
+        writeln!(
+            self.out,
+            "_s.push();   // diversity-blocking clauses (free fields only)"
+        )
+        .ok();
         for f in &free_fields {
             self.pad(depth + 1);
-            writeln!(self.out,
+            writeln!(
+                self.out,
                 "if ({cache_tag}_{}.size() > 32) {cache_tag}_{}.clear();",
-                f.name, f.name).ok();
+                f.name, f.name
+            )
+            .ok();
             self.pad(depth + 1);
-            writeln!(self.out,
+            writeln!(
+                self.out,
                 "for (auto _v : {cache_tag}_{}) _s.add(_z_{} != _ctx.bv_val(_v, 64));",
-                f.name, f.name).ok();
+                f.name, f.name
+            )
+            .ok();
         }
         // First check: with blocking. If UNSAT (cache has saturated the
         // satisfiable space), drop the blocks and clear the cache.
@@ -4105,21 +5080,34 @@ impl Emitter {
             // a Z3-chosen satisfying value. Only free fields get pushed
             // into the diversity cache.
             self.pad(depth + 2);
-            writeln!(self.out, "uint64_t _val_{} = _m.eval(_z_{}).get_numeral_uint64();",
-                f.name, f.name).ok();
+            writeln!(
+                self.out,
+                "uint64_t _val_{} = _m.eval(_z_{}).get_numeral_uint64();",
+                f.name, f.name
+            )
+            .ok();
             self.pad(depth + 2);
             write!(self.out, "").ok();
             self.emit_expr(target);
             writeln!(self.out, ".{} = _val_{};", f.name, f.name).ok();
             if !pinned.contains(&f.name) {
                 self.pad(depth + 2);
-                writeln!(self.out, "{cache_tag}_{}.push_back(_val_{});", f.name, f.name).ok();
+                writeln!(
+                    self.out,
+                    "{cache_tag}_{}.push_back(_val_{});",
+                    f.name, f.name
+                )
+                .ok();
             }
         }
         self.pad(depth + 1);
         writeln!(self.out, "}} else {{").ok();
         self.pad(depth + 2);
-        writeln!(self.out, "sim_log_line(\"FAIL\", \"randomize(t) with: constraint UNSAT\");").ok();
+        writeln!(
+            self.out,
+            "sim_log_line(\"FAIL\", \"randomize(t) with: constraint UNSAT\");"
+        )
+        .ok();
         self.pad(depth + 2);
         writeln!(self.out, "errors++;").ok();
         self.pad(depth + 1);
@@ -4172,17 +5160,27 @@ impl Emitter {
                 } else if let Some(idx) = self.enum_variants.get(&id.name).copied() {
                     write!(self.out, "_ctx.bv_val((uint64_t){}, {})", idx, width).ok();
                 } else {
-                    self.errors.push(format!(
-                        "constraint references unknown name `{}`", id.name
-                    ));
+                    self.errors
+                        .push(format!("constraint references unknown name `{}`", id.name));
                     write!(self.out, "_ctx.bool_val(true)").ok();
                 }
             }
             ExprKind::Int(s) => {
-                write!(self.out, "_ctx.bv_val((uint64_t){}, {})", c_int_literal(s), width).ok();
+                write!(
+                    self.out,
+                    "_ctx.bv_val((uint64_t){}, {})",
+                    c_int_literal(s),
+                    width
+                )
+                .ok();
             }
             ExprKind::Bool(b) => {
-                write!(self.out, "_ctx.bool_val({})", if *b { "true" } else { "false" }).ok();
+                write!(
+                    self.out,
+                    "_ctx.bool_val({})",
+                    if *b { "true" } else { "false" }
+                )
+                .ok();
             }
             ExprKind::Paren(inner) => {
                 write!(self.out, "(").ok();
@@ -4229,14 +5227,14 @@ impl Emitter {
                     Add => (" + ", None),
                     Sub => (" - ", None),
                     Mul => (" * ", None),
-                    Div => ("",    Some("udiv")),
-                    Mod => ("",    Some("urem")),
+                    Div => ("", Some("udiv")),
+                    Mod => ("", Some("urem")),
                     Eq => (" == ", None),
                     Ne => (" != ", None),
-                    Lt => ("",     Some("ult")),
-                    Le => ("",     Some("ule")),
-                    Gt => ("",     Some("ugt")),
-                    Ge => ("",     Some("uge")),
+                    Lt => ("", Some("ult")),
+                    Le => ("", Some("ule")),
+                    Gt => ("", Some("ugt")),
+                    Ge => ("", Some("uge")),
                     AndAnd | AndKw => (" && ", None),
                     OrOr | OrKw => (" || ", None),
                     BitAnd => (" & ", None),
@@ -4306,7 +5304,9 @@ impl Emitter {
                     has_any = true;
                 }
                 if let Some(h) = hi {
-                    if has_any { write!(self.out, " && ").ok(); }
+                    if has_any {
+                        write!(self.out, " && ").ok();
+                    }
                     write!(self.out, "z3::ule(").ok();
                     self.emit_constraint_expr_w(lhs, field_set, width);
                     write!(self.out, ", ").ok();
@@ -4326,7 +5326,9 @@ impl Emitter {
                     write!(self.out, "_ctx.bool_val(false)").ok();
                 } else {
                     for (i, it) in items.iter().enumerate() {
-                        if i > 0 { write!(self.out, " || ").ok(); }
+                        if i > 0 {
+                            write!(self.out, " || ").ok();
+                        }
                         // Recurse so `{[0..3], 7}` expands correctly.
                         match &*it.kind {
                             ExprKind::RangeLit { .. } | ExprKind::SetLit(_) => {
@@ -4365,26 +5367,38 @@ impl Emitter {
     /// matches `log()`'s rules (first ident is severity; first string is
     /// the message).
     fn emit_log(&mut self, args: &[CallArg], file_path: Option<String>, depth: usize) {
-        let sev = args.iter().find_map(|a| match a {
-            CallArg::Expr(e) => match &*e.kind {
-                ExprKind::Ident(id) => Some(id.name.to_uppercase()),
+        let sev = args
+            .iter()
+            .find_map(|a| match a {
+                CallArg::Expr(e) => match &*e.kind {
+                    ExprKind::Ident(id) => Some(id.name.to_uppercase()),
+                    _ => None,
+                },
                 _ => None,
-            }
-            _ => None,
-        }).unwrap_or_else(|| "INFO".to_string());
-        let msg = args.iter().find_map(|a| match a {
-            CallArg::Expr(e) => match &*e.kind {
-                ExprKind::String(s) => Some(s.clone()),
+            })
+            .unwrap_or_else(|| "INFO".to_string());
+        let msg = args
+            .iter()
+            .find_map(|a| match a {
+                CallArg::Expr(e) => match &*e.kind {
+                    ExprKind::String(s) => Some(s.clone()),
+                    _ => None,
+                },
                 _ => None,
-            }
-            _ => None,
-        }).unwrap_or_else(|| "".to_string());
+            })
+            .unwrap_or_else(|| "".to_string());
         let (fmt, caps) = process_interp(&msg);
         self.pad(depth);
         match file_path {
             Some(p) => {
-                write!(self.out, "sim_logf_line(get_log_file(\"{}\"), \"{}\", \"{}\"",
-                    escape_c(&p), sev, escape_c(&fmt)).ok();
+                write!(
+                    self.out,
+                    "sim_logf_line(get_log_file(\"{}\"), \"{}\", \"{}\"",
+                    escape_c(&p),
+                    sev,
+                    escape_c(&fmt)
+                )
+                .ok();
             }
             None => {
                 write!(self.out, "sim_log_line(\"{}\", \"{}\"", sev, escape_c(&fmt)).ok();
@@ -4437,7 +5451,9 @@ impl Emitter {
                 write!(self.out, "(const char*)harc_rt::HarcHexBuf128(").ok();
                 match crate::parser::parse_expr_fragment(&cap.expr) {
                     Ok(e) => self.emit_expr(&e),
-                    Err(_) => { write!(self.out, "{}", cap.expr).ok(); }
+                    Err(_) => {
+                        write!(self.out, "{}", cap.expr).ok();
+                    }
                 }
                 write!(self.out, ", {width}, {upper_str})").ok();
             }
@@ -4446,7 +5462,9 @@ impl Emitter {
                 write!(self.out, "(long long)(").ok();
                 match crate::parser::parse_expr_fragment(&cap.expr) {
                     Ok(e) => self.emit_expr(&e),
-                    Err(_) => { write!(self.out, "{}", cap.expr).ok(); }
+                    Err(_) => {
+                        write!(self.out, "{}", cap.expr).ok();
+                    }
                 }
                 write!(self.out, ")").ok();
             }
@@ -4463,15 +5481,22 @@ impl Emitter {
     fn emit_tseq(&mut self, t: &TseqDecl, depth: usize) {
         // Inner type: pull T out of `TSeq<T>`. Default to `int64_t` if
         // the user wrote a bare `tseq`-as-block without a return clause.
-        let inner = t.return_ty.as_ref()
+        let inner = t
+            .return_ty
+            .as_ref()
             .and_then(tseq_inner_type)
             .unwrap_or_else(|| "int64_t".to_string());
         self.pad(depth);
         write!(self.out, "auto {} = [&](", t.name.name).ok();
         let mut added: Vec<String> = Vec::new();
         for (i, p) in t.params.iter().enumerate() {
-            if i > 0 { write!(self.out, ", ").ok(); }
-            let pty = p.ty.as_ref().map(c_type_for).unwrap_or("int64_t".to_string());
+            if i > 0 {
+                write!(self.out, ", ").ok();
+            }
+            let pty =
+                p.ty.as_ref()
+                    .map(c_type_for)
+                    .unwrap_or("int64_t".to_string());
             write!(self.out, "{pty} {}", p.name.name).ok();
             if matches!(&p.ty, Some(TypeExpr::Named { .. })) {
                 if self.pointer_vars.insert(p.name.name.clone()) {
@@ -4487,22 +5512,33 @@ impl Emitter {
         self.current_yield_target = prev;
         self.pad(depth + 1);
         writeln!(self.out, "return _result;").ok();
-        for k in added { self.pointer_vars.remove(&k); }
+        for k in added {
+            self.pointer_vars.remove(&k);
+        }
         self.pad(depth);
         writeln!(self.out, "}};").ok();
     }
 
     fn emit_function(&mut self, f: &FunctionDecl, depth: usize) {
         self.pad(depth);
-        let ret = f.return_ty.as_ref().map(c_type_for).unwrap_or("void".to_string());
+        let ret = f
+            .return_ty
+            .as_ref()
+            .map(c_type_for)
+            .unwrap_or("void".to_string());
         write!(self.out, "auto {} = [&](", f.name.name).ok();
         // Track which params are Named-typed (pointer-shaped). Add to
         // `pointer_vars` while emitting the body, then remove on exit so
         // siblings don't leak each other's params.
         let mut added: Vec<String> = Vec::new();
         for (i, p) in f.params.iter().enumerate() {
-            if i > 0 { write!(self.out, ", ").ok(); }
-            let pty = p.ty.as_ref().map(c_type_for).unwrap_or("int64_t".to_string());
+            if i > 0 {
+                write!(self.out, ", ").ok();
+            }
+            let pty =
+                p.ty.as_ref()
+                    .map(c_type_for)
+                    .unwrap_or("int64_t".to_string());
             write!(self.out, "{pty} {}", p.name.name).ok();
             if matches!(&p.ty, Some(TypeExpr::Named { .. })) {
                 if self.pointer_vars.insert(p.name.name.clone()) {
@@ -4512,7 +5548,9 @@ impl Emitter {
         }
         writeln!(self.out, ") -> {ret} {{").ok();
         self.emit_block(&f.body, depth + 1);
-        for k in added { self.pointer_vars.remove(&k); }
+        for k in added {
+            self.pointer_vars.remove(&k);
+        }
         self.pad(depth);
         writeln!(self.out, "}};").ok();
     }
@@ -4537,7 +5575,11 @@ impl Emitter {
             StmtKind::For(f) => {
                 self.pad(depth);
                 let var = &f.var.name;
-                if let ExprKind::RangeLit { lo: Some(lo), hi: Some(hi) } = &*f.iter.kind {
+                if let ExprKind::RangeLit {
+                    lo: Some(lo),
+                    hi: Some(hi),
+                } = &*f.iter.kind
+                {
                     // `for i in lo .. hi` — emit as an indexed C++ for loop.
                     write!(self.out, "for (int64_t {var} = ").ok();
                     self.emit_expr(lo);
@@ -4636,7 +5678,9 @@ impl Emitter {
                     writeln!(self.out, "}}").ok();
                 }
             }
-            StmtKind::Wait { duration, clock, .. } => {
+            StmtKind::Wait {
+                duration, clock, ..
+            } => {
                 self.pad(depth);
                 // `wait N cycles on <clock>` — advance simulated time
                 // until the named clock has seen N more rising edges.
@@ -4672,9 +5716,17 @@ impl Emitter {
                     // cooperate with other coroutines, the main loop
                     // gets reworked to advance by next-edge-of-any-clock
                     // and the coroutine path resumes.
-                    write!(self.out, "{{ long long _target = clocks_[{idx}].rising_count + (long long)(").ok();
+                    write!(
+                        self.out,
+                        "{{ long long _target = clocks_[{idx}].rising_count + (long long)("
+                    )
+                    .ok();
                     self.emit_expr(duration);
-                    writeln!(self.out, "); while (clocks_[{idx}].rising_count < _target) {{").ok();
+                    writeln!(
+                        self.out,
+                        "); while (clocks_[{idx}].rising_count < _target) {{"
+                    )
+                    .ok();
                     self.pad(depth + 1);
                     writeln!(self.out, "long long _next = clocks_[0].next_edge_ps;").ok();
                     self.pad(depth + 1);
@@ -4707,7 +5759,12 @@ impl Emitter {
                     writeln!(self.out, "; _w++) tick();").ok();
                 }
             }
-            StmtKind::WaitUntil { mode, conditions, timeout, .. } => {
+            StmtKind::WaitUntil {
+                mode,
+                conditions,
+                timeout,
+                ..
+            } => {
                 self.emit_wait_until(mode, conditions, timeout.as_ref(), depth);
             }
             StmtKind::Assert(v) => {
@@ -4771,10 +5828,16 @@ impl Emitter {
                         (id.name.clone(), expr.clone())
                     }
                 } else {
-                    (format!("cov_{}_{}", expr.span.start, expr.span.end), expr.clone())
+                    (
+                        format!("cov_{}_{}", expr.span.start, expr.span.end),
+                        expr.clone(),
+                    )
                 };
                 let tag = format!("c_{}_{}", expr.span.start, expr.span.end);
-                self.covers.push(CoverInfo { tag: tag.clone(), label });
+                self.covers.push(CoverInfo {
+                    tag: tag.clone(),
+                    label,
+                });
                 self.pad(depth);
                 writeln!(self.out, "static uint64_t _cov_{tag}_hits = 0;").ok();
                 self.pad(depth);
@@ -4814,7 +5877,8 @@ impl Emitter {
                     (path, rest)
                 };
                 if path.is_none() {
-                    self.errors.push("logf requires a string-literal file path as the first arg".into());
+                    self.errors
+                        .push("logf requires a string-literal file path as the first arg".into());
                     return;
                 }
                 let collected: Vec<CallArg> = rest.into_iter().cloned().collect();
@@ -4848,9 +5912,8 @@ impl Emitter {
                     self.emit_expr(e);
                     writeln!(self.out, ");").ok();
                 } else {
-                    self.errors.push(
-                        "`yield` outside a `tseq` body is not supported in v0 cpp_tb".into(),
-                    );
+                    self.errors
+                        .push("`yield` outside a `tseq` body is not supported in v0 cpp_tb".into());
                 }
             }
             StmtKind::Emit { name, args, .. } => {
@@ -4862,12 +5925,15 @@ impl Emitter {
                 //     bare name to the instance-qualified field
                 //     (`mon.write_seen`).
                 let event_name = if name.segments.len() > 1 {
-                    name.segments.iter()
+                    name.segments
+                        .iter()
                         .map(|s| s.name.as_str())
                         .collect::<Vec<_>>()
                         .join(".")
                 } else {
-                    let raw = name.segments.last()
+                    let raw = name
+                        .segments
+                        .last()
                         .map(|s| s.name.clone())
                         .unwrap_or_default();
                     self.field_subs.get(&raw).cloned().unwrap_or(raw)
@@ -4909,18 +5975,23 @@ impl Emitter {
                             HookSide::Pre => "pre",
                             HookSide::Post => "post",
                         };
-                        let arg_decls: Vec<String> = params.iter().map(|p| {
-                            let ty = p.ty.as_ref()
-                                .map(|t| self.c_type_for_param(t))
-                                .unwrap_or_else(|| "int64_t".to_string());
-                            format!("{ty} {}", p.name.name)
-                        }).collect();
+                        let arg_decls: Vec<String> = params
+                            .iter()
+                            .map(|p| {
+                                let ty =
+                                    p.ty.as_ref()
+                                        .map(|t| self.c_type_for_param(t))
+                                        .unwrap_or_else(|| "int64_t".to_string());
+                                format!("{ty} {}", p.name.name)
+                            })
+                            .collect();
                         self.pad(depth);
                         writeln!(
                             self.out,
                             "{comp_ty}_{method_name}_{side_str}.push_back([&]({}) {{",
                             arg_decls.join(", "),
-                        ).ok();
+                        )
+                        .ok();
                         self.emit_block(&h.body, depth + 1);
                         self.pad(depth);
                         writeln!(self.out, "}});").ok();
@@ -4947,7 +6018,8 @@ impl Emitter {
                             tmp
                         }
                         _ => {
-                            self.errors.push("on <event>(arg): event must be `name` or `obj.name`".into());
+                            self.errors
+                                .push("on <event>(arg): event must be `name` or `obj.name`".into());
                             return;
                         }
                     };
@@ -4959,7 +6031,10 @@ impl Emitter {
                         },
                         _ => "_v".into(),
                     };
-                    let arg_ty = self.event_types.get(&raw).cloned()
+                    let arg_ty = self
+                        .event_types
+                        .get(&raw)
+                        .cloned()
                         .unwrap_or_else(|| "int64_t".into());
                     self.pad(depth);
                     writeln!(self.out, "{event_ref}.push_back([&]({arg_ty} {arg}) {{").ok();
@@ -4973,7 +6048,11 @@ impl Emitter {
                     self.emit_cycle_trigger(h, depth, "_t_");
                 }
             }
-            StmtKind::Randomize { blocking: _, target, with_body } => {
+            StmtKind::Randomize {
+                blocking: _,
+                target,
+                with_body,
+            } => {
                 let ty = match &*target.kind {
                     ExprKind::Ident(id) => self.let_types.get(&id.name).cloned(),
                     _ => None,
@@ -5049,7 +6128,8 @@ impl Emitter {
                     // this prefix when registering — see
                     // `emit_component_handler_registrations_bound`.
                     let prefix = l.name.name.clone();
-                    self.bus_bindings.insert(l.name.name.clone(), (bus, buf, prefix));
+                    self.bus_bindings
+                        .insert(l.name.name.clone(), (bus, buf, prefix));
                     return;
                 }
             }
@@ -5117,7 +6197,10 @@ impl Emitter {
                                     // call is cleaner).
                                     if include_active {
                                         self.try_emit_bound_driver_actor(
-                                            &synth, &l.name.name, depth, &binding,
+                                            &synth,
+                                            &l.name.name,
+                                            depth,
+                                            &binding,
                                         );
                                     }
                                     // Monitor-actor path: handshake
@@ -5126,7 +6209,10 @@ impl Emitter {
                                     // mode. This is the observation
                                     // half of the transactor.
                                     self.emit_bound_monitor_actors(
-                                        &synth, &l.name.name, depth, &binding,
+                                        &synth,
+                                        &l.name.name,
+                                        depth,
+                                        &binding,
                                     );
                                     return;
                                 } else {
@@ -5154,7 +6240,10 @@ impl Emitter {
                             writeln!(self.out, "{simple} {};", l.name.name).ok();
                             let tag = format!("_xactor_{}_", l.name.name);
                             self.emit_component_handler_registrations(
-                                &synth, &l.name.name, depth, &tag,
+                                &synth,
+                                &l.name.name,
+                                depth,
+                                &tag,
                             );
                             return;
                         }
@@ -5220,13 +6309,20 @@ impl Emitter {
                                     // for now to keep the model
                                     // tractable).
                                     if self.try_emit_bound_driver_actor(
-                                        &comp, &l.name.name, depth, &binding,
+                                        &comp,
+                                        &l.name.name,
+                                        depth,
+                                        &binding,
                                     ) {
                                         return;
                                     }
                                     let tag = format!("_{}_", comp.kind.keyword());
                                     self.emit_component_handler_registrations_bound(
-                                        &comp, &l.name.name, depth, &tag, Some(binding),
+                                        &comp,
+                                        &l.name.name,
+                                        depth,
+                                        &tag,
+                                        Some(binding),
                                     );
                                     return;
                                 } else {
@@ -5254,13 +6350,26 @@ impl Emitter {
         // `let e : event<T>` — pub/sub primitive. Lower to a vector of
         // std::function<void(T)>; `on e(arg) body end on` registers a
         // closure; `emit e(v)` calls every subscriber. (Spec §3.4 + §7.3.)
-        if let Some(TypeExpr::Builtin { name: BuiltinTy::Event, args, .. }) = &l.ty {
-            let inner = args.first().map(|a| match a {
-                TypeArg::Type(t) => txn_field_c_type(t),
-                _ => "uint64_t".into(),
-            }).unwrap_or_else(|| "uint64_t".into());
+        if let Some(TypeExpr::Builtin {
+            name: BuiltinTy::Event,
+            args,
+            ..
+        }) = &l.ty
+        {
+            let inner = args
+                .first()
+                .map(|a| match a {
+                    TypeArg::Type(t) => txn_field_c_type(t),
+                    _ => "uint64_t".into(),
+                })
+                .unwrap_or_else(|| "uint64_t".into());
             self.pad(depth);
-            writeln!(self.out, "std::vector<std::function<void({inner})>> {};", l.name.name).ok();
+            writeln!(
+                self.out,
+                "std::vector<std::function<void({inner})>> {};",
+                l.name.name
+            )
+            .ok();
             self.event_types.insert(l.name.name.clone(), inner);
             return;
         }
@@ -5280,7 +6389,11 @@ impl Emitter {
             // `auto` when the rhs is a call — function/tseq/method
             // returns can be `std::vector<T>` or a transaction value,
             // neither of which fit in int64_t.
-            let ty = if rhs_wants_auto(v, &self.tseq_names) { "auto" } else { "int64_t" };
+            let ty = if rhs_wants_auto(v, &self.tseq_names) {
+                "auto"
+            } else {
+                "int64_t"
+            };
             write!(self.out, "{ty} {} = ", l.name.name).ok();
             self.emit_expr(v);
             writeln!(self.out, ";").ok();
@@ -5326,9 +6439,7 @@ impl Emitter {
                     let synth = synth_component_from_transactor(&t, include_active);
                     writeln!(self.out, "{name} {};", l.name.name).ok();
                     let tag = format!("_xactor_{}_", l.name.name);
-                    self.emit_component_handler_registrations(
-                        &synth, &l.name.name, depth, &tag,
-                    );
+                    self.emit_component_handler_registrations(&synth, &l.name.name, depth, &tag);
                     return;
                 }
                 if let Some(comp) = self.components.get(name).cloned() {
@@ -5360,7 +6471,10 @@ impl Emitter {
                         _ => None,
                     };
                     self.emit_subcomponent_handler_registrations(
-                        &comp, &l.name.name, root_mode, depth,
+                        &comp,
+                        &l.name.name,
+                        root_mode,
+                        depth,
                     );
                     // Top-level watchdog (spec §8.6). Install a periodic
                     // `_checkers` closure that fires `<Type>_watchdog(<inst>)`
@@ -5447,7 +6561,9 @@ impl Emitter {
                 self.emit_lvalue(target);
                 write!(self.out, ", {{").ok();
                 for (i, w) in words.iter().enumerate() {
-                    if i > 0 { write!(self.out, ", ").ok(); }
+                    if i > 0 {
+                        write!(self.out, ", ").ok();
+                    }
                     write!(self.out, "{w}").ok();
                 }
                 writeln!(self.out, "}});").ok();
@@ -5507,15 +6623,26 @@ impl Emitter {
             }
         }
         match &*e.kind {
-            ExprKind::Int(s) => { write!(self.out, "{}", c_int_literal(s)).ok(); }
-            ExprKind::Float(s) => { write!(self.out, "{s}").ok(); }
+            ExprKind::Int(s) => {
+                write!(self.out, "{}", c_int_literal(s)).ok();
+            }
+            ExprKind::Float(s) => {
+                write!(self.out, "{s}").ok();
+            }
             ExprKind::Time(s) => {
                 // Strip the unit suffix and emit the numeric portion.
-                let n: String = s.chars().take_while(|c| c.is_ascii_digit() || *c == '_').collect();
+                let n: String = s
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '_')
+                    .collect();
                 write!(self.out, "{n}").ok();
             }
-            ExprKind::String(s) => { write!(self.out, "\"{}\"", escape_c(s)).ok(); }
-            ExprKind::Bool(b) => { write!(self.out, "{}", if *b { "true" } else { "false" }).ok(); }
+            ExprKind::String(s) => {
+                write!(self.out, "\"{}\"", escape_c(s)).ok();
+            }
+            ExprKind::Bool(b) => {
+                write!(self.out, "{}", if *b { "true" } else { "false" }).ok();
+            }
             ExprKind::Ident(id) => {
                 // Monitor-body bare-name rewrite — see field_subs.
                 if let Some(s) = self.field_subs.get(&id.name) {
@@ -5581,14 +6708,37 @@ impl Emitter {
                 write!(self.out, "]").ok();
             }
             ExprKind::Call { callee, args } => {
+                // Env/test-level quiescence helper: `env.quiesced(N)`
+                // aggregates the built-in `idle(N)` predicate over all
+                // nested component fields registered under that component.
+                // Timed `wait until` expands the same helper into per-leaf
+                // predicates so timeout diagnostics name the blocking
+                // sub-component.
+                if let Some((instances, n_expr)) =
+                    self.resolve_component_quiesced_predicate(callee, args)
+                {
+                    if instances.is_empty() {
+                        write!(self.out, "true").ok();
+                    } else if instances.len() == 1 {
+                        self.emit_idle_predicate(&instances[0], "idle", n_expr);
+                    } else {
+                        for (i, instance) in instances.iter().enumerate() {
+                            if i > 0 {
+                                write!(self.out, " && ").ok();
+                            }
+                            write!(self.out, "(").ok();
+                            self.emit_idle_predicate(instance, "idle", n_expr);
+                            write!(self.out, ")").ok();
+                        }
+                    }
+                    return;
+                }
                 // Built-in activity-tracking predicates: `obj.idle(N)`,
                 // `obj.idle_in(N)`, `obj.idle_out(N)` lower directly to
                 // arithmetic on the auto-injected heartbeat fields.
                 // Recognized BEFORE hookable method dispatch so a user
                 // can't shadow them. (Spec §7.x — activity tracking.)
-                if let Some((instance, kind)) =
-                    self.resolve_component_idle_predicate(callee)
-                {
+                if let Some((instance, kind)) = self.resolve_component_idle_predicate(callee) {
                     if args.len() != 1 {
                         self.errors.push(format!(
                             "{instance}.{kind}: expected 1 cycle-count arg, got {}",
@@ -5601,26 +6751,7 @@ impl Emitter {
                         CallArg::Expr(e) => e,
                         CallArg::Named { value, .. } => value,
                     };
-                    match kind.as_str() {
-                        "idle_in" => {
-                            write!(self.out, "(((uint64_t)cycle_count - {instance}._last_in_cycle) >= (uint64_t)(").ok();
-                            self.emit_expr(n_expr);
-                            write!(self.out, "))").ok();
-                        }
-                        "idle_out" => {
-                            write!(self.out, "(((uint64_t)cycle_count - {instance}._last_out_cycle) >= (uint64_t)(").ok();
-                            self.emit_expr(n_expr);
-                            write!(self.out, "))").ok();
-                        }
-                        "idle" => {
-                            write!(self.out, "((((uint64_t)cycle_count - {instance}._last_in_cycle) >= (uint64_t)(").ok();
-                            self.emit_expr(n_expr);
-                            write!(self.out, ")) && (((uint64_t)cycle_count - {instance}._last_out_cycle) >= (uint64_t)(").ok();
-                            self.emit_expr(n_expr);
-                            write!(self.out, ")))").ok();
-                        }
-                        _ => unreachable!(),
-                    }
+                    self.emit_idle_predicate(&instance, &kind, n_expr);
                     return;
                 }
                 // Method-call rewrite: `obj.method(args)` where `obj`'s
@@ -5645,7 +6776,9 @@ impl Emitter {
                 self.emit_expr(callee);
                 write!(self.out, "(").ok();
                 for (i, a) in args.iter().enumerate() {
-                    if i > 0 { write!(self.out, ", ").ok(); }
+                    if i > 0 {
+                        write!(self.out, ", ").ok();
+                    }
                     match a {
                         CallArg::Expr(ex) => self.emit_expr(ex),
                         CallArg::Named { value, .. } => self.emit_expr(value),
@@ -5678,7 +6811,9 @@ impl Emitter {
             }
             ExprKind::Unary { op, expr } => {
                 let s = match op {
-                    UnaryOp::Neg => "-", UnaryOp::Not => "!", UnaryOp::NotKw => "!",
+                    UnaryOp::Neg => "-",
+                    UnaryOp::Not => "!",
+                    UnaryOp::NotKw => "!",
                     UnaryOp::BitNot => "~",
                 };
                 write!(self.out, "{s}").ok();
@@ -5710,7 +6845,9 @@ impl Emitter {
                         self.emit_expr_with_arrow(sig_side, /*lvalue*/ true);
                         write!(self.out, ", {{").ok();
                         for (i, w) in words.iter().enumerate() {
-                            if i > 0 { write!(self.out, ", ").ok(); }
+                            if i > 0 {
+                                write!(self.out, ", ").ok();
+                            }
                             write!(self.out, "{w}").ok();
                         }
                         write!(self.out, "}})").ok();
@@ -5725,7 +6862,11 @@ impl Emitter {
                 write!(self.out, " {s} ").ok();
                 self.emit_expr(rhs);
             }
-            ExprKind::Ternary { cond, then_branch, else_branch } => {
+            ExprKind::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
                 // Wrap in parens so the ternary doesn't bind into a
                 // surrounding higher-precedence operator on the C++
                 // side (e.g. `a + (cond ? x : y)` lowers correctly).
@@ -5746,9 +6887,13 @@ impl Emitter {
                 // Bare ranges outside of `for`/`in` aren't representable in C++.
                 // Emit a comment so the user sees the issue without a hard fail.
                 write!(self.out, "/* range ").ok();
-                if let Some(l) = lo { self.emit_expr(l); }
+                if let Some(l) = lo {
+                    self.emit_expr(l);
+                }
                 write!(self.out, "..").ok();
-                if let Some(h) = hi { self.emit_expr(h); }
+                if let Some(h) = hi {
+                    self.emit_expr(h);
+                }
                 write!(self.out, " */ 0").ok();
             }
             other => {
@@ -5772,11 +6917,17 @@ fn file_uses_constraint_solver(file: &SourceFile) -> bool {
     // First pass: collect names of transactions that declare any
     // `keep` items. Any bare `randomize(t)` against one of these
     // routes through Z3 after the §4 keep-merge.
-    let keep_bearing: std::collections::HashSet<&str> = file.items.iter()
+    let keep_bearing: std::collections::HashSet<&str> = file
+        .items
+        .iter()
         .filter_map(|it| match it {
             Item::Transaction(t) => {
                 let has_keep = t.body.iter().any(|b| matches!(b, TxnBodyItem::Keep(_)));
-                if has_keep { Some(t.name.name.as_str()) } else { None }
+                if has_keep {
+                    Some(t.name.name.as_str())
+                } else {
+                    None
+                }
             }
             _ => None,
         })
@@ -5798,10 +6949,11 @@ fn file_uses_constraint_solver(file: &SourceFile) -> bool {
             StmtKind::Repeat(r) => block(&r.body, kb),
             StmtKind::Loop(b) => block(b, kb),
             StmtKind::While { body, .. } => block(body, kb),
-            StmtKind::If(i) =>
+            StmtKind::If(i) => {
                 block(&i.then_block, kb)
-                || i.else_block.as_ref().map_or(false, |b| block(b, kb))
-                || i.elsifs.iter().any(|(_, b)| block(b, kb)),
+                    || i.else_block.as_ref().map_or(false, |b| block(b, kb))
+                    || i.elsifs.iter().any(|(_, b)| block(b, kb))
+            }
             StmtKind::Fork(f) => f.branches.iter().any(|b| block(b, kb)),
             StmtKind::Parallel(bs) | StmtKind::Schedule(bs) => bs.iter().any(|b| block(b, kb)),
             StmtKind::Select(arms) => arms.iter().any(|a| block(&a.action, kb)),
@@ -5814,11 +6966,15 @@ fn file_uses_constraint_solver(file: &SourceFile) -> bool {
         Item::Function(f) => block(&f.body, &keep_bearing),
         Item::Test(t) => t.items.iter().any(|ti| match ti {
             TestItem::Stmt(s) => stmt(s, &keep_bearing),
-            TestItem::Scope(sc) =>
+            TestItem::Scope(sc) => {
                 sc.setup.as_ref().map_or(false, |b| block(b, &keep_bearing))
-                || sc.run.as_ref().map_or(false, |b| block(b, &keep_bearing))
-                || sc.check.as_ref().map_or(false, |b| block(b, &keep_bearing))
-                || sc.teardown.as_ref().map_or(false, |b| block(b, &keep_bearing)),
+                    || sc.run.as_ref().map_or(false, |b| block(b, &keep_bearing))
+                    || sc.check.as_ref().map_or(false, |b| block(b, &keep_bearing))
+                    || sc
+                        .teardown
+                        .as_ref()
+                        .map_or(false, |b| block(b, &keep_bearing))
+            }
             _ => false,
         }),
         // `impl sim for T` body items aren't folded into the Test by
@@ -5840,11 +6996,19 @@ fn file_uses_constraint_solver(file: &SourceFile) -> bool {
 /// `txn_field_c_type` but supports `queue<T>` → `HarcQueue<T>` (the small
 /// runtime template emitted at file scope when scoreboards are present).
 fn scoreboard_field_c_type(t: &TypeExpr) -> String {
-    if let TypeExpr::Builtin { name: BuiltinTy::Queue, args, .. } = t {
-        let inner = args.first().map(|a| match a {
-            TypeArg::Type(ty) => txn_field_c_type(ty),
-            _ => "uint64_t".into(),
-        }).unwrap_or_else(|| "uint64_t".into());
+    if let TypeExpr::Builtin {
+        name: BuiltinTy::Queue,
+        args,
+        ..
+    } = t
+    {
+        let inner = args
+            .first()
+            .map(|a| match a {
+                TypeArg::Type(ty) => txn_field_c_type(ty),
+                _ => "uint64_t".into(),
+            })
+            .unwrap_or_else(|| "uint64_t".into());
         return format!("HarcQueue<{inner}>");
     }
     txn_field_c_type(t)
@@ -5859,7 +7023,9 @@ fn txn_field_c_type(t: &TypeExpr) -> String {
             BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {
                 cpp_uint_for_width(int_width_from_args(args)).into()
             }
-            BuiltinTy::SInt | BuiltinTy::SIntCap => cpp_sint_for_width(int_width_from_args(args)).into(),
+            BuiltinTy::SInt | BuiltinTy::SIntCap => {
+                cpp_sint_for_width(int_width_from_args(args)).into()
+            }
             BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => "bool".into(),
             _ => "uint64_t".into(),
         },
@@ -5946,12 +7112,32 @@ fn expr_path_str(e: &Expr) -> Option<String> {
 ///                     name: "handshake" },
 ///     args:   [Expr::Ident(arg)] }
 fn extract_bus_handshake_event(event: &Expr, bus_ident: &str) -> Option<(String, String)> {
-    let ExprKind::Call { callee, args } = &*event.kind else { return None; };
-    let ExprKind::Field { target, name: method } = &*callee.kind else { return None; };
-    if method.name != "handshake" { return None; }
-    let ExprKind::Field { target: outer, name: ch } = &*target.kind else { return None; };
-    let ExprKind::Ident(id) = &*outer.kind else { return None; };
-    if id.name != bus_ident { return None; }
+    let ExprKind::Call { callee, args } = &*event.kind else {
+        return None;
+    };
+    let ExprKind::Field {
+        target,
+        name: method,
+    } = &*callee.kind
+    else {
+        return None;
+    };
+    if method.name != "handshake" {
+        return None;
+    }
+    let ExprKind::Field {
+        target: outer,
+        name: ch,
+    } = &*target.kind
+    else {
+        return None;
+    };
+    let ExprKind::Ident(id) = &*outer.kind else {
+        return None;
+    };
+    if id.name != bus_ident {
+        return None;
+    }
     let arg_name = match args.first() {
         Some(CallArg::Expr(e)) => match &*e.kind {
             ExprKind::Ident(id) => id.name.clone(),
@@ -5963,7 +7149,9 @@ fn extract_bus_handshake_event(event: &Expr, bus_ident: &str) -> Option<(String,
 }
 
 fn extract_event_subscription(event: &Expr) -> Option<(String, String)> {
-    let ExprKind::Call { callee, args } = &*event.kind else { return None; };
+    let ExprKind::Call { callee, args } = &*event.kind else {
+        return None;
+    };
     let event_name = match &*callee.kind {
         ExprKind::Ident(id) => id.name.clone(),
         _ => return None,
@@ -5997,7 +7185,12 @@ fn rhs_wants_auto(e: &Expr, _tseq_names: &std::collections::HashSet<String>) -> 
 /// something well-formed in practice — this guards against synth from
 /// degenerate ASTs).
 fn tseq_inner_type(t: &TypeExpr) -> Option<String> {
-    if let TypeExpr::Builtin { name: BuiltinTy::TSeq, args, .. } = t {
+    if let TypeExpr::Builtin {
+        name: BuiltinTy::TSeq,
+        args,
+        ..
+    } = t
+    {
         if let Some(TypeArg::Type(inner)) = args.first() {
             return Some(c_type_for(inner));
         }
@@ -6056,7 +7249,9 @@ fn c_type_for(t: &TypeExpr) -> String {
             BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {
                 cpp_uint_for_width(int_width_from_args(args)).into()
             }
-            BuiltinTy::SInt | BuiltinTy::SIntCap => cpp_sint_for_width(int_width_from_args(args)).into(),
+            BuiltinTy::SInt | BuiltinTy::SIntCap => {
+                cpp_sint_for_width(int_width_from_args(args)).into()
+            }
             BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => "bool".into(),
             BuiltinTy::String => "const char*".into(),
             BuiltinTy::Time => "uint64_t".into(),
@@ -6074,20 +7269,23 @@ fn c_type_for(t: &TypeExpr) -> String {
                 // `queue<T>` as a function param — pass by reference to
                 // avoid copying the runtime queue. Mirrors the field-type
                 // lowering.
-                let inner = args.first().map(|a| match a {
-                    TypeArg::Type(ty) => txn_field_c_type(ty),
-                    TypeArg::Expr(e) => match &*e.kind {
-                        ExprKind::Ident(id) => id.name.clone(),
+                let inner = args
+                    .first()
+                    .map(|a| match a {
+                        TypeArg::Type(ty) => txn_field_c_type(ty),
+                        TypeArg::Expr(e) => match &*e.kind {
+                            ExprKind::Ident(id) => id.name.clone(),
+                            _ => "uint64_t".into(),
+                        },
                         _ => "uint64_t".into(),
-                    },
-                    _ => "uint64_t".into(),
-                }).unwrap_or_else(|| "uint64_t".into());
+                    })
+                    .unwrap_or_else(|| "uint64_t".into());
                 format!("HarcQueue<{inner}>&")
             }
             // Aggregates / verification-only types fall back to the spelling
             // — caller will get a compile error pointing at the gap.
             _ => format!("/* TODO: type {:?} */ uint64_t", name),
-        }
+        },
         TypeExpr::Named { name, .. } => {
             // User-defined module types lower to Verilator pointers (`VFoo*`).
             // Matches the `let dut : AxiLiteRegs` → `VAxiLiteRegs* dut` rule
@@ -6101,17 +7299,30 @@ fn c_type_for(t: &TypeExpr) -> String {
 fn c_binary_op(op: BinaryOp) -> &'static str {
     use BinaryOp::*;
     match op {
-        Add => "+", Sub => "-", Mul => "*", Div => "/", Mod => "%",
-        Eq => "==", Ne => "!=", Lt => "<", Le => "<=", Gt => ">", Ge => ">=",
+        Add => "+",
+        Sub => "-",
+        Mul => "*",
+        Div => "/",
+        Mod => "%",
+        Eq => "==",
+        Ne => "!=",
+        Lt => "<",
+        Le => "<=",
+        Gt => ">",
+        Ge => ">=",
         AndAnd | AndKw => "&&",
         OrOr | OrKw => "||",
-        BitAnd => "&", BitOr => "|", BitXor => "^",
-        Shl => "<<", Shr => ">>",
+        BitAnd => "&",
+        BitOr => "|",
+        BitXor => "^",
+        Shl => "<<",
+        Shr => ">>",
         // Temporal / membership operators have no direct C++ equivalent — they
         // shouldn't appear in v0 cpp_tb input. Emit a placeholder rather than
         // fail hard so the whole emit doesn't abort on one stray operator.
-        PipeImplies | PipeImpliesNext | Throughout | Within | Intersect
-        | In | Inside => "/* unsupported-op */ ,",
+        PipeImplies | PipeImpliesNext | Throughout | Within | Intersect | In | Inside => {
+            "/* unsupported-op */ ,"
+        }
     }
 }
 
@@ -6187,7 +7398,9 @@ fn c_wide_lit_words(s: &str) -> Option<Vec<String>> {
     } else {
         s.replace('_', "")
     };
-    let hex = normalized.strip_prefix("0x").or_else(|| normalized.strip_prefix("0X"))?;
+    let hex = normalized
+        .strip_prefix("0x")
+        .or_else(|| normalized.strip_prefix("0X"))?;
     if hex.len() <= 32 {
         return None;
     }
@@ -6252,8 +7465,12 @@ fn process_interp(s: &str) -> (String, Vec<InterpCap>) {
         if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
             // Walk to matching `}` (no nested braces in v0).
             let mut j = i + 2;
-            while j < bytes.len() && bytes[j] != b'}' { j += 1; }
-            if j >= bytes.len() { break; } // unmatched — bail and keep what we have
+            while j < bytes.len() && bytes[j] != b'}' {
+                j += 1;
+            }
+            if j >= bytes.len() {
+                break;
+            } // unmatched — bail and keep what we have
             let inner = std::str::from_utf8(&bytes[i + 2..j]).unwrap_or("").trim();
             // Split on the last `:` to extract an optional format spec.
             let (expr_src, spec) = match inner.rfind(':') {
@@ -6261,7 +7478,10 @@ fn process_interp(s: &str) -> (String, Vec<InterpCap>) {
                 None => (inner, ""),
             };
             let (fmt_token, wide_hex) = translate_fmt_spec(spec);
-            captures.push(InterpCap { expr: expr_src.to_string(), wide_hex });
+            captures.push(InterpCap {
+                expr: expr_src.to_string(),
+                wide_hex,
+            });
             fmt.push_str(&fmt_token);
             i = j + 1;
         } else if bytes[i] == b'%' {
@@ -6282,7 +7502,9 @@ fn process_interp(s: &str) -> (String, Vec<InterpCap>) {
 ///   wider than 16 digits — the caller must emit the value via
 ///   `HarcHexBuf128` so it prints in full 128-bit precision.
 fn translate_fmt_spec(spec: &str) -> (String, Option<(usize, bool)>) {
-    if spec.is_empty() { return ("%lld".to_string(), None); }
+    if spec.is_empty() {
+        return ("%lld".to_string(), None);
+    }
     let last = spec.chars().last().unwrap();
     let prefix = &spec[..spec.len() - last.len_utf8()];
 
@@ -6291,8 +7513,12 @@ fn translate_fmt_spec(spec: &str) -> (String, Option<(usize, bool)>) {
     //   "032x" → width 32, hex. "8d" → width 8, decimal. "x" → width 0.
     let width: usize = {
         let trimmed = prefix.trim_start_matches('0');
-        trimmed.chars().take_while(|c| c.is_ascii_digit()).collect::<String>()
-            .parse::<usize>().unwrap_or(0)
+        trimmed
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse::<usize>()
+            .unwrap_or(0)
     };
 
     match last {
@@ -6306,7 +7532,7 @@ fn translate_fmt_spec(spec: &str) -> (String, Option<(usize, bool)>) {
         }
         'x' => (format!("%{prefix}llx"), None),
         'X' => (format!("%{prefix}llX"), None),
-        _   => ("%lld".to_string(), None),
+        _ => ("%lld".to_string(), None),
     }
 }
 
@@ -6314,17 +7540,24 @@ fn translate_fmt_spec(spec: &str) -> (String, Option<(usize, bool)>) {
 /// to picoseconds. Returns `Err(msg)` on unrecognised units. The `cycles`
 /// suffix is rejected here — clock periods must be wall-clock time.
 fn time_literal_to_ps(s: &str) -> Result<i64, String> {
-    let digits: String = s.chars().take_while(|c| c.is_ascii_digit() || *c == '_').collect();
+    let digits: String = s
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '_')
+        .collect();
     let unit: String = s.chars().skip(digits.len()).collect();
-    let n: i64 = digits.replace('_', "").parse()
+    let n: i64 = digits
+        .replace('_', "")
+        .parse()
         .map_err(|_| format!("bad number in time literal `{s}`"))?;
     match unit.as_str() {
         "ps" => Ok(n),
         "ns" => Ok(n * 1_000),
         "us" => Ok(n * 1_000_000),
         "ms" => Ok(n * 1_000_000_000),
-        "s"  => Ok(n * 1_000_000_000_000),
-        other => Err(format!("unsupported time unit `{other}` in `{s}` (expected ps/ns/us/ms/s)")),
+        "s" => Ok(n * 1_000_000_000_000),
+        other => Err(format!(
+            "unsupported time unit `{other}` in `{s}` (expected ps/ns/us/ms/s)"
+        )),
     }
 }
 
@@ -6345,7 +7578,10 @@ fn match_temporal_call(e: &Expr) -> Option<(SystemFn, &Expr)> {
             args.first().map(|a| (kind, a))
         }
         ExprKind::Call { callee, args } => {
-            let id = match &*callee.kind { ExprKind::Ident(id) => id, _ => return None };
+            let id = match &*callee.kind {
+                ExprKind::Ident(id) => id,
+                _ => return None,
+            };
             let kind = match id.name.as_str() {
                 "past" => SystemFn::Past,
                 "rose" => SystemFn::Rose,
@@ -6374,30 +7610,42 @@ fn is_concurrent_assertion(
     properties: &std::collections::HashMap<String, Expr>,
 ) -> bool {
     if let ExprKind::Ident(id) = &*expr.kind {
-        if properties.contains_key(&id.name) { return true; }
+        if properties.contains_key(&id.name) {
+            return true;
+        }
     }
     contains_temporal(expr)
 }
 
 fn contains_temporal(e: &Expr) -> bool {
-    if match_temporal_call(e).is_some() { return true; }
+    if match_temporal_call(e).is_some() {
+        return true;
+    }
     match &*e.kind {
         ExprKind::Binary { op, lhs, rhs } => {
-            matches!(op, BinaryOp::PipeImplies | BinaryOp::PipeImpliesNext
-                       | BinaryOp::Throughout | BinaryOp::Within | BinaryOp::Intersect)
-                || contains_temporal(lhs) || contains_temporal(rhs)
+            matches!(
+                op,
+                BinaryOp::PipeImplies
+                    | BinaryOp::PipeImpliesNext
+                    | BinaryOp::Throughout
+                    | BinaryOp::Within
+                    | BinaryOp::Intersect
+            ) || contains_temporal(lhs)
+                || contains_temporal(rhs)
         }
         ExprKind::SystemCall { args, .. } => args.iter().any(contains_temporal),
         ExprKind::HashHash { .. } | ExprKind::SeqRepeat { .. } => true,
         ExprKind::Field { target, .. } => contains_temporal(target),
         ExprKind::Index { target, index } => contains_temporal(target) || contains_temporal(index),
-        ExprKind::BitSlice { target, hi, lo } =>
-            contains_temporal(target) || contains_temporal(hi) || contains_temporal(lo),
+        ExprKind::BitSlice { target, hi, lo } => {
+            contains_temporal(target) || contains_temporal(hi) || contains_temporal(lo)
+        }
         ExprKind::Call { callee, args } => {
-            contains_temporal(callee) || args.iter().any(|a| match a {
-                CallArg::Expr(x) => contains_temporal(x),
-                CallArg::Named { value, .. } => contains_temporal(value),
-            })
+            contains_temporal(callee)
+                || args.iter().any(|a| match a {
+                    CallArg::Expr(x) => contains_temporal(x),
+                    CallArg::Named { value, .. } => contains_temporal(value),
+                })
         }
         ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => contains_temporal(expr),
         ExprKind::Paren(inner) => contains_temporal(inner),
@@ -6436,24 +7684,48 @@ fn collect_temporal_occurrences(body: &Expr) -> Vec<Temporal> {
         }
         match &*e.kind {
             ExprKind::Field { target, .. } => walk(target, out),
-            ExprKind::Index { target, index } => { walk(target, out); walk(index, out); }
-            ExprKind::BitSlice { target, hi, lo } => { walk(target, out); walk(hi, out); walk(lo, out); }
+            ExprKind::Index { target, index } => {
+                walk(target, out);
+                walk(index, out);
+            }
+            ExprKind::BitSlice { target, hi, lo } => {
+                walk(target, out);
+                walk(hi, out);
+                walk(lo, out);
+            }
             ExprKind::Call { callee, args } => {
                 walk(callee, out);
                 for a in args {
-                    if let CallArg::Expr(e) = a { walk(e, out); }
-                    else if let CallArg::Named { value, .. } = a { walk(value, out); }
+                    if let CallArg::Expr(e) = a {
+                        walk(e, out);
+                    } else if let CallArg::Named { value, .. } = a {
+                        walk(value, out);
+                    }
                 }
             }
             ExprKind::Cast { expr, .. } => walk(expr, out),
-            ExprKind::Send { target, value } => { walk(target, out); walk(value, out); }
+            ExprKind::Send { target, value } => {
+                walk(target, out);
+                walk(value, out);
+            }
             ExprKind::Unary { expr, .. } => walk(expr, out),
-            ExprKind::Binary { lhs, rhs, .. } => { walk(lhs, out); walk(rhs, out); }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                walk(lhs, out);
+                walk(rhs, out);
+            }
             ExprKind::Paren(inner) => walk(inner, out),
-            ExprKind::SystemCall { args, .. } => for a in args { walk(a, out); },
+            ExprKind::SystemCall { args, .. } => {
+                for a in args {
+                    walk(a, out);
+                }
+            }
             ExprKind::HashHash { expr, .. } => walk(expr, out),
             ExprKind::SeqRepeat { expr, .. } => walk(expr, out),
-            ExprKind::SetLit(items) => for i in items { walk(i, out); },
+            ExprKind::SetLit(items) => {
+                for i in items {
+                    walk(i, out);
+                }
+            }
             _ => {}
         }
     }
