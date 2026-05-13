@@ -116,6 +116,32 @@ harc sim --sv tests/dut/sync_fifo.sv tests/fixtures/sync_fifo_test.harc --top Tx
 
 HARC compiles the test to C++, links Verilator's compiled DUT, runs the binary, and prints cycle-stamped log lines plus a coverage report.
 
+## Compile flow
+
+```mermaid
+graph LR
+    H[".harc test +<br/>extend files"]
+    H --> Parse["parse +<br/>extend merge"]
+    Parse --> Codegen["cpp_tb codegen"]
+    Codegen --> TB["testbench.cpp"]
+
+    SV[".sv DUT<br/>(--sv)"]
+    ARCH[".arch DUT<br/>(--dut)"]
+    REF[".c/.cpp ref<br/>(--ref-src)"]
+    RT["harc_thread_rt.h<br/>(coroutine runtime)"]
+
+    TB --> Build["verilator / arch sim<br/>+ Z3 link"]
+    SV --> Build
+    ARCH --> Build
+    REF --> Build
+    RT --> Build
+
+    Build --> Bin["sim binary"]
+    Bin --> Out["ALL TESTS PASSED<br/>+ sim.log + coverage.dat"]
+```
+
+One `harc sim` invocation drives the full pipeline: it parses the `.harc` source (folding any sibling `extend test T` files), emits a single C++ testbench, then chains through either Verilator (`--sv`) or `arch sim` (`--dut`) to compile the DUT alongside the TB, the runtime header, and any `--ref-src` reference models. The resulting binary self-tests at run time, exits zero on `ALL TESTS PASSED`, and writes per-test logs + an optional coverage database. CI runs [`tests/run_fixtures.sh`](tests/run_fixtures.sh) which does this for all 56 fixtures.
+
 ## CLI
 
 | Command | What it does |
