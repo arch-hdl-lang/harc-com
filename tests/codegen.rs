@@ -34,14 +34,16 @@ fn split_test_via_extend_round_trips_to_same_cpp() {
 
 #[test]
 fn impl_with_no_base_test_errors_clearly() {
-    let only_impl = parse_source(
-        "impl sim for Missing\n    run\n    end run\nend impl Missing",
-    ).unwrap();
+    let only_impl =
+        parse_source("impl sim for Missing\n    run\n    end run\nend impl Missing").unwrap();
     // `merge_for_sim` requires a base test; an `impl` referencing
     // an unknown test name surfaces at codegen time, not merge time.
     let err = merge::merge_for_sim(&[only_impl], None).unwrap_err();
-    assert!(err.contains("no `test` declaration"),
-        "expected 'no `test` declaration' error, got: {}", err);
+    assert!(
+        err.contains("no `test` declaration"),
+        "expected 'no `test` declaration' error, got: {}",
+        err
+    );
 }
 
 #[test]
@@ -54,7 +56,8 @@ test B
     let dut : Y
 end test B
 "#,
-    ).unwrap();
+    )
+    .unwrap();
     let err = merge::merge_for_sim(&[f], None).unwrap_err();
     assert!(err.contains("multiple tests"));
 }
@@ -104,21 +107,40 @@ end impl T"#,
     let cpp = cpp_tb::emit(&parsed).expect("emit");
 
     // Wide-hex lowercase — printf `%s` + HarcHexBuf128 with upper=false.
-    assert!(cpp.contains("\"ct=0x%s\""),
-        "expected `%s` format token for wide-hex spec:\n{}", cpp);
-    assert!(cpp.contains("(const char*)harc_rt::HarcHexBuf128(harc_rt::harc_read(dut->text_out), 32, false)"),
-        "expected HarcHexBuf128 lowering for `:032x`:\n{}", cpp);
+    assert!(
+        cpp.contains("\"ct=0x%s\""),
+        "expected `%s` format token for wide-hex spec:\n{}",
+        cpp
+    );
+    assert!(
+        cpp.contains(
+            "(const char*)harc_rt::HarcHexBuf128(harc_rt::harc_read(dut->text_out), 32, false)"
+        ),
+        "expected HarcHexBuf128 lowering for `:032x`:\n{}",
+        cpp
+    );
 
     // Wide-hex uppercase — same shape, upper=true.
-    assert!(cpp.contains("(const char*)harc_rt::HarcHexBuf128(harc_rt::harc_read(dut->text_out), 32, true)"),
-        "expected HarcHexBuf128 lowering for `:032X`:\n{}", cpp);
+    assert!(
+        cpp.contains(
+            "(const char*)harc_rt::HarcHexBuf128(harc_rt::harc_read(dut->text_out), 32, true)"
+        ),
+        "expected HarcHexBuf128 lowering for `:032X`:\n{}",
+        cpp
+    );
 
     // Narrow-hex stays on the legacy path.
-    assert!(cpp.contains("\"narrow=0x%08llx\""),
-        "expected `%08llx` for narrow `:08x` spec:\n{}", cpp);
-    assert!(!cpp.contains("HarcHexBuf128(harc_rt::harc_read(dut->x)") &&
-            !cpp.contains("HarcHexBuf128(dut->x"),
-        "narrow-hex spec must NOT route through HarcHexBuf128:\n{}", cpp);
+    assert!(
+        cpp.contains("\"narrow=0x%08llx\""),
+        "expected `%08llx` for narrow `:08x` spec:\n{}",
+        cpp
+    );
+    assert!(
+        !cpp.contains("HarcHexBuf128(harc_rt::harc_read(dut->x)")
+            && !cpp.contains("HarcHexBuf128(dut->x"),
+        "narrow-hex spec must NOT route through HarcHexBuf128:\n{}",
+        cpp
+    );
 }
 
 /// Hex literals wider than 128 bits (>32 hex digits) overflow
@@ -186,21 +208,25 @@ end impl T"#,
     // emit as `((_harc_u128)0x0001020304050607ULL << 64) |
     //         (_harc_u128)0x08090a0b0c0d0e0fULL`.
     assert!(
-        cpp.contains("(_harc_u128)0x0001020304050607ULL << 64") &&
-        cpp.contains("(_harc_u128)0x08090a0b0c0d0e0fULL"),
-        "expected composite _harc_u128 lowering for the assigned literal:\n{}", cpp,
+        cpp.contains("(_harc_u128)0x0001020304050607ULL << 64")
+            && cpp.contains("(_harc_u128)0x08090a0b0c0d0e0fULL"),
+        "expected composite _harc_u128 lowering for the assigned literal:\n{}",
+        cpp,
     );
     assert!(
-        cpp.contains("(_harc_u128)0x66e94bd4ef8a2c3bULL << 64") &&
-        cpp.contains("(_harc_u128)0x884cfa59ca342b2eULL"),
-        "expected composite _harc_u128 lowering for the compared literal:\n{}", cpp,
+        cpp.contains("(_harc_u128)0x66e94bd4ef8a2c3bULL << 64")
+            && cpp.contains("(_harc_u128)0x884cfa59ca342b2eULL"),
+        "expected composite _harc_u128 lowering for the compared literal:\n{}",
+        cpp,
     );
 
     // Narrow literals (<= 16 hex digits) stay as plain hex —
     // no composite, no _harc_u128 cast.
-    assert!(!cpp.contains("(_harc_u128)0xDEADBEEF") &&
-            !cpp.contains("(_harc_u128)0xdeadbeef"),
-        "narrow hex shouldn't be wrapped:\n{}", cpp);
+    assert!(
+        !cpp.contains("(_harc_u128)0xDEADBEEF") && !cpp.contains("(_harc_u128)0xdeadbeef"),
+        "narrow hex shouldn't be wrapped:\n{}",
+        cpp
+    );
 }
 
 /// `wait N cycles` matches Verilog's `@(posedge clk)` semantic: values
@@ -240,32 +266,48 @@ end impl T"#,
     // Initial comb settle: `dut->clk = 0; dut->eval();` BEFORE the loop
     // opens. There must be NO `clk = 1; eval();` between bootstrap and
     // the loop (no posedge before loop).
-    let bootstrap_pos = cpp.find("sched.bootstrap()")
+    let bootstrap_pos = cpp
+        .find("sched.bootstrap()")
         .expect("expected sched.bootstrap() call");
-    let loop_pos = cpp.find("while (_run_slot.kind != harc_rt::WaitKind::Done")
+    let loop_pos = cpp
+        .find("while (_run_slot.kind != harc_rt::WaitKind::Done")
         .expect("expected main run loop");
     assert!(bootstrap_pos < loop_pos);
     let between = &cpp[bootstrap_pos..loop_pos];
-    assert!(between.contains("dut->clk = 0; dut->eval();"),
-        "expected initial `dut->clk = 0; dut->eval();` between bootstrap and loop:\n{}", between);
-    assert!(!between.contains("dut->clk = 1; dut->eval();"),
-        "no posedge should appear between bootstrap and loop:\n{}", between);
+    assert!(
+        between.contains("dut->clk = 0; dut->eval();"),
+        "expected initial `dut->clk = 0; dut->eval();` between bootstrap and loop:\n{}",
+        between
+    );
+    assert!(
+        !between.contains("dut->clk = 1; dut->eval();"),
+        "no posedge should appear between bootstrap and loop:\n{}",
+        between
+    );
 
     // Inside the loop body, the order must be: clk=1 eval (posedge)
     // FIRST, then sched.tick(), then clk=0 eval (falling).
-    let loop_body_end = cpp[loop_pos..].find("\n    }\n").map(|p| loop_pos + p)
+    let loop_body_end = cpp[loop_pos..]
+        .find("\n    }\n")
+        .map(|p| loop_pos + p)
         .expect("expected loop close");
     let body = &cpp[loop_pos..loop_body_end];
-    let posedge_pos = body.find("dut->clk = 1; dut->eval();")
+    let posedge_pos = body
+        .find("dut->clk = 1; dut->eval();")
         .expect("expected posedge inside loop");
-    let tick_pos = body.find("sched.tick();")
+    let tick_pos = body
+        .find("sched.tick();")
         .expect("expected sched.tick() inside loop");
-    let falling_pos = body.find("dut->clk = 0; dut->eval();")
+    let falling_pos = body
+        .find("dut->clk = 0; dut->eval();")
         .expect("expected falling edge inside loop");
-    assert!(posedge_pos < tick_pos && tick_pos < falling_pos,
+    assert!(
+        posedge_pos < tick_pos && tick_pos < falling_pos,
         "expected loop order: posedge → tick → falling. \
          got posedge@{posedge_pos}, tick@{tick_pos}, falling@{falling_pos}\n\
-         body:\n{}", body);
+         body:\n{}",
+        body
+    );
 }
 
 /// `dut.<signal> = <expr>` and `dut.<signal>` accesses lower through
@@ -295,24 +337,37 @@ end impl T"#,
     let cpp = cpp_tb::emit(&parsed).expect("emit");
 
     // Writes lower as harc_assign(...).
-    assert!(cpp.contains("harc_rt::harc_assign(dut->wide_in,"),
-        "expected `harc_rt::harc_assign(dut->wide_in, ...)` in:\n{}", cpp);
-    assert!(cpp.contains("harc_rt::harc_assign(dut->narrow_in,"),
-        "expected `harc_rt::harc_assign(dut->narrow_in, ...)` in:\n{}", cpp);
+    assert!(
+        cpp.contains("harc_rt::harc_assign(dut->wide_in,"),
+        "expected `harc_rt::harc_assign(dut->wide_in, ...)` in:\n{}",
+        cpp
+    );
+    assert!(
+        cpp.contains("harc_rt::harc_assign(dut->narrow_in,"),
+        "expected `harc_rt::harc_assign(dut->narrow_in, ...)` in:\n{}",
+        cpp
+    );
 
     // Reads lower as harc_read(...).
-    assert!(cpp.contains("harc_rt::harc_read(dut->wide_out)"),
-        "expected `harc_rt::harc_read(dut->wide_out)` in:\n{}", cpp);
+    assert!(
+        cpp.contains("harc_rt::harc_read(dut->wide_out)"),
+        "expected `harc_rt::harc_read(dut->wide_out)` in:\n{}",
+        cpp
+    );
 
     // L-value path must NOT wrap with harc_read — the assignment
     // target stays a plain L-value reference passed to harc_assign.
     // Spot-check: the assignment line should contain the field as
     // an L-value, not `harc_read(dut->wide_in)`.
-    let assign_line = cpp.lines()
+    let assign_line = cpp
+        .lines()
         .find(|l| l.contains("harc_assign(dut->wide_in,"))
         .expect("expected assign line");
-    assert!(!assign_line.contains("harc_read(dut->wide_in"),
-        "L-value position must not be wrapped with harc_read:\n{}", assign_line);
+    assert!(
+        !assign_line.contains("harc_read(dut->wide_in"),
+        "L-value position must not be wrapped with harc_read:\n{}",
+        assign_line
+    );
 }
 
 /// `const NAME : Ty = expr` lowers to a file-scope `static constexpr`
@@ -340,16 +395,25 @@ end impl T"#,
     let cpp = cpp_tb::emit(&parsed).expect("emit");
 
     // Both consts emitted at file scope, before main().
-    assert!(cpp.contains("static constexpr uint64_t MSHR_SIZE = 32;"),
-        "expected `static constexpr uint64_t MSHR_SIZE = 32;` in:\n{}", cpp);
-    assert!(cpp.contains("static constexpr uint64_t HALF ="),
-        "expected `static constexpr uint64_t HALF` in:\n{}", cpp);
+    assert!(
+        cpp.contains("static constexpr uint64_t MSHR_SIZE = 32;"),
+        "expected `static constexpr uint64_t MSHR_SIZE = 32;` in:\n{}",
+        cpp
+    );
+    assert!(
+        cpp.contains("static constexpr uint64_t HALF ="),
+        "expected `static constexpr uint64_t HALF` in:\n{}",
+        cpp
+    );
 
     // Order matters — both should appear BEFORE `int main`.
     let main_pos = cpp.find("int main").expect("expected `int main` in output");
     let mshr_pos = cpp.find("static constexpr uint64_t MSHR_SIZE").unwrap();
     let half_pos = cpp.find("static constexpr uint64_t HALF").unwrap();
-    assert!(mshr_pos < main_pos, "MSHR_SIZE should be emitted before main()");
+    assert!(
+        mshr_pos < main_pos,
+        "MSHR_SIZE should be emitted before main()"
+    );
     assert!(half_pos < main_pos, "HALF should be emitted before main()");
 }
 
@@ -380,13 +444,17 @@ end impl T"#,
     let cpp = cpp_tb::emit(&parsed).expect("emit");
 
     // Sanity: the test-result flag is declared.
-    assert!(cpp.contains("bool _fatal = false;"),
-        "expected `_fatal` flag declaration in main()");
+    assert!(
+        cpp.contains("bool _fatal = false;"),
+        "expected `_fatal` flag declaration in main()"
+    );
 
     // The main simulation loop guard checks _fatal so the test instance
     // exits at end of current cycle when fatal is set.
-    assert!(cpp.contains("&& !_fatal"),
-        "expected main loop to check `!_fatal`");
+    assert!(
+        cpp.contains("&& !_fatal"),
+        "expected main loop to check `!_fatal`"
+    );
 
     // `log(info|warn|debug, ...)` must not bump errors. We grep for
     // `sim_log_line(\"INFO\"`, ... and verify the line that follows is
@@ -400,13 +468,18 @@ end impl T"#,
     // From-source: 2 (one for log(error), one for log(fatal)).
     // Plus existing `errors++;` from assert/fail paths: 0 here (no
     // asserts in the fixture).
-    assert_eq!(errors_inc_count, 2,
+    assert_eq!(
+        errors_inc_count, 2,
         "expected exactly 2 `errors++;` lines (one for ERROR, one for FATAL); \
-         got {} in:\n{}", errors_inc_count, cpp);
+         got {} in:\n{}",
+        errors_inc_count, cpp
+    );
 
     // `log(fatal, ...)` additionally sets `_fatal = true`.
-    assert!(cpp.contains("_fatal = true;"),
-        "expected `_fatal = true;` in FATAL lowering");
+    assert!(
+        cpp.contains("_fatal = true;"),
+        "expected `_fatal = true;` in FATAL lowering"
+    );
 }
 
 /// Custom `phase <name> ... end phase <name>` blocks inside an
@@ -431,25 +504,34 @@ impl sim for T
         wait 1 cycle
     end run
 end impl T"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
 
     // Phase emits as `auto warmup = [&]() -> void { ... };`
-    assert!(cpp.contains("auto warmup = [&]() -> void {"),
-        "expected `auto warmup = [&]() -> void {{` in:\n{cpp}");
+    assert!(
+        cpp.contains("auto warmup = [&]() -> void {"),
+        "expected `auto warmup = [&]() -> void {{` in:\n{cpp}"
+    );
     // Body of the phase contains the log line.
-    assert!(cpp.contains("warmup phase"),
-        "phase body should contain its log message; got:\n{cpp}");
+    assert!(
+        cpp.contains("warmup phase"),
+        "phase body should contain its log message; got:\n{cpp}"
+    );
     // Run-coroutine body invokes the phase by name.
-    assert!(cpp.contains("warmup();"),
-        "run body should call `warmup();` to invoke the phase; got:\n{cpp}");
+    assert!(
+        cpp.contains("warmup();"),
+        "run body should call `warmup();` to invoke the phase; got:\n{cpp}"
+    );
 
     // Phase lambda emits BEFORE the run-coroutine bootstrap so the
     // capture-by-reference closure is in scope when run calls it.
     let phase_pos = cpp.find("auto warmup = [&]()").unwrap();
     let bootstrap_pos = cpp.find("sched.bootstrap()").unwrap();
-    assert!(phase_pos < bootstrap_pos,
-        "custom phase lambda must be emitted before sched.bootstrap()");
+    assert!(
+        phase_pos < bootstrap_pos,
+        "custom phase lambda must be emitted before sched.bootstrap()"
+    );
 }
 
 /// v0 only emits codegen for `impl sim for ...`. A test with only
@@ -467,11 +549,15 @@ impl emu for T
         log(info, "emu run body")
     end run
 end impl T"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     let err = cpp_tb::emit(&parsed).unwrap_err();
-    assert!(err.0.contains("only non-sim impls") && err.0.contains("emu"),
-        "expected clear error mentioning non-sim impls; got: {}", err.0);
+    assert!(
+        err.0.contains("only non-sim impls") && err.0.contains("emu"),
+        "expected clear error mentioning non-sim impls; got: {}",
+        err.0
+    );
 }
 
 /// `expr as Type` (postfix cast, same shape as arch-com's grammar)
@@ -496,18 +582,22 @@ impl sim for T
         dut.X = mask
     end run
 end impl T"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
 
     // Cast emits as `((uint64_t)(1))` — HARC's c_type_for maps
     // uint<32> to uint64_t (the C++ widening covers all ≤64-bit
     // unsigned ints uniformly).
-    assert!(cpp.contains("((uint64_t)(1))"),
-        "expected `((uint64_t)(1))` from `1 as uint<32>`; got:\n{cpp}");
+    assert!(
+        cpp.contains("((uint64_t)(1))"),
+        "expected `((uint64_t)(1))` from `1 as uint<32>`; got:\n{cpp}"
+    );
     // And the shift uses that cast result, not a bare `1 << 31`.
-    assert!(cpp.contains("((uint64_t)(1))) << 31") ||
-            cpp.contains("((uint64_t)(1)) << 31"),
-        "expected shift to operate on the cast result; got:\n{cpp}");
+    assert!(
+        cpp.contains("((uint64_t)(1))) << 31") || cpp.contains("((uint64_t)(1)) << 31"),
+        "expected shift to operate on the cast result; got:\n{cpp}"
+    );
 }
 
 /// Standalone `fail("...")` lowers to the same emission as the
@@ -532,15 +622,20 @@ impl sim for T
         end for
     end run
 end impl T"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
 
     // The standalone fail emits a sim_log_line + errors++ inline,
     // no surrounding `if (!...)` guard.
-    assert!(cpp.contains("sim_log_line(\"FAIL\", \"loop reached unreachable branch at i=%lld\""),
-        "expected sim_log_line(\"FAIL\", ...) for standalone fail; got:\n{cpp}");
-    assert!(cpp.contains("errors++"),
-        "expected `errors++;` after standalone fail; got:\n{cpp}");
+    assert!(
+        cpp.contains("sim_log_line(\"FAIL\", \"loop reached unreachable branch at i=%lld\""),
+        "expected sim_log_line(\"FAIL\", ...) for standalone fail; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("errors++"),
+        "expected `errors++;` after standalone fail; got:\n{cpp}"
+    );
 }
 
 /// Every component struct (transactor/agent/env/scoreboard/sequencer)
@@ -580,24 +675,35 @@ impl sim for HeartbeatTest
         wait 1 cycle
     end run
 end impl HeartbeatTest"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
 
     // 1. Heartbeat fields appear on the component struct.
-    assert!(cpp.contains("struct Producer {"),
-        "Producer struct should be emitted; got:\n{cpp}");
-    assert!(cpp.contains("uint64_t _last_in_cycle = 0;"),
-        "expected `_last_in_cycle` field on component; got:\n{cpp}");
-    assert!(cpp.contains("uint64_t _last_out_cycle = 0;"),
-        "expected `_last_out_cycle` field on component; got:\n{cpp}");
+    assert!(
+        cpp.contains("struct Producer {"),
+        "Producer struct should be emitted; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("uint64_t _last_in_cycle = 0;"),
+        "expected `_last_in_cycle` field on component; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("uint64_t _last_out_cycle = 0;"),
+        "expected `_last_out_cycle` field on component; got:\n{cpp}"
+    );
 
     // 2. The `on in_ev(t)` handler body bumps `_last_in_cycle` at entry.
-    assert!(cpp.contains("prod._last_in_cycle = (uint64_t)cycle_count;"),
-        "on-handler body should bump _last_in_cycle on entry; got:\n{cpp}");
+    assert!(
+        cpp.contains("prod._last_in_cycle = (uint64_t)cycle_count;"),
+        "on-handler body should bump _last_in_cycle on entry; got:\n{cpp}"
+    );
 
     // 3. The `emit out(t)` inside the handler bumps `_last_out_cycle`.
-    assert!(cpp.contains("prod._last_out_cycle = (uint64_t)cycle_count;"),
-        "emit inside component body should bump _last_out_cycle; got:\n{cpp}");
+    assert!(
+        cpp.contains("prod._last_out_cycle = (uint64_t)cycle_count;"),
+        "emit inside component body should bump _last_out_cycle; got:\n{cpp}"
+    );
 
     // 4. `prod.idle(N)` lowers to a conjunction over both cycle deltas.
     assert!(
@@ -606,11 +712,15 @@ end impl HeartbeatTest"#,
         "idle(N) should lower to (in_delta >= N) && (out_delta >= N); got:\n{cpp}",
     );
     // 5. `prod.idle_in(N)` lowers to in-delta only.
-    assert!(cpp.contains("((uint64_t)cycle_count - prod._last_in_cycle) >= (uint64_t)(10))"),
-        "idle_in(N) should lower to (in_delta >= N); got:\n{cpp}");
+    assert!(
+        cpp.contains("((uint64_t)cycle_count - prod._last_in_cycle) >= (uint64_t)(10))"),
+        "idle_in(N) should lower to (in_delta >= N); got:\n{cpp}"
+    );
     // 6. `prod.idle_out(N)` lowers to out-delta only.
-    assert!(cpp.contains("((uint64_t)cycle_count - prod._last_out_cycle) >= (uint64_t)(20))"),
-        "idle_out(N) should lower to (out_delta >= N); got:\n{cpp}");
+    assert!(
+        cpp.contains("((uint64_t)cycle_count - prod._last_out_cycle) >= (uint64_t)(20))"),
+        "idle_out(N) should lower to (out_delta >= N); got:\n{cpp}"
+    );
 }
 
 /// `bus.<ch>.send` and `bus.<ch>.recv` inside a component body bump
@@ -658,14 +768,19 @@ impl sim for BusHeartbeatTest
         wait 1 cycle
     end run
 end impl BusHeartbeatTest"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     // Bound-driver actor pops a transaction → bumps _last_in_cycle.
-    assert!(cpp.contains("drv._last_in_cycle = (uint64_t)cycle_count;"),
-        "bound-driver actor pop should bump _last_in_cycle; got:\n{cpp}");
+    assert!(
+        cpp.contains("drv._last_in_cycle = (uint64_t)cycle_count;"),
+        "bound-driver actor pop should bump _last_in_cycle; got:\n{cpp}"
+    );
     // bus.w.send inside the actor body → bumps _last_out_cycle.
-    assert!(cpp.contains("drv._last_out_cycle = (uint64_t)cycle_count;"),
-        "bus.<ch>.send inside component body should bump _last_out_cycle; got:\n{cpp}");
+    assert!(
+        cpp.contains("drv._last_out_cycle = (uint64_t)cycle_count;"),
+        "bus.<ch>.send inside component body should bump _last_out_cycle; got:\n{cpp}"
+    );
 }
 
 /// A user-defined `hookable idle(n)` on a component or transactor
@@ -698,16 +813,21 @@ impl sim for UserIdleTest
         xact.idle(4)
     end run
 end impl UserIdleTest"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     // The call should dispatch to the user's hookable, NOT to the
     // built-in heartbeat predicate.
-    assert!(cpp.contains("Xact_idle(xact, 4)"),
-        "user `hookable idle(n)` should be called via the standard dispatcher; got:\n{cpp}");
+    assert!(
+        cpp.contains("Xact_idle(xact, 4)"),
+        "user `hookable idle(n)` should be called via the standard dispatcher; got:\n{cpp}"
+    );
     // Specifically, the call's lowering should NOT contain the
     // built-in delta-comparison shape.
-    assert!(!cpp.contains("cycle_count - xact._last_in_cycle"),
-        "built-in predicate should NOT shadow user's `hookable idle`; got:\n{cpp}");
+    assert!(
+        !cpp.contains("cycle_count - xact._last_in_cycle"),
+        "built-in predicate should NOT shadow user's `hookable idle`; got:\n{cpp}"
+    );
 }
 
 /// `idle()` predicate on a nested sub-component path (e.g.
@@ -736,10 +856,64 @@ impl sim for NestedTest
         wait 1 cycle
     end run
 end impl NestedTest"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(cpp.contains("top.w._last_in_cycle") && cpp.contains("top.w._last_out_cycle"),
         "nested idle() should walk through the env's field to the agent's heartbeat fields; got:\n{cpp}");
+}
+
+/// `env.quiesced(N)` lowers to all nested component heartbeat
+/// predicates. In a timed `wait until`, it expands before diagnostic
+/// emission so timeout logs attribute the blocker to `env.sub.idle(N)`
+/// instead of the opaque aggregate helper.
+#[test]
+fn env_quiesced_aggregates_nested_component_idle_predicates() {
+    let parsed = parse_source(
+        r#"agent Producer
+    in_ev : event<int>
+end agent Producer
+
+scoreboard DrainSb
+    expected : queue<int>
+end scoreboard DrainSb
+
+env TopEnv
+    prod : Producer
+    sb   : DrainSb
+end env TopEnv
+
+test EnvQuiescedTest
+    let dut : DummyDut
+    let top : TopEnv
+end test EnvQuiescedTest
+
+impl sim for EnvQuiescedTest
+    run
+        wait until top.quiesced(12)
+            timeout 100 cycles fail("environment did not quiesce")
+    end run
+end impl EnvQuiescedTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+
+    assert!(
+        cpp.contains("top.prod._last_in_cycle") && cpp.contains("top.prod._last_out_cycle"),
+        "quiesced(N) should include nested agent heartbeat fields; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("top.sb._last_in_cycle") && cpp.contains("top.sb._last_out_cycle"),
+        "quiesced(N) should include nested scoreboard heartbeat fields; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("not yet true: top.prod.idle(12)"),
+        "timeout diagnostic should attribute the producer leaf; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("not yet true: top.sb.idle(12)"),
+        "timeout diagnostic should attribute the scoreboard leaf; got:\n{cpp}"
+    );
 }
 
 /// `wait until <expr>` with no timeout lowers to a direct
@@ -759,7 +933,8 @@ impl sim for T
         wait until dut.ready
     end run
 end impl T"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
         cpp.contains("co_await harc_rt::wait_until(_slot, [&]{ return")
@@ -789,35 +964,52 @@ impl sim for T
             timeout 500 cycles fail("did not quiesce")
     end run
 end impl T"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     // Budget captured once into a local — same as before.
-    assert!(cpp.contains("int64_t _wu_budget = (int64_t)(500);"),
-        "expected `_wu_budget` initialized from the timeout expr; got:\n{cpp}");
+    assert!(
+        cpp.contains("int64_t _wu_budget = (int64_t)(500);"),
+        "expected `_wu_budget` initialized from the timeout expr; got:\n{cpp}"
+    );
     // The optimization: a single co_await of wait_until_timeout
     // instead of a per-cycle co_await wait_cycles(1) polling loop.
-    assert!(cpp.contains("co_await harc_rt::wait_until_timeout(_slot,")
+    assert!(
+        cpp.contains("co_await harc_rt::wait_until_timeout(_slot,")
             && cpp.contains("(uint32_t)_wu_budget);"),
-        "expected single `co_await wait_until_timeout(_slot, pred, _wu_budget)`; got:\n{cpp}");
-    assert!(cpp.contains("if (!_wu_satisfied) {"),
-        "expected `if (!_wu_satisfied)` guard around the diagnostic; got:\n{cpp}");
+        "expected single `co_await wait_until_timeout(_slot, pred, _wu_budget)`; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("if (!_wu_satisfied) {"),
+        "expected `if (!_wu_satisfied)` guard around the diagnostic; got:\n{cpp}"
+    );
     // No more per-cycle co_await wait_cycles(_slot, 1) in this lowering.
     // (Other wait_cycles calls — from `wait N cycles` elsewhere — may
     // appear, but inside the wait-until-timeout's brace block we don't
     // expect one. We assert the runtime helper is the only suspension.)
-    assert!(!cpp.contains("if (!_wu_satisfied) {\n        co_await harc_rt::wait_cycles"),
-        "wait_until_timeout should not be followed by a per-cycle polling loop; got:\n{cpp}");
+    assert!(
+        !cpp.contains("if (!_wu_satisfied) {\n        co_await harc_rt::wait_cycles"),
+        "wait_until_timeout should not be followed by a per-cycle polling loop; got:\n{cpp}"
+    );
     // Per-sub-predicate breakdown: one line per condition still false.
-    assert!(cpp.contains("not yet true: dut.ready"),
-        "expected per-predicate diagnostic mentioning `dut.ready`; got:\n{cpp}");
-    assert!(cpp.contains("not yet true: dut.empty"),
-        "expected per-predicate diagnostic mentioning `dut.empty`; got:\n{cpp}");
+    assert!(
+        cpp.contains("not yet true: dut.ready"),
+        "expected per-predicate diagnostic mentioning `dut.ready`; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("not yet true: dut.empty"),
+        "expected per-predicate diagnostic mentioning `dut.empty`; got:\n{cpp}"
+    );
     // User-supplied header line.
-    assert!(cpp.contains("did not quiesce"),
-        "expected the user-supplied fail() message in the timeout log; got:\n{cpp}");
+    assert!(
+        cpp.contains("did not quiesce"),
+        "expected the user-supplied fail() message in the timeout log; got:\n{cpp}"
+    );
     // Errors counter bumps.
-    assert!(cpp.contains("errors++;"),
-        "expected `errors++;` on timeout; got:\n{cpp}");
+    assert!(
+        cpp.contains("errors++;"),
+        "expected `errors++;` on timeout; got:\n{cpp}"
+    );
 }
 
 /// `wait until any of <e1>, <e2>` on timeout reports "none of" with
@@ -836,16 +1028,21 @@ impl sim for T
             timeout 200 cycles fail("expected error or done")
     end run
 end impl T"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     // The overall cond is `||`-joined — emit_expr wraps DUT signals
     // in `harc_rt::harc_read(...)` so we test the join-shape with a
     // tolerant match rather than exact lexical comparison.
-    assert!(cpp.contains("dut->error)) || (harc_rt::harc_read(dut->done"),
-        "any-of overall predicate should be ||-joined; got:\n{cpp}");
+    assert!(
+        cpp.contains("dut->error)) || (harc_rt::harc_read(dut->done"),
+        "any-of overall predicate should be ||-joined; got:\n{cpp}"
+    );
     // Diagnostic lists every sub-predicate (none fired).
-    assert!(cpp.contains("none of: dut.error, dut.done"),
-        "expected `none of:` listing every sub-predicate; got:\n{cpp}");
+    assert!(
+        cpp.contains("none of: dut.error, dut.done"),
+        "expected `none of:` listing every sub-predicate; got:\n{cpp}"
+    );
 }
 
 /// `wait until <cond> timeout N cycles fail("…")` inside a *sync*
@@ -873,21 +1070,30 @@ impl sim for T
         xact.wait_for_ready_bounded()
     end run
 end impl T"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     // Sync context: while-loop with tick() body.
-    assert!(cpp.contains("_wu_start = (int64_t)cycle_count;")
+    assert!(
+        cpp.contains("_wu_start = (int64_t)cycle_count;")
             && cpp.contains("- _wu_start) < _wu_budget) {"),
-        "sync timed wait-until should keep the explicit polling loop; got:\n{cpp}");
-    assert!(cpp.contains(") tick();") || cpp.contains("tick();\n            }"),
-        "sync timed wait-until should call tick() each cycle; got:\n{cpp}");
+        "sync timed wait-until should keep the explicit polling loop; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains(") tick();") || cpp.contains("tick();\n            }"),
+        "sync timed wait-until should call tick() each cycle; got:\n{cpp}"
+    );
     // The coroutine awaiter must NOT be used here (it would suspend
     // a non-coroutine, which the C++ compiler would reject).
-    assert!(!cpp.contains("co_await harc_rt::wait_until_timeout"),
-        "sync timed wait-until should not use the coroutine awaiter; got:\n{cpp}");
+    assert!(
+        !cpp.contains("co_await harc_rt::wait_until_timeout"),
+        "sync timed wait-until should not use the coroutine awaiter; got:\n{cpp}"
+    );
     // The user-supplied fail message still threads through.
-    assert!(cpp.contains("ready never asserted"),
-        "user fail message should still appear in sync diagnostic; got:\n{cpp}");
+    assert!(
+        cpp.contains("ready never asserted"),
+        "user fail message should still appear in sync diagnostic; got:\n{cpp}"
+    );
 }
 
 /// `wait until <expr>` with no timeout still works inside a sync
@@ -916,12 +1122,14 @@ impl sim for T
         xact.wait_for_ready()
     end run
 end impl T"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     // Inside a hookable, wait until must lower synchronously.
-    assert!(cpp.contains("while (!(")
-            && cpp.contains(")) tick();"),
-        "wait until in sync context should be `while (!cond) tick();`; got:\n{cpp}");
+    assert!(
+        cpp.contains("while (!(") && cpp.contains(")) tick();"),
+        "wait until in sync context should be `while (!cond) tick();`; got:\n{cpp}"
+    );
 }
 
 /// `on <N> cycles … end on` lowers to a `_checkers` closure with a
@@ -944,21 +1152,29 @@ impl sim for T
         wait 5 cycles
     end run
 end impl T"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     // Body wrapped in a static-state _checkers closure.
-    assert!(cpp.contains("_checkers.push_back([&]() {"),
-        "expected periodic on-handler to register a _checkers closure; got:\n{cpp}");
+    assert!(
+        cpp.contains("_checkers.push_back([&]() {"),
+        "expected periodic on-handler to register a _checkers closure; got:\n{cpp}"
+    );
     // The period expression is captured into a local each cycle.
-    assert!(cpp.contains("_period = (int64_t)(100);"),
-        "expected period to be re-read each cycle; got:\n{cpp}");
+    assert!(
+        cpp.contains("_period = (int64_t)(100);"),
+        "expected period to be re-read each cycle; got:\n{cpp}"
+    );
     // Guard against zero/negative period + correct delta comparison.
-    assert!(cpp.contains("_period > 0") && cpp.contains("cycle_count -")
-            && cpp.contains(">= "),
-        "expected `_period > 0 && cycle_count - _last >= _period` guard; got:\n{cpp}");
+    assert!(
+        cpp.contains("_period > 0") && cpp.contains("cycle_count -") && cpp.contains(">= "),
+        "expected `_period > 0 && cycle_count - _last >= _period` guard; got:\n{cpp}"
+    );
     // The body's log call survives.
-    assert!(cpp.contains("\"heartbeat\""),
-        "expected the body's log message; got:\n{cpp}");
+    assert!(
+        cpp.contains("\"heartbeat\""),
+        "expected the body's log message; got:\n{cpp}"
+    );
 }
 
 /// `watchdog` agent body item (spec §8.6) lowers to:
@@ -989,26 +1205,41 @@ impl sim for T
         wait 1 cycle
     end run
 end impl T"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     // Hook vectors so `on Foo.watchdog pre/post` works.
-    assert!(cpp.contains("Foo_watchdog_pre;") && cpp.contains("Foo_watchdog_post;"),
-        "expected watchdog hook vectors; got:\n{cpp}");
+    assert!(
+        cpp.contains("Foo_watchdog_pre;") && cpp.contains("Foo_watchdog_post;"),
+        "expected watchdog hook vectors; got:\n{cpp}"
+    );
     // Synthetic method lambda.
-    assert!(cpp.contains("auto Foo_watchdog = [&](Foo& self) -> void {"),
-        "expected `Foo_watchdog` lambda taking `Foo& self`; got:\n{cpp}");
+    assert!(
+        cpp.contains("auto Foo_watchdog = [&](Foo& self) -> void {"),
+        "expected `Foo_watchdog` lambda taking `Foo& self`; got:\n{cpp}"
+    );
     // Idle check inside the method: BOTH in and out deltas must be ≥ max_idle.
-    assert!(cpp.contains("self._last_in_cycle") && cpp.contains("self._last_out_cycle"),
-        "expected idle check to read both heartbeat fields; got:\n{cpp}");
-    assert!(cpp.contains("_wdog_max_idle = (int64_t)(1000)"),
-        "expected max_idle threshold from the watchdog clause; got:\n{cpp}");
-    assert!(cpp.contains("watchdog: Foo has been idle for"),
-        "expected the watchdog fail message; got:\n{cpp}");
+    assert!(
+        cpp.contains("self._last_in_cycle") && cpp.contains("self._last_out_cycle"),
+        "expected idle check to read both heartbeat fields; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("_wdog_max_idle = (int64_t)(1000)"),
+        "expected max_idle threshold from the watchdog clause; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("watchdog: Foo has been idle for"),
+        "expected the watchdog fail message; got:\n{cpp}"
+    );
     // Periodic checker installed at let-time: calls Foo_watchdog(foo) every `period` cycles.
-    assert!(cpp.contains("_wdog_foo_period = (int64_t)(250)"),
-        "expected per-instance period variable; got:\n{cpp}");
-    assert!(cpp.contains("Foo_watchdog(foo);"),
-        "expected the periodic checker to call Foo_watchdog(foo); got:\n{cpp}");
+    assert!(
+        cpp.contains("_wdog_foo_period = (int64_t)(250)"),
+        "expected per-instance period variable; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("Foo_watchdog(foo);"),
+        "expected the periodic checker to call Foo_watchdog(foo); got:\n{cpp}"
+    );
 }
 
 /// `watchdog disabled` emits NO hook vectors, NO method, NO periodic
@@ -1034,12 +1265,17 @@ impl sim for T
         wait 1 cycle
     end run
 end impl T"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
-    assert!(!cpp.contains("NoWdog_watchdog"),
-        "watchdog disabled should emit NO `NoWdog_watchdog` method/hooks; got:\n{cpp}");
-    assert!(!cpp.contains("_wdog_nw"),
-        "watchdog disabled should emit NO periodic checker for the instance; got:\n{cpp}");
+    assert!(
+        !cpp.contains("NoWdog_watchdog"),
+        "watchdog disabled should emit NO `NoWdog_watchdog` method/hooks; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("_wdog_nw"),
+        "watchdog disabled should emit NO periodic checker for the instance; got:\n{cpp}"
+    );
 }
 
 /// Watchdog period and max_idle can reference component fields, so
@@ -1072,16 +1308,21 @@ impl sim for T
         wait 1 cycle
     end run
 end impl T"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     // Inside the method body, the field reference uses `self.`.
-    assert!(cpp.contains("_wdog_max_idle = (int64_t)(harc_rt::harc_read(self.wdog_max_idle))")
+    assert!(
+        cpp.contains("_wdog_max_idle = (int64_t)(harc_rt::harc_read(self.wdog_max_idle))")
             || cpp.contains("_wdog_max_idle = (int64_t)(self.wdog_max_idle)"),
-        "max_idle inside method should resolve to self.wdog_max_idle; got:\n{cpp}");
+        "max_idle inside method should resolve to self.wdog_max_idle; got:\n{cpp}"
+    );
     // At let-time, the period reference uses `<instance>.`.
-    assert!(cpp.contains("_wdog_foo_period = (int64_t)(harc_rt::harc_read(foo.wdog_period))")
+    assert!(
+        cpp.contains("_wdog_foo_period = (int64_t)(harc_rt::harc_read(foo.wdog_period))")
             || cpp.contains("_wdog_foo_period = (int64_t)(foo.wdog_period)"),
-        "period inside checker should resolve to foo.wdog_period; got:\n{cpp}");
+        "period inside checker should resolve to foo.wdog_period; got:\n{cpp}"
+    );
 }
 
 /// Transaction-level `keep` constraints flow through to the Z3
@@ -1112,20 +1353,30 @@ impl sim for KeepTest
         randomize(t)
     end run
 end impl KeepTest"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     // Z3 block emitted even though there's no `with`.
-    assert!(cpp.contains("z3::context _ctx;") && cpp.contains("z3::solver _s(_ctx);"),
-        "bare randomize on a keep-bearing txn should still emit the Z3 block; got:\n{cpp}");
+    assert!(
+        cpp.contains("z3::context _ctx;") && cpp.contains("z3::solver _s(_ctx);"),
+        "bare randomize on a keep-bearing txn should still emit the Z3 block; got:\n{cpp}"
+    );
     // The keep constraints are added to the solver — len in [1..16]
     // lowers via z3::uge/ule, addr % 4 == 0 lowers as plain ==.
-    assert!(cpp.contains("z3::uge(_z_len") && cpp.contains("z3::ule(_z_len"),
-        "expected `len in [1..16]` to lower to uge/ule pair; got:\n{cpp}");
-    assert!(cpp.contains("_z_addr") && cpp.contains(" %% ") || cpp.contains("_z_addr") && cpp.contains("z3"),
-        "expected `addr % 4 == 0` to reach the solver; got:\n{cpp}");
+    assert!(
+        cpp.contains("z3::uge(_z_len") && cpp.contains("z3::ule(_z_len"),
+        "expected `len in [1..16]` to lower to uge/ule pair; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("_z_addr") && cpp.contains(" %% ")
+            || cpp.contains("_z_addr") && cpp.contains("z3"),
+        "expected `addr % 4 == 0` to reach the solver; got:\n{cpp}"
+    );
     // No fallback to randomize_T(&t) — that would silently bypass the keeps.
-    assert!(!cpp.contains("randomize_T(&t);"),
-        "should NOT fall back to PRNG `randomize_T`; got:\n{cpp}");
+    assert!(
+        !cpp.contains("randomize_T(&t);"),
+        "should NOT fall back to PRNG `randomize_T`; got:\n{cpp}"
+    );
 }
 
 /// Both transaction-level `keep`s AND the user's `with` body are
@@ -1152,14 +1403,19 @@ impl sim for MergeTest
         end randomize
     end run
 end impl MergeTest"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     // Both constraints reach the solver: the txn's `keep val in [10..200]`
     // AND the user's `t.val > 100`. Z3 has to satisfy both.
-    assert!(cpp.contains("z3::uge(_z_val") && cpp.contains("z3::ule(_z_val"),
-        "transaction's `val in [10..200]` should still apply; got:\n{cpp}");
-    assert!(cpp.contains("z3::ugt(_z_val, _ctx.bv_val((uint64_t)100"),
-        "user's `t.val > 100` should also reach the solver; got:\n{cpp}");
+    assert!(
+        cpp.contains("z3::uge(_z_val") && cpp.contains("z3::ule(_z_val"),
+        "transaction's `val in [10..200]` should still apply; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("z3::ugt(_z_val, _ctx.bv_val((uint64_t)100"),
+        "user's `t.val > 100` should also reach the solver; got:\n{cpp}"
+    );
 }
 
 /// `keep f != WRAP` where `WRAP` is an enum variant resolves via
@@ -1185,13 +1441,16 @@ impl sim for EnumKeepTest
         randomize(t)
     end run
 end impl EnumKeepTest"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     // WRAP is the 3rd variant (index 2). The constraint lowers to
     // _z_burst != bv_val(2, 64). The != comparison emits as plain `!=`
     // (no z3::ult-family wrapper needed for equality).
-    assert!(cpp.contains("_z_burst != _ctx.bv_val((uint64_t)2, 64)"),
-        "expected `burst != WRAP` to lower with WRAP resolved to index 2; got:\n{cpp}");
+    assert!(
+        cpp.contains("_z_burst != _ctx.bv_val((uint64_t)2, 64)"),
+        "expected `burst != WRAP` to lower with WRAP resolved to index 2; got:\n{cpp}"
+    );
 }
 
 /// Smoke-sweep every fixture under `tests/fixtures/` through
@@ -1207,7 +1466,8 @@ end impl EnumKeepTest"#,
 #[test]
 fn all_fixtures_emit_cleanly() {
     let fixtures = std::path::Path::new("tests/fixtures");
-    let mut paths: Vec<_> = std::fs::read_dir(fixtures).unwrap()
+    let mut paths: Vec<_> = std::fs::read_dir(fixtures)
+        .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("harc"))
         .collect();
@@ -1231,9 +1491,8 @@ fn all_fixtures_emit_cleanly() {
             }
         };
         // Try sibling sim half if present.
-        let sim_sibling = path.with_file_name(
-            format!("{}_sim.harc", name.trim_end_matches(".harc")),
-        );
+        let sim_sibling =
+            path.with_file_name(format!("{}_sim.harc", name.trim_end_matches(".harc")));
         let parsed_units = if sim_sibling.exists() {
             let sim_src = std::fs::read_to_string(&sim_sibling).unwrap();
             match parse_source(&sim_src) {
@@ -1279,13 +1538,19 @@ fn all_fixtures_emit_cleanly() {
             }
         }
     }
-    assert!(failures.is_empty(),
+    assert!(
+        failures.is_empty(),
         "fixture sweep: {} emitted, {} failed:\n{}",
-        emitted, failures.len(), failures.join("\n"));
+        emitted,
+        failures.len(),
+        failures.join("\n")
+    );
     // Sanity: at least a substantial fraction of fixtures should have
     // gone through emit; otherwise the skip filter is too aggressive.
-    assert!(emitted >= 20,
-        "fixture sweep only emitted {emitted} files — skip filter too aggressive?");
+    assert!(
+        emitted >= 20,
+        "fixture sweep only emitted {emitted} files — skip filter too aggressive?"
+    );
 }
 
 /// Casts to non-Builtin types (struct, named) drop to identity at
@@ -1310,13 +1575,15 @@ impl sim for T
         dut.X = pkt.addr
     end run
 end impl T"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
 
     // No `(Pkt)` C++ cast should appear — the user-level cast to a
     // struct is identity at the HARC C++ TB layer (struct field
     // access still uses `.addr`, which works on the underlying value).
-    assert!(!cpp.contains("(Pkt)("),
-        "expected NO `(Pkt)(...)` C++ cast for struct-targeted `as`; got:\n{cpp}");
+    assert!(
+        !cpp.contains("(Pkt)("),
+        "expected NO `(Pkt)(...)` C++ cast for struct-targeted `as`; got:\n{cpp}"
+    );
 }
-
