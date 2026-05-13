@@ -1,12 +1,27 @@
 # HARC
 
-**HARC** (*Harness of ARCh*) is a verification language compiler — sister to **ARCH**, the hardware description language at [`arch-hdl-lang/arch-com`](https://github.com/arch-hdl-lang/arch-com). HARC produces a Verilator-driven C++ testbench from a high-level test description, with first-class support for transactions, constraint-randomized stimulus, transactors (synthesizable BFMs), scoreboards, covergroups, concurrent assertions, `extern function` references to C/C++ reference models, and a heartbeat-based replacement for UVM's objection mechanism (per-agent `watchdog` + `wait until` with per-predicate timeout diagnostics).
+**HARC** (*Harness of ARCh*) is a verification language compiler — sister to **ARCH**, the hardware description language at [`arch-hdl-lang/arch-com`](https://github.com/arch-hdl-lang/arch-com). From a single high-level test description, HARC compiles a C++ testbench that drives the DUT through one of two paths today:
 
-The full language reference is in [`spec.md`](spec.md).
+- **Verilator-compiled SystemVerilog** (`harc sim --sv`) — the canonical path for hand-written or arch-built SV
+- **ARCH co-simulation** (`harc sim --dut`) — pipes through `arch sim` against ARCH's built-in cpp simulation model; fastest iteration for ARCH-authored DUTs
+
+The language has first-class support for transactions, constraint-randomized stimulus, transactors (synthesizable BFMs), scoreboards, covergroups, concurrent assertions, `extern function` references to C/C++ reference models, and a heartbeat-based replacement for UVM's objection mechanism (per-agent `watchdog` + `wait until` with per-predicate timeout diagnostics).
+
+The same source is designed to retarget without rewrites: spec §10 documents the SV+UVM transpile path (`harc -emit sv-uvm` — class hierarchy + `uvm_sequence_item` + SVA), the formal export path (`harc -emit btor2` / `-emit smt2`), and synthesizable-checker emulation. None of those backends ship in v0 — they're roadmap. The full language reference is in [`spec.md`](spec.md).
+
+## Why a new HVL?
+
+The three established choices for testbench authoring each have a specific cost:
+
+- **UVM (SystemVerilog + UVM library)** — verbose factory boilerplate (`uvm_component_utils`, `build_phase`, `connect_phase`, `new()` super-call chains) around every component, and a 9-phase elaboration model + 12-step run-phase pre/post fan-out each component has to slot into. The dominant runtime pain point is **`uvm_config_db`**: cross-component configuration travels through *string-keyed wildcard paths* (`"*.driver"`, `"top.env.*"`), type-erased — a typo in the path or a mismatched type parameter at `get()` silently falls back to the default value, with no compile-time check and no runtime error. `set()` must precede the consumer's `get()` in phase order; one phase too late and the value silently has no effect. No static tool can audit "this `set` has no `get`" or vice versa, because the keys resolve at runtime against the component hierarchy. Combined with the distributed objection-counting termination story (`Drain time expired with N objections still raised` when a test hangs — no information about *which* component or *what* condition), runtime debugging is dominated by "wrong value, no error, find out 30 minutes into the sim." The SV constraint solver is implementation-defined per simulator, so behavior drifts between vendors. The vendor simulators that run UVM well (VCS / Xcelium / Questa) are paid.
+- **Cocotb (Python + RTL cosim)** — every signal access crosses the Python ↔ VPI/VHPI boundary; per-cycle throughput is orders of magnitude below Verilator at the kernel level. No built-in constraint solver, no typed bus / transaction abstractions, no SVA-style concurrent properties — these are all roll-your-own on top of the Python event loop. Production verification at large scale is rare.
+- **Raw C++ + Verilator** — Verilator-class speed but no verification library: no constraint solver, no covergroups, no transactions, no concurrent assertions, no scoreboard primitives. Each TB is bespoke C++; reusability and refactor cost scale poorly with project size.
+
+HARC's bet is that you can get UVM's language affordances (transactions, constraints, scoreboards, properties, covergroups) at Verilator's speed, on an open-source toolchain (Verilator + Z3), with a positive termination story (heartbeat-tracked `watchdog` + `wait until` per-predicate diagnostics) instead of objection accounting.
 
 ## Status
 
-Pre-1.0. Stimulus → observation → scoreboard → properties/coverage → reference-model comparison → watchdog termination are all usable end-to-end. 56 fixtures pass against real Verilator-compiled SystemVerilog DUTs.
+Pre-1.0. Stimulus → observation → scoreboard → properties/coverage → reference-model comparison → watchdog termination are all usable end-to-end. 56 fixtures pass against real Verilator-compiled SystemVerilog DUTs in CI. The ARCH cosim path (`--dut`) shares the same C++ TB emission and runs alongside `arch sim` for ARCH-authored DUTs.
 
 ## Install
 
@@ -101,6 +116,32 @@ harc sim --sv tests/dut/sync_fifo.sv tests/fixtures/sync_fifo_test.harc --top Tx
 
 HARC compiles the test to C++, links Verilator's compiled DUT, runs the binary, and prints cycle-stamped log lines plus a coverage report.
 
+## Compile flow
+
+```mermaid
+graph LR
+    H[".harc test +<br/>extend files"]
+    H --> Parse["parse +<br/>extend merge"]
+    Parse --> Codegen["cpp_tb codegen"]
+    Codegen --> TB["testbench.cpp"]
+
+    SV[".sv DUT<br/>(--sv)"]
+    ARCH[".arch DUT<br/>(--dut)"]
+    REF[".c/.cpp ref<br/>(--ref-src)"]
+    RT["harc_thread_rt.h<br/>(coroutine runtime)"]
+
+    TB --> Build["verilator / arch sim<br/>+ Z3 link"]
+    SV --> Build
+    ARCH --> Build
+    REF --> Build
+    RT --> Build
+
+    Build --> Bin["sim binary"]
+    Bin --> Out["ALL TESTS PASSED<br/>+ sim.log + coverage.dat"]
+```
+
+One `harc sim` invocation drives the full pipeline: it parses the `.harc` source (folding any sibling `extend test T` files), emits a single C++ testbench, then chains through either Verilator (`--sv`) or `arch sim` (`--dut`) to compile the DUT alongside the TB, the runtime header, and any `--ref-src` reference models. The resulting binary self-tests at run time, exits zero on `ALL TESTS PASSED`, and writes per-test logs + an optional coverage database. CI runs [`tests/run_fixtures.sh`](tests/run_fixtures.sh) which does this for all 56 fixtures.
+
 ## CLI
 
 | Command | What it does |
@@ -155,7 +196,7 @@ src/
   diagnostics.rs          miette-based error reporting
   learn/                  Local learning store (`harc advise`)
   codegen/
-    cpp_tb.rs             Verilator C++ TB emitter (single file)
+    cpp_tb.rs             C++ TB emitter (single file; drives both --sv and --dut paths)
     merge.rs              Multi-file `extend test T` merging
   main.rs                 CLI
 
