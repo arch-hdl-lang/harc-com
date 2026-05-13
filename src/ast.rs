@@ -994,6 +994,27 @@ pub enum StmtKind {
     /// named clock sees `<expr>` more rising edges (other clocks
     /// continue ticking at their natural rate).
     Wait { duration: Expr, clock: Option<Ident>, span: Span },
+    /// `wait until <expr> [timeout N cycles fail("...")]` — suspend
+    /// the current coroutine until the predicate becomes true at a
+    /// posedge of the primary clock. With `all of` / `any of` the
+    /// predicate is a conjunction / disjunction over multiple
+    /// sub-expressions; on `timeout` the codegen reports which
+    /// sub-predicate was false (or, for `any of`, that none became
+    /// true) in the diagnostic. Spec §7.9.
+    ///
+    /// Forms supported (after the `wait until` prefix):
+    /// - single condition: `wait until <expr> [timeout ...]`
+    /// - all-of:           `wait until all of <e1>, <e2>, ... [timeout ...]`
+    /// - any-of:           `wait until any of <e1>, <e2>, ... [timeout ...]`
+    ///
+    /// `mode == WaitUntilMode::Single` always has exactly one entry
+    /// in `conditions`; `AllOf` / `AnyOf` have one or more.
+    WaitUntil {
+        mode: WaitUntilMode,
+        conditions: Vec<Expr>,
+        timeout: Option<WaitTimeout>,
+        span: Span,
+    },
     /// `fail("...")` as a standalone statement (also accepted inside
     /// `assert ... else fail(...)` via the existing `Verify.else_fail`
     /// channel). Lowering: unconditional `sim_log_line("FAIL", msg);
@@ -1004,6 +1025,30 @@ pub enum StmtKind {
     /// condition is structural rather than expressible as one
     /// expression).
     Fail { msg: Expr, span: Span },
+}
+
+/// Quantifier over the predicate list of a `wait until` statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitUntilMode {
+    /// `wait until <single-expr>` — no quantifier prefix.
+    Single,
+    /// `wait until all of <e1>, <e2>, …` — conjunction.
+    AllOf,
+    /// `wait until any of <e1>, <e2>, …` — disjunction.
+    AnyOf,
+}
+
+/// `timeout N cycles fail("…")` tail clause on a `wait until`.
+/// The `message` is an optional string literal — when present the
+/// codegen logs it on timeout *before* the per-predicate breakdown.
+/// `cycles` is any integer expression (typically a const, but
+/// component-parameter expressions are accepted so each test can
+/// pick its own budget without editing the wait site).
+#[derive(Debug, Clone)]
+pub struct WaitTimeout {
+    pub cycles: Expr,
+    pub message: Option<Expr>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]

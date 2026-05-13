@@ -1792,6 +1792,84 @@ impl Parser {
             }
             Some(TokenKind::Wait) => {
                 self.advance();
+                // `wait until …` form (spec §7.9) — UVM's objection
+                // mechanism replaced by a positive "wait until these
+                // conditions hold" with optional timeout + per-predicate
+                // diagnostics. Always-single-line; not a block stmt.
+                if self.check_ident("until") {
+                    self.advance();
+                    // Optional `all of` / `any of` quantifier prefix.
+                    let mode = if self.check_ident("all") {
+                        self.advance();
+                        if !self.check_ident("of") {
+                            return Err(CompileError::unexpected_token(
+                                "`of` after `all`",
+                                &self.peek_kind().map(|k| k.to_string()).unwrap_or("EOF".into()),
+                                self.peek_span(),
+                            ));
+                        }
+                        self.advance();
+                        WaitUntilMode::AllOf
+                    } else if self.check_ident("any") {
+                        self.advance();
+                        if !self.check_ident("of") {
+                            return Err(CompileError::unexpected_token(
+                                "`of` after `any`",
+                                &self.peek_kind().map(|k| k.to_string()).unwrap_or("EOF".into()),
+                                self.peek_span(),
+                            ));
+                        }
+                        self.advance();
+                        WaitUntilMode::AnyOf
+                    } else {
+                        WaitUntilMode::Single
+                    };
+                    // Parse first condition. For all-of/any-of, accept
+                    // additional comma-separated conditions until we hit
+                    // `timeout` or statement end.
+                    let mut conditions = vec![self.parse_expr()?];
+                    if matches!(mode, WaitUntilMode::AllOf | WaitUntilMode::AnyOf) {
+                        while self.check(TokenKind::Comma) {
+                            self.advance();
+                            conditions.push(self.parse_expr()?);
+                        }
+                    }
+                    // Optional `timeout N cycles fail("…")` tail.
+                    // Each clause is itself optional inside the timeout
+                    // block: `timeout N cycles` (no message), `timeout N
+                    // cycles fail("...")` (with message). The default
+                    // message ("wait until timed out at cycle N") is
+                    // supplied by codegen when `message` is None.
+                    let timeout = if self.check_ident("timeout") {
+                        let to_start = self.peek_span();
+                        self.advance();
+                        let cycles = self.parse_expr()?;
+                        if self.check_ident("cycles") || self.check_ident("cycle") {
+                            self.advance();
+                        }
+                        let message = if self.check(TokenKind::Fail) {
+                            self.advance();
+                            self.expect(TokenKind::LParen)?;
+                            let msg = self.parse_expr()?;
+                            self.expect(TokenKind::RParen)?;
+                            Some(msg)
+                        } else {
+                            None
+                        };
+                        let to_end = message.as_ref().map(|m| m.span).unwrap_or(cycles.span);
+                        Some(WaitTimeout { cycles, message, span: to_start.merge(to_end) })
+                    } else {
+                        None
+                    };
+                    let last_span = timeout.as_ref().map(|t| t.span)
+                        .or_else(|| conditions.last().map(|c| c.span))
+                        .unwrap_or(start);
+                    let span = start.merge(last_span);
+                    return Ok(Stmt {
+                        kind: StmtKind::WaitUntil { mode, conditions, timeout, span },
+                        span,
+                    });
+                }
                 let dur = self.parse_expr()?;
                 // `cycles` / `cycle` decoration — optional, ARCH-shape.
                 if self.check_ident("cycles") || self.check_ident("cycle") {
