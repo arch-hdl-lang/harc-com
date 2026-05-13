@@ -1,12 +1,17 @@
 # HARC
 
-**HARC** (*Harness of ARCh*) is a verification language compiler — sister to **ARCH**, the hardware description language at [`arch-hdl-lang/arch-com`](https://github.com/arch-hdl-lang/arch-com). HARC produces a Verilator-driven C++ testbench from a high-level test description, with first-class support for transactions, constraint-randomized stimulus, transactors (synthesizable BFMs), scoreboards, covergroups, concurrent assertions, `extern function` references to C/C++ reference models, and a heartbeat-based replacement for UVM's objection mechanism (per-agent `watchdog` + `wait until` with per-predicate timeout diagnostics).
+**HARC** (*Harness of ARCh*) is a verification language compiler — sister to **ARCH**, the hardware description language at [`arch-hdl-lang/arch-com`](https://github.com/arch-hdl-lang/arch-com). From a single high-level test description, HARC compiles a C++ testbench that drives the DUT through one of two paths today:
 
-The full language reference is in [`spec.md`](spec.md).
+- **Verilator-compiled SystemVerilog** (`harc sim --sv`) — the canonical path for hand-written or arch-built SV
+- **ARCH co-simulation** (`harc sim --dut`) — pipes through `arch sim` against ARCH's built-in cpp simulation model; fastest iteration for ARCH-authored DUTs
+
+The language has first-class support for transactions, constraint-randomized stimulus, transactors (synthesizable BFMs), scoreboards, covergroups, concurrent assertions, `extern function` references to C/C++ reference models, and a heartbeat-based replacement for UVM's objection mechanism (per-agent `watchdog` + `wait until` with per-predicate timeout diagnostics).
+
+The same source is designed to retarget without rewrites: spec §10 documents the SV+UVM transpile path (`harc -emit sv-uvm` — class hierarchy + `uvm_sequence_item` + SVA), the formal export path (`harc -emit btor2` / `-emit smt2`), and synthesizable-checker emulation. None of those backends ship in v0 — they're roadmap. The full language reference is in [`spec.md`](spec.md).
 
 ## Status
 
-Pre-1.0. Stimulus → observation → scoreboard → properties/coverage → reference-model comparison → watchdog termination are all usable end-to-end. 56 fixtures pass against real Verilator-compiled SystemVerilog DUTs.
+Pre-1.0. Stimulus → observation → scoreboard → properties/coverage → reference-model comparison → watchdog termination are all usable end-to-end. 56 fixtures pass against real Verilator-compiled SystemVerilog DUTs in CI. The ARCH cosim path (`--dut`) shares the same C++ TB emission and runs alongside `arch sim` for ARCH-authored DUTs.
 
 ## Install
 
@@ -155,7 +160,7 @@ src/
   diagnostics.rs          miette-based error reporting
   learn/                  Local learning store (`harc advise`)
   codegen/
-    cpp_tb.rs             Verilator C++ TB emitter (single file)
+    cpp_tb.rs             C++ TB emitter (single file; drives both --sv and --dut paths)
     merge.rs              Multi-file `extend test T` merging
   main.rs                 CLI
 
