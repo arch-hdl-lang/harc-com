@@ -118,12 +118,18 @@ HARC compiles the test to C++, links Verilator's compiled DUT, runs the binary, 
 
 ## Compile flow
 
+Solid = ships in v0. Dashed = spec §10 roadmap (same compiler IR, alternate emit target).
+
 ```mermaid
 graph LR
     H[".harc test +<br/>extend files"]
     H --> Parse["parse +<br/>extend merge"]
-    Parse --> Codegen["cpp_tb codegen"]
-    Codegen --> TB["testbench.cpp"]
+    Parse --> Codegen["codegen<br/>(per-emit target)"]
+
+    Codegen -->|"v0: cpp_tb"| TB["testbench.cpp"]
+    Codegen -.->|"§10.2 sv-uvm"| SVUVM["SV+UVM TB<br/>(class hierarchy +<br/>uvm_sequence_item + SVA)"]
+    Codegen -.->|"§10.3 btor2 / smt2"| Formal["BTOR2 / SMT-LIB2"]
+    Codegen -.->|"§10.4 emul"| Emul["synthesizable<br/>RTL checkers"]
 
     SV[".sv DUT<br/>(--sv)"]
     ARCH[".arch DUT<br/>(--dut)"]
@@ -138,9 +144,22 @@ graph LR
 
     Build --> Bin["sim binary"]
     Bin --> Out["ALL TESTS PASSED<br/>+ sim.log + coverage.dat"]
+
+    SVUVM -.-> VendorSim["VCS / Xcelium / Questa"]
+    Formal -.-> FormalTool["Pono / AVR / Z3<br/>(BMC, k-induction)"]
+    Emul -.-> EmulPlatform["FPGA / emulator"]
+
+    style SVUVM stroke-dasharray: 5 5
+    style Formal stroke-dasharray: 5 5
+    style Emul stroke-dasharray: 5 5
+    style VendorSim stroke-dasharray: 5 5
+    style FormalTool stroke-dasharray: 5 5
+    style EmulPlatform stroke-dasharray: 5 5
 ```
 
-One `harc sim` invocation drives the full pipeline: it parses the `.harc` source (folding any sibling `extend test T` files), emits a single C++ testbench, then chains through either Verilator (`--sv`) or `arch sim` (`--dut`) to compile the DUT alongside the TB, the runtime header, and any `--ref-src` reference models. The resulting binary self-tests at run time, exits zero on `ALL TESTS PASSED`, and writes per-test logs + an optional coverage database. CI runs [`tests/run_fixtures.sh`](tests/run_fixtures.sh) which does this for all 56 fixtures.
+One `harc sim` invocation drives the v0 path (solid): it parses the `.harc` source (folding any sibling `extend test T` files), emits a single C++ testbench via the `cpp_tb` codegen, then chains through either Verilator (`--sv`) or `arch sim` (`--dut`) to compile the DUT alongside the TB, the runtime header, and any `--ref-src` reference models. The resulting binary self-tests at run time, exits zero on `ALL TESTS PASSED`, and writes per-test logs + an optional coverage database. CI runs [`tests/run_fixtures.sh`](tests/run_fixtures.sh) which does this for all 56 fixtures.
+
+The dashed paths share the same parser + AST + IR; they branch at codegen by emitting a different target representation. Spec §10 documents the contracts (what survives the transpile cleanly, what's lossy) and the lowering tables. None of the three ship in v0 — the diagram exists so the reader can see where the language is going, not what it does today.
 
 ## CLI
 
