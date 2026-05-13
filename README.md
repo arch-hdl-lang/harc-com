@@ -9,6 +9,16 @@ The language has first-class support for transactions, constraint-randomized sti
 
 The same source is designed to retarget without rewrites: spec §10 documents the SV+UVM transpile path (`harc -emit sv-uvm` — class hierarchy + `uvm_sequence_item` + SVA), the formal export path (`harc -emit btor2` / `-emit smt2`), and synthesizable-checker emulation. None of those backends ship in v0 — they're roadmap. The full language reference is in [`spec.md`](spec.md).
 
+## Why a new HVL?
+
+The three established choices for testbench authoring each have a specific cost:
+
+- **UVM (SystemVerilog + UVM library)** — verbose factory boilerplate (`uvm_component_utils`, `build_phase`, `connect_phase`, `new()` super-call chains) around every component, string-keyed `uvm_config_db` for cross-component configuration, and a distributed objection-counting termination story that surfaces as `Drain time expired with N objections still raised` when a test hangs — no information about *which* component or *what* condition. The SV constraint solver is implementation-defined per simulator, so behavior drifts between vendors. The vendor simulators that run UVM well (VCS / Xcelium / Questa) are paid.
+- **Cocotb (Python + RTL cosim)** — every signal access crosses the Python ↔ VPI/VHPI boundary; per-cycle throughput is orders of magnitude below Verilator at the kernel level. No built-in constraint solver, no typed bus / transaction abstractions, no SVA-style concurrent properties — these are all roll-your-own on top of the Python event loop. Production verification at large scale is rare.
+- **Raw C++ + Verilator** — Verilator-class speed but no verification library: no constraint solver, no covergroups, no transactions, no concurrent assertions, no scoreboard primitives. Each TB is bespoke C++; reusability and refactor cost scale poorly with project size.
+
+HARC's bet is that you can get UVM's language affordances (transactions, constraints, scoreboards, properties, covergroups) at Verilator's speed, on an open-source toolchain (Verilator + Z3), with a positive termination story (heartbeat-tracked `watchdog` + `wait until` per-predicate diagnostics) instead of objection accounting.
+
 ## Status
 
 Pre-1.0. Stimulus → observation → scoreboard → properties/coverage → reference-model comparison → watchdog termination are all usable end-to-end. 56 fixtures pass against real Verilator-compiled SystemVerilog DUTs in CI. The ARCH cosim path (`--dut`) shares the same C++ TB emission and runs alongside `arch sim` for ARCH-authored DUTs.
