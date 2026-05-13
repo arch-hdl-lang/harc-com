@@ -234,4 +234,6 @@ Bug coverage rule of thumb: if the same test passes under `--dut` but fails unde
 
 ## License
 
-TBD.
+LGPL-3.0-or-later — full text in [`LICENSE`](LICENSE). Matches the sister ARCH compiler so HARC and ARCH source can be combined into a single tool without license-compatibility ceremony.
+
+Contributions are accepted under the [`Contributor License Agreement`](CLA.md). GitHub's CLA Assistant prompts for sign-off on the first PR; subsequent PRs from the same contributor pass automatically.
