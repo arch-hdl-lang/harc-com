@@ -1,0 +1,90 @@
+// End-to-end demo of activity-tracking heartbeats and the `idle(N)`
+// predicate (spec §7.8). Background: UVM uses an objection-counting
+// mechanism for test termination; HARC inverts that into a positive
+// "has this component been idle for N cycles?" question. Every
+// component carries auto-injected `_last_in_cycle` / `_last_out_cycle`
+// fields that the framework bumps at every site where it can
+// attribute activity to a component instance: `on <event>` handler
+// body entry, `emit <event>`, `bus.<ch>.send/recv`, and bound-driver
+// actor queue pop. The predicate `agent.idle_in(N)` reads those
+// fields against the global `cycle_count` and returns true once at
+// least N cycles have elapsed since the last input bump.
+//
+// This fixture:
+//   1. Declares an agent `Producer` with an input event field.
+//   2. Emits 3 transactions onto `prod.in_ev` over the first ~9
+//      cycles, bumping `prod._last_in_cycle` each time.
+//   3. Then hand-rolls a `while`-loop poll on `prod.idle_in(8)` plus
+//      `wait 1 cycle`, bounded by a safety counter so the test
+//      terminates even if the predicate logic is buggy. (The
+//      ergonomic `wait until <expr> timeout N cycles ...` lands in
+//      a follow-up PR.)
+//   4. Asserts the predicate flipped true within the budget.
+//
+// The DUT is irrelevant here — we use `Top` (the counter from
+// top_counter_test) only because it's already registered with the
+// verilator regression. The counter ticks happily in the background
+// while the test logic exercises the heartbeat fields.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction TinyTxn
+    tag : uint<8>
+end transaction TinyTxn
+
+agent Producer
+    in_ev : event<TinyTxn>
+    seen  : uint<32> default 0
+
+    on in_ev(t)
+        // Body intentionally simple — the `_last_in_cycle` bump at
+        // entry is what matters here, not the body content.
+        seen = seen + 1
+    end on
+end agent Producer
+
+test HeartbeatIdleTest
+    let dut : Top
+
+    clock clk = SysDomain
+
+    let prod : Producer
+end test HeartbeatIdleTest
+
+impl sim for HeartbeatIdleTest
+    run
+        // Park the DUT so it doesn't interfere — we only care about
+        // the clock running.
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Emit 3 transactions spaced 3 cycles apart.
+        for i in 0 .. 3
+            let t : TinyTxn
+            t.tag = i
+            emit prod.in_ev(t)
+            wait 3 cycles
+        end for
+
+        // After the last emit, the agent should report
+        // `idle_in(N)` true once N cycles have elapsed since the
+        // last bump. Poll with a bounded safety budget.
+        let waited = 0
+        let budget = 100
+        while !prod.idle_in(8) && waited < budget
+            wait 1 cycle
+            waited = waited + 1
+        end while
+
+        assert prod.idle_in(8)
+            else fail("agent did not report idle_in(8) within ${budget} cycles after last emit; waited=${waited}")
+        assert prod.seen == 3
+            else fail("expected 3 emits to register, got ${prod.seen}")
+        log(info, "PASS: agent reported idle_in(8) after ${waited} cycles of inactivity; seen=${prod.seen}")
+    end run
+end impl HeartbeatIdleTest

@@ -382,6 +382,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         mt: opts.mt,
         driver_bus_for_hookables: std::collections::HashMap::new(),
         transactors,
+        current_component_instance: None,
     };
 
     // Header.
@@ -1352,6 +1353,22 @@ struct Emitter {
     /// `T.when_active` (only when mode == Active) and reuses the
     /// existing bound-driver-actor + bound-monitor-actor lowering.
     transactors: std::collections::HashMap<String, TransactorDecl>,
+    /// While we're emitting statements *inside a component instance's
+    /// own body* — an `on <event>` subscriber, a bound-driver actor
+    /// coroutine, a bound-monitor handshake actor — this names the
+    /// fully-qualified instance path (`"ag"`, `"topenv.ag"`, etc.).
+    /// `None` outside such bodies (test run code, free functions,
+    /// hookable method bodies which use `self` instead).
+    ///
+    /// Used by the activity-tracking lowering to bump
+    /// `<instance>._last_in_cycle` / `_last_out_cycle` at the sites
+    /// where the framework knows an in/out has just happened:
+    /// `emit ev(arg)`, `bus.<ch>.send(...)`, `bus.<ch>.recv()`. The
+    /// in-handler entry bump uses the static `instance` parameter
+    /// directly (already in scope), but `emit`/`send`/`recv` can
+    /// appear nested inside arbitrary expressions and need this
+    /// context to know whose heartbeat to bump.
+    current_component_instance: Option<String>,
 }
 
 impl Emitter {
@@ -1830,6 +1847,11 @@ impl Emitter {
                         write!(self.out, "{root}->{chan_prefix}_{}", sig.name.name).ok();
                     }
                     writeln!(self.out, "}};").ok();
+                    // Activity tracking (spec §7.x): an observed bus
+                    // handshake counts as an "in" for this monitor
+                    // instance.
+                    self.pad(depth + 2);
+                    writeln!(self.out, "{instance}._last_in_cycle = (uint64_t)cycle_count;").ok();
 
                     // Body: install field subs + bus binding, mark
                     // coroutine context, emit, restore state.
@@ -1843,9 +1865,14 @@ impl Emitter {
                     let prior_bus = self.bus_bindings.insert("bus".into(), binding.clone());
                     let prior_corout = self.in_coroutine;
                     self.in_coroutine = true;
+                    let prior_inst = std::mem::replace(
+                        &mut self.current_component_instance,
+                        Some(instance.to_string()),
+                    );
 
                     self.emit_block(&h.body, depth + 2);
 
+                    self.current_component_instance = prior_inst;
                     self.in_coroutine = prior_corout;
                     match prior_bus {
                         Some(prev) => { self.bus_bindings.insert("bus".into(), prev); }
@@ -2029,6 +2056,10 @@ impl Emitter {
         writeln!(self.out, "auto {arg_name} = {queue_var}.front();").ok();
         self.pad(depth + 2);
         writeln!(self.out, "{queue_var}.pop_front();").ok();
+        // Activity tracking (spec §7.x): popping a transaction off
+        // the per-actor queue counts as an "in" for this instance.
+        self.pad(depth + 2);
+        writeln!(self.out, "{instance}._last_in_cycle = (uint64_t)cycle_count;").ok();
 
         // Build field-name substitution map: bare names inside the
         // handler body resolve to `instance.field`. Event-typed
@@ -2061,9 +2092,17 @@ impl Emitter {
         // Mark coroutine context so wait/tick lower to co_await.
         let prior_corout = self.in_coroutine;
         self.in_coroutine = true;
+        // Set current-component scope so `emit`/`bus.<ch>.send/recv`
+        // nested in the actor body bump this instance's heartbeat
+        // fields.
+        let prior_inst = std::mem::replace(
+            &mut self.current_component_instance,
+            Some(instance.to_string()),
+        );
 
         self.emit_block(&handler.body, depth + 2);
 
+        self.current_component_instance = prior_inst;
         self.in_coroutine = prior_corout;
         match prior_bus {
             Some(prev) => { self.bus_bindings.insert("bus".into(), prev); }
@@ -2153,6 +2192,20 @@ impl Emitter {
                             self.out,
                             "{instance}.{event_name}.push_back([&]({arg_ty} {arg_name}) {{",
                         ).ok();
+                        // Activity tracking (spec §7.x): an incoming event
+                        // counts as an "in" for the component instance —
+                        // bump _last_in_cycle to the current cycle. The
+                        // current-component-instance scope is also set
+                        // so any `emit`/`bus.send`/`bus.recv` *inside*
+                        // this body bumps the same instance's
+                        // _last_out_cycle (those sites can't see the
+                        // static `instance` parameter directly).
+                        self.pad(depth + 1);
+                        writeln!(self.out, "{instance}._last_in_cycle = (uint64_t)cycle_count;").ok();
+                        let prior_inst = std::mem::replace(
+                            &mut self.current_component_instance,
+                            Some(instance.to_string()),
+                        );
                         // For `bound to BusType` components, expose the
                         // driver's bus binding inside the handler body
                         // as the bare identifier `bus`. Same root +
@@ -2169,6 +2222,7 @@ impl Emitter {
                                 None       => { self.bus_bindings.remove("bus"); }
                             }
                         }
+                        self.current_component_instance = prior_inst;
                         self.pad(depth);
                         writeln!(self.out, "}});").ok();
                         continue;
@@ -2419,6 +2473,15 @@ impl Emitter {
                 }
                 self.pad(depth);
                 writeln!(self.out, "{root}->{prefix}_valid = 0;").ok();
+                // Activity tracking (spec §7.x): a completed
+                // bus.<ch>.send counts as an "out" for the surrounding
+                // component instance, if any. Bus calls inside
+                // free/test-run code (no enclosing component) skip the
+                // bump.
+                if let Some(inst) = self.current_component_instance.clone() {
+                    self.pad(depth);
+                    writeln!(self.out, "{inst}._last_out_cycle = (uint64_t)cycle_count;").ok();
+                }
                 true
             }
             "recv" => {
@@ -2476,6 +2539,13 @@ impl Emitter {
                 }
                 self.pad(depth);
                 writeln!(self.out, "{root}->{prefix}_ready = 0;").ok();
+                // Activity tracking (spec §7.x): a completed
+                // bus.<ch>.recv counts as an "in" for the surrounding
+                // component instance, if any.
+                if let Some(inst) = self.current_component_instance.clone() {
+                    self.pad(depth);
+                    writeln!(self.out, "{inst}._last_in_cycle = (uint64_t)cycle_count;").ok();
+                }
                 true
             }
             _ => false,
@@ -2637,6 +2707,96 @@ impl Emitter {
     /// - `<env>.<sub>.<method>` — `env` is a let-bound env-style
     ///   component, `<sub>` is one of its sub-component fields, and
     ///   `<method>` is a `hookable` on the sub-component's type.
+    /// Detect built-in activity-tracking predicates `idle(N)`,
+    /// `idle_in(N)`, `idle_out(N)` on a component-typed binding. Walks
+    /// the field-access chain (same shape as `resolve_component_method_call`,
+    /// but doesn't require a `hookable` method — these predicates read
+    /// the auto-injected `_last_in_cycle` / `_last_out_cycle` fields
+    /// instead). Returns `Some((instance_path, predicate_kind))` on
+    /// match, where `predicate_kind` is `"idle"`, `"idle_in"`, or
+    /// `"idle_out"`.
+    ///
+    /// **User-defined hookables win.** If the resolved component type
+    /// already declares a `hookable <same-name>` method, we return
+    /// `None` so the call falls through to the normal hookable-dispatch
+    /// path. That keeps pre-existing fixtures (e.g. `buf_mgr_test`,
+    /// which has a `hookable idle(n)` that holds bus valids low for
+    /// `n` cycles) compiling unchanged. The built-in predicate is
+    /// effectively a *default* — users override by declaring the
+    /// method themselves.
+    fn resolve_component_idle_predicate(&self, callee: &Expr) -> Option<(String, String)> {
+        let ExprKind::Field { target, name: method } = &*callee.kind else { return None; };
+        match method.name.as_str() {
+            "idle" | "idle_in" | "idle_out" => {}
+            _ => return None,
+        }
+        let mut path: Vec<String> = Vec::new();
+        let mut cur: &Expr = target;
+        loop {
+            match &*cur.kind {
+                ExprKind::Field { target: inner, name } => {
+                    path.push(name.name.clone());
+                    cur = inner;
+                }
+                ExprKind::Ident(id) => {
+                    path.push(id.name.clone());
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        path.reverse();
+
+        let root = path.first()?;
+        let mut cur_ty: String = self.let_types.get(root)?.clone();
+        for seg in path.iter().skip(1) {
+            let next_ty = if let Some(comp) = self.components.get(&cur_ty) {
+                comp.items.iter().find_map(|it| {
+                    if let ComponentItem::Field(f) = it {
+                        if &f.name.name == seg {
+                            return type_simple_name(Some(&f.ty)).map(String::from);
+                        }
+                    }
+                    None
+                })
+            } else if let Some(t) = self.transactors.get(&cur_ty) {
+                let synth = synth_component_from_transactor(t, /*include_active*/true);
+                synth.items.iter().find_map(|it| {
+                    if let ComponentItem::Field(f) = it {
+                        if &f.name.name == seg {
+                            return type_simple_name(Some(&f.ty)).map(String::from);
+                        }
+                    }
+                    None
+                })
+            } else {
+                None
+            };
+            cur_ty = next_ty?;
+        }
+        // The target must resolve to a known component or transactor
+        // type — those are what get the auto-injected heartbeat fields.
+        let has_hookable_override = |items: &[ComponentItem]| -> bool {
+            items.iter().any(|it| matches!(
+                it, ComponentItem::Hookable(h) if h.name.name == method.name
+            ))
+        };
+        let user_overrides = if let Some(comp) = self.components.get(&cur_ty) {
+            has_hookable_override(&comp.items)
+        } else if let Some(t) = self.transactors.get(&cur_ty) {
+            let synth = synth_component_from_transactor(t, /*include_active*/true);
+            has_hookable_override(&synth.items)
+        } else {
+            return None;
+        };
+        if user_overrides {
+            // User has a hookable with this name — defer to the
+            // normal `Type_method(obj, args)` dispatch path.
+            return None;
+        }
+        Some((path.join("."), method.name.clone()))
+    }
+
     fn resolve_component_method_call(&self, callee: &Expr) -> Option<(String, String, String)> {
         let ExprKind::Field { target, name: method } = &*callee.kind else { return None; };
         // Walk the field-access chain to its root, collecting the path
@@ -2905,6 +3065,16 @@ impl Emitter {
                 writeln!(self.out, "{INDENT}{cty} {}{};", f.name.name, init).ok();
             }
         }
+        // Auto-injected activity-tracking fields (spec §7.x). Bumped by
+        // codegen at every place the framework knows an in/out has just
+        // happened — `on <ev>` handler body entry, bus handshake actor
+        // body entry, `bus.<ch>.send/recv`, `emit ev(arg)` — and read
+        // by the `obj.idle(N)` / `idle_in(N)` / `idle_out(N)` predicate
+        // lowering. Initial value 0 means "no activity yet"; the
+        // predicate `idle(N)` correctly reports false until at least N
+        // cycles have elapsed since the last bump.
+        writeln!(self.out, "{INDENT}uint64_t _last_in_cycle = 0;").ok();
+        writeln!(self.out, "{INDENT}uint64_t _last_out_cycle = 0;").ok();
         writeln!(self.out, "}};").ok();
         writeln!(self.out, "").ok();
     }
@@ -2994,6 +3164,12 @@ impl Emitter {
                 writeln!(self.out, "{INDENT}{cty} {}{};", f.name.name, init).ok();
             }
         }
+        // Auto-injected activity-tracking fields (spec §7.x). Same shape
+        // as for driver/agent/env/sequencer in `emit_component_struct`
+        // — scoreboards also count as components, so `sb.idle(N)` is
+        // a valid watchdog predicate.
+        writeln!(self.out, "{INDENT}uint64_t _last_in_cycle = 0;").ok();
+        writeln!(self.out, "{INDENT}uint64_t _last_out_cycle = 0;").ok();
         writeln!(self.out, "}};").ok();
         writeln!(self.out, "").ok();
     }
@@ -3956,6 +4132,14 @@ impl Emitter {
                     }
                 }
                 writeln!(self.out, ");").ok();
+                // Activity tracking (spec §7.x): an `emit` counts as an
+                // "out" for the surrounding component instance. Emits
+                // outside a component (test-run / free function) don't
+                // attribute to any instance.
+                if let Some(inst) = self.current_component_instance.clone() {
+                    self.pad(depth);
+                    writeln!(self.out, "{inst}._last_out_cycle = (uint64_t)cycle_count;").ok();
+                }
             }
             StmtKind::On(h) => {
                 // Three shapes:
@@ -4627,6 +4811,48 @@ impl Emitter {
                 write!(self.out, "]").ok();
             }
             ExprKind::Call { callee, args } => {
+                // Built-in activity-tracking predicates: `obj.idle(N)`,
+                // `obj.idle_in(N)`, `obj.idle_out(N)` lower directly to
+                // arithmetic on the auto-injected heartbeat fields.
+                // Recognized BEFORE hookable method dispatch so a user
+                // can't shadow them. (Spec §7.x — activity tracking.)
+                if let Some((instance, kind)) =
+                    self.resolve_component_idle_predicate(callee)
+                {
+                    if args.len() != 1 {
+                        self.errors.push(format!(
+                            "{instance}.{kind}: expected 1 cycle-count arg, got {}",
+                            args.len(),
+                        ));
+                        write!(self.out, "false").ok();
+                        return;
+                    }
+                    let n_expr = match &args[0] {
+                        CallArg::Expr(e) => e,
+                        CallArg::Named { value, .. } => value,
+                    };
+                    match kind.as_str() {
+                        "idle_in" => {
+                            write!(self.out, "(((uint64_t)cycle_count - {instance}._last_in_cycle) >= (uint64_t)(").ok();
+                            self.emit_expr(n_expr);
+                            write!(self.out, "))").ok();
+                        }
+                        "idle_out" => {
+                            write!(self.out, "(((uint64_t)cycle_count - {instance}._last_out_cycle) >= (uint64_t)(").ok();
+                            self.emit_expr(n_expr);
+                            write!(self.out, "))").ok();
+                        }
+                        "idle" => {
+                            write!(self.out, "((((uint64_t)cycle_count - {instance}._last_in_cycle) >= (uint64_t)(").ok();
+                            self.emit_expr(n_expr);
+                            write!(self.out, ")) && (((uint64_t)cycle_count - {instance}._last_out_cycle) >= (uint64_t)(").ok();
+                            self.emit_expr(n_expr);
+                            write!(self.out, ")))").ok();
+                        }
+                        _ => unreachable!(),
+                    }
+                    return;
+                }
                 // Method-call rewrite: `obj.method(args)` where `obj`'s
                 // type is a known component with a `hookable method`
                 // lowers to `<Type>_method(obj, args)`. Falls through to
