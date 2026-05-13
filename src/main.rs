@@ -576,10 +576,24 @@ fn run_verilator(
     // with a clearer error than verilator default.
     let z3_inc = ["/opt/homebrew/include", "/usr/local/include", "/usr/include"]
         .iter().map(PathBuf::from).find(|p| p.join("z3++.h").exists());
-    let z3_lib = ["/opt/homebrew/lib", "/usr/local/lib", "/usr/lib"]
-        .iter().map(PathBuf::from).find(|p| {
-            p.join("libz3.dylib").exists() || p.join("libz3.so").exists()
-        });
+    // Lib search path. The Ubuntu / Debian multiarch entries
+    // (`/usr/lib/x86_64-linux-gnu`, `/usr/lib/aarch64-linux-gnu`) are
+    // where `apt install libz3-dev` actually lands the `.so` — plain
+    // `/usr/lib` doesn't contain it on those distros. Without those
+    // entries, the Linux CI runner's link step would skip `-L<dir>
+    // -lz3` entirely and the Z3-using fixtures (`keep_constraints_test`,
+    // `relation_inlining_test`, anything else that calls `randomize(t)
+    // with …` against keeps) fail with a wall of unresolved
+    // `Z3_get_*` symbols.
+    let z3_lib = [
+        "/opt/homebrew/lib",
+        "/usr/local/lib",
+        "/usr/lib",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+    ].iter().map(PathBuf::from).find(|p| {
+        p.join("libz3.dylib").exists() || p.join("libz3.so").exists()
+    });
 
     let mut args: Vec<String> = vec![
         "--cc".into(), "--exe".into(), "--build".into(),
