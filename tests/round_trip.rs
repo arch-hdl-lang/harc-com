@@ -185,6 +185,61 @@ end impl T
     );
 }
 
+/// `on <N> cycles … end on` (periodic trigger, spec §7.10) and
+/// `watchdog … end watchdog` (built-in watchdog body item, spec §8.6)
+/// round-trip through the pretty-printer. Covers all three watchdog
+/// surface forms: implicit-defaults, custom period/max_idle, and
+/// `watchdog disabled` opt-out.
+#[test]
+fn on_cycles_and_watchdog_round_trip() {
+    let src = r#"
+agent Foo
+    counter : uint<32> default 0
+
+    watchdog
+        period 500 cycles
+        max_idle 5000 cycles
+        log(info, "[wdog] counter=${counter}")
+    end watchdog
+end agent Foo
+
+agent Bar
+    watchdog disabled
+end agent Bar
+
+agent Baz
+    watchdog
+    end watchdog
+end agent Baz
+
+test T
+    let dut : X
+    let foo : Foo
+end test T
+
+impl sim for T
+    run
+        on 1000 cycles
+            log(info, "heartbeat at ${cycle_count}")
+        end on
+        wait 5 cycles
+    end run
+end impl T
+"#;
+    let printed = parse_print_reparse(src);
+    // Periodic on-handler keeps its `cycles` decorator.
+    assert!(printed.contains("on 1000 cycles"),
+        "`on 1000 cycles` should round-trip; got:\n{printed}");
+    // Watchdog default+custom forms.
+    assert!(printed.contains("watchdog\n        period 500 cycles\n        max_idle 5000 cycles"),
+        "watchdog with explicit period/max_idle should round-trip; got:\n{printed}");
+    assert!(printed.contains("watchdog disabled"),
+        "`watchdog disabled` opt-out should round-trip; got:\n{printed}");
+    // Implicit-defaults watchdog (no period/max_idle, no body).
+    assert!(printed.contains("agent Baz\n    watchdog\n    end watchdog"),
+        "defaults-only watchdog should round-trip; got:\n{printed}");
+}
+
 /// `///` outer doc comments attach to the next construct, populate
 /// `doc: Option<String>` on the AST node, and round-trip through the
 /// pretty-printer. Mirrors arch-com's `plan_arch_doc_comments.md` §2.1.

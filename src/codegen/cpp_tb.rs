@@ -820,6 +820,15 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             _ => {}
         }
     }
+    // Watchdog hook vectors must be emitted in the same forward-decl
+    // pass as the hookable hook vectors — `on <Type>.watchdog pre/post`
+    // captures them. The `emit_watchdog` helper below emits BOTH the
+    // hook vectors AND the synthetic method body in one go, since the
+    // method body refers to those vectors. So we forward-declare the
+    // method via the same pass that emits hookable method lambdas
+    // below; here, no separate forward decl is needed because the
+    // method lambda + its hook vectors are emitted together at that
+    // point.
     // Pre-scan: register test-scope bus bindings (`let axil :
     // BusAxiLite = bind dut`) and driver-type → binding mappings
     // BEFORE hookable methods emit. Hookables on `bound to BusType`
@@ -884,6 +893,10 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                         e.emit_component_method(c, h, 1);
                         emitted_any_method = true;
                     }
+                    if let ComponentItem::Watchdog(w) = ci {
+                        e.emit_watchdog(c, w, 1);
+                        emitted_any_method = true;
+                    }
                 }
             }
             Item::Transactor(t) => {
@@ -895,6 +908,10 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                 for ci in &synth.items {
                     if let ComponentItem::Hookable(h) = ci {
                         e.emit_component_method(&synth, h, 1);
+                        emitted_any_method = true;
+                    }
+                    if let ComponentItem::Watchdog(w) = ci {
+                        e.emit_watchdog(&synth, w, 1);
                         emitted_any_method = true;
                     }
                 }
@@ -1695,10 +1712,43 @@ impl Emitter {
     /// Used by both the test-scope `on` form and monitor body handlers; the
     /// `prefix` distinguishes the static-state tags so concurrent handlers
     /// at the same span don't collide.
+    ///
+    /// Also handles the periodic form `on <N> cycles ... end on` (spec
+    /// §7.10) — fires the body once every `<N>` primary-clock cycles.
+    /// `N` is re-read each cycle so per-test overrides via component-
+    /// field initialization (or a free `int wdog_period = 5000`)
+    /// flow through naturally without rebuilding.
     fn emit_cycle_trigger(&mut self, h: &OnHandler, depth: usize, prefix: &str) {
         let tag = format!("{prefix}{}_{}", h.event.span.start, h.event.span.end);
         self.pad(depth);
         writeln!(self.out, "_checkers.push_back([&]() {{").ok();
+        if h.periodic {
+            // Periodic: fire body when cycle_count - last_fired >= N.
+            // Initial state: last_fired = 0 means first firing is at
+            // cycle N (NOT cycle 0 — the user didn't ask for an
+            // immediate-fire-on-start; they asked for "every N cycles").
+            self.pad(depth + 1);
+            writeln!(self.out, "static int64_t {tag}_last = 0;").ok();
+            self.pad(depth + 1);
+            write!(self.out, "int64_t {tag}_period = (int64_t)(").ok();
+            self.emit_expr(&h.event);
+            writeln!(self.out, ");").ok();
+            // Guard against period <= 0 — a misconfigured period would
+            // otherwise spin-fire every cycle (negative) or every cycle
+            // forever (zero). Treat as no-op.
+            self.pad(depth + 1);
+            writeln!(self.out,
+                "if ({tag}_period > 0 && (int64_t)cycle_count - {tag}_last >= {tag}_period) {{"
+            ).ok();
+            self.pad(depth + 2);
+            writeln!(self.out, "{tag}_last = (int64_t)cycle_count;").ok();
+            self.emit_block(&h.body, depth + 2);
+            self.pad(depth + 1);
+            writeln!(self.out, "}}").ok();
+            self.pad(depth);
+            writeln!(self.out, "}});").ok();
+            return;
+        }
         match h.edge {
             EdgeMode::Level => {
                 self.pad(depth + 1);
@@ -1821,6 +1871,15 @@ impl Emitter {
                 let sub_inst = format!("{}.{}", instance_path, f.name.name);
                 let sub_tag = format!("_{}_{}_", sub_comp.kind.keyword(), f.name.name);
                 self.emit_component_handler_registrations(&sub_comp, &sub_inst, depth, &sub_tag);
+                // Sub-component watchdog (spec §8.6) — install the
+                // periodic checker prefixed with the sub-instance path
+                // so each composed agent inside an env gets its own
+                // independent watchdog firing.
+                for sub_ci in &sub_comp.items {
+                    if let ComponentItem::Watchdog(w) = sub_ci {
+                        self.emit_watchdog_checker(&sub_comp, w, &sub_inst, depth);
+                    }
+                }
                 // Recurse into the sub-component's own sub-fields.
                 self.emit_subcomponent_handler_registrations(
                     &sub_comp, &sub_inst, effective_mode, depth,
@@ -3179,6 +3238,170 @@ impl Emitter {
         for k in added { self.pointer_vars.remove(&k); }
         self.pad(depth);
         writeln!(self.out, "}};").ok();
+    }
+
+    /// Default watchdog period (cycles) when the user writes `watchdog`
+    /// without an explicit `period` clause. Spec §8.6.
+    const WATCHDOG_DEFAULT_PERIOD: i64 = 1000;
+    /// Default watchdog idle threshold (cycles) when the user writes
+    /// `watchdog` without an explicit `max_idle` clause.
+    const WATCHDOG_DEFAULT_MAX_IDLE: i64 = 10000;
+
+    /// Emit hook-vector declarations + the synthetic `<Type>_watchdog`
+    /// method for a component's `watchdog` block (spec §8.6). The
+    /// method body, in order:
+    ///   1. Pre-hooks (`<Type>_watchdog_pre`) — for `on <Type>.watchdog
+    ///      pre` aspect attachments.
+    ///   2. User-supplied body statements (typically `log(info, …)`
+    ///      debug prints). Field references rewrite to `self.<field>`
+    ///      via the same `field_subs` mechanism used for hookable
+    ///      methods.
+    ///   3. The idle check: if BOTH `_last_in_cycle` AND
+    ///      `_last_out_cycle` are ≥ `max_idle` cycles behind
+    ///      `cycle_count`, log `FAIL` with a watchdog-specific message
+    ///      and bump `errors`.
+    ///   4. Post-hooks (`<Type>_watchdog_post`).
+    ///
+    /// `disabled` watchdogs emit nothing — no hook vectors, no method.
+    /// External `on <Type>.watchdog pre/post` referencing a disabled
+    /// component's watchdog will surface as a missing-symbol C++
+    /// compile error, which is the intended signal that the aspect
+    /// has no target. (Reasonable people who turned the watchdog
+    /// off will know to remove their hooks.)
+    fn emit_watchdog(&mut self, c: &ComponentDecl, w: &WatchdogDecl, depth: usize) {
+        if w.disabled { return; }
+        let comp_ty = &c.name.name;
+        // Hook vectors — `watchdog` takes no args, so `void()` signature.
+        self.pad(depth);
+        writeln!(self.out, "std::vector<std::function<void()>> {comp_ty}_watchdog_pre;").ok();
+        self.pad(depth);
+        writeln!(self.out, "std::vector<std::function<void()>> {comp_ty}_watchdog_post;").ok();
+        // The method itself: a `[&]`-capturing lambda parallelling the
+        // shape of `emit_component_method` so the hookable-dispatch
+        // path (`<Type>_<method>(obj, args)`) finds the same symbol.
+        self.pad(depth);
+        writeln!(self.out, "auto {comp_ty}_watchdog = [&]({comp_ty}& self) -> void {{").ok();
+        // Field substitution: bare `wdog_max_idle` inside the user body
+        // resolves to `self.wdog_max_idle`. Same shape as
+        // emit_component_method's `subs` setup.
+        let mut subs = std::collections::HashMap::new();
+        let mut added_pointer_fields: Vec<String> = Vec::new();
+        for ci in &c.items {
+            if let ComponentItem::Field(f) = ci {
+                subs.insert(f.name.name.clone(), format!("self.{}", f.name.name));
+                if self.is_dut_pointer_field_type(&f.ty) {
+                    if self.pointer_vars.insert(f.name.name.clone()) {
+                        added_pointer_fields.push(f.name.name.clone());
+                    }
+                }
+            }
+        }
+        let prev_subs = std::mem::replace(&mut self.field_subs, subs);
+
+        // Pre-hooks.
+        self.pad(depth + 1);
+        writeln!(self.out, "for (auto& _h : {comp_ty}_watchdog_pre) _h();").ok();
+
+        // User body (typically debug logging).
+        self.emit_block(&w.body, depth + 1);
+
+        // Idle check. We emit the C++ directly (not through the HARC
+        // `idle()` predicate dispatch) because the receiver is `self`,
+        // not a let-bound variable, and `resolve_component_idle_predicate`
+        // expects to resolve through `let_types`. Direct C++ keeps
+        // the synthetic method self-contained and avoids polluting
+        // let_types with the synthetic name `self`.
+        self.pad(depth + 1);
+        write!(self.out, "int64_t _wdog_max_idle = (int64_t)(").ok();
+        if let Some(m) = &w.max_idle {
+            self.emit_expr(m);
+        } else {
+            write!(self.out, "{}", Self::WATCHDOG_DEFAULT_MAX_IDLE).ok();
+        }
+        writeln!(self.out, ");").ok();
+        self.pad(depth + 1);
+        writeln!(self.out,
+            "if (_wdog_max_idle > 0 \
+             && (int64_t)((uint64_t)cycle_count - self._last_in_cycle) >= _wdog_max_idle \
+             && (int64_t)((uint64_t)cycle_count - self._last_out_cycle) >= _wdog_max_idle) {{"
+        ).ok();
+        self.pad(depth + 2);
+        writeln!(self.out,
+            "sim_log_line(\"FAIL\", \"watchdog: {comp_ty} has been idle for >= %lld cycles\", \
+             (long long)_wdog_max_idle);"
+        ).ok();
+        self.pad(depth + 2);
+        writeln!(self.out, "errors++;").ok();
+        self.pad(depth + 1);
+        writeln!(self.out, "}}").ok();
+
+        // Post-hooks.
+        self.pad(depth + 1);
+        writeln!(self.out, "for (auto& _h : {comp_ty}_watchdog_post) _h();").ok();
+
+        // Restore state.
+        self.field_subs = prev_subs;
+        for k in added_pointer_fields { self.pointer_vars.remove(&k); }
+        self.pad(depth);
+        writeln!(self.out, "}};").ok();
+    }
+
+    /// Emit a periodic `_checkers` closure that calls `<Type>_watchdog(<inst>)`
+    /// every `period` cycles. Installed at every `let foo : Agent` site
+    /// (including sub-component composition). The closure re-reads
+    /// the period expression each cycle so per-test overrides via
+    /// field assignment work without re-installation.
+    fn emit_watchdog_checker(
+        &mut self,
+        c: &ComponentDecl,
+        w: &WatchdogDecl,
+        instance: &str,
+        depth: usize,
+    ) {
+        if w.disabled { return; }
+        let comp_ty = &c.name.name;
+        // The instance path may contain dots (`env.agent`); the static
+        // tag needs to be a valid C++ identifier, so flatten dots to
+        // underscores.
+        let inst_tag = instance.replace('.', "_");
+        // Field substitution: a period expression like `wdog_period`
+        // resolves to `<instance>.wdog_period` (parallels how field
+        // refs inside `on event(t)` bodies work at let-time).
+        let mut subs = std::collections::HashMap::new();
+        for ci in &c.items {
+            if let ComponentItem::Field(f) = ci {
+                subs.insert(f.name.name.clone(), format!("{instance}.{}", f.name.name));
+            }
+        }
+        let prev_subs = std::mem::replace(&mut self.field_subs, subs);
+
+        self.pad(depth);
+        writeln!(self.out, "_checkers.push_back([&]() {{").ok();
+        self.pad(depth + 1);
+        writeln!(self.out, "static int64_t _wdog_{inst_tag}_last = 0;").ok();
+        self.pad(depth + 1);
+        write!(self.out, "int64_t _wdog_{inst_tag}_period = (int64_t)(").ok();
+        if let Some(p) = &w.period {
+            self.emit_expr(p);
+        } else {
+            write!(self.out, "{}", Self::WATCHDOG_DEFAULT_PERIOD).ok();
+        }
+        writeln!(self.out, ");").ok();
+        self.pad(depth + 1);
+        writeln!(self.out,
+            "if (_wdog_{inst_tag}_period > 0 \
+             && (int64_t)cycle_count - _wdog_{inst_tag}_last >= _wdog_{inst_tag}_period) {{"
+        ).ok();
+        self.pad(depth + 2);
+        writeln!(self.out, "_wdog_{inst_tag}_last = (int64_t)cycle_count;").ok();
+        self.pad(depth + 2);
+        writeln!(self.out, "{comp_ty}_watchdog({instance});").ok();
+        self.pad(depth + 1);
+        writeln!(self.out, "}}").ok();
+        self.pad(depth);
+        writeln!(self.out, "}});").ok();
+
+        self.field_subs = prev_subs;
     }
 
     /// Emit a `driver` / `agent` / `env` / `sequencer` body as a C++
@@ -4754,6 +4977,15 @@ impl Emitter {
                     self.emit_subcomponent_handler_registrations(
                         &comp, &l.name.name, root_mode, depth,
                     );
+                    // Top-level watchdog (spec §8.6). Install a periodic
+                    // `_checkers` closure that fires `<Type>_watchdog(<inst>)`
+                    // every `period` cycles. Sub-component watchdogs are
+                    // installed by `emit_subcomponent_handler_registrations`.
+                    for ci in &comp.items {
+                        if let ComponentItem::Watchdog(w) = ci {
+                            self.emit_watchdog_checker(&comp, w, &l.name.name, depth);
+                        }
+                    }
                     // Top-level connect edges (the let's own component's
                     // connect block, if any). Nested sub-component
                     // connects are emitted inside the recursive helper
