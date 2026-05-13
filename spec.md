@@ -1222,6 +1222,55 @@ end component AxiDriver
 
 **Lowering — see §16** for the full ARCH and SV+UVM mapping.
 
+### 7.8 Activity tracking and idle predicates
+
+UVM's *objection mechanism* asks every component to vote on when the test is done. Components that forget to drop their objection hang the test; components that drop too eagerly truncate stimulus. The accounting is distributed across the test source, hidden behind macros, and only debuggable by tracing `set_drain_time` / `raise_objection` / `drop_objection` calls in execution order. HARC takes the opposite stance: instead of asking "has every component voted to stop?", it asks "has every component made progress recently?" — a positive predicate the framework can evaluate on demand.
+
+Every `transactor` / `agent` / `env` / `sequencer` / `scoreboard` carries two auto-injected fields:
+
+```
+_last_in_cycle  : uint<64>     // last cycle this component saw an "in" event
+_last_out_cycle : uint<64>     // last cycle this component drove an "out" event
+```
+
+Both default to 0 and are bumped automatically by the framework at every site where the language can attribute activity to a component instance:
+
+| Site | Bumps | Notes |
+|---|---|---|
+| `on <event_field>(arg) ... end on` body entry | `_last_in_cycle` | The component just received an event over its own field |
+| `on bus.<ch>.handshake(arg) ... end on` body entry | `_last_in_cycle` | Bound monitor observed a bus handshake |
+| Bound-driver actor pops its input queue | `_last_in_cycle` | The actor consumed a transaction |
+| `emit <event>(arg)` inside the component body | `_last_out_cycle` | The component published an event |
+| `bus.<ch>.send(args)` completes | `_last_out_cycle` | The component drove a bus handshake |
+| `bus.<ch>.recv()` completes | `_last_in_cycle` | The component captured a bus handshake |
+
+Raw DUT pin writes (`dut.sig = value`) are *not* tracked — they're below the framework's awareness. The user opts in by routing through `emit` or `bus.<ch>.send/recv`.
+
+**Idle predicates.** Every component-typed binding exposes three boolean predicates:
+
+```
+agent.idle(N)        // both: cycle_count - max(_last_in, _last_out) ≥ N
+agent.idle_in(N)     // input only: cycle_count - _last_in_cycle ≥ N
+agent.idle_out(N)    // output only: cycle_count - _last_out_cycle ≥ N
+```
+
+`N` is any integer expression (cycles). The predicates lower to plain arithmetic on the heartbeat fields — no allocations, no per-cycle bookkeeping cost. They compose with everything that takes a boolean (`if`, `assert`, `wait until`, `while`, etc.). The path before the predicate is any chain that resolves to a component-typed binding through the type system: `env.agent.idle(50)`, `top.scoreboard.idle_in(100)`, etc.
+
+**End-of-test convention.** The recommended termination idiom is positive:
+
+```
+wait until all of
+    env.agent.idle(100),
+    env.scoreboard.queue.is_empty()
+timeout 10000 cycles
+    fail("test did not quiesce within 10000 cycles")
+end wait
+```
+
+This says "wait until every interesting component has been idle for 100 cycles AND the scoreboard has drained, but fail with a clear message if that hasn't happened by cycle 10000". The diagnostic on timeout reports exactly which sub-predicate was false — no `objection.depth` tracing.
+
+`wait until` and the per-agent `watchdog` body that fires the idle check periodically are layered features on top of this foundation; see §7.9 and §8.6.
+
 ---
 
 ## 8. Testbench Architecture — Native Constructs

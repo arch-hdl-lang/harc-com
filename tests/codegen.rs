@@ -543,6 +543,294 @@ end impl T"#,
         "expected `errors++;` after standalone fail; got:\n{cpp}");
 }
 
+/// Every component struct (transactor/agent/env/scoreboard/sequencer)
+/// gets two auto-injected heartbeat fields — `_last_in_cycle` and
+/// `_last_out_cycle` — used by the built-in `idle(N)` / `idle_in(N)` /
+/// `idle_out(N)` predicates. These fields default to 0 and are bumped
+/// at every site the framework knows an in/out has just happened:
+/// `on <event>` handler body entry, `emit ev(arg)`, `bus.<ch>.send`,
+/// `bus.<ch>.recv`. This pins the lowering shape (spec §7.x).
+#[test]
+fn component_heartbeat_fields_and_bump_sites() {
+    let parsed = parse_source(
+        r#"transaction T
+    addr  : uint<8>
+    value : uint<32>
+end transaction T
+
+agent Producer
+    out : event<T>
+    in_ev : event<T>
+
+    on in_ev(t)
+        emit out(t)
+    end on
+end agent Producer
+
+test HeartbeatTest
+    let dut : DummyDut
+    let prod : Producer
+end test HeartbeatTest
+
+impl sim for HeartbeatTest
+    run
+        let stuck = prod.idle(50)
+        let stuck_in = prod.idle_in(10)
+        let stuck_out = prod.idle_out(20)
+        wait 1 cycle
+    end run
+end impl HeartbeatTest"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+
+    // 1. Heartbeat fields appear on the component struct.
+    assert!(cpp.contains("struct Producer {"),
+        "Producer struct should be emitted; got:\n{cpp}");
+    assert!(cpp.contains("uint64_t _last_in_cycle = 0;"),
+        "expected `_last_in_cycle` field on component; got:\n{cpp}");
+    assert!(cpp.contains("uint64_t _last_out_cycle = 0;"),
+        "expected `_last_out_cycle` field on component; got:\n{cpp}");
+
+    // 2. The `on in_ev(t)` handler body bumps `_last_in_cycle` at entry.
+    assert!(cpp.contains("prod._last_in_cycle = (uint64_t)cycle_count;"),
+        "on-handler body should bump _last_in_cycle on entry; got:\n{cpp}");
+
+    // 3. The `emit out(t)` inside the handler bumps `_last_out_cycle`.
+    assert!(cpp.contains("prod._last_out_cycle = (uint64_t)cycle_count;"),
+        "emit inside component body should bump _last_out_cycle; got:\n{cpp}");
+
+    // 4. `prod.idle(N)` lowers to a conjunction over both cycle deltas.
+    assert!(
+        cpp.contains("((uint64_t)cycle_count - prod._last_in_cycle) >= (uint64_t)(50))")
+            && cpp.contains("((uint64_t)cycle_count - prod._last_out_cycle) >= (uint64_t)(50))"),
+        "idle(N) should lower to (in_delta >= N) && (out_delta >= N); got:\n{cpp}",
+    );
+    // 5. `prod.idle_in(N)` lowers to in-delta only.
+    assert!(cpp.contains("((uint64_t)cycle_count - prod._last_in_cycle) >= (uint64_t)(10))"),
+        "idle_in(N) should lower to (in_delta >= N); got:\n{cpp}");
+    // 6. `prod.idle_out(N)` lowers to out-delta only.
+    assert!(cpp.contains("((uint64_t)cycle_count - prod._last_out_cycle) >= (uint64_t)(20))"),
+        "idle_out(N) should lower to (out_delta >= N); got:\n{cpp}");
+}
+
+/// `bus.<ch>.send` and `bus.<ch>.recv` inside a component body bump
+/// `_last_out_cycle` / `_last_in_cycle` respectively. Bus calls in
+/// free test-run code don't attribute to any component instance and
+/// emit no bump.
+#[test]
+fn bus_send_recv_bump_component_heartbeat() {
+    // Setup mirrors `axilite_seqdrv_test.harc` — a bound active
+    // transactor whose on-handler uses bus.send. The handshake spin
+    // loop ends with a bump to `_last_out_cycle` on the driver
+    // instance.
+    let parsed = parse_source(
+        r#"transaction RegOp
+    addr  : uint<8>
+    value : uint<32>
+end transaction RegOp
+
+bus BusLite
+    handshake_channel w: send kind: valid_ready
+        addr : uint<8>
+        data : uint<32>
+    end handshake_channel w
+end bus BusLite
+
+transactor SeqXactor bound to BusLite
+    dut : DummyDut
+
+    when active
+        req : in event<RegOp>
+        on req(t)
+            bus.w.send(t.addr, t.value)
+        end on
+    end when
+end transactor SeqXactor
+
+test BusHeartbeatTest
+    let dut : DummyDut
+    let axil : BusLite = bind dut
+    let drv : SeqXactor active = bind axil
+end test BusHeartbeatTest
+
+impl sim for BusHeartbeatTest
+    run
+        wait 1 cycle
+    end run
+end impl BusHeartbeatTest"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    // Bound-driver actor pops a transaction → bumps _last_in_cycle.
+    assert!(cpp.contains("drv._last_in_cycle = (uint64_t)cycle_count;"),
+        "bound-driver actor pop should bump _last_in_cycle; got:\n{cpp}");
+    // bus.w.send inside the actor body → bumps _last_out_cycle.
+    assert!(cpp.contains("drv._last_out_cycle = (uint64_t)cycle_count;"),
+        "bus.<ch>.send inside component body should bump _last_out_cycle; got:\n{cpp}");
+}
+
+/// A user-defined `hookable idle(n)` on a component or transactor
+/// wins over the built-in `idle(N)` predicate. The call lowers to
+/// `<Type>_idle(obj, n)` as a regular hookable dispatch, NOT to the
+/// boolean heartbeat-delta predicate. This is what lets pre-existing
+/// fixtures keep their custom `idle()` semantics (e.g.
+/// `buf_mgr_test.harc`'s `hookable idle(n)` that holds bus valids
+/// low for `n` cycles).
+#[test]
+fn user_hookable_idle_wins_over_builtin_predicate() {
+    let parsed = parse_source(
+        r#"transactor Xact
+    dut : DummyDut
+
+    hookable idle(n: uint<32>)
+        for _ in 0 .. n
+            wait 1 cycle
+        end for
+    end idle
+end transactor Xact
+
+test UserIdleTest
+    let dut : DummyDut
+    let xact : Xact passive
+end test UserIdleTest
+
+impl sim for UserIdleTest
+    run
+        xact.idle(4)
+    end run
+end impl UserIdleTest"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    // The call should dispatch to the user's hookable, NOT to the
+    // built-in heartbeat predicate.
+    assert!(cpp.contains("Xact_idle(xact, 4)"),
+        "user `hookable idle(n)` should be called via the standard dispatcher; got:\n{cpp}");
+    // Specifically, the call's lowering should NOT contain the
+    // built-in delta-comparison shape.
+    assert!(!cpp.contains("cycle_count - xact._last_in_cycle"),
+        "built-in predicate should NOT shadow user's `hookable idle`; got:\n{cpp}");
+}
+
+/// `idle()` predicate on a nested sub-component path (e.g.
+/// `env.drv.idle(N)`) walks the type chain to confirm the leaf is a
+/// component-typed binding. Mirrors `resolve_component_method_call`'s
+/// chain walk so the predicate works wherever method dispatch works.
+#[test]
+fn idle_predicate_resolves_through_nested_component_path() {
+    let parsed = parse_source(
+        r#"agent Worker
+    in_ev : event<int>
+end agent Worker
+
+env TopEnv
+    w : Worker
+end env TopEnv
+
+test NestedTest
+    let dut : DummyDut
+    let top : TopEnv
+end test NestedTest
+
+impl sim for NestedTest
+    run
+        let hung = top.w.idle(100)
+        wait 1 cycle
+    end run
+end impl NestedTest"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(cpp.contains("top.w._last_in_cycle") && cpp.contains("top.w._last_out_cycle"),
+        "nested idle() should walk through the env's field to the agent's heartbeat fields; got:\n{cpp}");
+}
+
+/// Smoke-sweep every fixture under `tests/fixtures/` through
+/// `cpp_tb::emit`. Fixtures missing a sibling `_sim.harc` half are
+/// auto-paired (e.g. `counter_test.harc` + `counter_test_sim.harc`);
+/// the rest go through `emit` standalone. Anything that emits without
+/// error must continue to emit without error after the heartbeat-
+/// foundation changes — this catches any case where the new bump
+/// sites accidentally reference an out-of-scope instance.
+///
+/// Failures are reported as a single aggregated panic at the end so
+/// one bad fixture doesn't mask issues in others.
+#[test]
+fn all_fixtures_emit_cleanly() {
+    let fixtures = std::path::Path::new("tests/fixtures");
+    let mut paths: Vec<_> = std::fs::read_dir(fixtures).unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("harc"))
+        .collect();
+    paths.sort();
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut emitted = 0usize;
+    for path in &paths {
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+        // Skip the `_sim.harc` halves — they're picked up via their
+        // sibling base file's merge.
+        if name.ends_with("_sim.harc") || name.ends_with("_domains.harc") {
+            continue;
+        }
+        let src = std::fs::read_to_string(path).unwrap();
+        let parsed = match parse_source(&src) {
+            Ok(p) => p,
+            Err(e) => {
+                failures.push(format!("[parse] {name}: {e:?}"));
+                continue;
+            }
+        };
+        // Try sibling sim half if present.
+        let sim_sibling = path.with_file_name(
+            format!("{}_sim.harc", name.trim_end_matches(".harc")),
+        );
+        let parsed_units = if sim_sibling.exists() {
+            let sim_src = std::fs::read_to_string(&sim_sibling).unwrap();
+            match parse_source(&sim_src) {
+                Ok(sim) => vec![parsed.clone(), sim],
+                Err(_) => vec![parsed.clone()],
+            }
+        } else {
+            vec![parsed.clone()]
+        };
+        let to_emit = match merge::merge_for_sim(&parsed_units, None) {
+            Ok(m) => m,
+            Err(_) => parsed.clone(),
+        };
+        match cpp_tb::emit(&to_emit) {
+            Ok(_) => emitted += 1,
+            // Fixtures that legitimately error (no test / no sim impl /
+            // missing DUT) are skipped silently — those error paths
+            // aren't part of what this sweep is checking.
+            Err(e) => {
+                let msg = e.0;
+                // Benign error classes — these fixtures depend on
+                // external declarations (`use BusAxiLite` brings in a
+                // sibling bus decl, multi-clock fixtures rely on a
+                // separate `domain` file) that aren't in scope when
+                // emitting the fixture standalone. They're not
+                // heartbeat-foundation regressions.
+                let benign = msg.contains("no `test` declaration")
+                    || msg.contains("let dut")
+                    || msg.contains("only non-sim impls")
+                    || msg.contains("no `impl sim`")
+                    || msg.contains("multiple tests")
+                    || msg.contains("is not a known bus binding")
+                    || msg.contains("no `domain") && msg.contains("declaration was found")
+                    || msg.contains("randomize(") && msg.contains("no `transaction");
+                if !benign {
+                    failures.push(format!("[emit] {name}: {msg}"));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(),
+        "fixture sweep: {} emitted, {} failed:\n{}",
+        emitted, failures.len(), failures.join("\n"));
+    // Sanity: at least a substantial fraction of fixtures should have
+    // gone through emit; otherwise the skip filter is too aggressive.
+    assert!(emitted >= 20,
+        "fixture sweep only emitted {emitted} files — skip filter too aggressive?");
+}
+
 /// Casts to non-Builtin types (struct, named) drop to identity at
 /// codegen time. The cast is purely a HARC-level type assertion;
 /// the C++ representation doesn't change.
