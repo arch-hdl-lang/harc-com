@@ -71,6 +71,9 @@ pub enum Item {
     CoverSequence(CoverSequenceDecl),
     ExternalModule(ExternalModuleDecl),
     Function(FunctionDecl),
+    /// `extern fn name(params) -> ret` — forward declaration of a
+    /// C / C++ reference function (spec §9). See `ExternFnDecl`.
+    ExternFn(ExternFnDecl),
     Apply(ApplyDecl),
     /// `bus Name { signals + handshake_channels }` — protocol-typed
     /// bundle of DUT signals. v0 carries flat signals + named
@@ -744,6 +747,31 @@ pub struct FunctionDecl {
     pub inner_doc: Option<String>,
 }
 
+/// `extern function name(params) -> ret` — forward-declares a function
+/// whose implementation lives in a separate C / C++ source file linked
+/// into the verilator-built TB (spec §9). The typical use is calling a
+/// reference model (CRC, AES, ISA simulator, etc.) from a scoreboard
+/// to compare against the DUT. No body — the parser ends the
+/// declaration at the return-type (or at the close-paren when the
+/// function returns void).
+///
+/// Codegen lowers each `extern function` to a single `extern "C"
+/// <ret> <name>(<params>);` forward declaration at file scope. The
+/// user provides the implementation in a `.c`/`.cpp` file passed via
+/// `harc sim --ref-src <file>` (repeatable). The C side sees plain
+/// scalar types (`uint64_t`, `int64_t`, `bool`); 65–128b parameters
+/// use `_harc_u128` (the runtime header's typedef for
+/// `unsigned __int128`) — the user includes `harc_thread_rt.h` or
+/// uses the underlying compiler extension type directly.
+#[derive(Debug, Clone)]
+pub struct ExternFnDecl {
+    pub name: Ident,
+    pub params: Vec<Param>,
+    pub return_ty: Option<TypeExpr>,
+    pub span: Span,
+    pub doc: Option<String>,
+}
+
 // ── Generic parameters / function parameters ──────────────────────────────────
 
 /// `name : type` (function-style) or `Name = expr` (named-arg style at call).
@@ -1284,6 +1312,7 @@ impl_construct_direct!(CoverSequenceDecl, "cover_sequence", +inner);
 impl_construct_direct!(BusDecl, "bus", +inner);
 impl_construct_direct!(ExternalModuleDecl, "module");
 impl_construct_direct!(FunctionDecl, "function", +inner);
+impl_construct_direct!(ExternFnDecl, "extern fn");
 
 // `agent` / `env` / `scoreboard` / `sequencer` share `ComponentDecl`;
 // the kind_label varies. Implemented manually so `kind` selects the
@@ -1420,6 +1449,7 @@ impl Item {
             Item::CoverSequence(c) => c,
             Item::ExternalModule(m) => m,
             Item::Function(f) => f,
+            Item::ExternFn(f) => f,
             Item::Apply(a) => a,
             Item::Bus(b) => b,
             Item::Transactor(t) => t,
