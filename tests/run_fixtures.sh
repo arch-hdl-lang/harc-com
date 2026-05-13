@@ -34,6 +34,7 @@ top_counter_test        | Top            | top_counter.sv         |
 heartbeat_idle_test     | Top            | top_counter.sv         |
 wait_until_quiesce_test | Top            | top_counter.sv         |
 watchdog_quiesce_test   | Top            | top_counter.sv         |
+env_quiesced_phase_test | Top            | top_counter.sv         |
 keep_constraints_test   | Top            | top_counter.sv         |
 fsm_counter_test        | FsmCounter     | fsm_counter.sv         |
 clk_div_counter_test    | ClkDivCounter  | clk_div_counter.sv clk_divider.sv |

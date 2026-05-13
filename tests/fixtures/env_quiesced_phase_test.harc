@@ -1,0 +1,75 @@
+// Env-level heartbeat aggregation and phase orchestration smoke test.
+// `top.quiesced(N)` expands to the `idle(N)` predicates of registered
+// nested components, and the `drain` phase reuses `wait until ... timeout`
+// diagnostics if a component prevents quiescence.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction TinyTxn
+    tag : uint<8>
+end transaction TinyTxn
+
+agent Producer
+    in_ev : event<TinyTxn>
+    seen  : uint<32> default 0
+
+    on in_ev(t)
+        seen = seen + 1
+    end on
+end agent Producer
+
+scoreboard DrainSb
+    expected : queue<uint<8>>
+end scoreboard DrainSb
+
+env HeartbeatEnv
+    prod : Producer
+    sb   : DrainSb
+end env HeartbeatEnv
+
+test EnvQuiescedPhaseTest
+    let dut : Top
+
+    clock clk = SysDomain
+
+    let top : HeartbeatEnv
+end test EnvQuiescedPhaseTest
+
+impl sim for EnvQuiescedPhaseTest
+    phase drain
+        wait until all of top.quiesced(8), top.prod.seen == 3
+            timeout 200 cycles fail("environment did not quiesce")
+    end phase drain
+
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        for i in 0 .. 3
+            let t : TinyTxn
+            t.tag = i
+            emit top.prod.in_ev(t)
+            top.sb.expected.push(t.tag)
+            wait 3 cycles
+        end for
+
+        while !top.sb.expected.empty()
+            let drained = top.sb.expected.pop()
+        end while
+
+        drain()
+    end run
+
+    check
+        assert top.prod.seen == 3
+            else fail("expected producer to see 3 transactions, got ${top.prod.seen}")
+        assert top.sb.expected.empty()
+            else fail("scoreboard queue did not drain")
+        log(info, "PASS: environment drain/check phases completed")
+    end check
+end impl EnvQuiescedPhaseTest
