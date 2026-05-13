@@ -249,6 +249,8 @@ pub enum TokenKind {
     When,
     #[token("hookable")]
     Hookable,
+    #[token("watchdog")]
+    Watchdog,
     #[token("pre")]
     Pre,
     #[token("post")]
@@ -576,6 +578,7 @@ impl fmt::Display for TokenKind {
             Extend => write!(f, "extend"),
             When => write!(f, "when"),
             Hookable => write!(f, "hookable"),
+            Watchdog => write!(f, "watchdog"),
             Pre => write!(f, "pre"),
             Post => write!(f, "post"),
             Apply => write!(f, "apply"),

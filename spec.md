@@ -1332,6 +1332,42 @@ Compare with UVM, where a hung test typically surfaces as a generic "Drain time 
 
 **Non-aborting on timeout.** A `timeout` failure logs `FAIL` and bumps the `errors` counter (same path as `assert … else fail(…)`), but does not abort the run. Execution continues past the `wait until` statement. Use `log(fatal, …)` after a critical-path timeout if you want abort-on-timeout semantics — the runtime treats `fatal` as immediate test-instance termination (§7.7).
 
+### 7.10 Periodic triggers — `on <N> cycles`
+
+`on <N> cycles … end on` fires its body once every `N` primary-clock cycles. The form is dual to `on <bool-expr> … end on` — same `on` keyword, the trailing `cycles`/`cycle` decoration tells the parser to interpret `<N>` as a period rather than a boolean predicate.
+
+```
+on 1000 cycles
+    log(info, "still running at cycle ${cycle_count}")
+end on
+
+on heartbeat_period cycles
+    sb.dump_pending()
+end on
+```
+
+`<N>` is any integer expression. It's re-read on every cycle, so per-test overrides via field assignment (`agent.heartbeat_period = 500`) take effect immediately without re-registering the handler.
+
+**Lowering.** Each periodic handler registers a `_checkers` closure with a per-handler `static int64_t _last` counter:
+
+```cpp
+_checkers.push_back([&]() {
+    static int64_t _<tag>_last = 0;
+    int64_t _<tag>_period = (int64_t)(<N>);
+    if (_<tag>_period > 0
+        && (int64_t)cycle_count - _<tag>_last >= _<tag>_period) {
+        _<tag>_last = (int64_t)cycle_count;
+        <body>
+    }
+});
+```
+
+The `_<tag>_period > 0` guard treats a misconfigured zero/negative period as a no-op (rather than spin-firing every cycle). The first firing happens at `cycle_count == N`, not at cycle 0 — "every N cycles" means "after N cycles of waiting", not "now + every N".
+
+**Performance.** A periodic handler costs the same as a level-mode `on <bool-expr>`: one integer comparison per cycle. This is the right primitive for low-frequency monitoring (heartbeats, watchdogs, periodic invariants) — a per-cycle level-mode handler would cost `1+(body cost)` per cycle; a periodic one costs `1 + (body cost / N)`.
+
+`on <N> cycles` is allowed wherever a regular `on` handler is allowed: test-scope (`scope sim/run`), component body, monitor body. Inside a component, the periodic handler's body sees the component's fields via the usual `<instance>.<field>` substitution.
+
 ---
 
 ## 8. Testbench Architecture — Native Constructs
@@ -1704,6 +1740,112 @@ end env Mixed
 ```
 
 The agent's value-add over a bare transactor is bundling reusable stimulus; the env's value-add over a flat test scope is multi-bus coordination. Both layers are optional but address different problems.
+
+### 8.6 `watchdog` — built-in idle monitor
+
+Every component supports an optional **`watchdog`** body item that periodically asserts the component has been making progress. Pairs with the heartbeat fields from §7.8 and the periodic-trigger primitive from §7.10 to give every agent in the testbench a one-line declarative liveness monitor — no boilerplate in the `run` body, no UVM-style objection accounting.
+
+```
+agent AxiDriver
+    in_ev : event<AxiTxn>
+    bus   : AxiBus
+
+    on in_ev(t)
+        bus.aw.send(t.addr, t.prot)
+        bus.w.send(t.data, t.strb)
+    end on
+
+    watchdog
+        period 1000 cycles
+        max_idle 10000 cycles
+        log(info, "[wdog ${cycle_count}] axi_driver alive")
+    end watchdog
+end agent AxiDriver
+```
+
+**Four surface forms:**
+
+1. **Implicit defaults** — `period 1000 cycles`, `max_idle 10000 cycles`, no extra body:
+   ```
+   watchdog
+   end watchdog
+   ```
+
+2. **Custom period / threshold**:
+   ```
+   watchdog
+       period 500 cycles
+       max_idle 5000 cycles
+   end watchdog
+   ```
+
+3. **With user body** (typically debug logging):
+   ```
+   watchdog
+       period 1000 cycles
+       max_idle 10000 cycles
+       log(info, "[wdog] seen=${seen} pending=${queue.size()}")
+   end watchdog
+   ```
+
+4. **Opt-out** — `watchdog disabled` suppresses all watchdog codegen for the component. Useful for soak tests / randomized stress where the watchdog would false-positive on legitimate long idles:
+   ```
+   watchdog disabled
+   ```
+
+**Per-test override.** Because `period` and `max_idle` accept any expression, including references to component fields, users can override the budget per-test by initializing a field at test scope:
+
+```
+agent Foo
+    wdog_period   : uint<32> default 1000
+    wdog_max_idle : uint<32> default 10000
+
+    watchdog
+        period wdog_period cycles
+        max_idle wdog_max_idle cycles
+    end watchdog
+end agent Foo
+
+# In one test:
+let foo : Foo
+foo.wdog_max_idle = 50000    # more permissive for this test
+
+# In another:
+let foo2 : Foo
+foo2.wdog_max_idle = 1000    # tighter
+```
+
+**Desugaring.** The compiler synthesizes two artifacts per non-disabled watchdog:
+
+1. A `<Type>_watchdog` method (parallels a `hookable` method, including pre/post hook vectors). Its body, in order:
+   - Pre-hook subscribers
+   - User body statements (with `self.<field>` substitution active)
+   - Idle check: `if both _last_in_cycle and _last_out_cycle are ≥ max_idle behind cycle_count then sim_log_line("FAIL", "watchdog: <Type> has been idle for ≥ N cycles"); errors++;`
+   - Post-hook subscribers
+2. A `_checkers` closure registered at every `let foo : <Type>` site (including sub-component composition) that calls `<Type>_watchdog(foo)` every `period` cycles.
+
+**Composition with hooks.** Because the synthesized method follows the same shape as a `hookable`, external aspects attach via the existing `on <Type>.watchdog pre/post` mechanism — same parser, same hook-vector mechanism (§7.3, §8.1):
+
+```
+# In a separate file or `extend test T`:
+on AxiDriver.watchdog pre
+    log(debug, "[wdog pre] entering")
+end on
+
+on AxiDriver.watchdog post
+    log(debug, "[wdog post] last_in=${last_in_cycle} last_out=${last_out_cycle}")
+end on
+```
+
+This lets a tracing/profiling layer instrument every agent's watchdog without modifying the agent definitions.
+
+**Diagnostic shape.** On firing, the watchdog logs:
+
+```
+[cycle:10000 FAIL] watchdog: AxiDriver has been idle for >= 5000 cycles
+```
+
+Combined with `wait until` per-predicate diagnostics (§7.9), a hung test surfaces with full attribution: which component, what threshold, exactly when. Compare with UVM's *"Drain time expired with N objections still raised"* and the multi-hour git-blame archaeology that follows it.
 
 ---
 
