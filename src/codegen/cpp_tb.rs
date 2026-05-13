@@ -1485,33 +1485,54 @@ impl Emitter {
             Some(to) => {
                 // Timed wait — open a brace block so the budget /
                 // start variables don't leak.
+                //
+                // Coroutine context uses the runtime's
+                // `wait_until_timeout` awaiter (one scheduler
+                // round-trip): the scheduler evaluates the predicate
+                // each cycle AND decrements a per-slot countdown,
+                // resuming the coroutine when EITHER pred fires OR
+                // the budget hits 0. The awaiter returns `true` for
+                // pred-fired, `false` for timed-out — drives the
+                // diagnostic emission below.
+                //
+                // Synchronous context (hookable body, etc.) has no
+                // coroutine to suspend, so it stays on the explicit
+                // polling loop (the only mechanism available there).
                 self.pad(depth);
                 writeln!(self.out, "{{").ok();
                 self.pad(depth + 1);
                 write!(self.out, "int64_t _wu_budget = (int64_t)(").ok();
                 self.emit_expr(&to.cycles);
                 writeln!(self.out, ");").ok();
-                self.pad(depth + 1);
-                writeln!(self.out, "int64_t _wu_start = (int64_t)cycle_count;").ok();
-                // Loop: while the cond is false and we still have budget,
-                // advance one cycle and retry.
-                self.pad(depth + 1);
-                write!(self.out, "while (!(").ok();
-                emit_overall_cond(self);
-                writeln!(self.out, ") && ((int64_t)cycle_count - _wu_start) < _wu_budget) {{").ok();
-                self.pad(depth + 2);
                 if self.in_coroutine {
-                    writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
+                    // Single co_await — runtime handles the wait + countdown.
+                    self.pad(depth + 1);
+                    write!(self.out, "bool _wu_satisfied = co_await harc_rt::wait_until_timeout(_slot, [&]{{ return ").ok();
+                    emit_overall_cond(self);
+                    writeln!(self.out, "; }}, (uint32_t)_wu_budget);").ok();
+                    self.pad(depth + 1);
+                    writeln!(self.out, "if (!_wu_satisfied) {{").ok();
                 } else {
+                    // Sync context: keep the explicit polling loop —
+                    // no scheduler to defer the wait to.
+                    self.pad(depth + 1);
+                    writeln!(self.out, "int64_t _wu_start = (int64_t)cycle_count;").ok();
+                    self.pad(depth + 1);
+                    write!(self.out, "while (!(").ok();
+                    emit_overall_cond(self);
+                    writeln!(self.out, ") && ((int64_t)cycle_count - _wu_start) < _wu_budget) {{").ok();
+                    self.pad(depth + 2);
                     writeln!(self.out, "tick();").ok();
+                    self.pad(depth + 1);
+                    writeln!(self.out, "}}").ok();
+                    // Final check: re-evaluate the predicate now that
+                    // the loop has ended (either pred fired or budget
+                    // expired).
+                    self.pad(depth + 1);
+                    write!(self.out, "if (!(").ok();
+                    emit_overall_cond(self);
+                    writeln!(self.out, ")) {{").ok();
                 }
-                self.pad(depth + 1);
-                writeln!(self.out, "}}").ok();
-                // Final check + diagnostic if timed out.
-                self.pad(depth + 1);
-                write!(self.out, "if (!(").ok();
-                emit_overall_cond(self);
-                writeln!(self.out, ")) {{").ok();
                 // Header line — user-supplied message or default.
                 let header = to.message.as_ref().and_then(|e| match &*e.kind {
                     ExprKind::String(s) => Some(s.clone()),

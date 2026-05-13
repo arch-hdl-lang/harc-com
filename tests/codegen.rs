@@ -769,10 +769,13 @@ end impl T"#,
 }
 
 /// `wait until all of <e1>, <e2> timeout N cycles fail("...")` lowers
-/// to a bounded polling loop with per-sub-predicate diagnostics on
-/// timeout. The diagnostic identifies each sub-predicate by its
-/// pretty-printed source text (so logs show `dut.ready` rather than
-/// a synthetic index).
+/// to a single `co_await harc_rt::wait_until_timeout(_slot, pred, N)`
+/// call in coroutine context (the runtime handles the per-cycle
+/// predicate evaluation and countdown internally — one scheduler
+/// round-trip instead of N). On timeout the awaiter returns false
+/// and the diagnostic block fires with per-sub-predicate breakdown.
+/// The diagnostic identifies each sub-predicate by its pretty-printed
+/// source text (so logs show `dut.ready` rather than a synthetic index).
 #[test]
 fn wait_until_all_of_with_timeout_emits_per_predicate_diagnostic() {
     let parsed = parse_source(
@@ -788,11 +791,22 @@ impl sim for T
 end impl T"#,
     ).unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
-    // Loop bounded by `_wu_budget` against `cycle_count`.
+    // Budget captured once into a local — same as before.
     assert!(cpp.contains("int64_t _wu_budget = (int64_t)(500);"),
         "expected `_wu_budget` initialized from the timeout expr; got:\n{cpp}");
-    assert!(cpp.contains("_wu_start = (int64_t)cycle_count;"),
-        "expected `_wu_start` snapshot from cycle_count; got:\n{cpp}");
+    // The optimization: a single co_await of wait_until_timeout
+    // instead of a per-cycle co_await wait_cycles(1) polling loop.
+    assert!(cpp.contains("co_await harc_rt::wait_until_timeout(_slot,")
+            && cpp.contains("(uint32_t)_wu_budget);"),
+        "expected single `co_await wait_until_timeout(_slot, pred, _wu_budget)`; got:\n{cpp}");
+    assert!(cpp.contains("if (!_wu_satisfied) {"),
+        "expected `if (!_wu_satisfied)` guard around the diagnostic; got:\n{cpp}");
+    // No more per-cycle co_await wait_cycles(_slot, 1) in this lowering.
+    // (Other wait_cycles calls — from `wait N cycles` elsewhere — may
+    // appear, but inside the wait-until-timeout's brace block we don't
+    // expect one. We assert the runtime helper is the only suspension.)
+    assert!(!cpp.contains("if (!_wu_satisfied) {\n        co_await harc_rt::wait_cycles"),
+        "wait_until_timeout should not be followed by a per-cycle polling loop; got:\n{cpp}");
     // Per-sub-predicate breakdown: one line per condition still false.
     assert!(cpp.contains("not yet true: dut.ready"),
         "expected per-predicate diagnostic mentioning `dut.ready`; got:\n{cpp}");
@@ -832,6 +846,48 @@ end impl T"#,
     // Diagnostic lists every sub-predicate (none fired).
     assert!(cpp.contains("none of: dut.error, dut.done"),
         "expected `none of:` listing every sub-predicate; got:\n{cpp}");
+}
+
+/// `wait until <cond> timeout N cycles fail("…")` inside a *sync*
+/// context (hookable body, free function) keeps the explicit polling
+/// loop — `wait_until_timeout` is a coroutine awaiter and can't be
+/// used here. The optimization to a single co_await applies only in
+/// coroutine context (test-run body, bound-driver actor body, etc.).
+#[test]
+fn wait_until_with_timeout_in_sync_context_keeps_polling_loop() {
+    let parsed = parse_source(
+        r#"transactor X
+    dut : DummyDut
+    hookable wait_for_ready_bounded()
+        wait until dut.ready timeout 100 cycles fail("ready never asserted")
+    end wait_for_ready_bounded
+end transactor X
+
+test T
+    let dut : DummyDut
+    let xact : X passive
+end test T
+
+impl sim for T
+    run
+        xact.wait_for_ready_bounded()
+    end run
+end impl T"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    // Sync context: while-loop with tick() body.
+    assert!(cpp.contains("_wu_start = (int64_t)cycle_count;")
+            && cpp.contains("- _wu_start) < _wu_budget) {"),
+        "sync timed wait-until should keep the explicit polling loop; got:\n{cpp}");
+    assert!(cpp.contains(") tick();") || cpp.contains("tick();\n            }"),
+        "sync timed wait-until should call tick() each cycle; got:\n{cpp}");
+    // The coroutine awaiter must NOT be used here (it would suspend
+    // a non-coroutine, which the C++ compiler would reject).
+    assert!(!cpp.contains("co_await harc_rt::wait_until_timeout"),
+        "sync timed wait-until should not use the coroutine awaiter; got:\n{cpp}");
+    // The user-supplied fail message still threads through.
+    assert!(cpp.contains("ready never asserted"),
+        "user fail message should still appear in sync diagnostic; got:\n{cpp}");
 }
 
 /// `wait until <expr>` with no timeout still works inside a sync
