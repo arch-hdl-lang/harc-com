@@ -18,10 +18,11 @@ if [ ! -x "$HARC" ]; then
     cargo build --release --bin harc
 fi
 
-# Each row: <test_name> <top_module> <sv_files> <extra_harc_files>
+# Each row: <test_name> <top_module> <sv_files> <extra_harc_files> <ref_src> <test_struct>
 # Fields are pipe-separated. SV files are relative to DUT_DIR; HARC files
 # are relative to FIX_DIR. Multiple files within a field are space-
-# separated.
+# separated. The 6th field (test_struct) is passed via `--test` when the
+# loaded harc files declare more than one test struct.
 read -r -d '' FIXTURES <<'EOF' || true
 rom_lut_test            | RomLut         | rom_lut.sv             |
 bus_arbiter_test        | BusArbiter     | bus_arbiter.sv         |
@@ -58,6 +59,7 @@ axilite_bus_send_test   | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_bound_mon_test  | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_multi_payload_test | AxiLiteRegs | AxiLiteRegs.sv         |
 axilite_regs_full_test  | AxiLiteRegs    | AxiLiteRegs.sv         |
+axilite_constraint_test | AxiLiteRegs    | AxiLiteRegs.sv         | axilite_regs_test.harc axilite_constraint_test_sim.harc | | AxiLiteConstraintTest
 transactor_parse_test   | AxiLiteRegs    | AxiLiteRegs.sv         |
 transactor_active_test  | AxiLiteRegs    | AxiLiteRegs.sv         |
 transactor_passive_only_test | AxiLiteRegs | AxiLiteRegs.sv        |
@@ -91,12 +93,13 @@ run_one() {
     # Optional 5th field: space-separated C/C++ reference-model source
     # files relative to DUT_DIR, passed via `--ref-src`. Used by
     # `extern function` tests (spec §9).
-    IFS='|' read -r test top sv extras ref_src <<<"$row"
+    IFS='|' read -r test top sv extras ref_src test_struct <<<"$row"
     test="$(echo "$test" | xargs)"
     top="$(echo "$top" | xargs)"
     sv="$(echo "$sv" | xargs)"
     extras="$(echo "$extras" | xargs || true)"
     ref_src="$(echo "$ref_src" | xargs || true)"
+    test_struct="$(echo "$test_struct" | xargs || true)"
     [ -z "$test" ] && return 0
 
     local sv_args=()
@@ -108,11 +111,14 @@ run_one() {
     local harc_files=("$FIX_DIR/$test.harc")
     for f in $extras; do harc_files+=("$FIX_DIR/$f"); done
 
+    local test_args=()
+    [ -n "$test_struct" ] && test_args=("--test" "$test_struct")
+
     rm -rf harc_sim_build
     local out
     # `${ref_args[@]:-}` tolerates an empty array under `set -u` (most
     # fixtures don't pass any --ref-src).
-    out="$("$HARC" sim "${sv_args[@]}" ${ref_args[@]:+"${ref_args[@]}"} "${harc_files[@]}" --top "$top" 2>&1)" || true
+    out="$("$HARC" sim "${sv_args[@]}" ${ref_args[@]:+"${ref_args[@]}"} "${harc_files[@]}" --top "$top" ${test_args[@]:+"${test_args[@]}"} 2>&1)" || true
 
     if echo "$out" | grep -q "ALL TESTS PASSED"; then
         echo "  PASS  $test"
