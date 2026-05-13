@@ -220,11 +220,16 @@ struct HarcThread {
 };
 
 // State a suspended slot is parked on.
-//   Ready       — not currently suspended; will run on next tick().
-//   WaitUntil   — resume when pred() returns true at a posedge.
-//   WaitCycles  — resume after `cycles_remaining` posedges.
-//   Done        — coroutine finished.
-enum class WaitKind : uint8_t { Ready, WaitUntil, WaitCycles, Done };
+//   Ready            — not currently suspended; will run on next tick().
+//   WaitUntil        — resume when pred() returns true at a posedge.
+//   WaitUntilTimeout — same as WaitUntil but with a per-slot cycle
+//                      countdown; resume when EITHER pred() becomes
+//                      true OR cycles_remaining hits 0. The `timed_out`
+//                      flag distinguishes the two resume reasons for
+//                      the awaiter's return value.
+//   WaitCycles       — resume after `cycles_remaining` posedges.
+//   Done             — coroutine finished.
+enum class WaitKind : uint8_t { Ready, WaitUntil, WaitUntilTimeout, WaitCycles, Done };
 
 // One scheduled coroutine. The scheduler owns these; awaiters mutate
 // the fields when a coroutine suspends.
@@ -232,7 +237,13 @@ struct ThreadSlot {
     HarcThread thread;
     WaitKind   kind = WaitKind::Ready;
     uint32_t   cycles_remaining = 0;
-    std::function<bool()> pred;  // for WaitUntil
+    std::function<bool()> pred;  // for WaitUntil + WaitUntilTimeout
+    /// Set by the scheduler when a `WaitUntilTimeout` slot resumes
+    /// because the cycle budget hit 0 (predicate never became true).
+    /// `false` when the slot resumes because `pred()` fired first.
+    /// Read by `WaitUntilTimeoutAwaiter::await_resume` to return the
+    /// "satisfied?" boolean to the coroutine.
+    bool timed_out = false;
 };
 
 // Awaiter: `co_await wait_until(slot, pred)`. The predicate is captured
@@ -267,6 +278,50 @@ struct WaitCyclesAwaiter {
         slot->cycles_remaining = n;
     }
     void await_resume() noexcept {}
+};
+
+// Awaiter: `co_await wait_until_timeout(slot, pred, max_cycles)`.
+//
+// Replaces the codegen's previous polling-loop shape
+// (`while (!cond) { co_await wait_cycles(_slot, 1); }`) for timed
+// `wait until <expr> timeout N cycles fail("…")` (spec §7.9). One
+// scheduler round-trip instead of N: the scheduler evaluates `pred`
+// each tick (same path as plain WaitUntil) and additionally decrements
+// `cycles_remaining`. Resumes when EITHER pred fires OR the countdown
+// hits zero; `await_resume()` returns `true` for the former,
+// `false` for the latter.
+//
+// Short-circuit when pred is already true at entry: `await_ready`
+// returns true and the coroutine never suspends — matches the
+// existing polling-loop semantics where `pred-true-at-entry` doesn't
+// wait. The `ready_satisfied` flag is per-awaiter (lives in the
+// coroutine frame), not on the slot, so multiple in-flight
+// `wait_until_timeout` calls in the same coroutine don't interfere.
+struct WaitUntilTimeoutAwaiter {
+    std::function<bool()> pred;
+    ThreadSlot* slot;
+    uint32_t max_cycles;
+    bool ready_satisfied = false;
+
+    bool await_ready() noexcept {
+        if (pred && pred()) { ready_satisfied = true; return true; }
+        // N == 0 + pred false: also short-circuit (immediate timeout).
+        // Same semantics as the existing polling-loop's
+        // `(cycle_count - start) < 0` guard skipping the loop body.
+        if (max_cycles == 0) { ready_satisfied = false; return true; }
+        return false;
+    }
+    void await_suspend(std::coroutine_handle<>) noexcept {
+        slot->kind = WaitKind::WaitUntilTimeout;
+        slot->pred = std::move(pred);
+        slot->cycles_remaining = max_cycles;
+        slot->timed_out = false;
+    }
+    bool await_resume() noexcept {
+        // Short-circuit path: ready_satisfied was set by await_ready.
+        // Suspend path: scheduler set slot->timed_out.
+        return ready_satisfied || !slot->timed_out;
+    }
 };
 
 // Scheduler: one per test. Owns slot pointers; the slot lifetime is
@@ -311,11 +366,33 @@ struct ThreadScheduler {
                 if (s->cycles_remaining == 0) s->kind = WaitKind::Ready;
             } else if (s->kind == WaitKind::WaitUntil) {
                 if (s->pred && s->pred()) s->kind = WaitKind::Ready;
+            } else if (s->kind == WaitKind::WaitUntilTimeout) {
+                // Pred-first: if it fires this cycle, that takes
+                // priority over a coincident countdown hit (the user
+                // asked "did the condition hold within N cycles?";
+                // having it hold at cycle N exactly counts as yes).
+                if (s->pred && s->pred()) {
+                    s->kind = WaitKind::Ready;
+                    s->timed_out = false;
+                } else if (s->cycles_remaining > 0) {
+                    --s->cycles_remaining;
+                    if (s->cycles_remaining == 0) {
+                        s->kind = WaitKind::Ready;
+                        s->timed_out = true;
+                    }
+                } else {
+                    // cycles_remaining was 0 at entry and pred didn't
+                    // fire — defensive; the awaiter's await_ready
+                    // short-circuits this case so we shouldn't reach
+                    // here in practice.
+                    s->kind = WaitKind::Ready;
+                    s->timed_out = true;
+                }
             }
         }
         // Pass 2 (fixed point): resume Ready slots, then re-check
-        // remaining WaitUntil preds (a resumed slot may have changed
-        // signal state another slot is waiting on).
+        // remaining WaitUntil/WaitUntilTimeout preds (a resumed slot
+        // may have changed signal state another slot is waiting on).
         bool changed = true;
         while (changed) {
             changed = false;
@@ -334,6 +411,15 @@ struct ThreadScheduler {
                         changed = true;
                     }
                 }
+                if (!resumed[i] && slots[i]->kind == WaitKind::WaitUntilTimeout) {
+                    // Same priority rule as Pass 1: pred-true wins
+                    // over a coincident timeout.
+                    if (slots[i]->pred && slots[i]->pred()) {
+                        slots[i]->kind = WaitKind::Ready;
+                        slots[i]->timed_out = false;
+                        changed = true;
+                    }
+                }
             }
         }
     }
@@ -348,6 +434,9 @@ struct ThreadScheduler {
 // the awaiter can write its suspend state.
 inline WaitUntilAwaiter  wait_until (ThreadSlot* s, std::function<bool()> p) { return {std::move(p), s}; }
 inline WaitCyclesAwaiter wait_cycles(ThreadSlot* s, uint32_t n)              { return {n, s}; }
+inline WaitUntilTimeoutAwaiter wait_until_timeout(
+    ThreadSlot* s, std::function<bool()> p, uint32_t n
+) { return {std::move(p), s, n, /*ready_satisfied=*/false}; }
 
 // ─── Multi-OS-thread support (Phase 3a) ───────────────────────────────
 //
