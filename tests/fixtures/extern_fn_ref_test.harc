@@ -1,0 +1,74 @@
+// End-to-end demo of `extern function` (spec §9): call a C reference
+// model from a HARC test and compare its output against an in-HARC
+// computation. The DUT (Top counter) is incidental — what's being
+// exercised is the calling convention between the emitted TB and a
+// user-supplied `.cpp` linked in via `--ref-src`.
+//
+// Run with:
+//     harc sim --sv tests/dut/top_counter.sv \
+//              --ref-src tests/dut/extern_fn_ref.cpp \
+//              tests/fixtures/extern_fn_ref_test.harc \
+//              --top Top
+//
+// The C side declares (in `tests/dut/extern_fn_ref.cpp`):
+//     extern "C" uint64_t ref_crc8_step(uint64_t crc, uint64_t byte);
+//
+// HARC's codegen emits a matching forward declaration at file scope
+// inside `extern "C" { ... }` so the linker resolves the symbol.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+// Forward declaration of the C reference function. The compiler emits
+// `extern "C" uint64_t ref_crc8_step(uint64_t, uint64_t);` at file
+// scope. The implementation is in tests/dut/extern_fn_ref.cpp.
+extern function ref_crc8_step(crc: uint<8>, byte: uint<8>) -> uint<8>
+
+// Plain HARC function — same CRC-8 polynomial (0x07, CCITT), no
+// reflection. Acts as the "DUT" side for this fixture: we compute the
+// same CRC two ways and compare. In a real testbench the HARC side
+// would read from the actual DUT pins; here we keep it self-contained
+// so the fixture passes regardless of what `Top` does.
+function harc_crc8_step(crc: uint<8>, byte: uint<8>) -> uint<8>
+    let x = crc ^ byte
+    for _ in 0 .. 8
+        if (x & 0x80) != 0
+            x = ((x << 1) ^ 0x07) & 0xFF
+        else
+            x = (x << 1) & 0xFF
+        end if
+    end for
+    return x
+end function harc_crc8_step
+
+test ExternFnRefTest
+    let dut : Top
+
+    clock clk = SysDomain
+end test ExternFnRefTest
+
+impl sim for ExternFnRefTest
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Run 16 bytes through both implementations and compare.
+        // The C reference is the source of truth; mismatches would
+        // surface immediately and identify the diverging byte.
+        let crc_ref = 0xFF
+        let crc_harc = 0xFF
+        for i in 0 .. 16
+            let b = (i * 17 + 42) & 0xFF
+            crc_ref = ref_crc8_step(crc_ref, b)
+            crc_harc = harc_crc8_step(crc_harc, b)
+            assert crc_ref == crc_harc
+                else fail("byte ${i}: ref=0x${crc_ref:02x} harc=0x${crc_harc:02x}")
+        end for
+
+        log(info, "PASS: 16-byte CRC-8 round-trip matched C reference; final=0x${crc_ref:02x}")
+    end run
+end impl ExternFnRefTest

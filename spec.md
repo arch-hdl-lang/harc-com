@@ -1897,7 +1897,69 @@ Combined with `wait until` per-predicate diagnostics (§7.9), a hung test surfac
 
 ## 9. Reference Models and Co-simulation
 
-ARCH already supports C function bodies behind fixed-latency pipes (per April-15). HARC inherits this for reference models:
+The verification idiom is *"compare DUT output against a known-good reference"*. HARC ships two layers:
+
+### 9.1 `extern function` — call a C / C++ reference function
+
+The minimal primitive: forward-declare a C-linkage function whose implementation lives in a separate source file linked into the verilator-built TB. The HARC side calls it like any other function.
+
+```
+extern function ref_crc8_step(crc: uint<8>, byte: uint<8>) -> uint<8>
+extern function ref_aes_block(key: bits<128>, pt: bits<128>) -> bits<128>
+extern function ref_dump_state(cycle: uint<64>)
+```
+
+No body, no `end function` — the declaration terminates after the return type (or after the close-paren when the function returns void).
+
+**Usage in a scoreboard:**
+
+```
+scoreboard AesSb
+    expected : queue<bits<128>>
+
+    on env.agent.monitor.input(t)
+        expected.push(ref_aes_block(t.key, t.plaintext))
+    end on
+
+    on env.agent.monitor.output(ct)
+        let exp = expected.pop()
+        assert ct == exp
+            else fail("AES mismatch: ref=0x${exp:032x} dut=0x${ct:032x}")
+    end on
+end scoreboard AesSb
+```
+
+**Invocation:** the user provides the C/C++ source separately and passes it via `--ref-src <file>` (repeatable):
+
+```
+harc sim --sv aes_core.sv --ref-src aes_ref.cpp my_test.harc --top aes_core
+```
+
+**Lowering.** HARC codegen emits, at file scope of the generated TB:
+
+```cpp
+extern "C" {
+    uint64_t ref_crc8_step(uint64_t crc, uint64_t byte);
+    _harc_u128 ref_aes_block(_harc_u128 key, _harc_u128 pt);
+    void ref_dump_state(uint64_t cycle);
+}
+```
+
+The user's `.c`/`.cpp` file provides matching definitions:
+
+```cpp
+extern "C" uint64_t ref_crc8_step(uint64_t crc, uint64_t byte) { /* ... */ }
+```
+
+**FFI calling convention.** HARC widens every narrow integer to `uint64_t` / `int64_t` at the FFI boundary (matches the rest of the codegen — the C side only ever sees standard scalar types). 65–128b parameters use `_harc_u128`, the runtime header's typedef for `unsigned __int128`. Wider-than-128b types aren't supported across the boundary in v0; callers should slice into 128b chunks themselves.
+
+**Verilator integration.** Each `--ref-src` file is appended to the verilator invocation alongside the emitted TB `.cpp`. They compile + link with the same flags. The `extern "C"` wrapper ensures C-linkage even when the source file is a `.cpp` and the user forgets their own `extern "C"`.
+
+**Determinism.** `extern function` calls are fully synchronous — they run inline at the call site, not deferred to a solver pool or off-cycle queue. The user's C function must itself be deterministic for the test to be reproducible (no `time()` seeding, no static state across calls unless explicitly intended).
+
+### 9.2 `ref module` — whole-component reference modeling *(future)*
+
+A heavier alternative for modeling a whole pipelined component as a reference. The user declares a `ref module` whose ports mirror the DUT's bus, and the framework auto-wires it to a scoreboard so DUT and ref are driven by the same stimulus and compared cycle-by-cycle.
 
 ```
 ref module AxiRefMem#(SIZE: int)
@@ -1909,9 +1971,9 @@ ref module AxiRefMem#(SIZE: int)
 end ref module AxiRefMem
 ```
 
-A `ref module` is a module whose body is functional (C function or pure ARCH). The scoreboard compares DUT output against `ref` output without DPI ceremony — the typed channel does the marshaling.
+Not implemented in v0. Most reference-model use cases are well-served by `extern function` (a single function call per transaction), so `ref module` is deferred until someone hits the boilerplate threshold where the auto-wiring pays for itself — typically when modeling a pipelined component whose state evolves across multiple transactions (an ISA simulator, a cache hierarchy, etc.).
 
-ISA-spec embedding: a Sail model compiles to a `ref module` via the C-emulator path (per April-21 thread), giving spec-driven reference models for free.
+ISA-spec embedding: a Sail model compiles to a C library, exposed to HARC today via one or more `extern function` declarations. A future `ref module` would layer auto-bus-wiring on top of the same primitive.
 
 ---
 

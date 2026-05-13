@@ -98,6 +98,15 @@ enum Cmd {
         /// the TB. Off by default (small compile/runtime cost).
         #[arg(long)]
         coverage: bool,
+        /// Reference-model C / C++ source file(s) — implementations
+        /// for `extern function` declarations (spec §9). Repeatable.
+        /// Each file is passed verbatim to the verilator invocation
+        /// alongside the emitted TB `.cpp`, so the linker resolves
+        /// `extern "C"` forward declarations against them. Typical
+        /// use: a one-file reference model (CRC, AES, ISA simulator)
+        /// the scoreboard calls to compute expected outputs.
+        #[arg(long)]
+        ref_src: Vec<PathBuf>,
     },
     // ── Learning store (sister to `arch advise` and friends, port of
     // arch-com/src/learn.rs). Every `harc check` / `harc sim` records
@@ -173,11 +182,11 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Check { files, ast } => learn_wrap(&files, || cmd_check(files.clone(), ast)),
         Cmd::Fmt { file, write } => cmd_fmt(file, write),
-        Cmd::Sim { files, dut, sv, top, test, outdir, seed, emit_only, arch_bin, mt, coverage } => {
+        Cmd::Sim { files, dut, sv, top, test, outdir, seed, emit_only, arch_bin, mt, coverage, ref_src } => {
             let captured = files.clone();
             learn_wrap(&captured, || cmd_sim(
                 files.clone(), dut.clone(), sv.clone(), top.clone(), test.clone(),
-                outdir.clone(), seed, emit_only, arch_bin.clone(), mt, coverage,
+                outdir.clone(), seed, emit_only, arch_bin.clone(), mt, coverage, ref_src.clone(),
             ))
         }
         Cmd::Advise { query, top, from_stderr, feature } =>
@@ -549,6 +558,7 @@ fn run_verilator(
     sim_log_path: &PathBuf,
     seed: Option<u64>,
     coverage: bool,
+    ref_src: &[PathBuf],
 ) -> Result<()> {
     let mdir = outdir_abs.join("obj_dir");
     let _ = fs::remove_dir_all(&mdir); // start clean — stale .o's bite us
@@ -669,6 +679,15 @@ fn run_verilator(
     for s in sv {
         args.push(s.display().to_string());
     }
+    // Reference-model sources (spec §9 `extern function`). Passed
+    // verbatim to verilator alongside the emitted TB so the C linker
+    // can resolve `extern "C"` forward declarations. Verilator's
+    // `--cc --exe --build` flow accepts arbitrary `.c` / `.cpp` files
+    // on the command line — they compile + link with the same flags
+    // as the TB.
+    for r in ref_src {
+        args.push(r.display().to_string());
+    }
     args.push(cpp.display().to_string());
 
     let build_log_path = outdir_abs.join("build.log");
@@ -726,6 +745,7 @@ fn cmd_sim(
     arch_bin: Option<PathBuf>,
     mt: bool,
     coverage: bool,
+    ref_src: Vec<PathBuf>,
 ) -> Result<()> {
     if dut.is_empty() && sv.is_empty() {
         return Err(miette::miette!("pass either --dut <file.arch> or --sv <file.sv>"));
@@ -790,7 +810,15 @@ fn cmd_sim(
         for s in &sv {
             sv_abs.push(fs::canonicalize(s).into_diagnostic()?);
         }
-        return run_verilator(&top_name, &sv_abs, &cpp_abs, &outdir_abs, &sim_log_path, seed, coverage);
+        // Canonicalize ref-src paths so verilator (running in obj_dir/)
+        // can still find them. Missing files surface as a clear
+        // canonicalize error before the verilator command runs,
+        // which beats a "no such file" deep in the build log.
+        let mut ref_src_abs = Vec::with_capacity(ref_src.len());
+        for r in &ref_src {
+            ref_src_abs.push(fs::canonicalize(r).into_diagnostic()?);
+        }
+        return run_verilator(&top_name, &sv_abs, &cpp_abs, &outdir_abs, &sim_log_path, seed, coverage, &ref_src_abs);
     }
 
     // ARCH path: run `arch sim <dut...> --tb <cpp_path>`.

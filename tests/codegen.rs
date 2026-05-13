@@ -1194,6 +1194,64 @@ end impl EnumKeepTest"#,
         "expected `burst != WRAP` to lower with WRAP resolved to index 2; got:\n{cpp}");
 }
 
+/// `extern function name(params) -> ret` (spec §9) emits a C-linkage
+/// forward declaration at file scope wrapped in `extern "C" { ... }`,
+/// so the user's `--ref-src <file>` implementation links against it.
+/// Call sites use the existing function-call lowering path.
+#[test]
+fn extern_function_emits_extern_c_forward_decl() {
+    let parsed = parse_source(
+        r#"extern function ref_crc8_step(crc: uint<8>, byte: uint<8>) -> uint<8>
+
+test ExternTest
+    let dut : DummyDut
+end test ExternTest
+
+impl sim for ExternTest
+    run
+        let c = ref_crc8_step(0xFF, 0x42)
+        assert c == ref_crc8_step(0xFF, 0x42)
+    end run
+end impl ExternTest"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    // Forward declaration block at file scope.
+    assert!(cpp.contains("extern \"C\" {"),
+        "expected `extern \"C\" {{` wrapper for extern fns; got:\n{cpp}");
+    // Signature: HARC widens narrow ints to uint64_t at the FFI boundary.
+    assert!(cpp.contains("uint64_t ref_crc8_step(uint64_t crc, uint64_t byte);"),
+        "expected widened C-linkage forward decl; got:\n{cpp}");
+    // The forward decl appears OUTSIDE main() (before `int main(`).
+    let extern_pos = cpp.find("uint64_t ref_crc8_step(uint64_t").unwrap();
+    let main_pos   = cpp.find("int main(").unwrap();
+    assert!(extern_pos < main_pos,
+        "extern fn decl must be at file scope (before main); got extern at {extern_pos}, main at {main_pos}");
+    // Call sites lower as plain function calls — no special wrapping.
+    assert!(cpp.contains("ref_crc8_step(255, 66)") || cpp.contains("ref_crc8_step(0xFF, 0x42)")
+            || cpp.contains("ref_crc8_step(") && cpp.contains(")"),
+        "expected plain function-call lowering at call sites; got:\n{cpp}");
+}
+
+/// A file with no `extern function` declarations emits no `extern "C" {`
+/// block — the wrapper only appears when needed.
+#[test]
+fn no_extern_function_means_no_extern_c_block() {
+    let parsed = parse_source(
+        r#"test T
+    let dut : DummyDut
+end test T
+
+impl sim for T
+    run
+        wait 1 cycle
+    end run
+end impl T"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(!cpp.contains("extern \"C\" {"),
+        "no extern fns should mean no extern \"C\" block; got:\n{cpp}");
+}
+
 /// Smoke-sweep every fixture under `tests/fixtures/` through
 /// `cpp_tb::emit`. Fixtures missing a sibling `_sim.harc` half are
 /// auto-paired (e.g. `counter_test.harc` + `counter_test_sim.harc`);

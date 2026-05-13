@@ -363,6 +363,17 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
             pad(out, depth);
             writeln!(out, "end function {}", f.name.name).ok();
         }
+        Item::ExternFn(f) => {
+            print_doc(out, &f.doc, depth);
+            pad(out, depth);
+            write!(out, "extern function {}", f.name.name).ok();
+            print_paren_params(out, &f.params);
+            if let Some(rt) = &f.return_ty {
+                write!(out, " -> ").ok();
+                print_type(out, rt);
+            }
+            writeln!(out).ok();
+        }
         Item::Apply(a) => {
             pad(out, depth);
             write!(out, "apply ").ok();
