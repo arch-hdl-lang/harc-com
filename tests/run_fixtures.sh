@@ -32,6 +32,7 @@ single_port_ram_test    | SimpleMem      | single_port_ram.sv     |
 int_regs_test           | IntRegs        | int_regs.sv            |
 top_counter_test        | Top            | top_counter.sv         |
 heartbeat_idle_test     | Top            | top_counter.sv         |
+wait_until_quiesce_test | Top            | top_counter.sv         |
 fsm_counter_test        | FsmCounter     | fsm_counter.sv         |
 clk_div_counter_test    | ClkDivCounter  | clk_div_counter.sv clk_divider.sv |
 synchronizer_basic_test | FlagSync       | synchronizer_basic.sv  | async_fifo_domains.harc
