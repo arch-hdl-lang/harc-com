@@ -1317,22 +1317,37 @@ timeout 10000 cycles
 
 (The block-style multi-line form is just the same comma-separated list with newlines between items; the parser is whitespace-insensitive between commas and `timeout`.)
 
-**Lowering.** Without `timeout`, `wait until <cond>` lowers to `co_await harc_rt::wait_until(_slot, [&]{ return <cond>; });` in coroutine context (efficient: the scheduler evaluates the predicate once per cycle) and to `while (!<cond>) tick();` in synchronous contexts (hookable bodies, free functions). With `timeout`, both contexts use a bounded polling loop measured against the global `cycle_count`:
+**Lowering.** Without `timeout`, `wait until <cond>` lowers to `co_await harc_rt::wait_until(_slot, [&]{ return <cond>; });` in coroutine context (efficient: the scheduler evaluates the predicate once per cycle and only resumes when true) and to `while (!<cond>) tick();` in synchronous contexts (hookable bodies, free functions).
+
+With `timeout`, **coroutine** context uses the runtime's `wait_until_timeout` awaiter — *one* scheduler round-trip rather than one-per-cycle. The scheduler evaluates the predicate and decrements a per-slot countdown each tick; the coroutine resumes when either pred fires or the countdown hits zero, with the awaiter's return value indicating which:
 
 ```cpp
 {
     int64_t _wu_budget = (N);
-    int64_t _wu_start  = (int64_t)cycle_count;
-    while (!<overall_cond>() && ((int64_t)cycle_count - _wu_start) < _wu_budget) {
-        co_await harc_rt::wait_cycles(_slot, 1);   // or tick() sync
-    }
-    if (!<overall_cond>()) {
+    bool _wu_satisfied = co_await harc_rt::wait_until_timeout(
+        _slot, [&]{ return <overall_cond>; }, (uint32_t)_wu_budget);
+    if (!_wu_satisfied) {
         sim_log_line("FAIL", "<user msg or default>");
         // Per-sub-predicate breakdown — see below.
         errors++;
     }
 }
 ```
+
+**Synchronous** context has no scheduler to defer to, so timed `wait until` there keeps the explicit polling loop (the only shape available):
+
+```cpp
+{
+    int64_t _wu_budget = (N);
+    int64_t _wu_start  = (int64_t)cycle_count;
+    while (!<overall_cond>() && ((int64_t)cycle_count - _wu_start) < _wu_budget) {
+        tick();
+    }
+    if (!<overall_cond>()) { /* same diagnostic + errors++ */ }
+}
+```
+
+The two shapes are observationally identical: same cycle of resumption, same diagnostic on timeout. The coroutine path is strictly cheaper at runtime — long timeouts (`timeout 10000 cycles`) no longer wake the coroutine 10,000 times to do nothing.
 
 **Per-sub-predicate diagnostics.** On `timeout`, the codegen reports exactly which condition(s) failed to become true:
 
