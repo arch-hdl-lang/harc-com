@@ -331,6 +331,41 @@ pub enum ComponentItem {
     Hookable(HookableMethod),
     /// Inline `apply Name` inside a component body (rare but legal in scopes).
     Apply(ApplyDecl),
+    /// Built-in watchdog (spec §8.6). At elaboration time this desugars
+    /// to a synthetic `hookable watchdog()` whose body asserts the
+    /// `idle(max_idle)` predicate is false, plus a periodic `_checkers`
+    /// closure that calls the method every `period` cycles. External
+    /// aspects can attach via `on <ComponentType>.watchdog pre/post`,
+    /// reusing the existing hookable-hook mechanism.
+    Watchdog(WatchdogDecl),
+}
+
+/// `watchdog … end watchdog` declaration (spec §8.6). All fields
+/// optional; missing `period` / `max_idle` default to 1000 / 10000
+/// cycles respectively. `disabled = true` (from `watchdog disabled`)
+/// suppresses all codegen — useful for tests where the user wants
+/// to skip the watchdog entirely (e.g. soak tests, randomized stress).
+#[derive(Debug, Clone)]
+pub struct WatchdogDecl {
+    /// `watchdog disabled` — opt-out. `period`/`max_idle`/`body` are
+    /// ignored when `disabled = true`.
+    pub disabled: bool,
+    /// `period <expr> cycles` clause. `None` → default 1000 cycles.
+    /// May reference component fields so per-test override works:
+    ///   `agent A
+    ///       wdog_period : uint<32> default 1000
+    ///       watchdog
+    ///           period wdog_period cycles
+    ///       end watchdog
+    ///   end agent A`
+    pub period: Option<Expr>,
+    /// `max_idle <expr> cycles` clause. `None` → default 10000 cycles.
+    pub max_idle: Option<Expr>,
+    /// Optional user statements that run BEFORE the idle check on each
+    /// firing. The conventional use is debug logging
+    /// (`log(info, "[wdog] cycle=${cycle_count}")`).
+    pub body: Block,
+    pub span: Span,
 }
 
 /// A field of a component — `name : Type` or `name : direction event<T>` etc.
@@ -1111,10 +1146,20 @@ pub struct OnHandler {
     pub hook: Option<HookSide>, // `pre` / `post` (§7.3)
     /// Edge mode for cycle-trigger `on <bool-expr>` form. Defaults to
     /// `Rising` — fires on 0→1 transitions of the trigger expression.
-    /// Ignored for event-subscription `on event_name(arg)` form.
+    /// Ignored for event-subscription `on event_name(arg)` form and
+    /// for the periodic form (`on N cycles`).
     pub edge: EdgeMode,
     pub body: Block,
     pub span: Span,
+    /// `on <N> cycles ... end on` — when `true`, `event` is the period
+    /// (in primary-clock cycles) at which to fire the body, not a
+    /// boolean trigger expression. The codegen lowers this to a
+    /// `_checkers` closure that compares `cycle_count` against a
+    /// per-handler "last-fired" tracker so the body fires once every
+    /// `event` cycles regardless of `event` being constant or
+    /// variable (the period is re-read each cycle, so users can
+    /// override it from the test scope).
+    pub periodic: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

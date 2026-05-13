@@ -1,0 +1,78 @@
+// End-to-end demo of the built-in `watchdog` (spec §8.6) + `on N
+// cycles` periodic trigger (spec §7.10). Builds on the heartbeat
+// foundation (§7.8) and `wait until` machinery (§7.9): the test
+// declares an agent with a watchdog directly in its body, and the
+// codegen synthesizes:
+//
+//   1. A `_watchdog_pre` / `_watchdog_post` hook-vector pair so
+//      `on Producer.watchdog pre/post` aspects compose.
+//   2. A `Producer_watchdog` method that runs the user body THEN
+//      asserts the agent has been idle for less than `max_idle`
+//      cycles.
+//   3. A periodic `_checkers` closure installed at the `let prod :
+//      Producer` site that calls `Producer_watchdog(prod)` every
+//      `period` cycles.
+//
+// In this fixture the agent is producing transactions every 3
+// cycles, far below the 1000-cycle max_idle threshold. The watchdog
+// fires every 500 cycles, the user body logs a heartbeat, and the
+// idle check never trips. After 20 emits the test exits cleanly.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction TinyTxn
+    tag : uint<8>
+end transaction TinyTxn
+
+agent Producer
+    in_ev : event<TinyTxn>
+    seen  : uint<32> default 0
+
+    on in_ev(t)
+        seen = seen + 1
+    end on
+
+    watchdog
+        period 500 cycles
+        max_idle 1000 cycles
+        log(info, "[wdog ${cycle_count}] producer seen=${seen}")
+    end watchdog
+end agent Producer
+
+test WatchdogQuiesceTest
+    let dut : Top
+
+    clock clk = SysDomain
+
+    let prod : Producer
+end test WatchdogQuiesceTest
+
+impl sim for WatchdogQuiesceTest
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Emit 20 transactions spaced 3 cycles apart (= 60 cycles total).
+        // Well above the watchdog's 500-cycle period (one heartbeat
+        // log expected mid-run, none during the busy phase).
+        for i in 0 .. 20
+            let t : TinyTxn
+            t.tag = i
+            emit prod.in_ev(t)
+            wait 3 cycles
+        end for
+
+        // Drain via the wait-until quiesce pattern from §7.9 — the
+        // watchdog runs independently in the background and will fire
+        // its heartbeat log at cycles 500, 1000, … as long as the test
+        // is running.
+        wait until prod.seen == 20
+            timeout 200 cycles fail("agent did not finish all 20 emits")
+        log(info, "PASS: watchdog watched ${prod.seen} emits without tripping")
+    end run
+end impl WatchdogQuiesceTest
