@@ -730,6 +730,16 @@ Phase 1a does not link the SMT solver. Single-field constraints whose right-hand
 
 The static checker rejects multi-field constraints in Phase 1a with a clear error pointing at the offending term and citing the field count. Single-field constants-only forms compile without the solver linked.
 
+**Implementation status (v0 codegen).** Transaction-level `keep` constraints are honored by **every** call to `randomize(t)` — bare or with an explicit `with` body — by merging the transaction's keep list into the same Z3 solver block at the call site. Specifically:
+
+- `randomize(t)` on a transaction with `keep`s emits the full Z3 solver block, with each `keep` expression added as a constraint alongside per-field width bounds.
+- `randomize(t) with <user-body>` merges `<user-body>` with the transaction's keeps; the solver finds a satisfying assignment over the combined constraint set.
+- `randomize(t)` on a transaction with **no** keeps stays on the fast PRNG path (per-field uniform sampling).
+
+The Phase 1a/1b distinction is preserved as a design intent (single-field constants-only could in principle compile without Z3), but v0 collapses both phases into the always-Z3 path now that the solver is linked. The simplification keeps a single code path for correctness; the per-attribute fast paths (`[range]`, `[dist]`) remain available for users who want to express stimulus shape at field-declaration time rather than via `keep`.
+
+This eliminates the historical footgun where keeps appeared to constrain but didn't — the parser accepted `keep len in [1..256]` but earlier codegen visited only `TxnBodyItem::Field`, dropping the keep silently and producing unconstrained random values across the field's full width.
+
 This makes `keep` and attributes equivalent for simple cases, and the attribute form a *concrete syntactic alternative* rather than a separate Phase 1a-vs-1b feature gate. Style guidance: use attributes when the constraint is intrinsic to the field (always applies, part of the type's contract); use `keep` when the constraint is composed with others or expresses a relationship even if currently constant. Attributes are declaration-style, `keep` is constraint-style — same lowering for the simple cases.
 
 #### `[dist]` attribute vs. `dist` directive — when to use which

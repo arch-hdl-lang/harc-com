@@ -1,0 +1,69 @@
+// End-to-end demo of transaction-level `keep` constraints feeding
+// through bare `randomize(t)` (spec §4). Verifies that the keep
+// blocks aren't silently dropped: every randomized value must
+// satisfy every keep, asserted at runtime.
+//
+// Before the §4 fix, this test would fail on most iterations —
+// `randomize(t)` would produce uniformly-random values across the
+// field's full width, ignoring `keep len in [1..16]` entirely.
+// After the fix, each randomized value flows through Z3 with the
+// keeps enabled, so the asserts always hold.
+//
+// The DUT is unused here (we're not driving any pins); `Top` is
+// chosen because it's already in the verilator regression and
+// gives us a clock.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+enum Color { RED, GREEN, BLUE }
+
+transaction Req
+    len   : uint<8>
+    addr  : uint<32>
+    color : Color
+
+    // Range membership: 1..16 inclusive.
+    keep len in [1..16]
+    // Cross-field arithmetic: addr must be 4-byte aligned.
+    keep addr % 4 == 0
+    // Enum exclusion: NEVER produce RED (index 0).
+    keep color != RED
+end transaction Req
+
+test KeepConstraintsTest
+    let dut : Top
+
+    clock clk = SysDomain
+end test KeepConstraintsTest
+
+impl sim for KeepConstraintsTest
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Randomize 30 transactions, asserting each one satisfies
+        // the full keep set. Before the §4 fix, len would typically
+        // exceed 16 and addr would not be 4-aligned and color could
+        // be RED — any one of those would fail.
+        for i in 0 .. 30
+            let t : Req
+            randomize(t)
+
+            assert t.len >= 1 && t.len <= 16
+                else fail("iter ${i}: len=${t.len} violates `keep len in [1..16]`")
+            assert t.addr % 4 == 0
+                else fail("iter ${i}: addr=0x${t.addr:08x} not 4-aligned")
+            // RED = 0 (first variant). The codegen translates
+            // `color != RED` to `_z_color != bv_val(0)`.
+            assert t.color != 0
+                else fail("iter ${i}: color=RED violates `keep color != RED`")
+        end for
+
+        log(info, "PASS: 30 randomize(t) calls satisfied every keep constraint")
+    end run
+end impl KeepConstraintsTest
