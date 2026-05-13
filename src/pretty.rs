@@ -517,6 +517,9 @@ fn print_component_item(out: &mut String, it: &ComponentItem, depth: usize) {
             print_path(out, &a.path);
             writeln!(out).ok();
         }
+        ComponentItem::Watchdog(w) => {
+            print_watchdog(out, w, depth);
+        }
     }
 }
 
@@ -524,6 +527,9 @@ fn print_on_handler(out: &mut String, h: &OnHandler, depth: usize) {
     pad(out, depth);
     write!(out, "on ").ok();
     print_expr(out, &h.event);
+    if h.periodic {
+        write!(out, " cycles").ok();
+    }
     if let Some(s) = h.hook {
         let s = match s { HookSide::Pre => " pre", HookSide::Post => " post" };
         write!(out, "{s}").ok();
@@ -532,6 +538,30 @@ fn print_on_handler(out: &mut String, h: &OnHandler, depth: usize) {
     print_block_inner(out, &h.body, depth + 1);
     pad(out, depth);
     writeln!(out, "end on").ok();
+}
+
+fn print_watchdog(out: &mut String, w: &WatchdogDecl, depth: usize) {
+    pad(out, depth);
+    if w.disabled {
+        writeln!(out, "watchdog disabled").ok();
+        return;
+    }
+    writeln!(out, "watchdog").ok();
+    if let Some(p) = &w.period {
+        pad(out, depth + 1);
+        write!(out, "period ").ok();
+        print_expr(out, p);
+        writeln!(out, " cycles").ok();
+    }
+    if let Some(m) = &w.max_idle {
+        pad(out, depth + 1);
+        write!(out, "max_idle ").ok();
+        print_expr(out, m);
+        writeln!(out, " cycles").ok();
+    }
+    print_block_inner(out, &w.body, depth + 1);
+    pad(out, depth);
+    writeln!(out, "end watchdog").ok();
 }
 
 fn print_test_item(out: &mut String, it: &TestItem, depth: usize) {

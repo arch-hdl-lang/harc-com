@@ -663,8 +663,70 @@ impl Parser {
             Some(TokenKind::On) => Ok(ComponentItem::OnHandler(self.parse_on_handler()?)),
             Some(TokenKind::Hookable) => Ok(ComponentItem::Hookable(self.parse_hookable()?)),
             Some(TokenKind::Apply) => Ok(ComponentItem::Apply(self.parse_apply()?)),
+            Some(TokenKind::Watchdog) => Ok(ComponentItem::Watchdog(self.parse_watchdog()?)),
             _ => Ok(ComponentItem::Field(self.parse_component_field(doc)?)),
         }
+    }
+
+    /// Parse a `watchdog … end watchdog` declaration (spec §8.6).
+    /// Three shapes:
+    ///   * `watchdog disabled` — single-line opt-out
+    ///   * `watchdog\nend watchdog` — defaults (period 1000, max_idle 10000)
+    ///   * `watchdog\n[period N cycles]\n[max_idle M cycles]\n[body…]\nend watchdog`
+    ///
+    /// `period` and `max_idle` clauses, when present, must precede any
+    /// other body statements. Their `<expr>` may be a literal or a
+    /// reference to a component field — letting users override the
+    /// budget per-test by initializing a `wdog_period`/`wdog_max_idle`
+    /// field at test scope.
+    fn parse_watchdog(&mut self) -> Result<WatchdogDecl, CompileError> {
+        let start = self.expect(TokenKind::Watchdog)?.span;
+        // Inline `disabled` opt-out.
+        if self.check_ident("disabled") {
+            let end = self.advance().unwrap().span;
+            return Ok(WatchdogDecl {
+                disabled: true,
+                period: None,
+                max_idle: None,
+                body: Block { stmts: Vec::new(), span: start.merge(end) },
+                span: start.merge(end),
+            });
+        }
+        // Optional `period <expr> cycles` and `max_idle <expr> cycles`
+        // clauses. Either order; both optional. The `cycles` /
+        // `cycle` decoration is required (matches the `wait N cycles`
+        // convention so the human-facing units are explicit).
+        let mut period: Option<Expr> = None;
+        let mut max_idle: Option<Expr> = None;
+        loop {
+            if self.check_ident("period") && period.is_none() {
+                self.advance();
+                let e = self.parse_expr()?;
+                if self.check_ident("cycles") || self.check_ident("cycle") {
+                    self.advance();
+                }
+                period = Some(e);
+            } else if self.check_ident("max_idle") && max_idle.is_none() {
+                self.advance();
+                let e = self.parse_expr()?;
+                if self.check_ident("cycles") || self.check_ident("cycle") {
+                    self.advance();
+                }
+                max_idle = Some(e);
+            } else {
+                break;
+            }
+        }
+        let body_start = self.peek_span();
+        let stmts = self.parse_stmt_list_until_end()?;
+        let end = self.expect_end_anon(TokenKind::Watchdog)?;
+        Ok(WatchdogDecl {
+            disabled: false,
+            period,
+            max_idle,
+            body: Block { stmts, span: body_start.merge(end) },
+            span: start.merge(end),
+        })
     }
 
     /// Parse `transactor T#(generics) bound to BusType { items;
@@ -804,6 +866,19 @@ impl Parser {
     fn parse_on_handler(&mut self) -> Result<OnHandler, CompileError> {
         let start = self.expect(TokenKind::On)?.span;
         let event = self.parse_expr()?;
+        // `on <N> cycles ... end on` — periodic trigger form (spec
+        // §7.10). Fires the body once every `<N>` primary-clock
+        // cycles. The `cycles` / `cycle` decoration is required (it's
+        // what distinguishes this from a boolean trigger expression
+        // that happens to be an integer); without it, an `on 1000 ...`
+        // would mean "fire when the integer 1000 transitions to true",
+        // which is nonsense.
+        let periodic = if self.check_ident("cycles") || self.check_ident("cycle") {
+            self.advance();
+            true
+        } else {
+            false
+        };
         let hook = match self.peek_kind() {
             Some(TokenKind::Pre) => { self.advance(); Some(HookSide::Pre) }
             Some(TokenKind::Post) => { self.advance(); Some(HookSide::Post) }
@@ -812,6 +887,8 @@ impl Parser {
         // Optional edge-mode keyword for cycle-trigger form: `rising` /
         // `falling` / `level`. Ident-tokens, not reserved keywords (so a
         // user can still name a variable `level` outside trigger context).
+        // Periodic handlers ignore the edge mode (always fire on the
+        // counter-match), but the parser still accepts it for symmetry.
         let edge = if self.check_ident("rising") {
             self.advance(); EdgeMode::Rising
         } else if self.check_ident("falling") {
@@ -825,7 +902,7 @@ impl Parser {
         let stmts = self.parse_stmt_list_until_end()?;
         let end = self.expect_end_anon(TokenKind::On)?;
         let body = Block { stmts, span: body_start.merge(end) };
-        Ok(OnHandler { event, hook, edge, body, span: start.merge(end) })
+        Ok(OnHandler { event, hook, edge, body, span: start.merge(end), periodic })
     }
 
     fn parse_hookable(&mut self) -> Result<HookableMethod, CompileError> {

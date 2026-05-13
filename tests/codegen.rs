@@ -868,6 +868,166 @@ end impl T"#,
         "wait until in sync context should be `while (!cond) tick();`; got:\n{cpp}");
 }
 
+/// `on <N> cycles … end on` lowers to a `_checkers` closure with a
+/// `static int64_t _last` counter and a `cycle_count - _last >= period`
+/// guard — fires the body once every N cycles (spec §7.10). The
+/// period expression is re-read each cycle so per-test overrides via
+/// field assignment work without re-installation.
+#[test]
+fn on_n_cycles_lowers_to_periodic_checker() {
+    let parsed = parse_source(
+        r#"test T
+    let dut : DummyDut
+end test T
+
+impl sim for T
+    run
+        on 100 cycles
+            log(info, "heartbeat")
+        end on
+        wait 5 cycles
+    end run
+end impl T"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    // Body wrapped in a static-state _checkers closure.
+    assert!(cpp.contains("_checkers.push_back([&]() {"),
+        "expected periodic on-handler to register a _checkers closure; got:\n{cpp}");
+    // The period expression is captured into a local each cycle.
+    assert!(cpp.contains("_period = (int64_t)(100);"),
+        "expected period to be re-read each cycle; got:\n{cpp}");
+    // Guard against zero/negative period + correct delta comparison.
+    assert!(cpp.contains("_period > 0") && cpp.contains("cycle_count -")
+            && cpp.contains(">= "),
+        "expected `_period > 0 && cycle_count - _last >= _period` guard; got:\n{cpp}");
+    // The body's log call survives.
+    assert!(cpp.contains("\"heartbeat\""),
+        "expected the body's log message; got:\n{cpp}");
+}
+
+/// `watchdog` agent body item (spec §8.6) lowers to:
+/// 1. Hook vectors `<Type>_watchdog_pre` / `<Type>_watchdog_post`
+/// 2. A `<Type>_watchdog` method lambda whose body asserts the agent
+///    has been idle for >= max_idle cycles
+/// 3. A periodic `_checkers` closure at let-time that calls the
+///    method every `period` cycles
+#[test]
+fn watchdog_lowers_to_method_plus_periodic_checker() {
+    let parsed = parse_source(
+        r#"agent Foo
+    in_ev : event<int>
+
+    watchdog
+        period 250 cycles
+        max_idle 1000 cycles
+    end watchdog
+end agent Foo
+
+test T
+    let dut : DummyDut
+    let foo : Foo
+end test T
+
+impl sim for T
+    run
+        wait 1 cycle
+    end run
+end impl T"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    // Hook vectors so `on Foo.watchdog pre/post` works.
+    assert!(cpp.contains("Foo_watchdog_pre;") && cpp.contains("Foo_watchdog_post;"),
+        "expected watchdog hook vectors; got:\n{cpp}");
+    // Synthetic method lambda.
+    assert!(cpp.contains("auto Foo_watchdog = [&](Foo& self) -> void {"),
+        "expected `Foo_watchdog` lambda taking `Foo& self`; got:\n{cpp}");
+    // Idle check inside the method: BOTH in and out deltas must be ≥ max_idle.
+    assert!(cpp.contains("self._last_in_cycle") && cpp.contains("self._last_out_cycle"),
+        "expected idle check to read both heartbeat fields; got:\n{cpp}");
+    assert!(cpp.contains("_wdog_max_idle = (int64_t)(1000)"),
+        "expected max_idle threshold from the watchdog clause; got:\n{cpp}");
+    assert!(cpp.contains("watchdog: Foo has been idle for"),
+        "expected the watchdog fail message; got:\n{cpp}");
+    // Periodic checker installed at let-time: calls Foo_watchdog(foo) every `period` cycles.
+    assert!(cpp.contains("_wdog_foo_period = (int64_t)(250)"),
+        "expected per-instance period variable; got:\n{cpp}");
+    assert!(cpp.contains("Foo_watchdog(foo);"),
+        "expected the periodic checker to call Foo_watchdog(foo); got:\n{cpp}");
+}
+
+/// `watchdog disabled` emits NO hook vectors, NO method, NO periodic
+/// checker — the user explicitly opted out. Existing fixtures that
+/// don't declare a watchdog get the same treatment automatically
+/// (no auto-injected watchdog), so this test pins both the
+/// disabled-by-keyword path and the no-mention default.
+#[test]
+fn watchdog_disabled_emits_nothing() {
+    let parsed = parse_source(
+        r#"agent NoWdog
+    in_ev : event<int>
+    watchdog disabled
+end agent NoWdog
+
+test T
+    let dut : DummyDut
+    let nw : NoWdog
+end test T
+
+impl sim for T
+    run
+        wait 1 cycle
+    end run
+end impl T"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(!cpp.contains("NoWdog_watchdog"),
+        "watchdog disabled should emit NO `NoWdog_watchdog` method/hooks; got:\n{cpp}");
+    assert!(!cpp.contains("_wdog_nw"),
+        "watchdog disabled should emit NO periodic checker for the instance; got:\n{cpp}");
+}
+
+/// Watchdog period and max_idle can reference component fields, so
+/// per-test overrides via field assignment work without recompiling
+/// the agent. The field reference inside the period expression
+/// rewrites to `<instance>.<field>` at let-time; inside the method
+/// body it rewrites to `self.<field>`.
+#[test]
+fn watchdog_period_and_max_idle_can_reference_component_fields() {
+    let parsed = parse_source(
+        r#"agent Foo
+    wdog_period   : uint<32> default 1000
+    wdog_max_idle : uint<32> default 10000
+
+    watchdog
+        period wdog_period cycles
+        max_idle wdog_max_idle cycles
+    end watchdog
+end agent Foo
+
+test T
+    let dut : DummyDut
+    let foo : Foo
+end test T
+
+impl sim for T
+    run
+        foo.wdog_period = 100
+        foo.wdog_max_idle = 500
+        wait 1 cycle
+    end run
+end impl T"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    // Inside the method body, the field reference uses `self.`.
+    assert!(cpp.contains("_wdog_max_idle = (int64_t)(harc_rt::harc_read(self.wdog_max_idle))")
+            || cpp.contains("_wdog_max_idle = (int64_t)(self.wdog_max_idle)"),
+        "max_idle inside method should resolve to self.wdog_max_idle; got:\n{cpp}");
+    // At let-time, the period reference uses `<instance>.`.
+    assert!(cpp.contains("_wdog_foo_period = (int64_t)(harc_rt::harc_read(foo.wdog_period))")
+            || cpp.contains("_wdog_foo_period = (int64_t)(foo.wdog_period)"),
+        "period inside checker should resolve to foo.wdog_period; got:\n{cpp}");
+}
+
 /// Smoke-sweep every fixture under `tests/fixtures/` through
 /// `cpp_tb::emit`. Fixtures missing a sibling `_sim.harc` half are
 /// auto-paired (e.g. `counter_test.harc` + `counter_test_sim.harc`);

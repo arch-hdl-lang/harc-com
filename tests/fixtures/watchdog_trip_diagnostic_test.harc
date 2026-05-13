@@ -1,0 +1,58 @@
+// Negative-path demo: deliberately stall a watchdog-equipped agent
+// past its `max_idle` threshold so the watchdog fires its FAIL line.
+// Exits with error status (intentional — that's how we know the
+// watchdog tripped), so this fixture is NOT in `run_fixtures.sh`'s
+// pass-required regression. Run manually with `harc sim` to inspect
+// the watchdog diagnostic.
+//
+// The agent's input event is never driven, so both _last_in_cycle
+// and _last_out_cycle stay at 0. The watchdog fires every 50 cycles;
+// after the first firing past cycle 200 (max_idle), the idle check
+// trips and logs:
+//
+//   FAIL  watchdog: SilentAgent has been idle for >= 200 cycles
+//
+// The test waits 600 cycles total so the watchdog gets several
+// firings (at cycles 50, 100, 150, 200, 250, 300, …). Cycles 50,
+// 100, 150 don't trip (200-cycle threshold not yet reached). From
+// cycle 250 onward, every firing trips.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent SilentAgent
+    in_ev : event<int>
+    seen  : uint<32> default 0
+
+    on in_ev(t)
+        seen = seen + 1   // never fires; here so the agent has the heartbeat plumbing
+    end on
+
+    watchdog
+        period 50 cycles
+        max_idle 200 cycles
+    end watchdog
+end agent SilentAgent
+
+test WatchdogTripDemoTest
+    let dut : Top
+
+    clock clk = SysDomain
+
+    let agent : SilentAgent
+end test WatchdogTripDemoTest
+
+impl sim for WatchdogTripDemoTest
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+
+        // Just sit idle — the watchdog should trip past cycle 200.
+        wait 600 cycles
+
+        log(info, "DEMO: watchdog should have tripped multiple times above")
+    end run
+end impl WatchdogTripDemoTest
