@@ -35,6 +35,7 @@ heartbeat_idle_test     | Top            | top_counter.sv         |
 wait_until_quiesce_test | Top            | top_counter.sv         |
 watchdog_quiesce_test   | Top            | top_counter.sv         |
 keep_constraints_test   | Top            | top_counter.sv         |
+extern_fn_ref_test      | Top            | top_counter.sv         |     | extern_fn_ref.cpp
 fsm_counter_test        | FsmCounter     | fsm_counter.sv         |
 clk_div_counter_test    | ClkDivCounter  | clk_div_counter.sv clk_divider.sv |
 synchronizer_basic_test | FlagSync       | synchronizer_basic.sv  | async_fifo_domains.harc
@@ -85,22 +86,31 @@ FAILED_NAMES=()
 
 run_one() {
     local row="$1"
-    IFS='|' read -r test top sv extras <<<"$row"
+    # Optional 5th field: space-separated C/C++ reference-model source
+    # files relative to DUT_DIR, passed via `--ref-src`. Used by
+    # `extern function` tests (spec §9).
+    IFS='|' read -r test top sv extras ref_src <<<"$row"
     test="$(echo "$test" | xargs)"
     top="$(echo "$top" | xargs)"
     sv="$(echo "$sv" | xargs)"
     extras="$(echo "$extras" | xargs || true)"
+    ref_src="$(echo "$ref_src" | xargs || true)"
     [ -z "$test" ] && return 0
 
     local sv_args=()
     for f in $sv; do sv_args+=("--sv" "$DUT_DIR/$f"); done
+
+    local ref_args=()
+    for f in $ref_src; do ref_args+=("--ref-src" "$DUT_DIR/$f"); done
 
     local harc_files=("$FIX_DIR/$test.harc")
     for f in $extras; do harc_files+=("$FIX_DIR/$f"); done
 
     rm -rf harc_sim_build
     local out
-    out="$("$HARC" sim "${sv_args[@]}" "${harc_files[@]}" --top "$top" 2>&1)" || true
+    # `${ref_args[@]:-}` tolerates an empty array under `set -u` (most
+    # fixtures don't pass any --ref-src).
+    out="$("$HARC" sim "${sv_args[@]}" ${ref_args[@]:+"${ref_args[@]}"} "${harc_files[@]}" --top "$top" 2>&1)" || true
 
     if echo "$out" | grep -q "ALL TESTS PASSED"; then
         echo "  PASS  $test"

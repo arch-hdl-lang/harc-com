@@ -240,6 +240,41 @@ end impl T
         "defaults-only watchdog should round-trip; got:\n{printed}");
 }
 
+/// `extern function name(params) -> ret` (spec §9) round-trips: no
+/// body, no `end function` — terminates after the return type. Also
+/// works without a return type (void). The pretty-printer uses the
+/// same `extern function` surface as the parser accepts.
+#[test]
+fn extern_function_round_trips() {
+    let src = r#"
+extern function ref_crc8_step(crc: uint<8>, byte: uint<8>) -> uint<8>
+extern function ref_aes_block(key: bits<128>, pt: bits<128>) -> bits<128>
+extern function ref_dump_state(cycle: uint<64>)
+
+test T
+    let dut : X
+end test T
+
+impl sim for T
+    run
+        let c = ref_crc8_step(0xFF, 0)
+        ref_dump_state(100)
+        wait 1 cycle
+    end run
+end impl T
+"#;
+    let printed = parse_print_reparse(src);
+    assert!(printed.contains("extern function ref_crc8_step(crc: uint<8>, byte: uint<8>) -> uint<8>"),
+        "extern function with return type should round-trip; got:\n{printed}");
+    assert!(printed.contains("extern function ref_aes_block(key: bits<128>, pt: bits<128>) -> bits<128>"),
+        "extern function with wide bits param should round-trip; got:\n{printed}");
+    assert!(printed.contains("extern function ref_dump_state(cycle: uint<64>)\n"),
+        "extern function with no return type (void) should round-trip; got:\n{printed}");
+    // No spurious `end function` for an extern.
+    assert!(!printed.contains("end function ref_crc8_step"),
+        "extern function should NOT close with `end function`; got:\n{printed}");
+}
+
 /// `///` outer doc comments attach to the next construct, populate
 /// `doc: Option<String>` on the AST node, and round-trip through the
 /// pretty-printer. Mirrors arch-com's `plan_arch_doc_comments.md` §2.1.
