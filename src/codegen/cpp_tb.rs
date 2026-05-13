@@ -286,6 +286,19 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // signed values fit naturally; the solver widens at use site.
     let mut enum_variants: std::collections::HashMap<String, i64> =
         std::collections::HashMap::new();
+    // Relation declarations indexed by name (spec §4.2). At constraint-
+    // emit time, any `Call(Ident(R), args)` whose name is in this map
+    // is inlined: the formal parameters substitute into R's body and
+    // each expression becomes its own constraint added to the Z3
+    // solver block. Recursive expansion handles relation-aliases-of-
+    // relations (`relation A(t) = B(t) && t.x == 0`).
+    let mut relations: std::collections::HashMap<String, RelationDecl> =
+        std::collections::HashMap::new();
+    for it in &file.items {
+        if let Item::Relation(r) = it {
+            relations.insert(r.name.name.clone(), r.clone());
+        }
+    }
     for it in &file.items {
         match it {
             Item::Scoreboard(c) => {
@@ -417,6 +430,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         transactors,
         current_component_instance: None,
         txn_keeps,
+        relations,
     };
 
     // Header.
@@ -1301,6 +1315,14 @@ struct Emitter {
     /// key means the transaction has no `keep`s; bare `randomize(t)`
     /// stays on the fast PRNG path.
     txn_keeps: std::collections::HashMap<String, Vec<Expr>>,
+    /// Free-standing `relation` declarations indexed by name (spec
+    /// §4.2). `Call(Ident(R), args)` inside a constraint expression
+    /// expands to R's body with formal parameters substituted by the
+    /// call arguments. Block-body relations contribute one
+    /// constraint per body expression; alias-body relations
+    /// contribute one. Expansion is recursive so a relation that
+    /// calls another relation flattens fully before reaching Z3.
+    relations: std::collections::HashMap<String, RelationDecl>,
     /// Identifiers that are emitted as Verilator-class pointers (`VFoo*`).
     /// Field access on these uses `->` instead of `.`. Populated from
     /// `let x : <NamedType>` declarations and from function parameters
@@ -3800,6 +3822,148 @@ impl Emitter {
         }
     }
 
+    /// Inline a list of top-level constraint expressions, expanding
+    /// any `Call(Ident(R), args)` whose name resolves to a known
+    /// `relation R(params) … end relation` (spec §4.2). Each call:
+    ///   * Looks up R in `self.relations`.
+    ///   * Builds a substitution map `formal_param → actual_arg`.
+    ///   * For `RelationBody::Block(exprs)`, returns each expr with
+    ///     substitution applied — each becomes its own constraint at
+    ///     top level (`_s.add(...)` per body expr).
+    ///   * For `RelationBody::Alias(expr)`, returns a 1-element Vec
+    ///     of the substituted expr.
+    ///
+    /// Non-call expressions are also walked with `expand_relation_subtree`
+    /// so a nested relation call (e.g. inside a `Binary &&`) expands too.
+    /// Recursion handles relations of relations.
+    fn expand_relation_calls(&self, exprs: &[Expr]) -> Vec<Expr> {
+        let mut out: Vec<Expr> = Vec::with_capacity(exprs.len());
+        for e in exprs {
+            // Top-level Call: expand to potentially multiple constraints.
+            if let Some(expanded) = self.try_expand_top_level_call(e) {
+                // Each body expr is itself walked so block-form
+                // relations that contain nested calls flatten too.
+                for be in &expanded {
+                    out.extend(self.expand_relation_calls(&[be.clone()]));
+                }
+                continue;
+            }
+            // Non-call (or unknown-name call): walk the subtree so any
+            // nested R(args) inside Binary / Unary / Paren / etc.
+            // expands inline.
+            out.push(self.expand_relation_subtree(e));
+        }
+        out
+    }
+
+    /// Try to expand `e` as a top-level relation call. Returns the
+    /// substituted body expressions if `e` is `Call(Ident(R), args)`
+    /// for a known relation; `None` otherwise (caller falls back to
+    /// subtree walking). Arity-mismatched calls return `None` so the
+    /// downstream translator surfaces a "constraint expression not
+    /// supported" error with a useful span — better than swallowing.
+    fn try_expand_top_level_call(&self, e: &Expr) -> Option<Vec<Expr>> {
+        let ExprKind::Call { callee, args } = &*e.kind else { return None; };
+        let ExprKind::Ident(id) = &*callee.kind else { return None; };
+        let rel = self.relations.get(&id.name)?;
+        if rel.params.len() != args.len() {
+            return None;
+        }
+        let mut subst: std::collections::HashMap<String, Expr> =
+            std::collections::HashMap::new();
+        for (p, a) in rel.params.iter().zip(args.iter()) {
+            let arg_expr = match a {
+                CallArg::Expr(ex) => ex.clone(),
+                CallArg::Named { value, .. } => value.clone(),
+            };
+            subst.insert(p.name.name.clone(), arg_expr);
+        }
+        let body_exprs: Vec<Expr> = match &rel.body {
+            RelationBody::Block(exprs) => exprs.iter()
+                .map(|x| substitute_idents(x, &subst))
+                .collect(),
+            RelationBody::Alias(expr) =>
+                vec![substitute_idents(expr, &subst)],
+        };
+        Some(body_exprs)
+    }
+
+    /// Walk a constraint expression, replacing any nested
+    /// `Call(Ident(R), args)` (for a known relation R) with R's body.
+    /// Block-form bodies collapse to a `&&`-chain so they fit where a
+    /// single expression is expected (e.g. inside a `Binary &&`); use
+    /// `expand_relation_calls` at the top level to get one constraint
+    /// per body expression.
+    fn expand_relation_subtree(&self, expr: &Expr) -> Expr {
+        let span = expr.span;
+        // Recognize a relation Call anywhere in the tree. For block-form
+        // bodies, build the AND-of-all-body-exprs expression so the
+        // call site (which expected one Expr) gets one Expr back.
+        if let Some(body_exprs) = self.try_expand_top_level_call(expr) {
+            let exprs: Vec<Expr> = body_exprs.iter()
+                .map(|x| self.expand_relation_subtree(x))
+                .collect();
+            return and_join(&exprs, span);
+        }
+        let new_kind: ExprKind = match &*expr.kind {
+            ExprKind::Field { target, name } => ExprKind::Field {
+                target: self.expand_relation_subtree(target),
+                name: name.clone(),
+            },
+            ExprKind::Index { target, index } => ExprKind::Index {
+                target: self.expand_relation_subtree(target),
+                index:  self.expand_relation_subtree(index),
+            },
+            ExprKind::BitSlice { target, hi, lo } => ExprKind::BitSlice {
+                target: self.expand_relation_subtree(target),
+                hi:     self.expand_relation_subtree(hi),
+                lo:     self.expand_relation_subtree(lo),
+            },
+            ExprKind::Call { callee, args } => ExprKind::Call {
+                callee: self.expand_relation_subtree(callee),
+                args: args.iter().map(|a| match a {
+                    CallArg::Expr(e) => CallArg::Expr(self.expand_relation_subtree(e)),
+                    CallArg::Named { name, value } => CallArg::Named {
+                        name: name.clone(),
+                        value: self.expand_relation_subtree(value),
+                    },
+                }).collect(),
+            },
+            ExprKind::Cast { expr, ty } => ExprKind::Cast {
+                expr: self.expand_relation_subtree(expr),
+                ty: ty.clone(),
+            },
+            ExprKind::Unary { op, expr } => ExprKind::Unary {
+                op: *op,
+                expr: self.expand_relation_subtree(expr),
+            },
+            ExprKind::Binary { op, lhs, rhs } => ExprKind::Binary {
+                op: *op,
+                lhs: self.expand_relation_subtree(lhs),
+                rhs: self.expand_relation_subtree(rhs),
+            },
+            ExprKind::Ternary { cond, then_branch, else_branch } => ExprKind::Ternary {
+                cond:        self.expand_relation_subtree(cond),
+                then_branch: self.expand_relation_subtree(then_branch),
+                else_branch: self.expand_relation_subtree(else_branch),
+            },
+            ExprKind::Paren(inner) => ExprKind::Paren(self.expand_relation_subtree(inner)),
+            ExprKind::Membership { expr, set } => ExprKind::Membership {
+                expr: self.expand_relation_subtree(expr),
+                set:  self.expand_relation_subtree(set),
+            },
+            ExprKind::SetLit(items) => ExprKind::SetLit(
+                items.iter().map(|x| self.expand_relation_subtree(x)).collect()
+            ),
+            ExprKind::RangeLit { lo, hi } => ExprKind::RangeLit {
+                lo: lo.as_ref().map(|x| self.expand_relation_subtree(x)),
+                hi: hi.as_ref().map(|x| self.expand_relation_subtree(x)),
+            },
+            other => other.clone(),
+        };
+        Expr::new(new_kind, span)
+    }
+
     /// Emit an inline Z3 solver block for `randomize(t) with { ... }`.
     /// Each call builds a fresh Z3 context, declares one bitvector variable
     /// per field at its declared width, translates the constraint
@@ -3813,6 +3977,12 @@ impl Emitter {
         with_body: &[Expr],
         depth: usize,
     ) {
+        // Expand relation calls into their bodies up-front so the
+        // rest of the function sees a flat list of constraints. Both
+        // the user's `with` body AND the transaction's keeps reach
+        // this function via the merge in StmtKind::Randomize.
+        let with_body_owned: Vec<Expr> = self.expand_relation_calls(with_body);
+        let with_body: &[Expr] = &with_body_owned;
         let fields = match self.txn_fields.get(ty).cloned() {
             Some(f) => f,
             None => {
@@ -6328,4 +6498,116 @@ fn expr_source_str(e: &Expr) -> String {
     let mut buf = String::new();
     crate::pretty::print_expr(&mut buf, e);
     buf
+}
+
+/// Combine a list of constraint expressions into one
+/// `Binary(AndAnd, …)` chain. Used by `expand_relation_subtree` when a
+/// block-form relation appears in a position that expects a single
+/// expression (e.g. nested inside another `Binary &&`). Empty input
+/// returns a literal `true`. Single-element input returns the element
+/// unchanged.
+fn and_join(exprs: &[Expr], span: Span) -> Expr {
+    if exprs.is_empty() {
+        return Expr::new(ExprKind::Bool(true), span);
+    }
+    let mut iter = exprs.iter().cloned();
+    let mut acc = iter.next().unwrap();
+    for next in iter {
+        let s = acc.span.merge(next.span);
+        acc = Expr::new(
+            ExprKind::Binary { op: BinaryOp::AndAnd, lhs: acc, rhs: next },
+            s,
+        );
+    }
+    acc
+}
+
+/// Walk `expr` and replace each `ExprKind::Ident(name)` whose name is
+/// in `subst` with the corresponding substitute expression (cloned in
+/// place). Used by `expand_relation_calls` to bind each relation's
+/// formal parameter to the actual call argument before the body is
+/// added to the Z3 solver block.
+///
+/// The substitute can be any expression — a bare ident (the common
+/// case: `R(pkt)` → `pkt`), a field access (`R(env.agent.txn)`), or
+/// a deeper subtree. Field-access names (`Field { name, .. }`) are
+/// attribute references, not bindings, so they're never substituted.
+fn substitute_idents(
+    expr: &Expr,
+    subst: &std::collections::HashMap<String, Expr>,
+) -> Expr {
+    let span = expr.span;
+    let new_kind: ExprKind = match &*expr.kind {
+        ExprKind::Ident(id) => {
+            if let Some(replacement) = subst.get(&id.name) {
+                // Splice the replacement's *kind* in at the current
+                // span. Keeping the original ident's span preserves
+                // source attribution in any future diagnostic.
+                return Expr::new((*replacement.kind).clone(), span);
+            }
+            ExprKind::Ident(id.clone())
+        }
+        ExprKind::Field { target, name } => ExprKind::Field {
+            target: substitute_idents(target, subst),
+            name: name.clone(),
+        },
+        ExprKind::Index { target, index } => ExprKind::Index {
+            target: substitute_idents(target, subst),
+            index:  substitute_idents(index,  subst),
+        },
+        ExprKind::BitSlice { target, hi, lo } => ExprKind::BitSlice {
+            target: substitute_idents(target, subst),
+            hi:     substitute_idents(hi,     subst),
+            lo:     substitute_idents(lo,     subst),
+        },
+        ExprKind::Call { callee, args } => ExprKind::Call {
+            callee: substitute_idents(callee, subst),
+            args: args.iter().map(|a| match a {
+                CallArg::Expr(e) => CallArg::Expr(substitute_idents(e, subst)),
+                CallArg::Named { name, value } => CallArg::Named {
+                    name: name.clone(),
+                    value: substitute_idents(value, subst),
+                },
+            }).collect(),
+        },
+        ExprKind::Cast { expr, ty } => ExprKind::Cast {
+            expr: substitute_idents(expr, subst),
+            ty: ty.clone(),
+        },
+        ExprKind::Unary { op, expr } => ExprKind::Unary {
+            op: *op,
+            expr: substitute_idents(expr, subst),
+        },
+        ExprKind::Binary { op, lhs, rhs } => ExprKind::Binary {
+            op: *op,
+            lhs: substitute_idents(lhs, subst),
+            rhs: substitute_idents(rhs, subst),
+        },
+        ExprKind::Ternary { cond, then_branch, else_branch } => ExprKind::Ternary {
+            cond:        substitute_idents(cond,        subst),
+            then_branch: substitute_idents(then_branch, subst),
+            else_branch: substitute_idents(else_branch, subst),
+        },
+        ExprKind::Paren(inner) => ExprKind::Paren(substitute_idents(inner, subst)),
+        ExprKind::Membership { expr, set } => ExprKind::Membership {
+            expr: substitute_idents(expr, subst),
+            set:  substitute_idents(set,  subst),
+        },
+        ExprKind::SetLit(items) => ExprKind::SetLit(
+            items.iter().map(|x| substitute_idents(x, subst)).collect()
+        ),
+        ExprKind::RangeLit { lo, hi } => ExprKind::RangeLit {
+            lo: lo.as_ref().map(|x| substitute_idents(x, subst)),
+            hi: hi.as_ref().map(|x| substitute_idents(x, subst)),
+        },
+        // Literals, ImplicitSelf, and the spec-§5 / §6 / §8 forms
+        // (HashHash, SeqRepeat, DistLit, etc.) don't bind names and
+        // aren't expected inside constraint bodies; pass through
+        // verbatim. If a relation body happens to contain one of these
+        // shapes, the downstream constraint translator will reject it
+        // with a clear "not supported" error, same as it would for an
+        // un-inlined body.
+        other => other.clone(),
+    };
+    Expr::new(new_kind, span)
 }
