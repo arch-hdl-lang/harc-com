@@ -1271,6 +1271,67 @@ This says "wait until every interesting component has been idle for 100 cycles A
 
 `wait until` and the per-agent `watchdog` body that fires the idle check periodically are layered features on top of this foundation; see §7.9 and §8.6.
 
+### 7.9 `wait until` with timeout + per-predicate diagnostics
+
+`wait until` is the user-facing wait primitive that consumes the heartbeat predicates from §7.8 (and any other boolean expression). It comes in three forms:
+
+```
+wait until <expr>                                          # single predicate
+wait until all of <e1>, <e2>, … , <eN>                     # conjunction
+wait until any of <e1>, <e2>, … , <eN>                     # disjunction
+```
+
+Each form optionally takes an inline `timeout <N> cycles fail("<message>")` tail. The `<message>` is itself optional — `timeout N cycles` (no `fail(…)`) lowers to a default `"wait until [all of|any of] timed out after N cycles"` log.
+
+```
+wait until env.agent.idle(100)
+wait until dut.ready timeout 500 cycles fail("ready never asserted")
+wait until all of
+    env.agent.idle(100),
+    env.scoreboard.queue.is_empty(),
+    dut.done
+timeout 10000 cycles
+    fail("test did not quiesce within 10000 cycles")
+```
+
+(The block-style multi-line form is just the same comma-separated list with newlines between items; the parser is whitespace-insensitive between commas and `timeout`.)
+
+**Lowering.** Without `timeout`, `wait until <cond>` lowers to `co_await harc_rt::wait_until(_slot, [&]{ return <cond>; });` in coroutine context (efficient: the scheduler evaluates the predicate once per cycle) and to `while (!<cond>) tick();` in synchronous contexts (hookable bodies, free functions). With `timeout`, both contexts use a bounded polling loop measured against the global `cycle_count`:
+
+```cpp
+{
+    int64_t _wu_budget = (N);
+    int64_t _wu_start  = (int64_t)cycle_count;
+    while (!<overall_cond>() && ((int64_t)cycle_count - _wu_start) < _wu_budget) {
+        co_await harc_rt::wait_cycles(_slot, 1);   // or tick() sync
+    }
+    if (!<overall_cond>()) {
+        sim_log_line("FAIL", "<user msg or default>");
+        // Per-sub-predicate breakdown — see below.
+        errors++;
+    }
+}
+```
+
+**Per-sub-predicate diagnostics.** On `timeout`, the codegen reports exactly which condition(s) failed to become true:
+
+- `wait until <e>` and `wait until all of <e1>, …, <eN>`:
+  - For each `e_i` *still false at timeout*, log `not yet true: <pretty-printed e_i>`.
+- `wait until any of <e1>, …, <eN>`:
+  - None became true (by definition — that's why the timeout fired), so log a single line `none of: <e1>, <e2>, …, <eN>` listing every predicate that was being awaited.
+
+The pretty-printed source text comes from the same renderer the `harc fmt` command uses, so the diagnostic shows the user's original expression (`env.agent.idle(100)`, `dut.done`) rather than a synthetic index. Example log on timeout of a quiesce wait:
+
+```
+[cycle:10000 FAIL] test did not quiesce within 10000 cycles
+[cycle:10000 FAIL]   not yet true: env.agent.idle(100)
+[cycle:10000 FAIL]   not yet true: env.scoreboard.queue.is_empty()
+```
+
+Compare with UVM, where a hung test typically surfaces as a generic "Drain time expired with N objections still raised" — no information about *which* objection, *which* component, or *what* condition was being waited on. The HARC log identifies the offender by source text.
+
+**Non-aborting on timeout.** A `timeout` failure logs `FAIL` and bumps the `errors` counter (same path as `assert … else fail(…)`), but does not abort the run. Execution continues past the `wait until` statement. Use `log(fatal, …)` after a critical-path timeout if you want abort-on-timeout semantics — the runtime treats `fatal` as immediate test-instance termination (§7.7).
+
 ---
 
 ## 8. Testbench Architecture — Native Constructs

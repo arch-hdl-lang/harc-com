@@ -1048,6 +1048,31 @@ fn print_stmt(out: &mut String, s: &Stmt, depth: usize) {
             }
             writeln!(out).ok();
         }
+        StmtKind::WaitUntil { mode, conditions, timeout, .. } => {
+            pad(out, depth);
+            write!(out, "wait until").ok();
+            match mode {
+                WaitUntilMode::Single => {}
+                WaitUntilMode::AllOf  => { write!(out, " all of").ok(); }
+                WaitUntilMode::AnyOf  => { write!(out, " any of").ok(); }
+            }
+            for (i, c) in conditions.iter().enumerate() {
+                if i == 0 { write!(out, " ").ok(); }
+                else      { write!(out, ", ").ok(); }
+                print_expr(out, c);
+            }
+            if let Some(to) = timeout {
+                write!(out, " timeout ").ok();
+                print_expr(out, &to.cycles);
+                write!(out, " cycles").ok();
+                if let Some(m) = &to.message {
+                    write!(out, " fail(").ok();
+                    print_expr(out, m);
+                    write!(out, ")").ok();
+                }
+            }
+            writeln!(out).ok();
+        }
         StmtKind::Fail { msg, .. } => {
             pad(out, depth);
             write!(out, "fail(").ok();

@@ -1404,6 +1404,156 @@ impl Emitter {
         writeln!(self.out, "}}").ok();
     }
 
+    /// Emit a `wait until …` statement (spec §7.9). Four shape axes:
+    ///
+    /// - **Single / AllOf / AnyOf** — the predicate is one expression
+    ///   or the conjunction / disjunction of multiple sub-expressions.
+    /// - **With or without `timeout`** — without, the loop is an
+    ///   unbounded `co_await wait_until(_slot, [&]{ … })` (or sync
+    ///   `while (!cond) tick();`). With timeout, a bounded polling
+    ///   loop measured against `cycle_count` plus per-predicate
+    ///   diagnostic logging on expiration.
+    ///
+    /// Diagnostic on `all of` timeout: lists each sub-predicate still
+    /// false, identified by its pretty-printed source text (so the
+    /// log mentions `env.agent.idle(100)` rather than a synthetic
+    /// index). For `any of`, the breakdown lists every sub-predicate
+    /// since none became true.
+    fn emit_wait_until(
+        &mut self,
+        mode: &WaitUntilMode,
+        conditions: &[Expr],
+        timeout: Option<&WaitTimeout>,
+        depth: usize,
+    ) {
+        if conditions.is_empty() {
+            self.errors.push("wait until: at least one condition required".into());
+            return;
+        }
+        // Combine conditions into one predicate expression in C++.
+        // `Single` uses the bare expression; `AllOf` / `AnyOf` are
+        // emitted as parenthesized `&&` / `||` chains.
+        let joiner = match mode {
+            WaitUntilMode::Single | WaitUntilMode::AllOf => "&&",
+            WaitUntilMode::AnyOf => "||",
+        };
+        let emit_overall_cond = |this: &mut Self| {
+            if conditions.len() == 1 {
+                this.emit_expr(&conditions[0]);
+                return;
+            }
+            for (i, c) in conditions.iter().enumerate() {
+                if i > 0 { write!(this.out, " {joiner} ").ok(); }
+                write!(this.out, "(").ok();
+                this.emit_expr(c);
+                write!(this.out, ")").ok();
+            }
+        };
+
+        match timeout {
+            None => {
+                // Untimed wait. Coroutine context: yield to the
+                // scheduler; sync context: a synchronous polling loop.
+                self.pad(depth);
+                if self.in_coroutine {
+                    write!(self.out, "co_await harc_rt::wait_until(_slot, [&]{{ return ").ok();
+                    emit_overall_cond(self);
+                    writeln!(self.out, "; }});").ok();
+                } else {
+                    write!(self.out, "while (!(").ok();
+                    emit_overall_cond(self);
+                    writeln!(self.out, ")) tick();").ok();
+                }
+            }
+            Some(to) => {
+                // Timed wait — open a brace block so the budget /
+                // start variables don't leak.
+                self.pad(depth);
+                writeln!(self.out, "{{").ok();
+                self.pad(depth + 1);
+                write!(self.out, "int64_t _wu_budget = (int64_t)(").ok();
+                self.emit_expr(&to.cycles);
+                writeln!(self.out, ");").ok();
+                self.pad(depth + 1);
+                writeln!(self.out, "int64_t _wu_start = (int64_t)cycle_count;").ok();
+                // Loop: while the cond is false and we still have budget,
+                // advance one cycle and retry.
+                self.pad(depth + 1);
+                write!(self.out, "while (!(").ok();
+                emit_overall_cond(self);
+                writeln!(self.out, ") && ((int64_t)cycle_count - _wu_start) < _wu_budget) {{").ok();
+                self.pad(depth + 2);
+                if self.in_coroutine {
+                    writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
+                } else {
+                    writeln!(self.out, "tick();").ok();
+                }
+                self.pad(depth + 1);
+                writeln!(self.out, "}}").ok();
+                // Final check + diagnostic if timed out.
+                self.pad(depth + 1);
+                write!(self.out, "if (!(").ok();
+                emit_overall_cond(self);
+                writeln!(self.out, ")) {{").ok();
+                // Header line — user-supplied message or default.
+                let header = to.message.as_ref().and_then(|e| match &*e.kind {
+                    ExprKind::String(s) => Some(s.clone()),
+                    _ => None,
+                });
+                self.pad(depth + 2);
+                if let Some(raw) = header {
+                    let (fmt, caps) = process_interp(&raw);
+                    write!(self.out, "sim_log_line(\"FAIL\", \"{}\"", escape_c(&fmt)).ok();
+                    for c in &caps { self.emit_interp_arg(c); }
+                    writeln!(self.out, ");").ok();
+                } else {
+                    let label = match mode {
+                        WaitUntilMode::Single => "wait until",
+                        WaitUntilMode::AllOf  => "wait until all of",
+                        WaitUntilMode::AnyOf  => "wait until any of",
+                    };
+                    writeln!(self.out,
+                        "sim_log_line(\"FAIL\", \"{label} timed out after %lld cycles\", (long long)_wu_budget);"
+                    ).ok();
+                }
+                // Per-sub-predicate breakdown.
+                match mode {
+                    WaitUntilMode::Single | WaitUntilMode::AllOf => {
+                        for c in conditions {
+                            let src = expr_source_str(c);
+                            let escaped = escape_c(&src);
+                            self.pad(depth + 2);
+                            write!(self.out, "if (!(").ok();
+                            self.emit_expr(c);
+                            writeln!(self.out, ")) sim_log_line(\"FAIL\", \"  not yet true: {escaped}\");").ok();
+                        }
+                    }
+                    WaitUntilMode::AnyOf => {
+                        // None became true — list everything that was
+                        // being waited on so the user can spot the
+                        // expected-firing condition that never fired.
+                        let mut joined = String::new();
+                        for (i, c) in conditions.iter().enumerate() {
+                            if i > 0 { joined.push_str(", "); }
+                            joined.push_str(&expr_source_str(c));
+                        }
+                        let escaped = escape_c(&joined);
+                        self.pad(depth + 2);
+                        writeln!(self.out,
+                            "sim_log_line(\"FAIL\", \"  none of: {escaped}\");"
+                        ).ok();
+                    }
+                }
+                self.pad(depth + 2);
+                writeln!(self.out, "errors++;").ok();
+                self.pad(depth + 1);
+                writeln!(self.out, "}}").ok();
+                self.pad(depth);
+                writeln!(self.out, "}}").ok();
+            }
+        }
+    }
+
     /// `assume <expr>` (immediate form) — same as inline assert but logged
     /// as ASSUME so the user can grep separately. No `errors++` because in
     /// sim, assumes are warnings (spec §5.2).
@@ -3960,6 +4110,9 @@ impl Emitter {
                     writeln!(self.out, "; _w++) tick();").ok();
                 }
             }
+            StmtKind::WaitUntil { mode, conditions, timeout, .. } => {
+                self.emit_wait_until(mode, conditions, timeout.as_ref(), depth);
+            }
             StmtKind::Assert(v) => {
                 // Spec §2 LL(1) table: bare IDENT → named property
                 // reference (concurrent); expression with temporal ops →
@@ -5682,4 +5835,14 @@ fn escape_c(s: &str) -> String {
         }
     }
     out
+}
+
+/// Render a HARC `Expr` back to source-level text via the pretty
+/// printer. Used by `wait until` codegen to label each sub-predicate
+/// in the timeout diagnostic with the user's original expression
+/// (e.g. `env.agent.idle(100)` rather than a synthetic index).
+fn expr_source_str(e: &Expr) -> String {
+    let mut buf = String::new();
+    crate::pretty::print_expr(&mut buf, e);
+    buf
 }

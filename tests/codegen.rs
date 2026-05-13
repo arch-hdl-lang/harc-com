@@ -742,6 +742,132 @@ end impl NestedTest"#,
         "nested idle() should walk through the env's field to the agent's heartbeat fields; got:\n{cpp}");
 }
 
+/// `wait until <expr>` with no timeout lowers to a direct
+/// `co_await harc_rt::wait_until(_slot, [&]{ return <expr>; });` —
+/// the most efficient shape (the scheduler evaluates the predicate
+/// once per cycle and only resumes when true). Pins the lowering
+/// shape (spec §7.9).
+#[test]
+fn wait_until_no_timeout_lowers_to_coroutine_wait_until() {
+    let parsed = parse_source(
+        r#"test T
+    let dut : DummyDut
+end test T
+
+impl sim for T
+    run
+        wait until dut.ready
+    end run
+end impl T"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("co_await harc_rt::wait_until(_slot, [&]{ return")
+            && cpp.contains("dut->ready"),
+        "untimed wait until should lower to coroutine wait_until + predicate lambda; got:\n{cpp}",
+    );
+}
+
+/// `wait until all of <e1>, <e2> timeout N cycles fail("...")` lowers
+/// to a bounded polling loop with per-sub-predicate diagnostics on
+/// timeout. The diagnostic identifies each sub-predicate by its
+/// pretty-printed source text (so logs show `dut.ready` rather than
+/// a synthetic index).
+#[test]
+fn wait_until_all_of_with_timeout_emits_per_predicate_diagnostic() {
+    let parsed = parse_source(
+        r#"test T
+    let dut : DummyDut
+end test T
+
+impl sim for T
+    run
+        wait until all of dut.ready, dut.empty
+            timeout 500 cycles fail("did not quiesce")
+    end run
+end impl T"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    // Loop bounded by `_wu_budget` against `cycle_count`.
+    assert!(cpp.contains("int64_t _wu_budget = (int64_t)(500);"),
+        "expected `_wu_budget` initialized from the timeout expr; got:\n{cpp}");
+    assert!(cpp.contains("_wu_start = (int64_t)cycle_count;"),
+        "expected `_wu_start` snapshot from cycle_count; got:\n{cpp}");
+    // Per-sub-predicate breakdown: one line per condition still false.
+    assert!(cpp.contains("not yet true: dut.ready"),
+        "expected per-predicate diagnostic mentioning `dut.ready`; got:\n{cpp}");
+    assert!(cpp.contains("not yet true: dut.empty"),
+        "expected per-predicate diagnostic mentioning `dut.empty`; got:\n{cpp}");
+    // User-supplied header line.
+    assert!(cpp.contains("did not quiesce"),
+        "expected the user-supplied fail() message in the timeout log; got:\n{cpp}");
+    // Errors counter bumps.
+    assert!(cpp.contains("errors++;"),
+        "expected `errors++;` on timeout; got:\n{cpp}");
+}
+
+/// `wait until any of <e1>, <e2>` on timeout reports "none of" with
+/// the joined source list (we can't say which one was supposed to
+/// fire — by definition none did).
+#[test]
+fn wait_until_any_of_timeout_reports_none_of_list() {
+    let parsed = parse_source(
+        r#"test T
+    let dut : DummyDut
+end test T
+
+impl sim for T
+    run
+        wait until any of dut.error, dut.done
+            timeout 200 cycles fail("expected error or done")
+    end run
+end impl T"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    // The overall cond is `||`-joined — emit_expr wraps DUT signals
+    // in `harc_rt::harc_read(...)` so we test the join-shape with a
+    // tolerant match rather than exact lexical comparison.
+    assert!(cpp.contains("dut->error)) || (harc_rt::harc_read(dut->done"),
+        "any-of overall predicate should be ||-joined; got:\n{cpp}");
+    // Diagnostic lists every sub-predicate (none fired).
+    assert!(cpp.contains("none of: dut.error, dut.done"),
+        "expected `none of:` listing every sub-predicate; got:\n{cpp}");
+}
+
+/// `wait until <expr>` with no timeout still works inside a sync
+/// context — e.g. inside a hookable method body — and lowers to a
+/// `while (!cond) tick();` synchronous polling loop instead of
+/// `co_await`. (Coroutines aren't available inside hookable bodies
+/// because they run between coroutine yields, not as their own
+/// coroutines.)
+#[test]
+fn wait_until_in_sync_context_uses_tick_loop() {
+    let parsed = parse_source(
+        r#"transactor X
+    dut : DummyDut
+    hookable wait_for_ready()
+        wait until dut.ready
+    end wait_for_ready
+end transactor X
+
+test T
+    let dut : DummyDut
+    let xact : X passive
+end test T
+
+impl sim for T
+    run
+        xact.wait_for_ready()
+    end run
+end impl T"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    // Inside a hookable, wait until must lower synchronously.
+    assert!(cpp.contains("while (!(")
+            && cpp.contains(")) tick();"),
+        "wait until in sync context should be `while (!cond) tick();`; got:\n{cpp}");
+}
+
 /// Smoke-sweep every fixture under `tests/fixtures/` through
 /// `cpp_tb::emit`. Fixtures missing a sibling `_sim.harc` half are
 /// auto-paired (e.g. `counter_test.harc` + `counter_test_sim.harc`);

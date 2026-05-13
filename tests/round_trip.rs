@@ -144,6 +144,47 @@ end impl T
     );
 }
 
+/// `wait until <expr>`, `wait until all of …`, `wait until any of …`,
+/// each with or without an inline `timeout N cycles fail("…")` tail,
+/// parse, pretty-print, and re-parse to the same AST shape. Verifies
+/// the source-level surface of spec §7.9.
+#[test]
+fn wait_until_forms_round_trip() {
+    let src = r#"
+test T
+    let dut : X
+end test T
+
+impl sim for T
+    run
+        wait until dut.ready
+        wait until dut.ready timeout 100 cycles fail("ready never asserted")
+        wait until all of dut.ready, dut.empty
+        wait until all of dut.ready, dut.empty timeout 500 cycles fail("hang")
+        wait until any of dut.error, dut.done timeout 1000 cycles
+    end run
+end impl T
+"#;
+    let printed = parse_print_reparse(src);
+    // The single-line shape should survive both passes verbatim.
+    assert!(
+        printed.contains("wait until dut.ready"),
+        "single-condition wait-until should round-trip; got:\n{printed}",
+    );
+    assert!(
+        printed.contains("wait until all of dut.ready, dut.empty"),
+        "all-of list should round-trip with comma separators; got:\n{printed}",
+    );
+    assert!(
+        printed.contains("wait until any of dut.error, dut.done timeout 1000 cycles"),
+        "any-of with timeout (no fail message) should round-trip; got:\n{printed}",
+    );
+    assert!(
+        printed.contains("timeout 100 cycles fail(\"ready never asserted\")"),
+        "inline timeout + fail message should round-trip; got:\n{printed}",
+    );
+}
+
 /// `///` outer doc comments attach to the next construct, populate
 /// `doc: Option<String>` on the AST node, and round-trip through the
 /// pretty-printer. Mirrors arch-com's `plan_arch_doc_comments.md` §2.1.

@@ -1,0 +1,49 @@
+// Negative-path demo of `wait until …` + `timeout`: deliberately
+// trip the timeout so the per-sub-predicate diagnostic fires, then
+// verify the test exits with an error (which is the *intended*
+// outcome here — we WANT the timeout to fire so we can observe the
+// failure message). The fixture pattern:
+//
+//   wait until all of cond_that_holds, cond_that_never_holds
+//       timeout 20 cycles fail("…")
+//
+// On timeout the codegen logs:
+//   FAIL  …user message…
+//   FAIL    not yet true: cond_that_never_holds
+//
+// Because `errors > 0` at end-of-test the runtime exits with status
+// 1 and prints "N TESTS FAILED" — which `run_fixtures.sh` would
+// treat as a FAIL. This fixture is therefore NOT registered in the
+// regression sweep; it's run by the cargo `wait_until_timeout_*`
+// codegen test (static check that the diagnostic is emitted) and
+// can be run manually with `harc sim` when one wants to eyeball the
+// log shape.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+test WaitUntilTimeoutDemoTest
+    let dut : Top
+
+    clock clk = SysDomain
+end test WaitUntilTimeoutDemoTest
+
+impl sim for WaitUntilTimeoutDemoTest
+    run
+        dut.rst = 1
+        wait 1 cycle
+        dut.rst = 0
+
+        // Will time out after 20 cycles. The second predicate
+        // (`false`) never holds, so the diagnostic should log
+        // "not yet true: false". The `dut.count_out == 0` arm DOES
+        // hold (counter held with en=0), so it should NOT appear in
+        // the not-yet-true list.
+        dut.en = 0
+        wait until all of dut.count_out == 0, false
+            timeout 20 cycles fail("expected: this timeout demonstrates the diagnostic")
+
+        log(info, "DEMO: wait-until timeout fired as expected")
+    end run
+end impl WaitUntilTimeoutDemoTest
