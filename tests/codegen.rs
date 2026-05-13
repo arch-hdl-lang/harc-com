@@ -1084,6 +1084,116 @@ end impl T"#,
         "period inside checker should resolve to foo.wdog_period; got:\n{cpp}");
 }
 
+/// Transaction-level `keep` constraints flow through to the Z3
+/// solver block on bare `randomize(t)` (no `with` clause). Before
+/// this change, `keep` items were silently dropped — the parser
+/// accepted them but the codegen only visited `TxnBodyItem::Field`,
+/// so users could write `keep len in [1..256]` and `randomize(t)`
+/// would happily produce `len = 0xFFFFFFFF`. Now every `randomize`
+/// of a transaction with `keep`s routes through Z3.
+#[test]
+fn bare_randomize_routes_keep_constraints_through_z3() {
+    let parsed = parse_source(
+        r#"transaction T
+    addr : uint<32>
+    len  : uint<8>
+
+    keep len in [1..16]
+    keep addr % 4 == 0
+end transaction T
+
+test KeepTest
+    let dut : DummyDut
+end test KeepTest
+
+impl sim for KeepTest
+    run
+        let t : T
+        randomize(t)
+    end run
+end impl KeepTest"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    // Z3 block emitted even though there's no `with`.
+    assert!(cpp.contains("z3::context _ctx;") && cpp.contains("z3::solver _s(_ctx);"),
+        "bare randomize on a keep-bearing txn should still emit the Z3 block; got:\n{cpp}");
+    // The keep constraints are added to the solver — len in [1..16]
+    // lowers via z3::uge/ule, addr % 4 == 0 lowers as plain ==.
+    assert!(cpp.contains("z3::uge(_z_len") && cpp.contains("z3::ule(_z_len"),
+        "expected `len in [1..16]` to lower to uge/ule pair; got:\n{cpp}");
+    assert!(cpp.contains("_z_addr") && cpp.contains(" %% ") || cpp.contains("_z_addr") && cpp.contains("z3"),
+        "expected `addr % 4 == 0` to reach the solver; got:\n{cpp}");
+    // No fallback to randomize_T(&t) — that would silently bypass the keeps.
+    assert!(!cpp.contains("randomize_T(&t);"),
+        "should NOT fall back to PRNG `randomize_T`; got:\n{cpp}");
+}
+
+/// Both transaction-level `keep`s AND the user's `with` body are
+/// added to the same Z3 solver call. The user's constraints can
+/// reference the same fields the keeps constrain — the solver
+/// finds a satisfying assignment across the combined set.
+#[test]
+fn randomize_with_merges_keeps_and_user_constraints() {
+    let parsed = parse_source(
+        r#"transaction T
+    val : uint<32>
+    keep val in [10..200]
+end transaction T
+
+test MergeTest
+    let dut : DummyDut
+end test MergeTest
+
+impl sim for MergeTest
+    run
+        let t : T
+        randomize(t) with
+            t.val > 100
+        end randomize
+    end run
+end impl MergeTest"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    // Both constraints reach the solver: the txn's `keep val in [10..200]`
+    // AND the user's `t.val > 100`. Z3 has to satisfy both.
+    assert!(cpp.contains("z3::uge(_z_val") && cpp.contains("z3::ule(_z_val"),
+        "transaction's `val in [10..200]` should still apply; got:\n{cpp}");
+    assert!(cpp.contains("z3::ugt(_z_val, _ctx.bv_val((uint64_t)100"),
+        "user's `t.val > 100` should also reach the solver; got:\n{cpp}");
+}
+
+/// `keep f != WRAP` where `WRAP` is an enum variant resolves via
+/// the global `enum_variants` map. Without this lookup the
+/// constraint translator would error with "unknown name `WRAP`".
+#[test]
+fn keep_with_enum_variant_resolves_to_numeric_index() {
+    let parsed = parse_source(
+        r#"enum BurstType { FIXED, INCR, WRAP }
+
+transaction T
+    burst : BurstType
+    keep burst != WRAP
+end transaction T
+
+test EnumKeepTest
+    let dut : DummyDut
+end test EnumKeepTest
+
+impl sim for EnumKeepTest
+    run
+        let t : T
+        randomize(t)
+    end run
+end impl EnumKeepTest"#,
+    ).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    // WRAP is the 3rd variant (index 2). The constraint lowers to
+    // _z_burst != bv_val(2, 64). The != comparison emits as plain `!=`
+    // (no z3::ult-family wrapper needed for equality).
+    assert!(cpp.contains("_z_burst != _ctx.bv_val((uint64_t)2, 64)"),
+        "expected `burst != WRAP` to lower with WRAP resolved to index 2; got:\n{cpp}");
+}
+
 /// Smoke-sweep every fixture under `tests/fixtures/` through
 /// `cpp_tb::emit`. Fixtures missing a sibling `_sim.harc` half are
 /// auto-paired (e.g. `counter_test.harc` + `counter_test_sim.harc`);
@@ -1148,8 +1258,7 @@ fn all_fixtures_emit_cleanly() {
                 // external declarations (`use BusAxiLite` brings in a
                 // sibling bus decl, multi-clock fixtures rely on a
                 // separate `domain` file) that aren't in scope when
-                // emitting the fixture standalone. They're not
-                // heartbeat-foundation regressions.
+                // emitting the fixture standalone.
                 let benign = msg.contains("no `test` declaration")
                     || msg.contains("let dut")
                     || msg.contains("only non-sim impls")
@@ -1157,7 +1266,13 @@ fn all_fixtures_emit_cleanly() {
                     || msg.contains("multiple tests")
                     || msg.contains("is not a known bus binding")
                     || msg.contains("no `domain") && msg.contains("declaration was found")
-                    || msg.contains("randomize(") && msg.contains("no `transaction");
+                    || msg.contains("randomize(") && msg.contains("no `transaction")
+                    // axi_agent.harc references enum variants (READ /
+                    // WRITE / WRAP / INCR / FIXED) declared in
+                    // arc.stdlib.BusAxi4. Standalone emit-sweep
+                    // can't resolve them; the real `harc sim`
+                    // invocation imports them via `use`.
+                    || msg.contains("constraint references unknown name");
                 if !benign {
                     failures.push(format!("[emit] {name}: {msg}"));
                 }
