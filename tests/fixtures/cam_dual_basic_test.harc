@@ -73,9 +73,7 @@ test CamDualBasicTest
     let xact : CamDualXactor passive
 
     clock clk = SysDomain
-end test CamDualBasicTest
 
-impl sim for CamDualBasicTest
     run
         log(info, "Mshr_Addr_Cam_Dual dual-write port CAM test")
         xact.dut = dut
@@ -165,5 +163,5 @@ impl sim for CamDualBasicTest
             else fail("post-reset: search_mask=${dut.search_mask}, expected 0")
         log(info, "PASS: reset clears all valid bits")
     end run
-end impl CamDualBasicTest
+end test CamDualBasicTest
 

@@ -62,9 +62,7 @@ end transactor AesXactor
 test AesCipherTopTest
     let dut  : AesCipherTop
     let xact : AesXactor passive
-end test AesCipherTopTest
 
-impl sim for AesCipherTopTest
     run
         log(info, "AES-128 encryption test (FIPS-197 + zero vector)")
         xact.dut = dut
@@ -97,5 +95,5 @@ impl sim for AesCipherTopTest
 
         log(info, "ALL 2 SUB-TESTS PASSED — AES-128 cipher")
     end run
-end impl AesCipherTopTest
+end test AesCipherTopTest
 

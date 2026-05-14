@@ -53,9 +53,7 @@ end transactor PipeXactor
 test CpuPipelineTest
     let dut  : CpuPipe
     let pipe : PipeXactor passive
-end test CpuPipelineTest
 
-impl sim for CpuPipelineTest
     run
         log(info, "CpuPipe 4-stage pipeline test")
         pipe.dut = dut
@@ -269,5 +267,5 @@ impl sim for CpuPipelineTest
 
         log(info, "ALL 7 SUB-TESTS PASSED — CpuPipe pipeline coverage")
     end run
-end impl CpuPipelineTest
+end test CpuPipelineTest
 

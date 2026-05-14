@@ -71,9 +71,7 @@ test AxiLiteMultiPayloadTest
     let axil : BusAxiLite = bind dut
     let drv  : AxilXactor active  = bind axil
     let mon  : AxilXactor passive = bind axil
-end test AxiLiteMultiPayloadTest
 
-impl sim for AxiLiteMultiPayloadTest
     run
         log(info, "AxiLiteRegs multi-payload transactor test")
 
@@ -124,5 +122,5 @@ impl sim for AxiLiteMultiPayloadTest
 
         log(info, "PASS: multi-payload recv() + handshake() captured data + resp on 5 round-trips")
     end run
-end impl AxiLiteMultiPayloadTest
+end test AxiLiteMultiPayloadTest
 

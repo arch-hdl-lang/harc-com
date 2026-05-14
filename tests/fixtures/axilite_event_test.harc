@@ -25,4 +25,59 @@ end scoreboard EvSb
 
 test AxiLiteEventTest
     let dut : AxiLiteRegs
+
+    run
+        log(info, "starting AxiLiteRegs event-driven scoreboard test")
+
+        // ── Reset ────────────────────────────────────────────────────
+        dut.rst = 1
+        dut.axil_aw_addr = 0
+        dut.axil_aw_valid = 0
+        dut.axil_w_data = 0
+        dut.axil_w_strb = 15
+        dut.axil_w_valid = 0
+        dut.axil_b_ready = 1
+        dut.axil_ar_addr = 0
+        dut.axil_ar_valid = 0
+        dut.axil_r_ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // ── 5 random write/read pairs through events ─────────────────
+        for i in 0 .. 5
+            let t : RegOp
+            randomize(t)
+            // Pin addr to MM2S_SA so each write actually round-trips.
+            t.addr = 24
+
+            // Producer side: emit "I'm about to write this value".
+            emit reg_writes(t.value)
+            axil_write(dut, t.addr, t.value)
+            let got = axil_read(dut, t.addr)
+            // Producer side: emit "I just read this value".
+            emit reg_reads(got)
+            logf("axi_master.log", info,
+                 "ev[${i}] addr=0x${t.addr:02x} wrote=0x${t.value:08x} read=0x${got:08x}")
+        end for
+    end run
+
+    check
+        assert sb.expected.empty() else fail("queue not drained: ${sb.expected.size()} left")
+        assert sb.pairs == 5 else fail("expected 5 paired R/W operations, saw ${sb.pairs}")
+        log(info, "PASS: ${sb.pairs} event-driven write/read pairs verified by scoreboard")
+    end check
 end test AxiLiteEventTest
+
+// Sim scope: events decouple test body (producer) from scoreboard (consumer).
+

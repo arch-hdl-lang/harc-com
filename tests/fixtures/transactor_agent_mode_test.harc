@@ -144,9 +144,7 @@ test TransactorAgentModeTest
     // different modes. Mode flows through to `drv` automatically.
     let act : AxilAgent active
     let pas : AxilAgent passive
-end test TransactorAgentModeTest
 
-impl sim for TransactorAgentModeTest
     run
         log(info, "agent declaration reused as active + passive")
 
@@ -209,5 +207,5 @@ impl sim for TransactorAgentModeTest
 
         log(info, "PASS: same agent decl, mode inherited — active drove, passive observed")
     end run
-end impl TransactorAgentModeTest
+end test TransactorAgentModeTest
 

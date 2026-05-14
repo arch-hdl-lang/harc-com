@@ -79,9 +79,7 @@ end transactor MshrXactor
 test MshrCocotbTest
     let dut  : cache_mshr
     let xact : MshrXactor passive
-end test MshrCocotbTest
 
-impl sim for MshrCocotbTest
     run
         log(info, "cache_mshr cocotb-style port — 4 sub-tests")
         xact.dut = dut
@@ -177,5 +175,5 @@ impl sim for MshrCocotbTest
 
         log(info, "ALL 4 SUB-TESTS PASSED — cache_mshr cocotb-port coverage")
     end run
-end impl MshrCocotbTest
+end test MshrCocotbTest
 

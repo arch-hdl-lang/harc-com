@@ -45,9 +45,7 @@ test RelationInliningTest
     let dut : Top
 
     clock clk = SysDomain
-end test RelationInliningTest
 
-impl sim for RelationInliningTest
     run
         dut.rst = 1
         dut.en = 0
@@ -74,4 +72,5 @@ impl sim for RelationInliningTest
 
         log(info, "PASS: 20 randomize-with-relation calls satisfied all 3 inlined constraints")
     end run
-end impl RelationInliningTest
+end test RelationInliningTest
+

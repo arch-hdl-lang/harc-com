@@ -19,9 +19,7 @@ test PtrSyncTest
 
     clock dst_clk = DstDomain    // 133 MHz — primary, drives the sync chain
     clock src_clk = SrcDomain    // 100 MHz — unused inside DUT, just for completeness
-end test PtrSyncTest
 
-impl sim for PtrSyncTest
     run
         // Reset.
         dut.rst = 1
@@ -56,5 +54,5 @@ impl sim for PtrSyncTest
             else fail("v=5 after reset: data_out=${dut.data_out}")
         log(info, "PASS: clean restart after mid-stream reset")
     end run
-end impl PtrSyncTest
+end test PtrSyncTest
 

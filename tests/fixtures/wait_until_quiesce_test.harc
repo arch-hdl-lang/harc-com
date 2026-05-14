@@ -45,9 +45,7 @@ test WaitUntilQuiesceTest
     clock clk = SysDomain
 
     let prod : Producer
-end test WaitUntilQuiesceTest
 
-impl sim for WaitUntilQuiesceTest
     run
         dut.rst = 1
         dut.en = 0
@@ -72,4 +70,5 @@ impl sim for WaitUntilQuiesceTest
 
         log(info, "PASS: wait until quiesced after seen=${prod.seen}")
     end run
-end impl WaitUntilQuiesceTest
+end test WaitUntilQuiesceTest
+

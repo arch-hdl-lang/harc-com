@@ -486,6 +486,11 @@ pub enum TestItem {
     /// phases. The statements form an implicit `run` that lowers the same
     /// way an explicit `run { ... }` would.
     Stmt(Stmt),
+    /// `phase <name> ... end phase <name>` — user-defined named phase
+    /// block at test scope (docs/test-ergonomics.md inline form).
+    /// Equivalent to the same body item inside an `impl sim for T` —
+    /// codegen lifts both into the same `custom_phases` table.
+    Phase(Ident, Block),
 }
 
 #[derive(Debug, Clone)]

@@ -16,9 +16,7 @@ test DataSyncTest
 
     clock dst_clk = DstDomain
     clock src_clk = SrcDomain
-end test DataSyncTest
 
-impl sim for DataSyncTest
     run
         // Reset.
         dut.rst = 1
@@ -93,5 +91,5 @@ impl sim for DataSyncTest
             else fail("stream i=4: data_out=${dut.data_out:02x}, expected 0x33")
         log(info, "PASS: data stream propagates with 3-cycle delay")
     end run
-end impl DataSyncTest
+end test DataSyncTest
 

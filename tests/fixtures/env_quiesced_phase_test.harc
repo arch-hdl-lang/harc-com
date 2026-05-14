@@ -35,9 +35,7 @@ test EnvQuiescedPhaseTest
     clock clk = SysDomain
 
     let top : HeartbeatEnv
-end test EnvQuiescedPhaseTest
 
-impl sim for EnvQuiescedPhaseTest
     phase drain
         wait until all of top.quiesced(8), top.prod.seen == 3
             timeout 200 cycles fail("environment did not quiesce")
@@ -72,4 +70,5 @@ impl sim for EnvQuiescedPhaseTest
             else fail("scoreboard queue did not drain")
         log(info, "PASS: environment drain/check phases completed")
     end check
-end impl EnvQuiescedPhaseTest
+end test EnvQuiescedPhaseTest
+

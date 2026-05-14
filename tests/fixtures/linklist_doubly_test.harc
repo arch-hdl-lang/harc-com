@@ -119,9 +119,7 @@ end transactor SchedXactor
 test LinklistDoublyTest
     let dut  : SchedList
     let xact : SchedXactor passive
-end test LinklistDoublyTest
 
-impl sim for LinklistDoublyTest
     run
         log(info, "SchedList doubly-linked list test")
         xact.dut = dut
@@ -240,5 +238,5 @@ impl sim for LinklistDoublyTest
 
         log(info, "ALL 5 SUB-TESTS PASSED — SchedList doubly-linked list coverage")
     end run
-end impl LinklistDoublyTest
+end test LinklistDoublyTest
 

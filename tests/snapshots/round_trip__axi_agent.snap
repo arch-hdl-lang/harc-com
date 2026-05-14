@@ -74,9 +74,6 @@ end env AxiTbEnv
 test SmokeTest
     let dut : AxiSlave#(AW=32, DW=64, IDW=4)
     let env : AxiTbEnv = bind dut.s_axi
-end test SmokeTest
-
-impl sim for SmokeTest
     run
         env.agent.sequencer.run(RandomTxns(1000))
     end run
@@ -84,7 +81,7 @@ impl sim for SmokeTest
         assert env.cov.cp_op.coverage > 95.0
         assert env.sb.errors == 0
     end check
-end impl SmokeTest
+end test SmokeTest
 
 use tests.aspects.short_bursts
 
@@ -92,13 +89,10 @@ test ShortBurstSmoke
     apply ShortBursts
     let dut : AxiSlave#(AW=32, DW=64, IDW=4)
     let env : AxiTbEnv = bind dut.s_axi
-end test ShortBurstSmoke
-
-impl sim for ShortBurstSmoke
     run
         env.agent.sequencer.run(RandomTxns(500))
     end run
     check
         assert env.sb.errors == 0
     end check
-end impl ShortBurstSmoke
+end test ShortBurstSmoke

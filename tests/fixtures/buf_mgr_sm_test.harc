@@ -115,9 +115,7 @@ end transactor BufMgrXactor
 test BufMgrSmTest
     let dut  : BufMgrSm
     let xact : BufMgrXactor passive
-end test BufMgrSmTest
 
-impl sim for BufMgrSmTest
     run
         log(info, "BufMgrSm small-variant test (16x32, 4 queues)")
         xact.dut = dut
@@ -239,5 +237,5 @@ impl sim for BufMgrSmTest
 
         log(info, "ALL 6 SUB-TESTS PASSED — BufMgrSm coverage")
     end run
-end impl BufMgrSmTest
+end test BufMgrSmTest
 

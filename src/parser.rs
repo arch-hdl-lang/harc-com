@@ -272,9 +272,22 @@ impl Parser {
             Some(TokenKind::Extern) => self.parse_extern_fn(doc).map(Item::ExternFn),
             Some(TokenKind::Apply) => self.parse_apply().map(Item::Apply),
             Some(TokenKind::Bus) => self.parse_bus(doc).map(Item::Bus),
-            Some(TokenKind::Impl) => self.parse_impl(doc).map(Item::Impl),
+            // `impl <target> for <Test>` is the legacy two-block form
+            // (docs/test-ergonomics.md). Removed after the fixture
+            // corpus migrated to inline `run`/`setup`/`check`/`teardown`
+            // inside `test`. Kept as a parser-error surface so legacy
+            // sources fail with a clear directive rather than a generic
+            // "unexpected token".
+            Some(TokenKind::Impl) => Err(CompileError::unexpected_token(
+                "inline `run` / `setup` / `check` / `teardown` block \
+                 inside the `test` body (the legacy `impl <target> for <Test>` \
+                 wrapper was removed — see docs/test-ergonomics.md and \
+                 scripts/migrate_v1_inline.py)",
+                "impl",
+                self.peek_span(),
+            )),
             Some(other) => Err(CompileError::unexpected_token(
-                "use, package, const, struct, enum, transaction, relation, tseq, agent, env, scoreboard, sequencer, transactor, test, extend, impl, covergroup, property, pseq, cover sequence, module, function, or apply",
+                "use, package, const, struct, enum, transaction, relation, tseq, agent, env, scoreboard, sequencer, transactor, test, extend, covergroup, property, pseq, cover sequence, module, function, or apply",
                 &other.to_string(),
                 self.peek_span(),
             )),
@@ -1020,6 +1033,16 @@ impl Parser {
                     inline_scope.teardown = Some(Block { stmts, span: end_span });
                     inline_scope.span = end_span;
                     saw_inline_phase = true;
+                }
+                Some(TokenKind::Phase) => {
+                    self.advance();
+                    let phase_name = self.expect_ident()?;
+                    let stmts = self.parse_stmt_list_until_end()?;
+                    let end_span = self.expect_end(TokenKind::Phase, &phase_name.name)?;
+                    items.push(TestItem::Phase(
+                        phase_name,
+                        Block { stmts, span: end_span },
+                    ));
                 }
                 _ => {
                     items.push(self.parse_test_item()?);

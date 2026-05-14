@@ -46,9 +46,7 @@ test ExternFnRefTest
     let dut : Top
 
     clock clk = SysDomain
-end test ExternFnRefTest
 
-impl sim for ExternFnRefTest
     run
         dut.rst = 1
         dut.en = 0
@@ -71,4 +69,5 @@ impl sim for ExternFnRefTest
 
         log(info, "PASS: 16-byte CRC-8 round-trip matched C reference; final=0x${crc_ref:02x}")
     end run
-end impl ExternFnRefTest
+end test ExternFnRefTest
+

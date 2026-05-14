@@ -168,6 +168,15 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // Hold the owned clone for the lifetime of this emission and
     // re-borrow it as `test` so downstream code is unchanged.
     let mut custom_phases: Vec<(Ident, Block)> = Vec::new();
+    // Inline-form `phase <name> ... end phase` blocks declared directly
+    // inside the test body (docs/test-ergonomics.md) feed the same
+    // table as `ImplItem::Phase` entries from a legacy `impl sim for T`
+    // wrapper — codegen treats both shapes identically downstream.
+    for it in &test_decl.items {
+        if let TestItem::Phase(name, body) = it {
+            custom_phases.push((name.clone(), body.clone()));
+        }
+    }
     let test_owned: TestDecl = {
         let mut t = test_decl.clone();
         if let Some(im) = sim_impl {
