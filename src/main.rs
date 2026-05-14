@@ -825,10 +825,25 @@ fn cmd_sim(
             .ok_or_else(|| miette::miette!(
                 "could not determine SV top module — pass --top or declare `let dut : T`"
             ))?;
-        let mut sv_abs = Vec::with_capacity(sv.len());
+        let mut sv_abs = Vec::with_capacity(sv.len() + 1);
         for s in &sv {
             sv_abs.push(fs::canonicalize(s).into_diagnostic()?);
         }
+
+        // If the test's `let dut : T` carries `probe` declarations,
+        // emit the SV bind stub alongside the .cpp and prepend it
+        // to the verilator inputs. Probe-less tests skip both the
+        // stub write and the public-flat-rd machinery — zero impact
+        // on the existing fixture corpus.
+        if let Some((dut_ty, probes)) = harc::codegen::cpp_tb::dut_probes(&merged) {
+            let stub_src = harc::codegen::sv_stub::emit_stub(&dut_ty, probes)
+                .map_err(|e| miette::miette!("probe stub emit failed: {e}"))?;
+            let stub_path = outdir_abs.join(format!("__harc_probe_{dut_ty}.sv"));
+            fs::write(&stub_path, &stub_src).into_diagnostic()?;
+            eprintln!("emitted {}", stub_path.display());
+            sv_abs.push(stub_path);
+        }
+
         // Canonicalize ref-src paths so verilator (running in obj_dir/)
         // can still find them. Missing files surface as a clear
         // canonicalize error before the verilator command runs,

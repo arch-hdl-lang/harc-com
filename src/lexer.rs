@@ -195,6 +195,13 @@ pub enum TokenKind {
     Active,
     #[token("passive")]
     Passive,
+    /// `probe` declares a hierarchical DUT-internal signal observation
+    /// on a `let dut : T` declaration. `at` introduces the dotted path
+    /// inside the DUT. See docs/probe-signals.md.
+    #[token("probe")]
+    Probe,
+    #[token("at")]
+    At,
     #[token("sequencer")]
     Sequencer,
     #[token("tseq")]
@@ -451,7 +458,7 @@ pub enum TokenKind {
     #[token("#")]
     Hash,
     #[token("@")]
-    At,
+    AtSign,
     #[token("_")]
     Underscore,
 
@@ -553,6 +560,8 @@ impl fmt::Display for TokenKind {
             Transactor => write!(f, "transactor"),
             Active => write!(f, "active"),
             Passive => write!(f, "passive"),
+            Probe => write!(f, "probe"),
+            At => write!(f, "at"),
             Sequencer => write!(f, "sequencer"),
             Tseq => write!(f, "tseq"),
             Scoreboard => write!(f, "scoreboard"),
@@ -674,7 +683,7 @@ impl fmt::Display for TokenKind {
             Bang => write!(f, "!"),
             Question => write!(f, "?"),
             Hash => write!(f, "#"),
-            At => write!(f, "@"),
+            AtSign => write!(f, "@"),
             Underscore => write!(f, "_"),
             TimeLiteral(s) | HexLiteral(s) | BinLiteral(s) | SizedLiteral(s)
             | FloatLiteral(s) | DecLiteral(s) => write!(f, "{s}"),

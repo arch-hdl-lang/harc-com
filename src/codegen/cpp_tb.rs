@@ -78,6 +78,25 @@ pub fn dut_type_name(file: &SourceFile) -> Option<String> {
     None
 }
 
+/// If the test's `let dut : T` carries `probe ... at <path>` declarations,
+/// return `(T's simple name, &probes)`. `None` for tests without probes —
+/// callers skip the SV bind-stub emission entirely in that case.
+pub fn dut_probes(file: &SourceFile) -> Option<(String, &[Probe])> {
+    let test = file.items.iter().find_map(|it| match it {
+        Item::Test(t) => Some(t),
+        _ => None,
+    })?;
+    for it in &test.items {
+        if let TestItem::Let(l) = it {
+            if l.name.name == "dut" && !l.probes.is_empty() {
+                let ty = type_simple_name(l.ty.as_ref())?.to_string();
+                return Some((ty, &l.probes));
+            }
+        }
+    }
+    None
+}
+
 /// Emit a C++ Verilator TB for the single `test` declaration in this file.
 /// Per-emit options. Currently just the `--mt` opt-in for Phase 3a's
 /// per-actor OS thread topology; defaults to cooperative
@@ -239,6 +258,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     let mut bare_stmts: Vec<&Stmt> = Vec::new();
     let mut explicit_run: Option<&Block> = None;
     let mut clocks: Vec<&ClockDecl> = Vec::new();
+    let mut probe_accessors: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for it in &test.items {
         match it {
             TestItem::Let(l) => {
@@ -247,6 +268,14 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                         EmitError("`let dut : <Type>` must use a simple named type".into())
                     })?;
                     dut_type = Some(ty_name);
+                    // Capture probe accessors: name → mangled path inside
+                    // `dut->rootp`. Matches src/codegen/sv_stub.rs naming.
+                    for p in &l.probes {
+                        probe_accessors.insert(
+                            p.name.name.clone(),
+                            crate::codegen::sv_stub::mangled_accessor(ty_name, &p.name.name),
+                        );
+                    }
                 } else {
                     other_lets.push(l);
                 }
@@ -466,6 +495,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         current_component_instance: None,
         txn_keeps,
         relations,
+        probes: probe_accessors,
     };
 
     // Header.
@@ -492,6 +522,13 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     writeln!(e.out, "#endif").ok();
     writeln!(e.out, "").ok();
     writeln!(e.out, "#include \"V{dut_type}.h\"").ok();
+    // Probe access needs the root struct's full definition (the
+    // `rootp` field on V<Top> is a forward-declared pointer in
+    // `V<Top>.h`). When the test declares one or more probes, also
+    // include the root header so `dut->rootp-><mangled>` compiles.
+    if !e.probes.is_empty() {
+        writeln!(e.out, "#include \"V{dut_type}___024root.h\"").ok();
+    }
     writeln!(e.out, "#include \"verilated.h\"").ok();
     writeln!(e.out, "#if VM_COVERAGE").ok();
     writeln!(e.out, "#include \"verilated_cov.h\"").ok();
@@ -1720,6 +1757,13 @@ struct Emitter {
     /// key means the transaction has no `keep`s; bare `randomize(t)`
     /// stays on the fast PRNG path.
     txn_keeps: std::collections::HashMap<String, Vec<Expr>>,
+    /// Map from `probe_name` to the mangled accessor string used after
+    /// `dut->rootp->`. Populated from the test's `let dut : T { probe ... }`
+    /// block at emit start; consulted when lowering `dut.<X>` so that
+    /// probe reads/writes route through the Verilator-bind stub instead of
+    /// the (non-existent) top-level signal of the original DUT. Empty for
+    /// probe-less tests — current 76 fixtures all sit in this bucket.
+    probes: std::collections::HashMap<String, String>,
     /// Free-standing `relation` declarations indexed by name (spec
     /// §4.2). `Call(Ident(R), args)` inside a constraint expression
     /// expands to R's body with formal parameters substituted by the
@@ -6653,6 +6697,24 @@ impl Emitter {
             }
             ExprKind::ImplicitSelf => {}
             ExprKind::Field { target, name } => {
+                // Probe lowering. `dut.<name>` where <name> was declared
+                // as a `probe` on the `let dut : T` decl resolves to
+                // `dut->rootp-><mangled>`, not the (non-existent) top-
+                // level `dut-><name>`. Reads still wrap with harc_read
+                // so wide signals downcast cleanly. See
+                // docs/probe-signals.md.
+                if let ExprKind::Ident(id) = &*target.kind {
+                    if id.name == "dut" {
+                        if let Some(mangled) = self.probes.get(&name.name).cloned() {
+                            if lvalue {
+                                write!(self.out, "dut->rootp->{mangled}").ok();
+                            } else {
+                                write!(self.out, "harc_rt::harc_read(dut->rootp->{mangled})").ok();
+                            }
+                            return;
+                        }
+                    }
+                }
                 // Bus-bound binding lowering. If `target` is an Ident
                 // bound to a bus (`let axil : BusAxiLite = bind dut`),
                 // resolve `axil.signal` to `<root>-><axil>_<signal>`.
