@@ -1065,6 +1065,12 @@ fn print_stmt(out: &mut String, s: &Stmt, depth: usize) {
             print_path(out, &a.path);
             writeln!(out).ok();
         }
+        StmtKind::Release(e) => {
+            pad(out, depth);
+            write!(out, "release ").ok();
+            print_expr(out, e);
+            writeln!(out).ok();
+        }
         StmtKind::Assert(v) => print_verify(out, "assert", v, depth),
         StmtKind::Assume(v) => print_verify(out, "assume", v, depth),
         StmtKind::Cover(v) => print_verify(out, "cover", v, depth),
