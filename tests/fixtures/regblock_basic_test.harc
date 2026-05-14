@@ -1,0 +1,92 @@
+// RAL Phase 1a smoke test (docs/ral-support.md).
+//
+// Declares a `regblock` with three named registers against the
+// AxiLiteRegs DUT, routes reads/writes through an `AxilHelper`
+// transactor (`via AxilHelper`), and verifies the mirror + bus
+// round-trip end-to-end.
+//
+// Surface exercised:
+//   - `regblock R via Helper width N` decl
+//   - `register NAME @ ADDR access rw` (with optional reset)
+//   - `let regs : R = bind helper` instantiation (mirror struct)
+//   - `regs.NAME = value` lowering (mirror update + helper.write)
+//   - `regs.NAME` rvalue lowering (helper.read)
+//
+// Out of scope (deferred to later phases per RFC §10):
+// field-level decomposition, addrmap composition, w1c/ro/wo
+// policies, mem blocks, bitbash, multi-map.
+
+use BusAxiLite
+
+transactor AxilHelper bound to BusAxiLite
+    hookable write(addr: uint<8>, data: uint<32>)
+        bus.aw.addr = addr
+        bus.aw.valid = 1
+        bus.w.send(data, 15)
+        bus.aw.valid = 0
+        wait 1 cycle
+    end write
+
+    hookable read(addr: uint<8>) -> uint<32>
+        bus.ar.addr = addr
+        bus.ar.valid = 1
+        let r = bus.r.recv()
+        bus.ar.valid = 0
+        wait 1 cycle
+        return r.data
+    end read
+end transactor AxilHelper
+
+regblock DmaRegs via AxilHelper width 32
+    /// DMACR — DMA control register. Bit 0 is RS (run/stop).
+    register DMACR @ 0x00 reset 0 access rw
+    /// MM2S_SA — memory-to-stream source address.
+    register MM2S_SA @ 0x18 reset 0 access rw
+    /// MM2S_LEN — transfer length.
+    register MM2S_LEN @ 0x28 reset 0 access rw
+end regblock DmaRegs
+
+test RegblockBasicTest
+    let dut    : AxiLiteRegs
+    let axil   : BusAxiLite = bind dut
+    let helper : AxilHelper passive = bind axil
+    let regs   : DmaRegs = bind helper
+
+    run
+        // Reset.
+        dut.rst = 1
+        axil.aw.valid = 0
+        axil.w.valid = 0
+        axil.b.ready = 1
+        axil.ar.valid = 0
+        axil.r.ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Frontdoor write through the regblock.
+        regs.DMACR = 1
+        assert (regs.DMACR & 1) == 1
+            else fail("DMACR.RS readback (got 0x${regs.DMACR:08x})")
+
+        regs.MM2S_SA = 3735879680            // 0xDEAD_1000
+        assert regs.MM2S_SA == 3735879680
+            else fail("MM2S_SA readback (got 0x${regs.MM2S_SA:08x})")
+
+        regs.MM2S_LEN = 64
+        assert regs.MM2S_LEN == 64
+            else fail("MM2S_LEN readback (got 0x${regs.MM2S_LEN:08x})")
+
+        log(info, "PASS: 3 regblock registers round-tripped via AxilHelper")
+    end run
+end test RegblockBasicTest

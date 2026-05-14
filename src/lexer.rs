@@ -202,6 +202,17 @@ pub enum TokenKind {
     Probe,
     #[token("at")]
     At,
+    /// Register Abstraction Layer (docs/ral-support.md). `regblock`
+    /// declares a typed register block; `register` declares one
+    /// register inside it; `via` names the helper transactor whose
+    /// `write(addr, data)` / `read(addr) -> data` methods route bus
+    /// traffic.
+    #[token("regblock")]
+    Regblock,
+    #[token("register")]
+    Register,
+    #[token("via")]
+    Via,
     #[token("sequencer")]
     Sequencer,
     #[token("tseq")]
@@ -562,6 +573,9 @@ impl fmt::Display for TokenKind {
             Passive => write!(f, "passive"),
             Probe => write!(f, "probe"),
             At => write!(f, "at"),
+            Regblock => write!(f, "regblock"),
+            Register => write!(f, "register"),
+            Via => write!(f, "via"),
             Sequencer => write!(f, "sequencer"),
             Tseq => write!(f, "tseq"),
             Scoreboard => write!(f, "scoreboard"),
