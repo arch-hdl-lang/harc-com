@@ -324,6 +324,12 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     let mut buses: std::collections::HashMap<String, BusDecl> = std::collections::HashMap::new();
     let mut transactors: std::collections::HashMap<String, TransactorDecl> =
         std::collections::HashMap::new();
+    // RAL regblocks indexed by name. Populated in the pre-pass below;
+    // consulted at codegen time to (a) emit one POD mirror struct +
+    // constexpr address table per regblock at file scope, and (b)
+    // lower `regs.NAME` field accesses against the bound helper.
+    let mut regblocks: std::collections::HashMap<String, RegblockDecl> =
+        std::collections::HashMap::new();
     let mut txn_fields: std::collections::HashMap<String, Vec<TxnFieldInfo>> =
         std::collections::HashMap::new();
     // Per-transaction `keep` constraints (spec §4 — "constraints are
@@ -373,6 +379,9 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             }
             Item::Transactor(t) => {
                 transactors.insert(t.name.name.clone(), t.clone());
+            }
+            Item::Regblock(r) => {
+                regblocks.insert(r.name.name.clone(), r.clone());
             }
             _ => {}
         }
@@ -457,6 +466,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                 || covergroups.contains_key(simple)
                 || buses.contains_key(simple)
                 || transactors.contains_key(simple)
+                || regblocks.contains_key(simple)
             {
                 continue;
             }
@@ -505,6 +515,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         txn_keeps,
         relations,
         probes: probe_accessors,
+        regblocks,
+        let_helper: std::collections::HashMap::new(),
     };
 
     // Header.
@@ -712,6 +724,57 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                 writeln!(e.out, "}};").ok();
                 writeln!(e.out, "").ok();
             }
+        }
+    }
+
+    // ── RAL regblock mirror structs + address tables ────────────────────
+    // One POD `struct <Name>_Mirror { uint<W>_t REG; ... };` per
+    // declared `regblock`, plus a `constexpr` address table giving
+    // each register's byte offset. Accessor calls (`regs.NAME = v` /
+    // `let x = regs.NAME`) lower to mirror update + helper.write/read
+    // — see docs/ral-support.md §7.4 (frontdoor lowering). Phase 1a
+    // keeps the mirror flat — no nested addrmap composition yet.
+    for it in &file.items {
+        if let Item::Regblock(r) = it {
+            let default_w = r.default_width.unwrap_or(32);
+            writeln!(e.out, "struct {}_Mirror {{", r.name.name).ok();
+            for reg in &r.registers {
+                let w = reg.width.unwrap_or(default_w);
+                let cty = mirror_field_c_type(w);
+                let init = match &reg.reset {
+                    Some(rv) => format!(" = {}", c_int_literal_from(&rv.kind)),
+                    None => " = 0".to_string(),
+                };
+                writeln!(e.out, "{INDENT}{cty} {}{};", reg.name.name, init).ok();
+            }
+            writeln!(e.out, "}};").ok();
+            writeln!(e.out, "").ok();
+
+            // constexpr address table — one entry per register, indexed
+            // by C++ identifier matching the source register name. Used
+            // by future bitbash() lowering; reads/writes inline the
+            // offset literal directly for simplicity in Phase 1a.
+            writeln!(
+                e.out,
+                "struct {}_AddrEntry {{ const char* name; uint64_t offset; uint32_t width; }};",
+                r.name.name,
+            ).ok();
+            writeln!(
+                e.out,
+                "static constexpr {}_AddrEntry {}_AddrTable[] = {{",
+                r.name.name, r.name.name,
+            ).ok();
+            for reg in &r.registers {
+                let w = reg.width.unwrap_or(default_w);
+                let off = c_int_literal_from(&reg.offset.kind);
+                writeln!(
+                    e.out,
+                    "{INDENT}{{ \"{name}\", {off}, {w} }},",
+                    name = reg.name.name,
+                ).ok();
+            }
+            writeln!(e.out, "}};").ok();
+            writeln!(e.out, "").ok();
         }
     }
 
@@ -1773,6 +1836,18 @@ struct Emitter {
     /// the (non-existent) top-level signal of the original DUT. Empty for
     /// probe-less tests — current 76 fixtures all sit in this bucket.
     probes: std::collections::HashMap<String, String>,
+    /// RAL regblock declarations indexed by type name. See ast.rs::
+    /// `RegblockDecl`. Used to emit one POD mirror struct +
+    /// `constexpr` address table per declared regblock at file scope,
+    /// and to lower `regs.NAME` field accesses against the bound
+    /// helper transactor at call sites.
+    regblocks: std::collections::HashMap<String, RegblockDecl>,
+    /// Per-test map from a `let regs : <RegblockType> = bind <helper>`
+    /// variable name to its helper transactor variable name. Populated
+    /// when emitting the test's `let`s; consulted when lowering
+    /// `regs.<reg>` accessors so the emitted call resolves to
+    /// `<helper>.write(addr, val)` / `<helper>.read(addr)`.
+    let_helper: std::collections::HashMap<String, String>,
     /// Free-standing `relation` declarations indexed by name (spec
     /// §4.2). `Call(Ident(R), args)` inside a constraint expression
     /// expands to R's body with formal parameters substituted by the
@@ -5619,11 +5694,11 @@ impl Emitter {
             StmtKind::Let(l) => self.emit_let(l, depth),
             StmtKind::Send { target, value } => {
                 self.pad(depth);
-                self.emit_signal_assignment(target, value);
+                self.emit_signal_assignment(target, value, depth);
             }
             StmtKind::Assign { target, value } => {
                 self.pad(depth);
-                self.emit_signal_assignment(target, value);
+                self.emit_signal_assignment(target, value, depth);
             }
             StmtKind::For(f) => {
                 self.pad(depth);
@@ -6187,6 +6262,36 @@ impl Emitter {
                 }
             }
         }
+        // RAL regblock binding: `let regs : <RegblockType> = bind <helper>`.
+        // Emit `<T>_Mirror regs;` (reset values populate from the struct
+        // default initializers emitted at file scope) and record the
+        // helper variable name so accessor lowering can resolve it.
+        // See docs/ral-support.md.
+        if let Some(simple) = type_simple_name(l.ty.as_ref()) {
+            if self.regblocks.contains_key(simple) {
+                if l.bind {
+                    if let Some(v) = &l.value {
+                        if let ExprKind::Ident(rhs) = &*v.kind {
+                            self.let_helper
+                                .insert(l.name.name.clone(), rhs.name.clone());
+                        } else {
+                            self.errors.push(format!(
+                                "let {} : {simple} = bind <expr>: regblock binding RHS must be a helper transactor identifier",
+                                l.name.name,
+                            ));
+                        }
+                    }
+                } else {
+                    self.errors.push(format!(
+                        "let {} : {simple}: regblock instantiation requires `= bind <helper>` (a transactor with write/read methods)",
+                        l.name.name,
+                    ));
+                }
+                self.pad(depth);
+                writeln!(self.out, "{simple}_Mirror {};", l.name.name).ok();
+                return;
+            }
+        }
         // Component binding: `let drv : AxilDrv = bind axil` for a
         // `driver` / `agent` / `monitor` declared `bound to BusType`.
         // The binding ties this driver instance to the named bus
@@ -6603,7 +6708,59 @@ impl Emitter {
     ///      `std::initializer_list<uint32_t>`. Without this, the
     ///      literal would clamp at 128 bits in `c_int_literal`'s
     ///      composite path and silently lose the high bits.
-    fn emit_signal_assignment(&mut self, target: &Expr, value: &Expr) {
+    /// If `target` is a `regs.NAME` field access where `regs` is a
+    /// RAL regblock binding, return `(regs_var, helper_var, helper_ty,
+    /// offset_literal)`. Used by `emit_signal_assignment` (write side)
+    /// and `emit_expr_with_arrow` (read side).
+    fn resolve_regblock_field_lookup(
+        &self,
+        target: &Expr,
+    ) -> Option<(String, String, String, String)> {
+        let ExprKind::Field { target: outer, name } = &*target.kind else {
+            return None;
+        };
+        let ExprKind::Ident(regs_id) = &*outer.kind else {
+            return None;
+        };
+        let regs_ty = self.let_types.get(&regs_id.name)?;
+        let block = self.regblocks.get(regs_ty)?;
+        let reg = block.registers.iter().find(|r| r.name.name == name.name)?;
+        let helper_var = self.let_helper.get(&regs_id.name)?.clone();
+        let helper_ty = self.let_types.get(&helper_var)?.clone();
+        let offset_lit = c_int_literal_from(&reg.offset.kind);
+        Some((regs_id.name.clone(), helper_var, helper_ty, offset_lit))
+    }
+
+    fn resolve_regblock_field_write(
+        &self,
+        target: &Expr,
+    ) -> Option<(String, String, String, String)> {
+        self.resolve_regblock_field_lookup(target)
+    }
+
+    fn emit_signal_assignment(&mut self, target: &Expr, value: &Expr, depth: usize) {
+        // RAL frontdoor write: `regs.NAME = expr` where `regs` is a
+        // `let regs : <Regblock> = bind <helper>` instantiation. Lowers
+        // to mirror update + `<HelperType>_write(helper, OFFSET, expr)`.
+        // See docs/ral-support.md §7.4. Phase 1a does only the write
+        // half of predict (read-side mirror sync is a follow-up).
+        if let Some((regs_var, helper_var, helper_ty, offset_lit)) =
+            self.resolve_regblock_field_write(target)
+        {
+            write!(self.out, "{regs_var}.").ok();
+            if let ExprKind::Field { name, .. } = &*target.kind {
+                write!(self.out, "{}", name.name).ok();
+            }
+            write!(self.out, " = ").ok();
+            self.emit_expr(value);
+            writeln!(self.out, ";").ok();
+            self.pad(depth);
+            write!(self.out, "{helper_ty}_write({helper_var}, {offset_lit}, ").ok();
+            self.emit_expr(value);
+            writeln!(self.out, ");").ok();
+            return;
+        }
+
         let pointer_rooted = self.is_pointer_rooted_signal_lvalue(target);
         let wide_words = is_wide_int_literal(value);
 
@@ -6706,6 +6863,19 @@ impl Emitter {
             }
             ExprKind::ImplicitSelf => {}
             ExprKind::Field { target, name } => {
+                // RAL frontdoor read: `regs.NAME` rvalue. Lowers to
+                // `<HelperType>_read(helper, OFFSET)`. The write side
+                // is handled in emit_signal_assignment so it can
+                // also emit the mirror update on a separate line.
+                // See docs/ral-support.md §7.4.
+                if !lvalue {
+                    if let Some((_regs_var, helper_var, helper_ty, offset_lit)) =
+                        self.resolve_regblock_field_lookup(e)
+                    {
+                        write!(self.out, "{helper_ty}_read({helper_var}, {offset_lit})").ok();
+                        return;
+                    }
+                }
                 // Probe lowering. `dut.<name>` where <name> was declared
                 // as a `probe` on the `let dut : T` decl resolves to
                 // `dut->rootp-><mangled>`, not the (non-existent) top-
@@ -7394,6 +7564,31 @@ fn c_binary_op(op: BinaryOp) -> &'static str {
         PipeImplies | PipeImpliesNext | Throughout | Within | Intersect | In | Inside => {
             "/* unsupported-op */ ,"
         }
+    }
+}
+
+/// C++ unsigned integer type wide enough to hold a register of `width`
+/// bits. Phase 1a caps at 64; wider registers (e.g. AES blocks) would
+/// need the `harc_rt::harc_u128` story used elsewhere in this file.
+fn mirror_field_c_type(width: u32) -> &'static str {
+    match width {
+        1..=8 => "uint8_t",
+        9..=16 => "uint16_t",
+        17..=32 => "uint32_t",
+        _ => "uint64_t",
+    }
+}
+
+/// Render an integer-literal `ExprKind` as a C++ integer literal.
+/// Non-integer expressions fall back to `0` so the emitted code still
+/// compiles; the parser path that calls this only fires on `Int(...)`
+/// today because reset values and addresses are parsed with
+/// `parse_expr` and the codegen surfaces dynamic expressions through
+/// the main emit path. Phase 1a callers always supply Int kinds.
+fn c_int_literal_from(k: &ExprKind) -> String {
+    match k {
+        ExprKind::Int(s) => c_int_literal(s),
+        _ => "0".to_string(),
     }
 }
 

@@ -222,6 +222,33 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
             pad(out, depth);
             writeln!(out, "end impl {}", i.test_name.name).ok();
         }
+        Item::Regblock(r) => {
+            print_doc(out, &r.doc, depth);
+            pad(out, depth);
+            write!(out, "regblock {} via {}", r.name.name, r.via_helper.name).ok();
+            if let Some(w) = r.default_width {
+                write!(out, " width {w}").ok();
+            }
+            writeln!(out).ok();
+            print_inner_doc(out, &r.inner_doc, depth + 1);
+            for reg in &r.registers {
+                print_doc(out, &reg.doc, depth + 1);
+                pad(out, depth + 1);
+                write!(out, "register {} @ ", reg.name.name).ok();
+                print_expr(out, &reg.offset);
+                if let Some(w) = reg.width {
+                    write!(out, " width {w}").ok();
+                }
+                if let Some(rv) = &reg.reset {
+                    write!(out, " reset ").ok();
+                    print_expr(out, rv);
+                }
+                write!(out, " access {}", reg.access.keyword()).ok();
+                writeln!(out).ok();
+            }
+            pad(out, depth);
+            writeln!(out, "end regblock {}", r.name.name).ok();
+        }
         Item::Test(t) => {
             print_doc(out, &t.doc, depth);
             pad(out, depth);
