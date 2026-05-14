@@ -138,9 +138,7 @@ end transactor BufMgrXactor
 test BufMgrTest
     let dut  : BufMgr
     let xact : BufMgrXactor passive
-end test BufMgrTest
 
-impl sim for BufMgrTest
     run
         log(info, "BufMgr: 256-queue shared buffer manager — 7 sub-tests")
         xact.dut = dut
@@ -261,5 +259,5 @@ impl sim for BufMgrTest
 
         log(info, "ALL 7 SUB-TESTS PASSED — BufMgr 256-queue buffer manager coverage")
     end run
-end impl BufMgrTest
+end test BufMgrTest
 

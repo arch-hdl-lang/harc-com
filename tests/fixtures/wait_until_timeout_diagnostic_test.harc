@@ -27,9 +27,7 @@ test WaitUntilTimeoutDemoTest
     let dut : Top
 
     clock clk = SysDomain
-end test WaitUntilTimeoutDemoTest
 
-impl sim for WaitUntilTimeoutDemoTest
     run
         dut.rst = 1
         wait 1 cycle
@@ -46,4 +44,5 @@ impl sim for WaitUntilTimeoutDemoTest
 
         log(info, "DEMO: wait-until timeout fired as expected")
     end run
-end impl WaitUntilTimeoutDemoTest
+end test WaitUntilTimeoutDemoTest
+

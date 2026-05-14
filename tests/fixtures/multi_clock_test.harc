@@ -11,9 +11,7 @@ test MultiClockSyncTest
 
     clock fast_clk = FastDomain    // 200 MHz → 5  ns period
     clock slow_clk = SlowDomain    //  50 MHz → 20 ns period
-end test MultiClockSyncTest
 
-impl sim for MultiClockSyncTest
     run
         // Reset on both domains.
         dut.rst = 1
@@ -57,5 +55,5 @@ impl sim for MultiClockSyncTest
             else fail("fast advanced ${now_fast - prev_fast} during 1 slow cycle, expected 4")
         log(info, "PASS: independent clock domains advance in real time (4:1 ratio observed)")
     end run
-end impl MultiClockSyncTest
+end test MultiClockSyncTest
 

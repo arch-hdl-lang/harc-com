@@ -121,9 +121,6 @@ fn ternary_round_trips() {
     let src = r#"
 test T
     let dut : X
-end test T
-
-impl sim for T
     run
         let a = 5
         let b = 10
@@ -132,7 +129,7 @@ impl sim for T
         let e = (a > 0 ? a : b) + 1
         wait 1 cycle
     end run
-end impl T
+end test T
 "#;
     let printed = parse_print_reparse(src);
     // Sanity-check that the parens around the ternary inside `e` survive
@@ -153,9 +150,6 @@ fn wait_until_forms_round_trip() {
     let src = r#"
 test T
     let dut : X
-end test T
-
-impl sim for T
     run
         wait until dut.ready
         wait until dut.ready timeout 100 cycles fail("ready never asserted")
@@ -163,7 +157,7 @@ impl sim for T
         wait until all of dut.ready, dut.empty timeout 500 cycles fail("hang")
         wait until any of dut.error, dut.done timeout 1000 cycles
     end run
-end impl T
+end test T
 "#;
     let printed = parse_print_reparse(src);
     // The single-line shape should survive both passes verbatim.
@@ -215,16 +209,13 @@ end agent Baz
 test T
     let dut : X
     let foo : Foo
-end test T
-
-impl sim for T
     run
         on 1000 cycles
             log(info, "heartbeat at ${cycle_count}")
         end on
         wait 5 cycles
     end run
-end impl T
+end test T
 "#;
     let printed = parse_print_reparse(src);
     // Periodic on-handler keeps its `cycles` decorator.
@@ -253,15 +244,12 @@ extern function ref_dump_state(cycle: uint<64>)
 
 test T
     let dut : X
-end test T
-
-impl sim for T
     run
         let c = ref_crc8_step(0xFF, 0)
         ref_dump_state(100)
         wait 1 cycle
     end run
-end impl T
+end test T
 "#;
     let printed = parse_print_reparse(src);
     assert!(printed.contains("extern function ref_crc8_step(crc: uint<8>, byte: uint<8>) -> uint<8>"),
@@ -400,14 +388,11 @@ end transactor AxiWrXactor
 test SmokeTest
     //! Smoke test — runs once and exits.
     let dut : DummyDut
-end test SmokeTest
-
-impl sim for SmokeTest
     //! Sim implementation — emits one log line.
     run
         log(info, "ok")
     end run
-end impl SmokeTest
+end test SmokeTest
 "#;
     let parsed = parse_source(src).expect("parse");
     for item in &parsed.items {

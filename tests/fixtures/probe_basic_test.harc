@@ -16,9 +16,7 @@ test ProbeBasicTest
         probe alu_b   : uint<32> at alu0.b
         probe alu_res : uint<32> at alu0.result
     end let dut
-end test ProbeBasicTest
 
-impl sim for ProbeBasicTest
     run
         log(info, "CpuPipe probe-signals smoke test")
 
@@ -56,4 +54,5 @@ impl sim for ProbeBasicTest
 
         log(info, "PASS: 3 probes through SV bind stub verified")
     end run
-end impl ProbeBasicTest
+end test ProbeBasicTest
+

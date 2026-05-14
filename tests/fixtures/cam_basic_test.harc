@@ -19,9 +19,7 @@ test CamBasicTest
     let dut : Mshr_Addr_Cam
 
     clock clk = SysDomain
-end test CamBasicTest
 
-impl sim for CamBasicTest
     run
         // Reset.
         dut.rst = 1
@@ -87,5 +85,5 @@ impl sim for CamBasicTest
             else fail("post-clear: first=${dut.search_first}, expected 7")
         log(info, "PASS: clear idx 3 → search 0x55 finds only idx 7")
     end run
-end impl CamBasicTest
+end test CamBasicTest
 

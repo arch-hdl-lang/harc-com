@@ -17,9 +17,7 @@ test IfWaitForInThenTest
     let done_pulses : uint<32> = 0
     let prev_done   : uint<32> = 0
     let cycles_since_last_done : uint<32> = 0
-end test IfWaitForInThenTest
 
-impl sim for IfWaitForInThenTest
     run
         log(info, "if_wait_for_in_then sim")
 
@@ -67,5 +65,5 @@ impl sim for IfWaitForInThenTest
             else fail("for-loop did not iterate the expected number of times: got ${done_pulses}, expected 4")
         log(info, "PASS: for-loop iterated ${done_pulses} times correctly")
     end run
-end impl IfWaitForInThenTest
+end test IfWaitForInThenTest
 

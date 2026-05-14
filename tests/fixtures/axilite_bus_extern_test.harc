@@ -21,9 +21,7 @@ test AxiLiteBusExternTest
     // payload signals. The binding name `axil` is the prefix on
     // `dut`'s flat signals (matches arch-com's port naming).
     let axil : BusAxiLite = bind dut
-end test AxiLiteBusExternTest
 
-impl sim for AxiLiteBusExternTest
     run
         // Reset.
         dut.rst = 1
@@ -86,5 +84,5 @@ impl sim for AxiLiteBusExternTest
             else fail("read got 0x${val:08x}, expected 0xDEADBEEF")
         log(info, "PASS: BusAxiLite (extern-imported) round-trip")
     end run
-end impl AxiLiteBusExternTest
+end test AxiLiteBusExternTest
 

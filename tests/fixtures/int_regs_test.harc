@@ -15,9 +15,7 @@ end function write_reg
 
 test IntRegsTest
     let dut : IntRegs
-end test IntRegsTest
 
-impl sim for IntRegsTest
     run
         // Reset
         dut.rst = 1
@@ -74,5 +72,5 @@ impl sim for IntRegsTest
 
         dut.write_en = 0
     end run
-end impl IntRegsTest
+end test IntRegsTest
 

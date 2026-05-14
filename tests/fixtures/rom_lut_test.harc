@@ -30,9 +30,7 @@ end covergroup RomCov
 test RomLutTest
     let dut : RomLut
     let cov : RomCov
-end test RomLutTest
 
-impl sim for RomLutTest
     run
         // Init inputs.
         dut.rd_addr = 0
@@ -58,5 +56,5 @@ impl sim for RomLutTest
         assert cov.cp_addr.a0 > 0 else fail("addr 0 coverage hole")
         assert cov.cp_addr.a7 > 0 else fail("addr 7 coverage hole")
     end check
-end impl RomLutTest
+end test RomLutTest
 

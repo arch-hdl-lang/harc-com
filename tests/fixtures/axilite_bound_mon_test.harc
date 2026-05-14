@@ -78,9 +78,7 @@ test AxiLiteBoundMonTest
     let axil : BusAxiLite = bind dut
     let drv  : AxilXactor active  = bind axil
     let mon  : AxilXactor passive = bind axil
-end test AxiLiteBoundMonTest
 
-impl sim for AxiLiteBoundMonTest
     run
         log(info, "AxiLiteRegs transactor passive-observer test")
 
@@ -125,5 +123,5 @@ impl sim for AxiLiteBoundMonTest
 
         log(info, "PASS: passive transactor observed 5 writes + 5 reads")
     end run
-end impl AxiLiteBoundMonTest
+end test AxiLiteBoundMonTest
 

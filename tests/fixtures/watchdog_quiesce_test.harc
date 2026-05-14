@@ -47,9 +47,7 @@ test WatchdogQuiesceTest
     clock clk = SysDomain
 
     let prod : Producer
-end test WatchdogQuiesceTest
 
-impl sim for WatchdogQuiesceTest
     run
         dut.rst = 1
         dut.en = 0
@@ -75,4 +73,5 @@ impl sim for WatchdogQuiesceTest
             timeout 200 cycles fail("agent did not finish all 20 emits")
         log(info, "PASS: watchdog watched ${prod.seen} emits without tripping")
     end run
-end impl WatchdogQuiesceTest
+end test WatchdogQuiesceTest
+

@@ -134,9 +134,7 @@ test TransactorEnvModeTest
     // levels (env → agent → transactor) at each.
     let active_env  : AxilEnv active
     let passive_env : AxilEnv passive
-end test TransactorEnvModeTest
 
-impl sim for TransactorEnvModeTest
     run
         log(info, "env mode inheritance flows env → agent → transactor")
 
@@ -197,5 +195,5 @@ impl sim for TransactorEnvModeTest
 
         log(info, "PASS: same env decl, mode inherited two levels — env→agent→transactor")
     end run
-end impl TransactorEnvModeTest
+end test TransactorEnvModeTest
 

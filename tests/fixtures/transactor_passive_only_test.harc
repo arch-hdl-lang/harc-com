@@ -73,9 +73,7 @@ test TransactorPassiveOnlyTest
     let axil : BusAxiLite = bind dut
     // Single passive instance — no `active` companion exists.
     let mon  : AxilXactor passive = bind axil
-end test TransactorPassiveOnlyTest
 
-impl sim for TransactorPassiveOnlyTest
     run
         log(info, "passive-only transactor regression: monitor sees test-scope bus traffic")
 
@@ -130,5 +128,5 @@ impl sim for TransactorPassiveOnlyTest
 
         log(info, "PASS: passive-only transactor observed 3 writes + 3 reads, active half cleanly elided")
     end run
-end impl TransactorPassiveOnlyTest
+end test TransactorPassiveOnlyTest
 

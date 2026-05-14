@@ -21,9 +21,7 @@ end function ram_read
 
 test SinglePortRamTest
     let dut : SimpleMem
-end test SinglePortRamTest
 
-impl sim for SinglePortRamTest
     run
         // Idle init.
         dut.access_en = 0
@@ -75,5 +73,5 @@ impl sim for SinglePortRamTest
 
         dut.access_en = 0
     end run
-end impl SinglePortRamTest
+end test SinglePortRamTest
 

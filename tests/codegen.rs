@@ -17,34 +17,11 @@ fn missing_test_is_a_clean_error() {
     assert!(err.0.contains("no `test` declaration"));
 }
 
-#[test]
-fn split_test_via_extend_round_trips_to_same_cpp() {
-    // The split-file form (base + extend test) should produce the same C++
-    // as the all-in-one form. Snapshot equality is the discipline.
-    let base = include_str!("fixtures/counter_test.harc");
-    let sim = include_str!("fixtures/counter_test_sim.harc");
-    let parsed = vec![
-        parse_source(base).expect("base parse"),
-        parse_source(sim).expect("sim extend parse"),
-    ];
-    let merged = merge::merge_for_sim(&parsed, None).expect("merge");
-    let cpp = cpp_tb::emit(&merged).expect("emit");
-    insta::assert_snapshot!("counter_tb_cpp", cpp);
-}
-
-#[test]
-fn impl_with_no_base_test_errors_clearly() {
-    let only_impl =
-        parse_source("impl sim for Missing\n    run\n    end run\nend impl Missing").unwrap();
-    // `merge_for_sim` requires a base test; an `impl` referencing
-    // an unknown test name surfaces at codegen time, not merge time.
-    let err = merge::merge_for_sim(&[only_impl], None).unwrap_err();
-    assert!(
-        err.contains("no `test` declaration"),
-        "expected 'no `test` declaration' error, got: {}",
-        err
-    );
-}
+// Tests for the legacy `impl sim for T` two-block form were removed
+// alongside its parser entry in Phase 2 of docs/test-ergonomics.md.
+// Inline-form coverage lives in the fixture suite (counter_test,
+// rom_lut_inline_test, etc.) — those exercise the same lowering
+// through the new single-block path.
 
 #[test]
 fn multiple_tests_require_explicit_pick() {
@@ -66,12 +43,9 @@ end test B
 fn missing_dut_let_is_a_clean_error() {
     let parsed = parse_source(
         r#"test T
-end test T
-
-impl sim for T
     run
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap();
     let err = cpp_tb::emit(&parsed).unwrap_err();
@@ -90,9 +64,6 @@ fn wide_hex_format_spec_routes_through_hexbuf128() {
     let parsed = parse_source(
         r#"test T
     let dut : DummyDut
-end test T
-
-impl sim for T
     run
         // Wide-hex spec — width 32 hex digits = 128 bits.
         log(info, "ct=0x${dut.text_out:032x}")
@@ -101,7 +72,7 @@ impl sim for T
         // Uppercase wide spec.
         log(info, "CT=0x${dut.text_out:032X}")
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -155,9 +126,6 @@ fn wide_hex_literal_routes_assign_and_eq_through_word_helpers() {
     let parsed = parse_source(
         r#"test T
     let dut : DummyDut
-end test T
-
-impl sim for T
     run
         // 256-bit literal — 64 hex digits — must split into 8
         // words and route through harc_assign_words for the write
@@ -166,7 +134,7 @@ impl sim for T
         assert dut.data == 0xffffffffffffffff_0000000000000000_aabbccddeeff0011_2233445566778899
             else fail("nope")
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -191,15 +159,12 @@ fn wide_hex_literal_lowers_to_harc_u128_composite() {
     let parsed = parse_source(
         r#"test T
     let dut : DummyDut
-end test T
-
-impl sim for T
     run
         dut.x = 0x000102030405060708090a0b0c0d0e0f
         assert dut.y == 0x66e94bd4ef8a2c3b884cfa59ca342b2e
             else fail("nope")
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -249,16 +214,13 @@ fn main_loop_settles_comb_before_first_posedge_then_posedge_before_tick() {
     let parsed = parse_source(
         r#"test T
     let dut : DummyDut
-end test T
-
-impl sim for T
     run
         dut.x = 1
         wait 1 cycle
         dut.x = 2
         wait 1 cycle
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -321,9 +283,6 @@ fn pointer_rooted_signal_access_uses_wide_helpers() {
     let parsed = parse_source(
         r#"test T
     let dut : DummyDut
-end test T
-
-impl sim for T
     run
         dut.wide_in = 305419896
         dut.narrow_in = 5
@@ -331,7 +290,7 @@ impl sim for T
             else fail("wide read")
         let v = dut.wide_out + 1
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -380,16 +339,13 @@ fn top_level_const_lowers_to_static_constexpr() {
 const HALF      : uint<32> = MSHR_SIZE / 2
 test T
     let dut : DummyDut
-end test T
-
-impl sim for T
     run
         assert MSHR_SIZE == 32
             else fail("MSHR_SIZE wrong")
         assert HALF == 16
             else fail("HALF wrong")
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -428,9 +384,6 @@ fn log_severity_test_result_semantics() {
     let parsed = parse_source(
         r#"test T
     let dut : DummyDut
-end test T
-
-impl sim for T
     run
         log(info,  "info: no effect")
         log(warn,  "warn: no effect")
@@ -438,7 +391,7 @@ impl sim for T
         log(error, "error: should bump counter")
         log(fatal, "fatal: should abort")
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -492,9 +445,6 @@ fn impl_sim_custom_phase_lowers_as_named_lambda() {
     let parsed = parse_source(
         r#"test T
     let dut : DummyDut
-end test T
-
-impl sim for T
     phase warmup
         log(info, "warmup phase")
     end phase warmup
@@ -503,7 +453,7 @@ impl sim for T
         warmup()
         wait 1 cycle
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -534,31 +484,10 @@ end impl T"#,
     );
 }
 
-/// v0 only emits codegen for `impl sim for ...`. A test with only
-/// non-sim impls (e.g. `impl emu for ...`) errors clearly rather than
-/// silently producing an empty binary — emu transport is post-v0.
-#[test]
-fn impl_emu_only_test_errors_clearly() {
-    let parsed = parse_source(
-        r#"test T
-    let dut : DummyDut
-end test T
-
-impl emu for T
-    run
-        log(info, "emu run body")
-    end run
-end impl T"#,
-    )
-    .unwrap();
-
-    let err = cpp_tb::emit(&parsed).unwrap_err();
-    assert!(
-        err.0.contains("only non-sim impls") && err.0.contains("emu"),
-        "expected clear error mentioning non-sim impls; got: {}",
-        err.0
-    );
-}
+// The legacy `impl <target> for <Test>` form was removed in Phase 2
+// of docs/test-ergonomics.md, so an emu-only impl is no longer
+// expressible at parse time. Backend selection moves to CLI
+// subcommands (`harc sim` / future `harc emu`); see RFC §5.
 
 /// `expr as Type` (postfix cast, same shape as arch-com's grammar)
 /// emits a C++ cast `((<c_type>)(<inner>))` when the target is a
@@ -571,9 +500,6 @@ fn cast_to_builtin_emits_cpp_cast() {
     let parsed = parse_source(
         r#"test T
     let dut : DummyDut
-end test T
-
-impl sim for T
     run
         // Walk-1 pattern that needs cast-widened source: `(1 as
         // uint<32>) << 31` would otherwise be `1 << 31` against a
@@ -581,7 +507,7 @@ impl sim for T
         let mask : uint<32> = (1 as uint<32>) << 31
         dut.X = mask
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -611,9 +537,6 @@ fn standalone_fail_emits_sim_log_and_errors_bump() {
     let parsed = parse_source(
         r#"test T
     let dut : DummyDut
-end test T
-
-impl sim for T
     run
         for i in 0 .. 4
             if i == 3
@@ -621,7 +544,7 @@ impl sim for T
             end if
         end for
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -665,16 +588,13 @@ end agent Producer
 test HeartbeatTest
     let dut : DummyDut
     let prod : Producer
-end test HeartbeatTest
-
-impl sim for HeartbeatTest
     run
         let stuck = prod.idle(50)
         let stuck_in = prod.idle_in(10)
         let stuck_out = prod.idle_out(20)
         wait 1 cycle
     end run
-end impl HeartbeatTest"#,
+end test HeartbeatTest"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -761,13 +681,10 @@ test BusHeartbeatTest
     let dut : DummyDut
     let axil : BusLite = bind dut
     let drv : SeqXactor active = bind axil
-end test BusHeartbeatTest
-
-impl sim for BusHeartbeatTest
     run
         wait 1 cycle
     end run
-end impl BusHeartbeatTest"#,
+end test BusHeartbeatTest"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -806,13 +723,10 @@ end transactor Xact
 test UserIdleTest
     let dut : DummyDut
     let xact : Xact passive
-end test UserIdleTest
-
-impl sim for UserIdleTest
     run
         xact.idle(4)
     end run
-end impl UserIdleTest"#,
+end test UserIdleTest"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -848,14 +762,11 @@ end env TopEnv
 test NestedTest
     let dut : DummyDut
     let top : TopEnv
-end test NestedTest
-
-impl sim for NestedTest
     run
         let hung = top.w.idle(100)
         wait 1 cycle
     end run
-end impl NestedTest"#,
+end test NestedTest"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -886,14 +797,11 @@ end env TopEnv
 test EnvQuiescedTest
     let dut : DummyDut
     let top : TopEnv
-end test EnvQuiescedTest
-
-impl sim for EnvQuiescedTest
     run
         wait until top.quiesced(12)
             timeout 100 cycles fail("environment did not quiesce")
     end run
-end impl EnvQuiescedTest"#,
+end test EnvQuiescedTest"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -926,13 +834,10 @@ fn wait_until_no_timeout_lowers_to_coroutine_wait_until() {
     let parsed = parse_source(
         r#"test T
     let dut : DummyDut
-end test T
-
-impl sim for T
     run
         wait until dut.ready
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -956,14 +861,11 @@ fn wait_until_all_of_with_timeout_emits_per_predicate_diagnostic() {
     let parsed = parse_source(
         r#"test T
     let dut : DummyDut
-end test T
-
-impl sim for T
     run
         wait until all of dut.ready, dut.empty
             timeout 500 cycles fail("did not quiesce")
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -1020,14 +922,11 @@ fn wait_until_any_of_timeout_reports_none_of_list() {
     let parsed = parse_source(
         r#"test T
     let dut : DummyDut
-end test T
-
-impl sim for T
     run
         wait until any of dut.error, dut.done
             timeout 200 cycles fail("expected error or done")
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -1063,13 +962,10 @@ end transactor X
 test T
     let dut : DummyDut
     let xact : X passive
-end test T
-
-impl sim for T
     run
         xact.wait_for_ready_bounded()
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -1115,13 +1011,10 @@ end transactor X
 test T
     let dut : DummyDut
     let xact : X passive
-end test T
-
-impl sim for T
     run
         xact.wait_for_ready()
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -1142,16 +1035,13 @@ fn on_n_cycles_lowers_to_periodic_checker() {
     let parsed = parse_source(
         r#"test T
     let dut : DummyDut
-end test T
-
-impl sim for T
     run
         on 100 cycles
             log(info, "heartbeat")
         end on
         wait 5 cycles
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -1198,13 +1088,10 @@ end agent Foo
 test T
     let dut : DummyDut
     let foo : Foo
-end test T
-
-impl sim for T
     run
         wait 1 cycle
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -1258,13 +1145,10 @@ end agent NoWdog
 test T
     let dut : DummyDut
     let nw : NoWdog
-end test T
-
-impl sim for T
     run
         wait 1 cycle
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -1299,15 +1183,12 @@ end agent Foo
 test T
     let dut : DummyDut
     let foo : Foo
-end test T
-
-impl sim for T
     run
         foo.wdog_period = 100
         foo.wdog_max_idle = 500
         wait 1 cycle
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -1345,14 +1226,11 @@ end transaction T
 
 test KeepTest
     let dut : DummyDut
-end test KeepTest
-
-impl sim for KeepTest
     run
         let t : T
         randomize(t)
     end run
-end impl KeepTest"#,
+end test KeepTest"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -1393,16 +1271,13 @@ end transaction T
 
 test MergeTest
     let dut : DummyDut
-end test MergeTest
-
-impl sim for MergeTest
     run
         let t : T
         randomize(t) with
             t.val > 100
         end randomize
     end run
-end impl MergeTest"#,
+end test MergeTest"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -1433,14 +1308,11 @@ end transaction T
 
 test EnumKeepTest
     let dut : DummyDut
-end test EnumKeepTest
-
-impl sim for EnumKeepTest
     run
         let t : T
         randomize(t)
     end run
-end impl EnumKeepTest"#,
+end test EnumKeepTest"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
@@ -1473,14 +1345,11 @@ end relation Bounded
 
 test BlockRelTest
     let dut : DummyDut
-end test BlockRelTest
-
-impl sim for BlockRelTest
     run
         let t : T
         randomize(t) with Bounded(t) end randomize
     end run
-end impl BlockRelTest"#,
+end test BlockRelTest"#,
     ).unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     // Both relation body expressions reach the solver.
@@ -1507,14 +1376,11 @@ relation BothAlignedAndHigh(x: T) = Aligned(x) && HighHalf(x)
 
 test AliasRelTest
     let dut : DummyDut
-end test AliasRelTest
-
-impl sim for AliasRelTest
     run
         let t : T
         randomize(t) with BothAlignedAndHigh(t) end randomize
     end run
-end impl AliasRelTest"#,
+end test AliasRelTest"#,
     ).unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     // The alias `BothAlignedAndHigh(t)` should expand to
@@ -1554,14 +1420,11 @@ end relation Small
 
 test SubstTest
     let dut : DummyDut
-end test SubstTest
-
-impl sim for SubstTest
     run
         let pkt : Pkt
         randomize(pkt) with Small(pkt) end randomize
     end run
-end impl SubstTest"#,
+end test SubstTest"#,
     ).unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     // After substitution, `x.size` becomes `pkt.size`, which the
@@ -1584,14 +1447,11 @@ fn extern_function_emits_extern_c_forward_decl() {
 
 test ExternTest
     let dut : DummyDut
-end test ExternTest
-
-impl sim for ExternTest
     run
         let c = ref_crc8_step(0xFF, 0x42)
         assert c == ref_crc8_step(0xFF, 0x42)
     end run
-end impl ExternTest"#,
+end test ExternTest"#,
     ).unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     // Forward declaration block at file scope.
@@ -1618,13 +1478,10 @@ fn no_extern_function_means_no_extern_c_block() {
     let parsed = parse_source(
         r#"test T
     let dut : DummyDut
-end test T
-
-impl sim for T
     run
         wait 1 cycle
     end run
-end impl T"#,
+end test T"#,
     ).unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(!cpp.contains("extern \"C\" {"),
@@ -1744,15 +1601,12 @@ end struct Pkt
 
 test T
     let dut : DummyDut
-end test T
-
-impl sim for T
     run
         let raw : uint<64> = 0xDEAD_BEEF_CAFE_BABE
         let pkt = raw as Pkt
         dut.X = pkt.addr
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");

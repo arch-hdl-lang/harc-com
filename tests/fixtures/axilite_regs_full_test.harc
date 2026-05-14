@@ -47,9 +47,7 @@ test AxiLiteRegsFullTest
     let dut    : AxiLiteRegs
     let axil   : BusAxiLite = bind dut
     let helper : AxilHelper passive = bind axil
-end test AxiLiteRegsFullTest
 
-impl sim for AxiLiteRegsFullTest
     run
         // ── Reset ────────────────────────────────────────────────
         dut.rst = 1
@@ -239,5 +237,5 @@ impl sim for AxiLiteRegsFullTest
 
         log(info, "ALL 6 SUB-TESTS PASSED — register-level coverage of AxiLiteRegs")
     end run
-end impl AxiLiteRegsFullTest
+end test AxiLiteRegsFullTest
 

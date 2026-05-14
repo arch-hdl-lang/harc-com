@@ -41,9 +41,7 @@ test WatchdogTripDemoTest
     clock clk = SysDomain
 
     let agent : SilentAgent
-end test WatchdogTripDemoTest
 
-impl sim for WatchdogTripDemoTest
     run
         dut.rst = 1
         dut.en = 0
@@ -55,4 +53,5 @@ impl sim for WatchdogTripDemoTest
 
         log(info, "DEMO: watchdog should have tripped multiple times above")
     end run
-end impl WatchdogTripDemoTest
+end test WatchdogTripDemoTest
+
