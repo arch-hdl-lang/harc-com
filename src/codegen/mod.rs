@@ -6,3 +6,4 @@
 
 pub mod cpp_tb;
 pub mod merge;
+pub mod sv_stub;
