@@ -246,6 +246,12 @@ impl Parser {
             Some(TokenKind::Tseq) => self.parse_tseq(doc).map(Item::Tseq),
             Some(TokenKind::Agent) => self.parse_component(ComponentKind::Agent, doc).map(Item::Agent),
             Some(TokenKind::Env) => self.parse_component(ComponentKind::Env, doc).map(Item::Env),
+            // `testbench T ... end testbench T` shares env's component
+            // machinery (fields, hookable methods, bus binding) — the
+            // distinction is the source keyword and the convention of
+            // owning a DUT-typed field. Stored as `Item::Env` so all
+            // downstream codegen passes treat it identically.
+            Some(TokenKind::Testbench) => self.parse_component(ComponentKind::Testbench, doc).map(Item::Env),
             Some(TokenKind::Scoreboard) => self.parse_component(ComponentKind::Scoreboard, doc).map(Item::Scoreboard),
             Some(TokenKind::Sequencer) => self.parse_component(ComponentKind::Sequencer, doc).map(Item::Sequencer),
             Some(TokenKind::Transactor) => self.parse_transactor(doc).map(Item::Transactor),
@@ -650,6 +656,7 @@ impl Parser {
                 "ComponentKind::Transactor is a synthetic codegen-only kind; \
                  transactors enter the parser via parse_transactor, not parse_component"
             ),
+            ComponentKind::Testbench => TokenKind::Testbench,
         };
         let start = self.expect(start_kw.clone())?.span;
         let name = self.expect_ident()?;
