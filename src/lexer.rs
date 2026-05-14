@@ -217,6 +217,14 @@ pub enum TokenKind {
     /// — bit-slice inside a `register` block. See docs/ral-support.md.
     #[token("field")]
     Field,
+    /// `addrmap` is the chip-level container holding multiple
+    /// regblock instances at different base addresses. `instance NAME
+    /// : RegblockType @ BASE` decls populate the body. See
+    /// docs/ral-support.md §4.
+    #[token("addrmap")]
+    Addrmap,
+    #[token("instance")]
+    Instance,
     #[token("sequencer")]
     Sequencer,
     #[token("tseq")]
@@ -581,6 +589,8 @@ impl fmt::Display for TokenKind {
             Register => write!(f, "register"),
             Via => write!(f, "via"),
             Field => write!(f, "field"),
+            Addrmap => write!(f, "addrmap"),
+            Instance => write!(f, "instance"),
             Sequencer => write!(f, "sequencer"),
             Tseq => write!(f, "tseq"),
             Scoreboard => write!(f, "scoreboard"),

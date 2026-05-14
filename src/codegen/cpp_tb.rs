@@ -254,6 +254,10 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // lower `regs.NAME` field accesses against the bound helper.
     let mut regblocks: std::collections::HashMap<String, RegblockDecl> =
         std::collections::HashMap::new();
+    // RAL addrmaps indexed by name. Chip-level container of regblock
+    // instances at distinct base addresses. See docs/ral-support.md §4.
+    let mut addrmaps: std::collections::HashMap<String, AddrmapDecl> =
+        std::collections::HashMap::new();
     let mut txn_fields: std::collections::HashMap<String, Vec<TxnFieldInfo>> =
         std::collections::HashMap::new();
     // Per-transaction `keep` constraints (spec §4 — "constraints are
@@ -306,6 +310,9 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             }
             Item::Regblock(r) => {
                 regblocks.insert(r.name.name.clone(), r.clone());
+            }
+            Item::Addrmap(a) => {
+                addrmaps.insert(a.name.name.clone(), a.clone());
             }
             _ => {}
         }
@@ -391,6 +398,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                 || buses.contains_key(simple)
                 || transactors.contains_key(simple)
                 || regblocks.contains_key(simple)
+                || addrmaps.contains_key(simple)
             {
                 continue;
             }
@@ -440,6 +448,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         relations,
         probes: probe_accessors,
         regblocks,
+        addrmaps,
         let_helper: std::collections::HashMap::new(),
     };
 
@@ -695,6 +704,28 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                     e.out,
                     "{INDENT}{{ \"{name}\", {off}, {w} }},",
                     name = reg.name.name,
+                ).ok();
+            }
+            writeln!(e.out, "}};").ok();
+            writeln!(e.out, "").ok();
+        }
+    }
+
+    // ── RAL addrmap mirror structs ──────────────────────────────────────
+    // Chip-level container. Each `addrmap A { instance inst : R @ B }`
+    // lowers to `struct A_Mirror { R_Mirror inst; ... };` — one
+    // member per instance, of the corresponding regblock's Mirror
+    // type. Bus addresses for `chip.inst.REG` are computed
+    // `BASE_inst + offset(REG)` at codegen time. See docs/ral-support.md §4.
+    for it in &file.items {
+        if let Item::Addrmap(a) = it {
+            writeln!(e.out, "struct {}_Mirror {{", a.name.name).ok();
+            for inst in &a.instances {
+                writeln!(
+                    e.out,
+                    "{INDENT}{ty}_Mirror {name};",
+                    ty = inst.regblock_ty.name,
+                    name = inst.name.name,
                 ).ok();
             }
             writeln!(e.out, "}};").ok();
@@ -1766,6 +1797,10 @@ struct Emitter {
     /// and to lower `regs.NAME` field accesses against the bound
     /// helper transactor at call sites.
     regblocks: std::collections::HashMap<String, RegblockDecl>,
+    /// RAL addrmap declarations indexed by type name. Chip-level
+    /// container; each instance owns one regblock at a distinct base
+    /// address. See docs/ral-support.md §4.
+    addrmaps: std::collections::HashMap<String, AddrmapDecl>,
     /// Per-test map from a `let regs : <RegblockType> = bind <helper>`
     /// variable name to its helper transactor variable name. Populated
     /// when emitting the test's `let`s; consulted when lowering
@@ -6194,6 +6229,34 @@ impl Emitter {
                 }
             }
         }
+        // RAL addrmap binding: `let chip : <AddrmapType> = bind <helper>`.
+        // Same shape as regblock binding — emits a value-typed mirror
+        // struct and records the helper.
+        if let Some(simple) = type_simple_name(l.ty.as_ref()) {
+            if self.addrmaps.contains_key(simple) {
+                if l.bind {
+                    if let Some(v) = &l.value {
+                        if let ExprKind::Ident(rhs) = &*v.kind {
+                            self.let_helper
+                                .insert(l.name.name.clone(), rhs.name.clone());
+                        } else {
+                            self.errors.push(format!(
+                                "let {} : {simple} = bind <expr>: addrmap binding RHS must be a helper transactor identifier",
+                                l.name.name,
+                            ));
+                        }
+                    }
+                } else {
+                    self.errors.push(format!(
+                        "let {} : {simple}: addrmap instantiation requires `= bind <helper>`",
+                        l.name.name,
+                    ));
+                }
+                self.pad(depth);
+                writeln!(self.out, "{simple}_Mirror {};", l.name.name).ok();
+                return;
+            }
+        }
         // RAL regblock binding: `let regs : <RegblockType> = bind <helper>`.
         // Emit `<T>_Mirror regs;` (reset values populate from the struct
         // default initializers emitted at file scope) and record the
@@ -6728,6 +6791,82 @@ impl Emitter {
         true
     }
 
+    /// 3-level `chip.inst.REG` addrmap access. Returns
+    /// `(chip_var, instance_path, helper_var, helper_ty,
+    ///   effective_offset_expr, register-access-policy)`.
+    fn resolve_addrmap_register_lookup(
+        &self,
+        target: &Expr,
+    ) -> Option<(String, String, String, String, String, RegAccess)> {
+        let ExprKind::Field { target: mid, name: reg_name } = &*target.kind else {
+            return None;
+        };
+        let ExprKind::Field { target: outer, name: inst_name } = &*mid.kind else {
+            return None;
+        };
+        let ExprKind::Ident(chip_id) = &*outer.kind else {
+            return None;
+        };
+        let chip_ty = self.let_types.get(&chip_id.name)?;
+        let amap = self.addrmaps.get(chip_ty)?;
+        let inst = amap.instances.iter().find(|i| i.name.name == inst_name.name)?;
+        let block = self.regblocks.get(&inst.regblock_ty.name)?;
+        let reg = block.registers.iter().find(|r| r.name.name == reg_name.name)?;
+        let helper_var = self.let_helper.get(&chip_id.name)?.clone();
+        let helper_ty = self.let_types.get(&helper_var)?.clone();
+        let base = c_int_literal_from(&inst.base_addr.kind);
+        let off = c_int_literal_from(&reg.offset.kind);
+        let effective = format!("({base} + {off})");
+        let instance_path = format!("{}.{}", chip_id.name, inst_name.name);
+        Some((chip_id.name.clone(), instance_path, helper_var, helper_ty, effective, reg.access))
+    }
+
+    /// 4-level `chip.inst.REG.FIELD` addrmap+field access.
+    fn resolve_addrmap_subfield_lookup(
+        &self,
+        target: &Expr,
+    ) -> Option<(String, String, String, String, String, String, &'static str, u32, u32, RegAccess)> {
+        let ExprKind::Field { target: lvl3, name: fld_name } = &*target.kind else {
+            return None;
+        };
+        let ExprKind::Field { target: lvl2, name: reg_name } = &*lvl3.kind else {
+            return None;
+        };
+        let ExprKind::Field { target: lvl1, name: inst_name } = &*lvl2.kind else {
+            return None;
+        };
+        let ExprKind::Ident(chip_id) = &*lvl1.kind else {
+            return None;
+        };
+        let chip_ty = self.let_types.get(&chip_id.name)?;
+        let amap = self.addrmaps.get(chip_ty)?;
+        let inst = amap.instances.iter().find(|i| i.name.name == inst_name.name)?;
+        let block = self.regblocks.get(&inst.regblock_ty.name)?;
+        let reg = block.registers.iter().find(|r| r.name.name == reg_name.name)?;
+        let fld = reg.fields.iter().find(|f| f.name.name == fld_name.name)?;
+        let helper_var = self.let_helper.get(&chip_id.name)?.clone();
+        let helper_ty = self.let_types.get(&helper_var)?.clone();
+        let base = c_int_literal_from(&inst.base_addr.kind);
+        let off = c_int_literal_from(&reg.offset.kind);
+        let effective = format!("({base} + {off})");
+        let reg_width = reg.width.unwrap_or(block.default_width.unwrap_or(32));
+        let reg_c_type = mirror_field_c_type(reg_width);
+        let bit_width = field_bit_width(&fld.ty);
+        let instance_path = format!("{}.{}", chip_id.name, inst_name.name);
+        Some((
+            chip_id.name.clone(),
+            instance_path,
+            reg.name.name.clone(),
+            helper_var,
+            helper_ty,
+            effective,
+            reg_c_type,
+            fld.bit_pos,
+            bit_width,
+            fld.access,
+        ))
+    }
+
     fn resolve_regblock_field_lookup(
         &self,
         target: &Expr,
@@ -6796,6 +6935,62 @@ impl Emitter {
     }
 
     fn emit_signal_assignment(&mut self, target: &Expr, value: &Expr, depth: usize) {
+        // RAL addrmap subfield write: `chip.inst.REG.FIELD = expr`.
+        // Identical lowering to the regblock subfield path, but the
+        // bus offset is `base(inst) + offset(REG)` and the mirror path
+        // walks through the instance: `chip.inst.REG`.
+        if let Some((
+            _chip_var, inst_path, reg_name, helper_var, helper_ty,
+            effective_off, reg_c_type, bit_pos, bit_width, access,
+        )) = self.resolve_addrmap_subfield_lookup(target)
+        {
+            let mask = field_mask_literal(bit_width);
+            write!(
+                self.out,
+                "{inst_path}.{reg_name} = ({inst_path}.{reg_name} & ~(({reg_c_type})0x{mask:x}u << {bit_pos})) | (((({reg_c_type})(",
+            ).ok();
+            self.emit_expr(value);
+            writeln!(
+                self.out,
+                ")) & 0x{mask:x}u) << {bit_pos});",
+            ).ok();
+            if access.writes_to_bus() {
+                self.pad(depth);
+                writeln!(
+                    self.out,
+                    "{helper_ty}_write({helper_var}, {effective_off}, {inst_path}.{reg_name});",
+                ).ok();
+            } else {
+                self.pad(depth);
+                writeln!(self.out, "// RO field — write to bus suppressed (chip mirror still updated)").ok();
+            }
+            return;
+        }
+
+        // RAL addrmap register write: `chip.inst.REG = expr`.
+        if let Some((_chip_var, inst_path, helper_var, helper_ty, effective_off, access)) =
+            self.resolve_addrmap_register_lookup(target)
+        {
+            // The outer Field's `name` is the register name itself.
+            write!(self.out, "{inst_path}.").ok();
+            if let ExprKind::Field { name, .. } = &*target.kind {
+                write!(self.out, "{}", name.name).ok();
+            }
+            write!(self.out, " = ").ok();
+            self.emit_expr(value);
+            writeln!(self.out, ";").ok();
+            if access.writes_to_bus() {
+                self.pad(depth);
+                write!(self.out, "{helper_ty}_write({helper_var}, {effective_off}, ").ok();
+                self.emit_expr(value);
+                writeln!(self.out, ");").ok();
+            } else {
+                self.pad(depth);
+                writeln!(self.out, "// RO register — write to bus suppressed (mirror updated)").ok();
+            }
+            return;
+        }
+
         // RAL frontdoor field-level write: `regs.REG.FIELD = expr`.
         // Lowers to a read-modify-write on the mirror (mask out the
         // FIELD bits, OR in the new value shifted into POS) + a bus
@@ -6963,6 +7158,46 @@ impl Emitter {
             }
             ExprKind::ImplicitSelf => {}
             ExprKind::Field { target, name } => {
+                // RAL addrmap subfield read: `chip.inst.REG.FIELD`.
+                // Mirror path is `chip.inst.REG`; offset is base+reg_off.
+                if !lvalue {
+                    if let Some((
+                        _chip_var, inst_path, reg_name, helper_var, helper_ty,
+                        effective_off, _reg_c_type, bit_pos, bit_width, access,
+                    )) = self.resolve_addrmap_subfield_lookup(e)
+                    {
+                        let mask = field_mask_literal(bit_width);
+                        if access.reads_from_bus() {
+                            write!(
+                                self.out,
+                                "((({inst_path}.{reg_name} = {helper_ty}_read({helper_var}, {effective_off})) >> {bit_pos}) & 0x{mask:x}u)",
+                            ).ok();
+                        } else {
+                            write!(
+                                self.out,
+                                "(({inst_path}.{reg_name} >> {bit_pos}) & 0x{mask:x}u)",
+                            ).ok();
+                        }
+                        return;
+                    }
+                }
+                // RAL addrmap register read: `chip.inst.REG`.
+                if !lvalue {
+                    if let Some((_chip_var, inst_path, helper_var, helper_ty, effective_off, access)) =
+                        self.resolve_addrmap_register_lookup(e)
+                    {
+                        if access.reads_from_bus() {
+                            write!(
+                                self.out,
+                                "({inst_path}.{} = {helper_ty}_read({helper_var}, {effective_off}))",
+                                name.name,
+                            ).ok();
+                        } else {
+                            write!(self.out, "{inst_path}.{}", name.name).ok();
+                        }
+                        return;
+                    }
+                }
                 // RAL frontdoor field-level read: `regs.REG.FIELD`.
                 // For RW/RO: `((regs.REG = <H>_read(helper, OFFSET)) >> POS) & MASK`
                 // — bus read updates the mirror (read-side predict) AND
