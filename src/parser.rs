@@ -272,6 +272,7 @@ impl Parser {
             Some(TokenKind::Extern) => self.parse_extern_fn(doc).map(Item::ExternFn),
             Some(TokenKind::Apply) => self.parse_apply().map(Item::Apply),
             Some(TokenKind::Bus) => self.parse_bus(doc).map(Item::Bus),
+            Some(TokenKind::Regblock) => self.parse_regblock(doc).map(Item::Regblock),
             // `impl <target> for <Test>` is the legacy two-block form
             // (docs/test-ergonomics.md). Removed after the fixture
             // corpus migrated to inline `run`/`setup`/`check`/`teardown`
@@ -1455,6 +1456,128 @@ impl Parser {
             name, params: Vec::new(), signals, handshakes,
             span: start.merge(end), doc, inner_doc,
         })
+    }
+
+    // ── Register Abstraction Layer (RAL) ──────────────────────────────────────
+
+    /// Parse:
+    ///   regblock <Name> via <Helper> [width <N>]
+    ///       register <Name> @ <addr> [width <N>] [reset <V>] [access <Policy>]
+    ///       ...
+    ///   end regblock <Name>
+    ///
+    /// Phase 1a: registers only (no field-level decomposition); single
+    /// access policy (`rw`); helper-routed protocol (`via <Transactor>`),
+    /// not direct `bound to <Bus>`. See docs/ral-support.md.
+    fn parse_regblock(&mut self, doc: Option<String>) -> Result<RegblockDecl, CompileError> {
+        let start = self.expect(TokenKind::Regblock)?.span;
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::Via)?;
+        let via_helper = self.expect_ident()?;
+        let default_width = if self.check_ident("width") {
+            self.advance();
+            Some(self.expect_uint_literal("width")?)
+        } else {
+            None
+        };
+        let inner_doc = self.consume_inner_doc();
+        let mut registers = Vec::new();
+        while !self.check_end_keyword() {
+            registers.push(self.parse_register()?);
+        }
+        let end = self.expect_end(TokenKind::Regblock, &name.name)?;
+        Ok(RegblockDecl {
+            name,
+            via_helper,
+            default_width,
+            registers,
+            span: start.merge(end),
+            doc,
+            inner_doc,
+        })
+    }
+
+    fn parse_register(&mut self) -> Result<RegisterDecl, CompileError> {
+        let doc = self.consume_outer_doc();
+        let start = self.expect(TokenKind::Register)?.span;
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::AtSign)?;
+        let offset = self.parse_expr()?;
+
+        let mut width: Option<u32> = None;
+        let mut reset: Option<Expr> = None;
+        let mut access = RegAccess::Rw;
+        let mut end = offset.span;
+        loop {
+            if self.check_ident("width") {
+                self.advance();
+                width = Some(self.expect_uint_literal("width")?);
+                end = self.prev_span_or(end);
+            } else if self.check_ident("reset") {
+                self.advance();
+                let e = self.parse_expr()?;
+                end = e.span;
+                reset = Some(e);
+            } else if self.check_ident("access") {
+                self.advance();
+                let kw = self.expect_ident_or_kw()?;
+                access = match kw.name.as_str() {
+                    "rw" => RegAccess::Rw,
+                    other => {
+                        return Err(CompileError::general(
+                            &format!(
+                                "register access policy `{other}` not supported in Phase 1a \
+                                 (only `rw` ships; `ro`/`wo`/`w1c`/`w1s`/`wclr`/`wset`/`rc`/`rs` \
+                                 follow per docs/ral-support.md)"
+                            ),
+                            kw.span,
+                        ));
+                    }
+                };
+                end = kw.span;
+            } else {
+                break;
+            }
+        }
+        Ok(RegisterDecl {
+            name,
+            offset,
+            width,
+            reset,
+            access,
+            span: start.merge(end),
+            doc,
+        })
+    }
+
+    /// Helper: consume the next token as a `uint` decimal literal and return
+    /// its value as `u32`. Used for `width <N>` clauses that need a numeric
+    /// width, not an arbitrary expression.
+    fn expect_uint_literal(&mut self, label: &str) -> Result<u32, CompileError> {
+        let span = self.peek_span();
+        let e = self.parse_expr()?;
+        if let ExprKind::Int(s) = &*e.kind {
+            s.replace('_', "").parse::<u32>().map_err(|_| {
+                CompileError::general(
+                    &format!("`{label}` value must be a positive integer (got `{s}`)"),
+                    span,
+                )
+            })
+        } else {
+            Err(CompileError::general(
+                &format!("`{label}` requires an integer literal"),
+                span,
+            ))
+        }
+    }
+
+    /// Helper: span of the previously-consumed token, fallback to `prev` if
+    /// the parser hasn't advanced since `prev` was captured.
+    fn prev_span_or(&self, prev: Span) -> Span {
+        // The lexer doesn't expose a public "previous token span"; the
+        // caller usually has the most recently consumed token's span. This
+        // helper is mostly cosmetic for span-merging during error reports.
+        prev
     }
 
     fn parse_external_module(&mut self, doc: Option<String>) -> Result<ExternalModuleDecl, CompileError> {

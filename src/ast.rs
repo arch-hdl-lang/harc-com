@@ -110,6 +110,67 @@ pub enum Item {
     /// (the latter are inlined when the user calls them by name from
     /// `run`).
     Impl(ImplDecl),
+    /// `regblock R via Helper { register NAME @ ADDR width N reset V
+    /// access POLICY }` — Register Abstraction Layer block, lowered
+    /// to a POD mirror struct + `constexpr` address table + frontdoor
+    /// reads/writes that route through the helper transactor's
+    /// `write(addr, data)` / `read(addr) -> data` methods. See
+    /// docs/ral-support.md. Phase 1a: registers only (no field-level
+    /// decomposition yet).
+    Regblock(RegblockDecl),
+}
+
+// ── Register Abstraction Layer ────────────────────────────────────────────────
+
+/// `regblock <Name> via <Helper> [width <N>] { <register>* }`
+#[derive(Debug, Clone)]
+pub struct RegblockDecl {
+    pub name: Ident,
+    /// `via <HelperType>` — names the transactor whose `write(addr, data)`
+    /// and `read(addr) -> data` methods receive bus traffic. Required in
+    /// Phase 1a; later phases may infer it from a `bound to BusT` clause
+    /// or auto-synthesize a helper for known protocol types.
+    pub via_helper: Ident,
+    /// Default register width in bits (used when a `register` block
+    /// omits an explicit width). Defaults to 32 if absent.
+    pub default_width: Option<u32>,
+    pub registers: Vec<RegisterDecl>,
+    pub span: Span,
+    pub doc: Option<String>,
+    pub inner_doc: Option<String>,
+}
+
+/// `register <Name> @ <addr> [width <N>] [reset <V>] [access <Policy>]`
+#[derive(Debug, Clone)]
+pub struct RegisterDecl {
+    pub name: Ident,
+    /// Byte-offset within the regblock. Parsed as an `Expr` so hex
+    /// literals (`0x18`), constant references, and simple arithmetic
+    /// all work; constant-folded at codegen time.
+    pub offset: Expr,
+    /// Width in bits. `None` means inherit the regblock's `default_width`.
+    pub width: Option<u32>,
+    /// Reset value. `None` means zero.
+    pub reset: Option<Expr>,
+    /// Access policy. Phase 1a supports `rw` only; the enum is shaped
+    /// for the RFC-§3.1 expansion to `ro`/`wo`/`w1c`/`w1s`/`wclr`/
+    /// `wset`/`rc`/`rs` in later phases.
+    pub access: RegAccess,
+    pub span: Span,
+    pub doc: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegAccess {
+    Rw,
+}
+
+impl RegAccess {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            RegAccess::Rw => "rw",
+        }
+    }
 }
 
 // ── Use / Package ─────────────────────────────────────────────────────────────
@@ -1479,6 +1540,9 @@ impl Item {
             Item::Bus(b) => b,
             Item::Transactor(t) => t,
             Item::Impl(i) => i,
+            Item::Regblock(r) => r,
         }
     }
 }
+
+impl_construct_direct!(RegblockDecl, "regblock", +inner);
