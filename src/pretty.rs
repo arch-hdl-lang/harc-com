@@ -229,6 +229,10 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
                 pad(out, depth + 1);
                 write!(out, "instance {} : {} @ ", inst.name.name, inst.regblock_ty.name).ok();
                 print_expr(out, &inst.base_addr);
+                if let Some(sz) = &inst.size {
+                    write!(out, " size ").ok();
+                    print_expr(out, sz);
+                }
                 writeln!(out).ok();
             }
             pad(out, depth);

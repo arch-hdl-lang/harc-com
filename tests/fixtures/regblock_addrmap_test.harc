@@ -55,11 +55,13 @@ end regblock DmaChan
 
 addrmap Soc via AxilHelper
     /// MM2S channel at base 0x00 — register addresses align with the
-    /// AxiLiteRegs MM2S register layout.
-    instance mm2s : DmaChan @ 0x00
+    /// AxiLiteRegs MM2S register layout. `size 0x30` declares the
+    /// window so the codegen can statically rule out overlap with
+    /// the s2mm instance below.
+    instance mm2s : DmaChan @ 0x00 size 0x30
     /// S2MM channel at base 0x30 — DMACR at 0x30, SA at 0x48
     /// (0x30 + 0x18) — also matches the AxiLiteRegs layout.
-    instance s2mm : DmaChan @ 0x30
+    instance s2mm : DmaChan @ 0x30 size 0x30
 end addrmap Soc
 
 test RegblockAddrmapTest
