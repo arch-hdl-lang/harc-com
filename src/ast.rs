@@ -129,6 +129,13 @@ pub struct RegblockDecl {
 }
 
 /// `register <Name> @ <addr> [width <N>] [reset <V>] [access <Policy>]`
+///
+/// Two body shapes:
+/// - Single-line: terminator is the next `register` keyword or the
+///   regblock's `end regblock` (no fields, no `end register`).
+/// - Block form: `field <name> : <ty> @ <bit_pos> [reset <v>]
+///   [access <p>]` declarations followed by `end register [<Name>]`.
+///   The `fields` Vec is empty in the single-line case.
 #[derive(Debug, Clone)]
 pub struct RegisterDecl {
     pub name: Ident,
@@ -143,6 +150,32 @@ pub struct RegisterDecl {
     /// Access policy. Phase 1a supports `rw` only; the enum is shaped
     /// for the RFC-§3.1 expansion to `ro`/`wo`/`w1c`/`w1s`/`wclr`/
     /// `wset`/`rc`/`rs` in later phases.
+    pub access: RegAccess,
+    /// Field-level bit-slice declarations. Empty for the single-line
+    /// register form. See `FieldDecl` and docs/ral-support.md §3.1.
+    pub fields: Vec<FieldDecl>,
+    pub span: Span,
+    pub doc: Option<String>,
+}
+
+/// `field <Name> : <Type> @ <bit_pos> [reset <V>] [access <Policy>]`
+///
+/// Width is derived from `ty`: `bit`/`bool` → 1 bit; `uint<N>` /
+/// `sint<N>` / `bits<N>` → N bits. Phase 1b ships fields with the
+/// register's access policy (`rw`); per-field policies (`w1c`, `ro`,
+/// etc.) follow the same RegAccess expansion.
+#[derive(Debug, Clone)]
+pub struct FieldDecl {
+    pub name: Ident,
+    pub ty: TypeExpr,
+    /// Bit position (LSB) inside the parent register. Parsed as
+    /// `u32` directly (not `Expr`) since the codegen needs the literal
+    /// to fold mask/shift constants.
+    pub bit_pos: u32,
+    /// Reset value. `None` means zero.
+    pub reset: Option<Expr>,
+    /// Access policy. Inherits the register's policy when the field
+    /// decl omits an explicit `access` clause.
     pub access: RegAccess,
     pub span: Span,
     pub doc: Option<String>,

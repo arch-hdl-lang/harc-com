@@ -62,6 +62,7 @@ axilite_bound_mon_test  | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_multi_payload_test | AxiLiteRegs | AxiLiteRegs.sv         |
 axilite_regs_full_test  | AxiLiteRegs    | AxiLiteRegs.sv         |
 regblock_basic_test     | AxiLiteRegs    | AxiLiteRegs.sv         |
+regblock_fields_test    | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_constraint_test | AxiLiteRegs    | AxiLiteRegs.sv         | axilite_regs_test.harc | | AxiLiteConstraintTest
 transactor_parse_test   | AxiLiteRegs    | AxiLiteRegs.sv         |
 transactor_active_test  | AxiLiteRegs    | AxiLiteRegs.sv         |
