@@ -279,6 +279,7 @@ impl Parser {
             Some(TokenKind::Apply) => self.parse_apply().map(Item::Apply),
             Some(TokenKind::Bus) => self.parse_bus(doc).map(Item::Bus),
             Some(TokenKind::Regblock) => self.parse_regblock(doc).map(Item::Regblock),
+            Some(TokenKind::Addrmap) => self.parse_addrmap(doc).map(Item::Addrmap),
             // `impl <target> for <Test>` is the legacy two-block form
             // (docs/test-ergonomics.md). Removed after the fixture
             // corpus migrated to inline `run`/`setup`/`check`/`teardown`
@@ -1505,6 +1506,54 @@ impl Parser {
     /// [access <policy>]` declaration inside a `register` block. The
     /// `parent_access` argument supplies the access policy when the
     /// field decl doesn't override it explicitly.
+    /// Parse:
+    ///   addrmap <Name> via <Helper>
+    ///       instance <name> : <RegblockType> @ <base_addr>
+    ///       ...
+    ///   end addrmap <Name>
+    ///
+    /// Phase 1e: flat container only — no nested addrmaps, no
+    /// `alias of`, no per-instance bus override. See
+    /// docs/ral-support.md §4.
+    fn parse_addrmap(&mut self, doc: Option<String>) -> Result<AddrmapDecl, CompileError> {
+        let start = self.expect(TokenKind::Addrmap)?.span;
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::Via)?;
+        let via_helper = self.expect_ident()?;
+        let inner_doc = self.consume_inner_doc();
+        let mut instances = Vec::new();
+        while !self.check_end_keyword() {
+            instances.push(self.parse_addrmap_instance()?);
+        }
+        let end = self.expect_end(TokenKind::Addrmap, &name.name)?;
+        Ok(AddrmapDecl {
+            name,
+            via_helper,
+            instances,
+            span: start.merge(end),
+            doc,
+            inner_doc,
+        })
+    }
+
+    fn parse_addrmap_instance(&mut self) -> Result<InstanceDecl, CompileError> {
+        let doc = self.consume_outer_doc();
+        let start = self.expect(TokenKind::Instance)?.span;
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::Colon)?;
+        let regblock_ty = self.expect_ident()?;
+        self.expect(TokenKind::AtSign)?;
+        let base_addr = self.parse_expr()?;
+        let end = base_addr.span;
+        Ok(InstanceDecl {
+            name,
+            regblock_ty,
+            base_addr,
+            span: start.merge(end),
+            doc,
+        })
+    }
+
     fn parse_register_field(&mut self, parent_access: RegAccess) -> Result<FieldDecl, CompileError> {
         let doc = self.consume_outer_doc();
         let start = self.expect(TokenKind::Field)?.span;
