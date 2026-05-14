@@ -53,13 +53,11 @@ test TransactorParseTest
     let axil : BusAxiLite = bind dut
     let drv  : AxilXactor active  = bind axil
     let obs  : AxilXactor passive = bind axil
-end test TransactorParseTest
 
-impl sim for TransactorParseTest
     run
         // Body intentionally minimal — codegen errors before this
         // point in T-1, so the run body just needs to parse.
         wait 1 cycle
     end run
-end impl TransactorParseTest
+end test TransactorParseTest
 

@@ -18,9 +18,7 @@ end covergroup LightCov
 test TrafficLightTest
     let dut : TrafficLight
     let cov : LightCov
-end test TrafficLightTest
 
-impl sim for TrafficLightTest
     run
         // Reset: hold timer=1 so the FSM doesn't try to leave Red
         // before rst deasserts.
@@ -78,5 +76,5 @@ impl sim for TrafficLightTest
         assert cov.cp_yellow.lit > 0 else fail("Yellow state coverage hole")
         assert cov.cp_green.lit  > 0 else fail("Green  state coverage hole")
     end check
-end impl TrafficLightTest
+end test TrafficLightTest
 

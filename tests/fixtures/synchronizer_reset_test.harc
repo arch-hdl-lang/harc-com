@@ -18,9 +18,7 @@ test RstSyncTest
 
     clock dst_clk = DstDomain    // 200 MHz — primary, drives the sync chain
     clock src_clk = SrcDomain    // 100 MHz — unused inside DUT
-end test RstSyncTest
 
-impl sim for RstSyncTest
     run
         // Initialize.
         dut.data_in = 0
@@ -78,5 +76,5 @@ impl sim for RstSyncTest
             else fail("2 cycles after deassert: data_out=${dut.data_out}, expected 0")
         log(info, "PASS: re-assert then deassert")
     end run
-end impl RstSyncTest
+end test RstSyncTest
 

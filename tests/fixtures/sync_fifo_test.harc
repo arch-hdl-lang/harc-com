@@ -19,9 +19,7 @@ end covergroup FifoCov
 test SyncFifoTest
     let dut : TxQueue
     let cov : FifoCov
-end test SyncFifoTest
 
-impl sim for SyncFifoTest
     run
         // Reset
         dut.rst = 1
@@ -77,5 +75,5 @@ impl sim for SyncFifoTest
         assert cov.cp_empty.yes > 0 else fail("empty=1 coverage hole")
         assert cov.cp_full.yes  > 0 else fail("full=1  coverage hole")
     end check
-end impl SyncFifoTest
+end test SyncFifoTest
 

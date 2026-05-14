@@ -12,9 +12,7 @@ end property pipe_depth_3
 
 test PipeRegTest
     let dut : PipeRegTest
-end test PipeRegTest
 
-impl sim for PipeRegTest
     run
         // Reset for 2 cycles.
         dut.rst = 1
@@ -53,5 +51,5 @@ impl sim for PipeRegTest
 
         log(info, "PASS: 3-stage pipeline propagates with correct delay")
     end run
-end impl PipeRegTest
+end test PipeRegTest
 

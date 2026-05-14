@@ -601,38 +601,46 @@ fn print_test_item(out: &mut String, it: &TestItem, depth: usize) {
             writeln!(out).ok();
         }
         TestItem::Scope(s) => {
-            pad(out, depth);
-            writeln!(out, "scope {}", s.name.name).ok();
+            // Inline form per docs/test-ergonomics.md — emit each
+            // populated phase block directly at test scope, with no
+            // outer `scope sim ... end scope sim` wrapper. The
+            // round-trip discipline relies on this matching the
+            // parser's accepted shape (parse_test).
             if let Some(b) = &s.setup {
-                pad(out, depth + 1);
+                pad(out, depth);
                 writeln!(out, "setup").ok();
-                print_block_inner(out, b, depth + 2);
-                pad(out, depth + 1);
+                print_block_inner(out, b, depth + 1);
+                pad(out, depth);
                 writeln!(out, "end setup").ok();
             }
             if let Some(b) = &s.run {
-                pad(out, depth + 1);
+                pad(out, depth);
                 writeln!(out, "run").ok();
-                print_block_inner(out, b, depth + 2);
-                pad(out, depth + 1);
+                print_block_inner(out, b, depth + 1);
+                pad(out, depth);
                 writeln!(out, "end run").ok();
             }
             if let Some(b) = &s.check {
-                pad(out, depth + 1);
+                pad(out, depth);
                 writeln!(out, "check").ok();
-                print_block_inner(out, b, depth + 2);
-                pad(out, depth + 1);
+                print_block_inner(out, b, depth + 1);
+                pad(out, depth);
                 writeln!(out, "end check").ok();
             }
             if let Some(b) = &s.teardown {
-                pad(out, depth + 1);
+                pad(out, depth);
                 writeln!(out, "teardown").ok();
-                print_block_inner(out, b, depth + 2);
-                pad(out, depth + 1);
+                print_block_inner(out, b, depth + 1);
+                pad(out, depth);
                 writeln!(out, "end teardown").ok();
             }
+        }
+        TestItem::Phase(name, body) => {
             pad(out, depth);
-            writeln!(out, "end scope {}", s.name.name).ok();
+            writeln!(out, "phase {}", name.name).ok();
+            print_block_inner(out, body, depth + 1);
+            pad(out, depth);
+            writeln!(out, "end phase {}", name.name).ok();
         }
     }
 }

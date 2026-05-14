@@ -54,9 +54,7 @@ end transactor MacTableXactor
 test MacTableTest
     let dut  : mac_table
     let xact : MacTableXactor passive
-end test MacTableTest
 
-impl sim for MacTableTest
     run
         log(info, "mac_table CAM-backed MAC learning test")
         xact.dut = dut
@@ -130,5 +128,5 @@ impl sim for MacTableTest
 
         log(info, "ALL 5 SUB-TESTS PASSED — mac_table coverage")
     end run
-end impl MacTableTest
+end test MacTableTest
 

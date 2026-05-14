@@ -14,9 +14,7 @@ use BusAxiLite
 test AxiLiteBusSendTest
     let dut : AxiLiteRegs
     let axil : BusAxiLite = bind dut
-end test AxiLiteBusSendTest
 
-impl sim for AxiLiteBusSendTest
     run
         // Reset.
         dut.rst = 1
@@ -72,5 +70,5 @@ impl sim for AxiLiteBusSendTest
             else fail("read got 0x${val:08x}, expected 0xCAFEBABE")
         log(info, "PASS: bus.send/recv auto-handshake round-trip")
     end run
-end impl AxiLiteBusSendTest
+end test AxiLiteBusSendTest
 

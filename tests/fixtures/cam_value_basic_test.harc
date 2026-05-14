@@ -43,9 +43,7 @@ test CamValueBasicTest
     let xact : CamValueXactor passive
 
     clock clk = SysDomain
-end test CamValueBasicTest
 
-impl sim for CamValueBasicTest
     run
         log(info, "Tag_Value_Cam value-payload CAM test")
         xact.dut = dut
@@ -133,5 +131,5 @@ impl sim for CamValueBasicTest
             else fail("post-reset: search_any=${dut.search_any}, expected 0")
         log(info, "PASS: post-reset: empty")
     end run
-end impl CamValueBasicTest
+end test CamValueBasicTest
 

@@ -43,9 +43,7 @@ end function pq_pop
 
 test PacketQueueTest
     let dut : PacketQueue
-end test PacketQueueTest
 
-impl sim for PacketQueueTest
     run
         // Reset.
         dut.rst = 1
@@ -106,5 +104,5 @@ impl sim for PacketQueueTest
         assert dut.empty == 1 else fail("empty after interleaved")
         log(info, "PASS: interleaved push/pop ordering preserved")
     end run
-end impl PacketQueueTest
+end test PacketQueueTest
 

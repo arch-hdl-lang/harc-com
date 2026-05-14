@@ -51,9 +51,7 @@ test HeartbeatIdleTest
     clock clk = SysDomain
 
     let prod : Producer
-end test HeartbeatIdleTest
 
-impl sim for HeartbeatIdleTest
     run
         // Park the DUT so it doesn't interfere — we only care about
         // the clock running.
@@ -87,4 +85,5 @@ impl sim for HeartbeatIdleTest
             else fail("expected 3 emits to register, got ${prod.seen}")
         log(info, "PASS: agent reported idle_in(8) after ${waited} cycles of inactivity; seen=${prod.seen}")
     end run
-end impl HeartbeatIdleTest
+end test HeartbeatIdleTest
+

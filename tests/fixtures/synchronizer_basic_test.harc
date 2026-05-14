@@ -10,9 +10,7 @@ test FlagSyncTest
     // cycle` advances dst_clk (matches the original C++ TB).
     clock dst_clk = SlowDomain    // 50 MHz  → 20 ns period
     clock src_clk = FastDomain    // 200 MHz → 5  ns period
-end test FlagSyncTest
 
-impl sim for FlagSyncTest
     run
         // Async reset.
         dut.rst = 0
@@ -62,5 +60,5 @@ impl sim for FlagSyncTest
         dut.rst = 0
         log(info, "PASS: mid-operation reset clears chain")
     end run
-end impl FlagSyncTest
+end test FlagSyncTest
 

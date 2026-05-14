@@ -83,9 +83,7 @@ end tseq RandomTxns
 test AxiLiteSeqDrvTest
     let dut : AxiLiteRegs
     let drv : SeqXactor active
-end test AxiLiteSeqDrvTest
 
-impl sim for AxiLiteSeqDrvTest
     run
         log(info, "AxiLiteRegs sequencer → transactor (unbound) event-driven test")
         drv.dut = dut
@@ -132,5 +130,5 @@ impl sim for AxiLiteSeqDrvTest
 
         log(info, "PASS: 5 sequencer→transactor round-trips via event dispatch")
     end run
-end impl AxiLiteSeqDrvTest
+end test AxiLiteSeqDrvTest
 

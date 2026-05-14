@@ -10,9 +10,7 @@ test TopCounterTest
     let dut : Top
 
     clock clk = SysDomain        // 100 MHz
-end test TopCounterTest
 
-impl sim for TopCounterTest
     run
         // Reset for 3 cycles.
         dut.rst = 1
@@ -59,5 +57,5 @@ impl sim for TopCounterTest
             else fail("mid-count reset: count_out=${dut.count_out}, expected 0")
         log(info, "PASS: mid-count reset works")
     end run
-end impl TopCounterTest
+end test TopCounterTest
 

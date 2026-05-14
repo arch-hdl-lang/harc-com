@@ -24,4 +24,54 @@ end tseq RandomRegs
 
 test AxiLiteFuzzTest
     let dut : AxiLiteRegs
+
+    run
+        log(info, "starting AxiLiteRegs fuzz test")
+
+        // ── Reset (same as axilite_regs_test_sim.harc) ────────────────
+        dut.rst = 1
+        dut.axil_aw_addr = 0
+        dut.axil_aw_valid = 0
+        dut.axil_w_data = 0
+        dut.axil_w_strb = 15
+        dut.axil_w_valid = 0
+        dut.axil_b_ready = 1
+        dut.axil_ar_addr = 0
+        dut.axil_ar_valid = 0
+        dut.axil_r_ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // ── 5 random write/read iterations on MM2S_SA ─────────────────
+        // `RandomRegs(5)` is a `tseq` that returns a vector of
+        // randomized `RegData` values; iterate it with the
+        // sequence-form for-loop.
+        let txns = RandomRegs(5)
+        let i = 0
+        for t in txns
+            axil_write(dut, 24, t.value)
+            let got = axil_read(dut, 24)
+            logf("axi_master.log", info, "fuzz[${i}] wrote=0x${t.value:08x} got=0x${got:08x}")
+            assert got == t.value else fail("fuzz[${i}] mismatch: wrote ${t.value:08x} got ${got:08x}")
+            i = i + 1
+        end for
+
+        log(info, "PASS: 5 random round-trips on MM2S_SA")
+    end run
 end test AxiLiteFuzzTest
+
+// Fuzz scope: write 5 random 32-bit values to MM2S_SA (offset 0x18 — known
+// RW register), read each back, assert they round-trip. With a fixed seed
+// the same five values are written every run, so failures reproduce.
+
