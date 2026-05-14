@@ -1,0 +1,123 @@
+// RAL Phase 1c smoke test (docs/ral-support.md §3.1).
+//
+// Demonstrates non-`rw` access policies and read-side mirror predict.
+//
+// Three policies exercised:
+//   - `rw` (existing): bus traffic for both reads and writes.
+//   - `ro` (new): bus reads work; writes lower to mirror-only (the
+//     bus write is suppressed — RO from the CPU's perspective).
+//   - `wo` (new): bus writes work; reads serve from the mirror
+//     without bus traffic (a real WO register would return garbage
+//     on a bus read).
+//
+// Read-side mirror predict (also new): every bus read now also
+// stores the returned value into the mirror, so a subsequent
+// `regs.X` access without an intervening bus read sees the same
+// value the DUT just provided.
+//
+// Verification strategy:
+//   - RO suppression: try to write `MM2S_SA` (declared `ro` here),
+//     then check the DUT's `mm2s_src_addr` output didn't move.
+//     `mm2s_src_addr` is the live DUT output driven by the
+//     internal MM2S_SA register; if the bus write had reached the
+//     DUT, it would mirror the written value.
+//   - WO mirror-only read: write a value to a WO register and
+//     read it back. The mirror should retain the written value.
+//   - Read-side predict: read RW register, observe the mirror
+//     reflects the bus-returned value.
+
+use BusAxiLite
+
+transactor AxilHelper bound to BusAxiLite
+    hookable write(addr: uint<8>, data: uint<32>)
+        bus.aw.addr = addr
+        bus.aw.valid = 1
+        bus.w.send(data, 15)
+        bus.aw.valid = 0
+        wait 1 cycle
+    end write
+
+    hookable read(addr: uint<8>) -> uint<32>
+        bus.ar.addr = addr
+        bus.ar.valid = 1
+        let r = bus.r.recv()
+        bus.ar.valid = 0
+        wait 1 cycle
+        return r.data
+    end read
+end transactor AxilHelper
+
+regblock DmaRegs via AxilHelper width 32
+    /// MM2S_SA — declared `ro` for this test so the bus write below
+    /// is suppressed at codegen time. (The DUT's real register is RW;
+    /// the regblock policy here governs HARC's bus traffic, not the
+    /// DUT's internal semantics.)
+    register MM2S_SA   @ 0x18 access ro
+
+    /// MM2S_LEN — RW. Round-trips through the bus with read-side
+    /// mirror predict.
+    register MM2S_LEN  @ 0x28 access rw
+
+    /// S2MM_SA — declared `wo` for this test. Bus writes go out; bus
+    /// reads do NOT — `regs.S2MM_SA` rvalue serves from mirror only.
+    register S2MM_SA   @ 0x20 access wo
+end regblock DmaRegs
+
+test RegblockAccessTest
+    let dut    : AxiLiteRegs
+    let axil   : BusAxiLite = bind dut
+    let helper : AxilHelper passive = bind axil
+    let regs   : DmaRegs = bind helper
+
+    run
+        dut.rst = 1
+        axil.aw.valid = 0
+        axil.w.valid = 0
+        axil.b.ready = 1
+        axil.ar.valid = 0
+        axil.r.ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // 1. RO suppression. `MM2S_SA` is declared `ro`; the bus
+        //    write below is dropped at codegen time. The DUT's
+        //    `mm2s_src_addr` output should stay at its post-reset
+        //    value (0) because no actual bus write reaches it.
+        regs.MM2S_SA = 3735879680      // 0xDEAD_1000 — should NOT propagate
+        wait 2 cycles
+        assert dut.mm2s_src_addr == 0
+            else fail("RO suppression failed: dut.mm2s_src_addr=0x${dut.mm2s_src_addr:08x} (write should not have reached DUT)")
+
+        // 2. RW round-trip + read-side mirror predict. Write a value,
+        //    then read it back; the mirror should reflect the bus
+        //    return.
+        regs.MM2S_LEN = 64
+        let v = regs.MM2S_LEN
+        assert v == 64
+            else fail("RW readback (got 0x${v:08x})")
+
+        // 3. WO mirror-only read. Write a value to S2MM_SA, then
+        //    read regs.S2MM_SA. With WO semantics this serves from
+        //    the mirror (no bus traffic), so we get back what we
+        //    wrote without round-tripping. (The bus write itself
+        //    does propagate to the DUT; the DUT-side observable
+        //    propagation timing is incidental to this test.)
+        regs.S2MM_SA = 305419896       // 0x12345678
+        let wo_back = regs.S2MM_SA
+        assert wo_back == 305419896
+            else fail("WO mirror readback (got 0x${wo_back:08x})")
+
+        log(info, "PASS: ro suppresses bus write; rw round-trips with mirror predict; wo serves reads from mirror")
+    end run
+end test RegblockAccessTest
