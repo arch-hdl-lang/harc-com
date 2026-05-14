@@ -25,6 +25,7 @@ fi
 # loaded harc files declare more than one test struct.
 read -r -d '' FIXTURES <<'EOF' || true
 rom_lut_test            | RomLut         | rom_lut.sv             |
+rom_lut_inline_test     | RomLut         | rom_lut.sv             |
 bus_arbiter_test        | BusArbiter     | bus_arbiter.sv         |
 traffic_light_test      | TrafficLight   | traffic_light.sv       |
 sync_fifo_test          | TxQueue        | sync_fifo.sv           |
