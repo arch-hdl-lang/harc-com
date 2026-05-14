@@ -1,0 +1,55 @@
+// Inline-`run` form for the test ergonomics RFC (docs/test-ergonomics.md).
+// Same DUT and coverage as rom_lut_test.harc, but the `run` and `check`
+// blocks live directly inside the `test` body — no `impl sim for T`
+// wrapper. Existing two-block form keeps working alongside (see
+// rom_lut_test.harc); migration to inline form is mechanical and lands
+// in a follow-up PR.
+
+function read_addr_inline(dut: RomLut, addr: uint<3>) -> uint<8>
+    dut.rd_addr = addr
+    dut.rd_en = 1
+    wait 1 cycle
+    return dut.rd_data
+end function read_addr_inline
+
+covergroup RomCovInline @(posedge dut.clk)
+    cp_addr : cover dut.rd_addr
+        bins
+            a0 = {0}
+            a1 = {1}
+            a2 = {2}
+            a3 = {3}
+            a4 = {4}
+            a5 = {5}
+            a6 = {6}
+            a7 = {7}
+        end bins
+end covergroup RomCovInline
+
+test RomLutInlineTest
+    let dut : RomLut
+    let cov : RomCovInline
+
+    run
+        dut.rd_addr = 0
+        dut.rd_en = 0
+        wait 1 cycle
+
+        assert read_addr_inline(dut, 0) == 0   else fail("addr 0: got 0x${dut.rd_data:02x}")
+        assert read_addr_inline(dut, 1) == 49  else fail("addr 1: got 0x${dut.rd_data:02x}")
+        assert read_addr_inline(dut, 2) == 90  else fail("addr 2: got 0x${dut.rd_data:02x}")
+        assert read_addr_inline(dut, 3) == 118 else fail("addr 3: got 0x${dut.rd_data:02x}")
+        assert read_addr_inline(dut, 4) == 127 else fail("addr 4: got 0x${dut.rd_data:02x}")
+        assert read_addr_inline(dut, 5) == 118 else fail("addr 5: got 0x${dut.rd_data:02x}")
+        assert read_addr_inline(dut, 6) == 90  else fail("addr 6: got 0x${dut.rd_data:02x}")
+        assert read_addr_inline(dut, 7) == 49  else fail("addr 7: got 0x${dut.rd_data:02x}")
+
+        log(info, "PASS: 8 ROM entries match (inline-run form)")
+    end run
+
+    check
+        cov.report()
+        assert cov.cp_addr.a0 > 0 else fail("addr 0 coverage hole")
+        assert cov.cp_addr.a7 > 0 else fail("addr 7 coverage hole")
+    end check
+end test RomLutInlineTest
