@@ -300,6 +300,11 @@ pub enum ComponentKind {
     /// tags a synth ComponentDecl built from a `TransactorDecl` with
     /// this kind so the rest of the pipeline can identify it.
     Transactor,
+    /// `testbench T ... end testbench T` — the DUT-owning, helper-
+    /// method-bearing variant per docs/test-ergonomics.md §3.
+    /// Lowered through the same component machinery as `env`; the
+    /// distinction is conventional + source-keyword level.
+    Testbench,
 }
 
 impl ComponentKind {
@@ -310,6 +315,7 @@ impl ComponentKind {
             ComponentKind::Scoreboard => "scoreboard",
             ComponentKind::Sequencer => "sequencer",
             ComponentKind::Transactor => "transactor",
+            ComponentKind::Testbench => "testbench",
         }
     }
 }
@@ -1356,6 +1362,7 @@ impl Construct for ComponentDecl {
             // surface it under the same label as the dedicated
             // transactor.
             ComponentKind::Transactor => "transactor",
+            ComponentKind::Testbench => "testbench",
         }
     }
     fn name(&self) -> &Ident { &self.name }
