@@ -6634,12 +6634,13 @@ impl Emitter {
     ///      composite path and silently lose the high bits.
     /// If `target` is a `regs.NAME` field access where `regs` is a
     /// RAL regblock binding, return `(regs_var, helper_var, helper_ty,
-    /// offset_literal)`. Used by `emit_signal_assignment` (write side)
-    /// and `emit_expr_with_arrow` (read side).
+    /// offset_literal, register-access-policy)`. Used by
+    /// `emit_signal_assignment` (write side) and `emit_expr_with_arrow`
+    /// (read side).
     fn resolve_regblock_field_lookup(
         &self,
         target: &Expr,
-    ) -> Option<(String, String, String, String)> {
+    ) -> Option<(String, String, String, String, RegAccess)> {
         let ExprKind::Field { target: outer, name } = &*target.kind else {
             return None;
         };
@@ -6652,13 +6653,13 @@ impl Emitter {
         let helper_var = self.let_helper.get(&regs_id.name)?.clone();
         let helper_ty = self.let_types.get(&helper_var)?.clone();
         let offset_lit = c_int_literal_from(&reg.offset.kind);
-        Some((regs_id.name.clone(), helper_var, helper_ty, offset_lit))
+        Some((regs_id.name.clone(), helper_var, helper_ty, offset_lit, reg.access))
     }
 
     fn resolve_regblock_field_write(
         &self,
         target: &Expr,
-    ) -> Option<(String, String, String, String)> {
+    ) -> Option<(String, String, String, String, RegAccess)> {
         self.resolve_regblock_field_lookup(target)
     }
 
@@ -6666,11 +6667,11 @@ impl Emitter {
     /// is a RAL regblock binding and FIELD is declared inside REG,
     /// return all metadata needed to emit a masked write / shifted
     /// read: `(regs_var, helper_var, helper_ty, offset_lit, reg_name,
-    /// reg_c_type, bit_pos, bit_width)`.
+    /// reg_c_type, bit_pos, bit_width, field-access-policy)`.
     fn resolve_regblock_subfield_lookup(
         &self,
         target: &Expr,
-    ) -> Option<(String, String, String, String, String, &'static str, u32, u32)> {
+    ) -> Option<(String, String, String, String, String, &'static str, u32, u32, RegAccess)> {
         let ExprKind::Field { target: mid, name: fld_name } = &*target.kind else {
             return None;
         };
@@ -6699,6 +6700,7 @@ impl Emitter {
             reg_c_type,
             fld.bit_pos,
             bit_width,
+            fld.access,
         ))
     }
 
@@ -6709,10 +6711,15 @@ impl Emitter {
         // write of the full register word. Checked before the
         // register-level path because it's strictly more specific
         // (3-level Field expr vs 2-level).
-        if let Some((regs_var, helper_var, helper_ty, offset_lit, reg_name, reg_c_type, bit_pos, bit_width)) =
-            self.resolve_regblock_subfield_lookup(target)
+        if let Some((
+            regs_var, helper_var, helper_ty, offset_lit,
+            reg_name, reg_c_type, bit_pos, bit_width, access,
+        )) = self.resolve_regblock_subfield_lookup(target)
         {
             let mask = field_mask_literal(bit_width);
+            // Mirror update always happens; even RO mirrors might be
+            // useful for the read-predict side. For RO we then DROP
+            // the bus write — matches the RFC `ro` semantics.
             write!(
                 self.out,
                 "{regs_var}.{reg_name} = ({regs_var}.{reg_name} & ~(({reg_c_type})0x{mask:x}u << {bit_pos})) | (((({reg_c_type})(",
@@ -6722,20 +6729,26 @@ impl Emitter {
                 self.out,
                 ")) & 0x{mask:x}u) << {bit_pos});",
             ).ok();
-            self.pad(depth);
-            writeln!(
-                self.out,
-                "{helper_ty}_write({helper_var}, {offset_lit}, {regs_var}.{reg_name});",
-            ).ok();
+            if access.writes_to_bus() {
+                self.pad(depth);
+                writeln!(
+                    self.out,
+                    "{helper_ty}_write({helper_var}, {offset_lit}, {regs_var}.{reg_name});",
+                ).ok();
+            } else {
+                self.pad(depth);
+                writeln!(
+                    self.out,
+                    "// RO field — write to bus suppressed (regs.{reg_name}.<field> mirror still updated)",
+                ).ok();
+            }
             return;
         }
 
         // RAL frontdoor write: `regs.NAME = expr` where `regs` is a
         // `let regs : <Regblock> = bind <helper>` instantiation. Lowers
         // to mirror update + `<HelperType>_write(helper, OFFSET, expr)`.
-        // See docs/ral-support.md §7.4. Phase 1a does only the write
-        // half of predict (read-side mirror sync is a follow-up).
-        if let Some((regs_var, helper_var, helper_ty, offset_lit)) =
+        if let Some((regs_var, helper_var, helper_ty, offset_lit, access)) =
             self.resolve_regblock_field_write(target)
         {
             write!(self.out, "{regs_var}.").ok();
@@ -6745,10 +6758,15 @@ impl Emitter {
             write!(self.out, " = ").ok();
             self.emit_expr(value);
             writeln!(self.out, ";").ok();
-            self.pad(depth);
-            write!(self.out, "{helper_ty}_write({helper_var}, {offset_lit}, ").ok();
-            self.emit_expr(value);
-            writeln!(self.out, ");").ok();
+            if access.writes_to_bus() {
+                self.pad(depth);
+                write!(self.out, "{helper_ty}_write({helper_var}, {offset_lit}, ").ok();
+                self.emit_expr(value);
+                writeln!(self.out, ");").ok();
+            } else {
+                self.pad(depth);
+                writeln!(self.out, "// RO register — write to bus suppressed (mirror updated)").ok();
+            }
             return;
         }
 
@@ -6855,39 +6873,54 @@ impl Emitter {
             ExprKind::ImplicitSelf => {}
             ExprKind::Field { target, name } => {
                 // RAL frontdoor field-level read: `regs.REG.FIELD`.
-                // Lowers to `(<H>_read(helper, OFFSET) >> POS) & MASK`.
-                // Checked before the register-level path because it's
-                // strictly more specific.
+                // For RW/RO: `((regs.REG = <H>_read(helper, OFFSET)) >> POS) & MASK`
+                // — bus read updates the mirror (read-side predict) AND
+                // returns the value, then bit-extract.
+                // For WO: `((regs.REG >> POS) & MASK)` — the bus would
+                // return garbage on a WO register, so we serve from the
+                // mirror.
                 if !lvalue {
                     if let Some((
-                        _regs_var,
-                        helper_var,
-                        helper_ty,
-                        offset_lit,
-                        _reg_name,
-                        _reg_c_type,
-                        bit_pos,
-                        bit_width,
+                        regs_var, helper_var, helper_ty, offset_lit,
+                        reg_name, _reg_c_type, bit_pos, bit_width, access,
                     )) = self.resolve_regblock_subfield_lookup(e)
                     {
                         let mask = field_mask_literal(bit_width);
-                        write!(
-                            self.out,
-                            "(({helper_ty}_read({helper_var}, {offset_lit}) >> {bit_pos}) & 0x{mask:x}u)",
-                        ).ok();
+                        if access.reads_from_bus() {
+                            write!(
+                                self.out,
+                                "((({regs_var}.{reg_name} = {helper_ty}_read({helper_var}, {offset_lit})) >> {bit_pos}) & 0x{mask:x}u)",
+                            ).ok();
+                        } else {
+                            // WO — serve from mirror only.
+                            write!(
+                                self.out,
+                                "(({regs_var}.{reg_name} >> {bit_pos}) & 0x{mask:x}u)",
+                            ).ok();
+                        }
                         return;
                     }
                 }
-                // RAL frontdoor read: `regs.NAME` rvalue. Lowers to
-                // `<HelperType>_read(helper, OFFSET)`. The write side
-                // is handled in emit_signal_assignment so it can
-                // also emit the mirror update on a separate line.
-                // See docs/ral-support.md §7.4.
+                // RAL frontdoor register-level read: `regs.NAME` rvalue.
+                // RW/RO: `(regs.NAME = <H>_read(helper, OFFSET))` —
+                // assignment-expression form so the mirror updates AND
+                // the expression yields the value. WO: serve from
+                // mirror only.
                 if !lvalue {
-                    if let Some((_regs_var, helper_var, helper_ty, offset_lit)) =
+                    if let Some((regs_var, helper_var, helper_ty, offset_lit, access)) =
                         self.resolve_regblock_field_lookup(e)
                     {
-                        write!(self.out, "{helper_ty}_read({helper_var}, {offset_lit})").ok();
+                        // The `name` of the outer Field expr is the
+                        // register name itself.
+                        if access.reads_from_bus() {
+                            write!(
+                                self.out,
+                                "({regs_var}.{} = {helper_ty}_read({helper_var}, {offset_lit}))",
+                                name.name,
+                            ).ok();
+                        } else {
+                            write!(self.out, "{regs_var}.{}", name.name).ok();
+                        }
                         return;
                     }
                 }
