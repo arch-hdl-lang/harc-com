@@ -1120,6 +1120,26 @@ pub struct LetStmt {
     pub ty: Option<TypeExpr>,
     pub value: Option<Expr>,
     pub bind: bool, // true if `= bind ...` — DUT/env binding form
+    /// Hierarchical signal probes attached to this `let`. Used on the
+    /// test-level `let dut : T` to declare observation points inside
+    /// the DUT (see docs/probe-signals.md). Empty for ordinary lets.
+    pub probes: Vec<Probe>,
+    pub span: Span,
+}
+
+/// A single `probe <name> : <ty> at <path>` declaration inside a
+/// `let dut : T` block. Lowers to a Verilator `bind` stub with
+/// per-signal `/* verilator public_flat_rd */` annotations; signal
+/// access (`dut.<name>`) resolves to the mangled root accessor.
+#[derive(Debug, Clone)]
+pub struct Probe {
+    pub name: Ident,
+    pub ty: TypeExpr,
+    /// Dotted hierarchical path inside the DUT, e.g. `alu0.result`.
+    /// Stored as joined string for verbatim emission into the SV stub;
+    /// HARC does not validate the path — Verilator does, with
+    /// diagnostics cross-referenced back to the probe decl.
+    pub path: String,
     pub span: Span,
 }
 

@@ -1,0 +1,59 @@
+// Probe-signals smoke test (docs/probe-signals.md).
+//
+// Exercises the `probe` field-kind on `let dut : CpuPipe`:
+//   - Three read-only probes hoist `alu0.a`, `alu0.b`, `alu0.result`
+//     from inside the Alu submodule out to the testbench.
+//   - HARC generates `__harc_probe_CpuPipe.sv` with a `bind`
+//     directive + per-signal `/* verilator public_flat_rd */`
+//     annotations; Verilator picks it up alongside the DUT source.
+//   - `dut.<probe_name>` lowers to `dut->rootp->...` for the
+//     mangled accessor; the test reads back the ALU inputs/output
+//     as if they were ordinary top-level ports.
+
+test ProbeBasicTest
+    let dut : CpuPipe
+        probe alu_a   : uint<32> at alu0.a
+        probe alu_b   : uint<32> at alu0.b
+        probe alu_res : uint<32> at alu0.result
+    end let dut
+end test ProbeBasicTest
+
+impl sim for ProbeBasicTest
+    run
+        log(info, "CpuPipe probe-signals smoke test")
+
+        // Initial state.
+        dut.rst = 1
+        dut.imem_valid = 1
+        dut.imem_data = 0
+        dut.rs1_data = 0
+        dut.rs2_data = 0
+        dut.branch_taken = 0
+        dut.branch_target = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Feed an instruction with rs1=100, rs2=200. After one cycle
+        // the values latch into decode regs; after another cycle they
+        // are presented to alu0.a/alu0.b and alu0.result = 300
+        // combinationally.
+        dut.imem_data = 96
+        dut.rs1_data  = 100
+        dut.rs2_data  = 200
+        wait 1 cycle
+
+        dut.imem_data = 0
+        wait 1 cycle
+
+        // Probes now see the live ALU inputs and output.
+        assert dut.alu_a == 100
+            else fail("alu_a probe: expected 100, got ${dut.alu_a}")
+        assert dut.alu_b == 200
+            else fail("alu_b probe: expected 200, got ${dut.alu_b}")
+        assert dut.alu_res == 300
+            else fail("alu_res probe: expected 300, got ${dut.alu_res}")
+
+        log(info, "PASS: 3 probes through SV bind stub verified")
+    end run
+end impl ProbeBasicTest
