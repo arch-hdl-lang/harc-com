@@ -2092,6 +2092,14 @@ impl Parser {
                 let span = a.span;
                 Ok(Stmt { kind: StmtKind::Apply(a), span })
             }
+            Some(TokenKind::Release) => {
+                // `release <expr>` — disable a `probe force` signal's
+                // SV procedural force. See docs/probe-signals.md.
+                self.advance();
+                let e = self.parse_expr()?;
+                let span = start.merge(e.span);
+                Ok(Stmt { kind: StmtKind::Release(e), span })
+            }
             Some(TokenKind::Assert) => {
                 self.advance();
                 // `property` keyword is allowed in all three roles per spec
@@ -2398,12 +2406,20 @@ impl Parser {
     }
 
     /// Parse a single probe declaration:
-    ///     probe <name> : <type> at <dotted.path>
+    ///     probe [force] <name> : <type> at <dotted.path>
     /// The path is parsed as a sequence of identifiers separated by `.`
     /// and stored verbatim as a string — HARC does not validate paths
-    /// against the DUT's SV source; Verilator does.
+    /// against the DUT's SV source; Verilator does. The optional
+    /// `force` modifier opts into SV-procedural-force support for
+    /// fault injection (docs/probe-signals.md §3.1).
     fn parse_probe_decl(&mut self) -> Result<Probe, CompileError> {
         let start = self.expect(TokenKind::Probe)?.span;
+        let force = if self.check(TokenKind::Force) {
+            self.advance();
+            true
+        } else {
+            false
+        };
         let name = self.expect_field_name()?;
         self.expect(TokenKind::Colon)?;
         let ty = self.parse_type_expr()?;
@@ -2419,7 +2435,7 @@ impl Parser {
             path.push_str(&next.name);
             end = next.span;
         }
-        Ok(Probe { name, ty, path, span: start.merge(end) })
+        Ok(Probe { name, ty, path, force, span: start.merge(end) })
     }
 
     fn parse_for_stmt(&mut self) -> Result<ForStmt, CompileError> {

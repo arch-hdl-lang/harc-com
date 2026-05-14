@@ -202,6 +202,15 @@ pub enum TokenKind {
     Probe,
     #[token("at")]
     At,
+    /// `probe force NAME : T at PATH` — fault-injection variant that
+    /// lets the test write to an internal DUT signal via SV
+    /// `force` / `release`. See docs/probe-signals.md.
+    #[token("force")]
+    Force,
+    /// `release dut.<probe>` — statement that disables the active
+    /// force on a `probe force` signal. Pairs with `probe force`.
+    #[token("release")]
+    Release,
     /// Register Abstraction Layer (docs/ral-support.md). `regblock`
     /// declares a typed register block; `register` declares one
     /// register inside it; `via` names the helper transactor whose
@@ -585,6 +594,8 @@ impl fmt::Display for TokenKind {
             Passive => write!(f, "passive"),
             Probe => write!(f, "probe"),
             At => write!(f, "at"),
+            Force => write!(f, "force"),
+            Release => write!(f, "release"),
             Regblock => write!(f, "regblock"),
             Register => write!(f, "register"),
             Via => write!(f, "via"),
