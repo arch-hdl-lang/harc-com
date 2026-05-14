@@ -1130,7 +1130,7 @@ impl Parser {
     fn parse_covergroup(&mut self, doc: Option<String>) -> Result<CovergroupDecl, CompileError> {
         let start = self.expect(TokenKind::Covergroup)?.span;
         let name = self.expect_ident()?;
-        let clocking = if self.check(TokenKind::At) {
+        let clocking = if self.check(TokenKind::AtSign) {
             self.advance();
             self.expect(TokenKind::LParen)?;
             // Allow optional `posedge`/`negedge` identifier prefix (SVA-style).
@@ -2073,8 +2073,57 @@ impl Parser {
                 value = Some(self.parse_expr()?);
             }
         }
-        let end = value.as_ref().map(|e| e.span).or(ty.as_ref().map(|t| t.span())).unwrap_or(name.span);
-        Ok(LetStmt { name, ty, value, bind, span: start.merge(end) })
+        // Optional probe block: `let dut : T  probe N : T at p.q  ...  end let`.
+        // Only valid when a type was given (no inferred-type lets); enforced
+        // by the parser surfacing a clear error if `probe` appears with no
+        // type. The block terminator is `end let [name]`, matching HARC's
+        // standard `end <kw> <name>` closer convention.
+        let mut probes = Vec::new();
+        let mut probe_end_span = None;
+        if self.check(TokenKind::Probe) {
+            if ty.is_none() {
+                return Err(CompileError::general(
+                    "`probe` block requires the `let` to have a typed annotation \
+                     (`let dut : <DutType>`)".into(),
+                    self.peek_span(),
+                ));
+            }
+            while self.check(TokenKind::Probe) {
+                probes.push(self.parse_probe_decl()?);
+            }
+            probe_end_span = Some(self.expect_end(TokenKind::Let, &name.name)?);
+        }
+
+        let end = probe_end_span
+            .or_else(|| value.as_ref().map(|e| e.span))
+            .or_else(|| ty.as_ref().map(|t| t.span()))
+            .unwrap_or(name.span);
+        Ok(LetStmt { name, ty, value, bind, probes, span: start.merge(end) })
+    }
+
+    /// Parse a single probe declaration:
+    ///     probe <name> : <type> at <dotted.path>
+    /// The path is parsed as a sequence of identifiers separated by `.`
+    /// and stored verbatim as a string — HARC does not validate paths
+    /// against the DUT's SV source; Verilator does.
+    fn parse_probe_decl(&mut self) -> Result<Probe, CompileError> {
+        let start = self.expect(TokenKind::Probe)?.span;
+        let name = self.expect_field_name()?;
+        self.expect(TokenKind::Colon)?;
+        let ty = self.parse_type_expr()?;
+        self.expect(TokenKind::At)?;
+        // Dotted path: ident ('.' ident)*
+        let first = self.expect_field_name()?;
+        let mut path = first.name;
+        let mut end = first.span;
+        while self.check(TokenKind::Dot) {
+            self.advance();
+            let next = self.expect_field_name()?;
+            path.push('.');
+            path.push_str(&next.name);
+            end = next.span;
+        }
+        Ok(Probe { name, ty, path, span: start.merge(end) })
     }
 
     fn parse_for_stmt(&mut self) -> Result<ForStmt, CompileError> {
