@@ -1,0 +1,74 @@
+// probe-signals Phase 2 smoke test (docs/probe-signals.md §3.1).
+//
+// `probe force <name> : <ty> at <path>` opts into SV procedural
+// force on the target internal signal. Two extra accessors get
+// emitted in the bind stub:
+//   <name>_drv (public_flat_rw) — drive value
+//   <name>_en  (public_flat_rw) — force-enable
+// plus an `always_comb` that conditionally forces or releases the
+// target. From HARC source:
+//   - `dut.<name>` reads the live signal (post-force) as a regular
+//     read-only probe.
+//   - `dut.<name> = expr` lowers to a two-store pair: drv = expr,
+//     en = 1.
+//   - `release dut.<name>` lowers to en = 0 — the DUT signal
+//     returns to its natural value.
+//
+// Verifies against CpuPipe by forcing the internal
+// `decode_rs1_val` register, observing the forced value flows
+// through `alu0.a` (combinational forwarding), then releasing and
+// confirming the natural value returns.
+
+test ProbeForceTest
+    let dut : CpuPipe
+        probe alu_a       : uint<32> at alu0.a
+        probe force inject_rs1 : uint<32> at decode_rs1_val
+    end let dut
+
+    run
+        log(info, "CpuPipe probe force/release fault-injection test")
+
+        dut.rst = 1
+        dut.imem_valid = 1
+        dut.imem_data = 0
+        dut.rs1_data = 100
+        dut.rs2_data = 200
+        dut.branch_taken = 0
+        dut.branch_target = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Feed an instruction so decode latches rs1=100 into
+        // decode_rs1_val. After another cycle, alu0.a reflects
+        // the forwarded value through decode_rs1_fwd.
+        dut.imem_data = 96
+        wait 1 cycle
+        dut.imem_data = 0
+        wait 1 cycle
+
+        // Natural value flows from rs1_data → decode_rs1_val → alu0.a.
+        assert dut.alu_a == 100
+            else fail("natural alu_a: expected 100, got ${dut.alu_a}")
+
+        // Force decode_rs1_val to 0xDEADBEEF — should propagate
+        // combinationally to alu0.a through the forwarding mux.
+        dut.inject_rs1 = 3735928559   // 0xDEAD_BEEF
+        wait 1 cycle
+        assert dut.alu_a == 3735928559
+            else fail("forced alu_a: expected 0xDEADBEEF, got 0x${dut.alu_a:08x}")
+
+        // Release the force and feed a new instruction — natural
+        // path takes over again.
+        release dut.inject_rs1
+        dut.rs1_data = 42
+        dut.imem_data = 96
+        wait 1 cycle
+        dut.imem_data = 0
+        wait 1 cycle
+        assert dut.alu_a == 42
+            else fail("after release alu_a: expected 42, got ${dut.alu_a}")
+
+        log(info, "PASS: probe force injected 0xDEADBEEF, release restored natural flow")
+    end run
+end test ProbeForceTest

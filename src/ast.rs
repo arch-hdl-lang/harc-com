@@ -1143,6 +1143,11 @@ pub enum StmtKind {
     Yield(Expr),
     Return(Option<Expr>),
     Apply(ApplyDecl),
+    /// `release <expr>` — disable the active SV procedural force on
+    /// a `probe force` signal. Expression must resolve to a
+    /// `dut.<probe_name>` reference where the named probe was
+    /// declared with the `force` modifier. See docs/probe-signals.md.
+    Release(Expr),
     /// `assert name` / `assert <expr>` / `assert <expr> else fail("...")`.
     Assert(Verify),
     Assume(Verify),
@@ -1251,6 +1256,14 @@ pub struct Probe {
     /// HARC does not validate the path — Verilator does, with
     /// diagnostics cross-referenced back to the probe decl.
     pub path: String,
+    /// `true` for `probe force <name> ...` — fault-injection variant.
+    /// The SV stub additionally emits a `<name>_drv` + `<name>_en`
+    /// pair plus an `always_comb` that drives the target via SV
+    /// `force` when `_en` is high (released otherwise). HARC source
+    /// then permits `dut.<name> = expr` (sets drv + en) and
+    /// `release dut.<name>` (clears en). Read access works the same
+    /// as a read-only probe regardless of this flag.
+    pub force: bool,
     pub span: Span,
 }
 
