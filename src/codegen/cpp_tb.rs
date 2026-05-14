@@ -124,98 +124,22 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         })
         .ok_or_else(|| EmitError("no `test` declaration found".into()))?;
 
-    // Per-target test impl blocks (spec §7.2). `impl sim for <Test>`
-    // contributes its reserved phase blocks (setup/run/check/teardown)
-    // back into the test as a synthesized `ScopeDecl`, reusing the
-    // existing scope-sim codegen path byte-for-byte. Custom `phase
-    // <name>` blocks are pulled out as named [&]-lambdas emitted at
-    // main() scope alongside free functions, callable by name from
-    // `run` (and from each other) with sync `tick()` semantics. v0
-    // only emits codegen for `sim`; if a test has impls only for
-    // non-sim targets (e.g. `impl emu for ...`) we fail with a clear
-    // "not yet implemented" error rather than silently producing an
-    // empty binary.
-    let impls_for_test: Vec<&ImplDecl> = file
+    // Inline-form `phase <name> ... end phase` blocks declared directly
+    // inside the test body (docs/test-ergonomics.md) populate the
+    // `custom_phases` table that downstream codegen emits as named
+    // [&]-lambdas at main() scope. The legacy `impl <target> for <Test>`
+    // wrapper was removed in Phase 2; the per-target multi-impl design
+    // was never used in the fixture corpus and the parser entry is
+    // gone.
+    let custom_phases: Vec<(Ident, Block)> = test_decl
         .items
         .iter()
         .filter_map(|it| match it {
-            Item::Impl(i) if i.test_name.name == test_decl.name.name => Some(i),
+            TestItem::Phase(name, body) => Some((name.clone(), body.clone())),
             _ => None,
         })
         .collect();
-
-    let sim_impl: Option<&ImplDecl> = impls_for_test
-        .iter()
-        .copied()
-        .find(|i| i.target.name == "sim");
-
-    if !impls_for_test.is_empty() && sim_impl.is_none() {
-        let targets: Vec<&str> = impls_for_test
-            .iter()
-            .map(|i| i.target.name.as_str())
-            .collect();
-        return Err(EmitError(format!(
-            "test `{}` has only non-sim impls (targets: {}); v0 codegen \
-             only supports `impl sim for ...` — `emu` and other targets \
-             follow.",
-            test_decl.name.name,
-            targets.join(", "),
-        )));
-    }
-
-    // Synthesize the effective test by merging the sim impl's reserved
-    // phases into a `TestItem::Scope` appended to the test's items.
-    // Hold the owned clone for the lifetime of this emission and
-    // re-borrow it as `test` so downstream code is unchanged.
-    let mut custom_phases: Vec<(Ident, Block)> = Vec::new();
-    // Inline-form `phase <name> ... end phase` blocks declared directly
-    // inside the test body (docs/test-ergonomics.md) feed the same
-    // table as `ImplItem::Phase` entries from a legacy `impl sim for T`
-    // wrapper — codegen treats both shapes identically downstream.
-    for it in &test_decl.items {
-        if let TestItem::Phase(name, body) = it {
-            custom_phases.push((name.clone(), body.clone()));
-        }
-    }
-    let test_owned: TestDecl = {
-        let mut t = test_decl.clone();
-        if let Some(im) = sim_impl {
-            let mut setup = None;
-            let mut run = None;
-            let mut check = None;
-            let mut teardown = None;
-            for it in &im.items {
-                match it {
-                    ImplItem::Setup(b) => setup = Some(b.clone()),
-                    ImplItem::Run(b) => run = Some(b.clone()),
-                    ImplItem::Check(b) => check = Some(b.clone()),
-                    ImplItem::Teardown(b) => teardown = Some(b.clone()),
-                    ImplItem::Phase(name, b) => {
-                        custom_phases.push((name.clone(), b.clone()));
-                    }
-                }
-            }
-            // Only synthesize the Scope if at least one reserved phase
-            // is present — empty impl blocks (only custom phases) leave
-            // the test's existing scope/bare-stmt items untouched.
-            if setup.is_some() || run.is_some() || check.is_some() || teardown.is_some() {
-                let scope = ScopeDecl {
-                    name: Ident {
-                        name: "sim".into(),
-                        span: im.span,
-                    },
-                    setup,
-                    run,
-                    check,
-                    teardown,
-                    span: im.span,
-                };
-                t.items.push(TestItem::Scope(scope));
-            }
-        }
-        t
-    };
-    let test = &test_owned;
+    let test = test_decl;
 
     // Collect top-level functions — emitted as lambdas inside main() so they
     // can capture `dut` and `tick` lexically.
@@ -7217,17 +7141,6 @@ fn file_uses_constraint_solver(file: &SourceFile) -> bool {
                         .map_or(false, |b| block(b, &keep_bearing))
             }
             _ => false,
-        }),
-        // `impl sim for T` body items aren't folded into the Test by
-        // merge — they pass through as separate Item::Impl entries.
-        // Walk their `run` / phase / setup / etc. blocks too so
-        // `randomize(...)` inside an impl run-body is detected.
-        Item::Impl(i) => i.items.iter().any(|ii| match ii {
-            ImplItem::Setup(b)
-            | ImplItem::Run(b)
-            | ImplItem::Check(b)
-            | ImplItem::Teardown(b)
-            | ImplItem::Phase(_, b) => block(b, &keep_bearing),
         }),
         _ => false,
     })
