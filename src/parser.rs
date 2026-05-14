@@ -943,8 +943,91 @@ impl Parser {
         };
         let inner_doc = self.consume_inner_doc();
         let mut items = Vec::new();
+
+        // Per docs/test-ergonomics.md, the four reserved phase blocks
+        // (`run` / `setup` / `check` / `teardown`) may appear directly
+        // inside a `test ... end test` body, collapsing the
+        // two-block `test T { ... } / impl sim for T { ... }` form
+        // into one. Inline phases accumulate into a single synthetic
+        // `TestItem::Scope` — exactly the shape the codegen
+        // synthesizes from a matching `Item::Impl` — so emit code
+        // stays unchanged. The legacy `impl sim for T` form remains
+        // supported in parallel until the migration in Phase 2.
+        let mut inline_scope = ScopeDecl {
+            name: Ident { name: "sim".into(), span: start },
+            setup: None,
+            run: None,
+            check: None,
+            teardown: None,
+            span: start,
+        };
+        let mut saw_inline_phase = false;
+
         while !self.check_end_keyword() {
-            items.push(self.parse_test_item()?);
+            match self.peek_kind() {
+                Some(TokenKind::Run) => {
+                    let kw_span = self.advance().unwrap().span;
+                    let stmts = self.parse_stmt_list_until_end()?;
+                    let end_span = self.expect_end_anon(TokenKind::Run)?;
+                    if inline_scope.run.is_some() {
+                        return Err(CompileError::general(
+                            &format!("duplicate `run` block in test `{}`", name.name),
+                            kw_span,
+                        ));
+                    }
+                    inline_scope.run = Some(Block { stmts, span: end_span });
+                    inline_scope.span = end_span;
+                    saw_inline_phase = true;
+                }
+                Some(TokenKind::Setup) => {
+                    let kw_span = self.advance().unwrap().span;
+                    let stmts = self.parse_stmt_list_until_end()?;
+                    let end_span = self.expect_end_anon(TokenKind::Setup)?;
+                    if inline_scope.setup.is_some() {
+                        return Err(CompileError::general(
+                            &format!("duplicate `setup` block in test `{}`", name.name),
+                            kw_span,
+                        ));
+                    }
+                    inline_scope.setup = Some(Block { stmts, span: end_span });
+                    inline_scope.span = end_span;
+                    saw_inline_phase = true;
+                }
+                Some(TokenKind::Check) => {
+                    let kw_span = self.advance().unwrap().span;
+                    let stmts = self.parse_stmt_list_until_end()?;
+                    let end_span = self.expect_end_anon(TokenKind::Check)?;
+                    if inline_scope.check.is_some() {
+                        return Err(CompileError::general(
+                            &format!("duplicate `check` block in test `{}`", name.name),
+                            kw_span,
+                        ));
+                    }
+                    inline_scope.check = Some(Block { stmts, span: end_span });
+                    inline_scope.span = end_span;
+                    saw_inline_phase = true;
+                }
+                Some(TokenKind::Teardown) => {
+                    let kw_span = self.advance().unwrap().span;
+                    let stmts = self.parse_stmt_list_until_end()?;
+                    let end_span = self.expect_end_anon(TokenKind::Teardown)?;
+                    if inline_scope.teardown.is_some() {
+                        return Err(CompileError::general(
+                            &format!("duplicate `teardown` block in test `{}`", name.name),
+                            kw_span,
+                        ));
+                    }
+                    inline_scope.teardown = Some(Block { stmts, span: end_span });
+                    inline_scope.span = end_span;
+                    saw_inline_phase = true;
+                }
+                _ => {
+                    items.push(self.parse_test_item()?);
+                }
+            }
+        }
+        if saw_inline_phase {
+            items.push(TestItem::Scope(inline_scope));
         }
         let end = self.expect_end(TokenKind::Test, &name.name)?;
         Ok(TestDecl { name, params, items, span: start.merge(end), doc, inner_doc })
