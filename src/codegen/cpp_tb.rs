@@ -191,7 +191,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     let mut bare_stmts: Vec<&Stmt> = Vec::new();
     let mut explicit_run: Option<&Block> = None;
     let mut clocks: Vec<&ClockDecl> = Vec::new();
-    let mut probe_accessors: std::collections::HashMap<String, String> =
+    let mut probe_accessors: std::collections::HashMap<String, ProbeAccessor> =
         std::collections::HashMap::new();
     for it in &test.items {
         match it {
@@ -201,12 +201,17 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                         EmitError("`let dut : <Type>` must use a simple named type".into())
                     })?;
                     dut_type = Some(ty_name);
-                    // Capture probe accessors: name → mangled path inside
-                    // `dut->rootp`. Matches src/codegen/sv_stub.rs naming.
+                    // Capture probe accessors: name → (mangled read,
+                    // is_force). Matches src/codegen/sv_stub.rs naming.
+                    // Force probes also have `<name>_drv` and
+                    // `<name>_en` siblings — derived on demand.
                     for p in &l.probes {
                         probe_accessors.insert(
                             p.name.name.clone(),
-                            crate::codegen::sv_stub::mangled_accessor(ty_name, &p.name.name),
+                            ProbeAccessor {
+                                read: crate::codegen::sv_stub::mangled_accessor(ty_name, &p.name.name),
+                                force: p.force,
+                            },
                         );
                     }
                 } else {
@@ -1781,6 +1786,21 @@ struct TxnFieldInfo {
     non_random: bool,
 }
 
+/// Per-probe codegen state. The mangled read accessor is the bare
+/// path `<TopModule>__DOT__harc_probes__DOT__<name>`. The `_drv`
+/// and `_en` siblings (force probes only) are derived by appending
+/// the suffix; see `ProbeAccessor::drive` / `enable`.
+#[derive(Clone, Debug)]
+struct ProbeAccessor {
+    read: String,
+    force: bool,
+}
+
+impl ProbeAccessor {
+    fn drive(&self) -> String { format!("{}_drv", self.read) }
+    fn enable(&self) -> String { format!("{}_en", self.read) }
+}
+
 struct Emitter {
     out: String,
     errors: Vec<String>,
@@ -1800,7 +1820,7 @@ struct Emitter {
     /// probe reads/writes route through the Verilator-bind stub instead of
     /// the (non-existent) top-level signal of the original DUT. Empty for
     /// probe-less tests — current 76 fixtures all sit in this bucket.
-    probes: std::collections::HashMap<String, String>,
+    probes: std::collections::HashMap<String, ProbeAccessor>,
     /// RAL regblock declarations indexed by type name. See ast.rs::
     /// `RegblockDecl`. Used to emit one POD mirror struct +
     /// `constexpr` address table per declared regblock at file scope,
@@ -6000,6 +6020,20 @@ impl Emitter {
                 self.emit_expr(e);
                 writeln!(self.out, ";").ok();
             }
+            StmtKind::Release(e) => {
+                // `release <expr>` — disable the active SV procedural
+                // force on a `probe force` signal. Lowers to a single
+                // store: `<name>_en = 0`. Read-only probes (no `force`
+                // modifier) error.
+                if let Some(probe) = self.resolve_force_probe(e) {
+                    self.pad(depth);
+                    writeln!(self.out, "dut->rootp->{} = 0;", probe.enable()).ok();
+                } else {
+                    self.errors.push(
+                        "`release` target must be `dut.<probe_name>` where the named probe was declared with `probe force`".into(),
+                    );
+                }
+            }
             StmtKind::Return(opt) => {
                 self.pad(depth);
                 if let Some(e) = opt {
@@ -6944,7 +6978,54 @@ impl Emitter {
         ))
     }
 
+    /// If `target` is `dut.<probe>` where the probe was declared with
+    /// the `force` modifier, return its `ProbeAccessor`. Used by
+    /// `emit_signal_assignment` and the `release` statement to emit
+    /// the two-store (drv + en) lowering.
+    fn resolve_force_probe(&self, target: &Expr) -> Option<ProbeAccessor> {
+        let ExprKind::Field { target: outer, name } = &*target.kind else {
+            return None;
+        };
+        let ExprKind::Ident(id) = &*outer.kind else {
+            return None;
+        };
+        if id.name != "dut" {
+            return None;
+        }
+        let probe = self.probes.get(&name.name)?;
+        if probe.force { Some(probe.clone()) } else { None }
+    }
+
     fn emit_signal_assignment(&mut self, target: &Expr, value: &Expr, depth: usize) {
+        // `probe force <name>` write: lower to a paired store of
+        // `<name>_drv = expr` and `<name>_en = 1`. See
+        // docs/probe-signals.md. The bound SV stub's `always_comb`
+        // picks up `_en=1` next cycle and procedurally forces the
+        // target path with the latched `_drv` value.
+        if let Some(probe) = self.resolve_force_probe(target) {
+            write!(self.out, "dut->rootp->{} = ", probe.drive()).ok();
+            self.emit_expr(value);
+            writeln!(self.out, ";").ok();
+            self.pad(depth);
+            writeln!(self.out, "dut->rootp->{} = 1;", probe.enable()).ok();
+            return;
+        }
+        // Plain-probe write: not allowed. Surface a clear codegen
+        // error rather than emit invalid C++. Read-only probes
+        // can't drive their target signal — declare with `force`
+        // for fault injection.
+        if let ExprKind::Field { target: outer, name } = &*target.kind {
+            if let ExprKind::Ident(id) = &*outer.kind {
+                if id.name == "dut" && self.probes.contains_key(&name.name) {
+                    self.errors.push(format!(
+                        "write to `dut.{}`: read-only probe — declare with `probe force` to enable fault injection",
+                        name.name,
+                    ));
+                    return;
+                }
+            }
+        }
+
         // RAL addrmap subfield write: `chip.inst.REG.FIELD = expr`.
         // Identical lowering to the regblock subfield path, but the
         // bus offset is `base(inst) + offset(REG)` and the mirror path
@@ -7268,11 +7349,16 @@ impl Emitter {
                 // docs/probe-signals.md.
                 if let ExprKind::Ident(id) = &*target.kind {
                     if id.name == "dut" {
-                        if let Some(mangled) = self.probes.get(&name.name).cloned() {
+                        if let Some(probe) = self.probes.get(&name.name).cloned() {
+                            // Reads always come from the read-side
+                            // accessor regardless of `force`. Writes
+                            // are handled elsewhere (emit_signal_
+                            // assignment) since they expand to a
+                            // two-statement drv+en pair.
                             if lvalue {
-                                write!(self.out, "dut->rootp->{mangled}").ok();
+                                write!(self.out, "dut->rootp->{}", probe.read).ok();
                             } else {
-                                write!(self.out, "harc_rt::harc_read(dut->rootp->{mangled})").ok();
+                                write!(self.out, "harc_rt::harc_read(dut->rootp->{})", probe.read).ok();
                             }
                             return;
                         }
