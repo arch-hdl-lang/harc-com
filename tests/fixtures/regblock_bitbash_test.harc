@@ -1,0 +1,86 @@
+// RAL Phase 1d smoke test (docs/ral-support.md §7.7).
+//
+// `bitbash(regs)` is a compile-time-unrolled walk-all over the
+// regblock's RW registers. For each RW register the codegen emits
+// a write(all-ones) + read + compare + write(zero) + read + compare
+// pair. Mismatches bump the `errors` counter via the same path the
+// `assert ... else fail(...)` form uses.
+//
+// RO/WO registers are skipped with a marker comment in the emitted
+// C++ — RO can't accept the write; WO reads are mirror-only.
+//
+// Verifies end-to-end against AxiLiteRegs (which acts as RW from
+// the bus side) that the unrolled sequence compiles, runs, and
+// reports zero errors.
+
+use BusAxiLite
+
+transactor AxilHelper bound to BusAxiLite
+    hookable write(addr: uint<8>, data: uint<32>)
+        bus.aw.addr = addr
+        bus.aw.valid = 1
+        bus.w.send(data, 15)
+        bus.aw.valid = 0
+        wait 1 cycle
+    end write
+
+    hookable read(addr: uint<8>) -> uint<32>
+        bus.ar.addr = addr
+        bus.ar.valid = 1
+        let r = bus.r.recv()
+        bus.ar.valid = 0
+        wait 1 cycle
+        return r.data
+    end read
+end transactor AxilHelper
+
+regblock DmaRegs via AxilHelper width 32
+    /// Three RW registers — bitbash walks each one with 0xFFFFFFFF
+    /// and 0x00000000 patterns.
+    register MM2S_SA   @ 0x18 access rw
+    register MM2S_LEN  @ 0x28 access rw
+    register S2MM_SA   @ 0x48 access rw
+
+    /// Skipped — bitbash logs a marker and moves on.
+    register STATUS_RO @ 0x04 access ro
+    /// Skipped — WO reads serve from mirror, not bus.
+    register CMD_WO    @ 0x58 access wo
+end regblock DmaRegs
+
+test RegblockBitbashTest
+    let dut    : AxiLiteRegs
+    let axil   : BusAxiLite = bind dut
+    let helper : AxilHelper passive = bind axil
+    let regs   : DmaRegs = bind helper
+
+    run
+        dut.rst = 1
+        axil.aw.valid = 0
+        axil.w.valid = 0
+        axil.b.ready = 1
+        axil.ar.valid = 0
+        axil.r.ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Compile-time-unrolled walk over the three RW registers.
+        // 6 bus transactions per cycle pair = 36 cycles for 3 regs
+        // × 2 patterns × (write + read). RO/WO are skipped.
+        bitbash(regs)
+
+        assert errors == 0
+            else fail("bitbash reported ${errors} mismatch(es)")
+        log(info, "PASS: bitbash walked 3 RW registers with all-ones and zero patterns")
+    end run
+end test RegblockBitbashTest

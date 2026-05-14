@@ -5943,6 +5943,14 @@ impl Emitter {
                 if self.try_emit_bus_handshake(e, None, depth) {
                     return;
                 }
+                // `bitbash(regs)` — RFC §7.7 compile-time-unrolled
+                // walk-all over each RW register in the regblock.
+                // Emits write(all-ones) + read + assert + write(0) +
+                // read + assert for every RW register. RO/WO are
+                // skipped with a comment. See docs/ral-support.md.
+                if self.try_emit_bitbash(e, depth) {
+                    return;
+                }
                 self.pad(depth);
                 self.emit_expr(e);
                 writeln!(self.out, ";").ok();
@@ -6637,6 +6645,89 @@ impl Emitter {
     /// offset_literal, register-access-policy)`. Used by
     /// `emit_signal_assignment` (write side) and `emit_expr_with_arrow`
     /// (read side).
+    /// Compile-time-unrolled bitbash walk. Detects a bare statement
+    /// `bitbash(<regs_ident>)` where the argument is a `let regs : R =
+    /// bind helper` binding, and emits one write-all-ones / read-back
+    /// + write-zero / read-back pair per RW register in the regblock.
+    /// RO/WO registers are skipped (RO can't accept the write; WO
+    /// can't be read meaningfully). Failures bump the `errors`
+    /// counter and log via `sim_log_line` so the existing test-result
+    /// machinery picks them up.
+    fn try_emit_bitbash(&mut self, e: &Expr, depth: usize) -> bool {
+        let ExprKind::Call { callee, args } = &*e.kind else {
+            return false;
+        };
+        let ExprKind::Ident(name) = &*callee.kind else {
+            return false;
+        };
+        if name.name != "bitbash" || args.len() != 1 {
+            return false;
+        }
+        let arg = match &args[0] {
+            CallArg::Expr(ex) => ex,
+            CallArg::Named { value, .. } => value,
+        };
+        let ExprKind::Ident(regs_id) = &*arg.kind else {
+            return false;
+        };
+        let Some(regs_ty) = self.let_types.get(&regs_id.name).cloned() else {
+            return false;
+        };
+        let Some(block) = self.regblocks.get(&regs_ty).cloned() else {
+            return false;
+        };
+        let Some(helper_var) = self.let_helper.get(&regs_id.name).cloned() else {
+            return false;
+        };
+        let Some(helper_ty) = self.let_types.get(&helper_var).cloned() else {
+            return false;
+        };
+
+        let default_w = block.default_width.unwrap_or(32);
+        self.pad(depth);
+        writeln!(self.out, "// bitbash({}) — RAL walk-all over RW regs of {}",
+            regs_id.name, regs_ty).ok();
+        for reg in &block.registers {
+            let w = reg.width.unwrap_or(default_w);
+            let mask: u64 = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+            let off = c_int_literal_from(&reg.offset.kind);
+            let regname = &reg.name.name;
+            if !reg.access.writes_to_bus() || !reg.access.reads_from_bus() {
+                self.pad(depth);
+                writeln!(self.out,
+                    "// bitbash: skipping {} (access {})",
+                    regname, reg.access.keyword()).ok();
+                continue;
+            }
+            // Two patterns: all-ones (masked to register width), then
+            // zero. Each pair: write → read → compare → bump errors
+            // if mismatch + sim_log.
+            for (pat_label, pat) in [("ones", mask), ("zero", 0u64)] {
+                self.pad(depth);
+                writeln!(self.out, "{{").ok();
+                self.pad(depth + 1);
+                writeln!(self.out, "uint64_t _bb_pat = 0x{pat:x}ull;").ok();
+                self.pad(depth + 1);
+                writeln!(self.out, "{helper_ty}_write({helper_var}, {off}, _bb_pat);").ok();
+                self.pad(depth + 1);
+                writeln!(self.out,
+                    "uint64_t _bb_got = {helper_ty}_read({helper_var}, {off});").ok();
+                self.pad(depth + 1);
+                writeln!(self.out, "if (_bb_got != _bb_pat) {{").ok();
+                self.pad(depth + 2);
+                writeln!(self.out,
+                    "sim_log_line(\"FAIL\", \"bitbash {regname} {pat_label}: wrote 0x%llx, got 0x%llx\", (long long)_bb_pat, (long long)_bb_got);").ok();
+                self.pad(depth + 2);
+                writeln!(self.out, "errors++;").ok();
+                self.pad(depth + 1);
+                writeln!(self.out, "}}").ok();
+                self.pad(depth);
+                writeln!(self.out, "}}").ok();
+            }
+        }
+        true
+    }
+
     fn resolve_regblock_field_lookup(
         &self,
         target: &Expr,
