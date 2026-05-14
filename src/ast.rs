@@ -183,14 +183,39 @@ pub struct FieldDecl {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegAccess {
+    /// Read-write. Bus reads return the live DUT value; writes
+    /// propagate user data. Mirror tracks the most-recent value.
     Rw,
+    /// Read-only. Bus reads work normally; writes lower to no bus
+    /// traffic and emit a sim-time warning (the DUT would drop them
+    /// anyway). The mirror is read-only too — only refreshed by
+    /// read-side predict.
+    Ro,
+    /// Write-only. Bus writes work normally; reads return the
+    /// mirror without bus traffic (a real DUT typically returns
+    /// undefined or zero for a WO register, so going to the bus
+    /// would surprise the user). Mirror tracks user writes.
+    Wo,
 }
 
 impl RegAccess {
     pub fn keyword(self) -> &'static str {
         match self {
             RegAccess::Rw => "rw",
+            RegAccess::Ro => "ro",
+            RegAccess::Wo => "wo",
         }
+    }
+
+    /// Whether a write to this register/field reaches the bus.
+    pub fn writes_to_bus(self) -> bool {
+        matches!(self, RegAccess::Rw | RegAccess::Wo)
+    }
+
+    /// Whether a read of this register/field reaches the bus. RO/RW
+    /// do; WO reads stay local (return the mirror).
+    pub fn reads_from_bus(self) -> bool {
+        matches!(self, RegAccess::Rw | RegAccess::Ro)
     }
 }
 

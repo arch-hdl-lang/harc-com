@@ -1457,11 +1457,13 @@ impl Parser {
                 let kw = self.expect_ident_or_kw()?;
                 access = match kw.name.as_str() {
                     "rw" => RegAccess::Rw,
+                    "ro" => RegAccess::Ro,
+                    "wo" => RegAccess::Wo,
                     other => {
                         return Err(CompileError::general(
                             &format!(
-                                "register access policy `{other}` not supported in Phase 1a \
-                                 (only `rw` ships; `ro`/`wo`/`w1c`/`w1s`/`wclr`/`wset`/`rc`/`rs` \
+                                "register access policy `{other}` not supported yet \
+                                 (`rw`/`ro`/`wo` ship; `w1c`/`w1s`/`wclr`/`wset`/`rc`/`rs` \
                                  follow per docs/ral-support.md)"
                             ),
                             kw.span,
@@ -1525,11 +1527,13 @@ impl Parser {
                 let kw = self.expect_ident_or_kw()?;
                 access = match kw.name.as_str() {
                     "rw" => RegAccess::Rw,
+                    "ro" => RegAccess::Ro,
+                    "wo" => RegAccess::Wo,
                     other => {
                         return Err(CompileError::general(
                             &format!(
-                                "field access policy `{other}` not supported in Phase 1b \
-                                 (only `rw` ships; `ro`/`wo`/`w1c`/`w1s`/`wclr`/`wset`/`rc`/`rs` \
+                                "field access policy `{other}` not supported yet \
+                                 (`rw`/`ro`/`wo` ship; `w1c`/`w1s`/`wclr`/`wset`/`rc`/`rs` \
                                  follow per docs/ral-support.md)"
                             ),
                             kw.span,
