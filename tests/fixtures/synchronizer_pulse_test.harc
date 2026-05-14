@@ -14,9 +14,7 @@ test EventSyncTest
 
     clock src_clk = SrcDomain    // 100 MHz → 10 ns period
     clock dst_clk = DstDomain    // 200 MHz → 5  ns period
-end test EventSyncTest
 
-impl sim for EventSyncTest
     run
         // Reset.
         dut.rst = 1
@@ -64,5 +62,5 @@ impl sim for EventSyncTest
         end for
         log(info, "PASS: no spurious pulses during idle")
     end run
-end impl EventSyncTest
+end test EventSyncTest
 

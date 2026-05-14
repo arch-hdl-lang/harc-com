@@ -40,9 +40,7 @@ test AxiLiteBusTest
     // Lite signal group on `dut`. The binding name is the prefix —
     // `axil.aw.addr` lowers to `dut->axil_aw_addr`.
     let axil : AxiLiteBus = bind dut
-end test AxiLiteBusTest
 
-impl sim for AxiLiteBusTest
     run
         // Reset.
         dut.rst = 1
@@ -101,5 +99,5 @@ impl sim for AxiLiteBusTest
             else fail("read got 0x${val:08x}, expected 0xCAFEBABE")
         log(info, "PASS: bus-typed AXI-Lite write/read round-trip")
     end run
-end impl AxiLiteBusTest
+end test AxiLiteBusTest
 

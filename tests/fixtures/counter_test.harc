@@ -8,4 +8,42 @@
 
 test CounterTest
     let dut : WrapCounter
+
+    run
+        // Hold reset for 2 cycles, init inputs.
+        dut.rst = 1
+        dut.inc = 0
+        dut.max = 15
+        wait 2 cycles
+        dut.rst = 0
+
+        // Count from 0 to 15.
+        for i in 0 .. 16
+            assert dut.value == i else fail("count mismatch")
+            if i == 15
+                assert dut.at_max else fail("at_max should be 1 at 15")
+            end if
+            dut.inc = 1
+            wait 1 cycle
+        end for
+
+        // After the 16th tick the counter wraps back to 0.
+        assert dut.value == 0 else fail("wrap failed")
+        log(info, "PASS: wrap at MAX=15")
+
+        // With inc deasserted the value must hold.
+        dut.inc = 0
+        wait 2 cycles
+        assert dut.value == 0 else fail("hold failed")
+        log(info, "PASS: hold when inc=0")
+    end run
 end test CounterTest
+
+// Sim-scope of CounterTest. Generates clock + reset, walks 0..15, checks
+// at_max + wrap + hold semantics. Mirrors examples/counter_tb.cpp end-to-end.
+//
+// `=` is blocking assignment (matches ARCH); raw DUT signal drives use it.
+// `<-` is reserved for channel/event/state sends (spec §17.2, future).
+// `wait N cycles` is the single-statement suspend (ARCH-shape sugar for
+// `after N cycles ... end after`).
+

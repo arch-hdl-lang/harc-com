@@ -77,9 +77,7 @@ test AxiLiteHooksTest
         post_value_sum = post_value_sum + t.value
         logf("axi_master.log", debug, "post drv.send last_read=0x${drv.last_read:08x}")
     end on
-end test AxiLiteHooksTest
 
-impl sim for AxiLiteHooksTest
     run
         log(info, "AxiLiteRegs pre/post hooks test")
         drv.dut = dut
@@ -131,5 +129,5 @@ impl sim for AxiLiteHooksTest
             else fail("post_value_sum=${post_value_sum}, expected ${total}")
         log(info, "PASS: pre_count=${pre_count}, post_count=${post_count}, sum matches")
     end run
-end impl AxiLiteHooksTest
+end test AxiLiteHooksTest
 

@@ -16,9 +16,7 @@
 
 test InstVecPortRegressionTest
     let dut : Top
-end test InstVecPortRegressionTest
 
-impl sim for InstVecPortRegressionTest
     run
         log(info, "inst_vec_port_regression sim")
 
@@ -58,5 +56,5 @@ impl sim for InstVecPortRegressionTest
 
         log(info, "PASS: 8 vec lanes mirror end-to-end")
     end run
-end impl InstVecPortRegressionTest
+end test InstVecPortRegressionTest
 

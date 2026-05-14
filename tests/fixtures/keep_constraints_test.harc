@@ -36,9 +36,7 @@ test KeepConstraintsTest
     let dut : Top
 
     clock clk = SysDomain
-end test KeepConstraintsTest
 
-impl sim for KeepConstraintsTest
     run
         dut.rst = 1
         dut.en = 0
@@ -66,4 +64,5 @@ impl sim for KeepConstraintsTest
 
         log(info, "PASS: 30 randomize(t) calls satisfied every keep constraint")
     end run
-end impl KeepConstraintsTest
+end test KeepConstraintsTest
+

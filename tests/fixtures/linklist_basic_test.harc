@@ -96,9 +96,7 @@ test LinklistBasicTest
     let dut : TaskQueue
 
     clock clk = SysDomain        // 100 MHz
-end test LinklistBasicTest
 
-impl sim for LinklistBasicTest
     run
         // ── Test 1: initial state ─────────────────────────────────
         reset_dut(dut)
@@ -219,5 +217,5 @@ impl sim for LinklistBasicTest
         assert dut.empty == 1 else fail("empty after interleaved")
         log(info, "PASS: interleaved insert/delete")
     end run
-end impl LinklistBasicTest
+end test LinklistBasicTest
 

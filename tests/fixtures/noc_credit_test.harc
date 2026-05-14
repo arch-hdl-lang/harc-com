@@ -48,9 +48,7 @@ end transactor NocCreditXactor
 test NocCreditTest
     let dut  : NocCreditTop
     let xact : NocCreditXactor passive
-end test NocCreditTest
 
-impl sim for NocCreditTest
     run
         log(info, "NocCreditTop credit-channel test")
         xact.dut = dut
@@ -111,5 +109,5 @@ impl sim for NocCreditTest
 
         log(info, "ALL 5 SUB-TESTS PASSED — NocCreditTop credit-channel coverage")
     end run
-end impl NocCreditTest
+end test NocCreditTest
 

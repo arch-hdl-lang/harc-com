@@ -17,9 +17,7 @@ test BusSyncTest
 
     clock src_clk = SrcDomain    // 100 MHz — primary
     clock dst_clk = DstDomain    // 250 MHz
-end test BusSyncTest
 
-impl sim for BusSyncTest
     run
         // Reset.
         dut.rst = 1
@@ -69,5 +67,5 @@ impl sim for BusSyncTest
             else fail("after reset: data_out=${dut.data_out:08x}, expected 0")
         log(info, "PASS: reset clears state")
     end run
-end impl BusSyncTest
+end test BusSyncTest
 

@@ -94,9 +94,7 @@ test DmaEngineTest
     let dut : DmaEngine
     let mon : MemXactor passive
     let apb : ApbXactor passive
-end test DmaEngineTest
 
-impl sim for DmaEngineTest
     run
         log(info, "DmaEngine test — APB config + mem_rd/mem_wr handshake observation")
 
@@ -179,5 +177,5 @@ impl sim for DmaEngineTest
 
         log(info, "PASS: 4 r/w beats observed via transactor handlers, IRQ fired, APB readback correct")
     end run
-end impl DmaEngineTest
+end test DmaEngineTest
 

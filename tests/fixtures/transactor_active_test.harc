@@ -51,9 +51,7 @@ test TransactorActiveTest
     let axil : BusAxiLite = bind dut
     let xact : AxilXactor active = bind axil
     let sb   : AxilSb
-end test TransactorActiveTest
 
-impl sim for TransactorActiveTest
     run
         log(info, "transactor test — active instance drives via req event")
 
@@ -105,8 +103,7 @@ impl sim for TransactorActiveTest
 
         log(info, "PASS: 5 transactions processed by `AxilXactor active`")
     end run
-end impl TransactorActiveTest
-
+end test TransactorActiveTest
 
 scoreboard AxilSb
     expected : queue<uint<32>>

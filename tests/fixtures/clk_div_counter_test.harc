@@ -16,9 +16,7 @@ test ClkDivCounterTest
     let dut : ClkDivCounter
 
     clock clk = ClkDomain        // 100 MHz → 10 ns period
-end test ClkDivCounterTest
 
-impl sim for ClkDivCounterTest
     run
         // Active-low reset: hold rst_n=0 for 3 full cycles.
         dut.rst_n = 0
@@ -43,5 +41,5 @@ impl sim for ClkDivCounterTest
         end for
         log(info, "PASS: counter tracks div_clk rising edges over 8 fast cycles")
     end run
-end impl ClkDivCounterTest
+end test ClkDivCounterTest
 
