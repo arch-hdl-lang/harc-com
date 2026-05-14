@@ -106,6 +106,43 @@ pub enum Item {
     /// docs/ral-support.md. Phase 1a: registers only (no field-level
     /// decomposition yet).
     Regblock(RegblockDecl),
+    /// `addrmap A via Helper { instance NAME : RegblockType @ BASE_ADDR }`
+    /// — chip-level composition of one or more regblock instances,
+    /// each at its own base address. Lowered to a POD outer struct
+    /// containing one `<RegblockType>_Mirror` per instance.
+    /// Frontdoor traffic via the same helper transactor as a flat
+    /// regblock. See docs/ral-support.md §4. Phase 1e: flat (no
+    /// nested addrmaps, no `alias of`, no per-instance bus override).
+    Addrmap(AddrmapDecl),
+}
+
+/// `addrmap <Name> via <Helper> { <instance>* }`
+#[derive(Debug, Clone)]
+pub struct AddrmapDecl {
+    pub name: Ident,
+    /// Helper transactor (`via <Type>`) routing bus traffic — same
+    /// shape as `regblock.via_helper`.
+    pub via_helper: Ident,
+    pub instances: Vec<InstanceDecl>,
+    pub span: Span,
+    pub doc: Option<String>,
+    pub inner_doc: Option<String>,
+}
+
+/// `instance <Name> : <RegblockType> @ <base_addr>`
+#[derive(Debug, Clone)]
+pub struct InstanceDecl {
+    pub name: Ident,
+    /// Regblock type this instance is a child of. Resolved against
+    /// the file's `RegblockDecl`s at codegen time; missing types
+    /// produce a clean error message.
+    pub regblock_ty: Ident,
+    /// Base address of the instance within the chip's address space.
+    /// `Expr` so hex literals + simple arithmetic work; constant-
+    /// folded at codegen time.
+    pub base_addr: Expr,
+    pub span: Span,
+    pub doc: Option<String>,
 }
 
 // ── Register Abstraction Layer ────────────────────────────────────────────────
@@ -1402,6 +1439,8 @@ impl_construct_direct!(BusDecl, "bus", +inner);
 impl_construct_direct!(ExternalModuleDecl, "module");
 impl_construct_direct!(FunctionDecl, "function", +inner);
 impl_construct_direct!(ExternFnDecl, "extern fn");
+impl_construct_direct!(RegblockDecl, "regblock", +inner);
+impl_construct_direct!(AddrmapDecl, "addrmap", +inner);
 
 // `agent` / `env` / `scoreboard` / `sequencer` share `ComponentDecl`;
 // the kind_label varies. Implemented manually so `kind` selects the
@@ -1534,8 +1573,8 @@ impl Item {
             Item::Bus(b) => b,
             Item::Transactor(t) => t,
             Item::Regblock(r) => r,
+            Item::Addrmap(a) => a,
         }
     }
 }
 
-impl_construct_direct!(RegblockDecl, "regblock", +inner);

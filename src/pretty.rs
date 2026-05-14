@@ -219,6 +219,21 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
             pad(out, depth);
             writeln!(out, "end regblock {}", r.name.name).ok();
         }
+        Item::Addrmap(a) => {
+            print_doc(out, &a.doc, depth);
+            pad(out, depth);
+            writeln!(out, "addrmap {} via {}", a.name.name, a.via_helper.name).ok();
+            print_inner_doc(out, &a.inner_doc, depth + 1);
+            for inst in &a.instances {
+                print_doc(out, &inst.doc, depth + 1);
+                pad(out, depth + 1);
+                write!(out, "instance {} : {} @ ", inst.name.name, inst.regblock_ty.name).ok();
+                print_expr(out, &inst.base_addr);
+                writeln!(out).ok();
+            }
+            pad(out, depth);
+            writeln!(out, "end addrmap {}", a.name.name).ok();
+        }
         Item::Test(t) => {
             print_doc(out, &t.doc, depth);
             pad(out, depth);

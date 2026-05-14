@@ -1,0 +1,124 @@
+// RAL Phase 1e smoke test (docs/ral-support.md §4).
+//
+// `addrmap` is the chip-level container: it instantiates one or
+// more regblocks at distinct base addresses. `chip.inst.REG` is a
+// 3-level access that lowers to a bus transaction at `base(inst)
+// + offset(REG)`. Field-level `chip.inst.REG.FIELD` adds the
+// usual mask + shift on top.
+//
+// Surface exercised:
+//   - `addrmap A via Helper { instance NAME : R @ BASE ... }`
+//   - `let chip : A = bind helper`
+//   - `chip.inst.REG = value` (3-level write at chip-level address)
+//   - `let v = chip.inst.REG` (3-level read with mirror predict)
+//   - `chip.inst.REG.FIELD = value` (4-level masked write)
+//   - `chip.inst.REG.FIELD` (4-level shifted read)
+//   - Two instances of the same regblock at different bases —
+//     prove the base address routes each one independently
+//
+// Verification: against AxiLiteRegs the two "instances" live at
+// different offsets in the same DUT. Writing to `inst_a.SA` lands
+// at 0x18; writing to `inst_b.SA` lands at 0x48 (different DUT
+// register). Reading back via the regblock readback proves the
+// base address routing.
+
+use BusAxiLite
+
+transactor AxilHelper bound to BusAxiLite
+    hookable write(addr: uint<8>, data: uint<32>)
+        bus.aw.addr = addr
+        bus.aw.valid = 1
+        bus.w.send(data, 15)
+        bus.aw.valid = 0
+        wait 1 cycle
+    end write
+
+    hookable read(addr: uint<8>) -> uint<32>
+        bus.ar.addr = addr
+        bus.ar.valid = 1
+        let r = bus.r.recv()
+        bus.ar.valid = 0
+        wait 1 cycle
+        return r.data
+    end read
+end transactor AxilHelper
+
+regblock DmaChan via AxilHelper width 32
+    /// DMACR — bit 0 is RS (run/stop).
+    register DMACR @ 0x00 access rw
+        field RS : bit @ 0 reset 0 access rw
+    end register DMACR
+
+    /// SA — full-word source address.
+    register SA @ 0x18 access rw
+end regblock DmaChan
+
+addrmap Soc via AxilHelper
+    /// MM2S channel at base 0x00 — register addresses align with the
+    /// AxiLiteRegs MM2S register layout.
+    instance mm2s : DmaChan @ 0x00
+    /// S2MM channel at base 0x30 — DMACR at 0x30, SA at 0x48
+    /// (0x30 + 0x18) — also matches the AxiLiteRegs layout.
+    instance s2mm : DmaChan @ 0x30
+end addrmap Soc
+
+test RegblockAddrmapTest
+    let dut    : AxiLiteRegs
+    let axil   : BusAxiLite = bind dut
+    let helper : AxilHelper passive = bind axil
+    let chip   : Soc = bind helper
+
+    run
+        dut.rst = 1
+        axil.aw.valid = 0
+        axil.w.valid = 0
+        axil.b.ready = 1
+        axil.ar.valid = 0
+        axil.r.ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // 3-level register-level write to instance mm2s — bus
+        // address 0x00 + 0x18 = 0x18.
+        chip.mm2s.SA = 3735879680      // 0xDEAD_1000
+        assert chip.mm2s.SA == 3735879680
+            else fail("mm2s.SA readback (got 0x${chip.mm2s.SA:08x})")
+
+        // Same register on instance s2mm — bus address 0x30 + 0x18
+        // = 0x48 — a DIFFERENT DUT register.
+        chip.s2mm.SA = 305419896       // 0x12345678
+        assert chip.s2mm.SA == 305419896
+            else fail("s2mm.SA readback (got 0x${chip.s2mm.SA:08x})")
+
+        // Cross-check: mm2s.SA is unchanged after writing s2mm.SA —
+        // proves the base address routing keeps the two instances
+        // isolated.
+        assert chip.mm2s.SA == 3735879680
+            else fail("mm2s.SA clobbered by s2mm write (got 0x${chip.mm2s.SA:08x})")
+
+        // 4-level field-level write — masked update through the
+        // instance's mirror.
+        chip.mm2s.DMACR.RS = 1
+        assert chip.mm2s.DMACR.RS == 1
+            else fail("mm2s.DMACR.RS readback (got ${chip.mm2s.DMACR.RS})")
+
+        // The s2mm channel's DMACR is at bus address 0x30 — distinct
+        // from mm2s's 0x00. Verify it's independently writable.
+        chip.s2mm.DMACR.RS = 1
+        assert chip.s2mm.DMACR.RS == 1
+            else fail("s2mm.DMACR.RS readback (got ${chip.s2mm.DMACR.RS})")
+
+        log(info, "PASS: 2 addrmap instances of DmaChan round-trip at distinct bases")
+    end run
+end test RegblockAddrmapTest
