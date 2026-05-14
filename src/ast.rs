@@ -98,18 +98,6 @@ pub enum Item {
     /// `generate_if ACTIVE` lowering is T-3; emulator transport is
     /// out-of-v0.
     Transactor(TransactorDecl),
-    /// `impl <target> for <TestName> { setup ... run ... check ...
-    /// teardown ... phase <name> ... }` — per-target test implementation
-    /// (spec §7.2). Replaces the older inline `scope sim` block: the
-    /// test struct holds field declarations only, while each target
-    /// (`sim`, `emu`, ...) gets its own top-level `impl` item. Mirrors
-    /// Rust's `impl Trait for Type` shape — sim and emu impls of the
-    /// same test compose orthogonally and can live in separate files.
-    /// In v0 only `run` actually lowers; `setup`/`check`/`teardown` and
-    /// custom `phase <name>` blocks parse but are placeholder no-ops
-    /// (the latter are inlined when the user calls them by name from
-    /// `run`).
-    Impl(ImplDecl),
     /// `regblock R via Helper { register NAME @ ADDR width N reset V
     /// access POLICY }` — Register Abstraction Layer block, lowered
     /// to a POD mirror struct + `constexpr` address table + frontdoor
@@ -582,55 +570,6 @@ pub struct ScopeDecl {
     pub check: Option<Block>,
     pub teardown: Option<Block>,
     pub span: Span,
-}
-
-// ── Impl block (§7.2) ─────────────────────────────────────────────────────────
-
-/// `impl <target> for <TestName> { ... }` — per-target test implementation.
-///
-/// `target` is a tag identifier — `sim` for native simulation, `emu` for
-/// emulation; v0 only emits codegen for `sim`. The body holds the four
-/// reserved phase blocks (`setup` / `run` / `check` / `teardown`) plus any
-/// number of user-defined `phase <name> ... end phase <name>` helper
-/// blocks. v0 codegen only lowers `run` (and inlines user phases the
-/// user calls from `run`); the other reserved phases parse but emit
-/// placeholder comments so the syntax surface is locked.
-#[derive(Debug, Clone)]
-pub struct ImplDecl {
-    /// Target tag — `sim`, `emu`, etc. Free-form identifier for now;
-    /// v0 only recognizes `sim` at codegen time.
-    pub target: Ident,
-    /// Test the impl applies to. Resolution at codegen time picks the
-    /// `TestDecl` with matching name; missing-test error is reported
-    /// from the codegen layer.
-    pub test_name: Ident,
-    /// Reserved-phase + custom-phase body items, in source order.
-    pub items: Vec<ImplItem>,
-    pub span: Span,
-    pub doc: Option<String>,
-    pub inner_doc: Option<String>,
-}
-
-/// A single body item inside an `impl <target> for <TestName>` block.
-#[derive(Debug, Clone)]
-pub enum ImplItem {
-    /// `setup ... end setup` — runs once before clocks start.
-    /// v0 placeholder (parses, no-op codegen).
-    Setup(Block),
-    /// `run ... end run` — main coroutine body. The runtime entry point
-    /// for the test.
-    Run(Block),
-    /// `check ... end check` — runs once after `run` completes.
-    /// v0 placeholder.
-    Check(Block),
-    /// `teardown ... end teardown` — runs at process exit.
-    /// v0 placeholder.
-    Teardown(Block),
-    /// `phase <name> ... end phase <name>` — user-defined named phase.
-    /// Pure code-organization helper; not auto-fired by the runtime.
-    /// User invokes it by name (`<name>()`) from `run` or another
-    /// phase. v0 lowers as an inlined block at the call site.
-    Phase(Ident, Block),
 }
 
 // ── Extend aspect (§3.6) ──────────────────────────────────────────────────────
@@ -1504,16 +1443,6 @@ impl Construct for ApplyDecl {
     fn doc(&self) -> Option<&str> { None }
 }
 
-// `impl <target> for <TestName>` — "name" is the TestName (which
-// is what the impl hangs off of); kind_label is "impl".
-impl Construct for ImplDecl {
-    fn kind_label(&self) -> &'static str { "impl" }
-    fn name(&self) -> &Ident { &self.test_name }
-    fn span(&self) -> Span { self.span }
-    fn doc(&self) -> Option<&str> { self.doc.as_deref() }
-    fn inner_doc(&self) -> Option<&str> { self.inner_doc.as_deref() }
-}
-
 impl Item {
     /// Single dispatch point covering every `Item::*` variant. Lets
     /// the learning-store feature harvester (and future passes)
@@ -1546,7 +1475,6 @@ impl Item {
             Item::Apply(a) => a,
             Item::Bus(b) => b,
             Item::Transactor(t) => t,
-            Item::Impl(i) => i,
             Item::Regblock(r) => r,
         }
     }

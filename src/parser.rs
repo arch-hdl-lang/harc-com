@@ -1105,83 +1105,10 @@ impl Parser {
         Ok(ApplyDecl { path, span })
     }
 
-    // `parse_scope` was the parser path for the legacy `scope sim ...
-    // end scope sim` block. It's been removed in favor of `impl <target>
-    // for <Test>` (parsed by `parse_impl` above; spec §7.2). The
-    // `ScopeDecl` AST node + `TestItem::Scope` variant are kept as the
-    // internal IR shape that codegen synthesizes from a matching
-    // `Item::Impl`, so the existing emit pipeline reuses byte-for-byte.
-
-    /// Parse `impl <target> for <TestName> ... end impl <TestName>` —
-    /// per-target test implementation block (spec §7.2).
-    ///
-    /// Body items are the four reserved phase keywords (`setup` / `run` /
-    /// `check` / `teardown`) plus any number of `phase <name> ... end
-    /// phase <name>` user-defined named-phase blocks. Items appear in
-    /// any order; reserved phases may appear at most once each.
-    fn parse_impl(&mut self, doc: Option<String>) -> Result<ImplDecl, CompileError> {
-        let start = self.expect(TokenKind::Impl)?.span;
-        let target = self.expect_ident()?;
-        self.expect(TokenKind::For)?;
-        let test_name = self.expect_ident()?;
-        let inner_doc = self.consume_inner_doc();
-        let mut items = Vec::new();
-        while !self.check_end_keyword() {
-            match self.peek_kind() {
-                Some(TokenKind::Setup) => {
-                    self.advance();
-                    let stmts = self.parse_stmt_list_until_end()?;
-                    let end = self.expect_end_anon(TokenKind::Setup)?;
-                    items.push(ImplItem::Setup(Block { stmts, span: end }));
-                }
-                Some(TokenKind::Run) => {
-                    self.advance();
-                    let stmts = self.parse_stmt_list_until_end()?;
-                    let end = self.expect_end_anon(TokenKind::Run)?;
-                    items.push(ImplItem::Run(Block { stmts, span: end }));
-                }
-                Some(TokenKind::Check) => {
-                    self.advance();
-                    let stmts = self.parse_stmt_list_until_end()?;
-                    let end = self.expect_end_anon(TokenKind::Check)?;
-                    items.push(ImplItem::Check(Block { stmts, span: end }));
-                }
-                Some(TokenKind::Teardown) => {
-                    self.advance();
-                    let stmts = self.parse_stmt_list_until_end()?;
-                    let end = self.expect_end_anon(TokenKind::Teardown)?;
-                    items.push(ImplItem::Teardown(Block { stmts, span: end }));
-                }
-                Some(TokenKind::Phase) => {
-                    self.advance();
-                    let phase_name = self.expect_ident()?;
-                    let stmts = self.parse_stmt_list_until_end()?;
-                    let end = self.expect_end(TokenKind::Phase, &phase_name.name)?;
-                    items.push(ImplItem::Phase(
-                        phase_name,
-                        Block { stmts, span: end },
-                    ));
-                }
-                Some(other) => {
-                    return Err(CompileError::unexpected_token(
-                        "setup, run, check, teardown, or phase <name>",
-                        &other.to_string(),
-                        self.peek_span(),
-                    ));
-                }
-                None => return Err(CompileError::UnexpectedEof),
-            }
-        }
-        let end = self.expect_end(TokenKind::Impl, &test_name.name)?;
-        Ok(ImplDecl {
-            target,
-            test_name,
-            items,
-            span: start.merge(end),
-            doc,
-            inner_doc,
-        })
-    }
+    // The legacy `impl <target> for <Test>` block (Item::Impl, ImplDecl,
+    // ImplItem) was removed alongside its parser entry in Phase 2 of
+    // docs/test-ergonomics.md. Inline-form phase blocks inside `test`
+    // (handled by `parse_test`) are the canonical surface.
 
     // ── Extend ────────────────────────────────────────────────────────────────
 
