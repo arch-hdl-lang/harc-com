@@ -317,6 +317,16 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             _ => {}
         }
     }
+
+    // Validate addrmap instance windows for overlap. Only pairs where
+    // both instances declare an explicit `size` are checked — without
+    // a known size, the bounds aren't computable. Aliasing is deferred
+    // (RFC §4 `alias of`); when it lands, aliased pairs skip this check.
+    for a in addrmaps.values() {
+        if let Some(err) = check_addrmap_overlap(a) {
+            return Err(EmitError(err));
+        }
+    }
     for it in &file.items {
         match it {
             Item::Transaction(t) => {
@@ -7928,6 +7938,73 @@ fn c_binary_op(op: BinaryOp) -> &'static str {
             "/* unsupported-op */ ,"
         }
     }
+}
+
+/// Constant-fold a base/size expression to `u64` for the addrmap
+/// overlap check. Handles plain integer literals only (hex/decimal/
+/// underscored). Non-literal expressions fall back to `None` — the
+/// overlap check skips pairs whose bounds aren't computable, which
+/// keeps the static analysis honest without surfacing false
+/// positives.
+fn fold_int_literal(e: &Expr) -> Option<u64> {
+    match &*e.kind {
+        ExprKind::Int(s) => parse_int_str(s),
+        _ => None,
+    }
+}
+
+fn parse_int_str(s: &str) -> Option<u64> {
+    let cleaned: String = s.chars().filter(|c| *c != '_').collect();
+    if let Some(idx) = cleaned.find('\'') {
+        let (_, tail) = cleaned.split_at(idx + 1);
+        let kind = tail.chars().next()?;
+        let digits: &str = &tail[1..];
+        match kind {
+            'h' | 'H' => u64::from_str_radix(digits, 16).ok(),
+            'b' | 'B' => u64::from_str_radix(digits, 2).ok(),
+            'o' | 'O' => u64::from_str_radix(digits, 8).ok(),
+            _ => digits.parse::<u64>().ok(),
+        }
+    } else if let Some(hex) = cleaned.strip_prefix("0x").or_else(|| cleaned.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else if let Some(bin) = cleaned.strip_prefix("0b").or_else(|| cleaned.strip_prefix("0B")) {
+        u64::from_str_radix(bin, 2).ok()
+    } else {
+        cleaned.parse::<u64>().ok()
+    }
+}
+
+/// Walks an addrmap's instance list and returns an error message
+/// when any two sized instances have overlapping windows. Windows
+/// are half-open `[base, base + size)`. Skips pairs where either
+/// instance lacks `size` (RFC §4 makes the clause optional).
+fn check_addrmap_overlap(a: &AddrmapDecl) -> Option<String> {
+    let sized: Vec<(usize, &InstanceDecl, u64, u64)> = a
+        .instances
+        .iter()
+        .enumerate()
+        .filter_map(|(i, inst)| {
+            let base = fold_int_literal(&inst.base_addr)?;
+            let size = fold_int_literal(inst.size.as_ref()?)?;
+            Some((i, inst, base, base.saturating_add(size)))
+        })
+        .collect();
+    for w in 0..sized.len() {
+        for x in (w + 1)..sized.len() {
+            let (_i_a, a_inst, a_lo, a_hi) = &sized[w];
+            let (_i_b, b_inst, b_lo, b_hi) = &sized[x];
+            // Half-open overlap test.
+            if *a_lo < *b_hi && *b_lo < *a_hi {
+                return Some(format!(
+                    "addrmap `{}`: instance `{}` [0x{:x}, 0x{:x}) overlaps instance `{}` [0x{:x}, 0x{:x})",
+                    a.name.name,
+                    a_inst.name.name, a_lo, a_hi,
+                    b_inst.name.name, b_lo, b_hi,
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Width in bits of a RAL field declared as `field name : <ty>`.
