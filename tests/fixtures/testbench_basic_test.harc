@@ -1,0 +1,61 @@
+// Smoke test for the `testbench` block (docs/test-ergonomics.md §3).
+//
+// Demonstrates the shared-structural-skeleton pattern: a `testbench`
+// owns the DUT plus a helper method (`reset`); two distinct tests
+// instantiate the same testbench via `let tb : CounterTb` and call
+// `tb.reset()` instead of repeating the reset sequence.
+//
+// Under the hood `testbench` shares env's component machinery — the
+// parser routes it through ComponentKind::Testbench; codegen treats
+// it identically to env. The user-visible distinction is the source
+// keyword + the convention that a testbench owns a DUT-typed field.
+
+testbench CounterTb
+    dut : Top
+
+    hookable reset()
+        dut.rst = 1
+        dut.en  = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+    end reset
+end testbench CounterTb
+
+test TestbenchSmoke
+    let dut : Top
+    let tb  : CounterTb
+
+    run
+        tb.dut = dut          // wire DUT pointer into the testbench, matches
+                              // the transactor `drv.dut = dut` convention.
+        tb.reset()
+        dut.en = 1
+        wait 5 cycles
+        assert dut.count_out == 5
+            else fail("smoke: count_out=${dut.count_out}, expected 5")
+        log(info, "PASS: testbench-shared reset + count")
+    end run
+end test TestbenchSmoke
+
+// Second test reusing the same `CounterTb` declaration. Demonstrates
+// the line-saving win: no duplicated reset sequence — both tests call
+// the shared `tb.reset()`. Selected at the CLI via `--test`.
+test TestbenchEnableToggle
+    let dut : Top
+    let tb  : CounterTb
+
+    run
+        tb.dut = dut
+        tb.reset()
+        dut.en = 1
+        wait 3 cycles
+        dut.en = 0
+        wait 3 cycles               // count holds while en=0
+        let frozen = dut.count_out
+        wait 5 cycles
+        assert dut.count_out == frozen
+            else fail("toggle: count moved while en=0")
+        log(info, "PASS: enable-toggle reuses CounterTb.reset")
+    end run
+end test TestbenchEnableToggle
