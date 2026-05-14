@@ -323,11 +323,14 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         }
     }
 
-    // Validate addrmap instance windows for overlap. Only pairs where
-    // both instances declare an explicit `size` are checked — without
-    // a known size, the bounds aren't computable. Aliasing is deferred
-    // (RFC §4 `alias of`); when it lands, aliased pairs skip this check.
+    // Validate addrmap structure: alias targets resolve, no chained
+    // aliases, instance windows don't overlap (for pairs with size,
+    // skipping any pair where one side aliases the other or both
+    // alias the same target).
     for a in addrmaps.values() {
+        if let Some(err) = check_addrmap_aliases(a) {
+            return Err(EmitError(err));
+        }
         if let Some(err) = check_addrmap_overlap(a) {
             return Err(EmitError(err));
         }
@@ -736,6 +739,19 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         if let Item::Addrmap(a) = it {
             writeln!(e.out, "struct {}_Mirror {{", a.name.name).ok();
             for inst in &a.instances {
+                // Aliased instances share mirror storage with their
+                // target — no separate field. Access through the
+                // alias rewrites to the target's mirror path at
+                // codegen time. See docs/ral-support.md §4.
+                if inst.alias_of.is_some() {
+                    writeln!(
+                        e.out,
+                        "{INDENT}// {name}: alias of {target} — shares mirror",
+                        name = inst.name.name,
+                        target = inst.alias_of.as_ref().unwrap().name,
+                    ).ok();
+                    continue;
+                }
                 writeln!(
                     e.out,
                     "{INDENT}{ty}_Mirror {name};",
@@ -6838,6 +6854,11 @@ impl Emitter {
     /// 3-level `chip.inst.REG` addrmap access. Returns
     /// `(chip_var, instance_path, helper_var, helper_ty,
     ///   effective_offset_expr, register-access-policy)`.
+    /// 3-level `chip.inst.REG` addrmap access. If `inst` is aliased
+    /// to another instance via `alias of`, the returned
+    /// `instance_path` points at the TARGET's mirror cell (one
+    /// storage shared across windows) while the effective bus
+    /// offset still uses this instance's own base.
     fn resolve_addrmap_register_lookup(
         &self,
         target: &Expr,
@@ -6861,11 +6882,15 @@ impl Emitter {
         let base = c_int_literal_from(&inst.base_addr.kind);
         let off = c_int_literal_from(&reg.offset.kind);
         let effective = format!("({base} + {off})");
-        let instance_path = format!("{}.{}", chip_id.name, inst_name.name);
+        let mirror_inst_name = inst.alias_of.as_ref()
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| inst.name.name.clone());
+        let instance_path = format!("{}.{}", chip_id.name, mirror_inst_name);
         Some((chip_id.name.clone(), instance_path, helper_var, helper_ty, effective, reg.access))
     }
 
-    /// 4-level `chip.inst.REG.FIELD` addrmap+field access.
+    /// 4-level `chip.inst.REG.FIELD` addrmap+field access. Alias-
+    /// aware like its 3-level sibling.
     fn resolve_addrmap_subfield_lookup(
         &self,
         target: &Expr,
@@ -6896,7 +6921,10 @@ impl Emitter {
         let reg_width = reg.width.unwrap_or(block.default_width.unwrap_or(32));
         let reg_c_type = mirror_field_c_type(reg_width);
         let bit_width = field_bit_width(&fld.ty);
-        let instance_path = format!("{}.{}", chip_id.name, inst_name.name);
+        let mirror_inst_name = inst.alias_of.as_ref()
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| inst.name.name.clone());
+        let instance_path = format!("{}.{}", chip_id.name, mirror_inst_name);
         Some((
             chip_id.name.clone(),
             instance_path,
@@ -8060,10 +8088,60 @@ fn parse_int_str(s: &str) -> Option<u64> {
     }
 }
 
+/// Validates `alias of` targets: target instance must exist in the
+/// same addrmap, must not itself be aliased (chained aliases are
+/// out of scope for Phase 1g), and must have the same regblock
+/// type as the alias (otherwise the shared mirror would be a
+/// type error).
+fn check_addrmap_aliases(a: &AddrmapDecl) -> Option<String> {
+    for inst in &a.instances {
+        let Some(target_name) = &inst.alias_of else {
+            continue;
+        };
+        let target = a.instances.iter().find(|i| i.name.name == target_name.name);
+        let Some(target) = target else {
+            return Some(format!(
+                "addrmap `{}`: instance `{}` aliases `{}`, but no such instance exists in this addrmap",
+                a.name.name, inst.name.name, target_name.name,
+            ));
+        };
+        if target.alias_of.is_some() {
+            return Some(format!(
+                "addrmap `{}`: instance `{}` aliases `{}`, which is itself an alias — chained aliases are not supported",
+                a.name.name, inst.name.name, target_name.name,
+            ));
+        }
+        if target.regblock_ty.name != inst.regblock_ty.name {
+            return Some(format!(
+                "addrmap `{}`: instance `{}` (type `{}`) aliases `{}` (type `{}`) — alias target must share the regblock type",
+                a.name.name, inst.name.name, inst.regblock_ty.name,
+                target_name.name, target.regblock_ty.name,
+            ));
+        }
+    }
+    None
+}
+
 /// Walks an addrmap's instance list and returns an error message
 /// when any two sized instances have overlapping windows. Windows
 /// are half-open `[base, base + size)`. Skips pairs where either
-/// instance lacks `size` (RFC §4 makes the clause optional).
+/// instance lacks `size`, or where either instance aliases the
+/// other (or both alias the same target — RFC §4 explicitly
+/// permits this).
+fn pair_is_aliased(a: &InstanceDecl, b: &InstanceDecl) -> bool {
+    if let Some(t) = &a.alias_of {
+        if t.name == b.name.name { return true; }
+    }
+    if let Some(t) = &b.alias_of {
+        if t.name == a.name.name { return true; }
+    }
+    // Both alias the same third instance.
+    match (&a.alias_of, &b.alias_of) {
+        (Some(ta), Some(tb)) if ta.name == tb.name => true,
+        _ => false,
+    }
+}
+
 fn check_addrmap_overlap(a: &AddrmapDecl) -> Option<String> {
     let sized: Vec<(usize, &InstanceDecl, u64, u64)> = a
         .instances
@@ -8079,6 +8157,9 @@ fn check_addrmap_overlap(a: &AddrmapDecl) -> Option<String> {
         for x in (w + 1)..sized.len() {
             let (_i_a, a_inst, a_lo, a_hi) = &sized[w];
             let (_i_b, b_inst, b_lo, b_hi) = &sized[x];
+            if pair_is_aliased(a_inst, b_inst) {
+                continue;
+            }
             // Half-open overlap test.
             if *a_lo < *b_hi && *b_lo < *a_hi {
                 return Some(format!(

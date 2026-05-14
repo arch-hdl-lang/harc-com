@@ -83,6 +83,89 @@ end test T"#,
 }
 
 #[test]
+fn addrmap_alias_to_missing_instance_errors() {
+    let parsed = parse_source(
+        r#"regblock R via H width 32
+    register A @ 0x00 access rw
+end regblock R
+
+addrmap M via H
+    instance a : R @ 0x1000
+    instance b : R @ 0x2000 alias of nonexistent
+end addrmap M
+
+test T
+    let dut : SomeDut
+    run
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let err = cpp_tb::emit(&merged).unwrap_err();
+    assert!(
+        err.0.contains("`b`") && err.0.contains("aliases `nonexistent`"),
+        "expected error naming the bad alias; got: {}",
+        err.0,
+    );
+}
+
+#[test]
+fn addrmap_chained_alias_errors() {
+    let parsed = parse_source(
+        r#"regblock R via H width 32
+    register A @ 0x00 access rw
+end regblock R
+
+addrmap M via H
+    instance a : R @ 0x1000
+    instance b : R @ 0x2000 alias of a
+    instance c : R @ 0x3000 alias of b
+end addrmap M
+
+test T
+    let dut : SomeDut
+    run
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let err = cpp_tb::emit(&merged).unwrap_err();
+    assert!(
+        err.0.contains("chained aliases"),
+        "expected chained-alias error; got: {}",
+        err.0,
+    );
+}
+
+#[test]
+fn addrmap_alias_skips_overlap_check() {
+    // Aliased pairs intentionally share storage at different bus
+    // bases — the overlap check skips them.
+    let parsed = parse_source(
+        r#"regblock R via H width 32
+    register A @ 0x00 access rw
+end regblock R
+
+addrmap M via H
+    instance a : R @ 0x1000 size 0x200
+    instance b : R @ 0x1100 size 0x100 alias of a
+end addrmap M
+
+test T
+    let dut : SomeDut
+    run
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    cpp_tb::emit(&merged)
+        .expect("aliased instances should bypass the overlap check");
+}
+
+#[test]
 fn addrmap_size_optional_skips_overlap_check() {
     // Without `size`, the codegen can't bound the window and
     // skips the check. This matches the documented behavior in
