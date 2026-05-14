@@ -1,11 +1,38 @@
 # Design doc: Register Abstraction Layer (RAL) support
 
-**Status:** Proposed (RFC, not yet implemented).
-**Date logged:** 2026-05-13.
+**Status:** Phase 1 largely shipped. Phase 2 + 3 still proposed.
+**Date logged:** 2026-05-13. Updated 2026-05-14 after Phase 1a–1e.
 **Scope:** Add first-class register-block, address-map, and memory primitives
 to HARC v1 so a single declarative source compiles to a high-performance
 mirror + predict + frontdoor/backdoor + constraint layer — replacing the
 runtime-metaprogramming model of UVM RAL.
+
+## Implementation status
+
+| Item | Status | Lands in |
+|---|---|---|
+| `regblock` decl + bind helper + register-level R/W frontdoor | **Shipped** | PR #95 (Phase 1a) |
+| Field-level decomposition (`field N : T @ POS`) | **Shipped** | PR #97 (Phase 1b) |
+| Read-side mirror predict | **Shipped** | PR #98 (Phase 1c) |
+| `rw` / `ro` / `wo` access policies | **Shipped** | PR #98 (Phase 1c) |
+| `bitbash(regs)` compile-time-unrolled walk-all | **Shipped** | PR #99 (Phase 1d) |
+| `addrmap` composition (flat) — multiple regblock instances at distinct bases | **Shipped** | PR #100 (Phase 1e) |
+| `w1c` / `w1s` / `wclr` / `wset` / `rc` / `rs` policies | **Proposed (deferred)** | testability problem — needs W1C-aware DUT |
+| `alias of` instance aliasing | **Proposed** | Phase 2 |
+| Nested `addrmap`s (addrmap inside addrmap) | **Proposed** | Phase 2 |
+| Multi-map (two addrmaps over the same instances) | **Proposed** | Phase 2 |
+| Per-instance bus binding override | **Proposed** | Phase 2 |
+| `extend regblock` | **Proposed** | Phase 2 |
+| `mem` blocks (sparse / dense / none) | **Proposed** | Phase 2 / 3 |
+| Backdoor accessors (Verilator direct-handle reads/writes) | **Proposed** | Phase 2 |
+| `mem mirror none` + reference model | **Proposed** | Phase 3 |
+| RDL → HARC generator (`rdl2harc`) | **Proposed** | sibling repo, gated on Phase 1 |
+
+The shipped Phase 1 surface delivers what the RFC framed as the MVP for
+real DV: typed register/field decls, frontdoor reads/writes routed
+through a helper transactor (`via Helper` clause), automatic mirror with
+read-side predict, register-level access policies that drop bus traffic
+appropriately, compile-time bit-bash, and chip-level composition.
 
 ## 1. Motivation
 
@@ -71,27 +98,35 @@ compile-time POD struct + constant address table.
    that exist only because of UVM's class architecture.
 4. Multi-map cross-aliasing of `mem` blocks in v0.1 (see §11.2).
 
-## 3. Surface — `regblock`
+## 3. Surface — `regblock`  *(shipped, Phase 1a–1c)*
+
+What shipped: registers can be single-line or block-form (with
+fields); access policies `rw`/`ro`/`wo` are recognized; the helper
+that routes bus traffic is named with the `via <Transactor>` clause
+(not the RFC's original `bound to <Bus>` — see §10 for the
+rationale). The `endian` keyword is parsed but unused.
 
 ```harc
-regblock AxiDmaRegs bound to BusAxiLite width 32 endian little
-    register DMACR @ 0x00
+regblock AxiDmaRegs via AxilHelper width 32
+    register DMACR @ 0x00 access rw
         field RS       : bit  @ 0   reset 0  access rw
-        field Reset    : bit  @ 2   reset 0  access w1c
+        // `w1c`/`w1s`/etc. policies are not in the shipped slice yet
+        // — see the status table. `rw` is the placeholder.
         field IRQ_IOC  : bit  @ 12  reset 0  access rw
-    end register
+    end register DMACR
 
-    register DMASR @ 0x04
+    register DMASR @ 0x04 access ro
         field Halted   : bit  @ 0   reset 1  access ro
         field Idle     : bit  @ 1   reset 1  access ro
-        field IRQ_IOC  : bit  @ 12  reset 0  access w1c
-    end register
+    end register DMASR
 
     register MM2S_SA  @ 0x18  access rw
-        field value : uint<32> @ 0 reset 0
-    end register
-end regblock
+end regblock AxiDmaRegs
 ```
+
+The single-line `register N @ A access X` form (no fields, no `end
+register` closer) coexists with the block form. Most fixtures use
+single-line; field-bearing registers use the block form.
 
 ### Field access policy keywords
 
@@ -128,38 +163,35 @@ end register
 Reset values are part of the decl and form the initial mirror state. Width
 is checked against the declared field type at compile time.
 
-## 4. Surface — `addrmap`
+## 4. Surface — `addrmap`  *(Phase 1e shipped, advanced composition pending)*
+
+What shipped: flat addrmap with multiple instances at distinct bases.
+Helper-routed (`via Helper`) like regblock. Access patterns
+`chip.inst.REG` and `chip.inst.REG.FIELD` work end-to-end.
 
 ```harc
-addrmap SocRegs bound to BusAxiLite
-    instance dma0  : AxiDmaRegs @ 0x4000_0000  size 0x1000
-    instance dma1  : AxiDmaRegs @ 0x4000_1000  size 0x1000  alias of dma0
-    instance uart0 : UartRegs   @ 0x5000_0000  size 0x0100
-    instance gpio  : GpioRegs   @ 0x6000_0000  size 0x0100
-end addrmap
-
-addrmap SocRegsDebug bound to BusAxiLite
-    instance dma0  : AxiDmaRegs @ 0xF000_0000
-    instance uart0 : UartRegs   @ 0xF000_1000
-end addrmap
+addrmap SocRegs via AxilHelper
+    instance dma0  : AxiDmaRegs @ 0x4000_0000
+    instance uart0 : UartRegs   @ 0x5000_0000
+end addrmap SocRegs
 ```
 
 ### Composition rules
 
-- `addrmap` may contain `instance` of `regblock`, `mem`, or another
-  `addrmap`. Nesting is unbounded; address offsets compose by addition.
-- `alias of <other_instance>` declares two address windows backed by one
-  mirror cell. Predict updates the shared cell regardless of which window
-  the bus access traveled through.
-- `size` is optional; when present, the compiler checks that no two
-  non-aliased windows overlap, with the offending pair pointed at in the
-  error message.
-- Multiple `addrmap`s may instantiate the same `regblock` at different
-  bases (different CPU views, debug bus, security domain). The mirror tree
-  is shared if the same `let` instance is rebound; cloned if a fresh
-  `let` is created.
+| Rule | Status |
+|---|---|
+| Flat addrmap with multiple instances at distinct bases | **Shipped** |
+| `alias of` (two windows over one mirror cell) | **Proposed** |
+| Nested addrmaps (addrmap inside addrmap) | **Proposed** |
+| `size` clause + overlap checking | **Proposed** |
+| Multiple addrmaps over the same regblock type at different bases | **Shipped** (just declare two addrmaps; each has its own mirror tree per `let` instance) |
+| Per-instance bus binding override | **Proposed** |
 
-## 5. Surface — `mem`
+`bound to <Bus>` (the original RFC vocabulary) is not what shipped;
+the helper transactor routes bus traffic via the `via <Helper>`
+clause on both `regblock` and `addrmap`. See §10 for the rationale.
+
+## 5. Surface — `mem`  *(Proposed — not yet implemented)*
 
 ```harc
 mem ScratchPad
@@ -201,10 +233,10 @@ single `memcpy` after parsing the file; for `sparse`, it walks the file
 inserting hashmap entries. For `none` with a reference model, it calls
 the reference's bulk-load hook.
 
-## 6. Surface — `extend`
+## 6. Surface — `extend`  *(Proposed — not yet implemented)*
 
 HARC already has `extend test T` (see [spec.md §8](../spec.md)); the same
-pattern applies to regblocks and addrmaps:
+pattern is proposed for regblocks and addrmaps:
 
 ```harc
 // Original decl somewhere — possibly rdl2harc-generated.
@@ -225,6 +257,13 @@ This is intentional: it preserves the "no surprise at sim time" property
 of the HARC design, at the cost of recompilation when overrides change.
 
 ## 7. Lowering
+
+The lowering sections below mix shipped and proposed material. Items
+covered by Phase 1a–1e (regblock + addrmap + field-level access +
+ro/wo + read predict + bitbash) match the production codegen
+mostly-faithfully — the one substantive divergence is `via Helper`
+vs `bound to <Bus>` for naming the protocol layer (§7.4). `mem`
+and backdoor lowering remain proposed.
 
 ### 7.1 Mirror struct
 
@@ -265,7 +304,7 @@ constexpr std::array<RegEntry, N_regs> SocRegs_AddrTable = {{
 This table drives `bitbash(regs)`, address-overlap checks, and runtime
 diagnostic messages ("write to RO field ignored at addr 0x...").
 
-### 7.3 Dense mem heap-boxing
+### 7.3 Dense mem heap-boxing  *(Proposed — `mem` is not implemented yet)*
 
 Dense storage is heap-boxed by default, not inlined into the mirror struct.
 This keeps the top-level `SocRegs_Mirror` small (one pointer per dense mem)
@@ -292,25 +331,46 @@ mems.
 The `inline` escape hatch (`mirror dense inline`) is permitted only when
 `depth × width ≤ 128 bytes`; the compiler emits a warning above that.
 
-### 7.4 Frontdoor access
+### 7.4 Frontdoor access  *(shipped, with one divergence from the RFC)*
 
-```harc
-regs.dma0.DMACR.RS = 1
-```
+The shipped lowering routes through a user-supplied helper transactor
+named with the `via <Helper>` clause, **not** an auto-synthesized
+accessor on a `bound to <Bus>` decl. The helper exposes
+`write(addr, data)` and `read(addr) -> data` methods (typically a
+~20-line `hookable` pair against a stdlib bus type — see the
+existing `axilite_regs_full_test` and the new `regblock_*` fixtures
+for the convention). Auto-derived bus accessors from a `bound to`
+clause remain on the roadmap; the `via Helper` form ships now
+because it composes cleanly with the existing transactor machinery
+without teaching the codegen about each bus protocol.
 
-lowers to (schematically):
+`regs.dma0.DMACR.RS = 1` (4-level addrmap+subfield) actually lowers
+to:
 
 ```cpp
-mirror.dma0.DMACR = (mirror.dma0.DMACR & ~0x1u) | 0x1u;
-co_await bus_axil.write(DMA0_BASE + 0x00, mirror.dma0.DMACR);
+chip.dma0.DMACR = (chip.dma0.DMACR & ~((uint32_t)0x1u << 0))
+               | ((((uint32_t)(1)) & 0x1u) << 0);
+AxilHelper_write(helper, (0x4000'0000ull + 0x00ull), chip.dma0.DMACR);
 ```
 
-For W1C, the write-side mask is applied to the mirror automatically; for
-RO, the write is dropped with a warning at sim time (or hard-failed under
-`--strict`); for `rclr`/`rset`, the read-side mirror update reflects the
-side effect.
+For RO fields the bus write is dropped with a `// RO field — write
+to bus suppressed (...)` marker comment so the codegen output stays
+auditable. Reads use the assignment-expression form
+`(chip.dma0.DMACR = AxilHelper_read(helper, EFFECTIVE_OFFSET))` so the
+mirror sees the bus return (read-side predict) and the expression
+yields the read value.
 
-### 7.5 Backdoor access
+WO registers/fields serve reads from the mirror without bus traffic
+(a real WO register would return garbage on a read; the mirror-only
+path lets `let x = regs.WO_REG; assert x == prev_write` round-trip
+cleanly).
+
+For `w1c`/`w1s`/`rc`/`rs`, the policy-aware mirror update will follow
+once those keywords ship. The Phase 1c slice covers `rw`/`ro`/`wo`
+explicitly; the remaining policies parse only as errors directing
+users at this doc.
+
+### 7.5 Backdoor access  *(Proposed — not yet implemented)*
 
 ```harc
 backdoor regs.uart0.RBR = 0x42
@@ -334,7 +394,7 @@ If no path is available, the compiler **refuses to emit** the backdoor
 accessor and reports the missing path at the decl site. We will not
 generate broken backdoor code that fails silently at runtime.
 
-### 7.6 Constraint randomization
+### 7.6 Constraint randomization  *(Proposed — works in principle on top of the existing `randomize` lowering, but no fixture currently exercises `randomize(regs.…)`)*
 
 ```harc
 randomize(regs.dma0.MM2S_SA) with {
@@ -351,13 +411,18 @@ normal frontdoor path. The variable namespace is path-qualified
 (`dma0_MM2S_SA`, `uart0_CTRL`, etc.) so cross-IP constraints stay
 unambiguous.
 
-### 7.7 Bit-bash / walk-all sequences
+### 7.7 Bit-bash / walk-all sequences  *(shipped)*
 
 `bitbash(regs)` is a codegen builtin that expands at compile time to a
-flat sequence of writes and reads over `SocRegs_AddrTable`, with policy
-masks pre-applied (so RO fields are read-only-tested, W1C fields get a
-write-1-then-readback pattern, etc.). `bitbash(regs.dma0)` filters the
-expansion to one subtree.
+flat sequence of writes and reads over each RW register: write
+all-ones, read back, compare; write zero, read back, compare.
+RO/WO registers are skipped with a marker comment. Mismatches bump
+the test's `errors` counter via `sim_log_line("FAIL", ...)`.
+
+Currently shipped: walk-all over a top-level regblock binding
+(`bitbash(regs)`). Per-instance filtering (`bitbash(chip.dma0)`)
+and field-policy-aware patterns (W1C write-1-then-readback) are
+proposed for later phases once the policy keyword set expands.
 
 No runtime reflection; the unrolled code is visible in the emitted C++.
 
@@ -416,31 +481,58 @@ known DUT.
 
 ## 10. Scope of the v0.1 implementation
 
-Phase 1 (this RFC's MVP):
+### Phase 1 — shipped across PRs #95 / #97 / #98 / #99 / #100
 
-1. `regblock` parse + AST + semantic checks (field width, bit position
-   overlap, reset width).
-2. `addrmap` with single-level composition, base addresses, overlap
-   check, aliasing.
-3. Mirror struct codegen (POD, struct of structs, with `clone()` for
-   snapshots).
-4. Address + policy table codegen as `constexpr` arrays.
-5. Frontdoor `read` / `write` lowering through the existing
-   `bound to <Bus>` machinery (no changes to the bus protocol layer).
-6. Constraint integration: `randomize(regs.path.field)` plumbed into the
-   existing Z3 lowering.
-7. Access policy enforcement: `rw / ro / wo / w1c / w1s / wclr / wset /
-   rc / rs`. (The full RDL-aligned set in §3 is the eventual target;
-   ship the common ones first.)
-8. `bitbash(regs)` builtin (compile-time unroll, no runtime reflection).
+1. **`regblock` parse + AST** — width/reset/access on registers,
+   `field` decls with bit position and width derived from type.
+   Single-line and block-form registers coexist. (PR #95 / #97)
+2. **Mirror struct codegen** — POD, struct-of-structs for
+   addrmaps. Reset values populate via C++ field default
+   initializers. (PR #95 / #100)
+3. **Address tables** — `constexpr <Regblock>_AddrTable[]` per
+   regblock. Currently used for documentation; future `bitbash`
+   variants and overlap checks will consume them. (PR #95)
+4. **Frontdoor R/W lowering** — via the `via <Helper>` clause and
+   the helper's `write(addr, data)` / `read(addr) -> data`
+   methods. The RFC's `bound to <Bus>` form is still on the
+   roadmap; helper-routed shipped first because it composes with
+   the existing transactor machinery without protocol-specific
+   codegen. (PR #95)
+5. **Read-side mirror predict** — every bus read updates the
+   mirror via `(mirror = bus_read())` assignment expression form.
+   (PR #98)
+6. **Access policies `rw` / `ro` / `wo`** — `ro` drops bus writes;
+   `wo` serves reads from the mirror without bus traffic. (PR #98)
+7. **`bitbash(regs)` builtin** — compile-time-unrolled all-ones +
+   zero pattern walk over RW registers; RO/WO skipped with marker
+   comments. (PR #99)
+8. **Flat `addrmap` composition** — multiple regblock instances at
+   distinct base addresses; 3-level `chip.inst.REG` and 4-level
+   `chip.inst.REG.FIELD` access. (PR #100)
 
-Phase 2 (post-MVP):
+### Deferred — testability concern
+
+`w1c` / `w1s` / `wclr` / `wset` / `rc` / `rs` policies parse-error
+today, pointing the user at this doc. Honest end-to-end tests
+require a W1C-aware DUT; the existing `AxiLiteRegs` fixture DUT
+acts RW from the bus side, so a `regs.IRQ = 1` write to a W1C
+register would look indistinguishable from a `rw` write at the
+bus. The codegen for these policies is small (mirror-update
+predicate), but landing them without a credible end-to-end test
+risks shipping silent-bug behavior. They land alongside a
+W1C-aware DUT (or RDL-generated DUT pair).
+
+### Phase 2 (proposed)
 
 1. `mem` decl in `sparse` and `dense` modes (no `none` / reference yet).
 2. `backdoor` accessors for registers and dense mems.
 3. Multi-level `addrmap` nesting.
-4. Multiple-map support (`addrmap SocRegsDebug` parallel to `SocRegs`).
-5. `extend regblock` override syntax.
+4. `alias of` instance aliasing.
+5. Multiple-map support (`addrmap SocRegsDebug` parallel to `SocRegs`).
+6. `extend regblock` override syntax.
+7. `size` clause on addrmap instances + overlap checking.
+8. Constraint integration: `randomize(regs.path.field)` plumbed
+   into the existing Z3 lowering.
 
 Phase 3:
 
@@ -515,7 +607,17 @@ the mem-reference pattern is proven.
 
 - HARC v1 spec: [`../spec.md`](../spec.md)
 - HARC README: [`../README.md`](../README.md)
-- Existing axilite test patterns:
+- **Shipped RAL fixtures** (use these as the canonical syntax reference
+  for what works today):
+  - [`tests/fixtures/regblock_basic_test.harc`](../tests/fixtures/regblock_basic_test.harc) — Phase 1a, register-level R/W via helper
+  - [`tests/fixtures/regblock_fields_test.harc`](../tests/fixtures/regblock_fields_test.harc) — Phase 1b, field-level decomposition
+  - [`tests/fixtures/regblock_access_test.harc`](../tests/fixtures/regblock_access_test.harc) — Phase 1c, ro/wo policies + read predict
+  - [`tests/fixtures/regblock_bitbash_test.harc`](../tests/fixtures/regblock_bitbash_test.harc) — Phase 1d, walk-all builtin
+  - [`tests/fixtures/regblock_addrmap_test.harc`](../tests/fixtures/regblock_addrmap_test.harc) — Phase 1e, addrmap composition
+- **PR history** for the shipped phases:
+  - PR #95 (1a regblock), #97 (1b fields), #98 (1c read predict + ro/wo),
+    #99 (1d bitbash), #100 (1e addrmap)
+- Pre-RAL axilite test patterns (still pass, kept for protocol-level coverage):
   [`tests/fixtures/axilite_regs_full_test.harc`](../tests/fixtures/axilite_regs_full_test.harc),
   [`tests/fixtures/axilite_constraint_test.harc`](../tests/fixtures/axilite_constraint_test.harc)
 - `rdl2arch` (sibling DUT-side generator): https://github.com/arch-hdl-lang/rdl2arch
