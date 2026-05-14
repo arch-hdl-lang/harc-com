@@ -23,6 +23,92 @@ fn missing_test_is_a_clean_error() {
 // rom_lut_inline_test, etc.) — those exercise the same lowering
 // through the new single-block path.
 
+/// `size` on addrmap instances triggers static overlap detection
+/// (docs/ral-support.md §4). Two sized windows that share any byte
+/// must fail codegen with a message naming both instances and
+/// their address ranges. Aliased pairs are skipped (alias support
+/// pending).
+#[test]
+fn addrmap_overlap_errors_clearly() {
+    let parsed = parse_source(
+        r#"regblock R via H width 32
+    register A @ 0x00 access rw
+end regblock R
+
+addrmap M via H
+    instance a : R @ 0x1000 size 0x200
+    instance b : R @ 0x1100 size 0x100
+end addrmap M
+
+test T
+    let dut : SomeDut
+    run
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let err = cpp_tb::emit(&merged).unwrap_err();
+    assert!(
+        err.0.contains("addrmap `M`")
+            && err.0.contains("instance `a`")
+            && err.0.contains("instance `b`")
+            && err.0.contains("overlaps"),
+        "expected overlap error naming addrmap M + both instances a + b; got: {}",
+        err.0,
+    );
+}
+
+#[test]
+fn addrmap_no_overlap_emits_cleanly() {
+    let parsed = parse_source(
+        r#"regblock R via H width 32
+    register A @ 0x00 access rw
+end regblock R
+
+addrmap M via H
+    instance a : R @ 0x1000 size 0x100
+    instance b : R @ 0x1200 size 0x100
+end addrmap M
+
+test T
+    let dut : SomeDut
+    run
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    cpp_tb::emit(&merged).expect("non-overlapping sized instances should emit cleanly");
+}
+
+#[test]
+fn addrmap_size_optional_skips_overlap_check() {
+    // Without `size`, the codegen can't bound the window and
+    // skips the check. This matches the documented behavior in
+    // docs/ral-support.md §4 (`size` is optional).
+    let parsed = parse_source(
+        r#"regblock R via H width 32
+    register A @ 0x00 access rw
+end regblock R
+
+addrmap M via H
+    instance a : R @ 0x1000
+    instance b : R @ 0x1080
+end addrmap M
+
+test T
+    let dut : SomeDut
+    run
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    cpp_tb::emit(&merged)
+        .expect("instances without `size` should not trip the overlap check");
+}
+
 #[test]
 fn multiple_tests_require_explicit_pick() {
     let f = parse_source(

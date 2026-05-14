@@ -1544,11 +1544,23 @@ impl Parser {
         let regblock_ty = self.expect_ident()?;
         self.expect(TokenKind::AtSign)?;
         let base_addr = self.parse_expr()?;
-        let end = base_addr.span;
+        // Optional `size <expr>` clause — drives the overlap check at
+        // codegen time. `size` is a soft keyword (parsed via
+        // `check_ident`) so it doesn't clash with the identifier of
+        // the same name used elsewhere (e.g. AXI transaction fields).
+        let mut size: Option<Expr> = None;
+        let mut end = base_addr.span;
+        if self.check_ident("size") {
+            self.advance();
+            let e = self.parse_expr()?;
+            end = e.span;
+            size = Some(e);
+        }
         Ok(InstanceDecl {
             name,
             regblock_ty,
             base_addr,
+            size,
             span: start.merge(end),
             doc,
         })

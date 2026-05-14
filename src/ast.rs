@@ -129,7 +129,7 @@ pub struct AddrmapDecl {
     pub inner_doc: Option<String>,
 }
 
-/// `instance <Name> : <RegblockType> @ <base_addr>`
+/// `instance <Name> : <RegblockType> @ <base_addr> [size <expr>]`
 #[derive(Debug, Clone)]
 pub struct InstanceDecl {
     pub name: Ident,
@@ -141,6 +141,11 @@ pub struct InstanceDecl {
     /// `Expr` so hex literals + simple arithmetic work; constant-
     /// folded at codegen time.
     pub base_addr: Expr,
+    /// Optional `size <expr>` clause — size in bytes of the address
+    /// window this instance occupies. When present on both sides of
+    /// any pair, the codegen verifies non-overlap. Instances without
+    /// `size` are skipped during the overlap check.
+    pub size: Option<Expr>,
     pub span: Span,
     pub doc: Option<String>,
 }
