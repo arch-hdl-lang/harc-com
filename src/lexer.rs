@@ -213,6 +213,10 @@ pub enum TokenKind {
     Register,
     #[token("via")]
     Via,
+    /// `field <name> : <ty> @ <bit_pos> [reset <v>] [access <policy>]`
+    /// — bit-slice inside a `register` block. See docs/ral-support.md.
+    #[token("field")]
+    Field,
     #[token("sequencer")]
     Sequencer,
     #[token("tseq")]
@@ -576,6 +580,7 @@ impl fmt::Display for TokenKind {
             Regblock => write!(f, "regblock"),
             Register => write!(f, "register"),
             Via => write!(f, "via"),
+            Field => write!(f, "field"),
             Sequencer => write!(f, "sequencer"),
             Tseq => write!(f, "tseq"),
             Scoreboard => write!(f, "scoreboard"),

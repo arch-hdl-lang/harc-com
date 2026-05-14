@@ -1473,10 +1473,78 @@ impl Parser {
                 break;
             }
         }
+
+        // Optional field block: presence of a `field` keyword switches
+        // the register into block form. Closed by `end register
+        // [<Name>]`. Single-line registers (no `field` keyword) leave
+        // `fields` empty and don't expect a closer — the next
+        // `register` keyword or the regblock's `end regblock` ends them.
+        let mut fields: Vec<FieldDecl> = Vec::new();
+        if self.check(TokenKind::Field) {
+            while self.check(TokenKind::Field) {
+                fields.push(self.parse_register_field(access)?);
+            }
+            end = self.expect_end(TokenKind::Register, &name.name)?;
+        }
+
         Ok(RegisterDecl {
             name,
             offset,
             width,
+            reset,
+            access,
+            fields,
+            span: start.merge(end),
+            doc,
+        })
+    }
+
+    /// Parse a single `field <name> : <ty> @ <bit_pos> [reset <v>]
+    /// [access <policy>]` declaration inside a `register` block. The
+    /// `parent_access` argument supplies the access policy when the
+    /// field decl doesn't override it explicitly.
+    fn parse_register_field(&mut self, parent_access: RegAccess) -> Result<FieldDecl, CompileError> {
+        let doc = self.consume_outer_doc();
+        let start = self.expect(TokenKind::Field)?.span;
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::Colon)?;
+        let ty = self.parse_type_expr()?;
+        self.expect(TokenKind::AtSign)?;
+        let bit_pos = self.expect_uint_literal("bit position")?;
+        let mut reset: Option<Expr> = None;
+        let mut access = parent_access;
+        let mut end = ty.span();
+        loop {
+            if self.check_ident("reset") {
+                self.advance();
+                let e = self.parse_expr()?;
+                end = e.span;
+                reset = Some(e);
+            } else if self.check_ident("access") {
+                self.advance();
+                let kw = self.expect_ident_or_kw()?;
+                access = match kw.name.as_str() {
+                    "rw" => RegAccess::Rw,
+                    other => {
+                        return Err(CompileError::general(
+                            &format!(
+                                "field access policy `{other}` not supported in Phase 1b \
+                                 (only `rw` ships; `ro`/`wo`/`w1c`/`w1s`/`wclr`/`wset`/`rc`/`rs` \
+                                 follow per docs/ral-support.md)"
+                            ),
+                            kw.span,
+                        ));
+                    }
+                };
+                end = kw.span;
+            } else {
+                break;
+            }
+        }
+        Ok(FieldDecl {
+            name,
+            ty,
+            bit_pos,
             reset,
             access,
             span: start.merge(end),

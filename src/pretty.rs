@@ -198,6 +198,23 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
                 }
                 write!(out, " access {}", reg.access.keyword()).ok();
                 writeln!(out).ok();
+                if !reg.fields.is_empty() {
+                    for fld in &reg.fields {
+                        print_doc(out, &fld.doc, depth + 2);
+                        pad(out, depth + 2);
+                        write!(out, "field {} : ", fld.name.name).ok();
+                        print_type(out, &fld.ty);
+                        write!(out, " @ {}", fld.bit_pos).ok();
+                        if let Some(rv) = &fld.reset {
+                            write!(out, " reset ").ok();
+                            print_expr(out, rv);
+                        }
+                        write!(out, " access {}", fld.access.keyword()).ok();
+                        writeln!(out).ok();
+                    }
+                    pad(out, depth + 1);
+                    writeln!(out, "end register {}", reg.name.name).ok();
+                }
             }
             pad(out, depth);
             writeln!(out, "end regblock {}", r.name.name).ok();

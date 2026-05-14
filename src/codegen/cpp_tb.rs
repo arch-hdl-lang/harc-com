@@ -6662,7 +6662,74 @@ impl Emitter {
         self.resolve_regblock_field_lookup(target)
     }
 
+    /// If `target` is a 3-level `regs.REG.FIELD` access where `regs`
+    /// is a RAL regblock binding and FIELD is declared inside REG,
+    /// return all metadata needed to emit a masked write / shifted
+    /// read: `(regs_var, helper_var, helper_ty, offset_lit, reg_name,
+    /// reg_c_type, bit_pos, bit_width)`.
+    fn resolve_regblock_subfield_lookup(
+        &self,
+        target: &Expr,
+    ) -> Option<(String, String, String, String, String, &'static str, u32, u32)> {
+        let ExprKind::Field { target: mid, name: fld_name } = &*target.kind else {
+            return None;
+        };
+        let ExprKind::Field { target: outer, name: reg_name } = &*mid.kind else {
+            return None;
+        };
+        let ExprKind::Ident(regs_id) = &*outer.kind else {
+            return None;
+        };
+        let regs_ty = self.let_types.get(&regs_id.name)?;
+        let block = self.regblocks.get(regs_ty)?;
+        let reg = block.registers.iter().find(|r| r.name.name == reg_name.name)?;
+        let fld = reg.fields.iter().find(|f| f.name.name == fld_name.name)?;
+        let helper_var = self.let_helper.get(&regs_id.name)?.clone();
+        let helper_ty = self.let_types.get(&helper_var)?.clone();
+        let offset_lit = c_int_literal_from(&reg.offset.kind);
+        let reg_width = reg.width.unwrap_or(block.default_width.unwrap_or(32));
+        let reg_c_type = mirror_field_c_type(reg_width);
+        let bit_width = field_bit_width(&fld.ty);
+        Some((
+            regs_id.name.clone(),
+            helper_var,
+            helper_ty,
+            offset_lit,
+            reg.name.name.clone(),
+            reg_c_type,
+            fld.bit_pos,
+            bit_width,
+        ))
+    }
+
     fn emit_signal_assignment(&mut self, target: &Expr, value: &Expr, depth: usize) {
+        // RAL frontdoor field-level write: `regs.REG.FIELD = expr`.
+        // Lowers to a read-modify-write on the mirror (mask out the
+        // FIELD bits, OR in the new value shifted into POS) + a bus
+        // write of the full register word. Checked before the
+        // register-level path because it's strictly more specific
+        // (3-level Field expr vs 2-level).
+        if let Some((regs_var, helper_var, helper_ty, offset_lit, reg_name, reg_c_type, bit_pos, bit_width)) =
+            self.resolve_regblock_subfield_lookup(target)
+        {
+            let mask = field_mask_literal(bit_width);
+            write!(
+                self.out,
+                "{regs_var}.{reg_name} = ({regs_var}.{reg_name} & ~(({reg_c_type})0x{mask:x}u << {bit_pos})) | (((({reg_c_type})(",
+            ).ok();
+            self.emit_expr(value);
+            writeln!(
+                self.out,
+                ")) & 0x{mask:x}u) << {bit_pos});",
+            ).ok();
+            self.pad(depth);
+            writeln!(
+                self.out,
+                "{helper_ty}_write({helper_var}, {offset_lit}, {regs_var}.{reg_name});",
+            ).ok();
+            return;
+        }
+
         // RAL frontdoor write: `regs.NAME = expr` where `regs` is a
         // `let regs : <Regblock> = bind <helper>` instantiation. Lowers
         // to mirror update + `<HelperType>_write(helper, OFFSET, expr)`.
@@ -6787,6 +6854,30 @@ impl Emitter {
             }
             ExprKind::ImplicitSelf => {}
             ExprKind::Field { target, name } => {
+                // RAL frontdoor field-level read: `regs.REG.FIELD`.
+                // Lowers to `(<H>_read(helper, OFFSET) >> POS) & MASK`.
+                // Checked before the register-level path because it's
+                // strictly more specific.
+                if !lvalue {
+                    if let Some((
+                        _regs_var,
+                        helper_var,
+                        helper_ty,
+                        offset_lit,
+                        _reg_name,
+                        _reg_c_type,
+                        bit_pos,
+                        bit_width,
+                    )) = self.resolve_regblock_subfield_lookup(e)
+                    {
+                        let mask = field_mask_literal(bit_width);
+                        write!(
+                            self.out,
+                            "(({helper_ty}_read({helper_var}, {offset_lit}) >> {bit_pos}) & 0x{mask:x}u)",
+                        ).ok();
+                        return;
+                    }
+                }
                 // RAL frontdoor read: `regs.NAME` rvalue. Lowers to
                 // `<HelperType>_read(helper, OFFSET)`. The write side
                 // is handled in emit_signal_assignment so it can
@@ -7478,6 +7569,34 @@ fn c_binary_op(op: BinaryOp) -> &'static str {
             "/* unsupported-op */ ,"
         }
     }
+}
+
+/// Width in bits of a RAL field declared as `field name : <ty>`.
+/// `bit` / `bool` collapse to 1; `uint<N>` / `sint<N>` / `bits<N>` /
+/// `UInt<N>` / `SInt<N>` use the type argument. Falls back to 1 for
+/// shapes the parser shouldn't have accepted (caller reports a clean
+/// error path).
+fn field_bit_width(t: &TypeExpr) -> u32 {
+    match t {
+        TypeExpr::Builtin { name, args, .. } => match name {
+            BuiltinTy::Bit | BuiltinTy::Bool | BuiltinTy::BoolLower => 1,
+            BuiltinTy::UInt
+            | BuiltinTy::SInt
+            | BuiltinTy::Bits
+            | BuiltinTy::UIntCap
+            | BuiltinTy::SIntCap => type_arg_width(args).unwrap_or(1),
+            _ => 1,
+        },
+        _ => 1,
+    }
+}
+
+/// Right-aligned bit mask for a `width`-bit field, suitable for emit
+/// as `0x{mask:x}u`. Clamped at 32 bits because Phase 1b fields cap at
+/// register width 32 (mirror is `uint32_t`); wider fields are a
+/// downstream extension along with the wider mirror types.
+fn field_mask_literal(width: u32) -> u64 {
+    if width >= 32 { 0xFFFFFFFFu64 } else { (1u64 << width) - 1 }
 }
 
 /// C++ unsigned integer type wide enough to hold a register of `width`
