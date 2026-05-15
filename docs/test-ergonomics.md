@@ -17,7 +17,7 @@ two-block `test T { ... } / impl sim for T { run ... }` form.
 | Fixture-corpus migration to inline form | **Shipped** | PR #92 (all 60 fixtures + `scripts/migrate_v1_inline.py`) |
 | Remove `impl <target> for <Test>` parser entry | **Shipped** | PR #92 |
 | Backend selection via CLI subcommand only | **Shipped** | implied by parser removal — no per-test annotation surface |
-| `testbench` block (shared structural skeleton + helper methods) | **Proposed (not yet implemented)** | Phase 3 — separate future PR |
+| `testbench` block (shared structural skeleton + helper methods) | **Shipped** | Parser entry pre-existing; `function` keyword + codegen suppression of hook vectors landed in PR adding this row. Bus-binding-as-field (`bus : Bus = bind dut`) and `hookable function` deferred. |
 | Dead-code prune (`Item::Impl`, `ImplDecl`, `ImplItem`, `parse_impl`) | **Pending** | follow-up tidy PR |
 
 ## 1. Motivation
@@ -113,7 +113,16 @@ paid to a feature that wasn't used and won't need to be used.
    `run` (`tb.reset()`), consistent with HARC's "no UVM phase machinery"
    stance.
 
-## 3. Surface — `testbench`  *(Phase 3, not yet implemented)*
+## 3. Surface — `testbench`  *(Shipped)*
+
+The reference fixture is `tests/fixtures/testbench_basic_test.harc` — two distinct tests share one `testbench CounterTb` declaration with `function reset()` and `function bump(n)` helpers. Run-fixture manifest entries:
+
+```
+testbench_basic_test    | Top  | top_counter.sv | | | TestbenchSmoke
+testbench_basic_test    | Top  | top_counter.sv | | | TestbenchEnableToggle
+```
+
+Spec syntax (updated for what actually lands today — the prose below uses `function` rather than the originally-proposed `fn`, since `function` is already the HARC top-level free-function keyword and reusing it keeps the language to one spelling per concept):
 
 ```harc
 testbench AxiLiteTb
@@ -124,7 +133,7 @@ testbench AxiLiteTb
     sb  : AxilSb
 
     // Shared procedural helpers — callable from any test's run.
-    fn reset()
+    function reset()
         dut.rst = 1
         dut.axil_aw_valid = 0
         dut.axil_w_valid = 0
@@ -135,9 +144,9 @@ testbench AxiLiteTb
         wait 2 cycles
         dut.rst = 0
         wait 1 cycle
-    end fn
+    end function reset
 
-    fn drive_random(n: int)
+    function drive_random(n: int)
         let txns = RandomTxns(n)
         for t in txns
             sb.expected.push(t.value)
@@ -147,9 +156,11 @@ testbench AxiLiteTb
                 sb.errors = sb.errors + 1
             end if
         end for
-    end fn
+    end function drive_random
 end testbench AxiLiteTb
 ```
+
+> The `bus : BusAxiLite = bind dut` and transactor-instance-as-field shapes shown above are illustrative — bus-binding inside a component body is a follow-up surface (currently bus bindings work only at test scope as `let axil : BusAxiLite = bind dut`). The shipped subset is: DUT-typed fields, value-typed inner state (scoreboards / primitives), and `function` / `hookable` helper methods. A testbench that needs bus access goes through a test-scope bus binding plus a transactor in env composition today.
 
 ### 3.1 Field semantics
 
@@ -165,15 +176,11 @@ end testbench AxiLiteTb
 
 ### 3.2 Function semantics
 
-- `fn name(...) [-> T]` declares a method on the testbench instance.
-- Inside the body, bare field names resolve to `self.<field>` (consistent
-  with how `transactor` already resolves `bus`).
-- Functions are **synchronous between waits**, same coroutine model as
-  the test's `run` block. They may call `wait`, `for`, `if`, and other
-  procedural constructs.
-- Functions are **not hookable** by default. If a testbench function
-  needs the pre/post hook machinery, it's declared `hookable fn` (same
-  keyword shape as transactor methods).
+- `function name(...) [-> T] ... end function [name]` declares a method on the testbench instance. (The originally-drafted `fn` keyword was renamed to `function` during implementation to keep HARC to one spelling per concept — `function` is the existing keyword for free-function declarations at top level.)
+- Inside the body, bare field names resolve to `self.<field>` via the same field-substitution path that transactor `hookable` methods use.
+- Functions are **synchronous between waits**, same coroutine model as the test's `run` block. They may call `wait`, `for`, `if`, and other procedural constructs.
+- Functions are **not hookable**: no `<Type>_<method>_pre` / `<Type>_<method>_post` vectors are emitted, and the method body has no fan-out wrapper. Lowering: a free `[&]`-capturing lambda named `<Type>_<method>`, called as `<Type>_<method>(tb, args)` at every `tb.method(args)` call site (`resolve_component_method_call` walks the same path as for hookables).
+- If a testbench function needs the pre/post hook machinery, declare it `hookable` instead of `function` — same body shape, plus the hook vectors.
 
 ### 3.3 Why a new keyword (`testbench`) instead of extending `env`?
 

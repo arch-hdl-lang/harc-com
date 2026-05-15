@@ -4372,6 +4372,14 @@ impl Emitter {
     /// Empty by default; users push closures via `on obj.method pre`
     /// / `on obj.method post` at test scope.
     fn emit_hook_vectors(&mut self, c: &ComponentDecl, h: &HookableMethod, depth: usize) {
+        // `function` methods (testbench / env helpers, docs/test-
+        // ergonomics.md §3.2) carry `is_hookable = false`: no pre/post
+        // vectors emitted, and the corresponding fan-out in
+        // `emit_component_method` is suppressed. The method itself
+        // still emits as a free `<Type>_<method>` lambda.
+        if !h.is_hookable {
+            return;
+        }
         let comp_ty = &c.name.name;
         let m_name = &h.name.name;
         let arg_tys: Vec<String> = h
@@ -4471,21 +4479,30 @@ impl Emitter {
         // emit.
         let arg_list: Vec<String> = h.params.iter().map(|p| p.name.name.clone()).collect();
         let arg_csv = arg_list.join(", ");
-        self.pad(depth + 1);
-        writeln!(
-            self.out,
-            "for (auto& _h : {comp_ty}_{m_name}_pre) _h({arg_csv});"
-        )
-        .ok();
+        // Pre/post hook fan-out is skipped for non-hookable `function`
+        // methods (docs/test-ergonomics.md §3.2): no vectors were
+        // emitted for them, so the fan-out would reference undeclared
+        // symbols.
+        if h.is_hookable {
+            self.pad(depth + 1);
+            writeln!(
+                self.out,
+                "for (auto& _h : {comp_ty}_{m_name}_pre) _h({arg_csv});"
+            )
+            .ok();
+        }
 
         self.emit_block(&h.body, depth + 1);
 
-        self.pad(depth + 1);
-        writeln!(
-            self.out,
-            "for (auto& _h : {comp_ty}_{m_name}_post) _h({arg_csv});"
-        )
-        .ok();
+        if h.is_hookable {
+            self.pad(depth + 1);
+            writeln!(
+                self.out,
+                "for (auto& _h : {comp_ty}_{m_name}_post) _h({arg_csv});"
+            )
+            .ok();
+        }
+        let _ = arg_csv;
         // Restore state.
         if pushed_bus.is_some() {
             match prior_bus {
