@@ -2089,6 +2089,82 @@ end test T"#,
     );
 }
 
+/// `impl <name> for <Tb>` (docs/test-ergonomics.md §3.3) binds a
+/// test to a testbench. The pre-emission desugaring synthesizes
+/// `let dut : <SVType>` + `let _tb : <TbType>` at test scope, wires
+/// `_tb.dut = dut`, and rewrites bare-name references to testbench
+/// fields / methods into `_tb.<x>` accesses / `<TbType>_<m>(_tb,...)`
+/// dispatches. Result: the bound test threads through the same
+/// codegen as a classic `test T { ... }` after desugaring.
+#[test]
+fn impl_for_testbench_emits_per_test_tb_instance_and_wires_dut() {
+    let parsed = parse_source(
+        r#"testbench TopTb
+    dut : Top
+
+    function reset()
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+    end function reset
+end testbench TopTb
+
+impl Smoke for TopTb
+    run
+        reset()
+        assert dut.count_out == 0
+    end run
+end impl Smoke"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("impl form lowers cleanly");
+    // The synthesized `_tb` instance must appear in main()'s scope
+    // (default-constructed TopTb struct).
+    assert!(
+        cpp.contains("TopTb _tb"),
+        "expected `TopTb _tb;` instantiation; got first 600 chars:\n{}",
+        &cpp[..600.min(cpp.len())],
+    );
+    // The DUT auto-wire (`_tb.dut = dut`) lands as the first stmt of
+    // the run block.
+    assert!(
+        cpp.contains("_tb.dut = dut"),
+        "expected `_tb.dut = dut` wire-up; got:\n{}",
+        cpp,
+    );
+    // Bare `reset()` rewrote to `TopTb_reset(_tb)` via the
+    // testbench-method-dispatch path.
+    assert!(
+        cpp.contains("TopTb_reset(_tb"),
+        "expected `TopTb_reset(_tb...)` method dispatch; got:\n{}",
+        cpp,
+    );
+    // Bare `dut.count_out` stayed bare (refers to the synthesized
+    // test-scope `let dut : Top`, lowered through the existing
+    // pointer-var path as `dut->count_out`).
+    assert!(
+        cpp.contains("dut->count_out"),
+        "expected `dut->count_out` from bare `dut.count_out`; got:\n{}",
+        cpp,
+    );
+}
+
+/// Classic `test T { ... }` form keeps working alongside the new
+/// bound form — sweep + parser-entry removal is Phase 2.
+#[test]
+fn classic_test_form_still_emits() {
+    let parsed = parse_source(
+        r#"test Smoke
+    let dut : Top
+    run
+        dut.rst = 1
+    end run
+end test Smoke"#,
+    )
+    .unwrap();
+    cpp_tb::emit(&parsed).expect("classic `test` form should still lower cleanly");
+}
+
 #[test]
 fn testbench_hookable_still_emits_hook_vectors() {
     // Companion: `hookable name(...)` keeps its pre/post vectors. The

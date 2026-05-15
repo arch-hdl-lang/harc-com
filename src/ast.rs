@@ -639,6 +639,18 @@ pub struct TestDecl {
     pub span: Span,
     pub doc: Option<String>,
     pub inner_doc: Option<String>,
+    /// `impl <name> for <TbType> ... end impl <name>` — the testbench-
+    /// bound test form (docs/test-ergonomics.md §3.3). When `Some`, the
+    /// test implicitly instantiates a fresh `<TbType>` instance for
+    /// the duration of `run` (plus the surrounding setup/check/
+    /// teardown phases), and bare-name lookups inside the body resolve
+    /// to the testbench's fields and helper methods first. `None` =
+    /// classic `test <name> ... end test <name>` form (standalone,
+    /// user manages `let dut` / `let tb` explicitly). Both forms
+    /// share the same AST and lower through the same codegen path —
+    /// the `for_testbench` discriminator gates the bare-name
+    /// substitution + per-test Tb instance.
+    pub for_testbench: Option<Ident>,
 }
 
 #[derive(Debug, Clone)]

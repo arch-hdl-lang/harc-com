@@ -242,11 +242,19 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
             writeln!(out, "end addrmap {}", a.name.name).ok();
         }
         Item::Test(t) => {
+            // Two forms round-trip through the same Item::Test arm —
+            // distinguished by `for_testbench`. The testbench-bound
+            // form (`impl <name> for <Tb> ... end impl <name>`) was
+            // added in docs/test-ergonomics.md §3.3.
             print_doc(out, &t.doc, depth);
             pad(out, depth);
-            write!(out, "test {}", t.name.name).ok();
-            if !t.params.is_empty() {
-                print_paren_params(out, &t.params);
+            if let Some(tb) = &t.for_testbench {
+                write!(out, "impl {} for {}", t.name.name, tb.name).ok();
+            } else {
+                write!(out, "test {}", t.name.name).ok();
+                if !t.params.is_empty() {
+                    print_paren_params(out, &t.params);
+                }
             }
             writeln!(out).ok();
             print_inner_doc(out, &t.inner_doc, depth + 1);
@@ -254,7 +262,11 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
                 print_test_item(out, it, depth + 1);
             }
             pad(out, depth);
-            writeln!(out, "end test {}", t.name.name).ok();
+            if t.for_testbench.is_some() {
+                writeln!(out, "end impl {}", t.name.name).ok();
+            } else {
+                writeln!(out, "end test {}", t.name.name).ok();
+            }
         }
         Item::Extend(e) => {
             print_doc(out, &e.doc, depth);

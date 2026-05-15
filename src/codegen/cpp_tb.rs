@@ -114,6 +114,19 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
 }
 
 pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitError> {
+    // Desugar `impl <name> for <TbType>` tests into the classic
+    // `test <name>` form before any other emission work runs. The
+    // testbench-bound form (docs/test-ergonomics.md §3.3) folds a
+    // testbench's fields + helper methods into the bound test's
+    // scope; desugaring synthesizes the equivalent `let dut : ...` /
+    // `let _tb : <TbType>` declarations at test scope and rewrites
+    // bare-name references inside run/setup/check/teardown bodies
+    // to `_tb.<field>` / `<TbType>_<method>(_tb, ...)`. Once
+    // desugared, the test looks identical to a classic-form test
+    // and threads through the existing pipeline unchanged.
+    let file = desugar_impl_for_test_in_file(file);
+    let file = &file;
+
     // Find a single `test` item — the entry point.
     let test_decl = file
         .items
@@ -8429,6 +8442,543 @@ fn check_addrmap_overlap(a: &AddrmapDecl) -> Option<String> {
         }
     }
     None
+}
+
+/// Desugar `impl <name> for <TbType>` tests into the classic
+/// `test <name>` form (docs/test-ergonomics.md §3.3). For each test
+/// with `for_testbench: Some(tb)`:
+///
+/// 1. Find the bound testbench's declaration (in `file.items`).
+/// 2. Classify its fields:
+///    - First named-type field whose type isn't a known HARC
+///      construct → the DUT (e.g. `dut : Top`). Synthesize a test-
+///      scope `let dut : <SVType>` so the existing Verilator-init
+///      path picks up the allocation. (Other DUT-typed fields are
+///      currently out of scope — multi-DUT testbenches will need a
+///      separate plumbing pass.)
+///    - All fields participate in the bare-name-rewrite set.
+/// 3. Synthesize a test-scope `let _tb : <TbType>` so the existing
+///    component-instantiation path constructs the testbench struct.
+/// 4. Synthesize `_tb.dut = dut` at the start of the run block so
+///    the testbench's DUT pointer is wired to the test-scope let.
+/// 5. Walk every Stmt / Expr in the test items and rewrite bare
+///    `Ident(name)` references where `name` matches a testbench
+///    field (other than `dut`) or a testbench helper method to
+///    `_tb.<name>` field-access or `_tb.<name>(...)` call,
+///    respectively. `dut` keeps its bare form — it refers to the
+///    synthesized test-scope let, which is the same underlying
+///    VTop instance as `_tb.dut` (one allocation, two pointers).
+///
+/// Tests with `for_testbench: None` (classic form) pass through
+/// unchanged.
+fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
+    // Index components by name so the desugarer can resolve the
+    // bound testbench's field list without re-walking the file.
+    let mut components: std::collections::HashMap<String, ComponentDecl> =
+        std::collections::HashMap::new();
+    for it in &file.items {
+        match it {
+            Item::Env(c) | Item::Agent(c) | Item::Sequencer(c) | Item::Scoreboard(c) => {
+                components.insert(c.name.name.clone(), c.clone());
+            }
+            _ => {}
+        }
+    }
+    let transactors: std::collections::HashMap<String, TransactorDecl> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Transactor(t) => Some((t.name.name.clone(), t.clone())),
+            _ => None,
+        })
+        .collect();
+    let scoreboards: std::collections::HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Scoreboard(c) => Some(c.name.name.clone()),
+            _ => None,
+        })
+        .collect();
+    let buses: std::collections::HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Bus(b) => Some(b.name.name.clone()),
+            _ => None,
+        })
+        .collect();
+    let covergroups: std::collections::HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Covergroup(g) => Some(g.name.name.clone()),
+            _ => None,
+        })
+        .collect();
+    let regblocks: std::collections::HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Regblock(r) => Some(r.name.name.clone()),
+            _ => None,
+        })
+        .collect();
+    let addrmaps: std::collections::HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Addrmap(a) => Some(a.name.name.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let mut out = file.clone();
+    for it in out.items.iter_mut() {
+        let Item::Test(t) = it else { continue };
+        let Some(tb_ident) = t.for_testbench.clone() else { continue };
+        let Some(tb) = components.get(&tb_ident.name) else {
+            // Bound testbench not found — leave as is; the main
+            // pipeline will surface a sensible error when nothing
+            // resolves `_tb`'s type.
+            continue;
+        };
+
+        // Classify testbench fields.
+        let mut dut_field: Option<(String, TypeExpr)> = None;
+        let mut field_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut field_is_pointer: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for ci in &tb.items {
+            if let ComponentItem::Field(f) = ci {
+                field_names.insert(f.name.name.clone());
+                if let TypeExpr::Named { name, .. } = &f.ty {
+                    let simple = name
+                        .segments
+                        .last()
+                        .map(|s| s.name.as_str())
+                        .unwrap_or("");
+                    let is_harc = components.contains_key(simple)
+                        || transactors.contains_key(simple)
+                        || scoreboards.contains(simple)
+                        || buses.contains(simple)
+                        || covergroups.contains(simple)
+                        || regblocks.contains(simple)
+                        || addrmaps.contains(simple);
+                    if !is_harc {
+                        // Treat as a DUT pointer (Verilator-named SV
+                        // module type). First wins for the synthesized
+                        // `let dut : ...`.
+                        if dut_field.is_none() {
+                            dut_field = Some((f.name.name.clone(), f.ty.clone()));
+                        }
+                        field_is_pointer.insert(f.name.name.clone());
+                    }
+                }
+            }
+        }
+
+        // Method names — both `hookable` and `function` items.
+        let mut method_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for ci in &tb.items {
+            if let ComponentItem::Hookable(h) = ci {
+                method_names.insert(h.name.name.clone());
+            }
+        }
+
+        // Build the rewriter's "skip set" — names that must NOT be
+        // rewritten because they shadow testbench fields at test
+        // scope. `dut` always shadows (we synthesize `let dut : ...`
+        // for it). Any user-declared `let X` at test scope also
+        // shadows — capture them up-front.
+        let mut shadow: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        shadow.insert("dut".into());
+        shadow.insert("_tb".into());
+        for ti in &t.items {
+            if let TestItem::Let(l) = ti {
+                shadow.insert(l.name.name.clone());
+            }
+        }
+
+        // Rewrite every Stmt / Expr in the test body.
+        for ti in t.items.iter_mut() {
+            match ti {
+                TestItem::Stmt(s) => rewrite_stmt_for_impl(s, &field_names, &method_names, &field_is_pointer, &shadow),
+                TestItem::Scope(sc) => {
+                    if let Some(b) = sc.run.as_mut() {
+                        rewrite_block_for_impl(b, &field_names, &method_names, &field_is_pointer, &shadow);
+                    }
+                    if let Some(b) = sc.setup.as_mut() {
+                        rewrite_block_for_impl(b, &field_names, &method_names, &field_is_pointer, &shadow);
+                    }
+                    if let Some(b) = sc.check.as_mut() {
+                        rewrite_block_for_impl(b, &field_names, &method_names, &field_is_pointer, &shadow);
+                    }
+                    if let Some(b) = sc.teardown.as_mut() {
+                        rewrite_block_for_impl(b, &field_names, &method_names, &field_is_pointer, &shadow);
+                    }
+                }
+                TestItem::Phase(_, b) => {
+                    rewrite_block_for_impl(b, &field_names, &method_names, &field_is_pointer, &shadow);
+                }
+                _ => {}
+            }
+        }
+
+        // Prepend synthesized lets. Order: `let dut : Top` (so the
+        // Verilator-init path sees it as a top-level DUT pointer),
+        // then `let _tb : TopTb`. Inserted at the head of items so
+        // they win over any user-declared lets that happen to shadow
+        // (a defensive choice; today shadowing is also a HARC error
+        // via duplicate-let detection).
+        let mut prefix: Vec<TestItem> = Vec::new();
+        if let Some((_dut_name, dut_ty)) = &dut_field {
+            // Synthesize: `let dut : <SVType>`
+            prefix.push(TestItem::Let(LetStmt {
+                name: Ident { name: "dut".into(), span: tb_ident.span },
+                ty: Some(dut_ty.clone()),
+                value: None,
+                bind: false,
+                probes: Vec::new(),
+                bind_remap: Vec::new(),
+                span: tb_ident.span,
+            }));
+        }
+        // Synthesize: `let _tb : <TbType>` — default-constructed
+        // through the existing component-let path.
+        prefix.push(TestItem::Let(LetStmt {
+            name: Ident { name: "_tb".into(), span: tb_ident.span },
+            ty: Some(TypeExpr::Named {
+                name: Path { segments: vec![tb_ident.clone()], span: tb_ident.span },
+                generics: Vec::new(),
+                mode: None,
+                span: tb_ident.span,
+            }),
+            value: None,
+            bind: false,
+            probes: Vec::new(),
+            bind_remap: Vec::new(),
+            span: tb_ident.span,
+        }));
+
+        // Splice synthesized lets at the head, preserving the rest
+        // of the items in original order.
+        let original: Vec<TestItem> = std::mem::take(&mut t.items);
+        t.items = prefix;
+        for ti in original {
+            // Inject `_tb.dut = dut` as the first stmt of the
+            // run block so the wiring happens before any user code.
+            if dut_field.is_some() {
+                if let TestItem::Scope(sc) = &ti {
+                    if let Some(run) = &sc.run {
+                        let mut sc = sc.clone();
+                        let mut new_stmts = Vec::with_capacity(run.stmts.len() + 1);
+                        new_stmts.push(make_wire_dut_stmt(tb_ident.span));
+                        new_stmts.extend(run.stmts.iter().cloned());
+                        sc.run = Some(Block { stmts: new_stmts, span: run.span });
+                        t.items.push(TestItem::Scope(sc));
+                        continue;
+                    }
+                }
+            }
+            t.items.push(ti);
+        }
+
+        // Mark as desugared so any downstream consumer (pretty-
+        // printer for diagnostics, etc.) sees the classic shape.
+        t.for_testbench = None;
+    }
+    out
+}
+
+/// Build the synthetic `_tb.dut = dut` statement that wires the
+/// testbench's DUT pointer to the test-scope `let dut : ...`. Same
+/// shape as a user-written assignment, so it threads through
+/// `emit_stmt` unchanged.
+fn make_wire_dut_stmt(span: Span) -> Stmt {
+    let _tb = Expr {
+        kind: Box::new(ExprKind::Ident(Ident { name: "_tb".into(), span })),
+        span,
+    };
+    let _tb_dut = Expr {
+        kind: Box::new(ExprKind::Field {
+            target: _tb,
+            name: Ident { name: "dut".into(), span },
+        }),
+        span,
+    };
+    let dut = Expr {
+        kind: Box::new(ExprKind::Ident(Ident { name: "dut".into(), span })),
+        span,
+    };
+    Stmt {
+        kind: StmtKind::Assign {
+            target: _tb_dut,
+            value: dut,
+        },
+        span,
+    }
+}
+
+/// Walk a block and rewrite bare-ident references that match a
+/// testbench field or method to `_tb.<name>`. See
+/// `desugar_impl_for_test_in_file` for the rewrite rules.
+fn rewrite_block_for_impl(
+    b: &mut Block,
+    fields: &std::collections::HashSet<String>,
+    methods: &std::collections::HashSet<String>,
+    pointers: &std::collections::HashSet<String>,
+    shadow: &std::collections::HashSet<String>,
+) {
+    for s in b.stmts.iter_mut() {
+        rewrite_stmt_for_impl(s, fields, methods, pointers, shadow);
+    }
+}
+
+fn rewrite_stmt_for_impl(
+    s: &mut Stmt,
+    fields: &std::collections::HashSet<String>,
+    methods: &std::collections::HashSet<String>,
+    pointers: &std::collections::HashSet<String>,
+    shadow: &std::collections::HashSet<String>,
+) {
+    match &mut s.kind {
+        StmtKind::Let(l) => {
+            if let Some(v) = l.value.as_mut() {
+                rewrite_expr_for_impl(v, fields, methods, pointers, shadow);
+            }
+        }
+        StmtKind::Assign { target, value } | StmtKind::Send { target, value } => {
+            rewrite_expr_for_impl(target, fields, methods, pointers, shadow);
+            rewrite_expr_for_impl(value, fields, methods, pointers, shadow);
+        }
+        StmtKind::Expr(e) => rewrite_expr_for_impl(e, fields, methods, pointers, shadow),
+        StmtKind::For(f) => {
+            rewrite_expr_for_impl(&mut f.iter, fields, methods, pointers, shadow);
+            rewrite_block_for_impl(&mut f.body, fields, methods, pointers, shadow);
+        }
+        StmtKind::Repeat(r) => {
+            rewrite_expr_for_impl(&mut r.count, fields, methods, pointers, shadow);
+            rewrite_block_for_impl(&mut r.body, fields, methods, pointers, shadow);
+        }
+        StmtKind::Loop(b) => rewrite_block_for_impl(b, fields, methods, pointers, shadow),
+        StmtKind::While { cond, body, .. } => {
+            rewrite_expr_for_impl(cond, fields, methods, pointers, shadow);
+            rewrite_block_for_impl(body, fields, methods, pointers, shadow);
+        }
+        StmtKind::If(ifs) => {
+            rewrite_expr_for_impl(&mut ifs.cond, fields, methods, pointers, shadow);
+            rewrite_block_for_impl(&mut ifs.then_block, fields, methods, pointers, shadow);
+            for (c, b) in ifs.elsifs.iter_mut() {
+                rewrite_expr_for_impl(c, fields, methods, pointers, shadow);
+                rewrite_block_for_impl(b, fields, methods, pointers, shadow);
+            }
+            if let Some(b) = ifs.else_block.as_mut() {
+                rewrite_block_for_impl(b, fields, methods, pointers, shadow);
+            }
+        }
+        StmtKind::Fork(fk) => {
+            for b in fk.branches.iter_mut() {
+                rewrite_block_for_impl(b, fields, methods, pointers, shadow);
+            }
+        }
+        StmtKind::Parallel(blocks) | StmtKind::Schedule(blocks) => {
+            for b in blocks.iter_mut() {
+                rewrite_block_for_impl(b, fields, methods, pointers, shadow);
+            }
+        }
+        StmtKind::Select(arms) => {
+            for a in arms.iter_mut() {
+                rewrite_expr_for_impl(&mut a.event, fields, methods, pointers, shadow);
+                rewrite_block_for_impl(&mut a.action, fields, methods, pointers, shadow);
+            }
+        }
+        StmtKind::On(h) => {
+            rewrite_expr_for_impl(&mut h.event, fields, methods, pointers, shadow);
+            rewrite_block_for_impl(&mut h.body, fields, methods, pointers, shadow);
+        }
+        StmtKind::After { duration, body, .. } => {
+            rewrite_expr_for_impl(duration, fields, methods, pointers, shadow);
+            rewrite_block_for_impl(body, fields, methods, pointers, shadow);
+        }
+        StmtKind::Wait { duration, .. } => {
+            rewrite_expr_for_impl(duration, fields, methods, pointers, shadow);
+        }
+        StmtKind::WaitUntil { conditions, timeout, .. } => {
+            for c in conditions.iter_mut() {
+                rewrite_expr_for_impl(c, fields, methods, pointers, shadow);
+            }
+            if let Some(t) = timeout.as_mut() {
+                rewrite_expr_for_impl(&mut t.cycles, fields, methods, pointers, shadow);
+                if let Some(m) = t.message.as_mut() {
+                    rewrite_expr_for_impl(m, fields, methods, pointers, shadow);
+                }
+            }
+        }
+        StmtKind::Yield(e) | StmtKind::Release(e) => {
+            rewrite_expr_for_impl(e, fields, methods, pointers, shadow);
+        }
+        StmtKind::Return(opt) => {
+            if let Some(e) = opt.as_mut() {
+                rewrite_expr_for_impl(e, fields, methods, pointers, shadow);
+            }
+        }
+        StmtKind::Assert(v) | StmtKind::Assume(v) | StmtKind::Cover(v) => {
+            if let Some(ex) = v.expr.as_mut() {
+                rewrite_expr_for_impl(ex, fields, methods, pointers, shadow);
+            }
+            if let Some(else_fail) = v.else_fail.as_mut() {
+                rewrite_expr_for_impl(else_fail, fields, methods, pointers, shadow);
+            }
+        }
+        StmtKind::Randomize { target, with_body, .. } => {
+            rewrite_expr_for_impl(target, fields, methods, pointers, shadow);
+            for e in with_body.iter_mut() {
+                rewrite_expr_for_impl(e, fields, methods, pointers, shadow);
+            }
+        }
+        StmtKind::Log { args, .. } | StmtKind::LogF { args, .. } | StmtKind::Emit { args, .. } => {
+            for a in args.iter_mut() {
+                match a {
+                    CallArg::Expr(e) => rewrite_expr_for_impl(e, fields, methods, pointers, shadow),
+                    CallArg::Named { value, .. } => {
+                        rewrite_expr_for_impl(value, fields, methods, pointers, shadow);
+                    }
+                }
+            }
+        }
+        StmtKind::Fail { msg, .. } => {
+            rewrite_expr_for_impl(msg, fields, methods, pointers, shadow);
+        }
+        StmtKind::Apply(_) | StmtKind::Break { .. } | StmtKind::Continue { .. } => {}
+    }
+}
+
+fn rewrite_expr_for_impl(
+    e: &mut Expr,
+    fields: &std::collections::HashSet<String>,
+    methods: &std::collections::HashSet<String>,
+    _pointers: &std::collections::HashSet<String>,
+    shadow: &std::collections::HashSet<String>,
+) {
+    match e.kind.as_mut() {
+        ExprKind::Ident(id) => {
+            // Bare ident matching a testbench field (non-shadowed)
+            // → `_tb.<id>`.
+            if fields.contains(&id.name) && !shadow.contains(&id.name) {
+                let new_id = id.clone();
+                let span = e.span;
+                let inner = Expr {
+                    kind: Box::new(ExprKind::Ident(Ident { name: "_tb".into(), span })),
+                    span,
+                };
+                *e.kind = ExprKind::Field { target: inner, name: new_id };
+            }
+        }
+        ExprKind::Call { callee, args } => {
+            // Bare-name method call `<m>(args)` where `<m>` is a
+            // testbench helper (function/hookable) and not shadowed
+            // → rewrite callee to `_tb.<m>` so the existing
+            // `resolve_component_method_call` dispatcher picks it up.
+            if let ExprKind::Ident(id) = callee.kind.as_ref() {
+                if methods.contains(&id.name) && !shadow.contains(&id.name) {
+                    let new_id = id.clone();
+                    let span = callee.span;
+                    let inner = Expr {
+                        kind: Box::new(ExprKind::Ident(Ident { name: "_tb".into(), span })),
+                        span,
+                    };
+                    *callee.kind = ExprKind::Field { target: inner, name: new_id };
+                }
+            } else {
+                rewrite_expr_for_impl(callee, fields, methods, _pointers, shadow);
+            }
+            for a in args.iter_mut() {
+                match a {
+                    CallArg::Expr(x) => rewrite_expr_for_impl(x, fields, methods, _pointers, shadow),
+                    CallArg::Named { value, .. } => {
+                        rewrite_expr_for_impl(value, fields, methods, _pointers, shadow);
+                    }
+                }
+            }
+        }
+        ExprKind::Field { target, .. } => {
+            rewrite_expr_for_impl(target, fields, methods, _pointers, shadow);
+        }
+        ExprKind::Index { target, index } => {
+            rewrite_expr_for_impl(target, fields, methods, _pointers, shadow);
+            rewrite_expr_for_impl(index, fields, methods, _pointers, shadow);
+        }
+        ExprKind::BitSlice { target, hi, lo } => {
+            rewrite_expr_for_impl(target, fields, methods, _pointers, shadow);
+            rewrite_expr_for_impl(hi, fields, methods, _pointers, shadow);
+            rewrite_expr_for_impl(lo, fields, methods, _pointers, shadow);
+        }
+        ExprKind::Cast { expr, .. } => rewrite_expr_for_impl(expr, fields, methods, _pointers, shadow),
+        ExprKind::Send { target, value } => {
+            rewrite_expr_for_impl(target, fields, methods, _pointers, shadow);
+            rewrite_expr_for_impl(value, fields, methods, _pointers, shadow);
+        }
+        ExprKind::Unary { expr, .. } => rewrite_expr_for_impl(expr, fields, methods, _pointers, shadow),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            rewrite_expr_for_impl(lhs, fields, methods, _pointers, shadow);
+            rewrite_expr_for_impl(rhs, fields, methods, _pointers, shadow);
+        }
+        ExprKind::Ternary { cond, then_branch, else_branch } => {
+            rewrite_expr_for_impl(cond, fields, methods, _pointers, shadow);
+            rewrite_expr_for_impl(then_branch, fields, methods, _pointers, shadow);
+            rewrite_expr_for_impl(else_branch, fields, methods, _pointers, shadow);
+        }
+        ExprKind::HashHash { expr, .. } => rewrite_expr_for_impl(expr, fields, methods, _pointers, shadow),
+        ExprKind::SeqRepeat { expr, .. } => rewrite_expr_for_impl(expr, fields, methods, _pointers, shadow),
+        ExprKind::RangeLit { lo, hi } => {
+            if let Some(lo) = lo.as_mut() { rewrite_expr_for_impl(lo, fields, methods, _pointers, shadow); }
+            if let Some(hi) = hi.as_mut() { rewrite_expr_for_impl(hi, fields, methods, _pointers, shadow); }
+        }
+        ExprKind::SetLit(es) => {
+            for x in es.iter_mut() { rewrite_expr_for_impl(x, fields, methods, _pointers, shadow); }
+        }
+        ExprKind::SystemCall { args, .. } => {
+            for x in args.iter_mut() { rewrite_expr_for_impl(x, fields, methods, _pointers, shadow); }
+        }
+        ExprKind::Randomize { target, with_body, .. } => {
+            rewrite_expr_for_impl(target, fields, methods, _pointers, shadow);
+            for x in with_body.iter_mut() { rewrite_expr_for_impl(x, fields, methods, _pointers, shadow); }
+        }
+        ExprKind::DistDirective { target, .. } => {
+            rewrite_expr_for_impl(target, fields, methods, _pointers, shadow);
+        }
+        ExprKind::Paren(x) => rewrite_expr_for_impl(x, fields, methods, _pointers, shadow),
+        ExprKind::NamedArg { value, .. } => {
+            rewrite_expr_for_impl(value, fields, methods, _pointers, shadow);
+        }
+        ExprKind::StructLit { fields: nfs, .. } => {
+            for nf in nfs.iter_mut() {
+                rewrite_expr_for_impl(&mut nf.value, fields, methods, _pointers, shadow);
+            }
+        }
+        ExprKind::CoverArrow { lhs, rhs, .. } => {
+            rewrite_expr_for_impl(lhs, fields, methods, _pointers, shadow);
+            rewrite_expr_for_impl(rhs, fields, methods, _pointers, shadow);
+        }
+        ExprKind::Solve { args, .. } => {
+            for x in args.iter_mut() { rewrite_expr_for_impl(x, fields, methods, _pointers, shadow); }
+        }
+        ExprKind::Membership { expr, set } => {
+            rewrite_expr_for_impl(expr, fields, methods, _pointers, shadow);
+            rewrite_expr_for_impl(set, fields, methods, _pointers, shadow);
+        }
+        ExprKind::DistLit(_)
+        | ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Time(_)
+        | ExprKind::String(_)
+        | ExprKind::Bool(_)
+        | ExprKind::ImplicitSelf => {}
+    }
 }
 
 /// Enforce: a transactor's always-on body (anything not under

@@ -17,7 +17,8 @@ two-block `test T { ... } / impl sim for T { run ... }` form.
 | Fixture-corpus migration to inline form | **Shipped** | PR #92 (all 60 fixtures + `scripts/migrate_v1_inline.py`) |
 | Remove `impl <target> for <Test>` parser entry | **Shipped** | PR #92 |
 | Backend selection via CLI subcommand only | **Shipped** | implied by parser removal — no per-test annotation surface |
-| `testbench` block (shared structural skeleton + helper methods) | **Shipped** | Parser entry pre-existing; `function` keyword + codegen suppression of hook vectors landed in PR adding this row. Bus-binding-as-field (`bus : Bus = bind dut`) and `hookable function` deferred. |
+| `testbench` block (shared structural skeleton + helper methods) | **Shipped** | Parser entry pre-existing; `function` keyword + codegen suppression of hook vectors landed in PR #109. Bus-binding-as-field (`bus : Bus = bind dut`) and `hookable function` deferred. |
+| `impl <name> for <Tb> ... end impl <name>` — testbench-bound test form | **Shipped** | Parser + AST + pre-emission desugaring. Canary fixture: `testbench_basic_test.harc`. Phase 2 (separate PR) sweeps the 70-fixture corpus and removes the classic `test T { let dut; ... }` form. |
 | Dead-code prune (`Item::Impl`, `ImplDecl`, `ImplItem`, `parse_impl`) | **Pending** | follow-up tidy PR |
 
 ## 1. Motivation
@@ -199,6 +200,57 @@ The split between `env` and `testbench` becomes meaningful:
 A `testbench` typically *contains* an `env`. The env stays DUT-agnostic
 and reusable across testbenches; the testbench is the DUT-specific
 binding point.
+
+### 3.3 Testbench-bound test form — `impl <name> for <Tb>`
+
+The classic `test T { let dut; let tb; run; }` form forces every test to repeat the same instantiation boilerplate (and the awkward `tb.dut = dut` wire-up). The bound form folds the testbench into the test's scope:
+
+```harc
+testbench CounterTb
+    dut : Top
+
+    function reset()
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+    end function reset
+
+    function bump(n : uint<32>)
+        dut.en = 1
+        wait n cycles
+        dut.en = 0
+    end function bump
+end testbench CounterTb
+
+impl Smoke for CounterTb
+    run
+        reset()                       -- = _tb.reset()
+        bump(5)                       -- = _tb.bump(5)
+        assert dut.count_out == 5    -- = dut->count_out
+    end run
+end impl Smoke
+
+impl EnableToggle for CounterTb       -- second test, same testbench
+    run
+        reset()
+        bump(3)
+        wait 3 cycles
+        let frozen = dut.count_out
+        wait 5 cycles
+        assert dut.count_out == frozen
+    end run
+end impl EnableToggle
+```
+
+**Semantics.**
+- Bare-name lookup inside the bound test body falls through to the testbench instance: identifiers matching testbench fields rewrite to `_tb.<name>`, identifiers matching testbench methods (`function` or `hookable`) rewrite to `<TbType>_<name>(_tb, ...)`.
+- `dut` is reserved as the test-scope name for the DUT pointer. The desugarer synthesizes `let dut : <SVType>` at test scope from the testbench's first SV-typed field, then emits `_tb.dut = dut` so the testbench's pointer aliases the test-scope pointer (one allocation, two pointers, same instance). Bare `dut.signal` resolves through the existing pointer-var path — no `_tb.` prefix.
+- User-declared `let X` at test scope shadows any testbench field named `X` (other than `dut`, which is always synthesized).
+- The testbench instance is **fresh per test** — each `impl Foo for Tb` gets its own default-constructed `Tb` allocated at the start of that test's `main()`.
+
+**Lowering.** A pre-emission AST pass (`desugar_impl_for_test_in_file`) expands each `TestDecl` with `for_testbench: Some(...)` into the classic shape: prepend `let dut : <SVType>` and `let _tb : <TbType>`, prepend `_tb.dut = dut` to the run block, and rewrite bare-name references in run / setup / check / teardown / phase bodies. Once desugared, the test threads through the same codegen as a classic-form test.
+
+**Status.** Surface + canary fixture shipped. Phase 2 (a separate PR) sweeps the remaining 69 fixtures from `test T { ... }` to `impl T for SomeTb { ... }` and then removes the classic-form parser entry.
 
 ## 4. Surface — inline `run` inside `test`  *(shipped in PR #91 + #92)*
 
