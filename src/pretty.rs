@@ -233,6 +233,9 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
                     write!(out, " size ").ok();
                     print_expr(out, sz);
                 }
+                if let Some(target) = &inst.alias_of {
+                    write!(out, " alias of {}", target.name).ok();
+                }
                 writeln!(out).ok();
             }
             pad(out, depth);
