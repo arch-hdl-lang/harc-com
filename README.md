@@ -180,6 +180,16 @@ Common `harc sim` flags:
 - `--coverage` — enable DUT coverage collection. Works on both DUT paths: `--sv` passes `--coverage` to Verilator; `--dut` passes `--coverage` + `--coverage-dat=<outdir>/coverage.dat` to `arch sim`. The Verilator-compatible `coverage.dat` lands in `<outdir>/` on both paths so downstream tools (`verilator_coverage`, the CVDP scorer) see a uniform shape
 - `--mt` — opt into the per-actor multi-OS-thread runtime (default is cooperative single-thread, typically faster on real fixtures)
 
+Z3 is required for constraint-randomized tests (`randomize(t) with ...` and transaction `keep` constraints). System installs are auto-detected, and custom installs can be selected with a root prefix or explicit include/lib directories:
+
+```sh
+HARC_Z3_ROOT=/path/to/z3 harc sim --sv dut.sv test.harc --top Top
+harc sim --z3-root /path/to/z3 --sv dut.sv test.harc --top Top
+harc sim --z3-include-dir /path/to/z3/include --z3-lib-dir /path/to/z3/lib --sv dut.sv test.harc --top Top
+```
+
+The resolver checks CLI flags first, then `HARC_Z3_INCLUDE_DIR` / `HARC_Z3_LIB_DIR`, then `--z3-root`, `HARC_Z3_ROOT`, `third_party/z3`, and finally common system paths.
+
 ## Examples
 
 [`tests/fixtures/`](tests/fixtures/) holds 56 runnable HARC TBs targeting DUTs vendored under [`tests/dut/`](tests/dut/). Each fixture compiles, runs through Verilator, and asserts `ALL TESTS PASSED`. A non-exhaustive tour:

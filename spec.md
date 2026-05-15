@@ -2069,6 +2069,17 @@ Compilation produces a single C++ binary linking:
 - Z3 / Bitwuzla — linked as the off-cycle solver pool serving queued `randomize` requests (§4.4)
 - Coverage / wave runtime — emits UCDB / FSDB / VCD via standard formats
 
+**v0 Z3 path resolution.** Solver-backed generated C++ includes `<z3++.h>` and links `libz3` when a test uses `randomize(t) with ...` or transaction `keep` constraints (§4.1). `harc sim --sv` resolves Z3 paths in this order:
+
+1. Explicit CLI include/lib overrides: `--z3-include-dir`, `--z3-lib-dir`.
+2. Explicit environment include/lib overrides: `HARC_Z3_INCLUDE_DIR`, `HARC_Z3_LIB_DIR`.
+3. CLI root prefix: `--z3-root <prefix>`; probes `<prefix>/include` plus `<prefix>/lib` or `<prefix>/lib64`.
+4. Environment root prefix: `HARC_Z3_ROOT=<prefix>` with the same root layout.
+5. Repo-local `third_party/z3` with the same root layout.
+6. System defaults: Homebrew and `/usr` include/lib paths.
+
+If a solver-backed test cannot resolve both the include directory and the library directory, `harc sim --sv` fails before invoking Verilator and tells the user to set `HARC_Z3_ROOT`, pass `--z3-root`, or pass explicit include/lib flags. When a library directory is resolved, HARC passes `-L<dir> -Wl,-rpath,<dir> -lz3` to Verilator and prepends `<dir>` to `LD_LIBRARY_PATH` and `DYLD_LIBRARY_PATH` only for the spawned simulator process.
+
 Per-cycle dispatch shape (one per clock domain, see §7.1):
 
 ```
