@@ -13,9 +13,11 @@ domain DstDomain
   freq_mhz: 200
 end domain DstDomain
 
-test RstSyncTest
-    let dut : RstSync
+testbench RstSyncTb
+    dut : RstSync
+end testbench RstSyncTb
 
+impl RstSyncTest for RstSyncTb
     clock dst_clk = DstDomain    // 200 MHz — primary, drives the sync chain
     clock src_clk = SrcDomain    // 100 MHz — unused inside DUT
 
@@ -76,5 +78,5 @@ test RstSyncTest
             else fail("2 cycles after deassert: data_out=${dut.data_out}, expected 0")
         log(info, "PASS: re-assert then deassert")
     end run
-end test RstSyncTest
+end impl RstSyncTest
 

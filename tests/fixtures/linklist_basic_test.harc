@@ -92,9 +92,11 @@ function reset_dut(dut: TaskQueue)
     dut.rst = 0
 end function reset_dut
 
-test LinklistBasicTest
-    let dut : TaskQueue
+testbench LinklistBasicTb
+    dut : TaskQueue
+end testbench LinklistBasicTb
 
+impl LinklistBasicTest for LinklistBasicTb
     clock clk = SysDomain        // 100 MHz
 
     run
@@ -217,5 +219,5 @@ test LinklistBasicTest
         assert dut.empty == 1 else fail("empty after interleaved")
         log(info, "PASS: interleaved insert/delete")
     end run
-end test LinklistBasicTest
+end impl LinklistBasicTest
 

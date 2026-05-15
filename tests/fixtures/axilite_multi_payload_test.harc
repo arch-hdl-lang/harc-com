@@ -66,8 +66,11 @@ tseq RandomTxns(n: int) -> TSeq<RegOp>
     end for
 end tseq RandomTxns
 
-test AxiLiteMultiPayloadTest
-    let dut  : AxiLiteRegs
+testbench AxiLiteMultiPayloadTb
+    dut : AxiLiteRegs
+end testbench AxiLiteMultiPayloadTb
+
+impl AxiLiteMultiPayloadTest for AxiLiteMultiPayloadTb
     let axil : BusAxiLite = bind dut
     let drv  : AxilXactor active  = bind axil
     let mon  : AxilXactor passive = bind axil
@@ -122,5 +125,5 @@ test AxiLiteMultiPayloadTest
 
         log(info, "PASS: multi-payload recv() + handshake() captured data + resp on 5 round-trips")
     end run
-end test AxiLiteMultiPayloadTest
+end impl AxiLiteMultiPayloadTest
 

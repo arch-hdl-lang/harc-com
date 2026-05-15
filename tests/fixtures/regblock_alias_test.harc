@@ -56,8 +56,11 @@ addrmap Soc via AxilHelper
     instance mm2s_view : DmaChan @ 0x30 alias of mm2s
 end addrmap Soc
 
-test RegblockAliasTest
-    let dut    : AxiLiteRegs
+testbench RegblockAliasTb
+    dut : AxiLiteRegs
+end testbench RegblockAliasTb
+
+impl RegblockAliasTest for RegblockAliasTb
     let axil   : BusAxiLite = bind dut
     let helper : AxilHelper active = bind axil
     let chip   : Soc = bind helper
@@ -111,4 +114,4 @@ test RegblockAliasTest
 
         log(info, "PASS: alias instance round-trips at distinct bus base; shared mirror cell")
     end run
-end test RegblockAliasTest
+end impl RegblockAliasTest

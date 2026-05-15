@@ -93,10 +93,13 @@ transactor ApbXactor
     end when
 end transactor ApbXactor
 
-test DmaEngineTest
-    let dut : DmaEngine
-    let mon : MemXactor passive
-    let apb : ApbXactor active
+testbench DmaEngineTb
+    dut : DmaEngine
+    mon : MemXactor passive
+    apb : ApbXactor active
+end testbench DmaEngineTb
+
+impl DmaEngineTest for DmaEngineTb
 
     run
         log(info, "DmaEngine test — APB config + mem_rd/mem_wr handshake observation")
@@ -180,5 +183,5 @@ test DmaEngineTest
 
         log(info, "PASS: 4 r/w beats observed via transactor handlers, IRQ fired, APB readback correct")
     end run
-end test DmaEngineTest
+end impl DmaEngineTest
 

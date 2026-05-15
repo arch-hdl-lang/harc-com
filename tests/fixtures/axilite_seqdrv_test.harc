@@ -80,9 +80,12 @@ tseq RandomTxns(n: int) -> TSeq<RegOp>
     end for
 end tseq RandomTxns
 
-test AxiLiteSeqDrvTest
-    let dut : AxiLiteRegs
-    let drv : SeqXactor active
+testbench AxiLiteSeqDrvTb
+    dut : AxiLiteRegs
+    drv : SeqXactor active
+end testbench AxiLiteSeqDrvTb
+
+impl AxiLiteSeqDrvTest for AxiLiteSeqDrvTb
 
     run
         log(info, "AxiLiteRegs sequencer → transactor (unbound) event-driven test")
@@ -130,5 +133,5 @@ test AxiLiteSeqDrvTest
 
         log(info, "PASS: 5 sequencer→transactor round-trips via event dispatch")
     end run
-end test AxiLiteSeqDrvTest
+end impl AxiLiteSeqDrvTest
 

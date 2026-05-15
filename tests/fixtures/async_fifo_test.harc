@@ -5,9 +5,11 @@
 // async_fifo_domains.harc) so the period is derived from `freq_mhz`
 // instead of duplicated as a time literal.
 
-test AsyncFifoTest
-    let dut : AsyncBridge
+testbench AsyncFifoTb
+    dut : AsyncBridge
+end testbench AsyncFifoTb
 
+impl AsyncFifoTest for AsyncFifoTb
     // First-declared clock (wr_clk) is the primary — `wait N cycles` (no
     // name) advances by N wr_clk cycles, and the cycle counter in log
     // lines tracks wr_clk rising edges.
@@ -59,7 +61,7 @@ test AsyncFifoTest
 
         log(info, "PASS: 8/8 items round-tripped through async FIFO")
     end run
-end test AsyncFifoTest
+end impl AsyncFifoTest
 
 // Sim scope for AsyncFifoTest.
 // Push 8 items on the fast side, let synchronizers settle, pop on the

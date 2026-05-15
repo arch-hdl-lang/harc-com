@@ -10,7 +10,10 @@
 //     mangled accessor; the test reads back the ALU inputs/output
 //     as if they were ordinary top-level ports.
 
-test ProbeBasicTest
+testbench ProbeBasicTb
+end testbench ProbeBasicTb
+
+impl ProbeBasicTest for ProbeBasicTb
     let dut : CpuPipe
         probe alu_a   : uint<32> at alu0.a
         probe alu_b   : uint<32> at alu0.b
@@ -54,5 +57,5 @@ test ProbeBasicTest
 
         log(info, "PASS: 3 probes through SV bind stub verified")
     end run
-end test ProbeBasicTest
+end impl ProbeBasicTest
 

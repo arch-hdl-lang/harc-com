@@ -52,9 +52,12 @@ transactor PipeXactor
     end when
 end transactor PipeXactor
 
-test CpuPipelineTest
-    let dut  : CpuPipe
-    let pipe : PipeXactor active
+testbench CpuPipelineTb
+    dut  : CpuPipe
+    pipe : PipeXactor active
+end testbench CpuPipelineTb
+
+impl CpuPipelineTest for CpuPipelineTb
 
     run
         log(info, "CpuPipe 4-stage pipeline test")
@@ -269,5 +272,5 @@ test CpuPipelineTest
 
         log(info, "ALL 7 SUB-TESTS PASSED — CpuPipe pipeline coverage")
     end run
-end test CpuPipelineTest
+end impl CpuPipelineTest
 

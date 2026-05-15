@@ -40,9 +40,11 @@ function axil_read(dut: AxiLiteRegs, addr: uint<8>) -> uint<32>
     return val
 end function axil_read
 
-test AxiLiteRegsTest
-    let dut : AxiLiteRegs
+testbench AxiLiteRegsTb
+    dut : AxiLiteRegs
+end testbench AxiLiteRegsTb
 
+impl AxiLiteRegsTest for AxiLiteRegsTb
     run
         log(info, "starting AxiLiteRegs test")
 
@@ -104,7 +106,7 @@ test AxiLiteRegsTest
 
         log(info, "all 3 register R/W operations passed")
     end run
-end test AxiLiteRegsTest
+end impl AxiLiteRegsTest
 
 // Sim scope of AxiLiteRegsTest — minimal AXI4-Lite write+read on MM2S_DMACR.
 // Mirrors `test_mm2s_register_rw` from arch-com/tests/axi_dma/tb_axilite_regs.cpp.

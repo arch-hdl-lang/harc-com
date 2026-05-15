@@ -137,9 +137,11 @@ tseq RandomTxns(n: int) -> TSeq<RegOp>
     end for
 end tseq RandomTxns
 
-test TransactorAgentModeTest
-    let dut : AxiLiteRegs
+testbench TransactorAgentModeTb
+    dut : AxiLiteRegs
+end testbench TransactorAgentModeTb
 
+impl TransactorAgentModeTest for TransactorAgentModeTb
     // Same `AxilAgent` declaration, two instantiations with
     // different modes. Mode flows through to `drv` automatically.
     let act : AxilAgent active
@@ -207,5 +209,5 @@ test TransactorAgentModeTest
 
         log(info, "PASS: same agent decl, mode inherited — active drove, passive observed")
     end run
-end test TransactorAgentModeTest
+end impl TransactorAgentModeTest
 

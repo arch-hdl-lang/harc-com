@@ -39,12 +39,13 @@ agent Producer
     end on
 end agent Producer
 
-test WaitUntilQuiesceTest
-    let dut : Top
+testbench WaitUntilQuiesceTb
+    dut  : Top
+    prod : Producer
+end testbench WaitUntilQuiesceTb
 
+impl WaitUntilQuiesceTest for WaitUntilQuiesceTb
     clock clk = SysDomain
-
-    let prod : Producer
 
     run
         dut.rst = 1
@@ -70,5 +71,5 @@ test WaitUntilQuiesceTest
 
         log(info, "PASS: wait until quiesced after seen=${prod.seen}")
     end run
-end test WaitUntilQuiesceTest
+end impl WaitUntilQuiesceTest
 

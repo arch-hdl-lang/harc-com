@@ -19,9 +19,11 @@ function ram_read(dut: SimpleMem, addr: uint<8>) -> uint<8>
     return dut.access_rdata
 end function ram_read
 
-test SinglePortRamTest
-    let dut : SimpleMem
+testbench SinglePortRamTb
+    dut : SimpleMem
+end testbench SinglePortRamTb
 
+impl SinglePortRamTest for SinglePortRamTb
     run
         // Idle init.
         dut.access_en = 0
@@ -73,5 +75,5 @@ test SinglePortRamTest
 
         dut.access_en = 0
     end run
-end test SinglePortRamTest
+end impl SinglePortRamTest
 

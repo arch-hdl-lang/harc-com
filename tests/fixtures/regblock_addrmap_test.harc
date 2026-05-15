@@ -66,8 +66,11 @@ addrmap Soc via AxilHelper
     instance s2mm : DmaChan @ 0x30 size 0x30
 end addrmap Soc
 
-test RegblockAddrmapTest
-    let dut    : AxiLiteRegs
+testbench RegblockAddrmapTb
+    dut : AxiLiteRegs
+end testbench RegblockAddrmapTb
+
+impl RegblockAddrmapTest for RegblockAddrmapTb
     let axil   : BusAxiLite = bind dut
     let helper : AxilHelper active = bind axil
     let chip   : Soc = bind helper
@@ -125,4 +128,4 @@ test RegblockAddrmapTest
 
         log(info, "PASS: 2 addrmap instances of DmaChan round-trip at distinct bases")
     end run
-end test RegblockAddrmapTest
+end impl RegblockAddrmapTest

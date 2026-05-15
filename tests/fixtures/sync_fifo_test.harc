@@ -16,10 +16,12 @@ covergroup FifoCov @(posedge dut.clk)
         end bins
 end covergroup FifoCov
 
-test SyncFifoTest
-    let dut : TxQueue
-    let cov : FifoCov
+testbench SyncFifoTb
+    dut : TxQueue
+    cov : FifoCov
+end testbench SyncFifoTb
 
+impl SyncFifoTest for SyncFifoTb
     run
         // Reset
         dut.rst = 1
@@ -75,5 +77,5 @@ test SyncFifoTest
         assert cov.cp_empty.yes > 0 else fail("empty=1 coverage hole")
         assert cov.cp_full.yes  > 0 else fail("full=1  coverage hole")
     end check
-end test SyncFifoTest
+end impl SyncFifoTest
 
