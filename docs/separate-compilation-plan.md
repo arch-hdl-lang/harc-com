@@ -6,9 +6,10 @@ Status: **In progress.**
 
 | Phase | Status | Scope |
 |---|---|---|
-| 1a — dispatcher scaffolding | **Shipped (PR `feat/v0-multi-test-binary`)** | Emit `int run_<TestName>(argc, argv)` per test (today: one) + dispatcher `int main()` that reads `--test <name>` / `HARC_TEST` and dispatches. Single-test binaries are functionally unchanged; the dispatcher just always picks the one test. |
-| 1b — multi-test emission | **Next PR** | Iterate `emit_with_opts` over all tests, emit one `run_<TestName>` per test, dispatcher gains multi-branch logic. CLI passes `--test <name>` to the binary at runtime instead of using it to filter `merge_for_sim` at codegen time. The user-facing payoff lands here: `harc sim --test foo` and `harc sim --test bar` produce byte-identical `.cpp` and Verilator's Make catches the skip. |
-| 2 — full per-test `.o` (member-function refactor) | **Deferred** | The long-term end state below. Requires converting every `[&]`-capturing lambda in the codegen to a member function (or explicit-param function). ~2-3 weeks of careful work. Wait until 1b's benchmarks justify the spend. |
+| 1a — dispatcher scaffolding | **Shipped (PR #112)** | `int run_<TestName>(argc, argv)` per test + dispatcher `int main()` reading `--test <name>` / `HARC_TEST`. |
+| 1b — multi-test emission | **Shipped (PR #113)** | `emit_with_opts` iterates over all tests; one `run_<TestName>` per test; dispatcher's multi-branch logic; CLI passes `--test <name>` to binary at runtime. |
+| 1c — build reuse | **Shipped (PR `feat/v0-build-reuse`)** | Drop the per-invocation `obj_dir/` wipe so Make's mtime check kicks in. Combined with `write_if_changed` for the emitted `.cpp`, `harc sim --test foo` then `harc sim --test bar` against the same source skips Verilator entirely — ~45× speedup measured (6.85s → 0.15s). `--rebuild` flag forces the cleanup when needed (Verilator-version change, etc.). |
+| 2 — full per-test `.o` (member-function refactor) | **Deferred** | The long-term end state below. Requires converting every `[&]`-capturing lambda in the codegen to a member function (or explicit-param function). ~2-3 weeks of careful work. Wait until benchmarks justify the spend. |
 
 The remainder of this doc describes phase 2 — the end state.
 
