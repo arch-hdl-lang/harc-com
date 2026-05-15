@@ -1897,6 +1897,148 @@ end test T"#,
         .expect("drive code inside `when active` should emit cleanly under any mode");
 }
 
+/// Call-site enforcement (spec §8.1, Phase B): even after the
+/// structural check moves drive code into `when active`, a passive
+/// instance still has those C++ functions emitted (only the actor
+/// coroutine is gated by mode). A direct call like
+/// `passive_inst.write(...)` would silently dispatch into orphan code.
+/// This test pins the error message.
+#[test]
+fn passive_instance_calling_when_active_hookable_errors_clearly() {
+    let parsed = parse_source(
+        r#"transactor X
+    dut : SomeDut
+
+    when active
+        hookable write(v : uint<32>)
+            dut.addr = v
+        end write
+    end when
+end transactor X
+
+test T
+    let dut : SomeDut
+    let x : X passive
+    run
+        x.write(42)
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&parsed).unwrap_err();
+    assert!(
+        err.0.contains("x.write")
+            && err.0.contains("when active")
+            && err.0.contains("transactor `X`")
+            && err.0.contains("X active"),
+        "expected call-site passive error naming x.write, when active, X, and the fix; got: {}",
+        err.0,
+    );
+}
+
+/// Mode inheritance through env composition: `let e : E passive`
+/// where `E { drv : X }` makes `e.drv` passive even though no field-
+/// level annotation is present. A call to `e.drv.write(...)` (where
+/// `write` lives in `X.when_active`) must surface the same error.
+#[test]
+fn passive_instance_through_env_inheritance_errors_clearly() {
+    let parsed = parse_source(
+        r#"transactor X
+    dut : SomeDut
+
+    when active
+        hookable write(v : uint<32>)
+            dut.addr = v
+        end write
+    end when
+end transactor X
+
+env E
+    drv : X
+end env E
+
+test T
+    let dut : SomeDut
+    let e : E passive
+    run
+        e.drv.write(42)
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&parsed).unwrap_err();
+    assert!(
+        err.0.contains("e.drv.write")
+            && err.0.contains("when active")
+            && err.0.contains("transactor `X`"),
+        "expected env-inherited passive error naming e.drv.write + when active + X; got: {}",
+        err.0,
+    );
+}
+
+/// Positive case: the same call on an `active` instance compiles
+/// cleanly. Proves the fix the error message recommends actually
+/// works end-to-end (active mode dispatches into `when_active`
+/// methods normally).
+#[test]
+fn active_instance_calling_when_active_hookable_emits_cleanly() {
+    let parsed = parse_source(
+        r#"transactor X
+    dut : SomeDut
+
+    when active
+        hookable write(v : uint<32>)
+            dut.addr = v
+        end write
+    end when
+end transactor X
+
+test T
+    let dut : SomeDut
+    let x : X active
+    run
+        x.write(42)
+    end run
+end test T"#,
+    )
+    .unwrap();
+    cpp_tb::emit(&parsed)
+        .expect("active instance calling a when-active hookable should emit cleanly");
+}
+
+/// A `passive` instance calling an *always-on* hookable (one declared
+/// in `T.items`, not under `when active`) must keep working — that's
+/// the observer-helper shape (e.g. a scoreboard-mutating helper
+/// callable from observation handlers). Only `when active` methods
+/// are gated by the call-site check.
+#[test]
+fn passive_instance_calling_always_on_hookable_emits_cleanly() {
+    let parsed = parse_source(
+        r#"scoreboard S
+    count : uint<32> default 0
+end scoreboard S
+
+transactor X
+    sb : S
+
+    hookable bump()
+        sb.count = sb.count + 1
+    end bump
+end transactor X
+
+test T
+    let dut : SomeDut
+    let x : X passive
+    run
+        x.bump()
+    end run
+end test T"#,
+    )
+    .unwrap();
+    cpp_tb::emit(&parsed)
+        .expect("passive instance calling a non-drive always-on hookable should emit cleanly");
+}
+
 /// Negative case for the genuine-observer shape we want to keep
 /// working: an always-on `on bus.<ch>.handshake(t)` handler that
 /// only pushes into a scoreboard field (no DUT write, no bus send)
