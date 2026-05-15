@@ -1,5 +1,7 @@
 /target
 /harc_sim_build
+/harc_sim_build*/
+/third_party/z3/
 Cargo.lock
 *.swp
 *.log
