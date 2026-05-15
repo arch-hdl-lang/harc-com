@@ -5,7 +5,7 @@
 // value); the read side returns the value at search_first directly.
 //
 // The C++ TB pokes signals directly with no events, so the HARC port
-// uses a passive transactor with hookable methods — one per logical
+// uses an active transactor with hookable methods — one per logical
 // operation (write, reset). Search is just a combinational read so it
 // stays inline as `dut.search_key = X; wait 1 cycle`.
 
@@ -16,31 +16,33 @@ end domain SysDomain
 transactor CamValueXactor
     dut : Tag_Value_Cam
 
-    // Drive a single-cycle write with explicit value payload.
-    hookable write(idx: uint<3>, key: uint<16>, value: uint<32>, set: bool)
-        dut.write_valid = 1
-        dut.write_idx = idx
-        dut.write_key = key
-        dut.write_value = value
-        dut.write_set = set
-        wait 1 cycle
-        dut.write_valid = 0
-    end write
+    when active
+        // Drive a single-cycle write with explicit value payload.
+        hookable write(idx: uint<3>, key: uint<16>, value: uint<32>, set: bool)
+            dut.write_valid = 1
+            dut.write_idx = idx
+            dut.write_key = key
+            dut.write_value = value
+            dut.write_set = set
+            wait 1 cycle
+            dut.write_valid = 0
+        end write
 
-    // Reset pulse — matches the C++ TB's do_reset(): two ticks asserted,
-    // one tick deasserted.
-    hookable reset_dut()
-        dut.rst = 1
-        dut.write_valid = 0
-        wait 2 cycles
-        dut.rst = 0
-        wait 1 cycle
-    end reset_dut
+        // Reset pulse — matches the C++ TB's do_reset(): two ticks asserted,
+        // one tick deasserted.
+        hookable reset_dut()
+            dut.rst = 1
+            dut.write_valid = 0
+            wait 2 cycles
+            dut.rst = 0
+            wait 1 cycle
+        end reset_dut
+    end when
 end transactor CamValueXactor
 
 test CamValueBasicTest
     let dut  : Tag_Value_Cam
-    let xact : CamValueXactor passive
+    let xact : CamValueXactor active
 
     clock clk = SysDomain
 

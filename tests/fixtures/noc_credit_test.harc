@@ -18,36 +18,38 @@
 //   5. Final invariant: every popped flit's seq_no is exactly the
 //      previous + 1 → last_seq == popped_count - 1 (when saw_any).
 //
-// Helpers live on a passive transactor — `run_window` mirrors the
+// Helpers live on an active transactor — `run_window` mirrors the
 // C++ helper (set pressures, tick N cycles, return delta in
 // popped_count).
 
 transactor NocCreditXactor
     dut : NocCreditTop
 
-    hookable init_dut()
-        dut.rst = 1
-        dut.gen_pressure = 0
-        dut.pop_pressure = 0
-        wait 3 cycles
-        dut.rst = 0
-        wait 1 cycle
-    end init_dut
-
-    // Set pressure knobs and tick `cycles` cycles. Caller reads
-    // `dut.popped_count` / `dut.last_seq` / `dut.in_order` after.
-    hookable run_window(gen: uint<8>, pop: uint<8>, cycles: uint<32>)
-        dut.gen_pressure = gen
-        dut.pop_pressure = pop
-        for _ in 0 .. cycles
+    when active
+        hookable init_dut()
+            dut.rst = 1
+            dut.gen_pressure = 0
+            dut.pop_pressure = 0
+            wait 3 cycles
+            dut.rst = 0
             wait 1 cycle
-        end for
-    end run_window
+        end init_dut
+
+        // Set pressure knobs and tick `cycles` cycles. Caller reads
+        // `dut.popped_count` / `dut.last_seq` / `dut.in_order` after.
+        hookable run_window(gen: uint<8>, pop: uint<8>, cycles: uint<32>)
+            dut.gen_pressure = gen
+            dut.pop_pressure = pop
+            for _ in 0 .. cycles
+                wait 1 cycle
+            end for
+        end run_window
+    end when
 end transactor NocCreditXactor
 
 test NocCreditTest
     let dut  : NocCreditTop
-    let xact : NocCreditXactor passive
+    let xact : NocCreditXactor active
 
     run
         log(info, "NocCreditTop credit-channel test")
