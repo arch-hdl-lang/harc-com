@@ -27,37 +27,39 @@ end transaction AxilTxn
 transactor AxilXactor
     dut : AxiLiteRegs
 
-    hookable axil_write(addr: uint<8>, data: uint<32>)
-        dut.axil_aw_addr = addr
-        dut.axil_aw_valid = 1
-        dut.axil_w_data = data
-        dut.axil_w_strb = 15
-        dut.axil_w_valid = 1
-        wait 10 cycles
-        dut.axil_aw_valid = 0
-        dut.axil_w_valid = 0
-        wait 2 cycles
-    end axil_write
+    when active
+        hookable axil_write(addr: uint<8>, data: uint<32>)
+            dut.axil_aw_addr = addr
+            dut.axil_aw_valid = 1
+            dut.axil_w_data = data
+            dut.axil_w_strb = 15
+            dut.axil_w_valid = 1
+            wait 10 cycles
+            dut.axil_aw_valid = 0
+            dut.axil_w_valid = 0
+            wait 2 cycles
+        end axil_write
 
-    hookable axil_read(addr: uint<8>) -> uint<32>
-        let val = 0
-        let saw = 0
-        dut.axil_ar_addr = addr
-        dut.axil_ar_valid = 1
-        for _ in 0 .. 10
-            wait 1 cycle
-            if dut.axil_r_valid
-                if saw == 0
-                    val = dut.axil_r_data
-                    dut.axil_ar_valid = 0
-                    saw = 1
+        hookable axil_read(addr: uint<8>) -> uint<32>
+            let val = 0
+            let saw = 0
+            dut.axil_ar_addr = addr
+            dut.axil_ar_valid = 1
+            for _ in 0 .. 10
+                wait 1 cycle
+                if dut.axil_r_valid
+                    if saw == 0
+                        val = dut.axil_r_data
+                        dut.axil_ar_valid = 0
+                        saw = 1
+                    end if
                 end if
-            end if
-        end for
-        dut.axil_ar_valid = 0
-        wait 1 cycle
-        return val
-    end axil_read
+            end for
+            dut.axil_ar_valid = 0
+            wait 1 cycle
+            return val
+        end axil_read
+    end when
 end transactor AxilXactor
 
 scoreboard AxilSb
@@ -66,7 +68,7 @@ scoreboard AxilSb
 end scoreboard AxilSb
 
 env AxilEnv
-    drv : AxilXactor passive
+    drv : AxilXactor active
     sb  : AxilSb
 end env AxilEnv
 

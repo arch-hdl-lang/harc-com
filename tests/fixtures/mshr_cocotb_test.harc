@@ -16,7 +16,7 @@
 //   4. Simultaneous allocate + finalize: same-cycle assertion of
 //      both; allocate_id rolls forward to slot 1.
 //
-// Helpers live on a passive transactor (`MshrXactor`) — same
+// Helpers live on an active transactor (`MshrXactor`) — same
 // pattern as cpu_pipeline_test and linklist_doubly_test. Each
 // hookable mirrors a cocotb sequence.
 
@@ -27,58 +27,60 @@ const MSHR_SIZE : uint<32> = 32
 transactor MshrXactor
     dut : cache_mshr
 
-    // Reset pulse (matches cocotb reset_dut helper). Three half-
-    // cycles wide, mirroring the duration_ns=10 ns pattern.
-    hookable reset_dut()
-        dut.reset = 0
-        wait 1 cycle
-        dut.reset = 1
-        wait 2 cycles
-        dut.reset = 0
-        wait 1 cycle
-    end reset_dut
+    when active
+        // Reset pulse (matches cocotb reset_dut helper). Three half-
+        // cycles wide, mirroring the duration_ns=10 ns pattern.
+        hookable reset_dut()
+            dut.reset = 0
+            wait 1 cycle
+            dut.reset = 1
+            wait 2 cycles
+            dut.reset = 0
+            wait 1 cycle
+        end reset_dut
 
-    hookable init_dut()
-        dut.reset = 0
-        dut.allocate_valid = 0
-        dut.allocate_addr = 0
-        dut.allocate_rw = 0
-        dut.allocate_data = 0
-        dut.finalize_valid = 0
-        dut.finalize_id = 0
-        dut.fill_valid = 0
-        dut.fill_id = 0
-        dut.dequeue_ready = 0
-    end init
+        hookable init_dut()
+            dut.reset = 0
+            dut.allocate_valid = 0
+            dut.allocate_addr = 0
+            dut.allocate_rw = 0
+            dut.allocate_data = 0
+            dut.finalize_valid = 0
+            dut.finalize_id = 0
+            dut.fill_valid = 0
+            dut.fill_id = 0
+            dut.dequeue_ready = 0
+        end init
 
-    // Drive a single allocate request for one cycle and capture the
-    // assigned id.
-    hookable allocate_one(addr: uint<10>, rw: uint<1>, data: uint<32>) -> uint<5>
-        dut.allocate_valid = 1
-        dut.allocate_addr = addr
-        dut.allocate_rw = rw
-        dut.allocate_data = data
-        wait 1 cycle
-        let id = dut.allocate_id
-        dut.allocate_valid = 0
-        dut.allocate_addr = 0
-        dut.allocate_rw = 0
-        dut.allocate_data = 0
-        return id
-    end allocate_one
+        // Drive a single allocate request for one cycle and capture the
+        // assigned id.
+        hookable allocate_one(addr: uint<10>, rw: uint<1>, data: uint<32>) -> uint<5>
+            dut.allocate_valid = 1
+            dut.allocate_addr = addr
+            dut.allocate_rw = rw
+            dut.allocate_data = data
+            wait 1 cycle
+            let id = dut.allocate_id
+            dut.allocate_valid = 0
+            dut.allocate_addr = 0
+            dut.allocate_rw = 0
+            dut.allocate_data = 0
+            return id
+        end allocate_one
 
-    hookable finalize_one(id: uint<5>)
-        dut.finalize_valid = 1
-        dut.finalize_id = id
-        wait 1 cycle
-        dut.finalize_valid = 0
-        dut.finalize_id = 0
-    end finalize_one
+        hookable finalize_one(id: uint<5>)
+            dut.finalize_valid = 1
+            dut.finalize_id = id
+            wait 1 cycle
+            dut.finalize_valid = 0
+            dut.finalize_id = 0
+        end finalize_one
+    end when
 end transactor MshrXactor
 
 test MshrCocotbTest
     let dut  : cache_mshr
-    let xact : MshrXactor passive
+    let xact : MshrXactor active
 
     run
         log(info, "cache_mshr cocotb-style port — 4 sub-tests")

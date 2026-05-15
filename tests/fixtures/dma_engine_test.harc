@@ -20,8 +20,9 @@
 //     can't use the typed `bus.<ch>.handshake(beat)` form — that
 //     requires `<binding>_<chan>_<sig>` prefixed names. The cycle-
 //     trigger fallback is still a clean expression.)
-//   - `ApbXactor passive` — helper transactor with hookable
-//     `write` / `read` methods that drive the 2-phase APB sequence.
+//   - `ApbXactor active` — helper transactor with hookable
+//     `write` / `read` methods (in a `when active` block) that drive
+//     the 2-phase APB sequence.
 //     Call sites become a single line each (`apb.write(addr,
 //     data)`).
 
@@ -58,42 +59,44 @@ end transactor MemXactor
 transactor ApbXactor
     dut : DmaEngine
 
-    hookable write(addr: uint<8>, data: uint<32>)
-        // Phase 1: setup
-        dut.apb_sel    = 1
-        dut.apb_enable = 0
-        dut.apb_write  = 1
-        dut.apb_addr   = addr
-        dut.apb_wdata  = data
-        wait 1 cycle
-        // Phase 2: access
-        dut.apb_enable = 1
-        wait 1 cycle
-        // Deassert
-        dut.apb_sel    = 0
-        dut.apb_enable = 0
-        dut.apb_write  = 0
-    end write
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            // Phase 1: setup
+            dut.apb_sel    = 1
+            dut.apb_enable = 0
+            dut.apb_write  = 1
+            dut.apb_addr   = addr
+            dut.apb_wdata  = data
+            wait 1 cycle
+            // Phase 2: access
+            dut.apb_enable = 1
+            wait 1 cycle
+            // Deassert
+            dut.apb_sel    = 0
+            dut.apb_enable = 0
+            dut.apb_write  = 0
+        end write
 
-    hookable read(addr: uint<8>) -> uint<32>
-        dut.apb_sel    = 1
-        dut.apb_enable = 0
-        dut.apb_write  = 0
-        dut.apb_addr   = addr
-        wait 1 cycle
-        dut.apb_enable = 1
-        wait 1 cycle
-        let val = dut.apb_rdata
-        dut.apb_sel    = 0
-        dut.apb_enable = 0
-        return val
-    end read
+        hookable read(addr: uint<8>) -> uint<32>
+            dut.apb_sel    = 1
+            dut.apb_enable = 0
+            dut.apb_write  = 0
+            dut.apb_addr   = addr
+            wait 1 cycle
+            dut.apb_enable = 1
+            wait 1 cycle
+            let val = dut.apb_rdata
+            dut.apb_sel    = 0
+            dut.apb_enable = 0
+            return val
+        end read
+    end when
 end transactor ApbXactor
 
 test DmaEngineTest
     let dut : DmaEngine
     let mon : MemXactor passive
-    let apb : ApbXactor passive
+    let apb : ApbXactor active
 
     run
         log(info, "DmaEngine test — APB config + mem_rd/mem_wr handshake observation")

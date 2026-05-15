@@ -18,42 +18,44 @@
 //      slot stays oldest-wins per cam.search_first LSB priority.
 //
 // The C++ TB pokes signals directly with no transactor object, but
-// learn is a multi-signal sequence so it lives on a passive
+// learn is a multi-signal sequence so it lives on an active
 // transactor with a single hookable. Lookup stays inline — it's
 // just one assignment to `lookup_mac` plus a tick.
 
 transactor MacTableXactor
     dut : mac_table
 
-    // Drive a single learn pulse for one cycle.
-    hookable learn(mac: uint<48>, port_id: uint<2>, idx: uint<3>)
-        dut.learn_valid = 1
-        dut.learn_mac = mac
-        dut.learn_port = port_id
-        dut.learn_idx = idx
-        wait 1 cycle
-        dut.learn_valid = 0
-        dut.learn_mac = 0
-        dut.learn_port = 0
-        dut.learn_idx = 0
-    end learn
+    when active
+        // Drive a single learn pulse for one cycle.
+        hookable learn(mac: uint<48>, port_id: uint<2>, idx: uint<3>)
+            dut.learn_valid = 1
+            dut.learn_mac = mac
+            dut.learn_port = port_id
+            dut.learn_idx = idx
+            wait 1 cycle
+            dut.learn_valid = 0
+            dut.learn_mac = 0
+            dut.learn_port = 0
+            dut.learn_idx = 0
+        end learn
 
-    hookable init_dut()
-        dut.rst = 1
-        dut.learn_valid = 0
-        dut.learn_mac = 0
-        dut.learn_port = 0
-        dut.learn_idx = 0
-        dut.lookup_mac = 0
-        wait 2 cycles
-        dut.rst = 0
-        wait 1 cycle
-    end init_dut
+        hookable init_dut()
+            dut.rst = 1
+            dut.learn_valid = 0
+            dut.learn_mac = 0
+            dut.learn_port = 0
+            dut.learn_idx = 0
+            dut.lookup_mac = 0
+            wait 2 cycles
+            dut.rst = 0
+            wait 1 cycle
+        end init_dut
+    end when
 end transactor MacTableXactor
 
 test MacTableTest
     let dut  : mac_table
-    let xact : MacTableXactor passive
+    let xact : MacTableXactor active
 
     run
         log(info, "mac_table CAM-backed MAC learning test")
