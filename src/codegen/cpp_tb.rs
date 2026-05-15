@@ -411,10 +411,19 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
 
     // Seed let_types from test-level `let` decls so `randomize(t)` works
     // when the let appears at test scope (above any scope sim / bare stmts).
+    // Also seed let_modes from any `: T active`/`: T passive` annotation;
+    // the call-site passive-mode check (further down, in emit_expr) walks
+    // this map to determine the effective mode of `<env>.<sub>...<xact>`
+    // paths whose root resolves to a let-bound name.
     let mut let_types = std::collections::HashMap::new();
+    let mut let_modes_seed: std::collections::HashMap<String, TransactorMode> =
+        std::collections::HashMap::new();
     for l in &other_lets {
         if let Some(s) = type_simple_name(l.ty.as_ref()) {
             let_types.insert(l.name.name.clone(), s.to_string());
+        }
+        if let Some(TypeExpr::Named { mode: Some(m), .. }) = l.ty.as_ref() {
+            let_modes_seed.insert(l.name.name.clone(), *m);
         }
     }
 
@@ -456,6 +465,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         errors: Vec::new(),
         pointer_vars,
         let_types,
+        let_modes: let_modes_seed,
         transactions,
         scoreboards,
         components,
@@ -1909,6 +1919,17 @@ struct Emitter {
     /// `randomize_T()` function to call. Populated by `let t : T` and
     /// function parameters.
     let_types: std::collections::HashMap<String, String>,
+    /// Identifier → transactor mode, for let-bindings that carry a mode
+    /// annotation (`let x : T active`, `let env : E passive`). The mode
+    /// is recorded for the root let-name and forms the inheritance root
+    /// for nested sub-component / sub-transactor fields; resolution at
+    /// any path walks down field-by-field, with field-explicit modes
+    /// overriding the inherited mode (same model as
+    /// `emit_subcomponent_handler_registrations`). Used by the
+    /// call-site passive-mode check (spec §8.1): a method call that
+    /// resolves to a hookable inside `T.when_active` on a passive
+    /// instance is a HARC-level error.
+    let_modes: std::collections::HashMap<String, TransactorMode>,
     /// Set of transaction type names emitted in this file — guards against
     /// `randomize(t)` against a non-transaction type.
     transactions: std::collections::HashSet<String>,
@@ -4214,6 +4235,106 @@ impl Emitter {
         Some((cur_ty, path.join("."), method.name.clone()))
     }
 
+    /// Walk the field-access chain rooted at `callee` (which must be a
+    /// `Field { target, name }` call target) and return the path of
+    /// segment names from the root let-binding down to (but excluding)
+    /// the method name. Mirrors the path-extraction half of
+    /// `resolve_component_method_call`; factored out so the passive-mode
+    /// check can re-use the same path without duplicating the walker.
+    /// Returns `None` if the callee isn't a field-access chain rooted
+    /// at an `Ident`.
+    fn extract_method_call_path(callee: &Expr) -> Option<Vec<String>> {
+        let ExprKind::Field { target, name: _ } = &*callee.kind else {
+            return None;
+        };
+        let mut path: Vec<String> = Vec::new();
+        let mut cur: &Expr = target;
+        loop {
+            match &*cur.kind {
+                ExprKind::Field {
+                    target: inner,
+                    name,
+                } => {
+                    path.push(name.name.clone());
+                    cur = inner;
+                }
+                ExprKind::Ident(id) => {
+                    path.push(id.name.clone());
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        path.reverse();
+        Some(path)
+    }
+
+    /// Resolve the effective transactor mode at the end of a
+    /// field-access path. The root segment must be a let-bound name
+    /// whose mode is in `self.let_modes` (the inheritance root); each
+    /// subsequent segment can override via its field-level mode
+    /// annotation, otherwise it inherits. Same model as
+    /// `emit_subcomponent_handler_registrations` — kept here as a pure
+    /// `&self` resolver so the call-site check can run during
+    /// `emit_expr` without conflicting with the mutable emitter.
+    ///
+    /// Returns `None` when the root has no recorded mode (e.g. the
+    /// path roots at a non-transactor non-env let), or when an
+    /// intermediate type doesn't resolve cleanly. Both cases mean "no
+    /// passive-mode constraint to enforce at this site."
+    fn resolve_path_mode(&self, path: &[String]) -> Option<TransactorMode> {
+        let root = path.first()?;
+        let mut effective: Option<TransactorMode> = self.let_modes.get(root).copied();
+        let mut cur_ty: String = self.let_types.get(root)?.clone();
+        for seg in path.iter().skip(1) {
+            let lookup = |items: &[ComponentItem]| -> Option<(String, Option<TransactorMode>)> {
+                items.iter().find_map(|it| {
+                    if let ComponentItem::Field(f) = it {
+                        if &f.name.name == seg {
+                            let ty_name = type_simple_name(Some(&f.ty)).map(String::from)?;
+                            let mode = match &f.ty {
+                                TypeExpr::Named { mode: Some(m), .. } => Some(*m),
+                                _ => None,
+                            };
+                            return Some((ty_name, mode));
+                        }
+                    }
+                    None
+                })
+            };
+            let next = if let Some(comp) = self.components.get(&cur_ty) {
+                lookup(&comp.items)
+            } else if let Some(t) = self.transactors.get(&cur_ty) {
+                let synth = synth_component_from_transactor(t, /*include_active*/ true);
+                lookup(&synth.items)
+            } else {
+                None
+            };
+            let (ty, mode_opt) = next?;
+            cur_ty = ty;
+            if let Some(m) = mode_opt {
+                effective = Some(m);
+            }
+        }
+        effective
+    }
+
+    /// True iff `method_name` is declared as a `hookable` inside
+    /// `transactor_name`'s `when active { ... }` block (and is NOT also
+    /// shadowed in the always-on body — though that's a parse error in
+    /// practice).
+    fn method_lives_in_when_active(&self, transactor_name: &str, method_name: &str) -> bool {
+        let Some(t) = self.transactors.get(transactor_name) else {
+            return false;
+        };
+        let Some(when_active) = &t.when_active else {
+            return false;
+        };
+        when_active.iter().any(|it| {
+            matches!(it, ComponentItem::Hookable(h) if h.name.name == method_name)
+        })
+    }
+
     /// Emit a single `hookable` method on a component as a free
     /// `[&]`-capturing lambda named `<Type>_<method>`. The first
     /// parameter is `<Type>& self`; subsequent parameters mirror the
@@ -6314,6 +6435,13 @@ impl Emitter {
         if let Some(s) = type_simple_name(l.ty.as_ref()) {
             self.let_types.insert(l.name.name.clone(), s.to_string());
         }
+        // Track mode annotation for the call-site passive-mode check.
+        // Same gate as the pre-pass at lowering entry — only typed lets
+        // with an explicit `active`/`passive` populate; inheritance is
+        // resolved at lookup time via `resolve_path_mode`.
+        if let Some(TypeExpr::Named { mode: Some(m), .. }) = l.ty.as_ref() {
+            self.let_modes.insert(l.name.name.clone(), *m);
+        }
         // Bus binding: `let axil : BusAxiLite = bind dut`. Track the
         // (bus, dut-root) pair so subsequent `axil.signal` accesses
         // can lower to flat DUT signals (`dut->axil_signal`). The
@@ -7590,6 +7718,29 @@ impl Emitter {
                 if let Some((comp_ty, instance, method)) =
                     self.resolve_component_method_call(callee)
                 {
+                    // Passive-mode call-site check (spec §8.1):
+                    // a hookable declared inside `T.when_active` is
+                    // structurally absent from passive instances (the
+                    // `when_active` block is elided by
+                    // `synth_component_from_transactor` for passive).
+                    // Today both halves still emit as free C++ functions
+                    // — the actor coroutine is the only thing the
+                    // passive mode suppresses — so a `passive_instance
+                    // .when_active_method(...)` call would otherwise
+                    // silently dispatch into orphan code. Surface it.
+                    if self.method_lives_in_when_active(&comp_ty, &method) {
+                        let path = Self::extract_method_call_path(callee)
+                            .unwrap_or_else(|| vec![instance.clone()]);
+                        if let Some(TransactorMode::Passive) = self.resolve_path_mode(&path) {
+                            self.errors.push(format!(
+                                "method `{}.{}(...)`: hookable `{}` lives inside `when active` of transactor `{}`, \
+                                 so it does not exist on a passive instance. Change the let-binding to `{} active`, \
+                                 or remove the call. See spec §8.1.",
+                                instance, method, method, comp_ty, comp_ty,
+                            ));
+                            return;
+                        }
+                    }
                     write!(self.out, "{comp_ty}_{method}({instance}").ok();
                     for a in args.iter() {
                         write!(self.out, ", ").ok();
