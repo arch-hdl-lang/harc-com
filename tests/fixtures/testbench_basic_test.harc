@@ -38,33 +38,32 @@ testbench CounterTb
     end function bump
 end testbench CounterTb
 
-test TestbenchSmoke
-    let dut : Top
-    let tb  : CounterTb
-
+// `impl <name> for <Tb>` (docs/test-ergonomics.md §3.3) binds a test
+// to a testbench at declaration time. The testbench's fields and
+// helper methods fold into scope inside the bound test's body —
+// `reset()` resolves to `_tb.reset()`, bare `dut.signal` to
+// `_tb.dut->signal` (one VTop instance, two pointers via auto-wire).
+// No more `let dut` / `let tb` repetition; no more `tb.dut = dut`
+// boilerplate. The classic `test T { let dut; let tb; run; }` form
+// is still accepted in v0; Phase 2 removes it after the corpus sweep.
+impl TestbenchSmoke for CounterTb
     run
-        tb.dut = dut          // wire DUT pointer into the testbench, matches
-                              // the transactor `drv.dut = dut` convention.
-        tb.reset()
-        tb.bump(5)
+        reset()
+        bump(5)
         assert dut.count_out == 5
             else fail("smoke: count_out=${dut.count_out}, expected 5")
         log(info, "PASS: testbench-shared reset + bump")
     end run
-end test TestbenchSmoke
+end impl TestbenchSmoke
 
 // Second test reusing the same `CounterTb` declaration. Demonstrates
-// the line-saving win: no duplicated reset / bump sequences — both
-// tests call the shared `tb.reset()` and `tb.bump(N)`. Selected at
+// the line-saving win: both tests share reset / bump via the
+// testbench, with no per-test instantiation boilerplate. Selected at
 // the CLI via `--test`.
-test TestbenchEnableToggle
-    let dut : Top
-    let tb  : CounterTb
-
+impl TestbenchEnableToggle for CounterTb
     run
-        tb.dut = dut
-        tb.reset()
-        tb.bump(3)
+        reset()
+        bump(3)
         wait 3 cycles               // count holds while en=0
         let frozen = dut.count_out
         wait 5 cycles
@@ -72,4 +71,4 @@ test TestbenchEnableToggle
             else fail("toggle: count moved while en=0")
         log(info, "PASS: enable-toggle reuses CounterTb helpers")
     end run
-end test TestbenchEnableToggle
+end impl TestbenchEnableToggle
