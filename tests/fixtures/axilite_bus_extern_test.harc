@@ -13,9 +13,11 @@
 
 use BusAxiLite
 
-test AxiLiteBusExternTest
-    let dut : AxiLiteRegs
+testbench AxiLiteBusExternTb
+    dut : AxiLiteRegs
+end testbench AxiLiteBusExternTb
 
+impl AxiLiteBusExternTest for AxiLiteBusExternTb
     // BusAxiLite (from arch-com/stdlib) declares 5 channels:
     // aw / w / b / ar / r — each a handshake_channel with the AXI-Lite
     // payload signals. The binding name `axil` is the prefix on
@@ -84,5 +86,5 @@ test AxiLiteBusExternTest
             else fail("read got 0x${val:08x}, expected 0xDEADBEEF")
         log(info, "PASS: BusAxiLite (extern-imported) round-trip")
     end run
-end test AxiLiteBusExternTest
+end impl AxiLiteBusExternTest
 

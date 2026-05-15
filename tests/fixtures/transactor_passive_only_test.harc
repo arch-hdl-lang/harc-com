@@ -68,8 +68,11 @@ transactor AxilXactor bound to BusAxiLite
     end when
 end transactor AxilXactor
 
-test TransactorPassiveOnlyTest
-    let dut  : AxiLiteRegs
+testbench TransactorPassiveOnlyTb
+    dut : AxiLiteRegs
+end testbench TransactorPassiveOnlyTb
+
+impl TransactorPassiveOnlyTest for TransactorPassiveOnlyTb
     let axil : BusAxiLite = bind dut
     // Single passive instance — no `active` companion exists.
     let mon  : AxilXactor passive = bind axil
@@ -128,5 +131,5 @@ test TransactorPassiveOnlyTest
 
         log(info, "PASS: passive-only transactor observed 3 writes + 3 reads, active half cleanly elided")
     end run
-end test TransactorPassiveOnlyTest
+end impl TransactorPassiveOnlyTest
 

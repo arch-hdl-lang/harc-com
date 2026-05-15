@@ -14,9 +14,11 @@ domain DstDomain
   freq_mhz: 133
 end domain DstDomain
 
-test PtrSyncTest
-    let dut : PtrSync
+testbench PtrSyncTb
+    dut : PtrSync
+end testbench PtrSyncTb
 
+impl PtrSyncTest for PtrSyncTb
     clock dst_clk = DstDomain    // 133 MHz — primary, drives the sync chain
     clock src_clk = SrcDomain    // 100 MHz — unused inside DUT, just for completeness
 
@@ -54,5 +56,5 @@ test PtrSyncTest
             else fail("v=5 after reset: data_out=${dut.data_out}")
         log(info, "PASS: clean restart after mid-stream reset")
     end run
-end test PtrSyncTest
+end impl PtrSyncTest
 

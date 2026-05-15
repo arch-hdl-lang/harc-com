@@ -14,9 +14,11 @@
 // into a single 64-bit word, so we drive/read `dut.src`/`dut.dst` as a
 // uint<64> with byte i at bits [8*i +: 8].
 
-test InstVecPortRegressionTest
-    let dut : Top
+testbench InstVecPortRegressionTb
+    dut : Top
+end testbench InstVecPortRegressionTb
 
+impl InstVecPortRegressionTest for InstVecPortRegressionTb
     run
         log(info, "inst_vec_port_regression sim")
 
@@ -56,5 +58,5 @@ test InstVecPortRegressionTest
 
         log(info, "PASS: 8 vec lanes mirror end-to-end")
     end run
-end test InstVecPortRegressionTest
+end impl InstVecPortRegressionTest
 

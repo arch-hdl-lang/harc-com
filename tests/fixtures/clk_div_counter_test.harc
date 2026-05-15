@@ -12,9 +12,11 @@ domain ClkDomain
   freq_mhz: 100
 end domain ClkDomain
 
-test ClkDivCounterTest
-    let dut : ClkDivCounter
+testbench ClkDivCounterTb
+    dut : ClkDivCounter
+end testbench ClkDivCounterTb
 
+impl ClkDivCounterTest for ClkDivCounterTb
     clock clk = ClkDomain        // 100 MHz → 10 ns period
 
     run
@@ -41,5 +43,5 @@ test ClkDivCounterTest
         end for
         log(info, "PASS: counter tracks div_clk rising edges over 8 fast cycles")
     end run
-end test ClkDivCounterTest
+end impl ClkDivCounterTest
 

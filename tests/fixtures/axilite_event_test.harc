@@ -23,9 +23,11 @@ scoreboard EvSb
     pairs : uint<32> default 0
 end scoreboard EvSb
 
-test AxiLiteEventTest
-    let dut : AxiLiteRegs
+testbench AxiLiteEventTb
+    dut : AxiLiteRegs
+end testbench AxiLiteEventTb
 
+impl AxiLiteEventTest for AxiLiteEventTb
     run
         log(info, "starting AxiLiteRegs event-driven scoreboard test")
 
@@ -77,7 +79,7 @@ test AxiLiteEventTest
         assert sb.pairs == 5 else fail("expected 5 paired R/W operations, saw ${sb.pairs}")
         log(info, "PASS: ${sb.pairs} event-driven write/read pairs verified by scoreboard")
     end check
-end test AxiLiteEventTest
+end impl AxiLiteEventTest
 
 // Sim scope: events decouple test body (producer) from scoreboard (consumer).
 

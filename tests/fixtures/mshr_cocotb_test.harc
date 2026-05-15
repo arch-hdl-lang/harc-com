@@ -78,9 +78,12 @@ transactor MshrXactor
     end when
 end transactor MshrXactor
 
-test MshrCocotbTest
-    let dut  : cache_mshr
-    let xact : MshrXactor active
+testbench MshrCocotbTb
+    dut  : cache_mshr
+    xact : MshrXactor active
+end testbench MshrCocotbTb
+
+impl MshrCocotbTest for MshrCocotbTb
 
     run
         log(info, "cache_mshr cocotb-style port — 4 sub-tests")
@@ -177,5 +180,5 @@ test MshrCocotbTest
 
         log(info, "ALL 4 SUB-TESTS PASSED — cache_mshr cocotb-port coverage")
     end run
-end test MshrCocotbTest
+end impl MshrCocotbTest
 

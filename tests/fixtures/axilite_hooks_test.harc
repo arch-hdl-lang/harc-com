@@ -56,10 +56,12 @@ transactor HookXactor
     end when
 end transactor HookXactor
 
-test AxiLiteHooksTest
-    let dut : AxiLiteRegs
-    let drv : HookXactor active
+testbench AxiLiteHooksTb
+    dut : AxiLiteRegs
+    drv : HookXactor active
+end testbench AxiLiteHooksTb
 
+impl AxiLiteHooksTest for AxiLiteHooksTb
     // Pre/post hook counters live at test scope so the hook bodies
     // can mutate them by-reference via [&] capture.
     let pre_count : uint<32> = 0
@@ -131,5 +133,5 @@ test AxiLiteHooksTest
             else fail("post_value_sum=${post_value_sum}, expected ${total}")
         log(info, "PASS: pre_count=${pre_count}, post_count=${post_count}, sum matches")
     end run
-end test AxiLiteHooksTest
+end impl AxiLiteHooksTest
 

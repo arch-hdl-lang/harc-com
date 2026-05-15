@@ -65,8 +65,11 @@ regblock DmaRegs via AxilHelper width 32
     register S2MM_SA   @ 0x20 access wo
 end regblock DmaRegs
 
-test RegblockAccessTest
-    let dut    : AxiLiteRegs
+testbench RegblockAccessTb
+    dut : AxiLiteRegs
+end testbench RegblockAccessTb
+
+impl RegblockAccessTest for RegblockAccessTb
     let axil   : BusAxiLite = bind dut
     let helper : AxilHelper active = bind axil
     let regs   : DmaRegs = bind helper
@@ -122,4 +125,4 @@ test RegblockAccessTest
 
         log(info, "PASS: ro suppresses bus write; rw round-trips with mirror predict; wo serves reads from mirror")
     end run
-end test RegblockAccessTest
+end impl RegblockAccessTest

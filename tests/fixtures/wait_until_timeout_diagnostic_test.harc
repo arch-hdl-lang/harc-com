@@ -23,9 +23,11 @@ domain SysDomain
   freq_mhz: 100
 end domain SysDomain
 
-test WaitUntilTimeoutDemoTest
-    let dut : Top
+testbench WaitUntilTimeoutDemoTb
+    dut : Top
+end testbench WaitUntilTimeoutDemoTb
 
+impl WaitUntilTimeoutDemoTest for WaitUntilTimeoutDemoTb
     clock clk = SysDomain
 
     run
@@ -44,5 +46,5 @@ test WaitUntilTimeoutDemoTest
 
         log(info, "DEMO: wait-until timeout fired as expected")
     end run
-end test WaitUntilTimeoutDemoTest
+end impl WaitUntilTimeoutDemoTest
 

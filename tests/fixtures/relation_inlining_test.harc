@@ -41,9 +41,11 @@ relation HighAddr(r: Req) = r.addr >= 0x10000
 // expansion flattens all three relations into the same solver block.
 relation BoundedAndHigh(r: Req) = Bounded(r) && HighAddr(r)
 
-test RelationInliningTest
-    let dut : Top
+testbench RelationInliningTb
+    dut : Top
+end testbench RelationInliningTb
 
+impl RelationInliningTest for RelationInliningTb
     clock clk = SysDomain
 
     run
@@ -72,5 +74,5 @@ test RelationInliningTest
 
         log(info, "PASS: 20 randomize-with-relation calls satisfied all 3 inlined constraints")
     end run
-end test RelationInliningTest
+end impl RelationInliningTest
 

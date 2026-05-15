@@ -29,12 +29,13 @@ env HeartbeatEnv
     sb   : DrainSb
 end env HeartbeatEnv
 
-test EnvQuiescedPhaseTest
-    let dut : Top
+testbench EnvQuiescedPhaseTb
+    dut : Top
+    top : HeartbeatEnv
+end testbench EnvQuiescedPhaseTb
 
+impl EnvQuiescedPhaseTest for EnvQuiescedPhaseTb
     clock clk = SysDomain
-
-    let top : HeartbeatEnv
 
     phase drain
         wait until all of top.quiesced(8), top.prod.seen == 3
@@ -70,5 +71,5 @@ test EnvQuiescedPhaseTest
             else fail("scoreboard queue did not drain")
         log(info, "PASS: environment drain/check phases completed")
     end check
-end test EnvQuiescedPhaseTest
+end impl EnvQuiescedPhaseTest
 

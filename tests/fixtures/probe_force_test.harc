@@ -19,7 +19,10 @@
 // through `alu0.a` (combinational forwarding), then releasing and
 // confirming the natural value returns.
 
-test ProbeForceTest
+testbench ProbeForceTb
+end testbench ProbeForceTb
+
+impl ProbeForceTest for ProbeForceTb
     let dut : CpuPipe
         probe alu_a       : uint<32> at alu0.a
         probe force inject_rs1 : uint<32> at decode_rs1_val
@@ -71,4 +74,4 @@ test ProbeForceTest
 
         log(info, "PASS: probe force injected 0xDEADBEEF, release restored natural flow")
     end run
-end test ProbeForceTest
+end impl ProbeForceTest

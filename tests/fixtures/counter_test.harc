@@ -6,9 +6,11 @@
 //   harc sim   counter_test.harc counter_test_sim.harc   --dut wrap_counter.arch
 //   harc formal counter_test.harc counter_test_formal.harc      (future)
 
-test CounterTest
-    let dut : WrapCounter
+testbench WrapCounterTb
+    dut : WrapCounter
+end testbench WrapCounterTb
 
+impl CounterTest for WrapCounterTb
     run
         // Hold reset for 2 cycles, init inputs.
         dut.rst = 1
@@ -37,7 +39,7 @@ test CounterTest
         assert dut.value == 0 else fail("hold failed")
         log(info, "PASS: hold when inc=0")
     end run
-end test CounterTest
+end impl CounterTest
 
 // Sim-scope of CounterTest. Generates clock + reset, walks 0..15, checks
 // at_max + wrap + hold semantics. Mirrors examples/counter_tb.cpp end-to-end.

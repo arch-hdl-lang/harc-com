@@ -112,10 +112,12 @@ tseq RandomTxns(n: int) -> TSeq<RegOp>
     end for
 end tseq RandomTxns
 
-test AxiLiteConnectTest
-    let dut : AxiLiteRegs
-    let env : AxilEnv
+testbench AxiLiteConnectTb
+    dut : AxiLiteRegs
+    env : AxilEnv
+end testbench AxiLiteConnectTb
 
+impl AxiLiteConnectTest for AxiLiteConnectTb
     run
         log(info, "AxiLiteRegs env+connect test (sequencer→transactor via event bridge)")
         env.drv.dut = dut
@@ -169,5 +171,5 @@ test AxiLiteConnectTest
 
         log(info, "PASS: 5 sequencer→transactor round-trips via `connect` event bridge")
     end run
-end test AxiLiteConnectTest
+end impl AxiLiteConnectTest
 

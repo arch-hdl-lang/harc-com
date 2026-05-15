@@ -12,9 +12,11 @@ domain DstDomain
   freq_mhz: 250
 end domain DstDomain
 
-test BusSyncTest
-    let dut : BusSync
+testbench BusSyncTb
+    dut : BusSync
+end testbench BusSyncTb
 
+impl BusSyncTest for BusSyncTb
     clock src_clk = SrcDomain    // 100 MHz — primary
     clock dst_clk = DstDomain    // 250 MHz
 
@@ -67,5 +69,5 @@ test BusSyncTest
             else fail("after reset: data_out=${dut.data_out:08x}, expected 0")
         log(info, "PASS: reset clears state")
     end run
-end test BusSyncTest
+end impl BusSyncTest
 

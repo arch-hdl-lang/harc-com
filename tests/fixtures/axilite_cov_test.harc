@@ -27,9 +27,11 @@ covergroup AxiCov @(posedge dut.clk)
         end bins
 end covergroup AxiCov
 
-test AxiLiteCovTest
-    let dut : AxiLiteRegs
+testbench AxiLiteCovTb
+    dut : AxiLiteRegs
+end testbench AxiLiteCovTb
 
+impl AxiLiteCovTest for AxiLiteCovTb
     run
         log(info, "starting AxiLiteRegs coverage test")
 
@@ -83,7 +85,7 @@ test AxiLiteCovTest
 
         log(info, "coverage assertions passed")
     end check
-end test AxiLiteCovTest
+end impl AxiLiteCovTest
 
 // Drive a mix of register addresses + random data, then print the
 // coverage report at end of test. Tests:

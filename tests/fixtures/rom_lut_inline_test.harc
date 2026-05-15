@@ -26,10 +26,12 @@ covergroup RomCovInline @(posedge dut.clk)
         end bins
 end covergroup RomCovInline
 
-test RomLutInlineTest
-    let dut : RomLut
-    let cov : RomCovInline
+testbench RomLutInlineTb
+    dut : RomLut
+    cov : RomCovInline
+end testbench RomLutInlineTb
 
+impl RomLutInlineTest for RomLutInlineTb
     run
         dut.rd_addr = 0
         dut.rd_en = 0
@@ -52,4 +54,4 @@ test RomLutInlineTest
         assert cov.cp_addr.a0 > 0 else fail("addr 0 coverage hole")
         assert cov.cp_addr.a7 > 0 else fail("addr 7 coverage hole")
     end check
-end test RomLutInlineTest
+end impl RomLutInlineTest

@@ -13,9 +13,11 @@ function write_reg(dut: IntRegs, addr: uint<5>, data: uint<8>)
     wait 1 cycle
 end function write_reg
 
-test IntRegsTest
-    let dut : IntRegs
+testbench IntRegsTb
+    dut : IntRegs
+end testbench IntRegsTb
 
+impl IntRegsTest for IntRegsTb
     run
         // Reset
         dut.rst = 1
@@ -72,5 +74,5 @@ test IntRegsTest
 
         dut.write_en = 0
     end run
-end test IntRegsTest
+end impl IntRegsTest
 

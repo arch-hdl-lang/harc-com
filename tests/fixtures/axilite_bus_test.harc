@@ -33,9 +33,11 @@ bus AxiLiteBus
     end handshake_channel r
 end bus AxiLiteBus
 
-test AxiLiteBusTest
-    let dut : AxiLiteRegs
+testbench AxiLiteBusTb
+    dut : AxiLiteRegs
+end testbench AxiLiteBusTb
 
+impl AxiLiteBusTest for AxiLiteBusTb
     // Bus binding: `axil` becomes a type-checked alias for the AXI-
     // Lite signal group on `dut`. The binding name is the prefix —
     // `axil.aw.addr` lowers to `dut->axil_aw_addr`.
@@ -99,5 +101,5 @@ test AxiLiteBusTest
             else fail("read got 0x${val:08x}, expected 0xCAFEBABE")
         log(info, "PASS: bus-typed AXI-Lite write/read round-trip")
     end run
-end test AxiLiteBusTest
+end impl AxiLiteBusTest
 

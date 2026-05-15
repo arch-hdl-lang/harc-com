@@ -61,10 +61,12 @@ transactor AesXactor
     end when
 end transactor AesXactor
 
-test AesCipherTopTest
-    let dut  : AesCipherTop
-    let xact : AesXactor active
+testbench AesCipherTopTb
+    dut  : AesCipherTop
+    xact : AesXactor active
+end testbench AesCipherTopTb
 
+impl AesCipherTopTest for AesCipherTopTb
     run
         log(info, "AES-128 encryption test (FIPS-197 + zero vector)")
         xact.dut = dut
@@ -97,5 +99,5 @@ test AesCipherTopTest
 
         log(info, "ALL 2 SUB-TESTS PASSED — AES-128 cipher")
     end run
-end test AesCipherTopTest
+end impl AesCipherTopTest
 
