@@ -529,8 +529,18 @@ fn print_component_item(out: &mut String, it: &ComponentItem, depth: usize) {
             print_on_handler(out, h, depth);
         }
         ComponentItem::Hookable(h) => {
+            // Round-trip the introducer + the matching closer per the
+            // `is_hookable` discriminator (docs/test-ergonomics.md §3.2).
+            // `hookable` methods preserve their existing `end <name>`
+            // closing form (an early HARC convention). `function`
+            // methods use `end function [<name>]` so the closer
+            // mirrors the opener.
             pad(out, depth);
-            write!(out, "hookable {}", h.name.name).ok();
+            if h.is_hookable {
+                write!(out, "hookable {}", h.name.name).ok();
+            } else {
+                write!(out, "function {}", h.name.name).ok();
+            }
             print_paren_params(out, &h.params);
             if let Some(rt) = &h.return_ty {
                 write!(out, " -> ").ok();
@@ -539,7 +549,11 @@ fn print_component_item(out: &mut String, it: &ComponentItem, depth: usize) {
             writeln!(out).ok();
             print_block_inner(out, &h.body, depth + 1);
             pad(out, depth);
-            writeln!(out, "end {}", h.name.name).ok();
+            if h.is_hookable {
+                writeln!(out, "end {}", h.name.name).ok();
+            } else {
+                writeln!(out, "end function {}", h.name.name).ok();
+            }
         }
         ComponentItem::Apply(a) => {
             pad(out, depth);

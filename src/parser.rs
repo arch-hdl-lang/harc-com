@@ -685,6 +685,13 @@ impl Parser {
             Some(TokenKind::Connect) => Ok(ComponentItem::Connect(self.parse_connect_block()?)),
             Some(TokenKind::On) => Ok(ComponentItem::OnHandler(self.parse_on_handler()?)),
             Some(TokenKind::Hookable) => Ok(ComponentItem::Hookable(self.parse_hookable()?)),
+            // `function name(...) ... end function` — non-hookable
+            // method on the enclosing component. Stored in the same
+            // AST slot as `hookable` (HookableMethod with
+            // `is_hookable = false`); codegen suppresses the pre/post
+            // hook-vector machinery for it. Docs/test-ergonomics.md
+            // §3.2 covers the surface.
+            Some(TokenKind::Function) => Ok(ComponentItem::Hookable(self.parse_component_function()?)),
             Some(TokenKind::Apply) => Ok(ComponentItem::Apply(self.parse_apply()?)),
             Some(TokenKind::Watchdog) => Ok(ComponentItem::Watchdog(self.parse_watchdog()?)),
             _ => Ok(ComponentItem::Field(self.parse_component_field(doc)?)),
@@ -950,6 +957,42 @@ impl Parser {
             return_ty,
             body: Block { stmts, span: body_start.merge(end) },
             span: start.merge(end),
+            is_hookable: true,
+        })
+    }
+
+    /// Parse `function name(params) [-> Type] ... end function [name]`
+    /// inside a component body (testbench / env / agent / sequencer).
+    /// Same shape as `hookable`, but the resulting `HookableMethod`
+    /// carries `is_hookable = false` so codegen skips the pre/post
+    /// hook-vector emission and the corresponding fan-out in the
+    /// method body. See docs/test-ergonomics.md §3.2.
+    ///
+    /// The `end` form accepts both `end function` and `end function
+    /// <name>` (matching the open form), with the same lenient
+    /// fallback as `parse_hookable`.
+    fn parse_component_function(&mut self) -> Result<HookableMethod, CompileError> {
+        let start = self.expect(TokenKind::Function)?.span;
+        let name = self.expect_ident()?;
+        let params = self.parse_paren_params()?;
+        let return_ty = if self.check(TokenKind::RArrow) {
+            self.advance();
+            Some(self.parse_type_expr()?)
+        } else {
+            None
+        };
+        let body_start = self.peek_span();
+        let stmts = self.parse_stmt_list_until_end()?;
+        let end = self.expect_end(TokenKind::Function, &name.name).or_else(|_| {
+            Ok::<Span, CompileError>(body_start)
+        })?;
+        Ok(HookableMethod {
+            name,
+            params,
+            return_ty,
+            body: Block { stmts, span: body_start.merge(end) },
+            span: start.merge(end),
+            is_hookable: false,
         })
     }
 
