@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use miette::{IntoDiagnostic, NamedSource, Report, Result};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Parser, Debug)]
@@ -112,6 +112,15 @@ enum Cmd {
         /// the scoreboard calls to compute expected outputs.
         #[arg(long)]
         ref_src: Vec<PathBuf>,
+        /// Z3 installation prefix. Looks for include/z3++.h and lib*/libz3.
+        #[arg(long)]
+        z3_root: Option<PathBuf>,
+        /// Explicit Z3 include directory containing z3++.h.
+        #[arg(long)]
+        z3_include_dir: Option<PathBuf>,
+        /// Explicit Z3 library directory containing libz3.
+        #[arg(long)]
+        z3_lib_dir: Option<PathBuf>,
     },
     // ── Learning store (sister to `arch advise` and friends, port of
     // arch-com/src/learn.rs). Every `harc check` / `harc sim` records
@@ -187,15 +196,52 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Check { files, ast } => learn_wrap(&files, || cmd_check(files.clone(), ast)),
         Cmd::Fmt { file, write } => cmd_fmt(file, write),
-        Cmd::Sim { files, dut, sv, top, test, outdir, seed, emit_only, arch_bin, mt, coverage, ref_src } => {
+        Cmd::Sim {
+            files,
+            dut,
+            sv,
+            top,
+            test,
+            outdir,
+            seed,
+            emit_only,
+            arch_bin,
+            mt,
+            coverage,
+            ref_src,
+            z3_root,
+            z3_include_dir,
+            z3_lib_dir,
+        } => {
             let captured = files.clone();
-            learn_wrap(&captured, || cmd_sim(
-                files.clone(), dut.clone(), sv.clone(), top.clone(), test.clone(),
-                outdir.clone(), seed, emit_only, arch_bin.clone(), mt, coverage, ref_src.clone(),
-            ))
+            learn_wrap(&captured, || {
+                cmd_sim(
+                    files.clone(),
+                    dut.clone(),
+                    sv.clone(),
+                    top.clone(),
+                    test.clone(),
+                    outdir.clone(),
+                    seed,
+                    emit_only,
+                    arch_bin.clone(),
+                    mt,
+                    coverage,
+                    ref_src.clone(),
+                    Z3PathOpts {
+                        root: z3_root.clone(),
+                        include_dir: z3_include_dir.clone(),
+                        lib_dir: z3_lib_dir.clone(),
+                    },
+                )
+            })
         }
-        Cmd::Advise { query, top, from_stderr, feature } =>
-            cmd_advise(query, top, from_stderr, feature),
+        Cmd::Advise {
+            query,
+            top,
+            from_stderr,
+            feature,
+        } => cmd_advise(query, top, from_stderr, feature),
         Cmd::LearnBootstrap { path } => cmd_learn_bootstrap(&path),
         Cmd::LearnIndex => {
             let n = harc::learn::build_index().map_err(|e| miette::miette!("{}", e))?;
@@ -211,13 +257,19 @@ fn main() -> Result<()> {
             eprintln!("Cleared ~/.harc/learn/");
             Ok(())
         }
-        Cmd::LearnPrune { code, contains, older_than_days, dry_run } => {
+        Cmd::LearnPrune {
+            code,
+            contains,
+            older_than_days,
+            dry_run,
+        } => {
             let (kept, removed) = harc::learn::prune(
                 code.as_deref(),
                 contains.as_deref(),
                 older_than_days,
                 dry_run,
-            ).map_err(|e| miette::miette!("{}", e))?;
+            )
+            .map_err(|e| miette::miette!("{}", e))?;
             if dry_run {
                 eprintln!("[dry-run] would remove {removed} event(s); {kept} would remain.");
             } else {
@@ -226,6 +278,161 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+#[derive(Debug, Default, Clone)]
+struct Z3PathOpts {
+    root: Option<PathBuf>,
+    include_dir: Option<PathBuf>,
+    lib_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct Z3Paths {
+    include_dir: Option<PathBuf>,
+    lib_dir: Option<PathBuf>,
+}
+
+fn z3_include_dir(dir: &Path) -> Option<PathBuf> {
+    dir.join("z3++.h").exists().then(|| dir.to_path_buf())
+}
+
+fn z3_lib_dir(dir: &Path) -> Option<PathBuf> {
+    ["libz3.so", "libz3.dylib", "libz3.a"]
+        .iter()
+        .any(|name| dir.join(name).exists())
+        .then(|| dir.to_path_buf())
+}
+
+fn z3_root_dirs(root: &Path) -> Z3Paths {
+    Z3Paths {
+        include_dir: z3_include_dir(&root.join("include")),
+        lib_dir: z3_lib_dir(&root.join("lib")).or_else(|| z3_lib_dir(&root.join("lib64"))),
+    }
+}
+
+fn resolve_z3_paths(opts: &Z3PathOpts) -> Z3Paths {
+    let env_root = std::env::var_os("HARC_Z3_ROOT").map(PathBuf::from);
+    let env_include = std::env::var_os("HARC_Z3_INCLUDE_DIR").map(PathBuf::from);
+    let env_lib = std::env::var_os("HARC_Z3_LIB_DIR").map(PathBuf::from);
+    resolve_z3_paths_with(
+        opts,
+        env_root.as_deref(),
+        env_include.as_deref(),
+        env_lib.as_deref(),
+        Path::new("."),
+    )
+}
+
+fn resolve_z3_paths_with(
+    opts: &Z3PathOpts,
+    env_root: Option<&Path>,
+    env_include: Option<&Path>,
+    env_lib: Option<&Path>,
+    repo_root: &Path,
+) -> Z3Paths {
+    let mut out = Z3Paths::default();
+    let mut include_locked = false;
+    let mut lib_locked = false;
+
+    let apply_explicit = |inc: Option<&Path>,
+                          lib: Option<&Path>,
+                          out: &mut Z3Paths,
+                          include_locked: &mut bool,
+                          lib_locked: &mut bool| {
+        if !*include_locked {
+            if let Some(inc) = inc {
+                out.include_dir = z3_include_dir(inc);
+                *include_locked = true;
+            }
+        }
+        if !*lib_locked {
+            if let Some(lib) = lib {
+                out.lib_dir = z3_lib_dir(lib);
+                *lib_locked = true;
+            }
+        }
+    };
+
+    apply_explicit(
+        opts.include_dir.as_deref(),
+        opts.lib_dir.as_deref(),
+        &mut out,
+        &mut include_locked,
+        &mut lib_locked,
+    );
+    apply_explicit(
+        env_include,
+        env_lib,
+        &mut out,
+        &mut include_locked,
+        &mut lib_locked,
+    );
+
+    let local_root = repo_root.join("third_party/z3");
+    for root in [opts.root.as_deref(), env_root, Some(local_root.as_path())]
+        .into_iter()
+        .flatten()
+    {
+        let candidate = z3_root_dirs(root);
+        if !include_locked && out.include_dir.is_none() {
+            out.include_dir = candidate.include_dir;
+        }
+        if !lib_locked && out.lib_dir.is_none() {
+            out.lib_dir = candidate.lib_dir;
+        }
+    }
+
+    for (inc, lib) in [
+        (
+            Path::new("/opt/homebrew/include"),
+            Path::new("/opt/homebrew/lib"),
+        ),
+        (Path::new("/usr/local/include"), Path::new("/usr/local/lib")),
+        (Path::new("/usr/include"), Path::new("/usr/lib")),
+        (
+            Path::new("/usr/include"),
+            Path::new("/usr/lib/x86_64-linux-gnu"),
+        ),
+        (
+            Path::new("/usr/include"),
+            Path::new("/usr/lib/aarch64-linux-gnu"),
+        ),
+    ] {
+        if !include_locked && out.include_dir.is_none() {
+            out.include_dir = z3_include_dir(inc);
+        }
+        if !lib_locked && out.lib_dir.is_none() {
+            out.lib_dir = z3_lib_dir(lib);
+        }
+    }
+
+    out
+}
+
+fn prepend_env_path(cmd: &mut Command, name: &str, path: &Path) -> Result<()> {
+    let mut paths = vec![path.to_path_buf()];
+    if let Some(existing) = std::env::var_os(name) {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    let joined = std::env::join_paths(paths).into_diagnostic()?;
+    cmd.env(name, joined);
+    Ok(())
+}
+
+fn ensure_z3_for_solver(paths: &Z3Paths) -> Result<()> {
+    if paths.include_dir.is_some() && paths.lib_dir.is_some() {
+        return Ok(());
+    }
+    let missing = match (&paths.include_dir, &paths.lib_dir) {
+        (None, None) => "include and library directories",
+        (None, Some(_)) => "include directory",
+        (Some(_), None) => "library directory",
+        (Some(_), Some(_)) => unreachable!(),
+    };
+    Err(miette::miette!(
+        "Z3 is required for this test's constraint-randomization, but the Z3 {missing} could not be resolved. Set HARC_Z3_ROOT=/path/to/z3, pass --z3-root /path/to/z3, or pass --z3-include-dir and --z3-lib-dir explicitly."
+    ))
 }
 
 /// Wrap a `harc check` / `harc sim` invocation with learning capture.
@@ -262,9 +469,7 @@ where
                     // covered that case.
                     if let Ok(ast) = harc::parser::parse_source(&src) {
                         let file_path = path_str.clone();
-                        let _ = harc::learn::harvest_features(&ast, |_item| {
-                            file_path.clone()
-                        });
+                        let _ = harc::learn::harvest_features(&ast, |_item| file_path.clone());
                     }
                 }
             }
@@ -305,9 +510,13 @@ fn cmd_advise(query: Vec<String>, top: usize, from_stderr: bool, feature: bool) 
     if from_stderr {
         use std::io::Read;
         let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf).into_diagnostic()?;
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .into_diagnostic()?;
         if !buf.trim().is_empty() {
-            if !q.is_empty() { q.push(' '); }
+            if !q.is_empty() {
+                q.push(' ');
+            }
             q.push_str(buf.trim());
         }
     }
@@ -321,9 +530,17 @@ fn cmd_advise(query: Vec<String>, top: usize, from_stderr: bool, feature: bool) 
     let pool_size = if feature { top.max(1) * 8 } else { top };
     let matches = harc::learn::advise(&q, pool_size).map_err(|e| miette::miette!("{}", e))?;
     let matches: Vec<_> = if feature {
-        matches.into_iter().filter(|m| m.event.kind == "feature").take(top).collect()
+        matches
+            .into_iter()
+            .filter(|m| m.event.kind == "feature")
+            .take(top)
+            .collect()
     } else {
-        matches.into_iter().filter(|m| m.event.kind != "feature").take(top).collect()
+        matches
+            .into_iter()
+            .filter(|m| m.event.kind != "feature")
+            .take(top)
+            .collect()
     };
     if matches.is_empty() {
         eprintln!("No matches.");
@@ -332,7 +549,9 @@ fn cmd_advise(query: Vec<String>, top: usize, from_stderr: bool, feature: bool) 
     for (i, m) in matches.iter().enumerate() {
         println!(
             "── match #{} (score {:.3}, retrieved {}×) ──────────────────────",
-            i + 1, m.score, m.retrieved_count
+            i + 1,
+            m.score,
+            m.retrieved_count
         );
         if m.event.kind == "feature" {
             // Feature event: file::construct + doc snippet.
@@ -456,7 +675,9 @@ fn resolve_use_imports(
     let mut search: Vec<PathBuf> = Vec::new();
     if let Ok(envp) = std::env::var("HARC_LIB_PATH") {
         for p in envp.split(':') {
-            if !p.is_empty() { search.push(PathBuf::from(p)); }
+            if !p.is_empty() {
+                search.push(PathBuf::from(p));
+            }
         }
     }
     let input_dir = first_input
@@ -470,24 +691,36 @@ fn resolve_use_imports(
     search.push(PathBuf::from("../arch-com/examples"));
 
     let mut imported: Vec<harc::ast::SourceFile> = Vec::new();
-    let mut already: std::collections::HashSet<String> = files.iter()
-        .flat_map(|f| f.items.iter().filter_map(|it| match it {
-            Item::Bus(b) => Some(b.name.name.clone()),
-            _ => None,
-        }))
+    let mut already: std::collections::HashSet<String> = files
+        .iter()
+        .flat_map(|f| {
+            f.items.iter().filter_map(|it| match it {
+                Item::Bus(b) => Some(b.name.name.clone()),
+                _ => None,
+            })
+        })
         .collect();
 
     for name in &wanted {
-        if already.contains(name) { continue; }
+        if already.contains(name) {
+            continue;
+        }
         let mut found_path: Option<PathBuf> = None;
         for dir in &search {
             for ext in &["arch", "harc"] {
                 let candidate = dir.join(format!("{name}.{ext}"));
-                if candidate.exists() { found_path = Some(candidate); break; }
+                if candidate.exists() {
+                    found_path = Some(candidate);
+                    break;
+                }
             }
-            if found_path.is_some() { break; }
+            if found_path.is_some() {
+                break;
+            }
         }
-        let Some(path) = found_path else { continue; };
+        let Some(path) = found_path else {
+            continue;
+        };
 
         let src = match fs::read_to_string(&path) {
             Ok(s) => s,
@@ -495,14 +728,18 @@ fn resolve_use_imports(
         };
         let parsed = match harc::parser::parse_source(&src) {
             Ok(p) => p,
-            Err(_) => continue,  // skip files we can't parse
+            Err(_) => continue, // skip files we can't parse
         };
-        let bus_only: Vec<Item> = parsed.items.into_iter()
+        let bus_only: Vec<Item> = parsed
+            .items
+            .into_iter()
             .filter(|it| matches!(it, Item::Bus(_)))
             .collect();
         if !bus_only.is_empty() {
             for it in &bus_only {
-                if let Item::Bus(b) = it { already.insert(b.name.name.clone()); }
+                if let Item::Bus(b) = it {
+                    already.insert(b.name.name.clone());
+                }
             }
             imported.push(harc::ast::SourceFile {
                 items: bus_only,
@@ -517,10 +754,7 @@ fn resolve_use_imports(
 fn parse_file(path: &PathBuf) -> Result<harc::ast::SourceFile> {
     let src = fs::read_to_string(path).into_diagnostic()?;
     harc::parser::parse_source(&src).map_err(|e| {
-        Report::new(e).with_source_code(NamedSource::new(
-            path.display().to_string(),
-            src,
-        ))
+        Report::new(e).with_source_code(NamedSource::new(path.display().to_string(), src))
     })
 }
 
@@ -535,7 +769,11 @@ fn cmd_check(files: Vec<PathBuf>, ast: bool) -> Result<()> {
         }
     }
     if !ast {
-        println!("ok: {} file(s), {} top-level item(s)", files.len(), total_items);
+        println!(
+            "ok: {} file(s), {} top-level item(s)",
+            files.len(),
+            total_items
+        );
     }
     Ok(())
 }
@@ -564,40 +802,18 @@ fn run_verilator(
     seed: Option<u64>,
     coverage: bool,
     ref_src: &[PathBuf],
+    z3_paths: &Z3Paths,
 ) -> Result<()> {
     let mdir = outdir_abs.join("obj_dir");
     let _ = fs::remove_dir_all(&mdir); // start clean — stale .o's bite us
     fs::create_dir_all(&mdir).into_diagnostic()?;
 
-    // Detect Z3 (Homebrew on macOS, /usr/{include,lib} on Linux). When
-    // present, link it so the generated TB can use the inline solver path
-    // for `randomize(t) with <constraints>`. When absent, the build still
-    // works for solver-free TBs; constraint TBs would fail at link time
-    // with a clearer error than verilator default.
-    let z3_inc = ["/opt/homebrew/include", "/usr/local/include", "/usr/include"]
-        .iter().map(PathBuf::from).find(|p| p.join("z3++.h").exists());
-    // Lib search path. The Ubuntu / Debian multiarch entries
-    // (`/usr/lib/x86_64-linux-gnu`, `/usr/lib/aarch64-linux-gnu`) are
-    // where `apt install libz3-dev` actually lands the `.so` — plain
-    // `/usr/lib` doesn't contain it on those distros. Without those
-    // entries, the Linux CI runner's link step would skip `-L<dir>
-    // -lz3` entirely and the Z3-using fixtures (`keep_constraints_test`,
-    // `relation_inlining_test`, anything else that calls `randomize(t)
-    // with …` against keeps) fail with a wall of unresolved
-    // `Z3_get_*` symbols.
-    let z3_lib = [
-        "/opt/homebrew/lib",
-        "/usr/local/lib",
-        "/usr/lib",
-        "/usr/lib/x86_64-linux-gnu",
-        "/usr/lib/aarch64-linux-gnu",
-    ].iter().map(PathBuf::from).find(|p| {
-        p.join("libz3.dylib").exists() || p.join("libz3.so").exists()
-    });
-
     let mut args: Vec<String> = vec![
-        "--cc".into(), "--exe".into(), "--build".into(),
-        "-Wno-fatal".into(), "-Wno-WIDTH".into(),
+        "--cc".into(),
+        "--exe".into(),
+        "--build".into(),
+        "-Wno-fatal".into(),
+        "-Wno-WIDTH".into(),
         // Tolerate SV quirks Xcelium accepts but Verilator escalates:
         //   BLKANDNBLK — same variable written by `=` in one block
         //                and `<=` in another. Common in CVDP DUTs
@@ -607,7 +823,8 @@ fn run_verilator(
         //                that Verilator's optimizer flags as
         //                potentially looped (false positive on most
         //                CVDP DUTs).
-        "-Wno-BLKANDNBLK".into(), "-Wno-UNOPTFLAT".into(),
+        "-Wno-BLKANDNBLK".into(),
+        "-Wno-UNOPTFLAT".into(),
         // Cycle-based TBs don't need delay semantics; tell Verilator
         // to elide `#N` delay statements rather than refusing to
         // elaborate. HARC's `wait N cycles` is always cycle-based
@@ -615,8 +832,10 @@ fn run_verilator(
         // are a property of the DUT author, not the TB, and CVDP
         // coverage scoring ignores delay semantics too.
         "--no-timing".into(),
-        "--top-module".into(), top.into(),
-        "--Mdir".into(), mdir.display().to_string(),
+        "--top-module".into(),
+        top.into(),
+        "--Mdir".into(),
+        mdir.display().to_string(),
     ];
     if coverage {
         // Enable Verilator coverage on the DUT — full umbrella
@@ -687,13 +906,17 @@ fn run_verilator(
     // `obj_dir/` (cwd at compile time) and the header lives one level up.
     args.push("-CFLAGS".into());
     args.push(format!("-I{}", outdir_abs.display()));
-    if let Some(inc) = &z3_inc {
+    if let Some(inc) = &z3_paths.include_dir {
         args.push("-CFLAGS".into());
         args.push(format!("-I{}", inc.display()));
     }
-    if let Some(lib) = &z3_lib {
+    if let Some(lib) = &z3_paths.lib_dir {
         args.push("-LDFLAGS".into());
-        args.push(format!("-L{} -lz3", lib.display()));
+        args.push(format!(
+            "-L{} -Wl,-rpath,{} -lz3",
+            lib.display(),
+            lib.display()
+        ));
     }
     for s in sv {
         args.push(s.display().to_string());
@@ -732,16 +955,23 @@ fn run_verilator(
     }
     eprintln!("build.log written to {}", build_log_path.display());
     if !output.status.success() {
-        return Err(miette::miette!("verilator build failed (status {})", output.status));
+        return Err(miette::miette!(
+            "verilator build failed (status {})",
+            output.status
+        ));
     }
 
     let bin = mdir.join(format!("V{top}"));
     eprintln!("running: {}", bin.display());
     let mut cmd = Command::new(&bin);
     cmd.env("HARC_SIM_LOG", sim_log_path)
-       .env("HARC_LOG_DIR", outdir_abs);
+        .env("HARC_LOG_DIR", outdir_abs);
     if let Some(s) = seed {
         cmd.env("HARC_SEED", s.to_string());
+    }
+    if let Some(lib) = &z3_paths.lib_dir {
+        prepend_env_path(&mut cmd, "LD_LIBRARY_PATH", lib)?;
+        prepend_env_path(&mut cmd, "DYLD_LIBRARY_PATH", lib)?;
     }
     let status = cmd.status().into_diagnostic()?;
     if status.success() {
@@ -765,9 +995,12 @@ fn cmd_sim(
     mt: bool,
     coverage: bool,
     ref_src: Vec<PathBuf>,
+    z3_opts: Z3PathOpts,
 ) -> Result<()> {
     if dut.is_empty() && sv.is_empty() {
-        return Err(miette::miette!("pass either --dut <file.arch> or --sv <file.sv>"));
+        return Err(miette::miette!(
+            "pass either --dut <file.arch> or --sv <file.sv>"
+        ));
     }
 
     // Parse every input file, then fold `extend test T` blocks into their
@@ -790,12 +1023,18 @@ fn cmd_sim(
     let merged = harc::codegen::merge::merge_for_sim(&all_files, test.as_deref())
         .map_err(|e| miette::miette!("{}", e))?;
 
-    let cpp = harc::codegen::cpp_tb::emit_with_opts(&merged, harc::codegen::cpp_tb::EmitOpts { mt })
-        .map_err(|e| miette::miette!("{}", e))?;
+    let cpp =
+        harc::codegen::cpp_tb::emit_with_opts(&merged, harc::codegen::cpp_tb::EmitOpts { mt })
+            .map_err(|e| miette::miette!("{}", e))?;
+    let uses_solver = harc::codegen::cpp_tb::uses_constraint_solver(&merged);
+    let z3_paths = resolve_z3_paths(&z3_opts);
 
     let outdir = outdir.unwrap_or_else(|| PathBuf::from("harc_sim_build"));
     fs::create_dir_all(&outdir).into_diagnostic()?;
-    let stem = files[0].file_stem().and_then(|s| s.to_str()).unwrap_or("harc_tb");
+    let stem = files[0]
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("harc_tb");
     let cpp_path = outdir.join(format!("{stem}.cpp"));
     fs::write(&cpp_path, &cpp).into_diagnostic()?;
     eprintln!("emitted {}", cpp_path.display());
@@ -807,8 +1046,7 @@ fn cmd_sim(
     // `include_str!` so a binary install of `harc` ships the runtime
     // without a separate file dependency.
     let rt_header_path = outdir.join("harc_thread_rt.h");
-    fs::write(&rt_header_path, harc::codegen::cpp_tb::THREAD_RT_HEADER)
-        .into_diagnostic()?;
+    fs::write(&rt_header_path, harc::codegen::cpp_tb::THREAD_RT_HEADER).into_diagnostic()?;
 
     if emit_only {
         return Ok(());
@@ -819,12 +1057,18 @@ fn cmd_sim(
     let sim_log_path = outdir_abs.join("sim.log");
 
     if !sv.is_empty() {
+        if uses_solver {
+            ensure_z3_for_solver(&z3_paths)?;
+        }
         // SV / Verilator path — no `arch sim` involvement. Resolves the top
         // module name from `--top` if given, else from the HARC `let dut : T`.
-        let top_name = top.or_else(|| harc::codegen::cpp_tb::dut_type_name(&merged))
-            .ok_or_else(|| miette::miette!(
-                "could not determine SV top module — pass --top or declare `let dut : T`"
-            ))?;
+        let top_name = top
+            .or_else(|| harc::codegen::cpp_tb::dut_type_name(&merged))
+            .ok_or_else(|| {
+                miette::miette!(
+                    "could not determine SV top module — pass --top or declare `let dut : T`"
+                )
+            })?;
         let mut sv_abs = Vec::with_capacity(sv.len() + 1);
         for s in &sv {
             sv_abs.push(fs::canonicalize(s).into_diagnostic()?);
@@ -852,7 +1096,17 @@ fn cmd_sim(
         for r in &ref_src {
             ref_src_abs.push(fs::canonicalize(r).into_diagnostic()?);
         }
-        return run_verilator(&top_name, &sv_abs, &cpp_abs, &outdir_abs, &sim_log_path, seed, coverage, &ref_src_abs);
+        return run_verilator(
+            &top_name,
+            &sv_abs,
+            &cpp_abs,
+            &outdir_abs,
+            &sim_log_path,
+            seed,
+            coverage,
+            &ref_src_abs,
+            &z3_paths,
+        );
     }
 
     // ARCH path: run `arch sim <dut...> --tb <cpp_path>`.
@@ -862,7 +1116,11 @@ fn cmd_sim(
     }
 
     let (program, mut prefix_args, working_dir) = match &arch_bin {
-        Some(p) => (p.clone(), Vec::<String>::new(), std::env::current_dir().into_diagnostic()?),
+        Some(p) => (
+            p.clone(),
+            Vec::<String>::new(),
+            std::env::current_dir().into_diagnostic()?,
+        ),
         None => {
             // Default: invoke arch via cargo against the sibling arch-com checkout.
             // Working dir = the arch-com root so its relative paths (runtime/, etc.) resolve.
@@ -910,12 +1168,12 @@ fn cmd_sim(
     eprintln!("running: {} {}", program.display(), prefix_args.join(" "));
     let mut cmd = Command::new(&program);
     cmd.args(&prefix_args)
-       .current_dir(&working_dir)
-       .env("HARC_SIM_LOG", &sim_log_path)
-       // Anchor relative `logf("foo.log", ...)` paths to the build dir so
-       // per-component log files land next to sim.log instead of under
-       // arch-com/ (where the binary actually runs from).
-       .env("HARC_LOG_DIR", &outdir_abs);
+        .current_dir(&working_dir)
+        .env("HARC_SIM_LOG", &sim_log_path)
+        // Anchor relative `logf("foo.log", ...)` paths to the build dir so
+        // per-component log files land next to sim.log instead of under
+        // arch-com/ (where the binary actually runs from).
+        .env("HARC_LOG_DIR", &outdir_abs);
     if let Some(s) = seed {
         cmd.env("HARC_SEED", s.to_string());
     }
@@ -927,4 +1185,169 @@ fn cmd_sim(
         return Err(miette::miette!("arch sim exited with status {status}"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "harc-z3-test-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn make_include(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("z3++.h"), "").unwrap();
+    }
+
+    fn make_lib(dir: &Path, name: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(name), "").unwrap();
+    }
+
+    fn make_root(root: &Path, lib_subdir: &str, lib_name: &str) {
+        make_include(&root.join("include"));
+        make_lib(&root.join(lib_subdir), lib_name);
+    }
+
+    #[test]
+    fn z3_resolver_prefers_cli_explicit_over_env() {
+        let base = temp_dir("explicit");
+        let cli_inc = base.join("cli/include");
+        let cli_lib = base.join("cli/lib");
+        let env_inc = base.join("env/include");
+        let env_lib = base.join("env/lib");
+        make_include(&cli_inc);
+        make_lib(&cli_lib, "libz3.so");
+        make_include(&env_inc);
+        make_lib(&env_lib, "libz3.dylib");
+
+        let paths = resolve_z3_paths_with(
+            &Z3PathOpts {
+                root: None,
+                include_dir: Some(cli_inc.clone()),
+                lib_dir: Some(cli_lib.clone()),
+            },
+            None,
+            Some(&env_inc),
+            Some(&env_lib),
+            &base,
+        );
+
+        assert_eq!(paths.include_dir.as_deref(), Some(cli_inc.as_path()));
+        assert_eq!(paths.lib_dir.as_deref(), Some(cli_lib.as_path()));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn z3_resolver_uses_env_explicit_before_cli_root() {
+        let base = temp_dir("env-before-root");
+        let env_inc = base.join("env/include");
+        let env_lib = base.join("env/lib");
+        let cli_root = base.join("cli-root");
+        make_include(&env_inc);
+        make_lib(&env_lib, "libz3.a");
+        make_root(&cli_root, "lib", "libz3.so");
+
+        let paths = resolve_z3_paths_with(
+            &Z3PathOpts {
+                root: Some(cli_root),
+                include_dir: None,
+                lib_dir: None,
+            },
+            None,
+            Some(&env_inc),
+            Some(&env_lib),
+            &base,
+        );
+
+        assert_eq!(paths.include_dir.as_deref(), Some(env_inc.as_path()));
+        assert_eq!(paths.lib_dir.as_deref(), Some(env_lib.as_path()));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn z3_resolver_checks_root_lib64_and_repo_local() {
+        let base = temp_dir("root-lib64");
+        let env_root = base.join("env-root");
+        let local_root = base.join("third_party/z3");
+        make_root(&env_root, "lib64", "libz3.so");
+        make_root(&local_root, "lib", "libz3.dylib");
+
+        let paths =
+            resolve_z3_paths_with(&Z3PathOpts::default(), Some(&env_root), None, None, &base);
+
+        assert_eq!(
+            paths.include_dir.as_deref(),
+            Some(env_root.join("include").as_path())
+        );
+        assert_eq!(
+            paths.lib_dir.as_deref(),
+            Some(env_root.join("lib64").as_path())
+        );
+
+        let local_paths = resolve_z3_paths_with(&Z3PathOpts::default(), None, None, None, &base);
+        assert_eq!(
+            local_paths.include_dir.as_deref(),
+            Some(local_root.join("include").as_path())
+        );
+        assert_eq!(
+            local_paths.lib_dir.as_deref(),
+            Some(local_root.join("lib").as_path())
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn z3_resolver_bad_explicit_does_not_fall_back() {
+        let base = temp_dir("bad-explicit");
+        let local_root = base.join("third_party/z3");
+        make_root(&local_root, "lib", "libz3.so");
+
+        let paths = resolve_z3_paths_with(
+            &Z3PathOpts {
+                root: None,
+                include_dir: Some(base.join("missing-include")),
+                lib_dir: Some(base.join("missing-lib")),
+            },
+            None,
+            None,
+            None,
+            &base,
+        );
+
+        assert!(paths.include_dir.is_none());
+        assert!(paths.lib_dir.is_none());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn detects_constraint_solver_for_keep_backed_randomize() {
+        let src = r#"
+            transaction Req
+                len : uint<8>
+                keep len in [1..16]
+            end transaction Req
+
+            test T
+                let dut : Top
+
+                run
+                    let t : Req
+                    randomize(t)
+                end run
+            end test
+        "#;
+        let file = harc::parser::parse_source(src).unwrap();
+        assert!(harc::codegen::cpp_tb::uses_constraint_solver(&file));
+    }
 }

@@ -209,7 +209,10 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                         probe_accessors.insert(
                             p.name.name.clone(),
                             ProbeAccessor {
-                                read: crate::codegen::sv_stub::mangled_accessor(ty_name, &p.name.name),
+                                read: crate::codegen::sv_stub::mangled_accessor(
+                                    ty_name,
+                                    &p.name.name,
+                                ),
                                 force: p.force,
                             },
                         );
@@ -528,7 +531,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // Multi-actor parallelism (driver + monitor coroutines on the same
     // bus) lands in Phase 2 on top of the same runtime.
     writeln!(e.out, "#include \"harc_thread_rt.h\"").ok();
-    let uses_solver = file_uses_constraint_solver(file);
+    let uses_solver = uses_constraint_solver(file);
     if uses_solver {
         writeln!(
             e.out,
@@ -710,12 +713,14 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                 e.out,
                 "struct {}_AddrEntry {{ const char* name; uint64_t offset; uint32_t width; }};",
                 r.name.name,
-            ).ok();
+            )
+            .ok();
             writeln!(
                 e.out,
                 "static constexpr {}_AddrEntry {}_AddrTable[] = {{",
                 r.name.name, r.name.name,
-            ).ok();
+            )
+            .ok();
             for reg in &r.registers {
                 let w = reg.width.unwrap_or(default_w);
                 let off = c_int_literal_from(&reg.offset.kind);
@@ -723,7 +728,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                     e.out,
                     "{INDENT}{{ \"{name}\", {off}, {w} }},",
                     name = reg.name.name,
-                ).ok();
+                )
+                .ok();
             }
             writeln!(e.out, "}};").ok();
             writeln!(e.out, "").ok();
@@ -750,7 +756,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                         "{INDENT}// {name}: alias of {target} — shares mirror",
                         name = inst.name.name,
                         target = inst.alias_of.as_ref().unwrap().name,
-                    ).ok();
+                    )
+                    .ok();
                     continue;
                 }
                 writeln!(
@@ -758,7 +765,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                     "{INDENT}{ty}_Mirror {name};",
                     ty = inst.regblock_ty.name,
                     name = inst.name.name,
-                ).ok();
+                )
+                .ok();
             }
             writeln!(e.out, "}};").ok();
             writeln!(e.out, "").ok();
@@ -830,21 +838,42 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // its implementation. Wrap in a single `extern "C" { … }` block
     // so even C++ source files that don't add their own `extern "C"`
     // get the right calling convention.
-    let extern_fns: Vec<&ExternFnDecl> = file.items.iter().filter_map(|it| match it {
-        Item::ExternFn(f) => Some(f),
-        _ => None,
-    }).collect();
+    let extern_fns: Vec<&ExternFnDecl> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::ExternFn(f) => Some(f),
+            _ => None,
+        })
+        .collect();
     if !extern_fns.is_empty() {
-        writeln!(e.out, "// extern reference functions (spec §9) — implementations").ok();
-        writeln!(e.out, "// supplied via `harc sim --ref-src <file>` and linked into the").ok();
+        writeln!(
+            e.out,
+            "// extern reference functions (spec §9) — implementations"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "// supplied via `harc sim --ref-src <file>` and linked into the"
+        )
+        .ok();
         writeln!(e.out, "// verilator-built binary.").ok();
         writeln!(e.out, "extern \"C\" {{").ok();
         for f in &extern_fns {
-            let ret = f.return_ty.as_ref().map(c_type_for).unwrap_or_else(|| "void".to_string());
+            let ret = f
+                .return_ty
+                .as_ref()
+                .map(c_type_for)
+                .unwrap_or_else(|| "void".to_string());
             write!(e.out, "{INDENT}{ret} {}(", f.name.name).ok();
             for (i, p) in f.params.iter().enumerate() {
-                if i > 0 { write!(e.out, ", ").ok(); }
-                let pty = p.ty.as_ref().map(c_type_for).unwrap_or_else(|| "int64_t".to_string());
+                if i > 0 {
+                    write!(e.out, ", ").ok();
+                }
+                let pty =
+                    p.ty.as_ref()
+                        .map(c_type_for)
+                        .unwrap_or_else(|| "int64_t".to_string());
                 write!(e.out, "{pty} {}", p.name.name).ok();
             }
             writeln!(e.out, ");").ok();
@@ -1246,7 +1275,10 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                                 for entry in &l.bind_remap {
                                     if entry.path.len() == 2 {
                                         map.insert(
-                                            (entry.path[0].name.clone(), entry.path[1].name.clone()),
+                                            (
+                                                entry.path[0].name.clone(),
+                                                entry.path[1].name.clone(),
+                                            ),
                                             entry.port.clone(),
                                         );
                                     }
@@ -1834,8 +1866,12 @@ struct ProbeAccessor {
 }
 
 impl ProbeAccessor {
-    fn drive(&self) -> String { format!("{}_drv", self.read) }
-    fn enable(&self) -> String { format!("{}_en", self.read) }
+    fn drive(&self) -> String {
+        format!("{}_drv", self.read)
+    }
+    fn enable(&self) -> String {
+        format!("{}_en", self.read)
+    }
 }
 
 struct Emitter {
@@ -1985,7 +2021,8 @@ struct Emitter {
     /// to the `<prefix>_<channel>_<signal>` convention. Empty for
     /// binds without a `with { ... }` clause — most fixtures sit
     /// in this bucket.
-    bus_remap: std::collections::HashMap<String, std::collections::HashMap<(String, String), String>>,
+    bus_remap:
+        std::collections::HashMap<String, std::collections::HashMap<(String, String), String>>,
     /// True while emitting statements *directly inside the test's run
     /// coroutine body* (the `scope sim/run` block plus bare test-level
     /// stmts). When set, `wait N cycles`, bare `tick()` (the bus
@@ -4972,14 +5009,17 @@ impl Emitter {
     /// downstream translator surfaces a "constraint expression not
     /// supported" error with a useful span — better than swallowing.
     fn try_expand_top_level_call(&self, e: &Expr) -> Option<Vec<Expr>> {
-        let ExprKind::Call { callee, args } = &*e.kind else { return None; };
-        let ExprKind::Ident(id) = &*callee.kind else { return None; };
+        let ExprKind::Call { callee, args } = &*e.kind else {
+            return None;
+        };
+        let ExprKind::Ident(id) = &*callee.kind else {
+            return None;
+        };
         let rel = self.relations.get(&id.name)?;
         if rel.params.len() != args.len() {
             return None;
         }
-        let mut subst: std::collections::HashMap<String, Expr> =
-            std::collections::HashMap::new();
+        let mut subst: std::collections::HashMap<String, Expr> = std::collections::HashMap::new();
         for (p, a) in rel.params.iter().zip(args.iter()) {
             let arg_expr = match a {
                 CallArg::Expr(ex) => ex.clone(),
@@ -4988,11 +5028,10 @@ impl Emitter {
             subst.insert(p.name.name.clone(), arg_expr);
         }
         let body_exprs: Vec<Expr> = match &rel.body {
-            RelationBody::Block(exprs) => exprs.iter()
-                .map(|x| substitute_idents(x, &subst))
-                .collect(),
-            RelationBody::Alias(expr) =>
-                vec![substitute_idents(expr, &subst)],
+            RelationBody::Block(exprs) => {
+                exprs.iter().map(|x| substitute_idents(x, &subst)).collect()
+            }
+            RelationBody::Alias(expr) => vec![substitute_idents(expr, &subst)],
         };
         Some(body_exprs)
     }
@@ -5009,7 +5048,8 @@ impl Emitter {
         // bodies, build the AND-of-all-body-exprs expression so the
         // call site (which expected one Expr) gets one Expr back.
         if let Some(body_exprs) = self.try_expand_top_level_call(expr) {
-            let exprs: Vec<Expr> = body_exprs.iter()
+            let exprs: Vec<Expr> = body_exprs
+                .iter()
                 .map(|x| self.expand_relation_subtree(x))
                 .collect();
             return and_join(&exprs, span);
@@ -5021,22 +5061,25 @@ impl Emitter {
             },
             ExprKind::Index { target, index } => ExprKind::Index {
                 target: self.expand_relation_subtree(target),
-                index:  self.expand_relation_subtree(index),
+                index: self.expand_relation_subtree(index),
             },
             ExprKind::BitSlice { target, hi, lo } => ExprKind::BitSlice {
                 target: self.expand_relation_subtree(target),
-                hi:     self.expand_relation_subtree(hi),
-                lo:     self.expand_relation_subtree(lo),
+                hi: self.expand_relation_subtree(hi),
+                lo: self.expand_relation_subtree(lo),
             },
             ExprKind::Call { callee, args } => ExprKind::Call {
                 callee: self.expand_relation_subtree(callee),
-                args: args.iter().map(|a| match a {
-                    CallArg::Expr(e) => CallArg::Expr(self.expand_relation_subtree(e)),
-                    CallArg::Named { name, value } => CallArg::Named {
-                        name: name.clone(),
-                        value: self.expand_relation_subtree(value),
-                    },
-                }).collect(),
+                args: args
+                    .iter()
+                    .map(|a| match a {
+                        CallArg::Expr(e) => CallArg::Expr(self.expand_relation_subtree(e)),
+                        CallArg::Named { name, value } => CallArg::Named {
+                            name: name.clone(),
+                            value: self.expand_relation_subtree(value),
+                        },
+                    })
+                    .collect(),
             },
             ExprKind::Cast { expr, ty } => ExprKind::Cast {
                 expr: self.expand_relation_subtree(expr),
@@ -5051,18 +5094,25 @@ impl Emitter {
                 lhs: self.expand_relation_subtree(lhs),
                 rhs: self.expand_relation_subtree(rhs),
             },
-            ExprKind::Ternary { cond, then_branch, else_branch } => ExprKind::Ternary {
-                cond:        self.expand_relation_subtree(cond),
+            ExprKind::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => ExprKind::Ternary {
+                cond: self.expand_relation_subtree(cond),
                 then_branch: self.expand_relation_subtree(then_branch),
                 else_branch: self.expand_relation_subtree(else_branch),
             },
             ExprKind::Paren(inner) => ExprKind::Paren(self.expand_relation_subtree(inner)),
             ExprKind::Membership { expr, set } => ExprKind::Membership {
                 expr: self.expand_relation_subtree(expr),
-                set:  self.expand_relation_subtree(set),
+                set: self.expand_relation_subtree(set),
             },
             ExprKind::SetLit(items) => ExprKind::SetLit(
-                items.iter().map(|x| self.expand_relation_subtree(x)).collect()
+                items
+                    .iter()
+                    .map(|x| self.expand_relation_subtree(x))
+                    .collect(),
             ),
             ExprKind::RangeLit { lo, hi } => ExprKind::RangeLit {
                 lo: lo.as_ref().map(|x| self.expand_relation_subtree(x)),
@@ -6866,8 +6916,12 @@ impl Emitter {
 
         let default_w = block.default_width.unwrap_or(32);
         self.pad(depth);
-        writeln!(self.out, "// bitbash({}) — RAL walk-all over RW regs of {}",
-            regs_id.name, regs_ty).ok();
+        writeln!(
+            self.out,
+            "// bitbash({}) — RAL walk-all over RW regs of {}",
+            regs_id.name, regs_ty
+        )
+        .ok();
         for reg in &block.registers {
             let w = reg.width.unwrap_or(default_w);
             let mask: u64 = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
@@ -6875,9 +6929,13 @@ impl Emitter {
             let regname = &reg.name.name;
             if !reg.access.writes_to_bus() || !reg.access.reads_from_bus() {
                 self.pad(depth);
-                writeln!(self.out,
+                writeln!(
+                    self.out,
                     "// bitbash: skipping {} (access {})",
-                    regname, reg.access.keyword()).ok();
+                    regname,
+                    reg.access.keyword()
+                )
+                .ok();
                 continue;
             }
             // Two patterns: all-ones (masked to register width), then
@@ -6891,8 +6949,11 @@ impl Emitter {
                 self.pad(depth + 1);
                 writeln!(self.out, "{helper_ty}_write({helper_var}, {off}, _bb_pat);").ok();
                 self.pad(depth + 1);
-                writeln!(self.out,
-                    "uint64_t _bb_got = {helper_ty}_read({helper_var}, {off});").ok();
+                writeln!(
+                    self.out,
+                    "uint64_t _bb_got = {helper_ty}_read({helper_var}, {off});"
+                )
+                .ok();
                 self.pad(depth + 1);
                 writeln!(self.out, "if (_bb_got != _bb_pat) {{").ok();
                 self.pad(depth + 2);
@@ -6921,10 +6982,18 @@ impl Emitter {
         &self,
         target: &Expr,
     ) -> Option<(String, String, String, String, String, RegAccess)> {
-        let ExprKind::Field { target: mid, name: reg_name } = &*target.kind else {
+        let ExprKind::Field {
+            target: mid,
+            name: reg_name,
+        } = &*target.kind
+        else {
             return None;
         };
-        let ExprKind::Field { target: outer, name: inst_name } = &*mid.kind else {
+        let ExprKind::Field {
+            target: outer,
+            name: inst_name,
+        } = &*mid.kind
+        else {
             return None;
         };
         let ExprKind::Ident(chip_id) = &*outer.kind else {
@@ -6932,19 +7001,34 @@ impl Emitter {
         };
         let chip_ty = self.let_types.get(&chip_id.name)?;
         let amap = self.addrmaps.get(chip_ty)?;
-        let inst = amap.instances.iter().find(|i| i.name.name == inst_name.name)?;
+        let inst = amap
+            .instances
+            .iter()
+            .find(|i| i.name.name == inst_name.name)?;
         let block = self.regblocks.get(&inst.regblock_ty.name)?;
-        let reg = block.registers.iter().find(|r| r.name.name == reg_name.name)?;
+        let reg = block
+            .registers
+            .iter()
+            .find(|r| r.name.name == reg_name.name)?;
         let helper_var = self.let_helper.get(&chip_id.name)?.clone();
         let helper_ty = self.let_types.get(&helper_var)?.clone();
         let base = c_int_literal_from(&inst.base_addr.kind);
         let off = c_int_literal_from(&reg.offset.kind);
         let effective = format!("({base} + {off})");
-        let mirror_inst_name = inst.alias_of.as_ref()
+        let mirror_inst_name = inst
+            .alias_of
+            .as_ref()
             .map(|t| t.name.clone())
             .unwrap_or_else(|| inst.name.name.clone());
         let instance_path = format!("{}.{}", chip_id.name, mirror_inst_name);
-        Some((chip_id.name.clone(), instance_path, helper_var, helper_ty, effective, reg.access))
+        Some((
+            chip_id.name.clone(),
+            instance_path,
+            helper_var,
+            helper_ty,
+            effective,
+            reg.access,
+        ))
     }
 
     /// 4-level `chip.inst.REG.FIELD` addrmap+field access. Alias-
@@ -6952,14 +7036,37 @@ impl Emitter {
     fn resolve_addrmap_subfield_lookup(
         &self,
         target: &Expr,
-    ) -> Option<(String, String, String, String, String, String, &'static str, u32, u32, RegAccess)> {
-        let ExprKind::Field { target: lvl3, name: fld_name } = &*target.kind else {
+    ) -> Option<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        &'static str,
+        u32,
+        u32,
+        RegAccess,
+    )> {
+        let ExprKind::Field {
+            target: lvl3,
+            name: fld_name,
+        } = &*target.kind
+        else {
             return None;
         };
-        let ExprKind::Field { target: lvl2, name: reg_name } = &*lvl3.kind else {
+        let ExprKind::Field {
+            target: lvl2,
+            name: reg_name,
+        } = &*lvl3.kind
+        else {
             return None;
         };
-        let ExprKind::Field { target: lvl1, name: inst_name } = &*lvl2.kind else {
+        let ExprKind::Field {
+            target: lvl1,
+            name: inst_name,
+        } = &*lvl2.kind
+        else {
             return None;
         };
         let ExprKind::Ident(chip_id) = &*lvl1.kind else {
@@ -6967,9 +7074,15 @@ impl Emitter {
         };
         let chip_ty = self.let_types.get(&chip_id.name)?;
         let amap = self.addrmaps.get(chip_ty)?;
-        let inst = amap.instances.iter().find(|i| i.name.name == inst_name.name)?;
+        let inst = amap
+            .instances
+            .iter()
+            .find(|i| i.name.name == inst_name.name)?;
         let block = self.regblocks.get(&inst.regblock_ty.name)?;
-        let reg = block.registers.iter().find(|r| r.name.name == reg_name.name)?;
+        let reg = block
+            .registers
+            .iter()
+            .find(|r| r.name.name == reg_name.name)?;
         let fld = reg.fields.iter().find(|f| f.name.name == fld_name.name)?;
         let helper_var = self.let_helper.get(&chip_id.name)?.clone();
         let helper_ty = self.let_types.get(&helper_var)?.clone();
@@ -6979,7 +7092,9 @@ impl Emitter {
         let reg_width = reg.width.unwrap_or(block.default_width.unwrap_or(32));
         let reg_c_type = mirror_field_c_type(reg_width);
         let bit_width = field_bit_width(&fld.ty);
-        let mirror_inst_name = inst.alias_of.as_ref()
+        let mirror_inst_name = inst
+            .alias_of
+            .as_ref()
             .map(|t| t.name.clone())
             .unwrap_or_else(|| inst.name.name.clone());
         let instance_path = format!("{}.{}", chip_id.name, mirror_inst_name);
@@ -7001,7 +7116,11 @@ impl Emitter {
         &self,
         target: &Expr,
     ) -> Option<(String, String, String, String, RegAccess)> {
-        let ExprKind::Field { target: outer, name } = &*target.kind else {
+        let ExprKind::Field {
+            target: outer,
+            name,
+        } = &*target.kind
+        else {
             return None;
         };
         let ExprKind::Ident(regs_id) = &*outer.kind else {
@@ -7013,7 +7132,13 @@ impl Emitter {
         let helper_var = self.let_helper.get(&regs_id.name)?.clone();
         let helper_ty = self.let_types.get(&helper_var)?.clone();
         let offset_lit = c_int_literal_from(&reg.offset.kind);
-        Some((regs_id.name.clone(), helper_var, helper_ty, offset_lit, reg.access))
+        Some((
+            regs_id.name.clone(),
+            helper_var,
+            helper_ty,
+            offset_lit,
+            reg.access,
+        ))
     }
 
     fn resolve_regblock_field_write(
@@ -7031,11 +7156,29 @@ impl Emitter {
     fn resolve_regblock_subfield_lookup(
         &self,
         target: &Expr,
-    ) -> Option<(String, String, String, String, String, &'static str, u32, u32, RegAccess)> {
-        let ExprKind::Field { target: mid, name: fld_name } = &*target.kind else {
+    ) -> Option<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        &'static str,
+        u32,
+        u32,
+        RegAccess,
+    )> {
+        let ExprKind::Field {
+            target: mid,
+            name: fld_name,
+        } = &*target.kind
+        else {
             return None;
         };
-        let ExprKind::Field { target: outer, name: reg_name } = &*mid.kind else {
+        let ExprKind::Field {
+            target: outer,
+            name: reg_name,
+        } = &*mid.kind
+        else {
             return None;
         };
         let ExprKind::Ident(regs_id) = &*outer.kind else {
@@ -7043,7 +7186,10 @@ impl Emitter {
         };
         let regs_ty = self.let_types.get(&regs_id.name)?;
         let block = self.regblocks.get(regs_ty)?;
-        let reg = block.registers.iter().find(|r| r.name.name == reg_name.name)?;
+        let reg = block
+            .registers
+            .iter()
+            .find(|r| r.name.name == reg_name.name)?;
         let fld = reg.fields.iter().find(|f| f.name.name == fld_name.name)?;
         let helper_var = self.let_helper.get(&regs_id.name)?.clone();
         let helper_ty = self.let_types.get(&helper_var)?.clone();
@@ -7083,7 +7229,11 @@ impl Emitter {
     /// `emit_signal_assignment` and the `release` statement to emit
     /// the two-store (drv + en) lowering.
     fn resolve_force_probe(&self, target: &Expr) -> Option<ProbeAccessor> {
-        let ExprKind::Field { target: outer, name } = &*target.kind else {
+        let ExprKind::Field {
+            target: outer,
+            name,
+        } = &*target.kind
+        else {
             return None;
         };
         let ExprKind::Ident(id) = &*outer.kind else {
@@ -7093,7 +7243,11 @@ impl Emitter {
             return None;
         }
         let probe = self.probes.get(&name.name)?;
-        if probe.force { Some(probe.clone()) } else { None }
+        if probe.force {
+            Some(probe.clone())
+        } else {
+            None
+        }
     }
 
     fn emit_signal_assignment(&mut self, target: &Expr, value: &Expr, depth: usize) {
@@ -7114,7 +7268,11 @@ impl Emitter {
         // error rather than emit invalid C++. Read-only probes
         // can't drive their target signal — declare with `force`
         // for fault injection.
-        if let ExprKind::Field { target: outer, name } = &*target.kind {
+        if let ExprKind::Field {
+            target: outer,
+            name,
+        } = &*target.kind
+        {
             if let ExprKind::Ident(id) = &*outer.kind {
                 if id.name == "dut" && self.probes.contains_key(&name.name) {
                     self.errors.push(format!(
@@ -7131,8 +7289,16 @@ impl Emitter {
         // bus offset is `base(inst) + offset(REG)` and the mirror path
         // walks through the instance: `chip.inst.REG`.
         if let Some((
-            _chip_var, inst_path, reg_name, helper_var, helper_ty,
-            effective_off, reg_c_type, bit_pos, bit_width, access,
+            _chip_var,
+            inst_path,
+            reg_name,
+            helper_var,
+            helper_ty,
+            effective_off,
+            reg_c_type,
+            bit_pos,
+            bit_width,
+            access,
         )) = self.resolve_addrmap_subfield_lookup(target)
         {
             let mask = field_mask_literal(bit_width);
@@ -7141,19 +7307,21 @@ impl Emitter {
                 "{inst_path}.{reg_name} = ({inst_path}.{reg_name} & ~(({reg_c_type})0x{mask:x}u << {bit_pos})) | (((({reg_c_type})(",
             ).ok();
             self.emit_expr(value);
-            writeln!(
-                self.out,
-                ")) & 0x{mask:x}u) << {bit_pos});",
-            ).ok();
+            writeln!(self.out, ")) & 0x{mask:x}u) << {bit_pos});",).ok();
             if access.writes_to_bus() {
                 self.pad(depth);
                 writeln!(
                     self.out,
                     "{helper_ty}_write({helper_var}, {effective_off}, {inst_path}.{reg_name});",
-                ).ok();
+                )
+                .ok();
             } else {
                 self.pad(depth);
-                writeln!(self.out, "// RO field — write to bus suppressed (chip mirror still updated)").ok();
+                writeln!(
+                    self.out,
+                    "// RO field — write to bus suppressed (chip mirror still updated)"
+                )
+                .ok();
             }
             return;
         }
@@ -7172,12 +7340,20 @@ impl Emitter {
             writeln!(self.out, ";").ok();
             if access.writes_to_bus() {
                 self.pad(depth);
-                write!(self.out, "{helper_ty}_write({helper_var}, {effective_off}, ").ok();
+                write!(
+                    self.out,
+                    "{helper_ty}_write({helper_var}, {effective_off}, "
+                )
+                .ok();
                 self.emit_expr(value);
                 writeln!(self.out, ");").ok();
             } else {
                 self.pad(depth);
-                writeln!(self.out, "// RO register — write to bus suppressed (mirror updated)").ok();
+                writeln!(
+                    self.out,
+                    "// RO register — write to bus suppressed (mirror updated)"
+                )
+                .ok();
             }
             return;
         }
@@ -7189,8 +7365,15 @@ impl Emitter {
         // register-level path because it's strictly more specific
         // (3-level Field expr vs 2-level).
         if let Some((
-            regs_var, helper_var, helper_ty, offset_lit,
-            reg_name, reg_c_type, bit_pos, bit_width, access,
+            regs_var,
+            helper_var,
+            helper_ty,
+            offset_lit,
+            reg_name,
+            reg_c_type,
+            bit_pos,
+            bit_width,
+            access,
         )) = self.resolve_regblock_subfield_lookup(target)
         {
             let mask = field_mask_literal(bit_width);
@@ -7202,16 +7385,14 @@ impl Emitter {
                 "{regs_var}.{reg_name} = ({regs_var}.{reg_name} & ~(({reg_c_type})0x{mask:x}u << {bit_pos})) | (((({reg_c_type})(",
             ).ok();
             self.emit_expr(value);
-            writeln!(
-                self.out,
-                ")) & 0x{mask:x}u) << {bit_pos});",
-            ).ok();
+            writeln!(self.out, ")) & 0x{mask:x}u) << {bit_pos});",).ok();
             if access.writes_to_bus() {
                 self.pad(depth);
                 writeln!(
                     self.out,
                     "{helper_ty}_write({helper_var}, {offset_lit}, {regs_var}.{reg_name});",
-                ).ok();
+                )
+                .ok();
             } else {
                 self.pad(depth);
                 writeln!(
@@ -7242,7 +7423,11 @@ impl Emitter {
                 writeln!(self.out, ");").ok();
             } else {
                 self.pad(depth);
-                writeln!(self.out, "// RO register — write to bus suppressed (mirror updated)").ok();
+                writeln!(
+                    self.out,
+                    "// RO register — write to bus suppressed (mirror updated)"
+                )
+                .ok();
             }
             return;
         }
@@ -7353,8 +7538,16 @@ impl Emitter {
                 // Mirror path is `chip.inst.REG`; offset is base+reg_off.
                 if !lvalue {
                     if let Some((
-                        _chip_var, inst_path, reg_name, helper_var, helper_ty,
-                        effective_off, _reg_c_type, bit_pos, bit_width, access,
+                        _chip_var,
+                        inst_path,
+                        reg_name,
+                        helper_var,
+                        helper_ty,
+                        effective_off,
+                        _reg_c_type,
+                        bit_pos,
+                        bit_width,
+                        access,
                     )) = self.resolve_addrmap_subfield_lookup(e)
                     {
                         let mask = field_mask_literal(bit_width);
@@ -7367,15 +7560,22 @@ impl Emitter {
                             write!(
                                 self.out,
                                 "(({inst_path}.{reg_name} >> {bit_pos}) & 0x{mask:x}u)",
-                            ).ok();
+                            )
+                            .ok();
                         }
                         return;
                     }
                 }
                 // RAL addrmap register read: `chip.inst.REG`.
                 if !lvalue {
-                    if let Some((_chip_var, inst_path, helper_var, helper_ty, effective_off, access)) =
-                        self.resolve_addrmap_register_lookup(e)
+                    if let Some((
+                        _chip_var,
+                        inst_path,
+                        helper_var,
+                        helper_ty,
+                        effective_off,
+                        access,
+                    )) = self.resolve_addrmap_register_lookup(e)
                     {
                         if access.reads_from_bus() {
                             write!(
@@ -7398,8 +7598,15 @@ impl Emitter {
                 // mirror.
                 if !lvalue {
                     if let Some((
-                        regs_var, helper_var, helper_ty, offset_lit,
-                        reg_name, _reg_c_type, bit_pos, bit_width, access,
+                        regs_var,
+                        helper_var,
+                        helper_ty,
+                        offset_lit,
+                        reg_name,
+                        _reg_c_type,
+                        bit_pos,
+                        bit_width,
+                        access,
                     )) = self.resolve_regblock_subfield_lookup(e)
                     {
                         let mask = field_mask_literal(bit_width);
@@ -7413,7 +7620,8 @@ impl Emitter {
                             write!(
                                 self.out,
                                 "(({regs_var}.{reg_name} >> {bit_pos}) & 0x{mask:x}u)",
-                            ).ok();
+                            )
+                            .ok();
                         }
                         return;
                     }
@@ -7434,7 +7642,8 @@ impl Emitter {
                                 self.out,
                                 "({regs_var}.{} = {helper_ty}_read({helper_var}, {offset_lit}))",
                                 name.name,
-                            ).ok();
+                            )
+                            .ok();
                         } else {
                             write!(self.out, "{regs_var}.{}", name.name).ok();
                         }
@@ -7458,7 +7667,8 @@ impl Emitter {
                             if lvalue {
                                 write!(self.out, "dut->rootp->{}", probe.read).ok();
                             } else {
-                                write!(self.out, "harc_rt::harc_read(dut->rootp->{})", probe.read).ok();
+                                write!(self.out, "harc_rt::harc_read(dut->rootp->{})", probe.read)
+                                    .ok();
                             }
                             return;
                         }
@@ -7724,7 +7934,7 @@ impl Emitter {
 ///   * `randomize(t) with <body>` — always solver (user wrote constraints)
 ///   * bare `randomize(t)` where `t`'s transaction has `keep` items —
 ///     also solver (the keeps merge into a solver block at the call site)
-fn file_uses_constraint_solver(file: &SourceFile) -> bool {
+pub fn uses_constraint_solver(file: &SourceFile) -> bool {
     // First pass: collect names of transactions that declare any
     // `keep` items. Any bare `randomize(t)` against one of these
     // routes through Z3 after the §4 keep-merge.
@@ -8151,9 +8361,15 @@ fn parse_int_str(s: &str) -> Option<u64> {
             'o' | 'O' => u64::from_str_radix(digits, 8).ok(),
             _ => digits.parse::<u64>().ok(),
         }
-    } else if let Some(hex) = cleaned.strip_prefix("0x").or_else(|| cleaned.strip_prefix("0X")) {
+    } else if let Some(hex) = cleaned
+        .strip_prefix("0x")
+        .or_else(|| cleaned.strip_prefix("0X"))
+    {
         u64::from_str_radix(hex, 16).ok()
-    } else if let Some(bin) = cleaned.strip_prefix("0b").or_else(|| cleaned.strip_prefix("0B")) {
+    } else if let Some(bin) = cleaned
+        .strip_prefix("0b")
+        .or_else(|| cleaned.strip_prefix("0B"))
+    {
         u64::from_str_radix(bin, 2).ok()
     } else {
         cleaned.parse::<u64>().ok()
@@ -8202,10 +8418,14 @@ fn check_addrmap_aliases(a: &AddrmapDecl) -> Option<String> {
 /// permits this).
 fn pair_is_aliased(a: &InstanceDecl, b: &InstanceDecl) -> bool {
     if let Some(t) = &a.alias_of {
-        if t.name == b.name.name { return true; }
+        if t.name == b.name.name {
+            return true;
+        }
     }
     if let Some(t) = &b.alias_of {
-        if t.name == a.name.name { return true; }
+        if t.name == a.name.name {
+            return true;
+        }
     }
     // Both alias the same third instance.
     match (&a.alias_of, &b.alias_of) {
@@ -8271,7 +8491,11 @@ fn field_bit_width(t: &TypeExpr) -> u32 {
 /// register width 32 (mirror is `uint32_t`); wider fields are a
 /// downstream extension along with the wider mirror types.
 fn field_mask_literal(width: u32) -> u64 {
-    if width >= 32 { 0xFFFFFFFFu64 } else { (1u64 << width) - 1 }
+    if width >= 32 {
+        0xFFFFFFFFu64
+    } else {
+        (1u64 << width) - 1
+    }
 }
 
 /// C++ unsigned integer type wide enough to hold a register of `width`
@@ -8760,7 +8984,11 @@ fn and_join(exprs: &[Expr], span: Span) -> Expr {
     for next in iter {
         let s = acc.span.merge(next.span);
         acc = Expr::new(
-            ExprKind::Binary { op: BinaryOp::AndAnd, lhs: acc, rhs: next },
+            ExprKind::Binary {
+                op: BinaryOp::AndAnd,
+                lhs: acc,
+                rhs: next,
+            },
             s,
         );
     }
@@ -8777,10 +9005,7 @@ fn and_join(exprs: &[Expr], span: Span) -> Expr {
 /// case: `R(pkt)` → `pkt`), a field access (`R(env.agent.txn)`), or
 /// a deeper subtree. Field-access names (`Field { name, .. }`) are
 /// attribute references, not bindings, so they're never substituted.
-fn substitute_idents(
-    expr: &Expr,
-    subst: &std::collections::HashMap<String, Expr>,
-) -> Expr {
+fn substitute_idents(expr: &Expr, subst: &std::collections::HashMap<String, Expr>) -> Expr {
     let span = expr.span;
     let new_kind: ExprKind = match &*expr.kind {
         ExprKind::Ident(id) => {
@@ -8798,22 +9023,25 @@ fn substitute_idents(
         },
         ExprKind::Index { target, index } => ExprKind::Index {
             target: substitute_idents(target, subst),
-            index:  substitute_idents(index,  subst),
+            index: substitute_idents(index, subst),
         },
         ExprKind::BitSlice { target, hi, lo } => ExprKind::BitSlice {
             target: substitute_idents(target, subst),
-            hi:     substitute_idents(hi,     subst),
-            lo:     substitute_idents(lo,     subst),
+            hi: substitute_idents(hi, subst),
+            lo: substitute_idents(lo, subst),
         },
         ExprKind::Call { callee, args } => ExprKind::Call {
             callee: substitute_idents(callee, subst),
-            args: args.iter().map(|a| match a {
-                CallArg::Expr(e) => CallArg::Expr(substitute_idents(e, subst)),
-                CallArg::Named { name, value } => CallArg::Named {
-                    name: name.clone(),
-                    value: substitute_idents(value, subst),
-                },
-            }).collect(),
+            args: args
+                .iter()
+                .map(|a| match a {
+                    CallArg::Expr(e) => CallArg::Expr(substitute_idents(e, subst)),
+                    CallArg::Named { name, value } => CallArg::Named {
+                        name: name.clone(),
+                        value: substitute_idents(value, subst),
+                    },
+                })
+                .collect(),
         },
         ExprKind::Cast { expr, ty } => ExprKind::Cast {
             expr: substitute_idents(expr, subst),
@@ -8828,19 +9056,23 @@ fn substitute_idents(
             lhs: substitute_idents(lhs, subst),
             rhs: substitute_idents(rhs, subst),
         },
-        ExprKind::Ternary { cond, then_branch, else_branch } => ExprKind::Ternary {
-            cond:        substitute_idents(cond,        subst),
+        ExprKind::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => ExprKind::Ternary {
+            cond: substitute_idents(cond, subst),
             then_branch: substitute_idents(then_branch, subst),
             else_branch: substitute_idents(else_branch, subst),
         },
         ExprKind::Paren(inner) => ExprKind::Paren(substitute_idents(inner, subst)),
         ExprKind::Membership { expr, set } => ExprKind::Membership {
             expr: substitute_idents(expr, subst),
-            set:  substitute_idents(set,  subst),
+            set: substitute_idents(set, subst),
         },
-        ExprKind::SetLit(items) => ExprKind::SetLit(
-            items.iter().map(|x| substitute_idents(x, subst)).collect()
-        ),
+        ExprKind::SetLit(items) => {
+            ExprKind::SetLit(items.iter().map(|x| substitute_idents(x, subst)).collect())
+        }
         ExprKind::RangeLit { lo, hi } => ExprKind::RangeLit {
             lo: lo.as_ref().map(|x| substitute_idents(x, subst)),
             hi: hi.as_ref().map(|x| substitute_idents(x, subst)),
