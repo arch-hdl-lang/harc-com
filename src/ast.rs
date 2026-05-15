@@ -1248,6 +1248,25 @@ pub struct LetStmt {
     /// test-level `let dut : T` to declare observation points inside
     /// the DUT (see docs/probe-signals.md). Empty for ordinary lets.
     pub probes: Vec<Probe>,
+    /// Per-signal name overrides on a bus bind. Populated when the
+    /// bind clause carries a `with { ch.sig: "port_name", ... }`
+    /// suffix. Each entry maps a dotted-path inside the bus to the
+    /// concrete flat DUT port name. Unmapped signals fall back to
+    /// the `<bind_var>_<channel>_<signal>` convention. See spec
+    /// §10.5 / docs (TBD).
+    pub bind_remap: Vec<BindRemapEntry>,
+    pub span: Span,
+}
+
+/// One entry in a `bind ... with { ... }` remap block.
+#[derive(Debug, Clone)]
+pub struct BindRemapEntry {
+    /// Dotted path inside the bus, e.g. `[aw, valid]` for
+    /// `aw.valid`. Stored as a Vec of idents to preserve span
+    /// information for diagnostics.
+    pub path: Vec<Ident>,
+    /// SV port name on the bound DUT, e.g. `"s_axi_awvalid"`.
+    pub port: String,
     pub span: Span,
 }
 
