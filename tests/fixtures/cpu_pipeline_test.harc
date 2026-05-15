@@ -16,43 +16,45 @@
 // Tests use rd=0 throughout to avoid this.
 //
 // The HARC version groups the per-cycle signal poking into a small
-// passive transactor with two hookable methods (`feed` and
+// active transactor with two hookable methods (`feed` and
 // `feed_nop`), so each test reads as a sequence of intent-named
 // calls rather than 4 lines of `dut.* = ...` per cycle.
 
 transactor PipeXactor
     dut : CpuPipe
 
-    // Drive a single-cycle instruction into Fetch + present register
-    // data. Caller still manages timing — this just sets the inputs
-    // for the upcoming cycle.
-    hookable feed(imem: uint<32>, rs1: uint<32>, rs2: uint<32>, target: uint<32>)
-        dut.imem_data = imem
-        dut.rs1_data = rs1
-        dut.rs2_data = rs2
-        dut.branch_target = target
-    end feed
+    when active
+        // Drive a single-cycle instruction into Fetch + present register
+        // data. Caller still manages timing — this just sets the inputs
+        // for the upcoming cycle.
+        hookable feed(imem: uint<32>, rs1: uint<32>, rs2: uint<32>, target: uint<32>)
+            dut.imem_data = imem
+            dut.rs1_data = rs1
+            dut.rs2_data = rs2
+            dut.branch_target = target
+        end feed
 
-    // Bubble — drive zeros so any in-flight instruction in Decode/
-    // Execute keeps using its own latched data while Fetch sees a
-    // NOP.
-    hookable feed_nop()
-        dut.imem_data = 0
-        dut.rs1_data = 0
-        dut.rs2_data = 0
-    end feed_nop
+        // Bubble — drive zeros so any in-flight instruction in Decode/
+        // Execute keeps using its own latched data while Fetch sees a
+        // NOP.
+        hookable feed_nop()
+            dut.imem_data = 0
+            dut.rs1_data = 0
+            dut.rs2_data = 0
+        end feed_nop
 
-    // Hold register data without changing imem (e.g. across the
-    // Decode-read-rs1/rs2 cycle).
-    hookable feed_regs(rs1: uint<32>, rs2: uint<32>)
-        dut.rs1_data = rs1
-        dut.rs2_data = rs2
-    end feed_regs
+        // Hold register data without changing imem (e.g. across the
+        // Decode-read-rs1/rs2 cycle).
+        hookable feed_regs(rs1: uint<32>, rs2: uint<32>)
+            dut.rs1_data = rs1
+            dut.rs2_data = rs2
+        end feed_regs
+    end when
 end transactor PipeXactor
 
 test CpuPipelineTest
     let dut  : CpuPipe
-    let pipe : PipeXactor passive
+    let pipe : PipeXactor active
 
     run
         log(info, "CpuPipe 4-stage pipeline test")

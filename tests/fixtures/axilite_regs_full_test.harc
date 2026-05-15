@@ -25,28 +25,30 @@ use BusAxiLite
 // inside the hookable bodies resolve to the parent's bus binding
 // (see PR #18). Two methods replace ~30 lines of C++ helpers.
 transactor AxilHelper bound to BusAxiLite
-    hookable write(addr: uint<8>, data: uint<32>)
-        bus.aw.addr = addr
-        bus.aw.valid = 1
-        bus.w.send(data, 15)         // data, strb=0xF (full word write)
-        bus.aw.valid = 0
-        wait 1 cycle
-    end write
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            bus.aw.addr = addr
+            bus.aw.valid = 1
+            bus.w.send(data, 15)         // data, strb=0xF (full word write)
+            bus.aw.valid = 0
+            wait 1 cycle
+        end write
 
-    hookable read(addr: uint<8>) -> uint<32>
-        bus.ar.addr = addr
-        bus.ar.valid = 1
-        let r = bus.r.recv()         // struct { data, resp }
-        bus.ar.valid = 0
-        wait 1 cycle
-        return r.data
-    end read
+        hookable read(addr: uint<8>) -> uint<32>
+            bus.ar.addr = addr
+            bus.ar.valid = 1
+            let r = bus.r.recv()         // struct { data, resp }
+            bus.ar.valid = 0
+            wait 1 cycle
+            return r.data
+        end read
+    end when
 end transactor AxilHelper
 
 test AxiLiteRegsFullTest
     let dut    : AxiLiteRegs
     let axil   : BusAxiLite = bind dut
-    let helper : AxilHelper passive = bind axil
+    let helper : AxilHelper active = bind axil
 
     run
         // ── Reset ────────────────────────────────────────────────

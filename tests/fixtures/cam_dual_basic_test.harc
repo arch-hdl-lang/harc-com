@@ -6,7 +6,7 @@
 // port-2 scenarios plus reset clearing.
 //
 // The C++ TB pokes signals directly with no events, so the HARC port
-// uses a passive transactor with hookable methods — write1, write2,
+// uses an active transactor with hookable methods — write1, write2,
 // write_both for the two-port concurrency cases, plus reset_dut.
 
 domain SysDomain
@@ -16,61 +16,63 @@ end domain SysDomain
 transactor CamDualXactor
     dut : Mshr_Addr_Cam_Dual
 
-    // Drive a single-cycle write on port 1 only.
-    hookable write1(idx: uint<4>, key: uint<8>, set: bool)
-        dut.write_valid = 1
-        dut.write_idx = idx
-        dut.write_key = key
-        dut.write_set = set
-        dut.write2_valid = 0
-        wait 1 cycle
-        dut.write_valid = 0
-        dut.write2_valid = 0
-    end write1
+    when active
+        // Drive a single-cycle write on port 1 only.
+        hookable write1(idx: uint<4>, key: uint<8>, set: bool)
+            dut.write_valid = 1
+            dut.write_idx = idx
+            dut.write_key = key
+            dut.write_set = set
+            dut.write2_valid = 0
+            wait 1 cycle
+            dut.write_valid = 0
+            dut.write2_valid = 0
+        end write1
 
-    // Drive a single-cycle write on port 2 only.
-    hookable write2(idx: uint<4>, key: uint<8>, set: bool)
-        dut.write_valid = 0
-        dut.write2_valid = 1
-        dut.write2_idx = idx
-        dut.write2_key = key
-        dut.write2_set = set
-        wait 1 cycle
-        dut.write_valid = 0
-        dut.write2_valid = 0
-    end write2
+        // Drive a single-cycle write on port 2 only.
+        hookable write2(idx: uint<4>, key: uint<8>, set: bool)
+            dut.write_valid = 0
+            dut.write2_valid = 1
+            dut.write2_idx = idx
+            dut.write2_key = key
+            dut.write2_set = set
+            wait 1 cycle
+            dut.write_valid = 0
+            dut.write2_valid = 0
+        end write2
 
-    // Drive both ports in the same cycle (concurrency / conflict cases).
-    hookable write_both(idx1: uint<4>, key1: uint<8>, set1: bool,
-                        idx2: uint<4>, key2: uint<8>, set2: bool)
-        dut.write_valid = 1
-        dut.write_idx = idx1
-        dut.write_key = key1
-        dut.write_set = set1
-        dut.write2_valid = 1
-        dut.write2_idx = idx2
-        dut.write2_key = key2
-        dut.write2_set = set2
-        wait 1 cycle
-        dut.write_valid = 0
-        dut.write2_valid = 0
-    end write_both
+        // Drive both ports in the same cycle (concurrency / conflict cases).
+        hookable write_both(idx1: uint<4>, key1: uint<8>, set1: bool,
+                            idx2: uint<4>, key2: uint<8>, set2: bool)
+            dut.write_valid = 1
+            dut.write_idx = idx1
+            dut.write_key = key1
+            dut.write_set = set1
+            dut.write2_valid = 1
+            dut.write2_idx = idx2
+            dut.write2_key = key2
+            dut.write2_set = set2
+            wait 1 cycle
+            dut.write_valid = 0
+            dut.write2_valid = 0
+        end write_both
 
-    // Reset pulse — matches the C++ TB's do_reset(): two ticks asserted,
-    // one tick deasserted.
-    hookable reset_dut()
-        dut.rst = 1
-        dut.write_valid = 0
-        dut.write2_valid = 0
-        wait 2 cycles
-        dut.rst = 0
-        wait 1 cycle
-    end reset_dut
+        // Reset pulse — matches the C++ TB's do_reset(): two ticks asserted,
+        // one tick deasserted.
+        hookable reset_dut()
+            dut.rst = 1
+            dut.write_valid = 0
+            dut.write2_valid = 0
+            wait 2 cycles
+            dut.rst = 0
+            wait 1 cycle
+        end reset_dut
+    end when
 end transactor CamDualXactor
 
 test CamDualBasicTest
     let dut  : Mshr_Addr_Cam_Dual
-    let xact : CamDualXactor passive
+    let xact : CamDualXactor active
 
     clock clk = SysDomain
 

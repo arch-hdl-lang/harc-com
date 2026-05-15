@@ -22,46 +22,48 @@
 //   Test 2: zero key, zero plaintext
 //     ct  = 0x66e94bd4ef8a2c3b884cfa59ca342b2e
 //
-// Helpers live on a passive transactor (`AesXactor`).
+// Helpers live on an active transactor (`AesXactor`).
 
 transactor AesXactor
     dut : AesCipherTop
 
-    hookable reset_dut()
-        dut.rst = 1
-        dut.ld = 0
-        dut.key = 0
-        dut.text_in = 0
-        wait 2 cycles
-        dut.rst = 0
-        wait 1 cycle
-    end reset_dut
+    when active
+        hookable reset_dut()
+            dut.rst = 1
+            dut.ld = 0
+            dut.key = 0
+            dut.text_in = 0
+            wait 2 cycles
+            dut.rst = 0
+            wait 1 cycle
+        end reset_dut
 
-    // Drive key + plaintext as whole 128-bit values, pulse `ld`
-    // for one cycle.
-    hookable load_block(key: uint<128>, text_in: uint<128>)
-        dut.key = key
-        dut.text_in = text_in
-        dut.ld = 1
-        wait 1 cycle
-        dut.ld = 0
-    end load_block
+        // Drive key + plaintext as whole 128-bit values, pulse `ld`
+        // for one cycle.
+        hookable load_block(key: uint<128>, text_in: uint<128>)
+            dut.key = key
+            dut.text_in = text_in
+            dut.ld = 1
+            wait 1 cycle
+            dut.ld = 0
+        end load_block
 
-    // Spin up to 14 cycles waiting for `done`. Matches the C++ TB
-    // bound. In practice the AES core takes 11 cycles (1 load +
-    // 10 rounds, with `done` rising at the final round).
-    hookable wait_for_done()
-        for _ in 0 .. 14
-            if dut.done == 0
-                wait 1 cycle
-            end if
-        end for
-    end wait_for_done
+        // Spin up to 14 cycles waiting for `done`. Matches the C++ TB
+        // bound. In practice the AES core takes 11 cycles (1 load +
+        // 10 rounds, with `done` rising at the final round).
+        hookable wait_for_done()
+            for _ in 0 .. 14
+                if dut.done == 0
+                    wait 1 cycle
+                end if
+            end for
+        end wait_for_done
+    end when
 end transactor AesXactor
 
 test AesCipherTopTest
     let dut  : AesCipherTop
-    let xact : AesXactor passive
+    let xact : AesXactor active
 
     run
         log(info, "AES-128 encryption test (FIPS-197 + zero vector)")

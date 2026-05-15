@@ -1788,3 +1788,149 @@ end test T"#,
         "expected NO `(Pkt)(...)` C++ cast for struct-targeted `as`; got:\n{cpp}"
     );
 }
+
+// ── Passive-transactor enforcement ──────────────────────────────────────
+//
+// A transactor's always-on body (anything NOT under `when active`) must
+// not drive DUT signals. Drive-side hookables / on-handlers must live
+// inside `when active { ... }` so a passive instance — whose
+// `when_active` body is elided at codegen — cannot end up driving the
+// bus. See spec §8.1 and src/codegen/cpp_tb.rs
+// `check_transactor_no_drive_in_always_on_body`.
+
+/// Direct DUT-pointer drive (`dut.<port> = ...`) inside an always-on
+/// hookable surfaces a HARC-level error naming the transactor, the
+/// hookable, the offending signal, and the recommended fix.
+#[test]
+fn transactor_always_on_dut_write_errors_clearly() {
+    let parsed = parse_source(
+        r#"transactor X
+    dut : SomeDut
+
+    hookable write(v : uint<32>)
+        dut.addr = v
+    end write
+end transactor X
+
+test T
+    let dut : SomeDut
+    let x : X passive
+    run
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&parsed).unwrap_err();
+    assert!(
+        err.0.contains("transactor `X`")
+            && err.0.contains("hookable `write`")
+            && err.0.contains("dut.addr")
+            && err.0.contains("when active"),
+        "expected drive-in-always-on error pointing at X.write + dut.addr + when active; got: {}",
+        err.0,
+    );
+}
+
+/// Same enforcement for `bound to BusType` transactors: writing
+/// `bus.<ch>.<sig>` or calling `bus.<ch>.send(...)` in the always-on
+/// body is a drive.
+#[test]
+fn transactor_always_on_bus_send_errors_clearly() {
+    let parsed = parse_source(
+        r#"bus B
+    handshake_channel ch: send kind: valid_ready
+        data: uint<32>;
+    end handshake_channel ch
+end bus B
+
+transactor X bound to B
+    hookable write(v : uint<32>)
+        bus.ch.send(v)
+    end write
+end transactor X
+
+test T
+    let dut : SomeDut
+    let b : B = bind dut
+    let x : X passive = bind b
+    run
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&parsed).unwrap_err();
+    assert!(
+        err.0.contains("transactor `X`")
+            && err.0.contains("hookable `write`")
+            && err.0.contains("bus.ch.send")
+            && err.0.contains("when active"),
+        "expected drive-in-always-on error pointing at X.write + bus.ch.send + when active; got: {}",
+        err.0,
+    );
+}
+
+/// Positive case: identical transactor with the drive code moved into
+/// `when active { ... }` emits cleanly. Proves the fix the error
+/// message recommends actually works.
+#[test]
+fn transactor_when_active_drive_emits_cleanly() {
+    let parsed = parse_source(
+        r#"transactor X
+    dut : SomeDut
+
+    when active
+        hookable write(v : uint<32>)
+            dut.addr = v
+        end write
+    end when
+end transactor X
+
+test T
+    let dut : SomeDut
+    let x : X active
+    run
+    end run
+end test T"#,
+    )
+    .unwrap();
+    cpp_tb::emit(&parsed)
+        .expect("drive code inside `when active` should emit cleanly under any mode");
+}
+
+/// Negative case for the genuine-observer shape we want to keep
+/// working: an always-on `on bus.<ch>.handshake(t)` handler that
+/// only pushes into a scoreboard field (no DUT write, no bus send)
+/// is fine even on a `passive` instance.
+#[test]
+fn transactor_always_on_observer_emits_cleanly() {
+    let parsed = parse_source(
+        r#"bus B
+    handshake_channel ch: receive kind: valid_ready
+        data: uint<32>;
+    end handshake_channel ch
+end bus B
+
+scoreboard S
+    seen : queue<uint<32>>
+end scoreboard S
+
+transactor Mon bound to B
+    sb : S
+
+    on bus.ch.handshake(d)
+        sb.seen.push(d)
+    end on
+end transactor Mon
+
+test T
+    let dut : SomeDut
+    let b : B = bind dut
+    let mon : Mon passive = bind b
+    run
+    end run
+end test T"#,
+    )
+    .unwrap();
+    cpp_tb::emit(&parsed)
+        .expect("observer-only handler in always-on body should emit cleanly under `passive`");
+}

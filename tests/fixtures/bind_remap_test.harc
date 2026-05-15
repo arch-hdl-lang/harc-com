@@ -15,22 +15,24 @@
 use BusAxiLite
 
 transactor AxilHelper bound to BusAxiLite
-    hookable write(addr: uint<8>, data: uint<32>)
-        bus.aw.addr = addr
-        bus.aw.valid = 1
-        bus.w.send(data, 15)
-        bus.aw.valid = 0
-        wait 1 cycle
-    end write
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            bus.aw.addr = addr
+            bus.aw.valid = 1
+            bus.w.send(data, 15)
+            bus.aw.valid = 0
+            wait 1 cycle
+        end write
 
-    hookable read(addr: uint<8>) -> uint<32>
-        bus.ar.addr = addr
-        bus.ar.valid = 1
-        let r = bus.r.recv()
-        bus.ar.valid = 0
-        wait 1 cycle
-        return r.data
-    end read
+        hookable read(addr: uint<8>) -> uint<32>
+            bus.ar.addr = addr
+            bus.ar.valid = 1
+            let r = bus.r.recv()
+            bus.ar.valid = 0
+            wait 1 cycle
+            return r.data
+        end read
+    end when
 end transactor AxilHelper
 
 test BindRemapTest
@@ -44,7 +46,7 @@ test BindRemapTest
         r.valid:  "s_axi_rvalid",  r.ready:  "s_axi_rready",
         r.data:   "s_axi_rdata",   r.resp:   "s_axi_rresp"
     }
-    let helper : AxilHelper passive = bind s_axi
+    let helper : AxilHelper active = bind s_axi
 
     run
         dut.rst = 1
