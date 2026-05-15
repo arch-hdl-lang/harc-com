@@ -2384,6 +2384,7 @@ impl Parser {
         };
         let mut value = None;
         let mut bind = false;
+        let mut bind_remap: Vec<BindRemapEntry> = Vec::new();
         if self.check(TokenKind::Eq) {
             self.advance();
             if self.check(TokenKind::Bind) {
@@ -2391,6 +2392,19 @@ impl Parser {
                 bind = true;
                 // Bind value can be a free expression: `bind dut.s_axi`.
                 value = Some(self.parse_expr()?);
+                // Optional per-signal remap clause:
+                //   bind dut with { aw.valid: "awvalid", w.data: "wdata" }
+                if self.check(TokenKind::With) {
+                    self.advance();
+                    self.expect(TokenKind::LBrace)?;
+                    while !self.check(TokenKind::RBrace) {
+                        bind_remap.push(self.parse_bind_remap_entry()?);
+                        if self.check(TokenKind::Comma) {
+                            self.advance();
+                        }
+                    }
+                    self.expect(TokenKind::RBrace)?;
+                }
             } else {
                 value = Some(self.parse_expr()?);
             }
@@ -2420,7 +2434,33 @@ impl Parser {
             .or_else(|| value.as_ref().map(|e| e.span))
             .or_else(|| ty.as_ref().map(|t| t.span()))
             .unwrap_or(name.span);
-        Ok(LetStmt { name, ty, value, bind, probes, span: start.merge(end) })
+        Ok(LetStmt { name, ty, value, bind, probes, bind_remap, span: start.merge(end) })
+    }
+
+    /// Parse one `<dotted.path>: "<port-name>"` entry inside a
+    /// `bind ... with { ... }` block.
+    fn parse_bind_remap_entry(&mut self) -> Result<BindRemapEntry, CompileError> {
+        let start = self.peek_span();
+        let first = self.expect_field_name()?;
+        let mut path = vec![first];
+        while self.check(TokenKind::Dot) {
+            self.advance();
+            path.push(self.expect_field_name()?);
+        }
+        self.expect(TokenKind::Colon)?;
+        let lit_span = self.peek_span();
+        let lit_tok = self.advance().ok_or(CompileError::UnexpectedEof)?;
+        let port = match lit_tok.kind {
+            TokenKind::StringLit(s) => s,
+            other => {
+                return Err(CompileError::unexpected_token(
+                    "string literal for SV port name (e.g. \"s_axi_awvalid\")",
+                    &other.to_string(),
+                    lit_span,
+                ));
+            }
+        };
+        Ok(BindRemapEntry { path, port, span: start.merge(lit_tok.span) })
     }
 
     /// Parse a single probe declaration:
