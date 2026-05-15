@@ -193,19 +193,56 @@ end test T"#,
 }
 
 #[test]
-fn multiple_tests_require_explicit_pick() {
+fn multiple_tests_with_different_duts_errors_at_emit() {
+    // Phase 1b: merge_for_sim now passes multiple tests through to
+    // codegen (each emits its own `run_<TestName>` function). The
+    // shared-DUT validation moved to emit_with_opts — it surfaces a
+    // clear error when two tests pick different SV modules, since
+    // Verilator can only build one V<top> per binary. The validation
+    // names both tests + both DUT types.
     let f = parse_source(
         r#"test A
     let dut : X
+    run end run
 end test A
 test B
     let dut : Y
+    run end run
 end test B
 "#,
     )
     .unwrap();
-    let err = merge::merge_for_sim(&[f], None).unwrap_err();
-    assert!(err.contains("multiple tests"));
+    let merged = merge::merge_for_sim(&[f], None).expect("merge keeps both tests");
+    let err = cpp_tb::emit(&merged).unwrap_err();
+    assert!(
+        err.0.contains("multi-DUT") && err.0.contains("`X`") && err.0.contains("`Y`"),
+        "expected multi-DUT error naming X and Y; got: {}",
+        err.0,
+    );
+}
+
+#[test]
+fn multiple_tests_with_same_dut_emit_all_run_functions() {
+    let f = parse_source(
+        r#"test A
+    let dut : X
+    run end run
+end test A
+test B
+    let dut : X
+    run end run
+end test B
+"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(&[f], None).expect("merge keeps both tests");
+    let cpp = cpp_tb::emit(&merged).expect("same-DUT multi-test emits cleanly");
+    assert!(cpp.contains("int run_A(int argc"), "expected run_A function");
+    assert!(cpp.contains("int run_B(int argc"), "expected run_B function");
+    assert!(
+        cpp.contains("std::strcmp(test_sel, \"A\") == 0") && cpp.contains("std::strcmp(test_sel, \"B\") == 0"),
+        "expected dispatcher branches for both A and B; got:\n{cpp}",
+    );
 }
 
 #[test]

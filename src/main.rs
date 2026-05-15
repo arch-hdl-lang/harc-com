@@ -803,6 +803,7 @@ fn run_verilator(
     coverage: bool,
     ref_src: &[PathBuf],
     z3_paths: &Z3Paths,
+    test: Option<&str>,
 ) -> Result<()> {
     let mdir = outdir_abs.join("obj_dir");
     let _ = fs::remove_dir_all(&mdir); // start clean — stale .o's bite us
@@ -969,6 +970,15 @@ fn run_verilator(
     if let Some(s) = seed {
         cmd.env("HARC_SEED", s.to_string());
     }
+    // Per-test selection at runtime (Phase 1b of
+    // docs/separate-compilation-plan.md). The binary now contains
+    // every test in the source as a separate `run_<TestName>`
+    // function; the dispatcher `main()` picks one based on this
+    // flag (or the `HARC_TEST` env var). When unset, the dispatcher
+    // runs the alphabetically-first test.
+    if let Some(t) = test {
+        cmd.args(&["--test", t]);
+    }
     if let Some(lib) = &z3_paths.lib_dir {
         prepend_env_path(&mut cmd, "LD_LIBRARY_PATH", lib)?;
         prepend_env_path(&mut cmd, "DYLD_LIBRARY_PATH", lib)?;
@@ -1106,6 +1116,7 @@ fn cmd_sim(
             coverage,
             &ref_src_abs,
             &z3_paths,
+            test.as_deref(),
         );
     }
 
