@@ -2039,6 +2039,161 @@ end test T"#,
         .expect("passive instance calling a non-drive always-on hookable should emit cleanly");
 }
 
+// ── Testbench-block `function` methods ─────────────────────────────────
+//
+// docs/test-ergonomics.md §3. A `testbench` body now accepts
+// `function name(...) [-> T] ... end function name` declarations
+// (non-hookable methods). Codegen reuses the existing hookable lambda
+// path but suppresses per-method pre/post hook vectors and the
+// corresponding fan-out — i.e. no `<Type>_<method>_pre` /
+// `<Type>_<method>_post` symbols in the emitted C++.
+
+#[test]
+fn testbench_function_emits_method_lambda_without_hook_vectors() {
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : Top
+
+    function reset()
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+    end function reset
+end testbench Tb
+
+test T
+    let dut : Top
+    let tb  : Tb
+    run
+        tb.dut = dut
+        tb.reset()
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("testbench + function lowers cleanly");
+    assert!(
+        cpp.contains("Tb_reset"),
+        "expected `Tb_reset` method lambda; got: {}",
+        &cpp[..400.min(cpp.len())],
+    );
+    assert!(
+        !cpp.contains("Tb_reset_pre"),
+        "non-hookable `function` should NOT emit Tb_reset_pre hook vector; got:\n{}",
+        cpp,
+    );
+    assert!(
+        !cpp.contains("Tb_reset_post"),
+        "non-hookable `function` should NOT emit Tb_reset_post hook vector; got:\n{}",
+        cpp,
+    );
+}
+
+/// `impl <name> for <Tb>` (docs/test-ergonomics.md §3.3) binds a
+/// test to a testbench. The pre-emission desugaring synthesizes
+/// `let dut : <SVType>` + `let _tb : <TbType>` at test scope, wires
+/// `_tb.dut = dut`, and rewrites bare-name references to testbench
+/// fields / methods into `_tb.<x>` accesses / `<TbType>_<m>(_tb,...)`
+/// dispatches. Result: the bound test threads through the same
+/// codegen as a classic `test T { ... }` after desugaring.
+#[test]
+fn impl_for_testbench_emits_per_test_tb_instance_and_wires_dut() {
+    let parsed = parse_source(
+        r#"testbench TopTb
+    dut : Top
+
+    function reset()
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+    end function reset
+end testbench TopTb
+
+impl Smoke for TopTb
+    run
+        reset()
+        assert dut.count_out == 0
+    end run
+end impl Smoke"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("impl form lowers cleanly");
+    // The synthesized `_tb` instance must appear in main()'s scope
+    // (default-constructed TopTb struct).
+    assert!(
+        cpp.contains("TopTb _tb"),
+        "expected `TopTb _tb;` instantiation; got first 600 chars:\n{}",
+        &cpp[..600.min(cpp.len())],
+    );
+    // The DUT auto-wire (`_tb.dut = dut`) lands as the first stmt of
+    // the run block.
+    assert!(
+        cpp.contains("_tb.dut = dut"),
+        "expected `_tb.dut = dut` wire-up; got:\n{}",
+        cpp,
+    );
+    // Bare `reset()` rewrote to `TopTb_reset(_tb)` via the
+    // testbench-method-dispatch path.
+    assert!(
+        cpp.contains("TopTb_reset(_tb"),
+        "expected `TopTb_reset(_tb...)` method dispatch; got:\n{}",
+        cpp,
+    );
+    // Bare `dut.count_out` stayed bare (refers to the synthesized
+    // test-scope `let dut : Top`, lowered through the existing
+    // pointer-var path as `dut->count_out`).
+    assert!(
+        cpp.contains("dut->count_out"),
+        "expected `dut->count_out` from bare `dut.count_out`; got:\n{}",
+        cpp,
+    );
+}
+
+/// Classic `test T { ... }` form keeps working alongside the new
+/// bound form — sweep + parser-entry removal is Phase 2.
+#[test]
+fn classic_test_form_still_emits() {
+    let parsed = parse_source(
+        r#"test Smoke
+    let dut : Top
+    run
+        dut.rst = 1
+    end run
+end test Smoke"#,
+    )
+    .unwrap();
+    cpp_tb::emit(&parsed).expect("classic `test` form should still lower cleanly");
+}
+
+#[test]
+fn testbench_hookable_still_emits_hook_vectors() {
+    // Companion: `hookable name(...)` keeps its pre/post vectors. The
+    // discriminator is the AST flag `is_hookable`, set from the
+    // introducing keyword.
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : Top
+
+    hookable reset()
+        dut.rst = 1
+    end reset
+end testbench Tb
+
+test T
+    let dut : Top
+    let tb  : Tb
+    run
+        tb.dut = dut
+        tb.reset()
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("testbench + hookable lowers cleanly");
+    assert!(cpp.contains("Tb_reset_pre"), "hookable should emit pre vector");
+    assert!(cpp.contains("Tb_reset_post"), "hookable should emit post vector");
+}
+
 /// Negative case for the genuine-observer shape we want to keep
 /// working: an always-on `on bus.<ch>.handshake(t)` handler that
 /// only pushes into a scoreboard field (no DUT write, no bus send)

@@ -280,20 +280,15 @@ impl Parser {
             Some(TokenKind::Bus) => self.parse_bus(doc).map(Item::Bus),
             Some(TokenKind::Regblock) => self.parse_regblock(doc).map(Item::Regblock),
             Some(TokenKind::Addrmap) => self.parse_addrmap(doc).map(Item::Addrmap),
-            // `impl <target> for <Test>` is the legacy two-block form
-            // (docs/test-ergonomics.md). Removed after the fixture
-            // corpus migrated to inline `run`/`setup`/`check`/`teardown`
-            // inside `test`. Kept as a parser-error surface so legacy
-            // sources fail with a clear directive rather than a generic
-            // "unexpected token".
-            Some(TokenKind::Impl) => Err(CompileError::unexpected_token(
-                "inline `run` / `setup` / `check` / `teardown` block \
-                 inside the `test` body (the legacy `impl <target> for <Test>` \
-                 wrapper was removed — see docs/test-ergonomics.md and \
-                 scripts/migrate_v1_inline.py)",
-                "impl",
-                self.peek_span(),
-            )),
+            // `impl <name> for <TbType> ... end impl <name>` — the
+            // testbench-bound test form. Replaces the legacy
+            // `impl sim for <Test>` two-block form (which was removed
+            // in PR #92) with a different semantic: the `for` target
+            // is a `testbench` declaration the test binds to, and the
+            // testbench's fields + helper functions fold into scope
+            // for the bound test's body. See docs/test-ergonomics.md
+            // §3.3 and the AST `TestDecl.for_testbench` field.
+            Some(TokenKind::Impl) => self.parse_impl_for_test(doc).map(Item::Test),
             Some(other) => Err(CompileError::unexpected_token(
                 "use, package, const, struct, enum, transaction, relation, tseq, agent, env, scoreboard, sequencer, transactor, test, extend, covergroup, property, pseq, cover sequence, module, function, or apply",
                 &other.to_string(),
@@ -685,6 +680,13 @@ impl Parser {
             Some(TokenKind::Connect) => Ok(ComponentItem::Connect(self.parse_connect_block()?)),
             Some(TokenKind::On) => Ok(ComponentItem::OnHandler(self.parse_on_handler()?)),
             Some(TokenKind::Hookable) => Ok(ComponentItem::Hookable(self.parse_hookable()?)),
+            // `function name(...) ... end function` — non-hookable
+            // method on the enclosing component. Stored in the same
+            // AST slot as `hookable` (HookableMethod with
+            // `is_hookable = false`); codegen suppresses the pre/post
+            // hook-vector machinery for it. Docs/test-ergonomics.md
+            // §3.2 covers the surface.
+            Some(TokenKind::Function) => Ok(ComponentItem::Hookable(self.parse_component_function()?)),
             Some(TokenKind::Apply) => Ok(ComponentItem::Apply(self.parse_apply()?)),
             Some(TokenKind::Watchdog) => Ok(ComponentItem::Watchdog(self.parse_watchdog()?)),
             _ => Ok(ComponentItem::Field(self.parse_component_field(doc)?)),
@@ -950,6 +952,42 @@ impl Parser {
             return_ty,
             body: Block { stmts, span: body_start.merge(end) },
             span: start.merge(end),
+            is_hookable: true,
+        })
+    }
+
+    /// Parse `function name(params) [-> Type] ... end function [name]`
+    /// inside a component body (testbench / env / agent / sequencer).
+    /// Same shape as `hookable`, but the resulting `HookableMethod`
+    /// carries `is_hookable = false` so codegen skips the pre/post
+    /// hook-vector emission and the corresponding fan-out in the
+    /// method body. See docs/test-ergonomics.md §3.2.
+    ///
+    /// The `end` form accepts both `end function` and `end function
+    /// <name>` (matching the open form), with the same lenient
+    /// fallback as `parse_hookable`.
+    fn parse_component_function(&mut self) -> Result<HookableMethod, CompileError> {
+        let start = self.expect(TokenKind::Function)?.span;
+        let name = self.expect_ident()?;
+        let params = self.parse_paren_params()?;
+        let return_ty = if self.check(TokenKind::RArrow) {
+            self.advance();
+            Some(self.parse_type_expr()?)
+        } else {
+            None
+        };
+        let body_start = self.peek_span();
+        let stmts = self.parse_stmt_list_until_end()?;
+        let end = self.expect_end(TokenKind::Function, &name.name).or_else(|_| {
+            Ok::<Span, CompileError>(body_start)
+        })?;
+        Ok(HookableMethod {
+            name,
+            params,
+            return_ty,
+            body: Block { stmts, span: body_start.merge(end) },
+            span: start.merge(end),
+            is_hookable: false,
         })
     }
 
@@ -1062,7 +1100,129 @@ impl Parser {
             items.push(TestItem::Scope(inline_scope));
         }
         let end = self.expect_end(TokenKind::Test, &name.name)?;
-        Ok(TestDecl { name, params, items, span: start.merge(end), doc, inner_doc })
+        Ok(TestDecl { name, params, items, span: start.merge(end), doc, inner_doc, for_testbench: None })
+    }
+
+    /// Parse `impl <name> for <TbType> { run/setup/check/teardown/phase }
+    /// end impl <name>` — the testbench-bound test form
+    /// (docs/test-ergonomics.md §3.3). Body items are the same as
+    /// `parse_test` accepts (phases + bare statements form the
+    /// implicit `run`), but the test does NOT carry user-visible
+    /// `let dut` / `let tb` declarations — those are derived from
+    /// the bound testbench's field list at codegen time.
+    ///
+    /// Lowered through the same `TestDecl` AST as the classic `test`
+    /// form, with `for_testbench: Some(TbType)`. The classic form's
+    /// codegen ignores the field; the new form's codegen uses it to
+    /// emit a per-test Tb instance and to fold testbench fields /
+    /// helper methods into the run-body scope.
+    fn parse_impl_for_test(&mut self, doc: Option<String>) -> Result<TestDecl, CompileError> {
+        let start = self.expect(TokenKind::Impl)?.span;
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::For)?;
+        let tb_ty = self.expect_ident()?;
+        let inner_doc = self.consume_inner_doc();
+
+        // Body — same shape as `parse_test`. Bare statements +
+        // run/setup/check/teardown/phase blocks accumulate into the
+        // items list. Lets at impl scope are accepted (rare but legal
+        // — e.g. test-local helpers that aren't testbench fields).
+        let mut items: Vec<TestItem> = Vec::new();
+        let mut inline_scope = ScopeDecl {
+            name: Ident { name: "sim".into(), span: start },
+            setup: None,
+            run: None,
+            check: None,
+            teardown: None,
+            span: start,
+        };
+        let mut saw_inline_phase = false;
+        while !self.check_end_keyword() {
+            match self.peek_kind() {
+                Some(TokenKind::Run) => {
+                    let kw_span = self.advance().unwrap().span;
+                    let stmts = self.parse_stmt_list_until_end()?;
+                    let end_span = self.expect_end_anon(TokenKind::Run)?;
+                    if inline_scope.run.is_some() {
+                        return Err(CompileError::general(
+                            &format!("duplicate `run` block in impl `{}`", name.name),
+                            kw_span,
+                        ));
+                    }
+                    inline_scope.run = Some(Block { stmts, span: end_span });
+                    inline_scope.span = end_span;
+                    saw_inline_phase = true;
+                }
+                Some(TokenKind::Setup) => {
+                    let kw_span = self.advance().unwrap().span;
+                    let stmts = self.parse_stmt_list_until_end()?;
+                    let end_span = self.expect_end_anon(TokenKind::Setup)?;
+                    if inline_scope.setup.is_some() {
+                        return Err(CompileError::general(
+                            &format!("duplicate `setup` block in impl `{}`", name.name),
+                            kw_span,
+                        ));
+                    }
+                    inline_scope.setup = Some(Block { stmts, span: end_span });
+                    inline_scope.span = end_span;
+                    saw_inline_phase = true;
+                }
+                Some(TokenKind::Check) => {
+                    let kw_span = self.advance().unwrap().span;
+                    let stmts = self.parse_stmt_list_until_end()?;
+                    let end_span = self.expect_end_anon(TokenKind::Check)?;
+                    if inline_scope.check.is_some() {
+                        return Err(CompileError::general(
+                            &format!("duplicate `check` block in impl `{}`", name.name),
+                            kw_span,
+                        ));
+                    }
+                    inline_scope.check = Some(Block { stmts, span: end_span });
+                    inline_scope.span = end_span;
+                    saw_inline_phase = true;
+                }
+                Some(TokenKind::Teardown) => {
+                    let kw_span = self.advance().unwrap().span;
+                    let stmts = self.parse_stmt_list_until_end()?;
+                    let end_span = self.expect_end_anon(TokenKind::Teardown)?;
+                    if inline_scope.teardown.is_some() {
+                        return Err(CompileError::general(
+                            &format!("duplicate `teardown` block in impl `{}`", name.name),
+                            kw_span,
+                        ));
+                    }
+                    inline_scope.teardown = Some(Block { stmts, span: end_span });
+                    inline_scope.span = end_span;
+                    saw_inline_phase = true;
+                }
+                Some(TokenKind::Phase) => {
+                    self.advance();
+                    let phase_name = self.expect_ident()?;
+                    let stmts = self.parse_stmt_list_until_end()?;
+                    let end_span = self.expect_end(TokenKind::Phase, &phase_name.name)?;
+                    items.push(TestItem::Phase(
+                        phase_name,
+                        Block { stmts, span: end_span },
+                    ));
+                }
+                _ => {
+                    items.push(self.parse_test_item()?);
+                }
+            }
+        }
+        if saw_inline_phase {
+            items.push(TestItem::Scope(inline_scope));
+        }
+        let end = self.expect_end(TokenKind::Impl, &name.name)?;
+        Ok(TestDecl {
+            name,
+            params: Vec::new(),
+            items,
+            span: start.merge(end),
+            doc,
+            inner_doc,
+            for_testbench: Some(tb_ty),
+        })
     }
 
     fn parse_test_item(&mut self) -> Result<TestItem, CompileError> {

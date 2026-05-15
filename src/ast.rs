@@ -575,6 +575,16 @@ pub struct HookableMethod {
     pub return_ty: Option<TypeExpr>,
     pub body: Block,
     pub span: Span,
+    /// `true` for `hookable <name>(...)` (the existing surface — emits
+    /// per-method pre/post hook vectors and wraps the body with hook
+    /// fan-out calls). `false` for `function <name>(...)` inside a
+    /// component body (testbench / env / agent / sequencer) — same
+    /// shape, but no hook vectors and no pre/post fan-out. Used for
+    /// helper methods on `testbench` blocks (docs/test-ergonomics.md
+    /// §3). Lowering is identical otherwise: a free
+    /// `[&]`-capturing lambda named `<Type>_<method>` resolved by
+    /// `resolve_component_method_call` at any call site.
+    pub is_hookable: bool,
 }
 
 // ── Transactor (§8.1) ──────────────────────────────────────────────────────
@@ -629,6 +639,18 @@ pub struct TestDecl {
     pub span: Span,
     pub doc: Option<String>,
     pub inner_doc: Option<String>,
+    /// `impl <name> for <TbType> ... end impl <name>` — the testbench-
+    /// bound test form (docs/test-ergonomics.md §3.3). When `Some`, the
+    /// test implicitly instantiates a fresh `<TbType>` instance for
+    /// the duration of `run` (plus the surrounding setup/check/
+    /// teardown phases), and bare-name lookups inside the body resolve
+    /// to the testbench's fields and helper methods first. `None` =
+    /// classic `test <name> ... end test <name>` form (standalone,
+    /// user manages `let dut` / `let tb` explicitly). Both forms
+    /// share the same AST and lower through the same codegen path —
+    /// the `for_testbench` discriminator gates the bare-name
+    /// substitution + per-test Tb instance.
+    pub for_testbench: Option<Ident>,
 }
 
 #[derive(Debug, Clone)]
