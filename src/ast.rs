@@ -129,7 +129,8 @@ pub struct AddrmapDecl {
     pub inner_doc: Option<String>,
 }
 
-/// `instance <Name> : <RegblockType> @ <base_addr> [size <expr>]`
+/// `instance <Name> : <RegblockType> @ <base_addr> [size <expr>]
+///                                                 [alias of <other>]`
 #[derive(Debug, Clone)]
 pub struct InstanceDecl {
     pub name: Ident,
@@ -146,6 +147,13 @@ pub struct InstanceDecl {
     /// any pair, the codegen verifies non-overlap. Instances without
     /// `size` are skipped during the overlap check.
     pub size: Option<Expr>,
+    /// Optional `alias of <other_inst>` clause — declares this
+    /// instance as a second address window over the same underlying
+    /// mirror cells as `<other_inst>`. Bus traffic flows at this
+    /// instance's own base; reads/writes update / read the aliased
+    /// target's mirror. Aliased pairs are skipped during the
+    /// overlap check. See docs/ral-support.md §4.
+    pub alias_of: Option<Ident>,
     pub span: Span,
     pub doc: Option<String>,
 }

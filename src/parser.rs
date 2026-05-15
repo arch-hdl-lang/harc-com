@@ -1544,23 +1544,41 @@ impl Parser {
         let regblock_ty = self.expect_ident()?;
         self.expect(TokenKind::AtSign)?;
         let base_addr = self.parse_expr()?;
-        // Optional `size <expr>` clause — drives the overlap check at
-        // codegen time. `size` is a soft keyword (parsed via
-        // `check_ident`) so it doesn't clash with the identifier of
+        // Optional `size <expr>` and `alias of <ident>` clauses,
+        // either order. Both are soft keywords (parsed via
+        // `check_ident`) so they don't clash with the identifiers of
         // the same name used elsewhere (e.g. AXI transaction fields).
         let mut size: Option<Expr> = None;
+        let mut alias_of: Option<Ident> = None;
         let mut end = base_addr.span;
-        if self.check_ident("size") {
-            self.advance();
-            let e = self.parse_expr()?;
-            end = e.span;
-            size = Some(e);
+        loop {
+            if self.check_ident("size") && size.is_none() {
+                self.advance();
+                let e = self.parse_expr()?;
+                end = e.span;
+                size = Some(e);
+            } else if self.check_ident("alias") && alias_of.is_none() {
+                self.advance();
+                if !self.check_ident("of") {
+                    return Err(CompileError::general(
+                        "expected `of` after `alias` in instance clause",
+                        self.peek_span(),
+                    ));
+                }
+                self.advance();
+                let target = self.expect_ident()?;
+                end = target.span;
+                alias_of = Some(target);
+            } else {
+                break;
+            }
         }
         Ok(InstanceDecl {
             name,
             regblock_ty,
             base_addr,
             size,
+            alias_of,
             span: start.merge(end),
             doc,
         })
