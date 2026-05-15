@@ -1,9 +1,16 @@
 // Smoke test for the `testbench` block (docs/test-ergonomics.md §3).
 //
 // Demonstrates the shared-structural-skeleton pattern: a `testbench`
-// owns the DUT plus a helper method (`reset`); two distinct tests
-// instantiate the same testbench via `let tb : CounterTb` and call
-// `tb.reset()` instead of repeating the reset sequence.
+// owns the DUT plus helper methods (`reset`, `bump`); two distinct
+// tests instantiate the same testbench via `let tb : CounterTb` and
+// call `tb.reset()` / `tb.bump(N)` instead of repeating the bodies
+// inline.
+//
+// Helpers are declared with the non-hookable `function` keyword
+// (docs/test-ergonomics.md §3.2): same body shape as `hookable`, but
+// no pre/post hook vectors and no fan-out — these are plain methods
+// on the testbench struct. Useful when the helper doesn't need the
+// pre/post hook machinery transactor methods provide.
 //
 // Under the hood `testbench` shares env's component machinery — the
 // parser routes it through ComponentKind::Testbench; codegen treats
@@ -13,49 +20,55 @@
 testbench CounterTb
     dut : Top
 
-    hookable reset()
+    function reset()
         dut.rst = 1
         dut.en  = 0
         wait 2 cycles
         dut.rst = 0
         wait 1 cycle
-    end reset
+    end function reset
+
+    // Drive `en = 1` for N cycles, then drop. The method shape mirrors
+    // `reset` — multi-arg / return-typed variants follow the same
+    // lowering (free `<Tb>_<fn>(self, args)` lambda).
+    function bump(n : uint<32>)
+        dut.en = 1
+        wait n cycles
+        dut.en = 0
+    end function bump
 end testbench CounterTb
 
-test TestbenchSmoke
-    let dut : Top
-    let tb  : CounterTb
-
+// `impl <name> for <Tb>` (docs/test-ergonomics.md §3.3) binds a test
+// to a testbench at declaration time. The testbench's fields and
+// helper methods fold into scope inside the bound test's body —
+// `reset()` resolves to `_tb.reset()`, bare `dut.signal` to
+// `_tb.dut->signal` (one VTop instance, two pointers via auto-wire).
+// No more `let dut` / `let tb` repetition; no more `tb.dut = dut`
+// boilerplate. The classic `test T { let dut; let tb; run; }` form
+// is still accepted in v0; Phase 2 removes it after the corpus sweep.
+impl TestbenchSmoke for CounterTb
     run
-        tb.dut = dut          // wire DUT pointer into the testbench, matches
-                              // the transactor `drv.dut = dut` convention.
-        tb.reset()
-        dut.en = 1
-        wait 5 cycles
+        reset()
+        bump(5)
         assert dut.count_out == 5
             else fail("smoke: count_out=${dut.count_out}, expected 5")
-        log(info, "PASS: testbench-shared reset + count")
+        log(info, "PASS: testbench-shared reset + bump")
     end run
-end test TestbenchSmoke
+end impl TestbenchSmoke
 
 // Second test reusing the same `CounterTb` declaration. Demonstrates
-// the line-saving win: no duplicated reset sequence — both tests call
-// the shared `tb.reset()`. Selected at the CLI via `--test`.
-test TestbenchEnableToggle
-    let dut : Top
-    let tb  : CounterTb
-
+// the line-saving win: both tests share reset / bump via the
+// testbench, with no per-test instantiation boilerplate. Selected at
+// the CLI via `--test`.
+impl TestbenchEnableToggle for CounterTb
     run
-        tb.dut = dut
-        tb.reset()
-        dut.en = 1
-        wait 3 cycles
-        dut.en = 0
+        reset()
+        bump(3)
         wait 3 cycles               // count holds while en=0
         let frozen = dut.count_out
         wait 5 cycles
         assert dut.count_out == frozen
             else fail("toggle: count moved while en=0")
-        log(info, "PASS: enable-toggle reuses CounterTb.reset")
+        log(info, "PASS: enable-toggle reuses CounterTb helpers")
     end run
-end test TestbenchEnableToggle
+end impl TestbenchEnableToggle

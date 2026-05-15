@@ -17,7 +17,8 @@ two-block `test T { ... } / impl sim for T { run ... }` form.
 | Fixture-corpus migration to inline form | **Shipped** | PR #92 (all 60 fixtures + `scripts/migrate_v1_inline.py`) |
 | Remove `impl <target> for <Test>` parser entry | **Shipped** | PR #92 |
 | Backend selection via CLI subcommand only | **Shipped** | implied by parser removal — no per-test annotation surface |
-| `testbench` block (shared structural skeleton + helper methods) | **Proposed (not yet implemented)** | Phase 3 — separate future PR |
+| `testbench` block (shared structural skeleton + helper methods) | **Shipped** | Parser entry pre-existing; `function` keyword + codegen suppression of hook vectors landed in PR #109. Bus-binding-as-field (`bus : Bus = bind dut`) and `hookable function` deferred. |
+| `impl <name> for <Tb> ... end impl <name>` — testbench-bound test form | **Shipped** | Parser + AST + pre-emission desugaring. Canary fixture: `testbench_basic_test.harc`. Phase 2 (separate PR) sweeps the 70-fixture corpus and removes the classic `test T { let dut; ... }` form. |
 | Dead-code prune (`Item::Impl`, `ImplDecl`, `ImplItem`, `parse_impl`) | **Pending** | follow-up tidy PR |
 
 ## 1. Motivation
@@ -113,7 +114,16 @@ paid to a feature that wasn't used and won't need to be used.
    `run` (`tb.reset()`), consistent with HARC's "no UVM phase machinery"
    stance.
 
-## 3. Surface — `testbench`  *(Phase 3, not yet implemented)*
+## 3. Surface — `testbench`  *(Shipped)*
+
+The reference fixture is `tests/fixtures/testbench_basic_test.harc` — two distinct tests share one `testbench CounterTb` declaration with `function reset()` and `function bump(n)` helpers. Run-fixture manifest entries:
+
+```
+testbench_basic_test    | Top  | top_counter.sv | | | TestbenchSmoke
+testbench_basic_test    | Top  | top_counter.sv | | | TestbenchEnableToggle
+```
+
+Spec syntax (updated for what actually lands today — the prose below uses `function` rather than the originally-proposed `fn`, since `function` is already the HARC top-level free-function keyword and reusing it keeps the language to one spelling per concept):
 
 ```harc
 testbench AxiLiteTb
@@ -124,7 +134,7 @@ testbench AxiLiteTb
     sb  : AxilSb
 
     // Shared procedural helpers — callable from any test's run.
-    fn reset()
+    function reset()
         dut.rst = 1
         dut.axil_aw_valid = 0
         dut.axil_w_valid = 0
@@ -135,9 +145,9 @@ testbench AxiLiteTb
         wait 2 cycles
         dut.rst = 0
         wait 1 cycle
-    end fn
+    end function reset
 
-    fn drive_random(n: int)
+    function drive_random(n: int)
         let txns = RandomTxns(n)
         for t in txns
             sb.expected.push(t.value)
@@ -147,9 +157,11 @@ testbench AxiLiteTb
                 sb.errors = sb.errors + 1
             end if
         end for
-    end fn
+    end function drive_random
 end testbench AxiLiteTb
 ```
+
+> The `bus : BusAxiLite = bind dut` and transactor-instance-as-field shapes shown above are illustrative — bus-binding inside a component body is a follow-up surface (currently bus bindings work only at test scope as `let axil : BusAxiLite = bind dut`). The shipped subset is: DUT-typed fields, value-typed inner state (scoreboards / primitives), and `function` / `hookable` helper methods. A testbench that needs bus access goes through a test-scope bus binding plus a transactor in env composition today.
 
 ### 3.1 Field semantics
 
@@ -165,15 +177,11 @@ end testbench AxiLiteTb
 
 ### 3.2 Function semantics
 
-- `fn name(...) [-> T]` declares a method on the testbench instance.
-- Inside the body, bare field names resolve to `self.<field>` (consistent
-  with how `transactor` already resolves `bus`).
-- Functions are **synchronous between waits**, same coroutine model as
-  the test's `run` block. They may call `wait`, `for`, `if`, and other
-  procedural constructs.
-- Functions are **not hookable** by default. If a testbench function
-  needs the pre/post hook machinery, it's declared `hookable fn` (same
-  keyword shape as transactor methods).
+- `function name(...) [-> T] ... end function [name]` declares a method on the testbench instance. (The originally-drafted `fn` keyword was renamed to `function` during implementation to keep HARC to one spelling per concept — `function` is the existing keyword for free-function declarations at top level.)
+- Inside the body, bare field names resolve to `self.<field>` via the same field-substitution path that transactor `hookable` methods use.
+- Functions are **synchronous between waits**, same coroutine model as the test's `run` block. They may call `wait`, `for`, `if`, and other procedural constructs.
+- Functions are **not hookable**: no `<Type>_<method>_pre` / `<Type>_<method>_post` vectors are emitted, and the method body has no fan-out wrapper. Lowering: a free `[&]`-capturing lambda named `<Type>_<method>`, called as `<Type>_<method>(tb, args)` at every `tb.method(args)` call site (`resolve_component_method_call` walks the same path as for hookables).
+- If a testbench function needs the pre/post hook machinery, declare it `hookable` instead of `function` — same body shape, plus the hook vectors.
 
 ### 3.3 Why a new keyword (`testbench`) instead of extending `env`?
 
@@ -192,6 +200,57 @@ The split between `env` and `testbench` becomes meaningful:
 A `testbench` typically *contains* an `env`. The env stays DUT-agnostic
 and reusable across testbenches; the testbench is the DUT-specific
 binding point.
+
+### 3.3 Testbench-bound test form — `impl <name> for <Tb>`
+
+The classic `test T { let dut; let tb; run; }` form forces every test to repeat the same instantiation boilerplate (and the awkward `tb.dut = dut` wire-up). The bound form folds the testbench into the test's scope:
+
+```harc
+testbench CounterTb
+    dut : Top
+
+    function reset()
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+    end function reset
+
+    function bump(n : uint<32>)
+        dut.en = 1
+        wait n cycles
+        dut.en = 0
+    end function bump
+end testbench CounterTb
+
+impl Smoke for CounterTb
+    run
+        reset()                       -- = _tb.reset()
+        bump(5)                       -- = _tb.bump(5)
+        assert dut.count_out == 5    -- = dut->count_out
+    end run
+end impl Smoke
+
+impl EnableToggle for CounterTb       -- second test, same testbench
+    run
+        reset()
+        bump(3)
+        wait 3 cycles
+        let frozen = dut.count_out
+        wait 5 cycles
+        assert dut.count_out == frozen
+    end run
+end impl EnableToggle
+```
+
+**Semantics.**
+- Bare-name lookup inside the bound test body falls through to the testbench instance: identifiers matching testbench fields rewrite to `_tb.<name>`, identifiers matching testbench methods (`function` or `hookable`) rewrite to `<TbType>_<name>(_tb, ...)`.
+- `dut` is reserved as the test-scope name for the DUT pointer. The desugarer synthesizes `let dut : <SVType>` at test scope from the testbench's first SV-typed field, then emits `_tb.dut = dut` so the testbench's pointer aliases the test-scope pointer (one allocation, two pointers, same instance). Bare `dut.signal` resolves through the existing pointer-var path — no `_tb.` prefix.
+- User-declared `let X` at test scope shadows any testbench field named `X` (other than `dut`, which is always synthesized).
+- The testbench instance is **fresh per test** — each `impl Foo for Tb` gets its own default-constructed `Tb` allocated at the start of that test's `main()`.
+
+**Lowering.** A pre-emission AST pass (`desugar_impl_for_test_in_file`) expands each `TestDecl` with `for_testbench: Some(...)` into the classic shape: prepend `let dut : <SVType>` and `let _tb : <TbType>`, prepend `_tb.dut = dut` to the run block, and rewrite bare-name references in run / setup / check / teardown / phase bodies. Once desugared, the test threads through the same codegen as a classic-form test.
+
+**Status.** Surface + canary fixture shipped. Phase 2 (a separate PR) sweeps the remaining 69 fixtures from `test T { ... }` to `impl T for SomeTb { ... }` and then removes the classic-form parser entry.
 
 ## 4. Surface — inline `run` inside `test`  *(shipped in PR #91 + #92)*
 
