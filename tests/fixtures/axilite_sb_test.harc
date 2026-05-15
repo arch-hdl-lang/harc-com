@@ -18,9 +18,11 @@ transaction FuzzReg
     value : uint<32>
 end transaction FuzzReg
 
-test AxiLiteSbTest
-    let dut : AxiLiteRegs
+testbench AxiLiteSbTb
+    dut : AxiLiteRegs
+end testbench AxiLiteSbTb
 
+impl AxiLiteSbTest for AxiLiteSbTb
     run
         log(info, "starting AxiLiteRegs scoreboard fuzz test")
 
@@ -75,7 +77,7 @@ test AxiLiteSbTest
         assert sb.writes == sb.reads else fail("scoreboard counter drift: writes=${sb.writes} reads=${sb.reads}")
         log(info, "PASS: scoreboard drained, ${sb.reads} reads matched ${sb.writes} writes")
     end check
-end test AxiLiteSbTest
+end impl AxiLiteSbTest
 
 // Sim scope: 5 random write/read pairs through a queue scoreboard.
 // `sb` is at test scope so the `check { ... }` phase can see it after

@@ -255,6 +255,15 @@ impl Parser {
             Some(TokenKind::Scoreboard) => self.parse_component(ComponentKind::Scoreboard, doc).map(Item::Scoreboard),
             Some(TokenKind::Sequencer) => self.parse_component(ComponentKind::Sequencer, doc).map(Item::Sequencer),
             Some(TokenKind::Transactor) => self.parse_transactor(doc).map(Item::Transactor),
+            // Classic `test <name> ... end test <name>` form. The
+            // corpus sweep (PR #110 follow-up) migrated every fixture
+            // to the new `impl <name> for <Tb>` form
+            // (docs/test-ergonomics.md §3.3); the parser entry is
+            // kept alive in this PR so the in-tree codegen unit
+            // tests (~50 inline-source assertions) keep building.
+            // Removal of the parser entry, plus the codegen-test
+            // sweep, lands in a separate follow-up PR (same pattern
+            // as PR #91 → #92 staged the inline-run migration).
             Some(TokenKind::Test) => self.parse_test(doc).map(Item::Test),
             Some(TokenKind::Extend) => self.parse_extend(doc).map(Item::Extend),
             Some(TokenKind::Covergroup) => self.parse_covergroup(doc).map(Item::Covergroup),

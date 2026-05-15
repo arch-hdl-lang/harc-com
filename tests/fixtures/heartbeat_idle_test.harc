@@ -45,12 +45,13 @@ agent Producer
     end on
 end agent Producer
 
-test HeartbeatIdleTest
-    let dut : Top
+testbench HeartbeatIdleTb
+    dut  : Top
+    prod : Producer
+end testbench HeartbeatIdleTb
 
+impl HeartbeatIdleTest for HeartbeatIdleTb
     clock clk = SysDomain
-
-    let prod : Producer
 
     run
         // Park the DUT so it doesn't interfere — we only care about
@@ -85,5 +86,5 @@ test HeartbeatIdleTest
             else fail("expected 3 emits to register, got ${prod.seen}")
         log(info, "PASS: agent reported idle_in(8) after ${waited} cycles of inactivity; seen=${prod.seen}")
     end run
-end test HeartbeatIdleTest
+end impl HeartbeatIdleTest
 

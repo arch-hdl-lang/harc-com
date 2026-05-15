@@ -127,9 +127,11 @@ tseq RandomTxns(n: int) -> TSeq<RegOp>
     end for
 end tseq RandomTxns
 
-test TransactorEnvModeTest
-    let dut : AxiLiteRegs
+testbench TransactorEnvModeTb
+    dut : AxiLiteRegs
+end testbench TransactorEnvModeTb
 
+impl TransactorEnvModeTest for TransactorEnvModeTb
     // Same env declaration, two instantiations. Mode flows down two
     // levels (env → agent → transactor) at each.
     let active_env  : AxilEnv active
@@ -195,5 +197,5 @@ test TransactorEnvModeTest
 
         log(info, "PASS: same env decl, mode inherited two levels — env→agent→transactor")
     end run
-end test TransactorEnvModeTest
+end impl TransactorEnvModeTest
 

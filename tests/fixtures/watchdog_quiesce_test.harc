@@ -41,12 +41,13 @@ agent Producer
     end watchdog
 end agent Producer
 
-test WatchdogQuiesceTest
-    let dut : Top
+testbench WatchdogQuiesceTb
+    dut  : Top
+    prod : Producer
+end testbench WatchdogQuiesceTb
 
+impl WatchdogQuiesceTest for WatchdogQuiesceTb
     clock clk = SysDomain
-
-    let prod : Producer
 
     run
         dut.rst = 1
@@ -73,5 +74,5 @@ test WatchdogQuiesceTest
             timeout 200 cycles fail("agent did not finish all 20 emits")
         log(info, "PASS: watchdog watched ${prod.seen} emits without tripping")
     end run
-end test WatchdogQuiesceTest
+end impl WatchdogQuiesceTest
 

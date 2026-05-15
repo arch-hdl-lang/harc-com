@@ -35,8 +35,11 @@ transactor AxilHelper bound to BusAxiLite
     end when
 end transactor AxilHelper
 
-test BindRemapTest
-    let dut    : axil_amba
+testbench BindRemapTb
+    dut : axil_amba
+end testbench BindRemapTb
+
+impl BindRemapTest for BindRemapTb
     let s_axi  : BusAxiLite = bind dut with {
         aw.valid: "s_axi_awvalid", aw.ready: "s_axi_awready", aw.addr: "s_axi_awaddr",
         w.valid:  "s_axi_wvalid",  w.ready:  "s_axi_wready",
@@ -73,4 +76,4 @@ test BindRemapTest
 
         log(info, "PASS: bind remap routed all 5 channels to AMBA-style port names")
     end run
-end test BindRemapTest
+end impl BindRemapTest

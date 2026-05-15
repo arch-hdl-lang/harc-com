@@ -813,6 +813,18 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         }
     }
 
+    // ── Covergroup structs (per-bin counters + sample() + report()) ─────
+    // Emitted BEFORE component structs so a `testbench Tb { cov : Cg }`
+    // body can name `Cg` as a field type without a forward-decl. The
+    // testbench/env composition is the only direction the dependency
+    // runs — covergroups are leaf observables, they never name a
+    // component or transactor.
+    for it in &file.items {
+        if let Item::Covergroup(g) = it {
+            e.emit_covergroup_struct(g);
+        }
+    }
+
     // ── Monitor structs ──────────────────────────────────────────────────
     // Same shape as scoreboards; output `event<T>` fields lower to
     // ── Component structs (agent / env / sequencer).
@@ -837,13 +849,6 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                 e.emit_component_struct(&synth);
             }
             _ => {}
-        }
-    }
-
-    // ── Covergroup structs (per-bin counters + sample() + report()) ─────
-    for it in &file.items {
-        if let Item::Covergroup(g) = it {
-            e.emit_covergroup_struct(g);
         }
     }
 
@@ -2737,6 +2742,20 @@ impl Emitter {
                         }
                     }
                 }
+                continue;
+            }
+
+            // Covergroup sub-field. Register the per-cycle sample
+            // closure prefixed with the sub-instance path so the
+            // testbench-bound form (`testbench Tb { cov : Cg }`)
+            // gets its sample firing for free. Without this, a
+            // covergroup declared as a testbench field never
+            // samples (the test-scope `let cov : Cg` registration
+            // is the only path otherwise — and the desugarer doesn't
+            // mint a parallel let at test scope).
+            if let Some(g) = self.covergroups.get(field_ty).cloned() {
+                let sub_inst = format!("{}.{}", instance_path, f.name.name);
+                self.emit_covergroup_sample_registration(&g, &sub_inst, depth);
                 continue;
             }
 
@@ -9060,7 +9079,27 @@ fn rewrite_stmt_for_impl(
                 rewrite_expr_for_impl(e, fields, methods, pointers, shadow);
             }
         }
-        StmtKind::Log { args, .. } | StmtKind::LogF { args, .. } | StmtKind::Emit { args, .. } => {
+        StmtKind::Log { args, .. } | StmtKind::LogF { args, .. } => {
+            for a in args.iter_mut() {
+                match a {
+                    CallArg::Expr(e) => rewrite_expr_for_impl(e, fields, methods, pointers, shadow),
+                    CallArg::Named { value, .. } => {
+                        rewrite_expr_for_impl(value, fields, methods, pointers, shadow);
+                    }
+                }
+            }
+        }
+        StmtKind::Emit { name, args, .. } => {
+            // Multi-segment `emit X.Y(t)` lowers verbatim as
+            // `X.Y(...)` in the codegen at StmtKind::Emit handling
+            // (see lower_emit). If the head segment is a testbench
+            // field, prepend `_tb` so the lowered C++ resolves
+            // through the testbench struct.
+            if let Some(head) = name.segments.first() {
+                if fields.contains(&head.name) && !shadow.contains(&head.name) {
+                    name.segments.insert(0, Ident { name: "_tb".into(), span: head.span });
+                }
+            }
             for a in args.iter_mut() {
                 match a {
                     CallArg::Expr(e) => rewrite_expr_for_impl(e, fields, methods, pointers, shadow),
@@ -9191,14 +9230,79 @@ fn rewrite_expr_for_impl(
             rewrite_expr_for_impl(expr, fields, methods, _pointers, shadow);
             rewrite_expr_for_impl(set, fields, methods, _pointers, shadow);
         }
+        ExprKind::String(s) => {
+            // Rewrite testbench-field references inside `${...}`
+            // interpolations. Without this, `fail("count = ${env.sb}")`
+            // emits raw `env.sb` after the desugarer has already
+            // rewritten the rest of the AST, producing a compile-time
+            // "undeclared identifier" in C++. Textual rewrite is
+            // safe — `${...}` spans don't nest in v0.
+            *s = rewrite_interp_in_string(s, fields, methods, shadow);
+        }
         ExprKind::DistLit(_)
         | ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Time(_)
-        | ExprKind::String(_)
         | ExprKind::Bool(_)
         | ExprKind::ImplicitSelf => {}
     }
+}
+
+/// Scan a string literal for `${...}` interpolation segments and
+/// prepend `_tb.` to any segment whose leading identifier matches
+/// a testbench field (or method that's been folded into scope) and
+/// isn't shadowed. Operates textually so it can't get confused by
+/// quote-escaping nuances inside the expression — `${...}` doesn't
+/// nest in v0.
+fn rewrite_interp_in_string(
+    s: &str,
+    fields: &std::collections::HashSet<String>,
+    methods: &std::collections::HashSet<String>,
+    shadow: &std::collections::HashSet<String>,
+) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Look for the start of a `${` interpolation (not preceded by
+        // a backslash). v0 doesn't ship a fancier escape grammar, so
+        // a bare `${` is always an interpolation.
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            out.push_str("${");
+            i += 2;
+            // Capture up to the matching `}`.
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'}' {
+                i += 1;
+            }
+            let segment = &s[start..i];
+            // Extract the leading identifier (before any `.`, `:`,
+            // `[`, or whitespace). The format-spec suffix `:<fmt>` is
+            // preserved unchanged so widthhex / decimal hints
+            // continue to work.
+            let head_end = segment
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(segment.len());
+            let head = &segment[..head_end];
+            if !head.is_empty()
+                && (fields.contains(head) || methods.contains(head))
+                && !shadow.contains(head)
+            {
+                out.push_str("_tb.");
+            }
+            out.push_str(segment);
+            // Consume the closing `}` (if present — malformed
+            // interpolations pass through untouched).
+            if i < bytes.len() {
+                out.push('}');
+                i += 1;
+            }
+        } else {
+            out.push(s.as_bytes()[i] as char);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Enforce: a transactor's always-on body (anything not under

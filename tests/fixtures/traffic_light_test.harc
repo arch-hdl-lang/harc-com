@@ -15,10 +15,12 @@ covergroup LightCov @(posedge dut.clk)
     cp_green  : cover dut.green  bins lit={1} dark={0} end bins
 end covergroup LightCov
 
-test TrafficLightTest
-    let dut : TrafficLight
-    let cov : LightCov
+testbench TrafficLightTb
+    dut : TrafficLight
+    cov : LightCov
+end testbench TrafficLightTb
 
+impl TrafficLightTest for TrafficLightTb
     run
         // Reset: hold timer=1 so the FSM doesn't try to leave Red
         // before rst deasserts.
@@ -76,5 +78,5 @@ test TrafficLightTest
         assert cov.cp_yellow.lit > 0 else fail("Yellow state coverage hole")
         assert cov.cp_green.lit  > 0 else fail("Green  state coverage hole")
     end check
-end test TrafficLightTest
+end impl TrafficLightTest
 

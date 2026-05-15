@@ -70,10 +70,12 @@ transactor CamDualXactor
     end when
 end transactor CamDualXactor
 
-test CamDualBasicTest
-    let dut  : Mshr_Addr_Cam_Dual
-    let xact : CamDualXactor active
+testbench CamDualBasicTb
+    dut  : Mshr_Addr_Cam_Dual
+    xact : CamDualXactor active
+end testbench CamDualBasicTb
 
+impl CamDualBasicTest for CamDualBasicTb
     clock clk = SysDomain
 
     run
@@ -165,5 +167,5 @@ test CamDualBasicTest
             else fail("post-reset: search_mask=${dut.search_mask}, expected 0")
         log(info, "PASS: reset clears all valid bits")
     end run
-end test CamDualBasicTest
+end impl CamDualBasicTest
 

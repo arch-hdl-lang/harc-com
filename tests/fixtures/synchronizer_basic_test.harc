@@ -3,9 +3,11 @@
 // dst_clk; src_clk is unused inside the module. Mirrors
 // arch-com/examples/synchronizer_basic_tb.cpp.
 
-test FlagSyncTest
-    let dut : FlagSync
+testbench FlagSyncTb
+    dut : FlagSync
+end testbench FlagSyncTb
 
+impl FlagSyncTest for FlagSyncTb
     // dst_clk drives the sync chain. Make it the primary so `wait 1
     // cycle` advances dst_clk (matches the original C++ TB).
     clock dst_clk = SlowDomain    // 50 MHz  → 20 ns period
@@ -60,5 +62,5 @@ test FlagSyncTest
         dut.rst = 0
         log(info, "PASS: mid-operation reset clears chain")
     end run
-end test FlagSyncTest
+end impl FlagSyncTest
 

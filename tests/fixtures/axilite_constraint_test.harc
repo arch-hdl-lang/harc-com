@@ -12,9 +12,11 @@ transaction RegPair
     value : uint<32>
 end transaction RegPair
 
-test AxiLiteConstraintTest
-    let dut : AxiLiteRegs
+testbench AxiLiteConstraintTb
+    dut : AxiLiteRegs
+end testbench AxiLiteConstraintTb
 
+impl AxiLiteConstraintTest for AxiLiteConstraintTb
     run
         log(info, "starting AxiLiteRegs constraint-solver fuzz test")
 
@@ -70,7 +72,7 @@ test AxiLiteConstraintTest
 
         log(info, "PASS: 4 constraint-solved iterations on MM2S_SA")
     end run
-end test AxiLiteConstraintTest
+end impl AxiLiteConstraintTest
 
 // Constraint-solving fuzz scope. Each iteration asks Z3 to find an
 // (addr, value) pair satisfying:

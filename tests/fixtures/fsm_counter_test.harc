@@ -30,9 +30,11 @@ function run_count(dut: FsmCounter, target: uint<8>, expected_count: uint<8>)
         else fail("done should clear when FSM returns to IDLE")
 end function run_count
 
-test FsmCounterTest
-    let dut : FsmCounter
+testbench FsmCounterTb
+    dut : FsmCounter
+end testbench FsmCounterTb
 
+impl FsmCounterTest for FsmCounterTb
     clock clk = SysDomain        // 100 MHz
 
     run
@@ -59,5 +61,5 @@ test FsmCounterTest
         run_count(dut, 0, 1)
         log(info, "PASS: target=0 → count=1 (immediate done)")
     end run
-end test FsmCounterTest
+end impl FsmCounterTest
 

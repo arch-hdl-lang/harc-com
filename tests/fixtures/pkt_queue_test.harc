@@ -41,9 +41,11 @@ function pq_pop(dut: PacketQueue) -> uint<32>
     return dut.pop_data
 end function pq_pop
 
-test PacketQueueTest
-    let dut : PacketQueue
+testbench PacketQueueTb
+    dut : PacketQueue
+end testbench PacketQueueTb
 
+impl PacketQueueTest for PacketQueueTb
     run
         // Reset.
         dut.rst = 1
@@ -104,5 +106,5 @@ test PacketQueueTest
         assert dut.empty == 1 else fail("empty after interleaved")
         log(info, "PASS: interleaved push/pop ordering preserved")
     end run
-end test PacketQueueTest
+end impl PacketQueueTest
 

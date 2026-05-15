@@ -35,12 +35,13 @@ agent SilentAgent
     end watchdog
 end agent SilentAgent
 
-test WatchdogTripDemoTest
-    let dut : Top
+testbench WatchdogTripDemoTb
+    dut : Top
+    agent : SilentAgent
+end testbench WatchdogTripDemoTb
 
+impl WatchdogTripDemoTest for WatchdogTripDemoTb
     clock clk = SysDomain
-
-    let agent : SilentAgent
 
     run
         dut.rst = 1
@@ -53,5 +54,5 @@ test WatchdogTripDemoTest
 
         log(info, "DEMO: watchdog should have tripped multiple times above")
     end run
-end test WatchdogTripDemoTest
+end impl WatchdogTripDemoTest
 
