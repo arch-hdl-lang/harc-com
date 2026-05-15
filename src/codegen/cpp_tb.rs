@@ -927,7 +927,14 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "").ok();
     }
 
-    writeln!(e.out, "int main(int argc, char** argv) {{").ok();
+    // Per-test entry point. The dispatcher `int main()` below picks
+    // which `run_<TestName>` to invoke based on `--test <name>` or the
+    // `HARC_TEST` env var. Each `run_<TestName>` owns its DUT pointer,
+    // its scheduler, its `_checkers` vector — every test runs against
+    // its own fresh Verilator instance (sequentially, in one binary
+    // run). See docs/separate-compilation-plan.md for the future
+    // direction (per-test `.o` files).
+    writeln!(e.out, "int run_{}(int argc, char** argv) {{", test.name.name).ok();
     writeln!(e.out, "{INDENT}Verilated::commandArgs(argc, argv);").ok();
     writeln!(e.out, "{INDENT}V{dut_type}* dut = new V{dut_type};").ok();
     writeln!(e.out, "{INDENT}int errors = 0;").ok();
@@ -1808,6 +1815,23 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         "{INDENT}else             {{ std::printf(\"\\n%d TESTS FAILED\\n\", errors); return 1; }}"
     )
     .ok();
+    writeln!(e.out, "}}").ok();
+    writeln!(e.out, "").ok();
+
+    // Dispatcher `main()`. Single-test today (the file-scope test
+    // is just one); the multi-test loop (Phase 1b) wraps the
+    // `int run_<TestName>` body in a loop over `&tests` and adds
+    // additional `if (strcmp(test, "X") == 0) return run_X(...);`
+    // branches here.
+    let test_name = &test.name.name;
+    writeln!(e.out, "int main(int argc, char** argv) {{").ok();
+    writeln!(e.out, "{INDENT}const char* test_sel = std::getenv(\"HARC_TEST\");").ok();
+    writeln!(e.out, "{INDENT}for (int i = 1; i + 1 < argc; i++) {{").ok();
+    writeln!(e.out, "{INDENT}{INDENT}if (std::strcmp(argv[i], \"--test\") == 0) {{ test_sel = argv[i + 1]; break; }}").ok();
+    writeln!(e.out, "{INDENT}}}").ok();
+    writeln!(e.out, "{INDENT}if (!test_sel || std::strcmp(test_sel, \"{test_name}\") == 0) return run_{test_name}(argc, argv);").ok();
+    writeln!(e.out, "{INDENT}std::fprintf(stderr, \"unknown test: %s (available: {test_name})\\n\", test_sel);").ok();
+    writeln!(e.out, "{INDENT}return 1;").ok();
     writeln!(e.out, "}}").ok();
 
     if !e.errors.is_empty() {
