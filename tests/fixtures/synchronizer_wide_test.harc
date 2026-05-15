@@ -11,9 +11,11 @@ domain DstDomain
   freq_mhz: 133
 end domain DstDomain
 
-test DataSyncTest
-    let dut : DataSync
+testbench DataSyncTb
+    dut : DataSync
+end testbench DataSyncTb
 
+impl DataSyncTest for DataSyncTb
     clock dst_clk = DstDomain
     clock src_clk = SrcDomain
 
@@ -91,5 +93,5 @@ test DataSyncTest
             else fail("stream i=4: data_out=${dut.data_out:02x}, expected 0x33")
         log(info, "PASS: data stream propagates with 3-cycle delay")
     end run
-end test DataSyncTest
+end impl DataSyncTest
 

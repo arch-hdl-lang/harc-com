@@ -2149,8 +2149,9 @@ end impl Smoke"#,
     );
 }
 
-/// Classic `test T { ... }` form keeps working alongside the new
-/// bound form — sweep + parser-entry removal is Phase 2.
+/// Classic `test T { ... }` form keeps building in this PR — the
+/// parser-entry removal + the inline-source-test sweep lands as a
+/// follow-up. Mirrors PR #91 → #92's staged inline-`run` migration.
 #[test]
 fn classic_test_form_still_emits() {
     let parsed = parse_source(

@@ -42,9 +42,11 @@ function harc_crc8_step(crc: uint<8>, byte: uint<8>) -> uint<8>
     return x
 end function harc_crc8_step
 
-test ExternFnRefTest
-    let dut : Top
+testbench ExternFnRefTb
+    dut : Top
+end testbench ExternFnRefTb
 
+impl ExternFnRefTest for ExternFnRefTb
     clock clk = SysDomain
 
     run
@@ -69,5 +71,5 @@ test ExternFnRefTest
 
         log(info, "PASS: 16-byte CRC-8 round-trip matched C reference; final=0x${crc_ref:02x}")
     end run
-end test ExternFnRefTest
+end impl ExternFnRefTest
 

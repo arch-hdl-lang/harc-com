@@ -47,9 +47,12 @@ transactor NocCreditXactor
     end when
 end transactor NocCreditXactor
 
-test NocCreditTest
-    let dut  : NocCreditTop
-    let xact : NocCreditXactor active
+testbench NocCreditTb
+    dut  : NocCreditTop
+    xact : NocCreditXactor active
+end testbench NocCreditTb
+
+impl NocCreditTest for NocCreditTb
 
     run
         log(info, "NocCreditTop credit-channel test")
@@ -111,5 +114,5 @@ test NocCreditTest
 
         log(info, "ALL 5 SUB-TESTS PASSED — NocCreditTop credit-channel coverage")
     end run
-end test NocCreditTest
+end impl NocCreditTest
 

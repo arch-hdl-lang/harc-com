@@ -51,8 +51,11 @@ regblock DmaRegs via AxilHelper width 32
     register MM2S_SA @ 0x18 access rw
 end regblock DmaRegs
 
-test RegblockFieldsTest
-    let dut    : AxiLiteRegs
+testbench RegblockFieldsTb
+    dut : AxiLiteRegs
+end testbench RegblockFieldsTb
+
+impl RegblockFieldsTest for RegblockFieldsTb
     let axil   : BusAxiLite = bind dut
     let helper : AxilHelper active = bind axil
     let regs   : DmaRegs = bind helper
@@ -102,4 +105,4 @@ test RegblockFieldsTest
 
         log(info, "PASS: field-level R/W on DMACR + register-level R/W on MM2S_SA")
     end run
-end test RegblockFieldsTest
+end impl RegblockFieldsTest

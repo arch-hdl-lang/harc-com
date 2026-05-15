@@ -81,10 +81,12 @@ tseq RandomTxns(n: int) -> TSeq<AxilTxn>
     end for
 end tseq RandomTxns
 
-test AxiLiteEnvTest
-    let dut : AxiLiteRegs
-    let env : AxilEnv
+testbench AxiLiteEnvTb
+    dut : AxiLiteRegs
+    env : AxilEnv
+end testbench AxiLiteEnvTb
 
+impl AxiLiteEnvTest for AxiLiteEnvTb
     run
         log(info, "AxiLiteRegs env-composite test")
         env.drv.dut = dut
@@ -129,5 +131,5 @@ test AxiLiteEnvTest
 
         log(info, "PASS: 5 round-trips through env.drv with env.sb scoreboard")
     end run
-end test AxiLiteEnvTest
+end impl AxiLiteEnvTest
 

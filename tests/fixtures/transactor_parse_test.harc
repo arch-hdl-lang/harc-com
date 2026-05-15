@@ -48,8 +48,11 @@ transactor AxilXactor bound to BusAxiLite
     end when
 end transactor AxilXactor
 
-test TransactorParseTest
-    let dut  : AxiLiteRegs
+testbench TransactorParseTb
+    dut : AxiLiteRegs
+end testbench TransactorParseTb
+
+impl TransactorParseTest for TransactorParseTb
     let axil : BusAxiLite = bind dut
     let drv  : AxilXactor active  = bind axil
     let obs  : AxilXactor passive = bind axil
@@ -59,5 +62,5 @@ test TransactorParseTest
         // point in T-1, so the run body just needs to parse.
         wait 1 cycle
     end run
-end test TransactorParseTest
+end impl TransactorParseTest
 

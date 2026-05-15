@@ -22,9 +22,11 @@ tseq RandomRegs(n: int) -> TSeq<RegData>
     end for
 end tseq RandomRegs
 
-test AxiLiteFuzzTest
-    let dut : AxiLiteRegs
+testbench AxiLiteFuzzTb
+    dut : AxiLiteRegs
+end testbench AxiLiteFuzzTb
 
+impl AxiLiteFuzzTest for AxiLiteFuzzTb
     run
         log(info, "starting AxiLiteRegs fuzz test")
 
@@ -69,7 +71,7 @@ test AxiLiteFuzzTest
 
         log(info, "PASS: 5 random round-trips on MM2S_SA")
     end run
-end test AxiLiteFuzzTest
+end impl AxiLiteFuzzTest
 
 // Fuzz scope: write 5 random 32-bit values to MM2S_SA (offset 0x18 — known
 // RW register), read each back, assert they round-trip. With a fixed seed

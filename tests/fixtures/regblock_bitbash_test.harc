@@ -49,8 +49,11 @@ regblock DmaRegs via AxilHelper width 32
     register CMD_WO    @ 0x58 access wo
 end regblock DmaRegs
 
-test RegblockBitbashTest
-    let dut    : AxiLiteRegs
+testbench RegblockBitbashTb
+    dut : AxiLiteRegs
+end testbench RegblockBitbashTb
+
+impl RegblockBitbashTest for RegblockBitbashTb
     let axil   : BusAxiLite = bind dut
     let helper : AxilHelper active = bind axil
     let regs   : DmaRegs = bind helper
@@ -85,4 +88,4 @@ test RegblockBitbashTest
             else fail("bitbash reported ${errors} mismatch(es)")
         log(info, "PASS: bitbash walked 3 RW registers with all-ones and zero patterns")
     end run
-end test RegblockBitbashTest
+end impl RegblockBitbashTest

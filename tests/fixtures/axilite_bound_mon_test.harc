@@ -73,8 +73,11 @@ tseq RandomTxns(n: int) -> TSeq<RegOp>
     end for
 end tseq RandomTxns
 
-test AxiLiteBoundMonTest
-    let dut  : AxiLiteRegs
+testbench AxiLiteBoundMonTb
+    dut : AxiLiteRegs
+end testbench AxiLiteBoundMonTb
+
+impl AxiLiteBoundMonTest for AxiLiteBoundMonTb
     let axil : BusAxiLite = bind dut
     let drv  : AxilXactor active  = bind axil
     let mon  : AxilXactor passive = bind axil
@@ -123,5 +126,5 @@ test AxiLiteBoundMonTest
 
         log(info, "PASS: passive transactor observed 5 writes + 5 reads")
     end run
-end test AxiLiteBoundMonTest
+end impl AxiLiteBoundMonTest
 

@@ -9,9 +9,11 @@
 // to the named clock, so each step times naturally even though the two
 // domains run at different frequencies.
 
-test EventSyncTest
-    let dut : EventSync
+testbench EventSyncTb
+    dut : EventSync
+end testbench EventSyncTb
 
+impl EventSyncTest for EventSyncTb
     clock src_clk = SrcDomain    // 100 MHz → 10 ns period
     clock dst_clk = DstDomain    // 200 MHz → 5  ns period
 
@@ -62,5 +64,5 @@ test EventSyncTest
         end for
         log(info, "PASS: no spurious pulses during idle")
     end run
-end test EventSyncTest
+end impl EventSyncTest
 

@@ -114,10 +114,12 @@ transactor BufMgrXactor
     end when
 end transactor BufMgrXactor
 
-test BufMgrSmTest
-    let dut  : BufMgrSm
-    let xact : BufMgrXactor active
+testbench BufMgrSmTb
+    dut  : BufMgrSm
+    xact : BufMgrXactor active
+end testbench BufMgrSmTb
 
+impl BufMgrSmTest for BufMgrSmTb
     run
         log(info, "BufMgrSm small-variant test (16x32, 4 queues)")
         xact.dut = dut
@@ -239,5 +241,5 @@ test BufMgrSmTest
 
         log(info, "ALL 6 SUB-TESTS PASSED — BufMgrSm coverage")
     end run
-end test BufMgrSmTest
+end impl BufMgrSmTest
 

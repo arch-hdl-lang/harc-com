@@ -7,9 +7,11 @@
 // pattern any wide-bus DUT would use (AXI4 256/512/1024-bit
 // data, vector lane state, etc.).
 
-test WideRegTest
-    let dut : WideReg
+testbench WideRegTb
+    dut : WideReg
+end testbench WideRegTb
 
+impl WideRegTest for WideRegTb
     run
         log(info, "wide-bit-vector test: 256-bit signal whole-signal access")
 
@@ -66,5 +68,5 @@ test WideRegTest
 
         log(info, "ALL 3 SUB-TESTS PASSED — wide bit-vector codegen")
     end run
-end test WideRegTest
+end impl WideRegTest
 

@@ -32,9 +32,11 @@ transaction Req
     keep color != RED
 end transaction Req
 
-test KeepConstraintsTest
-    let dut : Top
+testbench KeepConstraintsTb
+    dut : Top
+end testbench KeepConstraintsTb
 
+impl KeepConstraintsTest for KeepConstraintsTb
     clock clk = SysDomain
 
     run
@@ -64,5 +66,5 @@ test KeepConstraintsTest
 
         log(info, "PASS: 30 randomize(t) calls satisfied every keep constraint")
     end run
-end test KeepConstraintsTest
+end impl KeepConstraintsTest
 

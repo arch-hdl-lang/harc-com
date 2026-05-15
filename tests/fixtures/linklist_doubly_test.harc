@@ -118,9 +118,12 @@ transactor SchedXactor
     end when
 end transactor SchedXactor
 
-test LinklistDoublyTest
-    let dut  : SchedList
-    let xact : SchedXactor active
+testbench LinklistDoublyTb
+    dut  : SchedList
+    xact : SchedXactor active
+end testbench LinklistDoublyTb
+
+impl LinklistDoublyTest for LinklistDoublyTb
 
     run
         log(info, "SchedList doubly-linked list test")
@@ -240,5 +243,5 @@ test LinklistDoublyTest
 
         log(info, "ALL 5 SUB-TESTS PASSED — SchedList doubly-linked list coverage")
     end run
-end test LinklistDoublyTest
+end impl LinklistDoublyTest
 

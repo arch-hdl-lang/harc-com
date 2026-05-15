@@ -10,9 +10,11 @@ property pipe_depth_3
     !rst |-> data_out == past(data_in ^ 255, 3)
 end property pipe_depth_3
 
-test PipeRegTest
-    let dut : PipeRegTest
+testbench PipeRegTb
+    dut : PipeRegTest
+end testbench PipeRegTb
 
+impl PipeRegTest for PipeRegTb
     run
         // Reset for 2 cycles.
         dut.rst = 1
@@ -51,5 +53,5 @@ test PipeRegTest
 
         log(info, "PASS: 3-stage pipeline propagates with correct delay")
     end run
-end test PipeRegTest
+end impl PipeRegTest
 

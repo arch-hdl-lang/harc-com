@@ -6,9 +6,11 @@
 // drove clocks on artificial schedules like "only slow_clk toggles"
 // — those are simulator-behavior tests, not DUT-property tests).
 
-test MultiClockSyncTest
-    let dut : MultiClockSync
+testbench MultiClockSyncTb
+    dut : MultiClockSync
+end testbench MultiClockSyncTb
 
+impl MultiClockSyncTest for MultiClockSyncTb
     clock fast_clk = FastDomain    // 200 MHz → 5  ns period
     clock slow_clk = SlowDomain    //  50 MHz → 20 ns period
 
@@ -55,5 +57,5 @@ test MultiClockSyncTest
             else fail("fast advanced ${now_fast - prev_fast} during 1 slow cycle, expected 4")
         log(info, "PASS: independent clock domains advance in real time (4:1 ratio observed)")
     end run
-end test MultiClockSyncTest
+end impl MultiClockSyncTest
 

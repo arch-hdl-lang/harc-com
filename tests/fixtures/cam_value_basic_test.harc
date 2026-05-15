@@ -40,10 +40,12 @@ transactor CamValueXactor
     end when
 end transactor CamValueXactor
 
-test CamValueBasicTest
-    let dut  : Tag_Value_Cam
-    let xact : CamValueXactor active
+testbench CamValueBasicTb
+    dut  : Tag_Value_Cam
+    xact : CamValueXactor active
+end testbench CamValueBasicTb
 
+impl CamValueBasicTest for CamValueBasicTb
     clock clk = SysDomain
 
     run
@@ -133,5 +135,5 @@ test CamValueBasicTest
             else fail("post-reset: search_any=${dut.search_any}, expected 0")
         log(info, "PASS: post-reset: empty")
     end run
-end test CamValueBasicTest
+end impl CamValueBasicTest
 

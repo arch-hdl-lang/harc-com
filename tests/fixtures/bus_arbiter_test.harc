@@ -23,10 +23,12 @@ covergroup ArbCov @(posedge dut.clk)
         end bins
 end covergroup ArbCov
 
-test BusArbiterTest
-    let dut : BusArbiter
-    let cov : ArbCov
+testbench BusArbiterTb
+    dut : BusArbiter
+    cov : ArbCov
+end testbench BusArbiterTb
 
+impl BusArbiterTest for BusArbiterTb
     run
         // Reset
         dut.rst = 1
@@ -67,5 +69,5 @@ test BusArbiterTest
         assert cov.cp_valid.granted    > 0 else fail("granted coverage hole")
         assert cov.cp_valid.no_request > 0 else fail("no-request coverage hole")
     end check
-end test BusArbiterTest
+end impl BusArbiterTest
 

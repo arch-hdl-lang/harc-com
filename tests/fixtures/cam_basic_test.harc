@@ -15,9 +15,11 @@ function cam_write(dut: Mshr_Addr_Cam, idx: uint<5>, key: uint<10>, set: bool)
     dut.write_valid = 0
 end function cam_write
 
-test CamBasicTest
-    let dut : Mshr_Addr_Cam
+testbench CamBasicTb
+    dut : Mshr_Addr_Cam
+end testbench CamBasicTb
 
+impl CamBasicTest for CamBasicTb
     clock clk = SysDomain
 
     run
@@ -85,5 +87,5 @@ test CamBasicTest
             else fail("post-clear: first=${dut.search_first}, expected 7")
         log(info, "PASS: clear idx 3 → search 0x55 finds only idx 7")
     end run
-end test CamBasicTest
+end impl CamBasicTest
 

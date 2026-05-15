@@ -45,8 +45,11 @@ transactor AxilHelper bound to BusAxiLite
     end when
 end transactor AxilHelper
 
-test AxiLiteRegsFullTest
-    let dut    : AxiLiteRegs
+testbench AxiLiteRegsFullTb
+    dut : AxiLiteRegs
+end testbench AxiLiteRegsFullTb
+
+impl AxiLiteRegsFullTest for AxiLiteRegsFullTb
     let axil   : BusAxiLite = bind dut
     let helper : AxilHelper active = bind axil
 
@@ -239,5 +242,5 @@ test AxiLiteRegsFullTest
 
         log(info, "ALL 6 SUB-TESTS PASSED — register-level coverage of AxiLiteRegs")
     end run
-end test AxiLiteRegsFullTest
+end impl AxiLiteRegsFullTest
 

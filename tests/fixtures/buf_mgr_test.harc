@@ -137,10 +137,12 @@ transactor BufMgrXactor
     end when
 end transactor BufMgrXactor
 
-test BufMgrTest
-    let dut  : BufMgr
-    let xact : BufMgrXactor active
+testbench BufMgrTb
+    dut  : BufMgr
+    xact : BufMgrXactor active
+end testbench BufMgrTb
 
+impl BufMgrTest for BufMgrTb
     run
         log(info, "BufMgr: 256-queue shared buffer manager — 7 sub-tests")
         xact.dut = dut
@@ -261,5 +263,5 @@ test BufMgrTest
 
         log(info, "ALL 7 SUB-TESTS PASSED — BufMgr 256-queue buffer manager coverage")
     end run
-end test BufMgrTest
+end impl BufMgrTest
 
