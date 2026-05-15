@@ -127,32 +127,82 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     let file = desugar_impl_for_test_in_file(file);
     let file = &file;
 
-    // Find a single `test` item — the entry point.
-    let test_decl = file
-        .items
-        .iter()
-        .find_map(|it| match it {
-            Item::Test(t) => Some(t),
-            _ => None,
-        })
-        .ok_or_else(|| EmitError("no `test` declaration found".into()))?;
-
-    // Inline-form `phase <name> ... end phase` blocks declared directly
-    // inside the test body (docs/test-ergonomics.md) populate the
-    // `custom_phases` table that downstream codegen emits as named
-    // [&]-lambdas at main() scope. The legacy `impl <target> for <Test>`
-    // wrapper was removed in Phase 2; the per-target multi-impl design
-    // was never used in the fixture corpus and the parser entry is
-    // gone.
-    let custom_phases: Vec<(Ident, Block)> = test_decl
+    // Collect ALL `test` items — every one becomes a `run_<TestName>`
+    // function in the emitted binary, and the dispatcher `main()` at
+    // the end picks one based on `--test <name>` or the `HARC_TEST`
+    // env var (Phase 1b of docs/separate-compilation-plan.md).
+    // Multi-test in one binary lets `harc sim --test foo` then
+    // `harc sim --test bar` share Verilator output (the .cpp is
+    // byte-identical across selectors).
+    let tests: Vec<&TestDecl> = file
         .items
         .iter()
         .filter_map(|it| match it {
-            TestItem::Phase(name, body) => Some((name.clone(), body.clone())),
+            Item::Test(t) => Some(t),
             _ => None,
         })
         .collect();
-    let test = test_decl;
+    if tests.is_empty() {
+        return Err(EmitError("no `test` declaration found".into()));
+    }
+
+    // Validate: all tests in one binary must agree on the DUT type
+    // (Verilator builds one V<top> per build; multi-DUT requires
+    // separate builds, out of scope for v0). Aggregate the probe
+    // accessors across tests so the root-header include gate sees
+    // every test's probes — without this, a test with probes that
+    // wasn't the first one in source order would compile against a
+    // V<Top>.h that didn't pull in V<Top>___024root.h.
+    let mut shared_dut_type: Option<&str> = None;
+    let mut aggregated_probes: std::collections::HashMap<String, ProbeAccessor> =
+        std::collections::HashMap::new();
+    for t in &tests {
+        for it in &t.items {
+            if let TestItem::Let(l) = it {
+                if l.name.name == "dut" {
+                    let ty_name = type_simple_name(l.ty.as_ref()).ok_or_else(|| {
+                        EmitError("`let dut : <Type>` must use a simple named type".into())
+                    })?;
+                    match shared_dut_type {
+                        Some(prev) if prev != ty_name => {
+                            return Err(EmitError(format!(
+                                "multi-DUT tests in one binary are out of scope for v0; \
+                                 test `{}` uses `{}`, but a previous test used `{}`",
+                                t.name.name, ty_name, prev,
+                            )));
+                        }
+                        _ => {
+                            shared_dut_type = Some(ty_name);
+                        }
+                    }
+                    for p in &l.probes {
+                        aggregated_probes
+                            .entry(p.name.name.clone())
+                            .or_insert_with(|| ProbeAccessor {
+                                read: crate::codegen::sv_stub::mangled_accessor(
+                                    ty_name,
+                                    &p.name.name,
+                                ),
+                                force: p.force,
+                            });
+                    }
+                }
+            }
+        }
+    }
+    let dut_type: &str = shared_dut_type.ok_or_else(|| {
+        EmitError("expected `let dut : <Type>` declaration in test body".into())
+    })?;
+
+    // Per-test metadata (custom_phases, other_lets, ...) is derived
+    // inside the per-test emission loop further down. The few
+    // file-scope code paths that previously referenced `test_decl`
+    // (e.g. when computing tseq/funcs/etc.) keep working off any of
+    // the tests — those collections walk `file.items`, not
+    // `test.items`. We bind `test_decl` to the alphabetically-first
+    // test only so leftover single-test references compile during
+    // the staged migration.
+    let _test_decl = tests[0];
 
     // Collect top-level functions — emitted as lambdas inside main() so they
     // can capture `dut` and `tick` lexically.
@@ -197,66 +247,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         }
     }
 
-    // Find the `let dut : <Type>` declaration to learn the V-class name.
-    // Walk both top-level Let items and Lets nested inside `scope sim` blocks.
-    let mut dut_type: Option<&str> = None;
-    let mut other_lets: Vec<&LetStmt> = Vec::new();
-    let mut bare_stmts: Vec<&Stmt> = Vec::new();
-    let mut explicit_run: Option<&Block> = None;
-    let mut clocks: Vec<&ClockDecl> = Vec::new();
-    let mut probe_accessors: std::collections::HashMap<String, ProbeAccessor> =
-        std::collections::HashMap::new();
-    for it in &test.items {
-        match it {
-            TestItem::Let(l) => {
-                if l.name.name == "dut" {
-                    let ty_name = type_simple_name(l.ty.as_ref()).ok_or_else(|| {
-                        EmitError("`let dut : <Type>` must use a simple named type".into())
-                    })?;
-                    dut_type = Some(ty_name);
-                    // Capture probe accessors: name → (mangled read,
-                    // is_force). Matches src/codegen/sv_stub.rs naming.
-                    // Force probes also have `<name>_drv` and
-                    // `<name>_en` siblings — derived on demand.
-                    for p in &l.probes {
-                        probe_accessors.insert(
-                            p.name.name.clone(),
-                            ProbeAccessor {
-                                read: crate::codegen::sv_stub::mangled_accessor(
-                                    ty_name,
-                                    &p.name.name,
-                                ),
-                                force: p.force,
-                            },
-                        );
-                    }
-                } else {
-                    other_lets.push(l);
-                }
-            }
-            TestItem::Scope(s) => {
-                if let Some(r) = &s.run {
-                    explicit_run = Some(r);
-                }
-            }
-            TestItem::Stmt(s) => bare_stmts.push(s),
-            TestItem::Clock(c) => clocks.push(c),
-            _ => {}
-        }
-    }
-    let dut_type = dut_type
-        .ok_or_else(|| EmitError("expected `let dut : <Type>` declaration in test body".into()))?;
-
-    // Mixing rule was previously "pick one of scope sim or bare statements";
-    // relaxed now to "items emit in declaration order" so a property-extend
-    // file can place `assert property X` lines alongside an existing
-    // `scope sim/run` block (typically extends provide setup-like code).
-    if explicit_run.is_none() && bare_stmts.is_empty() {
-        return Err(EmitError(
-            "test has no body — add a `scope sim` or bare statements".into(),
-        ));
-    }
-    let _ = (&explicit_run, &bare_stmts); // kept for parser-level error checking
+    // Per-test metadata (dut_type for V<top>* construction, other_lets,
+    // bare_stmts, explicit_run, clocks, probe_accessors) is derived
+    // inside the per-test emission loop further down (search for
+    // `for test in &tests`). The shared `dut_type` resolved above is
+    // used by file-scope code paths that need the DUT module name.
 
     // Collect transactions + enums + scoreboards + monitors for typed-let
     // emission.
@@ -431,43 +426,6 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // the call-site passive-mode check (further down, in emit_expr) walks
     // this map to determine the effective mode of `<env>.<sub>...<xact>`
     // paths whose root resolves to a let-bound name.
-    let mut let_types = std::collections::HashMap::new();
-    let mut let_modes_seed: std::collections::HashMap<String, TransactorMode> =
-        std::collections::HashMap::new();
-    for l in &other_lets {
-        if let Some(s) = type_simple_name(l.ty.as_ref()) {
-            let_types.insert(l.name.name.clone(), s.to_string());
-        }
-        if let Some(TypeExpr::Named { mode: Some(m), .. }) = l.ty.as_ref() {
-            let_modes_seed.insert(l.name.name.clone(), *m);
-        }
-    }
-
-    let mut pointer_vars = std::collections::HashSet::new();
-    // Test-level `let dut : <NamedType>` is a DUT pointer. Other Named-
-    // typed lets are pointer-shaped only if they're not value-struct
-    // types (transactions / scoreboards) — those default-construct on
-    // the stack and use `.` for field access.
-    pointer_vars.insert("dut".to_string());
-    for l in &other_lets {
-        if let Some(simple) = type_simple_name(l.ty.as_ref()) {
-            if transactions.contains(simple)
-                || scoreboards.contains(simple)
-                || components.contains_key(simple)
-                || covergroups.contains_key(simple)
-                || buses.contains_key(simple)
-                || transactors.contains_key(simple)
-                || regblocks.contains_key(simple)
-                || addrmaps.contains_key(simple)
-            {
-                continue;
-            }
-        }
-        if matches!(&l.ty, Some(TypeExpr::Named { .. })) {
-            pointer_vars.insert(l.name.name.clone());
-        }
-    }
-
     // Build the property name → body table.
     let mut properties = std::collections::HashMap::new();
     for it in &file.items {
@@ -476,12 +434,18 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         }
     }
 
+    // Construct the emitter with all FILE-SCOPE shared state. Per-test
+    // fields (let_types, let_modes, pointer_vars, probes, clock_names,
+    // bus_bindings, bus_remap, covers, actor_threads, field_subs,
+    // driver_bus_for_hookables, let_helper) are intentionally left
+    // empty here — they're reset+populated inside the per-test
+    // emission loop below.
     let mut e = Emitter {
         out: String::new(),
         errors: Vec::new(),
-        pointer_vars,
-        let_types,
-        let_modes: let_modes_seed,
+        pointer_vars: std::collections::HashSet::new(),
+        let_types: std::collections::HashMap::new(),
+        let_modes: std::collections::HashMap::new(),
         transactions,
         scoreboards,
         components,
@@ -494,7 +458,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         event_types: std::collections::HashMap::new(),
         field_subs: std::collections::HashMap::new(),
         covers: Vec::new(),
-        clock_names: clocks.iter().map(|c| c.name.name.clone()).collect(),
+        clock_names: Vec::new(),
         current_yield_target: None,
         tseq_names: tseqs.iter().map(|t| t.name.name.clone()).collect(),
         buses,
@@ -508,7 +472,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         current_component_instance: None,
         txn_keeps,
         relations,
-        probes: probe_accessors,
+        probes: std::collections::HashMap::new(),
         regblocks,
         addrmaps,
         let_helper: std::collections::HashMap::new(),
@@ -516,7 +480,12 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
 
     // Header.
     writeln!(e.out, "// Auto-generated by harc — do not edit.").ok();
-    writeln!(e.out, "// HARC test: {}", test.name.name).ok();
+    if tests.len() == 1 {
+        writeln!(e.out, "// HARC test: {}", tests[0].name.name).ok();
+    } else {
+        let names: Vec<&str> = tests.iter().map(|t| t.name.name.as_str()).collect();
+        writeln!(e.out, "// HARC tests ({}): {}", tests.len(), names.join(", ")).ok();
+    }
     writeln!(e.out, "").ok();
     // Disable clang optimization for this file. clang 17+ on both
     // Apple Silicon and Linux x86_64 mis-optimizes our `[&]`-
@@ -542,7 +511,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // `rootp` field on V<Top> is a forward-declared pointer in
     // `V<Top>.h`). When the test declares one or more probes, also
     // include the root header so `dut->rootp-><mangled>` compiles.
-    if !e.probes.is_empty() {
+    if !aggregated_probes.is_empty() {
         writeln!(e.out, "#include \"V{dut_type}___024root.h\"").ok();
     }
     writeln!(e.out, "#include \"verilated.h\"").ok();
@@ -927,13 +896,111 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "").ok();
     }
 
-    // Per-test entry point. The dispatcher `int main()` below picks
-    // which `run_<TestName>` to invoke based on `--test <name>` or the
-    // `HARC_TEST` env var. Each `run_<TestName>` owns its DUT pointer,
-    // its scheduler, its `_checkers` vector — every test runs against
-    // its own fresh Verilator instance (sequentially, in one binary
-    // run). See docs/separate-compilation-plan.md for the future
-    // direction (per-test `.o` files).
+    // Per-test entry points. Each `Item::Test` in source gets its
+    // own `int run_<TestName>(argc, argv)` function. The dispatcher
+    // `int main()` below picks one based on `--test <name>` /
+    // `HARC_TEST` env. Each run function owns its DUT pointer,
+    // scheduler, `_checkers` vector — tests run against fresh
+    // Verilator instances, sequentially (one binary, dispatched).
+    // See docs/separate-compilation-plan.md for the future per-test
+    // `.o` direction (Phase 2).
+    for test in &tests {
+        // ── Reset Emitter per-test state ────────────────────────────
+        e.let_types.clear();
+        e.let_modes.clear();
+        e.pointer_vars.clear();
+        e.pointer_vars.insert("dut".to_string());
+        e.bus_bindings.clear();
+        e.bus_remap.clear();
+        e.probes.clear();
+        e.clock_names.clear();
+        e.covers.clear();
+        e.actor_threads.clear();
+        e.field_subs.clear();
+        e.driver_bus_for_hookables.clear();
+        e.let_helper.clear();
+        e.in_coroutine = false;
+        e.current_yield_target = None;
+        e.current_component_instance = None;
+
+        // ── Derive per-test metadata ───────────────────────────────
+        let custom_phases: Vec<(Ident, Block)> = test
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                TestItem::Phase(name, body) => Some((name.clone(), body.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut other_lets: Vec<&LetStmt> = Vec::new();
+        let mut bare_stmts: Vec<&Stmt> = Vec::new();
+        let mut explicit_run: Option<&Block> = None;
+        let mut clocks: Vec<&ClockDecl> = Vec::new();
+        for it in &test.items {
+            match it {
+                TestItem::Let(l) => {
+                    if l.name.name == "dut" {
+                        for p in &l.probes {
+                            e.probes.insert(
+                                p.name.name.clone(),
+                                ProbeAccessor {
+                                    read: crate::codegen::sv_stub::mangled_accessor(
+                                        dut_type,
+                                        &p.name.name,
+                                    ),
+                                    force: p.force,
+                                },
+                            );
+                        }
+                    } else {
+                        other_lets.push(l);
+                    }
+                }
+                TestItem::Scope(s) => {
+                    if let Some(r) = &s.run {
+                        explicit_run = Some(r);
+                    }
+                }
+                TestItem::Stmt(s) => bare_stmts.push(s),
+                TestItem::Clock(c) => clocks.push(c),
+                _ => {}
+            }
+        }
+        if explicit_run.is_none() && bare_stmts.is_empty() {
+            return Err(EmitError(format!(
+                "test `{}` has no body — add a `scope sim`, `run`, or bare statements",
+                test.name.name,
+            )));
+        }
+        let _ = (&explicit_run, &bare_stmts);
+
+        // ── Seed Emitter per-test state ────────────────────────────
+        for l in &other_lets {
+            if let Some(s) = type_simple_name(l.ty.as_ref()) {
+                e.let_types.insert(l.name.name.clone(), s.to_string());
+            }
+            if let Some(TypeExpr::Named { mode: Some(m), .. }) = l.ty.as_ref() {
+                e.let_modes.insert(l.name.name.clone(), *m);
+            }
+            if let Some(simple) = type_simple_name(l.ty.as_ref()) {
+                if e.transactions.contains(simple)
+                    || e.scoreboards.contains(simple)
+                    || e.components.contains_key(simple)
+                    || e.covergroups.contains_key(simple)
+                    || e.buses.contains_key(simple)
+                    || e.transactors.contains_key(simple)
+                    || e.regblocks.contains_key(simple)
+                    || e.addrmaps.contains_key(simple)
+                {
+                    continue;
+                }
+            }
+            if matches!(&l.ty, Some(TypeExpr::Named { .. })) {
+                e.pointer_vars.insert(l.name.name.clone());
+            }
+        }
+        e.clock_names = clocks.iter().map(|c| c.name.name.clone()).collect();
+
     writeln!(e.out, "int run_{}(int argc, char** argv) {{", test.name.name).ok();
     writeln!(e.out, "{INDENT}Verilated::commandArgs(argc, argv);").ok();
     writeln!(e.out, "{INDENT}V{dut_type}* dut = new V{dut_type};").ok();
@@ -1817,20 +1884,43 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     .ok();
     writeln!(e.out, "}}").ok();
     writeln!(e.out, "").ok();
+    } // end of `for test in &tests`
 
-    // Dispatcher `main()`. Single-test today (the file-scope test
-    // is just one); the multi-test loop (Phase 1b) wraps the
-    // `int run_<TestName>` body in a loop over `&tests` and adds
-    // additional `if (strcmp(test, "X") == 0) return run_X(...);`
-    // branches here.
-    let test_name = &test.name.name;
+    // Dispatcher `main()` (Phase 1b). One branch per test: the
+    // dispatcher reads `--test <name>` from argv (preferred) or the
+    // `HARC_TEST` env var, then `return run_<TestName>(argc, argv)`.
+    // When unset, dispatches to the alphabetically-first test
+    // (deterministic — matches the sort key in merge_for_sim).
     writeln!(e.out, "int main(int argc, char** argv) {{").ok();
     writeln!(e.out, "{INDENT}const char* test_sel = std::getenv(\"HARC_TEST\");").ok();
     writeln!(e.out, "{INDENT}for (int i = 1; i + 1 < argc; i++) {{").ok();
     writeln!(e.out, "{INDENT}{INDENT}if (std::strcmp(argv[i], \"--test\") == 0) {{ test_sel = argv[i + 1]; break; }}").ok();
     writeln!(e.out, "{INDENT}}}").ok();
-    writeln!(e.out, "{INDENT}if (!test_sel || std::strcmp(test_sel, \"{test_name}\") == 0) return run_{test_name}(argc, argv);").ok();
-    writeln!(e.out, "{INDENT}std::fprintf(stderr, \"unknown test: %s (available: {test_name})\\n\", test_sel);").ok();
+    // Default (no --test, no HARC_TEST) → run the first test.
+    let first_test = &tests[0].name.name;
+    writeln!(
+        e.out,
+        "{INDENT}if (!test_sel) return run_{first_test}(argc, argv);"
+    )
+    .ok();
+    // Branches for every test.
+    for t in &tests {
+        let n = &t.name.name;
+        writeln!(
+            e.out,
+            "{INDENT}if (std::strcmp(test_sel, \"{n}\") == 0) return run_{n}(argc, argv);"
+        )
+        .ok();
+    }
+    // Build the human-readable "available tests" list for the
+    // unknown-test error message.
+    let avail: Vec<&str> = tests.iter().map(|t| t.name.name.as_str()).collect();
+    let avail_csv = avail.join(", ");
+    writeln!(
+        e.out,
+        "{INDENT}std::fprintf(stderr, \"unknown test: %s (available: {avail_csv})\\n\", test_sel);"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}return 1;").ok();
     writeln!(e.out, "}}").ok();
 

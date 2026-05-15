@@ -58,24 +58,30 @@ pub fn merge_for_sim(files: &[SourceFile], pick: Option<&str>) -> Result<SourceF
         test.items.extend(items);
     }
 
-    // Pick a single test for sim.
-    let chosen = match (pick, tests.len()) {
-        (Some(name), _) => tests.remove(name).ok_or_else(|| {
-            format!("no test named `{name}` in input files")
-        })?,
-        (None, 0) => return Err("no `test` declaration found in input files".into()),
-        (None, 1) => tests.into_values().next().unwrap(),
-        (None, _) => {
-            let names: Vec<_> = tests.keys().cloned().collect();
-            return Err(format!(
-                "multiple tests in input ({}); pass --test <name> to select",
-                names.join(", ")
-            ));
+    // Validate `--test <name>` if given — surface a clear error when
+    // the requested test doesn't exist. Otherwise pass ALL tests
+    // through to codegen, which emits one `run_<TestName>` per test
+    // and a dispatcher `main()` that picks one at runtime via
+    // `--test <name>` / `HARC_TEST` (Phase 1b of
+    // docs/separate-compilation-plan.md). The `pick` here used to
+    // filter at merge time; now it just validates.
+    if let Some(name) = pick {
+        if !tests.contains_key(name) {
+            return Err(format!("no test named `{name}` in input files"));
         }
-    };
+    }
+    if tests.is_empty() {
+        return Err("no `test` declaration found in input files".into());
+    }
 
-    // Synthetic file: chosen test plus all other items, in stable order.
+    // Synthetic file: ALL tests plus all other items, in stable order
+    // (alphabetical-by-name for tests to keep emitted output
+    // deterministic across runs).
     let mut items = other_items;
-    items.push(Item::Test(chosen));
+    let mut test_names: Vec<String> = tests.keys().cloned().collect();
+    test_names.sort();
+    for name in test_names {
+        items.push(Item::Test(tests.remove(&name).unwrap()));
+    }
     Ok(SourceFile { items, inner_doc: None, frontmatter: None })
 }
