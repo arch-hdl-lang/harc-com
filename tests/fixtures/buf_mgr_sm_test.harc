@@ -12,7 +12,7 @@
 //   - 16-cycle internal init phase after reset (`init_done` rises
 //     when free-list SRAM has been seeded with all 16 slots)
 //
-// The HARC version uses a passive transactor (`BufMgrXactor`) with
+// The HARC version uses an active transactor (`BufMgrXactor`) with
 // hookable methods that mirror the C++ TB's `enqueue` / `dequeue` /
 // `idle` helpers. The `xact.dut` field is wired once at the top of
 // run().
@@ -25,96 +25,98 @@
 transactor BufMgrXactor
     dut : BufMgrSm
 
-    // Reset pulse: hold rst=1 for 2 cycles (matches C++ tick();tick();
-    // pattern), then drop. Inputs idled.
-    hookable reset_dut()
-        dut.rst = 1
-        dut.enqueue_valid = 0
-        dut.dequeue_valid = 0
-        dut.enqueue_queue_number = 0
-        dut.enqueue_data = 0
-        dut.dequeue_queue_number = 0
-        wait 2 cycles
-        dut.rst = 0
-    end reset_dut
+    when active
+        // Reset pulse: hold rst=1 for 2 cycles (matches C++ tick();tick();
+        // pattern), then drop. Inputs idled.
+        hookable reset_dut()
+            dut.rst = 1
+            dut.enqueue_valid = 0
+            dut.dequeue_valid = 0
+            dut.enqueue_queue_number = 0
+            dut.enqueue_data = 0
+            dut.dequeue_queue_number = 0
+            wait 2 cycles
+            dut.rst = 0
+        end reset_dut
 
-    // After reset, the free-list SRAM seeds itself over 16 cycles.
-    // Spin (up to 100 cycles, like C++) until init_done rises.
-    hookable wait_init()
-        for _ in 0 .. 100
-            if dut.init_done == 0
-                wait 1 cycle
-            end if
-        end for
-    end wait_init
+        // After reset, the free-list SRAM seeds itself over 16 cycles.
+        // Spin (up to 100 cycles, like C++) until init_done rises.
+        hookable wait_init()
+            for _ in 0 .. 100
+                if dut.init_done == 0
+                    wait 1 cycle
+                end if
+            end for
+        end wait_init
 
-    // Single enqueue: drive valid for 1 cycle, deassert.
-    hookable enqueue(qn: uint<2>, data: uint<32>)
-        dut.enqueue_valid = 1
-        dut.enqueue_queue_number = qn
-        dut.enqueue_data = data
-        wait 1 cycle
-        dut.enqueue_valid = 0
-    end enqueue
-
-    // Dequeue: drive valid for 1 cycle (DQ0 — SRAM read issued),
-    // deassert, wait 1 more cycle (DQ1 — dq2_valid + data available).
-    // Returns the dequeued data; resp_valid is checked at the call
-    // site via dut.dequeue_resp_valid right after.
-    hookable dequeue_one(qn: uint<2>) -> uint<32>
-        dut.dequeue_valid = 1
-        dut.dequeue_queue_number = qn
-        wait 1 cycle
-        dut.dequeue_valid = 0
-        wait 1 cycle
-        return dut.dequeue_data
-    end dequeue_one
-
-    hookable idle_n(n: uint<32>)
-        dut.enqueue_valid = 0
-        dut.dequeue_valid = 0
-        for _ in 0 .. n
+        // Single enqueue: drive valid for 1 cycle, deassert.
+        hookable enqueue(qn: uint<2>, data: uint<32>)
+            dut.enqueue_valid = 1
+            dut.enqueue_queue_number = qn
+            dut.enqueue_data = data
             wait 1 cycle
-        end for
-    end idle_n
+            dut.enqueue_valid = 0
+        end enqueue
 
-    // Back-to-back enqueue: hold valid high across `count` cycles,
-    // injecting `d0`, `d1`, `d2` (matches the C++ TB's 3-cycle
-    // valid-held-high pattern in Test 5). Lives on the transactor so
-    // each `wait 1 cycle` rides the synchronous tick() lambda — the
-    // run-scope coroutine wait can suspend-and-resume around the same
-    // edge, dropping the first sample.
-    hookable enqueue_b2b3(qn: uint<2>, d0: uint<32>, d1: uint<32>, d2: uint<32>)
-        dut.enqueue_valid = 1
-        dut.enqueue_queue_number = qn
-        dut.enqueue_data = d0
-        wait 1 cycle
-        dut.enqueue_data = d1
-        wait 1 cycle
-        dut.enqueue_data = d2
-        wait 1 cycle
-        dut.enqueue_valid = 0
-    end enqueue_b2b3
+        // Dequeue: drive valid for 1 cycle (DQ0 — SRAM read issued),
+        // deassert, wait 1 more cycle (DQ1 — dq2_valid + data available).
+        // Returns the dequeued data; resp_valid is checked at the call
+        // site via dut.dequeue_resp_valid right after.
+        hookable dequeue_one(qn: uint<2>) -> uint<32>
+            dut.dequeue_valid = 1
+            dut.dequeue_queue_number = qn
+            wait 1 cycle
+            dut.dequeue_valid = 0
+            wait 1 cycle
+            return dut.dequeue_data
+        end dequeue_one
 
-    // Same-cycle enqueue + dequeue (different queues), matching the
-    // C++ TB's Test 6 pattern. After this method returns,
-    // dut.dequeue_resp_valid + dut.dequeue_data carry the response.
-    hookable enqueue_dequeue_simul(eq_qn: uint<2>, eq_data: uint<32>, dq_qn: uint<2>)
-        dut.enqueue_valid = 1
-        dut.enqueue_queue_number = eq_qn
-        dut.enqueue_data = eq_data
-        dut.dequeue_valid = 1
-        dut.dequeue_queue_number = dq_qn
-        wait 1 cycle
-        dut.enqueue_valid = 0
-        dut.dequeue_valid = 0
-        wait 1 cycle
-    end enqueue_dequeue_simul
+        hookable idle_n(n: uint<32>)
+            dut.enqueue_valid = 0
+            dut.dequeue_valid = 0
+            for _ in 0 .. n
+                wait 1 cycle
+            end for
+        end idle_n
+
+        // Back-to-back enqueue: hold valid high across `count` cycles,
+        // injecting `d0`, `d1`, `d2` (matches the C++ TB's 3-cycle
+        // valid-held-high pattern in Test 5). Lives on the transactor so
+        // each `wait 1 cycle` rides the synchronous tick() lambda — the
+        // run-scope coroutine wait can suspend-and-resume around the same
+        // edge, dropping the first sample.
+        hookable enqueue_b2b3(qn: uint<2>, d0: uint<32>, d1: uint<32>, d2: uint<32>)
+            dut.enqueue_valid = 1
+            dut.enqueue_queue_number = qn
+            dut.enqueue_data = d0
+            wait 1 cycle
+            dut.enqueue_data = d1
+            wait 1 cycle
+            dut.enqueue_data = d2
+            wait 1 cycle
+            dut.enqueue_valid = 0
+        end enqueue_b2b3
+
+        // Same-cycle enqueue + dequeue (different queues), matching the
+        // C++ TB's Test 6 pattern. After this method returns,
+        // dut.dequeue_resp_valid + dut.dequeue_data carry the response.
+        hookable enqueue_dequeue_simul(eq_qn: uint<2>, eq_data: uint<32>, dq_qn: uint<2>)
+            dut.enqueue_valid = 1
+            dut.enqueue_queue_number = eq_qn
+            dut.enqueue_data = eq_data
+            dut.dequeue_valid = 1
+            dut.dequeue_queue_number = dq_qn
+            wait 1 cycle
+            dut.enqueue_valid = 0
+            dut.dequeue_valid = 0
+            wait 1 cycle
+        end enqueue_dequeue_simul
+    end when
 end transactor BufMgrXactor
 
 test BufMgrSmTest
     let dut  : BufMgrSm
-    let xact : BufMgrXactor passive
+    let xact : BufMgrXactor active
 
     run
         log(info, "BufMgrSm small-variant test (16x32, 4 queues)")

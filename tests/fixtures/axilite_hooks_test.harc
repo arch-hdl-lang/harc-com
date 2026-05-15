@@ -21,42 +21,44 @@ transactor HookXactor
     dut       : AxiLiteRegs
     last_read : uint<32> default 0
 
-    hookable send(t: RegOp)
-        // Write phase
-        dut.axil_aw_addr = t.addr
-        dut.axil_aw_valid = 1
-        dut.axil_w_data = t.value
-        dut.axil_w_strb = 15
-        dut.axil_w_valid = 1
-        wait 10 cycles
-        dut.axil_aw_valid = 0
-        dut.axil_w_valid = 0
-        wait 2 cycles
+    when active
+        hookable send(t: RegOp)
+            // Write phase
+            dut.axil_aw_addr = t.addr
+            dut.axil_aw_valid = 1
+            dut.axil_w_data = t.value
+            dut.axil_w_strb = 15
+            dut.axil_w_valid = 1
+            wait 10 cycles
+            dut.axil_aw_valid = 0
+            dut.axil_w_valid = 0
+            wait 2 cycles
 
-        // Read phase
-        let val = 0
-        let saw = 0
-        dut.axil_ar_addr = t.addr
-        dut.axil_ar_valid = 1
-        for _ in 0 .. 10
-            wait 1 cycle
-            if dut.axil_r_valid
-                if saw == 0
-                    val = dut.axil_r_data
-                    dut.axil_ar_valid = 0
-                    saw = 1
+            // Read phase
+            let val = 0
+            let saw = 0
+            dut.axil_ar_addr = t.addr
+            dut.axil_ar_valid = 1
+            for _ in 0 .. 10
+                wait 1 cycle
+                if dut.axil_r_valid
+                    if saw == 0
+                        val = dut.axil_r_data
+                        dut.axil_ar_valid = 0
+                        saw = 1
+                    end if
                 end if
-            end if
-        end for
-        dut.axil_ar_valid = 0
-        wait 1 cycle
-        last_read = val
-    end send
+            end for
+            dut.axil_ar_valid = 0
+            wait 1 cycle
+            last_read = val
+        end send
+    end when
 end transactor HookXactor
 
 test AxiLiteHooksTest
     let dut : AxiLiteRegs
-    let drv : HookXactor passive
+    let drv : HookXactor active
 
     // Pre/post hook counters live at test scope so the hook bodies
     // can mutate them by-reference via [&] capture.

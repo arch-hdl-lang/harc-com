@@ -10,115 +10,117 @@
 // "expect" comments are advisory. This HARC version captures every
 // returned handle and asserts traversal correctness end-to-end.
 //
-// Helpers live on a passive transactor (no `when active` body) so
+// Helpers live on an active transactor (driven from `when active`) so
 // each test scope reads as a sequence of intent-named calls. The
 // `xact.dut` field is wired once at the top of run().
 
 transactor SchedXactor
     dut : SchedList
 
-    // Latency-2 inserts: drive *_valid for 1 cycle, deassert,
-    // observe *_resp_valid on the *next* cycle, then a settle tick.
-    // 0xFF = "no handle returned" sentinel (matches C++ TB).
-    hookable insert_head(data: uint<32>) -> uint<32>
-        dut.insert_head_req_valid = 1
-        dut.insert_head_req_data = data
-        wait 1 cycle
-        dut.insert_head_req_valid = 0
-        dut.insert_head_req_data = 0
-        wait 1 cycle
-        let h = dut.insert_head_resp_valid ? dut.insert_head_resp_handle : 255
-        wait 1 cycle
-        return h
-    end insert_head
+    when active
+        // Latency-2 inserts: drive *_valid for 1 cycle, deassert,
+        // observe *_resp_valid on the *next* cycle, then a settle tick.
+        // 0xFF = "no handle returned" sentinel (matches C++ TB).
+        hookable insert_head(data: uint<32>) -> uint<32>
+            dut.insert_head_req_valid = 1
+            dut.insert_head_req_data = data
+            wait 1 cycle
+            dut.insert_head_req_valid = 0
+            dut.insert_head_req_data = 0
+            wait 1 cycle
+            let h = dut.insert_head_resp_valid ? dut.insert_head_resp_handle : 255
+            wait 1 cycle
+            return h
+        end insert_head
 
-    hookable insert_tail(data: uint<32>) -> uint<32>
-        dut.insert_tail_req_valid = 1
-        dut.insert_tail_req_data = data
-        wait 1 cycle
-        dut.insert_tail_req_valid = 0
-        dut.insert_tail_req_data = 0
-        wait 1 cycle
-        let h = dut.insert_tail_resp_valid ? dut.insert_tail_resp_handle : 255
-        wait 1 cycle
-        return h
-    end insert_tail
+        hookable insert_tail(data: uint<32>) -> uint<32>
+            dut.insert_tail_req_valid = 1
+            dut.insert_tail_req_data = data
+            wait 1 cycle
+            dut.insert_tail_req_valid = 0
+            dut.insert_tail_req_data = 0
+            wait 1 cycle
+            let h = dut.insert_tail_resp_valid ? dut.insert_tail_resp_handle : 255
+            wait 1 cycle
+            return h
+        end insert_tail
 
-    hookable insert_after(after_handle: uint<32>, data: uint<32>) -> uint<32>
-        dut.insert_after_req_valid = 1
-        dut.insert_after_req_handle = after_handle
-        dut.insert_after_req_data = data
-        wait 1 cycle
-        dut.insert_after_req_valid = 0
-        dut.insert_after_req_handle = 0
-        dut.insert_after_req_data = 0
-        wait 1 cycle
-        let h = dut.insert_after_resp_valid ? dut.insert_after_resp_handle : 255
-        wait 1 cycle
-        return h
-    end insert_after
+        hookable insert_after(after_handle: uint<32>, data: uint<32>) -> uint<32>
+            dut.insert_after_req_valid = 1
+            dut.insert_after_req_handle = after_handle
+            dut.insert_after_req_data = data
+            wait 1 cycle
+            dut.insert_after_req_valid = 0
+            dut.insert_after_req_handle = 0
+            dut.insert_after_req_data = 0
+            wait 1 cycle
+            let h = dut.insert_after_resp_valid ? dut.insert_after_resp_handle : 255
+            wait 1 cycle
+            return h
+        end insert_after
 
-    hookable delete_head() -> uint<32>
-        dut.delete_head_req_valid = 1
-        wait 1 cycle
-        dut.delete_head_req_valid = 0
-        wait 1 cycle
-        let d = dut.delete_head_resp_valid ? dut.delete_head_resp_data : 57005   // 0xDEAD
-        wait 1 cycle
-        return d
-    end delete_head
+        hookable delete_head() -> uint<32>
+            dut.delete_head_req_valid = 1
+            wait 1 cycle
+            dut.delete_head_req_valid = 0
+            wait 1 cycle
+            let d = dut.delete_head_resp_valid ? dut.delete_head_resp_data : 57005   // 0xDEAD
+            wait 1 cycle
+            return d
+        end delete_head
 
-    // Latency-1 traversal: drive *_valid for 1 cycle, observe
-    // *_resp_valid on the SAME cycle the FSM latches, then a settle
-    // tick to drop the request.
-    hookable next(handle: uint<32>) -> uint<32>
-        dut.next_req_valid = 1
-        dut.next_req_handle = handle
-        wait 1 cycle
-        let h = dut.next_resp_valid ? dut.next_resp_handle : 255
-        dut.next_req_valid = 0
-        dut.next_req_handle = 0
-        wait 1 cycle
-        return h
-    end next
+        // Latency-1 traversal: drive *_valid for 1 cycle, observe
+        // *_resp_valid on the SAME cycle the FSM latches, then a settle
+        // tick to drop the request.
+        hookable next(handle: uint<32>) -> uint<32>
+            dut.next_req_valid = 1
+            dut.next_req_handle = handle
+            wait 1 cycle
+            let h = dut.next_resp_valid ? dut.next_resp_handle : 255
+            dut.next_req_valid = 0
+            dut.next_req_handle = 0
+            wait 1 cycle
+            return h
+        end next
 
-    hookable prev(handle: uint<32>) -> uint<32>
-        dut.prev_req_valid = 1
-        dut.prev_req_handle = handle
-        wait 1 cycle
-        let h = dut.prev_resp_valid ? dut.prev_resp_handle : 255
-        dut.prev_req_valid = 0
-        dut.prev_req_handle = 0
-        wait 1 cycle
-        return h
-    end prev
+        hookable prev(handle: uint<32>) -> uint<32>
+            dut.prev_req_valid = 1
+            dut.prev_req_handle = handle
+            wait 1 cycle
+            let h = dut.prev_resp_valid ? dut.prev_resp_handle : 255
+            dut.prev_req_valid = 0
+            dut.prev_req_handle = 0
+            wait 1 cycle
+            return h
+        end prev
 
-    hookable reset_dut()
-        dut.rst = 1
-        dut.alloc_req_valid = 0
-        dut.free_req_valid = 0
-        dut.free_req_handle = 0
-        dut.insert_head_req_valid = 0
-        dut.insert_head_req_data = 0
-        dut.insert_tail_req_valid = 0
-        dut.insert_tail_req_data = 0
-        dut.insert_after_req_valid = 0
-        dut.insert_after_req_handle = 0
-        dut.insert_after_req_data = 0
-        dut.delete_head_req_valid = 0
-        dut.next_req_valid = 0
-        dut.next_req_handle = 0
-        dut.prev_req_valid = 0
-        dut.prev_req_handle = 0
-        wait 2 cycles
-        dut.rst = 0
-        wait 1 cycle
-    end reset_dut
+        hookable reset_dut()
+            dut.rst = 1
+            dut.alloc_req_valid = 0
+            dut.free_req_valid = 0
+            dut.free_req_handle = 0
+            dut.insert_head_req_valid = 0
+            dut.insert_head_req_data = 0
+            dut.insert_tail_req_valid = 0
+            dut.insert_tail_req_data = 0
+            dut.insert_after_req_valid = 0
+            dut.insert_after_req_handle = 0
+            dut.insert_after_req_data = 0
+            dut.delete_head_req_valid = 0
+            dut.next_req_valid = 0
+            dut.next_req_handle = 0
+            dut.prev_req_valid = 0
+            dut.prev_req_handle = 0
+            wait 2 cycles
+            dut.rst = 0
+            wait 1 cycle
+        end reset_dut
+    end when
 end transactor SchedXactor
 
 test LinklistDoublyTest
     let dut  : SchedList
-    let xact : SchedXactor passive
+    let xact : SchedXactor active
 
     run
         log(info, "SchedList doubly-linked list test")

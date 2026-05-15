@@ -335,6 +335,23 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             return Err(EmitError(err));
         }
     }
+
+    // Enforce: a transactor's always-on body cannot drive DUT signals.
+    // Drive-side hookables / on-handlers must live inside `when active`.
+    // Without this check, a `passive` instance — which has its
+    // `when_active` body elided — would still emit the drive code and
+    // could wire an observer to the bus (block-level→chip-level TB
+    // reuse footgun). See `check_transactor_no_drive_in_always_on_body`
+    // for the full rationale and detection model.
+    for t in transactors.values() {
+        if let Some(err) = check_transactor_no_drive_in_always_on_body(
+            t, &transactors, &components, &scoreboards, &covergroups, &buses,
+            &regblocks, &addrmaps,
+        ) {
+            return Err(EmitError(err));
+        }
+    }
+
     for it in &file.items {
         match it {
             Item::Transaction(t) => {
@@ -8244,6 +8261,247 @@ fn check_addrmap_overlap(a: &AddrmapDecl) -> Option<String> {
         }
     }
     None
+}
+
+/// Enforce: a transactor's always-on body (anything not under
+/// `when active { ... }`) must not drive DUT signals. Drive-capable
+/// hookables / on-handlers must live inside `when active`.
+///
+/// Rationale (spec §8.1): a `passive` instance literally has its
+/// `when active` body elided at codegen (see
+/// `synth_component_from_transactor`). If drive code lived in the
+/// always-on portion, a passive instance would still emit that code
+/// and could end up wiring an observer to the bus — exactly the
+/// footgun this check prevents. The common block-level→chip-level
+/// TB reuse pattern (passive instance at chip level monitoring a bus
+/// the chip already drives) silently miscompiles otherwise.
+///
+/// "Drive" is:
+/// - assignment whose LHS is a field-access chain rooted at a
+///   non-HARC-inner-typed field (treated as a DUT pointer), or
+///   rooted at the implicit `bus` alias of a `bound to BusType`
+///   transactor.
+/// - call to `<bus>.<ch>.send(...)` or `<bus>.<ch>.recv()` — both
+///   drive the channel's valid (send) or ready (recv) line.
+/// - `release <expr>` — pairs with `probe force` writes.
+/// - `<lhs> <- <rhs>` channel-send statement on a DUT-rooted target.
+///
+/// Returns an error message string on the first violation (caller
+/// converts to `EmitError`).
+fn check_transactor_no_drive_in_always_on_body(
+    t: &TransactorDecl,
+    transactors: &std::collections::HashMap<String, TransactorDecl>,
+    components: &std::collections::HashMap<String, ComponentDecl>,
+    scoreboards: &std::collections::HashSet<String>,
+    covergroups: &std::collections::HashMap<String, CovergroupDecl>,
+    buses: &std::collections::HashMap<String, BusDecl>,
+    regblocks: &std::collections::HashMap<String, RegblockDecl>,
+    addrmaps: &std::collections::HashMap<String, AddrmapDecl>,
+) -> Option<String> {
+    // 1) Decide which of T's fields are HARC inner constructs (and so
+    //    safe to read/write at the field level) versus DUT pointers
+    //    (member-write counts as a drive). Builtins (uint/sint/bool/
+    //    queue/event/...) are excluded — they're plain inner state.
+    let mut dut_field_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for it in &t.items {
+        if let ComponentItem::Field(f) = it {
+            let TypeExpr::Named { name, .. } = &f.ty else {
+                continue; // builtin / event / queue → not a DUT pointer
+            };
+            let Some(simple) = name.segments.last().map(|s| s.name.as_str()) else {
+                continue;
+            };
+            let is_harc_inner = transactors.contains_key(simple)
+                || components.contains_key(simple)
+                || scoreboards.contains(simple)
+                || covergroups.contains_key(simple)
+                || regblocks.contains_key(simple)
+                || addrmaps.contains_key(simple)
+                || buses.contains_key(simple);
+            if !is_harc_inner {
+                dut_field_names.insert(f.name.name.clone());
+            }
+        }
+    }
+    let is_bound_to_bus = t.bound_to.is_some();
+
+    // 2) Walk every hookable + on-handler in the always-on body
+    //    (skipping `t.when_active`, which is the legitimate home for
+    //    drive code).
+    for it in &t.items {
+        match it {
+            ComponentItem::Hookable(h) => {
+                if let Some(violation) = find_drive_in_block(
+                    &h.body,
+                    &dut_field_names,
+                    is_bound_to_bus,
+                ) {
+                    return Some(format!(
+                        "transactor `{}` hookable `{}` drives a DUT signal ({}) from the always-on body. \
+                         Passive instances would still execute this code. Move the hookable into a \
+                         `when active ... end when` block, or remove the drive. See spec §8.1.",
+                        t.name.name, h.name.name, violation,
+                    ));
+                }
+            }
+            ComponentItem::OnHandler(h) => {
+                if let Some(violation) = find_drive_in_block(
+                    &h.body,
+                    &dut_field_names,
+                    is_bound_to_bus,
+                ) {
+                    return Some(format!(
+                        "transactor `{}` `on`-handler drives a DUT signal ({}) from the always-on body. \
+                         Passive instances would still execute this code. Move the handler into a \
+                         `when active ... end when` block, or remove the drive. See spec §8.1.",
+                        t.name.name, violation,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Returns the offending source snippet describing the first drive
+/// statement found in `block`, or `None` if the block is drive-free.
+fn find_drive_in_block(
+    block: &Block,
+    dut_fields: &std::collections::HashSet<String>,
+    bound_to_bus: bool,
+) -> Option<String> {
+    for s in &block.stmts {
+        if let Some(v) = find_drive_in_stmt(s, dut_fields, bound_to_bus) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn find_drive_in_stmt(
+    s: &Stmt,
+    dut_fields: &std::collections::HashSet<String>,
+    bound_to_bus: bool,
+) -> Option<String> {
+    match &s.kind {
+        StmtKind::Assign { target, value: _ } | StmtKind::Send { target, value: _ } => {
+            if let Some(root) = expr_root_ident(target) {
+                if has_field_access(target) {
+                    if dut_fields.contains(&root) {
+                        return Some(format!("`{}` = ...", expr_source_str(target)));
+                    }
+                    if bound_to_bus && root == "bus" {
+                        return Some(format!("`{}` = ...", expr_source_str(target)));
+                    }
+                }
+            }
+            None
+        }
+        StmtKind::Release(e) => Some(format!("release {}", expr_source_str(e))),
+        StmtKind::Expr(e) => find_drive_in_expr(e, dut_fields, bound_to_bus),
+        StmtKind::Let(l) => l
+            .value
+            .as_ref()
+            .and_then(|v| find_drive_in_expr(v, dut_fields, bound_to_bus)),
+        StmtKind::For(f) => find_drive_in_block(&f.body, dut_fields, bound_to_bus),
+        StmtKind::Repeat(r) => find_drive_in_block(&r.body, dut_fields, bound_to_bus),
+        StmtKind::Loop(b) => find_drive_in_block(b, dut_fields, bound_to_bus),
+        StmtKind::While { body, .. } => find_drive_in_block(body, dut_fields, bound_to_bus),
+        StmtKind::If(ifs) => find_drive_in_if(ifs, dut_fields, bound_to_bus),
+        StmtKind::Fork(fk) => fk
+            .branches
+            .iter()
+            .find_map(|b| find_drive_in_block(b, dut_fields, bound_to_bus)),
+        StmtKind::Parallel(blocks) | StmtKind::Schedule(blocks) => blocks
+            .iter()
+            .find_map(|b| find_drive_in_block(b, dut_fields, bound_to_bus)),
+        StmtKind::Select(arms) => arms
+            .iter()
+            .find_map(|a| find_drive_in_block(&a.action, dut_fields, bound_to_bus)),
+        StmtKind::On(h) => find_drive_in_block(&h.body, dut_fields, bound_to_bus),
+        StmtKind::After { body, .. } => find_drive_in_block(body, dut_fields, bound_to_bus),
+        _ => None,
+    }
+}
+
+fn find_drive_in_if(
+    ifs: &IfStmt,
+    dut_fields: &std::collections::HashSet<String>,
+    bound_to_bus: bool,
+) -> Option<String> {
+    if let Some(v) = find_drive_in_block(&ifs.then_block, dut_fields, bound_to_bus) {
+        return Some(v);
+    }
+    for (_cond, body) in &ifs.elsifs {
+        if let Some(v) = find_drive_in_block(body, dut_fields, bound_to_bus) {
+            return Some(v);
+        }
+    }
+    if let Some(else_b) = &ifs.else_block {
+        if let Some(v) = find_drive_in_block(else_b, dut_fields, bound_to_bus) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn find_drive_in_expr(
+    e: &Expr,
+    dut_fields: &std::collections::HashSet<String>,
+    bound_to_bus: bool,
+) -> Option<String> {
+    // The only expression-position drive we flag is a method call
+    // `<bus>.<ch>.send(...)` or `<bus>.<ch>.recv()` — both drive a
+    // handshake line.
+    if let ExprKind::Call { callee, args } = &*e.kind {
+        if let ExprKind::Field { target, name } = &*callee.kind {
+            if (name.name == "send" || name.name == "recv") && bound_to_bus {
+                if let ExprKind::Field {
+                    target: inner,
+                    name: _,
+                } = &*target.kind
+                {
+                    if let ExprKind::Ident(id) = &*inner.kind {
+                        if id.name == "bus" {
+                            return Some(format!("{}(...)", expr_source_str(callee)));
+                        }
+                    }
+                }
+            }
+        }
+        // Recurse into args in case a deeply-nested call drives.
+        for a in args {
+            let arg_expr = match a {
+                CallArg::Expr(x) => x,
+                CallArg::Named { value, .. } => value,
+            };
+            if let Some(v) = find_drive_in_expr(arg_expr, dut_fields, bound_to_bus) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+fn expr_root_ident(e: &Expr) -> Option<String> {
+    let mut cur = e;
+    loop {
+        match &*cur.kind {
+            ExprKind::Ident(id) => return Some(id.name.clone()),
+            ExprKind::Field { target, .. } => cur = target,
+            ExprKind::Index { target, .. } => cur = target,
+            ExprKind::Paren(inner) => cur = inner,
+            _ => return None,
+        }
+    }
+}
+
+fn has_field_access(e: &Expr) -> bool {
+    matches!(&*e.kind, ExprKind::Field { .. })
+        || matches!(&*e.kind, ExprKind::Index { target, .. } if has_field_access(target))
+        || matches!(&*e.kind, ExprKind::Paren(inner) if has_field_access(inner))
 }
 
 /// Width in bits of a RAL field declared as `field name : <ty>`.

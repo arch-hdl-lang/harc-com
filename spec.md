@@ -1592,6 +1592,15 @@ No default — mode is mandatory at the let site. Forces every reuse to declare 
 
 **Type checking with mode.** Field access is mode-sensitive at the binding site. `emit xact.req(t)` is an error when `xact` is passive (the `req` field doesn't exist in passive mode). `connect seq.dispatched -> xact.req` likewise errors at elaboration when `xact` is passive. `xact.completed` works on both — the field is in the always-present body.
 
+**Drive code lives in `when active`, not the always-on body.** A passive instance literally has its `when active` body elided at codegen (`synth_component_from_transactor` drops it). The always-on body is shared by both modes, so anything in it executes on passive instances too. To preserve the contract that **a passive instance cannot drive the DUT** — the foundational invariant for block-level→chip-level TB reuse, where the same transactor declaration acts as the active BFM at block level and a passive observer at chip level — the compiler rejects any hookable or `on`-handler in the always-on body that:
+
+- assigns to a `<dut-pointer-field>.<port>` (where the field's type is a non-HARC named type — i.e. a DUT module),
+- assigns to `bus.<ch>.<sig>` (for `bound to BusType` transactors),
+- calls `bus.<ch>.send(...)` or `bus.<ch>.recv()`, or
+- contains a `release <expr>` (pairs with `probe force` writes).
+
+The error names the transactor, the hookable / handler, the offending signal, and recommends moving the code into `when active`. The corollary: hookable methods that drive the DUT — write helpers, read helpers, anything that touches a SV port from the TB side — must be declared inside `when active`, and the let-binding must use `active` mode at the test scope. Observer-only handlers (`on bus.<ch>.handshake(t)` that only pushes to a scoreboard, `on <bool-expr>` cycle triggers that read DUT state) stay in the always-on body and are shared by both modes.
+
 **Lowering — synthesizable ARCH module.** Each transactor compiles to an ARCH module with `param ACTIVE: const = 1` and the `when active` body wrapped in `generate_if ACTIVE`:
 
 ```

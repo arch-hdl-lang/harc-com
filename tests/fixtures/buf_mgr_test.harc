@@ -25,119 +25,121 @@
 //   6. Simultaneous enqueue + dequeue on different queues.
 //   7. High queue numbers (q=255, q=128).
 //
-// Helpers live on a passive `BufMgrXactor` (cpu_pipeline / mshr_cocotb
+// Helpers live on an active `BufMgrXactor` (cpu_pipeline / mshr_cocotb
 // pattern). Tests only inspect the low 32 bits of the 128-bit data port,
 // matching the C++ TB's `set_data(lo)` / `dequeue_data._data[0]` shape.
 
 transactor BufMgrXactor
     dut : BufMgr
 
-    hookable init_dut()
-        dut.rst = 0
-        dut.enqueue_valid = 0
-        dut.enqueue_queue_number = 0
-        dut.enqueue_data = 0
-        dut.dequeue_valid = 0
-        dut.dequeue_queue_number = 0
-    end init_dut
+    when active
+        hookable init_dut()
+            dut.rst = 0
+            dut.enqueue_valid = 0
+            dut.enqueue_queue_number = 0
+            dut.enqueue_data = 0
+            dut.dequeue_valid = 0
+            dut.dequeue_queue_number = 0
+        end init_dut
 
-    // Two-cycle reset pulse (matches the C++ TB's `reset()`: two ticks with
-    // rst=1, then drop).
-    hookable reset_dut()
-        dut.rst = 1
-        dut.enqueue_valid = 0
-        dut.dequeue_valid = 0
-        wait 2 cycles
-        dut.rst = 0
-    end reset_dut
+        // Two-cycle reset pulse (matches the C++ TB's `reset()`: two ticks with
+        // rst=1, then drop).
+        hookable reset_dut()
+            dut.rst = 1
+            dut.enqueue_valid = 0
+            dut.dequeue_valid = 0
+            wait 2 cycles
+            dut.rst = 0
+        end reset_dut
 
-    // Wait up to 20000 cycles for init_done. The C++ TB caps at 20000.
-    // SetupCounter writes 16384 entries, then the prefetch pipeline needs
-    // ~3 cycles to fill the buffer past the threshold (fl_buf_count >= 2).
-    hookable wait_init() -> uint<32>
-        let cycles = 0
-        while !dut.init_done && cycles < 20000
+        // Wait up to 20000 cycles for init_done. The C++ TB caps at 20000.
+        // SetupCounter writes 16384 entries, then the prefetch pipeline needs
+        // ~3 cycles to fill the buffer past the threshold (fl_buf_count >= 2).
+        hookable wait_init() -> uint<32>
+            let cycles = 0
+            while !dut.init_done && cycles < 20000
+                wait 1 cycle
+                cycles = cycles + 1
+            end while
+            return cycles
+        end wait_init
+
+        // Single-cycle enqueue. C++ TB writes only the low 32 bits and zeroes
+        // the upper 96; assigning a small constant to the 128-bit port has the
+        // same effect.
+        hookable enqueue(qn: uint<8>, data_lo: uint<32>)
+            dut.enqueue_valid = 1
+            dut.enqueue_queue_number = qn
+            dut.enqueue_data = data_lo
             wait 1 cycle
-            cycles = cycles + 1
-        end while
-        return cycles
-    end wait_init
+            dut.enqueue_valid = 0
+            dut.enqueue_data = 0
+        end enqueue
 
-    // Single-cycle enqueue. C++ TB writes only the low 32 bits and zeroes
-    // the upper 96; assigning a small constant to the 128-bit port has the
-    // same effect.
-    hookable enqueue(qn: uint<8>, data_lo: uint<32>)
-        dut.enqueue_valid = 1
-        dut.enqueue_queue_number = qn
-        dut.enqueue_data = data_lo
-        wait 1 cycle
-        dut.enqueue_valid = 0
-        dut.enqueue_data = 0
-    end enqueue
+        // Two-tick dequeue: DQ0 issues SRAM reads, DQ1→DQ2 latches the result.
+        // dequeue_resp_valid must be 1 in the second cycle; we assert it here
+        // so callers can rely on the returned data being meaningful.
+        hookable dequeue(qn: uint<8>) -> uint<32>
+            dut.dequeue_valid = 1
+            dut.dequeue_queue_number = qn
+            wait 1 cycle              // DQ0
+            dut.dequeue_valid = 0
+            wait 1 cycle              // DQ1 → DQ2
+            assert dut.dequeue_resp_valid == 1
+                else fail("dequeue: resp_valid=0 for queue ${qn}")
+            return dut.dequeue_data
+        end dequeue
 
-    // Two-tick dequeue: DQ0 issues SRAM reads, DQ1→DQ2 latches the result.
-    // dequeue_resp_valid must be 1 in the second cycle; we assert it here
-    // so callers can rely on the returned data being meaningful.
-    hookable dequeue(qn: uint<8>) -> uint<32>
-        dut.dequeue_valid = 1
-        dut.dequeue_queue_number = qn
-        wait 1 cycle              // DQ0
-        dut.dequeue_valid = 0
-        wait 1 cycle              // DQ1 → DQ2
-        assert dut.dequeue_resp_valid == 1
-            else fail("dequeue: resp_valid=0 for queue ${qn}")
-        return dut.dequeue_data
-    end dequeue
+        // Hold all valids low for n cycles. Mirrors the C++ TB's `idle(n)`,
+        // used between bursts to let the EQ/DQ pipelines drain.
+        hookable idle(n: uint<32>)
+            dut.enqueue_valid = 0
+            dut.dequeue_valid = 0
+            for _ in 0 .. n
+                wait 1 cycle
+            end for
+        end idle
 
-    // Hold all valids low for n cycles. Mirrors the C++ TB's `idle(n)`,
-    // used between bursts to let the EQ/DQ pipelines drain.
-    hookable idle(n: uint<32>)
-        dut.enqueue_valid = 0
-        dut.dequeue_valid = 0
-        for _ in 0 .. n
+        // Back-to-back enqueue: hold valid high across 3 cycles, injecting
+        // d0/d1/d2. Lives on the transactor (not in run scope) so each
+        // `wait 1 cycle` lowers to a synchronous `tick()` in the lambda.
+        // The run-scope coroutine path uses `co_await wait_cycles(1)` which
+        // resumes BEFORE the next posedge, so the first sample is dropped.
+        // (See buf_mgr_sm_test.harc — same workaround.)
+        hookable enqueue_b2b3(qn: uint<8>, d0: uint<32>, d1: uint<32>, d2: uint<32>)
+            dut.enqueue_valid = 1
+            dut.enqueue_queue_number = qn
+            dut.enqueue_data = d0
             wait 1 cycle
-        end for
-    end idle
+            dut.enqueue_data = d1
+            wait 1 cycle
+            dut.enqueue_data = d2
+            wait 1 cycle
+            dut.enqueue_valid = 0
+            dut.enqueue_data = 0
+        end enqueue_b2b3
 
-    // Back-to-back enqueue: hold valid high across 3 cycles, injecting
-    // d0/d1/d2. Lives on the transactor (not in run scope) so each
-    // `wait 1 cycle` lowers to a synchronous `tick()` in the lambda.
-    // The run-scope coroutine path uses `co_await wait_cycles(1)` which
-    // resumes BEFORE the next posedge, so the first sample is dropped.
-    // (See buf_mgr_sm_test.harc — same workaround.)
-    hookable enqueue_b2b3(qn: uint<8>, d0: uint<32>, d1: uint<32>, d2: uint<32>)
-        dut.enqueue_valid = 1
-        dut.enqueue_queue_number = qn
-        dut.enqueue_data = d0
-        wait 1 cycle
-        dut.enqueue_data = d1
-        wait 1 cycle
-        dut.enqueue_data = d2
-        wait 1 cycle
-        dut.enqueue_valid = 0
-        dut.enqueue_data = 0
-    end enqueue_b2b3
-
-    // Same-cycle enqueue + dequeue (different queues), matching the
-    // C++ TB's Test 6 pattern. After this method returns,
-    // dut.dequeue_resp_valid + dut.dequeue_data carry the response.
-    hookable enqueue_dequeue_simul(eq_qn: uint<8>, eq_data: uint<32>, dq_qn: uint<8>)
-        dut.enqueue_valid = 1
-        dut.enqueue_queue_number = eq_qn
-        dut.enqueue_data = eq_data
-        dut.dequeue_valid = 1
-        dut.dequeue_queue_number = dq_qn
-        wait 1 cycle
-        dut.enqueue_valid = 0
-        dut.dequeue_valid = 0
-        dut.enqueue_data = 0
-        wait 1 cycle              // DQ1 → DQ2 + sync_out
-    end enqueue_dequeue_simul
+        // Same-cycle enqueue + dequeue (different queues), matching the
+        // C++ TB's Test 6 pattern. After this method returns,
+        // dut.dequeue_resp_valid + dut.dequeue_data carry the response.
+        hookable enqueue_dequeue_simul(eq_qn: uint<8>, eq_data: uint<32>, dq_qn: uint<8>)
+            dut.enqueue_valid = 1
+            dut.enqueue_queue_number = eq_qn
+            dut.enqueue_data = eq_data
+            dut.dequeue_valid = 1
+            dut.dequeue_queue_number = dq_qn
+            wait 1 cycle
+            dut.enqueue_valid = 0
+            dut.dequeue_valid = 0
+            dut.enqueue_data = 0
+            wait 1 cycle              // DQ1 → DQ2 + sync_out
+        end enqueue_dequeue_simul
+    end when
 end transactor BufMgrXactor
 
 test BufMgrTest
     let dut  : BufMgr
-    let xact : BufMgrXactor passive
+    let xact : BufMgrXactor active
 
     run
         log(info, "BufMgr: 256-queue shared buffer manager — 7 sub-tests")
