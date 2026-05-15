@@ -21,7 +21,7 @@ HARC's bet is that you can get UVM's language affordances (transactions, constra
 
 ## Status
 
-Pre-1.0. Stimulus → observation → scoreboard → properties/coverage → reference-model comparison → watchdog termination are all usable end-to-end. 56 fixtures pass against real Verilator-compiled SystemVerilog DUTs in CI. The ARCH cosim path (`--dut`) shares the same C++ TB emission and runs alongside `arch sim` for ARCH-authored DUTs.
+Pre-1.0. Stimulus → observation → scoreboard → properties/coverage → reference-model comparison → watchdog termination → register abstraction layer (RAL) are all usable end-to-end. 69 fixtures pass against real Verilator-compiled SystemVerilog DUTs in CI. The ARCH cosim path (`--dut`) shares the same C++ TB emission and runs alongside `arch sim` for ARCH-authored DUTs.
 
 ## Install
 
@@ -157,7 +157,7 @@ graph LR
     style EmulPlatform stroke-dasharray: 5 5
 ```
 
-One `harc sim` invocation drives the v0 path (solid): it parses the `.harc` source (folding any sibling `extend test T` files), emits a single C++ testbench via the `cpp_tb` codegen, then chains through either Verilator (`--sv`) or `arch sim` (`--dut`) to compile the DUT alongside the TB, the runtime header, and any `--ref-src` reference models. The resulting binary self-tests at run time, exits zero on `ALL TESTS PASSED`, and writes per-test logs + an optional coverage database. CI runs [`tests/run_fixtures.sh`](tests/run_fixtures.sh) which does this for all 56 fixtures.
+One `harc sim` invocation drives the v0 path (solid): it parses the `.harc` source (folding any sibling `extend test T` files), emits a single C++ testbench via the `cpp_tb` codegen, then chains through either Verilator (`--sv`) or `arch sim` (`--dut`) to compile the DUT alongside the TB, the runtime header, and any `--ref-src` reference models. The resulting binary self-tests at run time, exits zero on `ALL TESTS PASSED`, and writes per-test logs + an optional coverage database. CI runs [`tests/run_fixtures.sh`](tests/run_fixtures.sh) which does this for all 69 fixtures.
 
 The dashed paths share the same parser + AST + IR; they branch at codegen by emitting a different target representation. Spec §10 documents the contracts (what survives the transpile cleanly, what's lossy) and the lowering tables. None of the three ship in v0 — the diagram exists so the reader can see where the language is going, not what it does today.
 
@@ -182,7 +182,7 @@ Common `harc sim` flags:
 
 ## Examples
 
-[`tests/fixtures/`](tests/fixtures/) holds 56 runnable HARC TBs targeting DUTs vendored under [`tests/dut/`](tests/dut/). Each fixture compiles, runs through Verilator, and asserts `ALL TESTS PASSED`. A non-exhaustive tour:
+[`tests/fixtures/`](tests/fixtures/) holds 69 runnable HARC TBs targeting DUTs vendored under [`tests/dut/`](tests/dut/). Each fixture compiles, runs through Verilator, and asserts `ALL TESTS PASSED`. A non-exhaustive tour:
 
 | Fixture | DUT | Demonstrates |
 |---|---|---|
@@ -194,6 +194,9 @@ Common `harc sim` flags:
 | `axilite_bus_send_test.harc` | `AxiLiteRegs.sv` | typed bus binding + `bus.<ch>.send/recv` |
 | `axilite_bound_mon_test.harc` | `AxiLiteRegs.sv` | bound monitor (`on bus.<ch>.handshake(t)`) |
 | `axilite_constraint_test.harc` | `AxiLiteRegs.sv` | `randomize(t) with …` through Z3 |
+| `bind_remap_test.harc` | `axil_amba.sv` | `bind ... with { ch.sig: "port" }` per-signal SV port override |
+| `regblock_alias_test.harc` | `AxiLiteRegs.sv` | RAL `regblock` + `alias of <addrmap>` reuse |
+| `probe_force_test.harc` | `cpu_pipeline.sv` | `force` / `release` of internal DUT signals via probe path |
 | `keep_constraints_test.harc` | `top_counter.sv` | transaction `keep` constraints (range, modulus, enum exclusion) |
 | `relation_inlining_test.harc` | `top_counter.sv` | `relation` inlining — block + alias + composite forms |
 | `heartbeat_idle_test.harc` | `top_counter.sv` | per-agent `_last_in_cycle` heartbeats + `idle(N)` predicate |
@@ -236,8 +239,8 @@ spec.md                   Language reference
 ## Running the test suite locally
 
 ```sh
-cargo test --release          # 80 cargo tests (lib + codegen + round-trip)
-./tests/run_fixtures.sh       # 56 fixtures end-to-end via Verilator
+cargo test --release          # 84 cargo tests (lib + codegen + round-trip)
+./tests/run_fixtures.sh       # 69 fixtures end-to-end via Verilator
 ```
 
 The fixture runner builds harc, then for each entry in its manifest: runs Verilator on the vendored `.sv` DUT (linking any `--ref-src` C/C++ files), builds against the HARC-generated C++ testbench, and asserts the binary prints `ALL TESTS PASSED`. CI runs the same script on every push and PR.
