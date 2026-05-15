@@ -1,0 +1,74 @@
+// Bind remap fixture (spec §10.5 / TODO doc).
+//
+// `bind <dut> with { ch.sig: "<port>", ... }` overrides individual
+// `<channel>.<signal>` → SV port names. Unmapped signals fall
+// through to the `<bind_var>_<channel>_<signal>` convention. Lets
+// HARC TBs work against DUTs whose port names don't fit any single
+// prefix scheme (e.g. AMBA `s_axi_awvalid` one-word convention vs
+// the conventional `s_axi_aw_valid` two-word form).
+//
+// The DUT here (`axil_amba.sv`) uses AMBA-style names; the bind
+// clause maps every BusAxiLite channel/signal pair to its actual
+// port. A single register write + read round-trip proves the
+// remap reaches every signal the protocol touches.
+
+use BusAxiLite
+
+transactor AxilHelper bound to BusAxiLite
+    hookable write(addr: uint<8>, data: uint<32>)
+        bus.aw.addr = addr
+        bus.aw.valid = 1
+        bus.w.send(data, 15)
+        bus.aw.valid = 0
+        wait 1 cycle
+    end write
+
+    hookable read(addr: uint<8>) -> uint<32>
+        bus.ar.addr = addr
+        bus.ar.valid = 1
+        let r = bus.r.recv()
+        bus.ar.valid = 0
+        wait 1 cycle
+        return r.data
+    end read
+end transactor AxilHelper
+
+test BindRemapTest
+    let dut    : axil_amba
+    let s_axi  : BusAxiLite = bind dut with {
+        aw.valid: "s_axi_awvalid", aw.ready: "s_axi_awready", aw.addr: "s_axi_awaddr",
+        w.valid:  "s_axi_wvalid",  w.ready:  "s_axi_wready",
+        w.data:   "s_axi_wdata",   w.strb:   "s_axi_wstrb",
+        b.valid:  "s_axi_bvalid",  b.ready:  "s_axi_bready",  b.resp: "s_axi_bresp",
+        ar.valid: "s_axi_arvalid", ar.ready: "s_axi_arready", ar.addr: "s_axi_araddr",
+        r.valid:  "s_axi_rvalid",  r.ready:  "s_axi_rready",
+        r.data:   "s_axi_rdata",   r.resp:   "s_axi_rresp"
+    }
+    let helper : AxilHelper passive = bind s_axi
+
+    run
+        dut.rst = 1
+        s_axi.aw.valid = 0
+        s_axi.w.valid = 0
+        s_axi.b.ready = 1
+        s_axi.ar.valid = 0
+        s_axi.r.ready = 1
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        helper.write(0, 3735879680)         // 0xDEAD_1000
+        wait 2 cycles
+        // Cross-check via the storage_out port — proves the bus
+        // write reached the DUT's storage, which it could only do
+        // if every channel signal was correctly mapped.
+        assert dut.storage_out == 3735879680
+            else fail("storage didn't catch the bus write — remap drop somewhere; storage=0x${dut.storage_out:08x}")
+
+        let v = helper.read(0)
+        assert v == 3735879680
+            else fail("bus readback differs from write (got 0x${v:08x})")
+
+        log(info, "PASS: bind remap routed all 5 channels to AMBA-style port names")
+    end run
+end test BindRemapTest

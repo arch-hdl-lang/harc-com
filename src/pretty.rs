@@ -1189,6 +1189,19 @@ fn print_let(out: &mut String, l: &LetStmt, depth: usize) {
             write!(out, "bind ").ok();
         }
         print_expr(out, v);
+        if !l.bind_remap.is_empty() {
+            write!(out, " with {{").ok();
+            for (i, entry) in l.bind_remap.iter().enumerate() {
+                if i > 0 { write!(out, ",").ok(); }
+                write!(out, " ").ok();
+                for (j, seg) in entry.path.iter().enumerate() {
+                    if j > 0 { write!(out, ".").ok(); }
+                    write!(out, "{}", seg.name).ok();
+                }
+                write!(out, ": \"{}\"", entry.port).ok();
+            }
+            write!(out, " }}").ok();
+        }
     }
     writeln!(out).ok();
 }
