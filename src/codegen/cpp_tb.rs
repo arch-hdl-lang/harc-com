@@ -456,6 +456,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         tseq_names: tseqs.iter().map(|t| t.name.name.clone()).collect(),
         buses,
         bus_bindings: std::collections::HashMap::new(),
+        bus_remap: std::collections::HashMap::new(),
         in_coroutine: false,
         actor_threads: Vec::new(),
         mt: opts.mt,
@@ -1231,7 +1232,27 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                             std::mem::swap(&mut e.out, &mut buf);
                             let prefix = l.name.name.clone();
                             e.bus_bindings
-                                .insert(l.name.name.clone(), (bus_decl, buf, prefix));
+                                .insert(l.name.name.clone(), (bus_decl, buf, prefix.clone()));
+                            // Populate the per-bind signal remap so hookable-
+                            // method emission (which precedes `emit_let`) can
+                            // resolve `bus.<ch>.<sig>` against the override
+                            // table. Without this pre-pass, transactor
+                            // bodies use only the prefix-convention name and
+                            // the override never fires for indirectly-routed
+                            // accesses.
+                            if !l.bind_remap.is_empty() {
+                                let mut map: std::collections::HashMap<(String, String), String> =
+                                    std::collections::HashMap::new();
+                                for entry in &l.bind_remap {
+                                    if entry.path.len() == 2 {
+                                        map.insert(
+                                            (entry.path[0].name.clone(), entry.path[1].name.clone()),
+                                            entry.port.clone(),
+                                        );
+                                    }
+                                }
+                                e.bus_remap.insert(prefix, map);
+                            }
                         }
                     }
                 }
@@ -1956,6 +1977,15 @@ struct Emitter {
     /// names. Distinguishing the lookup key from the prefix is what
     /// makes the alias work.
     bus_bindings: std::collections::HashMap<String, (BusDecl, String, String)>,
+    /// Per-bind per-signal name override table populated from
+    /// `bind <dut> with { ch.sig: "port" }` clauses. Outer key is
+    /// the bind variable name (matching the `sig_prefix` field of
+    /// `bus_bindings`); inner key is `(channel, signal)` tuple.
+    /// Lookups consult this map first; missing entries fall through
+    /// to the `<prefix>_<channel>_<signal>` convention. Empty for
+    /// binds without a `with { ... }` clause — most fixtures sit
+    /// in this bucket.
+    bus_remap: std::collections::HashMap<String, std::collections::HashMap<(String, String), String>>,
     /// True while emitting statements *directly inside the test's run
     /// coroutine body* (the `scope sim/run` block plus bare test-level
     /// stmts). When set, `wait N cycles`, bare `tick()` (the bus
@@ -2729,7 +2759,6 @@ impl Emitter {
                         continue;
                     }
                     let (bus_decl, root, sig_prefix) = binding;
-                    let chan_prefix = format!("{}_{}", sig_prefix, ch_name);
                     let slot_var = format!("_{instance}_{ch_name}_slot");
                     let sched_var = format!("_{instance}_{ch_name}_sched");
 
@@ -2754,10 +2783,12 @@ impl Emitter {
                     ).ok();
                     self.pad(depth + 1);
                     writeln!(self.out, "while (true) {{").ok();
+                    let valid_port = self.bus_signal_name(&sig_prefix, &ch_name, "valid");
+                    let ready_port = self.bus_signal_name(&sig_prefix, &ch_name, "ready");
                     self.pad(depth + 2);
                     writeln!(
                         self.out,
-                        "co_await harc_rt::wait_until(_slot, [&]{{ return {root}->{chan_prefix}_valid && {root}->{chan_prefix}_ready; }});",
+                        "co_await harc_rt::wait_until(_slot, [&]{{ return {root}->{valid_port} && {root}->{ready_port}; }});",
                     ).ok();
                     // Bind `arg` to the per-channel payload struct so the
                     // body can use `arg.data`, `arg.resp`, etc. The
@@ -2774,7 +2805,8 @@ impl Emitter {
                             write!(self.out, ", ").ok();
                         }
                         first = false;
-                        write!(self.out, "{root}->{chan_prefix}_{}", sig.name.name).ok();
+                        let sig_port = self.bus_signal_name(&sig_prefix, &ch_name, &sig.name.name);
+                        write!(self.out, "{root}->{sig_port}").ok();
                     }
                     writeln!(self.out, "}};").ok();
                     // Activity tracking (spec §7.x): an observed bus
@@ -3443,7 +3475,8 @@ impl Emitter {
         else {
             return false;
         };
-        let prefix = format!("{}_{}", sig_prefix, ch.name); // axil_aw
+        let valid_port = self.bus_signal_name(&sig_prefix, &ch.name, "valid");
+        let ready_port = self.bus_signal_name(&sig_prefix, &ch.name, "ready");
 
         match method.name.as_str() {
             "send" => {
@@ -3467,8 +3500,9 @@ impl Emitter {
                 writeln!(self.out, "// bus.{}.send", ch.name).ok();
                 // Drive payload signals.
                 for (sig, arg) in h.payload.iter().zip(args.iter()) {
+                    let sig_port = self.bus_signal_name(&sig_prefix, &ch.name, &sig.name.name);
                     self.pad(depth);
-                    write!(self.out, "{root}->{prefix}_{} = ", sig.name.name).ok();
+                    write!(self.out, "{root}->{sig_port} = ").ok();
                     match arg {
                         CallArg::Expr(e) => self.emit_expr(e),
                         CallArg::Named { value, .. } => self.emit_expr(value),
@@ -3476,22 +3510,22 @@ impl Emitter {
                     writeln!(self.out, ";").ok();
                 }
                 self.pad(depth);
-                writeln!(self.out, "{root}->{prefix}_valid = 1;").ok();
+                writeln!(self.out, "{root}->{valid_port} = 1;").ok();
                 self.pad(depth);
                 if self.in_coroutine {
                     // Coroutine path: yield until ready=1 (bounded). The
                     // bound matches the sync 16-cycle budget so a stuck
                     // DUT still terminates the test rather than hanging.
-                    writeln!(self.out, "{{ int _b = 16; while (!{root}->{prefix}_ready && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}").ok();
+                    writeln!(self.out, "{{ int _b = 16; while (!{root}->{ready_port} && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}").ok();
                     self.pad(depth);
                     writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
                 } else {
-                    writeln!(self.out, "{{ int _b = 16; while (!{root}->{prefix}_ready && _b > 0) {{ tick(); _b--; }} }}").ok();
+                    writeln!(self.out, "{{ int _b = 16; while (!{root}->{ready_port} && _b > 0) {{ tick(); _b--; }} }}").ok();
                     self.pad(depth);
                     writeln!(self.out, "tick();").ok();
                 }
                 self.pad(depth);
-                writeln!(self.out, "{root}->{prefix}_valid = 0;").ok();
+                writeln!(self.out, "{root}->{valid_port} = 0;").ok();
                 // Activity tracking (spec §7.x): a completed
                 // bus.<ch>.send counts as an "out" for the surrounding
                 // component instance, if any. Bus calls inside
@@ -3530,12 +3564,12 @@ impl Emitter {
                 self.pad(depth);
                 writeln!(self.out, "// bus.{}.recv", ch.name).ok();
                 self.pad(depth);
-                writeln!(self.out, "{root}->{prefix}_ready = 1;").ok();
+                writeln!(self.out, "{root}->{ready_port} = 1;").ok();
                 self.pad(depth);
                 if self.in_coroutine {
-                    writeln!(self.out, "{{ int _b = 16; while (!{root}->{prefix}_valid && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}").ok();
+                    writeln!(self.out, "{{ int _b = 16; while (!{root}->{valid_port} && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}").ok();
                 } else {
-                    writeln!(self.out, "{{ int _b = 16; while (!{root}->{prefix}_valid && _b > 0) {{ tick(); _b--; }} }}").ok();
+                    writeln!(self.out, "{{ int _b = 16; while (!{root}->{valid_port} && _b > 0) {{ tick(); _b--; }} }}").ok();
                 }
                 // Capture BEFORE the trailing tick: the destination signals
                 // are valid in the same cycle as `valid` is high.
@@ -3549,7 +3583,8 @@ impl Emitter {
                             write!(self.out, ", ").ok();
                         }
                         first = false;
-                        write!(self.out, "{root}->{prefix}_{}", sig.name.name).ok();
+                        let sig_port = self.bus_signal_name(&sig_prefix, &ch.name, &sig.name.name);
+                        write!(self.out, "{root}->{sig_port}").ok();
                     }
                     writeln!(self.out, "}};").ok();
                 }
@@ -3560,7 +3595,7 @@ impl Emitter {
                     writeln!(self.out, "tick();").ok();
                 }
                 self.pad(depth);
-                writeln!(self.out, "{root}->{prefix}_ready = 0;").ok();
+                writeln!(self.out, "{root}->{ready_port} = 0;").ok();
                 // Activity tracking (spec §7.x): a completed
                 // bus.<ch>.recv counts as an "in" for the surrounding
                 // component instance, if any.
@@ -3620,10 +3655,8 @@ impl Emitter {
                             || name.name == "ready"
                             || h.payload.iter().any(|s| s.name.name == name.name)
                         {
-                            return Some(format!(
-                                "{root}->{}_{}_{}",
-                                sig_prefix, ch.name, name.name,
-                            ));
+                            let sig_port = self.bus_signal_name(&sig_prefix, &ch.name, &name.name);
+                            return Some(format!("{root}->{sig_port}"));
                         }
                         let valid_options: Vec<&str> = std::iter::once("valid")
                             .chain(std::iter::once("ready"))
@@ -6284,7 +6317,32 @@ impl Emitter {
                     // `emit_component_handler_registrations_bound`.
                     let prefix = l.name.name.clone();
                     self.bus_bindings
-                        .insert(l.name.name.clone(), (bus, buf, prefix));
+                        .insert(l.name.name.clone(), (bus, buf, prefix.clone()));
+                    // Translate the AST's bind_remap entries into a
+                    // (channel, signal) → port_name lookup table. The
+                    // path is required to be exactly `<channel>.<signal>`
+                    // (two segments) — single-segment paths and 3+
+                    // levels error out cleanly.
+                    if !l.bind_remap.is_empty() {
+                        let mut map: std::collections::HashMap<(String, String), String> =
+                            std::collections::HashMap::new();
+                        for entry in &l.bind_remap {
+                            if entry.path.len() != 2 {
+                                self.errors.push(format!(
+                                    "bind {} with: signal path `{}` must be exactly `<channel>.<signal>` (2 segments, got {})",
+                                    l.name.name,
+                                    entry.path.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join("."),
+                                    entry.path.len(),
+                                ));
+                                continue;
+                            }
+                            map.insert(
+                                (entry.path[0].name.clone(), entry.path[1].name.clone()),
+                                entry.port.clone(),
+                            );
+                        }
+                        self.bus_remap.insert(prefix, map);
+                    }
                     return;
                 }
             }
@@ -7004,6 +7062,20 @@ impl Emitter {
             bit_width,
             fld.access,
         ))
+    }
+
+    /// Resolve the SV port name for `<bus>.<channel>.<signal>` access.
+    /// Checks the `bind ... with { ch.sig: "port" }` remap first;
+    /// falls back to the `<prefix>_<channel>_<signal>` convention.
+    /// `prefix` is typically the bind variable's name (same as the
+    /// `sig_prefix` field stored in `bus_bindings`).
+    fn bus_signal_name(&self, prefix: &str, channel: &str, signal: &str) -> String {
+        if let Some(map) = self.bus_remap.get(prefix) {
+            if let Some(port) = map.get(&(channel.to_string(), signal.to_string())) {
+                return port.clone();
+            }
+        }
+        format!("{prefix}_{channel}_{signal}")
     }
 
     /// If `target` is `dut.<probe>` where the probe was declared with
