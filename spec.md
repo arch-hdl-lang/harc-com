@@ -1601,6 +1601,8 @@ No default — mode is mandatory at the let site. Forces every reuse to declare 
 
 The error names the transactor, the hookable / handler, the offending signal, and recommends moving the code into `when active`. The corollary: hookable methods that drive the DUT — write helpers, read helpers, anything that touches a SV port from the TB side — must be declared inside `when active`, and the let-binding must use `active` mode at the test scope. Observer-only handlers (`on bus.<ch>.handshake(t)` that only pushes to a scoreboard, `on <bool-expr>` cycle triggers that read DUT state) stay in the always-on body and are shared by both modes.
 
+**Call-site enforcement.** The structural check above prevents drive code from emitting under the always-on body, but the `when active` body's hookables still compile to free C++ functions (only the actor coroutine is gated by mode). A direct call `passive_inst.write(...)` would otherwise silently dispatch into orphan code. The compiler additionally rejects any method call whose resolved hookable lives in `T.when_active` when the call's instance path resolves to passive mode — including paths that inherit passive through env / agent composition (`let e : E passive` makes `e.<sub>.<field>` passive at every depth that doesn't override). The error names the call path, the offending method, the transactor that owns it, and recommends flipping the let-binding to `active`. Always-on hookables remain callable in both modes; only `when active` ones are gated.
+
 **Lowering — synthesizable ARCH module.** Each transactor compiles to an ARCH module with `param ACTIVE: const = 1` and the `when active` body wrapped in `generate_if ACTIVE`:
 
 ```
