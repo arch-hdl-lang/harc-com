@@ -1699,6 +1699,86 @@ end test SolveOrderTest"#,
     );
 }
 
+#[test]
+fn blocking_randomize_marks_immediate_solver_path() {
+    let parsed = parse_source(
+        r#"transaction T
+    len : uint<8>
+end transaction T
+
+test BlockingRandomizeTest
+    let dut : DummyDut
+    run
+        let t : T
+        blocking randomize(t) with
+            t.len > 0
+        end randomize
+    end run
+end test BlockingRandomizeTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("// blocking randomize(t) with") && cpp.contains("immediate Z3 solver block"),
+        "blocking randomize should be visible in emitted solver path; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn randomize_rejects_runtime_state_dependencies_by_mode() {
+    let queued = parse_source(
+        r#"transaction T
+    len : uint<8>
+end transaction T
+
+test QueuedRuntimeDepTest
+    let dut : DummyDut
+    run
+        let t : T
+        let other : T
+        randomize(t) with
+            other.len == 1
+        end randomize
+    end run
+end test QueuedRuntimeDepTest"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&queued).unwrap_err();
+    assert!(
+        err.0.contains("queued randomize(T)")
+            && err.0.contains("runtime state `other.len`")
+            && err.0.contains("blocking randomize"),
+        "queued randomize should reject live non-target state with guidance; got: {}",
+        err.0,
+    );
+
+    let blocking = parse_source(
+        r#"transaction T
+    len : uint<8>
+end transaction T
+
+test BlockingRuntimeDepTest
+    let dut : DummyDut
+    run
+        let t : T
+        let other : T
+        blocking randomize(t) with
+            other.len == 1
+        end randomize
+    end run
+end test BlockingRuntimeDepTest"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&blocking).unwrap_err();
+    assert!(
+        err.0.contains("blocking randomize(T)")
+            && err.0.contains("runtime state `other.len`")
+            && err.0.contains("not supported yet"),
+        "blocking randomize should reject live non-target state until runtime-dependent lowering lands; got: {}",
+        err.0,
+    );
+}
+
 /// `keep f != WRAP` where `WRAP` is an enum variant resolves via
 /// the global `enum_variants` map. Without this lookup the
 /// constraint translator would error with "unknown name `WRAP`".
