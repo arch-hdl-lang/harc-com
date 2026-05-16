@@ -5800,22 +5800,6 @@ impl Emitter {
         writeln!(self.out, "}}").ok();
     }
 
-    fn report_unsupported_randomize_field_attrs(&mut self, ty: &str) {
-        let Some(fields) = self.txn_fields.get(ty) else {
-            return;
-        };
-        for f in fields {
-            for a in &f.attrs {
-                if a.name.name == "cyclic" {
-                    self.errors.push(format!(
-                        "randomize({ty}): field attribute `[{}]` on `{}.{}` is parsed but not supported yet; cyclic history needs runtime state semantics",
-                        a.name.name, ty, f.name,
-                    ));
-                }
-            }
-        }
-    }
-
     fn report_runtime_dependent_randomize_field_attrs(&mut self, ty: &str) {
         let Some(fields) = self.txn_fields.get(ty).cloned() else {
             return;
@@ -6745,17 +6729,6 @@ impl Emitter {
             )
             .ok();
         }
-        for f in &free_fields {
-            if unique_fields.contains(&f.name) {
-                self.pad(depth + 1);
-                writeln!(
-                    self.out,
-                    "for (auto _v : {cache_tag}_{}) _s.add(_z_{} != _ctx.bv_val(_v, 64));   // [unique] policy for unconstrained field",
-                    f.name, f.name
-                )
-                .ok();
-            }
-        }
 
         // Seeded preference values. These are hard clauses only for the first
         // check; if the preferred tuple is incompatible with the user's
@@ -6837,6 +6810,13 @@ impl Emitter {
         writeln!(self.out, "}}").ok();
         for f in &free_fields {
             if unique_fields.contains(&f.name) {
+                self.pad(depth + 1);
+                writeln!(
+                    self.out,
+                    "for (auto _v : {cache_tag}_{}) _s.add(_z_{} != _ctx.bv_val(_v, 64));   // [unique] policy: no repeat until exhausted",
+                    f.name, f.name
+                )
+                .ok();
                 continue;
             }
             self.pad(depth + 1);
@@ -6863,9 +6843,6 @@ impl Emitter {
         self.pad(depth + 2);
         writeln!(self.out, "_s.pop();").ok();
         for f in &free_fields {
-            if unique_fields.contains(&f.name) {
-                continue;
-            }
             self.pad(depth + 2);
             writeln!(self.out, "{cache_tag}_{}.clear();", f.name).ok();
         }
@@ -8035,7 +8012,6 @@ impl Emitter {
                 let mut combined: Vec<Expr> = Vec::with_capacity(txn_keeps.len() + with_body.len());
                 combined.extend(txn_keeps);
                 combined.extend(with_body.iter().cloned());
-                self.report_unsupported_randomize_field_attrs(&ty);
                 self.report_runtime_dependent_randomize_field_attrs(&ty);
                 let has_unique_fields = self
                     .txn_fields
