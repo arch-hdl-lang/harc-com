@@ -98,6 +98,13 @@ retry without treating the preference as a hard failure. The same runtime state
 should report hit/miss/blocked summaries at test end so users can see which
 generated preferences still need attention.
 
+Declared covergroup crosses are separate from these solver preferences:
+`cross cp_a, cp_b, ...` is a functional coverage declaration. It is sampled at
+the covergroup trigger, records only bin combinations hit in that same sample
+event, and reports missing bin tuples at `report()` time. It does not by itself
+constrain or steer randomization; solver steering comes from the auto coverage
+preference path above.
+
 `[unique]` is also a randomization policy, not a hard field invariant. It
 should steer fields that remain unconstrained after `keep`, relation expansion,
 and `randomize ... with` constraints; explicit user constraints and direct
