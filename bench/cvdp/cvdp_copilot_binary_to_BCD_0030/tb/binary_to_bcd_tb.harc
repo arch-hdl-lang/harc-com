@@ -18,11 +18,11 @@ function bcd_ref(n: uint<8>) -> uint<12>
     return (hundreds << 8) | (tens << 4) | ones
 end function bcd_ref
 
-test BinaryToBcdTest
-    let dut : binary_to_bcd_top
-end test BinaryToBcdTest
+testbench BinaryToBcdTestTb
+    dut : binary_to_bcd_top
+end testbench BinaryToBcdTestTb
 
-impl sim for BinaryToBcdTest
+impl BinaryToBcdTest for BinaryToBcdTestTb
     run
         log(info, "binary_to_bcd: exhaustive 0..255 sweep vs sw model")
         dut.binary_in = 0

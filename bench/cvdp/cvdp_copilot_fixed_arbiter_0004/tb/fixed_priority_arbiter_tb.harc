@@ -23,11 +23,11 @@ function priority_grant(req: uint<8>) -> uint<8>
     return 0
 end function priority_grant
 
-test FixedPriorityArbiterTest
-    let dut : fixed_priority_arbiter
-end test FixedPriorityArbiterTest
+testbench FixedPriorityArbiterTestTb
+    dut : fixed_priority_arbiter
+end testbench FixedPriorityArbiterTestTb
 
-impl sim for FixedPriorityArbiterTest
+impl FixedPriorityArbiterTest for FixedPriorityArbiterTestTb
     run
         log(info, "fixed_priority_arbiter: reset + exhaustive req sweep")
 
