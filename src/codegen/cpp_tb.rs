@@ -445,6 +445,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         errors: Vec::new(),
         pointer_vars: std::collections::HashSet::new(),
         let_types: std::collections::HashMap::new(),
+        let_widths: std::collections::HashMap::new(),
         let_modes: std::collections::HashMap::new(),
         transactions,
         scoreboards,
@@ -908,6 +909,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         // ── Reset Emitter per-test state ────────────────────────────
         e.let_types.clear();
         e.let_modes.clear();
+        e.let_widths.clear();
         e.pointer_vars.clear();
         e.pointer_vars.insert("dut".to_string());
         e.bus_bindings.clear();
@@ -981,6 +983,21 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             }
             if let Some(TypeExpr::Named { mode: Some(m), .. }) = l.ty.as_ref() {
                 e.let_modes.insert(l.name.name.clone(), *m);
+            }
+            // Track bit-widths for uint<W> / sint<W> / bits<W> lets so
+            // the width-method intrinsics (`.trunc<N>()` / `.sext<N>()`
+            // etc.) can statically check that the requested width
+            // direction matches the source width, and so sext can emit
+            // its shift-fill from the right MSB position.
+            if let Some(TypeExpr::Builtin { name, args, .. }) = l.ty.as_ref() {
+                if matches!(
+                    name,
+                    BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits
+                ) {
+                    if let Some(w) = type_arg_width(args) {
+                        e.let_widths.insert(l.name.name.clone(), w as u32);
+                    }
+                }
             }
             if let Some(simple) = type_simple_name(l.ty.as_ref()) {
                 if e.transactions.contains(simple)
@@ -2087,6 +2104,15 @@ struct Emitter {
     /// `randomize_T()` function to call. Populated by `let t : T` and
     /// function parameters.
     let_types: std::collections::HashMap<String, String>,
+    /// Per-test bit-widths for `let X : uint<W>` (and sint/bits)
+    /// declarations. Used by the width-method intrinsics
+    /// (`.trunc<N>()` / `.zext<N>()` / `.sext<N>()` / `.resize<N>()`)
+    /// to (a) reject wrong-direction casts at codegen time and (b)
+    /// give sext the correct source-width for its shift-fill. Lets
+    /// without an explicit type (`let x = expr`) don't populate this
+    /// map — width-direction checks then fall back to best-effort
+    /// inference on the RHS expression.
+    let_widths: std::collections::HashMap<String, u32>,
     /// Identifier → transactor mode, for let-bindings that carry a mode
     /// annotation (`let x : T active`, `let env : E passive`). The mode
     /// is recorded for the root let-name and forms the inheritance root
@@ -3828,6 +3854,258 @@ impl Emitter {
             }
             _ => false,
         }
+    }
+
+    /// Intrinsic width-method lowering: `.trunc<N>()`, `.zext<N>()`,
+    /// `.sext<N>()`, `.resize<N>()`. Ported from arch-com's
+    /// `cpp_method_call` (src/sim_codegen/mod.rs:2688). The parser
+    /// emits these as `Call { callee: Field{recv, name},
+    /// args: [width_const] }`. We dispatch on `name`, evaluate the
+    /// width as a compile-time constant, and emit the C++ narrow or
+    /// extend. Returns `true` when the call matched and was emitted;
+    /// `false` otherwise (caller falls through to normal call
+    /// emission).
+    ///
+    /// Behavior summary (matches arch-com's semantics):
+    /// - `.trunc<N>()`  — narrow to N bits: `((uintN_t)((expr) & MASK))`
+    ///                    where MASK = (1 << N) - 1. Errors if N >=
+    ///                    source width when source width is known
+    ///                    (would widen, wrong direction).
+    /// - `.zext<N>()`   — zero-extend to N bits: `((uintN_t)(expr))`.
+    /// - `.sext<N>()`   — sign-extend to N bits: shift-fill trick.
+    /// - `.resize<N>()` — direction-agnostic: narrow if N < source
+    ///                    width, zero-extend otherwise.
+    fn try_emit_width_method(&mut self, callee: &Expr, args: &[CallArg]) -> bool {
+        let ExprKind::Field { target, name } = &*callee.kind else {
+            return false;
+        };
+        let kind = match name.name.as_str() {
+            "trunc" => "trunc",
+            "zext" => "zext",
+            "sext" => "sext",
+            "resize" => "resize",
+            _ => return false,
+        };
+        let width_expr = match args.first() {
+            Some(CallArg::Expr(e)) => e,
+            _ => {
+                self.errors.push(format!(
+                    "`.{kind}<N>()` requires a constant width argument",
+                ));
+                return true;
+            }
+        };
+        let width = match eval_const_width(width_expr) {
+            Some(w) => w,
+            None => {
+                self.errors.push(format!(
+                    "`.{kind}<N>()` requires a constant integer width \
+                     (saw a non-const expression); span at parse-time \
+                     should pin the offending token",
+                ));
+                return true;
+            }
+        };
+        if width == 0 || width > 64 {
+            // arch-com supports wider (VlWide) but harc-com lowers all
+            // ≤64-bit ints to int64_t — wide-int support exists for
+            // 128-bit literals but the cast helpers used here assume
+            // ≤64. Surface the limit explicitly.
+            self.errors.push(format!(
+                "`.{kind}<{width}>()`: width must be in 1..=64 (wide-int \
+                 narrow/extend not yet supported in harc-com)",
+            ));
+            return true;
+        }
+        // Best-effort source-width inference for the type-direction check.
+        // We can detect width when the receiver is a literal-typed `let`
+        // or an explicit `as uint<W>` / `as sint<W>` cast. Otherwise the
+        // width is unknown and we skip the type-direction check.
+        let source_width = self.infer_expr_width_best_effort(target);
+        if let Some(sw) = source_width {
+            match kind {
+                "trunc" if width >= sw => {
+                    self.errors.push(format!(
+                        "`.trunc<{width}>()` on a {sw}-bit value: width \
+                         must be strictly less than the source width \
+                         (otherwise it's a no-op or wrong-direction). \
+                         Use `.zext<{width}>()` to widen, or remove the \
+                         cast if you meant a no-op.",
+                    ));
+                    return true;
+                }
+                "zext" | "sext" if width < sw => {
+                    self.errors.push(format!(
+                        "`.{kind}<{width}>()` on a {sw}-bit value: width \
+                         must be ≥ the source width (otherwise it \
+                         narrows, wrong direction). Use `.trunc<{width}>()` \
+                         to narrow.",
+                    ));
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        // Emit. Pattern follows arch-com's cast_to_bits / shift-fill
+        // for sext.
+        let c_unsigned = cpp_uint_for_width(Some(width));
+        match kind {
+            "trunc" => {
+                if width == 64 {
+                    write!(self.out, "(({c_unsigned})(").ok();
+                    self.emit_expr(target);
+                    write!(self.out, "))").ok();
+                } else {
+                    let mask = (1u64 << width) - 1;
+                    write!(self.out, "(({c_unsigned})(((").ok();
+                    self.emit_expr(target);
+                    write!(self.out, ") & 0x{mask:X}ULL)))").ok();
+                }
+            }
+            "zext" => {
+                // Mask to the source width before widening so any high bits
+                // in the underlying int64_t storage (from a prior no-op cast)
+                // are dropped. When source width is unknown we conservatively
+                // assume the receiver already fits in N bits — same shape
+                // as arch-com.
+                write!(self.out, "(({c_unsigned})(").ok();
+                self.emit_expr(target);
+                write!(self.out, "))").ok();
+            }
+            "sext" => {
+                // Sign-extend from source width to dest width. Strategy:
+                // shift source-width MSB into bit 63 of an int64_t, then
+                // arithmetic-shift right back (the standard idiom).
+                // The result is masked to the dest width via the C++
+                // cast `((cpp_uint_for_width(width))<expr>)`. When source
+                // width is unknown, fall back to a plain widening cast
+                // — the receiver almost certainly already has the right
+                // sign-bit pattern in its underlying storage.
+                if let Some(sw) = source_width {
+                    if sw < width {
+                        let shift = 64 - sw;
+                        if width == 64 {
+                            // Want full 64-bit signed-extended view.
+                            write!(self.out, "((uint64_t)(((int64_t)((uint64_t)(").ok();
+                            self.emit_expr(target);
+                            write!(self.out, ") << {shift})) >> {shift}))").ok();
+                        } else {
+                            let mask = (1u64 << width) - 1;
+                            write!(self.out, "(({c_unsigned})(((int64_t)((uint64_t)(").ok();
+                            self.emit_expr(target);
+                            write!(self.out, ") << {shift})) >> {shift}) & 0x{mask:X}ULL)").ok();
+                        }
+                    } else {
+                        write!(self.out, "(({c_unsigned})(").ok();
+                        self.emit_expr(target);
+                        write!(self.out, "))").ok();
+                    }
+                } else {
+                    write!(self.out, "(({c_unsigned})(").ok();
+                    self.emit_expr(target);
+                    write!(self.out, "))").ok();
+                }
+            }
+            "resize" => {
+                // Direction-agnostic: narrow with mask when narrowing,
+                // plain cast otherwise.
+                if let Some(sw) = source_width {
+                    if width < sw {
+                        // Narrowing — mask + cast.
+                        if width == 64 {
+                            write!(self.out, "(({c_unsigned})(").ok();
+                            self.emit_expr(target);
+                            write!(self.out, "))").ok();
+                        } else {
+                            let mask = (1u64 << width) - 1;
+                            write!(self.out, "(({c_unsigned})(((").ok();
+                            self.emit_expr(target);
+                            write!(self.out, ") & 0x{mask:X}ULL)))").ok();
+                        }
+                    } else {
+                        // Widening or same width — plain cast.
+                        write!(self.out, "(({c_unsigned})(").ok();
+                        self.emit_expr(target);
+                        write!(self.out, "))").ok();
+                    }
+                } else {
+                    // Unknown source width — default to mask-narrow,
+                    // since `.resize<N>()` with `N <= 64` always wants
+                    // a value bounded to N bits regardless of source.
+                    if width == 64 {
+                        write!(self.out, "(({c_unsigned})(").ok();
+                        self.emit_expr(target);
+                        write!(self.out, "))").ok();
+                    } else {
+                        let mask = (1u64 << width) - 1;
+                        write!(self.out, "(({c_unsigned})(((").ok();
+                        self.emit_expr(target);
+                        write!(self.out, ") & 0x{mask:X}ULL)))").ok();
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+        true
+    }
+
+    /// Best-effort source-width inference for the width-method type
+    /// checks. Returns the width in bits when it can be statically
+    /// determined; `None` otherwise (callers skip the type-direction
+    /// check in that case). Recognized shapes:
+    ///   - Parenthesized expression → recurse into inner.
+    ///   - `<expr> as uint<W>` / `<expr> as sint<W>` → W.
+    ///   - `<expr>.trunc<W>()` / `.zext<W>()` / `.sext<W>()` / `.resize<W>()`
+    ///     → W (the prior width-method's target width).
+    ///   - Bare integer literal → minimum unsigned bit-width of the
+    ///     literal value (cheap heuristic: `64 - leading_zeros(v)` for
+    ///     positive values; `None` for negatives).
+    fn infer_expr_width_best_effort(&self, e: &Expr) -> Option<u32> {
+        match &*e.kind {
+            ExprKind::Paren(inner) => self.infer_expr_width_best_effort(inner),
+            ExprKind::Cast { ty, .. } => match ty {
+                TypeExpr::Builtin {
+                    name: BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits,
+                    args,
+                    ..
+                } => type_arg_width(args).map(|w| w as u32),
+                _ => None,
+            },
+            ExprKind::Call { callee, args } => {
+                if let ExprKind::Field { name, .. } = &*callee.kind {
+                    if Emitter::is_width_method_name(&name.name) {
+                        if let Some(CallArg::Expr(w)) = args.first() {
+                            return eval_const_width(w);
+                        }
+                    }
+                }
+                None
+            }
+            ExprKind::Int(s) => {
+                // Parse the literal text to a u64 and use bit-width.
+                let stripped = s.replace('_', "");
+                let v: Option<u64> = if let Some(rest) = stripped
+                    .strip_prefix("0x")
+                    .or_else(|| stripped.strip_prefix("0X"))
+                {
+                    u64::from_str_radix(rest, 16).ok()
+                } else if let Some(rest) = stripped
+                    .strip_prefix("0b")
+                    .or_else(|| stripped.strip_prefix("0B"))
+                {
+                    u64::from_str_radix(rest, 2).ok()
+                } else {
+                    stripped.parse::<u64>().ok()
+                };
+                v.map(|v| if v == 0 { 1 } else { 64 - v.leading_zeros() })
+            }
+            ExprKind::Ident(id) => self.let_widths.get(&id.name).copied(),
+            _ => None,
+        }
+    }
+
+    fn is_width_method_name(name: &str) -> bool {
+        matches!(name, "trunc" | "zext" | "sext" | "resize")
     }
 
     fn try_emit_bus_field_access(&mut self, target: &Expr, name: &Ident) -> Option<String> {
@@ -6655,6 +6933,20 @@ impl Emitter {
         if let Some(TypeExpr::Named { mode: Some(m), .. }) = l.ty.as_ref() {
             self.let_modes.insert(l.name.name.clone(), *m);
         }
+        // Track explicit bit-width for width-method intrinsics
+        // (`.trunc<N>()` etc.). Same logic as the per-test loop seed
+        // in `emit_with_opts` — typed lets only; bare `let x = expr`
+        // falls back to RHS inference.
+        if let Some(TypeExpr::Builtin { name, args, .. }) = l.ty.as_ref() {
+            if matches!(
+                name,
+                BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits
+            ) {
+                if let Some(w) = type_arg_width(args) {
+                    self.let_widths.insert(l.name.name.clone(), w as u32);
+                }
+            }
+        }
         // Bus binding: `let axil : BusAxiLite = bind dut`. Track the
         // (bus, dut-root) pair so subsequent `axil.signal` accesses
         // can lower to flat DUT signals (`dut->axil_signal`). The
@@ -8083,6 +8375,16 @@ impl Emitter {
                     self.emit_idle_predicate(&instance, &kind, n_expr);
                     return;
                 }
+                // Width-method intrinsics: `.trunc<N>()` / `.zext<N>()` /
+                // `.sext<N>()` / `.resize<N>()`. Mirrors arch-com's
+                // sim_codegen lowering (src/sim_codegen/mod.rs:2688).
+                // Parser emits these as `Call { callee: Field{recv, name},
+                // args: [width_expr] }`. The width_expr resolves to a
+                // const integer at emit time (literal or const path).
+                if self.try_emit_width_method(callee, args) {
+                    return;
+                }
+
                 // Method-call rewrite: `obj.method(args)` where `obj`'s
                 // type is a known component with a `hookable method`
                 // lowers to `<Type>_method(obj, args)`. Falls through to
@@ -8558,6 +8860,34 @@ fn int_width_from_args(args: &[TypeArg]) -> Option<u32> {
         },
         _ => None,
     })
+}
+
+/// Evaluate a HARC expression as a compile-time integer width. Used by
+/// the width-method intrinsics (`.trunc<N>()` / `.zext<N>()` /
+/// `.sext<N>()` / `.resize<N>()`) to extract `N`. Today recognizes only
+/// integer literals (the common case); a future pass could fold `const
+/// NAME : <Ty> = <expr>` references too.
+fn eval_const_width(e: &Expr) -> Option<u32> {
+    match &*e.kind {
+        ExprKind::Paren(inner) => eval_const_width(inner),
+        ExprKind::Int(s) => {
+            let stripped = s.replace('_', "");
+            if let Some(rest) = stripped
+                .strip_prefix("0x")
+                .or_else(|| stripped.strip_prefix("0X"))
+            {
+                u32::from_str_radix(rest, 16).ok()
+            } else if let Some(rest) = stripped
+                .strip_prefix("0b")
+                .or_else(|| stripped.strip_prefix("0B"))
+            {
+                u32::from_str_radix(rest, 2).ok()
+            } else {
+                stripped.parse::<u32>().ok()
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Pick the C++ value-type for a HARC unsigned integer of the given
