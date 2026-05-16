@@ -254,7 +254,7 @@ fn typed_lowering_reports_unsupported_constraint_forms() {
     let parsed = parse_source(
         r#"transaction T
     addr : uint<32>
-    keep solve_before(addr, addr)
+    keep solve_order(addr, addr)
 end transaction T"#,
     )
     .unwrap();

@@ -3987,8 +3987,7 @@ impl Parser {
             // properties / SVA. Only `$clog2` keeps the `$` form since it's
             // a compile-time function shared with ARCH.
             Some(TokenKind::Clog2) => self.parse_system_call(SystemFn::Clog2),
-            Some(TokenKind::SolveBefore) => self.parse_solve_directive(SolveKind::Before),
-            Some(TokenKind::SolveAfter) => self.parse_solve_directive(SolveKind::After),
+            Some(TokenKind::SolveOrder) => self.parse_solve_order_directive(),
             Some(TokenKind::Dist) => {
                 // Standalone `dist { ... }` — wraps as a directive without target.
                 self.advance();
@@ -4081,7 +4080,7 @@ impl Parser {
         Ok(Expr::new(ExprKind::SystemCall { name, args }, start))
     }
 
-    fn parse_solve_directive(&mut self, kind: SolveKind) -> Result<Expr, CompileError> {
+    fn parse_solve_order_directive(&mut self) -> Result<Expr, CompileError> {
         let start = self.advance().unwrap().span;
         self.expect(TokenKind::LParen)?;
         let mut args = Vec::new();
@@ -4094,10 +4093,7 @@ impl Parser {
             }
         }
         let close = self.expect(TokenKind::RParen)?.span;
-        Ok(Expr::new(
-            ExprKind::Solve { kind, args },
-            start.merge(close),
-        ))
+        Ok(Expr::new(ExprKind::SolveOrder { args }, start.merge(close)))
     }
 }
 

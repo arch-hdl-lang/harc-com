@@ -1126,9 +1126,8 @@ pub enum ExprKind {
         rhs: Expr,
         count: Option<HashCount>,
     },
-    /// `solve_before(a, b)` / `solve_after(a, b)` directive — kept as a call.
-    Solve {
-        kind: SolveKind,
+    /// `solve_order(a, b, c)` directive — kept as scheduling metadata.
+    SolveOrder {
         args: Vec<Expr>,
     },
     /// `e in <set-or-range>` membership test.
@@ -1209,12 +1208,6 @@ pub enum SystemFn {
     Stable,
     Past,
     Clog2,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SolveKind {
-    Before,
-    After,
 }
 
 // ── Statements / Blocks ───────────────────────────────────────────────────────

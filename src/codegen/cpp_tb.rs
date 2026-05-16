@@ -2353,7 +2353,7 @@ fn collect_randomize_target_field_refs(
                 collect_hash_count_field_refs(count, field_info, target_root, out);
             }
         }
-        ExprKind::Solve { args, .. } => {
+        ExprKind::SolveOrder { args } => {
             for arg in args {
                 collect_randomize_target_field_refs(arg, field_info, target_root, out);
             }
@@ -2379,13 +2379,6 @@ fn collect_hash_count_field_refs(
             collect_randomize_target_field_refs(lo, field_info, target_root, out);
             collect_randomize_target_field_refs(hi, field_info, target_root, out);
         }
-    }
-}
-
-fn solve_kind_name(kind: SolveKind) -> &'static str {
-    match kind {
-        SolveKind::Before => "solve_before",
-        SolveKind::After => "solve_after",
     }
 }
 
@@ -5917,7 +5910,7 @@ impl Emitter {
                     self.validate_field_attr_static_expr(ty, field, attr, &entry.weight);
                 }
             }
-            ExprKind::SystemCall { args, .. } | ExprKind::Solve { args, .. } => {
+            ExprKind::SystemCall { args, .. } | ExprKind::SolveOrder { args } => {
                 for e in args {
                     self.validate_field_attr_static_expr(ty, field, attr, e);
                 }
@@ -6110,7 +6103,7 @@ impl Emitter {
                     );
                 }
             }
-            ExprKind::SystemCall { args, .. } | ExprKind::Solve { args, .. } => {
+            ExprKind::SystemCall { args, .. } | ExprKind::SolveOrder { args } => {
                 for e in args {
                     self.validate_randomize_constraint_dependencies(
                         ty,
@@ -6512,7 +6505,7 @@ impl Emitter {
         let target_root = randomize_target_ident(target);
         let mut dist_directives: std::collections::HashMap<String, Vec<DistEntry>> =
             std::collections::HashMap::new();
-        let mut solve_order_directives: Vec<(SolveKind, Vec<String>)> = Vec::new();
+        let mut solve_order_directives: Vec<Vec<String>> = Vec::new();
         let mut hard_constraints: Vec<&Expr> = Vec::new();
         for c in with_body {
             match &*c.kind {
@@ -6544,11 +6537,10 @@ impl Emitter {
                     }
                     continue;
                 }
-                ExprKind::Solve { kind, args } => {
+                ExprKind::SolveOrder { args } => {
                     if args.len() < 2 {
                         self.errors.push(format!(
-                            "randomize({ty}) with `{}` expects at least two target fields",
-                            solve_kind_name(*kind),
+                            "randomize({ty}) with `solve_order` expects at least two target fields",
                         ));
                         continue;
                     }
@@ -6561,14 +6553,13 @@ impl Emitter {
                             fields.push(field);
                         } else {
                             self.errors.push(format!(
-                                "randomize({ty}) with `{}`: arguments must be fields of transaction `{ty}`",
-                                solve_kind_name(*kind),
+                                "randomize({ty}) with `solve_order`: arguments must be fields of transaction `{ty}`",
                             ));
                             valid = false;
                         }
                     }
                     if valid {
-                        solve_order_directives.push((*kind, fields));
+                        solve_order_directives.push(fields);
                     }
                     continue;
                 }
@@ -6687,12 +6678,11 @@ impl Emitter {
             self.emit_constraint_expr(c, &field_info, target_root, blocking);
             writeln!(self.out, ");").ok();
         }
-        for (kind, fields) in &solve_order_directives {
+        for fields in &solve_order_directives {
             self.pad(depth + 1);
             writeln!(
                 self.out,
-                "// {}({}) accepted as solver scheduling metadata",
-                solve_kind_name(*kind),
+                "// solve_order({}) accepted as solver scheduling metadata",
                 fields.join(", ")
             )
             .ok();
@@ -6753,13 +6743,10 @@ impl Emitter {
                 .iter()
                 .map(|f| (f.name.clone(), 0usize))
                 .collect();
-            for (kind, ordered_fields) in &solve_order_directives {
+            for ordered_fields in &solve_order_directives {
                 for i in 0..ordered_fields.len() {
                     for j in (i + 1)..ordered_fields.len() {
-                        let (src, dst) = match kind {
-                            SolveKind::Before => (&ordered_fields[i], &ordered_fields[j]),
-                            SolveKind::After => (&ordered_fields[j], &ordered_fields[i]),
-                        };
+                        let (src, dst) = (&ordered_fields[i], &ordered_fields[j]);
                         if !free_field_names.contains(src) || !free_field_names.contains(dst) {
                             continue;
                         }
@@ -11028,7 +11015,7 @@ fn rewrite_expr_for_impl(
             rewrite_expr_for_impl(lhs, fields, methods, _pointers, shadow);
             rewrite_expr_for_impl(rhs, fields, methods, _pointers, shadow);
         }
-        ExprKind::Solve { args, .. } => {
+        ExprKind::SolveOrder { args } => {
             for x in args.iter_mut() {
                 rewrite_expr_for_impl(x, fields, methods, _pointers, shadow);
             }
