@@ -955,11 +955,11 @@ pub enum TypeExpr {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinTy {
-    UInt,         // uint<N>
-    SInt,         // sint<N>
-    Bits,         // bits<N>
-    UIntCap,      // UInt<N> (legacy ARCH form)
-    SIntCap,      // SInt<N>
+    UInt,    // uint<N>
+    SInt,    // sint<N>
+    Bits,    // bits<N>
+    UIntCap, // UInt<N> (legacy ARCH form)
+    SIntCap, // SInt<N>
     Bool,
     BoolLower,
     Bit,
@@ -988,7 +988,10 @@ pub enum TypeArg {
     Expr(Expr),
     Type(TypeExpr),
     /// Named: `AxiBus#(ADDR_W=32)`, or `buffer<T, depth=16>`.
-    Named { name: Ident, value: Expr },
+    Named {
+        name: Ident,
+        value: Expr,
+    },
 }
 
 // ── Expressions ───────────────────────────────────────────────────────────────
@@ -1001,7 +1004,10 @@ pub struct Expr {
 
 impl Expr {
     pub fn new(kind: ExprKind, span: Span) -> Self {
-        Self { kind: Box::new(kind), span }
+        Self {
+            kind: Box::new(kind),
+            span,
+        }
     }
 }
 
@@ -1017,37 +1023,79 @@ pub enum ExprKind {
     Ident(Ident),
     /// `a.b` — also used for `.field` shorthand inside list-comprehension
     /// closures; in that case `target` is `ImplicitSelf`.
-    Field { target: Expr, name: Ident },
+    Field {
+        target: Expr,
+        name: Ident,
+    },
     ImplicitSelf, // The implicit `.` in `.field` shorthand
     /// `a[i]` or `a[m..n]` (single-bracket subscript / slice).
-    Index { target: Expr, index: Expr },
+    Index {
+        target: Expr,
+        index: Expr,
+    },
     /// `a[m:n]` — bit slice; kept distinct from range-slice to preserve syntax.
-    BitSlice { target: Expr, hi: Expr, lo: Expr },
+    BitSlice {
+        target: Expr,
+        hi: Expr,
+        lo: Expr,
+    },
     /// Function or method call: `f(a, b)` or `t.foo(args)`.
-    Call { callee: Expr, args: Vec<CallArg> },
+    Call {
+        callee: Expr,
+        args: Vec<CallArg>,
+    },
     /// `a as Type` — cast.
-    Cast { expr: Expr, ty: TypeExpr },
+    Cast {
+        expr: Expr,
+        ty: TypeExpr,
+    },
     /// `dut.s_axi_awready <- 1` — channel send / state write target.
-    Send { target: Expr, value: Expr },
+    Send {
+        target: Expr,
+        value: Expr,
+    },
     /// Assignment `lhs = rhs` (statement-level only — see Stmt::Assign).
-    Unary { op: UnaryOp, expr: Expr },
-    Binary { op: BinaryOp, lhs: Expr, rhs: Expr },
+    Unary {
+        op: UnaryOp,
+        expr: Expr,
+    },
+    Binary {
+        op: BinaryOp,
+        lhs: Expr,
+        rhs: Expr,
+    },
     /// `cond ? then_branch : else_branch` — conditional (ternary) expression.
     /// Right-associative; lower precedence than every other operator
     /// except assignment (which isn't an expression in HARC).
-    Ternary { cond: Expr, then_branch: Expr, else_branch: Expr },
+    Ternary {
+        cond: Expr,
+        then_branch: Expr,
+        else_branch: Expr,
+    },
     /// SVA delay `##N expr` and `##[m:n] expr` — unary in expression position.
-    HashHash { count: HashCount, expr: Expr },
+    HashHash {
+        count: HashCount,
+        expr: Expr,
+    },
     /// `e [*N]` / `e [*m:n]` — sequence repetition.
-    SeqRepeat { expr: Expr, count: HashCount },
+    SeqRepeat {
+        expr: Expr,
+        count: HashCount,
+    },
     /// `[a..b]` range expression — used in `[range(a,b)]`, `bins`, etc.
-    RangeLit { lo: Option<Expr>, hi: Option<Expr> },
+    RangeLit {
+        lo: Option<Expr>,
+        hi: Option<Expr>,
+    },
     /// `{a, b, c}` set literal.
     SetLit(Vec<Expr>),
     /// `dist {[0..0xFF] :/ 80, c :/ 20}` distribution literal.
     DistLit(Vec<DistEntry>),
     /// `$past(e, N)`, `$rose(e)`, `$fell(e)`, `$stable(e)`, `$clog2(e)`.
-    SystemCall { name: SystemFn, args: Vec<Expr> },
+    SystemCall {
+        name: SystemFn,
+        args: Vec<Expr>,
+    },
     /// `randomize(t)` or `randomize(t) with <body>` or `blocking randomize(t) with <body>`.
     Randomize {
         blocking: bool,
@@ -1055,20 +1103,39 @@ pub enum ExprKind {
         with_body: Vec<Expr>,
     },
     /// `dist <expr> { ... }` directive form inside `randomize ... with`.
-    DistDirective { target: Expr, entries: Vec<DistEntry> },
+    DistDirective {
+        target: Expr,
+        entries: Vec<DistEntry>,
+    },
     /// Parenthesized.
     Paren(Expr),
     /// `name = value` — used in struct literals and named call args.
-    NamedArg { name: Ident, value: Expr },
+    NamedArg {
+        name: Ident,
+        value: Expr,
+    },
     /// `Type { name: value, ... }` struct literal.
-    StructLit { ty: TypeExpr, fields: Vec<NamedExpr> },
+    StructLit {
+        ty: TypeExpr,
+        fields: Vec<NamedExpr>,
+    },
     /// `a -> b` / `a ->[N] b` / `a ->[m:n] b` cover-sequence pattern operator
     /// (only valid inside `cover sequence` patterns; we accept it as a binary).
-    CoverArrow { lhs: Expr, rhs: Expr, count: Option<HashCount> },
+    CoverArrow {
+        lhs: Expr,
+        rhs: Expr,
+        count: Option<HashCount>,
+    },
     /// `solve_before(a, b)` / `solve_after(a, b)` directive — kept as a call.
-    Solve { kind: SolveKind, args: Vec<Expr> },
+    Solve {
+        kind: SolveKind,
+        args: Vec<Expr>,
+    },
     /// `e in <set-or-range>` membership test.
-    Membership { expr: Expr, set: Expr },
+    Membership {
+        expr: Expr,
+        set: Expr,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1101,13 +1168,29 @@ pub enum UnaryOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
     // arithmetic
-    Add, Sub, Mul, Div, Mod,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
     // comparison
-    Eq, Ne, Lt, Le, Gt, Ge,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
     // logical
-    AndAnd, OrOr, AndKw, OrKw,
+    AndAnd,
+    OrOr,
+    AndKw,
+    OrKw,
     // bitwise
-    BitAnd, BitOr, BitXor, Shl, Shr,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
     // temporal SVA
     PipeImplies,     // |->
     PipeImpliesNext, // |=>
@@ -1115,7 +1198,8 @@ pub enum BinaryOp {
     Within,
     Intersect,
     // membership
-    In, Inside,
+    In,
+    Inside,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1150,26 +1234,44 @@ pub struct Stmt {
 #[derive(Debug, Clone)]
 pub enum StmtKind {
     Let(LetStmt),
-    Assign { target: Expr, value: Expr },     // lhs = rhs
-    Send { target: Expr, value: Expr },       // lhs <- rhs
+    Assign {
+        target: Expr,
+        value: Expr,
+    }, // lhs = rhs
+    Send {
+        target: Expr,
+        value: Expr,
+    }, // lhs <- rhs
     For(ForStmt),
     Repeat(RepeatStmt),
     Loop(Block),
     /// `while <cond> ... end while` — pre-tested loop.
-    While { cond: Expr, body: Block, span: Span },
+    While {
+        cond: Expr,
+        body: Block,
+        span: Span,
+    },
     /// `break` — exit innermost enclosing loop (`while` / `loop` / `for` /
     /// `repeat`). Type-checked at codegen: a `break` outside a loop is a
     /// hard error.
-    Break { span: Span },
+    Break {
+        span: Span,
+    },
     /// `continue` — skip to next iteration of innermost enclosing loop.
-    Continue { span: Span },
+    Continue {
+        span: Span,
+    },
     If(IfStmt),
     Fork(ForkStmt),
     Parallel(Vec<Block>),
     Schedule(Vec<Block>),
     Select(Vec<SelectArm>),
     On(OnHandler),
-    Emit { name: Path, args: Vec<CallArg>, span: Span },
+    Emit {
+        name: Path,
+        args: Vec<CallArg>,
+        span: Span,
+    },
     Yield(Expr),
     Return(Option<Expr>),
     Apply(ApplyDecl),
@@ -1184,25 +1286,43 @@ pub enum StmtKind {
     /// `cover <expr>` / `cover <name>` / `cover property <expr>`.
     Cover(Verify),
     /// `randomize(t) with ...` as a statement.
-    Randomize { blocking: bool, target: Expr, with_body: Vec<Expr> },
+    Randomize {
+        blocking: bool,
+        target: Expr,
+        with_body: Vec<Expr>,
+    },
     /// `log(severity, "...", id="...", verbosity=HIGH)`.
-    Log { args: Vec<CallArg>, span: Span },
+    Log {
+        args: Vec<CallArg>,
+        span: Span,
+    },
     /// `logf("path.log", severity, "...")` — like `log` but writes to a
     /// named file (in addition to stdout). Useful for per-component or
     /// per-protocol log streams. The first positional arg is the file
     /// path (string literal); the rest follow `log` semantics.
-    LogF { args: Vec<CallArg>, span: Span },
+    LogF {
+        args: Vec<CallArg>,
+        span: Span,
+    },
     /// Bare expression statement (call, etc.).
     Expr(Expr),
     /// `after N cycles ... end after` — suspend primitive (§7.4) with a body.
-    After { duration: Expr, body: Block, span: Span },
+    After {
+        duration: Expr,
+        body: Block,
+        span: Span,
+    },
     /// `wait <expr> cycles [on <clock>]` — single-statement suspend,
     /// ARCH-shape sugar for `after N cycles ... end after` with an empty
     /// body. The trailing `cycles` / `cycle` keyword is decorative and
     /// optional. When `clock` is set, advances simulated time so the
     /// named clock sees `<expr>` more rising edges (other clocks
     /// continue ticking at their natural rate).
-    Wait { duration: Expr, clock: Option<Ident>, span: Span },
+    Wait {
+        duration: Expr,
+        clock: Option<Ident>,
+        span: Span,
+    },
     /// `wait until <expr> [timeout N cycles fail("...")]` — suspend
     /// the current coroutine until the predicate becomes true at a
     /// posedge of the primary clock. With `all of` / `any of` the
@@ -1233,7 +1353,10 @@ pub enum StmtKind {
     /// predicate (e.g. inside an `if`/`for` body where the failure
     /// condition is structural rather than expressible as one
     /// expression).
-    Fail { msg: Expr, span: Span },
+    Fail {
+        msg: Expr,
+        span: Span,
+    },
 }
 
 /// Quantifier over the predicate list of a `wait until` statement.
@@ -1356,8 +1479,8 @@ pub enum ForkJoin {
 
 #[derive(Debug, Clone)]
 pub struct SelectArm {
-    pub event: Expr,    // before `=>`
-    pub action: Block,  // after `=>` (one statement, lifted to block)
+    pub event: Expr,   // before `=>`
+    pub action: Block, // after `=>` (one statement, lifted to block)
     pub span: Span,
 }
 
@@ -1471,19 +1594,37 @@ pub trait Construct {
 macro_rules! impl_construct_direct {
     ($ty:ty, $label:expr) => {
         impl Construct for $ty {
-            fn kind_label(&self) -> &'static str { $label }
-            fn name(&self) -> &Ident { &self.name }
-            fn span(&self) -> Span { self.span }
-            fn doc(&self) -> Option<&str> { self.doc.as_deref() }
+            fn kind_label(&self) -> &'static str {
+                $label
+            }
+            fn name(&self) -> &Ident {
+                &self.name
+            }
+            fn span(&self) -> Span {
+                self.span
+            }
+            fn doc(&self) -> Option<&str> {
+                self.doc.as_deref()
+            }
         }
     };
     ($ty:ty, $label:expr, +inner) => {
         impl Construct for $ty {
-            fn kind_label(&self) -> &'static str { $label }
-            fn name(&self) -> &Ident { &self.name }
-            fn span(&self) -> Span { self.span }
-            fn doc(&self) -> Option<&str> { self.doc.as_deref() }
-            fn inner_doc(&self) -> Option<&str> { self.inner_doc.as_deref() }
+            fn kind_label(&self) -> &'static str {
+                $label
+            }
+            fn name(&self) -> &Ident {
+                &self.name
+            }
+            fn span(&self) -> Span {
+                self.span
+            }
+            fn doc(&self) -> Option<&str> {
+                self.doc.as_deref()
+            }
+            fn inner_doc(&self) -> Option<&str> {
+                self.inner_doc.as_deref()
+            }
         }
     };
 }
@@ -1529,10 +1670,18 @@ impl Construct for ComponentDecl {
             ComponentKind::Testbench => "testbench",
         }
     }
-    fn name(&self) -> &Ident { &self.name }
-    fn span(&self) -> Span { self.span }
-    fn doc(&self) -> Option<&str> { self.doc.as_deref() }
-    fn inner_doc(&self) -> Option<&str> { self.inner_doc.as_deref() }
+    fn name(&self) -> &Ident {
+        &self.name
+    }
+    fn span(&self) -> Span {
+        self.span
+    }
+    fn doc(&self) -> Option<&str> {
+        self.doc.as_deref()
+    }
+    fn inner_doc(&self) -> Option<&str> {
+        self.inner_doc.as_deref()
+    }
 }
 
 // `use foo.bar.Baz` — Construct uses the last path segment as the
@@ -1543,46 +1692,53 @@ impl Construct for ComponentDecl {
 // `OnceCell` per UseDecl. For v0 we just return the last segment's
 // Ident directly — `Path.segments` already owns the Idents.
 impl Construct for UseDecl {
-    fn kind_label(&self) -> &'static str { "use" }
+    fn kind_label(&self) -> &'static str {
+        "use"
+    }
     fn name(&self) -> &Ident {
         // Return the last segment's Ident; falls back to a static
         // synthetic name when the path is empty (shouldn't happen
         // post-parse but the borrow surface needs something to point
         // at).
-        self.path
-            .segments
-            .last()
-            .map(|s| s)
-            .unwrap_or_else(|| {
-                static EMPTY: std::sync::OnceLock<Ident> = std::sync::OnceLock::new();
-                EMPTY.get_or_init(|| Ident {
-                    name: "<empty-use>".into(),
-                    span: Span::new(0, 0),
-                })
+        self.path.segments.last().map(|s| s).unwrap_or_else(|| {
+            static EMPTY: std::sync::OnceLock<Ident> = std::sync::OnceLock::new();
+            EMPTY.get_or_init(|| Ident {
+                name: "<empty-use>".into(),
+                span: Span::new(0, 0),
             })
+        })
     }
-    fn span(&self) -> Span { self.span }
-    fn doc(&self) -> Option<&str> { self.doc.as_deref() }
+    fn span(&self) -> Span {
+        self.span
+    }
+    fn doc(&self) -> Option<&str> {
+        self.doc.as_deref()
+    }
 }
 
 // `extend X { ... }` — name is the last segment of `target`.
 impl Construct for ExtendDecl {
-    fn kind_label(&self) -> &'static str { "extend" }
-    fn name(&self) -> &Ident {
-        self.target
-            .segments
-            .last()
-            .unwrap_or_else(|| {
-                static EMPTY: std::sync::OnceLock<Ident> = std::sync::OnceLock::new();
-                EMPTY.get_or_init(|| Ident {
-                    name: "<empty-extend>".into(),
-                    span: Span::new(0, 0),
-                })
-            })
+    fn kind_label(&self) -> &'static str {
+        "extend"
     }
-    fn span(&self) -> Span { self.span }
-    fn doc(&self) -> Option<&str> { self.doc.as_deref() }
-    fn inner_doc(&self) -> Option<&str> { self.inner_doc.as_deref() }
+    fn name(&self) -> &Ident {
+        self.target.segments.last().unwrap_or_else(|| {
+            static EMPTY: std::sync::OnceLock<Ident> = std::sync::OnceLock::new();
+            EMPTY.get_or_init(|| Ident {
+                name: "<empty-extend>".into(),
+                span: Span::new(0, 0),
+            })
+        })
+    }
+    fn span(&self) -> Span {
+        self.span
+    }
+    fn doc(&self) -> Option<&str> {
+        self.doc.as_deref()
+    }
+    fn inner_doc(&self) -> Option<&str> {
+        self.inner_doc.as_deref()
+    }
 }
 
 // `apply Foo.Bar` — no name, no doc. Synthesize an empty name and
@@ -1590,21 +1746,24 @@ impl Construct for ExtendDecl {
 // produces a useful feature event, but Construct must be exhaustive
 // so `as_construct` covers every Item variant.
 impl Construct for ApplyDecl {
-    fn kind_label(&self) -> &'static str { "apply" }
-    fn name(&self) -> &Ident {
-        self.path
-            .segments
-            .last()
-            .unwrap_or_else(|| {
-                static EMPTY: std::sync::OnceLock<Ident> = std::sync::OnceLock::new();
-                EMPTY.get_or_init(|| Ident {
-                    name: "<empty-apply>".into(),
-                    span: Span::new(0, 0),
-                })
-            })
+    fn kind_label(&self) -> &'static str {
+        "apply"
     }
-    fn span(&self) -> Span { self.span }
-    fn doc(&self) -> Option<&str> { None }
+    fn name(&self) -> &Ident {
+        self.path.segments.last().unwrap_or_else(|| {
+            static EMPTY: std::sync::OnceLock<Ident> = std::sync::OnceLock::new();
+            EMPTY.get_or_init(|| Ident {
+                name: "<empty-apply>".into(),
+                span: Span::new(0, 0),
+            })
+        })
+    }
+    fn span(&self) -> Span {
+        self.span
+    }
+    fn doc(&self) -> Option<&str> {
+        None
+    }
 }
 
 impl Item {

@@ -14,8 +14,7 @@ use crate::ast::*;
 
 pub fn merge_for_sim(files: &[SourceFile], pick: Option<&str>) -> Result<SourceFile, String> {
     // Index test bases by name and collect extends targeting tests.
-    let mut tests: std::collections::HashMap<String, TestDecl> =
-        std::collections::HashMap::new();
+    let mut tests: std::collections::HashMap<String, TestDecl> = std::collections::HashMap::new();
     let mut test_extends: Vec<(String, Vec<TestItem>)> = Vec::new();
     let mut other_items: Vec<Item> = Vec::new();
 
@@ -25,13 +24,17 @@ pub fn merge_for_sim(files: &[SourceFile], pick: Option<&str>) -> Result<SourceF
                 Item::Test(t) => {
                     if tests.contains_key(&t.name.name) {
                         return Err(format!(
-                            "duplicate test base `{}` across input files", t.name.name
+                            "duplicate test base `{}` across input files",
+                            t.name.name
                         ));
                     }
                     tests.insert(t.name.name.clone(), t.clone());
                 }
                 Item::Extend(e) => {
-                    let target = e.target.segments.last()
+                    let target = e
+                        .target
+                        .segments
+                        .last()
                         .map(|s| s.name.clone())
                         .unwrap_or_default();
                     match &e.body {
@@ -83,5 +86,9 @@ pub fn merge_for_sim(files: &[SourceFile], pick: Option<&str>) -> Result<SourceF
     for name in test_names {
         items.push(Item::Test(tests.remove(&name).unwrap()));
     }
-    Ok(SourceFile { items, inner_doc: None, frontmatter: None })
+    Ok(SourceFile {
+        items,
+        inner_doc: None,
+        frontmatter: None,
+    })
 }

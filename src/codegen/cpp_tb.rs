@@ -190,9 +190,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             }
         }
     }
-    let dut_type: &str = shared_dut_type.ok_or_else(|| {
-        EmitError("expected `let dut : <Type>` declaration in test body".into())
-    })?;
+    let dut_type: &str = shared_dut_type
+        .ok_or_else(|| EmitError("expected `let dut : <Type>` declaration in test body".into()))?;
 
     // Per-test metadata (custom_phases, other_lets, ...) is derived
     // inside the per-test emission loop further down. The few
@@ -356,8 +355,14 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // for the full rationale and detection model.
     for t in transactors.values() {
         if let Some(err) = check_transactor_no_drive_in_always_on_body(
-            t, &transactors, &components, &scoreboards, &covergroups, &buses,
-            &regblocks, &addrmaps,
+            t,
+            &transactors,
+            &components,
+            &scoreboards,
+            &covergroups,
+            &buses,
+            &regblocks,
+            &addrmaps,
         ) {
             return Err(EmitError(err));
         }
@@ -485,7 +490,13 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "// HARC test: {}", tests[0].name.name).ok();
     } else {
         let names: Vec<&str> = tests.iter().map(|t| t.name.name.as_str()).collect();
-        writeln!(e.out, "// HARC tests ({}): {}", tests.len(), names.join(", ")).ok();
+        writeln!(
+            e.out,
+            "// HARC tests ({}): {}",
+            tests.len(),
+            names.join(", ")
+        )
+        .ok();
     }
     writeln!(e.out, "").ok();
     // Disable clang optimization for this file. clang 17+ on both
@@ -618,18 +629,46 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // JSONL writer used by `harc sim --record-trace <path>` (plumbed as
     // HARC_TRACE by the CLI). Keep this tiny and dependency-free so the
     // emitted TB remains a single C++ file plus runtime header.
-    writeln!(e.out, "static std::string harc_trace_escape(const std::string& s) {{").ok();
+    writeln!(
+        e.out,
+        "static std::string harc_trace_escape(const std::string& s) {{"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}std::string out; out.reserve(s.size() + 8);").ok();
     writeln!(e.out, "{INDENT}for (unsigned char c : s) {{").ok();
     writeln!(e.out, "{INDENT}{INDENT}switch (c) {{").ok();
-    writeln!(e.out, "{INDENT}{INDENT}{INDENT}case '\"': out += \"\\\\\\\"\"; break;").ok();
-    writeln!(e.out, "{INDENT}{INDENT}{INDENT}case '\\\\': out += \"\\\\\\\\\"; break;").ok();
-    writeln!(e.out, "{INDENT}{INDENT}{INDENT}case '\\n': out += \"\\\\n\"; break;").ok();
-    writeln!(e.out, "{INDENT}{INDENT}{INDENT}case '\\r': out += \"\\\\r\"; break;").ok();
-    writeln!(e.out, "{INDENT}{INDENT}{INDENT}case '\\t': out += \"\\\\t\"; break;").ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}{INDENT}case '\"': out += \"\\\\\\\"\"; break;"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}{INDENT}case '\\\\': out += \"\\\\\\\\\"; break;"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}{INDENT}case '\\n': out += \"\\\\n\"; break;"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}{INDENT}case '\\r': out += \"\\\\r\"; break;"
+    )
+    .ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}{INDENT}case '\\t': out += \"\\\\t\"; break;"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}{INDENT}{INDENT}default:").ok();
     writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}if (c < 0x20) {{ char buf[7]; std::snprintf(buf, sizeof(buf), \"\\\\u%04x\", c); out += buf; }}").ok();
-    writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}else out.push_back((char)c);").ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}{INDENT}{INDENT}else out.push_back((char)c);"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}{INDENT}}}").ok();
     writeln!(e.out, "{INDENT}}}").ok();
     writeln!(e.out, "{INDENT}return out;").ok();
@@ -646,17 +685,33 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     writeln!(e.out, "{INDENT}{INDENT}std::fprintf(out, \"{{\\\"type\\\":\\\"meta\\\",\\\"schema_version\\\":1,\\\"tool\\\":\\\"harc\\\",\\\"seed\\\":%llu,\\\"dut_backend\\\":\\\"%s\\\",\\\"top\\\":\\\"%s\\\",\\\"test\\\":\\\"%s\\\"}}\\n\", (unsigned long long)seed, backend ? backend : \"unknown\", top ? top : \"\", test ? test : \"\");").ok();
     writeln!(e.out, "{INDENT}{INDENT}std::fflush(out);").ok();
     writeln!(e.out, "{INDENT}}}").ok();
-    writeln!(e.out, "{INDENT}void raw(const char* type, int cycle, const std::string& payload) {{").ok();
+    writeln!(
+        e.out,
+        "{INDENT}void raw(const char* type, int cycle, const std::string& payload) {{"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}{INDENT}if (!enabled) return;").ok();
     writeln!(e.out, "{INDENT}{INDENT}std::fprintf(out, \"{{\\\"type\\\":\\\"%s\\\",\\\"cycle\\\":%d,\\\"seq\\\":%llu%s%s}}\\n\", type, cycle, (unsigned long long)next_seq(), payload.empty() ? \"\" : \",\", payload.c_str());").ok();
     writeln!(e.out, "{INDENT}{INDENT}std::fflush(out);").ok();
     writeln!(e.out, "{INDENT}}}").ok();
-    writeln!(e.out, "{INDENT}void log(int cycle, const char* sev, const std::string& msg) {{").ok();
+    writeln!(
+        e.out,
+        "{INDENT}void log(int cycle, const char* sev, const std::string& msg) {{"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}{INDENT}std::string payload = \"\\\"severity\\\":\\\"\" + harc_trace_escape(sev ? sev : \"\") + \"\\\",\\\"message\\\":\\\"\" + harc_trace_escape(msg) + \"\\\"\";").ok();
     writeln!(e.out, "{INDENT}{INDENT}raw(\"log\", cycle, payload);").ok();
-    writeln!(e.out, "{INDENT}{INDENT}if (sev && std::strcmp(sev, \"FAIL\") == 0) {{").ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}if (sev && std::strcmp(sev, \"FAIL\") == 0) {{"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}{INDENT}{INDENT}std::string fail_payload = \"\\\"failure_id\\\":\\\"fail\\\",\\\"message\\\":\\\"\" + harc_trace_escape(msg) + \"\\\"\";").ok();
-    writeln!(e.out, "{INDENT}{INDENT}{INDENT}raw(\"assertion_failure\", cycle, fail_payload);").ok();
+    writeln!(
+        e.out,
+        "{INDENT}{INDENT}{INDENT}raw(\"assertion_failure\", cycle, fail_payload);"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}{INDENT}}}").ok();
     writeln!(e.out, "{INDENT}}}").ok();
     writeln!(e.out, "}};").ok();
@@ -1039,10 +1094,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             // direction matches the source width, and so sext can emit
             // its shift-fill from the right MSB position.
             if let Some(TypeExpr::Builtin { name, args, .. }) = l.ty.as_ref() {
-                if matches!(
-                    name,
-                    BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits
-                ) {
+                if matches!(name, BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits) {
                     if let Some(w) = type_arg_width(args) {
                         e.let_widths.insert(l.name.name.clone(), w as u32);
                     }
@@ -1067,78 +1119,87 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         }
         e.clock_names = clocks.iter().map(|c| c.name.name.clone()).collect();
 
-    writeln!(e.out, "int run_{}(int argc, char** argv) {{", test.name.name).ok();
-    writeln!(e.out, "{INDENT}Verilated::commandArgs(argc, argv);").ok();
-    writeln!(e.out, "{INDENT}V{dut_type}* dut = new V{dut_type};").ok();
-    writeln!(e.out, "{INDENT}int errors = 0;").ok();
-    // Per spec §7.7: `log(fatal, ...)` aborts this test instance at
-    // the end of the current cycle. The flag is checked by the
-    // main simulation-loop guard below.
-    writeln!(e.out, "{INDENT}bool _fatal = false;").ok();
-    writeln!(e.out, "{INDENT}int cycle_count = 0;").ok();
-    writeln!(e.out, "").ok();
-    // Seed PRNG from HARC_SEED env (or 1 if unset). Logged after sim_log_line
-    // is defined so it lands in sim.log along with normal test output.
-    writeln!(e.out, "{INDENT}{{ const char* s = std::getenv(\"HARC_SEED\"); harc_rng_state = s ? std::strtoull(s, nullptr, 0) : 1ULL; }}").ok();
-    writeln!(e.out, "{INDENT}HarcTraceWriter trace;").ok();
-    writeln!(e.out, "{INDENT}trace.open_env();").ok();
-    writeln!(e.out, "{INDENT}trace.meta(harc_rng_state, std::getenv(\"HARC_DUT_BACKEND\"), \"{dut_type}\", \"{}\");", test.name.name).ok();
-    writeln!(e.out, "{INDENT}trace.raw(\"sim_start\", cycle_count, \"\");").ok();
-    writeln!(e.out, "").ok();
-    // sim.log captures every log()/assert/fail line with cycle + severity
-    // prefix. Path is configurable via the HARC_SIM_LOG env var (so the
-    // outer harness can put it in the build dir); default `sim.log` in cwd.
-    writeln!(
-        e.out,
-        "{INDENT}const char* sim_log_path = std::getenv(\"HARC_SIM_LOG\");"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}if (!sim_log_path) sim_log_path = \"sim.log\";"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}FILE* sim_log = std::fopen(sim_log_path, \"w\");"
-    )
-    .ok();
-    writeln!(e.out, "").ok();
-    // Concurrent assertion hook — every `assert property <expr>` /
-    // `assert property NAME` registers a closure here; tick() invokes the
-    // whole list after each `eval()`. Same-cycle (`|->`) and one-cycle
-    // (`|=>`) properties run on every primary-clock edge.
-    writeln!(
-        e.out,
-        "{INDENT}std::vector<std::function<void()>> _checkers;"
-    )
-    .ok();
-    writeln!(e.out, "").ok();
-
-    if clocks.is_empty() {
-        // Single-clock backward-compat path: drives `dut->clk`. cycle_count
-        // increments once per tick. Used by tests that don't declare any
-        // `clock <name> = <period>` items.
-        writeln!(e.out, "{INDENT}auto tick = [&]() {{").ok();
-        writeln!(e.out, "{INDENT}{INDENT}dut->clk = 0; dut->eval();").ok();
-        writeln!(e.out, "{INDENT}{INDENT}dut->clk = 1; dut->eval();").ok();
-        writeln!(e.out, "{INDENT}{INDENT}cycle_count++;").ok();
-        writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
-        writeln!(e.out, "{INDENT}}};").ok();
+        writeln!(
+            e.out,
+            "int run_{}(int argc, char** argv) {{",
+            test.name.name
+        )
+        .ok();
+        writeln!(e.out, "{INDENT}Verilated::commandArgs(argc, argv);").ok();
+        writeln!(e.out, "{INDENT}V{dut_type}* dut = new V{dut_type};").ok();
+        writeln!(e.out, "{INDENT}int errors = 0;").ok();
+        // Per spec §7.7: `log(fatal, ...)` aborts this test instance at
+        // the end of the current cycle. The flag is checked by the
+        // main simulation-loop guard below.
+        writeln!(e.out, "{INDENT}bool _fatal = false;").ok();
+        writeln!(e.out, "{INDENT}int cycle_count = 0;").ok();
         writeln!(e.out, "").ok();
-    } else {
-        // Multi-clock scheduler: every declared clock keeps its own next-edge
-        // timestamp; we advance simulation time to the earliest pending edge,
-        // toggle that clock, call eval(). cycle_count tracks rising edges of
-        // the primary clock (first-declared) so existing log lines remain
-        // meaningful.
-        writeln!(e.out, "{INDENT}long long now_ps = 0;").ok();
-        writeln!(e.out, "{INDENT}struct ClockState {{ const char* name; long long half_period_ps; long long next_edge_ps; int level; long long rising_count; }};").ok();
-        writeln!(e.out, "{INDENT}std::vector<ClockState> clocks_;").ok();
-        for c in &clocks {
-            // Period source: time literal `5ns` OR domain reference `FastDomain`
-            // (looked up in the domain table → derived from freq_mhz).
-            let period_ps = match &*c.period.kind {
+        // Seed PRNG from HARC_SEED env (or 1 if unset). Logged after sim_log_line
+        // is defined so it lands in sim.log along with normal test output.
+        writeln!(e.out, "{INDENT}{{ const char* s = std::getenv(\"HARC_SEED\"); harc_rng_state = s ? std::strtoull(s, nullptr, 0) : 1ULL; }}").ok();
+        writeln!(e.out, "{INDENT}HarcTraceWriter trace;").ok();
+        writeln!(e.out, "{INDENT}trace.open_env();").ok();
+        writeln!(e.out, "{INDENT}trace.meta(harc_rng_state, std::getenv(\"HARC_DUT_BACKEND\"), \"{dut_type}\", \"{}\");", test.name.name).ok();
+        writeln!(
+            e.out,
+            "{INDENT}trace.raw(\"sim_start\", cycle_count, \"\");"
+        )
+        .ok();
+        writeln!(e.out, "").ok();
+        // sim.log captures every log()/assert/fail line with cycle + severity
+        // prefix. Path is configurable via the HARC_SIM_LOG env var (so the
+        // outer harness can put it in the build dir); default `sim.log` in cwd.
+        writeln!(
+            e.out,
+            "{INDENT}const char* sim_log_path = std::getenv(\"HARC_SIM_LOG\");"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}if (!sim_log_path) sim_log_path = \"sim.log\";"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}FILE* sim_log = std::fopen(sim_log_path, \"w\");"
+        )
+        .ok();
+        writeln!(e.out, "").ok();
+        // Concurrent assertion hook — every `assert property <expr>` /
+        // `assert property NAME` registers a closure here; tick() invokes the
+        // whole list after each `eval()`. Same-cycle (`|->`) and one-cycle
+        // (`|=>`) properties run on every primary-clock edge.
+        writeln!(
+            e.out,
+            "{INDENT}std::vector<std::function<void()>> _checkers;"
+        )
+        .ok();
+        writeln!(e.out, "").ok();
+
+        if clocks.is_empty() {
+            // Single-clock backward-compat path: drives `dut->clk`. cycle_count
+            // increments once per tick. Used by tests that don't declare any
+            // `clock <name> = <period>` items.
+            writeln!(e.out, "{INDENT}auto tick = [&]() {{").ok();
+            writeln!(e.out, "{INDENT}{INDENT}dut->clk = 0; dut->eval();").ok();
+            writeln!(e.out, "{INDENT}{INDENT}dut->clk = 1; dut->eval();").ok();
+            writeln!(e.out, "{INDENT}{INDENT}cycle_count++;").ok();
+            writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
+            writeln!(e.out, "{INDENT}}};").ok();
+            writeln!(e.out, "").ok();
+        } else {
+            // Multi-clock scheduler: every declared clock keeps its own next-edge
+            // timestamp; we advance simulation time to the earliest pending edge,
+            // toggle that clock, call eval(). cycle_count tracks rising edges of
+            // the primary clock (first-declared) so existing log lines remain
+            // meaningful.
+            writeln!(e.out, "{INDENT}long long now_ps = 0;").ok();
+            writeln!(e.out, "{INDENT}struct ClockState {{ const char* name; long long half_period_ps; long long next_edge_ps; int level; long long rising_count; }};").ok();
+            writeln!(e.out, "{INDENT}std::vector<ClockState> clocks_;").ok();
+            for c in &clocks {
+                // Period source: time literal `5ns` OR domain reference `FastDomain`
+                // (looked up in the domain table → derived from freq_mhz).
+                let period_ps = match &*c.period.kind {
                 ExprKind::Time(s) => time_literal_to_ps(s).map_err(EmitError)?,
                 ExprKind::Ident(id) => *domains.get(&id.name).ok_or_else(|| EmitError(format!(
                     "clock {} references domain `{}` but no `domain {}` declaration was found in any input file",
@@ -1149,816 +1210,818 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                     c.name.name
                 ))),
             };
-            let half = period_ps / 2;
-            // First edge fires at half_period (rising) so initial state is 0.
+                let half = period_ps / 2;
+                // First edge fires at half_period (rising) so initial state is 0.
+                writeln!(
+                    e.out,
+                    "{INDENT}clocks_.push_back(ClockState{{\"{}\", {half}, {half}, 0, 0}});",
+                    c.name.name
+                )
+                .ok();
+                writeln!(e.out, "{INDENT}dut->{} = 0;", c.name.name).ok();
+            }
+            writeln!(e.out, "").ok();
             writeln!(
                 e.out,
-                "{INDENT}clocks_.push_back(ClockState{{\"{}\", {half}, {half}, 0, 0}});",
-                c.name.name
+                "{INDENT}auto eval_clocks_until = [&](long long t_ps) {{"
             )
             .ok();
-            writeln!(e.out, "{INDENT}dut->{} = 0;", c.name.name).ok();
-        }
-        writeln!(e.out, "").ok();
-        writeln!(
-            e.out,
-            "{INDENT}auto eval_clocks_until = [&](long long t_ps) {{"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}{INDENT}while (now_ps < t_ps) {{").ok();
-        writeln!(e.out, "{INDENT}{INDENT}{INDENT}long long next = t_ps;").ok();
-        writeln!(e.out, "{INDENT}{INDENT}{INDENT}for (auto& c : clocks_) if (c.next_edge_ps < next) next = c.next_edge_ps;").ok();
-        writeln!(e.out, "{INDENT}{INDENT}{INDENT}now_ps = next;").ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}{INDENT}for (size_t i = 0; i < clocks_.size(); i++) {{"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}{INDENT}{INDENT}auto& c = clocks_[i];"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}{INDENT}{INDENT}if (c.next_edge_ps == now_ps) {{"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}c.level = !c.level;"
-        )
-        .ok();
-        // Per-clock signal write — done by name lookup.
-        for (idx, c) in clocks.iter().enumerate() {
+            writeln!(e.out, "{INDENT}{INDENT}while (now_ps < t_ps) {{").ok();
+            writeln!(e.out, "{INDENT}{INDENT}{INDENT}long long next = t_ps;").ok();
+            writeln!(e.out, "{INDENT}{INDENT}{INDENT}for (auto& c : clocks_) if (c.next_edge_ps < next) next = c.next_edge_ps;").ok();
+            writeln!(e.out, "{INDENT}{INDENT}{INDENT}now_ps = next;").ok();
             writeln!(
                 e.out,
-                "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (i == {idx}) dut->{} = c.level;",
-                c.name.name
+                "{INDENT}{INDENT}{INDENT}for (size_t i = 0; i < clocks_.size(); i++) {{"
             )
             .ok();
-        }
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}c.next_edge_ps += c.half_period_ps;"
-        )
-        .ok();
-        // Per-clock rising-edge count (consumed by `wait N cycles on <clock>`).
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (c.level == 1) c.rising_count++;"
-        )
-        .ok();
-        // Primary clock rising edge bumps cycle_count.
-        writeln!(
+            writeln!(
+                e.out,
+                "{INDENT}{INDENT}{INDENT}{INDENT}auto& c = clocks_[i];"
+            )
+            .ok();
+            writeln!(
+                e.out,
+                "{INDENT}{INDENT}{INDENT}{INDENT}if (c.next_edge_ps == now_ps) {{"
+            )
+            .ok();
+            writeln!(
+                e.out,
+                "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}c.level = !c.level;"
+            )
+            .ok();
+            // Per-clock signal write — done by name lookup.
+            for (idx, c) in clocks.iter().enumerate() {
+                writeln!(
+                    e.out,
+                    "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (i == {idx}) dut->{} = c.level;",
+                    c.name.name
+                )
+                .ok();
+            }
+            writeln!(
+                e.out,
+                "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}c.next_edge_ps += c.half_period_ps;"
+            )
+            .ok();
+            // Per-clock rising-edge count (consumed by `wait N cycles on <clock>`).
+            writeln!(
+                e.out,
+                "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (c.level == 1) c.rising_count++;"
+            )
+            .ok();
+            // Primary clock rising edge bumps cycle_count.
+            writeln!(
             e.out,
             "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (i == 0 && c.level == 1) cycle_count++;"
         )
+            .ok();
+            writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}}}").ok();
+            writeln!(e.out, "{INDENT}{INDENT}{INDENT}}}").ok();
+            writeln!(e.out, "{INDENT}{INDENT}{INDENT}dut->eval();").ok();
+            writeln!(e.out, "{INDENT}{INDENT}}}").ok();
+            writeln!(e.out, "{INDENT}}};").ok();
+            writeln!(e.out, "").ok();
+            // `tick()` advances by one full primary clock period (one rising
+            // edge). Other clocks tick at their natural rate during this span.
+            writeln!(e.out, "{INDENT}auto tick = [&]() {{").ok();
+            writeln!(
+                e.out,
+                "{INDENT}{INDENT}long long target = now_ps + clocks_[0].half_period_ps * 2;"
+            )
+            .ok();
+            writeln!(e.out, "{INDENT}{INDENT}eval_clocks_until(target);").ok();
+            writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
+            writeln!(e.out, "{INDENT}}};").ok();
+            writeln!(e.out, "").ok();
+        }
+        // Variadic so log()/assert/fail callers can pass printf-style args
+        // produced by `${expr}` string-interpolation lowering. Format string
+        // and varargs are evaluated twice (once per sink) — no shared state.
+        // Per-file log handles, opened on first reference, closed at exit.
+        // Relative paths are anchored to HARC_LOG_DIR (set by `harc sim` to the
+        // outdir) so per-component files land next to sim.log.
+        writeln!(
+            e.out,
+            "{INDENT}std::unordered_map<std::string, FILE*> log_files;"
+        )
         .ok();
-        writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}}}").ok();
-        writeln!(e.out, "{INDENT}{INDENT}{INDENT}}}").ok();
-        writeln!(e.out, "{INDENT}{INDENT}{INDENT}dut->eval();").ok();
+        writeln!(
+            e.out,
+            "{INDENT}auto resolve_log_path = [&](const char* path) -> std::string {{"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}if (path[0] == '/') return std::string(path);"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}const char* base = std::getenv(\"HARC_LOG_DIR\");"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}if (base) return std::string(base) + \"/\" + path;"
+        )
+        .ok();
+        writeln!(e.out, "{INDENT}{INDENT}return std::string(path);").ok();
+        writeln!(e.out, "{INDENT}}};").ok();
+        writeln!(
+            e.out,
+            "{INDENT}auto get_log_file = [&](const char* path) -> FILE* {{"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}std::string resolved = resolve_log_path(path);"
+        )
+        .ok();
+        writeln!(e.out, "{INDENT}{INDENT}auto it = log_files.find(resolved);").ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}if (it != log_files.end()) return it->second;"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}FILE* f = std::fopen(resolved.c_str(), \"w\");"
+        )
+        .ok();
+        writeln!(e.out, "{INDENT}{INDENT}log_files[resolved] = f;").ok();
+        writeln!(e.out, "{INDENT}{INDENT}return f;").ok();
+        writeln!(e.out, "{INDENT}}};").ok();
+        writeln!(e.out, "").ok();
+        writeln!(
+            e.out,
+            "{INDENT}auto sim_logf_line = [&](FILE* f, const char* sev, const char* fmt, ...) {{"
+        )
+        .ok();
+        writeln!(e.out, "{INDENT}{INDENT}va_list ap;").ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}std::printf(\"[cycle:%d %s] \", cycle_count, sev);"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}va_start(ap, fmt); std::vprintf(fmt, ap); va_end(ap);"
+        )
+        .ok();
+        writeln!(e.out, "{INDENT}{INDENT}std::printf(\"\\n\");").ok();
+        writeln!(e.out, "{INDENT}{INDENT}if (f) {{").ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}{INDENT}std::fprintf(f, \"[cycle:%d %s] \", cycle_count, sev);"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}{INDENT}va_start(ap, fmt); std::vfprintf(f, fmt, ap); va_end(ap);"
+        )
+        .ok();
+        writeln!(e.out, "{INDENT}{INDENT}{INDENT}std::fprintf(f, \"\\n\");").ok();
+        writeln!(e.out, "{INDENT}{INDENT}{INDENT}std::fflush(f);").ok();
         writeln!(e.out, "{INDENT}{INDENT}}}").ok();
         writeln!(e.out, "{INDENT}}};").ok();
         writeln!(e.out, "").ok();
-        // `tick()` advances by one full primary clock period (one rising
-        // edge). Other clocks tick at their natural rate during this span.
-        writeln!(e.out, "{INDENT}auto tick = [&]() {{").ok();
+        // After sim_log_line below is defined, emit the seed line so it lands
+        // in sim.log on every run — required for reproducing failures.
+        let log_seed = true;
+
         writeln!(
             e.out,
-            "{INDENT}{INDENT}long long target = now_ps + clocks_[0].half_period_ps * 2;"
+            "{INDENT}auto sim_log_line = [&](const char* sev, const char* fmt, ...) {{"
         )
         .ok();
-        writeln!(e.out, "{INDENT}{INDENT}eval_clocks_until(target);").ok();
-        writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
+        writeln!(e.out, "{INDENT}{INDENT}va_list ap;").ok();
+        writeln!(e.out, "{INDENT}{INDENT}char _trace_msg[4096];").ok();
+        writeln!(e.out, "{INDENT}{INDENT}va_start(ap, fmt); std::vsnprintf(_trace_msg, sizeof(_trace_msg), fmt, ap); va_end(ap);").ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}std::printf(\"[cycle:%d %s] \", cycle_count, sev);"
+        )
+        .ok();
+        writeln!(e.out, "{INDENT}{INDENT}std::printf(\"%s\", _trace_msg);").ok();
+        writeln!(e.out, "{INDENT}{INDENT}std::printf(\"\\n\");").ok();
+        writeln!(e.out, "{INDENT}{INDENT}if (sim_log) {{").ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}{INDENT}std::fprintf(sim_log, \"[cycle:%d %s] \", cycle_count, sev);"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}{INDENT}std::fprintf(sim_log, \"%s\", _trace_msg);"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}{INDENT}std::fprintf(sim_log, \"\\n\");"
+        )
+        .ok();
+        writeln!(e.out, "{INDENT}{INDENT}{INDENT}std::fflush(sim_log);").ok();
+        writeln!(e.out, "{INDENT}{INDENT}}}").ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}trace.log(cycle_count, sev, _trace_msg);"
+        )
+        .ok();
         writeln!(e.out, "{INDENT}}};").ok();
         writeln!(e.out, "").ok();
-    }
-    // Variadic so log()/assert/fail callers can pass printf-style args
-    // produced by `${expr}` string-interpolation lowering. Format string
-    // and varargs are evaluated twice (once per sink) — no shared state.
-    // Per-file log handles, opened on first reference, closed at exit.
-    // Relative paths are anchored to HARC_LOG_DIR (set by `harc sim` to the
-    // outdir) so per-component files land next to sim.log.
-    writeln!(
-        e.out,
-        "{INDENT}std::unordered_map<std::string, FILE*> log_files;"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}auto resolve_log_path = [&](const char* path) -> std::string {{"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}if (path[0] == '/') return std::string(path);"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}const char* base = std::getenv(\"HARC_LOG_DIR\");"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}if (base) return std::string(base) + \"/\" + path;"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}{INDENT}return std::string(path);").ok();
-    writeln!(e.out, "{INDENT}}};").ok();
-    writeln!(
-        e.out,
-        "{INDENT}auto get_log_file = [&](const char* path) -> FILE* {{"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}std::string resolved = resolve_log_path(path);"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}{INDENT}auto it = log_files.find(resolved);").ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}if (it != log_files.end()) return it->second;"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}FILE* f = std::fopen(resolved.c_str(), \"w\");"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}{INDENT}log_files[resolved] = f;").ok();
-    writeln!(e.out, "{INDENT}{INDENT}return f;").ok();
-    writeln!(e.out, "{INDENT}}};").ok();
-    writeln!(e.out, "").ok();
-    writeln!(
-        e.out,
-        "{INDENT}auto sim_logf_line = [&](FILE* f, const char* sev, const char* fmt, ...) {{"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}{INDENT}va_list ap;").ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}std::printf(\"[cycle:%d %s] \", cycle_count, sev);"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}va_start(ap, fmt); std::vprintf(fmt, ap); va_end(ap);"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}{INDENT}std::printf(\"\\n\");").ok();
-    writeln!(e.out, "{INDENT}{INDENT}if (f) {{").ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}{INDENT}std::fprintf(f, \"[cycle:%d %s] \", cycle_count, sev);"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}{INDENT}va_start(ap, fmt); std::vfprintf(f, fmt, ap); va_end(ap);"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}{INDENT}{INDENT}std::fprintf(f, \"\\n\");").ok();
-    writeln!(e.out, "{INDENT}{INDENT}{INDENT}std::fflush(f);").ok();
-    writeln!(e.out, "{INDENT}{INDENT}}}").ok();
-    writeln!(e.out, "{INDENT}}};").ok();
-    writeln!(e.out, "").ok();
-    // After sim_log_line below is defined, emit the seed line so it lands
-    // in sim.log on every run — required for reproducing failures.
-    let log_seed = true;
 
-    writeln!(
-        e.out,
-        "{INDENT}auto sim_log_line = [&](const char* sev, const char* fmt, ...) {{"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}{INDENT}va_list ap;").ok();
-    writeln!(e.out, "{INDENT}{INDENT}char _trace_msg[4096];").ok();
-    writeln!(e.out, "{INDENT}{INDENT}va_start(ap, fmt); std::vsnprintf(_trace_msg, sizeof(_trace_msg), fmt, ap); va_end(ap);").ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}std::printf(\"[cycle:%d %s] \", cycle_count, sev);"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}std::printf(\"%s\", _trace_msg);"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}{INDENT}std::printf(\"\\n\");").ok();
-    writeln!(e.out, "{INDENT}{INDENT}if (sim_log) {{").ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}{INDENT}std::fprintf(sim_log, \"[cycle:%d %s] \", cycle_count, sev);"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}{INDENT}std::fprintf(sim_log, \"%s\", _trace_msg);"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}{INDENT}std::fprintf(sim_log, \"\\n\");"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}{INDENT}{INDENT}std::fflush(sim_log);").ok();
-    writeln!(e.out, "{INDENT}{INDENT}}}").ok();
-    writeln!(e.out, "{INDENT}{INDENT}trace.log(cycle_count, sev, _trace_msg);").ok();
-    writeln!(e.out, "{INDENT}}};").ok();
-    writeln!(e.out, "").ok();
-
-    if log_seed {
-        writeln!(
-            e.out,
-            "{INDENT}sim_log_line(\"INFO\", \"seed=%llu\", (long long)harc_rng_state);"
-        )
-        .ok();
-        writeln!(e.out, "").ok();
-    }
-
-    // User-defined functions become lambdas. Emitted before the test body so
-    // the body can call them. Capture-all (`[&]`) so they see `dut`/`tick`/
-    // any test-level let bindings.
-    for f in &funcs {
-        e.emit_function(f, 1);
-    }
-    if !funcs.is_empty() {
-        writeln!(e.out, "").ok();
-    }
-    // Tseqs lower to lambdas returning `std::vector<T>`; emitted alongside
-    // functions so the run-block can invoke them and consume the result.
-    for t in &tseqs {
-        e.emit_tseq(t, 1);
-    }
-    if !tseqs.is_empty() {
-        writeln!(e.out, "").ok();
-    }
-    // Hookable methods on driver / agent / env / sequencer / scoreboard
-    // become free `[&]`-capturing lambdas named `<Type>_<method>`. The
-    // method-call site rewrites `obj.method(args)` to
-    // `<Type>_<method>(obj, args)` so the body sees `tick` / `_checkers`
-    // / etc. from the test scope.
-    //
-    // Pre/post hook vectors emit FIRST so the method bodies (and the
-    // test-scope `on obj.method pre/post` registrations) can `[&]`-
-    // capture them. Empty vectors are no-ops; the wrap is unconditional.
-    let mut emitted_any_method = false;
-    for it in &file.items {
-        match it {
-            Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c) => {
-                for ci in &c.items {
-                    if let ComponentItem::Hookable(h) = ci {
-                        e.emit_hook_vectors(c, h, 1);
-                    }
-                }
-            }
-            Item::Transactor(t) => {
-                let synth = synth_component_from_transactor(t, /*include_active*/ true);
-                for ci in &synth.items {
-                    if let ComponentItem::Hookable(h) = ci {
-                        e.emit_hook_vectors(&synth, h, 1);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    // Watchdog hook vectors must be emitted in the same forward-decl
-    // pass as the hookable hook vectors — `on <Type>.watchdog pre/post`
-    // captures them. The `emit_watchdog` helper below emits BOTH the
-    // hook vectors AND the synthetic method body in one go, since the
-    // method body refers to those vectors. So we forward-declare the
-    // method via the same pass that emits hookable method lambdas
-    // below; here, no separate forward decl is needed because the
-    // method lambda + its hook vectors are emitted together at that
-    // point.
-    // Pre-scan: register test-scope bus bindings (`let axil :
-    // BusAxiLite = bind dut`) and driver-type → binding mappings
-    // BEFORE hookable methods emit. Hookables on `bound to BusType`
-    // drivers need the binding active so `bus.<ch>.send/recv` and
-    // `bus.<ch>.<sig>` resolve correctly. emit_let later re-registers
-    // the bus bindings (idempotent — same key, same value).
-    for it in &test.items {
-        if let TestItem::Let(l) = it {
-            if l.bind {
-                if let Some(simple) = type_simple_name(l.ty.as_ref()) {
-                    if let Some(bus_decl) = e.buses.get(simple).cloned() {
-                        if let Some(v) = &l.value {
-                            let mut buf = String::new();
-                            std::mem::swap(&mut e.out, &mut buf);
-                            e.emit_expr(v);
-                            std::mem::swap(&mut e.out, &mut buf);
-                            let prefix = l.name.name.clone();
-                            e.bus_bindings
-                                .insert(l.name.name.clone(), (bus_decl, buf, prefix.clone()));
-                            // Populate the per-bind signal remap so hookable-
-                            // method emission (which precedes `emit_let`) can
-                            // resolve `bus.<ch>.<sig>` against the override
-                            // table. Without this pre-pass, transactor
-                            // bodies use only the prefix-convention name and
-                            // the override never fires for indirectly-routed
-                            // accesses.
-                            if !l.bind_remap.is_empty() {
-                                let mut map: std::collections::HashMap<(String, String), String> =
-                                    std::collections::HashMap::new();
-                                for entry in &l.bind_remap {
-                                    if entry.path.len() == 2 {
-                                        map.insert(
-                                            (
-                                                entry.path[0].name.clone(),
-                                                entry.path[1].name.clone(),
-                                            ),
-                                            entry.port.clone(),
-                                        );
-                                    }
-                                }
-                                e.bus_remap.insert(prefix, map);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    for it in &test.items {
-        if let TestItem::Let(l) = it {
-            if l.bind {
-                if let Some(simple) = type_simple_name(l.ty.as_ref()) {
-                    let bound_decl_to_bus = e
-                        .components
-                        .get(simple)
-                        .and_then(|c| c.bound_to.as_ref().map(|_| ()))
-                        .is_some()
-                        || e.transactors
-                            .get(simple)
-                            .and_then(|t| t.bound_to.as_ref().map(|_| ()))
-                            .is_some();
-                    if bound_decl_to_bus {
-                        if let Some(v) = &l.value {
-                            if let ExprKind::Ident(rhs) = &*v.kind {
-                                if let Some(binding) = e.bus_bindings.get(&rhs.name).cloned() {
-                                    // First binding wins; multi-instance is deferred.
-                                    e.driver_bus_for_hookables
-                                        .entry(simple.to_string())
-                                        .or_insert(binding);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Hookable methods on regular components (agent / env /
-    // sequencer / scoreboard) plus transactors. Transactor hookables
-    // are emitted via the synth ComponentDecl so the existing
-    // emit_component_method path finds the same struct shape.
-    for it in &file.items {
-        match it {
-            Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c) => {
-                for ci in &c.items {
-                    if let ComponentItem::Hookable(h) = ci {
-                        e.emit_component_method(c, h, 1);
-                        emitted_any_method = true;
-                    }
-                    if let ComponentItem::Watchdog(w) = ci {
-                        e.emit_watchdog(c, w, 1);
-                        emitted_any_method = true;
-                    }
-                }
-            }
-            Item::Transactor(t) => {
-                // include_active = true so any hookable inside `when
-                // active` is also emitted. Active-only hookables on a
-                // passive instance still compile but won't be invoked
-                // at runtime (no input event firing).
-                let synth = synth_component_from_transactor(t, /*include_active*/ true);
-                for ci in &synth.items {
-                    if let ComponentItem::Hookable(h) = ci {
-                        e.emit_component_method(&synth, h, 1);
-                        emitted_any_method = true;
-                    }
-                    if let ComponentItem::Watchdog(w) = ci {
-                        e.emit_watchdog(&synth, w, 1);
-                        emitted_any_method = true;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    if emitted_any_method {
-        writeln!(e.out, "").ok();
-    }
-
-    // ── Scheduler — declared before hoisted lets so bound coroutine
-    // drivers (Phase 2b) can register their slots inline at the
-    // hoisted-let site. The run coroutine's slot is added below
-    // alongside its body.
-    writeln!(e.out, "{INDENT}harc_rt::ThreadScheduler sched;").ok();
-
-    // Other lets get hoisted up front. Bound coroutine drivers also
-    // emit their slot + per-driver transaction queue + actor
-    // coroutine here (see the `let drv : Drv = bind axil` arm in
-    // emit_let).
-    for l in &other_lets {
-        e.emit_let(l, 1);
-    }
-
-    // Custom `phase <name> ... end phase <name>` blocks from the test
-    // lifecycle body (spec §7.2). Emitted after hoisted lets so
-    // phase bodies can reference test-level env/agent/scoreboard
-    // instances. Calls of the form `<name>()` from inside `run` lower as
-    // plain C++ function calls; `wait` inside the phase takes the sync
-    // `tick()` path because the lambda body emits with `in_coroutine =
-    // false`.
-    if !custom_phases.is_empty() {
-        for (name, body) in &custom_phases {
-            e.pad(1);
-            writeln!(e.out, "auto {} = [&]() -> void {{", name.name).ok();
-            e.emit_block(body, 2);
-            e.pad(1);
-            writeln!(e.out, "}};").ok();
-        }
-        writeln!(e.out, "").ok();
-    }
-
-    // ── Coroutine wrap for the test body ───────────────────────────────
-    //
-    // The whole test body (bare stmts + scope sim/{setup,run,check,
-    // teardown}) becomes a single C++20 coroutine driven by
-    // `harc_rt::ThreadScheduler`. Setting `in_coroutine = true` flips
-    // the wait/tick lowering inside this scope to emit
-    // `co_await harc_rt::wait_cycles(_slot, N)` instead of the
-    // synchronous `for (...) tick();` form.
-    //
-    // The lambda captures by reference (`[&]`) so it sees `dut`,
-    // `tick`, `cycle_count`, `_checkers`, hookable-method lambdas,
-    // and any hoisted lets defined above in `main`'s scope.
-    //
-    // After the coroutine is constructed, `sched.bootstrap()` resumes
-    // every initially-Ready slot once (the run setup statements,
-    // plus any bound-driver actors' first wait_until on their queue).
-    // The main loop then drives the clock until the run coroutine is
-    // `Done` — driver coroutines may still be parked in WaitUntil
-    // (queue empty) at that point; abandoning them is intentional
-    // since the test is over.
-    writeln!(e.out, "{INDENT}harc_rt::ThreadSlot _run_slot;").ok();
-    writeln!(e.out, "{INDENT}sched.slots.push_back(&_run_slot);").ok();
-    writeln!(
-        e.out,
-        "{INDENT}_run_slot.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
-    )
-    .ok();
-
-    e.in_coroutine = true;
-    for it in &test.items {
-        match it {
-            TestItem::Stmt(s) => e.emit_stmt(s, 2),
-            TestItem::Scope(s) => {
-                if let Some(b) = &s.setup {
-                    e.emit_block(b, 2);
-                }
-                if let Some(b) = &s.run {
-                    e.emit_block(b, 2);
-                }
-                if let Some(b) = &s.check {
-                    e.emit_block(b, 2);
-                }
-                if let Some(b) = &s.teardown {
-                    e.emit_block(b, 2);
-                }
-            }
-            _ => {}
-        }
-    }
-    e.in_coroutine = false;
-
-    writeln!(e.out, "{INDENT}{INDENT}co_return;").ok();
-    writeln!(e.out, "{INDENT}}}(&_run_slot);").ok();
-    writeln!(e.out, "").ok();
-
-    // `actor_threads` is populated only when `--mt` is set (cooperative
-    // mode pushes actor slots into the global `sched` instead). So
-    // `mt` here means "we have per-actor schedulers needing barrier
-    // sync"; cooperative mode skips the worker spawn / barrier dance
-    // entirely even when actors are present.
-    let n_actors = e.actor_threads.len();
-    let mt = n_actors > 0;
-    debug_assert!(mt == (e.mt && !e.actor_threads.is_empty()));
-    let _ = e.mt; // suppress unused warning when no actors
-
-    // ── Bootstrap ──────────────────────────────────────────────────────
-    // Single-threaded — workers haven't started yet. Each scheduler
-    // (main + per-actor) runs its initially-Ready slots once until
-    // they hit their first co_await.
-    writeln!(
-        e.out,
-        "{INDENT}// Resume each coroutine once so initial-setup statements run"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}// before the first clock edge. Single-threaded — workers"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}// haven't been spawned yet.").ok();
-    writeln!(e.out, "{INDENT}sched.bootstrap();").ok();
-    if mt {
-        for (sched_var, _) in &e.actor_threads {
-            writeln!(e.out, "{INDENT}{sched_var}.bootstrap();").ok();
-        }
-    }
-    writeln!(e.out, "").ok();
-
-    if mt {
-        // ── Phase 3a multi-thread topology ──────────────────────────
-        // Each actor coroutine runs on its own `std::thread`. Per
-        // posedge: main runs the run-coroutine, two atomic-spin
-        // barriers synchronize main with N worker threads, each
-        // worker runs `_<n>_sched.tick()` once. Then main does
-        // `dut->eval()` (single-threaded — Verilator-generated DUT
-        // code is not MT-safe) and runs `_checkers`. The dual
-        // barrier mirrors arch-com's Phase 3 design (`Barrier` class
-        // shared in `harc_thread_rt.h`); cycle batching to amortize
-        // barrier cost is Phase 3b.
-        writeln!(
-            e.out,
-            "{INDENT}// Phase 3a: per-actor OS threads with dual barrier sync."
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}// {} actor(s) → {} barrier participants (main + workers).",
-            n_actors,
-            n_actors + 1
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}std::atomic<bool> _shutdown{{false}};").ok();
-        writeln!(
-            e.out,
-            "{INDENT}harc_rt::Barrier _start_barrier({});",
-            n_actors + 1
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}harc_rt::Barrier _end_barrier({});",
-            n_actors + 1
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}std::vector<std::thread> _workers;").ok();
-        for (sched_var, _) in &e.actor_threads {
-            writeln!(e.out, "{INDENT}_workers.emplace_back([&]() {{").ok();
-            writeln!(e.out, "{INDENT}{INDENT}while (true) {{").ok();
-            writeln!(e.out, "{INDENT}{INDENT}{INDENT}_start_barrier.wait();").ok();
+        if log_seed {
             writeln!(
                 e.out,
-                "{INDENT}{INDENT}{INDENT}if (_shutdown.load(std::memory_order_acquire)) break;"
+                "{INDENT}sim_log_line(\"INFO\", \"seed=%llu\", (long long)harc_rng_state);"
             )
             .ok();
-            writeln!(e.out, "{INDENT}{INDENT}{INDENT}{sched_var}.tick();").ok();
-            writeln!(e.out, "{INDENT}{INDENT}{INDENT}_end_barrier.wait();").ok();
-            writeln!(e.out, "{INDENT}{INDENT}}}").ok();
-            writeln!(e.out, "{INDENT}}});").ok();
+            writeln!(e.out, "").ok();
+        }
+
+        // User-defined functions become lambdas. Emitted before the test body so
+        // the body can call them. Capture-all (`[&]`) so they see `dut`/`tick`/
+        // any test-level let bindings.
+        for f in &funcs {
+            e.emit_function(f, 1);
+        }
+        if !funcs.is_empty() {
+            writeln!(e.out, "").ok();
+        }
+        // Tseqs lower to lambdas returning `std::vector<T>`; emitted alongside
+        // functions so the run-block can invoke them and consume the result.
+        for t in &tseqs {
+            e.emit_tseq(t, 1);
+        }
+        if !tseqs.is_empty() {
+            writeln!(e.out, "").ok();
+        }
+        // Hookable methods on driver / agent / env / sequencer / scoreboard
+        // become free `[&]`-capturing lambdas named `<Type>_<method>`. The
+        // method-call site rewrites `obj.method(args)` to
+        // `<Type>_<method>(obj, args)` so the body sees `tick` / `_checkers`
+        // / etc. from the test scope.
+        //
+        // Pre/post hook vectors emit FIRST so the method bodies (and the
+        // test-scope `on obj.method pre/post` registrations) can `[&]`-
+        // capture them. Empty vectors are no-ops; the wrap is unconditional.
+        let mut emitted_any_method = false;
+        for it in &file.items {
+            match it {
+                Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c) => {
+                    for ci in &c.items {
+                        if let ComponentItem::Hookable(h) = ci {
+                            e.emit_hook_vectors(c, h, 1);
+                        }
+                    }
+                }
+                Item::Transactor(t) => {
+                    let synth = synth_component_from_transactor(t, /*include_active*/ true);
+                    for ci in &synth.items {
+                        if let ComponentItem::Hookable(h) = ci {
+                            e.emit_hook_vectors(&synth, h, 1);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Watchdog hook vectors must be emitted in the same forward-decl
+        // pass as the hookable hook vectors — `on <Type>.watchdog pre/post`
+        // captures them. The `emit_watchdog` helper below emits BOTH the
+        // hook vectors AND the synthetic method body in one go, since the
+        // method body refers to those vectors. So we forward-declare the
+        // method via the same pass that emits hookable method lambdas
+        // below; here, no separate forward decl is needed because the
+        // method lambda + its hook vectors are emitted together at that
+        // point.
+        // Pre-scan: register test-scope bus bindings (`let axil :
+        // BusAxiLite = bind dut`) and driver-type → binding mappings
+        // BEFORE hookable methods emit. Hookables on `bound to BusType`
+        // drivers need the binding active so `bus.<ch>.send/recv` and
+        // `bus.<ch>.<sig>` resolve correctly. emit_let later re-registers
+        // the bus bindings (idempotent — same key, same value).
+        for it in &test.items {
+            if let TestItem::Let(l) = it {
+                if l.bind {
+                    if let Some(simple) = type_simple_name(l.ty.as_ref()) {
+                        if let Some(bus_decl) = e.buses.get(simple).cloned() {
+                            if let Some(v) = &l.value {
+                                let mut buf = String::new();
+                                std::mem::swap(&mut e.out, &mut buf);
+                                e.emit_expr(v);
+                                std::mem::swap(&mut e.out, &mut buf);
+                                let prefix = l.name.name.clone();
+                                e.bus_bindings
+                                    .insert(l.name.name.clone(), (bus_decl, buf, prefix.clone()));
+                                // Populate the per-bind signal remap so hookable-
+                                // method emission (which precedes `emit_let`) can
+                                // resolve `bus.<ch>.<sig>` against the override
+                                // table. Without this pre-pass, transactor
+                                // bodies use only the prefix-convention name and
+                                // the override never fires for indirectly-routed
+                                // accesses.
+                                if !l.bind_remap.is_empty() {
+                                    let mut map: std::collections::HashMap<
+                                        (String, String),
+                                        String,
+                                    > = std::collections::HashMap::new();
+                                    for entry in &l.bind_remap {
+                                        if entry.path.len() == 2 {
+                                            map.insert(
+                                                (
+                                                    entry.path[0].name.clone(),
+                                                    entry.path[1].name.clone(),
+                                                ),
+                                                entry.port.clone(),
+                                            );
+                                        }
+                                    }
+                                    e.bus_remap.insert(prefix, map);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for it in &test.items {
+            if let TestItem::Let(l) = it {
+                if l.bind {
+                    if let Some(simple) = type_simple_name(l.ty.as_ref()) {
+                        let bound_decl_to_bus = e
+                            .components
+                            .get(simple)
+                            .and_then(|c| c.bound_to.as_ref().map(|_| ()))
+                            .is_some()
+                            || e.transactors
+                                .get(simple)
+                                .and_then(|t| t.bound_to.as_ref().map(|_| ()))
+                                .is_some();
+                        if bound_decl_to_bus {
+                            if let Some(v) = &l.value {
+                                if let ExprKind::Ident(rhs) = &*v.kind {
+                                    if let Some(binding) = e.bus_bindings.get(&rhs.name).cloned() {
+                                        // First binding wins; multi-instance is deferred.
+                                        e.driver_bus_for_hookables
+                                            .entry(simple.to_string())
+                                            .or_insert(binding);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Hookable methods on regular components (agent / env /
+        // sequencer / scoreboard) plus transactors. Transactor hookables
+        // are emitted via the synth ComponentDecl so the existing
+        // emit_component_method path finds the same struct shape.
+        for it in &file.items {
+            match it {
+                Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c) => {
+                    for ci in &c.items {
+                        if let ComponentItem::Hookable(h) = ci {
+                            e.emit_component_method(c, h, 1);
+                            emitted_any_method = true;
+                        }
+                        if let ComponentItem::Watchdog(w) = ci {
+                            e.emit_watchdog(c, w, 1);
+                            emitted_any_method = true;
+                        }
+                    }
+                }
+                Item::Transactor(t) => {
+                    // include_active = true so any hookable inside `when
+                    // active` is also emitted. Active-only hookables on a
+                    // passive instance still compile but won't be invoked
+                    // at runtime (no input event firing).
+                    let synth = synth_component_from_transactor(t, /*include_active*/ true);
+                    for ci in &synth.items {
+                        if let ComponentItem::Hookable(h) = ci {
+                            e.emit_component_method(&synth, h, 1);
+                            emitted_any_method = true;
+                        }
+                        if let ComponentItem::Watchdog(w) = ci {
+                            e.emit_watchdog(&synth, w, 1);
+                            emitted_any_method = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if emitted_any_method {
+            writeln!(e.out, "").ok();
+        }
+
+        // ── Scheduler — declared before hoisted lets so bound coroutine
+        // drivers (Phase 2b) can register their slots inline at the
+        // hoisted-let site. The run coroutine's slot is added below
+        // alongside its body.
+        writeln!(e.out, "{INDENT}harc_rt::ThreadScheduler sched;").ok();
+
+        // Other lets get hoisted up front. Bound coroutine drivers also
+        // emit their slot + per-driver transaction queue + actor
+        // coroutine here (see the `let drv : Drv = bind axil` arm in
+        // emit_let).
+        for l in &other_lets {
+            e.emit_let(l, 1);
+        }
+
+        // Custom `phase <name> ... end phase <name>` blocks from the test
+        // lifecycle body (spec §7.2). Emitted after hoisted lets so
+        // phase bodies can reference test-level env/agent/scoreboard
+        // instances. Calls of the form `<name>()` from inside `run` lower as
+        // plain C++ function calls; `wait` inside the phase takes the sync
+        // `tick()` path because the lambda body emits with `in_coroutine =
+        // false`.
+        if !custom_phases.is_empty() {
+            for (name, body) in &custom_phases {
+                e.pad(1);
+                writeln!(e.out, "auto {} = [&]() -> void {{", name.name).ok();
+                e.emit_block(body, 2);
+                e.pad(1);
+                writeln!(e.out, "}};").ok();
+            }
+            writeln!(e.out, "").ok();
+        }
+
+        // ── Coroutine wrap for the test body ───────────────────────────────
+        //
+        // The whole test body (bare stmts + scope sim/{setup,run,check,
+        // teardown}) becomes a single C++20 coroutine driven by
+        // `harc_rt::ThreadScheduler`. Setting `in_coroutine = true` flips
+        // the wait/tick lowering inside this scope to emit
+        // `co_await harc_rt::wait_cycles(_slot, N)` instead of the
+        // synchronous `for (...) tick();` form.
+        //
+        // The lambda captures by reference (`[&]`) so it sees `dut`,
+        // `tick`, `cycle_count`, `_checkers`, hookable-method lambdas,
+        // and any hoisted lets defined above in `main`'s scope.
+        //
+        // After the coroutine is constructed, `sched.bootstrap()` resumes
+        // every initially-Ready slot once (the run setup statements,
+        // plus any bound-driver actors' first wait_until on their queue).
+        // The main loop then drives the clock until the run coroutine is
+        // `Done` — driver coroutines may still be parked in WaitUntil
+        // (queue empty) at that point; abandoning them is intentional
+        // since the test is over.
+        writeln!(e.out, "{INDENT}harc_rt::ThreadSlot _run_slot;").ok();
+        writeln!(e.out, "{INDENT}sched.slots.push_back(&_run_slot);").ok();
+        writeln!(
+            e.out,
+            "{INDENT}_run_slot.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+        )
+        .ok();
+
+        e.in_coroutine = true;
+        for it in &test.items {
+            match it {
+                TestItem::Stmt(s) => e.emit_stmt(s, 2),
+                TestItem::Scope(s) => {
+                    if let Some(b) = &s.setup {
+                        e.emit_block(b, 2);
+                    }
+                    if let Some(b) = &s.run {
+                        e.emit_block(b, 2);
+                    }
+                    if let Some(b) = &s.check {
+                        e.emit_block(b, 2);
+                    }
+                    if let Some(b) = &s.teardown {
+                        e.emit_block(b, 2);
+                    }
+                }
+                _ => {}
+            }
+        }
+        e.in_coroutine = false;
+
+        writeln!(e.out, "{INDENT}{INDENT}co_return;").ok();
+        writeln!(e.out, "{INDENT}}}(&_run_slot);").ok();
+        writeln!(e.out, "").ok();
+
+        // `actor_threads` is populated only when `--mt` is set (cooperative
+        // mode pushes actor slots into the global `sched` instead). So
+        // `mt` here means "we have per-actor schedulers needing barrier
+        // sync"; cooperative mode skips the worker spawn / barrier dance
+        // entirely even when actors are present.
+        let n_actors = e.actor_threads.len();
+        let mt = n_actors > 0;
+        debug_assert!(mt == (e.mt && !e.actor_threads.is_empty()));
+        let _ = e.mt; // suppress unused warning when no actors
+
+        // ── Bootstrap ──────────────────────────────────────────────────────
+        // Single-threaded — workers haven't started yet. Each scheduler
+        // (main + per-actor) runs its initially-Ready slots once until
+        // they hit their first co_await.
+        writeln!(
+            e.out,
+            "{INDENT}// Resume each coroutine once so initial-setup statements run"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}// before the first clock edge. Single-threaded — workers"
+        )
+        .ok();
+        writeln!(e.out, "{INDENT}// haven't been spawned yet.").ok();
+        writeln!(e.out, "{INDENT}sched.bootstrap();").ok();
+        if mt {
+            for (sched_var, _) in &e.actor_threads {
+                writeln!(e.out, "{INDENT}{sched_var}.bootstrap();").ok();
+            }
         }
         writeln!(e.out, "").ok();
-    }
 
-    writeln!(
-        e.out,
-        "{INDENT}// Drive the clock until the run coroutine completes."
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}//").ok();
-    writeln!(
-        e.out,
-        "{INDENT}// `wait N cycles` matches Verilog's `@(posedge clk)` semantic:"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}// values set in the segment BEFORE the wait are sampled at the"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}// next posedge. Per loop iteration:").ok();
-    writeln!(
-        e.out,
-        "{INDENT}//   1. Posedge (clk 0→1, eval) — DUT FFs latch the current input"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}//      values (set in the previous segment, or in bootstrap on"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}//      the first iteration).").ok();
-    writeln!(
-        e.out,
-        "{INDENT}//   2. `sched.tick()` — advance the run coroutine to its next"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}//      wait, setting the inputs for the NEXT cycle's posedge."
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}//   3. Falling edge (clk 1→0, eval) — comb re-settles with the"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}//      newly-set inputs.").ok();
-    writeln!(e.out, "{INDENT}//   4. Cycle counter + checkers.").ok();
-    writeln!(
-        e.out,
-        "{INDENT}// One initial `eval(clk=0)` before the loop settles combinational"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}// logic with the bootstrap inputs — same role as `initial`-block"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}// settle in Verilog. Each `wait 1 cycle` then maps to exactly"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}// one posedge that observes the just-set values."
-    )
-    .ok();
-    if mt {
+        if mt {
+            // ── Phase 3a multi-thread topology ──────────────────────────
+            // Each actor coroutine runs on its own `std::thread`. Per
+            // posedge: main runs the run-coroutine, two atomic-spin
+            // barriers synchronize main with N worker threads, each
+            // worker runs `_<n>_sched.tick()` once. Then main does
+            // `dut->eval()` (single-threaded — Verilator-generated DUT
+            // code is not MT-safe) and runs `_checkers`. The dual
+            // barrier mirrors arch-com's Phase 3 design (`Barrier` class
+            // shared in `harc_thread_rt.h`); cycle batching to amortize
+            // barrier cost is Phase 3b.
+            writeln!(
+                e.out,
+                "{INDENT}// Phase 3a: per-actor OS threads with dual barrier sync."
+            )
+            .ok();
+            writeln!(
+                e.out,
+                "{INDENT}// {} actor(s) → {} barrier participants (main + workers).",
+                n_actors,
+                n_actors + 1
+            )
+            .ok();
+            writeln!(e.out, "{INDENT}std::atomic<bool> _shutdown{{false}};").ok();
+            writeln!(
+                e.out,
+                "{INDENT}harc_rt::Barrier _start_barrier({});",
+                n_actors + 1
+            )
+            .ok();
+            writeln!(
+                e.out,
+                "{INDENT}harc_rt::Barrier _end_barrier({});",
+                n_actors + 1
+            )
+            .ok();
+            writeln!(e.out, "{INDENT}std::vector<std::thread> _workers;").ok();
+            for (sched_var, _) in &e.actor_threads {
+                writeln!(e.out, "{INDENT}_workers.emplace_back([&]() {{").ok();
+                writeln!(e.out, "{INDENT}{INDENT}while (true) {{").ok();
+                writeln!(e.out, "{INDENT}{INDENT}{INDENT}_start_barrier.wait();").ok();
+                writeln!(
+                    e.out,
+                    "{INDENT}{INDENT}{INDENT}if (_shutdown.load(std::memory_order_acquire)) break;"
+                )
+                .ok();
+                writeln!(e.out, "{INDENT}{INDENT}{INDENT}{sched_var}.tick();").ok();
+                writeln!(e.out, "{INDENT}{INDENT}{INDENT}_end_barrier.wait();").ok();
+                writeln!(e.out, "{INDENT}{INDENT}}}").ok();
+                writeln!(e.out, "{INDENT}}});").ok();
+            }
+            writeln!(e.out, "").ok();
+        }
+
+        writeln!(
+            e.out,
+            "{INDENT}// Drive the clock until the run coroutine completes."
+        )
+        .ok();
         writeln!(e.out, "{INDENT}//").ok();
         writeln!(
             e.out,
-            "{INDENT}// MT mode: workers run between tick() and the falling edge,"
+            "{INDENT}// `wait N cycles` matches Verilog's `@(posedge clk)` semantic:"
         )
         .ok();
         writeln!(
             e.out,
-            "{INDENT}// gated by _start_barrier / _end_barrier. Run-coroutine writes"
+            "{INDENT}// values set in the segment BEFORE the wait are sampled at the"
+        )
+        .ok();
+        writeln!(e.out, "{INDENT}// next posedge. Per loop iteration:").ok();
+        writeln!(
+            e.out,
+            "{INDENT}//   1. Posedge (clk 0→1, eval) — DUT FFs latch the current input"
         )
         .ok();
         writeln!(
             e.out,
-            "{INDENT}// complete BEFORE workers wake → no race on shared queues."
+            "{INDENT}//      values (set in the previous segment, or in bootstrap on"
+        )
+        .ok();
+        writeln!(e.out, "{INDENT}//      the first iteration).").ok();
+        writeln!(
+            e.out,
+            "{INDENT}//   2. `sched.tick()` — advance the run coroutine to its next"
         )
         .ok();
         writeln!(
             e.out,
-            "{INDENT}// Workers' DUT-input writes complete BEFORE the falling-edge"
+            "{INDENT}//      wait, setting the inputs for the NEXT cycle's posedge."
         )
         .ok();
-        writeln!(e.out, "{INDENT}// eval → no race on signal state.").ok();
-    }
-    if clocks.is_empty() {
-        // Initial comb settle — bootstrap's inputs propagate through
-        // combinational logic before the first posedge.
-        writeln!(e.out, "{INDENT}dut->clk = 0; dut->eval();").ok();
         writeln!(
             e.out,
-            "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {{"
+            "{INDENT}//   3. Falling edge (clk 1→0, eval) — comb re-settles with the"
         )
         .ok();
-        // Posedge first — latches current input values.
-        writeln!(e.out, "{INDENT}{INDENT}dut->clk = 1; dut->eval();").ok();
-        // Then advance the run coroutine for the next cycle's inputs.
-        writeln!(e.out, "{INDENT}{INDENT}sched.tick();").ok();
+        writeln!(e.out, "{INDENT}//      newly-set inputs.").ok();
+        writeln!(e.out, "{INDENT}//   4. Cycle counter + checkers.").ok();
+        writeln!(
+            e.out,
+            "{INDENT}// One initial `eval(clk=0)` before the loop settles combinational"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}// logic with the bootstrap inputs — same role as `initial`-block"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}// settle in Verilog. Each `wait 1 cycle` then maps to exactly"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}// one posedge that observes the just-set values."
+        )
+        .ok();
         if mt {
-            writeln!(e.out, "{INDENT}{INDENT}_start_barrier.wait();").ok();
-            writeln!(e.out, "{INDENT}{INDENT}_end_barrier.wait();").ok();
+            writeln!(e.out, "{INDENT}//").ok();
+            writeln!(
+                e.out,
+                "{INDENT}// MT mode: workers run between tick() and the falling edge,"
+            )
+            .ok();
+            writeln!(
+                e.out,
+                "{INDENT}// gated by _start_barrier / _end_barrier. Run-coroutine writes"
+            )
+            .ok();
+            writeln!(
+                e.out,
+                "{INDENT}// complete BEFORE workers wake → no race on shared queues."
+            )
+            .ok();
+            writeln!(
+                e.out,
+                "{INDENT}// Workers' DUT-input writes complete BEFORE the falling-edge"
+            )
+            .ok();
+            writeln!(e.out, "{INDENT}// eval → no race on signal state.").ok();
         }
-        // Falling edge + comb resettle with the new inputs.
-        writeln!(e.out, "{INDENT}{INDENT}dut->clk = 0; dut->eval();").ok();
-        writeln!(e.out, "{INDENT}{INDENT}cycle_count++;").ok();
-        writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
-        writeln!(e.out, "{INDENT}}}").ok();
-    } else {
-        // Multi-clock: initial bare eval() to settle combinational
-        // logic with bootstrap inputs (no clock advancement). The
-        // loop's eval_clocks_until then advances time by one full
-        // primary-clock period per iteration. Posedge-vs-tick ordering
-        // is constrained by eval_clocks_until's atomic per-edge eval
-        // — we tick AFTER eval_clocks_until so the run coroutine
-        // observes the just-completed cycle's outputs and sets the
-        // next cycle's inputs in time for the following iteration's
-        // first edge. Same effect as the single-clock branch, just
-        // with the clock toggling factored into eval_clocks_until.
-        writeln!(e.out, "{INDENT}dut->eval();").ok();
-        writeln!(
-            e.out,
-            "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {{"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}long long _target = now_ps + clocks_[0].half_period_ps * 2;"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}{INDENT}eval_clocks_until(_target);").ok();
-        writeln!(e.out, "{INDENT}{INDENT}sched.tick();").ok();
-        if mt {
-            writeln!(e.out, "{INDENT}{INDENT}_start_barrier.wait();").ok();
-            writeln!(e.out, "{INDENT}{INDENT}_end_barrier.wait();").ok();
+        if clocks.is_empty() {
+            // Initial comb settle — bootstrap's inputs propagate through
+            // combinational logic before the first posedge.
+            writeln!(e.out, "{INDENT}dut->clk = 0; dut->eval();").ok();
+            writeln!(
+                e.out,
+                "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {{"
+            )
+            .ok();
+            // Posedge first — latches current input values.
+            writeln!(e.out, "{INDENT}{INDENT}dut->clk = 1; dut->eval();").ok();
+            // Then advance the run coroutine for the next cycle's inputs.
+            writeln!(e.out, "{INDENT}{INDENT}sched.tick();").ok();
+            if mt {
+                writeln!(e.out, "{INDENT}{INDENT}_start_barrier.wait();").ok();
+                writeln!(e.out, "{INDENT}{INDENT}_end_barrier.wait();").ok();
+            }
+            // Falling edge + comb resettle with the new inputs.
+            writeln!(e.out, "{INDENT}{INDENT}dut->clk = 0; dut->eval();").ok();
+            writeln!(e.out, "{INDENT}{INDENT}cycle_count++;").ok();
+            writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
+            writeln!(e.out, "{INDENT}}}").ok();
+        } else {
+            // Multi-clock: initial bare eval() to settle combinational
+            // logic with bootstrap inputs (no clock advancement). The
+            // loop's eval_clocks_until then advances time by one full
+            // primary-clock period per iteration. Posedge-vs-tick ordering
+            // is constrained by eval_clocks_until's atomic per-edge eval
+            // — we tick AFTER eval_clocks_until so the run coroutine
+            // observes the just-completed cycle's outputs and sets the
+            // next cycle's inputs in time for the following iteration's
+            // first edge. Same effect as the single-clock branch, just
+            // with the clock toggling factored into eval_clocks_until.
+            writeln!(e.out, "{INDENT}dut->eval();").ok();
+            writeln!(
+                e.out,
+                "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {{"
+            )
+            .ok();
+            writeln!(
+                e.out,
+                "{INDENT}{INDENT}long long _target = now_ps + clocks_[0].half_period_ps * 2;"
+            )
+            .ok();
+            writeln!(e.out, "{INDENT}{INDENT}eval_clocks_until(_target);").ok();
+            writeln!(e.out, "{INDENT}{INDENT}sched.tick();").ok();
+            if mt {
+                writeln!(e.out, "{INDENT}{INDENT}_start_barrier.wait();").ok();
+                writeln!(e.out, "{INDENT}{INDENT}_end_barrier.wait();").ok();
+            }
+            writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
+            writeln!(e.out, "{INDENT}}}").ok();
         }
-        writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
-        writeln!(e.out, "{INDENT}}}").ok();
-    }
 
-    if mt {
-        // Shutdown sequence: workers are blocked on _start_barrier
-        // (their next iteration). Set _shutdown, wake them via the
-        // start barrier; they observe the flag and break out of their
-        // loop without reaching _end_barrier. Then join.
+        if mt {
+            // Shutdown sequence: workers are blocked on _start_barrier
+            // (their next iteration). Set _shutdown, wake them via the
+            // start barrier; they observe the flag and break out of their
+            // loop without reaching _end_barrier. Then join.
+            writeln!(e.out, "").ok();
+            writeln!(
+                e.out,
+                "{INDENT}_shutdown.store(true, std::memory_order_release);"
+            )
+            .ok();
+            writeln!(e.out, "{INDENT}_start_barrier.wait();").ok();
+            writeln!(e.out, "{INDENT}for (auto& _w : _workers) _w.join();").ok();
+        }
+        writeln!(e.out, "").ok();
+
+        // Final + return.
+        writeln!(e.out, "").ok();
+        // Property-cover summary (ARCH-style: header line + per-point lines
+        // with `*NOT HIT*` marker; stdout destination — see covergroup
+        // report() for the rationale on stdout vs stderr).
+        if !e.covers.is_empty() {
+            let n_covers = e.covers.len();
+            writeln!(e.out, "{INDENT}{{").ok();
+            writeln!(e.out, "{INDENT}{INDENT}uint64_t _cov_total = {n_covers};").ok();
+            writeln!(e.out, "{INDENT}{INDENT}uint64_t _cov_hit = 0;").ok();
+            let covers_clone = e.covers.clone();
+            for c in &covers_clone {
+                writeln!(
+                    e.out,
+                    "{INDENT}{INDENT}if (_cov_{tag}_hits > 0) _cov_hit++;",
+                    tag = c.tag
+                )
+                .ok();
+            }
+            writeln!(e.out, "{INDENT}{INDENT}std::printf(\"[cover] %llu/%llu hit (%.1f%%)\\n\", (unsigned long long)_cov_hit, (unsigned long long)_cov_total, _cov_total ? (100.0 * _cov_hit / _cov_total) : 0.0);").ok();
+            for c in &covers_clone {
+                writeln!(e.out,
+                "{INDENT}{INDENT}std::printf(\"  [{label}]: %llu hits%s\\n\", (unsigned long long)_cov_{tag}_hits, _cov_{tag}_hits ? \"\" : \" *NOT HIT*\");",
+                tag = c.tag, label = escape_c(&c.label)).ok();
+            }
+            writeln!(e.out, "{INDENT}}}").ok();
+        }
+        writeln!(e.out, "{INDENT}dut->final();").ok();
+        // Verilator coverage write — only does anything when the TB was
+        // built with `harc sim --coverage` (which sets `--coverage` on
+        // verilator → defines `VM_COVERAGE=1`). The .dat file lands in
+        // $HARC_LOG_DIR (set by `harc sim`) so the CVDP-style scorer can
+        // post-process it with `verilator_coverage`. Always-emitted-but-
+        // ifdef'd so a coverage-built TB is the only difference.
+        writeln!(e.out, "#if VM_COVERAGE").ok();
+        writeln!(e.out, "{INDENT}{{").ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}const char* _cov_dir = std::getenv(\"HARC_LOG_DIR\");"
+        )
+        .ok();
+        writeln!(e.out, "{INDENT}{INDENT}std::string _cov_path = _cov_dir ? std::string(_cov_dir) + \"/coverage.dat\" : std::string(\"coverage.dat\");").ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}Verilated::threadContextp()->coveragep()->write(_cov_path.c_str());"
+        )
+        .ok();
+        writeln!(e.out, "{INDENT}}}").ok();
+        writeln!(e.out, "#endif").ok();
+        writeln!(e.out, "{INDENT}delete dut;").ok();
+        writeln!(e.out, "{INDENT}if (sim_log) std::fclose(sim_log);").ok();
+        writeln!(
+            e.out,
+            "{INDENT}for (auto& kv : log_files) {{ if (kv.second) std::fclose(kv.second); }}"
+        )
+        .ok();
+        writeln!(e.out, "{INDENT}trace.raw(\"sim_end\", cycle_count, \"\\\"errors\\\":\" + std::to_string(errors));").ok();
+        writeln!(e.out, "{INDENT}trace.close();").ok();
         writeln!(e.out, "").ok();
         writeln!(
             e.out,
-            "{INDENT}_shutdown.store(true, std::memory_order_release);"
+            "{INDENT}if (errors == 0) {{ std::printf(\"\\nALL TESTS PASSED\\n\"); return 0; }}"
         )
         .ok();
-        writeln!(e.out, "{INDENT}_start_barrier.wait();").ok();
-        writeln!(e.out, "{INDENT}for (auto& _w : _workers) _w.join();").ok();
-    }
-    writeln!(e.out, "").ok();
-
-    // Final + return.
-    writeln!(e.out, "").ok();
-    // Property-cover summary (ARCH-style: header line + per-point lines
-    // with `*NOT HIT*` marker; stdout destination — see covergroup
-    // report() for the rationale on stdout vs stderr).
-    if !e.covers.is_empty() {
-        let n_covers = e.covers.len();
-        writeln!(e.out, "{INDENT}{{").ok();
-        writeln!(e.out, "{INDENT}{INDENT}uint64_t _cov_total = {n_covers};").ok();
-        writeln!(e.out, "{INDENT}{INDENT}uint64_t _cov_hit = 0;").ok();
-        let covers_clone = e.covers.clone();
-        for c in &covers_clone {
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}if (_cov_{tag}_hits > 0) _cov_hit++;",
-                tag = c.tag
-            )
-            .ok();
-        }
-        writeln!(e.out, "{INDENT}{INDENT}std::printf(\"[cover] %llu/%llu hit (%.1f%%)\\n\", (unsigned long long)_cov_hit, (unsigned long long)_cov_total, _cov_total ? (100.0 * _cov_hit / _cov_total) : 0.0);").ok();
-        for c in &covers_clone {
-            writeln!(e.out,
-                "{INDENT}{INDENT}std::printf(\"  [{label}]: %llu hits%s\\n\", (unsigned long long)_cov_{tag}_hits, _cov_{tag}_hits ? \"\" : \" *NOT HIT*\");",
-                tag = c.tag, label = escape_c(&c.label)).ok();
-        }
-        writeln!(e.out, "{INDENT}}}").ok();
-    }
-    writeln!(e.out, "{INDENT}dut->final();").ok();
-    // Verilator coverage write — only does anything when the TB was
-    // built with `harc sim --coverage` (which sets `--coverage` on
-    // verilator → defines `VM_COVERAGE=1`). The .dat file lands in
-    // $HARC_LOG_DIR (set by `harc sim`) so the CVDP-style scorer can
-    // post-process it with `verilator_coverage`. Always-emitted-but-
-    // ifdef'd so a coverage-built TB is the only difference.
-    writeln!(e.out, "#if VM_COVERAGE").ok();
-    writeln!(e.out, "{INDENT}{{").ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}const char* _cov_dir = std::getenv(\"HARC_LOG_DIR\");"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}{INDENT}std::string _cov_path = _cov_dir ? std::string(_cov_dir) + \"/coverage.dat\" : std::string(\"coverage.dat\");").ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}Verilated::threadContextp()->coveragep()->write(_cov_path.c_str());"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}}}").ok();
-    writeln!(e.out, "#endif").ok();
-    writeln!(e.out, "{INDENT}delete dut;").ok();
-    writeln!(e.out, "{INDENT}if (sim_log) std::fclose(sim_log);").ok();
-    writeln!(
-        e.out,
-        "{INDENT}for (auto& kv : log_files) {{ if (kv.second) std::fclose(kv.second); }}"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}trace.raw(\"sim_end\", cycle_count, \"\\\"errors\\\":\" + std::to_string(errors));").ok();
-    writeln!(e.out, "{INDENT}trace.close();").ok();
-    writeln!(e.out, "").ok();
-    writeln!(
-        e.out,
-        "{INDENT}if (errors == 0) {{ std::printf(\"\\nALL TESTS PASSED\\n\"); return 0; }}"
-    )
-    .ok();
-    writeln!(
+        writeln!(
         e.out,
         "{INDENT}else             {{ std::printf(\"\\n%d TESTS FAILED\\n\", errors); return 1; }}"
     )
-    .ok();
-    writeln!(e.out, "}}").ok();
-    writeln!(e.out, "").ok();
+        .ok();
+        writeln!(e.out, "}}").ok();
+        writeln!(e.out, "").ok();
     } // end of `for test in &tests`
 
     // Dispatcher `main()` (Phase 1b). One branch per test: the
@@ -1967,7 +2030,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // When unset, dispatches to the alphabetically-first test
     // (deterministic — matches the sort key in merge_for_sim).
     writeln!(e.out, "int main(int argc, char** argv) {{").ok();
-    writeln!(e.out, "{INDENT}const char* test_sel = std::getenv(\"HARC_TEST\");").ok();
+    writeln!(
+        e.out,
+        "{INDENT}const char* test_sel = std::getenv(\"HARC_TEST\");"
+    )
+    .ok();
     writeln!(e.out, "{INDENT}for (int i = 1; i + 1 < argc; i++) {{").ok();
     writeln!(e.out, "{INDENT}{INDENT}if (std::strcmp(argv[i], \"--test\") == 0) {{ test_sel = argv[i + 1]; break; }}").ok();
     writeln!(e.out, "{INDENT}}}").ok();
@@ -3947,9 +4014,8 @@ impl Emitter {
         let width_expr = match args.first() {
             Some(CallArg::Expr(e)) => e,
             _ => {
-                self.errors.push(format!(
-                    "`.{kind}<N>()` requires a constant width argument",
-                ));
+                self.errors
+                    .push(format!("`.{kind}<N>()` requires a constant width argument",));
                 return true;
             }
         };
@@ -4849,9 +4915,9 @@ impl Emitter {
         let Some(when_active) = &t.when_active else {
             return false;
         };
-        when_active.iter().any(|it| {
-            matches!(it, ComponentItem::Hookable(h) if h.name.name == method_name)
-        })
+        when_active
+            .iter()
+            .any(|it| matches!(it, ComponentItem::Hookable(h) if h.name.name == method_name))
     }
 
     /// Emit a single `hookable` method on a component as a free
@@ -7054,10 +7120,7 @@ impl Emitter {
         // in `emit_with_opts` — typed lets only; bare `let x = expr`
         // falls back to RHS inference.
         if let Some(TypeExpr::Builtin { name, args, .. }) = l.ty.as_ref() {
-            if matches!(
-                name,
-                BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits
-            ) {
+            if matches!(name, BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits) {
                 if let Some(w) = type_arg_width(args) {
                     self.let_widths.insert(l.name.name.clone(), w as u32);
                 }
@@ -9351,7 +9414,9 @@ fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
     let mut out = file.clone();
     for it in out.items.iter_mut() {
         let Item::Test(t) = it else { continue };
-        let Some(tb_ident) = t.for_testbench.clone() else { continue };
+        let Some(tb_ident) = t.for_testbench.clone() else {
+            continue;
+        };
         let Some(tb) = components.get(&tb_ident.name) else {
             // Bound testbench not found — leave as is; the main
             // pipeline will surface a sensible error when nothing
@@ -9361,19 +9426,14 @@ fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
 
         // Classify testbench fields.
         let mut dut_field: Option<(String, TypeExpr)> = None;
-        let mut field_names: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut field_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut field_is_pointer: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         for ci in &tb.items {
             if let ComponentItem::Field(f) = ci {
                 field_names.insert(f.name.name.clone());
                 if let TypeExpr::Named { name, .. } = &f.ty {
-                    let simple = name
-                        .segments
-                        .last()
-                        .map(|s| s.name.as_str())
-                        .unwrap_or("");
+                    let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
                     let is_harc = components.contains_key(simple)
                         || transactors.contains_key(simple)
                         || scoreboards.contains(simple)
@@ -9395,8 +9455,7 @@ fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
         }
 
         // Method names — both `hookable` and `function` items.
-        let mut method_names: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut method_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         for ci in &tb.items {
             if let ComponentItem::Hookable(h) = ci {
                 method_names.insert(h.name.name.clone());
@@ -9408,8 +9467,7 @@ fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
         // scope. `dut` always shadows (we synthesize `let dut : ...`
         // for it). Any user-declared `let X` at test scope also
         // shadows — capture them up-front.
-        let mut shadow: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut shadow: std::collections::HashSet<String> = std::collections::HashSet::new();
         shadow.insert("dut".into());
         shadow.insert("_tb".into());
         for ti in &t.items {
@@ -9421,23 +9479,59 @@ fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
         // Rewrite every Stmt / Expr in the test body.
         for ti in t.items.iter_mut() {
             match ti {
-                TestItem::Stmt(s) => rewrite_stmt_for_impl(s, &field_names, &method_names, &field_is_pointer, &shadow),
+                TestItem::Stmt(s) => rewrite_stmt_for_impl(
+                    s,
+                    &field_names,
+                    &method_names,
+                    &field_is_pointer,
+                    &shadow,
+                ),
                 TestItem::Scope(sc) => {
                     if let Some(b) = sc.run.as_mut() {
-                        rewrite_block_for_impl(b, &field_names, &method_names, &field_is_pointer, &shadow);
+                        rewrite_block_for_impl(
+                            b,
+                            &field_names,
+                            &method_names,
+                            &field_is_pointer,
+                            &shadow,
+                        );
                     }
                     if let Some(b) = sc.setup.as_mut() {
-                        rewrite_block_for_impl(b, &field_names, &method_names, &field_is_pointer, &shadow);
+                        rewrite_block_for_impl(
+                            b,
+                            &field_names,
+                            &method_names,
+                            &field_is_pointer,
+                            &shadow,
+                        );
                     }
                     if let Some(b) = sc.check.as_mut() {
-                        rewrite_block_for_impl(b, &field_names, &method_names, &field_is_pointer, &shadow);
+                        rewrite_block_for_impl(
+                            b,
+                            &field_names,
+                            &method_names,
+                            &field_is_pointer,
+                            &shadow,
+                        );
                     }
                     if let Some(b) = sc.teardown.as_mut() {
-                        rewrite_block_for_impl(b, &field_names, &method_names, &field_is_pointer, &shadow);
+                        rewrite_block_for_impl(
+                            b,
+                            &field_names,
+                            &method_names,
+                            &field_is_pointer,
+                            &shadow,
+                        );
                     }
                 }
                 TestItem::Phase(_, b) => {
-                    rewrite_block_for_impl(b, &field_names, &method_names, &field_is_pointer, &shadow);
+                    rewrite_block_for_impl(
+                        b,
+                        &field_names,
+                        &method_names,
+                        &field_is_pointer,
+                        &shadow,
+                    );
                 }
                 _ => {}
             }
@@ -9453,7 +9547,10 @@ fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
         if let Some((_dut_name, dut_ty)) = &dut_field {
             // Synthesize: `let dut : <SVType>`
             prefix.push(TestItem::Let(LetStmt {
-                name: Ident { name: "dut".into(), span: tb_ident.span },
+                name: Ident {
+                    name: "dut".into(),
+                    span: tb_ident.span,
+                },
                 ty: Some(dut_ty.clone()),
                 value: None,
                 bind: false,
@@ -9465,9 +9562,15 @@ fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
         // Synthesize: `let _tb : <TbType>` — default-constructed
         // through the existing component-let path.
         prefix.push(TestItem::Let(LetStmt {
-            name: Ident { name: "_tb".into(), span: tb_ident.span },
+            name: Ident {
+                name: "_tb".into(),
+                span: tb_ident.span,
+            },
             ty: Some(TypeExpr::Named {
-                name: Path { segments: vec![tb_ident.clone()], span: tb_ident.span },
+                name: Path {
+                    segments: vec![tb_ident.clone()],
+                    span: tb_ident.span,
+                },
                 generics: Vec::new(),
                 mode: None,
                 span: tb_ident.span,
@@ -9493,7 +9596,10 @@ fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
                         let mut new_stmts = Vec::with_capacity(run.stmts.len() + 1);
                         new_stmts.push(make_wire_dut_stmt(tb_ident.span));
                         new_stmts.extend(run.stmts.iter().cloned());
-                        sc.run = Some(Block { stmts: new_stmts, span: run.span });
+                        sc.run = Some(Block {
+                            stmts: new_stmts,
+                            span: run.span,
+                        });
                         t.items.push(TestItem::Scope(sc));
                         continue;
                     }
@@ -9515,18 +9621,27 @@ fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
 /// `emit_stmt` unchanged.
 fn make_wire_dut_stmt(span: Span) -> Stmt {
     let _tb = Expr {
-        kind: Box::new(ExprKind::Ident(Ident { name: "_tb".into(), span })),
+        kind: Box::new(ExprKind::Ident(Ident {
+            name: "_tb".into(),
+            span,
+        })),
         span,
     };
     let _tb_dut = Expr {
         kind: Box::new(ExprKind::Field {
             target: _tb,
-            name: Ident { name: "dut".into(), span },
+            name: Ident {
+                name: "dut".into(),
+                span,
+            },
         }),
         span,
     };
     let dut = Expr {
-        kind: Box::new(ExprKind::Ident(Ident { name: "dut".into(), span })),
+        kind: Box::new(ExprKind::Ident(Ident {
+            name: "dut".into(),
+            span,
+        })),
         span,
     };
     Stmt {
@@ -9622,7 +9737,11 @@ fn rewrite_stmt_for_impl(
         StmtKind::Wait { duration, .. } => {
             rewrite_expr_for_impl(duration, fields, methods, pointers, shadow);
         }
-        StmtKind::WaitUntil { conditions, timeout, .. } => {
+        StmtKind::WaitUntil {
+            conditions,
+            timeout,
+            ..
+        } => {
             for c in conditions.iter_mut() {
                 rewrite_expr_for_impl(c, fields, methods, pointers, shadow);
             }
@@ -9649,7 +9768,9 @@ fn rewrite_stmt_for_impl(
                 rewrite_expr_for_impl(else_fail, fields, methods, pointers, shadow);
             }
         }
-        StmtKind::Randomize { target, with_body, .. } => {
+        StmtKind::Randomize {
+            target, with_body, ..
+        } => {
             rewrite_expr_for_impl(target, fields, methods, pointers, shadow);
             for e in with_body.iter_mut() {
                 rewrite_expr_for_impl(e, fields, methods, pointers, shadow);
@@ -9673,7 +9794,13 @@ fn rewrite_stmt_for_impl(
             // through the testbench struct.
             if let Some(head) = name.segments.first() {
                 if fields.contains(&head.name) && !shadow.contains(&head.name) {
-                    name.segments.insert(0, Ident { name: "_tb".into(), span: head.span });
+                    name.segments.insert(
+                        0,
+                        Ident {
+                            name: "_tb".into(),
+                            span: head.span,
+                        },
+                    );
                 }
             }
             for a in args.iter_mut() {
@@ -9707,10 +9834,16 @@ fn rewrite_expr_for_impl(
                 let new_id = id.clone();
                 let span = e.span;
                 let inner = Expr {
-                    kind: Box::new(ExprKind::Ident(Ident { name: "_tb".into(), span })),
+                    kind: Box::new(ExprKind::Ident(Ident {
+                        name: "_tb".into(),
+                        span,
+                    })),
                     span,
                 };
-                *e.kind = ExprKind::Field { target: inner, name: new_id };
+                *e.kind = ExprKind::Field {
+                    target: inner,
+                    name: new_id,
+                };
             }
         }
         ExprKind::Call { callee, args } => {
@@ -9723,17 +9856,25 @@ fn rewrite_expr_for_impl(
                     let new_id = id.clone();
                     let span = callee.span;
                     let inner = Expr {
-                        kind: Box::new(ExprKind::Ident(Ident { name: "_tb".into(), span })),
+                        kind: Box::new(ExprKind::Ident(Ident {
+                            name: "_tb".into(),
+                            span,
+                        })),
                         span,
                     };
-                    *callee.kind = ExprKind::Field { target: inner, name: new_id };
+                    *callee.kind = ExprKind::Field {
+                        target: inner,
+                        name: new_id,
+                    };
                 }
             } else {
                 rewrite_expr_for_impl(callee, fields, methods, _pointers, shadow);
             }
             for a in args.iter_mut() {
                 match a {
-                    CallArg::Expr(x) => rewrite_expr_for_impl(x, fields, methods, _pointers, shadow),
+                    CallArg::Expr(x) => {
+                        rewrite_expr_for_impl(x, fields, methods, _pointers, shadow)
+                    }
                     CallArg::Named { value, .. } => {
                         rewrite_expr_for_impl(value, fields, methods, _pointers, shadow);
                     }
@@ -9752,36 +9893,60 @@ fn rewrite_expr_for_impl(
             rewrite_expr_for_impl(hi, fields, methods, _pointers, shadow);
             rewrite_expr_for_impl(lo, fields, methods, _pointers, shadow);
         }
-        ExprKind::Cast { expr, .. } => rewrite_expr_for_impl(expr, fields, methods, _pointers, shadow),
+        ExprKind::Cast { expr, .. } => {
+            rewrite_expr_for_impl(expr, fields, methods, _pointers, shadow)
+        }
         ExprKind::Send { target, value } => {
             rewrite_expr_for_impl(target, fields, methods, _pointers, shadow);
             rewrite_expr_for_impl(value, fields, methods, _pointers, shadow);
         }
-        ExprKind::Unary { expr, .. } => rewrite_expr_for_impl(expr, fields, methods, _pointers, shadow),
+        ExprKind::Unary { expr, .. } => {
+            rewrite_expr_for_impl(expr, fields, methods, _pointers, shadow)
+        }
         ExprKind::Binary { lhs, rhs, .. } => {
             rewrite_expr_for_impl(lhs, fields, methods, _pointers, shadow);
             rewrite_expr_for_impl(rhs, fields, methods, _pointers, shadow);
         }
-        ExprKind::Ternary { cond, then_branch, else_branch } => {
+        ExprKind::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
             rewrite_expr_for_impl(cond, fields, methods, _pointers, shadow);
             rewrite_expr_for_impl(then_branch, fields, methods, _pointers, shadow);
             rewrite_expr_for_impl(else_branch, fields, methods, _pointers, shadow);
         }
-        ExprKind::HashHash { expr, .. } => rewrite_expr_for_impl(expr, fields, methods, _pointers, shadow),
-        ExprKind::SeqRepeat { expr, .. } => rewrite_expr_for_impl(expr, fields, methods, _pointers, shadow),
+        ExprKind::HashHash { expr, .. } => {
+            rewrite_expr_for_impl(expr, fields, methods, _pointers, shadow)
+        }
+        ExprKind::SeqRepeat { expr, .. } => {
+            rewrite_expr_for_impl(expr, fields, methods, _pointers, shadow)
+        }
         ExprKind::RangeLit { lo, hi } => {
-            if let Some(lo) = lo.as_mut() { rewrite_expr_for_impl(lo, fields, methods, _pointers, shadow); }
-            if let Some(hi) = hi.as_mut() { rewrite_expr_for_impl(hi, fields, methods, _pointers, shadow); }
+            if let Some(lo) = lo.as_mut() {
+                rewrite_expr_for_impl(lo, fields, methods, _pointers, shadow);
+            }
+            if let Some(hi) = hi.as_mut() {
+                rewrite_expr_for_impl(hi, fields, methods, _pointers, shadow);
+            }
         }
         ExprKind::SetLit(es) => {
-            for x in es.iter_mut() { rewrite_expr_for_impl(x, fields, methods, _pointers, shadow); }
+            for x in es.iter_mut() {
+                rewrite_expr_for_impl(x, fields, methods, _pointers, shadow);
+            }
         }
         ExprKind::SystemCall { args, .. } => {
-            for x in args.iter_mut() { rewrite_expr_for_impl(x, fields, methods, _pointers, shadow); }
+            for x in args.iter_mut() {
+                rewrite_expr_for_impl(x, fields, methods, _pointers, shadow);
+            }
         }
-        ExprKind::Randomize { target, with_body, .. } => {
+        ExprKind::Randomize {
+            target, with_body, ..
+        } => {
             rewrite_expr_for_impl(target, fields, methods, _pointers, shadow);
-            for x in with_body.iter_mut() { rewrite_expr_for_impl(x, fields, methods, _pointers, shadow); }
+            for x in with_body.iter_mut() {
+                rewrite_expr_for_impl(x, fields, methods, _pointers, shadow);
+            }
         }
         ExprKind::DistDirective { target, .. } => {
             rewrite_expr_for_impl(target, fields, methods, _pointers, shadow);
@@ -9800,7 +9965,9 @@ fn rewrite_expr_for_impl(
             rewrite_expr_for_impl(rhs, fields, methods, _pointers, shadow);
         }
         ExprKind::Solve { args, .. } => {
-            for x in args.iter_mut() { rewrite_expr_for_impl(x, fields, methods, _pointers, shadow); }
+            for x in args.iter_mut() {
+                rewrite_expr_for_impl(x, fields, methods, _pointers, shadow);
+            }
         }
         ExprKind::Membership { expr, set } => {
             rewrite_expr_for_impl(expr, fields, methods, _pointers, shadow);
@@ -9920,8 +10087,7 @@ fn check_transactor_no_drive_in_always_on_body(
     //    safe to read/write at the field level) versus DUT pointers
     //    (member-write counts as a drive). Builtins (uint/sint/bool/
     //    queue/event/...) are excluded — they're plain inner state.
-    let mut dut_field_names: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut dut_field_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     for it in &t.items {
         if let ComponentItem::Field(f) = it {
             let TypeExpr::Named { name, .. } = &f.ty else {
@@ -9950,11 +10116,9 @@ fn check_transactor_no_drive_in_always_on_body(
     for it in &t.items {
         match it {
             ComponentItem::Hookable(h) => {
-                if let Some(violation) = find_drive_in_block(
-                    &h.body,
-                    &dut_field_names,
-                    is_bound_to_bus,
-                ) {
+                if let Some(violation) =
+                    find_drive_in_block(&h.body, &dut_field_names, is_bound_to_bus)
+                {
                     return Some(format!(
                         "transactor `{}` hookable `{}` drives a DUT signal ({}) from the always-on body. \
                          Passive instances would still execute this code. Move the hookable into a \
@@ -9964,11 +10128,9 @@ fn check_transactor_no_drive_in_always_on_body(
                 }
             }
             ComponentItem::OnHandler(h) => {
-                if let Some(violation) = find_drive_in_block(
-                    &h.body,
-                    &dut_field_names,
-                    is_bound_to_bus,
-                ) {
+                if let Some(violation) =
+                    find_drive_in_block(&h.body, &dut_field_names, is_bound_to_bus)
+                {
                     return Some(format!(
                         "transactor `{}` `on`-handler drives a DUT signal ({}) from the always-on body. \
                          Passive instances would still execute this code. Move the handler into a \

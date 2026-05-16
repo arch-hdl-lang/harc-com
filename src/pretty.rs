@@ -28,7 +28,9 @@ pub fn print(f: &SourceFile) -> String {
 }
 
 fn pad(out: &mut String, depth: usize) {
-    for _ in 0..depth { out.push_str(INDENT); }
+    for _ in 0..depth {
+        out.push_str(INDENT);
+    }
 }
 
 fn print_doc(out: &mut String, doc: &Option<String>, depth: usize) {
@@ -67,7 +69,9 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
             writeln!(out, "package {}", p.name.name).ok();
             print_inner_doc(out, &p.inner_doc, depth + 1);
             for (i, it) in p.items.iter().enumerate() {
-                if i > 0 { writeln!(out).ok(); }
+                if i > 0 {
+                    writeln!(out).ok();
+                }
                 print_item(out, it, depth + 1);
             }
             pad(out, depth);
@@ -114,7 +118,9 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
             pad(out, depth);
             write!(out, "enum {} {{ ", e.name.name).ok();
             for (i, v) in e.variants.iter().enumerate() {
-                if i > 0 { write!(out, ", ").ok(); }
+                if i > 0 {
+                    write!(out, ", ").ok();
+                }
                 write!(out, "{}", v.name).ok();
             }
             writeln!(out, " }}").ok();
@@ -227,7 +233,12 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
             for inst in &a.instances {
                 print_doc(out, &inst.doc, depth + 1);
                 pad(out, depth + 1);
-                write!(out, "instance {} : {} @ ", inst.name.name, inst.regblock_ty.name).ok();
+                write!(
+                    out,
+                    "instance {} : {} @ ",
+                    inst.name.name, inst.regblock_ty.name
+                )
+                .ok();
                 print_expr(out, &inst.base_addr);
                 if let Some(sz) = &inst.size {
                     write!(out, " size ").ok();
@@ -437,7 +448,12 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
                     HandshakeRole::Send => "send",
                     HandshakeRole::Receive => "receive",
                 };
-                writeln!(out, "handshake_channel {}: {} kind: {}", h.name.name, role, h.variant.name).ok();
+                writeln!(
+                    out,
+                    "handshake_channel {}: {} kind: {}",
+                    h.name.name, role, h.variant.name
+                )
+                .ok();
                 for s in &h.payload {
                     pad(out, depth + 2);
                     write!(out, "{}: ", s.name.name).ok();
@@ -510,7 +526,11 @@ fn print_component_item(out: &mut String, it: &ComponentItem, depth: usize) {
             pad(out, depth);
             write!(out, "{} : ", f.name.name).ok();
             if let Some(d) = f.direction {
-                let s = match d { Direction::In => "in", Direction::Out => "out", Direction::InOut => "inout" };
+                let s = match d {
+                    Direction::In => "in",
+                    Direction::Out => "out",
+                    Direction::InOut => "inout",
+                };
                 write!(out, "{s} ").ok();
             }
             print_type(out, &f.ty);
@@ -587,7 +607,10 @@ fn print_on_handler(out: &mut String, h: &OnHandler, depth: usize) {
         write!(out, " cycles").ok();
     }
     if let Some(s) = h.hook {
-        let s = match s { HookSide::Pre => " pre", HookSide::Post => " post" };
+        let s = match s {
+            HookSide::Pre => " pre",
+            HookSide::Post => " post",
+        };
         write!(out, "{s}").ok();
     }
     writeln!(out).ok();
@@ -714,7 +737,9 @@ fn print_cover_item(out: &mut String, it: &CoverItem, depth: usize) {
             pad(out, depth);
             write!(out, "cross ").ok();
             for (i, p) in c.points.iter().enumerate() {
-                if i > 0 { write!(out, ", ").ok(); }
+                if i > 0 {
+                    write!(out, ", ").ok();
+                }
                 write!(out, "{}", p.name).ok();
             }
             writeln!(out).ok();
@@ -725,7 +750,9 @@ fn print_cover_item(out: &mut String, it: &CoverItem, depth: usize) {
 fn print_field(out: &mut String, f: &Field, depth: usize) {
     print_doc(out, &f.doc, depth);
     pad(out, depth);
-    if f.non_random { write!(out, "!").ok(); }
+    if f.non_random {
+        write!(out, "!").ok();
+    }
     write!(out, "{} : ", f.name.name).ok();
     print_type(out, &f.ty);
     if let Some(d) = &f.default {
@@ -735,7 +762,9 @@ fn print_field(out: &mut String, f: &Field, depth: usize) {
     if !f.attrs.is_empty() {
         write!(out, " with ").ok();
         for (i, a) in f.attrs.iter().enumerate() {
-            if i > 0 { write!(out, " ").ok(); }
+            if i > 0 {
+                write!(out, " ").ok();
+            }
             print_attr(out, a);
         }
     }
@@ -749,8 +778,12 @@ fn print_attr(out: &mut String, a: &Attr) {
         for arg in &a.args {
             match arg {
                 AttrArg::Expr(e) => {
-                    if !started { write!(out, "(").ok(); started = true; }
-                    else { write!(out, ", ").ok(); }
+                    if !started {
+                        write!(out, "(").ok();
+                        started = true;
+                    } else {
+                        write!(out, ", ").ok();
+                    }
                     print_expr(out, e);
                 }
                 AttrArg::WithinScope(s) => {
@@ -759,7 +792,9 @@ fn print_attr(out: &mut String, a: &Attr) {
                 AttrArg::Dist(entries) => {
                     write!(out, " {{").ok();
                     for (i, e) in entries.iter().enumerate() {
-                        if i > 0 { write!(out, ", ").ok(); }
+                        if i > 0 {
+                            write!(out, ", ").ok();
+                        }
                         print_expr(out, &e.value);
                         write!(out, " :/ ").ok();
                         print_expr(out, &e.weight);
@@ -768,7 +803,9 @@ fn print_attr(out: &mut String, a: &Attr) {
                 }
             }
         }
-        if started { write!(out, ")").ok(); }
+        if started {
+            write!(out, ")").ok();
+        }
     }
     write!(out, "]").ok();
 }
@@ -798,16 +835,22 @@ fn print_txn_body_item(out: &mut String, it: &TxnBodyItem, depth: usize) {
 
 fn print_path(out: &mut String, p: &Path) {
     for (i, s) in p.segments.iter().enumerate() {
-        if i > 0 { write!(out, ".").ok(); }
+        if i > 0 {
+            write!(out, ".").ok();
+        }
         write!(out, "{}", s.name).ok();
     }
 }
 
 fn print_generic_params(out: &mut String, ps: &[Param]) {
-    if ps.is_empty() { return; }
+    if ps.is_empty() {
+        return;
+    }
     write!(out, "#(").ok();
     for (i, p) in ps.iter().enumerate() {
-        if i > 0 { write!(out, ", ").ok(); }
+        if i > 0 {
+            write!(out, ", ").ok();
+        }
         write!(out, "{}", p.name.name).ok();
         if let Some(t) = &p.ty {
             write!(out, ": ").ok();
@@ -824,7 +867,9 @@ fn print_generic_params(out: &mut String, ps: &[Param]) {
 fn print_paren_params(out: &mut String, ps: &[Param]) {
     write!(out, "(").ok();
     for (i, p) in ps.iter().enumerate() {
-        if i > 0 { write!(out, ", ").ok(); }
+        if i > 0 {
+            write!(out, ", ").ok();
+        }
         write!(out, "{}", p.name.name).ok();
         if let Some(t) = &p.ty {
             write!(out, ": ").ok();
@@ -840,7 +885,12 @@ fn print_paren_params(out: &mut String, ps: &[Param]) {
 
 fn print_type(out: &mut String, t: &TypeExpr) {
     match t {
-        TypeExpr::Named { name, generics, mode, .. } => {
+        TypeExpr::Named {
+            name,
+            generics,
+            mode,
+            ..
+        } => {
             print_path(out, name);
             if !generics.is_empty() {
                 write!(out, "#(").ok();
@@ -902,7 +952,9 @@ fn builtin_ty_name(n: BuiltinTy) -> &'static str {
 
 fn print_type_args(out: &mut String, args: &[TypeArg]) {
     for (i, a) in args.iter().enumerate() {
-        if i > 0 { write!(out, ", ").ok(); }
+        if i > 0 {
+            write!(out, ", ").ok();
+        }
         match a {
             TypeArg::Type(t) => print_type(out, t),
             TypeArg::Expr(e) => print_expr(out, e),
@@ -1011,7 +1063,11 @@ fn print_stmt(out: &mut String, s: &Stmt, depth: usize) {
                 writeln!(out, "end branch").ok();
             }
             pad(out, depth);
-            let kw = match f.join { ForkJoin::All => "join_all", ForkJoin::Any => "join_any", ForkJoin::None => "join_none" };
+            let kw = match f.join {
+                ForkJoin::All => "join_all",
+                ForkJoin::Any => "join_any",
+                ForkJoin::None => "join_none",
+            };
             writeln!(out, "{kw}").ok();
         }
         StmtKind::Parallel(branches) => {
@@ -1060,7 +1116,9 @@ fn print_stmt(out: &mut String, s: &Stmt, depth: usize) {
             if !args.is_empty() {
                 write!(out, "(").ok();
                 for (i, a) in args.iter().enumerate() {
-                    if i > 0 { write!(out, ", ").ok(); }
+                    if i > 0 {
+                        write!(out, ", ").ok();
+                    }
                     match a {
                         CallArg::Expr(e) => print_expr(out, e),
                         CallArg::Named { name, value } => {
@@ -1103,9 +1161,15 @@ fn print_stmt(out: &mut String, s: &Stmt, depth: usize) {
         StmtKind::Assert(v) => print_verify(out, "assert", v, depth),
         StmtKind::Assume(v) => print_verify(out, "assume", v, depth),
         StmtKind::Cover(v) => print_verify(out, "cover", v, depth),
-        StmtKind::Randomize { blocking, target, with_body } => {
+        StmtKind::Randomize {
+            blocking,
+            target,
+            with_body,
+        } => {
             pad(out, depth);
-            if *blocking { write!(out, "blocking ").ok(); }
+            if *blocking {
+                write!(out, "blocking ").ok();
+            }
             write!(out, "randomize(").ok();
             print_expr(out, target);
             write!(out, ")").ok();
@@ -1138,7 +1202,9 @@ fn print_stmt(out: &mut String, s: &Stmt, depth: usize) {
             pad(out, depth);
             writeln!(out, "end after").ok();
         }
-        StmtKind::Wait { duration, clock, .. } => {
+        StmtKind::Wait {
+            duration, clock, ..
+        } => {
             pad(out, depth);
             write!(out, "wait ").ok();
             print_expr(out, duration);
@@ -1148,17 +1214,29 @@ fn print_stmt(out: &mut String, s: &Stmt, depth: usize) {
             }
             writeln!(out).ok();
         }
-        StmtKind::WaitUntil { mode, conditions, timeout, .. } => {
+        StmtKind::WaitUntil {
+            mode,
+            conditions,
+            timeout,
+            ..
+        } => {
             pad(out, depth);
             write!(out, "wait until").ok();
             match mode {
                 WaitUntilMode::Single => {}
-                WaitUntilMode::AllOf  => { write!(out, " all of").ok(); }
-                WaitUntilMode::AnyOf  => { write!(out, " any of").ok(); }
+                WaitUntilMode::AllOf => {
+                    write!(out, " all of").ok();
+                }
+                WaitUntilMode::AnyOf => {
+                    write!(out, " any of").ok();
+                }
             }
             for (i, c) in conditions.iter().enumerate() {
-                if i == 0 { write!(out, " ").ok(); }
-                else      { write!(out, ", ").ok(); }
+                if i == 0 {
+                    write!(out, " ").ok();
+                } else {
+                    write!(out, ", ").ok();
+                }
                 print_expr(out, c);
             }
             if let Some(to) = timeout {
@@ -1218,10 +1296,14 @@ fn print_let(out: &mut String, l: &LetStmt, depth: usize) {
         if !l.bind_remap.is_empty() {
             write!(out, " with {{").ok();
             for (i, entry) in l.bind_remap.iter().enumerate() {
-                if i > 0 { write!(out, ",").ok(); }
+                if i > 0 {
+                    write!(out, ",").ok();
+                }
                 write!(out, " ").ok();
                 for (j, seg) in entry.path.iter().enumerate() {
-                    if j > 0 { write!(out, ".").ok(); }
+                    if j > 0 {
+                        write!(out, ".").ok();
+                    }
                     write!(out, "{}", seg.name).ok();
                 }
                 write!(out, ": \"{}\"", entry.port).ok();
@@ -1253,10 +1335,18 @@ fn print_clocking_expr(out: &mut String, e: &Expr) {
 
 pub fn print_expr(out: &mut String, e: &Expr) {
     match &*e.kind {
-        ExprKind::Int(s) | ExprKind::Float(s) | ExprKind::Time(s) => { write!(out, "{s}").ok(); }
-        ExprKind::String(s) => { write!(out, "\"{s}\"").ok(); }
-        ExprKind::Bool(b) => { write!(out, "{}", if *b { "true" } else { "false" }).ok(); }
-        ExprKind::Ident(id) => { write!(out, "{}", id.name).ok(); }
+        ExprKind::Int(s) | ExprKind::Float(s) | ExprKind::Time(s) => {
+            write!(out, "{s}").ok();
+        }
+        ExprKind::String(s) => {
+            write!(out, "\"{s}\"").ok();
+        }
+        ExprKind::Bool(b) => {
+            write!(out, "{}", if *b { "true" } else { "false" }).ok();
+        }
+        ExprKind::Ident(id) => {
+            write!(out, "{}", id.name).ok();
+        }
         ExprKind::ImplicitSelf => {} // emitted as the leading dot in Field
         ExprKind::Field { target, name } => {
             if matches!(&*target.kind, ExprKind::ImplicitSelf) {
@@ -1284,7 +1374,9 @@ pub fn print_expr(out: &mut String, e: &Expr) {
             print_expr(out, callee);
             write!(out, "(").ok();
             for (i, a) in args.iter().enumerate() {
-                if i > 0 { write!(out, ", ").ok(); }
+                if i > 0 {
+                    write!(out, ", ").ok();
+                }
                 match a {
                     CallArg::Expr(e) => print_expr(out, e),
                     CallArg::Named { name, value } => {
@@ -1307,7 +1399,10 @@ pub fn print_expr(out: &mut String, e: &Expr) {
         }
         ExprKind::Unary { op, expr } => {
             let s = match op {
-                UnaryOp::Neg => "-", UnaryOp::Not => "!", UnaryOp::NotKw => "not ", UnaryOp::BitNot => "~",
+                UnaryOp::Neg => "-",
+                UnaryOp::Not => "!",
+                UnaryOp::NotKw => "not ",
+                UnaryOp::BitNot => "~",
             };
             write!(out, "{s}").ok();
             print_expr(out, expr);
@@ -1317,7 +1412,11 @@ pub fn print_expr(out: &mut String, e: &Expr) {
             write!(out, " {} ", binary_op_str(*op)).ok();
             print_expr(out, rhs);
         }
-        ExprKind::Ternary { cond, then_branch, else_branch } => {
+        ExprKind::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
             print_expr(out, cond);
             write!(out, " ? ").ok();
             print_expr(out, then_branch);
@@ -1338,15 +1437,21 @@ pub fn print_expr(out: &mut String, e: &Expr) {
         }
         ExprKind::RangeLit { lo, hi } => {
             write!(out, "[").ok();
-            if let Some(l) = lo { print_expr(out, l); }
+            if let Some(l) = lo {
+                print_expr(out, l);
+            }
             write!(out, "..").ok();
-            if let Some(h) = hi { print_expr(out, h); }
+            if let Some(h) = hi {
+                print_expr(out, h);
+            }
             write!(out, "]").ok();
         }
         ExprKind::SetLit(items) => {
             write!(out, "{{").ok();
             for (i, e) in items.iter().enumerate() {
-                if i > 0 { write!(out, ", ").ok(); }
+                if i > 0 {
+                    write!(out, ", ").ok();
+                }
                 print_expr(out, e);
             }
             write!(out, "}}").ok();
@@ -1354,7 +1459,9 @@ pub fn print_expr(out: &mut String, e: &Expr) {
         ExprKind::DistLit(entries) => {
             write!(out, "dist {{").ok();
             for (i, e) in entries.iter().enumerate() {
-                if i > 0 { write!(out, ", ").ok(); }
+                if i > 0 {
+                    write!(out, ", ").ok();
+                }
                 print_expr(out, &e.value);
                 write!(out, " :/ ").ok();
                 print_expr(out, &e.weight);
@@ -1363,29 +1470,41 @@ pub fn print_expr(out: &mut String, e: &Expr) {
         }
         ExprKind::SystemCall { name, args } => {
             let s = match name {
-                SystemFn::Rose => "$rose", SystemFn::Fell => "$fell",
-                SystemFn::Stable => "$stable", SystemFn::Past => "$past",
+                SystemFn::Rose => "$rose",
+                SystemFn::Fell => "$fell",
+                SystemFn::Stable => "$stable",
+                SystemFn::Past => "$past",
                 SystemFn::Clog2 => "$clog2",
             };
             write!(out, "{s}").ok();
             if !args.is_empty() {
                 write!(out, "(").ok();
                 for (i, a) in args.iter().enumerate() {
-                    if i > 0 { write!(out, ", ").ok(); }
+                    if i > 0 {
+                        write!(out, ", ").ok();
+                    }
                     print_expr(out, a);
                 }
                 write!(out, ")").ok();
             }
         }
-        ExprKind::Randomize { blocking, target, with_body } => {
-            if *blocking { write!(out, "blocking ").ok(); }
+        ExprKind::Randomize {
+            blocking,
+            target,
+            with_body,
+        } => {
+            if *blocking {
+                write!(out, "blocking ").ok();
+            }
             write!(out, "randomize(").ok();
             print_expr(out, target);
             write!(out, ")").ok();
             if !with_body.is_empty() {
                 write!(out, " with ").ok();
                 for (i, e) in with_body.iter().enumerate() {
-                    if i > 0 { write!(out, "; ").ok(); }
+                    if i > 0 {
+                        write!(out, "; ").ok();
+                    }
                     print_expr(out, e);
                 }
                 write!(out, " end randomize").ok();
@@ -1398,7 +1517,9 @@ pub fn print_expr(out: &mut String, e: &Expr) {
             }
             write!(out, "dist {{").ok();
             for (i, e) in entries.iter().enumerate() {
-                if i > 0 { write!(out, ", ").ok(); }
+                if i > 0 {
+                    write!(out, ", ").ok();
+                }
                 print_expr(out, &e.value);
                 write!(out, " :/ ").ok();
                 print_expr(out, &e.weight);
@@ -1418,7 +1539,9 @@ pub fn print_expr(out: &mut String, e: &Expr) {
             print_type(out, ty);
             write!(out, " {{").ok();
             for (i, f) in fields.iter().enumerate() {
-                if i > 0 { write!(out, ", ").ok(); }
+                if i > 0 {
+                    write!(out, ", ").ok();
+                }
                 write!(out, "{}: ", f.name.name).ok();
                 print_expr(out, &f.value);
             }
@@ -1436,10 +1559,15 @@ pub fn print_expr(out: &mut String, e: &Expr) {
             print_expr(out, rhs);
         }
         ExprKind::Solve { kind, args } => {
-            let s = match kind { SolveKind::Before => "solve_before", SolveKind::After => "solve_after" };
+            let s = match kind {
+                SolveKind::Before => "solve_before",
+                SolveKind::After => "solve_after",
+            };
             write!(out, "{s}(").ok();
             for (i, a) in args.iter().enumerate() {
-                if i > 0 { write!(out, ", ").ok(); }
+                if i > 0 {
+                    write!(out, ", ").ok();
+                }
                 print_expr(out, a);
             }
             write!(out, ")").ok();
@@ -1469,7 +1597,9 @@ fn print_log_call(out: &mut String, kw: &str, args: &[CallArg], depth: usize) {
     pad(out, depth);
     write!(out, "{kw}(").ok();
     for (i, a) in args.iter().enumerate() {
-        if i > 0 { write!(out, ", ").ok(); }
+        if i > 0 {
+            write!(out, ", ").ok();
+        }
         match a {
             CallArg::Expr(e) => print_expr(out, e),
             CallArg::Named { name, value } => {
@@ -1484,12 +1614,32 @@ fn print_log_call(out: &mut String, kw: &str, args: &[CallArg], depth: usize) {
 fn binary_op_str(op: BinaryOp) -> &'static str {
     use BinaryOp::*;
     match op {
-        Add => "+", Sub => "-", Mul => "*", Div => "/", Mod => "%",
-        Eq => "==", Ne => "!=", Lt => "<", Le => "<=", Gt => ">", Ge => ">=",
-        AndAnd => "&&", OrOr => "||", AndKw => "and", OrKw => "or",
-        BitAnd => "&", BitOr => "|", BitXor => "^", Shl => "<<", Shr => ">>",
-        PipeImplies => "|->", PipeImpliesNext => "|=>",
-        Throughout => "throughout", Within => "within", Intersect => "intersect",
-        In => "in", Inside => "inside",
+        Add => "+",
+        Sub => "-",
+        Mul => "*",
+        Div => "/",
+        Mod => "%",
+        Eq => "==",
+        Ne => "!=",
+        Lt => "<",
+        Le => "<=",
+        Gt => ">",
+        Ge => ">=",
+        AndAnd => "&&",
+        OrOr => "||",
+        AndKw => "and",
+        OrKw => "or",
+        BitAnd => "&",
+        BitOr => "|",
+        BitXor => "^",
+        Shl => "<<",
+        Shr => ">>",
+        PipeImplies => "|->",
+        PipeImpliesNext => "|=>",
+        Throughout => "throughout",
+        Within => "within",
+        Intersect => "intersect",
+        In => "in",
+        Inside => "inside",
     }
 }
