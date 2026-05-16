@@ -23,11 +23,11 @@ function gray_encode(c: uint<8>) -> uint<8>
     return c ^ (c >> 1)
 end function gray_encode
 
-test GenericCounterTest
-    let dut : generic_counter_top
-end test GenericCounterTest
+testbench GenericCounterTestTb
+    dut : generic_counter_top
+end testbench GenericCounterTestTb
 
-impl sim for GenericCounterTest
+impl GenericCounterTest for GenericCounterTestTb
     run
         log(info, "generic_counter: exercise every mode + enable + reset paths")
 
