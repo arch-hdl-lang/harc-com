@@ -1,4 +1,5 @@
 /target
+/arch_sim_build/
 /harc_sim_build
 /harc_sim_build*/
 /third_party/z3/
