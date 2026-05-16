@@ -1885,6 +1885,58 @@ end test BlockingFieldPathDepTest"#,
     );
 }
 
+#[test]
+fn randomize_dist_directives_follow_runtime_dependency_mode() {
+    let queued = parse_source(
+        r#"transaction T
+    len : uint<8>
+end transaction T
+
+test QueuedDistRuntimeDepTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t) with
+            t.len dist { [1..dut.max_len] :/ 10 }
+        end randomize
+    end run
+end test QueuedDistRuntimeDepTest"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&queued).unwrap_err();
+    assert!(
+        err.0.contains("queued randomize(T)")
+            && err.0.contains("runtime state `dut.max_len`")
+            && err.0.contains("blocking randomize"),
+        "queued randomize should reject runtime-dependent dist directives; got: {}",
+        err.0,
+    );
+
+    let blocking = parse_source(
+        r#"transaction T
+    len : uint<8>
+end transaction T
+
+test BlockingDistRuntimeDepTest
+    let dut : DummyDut
+    run
+        let t : T
+        blocking randomize(t) with
+            t.len dist { [1..dut.max_len] :/ 10 }
+        end randomize
+    end run
+end test BlockingDistRuntimeDepTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&blocking).expect("blocking dist runtime dependency emits");
+    assert!(
+        cpp.contains(
+            "harc_rng_dist({{(int64_t)(1), (int64_t)(harc_rt::harc_read(dut->max_len)), (int64_t)(10)}})"
+        ),
+        "blocking randomize should snapshot runtime-dependent dist entries; got:\n{cpp}",
+    );
+}
+
 /// `keep f != WRAP` where `WRAP` is an enum variant resolves via
 /// the global `enum_variants` map. Without this lookup the
 /// constraint translator would error with "unknown name `WRAP`".

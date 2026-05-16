@@ -6247,6 +6247,22 @@ impl Emitter {
                     if let Some(field) =
                         randomize_target_field_name(target, &field_info, target_root)
                     {
+                        for entry in entries {
+                            self.validate_randomize_constraint_dependencies(
+                                ty,
+                                &entry.value,
+                                &field_info,
+                                target_root,
+                                blocking,
+                            );
+                            self.validate_randomize_constraint_dependencies(
+                                ty,
+                                &entry.weight,
+                                &field_info,
+                                target_root,
+                                blocking,
+                            );
+                        }
                         dist_directives.insert(field, entries.clone());
                     } else {
                         self.errors.push(format!(
