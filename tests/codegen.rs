@@ -2269,3 +2269,199 @@ end test T"#,
     cpp_tb::emit(&parsed)
         .expect("observer-only handler in always-on body should emit cleanly under `passive`");
 }
+
+// ── Width-method intrinsics (.trunc/.zext/.sext/.resize) ────────────
+//
+// Ported from arch-com's surface (src/parser.rs:5757 +
+// src/sim_codegen/mod.rs:2688). Spec: each method takes one constant
+// width arg, parser recognizes `.<name><W>()` shape only when `<name>`
+// is one of `trunc` / `zext` / `sext` / `resize`. Codegen emits the
+// corresponding C++ narrow/extend, with a wrong-direction check when
+// the source width is statically known (via a typed let or an
+// explicit `as uint<W>` / `as sint<W>` cast).
+
+#[test]
+fn trunc_narrows_with_mask() {
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let v : uint<64> = 0x123456789ABCDEF0
+        let n = v.trunc<32>()
+        log(info, "${n:08x}")
+    end run
+end impl T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    // Expect a mask to 32 bits, then cast to uint64_t storage.
+    assert!(
+        cpp.contains("0xFFFFFFFFULL"),
+        "expected 0xFFFFFFFFULL mask in trunc emit; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn trunc_wrong_direction_errors() {
+    // `.trunc<N>()` where N >= source width is a no-op or widens —
+    // both wrong. The error suggests `.zext<N>()` as the fix.
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let v : uint<8> = 0xFF
+        let bad = v.trunc<16>()
+        log(info, "${bad}")
+    end run
+end impl T"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&parsed).unwrap_err();
+    assert!(
+        err.0.contains("trunc<16>")
+            && err.0.contains("8-bit")
+            && err.0.contains("zext"),
+        "expected widen-direction error pointing to zext; got: {}",
+        err.0,
+    );
+}
+
+#[test]
+fn zext_widens_via_cast() {
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let v : uint<8> = 0xAB
+        let w = v.zext<32>()
+        log(info, "${w:08x}")
+    end run
+end impl T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    // Plain `(uint64_t)(...)` widening — no mask, no shift.
+    assert!(
+        cpp.contains("(uint64_t)(") && !cpp.contains("0xFFFFFFFFULL"),
+        "expected plain widening cast for zext; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn zext_narrowing_direction_errors() {
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let v : uint<32> = 0xFFFF
+        let bad = v.zext<8>()
+        log(info, "${bad}")
+    end run
+end impl T"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&parsed).unwrap_err();
+    assert!(
+        err.0.contains("zext<8>")
+            && err.0.contains("32-bit")
+            && err.0.contains("trunc"),
+        "expected narrow-direction error pointing to trunc; got: {}",
+        err.0,
+    );
+}
+
+#[test]
+fn sext_uses_shift_arithmetic_idiom() {
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let v : uint<8> = 0xFF
+        let s = v.sext<32>()
+        log(info, "${s:08x}")
+    end run
+end impl T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    // Sign-extend idiom: cast to (int64_t), shift left by (64-sw),
+    // arith-shift right back. Look for the shift pair.
+    assert!(
+        cpp.contains("(int64_t)") && cpp.contains(") << 56") && cpp.contains(") >> 56"),
+        "expected (int64_t)(... << 56) >> 56 shift-fill idiom; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn resize_narrows_or_widens_by_direction() {
+    // Same source width as dest → plain cast (no mask).
+    let parsed_widen = parse_source(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let v : uint<8> = 0xFF
+        let w = v.resize<32>()
+        log(info, "${w:08x}")
+    end run
+end impl T"#,
+    )
+    .unwrap();
+    let cpp_widen = cpp_tb::emit(&parsed_widen).expect("emit");
+    // Widening path: plain cast.
+    assert!(!cpp_widen.contains("0xFFULL"), "expected no narrowing mask on widen; got:\n{cpp_widen}");
+
+    let parsed_narrow = parse_source(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let v : uint<32> = 0xDEADBEEF
+        let w = v.resize<16>()
+        log(info, "${w:04x}")
+    end run
+end impl T"#,
+    )
+    .unwrap();
+    let cpp_narrow = cpp_tb::emit(&parsed_narrow).expect("emit");
+    // Narrowing path: 16-bit mask.
+    assert!(
+        cpp_narrow.contains("0xFFFFULL"),
+        "expected 0xFFFFULL narrowing mask; got:\n{cpp_narrow}",
+    );
+}
+
+#[test]
+fn width_method_on_anonymous_expression_works() {
+    // No source-width inference, but emission still succeeds (the
+    // type-direction check just skips, matching arch-com).
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let s = (0xDEADBEEFFFFF as uint<48>).trunc<32>()
+        log(info, "${s:08x}")
+    end run
+end impl T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("0xFFFFFFFFULL"),
+        "expected 32-bit mask from .trunc<32>(); got:\n{cpp}",
+    );
+}
