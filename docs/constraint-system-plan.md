@@ -79,8 +79,8 @@ constraints. The implementation may use rejection sampling, randomized solver
 objectives, or a hybrid strategy, but the chosen behavior must be documented
 and stable under a seed.
 
-`solve_before` and `solve_after` are solver scheduling metadata, not boolean
-constraints. The v1 code generator should validate that their arguments are
+`solve_order(a, b, c)` is solver scheduling metadata, not a boolean
+constraint. The v1 code generator should validate that its arguments are
 fields of the randomize target and use the metadata to order free-field
 preference sampling without changing the hard solution space; richer
 distribution effects can be added in the typed solver backend once sampling
@@ -134,6 +134,6 @@ typed lowering, before C++ emission.
 4. Enforce non-random field semantics.
 5. Lower `when` subtype constraints with discriminator guards.
 6. Replace diversity blocking cache with deterministic seed-driven sampling.
-7. Implement principled `[dist]`, `[unique]`, and `solve_before`.
+7. Implement principled `[dist]`, `[unique]`, and `solve_order`.
 8. Add queued vs `blocking randomize` architecture and runtime dependency
    analysis.

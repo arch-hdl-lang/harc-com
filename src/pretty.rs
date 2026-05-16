@@ -1558,12 +1558,8 @@ pub fn print_expr(out: &mut String, e: &Expr) {
             write!(out, " ").ok();
             print_expr(out, rhs);
         }
-        ExprKind::Solve { kind, args } => {
-            let s = match kind {
-                SolveKind::Before => "solve_before",
-                SolveKind::After => "solve_after",
-            };
-            write!(out, "{s}(").ok();
+        ExprKind::SolveOrder { args } => {
+            write!(out, "solve_order(").ok();
             for (i, a) in args.iter().enumerate() {
                 if i > 0 {
                     write!(out, ", ").ok();
