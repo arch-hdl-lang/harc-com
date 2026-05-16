@@ -415,6 +415,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                                 signed,
                                 enum_variants,
                                 non_random: f.non_random,
+                                attrs: f.attrs.clone(),
                             })
                         }
                         _ => None,
@@ -2166,11 +2167,50 @@ struct TxnFieldInfo {
     width: u32,
     signed: bool,
     enum_variants: Option<usize>,
-    /// `!` prefix on a transaction field — non-random; carried for future
-    /// solver use. Not yet consulted by the lowering, but kept so the field
-    /// info round-trips through codegen.
-    #[allow(dead_code)]
+    /// `!` prefix on a transaction field — pinned to the current value during
+    /// solver-backed randomize and skipped during model assignment.
     non_random: bool,
+    attrs: Vec<Attr>,
+}
+
+fn field_attr_range(f: &TxnFieldInfo) -> Option<(&Expr, &Expr)> {
+    f.attrs.iter().find_map(|a| {
+        if a.name.name != "range" || a.args.len() < 2 {
+            return None;
+        }
+        match (&a.args[0], &a.args[1]) {
+            (AttrArg::Expr(lo), AttrArg::Expr(hi)) => Some((lo, hi)),
+            _ => None,
+        }
+    })
+}
+
+fn field_attr_dist_entries(f: &TxnFieldInfo) -> Option<&Vec<DistEntry>> {
+    f.attrs.iter().find_map(|a| {
+        if a.name.name != "dist" {
+            return None;
+        }
+        a.args.iter().find_map(|arg| match arg {
+            AttrArg::Dist(entries) => Some(entries),
+            _ => None,
+        })
+    })
+}
+
+fn randomize_target_field_name(
+    target: &Expr,
+    field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+) -> Option<String> {
+    match &*target.kind {
+        ExprKind::Field { target, name } if matches!(&*target.kind, ExprKind::Ident(_)) => {
+            field_info
+                .contains_key(&name.name)
+                .then(|| name.name.clone())
+        }
+        ExprKind::Ident(id) if field_info.contains_key(&id.name) => Some(id.name.clone()),
+        ExprKind::Paren(inner) => randomize_target_field_name(inner, field_info),
+        _ => None,
+    }
 }
 
 /// Per-probe codegen state. The mangled read accessor is the bare
@@ -5611,37 +5651,7 @@ impl Emitter {
                     });
                     if let Some(entries) = dist_args {
                         write!(self.out, "{INDENT}t->{} = harc_rng_dist({{", f.name.name).ok();
-                        for (i, e) in entries.iter().enumerate() {
-                            if i > 0 {
-                                write!(self.out, ", ").ok();
-                            }
-                            // Each dist entry: (lo, hi, weight). The `value`
-                            // expression is either a RangeLit (use lo/hi) or
-                            // a scalar (use as both lo and hi).
-                            match &*e.value.kind {
-                                ExprKind::RangeLit {
-                                    lo: Some(lo),
-                                    hi: Some(hi),
-                                } => {
-                                    write!(self.out, "{{(int64_t)(").ok();
-                                    self.emit_expr(lo);
-                                    write!(self.out, "), (int64_t)(").ok();
-                                    self.emit_expr(hi);
-                                    write!(self.out, "), (int64_t)(").ok();
-                                    self.emit_expr(&e.weight);
-                                    write!(self.out, ")}}").ok();
-                                }
-                                _ => {
-                                    write!(self.out, "{{(int64_t)(").ok();
-                                    self.emit_expr(&e.value);
-                                    write!(self.out, "), (int64_t)(").ok();
-                                    self.emit_expr(&e.value);
-                                    write!(self.out, "), (int64_t)(").ok();
-                                    self.emit_expr(&e.weight);
-                                    write!(self.out, ")}}").ok();
-                                }
-                            }
-                        }
+                        self.emit_rng_dist_entries(entries);
                         writeln!(self.out, "}});").ok();
                         handled = true;
                     }
@@ -5727,6 +5737,64 @@ impl Emitter {
                 }
             }
         }
+    }
+
+    fn emit_rng_dist_entries(&mut self, entries: &[DistEntry]) {
+        for (i, e) in entries.iter().enumerate() {
+            if i > 0 {
+                write!(self.out, ", ").ok();
+            }
+            // Each dist entry: (lo, hi, weight). The `value` expression is
+            // either a RangeLit (use lo/hi) or a scalar (use as both lo/hi).
+            match &*e.value.kind {
+                ExprKind::RangeLit {
+                    lo: Some(lo),
+                    hi: Some(hi),
+                } => {
+                    write!(self.out, "{{(int64_t)(").ok();
+                    self.emit_expr(lo);
+                    write!(self.out, "), (int64_t)(").ok();
+                    self.emit_expr(hi);
+                    write!(self.out, "), (int64_t)(").ok();
+                    self.emit_expr(&e.weight);
+                    write!(self.out, ")}}").ok();
+                }
+                _ => {
+                    write!(self.out, "{{(int64_t)(").ok();
+                    self.emit_expr(&e.value);
+                    write!(self.out, "), (int64_t)(").ok();
+                    self.emit_expr(&e.value);
+                    write!(self.out, "), (int64_t)(").ok();
+                    self.emit_expr(&e.weight);
+                    write!(self.out, ")}}").ok();
+                }
+            }
+        }
+    }
+
+    fn emit_solver_range_constraint(
+        &mut self,
+        f: &TxnFieldInfo,
+        lo: &Expr,
+        hi: &Expr,
+        field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+        depth: usize,
+    ) {
+        self.pad(depth);
+        write!(self.out, "_s.add(").ok();
+        if f.signed {
+            write!(self.out, "_z_{} >= ", f.name).ok();
+            self.emit_constraint_expr_w(lo, field_info, 64);
+            write!(self.out, " && _z_{} <= ", f.name).ok();
+            self.emit_constraint_expr_w(hi, field_info, 64);
+        } else {
+            write!(self.out, "z3::uge(_z_{}, ", f.name).ok();
+            self.emit_constraint_expr_w(lo, field_info, 64);
+            write!(self.out, ") && z3::ule(_z_{}, ", f.name).ok();
+            self.emit_constraint_expr_w(hi, field_info, 64);
+            write!(self.out, ")").ok();
+        }
+        writeln!(self.out, ");").ok();
     }
 
     /// Inline a list of top-level constraint expressions, expanding
@@ -5917,6 +5985,18 @@ impl Emitter {
         // source field type.
         let field_info: std::collections::HashMap<String, TxnFieldInfo> =
             fields.iter().map(|f| (f.name.clone(), f.clone())).collect();
+        let mut dist_directives: std::collections::HashMap<String, Vec<DistEntry>> =
+            std::collections::HashMap::new();
+        let mut hard_constraints: Vec<&Expr> = Vec::new();
+        for c in with_body {
+            if let ExprKind::DistDirective { target, entries } = &*c.kind {
+                if let Some(field) = randomize_target_field_name(target, &field_info) {
+                    dist_directives.insert(field, entries.clone());
+                    continue;
+                }
+            }
+            hard_constraints.push(c);
+        }
 
         self.pad(depth);
         writeln!(self.out, "{{   // randomize(t) with — Z3 solver block").ok();
@@ -5994,10 +6074,13 @@ impl Emitter {
                 self.emit_expr(target);
                 writeln!(self.out, ".{}), 64));", f.name).ok();
             }
+            if let Some((lo, hi)) = field_attr_range(f) {
+                self.emit_solver_range_constraint(f, lo, hi, &field_info, depth + 1);
+            }
         }
 
         // Translated constraints.
-        for c in with_body {
+        for c in &hard_constraints {
             self.pad(depth + 1);
             write!(self.out, "_s.add(").ok();
             self.emit_constraint_expr(c, &field_info);
@@ -6009,8 +6092,9 @@ impl Emitter {
         // clause for them makes the whole problem UNSAT after the first
         // call. We block only the *free* fields. Diversity then comes from
         // the free-field cache.
-        let pinned: std::collections::HashSet<String> = with_body
+        let pinned: std::collections::HashSet<String> = hard_constraints
             .iter()
+            .copied()
             .filter_map(|e| {
                 if let ExprKind::Binary {
                     op: BinaryOp::Eq,
@@ -6060,7 +6144,20 @@ impl Emitter {
         // consume the HARC seed without turning preferences into false UNSATs.
         for f in &free_fields {
             self.pad(depth + 1);
-            if let Some(n) = f.enum_variants {
+            let dist_entries = dist_directives
+                .get(&f.name)
+                .map(Vec::as_slice)
+                .or_else(|| field_attr_dist_entries(f).map(Vec::as_slice));
+            if let Some(entries) = dist_entries {
+                write!(
+                    self.out,
+                    "uint64_t _pref_{cache_tag}_{} = (uint64_t)harc_rng_dist({{",
+                    f.name
+                )
+                .ok();
+                self.emit_rng_dist_entries(entries);
+                writeln!(self.out, "}});").ok();
+            } else if let Some(n) = f.enum_variants {
                 writeln!(
                     self.out,
                     "uint64_t _pref_{cache_tag}_{} = (uint64_t)harc_rng_range(0, {});",
