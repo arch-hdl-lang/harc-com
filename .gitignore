@@ -6,8 +6,6 @@ Cargo.lock
 *.swp
 *.log
 .DS_Store
-HANDOFF.md
-HANDOFF.html
 .claude/
 
 # CVDP benchmark scorer outputs — coverage.dat, obj_dir, build logs.
