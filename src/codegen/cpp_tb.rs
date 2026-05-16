@@ -5982,6 +5982,12 @@ impl Emitter {
                 )
                 .ok();
             }
+            if f.non_random {
+                self.pad(depth + 1);
+                write!(self.out, "_s.add(_z_{} == _ctx.bv_val((uint64_t)(", f.name).ok();
+                self.emit_expr(target);
+                writeln!(self.out, ".{}), 64));", f.name).ok();
+            }
         }
 
         // Translated constraints.
@@ -6026,7 +6032,7 @@ impl Emitter {
         let cache_tag = format!("_div_cache_{}", target.span.start);
         let free_fields: Vec<&TxnFieldInfo> = fields
             .iter()
-            .filter(|f| !pinned.contains(&f.name))
+            .filter(|f| !f.non_random && !pinned.contains(&f.name))
             .collect();
 
         // One static history vector per free field — persists across loop
@@ -6085,6 +6091,9 @@ impl Emitter {
         self.pad(depth + 2);
         writeln!(self.out, "z3::model _m = _s.get_model();").ok();
         for f in &fields {
+            if f.non_random {
+                continue;
+            }
             // Every declared field is assigned from the model — equality-
             // pinned fields take their constrained value; free fields take
             // a Z3-chosen satisfying value. Only free fields get pushed
