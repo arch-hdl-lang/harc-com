@@ -1937,6 +1937,36 @@ end test BlockingDistRuntimeDepTest"#,
     );
 }
 
+#[test]
+fn randomize_field_attrs_reject_runtime_dependencies() {
+    let parsed = parse_source(
+        r#"transaction T
+    len : uint<8> with [range(1, dut.max_len)] [dist {[1..dut.max_len] :/ 10}]
+end transaction T
+
+test AttrRuntimeDepTest
+    let dut : DummyDut
+    run
+        let t : T
+        blocking randomize(t) with
+            t.len > 0
+        end randomize
+    end run
+end test AttrRuntimeDepTest"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&parsed).unwrap_err();
+    assert!(
+        err.0.contains("field attribute `[range]`")
+            && err.0.contains("T.len")
+            && err.0.contains("runtime state `dut.max_len`")
+            && err.0.contains("field attribute `[dist]`")
+            && err.0.contains("blocking randomize"),
+        "runtime-dependent field attrs should be rejected as type-level metadata; got: {}",
+        err.0,
+    );
+}
+
 /// `keep f != WRAP` where `WRAP` is an enum variant resolves via
 /// the global `enum_variants` map. Without this lookup the
 /// constraint translator would error with "unknown name `WRAP`".
