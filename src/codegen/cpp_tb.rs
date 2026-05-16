@@ -2200,15 +2200,30 @@ fn field_attr_dist_entries(f: &TxnFieldInfo) -> Option<&Vec<DistEntry>> {
 fn randomize_target_field_name(
     target: &Expr,
     field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+    target_root: Option<&str>,
 ) -> Option<String> {
     match &*target.kind {
-        ExprKind::Field { target, name } if matches!(&*target.kind, ExprKind::Ident(_)) => {
+        ExprKind::Field { target, name } => {
+            let ExprKind::Ident(root) = &*target.kind else {
+                return None;
+            };
+            if target_root.is_some_and(|expected| root.name != expected) {
+                return None;
+            }
             field_info
                 .contains_key(&name.name)
                 .then(|| name.name.clone())
         }
         ExprKind::Ident(id) if field_info.contains_key(&id.name) => Some(id.name.clone()),
-        ExprKind::Paren(inner) => randomize_target_field_name(inner, field_info),
+        ExprKind::Paren(inner) => randomize_target_field_name(inner, field_info, target_root),
+        _ => None,
+    }
+}
+
+fn randomize_target_ident(target: &Expr) -> Option<&str> {
+    match &*target.kind {
+        ExprKind::Ident(id) => Some(id.name.as_str()),
+        ExprKind::Paren(inner) => randomize_target_ident(inner),
         _ => None,
     }
 }
@@ -5647,6 +5662,213 @@ impl Emitter {
         }
     }
 
+    fn validate_randomize_constraint_dependencies(
+        &mut self,
+        ty: &str,
+        expr: &Expr,
+        field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+        target_root: Option<&str>,
+        blocking: bool,
+    ) {
+        match &*expr.kind {
+            ExprKind::Field { target, name } => {
+                if let ExprKind::Ident(root) = &*target.kind {
+                    if field_info.contains_key(&name.name)
+                        && target_root.is_some_and(|expected| root.name != expected)
+                    {
+                        let path = format!("{}.{}", root.name, name.name);
+                        if blocking {
+                            self.errors.push(format!(
+                                "blocking randomize({ty}) constraint references runtime state `{path}`, but runtime-dependent constraint lowering is not supported yet"
+                            ));
+                        } else {
+                            self.errors.push(format!(
+                                "queued randomize({ty}) constraint references runtime state `{path}`; use `blocking randomize` once runtime-dependent constraint lowering is supported"
+                            ));
+                        }
+                    }
+                }
+                self.validate_randomize_constraint_dependencies(
+                    ty,
+                    target,
+                    field_info,
+                    target_root,
+                    blocking,
+                );
+            }
+            ExprKind::Index { target, index } => {
+                self.validate_randomize_constraint_dependencies(
+                    ty,
+                    target,
+                    field_info,
+                    target_root,
+                    blocking,
+                );
+                self.validate_randomize_constraint_dependencies(
+                    ty,
+                    index,
+                    field_info,
+                    target_root,
+                    blocking,
+                );
+            }
+            ExprKind::BitSlice { target, hi, lo } => {
+                for e in [target, hi, lo] {
+                    self.validate_randomize_constraint_dependencies(
+                        ty,
+                        e,
+                        field_info,
+                        target_root,
+                        blocking,
+                    );
+                }
+            }
+            ExprKind::Call { callee, args } => {
+                self.validate_randomize_constraint_dependencies(
+                    ty,
+                    callee,
+                    field_info,
+                    target_root,
+                    blocking,
+                );
+                for arg in args {
+                    let value = match arg {
+                        CallArg::Expr(e) => e,
+                        CallArg::Named { value, .. } => value,
+                    };
+                    self.validate_randomize_constraint_dependencies(
+                        ty,
+                        value,
+                        field_info,
+                        target_root,
+                        blocking,
+                    );
+                }
+            }
+            ExprKind::Cast { expr, .. }
+            | ExprKind::Unary { expr, .. }
+            | ExprKind::HashHash { expr, .. }
+            | ExprKind::SeqRepeat { expr, .. }
+            | ExprKind::Paren(expr) => {
+                self.validate_randomize_constraint_dependencies(
+                    ty,
+                    expr,
+                    field_info,
+                    target_root,
+                    blocking,
+                );
+            }
+            ExprKind::Binary { lhs, rhs, .. }
+            | ExprKind::Membership {
+                expr: lhs,
+                set: rhs,
+            }
+            | ExprKind::CoverArrow { lhs, rhs, .. } => {
+                self.validate_randomize_constraint_dependencies(
+                    ty,
+                    lhs,
+                    field_info,
+                    target_root,
+                    blocking,
+                );
+                self.validate_randomize_constraint_dependencies(
+                    ty,
+                    rhs,
+                    field_info,
+                    target_root,
+                    blocking,
+                );
+            }
+            ExprKind::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                for e in [cond, then_branch, else_branch] {
+                    self.validate_randomize_constraint_dependencies(
+                        ty,
+                        e,
+                        field_info,
+                        target_root,
+                        blocking,
+                    );
+                }
+            }
+            ExprKind::RangeLit { lo, hi } => {
+                for e in lo.iter().chain(hi.iter()) {
+                    self.validate_randomize_constraint_dependencies(
+                        ty,
+                        e,
+                        field_info,
+                        target_root,
+                        blocking,
+                    );
+                }
+            }
+            ExprKind::SetLit(items) => {
+                for e in items {
+                    self.validate_randomize_constraint_dependencies(
+                        ty,
+                        e,
+                        field_info,
+                        target_root,
+                        blocking,
+                    );
+                }
+            }
+            ExprKind::DistLit(entries) | ExprKind::DistDirective { entries, .. } => {
+                for entry in entries {
+                    self.validate_randomize_constraint_dependencies(
+                        ty,
+                        &entry.value,
+                        field_info,
+                        target_root,
+                        blocking,
+                    );
+                    self.validate_randomize_constraint_dependencies(
+                        ty,
+                        &entry.weight,
+                        field_info,
+                        target_root,
+                        blocking,
+                    );
+                }
+            }
+            ExprKind::SystemCall { args, .. } | ExprKind::Solve { args, .. } => {
+                for e in args {
+                    self.validate_randomize_constraint_dependencies(
+                        ty,
+                        e,
+                        field_info,
+                        target_root,
+                        blocking,
+                    );
+                }
+            }
+            ExprKind::NamedArg { value, .. } => {
+                self.validate_randomize_constraint_dependencies(
+                    ty,
+                    value,
+                    field_info,
+                    target_root,
+                    blocking,
+                );
+            }
+            ExprKind::StructLit { fields, .. } => {
+                for field in fields {
+                    self.validate_randomize_constraint_dependencies(
+                        ty,
+                        &field.value,
+                        field_info,
+                        target_root,
+                        blocking,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Emit one random-field assignment honouring `[range(...)]` and
     /// `[dist {...}]` attributes. Falls back to a uniform sample over the
     /// declared type's value range.
@@ -5986,6 +6208,7 @@ impl Emitter {
         ty: &str,
         target: &Expr,
         with_body: &[Expr],
+        blocking: bool,
         depth: usize,
     ) {
         // Expand relation calls into their bodies up-front so the
@@ -6008,13 +6231,16 @@ impl Emitter {
         // source field type.
         let field_info: std::collections::HashMap<String, TxnFieldInfo> =
             fields.iter().map(|f| (f.name.clone(), f.clone())).collect();
+        let target_root = randomize_target_ident(target);
         let mut dist_directives: std::collections::HashMap<String, Vec<DistEntry>> =
             std::collections::HashMap::new();
         let mut hard_constraints: Vec<&Expr> = Vec::new();
         for c in with_body {
             match &*c.kind {
                 ExprKind::DistDirective { target, entries } => {
-                    if let Some(field) = randomize_target_field_name(target, &field_info) {
+                    if let Some(field) =
+                        randomize_target_field_name(target, &field_info, target_root)
+                    {
                         dist_directives.insert(field, entries.clone());
                     } else {
                         self.errors.push(format!(
@@ -6034,9 +6260,23 @@ impl Emitter {
             }
             hard_constraints.push(c);
         }
+        for c in &hard_constraints {
+            self.validate_randomize_constraint_dependencies(
+                ty,
+                c,
+                &field_info,
+                target_root,
+                blocking,
+            );
+        }
 
         self.pad(depth);
-        writeln!(self.out, "{{   // randomize(t) with — Z3 solver block").ok();
+        writeln!(
+            self.out,
+            "{{   // {} randomize(t) with — immediate Z3 solver block",
+            if blocking { "blocking" } else { "queued" }
+        )
+        .ok();
 
         // Context + solver. We use `z3::solver` (not `optimize`) so UNSAT
         // is reported faithfully — `optimize` can return a "best partial"
@@ -7344,7 +7584,7 @@ impl Emitter {
                 }
             }
             StmtKind::Randomize {
-                blocking: _,
+                blocking,
                 target,
                 with_body,
             } => {
@@ -7388,7 +7628,7 @@ impl Emitter {
                     self.emit_randomize_trace_event(&ty, target, depth);
                 } else {
                     // Constraint-solving path via Z3.
-                    self.emit_constraint_solver_block(&ty, target, &combined, depth);
+                    self.emit_constraint_solver_block(&ty, target, &combined, *blocking, depth);
                 }
             }
             other => {
