@@ -2968,6 +2968,16 @@ impl Parser {
         }
     }
 
+    /// Reserved width-method names that take a generic `<N>` width arg
+    /// followed by `()` parens. Ported from arch-com's `is_method_name`
+    /// (src/parser.rs:5757). When the parser sees `<recv>.<name><W>()`
+    /// for one of these names, it lowers to a Call with the width as
+    /// the first arg; codegen dispatches on the method name and emits
+    /// the appropriate narrow/extend C++.
+    fn is_width_method_static(name: &str) -> bool {
+        matches!(name, "trunc" | "zext" | "sext" | "resize")
+    }
+
     fn parse_postfix(&mut self) -> Result<Expr, CompileError> {
         let mut e = self.parse_primary()?;
         loop {
@@ -2976,7 +2986,34 @@ impl Parser {
                     self.advance();
                     let name = self.expect_field_name()?;
                     let span = e.span.merge(name.span);
-                    e = Expr::new(ExprKind::Field { target: e, name }, span);
+                    e = Expr::new(ExprKind::Field { target: e, name: name.clone() }, span);
+                    // Width-method generic call: `.trunc<N>()`, `.zext<N>()`,
+                    // `.sext<N>()`, `.resize<N>()`. Mirrors arch-com's
+                    // surface (src/parser.rs:3368 over there). The `<...>`
+                    // type-arg phase reuses the `no_angle` flag so `>` doesn't
+                    // get mis-parsed as a comparison. Emitted as
+                    // `Call { callee: Field{...}, args: [width_expr] }` — the
+                    // codegen dispatches on the method name pattern and
+                    // emits the corresponding C++ narrow/extend.
+                    if Self::is_width_method_static(&name.name) && self.check(TokenKind::Lt) {
+                        let lt_span = self.advance().unwrap().span;
+                        let prev = self.no_angle;
+                        self.no_angle = true;
+                        let width_expr = self.parse_expr()?;
+                        self.no_angle = prev;
+                        self.expect_close_angle()?;
+                        self.expect(TokenKind::LParen)?;
+                        let close = self.expect(TokenKind::RParen)?.span;
+                        let span = e.span.merge(close);
+                        let _ = lt_span;
+                        e = Expr::new(
+                            ExprKind::Call {
+                                callee: e,
+                                args: vec![CallArg::Expr(width_expr)],
+                            },
+                            span,
+                        );
+                    }
                 }
                 Some(TokenKind::LParen) => {
                     // Only treat `(...)` as a function-call postfix when the

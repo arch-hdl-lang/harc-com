@@ -1,0 +1,87 @@
+// Width-method intrinsics — `.trunc<N>()`, `.zext<N>()`, `.sext<N>()`,
+// `.resize<N>()`. Ports arch-com's bit-vector resize family
+// (arch-com src/sim_codegen/mod.rs:2688). Each method takes one
+// compile-time constant width arg; codegen lowers to the appropriate
+// C++ mask / cast / shift-fill.
+//
+// Why we need these even though `as uint<N>` looks like a narrowing
+// cast: today HARC's `as uint<N>` is a type relabel at the C++ level
+// — both source and destination lower to `int64_t`, so the cast
+// itself doesn't truncate. `.trunc<N>()` does the actual mask. Symmetric
+// `.zext<N>()` / `.sext<N>()` cover the widening directions; `.resize<N>()`
+// is direction-agnostic for parameterized code.
+//
+// Wrong-direction guards: `.trunc<N>()` errors when N ≥ source width
+// (it would widen, not narrow); `.zext<N>()` and `.sext<N>()` error
+// when N < source width (they would narrow). The source width is
+// known when the receiver is a typed `let` (`let v : uint<W> = ...`)
+// or an explicit `as uint<W>` / `as sint<W>` cast.
+
+testbench WidthMethodsTb
+    dut : Top
+end testbench WidthMethodsTb
+
+impl WidthMethodsTest for WidthMethodsTb
+    run
+        // ── trunc: narrowing ────────────────────────────────────────
+        let s64 : uint<64> = 0x123456789ABCDEF0
+        let t32 = s64.trunc<32>()
+        let t16 = s64.trunc<16>()
+        let t8  = s64.trunc<8>()
+        assert t32 == 0x9ABCDEF0
+            else fail("trunc<32>: got 0x${t32:08x}")
+        assert t16 == 0xDEF0
+            else fail("trunc<16>: got 0x${t16:04x}")
+        assert t8 == 0xF0
+            else fail("trunc<8>:  got 0x${t8:02x}")
+
+        // ── zext: zero-extension ────────────────────────────────────
+        let v8 : uint<8> = 0xAB
+        let z16 = v8.zext<16>()
+        let z32 = v8.zext<32>()
+        assert z16 == 0x00AB
+            else fail("zext<16>: got 0x${z16:04x}")
+        assert z32 == 0x000000AB
+            else fail("zext<32>: got 0x${z32:08x}")
+
+        // ── sext: sign-extension ────────────────────────────────────
+        let s8 : uint<8> = 0xFF              // MSB set → sign-extends to all-ones
+        let se16 = s8.sext<16>()
+        let se32 = s8.sext<32>()
+        assert se16 == 0xFFFF
+            else fail("sext<16> of 0xFF: got 0x${se16:04x}")
+        assert se32 == 0xFFFFFFFF
+            else fail("sext<32> of 0xFF: got 0x${se32:08x}")
+
+        // Positive value: MSB clear → no extension change.
+        let p8 : uint<8> = 0x7F
+        let pe16 = p8.sext<16>()
+        let pe32 = p8.sext<32>()
+        assert pe16 == 0x007F
+            else fail("sext<16> of 0x7F: got 0x${pe16:04x}")
+        assert pe32 == 0x0000007F
+            else fail("sext<32> of 0x7F: got 0x${pe32:08x}")
+
+        // ── resize: direction-agnostic ──────────────────────────────
+        let wide  : uint<32> = 0xDEADBEEF
+        let r16 = wide.resize<16>()          // narrowing
+        let r32 = wide.resize<32>()          // same width — plain cast
+        assert r16 == 0xBEEF
+            else fail("resize<16> narrow: got 0x${r16:04x}")
+        assert r32 == 0xDEADBEEF
+            else fail("resize<32> same: got 0x${r32:08x}")
+
+        // Anonymous source (cast as the receiver) — width inferred
+        // from the explicit cast.
+        let big = (0xDEADBEEFCAFE as uint<48>).trunc<32>()
+        assert big == 0xBEEFCAFE
+            else fail("anon-cast trunc<32>: got 0x${big:08x}")
+
+        // Chained width methods — output of one feeds the next.
+        let chained = (s8.sext<16>()).trunc<8>()
+        assert chained == 0xFF
+            else fail("chained sext<16>.trunc<8>: got 0x${chained:02x}")
+
+        log(info, "PASS: trunc/zext/sext/resize all match the software model")
+    end run
+end impl WidthMethodsTest
