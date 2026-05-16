@@ -6740,10 +6740,82 @@ impl Emitter {
         }
 
         let cache_tag = format!("_div_cache_{}", target.span.start);
-        let free_fields: Vec<&TxnFieldInfo> = fields
+        let mut free_fields: Vec<&TxnFieldInfo> = fields
             .iter()
             .filter(|f| !f.non_random && !pinned.contains(&f.name))
             .collect();
+        let free_field_names: std::collections::HashSet<String> =
+            free_fields.iter().map(|f| f.name.clone()).collect();
+        if !solve_order_directives.is_empty() {
+            let mut before: std::collections::HashMap<String, std::collections::HashSet<String>> =
+                std::collections::HashMap::new();
+            let mut indegree: std::collections::HashMap<String, usize> = free_fields
+                .iter()
+                .map(|f| (f.name.clone(), 0usize))
+                .collect();
+            for (kind, ordered_fields) in &solve_order_directives {
+                for i in 0..ordered_fields.len() {
+                    for j in (i + 1)..ordered_fields.len() {
+                        let (src, dst) = match kind {
+                            SolveKind::Before => (&ordered_fields[i], &ordered_fields[j]),
+                            SolveKind::After => (&ordered_fields[j], &ordered_fields[i]),
+                        };
+                        if !free_field_names.contains(src) || !free_field_names.contains(dst) {
+                            continue;
+                        }
+                        let entry = before.entry(src.clone()).or_default();
+                        if entry.insert(dst.clone()) {
+                            *indegree.entry(dst.clone()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+
+            let original_order: Vec<String> = free_fields.iter().map(|f| f.name.clone()).collect();
+            let mut ordered_names = Vec::new();
+            let mut ready: Vec<String> = original_order
+                .iter()
+                .filter(|name| indegree.get(*name).copied().unwrap_or(0) == 0)
+                .cloned()
+                .collect();
+            while let Some(name) = ready.first().cloned() {
+                ready.remove(0);
+                ordered_names.push(name.clone());
+                if let Some(nexts) = before.get(&name) {
+                    for candidate in &original_order {
+                        if !nexts.contains(candidate) {
+                            continue;
+                        }
+                        if let Some(n) = indegree.get_mut(candidate) {
+                            *n = n.saturating_sub(1);
+                            if *n == 0 {
+                                ready.push(candidate.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            if ordered_names.len() != free_fields.len() {
+                self.errors.push(format!(
+                    "randomize({ty}) solve-order hints form a cycle among free fields"
+                ));
+            } else {
+                let rank: std::collections::HashMap<String, usize> = ordered_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| (name.clone(), i))
+                    .collect();
+                free_fields.sort_by_key(|f| rank.get(&f.name).copied().unwrap_or(usize::MAX));
+                self.pad(depth + 1);
+                writeln!(
+                    self.out,
+                    "// solve-order sampling order: {}",
+                    ordered_names.join(", ")
+                )
+                .ok();
+            }
+        }
         let unique_fields: std::collections::HashSet<String> = free_fields
             .iter()
             .filter(|f| field_attr_unique(f) && !constrained_fields.contains(&f.name))
