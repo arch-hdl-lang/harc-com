@@ -1,0 +1,214 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_secure_read_write_bus_0005`.
+//
+// DUT: secure_read_write_bus_interface (key=0xAA, 8-bit addr+data).
+//   posedge i_capture_pulse OR negedge i_reset_bar drives a flop:
+//     - reset_bar==0           → o_data_out=0, o_error=0
+//     - key_match && r/w==1    → o_data_out <= mem[i_addr], o_error=0
+//     - key_match && r/w==0    → mem[i_addr] <= i_data_in, o_data_out=0
+//     - !key_match             → o_data_out=0, o_error=1
+//
+// Strategy: drive i_capture_pulse as an explicit posedge stimulus
+// (low → high across a `wait 1 cycle`). Exercise:
+//   - reset asserted / released
+//   - good-key write then read-back at low, mid, high addresses
+//   - bad-key write attempt (error raised, memory NOT updated)
+//   - bad-key read attempt (error raised, data=0)
+//   - alternating good/bad key sequences
+//   - mid-flow reset, then resume
+//   - rapid write/read flip-flopping
+//   - boundary addresses 0x00 and 0xFF
+
+testbench SecureRWTb
+    dut : secure_read_write_bus_interface_top
+end testbench SecureRWTb
+
+impl SecureRWTest for SecureRWTb
+    run
+        log(info, "secure_read_write_bus_interface: key-gated R/W coverage walk")
+
+        // ── Reset ────────────────────────────────────────────────
+        dut.i_reset_bar = 0
+        dut.i_capture_pulse = 0
+        dut.i_addr = 0
+        dut.i_data_in = 0
+        dut.i_key_in = 0
+        dut.i_read_write_enable = 0
+        wait 2 cycles
+        assert dut.o_data_out == 0
+            else fail("post-reset: o_data_out=0x${dut.o_data_out:02x}, expected 0")
+        assert dut.o_error == 0
+            else fail("post-reset: o_error=${dut.o_error}, expected 0")
+        dut.i_reset_bar = 1
+        wait 1 cycle
+
+        // ── Authorized write @ 0x00, data=0xC3 ──────────────────
+        dut.i_addr = 0x00
+        dut.i_data_in = 0xC3
+        dut.i_key_in = 0xAA
+        dut.i_read_write_enable = 0
+        dut.i_capture_pulse = 0
+        wait 1 cycle
+        dut.i_capture_pulse = 1
+        wait 1 cycle
+        assert dut.o_error == 0
+            else fail("authorized write @0x00: o_error=${dut.o_error}, expected 0")
+        assert dut.o_data_out == 0
+            else fail("authorized write @0x00: o_data_out=0x${dut.o_data_out:02x}, expected 0")
+        dut.i_capture_pulse = 0
+        wait 1 cycle
+
+        // ── Authorized read-back @ 0x00 → 0xC3 ──────────────────
+        dut.i_read_write_enable = 1
+        dut.i_capture_pulse = 1
+        wait 1 cycle
+        assert dut.o_error == 0
+            else fail("authorized read @0x00: o_error=${dut.o_error}")
+        assert dut.o_data_out == 0xC3
+            else fail("read-back @0x00: o_data_out=0x${dut.o_data_out:02x}, expected 0xC3")
+        dut.i_capture_pulse = 0
+        wait 1 cycle
+
+        // ── Authorized write @ 0xFF (upper boundary) ────────────
+        dut.i_addr = 0xFF
+        dut.i_data_in = 0x5A
+        dut.i_key_in = 0xAA
+        dut.i_read_write_enable = 0
+        dut.i_capture_pulse = 1
+        wait 1 cycle
+        dut.i_capture_pulse = 0
+        wait 1 cycle
+
+        // Authorized read-back @ 0xFF
+        dut.i_read_write_enable = 1
+        dut.i_capture_pulse = 1
+        wait 1 cycle
+        assert dut.o_data_out == 0x5A
+            else fail("read-back @0xFF: o_data_out=0x${dut.o_data_out:02x}, expected 0x5A")
+        assert dut.o_error == 0
+            else fail("read @0xFF: o_error=${dut.o_error}")
+        dut.i_capture_pulse = 0
+        wait 1 cycle
+
+        // ── Unauthorized write attempt: key=0x55 → error, mem unchanged ─
+        dut.i_addr = 0x00
+        dut.i_data_in = 0xFF
+        dut.i_key_in = 0x55
+        dut.i_read_write_enable = 0
+        dut.i_capture_pulse = 1
+        wait 1 cycle
+        assert dut.o_error == 1
+            else fail("unauthorized write: o_error=${dut.o_error}, expected 1")
+        assert dut.o_data_out == 0
+            else fail("unauthorized write: o_data_out=0x${dut.o_data_out:02x}, expected 0")
+        dut.i_capture_pulse = 0
+        wait 1 cycle
+
+        // Read @0x00 with good key — should still be 0xC3 (write was blocked)
+        dut.i_key_in = 0xAA
+        dut.i_read_write_enable = 1
+        dut.i_capture_pulse = 1
+        wait 1 cycle
+        assert dut.o_data_out == 0xC3
+            else fail("post-unauth-write read @0x00: got 0x${dut.o_data_out:02x}, expected 0xC3")
+        assert dut.o_error == 0
+            else fail("post-unauth-write read: o_error=${dut.o_error}")
+        dut.i_capture_pulse = 0
+        wait 1 cycle
+
+        // ── Unauthorized read attempt: error + data=0 ───────────
+        dut.i_key_in = 0x01
+        dut.i_read_write_enable = 1
+        dut.i_capture_pulse = 1
+        wait 1 cycle
+        assert dut.o_error == 1
+            else fail("unauthorized read: o_error=${dut.o_error}, expected 1")
+        assert dut.o_data_out == 0
+            else fail("unauthorized read: o_data_out=0x${dut.o_data_out:02x}, expected 0")
+        dut.i_capture_pulse = 0
+        wait 1 cycle
+
+        // ── Multiple authorized writes + reads with varied data ──
+        for k in 0 .. 16
+            let av : uint<8> = ((k * 17 + 3) & 0xFF) as uint<8>
+            let dv : uint<8> = ((k * 53 + 7) & 0xFF) as uint<8>
+            dut.i_addr = av
+            dut.i_data_in = dv
+            dut.i_key_in = 0xAA
+            dut.i_read_write_enable = 0
+            dut.i_capture_pulse = 1
+            wait 1 cycle
+            dut.i_capture_pulse = 0
+            wait 1 cycle
+
+            // Read back
+            dut.i_read_write_enable = 1
+            dut.i_capture_pulse = 1
+            wait 1 cycle
+            assert dut.o_data_out == dv
+                else fail("rw k=${k} addr=0x${av:02x}: got 0x${dut.o_data_out:02x}, exp 0x${dv:02x}")
+            assert dut.o_error == 0
+                else fail("rw k=${k}: o_error=${dut.o_error}, expected 0")
+            dut.i_capture_pulse = 0
+            wait 1 cycle
+        end for
+
+        // ── Alternating good/bad keys to toggle key_match & error ─
+        for k in 0 .. 8
+            // Bad key
+            dut.i_key_in = (0xAA ^ ((1 as uint<8>) << k)).trunc<8>()
+            dut.i_read_write_enable = 1
+            dut.i_addr = k as uint<8>
+            dut.i_capture_pulse = 1
+            wait 1 cycle
+            assert dut.o_error == 1
+                else fail("alt-bad k=${k}: o_error=${dut.o_error}, expected 1")
+            dut.i_capture_pulse = 0
+            wait 1 cycle
+
+            // Good key
+            dut.i_key_in = 0xAA
+            dut.i_capture_pulse = 1
+            wait 1 cycle
+            assert dut.o_error == 0
+                else fail("alt-good k=${k}: o_error=${dut.o_error}, expected 0")
+            dut.i_capture_pulse = 0
+            wait 1 cycle
+        end for
+
+        // ── Mid-flow async reset ─────────────────────────────────
+        dut.i_key_in = 0xAA
+        dut.i_addr = 0x42
+        dut.i_data_in = 0x99
+        dut.i_read_write_enable = 0
+        dut.i_capture_pulse = 1
+        wait 1 cycle
+        dut.i_reset_bar = 0
+        wait 1 cycle
+        assert dut.o_data_out == 0
+            else fail("mid-flow reset: o_data_out=0x${dut.o_data_out:02x}, expected 0")
+        assert dut.o_error == 0
+            else fail("mid-flow reset: o_error=${dut.o_error}, expected 0")
+        dut.i_reset_bar = 1
+        dut.i_capture_pulse = 0
+        wait 1 cycle
+
+        // ── Post-reset resume: write + read at random addrs ─────
+        dut.i_addr = 0x42
+        dut.i_data_in = 0x37
+        dut.i_key_in = 0xAA
+        dut.i_read_write_enable = 0
+        dut.i_capture_pulse = 1
+        wait 1 cycle
+        dut.i_capture_pulse = 0
+        wait 1 cycle
+        dut.i_read_write_enable = 1
+        dut.i_capture_pulse = 1
+        wait 1 cycle
+        assert dut.o_data_out == 0x37
+            else fail("post-reset read @0x42: got 0x${dut.o_data_out:02x}, expected 0x37")
+        dut.i_capture_pulse = 0
+        wait 1 cycle
+
+        log(info, "ALL TESTS PASSED — secure_read_write_bus_interface")
+    end run
+end impl SecureRWTest

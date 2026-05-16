@@ -1,0 +1,184 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_image_stego_0014`.
+//
+// DUT: image_stego (row=2, col=2, 4 pixels, 8 bpp = 32-bit img, 16-bit data_in).
+// Pure combinational. Three always blocks:
+//   (1) parity over data_in[0..16) → error_out
+//   (2) data_in_encrypted = data_in XOR (encryption_key replicated)
+//   (3) for each pixel i, if mask[i] set, embed `bpp+1` LSBs of encrypted
+//       data; case bpp 0..3 hits encode lengths 1..4, default leaves image.
+//       embedded_pixel_count++ when bpp <= 3, else stays 0.
+//       embedding_done: 00 if mask=0; 10 if any embed happened; 11 if mask!=0
+//       but bpp>3 (no embed).
+//
+// Strategy: directed corner sweep covering
+//   - mask=0 path (embedding_done=00)
+//   - mask non-zero + bpp in {0,1,2,3}: each `case` branch + count++ true
+//   - mask non-zero + bpp in {4,5,6,7}: default + count=0 → embedding_done=11
+//   - data_in with even & odd parity to flip error_out
+
+testbench ImageStegoTb
+    dut : image_stego_top
+end testbench ImageStegoTb
+
+// Software model
+function parity32(d: uint<16>) -> uint<1>
+    let p : uint<1> = 0
+    for k in 0 .. 16
+        p = p ^ ((d >> k) & 1).trunc<1>()
+    end for
+    return p
+end function parity32
+
+function model_img(img: uint<32>, dat: uint<16>, bp: uint<3>, key: uint<8>, msk: uint<4>) -> uint<32>
+    let enc : uint<16> = dat ^ ((key as uint<16>) | ((key as uint<16>) << 8))
+    let out : uint<32> = img
+    for i in 0 .. 4
+        let mbit = ((msk >> i) & 1).trunc<1>()
+        if mbit == 1
+            let pix : uint<8> = ((img >> (i * 8)) & 0xFF).trunc<8>()
+            let new_pix : uint<8> = pix
+            if bp == 0
+                let lsb = ((enc >> i) & 1).trunc<1>()
+                new_pix = ((pix & 0xFE) | (lsb as uint<8>)).trunc<8>()
+            elsif bp == 1
+                let v = ((enc >> (2 * i)) & 0x3).trunc<8>()
+                new_pix = ((pix & 0xFC) | v).trunc<8>()
+            elsif bp == 2
+                let v = ((enc >> (3 * i)) & 0x7).trunc<8>()
+                new_pix = ((pix & 0xF8) | v).trunc<8>()
+            elsif bp == 3
+                let v = ((enc >> (4 * i)) & 0xF).trunc<8>()
+                new_pix = ((pix & 0xF0) | v).trunc<8>()
+            else
+                new_pix = pix
+            end if
+            // Clear current byte and place new_pix
+            let clear_mask : uint<32> = ~((0xFF as uint<32>) << (i * 8))
+            out = (out & clear_mask) | ((new_pix as uint<32>) << (i * 8))
+        end if
+    end for
+    return out
+end function model_img
+
+function popcount4(m: uint<4>) -> uint<3>
+    let c : uint<3> = 0
+    for k in 0 .. 4
+        c = c + ((m >> k) & 1).trunc<3>()
+    end for
+    return c
+end function popcount4
+
+impl ImageStegoTest for ImageStegoTb
+    run
+        log(info, "image_stego: directed mask × bpp × parity sweep")
+
+        // ── Case 1: mask=0 → embedding_done=00, img_out=img_in, count=0 ─
+        dut.img_in = 0xDEADBEEF
+        dut.data_in = 0x1234
+        dut.bpp = 0
+        dut.encryption_key = 0xAA
+        dut.mask = 0
+        wait 1 cycle
+        assert dut.img_out == 0xDEADBEEF
+            else fail("mask=0: img_out=0x${dut.img_out:08x}, expected 0xDEADBEEF")
+        assert dut.embedding_done == 0
+            else fail("mask=0: embedding_done=${dut.embedding_done}, expected 0")
+        assert dut.embedded_pixel_count == 0
+            else fail("mask=0: count=${dut.embedded_pixel_count}, expected 0")
+        let par_exp = parity32(0x1234 as uint<16>)
+        assert dut.error_out == par_exp
+            else fail("mask=0 parity: error_out=${dut.error_out}, expected ${par_exp}")
+
+        // ── Case 2: bpp ∈ {0,1,2,3} with full mask=0xF ──────────
+        for bp in 0 .. 4
+            dut.img_in = 0xA5B4C3D2
+            dut.data_in = 0x789A
+            dut.bpp = bp as uint<3>
+            dut.encryption_key = 0x5A
+            dut.mask = 0xF
+            wait 1 cycle
+            let exp_img = model_img(0xA5B4C3D2 as uint<32>, 0x789A as uint<16>,
+                                     bp as uint<3>, 0x5A as uint<8>, 0xF as uint<4>)
+            assert dut.img_out == exp_img
+                else fail("bpp=${bp} mask=F: img_out=0x${dut.img_out:08x}, exp 0x${exp_img:08x}")
+            assert dut.embedded_pixel_count == 4
+                else fail("bpp=${bp}: count=${dut.embedded_pixel_count}, expected 4")
+            assert dut.embedding_done == 2
+                else fail("bpp=${bp}: embedding_done=${dut.embedding_done}, expected 2")
+        end for
+
+        // ── Case 3: bpp ∈ {4,5,6,7} → default branch, count stays 0,
+        //            embedding_done=11 because mask!=0 and no embed.
+        for bp in 4 .. 8
+            dut.img_in = 0x11223344
+            dut.data_in = 0x0F0F
+            dut.bpp = bp as uint<3>
+            dut.encryption_key = 0xC3
+            dut.mask = 0xF
+            wait 1 cycle
+            assert dut.img_out == 0x11223344
+                else fail("bpp=${bp}: default should leave img unchanged, got 0x${dut.img_out:08x}")
+            assert dut.embedded_pixel_count == 0
+                else fail("bpp=${bp}: count=${dut.embedded_pixel_count}, expected 0")
+            assert dut.embedding_done == 3
+                else fail("bpp=${bp}: embedding_done=${dut.embedding_done}, expected 3 (11b)")
+        end for
+
+        // ── Case 4: partial masks (every 4-bit mask combination) ─
+        for m in 1 .. 16
+            dut.img_in = 0x01234567
+            dut.data_in = 0xCAFE
+            dut.bpp = 1
+            dut.encryption_key = 0xA5
+            dut.mask = m as uint<4>
+            wait 1 cycle
+            let exp_img = model_img(0x01234567 as uint<32>, 0xCAFE as uint<16>,
+                                     1 as uint<3>, 0xA5 as uint<8>, m as uint<4>)
+            assert dut.img_out == exp_img
+                else fail("mask=0x${m:01x} bpp=1: img_out=0x${dut.img_out:08x}, exp 0x${exp_img:08x}")
+            let exp_cnt = popcount4(m as uint<4>)
+            assert dut.embedded_pixel_count == exp_cnt
+                else fail("mask=0x${m:01x}: count=${dut.embedded_pixel_count}, exp ${exp_cnt}")
+            assert dut.embedding_done == 2
+                else fail("mask=0x${m:01x}: embedding_done=${dut.embedding_done}, expected 2")
+        end for
+
+        // ── Case 5: parity flip — odd-parity data_in to assert error_out ─
+        dut.img_in = 0
+        dut.data_in = 0x0001   // single bit → parity=1
+        dut.bpp = 0
+        dut.encryption_key = 0
+        dut.mask = 0
+        wait 1 cycle
+        assert dut.error_out == 1
+            else fail("odd-parity: error_out=${dut.error_out}, expected 1")
+
+        dut.data_in = 0x0003   // two bits → parity=0
+        wait 1 cycle
+        assert dut.error_out == 0
+            else fail("even-parity: error_out=${dut.error_out}, expected 0")
+
+        // ── Case 6: varied (img, data, key) randomisation ───────
+        for k in 0 .. 16
+            let im : uint<32> = (((k * 2654435761) ^ 0x13579BDF) & 0xFFFFFFFF).trunc<32>()
+            let da : uint<16> = ((k * 0x9E37) & 0xFFFF).trunc<16>()
+            let key : uint<8> = ((k * 31 + 7) & 0xFF).trunc<8>()
+            let bp : uint<3> = (k & 3).trunc<3>()
+            let msk : uint<4> = ((k + 1) & 0xF).trunc<4>()
+            dut.img_in = im
+            dut.data_in = da
+            dut.bpp = bp
+            dut.encryption_key = key
+            dut.mask = msk
+            wait 1 cycle
+            let exp_img = model_img(im, da, bp, key, msk)
+            assert dut.img_out == exp_img
+                else fail("rand k=${k}: img_out=0x${dut.img_out:08x}, exp 0x${exp_img:08x}")
+            let par_e = parity32(da)
+            assert dut.error_out == par_e
+                else fail("rand k=${k}: error_out=${dut.error_out}, exp ${par_e}")
+        end for
+
+        log(info, "ALL TESTS PASSED — image_stego")
+    end run
+end impl ImageStegoTest
