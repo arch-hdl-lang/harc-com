@@ -1641,6 +1641,74 @@ end test DistSolverTest"#,
 }
 
 #[test]
+fn auto_coverage_goals_feed_solver_preferences() {
+    let parsed = parse_source(
+        r#"enum Op { Read, Write }
+
+transaction T
+    op : Op
+    len : uint<8> with [range(1, 4)]
+end transaction T
+
+test AutoCovPrefTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test AutoCovPrefTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("static bool _auto_cov_")
+            && cpp.contains("_op[2]")
+            && cpp.contains("_len[2]")
+            && cpp.contains("static bool _auto_cross_")
+            && cpp.contains("__len[2][2]")
+            && cpp.contains("bool _auto_cov_pref_")
+            && cpp.contains("_pref_")
+            && cpp.contains(" = _auto_vals_")
+            && cpp.contains("{0ULL, 1ULL}")
+            && cpp.contains("{1ULL, 4ULL}")
+            && cpp.contains("_auto_cov_")
+            && cpp.contains(" = true;")
+            && cpp.contains("_auto_cross_"),
+        "auto coverage goals and pairwise crosses should feed solver preferences and hit tracking; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn constrained_field_skips_auto_coverage_preferences() {
+    let parsed = parse_source(
+        r#"enum Op { Read, Write }
+
+transaction T
+    op : Op
+    len : uint<8> with [range(1, 4)]
+end transaction T
+
+test AutoCovConstrainedTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t) with
+            t.op == Read
+        end randomize
+    end run
+end test AutoCovConstrainedTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        (!cpp.contains("_auto_cov_") || !cpp.contains("_op["))
+            && cpp.contains("_len[2]")
+            && !cpp.contains("_auto_cross_"),
+        "explicitly constrained fields should not receive auto coverage preferences or crosses; got:\n{cpp}",
+    );
+}
+
+#[test]
 fn unique_field_randomize_uses_recycling_solver_history() {
     let parsed = parse_source(
         r#"transaction T
