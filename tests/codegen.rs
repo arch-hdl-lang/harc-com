@@ -1603,6 +1603,73 @@ end test EnumKeepTest"#,
     );
 }
 
+#[test]
+fn signed_keep_constraints_use_signed_solver_ops_and_domain() {
+    let parsed = parse_source(
+        r#"transaction T
+    delta : sint<12>
+    keep delta >= -8
+    keep delta < 8
+end transaction T
+
+test SignedKeepTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test SignedKeepTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+
+    assert!(
+        cpp.contains("_s.add(_z_delta >= _ctx.bv_val((uint64_t)(-(1LL << 11)), 64));")
+            && cpp.contains("_s.add(_z_delta <= _ctx.bv_val((uint64_t)((1LL << 11) - 1), 64));"),
+        "sint<12> should get a signed 64-bit domain projection; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("_z_delta >= -_ctx.bv_val((uint64_t)8, 64)")
+            && cpp.contains("_z_delta < _ctx.bv_val((uint64_t)8, 64)"),
+        "signed comparisons should use Z3's signed infix operators, not z3::uge/ult; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("int64_t _val_delta = (int64_t)_m.eval(_z_delta).get_numeral_uint64();"),
+        "signed fields should materialize model values as int64_t; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn enum_fields_get_solver_domain_constraints() {
+    let parsed = parse_source(
+        r#"enum Color { RED, GREEN, BLUE }
+
+transaction T
+    color : Color
+    keep color != RED
+end transaction T
+
+test EnumDomainTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test EnumDomainTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+
+    assert!(
+        cpp.contains("_s.add(z3::ule(_z_color, _ctx.bv_val((uint64_t)2, 64)));"),
+        "3-variant enum should constrain solver values to 0..2; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("_z_color != _ctx.bv_val((uint64_t)0, 64)"),
+        "enum variant constraints should still resolve variant indexes; got:\n{cpp}"
+    );
+}
+
 /// `randomize(t) with R(t)` inlines `R`'s body into the Z3 solver
 /// block (spec §4.2). Block-form relations contribute one constraint
 /// per body expression; the formal parameter substitutes for the
