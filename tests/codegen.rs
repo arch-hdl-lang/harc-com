@@ -1726,8 +1726,8 @@ end test UniqueConstrainedTest"#,
 fn randomize_accepts_solve_order_hints_as_metadata() {
     let parsed = parse_source(
         r#"transaction T
-    addr : uint<16>
     len : uint<8>
+    addr : uint<16>
 end transaction T
 
 test SolveOrderTest
@@ -1747,8 +1747,11 @@ end test SolveOrderTest"#,
     assert!(
         cpp.contains("// solve_before(addr, len) accepted as solver scheduling metadata")
             && cpp.contains("// solve_after(len, addr) accepted as solver scheduling metadata")
+            && cpp.contains("// solve-order sampling order: addr, len")
+            && cpp.find("_addr = harc_rng_uint(16)").unwrap()
+                < cpp.find("_len = harc_rng_uint(8)").unwrap()
             && cpp.contains("_s.add(z3::ugt(_z_len, _ctx.bv_val((uint64_t)0, 64)));"),
-        "expected solve-order hints to be metadata while ordinary constraints still lower; got:\n{cpp}",
+        "expected solve-order hints to order sampling metadata while ordinary constraints still lower; got:\n{cpp}",
     );
 }
 
@@ -1777,6 +1780,34 @@ end test BadSolveOrderTest"#,
             && err.0.contains("arguments must be fields")
             && err.0.contains("transaction `T`"),
         "expected clear solve-order target diagnostic; got: {}",
+        err.0,
+    );
+}
+
+#[test]
+fn randomize_rejects_cyclic_solve_order_hints() {
+    let parsed = parse_source(
+        r#"transaction T
+    addr : uint<16>
+    len : uint<8>
+end transaction T
+
+test CyclicSolveOrderTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t) with
+            solve_before(t.addr, t.len)
+            solve_before(t.len, t.addr)
+        end randomize
+    end run
+end test CyclicSolveOrderTest"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&parsed).unwrap_err();
+    assert!(
+        err.0.contains("solve-order hints form a cycle"),
+        "expected solve-order cycle diagnostic; got: {}",
         err.0,
     );
 }
