@@ -6512,6 +6512,7 @@ impl Emitter {
         let target_root = randomize_target_ident(target);
         let mut dist_directives: std::collections::HashMap<String, Vec<DistEntry>> =
             std::collections::HashMap::new();
+        let mut solve_order_directives: Vec<(SolveKind, Vec<String>)> = Vec::new();
         let mut hard_constraints: Vec<&Expr> = Vec::new();
         for c in with_body {
             match &*c.kind {
@@ -6543,11 +6544,32 @@ impl Emitter {
                     }
                     continue;
                 }
-                ExprKind::Solve { kind, .. } => {
-                    self.errors.push(format!(
-                        "randomize({ty}) with `{}` is parsed but not supported yet; solve-order hints need typed solver scheduling semantics",
-                        solve_kind_name(*kind),
-                    ));
+                ExprKind::Solve { kind, args } => {
+                    if args.len() < 2 {
+                        self.errors.push(format!(
+                            "randomize({ty}) with `{}` expects at least two target fields",
+                            solve_kind_name(*kind),
+                        ));
+                        continue;
+                    }
+                    let mut fields = Vec::new();
+                    let mut valid = true;
+                    for arg in args {
+                        if let Some(field) =
+                            randomize_target_field_name(arg, &field_info, target_root)
+                        {
+                            fields.push(field);
+                        } else {
+                            self.errors.push(format!(
+                                "randomize({ty}) with `{}`: arguments must be fields of transaction `{ty}`",
+                                solve_kind_name(*kind),
+                            ));
+                            valid = false;
+                        }
+                    }
+                    if valid {
+                        solve_order_directives.push((*kind, fields));
+                    }
                     continue;
                 }
                 _ => {}
@@ -6664,6 +6686,16 @@ impl Emitter {
             write!(self.out, "_s.add(").ok();
             self.emit_constraint_expr(c, &field_info, target_root, blocking);
             writeln!(self.out, ");").ok();
+        }
+        for (kind, fields) in &solve_order_directives {
+            self.pad(depth + 1);
+            writeln!(
+                self.out,
+                "// {}({}) accepted as solver scheduling metadata",
+                solve_kind_name(*kind),
+                fields.join(", ")
+            )
+            .ok();
         }
 
         // Detect fields the user has equality-pinned (e.g. `t.addr == 24`).

@@ -79,6 +79,12 @@ constraints. The implementation may use rejection sampling, randomized solver
 objectives, or a hybrid strategy, but the chosen behavior must be documented
 and stable under a seed.
 
+`solve_before` and `solve_after` are solver scheduling metadata, not boolean
+constraints. The v1 code generator should validate that their arguments are
+fields of the randomize target and carry the metadata through without changing
+the hard solution space; distribution effects can be added in the typed solver
+backend once sampling order is explicit.
+
 `[unique]` is also a randomization policy, not a hard field invariant. It
 should steer fields that remain unconstrained after `keep`, relation expansion,
 and `randomize ... with` constraints; explicit user constraints and direct
