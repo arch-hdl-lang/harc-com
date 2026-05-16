@@ -421,18 +421,14 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                     })
                     .collect();
                 txn_fields.insert(t.name.name.clone(), fields);
-                // Collect transaction-level `keep` constraints. v0
-                // ignores keeps nested inside `when subtype { ... }`
-                // — those need discriminated-subtype lowering that
-                // doesn't exist yet (see TODO in spec §3.3 / §4).
-                let keeps: Vec<Expr> = t
-                    .body
-                    .iter()
-                    .filter_map(|it| match it {
-                        TxnBodyItem::Keep(k) => Some(k.expr.clone()),
-                        _ => None,
-                    })
-                    .collect();
+                // Collect transaction-level `keep` constraints. Keeps nested
+                // inside `when` subtype bodies lower as guarded implications:
+                // `when G { keep K }` contributes `(!G) || K`, so the
+                // constraint participates only when the discriminator selects
+                // that subtype. Full tagged-ADT solver modeling remains a
+                // future backend step; this keeps the current flat solver path
+                // semantically honest for keeps over already-visible fields.
+                let keeps = collect_txn_keeps(&t.body);
                 if !keeps.is_empty() {
                     txn_keeps.insert(t.name.name.clone(), keeps);
                 }
@@ -8863,7 +8859,7 @@ pub fn uses_constraint_solver(file: &SourceFile) -> bool {
         .iter()
         .filter_map(|it| match it {
             Item::Transaction(t) => {
-                let has_keep = t.body.iter().any(|b| matches!(b, TxnBodyItem::Keep(_)));
+                let has_keep = txn_body_has_keep(&t.body);
                 if has_keep {
                     Some(t.name.name.as_str())
                 } else {
@@ -10901,6 +10897,60 @@ fn expr_source_str(e: &Expr) -> String {
     let mut buf = String::new();
     crate::pretty::print_expr(&mut buf, e);
     buf
+}
+
+fn txn_body_has_keep(items: &[TxnBodyItem]) -> bool {
+    items.iter().any(|item| match item {
+        TxnBodyItem::Keep(_) => true,
+        TxnBodyItem::When(w) => txn_body_has_keep(&w.items),
+        TxnBodyItem::Field(_) => false,
+    })
+}
+
+fn collect_txn_keeps(items: &[TxnBodyItem]) -> Vec<Expr> {
+    let mut out = Vec::new();
+    collect_txn_keeps_with_guard(items, None, &mut out);
+    out
+}
+
+fn collect_txn_keeps_with_guard(items: &[TxnBodyItem], guard: Option<Expr>, out: &mut Vec<Expr>) {
+    for item in items {
+        match item {
+            TxnBodyItem::Keep(k) => {
+                let expr = match &guard {
+                    Some(g) => guarded_keep_expr(g.clone(), k.expr.clone(), k.span),
+                    None => k.expr.clone(),
+                };
+                out.push(expr);
+            }
+            TxnBodyItem::When(w) => {
+                let next_guard = match &guard {
+                    Some(g) => and_join(&[g.clone(), w.discriminant.clone()], w.span),
+                    None => w.discriminant.clone(),
+                };
+                collect_txn_keeps_with_guard(&w.items, Some(next_guard), out);
+            }
+            TxnBodyItem::Field(_) => {}
+        }
+    }
+}
+
+fn guarded_keep_expr(guard: Expr, keep: Expr, span: Span) -> Expr {
+    let not_guard = Expr::new(
+        ExprKind::Unary {
+            op: UnaryOp::Not,
+            expr: Expr::new(ExprKind::Paren(guard), span),
+        },
+        span,
+    );
+    Expr::new(
+        ExprKind::Binary {
+            op: BinaryOp::OrOr,
+            lhs: not_guard,
+            rhs: keep,
+        },
+        span,
+    )
 }
 
 /// Combine a list of constraint expressions into one
