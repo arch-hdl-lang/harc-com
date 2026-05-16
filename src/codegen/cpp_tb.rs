@@ -4151,29 +4151,136 @@ impl Emitter {
         writeln!(self.out, "").ok();
     }
 
-    /// At a `let cov : G` site, emit a `_checkers` closure that runs the
-    /// covergroup's sample logic each cycle. The closure has `[&]` capture
-    /// so `dut` and the cov instance are both visible.
+    /// At a `let cov : G` site, register the covergroup's sample logic.
+    /// Clock/no-trigger covergroups use the legacy per-cycle `_checkers`
+    /// path; hook-triggered covergroups subscribe to the existing
+    /// `<Type>_<method>_pre/post` hook vectors so sampling occurs at the
+    /// semantic hook invocation point rather than every cycle.
     fn emit_covergroup_sample_registration(
         &mut self,
         g: &CovergroupDecl,
         instance: &str,
         depth: usize,
     ) {
-        if let Some(CoverTrigger::Hook { .. }) = &g.trigger {
-            self.errors.push(format!(
-                "covergroup `{}` uses a hook trigger; hook-triggered covergroup sampling is parsed but not lowered yet",
-                g.name.name
-            ));
-            return;
+        match &g.trigger {
+            Some(CoverTrigger::Hook { call, side }) => {
+                self.emit_covergroup_hook_sample_registration(g, instance, call, *side, depth);
+            }
+            _ => self.emit_covergroup_clock_sample_registration(g, instance, depth),
         }
+    }
+
+    fn emit_covergroup_clock_sample_registration(
+        &mut self,
+        g: &CovergroupDecl,
+        instance: &str,
+        depth: usize,
+    ) {
         let binned_points = covergroup_binned_points(g);
         let auto_crosses = covergroup_auto_crosses(g);
         self.pad(depth);
         writeln!(self.out, "_checkers.push_back([&]() {{").ok();
+        self.emit_covergroup_sample_body(g, instance, &binned_points, &auto_crosses, depth + 1);
+        self.pad(depth);
+        writeln!(self.out, "}});").ok();
+    }
+
+    fn emit_covergroup_hook_sample_registration(
+        &mut self,
+        g: &CovergroupDecl,
+        instance: &str,
+        call: &Expr,
+        side: HookSide,
+        depth: usize,
+    ) {
+        let ExprKind::Call { callee, args } = &*call.kind else {
+            self.errors.push(format!(
+                "covergroup `{}` hook trigger must be a method call",
+                g.name.name
+            ));
+            return;
+        };
+        let Some((comp_ty, method_name, params)) = self.resolve_component_hookable(callee) else {
+            self.errors.push(format!(
+                "covergroup `{}` hook trigger must resolve to a `hookable` on a known component type",
+                g.name.name
+            ));
+            return;
+        };
+        if args.len() != params.len() {
+            self.errors.push(format!(
+                "covergroup `{}` hook trigger `{method_name}` expects {} argument(s), got {}",
+                g.name.name,
+                params.len(),
+                args.len()
+            ));
+            return;
+        }
+        for (arg, param) in args.iter().zip(params.iter()) {
+            let CallArg::Expr(arg_expr) = arg else {
+                self.errors.push(format!(
+                    "covergroup `{}` hook trigger arguments must be identifiers",
+                    g.name.name
+                ));
+                return;
+            };
+            let ExprKind::Ident(arg_name) = &*arg_expr.kind else {
+                self.errors.push(format!(
+                    "covergroup `{}` hook trigger arguments must be identifiers",
+                    g.name.name
+                ));
+                return;
+            };
+            if arg_name.name != param.name.name || arg_name.name == "_" {
+                self.errors.push(format!(
+                    "covergroup `{}` hook trigger argument `{}` must match hook parameter `{}`",
+                    g.name.name, arg_name.name, param.name.name
+                ));
+                return;
+            }
+        }
+
+        let side_str = match side {
+            HookSide::Pre => "pre",
+            HookSide::Post => "post",
+        };
+        let param_names = cpp_param_names(&params);
+        let arg_decls: Vec<String> = params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let ty =
+                    p.ty.as_ref()
+                        .map(|t| self.c_type_for_param(t))
+                        .unwrap_or_else(|| "int64_t".to_string());
+                format!("{ty} {}", param_names[i])
+            })
+            .collect();
+        let binned_points = covergroup_binned_points(g);
+        let auto_crosses = covergroup_auto_crosses(g);
+        self.pad(depth);
+        writeln!(
+            self.out,
+            "{comp_ty}_{method_name}_{side_str}.push_back([&]({}) {{",
+            arg_decls.join(", "),
+        )
+        .ok();
+        self.emit_covergroup_sample_body(g, instance, &binned_points, &auto_crosses, depth + 1);
+        self.pad(depth);
+        writeln!(self.out, "}});").ok();
+    }
+
+    fn emit_covergroup_sample_body(
+        &mut self,
+        g: &CovergroupDecl,
+        instance: &str,
+        binned_points: &[&CoverPoint],
+        auto_crosses: &[(&CoverPoint, &CoverPoint)],
+        depth: usize,
+    ) {
         if !auto_crosses.is_empty() {
-            for p in &binned_points {
-                self.pad(depth + 1);
+            for p in binned_points {
+                self.pad(depth);
                 writeln!(
                     self.out,
                     "bool _cg_hit_{}[{}] = {{}};",
@@ -4185,14 +4292,14 @@ impl Emitter {
         }
         for it in &g.items {
             if let CoverItem::Point(p) = it {
-                self.pad(depth + 1);
+                self.pad(depth);
                 writeln!(self.out, "{{").ok();
-                self.pad(depth + 2);
+                self.pad(depth + 1);
                 write!(self.out, "uint64_t _v = (uint64_t)(").ok();
                 self.emit_expr(&p.target);
                 writeln!(self.out, ");").ok();
                 for (bin_idx, b) in p.bins.iter().enumerate() {
-                    self.pad(depth + 2);
+                    self.pad(depth + 1);
                     write!(self.out, "if (").ok();
                     self.emit_bin_membership(&b.spec);
                     if auto_crosses.is_empty() {
@@ -4206,39 +4313,37 @@ impl Emitter {
                         .ok();
                     }
                 }
-                self.pad(depth + 1);
+                self.pad(depth);
                 writeln!(self.out, "}}").ok();
             }
         }
-        for (a, b) in &auto_crosses {
-            self.pad(depth + 1);
+        for (a, b) in auto_crosses {
+            self.pad(depth);
             writeln!(
                 self.out,
                 "for (size_t _i = 0; _i < {}; ++_i) {{",
                 a.bins.len()
             )
             .ok();
-            self.pad(depth + 2);
+            self.pad(depth + 1);
             writeln!(
                 self.out,
                 "for (size_t _j = 0; _j < {}; ++_j) {{",
                 b.bins.len()
             )
             .ok();
-            self.pad(depth + 3);
+            self.pad(depth + 2);
             writeln!(
                 self.out,
                 "if (_cg_hit_{}[_i] && _cg_hit_{}[_j]) {instance}._auto_cross_{}__{}[_i][_j]++;",
                 a.name.name, b.name.name, a.name.name, b.name.name
             )
             .ok();
-            self.pad(depth + 2);
-            writeln!(self.out, "}}").ok();
             self.pad(depth + 1);
             writeln!(self.out, "}}").ok();
+            self.pad(depth);
+            writeln!(self.out, "}}").ok();
         }
-        self.pad(depth);
-        writeln!(self.out, "}});").ok();
     }
 
     /// Emit a scoreboard declaration as a C++ struct. Only the field list
