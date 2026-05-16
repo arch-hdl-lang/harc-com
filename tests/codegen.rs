@@ -1641,33 +1641,7 @@ end test DistSolverTest"#,
 }
 
 #[test]
-fn randomize_reports_unsupported_cyclic_attr() {
-    let parsed = parse_source(
-        r#"transaction T
-    ctr : uint<8> with [cyclic]
-end transaction T
-
-test CyclicTest
-    let dut : DummyDut
-    run
-        let t : T
-        randomize(t)
-    end run
-end test CyclicTest"#,
-    )
-    .unwrap();
-    let err = cpp_tb::emit(&parsed).unwrap_err();
-    assert!(
-        err.0.contains("[cyclic]")
-            && err.0.contains("T.ctr")
-            && err.0.contains("runtime state semantics"),
-        "expected explicit unsupported cyclic randomize diagnostic; got: {}",
-        err.0,
-    );
-}
-
-#[test]
-fn unique_field_randomize_uses_solver_history() {
+fn unique_field_randomize_uses_recycling_solver_history() {
     let parsed = parse_source(
         r#"transaction T
     tag : uint<8> with [unique within test]
@@ -1686,11 +1660,12 @@ end test UniqueTest"#,
     assert!(
         cpp.contains("z3::solver _s(_ctx);")
             && cpp.contains("for (auto _v : _div_cache_")
-            && cpp.contains("// [unique]")
+            && cpp.contains("// [unique] policy: no repeat until exhausted")
             && cpp.contains("_div_cache_")
+            && cpp.contains(".clear();")
             && !cpp.contains("if (_div_cache_")
             && !cpp.contains("randomize_T(&t);"),
-        "unique fields should route bare randomize through persistent solver history; got:\n{cpp}",
+        "unique fields should route bare randomize through recycling solver history; got:\n{cpp}",
     );
 }
 
@@ -1715,7 +1690,7 @@ end test UniqueOverrideTest"#,
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
         cpp.contains("_s.add(_z_tag == _ctx.bv_val((uint64_t)7, 64));")
-            && !cpp.contains("[unique] policy for unconstrained field")
+            && !cpp.contains("[unique] policy: no repeat until exhausted")
             && !cpp.contains("_div_cache_"),
         "explicit constraints on a unique field should override the unique history policy; got:\n{cpp}",
     );
@@ -1742,7 +1717,7 @@ end test UniqueConstrainedTest"#,
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
         cpp.contains("_div_cache_")
-            && !cpp.contains("[unique] policy for unconstrained field"),
+            && !cpp.contains("[unique] policy: no repeat until exhausted"),
         "constraints mentioning a unique field should suppress unique history while leaving ordinary diversity available; got:\n{cpp}",
     );
 }

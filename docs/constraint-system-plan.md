@@ -25,7 +25,7 @@ Constraint handling should flow through four layers:
    bit-vector widths, signed vs unsigned operators, enum finite domains, named
    assertions, model extraction, and unsat reporting.
 4. **Runtime randomization** owns deterministic seeding, distribution behavior,
-   uniqueness/cyclic history, queued solve delivery, and blocking solve calls.
+   uniqueness history, queued solve delivery, and blocking solve calls.
 
 The existing `src/codegen/cpp_tb.rs` Z3 string emission remains the behavioral
 source of truth until each layer replaces it with matching tests.
@@ -37,7 +37,7 @@ lowering:
 
 - field name, source span, type class, bit width, signedness, enum domain
 - `!` non-random status and whether the field has a default
-- field attributes such as `[range]`, `[dist]`, `[cyclic]`, and `[unique]`
+- field attributes such as `[range]`, `[dist]`, and `[unique]`
 - top-level `keep` constraints with their origin
 - `when` subtype discriminants and nested fields/keeps for future guarded
   subtype lowering
@@ -70,7 +70,7 @@ Randomization must be deterministic per seed. The long-term runtime model is:
 
 - fast PRNG sampling for unconstrained and simple per-field cases
 - typed solver calls for cross-field constraints and relation-expanded bodies
-- explicit handling for `[dist]`, `[cyclic]`, `[unique]`, and solve-order hints
+- explicit handling for `[dist]`, `[unique]`, and solve-order hints
 - reproducible model diversity that does not rely on ad hoc static blocking
   caches alone
 
@@ -79,12 +79,14 @@ constraints. The implementation may use rejection sampling, randomized solver
 objectives, or a hybrid strategy, but the chosen behavior must be documented
 and stable under a seed.
 
-`[unique]` and `[cyclic]` are also randomization policies, not hard field
-invariants. They should steer fields that remain unconstrained after `keep`,
-relation expansion, and `randomize ... with` constraints; explicit user
-constraints and direct assignments must win. The runtime history should be
-designed so a future solver-result cache can be queried across a selected
-group of tests without making type-level attributes impossible to override.
+`[unique]` is also a randomization policy, not a hard field invariant. It
+should steer fields that remain unconstrained after `keep`, relation expansion,
+and `randomize ... with` constraints; explicit user constraints and direct
+assignments must win. A unique field should avoid repeats until its currently
+legal value space is exhausted, then clear/recycle history and retry rather
+than reporting UNSAT. The runtime history should be designed so a future
+solver-result cache can be queried across a selected group of tests without
+making type-level attributes impossible to override.
 
 ## Queued vs Blocking Randomize
 
@@ -125,6 +127,6 @@ typed lowering, before C++ emission.
 4. Enforce non-random field semantics.
 5. Lower `when` subtype constraints with discriminator guards.
 6. Replace diversity blocking cache with deterministic seed-driven sampling.
-7. Implement principled `[dist]`, `[cyclic]`, `[unique]`, and `solve_before`.
+7. Implement principled `[dist]`, `[unique]`, and `solve_before`.
 8. Add queued vs `blocking randomize` architecture and runtime dependency
    analysis.
