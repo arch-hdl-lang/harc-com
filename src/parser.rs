@@ -1960,7 +1960,17 @@ impl Parser {
             Some(TokenKind::Bool) => self.consume_atomic_ty(BuiltinTy::Bool, TokenKind::Bool),
             Some(TokenKind::BoolLower) => self.consume_atomic_ty(BuiltinTy::BoolLower, TokenKind::BoolLower),
             Some(TokenKind::Bit) => self.consume_atomic_ty(BuiltinTy::Bit, TokenKind::Bit),
-            Some(TokenKind::Int) => self.consume_atomic_ty(BuiltinTy::Int, TokenKind::Int),
+            Some(TokenKind::Int) => {
+                let start = self.expect(TokenKind::Int)?.span;
+                if self.check(TokenKind::Lt) {
+                    return Err(CompileError::unsupported_syntax(
+                        "`int<N>` is not HARC syntax",
+                        "Use `sint<N>` for explicit-width signed values, or plain `int` for the unqualified scalar type.",
+                        start.merge(self.peek_span()),
+                    ));
+                }
+                Ok(TypeExpr::Builtin { name: BuiltinTy::Int, args: Vec::new(), span: start })
+            }
             Some(TokenKind::Time) => self.consume_atomic_ty(BuiltinTy::Time, TokenKind::Time),
             Some(TokenKind::Prop) => self.consume_atomic_ty(BuiltinTy::Prop, TokenKind::Prop),
             Some(TokenKind::Pseq) => self.consume_atomic_ty(BuiltinTy::Pseq, TokenKind::Pseq),
