@@ -1,0 +1,182 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_single_cycle_arbiter_0004`.
+//
+// DUT: single_cycle_arbiter (default N=32, fixed-priority arbiter).
+//   priority_req[0] = 0
+//   priority_req[i+1] = priority_req[i] | req_i[i]
+//   gnt_o = req_i & ~priority_req
+// Effect: gnt_o[k] = 1 iff req_i[k] && (no lower-index bit is set).
+//
+// Pure combinational (the module has a `clk` port but never reads it).
+// Strategy: reset, then a battery of patterns:
+//   - all-zero request
+//   - single-bit walking-1 across all 32 bit positions
+//   - simultaneous multi-bit patterns (every bit eventually set)
+//   - alternating / striped patterns
+//   - randomised dense patterns
+//   - mid-run reset re-assertion
+// The software model is the priority-encoder above, recomputed in HARC.
+
+testbench ArbiterTb
+    dut : single_cycle_arbiter
+end testbench ArbiterTb
+
+function expected_gnt(req: uint<32>) -> uint<32>
+    let g : uint<32> = 0
+    let seen : uint<1> = 0
+    for i in 0 .. 32
+        let bit = ((req >> i) & 1).trunc<1>()
+        if (bit == 1) and (seen == 0)
+            g = g | ((1 as uint<32>) << i)
+            seen = 1
+        end if
+    end for
+    return g
+end function expected_gnt
+
+impl ArbiterTest for ArbiterTb
+    run
+        log(info, "single_cycle_arbiter: priority + edge patterns")
+
+        // ── Reset ────────────────────────────────────────────────
+        dut.reset = 1
+        dut.req_i = 0
+        wait 2 cycles
+        dut.reset = 0
+        wait 1 cycle
+
+        // ── No requests: gnt should be all-zero ─────────────────
+        dut.req_i = 0
+        wait 1 cycle
+        assert dut.gnt_o == 0
+            else fail("no-req: gnt_o=0x${dut.gnt_o:08x}, expected 0")
+
+        // ── Single-bit walking-1 sweep across every bit ─────────
+        for k in 0 .. 32
+            let r : uint<32> = (1 as uint<32>) << k
+            dut.req_i = r
+            wait 1 cycle
+            let exp = expected_gnt(r)
+            assert dut.gnt_o == exp
+                else fail("walk1 k=${k}: req=0x${r:08x}, gnt=0x${dut.gnt_o:08x}, exp=0x${exp:08x}")
+        end for
+
+        // ── Walking-1 starting from MSB downward to toggle high bits 1→0 ─
+        for k in 0 .. 32
+            let r : uint<32> = (1 as uint<32>) << (31 - k)
+            dut.req_i = r
+            wait 1 cycle
+            let exp = expected_gnt(r)
+            assert dut.gnt_o == exp
+                else fail("walk1-down k=${k}: gnt=0x${dut.gnt_o:08x}, exp=0x${exp:08x}")
+        end for
+
+        // ── Striped / alternating patterns over the whole 32-bit width ─
+        let stripes_a : uint<32> = 0xAAAAAAAA   // odd-indexed
+        let stripes_b : uint<32> = 0x55555555   // even-indexed
+        let stripes_c : uint<32> = 0xC6C6C6C6   // groups of high bits
+        let stripes_d : uint<32> = 0x99999999   // alternating pairs
+        let stripes_e : uint<32> = 0xFFFFFFFF   // all bits
+        let stripes_f : uint<32> = 0x80000001   // MSB+LSB
+        let stripes_g : uint<32> = 0x12345678
+        let stripes_h : uint<32> = 0xDEADBEEF
+
+        dut.req_i = stripes_a
+        wait 1 cycle
+        assert dut.gnt_o == expected_gnt(stripes_a)
+            else fail("stripes_a: gnt=0x${dut.gnt_o:08x}")
+
+        dut.req_i = stripes_b
+        wait 1 cycle
+        assert dut.gnt_o == expected_gnt(stripes_b)
+            else fail("stripes_b: gnt=0x${dut.gnt_o:08x}")
+
+        dut.req_i = stripes_c
+        wait 1 cycle
+        assert dut.gnt_o == expected_gnt(stripes_c)
+            else fail("stripes_c: gnt=0x${dut.gnt_o:08x}")
+
+        dut.req_i = stripes_d
+        wait 1 cycle
+        assert dut.gnt_o == expected_gnt(stripes_d)
+            else fail("stripes_d: gnt=0x${dut.gnt_o:08x}")
+
+        dut.req_i = stripes_e
+        wait 1 cycle
+        // All bits set → only bit 0 should be granted.
+        assert dut.gnt_o == 1
+            else fail("all-ones: gnt=0x${dut.gnt_o:08x}, expected 0x00000001")
+
+        dut.req_i = stripes_f
+        wait 1 cycle
+        assert dut.gnt_o == 1
+            else fail("MSB+LSB: gnt=0x${dut.gnt_o:08x}, expected 0x00000001 (LSB wins)")
+
+        dut.req_i = stripes_g
+        wait 1 cycle
+        assert dut.gnt_o == expected_gnt(stripes_g)
+            else fail("stripes_g: gnt=0x${dut.gnt_o:08x}")
+
+        dut.req_i = stripes_h
+        wait 1 cycle
+        assert dut.gnt_o == expected_gnt(stripes_h)
+            else fail("stripes_h: gnt=0x${dut.gnt_o:08x}")
+
+        // ── Patterns sourced from the prompt (8-bit) but zero-extended ─
+        let p1 : uint<32> = 0xC6        // 8'b11000110
+        let p2 : uint<32> = 0xAA        // 8'b10101010
+        let p3 : uint<32> = 0x55        // 8'b01010101
+        let p4 : uint<32> = 0x99        // 8'b10011001
+
+        dut.req_i = p1
+        wait 1 cycle
+        assert dut.gnt_o == expected_gnt(p1)
+            else fail("p1=0xC6: gnt=0x${dut.gnt_o:08x}")
+        dut.req_i = p2
+        wait 1 cycle
+        assert dut.gnt_o == expected_gnt(p2)
+            else fail("p2=0xAA: gnt=0x${dut.gnt_o:08x}")
+        dut.req_i = p3
+        wait 1 cycle
+        assert dut.gnt_o == expected_gnt(p3)
+            else fail("p3=0x55: gnt=0x${dut.gnt_o:08x}")
+        dut.req_i = p4
+        wait 1 cycle
+        assert dut.gnt_o == expected_gnt(p4)
+            else fail("p4=0x99: gnt=0x${dut.gnt_o:08x}")
+
+        // ── Sequential walk: shift a request bit one cycle at a time ─
+        for k in 0 .. 32
+            dut.req_i = ((1 as uint<32>) << k) | ((1 as uint<32>) << ((k + 5) % 32))
+            wait 1 cycle
+            assert dut.gnt_o == expected_gnt(dut.req_i)
+                else fail("seq-walk k=${k}: gnt=0x${dut.gnt_o:08x}")
+        end for
+
+        // ── 50 randomised request patterns ──────────────────────
+        for k in 0 .. 50
+            let r : uint<32> = ((k * 2654435761) ^ 0xDEADBEEF) as uint<32>
+            dut.req_i = r
+            wait 1 cycle
+            assert dut.gnt_o == expected_gnt(r)
+                else fail("rand k=${k}: req=0x${r:08x}, gnt=0x${dut.gnt_o:08x}")
+        end for
+
+        // ── Mid-run reset re-assertion ──────────────────────────
+        dut.req_i = 0xFFFFFFFF
+        dut.reset = 1
+        wait 2 cycles
+        dut.reset = 0
+        dut.req_i = 0
+        wait 1 cycle
+        assert dut.gnt_o == 0
+            else fail("post-mid-reset: gnt=0x${dut.gnt_o:08x}, expected 0")
+
+        // Re-grant after reset on a known pattern
+        dut.req_i = 0x80
+        wait 1 cycle
+        assert dut.gnt_o == 0x80
+            else fail("post-reset re-grant: gnt=0x${dut.gnt_o:08x}, expected 0x80")
+
+        log(info, "ALL TESTS PASSED — single_cycle_arbiter")
+    end run
+end impl ArbiterTest

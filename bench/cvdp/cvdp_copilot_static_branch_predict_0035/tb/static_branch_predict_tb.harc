@@ -1,0 +1,153 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_static_branch_predict_0035`.
+//
+// DUT: static_branch_predict — RISC-V style static branch predictor.
+// Decodes 32-bit fetched instr into one of {JAL, JALR, B-type, C.J, C.B}
+// and produces predict_branch_taken_o + predict_branch_pc_o.
+//
+// case statement on (1'b1) with 5 instruction-type predicates and a
+// default. We need to hit each predicate-true arm + the default.
+//
+// Strategy: directed instruction-encodings for each opcode/compressed
+// pattern, with both `fetch_valid_i` levels, both sign-bit directions
+// for B-type and C.B (branch-taken / branch-not-taken), and a
+// non-matching opcode for the default arm.
+
+testbench BranchPredictTb
+    dut : static_branch_predict_top
+end testbench BranchPredictTb
+
+impl BranchPredictTest for BranchPredictTb
+    run
+        log(info, "static_branch_predict: instr-type + taken/not-taken coverage")
+
+        // ── Default arm: opcode = 0 (not BRANCH/JAL/JALR, not C-format) ─
+        // instr=0 → instr[1:0]=00, so instr_cb=0, instr_cj=0
+        dut.fetch_rdata_i = 0
+        dut.fetch_pc_i = 0x80000000
+        dut.register_addr_i = 0
+        dut.fetch_valid_i = 1
+        wait 1 cycle
+        assert dut.predict_branch_taken_o == 0
+            else fail("default-arm: predict_branch_taken_o=${dut.predict_branch_taken_o}, expected 0")
+
+        // ── JAL (opcode 0x6F): instr_jal=1, jump always taken ───
+        // Use a positive imm. instr[31] = 0 → imm sign-extends to 0.
+        // The lowest 7 bits = 0x6F. Use rd=x1 (instr[11:7]=00001).
+        dut.fetch_rdata_i = 0x000000EF as uint<32>
+        dut.fetch_pc_i = 0x1000
+        dut.fetch_valid_i = 1
+        wait 1 cycle
+        assert dut.predict_branch_taken_o == 1
+            else fail("JAL: predict_branch_taken_o=${dut.predict_branch_taken_o}, expected 1")
+
+        // JAL with fetch_valid_i=0 should suppress taken
+        dut.fetch_valid_i = 0
+        wait 1 cycle
+        assert dut.predict_branch_taken_o == 0
+            else fail("JAL no-valid: taken=${dut.predict_branch_taken_o}, expected 0")
+
+        // ── JALR (opcode 0x67): instr_jalr=1, register-indirect jump ──
+        dut.fetch_rdata_i = 0x000000E7 as uint<32>   // opcode 0x67, rd=x1
+        dut.register_addr_i = 0x2000
+        dut.fetch_valid_i = 1
+        wait 1 cycle
+        assert dut.predict_branch_taken_o == 1
+            else fail("JALR: taken=${dut.predict_branch_taken_o}, expected 1")
+
+        // ── B-type (opcode 0x63), imm sign-bit 0 → NOT taken ────
+        // instr[31] = 0. Imm bits build: instr[7]=0, instr[30:25]=0, instr[11:8]=0
+        // funct3=000 (BEQ), rs1=x0, rs2=x0
+        // instr = 32'h00000063
+        dut.fetch_rdata_i = 0x00000063 as uint<32>
+        dut.fetch_valid_i = 1
+        wait 1 cycle
+        assert dut.predict_branch_taken_o == 0
+            else fail("B-type imm[31]=0: taken=${dut.predict_branch_taken_o}, expected 0 (NOT taken)")
+
+        // ── B-type with imm[31]=1 → predicted TAKEN ─────────────
+        // Set instr[31]=1 → imm_b_type[31]=1
+        // instr = 32'h80000063
+        dut.fetch_rdata_i = 0x80000063 as uint<32>
+        wait 1 cycle
+        assert dut.predict_branch_taken_o == 1
+            else fail("B-type imm[31]=1: taken=${dut.predict_branch_taken_o}, expected 1")
+
+        // ── C.J (compressed jump): instr[1:0]=01, instr[15:13]=101 or 001
+        // funct3=101 (C.J): instr[15:13]=101 → instr = ?_101_?????????_01
+        // Pick instr = 16'b101_0_0000_0000_0001 = 16'hA001 (lower 16 bits only matter
+        //   for the compressed predicates, but the predictor still reads bit 31 etc).
+        // Use upper bits zero so imm_cj_type[31] propagates from instr[12]=0.
+        dut.fetch_rdata_i = 0x0000A001 as uint<32>
+        dut.fetch_valid_i = 1
+        wait 1 cycle
+        assert dut.predict_branch_taken_o == 1
+            else fail("C.J: taken=${dut.predict_branch_taken_o}, expected 1")
+
+        // Also exercise funct3=001 (the other C.J encoding)
+        dut.fetch_rdata_i = 0x00002001 as uint<32>  // funct3=001
+        wait 1 cycle
+        assert dut.predict_branch_taken_o == 1
+            else fail("C.J funct3=001: taken=${dut.predict_branch_taken_o}, expected 1")
+
+        // ── C.B (compressed branch): instr[1:0]=01, instr[15:13]=110 or 111 ─
+        // C.B with sign-bit 0 (imm[31]=0): instr = 16'b110_xxx_xxx_xxx_xx_01 with
+        //   instr[12]=0 → imm_cb_type sign=0 → NOT taken
+        // Pick instr = 16'b110_0_000_000_00000_01 = 16'hC001
+        dut.fetch_rdata_i = 0x0000C001 as uint<32>
+        wait 1 cycle
+        assert dut.predict_branch_taken_o == 0
+            else fail("C.B imm[31]=0: taken=${dut.predict_branch_taken_o}, expected 0")
+
+        // C.B with sign-bit 1: set instr[12]=1 → imm_cb_type[31]=1 → TAKEN
+        // instr = 16'b110_1_000_000_00000_01 = 16'hD001
+        dut.fetch_rdata_i = 0x0000D001 as uint<32>
+        wait 1 cycle
+        assert dut.predict_branch_taken_o == 1
+            else fail("C.B imm[31]=1: taken=${dut.predict_branch_taken_o}, expected 1")
+
+        // Also funct3=111 (the other C.B encoding)
+        dut.fetch_rdata_i = 0x0000F001 as uint<32>
+        wait 1 cycle
+        assert dut.predict_branch_taken_o == 1
+            else fail("C.B funct3=111: taken=${dut.predict_branch_taken_o}, expected 1")
+
+        // ── Drive PC + register_addr through many bit positions ──
+        for k in 0 .. 32
+            dut.fetch_rdata_i = 0x000000EF as uint<32>  // JAL
+            dut.fetch_pc_i = (1 as uint<32>) << k
+            dut.register_addr_i = (1 as uint<32>) << ((k + 7) % 32)
+            wait 1 cycle
+        end for
+
+        // Drive fetch_rdata_i through varied bit positions
+        // (uses each immediate field) — without asserting; mainly to
+        // toggle each bit of imm_{jal,jalr,b,cj,cb}_type and branch_imm.
+        for k in 0 .. 32
+            let r : uint<32> = ((1 as uint<32>) << k) | (0x000000EF as uint<32>)
+            dut.fetch_rdata_i = r
+            wait 1 cycle
+        end for
+
+        // C.J / C.B with varied middle bits
+        for k in 0 .. 16
+            let r : uint<32> = (((k as uint<32>) << 2) | 0x0000A001 as uint<32>).trunc<32>()
+            dut.fetch_rdata_i = r
+            wait 1 cycle
+        end for
+
+        for k in 0 .. 16
+            let r : uint<32> = (((k as uint<32>) << 2) | 0x0000C001 as uint<32>).trunc<32>()
+            dut.fetch_rdata_i = r
+            wait 1 cycle
+        end for
+
+        // ── fetch_valid_i=0 for the default + each predicate ────
+        dut.fetch_valid_i = 0
+        dut.fetch_rdata_i = 0
+        wait 1 cycle
+        assert dut.predict_branch_taken_o == 0
+            else fail("default no-valid: taken=${dut.predict_branch_taken_o}, expected 0")
+
+        log(info, "ALL TESTS PASSED — static_branch_predict")
+    end run
+end impl BranchPredictTest

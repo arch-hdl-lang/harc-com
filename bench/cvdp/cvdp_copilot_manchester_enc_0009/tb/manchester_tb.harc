@@ -1,0 +1,161 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_manchester_enc_0009`.
+//
+// DUT: top_manchester (N=8) — 1-cycle Manchester encoder + decoder.
+//   Encoder: enc_data_in[i]=1 → enc_data_out[2i]=1,[2i+1]=0
+//            enc_data_in[i]=0 → enc_data_out[2i]=0,[2i+1]=1
+//   Decoder: dec_data_in[2i:2i+1] = 10 → dec_data_out[i]=1
+//                                   = 01 → dec_data_out[i]=0
+//                                   = 00 or 11 → dec_data_out[i]=0 (else)
+//
+// Strategy:
+//   - reset both encoder/decoder
+//   - encoder: exhaustive 0..256 input sweep
+//   - decoder: feed valid Manchester codewords (1→10/01); also feed
+//     invalid 00 / 11 patterns to exercise the else branch.
+//   - exercise enc_valid_in=0 and dec_valid_in=0 (clear branches)
+//   - exercise reset re-assertion mid-flow
+
+testbench ManchesterTb
+    dut : top_manchester_top
+end testbench ManchesterTb
+
+function encode8(d: uint<8>) -> uint<16>
+    let r : uint<16> = 0
+    for i in 0 .. 8
+        let bit = ((d >> i) & 1).trunc<1>()
+        if bit == 1
+            r = r | ((1 as uint<16>) << (2 * i))
+        else
+            r = r | ((1 as uint<16>) << (2 * i + 1))
+        end if
+    end for
+    return r
+end function encode8
+
+impl ManchesterTest for ManchesterTb
+    run
+        log(info, "top_manchester: encoder+decoder coverage walk")
+
+        // ── Reset ────────────────────────────────────────────────
+        dut.rst_in = 1
+        dut.enc_valid_in = 0
+        dut.enc_data_in = 0
+        dut.dec_valid_in = 0
+        dut.dec_data_in = 0
+        wait 2 cycles
+        assert dut.enc_data_out == 0
+            else fail("reset: enc_data_out=0x${dut.enc_data_out:04x}, expected 0")
+        assert dut.enc_valid_out == 0
+            else fail("reset: enc_valid_out=${dut.enc_valid_out}, expected 0")
+        assert dut.dec_data_out == 0
+            else fail("reset: dec_data_out=0x${dut.dec_data_out:02x}, expected 0")
+        assert dut.dec_valid_out == 0
+            else fail("reset: dec_valid_out=${dut.dec_valid_out}")
+        dut.rst_in = 0
+        wait 1 cycle
+
+        // ── enc_valid_in=0 path: outputs cleared ────────────────
+        dut.enc_valid_in = 0
+        dut.enc_data_in = 0xFF
+        wait 1 cycle
+        assert dut.enc_data_out == 0
+            else fail("no-valid enc: enc_data_out=0x${dut.enc_data_out:04x}")
+        assert dut.enc_valid_out == 0
+            else fail("no-valid enc: enc_valid_out=${dut.enc_valid_out}")
+
+        // ── Encoder: exhaustive 256-input sweep ─────────────────
+        dut.enc_valid_in = 1
+        for k in 0 .. 256
+            dut.enc_data_in = k
+            wait 1 cycle
+            let exp = encode8(k as uint<8>)
+            assert dut.enc_data_out == exp
+                else fail("enc k=0x${k:02x}: got 0x${dut.enc_data_out:04x}, exp 0x${exp:04x}")
+            assert dut.enc_valid_out == 1
+                else fail("enc k=0x${k:02x}: valid_out=${dut.enc_valid_out}")
+        end for
+
+        // ── dec_valid_in=0 path ─────────────────────────────────
+        dut.dec_valid_in = 0
+        dut.dec_data_in = 0xAAAA
+        wait 1 cycle
+        assert dut.dec_data_out == 0
+            else fail("no-valid dec: dec_data_out=0x${dut.dec_data_out:02x}")
+        assert dut.dec_valid_out == 0
+            else fail("no-valid dec: dec_valid_out=${dut.dec_valid_out}")
+
+        // ── Decoder: valid codewords (encode-then-decode round-trip) ─
+        dut.dec_valid_in = 1
+        for k in 0 .. 256
+            let codeword = encode8(k as uint<8>)
+            dut.dec_data_in = codeword
+            wait 1 cycle
+            assert dut.dec_data_out == k
+                else fail("dec k=0x${k:02x}: got 0x${dut.dec_data_out:02x}, exp 0x${k:02x}")
+            assert dut.dec_valid_out == 1
+                else fail("dec k=0x${k:02x}: valid_out=${dut.dec_valid_out}")
+        end for
+
+        // ── Decoder: invalid 00 patterns ────────────────────────
+        // dec_data_in[2i+1:2i] = 00 for all i → every bit takes else
+        dut.dec_data_in = 0x0000
+        wait 1 cycle
+        assert dut.dec_data_out == 0
+            else fail("invalid 00: dec_data_out=0x${dut.dec_data_out:02x}, expected 0")
+
+        // ── Decoder: invalid 11 patterns ────────────────────────
+        dut.dec_data_in = 0xFFFF
+        wait 1 cycle
+        assert dut.dec_data_out == 0
+            else fail("invalid 11: dec_data_out=0x${dut.dec_data_out:02x}, expected 0")
+
+        // Mixed-validity codewords: pair0=10 (→1), pair1=11 (→else 0).
+        // Nibble bits (LSB first): pair0={1,0}, pair1={1,1} → 4 bits = 0b1101.
+        // Tiled across 16 bits: 16'b1101_1101_1101_1101.
+        // Output: even-indexed bits = 1 (from pair0=10), odd-indexed = 0 → 0x55.
+        dut.dec_data_in = 0b1101_1101_1101_1101 as uint<16>
+        wait 2 cycles
+        assert dut.dec_data_out == 0x55
+            else fail("mixed-valid: dec_data_out=0x${dut.dec_data_out:02x}, expected 0x55")
+
+        // Inverse mix: pair0={[0]=0,[1]=1} (decode 0), pair1={[2]=0,[3]=0} (else→0).
+        // Nibble bits (MSB→LSB) = 0010. Tiled across 16 bits = 0x2222.
+        dut.dec_data_in = 0x2222 as uint<16>
+        wait 2 cycles
+        assert dut.dec_data_out == 0
+            else fail("mixed-01-00: dec_data_out=0x${dut.dec_data_out:02x}, expected 0")
+
+        // Mix with both else-branch flavours: pair0={[0]=1,[1]=1} (else→0),
+        // pair1={[2]=0,[3]=0} (else→0). Nibble = 0011 → 0x3333.
+        dut.dec_data_in = 0x3333 as uint<16>
+        wait 2 cycles
+        assert dut.dec_data_out == 0
+            else fail("mixed-11-00: dec_data_out=0x${dut.dec_data_out:02x}, expected 0")
+
+        // ── Mid-flow reset ──────────────────────────────────────
+        dut.enc_valid_in = 1
+        dut.enc_data_in = 0xAA
+        wait 1 cycle
+        dut.rst_in = 1
+        wait 1 cycle
+        assert dut.enc_data_out == 0
+            else fail("mid-flow reset: enc_data_out=0x${dut.enc_data_out:04x}, expected 0")
+        assert dut.enc_valid_out == 0
+            else fail("mid-flow reset: enc_valid_out=${dut.enc_valid_out}, expected 0")
+        assert dut.dec_data_out == 0
+            else fail("mid-flow reset: dec_data_out=0x${dut.dec_data_out:02x}, expected 0")
+        assert dut.dec_valid_out == 0
+            else fail("mid-flow reset: dec_valid_out=${dut.dec_valid_out}, expected 0")
+        dut.rst_in = 0
+        wait 1 cycle
+
+        // ── Resume after reset ──────────────────────────────────
+        dut.enc_valid_in = 1
+        dut.enc_data_in = 0x5A
+        wait 1 cycle
+        assert dut.enc_data_out == encode8(0x5A as uint<8>)
+            else fail("post-reset enc: got 0x${dut.enc_data_out:04x}")
+
+        log(info, "ALL TESTS PASSED — top_manchester")
+    end run
+end impl ManchesterTest
