@@ -1763,19 +1763,17 @@ test BlockingRuntimeDepTest
         let t : T
         let other : T
         blocking randomize(t) with
-            other.len == 1
+            t.len == other.len
         end randomize
     end run
 end test BlockingRuntimeDepTest"#,
     )
     .unwrap();
-    let err = cpp_tb::emit(&blocking).unwrap_err();
+    let cpp = cpp_tb::emit(&blocking).expect("blocking runtime dependency emits");
     assert!(
-        err.0.contains("blocking randomize(T)")
-            && err.0.contains("runtime state `other.len`")
-            && err.0.contains("not supported yet"),
-        "blocking randomize should reject live non-target state until runtime-dependent lowering lands; got: {}",
-        err.0,
+        cpp.contains("_ctx.bv_val((uint64_t)(other.len), 64)")
+            && cpp.contains("_z_len == _ctx.bv_val((uint64_t)(other.len), 64)"),
+        "blocking randomize should snapshot non-target runtime state into the solver; got:\n{cpp}",
     );
 }
 
