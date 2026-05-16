@@ -178,6 +178,7 @@ Common `harc sim` flags:
 - `--emit-only` — emit C++ but don't compile/run
 - `--ref-src <file>` (repeatable) — C/C++ source file(s) providing implementations for `extern function` reference models (spec §9.1)
 - `--coverage` — enable DUT coverage collection. Works on both DUT paths: `--sv` passes `--coverage` to Verilator; `--dut` passes `--coverage` + `--coverage-dat=<outdir>/coverage.dat` to `arch sim`. The Verilator-compatible `coverage.dat` lands in `<outdir>/` on both paths so downstream tools (`verilator_coverage`, the CVDP scorer) see a uniform shape
+- `--record-trace <file.jsonl>` — write a semantic JSONL trace for the run. The trace includes metadata, `sim_start` / `sim_end`, `log` events, assertion-failure events derived from `fail` logs, and concrete `randomize` results. This is intended for debugging and post-run analysis without scraping stdout
 - `--mt` — opt into the per-actor multi-OS-thread runtime (default is cooperative single-thread, typically faster on real fixtures)
 
 Z3 is required for constraint-randomized tests (`randomize(t) with ...` and transaction `keep` constraints). System installs are auto-detected, and custom installs can be selected with a root prefix or explicit include/lib directories:

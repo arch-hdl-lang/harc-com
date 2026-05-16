@@ -673,8 +673,8 @@ pub enum TestItem {
     Stmt(Stmt),
     /// `phase <name> ... end phase <name>` — user-defined named phase
     /// block at test scope (docs/test-ergonomics.md inline form).
-    /// Equivalent to the same body item inside an `impl sim for T` —
-    /// codegen lifts both into the same `custom_phases` table.
+    /// Codegen lifts these into the same `custom_phases` table as
+    /// named phases from testbench-bound tests.
     Phase(Ident, Block),
 }
 
@@ -1460,7 +1460,7 @@ pub trait Construct {
 //
 // One `impl Construct for $ty` per `Item::*` variant. Most pull
 // `name` / `span` / `doc` directly off the `*Decl` struct;
-// `UseDecl` / `ExtendDecl` / `ApplyDecl` / `ImplDecl` carry a `path`
+// `UseDecl` / `ExtendDecl` / `ApplyDecl` carry a `path`
 // or different field names and need slim shim accessors.
 
 /// Implement `Construct` for a `*Decl` with the canonical
@@ -1644,4 +1644,3 @@ impl Item {
         }
     }
 }
-

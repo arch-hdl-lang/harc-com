@@ -44,6 +44,44 @@ end test TraceTest
     assert!(cpp.contains("raw(\"assertion_failure\""));
 }
 
+#[test]
+fn discard_binding_and_params_emit_cleanly() {
+    let parsed = parse_source(
+        r#"function consume(_: uint<8>, _: uint<8>)
+    let _ = 1
+end function consume
+
+agent Sink
+    in_ev : event<uint<8>>
+    hookable ignore(_: uint<8>, _: uint<8>)
+        let _ = 2
+    end ignore
+    on in_ev(_)
+        let _ = 3
+    end on
+end agent Sink
+
+test DiscardTest
+    let dut : DummyDut
+    run
+        let s : Sink
+        let _ = consume(1, 2)
+        s.ignore(3, 4)
+    end run
+end test DiscardTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("discard forms should emit cleanly");
+    assert!(
+        cpp.contains("(void)(1);") && cpp.contains("(void)(2);") && cpp.contains("(void)(3);"),
+        "expected discard lets to force evaluation with void casts; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("uint64_t _discard0, uint64_t _discard1"),
+        "expected duplicate `_` params to synthesize unique C++ names; got:\n{cpp}"
+    );
+}
+
 // Tests for the legacy `impl sim for T` two-block form were removed
 // alongside its parser entry in Phase 2 of docs/test-ergonomics.md.
 // Inline-form coverage lives in the fixture suite (counter_test,
