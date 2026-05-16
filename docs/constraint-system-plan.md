@@ -1,0 +1,124 @@
+# Constraint System Plan
+
+HARC's current constraint-randomization path is a working v0: transaction
+`keep` clauses and `randomize(t) with ...` bodies are merged at the call site
+and emitted directly as an inline Z3 block in C++ testbench codegen. That keeps
+early examples useful, but it is not the right semantic foundation for a robust
+HVL. The v1 path should put a typed elaboration layer between HARC syntax and
+any solver backend.
+
+This document defines that foundation. The first implementation step is
+non-invasive: extract schemas and constraint metadata from the parsed AST while
+leaving generated C++ behavior unchanged.
+
+## Architecture
+
+Constraint handling should flow through four layers:
+
+1. **Transaction elaboration** builds a schema for every transaction: fields,
+   widths, signedness, enum domains, non-random markers, defaults, attributes,
+   transaction-level keeps, and `when` subtype bodies.
+2. **Typed constraint IR** lowers `keep`, `randomize with`, field attributes,
+   and relation expansions into a checked expression tree with origins and
+   source spans.
+3. **Solver backend** translates the typed IR to Z3 or another solver. It owns
+   bit-vector widths, signed vs unsigned operators, enum finite domains, named
+   assertions, model extraction, and unsat reporting.
+4. **Runtime randomization** owns deterministic seeding, distribution behavior,
+   uniqueness/cyclic history, queued solve delivery, and blocking solve calls.
+
+The existing `src/codegen/cpp_tb.rs` Z3 string emission remains the behavioral
+source of truth until each layer replaces it with matching tests.
+
+## Elaboration Model
+
+The elaborated transaction schema records the facts needed before solver
+lowering:
+
+- field name, source span, type class, bit width, signedness, enum domain
+- `!` non-random status and whether the field has a default
+- field attributes such as `[range]`, `[dist]`, `[cyclic]`, and `[unique]`
+- top-level `keep` constraints with their origin
+- `when` subtype discriminants and nested fields/keeps for future guarded
+  subtype lowering
+
+Relations are collected as named constraint sets with parameter schemas and
+body shape. Expansion should eventually preserve origin chains so diagnostics
+can say which relation contributed a failing or unsupported constraint.
+
+## Solver Boundary
+
+The solver backend should consume typed IR, not raw AST or emitted C++ text.
+That boundary lets HARC reject unsupported constraints early and keeps solver
+semantics independent of the C++ backend.
+
+Required solver semantics for v1:
+
+- exact bit-vector width for every numeric field
+- signed operators for `sint<N>` comparisons, division, and modulo
+- unsigned operators for `uint<N>`, `bits<N>`, `bit`, and enum domains
+- finite-domain constraints for enums
+- named assertions for `keep`, `with`, relation, subtype, and attribute origins
+- model extraction that respects non-random fields and enum domains
+
+Unsupported forms should produce compile-time diagnostics with spans. The
+solver path should not silently replace unsupported expressions with `true`.
+
+## Randomization Semantics
+
+Randomization must be deterministic per seed. The long-term runtime model is:
+
+- fast PRNG sampling for unconstrained and simple per-field cases
+- typed solver calls for cross-field constraints and relation-expanded bodies
+- explicit handling for `[dist]`, `[cyclic]`, `[unique]`, and solve-order hints
+- reproducible model diversity that does not rely on ad hoc static blocking
+  caches alone
+
+`dist` and field distribution attributes are semantic weights, not hard solver
+constraints. The implementation may use rejection sampling, randomized solver
+objectives, or a hybrid strategy, but the chosen behavior must be documented
+and stable under a seed.
+
+## Queued vs Blocking Randomize
+
+Queued randomize is the default v1 performance path: constraints that depend
+only on transaction state and compile-time constants can be solved off-cycle
+and delivered through a result queue.
+
+`blocking randomize` is required when constraints depend on current runtime
+state that cannot be safely precomputed. The compiler should eventually perform
+dependency analysis and either:
+
+- permit queued solving for static or captured-snapshot constraints, or
+- require/blocking-lower the call when live DUT or simulation state is read.
+
+The current codegen ignores the parsed `blocking` flag. That is acceptable for
+v0 but must not be the v1 architecture.
+
+## Diagnostics
+
+Every lowered constraint needs an origin:
+
+- transaction-level `keep`
+- randomize-with body
+- relation expansion
+- field attribute
+- future `when` subtype guard/body
+
+UNSAT reporting should include the transaction type, randomize site, active
+origins, and named solver assertions. Unsupported syntax should fail during
+typed lowering, before C++ emission.
+
+## Migration Order
+
+1. Add foundation IR and schema extraction without behavior changes.
+2. Lower the currently supported constraint subset into typed IR.
+3. Replace ad hoc Z3 emission with exact-width, signedness-aware solver
+   lowering.
+4. Enforce non-random field semantics.
+5. Lower `when` subtype constraints with discriminator guards.
+6. Replace diversity blocking cache with deterministic seed-driven sampling.
+7. Implement principled `[dist]`, `[cyclic]`, `[unique]`, and `solve_before`.
+8. Add queued vs `blocking randomize` architecture and runtime dependency
+   analysis.
+
