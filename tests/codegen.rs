@@ -1666,6 +1666,14 @@ end test AutoCovPrefTest"#,
             && cpp.contains("_len[2]")
             && cpp.contains("static bool _auto_cross_")
             && cpp.contains("__len[2][2]")
+            && cpp.contains("std::vector<std::function<void()>> _auto_cov_reports;")
+            && cpp.contains("_auto_cov_reports.push_back")
+            && cpp.contains("[auto_cov T@")
+            && cpp.contains("T.op=0")
+            && cpp.contains("T.op=1")
+            && cpp.contains("T.len=1")
+            && cpp.contains("T.len=4")
+            && cpp.contains("T.op=0 x T.len=1")
             && cpp.contains("bool _auto_cov_pref_")
             && cpp.contains("_pref_")
             && cpp.contains(" = _auto_vals_")
@@ -1674,7 +1682,7 @@ end test AutoCovPrefTest"#,
             && cpp.contains("_auto_cov_")
             && cpp.contains(" = true;")
             && cpp.contains("_auto_cross_"),
-        "auto coverage goals and pairwise crosses should feed solver preferences and hit tracking; got:\n{cpp}",
+        "auto coverage goals and pairwise crosses should feed solver preferences, hit tracking, and reporting; got:\n{cpp}",
     );
 }
 
