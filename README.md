@@ -59,6 +59,10 @@ covergroup FifoCov @(posedge dut.clk)
         end bins
 end covergroup FifoCov
 
+// Covergroups may also sample on hookable transaction events, e.g.
+// `covergroup TxnCov @(mon.observed(t) post)`, so transaction coverage
+// does not have to be oversampled every clock.
+
 test SyncFifoTest
     let dut : TxQueue
     let cov : FifoCov
