@@ -461,3 +461,21 @@ end impl T"#;
         "expected directed error mentioning both `else if` and `elsif`; got: {msg}",
     );
 }
+
+/// `int<N>` looks plausible to users coming from HARC's `uint<N>` /
+/// `sint<N>` spelling, but `int` is intentionally the unqualified
+/// scalar type. Signed hardware-width values should use `sint<N>`.
+#[test]
+fn int_width_is_a_directed_error_to_sint() {
+    let src = r#"function check_case(value: uint<16>, expected: int<32>)
+end function check_case
+
+test T
+end test T"#;
+    let err = parse_source(src).unwrap_err();
+    let msg = format!("{:?}", err);
+    assert!(
+        msg.contains("int<N>") && msg.contains("sint<N>") && msg.contains("plain `int`"),
+        "expected directed error steering `int<N>` to `sint<N>`; got: {msg}",
+    );
+}
