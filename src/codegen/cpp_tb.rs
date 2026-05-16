@@ -2173,6 +2173,12 @@ struct TxnFieldInfo {
     attrs: Vec<Attr>,
 }
 
+#[derive(Debug, Clone)]
+struct AutoCoverageGoal {
+    field: String,
+    values: Vec<u64>,
+}
+
 fn field_attr_range(f: &TxnFieldInfo) -> Option<(&Expr, &Expr)> {
     f.attrs.iter().find_map(|a| {
         if a.name.name != "range" || a.args.len() < 2 {
@@ -2199,6 +2205,25 @@ fn field_attr_dist_entries(f: &TxnFieldInfo) -> Option<&Vec<DistEntry>> {
 
 fn field_attr_unique(f: &TxnFieldInfo) -> bool {
     f.attrs.iter().any(|a| a.name.name == "unique")
+}
+
+fn auto_coverage_values(f: &TxnFieldInfo) -> Vec<u64> {
+    let mut values = Vec::new();
+    if let Some(n) = f.enum_variants {
+        for i in 0..n {
+            values.push(i as u64);
+        }
+    } else if f.width == 1 && !f.signed {
+        values.extend([0, 1]);
+    } else if let Some((lo, hi)) = field_attr_range(f) {
+        if let (Some(lo), Some(hi)) = (fold_int_literal(lo), fold_int_literal(hi)) {
+            values.push(lo);
+            if hi != lo {
+                values.push(hi);
+            }
+        }
+    }
+    values
 }
 
 fn randomize_target_field_name(
@@ -6808,6 +6833,26 @@ impl Emitter {
             .filter(|f| field_attr_unique(f) && !constrained_fields.contains(&f.name))
             .map(|f| f.name.clone())
             .collect();
+        let auto_goals: Vec<AutoCoverageGoal> = free_fields
+            .iter()
+            .filter(|f| !constrained_fields.contains(&f.name))
+            .filter_map(|f| {
+                let values = auto_coverage_values(f);
+                (!values.is_empty()).then(|| AutoCoverageGoal {
+                    field: f.name.clone(),
+                    values,
+                })
+            })
+            .collect();
+        let mut auto_crosses: Vec<(AutoCoverageGoal, AutoCoverageGoal)> = Vec::new();
+        for i in 0..auto_goals.len() {
+            for j in (i + 1)..auto_goals.len() {
+                let cross_bins = auto_goals[i].values.len() * auto_goals[j].values.len();
+                if cross_bins <= 64 && auto_crosses.len() < 16 {
+                    auto_crosses.push((auto_goals[i].clone(), auto_goals[j].clone()));
+                }
+            }
+        }
 
         // One static history vector per free field — persists across loop
         // iterations to push the solver away from previously-seen answers.
@@ -6817,6 +6862,28 @@ impl Emitter {
                 self.out,
                 "static std::vector<uint64_t> {cache_tag}_{};",
                 f.name
+            )
+            .ok();
+        }
+        for goal in &auto_goals {
+            self.pad(depth + 1);
+            writeln!(
+                self.out,
+                "static bool _auto_cov_{cache_tag}_{}[{}] = {{}};",
+                goal.field,
+                goal.values.len()
+            )
+            .ok();
+        }
+        for (a, b) in &auto_crosses {
+            self.pad(depth + 1);
+            writeln!(
+                self.out,
+                "static bool _auto_cross_{cache_tag}_{}__{}[{}][{}] = {{}};",
+                a.field,
+                b.field,
+                a.values.len(),
+                b.values.len()
             )
             .ok();
         }
@@ -6873,6 +6940,125 @@ impl Emitter {
                 )
                 .ok();
             }
+        }
+        if !auto_goals.is_empty() {
+            self.pad(depth + 1);
+            writeln!(
+                self.out,
+                "bool _auto_cov_pref_{cache_tag} = false;   // auto coverage preference"
+            )
+            .ok();
+        }
+        for (a, b) in &auto_crosses {
+            self.pad(depth + 1);
+            writeln!(self.out, "if (!_auto_cov_pref_{cache_tag}) {{").ok();
+            self.pad(depth + 2);
+            writeln!(
+                self.out,
+                "for (size_t _i = 0; _i < {}; ++_i) {{",
+                a.values.len()
+            )
+            .ok();
+            self.pad(depth + 3);
+            writeln!(
+                self.out,
+                "for (size_t _j = 0; _j < {}; ++_j) {{",
+                b.values.len()
+            )
+            .ok();
+            self.pad(depth + 4);
+            writeln!(
+                self.out,
+                "if (!_auto_cross_{cache_tag}_{}__{}[_i][_j]) {{",
+                a.field, b.field
+            )
+            .ok();
+            self.pad(depth + 5);
+            writeln!(
+                self.out,
+                "static const uint64_t _auto_vals_{cache_tag}_{}[] = {{{}}};",
+                a.field,
+                a.values
+                    .iter()
+                    .map(|v| format!("{v}ULL"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .ok();
+            self.pad(depth + 5);
+            writeln!(
+                self.out,
+                "static const uint64_t _auto_vals_{cache_tag}_{}[] = {{{}}};",
+                b.field,
+                b.values
+                    .iter()
+                    .map(|v| format!("{v}ULL"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .ok();
+            self.pad(depth + 5);
+            writeln!(
+                self.out,
+                "_pref_{cache_tag}_{} = _auto_vals_{cache_tag}_{}[_i];",
+                a.field, a.field
+            )
+            .ok();
+            self.pad(depth + 5);
+            writeln!(
+                self.out,
+                "_pref_{cache_tag}_{} = _auto_vals_{cache_tag}_{}[_j];",
+                b.field, b.field
+            )
+            .ok();
+            self.pad(depth + 5);
+            writeln!(self.out, "_auto_cov_pref_{cache_tag} = true;").ok();
+            self.pad(depth + 5);
+            writeln!(self.out, "break;").ok();
+            self.pad(depth + 4);
+            writeln!(self.out, "}}").ok();
+            self.pad(depth + 3);
+            writeln!(self.out, "}}").ok();
+            self.pad(depth + 3);
+            writeln!(self.out, "if (_auto_cov_pref_{cache_tag}) break;").ok();
+            self.pad(depth + 2);
+            writeln!(self.out, "}}").ok();
+            self.pad(depth + 1);
+            writeln!(self.out, "}}").ok();
+        }
+        for goal in &auto_goals {
+            self.pad(depth + 1);
+            writeln!(self.out, "if (!_auto_cov_pref_{cache_tag}) {{").ok();
+            self.pad(depth + 2);
+            writeln!(
+                self.out,
+                "static const uint64_t _auto_vals_{cache_tag}_{}[] = {{{}}};",
+                goal.field,
+                goal.values
+                    .iter()
+                    .map(|v| format!("{v}ULL"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .ok();
+            self.pad(depth + 2);
+            writeln!(
+                self.out,
+                "for (size_t _i = 0; _i < {}; ++_i) {{",
+                goal.values.len()
+            )
+            .ok();
+            self.pad(depth + 3);
+            writeln!(
+                self.out,
+                "if (!_auto_cov_{cache_tag}_{}[_i]) {{ _pref_{cache_tag}_{} = _auto_vals_{cache_tag}_{}[_i]; _auto_cov_pref_{cache_tag} = true; break; }}",
+                goal.field, goal.field, goal.field
+            )
+            .ok();
+            self.pad(depth + 2);
+            writeln!(self.out, "}}").ok();
+            self.pad(depth + 1);
+            writeln!(self.out, "}}").ok();
         }
         self.pad(depth + 1);
         writeln!(
@@ -6975,6 +7161,30 @@ impl Emitter {
                     f.name, f.name
                 )
                 .ok();
+            }
+        }
+        for goal in &auto_goals {
+            for (idx, value) in goal.values.iter().enumerate() {
+                self.pad(depth + 2);
+                writeln!(
+                    self.out,
+                    "if ((uint64_t)_val_{} == {}ULL) _auto_cov_{cache_tag}_{}[{}] = true;",
+                    goal.field, value, goal.field, idx
+                )
+                .ok();
+            }
+        }
+        for (a, b) in &auto_crosses {
+            for (i, av) in a.values.iter().enumerate() {
+                for (j, bv) in b.values.iter().enumerate() {
+                    self.pad(depth + 2);
+                    writeln!(
+                        self.out,
+                        "if ((uint64_t)_val_{} == {}ULL && (uint64_t)_val_{} == {}ULL) _auto_cross_{cache_tag}_{}__{}[{}][{}] = true;",
+                        a.field, av, b.field, bv, a.field, b.field, i, j
+                    )
+                    .ok();
+                }
             }
         }
         self.emit_randomize_trace_event(ty, target, depth + 2);
@@ -8104,11 +8314,12 @@ impl Emitter {
                 combined.extend(txn_keeps);
                 combined.extend(with_body.iter().cloned());
                 self.report_runtime_dependent_randomize_field_attrs(&ty);
-                let has_unique_fields = self
-                    .txn_fields
-                    .get(&ty)
-                    .is_some_and(|fields| fields.iter().any(field_attr_unique));
-                if combined.is_empty() && !has_unique_fields {
+                let has_solver_policy_fields = self.txn_fields.get(&ty).is_some_and(|fields| {
+                    fields
+                        .iter()
+                        .any(|f| field_attr_unique(f) || !auto_coverage_values(f).is_empty())
+                });
+                if combined.is_empty() && !has_solver_policy_fields {
                     // No constraints anywhere: simple field-by-field PRNG path.
                     self.pad(depth);
                     write!(self.out, "randomize_{ty}(&").ok();
@@ -9782,9 +9993,9 @@ impl Emitter {
 /// `<z3++.h>` include + Z3 link flags. The check needs to mirror the
 /// codegen's actual decision:
 ///   * `randomize(t) with <body>` — always solver (user wrote constraints)
-///   * bare `randomize(t)` where `t`'s transaction has `keep` items or
-///     `[unique]` fields — also solver (keeps and unique history are
-///     call-site constraints)
+///   * bare `randomize(t)` where `t`'s transaction has `keep` items,
+///     `[unique]` fields, or auto coverage goals — also solver (keeps and
+///     policy preferences are call-site constraints)
 pub fn uses_constraint_solver(file: &SourceFile) -> bool {
     // First pass: collect names of transactions whose bare `randomize(t)`
     // needs the solver path. False positives are cheap (an unused include);
@@ -9794,7 +10005,7 @@ pub fn uses_constraint_solver(file: &SourceFile) -> bool {
         .iter()
         .filter_map(|it| match it {
             Item::Transaction(t) => {
-                if txn_body_has_keep(&t.body) || txn_body_has_unique_attr(&t.body) {
+                if txn_body_has_keep(&t.body) || txn_body_has_solver_policy(&t.body) {
                     Some(t.name.name.as_str())
                 } else {
                     None
@@ -11846,12 +12057,31 @@ fn txn_body_has_keep(items: &[TxnBodyItem]) -> bool {
     })
 }
 
-fn txn_body_has_unique_attr(items: &[TxnBodyItem]) -> bool {
+fn txn_body_has_solver_policy(items: &[TxnBodyItem]) -> bool {
     items.iter().any(|item| match item {
-        TxnBodyItem::Field(f) => f.attrs.iter().any(|a| a.name.name == "unique"),
-        TxnBodyItem::When(w) => txn_body_has_unique_attr(&w.items),
+        TxnBodyItem::Field(f) => txn_field_has_solver_policy(f),
+        TxnBodyItem::When(w) => txn_body_has_solver_policy(&w.items),
         TxnBodyItem::Keep(_) => false,
     })
+}
+
+fn txn_field_has_solver_policy(f: &Field) -> bool {
+    if f.attrs
+        .iter()
+        .any(|a| a.name.name == "unique" || a.name.name == "range")
+    {
+        return true;
+    }
+    match &f.ty {
+        TypeExpr::Builtin { name, args, .. } => match name {
+            BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => true,
+            BuiltinTy::Bits => type_arg_width(args) == Some(1),
+            _ => false,
+        },
+        // Named transaction fields may be enums; treat them as solver-bearing
+        // here so the Z3 include decision conservatively matches codegen.
+        TypeExpr::Named { .. } => true,
+    }
 }
 
 fn collect_txn_keeps(items: &[TxnBodyItem]) -> Vec<Expr> {
