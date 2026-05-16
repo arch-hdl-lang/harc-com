@@ -614,6 +614,54 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     writeln!(e.out, "}}").ok();
     writeln!(e.out, "").ok();
 
+    // ── Semantic trace runtime ───────────────────────────────────────────
+    // JSONL writer used by `harc sim --record-trace <path>` (plumbed as
+    // HARC_TRACE by the CLI). Keep this tiny and dependency-free so the
+    // emitted TB remains a single C++ file plus runtime header.
+    writeln!(e.out, "static std::string harc_trace_escape(const std::string& s) {{").ok();
+    writeln!(e.out, "{INDENT}std::string out; out.reserve(s.size() + 8);").ok();
+    writeln!(e.out, "{INDENT}for (unsigned char c : s) {{").ok();
+    writeln!(e.out, "{INDENT}{INDENT}switch (c) {{").ok();
+    writeln!(e.out, "{INDENT}{INDENT}{INDENT}case '\"': out += \"\\\\\\\"\"; break;").ok();
+    writeln!(e.out, "{INDENT}{INDENT}{INDENT}case '\\\\': out += \"\\\\\\\\\"; break;").ok();
+    writeln!(e.out, "{INDENT}{INDENT}{INDENT}case '\\n': out += \"\\\\n\"; break;").ok();
+    writeln!(e.out, "{INDENT}{INDENT}{INDENT}case '\\r': out += \"\\\\r\"; break;").ok();
+    writeln!(e.out, "{INDENT}{INDENT}{INDENT}case '\\t': out += \"\\\\t\"; break;").ok();
+    writeln!(e.out, "{INDENT}{INDENT}{INDENT}default:").ok();
+    writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}if (c < 0x20) {{ char buf[7]; std::snprintf(buf, sizeof(buf), \"\\\\u%04x\", c); out += buf; }}").ok();
+    writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}else out.push_back((char)c);").ok();
+    writeln!(e.out, "{INDENT}{INDENT}}}").ok();
+    writeln!(e.out, "{INDENT}}}").ok();
+    writeln!(e.out, "{INDENT}return out;").ok();
+    writeln!(e.out, "}}").ok();
+    writeln!(e.out, "struct HarcTraceWriter {{").ok();
+    writeln!(e.out, "{INDENT}FILE* out = nullptr;").ok();
+    writeln!(e.out, "{INDENT}uint64_t seq = 0;").ok();
+    writeln!(e.out, "{INDENT}bool enabled = false;").ok();
+    writeln!(e.out, "{INDENT}void open_env() {{ const char* p = std::getenv(\"HARC_TRACE\"); if (p && *p) {{ out = std::fopen(p, \"w\"); enabled = (out != nullptr); }} }}").ok();
+    writeln!(e.out, "{INDENT}void close() {{ if (out) {{ std::fflush(out); std::fclose(out); out = nullptr; }} enabled = false; }}").ok();
+    writeln!(e.out, "{INDENT}uint64_t next_seq() {{ return seq++; }}").ok();
+    writeln!(e.out, "{INDENT}void meta(uint64_t seed, const char* backend, const char* top, const char* test) {{").ok();
+    writeln!(e.out, "{INDENT}{INDENT}if (!enabled) return;").ok();
+    writeln!(e.out, "{INDENT}{INDENT}std::fprintf(out, \"{{\\\"type\\\":\\\"meta\\\",\\\"schema_version\\\":1,\\\"tool\\\":\\\"harc\\\",\\\"seed\\\":%llu,\\\"dut_backend\\\":\\\"%s\\\",\\\"top\\\":\\\"%s\\\",\\\"test\\\":\\\"%s\\\"}}\\n\", (unsigned long long)seed, backend ? backend : \"unknown\", top ? top : \"\", test ? test : \"\");").ok();
+    writeln!(e.out, "{INDENT}{INDENT}std::fflush(out);").ok();
+    writeln!(e.out, "{INDENT}}}").ok();
+    writeln!(e.out, "{INDENT}void raw(const char* type, int cycle, const std::string& payload) {{").ok();
+    writeln!(e.out, "{INDENT}{INDENT}if (!enabled) return;").ok();
+    writeln!(e.out, "{INDENT}{INDENT}std::fprintf(out, \"{{\\\"type\\\":\\\"%s\\\",\\\"cycle\\\":%d,\\\"seq\\\":%llu%s%s}}\\n\", type, cycle, (unsigned long long)next_seq(), payload.empty() ? \"\" : \",\", payload.c_str());").ok();
+    writeln!(e.out, "{INDENT}{INDENT}std::fflush(out);").ok();
+    writeln!(e.out, "{INDENT}}}").ok();
+    writeln!(e.out, "{INDENT}void log(int cycle, const char* sev, const std::string& msg) {{").ok();
+    writeln!(e.out, "{INDENT}{INDENT}std::string payload = \"\\\"severity\\\":\\\"\" + harc_trace_escape(sev ? sev : \"\") + \"\\\",\\\"message\\\":\\\"\" + harc_trace_escape(msg) + \"\\\"\";").ok();
+    writeln!(e.out, "{INDENT}{INDENT}raw(\"log\", cycle, payload);").ok();
+    writeln!(e.out, "{INDENT}{INDENT}if (sev && std::strcmp(sev, \"FAIL\") == 0) {{").ok();
+    writeln!(e.out, "{INDENT}{INDENT}{INDENT}std::string fail_payload = \"\\\"failure_id\\\":\\\"fail\\\",\\\"message\\\":\\\"\" + harc_trace_escape(msg) + \"\\\"\";").ok();
+    writeln!(e.out, "{INDENT}{INDENT}{INDENT}raw(\"assertion_failure\", cycle, fail_payload);").ok();
+    writeln!(e.out, "{INDENT}{INDENT}}}").ok();
+    writeln!(e.out, "{INDENT}}}").ok();
+    writeln!(e.out, "}};").ok();
+    writeln!(e.out, "").ok();
+
     // Tiny FIFO wrapper for `queue<T>` scoreboard fields. Provides pop()
     // returning the front element (std::queue separates front/pop), and
     // empty()/size(). Emitted only when scoreboards exist.
@@ -1031,6 +1079,10 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // Seed PRNG from HARC_SEED env (or 1 if unset). Logged after sim_log_line
     // is defined so it lands in sim.log along with normal test output.
     writeln!(e.out, "{INDENT}{{ const char* s = std::getenv(\"HARC_SEED\"); harc_rng_state = s ? std::strtoull(s, nullptr, 0) : 1ULL; }}").ok();
+    writeln!(e.out, "{INDENT}HarcTraceWriter trace;").ok();
+    writeln!(e.out, "{INDENT}trace.open_env();").ok();
+    writeln!(e.out, "{INDENT}trace.meta(harc_rng_state, std::getenv(\"HARC_DUT_BACKEND\"), \"{dut_type}\", \"{}\");", test.name.name).ok();
+    writeln!(e.out, "{INDENT}trace.raw(\"sim_start\", cycle_count, \"\");").ok();
     writeln!(e.out, "").ok();
     // sim.log captures every log()/assert/fail line with cycle + severity
     // prefix. Path is configurable via the HARC_SIM_LOG env var (so the
@@ -1282,6 +1334,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     )
     .ok();
     writeln!(e.out, "{INDENT}{INDENT}va_list ap;").ok();
+    writeln!(e.out, "{INDENT}{INDENT}char _trace_msg[4096];").ok();
+    writeln!(e.out, "{INDENT}{INDENT}va_start(ap, fmt); std::vsnprintf(_trace_msg, sizeof(_trace_msg), fmt, ap); va_end(ap);").ok();
     writeln!(
         e.out,
         "{INDENT}{INDENT}std::printf(\"[cycle:%d %s] \", cycle_count, sev);"
@@ -1289,7 +1343,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     .ok();
     writeln!(
         e.out,
-        "{INDENT}{INDENT}va_start(ap, fmt); std::vprintf(fmt, ap); va_end(ap);"
+        "{INDENT}{INDENT}std::printf(\"%s\", _trace_msg);"
     )
     .ok();
     writeln!(e.out, "{INDENT}{INDENT}std::printf(\"\\n\");").ok();
@@ -1301,7 +1355,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     .ok();
     writeln!(
         e.out,
-        "{INDENT}{INDENT}{INDENT}va_start(ap, fmt); std::vfprintf(sim_log, fmt, ap); va_end(ap);"
+        "{INDENT}{INDENT}{INDENT}std::fprintf(sim_log, \"%s\", _trace_msg);"
     )
     .ok();
     writeln!(
@@ -1311,6 +1365,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     .ok();
     writeln!(e.out, "{INDENT}{INDENT}{INDENT}std::fflush(sim_log);").ok();
     writeln!(e.out, "{INDENT}{INDENT}}}").ok();
+    writeln!(e.out, "{INDENT}{INDENT}trace.log(cycle_count, sev, _trace_msg);").ok();
     writeln!(e.out, "{INDENT}}};").ok();
     writeln!(e.out, "").ok();
 
@@ -1888,6 +1943,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         "{INDENT}for (auto& kv : log_files) {{ if (kv.second) std::fclose(kv.second); }}"
     )
     .ok();
+    writeln!(e.out, "{INDENT}trace.raw(\"sim_end\", cycle_count, \"\\\"errors\\\":\" + std::to_string(errors));").ok();
+    writeln!(e.out, "{INDENT}trace.close();").ok();
     writeln!(e.out, "").ok();
     writeln!(
         e.out,
@@ -5402,6 +5459,46 @@ impl Emitter {
         writeln!(self.out, "").ok();
     }
 
+    fn emit_randomize_trace_event(&mut self, ty: &str, target: &Expr, depth: usize) {
+        let Some(fields) = self.txn_fields.get(ty).cloned() else {
+            return;
+        };
+        self.pad(depth);
+        writeln!(self.out, "if (trace.enabled) {{").ok();
+        self.pad(depth + 1);
+        writeln!(
+            self.out,
+            "std::string _trace_fields = \"\\\"txn_type\\\":\\\"{}\\\",\\\"fields\\\":{{\";",
+            escape_c(ty)
+        )
+        .ok();
+        for (i, f) in fields.iter().enumerate() {
+            self.pad(depth + 1);
+            let prefix = if i == 0 {
+                format!("\\\"{}\\\":", escape_c(&f.name))
+            } else {
+                format!(",\\\"{}\\\":", escape_c(&f.name))
+            };
+            write!(
+                self.out,
+                "_trace_fields += \"{prefix}\" + std::to_string((unsigned long long)("
+            )
+            .ok();
+            self.emit_expr(target);
+            writeln!(self.out, ".{}));", f.name).ok();
+        }
+        self.pad(depth + 1);
+        writeln!(self.out, "_trace_fields += \"}}\";").ok();
+        self.pad(depth + 1);
+        writeln!(
+            self.out,
+            "trace.raw(\"randomize\", cycle_count, _trace_fields);"
+        )
+        .ok();
+        self.pad(depth);
+        writeln!(self.out, "}}").ok();
+    }
+
     /// Emit one random-field assignment honouring `[range(...)]` and
     /// `[dist {...}]` attributes. Falls back to a uniform sample over the
     /// declared type's value range.
@@ -5895,6 +5992,7 @@ impl Emitter {
                 .ok();
             }
         }
+        self.emit_randomize_trace_event(ty, target, depth + 2);
         self.pad(depth + 1);
         writeln!(self.out, "}} else {{").ok();
         self.pad(depth + 2);
@@ -6906,6 +7004,7 @@ impl Emitter {
                     write!(self.out, "randomize_{ty}(&").ok();
                     self.emit_expr(target);
                     writeln!(self.out, ");").ok();
+                    self.emit_randomize_trace_event(&ty, target, depth);
                 } else {
                     // Constraint-solving path via Z3.
                     self.emit_constraint_solver_block(&ty, target, &combined, depth);

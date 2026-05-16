@@ -132,6 +132,11 @@ enum Cmd {
         /// docs/separate-compilation-plan.md §1c.
         #[arg(long)]
         rebuild: bool,
+        /// Record a semantic execution trace as JSONL. The generated
+        /// testbench writes one metadata header followed by runtime
+        /// events such as logs, failures, and randomization results.
+        #[arg(long)]
+        record_trace: Option<PathBuf>,
     },
     // ── Learning store (sister to `arch advise` and friends, port of
     // arch-com/src/learn.rs). Every `harc check` / `harc sim` records
@@ -224,6 +229,7 @@ fn main() -> Result<()> {
             z3_include_dir,
             z3_lib_dir,
             rebuild,
+            record_trace,
         } => {
             let captured = files.clone();
             learn_wrap(&captured, || {
@@ -246,6 +252,7 @@ fn main() -> Result<()> {
                         lib_dir: z3_lib_dir.clone(),
                     },
                     rebuild,
+                    record_trace.clone(),
                 )
             })
         }
@@ -823,6 +830,13 @@ fn write_if_changed(path: &Path, contents: &[u8]) -> Result<bool> {
     Ok(true)
 }
 
+fn absolutize_trace_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(std::env::current_dir().into_diagnostic()?.join(path))
+}
+
 fn run_verilator(
     top: &str,
     sv: &[PathBuf],
@@ -835,6 +849,7 @@ fn run_verilator(
     z3_paths: &Z3Paths,
     test: Option<&str>,
     rebuild: bool,
+    record_trace: Option<&PathBuf>,
 ) -> Result<()> {
     let mdir = outdir_abs.join("obj_dir");
     // Build-reuse path (Phase 1c). When `--rebuild` is unset and the
@@ -1006,7 +1021,11 @@ fn run_verilator(
     eprintln!("running: {}", bin.display());
     let mut cmd = Command::new(&bin);
     cmd.env("HARC_SIM_LOG", sim_log_path)
-        .env("HARC_LOG_DIR", outdir_abs);
+        .env("HARC_LOG_DIR", outdir_abs)
+        .env("HARC_DUT_BACKEND", "sv");
+    if let Some(path) = record_trace {
+        cmd.env("HARC_TRACE", path);
+    }
     if let Some(s) = seed {
         cmd.env("HARC_SEED", s.to_string());
     }
@@ -1047,6 +1066,7 @@ fn cmd_sim(
     ref_src: Vec<PathBuf>,
     z3_opts: Z3PathOpts,
     rebuild: bool,
+    record_trace: Option<PathBuf>,
 ) -> Result<()> {
     if dut.is_empty() && sv.is_empty() {
         return Err(miette::miette!(
@@ -1118,6 +1138,10 @@ fn cmd_sim(
     let cpp_abs = fs::canonicalize(&cpp_path).into_diagnostic()?;
     let outdir_abs = fs::canonicalize(&outdir).into_diagnostic()?;
     let sim_log_path = outdir_abs.join("sim.log");
+    let trace_abs = record_trace
+        .as_ref()
+        .map(|p| absolutize_trace_path(p))
+        .transpose()?;
 
     if !sv.is_empty() {
         if uses_solver {
@@ -1171,6 +1195,7 @@ fn cmd_sim(
             &z3_paths,
             test.as_deref(),
             rebuild,
+            trace_abs.as_ref(),
         );
     }
 
@@ -1238,7 +1263,11 @@ fn cmd_sim(
         // Anchor relative `logf("foo.log", ...)` paths to the build dir so
         // per-component log files land next to sim.log instead of under
         // arch-com/ (where the binary actually runs from).
-        .env("HARC_LOG_DIR", &outdir_abs);
+        .env("HARC_LOG_DIR", &outdir_abs)
+        .env("HARC_DUT_BACKEND", "arch");
+    if let Some(path) = &trace_abs {
+        cmd.env("HARC_TRACE", path);
+    }
     if let Some(s) = seed {
         cmd.env("HARC_SEED", s.to_string());
     }
