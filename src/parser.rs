@@ -2712,6 +2712,20 @@ impl Parser {
         }
         let else_block = if self.check(TokenKind::Else) {
             self.advance();
+            // Catch `else if` — a two-token mistake from SV/Verilog
+            // muscle memory. HARC uses single-token `elsif`. Without
+            // this directed error the parser silently treats it as
+            // `else { nested if }`, which then runs out of `end`s
+            // and surfaces a misleading "opened with `if`, closed
+            // with <enclosing>" error far from the actual typo.
+            if self.check(TokenKind::If) {
+                return Err(CompileError::general(
+                    "`else if` is not HARC syntax — use single-token `elsif` instead. \
+                     (Spelling matches the keyword shape used by `elsif <cond>` chains in \
+                     `if … elsif … else … end if`.)",
+                    self.peek_span(),
+                ));
+            }
             let block_start = self.peek_span();
             let mut block_stmts = Vec::new();
             while !self.check(TokenKind::End) {
