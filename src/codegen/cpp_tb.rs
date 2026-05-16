@@ -5692,6 +5692,18 @@ impl Emitter {
                     blocking,
                 );
             }
+            ExprKind::Ident(id) => {
+                if !blocking
+                    && !field_info.contains_key(&id.name)
+                    && !self.enum_variants.contains_key(&id.name)
+                    && self.let_widths.contains_key(&id.name)
+                {
+                    self.errors.push(format!(
+                        "queued randomize({ty}) constraint references runtime state `{}`; use `blocking randomize` once runtime-dependent constraint lowering is supported",
+                        id.name
+                    ));
+                }
+            }
             ExprKind::Index { target, index } => {
                 self.validate_randomize_constraint_dependencies(
                     ty,
@@ -6672,6 +6684,8 @@ impl Emitter {
                     write!(self.out, "_z_{}", id.name).ok();
                 } else if let Some(idx) = self.enum_variants.get(&id.name).copied() {
                     write!(self.out, "_ctx.bv_val((uint64_t){}, {})", idx, width).ok();
+                } else if blocking && self.let_widths.contains_key(&id.name) {
+                    write!(self.out, "_ctx.bv_val((uint64_t)({}), {})", id.name, width).ok();
                 } else {
                     self.errors
                         .push(format!("constraint references unknown name `{}`", id.name));
