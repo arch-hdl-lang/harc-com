@@ -5673,15 +5673,11 @@ impl Emitter {
         match &*expr.kind {
             ExprKind::Field { target, name } => {
                 if let ExprKind::Ident(root) = &*target.kind {
-                    if field_info.contains_key(&name.name)
-                        && target_root.is_some_and(|expected| root.name != expected)
-                    {
-                        if !blocking {
-                            let path = format!("{}.{}", root.name, name.name);
-                            self.errors.push(format!(
-                                "queued randomize({ty}) constraint references runtime state `{path}`; use `blocking randomize` once runtime-dependent constraint lowering is supported"
-                            ));
-                        }
+                    if !blocking && target_root.is_some_and(|expected| root.name != expected) {
+                        let path = format!("{}.{}", root.name, name.name);
+                        self.errors.push(format!(
+                            "queued randomize({ty}) constraint references runtime state `{path}`; use `blocking randomize` once runtime-dependent constraint lowering is supported"
+                        ));
                     }
                 }
                 self.validate_randomize_constraint_dependencies(
@@ -6654,9 +6650,7 @@ impl Emitter {
                         && target_root.is_some_and(|expected| root.name == expected)
                     {
                         write!(self.out, "_z_{}", name.name).ok();
-                    } else if blocking
-                        && field_info.contains_key(&name.name)
-                        && target_root.is_some_and(|expected| root.name != expected)
+                    } else if blocking && target_root.is_some_and(|expected| root.name != expected)
                     {
                         write!(self.out, "_ctx.bv_val((uint64_t)(").ok();
                         self.emit_expr(e);

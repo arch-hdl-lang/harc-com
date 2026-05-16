@@ -1833,6 +1833,58 @@ end test BlockingScalarDepTest"#,
     );
 }
 
+#[test]
+fn blocking_randomize_snapshots_non_target_field_paths() {
+    let queued = parse_source(
+        r#"transaction T
+    len : uint<8>
+end transaction T
+
+test QueuedFieldPathDepTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t) with
+            t.len <= dut.max_len
+        end randomize
+    end run
+end test QueuedFieldPathDepTest"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&queued).unwrap_err();
+    assert!(
+        err.0.contains("queued randomize(T)")
+            && err.0.contains("runtime state `dut.max_len`")
+            && err.0.contains("blocking randomize"),
+        "queued randomize should reject non-target field paths with guidance; got: {}",
+        err.0,
+    );
+
+    let blocking = parse_source(
+        r#"transaction T
+    len : uint<8>
+end transaction T
+
+test BlockingFieldPathDepTest
+    let dut : DummyDut
+    run
+        let t : T
+        blocking randomize(t) with
+            t.len <= dut.max_len
+        end randomize
+    end run
+end test BlockingFieldPathDepTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&blocking).expect("blocking field-path dependency emits");
+    assert!(
+        cpp.contains(
+            "z3::ule(_z_len, _ctx.bv_val((uint64_t)(harc_rt::harc_read(dut->max_len)), 64))"
+        ),
+        "blocking randomize should snapshot non-target field paths into the solver; got:\n{cpp}",
+    );
+}
+
 /// `keep f != WRAP` where `WRAP` is an enum variant resolves via
 /// the global `enum_variants` map. Without this lookup the
 /// constraint translator would error with "unknown name `WRAP`".
