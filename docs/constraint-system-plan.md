@@ -79,6 +79,13 @@ constraints. The implementation may use rejection sampling, randomized solver
 objectives, or a hybrid strategy, but the chosen behavior must be documented
 and stable under a seed.
 
+`[unique]` and `[cyclic]` are also randomization policies, not hard field
+invariants. They should steer fields that remain unconstrained after `keep`,
+relation expansion, and `randomize ... with` constraints; explicit user
+constraints and direct assignments must win. The runtime history should be
+designed so a future solver-result cache can be queried across a selected
+group of tests without making type-level attributes impossible to override.
+
 ## Queued vs Blocking Randomize
 
 Queued randomize is the default v1 performance path: constraints that depend
@@ -121,4 +128,3 @@ typed lowering, before C++ emission.
 7. Implement principled `[dist]`, `[cyclic]`, `[unique]`, and `solve_before`.
 8. Add queued vs `blocking randomize` architecture and runtime dependency
    analysis.
-

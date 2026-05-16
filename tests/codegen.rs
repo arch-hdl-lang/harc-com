@@ -1641,31 +1641,109 @@ end test DistSolverTest"#,
 }
 
 #[test]
-fn randomize_reports_unsupported_unique_and_cyclic_attrs() {
+fn randomize_reports_unsupported_cyclic_attr() {
     let parsed = parse_source(
         r#"transaction T
-    tag : uint<8> with [unique within test]
     ctr : uint<8> with [cyclic]
 end transaction T
 
-test UniqueCyclicTest
+test CyclicTest
     let dut : DummyDut
     run
         let t : T
         randomize(t)
     end run
-end test UniqueCyclicTest"#,
+end test CyclicTest"#,
     )
     .unwrap();
     let err = cpp_tb::emit(&parsed).unwrap_err();
     assert!(
-        err.0.contains("[unique]")
-            && err.0.contains("T.tag")
-            && err.0.contains("[cyclic]")
+        err.0.contains("[cyclic]")
             && err.0.contains("T.ctr")
             && err.0.contains("runtime state semantics"),
-        "expected explicit unsupported unique/cyclic randomize diagnostics; got: {}",
+        "expected explicit unsupported cyclic randomize diagnostic; got: {}",
         err.0,
+    );
+}
+
+#[test]
+fn unique_field_randomize_uses_solver_history() {
+    let parsed = parse_source(
+        r#"transaction T
+    tag : uint<8> with [unique within test]
+end transaction T
+
+test UniqueTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test UniqueTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("z3::solver _s(_ctx);")
+            && cpp.contains("for (auto _v : _div_cache_")
+            && cpp.contains("// [unique]")
+            && cpp.contains("_div_cache_")
+            && !cpp.contains("if (_div_cache_")
+            && !cpp.contains("randomize_T(&t);"),
+        "unique fields should route bare randomize through persistent solver history; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn constrained_unique_field_skips_unique_history_policy() {
+    let parsed = parse_source(
+        r#"transaction T
+    tag : uint<8> with [unique within test]
+end transaction T
+
+test UniqueOverrideTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t) with
+            t.tag == 7
+        end randomize
+    end run
+end test UniqueOverrideTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("_s.add(_z_tag == _ctx.bv_val((uint64_t)7, 64));")
+            && !cpp.contains("[unique] policy for unconstrained field")
+            && !cpp.contains("_div_cache_"),
+        "explicit constraints on a unique field should override the unique history policy; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn range_constrained_unique_field_skips_unique_history_policy() {
+    let parsed = parse_source(
+        r#"transaction T
+    tag : uint<8> with [unique within test]
+end transaction T
+
+test UniqueConstrainedTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t) with
+            t.tag inside {7, 8}
+        end randomize
+    end run
+end test UniqueConstrainedTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("_div_cache_")
+            && !cpp.contains("[unique] policy for unconstrained field"),
+        "constraints mentioning a unique field should suppress unique history while leaving ordinary diversity available; got:\n{cpp}",
     );
 }
 
