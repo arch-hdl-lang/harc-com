@@ -39,6 +39,7 @@ watchdog_quiesce_test   | Top            | top_counter.sv         |
 env_quiesced_phase_test | Top            | top_counter.sv         |
 testbench_basic_test    | Top            | top_counter.sv         | | | TestbenchSmoke
 testbench_basic_test    | Top            | top_counter.sv         | | | TestbenchEnableToggle
+width_methods_test      | Top            | top_counter.sv         |
 keep_constraints_test   | Top            | top_counter.sv         |
 extern_fn_ref_test      | Top            | top_counter.sv         |     | extern_fn_ref.cpp
 relation_inlining_test  | Top            | top_counter.sv         |
