@@ -312,9 +312,9 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
             print_doc(out, &g.doc, depth);
             pad(out, depth);
             write!(out, "covergroup {}", g.name.name).ok();
-            if let Some(c) = &g.clocking {
+            if let Some(trigger) = &g.trigger {
                 write!(out, " @(").ok();
-                print_clocking_expr(out, c);
+                print_cover_trigger(out, trigger);
                 write!(out, ")").ok();
             }
             writeln!(out).ok();
@@ -1331,6 +1331,19 @@ fn print_clocking_expr(out: &mut String, e: &Expr) {
         }
     }
     print_expr(out, e);
+}
+
+fn print_cover_trigger(out: &mut String, trigger: &CoverTrigger) {
+    match trigger {
+        CoverTrigger::Clock(e) => print_clocking_expr(out, e),
+        CoverTrigger::Hook { call, side } => {
+            print_expr(out, call);
+            match side {
+                HookSide::Pre => write!(out, " pre").ok(),
+                HookSide::Post => write!(out, " post").ok(),
+            };
+        }
+    }
 }
 
 pub fn print_expr(out: &mut String, e: &Expr) {

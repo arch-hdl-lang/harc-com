@@ -59,6 +59,17 @@ end covergroup G
 }
 
 #[test]
+fn covergroup_with_hook_trigger() {
+    let src = r#"
+covergroup TxnCov @(mon.observed(t) post)
+    cp_op : cover t.op
+    cp_len : cover t.len
+end covergroup TxnCov
+"#;
+    parse_print_reparse(src);
+}
+
+#[test]
 fn tseq_with_composition_operators() {
     let src = r#"
 tseq DmaScenario -> TSeq<int>
