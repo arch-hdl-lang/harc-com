@@ -129,6 +129,111 @@ end test CoverAutoCrossTest"#,
 }
 
 #[test]
+fn covergroup_declared_crosses_lower_and_report() {
+    let parsed = parse_source(
+        r#"covergroup G @(posedge dut.clk)
+    cp_addr : cover dut.addr
+        bins
+            zero = {0}
+            high = [8..15]
+        end bins
+    cp_data : cover dut.data
+        bins
+            small = [0..3]
+            large = [12..15]
+        end bins
+    cross cp_addr, cp_data
+end covergroup G
+
+test CoverDeclaredCrossTest
+    let dut : DummyDut
+    run
+        let cov : G
+    end run
+end test CoverDeclaredCrossTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("uint64_t _cross_2_cp_addr__cp_data[4] = {};")
+            && cpp.contains("if (_cg_hit_cp_addr[_i0] && _cg_hit_cp_data[_i1]) {")
+            && cpp.contains("cov._cross_2_cp_addr__cp_data[(_i0 * 2 + _i1)]++;")
+            && cpp.contains("[G] cross cp_addr x cp_data")
+            && !cpp.contains("[G] auto_cross cp_addr x cp_data")
+            && cpp.contains("cp_addr.zero x cp_data.small: *NOT HIT*"),
+        "declared covergroup crosses should update and report sample-local bin combinations; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn covergroup_declared_three_way_crosses_flatten_bins() {
+    let parsed = parse_source(
+        r#"covergroup G @(posedge dut.clk)
+    cp_op : cover dut.op
+        bins
+            read = {0}
+            write = {1}
+        end bins
+    cp_burst : cover dut.burst
+        bins
+            fixed = {0}
+            incr = {1}
+        end bins
+    cp_len : cover dut.len
+        bins
+            single = {0}
+            multi = [1..15]
+        end bins
+    cross cp_op, cp_burst, cp_len
+end covergroup G
+
+test CoverDeclaredThreeWayCrossTest
+    let dut : DummyDut
+    run
+        let cov : G
+    end run
+end test CoverDeclaredThreeWayCrossTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("uint64_t _cross_3_cp_op__cp_burst__cp_len[8] = {};")
+            && cpp.contains("cov._cross_3_cp_op__cp_burst__cp_len[((_i0 * 2 + _i1) * 2 + _i2)]++;")
+            && cpp.contains("[G] cross cp_op x cp_burst x cp_len")
+            && cpp.contains("cp_op.read x cp_burst.fixed x cp_len.single: *NOT HIT*"),
+        "declared three-way crosses should flatten and report all bin tuples; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn covergroup_declared_crosses_validate_targets() {
+    let parsed = parse_source(
+        r#"covergroup G @(posedge dut.clk)
+    cp_addr : cover dut.addr
+        bins
+            zero = {0}
+        end bins
+    cross cp_addr, cp_missing
+end covergroup G
+
+test CoverBadCrossTest
+    let dut : DummyDut
+    run
+        let cov : G
+    end run
+end test CoverBadCrossTest"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&parsed).unwrap_err();
+    assert!(
+        err.0
+            .contains("covergroup `G` cross references unknown coverpoint `cp_missing`"),
+        "declared covergroup crosses should validate point names; got: {}",
+        err.0
+    );
+}
+
+#[test]
 fn hook_triggered_covergroups_sample_at_hook_point() {
     let parsed = parse_source(
         r#"transaction Txn
@@ -208,6 +313,84 @@ end test HookCoverArgTest"#,
         err.0
             .contains("hook trigger argument `pkt` must match hook parameter `t`"),
         "hook-triggered covergroups should validate trigger args against hook params; got: {}",
+        err.0
+    );
+}
+
+#[test]
+fn hook_triggered_covergroups_resolve_nested_paths() {
+    let parsed = parse_source(
+        r#"transaction Txn
+    op : uint<8>
+end transaction Txn
+
+agent Mon
+    hookable observed(t: Txn)
+    end observed
+end agent Mon
+
+env Env
+    mon : Mon
+end env Env
+
+covergroup TxnCov @(env.mon.observed(t) post)
+    cp_op : cover t.op
+        bins
+            read = {0}
+            write = {1}
+        end bins
+end covergroup TxnCov
+
+test NestedHookCoverTriggerTest
+    let dut : DummyDut
+    run
+        let env : Env
+        let cov : TxnCov
+    end run
+end test NestedHookCoverTriggerTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("Mon_observed_post.push_back([&](Txn t) {")
+            && cpp.contains("uint64_t _v = (uint64_t)(t.op);"),
+        "hook-triggered covergroups should resolve nested component paths; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn hook_triggered_covergroups_reject_non_hookable_targets() {
+    let parsed = parse_source(
+        r#"transaction Txn
+    op : uint<8>
+end transaction Txn
+
+agent Mon
+    function observed(t: Txn)
+    end function observed
+end agent Mon
+
+covergroup TxnCov @(mon.observed(t) post)
+    cp_op : cover t.op
+        bins
+            read = {0}
+        end bins
+end covergroup TxnCov
+
+test BadHookCoverTriggerTest
+    let dut : DummyDut
+    run
+        let mon : Mon
+        let cov : TxnCov
+    end run
+end test BadHookCoverTriggerTest"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&parsed).unwrap_err();
+    assert!(
+        err.0
+            .contains("hook trigger must resolve to a `hookable` on a known component type"),
+        "hook-triggered covergroups should reject non-hookable methods; got: {}",
         err.0
     );
 }
