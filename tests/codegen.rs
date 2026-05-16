@@ -1606,6 +1606,40 @@ end test SeededSolverTest"#,
     );
 }
 
+#[test]
+fn constraint_solver_uses_range_and_dist_metadata() {
+    let parsed = parse_source(
+        r#"transaction T
+    len : uint<8> with [range(1, 4)] [dist {[1..2] :/ 70, [3..4] :/ 30}]
+    keep len > 0
+end transaction T
+
+test DistSolverTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t) with
+            t.len dist { [3..4] :/ 90, [1..2] :/ 10 }
+        end randomize
+    end run
+end test DistSolverTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+
+    assert!(
+        cpp.contains("z3::uge(_z_len, _ctx.bv_val((uint64_t)1, 64))")
+            && cpp.contains("z3::ule(_z_len, _ctx.bv_val((uint64_t)4, 64))"),
+        "field [range] should lower as hard solver bounds; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("uint64_t _pref_")
+            && cpp.contains("harc_rng_dist({{(int64_t)(3), (int64_t)(4), (int64_t)(90)}")
+            && cpp.contains("{(int64_t)(1), (int64_t)(2), (int64_t)(10)}}"),
+        "dist metadata should feed seeded solver preferences; got:\n{cpp}"
+    );
+}
+
 /// `keep f != WRAP` where `WRAP` is an enum variant resolves via
 /// the global `enum_variants` map. Without this lookup the
 /// constraint translator would error with "unknown name `WRAP`".
