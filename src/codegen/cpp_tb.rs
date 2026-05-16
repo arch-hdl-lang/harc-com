@@ -2213,6 +2213,13 @@ fn randomize_target_field_name(
     }
 }
 
+fn solve_kind_name(kind: SolveKind) -> &'static str {
+    match kind {
+        SolveKind::Before => "solve_before",
+        SolveKind::After => "solve_after",
+    }
+}
+
 /// Per-probe codegen state. The mangled read accessor is the bare
 /// path `<TopModule>__DOT__harc_probes__DOT__<name>`. The `_drv`
 /// and `_en` siblings (force probes only) are derived by appending
@@ -5624,6 +5631,22 @@ impl Emitter {
         writeln!(self.out, "}}").ok();
     }
 
+    fn report_unsupported_randomize_field_attrs(&mut self, ty: &str) {
+        let Some(fields) = self.txn_fields.get(ty) else {
+            return;
+        };
+        for f in fields {
+            for a in &f.attrs {
+                if matches!(a.name.name.as_str(), "unique" | "cyclic") {
+                    self.errors.push(format!(
+                        "randomize({ty}): field attribute `[{}]` on `{}.{}` is parsed but not supported yet; uniqueness/cyclic history needs runtime state semantics",
+                        a.name.name, ty, f.name,
+                    ));
+                }
+            }
+        }
+    }
+
     /// Emit one random-field assignment honouring `[range(...)]` and
     /// `[dist {...}]` attributes. Falls back to a uniform sample over the
     /// declared type's value range.
@@ -5989,11 +6012,25 @@ impl Emitter {
             std::collections::HashMap::new();
         let mut hard_constraints: Vec<&Expr> = Vec::new();
         for c in with_body {
-            if let ExprKind::DistDirective { target, entries } = &*c.kind {
-                if let Some(field) = randomize_target_field_name(target, &field_info) {
-                    dist_directives.insert(field, entries.clone());
+            match &*c.kind {
+                ExprKind::DistDirective { target, entries } => {
+                    if let Some(field) = randomize_target_field_name(target, &field_info) {
+                        dist_directives.insert(field, entries.clone());
+                    } else {
+                        self.errors.push(format!(
+                            "randomize({ty}) with `dist`: target must be a field of transaction `{ty}`"
+                        ));
+                    }
                     continue;
                 }
+                ExprKind::Solve { kind, .. } => {
+                    self.errors.push(format!(
+                        "randomize({ty}) with `{}` is parsed but not supported yet; solve-order hints need typed solver scheduling semantics",
+                        solve_kind_name(*kind),
+                    ));
+                    continue;
+                }
+                _ => {}
             }
             hard_constraints.push(c);
         }
@@ -7341,6 +7378,7 @@ impl Emitter {
                 let mut combined: Vec<Expr> = Vec::with_capacity(txn_keeps.len() + with_body.len());
                 combined.extend(txn_keeps);
                 combined.extend(with_body.iter().cloned());
+                self.report_unsupported_randomize_field_attrs(&ty);
                 if combined.is_empty() {
                     // No constraints anywhere: simple field-by-field PRNG path.
                     self.pad(depth);
