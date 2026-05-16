@@ -19,7 +19,7 @@ two-block `test T { ... } / impl sim for T { run ... }` form.
 | Backend selection via CLI subcommand only | **Shipped** | implied by parser removal — no per-test annotation surface |
 | `testbench` block (shared structural skeleton + helper methods) | **Shipped** | Parser entry pre-existing; `function` keyword + codegen suppression of hook vectors landed in PR #109. Bus-binding-as-field (`bus : Bus = bind dut`) and `hookable function` deferred. |
 | `impl <name> for <Tb> ... end impl <name>` — testbench-bound test form | **Shipped** | Parser + AST + pre-emission desugaring. Canary fixture: `testbench_basic_test.harc`. Phase 2 (separate PR) sweeps the 70-fixture corpus and removes the classic `test T { let dut; ... }` form. |
-| Dead-code prune (`Item::Impl`, `ImplDecl`, `ImplItem`, `parse_impl`) | **Pending** | follow-up tidy PR |
+| Dead-code prune (`Item::Impl`, `ImplDecl`, `ImplItem`, legacy `parse_impl`) | **Shipped** | Legacy two-block impl AST/parser removed. The remaining `impl <name> for <Tb>` parser is the new testbench-bound test form. |
 
 ## 1. Motivation
 
@@ -458,28 +458,21 @@ Logic:
 The script remains in the tree for any future inbound legacy
 sources (third-party HARC files imported from elsewhere).
 
-### 7.3 Spec edits (still TODO)
+### 7.3 Spec edits
 
-These spec edits are not part of this RFC's PRs and should land
-separately:
+These spec edits landed after the implementation PRs:
 
-- §7.2: drop the multi-impl rationale. Replace with the inline-`run`
-  shape. Strike "There is no inheritance / no `super` chain — each
-  impl stands alone" and replace with "Each test stands alone — no
-  inheritance, no shared mutable state across tests."
-- §14 (Phasing): drop references to `impl X for T` from the phase
-  descriptions; the phase blocks live inside `test` directly.
-- §16 (ARCH Lowering Map): update the "Tests lower to ARCH `testbench`"
-  entry to note the user-facing `testbench` keyword (Phase 3) will
-  map more directly to the ARCH primitive than the v0 `test` block
-  did.
+- §7.2 now describes inline `test` lifecycle blocks instead of
+  `impl sim for <Test>`.
+- §12 and §16 now describe phase replacement and lowering in terms of
+  inline `test` blocks.
 
-### 7.4 Dead code (still TODO)
+### 7.4 Dead code
 
-The Phase 2 PR kept `Item::Impl`, `ImplDecl`, `ImplItem`,
-`parse_impl`, and the `cpp_tb` synthesis block that consumed them as
-unreachable code. They compile but are unused — a follow-up tidy PR
-should prune them once no in-flight branches reference them.
+The legacy two-block `impl sim for <Test>` AST/parser/codegen path has
+been removed. The remaining top-level `impl <name> for <Tb>` syntax is
+the testbench-bound test form from §3.3, not the old backend-selection
+wrapper.
 
 ## 8. Open questions
 
