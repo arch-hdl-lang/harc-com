@@ -96,10 +96,16 @@ def score(problem_dir: Path) -> int:
     repo_root = Path(__file__).resolve().parents[2]
 
     # ── 1. Gather files ──────────────────────────────────────────────
-    sv_files = sorted((problem_dir / "dut").glob("*.sv"))
+    # CVDP source files come as either `.sv` (SystemVerilog) or `.v`
+    # (plain Verilog). Verilator accepts both via the same `--sv`
+    # / `-cc` flow, so we hand both extensions to harc-sim.
+    sv_files = sorted(
+        list((problem_dir / "dut").glob("*.sv"))
+        + list((problem_dir / "dut").glob("*.v"))
+    )
     harc_files = sorted((problem_dir / "tb").glob("*.harc"))
     if not sv_files:
-        print(f"ERROR: no .sv files in {problem_dir}/dut/", file=sys.stderr)
+        print(f"ERROR: no .sv / .v files in {problem_dir}/dut/", file=sys.stderr)
         return 2
     if not harc_files:
         print(f"ERROR: no .harc files in {problem_dir}/tb/", file=sys.stderr)

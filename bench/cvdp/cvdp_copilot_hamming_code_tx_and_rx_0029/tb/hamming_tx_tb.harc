@@ -1,0 +1,42 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_hamming_code_tx_and_rx_0029`.
+//
+// DUT: hamming_code_tx_for_4bit — a 4-bit Hamming(8,4) encoder.
+//   data_out[0] = 0                          (padding)
+//   data_out[1] = d[0] ^ d[1] ^ d[3]         (parity 2^0)
+//   data_out[2] = d[0] ^ d[2] ^ d[3]         (parity 2^1)
+//   data_out[3] = d[0]
+//   data_out[4] = d[1] ^ d[2] ^ d[3]         (parity 2^2)
+//   data_out[5] = d[1]
+//   data_out[6] = d[2]
+//   data_out[7] = d[3]
+//
+// Pure combinational. 16 distinct inputs total → exhaustive sweep.
+// Every input toggles every data bit at least once across 0..16,
+// driving toggle coverage on the bus. The software model is the
+// expression above re-applied as `let exp = ...`.
+
+testbench HammingTxTb
+    dut : hamming_code_tx_for_4bit_top
+end testbench HammingTxTb
+
+impl HammingTxTest for HammingTxTb
+    run
+        log(info, "hamming_code_tx_for_4bit: exhaustive 4-bit sweep")
+        for i in 0 .. 16
+            dut.data_in = i
+            wait 1 cycle
+            let d0 = (i >> 0) & 1
+            let d1 = (i >> 1) & 1
+            let d2 = (i >> 2) & 1
+            let d3 = (i >> 3) & 1
+            let exp_b1 = d0 ^ d1 ^ d3
+            let exp_b2 = d0 ^ d2 ^ d3
+            let exp_b4 = d1 ^ d2 ^ d3
+            let exp = (d3 << 7) | (d2 << 6) | (d1 << 5) | (exp_b4 << 4)
+                    | (d0 << 3) | (exp_b2 << 2) | (exp_b1 << 1) | 0
+            assert dut.data_out == exp
+                else fail("data_in=${i}: got 0x${dut.data_out:02x}, expected 0x${exp:02x}")
+        end for
+        log(info, "PASS: 16/16 hamming codewords match the software model")
+    end run
+end impl HammingTxTest

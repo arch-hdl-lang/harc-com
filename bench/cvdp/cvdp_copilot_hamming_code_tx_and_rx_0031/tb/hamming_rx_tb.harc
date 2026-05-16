@@ -1,0 +1,51 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_hamming_code_tx_and_rx_0031`.
+//
+// DUT: hamming_code_receiver — 8-bit Hamming(8,4) receiver / decoder.
+//   c3 = data_in[1] ^ data_in[3] ^ data_in[5] ^ data_in[7]
+//   c2 = data_in[2] ^ data_in[3] ^ data_in[6] ^ data_in[7]
+//   c1 = data_in[4] ^ data_in[5] ^ data_in[6] ^ data_in[7]
+//   syndrome = {c1,c2,c3}  (3 bits)
+//   if syndrome != 0, flip the bit at position `syndrome` in data_in.
+//   data_out = {correct[7], correct[6], correct[5], correct[3]}.
+//
+// Combinational. 256 distinct inputs total → exhaustive sweep covers
+// every syndrome value (each appearing 256/8 = 32 times) and every
+// possible bit-flip target.
+
+testbench HammingRxTb
+    dut : hamming_code_receiver_top
+end testbench HammingRxTb
+
+impl HammingRxTest for HammingRxTb
+    run
+        log(info, "hamming_code_receiver: exhaustive 8-bit sweep")
+        for i in 0 .. 256
+            dut.data_in = i
+            wait 1 cycle
+            let b0 = (i >> 0) & 1
+            let b1 = (i >> 1) & 1
+            let b2 = (i >> 2) & 1
+            let b3 = (i >> 3) & 1
+            let b4 = (i >> 4) & 1
+            let b5 = (i >> 5) & 1
+            let b6 = (i >> 6) & 1
+            let b7 = (i >> 7) & 1
+            let c3 = b1 ^ b3 ^ b5 ^ b7
+            let c2 = b2 ^ b3 ^ b6 ^ b7
+            let c1 = b4 ^ b5 ^ b6 ^ b7
+            let syn = (c1 << 2) | (c2 << 1) | c3
+            let corrected = i
+            if syn != 0
+                corrected = i ^ (1 << syn)
+            end if
+            let cb3 = (corrected >> 3) & 1
+            let cb5 = (corrected >> 5) & 1
+            let cb6 = (corrected >> 6) & 1
+            let cb7 = (corrected >> 7) & 1
+            let exp = (cb7 << 3) | (cb6 << 2) | (cb5 << 1) | cb3
+            assert dut.data_out == exp
+                else fail("data_in=0x${i:02x}: got 0x${dut.data_out:01x}, expected 0x${exp:01x}")
+        end for
+        log(info, "ALL TESTS PASSED: 256/256 hamming decodes match the software model")
+    end run
+end impl HammingRxTest

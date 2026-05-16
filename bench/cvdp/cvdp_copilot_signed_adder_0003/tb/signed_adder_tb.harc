@@ -1,0 +1,302 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_signed_adder_0003`.
+//
+// DUT: signedadder (DATA_WIDTH=8) — FSM IDLE→LOAD→COMPUTE→OUTPUT→IDLE
+// driven by i_start/i_enable. mode=0 → add, mode=1 → sub. Computes
+// signed overflow flag per the classic two's-complement rule:
+//   add overflow: same-sign inputs, opposite-sign result
+//   sub overflow: opposite-sign inputs, result sign matches subtrahend
+//
+// Reset is async negedge on i_rst_n.
+//
+// Strategy:
+//   - reset
+//   - normal completions for add (no overflow, +ovf, -ovf) and sub
+//     (no overflow, +ovf, -ovf)
+//   - mid-stream i_clear test
+//   - i_enable drop-out at LOAD, COMPUTE, OUTPUT
+//   - i_start without i_enable (IDLE non-transition)
+// 99% target — keep coverage thorough.
+
+testbench SignedAdderTb
+    dut : signedadder_top
+end testbench SignedAdderTb
+
+impl SignedAdderTest for SignedAdderTb
+    run
+        log(info, "signedadder: FSM walk + overflow corner cases")
+
+        // ── Reset ────────────────────────────────────────────────
+        dut.i_rst_n = 0
+        dut.i_start = 0
+        dut.i_enable = 0
+        dut.i_mode = 0
+        dut.i_clear = 0
+        dut.i_operand_a = 0
+        dut.i_operand_b = 0
+        wait 2 cycles
+        dut.i_rst_n = 1
+        wait 1 cycle
+        assert dut.o_status == 0
+            else fail("post-reset: o_status=${dut.o_status}, expected IDLE (0)")
+        assert dut.o_ready == 0
+            else fail("post-reset: o_ready should be 0")
+
+        // ── Helper: run one operation expecting completion ───────
+        // Sequence: IDLE(i_enable+start) → LOAD → COMPUTE → OUTPUT → IDLE
+        // Takes 4 cycles to complete; o_ready pulses high in OUTPUT.
+
+        // ── Add: 5 + 3 = 8, no overflow ─────────────────────────
+        dut.i_operand_a = 5
+        dut.i_operand_b = 3
+        dut.i_mode = 0
+        dut.i_start = 1
+        dut.i_enable = 1
+        wait 1 cycle  // IDLE→LOAD
+        assert dut.o_status == 1
+            else fail("after-IDLE start: o_status=${dut.o_status}, expected LOAD (1)")
+        wait 1 cycle  // LOAD→COMPUTE
+        assert dut.o_status == 2
+            else fail("after-LOAD: o_status=${dut.o_status}, expected COMPUTE (2)")
+        wait 1 cycle  // COMPUTE→OUTPUT
+        assert dut.o_status == 3
+            else fail("after-COMPUTE: o_status=${dut.o_status}, expected OUTPUT (3)")
+        wait 1 cycle  // OUTPUT→IDLE (and outputs latch)
+        assert dut.o_ready == 1
+            else fail("after-OUTPUT: o_ready=${dut.o_ready}, expected 1")
+        assert dut.o_resultant_sum == 8
+            else fail("add 5+3: sum=${dut.o_resultant_sum}, expected 8")
+        assert dut.o_overflow == 0
+            else fail("add 5+3: overflow=${dut.o_overflow}, expected 0")
+
+        dut.i_start = 0
+
+        // ── Add: 100 + 50 = 150 (=-106 in 8-bit signed), +overflow ─
+        wait 1 cycle  // already in IDLE; ready clears next IDLE entry
+        dut.i_operand_a = 100  // 0x64
+        dut.i_operand_b = 50   // 0x32
+        dut.i_mode = 0
+        dut.i_start = 1
+        wait 4 cycles  // IDLE→LOAD→COMPUTE→OUTPUT→IDLE
+        // Result: 100+50=150 → low 8 bits = 0x96
+        assert dut.o_resultant_sum == 150
+            else fail("add 100+50: sum=${dut.o_resultant_sum}, expected 150")
+        assert dut.o_overflow == 1
+            else fail("add 100+50: should overflow (both +, result -)")
+        dut.i_start = 0
+        wait 1 cycle
+
+        // ── Add: -100 + -50 = -150 → +overflow (both -, result +) ─
+        // -100 in 8-bit = 0x9C, -50 = 0xCE; sum = 0x16A & 0xFF = 0x6A
+        dut.i_operand_a = 0x9C
+        dut.i_operand_b = 0xCE
+        dut.i_mode = 0
+        dut.i_start = 1
+        wait 4 cycles
+        assert dut.o_resultant_sum == 0x6A
+            else fail("add -100+-50: sum=0x${dut.o_resultant_sum:02x}, expected 0x6A")
+        assert dut.o_overflow == 1
+            else fail("add -100+-50: should overflow (both -, result +)")
+        dut.i_start = 0
+        wait 1 cycle
+
+        // ── Sub: 5 - 3 = 2, no overflow ─────────────────────────
+        dut.i_operand_a = 5
+        dut.i_operand_b = 3
+        dut.i_mode = 1
+        dut.i_start = 1
+        wait 4 cycles
+        assert dut.o_resultant_sum == 2
+            else fail("sub 5-3: sum=${dut.o_resultant_sum}, expected 2")
+        assert dut.o_overflow == 0
+            else fail("sub 5-3: overflow=${dut.o_overflow}, expected 0")
+        dut.i_start = 0
+        wait 1 cycle
+
+        // ── Sub: 100 - (-50) = 150 → +overflow (a +, b -, result -) ─
+        // a=0x64 (+100), b=0xCE (-50). a-b = 0x64 - 0xCE = ... binary subtract
+        // 0x64 - 0xCE = 0x64 + (~0xCE + 1) = 0x64 + 0x32 = 0x96 (=-106 signed)
+        dut.i_operand_a = 0x64
+        dut.i_operand_b = 0xCE
+        dut.i_mode = 1
+        dut.i_start = 1
+        wait 4 cycles
+        assert dut.o_resultant_sum == 0x96
+            else fail("sub 100-(-50): sum=0x${dut.o_resultant_sum:02x}, expected 0x96")
+        assert dut.o_overflow == 1
+            else fail("sub 100-(-50): should overflow")
+        dut.i_start = 0
+        wait 1 cycle
+
+        // ── Sub: -100 - 50 = -150 → -overflow (a -, b +, result +) ─
+        // a=0x9C, b=0x32. a-b = 0x9C - 0x32 = 0x6A (+106 signed)
+        dut.i_operand_a = 0x9C
+        dut.i_operand_b = 0x32
+        dut.i_mode = 1
+        dut.i_start = 1
+        wait 4 cycles
+        assert dut.o_resultant_sum == 0x6A
+            else fail("sub -100-50: sum=0x${dut.o_resultant_sum:02x}, expected 0x6A")
+        assert dut.o_overflow == 1
+            else fail("sub -100-50: should overflow")
+        dut.i_start = 0
+        wait 1 cycle
+
+        // ── i_clear test mid-flow ────────────────────────────────
+        // Start a new op, then assert i_clear mid-stream — should
+        // dump back to IDLE and clear o_resultant_sum.
+        dut.i_operand_a = 10
+        dut.i_operand_b = 20
+        dut.i_mode = 0
+        dut.i_start = 1
+        wait 1 cycle  // → LOAD
+        dut.i_start = 0
+        dut.i_clear = 1
+        wait 1 cycle  // clear: state←IDLE, o_resultant_sum←0
+        assert dut.o_status == 0
+            else fail("i_clear: o_status=${dut.o_status}, expected IDLE")
+        assert dut.o_resultant_sum == 0
+            else fail("i_clear: sum=${dut.o_resultant_sum}, expected 0")
+        dut.i_clear = 0
+        wait 1 cycle
+
+        // ── i_start without i_enable: stays in IDLE ──────────────
+        dut.i_enable = 0
+        dut.i_start = 1
+        wait 2 cycles
+        assert dut.o_status == 0
+            else fail("start w/o enable: o_status=${dut.o_status}, expected IDLE (still)")
+        dut.i_start = 0
+        dut.i_enable = 1
+        wait 1 cycle
+
+        // ── i_enable drop-out at LOAD: goes back to IDLE ─────────
+        dut.i_operand_a = 1
+        dut.i_operand_b = 2
+        dut.i_mode = 0
+        dut.i_start = 1
+        wait 1 cycle  // IDLE→LOAD
+        dut.i_start = 0
+        dut.i_enable = 0
+        wait 1 cycle  // LOAD sees enable=0 → state←IDLE
+        assert dut.o_status == 0
+            else fail("LOAD w/ enable=0: o_status=${dut.o_status}, expected IDLE")
+        dut.i_enable = 1
+        wait 1 cycle
+
+        // ── i_enable drop-out at COMPUTE: → IDLE ─────────────────
+        dut.i_operand_a = 1
+        dut.i_operand_b = 2
+        dut.i_mode = 0
+        dut.i_start = 1
+        wait 2 cycles  // → COMPUTE
+        dut.i_start = 0
+        dut.i_enable = 0
+        wait 1 cycle  // COMPUTE w/ enable=0 → IDLE
+        assert dut.o_status == 0
+            else fail("COMPUTE w/ enable=0: o_status=${dut.o_status}, expected IDLE")
+        dut.i_enable = 1
+        wait 1 cycle
+
+        // ── i_enable drop-out at OUTPUT: → IDLE without writing outputs ─
+        dut.i_operand_a = 1
+        dut.i_operand_b = 2
+        dut.i_mode = 0
+        dut.i_start = 1
+        wait 3 cycles  // → OUTPUT
+        dut.i_start = 0
+        dut.i_enable = 0
+        wait 1 cycle  // OUTPUT w/ enable=0 → IDLE without writing
+        assert dut.o_status == 0
+            else fail("OUTPUT w/ enable=0: o_status=${dut.o_status}, expected IDLE")
+        dut.i_enable = 1
+        wait 1 cycle
+
+        // ── async reset assertion mid-flow ───────────────────────
+        dut.i_operand_a = 7
+        dut.i_operand_b = 11
+        dut.i_mode = 0
+        dut.i_start = 1
+        wait 2 cycles
+        dut.i_rst_n = 0  // async low — fires immediately
+        wait 1 cycle
+        assert dut.o_status == 0
+            else fail("async reset: o_status=${dut.o_status}, expected IDLE")
+        assert dut.o_resultant_sum == 0
+            else fail("async reset: sum=${dut.o_resultant_sum}, expected 0")
+        dut.i_rst_n = 1
+        dut.i_start = 0
+        wait 1 cycle
+
+        // ── A few add/sub completions to toggle remaining operand bits ─
+        for k in 0 .. 8
+            let pat : uint<8> = (1 as uint<8>) << k
+            dut.i_operand_a = pat
+            dut.i_operand_b = (0xFF as uint<8>) ^ pat
+            dut.i_mode = 0
+            dut.i_start = 1
+            wait 1 cycle
+            dut.i_start = 0
+            wait 3 cycles
+            assert dut.o_resultant_sum == 0xFF
+                else fail("toggle add k=${k}: sum=0x${dut.o_resultant_sum:02x}, expected 0xFF")
+            wait 1 cycle
+
+            dut.i_operand_a = pat
+            dut.i_operand_b = pat
+            dut.i_mode = 1
+            dut.i_start = 1
+            wait 1 cycle
+            dut.i_start = 0
+            wait 3 cycles
+            assert dut.o_resultant_sum == 0
+                else fail("toggle sub k=${k}: sum=0x${dut.o_resultant_sum:02x}, expected 0")
+            wait 1 cycle
+        end for
+
+        // ── Targeted sub completions with varied bit patterns to
+        //    toggle every bit of reg_operand_a / reg_operand_b /
+        //    result on the subtract-overflow path (line 73).
+        for k in 0 .. 8
+            let pat_a : uint<8> = (1 as uint<8>) << k
+            // a = walking-1, b = walking-1 shifted by 1 → distinct
+            // operand bits, varied result bit pattern
+            let pat_b : uint<8> = (1 as uint<8>) << ((k + 3) % 8)
+            dut.i_operand_a = pat_a
+            dut.i_operand_b = pat_b
+            dut.i_mode = 1
+            dut.i_start = 1
+            wait 1 cycle
+            dut.i_start = 0
+            wait 3 cycles
+            wait 1 cycle
+
+            // Symmetric: high bits of operands, both signed-negative
+            let high_a : uint<8> = (0xF0 as uint<8>) | pat_a
+            let high_b : uint<8> = (0x80 as uint<8>) | pat_b
+            dut.i_operand_a = high_a
+            dut.i_operand_b = high_b
+            dut.i_mode = 1
+            dut.i_start = 1
+            wait 1 cycle
+            dut.i_start = 0
+            wait 3 cycles
+            wait 1 cycle
+        end for
+
+        // Random-ish subs hitting both sign combinations
+        for k in 0 .. 16
+            let av : uint<8> = ((k * 23) & 0xFF) as uint<8>
+            let bv : uint<8> = ((k * 41 + 7) & 0xFF) as uint<8>
+            dut.i_operand_a = av
+            dut.i_operand_b = bv
+            dut.i_mode = 1
+            dut.i_start = 1
+            wait 1 cycle
+            dut.i_start = 0
+            wait 3 cycles
+            wait 1 cycle
+        end for
+
+        log(info, "ALL TESTS PASSED — signedadder FSM + overflow cases")
+    end run
+end impl SignedAdderTest
