@@ -219,16 +219,24 @@ end test T
 "#;
     let printed = parse_print_reparse(src);
     // Periodic on-handler keeps its `cycles` decorator.
-    assert!(printed.contains("on 1000 cycles"),
-        "`on 1000 cycles` should round-trip; got:\n{printed}");
+    assert!(
+        printed.contains("on 1000 cycles"),
+        "`on 1000 cycles` should round-trip; got:\n{printed}"
+    );
     // Watchdog default+custom forms.
-    assert!(printed.contains("watchdog\n        period 500 cycles\n        max_idle 5000 cycles"),
-        "watchdog with explicit period/max_idle should round-trip; got:\n{printed}");
-    assert!(printed.contains("watchdog disabled"),
-        "`watchdog disabled` opt-out should round-trip; got:\n{printed}");
+    assert!(
+        printed.contains("watchdog\n        period 500 cycles\n        max_idle 5000 cycles"),
+        "watchdog with explicit period/max_idle should round-trip; got:\n{printed}"
+    );
+    assert!(
+        printed.contains("watchdog disabled"),
+        "`watchdog disabled` opt-out should round-trip; got:\n{printed}"
+    );
     // Implicit-defaults watchdog (no period/max_idle, no body).
-    assert!(printed.contains("agent Baz\n    watchdog\n    end watchdog"),
-        "defaults-only watchdog should round-trip; got:\n{printed}");
+    assert!(
+        printed.contains("agent Baz\n    watchdog\n    end watchdog"),
+        "defaults-only watchdog should round-trip; got:\n{printed}"
+    );
 }
 
 /// `extern function name(params) -> ret` (spec §9) round-trips: no
@@ -252,15 +260,24 @@ test T
 end test T
 "#;
     let printed = parse_print_reparse(src);
-    assert!(printed.contains("extern function ref_crc8_step(crc: uint<8>, byte: uint<8>) -> uint<8>"),
-        "extern function with return type should round-trip; got:\n{printed}");
-    assert!(printed.contains("extern function ref_aes_block(key: bits<128>, pt: bits<128>) -> bits<128>"),
-        "extern function with wide bits param should round-trip; got:\n{printed}");
-    assert!(printed.contains("extern function ref_dump_state(cycle: uint<64>)\n"),
-        "extern function with no return type (void) should round-trip; got:\n{printed}");
+    assert!(
+        printed.contains("extern function ref_crc8_step(crc: uint<8>, byte: uint<8>) -> uint<8>"),
+        "extern function with return type should round-trip; got:\n{printed}"
+    );
+    assert!(
+        printed
+            .contains("extern function ref_aes_block(key: bits<128>, pt: bits<128>) -> bits<128>"),
+        "extern function with wide bits param should round-trip; got:\n{printed}"
+    );
+    assert!(
+        printed.contains("extern function ref_dump_state(cycle: uint<64>)\n"),
+        "extern function with no return type (void) should round-trip; got:\n{printed}"
+    );
     // No spurious `end function` for an extern.
-    assert!(!printed.contains("end function ref_crc8_step"),
-        "extern function should NOT close with `end function`; got:\n{printed}");
+    assert!(
+        !printed.contains("end function ref_crc8_step"),
+        "extern function should NOT close with `end function`; got:\n{printed}"
+    );
 }
 
 /// `///` outer doc comments attach to the next construct, populate
@@ -283,15 +300,21 @@ end struct AxiTxn
         _ => panic!("expected struct"),
     };
     let doc = s.doc.as_ref().expect("expected doc attached to struct");
-    assert!(doc.contains("4-channel round-robin"),
-        "first line should be in doc; got: {doc:?}");
-    assert!(doc.contains("rotating priority pointer"),
-        "third line should be in doc; got: {doc:?}");
+    assert!(
+        doc.contains("4-channel round-robin"),
+        "first line should be in doc; got: {doc:?}"
+    );
+    assert!(
+        doc.contains("rotating priority pointer"),
+        "third line should be in doc; got: {doc:?}"
+    );
 
     let printed = print(&parsed);
     let _ = parse_source(&printed).expect("re-parse");
-    assert!(printed.contains("/// 4-channel round-robin"),
-        "pretty output should emit `///` outer-doc lines:\n{printed}");
+    assert!(
+        printed.contains("/// 4-channel round-robin"),
+        "pretty output should emit `///` outer-doc lines:\n{printed}"
+    );
 }
 
 /// File-top `//!` block populates `SourceFile.inner_doc`. The
@@ -319,32 +342,48 @@ end struct AxiTxn
 
     // inner_doc has the full leading //! block, with prefix stripped.
     let inner = parsed.inner_doc.as_ref().expect("expected inner_doc");
-    assert!(inner.starts_with("---\n"),
+    assert!(
+        inner.starts_with("---\n"),
         "inner_doc should keep the opening `---` line; got first line: {:?}",
-        inner.lines().next());
-    assert!(inner.contains("spec_md: doc/specs/axi_wr_arb.md#round-robin"),
-        "inner_doc should contain the spec_md field; got:\n{inner}");
-    assert!(inner.contains("4-channel round-robin"),
-        "inner_doc should also keep the prose below the fence");
+        inner.lines().next()
+    );
+    assert!(
+        inner.contains("spec_md: doc/specs/axi_wr_arb.md#round-robin"),
+        "inner_doc should contain the spec_md field; got:\n{inner}"
+    );
+    assert!(
+        inner.contains("4-channel round-robin"),
+        "inner_doc should also keep the prose below the fence"
+    );
 
     // frontmatter is the YAML between the fences.
     let fm = parsed.frontmatter.as_ref().expect("expected frontmatter");
-    assert!(fm.contains("spec_md: doc/specs/axi_wr_arb.md#round-robin"),
-        "frontmatter should include the spec_md key; got:\n{fm}");
-    assert!(fm.contains("tags: [arbitration, axi, axi4]"),
-        "frontmatter should include the tags key; got:\n{fm}");
-    assert!(!fm.contains("4-channel round-robin"),
-        "frontmatter should NOT include the prose after the closing fence; got:\n{fm}");
-    assert!(!fm.contains("\n---\n") && !fm.starts_with("---") && !fm.ends_with("---"),
-        "frontmatter should not include the fence lines themselves; got:\n{fm}");
+    assert!(
+        fm.contains("spec_md: doc/specs/axi_wr_arb.md#round-robin"),
+        "frontmatter should include the spec_md key; got:\n{fm}"
+    );
+    assert!(
+        fm.contains("tags: [arbitration, axi, axi4]"),
+        "frontmatter should include the tags key; got:\n{fm}"
+    );
+    assert!(
+        !fm.contains("4-channel round-robin"),
+        "frontmatter should NOT include the prose after the closing fence; got:\n{fm}"
+    );
+    assert!(
+        !fm.contains("\n---\n") && !fm.starts_with("---") && !fm.ends_with("---"),
+        "frontmatter should not include the fence lines themselves; got:\n{fm}"
+    );
 
     let printed = print(&parsed);
     // Pretty-print emits the leading `//!` block verbatim; round-trip
     // re-parse should recover both fields.
     let reparsed = parse_source(&printed).expect("re-parse");
-    assert_eq!(reparsed.frontmatter.as_deref(),
+    assert_eq!(
+        reparsed.frontmatter.as_deref(),
         parsed.frontmatter.as_deref(),
-        "frontmatter should round-trip identically");
+        "frontmatter should round-trip identically"
+    );
 }
 
 /// A leading `//!` block with no `---` fence has no frontmatter.
@@ -359,10 +398,17 @@ struct X
 end struct X
 "#;
     let parsed = parse_source(src).expect("parse");
-    assert!(parsed.inner_doc.as_deref().is_some_and(|d| d.contains("Free-form inner doc")),
-        "expected inner_doc to capture the //! prose");
-    assert!(parsed.frontmatter.is_none(),
-        "expected no frontmatter when there's no `---` fence");
+    assert!(
+        parsed
+            .inner_doc
+            .as_deref()
+            .is_some_and(|d| d.contains("Free-form inner doc")),
+        "expected inner_doc to capture the //! prose"
+    );
+    assert!(
+        parsed.frontmatter.is_none(),
+        "expected no frontmatter when there's no `---` fence"
+    );
 }
 
 /// Per-construct inner doc (`//!` immediately after the opening

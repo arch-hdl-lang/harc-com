@@ -38,7 +38,9 @@ end test TraceTest
     let cpp = cpp_tb::emit(&merged).expect("emit");
     assert!(cpp.contains("struct HarcTraceWriter"));
     assert!(cpp.contains("std::getenv(\"HARC_TRACE\")"));
-    assert!(cpp.contains("trace.meta(harc_rng_state, std::getenv(\"HARC_DUT_BACKEND\"), \"Top\", \"TraceTest\")"));
+    assert!(cpp.contains(
+        "trace.meta(harc_rng_state, std::getenv(\"HARC_DUT_BACKEND\"), \"Top\", \"TraceTest\")"
+    ));
     assert!(cpp.contains("trace.raw(\"randomize\", cycle_count, _trace_fields);"));
     assert!(cpp.contains("trace.log(cycle_count, sev, _trace_msg);"));
     assert!(cpp.contains("raw(\"assertion_failure\""));
@@ -226,8 +228,7 @@ end test T"#,
     )
     .unwrap();
     let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
-    cpp_tb::emit(&merged)
-        .expect("aliased instances should bypass the overlap check");
+    cpp_tb::emit(&merged).expect("aliased instances should bypass the overlap check");
 }
 
 #[test]
@@ -253,8 +254,7 @@ end test T"#,
     )
     .unwrap();
     let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
-    cpp_tb::emit(&merged)
-        .expect("instances without `size` should not trip the overlap check");
+    cpp_tb::emit(&merged).expect("instances without `size` should not trip the overlap check");
 }
 
 #[test]
@@ -302,10 +302,17 @@ end test B
     .unwrap();
     let merged = merge::merge_for_sim(&[f], None).expect("merge keeps both tests");
     let cpp = cpp_tb::emit(&merged).expect("same-DUT multi-test emits cleanly");
-    assert!(cpp.contains("int run_A(int argc"), "expected run_A function");
-    assert!(cpp.contains("int run_B(int argc"), "expected run_B function");
     assert!(
-        cpp.contains("std::strcmp(test_sel, \"A\") == 0") && cpp.contains("std::strcmp(test_sel, \"B\") == 0"),
+        cpp.contains("int run_A(int argc"),
+        "expected run_A function"
+    );
+    assert!(
+        cpp.contains("int run_B(int argc"),
+        "expected run_B function"
+    );
+    assert!(
+        cpp.contains("std::strcmp(test_sel, \"A\") == 0")
+            && cpp.contains("std::strcmp(test_sel, \"B\") == 0"),
         "expected dispatcher branches for both A and B; got:\n{cpp}",
     );
 }
@@ -1621,13 +1628,18 @@ test BlockRelTest
         randomize(t) with Bounded(t) end randomize
     end run
 end test BlockRelTest"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     // Both relation body expressions reach the solver.
-    assert!(cpp.contains("z3::uge(_z_len") && cpp.contains("z3::ule(_z_len"),
-        "expected `x.len in [1..16]` to lower to uge/ule pair after inlining; got:\n{cpp}");
-    assert!(cpp.contains("z3::urem(_z_addr"),
-        "expected `x.addr % 4 == 0` to lower with urem after inlining; got:\n{cpp}");
+    assert!(
+        cpp.contains("z3::uge(_z_len") && cpp.contains("z3::ule(_z_len"),
+        "expected `x.len in [1..16]` to lower to uge/ule pair after inlining; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("z3::urem(_z_addr"),
+        "expected `x.addr % 4 == 0` to lower with urem after inlining; got:\n{cpp}"
+    );
 }
 
 /// Alias-form relations (`relation A(t) = expr`) contribute their
@@ -1652,7 +1664,8 @@ test AliasRelTest
         randomize(t) with BothAlignedAndHigh(t) end randomize
     end run
 end test AliasRelTest"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     // The alias `BothAlignedAndHigh(t)` should expand to
     // `(Aligned(t) && HighHalf(t))`, then each sub-relation expands
@@ -1660,16 +1673,22 @@ end test AliasRelTest"#,
     // Both should reach the solver in the same _s.add call (since
     // the alias produces ONE constraint expression that is the &&
     // of the two sub-relation bodies).
-    assert!(cpp.contains("z3::urem(_z_addr"),
-        "expected recursively-inlined `Aligned(x)` to add urem; got:\n{cpp}");
-    assert!(cpp.contains("z3::uge(_z_addr"),
-        "expected recursively-inlined `HighHalf(x)` to add uge; got:\n{cpp}");
+    assert!(
+        cpp.contains("z3::urem(_z_addr"),
+        "expected recursively-inlined `Aligned(x)` to add urem; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("z3::uge(_z_addr"),
+        "expected recursively-inlined `HighHalf(x)` to add uge; got:\n{cpp}"
+    );
     // The inlined alias still appears as a single constraint joined
     // by &&, not two separate ones — that's the alias-form
     // contract (Block form would produce two _s.add calls).
     let urem_count = cpp.matches("z3::urem(_z_addr").count();
-    assert_eq!(urem_count, 1,
-        "expected exactly one urem from the alias-form `Aligned`; got {urem_count} in:\n{cpp}");
+    assert_eq!(
+        urem_count, 1,
+        "expected exactly one urem from the alias-form `Aligned`; got {urem_count} in:\n{cpp}"
+    );
 }
 
 /// Parameter substitution works when the relation's formal parameter
@@ -1696,15 +1715,20 @@ test SubstTest
         randomize(pkt) with Small(pkt) end randomize
     end run
 end test SubstTest"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     // After substitution, `x.size` becomes `pkt.size`, which the
     // constraint translator lowers to `_z_size` (the Z3 var of the
     // transaction's size field). No spurious `_z_x_size` symbol.
-    assert!(cpp.contains("z3::ule(_z_size,"),
-        "expected substituted-then-translated `size <= 4` constraint; got:\n{cpp}");
-    assert!(!cpp.contains("_z_x"),
-        "no Z3 var named after the formal param should appear; got:\n{cpp}");
+    assert!(
+        cpp.contains("z3::ule(_z_size,"),
+        "expected substituted-then-translated `size <= 4` constraint; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("_z_x"),
+        "no Z3 var named after the formal param should appear; got:\n{cpp}"
+    );
 }
 
 /// `extern function name(params) -> ret` (spec §9) emits a C-linkage
@@ -1723,23 +1747,31 @@ test ExternTest
         assert c == ref_crc8_step(0xFF, 0x42)
     end run
 end test ExternTest"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     // Forward declaration block at file scope.
-    assert!(cpp.contains("extern \"C\" {"),
-        "expected `extern \"C\" {{` wrapper for extern fns; got:\n{cpp}");
+    assert!(
+        cpp.contains("extern \"C\" {"),
+        "expected `extern \"C\" {{` wrapper for extern fns; got:\n{cpp}"
+    );
     // Signature: HARC widens narrow ints to uint64_t at the FFI boundary.
-    assert!(cpp.contains("uint64_t ref_crc8_step(uint64_t crc, uint64_t byte);"),
-        "expected widened C-linkage forward decl; got:\n{cpp}");
+    assert!(
+        cpp.contains("uint64_t ref_crc8_step(uint64_t crc, uint64_t byte);"),
+        "expected widened C-linkage forward decl; got:\n{cpp}"
+    );
     // The forward decl appears OUTSIDE main() (before `int main(`).
     let extern_pos = cpp.find("uint64_t ref_crc8_step(uint64_t").unwrap();
-    let main_pos   = cpp.find("int main(").unwrap();
+    let main_pos = cpp.find("int main(").unwrap();
     assert!(extern_pos < main_pos,
         "extern fn decl must be at file scope (before main); got extern at {extern_pos}, main at {main_pos}");
     // Call sites lower as plain function calls — no special wrapping.
-    assert!(cpp.contains("ref_crc8_step(255, 66)") || cpp.contains("ref_crc8_step(0xFF, 0x42)")
+    assert!(
+        cpp.contains("ref_crc8_step(255, 66)")
+            || cpp.contains("ref_crc8_step(0xFF, 0x42)")
             || cpp.contains("ref_crc8_step(") && cpp.contains(")"),
-        "expected plain function-call lowering at call sites; got:\n{cpp}");
+        "expected plain function-call lowering at call sites; got:\n{cpp}"
+    );
 }
 
 /// A file with no `extern function` declarations emits no `extern "C" {`
@@ -1753,10 +1785,13 @@ fn no_extern_function_means_no_extern_c_block() {
         wait 1 cycle
     end run
 end test T"#,
-    ).unwrap();
+    )
+    .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
-    assert!(!cpp.contains("extern \"C\" {"),
-        "no extern fns should mean no extern \"C\" block; got:\n{cpp}");
+    assert!(
+        !cpp.contains("extern \"C\" {"),
+        "no extern fns should mean no extern \"C\" block; got:\n{cpp}"
+    );
 }
 
 /// Smoke-sweep every fixture under `tests/fixtures/` through
@@ -2293,8 +2328,14 @@ end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("testbench + hookable lowers cleanly");
-    assert!(cpp.contains("Tb_reset_pre"), "hookable should emit pre vector");
-    assert!(cpp.contains("Tb_reset_post"), "hookable should emit post vector");
+    assert!(
+        cpp.contains("Tb_reset_pre"),
+        "hookable should emit pre vector"
+    );
+    assert!(
+        cpp.contains("Tb_reset_post"),
+        "hookable should emit post vector"
+    );
 }
 
 /// Negative case for the genuine-observer shape we want to keep
@@ -2387,9 +2428,7 @@ end impl T"#,
     .unwrap();
     let err = cpp_tb::emit(&parsed).unwrap_err();
     assert!(
-        err.0.contains("trunc<16>")
-            && err.0.contains("8-bit")
-            && err.0.contains("zext"),
+        err.0.contains("trunc<16>") && err.0.contains("8-bit") && err.0.contains("zext"),
         "expected widen-direction error pointing to zext; got: {}",
         err.0,
     );
@@ -2435,9 +2474,7 @@ end impl T"#,
     .unwrap();
     let err = cpp_tb::emit(&parsed).unwrap_err();
     assert!(
-        err.0.contains("zext<8>")
-            && err.0.contains("32-bit")
-            && err.0.contains("trunc"),
+        err.0.contains("zext<8>") && err.0.contains("32-bit") && err.0.contains("trunc"),
         "expected narrow-direction error pointing to trunc; got: {}",
         err.0,
     );
@@ -2485,7 +2522,10 @@ end impl T"#,
     .unwrap();
     let cpp_widen = cpp_tb::emit(&parsed_widen).expect("emit");
     // Widening path: plain cast.
-    assert!(!cpp_widen.contains("0xFFULL"), "expected no narrowing mask on widen; got:\n{cpp_widen}");
+    assert!(
+        !cpp_widen.contains("0xFFULL"),
+        "expected no narrowing mask on widen; got:\n{cpp_widen}"
+    );
 
     let parsed_narrow = parse_source(
         r#"testbench Tb
