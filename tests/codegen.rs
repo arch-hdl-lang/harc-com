@@ -1598,6 +1598,12 @@ end test SeededSolverTest"#,
             && cpp.contains("_s.set(_p);"),
         "Z3 solver-backed randomize should consume the HARC RNG seed; got:\n{cpp}"
     );
+    assert!(
+        cpp.contains("uint64_t _pref_")
+            && cpp.contains("_s.add(_z_val == _ctx.bv_val(_pref_")
+            && cpp.contains("retry without seeded preferences"),
+        "solver-backed randomize should first try seeded free-field preferences and fall back safely; got:\n{cpp}"
+    );
 }
 
 /// `keep f != WRAP` where `WRAP` is an enum variant resolves via
