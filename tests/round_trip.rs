@@ -479,3 +479,32 @@ end test T"#;
         "expected directed error steering `int<N>` to `sint<N>`; got: {msg}",
     );
 }
+
+#[test]
+fn discard_bindings_and_params_round_trip() {
+    let src = r#"function consume(_: uint<8>)
+    let _ = 1
+end function consume
+
+agent Sink
+    in_ev : event<uint<8>>
+    hookable ignore(_: uint<8>)
+        let _ = 2
+    end ignore
+    on in_ev(_)
+        let _ = 3
+    end on
+end agent Sink
+
+test DiscardTest
+    let dut : DummyDut
+    run
+        let _ = consume(1)
+    end run
+end test DiscardTest"#;
+    let printed = parse_print_reparse(src);
+    assert!(printed.contains("function consume(_: uint<8>)"));
+    assert!(printed.contains("hookable ignore(_: uint<8>)"));
+    assert!(printed.contains("on in_ev(_)"));
+    assert!(printed.contains("let _ = 1"));
+}

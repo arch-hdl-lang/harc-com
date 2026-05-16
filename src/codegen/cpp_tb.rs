@@ -923,6 +923,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "// verilator-built binary.").ok();
         writeln!(e.out, "extern \"C\" {{").ok();
         for f in &extern_fns {
+            let param_names = cpp_param_names(&f.params);
             let ret = f
                 .return_ty
                 .as_ref()
@@ -937,7 +938,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                     p.ty.as_ref()
                         .map(c_type_for)
                         .unwrap_or_else(|| "int64_t".to_string());
-                write!(e.out, "{pty} {}", p.name.name).ok();
+                write!(e.out, "{pty} {}", param_names[i]).ok();
             }
             writeln!(e.out, ");").ok();
         }
@@ -1568,8 +1569,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         e.emit_let(l, 1);
     }
 
-    // Custom `phase <name> ... end phase <name>` blocks from
-    // `impl sim for <Test>` (spec §7.2). Emitted after hoisted lets so
+    // Custom `phase <name> ... end phase <name>` blocks from the test
+    // lifecycle body (spec §7.2). Emitted after hoisted lets so
     // phase bodies can reference test-level env/agent/scoreboard
     // instances. Calls of the form `<name>()` from inside `run` lower as
     // plain C++ function calls; `wait` inside the phase takes the sync
@@ -4927,6 +4928,7 @@ impl Emitter {
     fn emit_component_method(&mut self, c: &ComponentDecl, h: &HookableMethod, depth: usize) {
         let comp_ty = &c.name.name;
         let m_name = &h.name.name;
+        let param_names = cpp_param_names(&h.params);
         let ret = h
             .return_ty
             .as_ref()
@@ -4938,14 +4940,15 @@ impl Emitter {
         // properly in the body. Restore on exit. Transaction / enum /
         // sub-component params are by-value (not pointer-shaped).
         let mut added: Vec<String> = Vec::new();
-        for p in &h.params {
+        for (i, p) in h.params.iter().enumerate() {
             let pty =
                 p.ty.as_ref()
                     .map(|t| self.c_type_for_param(t))
                     .unwrap_or_else(|| "int64_t".to_string());
-            write!(self.out, ", {pty} {}", p.name.name).ok();
+            write!(self.out, ", {pty} {}", param_names[i]).ok();
             if matches!(&p.ty, Some(TypeExpr::Named { .. }))
                 && self.is_dut_pointer_field_type(p.ty.as_ref().unwrap())
+                && p.name.name != "_"
             {
                 if self.pointer_vars.insert(p.name.name.clone()) {
                     added.push(p.name.name.clone());
@@ -4995,8 +4998,7 @@ impl Emitter {
         // body. The hook closures see the same args as the method —
         // empty vectors are a no-op so the wrap is always safe to
         // emit.
-        let arg_list: Vec<String> = h.params.iter().map(|p| p.name.name.clone()).collect();
-        let arg_csv = arg_list.join(", ");
+        let arg_csv = param_names.join(", ");
         // Pre/post hook fan-out is skipped for non-hookable `function`
         // methods (docs/test-ergonomics.md §3.2): no vectors were
         // emitted for them, so the fan-out would reference undeclared
@@ -6382,6 +6384,7 @@ impl Emitter {
         self.pad(depth);
         write!(self.out, "auto {} = [&](", t.name.name).ok();
         let mut added: Vec<String> = Vec::new();
+        let param_names = cpp_param_names(&t.params);
         for (i, p) in t.params.iter().enumerate() {
             if i > 0 {
                 write!(self.out, ", ").ok();
@@ -6390,8 +6393,8 @@ impl Emitter {
                 p.ty.as_ref()
                     .map(c_type_for)
                     .unwrap_or("int64_t".to_string());
-            write!(self.out, "{pty} {}", p.name.name).ok();
-            if matches!(&p.ty, Some(TypeExpr::Named { .. })) {
+            write!(self.out, "{pty} {}", param_names[i]).ok();
+            if matches!(&p.ty, Some(TypeExpr::Named { .. })) && p.name.name != "_" {
                 if self.pointer_vars.insert(p.name.name.clone()) {
                     added.push(p.name.name.clone());
                 }
@@ -6424,6 +6427,7 @@ impl Emitter {
         // `pointer_vars` while emitting the body, then remove on exit so
         // siblings don't leak each other's params.
         let mut added: Vec<String> = Vec::new();
+        let param_names = cpp_param_names(&f.params);
         for (i, p) in f.params.iter().enumerate() {
             if i > 0 {
                 write!(self.out, ", ").ok();
@@ -6432,8 +6436,8 @@ impl Emitter {
                 p.ty.as_ref()
                     .map(c_type_for)
                     .unwrap_or("int64_t".to_string());
-            write!(self.out, "{pty} {}", p.name.name).ok();
-            if matches!(&p.ty, Some(TypeExpr::Named { .. })) {
+            write!(self.out, "{pty} {}", param_names[i]).ok();
+            if matches!(&p.ty, Some(TypeExpr::Named { .. })) && p.name.name != "_" {
                 if self.pointer_vars.insert(p.name.name.clone()) {
                     added.push(p.name.name.clone());
                 }
@@ -6890,14 +6894,16 @@ impl Emitter {
                             HookSide::Pre => "pre",
                             HookSide::Post => "post",
                         };
+                        let param_names = cpp_param_names(&params);
                         let arg_decls: Vec<String> = params
                             .iter()
-                            .map(|p| {
+                            .enumerate()
+                            .map(|(i, p)| {
                                 let ty =
                                     p.ty.as_ref()
                                         .map(|t| self.c_type_for_param(t))
                                         .unwrap_or_else(|| "int64_t".to_string());
-                                format!("{ty} {}", p.name.name)
+                                format!("{ty} {}", param_names[i])
                             })
                             .collect();
                         self.pad(depth);
@@ -7020,6 +7026,17 @@ impl Emitter {
     }
 
     fn emit_let(&mut self, l: &LetStmt, depth: usize) {
+        if l.name.name == "_" {
+            self.pad(depth);
+            if let Some(v) = &l.value {
+                write!(self.out, "(void)(").ok();
+                self.emit_expr(v);
+                writeln!(self.out, ");").ok();
+            } else {
+                writeln!(self.out, "// let _ (discard)").ok();
+            }
+            return;
+        }
         // Track let-binding type for randomize(t) resolution. Done first
         // (before the dut shortcut) so even nested lets register.
         if let Some(s) = type_simple_name(l.ty.as_ref()) {
@@ -9064,6 +9081,22 @@ fn c_type_for(t: &TypeExpr) -> String {
             format!("V{last}*")
         }
     }
+}
+
+fn cpp_param_names(params: &[Param]) -> Vec<String> {
+    let mut discard_idx = 0usize;
+    params
+        .iter()
+        .map(|p| {
+            if p.name.name == "_" {
+                let name = format!("_discard{discard_idx}");
+                discard_idx += 1;
+                name
+            } else {
+                p.name.name.clone()
+            }
+        })
+        .collect()
 }
 
 fn c_binary_op(op: BinaryOp) -> &'static str {
