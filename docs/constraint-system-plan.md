@@ -86,6 +86,13 @@ preference sampling without changing the hard solution space; richer
 distribution effects can be added in the typed solver backend once sampling
 order is explicit.
 
+Auto coverage goals are solver preferences, not hard constraints. The v1
+runtime derives goals for enum variants, bool values, and literal `[range]`
+min/max endpoints, then derives capped pairwise crosses from those goals.
+Uncovered goals and crosses should be preferred ahead of ordinary seeded
+samples when the participating fields remain unconstrained; explicit user
+constraints and non-random fields must exclude the corresponding auto goals.
+
 `[unique]` is also a randomization policy, not a hard field invariant. It
 should steer fields that remain unconstrained after `keep`, relation expansion,
 and `randomize ... with` constraints; explicit user constraints and direct
