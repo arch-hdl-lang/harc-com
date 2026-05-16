@@ -53,6 +53,7 @@ pub struct TxnFieldSchema {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldTypeSchema {
     pub class: FieldTypeClass,
+    pub type_name: Option<String>,
     pub width: Option<u32>,
     pub signedness: Signedness,
     pub enum_domain: Option<EnumDomainSchema>,
@@ -85,6 +86,13 @@ pub struct EnumDomainSchema {
     pub variants: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumVariantSchema {
+    pub enum_name: String,
+    pub variant: String,
+    pub index: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct FieldAttrSchema {
     pub name: String,
@@ -104,6 +112,7 @@ pub struct ConstraintClause {
     pub origin: ConstraintOrigin,
     pub expr: Expr,
     pub ir: Option<ConstraintExpr>,
+    pub refs: ConstraintRefs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +169,21 @@ pub enum RelationBodySchema {
 pub struct ElaborationError {
     pub span: Span,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConstraintRefs {
+    pub fields: Vec<ConstraintFieldRef>,
+    pub enum_variants: Vec<EnumVariantSchema>,
+    pub relation_calls: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstraintFieldRef {
+    pub root: Option<String>,
+    pub field: String,
+    pub ty: FieldTypeSchema,
+    pub non_random: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +250,7 @@ pub enum ConstraintBinaryOp {
 
 pub fn elaborate_constraints(file: &SourceFile) -> ConstraintElaboration {
     let enum_domains = collect_enum_domains(file);
+    let enum_variants = collect_enum_variants(&enum_domains);
     let mut transactions = Vec::new();
     let mut relations = Vec::new();
     let mut errors = Vec::new();
@@ -260,6 +285,7 @@ pub fn elaborate_constraints(file: &SourceFile) -> ConstraintElaboration {
                                 },
                                 expr: expr.clone(),
                                 ir: lower_constraint_expr(expr, &mut errors),
+                                refs: ConstraintRefs::default(),
                             })
                             .collect(),
                     ),
@@ -270,6 +296,7 @@ pub fn elaborate_constraints(file: &SourceFile) -> ConstraintElaboration {
                         },
                         expr: expr.clone(),
                         ir: lower_constraint_expr(expr, &mut errors),
+                        refs: ConstraintRefs::default(),
                     }),
                 };
                 relations.push(RelationSchema {
@@ -283,11 +310,36 @@ pub fn elaborate_constraints(file: &SourceFile) -> ConstraintElaboration {
         }
     }
 
+    validate_constraint_refs(
+        &mut transactions,
+        &mut relations,
+        &enum_variants,
+        &mut errors,
+    );
+
     ConstraintElaboration {
         transactions,
         relations,
         errors,
     }
+}
+
+fn collect_enum_variants(
+    domains: &BTreeMap<String, EnumDomainSchema>,
+) -> BTreeMap<String, EnumVariantSchema> {
+    let mut variants = BTreeMap::new();
+    for domain in domains.values() {
+        for (index, variant) in domain.variants.iter().enumerate() {
+            variants
+                .entry(variant.clone())
+                .or_insert_with(|| EnumVariantSchema {
+                    enum_name: domain.name.clone(),
+                    variant: variant.clone(),
+                    index,
+                });
+        }
+    }
+    variants
 }
 
 fn collect_enum_domains(file: &SourceFile) -> BTreeMap<String, EnumDomainSchema> {
@@ -355,6 +407,7 @@ fn elaborate_txn_items(
                 },
                 expr: k.expr.clone(),
                 ir: lower_constraint_expr(&k.expr, errors),
+                refs: ConstraintRefs::default(),
             }),
             TxnBodyItem::When(w) => {
                 let (fields, keeps, nested) =
@@ -396,42 +449,49 @@ fn elaborate_field_type(
         TypeExpr::Builtin { name, args, .. } => match name {
             BuiltinTy::UInt | BuiltinTy::UIntCap => FieldTypeSchema {
                 class: FieldTypeClass::UInt,
+                type_name: None,
                 width: type_arg_width(args),
                 signedness: Signedness::Unsigned,
                 enum_domain: None,
             },
             BuiltinTy::SInt | BuiltinTy::SIntCap => FieldTypeSchema {
                 class: FieldTypeClass::SInt,
+                type_name: None,
                 width: type_arg_width(args),
                 signedness: Signedness::Signed,
                 enum_domain: None,
             },
             BuiltinTy::Bits => FieldTypeSchema {
                 class: FieldTypeClass::Bits,
+                type_name: None,
                 width: type_arg_width(args),
                 signedness: Signedness::Unsigned,
                 enum_domain: None,
             },
             BuiltinTy::Bool | BuiltinTy::BoolLower => FieldTypeSchema {
                 class: FieldTypeClass::Bool,
+                type_name: None,
                 width: Some(1),
                 signedness: Signedness::NotNumeric,
                 enum_domain: None,
             },
             BuiltinTy::Bit => FieldTypeSchema {
                 class: FieldTypeClass::Bit,
+                type_name: None,
                 width: Some(1),
                 signedness: Signedness::Unsigned,
                 enum_domain: None,
             },
             BuiltinTy::Int => FieldTypeSchema {
                 class: FieldTypeClass::Int,
+                type_name: None,
                 width: Some(32),
                 signedness: Signedness::Signed,
                 enum_domain: None,
             },
             other => FieldTypeSchema {
                 class: FieldTypeClass::UnsupportedBuiltin(format!("{other:?}")),
+                type_name: None,
                 width: None,
                 signedness: Signedness::Unknown,
                 enum_domain: None,
@@ -446,6 +506,7 @@ fn elaborate_field_type(
             if let Some(domain) = enum_domains.get(&type_name) {
                 FieldTypeSchema {
                     class: FieldTypeClass::Enum,
+                    type_name: Some(type_name),
                     width: enum_width(domain.variants.len()),
                     signedness: Signedness::Unsigned,
                     enum_domain: Some(domain.clone()),
@@ -453,6 +514,7 @@ fn elaborate_field_type(
             } else {
                 FieldTypeSchema {
                     class: FieldTypeClass::Named,
+                    type_name: Some(type_name),
                     width: None,
                     signedness: Signedness::Unknown,
                     enum_domain: None,
@@ -460,6 +522,239 @@ fn elaborate_field_type(
             }
         }
     }
+}
+
+fn validate_constraint_refs(
+    transactions: &mut [TxnSchema],
+    relations: &mut [RelationSchema],
+    enum_variants: &BTreeMap<String, EnumVariantSchema>,
+    errors: &mut Vec<ElaborationError>,
+) {
+    let txn_index: BTreeMap<String, TxnSchema> = transactions
+        .iter()
+        .map(|txn| (txn.name.clone(), txn.clone()))
+        .collect();
+    let relation_names: Vec<String> = relations.iter().map(|r| r.name.clone()).collect();
+
+    for txn in transactions {
+        let ctx = RefValidationCtx {
+            transaction: txn_index.get(&txn.name),
+            params: BTreeMap::new(),
+            transactions: &txn_index,
+            relation_names: &relation_names,
+            enum_variants,
+        };
+        for keep in &mut txn.keeps {
+            validate_clause_refs(keep, &ctx, errors);
+        }
+        validate_when_refs(&mut txn.when_subtypes, &ctx, errors);
+    }
+
+    for relation in relations {
+        let params = relation
+            .params
+            .iter()
+            .map(|p| (p.name.clone(), p.ty.clone()))
+            .collect();
+        let ctx = RefValidationCtx {
+            transaction: None,
+            params,
+            transactions: &txn_index,
+            relation_names: &relation_names,
+            enum_variants,
+        };
+        match &mut relation.body {
+            RelationBodySchema::Block(clauses) => {
+                for clause in clauses {
+                    validate_clause_refs(clause, &ctx, errors);
+                }
+            }
+            RelationBodySchema::Alias(clause) => validate_clause_refs(clause, &ctx, errors),
+        }
+    }
+}
+
+fn validate_when_refs(
+    when_subtypes: &mut [WhenSubtypeSchema],
+    ctx: &RefValidationCtx<'_>,
+    errors: &mut Vec<ElaborationError>,
+) {
+    for subtype in when_subtypes {
+        for keep in &mut subtype.keeps {
+            validate_clause_refs(keep, ctx, errors);
+        }
+        validate_when_refs(&mut subtype.when_subtypes, ctx, errors);
+    }
+}
+
+struct RefValidationCtx<'a> {
+    transaction: Option<&'a TxnSchema>,
+    params: BTreeMap<String, Option<FieldTypeSchema>>,
+    transactions: &'a BTreeMap<String, TxnSchema>,
+    relation_names: &'a [String],
+    enum_variants: &'a BTreeMap<String, EnumVariantSchema>,
+}
+
+fn validate_clause_refs(
+    clause: &mut ConstraintClause,
+    ctx: &RefValidationCtx<'_>,
+    errors: &mut Vec<ElaborationError>,
+) {
+    let Some(ir) = &clause.ir else {
+        return;
+    };
+    let mut refs = ConstraintRefs::default();
+    collect_constraint_refs(ir, clause.expr.span, ctx, &mut refs, errors);
+    clause.refs = refs;
+}
+
+fn collect_constraint_refs(
+    ir: &ConstraintExpr,
+    span: Span,
+    ctx: &RefValidationCtx<'_>,
+    refs: &mut ConstraintRefs,
+    errors: &mut Vec<ElaborationError>,
+) {
+    match ir {
+        ConstraintExpr::Ident(name) => {
+            if ctx.params.contains_key(name) {
+                return;
+            }
+            if let Some(field) = ctx.transaction.and_then(|txn| find_txn_field(txn, name)) {
+                refs.fields.push(ConstraintFieldRef {
+                    root: None,
+                    field: name.clone(),
+                    ty: field.ty.clone(),
+                    non_random: field.non_random,
+                });
+            } else if let Some(variant) = ctx.enum_variants.get(name) {
+                refs.enum_variants.push(variant.clone());
+            } else {
+                errors.push(ElaborationError {
+                    span,
+                    message: format!("constraint references unknown name `{name}`"),
+                });
+            }
+        }
+        ConstraintExpr::FieldRef { root, field } => {
+            if let Some(param_ty) = ctx.params.get(root) {
+                let Some(type_name) = param_ty.as_ref().and_then(|ty| ty.type_name.as_deref())
+                else {
+                    errors.push(ElaborationError {
+                        span,
+                        message: format!(
+                            "constraint parameter `{root}` has no transaction type for field `{field}`"
+                        ),
+                    });
+                    return;
+                };
+                if let Some(txn) = ctx.transactions.get(type_name) {
+                    if let Some(field_schema) = find_txn_field(txn, field) {
+                        refs.fields.push(ConstraintFieldRef {
+                            root: Some(root.clone()),
+                            field: field.clone(),
+                            ty: field_schema.ty.clone(),
+                            non_random: field_schema.non_random,
+                        });
+                    } else {
+                        errors.push(ElaborationError {
+                            span,
+                            message: format!(
+                                "constraint references unknown field `{field}` on `{type_name}`"
+                            ),
+                        });
+                    }
+                } else {
+                    errors.push(ElaborationError {
+                        span,
+                        message: format!(
+                            "constraint parameter `{root}` references unknown transaction `{type_name}`"
+                        ),
+                    });
+                }
+            } else if let Some(txn) = ctx.transaction {
+                if let Some(field_schema) = find_txn_field(txn, field) {
+                    refs.fields.push(ConstraintFieldRef {
+                        root: Some(root.clone()),
+                        field: field.clone(),
+                        ty: field_schema.ty.clone(),
+                        non_random: field_schema.non_random,
+                    });
+                } else {
+                    errors.push(ElaborationError {
+                        span,
+                        message: format!("constraint references unknown field `{field}`"),
+                    });
+                }
+            } else {
+                errors.push(ElaborationError {
+                    span,
+                    message: format!("constraint references unknown parameter `{root}`"),
+                });
+            }
+        }
+        ConstraintExpr::Unary { expr, .. } => {
+            collect_constraint_refs(expr, span, ctx, refs, errors)
+        }
+        ConstraintExpr::Binary { lhs, rhs, .. } => {
+            collect_constraint_refs(lhs, span, ctx, refs, errors);
+            collect_constraint_refs(rhs, span, ctx, refs, errors);
+        }
+        ConstraintExpr::Membership { expr, set } => {
+            collect_constraint_refs(expr, span, ctx, refs, errors);
+            collect_constraint_refs(set, span, ctx, refs, errors);
+        }
+        ConstraintExpr::Range { lo, hi } => {
+            if let Some(lo) = lo {
+                collect_constraint_refs(lo, span, ctx, refs, errors);
+            }
+            if let Some(hi) = hi {
+                collect_constraint_refs(hi, span, ctx, refs, errors);
+            }
+        }
+        ConstraintExpr::Set(items) => {
+            for item in items {
+                collect_constraint_refs(item, span, ctx, refs, errors);
+            }
+        }
+        ConstraintExpr::RelationCall { name, args } => {
+            if ctx.relation_names.iter().any(|relation| relation == name) {
+                refs.relation_calls.push(name.clone());
+            } else {
+                errors.push(ElaborationError {
+                    span,
+                    message: format!("constraint calls unknown relation `{name}`"),
+                });
+            }
+            for arg in args {
+                collect_constraint_refs(arg, span, ctx, refs, errors);
+            }
+        }
+        ConstraintExpr::IntLiteral(_) | ConstraintExpr::BoolLiteral(_) => {}
+    }
+}
+
+fn find_txn_field<'a>(txn: &'a TxnSchema, name: &str) -> Option<&'a TxnFieldSchema> {
+    txn.fields
+        .iter()
+        .chain(txn.when_subtypes.iter().flat_map(|subtype| {
+            subtype
+                .fields
+                .iter()
+                .chain(subtype.when_subtypes.iter().flat_map(flatten_when_fields))
+        }))
+        .find(|field| field.name == name)
+}
+
+fn flatten_when_fields(
+    subtype: &WhenSubtypeSchema,
+) -> Box<dyn Iterator<Item = &TxnFieldSchema> + '_> {
+    Box::new(
+        subtype
+            .fields
+            .iter()
+            .chain(subtype.when_subtypes.iter().flat_map(flatten_when_fields)),
+    )
 }
 
 fn lower_constraint_expr(

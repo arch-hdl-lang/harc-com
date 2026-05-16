@@ -271,3 +271,116 @@ end transaction T"#,
     let txn = elaborated.transaction("T").expect("T schema");
     assert!(txn.keeps[0].ir.is_none());
 }
+
+#[test]
+fn validates_constraint_refs_with_field_type_metadata() {
+    let parsed = parse_source(
+        r#"enum Color { RED, GREEN }
+
+transaction T
+    len : uint<8>
+    delta : sint<12>
+    color : Color
+    keep len < delta && color != RED
+end transaction T"#,
+    )
+    .unwrap();
+
+    let elaborated = elaborate_constraints(&parsed);
+    assert!(elaborated.errors.is_empty(), "{:?}", elaborated.errors);
+    let txn = elaborated.transaction("T").expect("T schema");
+    let refs = &txn.keeps[0].refs;
+
+    let len = refs
+        .fields
+        .iter()
+        .find(|field| field.field == "len")
+        .expect("len ref");
+    assert_eq!(len.ty.class, FieldTypeClass::UInt);
+    assert_eq!(len.ty.width, Some(8));
+    assert_eq!(len.ty.signedness, Signedness::Unsigned);
+
+    let delta = refs
+        .fields
+        .iter()
+        .find(|field| field.field == "delta")
+        .expect("delta ref");
+    assert_eq!(delta.ty.class, FieldTypeClass::SInt);
+    assert_eq!(delta.ty.width, Some(12));
+    assert_eq!(delta.ty.signedness, Signedness::Signed);
+
+    let color = refs
+        .fields
+        .iter()
+        .find(|field| field.field == "color")
+        .expect("color ref");
+    assert_eq!(color.ty.class, FieldTypeClass::Enum);
+    assert_eq!(color.ty.type_name.as_deref(), Some("Color"));
+
+    assert_eq!(refs.enum_variants.len(), 1);
+    assert_eq!(refs.enum_variants[0].enum_name, "Color");
+    assert_eq!(refs.enum_variants[0].variant, "RED");
+    assert_eq!(refs.enum_variants[0].index, 0);
+}
+
+#[test]
+fn validates_relation_field_refs_against_param_transaction_type() {
+    let parsed = parse_source(
+        r#"transaction T
+    addr : uint<32>
+end transaction T
+
+relation Aligned(x: T) = x.addr % 4 == 0"#,
+    )
+    .unwrap();
+
+    let elaborated = elaborate_constraints(&parsed);
+    assert!(elaborated.errors.is_empty(), "{:?}", elaborated.errors);
+    let relation = elaborated.relation("Aligned").expect("Aligned relation");
+    let RelationBodySchema::Alias(clause) = &relation.body else {
+        panic!("Aligned should be alias-form");
+    };
+
+    assert_eq!(clause.refs.fields.len(), 1);
+    assert_eq!(clause.refs.fields[0].root.as_deref(), Some("x"));
+    assert_eq!(clause.refs.fields[0].field, "addr");
+    assert_eq!(clause.refs.fields[0].ty.width, Some(32));
+}
+
+#[test]
+fn validation_reports_unknown_fields_names_and_relations() {
+    let parsed = parse_source(
+        r#"transaction T
+    addr : uint<32>
+    keep missing == 1
+    keep addr == UNKNOWN_ENUM
+    keep MissingRelation(addr)
+end transaction T"#,
+    )
+    .unwrap();
+
+    let elaborated = elaborate_constraints(&parsed);
+    let messages: Vec<&str> = elaborated
+        .errors
+        .iter()
+        .map(|err| err.message.as_str())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|msg| msg.contains("unknown name `missing`")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|msg| msg.contains("unknown name `UNKNOWN_ENUM`")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|msg| msg.contains("unknown relation `MissingRelation`")),
+        "{messages:?}"
+    );
+}
