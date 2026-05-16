@@ -129,29 +129,85 @@ end test CoverAutoCrossTest"#,
 }
 
 #[test]
-fn hook_triggered_covergroups_are_not_cycle_sampled_yet() {
+fn hook_triggered_covergroups_sample_at_hook_point() {
     let parsed = parse_source(
-        r#"covergroup TxnCov @(mon.observed(t) post)
+        r#"transaction Txn
+    op : uint<8>
+    len : uint<8>
+end transaction Txn
+
+agent Mon
+    hookable observed(t: Txn)
+    end observed
+end agent Mon
+
+covergroup TxnCov @(mon.observed(t) post)
     cp_op : cover t.op
         bins
             read = {0}
             write = {1}
+        end bins
+    cp_len : cover t.len
+        bins
+            short = [0..7]
+            long = [8..15]
         end bins
 end covergroup TxnCov
 
 test HookCoverTriggerTest
     let dut : DummyDut
     run
+        let mon : Mon
         let cov : TxnCov
     end run
 end test HookCoverTriggerTest"#,
     )
     .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("Mon_observed_post.push_back([&](Txn t) {")
+            && cpp.contains("uint64_t _v = (uint64_t)(t.op);")
+            && cpp.contains("uint64_t _v = (uint64_t)(t.len);")
+            && cpp.contains("bool _cg_hit_cp_op[2] = {};")
+            && cpp.contains("if (_cg_hit_cp_op[_i] && _cg_hit_cp_len[_j]) cov._auto_cross_cp_op__cp_len[_i][_j]++;")
+            && !cpp.contains("hook-triggered covergroup sampling is parsed but not lowered yet"),
+        "hook-triggered covergroups should register a sample lambda on the hook vector; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn hook_triggered_covergroups_validate_hook_args() {
+    let parsed = parse_source(
+        r#"transaction Txn
+    op : uint<8>
+end transaction Txn
+
+agent Mon
+    hookable observed(t: Txn)
+    end observed
+end agent Mon
+
+covergroup TxnCov @(mon.observed(pkt) post)
+    cp_op : cover pkt.op
+        bins
+            read = {0}
+        end bins
+end covergroup TxnCov
+
+test HookCoverArgTest
+    let dut : DummyDut
+    run
+        let mon : Mon
+        let cov : TxnCov
+    end run
+end test HookCoverArgTest"#,
+    )
+    .unwrap();
     let err = cpp_tb::emit(&parsed).unwrap_err();
     assert!(
         err.0
-            .contains("hook-triggered covergroup sampling is parsed but not lowered yet"),
-        "hook-triggered covergroups should not silently fall back to per-cycle sampling; got: {}",
+            .contains("hook trigger argument `pkt` must match hook parameter `t`"),
+        "hook-triggered covergroups should validate trigger args against hook params; got: {}",
         err.0
     );
 }
