@@ -429,3 +429,35 @@ end test SmokeTest
         );
     }
 }
+
+/// `else if` is a two-token mistake that ARCH-style SV/Verilog
+/// muscle memory tends to produce. HARC uses single-token `elsif`.
+/// The parser catches the error and points at the right keyword
+/// instead of silently treating it as `else { nested if }` (which
+/// the old parser did, then surfaced a misleading mismatched-`end`
+/// error several lines later).
+#[test]
+fn else_if_is_a_directed_error_to_elsif() {
+    let src = r#"testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    run
+        let x = 0
+        if x == 0
+            x = 1
+        else if x == 1
+            x = 2
+        else
+            x = 3
+        end if
+    end run
+end impl T"#;
+    let err = parse_source(src).unwrap_err();
+    let msg = format!("{:?}", err);
+    assert!(
+        msg.contains("else if") && msg.contains("elsif"),
+        "expected directed error mentioning both `else if` and `elsif`; got: {msg}",
+    );
+}
