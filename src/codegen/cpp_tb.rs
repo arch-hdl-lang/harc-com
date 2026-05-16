@@ -2182,7 +2182,33 @@ struct TxnFieldInfo {
 #[derive(Debug, Clone)]
 struct AutoCoverageGoal {
     field: String,
-    values: Vec<u64>,
+    values: Vec<AutoCoverageValue>,
+}
+
+#[derive(Debug, Clone)]
+struct AutoCoverageValue {
+    label: String,
+    c_expr: String,
+}
+
+impl AutoCoverageValue {
+    fn unsigned(value: u64) -> Self {
+        Self {
+            label: value.to_string(),
+            c_expr: format!("{value}ULL"),
+        }
+    }
+
+    fn signed(value: i64) -> Self {
+        Self {
+            label: value.to_string(),
+            c_expr: if value < 0 {
+                format!("(uint64_t)({value}LL)")
+            } else {
+                format!("{value}ULL")
+            },
+        }
+    }
 }
 
 fn field_attr_range(f: &TxnFieldInfo) -> Option<(&Expr, &Expr)> {
@@ -2213,19 +2239,27 @@ fn field_attr_unique(f: &TxnFieldInfo) -> bool {
     f.attrs.iter().any(|a| a.name.name == "unique")
 }
 
-fn auto_coverage_values(f: &TxnFieldInfo) -> Vec<u64> {
+fn auto_coverage_values(f: &TxnFieldInfo) -> Vec<AutoCoverageValue> {
     let mut values = Vec::new();
     if let Some(n) = f.enum_variants {
         for i in 0..n {
-            values.push(i as u64);
+            values.push(AutoCoverageValue::unsigned(i as u64));
         }
     } else if f.width == 1 && !f.signed {
-        values.extend([0, 1]);
+        values.extend([0, 1].map(AutoCoverageValue::unsigned));
     } else if let Some((lo, hi)) = field_attr_range(f) {
-        if let (Some(lo), Some(hi)) = (fold_int_literal(lo), fold_int_literal(hi)) {
-            values.push(lo);
+        if f.signed {
+            if let (Some(lo), Some(hi)) = (fold_signed_int_literal(lo), fold_signed_int_literal(hi))
+            {
+                values.push(AutoCoverageValue::signed(lo));
+                if hi != lo {
+                    values.push(AutoCoverageValue::signed(hi));
+                }
+            }
+        } else if let (Some(lo), Some(hi)) = (fold_int_literal(lo), fold_int_literal(hi)) {
+            values.push(AutoCoverageValue::unsigned(lo));
             if hi != lo {
-                values.push(hi);
+                values.push(AutoCoverageValue::unsigned(hi));
             }
         }
     }
@@ -6987,7 +7021,7 @@ impl Emitter {
                         "std::printf(\"  {}.{}={} : %s\\n\", _auto_cov_{cache_tag}_{}[{}] ? \"hit\" : (_auto_cov_blocked_{cache_tag}_{}[{}] ? \"*BLOCKED*\" : \"*NOT HIT*\"));",
                         escape_c(ty),
                         escape_c(&goal.field),
-                        value,
+                        escape_c(&value.label),
                         goal.field,
                         idx,
                         goal.field,
@@ -7005,10 +7039,10 @@ impl Emitter {
                             "std::printf(\"  {}.{}={} x {}.{}={} : %s\\n\", _auto_cross_{cache_tag}_{}__{}[{}][{}] ? \"hit\" : (_auto_cross_blocked_{cache_tag}_{}__{}[{}][{}] ? \"*BLOCKED*\" : \"*NOT HIT*\"));",
                             escape_c(ty),
                             escape_c(&a.field),
-                            av,
+                            escape_c(&av.label),
                             escape_c(ty),
                             escape_c(&b.field),
-                            bv,
+                            escape_c(&bv.label),
                             a.field,
                             b.field,
                             i,
@@ -7131,7 +7165,7 @@ impl Emitter {
                 a.field,
                 a.values
                     .iter()
-                    .map(|v| format!("{v}ULL"))
+                    .map(|v| v.c_expr.clone())
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -7143,7 +7177,7 @@ impl Emitter {
                 b.field,
                 b.values
                     .iter()
-                    .map(|v| format!("{v}ULL"))
+                    .map(|v| v.c_expr.clone())
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -7195,7 +7229,7 @@ impl Emitter {
                 goal.field,
                 goal.values
                     .iter()
-                    .map(|v| format!("{v}ULL"))
+                    .map(|v| v.c_expr.clone())
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -7347,8 +7381,8 @@ impl Emitter {
                 self.pad(depth + 2);
                 writeln!(
                     self.out,
-                    "if ((uint64_t)_val_{} == {}ULL) {{ _auto_cov_{cache_tag}_{}[{}] = true; _auto_cov_blocked_{cache_tag}_{}[{}] = false; }}",
-                    goal.field, value, goal.field, idx, goal.field, idx
+                    "if ((uint64_t)_val_{} == {}) {{ _auto_cov_{cache_tag}_{}[{}] = true; _auto_cov_blocked_{cache_tag}_{}[{}] = false; }}",
+                    goal.field, value.c_expr, goal.field, idx, goal.field, idx
                 )
                 .ok();
             }
@@ -7359,8 +7393,8 @@ impl Emitter {
                     self.pad(depth + 2);
                     writeln!(
                         self.out,
-                        "if ((uint64_t)_val_{} == {}ULL && (uint64_t)_val_{} == {}ULL) {{ _auto_cross_{cache_tag}_{}__{}[{}][{}] = true; _auto_cross_blocked_{cache_tag}_{}__{}[{}][{}] = false; }}",
-                        a.field, av, b.field, bv, a.field, b.field, i, j, a.field, b.field, i, j
+                        "if ((uint64_t)_val_{} == {} && (uint64_t)_val_{} == {}) {{ _auto_cross_{cache_tag}_{}__{}[{}][{}] = true; _auto_cross_blocked_{cache_tag}_{}__{}[{}][{}] = false; }}",
+                        a.field, av.c_expr, b.field, bv.c_expr, a.field, b.field, i, j, a.field, b.field, i, j
                     )
                     .ok();
                 }
@@ -10642,6 +10676,18 @@ fn c_binary_op(op: BinaryOp) -> &'static str {
 fn fold_int_literal(e: &Expr) -> Option<u64> {
     match &*e.kind {
         ExprKind::Int(s) => parse_int_str(s),
+        _ => None,
+    }
+}
+
+fn fold_signed_int_literal(e: &Expr) -> Option<i64> {
+    match &*e.kind {
+        ExprKind::Int(s) => i64::try_from(parse_int_str(s)?).ok(),
+        ExprKind::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => i64::try_from(fold_int_literal(expr)?).ok().map(|v| -v),
+        ExprKind::Paren(inner) => fold_signed_int_literal(inner),
         _ => None,
     }
 }
