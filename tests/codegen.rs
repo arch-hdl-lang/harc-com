@@ -1724,6 +1724,33 @@ end test AutoCovConstrainedTest"#,
 }
 
 #[test]
+fn signed_range_auto_coverage_includes_negative_endpoint() {
+    let parsed = parse_source(
+        r#"transaction T
+    delta : sint<8> with [range(-4, 4)]
+end transaction T
+
+test SignedAutoCovPrefTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test SignedAutoCovPrefTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("_delta[2]")
+            && cpp.contains("{(uint64_t)(-4LL), 4ULL}")
+            && cpp.contains("T.delta=-4")
+            && cpp.contains("T.delta=4")
+            && cpp.contains("(uint64_t)_val_delta == (uint64_t)(-4LL)"),
+        "signed [range] endpoints should feed auto coverage preferences and report as signed values; got:\n{cpp}",
+    );
+}
+
+#[test]
 fn unique_field_randomize_uses_recycling_solver_history() {
     let parsed = parse_source(
         r#"transaction T
