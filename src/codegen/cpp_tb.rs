@@ -1190,6 +1190,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             "{INDENT}std::vector<std::function<void()>> _checkers;"
         )
         .ok();
+        writeln!(
+            e.out,
+            "{INDENT}std::vector<std::function<void()>> _auto_cov_reports;"
+        )
+        .ok();
         writeln!(e.out, "").ok();
 
         if clocks.is_empty() {
@@ -1969,6 +1974,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
 
         // Final + return.
         writeln!(e.out, "").ok();
+        writeln!(e.out, "{INDENT}for (auto& _r : _auto_cov_reports) _r();").ok();
         // Property-cover summary (ARCH-style: header line + per-point lines
         // with `*NOT HIT*` marker; stdout destination — see covergroup
         // report() for the rationale on stdout vs stderr).
@@ -6886,6 +6892,102 @@ impl Emitter {
                 b.values.len()
             )
             .ok();
+        }
+        if !auto_goals.is_empty() {
+            let total_bins: usize = auto_goals.iter().map(|g| g.values.len()).sum::<usize>()
+                + auto_crosses
+                    .iter()
+                    .map(|(a, b)| a.values.len() * b.values.len())
+                    .sum::<usize>();
+            self.pad(depth + 1);
+            writeln!(
+                self.out,
+                "static bool _auto_cov_report_registered_{cache_tag} = false;"
+            )
+            .ok();
+            self.pad(depth + 1);
+            writeln!(self.out, "if (!_auto_cov_report_registered_{cache_tag}) {{").ok();
+            self.pad(depth + 2);
+            writeln!(self.out, "_auto_cov_reports.push_back([&]() {{").ok();
+            self.pad(depth + 3);
+            writeln!(self.out, "uint64_t _hit = 0;").ok();
+            self.pad(depth + 3);
+            writeln!(self.out, "uint64_t _total = {total_bins};").ok();
+            for goal in &auto_goals {
+                for idx in 0..goal.values.len() {
+                    self.pad(depth + 3);
+                    writeln!(
+                        self.out,
+                        "if (_auto_cov_{cache_tag}_{}[{}]) _hit++;",
+                        goal.field, idx
+                    )
+                    .ok();
+                }
+            }
+            for (a, b) in &auto_crosses {
+                for i in 0..a.values.len() {
+                    for j in 0..b.values.len() {
+                        self.pad(depth + 3);
+                        writeln!(
+                            self.out,
+                            "if (_auto_cross_{cache_tag}_{}__{}[{}][{}]) _hit++;",
+                            a.field, b.field, i, j
+                        )
+                        .ok();
+                    }
+                }
+            }
+            self.pad(depth + 3);
+            writeln!(
+                self.out,
+                "std::printf(\"[auto_cov {}@{}] %llu/%llu hit (%.1f%%)\\n\", (unsigned long long)_hit, (unsigned long long)_total, _total ? (100.0 * _hit / _total) : 0.0);",
+                escape_c(ty),
+                target.span.start
+            )
+            .ok();
+            for goal in &auto_goals {
+                for (idx, value) in goal.values.iter().enumerate() {
+                    self.pad(depth + 3);
+                    writeln!(
+                        self.out,
+                        "std::printf(\"  {}.{}={} : %s\\n\", _auto_cov_{cache_tag}_{}[{}] ? \"hit\" : \"*NOT HIT*\");",
+                        escape_c(ty),
+                        escape_c(&goal.field),
+                        value,
+                        goal.field,
+                        idx
+                    )
+                    .ok();
+                }
+            }
+            for (a, b) in &auto_crosses {
+                for (i, av) in a.values.iter().enumerate() {
+                    for (j, bv) in b.values.iter().enumerate() {
+                        self.pad(depth + 3);
+                        writeln!(
+                            self.out,
+                            "std::printf(\"  {}.{}={} x {}.{}={} : %s\\n\", _auto_cross_{cache_tag}_{}__{}[{}][{}] ? \"hit\" : \"*NOT HIT*\");",
+                            escape_c(ty),
+                            escape_c(&a.field),
+                            av,
+                            escape_c(ty),
+                            escape_c(&b.field),
+                            bv,
+                            a.field,
+                            b.field,
+                            i,
+                            j
+                        )
+                        .ok();
+                    }
+                }
+            }
+            self.pad(depth + 2);
+            writeln!(self.out, "}});").ok();
+            self.pad(depth + 2);
+            writeln!(self.out, "_auto_cov_report_registered_{cache_tag} = true;").ok();
+            self.pad(depth + 1);
+            writeln!(self.out, "}}").ok();
         }
 
         // Seeded preference values. These are hard clauses only for the first
