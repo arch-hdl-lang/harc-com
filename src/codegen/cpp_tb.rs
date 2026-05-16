@@ -2224,6 +2224,32 @@ impl AutoCoverageValue {
     }
 }
 
+const COVERGROUP_AUTO_CROSS_BIN_CAP: usize = 64;
+
+fn covergroup_binned_points(g: &CovergroupDecl) -> Vec<&CoverPoint> {
+    g.items
+        .iter()
+        .filter_map(|it| match it {
+            CoverItem::Point(p) if !p.bins.is_empty() => Some(p),
+            _ => None,
+        })
+        .collect()
+}
+
+fn covergroup_auto_crosses(g: &CovergroupDecl) -> Vec<(&CoverPoint, &CoverPoint)> {
+    let points = covergroup_binned_points(g);
+    let mut crosses = Vec::new();
+    for i in 0..points.len() {
+        for j in (i + 1)..points.len() {
+            let bins = points[i].bins.len() * points[j].bins.len();
+            if bins <= COVERGROUP_AUTO_CROSS_BIN_CAP {
+                crosses.push((points[i], points[j]));
+            }
+        }
+    }
+    crosses
+}
+
 fn field_attr_range(f: &TxnFieldInfo) -> Option<(&Expr, &Expr)> {
     f.attrs.iter().find_map(|a| {
         if a.name.name != "range" || a.args.len() < 2 {
@@ -3994,12 +4020,12 @@ impl Emitter {
     }
 
     /// Emit a covergroup as a C++ struct: one nested struct per cover-point
-    /// holding `uint64_t` bin counters; a `sample()` method that runs each
-    /// cover-point's expression once and increments the matching bin's
-    /// counter; a `report()` method that prints a coverage summary.
-    /// `cross` is parsed but not lowered in v0 — coverage of combinations
-    /// would need a 2D matrix per cross declaration.
+    /// holding `uint64_t` bin counters plus sample-local pairwise cross
+    /// matrices. Crosses are updated only from bins hit in the same sample
+    /// invocation; this is deliberately a semantic sample record, not a
+    /// post-hoc mix of bins hit at unrelated times.
     fn emit_covergroup_struct(&mut self, g: &CovergroupDecl) {
+        let auto_crosses = covergroup_auto_crosses(g);
         writeln!(self.out, "struct {} {{", g.name.name).ok();
         // Per-cover-point nested struct of bin counters. The struct is
         // pure data; the sample() logic is emitted at `let cov : G` time
@@ -4014,6 +4040,17 @@ impl Emitter {
                 }
                 writeln!(self.out, "{INDENT}}} {};", p.name.name).ok();
             }
+        }
+        for (a, b) in &auto_crosses {
+            writeln!(
+                self.out,
+                "{INDENT}uint64_t _auto_cross_{}__{}[{}][{}] = {{}};",
+                a.name.name,
+                b.name.name,
+                a.bins.len(),
+                b.bins.len()
+            )
+            .ok();
         }
         writeln!(self.out, "").ok();
         // report() — ARCH-format coverage dump (header line + per-bin
@@ -4061,6 +4098,54 @@ impl Emitter {
                 }
             }
         }
+        for (a, b) in &auto_crosses {
+            self.pad(2);
+            writeln!(self.out, "{{").ok();
+            self.pad(3);
+            writeln!(self.out, "uint64_t _cross_hit = 0;").ok();
+            self.pad(3);
+            writeln!(
+                self.out,
+                "for (size_t _i = 0; _i < {}; ++_i) for (size_t _j = 0; _j < {}; ++_j) if (_auto_cross_{}__{}[_i][_j] > 0) _cross_hit++;",
+                a.bins.len(),
+                b.bins.len(),
+                a.name.name,
+                b.name.name
+            )
+            .ok();
+            self.pad(3);
+            writeln!(
+                self.out,
+                "std::printf( \"[{}] auto_cross {} x {}: %llu/%llu hit (%.1f%%)\\n\", (unsigned long long)_cross_hit, (unsigned long long){}, {} ? (100.0 * _cross_hit / {}) : 0.0);",
+                g.name.name,
+                a.name.name,
+                b.name.name,
+                a.bins.len() * b.bins.len(),
+                a.bins.len() * b.bins.len(),
+                a.bins.len() * b.bins.len()
+            )
+            .ok();
+            for (i, ab) in a.bins.iter().enumerate() {
+                for (j, bb) in b.bins.iter().enumerate() {
+                    self.pad(3);
+                    writeln!(
+                        self.out,
+                        "if (_auto_cross_{}__{}[{}][{}] == 0) std::printf( \"  {}.{} x {}.{}: *NOT HIT*\\n\" );",
+                        a.name.name,
+                        b.name.name,
+                        i,
+                        j,
+                        a.name.name,
+                        ab.name.name,
+                        b.name.name,
+                        bb.name.name
+                    )
+                    .ok();
+                }
+            }
+            self.pad(2);
+            writeln!(self.out, "}}").ok();
+        }
         writeln!(self.out, "{INDENT}}}").ok();
         writeln!(self.out, "}};").ok();
         writeln!(self.out, "").ok();
@@ -4075,8 +4160,22 @@ impl Emitter {
         instance: &str,
         depth: usize,
     ) {
+        let binned_points = covergroup_binned_points(g);
+        let auto_crosses = covergroup_auto_crosses(g);
         self.pad(depth);
         writeln!(self.out, "_checkers.push_back([&]() {{").ok();
+        if !auto_crosses.is_empty() {
+            for p in &binned_points {
+                self.pad(depth + 1);
+                writeln!(
+                    self.out,
+                    "bool _cg_hit_{}[{}] = {{}};",
+                    p.name.name,
+                    p.bins.len()
+                )
+                .ok();
+            }
+        }
         for it in &g.items {
             if let CoverItem::Point(p) = it {
                 self.pad(depth + 1);
@@ -4085,15 +4184,51 @@ impl Emitter {
                 write!(self.out, "uint64_t _v = (uint64_t)(").ok();
                 self.emit_expr(&p.target);
                 writeln!(self.out, ");").ok();
-                for b in &p.bins {
+                for (bin_idx, b) in p.bins.iter().enumerate() {
                     self.pad(depth + 2);
                     write!(self.out, "if (").ok();
                     self.emit_bin_membership(&b.spec);
-                    writeln!(self.out, ") {instance}.{}.{}++;", p.name.name, b.name.name).ok();
+                    if auto_crosses.is_empty() {
+                        writeln!(self.out, ") {instance}.{}.{}++;", p.name.name, b.name.name).ok();
+                    } else {
+                        writeln!(
+                            self.out,
+                            ") {{ {instance}.{}.{}++; _cg_hit_{}[{}] = true; }}",
+                            p.name.name, b.name.name, p.name.name, bin_idx
+                        )
+                        .ok();
+                    }
                 }
                 self.pad(depth + 1);
                 writeln!(self.out, "}}").ok();
             }
+        }
+        for (a, b) in &auto_crosses {
+            self.pad(depth + 1);
+            writeln!(
+                self.out,
+                "for (size_t _i = 0; _i < {}; ++_i) {{",
+                a.bins.len()
+            )
+            .ok();
+            self.pad(depth + 2);
+            writeln!(
+                self.out,
+                "for (size_t _j = 0; _j < {}; ++_j) {{",
+                b.bins.len()
+            )
+            .ok();
+            self.pad(depth + 3);
+            writeln!(
+                self.out,
+                "if (_cg_hit_{}[_i] && _cg_hit_{}[_j]) {instance}._auto_cross_{}__{}[_i][_j]++;",
+                a.name.name, b.name.name, a.name.name, b.name.name
+            )
+            .ok();
+            self.pad(depth + 2);
+            writeln!(self.out, "}}").ok();
+            self.pad(depth + 1);
+            writeln!(self.out, "}}").ok();
         }
         self.pad(depth);
         writeln!(self.out, "}});").ok();
