@@ -1777,6 +1777,62 @@ end test BlockingRuntimeDepTest"#,
     );
 }
 
+#[test]
+fn blocking_randomize_snapshots_scalar_let_dependencies() {
+    let queued = parse_source(
+        r#"transaction T
+    len : uint<8>
+end transaction T
+
+test QueuedScalarDepTest
+    let dut : DummyDut
+    run
+        let t : T
+        let prev : T
+        randomize(prev)
+        let target_len : uint<8> = prev.len
+        randomize(t) with
+            t.len == target_len
+        end randomize
+    end run
+end test QueuedScalarDepTest"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&queued).unwrap_err();
+    assert!(
+        err.0.contains("queued randomize(T)")
+            && err.0.contains("runtime state `target_len`")
+            && err.0.contains("blocking randomize"),
+        "queued randomize should reject scalar runtime state with guidance; got: {}",
+        err.0,
+    );
+
+    let blocking = parse_source(
+        r#"transaction T
+    len : uint<8>
+end transaction T
+
+test BlockingScalarDepTest
+    let dut : DummyDut
+    run
+        let t : T
+        let prev : T
+        randomize(prev)
+        let target_len : uint<8> = prev.len
+        blocking randomize(t) with
+            t.len == target_len
+        end randomize
+    end run
+end test BlockingScalarDepTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&blocking).expect("blocking scalar dependency emits");
+    assert!(
+        cpp.contains("_z_len == _ctx.bv_val((uint64_t)(target_len), 64)"),
+        "blocking randomize should snapshot typed scalar lets into the solver; got:\n{cpp}",
+    );
+}
+
 /// `keep f != WRAP` where `WRAP` is an enum variant resolves via
 /// the global `enum_variants` map. Without this lookup the
 /// constraint translator would error with "unknown name `WRAP`".
