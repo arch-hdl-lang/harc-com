@@ -5676,12 +5676,8 @@ impl Emitter {
                     if field_info.contains_key(&name.name)
                         && target_root.is_some_and(|expected| root.name != expected)
                     {
-                        let path = format!("{}.{}", root.name, name.name);
-                        if blocking {
-                            self.errors.push(format!(
-                                "blocking randomize({ty}) constraint references runtime state `{path}`, but runtime-dependent constraint lowering is not supported yet"
-                            ));
-                        } else {
+                        if !blocking {
+                            let path = format!("{}.{}", root.name, name.name);
                             self.errors.push(format!(
                                 "queued randomize({ty}) constraint references runtime state `{path}`; use `blocking randomize` once runtime-dependent constraint lowering is supported"
                             ));
@@ -6023,20 +6019,22 @@ impl Emitter {
         lo: &Expr,
         hi: &Expr,
         field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+        target_root: Option<&str>,
+        blocking: bool,
         depth: usize,
     ) {
         self.pad(depth);
         write!(self.out, "_s.add(").ok();
         if f.signed {
             write!(self.out, "_z_{} >= ", f.name).ok();
-            self.emit_constraint_expr_w(lo, field_info, 64);
+            self.emit_constraint_expr_w(lo, field_info, 64, target_root, blocking);
             write!(self.out, " && _z_{} <= ", f.name).ok();
-            self.emit_constraint_expr_w(hi, field_info, 64);
+            self.emit_constraint_expr_w(hi, field_info, 64, target_root, blocking);
         } else {
             write!(self.out, "z3::uge(_z_{}, ", f.name).ok();
-            self.emit_constraint_expr_w(lo, field_info, 64);
+            self.emit_constraint_expr_w(lo, field_info, 64, target_root, blocking);
             write!(self.out, ") && z3::ule(_z_{}, ", f.name).ok();
-            self.emit_constraint_expr_w(hi, field_info, 64);
+            self.emit_constraint_expr_w(hi, field_info, 64, target_root, blocking);
             write!(self.out, ")").ok();
         }
         writeln!(self.out, ");").ok();
@@ -6352,7 +6350,15 @@ impl Emitter {
                 writeln!(self.out, ".{}), 64));", f.name).ok();
             }
             if let Some((lo, hi)) = field_attr_range(f) {
-                self.emit_solver_range_constraint(f, lo, hi, &field_info, depth + 1);
+                self.emit_solver_range_constraint(
+                    f,
+                    lo,
+                    hi,
+                    &field_info,
+                    target_root,
+                    blocking,
+                    depth + 1,
+                );
             }
         }
 
@@ -6360,7 +6366,7 @@ impl Emitter {
         for c in &hard_constraints {
             self.pad(depth + 1);
             write!(self.out, "_s.add(").ok();
-            self.emit_constraint_expr(c, &field_info);
+            self.emit_constraint_expr(c, &field_info, target_root, blocking);
             writeln!(self.out, ");").ok();
         }
 
@@ -6613,9 +6619,11 @@ impl Emitter {
         &mut self,
         e: &Expr,
         field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+        target_root: Option<&str>,
+        blocking: bool,
     ) {
         // All Z3 vars are 64-bit; literals match.
-        self.emit_constraint_expr_w(e, field_info, 64);
+        self.emit_constraint_expr_w(e, field_info, 64, target_root, blocking);
     }
 
     fn emit_constraint_expr_w(
@@ -6623,17 +6631,34 @@ impl Emitter {
         e: &Expr,
         field_info: &std::collections::HashMap<String, TxnFieldInfo>,
         width: u32,
+        target_root: Option<&str>,
+        blocking: bool,
     ) {
         match &*e.kind {
             // `t.<name>` → _z_<name>. Strip the `t.` prefix.
             ExprKind::Field { target, name } => {
-                if matches!(&*target.kind, ExprKind::Ident(_))
-                    && field_info.contains_key(&name.name)
-                {
-                    write!(self.out, "_z_{}", name.name).ok();
+                if let ExprKind::Ident(root) = &*target.kind {
+                    if field_info.contains_key(&name.name)
+                        && target_root.is_some_and(|expected| root.name == expected)
+                    {
+                        write!(self.out, "_z_{}", name.name).ok();
+                    } else if blocking
+                        && field_info.contains_key(&name.name)
+                        && target_root.is_some_and(|expected| root.name != expected)
+                    {
+                        write!(self.out, "_ctx.bv_val((uint64_t)(").ok();
+                        self.emit_expr(e);
+                        write!(self.out, "), {width})").ok();
+                    } else {
+                        self.errors.push(format!(
+                            "constraint references unknown field `{}` (only fields of the randomize target are supported)",
+                            name.name
+                        ));
+                        write!(self.out, "_ctx.bool_val(true)").ok();
+                    }
                 } else {
                     self.errors.push(format!(
-                        "constraint references unknown field `{}` (only `t.<field>` of the randomize target is supported)",
+                        "constraint references unknown field `{}` (only fields of the randomize target are supported)",
                         name.name
                     ));
                     write!(self.out, "_ctx.bool_val(true)").ok();
@@ -6672,7 +6697,7 @@ impl Emitter {
             }
             ExprKind::Paren(inner) => {
                 write!(self.out, "(").ok();
-                self.emit_constraint_expr_w(inner, field_info, width);
+                self.emit_constraint_expr_w(inner, field_info, width, target_root, blocking);
                 write!(self.out, ")").ok();
             }
             ExprKind::Unary { op, expr } => {
@@ -6682,7 +6707,7 @@ impl Emitter {
                     UnaryOp::BitNot => "~",
                 };
                 write!(self.out, "{s}").ok();
-                self.emit_constraint_expr_w(expr, field_info, width);
+                self.emit_constraint_expr_w(expr, field_info, width, target_root, blocking);
             }
             // `e in <range-or-set>` parses as ExprKind::Membership
             // (not Binary(In, …) — the `in` keyword is lexed as
@@ -6690,7 +6715,14 @@ impl Emitter {
             // OR-chain of equality / range-comparison sub-expressions
             // the solver handles natively.
             ExprKind::Membership { expr, set } => {
-                self.emit_constraint_membership(expr, set, field_info, width);
+                self.emit_constraint_membership(
+                    expr,
+                    set,
+                    field_info,
+                    width,
+                    target_root,
+                    blocking,
+                );
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 use BinaryOp::*;
@@ -6699,7 +6731,14 @@ impl Emitter {
                 // op variants exist, so keep the handler in case
                 // future parser paths emit them.
                 if matches!(op, In | Inside) {
-                    self.emit_constraint_membership(lhs, rhs, field_info, width);
+                    self.emit_constraint_membership(
+                        lhs,
+                        rhs,
+                        field_info,
+                        width,
+                        target_root,
+                        blocking,
+                    );
                     return;
                 }
                 // Z3's operator overloads on `z3::expr` default to
@@ -6750,14 +6789,14 @@ impl Emitter {
                 if let Some(fn_name) = fname {
                     // Unsigned op via z3::<fn>(lhs, rhs).
                     write!(self.out, "z3::{fn_name}(").ok();
-                    self.emit_constraint_expr_w(lhs, field_info, width);
+                    self.emit_constraint_expr_w(lhs, field_info, width, target_root, blocking);
                     write!(self.out, ", ").ok();
-                    self.emit_constraint_expr_w(rhs, field_info, width);
+                    self.emit_constraint_expr_w(rhs, field_info, width, target_root, blocking);
                     write!(self.out, ")").ok();
                 } else {
-                    self.emit_constraint_expr_w(lhs, field_info, width);
+                    self.emit_constraint_expr_w(lhs, field_info, width, target_root, blocking);
                     write!(self.out, "{sep}").ok();
-                    self.emit_constraint_expr_w(rhs, field_info, width);
+                    self.emit_constraint_expr_w(rhs, field_info, width, target_root, blocking);
                 }
             }
             _ => {
@@ -6786,6 +6825,8 @@ impl Emitter {
         rhs: &Expr,
         field_info: &std::collections::HashMap<String, TxnFieldInfo>,
         width: u32,
+        target_root: Option<&str>,
+        blocking: bool,
     ) {
         match &*rhs.kind {
             ExprKind::RangeLit { lo, hi } => {
@@ -6794,14 +6835,14 @@ impl Emitter {
                 let signed = self.constraint_expr_is_signed(lhs, field_info);
                 if let Some(l) = lo {
                     if signed {
-                        self.emit_constraint_expr_w(lhs, field_info, width);
+                        self.emit_constraint_expr_w(lhs, field_info, width, target_root, blocking);
                         write!(self.out, " >= ").ok();
-                        self.emit_constraint_expr_w(l, field_info, width);
+                        self.emit_constraint_expr_w(l, field_info, width, target_root, blocking);
                     } else {
                         write!(self.out, "z3::uge(").ok();
-                        self.emit_constraint_expr_w(lhs, field_info, width);
+                        self.emit_constraint_expr_w(lhs, field_info, width, target_root, blocking);
                         write!(self.out, ", ").ok();
-                        self.emit_constraint_expr_w(l, field_info, width);
+                        self.emit_constraint_expr_w(l, field_info, width, target_root, blocking);
                         write!(self.out, ")").ok();
                     }
                     has_any = true;
@@ -6811,14 +6852,14 @@ impl Emitter {
                         write!(self.out, " && ").ok();
                     }
                     if signed {
-                        self.emit_constraint_expr_w(lhs, field_info, width);
+                        self.emit_constraint_expr_w(lhs, field_info, width, target_root, blocking);
                         write!(self.out, " <= ").ok();
-                        self.emit_constraint_expr_w(h, field_info, width);
+                        self.emit_constraint_expr_w(h, field_info, width, target_root, blocking);
                     } else {
                         write!(self.out, "z3::ule(").ok();
-                        self.emit_constraint_expr_w(lhs, field_info, width);
+                        self.emit_constraint_expr_w(lhs, field_info, width, target_root, blocking);
                         write!(self.out, ", ").ok();
-                        self.emit_constraint_expr_w(h, field_info, width);
+                        self.emit_constraint_expr_w(h, field_info, width, target_root, blocking);
                         write!(self.out, ")").ok();
                     }
                     has_any = true;
@@ -6841,16 +6882,42 @@ impl Emitter {
                         // Recurse so `{[0..3], 7}` expands correctly.
                         match &*it.kind {
                             ExprKind::RangeLit { .. } | ExprKind::SetLit(_) => {
-                                self.emit_constraint_membership(lhs, it, field_info, width);
+                                self.emit_constraint_membership(
+                                    lhs,
+                                    it,
+                                    field_info,
+                                    width,
+                                    target_root,
+                                    blocking,
+                                );
                             }
                             ExprKind::Paren(inner) => {
-                                self.emit_constraint_membership(lhs, inner, field_info, width);
+                                self.emit_constraint_membership(
+                                    lhs,
+                                    inner,
+                                    field_info,
+                                    width,
+                                    target_root,
+                                    blocking,
+                                );
                             }
                             _ => {
                                 // Singleton element — equality test.
-                                self.emit_constraint_expr_w(lhs, field_info, width);
+                                self.emit_constraint_expr_w(
+                                    lhs,
+                                    field_info,
+                                    width,
+                                    target_root,
+                                    blocking,
+                                );
                                 write!(self.out, " == ").ok();
-                                self.emit_constraint_expr_w(it, field_info, width);
+                                self.emit_constraint_expr_w(
+                                    it,
+                                    field_info,
+                                    width,
+                                    target_root,
+                                    blocking,
+                                );
                             }
                         }
                     }
@@ -6858,14 +6925,21 @@ impl Emitter {
                 write!(self.out, ")").ok();
             }
             ExprKind::Paren(inner) => {
-                self.emit_constraint_membership(lhs, inner, field_info, width);
+                self.emit_constraint_membership(
+                    lhs,
+                    inner,
+                    field_info,
+                    width,
+                    target_root,
+                    blocking,
+                );
             }
             _ => {
                 // Fallback: treat rhs as a singleton — `a in b` becomes
                 // `a == b`. Same shape `emit_bin_membership` uses.
-                self.emit_constraint_expr_w(lhs, field_info, width);
+                self.emit_constraint_expr_w(lhs, field_info, width, target_root, blocking);
                 write!(self.out, " == ").ok();
-                self.emit_constraint_expr_w(rhs, field_info, width);
+                self.emit_constraint_expr_w(rhs, field_info, width, target_root, blocking);
             }
         }
     }
