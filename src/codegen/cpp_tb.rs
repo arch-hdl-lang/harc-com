@@ -6880,12 +6880,30 @@ impl Emitter {
                 goal.values.len()
             )
             .ok();
+            self.pad(depth + 1);
+            writeln!(
+                self.out,
+                "static bool _auto_cov_blocked_{cache_tag}_{}[{}] = {{}};",
+                goal.field,
+                goal.values.len()
+            )
+            .ok();
         }
         for (a, b) in &auto_crosses {
             self.pad(depth + 1);
             writeln!(
                 self.out,
                 "static bool _auto_cross_{cache_tag}_{}__{}[{}][{}] = {{}};",
+                a.field,
+                b.field,
+                a.values.len(),
+                b.values.len()
+            )
+            .ok();
+            self.pad(depth + 1);
+            writeln!(
+                self.out,
+                "static bool _auto_cross_blocked_{cache_tag}_{}__{}[{}][{}] = {{}};",
                 a.field,
                 b.field,
                 a.values.len(),
@@ -6912,6 +6930,8 @@ impl Emitter {
             self.pad(depth + 3);
             writeln!(self.out, "uint64_t _hit = 0;").ok();
             self.pad(depth + 3);
+            writeln!(self.out, "uint64_t _blocked = 0;").ok();
+            self.pad(depth + 3);
             writeln!(self.out, "uint64_t _total = {total_bins};").ok();
             for goal in &auto_goals {
                 for idx in 0..goal.values.len() {
@@ -6919,6 +6939,13 @@ impl Emitter {
                     writeln!(
                         self.out,
                         "if (_auto_cov_{cache_tag}_{}[{}]) _hit++;",
+                        goal.field, idx
+                    )
+                    .ok();
+                    self.pad(depth + 3);
+                    writeln!(
+                        self.out,
+                        "if (_auto_cov_blocked_{cache_tag}_{}[{}]) _blocked++;",
                         goal.field, idx
                     )
                     .ok();
@@ -6934,13 +6961,20 @@ impl Emitter {
                             a.field, b.field, i, j
                         )
                         .ok();
+                        self.pad(depth + 3);
+                        writeln!(
+                            self.out,
+                            "if (_auto_cross_blocked_{cache_tag}_{}__{}[{}][{}]) _blocked++;",
+                            a.field, b.field, i, j
+                        )
+                        .ok();
                     }
                 }
             }
             self.pad(depth + 3);
             writeln!(
                 self.out,
-                "std::printf(\"[auto_cov {}@{}] %llu/%llu hit (%.1f%%)\\n\", (unsigned long long)_hit, (unsigned long long)_total, _total ? (100.0 * _hit / _total) : 0.0);",
+                "std::printf(\"[auto_cov {}@{}] %llu/%llu hit (%.1f%%), blocked=%llu\\n\", (unsigned long long)_hit, (unsigned long long)_total, _total ? (100.0 * _hit / _total) : 0.0, (unsigned long long)_blocked);",
                 escape_c(ty),
                 target.span.start
             )
@@ -6950,10 +6984,12 @@ impl Emitter {
                     self.pad(depth + 3);
                     writeln!(
                         self.out,
-                        "std::printf(\"  {}.{}={} : %s\\n\", _auto_cov_{cache_tag}_{}[{}] ? \"hit\" : \"*NOT HIT*\");",
+                        "std::printf(\"  {}.{}={} : %s\\n\", _auto_cov_{cache_tag}_{}[{}] ? \"hit\" : (_auto_cov_blocked_{cache_tag}_{}[{}] ? \"*BLOCKED*\" : \"*NOT HIT*\"));",
                         escape_c(ty),
                         escape_c(&goal.field),
                         value,
+                        goal.field,
+                        idx,
                         goal.field,
                         idx
                     )
@@ -6966,13 +7002,17 @@ impl Emitter {
                         self.pad(depth + 3);
                         writeln!(
                             self.out,
-                            "std::printf(\"  {}.{}={} x {}.{}={} : %s\\n\", _auto_cross_{cache_tag}_{}__{}[{}][{}] ? \"hit\" : \"*NOT HIT*\");",
+                            "std::printf(\"  {}.{}={} x {}.{}={} : %s\\n\", _auto_cross_{cache_tag}_{}__{}[{}][{}] ? \"hit\" : (_auto_cross_blocked_{cache_tag}_{}__{}[{}][{}] ? \"*BLOCKED*\" : \"*NOT HIT*\"));",
                             escape_c(ty),
                             escape_c(&a.field),
                             av,
                             escape_c(ty),
                             escape_c(&b.field),
                             bv,
+                            a.field,
+                            b.field,
+                            i,
+                            j,
                             a.field,
                             b.field,
                             i,
@@ -7050,8 +7090,16 @@ impl Emitter {
                 "bool _auto_cov_pref_{cache_tag} = false;   // auto coverage preference"
             )
             .ok();
+            self.pad(depth + 1);
+            writeln!(self.out, "int _auto_cov_selected_kind_{cache_tag} = 0;").ok();
+            self.pad(depth + 1);
+            writeln!(self.out, "int _auto_cov_selected_group_{cache_tag} = -1;").ok();
+            self.pad(depth + 1);
+            writeln!(self.out, "size_t _auto_cov_selected_i_{cache_tag} = 0;").ok();
+            self.pad(depth + 1);
+            writeln!(self.out, "size_t _auto_cov_selected_j_{cache_tag} = 0;").ok();
         }
-        for (a, b) in &auto_crosses {
+        for (group, (a, b)) in auto_crosses.iter().enumerate() {
             self.pad(depth + 1);
             writeln!(self.out, "if (!_auto_cov_pref_{cache_tag}) {{").ok();
             self.pad(depth + 2);
@@ -7071,7 +7119,8 @@ impl Emitter {
             self.pad(depth + 4);
             writeln!(
                 self.out,
-                "if (!_auto_cross_{cache_tag}_{}__{}[_i][_j]) {{",
+                "if (!_auto_cross_{cache_tag}_{}__{}[_i][_j] && !_auto_cross_blocked_{cache_tag}_{}__{}[_i][_j]) {{",
+                a.field, b.field,
                 a.field, b.field
             )
             .ok();
@@ -7116,6 +7165,14 @@ impl Emitter {
             self.pad(depth + 5);
             writeln!(self.out, "_auto_cov_pref_{cache_tag} = true;").ok();
             self.pad(depth + 5);
+            writeln!(self.out, "_auto_cov_selected_kind_{cache_tag} = 2;").ok();
+            self.pad(depth + 5);
+            writeln!(self.out, "_auto_cov_selected_group_{cache_tag} = {group};").ok();
+            self.pad(depth + 5);
+            writeln!(self.out, "_auto_cov_selected_i_{cache_tag} = _i;").ok();
+            self.pad(depth + 5);
+            writeln!(self.out, "_auto_cov_selected_j_{cache_tag} = _j;").ok();
+            self.pad(depth + 5);
             writeln!(self.out, "break;").ok();
             self.pad(depth + 4);
             writeln!(self.out, "}}").ok();
@@ -7128,7 +7185,7 @@ impl Emitter {
             self.pad(depth + 1);
             writeln!(self.out, "}}").ok();
         }
-        for goal in &auto_goals {
+        for (group, goal) in auto_goals.iter().enumerate() {
             self.pad(depth + 1);
             writeln!(self.out, "if (!_auto_cov_pref_{cache_tag}) {{").ok();
             self.pad(depth + 2);
@@ -7153,8 +7210,8 @@ impl Emitter {
             self.pad(depth + 3);
             writeln!(
                 self.out,
-                "if (!_auto_cov_{cache_tag}_{}[_i]) {{ _pref_{cache_tag}_{} = _auto_vals_{cache_tag}_{}[_i]; _auto_cov_pref_{cache_tag} = true; break; }}",
-                goal.field, goal.field, goal.field
+                "if (!_auto_cov_{cache_tag}_{}[_i] && !_auto_cov_blocked_{cache_tag}_{}[_i]) {{ _pref_{cache_tag}_{} = _auto_vals_{cache_tag}_{}[_i]; _auto_cov_pref_{cache_tag} = true; _auto_cov_selected_kind_{cache_tag} = 1; _auto_cov_selected_group_{cache_tag} = {group}; _auto_cov_selected_i_{cache_tag} = _i; break; }}",
+                goal.field, goal.field, goal.field, goal.field
             )
             .ok();
             self.pad(depth + 2);
@@ -7181,6 +7238,26 @@ impl Emitter {
         writeln!(self.out, "auto _r = _s.check();").ok();
         self.pad(depth + 1);
         writeln!(self.out, "if (_r != z3::sat) {{").ok();
+        if !auto_goals.is_empty() {
+            for (group, (a, b)) in auto_crosses.iter().enumerate() {
+                self.pad(depth + 2);
+                writeln!(
+                    self.out,
+                    "if (_auto_cov_selected_kind_{cache_tag} == 2 && _auto_cov_selected_group_{cache_tag} == {group}) _auto_cross_blocked_{cache_tag}_{}__{}[_auto_cov_selected_i_{cache_tag}][_auto_cov_selected_j_{cache_tag}] = true;",
+                    a.field, b.field
+                )
+                .ok();
+            }
+            for (group, goal) in auto_goals.iter().enumerate() {
+                self.pad(depth + 2);
+                writeln!(
+                    self.out,
+                    "if (_auto_cov_selected_kind_{cache_tag} == 1 && _auto_cov_selected_group_{cache_tag} == {group}) _auto_cov_blocked_{cache_tag}_{}[_auto_cov_selected_i_{cache_tag}] = true;",
+                    goal.field
+                )
+                .ok();
+            }
+        }
         self.pad(depth + 2);
         writeln!(self.out, "_s.pop();").ok();
         self.pad(depth + 2);
@@ -7270,8 +7347,8 @@ impl Emitter {
                 self.pad(depth + 2);
                 writeln!(
                     self.out,
-                    "if ((uint64_t)_val_{} == {}ULL) _auto_cov_{cache_tag}_{}[{}] = true;",
-                    goal.field, value, goal.field, idx
+                    "if ((uint64_t)_val_{} == {}ULL) {{ _auto_cov_{cache_tag}_{}[{}] = true; _auto_cov_blocked_{cache_tag}_{}[{}] = false; }}",
+                    goal.field, value, goal.field, idx, goal.field, idx
                 )
                 .ok();
             }
@@ -7282,8 +7359,8 @@ impl Emitter {
                     self.pad(depth + 2);
                     writeln!(
                         self.out,
-                        "if ((uint64_t)_val_{} == {}ULL && (uint64_t)_val_{} == {}ULL) _auto_cross_{cache_tag}_{}__{}[{}][{}] = true;",
-                        a.field, av, b.field, bv, a.field, b.field, i, j
+                        "if ((uint64_t)_val_{} == {}ULL && (uint64_t)_val_{} == {}ULL) {{ _auto_cross_{cache_tag}_{}__{}[{}][{}] = true; _auto_cross_blocked_{cache_tag}_{}__{}[{}][{}] = false; }}",
+                        a.field, av, b.field, bv, a.field, b.field, i, j, a.field, b.field, i, j
                     )
                     .ok();
                 }

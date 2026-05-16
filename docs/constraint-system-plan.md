@@ -92,8 +92,11 @@ min/max endpoints, then derives capped pairwise crosses from those goals.
 Uncovered goals and crosses should be preferred ahead of ordinary seeded
 samples when the participating fields remain unconstrained; explicit user
 constraints and non-random fields must exclude the corresponding auto goals.
-The same runtime state should report hit/miss summaries at test end so users
-can see which generated preferences still need attention.
+If an auto coverage preference makes the first solver check UNSAT, the runtime
+should mark that generated goal as blocked, skip it on later attempts, and
+retry without treating the preference as a hard failure. The same runtime state
+should report hit/miss/blocked summaries at test end so users can see which
+generated preferences still need attention.
 
 `[unique]` is also a randomization policy, not a hard field invariant. It
 should steer fields that remain unconstrained after `keep`, relation expansion,
