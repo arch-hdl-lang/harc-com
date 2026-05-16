@@ -941,6 +941,52 @@ covergroup AxiOps @(posedge dut.axi_s.aclk)
 end covergroup AxiOps
 ```
 
+The `@(...)` clause defines the semantic sample event for the covergroup.
+Clocked covergroups sample on the named edge:
+
+```
+covergroup FifoCov @(posedge dut.clk)
+    cp_empty : cover dut.empty
+        bins
+            yes = {1}
+            no  = {0}
+        end bins
+end covergroup FifoCov
+```
+
+Covergroups can also sample at a hookable component method boundary:
+
+```
+agent AxiMonitor
+    hookable observed(t: AxiWrite)
+    end observed
+end agent AxiMonitor
+
+covergroup AxiTxnCov @(mon.observed(t) post)
+    cp_burst : cover t.burst
+    cp_len   : cover t.len
+        bins
+            single = {1}
+            short  = [2..8]
+            long   = [9..256]
+        end bins
+end covergroup AxiTxnCov
+```
+
+`pre` samples immediately before the hookable method body; `post` samples
+immediately after it. The trigger target must resolve to a `hookable` method on
+a known component instance, and trigger argument names must match the hook
+parameters. This keeps coverage sampling tied to the semantic transaction event
+instead of repeatedly sampling stable transaction fields on every clock.
+
+The v0 C++ backend also derives capped pairwise auto-crosses for binned
+coverpoints in a covergroup. Auto-crosses are updated only from bins hit during
+the same sample invocation, so `cp_a.bin1 x cp_b.bin2` is counted only when both
+bins occur in the same clock edge or hook call. The report prints auto-cross
+summaries and missing bin combinations. Explicit `cross cp_a, cp_b` is parsed
+and round-trips today; first-class declared-cross reporting is planned to reuse
+the same sample-local machinery.
+
 ### 6.3 Coverage as data
 
 A coverage group is a typed value. You can:
