@@ -1,7 +1,8 @@
 use harc::ast::ExprKind;
 use harc::codegen::cpp_tb;
 use harc::constraints::{
-    elaborate_constraints, FieldAttrArgSchema, FieldTypeClass, RelationBodySchema, Signedness,
+    elaborate_constraints, ConstraintBinaryOp, ConstraintExpr, FieldAttrArgSchema, FieldTypeClass,
+    RelationBodySchema, Signedness,
 };
 use harc::parser::parse_source;
 
@@ -179,4 +180,94 @@ end test SolverPathTest"#,
         cpp.contains("z3::urem(_z_addr"),
         "relation body should still inline into codegen solver constraints:\n{cpp}"
     );
+}
+
+#[test]
+fn lowers_supported_constraint_subset_to_typed_ir() {
+    let parsed = parse_source(
+        r#"transaction T
+    addr : uint<32>
+    len : uint<8>
+    keep len in {[1..4], 8}
+    keep addr % 4 == 0 && len <= 8
+end transaction T"#,
+    )
+    .unwrap();
+
+    let elaborated = elaborate_constraints(&parsed);
+    assert!(elaborated.errors.is_empty(), "{:?}", elaborated.errors);
+    let txn = elaborated.transaction("T").expect("T schema");
+
+    let membership = txn.keeps[0].ir.as_ref().expect("membership IR");
+    assert!(matches!(
+        membership,
+        ConstraintExpr::Membership {
+            expr,
+            set
+        } if matches!(&**expr, ConstraintExpr::Ident(name) if name == "len")
+            && matches!(&**set, ConstraintExpr::Set(items) if items.len() == 2)
+    ));
+
+    let combined = txn.keeps[1].ir.as_ref().expect("combined IR");
+    assert!(matches!(
+        combined,
+        ConstraintExpr::Binary {
+            op: ConstraintBinaryOp::LogicalAnd,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn lowers_relation_calls_to_typed_ir() {
+    let parsed = parse_source(
+        r#"transaction T
+    addr : uint<32>
+end transaction T
+
+relation Aligned(x: T) = x.addr % 4 == 0
+relation Legal(x: T) = Aligned(x) && x.addr > 16"#,
+    )
+    .unwrap();
+
+    let elaborated = elaborate_constraints(&parsed);
+    assert!(elaborated.errors.is_empty(), "{:?}", elaborated.errors);
+
+    let legal = elaborated.relation("Legal").expect("Legal relation");
+    let RelationBodySchema::Alias(clause) = &legal.body else {
+        panic!("Legal should be alias-form");
+    };
+    let ir = clause.ir.as_ref().expect("relation IR");
+    assert!(matches!(
+        ir,
+        ConstraintExpr::Binary {
+            op: ConstraintBinaryOp::LogicalAnd,
+            lhs,
+            rhs,
+        } if matches!(&**lhs, ConstraintExpr::RelationCall { name, args } if name == "Aligned" && args.len() == 1)
+            && matches!(&**rhs, ConstraintExpr::Binary { op: ConstraintBinaryOp::Gt, .. })
+    ));
+}
+
+#[test]
+fn typed_lowering_reports_unsupported_constraint_forms() {
+    let parsed = parse_source(
+        r#"transaction T
+    addr : uint<32>
+    keep solve_before(addr, addr)
+end transaction T"#,
+    )
+    .unwrap();
+
+    let elaborated = elaborate_constraints(&parsed);
+    assert_eq!(elaborated.errors.len(), 1);
+    assert!(
+        elaborated.errors[0]
+            .message
+            .contains("not supported by typed lowering"),
+        "{:?}",
+        elaborated.errors
+    );
+    let txn = elaborated.transaction("T").expect("T schema");
+    assert!(txn.keeps[0].ir.is_none());
 }
