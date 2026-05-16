@@ -1,0 +1,155 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_ring_token_0004`.
+//
+// DUT: token_ring_fsm — 4-state FSM walking a one-hot token around the ring.
+//   - On reset: state=NODE0, token=0001, token_received=0001, data_out=0.
+//   - Each cycle the case advances state and writes the next token/
+//     token_received values. The forwarding-check
+//       if (token_received[current_state] && has_data_to_send) data_out <= data_in;
+//       else data_out <= 0;
+//     reads the *just-pre-eval* registered token_received vs current_state.
+//   - In the first cycle after reset (current_state=NODE0, token_received=0001),
+//     token_received[0]=1 → forwarding works. After that, token_received lags
+//     state by one cycle and the bit-index always reads 0 → else branch fires
+//     every subsequent cycle.
+//
+// Strategy:
+//   - reset and verify init outputs
+//   - one full ring walk, asserting token / token_received per cycle
+//   - immediate-post-reset forwarding test (NODE0 with has_data_to_send=1)
+//   - else-branch coverage by walking many cycles with has_data_to_send=1
+//   - else-branch coverage with has_data_to_send=0
+//   - mid-flow async reset re-assertion
+
+testbench RingTokenTb
+    dut : token_ring_fsm
+end testbench RingTokenTb
+
+impl RingTokenTest for RingTokenTb
+    run
+        log(info, "token_ring_fsm: ring walk + reset-cycle forwarding")
+
+        // ── Reset ───────────────────────────────────────────────
+        dut.rst = 1
+        dut.data_in = 0
+        dut.has_data_to_send = 0
+        wait 2 cycles
+        assert dut.token == 0b0001
+            else fail("reset: token=0x${dut.token:01x}, expected 0001")
+        assert dut.token_received == 0b0001
+            else fail("reset: token_received=0x${dut.token_received:01x}, expected 0001")
+        assert dut.data_out == 0
+            else fail("reset: data_out=0x${dut.data_out:01x}, expected 0")
+
+        // ── First post-reset cycle: NODE0 with data forwarding ──
+        // At this rising edge, current_state=NODE0, token_received=0001,
+        // token_received[0]=1, so if has_data_to_send=1 → data_out <= data_in.
+        dut.rst = 0
+        dut.data_in = 0xC
+        dut.has_data_to_send = 1
+        wait 1 cycle
+        assert dut.token == 0b0010
+            else fail("post-reset NODE0: token=0x${dut.token:01x}, expected 0010")
+        assert dut.token_received == 0b0001
+            else fail("post-reset NODE0: token_received=0x${dut.token_received:01x}, expected 0001")
+        assert dut.data_out == 0xC
+            else fail("post-reset NODE0 forward: data_out=0x${dut.data_out:01x}, expected 0xC")
+
+        // ── NODE1: token_received[1]=0 → else branch, data_out=0 ─
+        dut.data_in = 0xA  // should NOT be forwarded
+        wait 1 cycle
+        assert dut.token == 0b0100
+            else fail("NODE1: token=0x${dut.token:01x}, expected 0100")
+        assert dut.token_received == 0b0010
+            else fail("NODE1: token_received=0x${dut.token_received:01x}, expected 0010")
+        assert dut.data_out == 0
+            else fail("NODE1 no-forward: data_out=0x${dut.data_out:01x}, expected 0")
+
+        // ── NODE2 ───────────────────────────────────────────────
+        wait 1 cycle
+        assert dut.token == 0b1000
+            else fail("NODE2: token=0x${dut.token:01x}, expected 1000")
+        assert dut.token_received == 0b0100
+            else fail("NODE2: token_received=0x${dut.token_received:01x}, expected 0100")
+        assert dut.data_out == 0
+            else fail("NODE2 no-forward: data_out=0x${dut.data_out:01x}, expected 0")
+
+        // ── NODE3 ───────────────────────────────────────────────
+        wait 1 cycle
+        assert dut.token == 0b0001
+            else fail("NODE3: token=0x${dut.token:01x}, expected 0001")
+        assert dut.token_received == 0b1000
+            else fail("NODE3: token_received=0x${dut.token_received:01x}, expected 1000")
+        assert dut.data_out == 0
+            else fail("NODE3 no-forward: data_out=0x${dut.data_out:01x}, expected 0")
+
+        // ── NODE0 (wrap): token_received was 1000, token_received[0]=0 ─
+        wait 1 cycle
+        assert dut.token == 0b0010
+            else fail("wrap NODE0: token=0x${dut.token:01x}, expected 0010")
+        assert dut.data_out == 0
+            else fail("wrap NODE0 no-forward: data_out=0x${dut.data_out:01x}, expected 0")
+
+        // ── Continue walking with has_data_to_send=0 to cover the else ─
+        dut.has_data_to_send = 0
+        for k in 0 .. 8
+            dut.data_in = (k & 0xF).trunc<4>()
+            wait 1 cycle
+            assert dut.data_out == 0
+                else fail("no-send k=${k}: data_out=0x${dut.data_out:01x}, expected 0")
+        end for
+
+        // ── Vary has_data_to_send & data_in patterns across the bus ─
+        for k in 0 .. 16
+            dut.data_in = (k & 0xF).trunc<4>()
+            dut.has_data_to_send = ((k >> 1) & 1).trunc<1>()
+            wait 1 cycle
+            // After post-reset cycle, no forwarding is possible; verify.
+            assert dut.data_out == 0
+                else fail("walk k=${k}: data_out=0x${dut.data_out:01x}, expected 0")
+        end for
+
+        // ── Re-reset then re-attempt forwarding on first cycle ──
+        dut.rst = 1
+        dut.has_data_to_send = 0
+        dut.data_in = 0
+        wait 2 cycles
+        assert dut.token == 0b0001
+            else fail("re-reset: token=0x${dut.token:01x}, expected 0001")
+        assert dut.token_received == 0b0001
+            else fail("re-reset: token_received=0x${dut.token_received:01x}, expected 0001")
+        assert dut.data_out == 0
+            else fail("re-reset: data_out=0x${dut.data_out:01x}, expected 0")
+
+        // ── Forward 0xF this time + ride the ring through all 4 states ─
+        dut.rst = 0
+        dut.data_in = 0xF
+        dut.has_data_to_send = 1
+        wait 1 cycle
+        assert dut.data_out == 0xF
+            else fail("re-reset NODE0 forward: data_out=0x${dut.data_out:01x}, expected 0xF")
+        wait 1 cycle
+        assert dut.data_out == 0
+            else fail("re-reset NODE1: data_out=0x${dut.data_out:01x}, expected 0")
+        wait 1 cycle
+        assert dut.data_out == 0
+            else fail("re-reset NODE2: data_out=0x${dut.data_out:01x}, expected 0")
+        wait 1 cycle
+        assert dut.data_out == 0
+            else fail("re-reset NODE3: data_out=0x${dut.data_out:01x}, expected 0")
+
+        // ── data_in variations on the forwarding cycle (drive each bit) ─
+        for k in 0 .. 4
+            dut.rst = 1
+            wait 2 cycles
+            dut.rst = 0
+            dut.data_in = ((1 as uint<4>) << k).trunc<4>()
+            dut.has_data_to_send = 1
+            wait 1 cycle
+            let exp = (1 as uint<4>) << k
+            assert dut.data_out == exp
+                else fail("data-bit k=${k}: data_out=0x${dut.data_out:01x}, expected 0x${exp:01x}")
+        end for
+
+        log(info, "ALL TESTS PASSED — token_ring_fsm")
+    end run
+end impl RingTokenTest
