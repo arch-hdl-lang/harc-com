@@ -2226,6 +2226,13 @@ impl AutoCoverageValue {
 
 const COVERGROUP_AUTO_CROSS_BIN_CAP: usize = 64;
 
+struct DeclaredCoverCross<'a> {
+    storage: String,
+    label: String,
+    points: Vec<&'a CoverPoint>,
+    total_bins: usize,
+}
+
 fn covergroup_binned_points(g: &CovergroupDecl) -> Vec<&CoverPoint> {
     g.items
         .iter()
@@ -2238,9 +2245,26 @@ fn covergroup_binned_points(g: &CovergroupDecl) -> Vec<&CoverPoint> {
 
 fn covergroup_auto_crosses(g: &CovergroupDecl) -> Vec<(&CoverPoint, &CoverPoint)> {
     let points = covergroup_binned_points(g);
+    let declared_pairs: std::collections::BTreeSet<(String, String)> = g
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            CoverItem::Cross(c) if c.points.len() == 2 => {
+                let mut names = [c.points[0].name.clone(), c.points[1].name.clone()];
+                names.sort();
+                Some((names[0].clone(), names[1].clone()))
+            }
+            _ => None,
+        })
+        .collect();
     let mut crosses = Vec::new();
     for i in 0..points.len() {
         for j in (i + 1)..points.len() {
+            let mut names = [points[i].name.name.clone(), points[j].name.name.clone()];
+            names.sort();
+            if declared_pairs.contains(&(names[0].clone(), names[1].clone())) {
+                continue;
+            }
             let bins = points[i].bins.len() * points[j].bins.len();
             if bins <= COVERGROUP_AUTO_CROSS_BIN_CAP {
                 crosses.push((points[i], points[j]));
@@ -2248,6 +2272,116 @@ fn covergroup_auto_crosses(g: &CovergroupDecl) -> Vec<(&CoverPoint, &CoverPoint)
         }
     }
     crosses
+}
+
+fn covergroup_declared_crosses(g: &CovergroupDecl) -> Result<Vec<DeclaredCoverCross<'_>>, String> {
+    let mut crosses = Vec::new();
+    for (cross_idx, item) in g.items.iter().enumerate() {
+        let CoverItem::Cross(cross) = item else {
+            continue;
+        };
+        if cross.points.len() < 2 {
+            return Err(format!(
+                "covergroup `{}` cross must name at least two coverpoints",
+                g.name.name
+            ));
+        }
+        let mut points = Vec::new();
+        for ident in &cross.points {
+            let point = g.items.iter().find_map(|item| match item {
+                CoverItem::Point(p) if p.name.name == ident.name => Some(p),
+                _ => None,
+            });
+            let Some(point) = point else {
+                return Err(format!(
+                    "covergroup `{}` cross references unknown coverpoint `{}`",
+                    g.name.name, ident.name
+                ));
+            };
+            if point.bins.is_empty() {
+                return Err(format!(
+                    "covergroup `{}` cross references coverpoint `{}` with no bins",
+                    g.name.name, point.name.name
+                ));
+            }
+            points.push(point);
+        }
+        let mut total_bins = 1usize;
+        for p in &points {
+            total_bins = total_bins.checked_mul(p.bins.len()).ok_or_else(|| {
+                format!(
+                    "covergroup `{}` cross `{}` has too many bins",
+                    g.name.name,
+                    cross
+                        .points
+                        .iter()
+                        .map(|p| p.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" x ")
+                )
+            })?;
+        }
+        let label = points
+            .iter()
+            .map(|p| p.name.name.as_str())
+            .collect::<Vec<_>>()
+            .join(" x ");
+        let storage = format!(
+            "_cross_{}_{}",
+            cross_idx,
+            points
+                .iter()
+                .map(|p| p.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join("__")
+        );
+        crosses.push(DeclaredCoverCross {
+            storage,
+            label,
+            points,
+            total_bins,
+        });
+    }
+    Ok(crosses)
+}
+
+fn declared_cross_index_expr(cross: &DeclaredCoverCross<'_>) -> String {
+    let mut expr = "_i0".to_string();
+    for (idx, point) in cross.points.iter().enumerate().skip(1) {
+        expr = format!("({expr} * {} + _i{idx})", point.bins.len());
+    }
+    expr
+}
+
+fn declared_cross_bin_labels(cross: &DeclaredCoverCross<'_>) -> Vec<(usize, String)> {
+    fn walk(
+        cross: &DeclaredCoverCross<'_>,
+        depth: usize,
+        index: usize,
+        labels: &mut Vec<String>,
+        out: &mut Vec<(usize, String)>,
+    ) {
+        if depth == cross.points.len() {
+            out.push((index, labels.join(" x ")));
+            return;
+        }
+        let point = cross.points[depth];
+        for (bin_idx, bin) in point.bins.iter().enumerate() {
+            labels.push(format!("{}.{}", point.name.name, bin.name.name));
+            walk(
+                cross,
+                depth + 1,
+                index * point.bins.len() + bin_idx,
+                labels,
+                out,
+            );
+            labels.pop();
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(cross, 0, 0, &mut Vec::new(), &mut out);
+    out
 }
 
 fn field_attr_range(f: &TxnFieldInfo) -> Option<(&Expr, &Expr)> {
@@ -4020,12 +4154,19 @@ impl Emitter {
     }
 
     /// Emit a covergroup as a C++ struct: one nested struct per cover-point
-    /// holding `uint64_t` bin counters plus sample-local pairwise cross
-    /// matrices. Crosses are updated only from bins hit in the same sample
-    /// invocation; this is deliberately a semantic sample record, not a
-    /// post-hoc mix of bins hit at unrelated times.
+    /// holding `uint64_t` bin counters plus sample-local cross counters.
+    /// Crosses are updated only from bins hit in the same sample invocation;
+    /// this is deliberately a semantic sample record, not a post-hoc mix of
+    /// bins hit at unrelated times.
     fn emit_covergroup_struct(&mut self, g: &CovergroupDecl) {
         let auto_crosses = covergroup_auto_crosses(g);
+        let declared_crosses = match covergroup_declared_crosses(g) {
+            Ok(crosses) => crosses,
+            Err(err) => {
+                self.errors.push(err);
+                Vec::new()
+            }
+        };
         writeln!(self.out, "struct {} {{", g.name.name).ok();
         // Per-cover-point nested struct of bin counters. The struct is
         // pure data; the sample() logic is emitted at `let cov : G` time
@@ -4049,6 +4190,14 @@ impl Emitter {
                 b.name.name,
                 a.bins.len(),
                 b.bins.len()
+            )
+            .ok();
+        }
+        for cross in &declared_crosses {
+            writeln!(
+                self.out,
+                "{INDENT}uint64_t {}[{}] = {{}};",
+                cross.storage, cross.total_bins
             )
             .ok();
         }
@@ -4097,6 +4246,41 @@ impl Emitter {
                         p.name.name, b.name.name).ok();
                 }
             }
+        }
+        for cross in &declared_crosses {
+            self.pad(2);
+            writeln!(self.out, "{{").ok();
+            self.pad(3);
+            writeln!(self.out, "uint64_t _cross_hit = 0;").ok();
+            self.pad(3);
+            writeln!(
+                self.out,
+                "for (size_t _i = 0; _i < {}; ++_i) if ({}[_i] > 0) _cross_hit++;",
+                cross.total_bins, cross.storage
+            )
+            .ok();
+            self.pad(3);
+            writeln!(
+                self.out,
+                "std::printf( \"[{}] cross {}: %llu/%llu hit (%.1f%%)\\n\", (unsigned long long)_cross_hit, (unsigned long long){}, {} ? (100.0 * _cross_hit / {}) : 0.0);",
+                g.name.name,
+                cross.label,
+                cross.total_bins,
+                cross.total_bins,
+                cross.total_bins
+            )
+            .ok();
+            for (idx, label) in declared_cross_bin_labels(cross) {
+                self.pad(3);
+                writeln!(
+                    self.out,
+                    "if ({}[{}] == 0) std::printf( \"  {}: *NOT HIT*\\n\" );",
+                    cross.storage, idx, label
+                )
+                .ok();
+            }
+            self.pad(2);
+            writeln!(self.out, "}}").ok();
         }
         for (a, b) in &auto_crosses {
             self.pad(2);
@@ -4178,9 +4362,20 @@ impl Emitter {
     ) {
         let binned_points = covergroup_binned_points(g);
         let auto_crosses = covergroup_auto_crosses(g);
+        let declared_crosses = match covergroup_declared_crosses(g) {
+            Ok(crosses) => crosses,
+            Err(_) => Vec::new(),
+        };
         self.pad(depth);
         writeln!(self.out, "_checkers.push_back([&]() {{").ok();
-        self.emit_covergroup_sample_body(g, instance, &binned_points, &auto_crosses, depth + 1);
+        self.emit_covergroup_sample_body(
+            g,
+            instance,
+            &binned_points,
+            &auto_crosses,
+            &declared_crosses,
+            depth + 1,
+        );
         self.pad(depth);
         writeln!(self.out, "}});").ok();
     }
@@ -4258,6 +4453,10 @@ impl Emitter {
             .collect();
         let binned_points = covergroup_binned_points(g);
         let auto_crosses = covergroup_auto_crosses(g);
+        let declared_crosses = match covergroup_declared_crosses(g) {
+            Ok(crosses) => crosses,
+            Err(_) => Vec::new(),
+        };
         self.pad(depth);
         writeln!(
             self.out,
@@ -4265,7 +4464,14 @@ impl Emitter {
             arg_decls.join(", "),
         )
         .ok();
-        self.emit_covergroup_sample_body(g, instance, &binned_points, &auto_crosses, depth + 1);
+        self.emit_covergroup_sample_body(
+            g,
+            instance,
+            &binned_points,
+            &auto_crosses,
+            &declared_crosses,
+            depth + 1,
+        );
         self.pad(depth);
         writeln!(self.out, "}});").ok();
     }
@@ -4276,9 +4482,10 @@ impl Emitter {
         instance: &str,
         binned_points: &[&CoverPoint],
         auto_crosses: &[(&CoverPoint, &CoverPoint)],
+        declared_crosses: &[DeclaredCoverCross<'_>],
         depth: usize,
     ) {
-        if !auto_crosses.is_empty() {
+        if !auto_crosses.is_empty() || !declared_crosses.is_empty() {
             for p in binned_points {
                 self.pad(depth);
                 writeln!(
@@ -4342,6 +4549,49 @@ impl Emitter {
             self.pad(depth + 1);
             writeln!(self.out, "}}").ok();
             self.pad(depth);
+            writeln!(self.out, "}}").ok();
+        }
+        for cross in declared_crosses {
+            self.emit_declared_cover_cross_sample_update(instance, cross, depth);
+        }
+    }
+
+    fn emit_declared_cover_cross_sample_update(
+        &mut self,
+        instance: &str,
+        cross: &DeclaredCoverCross<'_>,
+        depth: usize,
+    ) {
+        for (idx, point) in cross.points.iter().enumerate() {
+            self.pad(depth + idx);
+            writeln!(
+                self.out,
+                "for (size_t _i{idx} = 0; _i{idx} < {}; ++_i{idx}) {{",
+                point.bins.len()
+            )
+            .ok();
+        }
+        self.pad(depth + cross.points.len());
+        let hit_cond = cross
+            .points
+            .iter()
+            .enumerate()
+            .map(|(idx, point)| format!("_cg_hit_{}[_i{idx}]", point.name.name))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        writeln!(self.out, "if ({hit_cond}) {{").ok();
+        self.pad(depth + cross.points.len() + 1);
+        writeln!(
+            self.out,
+            "{instance}.{}[{}]++;",
+            cross.storage,
+            declared_cross_index_expr(cross)
+        )
+        .ok();
+        self.pad(depth + cross.points.len());
+        writeln!(self.out, "}}").ok();
+        for idx in (0..cross.points.len()).rev() {
+            self.pad(depth + idx);
             writeln!(self.out, "}}").ok();
         }
     }
@@ -4940,7 +5190,7 @@ impl Emitter {
         let find_method = |items: &[ComponentItem], m: &str| -> Option<Vec<Param>> {
             for it in items {
                 if let ComponentItem::Hookable(h) = it {
-                    if h.name.name == m {
+                    if h.is_hookable && h.name.name == m {
                         return Some(h.params.clone());
                     }
                 }
