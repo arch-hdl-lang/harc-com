@@ -1,0 +1,150 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_cellular_automata_0002`.
+//
+// DUT: pseudoRandGenerator_ca — 16-bit cellular automaton that evolves
+// CA_out each cycle by a fixed neighbourhood rule (mix of rules 90/150)
+// per Wolfram CA conventions. Synchronous active-high reset loads
+// CA_seed into CA_out.
+//
+// Strategy:
+//   - reset to a couple of non-trivial seeds and let the CA evolve
+//     for many cycles. Because each cell's next bit is XOR of nearby
+//     cells, a long evolution drives every output bit through both
+//     edges.
+//   - validate that reset loads seed exactly.
+//   - validate the first step against a software model of the rule.
+
+function ca_step(s: uint<16>) -> uint<16>
+    let b0  = (s >> 0)  & 1
+    let b1  = (s >> 1)  & 1
+    let b2  = (s >> 2)  & 1
+    let b3  = (s >> 3)  & 1
+    let b4  = (s >> 4)  & 1
+    let b5  = (s >> 5)  & 1
+    let b6  = (s >> 6)  & 1
+    let b7  = (s >> 7)  & 1
+    let b8  = (s >> 8)  & 1
+    let b9  = (s >> 9)  & 1
+    let b10 = (s >> 10) & 1
+    let b11 = (s >> 11) & 1
+    let b12 = (s >> 12) & 1
+    let b13 = (s >> 13) & 1
+    let b14 = (s >> 14) & 1
+    let b15 = (s >> 15) & 1
+    let n15 = b14                            // q1
+    let n14 = b15 ^ b13                      // q2
+    let n13 = b14 ^ b13 ^ b12                // q3
+    let n12 = b13 ^ b11                      // q4
+    let n11 = b12 ^ b11 ^ b10                // q5
+    let n10 = b11 ^ b9                       // q6
+    let n9  = b10 ^ b9 ^ b8                  // q7
+    let n8  = b9 ^ b7                        // q8
+    let n7  = b8 ^ b7 ^ b6                   // q9
+    let n6  = b7 ^ b5                        // q10
+    let n5  = b6 ^ b5 ^ b4                   // q11
+    let n4  = b5 ^ b3                        // q12
+    let n3  = b4 ^ b3 ^ b2                   // q13
+    let n2  = b3 ^ b1                        // q14
+    let n1  = b2 ^ b1 ^ b0                   // q15
+    let n0  = b1                             // q16
+    let r : uint<16> = 0
+    r = r | (n0  << 0)
+    r = r | (n1  << 1)
+    r = r | (n2  << 2)
+    r = r | (n3  << 3)
+    r = r | (n4  << 4)
+    r = r | (n5  << 5)
+    r = r | (n6  << 6)
+    r = r | (n7  << 7)
+    r = r | (n8  << 8)
+    r = r | (n9  << 9)
+    r = r | (n10 << 10)
+    r = r | (n11 << 11)
+    r = r | (n12 << 12)
+    r = r | (n13 << 13)
+    r = r | (n14 << 14)
+    r = r | (n15 << 15)
+    return r
+end function ca_step
+
+testbench CellularAutomataTb
+    dut : pseudoRandGenerator_ca_top
+end testbench CellularAutomataTb
+
+impl CellularAutomataTest for CellularAutomataTb
+    run
+        log(info, "pseudoRandGenerator_ca: seed-load + multi-step evolution checks")
+
+        // ── Reset with non-trivial seed ────────────────────────
+        dut.reset = 1
+        dut.CA_seed = 0xACE1 as uint<16>
+        wait 1 cycle
+        assert dut.CA_out == 0xACE1
+            else fail("after reset+seed=0xACE1: CA_out=0x${dut.CA_out:04x}, expected 0xACE1")
+        dut.reset = 0
+
+        // ── 64-step free evolution ────────────────────────────
+        let model : uint<16> = 0xACE1 as uint<16>
+        for i in 0 .. 64
+            let next_expected = ca_step(model)
+            wait 1 cycle
+            assert dut.CA_out == next_expected
+                else fail("step ${i}: CA_out=0x${dut.CA_out:04x}, expected 0x${next_expected:04x} (prev=0x${model:04x})")
+            model = next_expected
+        end for
+
+        // ── Switch seed and reset again ─────────────────────────
+        dut.reset = 1
+        dut.CA_seed = 0x5A5A as uint<16>
+        wait 1 cycle
+        assert dut.CA_out == 0x5A5A
+            else fail("after reset+seed=0x5A5A: CA_out=0x${dut.CA_out:04x}")
+        dut.reset = 0
+
+        model = 0x5A5A as uint<16>
+        for i in 0 .. 64
+            let nx = ca_step(model)
+            wait 1 cycle
+            assert dut.CA_out == nx
+                else fail("seed-2 step ${i}: got 0x${dut.CA_out:04x}, expected 0x${nx:04x}")
+            model = nx
+        end for
+
+        // ── Edge seed: all-zeros (stays zero forever) ───────────
+        dut.reset = 1
+        dut.CA_seed = 0
+        wait 1 cycle
+        assert dut.CA_out == 0
+            else fail("all-zero seed: CA_out=0x${dut.CA_out:04x}, expected 0")
+        dut.reset = 0
+        wait 5 cycles
+        assert dut.CA_out == 0
+            else fail("all-zero evolution: CA_out=0x${dut.CA_out:04x}, expected 0 (XOR fixed point)")
+
+        // ── Edge seed: all-ones to drive every input bit through 1→? ─
+        dut.reset = 1
+        dut.CA_seed = 0xFFFF as uint<16>
+        wait 1 cycle
+        assert dut.CA_out == 0xFFFF
+            else fail("all-ones seed: CA_out=0x${dut.CA_out:04x}, expected 0xFFFF")
+        dut.reset = 0
+        model = 0xFFFF as uint<16>
+        for i in 0 .. 16
+            let nx = ca_step(model)
+            wait 1 cycle
+            assert dut.CA_out == nx
+                else fail("all-ones step ${i}: got 0x${dut.CA_out:04x}, expected 0x${nx:04x}")
+            model = nx
+        end for
+
+        // ── Re-assert reset mid-evolution to hit reset-branch again ─
+        dut.reset = 1
+        dut.CA_seed = 0x1234 as uint<16>
+        wait 1 cycle
+        assert dut.CA_out == 0x1234
+            else fail("mid-evo reset: CA_out=0x${dut.CA_out:04x}, expected 0x1234")
+        dut.reset = 0
+        wait 2 cycles
+
+        log(info, "ALL TESTS PASSED — pseudoRandGenerator_ca")
+    end run
+end impl CellularAutomataTest

@@ -1,0 +1,132 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_32_bit_Brent_Kung_PP_adder_0004`.
+//
+// DUT: brent_kung_adder — pure-dataflow 32-bit carry-lookahead adder
+// with carry_in / carry_out. Massive fan-out of P/G prefix chains via
+// generate-loops. Branch coverage measures whether every prefix node
+// has seen both 0 and 1 on each of its operands.
+//
+// Strategy: directed corner cases (0/0, all-ones, walking-1) plus
+// ~150 random pairs. Software model: 64-bit sum then split.
+
+transaction AddPair
+    a : uint<32>
+    b : uint<32>
+    cin : uint<1>
+end transaction AddPair
+
+testbench BrentKungAdderTb
+    dut : brent_kung_adder_top
+end testbench BrentKungAdderTb
+
+impl BrentKungAdderTest for BrentKungAdderTb
+    run
+        log(info, "brent_kung_adder: directed corners + random sweep")
+
+        // ── Walking-1 patterns (a=b=walk-1, cin=0; then a=walk1, b=~walk1, cin=1) ─
+        for k in 0 .. 32
+            let pat : uint<32> = (1 as uint<32>) << k
+            dut.a = pat
+            dut.b = pat
+            dut.carry_in = 0
+            wait 1 cycle
+            let s64 = (pat as uint<64>) + (pat as uint<64>)
+            let es : uint<32> = (s64 & 0xFFFFFFFF) as uint<32>
+            let ec : uint<1> = ((s64 >> 32) & 1) as uint<1>
+            assert dut.sum == es
+                else fail("walk1 k=${k}: sum=0x${dut.sum:08x}, expected 0x${es:08x}")
+            assert dut.carry_out == ec
+                else fail("walk1 k=${k}: cout=${dut.carry_out}, expected ${ec}")
+
+            let cpat : uint<32> = (0xFFFFFFFF as uint<32>) ^ pat
+            dut.a = pat
+            dut.b = cpat
+            dut.carry_in = 1
+            wait 1 cycle
+            let s2 = (pat as uint<64>) + (cpat as uint<64>) + 1
+            let es2 = (s2 & 0xFFFFFFFF) as uint<32>
+            let ec2 = ((s2 >> 32) & 1) as uint<1>
+            assert dut.sum == es2
+                else fail("walk1c k=${k}: sum=0x${dut.sum:08x}, expected 0x${es2:08x}")
+            assert dut.carry_out == ec2
+                else fail("walk1c k=${k}: cout=${dut.carry_out}, expected ${ec2}")
+        end for
+
+        // ── Directed corners (a, b, cin) ─────────────────────────
+        // Each block: drive, wait, model, assert. Unrolled instead of
+        // using array literals (not part of HARC TB surface).
+        dut.a = 0
+        dut.b = 0
+        dut.carry_in = 0
+        wait 1 cycle
+        assert dut.sum == 0 && dut.carry_out == 0
+            else fail("0+0+0: sum=0x${dut.sum:08x} cout=${dut.carry_out}")
+
+        dut.a = 0xFFFFFFFF
+        dut.b = 0
+        dut.carry_in = 0
+        wait 1 cycle
+        assert dut.sum == 0xFFFFFFFF && dut.carry_out == 0
+            else fail("max+0+0: sum=0x${dut.sum:08x} cout=${dut.carry_out}")
+
+        dut.a = 0xFFFFFFFF
+        dut.b = 0xFFFFFFFF
+        dut.carry_in = 0
+        wait 1 cycle
+        assert dut.sum == 0xFFFFFFFE && dut.carry_out == 1
+            else fail("max+max+0: sum=0x${dut.sum:08x} cout=${dut.carry_out}")
+
+        dut.a = 0xFFFFFFFF
+        dut.b = 1
+        dut.carry_in = 0
+        wait 1 cycle
+        assert dut.sum == 0 && dut.carry_out == 1
+            else fail("max+1+0: sum=0x${dut.sum:08x} cout=${dut.carry_out}")
+
+        dut.a = 0xFFFFFFFF
+        dut.b = 0
+        dut.carry_in = 1
+        wait 1 cycle
+        assert dut.sum == 0 && dut.carry_out == 1
+            else fail("max+0+1: sum=0x${dut.sum:08x} cout=${dut.carry_out}")
+
+        dut.a = 0x80000000
+        dut.b = 0x80000000
+        dut.carry_in = 0
+        wait 1 cycle
+        assert dut.sum == 0 && dut.carry_out == 1
+            else fail("msb+msb: sum=0x${dut.sum:08x} cout=${dut.carry_out}")
+
+        dut.a = 0xAAAAAAAA
+        dut.b = 0x55555555
+        dut.carry_in = 0
+        wait 1 cycle
+        assert dut.sum == 0xFFFFFFFF && dut.carry_out == 0
+            else fail("AA+55: sum=0x${dut.sum:08x}")
+
+        dut.a = 0xAAAAAAAA
+        dut.b = 0x55555555
+        dut.carry_in = 1
+        wait 1 cycle
+        assert dut.sum == 0 && dut.carry_out == 1
+            else fail("AA+55+1: sum=0x${dut.sum:08x}")
+
+        // ── Random sweep ────────────────────────────────────────
+        for i in 0 .. 150
+            let t : AddPair
+            randomize(t)
+            dut.a = t.a
+            dut.b = t.b
+            dut.carry_in = t.cin
+            wait 1 cycle
+            let s = (t.a as uint<64>) + (t.b as uint<64>) + (t.cin as uint<64>)
+            let exp_sum = (s & 0xFFFFFFFF) as uint<32>
+            let exp_cout = ((s >> 32) & 1) as uint<1>
+            assert dut.sum == exp_sum
+                else fail("rand i=${i}: a=0x${t.a:08x} b=0x${t.b:08x} cin=${t.cin}: sum=0x${dut.sum:08x}, expected 0x${exp_sum:08x}")
+            assert dut.carry_out == exp_cout
+                else fail("rand i=${i}: cout=${dut.carry_out}, expected ${exp_cout}")
+        end for
+
+        log(info, "ALL TESTS PASSED — brent_kung_adder")
+    end run
+end impl BrentKungAdderTest

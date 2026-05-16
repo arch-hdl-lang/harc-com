@@ -148,9 +148,20 @@ discarded by the extractor).
 | `generic_nbit_counter_0013` (6 counter modes) | **100.00%** | **100.00%** | ≥100% | **PASS** *(after iteration)* |
 | `decode_firstbit_0017` (pipelined priority encoder) | 97.18% | 85.13% | ≥90% | FAIL — ceiling |
 
+### Round 3 (Phase 2b-scale batch 1, 6 problems)
+
+| Problem | Line | Branch | Target | Verdict |
+|---|---:|---:|---:|---|
+| `hamming_code_tx_and_rx_0029` (4-bit Hamming TX, pure dataflow) | **100.00%** | 91.67% | ≥91% | **PASS** |
+| `hamming_code_tx_and_rx_0031` (8-bit Hamming RX + correct, combinational) | **100.00%** | **100.00%** | ≥100% | **PASS** |
+| `nbit_swizzling_0009` (4-way 16-bit chunk reverse, combinational) | 93.33% | **100.00%** | ≥100% | **PASS** *(branch-gated)* |
+| `32_bit_Brent_Kung_PP_adder_0004` (32-bit prefix adder, pure dataflow) | **100.00%** | **100.00%** | ≥80% | **PASS** |
+| `signed_adder_0003` (signed add/sub, 1-clk sequential) | **100.00%** | **100.00%** | ≥99% | **PASS** *(after iteration)* |
+| `cellular_automata_0002` (16-cell rule-128-shape CA, sequential) | **100.00%** | **100.00%** | ≥100% | **PASS** |
+
 ### Net scoreboard
 
-**5/8 PASS, 3/8 ceiling-FAIL.** The PASS column reaches 100% line *and*
+**11/14 PASS, 3/14 ceiling-FAIL.** The PASS column reaches 100% line *and*
 branch coverage on every problem where the DUT doesn't have a
 structurally unreachable path under default parameters. The 3 FAILs
 all share the same shape:
