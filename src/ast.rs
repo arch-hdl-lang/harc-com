@@ -735,11 +735,19 @@ pub enum ExtendBody {
 #[derive(Debug, Clone)]
 pub struct CovergroupDecl {
     pub name: Ident,
-    pub clocking: Option<Expr>, // `@(posedge ...)` argument
+    pub trigger: Option<CoverTrigger>,
     pub items: Vec<CoverItem>,
     pub span: Span,
     pub doc: Option<String>,
     pub inner_doc: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CoverTrigger {
+    /// Clock/sample expression inside `@(...)`, including `posedge clk`.
+    Clock(Expr),
+    /// Hookable method trigger: `@(mon.observed(t) pre|post)`.
+    Hook { call: Expr, side: HookSide },
 }
 
 #[derive(Debug, Clone)]

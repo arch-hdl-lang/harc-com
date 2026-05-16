@@ -4160,6 +4160,13 @@ impl Emitter {
         instance: &str,
         depth: usize,
     ) {
+        if let Some(CoverTrigger::Hook { .. }) = &g.trigger {
+            self.errors.push(format!(
+                "covergroup `{}` uses a hook trigger; hook-triggered covergroup sampling is parsed but not lowered yet",
+                g.name.name
+            ));
+            return;
+        }
         let binned_points = covergroup_binned_points(g);
         let auto_crosses = covergroup_auto_crosses(g);
         self.pad(depth);
