@@ -1,0 +1,142 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_nbit_swizzling_0009`.
+//
+// DUT: nbit_swizzling — 64-bit data with 2-bit sel chooses between
+// four bit-reverse-in-chunks operations:
+//   sel=00: full 64-bit reverse
+//   sel=01: reverse each 32-bit half
+//   sel=10: reverse each 16-bit quarter
+//   sel=11: reverse each 8-bit eighth
+//   default: passthrough (unreachable with 2-bit sel — covered by case
+//            default block but not directly drivable)
+//
+// Strategy: for each sel value, drive several 64-bit patterns covering
+// every input bit position with both 0 and 1, then compute the expected
+// output via a software model that mirrors the chunk-reverse spec.
+
+function swizzle_model(d: uint<64>, sel: uint<2>) -> uint<64>
+    let result : uint<64> = 0
+    if sel == 0
+        // Reverse all 64 bits
+        for i in 0 .. 64
+            let src = (d >> (63 - i)) & 1
+            result = result | (src << i)
+        end for
+    else
+        if sel == 1
+            // Two halves of 32 bits each, reverse within each
+            for i in 0 .. 32
+                let lo_src = (d >> (31 - i)) & 1
+                let hi_src = (d >> (63 - i)) & 1
+                result = result | (lo_src << i)
+                result = result | (hi_src << (32 + i))
+            end for
+        else
+            if sel == 2
+                // Four chunks of 16 bits each
+                for i in 0 .. 16
+                    let q0 = (d >> (15 - i)) & 1
+                    let q1 = (d >> (31 - i)) & 1
+                    let q2 = (d >> (47 - i)) & 1
+                    let q3 = (d >> (63 - i)) & 1
+                    result = result | (q0 << i)
+                    result = result | (q1 << (16 + i))
+                    result = result | (q2 << (32 + i))
+                    result = result | (q3 << (48 + i))
+                end for
+            else
+                // sel == 3: eight chunks of 8 bits each
+                for i in 0 .. 8
+                    let e0 = (d >> (7  - i)) & 1
+                    let e1 = (d >> (15 - i)) & 1
+                    let e2 = (d >> (23 - i)) & 1
+                    let e3 = (d >> (31 - i)) & 1
+                    let e4 = (d >> (39 - i)) & 1
+                    let e5 = (d >> (47 - i)) & 1
+                    let e6 = (d >> (55 - i)) & 1
+                    let e7 = (d >> (63 - i)) & 1
+                    result = result | (e0 << i)
+                    result = result | (e1 << (8  + i))
+                    result = result | (e2 << (16 + i))
+                    result = result | (e3 << (24 + i))
+                    result = result | (e4 << (32 + i))
+                    result = result | (e5 << (40 + i))
+                    result = result | (e6 << (48 + i))
+                    result = result | (e7 << (56 + i))
+                end for
+            end if
+        end if
+    end if
+    return result
+end function swizzle_model
+
+function check_one(d: uint<64>, s: uint<2>, got: uint<64>) -> uint<1>
+    let exp = swizzle_model(d, s)
+    assert got == exp
+        else fail("sel=${s} data=0x${d:016x}: got 0x${got:016x}, expected 0x${exp:016x}")
+    return 1
+end function check_one
+
+testbench NbitSwizzlingTb
+    dut : nbit_swizzling_top
+end testbench NbitSwizzlingTb
+
+impl NbitSwizzlingTest for NbitSwizzlingTb
+    run
+        log(info, "nbit_swizzling: walking-bit and pattern sweep across all 4 sel values")
+
+        // For each sel value, drive a battery of patterns that toggles
+        // every input bit through both edges.
+        for s in 0 .. 4
+            dut.sel = s as uint<2>
+
+            // Pattern 1: all zeros (every bit starts low)
+            dut.data_in = 0 as uint<64>
+            wait 1 cycle
+            let r = check_one(0 as uint<64>, s as uint<2>, dut.data_out)
+
+            // Pattern 2: walking-1 across all 64 bits
+            for k in 0 .. 64
+                let pat : uint<64> = (1 as uint<64>) << k
+                dut.data_in = pat
+                wait 1 cycle
+                let r2 = check_one(pat, s as uint<2>, dut.data_out)
+            end for
+
+            // Pattern 3: all ones (every bit drives high)
+            let all_ones : uint<64> = 0xFFFFFFFFFFFFFFFF as uint<64>
+            dut.data_in = all_ones
+            wait 1 cycle
+            let r3 = check_one(all_ones, s as uint<2>, dut.data_out)
+
+            // Pattern 4: alternating 0xAA... and 0x55... (every bit
+            // toggles both directions when paired with the inverse)
+            let aa : uint<64> = 0xAAAAAAAAAAAAAAAA as uint<64>
+            dut.data_in = aa
+            wait 1 cycle
+            let r4 = check_one(aa, s as uint<2>, dut.data_out)
+
+            let cc : uint<64> = 0x5555555555555555 as uint<64>
+            dut.data_in = cc
+            wait 1 cycle
+            let r5 = check_one(cc, s as uint<2>, dut.data_out)
+
+            // Pattern 5: byte-counter pattern for diverse content
+            let mixed : uint<64> = 0x0123456789ABCDEF as uint<64>
+            dut.data_in = mixed
+            wait 1 cycle
+            let r6 = check_one(mixed, s as uint<2>, dut.data_out)
+
+            let mixed2 : uint<64> = 0xFEDCBA9876543210 as uint<64>
+            dut.data_in = mixed2
+            wait 1 cycle
+            let r7 = check_one(mixed2, s as uint<2>, dut.data_out)
+
+            // Final zero to drive 1→0 transition on every bit after all-ones
+            dut.data_in = 0 as uint<64>
+            wait 1 cycle
+            let r8 = check_one(0 as uint<64>, s as uint<2>, dut.data_out)
+        end for
+
+        log(info, "ALL TESTS PASSED — nbit_swizzling: all sel modes + every bit toggled")
+    end run
+end impl NbitSwizzlingTest
