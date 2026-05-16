@@ -5662,6 +5662,140 @@ impl Emitter {
         }
     }
 
+    fn report_runtime_dependent_randomize_field_attrs(&mut self, ty: &str) {
+        let Some(fields) = self.txn_fields.get(ty).cloned() else {
+            return;
+        };
+        for f in &fields {
+            for a in &f.attrs {
+                match a.name.name.as_str() {
+                    "range" => {
+                        for arg in &a.args {
+                            if let AttrArg::Expr(e) = arg {
+                                self.validate_field_attr_static_expr(ty, &f.name, "range", e);
+                            }
+                        }
+                    }
+                    "dist" => {
+                        for arg in &a.args {
+                            if let AttrArg::Dist(entries) = arg {
+                                for entry in entries {
+                                    self.validate_field_attr_static_expr(
+                                        ty,
+                                        &f.name,
+                                        "dist",
+                                        &entry.value,
+                                    );
+                                    self.validate_field_attr_static_expr(
+                                        ty,
+                                        &f.name,
+                                        "dist",
+                                        &entry.weight,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn validate_field_attr_static_expr(&mut self, ty: &str, field: &str, attr: &str, expr: &Expr) {
+        match &*expr.kind {
+            ExprKind::Field { target, name } => {
+                if let ExprKind::Ident(root) = &*target.kind {
+                    self.errors.push(format!(
+                        "randomize({ty}): field attribute `[{attr}]` on `{ty}.{field}` references runtime state `{}.{}`; move runtime-dependent constraints into `blocking randomize(...) with`",
+                        root.name, name.name,
+                    ));
+                }
+                self.validate_field_attr_static_expr(ty, field, attr, target);
+            }
+            ExprKind::Ident(id) if self.let_widths.contains_key(&id.name) => {
+                self.errors.push(format!(
+                    "randomize({ty}): field attribute `[{attr}]` on `{ty}.{field}` references runtime state `{}`; move runtime-dependent constraints into `blocking randomize(...) with`",
+                    id.name,
+                ));
+            }
+            ExprKind::Index { target, index } => {
+                self.validate_field_attr_static_expr(ty, field, attr, target);
+                self.validate_field_attr_static_expr(ty, field, attr, index);
+            }
+            ExprKind::BitSlice { target, hi, lo } => {
+                for e in [target, hi, lo] {
+                    self.validate_field_attr_static_expr(ty, field, attr, e);
+                }
+            }
+            ExprKind::Call { callee, args } => {
+                self.validate_field_attr_static_expr(ty, field, attr, callee);
+                for arg in args {
+                    let value = match arg {
+                        CallArg::Expr(e) => e,
+                        CallArg::Named { value, .. } => value,
+                    };
+                    self.validate_field_attr_static_expr(ty, field, attr, value);
+                }
+            }
+            ExprKind::Cast { expr, .. }
+            | ExprKind::Unary { expr, .. }
+            | ExprKind::HashHash { expr, .. }
+            | ExprKind::SeqRepeat { expr, .. }
+            | ExprKind::Paren(expr) => {
+                self.validate_field_attr_static_expr(ty, field, attr, expr);
+            }
+            ExprKind::Binary { lhs, rhs, .. }
+            | ExprKind::Membership {
+                expr: lhs,
+                set: rhs,
+            }
+            | ExprKind::CoverArrow { lhs, rhs, .. } => {
+                self.validate_field_attr_static_expr(ty, field, attr, lhs);
+                self.validate_field_attr_static_expr(ty, field, attr, rhs);
+            }
+            ExprKind::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                for e in [cond, then_branch, else_branch] {
+                    self.validate_field_attr_static_expr(ty, field, attr, e);
+                }
+            }
+            ExprKind::RangeLit { lo, hi } => {
+                for e in lo.iter().chain(hi.iter()) {
+                    self.validate_field_attr_static_expr(ty, field, attr, e);
+                }
+            }
+            ExprKind::SetLit(items) => {
+                for e in items {
+                    self.validate_field_attr_static_expr(ty, field, attr, e);
+                }
+            }
+            ExprKind::DistLit(entries) | ExprKind::DistDirective { entries, .. } => {
+                for entry in entries {
+                    self.validate_field_attr_static_expr(ty, field, attr, &entry.value);
+                    self.validate_field_attr_static_expr(ty, field, attr, &entry.weight);
+                }
+            }
+            ExprKind::SystemCall { args, .. } | ExprKind::Solve { args, .. } => {
+                for e in args {
+                    self.validate_field_attr_static_expr(ty, field, attr, e);
+                }
+            }
+            ExprKind::NamedArg { value, .. } => {
+                self.validate_field_attr_static_expr(ty, field, attr, value);
+            }
+            ExprKind::StructLit { fields, .. } => {
+                for f in fields {
+                    self.validate_field_attr_static_expr(ty, field, attr, &f.value);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn validate_randomize_constraint_dependencies(
         &mut self,
         ty: &str,
@@ -7717,6 +7851,7 @@ impl Emitter {
                 combined.extend(txn_keeps);
                 combined.extend(with_body.iter().cloned());
                 self.report_unsupported_randomize_field_attrs(&ty);
+                self.report_runtime_dependent_randomize_field_attrs(&ty);
                 if combined.is_empty() {
                     // No constraints anywhere: simple field-by-field PRNG path.
                     self.pad(depth);
