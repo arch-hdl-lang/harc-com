@@ -1599,7 +1599,7 @@ impl Parser {
     fn parse_covergroup(&mut self, doc: Option<String>) -> Result<CovergroupDecl, CompileError> {
         let start = self.expect(TokenKind::Covergroup)?.span;
         let name = self.expect_ident()?;
-        let clocking = if self.check(TokenKind::AtSign) {
+        let trigger = if self.check(TokenKind::AtSign) {
             self.advance();
             self.expect(TokenKind::LParen)?;
             // Allow optional `posedge`/`negedge` identifier prefix (SVA-style).
@@ -1619,8 +1619,24 @@ impl Parser {
             } else {
                 self.parse_expr()?
             };
+            let hook_side = match self.peek_kind() {
+                Some(TokenKind::Pre) => {
+                    self.advance();
+                    Some(HookSide::Pre)
+                }
+                Some(TokenKind::Post) => {
+                    self.advance();
+                    Some(HookSide::Post)
+                }
+                _ => None,
+            };
             self.expect(TokenKind::RParen)?;
-            Some(e)
+            if let Some(side) = hook_side {
+                self.validate_cover_hook_trigger(&e)?;
+                Some(CoverTrigger::Hook { call: e, side })
+            } else {
+                Some(CoverTrigger::Clock(e))
+            }
         } else {
             None
         };
@@ -1632,12 +1648,36 @@ impl Parser {
         let end = self.expect_end(TokenKind::Covergroup, &name.name)?;
         Ok(CovergroupDecl {
             name,
-            clocking,
+            trigger,
             items,
             span: start.merge(end),
             doc,
             inner_doc,
         })
+    }
+
+    fn validate_cover_hook_trigger(&self, e: &Expr) -> Result<(), CompileError> {
+        let ExprKind::Call { args, .. } = &*e.kind else {
+            return Err(CompileError::general(
+                "covergroup hook trigger must be a method call before `pre` or `post`",
+                e.span,
+            ));
+        };
+        for arg in args {
+            let CallArg::Expr(expr) = arg else {
+                return Err(CompileError::general(
+                    "covergroup hook trigger arguments must be identifiers",
+                    e.span,
+                ));
+            };
+            if !matches!(&*expr.kind, ExprKind::Ident(_)) {
+                return Err(CompileError::general(
+                    "covergroup hook trigger arguments must be identifiers",
+                    expr.span,
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn parse_cover_item(&mut self) -> Result<CoverItem, CompileError> {
@@ -4378,6 +4418,25 @@ end tseq RandomTxns"#;
     cross cp_op, cp_len
 end covergroup G"#;
         parse(src).unwrap();
+    }
+
+    #[test]
+    fn covergroup_hook_trigger() {
+        let src = r#"covergroup TxnCov @(mon.observed(t) post)
+    cp_op : cover t.op
+end covergroup TxnCov"#;
+        let f = parse(src).unwrap();
+        if let Item::Covergroup(g) = &f.items[0] {
+            assert!(matches!(
+                &g.trigger,
+                Some(CoverTrigger::Hook {
+                    side: HookSide::Post,
+                    ..
+                })
+            ));
+        } else {
+            panic!("expected covergroup");
+        }
     }
 
     #[test]
