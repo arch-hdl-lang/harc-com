@@ -5930,6 +5930,16 @@ impl Emitter {
         writeln!(self.out, "z3::context _ctx;").ok();
         self.pad(depth + 1);
         writeln!(self.out, "z3::solver _s(_ctx);").ok();
+        self.pad(depth + 1);
+        writeln!(self.out, "z3::params _p(_ctx);").ok();
+        self.pad(depth + 1);
+        writeln!(
+            self.out,
+            "_p.set(\"random_seed\", static_cast<unsigned>(harc_rng_next() & 0x7fffffffU));"
+        )
+        .ok();
+        self.pad(depth + 1);
+        writeln!(self.out, "_s.set(_p);").ok();
 
         // All Z3 vars declared at 64 bits so binops with literals and across
         // fields don't trip the width-compatibility check. Each field then

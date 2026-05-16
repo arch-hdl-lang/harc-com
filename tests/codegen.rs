@@ -1571,6 +1571,35 @@ end test MergeTest"#,
     );
 }
 
+#[test]
+fn constraint_solver_seed_flows_from_harc_rng() {
+    let parsed = parse_source(
+        r#"transaction T
+    val : uint<32>
+    keep val > 100
+end transaction T
+
+test SeededSolverTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test SeededSolverTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+
+    assert!(
+        cpp.contains("z3::params _p(_ctx);")
+            && cpp.contains(
+                "_p.set(\"random_seed\", static_cast<unsigned>(harc_rng_next() & 0x7fffffffU));"
+            )
+            && cpp.contains("_s.set(_p);"),
+        "Z3 solver-backed randomize should consume the HARC RNG seed; got:\n{cpp}"
+    );
+}
+
 /// `keep f != WRAP` where `WRAP` is an enum variant resolves via
 /// the global `enum_variants` map. Without this lookup the
 /// constraint translator would error with "unknown name `WRAP`".
