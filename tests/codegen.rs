@@ -1665,10 +1665,14 @@ end test AutoCovPrefTest"#,
             && cpp.contains("_op[2]")
             && cpp.contains("_len[2]")
             && cpp.contains("static bool _auto_cross_")
+            && cpp.contains("static bool _auto_cov_blocked_")
+            && cpp.contains("static bool _auto_cross_blocked_")
             && cpp.contains("__len[2][2]")
             && cpp.contains("std::vector<std::function<void()>> _auto_cov_reports;")
             && cpp.contains("_auto_cov_reports.push_back")
             && cpp.contains("[auto_cov T@")
+            && cpp.contains("blocked=%llu")
+            && cpp.contains("*BLOCKED*")
             && cpp.contains("T.op=0")
             && cpp.contains("T.op=1")
             && cpp.contains("T.len=1")
@@ -1680,9 +1684,12 @@ end test AutoCovPrefTest"#,
             && cpp.contains("{0ULL, 1ULL}")
             && cpp.contains("{1ULL, 4ULL}")
             && cpp.contains("_auto_cov_")
+            && cpp.contains("_auto_cov_selected_kind_")
+            && cpp.contains("_auto_cov_selected_group_")
+            && cpp.contains("retry without seeded preferences")
             && cpp.contains(" = true;")
             && cpp.contains("_auto_cross_"),
-        "auto coverage goals and pairwise crosses should feed solver preferences, hit tracking, and reporting; got:\n{cpp}",
+        "auto coverage goals and pairwise crosses should feed solver preferences, hit/blocked tracking, and reporting; got:\n{cpp}",
     );
 }
 
