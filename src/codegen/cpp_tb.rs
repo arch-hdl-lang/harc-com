@@ -2197,6 +2197,10 @@ fn field_attr_dist_entries(f: &TxnFieldInfo) -> Option<&Vec<DistEntry>> {
     })
 }
 
+fn field_attr_unique(f: &TxnFieldInfo) -> bool {
+    f.attrs.iter().any(|a| a.name.name == "unique")
+}
+
 fn randomize_target_field_name(
     target: &Expr,
     field_info: &std::collections::HashMap<String, TxnFieldInfo>,
@@ -2225,6 +2229,156 @@ fn randomize_target_ident(target: &Expr) -> Option<&str> {
         ExprKind::Ident(id) => Some(id.name.as_str()),
         ExprKind::Paren(inner) => randomize_target_ident(inner),
         _ => None,
+    }
+}
+
+fn collect_randomize_target_field_refs(
+    e: &Expr,
+    field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+    target_root: Option<&str>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match &*e.kind {
+        ExprKind::Ident(id) => {
+            if field_info.contains_key(&id.name) {
+                out.insert(id.name.clone());
+            }
+        }
+        ExprKind::Field { target, name } => match &*target.kind {
+            ExprKind::Ident(root)
+                if target_root.is_some_and(|expected| root.name == expected)
+                    && field_info.contains_key(&name.name) =>
+            {
+                out.insert(name.name.clone());
+            }
+            ExprKind::ImplicitSelf if field_info.contains_key(&name.name) => {
+                out.insert(name.name.clone());
+            }
+            _ => collect_randomize_target_field_refs(target, field_info, target_root, out),
+        },
+        ExprKind::Index { target, index } => {
+            collect_randomize_target_field_refs(target, field_info, target_root, out);
+            collect_randomize_target_field_refs(index, field_info, target_root, out);
+        }
+        ExprKind::BitSlice { target, hi, lo } => {
+            collect_randomize_target_field_refs(target, field_info, target_root, out);
+            collect_randomize_target_field_refs(hi, field_info, target_root, out);
+            collect_randomize_target_field_refs(lo, field_info, target_root, out);
+        }
+        ExprKind::Call { callee, args } => {
+            collect_randomize_target_field_refs(callee, field_info, target_root, out);
+            for arg in args {
+                match arg {
+                    CallArg::Expr(e) | CallArg::Named { value: e, .. } => {
+                        collect_randomize_target_field_refs(e, field_info, target_root, out)
+                    }
+                }
+            }
+        }
+        ExprKind::Cast { expr, .. }
+        | ExprKind::Unary { expr, .. }
+        | ExprKind::Paren(expr)
+        | ExprKind::HashHash { expr, .. }
+        | ExprKind::SeqRepeat { expr, .. } => {
+            collect_randomize_target_field_refs(expr, field_info, target_root, out);
+        }
+        ExprKind::Membership { expr, set } => {
+            collect_randomize_target_field_refs(expr, field_info, target_root, out);
+            collect_randomize_target_field_refs(set, field_info, target_root, out);
+        }
+        ExprKind::Send { target, value }
+        | ExprKind::Binary {
+            lhs: target,
+            rhs: value,
+            ..
+        } => {
+            collect_randomize_target_field_refs(target, field_info, target_root, out);
+            collect_randomize_target_field_refs(value, field_info, target_root, out);
+        }
+        ExprKind::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            collect_randomize_target_field_refs(cond, field_info, target_root, out);
+            collect_randomize_target_field_refs(then_branch, field_info, target_root, out);
+            collect_randomize_target_field_refs(else_branch, field_info, target_root, out);
+        }
+        ExprKind::RangeLit { lo, hi } => {
+            if let Some(lo) = lo {
+                collect_randomize_target_field_refs(lo, field_info, target_root, out);
+            }
+            if let Some(hi) = hi {
+                collect_randomize_target_field_refs(hi, field_info, target_root, out);
+            }
+        }
+        ExprKind::SetLit(items) => {
+            for item in items {
+                collect_randomize_target_field_refs(item, field_info, target_root, out);
+            }
+        }
+        ExprKind::DistLit(entries) => {
+            for entry in entries {
+                collect_randomize_target_field_refs(&entry.value, field_info, target_root, out);
+                collect_randomize_target_field_refs(&entry.weight, field_info, target_root, out);
+            }
+        }
+        ExprKind::SystemCall { args, .. }
+        | ExprKind::Randomize {
+            with_body: args, ..
+        } => {
+            for arg in args {
+                collect_randomize_target_field_refs(arg, field_info, target_root, out);
+            }
+        }
+        ExprKind::DistDirective { target, entries } => {
+            collect_randomize_target_field_refs(target, field_info, target_root, out);
+            for entry in entries {
+                collect_randomize_target_field_refs(&entry.value, field_info, target_root, out);
+                collect_randomize_target_field_refs(&entry.weight, field_info, target_root, out);
+            }
+        }
+        ExprKind::NamedArg { value, .. } => {
+            collect_randomize_target_field_refs(value, field_info, target_root, out);
+        }
+        ExprKind::StructLit { fields, .. } => {
+            for field in fields {
+                collect_randomize_target_field_refs(&field.value, field_info, target_root, out);
+            }
+        }
+        ExprKind::CoverArrow { lhs, rhs, count } => {
+            collect_randomize_target_field_refs(lhs, field_info, target_root, out);
+            collect_randomize_target_field_refs(rhs, field_info, target_root, out);
+            if let Some(count) = count {
+                collect_hash_count_field_refs(count, field_info, target_root, out);
+            }
+        }
+        ExprKind::Solve { args, .. } => {
+            for arg in args {
+                collect_randomize_target_field_refs(arg, field_info, target_root, out);
+            }
+        }
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Time(_)
+        | ExprKind::String(_)
+        | ExprKind::Bool(_)
+        | ExprKind::ImplicitSelf => {}
+    }
+}
+
+fn collect_hash_count_field_refs(
+    count: &HashCount,
+    field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+    target_root: Option<&str>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match count {
+        HashCount::Const(e) => collect_randomize_target_field_refs(e, field_info, target_root, out),
+        HashCount::Range { lo, hi } => {
+            collect_randomize_target_field_refs(lo, field_info, target_root, out);
+            collect_randomize_target_field_refs(hi, field_info, target_root, out);
+        }
     }
 }
 
@@ -5652,9 +5806,9 @@ impl Emitter {
         };
         for f in fields {
             for a in &f.attrs {
-                if matches!(a.name.name.as_str(), "unique" | "cyclic") {
+                if a.name.name == "cyclic" {
                     self.errors.push(format!(
-                        "randomize({ty}): field attribute `[{}]` on `{}.{}` is parsed but not supported yet; uniqueness/cyclic history needs runtime state semantics",
+                        "randomize({ty}): field attribute `[{}]` on `{}.{}` is parsed but not supported yet; cyclic history needs runtime state semantics",
                         a.name.name, ty, f.name,
                     ));
                 }
@@ -6559,11 +6713,25 @@ impl Emitter {
                 }
             })
             .collect();
+        let mut constrained_fields = std::collections::HashSet::new();
+        for c in &hard_constraints {
+            collect_randomize_target_field_refs(
+                c,
+                &field_info,
+                target_root,
+                &mut constrained_fields,
+            );
+        }
 
         let cache_tag = format!("_div_cache_{}", target.span.start);
         let free_fields: Vec<&TxnFieldInfo> = fields
             .iter()
             .filter(|f| !f.non_random && !pinned.contains(&f.name))
+            .collect();
+        let unique_fields: std::collections::HashSet<String> = free_fields
+            .iter()
+            .filter(|f| field_attr_unique(f) && !constrained_fields.contains(&f.name))
+            .map(|f| f.name.clone())
             .collect();
 
         // One static history vector per free field — persists across loop
@@ -6576,6 +6744,17 @@ impl Emitter {
                 f.name
             )
             .ok();
+        }
+        for f in &free_fields {
+            if unique_fields.contains(&f.name) {
+                self.pad(depth + 1);
+                writeln!(
+                    self.out,
+                    "for (auto _v : {cache_tag}_{}) _s.add(_z_{} != _ctx.bv_val(_v, 64));   // [unique] policy for unconstrained field",
+                    f.name, f.name
+                )
+                .ok();
+            }
         }
 
         // Seeded preference values. These are hard clauses only for the first
@@ -6657,6 +6836,9 @@ impl Emitter {
         self.pad(depth + 1);
         writeln!(self.out, "}}").ok();
         for f in &free_fields {
+            if unique_fields.contains(&f.name) {
+                continue;
+            }
             self.pad(depth + 1);
             writeln!(
                 self.out,
@@ -6681,6 +6863,9 @@ impl Emitter {
         self.pad(depth + 2);
         writeln!(self.out, "_s.pop();").ok();
         for f in &free_fields {
+            if unique_fields.contains(&f.name) {
+                continue;
+            }
             self.pad(depth + 2);
             writeln!(self.out, "{cache_tag}_{}.clear();", f.name).ok();
         }
@@ -7852,7 +8037,11 @@ impl Emitter {
                 combined.extend(with_body.iter().cloned());
                 self.report_unsupported_randomize_field_attrs(&ty);
                 self.report_runtime_dependent_randomize_field_attrs(&ty);
-                if combined.is_empty() {
+                let has_unique_fields = self
+                    .txn_fields
+                    .get(&ty)
+                    .is_some_and(|fields| fields.iter().any(field_attr_unique));
+                if combined.is_empty() && !has_unique_fields {
                     // No constraints anywhere: simple field-by-field PRNG path.
                     self.pad(depth);
                     write!(self.out, "randomize_{ty}(&").ok();
@@ -9526,19 +9715,19 @@ impl Emitter {
 /// `<z3++.h>` include + Z3 link flags. The check needs to mirror the
 /// codegen's actual decision:
 ///   * `randomize(t) with <body>` — always solver (user wrote constraints)
-///   * bare `randomize(t)` where `t`'s transaction has `keep` items —
-///     also solver (the keeps merge into a solver block at the call site)
+///   * bare `randomize(t)` where `t`'s transaction has `keep` items or
+///     `[unique]` fields — also solver (keeps and unique history are
+///     call-site constraints)
 pub fn uses_constraint_solver(file: &SourceFile) -> bool {
-    // First pass: collect names of transactions that declare any
-    // `keep` items. Any bare `randomize(t)` against one of these
-    // routes through Z3 after the §4 keep-merge.
-    let keep_bearing: std::collections::HashSet<&str> = file
+    // First pass: collect names of transactions whose bare `randomize(t)`
+    // needs the solver path. False positives are cheap (an unused include);
+    // false negatives are compile failures.
+    let solver_bearing: std::collections::HashSet<&str> = file
         .items
         .iter()
         .filter_map(|it| match it {
             Item::Transaction(t) => {
-                let has_keep = txn_body_has_keep(&t.body);
-                if has_keep {
+                if txn_body_has_keep(&t.body) || txn_body_has_unique_attr(&t.body) {
                     Some(t.name.name.as_str())
                 } else {
                     None
@@ -9548,47 +9737,52 @@ pub fn uses_constraint_solver(file: &SourceFile) -> bool {
         })
         .collect();
 
-    fn block(b: &Block, kb: &std::collections::HashSet<&str>) -> bool {
-        b.stmts.iter().any(|s| stmt(s, kb))
+    fn block(b: &Block, solver_bearing: &std::collections::HashSet<&str>) -> bool {
+        b.stmts.iter().any(|s| stmt(s, solver_bearing))
     }
-    fn stmt(s: &Stmt, kb: &std::collections::HashSet<&str>) -> bool {
+    fn stmt(s: &Stmt, solver_bearing: &std::collections::HashSet<&str>) -> bool {
         match &s.kind {
-            // `with <body>` always solves; bare randomize solves when
-            // the target's transaction carries keeps. The target's
-            // type isn't on the AST node directly here — we conservatively
-            // return `true` for bare randomize when the file has ANY
-            // keep-bearing transaction. False positives are cheap
-            // (an unused include); false negatives are compile failures.
-            StmtKind::Randomize { with_body, .. } => !with_body.is_empty() || !kb.is_empty(),
-            StmtKind::For(f) => block(&f.body, kb),
-            StmtKind::Repeat(r) => block(&r.body, kb),
-            StmtKind::Loop(b) => block(b, kb),
-            StmtKind::While { body, .. } => block(body, kb),
-            StmtKind::If(i) => {
-                block(&i.then_block, kb)
-                    || i.else_block.as_ref().map_or(false, |b| block(b, kb))
-                    || i.elsifs.iter().any(|(_, b)| block(b, kb))
+            StmtKind::Randomize { with_body, .. } => {
+                !with_body.is_empty() || !solver_bearing.is_empty()
             }
-            StmtKind::Fork(f) => f.branches.iter().any(|b| block(b, kb)),
-            StmtKind::Parallel(bs) | StmtKind::Schedule(bs) => bs.iter().any(|b| block(b, kb)),
-            StmtKind::Select(arms) => arms.iter().any(|a| block(&a.action, kb)),
-            StmtKind::On(h) => block(&h.body, kb),
-            StmtKind::After { body, .. } => block(body, kb),
+            StmtKind::For(f) => block(&f.body, solver_bearing),
+            StmtKind::Repeat(r) => block(&r.body, solver_bearing),
+            StmtKind::Loop(b) => block(b, solver_bearing),
+            StmtKind::While { body, .. } => block(body, solver_bearing),
+            StmtKind::If(i) => {
+                block(&i.then_block, solver_bearing)
+                    || i.else_block
+                        .as_ref()
+                        .map_or(false, |b| block(b, solver_bearing))
+                    || i.elsifs.iter().any(|(_, b)| block(b, solver_bearing))
+            }
+            StmtKind::Fork(f) => f.branches.iter().any(|b| block(b, solver_bearing)),
+            StmtKind::Parallel(bs) | StmtKind::Schedule(bs) => {
+                bs.iter().any(|b| block(b, solver_bearing))
+            }
+            StmtKind::Select(arms) => arms.iter().any(|a| block(&a.action, solver_bearing)),
+            StmtKind::On(h) => block(&h.body, solver_bearing),
+            StmtKind::After { body, .. } => block(body, solver_bearing),
             _ => false,
         }
     }
     file.items.iter().any(|it| match it {
-        Item::Function(f) => block(&f.body, &keep_bearing),
+        Item::Function(f) => block(&f.body, &solver_bearing),
         Item::Test(t) => t.items.iter().any(|ti| match ti {
-            TestItem::Stmt(s) => stmt(s, &keep_bearing),
+            TestItem::Stmt(s) => stmt(s, &solver_bearing),
             TestItem::Scope(sc) => {
-                sc.setup.as_ref().map_or(false, |b| block(b, &keep_bearing))
-                    || sc.run.as_ref().map_or(false, |b| block(b, &keep_bearing))
-                    || sc.check.as_ref().map_or(false, |b| block(b, &keep_bearing))
+                sc.setup
+                    .as_ref()
+                    .map_or(false, |b| block(b, &solver_bearing))
+                    || sc.run.as_ref().map_or(false, |b| block(b, &solver_bearing))
+                    || sc
+                        .check
+                        .as_ref()
+                        .map_or(false, |b| block(b, &solver_bearing))
                     || sc
                         .teardown
                         .as_ref()
-                        .map_or(false, |b| block(b, &keep_bearing))
+                        .map_or(false, |b| block(b, &solver_bearing))
             }
             _ => false,
         }),
@@ -11582,6 +11776,14 @@ fn txn_body_has_keep(items: &[TxnBodyItem]) -> bool {
         TxnBodyItem::Keep(_) => true,
         TxnBodyItem::When(w) => txn_body_has_keep(&w.items),
         TxnBodyItem::Field(_) => false,
+    })
+}
+
+fn txn_body_has_unique_attr(items: &[TxnBodyItem]) -> bool {
+    items.iter().any(|item| match item {
+        TxnBodyItem::Field(f) => f.attrs.iter().any(|a| a.name.name == "unique"),
+        TxnBodyItem::When(w) => txn_body_has_unique_attr(&w.items),
+        TxnBodyItem::Keep(_) => false,
     })
 }
 
