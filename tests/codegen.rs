@@ -1640,6 +1640,65 @@ end test DistSolverTest"#,
     );
 }
 
+#[test]
+fn randomize_reports_unsupported_unique_and_cyclic_attrs() {
+    let parsed = parse_source(
+        r#"transaction T
+    tag : uint<8> with [unique within test]
+    ctr : uint<8> with [cyclic]
+end transaction T
+
+test UniqueCyclicTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test UniqueCyclicTest"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&parsed).unwrap_err();
+    assert!(
+        err.0.contains("[unique]")
+            && err.0.contains("T.tag")
+            && err.0.contains("[cyclic]")
+            && err.0.contains("T.ctr")
+            && err.0.contains("runtime state semantics"),
+        "expected explicit unsupported unique/cyclic randomize diagnostics; got: {}",
+        err.0,
+    );
+}
+
+#[test]
+fn randomize_reports_unsupported_solve_order_hints() {
+    let parsed = parse_source(
+        r#"transaction T
+    addr : uint<16>
+    len : uint<8>
+end transaction T
+
+test SolveOrderTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t) with
+            solve_before(t.addr, t.len)
+            t.len > 0
+        end randomize
+    end run
+end test SolveOrderTest"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&parsed).unwrap_err();
+    assert!(
+        err.0.contains("solve_before")
+            && err.0.contains("not supported yet")
+            && err.0.contains("typed solver scheduling semantics"),
+        "expected explicit unsupported solve_before randomize diagnostic; got: {}",
+        err.0,
+    );
+}
+
 /// `keep f != WRAP` where `WRAP` is an enum variant resolves via
 /// the global `enum_variants` map. Without this lookup the
 /// constraint translator would error with "unknown name `WRAP`".
