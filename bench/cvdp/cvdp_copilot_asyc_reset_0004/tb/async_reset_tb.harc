@@ -15,11 +15,11 @@
 //      jumps back to 0x1F immediately, not waiting for next posedge)
 //      and that derived signals follow.
 
-test AsyncResetTest
-    let dut : async_reset
-end test AsyncResetTest
+testbench AsyncResetTestTb
+    dut : async_reset
+end testbench AsyncResetTestTb
 
-impl sim for AsyncResetTest
+impl AsyncResetTest for AsyncResetTestTb
     run
         log(info, "async_reset: countdown + async-reset behavioral checks")
 

@@ -23,11 +23,11 @@ function bcd_cout(a: uint<4>, b: uint<4>) -> uint<1>
     return 0
 end function bcd_cout
 
-test BcdAdderTest
-    let dut : bcd_adder_top
-end test BcdAdderTest
+testbench BcdAdderTestTb
+    dut : bcd_adder_top
+end testbench BcdAdderTestTb
 
-impl sim for BcdAdderTest
+impl BcdAdderTest for BcdAdderTestTb
     run
         log(info, "bcd_adder: exhaustive 10×10 BCD-digit sweep")
         dut.a = 0

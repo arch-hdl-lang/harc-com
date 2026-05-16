@@ -22,11 +22,11 @@
 //   5. Toggle-sweep: drive In_Data through 0xFFFFFFFF, 0x55555555,
 //      0xAAAAAAAA to toggle every input bit in both directions.
 
-test FirstBitTest
-    let dut : cvdp_copilot_decode_firstbit_top
-end test FirstBitTest
+testbench FirstBitTestTb
+    dut : cvdp_copilot_decode_firstbit_top
+end testbench FirstBitTestTb
 
-impl sim for FirstBitTest
+impl FirstBitTest for FirstBitTestTb
     run
         log(info, "decode_firstbit: walk-1 sweep through 32 bit positions")
 
