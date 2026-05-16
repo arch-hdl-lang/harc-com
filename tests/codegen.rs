@@ -17,6 +17,33 @@ fn missing_test_is_a_clean_error() {
     assert!(err.0.contains("no `test` declaration"));
 }
 
+#[test]
+fn semantic_trace_runtime_and_events_emit() {
+    let src = r#"
+transaction Req
+    addr : uint<32>
+end transaction Req
+
+test TraceTest
+    let dut : Top
+    run
+        let t : Req
+        randomize(t)
+        assert false else fail("boom")
+    end run
+end test TraceTest
+"#;
+    let parsed = parse_source(src).unwrap();
+    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let cpp = cpp_tb::emit(&merged).expect("emit");
+    assert!(cpp.contains("struct HarcTraceWriter"));
+    assert!(cpp.contains("std::getenv(\"HARC_TRACE\")"));
+    assert!(cpp.contains("trace.meta(harc_rng_state, std::getenv(\"HARC_DUT_BACKEND\"), \"Top\", \"TraceTest\")"));
+    assert!(cpp.contains("trace.raw(\"randomize\", cycle_count, _trace_fields);"));
+    assert!(cpp.contains("trace.log(cycle_count, sev, _trace_msg);"));
+    assert!(cpp.contains("raw(\"assertion_failure\""));
+}
+
 // Tests for the legacy `impl sim for T` two-block form were removed
 // alongside its parser entry in Phase 2 of docs/test-ergonomics.md.
 // Inline-form coverage lives in the fixture suite (counter_test,
