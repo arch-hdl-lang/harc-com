@@ -1714,6 +1714,46 @@ end test NonRandomSolverTest"#,
     );
 }
 
+#[test]
+fn when_subtype_keeps_lower_as_guarded_solver_constraints() {
+    let parsed = parse_source(
+        r#"enum Op { READ, WRITE }
+
+transaction T
+    op : Op
+    len : uint<8>
+
+    when op == WRITE
+        keep len > 4
+    end when
+end transaction T
+
+test WhenKeepTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test WhenKeepTest"#,
+    )
+    .unwrap();
+    assert!(
+        cpp_tb::uses_constraint_solver(&parsed),
+        "bare randomize should link Z3 when keeps live under a when subtype"
+    );
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+
+    assert!(
+        cpp.contains("!(_z_op == _ctx.bv_val((uint64_t)1, 64))")
+            && cpp.contains(" || z3::ugt(_z_len, _ctx.bv_val((uint64_t)4, 64))"),
+        "when keep should lower as `!guard || keep`; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("randomize_T(&t);"),
+        "bare randomize should not bypass guarded keeps; got:\n{cpp}"
+    );
+}
+
 /// `randomize(t) with R(t)` inlines `R`'s body into the Z3 solver
 /// block (spec §4.2). Block-form relations contribute one constraint
 /// per body expression; the formal parameter substitutes for the
