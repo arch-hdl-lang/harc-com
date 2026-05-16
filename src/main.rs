@@ -121,6 +121,17 @@ enum Cmd {
         /// Explicit Z3 library directory containing libz3.
         #[arg(long)]
         z3_lib_dir: Option<PathBuf>,
+        /// Force a clean rebuild: wipes `<outdir>/obj_dir/` before
+        /// invoking Verilator. Default (off) reuses the existing
+        /// Verilator output when the emitted `.cpp` is byte-identical
+        /// — `harc sim --test foo` then `harc sim --test bar` against
+        /// the same source skips Verilator entirely. Pass `--rebuild`
+        /// when Verilator's version changed, when SV flags changed
+        /// in a way the `.cpp` doesn't capture, or when investigating
+        /// a suspected stale-`.o` problem. See
+        /// docs/separate-compilation-plan.md §1c.
+        #[arg(long)]
+        rebuild: bool,
     },
     // ── Learning store (sister to `arch advise` and friends, port of
     // arch-com/src/learn.rs). Every `harc check` / `harc sim` records
@@ -212,6 +223,7 @@ fn main() -> Result<()> {
             z3_root,
             z3_include_dir,
             z3_lib_dir,
+            rebuild,
         } => {
             let captured = files.clone();
             learn_wrap(&captured, || {
@@ -233,6 +245,7 @@ fn main() -> Result<()> {
                         include_dir: z3_include_dir.clone(),
                         lib_dir: z3_lib_dir.clone(),
                     },
+                    rebuild,
                 )
             })
         }
@@ -793,6 +806,23 @@ fn cmd_fmt(file: PathBuf, write: bool) -> Result<()> {
 /// Verilator's `--build --exe` builds + links + produces `<obj_dir>/V<top>`;
 /// we then run that binary with `HARC_SIM_LOG` and `HARC_LOG_DIR` set so
 /// `sim.log` and any `logf("foo.log", ...)` files land next to build outputs.
+/// Write `contents` to `path` ONLY if the existing file differs (by
+/// byte-for-byte compare). Preserves mtime when the content is
+/// unchanged, which is the structural prerequisite for Make's
+/// incremental-rebuild path: an unchanged .cpp keeps its old mtime,
+/// so the .o stays valid and Verilator's Make skips the recompile.
+/// Returns `Ok(true)` when a write happened, `Ok(false)` when the
+/// file already matched.
+fn write_if_changed(path: &Path, contents: &[u8]) -> Result<bool> {
+    if let Ok(existing) = fs::read(path) {
+        if existing == contents {
+            return Ok(false);
+        }
+    }
+    fs::write(path, contents).into_diagnostic()?;
+    Ok(true)
+}
+
 fn run_verilator(
     top: &str,
     sv: &[PathBuf],
@@ -804,9 +834,19 @@ fn run_verilator(
     ref_src: &[PathBuf],
     z3_paths: &Z3Paths,
     test: Option<&str>,
+    rebuild: bool,
 ) -> Result<()> {
     let mdir = outdir_abs.join("obj_dir");
-    let _ = fs::remove_dir_all(&mdir); // start clean — stale .o's bite us
+    // Build-reuse path (Phase 1c). When `--rebuild` is unset and the
+    // emitted .cpp is byte-identical to the previous run's, Make's
+    // mtime-based skip kicks in and Verilator finishes in ~0.1s
+    // instead of ~5-10s. `--rebuild` (or a deleted outdir) forces
+    // a fresh build — useful when Verilator was upgraded or when
+    // verilator flags changed in a way the emitted .cpp doesn't
+    // capture.
+    if rebuild {
+        let _ = fs::remove_dir_all(&mdir);
+    }
     fs::create_dir_all(&mdir).into_diagnostic()?;
 
     let mut args: Vec<String> = vec![
@@ -1006,6 +1046,7 @@ fn cmd_sim(
     coverage: bool,
     ref_src: Vec<PathBuf>,
     z3_opts: Z3PathOpts,
+    rebuild: bool,
 ) -> Result<()> {
     if dut.is_empty() && sv.is_empty() {
         return Err(miette::miette!(
@@ -1046,8 +1087,17 @@ fn cmd_sim(
         .and_then(|s| s.to_str())
         .unwrap_or("harc_tb");
     let cpp_path = outdir.join(format!("{stem}.cpp"));
-    fs::write(&cpp_path, &cpp).into_diagnostic()?;
-    eprintln!("emitted {}", cpp_path.display());
+    // Only rewrite the .cpp when its content actually changed. Phase
+    // 1c: keeps mtime stable so Verilator's Make skips the rebuild
+    // when the same source is re-emitted with a different `--test`
+    // selection (the dispatcher's branch list is what changes; the
+    // emitted code is byte-identical).
+    let cpp_changed = write_if_changed(&cpp_path, cpp.as_bytes())?;
+    if cpp_changed {
+        eprintln!("emitted {}", cpp_path.display());
+    } else {
+        eprintln!("reused {} (unchanged)", cpp_path.display());
+    }
 
     // Drop the coroutine runtime header alongside the emitted .cpp so
     // verilator's standard `--Mdir`-relative include search picks it up
@@ -1056,7 +1106,10 @@ fn cmd_sim(
     // `include_str!` so a binary install of `harc` ships the runtime
     // without a separate file dependency.
     let rt_header_path = outdir.join("harc_thread_rt.h");
-    fs::write(&rt_header_path, harc::codegen::cpp_tb::THREAD_RT_HEADER).into_diagnostic()?;
+    write_if_changed(
+        &rt_header_path,
+        harc::codegen::cpp_tb::THREAD_RT_HEADER.as_bytes(),
+    )?;
 
     if emit_only {
         return Ok(());
@@ -1117,6 +1170,7 @@ fn cmd_sim(
             &ref_src_abs,
             &z3_paths,
             test.as_deref(),
+            rebuild,
         );
     }
 
