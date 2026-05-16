@@ -1018,10 +1018,8 @@ impl Parser {
         // inside a `test ... end test` body, collapsing the
         // two-block `test T { ... } / impl sim for T { ... }` form
         // into one. Inline phases accumulate into a single synthetic
-        // `TestItem::Scope` — exactly the shape the codegen
-        // synthesizes from a matching `Item::Impl` — so emit code
-        // stays unchanged. The legacy `impl sim for T` form remains
-        // supported in parallel until the migration in Phase 2.
+        // `TestItem::Scope`, preserving the codegen shape used for
+        // lifecycle blocks.
         let mut inline_scope = ScopeDecl {
             name: Ident { name: "sim".into(), span: start },
             setup: None,
@@ -1240,16 +1238,13 @@ impl Parser {
             Some(TokenKind::Let) => Ok(TestItem::Let(self.parse_let_stmt()?)),
             Some(TokenKind::Use) => Ok(TestItem::Use(self.parse_use(None)?)),
             Some(TokenKind::ClockGen) => Ok(TestItem::Clock(self.parse_clock_decl()?)),
-            // `scope sim` was the legacy lifecycle wrapper. It's been
-            // replaced by the top-level `impl sim for <Test>` item
-            // (spec §7.2). The token still lexes; we surface a clear
-            // error pointing the user at the new syntax rather than
+            // `scope sim` was the legacy lifecycle wrapper. Lifecycle
+            // blocks now live directly inside `test` (spec §7.2). The
+            // token still lexes; surface a clear error rather than
             // accept it silently.
             Some(TokenKind::Scope) => Err(CompileError::unexpected_token(
-                "`impl sim for <TestName> ... end impl <TestName>` \
-                 at top level (the legacy `scope sim` block was \
-                 removed in favor of per-target test impls — see \
-                 spec §7.2)",
+                "`run` / `setup` / `check` / `teardown` directly inside `test` \
+                 (the legacy `scope sim` block was removed — see spec §7.2)",
                 "scope",
                 self.peek_span(),
             )),
@@ -1929,7 +1924,15 @@ impl Parser {
     }
 
     fn parse_param(&mut self) -> Result<Param, CompileError> {
-        let name = self.expect_ident()?;
+        let name = if self.check(TokenKind::Underscore) {
+            let span = self.advance().unwrap().span;
+            Ident {
+                name: "_".into(),
+                span,
+            }
+        } else {
+            self.expect_ident()?
+        };
         let start = name.span;
         let mut ty = None;
         let mut default = None;
@@ -2531,7 +2534,15 @@ impl Parser {
 
     fn parse_let_stmt(&mut self) -> Result<LetStmt, CompileError> {
         let start = self.expect(TokenKind::Let)?.span;
-        let name = self.expect_field_name()?;
+        let name = if self.check(TokenKind::Underscore) {
+            let span = self.advance().unwrap().span;
+            Ident {
+                name: "_".into(),
+                span,
+            }
+        } else {
+            self.expect_field_name()?
+        };
         let ty = if self.check(TokenKind::Colon) {
             self.advance();
             let mut t = self.parse_type_expr()?;
