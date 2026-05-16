@@ -284,6 +284,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     let mut txn_keeps: std::collections::HashMap<String, Vec<Expr>> =
         std::collections::HashMap::new();
     let mut enums = std::collections::HashMap::new();
+    let mut enum_domains: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     // Global variant-name → index map. Used by the Z3 constraint
     // translator to resolve bare `WRAP` / `INCR` / etc. into their
     // numeric encoding. v0 assumes variant names are globally
@@ -308,6 +310,10 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     for it in &file.items {
         if let Item::Enum(e) = it {
             enums.insert(e.name.name.clone(), e.variants.len());
+            enum_domains.insert(
+                e.name.name.clone(),
+                e.variants.iter().map(|v| v.name.clone()).collect(),
+            );
             for (i, v) in e.variants.iter().enumerate() {
                 enum_variants.entry(v.name.clone()).or_insert(i as i64);
             }
@@ -385,27 +391,32 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                     .iter()
                     .filter_map(|it| match it {
                         TxnBodyItem::Field(f) => {
-                            let (width, signed, enum_variants) = match &f.ty {
+                            let (width, signed, enum_variants, enum_variant_labels) = match &f.ty {
                                 TypeExpr::Builtin { name, args, .. } => match name {
                                     BuiltinTy::UInt | BuiltinTy::Bits | BuiltinTy::UIntCap => {
-                                        (type_arg_width(args).unwrap_or(64), false, None)
+                                        (type_arg_width(args).unwrap_or(64), false, None, None)
                                     }
                                     BuiltinTy::SInt | BuiltinTy::SIntCap => {
-                                        (type_arg_width(args).unwrap_or(64), true, None)
+                                        (type_arg_width(args).unwrap_or(64), true, None, None)
                                     }
                                     BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => {
-                                        (1, false, None)
+                                        (1, false, None, None)
                                     }
-                                    BuiltinTy::Int => (32, true, None),
-                                    _ => (64, false, None),
+                                    BuiltinTy::Int => (32, true, None, None),
+                                    _ => (64, false, None, None),
                                 },
                                 TypeExpr::Named { name, .. } => {
                                     let last =
                                         name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
                                     if let Some(&n) = enums.get(last) {
-                                        (enum_width(n), false, Some(n))
+                                        (
+                                            enum_width(n),
+                                            false,
+                                            Some(n),
+                                            enum_domains.get(last).cloned(),
+                                        )
                                     } else {
-                                        (64, false, None)
+                                        (64, false, None, None)
                                     }
                                 }
                             };
@@ -414,6 +425,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                                 width,
                                 signed,
                                 enum_variants,
+                                enum_variant_labels,
                                 non_random: f.non_random,
                                 attrs: f.attrs.clone(),
                             })
@@ -2173,6 +2185,7 @@ struct TxnFieldInfo {
     width: u32,
     signed: bool,
     enum_variants: Option<usize>,
+    enum_variant_labels: Option<Vec<String>>,
     /// `!` prefix on a transaction field — pinned to the current value during
     /// solver-backed randomize and skipped during model assignment.
     non_random: bool,
@@ -2242,8 +2255,16 @@ fn field_attr_unique(f: &TxnFieldInfo) -> bool {
 fn auto_coverage_values(f: &TxnFieldInfo) -> Vec<AutoCoverageValue> {
     let mut values = Vec::new();
     if let Some(n) = f.enum_variants {
+        let labels = f.enum_variant_labels.as_deref();
         for i in 0..n {
-            values.push(AutoCoverageValue::unsigned(i as u64));
+            if let Some(label) = labels.and_then(|labels| labels.get(i)) {
+                values.push(AutoCoverageValue {
+                    label: label.clone(),
+                    c_expr: format!("{i}ULL"),
+                });
+            } else {
+                values.push(AutoCoverageValue::unsigned(i as u64));
+            }
         }
     } else if f.width == 1 && !f.signed {
         values.extend([0, 1].map(AutoCoverageValue::unsigned));
