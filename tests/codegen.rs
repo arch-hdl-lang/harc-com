@@ -1670,6 +1670,50 @@ end test EnumDomainTest"#,
     );
 }
 
+#[test]
+fn constraint_solver_pins_non_random_fields_to_current_value() {
+    let parsed = parse_source(
+        r#"transaction T
+    !mode : uint<4> default 3
+    val : uint<8>
+    keep val > mode
+end transaction T
+
+test NonRandomSolverTest
+    let dut : DummyDut
+    run
+        let t : T
+        t.mode = 5
+        randomize(t)
+    end run
+end test NonRandomSolverTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+
+    assert!(
+        cpp.contains("_s.add(_z_mode == _ctx.bv_val((uint64_t)(t.mode), 64));"),
+        "non-random fields should be pinned to the current transaction value in the solver; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("_div_cache_") || !cpp.contains("_mode;"),
+        "non-random fields should not get diversity cache declarations; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("uint64_t _val_mode =")
+            && !cpp.contains("int64_t _val_mode =")
+            && !cpp.contains("t.mode = _val_mode;")
+    );
+    assert!(
+        !cpp.contains("_val_mode"),
+        "non-random fields should not be assigned from the solver model or diversity cache; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("uint64_t _val_val ="),
+        "random fields should still be assigned from the model; got:\n{cpp}"
+    );
+}
+
 /// `randomize(t) with R(t)` inlines `R`'s body into the Z3 solver
 /// block (spec §4.2). Block-form relations contribute one constraint
 /// per body expression; the formal parameter substitutes for the
