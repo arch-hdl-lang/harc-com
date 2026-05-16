@@ -90,6 +90,44 @@ end test DiscardTest"#,
 // rom_lut_inline_test, etc.) — those exercise the same lowering
 // through the new single-block path.
 
+#[test]
+fn covergroup_auto_crosses_use_sample_local_bin_hits() {
+    let parsed = parse_source(
+        r#"covergroup G @(posedge dut.clk)
+    cp_addr : cover dut.addr
+        bins
+            zero = {0}
+            high = [8..15]
+        end bins
+    cp_data : cover dut.data
+        bins
+            small = [0..3]
+            large = [12..15]
+        end bins
+end covergroup G
+
+test CoverAutoCrossTest
+    let dut : DummyDut
+    run
+        let cov : G
+    end run
+end test CoverAutoCrossTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("uint64_t _auto_cross_cp_addr__cp_data[2][2] = {};")
+            && cpp.contains("bool _cg_hit_cp_addr[2] = {};")
+            && cpp.contains("bool _cg_hit_cp_data[2] = {};")
+            && cpp.contains("_cg_hit_cp_addr[0] = true;")
+            && cpp.contains("_cg_hit_cp_data[1] = true;")
+            && cpp.contains("if (_cg_hit_cp_addr[_i] && _cg_hit_cp_data[_j]) cov._auto_cross_cp_addr__cp_data[_i][_j]++;")
+            && cpp.contains("[G] auto_cross cp_addr x cp_data")
+            && cpp.contains("cp_addr.zero x cp_data.small: *NOT HIT*"),
+        "covergroup post-sim crosses should be updated from bins hit in the same sample record; got:\n{cpp}",
+    );
+}
+
 /// `size` on addrmap instances triggers static overlap detection
 /// (docs/ral-support.md §4). Two sized windows that share any byte
 /// must fail codegen with a message naming both instances and
