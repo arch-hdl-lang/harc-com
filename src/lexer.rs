@@ -725,8 +725,8 @@ impl fmt::Display for TokenKind {
             Hash => write!(f, "#"),
             AtSign => write!(f, "@"),
             Underscore => write!(f, "_"),
-            TimeLiteral(s) | HexLiteral(s) | BinLiteral(s) | SizedLiteral(s)
-            | FloatLiteral(s) | DecLiteral(s) => write!(f, "{s}"),
+            TimeLiteral(s) | HexLiteral(s) | BinLiteral(s) | SizedLiteral(s) | FloatLiteral(s)
+            | DecLiteral(s) => write!(f, "{s}"),
             StringLit(s) => write!(f, "\"{s}\""),
             Ident(s) => write!(f, "{s}"),
         }

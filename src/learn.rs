@@ -293,10 +293,7 @@ fn append_event(e: &Event) -> std::io::Result<()> {
 /// store-size cap, same as error-fix events.
 ///
 /// Returns the number of feature events emitted.
-pub fn harvest_features<F>(
-    ast: &crate::ast::SourceFile,
-    file_path_for: F,
-) -> std::io::Result<usize>
+pub fn harvest_features<F>(ast: &crate::ast::SourceFile, file_path_for: F) -> std::io::Result<usize>
 where
     F: Fn(&crate::ast::Item) -> String,
 {
@@ -314,10 +311,7 @@ where
             None => continue,
         };
         // Skip when there's nothing useful to retrieve.
-        if doc.is_empty()
-            && inner_doc.is_empty()
-            && frontmatter.is_empty()
-            && file_inner.is_empty()
+        if doc.is_empty() && inner_doc.is_empty() && frontmatter.is_empty() && file_inner.is_empty()
         {
             continue;
         }
@@ -628,7 +622,9 @@ pub fn print_stats() -> std::io::Result<()> {
     let dir = learn_dir()?;
     let events_path = dir.join("events.jsonl");
     if !events_path.exists() {
-        println!("No events captured yet. Run `harc check <file.harc>` (or `harc sim ...`) to start.");
+        println!(
+            "No events captured yet. Run `harc check <file.harc>` (or `harc sim ...`) to start."
+        );
         return Ok(());
     }
     let raw = fs::read_to_string(&events_path)?;
@@ -767,8 +763,18 @@ fn epoch_to_utc(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     }
     let ly = is_leap(year);
     let months = [
-        31u32, if ly { 29 } else { 28 }, 31, 30, 31, 30,
-        31, 31, 30, 31, 30, 31,
+        31u32,
+        if ly { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
     ];
     let mut month = 0u32;
     for (i, &ml) in months.iter().enumerate() {
@@ -1080,17 +1086,11 @@ pub fn classify_error(msg: &str) -> String {
     // since some of these contain the substring "expected" (e.g.
     // "expected `let dut : ...`") that would otherwise route them to
     // parse_error.
-    else if lower.contains("no `test` declaration")
-        || lower.contains("missing test")
-    {
+    else if lower.contains("no `test` declaration") || lower.contains("missing test") {
         "missing_test".to_string()
-    } else if lower.contains("let dut")
-        || lower.contains("could not determine sv top module")
-    {
+    } else if lower.contains("let dut") || lower.contains("could not determine sv top module") {
         "missing_dut".to_string()
-    } else if lower.contains("verilator build failed")
-        || lower.contains("simulation exited with")
-    {
+    } else if lower.contains("verilator build failed") || lower.contains("simulation exited with") {
         "sim_runtime".to_string()
     } else if lower.contains("only non-sim impls") {
         "non_sim_impl".to_string()
@@ -1153,8 +1153,14 @@ mod tests {
         );
         assert_eq!(classify_error("undefined signal `foo`"), "undefined_name");
         assert_eq!(classify_error("ambiguous precedence: ..."), "precedence");
-        assert_eq!(classify_error("unexpected token: expected )"), "parse_error");
-        assert_eq!(classify_error("no `test` declaration found"), "missing_test");
+        assert_eq!(
+            classify_error("unexpected token: expected )"),
+            "parse_error"
+        );
+        assert_eq!(
+            classify_error("no `test` declaration found"),
+            "missing_test"
+        );
         assert_eq!(
             classify_error("expected `let dut : <Type>` declaration in test body"),
             "missing_dut"
@@ -1181,10 +1187,7 @@ mod tests {
 
     #[test]
     fn diff_summary_picks_first_diff_line() {
-        let s = short_diff_summary(
-            "let a = 1\nlet b = 2\n",
-            "let a = 1\nlet b = 3\n",
-        );
+        let s = short_diff_summary("let a = 1\nlet b = 2\n", "let a = 1\nlet b = 3\n");
         assert!(s.contains("let b = 2") && s.contains("let b = 3"));
         assert!(s.contains("→"));
     }
@@ -1203,8 +1206,10 @@ end struct BeatCounter
         let (kind, name, doc, inner) = extract_doc(item).expect("extract");
         assert_eq!(kind, "struct");
         assert_eq!(name, "BeatCounter");
-        assert!(doc.contains("Per-channel beat counter"),
-            "outer doc captured; got: {doc:?}");
+        assert!(
+            doc.contains("Per-channel beat counter"),
+            "outer doc captured; got: {doc:?}"
+        );
         assert_eq!(inner, "", "no per-construct inner doc in HARC today");
     }
 
@@ -1230,9 +1235,13 @@ end struct BeatCounter
             }
         }
         assert_eq!(kept.len(), 2);
-        assert!(kept[0].contains("\"kind\":\"error_fix\""),
-            "error_fix events should not be dropped by feature-purge");
-        assert!(kept[1].contains("\"file_path\":\"other.harc\""),
-            "feature events for non-targeted files should be retained");
+        assert!(
+            kept[0].contains("\"kind\":\"error_fix\""),
+            "error_fix events should not be dropped by feature-purge"
+        );
+        assert!(
+            kept[1].contains("\"file_path\":\"other.harc\""),
+            "feature events for non-targeted files should be retained"
+        );
     }
 }
