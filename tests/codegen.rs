@@ -128,6 +128,34 @@ end test CoverAutoCrossTest"#,
     );
 }
 
+#[test]
+fn hook_triggered_covergroups_are_not_cycle_sampled_yet() {
+    let parsed = parse_source(
+        r#"covergroup TxnCov @(mon.observed(t) post)
+    cp_op : cover t.op
+        bins
+            read = {0}
+            write = {1}
+        end bins
+end covergroup TxnCov
+
+test HookCoverTriggerTest
+    let dut : DummyDut
+    run
+        let cov : TxnCov
+    end run
+end test HookCoverTriggerTest"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&parsed).unwrap_err();
+    assert!(
+        err.0
+            .contains("hook-triggered covergroup sampling is parsed but not lowered yet"),
+        "hook-triggered covergroups should not silently fall back to per-cycle sampling; got: {}",
+        err.0
+    );
+}
+
 /// `size` on addrmap instances triggers static overlap detection
 /// (docs/ral-support.md §4). Two sized windows that share any byte
 /// must fail codegen with a message naming both instances and
