@@ -4,7 +4,8 @@
 // `covergroup G @(posedge clk)` declares a sample trigger; each
 // cover-point's expression is evaluated on the trigger and the matching
 // bin's hit counter increments. End-of-test report prints per-bin counts
-// and a coverage percentage.
+// and a coverage percentage. Declared crosses record bin combinations hit
+// within one sample event, not unrelated hits collected across the run.
 
 covergroup AxiCov @(posedge dut.clk)
     // Which register address got written.
@@ -25,6 +26,7 @@ covergroup AxiCov @(posedge dut.clk)
             medium   = [65536..16777215]
             large    = [16777216..4294967295]
         end bins
+    cross cp_addr, cp_data
 end covergroup AxiCov
 
 testbench AxiLiteCovTb
@@ -91,4 +93,5 @@ end impl AxiLiteCovTest
 // coverage report at end of test. Tests:
 //   - cp_addr should hit 'dmacr', 'sa', 'length' (3 of 4 bins, 75%)
 //   - cp_data should hit a mix of magnitude bins depending on seed
-
+//   - cross cp_addr/cp_data should show which addr/data combinations
+//     occurred on the same sample
