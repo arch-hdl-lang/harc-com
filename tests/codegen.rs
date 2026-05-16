@@ -1723,7 +1723,7 @@ end test UniqueConstrainedTest"#,
 }
 
 #[test]
-fn randomize_reports_unsupported_solve_order_hints() {
+fn randomize_accepts_solve_order_hints_as_metadata() {
     let parsed = parse_source(
         r#"transaction T
     addr : uint<16>
@@ -1736,18 +1736,47 @@ test SolveOrderTest
         let t : T
         randomize(t) with
             solve_before(t.addr, t.len)
+            solve_after(len, addr)
             t.len > 0
         end randomize
     end run
 end test SolveOrderTest"#,
     )
     .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("// solve_before(addr, len) accepted as solver scheduling metadata")
+            && cpp.contains("// solve_after(len, addr) accepted as solver scheduling metadata")
+            && cpp.contains("_s.add(z3::ugt(_z_len, _ctx.bv_val((uint64_t)0, 64)));"),
+        "expected solve-order hints to be metadata while ordinary constraints still lower; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn randomize_rejects_bad_solve_order_targets() {
+    let parsed = parse_source(
+        r#"transaction T
+    addr : uint<16>
+    len : uint<8>
+end transaction T
+
+test BadSolveOrderTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t) with
+            solve_before(t.addr + 1, t.len)
+        end randomize
+    end run
+end test BadSolveOrderTest"#,
+    )
+    .unwrap();
     let err = cpp_tb::emit(&parsed).unwrap_err();
     assert!(
         err.0.contains("solve_before")
-            && err.0.contains("not supported yet")
-            && err.0.contains("typed solver scheduling semantics"),
-        "expected explicit unsupported solve_before randomize diagnostic; got: {}",
+            && err.0.contains("arguments must be fields")
+            && err.0.contains("transaction `T`"),
+        "expected clear solve-order target diagnostic; got: {}",
         err.0,
     );
 }
