@@ -1735,8 +1735,7 @@ test SolveOrderTest
     run
         let t : T
         randomize(t) with
-            solve_before(t.addr, t.len)
-            solve_after(len, addr)
+            solve_order(t.addr, t.len)
             t.len > 0
         end randomize
     end run
@@ -1745,8 +1744,7 @@ end test SolveOrderTest"#,
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
-        cpp.contains("// solve_before(addr, len) accepted as solver scheduling metadata")
-            && cpp.contains("// solve_after(len, addr) accepted as solver scheduling metadata")
+        cpp.contains("// solve_order(addr, len) accepted as solver scheduling metadata")
             && cpp.contains("// solve-order sampling order: addr, len")
             && cpp.find("_addr = harc_rng_uint(16)").unwrap()
                 < cpp.find("_len = harc_rng_uint(8)").unwrap()
@@ -1768,7 +1766,7 @@ test BadSolveOrderTest
     run
         let t : T
         randomize(t) with
-            solve_before(t.addr + 1, t.len)
+            solve_order(t.addr + 1, t.len)
         end randomize
     end run
 end test BadSolveOrderTest"#,
@@ -1776,7 +1774,7 @@ end test BadSolveOrderTest"#,
     .unwrap();
     let err = cpp_tb::emit(&parsed).unwrap_err();
     assert!(
-        err.0.contains("solve_before")
+        err.0.contains("solve_order")
             && err.0.contains("arguments must be fields")
             && err.0.contains("transaction `T`"),
         "expected clear solve-order target diagnostic; got: {}",
@@ -1797,8 +1795,8 @@ test CyclicSolveOrderTest
     run
         let t : T
         randomize(t) with
-            solve_before(t.addr, t.len)
-            solve_before(t.len, t.addr)
+            solve_order(t.addr, t.len)
+            solve_order(t.len, t.addr)
         end randomize
     end run
 end test CyclicSolveOrderTest"#,

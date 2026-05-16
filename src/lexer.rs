@@ -164,10 +164,8 @@ pub enum TokenKind {
     Property,
     #[token("pseq")]
     Pseq,
-    #[token("solve_before")]
-    SolveBefore,
-    #[token("solve_after")]
-    SolveAfter,
+    #[token("solve_order")]
+    SolveOrder,
     #[token("dist")]
     Dist,
     #[token("transaction")]
@@ -583,8 +581,7 @@ impl fmt::Display for TokenKind {
             Cover => write!(f, "cover"),
             Property => write!(f, "property"),
             Pseq => write!(f, "pseq"),
-            SolveBefore => write!(f, "solve_before"),
-            SolveAfter => write!(f, "solve_after"),
+            SolveOrder => write!(f, "solve_order"),
             Dist => write!(f, "dist"),
             Transaction => write!(f, "transaction"),
             Agent => write!(f, "agent"),
