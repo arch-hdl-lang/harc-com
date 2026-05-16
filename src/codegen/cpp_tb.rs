@@ -6052,12 +6052,72 @@ impl Emitter {
             )
             .ok();
         }
+
+        // Seeded preference values. These are hard clauses only for the first
+        // check; if the preferred tuple is incompatible with the user's
+        // constraints, we drop the preference stack and fall back to the
+        // diversity-only/base solve. This makes solver-backed randomize
+        // consume the HARC seed without turning preferences into false UNSATs.
+        for f in &free_fields {
+            self.pad(depth + 1);
+            if let Some(n) = f.enum_variants {
+                writeln!(
+                    self.out,
+                    "uint64_t _pref_{cache_tag}_{} = (uint64_t)harc_rng_range(0, {});",
+                    f.name,
+                    n.saturating_sub(1)
+                )
+                .ok();
+            } else if f.signed && f.width > 0 && f.width < 63 {
+                writeln!(
+                    self.out,
+                    "uint64_t _pref_{cache_tag}_{} = (uint64_t)harc_rng_range(-(1LL << {}), (1LL << {}) - 1);",
+                    f.name,
+                    f.width.saturating_sub(1),
+                    f.width.saturating_sub(1)
+                )
+                .ok();
+            } else if f.width < 64 {
+                writeln!(
+                    self.out,
+                    "uint64_t _pref_{cache_tag}_{} = harc_rng_uint({});",
+                    f.name, f.width
+                )
+                .ok();
+            } else {
+                writeln!(
+                    self.out,
+                    "uint64_t _pref_{cache_tag}_{} = harc_rng_next();",
+                    f.name
+                )
+                .ok();
+            }
+        }
         self.pad(depth + 1);
         writeln!(
             self.out,
-            "_s.push();   // diversity-blocking clauses (free fields only)"
+            "_s.push();   // seeded preference + diversity clauses (free fields only)"
         )
         .ok();
+        for f in &free_fields {
+            self.pad(depth + 1);
+            writeln!(
+                self.out,
+                "_s.add(_z_{} == _ctx.bv_val(_pref_{cache_tag}_{}, 64));",
+                f.name, f.name
+            )
+            .ok();
+        }
+        self.pad(depth + 1);
+        writeln!(self.out, "auto _r = _s.check();").ok();
+        self.pad(depth + 1);
+        writeln!(self.out, "if (_r != z3::sat) {{").ok();
+        self.pad(depth + 2);
+        writeln!(self.out, "_s.pop();").ok();
+        self.pad(depth + 2);
+        writeln!(self.out, "_s.push();   // retry without seeded preferences").ok();
+        self.pad(depth + 1);
+        writeln!(self.out, "}}").ok();
         for f in &free_fields {
             self.pad(depth + 1);
             writeln!(
@@ -6077,7 +6137,7 @@ impl Emitter {
         // First check: with blocking. If UNSAT (cache has saturated the
         // satisfiable space), drop the blocks and clear the cache.
         self.pad(depth + 1);
-        writeln!(self.out, "auto _r = _s.check();").ok();
+        writeln!(self.out, "_r = _s.check();").ok();
         self.pad(depth + 1);
         writeln!(self.out, "if (_r != z3::sat) {{").ok();
         self.pad(depth + 2);
