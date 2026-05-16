@@ -34,11 +34,11 @@ function gf_mul_ref(a: uint<4>, b: uint<4>) -> uint<4>
     return acc & 0xf
 end function gf_mul_ref
 
-test GfMultiplierTest
-    let dut : gf_multiplier_top
-end test GfMultiplierTest
+testbench GfMultiplierTestTb
+    dut : gf_multiplier_top
+end testbench GfMultiplierTestTb
 
-impl sim for GfMultiplierTest
+impl GfMultiplierTest for GfMultiplierTestTb
     run
         log(info, "GF(2^4) multiplier exhaustive sweep: 16 × 16 = 256 combos")
 

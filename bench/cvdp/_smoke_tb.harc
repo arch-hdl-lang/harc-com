@@ -7,11 +7,11 @@
 // The harness substitutes `{TOP_MODULE}` with each problem's actual
 // top module name at smoke time.
 
-test SmokeTest
-    let dut : {TOP_MODULE}
-end test SmokeTest
+testbench SmokeTb
+    dut : {TOP_MODULE}
+end testbench SmokeTb
 
-impl sim for SmokeTest
+impl SmokeTest for SmokeTb
     run
         wait 1 cycle
         log(info, "smoke: DUT alive")

@@ -15,11 +15,11 @@
 // each `inp` pattern (00, 01, 10, 11), with cycles to let the 1-stage
 // pipeline propagate. Reset/clear get separate dedicated coverage.
 
-test SyncMullerCTest
-    let dut : sync_muller_c_element_top
-end test SyncMullerCTest
+testbench SyncMullerCTestTb
+    dut : sync_muller_c_element_top
+end testbench SyncMullerCTestTb
 
-impl sim for SyncMullerCTest
+impl SyncMullerCTest for SyncMullerCTestTb
     run
         log(info, "sync_muller_c_element: exhaustive control + input sweep")
 

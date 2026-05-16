@@ -15,11 +15,11 @@ function gray_to_binary_ref(g: uint<4>) -> uint<4>
     return (b3 << 3) | (b2 << 2) | (b1 << 1) | b0
 end function gray_to_binary_ref
 
-test GrayToBinaryTest
-    let dut : gray_to_binary_top
-end test GrayToBinaryTest
+testbench GrayToBinaryTestTb
+    dut : gray_to_binary_top
+end testbench GrayToBinaryTestTb
 
-impl sim for GrayToBinaryTest
+impl GrayToBinaryTest for GrayToBinaryTestTb
     run
         log(info, "gray_to_binary: exhaustive 0..15 sweep vs sw model")
         dut.gray_in = 0
