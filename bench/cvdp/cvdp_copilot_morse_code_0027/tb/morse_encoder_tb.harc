@@ -1,0 +1,196 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_morse_code_0027`.
+//
+// DUT: morse_encoder — ASCII→Morse-code combinational lookup table
+// with explicit `default` for non-letter/digit/punctuation ASCII codes.
+//
+// Strategy: exhaustive sweep 0..256 — covers every case-arm + default.
+// Software model is a giant if/elsif/else mirroring the DUT case.
+
+testbench MorseEncoderTb
+    dut : morse_encoder_top
+end testbench MorseEncoderTb
+
+function model_morse(c: uint<8>) -> uint<16>
+    // Pack: (morse_length << 6) | morse_out, into a 16-bit field.
+    let m : uint<6> = 0
+    let l : uint<4> = 0
+    if c == 0x41
+        m = 0b000001
+        l = 2
+    elsif c == 0x42
+        m = 0b100000
+        l = 4
+    elsif c == 0x43
+        m = 0b101000
+        l = 4
+    elsif c == 0x44
+        m = 0b010000
+        l = 3
+    elsif c == 0x45
+        m = 0b000001
+        l = 1
+    elsif c == 0x46
+        m = 0b001000
+        l = 4
+    elsif c == 0x47
+        m = 0b110000
+        l = 3
+    elsif c == 0x48
+        m = 0b000000
+        l = 4
+    elsif c == 0x49
+        m = 0b000001
+        l = 2
+    elsif c == 0x4A
+        m = 0b011100
+        l = 4
+    elsif c == 0x4B
+        m = 0b101000
+        l = 3
+    elsif c == 0x4C
+        m = 0b010000
+        l = 4
+    elsif c == 0x4D
+        m = 0b110000
+        l = 2
+    elsif c == 0x4E
+        m = 0b100000
+        l = 2
+    elsif c == 0x4F
+        m = 0b111000
+        l = 3
+    elsif c == 0x50
+        m = 0b011000
+        l = 4
+    elsif c == 0x51
+        m = 0b110100
+        l = 4
+    elsif c == 0x52
+        m = 0b010000
+        l = 3
+    elsif c == 0x53
+        m = 0b000000
+        l = 3
+    elsif c == 0x54
+        m = 0b000001
+        l = 1
+    elsif c == 0x55
+        m = 0b001000
+        l = 3
+    elsif c == 0x56
+        m = 0b000100
+        l = 4
+    elsif c == 0x57
+        m = 0b011000
+        l = 3
+    elsif c == 0x58
+        m = 0b100100
+        l = 4
+    elsif c == 0x59
+        m = 0b101100
+        l = 4
+    elsif c == 0x5A
+        m = 0b110000
+        l = 4
+    elsif c == 0x30
+        m = 0b111111
+        l = 5
+    elsif c == 0x31
+        m = 0b011111
+        l = 5
+    elsif c == 0x32
+        m = 0b001111
+        l = 5
+    elsif c == 0x33
+        m = 0b000111
+        l = 5
+    elsif c == 0x34
+        m = 0b000011
+        l = 5
+    elsif c == 0x35
+        m = 0b000001
+        l = 5
+    elsif c == 0x36
+        m = 0b100000
+        l = 5
+    elsif c == 0x37
+        m = 0b110000
+        l = 5
+    elsif c == 0x38
+        m = 0b111000
+        l = 5
+    elsif c == 0x39
+        m = 0b111100
+        l = 5
+    elsif c == 0x2E
+        m = 0b010101
+        l = 6
+    elsif c == 0x2C
+        m = 0b110011
+        l = 6
+    elsif c == 0x3F
+        m = 0b001100
+        l = 6
+    elsif c == 0x27
+        m = 0b011110
+        l = 6
+    elsif c == 0x21
+        m = 0b101011
+        l = 6
+    elsif c == 0x2F
+        m = 0b100010
+        l = 5
+    elsif c == 0x28
+        m = 0b101100
+        l = 5
+    elsif c == 0x29
+        m = 0b101101
+        l = 6
+    elsif c == 0x26
+        m = 0b010000
+        l = 5
+    elsif c == 0x3A
+        m = 0b111000
+        l = 6
+    elsif c == 0x3B
+        m = 0b101010
+        l = 6
+    elsif c == 0x3D
+        m = 0b100001
+        l = 5
+    elsif c == 0x2B
+        m = 0b010100
+        l = 5
+    elsif c == 0x2D
+        m = 0b100001
+        l = 6
+    elsif c == 0x22
+        m = 0b010010
+        l = 6
+    elsif c == 0x40
+        m = 0b011010
+        l = 6
+    else
+        m = 0
+        l = 0
+    end if
+    return ((l as uint<16>) << 6) | (m as uint<16>)
+end function model_morse
+
+impl MorseEncoderTest for MorseEncoderTb
+    run
+        log(info, "morse_encoder: full 0..256 ASCII sweep")
+        for c in 0 .. 256
+            dut.ascii_in = c
+            wait 1 cycle
+            let exp = model_morse(c as uint<8>)
+            let exp_m = (exp & 0x3F).trunc<6>()
+            let exp_l = ((exp >> 6) & 0xF).trunc<4>()
+            assert dut.morse_out == exp_m
+                else fail("ascii=0x${c:02x}: morse_out=0x${dut.morse_out:02x}, expected 0x${exp_m:02x}")
+            assert dut.morse_length == exp_l
+                else fail("ascii=0x${c:02x}: morse_length=${dut.morse_length}, expected ${exp_l}")
+        end for
+        log(info, "ALL TESTS PASSED — morse_encoder 256/256 ASCII values")
+    end run
+end impl MorseEncoderTest

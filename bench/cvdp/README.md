@@ -159,9 +159,32 @@ discarded by the extractor).
 | `signed_adder_0003` (signed add/sub, 1-clk sequential) | **100.00%** | **100.00%** | ≥99% | **PASS** *(after iteration)* |
 | `cellular_automata_0002` (16-cell rule-128-shape CA, sequential) | **100.00%** | **100.00%** | ≥100% | **PASS** |
 
+### Round 4 (Phase 2b-scale batch 2, 8 problems)
+
+| Problem | Line | Branch | Target | Verdict |
+|---|---:|---:|---:|---|
+| `single_cycle_arbiter_0004` (1-clk request-grant FSM) | **100.00%** | 98.96% | ≥96% | **PASS** |
+| `hamming_code_tx_and_rx_0037` (param-width Hamming RX) | 96.67% | 83.93% | ≥97% | FAIL — ceiling |
+| `secure_read_write_bus_0005` (functional-clock APB-ish) | **100.00%** | **100.00%** | ≥100% | **PASS** |
+| `image_stego_0014` (LSB embed/extract, 33-bit accumulator) | **100.00%** | **100.00%** | ≥100% | **PASS** *(after iteration; used `.trunc<32>()`)* |
+| `morse_code_0027` (alphabet → variable-length morse table) | **100.00%** | 94.44% | ≥95% | FAIL — ceiling (0.56% short) |
+| `static_branch_predict_0035` (state-machine predictor) | **100.00%** | 98.70% | ≥95% | **PASS** |
+| `manchester_enc_0009` (1-clk bit-pair encoder) | **100.00%** | **100.00%** | ≥100% | **PASS** *(after iteration)* |
+| `ring_token_0004` (4-node ring token, FSM with `default` arm) | 94.87% | **100.00%** | ≥100% | **PASS** *(branch-gated)* |
+
+Round 4 ceiling-FAIL summary:
+- `hamming_code_tx_and_rx_0037`: 9 unhit BRDA subbranches on register-declaration pseudo-branches (`reg [$clog2(DATA_WIDTH)-1:0] j`, `i`, `k`, `count`) — Verilator counts these init-width subbranches but DATA_WIDTH=4 makes the high bits never matter.
+- `morse_code_0027`: 1 unhit BRDA on `morse_length[3]` MSB. DUT's lookup table only produces morse_length values 0..6 → bit 3 never toggles.
+
+### HARC language ergonomics noted (round 4)
+
+- **`else if` is two tokens**; HARC uses single-token `elsif`. Easy to hit when porting from SV-style sources.
+- **`bits` is a reserved identifier** — rename locals (`v`, `data`, etc.).
+- **`.trunc<N>()` (PR #117)** earns its keep: image_stego's TB needed to narrow a 33-bit intermediate (`sum + offset`) back to the DUT's 32-bit output before comparing — `.trunc<32>()` does it cleanly; `as uint<32>` would have been a no-op relabel.
+
 ### Net scoreboard
 
-**11/14 PASS, 3/14 ceiling-FAIL.** The PASS column reaches 100% line *and*
+**17/22 PASS, 5/22 ceiling-FAIL.** The PASS column reaches 100% line *and*
 branch coverage on every problem where the DUT doesn't have a
 structurally unreachable path under default parameters. The 3 FAILs
 all share the same shape:
