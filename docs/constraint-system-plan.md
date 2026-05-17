@@ -87,16 +87,24 @@ distribution effects can be added in the typed solver backend once sampling
 order is explicit.
 
 Auto coverage goals are solver preferences, not hard constraints. The v1
-runtime derives goals for enum variants, bool values, and literal `[range]`
-min/max endpoints, then derives capped pairwise crosses from those goals.
-Uncovered goals and crosses should be preferred ahead of ordinary seeded
-samples when the participating fields remain unconstrained; explicit user
-constraints and non-random fields must exclude the corresponding auto goals.
-If an auto coverage preference makes the first solver check UNSAT, the runtime
-should mark that generated goal as blocked, skip it on later attempts, and
-retry without treating the preference as a hard failure. The same runtime state
-should report hit/miss/blocked summaries at test end so users can see which
-generated preferences still need attention.
+runtime derives goals for enum variants, bool values, literal `[range]`
+min/max endpoints, and natural numeric min/max endpoints where the solver path
+can represent the field without truncation, then derives capped pairwise
+crosses from those goals. Uncovered goals and crosses should be preferred
+ahead of ordinary seeded samples when the participating fields remain
+unconstrained; explicit user constraints and non-random fields must exclude
+the corresponding auto goals. If an auto coverage preference makes the first
+solver check UNSAT, the runtime should mark that generated goal as blocked,
+skip it on later attempts, and retry without treating the preference as a hard
+failure. The same runtime state should report hit/miss/blocked summaries at
+test end so users can see which generated preferences still need attention.
+
+TODO: add capped walking-one and walking-zero auto coverage goals for wide
+numeric fields. These should be preferences, not hard constraints, and should
+use a cap/stride policy so large buses get meaningful bit-position pressure
+without exploding the number of generated goals or pairwise crosses. This is
+separate from full-width min/max support for `>64`-bit fields, which requires
+wide solver/model extraction before the endpoints can be represented safely.
 
 Declared covergroup crosses are separate from these solver preferences:
 `cross cp_a, cp_b, ...` is a functional coverage declaration. It is sampled at
