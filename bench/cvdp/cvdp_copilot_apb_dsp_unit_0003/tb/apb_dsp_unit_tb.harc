@@ -1,0 +1,406 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_apb_dsp_unit_0003`.
+//
+// DUT: apb_dsp_unit behind the generated `apb_dsp_unit_top` wrapper.
+// APB transactions complete when pselx && penable is sampled on clk.
+// CSR map:
+//   0 operand_1, 1 operand_2, 2 enable, 3 write_address,
+//   4 write_data, 5 result.
+//
+// Strategy:
+//   - reset and idle baseline
+//   - directed APB writes/reads across every valid CSR
+//   - invalid CSR accesses outside 0x0..0x5
+//   - malformed handshakes where pselx or penable is missing
+//   - SRAM write-mode loads followed by addition and multiplication
+//   - mid-test reset and post-reset resume
+//   - constrained-random APB address/data/mode/control sweeps using
+//     keep constraints, randomize-with constraints, relation inlining,
+//     field range/dist metadata, explicit covergroup crosses, and the
+//     transaction auto-coverage hooks emitted by HARC.
+//
+// Limitation: paddr is only 10 bits, so the RTL branch `paddr > MEM_SIZE`
+// under MODE_WRITE compares against 1024 and is structurally unreachable.
+
+transaction ApbStim
+    addr : uint<10> with [dist {[0..5] :/ 70, [6..1023] :/ 30}]
+    data : uint<8> with [dist {[0..0] :/ 10, [1..254] :/ 70, [255..255] :/ 20}]
+    mode : uint<8> with [range(0, 7)]
+    write : uint<1>
+    sel : uint<1>
+    enable : uint<1>
+
+    keep mode in [0..7]
+end transaction ApbStim
+
+relation LegalCsr(t: ApbStim) = t.addr in [0..5]
+relation InvalidCsr(t: ApbStim) = t.addr > 5
+relation ProperApb(t: ApbStim)
+    t.sel == 1
+    t.enable == 1
+end relation ProperApb
+
+covergroup ApbDspCov @(posedge dut.clk)
+    cp_addr : cover dut.paddr
+        bins
+            operand1 = {0}
+            operand2 = {1}
+            enable = {2}
+            write_addr = {3}
+            write_data = {4}
+            result = {5}
+            invalid_low = [6..255]
+            invalid_high = [256..1023]
+        end bins
+
+    cp_write : cover dut.pwrite
+        bins
+            read = {0}
+            write = {1}
+        end bins
+
+    cp_handshake : cover ((dut.pselx << 1) | dut.penable)
+        bins
+            idle = {0}
+            enable_only = {1}
+            setup_only = {2}
+            active_txn = {3}
+        end bins
+
+    cp_mode_data : cover dut.pwdata
+        bins
+            disabled = {0}
+            add = {1}
+            mult = {2}
+            mem_write = {3}
+            invalid_mode = [4..255]
+        end bins
+
+    cp_prdata : cover dut.prdata
+        bins
+            zero = {0}
+            low = [1..15]
+            mid = [16..254]
+            max = {255}
+        end bins
+
+    cp_ready : cover dut.pready
+        bins
+            low = {0}
+            high = {1}
+        end bins
+
+    cp_error : cover dut.pslverr
+        bins
+            clear = {0}
+            set = {1}
+        end bins
+
+    cross cp_addr, cp_write
+    cross cp_write, cp_error
+    cross cp_handshake, cp_error
+end covergroup ApbDspCov
+
+function apb_idle(dut: apb_dsp_unit_top)
+    dut.pselx = 0
+    dut.penable = 0
+    dut.pwrite = 0
+    dut.paddr = 0
+    dut.pwdata = 0
+    wait 1 cycle
+end function apb_idle
+
+function apb_write(dut: apb_dsp_unit_top, addr: uint<10>, data: uint<8>)
+    dut.paddr = addr
+    dut.pwdata = data
+    dut.pwrite = 1
+    dut.pselx = 1
+    dut.penable = 0
+    wait 1 cycle
+    dut.penable = 1
+    wait 1 cycle
+    assert dut.pready == 1
+        else fail("apb_write addr=0x${addr:03x}: pready was not asserted")
+    dut.pselx = 0
+    dut.penable = 0
+    dut.pwrite = 0
+    wait 1 cycle
+end function apb_write
+
+function apb_read(dut: apb_dsp_unit_top, addr: uint<10>) -> uint<8>
+    dut.paddr = addr
+    dut.pwdata = 0
+    dut.pwrite = 0
+    dut.pselx = 1
+    dut.penable = 0
+    wait 1 cycle
+    dut.penable = 1
+    wait 1 cycle
+    assert dut.pready == 1
+        else fail("apb_read addr=0x${addr:03x}: pready was not asserted")
+    let val = dut.prdata
+    dut.pselx = 0
+    dut.penable = 0
+    wait 1 cycle
+    return val
+end function apb_read
+
+function sram_store(dut: apb_dsp_unit_top, addr: uint<8>, data: uint<8>)
+    apb_write(dut, 2, 3)
+    apb_write(dut, 3, addr)
+    apb_write(dut, 4, data)
+    dut.sram_valid = 0
+    wait 1 cycle
+    dut.sram_valid = 1
+    wait 1 cycle
+    dut.sram_valid = 0
+    wait 1 cycle
+end function sram_store
+
+testbench ApbDspTb
+    dut : apb_dsp_unit_top
+    cov : ApbDspCov
+end testbench ApbDspTb
+
+impl ApbDspTest for ApbDspTb
+    run
+        log(info, "apb_dsp_unit: APB CSR, SRAM, arithmetic, constraints, and coverage")
+
+        dut.presetn = 0
+        dut.paddr = 0
+        dut.pselx = 0
+        dut.penable = 0
+        dut.pwrite = 0
+        dut.pwdata = 0
+        dut.sram_valid = 0
+        wait 3 cycles
+        assert dut.pready == 0 else fail("reset: pready expected 0")
+        assert dut.pslverr == 0 else fail("reset: pslverr expected 0")
+        assert dut.prdata == 0 else fail("reset: prdata expected 0")
+        dut.presetn = 1
+        wait 1 cycle
+
+        apb_write(dut, 0, 0x00)
+        apb_write(dut, 1, 0xFF)
+        apb_write(dut, 2, 0x00)
+        apb_write(dut, 3, 0x55)
+        apb_write(dut, 4, 0xAA)
+        assert apb_read(dut, 0) == 0x00 else fail("CSR0 readback mismatch")
+        assert apb_read(dut, 1) == 0xFF else fail("CSR1 readback mismatch")
+        assert apb_read(dut, 2) == 0x00 else fail("CSR2 readback mismatch")
+        assert apb_read(dut, 3) == 0x55 else fail("CSR3 readback mismatch")
+        assert apb_read(dut, 4) == 0xAA else fail("CSR4 readback mismatch")
+
+        apb_write(dut, 0, 0xFF)
+        apb_write(dut, 1, 0x00)
+        apb_write(dut, 2, 0x07)
+        apb_write(dut, 3, 0x00)
+        apb_write(dut, 4, 0xFF)
+        assert apb_read(dut, 2) == 0x07 else fail("invalid mode CSR readback mismatch")
+
+        dut.paddr = 0
+        dut.pwdata = 0x33
+        dut.pwrite = 1
+        dut.pselx = 1
+        dut.penable = 0
+        wait 1 cycle
+        dut.pselx = 0
+        dut.penable = 1
+        wait 1 cycle
+        dut.penable = 0
+        wait 1 cycle
+        assert apb_read(dut, 0) == 0xFF
+            else fail("malformed handshake unexpectedly changed operand_1")
+
+        apb_write(dut, 2, 0)
+        dut.paddr = 0x3FF
+        dut.pwrite = 0
+        dut.pselx = 1
+        dut.penable = 0
+        wait 1 cycle
+        dut.penable = 1
+        wait 1 cycle
+        assert dut.pslverr == 1
+            else fail("invalid CSR read did not raise pslverr")
+        dut.pselx = 0
+        dut.penable = 0
+        wait 1 cycle
+        assert dut.pslverr == 0
+            else fail("pslverr did not clear after invalid CSR access")
+
+        dut.paddr = 0x200
+        dut.pwdata = 0x44
+        dut.pwrite = 1
+        dut.pselx = 1
+        dut.penable = 0
+        wait 1 cycle
+        dut.penable = 1
+        wait 1 cycle
+        assert dut.pslverr == 1
+            else fail("invalid CSR write did not raise pslverr")
+        apb_idle(dut)
+
+        sram_store(dut, 0x10, 0x12)
+        sram_store(dut, 0x11, 0x34)
+        sram_store(dut, 0xFE, 0xFF)
+        apb_write(dut, 2, 3)
+        assert apb_read(dut, 0x10) == 0x12
+            else fail("memory read @0x10 mismatch in write mode")
+        assert apb_read(dut, 0x11) == 0x34
+            else fail("memory read @0x11 mismatch in write mode")
+
+        apb_write(dut, 0, 0x10)
+        apb_write(dut, 1, 0x11)
+        apb_write(dut, 2, 1)
+        wait 2 cycles
+        assert apb_read(dut, 5) == 0x46
+            else fail("addition result mismatch")
+
+        apb_write(dut, 0, 0xFE)
+        apb_write(dut, 1, 0x11)
+        apb_write(dut, 2, 1)
+        wait 2 cycles
+        assert apb_read(dut, 5) == 0x33
+            else fail("overflow addition result mismatch")
+
+        apb_write(dut, 0, 0x10)
+        apb_write(dut, 1, 0x11)
+        apb_write(dut, 2, 2)
+        wait 2 cycles
+        assert apb_read(dut, 5) == 0xA8
+            else fail("multiplication result mismatch")
+
+        apb_write(dut, 2, 0)
+        wait 2 cycles
+        assert apb_read(dut, 5) == 0xA8
+            else fail("disabled mode changed result unexpectedly")
+
+        dut.presetn = 0
+        wait 2 cycles
+        assert dut.pready == 0 else fail("mid-reset: pready expected 0")
+        assert dut.pslverr == 0 else fail("mid-reset: pslverr expected 0")
+        assert dut.prdata == 0 else fail("mid-reset: prdata expected 0")
+        dut.presetn = 1
+        wait 1 cycle
+        assert apb_read(dut, 0) == 0 else fail("post-reset CSR0 not cleared")
+        assert apb_read(dut, 1) == 0 else fail("post-reset CSR1 not cleared")
+        assert apb_read(dut, 2) == 0 else fail("post-reset CSR2 not cleared")
+
+        sram_store(dut, 0xFF, 0x7E)
+        apb_write(dut, 2, 3)
+        assert apb_read(dut, 0xFF) == 0x7E
+            else fail("memory read @0xff mismatch")
+
+        for k in 0 .. 24
+            let t : ApbStim
+            randomize(t) with
+                LegalCsr(t)
+                ProperApb(t)
+                t.mode in [0..3]
+            end randomize
+
+            apb_write(dut, 2, t.mode)
+            if t.write == 1
+                apb_write(dut, t.addr, t.data)
+            else
+                let rv = apb_read(dut, t.addr)
+                assert dut.pslverr == 0
+                    else fail("legal random read k=${k} addr=0x${t.addr:03x} raised pslverr")
+            end if
+        end for
+
+        for k in 0 .. 16
+            let t : ApbStim
+            randomize(t) with
+                InvalidCsr(t)
+                ProperApb(t)
+                t.mode in [0..2]
+            end randomize
+
+            apb_write(dut, 2, t.mode)
+            dut.paddr = t.addr
+            dut.pwdata = t.data
+            dut.pwrite = t.write
+            dut.pselx = 1
+            dut.penable = 0
+            wait 1 cycle
+            dut.penable = 1
+            wait 1 cycle
+            assert dut.pslverr == 1
+                else fail("invalid random APB k=${k} addr=0x${t.addr:03x} did not raise pslverr")
+            apb_idle(dut)
+        end for
+
+        for k in 0 .. 12
+            let t : ApbStim
+            randomize(t) with
+                t.sel == 0 || t.enable == 0
+            end randomize
+
+            dut.paddr = t.addr
+            dut.pwdata = t.data
+            dut.pwrite = t.write
+            dut.pselx = t.sel
+            dut.penable = t.enable
+            wait 1 cycle
+            assert dut.pslverr == 0
+                else fail("malformed random APB k=${k} raised pslverr without apb_valid")
+        end for
+
+        for m in 0 .. 8
+            apb_write(dut, 2, m as uint<8>)
+            wait 1 cycle
+        end for
+
+        // Toggle high bits of r_enable and pulse sram_valid while not in
+        // MODE_WRITE to cover the no-write side of the SRAM-valid block.
+        apb_write(dut, 2, 0xF8)
+        dut.sram_valid = 0
+        wait 1 cycle
+        dut.sram_valid = 1
+        wait 1 cycle
+        dut.sram_valid = 0
+        wait 1 cycle
+        apb_write(dut, 2, 0xFF)
+        wait 1 cycle
+        apb_write(dut, 2, 0)
+        wait 1 cycle
+
+        log(info, "ALL TESTS PASSED - apb_dsp_unit")
+    end run
+
+    check
+        cov.report()
+
+        assert cov.cp_addr.operand1 > 0 else fail("coverage hole: addr operand1")
+        assert cov.cp_addr.operand2 > 0 else fail("coverage hole: addr operand2")
+        assert cov.cp_addr.enable > 0 else fail("coverage hole: addr enable")
+        assert cov.cp_addr.write_addr > 0 else fail("coverage hole: addr write_addr")
+        assert cov.cp_addr.write_data > 0 else fail("coverage hole: addr write_data")
+        assert cov.cp_addr.result > 0 else fail("coverage hole: addr result")
+        assert cov.cp_addr.invalid_low > 0 else fail("coverage hole: addr invalid_low")
+        assert cov.cp_addr.invalid_high > 0 else fail("coverage hole: addr invalid_high")
+
+        assert cov.cp_write.read > 0 else fail("coverage hole: APB read")
+        assert cov.cp_write.write > 0 else fail("coverage hole: APB write")
+        assert cov.cp_handshake.idle > 0 else fail("coverage hole: handshake idle")
+        assert cov.cp_handshake.enable_only > 0 else fail("coverage hole: handshake enable_only")
+        assert cov.cp_handshake.setup_only > 0 else fail("coverage hole: handshake setup_only")
+        assert cov.cp_handshake.active_txn > 0 else fail("coverage hole: handshake active")
+
+        assert cov.cp_mode_data.disabled > 0 else fail("coverage hole: mode disabled")
+        assert cov.cp_mode_data.add > 0 else fail("coverage hole: mode add")
+        assert cov.cp_mode_data.mult > 0 else fail("coverage hole: mode mult")
+        assert cov.cp_mode_data.mem_write > 0 else fail("coverage hole: mode mem_write")
+        assert cov.cp_mode_data.invalid_mode > 0 else fail("coverage hole: invalid mode data")
+
+        assert cov.cp_prdata.zero > 0 else fail("coverage hole: prdata zero")
+        assert cov.cp_prdata.low > 0 else fail("coverage hole: prdata low")
+        assert cov.cp_prdata.mid > 0 else fail("coverage hole: prdata mid")
+        assert cov.cp_prdata.max > 0 else fail("coverage hole: prdata max")
+
+        assert cov.cp_ready.low > 0 else fail("coverage hole: pready low")
+        assert cov.cp_ready.high > 0 else fail("coverage hole: pready high")
+        assert cov.cp_error.clear > 0 else fail("coverage hole: pslverr clear")
+        assert cov.cp_error.set > 0 else fail("coverage hole: pslverr set")
+    end check
+end impl ApbDspTest
