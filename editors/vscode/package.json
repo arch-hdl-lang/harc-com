@@ -1,0 +1,29 @@
+{
+  "name": "harc",
+  "displayName": "HARC verification language",
+  "description": "Syntax highlighting for HARC (.harc files) — verification language sister to ARCH",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.70.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "harc",
+        "aliases": ["HARC", "harc"],
+        "extensions": [".harc"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "harc",
+        "scopeName": "source.harc",
+        "path": "./syntaxes/harc.tmLanguage.json"
+      }
+    ]
+  }
+}

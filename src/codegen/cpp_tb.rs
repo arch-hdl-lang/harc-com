@@ -10811,6 +10811,25 @@ pub fn uses_constraint_solver(file: &SourceFile) -> bool {
     fn block(b: &Block, solver_bearing: &std::collections::HashSet<&str>) -> bool {
         b.stmts.iter().any(|s| stmt(s, solver_bearing))
     }
+    fn component_item(
+        item: &ComponentItem,
+        solver_bearing: &std::collections::HashSet<&str>,
+    ) -> bool {
+        match item {
+            ComponentItem::OnHandler(h) => block(&h.body, solver_bearing),
+            ComponentItem::Hookable(h) => block(&h.body, solver_bearing),
+            ComponentItem::Watchdog(w) => block(&w.body, solver_bearing),
+            _ => false,
+        }
+    }
+    fn component_items(
+        items: &[ComponentItem],
+        solver_bearing: &std::collections::HashSet<&str>,
+    ) -> bool {
+        items
+            .iter()
+            .any(|item| component_item(item, solver_bearing))
+    }
     fn stmt(s: &Stmt, solver_bearing: &std::collections::HashSet<&str>) -> bool {
         match &s.kind {
             StmtKind::Randomize { with_body, .. } => {
@@ -10839,6 +10858,16 @@ pub fn uses_constraint_solver(file: &SourceFile) -> bool {
     }
     file.items.iter().any(|it| match it {
         Item::Function(f) => block(&f.body, &solver_bearing),
+        Item::Tseq(t) => block(&t.body, &solver_bearing),
+        Item::Agent(c) | Item::Env(c) | Item::Scoreboard(c) | Item::Sequencer(c) => {
+            component_items(&c.items, &solver_bearing)
+        }
+        Item::Transactor(t) => {
+            component_items(&t.items, &solver_bearing)
+                || t.when_active
+                    .as_ref()
+                    .map_or(false, |items| component_items(items, &solver_bearing))
+        }
         Item::Test(t) => t.items.iter().any(|ti| match ti {
             TestItem::Stmt(s) => stmt(s, &solver_bearing),
             TestItem::Scope(sc) => {
@@ -12881,6 +12910,9 @@ fn txn_field_has_solver_policy(f: &Field) -> bool {
         TypeExpr::Builtin { name, args, .. } => match name {
             BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => true,
             BuiltinTy::Bits => type_arg_width(args) == Some(1),
+            BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::SInt | BuiltinTy::SIntCap => {
+                type_arg_width(args).is_some_and(|w| w <= 64)
+            }
             _ => false,
         },
         // Named transaction fields may be enums; treat them as solver-bearing
