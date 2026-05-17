@@ -2228,6 +2228,7 @@ impl AutoCoverageValue {
 
 const COVERGROUP_AUTO_CROSS_BIN_CAP: usize = 64;
 const COVERGROUP_CROSS_MISSING_DETAIL_LIMIT: usize = 16;
+const AUTO_COVERAGE_WALKING_BIT_CAP: usize = 16;
 
 struct DeclaredCoverCross<'a> {
     storage: String,
@@ -2415,6 +2416,35 @@ fn field_attr_unique(f: &TxnFieldInfo) -> bool {
     f.attrs.iter().any(|a| a.name.name == "unique")
 }
 
+fn push_auto_coverage_value_unique(values: &mut Vec<AutoCoverageValue>, value: AutoCoverageValue) {
+    if !values.iter().any(|v| v.c_expr == value.c_expr) {
+        values.push(value);
+    }
+}
+
+fn walking_auto_coverage_bit_positions(width: u32) -> Vec<u32> {
+    if width == 0 || width > 64 {
+        return Vec::new();
+    }
+    let width_usize = width as usize;
+    let count = width_usize.min(AUTO_COVERAGE_WALKING_BIT_CAP);
+    if count == width_usize {
+        return (0..width).collect();
+    }
+
+    let mut positions = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let max_pos = width_usize - 1;
+    let max_idx = count - 1;
+    for i in 0..count {
+        let pos = (i * max_pos + (max_idx / 2)) / max_idx;
+        if seen.insert(pos) {
+            positions.push(pos as u32);
+        }
+    }
+    positions
+}
+
 fn natural_auto_coverage_endpoints(f: &TxnFieldInfo) -> Vec<AutoCoverageValue> {
     if f.width == 0 || f.width > 64 {
         return Vec::new();
@@ -2443,9 +2473,13 @@ fn natural_auto_coverage_endpoints(f: &TxnFieldInfo) -> Vec<AutoCoverageValue> {
         } else {
             (1u64 << f.width) - 1
         };
-        let mut values = vec![AutoCoverageValue::unsigned(0)];
-        if hi != 0 {
-            values.push(AutoCoverageValue::unsigned(hi));
+        let mut values = Vec::new();
+        push_auto_coverage_value_unique(&mut values, AutoCoverageValue::unsigned(0));
+        push_auto_coverage_value_unique(&mut values, AutoCoverageValue::unsigned(hi));
+        for bit in walking_auto_coverage_bit_positions(f.width) {
+            let one = 1u64 << bit;
+            push_auto_coverage_value_unique(&mut values, AutoCoverageValue::unsigned(one));
+            push_auto_coverage_value_unique(&mut values, AutoCoverageValue::unsigned(hi ^ one));
         }
         values
     }
