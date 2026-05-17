@@ -2080,15 +2080,19 @@ end test NaturalEndpointAutoCovTest"#,
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
-        cpp.contains("_addr[2]")
+        cpp.contains("_addr[18]")
             && cpp.contains("_delta[2]")
             && cpp.contains("T.addr=0")
             && cpp.contains("T.addr=255")
+            && cpp.contains("T.addr=1")
+            && cpp.contains("T.addr=128")
+            && cpp.contains("T.addr=254")
+            && cpp.contains("T.addr=127")
             && cpp.contains("T.delta=-8")
             && cpp.contains("T.delta=7")
-            && cpp.contains("{0ULL, 255ULL}")
+            && cpp.contains("{0ULL, 255ULL, 1ULL, 254ULL, 2ULL, 253ULL")
             && cpp.contains("{(uint64_t)(-8LL), 7ULL}"),
-        "natural numeric min/max endpoints should feed auto coverage preferences without redundant [range] attrs; got:\n{cpp}",
+        "natural numeric min/max and walking-bit endpoints should feed auto coverage preferences without redundant [range] attrs; got:\n{cpp}",
     );
 }
 
@@ -2112,6 +2116,36 @@ end test WideEndpointAutoCovTest"#,
     assert!(
         !cpp.contains("_data[2]") && !cpp.contains("T.data=340282366920938463463374607431768211455"),
         ">64-bit fields should not get bogus low-64 auto coverage endpoints until solver lowering supports full-width values; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn walking_auto_coverage_caps_wide_numeric_fields() {
+    let parsed = parse_source(
+        r#"transaction T
+    data : uint<32>
+end transaction T
+
+test WalkingAutoCovPrefTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test WalkingAutoCovPrefTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("_data[34]")
+            && cpp.contains("T.data=0")
+            && cpp.contains("T.data=4294967295")
+            && cpp.contains("T.data=1")
+            && cpp.contains("T.data=4294967294")
+            && cpp.contains("T.data=2147483648")
+            && cpp.contains("T.data=2147483647")
+            && !cpp.contains("_data[66]"),
+        "uint<32> should get min/max plus capped walking-one/walking-zero goals, not every bit twice without a cap; got:\n{cpp}",
     );
 }
 
