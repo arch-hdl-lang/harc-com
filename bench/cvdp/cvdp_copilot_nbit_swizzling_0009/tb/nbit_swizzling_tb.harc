@@ -21,50 +21,46 @@ function swizzle_model(d: uint<64>, sel: uint<2>) -> uint<64>
             let src = (d >> (63 - i)) & 1
             result = result | (src << i)
         end for
+    elsif sel == 1
+        // Two halves of 32 bits each, reverse within each
+        for i in 0 .. 32
+            let lo_src = (d >> (31 - i)) & 1
+            let hi_src = (d >> (63 - i)) & 1
+            result = result | (lo_src << i)
+            result = result | (hi_src << (32 + i))
+        end for
+    elsif sel == 2
+        // Four chunks of 16 bits each
+        for i in 0 .. 16
+            let q0 = (d >> (15 - i)) & 1
+            let q1 = (d >> (31 - i)) & 1
+            let q2 = (d >> (47 - i)) & 1
+            let q3 = (d >> (63 - i)) & 1
+            result = result | (q0 << i)
+            result = result | (q1 << (16 + i))
+            result = result | (q2 << (32 + i))
+            result = result | (q3 << (48 + i))
+        end for
     else
-        if sel == 1
-            // Two halves of 32 bits each, reverse within each
-            for i in 0 .. 32
-                let lo_src = (d >> (31 - i)) & 1
-                let hi_src = (d >> (63 - i)) & 1
-                result = result | (lo_src << i)
-                result = result | (hi_src << (32 + i))
-            end for
-        else
-            if sel == 2
-                // Four chunks of 16 bits each
-                for i in 0 .. 16
-                    let q0 = (d >> (15 - i)) & 1
-                    let q1 = (d >> (31 - i)) & 1
-                    let q2 = (d >> (47 - i)) & 1
-                    let q3 = (d >> (63 - i)) & 1
-                    result = result | (q0 << i)
-                    result = result | (q1 << (16 + i))
-                    result = result | (q2 << (32 + i))
-                    result = result | (q3 << (48 + i))
-                end for
-            else
-                // sel == 3: eight chunks of 8 bits each
-                for i in 0 .. 8
-                    let e0 = (d >> (7  - i)) & 1
-                    let e1 = (d >> (15 - i)) & 1
-                    let e2 = (d >> (23 - i)) & 1
-                    let e3 = (d >> (31 - i)) & 1
-                    let e4 = (d >> (39 - i)) & 1
-                    let e5 = (d >> (47 - i)) & 1
-                    let e6 = (d >> (55 - i)) & 1
-                    let e7 = (d >> (63 - i)) & 1
-                    result = result | (e0 << i)
-                    result = result | (e1 << (8  + i))
-                    result = result | (e2 << (16 + i))
-                    result = result | (e3 << (24 + i))
-                    result = result | (e4 << (32 + i))
-                    result = result | (e5 << (40 + i))
-                    result = result | (e6 << (48 + i))
-                    result = result | (e7 << (56 + i))
-                end for
-            end if
-        end if
+        // sel == 3: eight chunks of 8 bits each
+        for i in 0 .. 8
+            let e0 = (d >> (7  - i)) & 1
+            let e1 = (d >> (15 - i)) & 1
+            let e2 = (d >> (23 - i)) & 1
+            let e3 = (d >> (31 - i)) & 1
+            let e4 = (d >> (39 - i)) & 1
+            let e5 = (d >> (47 - i)) & 1
+            let e6 = (d >> (55 - i)) & 1
+            let e7 = (d >> (63 - i)) & 1
+            result = result | (e0 << i)
+            result = result | (e1 << (8  + i))
+            result = result | (e2 << (16 + i))
+            result = result | (e3 << (24 + i))
+            result = result | (e4 << (32 + i))
+            result = result | (e5 << (40 + i))
+            result = result | (e6 << (48 + i))
+            result = result | (e7 << (56 + i))
+        end for
     end if
     return result
 end function swizzle_model
