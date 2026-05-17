@@ -42,7 +42,8 @@ enum Cmd {
     /// - `--sv <file.sv>` (one or more) — Verilator-compiled SV DUT path
     ///   (interop). HARC emits a C++ TB and invokes Verilator directly to
     ///   build and run, no `arch` involvement at simulation time. The SV
-    ///   may itself come from `arch build`.
+    ///   may itself come from `arch build`. Verilator control files may be
+    ///   passed separately with `--vlt <file.vlt>`.
     ///
     /// Pass exactly one of `--dut` or `--sv`. Multiple `.harc` input files
     /// may be passed — useful when scopes are split across files via
@@ -60,6 +61,10 @@ enum Cmd {
         /// bypassing `arch sim`. Conflicts with `--dut`.
         #[arg(long)]
         sv: Vec<PathBuf>,
+        /// Verilator control file(s), typically `.vlt` waivers or coverage
+        /// controls. Forwarded to Verilator before the SV DUT files.
+        #[arg(long, conflicts_with = "dut")]
+        vlt: Vec<PathBuf>,
         /// SV top-module name (Verilator `--top-module`). Defaults to the
         /// type of `let dut : <Type>` in the HARC source.
         #[arg(long)]
@@ -216,6 +221,7 @@ fn main() -> Result<()> {
             files,
             dut,
             sv,
+            vlt,
             top,
             test,
             outdir,
@@ -237,6 +243,7 @@ fn main() -> Result<()> {
                     files.clone(),
                     dut.clone(),
                     sv.clone(),
+                    vlt.clone(),
                     top.clone(),
                     test.clone(),
                     outdir.clone(),
@@ -840,6 +847,7 @@ fn absolutize_trace_path(path: &Path) -> Result<PathBuf> {
 fn run_verilator(
     top: &str,
     sv: &[PathBuf],
+    vlt: &[PathBuf],
     cpp: &PathBuf,
     outdir_abs: &PathBuf,
     sim_log_path: &PathBuf,
@@ -974,6 +982,9 @@ fn run_verilator(
             lib.display()
         ));
     }
+    for control in vlt {
+        args.push(control.display().to_string());
+    }
     for s in sv {
         args.push(s.display().to_string());
     }
@@ -1055,6 +1066,7 @@ fn cmd_sim(
     files: Vec<PathBuf>,
     dut: Vec<PathBuf>,
     sv: Vec<PathBuf>,
+    vlt: Vec<PathBuf>,
     top: Option<String>,
     test: Option<String>,
     outdir: Option<PathBuf>,
@@ -1160,6 +1172,10 @@ fn cmd_sim(
         for s in &sv {
             sv_abs.push(fs::canonicalize(s).into_diagnostic()?);
         }
+        let mut vlt_abs = Vec::with_capacity(vlt.len());
+        for control in &vlt {
+            vlt_abs.push(fs::canonicalize(control).into_diagnostic()?);
+        }
 
         // If the test's `let dut : T` carries `probe` declarations,
         // emit the SV bind stub alongside the .cpp and prepend it
@@ -1186,6 +1202,7 @@ fn cmd_sim(
         return run_verilator(
             &top_name,
             &sv_abs,
+            &vlt_abs,
             &cpp_abs,
             &outdir_abs,
             &sim_log_path,

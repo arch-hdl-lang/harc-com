@@ -1,0 +1,275 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_apb_dsp_op_0006`.
+//
+// Stresses 32-bit APB/SRAM/DSP payloads with natural walking auto coverage.
+// The wrapper exposes `clk` for the DSP clock and a separate APB `PCLK`; APB
+// transfers below drive `PCLK` explicitly over HARC cycles.
+
+transaction ApbDspOpStim
+    addr : uint<8>
+    data : uint<32>
+    write : bool
+end transaction ApbDspOpStim
+
+relation ValidApbAddr(t: ApbDspOpStim) =
+    t.addr inside {0, 4, 8, 12, 16, 20, 24}
+
+covergroup ApbDspOpCov @(posedge dut.clk)
+    cp_addr : cover dut.PADDR
+        bins
+            op_a = {0}
+            op_b = {4}
+            op_c = {8}
+            op_o = {12}
+            control = {16}
+            wdata = {20}
+            sram_addr = {24}
+            invalid = [25..255]
+        end bins
+
+    cp_data : cover dut.PWDATA
+        bins
+            zero = {0}
+            one = {1}
+            high_bit = {2147483648}
+            ones = {4294967295}
+            small = [2..63]
+            mid = [64..65535]
+        end bins
+
+    cp_write : cover dut.PWRITE
+        bins
+            read = {0}
+            write = {1}
+        end bins
+
+    cp_handshake : cover ((dut.PSEL << 1) | dut.PENABLE)
+        bins
+            idle = {0}
+            enable_only = {1}
+            setup_only = {2}
+            active = {3}
+        end bins
+
+    cp_error : cover dut.PSLVERR
+        bins
+            clear = {0}
+            set = {1}
+        end bins
+
+    cross cp_addr, cp_write
+    cross cp_write, cp_error
+end covergroup ApbDspOpCov
+
+testbench ApbDspOpTb
+    dut : apb_dsp_op_top
+    cov : ApbDspOpCov
+end testbench ApbDspOpTb
+
+function pclk_tick(dut: apb_dsp_op_top)
+    dut.PCLK = 0
+    wait 1 cycle
+    dut.PCLK = 1
+    wait 1 cycle
+    dut.PCLK = 0
+    wait 1 cycle
+end function pclk_tick
+
+function apb_idle(dut: apb_dsp_op_top)
+    dut.PSEL = 0
+    dut.PENABLE = 0
+    dut.PWRITE = 0
+    dut.PADDR = 0
+    dut.PWDATA = 0
+    pclk_tick(dut)
+end function apb_idle
+
+function apb_write(dut: apb_dsp_op_top, addr: uint<8>, data: uint<32>)
+    dut.PADDR = addr
+    dut.PWDATA = data
+    dut.PWRITE = 1
+    dut.PSEL = 1
+    dut.PENABLE = 0
+    pclk_tick(dut)
+    dut.PENABLE = 1
+    pclk_tick(dut)
+    assert dut.PREADY == 1 else fail("apb_write addr=0x${addr:02x}: PREADY low")
+    dut.PSEL = 0
+    dut.PENABLE = 0
+    dut.PWRITE = 0
+    pclk_tick(dut)
+end function apb_write
+
+function apb_read(dut: apb_dsp_op_top, addr: uint<8>) -> uint<32>
+    dut.PADDR = addr
+    dut.PWDATA = 0
+    dut.PWRITE = 0
+    dut.PSEL = 1
+    dut.PENABLE = 0
+    pclk_tick(dut)
+    dut.PENABLE = 1
+    pclk_tick(dut)
+    let val = dut.PRDATA
+    dut.PSEL = 0
+    dut.PENABLE = 0
+    pclk_tick(dut)
+    return val
+end function apb_read
+
+function apb_enable_only(dut: apb_dsp_op_top, addr: uint<8>, data: uint<32>, write: bool)
+    dut.PADDR = addr
+    dut.PWDATA = data
+    dut.PWRITE = write
+    dut.PSEL = 0
+    dut.PENABLE = 1
+    pclk_tick(dut)
+    dut.PENABLE = 0
+    pclk_tick(dut)
+end function apb_enable_only
+
+function dsp_wait(dut: apb_dsp_op_top, n: uint<8>)
+    for _ in 0 .. n
+        wait 1 cycle
+    end for
+end function dsp_wait
+
+function sram_write(dut: apb_dsp_op_top, addr: uint<32>, data: uint<32>)
+    apb_write(dut, 20, data)
+    apb_write(dut, 24, addr)
+    apb_write(dut, 16, 1)
+    dsp_wait(dut, 4)
+end function sram_write
+
+function sram_read_mode(dut: apb_dsp_op_top, addr: uint<32>)
+    apb_write(dut, 24, addr)
+    apb_write(dut, 16, 2)
+    dsp_wait(dut, 6)
+end function sram_read_mode
+
+impl ApbDspOpTest for ApbDspOpTb
+    run
+        log(info, "apb_dsp_op: APB/DSP/SRAM walking-data stimulus")
+
+        dut.en_clk_dsp = 0
+        dut.PCLK = 0
+        dut.PRESETn = 0
+        dut.PADDR = 0
+        dut.PWRITE = 0
+        dut.PWDATA = 0
+        dut.PSEL = 0
+        dut.PENABLE = 0
+        wait 3 cycles
+        pclk_tick(dut)
+        assert dut.PREADY == 0 else fail("reset: PREADY expected low")
+        dut.PRESETn = 1
+        wait 2 cycles
+
+        apb_write(dut, 0, 0)
+        apb_write(dut, 4, 1)
+        apb_write(dut, 8, 2)
+        apb_write(dut, 12, 3)
+        apb_write(dut, 16, 0)
+        apb_write(dut, 20, 0x12345678)
+        apb_write(dut, 24, 0)
+        let _ra0 = apb_read(dut, 0)
+        let _rb0 = apb_read(dut, 4)
+        let _rc0 = apb_read(dut, 8)
+        let _ro0 = apb_read(dut, 12)
+        let _rctl0 = apb_read(dut, 16)
+        assert apb_read(dut, 20) == 0x12345678 else fail("WDATA register readback mismatch")
+
+        sram_write(dut, 0, 3)
+        sram_write(dut, 1, 4)
+        sram_write(dut, 2, 5)
+        sram_write(dut, 63, 0xFFFFFFFF)
+        sram_read_mode(dut, 0)
+        let _r0 = apb_read(dut, 0)
+
+        apb_write(dut, 0, 0)
+        apb_write(dut, 16, 3)
+        dsp_wait(dut, 4)
+        apb_write(dut, 4, 1)
+        apb_write(dut, 16, 4)
+        dsp_wait(dut, 4)
+        apb_write(dut, 8, 2)
+        apb_write(dut, 16, 5)
+        dsp_wait(dut, 4)
+        apb_write(dut, 12, 3)
+        apb_write(dut, 16, 6)
+        dsp_wait(dut, 6)
+        sram_read_mode(dut, 3)
+        let _res = apb_read(dut, 12)
+
+        dut.en_clk_dsp = 1
+        wait 6 cycles
+        dut.en_clk_dsp = 0
+        wait 2 cycles
+
+        // Invalid APB register access.
+        apb_write(dut, 0x80, 0xDEADBEEF)
+        assert dut.PSLVERR == 1 else fail("invalid APB write did not raise PSLVERR")
+        apb_idle(dut)
+        apb_enable_only(dut, 0x80, 0x80000000, true)
+
+        // Invalid SRAM address under SRAM_WRITE should also raise PSLVERR.
+        apb_write(dut, 24, 64)
+        apb_write(dut, 16, 1)
+        apb_write(dut, 20, 0x55AA55AA)
+        assert dut.PSLVERR == 1 else fail("invalid SRAM address did not raise PSLVERR")
+        apb_idle(dut)
+
+        // Invalid SRAM address under DSP_WRITE_OP_O exercises the other
+        // high-address error condition in the APB-side checker.
+        apb_write(dut, 12, 64)
+        apb_write(dut, 16, 6)
+        dsp_wait(dut, 4)
+        let _bad_o = apb_read(dut, 12)
+        assert dut.PSLVERR == 1 else fail("invalid DSP write-back address did not raise PSLVERR")
+        apb_idle(dut)
+
+        for bit in 0 .. 16
+            let one : uint<32> = ((1 as uint<32>) << bit).trunc<32>()
+            sram_write(dut, bit as uint<32>, one)
+            sram_write(dut, (31 - bit) as uint<32>, (0xFFFFFFFF ^ one).trunc<32>())
+        end for
+        sram_write(dut, 32, 0x80000000)
+        sram_write(dut, 33, 0x7FFFFFFF)
+
+        for k in 0 .. 32
+            let t : ApbDspOpStim
+            randomize(t) with ValidApbAddr(t) end randomize
+            if t.write
+                apb_write(dut, t.addr, t.data)
+            else
+                let _v = apb_read(dut, t.addr)
+            end if
+        end for
+
+        for k in 0 .. 34
+            let t : ApbDspOpStim
+            randomize(t) with
+                t.addr == 20
+            end randomize
+            apb_write(dut, 20, t.data)
+        end for
+
+        for addr in 0 .. 7
+            let reg_addr : uint<8> = (addr * 4) as uint<8>
+            apb_enable_only(dut, reg_addr, 0xFFFFFFFF, true)
+            apb_enable_only(dut, reg_addr, 0, false)
+        end for
+
+        log(info, "ALL TESTS PASSED - apb_dsp_op")
+    end run
+
+    check
+        cov.report()
+
+        assert cov.cp_data.zero > 0 else fail("coverage hole: PWDATA zero")
+        assert cov.cp_data.one > 0 else fail("coverage hole: PWDATA walking one")
+        assert cov.cp_data.high_bit > 0 else fail("coverage hole: PWDATA high bit")
+        assert cov.cp_data.ones > 0 else fail("coverage hole: PWDATA ones")
+        assert cov.cp_write.read > 0 else fail("coverage hole: APB reads")
+        assert cov.cp_write.write > 0 else fail("coverage hole: APB writes")
+        assert cov.cp_error.set > 0 else fail("coverage hole: PSLVERR")
+    end check
+end impl ApbDspOpTest

@@ -1,0 +1,202 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_afi_ptr_0004`.
+//
+// The 27-bit length field and 4-bit masks intentionally remain unconstrained
+// in randomized stimulus so natural endpoint and walking auto coverage can
+// steer odd-width pointer values and per-channel controls.
+
+transaction AfiStim
+    len : uint<27>
+    len_slot : uint<3>
+    reset_mask : uint<4>
+    channel : uint<2>
+    inc_m1 : uint<2>
+    busy : uint<4>
+    bother : bool
+end transaction AfiStim
+
+covergroup AfiCov @(posedge dut.clk)
+    cp_len : cover dut.sa_len_di
+        bins
+            zero = {0}
+            one = {1}
+            high_bit = {67108864}
+            max = {134217727}
+            small = [2..63]
+            medium = [64..1023]
+        end bins
+
+    cp_reset : cover dut.reset_pointers
+        bins
+            none = {0}
+            ch0 = {1}
+            ch1 = {2}
+            ch2 = {4}
+            ch3 = {8}
+            all = {15}
+        end bins
+
+    cp_channel : cover dut.pre_winner_channel
+        bins
+            c0 = {0}
+            c1 = {1}
+            c2 = {2}
+            c3 = {3}
+        end bins
+
+    cp_inc : cover dut.chunk_inc_want_m1
+        bins
+            inc0 = {0}
+            inc1 = {1}
+            inc2 = {2}
+            inc3 = {3}
+        end bins
+
+    cp_busy : cover dut.busy
+        bins
+            none = {0}
+            ch0 = {1}
+            ch1 = {2}
+            ch2 = {4}
+            ch3 = {8}
+            all = {15}
+        end bins
+
+    cp_state_out : cover ((dut.ptr_resetting << 1) | (dut.chunk_addr != 0))
+        bins
+            idle_zero = {0}
+            active_addr = {1}
+            resetting = {2}
+        end bins
+
+    cross cp_channel, cp_inc
+    cross cp_reset, cp_busy
+end covergroup AfiCov
+
+testbench AfiPtrTb
+    dut : cmprs_afi_mux_ptr_top
+    cov : AfiCov
+end testbench AfiPtrTb
+
+function idle_inputs(dut: cmprs_afi_mux_ptr_top)
+    dut.sa_len_di = 0
+    dut.sa_len_wa = 0
+    dut.sa_len_we = 0
+    dut.en = 1
+    dut.reset_pointers = 0
+    dut.pre_busy_w = 0
+    dut.pre_winner_channel = 0
+    dut.need_to_bother = 0
+    dut.chunk_inc_want_m1 = 0
+    dut.last_burst_in_frame = 0
+    dut.busy = 0
+end function idle_inputs
+
+function write_len(dut: cmprs_afi_mux_ptr_top, slot: uint<3>, len: uint<27>)
+    dut.sa_len_wa = slot
+    dut.sa_len_di = len
+    dut.sa_len_we = 1
+    dut.pre_busy_w = 0
+    dut.reset_pointers = 0
+    wait 1 cycle
+    dut.sa_len_we = 0
+    wait 1 cycle
+end function write_len
+
+function reset_mask(dut: cmprs_afi_mux_ptr_top, mask: uint<4>)
+    dut.reset_pointers = mask
+    dut.pre_busy_w = 0
+    dut.last_burst_in_frame = 1
+    wait 1 cycle
+    dut.reset_pointers = 0
+    dut.last_burst_in_frame = 0
+    wait 2 cycles
+end function reset_mask
+
+function update_ptr(dut: cmprs_afi_mux_ptr_top, ch: uint<2>, inc_m1: uint<2>, busy_mask: uint<4>, bother: bool)
+    dut.pre_winner_channel = ch
+    dut.chunk_inc_want_m1 = inc_m1
+    dut.need_to_bother = bother
+    dut.busy = busy_mask
+    dut.pre_busy_w = 1
+    wait 1 cycle
+    dut.pre_busy_w = 0
+    wait 3 cycles
+    dut.need_to_bother = 0
+    dut.busy = 0
+    wait 1 cycle
+end function update_ptr
+
+impl AfiPtrTest for AfiPtrTb
+    run
+        log(info, "cmprs_afi_mux_ptr: odd-width length, reset-mask, and arbitration stimulus")
+
+        dut.reset = 1
+        idle_inputs(dut)
+        wait 3 cycles
+        assert dut.chunk_addr == 0 else fail("reset did not clear chunk_addr")
+        dut.reset = 0
+        wait 1 cycle
+
+        for slot in 0 .. 8
+            let len : uint<27> = ((slot + 1) * 17) as uint<27>
+            write_len(dut, slot as uint<3>, len)
+        end for
+
+        for bit in 0 .. 16
+            let one : uint<27> = ((1 as uint<27>) << bit).trunc<27>()
+            write_len(dut, (bit % 8) as uint<3>, one)
+            write_len(dut, ((bit + 4) % 8) as uint<3>, (0x7FFFFFF ^ one).trunc<27>())
+        end for
+
+        write_len(dut, 0, 1)
+        write_len(dut, 1, 2)
+        write_len(dut, 2, 64)
+        write_len(dut, 3, 134217727)
+        write_len(dut, 4, 67108864)
+
+        reset_mask(dut, 1)
+        reset_mask(dut, 2)
+        reset_mask(dut, 4)
+        reset_mask(dut, 8)
+        reset_mask(dut, 15)
+
+        for ch in 0 .. 4
+            for inc in 0 .. 4
+                let busy : uint<4> = ((1 as uint<4>) << ch).trunc<4>()
+                update_ptr(dut, ch as uint<2>, inc as uint<2>, busy, true)
+            end for
+        end for
+
+        update_ptr(dut, 0, 3, 0, false)
+        update_ptr(dut, 1, 3, 15, false)
+
+        for k in 0 .. 40
+            let s : AfiStim
+            randomize(s)
+            write_len(dut, s.len_slot, s.len)
+            reset_mask(dut, s.reset_mask)
+            update_ptr(dut, s.channel, s.inc_m1, s.busy, s.bother)
+        end for
+
+        dut.reset = 1
+        wait 1 cycle
+        dut.reset = 0
+        idle_inputs(dut)
+        wait 1 cycle
+
+        log(info, "ALL TESTS PASSED - cmprs_afi_mux_ptr")
+    end run
+
+    check
+        cov.report()
+
+        assert cov.cp_len.zero > 0 else fail("coverage hole: len zero")
+        assert cov.cp_len.one > 0 else fail("coverage hole: len one")
+        assert cov.cp_len.high_bit > 0 else fail("coverage hole: len walking high bit")
+        assert cov.cp_len.max > 0 else fail("coverage hole: len max")
+        assert cov.cp_reset.all > 0 else fail("coverage hole: reset all mask")
+        assert cov.cp_busy.all > 0 else fail("coverage hole: busy all mask")
+        assert cov.cp_inc.inc3 > 0 else fail("coverage hole: max increment")
+        assert cov.cp_channel.c3 > 0 else fail("coverage hole: channel 3")
+    end check
+end impl AfiPtrTest
