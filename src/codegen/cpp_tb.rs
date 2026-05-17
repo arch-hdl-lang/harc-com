@@ -2225,6 +2225,7 @@ impl AutoCoverageValue {
 }
 
 const COVERGROUP_AUTO_CROSS_BIN_CAP: usize = 64;
+const COVERGROUP_CROSS_MISSING_DETAIL_LIMIT: usize = 16;
 
 struct DeclaredCoverCross<'a> {
     storage: String,
@@ -4253,6 +4254,8 @@ impl Emitter {
             self.pad(3);
             writeln!(self.out, "uint64_t _cross_hit = 0;").ok();
             self.pad(3);
+            writeln!(self.out, "uint64_t _cross_missing = 0;").ok();
+            self.pad(3);
             writeln!(
                 self.out,
                 "for (size_t _i = 0; _i < {}; ++_i) if ({}[_i] > 0) _cross_hit++;",
@@ -4274,11 +4277,19 @@ impl Emitter {
                 self.pad(3);
                 writeln!(
                     self.out,
-                    "if ({}[{}] == 0) std::printf( \"  {}: *NOT HIT*\\n\" );",
-                    cross.storage, idx, label
+                    "if ({}[{}] == 0) {{ if (_cross_missing < {}) std::printf( \"  {}: *NOT HIT*\\n\" ); _cross_missing++; }}",
+                    cross.storage, idx, COVERGROUP_CROSS_MISSING_DETAIL_LIMIT, label
                 )
                 .ok();
             }
+            self.pad(3);
+            writeln!(
+                self.out,
+                "if (_cross_missing > {}) std::printf( \"  ... %llu more missing cross bins\\n\", (unsigned long long)(_cross_missing - {}) );",
+                COVERGROUP_CROSS_MISSING_DETAIL_LIMIT,
+                COVERGROUP_CROSS_MISSING_DETAIL_LIMIT
+            )
+            .ok();
             self.pad(2);
             writeln!(self.out, "}}").ok();
         }
@@ -4287,6 +4298,8 @@ impl Emitter {
             writeln!(self.out, "{{").ok();
             self.pad(3);
             writeln!(self.out, "uint64_t _cross_hit = 0;").ok();
+            self.pad(3);
+            writeln!(self.out, "uint64_t _cross_missing = 0;").ok();
             self.pad(3);
             writeln!(
                 self.out,
@@ -4314,11 +4327,12 @@ impl Emitter {
                     self.pad(3);
                     writeln!(
                         self.out,
-                        "if (_auto_cross_{}__{}[{}][{}] == 0) std::printf( \"  {}.{} x {}.{}: *NOT HIT*\\n\" );",
+                        "if (_auto_cross_{}__{}[{}][{}] == 0) {{ if (_cross_missing < {}) std::printf( \"  {}.{} x {}.{}: *NOT HIT*\\n\" ); _cross_missing++; }}",
                         a.name.name,
                         b.name.name,
                         i,
                         j,
+                        COVERGROUP_CROSS_MISSING_DETAIL_LIMIT,
                         a.name.name,
                         ab.name.name,
                         b.name.name,
@@ -4327,6 +4341,14 @@ impl Emitter {
                     .ok();
                 }
             }
+            self.pad(3);
+            writeln!(
+                self.out,
+                "if (_cross_missing > {}) std::printf( \"  ... %llu more missing auto-cross bins\\n\", (unsigned long long)(_cross_missing - {}) );",
+                COVERGROUP_CROSS_MISSING_DETAIL_LIMIT,
+                COVERGROUP_CROSS_MISSING_DETAIL_LIMIT
+            )
+            .ok();
             self.pad(2);
             writeln!(self.out, "}}").ok();
         }
