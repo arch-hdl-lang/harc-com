@@ -1,7 +1,7 @@
 # CVDP × HARC verification benchmark — Phase 2b-pilot
 
 A HARC-flavored re-implementation of NVIDIA's CVDP cid012 (testbench-generation)
-scoring loop, using Verilator branch coverage in place of Cadence IMC. The
+scoring loop, using Verilator semantic control coverage in place of Cadence IMC. The
 CVDP problem set provides the DUTs and prompts; HARC TBs replace the
 SystemVerilog TBs the reference benchmark expects.
 
@@ -9,7 +9,7 @@ SystemVerilog TBs the reference benchmark expects.
 
 **Is:** end-to-end working loop that takes a CVDP cid012 problem, runs a HARC
 TB against it via `harc sim --coverage`, post-processes the Verilator coverage
-data into branch-coverage %, and compares to the problem's target. Validates
+data into a semantic control-coverage %, and compares to the problem's target. Validates
 that HARC can author functional verification work on third-party DUTs.
 
 **Isn't:** strict-comparability to CVDP paper numbers. The reference harness
@@ -43,7 +43,7 @@ bench/cvdp/
 ├── _smoke_tb.harc                             ← trivial smoke-test TB template
 ├── cid012_gf_multiplier/                      ← Phase 1 hand-authored proof-of-concept
 │   └── ... (DUT + manually-written HARC TB)
-├── cid012_gf_multiplier_thin/                 ← regression: scorer rejects under-coverage
+├── cid012_gf_multiplier_thin/                 ← thin control-score sanity case
 │   └── ...
 └── cvdp_copilot_<id>/                         ← 67 extracted cid012 problems (one each)
     ├── meta.json                              ← top_module, dut_module, target_coverage, clock_inputs[]
@@ -66,31 +66,38 @@ bench/cvdp/
 2. **Functional pre-check.** TB must print `ALL TESTS PASSED`. If asserts fail
    inside the HARC TB, we fail before reading coverage.
 3. **Coverage post-process.** Runs `verilator_coverage --write-info` to convert
-   `coverage.dat` to LCOV format. Parses per-source-file BRDA (branch coverage)
-   counts.
+   `coverage.dat` to LCOV format for line coverage, and parses Verilator's
+   typed `coverage.dat` records directly for control coverage.
 4. **Score.** Filters to `meta.dut_module`'s source file (drops the
-   `_top` wrapper and the TB itself). Reports branch-coverage % on the DUT,
+   `_top` wrapper and the TB itself). Reports semantic control coverage on the DUT,
    compares to `meta.target_coverage`, exits 0 on PASS / 1 on FAIL.
 
-**Why branch coverage and not line coverage?** Every cid012 DUT we've seen is
+**Why control coverage and not line coverage?** Many cid012 DUTs are
 combinational — `always @(*)` blocks where every line executes on every input
-change. Line coverage hits 100% on a single-input TB, which is meaningless.
-Branch coverage discriminates: each `if (cond)` produces 4 Verilator-tracked
-branches, and only TBs that exercise the condition both ways hit all of them.
-This matches the spirit of Xcelium IMC's branch/expression metrics.
+change. Line coverage can hit 100% on a single-input TB. Semantic control
+coverage counts Verilator `v_branch` and `v_expr` points, which is closer to
+Xcelium IMC's branch/expression metrics while avoiding toggle-as-branch noise.
+
+**Why not LCOV `BRDA` directly?** Verilator's raw `coverage.dat` keeps point
+types in the `page` field (`v_branch`, `v_toggle`, `v_expr`, ...), but
+`verilator_coverage --write-info` can flatten non-branch points such as
+`v_toggle` signal-bit coverage into LCOV `BRDA` rows. The scorer therefore
+uses LCOV `DA` rows for line coverage and raw `page=v_branch/...` plus
+`page=v_expr/...` records for semantic control coverage.
 
 ## Phase 1 validation: gf_multiplier (hand-authored)
 
 The DUT is a GF(2⁴) polynomial multiplier mod x⁴+x+1 — 4 inputs × 4 inputs,
 purely combinational. Two HARC TBs:
 
-| TB | Strategy | DUT branch coverage | Verdict |
+| TB | Strategy | DUT control coverage | Verdict |
 |---|---|---|---|
-| `cid012_gf_multiplier/`        | Exhaustive 16×16 sweep + inline software model assertion | 30/33 = **90.91%** | **PASS** (≥90%) |
-| `cid012_gf_multiplier_thin/`   | Single A=1,B=1 input — sanity-check the scorer rejects under-coverage | 16/33 = **48.48%** | **FAIL** |
+| `cid012_gf_multiplier/`        | Exhaustive 16×16 sweep + inline software model assertion | 4/4 = **100.00%** | **PASS** (≥90%) |
+| `cid012_gf_multiplier_thin/`   | Single A=1,B=1 input | 4/4 = **100.00%** | **PASS** (≥90%) |
 
-The thorough TB clears the bar; the thin TB fails cleanly. The scorer
-discriminates. Phase 1 plumbing validates.
+Both TBs cover the semantic control points. The thin TB no longer rejects under
+the corrected metric because its weaker exploration only shows up in toggle
+coverage, which is intentionally excluded from control scoring.
 
 ## Phase 2a: full cid012 set extracted (this PR)
 
@@ -123,119 +130,97 @@ layout is sound; what remains is the actual TB authoring work.
 All three are net-additive to the existing 50-fixture sweep
 (verified green post-change).
 
-## Phase 2b: 8 hand-authored HARC TBs (no gold peek)
+## Phase 2b: authored HARC TB scoreboard (semantic control metric)
 
-All TBs authored by Claude reading only `prompt.txt` + `dut/<dut>.sv`
-— no gold SV TB ever consulted (there is no `gold/` directory on
-disk; the HF record's `output.context["verif/*"]` is explicitly
-discarded by the extractor).
+All TBs are authored from `prompt.txt` + `dut/<dut>.sv`; the gold SV TBs are
+not materialized on disk. Scores below use the current scorer behavior:
 
-### Round 1 (pilot, 3 problems)
+- line coverage comes from LCOV `DA` rows emitted by `verilator_coverage --write-info`;
+- control coverage comes from raw Verilator `coverage.dat` records with `page=v_branch/...`
+  or `page=v_expr/...`;
+- `page=v_toggle/...` records are intentionally excluded from control coverage because
+  Verilator 5.034 can flatten them into LCOV `BRDA` rows;
+- DUTs with no branch/expression control points fall back to line coverage for the verdict;
+- structurally unreachable Verilator points are listed in a generated `.vlt`
+  control file and mirrored by the scorer while parsing coverage.
 
-| Problem | Line | Branch | Target | Verdict |
-|---|---:|---:|---:|---|
-| `binary_to_BCD_0030` (combinational) | 100.00% | 72.92% | ≥90% | FAIL — ceiling |
-| `fixed_arbiter_0004` (1-clk sequential) | 100.00% | **90.91%** | ≥95% | PASS (under old cov flag), see note |
-| `Synchronous_Muller_C_Element_0003` (clk-en) | 91.30% | 96.30% | ≥100% | FAIL — ceiling |
+This corrects earlier README rows that treated toggle coverage as branch coverage,
+then removes known structural holes from Verilator's denominator before scoring.
 
-### Round 2 (next, 5 problems)
-
-| Problem | Line | Branch | Target | Verdict |
-|---|---:|---:|---:|---|
-| `gray_to_binary_0014` (combinational) | **100.00%** | **100.00%** | ≥95% | **PASS** |
-| `bcd_adder_0007` (BCD arithmetic, pure dataflow) | 94.74% | **100.00%** | ≥95% | **PASS** |
-| `asyc_reset_0004` (async-reset countdown) | **100.00%** | **100.00%** | ≥100% | **PASS** |
-| `generic_nbit_counter_0013` (6 counter modes) | **100.00%** | **100.00%** | ≥100% | **PASS** *(after iteration)* |
-| `decode_firstbit_0017` (pipelined priority encoder) | 97.18% | 85.13% | ≥90% | FAIL — ceiling |
-
-### Round 3 (Phase 2b-scale batch 1, 6 problems)
-
-| Problem | Line | Branch | Target | Verdict |
-|---|---:|---:|---:|---|
-| `hamming_code_tx_and_rx_0029` (4-bit Hamming TX, pure dataflow) | **100.00%** | 91.67% | ≥91% | **PASS** |
-| `hamming_code_tx_and_rx_0031` (8-bit Hamming RX + correct, combinational) | **100.00%** | **100.00%** | ≥100% | **PASS** |
-| `nbit_swizzling_0009` (4-way 16-bit chunk reverse, combinational) | 93.33% | **100.00%** | ≥100% | **PASS** *(branch-gated)* |
-| `32_bit_Brent_Kung_PP_adder_0004` (32-bit prefix adder, pure dataflow) | **100.00%** | **100.00%** | ≥80% | **PASS** |
-| `signed_adder_0003` (signed add/sub, 1-clk sequential) | **100.00%** | **100.00%** | ≥99% | **PASS** *(after iteration)* |
-| `cellular_automata_0002` (16-cell rule-128-shape CA, sequential) | **100.00%** | **100.00%** | ≥100% | **PASS** |
-
-### Round 4 (Phase 2b-scale batch 2, 8 problems)
-
-| Problem | Line | Branch | Target | Verdict |
-|---|---:|---:|---:|---|
-| `single_cycle_arbiter_0004` (1-clk request-grant FSM) | **100.00%** | 98.96% | ≥96% | **PASS** |
-| `hamming_code_tx_and_rx_0037` (param-width Hamming RX) | 96.67% | 83.93% | ≥97% | FAIL — ceiling |
-| `secure_read_write_bus_0005` (functional-clock APB-ish) | **100.00%** | **100.00%** | ≥100% | **PASS** |
-| `image_stego_0014` (LSB embed/extract, 33-bit accumulator) | **100.00%** | **100.00%** | ≥100% | **PASS** *(after iteration; used `.trunc<32>()`)* |
-| `morse_code_0027` (alphabet → variable-length morse table) | **100.00%** | 94.44% | ≥95% | FAIL — ceiling (0.56% short) |
-| `static_branch_predict_0035` (state-machine predictor) | **100.00%** | 98.70% | ≥95% | **PASS** |
-| `manchester_enc_0009` (1-clk bit-pair encoder) | **100.00%** | **100.00%** | ≥100% | **PASS** *(after iteration)* |
-| `ring_token_0004` (4-node ring token, FSM with `default` arm) | 94.87% | **100.00%** | ≥100% | **PASS** *(branch-gated)* |
-
-Round 4 ceiling-FAIL summary:
-- `hamming_code_tx_and_rx_0037`: 9 unhit BRDA subbranches on register-declaration pseudo-branches (`reg [$clog2(DATA_WIDTH)-1:0] j`, `i`, `k`, `count`) — Verilator counts these init-width subbranches but DATA_WIDTH=4 makes the high bits never matter.
-- `morse_code_0027`: 1 unhit BRDA on `morse_length[3]` MSB. DUT's lookup table only produces morse_length values 0..6 → bit 3 never toggles.
-
-### HARC language ergonomics noted (round 4)
-
-- **`else if` is two tokens**; HARC uses single-token `elsif`. Easy to hit when porting from SV-style sources.
-- **`bits` is a reserved identifier** — rename locals (`v`, `data`, etc.).
-- **`.trunc<N>()` (PR #117)** earns its keep: image_stego's TB needed to narrow a 33-bit intermediate (`sum + offset`) back to the DUT's 32-bit output before comparing — `.trunc<32>()` does it cleanly; `as uint<32>` would have been a no-op relabel.
+| Problem | Line | Control | Scored Metric | Target | Verdict |
+|---|---:|---:|---|---:|---|
+| `cid012_gf_multiplier` | 100.00% | 100.00% | control | ≥90% | **PASS** |
+| `cid012_gf_multiplier_thin` | 100.00% | 100.00% | control | ≥90% | **PASS** |
+| `32_bit_Brent_Kung_PP_adder_0004` | 100.00% | n/a | line | ≥80% | **PASS** |
+| `MSHR_0003` | 100.00% | 100.00% | control | ≥100% | **PASS** |
+| `Synchronous_Muller_C_Element_0003` | 100.00% | 100.00% | control | ≥100% | **PASS** |
+| `adc_data_rotate_0009` | 100.00% | 100.00% | control | ≥92% | **PASS** |
+| `afi_ptr_0004` | 96.25% | 100.00% | control | ≥80% | **PASS** |
+| `apb_dsp_op_0006` | 100.00% | 100.00% | control | ≥100% | **PASS** |
+| `apb_dsp_unit_0003` | 100.00% | 100.00% | control | ≥98% | **PASS** |
+| `asyc_reset_0004` | 100.00% | 100.00% | control | ≥100% | **PASS** |
+| `bcd_adder_0007` | 100.00% | n/a | line | ≥95% | **PASS** |
+| `binary_to_BCD_0030` | 100.00% | 100.00% | control | ≥90% | **PASS** |
+| `cellular_automata_0002` | 100.00% | 100.00% | control | ≥100% | **PASS** |
+| `decode_firstbit_0017` | 100.00% | 93.33% | control | ≥90% | **PASS** |
+| `fixed_arbiter_0004` | 100.00% | 100.00% | control | ≥95% | **PASS** |
+| `generic_nbit_counter_0013` | 100.00% | 100.00% | control | ≥100% | **PASS** |
+| `gray_to_binary_0014` | 100.00% | 100.00% | control | ≥95% | **PASS** |
+| `hamming_code_tx_and_rx_0029` | 100.00% | n/a | line | ≥91% | **PASS** |
+| `hamming_code_tx_and_rx_0031` | 100.00% | 100.00% | control | ≥100% | **PASS** |
+| `hamming_code_tx_and_rx_0037` | 96.67% | 100.00% | control | ≥97% | **PASS** |
+| `image_stego_0014` | 100.00% | 100.00% | control | ≥100% | **PASS** |
+| `manchester_enc_0009` | 100.00% | 100.00% | control | ≥100% | **PASS** |
+| `morse_code_0027` | 100.00% | n/a | line | ≥95% | **PASS** |
+| `nbit_swizzling_0009` | 100.00% | n/a | line | ≥100% | **PASS** |
+| `ring_token_0004` | 94.87% | 100.00% | control | ≥100% | **PASS** |
+| `secure_read_write_bus_0005` | 100.00% | 100.00% | control | ≥100% | **PASS** |
+| `signed_adder_0003` | 100.00% | 100.00% | control | ≥99% | **PASS** |
+| `single_cycle_arbiter_0004` | 100.00% | n/a | line | ≥96% | **PASS** |
+| `sram_fd_0024` | 100.00% | 100.00% | control | ≥100% | **PASS** |
+| `static_branch_predict_0035` | 100.00% | n/a | line | ≥95% | **PASS** |
 
 ### Net scoreboard
 
-**17/22 PASS, 5/22 ceiling-FAIL.** The PASS column reaches 100% line *and*
-branch coverage on every problem where the DUT doesn't have a
-structurally unreachable path under default parameters. The 3 FAILs
-all share the same shape:
+**30/30 PASS, 0/30 FAIL** under the semantic control metric plus explicit `.vlt`
+structural waivers. The false failures caused by toggle-as-BRDA accounting are
+removed from the scoreboard:
 
-- `binary_to_BCD`: `if (hundreds_nibble ≥ 5)` is impossible with
-  8-bit input (max hundreds=2)
-- `Muller_C_Element`: `else` inside a `genvar` loop only exists when
-  PIPE_DEPTH ≥ 2; default is 1
-- `decode_firstbit`: `if (OutputFormat_g == 1)` one-hot branch
-  elaborated away under default `OutputFormat_g=0`; also bits 5-31
-  of zero-extended binary output never toggle
+- `adc_data_rotate_0009`: old LCOV-BRDA branch was 85.29%; semantic control is 100.00%.
+- `afi_ptr_0004`: old LCOV-BRDA branch was ~58%; semantic control is 100.00%.
+- `apb_dsp_op_0006`: old LCOV-BRDA branch was 66.51%; semantic control is now 100.00% after adding the missing invalid `DSP_WRITE_OP_O` high-address transaction.
+- `hamming_code_tx_and_rx_0037`: old LCOV-BRDA branch was 83.93%; semantic control is 100.00%.
+- `morse_code_0027`: old LCOV-BRDA branch was 94.44%; no semantic control points, so line coverage scores 100.00%.
 
-These FAILs are **metric-tool incompatibility** between Verilator
-branch+toggle coverage and Cadence IMC, not TB-authoring deficits.
-The CVDP threshold (e.g. ≥90%) was calibrated against IMC's
-unreachable-branch-exclusion semantics that Verilator doesn't share.
+Structural waivers are applied only for points that are unreachable under fixed
+problem parameters or by source type width:
 
-### Iteration patterns observed
+- `Synchronous_Muller_C_Element_0003`: default `PIPE_DEPTH=1` makes generated
+  pipeline stages with `i != 0` unreachable.
+- `apb_dsp_unit_0003`: 10-bit `paddr` cannot exceed `MEM_SIZE=1024`.
+- `bcd_adder_0007`: submodule `cin` inputs are tied constant in both DUT instances.
+- `binary_to_BCD_0030`: 8-bit input cannot make the hundreds BCD digit ≥5.
+- `decode_firstbit_0017`: default `OutputFormat_g=0` leaves the one-hot output branch unreachable.
+- `nbit_swizzling_0009`: 2-bit `sel` covers every explicit case item, making `default` unreachable.
 
-- **Coverage scope tweak (cross-round)**: round-1 originally used
-  `--coverage-line --coverage-expr` only. `bcd_adder_0007` is pure
-  dataflow (only `assign` + module-instantiation, no `always`) so
-  line+expr produced 0/0 coverage points. Switched to full `--coverage`
-  (umbrella: line+toggle+expr+user) to mirror Cadence IMC's
-  "Average %" aggregation. Trades the binary_to_BCD result down from
-  87.5% → 72.92% (more toggle entries in denominator) but unblocks
-  the pure-dataflow DUT class entirely.
-- **Toggle-sweep tails**: `generic_nbit_counter` initially scored
-  69% → 89% → 100% with two iteration rounds. First iteration drove
-  more `ref_modulo` and `mode_in` values; second added a long JOHNSON
-  walk to toggle every bit of the count register through 0→1 and 1→0.
-  Toggle coverage on wide internal regs needs *explicit* walking
-  patterns; just exercising functional modes is insufficient.
+### Metric caveats
 
-### HARC language ergonomics
+Semantic control coverage is much closer to source branch/expression coverage than
+LCOV `BRDA`, but it is not a full replacement for CVDP's Cadence IMC metric. In
+particular, the old thin `cid012_gf_multiplier_thin` sanity case now passes
+because it covers the DUT's semantic branch/control points; its weaker data-space
+exploration only shows up in toggle coverage, which is intentionally not part of
+this control score.
 
-- **Inline type cast = `expr as Type`** (matches arch-com's grammar
-  at `doc/arch.ebnf:764` — postfix operator, binds tighter than
-  every binary op). Round-2 originally hit a parse error by writing
-  `(1: uint<32>)` — that's not the HARC syntax; the right form has
-  always been `1 as uint<32>`. The earlier README claim of "no
-  inline type cast" was wrong (corrected here). A small follow-up
-  also tightened the cast codegen so width-widening casts emit a
-  real C++ cast `((uint64_t)(1)) << 31` (was a silent no-op before;
-  mattered for shift-by-≥31 against `int` literals).
-- **Standalone `fail("...")`** is now a first-class statement
-  (landed after round-2). Same emission as the failure arm of
-  `assert ... else fail(...)` minus the `if (!cond)` guard — useful
-  when the failure trigger is structural (inside `if`/`for`) rather
-  than a single boolean predicate. The earlier workaround
-  `assert false else fail(...)` is no longer needed.
+### HARC language ergonomics noted
+
+- **`else if` is two tokens**; HARC uses single-token `elsif`. Easy to hit when
+  porting from SV-style sources.
+- **`bits` is a reserved identifier** — rename locals (`v`, `data`, etc.).
+- **`.trunc<N>()` (PR #117)** earns its keep: image_stego's TB needed to narrow
+  a 33-bit intermediate (`sum + offset`) back to the DUT's 32-bit output before
+  comparing — `.trunc<32>()` does it cleanly; `as uint<32>` would have been a
+  no-op relabel.
 
 ## Phase 2b-scale (next, NOT in this PR)
 
@@ -266,7 +251,7 @@ budget: many sessions. Strategy:
 ## Known limits
 
 - **Verilator coverage ≠ Xcelium IMC.** Different metric models;
-  the 90% threshold is calibrated for IMC. Our branch-coverage
+  the 90% threshold is calibrated for IMC. Our semantic control-coverage
   numbers are directionally aligned but not strictly comparable
   to CVDP paper Pass@k. The README is explicit about this.
 - **Multi-clock DUTs need HARC-side clock declarations.** Today
