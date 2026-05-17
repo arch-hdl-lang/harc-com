@@ -2,13 +2,13 @@
 //
 // DUT: secure_read_write_bus_interface (key=0xAA, 8-bit addr+data).
 //   posedge i_capture_pulse OR negedge i_reset_bar drives a flop:
-//     - reset_bar==0           → o_data_out=0, o_error=0
-//     - key_match && r/w==1    → o_data_out <= mem[i_addr], o_error=0
-//     - key_match && r/w==0    → mem[i_addr] <= i_data_in, o_data_out=0
-//     - !key_match             → o_data_out=0, o_error=1
+//     - reset_bar==0           -> o_data_out=0, o_error=0
+//     - key_match && r/w==1    -> o_data_out <= mem[i_addr], o_error=0
+//     - key_match && r/w==0    -> mem[i_addr] <= i_data_in, o_data_out=0
+//     - !key_match             -> o_data_out=0, o_error=1
 //
 // Strategy: drive i_capture_pulse as an explicit posedge stimulus
-// (low → high across a `wait 1 cycle`). Exercise:
+// (low -> high across a `wait 1 cycle`). Exercise:
 //   - reset asserted / released
 //   - good-key write then read-back at low, mid, high addresses
 //   - bad-key write attempt (error raised, memory NOT updated)
@@ -17,16 +17,56 @@
 //   - mid-flow reset, then resume
 //   - rapid write/read flip-flopping
 //   - boundary addresses 0x00 and 0xFF
+//   - solver-randomized authorized/unauthorized read/write operations
+
+transaction SecureBusStim
+    addr : uint<8>
+    data : uint<8>
+    good_key : bool
+    read_op : bool
+end transaction SecureBusStim
+
+covergroup SecureBusCov @(posedge dut.clk)
+    cp_key : cover dut.i_key_in
+        bins
+            good = {170}
+            low_bad = [0..169]
+            high_bad = [171..255]
+        end bins
+
+    cp_op : cover dut.i_read_write_enable
+        bins
+            write = {0}
+            read = {1}
+        end bins
+
+    cp_addr : cover dut.i_addr
+        bins
+            zero = {0}
+            low = [1..15]
+            mid = [16..254]
+            max = {255}
+        end bins
+
+    cp_error : cover dut.o_error
+        bins
+            clear = {0}
+            set = {1}
+        end bins
+
+    cross cp_key, cp_op
+end covergroup SecureBusCov
 
 testbench SecureRWTb
     dut : secure_read_write_bus_interface_top
+    cov : SecureBusCov
 end testbench SecureRWTb
 
 impl SecureRWTest for SecureRWTb
     run
         log(info, "secure_read_write_bus_interface: key-gated R/W coverage walk")
 
-        // ── Reset ────────────────────────────────────────────────
+        // -- Reset ------------------------------------------------
         dut.i_reset_bar = 0
         dut.i_capture_pulse = 0
         dut.i_addr = 0
@@ -41,7 +81,7 @@ impl SecureRWTest for SecureRWTb
         dut.i_reset_bar = 1
         wait 1 cycle
 
-        // ── Authorized write @ 0x00, data=0xC3 ──────────────────
+        // -- Authorized write @ 0x00, data=0xC3 ------------------
         dut.i_addr = 0x00
         dut.i_data_in = 0xC3
         dut.i_key_in = 0xAA
@@ -57,7 +97,7 @@ impl SecureRWTest for SecureRWTb
         dut.i_capture_pulse = 0
         wait 1 cycle
 
-        // ── Authorized read-back @ 0x00 → 0xC3 ──────────────────
+        // -- Authorized read-back @ 0x00 -> 0xC3 ------------------
         dut.i_read_write_enable = 1
         dut.i_capture_pulse = 1
         wait 1 cycle
@@ -68,7 +108,7 @@ impl SecureRWTest for SecureRWTb
         dut.i_capture_pulse = 0
         wait 1 cycle
 
-        // ── Authorized write @ 0xFF (upper boundary) ────────────
+        // -- Authorized write @ 0xFF (upper boundary) ------------
         dut.i_addr = 0xFF
         dut.i_data_in = 0x5A
         dut.i_key_in = 0xAA
@@ -89,7 +129,7 @@ impl SecureRWTest for SecureRWTb
         dut.i_capture_pulse = 0
         wait 1 cycle
 
-        // ── Unauthorized write attempt: key=0x55 → error, mem unchanged ─
+        // -- Unauthorized write attempt: key=0x55 -> error, mem unchanged -
         dut.i_addr = 0x00
         dut.i_data_in = 0xFF
         dut.i_key_in = 0x55
@@ -103,7 +143,7 @@ impl SecureRWTest for SecureRWTb
         dut.i_capture_pulse = 0
         wait 1 cycle
 
-        // Read @0x00 with good key — should still be 0xC3 (write was blocked)
+        // Read @0x00 with good key - should still be 0xC3 (write was blocked)
         dut.i_key_in = 0xAA
         dut.i_read_write_enable = 1
         dut.i_capture_pulse = 1
@@ -115,7 +155,7 @@ impl SecureRWTest for SecureRWTb
         dut.i_capture_pulse = 0
         wait 1 cycle
 
-        // ── Unauthorized read attempt: error + data=0 ───────────
+        // -- Unauthorized read attempt: error + data=0 -----------
         dut.i_key_in = 0x01
         dut.i_read_write_enable = 1
         dut.i_capture_pulse = 1
@@ -127,7 +167,7 @@ impl SecureRWTest for SecureRWTb
         dut.i_capture_pulse = 0
         wait 1 cycle
 
-        // ── Multiple authorized writes + reads with varied data ──
+        // -- Multiple authorized writes + reads with varied data --
         for k in 0 .. 16
             let av : uint<8> = ((k * 17 + 3) & 0xFF) as uint<8>
             let dv : uint<8> = ((k * 53 + 7) & 0xFF) as uint<8>
@@ -152,7 +192,7 @@ impl SecureRWTest for SecureRWTb
             wait 1 cycle
         end for
 
-        // ── Alternating good/bad keys to toggle key_match & error ─
+        // -- Alternating good/bad keys to toggle key_match & error -
         for k in 0 .. 8
             // Bad key
             dut.i_key_in = (0xAA ^ ((1 as uint<8>) << k)).trunc<8>()
@@ -175,7 +215,7 @@ impl SecureRWTest for SecureRWTb
             wait 1 cycle
         end for
 
-        // ── Mid-flow async reset ─────────────────────────────────
+        // -- Mid-flow async reset ---------------------------------
         dut.i_key_in = 0xAA
         dut.i_addr = 0x42
         dut.i_data_in = 0x99
@@ -192,7 +232,7 @@ impl SecureRWTest for SecureRWTb
         dut.i_capture_pulse = 0
         wait 1 cycle
 
-        // ── Post-reset resume: write + read at random addrs ─────
+        // -- Post-reset resume: write + read at random addrs -----
         dut.i_addr = 0x42
         dut.i_data_in = 0x37
         dut.i_key_in = 0xAA
@@ -209,6 +249,75 @@ impl SecureRWTest for SecureRWTb
         dut.i_capture_pulse = 0
         wait 1 cycle
 
-        log(info, "ALL TESTS PASSED — secure_read_write_bus_interface")
+        // Unauthorized write attempt above the good key, to cover the
+        // high_bad x write functional cross bucket.
+        dut.i_addr = 0x7E
+        dut.i_data_in = 0xA5
+        dut.i_key_in = 0xFE
+        dut.i_read_write_enable = 0
+        dut.i_capture_pulse = 1
+        wait 1 cycle
+        assert dut.o_error == 1
+            else fail("unauthorized high-key write: o_error=${dut.o_error}, expected 1")
+        assert dut.o_data_out == 0
+            else fail("unauthorized high-key write: o_data_out=0x${dut.o_data_out:02x}, expected 0")
+        dut.i_capture_pulse = 0
+        wait 1 cycle
+
+        // Solver-randomized security/control sweep. Good-key writes
+        // and bad-key reads/writes have deterministic output behavior;
+        // good-key reads may observe previously unwritten memory, so
+        // only the error flag is checked for those.
+        for k in 0 .. 32
+            let s : SecureBusStim
+            randomize(s)
+            dut.i_addr = s.addr
+            dut.i_data_in = s.data
+            if s.good_key
+                dut.i_key_in = 0xAA
+            else
+                dut.i_key_in = 0x55
+            end if
+            if s.read_op
+                dut.i_read_write_enable = 1
+            else
+                dut.i_read_write_enable = 0
+            end if
+            dut.i_capture_pulse = 1
+            wait 1 cycle
+            if s.good_key
+                assert dut.o_error == 0
+                    else fail("rand k=${k}: good key unexpectedly set error")
+                if !s.read_op
+                    assert dut.o_data_out == 0
+                        else fail("rand k=${k}: authorized write data_out=0x${dut.o_data_out:02x}, expected 0")
+                end if
+            else
+                assert dut.o_error == 1
+                    else fail("rand k=${k}: bad key did not set error")
+                assert dut.o_data_out == 0
+                    else fail("rand k=${k}: bad key data_out=0x${dut.o_data_out:02x}, expected 0")
+            end if
+            dut.i_capture_pulse = 0
+            wait 1 cycle
+        end for
+
+        log(info, "ALL TESTS PASSED - secure_read_write_bus_interface")
     end run
+
+    check
+        cov.report()
+
+        assert cov.cp_key.good > 0 else fail("coverage hole: good key")
+        assert cov.cp_key.low_bad > 0 else fail("coverage hole: low bad key")
+        assert cov.cp_key.high_bad > 0 else fail("coverage hole: high bad key")
+        assert cov.cp_op.write > 0 else fail("coverage hole: write op")
+        assert cov.cp_op.read > 0 else fail("coverage hole: read op")
+        assert cov.cp_addr.zero > 0 else fail("coverage hole: addr zero")
+        assert cov.cp_addr.low > 0 else fail("coverage hole: addr low")
+        assert cov.cp_addr.mid > 0 else fail("coverage hole: addr mid")
+        assert cov.cp_addr.max > 0 else fail("coverage hole: addr max")
+        assert cov.cp_error.clear > 0 else fail("coverage hole: error clear")
+        assert cov.cp_error.set > 0 else fail("coverage hole: error set")
+    end check
 end impl SecureRWTest

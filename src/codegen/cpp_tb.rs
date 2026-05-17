@@ -2215,7 +2215,9 @@ impl AutoCoverageValue {
     fn signed(value: i64) -> Self {
         Self {
             label: value.to_string(),
-            c_expr: if value < 0 {
+            c_expr: if value == i64::MIN {
+                "(uint64_t)0x8000000000000000ULL".to_string()
+            } else if value < 0 {
                 format!("(uint64_t)({value}LL)")
             } else {
                 format!("{value}ULL")
@@ -2413,6 +2415,42 @@ fn field_attr_unique(f: &TxnFieldInfo) -> bool {
     f.attrs.iter().any(|a| a.name.name == "unique")
 }
 
+fn natural_auto_coverage_endpoints(f: &TxnFieldInfo) -> Vec<AutoCoverageValue> {
+    if f.width == 0 || f.width > 64 {
+        return Vec::new();
+    }
+
+    if f.signed {
+        let shift = f.width.saturating_sub(1);
+        let lo = if shift >= 63 {
+            i64::MIN
+        } else {
+            -(1i64 << shift)
+        };
+        let hi = if shift >= 63 {
+            i64::MAX
+        } else {
+            (1i64 << shift) - 1
+        };
+        let mut values = vec![AutoCoverageValue::signed(lo)];
+        if hi != lo {
+            values.push(AutoCoverageValue::signed(hi));
+        }
+        values
+    } else {
+        let hi = if f.width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << f.width) - 1
+        };
+        let mut values = vec![AutoCoverageValue::unsigned(0)];
+        if hi != 0 {
+            values.push(AutoCoverageValue::unsigned(hi));
+        }
+        values
+    }
+}
+
 fn auto_coverage_values(f: &TxnFieldInfo) -> Vec<AutoCoverageValue> {
     let mut values = Vec::new();
     if let Some(n) = f.enum_variants {
@@ -2444,6 +2482,8 @@ fn auto_coverage_values(f: &TxnFieldInfo) -> Vec<AutoCoverageValue> {
                 values.push(AutoCoverageValue::unsigned(hi));
             }
         }
+    } else {
+        values.extend(natural_auto_coverage_endpoints(f));
     }
     values
 }
@@ -4531,7 +4571,7 @@ impl Emitter {
                     self.pad(depth + 1);
                     write!(self.out, "if (").ok();
                     self.emit_bin_membership(&b.spec);
-                    if auto_crosses.is_empty() {
+                    if auto_crosses.is_empty() && declared_crosses.is_empty() {
                         writeln!(self.out, ") {instance}.{}.{}++;", p.name.name, b.name.name).ok();
                     } else {
                         writeln!(

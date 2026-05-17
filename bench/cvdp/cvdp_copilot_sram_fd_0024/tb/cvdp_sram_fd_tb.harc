@@ -1,0 +1,475 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_sram_fd_0024`.
+//
+// DUT: cvdp_sram_fd, default DATA_WIDTH=8 and ADDR_WIDTH=4.
+// Full-duplex dual-port SRAM with independent read and write controls:
+//   - ce=0 clears both read outputs and ignores writes
+//   - ce=1 and *_oe reads the addressed old value
+//   - ce=1 and *_we writes after the read-first observation
+//   - same-address writes from both ports are outside the DUT contract
+//
+// Strategy:
+//   - initialize all 16 addresses with known data
+//   - exercise port A and B single-port write/read paths
+//   - exercise dual reads to same and different addresses
+//   - exercise dual writes to different addresses
+//   - exercise same-port and cross-port read/write collisions
+//   - exercise ce=0 and ce=1/no-op output behavior
+//   - use constrained-random legal dual-port cycles for solver and
+//     auto-coverage paths, plus explicit covergroup crosses
+//
+// The DUT has no byte-enable signals, so byte-enable coverage is not
+// applicable for this benchmark.
+
+transaction SramTxn
+    ce      : uint<1>
+    a_we    : uint<1>
+    a_oe    : uint<1>
+    b_we    : uint<1>
+    b_oe    : uint<1>
+    a_addr  : uint<4>
+    b_addr  : uint<4>
+    a_wdata : uint<8>
+    b_wdata : uint<8>
+
+    keep !((a_we == 1) && (b_we == 1) && (a_addr == b_addr))
+end transaction SramTxn
+
+relation SameAddress(t: SramTxn) = t.a_addr == t.b_addr
+relation DifferentAddress(t: SramTxn) = t.a_addr != t.b_addr
+relation LegalDualWrite(t: SramTxn) =
+    (t.ce == 1) && (t.a_we == 1) && (t.b_we == 1) && (t.a_addr != t.b_addr)
+relation CrossPortCollision(t: SramTxn) =
+    (t.ce == 1) && (t.a_addr == t.b_addr) &&
+    (((t.a_we == 1) && (t.b_oe == 1)) || ((t.b_we == 1) && (t.a_oe == 1)))
+
+covergroup SramCov @(posedge dut.clk)
+    cp_ce : cover dut.ce
+        bins
+            disabled = {0}
+            enabled = {1}
+        end bins
+
+    cp_a_we : cover dut.a_we
+        bins
+            off = {0}
+            asserted = {1}
+        end bins
+
+    cp_a_oe : cover dut.a_oe
+        bins
+            off = {0}
+            asserted = {1}
+        end bins
+
+    cp_b_we : cover dut.b_we
+        bins
+            off = {0}
+            asserted = {1}
+        end bins
+
+    cp_b_oe : cover dut.b_oe
+        bins
+            off = {0}
+            asserted = {1}
+        end bins
+
+    cp_a_addr : cover dut.a_addr
+        bins
+            zero = {0}
+            low = [1..7]
+            high = [8..14]
+            max = {15}
+        end bins
+
+    cp_b_addr : cover dut.b_addr
+        bins
+            zero = {0}
+            low = [1..7]
+            high = [8..14]
+            max = {15}
+        end bins
+
+    cp_a_data : cover dut.a_wdata
+        bins
+            zero = {0}
+            low = [1..63]
+            mid = [64..191]
+            high = [192..254]
+            ones = {255}
+        end bins
+
+    cp_b_data : cover dut.b_wdata
+        bins
+            zero = {0}
+            low = [1..63]
+            mid = [64..191]
+            high = [192..254]
+            ones = {255}
+        end bins
+
+    cross cp_a_we, cp_a_oe
+    cross cp_b_we, cp_b_oe
+    cross cp_ce, cp_a_we, cp_a_oe
+    cross cp_ce, cp_b_we, cp_b_oe
+    cross cp_a_addr, cp_b_addr
+end covergroup SramCov
+
+testbench SramFdTb
+    dut : cvdp_sram_fd
+    cov : SramCov
+end testbench SramFdTb
+
+function init_data(addr: uint<4>) -> uint<8>
+    return ((addr as uint<8>) * 17 + 3).trunc<8>()
+end function init_data
+
+function drive_idle(dut: cvdp_sram_fd)
+    dut.ce = 1
+    dut.a_we = 0
+    dut.a_oe = 0
+    dut.a_addr = 0
+    dut.a_wdata = 0
+    dut.b_we = 0
+    dut.b_oe = 0
+    dut.b_addr = 0
+    dut.b_wdata = 0
+end function drive_idle
+
+function write_a(dut: cvdp_sram_fd, addr: uint<4>, data: uint<8>)
+    dut.ce = 1
+    dut.a_we = 1
+    dut.a_oe = 0
+    dut.a_addr = addr
+    dut.a_wdata = data
+    dut.b_we = 0
+    dut.b_oe = 0
+    wait 1 cycle
+    dut.a_we = 0
+end function write_a
+
+function write_b(dut: cvdp_sram_fd, addr: uint<4>, data: uint<8>)
+    dut.ce = 1
+    dut.a_we = 0
+    dut.a_oe = 0
+    dut.b_we = 1
+    dut.b_oe = 0
+    dut.b_addr = addr
+    dut.b_wdata = data
+    wait 1 cycle
+    dut.b_we = 0
+end function write_b
+
+function read_a(dut: cvdp_sram_fd, addr: uint<4>) -> uint<8>
+    dut.ce = 1
+    dut.a_we = 0
+    dut.a_oe = 1
+    dut.a_addr = addr
+    dut.b_we = 0
+    dut.b_oe = 0
+    wait 1 cycle
+    dut.a_oe = 0
+    return dut.a_rdata
+end function read_a
+
+function read_b(dut: cvdp_sram_fd, addr: uint<4>) -> uint<8>
+    dut.ce = 1
+    dut.a_we = 0
+    dut.a_oe = 0
+    dut.b_we = 0
+    dut.b_oe = 1
+    dut.b_addr = addr
+    wait 1 cycle
+    dut.b_oe = 0
+    return dut.b_rdata
+end function read_b
+
+impl SramFdTest for SramFdTb
+    run
+        log(info, "cvdp_sram_fd: dual-port SRAM read/write/collision coverage")
+
+        drive_idle(dut)
+        dut.ce = 0
+        wait 2 cycles
+        assert dut.a_rdata == 0 else fail("ce=0 baseline: a_rdata=0x${dut.a_rdata:02x}, expected 0")
+        assert dut.b_rdata == 0 else fail("ce=0 baseline: b_rdata=0x${dut.b_rdata:02x}, expected 0")
+
+        // Initialize the whole 16-entry address space two locations per
+        // cycle using legal simultaneous writes to different addresses.
+        dut.ce = 1
+        for i in 0 .. 8
+            let a : uint<4> = i as uint<4>
+            let b : uint<4> = (i + 8) as uint<4>
+            dut.a_we = 1
+            dut.a_oe = 0
+            dut.a_addr = a
+            dut.a_wdata = init_data(a)
+            dut.b_we = 1
+            dut.b_oe = 0
+            dut.b_addr = b
+            dut.b_wdata = init_data(b)
+            wait 1 cycle
+        end for
+        drive_idle(dut)
+        wait 1 cycle
+
+        // Single-port write/read on each port, including boundaries.
+        write_a(dut, 0, 0xA5)
+        assert read_a(dut, 0) == 0xA5
+            else fail("port A boundary read @0: got 0x${dut.a_rdata:02x}, expected 0xA5")
+
+        write_b(dut, 15, 0x5A)
+        assert read_b(dut, 15) == 0x5A
+            else fail("port B boundary read @15: got 0x${dut.b_rdata:02x}, expected 0x5A")
+
+        // Dual reads: same address should produce matching data on both ports.
+        dut.ce = 1
+        dut.a_we = 0
+        dut.a_oe = 1
+        dut.a_addr = 0
+        dut.b_we = 0
+        dut.b_oe = 1
+        dut.b_addr = 0
+        wait 1 cycle
+        assert dut.a_rdata == 0xA5
+            else fail("dual read same addr A: got 0x${dut.a_rdata:02x}, expected 0xA5")
+        assert dut.b_rdata == 0xA5
+            else fail("dual read same addr B: got 0x${dut.b_rdata:02x}, expected 0xA5")
+
+        // Dual reads: different addresses.
+        dut.a_addr = 3
+        dut.b_addr = 15
+        wait 1 cycle
+        assert dut.a_rdata == init_data(3)
+            else fail("dual read diff A@3: got 0x${dut.a_rdata:02x}, expected 0x${init_data(3):02x}")
+        assert dut.b_rdata == 0x5A
+            else fail("dual read diff B@15: got 0x${dut.b_rdata:02x}, expected 0x5A")
+
+        // Simultaneous legal writes to different addresses, then read back
+        // from the opposite ports.
+        dut.a_oe = 0
+        dut.b_oe = 0
+        dut.a_we = 1
+        dut.a_addr = 1
+        dut.a_wdata = 0x11
+        dut.b_we = 1
+        dut.b_addr = 14
+        dut.b_wdata = 0xEE
+        wait 1 cycle
+        dut.a_we = 0
+        dut.b_we = 0
+        assert read_b(dut, 1) == 0x11
+            else fail("dual write readback B@1: got 0x${dut.b_rdata:02x}, expected 0x11")
+        assert read_a(dut, 14) == 0xEE
+            else fail("dual write readback A@14: got 0x${dut.a_rdata:02x}, expected 0xEE")
+
+        // Same-port read/write collision is read-first: old data is observed,
+        // then the new data is visible on a later read.
+        write_a(dut, 2, 0x22)
+        dut.ce = 1
+        dut.a_we = 1
+        dut.a_oe = 1
+        dut.a_addr = 2
+        dut.a_wdata = 0x99
+        dut.b_we = 0
+        dut.b_oe = 0
+        wait 1 cycle
+        assert dut.a_rdata == 0x22
+            else fail("same-port A rw collision: got 0x${dut.a_rdata:02x}, expected old 0x22")
+        dut.a_we = 0
+        dut.a_oe = 1
+        wait 1 cycle
+        assert dut.a_rdata == 0x99
+            else fail("same-port A post-write: got 0x${dut.a_rdata:02x}, expected new 0x99")
+
+        write_b(dut, 13, 0x33)
+        dut.b_we = 1
+        dut.b_oe = 1
+        dut.b_addr = 13
+        dut.b_wdata = 0x77
+        dut.a_we = 0
+        dut.a_oe = 0
+        wait 1 cycle
+        assert dut.b_rdata == 0x33
+            else fail("same-port B rw collision: got 0x${dut.b_rdata:02x}, expected old 0x33")
+        dut.b_we = 0
+        dut.b_oe = 1
+        wait 1 cycle
+        assert dut.b_rdata == 0x77
+            else fail("same-port B post-write: got 0x${dut.b_rdata:02x}, expected new 0x77")
+
+        // Cross-port same-address read/write collisions are also read-first.
+        write_a(dut, 4, 0x44)
+        dut.ce = 1
+        dut.a_we = 1
+        dut.a_oe = 0
+        dut.a_addr = 4
+        dut.a_wdata = 0xC4
+        dut.b_we = 0
+        dut.b_oe = 1
+        dut.b_addr = 4
+        wait 1 cycle
+        assert dut.b_rdata == 0x44
+            else fail("A-write/B-read same addr: got 0x${dut.b_rdata:02x}, expected old 0x44")
+        dut.a_we = 0
+        wait 1 cycle
+        assert dut.b_rdata == 0xC4
+            else fail("A-write/B-read post-write: got 0x${dut.b_rdata:02x}, expected new 0xC4")
+
+        write_b(dut, 5, 0x55)
+        dut.a_we = 0
+        dut.a_oe = 1
+        dut.a_addr = 5
+        dut.b_we = 1
+        dut.b_oe = 0
+        dut.b_addr = 5
+        dut.b_wdata = 0xD5
+        wait 1 cycle
+        assert dut.a_rdata == 0x55
+            else fail("B-write/A-read same addr: got 0x${dut.a_rdata:02x}, expected old 0x55")
+        dut.b_we = 0
+        wait 1 cycle
+        assert dut.a_rdata == 0xD5
+            else fail("B-write/A-read post-write: got 0x${dut.a_rdata:02x}, expected new 0xD5")
+
+        // ce disabled with active-looking inputs: outputs clear, writes ignored.
+        dut.ce = 0
+        dut.a_we = 1
+        dut.a_oe = 1
+        dut.a_addr = 6
+        dut.a_wdata = 0x66
+        dut.b_we = 1
+        dut.b_oe = 1
+        dut.b_addr = 7
+        dut.b_wdata = 0x77
+        wait 1 cycle
+        assert dut.a_rdata == 0
+            else fail("ce=0 active A controls: got 0x${dut.a_rdata:02x}, expected 0")
+        assert dut.b_rdata == 0
+            else fail("ce=0 active B controls: got 0x${dut.b_rdata:02x}, expected 0")
+        assert read_a(dut, 6) == init_data(6)
+            else fail("ce=0 write ignored A@6: got 0x${dut.a_rdata:02x}, expected 0x${init_data(6):02x}")
+        assert read_b(dut, 7) == init_data(7)
+            else fail("ce=0 write ignored B@7: got 0x${dut.b_rdata:02x}, expected 0x${init_data(7):02x}")
+
+        // ce enabled with no op should retain the previous read outputs.
+        let hold_a = dut.a_rdata
+        let hold_b = dut.b_rdata
+        dut.ce = 1
+        dut.a_we = 0
+        dut.a_oe = 0
+        dut.b_we = 0
+        dut.b_oe = 0
+        wait 2 cycles
+        assert dut.a_rdata == hold_a
+            else fail("ce=1 no-op A hold: got 0x${dut.a_rdata:02x}, expected 0x${hold_a:02x}")
+        assert dut.b_rdata == hold_b
+            else fail("ce=1 no-op B hold: got 0x${dut.b_rdata:02x}, expected 0x${hold_b:02x}")
+
+        // Directed toggle/data sweep for full input bit transitions.
+        dut.ce = 1
+        dut.a_oe = 0
+        dut.b_oe = 0
+        for bit in 0 .. 8
+            dut.a_we = 1
+            dut.b_we = 1
+            dut.a_addr = bit as uint<4>
+            dut.b_addr = (15 - bit) as uint<4>
+            dut.a_wdata = ((1 as uint<8>) << bit).trunc<8>()
+            dut.b_wdata = (0xFF ^ ((1 as uint<8>) << bit)).trunc<8>()
+            wait 1 cycle
+        end for
+        dut.a_wdata = 0
+        dut.b_wdata = 0xFF
+        wait 1 cycle
+        dut.a_wdata = 0xFF
+        dut.b_wdata = 0
+        wait 1 cycle
+
+        // Verilator instruments the unpacked memory array per element and
+        // data bit. Force every RAM bit through 0 and 1 with legal writes.
+        for addr in 0 .. 16
+            write_a(dut, addr as uint<4>, 0x00)
+        end for
+        for addr in 0 .. 16
+            write_b(dut, addr as uint<4>, 0xFF)
+        end for
+        for addr in 0 .. 16
+            write_a(dut, addr as uint<4>, init_data(addr as uint<4>))
+        end for
+
+        // Constrained-random legal accesses. The first three loops force
+        // same-address collisions, different-address dual writes, and
+        // general legal traffic, respectively. Transaction field ranges
+        // feed HARC's auto-coverage preferences; covergroups sample pins.
+        for k in 0 .. 12
+            let t : SramTxn
+            randomize(t) with CrossPortCollision(t) end randomize
+            dut.ce = t.ce
+            dut.a_we = t.a_we
+            dut.a_oe = t.a_oe
+            dut.a_addr = t.a_addr
+            dut.a_wdata = t.a_wdata
+            dut.b_we = t.b_we
+            dut.b_oe = t.b_oe
+            dut.b_addr = t.b_addr
+            dut.b_wdata = t.b_wdata
+            wait 1 cycle
+        end for
+
+        for k in 0 .. 12
+            let t : SramTxn
+            randomize(t) with LegalDualWrite(t) end randomize
+            dut.ce = t.ce
+            dut.a_we = t.a_we
+            dut.a_oe = t.a_oe
+            dut.a_addr = t.a_addr
+            dut.a_wdata = t.a_wdata
+            dut.b_we = t.b_we
+            dut.b_oe = t.b_oe
+            dut.b_addr = t.b_addr
+            dut.b_wdata = t.b_wdata
+            wait 1 cycle
+        end for
+
+        for k in 0 .. 32
+            let t : SramTxn
+            randomize(t)
+            dut.ce = t.ce
+            dut.a_we = t.a_we
+            dut.a_oe = t.a_oe
+            dut.a_addr = t.a_addr
+            dut.a_wdata = t.a_wdata
+            dut.b_we = t.b_we
+            dut.b_oe = t.b_oe
+            dut.b_addr = t.b_addr
+            dut.b_wdata = t.b_wdata
+            wait 1 cycle
+
+            assert !(dut.a_we && dut.b_we && dut.a_addr == dut.b_addr)
+                else fail("random legal constraint violated: dual write same addr ${dut.a_addr}")
+        end for
+
+        drive_idle(dut)
+        wait 1 cycle
+        log(info, "ALL TESTS PASSED - cvdp_sram_fd")
+    end run
+
+    check
+        cov.report()
+
+        assert cov.cp_ce.disabled > 0 else fail("coverage hole: ce disabled")
+        assert cov.cp_ce.enabled > 0 else fail("coverage hole: ce enabled")
+        assert cov.cp_a_we.asserted > 0 else fail("coverage hole: A write enable")
+        assert cov.cp_a_oe.asserted > 0 else fail("coverage hole: A read enable")
+        assert cov.cp_b_we.asserted > 0 else fail("coverage hole: B write enable")
+        assert cov.cp_b_oe.asserted > 0 else fail("coverage hole: B read enable")
+        assert cov.cp_a_addr.zero > 0 else fail("coverage hole: A addr zero")
+        assert cov.cp_a_addr.max > 0 else fail("coverage hole: A addr max")
+        assert cov.cp_b_addr.zero > 0 else fail("coverage hole: B addr zero")
+        assert cov.cp_b_addr.max > 0 else fail("coverage hole: B addr max")
+        assert cov.cp_a_data.zero > 0 else fail("coverage hole: A data zero")
+        assert cov.cp_a_data.ones > 0 else fail("coverage hole: A data ones")
+        assert cov.cp_b_data.zero > 0 else fail("coverage hole: B data zero")
+        assert cov.cp_b_data.ones > 0 else fail("coverage hole: B data ones")
+    end check
+end impl SramFdTest

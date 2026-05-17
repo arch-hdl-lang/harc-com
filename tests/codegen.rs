@@ -159,6 +159,8 @@ end test CoverDeclaredCrossTest"#,
     assert!(
         cpp.contains("uint64_t _cross_2_cp_addr__cp_data[4] = {};")
             && cpp.contains("if (_cg_hit_cp_addr[_i0] && _cg_hit_cp_data[_i1]) {")
+            && cpp.contains("_cg_hit_cp_addr[0] = true;")
+            && cpp.contains("_cg_hit_cp_data[1] = true;")
             && cpp.contains("cov._cross_2_cp_addr__cp_data[(_i0 * 2 + _i1)]++;")
             && cpp.contains("[G] cross cp_addr x cp_data")
             && !cpp.contains("[G] auto_cross cp_addr x cp_data")
@@ -2056,6 +2058,60 @@ end test SignedAutoCovPrefTest"#,
             && cpp.contains("T.delta=4")
             && cpp.contains("(uint64_t)_val_delta == (uint64_t)(-4LL)"),
         "signed [range] endpoints should feed auto coverage preferences and report as signed values; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn natural_numeric_endpoints_feed_auto_coverage_preferences() {
+    let parsed = parse_source(
+        r#"transaction T
+    addr : uint<8>
+    delta : sint<4>
+end transaction T
+
+test NaturalEndpointAutoCovTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test NaturalEndpointAutoCovTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("_addr[2]")
+            && cpp.contains("_delta[2]")
+            && cpp.contains("T.addr=0")
+            && cpp.contains("T.addr=255")
+            && cpp.contains("T.delta=-8")
+            && cpp.contains("T.delta=7")
+            && cpp.contains("{0ULL, 255ULL}")
+            && cpp.contains("{(uint64_t)(-8LL), 7ULL}"),
+        "natural numeric min/max endpoints should feed auto coverage preferences without redundant [range] attrs; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn wide_numeric_auto_coverage_waits_for_wide_solver_support() {
+    let parsed = parse_source(
+        r#"transaction T
+    data : uint<128>
+end transaction T
+
+test WideEndpointAutoCovTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test WideEndpointAutoCovTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        !cpp.contains("_data[2]") && !cpp.contains("T.data=340282366920938463463374607431768211455"),
+        ">64-bit fields should not get bogus low-64 auto coverage endpoints until solver lowering supports full-width values; got:\n{cpp}",
     );
 }
 
