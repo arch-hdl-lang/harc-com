@@ -123,7 +123,9 @@ end test CoverAutoCrossTest"#,
             && cpp.contains("_cg_hit_cp_data[1] = true;")
             && cpp.contains("if (_cg_hit_cp_addr[_i] && _cg_hit_cp_data[_j]) cov._auto_cross_cp_addr__cp_data[_i][_j]++;")
             && cpp.contains("[G] auto_cross cp_addr x cp_data")
-            && cpp.contains("cp_addr.zero x cp_data.small: *NOT HIT*"),
+            && cpp.contains("cp_addr.zero x cp_data.small: *NOT HIT*")
+            && cpp.contains("uint64_t _cross_missing = 0;")
+            && cpp.contains("more missing auto-cross bins"),
         "covergroup post-sim crosses should be updated from bins hit in the same sample record; got:\n{cpp}",
     );
 }
@@ -160,7 +162,9 @@ end test CoverDeclaredCrossTest"#,
             && cpp.contains("cov._cross_2_cp_addr__cp_data[(_i0 * 2 + _i1)]++;")
             && cpp.contains("[G] cross cp_addr x cp_data")
             && !cpp.contains("[G] auto_cross cp_addr x cp_data")
-            && cpp.contains("cp_addr.zero x cp_data.small: *NOT HIT*"),
+            && cpp.contains("cp_addr.zero x cp_data.small: *NOT HIT*")
+            && cpp.contains("uint64_t _cross_missing = 0;")
+            && cpp.contains("more missing cross bins"),
         "declared covergroup crosses should update and report sample-local bin combinations; got:\n{cpp}",
     );
 }
