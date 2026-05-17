@@ -1,0 +1,432 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_MSHR_0003`.
+//
+// DUT: cache_mshr with default parameters:
+//   MSHR_SIZE=32, CS_LINE_ADDR_WIDTH=10, MSHR_ADDR_WIDTH=5, DATA_WIDTH=56.
+//
+// Strategy:
+//   - Keep a small software occupancy mask so finalize_id is only directed
+//     at allocated entries and allocate_valid is asserted only while ready.
+//   - Use HARC constraints for static stimulus facts: legal address width,
+//     non-zero data payloads, and read/write distribution. Runtime state
+//     choices (free/valid slot selection) stay directed because current HARC
+//     constraints cannot solve against mutable local occupancy history.
+//   - Exercise same-line pending chains, unique-line miss allocations, full
+//     MSHR deassertion of allocate_ready, ready reassertion after finalize,
+//     read/write toggling, empty/no-op cycles, and randomized legal-ish
+//     allocate/finalize interleavings.
+
+transaction MshrAlloc
+    addr : uint<10> with [dist {[0..3] :/ 8, [4..1020] :/ 84, [1021..1023] :/ 8}]
+    data : uint<56>
+    rw   : bool
+    keep data != 0
+end transaction MshrAlloc
+
+transaction MshrRandCtl
+    do_alloc : bool
+    do_final : bool
+    same_line : bool
+end transaction MshrRandCtl
+
+covergroup MshrCov @(posedge dut.clk)
+    cp_alloc_valid : cover dut.allocate_valid
+        bins
+            idle = {0}
+            asserted = {1}
+        end bins
+
+    cp_finalize_valid : cover dut.finalize_valid
+        bins
+            miss_hold = {0}
+            hit_release = {1}
+        end bins
+
+    cp_rw : cover dut.allocate_rw
+        bins
+            read = {0}
+            write = {1}
+        end bins
+
+    cp_ready : cover dut.allocate_ready
+        bins
+            full = {0}
+            space = {1}
+        end bins
+
+    cp_pending : cover dut.allocate_pending
+        bins
+            miss_line = {0}
+            same_line = {1}
+        end bins
+
+    cp_alloc_id : cover dut.allocate_id
+        bins
+            first = {0}
+            low = [1..7]
+            mid = [8..23]
+            high = [24..31]
+        end bins
+
+    cp_finalize_id : cover dut.finalize_id
+        bins
+            first = {0}
+            low = [1..7]
+            mid = [8..23]
+            high = [24..31]
+        end bins
+
+    cp_addr : cover dut.allocate_addr
+        bins
+            zero = {0}
+            fixed = {341}
+            low = [1..255]
+            mid = [256..767]
+            high = [768..1023]
+        end bins
+
+    cross cp_alloc_valid, cp_ready
+    cross cp_alloc_valid, cp_pending
+    cross cp_alloc_valid, cp_finalize_valid
+    cross cp_rw, cp_pending
+    cross cp_ready, cp_finalize_valid
+end covergroup MshrCov
+
+testbench CacheMshrTb
+    dut : cache_mshr
+    cov : MshrCov
+end testbench CacheMshrTb
+
+function slot_bit(idx: uint<5>) -> uint<32>
+    return (1 as uint<32>) << idx
+end function slot_bit
+
+function lowest_free(valid_mask: uint<32>) -> uint<5>
+    let idx : uint<5> = 0
+    let found : bool = false
+    for i in 0 .. 32
+        let bit = ((valid_mask >> i) & 1).trunc<1>()
+        if (found == false) and (bit == 0)
+            idx = i as uint<5>
+            found = true
+        end if
+    end for
+    return idx
+end function lowest_free
+
+function first_valid(valid_mask: uint<32>) -> uint<5>
+    let idx : uint<5> = 0
+    let found : bool = false
+    for i in 0 .. 32
+        let bit = ((valid_mask >> i) & 1).trunc<1>()
+        if (found == false) and (bit == 1)
+            idx = i as uint<5>
+            found = true
+        end if
+    end for
+    return idx
+end function first_valid
+
+function valid_count(valid_mask: uint<32>) -> uint<6>
+    let n : uint<6> = 0
+    for i in 0 .. 32
+        n = n + (((valid_mask >> i) & 1).trunc<1>() as uint<6>)
+    end for
+    return n
+end function valid_count
+
+impl CacheMshrTest for CacheMshrTb
+    run
+        log(info, "cache_mshr: stateful allocate/finalize/pending/full stress")
+
+        let valid_mask : uint<32> = 0
+        let fixed_line : uint<10> = 341
+
+        // Reset to empty.
+        dut.reset = 1
+        dut.allocate_valid = 0
+        dut.allocate_addr = 0
+        dut.allocate_rw = 0
+        dut.allocate_data = 0
+        dut.finalize_valid = 0
+        dut.finalize_id = 0
+        wait 3 cycles
+        assert dut.allocate_ready == 1
+            else fail("post-reset: allocate_ready=${dut.allocate_ready}, expected 1")
+        dut.reset = 0
+        wait 1 cycle
+
+        // Same-line chain: first allocation is a miss-line insert, later
+        // allocations on the fixed line must report pending on the following
+        // cycle and populate the previous-entry link path.
+        for k in 0 .. 32
+            let a : MshrAlloc
+            randomize(a) with
+                a.addr == 341
+                a.data != 0
+            end randomize
+
+            let exp_id = lowest_free(valid_mask)
+            dut.allocate_valid = 1
+            dut.allocate_addr = a.addr
+            dut.allocate_rw = a.rw
+            dut.allocate_data = a.data
+            dut.finalize_valid = 0
+            wait 1 cycle
+
+            assert dut.allocate_id == exp_id
+                else fail("same-line alloc ${k}: id=${dut.allocate_id}, expected ${exp_id}")
+            if k == 0
+                assert dut.allocate_pending == 0
+                    else fail("same-line alloc 0: pending=${dut.allocate_pending}, expected 0")
+            else
+                assert dut.allocate_pending == 1
+                    else fail("same-line alloc ${k}: pending=${dut.allocate_pending}, expected 1")
+            end if
+            valid_mask = valid_mask | slot_bit(exp_id)
+        end for
+
+        dut.allocate_valid = 0
+        wait 1 cycle
+        assert dut.allocate_ready == 0
+            else fail("full same-line chain: allocate_ready=${dut.allocate_ready}, expected 0")
+
+        // Finalize one pending-chain entry, then reallocate the same line to
+        // prove ready reasserts and the lookup path still sees a match.
+        dut.allocate_valid = 0
+        dut.finalize_valid = 1
+        dut.finalize_id = 2
+        wait 1 cycle
+        valid_mask = valid_mask & ~slot_bit(2)
+        assert dut.allocate_ready == 1
+            else fail("after finalize in same-line chain: ready=${dut.allocate_ready}, expected 1")
+
+        let refill_same : MshrAlloc
+        randomize(refill_same) with
+            refill_same.addr == 341
+        end randomize
+        dut.finalize_valid = 0
+        dut.allocate_valid = 1
+        dut.allocate_addr = refill_same.addr
+        dut.allocate_rw = 1
+        dut.allocate_data = refill_same.data
+        let refill_id = lowest_free(valid_mask)
+        wait 1 cycle
+        assert dut.allocate_id == refill_id
+            else fail("same-line refill: id=${dut.allocate_id}, expected ${refill_id}")
+        assert dut.allocate_pending == 1
+            else fail("same-line refill: pending=${dut.allocate_pending}, expected 1")
+        valid_mask = valid_mask | slot_bit(refill_id)
+
+        // Drain back to empty using only allocated slots.
+        dut.allocate_valid = 0
+        for k in 0 .. 32
+            let fid = first_valid(valid_mask)
+            dut.finalize_valid = 1
+            dut.finalize_id = fid
+            wait 1 cycle
+            valid_mask = valid_mask & ~slot_bit(fid)
+        end for
+        dut.finalize_valid = 0
+        wait 1 cycle
+        assert valid_mask == 0
+            else fail("software model did not drain: valid_mask=0x${valid_mask:08x}")
+        assert dut.allocate_ready == 1
+            else fail("after drain: ready=${dut.allocate_ready}, expected 1")
+
+        // Explicitly write every is_write_table bit as read, then write, so
+        // all per-entry RW storage sees both values independent of solver luck.
+        for pass in 0 .. 2
+            for k in 0 .. 32
+                let a : MshrAlloc
+                randomize(a)
+                let exp_id = lowest_free(valid_mask)
+                dut.allocate_valid = 1
+                dut.allocate_addr = ((k * 17 + pass * 389) & 1023) as uint<10>
+                dut.allocate_rw = pass == 1
+                dut.allocate_data = a.data ^ (((pass * 32 + k) as uint<56>) << 12)
+                dut.finalize_valid = 0
+                wait 1 cycle
+                assert dut.allocate_id == exp_id
+                    else fail("rw-sweep pass=${pass} k=${k}: id=${dut.allocate_id}, expected ${exp_id}")
+                valid_mask = valid_mask | slot_bit(exp_id)
+            end for
+
+            dut.allocate_valid = 0
+            for k in 0 .. 32
+                let fid = first_valid(valid_mask)
+                dut.finalize_valid = 1
+                dut.finalize_id = fid
+                wait 1 cycle
+                valid_mask = valid_mask & ~slot_bit(fid)
+            end for
+            dut.finalize_valid = 0
+            wait 1 cycle
+        end for
+
+        // Fill all 32 entries with unique-ish lines. This reaches full and
+        // covers allocate_ready deassertion without violating valid-only-when-
+        // ready sequencing.
+        for k in 0 .. 32
+            let a : MshrAlloc
+            let unique_line : uint<10> = ((k * 29 + 7) & 1023) as uint<10>
+            randomize(a)
+
+            let exp_id = lowest_free(valid_mask)
+            assert dut.allocate_ready == 1
+                else fail("fill ${k}: ready unexpectedly low before allocation")
+            dut.allocate_valid = 1
+            dut.allocate_addr = unique_line
+            dut.allocate_rw = (k & 1) == 1
+            dut.allocate_data = a.data
+            dut.finalize_valid = 0
+            wait 1 cycle
+            assert dut.allocate_id == exp_id
+                else fail("fill ${k}: id=${dut.allocate_id}, expected ${exp_id}")
+            valid_mask = valid_mask | slot_bit(exp_id)
+        end for
+
+        dut.allocate_valid = 0
+        dut.finalize_valid = 0
+        wait 1 cycle
+        assert valid_mask == 0xFFFFFFFF
+            else fail("full model: valid_mask=0x${valid_mask:08x}, expected all ones")
+        assert dut.allocate_ready == 0
+            else fail("full MSHR: allocate_ready=${dut.allocate_ready}, expected 0")
+
+        // Backpressure: assert allocate_valid while full. allocate_fire must
+        // stay low because allocate_ready is deasserted, so the full table is
+        // preserved while coverage observes the blocked request.
+        dut.allocate_valid = 1
+        dut.allocate_addr = 0
+        dut.allocate_rw = 0
+        dut.allocate_data = 0x1234
+        dut.finalize_valid = 0
+        wait 1 cycle
+        assert dut.allocate_ready == 0
+            else fail("full backpressure: allocate_ready=${dut.allocate_ready}, expected 0")
+        assert valid_mask == 0xFFFFFFFF
+            else fail("full backpressure model changed: valid_mask=0x${valid_mask:08x}")
+        dut.allocate_valid = 0
+        wait 1 cycle
+
+        // Release one slot and check ready reasserts.
+        dut.finalize_valid = 1
+        dut.finalize_id = 0
+        wait 1 cycle
+        valid_mask = valid_mask & ~slot_bit(0)
+        assert dut.allocate_ready == 1
+            else fail("post-full finalize: allocate_ready=${dut.allocate_ready}, expected 1")
+
+        // Refill the freed slot with a high address and write op to toggle the
+        // final low entry back into valid state.
+        let post_full : MshrAlloc
+        randomize(post_full) with
+            post_full.addr inside {1021, 1022, 1023}
+        end randomize
+        dut.finalize_valid = 0
+        dut.allocate_valid = 1
+        dut.allocate_addr = post_full.addr
+        dut.allocate_rw = 1
+        dut.allocate_data = post_full.data
+        wait 1 cycle
+        assert dut.allocate_id == 0
+            else fail("post-full refill: id=${dut.allocate_id}, expected 0")
+        valid_mask = valid_mask | slot_bit(0)
+
+        // Drain every slot, alternating finalize_id regions for coverage.
+        dut.allocate_valid = 0
+        for k in 0 .. 32
+            let fid = first_valid(valid_mask)
+            dut.finalize_valid = 1
+            dut.finalize_id = fid
+            wait 1 cycle
+            valid_mask = valid_mask & ~slot_bit(fid)
+        end for
+        dut.finalize_valid = 0
+        wait 1 cycle
+        assert valid_mask == 0
+            else fail("post-full drain model: valid_mask=0x${valid_mask:08x}, expected 0")
+        assert dut.allocate_ready == 1
+            else fail("post-full drain: ready=${dut.allocate_ready}, expected 1")
+
+        // Randomized legal-ish stress. Constraints generate payload, address,
+        // and control preferences; local state chooses whether requested
+        // operations are legal in the current cycle.
+        for k in 0 .. 96
+            let ctl : MshrRandCtl
+            let a : MshrAlloc
+            randomize(ctl)
+            randomize(a)
+
+            let used = valid_count(valid_mask)
+            let can_alloc = used < 32
+            let can_final = used > 0
+            let do_alloc_now = ctl.do_alloc and can_alloc
+            let do_final_now = ctl.do_final and can_final
+
+            let exp_alloc_id = lowest_free(valid_mask)
+            let exp_final_id = first_valid(valid_mask)
+
+            dut.allocate_valid = do_alloc_now
+            if ctl.same_line and (used > 0)
+                dut.allocate_addr = fixed_line
+            else
+                dut.allocate_addr = a.addr
+            end if
+            dut.allocate_rw = a.rw
+            dut.allocate_data = a.data ^ ((k as uint<56>) << 8)
+
+            dut.finalize_valid = do_final_now
+            dut.finalize_id = exp_final_id
+            wait 1 cycle
+
+            if do_alloc_now
+                assert dut.allocate_id == exp_alloc_id
+                    else fail("rand ${k}: alloc_id=${dut.allocate_id}, expected ${exp_alloc_id}")
+                valid_mask = valid_mask | slot_bit(exp_alloc_id)
+            end if
+            if do_final_now
+                valid_mask = valid_mask & ~slot_bit(exp_final_id)
+            end if
+        end for
+
+        // Final drain leaves the DUT empty for a clean end-of-test state.
+        dut.allocate_valid = 0
+        for k in 0 .. 32
+            if valid_mask != 0
+                let fid = first_valid(valid_mask)
+                dut.finalize_valid = 1
+                dut.finalize_id = fid
+                wait 1 cycle
+                valid_mask = valid_mask & ~slot_bit(fid)
+            end if
+        end for
+        dut.finalize_valid = 0
+        dut.allocate_addr = 0
+        dut.allocate_data = 0
+        wait 2 cycles
+        assert dut.allocate_ready == 1
+            else fail("final empty state: allocate_ready=${dut.allocate_ready}, expected 1")
+
+        log(info, "ALL TESTS PASSED - cache_mshr")
+    end run
+
+    check
+        cov.report()
+
+        assert cov.cp_alloc_valid.idle > 0 else fail("coverage hole: allocate_valid idle")
+        assert cov.cp_alloc_valid.asserted > 0 else fail("coverage hole: allocate_valid active")
+        assert cov.cp_finalize_valid.miss_hold > 0 else fail("coverage hole: no-finalize cycles")
+        assert cov.cp_finalize_valid.hit_release > 0 else fail("coverage hole: finalize cycles")
+        assert cov.cp_rw.read > 0 else fail("coverage hole: read allocations")
+        assert cov.cp_rw.write > 0 else fail("coverage hole: write allocations")
+        assert cov.cp_ready.full > 0 else fail("coverage hole: full/ready-low state")
+        assert cov.cp_ready.space > 0 else fail("coverage hole: ready-high state")
+        assert cov.cp_pending.miss_line > 0 else fail("coverage hole: allocate miss-line")
+        assert cov.cp_pending.same_line > 0 else fail("coverage hole: same-line pending")
+        assert cov.cp_addr.fixed > 0 else fail("coverage hole: fixed same-line address")
+        assert cov.cp_addr.high > 0 else fail("coverage hole: high addresses")
+        assert cov.cp_alloc_id.high > 0 else fail("coverage hole: high allocated ids")
+        assert cov.cp_finalize_id.high > 0 else fail("coverage hole: high finalized ids")
+    end check
+end impl CacheMshrTest
