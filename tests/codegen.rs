@@ -2736,6 +2736,46 @@ end test WhenKeepTest"#,
     );
 }
 
+#[test]
+fn solver_include_detection_walks_tseq_and_component_bodies() {
+    let tseq_parsed = parse_source(
+        r#"transaction T
+    addr : uint<8>
+end transaction T
+
+tseq Gen(n: int) -> TSeq<T>
+    for _ in 0 .. n
+        let t : T
+        randomize(t)
+        yield t
+    end for
+end tseq Gen"#,
+    )
+    .unwrap();
+    assert!(
+        cpp_tb::uses_constraint_solver(&tseq_parsed),
+        "natural numeric endpoint auto-coverage makes bare randomize in tseq require Z3"
+    );
+
+    let component_parsed = parse_source(
+        r#"transaction T
+    addr : uint<8>
+end transaction T
+
+agent A
+    hookable drive()
+        let t : T
+        randomize(t)
+    end drive
+end agent A"#,
+    )
+    .unwrap();
+    assert!(
+        cpp_tb::uses_constraint_solver(&component_parsed),
+        "Z3 include detection should walk component hookable/function bodies"
+    );
+}
+
 /// `randomize(t) with R(t)` inlines `R`'s body into the Z3 solver
 /// block (spec §4.2). Block-form relations contribute one constraint
 /// per body expression; the formal parameter substitutes for the
