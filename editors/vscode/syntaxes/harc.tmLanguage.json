@@ -1,0 +1,153 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "HARC",
+  "scopeName": "source.harc",
+  "patterns": [
+    { "include": "#doc-comment-outer" },
+    { "include": "#doc-comment-inner" },
+    { "include": "#line-comment" },
+    { "include": "#strings" },
+    { "include": "#sized-literals" },
+    { "include": "#hex-literals" },
+    { "include": "#binary-literals" },
+    { "include": "#decimal-literals" },
+    { "include": "#boolean-literals" },
+    { "include": "#construct-keywords" },
+    { "include": "#end-keyword" },
+    { "include": "#control-flow" },
+    { "include": "#verif-semantics" },
+    { "include": "#block-keywords" },
+    { "include": "#mode-keywords" },
+    { "include": "#probe-keywords" },
+    { "include": "#width-method-call" },
+    { "include": "#builtin-types" },
+    { "include": "#boolean-operators" },
+    { "include": "#cast-operator" },
+    { "include": "#builtin-functions" },
+    { "include": "#multi-char-operators" },
+    { "include": "#single-char-operators" },
+    { "include": "#enum-variant" },
+    { "include": "#upper-snake-identifiers" },
+    { "include": "#pascal-case-identifiers" }
+  ],
+  "repository": {
+    "doc-comment-outer": {
+      "name": "comment.line.documentation.outer.harc",
+      "match": "///.*$"
+    },
+    "doc-comment-inner": {
+      "name": "comment.line.documentation.inner.harc",
+      "match": "//!.*$"
+    },
+    "line-comment": {
+      "name": "comment.line.double-slash.harc",
+      "match": "//.*$"
+    },
+    "strings": {
+      "name": "string.quoted.double.harc",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.harc",
+          "match": "\\\\."
+        },
+        {
+          "name": "meta.template.expression.harc",
+          "match": "\\$\\{[^}]*\\}",
+          "captures": {
+            "0": { "name": "variable.other.template.harc" }
+          }
+        }
+      ]
+    },
+    "sized-literals": {
+      "name": "constant.numeric.sized.harc",
+      "match": "\\b[0-9]+'[bdhoBDHO][0-9a-fA-F_xXzZ]+\\b"
+    },
+    "hex-literals": {
+      "name": "constant.numeric.hex.harc",
+      "match": "\\b0[xX][0-9a-fA-F_]+\\b"
+    },
+    "binary-literals": {
+      "name": "constant.numeric.binary.harc",
+      "match": "\\b0[bB][01_]+\\b"
+    },
+    "decimal-literals": {
+      "name": "constant.numeric.decimal.harc",
+      "match": "\\b[0-9][0-9_]*\\b"
+    },
+    "boolean-literals": {
+      "name": "constant.language.boolean.harc",
+      "match": "\\b(true|false)\\b"
+    },
+    "construct-keywords": {
+      "name": "keyword.control.construct.harc",
+      "match": "\\b(test|testbench|impl|transactor|agent|env|scoreboard|sequencer|tseq|transaction|covergroup|property|pseq|bus|regblock|addrmap|struct|enum|domain|package|function|relation|contract|extend)\\b"
+    },
+    "end-keyword": {
+      "name": "keyword.control.end.harc",
+      "match": "\\bend\\b"
+    },
+    "control-flow": {
+      "name": "keyword.control.flow.harc",
+      "match": "\\b(if|elsif|else|for|in|loop|while|repeat|break|continue|return|on|when|after|unique|match|within|throughout|intersect|inside|wait|until|across|join_any|join_all|join_none|assert|assume|cover)\\b"
+    },
+    "verif-semantics": {
+      "name": "keyword.other.verif.harc",
+      "match": "\\b(fail|stop|fatal|log|logf|pre|post|hookable)\\b"
+    },
+    "block-keywords": {
+      "name": "keyword.other.block.harc",
+      "match": "\\b(param|port|let|reg|comb|seq|state|field|instance|register|watchdog|connect|emit|yield|apply|run|setup|check|teardown|phase|scope|keep|solve_order|dist|with|default|bins|use|thread|task|init|lock|weight|ref|const|type|kind|via|at|fork|branch|parallel|schedule|select|sequence|guarantee|buffer|event|queue|stream|clocking|cross|randomize)\\b"
+    },
+    "mode-keywords": {
+      "name": "storage.modifier.mode.harc",
+      "match": "\\b(active|passive|bound|to|bind|blocking)\\b"
+    },
+    "probe-keywords": {
+      "name": "keyword.other.probe.harc",
+      "match": "\\b(probe|force|release)\\b"
+    },
+    "width-method-call": {
+      "name": "support.function.width.harc",
+      "match": "\\.(trunc|zext|sext|resize)\\b"
+    },
+    "builtin-types": {
+      "name": "support.type.harc",
+      "match": "\\b(uint|sint|bits|bool|bit|int|prop|time|UInt|SInt|Bool|Bit|Vec|Clock|Reset|event|buffer|state|stream|queue|Severity|Logger|String|TSeq)\\b"
+    },
+    "boolean-operators": {
+      "name": "keyword.operator.logical.harc",
+      "match": "\\b(and|or|not)\\b"
+    },
+    "cast-operator": {
+      "name": "keyword.operator.cast.harc",
+      "match": "\\b(as)\\b"
+    },
+    "builtin-functions": {
+      "name": "support.function.builtin.harc",
+      "match": "\\$clog2|\\$past|\\$rose|\\$fell|\\$stable"
+    },
+    "multi-char-operators": {
+      "name": "keyword.operator.harc",
+      "match": "<=|<-|->|=>|::|\\|->|\\|=>|##|==|!=|>=|&&|\\|\\||<<|>>|:/|\\.\\."
+    },
+    "single-char-operators": {
+      "name": "keyword.operator.harc",
+      "match": "[+\\-*/%&|^~=!<>?:]"
+    },
+    "enum-variant": {
+      "name": "constant.other.enum.harc",
+      "match": "\\b[A-Z][a-zA-Z0-9]*::[A-Z][a-zA-Z0-9]*\\b"
+    },
+    "upper-snake-identifiers": {
+      "name": "constant.other.harc",
+      "match": "\\b[A-Z][A-Z0-9_]{2,}\\b"
+    },
+    "pascal-case-identifiers": {
+      "name": "entity.name.type.harc",
+      "match": "\\b[A-Z][a-zA-Z0-9]+\\b"
+    }
+  }
+}
