@@ -6,7 +6,7 @@
 // Async reset on rst_in; enable_in gates the state transition.
 //
 // Strategy:
-//   - Reset → all-zeros baseline
+//   - Reset -> all-zeros baseline
 //   - For each of the 6 modes plus a default-mode value, run enough
 //     cycles to exercise the case branch + observe an interesting
 //     state transition (e.g. RING needs an initial 0-state to take
@@ -14,10 +14,46 @@
 //   - enable_in=0 freeze check
 //   - GRAY's output transform path (count ^ count>>1)
 //
-// Doesn't need to verify exhaustive correctness — the DUT is a
+// Doesn't need to verify exhaustive correctness - the DUT is a
 // constructive case-statement, so hitting each case once is enough
 // to maximize branch coverage. We do verify a couple key transitions
 // per mode as sanity.
+
+transaction CounterStim
+    mode : uint<3>
+    enable : bool
+    modulo_ref : uint<8>
+end transaction CounterStim
+
+covergroup CounterCov @(posedge dut.clk)
+    cp_mode : cover dut.mode_in
+        bins
+            up = {0}
+            down = {1}
+            modulo = {2}
+            johnson = {3}
+            gray = {4}
+            ring = {5}
+            default6 = {6}
+            default7 = {7}
+        end bins
+
+    cp_enable : cover dut.enable_in
+        bins
+            disabled = {0}
+            enabled = {1}
+        end bins
+
+    cp_ref : cover dut.ref_modulo
+        bins
+            zero = {0}
+            small = [1..15]
+            mid = [16..254]
+            max = {255}
+        end bins
+
+    cross cp_mode, cp_enable
+end covergroup CounterCov
 
 function gray_encode(c: uint<8>) -> uint<8>
     return c ^ (c >> 1)
@@ -25,13 +61,14 @@ end function gray_encode
 
 testbench GenericCounterTestTb
     dut : generic_counter_top
+    cov : CounterCov
 end testbench GenericCounterTestTb
 
 impl GenericCounterTest for GenericCounterTestTb
     run
         log(info, "generic_counter: exercise every mode + enable + reset paths")
 
-        // ── Reset ─────────────────────────────────────────────────
+        // -- Reset -------------------------------------------------
         dut.rst_in = 1
         dut.enable_in = 0
         dut.mode_in = 0
@@ -42,40 +79,40 @@ impl GenericCounterTest for GenericCounterTestTb
         dut.rst_in = 0
         wait 1 cycle
 
-        // ── BINARY_UP (000) ───────────────────────────────────────
+        // -- BINARY_UP (000) ---------------------------------------
         dut.mode_in = 0
         dut.enable_in = 1
-        wait 1 cycle  // count: 0 → 1
+        wait 1 cycle  // count: 0 -> 1
         assert dut.o_count == 1
             else fail("BINARY_UP: o_count=${dut.o_count}, expected 1")
-        wait 3 cycles  // count: 1 → 2 → 3 → 4
+        wait 3 cycles  // count: 1 -> 2 -> 3 -> 4
         assert dut.o_count == 4
             else fail("BINARY_UP+3: o_count=${dut.o_count}, expected 4")
 
-        // ── enable_in=0 freeze ────────────────────────────────────
+        // -- enable_in=0 freeze ------------------------------------
         dut.enable_in = 0
         wait 3 cycles
         assert dut.o_count == 4
             else fail("enable=0 freeze: o_count=${dut.o_count}, expected 4")
         dut.enable_in = 1
 
-        // ── BINARY_DOWN (001) ─────────────────────────────────────
+        // -- BINARY_DOWN (001) -------------------------------------
         dut.mode_in = 1
-        wait 1 cycle  // 4 → 3
+        wait 1 cycle  // 4 -> 3
         assert dut.o_count == 3
             else fail("BINARY_DOWN: o_count=${dut.o_count}, expected 3")
-        wait 3 cycles  // 3 → 2 → 1 → 0
+        wait 3 cycles  // 3 -> 2 -> 1 -> 0
         assert dut.o_count == 0
             else fail("BINARY_DOWN+3: o_count=${dut.o_count}, expected 0")
 
-        // ── MODULO_256 (010) wrap-on-ref ─────────────────────────
+        // -- MODULO_256 (010) wrap-on-ref -------------------------
         // Reset to known state first
         dut.rst_in = 1
         wait 1 cycle
         dut.rst_in = 0
         dut.mode_in = 2  // MODULO_256
         dut.ref_modulo = 3  // wrap when count == 3
-        // count: 0 → 1 → 2 → 3 → wrap to 0
+        // count: 0 -> 1 -> 2 -> 3 -> wrap to 0
         wait 1 cycle
         assert dut.o_count == 1
             else fail("MODULO step 1: o_count=${dut.o_count}, expected 1")
@@ -86,10 +123,10 @@ impl GenericCounterTest for GenericCounterTestTb
         assert dut.o_count == 0
             else fail("MODULO wrap: o_count=${dut.o_count}, expected 0")
 
-        // ── JOHNSON (011) ────────────────────────────────────────
+        // -- JOHNSON (011) ----------------------------------------
         // Reset, then run several cycles. Johnson counter: count <=
-        // {~count[0], count[N-1:1]}. Starting from 0: ~0 → 1, shifted
-        // in at MSB. So 0x00 → 0x80 → 0xC0 → 0xE0 → 0xF0 → ...
+        // {~count[0], count[N-1:1]}. Starting from 0: ~0 -> 1, shifted
+        // in at MSB. So 0x00 -> 0x80 -> 0xC0 -> 0xE0 -> 0xF0 -> ...
         dut.rst_in = 1
         wait 1 cycle
         dut.rst_in = 0
@@ -101,42 +138,42 @@ impl GenericCounterTest for GenericCounterTestTb
         assert dut.o_count == 0xC0
             else fail("JOHNSON step 2: o_count=${dut.o_count:02x}, expected 0xC0")
 
-        // ── GRAY (100) ───────────────────────────────────────────
+        // -- GRAY (100) -------------------------------------------
         // Internal count increments; output is gray_encode(count).
         dut.rst_in = 1
         wait 1 cycle
         dut.rst_in = 0
         dut.mode_in = 4
-        wait 1 cycle  // internal count → 1, output = 1 ^ 0 = 1
+        wait 1 cycle  // internal count -> 1, output = 1 ^ 0 = 1
         assert dut.o_count == gray_encode(1)
             else fail("GRAY step 1: o_count=${dut.o_count:02x}, expected ${gray_encode(1):02x}")
-        wait 1 cycle  // count → 2, output = 2 ^ 1 = 3
+        wait 1 cycle  // count -> 2, output = 2 ^ 1 = 3
         assert dut.o_count == gray_encode(2)
             else fail("GRAY step 2: o_count=${dut.o_count:02x}, expected ${gray_encode(2):02x}")
-        wait 1 cycle  // count → 3, output = 3 ^ 1 = 2
+        wait 1 cycle  // count -> 3, output = 3 ^ 1 = 2
         assert dut.o_count == gray_encode(3)
             else fail("GRAY step 3: o_count=${dut.o_count:02x}, expected ${gray_encode(3):02x}")
 
-        // ── RING (101) — start with seed-1 branch (count==0 → 1) ─
+        // -- RING (101) - start with seed-1 branch (count==0 -> 1) -
         dut.rst_in = 1
         wait 1 cycle
         dut.rst_in = 0
         dut.mode_in = 5
-        wait 1 cycle  // count was 0 → seed: 0x01
+        wait 1 cycle  // count was 0 -> seed: 0x01
         assert dut.o_count == 0x01
             else fail("RING seed: o_count=${dut.o_count:02x}, expected 0x01")
-        wait 1 cycle  // count rotates: 0x01 → 0x80 (right-rotate on N=8)
+        wait 1 cycle  // count rotates: 0x01 -> 0x80 (right-rotate on N=8)
         // The shift is {count[N-2:0], count[N-1]} = rotate-left of high bit
         // i.e. count[6:0] in upper, count[7] in LSB.
         // For count=0x01 (bit0 set): {count[6:0]=0000000, count[7]=0} = 0x00? Wait.
         // {count[6:0], count[7]} means upper 7 bits become count[6:0], LSB becomes count[7].
         // For count=0b00000001: count[6:0]=0000000, count[7]=0. Result = 0b00000000_0 = 0x00.
         // Hmm but that would re-trigger the seed branch.
-        // Actually count=0x01 → {count[6:0], count[7]} = {0000000, 0} = 0b00000000 = 0x00 — seed re-fires.
+        // Actually count=0x01 -> {count[6:0], count[7]} = {0000000, 0} = 0b00000000 = 0x00 - seed re-fires.
         // Let me re-check the DUT comment: it says rotate, but the SV expression
         // is {count[N-2:0], count[N-1]} which IS rotate-LEFT-by-1 (for count where
         // MSB is the high bit). For count=0x01 (bit0 set, MSB=0): rotate-left moves
-        // bit0 to bit1 → 0x02. Wait, the expression {count[6:0], count[7]} for N=8
+        // bit0 to bit1 -> 0x02. Wait, the expression {count[6:0], count[7]} for N=8
         // takes bits [6:0] and prepends them, then count[7] in the LSB.
         // count[6:0] = 0b0000001 (low 7 bits of 0x01)
         // count[7] = 0 (high bit of 0x01)
@@ -146,11 +183,11 @@ impl GenericCounterTest for GenericCounterTestTb
         assert dut.o_count == 0x02
             else fail("RING step 2: o_count=${dut.o_count:02x}, expected 0x02 (rotate-left)")
 
-        // ── default (110, 111) → reset to 0 ──────────────────────
+        // -- default (110, 111) -> reset to 0 ----------------------
         // First drive a non-zero count, then switch to a default mode.
         dut.mode_in = 0  // back to BINARY_UP
         wait 3 cycles
-        // Now mode 6 — falls through case to default → count := 0
+        // Now mode 6 - falls through case to default -> count := 0
         dut.mode_in = 6
         wait 1 cycle
         assert dut.o_count == 0
@@ -160,8 +197,8 @@ impl GenericCounterTest for GenericCounterTestTb
         assert dut.o_count == 0
             else fail("default mode (111): o_count=${dut.o_count}, expected 0")
 
-        // ── Toggle-coverage sweep: drive ref_modulo + mode_in
-        // through every bit position 0→1 and 1→0 to hit every BRDA
+        // -- Toggle-coverage sweep: drive ref_modulo + mode_in
+        // through every bit position 0->1 and 1->0 to hit every BRDA
         // toggle point on wide input signals. Verilator's toggle
         // coverage counts per-bit transitions and won't reach 100%
         // unless every bit takes both edges during the run.
@@ -169,7 +206,7 @@ impl GenericCounterTest for GenericCounterTestTb
         wait 1 cycle
         dut.rst_in = 0
         dut.enable_in = 1
-        dut.mode_in = 2  // MODULO_256 — uses ref_modulo branches
+        dut.mode_in = 2  // MODULO_256 - uses ref_modulo branches
         for v in 0 .. 8
             dut.ref_modulo = 1 << v   // single-bit walking-1: 0x01,0x02,0x04,...,0x80
             wait 1 cycle
@@ -183,6 +220,20 @@ impl GenericCounterTest for GenericCounterTestTb
             dut.mode_in = m
             wait 1 cycle
         end for
+
+        // Solver-randomized control sweep. The [range] and bool fields
+        // in CounterStim feed HARC's auto-coverage preference machinery,
+        // while the explicit covergroup records actual sampled mode,
+        // enable, ref_modulo, and mode x enable combinations.
+        for k in 0 .. 32
+            let s : CounterStim
+            randomize(s)
+            dut.mode_in = s.mode
+            dut.enable_in = s.enable
+            dut.ref_modulo = s.modulo_ref
+            wait 1 cycle
+        end for
+
         // Both edges on rst_in
         dut.rst_in = 1
         wait 1 cycle
@@ -190,14 +241,35 @@ impl GenericCounterTest for GenericCounterTestTb
         wait 1 cycle
 
         // Walk count register through all 8 bit positions via JOHNSON
-        // (steps 0x80 → 0xC0 → 0xE0 → 0xF0 → 0xF8 → 0xFC → 0xFE → 0xFF
-        // → 0x7F → 0x3F → 0x1F → 0x0F → 0x07 → 0x03 → 0x01 → 0x00),
-        // ensuring every bit of o_count toggles both 0→1 and 1→0.
+        // (steps 0x80 -> 0xC0 -> 0xE0 -> 0xF0 -> 0xF8 -> 0xFC -> 0xFE -> 0xFF
+        // -> 0x7F -> 0x3F -> 0x1F -> 0x0F -> 0x07 -> 0x03 -> 0x01 -> 0x00),
+        // ensuring every bit of o_count toggles both 0->1 and 1->0.
         dut.mode_in = 3  // JOHNSON
         for _ in 0 .. 18
             wait 1 cycle
         end for
 
-        log(info, "ALL CHECKS PASSED — generic_counter exercises every mode")
+        log(info, "ALL CHECKS PASSED - generic_counter exercises every mode")
     end run
+
+    check
+        cov.report()
+
+        assert cov.cp_mode.up > 0 else fail("coverage hole: mode up")
+        assert cov.cp_mode.down > 0 else fail("coverage hole: mode down")
+        assert cov.cp_mode.modulo > 0 else fail("coverage hole: mode modulo")
+        assert cov.cp_mode.johnson > 0 else fail("coverage hole: mode johnson")
+        assert cov.cp_mode.gray > 0 else fail("coverage hole: mode gray")
+        assert cov.cp_mode.ring > 0 else fail("coverage hole: mode ring")
+        assert cov.cp_mode.default6 > 0 else fail("coverage hole: mode default6")
+        assert cov.cp_mode.default7 > 0 else fail("coverage hole: mode default7")
+
+        assert cov.cp_enable.disabled > 0 else fail("coverage hole: enable disabled")
+        assert cov.cp_enable.enabled > 0 else fail("coverage hole: enable enabled")
+
+        assert cov.cp_ref.zero > 0 else fail("coverage hole: ref zero")
+        assert cov.cp_ref.small > 0 else fail("coverage hole: ref small")
+        assert cov.cp_ref.mid > 0 else fail("coverage hole: ref mid")
+        assert cov.cp_ref.max > 0 else fail("coverage hole: ref max")
+    end check
 end impl GenericCounterTest
