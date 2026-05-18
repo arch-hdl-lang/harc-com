@@ -7972,7 +7972,30 @@ impl Emitter {
             self.pad(depth + 2);
             writeln!(
                 self.out,
-                "{} _val_{} = ({})_m.eval(_z_{}).get_numeral_uint64();",
+                "z3::expr _eval_{} = _m.eval(_z_{}, true).simplify();",
+                f.name, f.name
+            )
+            .ok();
+            self.pad(depth + 2);
+            writeln!(self.out, "uint64_t _raw_{} = 0;", f.name).ok();
+            self.pad(depth + 2);
+            writeln!(self.out, "if (!_eval_{}.is_numeral_u64(_raw_{})) {{", f.name, f.name)
+                .ok();
+            self.pad(depth + 3);
+            writeln!(
+                self.out,
+                "sim_log_line(\"FAIL\", \"randomize(t) with: solver model for field '{}' is not a uint64 numeral\");",
+                escape_c(&f.name)
+            )
+            .ok();
+            self.pad(depth + 3);
+            writeln!(self.out, "errors++;").ok();
+            self.pad(depth + 2);
+            writeln!(self.out, "}}").ok();
+            self.pad(depth + 2);
+            writeln!(
+                self.out,
+                "{} _val_{} = ({})_raw_{};",
                 val_ty, f.name, val_ty, f.name
             )
             .ok();
