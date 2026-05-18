@@ -33,6 +33,21 @@ end package ShortBursts
 }
 
 #[test]
+fn foreach_keep_round_trip() {
+    let src = r#"
+transaction Packet
+    items : list<uint<8>>
+    keep items.len() <= 4
+    keep for item in items
+        item > 0
+        item < 16
+    end for
+end transaction Packet
+"#;
+    parse_print_reparse(src);
+}
+
+#[test]
 fn property_assert_assume_cover() {
     let src = r#"
 property aw_valid_stable

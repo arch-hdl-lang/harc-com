@@ -656,7 +656,7 @@ impl Parser {
 
     fn parse_keep(&mut self) -> Result<Keep, CompileError> {
         let start = self.expect(TokenKind::Keep)?.span;
-        let expr = self.parse_expr()?;
+        let expr = self.parse_constraint_expr()?;
         let span = start.merge(expr.span);
         Ok(Keep { expr, span })
     }
