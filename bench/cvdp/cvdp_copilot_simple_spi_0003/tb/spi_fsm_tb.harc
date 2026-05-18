@@ -1,0 +1,209 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_simple_spi_0003`.
+//
+// Exercises normal 16-bit SPI transmission, disable/clear interruption, error
+// recovery, and randomized payloads. The payload is `[unique within test]` so
+// repeated randomize calls prefer fresh transfer words while auto coverage
+// steers min/max and walking-bit patterns.
+
+transaction SpiStim
+    data : uint<16> with [unique within test]
+    interrupt_at : uint<5> with [range(1, 20)]
+    fault : bool
+    clear : bool
+end transaction SpiStim
+
+covergroup SpiCov @(posedge dut.clk)
+    cp_state : cover dut.o_fsm_state
+        bins
+            idle = {0}
+            transmit = {1}
+            clock_toggle = {2}
+            error = {3}
+        end bins
+
+    cp_data : cover dut.i_data_in
+        bins
+            zero = {0}
+            one = {1}
+            high_bit = {32768}
+            ones = {65535}
+            alternating_a = {43690}
+            alternating_5 = {21845}
+        end bins
+
+    cp_enable : cover dut.i_enable
+        bins
+            disabled = {0}
+            enabled = {1}
+        end bins
+
+    cp_fault : cover dut.i_fault
+        bins
+            clear = {0}
+            set = {1}
+        end bins
+
+    cp_clear : cover dut.i_clear
+        bins
+            clear = {0}
+            set = {1}
+        end bins
+
+    cp_bits_left : cover dut.o_bits_left
+        bins
+            zero = {0}
+            one = {1}
+            full = {16}
+            middle = [2..15]
+        end bins
+
+    cp_done : cover dut.o_done
+        bins
+            low = {0}
+            high = {1}
+        end bins
+
+    cross cp_state, cp_enable
+    cross cp_state, cp_fault
+    cross cp_state, cp_clear
+end covergroup SpiCov
+
+testbench SpiFsmTb
+    dut : spi_fsm_top
+    cov : SpiCov
+end testbench SpiFsmTb
+
+function reset_spi(dut: spi_fsm_top)
+    dut.i_rst_b = 0
+    dut.i_data_in = 0
+    dut.i_enable = 0
+    dut.i_fault = 0
+    dut.i_clear = 0
+    wait 3 cycles
+    assert dut.o_fsm_state == 0 else fail("reset: state expected IDLE")
+    assert dut.o_bits_left == 16 else fail("reset: bits_left expected 16")
+    dut.i_rst_b = 1
+    wait 1 cycle
+end function reset_spi
+
+function run_full_transfer(dut: spi_fsm_top, data: uint<16>)
+    dut.i_data_in = data
+    dut.i_enable = 1
+    dut.i_fault = 0
+    dut.i_clear = 0
+
+    let saw_transmit : bool = false
+    let saw_toggle : bool = false
+    let saw_done : bool = false
+    for _ in 0 .. 40
+        if dut.o_fsm_state == 1
+            saw_transmit = true
+        end if
+        if dut.o_fsm_state == 2
+            saw_toggle = true
+        end if
+        if dut.o_done == 1
+            saw_done = true
+        end if
+        wait 1 cycle
+    end for
+
+    dut.i_enable = 0
+    wait 2 cycles
+    dut.i_enable = 1
+    wait 1 cycle
+end function run_full_transfer
+
+function interrupt_transfer(dut: spi_fsm_top, data: uint<16>, at_cycle: uint<5>, fault: bool, clear: bool)
+    dut.i_data_in = data
+    dut.i_enable = 1
+    dut.i_fault = 0
+    dut.i_clear = 0
+    wait 1 cycle
+
+    for _ in 0 .. at_cycle
+        wait 1 cycle
+    end for
+
+    if fault
+        dut.i_fault = 1
+        wait 2 cycles
+        assert dut.o_fsm_state == 3 else fail("fault interrupt: expected ERROR state")
+        dut.i_fault = 0
+        dut.i_clear = 0
+        wait 1 cycle
+        dut.i_clear = 1
+        wait 1 cycle
+        dut.i_clear = 0
+        wait 1 cycle
+        dut.i_fault = 1
+        dut.i_clear = 1
+        wait 1 cycle
+        dut.i_fault = 0
+        dut.i_clear = 0
+        wait 1 cycle
+    elsif clear
+        dut.i_clear = 1
+        wait 1 cycle
+        dut.i_clear = 0
+        wait 1 cycle
+    else
+        dut.i_enable = 0
+        wait 2 cycles
+        dut.i_enable = 1
+        wait 1 cycle
+    end if
+end function interrupt_transfer
+
+impl SpiFsmTest for SpiFsmTb
+    run
+        log(info, "spi_fsm: transmission, interrupts, fault recovery, and unique random payloads")
+
+        reset_spi(dut)
+
+        run_full_transfer(dut, 0x0000)
+        run_full_transfer(dut, 0xFFFF)
+        run_full_transfer(dut, 0x8000)
+        run_full_transfer(dut, 0x0001)
+        run_full_transfer(dut, 0xAAAA)
+        run_full_transfer(dut, 0x5555)
+
+        interrupt_transfer(dut, 0x1234, 4, false, false)
+        interrupt_transfer(dut, 0xCAFE, 6, false, true)
+        interrupt_transfer(dut, 0xBEEF, 8, true, false)
+
+        for bit in 0 .. 16
+            let data : uint<16> = ((1 as uint<16>) << bit).trunc<16>()
+            run_full_transfer(dut, data)
+            run_full_transfer(dut, (0xFFFF ^ data).trunc<16>())
+        end for
+
+        for _ in 0 .. 24
+            let s : SpiStim
+            randomize(s)
+            if s.fault or s.clear
+                interrupt_transfer(dut, s.data, s.interrupt_at, s.fault, s.clear)
+            else
+                run_full_transfer(dut, s.data)
+            end if
+        end for
+
+        reset_spi(dut)
+        log(info, "ALL TESTS PASSED - spi_fsm")
+    end run
+
+    check
+        cov.report()
+
+        assert cov.cp_state.idle > 0 else fail("coverage hole: IDLE state")
+        assert cov.cp_state.transmit > 0 else fail("coverage hole: TRANSMIT state")
+        assert cov.cp_state.clock_toggle > 0 else fail("coverage hole: CLOCK_TOGGLE state")
+        assert cov.cp_state.error > 0 else fail("coverage hole: ERROR state")
+        assert cov.cp_data.zero > 0 else fail("coverage hole: zero payload")
+        assert cov.cp_data.high_bit > 0 else fail("coverage hole: high-bit payload")
+        assert cov.cp_data.ones > 0 else fail("coverage hole: all-ones payload")
+        assert cov.cp_fault.set > 0 else fail("coverage hole: fault")
+        assert cov.cp_clear.set > 0 else fail("coverage hole: clear")
+        assert cov.cp_done.high > 0 else fail("coverage hole: done pulse")
+    end check
+end impl SpiFsmTest
