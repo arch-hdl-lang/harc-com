@@ -391,6 +391,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                     .iter()
                     .filter_map(|it| match it {
                         TxnBodyItem::Field(f) => {
+                            let list = list_field_info(&f.ty);
                             let (width, signed, enum_variants, enum_variant_labels) = match &f.ty {
                                 TypeExpr::Builtin { name, args, .. } => match name {
                                     BuiltinTy::UInt | BuiltinTy::Bits | BuiltinTy::UIntCap => {
@@ -426,6 +427,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                                 signed,
                                 enum_variants,
                                 enum_variant_labels,
+                                list,
                                 non_random: f.non_random,
                                 attrs: f.attrs.clone(),
                             })
@@ -2186,10 +2188,18 @@ struct TxnFieldInfo {
     signed: bool,
     enum_variants: Option<usize>,
     enum_variant_labels: Option<Vec<String>>,
+    list: Option<ListFieldInfo>,
     /// `!` prefix on a transaction field — pinned to the current value during
     /// solver-backed randomize and skipped during model assignment.
     non_random: bool,
     attrs: Vec<Attr>,
+}
+
+#[derive(Debug, Clone)]
+struct ListFieldInfo {
+    declared_max_len: Option<usize>,
+    elem_width: u32,
+    elem_signed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2551,6 +2561,141 @@ fn randomize_target_ident(target: &Expr) -> Option<&str> {
         ExprKind::Paren(inner) => randomize_target_ident(inner),
         _ => None,
     }
+}
+
+fn list_field_name_from_expr(
+    e: &Expr,
+    field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+    target_root: Option<&str>,
+) -> Option<String> {
+    let field = match &*e.kind {
+        ExprKind::Ident(id) => id.name.clone(),
+        ExprKind::Field { target, name } => match &*target.kind {
+            ExprKind::Ident(root) => {
+                if target_root.is_some_and(|expected| root.name != expected) {
+                    return None;
+                }
+                name.name.clone()
+            }
+            ExprKind::ImplicitSelf => name.name.clone(),
+            _ => return None,
+        },
+        ExprKind::Paren(inner) => return list_field_name_from_expr(inner, field_info, target_root),
+        _ => return None,
+    };
+    field_info
+        .get(&field)
+        .and_then(|info| info.list.as_ref().map(|_| field))
+}
+
+fn list_len_call_field_name(
+    e: &Expr,
+    field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+    target_root: Option<&str>,
+) -> Option<String> {
+    let ExprKind::Call { callee, args } = &*e.kind else {
+        return None;
+    };
+    if !args.is_empty() {
+        return None;
+    }
+    let ExprKind::Field { target, name } = &*callee.kind else {
+        return None;
+    };
+    if name.name != "len" {
+        return None;
+    }
+    list_field_name_from_expr(target, field_info, target_root)
+}
+
+fn const_usize_from_constraint_expr(e: &Expr) -> Option<usize> {
+    const_usize_expr(e)
+}
+
+fn list_len_upper_bound_from_expr(
+    e: &Expr,
+    field: &str,
+    field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+    target_root: Option<&str>,
+) -> Option<usize> {
+    match &*e.kind {
+        ExprKind::Paren(inner) => {
+            list_len_upper_bound_from_expr(inner, field, field_info, target_root)
+        }
+        ExprKind::Membership { expr, set } => {
+            if list_len_call_field_name(expr, field_info, target_root).as_deref() != Some(field) {
+                return None;
+            }
+            match &*set.kind {
+                ExprKind::RangeLit { hi: Some(hi), .. } => const_usize_from_constraint_expr(hi),
+                ExprKind::SetLit(items) => items
+                    .iter()
+                    .filter_map(|item| match &*item.kind {
+                        ExprKind::RangeLit { hi: Some(hi), .. } => {
+                            const_usize_from_constraint_expr(hi)
+                        }
+                        _ => const_usize_from_constraint_expr(item),
+                    })
+                    .max(),
+                _ => const_usize_from_constraint_expr(set),
+            }
+        }
+        ExprKind::Binary { op, lhs, rhs } => {
+            let lhs_is_len =
+                list_len_call_field_name(lhs, field_info, target_root).as_deref() == Some(field);
+            let rhs_is_len =
+                list_len_call_field_name(rhs, field_info, target_root).as_deref() == Some(field);
+            match op {
+                BinaryOp::Le if lhs_is_len => const_usize_from_constraint_expr(rhs),
+                BinaryOp::Lt if lhs_is_len => {
+                    const_usize_from_constraint_expr(rhs).and_then(|v| v.checked_sub(1))
+                }
+                BinaryOp::Eq if lhs_is_len => const_usize_from_constraint_expr(rhs),
+                BinaryOp::Ge if rhs_is_len => const_usize_from_constraint_expr(lhs),
+                BinaryOp::Gt if rhs_is_len => {
+                    const_usize_from_constraint_expr(lhs).and_then(|v| v.checked_sub(1))
+                }
+                BinaryOp::Eq if rhs_is_len => const_usize_from_constraint_expr(lhs),
+                BinaryOp::AndAnd | BinaryOp::AndKw => {
+                    let a = list_len_upper_bound_from_expr(lhs, field, field_info, target_root);
+                    let b = list_len_upper_bound_from_expr(rhs, field, field_info, target_root);
+                    match (a, b) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (Some(a), None) => Some(a),
+                        (None, Some(b)) => Some(b),
+                        (None, None) => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn infer_list_unroll_bounds(
+    fields: &[TxnFieldInfo],
+    hard_constraints: &[&Expr],
+    field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+    target_root: Option<&str>,
+) -> std::collections::HashMap<String, usize> {
+    let mut out = std::collections::HashMap::new();
+    for f in fields {
+        let Some(list) = &f.list else {
+            continue;
+        };
+        let mut bound = list.declared_max_len;
+        for c in hard_constraints {
+            if let Some(next) = list_len_upper_bound_from_expr(c, &f.name, field_info, target_root)
+            {
+                bound = Some(bound.map_or(next, |old| old.min(next)));
+            }
+        }
+        if let Some(bound) = bound {
+            out.insert(f.name.clone(), bound);
+        }
+    }
+    out
 }
 
 fn collect_randomize_target_field_refs(
@@ -6458,7 +6603,11 @@ impl Emitter {
             )
             .ok();
             self.emit_expr(target);
-            writeln!(self.out, ".{}));", f.name).ok();
+            if f.list.is_some() {
+                writeln!(self.out, ".{}.size()));", f.name).ok();
+            } else {
+                writeln!(self.out, ".{}));", f.name).ok();
+            }
         }
         self.pad(depth + 1);
         writeln!(self.out, "_trace_fields += \"}}\";").ok();
@@ -6821,6 +6970,63 @@ impl Emitter {
     /// `[dist {...}]` attributes. Falls back to a uniform sample over the
     /// declared type's value range.
     fn emit_field_random(&mut self, f: &Field) {
+        if let Some(info) = list_field_info(&f.ty) {
+            let max_len = info.declared_max_len.unwrap_or(0);
+            writeln!(
+                self.out,
+                "{INDENT}t->{}.resize((size_t)harc_rng_range(0, {}));",
+                f.name.name, max_len
+            )
+            .ok();
+            writeln!(
+                self.out,
+                "{INDENT}for (size_t _i = 0; _i < t->{}.size(); ++_i) {{",
+                f.name.name
+            )
+            .ok();
+            let elem_ty = list_elem_type(&f.ty);
+            match elem_ty {
+                Some(TypeExpr::Builtin { name, args, .. }) => match name {
+                    BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => {
+                        writeln!(
+                            self.out,
+                            "{INDENT}{INDENT}t->{}[_i] = harc_rng_uint({});",
+                            f.name.name,
+                            type_arg_width(args).unwrap_or(32)
+                        )
+                        .ok();
+                    }
+                    BuiltinTy::SInt | BuiltinTy::SIntCap => {
+                        let w = type_arg_width(args).unwrap_or(32);
+                        writeln!(
+                            self.out,
+                            "{INDENT}{INDENT}t->{}[_i] = harc_rng_range(-(1LL << {}), (1LL << {}) - 1);",
+                            f.name.name,
+                            w.saturating_sub(1),
+                            w.saturating_sub(1)
+                        )
+                        .ok();
+                    }
+                    BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => {
+                        writeln!(
+                            self.out,
+                            "{INDENT}{INDENT}t->{}[_i] = harc_rng_range(0, 1);",
+                            f.name.name
+                        )
+                        .ok();
+                    }
+                    _ => {
+                        writeln!(self.out, "{INDENT}{INDENT}t->{}[_i] = 0;", f.name.name).ok();
+                    }
+                },
+                _ => {
+                    writeln!(self.out, "{INDENT}{INDENT}t->{}[_i] = 0;", f.name.name).ok();
+                }
+            }
+            writeln!(self.out, "{INDENT}}}").ok();
+            return;
+        }
+
         // Look for a `[range(lo, hi)]` or `[dist {...}]` attribute.
         let mut handled = false;
         for a in &f.attrs {
@@ -6975,18 +7181,47 @@ impl Emitter {
         blocking: bool,
         depth: usize,
     ) {
+        let list_unroll_bounds = std::collections::HashMap::new();
         self.pad(depth);
         write!(self.out, "_s.add(").ok();
         if f.signed {
             write!(self.out, "_z_{} >= ", f.name).ok();
-            self.emit_constraint_expr_w(lo, field_info, 64, target_root, blocking);
+            self.emit_constraint_expr_w(
+                lo,
+                field_info,
+                64,
+                target_root,
+                blocking,
+                &list_unroll_bounds,
+            );
             write!(self.out, " && _z_{} <= ", f.name).ok();
-            self.emit_constraint_expr_w(hi, field_info, 64, target_root, blocking);
+            self.emit_constraint_expr_w(
+                hi,
+                field_info,
+                64,
+                target_root,
+                blocking,
+                &list_unroll_bounds,
+            );
         } else {
             write!(self.out, "z3::uge(_z_{}, ", f.name).ok();
-            self.emit_constraint_expr_w(lo, field_info, 64, target_root, blocking);
+            self.emit_constraint_expr_w(
+                lo,
+                field_info,
+                64,
+                target_root,
+                blocking,
+                &list_unroll_bounds,
+            );
             write!(self.out, ") && z3::ule(_z_{}, ", f.name).ok();
-            self.emit_constraint_expr_w(hi, field_info, 64, target_root, blocking);
+            self.emit_constraint_expr_w(
+                hi,
+                field_info,
+                64,
+                target_root,
+                blocking,
+                &list_unroll_bounds,
+            );
             write!(self.out, ")").ok();
         }
         writeln!(self.out, ");").ok();
@@ -7255,6 +7490,16 @@ impl Emitter {
                 blocking,
             );
         }
+        let list_unroll_bounds =
+            infer_list_unroll_bounds(&fields, &hard_constraints, &field_info, target_root);
+        for f in &fields {
+            if f.list.is_some() && !list_unroll_bounds.contains_key(&f.name) {
+                self.errors.push(format!(
+                    "randomize({ty}): list field `{}` needs a bounded length constraint such as `{}.len() <= N`",
+                    f.name, f.name
+                ));
+            }
+        }
 
         self.pad(depth);
         writeln!(
@@ -7289,6 +7534,83 @@ impl Emitter {
         // gets a range constraint enforcing its declared width — uniform
         // emission, no zext bookkeeping.
         for f in &fields {
+            if let Some(list) = &f.list {
+                let max_len = list_unroll_bounds.get(&f.name).copied().unwrap_or(0);
+                self.pad(depth + 1);
+                writeln!(
+                    self.out,
+                    "z3::expr _z_{}_len = _ctx.bv_const(\"{}_len\", 64);",
+                    f.name, f.name
+                )
+                .ok();
+                self.pad(depth + 1);
+                writeln!(
+                    self.out,
+                    "_s.add(z3::ule(_z_{}_len, _ctx.bv_val((uint64_t){}, 64)));",
+                    f.name, max_len
+                )
+                .ok();
+                if f.non_random {
+                    self.pad(depth + 1);
+                    write!(
+                        self.out,
+                        "_s.add(_z_{}_len == _ctx.bv_val((uint64_t)(",
+                        f.name
+                    )
+                    .ok();
+                    self.emit_expr(target);
+                    writeln!(self.out, ".{}.size()), 64));", f.name).ok();
+                }
+                for i in 0..max_len {
+                    self.pad(depth + 1);
+                    writeln!(
+                        self.out,
+                        "z3::expr _z_{}_{i} = _ctx.bv_const(\"{}_{i}\", 64);",
+                        f.name, f.name
+                    )
+                    .ok();
+                    if list.elem_signed && list.elem_width < 64 {
+                        self.pad(depth + 1);
+                        writeln!(
+                            self.out,
+                            "_s.add(_z_{}_{i} >= _ctx.bv_val((uint64_t)(-(1LL << {})), 64));",
+                            f.name,
+                            list.elem_width.saturating_sub(1)
+                        )
+                        .ok();
+                        self.pad(depth + 1);
+                        writeln!(
+                            self.out,
+                            "_s.add(_z_{}_{i} <= _ctx.bv_val((uint64_t)((1LL << {}) - 1), 64));",
+                            f.name,
+                            list.elem_width.saturating_sub(1)
+                        )
+                        .ok();
+                    } else if list.elem_width < 64 {
+                        self.pad(depth + 1);
+                        writeln!(
+                            self.out,
+                            "_s.add(z3::ult(_z_{}_{i}, _ctx.bv_val((uint64_t)1ULL << {}, 64)));",
+                            f.name, list.elem_width
+                        )
+                        .ok();
+                    }
+                    if f.non_random {
+                        self.pad(depth + 1);
+                        write!(self.out, "if (").ok();
+                        self.emit_expr(target);
+                        write!(
+                            self.out,
+                            ".{}.size() > {i}) _s.add(_z_{}_{i} == _ctx.bv_val((uint64_t)(",
+                            f.name, f.name
+                        )
+                        .ok();
+                        self.emit_expr(target);
+                        writeln!(self.out, ".{}[{i}]), 64));", f.name).ok();
+                    }
+                }
+                continue;
+            }
             self.pad(depth + 1);
             writeln!(
                 self.out,
@@ -7354,7 +7676,13 @@ impl Emitter {
         for c in &hard_constraints {
             self.pad(depth + 1);
             write!(self.out, "_s.add(").ok();
-            self.emit_constraint_expr(c, &field_info, target_root, blocking);
+            self.emit_constraint_expr_with_list_bounds(
+                c,
+                &field_info,
+                target_root,
+                blocking,
+                &list_unroll_bounds,
+            );
             writeln!(self.out, ");").ok();
         }
         for fields in &solve_order_directives {
@@ -7411,7 +7739,7 @@ impl Emitter {
         let cache_tag = format!("_div_cache_{}", target.span.start);
         let mut free_fields: Vec<&TxnFieldInfo> = fields
             .iter()
-            .filter(|f| !f.non_random && !pinned.contains(&f.name))
+            .filter(|f| f.list.is_none() && !f.non_random && !pinned.contains(&f.name))
             .collect();
         let free_field_names: std::collections::HashSet<String> =
             free_fields.iter().map(|f| f.name.clone()).collect();
@@ -7964,6 +8292,94 @@ impl Emitter {
             if f.non_random {
                 continue;
             }
+            if let Some(list) = &f.list {
+                let max_len = list_unroll_bounds.get(&f.name).copied().unwrap_or(0);
+                self.pad(depth + 2);
+                writeln!(
+                    self.out,
+                    "z3::expr _eval_{}_len = _m.eval(_z_{}_len, true).simplify();",
+                    f.name, f.name
+                )
+                .ok();
+                self.pad(depth + 2);
+                writeln!(self.out, "uint64_t _raw_{}_len = 0;", f.name).ok();
+                self.pad(depth + 2);
+                writeln!(
+                    self.out,
+                    "if (!_eval_{}_len.is_numeral_u64(_raw_{}_len)) {{",
+                    f.name, f.name
+                )
+                .ok();
+                self.pad(depth + 3);
+                writeln!(
+                    self.out,
+                    "sim_log_line(\"FAIL\", \"randomize(t) with: solver model for field '{}.len' is not a uint64 numeral\");",
+                    escape_c(&f.name)
+                )
+                .ok();
+                self.pad(depth + 3);
+                writeln!(self.out, "errors++;").ok();
+                self.pad(depth + 2);
+                writeln!(self.out, "}}").ok();
+                self.pad(depth + 2);
+                writeln!(
+                    self.out,
+                    "if (_raw_{}_len > {}) _raw_{}_len = {};",
+                    f.name, max_len, f.name, max_len
+                )
+                .ok();
+                self.pad(depth + 2);
+                self.emit_expr(target);
+                writeln!(self.out, ".{}.resize((size_t)_raw_{}_len);", f.name, f.name).ok();
+                for i in 0..max_len {
+                    self.pad(depth + 2);
+                    writeln!(self.out, "if (_raw_{}_len > {i}) {{", f.name).ok();
+                    self.pad(depth + 3);
+                    writeln!(
+                        self.out,
+                        "z3::expr _eval_{}_{i} = _m.eval(_z_{}_{i}, true).simplify();",
+                        f.name, f.name
+                    )
+                    .ok();
+                    self.pad(depth + 3);
+                    writeln!(self.out, "uint64_t _raw_{}_{i} = 0;", f.name).ok();
+                    self.pad(depth + 3);
+                    writeln!(
+                        self.out,
+                        "if (!_eval_{}_{i}.is_numeral_u64(_raw_{}_{i})) {{",
+                        f.name, f.name
+                    )
+                    .ok();
+                    self.pad(depth + 4);
+                    writeln!(
+                        self.out,
+                        "sim_log_line(\"FAIL\", \"randomize(t) with: solver model for field '{}[{i}]' is not a uint64 numeral\");",
+                        escape_c(&f.name)
+                    )
+                    .ok();
+                    self.pad(depth + 4);
+                    writeln!(self.out, "errors++;").ok();
+                    self.pad(depth + 3);
+                    writeln!(self.out, "}}").ok();
+                    self.pad(depth + 3);
+                    self.emit_expr(target);
+                    writeln!(
+                        self.out,
+                        ".{}[{i}] = ({})_raw_{}_{i};",
+                        f.name,
+                        if list.elem_signed {
+                            "int64_t"
+                        } else {
+                            "uint64_t"
+                        },
+                        f.name
+                    )
+                    .ok();
+                    self.pad(depth + 2);
+                    writeln!(self.out, "}}").ok();
+                }
+                continue;
+            }
             // Every declared field is assigned from the model — equality-
             // pinned fields take their constrained value; free fields take
             // a Z3-chosen satisfying value. Only free fields get pushed
@@ -7979,8 +8395,12 @@ impl Emitter {
             self.pad(depth + 2);
             writeln!(self.out, "uint64_t _raw_{} = 0;", f.name).ok();
             self.pad(depth + 2);
-            writeln!(self.out, "if (!_eval_{}.is_numeral_u64(_raw_{})) {{", f.name, f.name)
-                .ok();
+            writeln!(
+                self.out,
+                "if (!_eval_{}.is_numeral_u64(_raw_{})) {{",
+                f.name, f.name
+            )
+            .ok();
             self.pad(depth + 3);
             writeln!(
                 self.out,
@@ -8086,15 +8506,126 @@ impl Emitter {
     /// the surrounding solver block. Integer literals become `_ctx.bv_val(N, W)`
     /// at the field's width inferred from context. v0 is permissive — any
     /// untranslatable form falls back to a comment + `_ctx.bool_val(true)`.
-    fn emit_constraint_expr(
+    fn emit_constraint_expr_with_list_bounds(
         &mut self,
         e: &Expr,
         field_info: &std::collections::HashMap<String, TxnFieldInfo>,
         target_root: Option<&str>,
         blocking: bool,
+        list_unroll_bounds: &std::collections::HashMap<String, usize>,
     ) {
-        // All Z3 vars are 64-bit; literals match.
-        self.emit_constraint_expr_w(e, field_info, 64, target_root, blocking);
+        self.emit_constraint_expr_w(
+            e,
+            field_info,
+            64,
+            target_root,
+            blocking,
+            &list_unroll_bounds,
+        );
+    }
+
+    fn try_emit_constraint_list_call(
+        &mut self,
+        e: &Expr,
+        field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+        target_root: Option<&str>,
+        list_unroll_bounds: &std::collections::HashMap<String, usize>,
+    ) -> bool {
+        if let Some(field) = list_len_call_field_name(e, field_info, target_root) {
+            write!(self.out, "_z_{}_len", field).ok();
+            return true;
+        }
+
+        let ExprKind::Call { callee, args } = &*e.kind else {
+            return false;
+        };
+        let ExprKind::Ident(name) = &*callee.kind else {
+            return false;
+        };
+        if name.name != "sum" || args.len() != 1 {
+            return false;
+        }
+        let CallArg::Expr(arg) = &args[0] else {
+            return false;
+        };
+
+        let (field, lo, hi) = match &*arg.kind {
+            ExprKind::Index { target, index } => {
+                let Some(field) = list_field_name_from_expr(target, field_info, target_root) else {
+                    return false;
+                };
+                match &*index.kind {
+                    ExprKind::RangeLit { lo, hi } => (field, lo.as_ref(), hi.as_ref()),
+                    _ => {
+                        self.errors.push(
+                            "`sum(list[index])` constraints require a range slice like `sum(items[0..items.len()])`".into(),
+                        );
+                        write!(self.out, "_ctx.bool_val(true)").ok();
+                        return true;
+                    }
+                }
+            }
+            _ => {
+                let Some(field) = list_field_name_from_expr(arg, field_info, target_root) else {
+                    return false;
+                };
+                (field, None, None)
+            }
+        };
+        self.emit_constraint_list_sum(&field, lo, hi, field_info, target_root, list_unroll_bounds);
+        true
+    }
+
+    fn emit_constraint_list_sum(
+        &mut self,
+        field: &str,
+        lo: Option<&Expr>,
+        hi: Option<&Expr>,
+        field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+        target_root: Option<&str>,
+        list_unroll_bounds: &std::collections::HashMap<String, usize>,
+    ) {
+        let Some(_) = field_info.get(field).and_then(|f| f.list.as_ref()) else {
+            write!(self.out, "_ctx.bv_val((uint64_t)0, 64)").ok();
+            return;
+        };
+        let max_len = list_unroll_bounds.get(field).copied().unwrap_or(0);
+        let lo_const = lo.and_then(const_usize_expr).unwrap_or(0);
+        let hi_const = hi.and_then(const_usize_expr);
+        let hi_is_len = hi
+            .and_then(|h| list_len_call_field_name(h, field_info, target_root))
+            .as_deref()
+            == Some(field);
+        write!(self.out, "(").ok();
+        let mut emitted = false;
+        for i in 0..max_len {
+            if i < lo_const {
+                continue;
+            }
+            if let Some(hi) = hi_const {
+                if i >= hi {
+                    continue;
+                }
+            }
+            if emitted {
+                write!(self.out, " + ").ok();
+            }
+            if hi_is_len || hi.is_none() {
+                write!(
+                    self.out,
+                    "z3::ite(z3::ugt(_z_{}_len, _ctx.bv_val((uint64_t){i}, 64)), _z_{}_{i}, _ctx.bv_val((uint64_t)0, 64))",
+                    field, field
+                )
+                .ok();
+            } else {
+                write!(self.out, "_z_{}_{i}", field).ok();
+            }
+            emitted = true;
+        }
+        if !emitted {
+            write!(self.out, "_ctx.bv_val((uint64_t)0, 64)").ok();
+        }
+        write!(self.out, ")").ok();
     }
 
     fn emit_constraint_expr_w(
@@ -8104,15 +8635,65 @@ impl Emitter {
         width: u32,
         target_root: Option<&str>,
         blocking: bool,
+        list_unroll_bounds: &std::collections::HashMap<String, usize>,
     ) {
         match &*e.kind {
+            ExprKind::Call { .. } => {
+                if self.try_emit_constraint_list_call(
+                    e,
+                    field_info,
+                    target_root,
+                    list_unroll_bounds,
+                ) {
+                    return;
+                }
+                self.errors
+                    .push("constraint function call not supported in v0 solver path".into());
+                write!(self.out, "_ctx.bool_val(true)").ok();
+            }
+            ExprKind::Index { target, index } => {
+                if let Some(field) = list_field_name_from_expr(target, field_info, target_root) {
+                    if let Some(i) = const_usize_expr(index) {
+                        if field_info
+                            .get(&field)
+                            .and_then(|f| f.list.as_ref())
+                            .is_some()
+                        {
+                            if i < list_unroll_bounds.get(&field).copied().unwrap_or(0) {
+                                write!(self.out, "_z_{}_{i}", field).ok();
+                                return;
+                            }
+                        }
+                    }
+                    self.errors.push(
+                        "constraint list indexing requires a constant index within the list max length".into(),
+                    );
+                    write!(self.out, "_ctx.bool_val(true)").ok();
+                    return;
+                }
+                self.errors
+                    .push("constraint index expression not supported in v0 solver path".into());
+                write!(self.out, "_ctx.bool_val(true)").ok();
+            }
             // `t.<name>` → _z_<name>. Strip the `t.` prefix.
             ExprKind::Field { target, name } => {
                 if let ExprKind::Ident(root) = &*target.kind {
                     if field_info.contains_key(&name.name)
                         && target_root.is_some_and(|expected| root.name == expected)
                     {
-                        write!(self.out, "_z_{}", name.name).ok();
+                        if field_info
+                            .get(&name.name)
+                            .and_then(|f| f.list.as_ref())
+                            .is_some()
+                        {
+                            self.errors.push(format!(
+                                "constraint references list field `{}` as a scalar; use `{}.len()`, `{}[index]`, or `sum({}[0..{}.len()])`",
+                                name.name, name.name, name.name, name.name, name.name
+                            ));
+                            write!(self.out, "_ctx.bool_val(true)").ok();
+                        } else {
+                            write!(self.out, "_z_{}", name.name).ok();
+                        }
                     } else if blocking && target_root.is_some_and(|expected| root.name != expected)
                     {
                         write!(self.out, "_ctx.bv_val((uint64_t)(").ok();
@@ -8138,7 +8719,19 @@ impl Emitter {
                 // Lets a constraint like `keep op != WRAP` work — the
                 // RHS isn't a field, it's the enum variant `WRAP`.
                 if field_info.contains_key(&id.name) {
-                    write!(self.out, "_z_{}", id.name).ok();
+                    if field_info
+                        .get(&id.name)
+                        .and_then(|f| f.list.as_ref())
+                        .is_some()
+                    {
+                        self.errors.push(format!(
+                            "constraint references list field `{}` as a scalar; use `{}.len()`, `{}[index]`, or `sum({}[0..{}.len()])`",
+                            id.name, id.name, id.name, id.name, id.name
+                        ));
+                        write!(self.out, "_ctx.bool_val(true)").ok();
+                    } else {
+                        write!(self.out, "_z_{}", id.name).ok();
+                    }
                 } else if let Some(idx) = self.enum_variants.get(&id.name).copied() {
                     write!(self.out, "_ctx.bv_val((uint64_t){}, {})", idx, width).ok();
                 } else if blocking && self.let_widths.contains_key(&id.name) {
@@ -8168,7 +8761,14 @@ impl Emitter {
             }
             ExprKind::Paren(inner) => {
                 write!(self.out, "(").ok();
-                self.emit_constraint_expr_w(inner, field_info, width, target_root, blocking);
+                self.emit_constraint_expr_w(
+                    inner,
+                    field_info,
+                    width,
+                    target_root,
+                    blocking,
+                    list_unroll_bounds,
+                );
                 write!(self.out, ")").ok();
             }
             ExprKind::Unary { op, expr } => {
@@ -8178,7 +8778,14 @@ impl Emitter {
                     UnaryOp::BitNot => "~",
                 };
                 write!(self.out, "{s}").ok();
-                self.emit_constraint_expr_w(expr, field_info, width, target_root, blocking);
+                self.emit_constraint_expr_w(
+                    expr,
+                    field_info,
+                    width,
+                    target_root,
+                    blocking,
+                    list_unroll_bounds,
+                );
             }
             // `e in <range-or-set>` parses as ExprKind::Membership
             // (not Binary(In, …) — the `in` keyword is lexed as
@@ -8193,6 +8800,7 @@ impl Emitter {
                     width,
                     target_root,
                     blocking,
+                    list_unroll_bounds,
                 );
             }
             ExprKind::Binary { op, lhs, rhs } => {
@@ -8209,6 +8817,7 @@ impl Emitter {
                         width,
                         target_root,
                         blocking,
+                        list_unroll_bounds,
                     );
                     return;
                 }
@@ -8260,14 +8869,42 @@ impl Emitter {
                 if let Some(fn_name) = fname {
                     // Unsigned op via z3::<fn>(lhs, rhs).
                     write!(self.out, "z3::{fn_name}(").ok();
-                    self.emit_constraint_expr_w(lhs, field_info, width, target_root, blocking);
+                    self.emit_constraint_expr_w(
+                        lhs,
+                        field_info,
+                        width,
+                        target_root,
+                        blocking,
+                        list_unroll_bounds,
+                    );
                     write!(self.out, ", ").ok();
-                    self.emit_constraint_expr_w(rhs, field_info, width, target_root, blocking);
+                    self.emit_constraint_expr_w(
+                        rhs,
+                        field_info,
+                        width,
+                        target_root,
+                        blocking,
+                        list_unroll_bounds,
+                    );
                     write!(self.out, ")").ok();
                 } else {
-                    self.emit_constraint_expr_w(lhs, field_info, width, target_root, blocking);
+                    self.emit_constraint_expr_w(
+                        lhs,
+                        field_info,
+                        width,
+                        target_root,
+                        blocking,
+                        list_unroll_bounds,
+                    );
                     write!(self.out, "{sep}").ok();
-                    self.emit_constraint_expr_w(rhs, field_info, width, target_root, blocking);
+                    self.emit_constraint_expr_w(
+                        rhs,
+                        field_info,
+                        width,
+                        target_root,
+                        blocking,
+                        list_unroll_bounds,
+                    );
                 }
             }
             _ => {
@@ -8298,6 +8935,7 @@ impl Emitter {
         width: u32,
         target_root: Option<&str>,
         blocking: bool,
+        list_unroll_bounds: &std::collections::HashMap<String, usize>,
     ) {
         match &*rhs.kind {
             ExprKind::RangeLit { lo, hi } => {
@@ -8306,14 +8944,42 @@ impl Emitter {
                 let signed = self.constraint_expr_is_signed(lhs, field_info);
                 if let Some(l) = lo {
                     if signed {
-                        self.emit_constraint_expr_w(lhs, field_info, width, target_root, blocking);
+                        self.emit_constraint_expr_w(
+                            lhs,
+                            field_info,
+                            width,
+                            target_root,
+                            blocking,
+                            list_unroll_bounds,
+                        );
                         write!(self.out, " >= ").ok();
-                        self.emit_constraint_expr_w(l, field_info, width, target_root, blocking);
+                        self.emit_constraint_expr_w(
+                            l,
+                            field_info,
+                            width,
+                            target_root,
+                            blocking,
+                            list_unroll_bounds,
+                        );
                     } else {
                         write!(self.out, "z3::uge(").ok();
-                        self.emit_constraint_expr_w(lhs, field_info, width, target_root, blocking);
+                        self.emit_constraint_expr_w(
+                            lhs,
+                            field_info,
+                            width,
+                            target_root,
+                            blocking,
+                            list_unroll_bounds,
+                        );
                         write!(self.out, ", ").ok();
-                        self.emit_constraint_expr_w(l, field_info, width, target_root, blocking);
+                        self.emit_constraint_expr_w(
+                            l,
+                            field_info,
+                            width,
+                            target_root,
+                            blocking,
+                            list_unroll_bounds,
+                        );
                         write!(self.out, ")").ok();
                     }
                     has_any = true;
@@ -8323,14 +8989,42 @@ impl Emitter {
                         write!(self.out, " && ").ok();
                     }
                     if signed {
-                        self.emit_constraint_expr_w(lhs, field_info, width, target_root, blocking);
+                        self.emit_constraint_expr_w(
+                            lhs,
+                            field_info,
+                            width,
+                            target_root,
+                            blocking,
+                            list_unroll_bounds,
+                        );
                         write!(self.out, " <= ").ok();
-                        self.emit_constraint_expr_w(h, field_info, width, target_root, blocking);
+                        self.emit_constraint_expr_w(
+                            h,
+                            field_info,
+                            width,
+                            target_root,
+                            blocking,
+                            list_unroll_bounds,
+                        );
                     } else {
                         write!(self.out, "z3::ule(").ok();
-                        self.emit_constraint_expr_w(lhs, field_info, width, target_root, blocking);
+                        self.emit_constraint_expr_w(
+                            lhs,
+                            field_info,
+                            width,
+                            target_root,
+                            blocking,
+                            list_unroll_bounds,
+                        );
                         write!(self.out, ", ").ok();
-                        self.emit_constraint_expr_w(h, field_info, width, target_root, blocking);
+                        self.emit_constraint_expr_w(
+                            h,
+                            field_info,
+                            width,
+                            target_root,
+                            blocking,
+                            list_unroll_bounds,
+                        );
                         write!(self.out, ")").ok();
                     }
                     has_any = true;
@@ -8360,6 +9054,7 @@ impl Emitter {
                                     width,
                                     target_root,
                                     blocking,
+                                    list_unroll_bounds,
                                 );
                             }
                             ExprKind::Paren(inner) => {
@@ -8370,6 +9065,7 @@ impl Emitter {
                                     width,
                                     target_root,
                                     blocking,
+                                    list_unroll_bounds,
                                 );
                             }
                             _ => {
@@ -8380,6 +9076,7 @@ impl Emitter {
                                     width,
                                     target_root,
                                     blocking,
+                                    list_unroll_bounds,
                                 );
                                 write!(self.out, " == ").ok();
                                 self.emit_constraint_expr_w(
@@ -8388,6 +9085,7 @@ impl Emitter {
                                     width,
                                     target_root,
                                     blocking,
+                                    list_unroll_bounds,
                                 );
                             }
                         }
@@ -8403,14 +9101,29 @@ impl Emitter {
                     width,
                     target_root,
                     blocking,
+                    list_unroll_bounds,
                 );
             }
             _ => {
                 // Fallback: treat rhs as a singleton — `a in b` becomes
                 // `a == b`. Same shape `emit_bin_membership` uses.
-                self.emit_constraint_expr_w(lhs, field_info, width, target_root, blocking);
+                self.emit_constraint_expr_w(
+                    lhs,
+                    field_info,
+                    width,
+                    target_root,
+                    blocking,
+                    list_unroll_bounds,
+                );
                 write!(self.out, " == ").ok();
-                self.emit_constraint_expr_w(rhs, field_info, width, target_root, blocking);
+                self.emit_constraint_expr_w(
+                    rhs,
+                    field_info,
+                    width,
+                    target_root,
+                    blocking,
+                    list_unroll_bounds,
+                );
             }
         }
     }
@@ -10607,6 +11320,15 @@ impl Emitter {
                 write!(self.out, "]").ok();
             }
             ExprKind::Call { callee, args } => {
+                if args.is_empty() {
+                    if let ExprKind::Field { target, name } = &*callee.kind {
+                        if name.name == "len" {
+                            self.emit_expr(target);
+                            write!(self.out, ".size()").ok();
+                            return;
+                        }
+                    }
+                }
                 // Env/test-level quiescence helper: `env.quiesced(N)`
                 // aggregates the built-in `idle(N)` predicate over all
                 // nested component fields registered under that component.
@@ -10969,10 +11691,113 @@ fn scoreboard_field_c_type(t: &TypeExpr) -> String {
     txn_field_c_type(t)
 }
 
+fn named_type_last_segment(t: &TypeExpr) -> Option<&str> {
+    match t {
+        TypeExpr::Named { name, .. } => name.segments.last().map(|s| s.name.as_str()),
+        _ => None,
+    }
+}
+
+fn is_list_type(t: &TypeExpr) -> bool {
+    matches!(named_type_last_segment(t), Some("list") | Some("List"))
+}
+
+fn list_type_args(t: &TypeExpr) -> Option<&[TypeArg]> {
+    match t {
+        TypeExpr::Named { generics, .. } if is_list_type(t) => Some(generics.as_slice()),
+        _ => None,
+    }
+}
+
+fn list_elem_type(t: &TypeExpr) -> Option<&TypeExpr> {
+    list_type_args(t)?.first().and_then(|arg| match arg {
+        TypeArg::Type(ty) => Some(ty),
+        _ => None,
+    })
+}
+
+fn type_arg_const_usize(arg: &TypeArg) -> Option<usize> {
+    match arg {
+        TypeArg::Expr(e) => const_usize_expr(e),
+        TypeArg::Named { value, .. } => const_usize_expr(value),
+        _ => None,
+    }
+}
+
+fn const_usize_expr(e: &Expr) -> Option<usize> {
+    match &*e.kind {
+        ExprKind::Paren(inner) => const_usize_expr(inner),
+        ExprKind::Int(s) => {
+            let stripped = s.replace('_', "");
+            if let Some(rest) = stripped
+                .strip_prefix("0x")
+                .or_else(|| stripped.strip_prefix("0X"))
+            {
+                usize::from_str_radix(rest, 16).ok()
+            } else if let Some(rest) = stripped
+                .strip_prefix("0b")
+                .or_else(|| stripped.strip_prefix("0B"))
+            {
+                usize::from_str_radix(rest, 2).ok()
+            } else {
+                stripped.parse::<usize>().ok()
+            }
+        }
+        _ => None,
+    }
+}
+
+fn list_max_len(t: &TypeExpr) -> Option<usize> {
+    let args = list_type_args(t)?;
+    for arg in args {
+        if let TypeArg::Named { name, value } = arg {
+            if name.name == "max" {
+                return const_usize_expr(value);
+            }
+        }
+    }
+    args.get(1).and_then(type_arg_const_usize)
+}
+
+fn scalar_field_shape(t: &TypeExpr) -> (u32, bool) {
+    match t {
+        TypeExpr::Builtin { name, args, .. } => match name {
+            BuiltinTy::UInt | BuiltinTy::Bits | BuiltinTy::UIntCap => {
+                (type_arg_width(args).unwrap_or(64), false)
+            }
+            BuiltinTy::SInt | BuiltinTy::SIntCap => (type_arg_width(args).unwrap_or(64), true),
+            BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => (1, false),
+            BuiltinTy::Int => (32, true),
+            _ => (64, false),
+        },
+        _ => (64, false),
+    }
+}
+
+fn list_field_info(t: &TypeExpr) -> Option<ListFieldInfo> {
+    if !is_list_type(t) {
+        return None;
+    }
+    let elem = list_elem_type(t)?;
+    let declared_max_len = list_max_len(t);
+    let (elem_width, elem_signed) = scalar_field_shape(elem);
+    Some(ListFieldInfo {
+        declared_max_len,
+        elem_width,
+        elem_signed,
+    })
+}
+
 /// Pick a C++ representation for a transaction field's HARC type. Conservative
 /// — small ints get widened to `uint64_t`/`int64_t`; bool stays bool; named
 /// types get the bare name (likely an enum which is `int64_t` in v0).
 fn txn_field_c_type(t: &TypeExpr) -> String {
+    if is_list_type(t) {
+        let inner = list_elem_type(t)
+            .map(txn_field_c_type)
+            .unwrap_or_else(|| "uint64_t".into());
+        return format!("std::vector<{inner}>");
+    }
     match t {
         TypeExpr::Builtin { name, args, .. } => match name {
             BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {
@@ -10997,6 +11822,9 @@ fn txn_field_c_type(t: &TypeExpr) -> String {
 fn field_default(f: &Field) -> String {
     if let Some(d) = &f.default {
         return format_simple_expr(d);
+    }
+    if is_list_type(&f.ty) {
+        return "{}".into();
     }
     match &f.ty {
         TypeExpr::Builtin { name, .. } => match name {
@@ -11235,6 +12063,9 @@ fn cpp_sint_for_width(w: Option<u32>) -> &'static str {
 }
 
 fn c_type_for(t: &TypeExpr) -> String {
+    if is_list_type(t) {
+        return txn_field_c_type(t);
+    }
     match t {
         TypeExpr::Builtin { name, args, .. } => match name {
             BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {

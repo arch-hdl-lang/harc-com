@@ -74,6 +74,11 @@ Randomization must be deterministic per seed. The long-term runtime model is:
 - reproducible model diversity that does not rely on ad hoc static blocking
   caches alone
 
+Transaction fields are random by default. HARC should not add a SystemVerilog-
+style `rand` marker for ordinary fields or future aggregate fields. The existing
+`!` marker is the opt-out: `!field` means the field is non-random and retains
+its current/default value unless user code assigns it directly.
+
 `dist` and field distribution attributes are semantic weights, not hard solver
 constraints. The implementation may use rejection sampling, randomized solver
 objectives, or a hybrid strategy, but the chosen behavior must be documented
@@ -105,6 +110,17 @@ preferences still need attention.
 TODO: full-width min/max and walking-pattern auto coverage for `>64`-bit fields
 requires wide solver/model extraction before generated goals can be represented
 safely without truncation.
+
+Future aggregate constraints should keep the same default-random rule. A random
+list/array should look like an ordinary transaction field, not `rand list<...>`.
+The list length should be exposed as a built-in list property or method, for
+example `items.len()`, rather than as a separate random field that users must
+manually keep coherent. A future syntax could model `items : list<uint<8>>` and
+use ordinary constraints such as `items.len() <= 16`; solver lowering can infer
+the finite unroll bound from those length constraints and lower
+`sum(items[0..items.len()]) == total` by unrolling guarded element terms. The
+exact syntax is still open, but the random/non-random split is not: aggregate
+fields are random unless prefixed with `!`.
 
 Declared covergroup crosses are separate from these solver preferences:
 `cross cp_a, cp_b, ...` is a functional coverage declaration. It is sampled at
