@@ -110,6 +110,14 @@ COVERAGE_WAIVERS: dict[str, list[CoverageWaiver]] = {
             "sel is 2 bits and all four case values are covered, making default unreachable",
         ),
     ],
+    "cvdp_copilot_simple_spi_0003": [
+        CoverageWaiver(
+            "spi_fsm.v",
+            120,
+            120,
+            "outer !i_enable and i_fault priority branches make those inner IDLE-condition subterms unreachable",
+        ),
+    ],
 }
 
 
