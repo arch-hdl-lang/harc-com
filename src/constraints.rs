@@ -217,6 +217,16 @@ pub enum ConstraintExpr {
         name: String,
         args: Vec<ConstraintExpr>,
     },
+    FieldMethodCall {
+        target: Box<ConstraintExpr>,
+        method: String,
+        args: Vec<ConstraintExpr>,
+    },
+    ForEach {
+        var: String,
+        iter: Box<ConstraintExpr>,
+        body: Vec<ConstraintExpr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -615,8 +625,23 @@ fn collect_constraint_refs(
     refs: &mut ConstraintRefs,
     errors: &mut Vec<ElaborationError>,
 ) {
+    let locals = BTreeMap::new();
+    collect_constraint_refs_with_locals(ir, span, ctx, &locals, refs, errors);
+}
+
+fn collect_constraint_refs_with_locals(
+    ir: &ConstraintExpr,
+    span: Span,
+    ctx: &RefValidationCtx<'_>,
+    locals: &BTreeMap<String, ()>,
+    refs: &mut ConstraintRefs,
+    errors: &mut Vec<ElaborationError>,
+) {
     match ir {
         ConstraintExpr::Ident(name) => {
+            if locals.contains_key(name) {
+                return;
+            }
             if ctx.params.contains_key(name) {
                 return;
             }
@@ -637,6 +662,9 @@ fn collect_constraint_refs(
             }
         }
         ConstraintExpr::FieldRef { root, field } => {
+            if locals.contains_key(root) {
+                return;
+            }
             if let Some(param_ty) = ctx.params.get(root) {
                 let Some(type_name) = param_ty.as_ref().and_then(|ty| ty.type_name.as_deref())
                 else {
@@ -694,27 +722,27 @@ fn collect_constraint_refs(
             }
         }
         ConstraintExpr::Unary { expr, .. } => {
-            collect_constraint_refs(expr, span, ctx, refs, errors)
+            collect_constraint_refs_with_locals(expr, span, ctx, locals, refs, errors)
         }
         ConstraintExpr::Binary { lhs, rhs, .. } => {
-            collect_constraint_refs(lhs, span, ctx, refs, errors);
-            collect_constraint_refs(rhs, span, ctx, refs, errors);
+            collect_constraint_refs_with_locals(lhs, span, ctx, locals, refs, errors);
+            collect_constraint_refs_with_locals(rhs, span, ctx, locals, refs, errors);
         }
         ConstraintExpr::Membership { expr, set } => {
-            collect_constraint_refs(expr, span, ctx, refs, errors);
-            collect_constraint_refs(set, span, ctx, refs, errors);
+            collect_constraint_refs_with_locals(expr, span, ctx, locals, refs, errors);
+            collect_constraint_refs_with_locals(set, span, ctx, locals, refs, errors);
         }
         ConstraintExpr::Range { lo, hi } => {
             if let Some(lo) = lo {
-                collect_constraint_refs(lo, span, ctx, refs, errors);
+                collect_constraint_refs_with_locals(lo, span, ctx, locals, refs, errors);
             }
             if let Some(hi) = hi {
-                collect_constraint_refs(hi, span, ctx, refs, errors);
+                collect_constraint_refs_with_locals(hi, span, ctx, locals, refs, errors);
             }
         }
         ConstraintExpr::Set(items) => {
             for item in items {
-                collect_constraint_refs(item, span, ctx, refs, errors);
+                collect_constraint_refs_with_locals(item, span, ctx, locals, refs, errors);
             }
         }
         ConstraintExpr::RelationCall { name, args } => {
@@ -727,7 +755,21 @@ fn collect_constraint_refs(
                 });
             }
             for arg in args {
-                collect_constraint_refs(arg, span, ctx, refs, errors);
+                collect_constraint_refs_with_locals(arg, span, ctx, locals, refs, errors);
+            }
+        }
+        ConstraintExpr::FieldMethodCall { target, args, .. } => {
+            collect_constraint_refs_with_locals(target, span, ctx, locals, refs, errors);
+            for arg in args {
+                collect_constraint_refs_with_locals(arg, span, ctx, locals, refs, errors);
+            }
+        }
+        ConstraintExpr::ForEach { var, iter, body } => {
+            collect_constraint_refs_with_locals(iter, span, ctx, locals, refs, errors);
+            let mut inner_locals = locals.clone();
+            inner_locals.insert(var.clone(), ());
+            for clause in body {
+                collect_constraint_refs_with_locals(clause, span, ctx, &inner_locals, refs, errors);
             }
         }
         ConstraintExpr::IntLiteral(_) | ConstraintExpr::BoolLiteral(_) => {}
@@ -833,9 +875,6 @@ fn lower_constraint_expr_inner(expr: &Expr) -> Result<ConstraintExpr, String> {
                 .collect::<Result<Vec<_>, _>>()?,
         )),
         ExprKind::Call { callee, args } => {
-            let ExprKind::Ident(id) = &*callee.kind else {
-                return Err("constraint call callee must be a relation name".into());
-            };
             let lowered_args = args
                 .iter()
                 .map(|arg| match arg {
@@ -843,11 +882,29 @@ fn lower_constraint_expr_inner(expr: &Expr) -> Result<ConstraintExpr, String> {
                     CallArg::Named { value, .. } => lower_constraint_expr_inner(value),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            if let ExprKind::Field { target, name } = &*callee.kind {
+                return Ok(ConstraintExpr::FieldMethodCall {
+                    target: Box::new(lower_constraint_expr_inner(target)?),
+                    method: name.name.clone(),
+                    args: lowered_args,
+                });
+            }
+            let ExprKind::Ident(id) = &*callee.kind else {
+                return Err("constraint call callee must be a relation name".into());
+            };
             Ok(ConstraintExpr::RelationCall {
                 name: id.name.clone(),
                 args: lowered_args,
             })
         }
+        ExprKind::ForEachConstraint { var, iter, body } => Ok(ConstraintExpr::ForEach {
+            var: var.name.clone(),
+            iter: Box::new(lower_constraint_expr_inner(iter)?),
+            body: body
+                .iter()
+                .map(lower_constraint_expr_inner)
+                .collect::<Result<Vec<_>, _>>()?,
+        }),
         other => Err(format!(
             "constraint expression `{:?}` is not supported by typed lowering",
             std::mem::discriminant(other)
