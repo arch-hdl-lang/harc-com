@@ -1,0 +1,17 @@
+// Regression fixture for issue #167: uint<64> fields with [unique] should
+// keep their high auto-coverage endpoints without relying on Z3's asserting
+// get_numeral_uint64() extraction path.
+
+transaction Uint64UniqueStim
+    data : uint<64> with [unique within test]
+end transaction Uint64UniqueStim
+
+test Uint64UniqueRandomizeTest
+    let dut : DummyDut
+    run
+        for i in 0 .. 34
+            let s : Uint64UniqueStim
+            randomize(s)
+        end for
+    end run
+end test Uint64UniqueRandomizeTest
