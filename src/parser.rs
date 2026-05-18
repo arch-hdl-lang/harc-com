@@ -2929,7 +2929,7 @@ impl Parser {
                 if self.check(TokenKind::With) {
                     self.advance();
                     while !self.check_end_keyword() {
-                        with_body.push(self.parse_expr()?);
+                        with_body.push(self.parse_constraint_expr()?);
                     }
                     self.expect_end_anon(TokenKind::Randomize)?;
                 }
@@ -2951,7 +2951,7 @@ impl Parser {
                 if self.check(TokenKind::With) {
                     self.advance();
                     while !self.check_end_keyword() {
-                        with_body.push(self.parse_expr()?);
+                        with_body.push(self.parse_constraint_expr()?);
                     }
                     self.expect_end_anon(TokenKind::Randomize)?;
                 }
@@ -3389,6 +3389,37 @@ impl Parser {
             },
             span: start.merge(end),
         })
+    }
+
+    fn parse_constraint_expr(&mut self) -> Result<Expr, CompileError> {
+        if self.check(TokenKind::For) {
+            return self.parse_foreach_constraint_expr();
+        }
+        self.parse_expr()
+    }
+
+    fn parse_foreach_constraint_expr(&mut self) -> Result<Expr, CompileError> {
+        let start = self.expect(TokenKind::For)?.span;
+        let var = if self.check(TokenKind::Underscore) {
+            let s = self.advance().unwrap().span;
+            Ident {
+                name: "_".into(),
+                span: s,
+            }
+        } else {
+            self.expect_ident()?
+        };
+        self.expect(TokenKind::In)?;
+        let iter = self.parse_expr()?;
+        let mut body = Vec::new();
+        while !self.check_end_keyword() {
+            body.push(self.parse_constraint_expr()?);
+        }
+        let end = self.expect_end_anon(TokenKind::For)?;
+        Ok(Expr::new(
+            ExprKind::ForEachConstraint { var, iter, body },
+            start.merge(end),
+        ))
     }
 
     fn parse_repeat_stmt(&mut self) -> Result<RepeatStmt, CompileError> {
@@ -4050,7 +4081,7 @@ impl Parser {
                 if self.check(TokenKind::With) {
                     self.advance();
                     while !self.check_end_keyword() {
-                        with_body.push(self.parse_expr()?);
+                        with_body.push(self.parse_constraint_expr()?);
                     }
                     self.expect_end_anon(TokenKind::Randomize)?;
                 }

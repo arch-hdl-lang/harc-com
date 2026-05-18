@@ -1176,9 +1176,7 @@ fn print_stmt(out: &mut String, s: &Stmt, depth: usize) {
             if !with_body.is_empty() {
                 writeln!(out, " with").ok();
                 for e in with_body {
-                    pad(out, depth + 1);
-                    print_expr(out, e);
-                    writeln!(out).ok();
+                    print_constraint_expr(out, e, depth + 1);
                 }
                 pad(out, depth);
                 writeln!(out, "end randomize").ok();
@@ -1581,10 +1579,40 @@ pub fn print_expr(out: &mut String, e: &Expr) {
             }
             write!(out, ")").ok();
         }
+        ExprKind::ForEachConstraint { var, iter, body } => {
+            write!(out, "for {} in ", var.name).ok();
+            print_expr(out, iter);
+            for e in body {
+                write!(out, " ").ok();
+                print_expr(out, e);
+            }
+            write!(out, " end for").ok();
+        }
         ExprKind::Membership { expr, set } => {
             print_expr(out, expr);
             write!(out, " in ").ok();
             print_expr(out, set);
+        }
+    }
+}
+
+fn print_constraint_expr(out: &mut String, e: &Expr, depth: usize) {
+    match &*e.kind {
+        ExprKind::ForEachConstraint { var, iter, body } => {
+            pad(out, depth);
+            write!(out, "for {} in ", var.name).ok();
+            print_expr(out, iter);
+            writeln!(out).ok();
+            for clause in body {
+                print_constraint_expr(out, clause, depth + 1);
+            }
+            pad(out, depth);
+            writeln!(out, "end for").ok();
+        }
+        _ => {
+            pad(out, depth);
+            print_expr(out, e);
+            writeln!(out).ok();
         }
     }
 }
