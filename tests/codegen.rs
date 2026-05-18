@@ -2150,6 +2150,35 @@ end test WalkingAutoCovPrefTest"#,
 }
 
 #[test]
+fn uint64_unique_randomize_uses_checked_model_extraction() {
+    let parsed = parse_source(
+        r#"transaction T
+    data : uint<64> with [unique within test]
+end transaction T
+
+test Uint64UniqueTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test Uint64UniqueTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("_data[34]")
+            && cpp.contains("18446744073709551615ULL")
+            && cpp.contains("9223372036854775808ULL")
+            && cpp.contains("z3::expr _eval_data = _m.eval(_z_data, true).simplify();")
+            && cpp.contains("if (!_eval_data.is_numeral_u64(_raw_data))")
+            && cpp.contains("uint64_t _val_data = (uint64_t)_raw_data;")
+            && !cpp.contains("_m.eval(_z_data).get_numeral_uint64()"),
+        "uint<64> unique randomize should keep high auto-coverage endpoints and avoid assert-heavy Z3 extraction; got:\n{cpp}",
+    );
+}
+
+#[test]
 fn unique_field_randomize_uses_recycling_solver_history() {
     let parsed = parse_source(
         r#"transaction T
@@ -2650,7 +2679,8 @@ end test SignedKeepTest"#,
         "signed comparisons should use Z3's signed infix operators, not z3::uge/ult; got:\n{cpp}"
     );
     assert!(
-        cpp.contains("int64_t _val_delta = (int64_t)_m.eval(_z_delta).get_numeral_uint64();"),
+        cpp.contains("z3::expr _eval_delta = _m.eval(_z_delta, true).simplify();")
+            && cpp.contains("int64_t _val_delta = (int64_t)_raw_delta;"),
         "signed fields should materialize model values as int64_t; got:\n{cpp}"
     );
 }
