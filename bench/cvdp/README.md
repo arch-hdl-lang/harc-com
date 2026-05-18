@@ -164,6 +164,7 @@ then removes known structural holes from Verilator's denominator before scoring.
 | `cellular_automata_0002` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `csr_using_apb_0005` | 100.00% | 100.00% | control | ≥90% | **PASS** |
 | `decode_firstbit_0017` | 100.00% | 93.33% | control | ≥90% | **PASS** |
+| `encoder_8b10b_0026` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `endian_swapper_0004` | 99.24% | 98.41% | control | ≥92% | **PASS** |
 | `fixed_arbiter_0004` | 100.00% | 100.00% | control | ≥95% | **PASS** |
 | `generic_nbit_counter_0013` | 100.00% | 100.00% | control | ≥100% | **PASS** |
@@ -177,15 +178,17 @@ then removes known structural holes from Verilator's denominator before scoring.
 | `nbit_swizzling_0009` | 100.00% | n/a | line | ≥100% | **PASS** |
 | `ring_token_0004` | 94.87% | 100.00% | control | ≥100% | **PASS** |
 | `secure_read_write_bus_0005` | 100.00% | 100.00% | control | ≥100% | **PASS** |
+| `secure_variable_timer_0006` | 100.00% | 100.00% | control | ≥98% | **PASS** |
 | `signed_adder_0003` | 100.00% | 100.00% | control | ≥99% | **PASS** |
 | `simple_spi_0003` | 98.06% | 100.00% | control | ≥94% | **PASS** |
 | `single_cycle_arbiter_0004` | 100.00% | n/a | line | ≥96% | **PASS** |
+| `skid_register_0004` | 100.00% | 100.00% | control | ≥98% | **PASS** |
 | `sram_fd_0024` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `static_branch_predict_0035` | 100.00% | n/a | line | ≥95% | **PASS** |
 
 ### Net scoreboard
 
-**33/33 PASS, 0/33 FAIL** under the semantic control metric plus explicit `.vlt`
+**36/36 PASS, 0/36 FAIL** under the semantic control metric plus explicit `.vlt`
 structural waivers. The false failures caused by toggle-as-BRDA accounting are
 removed from the scoreboard:
 
@@ -204,6 +207,8 @@ problem parameters or by source type width:
 - `bcd_adder_0007`: submodule `cin` inputs are tied constant in both DUT instances.
 - `binary_to_BCD_0030`: 8-bit input cannot make the hundreds BCD digit ≥5.
 - `decode_firstbit_0017`: default `OutputFormat_g=0` leaves the one-hot output branch unreachable.
+- `encoder_8b10b_0026`: the two-state `current_disparity` enum is reset and
+  assigned only valid states, making its `default` recovery line unreachable.
 - `nbit_swizzling_0009`: 2-bit `sel` covers every explicit case item, making `default` unreachable.
 - `simple_spi_0003`: outer `!i_enable` and `i_fault` priority branches make
   the corresponding subterms of the nested IDLE-state condition unreachable.
@@ -215,9 +220,16 @@ problem parameters or by source type width:
 - `csr_using_apb_0005` uses APB transaction randomization, relation inlining for
   invalid-address accesses, and 32-bit data auto coverage. It reaches 100% control.
 - `endian_swapper_0004` uses directed 64-bit walking/endpoint patterns and
-  randomized 32-bit halves. Direct `uint<64>` randomization currently trips a
-  Z3 numeral extraction assertion on high unsigned endpoints, so wide 64-bit
-  solver coverage is tracked as issue #167 rather than a DUT coverage gap.
+  randomized 32-bit halves. Direct `uint<64>` solver extraction is now covered
+  by the issue #167 regression fix, but this TB keeps the two-half stimulus
+  explicit so the byte-swapping intent stays obvious.
+- `skid_register_0004` uses `[unique within test]` on 32-bit payloads while
+  crossing upstream valid, downstream ready, and data endpoint/walking bins.
+- `encoder_8b10b_0026` combines exhaustive data symbols, directed control
+  symbols, relation-constrained control-symbol randomization, and single-cycle
+  staging to hit the control running-disparity branch.
+- `secure_variable_timer_0006` uses `wait until ... timeout`, unique randomized
+  4-bit delays, long counting waits, and start-pattern/ack coverage.
 - `restoring_division_0006` is currently not an authored scoreboard case because
   the DUT does not converge in Verilator at cycle 0, before testbench stimulus.
 

@@ -102,6 +102,14 @@ COVERAGE_WAIVERS: dict[str, list[CoverageWaiver]] = {
             "OutputFormat_g defaults to 0, so the one-hot output format branch is unreachable",
         ),
     ],
+    "cvdp_copilot_encoder_8b10b_0026": [
+        CoverageWaiver(
+            "encoder_8b10b.sv",
+            121,
+            121,
+            "current_disparity is reset and assigned only RD_MINUS/RD_PLUS, so the enum case default is unreachable",
+        ),
+    ],
     "cvdp_copilot_nbit_swizzling_0009": [
         CoverageWaiver(
             "nbit_swizzling.sv",

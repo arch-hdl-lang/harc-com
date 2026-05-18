@@ -1,0 +1,160 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_secure_variable_timer_0006`.
+//
+// Exercises start-pattern detection (`1101`), delay capture, long counting
+// waits, completion/ack recovery, overlapping patterns, reset during activity,
+// and solver-randomized delay values. The delay transaction uses `[unique]`
+// so random tests prefer fresh 4-bit durations while auto coverage steers
+// min/max and walking patterns.
+
+transaction TimerStim
+    delay : uint<4> with [unique within test]
+end transaction TimerStim
+
+covergroup TimerCov @(posedge dut.clk)
+    cp_data : cover dut.i_data_in
+        bins
+            zero = {0}
+            one = {1}
+        end bins
+
+    cp_ack : cover dut.i_ack
+        bins
+            low = {0}
+            high = {1}
+        end bins
+
+    cp_processing : cover dut.o_processing
+        bins
+            idle = {0}
+            busy = {1}
+        end bins
+
+    cp_completed : cover dut.o_completed
+        bins
+            low = {0}
+            high = {1}
+        end bins
+
+    cp_time_left : cover dut.o_time_left
+        bins
+            zero = {0}
+            one = {1}
+            mid = [2..14]
+            max = {15}
+        end bins
+
+    cross cp_processing, cp_completed
+    cross cp_ack, cp_completed
+    cross cp_data, cp_processing
+end covergroup TimerCov
+
+testbench SecureVariableTimerTb
+    dut : secure_variable_timer_top
+    cov : TimerCov
+end testbench SecureVariableTimerTb
+
+function reset_timer(dut: secure_variable_timer_top)
+    dut.i_rst_n = 0
+    dut.i_data_in = 0
+    dut.i_ack = 0
+    wait 3 cycles
+    assert dut.o_processing == 0 else fail("reset: processing expected low")
+    dut.i_rst_n = 1
+    wait 2 cycles
+end function reset_timer
+
+function send_bit(dut: secure_variable_timer_top, bit: bool)
+    dut.i_data_in = bit
+    wait 1 cycle
+end function send_bit
+
+function send_start_and_delay(dut: secure_variable_timer_top, delay: uint<4>)
+    // Pattern detector observes the prior 4-bit shift register, so the cycle
+    // after 1101 is a spacer; delay capture starts on the following cycle.
+    send_bit(dut, true)
+    send_bit(dut, true)
+    send_bit(dut, false)
+    send_bit(dut, true)
+    send_bit(dut, false)
+    send_bit(dut, ((delay >> 3) & 1) == 1)
+    send_bit(dut, ((delay >> 2) & 1) == 1)
+    send_bit(dut, ((delay >> 1) & 1) == 1)
+    send_bit(dut, (delay & 1) == 1)
+end function send_start_and_delay
+
+function run_timer(dut: secure_variable_timer_top, delay: uint<4>)
+    send_start_and_delay(dut, delay)
+    wait until dut.o_processing == 1 timeout 40 cycles fail("delay ${delay}: processing never asserted")
+    wait until dut.o_completed == 1 timeout 18000 cycles fail("delay ${delay}: completed never asserted")
+    dut.i_ack = 0
+    wait 2 cycles
+    dut.i_ack = 1
+    wait 1 cycle
+    dut.i_ack = 0
+    wait 2 cycles
+end function run_timer
+
+impl SecureVariableTimerTest for SecureVariableTimerTb
+    run
+        log(info, "secure_variable_timer: pattern detection, long waits, ack recovery, and unique random delays")
+
+        reset_timer(dut)
+
+        // No-start traffic: avoids 1101 while still toggling serial input.
+        send_bit(dut, false)
+        send_bit(dut, true)
+        send_bit(dut, false)
+        send_bit(dut, false)
+        send_bit(dut, true)
+        send_bit(dut, true)
+        send_bit(dut, false)
+        send_bit(dut, false)
+        wait 4 cycles
+        assert dut.o_processing == 0 else fail("no-start traffic entered processing")
+
+        // Directed endpoints and representative middle values.
+        run_timer(dut, 0)
+        run_timer(dut, 1)
+        run_timer(dut, 5)
+        run_timer(dut, 15)
+
+        // Overlapping start pattern like 11101, followed by a short delay.
+        send_bit(dut, true)
+        send_bit(dut, true)
+        send_bit(dut, true)
+        send_bit(dut, false)
+        send_bit(dut, true)
+        send_bit(dut, false)
+        send_bit(dut, false)
+        send_bit(dut, false)
+        send_bit(dut, true)
+        send_bit(dut, false)
+        wait until dut.o_completed == 1 timeout 6000 cycles fail("overlap pattern: completed never asserted")
+        dut.i_ack = 1
+        wait 1 cycle
+        dut.i_ack = 0
+        wait 2 cycles
+
+        for _ in 0 .. 6
+            let s : TimerStim
+            randomize(s)
+            reset_timer(dut)
+            run_timer(dut, s.delay)
+        end for
+
+        reset_timer(dut)
+        log(info, "ALL TESTS PASSED - secure_variable_timer")
+    end run
+
+    check
+        cov.report()
+
+        assert cov.cp_data.zero > 0 else fail("coverage hole: serial zero")
+        assert cov.cp_data.one > 0 else fail("coverage hole: serial one")
+        assert cov.cp_ack.high > 0 else fail("coverage hole: ack high")
+        assert cov.cp_processing.busy > 0 else fail("coverage hole: processing active")
+        assert cov.cp_completed.high > 0 else fail("coverage hole: completed high")
+        assert cov.cp_time_left.zero > 0 else fail("coverage hole: time_left zero")
+        assert cov.cp_time_left.one > 0 else fail("coverage hole: time_left one")
+    end check
+end impl SecureVariableTimerTest
