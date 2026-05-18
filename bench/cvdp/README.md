@@ -162,7 +162,9 @@ then removes known structural holes from Verilator's denominator before scoring.
 | `bcd_adder_0007` | 100.00% | n/a | line | ≥95% | **PASS** |
 | `binary_to_BCD_0030` | 100.00% | 100.00% | control | ≥90% | **PASS** |
 | `cellular_automata_0002` | 100.00% | 100.00% | control | ≥100% | **PASS** |
+| `csr_using_apb_0005` | 100.00% | 100.00% | control | ≥90% | **PASS** |
 | `decode_firstbit_0017` | 100.00% | 93.33% | control | ≥90% | **PASS** |
+| `endian_swapper_0004` | 99.24% | 98.41% | control | ≥92% | **PASS** |
 | `fixed_arbiter_0004` | 100.00% | 100.00% | control | ≥95% | **PASS** |
 | `generic_nbit_counter_0013` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `gray_to_binary_0014` | 100.00% | 100.00% | control | ≥95% | **PASS** |
@@ -176,13 +178,14 @@ then removes known structural holes from Verilator's denominator before scoring.
 | `ring_token_0004` | 94.87% | 100.00% | control | ≥100% | **PASS** |
 | `secure_read_write_bus_0005` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `signed_adder_0003` | 100.00% | 100.00% | control | ≥99% | **PASS** |
+| `simple_spi_0003` | 98.06% | 100.00% | control | ≥94% | **PASS** |
 | `single_cycle_arbiter_0004` | 100.00% | n/a | line | ≥96% | **PASS** |
 | `sram_fd_0024` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `static_branch_predict_0035` | 100.00% | n/a | line | ≥95% | **PASS** |
 
 ### Net scoreboard
 
-**30/30 PASS, 0/30 FAIL** under the semantic control metric plus explicit `.vlt`
+**33/33 PASS, 0/33 FAIL** under the semantic control metric plus explicit `.vlt`
 structural waivers. The false failures caused by toggle-as-BRDA accounting are
 removed from the scoreboard:
 
@@ -202,6 +205,21 @@ problem parameters or by source type width:
 - `binary_to_BCD_0030`: 8-bit input cannot make the hundreds BCD digit ≥5.
 - `decode_firstbit_0017`: default `OutputFormat_g=0` leaves the one-hot output branch unreachable.
 - `nbit_swizzling_0009`: 2-bit `sel` covers every explicit case item, making `default` unreachable.
+- `simple_spi_0003`: outer `!i_enable` and `i_fault` priority branches make
+  the corresponding subterms of the nested IDLE-state condition unreachable.
+
+### Latest auto-coverage stress findings
+
+- `simple_spi_0003` uses `[unique within test]` on 16-bit payloads plus natural
+  walking endpoints to cover normal transfers, fault, clear, and FSM state bins.
+- `csr_using_apb_0005` uses APB transaction randomization, relation inlining for
+  invalid-address accesses, and 32-bit data auto coverage. It reaches 100% control.
+- `endian_swapper_0004` uses directed 64-bit walking/endpoint patterns and
+  randomized 32-bit halves. Direct `uint<64>` randomization currently trips a
+  Z3 numeral extraction assertion on high unsigned endpoints, so wide 64-bit
+  solver coverage is tracked as issue #167 rather than a DUT coverage gap.
+- `restoring_division_0006` is currently not an authored scoreboard case because
+  the DUT does not converge in Verilator at cycle 0, before testbench stimulus.
 
 ### Metric caveats
 
