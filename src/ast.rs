@@ -1138,6 +1138,13 @@ pub enum ExprKind {
     SolveOrder {
         args: Vec<Expr>,
     },
+    /// Constraint-context foreach: `for item in list ... end for`.
+    /// Used inside `randomize ... with` / relation-like constraint bodies.
+    ForEachConstraint {
+        var: Ident,
+        iter: Expr,
+        body: Vec<Expr>,
+    },
     /// `e in <set-or-range>` membership test.
     Membership {
         expr: Expr,

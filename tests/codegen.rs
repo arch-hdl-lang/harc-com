@@ -1960,6 +1960,72 @@ end test ListConstraintTest"#,
 }
 
 #[test]
+fn constraint_solver_supports_modulo_of_list_sum() {
+    let parsed = parse_source(
+        r#"transaction Packet
+    items : list<uint<8>>
+end transaction Packet
+
+test ListModuloConstraintTest
+    let dut : DummyDut
+    run
+        let p : Packet
+        randomize(p) with
+            p.items.len() >= 1
+            p.items.len() <= 4
+            sum(p.items[0..p.items.len()]) % 4 == 0
+        end randomize
+    end run
+end test ListModuloConstraintTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("z3::urem("),
+        "modulo on list-sum constraints should lower through unsigned remainder; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("z3::ugt(_z_items_len, _ctx.bv_val((uint64_t)0, 64))")
+            && cpp.contains("_z_items_0"),
+        "modulo operand should preserve guarded list-sum lowering; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn constraint_solver_supports_foreach_list_item_constraints() {
+    let parsed = parse_source(
+        r#"transaction Packet
+    items : list<uint<8>>
+end transaction Packet
+
+test ListForeachConstraintTest
+    let dut : DummyDut
+    run
+        let p : Packet
+        randomize(p) with
+            p.items.len() >= 1
+            p.items.len() <= 4
+            for item in p.items
+                item > 0
+                item < 16
+            end for
+        end randomize
+    end run
+end test ListForeachConstraintTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("z3::ule(_z_items_len, _ctx.bv_val((uint64_t)0, 64)) || (z3::ugt(_z_items_0"),
+        "foreach should lower item constraints under a len<=index guard; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("z3::ult(_z_items_3, _ctx.bv_val((uint64_t)16, 64))"),
+        "foreach should unroll item constraints through the inferred length bound; got:\n{cpp}"
+    );
+}
+
+#[test]
 fn constraint_solver_seed_flows_from_harc_rng() {
     let parsed = parse_source(
         r#"transaction T
