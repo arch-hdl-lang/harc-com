@@ -26,7 +26,7 @@
 - Power / UPF verification — defer to ARCH side
 - Mixed-signal / AMS
 - Emulation backend beyond a synthesizable assertion subset (full TB-on-emulation deferred to v2)
-- Commercial-simulator DUT backends (VCS / Xcelium / Questa via DPI/VPI co-sim) — v1.1+; same DUT abstraction layer extended with vendor-specific eval shims
+- Commercial-simulator DUT backends (VCS / Xcelium / Questa via DPI-C co-sim) — v1.1+; same DUT abstraction layer extended with simulator-owned-time adapter shims
 - VHDL DUTs — v1.1+ via GHDL or Verilator's experimental VHDL path; the DUT abstraction layer admits this without redesign
 - Protocol-typed grouping of raw SV signals — v1 ships raw signal access; convention-based or explicit binding for `bus`-typed access deferred to v1.1 once real DUT integration experience informs the design
 
@@ -2226,7 +2226,7 @@ on dut.s_axi_awvalid && dut.s_axi_awready
 end on
 ```
 
-The implicit default is `kind arch` — an ordinary `module Foo ... end module Foo` declaration with HARC/ARCH source body uses the ARCH backend. `kind verilator` selects the Verilator compilation backend; v1.1+ adds `kind vcs`, `kind xcelium`, `kind ghdl` along the same pattern.
+The implicit default is `kind arch` — an ordinary `module Foo ... end module Foo` declaration with HARC/ARCH source body uses the ARCH backend. `kind verilator` selects the Verilator compilation backend; v1.1+ adds commercial co-sim targets (`kind vcs`, `kind xcelium`, `kind questa`) and `kind ghdl` along the same pattern.
 
 **v1 limitations of the Verilator path:**
 
@@ -2238,11 +2238,22 @@ The implicit default is `kind arch` — an ordinary `module Foo ... end module F
 **Why ship Verilator support in v1.** The ARCH-only path gates HARC adoption on ARCH adoption. Verilator-linked SV DUT support means existing SV codebases can be driven, observed, scoreboarded, and asserted on by HARC TBs without an HDL migration — the realistic adoption path. ARCH remains the primary, fastest, most expressive path; Verilator is the on-ramp.
 
 **v1.1+ DUT backends:**
-- **Commercial-simulator co-sim (VCS / Xcelium / Questa).** HARC TB process talks to the vendor sim through DPI-C (HARC TB compiled as a shared library that the vendor sim loads). Slower than co-compiled Verilator (one cycle = one DPI roundtrip) but covers proprietary HDL flows and unmodifiable encrypted IP.
+- **Commercial-simulator co-sim (VCS / Xcelium / Questa via DPI-C).** HARC lowers the testbench into a native runtime library loaded by the HDL simulator. The simulator owns time; HARC is a passive DPI-C runtime called from deterministic SV hook points such as reset/setup, clock-edge callbacks, and final/report. HARC coroutines are still the source execution model, but they resume cooperatively inside DPI entrypoints rather than running as independent OS threads that race the simulator.
+- **Verilator DPI-C co-sim pilot.** The open-source rehearsal for the commercial path uses Verilator's DPI-C support, not a separate Icarus/VPI backend. A generated SV harness instantiates the DUT, imports `harc_init`, `harc_on_posedge`, and `harc_finish`, and exports typed signal accessors/tasks for DUT reads and drives. This validates the same simulator-owned-time contract expected from VCS/Xcelium/Questa while keeping the current direct-Verilator C++ backend as the v1 fast path.
 - **VHDL DUTs.** Via GHDL co-sim or Verilator's experimental VHDL frontend. Same DUT abstraction layer; just a different eval shim.
 - **Protocol-typed grouping for raw SV signals.** Convention-based default (`<prefix>_<channel>_<signal>` auto-groups into protocol types) with explicit binding stubs as override. Lets HARC transactors written against `bus BusAxi4` work against SV DUTs without adapter code.
 
-The DUT backend abstraction makes all three v1.1+ paths straightforward additions, not architectural rewrites.
+The DPI-C co-sim backend contract is:
+
+1. The HDL simulator owns time and calls HARC from generated SV hook points.
+2. HARC owns testbench intent: coroutine scheduling, constraints, scoreboards, coverage, watchdogs, logging, and failure policy.
+3. Signal access crosses the boundary through generated typed SV accessors/tasks, not simulator-specific hierarchical strings in user code.
+4. HARC coroutines resume only inside DPI entrypoints. Background OS threads may service solver queues or file I/O, but they must not call into simulator-owned SV state directly.
+5. The same HARC source should run on the direct-Verilator backend for speed and on a DPI-C backend for vendor-flow compatibility, modulo documented limitations around timing regions and internal signal visibility.
+
+The DUT backend abstraction makes these v1.1+ paths straightforward additions, not architectural rewrites.
+
+The commercial co-sim contract deliberately excludes Icarus-specific VPI support from the roadmap. Icarus can be useful for ad-hoc DUT diagnosis, but HARC's planned portable co-sim surface is DPI-C with simulator-owned time, typed SV accessors, and a passive HARC coroutine scheduler. Backend work should not introduce an Icarus-only VPI abstraction unless a future spec revision explicitly scopes it.
 
 ---
 
