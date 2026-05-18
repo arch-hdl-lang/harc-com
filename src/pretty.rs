@@ -814,10 +814,7 @@ fn print_txn_body_item(out: &mut String, it: &TxnBodyItem, depth: usize) {
     match it {
         TxnBodyItem::Field(f) => print_field(out, f, depth),
         TxnBodyItem::Keep(k) => {
-            pad(out, depth);
-            write!(out, "keep ").ok();
-            print_expr(out, &k.expr);
-            writeln!(out).ok();
+            print_keep_expr(out, &k.expr, depth);
         }
         TxnBodyItem::When(w) => {
             pad(out, depth);
@@ -1611,6 +1608,28 @@ fn print_constraint_expr(out: &mut String, e: &Expr, depth: usize) {
         }
         _ => {
             pad(out, depth);
+            print_expr(out, e);
+            writeln!(out).ok();
+        }
+    }
+}
+
+fn print_keep_expr(out: &mut String, e: &Expr, depth: usize) {
+    match &*e.kind {
+        ExprKind::ForEachConstraint { var, iter, body } => {
+            pad(out, depth);
+            write!(out, "keep for {} in ", var.name).ok();
+            print_expr(out, iter);
+            writeln!(out).ok();
+            for clause in body {
+                print_constraint_expr(out, clause, depth + 1);
+            }
+            pad(out, depth);
+            writeln!(out, "end for").ok();
+        }
+        _ => {
+            pad(out, depth);
+            write!(out, "keep ").ok();
             print_expr(out, e);
             writeln!(out).ok();
         }

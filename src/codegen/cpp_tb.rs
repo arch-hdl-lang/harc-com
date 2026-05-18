@@ -252,8 +252,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // `for test in &tests`). The shared `dut_type` resolved above is
     // used by file-scope code paths that need the DUT module name.
 
-    // Collect transactions + enums + scoreboards + monitors for typed-let
-    // emission.
+    // Collect records + enums + scoreboards + monitors for typed-let
+    // emission. Transactions and structs both lower as value-records;
+    // transaction-specific behavior (keeps, transactor-facing metadata)
+    // is layered on top.
+    let mut structs = std::collections::HashSet::new();
     let mut transactions = std::collections::HashSet::new();
     let mut scoreboards = std::collections::HashSet::new();
     let mut components: std::collections::HashMap<String, ComponentDecl> =
@@ -391,46 +394,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                     .iter()
                     .filter_map(|it| match it {
                         TxnBodyItem::Field(f) => {
-                            let list = list_field_info(&f.ty);
-                            let (width, signed, enum_variants, enum_variant_labels) = match &f.ty {
-                                TypeExpr::Builtin { name, args, .. } => match name {
-                                    BuiltinTy::UInt | BuiltinTy::Bits | BuiltinTy::UIntCap => {
-                                        (type_arg_width(args).unwrap_or(64), false, None, None)
-                                    }
-                                    BuiltinTy::SInt | BuiltinTy::SIntCap => {
-                                        (type_arg_width(args).unwrap_or(64), true, None, None)
-                                    }
-                                    BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => {
-                                        (1, false, None, None)
-                                    }
-                                    BuiltinTy::Int => (32, true, None, None),
-                                    _ => (64, false, None, None),
-                                },
-                                TypeExpr::Named { name, .. } => {
-                                    let last =
-                                        name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
-                                    if let Some(&n) = enums.get(last) {
-                                        (
-                                            enum_width(n),
-                                            false,
-                                            Some(n),
-                                            enum_domains.get(last).cloned(),
-                                        )
-                                    } else {
-                                        (64, false, None, None)
-                                    }
-                                }
-                            };
-                            Some(TxnFieldInfo {
-                                name: f.name.name.clone(),
-                                width,
-                                signed,
-                                enum_variants,
-                                enum_variant_labels,
-                                list,
-                                non_random: f.non_random,
-                                attrs: f.attrs.clone(),
-                            })
+                            Some(txn_field_info_from_field(f, &enums, &enum_domains))
                         }
                         _ => None,
                     })
@@ -447,6 +411,15 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                 if !keeps.is_empty() {
                     txn_keeps.insert(t.name.name.clone(), keeps);
                 }
+            }
+            Item::Struct(s) => {
+                structs.insert(s.name.name.clone());
+                let fields = s
+                    .fields
+                    .iter()
+                    .map(|f| txn_field_info_from_field(f, &enums, &enum_domains))
+                    .collect();
+                txn_fields.insert(s.name.name.clone(), fields);
             }
             Item::Enum(e) => {
                 enums.insert(e.name.name.clone(), e.variants.len());
@@ -483,6 +456,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         let_widths: std::collections::HashMap::new(),
         let_modes: std::collections::HashMap::new(),
         transactions,
+        structs,
         scoreboards,
         components,
         covergroups,
@@ -770,7 +744,15 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "").ok();
     }
 
-    // ── Transaction structs + per-type randomize_T(&t) functions ─────────
+    // ── Shared HVL value records ────────────────────────────────────────
+    // Structs and transactions share the C++ record/equality/randomize
+    // lowering. Transactions layer keeps and protocol-facing semantics at
+    // the randomize call site and in transactors.
+    for it in &file.items {
+        if let Item::Struct(s) = it {
+            e.emit_struct_record(s);
+        }
+    }
     for it in &file.items {
         if let Item::Transaction(t) = it {
             e.emit_transaction(t);
@@ -2202,6 +2184,50 @@ struct ListFieldInfo {
     elem_signed: bool,
 }
 
+fn txn_field_info_from_field(
+    f: &Field,
+    enums: &std::collections::HashMap<String, usize>,
+    enum_domains: &std::collections::HashMap<String, Vec<String>>,
+) -> TxnFieldInfo {
+    let list = list_field_info(&f.ty);
+    let (width, signed, enum_variants, enum_variant_labels) = match &f.ty {
+        TypeExpr::Builtin { name, args, .. } => match name {
+            BuiltinTy::UInt | BuiltinTy::Bits | BuiltinTy::UIntCap => {
+                (type_arg_width(args).unwrap_or(64), false, None, None)
+            }
+            BuiltinTy::SInt | BuiltinTy::SIntCap => {
+                (type_arg_width(args).unwrap_or(64), true, None, None)
+            }
+            BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => (1, false, None, None),
+            BuiltinTy::Int => (32, true, None, None),
+            _ => (64, false, None, None),
+        },
+        TypeExpr::Named { name, .. } => {
+            let last = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+            if let Some(&n) = enums.get(last) {
+                (
+                    enum_width(n),
+                    false,
+                    Some(n),
+                    enum_domains.get(last).cloned(),
+                )
+            } else {
+                (0, false, None, None)
+            }
+        }
+    };
+    TxnFieldInfo {
+        name: f.name.name.clone(),
+        width,
+        signed,
+        enum_variants,
+        enum_variant_labels,
+        list,
+        non_random: f.non_random,
+        attrs: f.attrs.clone(),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AutoCoverageGoal {
     field: String,
@@ -2950,6 +2976,10 @@ struct Emitter {
     /// Set of transaction type names emitted in this file — guards against
     /// `randomize(t)` against a non-transaction type.
     transactions: std::collections::HashSet<String>,
+    /// Set of plain struct record type names emitted in this file.
+    /// Structs share the value-record C++ lowering with transactions;
+    /// transactions add HVL/protocol semantics on top.
+    structs: std::collections::HashSet<String>,
     /// Set of scoreboard type names emitted in this file. `let sb : X`
     /// where X is in this set lowers to `X sb;` (default-constructed)
     /// rather than the int64_t fallback.
@@ -6448,7 +6478,7 @@ impl Emitter {
                     last.to_string()
                 }
             }
-            _ => txn_field_c_type(t),
+            _ => self.record_field_c_type(t),
         }
     }
 
@@ -6462,18 +6492,18 @@ impl Emitter {
         match arg {
             Some(TypeArg::Type(ty)) => {
                 if let Some(name) = type_simple_name(Some(ty)) {
-                    if self.transactions.contains(name) || self.enums.contains_key(name) {
+                    if self.is_record_type(name) || self.enums.contains_key(name) {
                         return name.to_string();
                     }
                 }
-                txn_field_c_type(ty)
+                self.record_field_c_type(ty)
             }
             Some(TypeArg::Expr(e)) => {
                 // `event<RegOp>` parses as TypeArg::Expr(Ident) at the
                 // type-arg layer — the parser doesn't always know the
                 // arg's a type until the user actually references it.
                 if let ExprKind::Ident(id) = &*e.kind {
-                    if self.transactions.contains(&id.name) || self.enums.contains_key(&id.name) {
+                    if self.is_record_type(&id.name) || self.enums.contains_key(&id.name) {
                         return id.name.clone();
                     }
                 }
@@ -6506,41 +6536,68 @@ impl Emitter {
         writeln!(self.out, "").ok();
     }
 
-    /// Emit a transaction as a C++ struct + a `randomize_T(&t)` function
-    /// that fills random fields per-attribute. Non-random (`!`-prefixed)
-    /// fields are zero-initialized in the struct's default ctor and left
-    /// alone by randomize. The user can set them in code.
-    fn emit_transaction(&mut self, t: &TransactionDecl) {
-        // Struct definition.
-        writeln!(self.out, "struct {} {{", t.name.name).ok();
-        for it in &t.body {
-            if let TxnBodyItem::Field(f) = it {
-                let cty = txn_field_c_type(&f.ty);
-                let init = field_default(f);
-                writeln!(self.out, "{INDENT}{cty} {} = {init};", f.name.name).ok();
+    fn is_record_type(&self, name: &str) -> bool {
+        self.transactions.contains(name) || self.structs.contains(name)
+    }
+
+    fn record_field_c_type(&self, t: &TypeExpr) -> String {
+        if is_list_type(t) {
+            let inner = list_elem_type(t)
+                .map(|ty| self.record_field_c_type(ty))
+                .unwrap_or_else(|| "uint64_t".into());
+            return format!("std::vector<{inner}>");
+        }
+        if let TypeExpr::Named { name, .. } = t {
+            if let Some(last) = name.segments.last().map(|s| s.name.as_str()) {
+                if self.is_record_type(last) {
+                    return last.to_string();
+                }
             }
+        }
+        txn_field_c_type(t)
+    }
+
+    fn record_field_default(&self, f: &Field) -> String {
+        if let Some(d) = &f.default {
+            return format_simple_expr(d);
+        }
+        if is_list_type(&f.ty) {
+            return "{}".into();
+        }
+        if let TypeExpr::Named { name, .. } = &f.ty {
+            if name
+                .segments
+                .last()
+                .is_some_and(|s| self.is_record_type(&s.name))
+            {
+                return "{}".into();
+            }
+        }
+        field_default(f)
+    }
+
+    fn emit_record_struct(&mut self, name: &str, fields: &[Field]) {
+        writeln!(self.out, "struct {name} {{").ok();
+        for f in fields {
+            let cty = self.record_field_c_type(&f.ty);
+            let init = self.record_field_default(f);
+            writeln!(self.out, "{INDENT}{cty} {} = {init};", f.name.name).ok();
         }
         writeln!(self.out, "}};").ok();
 
-        // Structural equality (spec §3.3) — transactions are value records
-        // with built-in deep-equal semantics. UVM's `t.compare(exp)` boils
-        // down to this for free. `!=` follows by negation.
-        let field_names: Vec<&str> = t
-            .body
-            .iter()
-            .filter_map(|it| match it {
-                TxnBodyItem::Field(f) => Some(f.name.name.as_str()),
-                _ => None,
-            })
-            .collect();
+        let field_names: Vec<&str> = fields.iter().map(|f| f.name.name.as_str()).collect();
         if field_names.is_empty() {
-            writeln!(self.out, "inline bool operator==(const {0}& a, const {0}& b) {{ (void)a; (void)b; return true; }}",
-                t.name.name).ok();
+            writeln!(
+                self.out,
+                "inline bool operator==(const {0}& a, const {0}& b) {{ (void)a; (void)b; return true; }}",
+                name
+            )
+            .ok();
         } else {
             write!(
                 self.out,
                 "inline bool operator==(const {0}& a, const {0}& b) {{ return ",
-                t.name.name
+                name
             )
             .ok();
             for (i, fname) in field_names.iter().enumerate() {
@@ -6554,33 +6611,51 @@ impl Emitter {
         writeln!(
             self.out,
             "inline bool operator!=(const {0}& a, const {0}& b) {{ return !(a == b); }}",
-            t.name.name
+            name
         )
         .ok();
         writeln!(self.out, "").ok();
+    }
 
-        // randomize_T(t) function.
-        writeln!(
-            self.out,
-            "static void randomize_{}({}* t) {{",
-            t.name.name, t.name.name
-        )
-        .ok();
-        for it in &t.body {
-            if let TxnBodyItem::Field(f) = it {
-                if f.non_random {
-                    if let Some(d) = &f.default {
-                        write!(self.out, "{INDENT}t->{} = ", f.name.name).ok();
-                        self.emit_expr(d);
-                        writeln!(self.out, ";").ok();
-                    }
-                    continue;
+    fn emit_record_randomize_fn(&mut self, name: &str, fields: &[Field]) {
+        writeln!(self.out, "static void randomize_{name}({name}* t) {{").ok();
+        for f in fields {
+            if f.non_random {
+                if let Some(d) = &f.default {
+                    write!(self.out, "{INDENT}t->{} = ", f.name.name).ok();
+                    self.emit_expr(d);
+                    writeln!(self.out, ";").ok();
                 }
-                self.emit_field_random(f);
+                continue;
             }
+            self.emit_field_random(f);
         }
         writeln!(self.out, "}}").ok();
         writeln!(self.out, "").ok();
+    }
+
+    /// Emit a plain `struct` as the shared value-record shape. It gets
+    /// the same PRNG helper as a transaction; transaction-only features
+    /// such as top-level keeps stay layered in the randomize call path.
+    fn emit_struct_record(&mut self, s: &StructDecl) {
+        self.emit_record_struct(&s.name.name, &s.fields);
+        self.emit_record_randomize_fn(&s.name.name, &s.fields);
+    }
+
+    /// Emit a transaction as the shared value-record shape plus a
+    /// `randomize_T(&t)` function. Transaction keeps are not emitted here;
+    /// the call site merges them into the solver path.
+    fn emit_transaction(&mut self, t: &TransactionDecl) {
+        let fields: Vec<Field> = t
+            .body
+            .iter()
+            .filter_map(|it| match it {
+                TxnBodyItem::Field(f) => Some(f.clone()),
+                _ => None,
+            })
+            .collect();
+        self.emit_record_struct(&t.name.name, &fields);
+        self.emit_record_randomize_fn(&t.name.name, &fields);
     }
 
     fn emit_randomize_trace_event(&mut self, ty: &str, target: &Expr, depth: usize) {
@@ -6596,13 +6671,18 @@ impl Emitter {
             escape_c(ty)
         )
         .ok();
-        for (i, f) in fields.iter().enumerate() {
+        let mut emitted = 0usize;
+        for f in &fields {
+            if f.width == 0 && f.list.is_none() {
+                continue;
+            }
             self.pad(depth + 1);
-            let prefix = if i == 0 {
+            let prefix = if emitted == 0 {
                 format!("\\\"{}\\\":", escape_c(&f.name))
             } else {
                 format!(",\\\"{}\\\":", escape_c(&f.name))
             };
+            emitted += 1;
             write!(
                 self.out,
                 "_trace_fields += \"{prefix}\" + std::to_string((unsigned long long)("
@@ -6833,6 +6913,9 @@ impl Emitter {
                 }
             }
             ExprKind::Call { callee, args } => {
+                if list_len_call_field_name(expr, field_info, target_root).is_some() {
+                    return;
+                }
                 self.validate_randomize_constraint_dependencies(
                     ty,
                     callee,
@@ -7156,6 +7239,8 @@ impl Emitter {
                         f.name.name, hi
                     )
                     .ok();
+                } else if self.is_record_type(last) {
+                    writeln!(self.out, "{INDENT}randomize_{last}(&t->{});", f.name.name).ok();
                 } else {
                     writeln!(
                         self.out,
@@ -7646,6 +7731,9 @@ impl Emitter {
                 }
                 continue;
             }
+            if f.width == 0 {
+                continue;
+            }
             self.pad(depth + 1);
             writeln!(
                 self.out,
@@ -7788,7 +7876,9 @@ impl Emitter {
         let cache_tag = format!("_div_cache_{}", target.span.start);
         let mut free_fields: Vec<&TxnFieldInfo> = fields
             .iter()
-            .filter(|f| f.list.is_none() && !f.non_random && !pinned.contains(&f.name))
+            .filter(|f| {
+                f.list.is_none() && f.width > 0 && !f.non_random && !pinned.contains(&f.name)
+            })
             .collect();
         let free_field_names: std::collections::HashSet<String> =
             free_fields.iter().map(|f| f.name.clone()).collect();
@@ -8429,6 +8519,9 @@ impl Emitter {
                 }
                 continue;
             }
+            if f.width == 0 {
+                continue;
+            }
             // Every declared field is assigned from the model — equality-
             // pinned fields take their constrained value; free fields take
             // a Z3-chosen satisfying value. Only free fields get pushed
@@ -8802,6 +8895,12 @@ impl Emitter {
                                 name.name, name.name, name.name, name.name, name.name
                             ));
                             write!(self.out, "_ctx.bool_val(true)").ok();
+                        } else if field_info.get(&name.name).is_some_and(|f| f.width == 0) {
+                            self.errors.push(format!(
+                                "constraint references composite field `{}` as a scalar; nested record constraint flattening is not supported yet",
+                                name.name
+                            ));
+                            write!(self.out, "_ctx.bool_val(true)").ok();
                         } else {
                             write!(self.out, "_z_{}", name.name).ok();
                         }
@@ -8838,6 +8937,12 @@ impl Emitter {
                         self.errors.push(format!(
                             "constraint references list field `{}` as a scalar; use `{}.len()`, `{}[index]`, or `sum({}[0..{}.len()])`",
                             id.name, id.name, id.name, id.name, id.name
+                        ));
+                        write!(self.out, "_ctx.bool_val(true)").ok();
+                    } else if field_info.get(&id.name).is_some_and(|f| f.width == 0) {
+                        self.errors.push(format!(
+                            "constraint references composite field `{}` as a scalar; nested record constraint flattening is not supported yet",
+                            id.name
                         ));
                         write!(self.out, "_ctx.bool_val(true)").ok();
                     } else {
@@ -9962,10 +10067,10 @@ impl Emitter {
                     _ => None,
                 };
                 let ty = match ty {
-                    Some(t) if self.transactions.contains(&t) => t,
+                    Some(t) if self.is_record_type(&t) => t,
                     Some(t) => {
                         self.errors.push(format!(
-                            "randomize(t): t has type `{t}` but no `transaction {t}` is declared in this file"
+                            "randomize(t): t has type `{t}` but no `transaction {t}` or `struct {t}` is declared in this file"
                         ));
                         return;
                     }
@@ -10382,7 +10487,7 @@ impl Emitter {
             let inner = args
                 .first()
                 .map(|a| match a {
-                    TypeArg::Type(t) => txn_field_c_type(t),
+                    TypeArg::Type(t) => self.record_field_c_type(t),
                     _ => "uint64_t".into(),
                 })
                 .unwrap_or_else(|| "uint64_t".into());
@@ -10428,7 +10533,7 @@ impl Emitter {
             // transactor arm below).
             let simple = type_simple_name(Some(t));
             if let Some(name) = simple {
-                if self.transactions.contains(name) || self.scoreboards.contains(name) {
+                if self.is_record_type(name) || self.scoreboards.contains(name) {
                     writeln!(self.out, "{name} {};", l.name.name).ok();
                     return;
                 }
@@ -11680,6 +11785,14 @@ impl Emitter {
 ///     `[unique]` fields, or auto coverage goals — also solver (keeps and
 ///     policy preferences are call-site constraints)
 pub fn uses_constraint_solver(file: &SourceFile) -> bool {
+    let enum_names: std::collections::HashSet<&str> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Enum(e) => Some(e.name.name.as_str()),
+            _ => None,
+        })
+        .collect();
     // First pass: collect names of transactions whose bare `randomize(t)`
     // needs the solver path. False positives are cheap (an unused include);
     // false negatives are compile failures.
@@ -11688,8 +11801,15 @@ pub fn uses_constraint_solver(file: &SourceFile) -> bool {
         .iter()
         .filter_map(|it| match it {
             Item::Transaction(t) => {
-                if txn_body_has_keep(&t.body) || txn_body_has_solver_policy(&t.body) {
+                if txn_body_has_keep(&t.body) || txn_body_has_solver_policy(&t.body, &enum_names) {
                     Some(t.name.name.as_str())
+                } else {
+                    None
+                }
+            }
+            Item::Struct(s) => {
+                if fields_have_solver_policy(&s.fields, &enum_names) {
+                    Some(s.name.name.as_str())
                 } else {
                     None
                 }
@@ -13898,15 +14018,27 @@ fn txn_body_has_keep(items: &[TxnBodyItem]) -> bool {
     })
 }
 
-fn txn_body_has_solver_policy(items: &[TxnBodyItem]) -> bool {
+fn txn_body_has_solver_policy(
+    items: &[TxnBodyItem],
+    enum_names: &std::collections::HashSet<&str>,
+) -> bool {
     items.iter().any(|item| match item {
-        TxnBodyItem::Field(f) => txn_field_has_solver_policy(f),
-        TxnBodyItem::When(w) => txn_body_has_solver_policy(&w.items),
+        TxnBodyItem::Field(f) => txn_field_has_solver_policy(f, enum_names),
+        TxnBodyItem::When(w) => txn_body_has_solver_policy(&w.items, enum_names),
         TxnBodyItem::Keep(_) => false,
     })
 }
 
-fn txn_field_has_solver_policy(f: &Field) -> bool {
+fn fields_have_solver_policy(
+    fields: &[Field],
+    enum_names: &std::collections::HashSet<&str>,
+) -> bool {
+    fields
+        .iter()
+        .any(|field| txn_field_has_solver_policy(field, enum_names))
+}
+
+fn txn_field_has_solver_policy(f: &Field, enum_names: &std::collections::HashSet<&str>) -> bool {
     if f.attrs
         .iter()
         .any(|a| a.name.name == "unique" || a.name.name == "range")
@@ -13922,9 +14054,10 @@ fn txn_field_has_solver_policy(f: &Field) -> bool {
             }
             _ => false,
         },
-        // Named transaction fields may be enums; treat them as solver-bearing
-        // here so the Z3 include decision conservatively matches codegen.
-        TypeExpr::Named { .. } => true,
+        TypeExpr::Named { name, .. } => name
+            .segments
+            .last()
+            .is_some_and(|segment| enum_names.contains(segment.name.as_str())),
     }
 }
 
@@ -13957,6 +14090,19 @@ fn collect_txn_keeps_with_guard(items: &[TxnBodyItem], guard: Option<Expr>, out:
 }
 
 fn guarded_keep_expr(guard: Expr, keep: Expr, span: Span) -> Expr {
+    if let ExprKind::ForEachConstraint { var, iter, body } = &*keep.kind {
+        return Expr::new(
+            ExprKind::ForEachConstraint {
+                var: var.clone(),
+                iter: iter.clone(),
+                body: body
+                    .iter()
+                    .map(|clause| guarded_keep_expr(guard.clone(), clause.clone(), clause.span))
+                    .collect(),
+            },
+            span,
+        );
+    }
     let not_guard = Expr::new(
         ExprKind::Unary {
             op: UnaryOp::Not,

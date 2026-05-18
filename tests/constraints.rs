@@ -101,6 +101,42 @@ end transaction AxiTxn"#,
 }
 
 #[test]
+fn elaborates_foreach_keep_constraint_ir() {
+    let parsed = parse_source(
+        r#"transaction Packet
+    items : list<uint<8>>
+    keep items.len() <= 4
+    keep for item in items
+        item > 0
+        item < 16
+    end for
+end transaction Packet"#,
+    )
+    .unwrap();
+
+    let elaborated = elaborate_constraints(&parsed);
+    assert!(elaborated.errors.is_empty(), "{:?}", elaborated.errors);
+    let txn = elaborated.transaction("Packet").expect("Packet schema");
+    assert_eq!(txn.keeps.len(), 2);
+    let foreach = txn.keeps[1].ir.as_ref().expect("foreach IR");
+    let ConstraintExpr::ForEach { var, iter, body } = foreach else {
+        panic!("expected foreach constraint IR, got {foreach:?}");
+    };
+    assert_eq!(var, "item");
+    assert!(matches!(&**iter, ConstraintExpr::Ident(name) if name == "items"));
+    assert_eq!(body.len(), 2);
+    assert!(matches!(
+        &body[0],
+        ConstraintExpr::Binary {
+            op: ConstraintBinaryOp::Gt,
+            ..
+        }
+    ));
+    assert_eq!(txn.keeps[1].refs.fields.len(), 1);
+    assert_eq!(txn.keeps[1].refs.fields[0].field, "items");
+}
+
+#[test]
 fn elaborates_relation_metadata() {
     let parsed = parse_source(
         r#"transaction T
