@@ -1883,6 +1883,83 @@ end test MergeTest"#,
 }
 
 #[test]
+fn transaction_list_fields_randomize_and_support_len_method() {
+    let parsed = parse_source(
+        r#"transaction Packet
+    items : list<uint<8>>
+end transaction Packet
+
+test ListRandomizeTest
+    let dut : DummyDut
+    run
+        let p : Packet
+        randomize(p) with
+            p.items.len() <= 4
+        end randomize
+        assert p.items.len() <= 4
+    end run
+end test ListRandomizeTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("std::vector<uint64_t> items = {};"),
+        "list fields should lower to std::vector storage; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("p.items.resize((size_t)_raw_items_len);"),
+        "solver randomize should choose the intrinsic list length; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("p.items.size() <= 4"),
+        "`items.len()` should lower to the vector size method; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn constraint_solver_supports_list_len_and_sum_slice() {
+    let parsed = parse_source(
+        r#"transaction Packet
+    items : list<uint<8>>
+    total : uint<10>
+end transaction Packet
+
+test ListConstraintTest
+    let dut : DummyDut
+    run
+        let p : Packet
+        randomize(p) with
+            p.items.len() >= 1
+            p.items.len() <= 4
+            sum(p.items[0..p.items.len()]) == p.total
+            p.total == 7
+        end randomize
+    end run
+end test ListConstraintTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("z3::expr _z_items_len = _ctx.bv_const(\"items_len\", 64);"),
+        "solver should allocate a length variable for list fields; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("z3::expr _z_items_0 = _ctx.bv_const(\"items_0\", 64);")
+            && cpp.contains("z3::expr _z_items_3 = _ctx.bv_const(\"items_3\", 64);"),
+        "solver should allocate fixed element slots up to max length; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("z3::ugt(_z_items_len, _ctx.bv_val((uint64_t)0, 64))")
+            && cpp.contains("_z_items_0"),
+        "`sum(items[0..items.len()])` should lower with length guards; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("p.items.resize((size_t)_raw_items_len);"),
+        "solver model should resize the vector to the solved intrinsic length; got:\n{cpp}"
+    );
+}
+
+#[test]
 fn constraint_solver_seed_flows_from_harc_rng() {
     let parsed = parse_source(
         r#"transaction T
