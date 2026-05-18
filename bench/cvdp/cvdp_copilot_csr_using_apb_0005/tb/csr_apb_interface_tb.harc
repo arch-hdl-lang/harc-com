@@ -1,0 +1,225 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_csr_using_apb_0005`.
+//
+// Exercises APB setup/enable handshakes, valid CSR reads/writes, invalid
+// addresses, malformed transactions, reset, and randomized payloads. The
+// randomized data field relies on natural auto coverage for 32-bit endpoints
+// and walking patterns.
+
+transaction CsrApbStim
+    addr : uint<32> with [dist {[16..24] :/ 75, [0..15] :/ 10, [25..255] :/ 15}]
+    data : uint<32>
+    write : bool
+end transaction CsrApbStim
+
+relation ValidCsr(t: CsrApbStim) = t.addr inside {16, 20, 24}
+relation InvalidCsr(t: CsrApbStim) = (t.addr != 16) and (t.addr != 20) and (t.addr != 24)
+
+covergroup CsrApbCov @(posedge dut.clk)
+    cp_addr : cover dut.paddr
+        bins
+            data_reg = {16}
+            control_reg = {20}
+            interrupt_reg = {24}
+            low_invalid = [0..15]
+            high_invalid = [25..255]
+        end bins
+
+    cp_data : cover dut.pwdata
+        bins
+            zero = {0}
+            one = {1}
+            high_bit = {2147483648}
+            ones = {4294967295}
+            low = [2..1023]
+            high = [1024..4294967294]
+        end bins
+
+    cp_handshake : cover ((dut.pselx << 1) | dut.penable)
+        bins
+            idle = {0}
+            enable_only = {1}
+            setup_only = {2}
+            active_txn = {3}
+        end bins
+
+    cp_write : cover dut.pwrite
+        bins
+            read = {0}
+            write = {1}
+        end bins
+
+    cp_ready : cover dut.pready
+        bins
+            low = {0}
+            high = {1}
+        end bins
+
+    cp_error : cover dut.pslverr
+        bins
+            clear = {0}
+            set = {1}
+        end bins
+
+    cp_read_data : cover dut.prdata
+        bins
+            zero = {0}
+            low = [1..1023]
+            high = [1024..4294967295]
+        end bins
+
+    cross cp_addr, cp_write
+    cross cp_handshake, cp_error
+    cross cp_write, cp_ready
+end covergroup CsrApbCov
+
+testbench CsrApbTb
+    dut : csr_apb_interface_top
+    cov : CsrApbCov
+end testbench CsrApbTb
+
+function apb_idle(dut: csr_apb_interface_top)
+    dut.pselx = 0
+    dut.penable = 0
+    dut.pwrite = 0
+    dut.paddr = 0
+    dut.pwdata = 0
+    wait 1 cycle
+end function apb_idle
+
+function reset_csr(dut: csr_apb_interface_top)
+    dut.presetn = 0
+    dut.paddr = 0
+    dut.pselx = 0
+    dut.penable = 0
+    dut.pwrite = 0
+    dut.pwdata = 0
+    wait 3 cycles
+    assert dut.pready == 0 else fail("reset: pready expected low")
+    assert dut.pslverr == 0 else fail("reset: pslverr expected low")
+    assert dut.prdata == 0 else fail("reset: prdata expected zero")
+    dut.presetn = 1
+    wait 1 cycle
+end function reset_csr
+
+function apb_write(dut: csr_apb_interface_top, addr: uint<32>, data: uint<32>)
+    dut.paddr = addr
+    dut.pwdata = data
+    dut.pwrite = 1
+    dut.pselx = 1
+    dut.penable = 0
+    wait 1 cycle
+    dut.penable = 1
+    wait 2 cycles
+    assert dut.pready == 1 else fail("apb_write addr=0x${addr:08x}: pready low")
+    apb_idle(dut)
+end function apb_write
+
+function apb_read(dut: csr_apb_interface_top, addr: uint<32>) -> uint<32>
+    dut.paddr = addr
+    dut.pwdata = 0
+    dut.pwrite = 0
+    dut.pselx = 1
+    dut.penable = 0
+    wait 1 cycle
+    dut.penable = 1
+    wait 2 cycles
+    assert dut.pready == 1 else fail("apb_read addr=0x${addr:08x}: pready low")
+    let val = dut.prdata
+    apb_idle(dut)
+    return val
+end function apb_read
+
+function malformed_apb(dut: csr_apb_interface_top, addr: uint<32>, data: uint<32>, write: bool)
+    dut.paddr = addr
+    dut.pwdata = data
+    dut.pwrite = write
+    dut.pselx = 0
+    dut.penable = 1
+    wait 1 cycle
+    dut.penable = 0
+    wait 1 cycle
+
+    dut.pselx = 1
+    dut.penable = 0
+    wait 2 cycles
+    apb_idle(dut)
+end function malformed_apb
+
+impl CsrApbTest for CsrApbTb
+    run
+        log(info, "csr_apb_interface: APB CSR directed and randomized stimulus")
+
+        reset_csr(dut)
+
+        apb_write(dut, 16, 0x00000000)
+        assert apb_read(dut, 16) == 0x00000000 else fail("DATA_REG zero readback mismatch")
+        apb_write(dut, 16, 0xFFFFFFFF)
+        assert apb_read(dut, 16) == 0xFFFFFFFF else fail("DATA_REG ones readback mismatch")
+        apb_write(dut, 16, 0x12345678)
+        assert apb_read(dut, 16) == 0x12345678 else fail("DATA_REG pattern readback mismatch")
+
+        apb_write(dut, 20, 0x00000000)
+        let _control_zero = apb_read(dut, 20)
+        apb_write(dut, 20, 0xFFFFFFFF)
+        let _control_ones = apb_read(dut, 20)
+
+        apb_write(dut, 24, 0x00000000)
+        let _int_zero = apb_read(dut, 24)
+        apb_write(dut, 24, 0xFFFFFFFF)
+        let _int_ones = apb_read(dut, 24)
+
+        apb_write(dut, 32, 0xDEADBEEF)
+        assert dut.pslverr == 1 else fail("invalid write did not set pslverr")
+        let _bad_read = apb_read(dut, 32)
+        assert dut.pslverr == 1 else fail("invalid read did not set pslverr")
+
+        malformed_apb(dut, 16, 0xAAAAAAAA, true)
+        malformed_apb(dut, 20, 0x55555555, false)
+
+        reset_csr(dut)
+
+        for bit in 0 .. 32
+            let data : uint<32> = ((1 as uint<32>) << bit).trunc<32>()
+            apb_write(dut, 16, data)
+            let _rd = apb_read(dut, 16)
+            apb_write(dut, 16, (0xFFFFFFFF ^ data).trunc<32>())
+            let _rz = apb_read(dut, 16)
+        end for
+
+        for _ in 0 .. 48
+            let t : CsrApbStim
+            randomize(t)
+            if t.write
+                apb_write(dut, t.addr, t.data)
+            else
+                let _v = apb_read(dut, t.addr)
+            end if
+        end for
+
+        // Force a few invalid randomized-style accesses with relation inlining.
+        for _ in 0 .. 8
+            let bad : CsrApbStim
+            randomize(bad) with InvalidCsr(bad) end randomize
+            apb_write(dut, bad.addr, bad.data)
+        end for
+
+        log(info, "ALL TESTS PASSED - csr_apb_interface")
+    end run
+
+    check
+        cov.report()
+
+        assert cov.cp_addr.data_reg > 0 else fail("coverage hole: DATA_REG")
+        assert cov.cp_addr.control_reg > 0 else fail("coverage hole: CONTROL_REG")
+        assert cov.cp_addr.interrupt_reg > 0 else fail("coverage hole: INTERRUPT_REG")
+        assert cov.cp_addr.high_invalid > 0 else fail("coverage hole: invalid address")
+        assert cov.cp_data.zero > 0 else fail("coverage hole: zero data")
+        assert cov.cp_data.high_bit > 0 else fail("coverage hole: data high bit")
+        assert cov.cp_data.ones > 0 else fail("coverage hole: all ones")
+        assert cov.cp_handshake.enable_only > 0 else fail("coverage hole: enable-only APB")
+        assert cov.cp_handshake.active_txn > 0 else fail("coverage hole: active APB")
+        assert cov.cp_write.read > 0 else fail("coverage hole: reads")
+        assert cov.cp_write.write > 0 else fail("coverage hole: writes")
+        assert cov.cp_error.set > 0 else fail("coverage hole: pslverr")
+    end check
+end impl CsrApbTest
