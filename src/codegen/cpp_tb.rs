@@ -2741,6 +2741,12 @@ fn collect_randomize_target_field_refs(
                 }
             }
         }
+        ExprKind::ForEachConstraint { iter, body, .. } => {
+            collect_randomize_target_field_refs(iter, field_info, target_root, out);
+            for clause in body {
+                collect_randomize_target_field_refs(clause, field_info, target_root, out);
+            }
+        }
         ExprKind::Cast { expr, .. }
         | ExprKind::Unary { expr, .. }
         | ExprKind::Paren(expr)
@@ -6697,6 +6703,12 @@ impl Emitter {
                     self.validate_field_attr_static_expr(ty, field, attr, value);
                 }
             }
+            ExprKind::ForEachConstraint { iter, body, .. } => {
+                self.validate_field_attr_static_expr(ty, field, attr, iter);
+                for clause in body {
+                    self.validate_field_attr_static_expr(ty, field, attr, clause);
+                }
+            }
             ExprKind::Cast { expr, .. }
             | ExprKind::Unary { expr, .. }
             | ExprKind::HashHash { expr, .. }
@@ -6836,6 +6848,24 @@ impl Emitter {
                     self.validate_randomize_constraint_dependencies(
                         ty,
                         value,
+                        field_info,
+                        target_root,
+                        blocking,
+                    );
+                }
+            }
+            ExprKind::ForEachConstraint { iter, body, .. } => {
+                self.validate_randomize_constraint_dependencies(
+                    ty,
+                    iter,
+                    field_info,
+                    target_root,
+                    blocking,
+                );
+                for clause in body {
+                    self.validate_randomize_constraint_dependencies(
+                        ty,
+                        clause,
                         field_info,
                         target_root,
                         blocking,
@@ -7340,6 +7370,11 @@ impl Emitter {
                     })
                     .collect(),
             },
+            ExprKind::ForEachConstraint { var, iter, body } => ExprKind::ForEachConstraint {
+                var: var.clone(),
+                iter: self.expand_relation_subtree(iter),
+                body: self.expand_relation_calls(body),
+            },
             ExprKind::Cast { expr, ty } => ExprKind::Cast {
                 expr: self.expand_relation_subtree(expr),
                 ty: ty.clone(),
@@ -7674,6 +7709,20 @@ impl Emitter {
 
         // Translated constraints.
         for c in &hard_constraints {
+            if let ExprKind::ForEachConstraint { var, iter, body } = &*c.kind {
+                self.emit_foreach_constraint_clauses(
+                    ty,
+                    var,
+                    iter,
+                    body,
+                    &field_info,
+                    target_root,
+                    blocking,
+                    &list_unroll_bounds,
+                    depth + 1,
+                );
+                continue;
+            }
             self.pad(depth + 1);
             write!(self.out, "_s.add(").ok();
             self.emit_constraint_expr_with_list_bounds(
@@ -8524,6 +8573,62 @@ impl Emitter {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn emit_foreach_constraint_clauses(
+        &mut self,
+        ty: &str,
+        var: &Ident,
+        iter: &Expr,
+        body: &[Expr],
+        field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+        target_root: Option<&str>,
+        blocking: bool,
+        list_unroll_bounds: &std::collections::HashMap<String, usize>,
+        depth: usize,
+    ) {
+        let Some(field) = list_field_name_from_expr(iter, field_info, target_root) else {
+            self.errors.push(format!(
+                "randomize({ty}) foreach constraint must iterate a list field of transaction `{ty}`"
+            ));
+            return;
+        };
+        let Some(max_len) = list_unroll_bounds.get(&field).copied() else {
+            self.errors.push(format!(
+                "randomize({ty}) foreach constraint over `{field}` needs a bounded length constraint such as `{field}.len() <= N`"
+            ));
+            return;
+        };
+        for i in 0..max_len {
+            let item = Expr::new(
+                ExprKind::Index {
+                    target: iter.clone(),
+                    index: Expr::new(ExprKind::Int(i.to_string()), var.span),
+                },
+                iter.span,
+            );
+            let mut subst = std::collections::HashMap::new();
+            subst.insert(var.name.clone(), item);
+            for clause in body {
+                let lowered = substitute_idents(clause, &subst);
+                self.pad(depth);
+                write!(
+                    self.out,
+                    "_s.add(z3::ule(_z_{}_len, _ctx.bv_val((uint64_t){i}, 64)) || (",
+                    field
+                )
+                .ok();
+                self.emit_constraint_expr_with_list_bounds(
+                    &lowered,
+                    field_info,
+                    target_root,
+                    blocking,
+                    list_unroll_bounds,
+                );
+                writeln!(self.out, "));").ok();
+            }
+        }
+    }
+
     fn try_emit_constraint_list_call(
         &mut self,
         e: &Expr,
@@ -8638,6 +8743,12 @@ impl Emitter {
         list_unroll_bounds: &std::collections::HashMap<String, usize>,
     ) {
         match &*e.kind {
+            ExprKind::ForEachConstraint { .. } => {
+                self.errors.push(
+                    "foreach constraints are only supported as top-level `randomize ... with` clauses".into(),
+                );
+                write!(self.out, "_ctx.bool_val(true)").ok();
+            }
             ExprKind::Call { .. } => {
                 if self.try_emit_constraint_list_call(
                     e,
@@ -12932,6 +13043,14 @@ fn rewrite_expr_for_impl(
                 rewrite_expr_for_impl(x, fields, methods, _pointers, shadow);
             }
         }
+        ExprKind::ForEachConstraint { var, iter, body } => {
+            rewrite_expr_for_impl(iter, fields, methods, _pointers, shadow);
+            let mut inner_shadow = shadow.clone();
+            inner_shadow.insert(var.name.clone());
+            for x in body.iter_mut() {
+                rewrite_expr_for_impl(x, fields, methods, _pointers, &inner_shadow);
+            }
+        }
         ExprKind::DistDirective { target, .. } => {
             rewrite_expr_for_impl(target, fields, methods, _pointers, shadow);
         }
@@ -13929,6 +14048,15 @@ fn substitute_idents(expr: &Expr, subst: &std::collections::HashMap<String, Expr
                 })
                 .collect(),
         },
+        ExprKind::ForEachConstraint { var, iter, body } => {
+            let mut scoped = subst.clone();
+            scoped.remove(&var.name);
+            ExprKind::ForEachConstraint {
+                var: var.clone(),
+                iter: substitute_idents(iter, subst),
+                body: body.iter().map(|e| substitute_idents(e, &scoped)).collect(),
+            }
+        }
         ExprKind::Cast { expr, ty } => ExprKind::Cast {
             expr: substitute_idents(expr, subst),
             ty: ty.clone(),
