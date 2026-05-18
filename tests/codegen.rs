@@ -2026,6 +2026,70 @@ end test ListForeachConstraintTest"#,
 }
 
 #[test]
+fn transaction_keep_supports_foreach_list_item_constraints() {
+    let parsed = parse_source(
+        r#"transaction Packet
+    items : list<uint<8>>
+    keep items.len() >= 1
+    keep items.len() <= 4
+    keep for item in items
+        item > 0
+        item < 16
+    end for
+end transaction Packet
+
+test ListForeachKeepTest
+    let dut : DummyDut
+    run
+        let p : Packet
+        randomize(p)
+    end run
+end test ListForeachKeepTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("z3::ule(_z_items_len, _ctx.bv_val((uint64_t)0, 64)) || (z3::ugt(_z_items_0"),
+        "foreach keep should lower item constraints under a len<=index guard; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("z3::ult(_z_items_3, _ctx.bv_val((uint64_t)16, 64))"),
+        "foreach keep should unroll item constraints through the inferred length bound; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn when_subtype_keep_supports_foreach_list_item_constraints() {
+    let parsed = parse_source(
+        r#"transaction Packet
+    enabled : bool
+    items : list<uint<8>>
+    keep items.len() <= 2
+
+    when enabled
+        keep for item in items
+            item > 7
+        end for
+    end when
+end transaction Packet
+
+test ListForeachWhenKeepTest
+    let dut : DummyDut
+    run
+        let p : Packet
+        randomize(p)
+    end run
+end test ListForeachWhenKeepTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("z3::ule(_z_items_len, _ctx.bv_val((uint64_t)0, 64)) || (!(_z_enabled) || z3::ugt(_z_items_0"),
+        "when-guarded foreach keep should distribute the guard into each unrolled item constraint; got:\n{cpp}"
+    );
+}
+
+#[test]
 fn constraint_solver_seed_flows_from_harc_rng() {
     let parsed = parse_source(
         r#"transaction T
@@ -3303,6 +3367,52 @@ end test T"#,
     assert!(
         !cpp.contains("(Pkt)("),
         "expected NO `(Pkt)(...)` C++ cast for struct-targeted `as`; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn structs_and_transactions_share_record_lowering() {
+    let parsed = parse_source(
+        r#"struct Header
+    addr : uint<8>
+    tag : uint<4>
+end struct Header
+
+transaction Packet
+    hdr : Header
+    len : uint<8>
+end transaction Packet
+
+test SharedRecordLoweringTest
+    let dut : DummyDut
+    run
+        let h : Header
+        randomize(h)
+        let p : Packet
+        randomize(p)
+        dut.addr = h.addr + p.hdr.addr
+    end run
+end test SharedRecordLoweringTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("struct Header {") && cpp.contains("struct Packet {"),
+        "structs and transactions should both emit value records; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("Header hdr = {};"),
+        "transaction fields should use emitted struct record types; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("inline bool operator==(const Header& a, const Header& b)")
+            && cpp.contains("inline bool operator==(const Packet& a, const Packet& b)"),
+        "shared record lowering should emit equality for both structs and transactions; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("static void randomize_Header(Header* t)")
+            && cpp.contains("randomize_Header(&t->hdr);"),
+        "record randomization should be shared and recurse into nested record fields; got:\n{cpp}"
     );
 }
 
