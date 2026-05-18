@@ -1,0 +1,178 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_encoder_8b10b_0026`.
+//
+// Exercises data/control paths, valid and invalid control symbols, both
+// disparity inputs, repeated control sequences, exhaustive data symbols, and
+// solver-randomized unique symbols. The randomized transaction keeps this case
+// tied to the constraint/auto-coverage path even though the directed sweep is
+// what closes the combinational encoder branches.
+
+transaction EncStim
+    symbol : uint<8> with [unique within test]
+    control : bool
+    rd : bool
+end transaction EncStim
+
+relation IsControlSymbol(t: EncStim) = t.symbol inside {0x1C, 0x3C, 0x5C, 0x7C, 0x9C, 0xBC, 0xDC, 0xFC, 0xF7, 0xFB, 0xFD, 0xFE}
+
+covergroup EncCov @(posedge dut.clk)
+    cp_control : cover dut.control_in
+        bins
+            data = {0}
+            control = {1}
+        end bins
+
+    cp_rd : cover dut.disparity_data_in
+        bins
+            minus = {0}
+            plus = {1}
+        end bins
+
+    cp_symbol : cover dut.encoder_in
+        bins
+            zero = {0}
+            one = {1}
+            k28_0 = {0x1C}
+            k28_1 = {0x3C}
+            k28_2 = {0x5C}
+            k28_3 = {0x7C}
+            k28_4 = {0x9C}
+            k28_5 = {0xBC}
+            k28_6 = {0xDC}
+            k28_7 = {0xFC}
+            k23_7 = {0xF7}
+            k27_7 = {0xFB}
+            k29_7 = {0xFD}
+            k30_7 = {0xFE}
+            high_bit = {0x80}
+            ones = {0xFF}
+            low = [2..31]
+            mid = [32..127]
+            high = [129..246]
+        end bins
+
+    cp_out : cover dut.encoder_out
+        bins
+            zero = {0}
+            nonzero = [1..1023]
+        end bins
+
+    cp_disparity_out : cover dut.disparity_out
+        bins
+            minus = {0}
+            plus = {1}
+        end bins
+
+    cross cp_control, cp_rd
+    cross cp_control, cp_symbol
+    cross cp_rd, cp_disparity_out
+end covergroup EncCov
+
+testbench Encoder8b10bTb
+    dut : encoder_8b10b_top
+    cov : EncCov
+end testbench Encoder8b10bTb
+
+function reset_encoder(dut: encoder_8b10b_top)
+    dut.reset_in = 1
+    dut.control_in = 0
+    dut.disparity_data_in = 0
+    dut.encoder_in = 0
+    wait 3 cycles
+    assert dut.encoder_out == 0 else fail("reset: encoder_out expected zero")
+    dut.reset_in = 0
+    wait 1 cycle
+end function reset_encoder
+
+function drive_symbol(dut: encoder_8b10b_top, symbol: uint<8>, control: bool, rd: bool)
+    dut.encoder_in = symbol
+    dut.control_in = control
+    dut.disparity_data_in = rd
+    wait 2 cycles
+end function drive_symbol
+
+impl Encoder8b10bTest for Encoder8b10bTb
+    run
+        log(info, "encoder_8b10b: exhaustive data, control symbols, disparity, and unique random traffic")
+
+        reset_encoder(dut)
+
+        // Valid control symbols, repeated with enough cycles to toggle the
+        // control-path running-disparity FSM.
+        drive_symbol(dut, 0x1C, true, false)
+        drive_symbol(dut, 0x3C, true, false)
+        drive_symbol(dut, 0x5C, true, false)
+        drive_symbol(dut, 0x7C, true, false)
+        drive_symbol(dut, 0x9C, true, false)
+        drive_symbol(dut, 0xBC, true, false)
+        drive_symbol(dut, 0xDC, true, false)
+        drive_symbol(dut, 0xFC, true, false)
+        drive_symbol(dut, 0xF7, true, false)
+        drive_symbol(dut, 0xFB, true, false)
+        drive_symbol(dut, 0xFD, true, false)
+        drive_symbol(dut, 0xFE, true, false)
+        // Target the control running-disparity no-toggle branch while already
+        // in RD_PLUS. Single-cycle staging matters because the control path
+        // evaluates the previously registered symbol.
+        dut.encoder_in = 0x3C
+        dut.control_in = 1
+        dut.disparity_data_in = 0
+        wait 1 cycle
+        dut.encoder_in = 0x1C
+        dut.control_in = 1
+        wait 2 cycles
+        drive_symbol(dut, 0x1C, true, false)
+        drive_symbol(dut, 0x3C, true, false)
+
+        // Invalid control symbols hit the default control-code branch.
+        drive_symbol(dut, 0x00, true, false)
+        drive_symbol(dut, 0x55, true, false)
+        drive_symbol(dut, 0xAA, true, false)
+        drive_symbol(dut, 0xFF, true, false)
+
+        // Exhaustive data symbols under both running-disparity inputs.
+        for v in 0 .. 256
+            drive_symbol(dut, v.trunc<8>(), false, false)
+        end for
+        for v in 0 .. 256
+            drive_symbol(dut, v.trunc<8>(), false, true)
+        end for
+
+        // Back-to-back mode transitions.
+        drive_symbol(dut, 0x1C, true, false)
+        drive_symbol(dut, 0x00, false, false)
+        drive_symbol(dut, 0xFE, true, false)
+        drive_symbol(dut, 0xFF, false, true)
+
+        // Solver-randomized symbols. Both unconstrained traffic and relation-
+        // constrained control symbols exercise current randomize/relation paths.
+        for _ in 0 .. 48
+            let s : EncStim
+            randomize(s)
+            drive_symbol(dut, s.symbol, s.control, s.rd)
+        end for
+        for _ in 0 .. 16
+            let k : EncStim
+            randomize(k) with IsControlSymbol(k) end randomize
+            drive_symbol(dut, k.symbol, true, false)
+        end for
+
+        reset_encoder(dut)
+        log(info, "ALL TESTS PASSED - encoder_8b10b")
+    end run
+
+    check
+        cov.report()
+
+        assert cov.cp_control.data > 0 else fail("coverage hole: data path")
+        assert cov.cp_control.control > 0 else fail("coverage hole: control path")
+        assert cov.cp_rd.minus > 0 else fail("coverage hole: RD minus")
+        assert cov.cp_rd.plus > 0 else fail("coverage hole: RD plus")
+        assert cov.cp_symbol.k28_0 > 0 else fail("coverage hole: K28.0")
+        assert cov.cp_symbol.k28_7 > 0 else fail("coverage hole: K28.7")
+        assert cov.cp_symbol.k30_7 > 0 else fail("coverage hole: K30.7")
+        assert cov.cp_symbol.zero > 0 else fail("coverage hole: symbol zero")
+        assert cov.cp_symbol.ones > 0 else fail("coverage hole: symbol ones")
+        assert cov.cp_out.nonzero > 0 else fail("coverage hole: nonzero output")
+        assert cov.cp_disparity_out.plus > 0 else fail("coverage hole: positive disparity out")
+    end check
+end impl Encoder8b10bTest
