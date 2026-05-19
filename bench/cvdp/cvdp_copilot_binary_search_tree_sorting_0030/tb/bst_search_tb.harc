@@ -1,0 +1,229 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_binary_search_tree_sorting_0030`.
+//
+// DUT: searches a packed binary-search-tree encoding and reports either the
+// sorted-array position of the key or an invalid-search pulse.
+//
+// Strategy: explicit valid BST encodings cover balanced, right-skewed,
+// left-skewed, single-node, empty, present, and missing-key searches. The
+// packed 240-bit key vector and 75-bit child-pointer vectors deliberately
+// stress wide-port stimulus.
+
+transaction SearchStim
+    key : uint<16> with [unique within test]
+        keep key > 14
+        keep key < 64
+end transaction SearchStim
+
+covergroup BstSearchCov @(posedge dut.clk)
+    cp_start : cover dut.start
+        bins
+            low = {0}
+            high = {1}
+        end bins
+
+    cp_root : cover dut.root
+        bins
+            node0 = {0}
+            null_root = {31}
+        end bins
+
+    cp_search_key : cover dut.search_key
+        bins
+            smallest = {1}
+            root_key = {8}
+            right_key = {10}
+            largest = {14}
+            single = {42}
+            missing = [15..63]
+        end bins
+
+    cp_position : cover dut.key_position
+        bins
+            pos0 = {0}
+            pos2 = {2}
+            pos3 = {3}
+            pos4 = {4}
+            pos6 = {6}
+            invalid = {31}
+        end bins
+
+    cp_found : cover dut.complete_found
+        bins
+            low = {0}
+            high = {1}
+        end bins
+
+    cp_invalid : cover dut.search_invalid
+        bins
+            low = {0}
+            high = {1}
+        end bins
+
+    cross cp_found, cp_invalid
+    cross cp_root, cp_invalid
+    cross cp_search_key, cp_position
+end covergroup BstSearchCov
+
+testbench BstSearchTb
+    dut : search_binary_search_tree
+    cov : BstSearchCov
+end testbench BstSearchTb
+
+function reset_bst(dut: search_binary_search_tree)
+    dut.reset = 1
+    dut.start = 0
+    dut.search_key = 0
+    dut.root = 31
+    dut.keys = 0
+    dut.left_child = 0x7FFFFFFFFFFFFFFFFFF
+    dut.right_child = 0x7FFFFFFFFFFFFFFFFFF
+    wait 2 cycles on clk
+    assert dut.complete_found == 0 else fail("reset: complete_found high")
+    assert dut.search_invalid == 0 else fail("reset: search_invalid high")
+    assert dut.key_position == 31 else fail("reset: key_position=${dut.key_position}, expected 31")
+    dut.reset = 0
+    wait 1 cycle on clk
+end function reset_bst
+
+function load_tree(dut: search_binary_search_tree,
+                   root: uint<5>,
+                   keys: uint<240>,
+                   left_child: uint<75>,
+                   right_child: uint<75>,
+                   search_key: uint<16>)
+    dut.root = root
+    dut.keys = keys
+    dut.left_child = left_child
+    dut.right_child = right_child
+    dut.search_key = search_key
+end function load_tree
+
+function wait_for_result(dut: search_binary_search_tree, limit: uint<8>) -> uint<1>
+    for _ in 0 .. limit
+        if dut.complete_found == 1 or dut.search_invalid == 1
+            return 0
+        end if
+        wait 1 cycle on clk
+    end for
+    log(error, "timeout waiting for BST search result")
+    return 1
+end function wait_for_result
+
+function run_search(dut: search_binary_search_tree,
+                    root: uint<5>,
+                    keys: uint<240>,
+                    left_child: uint<75>,
+                    right_child: uint<75>,
+                    search_key: uint<16>,
+                    expect_found: bool,
+                    expect_position: uint<5>) -> uint<1>
+    load_tree(dut, root, keys, left_child, right_child, search_key)
+    wait 1 cycle on clk
+    dut.start = 1
+    wait 1 cycle on clk
+    dut.start = 0
+
+    if wait_for_result(dut, 80) != 0
+        return 1
+    end if
+
+    if expect_found
+        if dut.complete_found != 1
+            log(error, "key ${search_key}: expected found pulse")
+            return 1
+        end if
+        if dut.search_invalid != 0
+            log(error, "key ${search_key}: unexpected invalid pulse")
+            return 1
+        end if
+        if dut.key_position != expect_position
+            log(error, "key ${search_key}: position=${dut.key_position}, expected ${expect_position}")
+            return 1
+        end if
+        wait 2 cycles on clk
+        return 0
+    end if
+
+    if dut.search_invalid != 1
+        log(error, "key ${search_key}: expected invalid pulse")
+        return 1
+    end if
+    if dut.complete_found != 0
+        log(error, "key ${search_key}: unexpected found pulse")
+        return 1
+    end if
+    if dut.key_position != 31
+        log(error, "key ${search_key}: invalid position=${dut.key_position}, expected 31")
+        return 1
+    end if
+
+    wait 2 cycles on clk
+    return 0
+end function run_search
+
+impl BstSearchTest for BstSearchTb
+    clock clk = 10ns
+
+    run
+        log(info, "bst_search: balanced/skewed/empty trees, present and missing keys, wide packed ports")
+
+        reset_bst(dut)
+        let errors : uint<32> = 0
+
+        let keys_bal : uint<240> = 0x00000000000000000000000000000000000E000A00060002000C00040008
+        let left_bal : uint<75> = 0x7FFFFFFFFFFFFFF9461
+        let right_bal : uint<75> = 0x7FFFFFFFFFFFFFF9882
+
+        let keys_right : uint<240> = 0x000000000000000000000000000000000000000000050004000300020001
+        let left_null : uint<75> = 0x7FFFFFFFFFFFFFFFFFF
+        let right_chain : uint<75> = 0x7FFFFFFFFFFFFF20C41
+
+        let keys_left : uint<240> = 0x000000000000000000000000000000000000000000010002000300040005
+        let left_chain : uint<75> = 0x7FFFFFFFFFFFFF20C41
+        let right_null : uint<75> = 0x7FFFFFFFFFFFFFFFFFF
+
+        let keys_single : uint<240> = 0x00000000000000000000000000000000000000000000000000000000002A
+        let keys_empty : uint<240> = 0
+
+        // Balanced 7-node tree: sorted order 2,4,6,8,10,12,14.
+        errors = errors + run_search(dut, 0, keys_bal, left_bal, right_bal, 8, true, 3)
+        errors = errors + run_search(dut, 0, keys_bal, left_bal, right_bal, 2, true, 0)
+        errors = errors + run_search(dut, 0, keys_bal, left_bal, right_bal, 6, true, 2)
+        errors = errors + run_search(dut, 0, keys_bal, left_bal, right_bal, 10, true, 4)
+        errors = errors + run_search(dut, 0, keys_bal, left_bal, right_bal, 14, true, 6)
+        errors = errors + run_search(dut, 0, keys_bal, left_bal, right_bal, 11, false, 31)
+
+        // Skewed trees force deep left-only and right-only traversals.
+        errors = errors + run_search(dut, 0, keys_right, left_null, right_chain, 5, true, 4)
+        errors = errors + run_search(dut, 0, keys_right, left_null, right_chain, 0x0033, false, 31)
+        errors = errors + run_search(dut, 0, keys_left, left_chain, right_null, 1, true, 0)
+        errors = errors + run_search(dut, 0, keys_left, left_chain, right_null, 3, true, 2)
+
+        // Single-node and empty-tree cases.
+        errors = errors + run_search(dut, 0, keys_single, left_null, right_null, 42, true, 0)
+        errors = errors + run_search(dut, 0, keys_single, left_null, right_null, 41, false, 31)
+        errors = errors + run_search(dut, 31, keys_empty, left_null, right_null, 8, false, 31)
+
+        for _ in 0 .. 8
+            let s : SearchStim
+            randomize(s)
+            errors = errors + run_search(dut, 0, keys_bal, left_bal, right_bal, s.key, false, 31)
+        end for
+
+        reset_bst(dut)
+        assert errors == 0 else fail("bst_search produced ${errors} search errors")
+        log(info, "ALL TESTS PASSED - bst_search")
+    end run
+
+    check
+        cov.report()
+
+        assert cov.cp_root.node0 > 0 else fail("coverage hole: root node0")
+        assert cov.cp_root.null_root > 0 else fail("coverage hole: null root")
+        assert cov.cp_found.high > 0 else fail("coverage hole: found")
+        assert cov.cp_invalid.high > 0 else fail("coverage hole: invalid")
+        assert cov.cp_position.pos0 > 0 else fail("coverage hole: position 0")
+        assert cov.cp_position.pos6 > 0 else fail("coverage hole: position 6")
+        assert cov.cp_position.invalid > 0 else fail("coverage hole: invalid position")
+    end check
+end impl BstSearchTest
