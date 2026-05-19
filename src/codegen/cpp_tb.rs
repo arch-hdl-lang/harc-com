@@ -2309,6 +2309,7 @@ fn flatten_record_field_infos_inner(
 #[derive(Debug, Clone)]
 struct AutoCoverageGoal {
     field: String,
+    c_field: String,
     values: Vec<AutoCoverageValue>,
 }
 
@@ -7955,11 +7956,10 @@ impl Emitter {
                 } = &*e.kind
                 {
                     let pin_from = |side: &Expr, other: &Expr| -> Option<String> {
-                        if let ExprKind::Field { target, name } = &*side.kind {
-                            if matches!(&*target.kind, ExprKind::Ident(_)) {
-                                if matches!(&*other.kind, ExprKind::Int(_)) {
-                                    return Some(name.name.clone());
-                                }
+                        if matches!(&*other.kind, ExprKind::Int(_)) {
+                            let field = expr_field_path(side, target_root)?;
+                            if field_info.contains_key(&field) {
+                                return Some(field);
                             }
                         }
                         None
@@ -8067,7 +8067,8 @@ impl Emitter {
             .filter_map(|f| {
                 let values = auto_coverage_values(f);
                 (!values.is_empty()).then(|| AutoCoverageGoal {
-                    field: c_ident(&f.name),
+                    field: f.name.clone(),
+                    c_field: c_ident(&f.name),
                     values,
                 })
             })
@@ -8099,7 +8100,7 @@ impl Emitter {
             writeln!(
                 self.out,
                 "static bool _auto_cov_{cache_tag}_{}[{}] = {{}};",
-                goal.field,
+                goal.c_field,
                 goal.values.len()
             )
             .ok();
@@ -8107,7 +8108,7 @@ impl Emitter {
             writeln!(
                 self.out,
                 "static bool _auto_cov_blocked_{cache_tag}_{}[{}] = {{}};",
-                goal.field,
+                goal.c_field,
                 goal.values.len()
             )
             .ok();
@@ -8117,8 +8118,8 @@ impl Emitter {
             writeln!(
                 self.out,
                 "static bool _auto_cross_{cache_tag}_{}__{}[{}][{}] = {{}};",
-                a.field,
-                b.field,
+                a.c_field,
+                b.c_field,
                 a.values.len(),
                 b.values.len()
             )
@@ -8127,8 +8128,8 @@ impl Emitter {
             writeln!(
                 self.out,
                 "static bool _auto_cross_blocked_{cache_tag}_{}__{}[{}][{}] = {{}};",
-                a.field,
-                b.field,
+                a.c_field,
+                b.c_field,
                 a.values.len(),
                 b.values.len()
             )
@@ -8162,14 +8163,14 @@ impl Emitter {
                     writeln!(
                         self.out,
                         "if (_auto_cov_{cache_tag}_{}[{}]) _hit++;",
-                        goal.field, idx
+                        goal.c_field, idx
                     )
                     .ok();
                     self.pad(depth + 3);
                     writeln!(
                         self.out,
                         "if (_auto_cov_blocked_{cache_tag}_{}[{}]) _blocked++;",
-                        goal.field, idx
+                        goal.c_field, idx
                     )
                     .ok();
                 }
@@ -8181,14 +8182,14 @@ impl Emitter {
                         writeln!(
                             self.out,
                             "if (_auto_cross_{cache_tag}_{}__{}[{}][{}]) _hit++;",
-                            a.field, b.field, i, j
+                            a.c_field, b.c_field, i, j
                         )
                         .ok();
                         self.pad(depth + 3);
                         writeln!(
                             self.out,
                             "if (_auto_cross_blocked_{cache_tag}_{}__{}[{}][{}]) _blocked++;",
-                            a.field, b.field, i, j
+                            a.c_field, b.c_field, i, j
                         )
                         .ok();
                     }
@@ -8211,9 +8212,9 @@ impl Emitter {
                         escape_c(ty),
                         escape_c(&goal.field),
                         escape_c(&value.label),
-                        goal.field,
+                        goal.c_field,
                         idx,
-                        goal.field,
+                        goal.c_field,
                         idx
                     )
                     .ok();
@@ -8232,12 +8233,12 @@ impl Emitter {
                             escape_c(ty),
                             escape_c(&b.field),
                             escape_c(&bv.label),
-                            a.field,
-                            b.field,
+                            a.c_field,
+                            b.c_field,
                             i,
                             j,
-                            a.field,
-                            b.field,
+                            a.c_field,
+                            b.c_field,
                             i,
                             j
                         )
@@ -8344,15 +8345,15 @@ impl Emitter {
             writeln!(
                 self.out,
                 "if (!_auto_cross_{cache_tag}_{}__{}[_i][_j] && !_auto_cross_blocked_{cache_tag}_{}__{}[_i][_j]) {{",
-                a.field, b.field,
-                a.field, b.field
+                a.c_field, b.c_field,
+                a.c_field, b.c_field
             )
             .ok();
             self.pad(depth + 5);
             writeln!(
                 self.out,
                 "static const uint64_t _auto_vals_{cache_tag}_{}[] = {{{}}};",
-                a.field,
+                a.c_field,
                 a.values
                     .iter()
                     .map(|v| v.c_expr.clone())
@@ -8364,7 +8365,7 @@ impl Emitter {
             writeln!(
                 self.out,
                 "static const uint64_t _auto_vals_{cache_tag}_{}[] = {{{}}};",
-                b.field,
+                b.c_field,
                 b.values
                     .iter()
                     .map(|v| v.c_expr.clone())
@@ -8376,14 +8377,14 @@ impl Emitter {
             writeln!(
                 self.out,
                 "_pref_{cache_tag}_{} = _auto_vals_{cache_tag}_{}[_i];",
-                a.field, a.field
+                a.c_field, a.c_field
             )
             .ok();
             self.pad(depth + 5);
             writeln!(
                 self.out,
                 "_pref_{cache_tag}_{} = _auto_vals_{cache_tag}_{}[_j];",
-                b.field, b.field
+                b.c_field, b.c_field
             )
             .ok();
             self.pad(depth + 5);
@@ -8416,7 +8417,7 @@ impl Emitter {
             writeln!(
                 self.out,
                 "static const uint64_t _auto_vals_{cache_tag}_{}[] = {{{}}};",
-                goal.field,
+                goal.c_field,
                 goal.values
                     .iter()
                     .map(|v| v.c_expr.clone())
@@ -8435,7 +8436,7 @@ impl Emitter {
             writeln!(
                 self.out,
                 "if (!_auto_cov_{cache_tag}_{}[_i] && !_auto_cov_blocked_{cache_tag}_{}[_i]) {{ _pref_{cache_tag}_{} = _auto_vals_{cache_tag}_{}[_i]; _auto_cov_pref_{cache_tag} = true; _auto_cov_selected_kind_{cache_tag} = 1; _auto_cov_selected_group_{cache_tag} = {group}; _auto_cov_selected_i_{cache_tag} = _i; break; }}",
-                goal.field, goal.field, goal.field, goal.field
+                goal.c_field, goal.c_field, goal.c_field, goal.c_field
             )
             .ok();
             self.pad(depth + 2);
@@ -8469,7 +8470,7 @@ impl Emitter {
                 writeln!(
                     self.out,
                     "if (_auto_cov_selected_kind_{cache_tag} == 2 && _auto_cov_selected_group_{cache_tag} == {group}) _auto_cross_blocked_{cache_tag}_{}__{}[_auto_cov_selected_i_{cache_tag}][_auto_cov_selected_j_{cache_tag}] = true;",
-                    a.field, b.field
+                    a.c_field, b.c_field
                 )
                 .ok();
             }
@@ -8478,7 +8479,7 @@ impl Emitter {
                 writeln!(
                     self.out,
                     "if (_auto_cov_selected_kind_{cache_tag} == 1 && _auto_cov_selected_group_{cache_tag} == {group}) _auto_cov_blocked_{cache_tag}_{}[_auto_cov_selected_i_{cache_tag}] = true;",
-                    goal.field
+                    goal.c_field
                 )
                 .ok();
             }
@@ -8693,7 +8694,7 @@ impl Emitter {
                 writeln!(
                     self.out,
                     "if ((uint64_t)_val_{} == {}) {{ _auto_cov_{cache_tag}_{}[{}] = true; _auto_cov_blocked_{cache_tag}_{}[{}] = false; }}",
-                    goal.field, value.c_expr, goal.field, idx, goal.field, idx
+                    goal.c_field, value.c_expr, goal.c_field, idx, goal.c_field, idx
                 )
                 .ok();
             }
@@ -8705,7 +8706,7 @@ impl Emitter {
                     writeln!(
                         self.out,
                         "if ((uint64_t)_val_{} == {} && (uint64_t)_val_{} == {}) {{ _auto_cross_{cache_tag}_{}__{}[{}][{}] = true; _auto_cross_blocked_{cache_tag}_{}__{}[{}][{}] = false; }}",
-                        a.field, av.c_expr, b.field, bv.c_expr, a.field, b.field, i, j, a.field, b.field, i, j
+                        a.c_field, av.c_expr, b.c_field, bv.c_expr, a.c_field, b.c_field, i, j, a.c_field, b.c_field, i, j
                     )
                     .ok();
                 }
