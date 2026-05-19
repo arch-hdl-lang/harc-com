@@ -1,0 +1,79 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_cdc_pulse_synchronizer_0017`.
+//
+// Strategy: manually toggle the source and destination clock inputs while the
+// wrapper's phantom `clk` advances HARC time. This exercises reset, source
+// pulse/no-pulse, destination synchronizer shift, and output XOR pulse paths.
+
+testbench CdcPulseTb
+    dut : cdc_pulse_synchronizer_top
+end testbench CdcPulseTb
+
+function settle_cdc(dut: cdc_pulse_synchronizer_top)
+    wait 1 cycle
+end function settle_cdc
+
+function src_tick(dut: cdc_pulse_synchronizer_top, pulse: bool)
+    dut.src_pulse = pulse
+    dut.src_clock = 0
+    settle_cdc(dut)
+    dut.src_clock = 1
+    settle_cdc(dut)
+    dut.src_clock = 0
+    dut.src_pulse = 0
+    settle_cdc(dut)
+end function src_tick
+
+function des_tick(dut: cdc_pulse_synchronizer_top)
+    dut.des_clock = 0
+    settle_cdc(dut)
+    dut.des_clock = 1
+    settle_cdc(dut)
+    dut.des_clock = 0
+    settle_cdc(dut)
+end function des_tick
+
+function reset_cdc(dut: cdc_pulse_synchronizer_top)
+    dut.rst_in = 1
+    dut.src_clock = 0
+    dut.des_clock = 0
+    dut.src_pulse = 0
+    settle_cdc(dut)
+    src_tick(dut, false)
+    des_tick(dut)
+    assert dut.des_pulse == 0 else fail("reset: des_pulse high")
+    dut.rst_in = 0
+    settle_cdc(dut)
+end function reset_cdc
+
+impl CdcPulseTest for CdcPulseTb
+    run
+        log(info, "cdc_pulse_synchronizer: reset, source toggles, destination sync pulse")
+
+        reset_cdc(dut)
+
+        // No-pulse source ticks should hold the toggle flop.
+        for _ in 0 .. 4
+            src_tick(dut, false)
+            des_tick(dut)
+            assert dut.des_pulse == 0 else fail("unexpected des_pulse without source pulse")
+        end for
+
+        // Drive several source pulses. The destination pulse appears after
+        // enough destination-domain ticks for the synchronizer chain.
+        for _ in 0 .. 8
+            src_tick(dut, true)
+            let saw : bool = false
+            for _ in 0 .. 6
+                des_tick(dut)
+                if dut.des_pulse == 1
+                    saw = true
+                end if
+            end for
+            assert saw else fail("source pulse did not reach destination domain")
+        end for
+
+        // Reset after activity to revisit async reset on all flops.
+        reset_cdc(dut)
+        log(info, "ALL TESTS PASSED - cdc_pulse_synchronizer")
+    end run
+end impl CdcPulseTest
