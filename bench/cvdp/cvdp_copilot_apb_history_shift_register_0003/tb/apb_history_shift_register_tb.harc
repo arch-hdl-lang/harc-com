@@ -1,0 +1,268 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_apb_history_shift_register_0003`.
+//
+// DUT: APB-accessible global-history register with a gated APB clock and an
+// independent `history_shift_valid` event edge for prediction-history updates.
+//
+// Strategy: use a generated APB clock, drive valid/invalid APB reads and
+// writes, verify clock-gated APB writes do not update, pulse the history event
+// for no-op/normal/mispredict paths, and force full/empty/error interrupts.
+
+transaction HistoryStim
+    control : uint<4> with [unique within test]
+    train : uint<7> with [unique within test]
+end transaction HistoryStim
+
+covergroup ApbHistoryCov @(posedge dut.clk)
+    cp_addr : cover dut.paddr
+        bins
+            control = {0}
+            train = {1}
+            predict = {2}
+            invalid = [3..1023]
+        end bins
+
+    cp_write : cover dut.pwrite
+        bins
+            read = {0}
+            write = {1}
+        end bins
+
+    cp_gate : cover dut.clk_gate_en
+        bins
+            open = {0}
+            gated = {1}
+        end bins
+
+    cp_pwdata : cover dut.pwdata
+        bins
+            zero = {0}
+            one = {1}
+            low_nibble = [2..15]
+            train_hi = {127}
+            ones = {255}
+        end bins
+
+    cp_shift : cover dut.history_shift_valid
+        bins
+            low = {0}
+            high = {1}
+        end bins
+
+    cp_error : cover dut.pslverr
+        bins
+            clear = {0}
+            set = {1}
+        end bins
+
+    cp_full : cover dut.history_full
+        bins
+            clear = {0}
+            set = {1}
+        end bins
+
+    cp_empty : cover dut.history_empty
+        bins
+            clear = {0}
+            set = {1}
+        end bins
+
+    cp_interrupt_error : cover dut.interrupt_error
+        bins
+            clear = {0}
+            set = {1}
+        end bins
+
+    cp_interrupt_full : cover dut.interrupt_full
+        bins
+            clear = {0}
+            set = {1}
+        end bins
+
+    cross cp_addr, cp_write
+    cross cp_gate, cp_write
+    cross cp_full, cp_empty
+end covergroup ApbHistoryCov
+
+testbench ApbHistoryTb
+    dut : APBGlobalHistoryRegister_top
+    cov : ApbHistoryCov
+end testbench ApbHistoryTb
+
+function reset_history(dut: APBGlobalHistoryRegister_top)
+    dut.presetn = 0
+    dut.paddr = 0
+    dut.pselx = 0
+    dut.penable = 0
+    dut.pwrite = 0
+    dut.pwdata = 0
+    dut.history_shift_valid = 0
+    dut.clk_gate_en = 0
+    wait 3 cycles on clk
+    assert dut.pready == 0 else fail("reset: pready high")
+    assert dut.pslverr == 0 else fail("reset: pslverr high")
+    assert dut.prdata == 0 else fail("reset: prdata nonzero")
+    assert dut.history_empty == 1 else fail("reset: history_empty low")
+    dut.presetn = 1
+    wait 1 cycle on clk
+end function reset_history
+
+function idle_apb(dut: APBGlobalHistoryRegister_top)
+    dut.pselx = 0
+    dut.penable = 0
+    dut.pwrite = 0
+    dut.paddr = 0
+    dut.pwdata = 0
+    wait 1 cycle on clk
+end function idle_apb
+
+function apb_write(dut: APBGlobalHistoryRegister_top, addr: uint<10>, data: uint<8>, gated: bool)
+    dut.clk_gate_en = gated
+    dut.paddr = addr
+    dut.pwdata = data
+    dut.pwrite = 1
+    dut.pselx = 1
+    dut.penable = 1
+    wait 1 cycle on clk
+    idle_apb(dut)
+    dut.clk_gate_en = 0
+end function apb_write
+
+function apb_read(dut: APBGlobalHistoryRegister_top, addr: uint<10>) -> uint<8>
+    dut.clk_gate_en = 0
+    dut.paddr = addr
+    dut.pwdata = 0
+    dut.pwrite = 0
+    dut.pselx = 1
+    dut.penable = 1
+    wait 1 cycle on clk
+    let data : uint<8> = dut.prdata
+    idle_apb(dut)
+    return data
+end function apb_read
+
+function pulse_history(dut: APBGlobalHistoryRegister_top)
+    dut.history_shift_valid = 0
+    wait 1ns
+    dut.history_shift_valid = 1
+    wait 1ns
+    dut.history_shift_valid = 0
+    wait 1ns
+end function pulse_history
+
+function check_read(dut: APBGlobalHistoryRegister_top, addr: uint<10>, expected: uint<8>) -> uint<1>
+    let got : uint<8> = apb_read(dut, addr)
+    if got != expected
+        log(error, "read addr=${addr:x} got=${got:02x} expected=${expected:02x}")
+        return 1
+    end if
+    return 0
+end function check_read
+
+function set_history_by_mispredict(dut: APBGlobalHistoryRegister_top, train: uint<7>, taken: bool) -> uint<8>
+    apb_write(dut, 1, train, false)
+    let ctrl : uint<8> = 4
+    if taken
+        ctrl = ctrl | 8
+    end if
+    apb_write(dut, 0, ctrl, false)
+    pulse_history(dut)
+    return ((train as uint<8>) << 1) | (taken as uint<8>)
+end function set_history_by_mispredict
+
+impl ApbHistoryTest for ApbHistoryTb
+    clock clk = 10ns
+
+    run
+        log(info, "apb_history: APB CSR, gated clock, event shift, and interrupt coverage")
+
+        reset_history(dut)
+        let errors : uint<32> = 0
+
+        errors = errors + check_read(dut, 0, 0)
+        errors = errors + check_read(dut, 1, 0)
+        errors = errors + check_read(dut, 2, 0)
+
+        // Valid APB writes mask reserved bits.
+        apb_write(dut, 0, 0xFF, false)
+        errors = errors + check_read(dut, 0, 0x0F)
+        apb_write(dut, 1, 0xFF, false)
+        errors = errors + check_read(dut, 1, 0x7F)
+
+        // Gated APB write: pclk_gated stays low, so the control register
+        // should retain its prior value.
+        apb_write(dut, 0, 0x00, true)
+        errors = errors + check_read(dut, 0, 0x0F)
+
+        // Invalid APB access drives the error/interrupt path and returns zero.
+        apb_write(dut, 9, 0x55, false)
+        assert dut.pslverr == 1 else fail("invalid write did not assert pslverr")
+        assert dut.interrupt_error == 1 else fail("invalid write did not assert interrupt_error")
+        errors = errors + check_read(dut, 9, 0)
+
+        // Clear error through a valid transaction.
+        apb_write(dut, 0, 0x00, false)
+        assert dut.pslverr == 0 else fail("valid write did not clear pslverr")
+
+        // No-update history event.
+        pulse_history(dut)
+        errors = errors + check_read(dut, 2, 0)
+
+        // Normal predict-valid shifts in alternating directions.
+        apb_write(dut, 0, 0x01, false)
+        pulse_history(dut)
+        errors = errors + check_read(dut, 2, 0)
+        apb_write(dut, 0, 0x03, false)
+        pulse_history(dut)
+        errors = errors + check_read(dut, 2, 1)
+        pulse_history(dut)
+        errors = errors + check_read(dut, 2, 3)
+        apb_write(dut, 0, 0x01, false)
+        pulse_history(dut)
+        errors = errors + check_read(dut, 2, 6)
+
+        // Mispredict restore path has priority over predict_valid.
+        let restored : uint<8> = set_history_by_mispredict(dut, 0x55, true)
+        errors = errors + check_read(dut, 2, restored)
+
+        // Force full and empty edge conditions.
+        let full_val : uint<8> = set_history_by_mispredict(dut, 0x7F, true)
+        errors = errors + check_read(dut, 2, full_val)
+        assert dut.history_full == 1 else fail("history_full low after 0xff restore")
+        assert dut.interrupt_full == 1 else fail("interrupt_full low after 0xff restore")
+        let empty_val : uint<8> = set_history_by_mispredict(dut, 0x00, false)
+        errors = errors + check_read(dut, 2, empty_val)
+        assert dut.history_empty == 1 else fail("history_empty low after 0x00 restore")
+
+        // Solver-backed random control/train combinations, including priority
+        // cases where both predict_valid and train_mispredicted may be set.
+        for _ in 0 .. 16
+            let s : HistoryStim
+            randomize(s)
+            apb_write(dut, 1, s.train, false)
+            apb_write(dut, 0, s.control, false)
+            pulse_history(dut)
+        end for
+
+        reset_history(dut)
+        assert errors == 0 else fail("apb_history produced ${errors} mismatches")
+        log(info, "ALL TESTS PASSED - apb_history")
+    end run
+
+    check
+        cov.report()
+
+        assert cov.cp_addr.control > 0 else fail("coverage hole: control register")
+        assert cov.cp_addr.train > 0 else fail("coverage hole: train history register")
+        assert cov.cp_addr.predict > 0 else fail("coverage hole: predict history register")
+        assert cov.cp_addr.invalid > 0 else fail("coverage hole: invalid APB address")
+        assert cov.cp_write.read > 0 else fail("coverage hole: APB read")
+        assert cov.cp_write.write > 0 else fail("coverage hole: APB write")
+        assert cov.cp_gate.gated > 0 else fail("coverage hole: clock gate")
+        assert cov.cp_shift.high > 0 else fail("coverage hole: history shift event")
+        assert cov.cp_error.set > 0 else fail("coverage hole: pslverr")
+        assert cov.cp_full.set > 0 else fail("coverage hole: history_full")
+        assert cov.cp_empty.set > 0 else fail("coverage hole: history_empty")
+        assert cov.cp_interrupt_error.set > 0 else fail("coverage hole: interrupt_error")
+        assert cov.cp_interrupt_full.set > 0 else fail("coverage hole: interrupt_full")
+    end check
+end impl ApbHistoryTest
