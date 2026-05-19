@@ -131,6 +131,32 @@ end test CoverAutoCrossTest"#,
 }
 
 #[test]
+fn covergroup_can_sample_dut_bit_slice() {
+    let parsed = parse_source(
+        r#"covergroup G @(posedge dut.clk)
+    cp_index : cover dut.cpu_addr[7:0]
+        bins
+            zero = {0}
+            last = {255}
+        end bins
+end covergroup G
+
+test CoverBitSliceTest
+    let dut : DummyDut
+    run
+        let cov : G
+    end run
+end test CoverBitSliceTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("bit-sliced coverpoint should lower");
+    assert!(
+        cpp.contains("harc_rt::harc_bits(harc_rt::harc_read(dut->cpu_addr), (uint32_t)(7), (uint32_t)(0))"),
+        "covergroup bit slice should lower through harc_bits; got:\n{cpp}",
+    );
+}
+
+#[test]
 fn covergroup_declared_crosses_lower_and_report() {
     let parsed = parse_source(
         r#"covergroup G @(posedge dut.clk)

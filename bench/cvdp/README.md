@@ -182,17 +182,21 @@ then removes known structural holes from Verilator's denominator before scoring.
 | `ring_token_0004` | 94.87% | 100.00% | control | ≥100% | **PASS** |
 | `secure_read_write_bus_0005` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `secure_variable_timer_0006` | 100.00% | 100.00% | control | ≥98% | **PASS** |
+| `Serial_Line_Converter_0006` | 98.86% | 100.00% | control | ≥95% | **PASS** |
 | `signed_adder_0003` | 100.00% | 100.00% | control | ≥99% | **PASS** |
 | `simple_spi_0003` | 98.06% | 100.00% | control | ≥94% | **PASS** |
 | `single_cycle_arbiter_0004` | 100.00% | n/a | line | ≥96% | **PASS** |
 | `skid_register_0004` | 100.00% | 100.00% | control | ≥98% | **PASS** |
 | `sram_fd_0024` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `static_branch_predict_0035` | 100.00% | n/a | line | ≥95% | **PASS** |
+| `traffic_light_controller_0007` | 100.00% | 100.00% | control | ≥97% | **PASS** |
 | `word_change_detector_0012` | 100.00% | 100.00% | control | ≥90% | **PASS** |
+| `word_reducer_0012` | 100.00% | 100.00% | control | ≥100% | **PASS** |
+| `write_through_data_direct_mapped_cache_0001` | 97.50% | 100.00% | control | ≥85% | **PASS** |
 
 ### Net scoreboard
 
-**40/40 PASS, 0/40 FAIL** under the semantic control metric plus explicit `.vlt`
+**44/44 PASS, 0/44 FAIL** under the semantic control metric plus explicit `.vlt`
 structural waivers. The false failures caused by toggle-as-BRDA accounting are
 removed from the scoreboard:
 
@@ -246,6 +250,22 @@ problem parameters or by source type width:
 - `IIR_filter_0016` uses signed unique samples plus directed impulse, step,
   endpoint, and alternating-signed sequences to exercise reset and normal
   signed arithmetic history updates.
+- `word_reducer_0012` uses exhaustive 3-bit operand pairs plus a
+  solver-randomized `[unique within test]` XOR-difference mask to cover every
+  Hamming-distance bucket and prove the combinational output against a model.
+- `traffic_light_controller_0007` uses directed FSM hold/transition stimulus
+  and output covergroups to hit every line and semantic control branch,
+  including the S3 hold path that requires vehicle present with long timer low.
+- `Serial_Line_Converter_0006` uses a `[unique within test]` mode/pattern
+  transaction plus directed 8-mode sweeps; holding each mode long enough for
+  the divider terminal count exercises RZ and scrambled-output behavior.
+- `write_through_data_direct_mapped_cache_0001` uses directed cache protocol
+  sequences plus constrained randomized tag/index/data accesses to cover miss
+  fill, hit, write allocation, same-index replacement, uncached bypass, delayed
+  memory ready, boundary addresses, reset invalidation, and sliced-address
+  coverpoints (`dut.cpu_addr[7:0]`). The complex bench exposed a CVDP DUT
+  issue: undeclared `cache_dout` becomes a 1-bit implicit Verilator wire, so
+  hit-read data cannot be checked meaningfully without fixing the DUT.
 - `restoring_division_0006` is currently not an authored scoreboard case because
   the DUT does not converge in Verilator at cycle 0, before testbench stimulus.
 

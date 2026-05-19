@@ -1,0 +1,111 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_word_reducer_0012`.
+//
+// DUT: 3-bit Hamming-distance counter. The wrapper adds a phantom `clk`
+// because the underlying DUT is purely combinational.
+//
+// Strategy: exhaustive 8 x 8 sweep with a software popcount model, plus
+// a short solver-randomized phase that uses unique base/difference masks.
+
+transaction DiffStim
+    a : uint<3> with [unique within test]
+    diff : uint<3> with [unique within test]
+end transaction DiffStim
+
+function hamming3(a: uint<3>, b: uint<3>) -> uint<2>
+    let x : uint<3> = a ^ b
+    let c : uint<2> = 0
+    for bit in 0 .. 3
+        if (((x >> bit) & 1) == 1)
+            c = c + 1
+        end if
+    end for
+    return c
+end function hamming3
+
+covergroup BitDiffCov @(posedge dut.clk)
+    cp_a : cover dut.input_A
+        bins
+            zero = {0}
+            ones = {7}
+            other = [1..6]
+        end bins
+
+    cp_b : cover dut.input_B
+        bins
+            zero = {0}
+            ones = {7}
+            other = [1..6]
+        end bins
+
+    cp_count : cover dut.bit_difference_count
+        bins
+            same = {0}
+            one_bit = {1}
+            two_bits = {2}
+            three_bits = {3}
+        end bins
+
+    cross cp_a, cp_b
+    cross cp_a, cp_count
+end covergroup BitDiffCov
+
+testbench BitDifferenceCounterTb
+    dut : Bit_Difference_Counter_top
+    cov : BitDiffCov
+end testbench BitDifferenceCounterTb
+
+function apply_and_check(dut: Bit_Difference_Counter_top, a: uint<3>, b: uint<3>) -> uint<1>
+    dut.input_A = a
+    dut.input_B = b
+    wait 1 cycle
+    let expected = hamming3(a, b)
+    if dut.bit_difference_count != expected
+        log(error, "MISMATCH A=${a:1x} B=${b:1x} got=${dut.bit_difference_count} expected=${expected}")
+        return 1
+    end if
+    return 0
+end function apply_and_check
+
+impl BitDifferenceCounterTest for BitDifferenceCounterTb
+    run
+        log(info, "bit_difference_counter: exhaustive sweep plus unique randomized masks")
+
+        dut.input_A = 0
+        dut.input_B = 0
+        wait 1 cycle
+
+        let errors : uint<32> = 0
+
+        // Exhaustive input-space sweep: 64 combinations, all distances 0..3.
+        for a in 0 .. 8
+            for b in 0 .. 8
+                errors = errors + apply_and_check(dut, a, b)
+            end for
+        end for
+
+        // Solver-backed variation. `diff` is XORed into `a`, so nonzero
+        // masks naturally force one-, two-, and three-bit differences.
+        for _ in 0 .. 20
+            let s : DiffStim
+            randomize(s) with
+                s.diff != 0
+            end randomize
+            let b : uint<3> = s.a ^ s.diff
+            errors = errors + apply_and_check(dut, s.a, b)
+        end for
+
+        assert errors == 0
+            else fail("bit_difference_counter produced ${errors} mismatches")
+
+        assert cov.cp_count.same > 0 else fail("coverage hole: distance 0")
+        assert cov.cp_count.one_bit > 0 else fail("coverage hole: distance 1")
+        assert cov.cp_count.two_bits > 0 else fail("coverage hole: distance 2")
+        assert cov.cp_count.three_bits > 0 else fail("coverage hole: distance 3")
+        assert cov.cp_a.zero > 0 else fail("coverage hole: input_A zero")
+        assert cov.cp_a.ones > 0 else fail("coverage hole: input_A ones")
+        assert cov.cp_b.zero > 0 else fail("coverage hole: input_B zero")
+        assert cov.cp_b.ones > 0 else fail("coverage hole: input_B ones")
+
+        log(info, "ALL TESTS PASSED - bit_difference_counter")
+    end run
+end impl BitDifferenceCounterTest

@@ -106,6 +106,16 @@ inline _harc_u128 harc_read(const Sig& sig) {
     }
 }
 
+inline uint64_t harc_bits(_harc_u128 value, uint32_t hi, uint32_t lo) {
+    if (hi < lo) return 0;
+    if (lo >= 128) return 0;
+    const uint32_t width = hi - lo + 1;
+    const _harc_u128 shifted = value >> lo;
+    if (width >= 64) return static_cast<uint64_t>(shifted);
+    const _harc_u128 mask = (static_cast<_harc_u128>(1) << width) - 1;
+    return static_cast<uint64_t>(shifted & mask);
+}
+
 // ── Wider-than-128-bit support ───────────────────────────────────────
 // 65–128b values flow through `_harc_u128` (above). For wider signals
 // (256, 512, 1024, … up to arbitrary `VlWide<N>`), the natural surface
