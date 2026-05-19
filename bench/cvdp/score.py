@@ -102,6 +102,20 @@ COVERAGE_WAIVERS: dict[str, list[CoverageWaiver]] = {
             "OutputFormat_g defaults to 0, so the one-hot output format branch is unreachable",
         ),
     ],
+    "cvdp_copilot_matrix_multiplier_0022": [
+        CoverageWaiver(
+            "matrix_multiplier.sv",
+            39,
+            39,
+            "default COL_A=4 makes MODIFIED_COL_A=4, so generated k<COL_A is always true",
+        ),
+        CoverageWaiver(
+            "matrix_multiplier.sv",
+            60,
+            60,
+            "default COL_A=4 makes HALF_MODIFIED_COL_A=2, so HALF_MODIFIED_COL_A>1 is always true",
+        ),
+    ],
     "cvdp_copilot_encoder_8b10b_0026": [
         CoverageWaiver(
             "encoder_8b10b.sv",
