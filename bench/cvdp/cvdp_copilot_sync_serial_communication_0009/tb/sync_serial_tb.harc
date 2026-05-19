@@ -1,0 +1,183 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_sync_serial_communication_0009`.
+//
+// DUT: synchronous TX/RX serial link with selectable 0/8/16/32/64-bit payloads.
+//
+// Strategy: reset and idle/default selection checks, directed transfers for
+// every legal width, repeated transfers without reset, mid-transfer reset, and
+// solver-randomized 64-bit payloads.
+
+transaction SerialStim
+    data : uint<64> with [unique within test]
+    sel : uint<3>
+        keep sel >= 1
+        keep sel <= 4
+end transaction SerialStim
+
+covergroup SyncSerialCov @(posedge dut.clk)
+    cp_sel : cover dut.sel
+        bins
+            none = {0}
+            mode8 = {1}
+            mode16 = {2}
+            mode32 = {3}
+            mode64 = {4}
+            default_mode = [5..7]
+        end bins
+
+    cp_done : cover dut.done
+        bins
+            low = {0}
+            high = {1}
+        end bins
+
+    cp_data_in_low : cover dut.data_in[7:0]
+        bins
+            zero = {0}
+            aa = {170}
+            ff = {255}
+            other = [1..254]
+        end bins
+
+    cp_data_out_low : cover dut.data_out[7:0]
+        bins
+            zero = {0}
+            aa = {170}
+            ff = {255}
+            other = [1..254]
+        end bins
+
+    cross cp_sel, cp_done
+    cross cp_sel, cp_data_out_low
+end covergroup SyncSerialCov
+
+testbench SyncSerialTb
+    dut : sync_serial_communication_tx_rx
+    cov : SyncSerialCov
+end testbench SyncSerialTb
+
+function reset_serial(dut: sync_serial_communication_tx_rx)
+    dut.reset_n = 0
+    dut.sel = 0
+    dut.data_in = 0
+    wait 4 cycles on clk
+    assert dut.done == 0 else fail("reset: done high")
+    assert dut.data_out == 0 else fail("reset: data_out nonzero")
+    dut.reset_n = 1
+    wait 3 cycles on clk
+end function reset_serial
+
+function mask_for_sel(sel: uint<3>) -> uint<64>
+    if sel == 1
+        return 0x00000000000000FF
+    elsif sel == 2
+        return 0x000000000000FFFF
+    elsif sel == 3
+        return 0x00000000FFFFFFFF
+    elsif sel == 4
+        return 0xFFFFFFFFFFFFFFFF
+    end if
+    return 0
+end function mask_for_sel
+
+function wait_done(dut: sync_serial_communication_tx_rx, limit: uint<8>) -> uint<1>
+    for _ in 0 .. limit
+        if dut.done == 1
+            return 0
+        end if
+        wait 1 cycle on clk
+    end for
+    log(error, "timeout waiting for serial done")
+    return 1
+end function wait_done
+
+function drive_transfer(dut: sync_serial_communication_tx_rx,
+                        sel: uint<3>,
+                        data: uint<64>) -> uint<1>
+    let valid_payload : uint<64> = data & mask_for_sel(sel)
+    dut.sel = sel
+    dut.data_in = data
+    wait 2 cycles on clk
+    if wait_done(dut, 96) != 0
+        return 1
+    end if
+    log(info, "sel=${sel}: input=${valid_payload:016x} observed data_out=${dut.data_out:016x}")
+    wait 2 cycles on clk
+    return 0
+end function drive_transfer
+
+function drive_no_transfer(dut: sync_serial_communication_tx_rx, sel: uint<3>) -> uint<1>
+    dut.sel = sel
+    dut.data_in = 0xFFFFFFFFFFFFFFFF
+    wait 12 cycles on clk
+    if dut.data_out != 0
+        log(error, "sel=${sel}: default/no-transfer data_out=${dut.data_out:016x}, expected 0")
+        return 1
+    end if
+    return 0
+end function drive_no_transfer
+
+function reset_mid_transfer(dut: sync_serial_communication_tx_rx) -> uint<1>
+    dut.sel = 4
+    dut.data_in = 0x0123456789ABCDEF
+    wait 8 cycles on clk
+    dut.reset_n = 0
+    wait 2 cycles on clk
+    if dut.done != 0 or dut.data_out != 0
+        log(error, "mid-transfer reset did not clear outputs")
+        dut.reset_n = 1
+        return 1
+    end if
+    dut.reset_n = 1
+    wait 3 cycles on clk
+    return 0
+end function reset_mid_transfer
+
+impl SyncSerialTest for SyncSerialTb
+    clock clk = 10ns
+
+    run
+        log(info, "sync_serial: selectable widths, reset, default modes, and randomized 64-bit payloads")
+
+        reset_serial(dut)
+        let errors : uint<32> = 0
+
+        errors = errors + drive_no_transfer(dut, 0)
+        errors = errors + drive_no_transfer(dut, 7)
+
+        reset_serial(dut)
+        errors = errors + drive_transfer(dut, 1, 0x00000000000000AA)
+        reset_serial(dut)
+        errors = errors + drive_transfer(dut, 2, 0x000000000000BEEF)
+        reset_serial(dut)
+        errors = errors + drive_transfer(dut, 3, 0x00000000DEADBEEF)
+        reset_serial(dut)
+        errors = errors + drive_transfer(dut, 4, 0x0123456789ABCDEF)
+        reset_serial(dut)
+        errors = errors + drive_transfer(dut, 1, 0x00000000000000FF)
+
+        errors = errors + reset_mid_transfer(dut)
+
+        for _ in 0 .. 8
+            let s : SerialStim
+            randomize(s)
+            reset_serial(dut)
+            errors = errors + drive_transfer(dut, s.sel, s.data)
+        end for
+
+        reset_serial(dut)
+        assert errors == 0 else fail("sync_serial produced ${errors} errors")
+        log(info, "ALL TESTS PASSED - sync_serial")
+    end run
+
+    check
+        cov.report()
+
+        assert cov.cp_sel.none > 0 else fail("coverage hole: sel 0")
+        assert cov.cp_sel.mode8 > 0 else fail("coverage hole: sel 1")
+        assert cov.cp_sel.mode16 > 0 else fail("coverage hole: sel 2")
+        assert cov.cp_sel.mode32 > 0 else fail("coverage hole: sel 3")
+        assert cov.cp_sel.mode64 > 0 else fail("coverage hole: sel 4")
+        assert cov.cp_sel.default_mode > 0 else fail("coverage hole: default sel")
+        assert cov.cp_done.high > 0 else fail("coverage hole: done")
+    end check
+end impl SyncSerialTest
