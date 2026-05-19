@@ -158,6 +158,7 @@ then removes known structural holes from Verilator's denominator before scoring.
 | `afi_ptr_0004` | 96.25% | 100.00% | control | ≥80% | **PASS** |
 | `apb_dsp_op_0006` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `apb_dsp_unit_0003` | 100.00% | 100.00% | control | ≥98% | **PASS** |
+| `apb_history_shift_register_0003` | 100.00% | 100.00% | control | ≥98% | **PASS** |
 | `asyc_reset_0004` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `bcd_adder_0007` | 100.00% | n/a | line | ≥95% | **PASS** |
 | `binary_to_BCD_0030` | 100.00% | 100.00% | control | ≥90% | **PASS** |
@@ -197,7 +198,7 @@ then removes known structural holes from Verilator's denominator before scoring.
 
 ### Net scoreboard
 
-**45/45 PASS, 0/45 FAIL** under the semantic control metric plus explicit `.vlt`
+**46/46 PASS, 0/46 FAIL** under the semantic control metric plus explicit `.vlt`
 structural waivers. The false failures caused by toggle-as-BRDA accounting are
 removed from the scoreboard:
 
@@ -271,6 +272,12 @@ problem parameters or by source type width:
   `wait ... on hclk` to cover Wishbone/AHB select decoding, read/write phases,
   AHB wait states, data-phase stalls, and idle/busy/nonseq transfer states.
   This validates HARC's ARCH-shaped multi-clock model on a CVDP bus bridge.
+- `apb_history_shift_register_0003` uses generated `clk` for APB CSR traffic
+  and short wall-time pulses on the event-like `history_shift_valid` input to
+  cover no-op, normal prediction, misprediction-priority restore, full/empty
+  history flags, invalid-address errors, and clock-gated APB no-update cases.
+  This validates mixed generated-clock plus event-edge stimulus without adding
+  a second artificial clock domain.
 - `restoring_division_0006` is currently not an authored scoreboard case because
   the DUT does not converge in Verilator at cycle 0, before testbench stimulus.
 
