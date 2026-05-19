@@ -1,0 +1,51 @@
+// Bus-level `tlm_method` smoke test.
+//
+// HARC lowers calls on a bound bus to ARCH-compatible req/rsp wires:
+// mem_read_req_valid, mem_read_addr, mem_read_req_ready,
+// mem_read_rsp_valid, mem_read_rsp_data, mem_read_rsp_ready, etc.
+
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+    tlm_method read_ooo(addr: uint<8>) -> uint<32>: out_of_order tags 2;
+    tlm_method poke(addr: uint<8>, data: uint<32>): blocking;
+end bus TlmMemBus
+
+testbench TlmMethodBusTb
+    dut : TlmMemory
+end testbench TlmMethodBusTb
+
+impl TlmMethodBusTest for TlmMethodBusTb
+    let mem : TlmMemBus = bind dut
+
+    run
+        dut.rst = 1
+        dut.mem_read_req_valid = 0
+        dut.mem_read_rsp_ready = 0
+        dut.mem_read_ooo_req_valid = 0
+        dut.mem_read_ooo_rsp_ready = 0
+        dut.mem_poke_req_valid = 0
+        dut.mem_poke_rsp_ready = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        let initial = mem.read(5)
+        assert initial == 261
+            else fail("initial read got 0x${initial:08x}, expected 0x00000105")
+
+        mem.poke(8, 3405691582)
+        let updated = mem.read(8)
+        assert updated == 3405691582
+            else fail("updated read got 0x${updated:08x}, expected 0xCAFEBABE")
+
+        let forked0 = fork mem.read_ooo(9)
+        let forked1 = fork mem.read_ooo(10)
+        join_all
+        assert forked0 == 265
+            else fail("forked0 read got 0x${forked0:08x}, expected 0x00000109")
+        assert forked1 == 266
+            else fail("forked1 read got 0x${forked1:08x}, expected 0x0000010a")
+
+        log(info, "PASS: bus tlm_method read/poke/fork")
+    end run
+end impl TlmMethodBusTest

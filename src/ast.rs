@@ -818,16 +818,18 @@ pub struct CoverSequenceDecl {
 ///   plus payload signals; flatten to `<chan>_valid`, `<chan>_ready`,
 ///   `<chan>_<sig>` per spec §19.2.2
 /// - parameter list (`param NAME: const = default`)
+/// - `tlm_method` request/response metadata for direct-Verilator
+///   transaction-method calls
 ///
-/// `credit_channel` and `tlm_method` blocks parse but don't yet take
-/// part in HARC's signal-access lowering (they're scaffold-only —
-/// covered by future PRs).
+/// `credit_channel` blocks parse but don't yet take part in HARC's
+/// signal-access lowering (they're scaffold-only — covered by future PRs).
 #[derive(Debug, Clone)]
 pub struct BusDecl {
     pub name: Ident,
     pub params: Vec<Param>,
     pub signals: Vec<BusSignal>,
     pub handshakes: Vec<HandshakeChannel>,
+    pub tlm_methods: Vec<TlmMethod>,
     pub span: Span,
     pub doc: Option<String>,
     pub inner_doc: Option<String>,
@@ -864,6 +866,19 @@ pub struct HandshakeChannel {
 pub enum HandshakeRole {
     Send,
     Receive,
+}
+
+/// `tlm_method read(addr: uint<32>) -> uint<64>: blocking;` — transaction-level
+/// method metadata carried by a bus declaration. HARC's direct-Verilator
+/// backend lowers calls to ARCH-compatible req/rsp wire protocol.
+#[derive(Debug, Clone)]
+pub struct TlmMethod {
+    pub name: Ident,
+    pub args: Vec<(Ident, TypeExpr)>,
+    pub ret: Option<TypeExpr>,
+    pub mode: Ident,
+    pub out_of_order_tags: Option<Expr>,
+    pub span: Span,
 }
 
 // ── External (Verilator-bound) module (§10.5) ─────────────────────────────────
@@ -1052,6 +1067,11 @@ pub enum ExprKind {
     Call {
         callee: Expr,
         args: Vec<CallArg>,
+    },
+    /// `fork bus.method(args)` — nonblocking issue for a bus `tlm_method`
+    /// call. The result is captured by a later `join_all` statement.
+    ForkCall {
+        call: Expr,
     },
     /// `a as Type` — cast.
     Cast {
@@ -1272,6 +1292,11 @@ pub enum StmtKind {
     },
     If(IfStmt),
     Fork(ForkStmt),
+    /// `join_all` as an RHS-fork TLM barrier. Distinct from the block-form
+    /// `fork ... join_all` statement.
+    JoinAll {
+        span: Span,
+    },
     Parallel(Vec<Block>),
     Schedule(Vec<Block>),
     Select(Vec<SelectArm>),

@@ -1826,15 +1826,16 @@ impl Parser {
     /// Parse a `bus Name ... end bus Name` declaration. v0 surface:
     /// plain signals (`name: in|out Type;`) and `handshake_channel`
     /// groupings (`handshake_channel ch: send kind: valid_ready { ... }
-    /// end handshake_channel ch`). Bus parameters,
-    /// `credit_channel`, and `tlm_method` blocks are explicitly out
-    /// of scope for v0 — those will need their own follow-up PRs.
+    /// end handshake_channel ch`), and `tlm_method` declarations.
+    /// `credit_channel` blocks are explicitly out of scope for v0 —
+    /// those will need their own follow-up PRs.
     fn parse_bus(&mut self, doc: Option<String>) -> Result<BusDecl, CompileError> {
         let start = self.expect(TokenKind::Bus)?.span;
         let name = self.expect_ident()?;
         let inner_doc = self.consume_inner_doc();
         let mut signals = Vec::new();
         let mut handshakes = Vec::new();
+        let mut tlm_methods = Vec::new();
         while !self.check_end_keyword() {
             // `param NAME: const = default;` — bus-level parameter.
             // Parsed but ignored at the AST level for v0; the stdlib
@@ -1917,6 +1918,11 @@ impl Parser {
                 });
                 continue;
             }
+            // `tlm_method read(addr: uint<32>) -> uint<64>: blocking;`
+            if self.check_ident("tlm_method") {
+                tlm_methods.push(self.parse_tlm_method_decl()?);
+                continue;
+            }
             // Plain signal: `name: in|out Type;`
             let s_name = self.expect_ident()?;
             self.expect(TokenKind::Colon)?;
@@ -1951,9 +1957,92 @@ impl Parser {
             params: Vec::new(),
             signals,
             handshakes,
+            tlm_methods,
             span: start.merge(end),
             doc,
             inner_doc,
+        })
+    }
+
+    /// Parse a `tlm_method` declaration inside a bus body. Matches ARCH's
+    /// current surface: `blocking` and `out_of_order tags N` are accepted in
+    /// the AST; direct HARC codegen currently lowers only `blocking` calls.
+    fn parse_tlm_method_decl(&mut self) -> Result<TlmMethod, CompileError> {
+        let start = self.advance().unwrap().span;
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::LParen)?;
+        let mut args = Vec::new();
+        if !self.check(TokenKind::RParen) {
+            loop {
+                let arg_name = self.expect_ident()?;
+                self.expect(TokenKind::Colon)?;
+                let arg_ty = self.parse_type_expr()?;
+                args.push((arg_name, arg_ty));
+                if self.check(TokenKind::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(TokenKind::RParen)?;
+        let ret = if self.check(TokenKind::RArrow) {
+            self.advance();
+            Some(self.parse_type_expr()?)
+        } else {
+            None
+        };
+        self.expect(TokenKind::Colon)?;
+        let mode = if self.check(TokenKind::Blocking) {
+            let tok = self.advance().unwrap();
+            Ident {
+                name: "blocking".into(),
+                span: tok.span,
+            }
+        } else {
+            self.expect_ident()?
+        };
+        let out_of_order_tags = if mode.name == "out_of_order" {
+            if self.check_ident("tags") {
+                self.advance();
+            } else {
+                return Err(CompileError::unexpected_token(
+                    "`tags`",
+                    &self.peek_kind().map(|k| k.to_string()).unwrap_or_default(),
+                    self.peek_span(),
+                ));
+            }
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        let end_span = if self.check(TokenKind::Semi) {
+            self.advance().unwrap().span
+        } else {
+            mode.span
+        };
+        if mode.name != "blocking" && mode.name != "out_of_order" {
+            return Err(CompileError::general(
+                &format!(
+                    "tlm_method concurrency mode `{}` is not implemented — use `blocking` or `out_of_order tags N`.",
+                    mode.name
+                ),
+                mode.span,
+            ));
+        }
+        if mode.name == "blocking" && out_of_order_tags.is_some() {
+            return Err(CompileError::general(
+                "`tags` is only valid on `out_of_order` TLM methods",
+                mode.span,
+            ));
+        }
+        Ok(TlmMethod {
+            name,
+            args,
+            ret,
+            mode,
+            out_of_order_tags,
+            span: start.merge(end_span),
         })
     }
 
@@ -2674,7 +2763,6 @@ impl Parser {
     fn is_block_terminator(&self) -> bool {
         match self.peek_kind() {
             Some(TokenKind::End) => true,
-            Some(TokenKind::JoinAll) | Some(TokenKind::JoinAny) | Some(TokenKind::JoinNone) => true,
             Some(TokenKind::Else) | Some(TokenKind::ElsIf) => true,
             Some(TokenKind::Branch) => false, // branch is opener inside fork
             None => true,
@@ -2769,6 +2857,13 @@ impl Parser {
                 let span = s.span;
                 Ok(Stmt {
                     kind: StmtKind::Fork(s),
+                    span,
+                })
+            }
+            Some(TokenKind::JoinAll) => {
+                let span = self.advance().unwrap().span;
+                Ok(Stmt {
+                    kind: StmtKind::JoinAll { span },
                     span,
                 })
             }
@@ -3814,6 +3909,12 @@ impl Parser {
                 let body = self.parse_unary()?;
                 let s = span0.merge(body.span);
                 Ok(Expr::new(ExprKind::HashHash { count, expr: body }, s))
+            }
+            Some(TokenKind::Fork) => {
+                self.advance();
+                let call = self.parse_postfix()?;
+                let s = span0.merge(call.span);
+                Ok(Expr::new(ExprKind::ForkCall { call }, s))
             }
             _ => self.parse_postfix(),
         }
