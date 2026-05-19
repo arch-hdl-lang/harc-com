@@ -107,8 +107,8 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
             pad(out, depth);
             writeln!(out, "struct {}", s.name.name).ok();
             print_inner_doc(out, &s.inner_doc, depth + 1);
-            for f in &s.fields {
-                print_field(out, f, depth + 1);
+            for item in &s.body {
+                print_txn_body_item(out, item, depth + 1);
             }
             pad(out, depth);
             writeln!(out, "end struct {}", s.name.name).ok();

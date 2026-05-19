@@ -323,6 +323,7 @@ pub struct DomainField {
 pub struct StructDecl {
     pub name: Ident,
     pub fields: Vec<Field>,
+    pub body: Vec<TxnBodyItem>,
     pub span: Span,
     pub doc: Option<String>,
     /// `//!` lines immediately after the opening `struct <Name>` and

@@ -278,6 +278,10 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         std::collections::HashMap::new();
     let mut txn_fields: std::collections::HashMap<String, Vec<TxnFieldInfo>> =
         std::collections::HashMap::new();
+    let mut record_fields: std::collections::HashMap<String, Vec<Field>> =
+        std::collections::HashMap::new();
+    let mut record_bodies: std::collections::HashMap<String, Vec<TxnBodyItem>> =
+        std::collections::HashMap::new();
     // Per-transaction `keep` constraints (spec §4 — "constraints are
     // relations, not directives"). Collected here so `randomize(t)`
     // and `randomize(t) with …` both route them through the Z3 solver
@@ -324,6 +328,14 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     }
     for it in &file.items {
         match it {
+            Item::Struct(s) => {
+                record_fields.insert(s.name.name.clone(), s.fields.clone());
+                record_bodies.insert(s.name.name.clone(), s.body.clone());
+            }
+            Item::Transaction(t) => {
+                record_fields.insert(t.name.name.clone(), txn_direct_fields(&t.body));
+                record_bodies.insert(t.name.name.clone(), t.body.clone());
+            }
             Item::Scoreboard(c) => {
                 scoreboards.insert(c.name.name.clone());
                 components.insert(c.name.name.clone(), c.clone());
@@ -389,16 +401,13 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         match it {
             Item::Transaction(t) => {
                 transactions.insert(t.name.name.clone());
-                let fields = t
-                    .body
-                    .iter()
-                    .filter_map(|it| match it {
-                        TxnBodyItem::Field(f) => {
-                            Some(txn_field_info_from_field(f, &enums, &enum_domains))
-                        }
-                        _ => None,
-                    })
-                    .collect();
+                let direct_fields = txn_direct_fields(&t.body);
+                let fields = flatten_record_field_infos(
+                    &direct_fields,
+                    &record_fields,
+                    &enums,
+                    &enum_domains,
+                );
                 txn_fields.insert(t.name.name.clone(), fields);
                 // Collect transaction-level `keep` constraints. Keeps nested
                 // inside `when` subtype bodies lower as guarded implications:
@@ -407,19 +416,20 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                 // that subtype. Full tagged-ADT solver modeling remains a
                 // future backend step; this keeps the current flat solver path
                 // semantically honest for keeps over already-visible fields.
-                let keeps = collect_txn_keeps(&t.body);
+                let keeps = collect_record_keeps(&t.body, &record_bodies, &record_fields);
                 if !keeps.is_empty() {
                     txn_keeps.insert(t.name.name.clone(), keeps);
                 }
             }
             Item::Struct(s) => {
                 structs.insert(s.name.name.clone());
-                let fields = s
-                    .fields
-                    .iter()
-                    .map(|f| txn_field_info_from_field(f, &enums, &enum_domains))
-                    .collect();
+                let fields =
+                    flatten_record_field_infos(&s.fields, &record_fields, &enums, &enum_domains);
                 txn_fields.insert(s.name.name.clone(), fields);
+                let keeps = collect_record_keeps(&s.body, &record_bodies, &record_fields);
+                if !keeps.is_empty() {
+                    txn_keeps.insert(s.name.name.clone(), keeps);
+                }
             }
             Item::Enum(e) => {
                 enums.insert(e.name.name.clone(), e.variants.len());
@@ -2166,6 +2176,7 @@ impl<'a> WaitCondition<'a> {
 #[derive(Debug, Clone)]
 struct TxnFieldInfo {
     name: String,
+    path: Vec<String>,
     width: u32,
     signed: bool,
     enum_variants: Option<usize>,
@@ -2184,8 +2195,9 @@ struct ListFieldInfo {
     elem_signed: bool,
 }
 
-fn txn_field_info_from_field(
+fn txn_field_info_from_field_path(
     f: &Field,
+    path: Vec<String>,
     enums: &std::collections::HashMap<String, usize>,
     enum_domains: &std::collections::HashMap<String, Vec<String>>,
 ) -> TxnFieldInfo {
@@ -2217,7 +2229,8 @@ fn txn_field_info_from_field(
         }
     };
     TxnFieldInfo {
-        name: f.name.name.clone(),
+        name: path.join("."),
+        path,
         width,
         signed,
         enum_variants,
@@ -2225,6 +2238,71 @@ fn txn_field_info_from_field(
         list,
         non_random: f.non_random,
         attrs: f.attrs.clone(),
+    }
+}
+
+fn record_type_name(t: &TypeExpr) -> Option<&str> {
+    let TypeExpr::Named { name, .. } = t else {
+        return None;
+    };
+    name.segments.last().map(|segment| segment.name.as_str())
+}
+
+fn txn_direct_fields(items: &[TxnBodyItem]) -> Vec<Field> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            TxnBodyItem::Field(f) => Some(f.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn flatten_record_field_infos(
+    fields: &[Field],
+    record_fields: &std::collections::HashMap<String, Vec<Field>>,
+    enums: &std::collections::HashMap<String, usize>,
+    enum_domains: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<TxnFieldInfo> {
+    let mut out = Vec::new();
+    flatten_record_field_infos_inner(
+        fields,
+        Vec::new(),
+        record_fields,
+        enums,
+        enum_domains,
+        &mut out,
+    );
+    out
+}
+
+fn flatten_record_field_infos_inner(
+    fields: &[Field],
+    prefix: Vec<String>,
+    record_fields: &std::collections::HashMap<String, Vec<Field>>,
+    enums: &std::collections::HashMap<String, usize>,
+    enum_domains: &std::collections::HashMap<String, Vec<String>>,
+    out: &mut Vec<TxnFieldInfo>,
+) {
+    for f in fields {
+        let mut path = prefix.clone();
+        path.push(f.name.name.clone());
+        if list_field_info(&f.ty).is_none() {
+            if let Some(record) = record_type_name(&f.ty).and_then(|name| record_fields.get(name)) {
+                if !enums.contains_key(record_type_name(&f.ty).unwrap_or_default()) {
+                    flatten_record_field_infos_inner(
+                        record,
+                        path,
+                        record_fields,
+                        enums,
+                        enum_domains,
+                        out,
+                    );
+                    continue;
+                }
+            }
+        }
+        out.push(txn_field_info_from_field_path(f, path, enums, enum_domains));
     }
 }
 
@@ -2558,27 +2636,25 @@ fn auto_coverage_values(f: &TxnFieldInfo) -> Vec<AutoCoverageValue> {
     values
 }
 
+fn c_ident(s: &str) -> String {
+    s.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn randomize_target_field_name(
     target: &Expr,
     field_info: &std::collections::HashMap<String, TxnFieldInfo>,
     target_root: Option<&str>,
 ) -> Option<String> {
-    match &*target.kind {
-        ExprKind::Field { target, name } => {
-            let ExprKind::Ident(root) = &*target.kind else {
-                return None;
-            };
-            if target_root.is_some_and(|expected| root.name != expected) {
-                return None;
-            }
-            field_info
-                .contains_key(&name.name)
-                .then(|| name.name.clone())
-        }
-        ExprKind::Ident(id) if field_info.contains_key(&id.name) => Some(id.name.clone()),
-        ExprKind::Paren(inner) => randomize_target_field_name(inner, field_info, target_root),
-        _ => None,
-    }
+    let field = expr_field_path(target, target_root)?;
+    field_info.contains_key(&field).then_some(field)
 }
 
 fn randomize_target_ident(target: &Expr) -> Option<&str> {
@@ -2594,24 +2670,44 @@ fn list_field_name_from_expr(
     field_info: &std::collections::HashMap<String, TxnFieldInfo>,
     target_root: Option<&str>,
 ) -> Option<String> {
-    let field = match &*e.kind {
-        ExprKind::Ident(id) => id.name.clone(),
-        ExprKind::Field { target, name } => match &*target.kind {
-            ExprKind::Ident(root) => {
-                if target_root.is_some_and(|expected| root.name != expected) {
-                    return None;
-                }
-                name.name.clone()
-            }
-            ExprKind::ImplicitSelf => name.name.clone(),
-            _ => return None,
-        },
-        ExprKind::Paren(inner) => return list_field_name_from_expr(inner, field_info, target_root),
-        _ => return None,
-    };
+    let field = expr_field_path(e, target_root)?;
     field_info
         .get(&field)
         .and_then(|info| info.list.as_ref().map(|_| field))
+}
+
+fn expr_field_path(e: &Expr, target_root: Option<&str>) -> Option<String> {
+    let mut parts = Vec::new();
+    collect_expr_field_path(e, &mut parts)?;
+    if parts.is_empty() {
+        return None;
+    }
+    if let Some(root) = target_root {
+        if parts.first().is_some_and(|part| part == root) {
+            parts.remove(0);
+        }
+    }
+    Some(parts.join("."))
+}
+
+fn expr_field_root(e: &Expr) -> Option<String> {
+    let mut parts = Vec::new();
+    collect_expr_field_path(e, &mut parts)?;
+    parts.first().cloned()
+}
+
+fn collect_expr_field_path(e: &Expr, out: &mut Vec<String>) -> Option<()> {
+    match &*e.kind {
+        ExprKind::Ident(id) => out.push(id.name.clone()),
+        ExprKind::ImplicitSelf => {}
+        ExprKind::Field { target, name } => {
+            collect_expr_field_path(target, out)?;
+            out.push(name.name.clone());
+        }
+        ExprKind::Paren(inner) => collect_expr_field_path(inner, out)?,
+        _ => return None,
+    }
+    Some(())
 }
 
 fn list_len_call_field_name(
@@ -2736,18 +2832,15 @@ fn collect_randomize_target_field_refs(
                 out.insert(id.name.clone());
             }
         }
-        ExprKind::Field { target, name } => match &*target.kind {
-            ExprKind::Ident(root)
-                if target_root.is_some_and(|expected| root.name == expected)
-                    && field_info.contains_key(&name.name) =>
-            {
-                out.insert(name.name.clone());
+        ExprKind::Field { target, .. } => {
+            if let Some(field) = expr_field_path(e, target_root) {
+                if field_info.contains_key(&field) {
+                    out.insert(field);
+                    return;
+                }
             }
-            ExprKind::ImplicitSelf if field_info.contains_key(&name.name) => {
-                out.insert(name.name.clone());
-            }
-            _ => collect_randomize_target_field_refs(target, field_info, target_root, out),
-        },
+            collect_randomize_target_field_refs(target, field_info, target_root, out);
+        }
         ExprKind::Index { target, index } => {
             collect_randomize_target_field_refs(target, field_info, target_root, out);
             collect_randomize_target_field_refs(index, field_info, target_root, out);
@@ -6747,6 +6840,13 @@ impl Emitter {
         }
     }
 
+    fn emit_target_field_access(&mut self, target: &Expr, f: &TxnFieldInfo) {
+        self.emit_expr(target);
+        for part in &f.path {
+            write!(self.out, ".{part}").ok();
+        }
+    }
+
     fn validate_field_attr_static_expr(&mut self, ty: &str, field: &str, attr: &str, expr: &Expr) {
         match &*expr.kind {
             ExprKind::Field { target, name } => {
@@ -6857,6 +6957,11 @@ impl Emitter {
     ) {
         match &*expr.kind {
             ExprKind::Field { target, name } => {
+                if expr_field_path(expr, target_root)
+                    .is_some_and(|field| field_info.contains_key(&field))
+                {
+                    return;
+                }
                 if let ExprKind::Ident(root) = &*target.kind {
                     if !blocking && target_root.is_some_and(|expected| root.name != expected) {
                         let path = format!("{}.{}", root.name, name.name);
@@ -7297,10 +7402,11 @@ impl Emitter {
         depth: usize,
     ) {
         let list_unroll_bounds = std::collections::HashMap::new();
+        let c_name = c_ident(&f.name);
         self.pad(depth);
         write!(self.out, "_s.add(").ok();
         if f.signed {
-            write!(self.out, "_z_{} >= ", f.name).ok();
+            write!(self.out, "_z_{} >= ", c_name).ok();
             self.emit_constraint_expr_w(
                 lo,
                 field_info,
@@ -7309,7 +7415,7 @@ impl Emitter {
                 blocking,
                 &list_unroll_bounds,
             );
-            write!(self.out, " && _z_{} <= ", f.name).ok();
+            write!(self.out, " && _z_{} <= ", c_name).ok();
             self.emit_constraint_expr_w(
                 hi,
                 field_info,
@@ -7319,7 +7425,7 @@ impl Emitter {
                 &list_unroll_bounds,
             );
         } else {
-            write!(self.out, "z3::uge(_z_{}, ", f.name).ok();
+            write!(self.out, "z3::uge(_z_{}, ", c_name).ok();
             self.emit_constraint_expr_w(
                 lo,
                 field_info,
@@ -7328,7 +7434,7 @@ impl Emitter {
                 blocking,
                 &list_unroll_bounds,
             );
-            write!(self.out, ") && z3::ule(_z_{}, ", f.name).ok();
+            write!(self.out, ") && z3::ule(_z_{}, ", c_name).ok();
             self.emit_constraint_expr_w(
                 hi,
                 field_info,
@@ -7654,20 +7760,21 @@ impl Emitter {
         // gets a range constraint enforcing its declared width — uniform
         // emission, no zext bookkeeping.
         for f in &fields {
+            let c_name = c_ident(&f.name);
             if let Some(list) = &f.list {
                 let max_len = list_unroll_bounds.get(&f.name).copied().unwrap_or(0);
                 self.pad(depth + 1);
                 writeln!(
                     self.out,
                     "z3::expr _z_{}_len = _ctx.bv_const(\"{}_len\", 64);",
-                    f.name, f.name
+                    c_name, c_name
                 )
                 .ok();
                 self.pad(depth + 1);
                 writeln!(
                     self.out,
                     "_s.add(z3::ule(_z_{}_len, _ctx.bv_val((uint64_t){}, 64)));",
-                    f.name, max_len
+                    c_name, max_len
                 )
                 .ok();
                 if f.non_random {
@@ -7675,18 +7782,18 @@ impl Emitter {
                     write!(
                         self.out,
                         "_s.add(_z_{}_len == _ctx.bv_val((uint64_t)(",
-                        f.name
+                        c_name
                     )
                     .ok();
-                    self.emit_expr(target);
-                    writeln!(self.out, ".{}.size()), 64));", f.name).ok();
+                    self.emit_target_field_access(target, f);
+                    writeln!(self.out, ".size()), 64));").ok();
                 }
                 for i in 0..max_len {
                     self.pad(depth + 1);
                     writeln!(
                         self.out,
                         "z3::expr _z_{}_{i} = _ctx.bv_const(\"{}_{i}\", 64);",
-                        f.name, f.name
+                        c_name, c_name
                     )
                     .ok();
                     if list.elem_signed && list.elem_width < 64 {
@@ -7694,7 +7801,7 @@ impl Emitter {
                         writeln!(
                             self.out,
                             "_s.add(_z_{}_{i} >= _ctx.bv_val((uint64_t)(-(1LL << {})), 64));",
-                            f.name,
+                            c_name,
                             list.elem_width.saturating_sub(1)
                         )
                         .ok();
@@ -7702,7 +7809,7 @@ impl Emitter {
                         writeln!(
                             self.out,
                             "_s.add(_z_{}_{i} <= _ctx.bv_val((uint64_t)((1LL << {}) - 1), 64));",
-                            f.name,
+                            c_name,
                             list.elem_width.saturating_sub(1)
                         )
                         .ok();
@@ -7711,22 +7818,22 @@ impl Emitter {
                         writeln!(
                             self.out,
                             "_s.add(z3::ult(_z_{}_{i}, _ctx.bv_val((uint64_t)1ULL << {}, 64)));",
-                            f.name, list.elem_width
+                            c_name, list.elem_width
                         )
                         .ok();
                     }
                     if f.non_random {
                         self.pad(depth + 1);
                         write!(self.out, "if (").ok();
-                        self.emit_expr(target);
+                        self.emit_target_field_access(target, f);
                         write!(
                             self.out,
-                            ".{}.size() > {i}) _s.add(_z_{}_{i} == _ctx.bv_val((uint64_t)(",
-                            f.name, f.name
+                            ".size() > {i}) _s.add(_z_{}_{i} == _ctx.bv_val((uint64_t)(",
+                            c_name
                         )
                         .ok();
-                        self.emit_expr(target);
-                        writeln!(self.out, ".{}[{i}]), 64));", f.name).ok();
+                        self.emit_target_field_access(target, f);
+                        writeln!(self.out, "[{i}]), 64));").ok();
                     }
                 }
                 continue;
@@ -7738,7 +7845,7 @@ impl Emitter {
             writeln!(
                 self.out,
                 "z3::expr _z_{} = _ctx.bv_const(\"{}\", 64);",
-                f.name, f.name
+                c_name, c_name
             )
             .ok();
             if let Some(n) = f.enum_variants {
@@ -7746,7 +7853,7 @@ impl Emitter {
                 writeln!(
                     self.out,
                     "_s.add(z3::ule(_z_{}, _ctx.bv_val((uint64_t){}, 64)));",
-                    f.name,
+                    c_name,
                     n.saturating_sub(1)
                 )
                 .ok();
@@ -7755,7 +7862,7 @@ impl Emitter {
                 writeln!(
                     self.out,
                     "_s.add(_z_{} >= _ctx.bv_val((uint64_t)(-(1LL << {})), 64));",
-                    f.name,
+                    c_name,
                     f.width.saturating_sub(1)
                 )
                 .ok();
@@ -7763,7 +7870,7 @@ impl Emitter {
                 writeln!(
                     self.out,
                     "_s.add(_z_{} <= _ctx.bv_val((uint64_t)((1LL << {}) - 1), 64));",
-                    f.name,
+                    c_name,
                     f.width.saturating_sub(1)
                 )
                 .ok();
@@ -7772,15 +7879,15 @@ impl Emitter {
                 writeln!(
                     self.out,
                     "_s.add(z3::ult(_z_{}, _ctx.bv_val((uint64_t)1ULL << {}, 64)));",
-                    f.name, f.width
+                    c_name, f.width
                 )
                 .ok();
             }
             if f.non_random {
                 self.pad(depth + 1);
-                write!(self.out, "_s.add(_z_{} == _ctx.bv_val((uint64_t)(", f.name).ok();
-                self.emit_expr(target);
-                writeln!(self.out, ".{}), 64));", f.name).ok();
+                write!(self.out, "_s.add(_z_{} == _ctx.bv_val((uint64_t)(", c_name).ok();
+                self.emit_target_field_access(target, f);
+                writeln!(self.out, "), 64));").ok();
             }
             if let Some((lo, hi)) = field_attr_range(f) {
                 self.emit_solver_range_constraint(
@@ -7960,7 +8067,7 @@ impl Emitter {
             .filter_map(|f| {
                 let values = auto_coverage_values(f);
                 (!values.is_empty()).then(|| AutoCoverageGoal {
-                    field: f.name.clone(),
+                    field: c_ident(&f.name),
                     values,
                 })
             })
@@ -7978,11 +8085,12 @@ impl Emitter {
         // One static history vector per free field — persists across loop
         // iterations to push the solver away from previously-seen answers.
         for f in &free_fields {
+            let c_name = c_ident(&f.name);
             self.pad(depth + 1);
             writeln!(
                 self.out,
                 "static std::vector<uint64_t> {cache_tag}_{};",
-                f.name
+                c_name
             )
             .ok();
         }
@@ -8151,6 +8259,7 @@ impl Emitter {
         // diversity-only/base solve. This makes solver-backed randomize
         // consume the HARC seed without turning preferences into false UNSATs.
         for f in &free_fields {
+            let c_name = c_ident(&f.name);
             self.pad(depth + 1);
             let dist_entries = dist_directives
                 .get(&f.name)
@@ -8160,7 +8269,7 @@ impl Emitter {
                 write!(
                     self.out,
                     "uint64_t _pref_{cache_tag}_{} = (uint64_t)harc_rng_dist({{",
-                    f.name
+                    c_name
                 )
                 .ok();
                 self.emit_rng_dist_entries(entries);
@@ -8169,7 +8278,7 @@ impl Emitter {
                 writeln!(
                     self.out,
                     "uint64_t _pref_{cache_tag}_{} = (uint64_t)harc_rng_range(0, {});",
-                    f.name,
+                    c_name,
                     n.saturating_sub(1)
                 )
                 .ok();
@@ -8177,7 +8286,7 @@ impl Emitter {
                 writeln!(
                     self.out,
                     "uint64_t _pref_{cache_tag}_{} = (uint64_t)harc_rng_range(-(1LL << {}), (1LL << {}) - 1);",
-                    f.name,
+                    c_name,
                     f.width.saturating_sub(1),
                     f.width.saturating_sub(1)
                 )
@@ -8186,14 +8295,14 @@ impl Emitter {
                 writeln!(
                     self.out,
                     "uint64_t _pref_{cache_tag}_{} = harc_rng_uint({});",
-                    f.name, f.width
+                    c_name, f.width
                 )
                 .ok();
             } else {
                 writeln!(
                     self.out,
                     "uint64_t _pref_{cache_tag}_{} = harc_rng_next();",
-                    f.name
+                    c_name
                 )
                 .ok();
             }
@@ -8341,11 +8450,12 @@ impl Emitter {
         )
         .ok();
         for f in &free_fields {
+            let c_name = c_ident(&f.name);
             self.pad(depth + 1);
             writeln!(
                 self.out,
                 "_s.add(_z_{} == _ctx.bv_val(_pref_{cache_tag}_{}, 64));",
-                f.name, f.name
+                c_name, c_name
             )
             .ok();
         }
@@ -8380,12 +8490,13 @@ impl Emitter {
         self.pad(depth + 1);
         writeln!(self.out, "}}").ok();
         for f in &free_fields {
+            let c_name = c_ident(&f.name);
             if unique_fields.contains(&f.name) {
                 self.pad(depth + 1);
                 writeln!(
                     self.out,
                     "for (auto _v : {cache_tag}_{}) _s.add(_z_{} != _ctx.bv_val(_v, 64));   // [unique] policy: no repeat until exhausted",
-                    f.name, f.name
+                    c_name, c_name
                 )
                 .ok();
                 continue;
@@ -8394,14 +8505,14 @@ impl Emitter {
             writeln!(
                 self.out,
                 "if ({cache_tag}_{}.size() > 32) {cache_tag}_{}.clear();",
-                f.name, f.name
+                c_name, c_name
             )
             .ok();
             self.pad(depth + 1);
             writeln!(
                 self.out,
                 "for (auto _v : {cache_tag}_{}) _s.add(_z_{} != _ctx.bv_val(_v, 64));",
-                f.name, f.name
+                c_name, c_name
             )
             .ok();
         }
@@ -8414,8 +8525,9 @@ impl Emitter {
         self.pad(depth + 2);
         writeln!(self.out, "_s.pop();").ok();
         for f in &free_fields {
+            let c_name = c_ident(&f.name);
             self.pad(depth + 2);
-            writeln!(self.out, "{cache_tag}_{}.clear();", f.name).ok();
+            writeln!(self.out, "{cache_tag}_{}.clear();", c_name).ok();
         }
         self.pad(depth + 2);
         writeln!(self.out, "_r = _s.check();").ok();
@@ -8428,6 +8540,7 @@ impl Emitter {
         self.pad(depth + 2);
         writeln!(self.out, "z3::model _m = _s.get_model();").ok();
         for f in &fields {
+            let c_name = c_ident(&f.name);
             if f.non_random {
                 continue;
             }
@@ -8437,16 +8550,16 @@ impl Emitter {
                 writeln!(
                     self.out,
                     "z3::expr _eval_{}_len = _m.eval(_z_{}_len, true).simplify();",
-                    f.name, f.name
+                    c_name, c_name
                 )
                 .ok();
                 self.pad(depth + 2);
-                writeln!(self.out, "uint64_t _raw_{}_len = 0;", f.name).ok();
+                writeln!(self.out, "uint64_t _raw_{}_len = 0;", c_name).ok();
                 self.pad(depth + 2);
                 writeln!(
                     self.out,
                     "if (!_eval_{}_len.is_numeral_u64(_raw_{}_len)) {{",
-                    f.name, f.name
+                    c_name, c_name
                 )
                 .ok();
                 self.pad(depth + 3);
@@ -8464,29 +8577,29 @@ impl Emitter {
                 writeln!(
                     self.out,
                     "if (_raw_{}_len > {}) _raw_{}_len = {};",
-                    f.name, max_len, f.name, max_len
+                    c_name, max_len, c_name, max_len
                 )
                 .ok();
                 self.pad(depth + 2);
-                self.emit_expr(target);
-                writeln!(self.out, ".{}.resize((size_t)_raw_{}_len);", f.name, f.name).ok();
+                self.emit_target_field_access(target, f);
+                writeln!(self.out, ".resize((size_t)_raw_{}_len);", c_name).ok();
                 for i in 0..max_len {
                     self.pad(depth + 2);
-                    writeln!(self.out, "if (_raw_{}_len > {i}) {{", f.name).ok();
+                    writeln!(self.out, "if (_raw_{}_len > {i}) {{", c_name).ok();
                     self.pad(depth + 3);
                     writeln!(
                         self.out,
                         "z3::expr _eval_{}_{i} = _m.eval(_z_{}_{i}, true).simplify();",
-                        f.name, f.name
+                        c_name, c_name
                     )
                     .ok();
                     self.pad(depth + 3);
-                    writeln!(self.out, "uint64_t _raw_{}_{i} = 0;", f.name).ok();
+                    writeln!(self.out, "uint64_t _raw_{}_{i} = 0;", c_name).ok();
                     self.pad(depth + 3);
                     writeln!(
                         self.out,
                         "if (!_eval_{}_{i}.is_numeral_u64(_raw_{}_{i})) {{",
-                        f.name, f.name
+                        c_name, c_name
                     )
                     .ok();
                     self.pad(depth + 4);
@@ -8501,17 +8614,16 @@ impl Emitter {
                     self.pad(depth + 3);
                     writeln!(self.out, "}}").ok();
                     self.pad(depth + 3);
-                    self.emit_expr(target);
+                    self.emit_target_field_access(target, f);
                     writeln!(
                         self.out,
-                        ".{}[{i}] = ({})_raw_{}_{i};",
-                        f.name,
+                        "[{i}] = ({})_raw_{}_{i};",
                         if list.elem_signed {
                             "int64_t"
                         } else {
                             "uint64_t"
                         },
-                        f.name
+                        c_name
                     )
                     .ok();
                     self.pad(depth + 2);
@@ -8531,16 +8643,16 @@ impl Emitter {
             writeln!(
                 self.out,
                 "z3::expr _eval_{} = _m.eval(_z_{}, true).simplify();",
-                f.name, f.name
+                c_name, c_name
             )
             .ok();
             self.pad(depth + 2);
-            writeln!(self.out, "uint64_t _raw_{} = 0;", f.name).ok();
+            writeln!(self.out, "uint64_t _raw_{} = 0;", c_name).ok();
             self.pad(depth + 2);
             writeln!(
                 self.out,
                 "if (!_eval_{}.is_numeral_u64(_raw_{})) {{",
-                f.name, f.name
+                c_name, c_name
             )
             .ok();
             self.pad(depth + 3);
@@ -8558,19 +8670,19 @@ impl Emitter {
             writeln!(
                 self.out,
                 "{} _val_{} = ({})_raw_{};",
-                val_ty, f.name, val_ty, f.name
+                val_ty, c_name, val_ty, c_name
             )
             .ok();
             self.pad(depth + 2);
             write!(self.out, "").ok();
-            self.emit_expr(target);
-            writeln!(self.out, ".{} = _val_{};", f.name, f.name).ok();
+            self.emit_target_field_access(target, f);
+            writeln!(self.out, " = _val_{};", c_name).ok();
             if !pinned.contains(&f.name) {
                 self.pad(depth + 2);
                 writeln!(
                     self.out,
                     "{cache_tag}_{}.push_back(_val_{});",
-                    f.name, f.name
+                    c_name, c_name
                 )
                 .ok();
             }
@@ -8691,6 +8803,7 @@ impl Emitter {
             ));
             return;
         };
+        let c_field = c_ident(&field);
         for i in 0..max_len {
             let item = Expr::new(
                 ExprKind::Index {
@@ -8707,7 +8820,7 @@ impl Emitter {
                 write!(
                     self.out,
                     "_s.add(z3::ule(_z_{}_len, _ctx.bv_val((uint64_t){i}, 64)) || (",
-                    field
+                    c_field
                 )
                 .ok();
                 self.emit_constraint_expr_with_list_bounds(
@@ -8730,7 +8843,7 @@ impl Emitter {
         list_unroll_bounds: &std::collections::HashMap<String, usize>,
     ) -> bool {
         if let Some(field) = list_len_call_field_name(e, field_info, target_root) {
-            write!(self.out, "_z_{}_len", field).ok();
+            write!(self.out, "_z_{}_len", c_ident(&field)).ok();
             return true;
         }
 
@@ -8788,6 +8901,7 @@ impl Emitter {
             return;
         };
         let max_len = list_unroll_bounds.get(field).copied().unwrap_or(0);
+        let c_field = c_ident(field);
         let lo_const = lo.and_then(const_usize_expr).unwrap_or(0);
         let hi_const = hi.and_then(const_usize_expr);
         let hi_is_len = hi
@@ -8812,11 +8926,11 @@ impl Emitter {
                 write!(
                     self.out,
                     "z3::ite(z3::ugt(_z_{}_len, _ctx.bv_val((uint64_t){i}, 64)), _z_{}_{i}, _ctx.bv_val((uint64_t)0, 64))",
-                    field, field
+                    c_field, c_field
                 )
                 .ok();
             } else {
-                write!(self.out, "_z_{}_{i}", field).ok();
+                write!(self.out, "_z_{}_{i}", c_field).ok();
             }
             emitted = true;
         }
@@ -8864,7 +8978,7 @@ impl Emitter {
                             .is_some()
                         {
                             if i < list_unroll_bounds.get(&field).copied().unwrap_or(0) {
-                                write!(self.out, "_z_{}_{i}", field).ok();
+                                write!(self.out, "_z_{}_{i}", c_ident(&field)).ok();
                                 return;
                             }
                         }
@@ -8880,31 +8994,28 @@ impl Emitter {
                 write!(self.out, "_ctx.bool_val(true)").ok();
             }
             // `t.<name>` → _z_<name>. Strip the `t.` prefix.
-            ExprKind::Field { target, name } => {
-                if let ExprKind::Ident(root) = &*target.kind {
-                    if field_info.contains_key(&name.name)
-                        && target_root.is_some_and(|expected| root.name == expected)
-                    {
-                        if field_info
-                            .get(&name.name)
-                            .and_then(|f| f.list.as_ref())
-                            .is_some()
-                        {
+            ExprKind::Field { .. } => {
+                if let Some(field) = expr_field_path(e, target_root) {
+                    if let Some(info) = field_info.get(&field) {
+                        if info.list.is_some() {
                             self.errors.push(format!(
                                 "constraint references list field `{}` as a scalar; use `{}.len()`, `{}[index]`, or `sum({}[0..{}.len()])`",
-                                name.name, name.name, name.name, name.name, name.name
+                                field, field, field, field, field
                             ));
                             write!(self.out, "_ctx.bool_val(true)").ok();
-                        } else if field_info.get(&name.name).is_some_and(|f| f.width == 0) {
+                        } else if info.width == 0 {
                             self.errors.push(format!(
                                 "constraint references composite field `{}` as a scalar; nested record constraint flattening is not supported yet",
-                                name.name
+                                field
                             ));
                             write!(self.out, "_ctx.bool_val(true)").ok();
                         } else {
-                            write!(self.out, "_z_{}", name.name).ok();
+                            write!(self.out, "_z_{}", c_ident(&field)).ok();
                         }
-                    } else if blocking && target_root.is_some_and(|expected| root.name != expected)
+                    } else if blocking
+                        && target_root
+                            .zip(expr_field_root(e).as_deref())
+                            .is_some_and(|(target, root)| root != target)
                     {
                         write!(self.out, "_ctx.bv_val((uint64_t)(").ok();
                         self.emit_expr(e);
@@ -8912,15 +9023,18 @@ impl Emitter {
                     } else {
                         self.errors.push(format!(
                             "constraint references unknown field `{}` (only fields of the randomize target are supported)",
-                            name.name
+                            field
                         ));
                         write!(self.out, "_ctx.bool_val(true)").ok();
                     }
+                } else if blocking {
+                    write!(self.out, "_ctx.bv_val((uint64_t)(").ok();
+                    self.emit_expr(e);
+                    write!(self.out, "), {width})").ok();
                 } else {
-                    self.errors.push(format!(
-                        "constraint references unknown field `{}` (only fields of the randomize target are supported)",
-                        name.name
-                    ));
+                    self.errors.push(
+                        "constraint references unsupported field path (only fields of the randomize target are supported)".into(),
+                    );
                     write!(self.out, "_ctx.bool_val(true)").ok();
                 }
             }
@@ -8946,7 +9060,7 @@ impl Emitter {
                         ));
                         write!(self.out, "_ctx.bool_val(true)").ok();
                     } else {
-                        write!(self.out, "_z_{}", id.name).ok();
+                        write!(self.out, "_z_{}", c_ident(&id.name)).ok();
                     }
                 } else if let Some(idx) = self.enum_variants.get(&id.name).copied() {
                     write!(self.out, "_ctx.bv_val((uint64_t){}, {})", idx, width).ok();
@@ -11808,7 +11922,7 @@ pub fn uses_constraint_solver(file: &SourceFile) -> bool {
                 }
             }
             Item::Struct(s) => {
-                if fields_have_solver_policy(&s.fields, &enum_names) {
+                if txn_body_has_keep(&s.body) || fields_have_solver_policy(&s.fields, &enum_names) {
                     Some(s.name.name.as_str())
                 } else {
                     None
@@ -14065,6 +14179,139 @@ fn collect_txn_keeps(items: &[TxnBodyItem]) -> Vec<Expr> {
     let mut out = Vec::new();
     collect_txn_keeps_with_guard(items, None, &mut out);
     out
+}
+
+fn collect_record_keeps(
+    items: &[TxnBodyItem],
+    record_bodies: &std::collections::HashMap<String, Vec<TxnBodyItem>>,
+    record_fields: &std::collections::HashMap<String, Vec<Field>>,
+) -> Vec<Expr> {
+    let mut out = collect_txn_keeps(items);
+    for f in txn_direct_fields(items) {
+        let Some(child_ty) = record_type_name(&f.ty) else {
+            continue;
+        };
+        if !record_fields.contains_key(child_ty) {
+            continue;
+        }
+        let Some(child_body) = record_bodies.get(child_ty) else {
+            continue;
+        };
+        let child_keeps = collect_record_keeps(child_body, record_bodies, record_fields);
+        if child_keeps.is_empty() {
+            continue;
+        }
+        let prefix = Expr::new(ExprKind::Ident(f.name.clone()), f.name.span);
+        let child_fields: std::collections::HashSet<String> = record_fields
+            .get(child_ty)
+            .into_iter()
+            .flat_map(|fields| fields.iter().map(|field| field.name.name.clone()))
+            .collect();
+        for keep in child_keeps {
+            out.push(prefix_record_keep_expr(&keep, &prefix, &child_fields));
+        }
+    }
+    out
+}
+
+fn prefix_record_keep_expr(
+    expr: &Expr,
+    prefix: &Expr,
+    field_names: &std::collections::HashSet<String>,
+) -> Expr {
+    let kind = match &*expr.kind {
+        ExprKind::Ident(id) if field_names.contains(&id.name) => ExprKind::Field {
+            target: prefix.clone(),
+            name: id.clone(),
+        },
+        ExprKind::Field { target, name } => ExprKind::Field {
+            target: prefix_record_keep_expr(target, prefix, field_names),
+            name: name.clone(),
+        },
+        ExprKind::Index { target, index } => ExprKind::Index {
+            target: prefix_record_keep_expr(target, prefix, field_names),
+            index: prefix_record_keep_expr(index, prefix, field_names),
+        },
+        ExprKind::BitSlice { target, hi, lo } => ExprKind::BitSlice {
+            target: prefix_record_keep_expr(target, prefix, field_names),
+            hi: prefix_record_keep_expr(hi, prefix, field_names),
+            lo: prefix_record_keep_expr(lo, prefix, field_names),
+        },
+        ExprKind::Call { callee, args } => ExprKind::Call {
+            callee: prefix_record_keep_expr(callee, prefix, field_names),
+            args: args
+                .iter()
+                .map(|arg| match arg {
+                    CallArg::Expr(e) => {
+                        CallArg::Expr(prefix_record_keep_expr(e, prefix, field_names))
+                    }
+                    CallArg::Named { name, value } => CallArg::Named {
+                        name: name.clone(),
+                        value: prefix_record_keep_expr(value, prefix, field_names),
+                    },
+                })
+                .collect(),
+        },
+        ExprKind::ForEachConstraint { var, iter, body } => ExprKind::ForEachConstraint {
+            var: var.clone(),
+            iter: prefix_record_keep_expr(iter, prefix, field_names),
+            body: body
+                .iter()
+                .map(|e| {
+                    if field_names.contains(&var.name) {
+                        e.clone()
+                    } else {
+                        prefix_record_keep_expr(e, prefix, field_names)
+                    }
+                })
+                .collect(),
+        },
+        ExprKind::Cast { expr, ty } => ExprKind::Cast {
+            expr: prefix_record_keep_expr(expr, prefix, field_names),
+            ty: ty.clone(),
+        },
+        ExprKind::Unary { op, expr } => ExprKind::Unary {
+            op: *op,
+            expr: prefix_record_keep_expr(expr, prefix, field_names),
+        },
+        ExprKind::Binary { op, lhs, rhs } => ExprKind::Binary {
+            op: *op,
+            lhs: prefix_record_keep_expr(lhs, prefix, field_names),
+            rhs: prefix_record_keep_expr(rhs, prefix, field_names),
+        },
+        ExprKind::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => ExprKind::Ternary {
+            cond: prefix_record_keep_expr(cond, prefix, field_names),
+            then_branch: prefix_record_keep_expr(then_branch, prefix, field_names),
+            else_branch: prefix_record_keep_expr(else_branch, prefix, field_names),
+        },
+        ExprKind::Paren(inner) => {
+            ExprKind::Paren(prefix_record_keep_expr(inner, prefix, field_names))
+        }
+        ExprKind::Membership { expr, set } => ExprKind::Membership {
+            expr: prefix_record_keep_expr(expr, prefix, field_names),
+            set: prefix_record_keep_expr(set, prefix, field_names),
+        },
+        ExprKind::SetLit(items) => ExprKind::SetLit(
+            items
+                .iter()
+                .map(|e| prefix_record_keep_expr(e, prefix, field_names))
+                .collect(),
+        ),
+        ExprKind::RangeLit { lo, hi } => ExprKind::RangeLit {
+            lo: lo
+                .as_ref()
+                .map(|e| prefix_record_keep_expr(e, prefix, field_names)),
+            hi: hi
+                .as_ref()
+                .map(|e| prefix_record_keep_expr(e, prefix, field_names)),
+        },
+        _ => return expr.clone(),
+    };
+    Expr::new(kind, expr.span)
 }
 
 fn collect_txn_keeps_with_guard(items: &[TxnBodyItem], guard: Option<Expr>, out: &mut Vec<Expr>) {

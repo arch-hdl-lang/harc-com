@@ -48,6 +48,17 @@ end transaction Packet
 }
 
 #[test]
+fn struct_keep_round_trip() {
+    let src = r#"
+struct Header
+    addr : uint<32>
+    keep addr % 4 == 0
+end struct Header
+"#;
+    parse_print_reparse(src);
+}
+
+#[test]
 fn property_assert_assume_cover() {
     let src = r#"
 property aw_valid_stable
