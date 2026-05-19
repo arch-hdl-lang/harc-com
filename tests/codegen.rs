@@ -84,6 +84,35 @@ end test DiscardTest"#,
     );
 }
 
+#[test]
+fn typed_wide_integer_lets_keep_declared_cpp_width() {
+    let parsed = parse_source(
+        r#"test WideLocalTest
+    let dut : DummyDut
+    run
+        let child_ptrs : uint<75> = 0x7FFFFFFFFFFFFFF9461
+        let keys : uint<240> = 0x00000000000000000000000000000000000E000A00060002000C00040008
+        dut.left_child = child_ptrs
+        dut.keys = keys
+    end run
+end test WideLocalTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("_harc_u128 child_ptrs = (((_harc_u128)0x7FFULL << 64) | (_harc_u128)0xFFFFFFFFFFFF9461ULL);"),
+        "uint<75> local should lower to _harc_u128, not int64_t; got:\n{cpp}",
+    );
+    assert!(
+        cpp.contains("_harc_u128 keys = (((_harc_u128)0x0000000E000A0006ULL << 64) | (_harc_u128)0x0002000C00040008ULL);"),
+        "wide integer local should not use int64_t truncating storage; got:\n{cpp}",
+    );
+    assert!(
+        !cpp.contains("int64_t child_ptrs") && !cpp.contains("int64_t keys"),
+        "typed wide locals must not use int64_t; got:\n{cpp}",
+    );
+}
+
 // Tests for the legacy `impl sim for T` two-block form were removed
 // alongside its parser entry in Phase 2 of docs/test-ergonomics.md.
 // Inline-form coverage lives in the fixture suite (counter_test,
@@ -151,7 +180,9 @@ end test CoverBitSliceTest"#,
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("bit-sliced coverpoint should lower");
     assert!(
-        cpp.contains("harc_rt::harc_bits(harc_rt::harc_read(dut->cpu_addr), (uint32_t)(7), (uint32_t)(0))"),
+        cpp.contains(
+            "harc_rt::harc_bits(harc_rt::harc_read(dut->cpu_addr), (uint32_t)(7), (uint32_t)(0))"
+        ),
         "covergroup bit slice should lower through harc_bits; got:\n{cpp}",
     );
 }
