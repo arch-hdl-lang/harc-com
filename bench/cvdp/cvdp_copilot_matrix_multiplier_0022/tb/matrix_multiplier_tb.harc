@@ -1,0 +1,219 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_matrix_multiplier_0022`.
+//
+// DUT: a pipelined 4x4 matrix multiplier with 128-bit packed input matrices
+// and a 288-bit packed output matrix.
+//
+// Strategy: reset and valid-gap checks, directed matrix products with full
+// 288-bit expected-output comparisons, back-to-back valid transactions, and
+// randomized narrow element patterns that keep the scoreboard literals tractable.
+
+transaction MatrixStim
+    base : uint<4> with [unique within test]
+    step : uint<4> with [unique within test]
+end transaction MatrixStim
+
+covergroup MatrixMulCov @(posedge dut.clk)
+    cp_valid_in : cover dut.valid_in
+        bins
+            low = {0}
+            high = {1}
+        end bins
+
+    cp_valid_out : cover dut.valid_out
+        bins
+            low = {0}
+            high = {1}
+        end bins
+
+    cp_a_low : cover dut.matrix_a[7:0]
+        bins
+            zero = {0}
+            one = {1}
+            two = {2}
+            other = [3..255]
+        end bins
+
+    cp_b_low : cover dut.matrix_b[7:0]
+        bins
+            zero = {0}
+            one = {1}
+            other = [2..255]
+        end bins
+
+    cp_c_low : cover dut.matrix_c[17:0]
+        bins
+            zero = {0}
+            one = {1}
+            four = {4}
+            sixteen = {16}
+            other = [2..262143]
+        end bins
+
+    cross cp_valid_in, cp_valid_out
+    cross cp_a_low, cp_b_low
+end covergroup MatrixMulCov
+
+testbench MatrixMultiplierTb
+    dut : matrix_multiplier
+    cov : MatrixMulCov
+end testbench MatrixMultiplierTb
+
+function reset_matrix(dut: matrix_multiplier)
+    dut.srst = 1
+    dut.valid_in = 0
+    dut.matrix_a = 0
+    dut.matrix_b = 0
+    wait 3 cycles on clk
+    assert dut.valid_out == 0 else fail("reset: valid_out high")
+    assert dut.matrix_c == 0 else fail("reset: matrix_c nonzero")
+    dut.srst = 0
+    wait 2 cycles on clk
+end function reset_matrix
+
+function wait_for_valid(dut: matrix_multiplier, limit: uint<8>) -> uint<1>
+    for _ in 0 .. limit
+        if dut.valid_out == 1
+            return 0
+        end if
+        wait 1 cycle on clk
+    end for
+    log(error, "timeout waiting for matrix valid_out")
+    return 1
+end function wait_for_valid
+
+function drive_matrix(dut: matrix_multiplier,
+                      a: uint<128>,
+                      b: uint<128>,
+                      expected: uint<288>) -> uint<1>
+    dut.matrix_a = a
+    dut.matrix_b = b
+    dut.valid_in = 1
+    wait 1 cycle on clk
+    dut.valid_in = 0
+    dut.matrix_a = 0
+    dut.matrix_b = 0
+
+    if wait_for_valid(dut, 12) != 0
+        return 1
+    end if
+    if dut.matrix_c != expected
+        log(error, "matrix mismatch: got=${dut.matrix_c:072x} expected=${expected:072x}")
+        return 1
+    end if
+    wait 2 cycles on clk
+    return 0
+end function drive_matrix
+
+function drive_gap(dut: matrix_multiplier) -> uint<1>
+    dut.valid_in = 0
+    dut.matrix_a = 0x01010101010101010101010101010101
+    dut.matrix_b = 0x01010101010101010101010101010101
+    wait 8 cycles on clk
+    if dut.valid_out != 0
+        log(error, "valid gap unexpectedly produced valid_out")
+        return 1
+    end if
+    return 0
+end function drive_gap
+
+function drive_back_to_back(dut: matrix_multiplier) -> uint<1>
+    let errors : uint<1> = 0
+
+    dut.matrix_a = 0x01000000000100000000010000000001
+    dut.matrix_b = 0x100F0E0D0C0B0A090807060504030201
+    dut.valid_in = 1
+    wait 1 cycle on clk
+
+    dut.matrix_a = 0x01010101010101010101010101010101
+    dut.matrix_b = 0x01010101010101010101010101010101
+    wait 1 cycle on clk
+
+    dut.valid_in = 0
+    dut.matrix_a = 0
+    dut.matrix_b = 0
+
+    if wait_for_valid(dut, 12) != 0
+        return 1
+    end if
+    if dut.matrix_c != 0x00040000F00038000D00030000B000280009000200007000180005000100003000080001
+        log(error, "back-to-back first product mismatch")
+        errors = errors + 1
+    end if
+    wait 1 cycle on clk
+    if dut.valid_out != 1
+        log(error, "back-to-back second valid_out missing")
+        errors = errors + 1
+    end if
+    if dut.matrix_c != 0x000100004000100004000100004000100004000100004000100004000100004000100004
+        log(error, "back-to-back second product mismatch")
+        errors = errors + 1
+    end if
+    wait 2 cycles on clk
+    return errors
+end function drive_back_to_back
+
+impl MatrixMultiplierTest for MatrixMultiplierTb
+    clock clk = 10ns
+
+    run
+        log(info, "matrix_multiplier: packed matrices, pipelined valid, wide output checks")
+
+        reset_matrix(dut)
+        let errors : uint<32> = 0
+
+        errors = errors + drive_gap(dut)
+
+        errors = errors + drive_matrix(dut,
+            0x01000000000100000000010000000001,
+            0x100F0E0D0C0B0A090807060504030201,
+            0x00040000F00038000D00030000B000280009000200007000180005000100003000080001)
+
+        errors = errors + drive_matrix(dut,
+            0x01010101010101010101010101010101,
+            0x01010101010101010101010101010101,
+            0x000100004000100004000100004000100004000100004000100004000100004000100004)
+
+        errors = errors + drive_matrix(dut,
+            0x02000000000200000000020000000002,
+            0x0F0E0D0C0B0A09080706050403020100,
+            0x00078001C00068001800058001400048001000038000C000280008000180004000080000)
+
+        errors = errors + drive_matrix(dut,
+            0x0A090807020100050102030404030201,
+            0x08000700000600050400030000020001,
+            0x001C0004400178003400040001000038000A00050001400040000E000A00014000880010)
+
+        errors = errors + drive_back_to_back(dut)
+
+        for _ in 0 .. 8
+            let s : MatrixStim
+            randomize(s)
+            let a : uint<128> = 0x01010101010101010101010101010101
+            let b : uint<128> = ((s.base as uint<128>) | ((s.step as uint<128>) << 8)
+                               | ((s.base as uint<128>) << 16) | ((s.step as uint<128>) << 24))
+            dut.matrix_a = a
+            dut.matrix_b = b
+            dut.valid_in = 1
+            wait 1 cycle on clk
+            dut.valid_in = 0
+            wait 8 cycles on clk
+        end for
+
+        reset_matrix(dut)
+        assert errors == 0 else fail("matrix multiplier produced ${errors} errors")
+        log(info, "ALL TESTS PASSED - matrix_multiplier")
+    end run
+
+    check
+        cov.report()
+
+        assert cov.cp_valid_in.high > 0 else fail("coverage hole: valid_in high")
+        assert cov.cp_valid_out.high > 0 else fail("coverage hole: valid_out high")
+        assert cov.cp_a_low.one > 0 else fail("coverage hole: matrix_a low one")
+        assert cov.cp_b_low.zero > 0 else fail("coverage hole: matrix_b low zero")
+        assert cov.cp_b_low.one > 0 else fail("coverage hole: matrix_b low one")
+        assert cov.cp_c_low.one > 0 else fail("coverage hole: matrix_c low one")
+        assert cov.cp_c_low.four > 0 else fail("coverage hole: matrix_c low four")
+        assert cov.cp_c_low.sixteen > 0 else fail("coverage hole: matrix_c low sixteen")
+    end check
+end impl MatrixMultiplierTest

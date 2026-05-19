@@ -180,6 +180,7 @@ then removes known structural holes from Verilator's denominator before scoring.
 | `IIR_filter_0016` | 100.00% | 100.00% | control | ≥95% | **PASS** |
 | `image_stego_0014` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `manchester_enc_0009` | 100.00% | 100.00% | control | ≥100% | **PASS** |
+| `matrix_multiplier_0022` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `morse_code_0027` | 100.00% | n/a | line | ≥95% | **PASS** |
 | `nbit_swizzling_0009` | 100.00% | n/a | line | ≥100% | **PASS** |
 | `ping_pong_buffer_0004` | 100.00% | 100.00% | control | ≥100% | **PASS** |
@@ -201,7 +202,7 @@ then removes known structural holes from Verilator's denominator before scoring.
 
 ### Net scoreboard
 
-**49/49 PASS, 0/49 FAIL** under the semantic control metric plus explicit `.vlt`
+**50/50 PASS, 0/50 FAIL** under the semantic control metric plus explicit `.vlt`
 structural waivers. The false failures caused by toggle-as-BRDA accounting are
 removed from the scoreboard:
 
@@ -222,6 +223,9 @@ problem parameters or by source type width:
 - `decode_firstbit_0017`: default `OutputFormat_g=0` leaves the one-hot output branch unreachable.
 - `encoder_8b10b_0026`: the two-state `current_disparity` enum is reset and
   assigned only valid states, making its `default` recovery line unreachable.
+- `matrix_multiplier_0022`: default `COL_A=4` makes `MODIFIED_COL_A=4` and
+  `HALF_MODIFIED_COL_A=2`, so the generated padding and half-width guard
+  expressions have structurally constant subterms.
 - `nbit_swizzling_0009`: 2-bit `sel` covers every explicit case item, making `default` unreachable.
 - `simple_spi_0003`: outer `!i_enable` and `i_fault` priority branches make
   the corresponding subterms of the nested IDLE-state condition unreachable.
@@ -296,6 +300,11 @@ problem parameters or by source type width:
   searches. It validates HARC wide-port stimulus on 240-bit key vectors and
   75-bit child-pointer vectors while using solver-randomized unique missing
   keys to exercise invalid-search behavior.
+- `matrix_multiplier_0022` uses full-width static scoreboarding for 128-bit
+  packed input matrices and 288-bit packed output matrices, including
+  back-to-back valid transactions and valid gaps. This extends the wide-value
+  validation from local temporaries to full signal equality on generated
+  Verilator wide vectors.
 - `restoring_division_0006` is currently not an authored scoreboard case because
   the DUT does not converge in Verilator at cycle 0, before testbench stimulus.
 
