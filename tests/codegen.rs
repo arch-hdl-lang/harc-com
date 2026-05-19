@@ -3416,6 +3416,48 @@ end test SharedRecordLoweringTest"#,
     );
 }
 
+#[test]
+fn nested_record_constraints_flatten_into_solver_fields() {
+    let parsed = parse_source(
+        r#"struct Header
+    addr : uint<8>
+    keep addr % 4 == 0
+end struct Header
+
+transaction Packet
+    hdr : Header
+    len : uint<8>
+    keep hdr.addr < 64
+end transaction Packet
+
+test NestedRecordConstraintTest
+    let dut : DummyDut
+    run
+        let p : Packet
+        randomize(p) with
+            p.hdr.addr >= 16
+        end randomize
+    end run
+end test NestedRecordConstraintTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("z3::expr _z_hdr_addr = _ctx.bv_const(\"hdr_addr\", 64);"),
+        "nested record scalar should be flattened to a Z3 field; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("z3::urem(_z_hdr_addr, _ctx.bv_val((uint64_t)4, 64))")
+            && cpp.contains("z3::ult(_z_hdr_addr, _ctx.bv_val((uint64_t)64, 64))")
+            && cpp.contains("z3::uge(_z_hdr_addr, _ctx.bv_val((uint64_t)16, 64))"),
+        "struct keep, transaction keep, and randomize-with constraints should all target the flattened field; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("p.hdr.addr = _val_hdr_addr;"),
+        "solver model should write back into the nested record field; got:\n{cpp}"
+    );
+}
+
 // ── Passive-transactor enforcement ──────────────────────────────────────
 //
 // A transactor's always-on body (anything NOT under `when active`) must
