@@ -1,0 +1,147 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_traffic_light_controller_0007`.
+//
+// DUT: four-state traffic-light FSM. The wrapper maps HARC's primary `clk`
+// to the DUT's `i_clk` port.
+//
+// Strategy: reset, hold/no-transition cases in each state, and directed
+// timer/sensor pulses for every transition branch.
+
+covergroup TrafficCov @(posedge dut.clk)
+    cp_main : cover dut.o_main
+        bins
+            off = {0}
+            green = {1}
+            yellow = {2}
+            red = {4}
+        end bins
+
+    cp_side : cover dut.o_side
+        bins
+            off = {0}
+            green = {1}
+            yellow = {2}
+            red = {4}
+        end bins
+
+    cp_short : cover dut.o_short_trigger
+        bins
+            low = {0}
+            high = {1}
+        end bins
+
+    cp_long : cover dut.o_long_trigger
+        bins
+            low = {0}
+            high = {1}
+        end bins
+
+    cp_vehicle : cover dut.i_vehicle_sensor_input
+        bins
+            absent = {0}
+            present = {1}
+        end bins
+
+    cp_short_in : cover dut.i_short_timer
+        bins
+            low = {0}
+            high = {1}
+        end bins
+
+    cp_long_in : cover dut.i_long_timer
+        bins
+            low = {0}
+            high = {1}
+        end bins
+
+    cross cp_vehicle, cp_long_in
+    cross cp_main, cp_side
+end covergroup TrafficCov
+
+testbench TrafficControllerTb
+    dut : traffic_controller_fsm_top
+    cov : TrafficCov
+end testbench TrafficControllerTb
+
+function drive_traffic(dut: traffic_controller_fsm_top, vehicle: bool, short_timer: bool, long_timer: bool)
+    dut.i_vehicle_sensor_input = vehicle
+    dut.i_short_timer = short_timer
+    dut.i_long_timer = long_timer
+    wait 1 cycle
+end function drive_traffic
+
+function reset_traffic(dut: traffic_controller_fsm_top)
+    dut.i_rst_b = 0
+    dut.i_vehicle_sensor_input = 0
+    dut.i_short_timer = 0
+    dut.i_long_timer = 0
+    wait 3 cycles
+    assert dut.o_main == 0 else fail("reset: main lights not off")
+    assert dut.o_side == 0 else fail("reset: side lights not off")
+    assert dut.o_short_trigger == 0 else fail("reset: short trigger high")
+    assert dut.o_long_trigger == 0 else fail("reset: long trigger high")
+    dut.i_rst_b = 1
+    wait 1 cycle
+end function reset_traffic
+
+impl TrafficControllerTest for TrafficControllerTb
+    run
+        log(info, "traffic_controller: directed FSM hold and transition stimulus")
+
+        reset_traffic(dut)
+
+        // S1 hold cases: not both vehicle and long timer.
+        drive_traffic(dut, false, false, false)
+        drive_traffic(dut, true, false, false)
+        drive_traffic(dut, false, false, true)
+
+        // S1 -> S2.
+        drive_traffic(dut, true, false, true)
+        drive_traffic(dut, false, false, false)
+
+        // S2 hold, then S2 -> S3.
+        drive_traffic(dut, false, false, false)
+        drive_traffic(dut, true, false, true)
+        drive_traffic(dut, true, true, false)
+        drive_traffic(dut, true, false, false)
+
+        // S3 hold when vehicle present and long timer low.
+        drive_traffic(dut, true, false, false)
+        drive_traffic(dut, true, false, false)
+
+        // S3 -> S4 via no vehicle.
+        drive_traffic(dut, false, false, false)
+        drive_traffic(dut, false, false, false)
+
+        // S4 hold, then S4 -> S1.
+        drive_traffic(dut, false, false, false)
+        drive_traffic(dut, false, true, false)
+        drive_traffic(dut, false, false, false)
+
+        // Run the alternate S3 -> S4 branch via long timer.
+        drive_traffic(dut, true, false, true)   // S1 -> S2
+        drive_traffic(dut, false, true, false)  // S2 -> S3
+        drive_traffic(dut, true, false, true)   // S3 -> S4 by long_timer
+        drive_traffic(dut, false, true, false)  // S4 -> S1
+
+        // Held timer pulses.
+        drive_traffic(dut, true, false, true)
+        drive_traffic(dut, true, false, true)
+        drive_traffic(dut, true, true, true)
+        drive_traffic(dut, true, true, true)
+        drive_traffic(dut, false, false, false)
+
+        // Mid-run async reset.
+        reset_traffic(dut)
+
+        assert cov.cp_main.green > 0 else fail("coverage hole: main green")
+        assert cov.cp_main.yellow > 0 else fail("coverage hole: main yellow")
+        assert cov.cp_main.red > 0 else fail("coverage hole: main red")
+        assert cov.cp_side.green > 0 else fail("coverage hole: side green")
+        assert cov.cp_side.yellow > 0 else fail("coverage hole: side yellow")
+        assert cov.cp_side.red > 0 else fail("coverage hole: side red")
+        assert cov.cp_short.high > 0 else fail("coverage hole: short trigger")
+        assert cov.cp_long.high > 0 else fail("coverage hole: long trigger")
+
+        log(info, "ALL TESTS PASSED - traffic_controller")
+    end run
+end impl TrafficControllerTest

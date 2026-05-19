@@ -11701,6 +11701,15 @@ impl Emitter {
                 self.emit_expr(index);
                 write!(self.out, "]").ok();
             }
+            ExprKind::BitSlice { target, hi, lo } => {
+                write!(self.out, "harc_rt::harc_bits(").ok();
+                self.emit_expr(target);
+                write!(self.out, ", (uint32_t)(").ok();
+                self.emit_expr(hi);
+                write!(self.out, "), (uint32_t)(").ok();
+                self.emit_expr(lo);
+                write!(self.out, "))").ok();
+            }
             ExprKind::Call { callee, args } => {
                 if args.is_empty() {
                     if let ExprKind::Field { target, name } = &*callee.kind {
