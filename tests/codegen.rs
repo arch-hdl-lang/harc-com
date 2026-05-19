@@ -3458,6 +3458,124 @@ end test NestedRecordConstraintTest"#,
     );
 }
 
+#[test]
+fn nested_record_list_constraints_use_flattened_solver_paths() {
+    let parsed = parse_source(
+        r#"struct Payload
+    items : list<uint<8>>
+    keep items.len() >= 1
+    keep items.len() <= 4
+    keep for item in items
+        item > 0
+    end for
+end struct Payload
+
+transaction Packet
+    payload : Payload
+    total : uint<10>
+    keep sum(payload.items[0..payload.items.len()]) == total
+end transaction Packet
+
+test NestedRecordListConstraintTest
+    let dut : DummyDut
+    run
+        let p : Packet
+        randomize(p) with
+            p.total == 7
+        end randomize
+    end run
+end test NestedRecordListConstraintTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("z3::expr _z_payload_items_len = _ctx.bv_const(\"payload_items_len\", 64);")
+            && cpp
+                .contains("z3::expr _z_payload_items_3 = _ctx.bv_const(\"payload_items_3\", 64);"),
+        "nested list fields should use flattened, C-safe solver variables; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains(
+            "z3::ule(_z_payload_items_len, _ctx.bv_val((uint64_t)0, 64)) || (z3::ugt(_z_payload_items_0"
+        ) && cpp.contains("z3::ugt(_z_payload_items_len, _ctx.bv_val((uint64_t)0, 64))"),
+        "nested foreach and list-sum constraints should lower through flattened list paths; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("p.payload.items.resize((size_t)_raw_payload_items_len);"),
+        "solver model should write nested list length back through the record path; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn nested_record_solve_order_and_pins_use_dotted_field_paths() {
+    let parsed = parse_source(
+        r#"struct Header
+    tag : uint<8> with [unique within test]
+end struct Header
+
+transaction Packet
+    hdr : Header
+    other : uint<8>
+end transaction Packet
+
+test NestedRecordSolveOrderPinTest
+    let dut : DummyDut
+    run
+        let p : Packet
+        randomize(p) with
+            solve_order(p.hdr.tag, p.other)
+            p.hdr.tag == 3
+        end randomize
+    end run
+end test NestedRecordSolveOrderPinTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("// solve_order(hdr.tag, other) accepted as solver scheduling metadata")
+            && cpp.contains("// solve-order sampling order: other"),
+        "nested solve_order args should validate as target fields and pinned nested fields should be removed from free-field ordering; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("_z_hdr_tag == _ctx.bv_val((uint64_t)3, 64)")
+            && cpp.contains("p.hdr.tag = _val_hdr_tag;")
+            && !cpp.contains("hdr_tag.push_back")
+            && !cpp.contains("[unique] policy: no repeat until exhausted"),
+        "equality-pinned nested fields should not receive diversity or unique-history clauses; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn nested_record_auto_coverage_uses_c_safe_identifiers_and_dotted_labels() {
+    let parsed = parse_source(
+        r#"struct Header
+    tag : uint<8> with [unique within test]
+end struct Header
+
+transaction Packet
+    hdr : Header
+end transaction Packet
+
+test NestedRecordAutoCoverageTest
+    let dut : DummyDut
+    run
+        let p : Packet
+        randomize(p)
+    end run
+end test NestedRecordAutoCoverageTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("_auto_cov_") && cpp.contains("_hdr_tag["),
+        "nested auto coverage should use flattened C identifiers; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("Packet.hdr.tag=0") && !cpp.contains("hdr.tag["),
+        "nested auto coverage reports should keep dotted field labels while generated identifiers stay C-safe; got:\n{cpp}"
+    );
+}
+
 // ── Passive-transactor enforcement ──────────────────────────────────────
 //
 // A transactor's always-on body (anything NOT under `when active`) must
