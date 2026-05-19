@@ -1198,6 +1198,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         .ok();
         writeln!(
             e.out,
+            "{INDENT}std::vector<std::function<void()>> _post_eval_services;"
+        )
+        .ok();
+        writeln!(
+            e.out,
             "{INDENT}std::vector<std::function<void()>> _auto_cov_reports;"
         )
         .ok();
@@ -1211,6 +1216,16 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             writeln!(e.out, "{INDENT}{INDENT}dut->clk = 0; dut->eval();").ok();
             writeln!(e.out, "{INDENT}{INDENT}dut->clk = 1; dut->eval();").ok();
             writeln!(e.out, "{INDENT}{INDENT}cycle_count++;").ok();
+            writeln!(
+                e.out,
+                "{INDENT}{INDENT}for (auto& _svc : _post_eval_services) _svc();"
+            )
+            .ok();
+            writeln!(
+                e.out,
+                "{INDENT}{INDENT}if (!_post_eval_services.empty()) dut->eval();"
+            )
+            .ok();
             writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
             writeln!(e.out, "{INDENT}}};").ok();
             writeln!(e.out, "").ok();
@@ -1259,6 +1274,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             writeln!(e.out, "{INDENT}{INDENT}{INDENT}now_ps = next;").ok();
             writeln!(
                 e.out,
+                "{INDENT}{INDENT}{INDENT}bool _primary_rising = false;"
+            )
+            .ok();
+            writeln!(
+                e.out,
                 "{INDENT}{INDENT}{INDENT}for (size_t i = 0; i < clocks_.size(); i++) {{"
             )
             .ok();
@@ -1300,12 +1320,17 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             // Primary clock rising edge bumps cycle_count.
             writeln!(
             e.out,
-            "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (i == 0 && c.level == 1) cycle_count++;"
+            "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (i == 0 && c.level == 1) {{ cycle_count++; _primary_rising = true; }}"
         )
             .ok();
             writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}}}").ok();
             writeln!(e.out, "{INDENT}{INDENT}{INDENT}}}").ok();
             writeln!(e.out, "{INDENT}{INDENT}{INDENT}dut->eval();").ok();
+            writeln!(
+                e.out,
+                "{INDENT}{INDENT}{INDENT}if (_primary_rising) {{ for (auto& _svc : _post_eval_services) _svc(); if (!_post_eval_services.empty()) dut->eval(); }}"
+            )
+            .ok();
             writeln!(e.out, "{INDENT}{INDENT}}}").ok();
             writeln!(e.out, "{INDENT}}};").ok();
             writeln!(e.out, "").ok();
@@ -1919,6 +1944,17 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             .ok();
             // Posedge first — latches current input values.
             writeln!(e.out, "{INDENT}{INDENT}dut->clk = 1; dut->eval();").ok();
+            writeln!(e.out, "{INDENT}{INDENT}cycle_count++;").ok();
+            writeln!(
+                e.out,
+                "{INDENT}{INDENT}for (auto& _svc : _post_eval_services) _svc();"
+            )
+            .ok();
+            writeln!(
+                e.out,
+                "{INDENT}{INDENT}if (!_post_eval_services.empty()) dut->eval();"
+            )
+            .ok();
             // Then advance the run coroutine for the next cycle's inputs.
             writeln!(e.out, "{INDENT}{INDENT}sched.tick();").ok();
             if mt {
@@ -1927,7 +1963,6 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             }
             // Falling edge + comb resettle with the new inputs.
             writeln!(e.out, "{INDENT}{INDENT}dut->clk = 0; dut->eval();").ok();
-            writeln!(e.out, "{INDENT}{INDENT}cycle_count++;").ok();
             writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
             writeln!(e.out, "{INDENT}}}").ok();
         } else {
@@ -3635,8 +3670,12 @@ impl Emitter {
     /// flow through naturally without rebuilding.
     fn emit_cycle_trigger(&mut self, h: &OnHandler, depth: usize, prefix: &str) {
         let tag = format!("{prefix}{}_{}", h.event.span.start, h.event.span.end);
+        let target_vec = match h.phase {
+            OnPhase::Checker => "_checkers",
+            OnPhase::PostEval => "_post_eval_services",
+        };
         self.pad(depth);
-        writeln!(self.out, "_checkers.push_back([&]() {{").ok();
+        writeln!(self.out, "{target_vec}.push_back([&]() {{").ok();
         if h.periodic {
             // Periodic: fire body when cycle_count - last_fired >= N.
             // Initial state: last_fired = 0 means first firing is at
@@ -10090,6 +10129,12 @@ impl Emitter {
                 //   `on event_name(arg) ... end on` — event subscription.
                 //   `on <bool-expr> ... end on`     — cycle trigger.
                 if let Some(side) = h.hook {
+                    if h.phase == OnPhase::PostEval {
+                        self.errors.push(
+                            "on <obj>.<method> phase post_eval is not supported; use `pre`/`post` method hooks or a cycle-trigger `on <expr> phase post_eval`".into()
+                        );
+                        return;
+                    }
                     if let Some((comp_ty, method_name, params)) =
                         self.resolve_component_hookable(&h.event)
                     {
@@ -10128,6 +10173,12 @@ impl Emitter {
                     }
                 }
                 if let ExprKind::Call { callee, args } = &*h.event.kind {
+                    if h.phase == OnPhase::PostEval {
+                        self.errors.push(
+                            "on <event>(arg) phase post_eval is not supported; post_eval is only for cycle-trigger handlers".into()
+                        );
+                        return;
+                    }
                     // Event-subscription path.
                     let raw = match &*callee.kind {
                         ExprKind::Ident(id) => id.name.clone(),
