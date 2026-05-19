@@ -161,6 +161,7 @@ then removes known structural holes from Verilator's denominator before scoring.
 | `asyc_reset_0004` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `bcd_adder_0007` | 100.00% | n/a | line | ≥95% | **PASS** |
 | `binary_to_BCD_0030` | 100.00% | 100.00% | control | ≥90% | **PASS** |
+| `cdc_pulse_synchronizer_0017` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `cellular_automata_0002` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `csr_using_apb_0005` | 100.00% | 100.00% | control | ≥90% | **PASS** |
 | `decode_firstbit_0017` | 100.00% | 93.33% | control | ≥90% | **PASS** |
@@ -172,10 +173,12 @@ then removes known structural holes from Verilator's denominator before scoring.
 | `hamming_code_tx_and_rx_0029` | 100.00% | n/a | line | ≥91% | **PASS** |
 | `hamming_code_tx_and_rx_0031` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `hamming_code_tx_and_rx_0037` | 96.67% | 100.00% | control | ≥97% | **PASS** |
+| `IIR_filter_0016` | 100.00% | 100.00% | control | ≥95% | **PASS** |
 | `image_stego_0014` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `manchester_enc_0009` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `morse_code_0027` | 100.00% | n/a | line | ≥95% | **PASS** |
 | `nbit_swizzling_0009` | 100.00% | n/a | line | ≥100% | **PASS** |
+| `ping_pong_buffer_0004` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `ring_token_0004` | 94.87% | 100.00% | control | ≥100% | **PASS** |
 | `secure_read_write_bus_0005` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `secure_variable_timer_0006` | 100.00% | 100.00% | control | ≥98% | **PASS** |
@@ -185,10 +188,11 @@ then removes known structural holes from Verilator's denominator before scoring.
 | `skid_register_0004` | 100.00% | 100.00% | control | ≥98% | **PASS** |
 | `sram_fd_0024` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `static_branch_predict_0035` | 100.00% | n/a | line | ≥95% | **PASS** |
+| `word_change_detector_0012` | 100.00% | 100.00% | control | ≥90% | **PASS** |
 
 ### Net scoreboard
 
-**36/36 PASS, 0/36 FAIL** under the semantic control metric plus explicit `.vlt`
+**40/40 PASS, 0/40 FAIL** under the semantic control metric plus explicit `.vlt`
 structural waivers. The false failures caused by toggle-as-BRDA accounting are
 removed from the scoreboard:
 
@@ -230,6 +234,18 @@ problem parameters or by source type width:
   staging to hit the control running-disparity branch.
 - `secure_variable_timer_0006` uses `wait until ... timeout`, unique randomized
   4-bit delays, long counting waits, and start-pattern/ack coverage.
+- `word_change_detector_0012` uses solver-randomized data/mask/pattern triples
+  plus directed latch/enable/masked-change cases to hit both per-bit change
+  detection and pattern-match pulse paths.
+- `ping_pong_buffer_0004` uses long fill/drain sequences to wrap both pointers
+  twice, which is necessary to cover `buffer_select <= !buffer_select` with
+  both input polarities.
+- `cdc_pulse_synchronizer_0017` manually toggles the source and destination
+  clock inputs under the HARC primary clock, giving a small cosim-like stress
+  case for non-primary clock stimulus.
+- `IIR_filter_0016` uses signed unique samples plus directed impulse, step,
+  endpoint, and alternating-signed sequences to exercise reset and normal
+  signed arithmetic history updates.
 - `restoring_division_0006` is currently not an authored scoreboard case because
   the DUT does not converge in Verilator at cycle 0, before testbench stimulus.
 
@@ -254,7 +270,7 @@ this control score.
 
 ## Phase 2b-scale (next, NOT in this PR)
 
-Author HARC TBs for the remaining 64 cid012 problems. Realistic
+Author HARC TBs for the remaining unscored cid012 problems. Realistic
 budget: many sessions. Strategy:
 
   1. **Group by topology**: process combinational batches together
