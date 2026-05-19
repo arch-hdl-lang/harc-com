@@ -5108,12 +5108,12 @@ impl Emitter {
         for ((arg_name, _), arg) in method.args.iter().zip(args.iter()) {
             let sig_port = self.bus_signal_name(&sig_prefix, &method.name.name, &arg_name.name);
             self.pad(depth);
-            write!(self.out, "{root}->{sig_port} = ").ok();
+            write!(self.out, "harc_rt::harc_assign({root}->{sig_port}, ").ok();
             match arg {
                 CallArg::Expr(e) => self.emit_expr(e),
                 CallArg::Named { value, .. } => self.emit_expr(value),
             }
-            writeln!(self.out, ";").ok();
+            writeln!(self.out, ");").ok();
         }
         self.pad(depth);
         writeln!(self.out, "{root}->{req_valid} = 1;").ok();
@@ -5142,7 +5142,7 @@ impl Emitter {
             if let Some(ret) = &method.ret {
                 self.pad(depth);
                 let cty = self.record_field_c_type(ret);
-                writeln!(self.out, "{cty} {name} = {root}->{rsp_data};").ok();
+                writeln!(self.out, "{cty} {name} = harc_rt::harc_read({root}->{rsp_data});").ok();
             }
         }
         self.pad(depth);
@@ -5257,12 +5257,12 @@ impl Emitter {
         for ((arg_name, _), arg) in method.args.iter().zip(args.iter()) {
             let sig_port = self.bus_signal_name(&sig_prefix, &method.name.name, &arg_name.name);
             self.pad(depth);
-            write!(self.out, "{root}->{sig_port} = ").ok();
+            write!(self.out, "harc_rt::harc_assign({root}->{sig_port}, ").ok();
             match arg {
                 CallArg::Expr(e) => self.emit_expr(e),
                 CallArg::Named { value, .. } => self.emit_expr(value),
             }
-            writeln!(self.out, ";").ok();
+            writeln!(self.out, ");").ok();
         }
         if let Some(tag) = tag {
             self.pad(depth);
@@ -5325,7 +5325,7 @@ impl Emitter {
             }
             if let Some(var) = &p.ret_var {
                 self.pad(depth);
-                writeln!(self.out, "{var} = {}->{};", p.root, rsp_data).ok();
+                writeln!(self.out, "{var} = harc_rt::harc_read({}->{});", p.root, rsp_data).ok();
             }
             self.pad(depth);
             if self.in_coroutine {
@@ -5377,7 +5377,7 @@ impl Emitter {
             .ok();
             if let Some(var) = &p.ret_var {
                 self.pad(depth + 3);
-                writeln!(self.out, "{var} = {}->{};", p.root, rsp_data).ok();
+                writeln!(self.out, "{var} = harc_rt::harc_read({}->{});", p.root, rsp_data).ok();
             }
             self.pad(depth + 3);
             writeln!(self.out, "{}->{} = 1;", p.root, rsp_ready).ok();
@@ -9977,15 +9977,12 @@ impl Emitter {
         write!(self.out, ", ").ok();
         match cap.wide_hex {
             Some((width, upper)) => {
-                // Wide-hex: route through HarcHexBuf128 so the full
-                // 128-bit value prints (printf with `%s`). The
-                // constructor takes `_harc_u128`; pointer-rooted
-                // Field accesses already wrap with `harc_read` in
-                // emit_expr (returning `_harc_u128`), and bare local
-                // ints widen via implicit conversion. No extra
-                // wrap needed here.
                 let upper_str = if upper { "true" } else { "false" };
-                write!(self.out, "(const char*)harc_rt::HarcHexBuf128(").ok();
+                if width > 32 {
+                    write!(self.out, "(const char*)harc_rt::HarcHexBufWide(").ok();
+                } else {
+                    write!(self.out, "(const char*)harc_rt::HarcHexBuf128(").ok();
+                }
                 match crate::parser::parse_expr_fragment(&cap.expr) {
                     Ok(e) => self.emit_expr(&e),
                     Err(_) => {
@@ -11910,7 +11907,7 @@ impl Emitter {
         }
         match &*e.kind {
             ExprKind::Int(s) => {
-                write!(self.out, "{}", c_int_literal(s)).ok();
+                write!(self.out, "{}", c_value_literal(s)).ok();
             }
             ExprKind::Float(s) => {
                 write!(self.out, "{s}").ok();
@@ -12639,10 +12636,10 @@ fn txn_field_c_type(t: &TypeExpr) -> String {
     match t {
         TypeExpr::Builtin { name, args, .. } => match name {
             BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {
-                cpp_uint_for_width(int_width_from_args(args)).into()
+                cpp_uint_for_width(int_width_from_args(args))
             }
             BuiltinTy::SInt | BuiltinTy::SIntCap => {
-                cpp_sint_for_width(int_width_from_args(args)).into()
+                cpp_sint_for_width(int_width_from_args(args))
             }
             BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => "bool".into(),
             _ => "uint64_t".into(),
@@ -12883,20 +12880,22 @@ fn eval_const_width(e: &Expr) -> Option<u32> {
 ///   >128     → _harc_u128     (truncates to low 128; whole-signal access
 ///                              beyond 128b is rare; per-word indexing
 ///                              via `dut.field[i]` covers the gap)
-fn cpp_uint_for_width(w: Option<u32>) -> &'static str {
+fn cpp_uint_for_width(w: Option<u32>) -> String {
     match w {
-        Some(n) if n > 64 => "_harc_u128",
-        _ => "uint64_t",
+        Some(n) if n > 128 => format!("harc_rt::HarcWide<{}>", n.div_ceil(32)),
+        Some(n) if n > 64 => "_harc_u128".into(),
+        _ => "uint64_t".into(),
     }
 }
 
-fn cpp_sint_for_width(w: Option<u32>) -> &'static str {
+fn cpp_sint_for_width(w: Option<u32>) -> String {
     match w {
         // No native __int128 signed in C++ portably — but unsigned
         // ops bit-wise emulate signed for the common ops we care
         // about. Cast at use sites if signedness matters above 64b.
-        Some(n) if n > 64 => "_harc_u128",
-        _ => "int64_t",
+        Some(n) if n > 128 => format!("harc_rt::HarcWide<{}>", n.div_ceil(32)),
+        Some(n) if n > 64 => "_harc_u128".into(),
+        _ => "int64_t".into(),
     }
 }
 
@@ -12907,10 +12906,10 @@ fn c_type_for(t: &TypeExpr) -> String {
     match t {
         TypeExpr::Builtin { name, args, .. } => match name {
             BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {
-                cpp_uint_for_width(int_width_from_args(args)).into()
+                cpp_uint_for_width(int_width_from_args(args))
             }
             BuiltinTy::SInt | BuiltinTy::SIntCap => {
-                cpp_sint_for_width(int_width_from_args(args)).into()
+                cpp_sint_for_width(int_width_from_args(args))
             }
             BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => "bool".into(),
             BuiltinTy::String => "const char*".into(),
@@ -14226,6 +14225,21 @@ fn c_int_literal(s: &str) -> String {
         return format!("(((_harc_u128)0x{hi}ULL << 64) | (_harc_u128)0x{lo}ULL)");
     }
     normalized
+}
+
+fn c_value_literal(s: &str) -> String {
+    if let Some(words) = c_wide_lit_words(s) {
+        let mut out = format!("harc_rt::HarcWide<{}>({{", words.len());
+        for (i, w) in words.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(w);
+        }
+        out.push_str("})");
+        return out;
+    }
+    c_int_literal(s)
 }
 
 /// If the integer literal `s` is hex with > 32 hex digits (i.e. >

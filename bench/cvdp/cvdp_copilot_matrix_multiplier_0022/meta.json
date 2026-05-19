@@ -4,10 +4,10 @@
     "cid012",
     "easy"
   ],
-  "top_module": "matrix_multiplier",
+  "top_module": "matrix_multiplier_tlm_top",
   "dut_module": "matrix_multiplier",
   "target_coverage": 100,
-  "auto_wrapper": null,
+  "auto_wrapper": "matrix_multiplier_tlm_top.sv",
   "n_ports": 7,
   "clock_inputs": [
     "clk"

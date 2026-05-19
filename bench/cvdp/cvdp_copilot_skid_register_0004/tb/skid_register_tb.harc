@@ -12,6 +12,10 @@ transaction SkidStim
     dn_ready : bool
 end transaction SkidStim
 
+bus SkidPipe
+    tlm_method transfer(data: uint<32>) -> uint<32>: blocking;
+end bus SkidPipe
+
 covergroup SkidCov @(posedge dut.clk)
     cp_up_val : cover dut.up_val
         bins
@@ -87,6 +91,15 @@ function drive_skid(dut: skid_register, data: uint<32>, up_valid: bool, dn_ready
 end function drive_skid
 
 impl SkidRegisterTest for SkidRegisterTb
+    let pipe : SkidPipe = bind dut with {
+        transfer.req_valid: "up_val",
+        transfer.req_ready: "up_rdy",
+        transfer.data: "up_bus",
+        transfer.rsp_valid: "dn_val",
+        transfer.rsp_ready: "dn_rdy",
+        transfer.rsp_data: "dn_bus"
+    }
+
     run
         log(info, "skid_register: backpressure, flush, restart, and unique random traffic")
 
@@ -118,6 +131,21 @@ impl SkidRegisterTest for SkidRegisterTb
         dut.up_val = 0
         dut.dn_rdy = 1
         wait 8 cycles
+
+        // RHS-fork TLM pipelining: issue two upstream transfers before
+        // joining either downstream response. This mirrors ARCH's direct-call
+        // fork style for overlapped blocking TLM transactions.
+        dut.dn_rdy = 0
+        let pipe0 = fork pipe.transfer(0x13579BDF)
+        let pipe1 = fork pipe.transfer(0x2468ACE0)
+        join_all
+        assert pipe0 == 0x13579BDF
+            else fail("forked transfer 0 got 0x${pipe0:08x}, expected 0x13579BDF")
+        assert pipe1 == 0x2468ACE0
+            else fail("forked transfer 1 got 0x${pipe1:08x}, expected 0x2468ACE0")
+        dut.up_val = 0
+        dut.dn_rdy = 1
+        wait 2 cycles
 
         // Stall/restart pulses and invalid bubbles.
         for i in 0 .. 16
