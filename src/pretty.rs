@@ -613,6 +613,9 @@ fn print_on_handler(out: &mut String, h: &OnHandler, depth: usize) {
         };
         write!(out, "{s}").ok();
     }
+    if h.phase == OnPhase::PostEval {
+        write!(out, " phase post_eval").ok();
+    }
     writeln!(out).ok();
     print_block_inner(out, &h.body, depth + 1);
     pad(out, depth);
