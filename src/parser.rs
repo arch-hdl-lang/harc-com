@@ -1094,6 +1094,22 @@ impl Parser {
             }
             _ => None,
         };
+        let phase = if self.check(TokenKind::Phase) {
+            let phase_span = self.advance().map(|t| t.span).unwrap_or(start);
+            let name = self.expect_ident()?;
+            match name.name.as_str() {
+                "post_eval" => OnPhase::PostEval,
+                "checker" => OnPhase::Checker,
+                other => {
+                    let message = format!(
+                        "unknown on-handler phase `{other}`; expected `post_eval` or `checker`"
+                    );
+                    return Err(CompileError::general(&message, phase_span.merge(name.span)));
+                }
+            }
+        } else {
+            OnPhase::Checker
+        };
         // Optional edge-mode keyword for cycle-trigger form: `rising` /
         // `falling` / `level`. Ident-tokens, not reserved keywords (so a
         // user can still name a variable `level` outside trigger context).
@@ -1122,6 +1138,7 @@ impl Parser {
             event,
             hook,
             edge,
+            phase,
             body,
             span: start.merge(end),
             periodic,

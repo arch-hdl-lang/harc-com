@@ -1656,6 +1656,86 @@ end test T"#,
     );
 }
 
+#[test]
+fn on_phase_post_eval_lowers_to_post_eval_service() {
+    let parsed = parse_source(
+        r#"test T
+    let dut : DummyDut
+    run
+        on 1 cycles phase post_eval
+            log(info, "service")
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("std::vector<std::function<void()>> _post_eval_services;"),
+        "expected generated post-eval service vector; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("_post_eval_services.push_back([&]() {"),
+        "expected post-eval handler to register as a service; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("_checkers.push_back([&]() {\n        static int64_t _t_"),
+        "post-eval periodic handler should not register as a checker; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn main_loop_runs_post_eval_services_before_coroutine_tick() {
+    let parsed = parse_source(
+        r#"test T
+    let dut : DummyDut
+    run
+        on dut.ready phase post_eval level
+            log(info, "ready")
+        end on
+        dut.x = 1
+        wait 1 cycle
+        dut.x = 2
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    let loop_pos = cpp
+        .find("while (_run_slot.kind != harc_rt::WaitKind::Done")
+        .expect("expected main run loop");
+    let loop_body_end = cpp[loop_pos..]
+        .find("\n    }\n")
+        .map(|p| loop_pos + p)
+        .expect("expected loop close");
+    let body = &cpp[loop_pos..loop_body_end];
+    let posedge_pos = body
+        .find("dut->clk = 1; dut->eval();")
+        .expect("expected posedge eval inside loop");
+    let service_pos = body
+        .find("for (auto& _svc : _post_eval_services) _svc();")
+        .expect("expected post-eval services inside loop");
+    let tick_pos = body
+        .find("sched.tick();")
+        .expect("expected scheduler tick inside loop");
+    let low_settle_pos = body
+        .find("dut->clk = 0; dut->eval();")
+        .expect("expected clk-low settle inside loop");
+    assert!(
+        posedge_pos < service_pos && service_pos < tick_pos && tick_pos < low_settle_pos,
+        "expected loop order: posedge eval -> post-eval service -> tick -> clk-low settle. \
+         got posedge@{posedge_pos}, service@{service_pos}, tick@{tick_pos}, low@{low_settle_pos}\n\
+         body:\n{}",
+        body
+    );
+    assert!(
+        body.contains("if (!_post_eval_services.empty()) dut->eval();"),
+        "expected immediate re-eval after post-eval services; got:\n{body}"
+    );
+}
+
 /// `watchdog` agent body item (spec §8.6) lowers to:
 /// 1. Hook vectors `<Type>_watchdog_pre` / `<Type>_watchdog_post`
 /// 2. A `<Type>_watchdog` method lambda whose body asserts the agent

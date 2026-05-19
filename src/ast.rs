@@ -1502,6 +1502,10 @@ pub struct OnHandler {
     /// Ignored for event-subscription `on event_name(arg)` form and
     /// for the periodic form (`on N cycles`).
     pub edge: EdgeMode,
+    /// Scheduling phase for cycle-trigger handlers. `Checker` preserves the
+    /// legacy `_checkers` timing; `PostEval` runs after DUT edge evaluation
+    /// and before blocked test coroutines resume.
+    pub phase: OnPhase,
     pub body: Block,
     pub span: Span,
     /// `on <N> cycles ... end on` — when `true`, `event` is the period
@@ -1519,6 +1523,12 @@ pub struct OnHandler {
 pub enum HookSide {
     Pre,
     Post,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnPhase {
+    Checker,
+    PostEval,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
