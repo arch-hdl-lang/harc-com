@@ -104,8 +104,8 @@ end test WideLocalTest"#,
         "uint<75> local should lower to _harc_u128, not int64_t; got:\n{cpp}",
     );
     assert!(
-        cpp.contains("_harc_u128 keys = (((_harc_u128)0x0000000E000A0006ULL << 64) | (_harc_u128)0x0002000C00040008ULL);"),
-        "wide integer local should not use int64_t truncating storage; got:\n{cpp}",
+        cpp.contains("harc_rt::HarcWide<8> keys = harc_rt::HarcWide<8>({0x00040008u, 0x0002000Cu, 0x000A0006u, 0x0000000Eu"),
+        "uint<240> local should lower to word-preserving HarcWide storage; got:\n{cpp}",
     );
     assert!(
         !cpp.contains("int64_t child_ptrs") && !cpp.contains("int64_t keys"),
@@ -4355,5 +4355,49 @@ end impl T"#,
     assert!(
         cpp.contains("0xFFFFFFFFULL"),
         "expected 32-bit mask from .trunc<32>(); got:\n{cpp}",
+    );
+}
+
+#[test]
+fn wide_vectors_up_to_1024_bits_lower_to_word_values() {
+    let parsed = parse_source(
+        r#"bus WideBus
+    tlm_method send(data: uint<1024>) -> uint<1024>: blocking;
+end bus WideBus
+
+testbench Tb
+    dut : WideTop
+end testbench Tb
+
+impl T for Tb
+    let wide : WideBus = bind dut with {
+        send.req_valid: "send_req_valid",
+        send.req_ready: "send_req_ready",
+        send.data: "send_data",
+        send.rsp_valid: "send_rsp_valid",
+        send.rsp_ready: "send_rsp_ready",
+        send.rsp_data: "send_rsp_data"
+    }
+
+    run
+        dut.payload = 0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        let got = wide.send(dut.payload)
+        assert got == dut.payload else fail("wide mismatch got=${got:0256x}")
+    end run
+end impl T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("harc_rt::HarcWide<32>"),
+        "expected uint<1024> to lower to HarcWide<32>; got:\n{cpp}",
+    );
+    assert!(
+        cpp.contains("harc_rt::harc_assign(dut->send_data, harc_rt::harc_read(dut->payload));"),
+        "expected TLM wide arg to route through harc_assign/harc_read; got:\n{cpp}",
+    );
+    assert!(
+        cpp.contains("harc_rt::HarcHexBufWide("),
+        "expected 1024-bit hex interpolation to use HarcHexBufWide; got:\n{cpp}",
     );
 }
