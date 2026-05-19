@@ -192,8 +192,10 @@ then removes known structural holes from Verilator's denominator before scoring.
 | `simple_spi_0003` | 98.06% | 100.00% | control | ≥94% | **PASS** |
 | `single_cycle_arbiter_0004` | 100.00% | n/a | line | ≥96% | **PASS** |
 | `skid_register_0004` | 100.00% | 100.00% | control | ≥98% | **PASS** |
+| `sobel_filter_0015` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `sram_fd_0024` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `static_branch_predict_0035` | 100.00% | n/a | line | ≥95% | **PASS** |
+| `sync_serial_communication_0009` | 96.55% | 100.00% | control | ≥100% | **PASS** |
 | `traffic_light_controller_0007` | 100.00% | 100.00% | control | ≥97% | **PASS** |
 | `word_change_detector_0012` | 100.00% | 100.00% | control | ≥90% | **PASS** |
 | `word_reducer_0012` | 100.00% | 100.00% | control | ≥100% | **PASS** |
@@ -202,7 +204,7 @@ then removes known structural holes from Verilator's denominator before scoring.
 
 ### Net scoreboard
 
-**50/50 PASS, 0/50 FAIL** under the semantic control metric plus explicit `.vlt`
+**52/52 PASS, 0/52 FAIL** under the semantic control metric plus explicit `.vlt`
 structural waivers. The false failures caused by toggle-as-BRDA accounting are
 removed from the scoreboard:
 
@@ -305,6 +307,17 @@ problem parameters or by source type width:
   back-to-back valid transactions and valid gaps. This extends the wide-value
   validation from local temporaries to full signal equality on generated
   Verilator wide vectors.
+- `sobel_filter_0015` uses directed 3x3 pixel windows to hit no-edge and
+  edge outputs, positive and negative Sobel gradient signs, valid gaps, and
+  mid-stream reset. The TB samples `valid_out` immediately after the ninth
+  valid pixel because the DUT reports a complete window when `pixel_count`
+  reaches 9 combinationally.
+- `sync_serial_communication_0009` uses selectable 0/8/16/32/64-bit transfer
+  modes, default/no-transfer modes, asynchronous resets, mid-transfer reset,
+  and solver-randomized unique 64-bit payloads. The DUT's delayed gated serial
+  clock is run through HARC's default Verilator `--no-timing` path, so the TB
+  checks reset/control behavior and records observed receive data rather than
+  using event-delay-dependent serial reconstruction as a pass/fail oracle.
 - `restoring_division_0006` is currently not an authored scoreboard case because
   the DUT does not converge in Verilator at cycle 0, before testbench stimulus.
 
