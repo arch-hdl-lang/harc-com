@@ -250,6 +250,9 @@ test T
         on 1000 cycles
             log(info, "heartbeat at ${cycle_count}")
         end on
+        on 1 cycles phase post_eval
+            log(info, "post-eval service")
+        end on
         wait 5 cycles
     end run
 end test T
@@ -259,6 +262,10 @@ end test T
     assert!(
         printed.contains("on 1000 cycles"),
         "`on 1000 cycles` should round-trip; got:\n{printed}"
+    );
+    assert!(
+        printed.contains("on 1 cycles phase post_eval"),
+        "`phase post_eval` should round-trip; got:\n{printed}"
     );
     // Watchdog default+custom forms.
     assert!(
