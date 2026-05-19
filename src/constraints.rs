@@ -9,13 +9,14 @@
 use std::collections::BTreeMap;
 
 use crate::ast::{
-    AttrArg, BinaryOp, BuiltinTy, CallArg, DistEntry, Expr, ExprKind, Item, Param, RelationBody,
-    SourceFile, TxnBodyItem, TypeArg, TypeExpr, UnaryOp,
+    AttrArg, BinaryOp, BuiltinTy, CallArg, DistEntry, Expr, ExprKind, Field, Item, Param,
+    RelationBody, SourceFile, TxnBodyItem, TypeArg, TypeExpr, UnaryOp,
 };
 use crate::lexer::Span;
 
 #[derive(Debug, Clone)]
 pub struct ConstraintElaboration {
+    pub structs: Vec<TxnSchema>,
     pub transactions: Vec<TxnSchema>,
     pub relations: Vec<RelationSchema>,
     pub errors: Vec<ElaborationError>,
@@ -24,6 +25,10 @@ pub struct ConstraintElaboration {
 impl ConstraintElaboration {
     pub fn transaction(&self, name: &str) -> Option<&TxnSchema> {
         self.transactions.iter().find(|t| t.name == name)
+    }
+
+    pub fn struct_schema(&self, name: &str) -> Option<&TxnSchema> {
+        self.structs.iter().find(|s| s.name == name)
     }
 
     pub fn relation(&self, name: &str) -> Option<&RelationSchema> {
@@ -43,6 +48,7 @@ pub struct TxnSchema {
 #[derive(Debug, Clone)]
 pub struct TxnFieldSchema {
     pub name: String,
+    pub path: Vec<String>,
     pub span: Span,
     pub ty: FieldTypeSchema,
     pub non_random: bool,
@@ -261,15 +267,41 @@ pub enum ConstraintBinaryOp {
 pub fn elaborate_constraints(file: &SourceFile) -> ConstraintElaboration {
     let enum_domains = collect_enum_domains(file);
     let enum_variants = collect_enum_variants(&enum_domains);
+    let record_bodies = collect_record_bodies(file);
+    let record_fields = collect_record_fields(file);
+    let mut structs = Vec::new();
     let mut transactions = Vec::new();
     let mut relations = Vec::new();
     let mut errors = Vec::new();
 
     for item in &file.items {
         match item {
+            Item::Struct(s) => {
+                let (fields, keeps, when_subtypes) = elaborate_txn_items(
+                    &s.name.name,
+                    &s.body,
+                    &enum_domains,
+                    &record_bodies,
+                    &record_fields,
+                    &mut errors,
+                );
+                structs.push(TxnSchema {
+                    name: s.name.name.clone(),
+                    span: s.span,
+                    fields,
+                    keeps,
+                    when_subtypes,
+                });
+            }
             Item::Transaction(t) => {
-                let (fields, keeps, when_subtypes) =
-                    elaborate_txn_items(&t.name.name, &t.body, &enum_domains, &mut errors);
+                let (fields, keeps, when_subtypes) = elaborate_txn_items(
+                    &t.name.name,
+                    &t.body,
+                    &enum_domains,
+                    &record_bodies,
+                    &record_fields,
+                    &mut errors,
+                );
                 transactions.push(TxnSchema {
                     name: t.name.name.clone(),
                     span: t.span,
@@ -321,6 +353,7 @@ pub fn elaborate_constraints(file: &SourceFile) -> ConstraintElaboration {
     }
 
     validate_constraint_refs(
+        &mut structs,
         &mut transactions,
         &mut relations,
         &enum_variants,
@@ -328,10 +361,34 @@ pub fn elaborate_constraints(file: &SourceFile) -> ConstraintElaboration {
     );
 
     ConstraintElaboration {
+        structs,
         transactions,
         relations,
         errors,
     }
+}
+
+fn collect_record_bodies(file: &SourceFile) -> BTreeMap<String, Vec<TxnBodyItem>> {
+    let mut records = BTreeMap::new();
+    for item in &file.items {
+        match item {
+            Item::Struct(s) => {
+                records.insert(s.name.name.clone(), s.body.clone());
+            }
+            Item::Transaction(t) => {
+                records.insert(t.name.name.clone(), t.body.clone());
+            }
+            _ => {}
+        }
+    }
+    records
+}
+
+fn collect_record_fields(file: &SourceFile) -> BTreeMap<String, Vec<Field>> {
+    collect_record_bodies(file)
+        .into_iter()
+        .map(|(name, body)| (name, direct_fields(&body)))
+        .collect()
 }
 
 fn collect_enum_variants(
@@ -372,6 +429,8 @@ fn elaborate_txn_items(
     txn_name: &str,
     items: &[TxnBodyItem],
     enum_domains: &BTreeMap<String, EnumDomainSchema>,
+    record_bodies: &BTreeMap<String, Vec<TxnBodyItem>>,
+    record_fields: &BTreeMap<String, Vec<Field>>,
     errors: &mut Vec<ElaborationError>,
 ) -> (
     Vec<TxnFieldSchema>,
@@ -384,32 +443,14 @@ fn elaborate_txn_items(
 
     for item in items {
         match item {
-            TxnBodyItem::Field(f) => fields.push(TxnFieldSchema {
-                name: f.name.name.clone(),
-                span: f.span,
-                ty: elaborate_field_type(&f.ty, enum_domains, errors),
-                non_random: f.non_random,
-                has_default: f.default.is_some(),
-                attrs: f
-                    .attrs
-                    .iter()
-                    .map(|a| FieldAttrSchema {
-                        name: a.name.name.clone(),
-                        span: a.span,
-                        args: a
-                            .args
-                            .iter()
-                            .map(|arg| match arg {
-                                AttrArg::Expr(e) => FieldAttrArgSchema::Expr(e.clone()),
-                                AttrArg::WithinScope(scope) => {
-                                    FieldAttrArgSchema::WithinScope(scope.name.clone())
-                                }
-                                AttrArg::Dist(entries) => FieldAttrArgSchema::Dist(entries.clone()),
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-            }),
+            TxnBodyItem::Field(f) => flatten_field_schema(
+                f,
+                Vec::new(),
+                enum_domains,
+                record_fields,
+                errors,
+                &mut fields,
+            ),
             TxnBodyItem::Keep(k) => keeps.push(ConstraintClause {
                 origin: ConstraintOrigin::TransactionKeep {
                     transaction: txn_name.to_string(),
@@ -420,8 +461,14 @@ fn elaborate_txn_items(
                 refs: ConstraintRefs::default(),
             }),
             TxnBodyItem::When(w) => {
-                let (fields, keeps, nested) =
-                    elaborate_txn_items(txn_name, &w.items, enum_domains, errors);
+                let (fields, keeps, nested) = elaborate_txn_items(
+                    txn_name,
+                    &w.items,
+                    enum_domains,
+                    record_bodies,
+                    record_fields,
+                    errors,
+                );
                 when_subtypes.push(WhenSubtypeSchema {
                     discriminant: w.discriminant.clone(),
                     span: w.span,
@@ -433,7 +480,280 @@ fn elaborate_txn_items(
         }
     }
 
+    keeps.extend(collect_nested_record_keeps(
+        txn_name,
+        items,
+        enum_domains,
+        record_bodies,
+        record_fields,
+        errors,
+    ));
+
     (fields, keeps, when_subtypes)
+}
+
+fn direct_fields(items: &[TxnBodyItem]) -> Vec<Field> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            TxnBodyItem::Field(f) => Some(f.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn flatten_field_schema(
+    field: &Field,
+    mut prefix: Vec<String>,
+    enum_domains: &BTreeMap<String, EnumDomainSchema>,
+    record_fields: &BTreeMap<String, Vec<Field>>,
+    errors: &mut Vec<ElaborationError>,
+    out: &mut Vec<TxnFieldSchema>,
+) {
+    prefix.push(field.name.name.clone());
+    if let Some(record_name) = record_type_name(&field.ty) {
+        if !enum_domains.contains_key(record_name) {
+            if let Some(fields) = record_fields.get(record_name) {
+                for child in fields {
+                    flatten_field_schema(
+                        child,
+                        prefix.clone(),
+                        enum_domains,
+                        record_fields,
+                        errors,
+                        out,
+                    );
+                }
+                return;
+            }
+        }
+    }
+    out.push(elaborate_field_schema(field, prefix, enum_domains, errors));
+}
+
+fn elaborate_field_schema(
+    field: &Field,
+    path: Vec<String>,
+    enum_domains: &BTreeMap<String, EnumDomainSchema>,
+    errors: &mut Vec<ElaborationError>,
+) -> TxnFieldSchema {
+    TxnFieldSchema {
+        name: path.join("."),
+        path,
+        span: field.span,
+        ty: elaborate_field_type(&field.ty, enum_domains, errors),
+        non_random: field.non_random,
+        has_default: field.default.is_some(),
+        attrs: field
+            .attrs
+            .iter()
+            .map(|a| FieldAttrSchema {
+                name: a.name.name.clone(),
+                span: a.span,
+                args: a
+                    .args
+                    .iter()
+                    .map(|arg| match arg {
+                        AttrArg::Expr(e) => FieldAttrArgSchema::Expr(e.clone()),
+                        AttrArg::WithinScope(scope) => {
+                            FieldAttrArgSchema::WithinScope(scope.name.clone())
+                        }
+                        AttrArg::Dist(entries) => FieldAttrArgSchema::Dist(entries.clone()),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+fn collect_nested_record_keeps(
+    txn_name: &str,
+    items: &[TxnBodyItem],
+    enum_domains: &BTreeMap<String, EnumDomainSchema>,
+    record_bodies: &BTreeMap<String, Vec<TxnBodyItem>>,
+    record_fields: &BTreeMap<String, Vec<Field>>,
+    errors: &mut Vec<ElaborationError>,
+) -> Vec<ConstraintClause> {
+    let mut keeps = Vec::new();
+    for field in direct_fields(items) {
+        let Some(record_name) = record_type_name(&field.ty) else {
+            continue;
+        };
+        if enum_domains.contains_key(record_name) {
+            continue;
+        }
+        let Some(child_body) = record_bodies.get(record_name) else {
+            continue;
+        };
+        let child_keeps = collect_direct_and_nested_record_keeps(
+            record_name,
+            child_body,
+            enum_domains,
+            record_bodies,
+            record_fields,
+            errors,
+        );
+        if child_keeps.is_empty() {
+            continue;
+        }
+        let child_field_names: std::collections::BTreeSet<String> = record_fields
+            .get(record_name)
+            .into_iter()
+            .flat_map(|fields| fields.iter().map(|field| field.name.name.clone()))
+            .collect();
+        let prefix = Expr::new(ExprKind::Ident(field.name.clone()), field.name.span);
+        for keep in child_keeps {
+            let expr = prefix_record_keep_expr(&keep.expr, &prefix, &child_field_names);
+            keeps.push(ConstraintClause {
+                origin: ConstraintOrigin::TransactionKeep {
+                    transaction: txn_name.to_string(),
+                    span: expr.span,
+                },
+                ir: lower_constraint_expr(&expr, errors),
+                refs: ConstraintRefs::default(),
+                expr,
+            });
+        }
+    }
+    keeps
+}
+
+fn collect_direct_and_nested_record_keeps(
+    record_name: &str,
+    items: &[TxnBodyItem],
+    enum_domains: &BTreeMap<String, EnumDomainSchema>,
+    record_bodies: &BTreeMap<String, Vec<TxnBodyItem>>,
+    record_fields: &BTreeMap<String, Vec<Field>>,
+    errors: &mut Vec<ElaborationError>,
+) -> Vec<ConstraintClause> {
+    let mut keeps = Vec::new();
+    for item in items {
+        if let TxnBodyItem::Keep(k) = item {
+            keeps.push(ConstraintClause {
+                origin: ConstraintOrigin::TransactionKeep {
+                    transaction: record_name.to_string(),
+                    span: k.span,
+                },
+                expr: k.expr.clone(),
+                ir: lower_constraint_expr(&k.expr, errors),
+                refs: ConstraintRefs::default(),
+            });
+        }
+    }
+    keeps.extend(collect_nested_record_keeps(
+        record_name,
+        items,
+        enum_domains,
+        record_bodies,
+        record_fields,
+        errors,
+    ));
+    keeps
+}
+
+fn record_type_name(ty: &TypeExpr) -> Option<&str> {
+    let TypeExpr::Named { name, .. } = ty else {
+        return None;
+    };
+    name.segments.last().map(|segment| segment.name.as_str())
+}
+
+fn prefix_record_keep_expr(
+    expr: &Expr,
+    prefix: &Expr,
+    field_names: &std::collections::BTreeSet<String>,
+) -> Expr {
+    let kind = match &*expr.kind {
+        ExprKind::Ident(id) if field_names.contains(&id.name) => ExprKind::Field {
+            target: prefix.clone(),
+            name: id.clone(),
+        },
+        ExprKind::Field { target, name } => ExprKind::Field {
+            target: prefix_record_keep_expr(target, prefix, field_names),
+            name: name.clone(),
+        },
+        ExprKind::Index { target, index } => ExprKind::Index {
+            target: prefix_record_keep_expr(target, prefix, field_names),
+            index: prefix_record_keep_expr(index, prefix, field_names),
+        },
+        ExprKind::BitSlice { target, hi, lo } => ExprKind::BitSlice {
+            target: prefix_record_keep_expr(target, prefix, field_names),
+            hi: prefix_record_keep_expr(hi, prefix, field_names),
+            lo: prefix_record_keep_expr(lo, prefix, field_names),
+        },
+        ExprKind::Call { callee, args } => ExprKind::Call {
+            callee: prefix_record_keep_expr(callee, prefix, field_names),
+            args: args
+                .iter()
+                .map(|arg| match arg {
+                    CallArg::Expr(e) => {
+                        CallArg::Expr(prefix_record_keep_expr(e, prefix, field_names))
+                    }
+                    CallArg::Named { name, value } => CallArg::Named {
+                        name: name.clone(),
+                        value: prefix_record_keep_expr(value, prefix, field_names),
+                    },
+                })
+                .collect(),
+        },
+        ExprKind::ForEachConstraint { var, iter, body } => {
+            let mut inner_fields = field_names.clone();
+            inner_fields.remove(&var.name);
+            ExprKind::ForEachConstraint {
+                var: var.clone(),
+                iter: prefix_record_keep_expr(iter, prefix, field_names),
+                body: body
+                    .iter()
+                    .map(|e| prefix_record_keep_expr(e, prefix, &inner_fields))
+                    .collect(),
+            }
+        }
+        ExprKind::Cast { expr, ty } => ExprKind::Cast {
+            expr: prefix_record_keep_expr(expr, prefix, field_names),
+            ty: ty.clone(),
+        },
+        ExprKind::Unary { op, expr } => ExprKind::Unary {
+            op: *op,
+            expr: prefix_record_keep_expr(expr, prefix, field_names),
+        },
+        ExprKind::Binary { op, lhs, rhs } => ExprKind::Binary {
+            op: *op,
+            lhs: prefix_record_keep_expr(lhs, prefix, field_names),
+            rhs: prefix_record_keep_expr(rhs, prefix, field_names),
+        },
+        ExprKind::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => ExprKind::Ternary {
+            cond: prefix_record_keep_expr(cond, prefix, field_names),
+            then_branch: prefix_record_keep_expr(then_branch, prefix, field_names),
+            else_branch: prefix_record_keep_expr(else_branch, prefix, field_names),
+        },
+        ExprKind::Paren(inner) => {
+            ExprKind::Paren(prefix_record_keep_expr(inner, prefix, field_names))
+        }
+        ExprKind::Membership { expr, set } => ExprKind::Membership {
+            expr: prefix_record_keep_expr(expr, prefix, field_names),
+            set: prefix_record_keep_expr(set, prefix, field_names),
+        },
+        ExprKind::SetLit(items) => ExprKind::SetLit(
+            items
+                .iter()
+                .map(|e| prefix_record_keep_expr(e, prefix, field_names))
+                .collect(),
+        ),
+        ExprKind::RangeLit { lo, hi } => ExprKind::RangeLit {
+            lo: lo
+                .as_ref()
+                .map(|e| prefix_record_keep_expr(e, prefix, field_names)),
+            hi: hi
+                .as_ref()
+                .map(|e| prefix_record_keep_expr(e, prefix, field_names)),
+        },
+        _ => return expr.clone(),
+    };
+    Expr::new(kind, expr.span)
 }
 
 fn elaborate_relation_param(
@@ -535,22 +855,38 @@ fn elaborate_field_type(
 }
 
 fn validate_constraint_refs(
+    structs: &mut [TxnSchema],
     transactions: &mut [TxnSchema],
     relations: &mut [RelationSchema],
     enum_variants: &BTreeMap<String, EnumVariantSchema>,
     errors: &mut Vec<ElaborationError>,
 ) {
-    let txn_index: BTreeMap<String, TxnSchema> = transactions
+    let record_index: BTreeMap<String, TxnSchema> = structs
         .iter()
-        .map(|txn| (txn.name.clone(), txn.clone()))
+        .chain(transactions.iter())
+        .map(|record| (record.name.clone(), record.clone()))
         .collect();
     let relation_names: Vec<String> = relations.iter().map(|r| r.name.clone()).collect();
 
+    for record in structs {
+        let ctx = RefValidationCtx {
+            transaction: record_index.get(&record.name),
+            params: BTreeMap::new(),
+            records: &record_index,
+            relation_names: &relation_names,
+            enum_variants,
+        };
+        for keep in &mut record.keeps {
+            validate_clause_refs(keep, &ctx, errors);
+        }
+        validate_when_refs(&mut record.when_subtypes, &ctx, errors);
+    }
+
     for txn in transactions {
         let ctx = RefValidationCtx {
-            transaction: txn_index.get(&txn.name),
+            transaction: record_index.get(&txn.name),
             params: BTreeMap::new(),
-            transactions: &txn_index,
+            records: &record_index,
             relation_names: &relation_names,
             enum_variants,
         };
@@ -569,7 +905,7 @@ fn validate_constraint_refs(
         let ctx = RefValidationCtx {
             transaction: None,
             params,
-            transactions: &txn_index,
+            records: &record_index,
             relation_names: &relation_names,
             enum_variants,
         };
@@ -600,7 +936,7 @@ fn validate_when_refs(
 struct RefValidationCtx<'a> {
     transaction: Option<&'a TxnSchema>,
     params: BTreeMap<String, Option<FieldTypeSchema>>,
-    transactions: &'a BTreeMap<String, TxnSchema>,
+    records: &'a BTreeMap<String, TxnSchema>,
     relation_names: &'a [String],
     enum_variants: &'a BTreeMap<String, EnumVariantSchema>,
 }
@@ -676,7 +1012,7 @@ fn collect_constraint_refs_with_locals(
                     });
                     return;
                 };
-                if let Some(txn) = ctx.transactions.get(type_name) {
+                if let Some(txn) = ctx.records.get(type_name) {
                     if let Some(field_schema) = find_txn_field(txn, field) {
                         refs.fields.push(ConstraintFieldRef {
                             root: Some(root.clone()),
@@ -701,7 +1037,15 @@ fn collect_constraint_refs_with_locals(
                     });
                 }
             } else if let Some(txn) = ctx.transaction {
-                if let Some(field_schema) = find_txn_field(txn, field) {
+                let nested_field = format!("{root}.{field}");
+                if let Some(field_schema) = find_txn_field(txn, &nested_field) {
+                    refs.fields.push(ConstraintFieldRef {
+                        root: Some(root.clone()),
+                        field: nested_field,
+                        ty: field_schema.ty.clone(),
+                        non_random: field_schema.non_random,
+                    });
+                } else if let Some(field_schema) = find_txn_field(txn, field) {
                     refs.fields.push(ConstraintFieldRef {
                         root: Some(root.clone()),
                         field: field.clone(),
@@ -824,6 +1168,10 @@ fn lower_constraint_expr_inner(expr: &Expr) -> Result<ConstraintExpr, String> {
                 ConstraintExpr::Ident(root) => Ok(ConstraintExpr::FieldRef {
                     root,
                     field: name.name.clone(),
+                }),
+                ConstraintExpr::FieldRef { root, field } => Ok(ConstraintExpr::FieldRef {
+                    root,
+                    field: format!("{field}.{}", name.name),
                 }),
                 _ => Err(format!(
                     "constraint field access `{}` has unsupported target shape",
