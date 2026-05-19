@@ -193,10 +193,11 @@ then removes known structural holes from Verilator's denominator before scoring.
 | `word_change_detector_0012` | 100.00% | 100.00% | control | ≥90% | **PASS** |
 | `word_reducer_0012` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `write_through_data_direct_mapped_cache_0001` | 97.50% | 100.00% | control | ≥85% | **PASS** |
+| `wb2ahb_0004` | 97.78% | 100.00% | control | ≥95% | **PASS** |
 
 ### Net scoreboard
 
-**44/44 PASS, 0/44 FAIL** under the semantic control metric plus explicit `.vlt`
+**45/45 PASS, 0/45 FAIL** under the semantic control metric plus explicit `.vlt`
 structural waivers. The false failures caused by toggle-as-BRDA accounting are
 removed from the scoreboard:
 
@@ -266,6 +267,10 @@ problem parameters or by source type width:
   coverpoints (`dut.cpu_addr[7:0]`). The complex bench exposed a CVDP DUT
   issue: undeclared `cache_dout` becomes a 1-bit implicit Verilator wire, so
   hit-read data cannot be checked meaningfully without fixing the DUT.
+- `wb2ahb_0004` declares generated `clk` and `hclk` clocks, then uses
+  `wait ... on hclk` to cover Wishbone/AHB select decoding, read/write phases,
+  AHB wait states, data-phase stalls, and idle/busy/nonseq transfer states.
+  This validates HARC's ARCH-shaped multi-clock model on a CVDP bus bridge.
 - `restoring_division_0006` is currently not an authored scoreboard case because
   the DUT does not converge in Verilator at cycle 0, before testbench stimulus.
 
