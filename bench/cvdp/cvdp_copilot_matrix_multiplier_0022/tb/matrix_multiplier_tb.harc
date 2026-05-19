@@ -12,6 +12,10 @@ transaction MatrixStim
     step : uint<4> with [unique within test]
 end transaction MatrixStim
 
+bus MatrixPipe
+    tlm_method multiply(a: uint<128>, b: uint<128>) -> uint<64>: blocking;
+end bus MatrixPipe
+
 covergroup MatrixMulCov @(posedge dut.clk)
     cp_valid_in : cover dut.valid_in
         bins
@@ -54,11 +58,11 @@ covergroup MatrixMulCov @(posedge dut.clk)
 end covergroup MatrixMulCov
 
 testbench MatrixMultiplierTb
-    dut : matrix_multiplier
+    dut : matrix_multiplier_tlm_top
     cov : MatrixMulCov
 end testbench MatrixMultiplierTb
 
-function reset_matrix(dut: matrix_multiplier)
+function reset_matrix(dut: matrix_multiplier_tlm_top)
     dut.srst = 1
     dut.valid_in = 0
     dut.matrix_a = 0
@@ -70,7 +74,7 @@ function reset_matrix(dut: matrix_multiplier)
     wait 2 cycles on clk
 end function reset_matrix
 
-function wait_for_valid(dut: matrix_multiplier, limit: uint<8>) -> uint<1>
+function wait_for_valid(dut: matrix_multiplier_tlm_top, limit: uint<8>) -> uint<1>
     for _ in 0 .. limit
         if dut.valid_out == 1
             return 0
@@ -81,7 +85,7 @@ function wait_for_valid(dut: matrix_multiplier, limit: uint<8>) -> uint<1>
     return 1
 end function wait_for_valid
 
-function drive_matrix(dut: matrix_multiplier,
+function drive_matrix(dut: matrix_multiplier_tlm_top,
                       a: uint<128>,
                       b: uint<128>,
                       expected: uint<288>) -> uint<1>
@@ -104,7 +108,7 @@ function drive_matrix(dut: matrix_multiplier,
     return 0
 end function drive_matrix
 
-function drive_gap(dut: matrix_multiplier) -> uint<1>
+function drive_gap(dut: matrix_multiplier_tlm_top) -> uint<1>
     dut.valid_in = 0
     dut.matrix_a = 0x01010101010101010101010101010101
     dut.matrix_b = 0x01010101010101010101010101010101
@@ -116,7 +120,7 @@ function drive_gap(dut: matrix_multiplier) -> uint<1>
     return 0
 end function drive_gap
 
-function drive_back_to_back(dut: matrix_multiplier) -> uint<1>
+function drive_back_to_back(dut: matrix_multiplier_tlm_top) -> uint<1>
     let errors : uint<1> = 0
 
     dut.matrix_a = 0x01000000000100000000010000000001
@@ -153,6 +157,16 @@ function drive_back_to_back(dut: matrix_multiplier) -> uint<1>
 end function drive_back_to_back
 
 impl MatrixMultiplierTest for MatrixMultiplierTb
+    let pipe : MatrixPipe = bind dut with {
+        multiply.req_valid: "mul_req_valid",
+        multiply.req_ready: "mul_req_ready",
+        multiply.a: "mul_a",
+        multiply.b: "mul_b",
+        multiply.rsp_valid: "mul_rsp_valid",
+        multiply.rsp_ready: "mul_rsp_ready",
+        multiply.rsp_data: "mul_rsp_data"
+    }
+
     clock clk = 10ns
 
     run
@@ -184,6 +198,21 @@ impl MatrixMultiplierTest for MatrixMultiplierTb
             0x001C0004400178003400040001000038000A00050001400040000E000A00014000880010)
 
         errors = errors + drive_back_to_back(dut)
+
+        // RHS-fork TLM view of the same fixed-latency pipeline: issue two
+        // matrix products back-to-back, then join the ordered low-64b results.
+        let pipe0 = fork pipe.multiply(
+            0x01000000000100000000010000000001,
+            0x100F0E0D0C0B0A090807060504030201)
+        let pipe1 = fork pipe.multiply(
+            0x01010101010101010101010101010101,
+            0x01010101010101010101010101010101)
+        join_all
+        assert pipe0 == 0x000100003000080001
+            else fail("forked matrix product 0 low64=0x${pipe0:016x}, expected 0x000100003000080001")
+        assert pipe1 == 0x000100004000100004
+            else fail("forked matrix product 1 low64=0x${pipe1:016x}, expected 0x000100004000100004")
+        wait 2 cycles on clk
 
         for _ in 0 .. 8
             let s : MatrixStim

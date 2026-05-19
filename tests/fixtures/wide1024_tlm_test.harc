@@ -1,0 +1,31 @@
+bus Wide1024Bus
+    tlm_method send(data: uint<1024>) -> uint<1024>: blocking;
+end bus Wide1024Bus
+
+test Wide1024TlmTest
+    let dut : wide1024_tlm
+    let wide : Wide1024Bus = bind dut with {
+        send.req_valid: "send_req_valid",
+        send.req_ready: "send_req_ready",
+        send.data: "send_data",
+        send.rsp_valid: "send_rsp_valid",
+        send.rsp_ready: "send_rsp_ready",
+        send.rsp_data: "send_rsp_data"
+    }
+
+    run
+        dut.rst = 1
+        dut.payload = 0
+        dut.send_req_valid = 0
+        dut.send_rsp_ready = 0
+        wait 2 cycles
+        dut.rst = 0
+
+        dut.payload = 0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        let got = wide.send(dut.payload)
+        assert got == dut.payload
+            else fail("1024-bit echo mismatch got=${got:0256x}")
+        log(info, "1024-bit echo got=${got:0256x}")
+        log(info, "ALL TESTS PASSED - wide1024_tlm")
+    end run
+end test Wide1024TlmTest
