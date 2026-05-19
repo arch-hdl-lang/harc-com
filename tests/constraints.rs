@@ -137,6 +137,112 @@ end transaction Packet"#,
 }
 
 #[test]
+fn elaborates_struct_schemas_and_nested_record_fields() {
+    let parsed = parse_source(
+        r#"enum Kind { A, B }
+
+struct Header
+    addr : uint<16>
+    flavor : Kind
+    keep addr < 1024
+end struct Header
+
+transaction Packet
+    hdr : Header
+    len : uint<8>
+    keep hdr.addr >= 16
+end transaction Packet"#,
+    )
+    .unwrap();
+
+    let elaborated = elaborate_constraints(&parsed);
+    assert!(elaborated.errors.is_empty(), "{:?}", elaborated.errors);
+
+    let header = elaborated.struct_schema("Header").expect("Header schema");
+    assert_eq!(header.fields.len(), 2);
+    assert_eq!(header.fields[0].name, "addr");
+    assert_eq!(header.fields[0].path, ["addr"]);
+    assert_eq!(header.fields[1].name, "flavor");
+    assert_eq!(header.fields[1].ty.class, FieldTypeClass::Enum);
+    assert_eq!(header.keeps.len(), 1);
+
+    let packet = elaborated.transaction("Packet").expect("Packet schema");
+    assert_eq!(
+        packet
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["hdr.addr", "hdr.flavor", "len"]
+    );
+    let hdr_addr = packet
+        .fields
+        .iter()
+        .find(|field| field.name == "hdr.addr")
+        .expect("hdr.addr");
+    assert_eq!(hdr_addr.path, ["hdr", "addr"]);
+    assert_eq!(hdr_addr.ty.width, Some(16));
+
+    assert_eq!(
+        packet.keeps.len(),
+        2,
+        "transaction keeps should include direct keeps plus prefixed nested struct keeps"
+    );
+    let refs = &packet.keeps[1].refs.fields;
+    assert!(
+        refs.iter().any(|field| field.field == "hdr.addr"),
+        "prefixed struct keep should reference the dotted nested field, got {refs:?}"
+    );
+}
+
+#[test]
+fn typed_ir_supports_nested_field_refs_on_records_and_relation_params() {
+    let parsed = parse_source(
+        r#"struct Header
+    addr : uint<16>
+end struct Header
+
+transaction Packet
+    hdr : Header
+end transaction Packet
+
+relation HeaderAligned(h: Header) = h.addr % 4 == 0
+relation PacketAligned(p: Packet) = p.hdr.addr % 4 == 0"#,
+    )
+    .unwrap();
+
+    let elaborated = elaborate_constraints(&parsed);
+    assert!(elaborated.errors.is_empty(), "{:?}", elaborated.errors);
+
+    let header = elaborated
+        .relation("HeaderAligned")
+        .expect("HeaderAligned relation");
+    let RelationBodySchema::Alias(header_clause) = &header.body else {
+        panic!("HeaderAligned should be alias-form");
+    };
+    assert_eq!(header_clause.refs.fields.len(), 1);
+    assert_eq!(header_clause.refs.fields[0].root.as_deref(), Some("h"));
+    assert_eq!(header_clause.refs.fields[0].field, "addr");
+
+    let packet = elaborated
+        .relation("PacketAligned")
+        .expect("PacketAligned relation");
+    let RelationBodySchema::Alias(packet_clause) = &packet.body else {
+        panic!("PacketAligned should be alias-form");
+    };
+    assert_eq!(packet_clause.refs.fields.len(), 1);
+    assert_eq!(packet_clause.refs.fields[0].root.as_deref(), Some("p"));
+    assert_eq!(packet_clause.refs.fields[0].field, "hdr.addr");
+    assert!(matches!(
+        packet_clause.ir.as_ref(),
+        Some(ConstraintExpr::Binary { lhs, .. })
+            if matches!(&**lhs, ConstraintExpr::Binary { lhs, .. }
+                if matches!(&**lhs, ConstraintExpr::FieldRef { root, field }
+                    if root == "p" && field == "hdr.addr"))
+    ));
+}
+
+#[test]
 fn elaborates_relation_metadata() {
     let parsed = parse_source(
         r#"transaction T

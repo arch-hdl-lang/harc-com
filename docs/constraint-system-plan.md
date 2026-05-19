@@ -15,9 +15,9 @@ leaving generated C++ behavior unchanged.
 
 Constraint handling should flow through four layers:
 
-1. **Transaction elaboration** builds a schema for every transaction: fields,
-   widths, signedness, enum domains, non-random markers, defaults, attributes,
-   transaction-level keeps, and `when` subtype bodies.
+1. **Record elaboration** builds a schema for every struct and transaction:
+   fields, widths, signedness, enum domains, non-random markers, defaults,
+   attributes, record-level keeps, and `when` subtype bodies.
 2. **Typed constraint IR** lowers `keep`, `randomize with`, field attributes,
    and relation expansions into a checked expression tree with origins and
    source spans.
@@ -32,15 +32,23 @@ source of truth until each layer replaces it with matching tests.
 
 ## Elaboration Model
 
-The elaborated transaction schema records the facts needed before solver
-lowering:
+The elaborated record schema records the facts needed before solver lowering.
+Transactions and structs use the same field and constraint schema; transactions
+remain the randomization entry point, while structs provide reusable aggregate
+field and keep definitions.
 
-- field name, source span, type class, bit width, signedness, enum domain
+- field path, source span, type class, bit width, signedness, enum domain
 - `!` non-random status and whether the field has a default
 - field attributes such as `[range]`, `[dist]`, and `[unique]`
 - top-level `keep` constraints with their origin
 - `when` subtype discriminants and nested fields/keeps for future guarded
   subtype lowering
+
+Nested record fields are represented by dotted paths such as `hdr.addr`, with
+the path components preserved structurally. When a transaction contains a
+struct field, the struct's keeps are represented as prefixed constraints on
+the containing record, so future solver lowering sees the same semantic field
+paths that current codegen already emits.
 
 Relations are collected as named constraint sets with parameter schemas and
 body shape. Expansion should eventually preserve origin chains so diagnostics
