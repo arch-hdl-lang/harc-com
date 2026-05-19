@@ -424,15 +424,19 @@ impl Parser {
         let start = self.expect(TokenKind::Struct)?.span;
         let name = self.expect_ident()?;
         let inner_doc = self.consume_inner_doc();
-        let mut fields = Vec::new();
-        while !self.check_end_keyword() {
-            let f_doc = self.consume_outer_doc();
-            fields.push(self.parse_field(f_doc)?);
-        }
+        let body = self.parse_txn_body_until_end()?;
+        let fields = body
+            .iter()
+            .filter_map(|item| match item {
+                TxnBodyItem::Field(f) => Some(f.clone()),
+                _ => None,
+            })
+            .collect();
         let end = self.expect_end(TokenKind::Struct, &name.name)?;
         Ok(StructDecl {
             name,
             fields,
+            body,
             span: start.merge(end),
             doc,
             inner_doc,
