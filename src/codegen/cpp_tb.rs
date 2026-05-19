@@ -6690,6 +6690,18 @@ impl Emitter {
         txn_field_c_type(t)
     }
 
+    fn local_value_c_type(&self, t: &TypeExpr) -> String {
+        if let TypeExpr::Named { name, .. } = t {
+            if let Some(last) = name.segments.last().map(|s| s.name.as_str()) {
+                if self.is_record_type(last) {
+                    return last.to_string();
+                }
+            }
+            return c_type_for(t);
+        }
+        self.record_field_c_type(t)
+    }
+
     fn record_field_default(&self, f: &Field) -> String {
         if let Some(d) = &f.default {
             return format_simple_expr(d);
@@ -10676,17 +10688,24 @@ impl Emitter {
                 return;
             }
             self.pad(depth);
-            // Default to `int64_t` for integer-shaped lets so 32-bit
-            // DUT signals zero-extend on assignment (matters for the
-            // `assert got == expected` pattern when comparing widened
-            // C++ ints against narrow Verilator outputs). Switch to
-            // `auto` when the rhs is a call — function/tseq/method
-            // returns can be `std::vector<T>` or a transaction value,
-            // neither of which fit in int64_t.
-            let ty = if rhs_wants_auto(v, &self.tseq_names) {
-                "auto"
+            // Explicitly typed initialized locals must keep their
+            // declared scalar width. In particular, `let x : uint<75> =
+            // ...` needs `_harc_u128`, not the historical `int64_t`
+            // fallback used for untyped integer-shaped lets.
+            let ty = if let Some(t) = &l.ty {
+                self.local_value_c_type(t)
+            } else if rhs_wants_auto(v, &self.tseq_names) {
+                "auto".into()
             } else {
-                "int64_t"
+                // Default to `int64_t` for untyped integer-shaped lets
+                // so 32-bit DUT signals zero-extend on assignment
+                // (matters for the `assert got == expected` pattern
+                // when comparing widened C++ ints against narrow
+                // Verilator outputs). Switch to `auto` when the rhs is
+                // a call — function/tseq/method returns can be
+                // `std::vector<T>` or a transaction value, neither of
+                // which fit in int64_t.
+                "int64_t".into()
             };
             write!(self.out, "{ty} {} = ", l.name.name).ok();
             self.emit_expr(v);

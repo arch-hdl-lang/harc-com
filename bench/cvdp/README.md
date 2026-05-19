@@ -152,6 +152,7 @@ then removes known structural holes from Verilator's denominator before scoring.
 | `cid012_gf_multiplier` | 100.00% | 100.00% | control | ≥90% | **PASS** |
 | `cid012_gf_multiplier_thin` | 100.00% | 100.00% | control | ≥90% | **PASS** |
 | `32_bit_Brent_Kung_PP_adder_0004` | 100.00% | n/a | line | ≥80% | **PASS** |
+| `Attenuator_0011` | 100.00% | 100.00% | control | ≥90% | **PASS** |
 | `MSHR_0003` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `Synchronous_Muller_C_Element_0003` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `adc_data_rotate_0009` | 100.00% | 100.00% | control | ≥92% | **PASS** |
@@ -161,6 +162,7 @@ then removes known structural holes from Verilator's denominator before scoring.
 | `apb_history_shift_register_0003` | 100.00% | 100.00% | control | ≥98% | **PASS** |
 | `asyc_reset_0004` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `bcd_adder_0007` | 100.00% | n/a | line | ≥95% | **PASS** |
+| `binary_search_tree_sorting_0030` | 98.59% | 100.00% | control | ≥96% | **PASS** |
 | `binary_to_BCD_0030` | 100.00% | 100.00% | control | ≥90% | **PASS** |
 | `cdc_pulse_synchronizer_0017` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `cellular_automata_0002` | 100.00% | 100.00% | control | ≥100% | **PASS** |
@@ -168,6 +170,7 @@ then removes known structural holes from Verilator's denominator before scoring.
 | `decode_firstbit_0017` | 100.00% | 93.33% | control | ≥90% | **PASS** |
 | `encoder_8b10b_0026` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `endian_swapper_0004` | 99.24% | 98.41% | control | ≥92% | **PASS** |
+| `events_to_apb_0021` | 94.29% | 100.00% | control | ≥99% | **PASS** |
 | `fixed_arbiter_0004` | 100.00% | 100.00% | control | ≥95% | **PASS** |
 | `generic_nbit_counter_0013` | 100.00% | 100.00% | control | ≥100% | **PASS** |
 | `gray_to_binary_0014` | 100.00% | 100.00% | control | ≥95% | **PASS** |
@@ -198,7 +201,7 @@ then removes known structural holes from Verilator's denominator before scoring.
 
 ### Net scoreboard
 
-**46/46 PASS, 0/46 FAIL** under the semantic control metric plus explicit `.vlt`
+**49/49 PASS, 0/49 FAIL** under the semantic control metric plus explicit `.vlt`
 structural waivers. The false failures caused by toggle-as-BRDA accounting are
 removed from the scoreboard:
 
@@ -278,6 +281,21 @@ problem parameters or by source type width:
   history flags, invalid-address errors, and clock-gated APB no-update cases.
   This validates mixed generated-clock plus event-edge stimulus without adding
   a second artificial clock domain.
+- `events_to_apb_0021` uses directed A/B/C event pulses, simultaneous-priority
+  queues, APB wait states, timeout abort, covergroup crosses, and unique
+  randomized APB payloads to validate event-to-bus sequencing. The TB exposed
+  a useful checker detail: queued APB tests need completion helpers that stop
+  at the idle boundary so the next queued SETUP is not sampled too late.
+- `Attenuator_0011` uses reset/idle holds, directed endpoint and walking-bit
+  patterns, and solver-randomized unique 5-bit values to cover a clk-divided
+  serial shifter. The checker waits for observable `ATTN_CLK` and `ATTN_LE`
+  pulses, which keeps the TB robust without binding to the internal `clk_div2`
+  scheduling.
+- `binary_search_tree_sorting_0030` uses explicit packed BST encodings for
+  balanced, right-skewed, left-skewed, single-node, empty, found, and missing
+  searches. It validates HARC wide-port stimulus on 240-bit key vectors and
+  75-bit child-pointer vectors while using solver-randomized unique missing
+  keys to exercise invalid-search behavior.
 - `restoring_division_0006` is currently not an authored scoreboard case because
   the DUT does not converge in Verilator at cycle 0, before testbench stimulus.
 
@@ -299,6 +317,10 @@ this control score.
   a 33-bit intermediate (`sum + offset`) back to the DUT's 32-bit output before
   comparing — `.trunc<32>()` does it cleanly; `as uint<32>` would have been a
   no-op relabel.
+- **Wide local temporaries are covered** — `binary_search_tree_sorting_0030`
+  declares 75-bit/240-bit packed tree constants as local variables before
+  driving DUT ports. This caught and now guards against truncating C++ local
+  lowering for explicitly typed wide integer lets.
 
 ## Phase 2b-scale (next, NOT in this PR)
 

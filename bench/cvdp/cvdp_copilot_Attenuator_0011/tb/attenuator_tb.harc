@@ -1,0 +1,167 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_Attenuator_0011`.
+//
+// DUT: a 5-bit attenuator serial shifter. Any input-data change is captured,
+// shifted through ATTN_DATA with ATTN_CLK pulses, then committed with ATTN_LE.
+//
+// Strategy: reset/idling checks, directed endpoint and walking-bit patterns,
+// repeated unchanged-data holds, and solver-randomized unique 5-bit values.
+
+transaction AttnStim
+    data : uint<5> with [unique within test]
+end transaction AttnStim
+
+covergroup AttenuatorCov @(posedge dut.clk)
+    cp_data : cover dut.data
+        bins
+            zero = {0}
+            all_ones = {31}
+            low_bit = {1}
+            high_bit = {16}
+            middle = [2..30]
+        end bins
+
+    cp_clk : cover dut.ATTN_CLK
+        bins
+            low = {0}
+            high = {1}
+        end bins
+
+    cp_serial : cover dut.ATTN_DATA
+        bins
+            zero = {0}
+            one = {1}
+        end bins
+
+    cp_latch : cover dut.ATTN_LE
+        bins
+            low = {0}
+            high = {1}
+        end bins
+
+    cp_activity : cover ((dut.ATTN_CLK << 1) | dut.ATTN_LE)
+        bins
+            idle = {0}
+            shift = {2}
+            latch = {1}
+        end bins
+
+    cross cp_data, cp_latch
+    cross cp_clk, cp_serial
+end covergroup AttenuatorCov
+
+testbench AttenuatorTb
+    dut : Attenuator
+    cov : AttenuatorCov
+end testbench AttenuatorTb
+
+function reset_attn(dut: Attenuator)
+    dut.reset = 1
+    dut.data = 0
+    wait 4 cycles on clk
+    assert dut.ATTN_CLK == 0 else fail("reset: ATTN_CLK high")
+    assert dut.ATTN_DATA == 0 else fail("reset: ATTN_DATA high")
+    assert dut.ATTN_LE == 0 else fail("reset: ATTN_LE high")
+    dut.reset = 0
+    wait 4 cycles on clk
+end function reset_attn
+
+function wait_for_shift_pulse(dut: Attenuator, limit: uint<8>) -> uint<1>
+    for _ in 0 .. limit
+        if dut.ATTN_CLK == 1
+            return 0
+        end if
+        wait 1 cycle on clk
+    end for
+    log(error, "timeout waiting for ATTN_CLK shift pulse")
+    return 1
+end function wait_for_shift_pulse
+
+function wait_for_latch(dut: Attenuator, limit: uint<8>) -> uint<1>
+    for _ in 0 .. limit
+        if dut.ATTN_LE == 1
+            return 0
+        end if
+        wait 1 cycle on clk
+    end for
+    log(error, "timeout waiting for ATTN_LE")
+    return 1
+end function wait_for_latch
+
+function drive_changed(dut: Attenuator, value: uint<5>) -> uint<1>
+    let errors : uint<1> = 0
+    dut.data = value
+    errors = errors + wait_for_shift_pulse(dut, 16)
+    errors = errors + wait_for_latch(dut, 24)
+    wait 4 cycles on clk
+    if dut.ATTN_LE != 0
+        log(error, "ATTN_LE stayed high after value ${value:02x}")
+        errors = errors + 1
+    end if
+    return errors
+end function drive_changed
+
+function hold_unchanged(dut: Attenuator, value: uint<5>, cycles: uint<8>) -> uint<1>
+    dut.data = value
+    for _ in 0 .. cycles
+        wait 1 cycle on clk
+        if dut.ATTN_CLK != 0 or dut.ATTN_LE != 0
+            log(error, "unchanged data generated activity: data=${value:02x}")
+            return 1
+        end if
+    end for
+    return 0
+end function hold_unchanged
+
+impl AttenuatorTest for AttenuatorTb
+    clock clk = 10ns
+
+    run
+        log(info, "attenuator: reset, unchanged hold, directed shifts, and randomized unique data")
+
+        reset_attn(dut)
+        let errors : uint<32> = 0
+
+        errors = errors + hold_unchanged(dut, 0, 10)
+
+        errors = errors + drive_changed(dut, 0x1F)
+        errors = errors + hold_unchanged(dut, 0x1F, 8)
+
+        errors = errors + drive_changed(dut, 0x00)
+        errors = errors + drive_changed(dut, 0x10)
+        errors = errors + drive_changed(dut, 0x01)
+        errors = errors + drive_changed(dut, 0x0A)
+        errors = errors + drive_changed(dut, 0x15)
+
+        for bit in 0 .. 5
+            let pat : uint<5> = ((1 as uint<5>) << bit).trunc<5>()
+            errors = errors + drive_changed(dut, pat)
+        end for
+
+        for _ in 0 .. 12
+            let s : AttnStim
+            randomize(s)
+            if s.data == dut.data
+                dut.data = (s.data ^ 0x1F).trunc<5>()
+                wait 6 cycles on clk
+            end if
+            errors = errors + drive_changed(dut, s.data)
+        end for
+
+        reset_attn(dut)
+        assert errors == 0 else fail("attenuator produced ${errors} protocol errors")
+        log(info, "ALL TESTS PASSED - attenuator")
+    end run
+
+    check
+        cov.report()
+
+        assert cov.cp_data.zero > 0 else fail("coverage hole: data zero")
+        assert cov.cp_data.all_ones > 0 else fail("coverage hole: data all ones")
+        assert cov.cp_data.low_bit > 0 else fail("coverage hole: data low bit")
+        assert cov.cp_data.high_bit > 0 else fail("coverage hole: data high bit")
+        assert cov.cp_clk.high > 0 else fail("coverage hole: ATTN_CLK high")
+        assert cov.cp_serial.zero > 0 else fail("coverage hole: serial zero")
+        assert cov.cp_serial.one > 0 else fail("coverage hole: serial one")
+        assert cov.cp_latch.high > 0 else fail("coverage hole: ATTN_LE high")
+    end check
+end impl AttenuatorTest
