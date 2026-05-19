@@ -484,6 +484,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         buses,
         bus_bindings: std::collections::HashMap::new(),
         bus_remap: std::collections::HashMap::new(),
+        pending_tlm_forks: Vec::new(),
+        next_tlm_fork_tag: std::collections::HashMap::new(),
         in_coroutine: false,
         actor_threads: Vec::new(),
         mt: opts.mt,
@@ -1040,6 +1042,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         e.pointer_vars.insert("dut".to_string());
         e.bus_bindings.clear();
         e.bus_remap.clear();
+        e.pending_tlm_forks.clear();
+        e.next_tlm_fork_tag.clear();
         e.probes.clear();
         e.clock_names.clear();
         e.covers.clear();
@@ -2182,6 +2186,15 @@ struct CoverInfo {
     label: String,
 }
 
+#[derive(Debug, Clone)]
+struct PendingTlmFork {
+    root: String,
+    method: String,
+    sig_prefix: String,
+    ret_var: Option<String>,
+    tag: Option<u64>,
+}
+
 enum WaitCondition<'a> {
     Expr(&'a Expr),
     Idle { instance: String, cycles: &'a Expr },
@@ -2905,6 +2918,7 @@ fn collect_randomize_target_field_refs(
         ExprKind::Cast { expr, .. }
         | ExprKind::Unary { expr, .. }
         | ExprKind::Paren(expr)
+        | ExprKind::ForkCall { call: expr }
         | ExprKind::HashHash { expr, .. }
         | ExprKind::SeqRepeat { expr, .. } => {
             collect_randomize_target_field_refs(expr, field_info, target_root, out);
@@ -3201,6 +3215,13 @@ struct Emitter {
     /// in this bucket.
     bus_remap:
         std::collections::HashMap<String, std::collections::HashMap<(String, String), String>>,
+    /// Pending RHS-fork TLM calls in the current run/method body. Populated
+    /// by `let x = fork bus.method(...)` or discarded `fork bus.method(...)`
+    /// and drained by `join_all`.
+    pending_tlm_forks: Vec<PendingTlmFork>,
+    /// Per `(bus prefix, method)` tag counter for RHS-fork calls to
+    /// `tlm_method ... : out_of_order tags N`.
+    next_tlm_fork_tag: std::collections::HashMap<(String, String), u64>,
     /// True while emitting statements *directly inside the test's run
     /// coroutine body* (the `scope sim/run` block plus bare test-level
     /// stmts). When set, `wait N cycles`, bare `tick()` (the bus
@@ -5021,6 +5042,373 @@ impl Emitter {
     /// each handshake_channel signal flattens to
     /// `<binding>_<channel>_<signal>` (and the implicit `valid` /
     /// `ready` signals flatten the same way).
+    /// Detect `<bus>.<method>(args)` for a `tlm_method` declared on a bus
+    /// binding and emit ARCH-compatible blocking req/rsp wire protocol:
+    /// `<prefix>_<method>_req_valid`, `<prefix>_<method>_<arg>`,
+    /// `<prefix>_<method>_req_ready`, `<prefix>_<method>_rsp_valid`,
+    /// optional `<prefix>_<method>_rsp_data`, and
+    /// `<prefix>_<method>_rsp_ready`.
+    fn try_emit_bus_tlm_method(&mut self, e: &Expr, let_name: Option<&str>, depth: usize) -> bool {
+        let ExprKind::Call { callee, args } = &*e.kind else {
+            return false;
+        };
+        let ExprKind::Field {
+            target,
+            name: method_name,
+        } = &*callee.kind
+        else {
+            return false;
+        };
+        let ExprKind::Ident(id) = &*target.kind else {
+            return false;
+        };
+        let Some((bus, root, sig_prefix)) = self.bus_bindings.get(&id.name).cloned() else {
+            return false;
+        };
+        let Some(method) = bus
+            .tlm_methods
+            .iter()
+            .find(|m| m.name.name == method_name.name)
+            .cloned()
+        else {
+            return false;
+        };
+        if method.mode.name != "blocking" {
+            self.errors.push(format!(
+                "bus.{}: HARC direct-Verilator lowering currently supports only `blocking` tlm_method calls; `{}` is parsed for ARCH compatibility but not lowered here",
+                method.name.name, method.mode.name
+            ));
+            return true;
+        }
+        if args.len() != method.args.len() {
+            self.errors.push(format!(
+                "bus.{}: expected {} arg(s), got {}",
+                method.name.name,
+                method.args.len(),
+                args.len(),
+            ));
+            return true;
+        }
+        if let_name.is_some() && method.ret.is_none() {
+            self.errors.push(format!(
+                "bus.{} returns no value; use it as a statement",
+                method.name.name,
+            ));
+            return true;
+        }
+
+        let req_valid = self.bus_signal_name(&sig_prefix, &method.name.name, "req_valid");
+        let req_ready = self.bus_signal_name(&sig_prefix, &method.name.name, "req_ready");
+        let rsp_valid = self.bus_signal_name(&sig_prefix, &method.name.name, "rsp_valid");
+        let rsp_ready = self.bus_signal_name(&sig_prefix, &method.name.name, "rsp_ready");
+        let rsp_data = self.bus_signal_name(&sig_prefix, &method.name.name, "rsp_data");
+
+        self.pad(depth);
+        writeln!(self.out, "// bus.{} tlm_method", method.name.name).ok();
+        for ((arg_name, _), arg) in method.args.iter().zip(args.iter()) {
+            let sig_port = self.bus_signal_name(&sig_prefix, &method.name.name, &arg_name.name);
+            self.pad(depth);
+            write!(self.out, "{root}->{sig_port} = ").ok();
+            match arg {
+                CallArg::Expr(e) => self.emit_expr(e),
+                CallArg::Named { value, .. } => self.emit_expr(value),
+            }
+            writeln!(self.out, ";").ok();
+        }
+        self.pad(depth);
+        writeln!(self.out, "{root}->{req_valid} = 1;").ok();
+        self.pad(depth);
+        if self.in_coroutine {
+            writeln!(self.out, "{{ int _b = 16; while (!{root}->{req_ready} && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}").ok();
+            self.pad(depth);
+            writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
+        } else {
+            writeln!(self.out, "{{ int _b = 16; while (!{root}->{req_ready} && _b > 0) {{ tick(); _b--; }} }}").ok();
+            self.pad(depth);
+            writeln!(self.out, "tick();").ok();
+        }
+        self.pad(depth);
+        writeln!(self.out, "{root}->{req_valid} = 0;").ok();
+
+        self.pad(depth);
+        writeln!(self.out, "{root}->{rsp_ready} = 1;").ok();
+        self.pad(depth);
+        if self.in_coroutine {
+            writeln!(self.out, "{{ int _b = 16; while (!{root}->{rsp_valid} && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}").ok();
+        } else {
+            writeln!(self.out, "{{ int _b = 16; while (!{root}->{rsp_valid} && _b > 0) {{ tick(); _b--; }} }}").ok();
+        }
+        if let Some(name) = let_name {
+            if let Some(ret) = &method.ret {
+                self.pad(depth);
+                let cty = self.record_field_c_type(ret);
+                writeln!(self.out, "{cty} {name} = {root}->{rsp_data};").ok();
+            }
+        }
+        self.pad(depth);
+        if self.in_coroutine {
+            writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
+        } else {
+            writeln!(self.out, "tick();").ok();
+        }
+        self.pad(depth);
+        writeln!(self.out, "{root}->{rsp_ready} = 0;").ok();
+
+        if let Some(inst) = self.current_component_instance.clone() {
+            self.pad(depth);
+            writeln!(self.out, "{inst}._last_out_cycle = (uint64_t)cycle_count;").ok();
+            self.pad(depth);
+            writeln!(self.out, "{inst}._last_in_cycle = (uint64_t)cycle_count;").ok();
+        }
+        true
+    }
+
+    /// Detect `fork bus.<method>(args)` and emit only the request side of a
+    /// bus-level `tlm_method` call. A later `join_all` drains the response
+    /// side and assigns any captured return values.
+    fn try_emit_bus_tlm_fork(&mut self, e: &Expr, let_name: Option<&str>, depth: usize) -> bool {
+        let ExprKind::ForkCall { call } = &*e.kind else {
+            return false;
+        };
+        let ExprKind::Call { callee, args } = &*call.kind else {
+            self.errors
+                .push("`fork` RHS currently requires a direct bus tlm_method call".into());
+            return true;
+        };
+        let ExprKind::Field {
+            target,
+            name: method_name,
+        } = &*callee.kind
+        else {
+            self.errors
+                .push("`fork` RHS currently requires a direct bus tlm_method call".into());
+            return true;
+        };
+        let ExprKind::Ident(id) = &*target.kind else {
+            self.errors
+                .push("`fork` RHS currently requires `bus.method(args)`".into());
+            return true;
+        };
+        let Some((bus, root, sig_prefix)) = self.bus_bindings.get(&id.name).cloned() else {
+            self.errors.push(format!(
+                "`fork {}.{}(...)`: `{}` is not a known bus binding",
+                id.name, method_name.name, id.name
+            ));
+            return true;
+        };
+        let Some(method) = bus
+            .tlm_methods
+            .iter()
+            .find(|m| m.name.name == method_name.name)
+            .cloned()
+        else {
+            self.errors.push(format!(
+                "bus `{}` has no tlm_method `{}`",
+                bus.name.name, method_name.name
+            ));
+            return true;
+        };
+        if args.len() != method.args.len() {
+            self.errors.push(format!(
+                "bus.{}: expected {} arg(s), got {}",
+                method.name.name,
+                method.args.len(),
+                args.len(),
+            ));
+            return true;
+        }
+
+        let ret_type = method.ret.as_ref().map(|t| self.record_field_c_type(t));
+        if let Some(name) = let_name {
+            let cty = ret_type.clone().unwrap_or_else(|| "uint64_t".into());
+            self.pad(depth);
+            writeln!(self.out, "{cty} {name} = {{}};").ok();
+        } else if method.ret.is_some() {
+            self.pad(depth);
+            writeln!(
+                self.out,
+                "// fork bus.{} result intentionally discarded",
+                method.name.name
+            )
+            .ok();
+        }
+
+        let req_valid = self.bus_signal_name(&sig_prefix, &method.name.name, "req_valid");
+        let req_ready = self.bus_signal_name(&sig_prefix, &method.name.name, "req_ready");
+        let req_tag = self.bus_signal_name(&sig_prefix, &method.name.name, "req_tag");
+        let tag = if method.mode.name == "out_of_order" {
+            let key = (sig_prefix.clone(), method.name.name.clone());
+            let next = self.next_tlm_fork_tag.entry(key).or_insert(0);
+            let tag = *next;
+            *next += 1;
+            Some(tag)
+        } else if method.mode.name == "blocking" {
+            None
+        } else {
+            self.errors.push(format!(
+                "bus.{}: HARC RHS-fork lowering supports `blocking` and `out_of_order tags N`, not `{}`",
+                method.name.name, method.mode.name
+            ));
+            return true;
+        };
+
+        self.pad(depth);
+        writeln!(self.out, "// fork bus.{} tlm_method issue", method.name.name).ok();
+        for ((arg_name, _), arg) in method.args.iter().zip(args.iter()) {
+            let sig_port = self.bus_signal_name(&sig_prefix, &method.name.name, &arg_name.name);
+            self.pad(depth);
+            write!(self.out, "{root}->{sig_port} = ").ok();
+            match arg {
+                CallArg::Expr(e) => self.emit_expr(e),
+                CallArg::Named { value, .. } => self.emit_expr(value),
+            }
+            writeln!(self.out, ";").ok();
+        }
+        if let Some(tag) = tag {
+            self.pad(depth);
+            writeln!(self.out, "{root}->{req_tag} = {tag};").ok();
+        }
+        self.pad(depth);
+        writeln!(self.out, "{root}->{req_valid} = 1;").ok();
+        self.pad(depth);
+        if self.in_coroutine {
+            writeln!(self.out, "{{ int _b = 16; while (!{root}->{req_ready} && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}").ok();
+            self.pad(depth);
+            writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
+        } else {
+            writeln!(self.out, "{{ int _b = 16; while (!{root}->{req_ready} && _b > 0) {{ tick(); _b--; }} }}").ok();
+            self.pad(depth);
+            writeln!(self.out, "tick();").ok();
+        }
+        self.pad(depth);
+        writeln!(self.out, "{root}->{req_valid} = 0;").ok();
+
+        self.pending_tlm_forks.push(PendingTlmFork {
+            root,
+            method: method.name.name,
+            sig_prefix,
+            ret_var: let_name.map(|s| s.to_string()),
+            tag,
+        });
+        true
+    }
+
+    fn emit_tlm_join_all(&mut self, depth: usize) {
+        if self.pending_tlm_forks.is_empty() {
+            self.pad(depth);
+            writeln!(self.out, "// join_all: no pending forked TLM calls").ok();
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_tlm_forks);
+        let tagged = pending.iter().any(|p| p.tag.is_some());
+        if tagged {
+            self.emit_tagged_tlm_join_all(&pending, depth);
+        } else {
+            self.emit_ordered_tlm_join_all(&pending, depth);
+        }
+    }
+
+    fn emit_ordered_tlm_join_all(&mut self, pending: &[PendingTlmFork], depth: usize) {
+        for p in pending {
+            let rsp_valid = self.bus_signal_name(&p.sig_prefix, &p.method, "rsp_valid");
+            let rsp_ready = self.bus_signal_name(&p.sig_prefix, &p.method, "rsp_ready");
+            let rsp_data = self.bus_signal_name(&p.sig_prefix, &p.method, "rsp_data");
+            self.pad(depth);
+            writeln!(self.out, "// join_all bus.{} response", p.method).ok();
+            self.pad(depth);
+            writeln!(self.out, "{}->{} = 1;", p.root, rsp_ready).ok();
+            self.pad(depth);
+            if self.in_coroutine {
+                writeln!(self.out, "{{ int _b = 64; while (!{}->{} && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}", p.root, rsp_valid).ok();
+            } else {
+                writeln!(self.out, "{{ int _b = 64; while (!{}->{} && _b > 0) {{ tick(); _b--; }} }}", p.root, rsp_valid).ok();
+            }
+            if let Some(var) = &p.ret_var {
+                self.pad(depth);
+                writeln!(self.out, "{var} = {}->{};", p.root, rsp_data).ok();
+            }
+            self.pad(depth);
+            if self.in_coroutine {
+                writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
+            } else {
+                writeln!(self.out, "tick();").ok();
+            }
+            self.pad(depth);
+            writeln!(self.out, "{}->{} = 0;", p.root, rsp_ready).ok();
+        }
+    }
+
+    fn emit_tagged_tlm_join_all(&mut self, pending: &[PendingTlmFork], depth: usize) {
+        self.pad(depth);
+        writeln!(self.out, "{{").ok();
+        self.pad(depth + 1);
+        writeln!(self.out, "int _tlm_pending = {};", pending.len()).ok();
+        for (idx, _) in pending.iter().enumerate() {
+            self.pad(depth + 1);
+            writeln!(self.out, "bool _tlm_seen_{idx} = false;").ok();
+        }
+        self.pad(depth + 1);
+        writeln!(self.out, "int _tlm_budget = 256;").ok();
+        self.pad(depth + 1);
+        writeln!(self.out, "while (_tlm_pending > 0 && _tlm_budget > 0) {{").ok();
+        for p in pending {
+            let rsp_ready = self.bus_signal_name(&p.sig_prefix, &p.method, "rsp_ready");
+            self.pad(depth + 2);
+            writeln!(self.out, "{}->{} = 0;", p.root, rsp_ready).ok();
+        }
+        self.pad(depth + 2);
+        writeln!(self.out, "bool _tlm_accept = false;").ok();
+        for (idx, p) in pending.iter().enumerate() {
+            let Some(tag) = p.tag else {
+                self.errors
+                    .push("cannot mix tagged and untagged RHS-fork TLM calls before one join_all".into());
+                continue;
+            };
+            let rsp_valid = self.bus_signal_name(&p.sig_prefix, &p.method, "rsp_valid");
+            let rsp_ready = self.bus_signal_name(&p.sig_prefix, &p.method, "rsp_ready");
+            let rsp_data = self.bus_signal_name(&p.sig_prefix, &p.method, "rsp_data");
+            let rsp_tag = self.bus_signal_name(&p.sig_prefix, &p.method, "rsp_tag");
+            self.pad(depth + 2);
+            writeln!(
+                self.out,
+                "if (!_tlm_seen_{idx} && {root}->{rsp_valid} && {root}->{rsp_tag} == {tag}) {{",
+                root = p.root
+            )
+            .ok();
+            if let Some(var) = &p.ret_var {
+                self.pad(depth + 3);
+                writeln!(self.out, "{var} = {}->{};", p.root, rsp_data).ok();
+            }
+            self.pad(depth + 3);
+            writeln!(self.out, "{}->{} = 1;", p.root, rsp_ready).ok();
+            self.pad(depth + 3);
+            writeln!(self.out, "_tlm_seen_{idx} = true;").ok();
+            self.pad(depth + 3);
+            writeln!(self.out, "_tlm_pending--;").ok();
+            self.pad(depth + 3);
+            writeln!(self.out, "_tlm_accept = true;").ok();
+            self.pad(depth + 2);
+            writeln!(self.out, "}}").ok();
+        }
+        self.pad(depth + 2);
+        if self.in_coroutine {
+            writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
+        } else {
+            writeln!(self.out, "tick();").ok();
+        }
+        self.pad(depth + 2);
+        writeln!(self.out, "if (!_tlm_accept) _tlm_budget--;").ok();
+        self.pad(depth + 1);
+        writeln!(self.out, "}}").ok();
+        for p in pending {
+            let rsp_ready = self.bus_signal_name(&p.sig_prefix, &p.method, "rsp_ready");
+            self.pad(depth + 1);
+            writeln!(self.out, "{}->{} = 0;", p.root, rsp_ready).ok();
+        }
+        self.pad(depth);
+        writeln!(self.out, "}}").ok();
+    }
+
     /// Detect `<bus>.<channel>.send(args)` / `<bus>.<channel>.recv()`
     /// calls and emit the auto-generated valid/ready handshake. The
     /// channel must be a `handshake_channel` on the bus the binding
@@ -10036,6 +10424,17 @@ impl Emitter {
                 self.emit_log(&collected, path, depth);
             }
             StmtKind::Expr(e) => {
+                // `fork bus.<method>(args)` issues a TLM request without
+                // waiting for the response; `join_all` drains responses.
+                if self.try_emit_bus_tlm_fork(e, None, depth) {
+                    return;
+                }
+                // `bus.<method>(args)` for bus-level `tlm_method`
+                // declarations expands into ARCH-compatible req/rsp
+                // protocol wires.
+                if self.try_emit_bus_tlm_method(e, None, depth) {
+                    return;
+                }
                 // `bus.<channel>.send(args)` and `bus.<channel>.recv()`
                 // expand into a multi-statement v/r handshake. When
                 // it's a discarded-result `recv()`, just run the dance.
@@ -10053,6 +10452,9 @@ impl Emitter {
                 self.pad(depth);
                 self.emit_expr(e);
                 writeln!(self.out, ";").ok();
+            }
+            StmtKind::JoinAll { .. } => {
+                self.emit_tlm_join_all(depth);
             }
             StmtKind::Release(e) => {
                 // `release <expr>` — disable the active SV procedural
@@ -10680,6 +11082,17 @@ impl Emitter {
             return;
         }
         if let Some(v) = &l.value {
+            // `let x = fork bus.<method>(args)` issues the request now
+            // and captures the response into x at a later `join_all`.
+            if self.try_emit_bus_tlm_fork(v, Some(&l.name.name), depth) {
+                return;
+            }
+            // `bus.<method>(args)` on the rhs expands the req/rsp
+            // transaction-method protocol and captures the response
+            // payload into the let when the method returns a value.
+            if self.try_emit_bus_tlm_method(v, Some(&l.name.name), depth) {
+                return;
+            }
             // `bus.<ch>.recv()` on the rhs expands the handshake +
             // captures the payload signal directly into the let.
             // Defer pad emission so the handshake helper can write its
@@ -13224,7 +13637,10 @@ fn rewrite_stmt_for_impl(
         StmtKind::Fail { msg, .. } => {
             rewrite_expr_for_impl(msg, fields, methods, pointers, shadow);
         }
-        StmtKind::Apply(_) | StmtKind::Break { .. } | StmtKind::Continue { .. } => {}
+        StmtKind::JoinAll { .. }
+        | StmtKind::Apply(_)
+        | StmtKind::Break { .. }
+        | StmtKind::Continue { .. } => {}
     }
 }
 
@@ -13311,6 +13727,9 @@ fn rewrite_expr_for_impl(
         }
         ExprKind::Unary { expr, .. } => {
             rewrite_expr_for_impl(expr, fields, methods, _pointers, shadow)
+        }
+        ExprKind::ForkCall { call } => {
+            rewrite_expr_for_impl(call, fields, methods, _pointers, shadow)
         }
         ExprKind::Binary { lhs, rhs, .. } => {
             rewrite_expr_for_impl(lhs, fields, methods, _pointers, shadow);

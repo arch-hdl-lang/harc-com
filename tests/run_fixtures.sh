@@ -76,6 +76,7 @@ transactor_active_test  | AxiLiteRegs    | AxiLiteRegs.sv         |
 transactor_passive_only_test | AxiLiteRegs | AxiLiteRegs.sv        |
 transactor_agent_mode_test | AxiLiteRegs   | AxiLiteRegs.sv         |
 transactor_env_mode_test | AxiLiteRegs     | AxiLiteRegs.sv         |
+tlm_method_bus_test   | TlmMemory      | TlmMemory.sv           |
 dma_engine_test         | DmaEngine      | dma_engine.sv          |
 pkt_queue_test          | PacketQueue    | pkt_queue.sv           |
 linklist_basic_test     | TaskQueue      | linklist_basic.sv      |

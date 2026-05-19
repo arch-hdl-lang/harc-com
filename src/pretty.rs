@@ -463,6 +463,28 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
                 pad(out, depth + 1);
                 writeln!(out, "end handshake_channel {}", h.name.name).ok();
             }
+            for m in &b.tlm_methods {
+                pad(out, depth + 1);
+                write!(out, "tlm_method {}(", m.name.name).ok();
+                for (idx, (arg_name, arg_ty)) in m.args.iter().enumerate() {
+                    if idx > 0 {
+                        write!(out, ", ").ok();
+                    }
+                    write!(out, "{}: ", arg_name.name).ok();
+                    print_type(out, arg_ty);
+                }
+                write!(out, ")").ok();
+                if let Some(ret) = &m.ret {
+                    write!(out, " -> ").ok();
+                    print_type(out, ret);
+                }
+                write!(out, ": {}", m.mode.name).ok();
+                if let Some(tags) = &m.out_of_order_tags {
+                    write!(out, " tags ").ok();
+                    print_expr(out, tags);
+                }
+                writeln!(out, ";").ok();
+            }
             pad(out, depth);
             writeln!(out, "end bus {}", b.name.name).ok();
         }
@@ -1070,6 +1092,10 @@ fn print_stmt(out: &mut String, s: &Stmt, depth: usize) {
             };
             writeln!(out, "{kw}").ok();
         }
+        StmtKind::JoinAll { .. } => {
+            pad(out, depth);
+            writeln!(out, "join_all").ok();
+        }
         StmtKind::Parallel(branches) => {
             pad(out, depth);
             writeln!(out, "parallel").ok();
@@ -1397,6 +1423,10 @@ pub fn print_expr(out: &mut String, e: &Expr) {
                 }
             }
             write!(out, ")").ok();
+        }
+        ExprKind::ForkCall { call } => {
+            write!(out, "fork ").ok();
+            print_expr(out, call);
         }
         ExprKind::Cast { expr, ty } => {
             print_expr(out, expr);
