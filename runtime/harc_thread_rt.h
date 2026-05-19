@@ -39,6 +39,7 @@
 #include <vector>
 #include <atomic>
 #include <thread>
+#include <array>
 
 // 65–128-bit integer type for whole-signal arithmetic and >64-bit
 // hex literals. File-scope (not inside `harc_rt::`) so emitted code
@@ -56,13 +57,11 @@ namespace harc_rt {
 //   >64 bits     → VlWide<N>  (array of N uint32_t words, N=ceil(W/32))
 //
 // HARC's testbench source language doesn't have separate "narrow"/"wide"
-// types — every integer expression flows through the same shape. To make
-// that uniform we use a single 128-bit value type for whole-signal
-// reads, and accept any integer value (cast up to 128 bits) on whole-
-// signal writes. 128 bits covers every arch-com DUT we vendor today
-// (AES blocks, AXI4 data lanes up to 128b). Wider signals (>128b)
-// fall back to per-word access via VlWide indexing — they round-trip
-// at the L-value level via Verilator's `operator[]`.
+// types — every integer expression flows through the same shape. Narrow
+// values use native integers / `_harc_u128`; wider vector values use
+// `HarcWide<N>`, a small LSB-first 32-bit word array. This is deliberately
+// sized by the compiler from the HARC type and supports the language-level
+// vector target of up to 1024 bits (N <= 32).
 //
 // Mirrors arch-com's `_arch_u128` design (see arch-com src/sim_codegen/
 // mod.rs:767 for the equivalent typedef and conversion helpers). The
@@ -70,38 +69,122 @@ namespace harc_rt {
 // it for the value type so codegen can emit `_harc_u128` literals
 // without namespace qualification.
 
+template<std::size_t N>
+struct HarcWide {
+    std::array<uint32_t, N> words{};
+
+    HarcWide() = default;
+
+    template<typename T, typename = std::enable_if_t<std::is_integral_v<T> || std::is_enum_v<T>>>
+    HarcWide(T v) {
+        _harc_u128 u = static_cast<_harc_u128>(v);
+        for (std::size_t i = 0; i < N; ++i) {
+            words[i] = (i < 4) ? static_cast<uint32_t>(u >> (32 * i)) : 0u;
+        }
+    }
+
+    HarcWide(std::initializer_list<uint32_t> init) {
+        std::size_t i = 0;
+        for (uint32_t w : init) {
+            if (i < N) words[i] = w;
+            ++i;
+        }
+    }
+
+    uint32_t operator[](std::size_t i) const { return i < N ? words[i] : 0u; }
+    uint32_t& operator[](std::size_t i) { return words[i]; }
+
+    operator uint64_t() const {
+        uint64_t v = 0;
+        if constexpr (N >= 1) v |= static_cast<uint64_t>(words[0]);
+        if constexpr (N >= 2) v |= static_cast<uint64_t>(words[1]) << 32;
+        return v;
+    }
+
+    operator _harc_u128() const {
+        _harc_u128 v = 0;
+        if constexpr (N >= 1) v |= static_cast<_harc_u128>(words[0]);
+        if constexpr (N >= 2) v |= static_cast<_harc_u128>(words[1]) << 32;
+        if constexpr (N >= 3) v |= static_cast<_harc_u128>(words[2]) << 64;
+        if constexpr (N >= 4) v |= static_cast<_harc_u128>(words[3]) << 96;
+        return v;
+    }
+};
+
+template<typename T> struct is_harc_wide : std::false_type {};
+template<std::size_t N> struct is_harc_wide<HarcWide<N>> : std::true_type {};
+template<typename T>
+inline constexpr bool is_harc_wide_v = is_harc_wide<std::remove_cv_t<std::remove_reference_t<T>>>::value;
+template<typename T> struct harc_wide_words;
+template<std::size_t N> struct harc_wide_words<HarcWide<N>> { static constexpr std::size_t value = N; };
+
+template<std::size_t A, std::size_t B>
+inline bool operator==(const HarcWide<A>& lhs, const HarcWide<B>& rhs) {
+    constexpr std::size_t M = (A > B) ? A : B;
+    for (std::size_t i = 0; i < M; ++i) {
+        const uint32_t l = (i < A) ? lhs.words[i] : 0u;
+        const uint32_t r = (i < B) ? rhs.words[i] : 0u;
+        if (l != r) return false;
+    }
+    return true;
+}
+
+template<std::size_t A, std::size_t B>
+inline bool operator!=(const HarcWide<A>& lhs, const HarcWide<B>& rhs) {
+    return !(lhs == rhs);
+}
+
+template<std::size_t N, typename T, typename = std::enable_if_t<std::is_integral_v<T> || std::is_enum_v<T>>>
+inline bool operator==(const HarcWide<N>& lhs, T rhs) {
+    return lhs == HarcWide<N>(rhs);
+}
+
+template<std::size_t N, typename T, typename = std::enable_if_t<std::is_integral_v<T> || std::is_enum_v<T>>>
+inline bool operator==(T lhs, const HarcWide<N>& rhs) {
+    return HarcWide<N>(lhs) == rhs;
+}
+
+template<std::size_t N, typename T, typename = std::enable_if_t<std::is_integral_v<T> || std::is_enum_v<T>>>
+inline bool operator!=(const HarcWide<N>& lhs, T rhs) {
+    return !(lhs == rhs);
+}
+
+template<std::size_t N, typename T, typename = std::enable_if_t<std::is_integral_v<T> || std::is_enum_v<T>>>
+inline bool operator!=(T lhs, const HarcWide<N>& rhs) {
+    return !(lhs == rhs);
+}
+
 template<typename Sig, typename Val>
 inline void harc_assign(Sig& sig, Val val) {
     if constexpr (std::is_arithmetic_v<Sig>) {
-        sig = static_cast<Sig>(val);
+        if constexpr (is_harc_wide_v<Val>) {
+            sig = static_cast<Sig>(static_cast<uint64_t>(val));
+        } else {
+            sig = static_cast<Sig>(val);
+        }
     } else {
-        // VlWide<N>: write low 128 bits via the first four words; zero
-        // anything beyond. `sizeof(Sig) / sizeof(uint32_t)` resolves to
-        // N because VlWide is `final` with a single uint32_t[N] member —
-        // no vtable, no padding under any standard ABI we target.
+        // VlWide<N>: write low words and zero anything beyond.
         constexpr std::size_t N = sizeof(Sig) / sizeof(uint32_t);
-        const _harc_u128 v = static_cast<_harc_u128>(val);
-        sig[0] = static_cast<uint32_t>(v);
-        if constexpr (N >= 2) sig[1] = static_cast<uint32_t>(v >> 32);
-        if constexpr (N >= 3) sig[2] = static_cast<uint32_t>(v >> 64);
-        if constexpr (N >= 4) sig[3] = static_cast<uint32_t>(v >> 96);
-        for (std::size_t i = 4; i < N; ++i) sig[i] = 0;
+        if constexpr (is_harc_wide_v<Val>) {
+            constexpr std::size_t M = harc_wide_words<std::remove_cv_t<std::remove_reference_t<Val>>>::value;
+            for (std::size_t i = 0; i < N; ++i) sig[i] = (i < M) ? val.words[i] : 0u;
+        } else {
+            const _harc_u128 v = static_cast<_harc_u128>(val);
+            for (std::size_t i = 0; i < N; ++i) {
+                sig[i] = (i < 4) ? static_cast<uint32_t>(v >> (32 * i)) : 0u;
+            }
+        }
     }
 }
 
 template<typename Sig>
-inline _harc_u128 harc_read(const Sig& sig) {
+inline auto harc_read(const Sig& sig) {
     if constexpr (std::is_arithmetic_v<Sig>) {
         return static_cast<_harc_u128>(sig);
     } else {
-        // VlWide<N>: combine the low four words into a 128-bit value.
-        // Upper words (if N > 4) are dropped — caller can use indexed
-        // access (`dut.field[i]`) for those.
         constexpr std::size_t N = sizeof(Sig) / sizeof(uint32_t);
-        _harc_u128 v = static_cast<uint32_t>(sig[0]);
-        if constexpr (N >= 2) v |= (static_cast<_harc_u128>(static_cast<uint32_t>(sig[1])) << 32);
-        if constexpr (N >= 3) v |= (static_cast<_harc_u128>(static_cast<uint32_t>(sig[2])) << 64);
-        if constexpr (N >= 4) v |= (static_cast<_harc_u128>(static_cast<uint32_t>(sig[3])) << 96);
+        HarcWide<N> v;
+        for (std::size_t i = 0; i < N; ++i) v.words[i] = static_cast<uint32_t>(sig[i]);
         return v;
     }
 }
@@ -114,6 +197,21 @@ inline uint64_t harc_bits(_harc_u128 value, uint32_t hi, uint32_t lo) {
     if (width >= 64) return static_cast<uint64_t>(shifted);
     const _harc_u128 mask = (static_cast<_harc_u128>(1) << width) - 1;
     return static_cast<uint64_t>(shifted & mask);
+}
+
+template<std::size_t N>
+inline uint64_t harc_bits(const HarcWide<N>& value, uint32_t hi, uint32_t lo) {
+    if (hi < lo || hi >= N * 32 || lo >= N * 32) return 0;
+    const uint32_t width = hi - lo + 1;
+    uint64_t out = 0;
+    const uint32_t capped = width > 64 ? 64 : width;
+    for (uint32_t b = 0; b < capped; ++b) {
+        const uint32_t src = lo + b;
+        const uint32_t word = src / 32;
+        const uint32_t bit = src % 32;
+        if ((value.words[word] >> bit) & 1u) out |= (uint64_t{1} << b);
+    }
+    return out;
 }
 
 // ── Wider-than-128-bit support ───────────────────────────────────────
@@ -178,6 +276,40 @@ struct HarcHexBuf128 {
         }
         buf[width] = '\0';
     }
+    operator const char*() const { return buf; }
+};
+
+struct HarcHexBufWide {
+    char buf[260];
+
+    template<typename T>
+    HarcHexBufWide(const T& v, int width, bool upper) {
+        const char* hex = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+        if (width < 1) width = 1;
+        if (width > 256) width = 256;
+        for (int i = 0; i < width; ++i) buf[i] = '0';
+        if constexpr (is_harc_wide_v<T>) {
+            constexpr std::size_t N = harc_wide_words<std::remove_cv_t<std::remove_reference_t<T>>>::value;
+            for (std::size_t wi = 0; wi < N; ++wi) {
+                uint32_t word = v.words[wi];
+                for (int nib = 0; nib < 8; ++nib) {
+                    int pos = width - 1 - static_cast<int>(wi * 8 + nib);
+                    if (pos >= 0) {
+                        buf[pos] = hex[word & 0xfu];
+                    }
+                    word >>= 4;
+                }
+            }
+        } else {
+            _harc_u128 tmp = static_cast<_harc_u128>(v);
+            for (int i = width - 1; i >= 0; --i) {
+                buf[i] = hex[static_cast<uint32_t>(tmp & 0xf)];
+                tmp >>= 4;
+            }
+        }
+        buf[width] = '\0';
+    }
+
     operator const char*() const { return buf; }
 };
 

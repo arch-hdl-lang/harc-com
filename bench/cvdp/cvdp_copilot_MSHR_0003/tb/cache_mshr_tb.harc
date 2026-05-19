@@ -28,6 +28,10 @@ transaction MshrRandCtl
     same_line : bool
 end transaction MshrRandCtl
 
+bus MshrAllocPipe
+    tlm_method allocate(addr: uint<10>, rw: bool, data: uint<56>) -> uint<11>: blocking;
+end bus MshrAllocPipe
+
 covergroup MshrCov @(posedge dut.clk)
     cp_alloc_valid : cover dut.allocate_valid
         bins
@@ -92,7 +96,7 @@ covergroup MshrCov @(posedge dut.clk)
 end covergroup MshrCov
 
 testbench CacheMshrTb
-    dut : cache_mshr
+    dut : cache_mshr_tlm_top
     cov : MshrCov
 end testbench CacheMshrTb
 
@@ -135,6 +139,17 @@ function valid_count(valid_mask: uint<32>) -> uint<6>
 end function valid_count
 
 impl CacheMshrTest for CacheMshrTb
+    let alloc_pipe : MshrAllocPipe = bind dut with {
+        allocate.req_valid: "alloc_req_valid",
+        allocate.req_ready: "alloc_req_ready",
+        allocate.addr: "alloc_addr",
+        allocate.rw: "alloc_rw",
+        allocate.data: "alloc_data",
+        allocate.rsp_valid: "alloc_rsp_valid",
+        allocate.rsp_ready: "alloc_rsp_ready",
+        allocate.rsp_data: "alloc_rsp_data"
+    }
+
     run
         log(info, "cache_mshr: stateful allocate/finalize/pending/full stress")
 
@@ -232,6 +247,32 @@ impl CacheMshrTest for CacheMshrTb
             else fail("software model did not drain: valid_mask=0x${valid_mask:08x}")
         assert dut.allocate_ready == 1
             else fail("after drain: ready=${dut.allocate_ready}, expected 1")
+
+        // RHS-fork TLM form of two pipelined same-line allocations. The
+        // wrapper packs {pending, previous_id, allocated_id} into the return.
+        let alloc0 = fork alloc_pipe.allocate(341, false, 0x1111)
+        let alloc1 = fork alloc_pipe.allocate(341, true, 0x2222)
+        join_all
+        let alloc0_id = (alloc0 & 31).trunc<5>()
+        let alloc0_prev = ((alloc0 >> 5) & 31).trunc<5>()
+        let alloc0_pending = ((alloc0 >> 10) & 1).trunc<1>()
+        let alloc1_id = (alloc1 & 31).trunc<5>()
+        let alloc1_prev = ((alloc1 >> 5) & 31).trunc<5>()
+        let alloc1_pending = ((alloc1 >> 10) & 1).trunc<1>()
+        assert alloc0_id == 0 and alloc0_pending == 0
+            else fail("fork alloc0 packed=0x${alloc0:03x}, expected id=0 pending=0")
+        assert alloc1_id == 1 and alloc1_prev == 0 and alloc1_pending == 1
+            else fail("fork alloc1 packed=0x${alloc1:03x}, expected id=1 prev=0 pending=1")
+        valid_mask = valid_mask | slot_bit(alloc0_id) | slot_bit(alloc1_id)
+        dut.finalize_valid = 1
+        dut.finalize_id = alloc0_id
+        wait 1 cycle
+        valid_mask = valid_mask & ~slot_bit(alloc0_id)
+        dut.finalize_id = alloc1_id
+        wait 1 cycle
+        valid_mask = valid_mask & ~slot_bit(alloc1_id)
+        dut.finalize_valid = 0
+        wait 1 cycle
 
         // Explicitly write every is_write_table bit as read, then write, so
         // all per-entry RW storage sees both values independent of solver luck.
