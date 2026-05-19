@@ -1,0 +1,124 @@
+// HARC testbench for CVDP cid012 `cvdp_copilot_Serial_Line_Converter_0006`.
+//
+// DUT: serial line code converter with eight 3-bit encoding modes and an
+// internal clock divider.
+//
+// Strategy: reset, directed mode sweep with toggling bit patterns, enough
+// cycles to hit the divider terminal count, and solver-randomized unique
+// mode/pattern pairs to stress auto coverage and no-repeat sampling.
+
+transaction SerialStim
+    mode : uint<3> with [unique within test]
+    pattern : uint<8> with [unique within test]
+end transaction SerialStim
+
+covergroup SerialLineCov @(posedge dut.clk)
+    cp_mode : cover dut.mode
+        bins
+            nrz = {0}
+            rz = {1}
+            differential = {2}
+            inverted = {3}
+            alternate = {4}
+            parity = {5}
+            scrambled = {6}
+            edge = {7}
+        end bins
+
+    cp_serial_in : cover dut.serial_in
+        bins
+            low = {0}
+            high = {1}
+        end bins
+
+    cp_serial_out : cover dut.serial_out
+        bins
+            low = {0}
+            high = {1}
+        end bins
+
+    cp_reset_n : cover dut.reset_n
+        bins
+            asserted = {0}
+            released = {1}
+        end bins
+
+    cross cp_mode, cp_serial_in
+    cross cp_mode, cp_serial_out
+end covergroup SerialLineCov
+
+testbench SerialLineConverterTb
+    dut : serial_line_code_converter
+    cov : SerialLineCov
+end testbench SerialLineConverterTb
+
+function reset_converter(dut: serial_line_code_converter)
+    dut.reset_n = 0
+    dut.serial_in = 0
+    dut.mode = 0
+    wait 4 cycles
+    assert dut.serial_out == 0 else fail("reset: serial_out high")
+    dut.reset_n = 1
+    wait 2 cycles
+end function reset_converter
+
+function drive_bit(dut: serial_line_code_converter, bit_value: bool)
+    dut.serial_in = bit_value
+    wait 1 cycle
+end function drive_bit
+
+function drive_pattern(dut: serial_line_code_converter, mode: uint<3>, pattern: uint<8>)
+    dut.mode = mode
+
+    for bit in 0 .. 8
+        drive_bit(dut, (((pattern >> bit) & 1) == 1))
+    end for
+
+    // Keep the mode selected long enough for CLK_DIV=16 to produce clk_pulse,
+    // which is required to exercise RZ and scrambled-mode divider behavior.
+    for bit in 0 .. 20
+        drive_bit(dut, ((bit & 1) == 1))
+    end for
+end function drive_pattern
+
+impl SerialLineConverterTest for SerialLineConverterTb
+    run
+        log(info, "serial_line_converter: mode sweep plus unique randomized patterns")
+
+        reset_converter(dut)
+
+        for mode in 0 .. 8
+            drive_pattern(dut, mode, 0x00)
+            drive_pattern(dut, mode, 0xFF)
+            drive_pattern(dut, mode, 0xAA)
+            drive_pattern(dut, mode, 0x55)
+            drive_pattern(dut, mode, ((1 as uint<8>) << mode).trunc<8>())
+        end for
+
+        for _ in 0 .. 16
+            let s : SerialStim
+            randomize(s)
+            drive_pattern(dut, s.mode, s.pattern)
+        end for
+
+        reset_converter(dut)
+        log(info, "ALL TESTS PASSED - serial_line_converter")
+    end run
+
+    check
+        cov.report()
+
+        assert cov.cp_mode.nrz > 0 else fail("coverage hole: NRZ mode")
+        assert cov.cp_mode.rz > 0 else fail("coverage hole: RZ mode")
+        assert cov.cp_mode.differential > 0 else fail("coverage hole: differential mode")
+        assert cov.cp_mode.inverted > 0 else fail("coverage hole: inverted NRZ mode")
+        assert cov.cp_mode.alternate > 0 else fail("coverage hole: alternate inversion mode")
+        assert cov.cp_mode.parity > 0 else fail("coverage hole: parity mode")
+        assert cov.cp_mode.scrambled > 0 else fail("coverage hole: scrambled mode")
+        assert cov.cp_mode.edge > 0 else fail("coverage hole: edge-triggered mode")
+        assert cov.cp_serial_in.low > 0 else fail("coverage hole: serial_in low")
+        assert cov.cp_serial_in.high > 0 else fail("coverage hole: serial_in high")
+        assert cov.cp_serial_out.low > 0 else fail("coverage hole: serial_out low")
+        assert cov.cp_serial_out.high > 0 else fail("coverage hole: serial_out high")
+    end check
+end impl SerialLineConverterTest
