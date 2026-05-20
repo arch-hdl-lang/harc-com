@@ -3477,6 +3477,34 @@ end test WhenSubtypeUnsatDiagnosticTest"#,
 }
 
 #[test]
+fn randomize_unsat_diagnostics_name_constraint_origins() {
+    let parsed = parse_source(
+        r#"transaction T
+    len : uint<4> with [range(0, 3)]
+    keep len > 4
+end transaction T
+
+test UnsatOriginDiagnosticTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t) with
+            t.len == 2
+        end randomize
+    end run
+end test UnsatOriginDiagnosticTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("constraint `len > 4` participated in the solve")
+            && cpp.contains("constraint `t.len == 2` participated in the solve")
+            && cpp.contains("field attribute `[range]` on `T.len` participated in the solve"),
+        "UNSAT diagnostics should list participating keep/with/range origins; got:\n{cpp}",
+    );
+}
+
+#[test]
 fn when_subtype_field_range_attributes_are_branch_guarded() {
     let parsed = parse_source(
         r#"enum Op { READ, WRITE }

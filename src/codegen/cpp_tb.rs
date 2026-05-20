@@ -10052,6 +10052,26 @@ impl Emitter {
             "sim_log_line(\"FAIL\", \"randomize(t) with: constraint UNSAT\");"
         )
         .ok();
+        let mut constraint_origins: Vec<String> = hard_constraints
+            .iter()
+            .map(|expr| format!("constraint `{}`", expr_source_str(expr)))
+            .collect();
+        for f in &fields {
+            if field_attr_range(f).is_some() {
+                constraint_origins.push(format!("field attribute `[range]` on `{ty}.{}`", f.name));
+            }
+        }
+        constraint_origins.sort();
+        constraint_origins.dedup();
+        for origin in constraint_origins {
+            self.pad(depth + 2);
+            writeln!(
+                self.out,
+                "sim_log_line(\"FAIL\", \"randomize(t) with: {} participated in the solve\");",
+                escape_c(&origin)
+            )
+            .ok();
+        }
         let mut when_guards: Vec<String> = fields
             .iter()
             .filter_map(|f| f.when_guard.as_ref().map(expr_source_str))
