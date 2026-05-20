@@ -401,9 +401,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         match it {
             Item::Transaction(t) => {
                 transactions.insert(t.name.name.clone());
-                let direct_fields = txn_direct_fields(&t.body);
-                let fields = flatten_record_field_infos(
-                    &direct_fields,
+                let fields = flatten_txn_body_field_infos(
+                    &t.body,
                     &record_fields,
                     &enums,
                     &enum_domains,
@@ -2294,6 +2293,7 @@ struct TxnFieldInfo {
     /// solver-backed randomize and skipped during model assignment.
     non_random: bool,
     attrs: Vec<Attr>,
+    when_guard: Option<Expr>,
 }
 
 #[derive(Debug, Clone)]
@@ -2306,6 +2306,7 @@ struct ListFieldInfo {
 fn txn_field_info_from_field_path(
     f: &Field,
     path: Vec<String>,
+    when_guard: Option<Expr>,
     enums: &std::collections::HashMap<String, usize>,
     enum_domains: &std::collections::HashMap<String, Vec<String>>,
 ) -> TxnFieldInfo {
@@ -2346,6 +2347,7 @@ fn txn_field_info_from_field_path(
         list,
         non_random: f.non_random,
         attrs: f.attrs.clone(),
+        when_guard,
     }
 }
 
@@ -2364,6 +2366,81 @@ fn txn_direct_fields(items: &[TxnBodyItem]) -> Vec<Field> {
             _ => None,
         })
         .collect()
+}
+
+fn txn_all_fields(items: &[TxnBodyItem]) -> Vec<Field> {
+    let mut out = Vec::new();
+    collect_txn_all_fields(items, &mut out);
+    out
+}
+
+fn collect_txn_all_fields(items: &[TxnBodyItem], out: &mut Vec<Field>) {
+    for item in items {
+        match item {
+            TxnBodyItem::Field(f) => out.push(f.clone()),
+            TxnBodyItem::When(w) => collect_txn_all_fields(&w.items, out),
+            TxnBodyItem::Keep(_) => {}
+        }
+    }
+}
+
+fn flatten_txn_body_field_infos(
+    items: &[TxnBodyItem],
+    record_fields: &std::collections::HashMap<String, Vec<Field>>,
+    enums: &std::collections::HashMap<String, usize>,
+    enum_domains: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<TxnFieldInfo> {
+    let mut out = Vec::new();
+    flatten_txn_body_field_infos_inner(
+        items,
+        Vec::new(),
+        None,
+        record_fields,
+        enums,
+        enum_domains,
+        &mut out,
+    );
+    out
+}
+
+fn flatten_txn_body_field_infos_inner(
+    items: &[TxnBodyItem],
+    prefix: Vec<String>,
+    when_guard: Option<Expr>,
+    record_fields: &std::collections::HashMap<String, Vec<Field>>,
+    enums: &std::collections::HashMap<String, usize>,
+    enum_domains: &std::collections::HashMap<String, Vec<String>>,
+    out: &mut Vec<TxnFieldInfo>,
+) {
+    for item in items {
+        match item {
+            TxnBodyItem::Field(f) => flatten_record_field_info_one(
+                f,
+                prefix.clone(),
+                when_guard.clone(),
+                record_fields,
+                enums,
+                enum_domains,
+                out,
+            ),
+            TxnBodyItem::When(w) => {
+                let next_guard = match &when_guard {
+                    Some(g) => and_join(&[g.clone(), w.discriminant.clone()], w.span),
+                    None => w.discriminant.clone(),
+                };
+                flatten_txn_body_field_infos_inner(
+                    &w.items,
+                    prefix.clone(),
+                    Some(next_guard),
+                    record_fields,
+                    enums,
+                    enum_domains,
+                    out,
+                );
+            }
+            TxnBodyItem::Keep(_) => {}
+        }
+    }
 }
 
 fn flatten_record_field_infos(
@@ -2393,25 +2470,51 @@ fn flatten_record_field_infos_inner(
     out: &mut Vec<TxnFieldInfo>,
 ) {
     for f in fields {
-        let mut path = prefix.clone();
-        path.push(f.name.name.clone());
-        if list_field_info(&f.ty).is_none() {
-            if let Some(record) = record_type_name(&f.ty).and_then(|name| record_fields.get(name)) {
-                if !enums.contains_key(record_type_name(&f.ty).unwrap_or_default()) {
-                    flatten_record_field_infos_inner(
-                        record,
-                        path,
-                        record_fields,
-                        enums,
-                        enum_domains,
-                        out,
-                    );
-                    continue;
-                }
+        flatten_record_field_info_one(
+            f,
+            prefix.clone(),
+            None,
+            record_fields,
+            enums,
+            enum_domains,
+            out,
+        );
+    }
+}
+
+fn flatten_record_field_info_one(
+    f: &Field,
+    prefix: Vec<String>,
+    when_guard: Option<Expr>,
+    record_fields: &std::collections::HashMap<String, Vec<Field>>,
+    enums: &std::collections::HashMap<String, usize>,
+    enum_domains: &std::collections::HashMap<String, Vec<String>>,
+    out: &mut Vec<TxnFieldInfo>,
+) {
+    let mut path = prefix;
+    path.push(f.name.name.clone());
+    if list_field_info(&f.ty).is_none() {
+        if let Some(record) = record_type_name(&f.ty).and_then(|name| record_fields.get(name)) {
+            if !enums.contains_key(record_type_name(&f.ty).unwrap_or_default()) {
+                flatten_record_field_infos_inner(
+                    record,
+                    path,
+                    record_fields,
+                    enums,
+                    enum_domains,
+                    out,
+                );
+                return;
             }
         }
-        out.push(txn_field_info_from_field_path(f, path, enums, enum_domains));
     }
+    out.push(txn_field_info_from_field_path(
+        f,
+        path,
+        when_guard,
+        enums,
+        enum_domains,
+    ));
 }
 
 #[derive(Debug, Clone)]
@@ -7496,14 +7599,7 @@ impl Emitter {
     /// `randomize_T(&t)` function. Transaction keeps are not emitted here;
     /// the call site merges them into the solver path.
     fn emit_transaction(&mut self, t: &TransactionDecl) {
-        let fields: Vec<Field> = t
-            .body
-            .iter()
-            .filter_map(|it| match it {
-                TxnBodyItem::Field(f) => Some(f.clone()),
-                _ => None,
-            })
-            .collect();
+        let fields = txn_all_fields(&t.body);
         self.emit_record_struct(&t.name.name, &fields);
         self.emit_record_randomize_fn(&t.name.name, &fields);
     }
@@ -8388,6 +8484,82 @@ impl Emitter {
         Expr::new(new_kind, span)
     }
 
+    fn enum_variants_as_ints(&self, expr: &Expr) -> Expr {
+        let span = expr.span;
+        if let ExprKind::Ident(id) = &*expr.kind {
+            if let Some(idx) = self.enum_variants.get(&id.name).copied() {
+                return Expr::new(ExprKind::Int(idx.to_string()), span);
+            }
+        }
+        let kind = match &*expr.kind {
+            ExprKind::Field { target, name } => ExprKind::Field {
+                target: self.enum_variants_as_ints(target),
+                name: name.clone(),
+            },
+            ExprKind::Index { target, index } => ExprKind::Index {
+                target: self.enum_variants_as_ints(target),
+                index: self.enum_variants_as_ints(index),
+            },
+            ExprKind::BitSlice { target, hi, lo } => ExprKind::BitSlice {
+                target: self.enum_variants_as_ints(target),
+                hi: self.enum_variants_as_ints(hi),
+                lo: self.enum_variants_as_ints(lo),
+            },
+            ExprKind::Call { callee, args } => ExprKind::Call {
+                callee: self.enum_variants_as_ints(callee),
+                args: args
+                    .iter()
+                    .map(|arg| match arg {
+                        CallArg::Expr(e) => CallArg::Expr(self.enum_variants_as_ints(e)),
+                        CallArg::Named { name, value } => CallArg::Named {
+                            name: name.clone(),
+                            value: self.enum_variants_as_ints(value),
+                        },
+                    })
+                    .collect(),
+            },
+            ExprKind::Cast { expr, ty } => ExprKind::Cast {
+                expr: self.enum_variants_as_ints(expr),
+                ty: ty.clone(),
+            },
+            ExprKind::Unary { op, expr } => ExprKind::Unary {
+                op: *op,
+                expr: self.enum_variants_as_ints(expr),
+            },
+            ExprKind::Binary { op, lhs, rhs } => ExprKind::Binary {
+                op: *op,
+                lhs: self.enum_variants_as_ints(lhs),
+                rhs: self.enum_variants_as_ints(rhs),
+            },
+            ExprKind::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => ExprKind::Ternary {
+                cond: self.enum_variants_as_ints(cond),
+                then_branch: self.enum_variants_as_ints(then_branch),
+                else_branch: self.enum_variants_as_ints(else_branch),
+            },
+            ExprKind::Paren(inner) => ExprKind::Paren(self.enum_variants_as_ints(inner)),
+            ExprKind::Membership { expr, set } => ExprKind::Membership {
+                expr: self.enum_variants_as_ints(expr),
+                set: self.enum_variants_as_ints(set),
+            },
+            ExprKind::SetLit(items) => ExprKind::SetLit(
+                items
+                    .iter()
+                    .map(|item| self.enum_variants_as_ints(item))
+                    .collect(),
+            ),
+            ExprKind::RangeLit { lo, hi } => ExprKind::RangeLit {
+                lo: lo.as_ref().map(|e| self.enum_variants_as_ints(e)),
+                hi: hi.as_ref().map(|e| self.enum_variants_as_ints(e)),
+            },
+            other => other.clone(),
+        };
+        Expr::new(kind, span)
+    }
+
     /// Emit an inline Z3 solver block for `randomize(t) with { ... }`.
     /// Each call builds a fresh Z3 context, declares one bitvector variable
     /// per field at its declared width, translates the constraint
@@ -8768,8 +8940,15 @@ impl Emitter {
             }
         }
 
-        // Translated constraints.
-        for c in &hard_constraints {
+        let (guarded_branch_constraints, base_hard_constraints): (Vec<&Expr>, Vec<&Expr>) =
+            hard_constraints
+                .iter()
+                .copied()
+                .partition(|c| guarded_constraint_guard(c).is_some());
+
+        // Translated base constraints. Guarded `when` branch constraints
+        // are added after a discriminator-only solve below.
+        for c in &base_hard_constraints {
             if let ExprKind::ForEachConstraint { var, iter, body } = &*c.kind {
                 self.emit_foreach_constraint_clauses(
                     ty,
@@ -8796,6 +8975,82 @@ impl Emitter {
                 &list_unroll_bounds,
             );
             writeln!(self.out, ");").ok();
+        }
+        if !guarded_branch_constraints.is_empty() {
+            let mut discriminator_fields = std::collections::HashSet::new();
+            for c in &guarded_branch_constraints {
+                if let Some(guard) = guarded_constraint_guard(c) {
+                    collect_randomize_target_field_refs(
+                        guard,
+                        &field_info,
+                        target_root,
+                        &mut discriminator_fields,
+                    );
+                }
+            }
+            if !discriminator_fields.is_empty() {
+                self.pad(depth + 1);
+                writeln!(
+                    self.out,
+                    "// discriminator-first when-subtype solve: pick guard fields before branch-local constraints"
+                )
+                .ok();
+                self.pad(depth + 1);
+                writeln!(self.out, "auto _when_r = _s.check();").ok();
+                self.pad(depth + 1);
+                writeln!(self.out, "if (_when_r == z3::sat) {{").ok();
+                self.pad(depth + 2);
+                writeln!(self.out, "z3::model _when_m = _s.get_model();").ok();
+                let mut discriminator_fields: Vec<String> =
+                    discriminator_fields.into_iter().collect();
+                discriminator_fields.sort();
+                for field in discriminator_fields {
+                    let Some(info) = field_info.get(&field) else {
+                        continue;
+                    };
+                    if info.list.is_some() || info.width == 0 {
+                        continue;
+                    }
+                    let c_name = c_ident(&field);
+                    self.pad(depth + 2);
+                    writeln!(
+                        self.out,
+                        "_s.add(_z_{} == _when_m.eval(_z_{}, true));",
+                        c_name, c_name
+                    )
+                    .ok();
+                }
+                self.pad(depth + 1);
+                writeln!(self.out, "}}").ok();
+            }
+            for c in &guarded_branch_constraints {
+                if let ExprKind::ForEachConstraint { var, iter, body } = &*c.kind {
+                    self.emit_foreach_constraint_clauses(
+                        ty,
+                        var,
+                        iter,
+                        body,
+                        &field_info,
+                        target_root,
+                        blocking,
+                        &list_unroll_bounds,
+                        solver_width,
+                        depth + 1,
+                    );
+                    continue;
+                }
+                self.pad(depth + 1);
+                write!(self.out, "_s.add(").ok();
+                self.emit_constraint_expr_with_list_bounds(
+                    c,
+                    &field_info,
+                    solver_width,
+                    target_root,
+                    blocking,
+                    &list_unroll_bounds,
+                );
+                writeln!(self.out, ");").ok();
+            }
         }
         for fields in &solve_order_directives {
             self.pad(depth + 1);
@@ -8852,6 +9107,7 @@ impl Emitter {
             .iter()
             .filter(|f| {
                 f.list.is_none() && f.width > 0 && !f.non_random && !pinned.contains(&f.name)
+                    && f.when_guard.is_none()
             })
             .collect();
         let free_field_names: std::collections::HashSet<String> =
@@ -9414,6 +9670,10 @@ impl Emitter {
         writeln!(self.out, "if (_r == z3::sat) {{").ok();
         self.pad(depth + 2);
         writeln!(self.out, "z3::model _m = _s.get_model();").ok();
+        let field_root_names: std::collections::HashSet<String> = field_info
+            .keys()
+            .filter_map(|name| name.split('.').next().map(str::to_string))
+            .collect();
         for f in &fields {
             let c_name = c_ident(&f.name);
             if f.non_random {
@@ -9519,11 +9779,25 @@ impl Emitter {
             if f.width == 0 {
                 continue;
             }
+            let guard_expr = f.when_guard.as_ref().map(|guard| {
+                self.enum_variants_as_ints(&prefix_record_keep_expr(
+                    guard,
+                    target,
+                    &field_root_names,
+                ))
+            });
+            let scalar_depth = if guard_expr.is_some() { depth + 3 } else { depth + 2 };
+            if let Some(guard) = &guard_expr {
+                self.pad(depth + 2);
+                write!(self.out, "if (").ok();
+                self.emit_expr(guard);
+                writeln!(self.out, ") {{   // active when-subtype field {}", f.name).ok();
+            }
             // Every declared field is assigned from the model — equality-
             // pinned fields take their constrained value; free fields take
             // a Z3-chosen satisfying value. Only free fields get pushed
             // into the diversity cache.
-            self.pad(depth + 2);
+            self.pad(scalar_depth);
             writeln!(
                 self.out,
                 "z3::expr _eval_{} = _m.eval(_z_{}, true).simplify();",
@@ -9532,14 +9806,14 @@ impl Emitter {
             .ok();
             if f.width <= 64 {
                 let val_ty = if f.signed { "int64_t" } else { "uint64_t" };
-                self.pad(depth + 2);
+                self.pad(scalar_depth);
                 writeln!(
                     self.out,
                     "uint64_t _raw_{} = harc_z3_bv_low_u64(_ctx, _eval_{});",
                     c_name, c_name
                 )
                 .ok();
-                self.pad(depth + 2);
+                self.pad(scalar_depth);
                 writeln!(
                     self.out,
                     "{} _val_{} = ({})_raw_{};",
@@ -9549,27 +9823,27 @@ impl Emitter {
             } else {
                 let val_ty = txn_field_solver_c_type(f);
                 let words = f.width.div_ceil(32);
-                self.pad(depth + 2);
+                self.pad(scalar_depth);
                 writeln!(
                     self.out,
                     "const char* _bin_{} = Z3_get_numeral_binary_string(_ctx, _eval_{});",
                     c_name, c_name
                 )
                 .ok();
-                self.pad(depth + 2);
+                self.pad(scalar_depth);
                 writeln!(self.out, "if (_bin_{} == nullptr) {{", c_name).ok();
-                self.pad(depth + 3);
+                self.pad(scalar_depth + 1);
                 writeln!(
                     self.out,
                     "sim_log_line(\"FAIL\", \"randomize(t) with: solver model for field '{}' is not a binary numeral\");",
                     escape_c(&f.name)
                 )
                 .ok();
-                self.pad(depth + 3);
+                self.pad(scalar_depth + 1);
                 writeln!(self.out, "errors++;").ok();
-                self.pad(depth + 2);
+                self.pad(scalar_depth);
                 writeln!(self.out, "}}").ok();
-                self.pad(depth + 2);
+                self.pad(scalar_depth);
                 writeln!(
                     self.out,
                     "{} _val_{} = ({})harc_rt::harc_wide_from_binary<{}>(_bin_{});",
@@ -9577,18 +9851,24 @@ impl Emitter {
                 )
                 .ok();
             }
-            self.pad(depth + 2);
+            self.pad(scalar_depth);
             write!(self.out, "").ok();
             self.emit_target_field_access(target, f);
             writeln!(self.out, " = _val_{};", c_name).ok();
             if !pinned.contains(&f.name) {
+                if f.when_guard.is_none() {
+                    self.pad(scalar_depth);
+                    writeln!(
+                        self.out,
+                        "{cache_tag}_{}.push_back(_val_{});",
+                        c_name, c_name
+                    )
+                    .ok();
+                }
+            }
+            if guard_expr.is_some() {
                 self.pad(depth + 2);
-                writeln!(
-                    self.out,
-                    "{cache_tag}_{}.push_back(_val_{});",
-                    c_name, c_name
-                )
-                .ok();
+                writeln!(self.out, "}}").ok();
             }
         }
         for goal in &auto_goals {
@@ -9624,6 +9904,26 @@ impl Emitter {
             "sim_log_line(\"FAIL\", \"randomize(t) with: constraint UNSAT\");"
         )
         .ok();
+        let mut when_guards: Vec<String> = fields
+            .iter()
+            .filter_map(|f| f.when_guard.as_ref().map(expr_source_str))
+            .collect();
+        when_guards.extend(
+            hard_constraints
+                .iter()
+                .filter_map(|expr| guarded_constraint_guard(expr).map(expr_source_str)),
+        );
+        when_guards.sort();
+        when_guards.dedup();
+        for guard in when_guards {
+            self.pad(depth + 2);
+            writeln!(
+                self.out,
+                "sim_log_line(\"FAIL\", \"randomize(t) with: active when subtype guard `{}` participated in the solve\");",
+                escape_c(&guard)
+            )
+            .ok();
+        }
         self.pad(depth + 2);
         writeln!(self.out, "errors++;").ok();
         self.pad(depth + 1);
@@ -15387,6 +15687,28 @@ fn guarded_keep_expr(guard: Expr, keep: Expr, span: Span) -> Expr {
         },
         span,
     )
+}
+
+fn guarded_constraint_guard(expr: &Expr) -> Option<&Expr> {
+    let ExprKind::Binary {
+        op: BinaryOp::OrOr,
+        lhs,
+        ..
+    } = &*expr.kind
+    else {
+        return None;
+    };
+    let ExprKind::Unary {
+        op: UnaryOp::Not,
+        expr,
+    } = &*lhs.kind
+    else {
+        return None;
+    };
+    match &*expr.kind {
+        ExprKind::Paren(inner) => Some(inner),
+        _ => Some(expr),
+    }
 }
 
 /// Combine a list of constraint expressions into one
