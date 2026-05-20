@@ -7,6 +7,7 @@
 //! Z3 directly from raw syntax.
 
 pub mod typed;
+pub mod typed_lower;
 
 use std::collections::BTreeMap;
 
