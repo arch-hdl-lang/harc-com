@@ -153,7 +153,6 @@ pub enum CExprKind {
     InRange { expr: Box<CTypedExpr>, lo: Option<Box<CTypedExpr>>, hi: Option<Box<CTypedExpr>> },
     Set(Vec<CTypedExpr>),
     Range { lo: Option<Box<CTypedExpr>>, hi: Option<Box<CTypedExpr>> },
-    RelationApply { name: RelationId, args: Vec<CTypedExpr> },   // monomorphic; expanded at lower-time
     FieldMethodCall { target: Box<CTypedExpr>, method: BuiltinMethod, args: Vec<CTypedExpr> },
     ForAll { var: LocalId, iter: Box<CTypedExpr>, body: Box<CTypedExpr> },
     // foreach lowers to ForAll once the iter range is known.
@@ -272,9 +271,10 @@ The lowering merges, in order:
    the body becomes one `CTypedClause`).
 4. Field-attribute-derived constraints (`[range]`, `[within]`).
 
-Relation calls are expanded at lower-time (`RelationApply` resolves
-to a fresh substitution into the relation body, inlined into the
-current problem). Recursive relations are an error.
+Relation calls are expanded at lower-time by substituting actual
+arguments into the relation body and inlining the result into the
+current problem. No `RelationApply` node is present in finished typed
+IR. Recursive relations are an error.
 
 ### Per-AST-node lowering rules
 
@@ -293,7 +293,7 @@ current problem). Recursive relations are an error.
 | `UnaryOp(~, a)` | `Unary(BitNot, a)` | a must be BV. |
 | `expr in [a, b, c]` | `InSet { expr, set: Set([a,b,c]) }` | Set elem-type must match expr. |
 | `expr in [lo .. hi]` | `InRange { expr, lo, hi }` | lo/hi must be BV matching expr. Open range allowed (`Option`). |
-| `relation(args...)` | Expand to inlined `RelationApply` body | Recursive relations rejected. |
+| `relation(args...)` | Expand to inlined body expressions | Recursive relations rejected. Block-form relations at top level contribute one clause per body expression; nested block-form calls collapse to an `&&` chain. |
 | `target.method(args)` | `FieldMethodCall { target, method, args }` | v1 supports `Len` only; everything else rejected. |
 | `foreach (var in iter) <body>` | `ForAll { var, iter, body }` | Only valid as a top-level clause; iter must be a literal-bounded range or a `Len`-bounded aggregate. |
 
@@ -388,7 +388,6 @@ same surface.
 | `Unary(LogicalNot, a)` | `(not a)` |
 | `InRange { expr, lo, hi }` | `(and (bvule lo expr) (bvule expr hi))` for unsigned; signed picks `bvsle` |
 | `InSet { expr, Set(es) }` | `(or (= expr e0) (= expr e1) ...)` |
-| `RelationApply` | should not appear (expanded earlier); verifier rejects |
 | `FieldMethodCall { Len }` | the aggregate's length field |
 | `ForAll { var, iter: Range(lo, hi), body }` | unrolled `(and body[var↦lo] body[var↦lo+1] ...)`; iter must be statically bounded |
 
