@@ -18,11 +18,10 @@
 //!   - `in` membership against `Set` and `Range`
 //!   - set and range literals
 //!   - relation application, including recursive alias/block expansion
+//!   - list `.len()` and foreach-list item constraints
 //!
 //! Explicitly out of scope for this phase (structured `LowerError`,
 //! never a panic):
-//!   - field-method calls (`items.len()`)             — Phase 2b
-//!   - foreach / ForAll                                 — Phase 2c
 //!   - `when` subtype guards                            — Phase 7
 //!
 //! Errors are collected (up to `MAX_ERRORS`) and returned as
@@ -125,6 +124,8 @@ struct LowerCtx<'a> {
     /// in a single global namespace).
     enum_variant_lookup: BTreeMap<String, (EnumDomainId, u32)>,
     next_clause_seq: u32,
+    next_local_id: u32,
+    locals: BTreeMap<String, (LocalId, CType)>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -164,6 +165,8 @@ pub fn lower_problem(
         errors: Vec::new(),
         enum_variant_lookup: build_enum_variant_lookup(elab),
         next_clause_seq: 0,
+        next_local_id: 0,
+        locals: BTreeMap::new(),
     };
 
     // Re-bind `env.enums` after the variant lookup is built — both use
@@ -287,6 +290,15 @@ fn ctype_from_field_schema(
         FieldTypeClass::Bool => CType::Bool,
         FieldTypeClass::Bit => CType::uint(1),
         FieldTypeClass::Int => CType::sint(32),
+        FieldTypeClass::List => {
+            let Some(list) = &schema.list else {
+                return CType::Bottom;
+            };
+            CType::List {
+                elem: Box::new(ctype_from_field_schema(&list.elem, domain_id_by_name)),
+                max_len: list.max_len,
+            }
+        }
         FieldTypeClass::Enum => {
             let dom = schema
                 .enum_domain
@@ -427,12 +439,8 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &Expr) -> CTypedExpr {
         // Calls are limited to relation applications for now. Field
         // methods and other call shapes remain structured errors; no panic.
         ExprKind::Call { callee, .. } => match &*callee.kind {
-            ExprKind::Field { .. } => {
-                ctx.record_error(LowerError::UnsupportedV1 {
-                    feature: "field-method call (e.g. .len())",
-                    span,
-                });
-                ctx.bottom(span, CExprKind::BoolLit(false))
+            ExprKind::Field { target, name } => {
+                lower_field_method_call(ctx, target, &name.name, expr, span)
             }
             ExprKind::Ident(id) => {
                 match expand_relation_call_as_expr(ctx, &id.name, expr, &mut Vec::new()) {
@@ -449,6 +457,10 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &Expr) -> CTypedExpr {
             }
         },
 
+        ExprKind::ForEachConstraint { var, iter, body } => {
+            lower_foreach_constraint(ctx, &var.name, iter, body, span)
+        }
+
         // Everything else in ExprKind that doesn't belong inside a
         // constraint body: ImplicitSelf, Index, BitSlice, ForkCall, Cast,
         // and a long tail of TB-only constructs.  Structured error.
@@ -463,7 +475,11 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &Expr) -> CTypedExpr {
 }
 
 fn lower_ident(ctx: &mut LowerCtx<'_>, name: &str, span: Span) -> CTypedExpr {
-    // 1. Enum variant?  Bare names in constraint bodies typically
+    // 1. Foreach local?
+    if let Some((local, ty)) = ctx.locals.get(name) {
+        return CTypedExpr::new(CExprKind::LocalRef(*local), ty.clone(), span);
+    }
+    // 2. Enum variant?  Bare names in constraint bodies typically
     //    resolve to enum variants when they aren't field paths.
     if let Some(&(domain, variant_idx)) = ctx.enum_variant_lookup.get(name) {
         return CTypedExpr::new(
@@ -475,12 +491,12 @@ fn lower_ident(ctx: &mut LowerCtx<'_>, name: &str, span: Span) -> CTypedExpr {
             span,
         );
     }
-    // 2. Bare field of the target record?
+    // 3. Bare field of the target record?
     let path = FieldPath::single(name);
     if let Some(info) = ctx.env.lookup(&path) {
         return CTypedExpr::new(CExprKind::FieldRef(path), info.ty.clone(), span);
     }
-    // 3. Unresolved.
+    // 4. Unresolved.
     ctx.record_error(LowerError::UnresolvedIdent {
         name: name.to_string(),
         span,
@@ -519,6 +535,149 @@ fn lower_field_access(ctx: &mut LowerCtx<'_>, target: &Expr, name: &str, span: S
         span,
     });
     ctx.bottom(span, CExprKind::FieldRef(full))
+}
+
+fn lower_field_method_call(
+    ctx: &mut LowerCtx<'_>,
+    target: &Expr,
+    method: &str,
+    call: &Expr,
+    span: Span,
+) -> CTypedExpr {
+    let ExprKind::Call { args, .. } = &*call.kind else {
+        return ctx.bottom(span, CExprKind::BoolLit(false));
+    };
+    let target_expr = lower_expr(ctx, target);
+    let lowered_args: Vec<CTypedExpr> = args
+        .iter()
+        .map(|arg| match arg {
+            CallArg::Expr(e) | CallArg::Named { value: e, .. } => lower_expr(ctx, e),
+        })
+        .collect();
+
+    match method {
+        "len" => {
+            if !matches!(target_expr.ty, CType::List { .. }) {
+                ctx.record_error(LowerError::UnsupportedV1 {
+                    feature: "len() on non-list field",
+                    span,
+                });
+                return CTypedExpr::new(
+                    CExprKind::FieldMethodCall {
+                        target: Box::new(target_expr),
+                        method: BuiltinMethod::Len,
+                        args: lowered_args,
+                    },
+                    CType::Bottom,
+                    span,
+                );
+            }
+            if !lowered_args.is_empty() {
+                ctx.record_error(LowerError::UnsupportedV1 {
+                    feature: "len() arguments",
+                    span,
+                });
+            }
+            CTypedExpr::new(
+                CExprKind::FieldMethodCall {
+                    target: Box::new(target_expr),
+                    method: BuiltinMethod::Len,
+                    args: lowered_args,
+                },
+                CType::uint(32),
+                span,
+            )
+        }
+        _ => {
+            ctx.record_error(LowerError::UnsupportedV1 {
+                feature: "field method",
+                span,
+            });
+            ctx.bottom(span, CExprKind::BoolLit(false))
+        }
+    }
+}
+
+fn lower_foreach_constraint(
+    ctx: &mut LowerCtx<'_>,
+    var: &str,
+    iter: &Expr,
+    body: &[Expr],
+    span: Span,
+) -> CTypedExpr {
+    let iter_expr = lower_expr(ctx, iter);
+    let elem_ty = match &iter_expr.ty {
+        CType::List { elem, .. } | CType::Set { elem } | CType::Range { elem } => {
+            elem.as_ref().clone()
+        }
+        other => {
+            let body_ty = if other.is_bottom() {
+                CType::Bottom
+            } else {
+                CType::Bool
+            };
+            ctx.record_error(LowerError::UnsupportedV1 {
+                feature: "foreach over non-iterable constraint expression",
+                span: iter.span,
+            });
+            let local = LocalId(ctx.next_local_id);
+            ctx.next_local_id += 1;
+            return CTypedExpr::new(
+                CExprKind::ForAll {
+                    var: local,
+                    iter: Box::new(iter_expr),
+                    body: Box::new(CTypedExpr::new(CExprKind::BoolLit(false), body_ty, span)),
+                },
+                CType::Bottom,
+                span,
+            );
+        }
+    };
+
+    let local = LocalId(ctx.next_local_id);
+    ctx.next_local_id += 1;
+    let prior = ctx.locals.insert(var.to_string(), (local, elem_ty));
+    let body_exprs: Vec<CTypedExpr> = body.iter().map(|e| lower_top_clause(ctx, e)).collect();
+    if let Some(old) = prior {
+        ctx.locals.insert(var.to_string(), old);
+    } else {
+        ctx.locals.remove(var);
+    }
+
+    let body_expr = and_join_typed(body_exprs, span);
+    CTypedExpr::new(
+        CExprKind::ForAll {
+            var: local,
+            iter: Box::new(iter_expr),
+            body: Box::new(body_expr),
+        },
+        CType::Bool,
+        span,
+    )
+}
+
+fn and_join_typed(exprs: Vec<CTypedExpr>, span: Span) -> CTypedExpr {
+    let mut iter = exprs.into_iter();
+    let Some(mut acc) = iter.next() else {
+        return CTypedExpr::new(CExprKind::BoolLit(true), CType::Bool, span);
+    };
+    for next in iter {
+        let ty = if acc.ty.is_bool() && next.ty.is_bool() {
+            CType::Bool
+        } else {
+            CType::Bottom
+        };
+        acc = CTypedExpr::new(
+            CExprKind::Binary {
+                op: CBinaryOp::LogicalAnd,
+                lhs: Box::new(acc),
+                rhs: Box::new(next),
+            },
+            ty,
+            span,
+        );
+    }
+    acc
 }
 
 fn collect_dotted(expr: &Expr) -> Option<Vec<String>> {
@@ -1496,6 +1655,16 @@ mod tests {
         )
     }
 
+    fn lower_bare_txn(src: &str) -> Result<CTypedProblem, Vec<LowerError>> {
+        let elab = elaborate(src);
+        let txn = elab
+            .transactions
+            .first()
+            .expect("test source must declare a transaction")
+            .clone();
+        lower_problem(&elab, &txn, None, Span::default(), ConstraintProblemId(0))
+    }
+
     #[test]
     fn lowers_simple_eq() {
         let src = r#"
@@ -1685,6 +1854,48 @@ relation Legal(r: Req) = Bounded(r) && HighAddr(r)
         let display = format!("{}", problem.constraints[0].expr);
         assert!(
             display.contains("&&") && display.contains("len") && display.contains("addr"),
+            "got: {display}"
+        );
+    }
+
+    #[test]
+    fn lowers_list_len_method() {
+        let src = r#"
+transaction Packet
+  items : list<uint<8>>
+end transaction Packet
+"#;
+        let problem = lower_with_body(src, &["p.items.len() <= 4"]).expect("len should lower");
+        assert_eq!(problem.constraints.len(), 1);
+        assert_eq!(problem.constraints[0].expr.ty, CType::Bool);
+        let display = format!("{}", problem.constraints[0].expr);
+        assert!(
+            display.contains(".len()") && display.contains("4:u32"),
+            "got: {display}"
+        );
+    }
+
+    #[test]
+    fn lowers_foreach_list_item_constraints() {
+        let src = r#"
+transaction Packet
+  items : list<uint<8>>
+  keep for item in items
+    item <= 10
+  end for
+end transaction Packet
+"#;
+        let problem = lower_bare_txn(src).expect("foreach should lower");
+        assert_eq!(problem.constraints.len(), 1);
+        assert_eq!(problem.constraints[0].expr.ty, CType::Bool);
+        let CExprKind::ForAll { iter, body, .. } = &problem.constraints[0].expr.kind else {
+            panic!("expected ForAll, got {}", problem.constraints[0].expr);
+        };
+        assert!(matches!(iter.ty, CType::List { .. }), "iter: {iter}");
+        assert_eq!(body.ty, CType::Bool);
+        let display = format!("{}", body);
+        assert!(
+            display.contains("%0:u8") && display.contains("10:u8"),
             "got: {display}"
         );
     }

@@ -40,9 +40,6 @@ The doc does **not** cover:
 
 - Constraint *syntax* — the surface language is fixed by the parser
   and spec.
-- Future aggregate constraints (random lists, `items.len()`, etc.) —
-  the IR shape is forward-compatible, but specific lowering rules wait
-  on that syntax landing.
 - The TB-IR control-flow layer — see `tb-ir-design.md`.
 
 ## Current state audit
@@ -160,6 +157,7 @@ pub enum CExprKind {
 
 pub enum CType {
     BV { width: u32, sign: Sign },        // covers UInt<N>, SInt<N>, Bits<N>, Bit
+    List { elem: Box<CType>, max_len: Option<usize> },
     Bool,
     Enum { domain: EnumDomainId },
     Range { elem: Box<CType> },           // value-typed range expression
@@ -187,7 +185,7 @@ pub enum CBinaryOp {
 }
 
 pub enum BuiltinMethod {
-    Len,           // future aggregate: items.len() → BV(unsigned)
+    Len,           // list aggregate: items.len() → BV(unsigned)
     // … extension point for spec-defined record/aggregate methods
 }
 
@@ -294,8 +292,8 @@ IR. Recursive relations are an error.
 | `expr in [a, b, c]` | `InSet { expr, set: Set([a,b,c]) }` | Set elem-type must match expr. |
 | `expr in [lo .. hi]` | `InRange { expr, lo, hi }` | lo/hi must be BV matching expr. Open range allowed (`Option`). |
 | `relation(args...)` | Expand to inlined body expressions | Recursive relations rejected. Block-form relations at top level contribute one clause per body expression; nested block-form calls collapse to an `&&` chain. |
-| `target.method(args)` | `FieldMethodCall { target, method, args }` | v1 supports `Len` only; everything else rejected. |
-| `foreach (var in iter) <body>` | `ForAll { var, iter, body }` | Only valid as a top-level clause; iter must be a literal-bounded range or a `Len`-bounded aggregate. |
+| `target.method(args)` | `FieldMethodCall { target, method, args }` | v1 supports list `Len` only; everything else rejected. |
+| `foreach (var in iter) <body>` | `ForAll { var, iter, body }` | Only valid as a top-level clause; v1 supports list, set, and range iterables. |
 
 ### Type-error diagnostics
 
@@ -388,8 +386,8 @@ same surface.
 | `Unary(LogicalNot, a)` | `(not a)` |
 | `InRange { expr, lo, hi }` | `(and (bvule lo expr) (bvule expr hi))` for unsigned; signed picks `bvsle` |
 | `InSet { expr, Set(es) }` | `(or (= expr e0) (= expr e1) ...)` |
-| `FieldMethodCall { Len }` | the aggregate's length field |
-| `ForAll { var, iter: Range(lo, hi), body }` | unrolled `(and body[var↦lo] body[var↦lo+1] ...)`; iter must be statically bounded |
+| `FieldMethodCall { Len }` | the list aggregate's length field |
+| `ForAll { var, iter, body }` | unrolled by solver lowering; iter must be statically bounded or list-bound |
 
 ### Named assertions and UNSAT origins
 
@@ -699,12 +697,11 @@ harc_solve_queued(c, /*pid=*/P_CMDREQ_0, /*seed=*/sd);
    error? Stopping risks under-reporting; continuing risks cascade
    noise. Proposed: collect up to 5 diagnostics, then stop. Tunable.
 
-2. **Aggregate length field representation.** Future `items :
-   list<uint<8>>` syntax wants `items.len()` as a field-like reference.
-   Today the IR has no `Aggregate` type. Forward-compat plan: add
-   `CType::Aggregate { elem, len_field }` and `FieldMethodCall { Len }`
-   resolves to a `FieldRef` on `len_field`. Pinning this in v1 even
-   without surface syntax avoids a future IR break.
+2. **Aggregate length field representation.** `items : list<uint<8>>`
+   now lowers as `CType::List { elem, max_len }`, and `items.len()` lowers
+   to `FieldMethodCall { Len }` with an unsigned BV result. Later solver
+   backends may choose whether to materialize that as a synthetic length
+   field or a backend-native aggregate operation.
 
 3. **Soft preferences and seed determinism.** Auto-coverage soft prefs
    today derive from `harc_rng_next()` at emission time — meaning the

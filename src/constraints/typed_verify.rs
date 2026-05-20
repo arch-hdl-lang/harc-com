@@ -631,7 +631,9 @@ impl<'a> Verifier<'a> {
                 found: ty.clone(),
                 span,
             }),
-            CType::Range { elem } | CType::Set { elem } => self.check_type_concrete(elem, span),
+            CType::Range { elem } | CType::Set { elem } | CType::List { elem, .. } => {
+                self.check_type_concrete(elem, span)
+            }
             CType::Enum { domain } => {
                 if self.problem.env.enum_by_id(*domain).is_none() {
                     self.push(VerifyError::EnumDomainNotFound {
@@ -661,6 +663,7 @@ impl<'a> Verifier<'a> {
 fn iterable_elem_type(ty: &CType) -> Option<CType> {
     match ty {
         CType::Set { elem } | CType::Range { elem } => Some(elem.as_ref().clone()),
+        CType::List { elem, .. } => Some(elem.as_ref().clone()),
         _ => None,
     }
 }

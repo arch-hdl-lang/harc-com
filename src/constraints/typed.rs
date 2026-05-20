@@ -94,13 +94,28 @@ impl fmt::Display for Sign {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CType {
     /// Covers `uint<N>`, `sint<N>`, `bits<N>`, `bit`.
-    BV { width: u32, sign: Sign },
+    BV {
+        width: u32,
+        sign: Sign,
+    },
     Bool,
-    Enum { domain: EnumDomainId },
+    Enum {
+        domain: EnumDomainId,
+    },
     /// Value-typed range (e.g. the rhs of `x in [lo .. hi]`).
-    Range { elem: Box<CType> },
+    Range {
+        elem: Box<CType>,
+    },
     /// Bag of values of homogeneous type (rhs of `x in [a, b, c]`).
-    Set { elem: Box<CType> },
+    Set {
+        elem: Box<CType>,
+    },
+    /// Aggregate list field. The optional max length is source metadata
+    /// used by later solver lowering; `len()` currently returns `u32`.
+    List {
+        elem: Box<CType>,
+        max_len: Option<usize>,
+    },
     /// Type-error marker.  Verifier rejects any problem containing
     /// `Bottom`.
     Bottom,
@@ -112,11 +127,17 @@ impl CType {
     }
 
     pub fn uint(width: u32) -> Self {
-        CType::BV { width, sign: Sign::Unsigned }
+        CType::BV {
+            width,
+            sign: Sign::Unsigned,
+        }
     }
 
     pub fn sint(width: u32) -> Self {
-        CType::BV { width, sign: Sign::Signed }
+        CType::BV {
+            width,
+            sign: Sign::Signed,
+        }
     }
 
     pub fn enum_(domain: EnumDomainId) -> Self {
@@ -152,6 +173,10 @@ impl fmt::Display for CType {
             CType::Enum { domain } => write!(f, "enum#{}", domain.0),
             CType::Range { elem } => write!(f, "range<{elem}>"),
             CType::Set { elem } => write!(f, "set<{elem}>"),
+            CType::List { elem, max_len } => match max_len {
+                Some(n) => write!(f, "list<{elem}, max={n}>"),
+                None => write!(f, "list<{elem}>"),
+            },
             CType::Bottom => f.write_str("⊥"),
         }
     }
@@ -231,9 +256,7 @@ impl fmt::Display for CBinaryOp {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinMethod {
-    /// `aggregate.len()` — future aggregate-constraint support.  v1
-    /// reserves the variant; the lowering layer rejects calls in v1
-    /// until aggregate syntax lands.
+    /// `aggregate.len()` — currently used for list-valued fields.
     Len,
 }
 
@@ -318,9 +341,14 @@ impl fmt::Display for CTypedExpr {
 pub enum CExprKind {
     /// Numeric literal with width inferred at lowering.  Value is held
     /// as `u128`; the `ty` field carries width + sign.
-    BvLit { value: u128 },
+    BvLit {
+        value: u128,
+    },
     BoolLit(bool),
-    EnumLit { domain: EnumDomainId, variant_idx: u32 },
+    EnumLit {
+        domain: EnumDomainId,
+        variant_idx: u32,
+    },
     FieldRef(FieldPath),
     LocalRef(LocalId),
     Unary {
@@ -366,7 +394,10 @@ impl fmt::Display for CExprKind {
         match self {
             CExprKind::BvLit { value } => write!(f, "{value}"),
             CExprKind::BoolLit(b) => write!(f, "{b}"),
-            CExprKind::EnumLit { domain, variant_idx } => {
+            CExprKind::EnumLit {
+                domain,
+                variant_idx,
+            } => {
                 write!(f, "enum#{}.{variant_idx}", domain.0)
             }
             CExprKind::FieldRef(p) => write!(f, "{p}"),
@@ -408,7 +439,11 @@ impl fmt::Display for CExprKind {
                 }
                 f.write_str("]")
             }
-            CExprKind::FieldMethodCall { target, method, args } => {
+            CExprKind::FieldMethodCall {
+                target,
+                method,
+                args,
+            } => {
                 write!(f, "{target}.{method}(")?;
                 for (i, a) in args.iter().enumerate() {
                     if i > 0 {
@@ -439,7 +474,13 @@ pub struct CTypedClause {
 
 impl fmt::Display for CTypedClause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{}] {} := {}", self.assertion_name, origin_short(&self.origin), self.expr)
+        write!(
+            f,
+            "[{}] {} := {}",
+            self.assertion_name,
+            origin_short(&self.origin),
+            self.expr
+        )
     }
 }
 
@@ -579,10 +620,33 @@ mod tests {
         assert_eq!(format!("{}", CType::uint(8)), "u8");
         assert_eq!(format!("{}", CType::sint(32)), "s32");
         assert_eq!(format!("{}", CType::Bool), "bool");
-        assert_eq!(format!("{}", CType::Enum { domain: EnumDomainId(3) }), "enum#3");
         assert_eq!(
-            format!("{}", CType::Set { elem: Box::new(CType::uint(4)) }),
+            format!(
+                "{}",
+                CType::Enum {
+                    domain: EnumDomainId(3)
+                }
+            ),
+            "enum#3"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                CType::Set {
+                    elem: Box::new(CType::uint(4))
+                }
+            ),
             "set<u4>"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                CType::List {
+                    elem: Box::new(CType::uint(8)),
+                    max_len: Some(4)
+                }
+            ),
+            "list<u8, max=4>"
         );
         assert_eq!(format!("{}", CType::Bottom), "⊥");
     }
@@ -684,7 +748,10 @@ mod tests {
             },
             env,
             constraints: vec![clause],
-            solve_order: Some(vec![FieldPath::of("p", "addr"), FieldPath::of("p", "value")]),
+            solve_order: Some(vec![
+                FieldPath::of("p", "addr"),
+                FieldPath::of("p", "value"),
+            ]),
         };
 
         let out = format!("{problem}");
@@ -699,8 +766,7 @@ mod tests {
 
     #[test]
     fn id_ordering_is_deterministic() {
-        let mut ids: Vec<EnumDomainId> =
-            (0..5).rev().map(EnumDomainId).collect();
+        let mut ids: Vec<EnumDomainId> = (0..5).rev().map(EnumDomainId).collect();
         ids.sort();
         assert_eq!(
             ids,
