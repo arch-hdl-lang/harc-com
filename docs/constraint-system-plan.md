@@ -106,6 +106,10 @@ preference sampling without changing the hard solution space; richer
 distribution effects can be added in the typed solver backend once sampling
 order is explicit.
 
+Because `solve_order` only affects free-field preference sampling, fields that
+are non-random, aggregate/list-valued, or equality-pinned by hard constraints
+are rejected with diagnostics instead of being silently ignored.
+
 Auto coverage goals are solver preferences, not hard constraints. The v1
 runtime derives goals for enum variants, bool values, literal `[range]`
 min/max endpoints, and natural numeric min/max endpoints where the solver path
@@ -155,6 +159,9 @@ legal value space is exhausted, then clear/recycle history and retry rather
 than reporting UNSAT. The runtime history should be designed so a future
 solver-result cache can be queried across a selected group of tests without
 making type-level attributes impossible to override.
+Generated state should include the declared uniqueness scope, such as
+`within test`, so future broader scopes can be introduced without changing the
+meaning of existing tests.
 
 ## Queued vs Blocking Randomize
 
