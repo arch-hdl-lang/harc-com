@@ -639,6 +639,33 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     writeln!(e.out, "{INDENT}for (auto& b : bins) {{ acc += std::get<2>(b); if (pick < acc) return harc_rng_range(std::get<0>(b), std::get<1>(b)); }}").ok();
     writeln!(e.out, "{INDENT}return std::get<0>(bins.front());").ok();
     writeln!(e.out, "}}").ok();
+    if uses_solver {
+        writeln!(e.out, "static inline z3::expr harc_z3_bv_words(z3::context& ctx, const uint32_t* words, size_t word_count, unsigned width) {{").ok();
+        writeln!(e.out, "{INDENT}z3::expr out = ctx.bv_val((uint64_t)0, width);").ok();
+        writeln!(e.out, "{INDENT}for (size_t i = 0; i < word_count; ++i) {{").ok();
+        writeln!(e.out, "{INDENT}{INDENT}if (words[i] == 0) continue;").ok();
+        writeln!(e.out, "{INDENT}{INDENT}z3::expr part = ctx.bv_val((uint64_t)words[i], width);").ok();
+        writeln!(e.out, "{INDENT}{INDENT}if (i != 0) part = z3::shl(part, ctx.bv_val((uint64_t)(i * 32), width));").ok();
+        writeln!(e.out, "{INDENT}{INDENT}out = out | part;").ok();
+        writeln!(e.out, "{INDENT}}}").ok();
+        writeln!(e.out, "{INDENT}return out;").ok();
+        writeln!(e.out, "}}").ok();
+        writeln!(e.out, "static inline z3::expr harc_z3_bv_value(z3::context& ctx, uint64_t v, unsigned width) {{").ok();
+        writeln!(e.out, "{INDENT}uint32_t words[2] = {{static_cast<uint32_t>(v), static_cast<uint32_t>(v >> 32)}};").ok();
+        writeln!(e.out, "{INDENT}return harc_z3_bv_words(ctx, words, 2, width);").ok();
+        writeln!(e.out, "}}").ok();
+        writeln!(e.out, "static inline z3::expr harc_z3_bv_value(z3::context& ctx, int64_t v, unsigned width) {{").ok();
+        writeln!(e.out, "{INDENT}return harc_z3_bv_value(ctx, static_cast<uint64_t>(v), width);").ok();
+        writeln!(e.out, "}}").ok();
+        writeln!(e.out, "static inline z3::expr harc_z3_bv_value(z3::context& ctx, _harc_u128 v, unsigned width) {{").ok();
+        writeln!(e.out, "{INDENT}uint32_t words[4] = {{static_cast<uint32_t>(v), static_cast<uint32_t>(v >> 32), static_cast<uint32_t>(v >> 64), static_cast<uint32_t>(v >> 96)}};").ok();
+        writeln!(e.out, "{INDENT}return harc_z3_bv_words(ctx, words, 4, width);").ok();
+        writeln!(e.out, "}}").ok();
+        writeln!(e.out, "template<size_t N>").ok();
+        writeln!(e.out, "static inline z3::expr harc_z3_bv_value(z3::context& ctx, const harc_rt::HarcWide<N>& v, unsigned width) {{").ok();
+        writeln!(e.out, "{INDENT}return harc_z3_bv_words(ctx, v.words.data(), v.words.size(), width);").ok();
+        writeln!(e.out, "}}").ok();
+    }
     writeln!(e.out, "").ok();
 
     // ── Semantic trace runtime ───────────────────────────────────────────
@@ -2365,6 +2392,7 @@ struct AutoCoverageGoal {
 struct AutoCoverageValue {
     label: String,
     c_expr: String,
+    words: Vec<u32>,
 }
 
 impl AutoCoverageValue {
@@ -2372,6 +2400,7 @@ impl AutoCoverageValue {
         Self {
             label: value.to_string(),
             c_expr: format!("{value}ULL"),
+            words: vec![value as u32, (value >> 32) as u32],
         }
     }
 
@@ -2379,12 +2408,49 @@ impl AutoCoverageValue {
         Self {
             label: value.to_string(),
             c_expr: if value == i64::MIN {
-                "(uint64_t)0x8000000000000000ULL".to_string()
+                "INT64_MIN".to_string()
             } else if value < 0 {
-                format!("(uint64_t)({value}LL)")
+                format!("{value}LL")
             } else {
-                format!("{value}ULL")
+                format!("{value}LL")
             },
+            words: vec![value as u32, ((value as u64) >> 32) as u32],
+        }
+    }
+
+    fn from_words(label: String, words: Vec<u32>) -> Self {
+        let c_expr = if words.len() <= 2 {
+            let lo = words.first().copied().unwrap_or(0) as u64;
+            let hi = words.get(1).copied().unwrap_or(0) as u64;
+            format!("{}ULL", lo | (hi << 32))
+        } else if words.len() <= 4 {
+            let mut terms = Vec::new();
+            for (idx, word) in words.iter().enumerate() {
+                if *word == 0 {
+                    continue;
+                }
+                terms.push(format!("((_harc_u128)0x{word:08x}ULL << {})", idx * 32));
+            }
+            if terms.is_empty() {
+                "(_harc_u128)0".to_string()
+            } else {
+                terms.join(" | ")
+            }
+        } else {
+            format!(
+                "harc_rt::HarcWide<{}>({{{}}})",
+                words.len(),
+                words
+                    .iter()
+                    .map(|w| format!("0x{w:08x}u"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        Self {
+            label,
+            c_expr,
+            words,
         }
     }
 }
@@ -2580,13 +2646,13 @@ fn field_attr_unique(f: &TxnFieldInfo) -> bool {
 }
 
 fn push_auto_coverage_value_unique(values: &mut Vec<AutoCoverageValue>, value: AutoCoverageValue) {
-    if !values.iter().any(|v| v.c_expr == value.c_expr) {
+    if !values.iter().any(|v| v.words == value.words) {
         values.push(value);
     }
 }
 
 fn walking_auto_coverage_bit_positions(width: u32) -> Vec<u32> {
-    if width == 0 || width > 64 {
+    if width == 0 {
         return Vec::new();
     }
     let width_usize = width as usize;
@@ -2608,12 +2674,87 @@ fn walking_auto_coverage_bit_positions(width: u32) -> Vec<u32> {
     positions
 }
 
+fn unsigned_max_words(width: u32) -> Vec<u32> {
+    let word_count = (width as usize).div_ceil(32).max(1);
+    let mut words = vec![0xffff_ffffu32; word_count];
+    let rem = width % 32;
+    if rem != 0 {
+        if let Some(last) = words.last_mut() {
+            *last = (1u32 << rem) - 1;
+        }
+    }
+    words
+}
+
+fn decimal_label_for_auto_words(width: u32, words: &[u32]) -> String {
+    if width <= 64 {
+        let lo = words.first().copied().unwrap_or(0) as u64;
+        let hi = words.get(1).copied().unwrap_or(0) as u64;
+        return (lo | (hi << 32)).to_string();
+    }
+    if words.iter().all(|w| *w == 0) {
+        return "0".to_string();
+    }
+    if words.iter().enumerate().all(|(idx, w)| {
+        let max = unsigned_max_words(width);
+        max.get(idx).copied().unwrap_or(0) == *w
+    }) {
+        return format!("2^{}-1", width);
+    }
+    if let Some((idx, word)) = words
+        .iter()
+        .enumerate()
+        .find(|(_, word)| **word != 0 && word.count_ones() == 1)
+    {
+        if words
+            .iter()
+            .enumerate()
+            .all(|(other_idx, other)| other_idx == idx || *other == 0)
+        {
+            let bit = idx as u32 * 32 + word.trailing_zeros();
+            return format!("2^{bit}");
+        }
+    }
+    if words.iter().enumerate().all(|(idx, word)| {
+        let mut max = unsigned_max_words(width);
+        let diff = max.get_mut(idx).map(|m| {
+            let d = *m ^ *word;
+            d != 0 && d.count_ones() == 1
+        });
+        let this_is_diff = diff.unwrap_or(false);
+        this_is_diff
+            || max
+                .get(idx)
+                .copied()
+                .map(|m| m == *word)
+                .unwrap_or(*word == 0)
+    }) {
+        let max = unsigned_max_words(width);
+        for (idx, (a, b)) in max.iter().zip(words.iter()).enumerate() {
+            let diff = *a ^ *b;
+            if diff != 0 && diff.count_ones() == 1 {
+                let bit = idx as u32 * 32 + diff.trailing_zeros();
+                return format!("2^{}-1-2^{bit}", width);
+            }
+        }
+    }
+    "wide".to_string()
+}
+
+fn auto_coverage_unsigned_word(value_words: Vec<u32>, width: u32) -> AutoCoverageValue {
+    let label = decimal_label_for_auto_words(width, &value_words);
+    AutoCoverageValue::from_words(label, value_words)
+}
+
 fn natural_auto_coverage_endpoints(f: &TxnFieldInfo) -> Vec<AutoCoverageValue> {
-    if f.width == 0 || f.width > 64 {
+    if f.width == 0 {
         return Vec::new();
     }
 
     if f.signed {
+        if f.width > 64 {
+            return Vec::new();
+        }
         let shift = f.width.saturating_sub(1);
         let lo = if shift >= 63 {
             i64::MIN
@@ -2631,18 +2772,29 @@ fn natural_auto_coverage_endpoints(f: &TxnFieldInfo) -> Vec<AutoCoverageValue> {
         }
         values
     } else {
-        let hi = if f.width >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << f.width) - 1
-        };
+        let hi_words = unsigned_max_words(f.width);
         let mut values = Vec::new();
-        push_auto_coverage_value_unique(&mut values, AutoCoverageValue::unsigned(0));
-        push_auto_coverage_value_unique(&mut values, AutoCoverageValue::unsigned(hi));
+        push_auto_coverage_value_unique(
+            &mut values,
+            auto_coverage_unsigned_word(vec![0; hi_words.len()], f.width),
+        );
+        push_auto_coverage_value_unique(
+            &mut values,
+            auto_coverage_unsigned_word(hi_words.clone(), f.width),
+        );
         for bit in walking_auto_coverage_bit_positions(f.width) {
-            let one = 1u64 << bit;
-            push_auto_coverage_value_unique(&mut values, AutoCoverageValue::unsigned(one));
-            push_auto_coverage_value_unique(&mut values, AutoCoverageValue::unsigned(hi ^ one));
+            let mut one = vec![0u32; hi_words.len()];
+            one[(bit / 32) as usize] = 1u32 << (bit % 32);
+            push_auto_coverage_value_unique(
+                &mut values,
+                auto_coverage_unsigned_word(one, f.width),
+            );
+            let mut inv = hi_words.clone();
+            inv[(bit / 32) as usize] ^= 1u32 << (bit % 32);
+            push_auto_coverage_value_unique(
+                &mut values,
+                auto_coverage_unsigned_word(inv, f.width),
+            );
         }
         values
     }
@@ -2657,6 +2809,7 @@ fn auto_coverage_values(f: &TxnFieldInfo) -> Vec<AutoCoverageValue> {
                 values.push(AutoCoverageValue {
                     label: label.clone(),
                     c_expr: format!("{i}ULL"),
+                    words: vec![i as u32, 0],
                 });
             } else {
                 values.push(AutoCoverageValue::unsigned(i as u64));
@@ -2683,6 +2836,70 @@ fn auto_coverage_values(f: &TxnFieldInfo) -> Vec<AutoCoverageValue> {
         values.extend(natural_auto_coverage_endpoints(f));
     }
     values
+}
+
+fn txn_field_solver_width(f: &TxnFieldInfo) -> u32 {
+    f.list
+        .as_ref()
+        .map(|list| list.elem_width)
+        .unwrap_or(f.width)
+}
+
+fn txn_field_solver_c_type(f: &TxnFieldInfo) -> String {
+    if f.signed {
+        cpp_sint_for_width(Some(f.width))
+    } else {
+        cpp_uint_for_width(Some(f.width))
+    }
+}
+
+fn auto_value_array_type(goal: &AutoCoverageGoal, field_info: &std::collections::HashMap<String, TxnFieldInfo>) -> String {
+    field_info
+        .get(&goal.field)
+        .map(txn_field_solver_c_type)
+        .unwrap_or_else(|| "uint64_t".to_string())
+}
+
+fn auto_value_initializer(values: &[AutoCoverageValue]) -> String {
+    values
+        .iter()
+        .map(|v| v.c_expr.clone())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn emit_random_pref_expr(f: &TxnFieldInfo) -> String {
+    emit_random_unsigned_expr(f.width)
+}
+
+fn emit_random_unsigned_expr(width: u32) -> String {
+    if width <= 64 {
+        if width < 64 {
+            format!("harc_rng_uint({width})")
+        } else {
+            "harc_rng_next()".to_string()
+        }
+    } else if width <= 128 {
+        let raw = "(((_harc_u128)harc_rng_next() << 64) | (_harc_u128)harc_rng_next())";
+        if width == 128 {
+            raw.to_string()
+        } else {
+            format!("({raw} & (((_harc_u128)1 << {width}) - 1))")
+        }
+    } else {
+        let words = width.div_ceil(32);
+        let last_bits = width % 32;
+        let mut parts = Vec::new();
+        for idx in 0..words {
+            if idx == words - 1 && last_bits != 0 {
+                let mask = (1u32 << last_bits) - 1;
+                parts.push(format!("(uint32_t)(harc_rng_next() & 0x{mask:08x}ULL)"));
+            } else {
+                parts.push("(uint32_t)harc_rng_next()".to_string());
+            }
+        }
+        format!("harc_rt::HarcWide<{}>({{{}}})", words, parts.join(", "))
+    }
 }
 
 fn c_ident(s: &str) -> String {
@@ -7646,11 +7863,12 @@ impl Emitter {
             match elem_ty {
                 Some(TypeExpr::Builtin { name, args, .. }) => match name {
                     BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => {
+                        let w = type_arg_width(args).unwrap_or(32);
                         writeln!(
                             self.out,
-                            "{INDENT}{INDENT}t->{}[_i] = harc_rng_uint({});",
+                            "{INDENT}{INDENT}t->{}[_i] = {};",
                             f.name.name,
-                            type_arg_width(args).unwrap_or(32)
+                            emit_random_unsigned_expr(w)
                         )
                         .ok();
                     }
@@ -7729,11 +7947,12 @@ impl Emitter {
                 let width = type_arg_width(args);
                 match name {
                     BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => {
+                        let w = width.unwrap_or(32);
                         writeln!(
                             self.out,
-                            "{INDENT}t->{} = harc_rng_uint({});",
+                            "{INDENT}t->{} = {};",
                             f.name.name,
-                            width.unwrap_or(32)
+                            emit_random_unsigned_expr(w)
                         )
                         .ok();
                     }
@@ -7839,6 +8058,7 @@ impl Emitter {
         field_info: &std::collections::HashMap<String, TxnFieldInfo>,
         target_root: Option<&str>,
         blocking: bool,
+        solver_width: u32,
         depth: usize,
     ) {
         let list_unroll_bounds = std::collections::HashMap::new();
@@ -7850,7 +8070,7 @@ impl Emitter {
             self.emit_constraint_expr_w(
                 lo,
                 field_info,
-                64,
+                solver_width,
                 target_root,
                 blocking,
                 &list_unroll_bounds,
@@ -7859,7 +8079,7 @@ impl Emitter {
             self.emit_constraint_expr_w(
                 hi,
                 field_info,
-                64,
+                solver_width,
                 target_root,
                 blocking,
                 &list_unroll_bounds,
@@ -7869,7 +8089,7 @@ impl Emitter {
             self.emit_constraint_expr_w(
                 lo,
                 field_info,
-                64,
+                solver_width,
                 target_root,
                 blocking,
                 &list_unroll_bounds,
@@ -7878,7 +8098,7 @@ impl Emitter {
             self.emit_constraint_expr_w(
                 hi,
                 field_info,
-                64,
+                solver_width,
                 target_root,
                 blocking,
                 &list_unroll_bounds,
@@ -8166,6 +8386,18 @@ impl Emitter {
                 ));
             }
         }
+        let solver_width = fields
+            .iter()
+            .map(txn_field_solver_width)
+            .max()
+            .unwrap_or(64)
+            .max(64);
+        if solver_width > 1024 {
+            self.errors.push(format!(
+                "randomize({ty}): constraint solver supports vector fields up to 1024 bits, got {} bits",
+                solver_width
+            ));
+        }
 
         self.pad(depth);
         writeln!(
@@ -8195,10 +8427,11 @@ impl Emitter {
         self.pad(depth + 1);
         writeln!(self.out, "_s.set(_p);").ok();
 
-        // All Z3 vars declared at 64 bits so binops with literals and across
-        // fields don't trip the width-compatibility check. Each field then
-        // gets a range constraint enforcing its declared width — uniform
-        // emission, no zext bookkeeping.
+        // All Z3 vars in this solve use one common bit-vector width so
+        // binops with literals and across fields don't trip Z3's sort
+        // compatibility checks. The common width grows past 64 when a
+        // wide field participates; each narrower field then gets a range
+        // constraint enforcing its declared width.
         for f in &fields {
             let c_name = c_ident(&f.name);
             if let Some(list) = &f.list {
@@ -8206,15 +8439,15 @@ impl Emitter {
                 self.pad(depth + 1);
                 writeln!(
                     self.out,
-                    "z3::expr _z_{}_len = _ctx.bv_const(\"{}_len\", 64);",
-                    c_name, c_name
+                    "z3::expr _z_{}_len = _ctx.bv_const(\"{}_len\", {});",
+                    c_name, c_name, solver_width
                 )
                 .ok();
                 self.pad(depth + 1);
                 writeln!(
                     self.out,
-                    "_s.add(z3::ule(_z_{}_len, _ctx.bv_val((uint64_t){}, 64)));",
-                    c_name, max_len
+                    "_s.add(z3::ule(_z_{}_len, _ctx.bv_val((uint64_t){}, {})));",
+                    c_name, max_len, solver_width
                 )
                 .ok();
                 if f.non_random {
@@ -8226,39 +8459,41 @@ impl Emitter {
                     )
                     .ok();
                     self.emit_target_field_access(target, f);
-                    writeln!(self.out, ".size()), 64));").ok();
+                    writeln!(self.out, ".size()), {}));", solver_width).ok();
                 }
                 for i in 0..max_len {
                     self.pad(depth + 1);
                     writeln!(
                         self.out,
-                        "z3::expr _z_{}_{i} = _ctx.bv_const(\"{}_{i}\", 64);",
-                        c_name, c_name
+                        "z3::expr _z_{}_{i} = _ctx.bv_const(\"{}_{i}\", {});",
+                        c_name, c_name, solver_width
                     )
                     .ok();
-                    if list.elem_signed && list.elem_width < 64 {
+                    if list.elem_signed && list.elem_width < 63 {
                         self.pad(depth + 1);
                         writeln!(
                             self.out,
-                            "_s.add(_z_{}_{i} >= _ctx.bv_val((uint64_t)(-(1LL << {})), 64));",
+                            "_s.add(_z_{}_{i} >= _ctx.bv_val((uint64_t)(-(1LL << {})), {}));",
                             c_name,
-                            list.elem_width.saturating_sub(1)
+                            list.elem_width.saturating_sub(1),
+                            solver_width
                         )
                         .ok();
                         self.pad(depth + 1);
                         writeln!(
                             self.out,
-                            "_s.add(_z_{}_{i} <= _ctx.bv_val((uint64_t)((1LL << {}) - 1), 64));",
+                            "_s.add(_z_{}_{i} <= _ctx.bv_val((uint64_t)((1LL << {}) - 1), {}));",
                             c_name,
-                            list.elem_width.saturating_sub(1)
+                            list.elem_width.saturating_sub(1),
+                            solver_width
                         )
                         .ok();
-                    } else if list.elem_width < 64 {
+                    } else if !list.elem_signed && list.elem_width < solver_width {
                         self.pad(depth + 1);
                         writeln!(
                             self.out,
-                            "_s.add(z3::ult(_z_{}_{i}, _ctx.bv_val((uint64_t)1ULL << {}, 64)));",
-                            c_name, list.elem_width
+                            "_s.add(z3::ult(_z_{}_{i}, z3::shl(_ctx.bv_val((uint64_t)1, {}), _ctx.bv_val((uint64_t){}, {}))));",
+                            c_name, solver_width, list.elem_width, solver_width
                         )
                         .ok();
                     }
@@ -8266,14 +8501,25 @@ impl Emitter {
                         self.pad(depth + 1);
                         write!(self.out, "if (").ok();
                         self.emit_target_field_access(target, f);
-                        write!(
-                            self.out,
-                            ".size() > {i}) _s.add(_z_{}_{i} == _ctx.bv_val((uint64_t)(",
+                        if list.elem_width <= 64 {
+                            write!(
+                                self.out,
+                                ".size() > {i}) _s.add(_z_{}_{i} == _ctx.bv_val((uint64_t)(",
+                                c_name
+                            )
+                            .ok();
+                            self.emit_target_field_access(target, f);
+                            writeln!(self.out, "[{i}]), {}));", solver_width).ok();
+                        } else {
+                            write!(
+                                self.out,
+                            ".size() > {i}) _s.add(_z_{}_{i} == harc_z3_bv_value(_ctx, ",
                             c_name
-                        )
-                        .ok();
-                        self.emit_target_field_access(target, f);
-                        writeln!(self.out, "[{i}]), 64));").ok();
+                            )
+                            .ok();
+                            self.emit_target_field_access(target, f);
+                            writeln!(self.out, "[{i}], {}));", solver_width).ok();
+                        }
                     }
                 }
                 continue;
@@ -8284,50 +8530,64 @@ impl Emitter {
             self.pad(depth + 1);
             writeln!(
                 self.out,
-                "z3::expr _z_{} = _ctx.bv_const(\"{}\", 64);",
-                c_name, c_name
+                "z3::expr _z_{} = _ctx.bv_const(\"{}\", {});",
+                c_name, c_name, solver_width
             )
             .ok();
             if let Some(n) = f.enum_variants {
                 self.pad(depth + 1);
                 writeln!(
                     self.out,
-                    "_s.add(z3::ule(_z_{}, _ctx.bv_val((uint64_t){}, 64)));",
+                    "_s.add(z3::ule(_z_{}, _ctx.bv_val((uint64_t){}, {})));",
                     c_name,
-                    n.saturating_sub(1)
+                    n.saturating_sub(1),
+                    solver_width
                 )
                 .ok();
-            } else if f.signed && f.width < 64 {
+            } else if f.signed && f.width < 63 {
                 self.pad(depth + 1);
                 writeln!(
                     self.out,
-                    "_s.add(_z_{} >= _ctx.bv_val((uint64_t)(-(1LL << {})), 64));",
+                    "_s.add(_z_{} >= _ctx.bv_val((uint64_t)(-(1LL << {})), {}));",
                     c_name,
-                    f.width.saturating_sub(1)
+                    f.width.saturating_sub(1),
+                    solver_width
                 )
                 .ok();
                 self.pad(depth + 1);
                 writeln!(
                     self.out,
-                    "_s.add(_z_{} <= _ctx.bv_val((uint64_t)((1LL << {}) - 1), 64));",
+                    "_s.add(_z_{} <= _ctx.bv_val((uint64_t)((1LL << {}) - 1), {}));",
                     c_name,
-                    f.width.saturating_sub(1)
+                    f.width.saturating_sub(1),
+                    solver_width
                 )
                 .ok();
-            } else if f.width < 64 {
+            } else if !f.signed && f.width < solver_width {
                 self.pad(depth + 1);
                 writeln!(
                     self.out,
-                    "_s.add(z3::ult(_z_{}, _ctx.bv_val((uint64_t)1ULL << {}, 64)));",
-                    c_name, f.width
+                    "_s.add(z3::ult(_z_{}, z3::shl(_ctx.bv_val((uint64_t)1, {}), _ctx.bv_val((uint64_t){}, {}))));",
+                    c_name, solver_width, f.width, solver_width
                 )
                 .ok();
             }
             if f.non_random {
                 self.pad(depth + 1);
-                write!(self.out, "_s.add(_z_{} == _ctx.bv_val((uint64_t)(", c_name).ok();
-                self.emit_target_field_access(target, f);
-                writeln!(self.out, "), 64));").ok();
+                if f.width <= 64 {
+                    write!(self.out, "_s.add(_z_{} == _ctx.bv_val((uint64_t)(", c_name).ok();
+                    self.emit_target_field_access(target, f);
+                    writeln!(self.out, "), {}));", solver_width).ok();
+                } else {
+                    write!(
+                        self.out,
+                        "_s.add(_z_{} == harc_z3_bv_value(_ctx, ",
+                        c_name
+                    )
+                    .ok();
+                    self.emit_target_field_access(target, f);
+                    writeln!(self.out, ", {}));", solver_width).ok();
+                }
             }
             if let Some((lo, hi)) = field_attr_range(f) {
                 self.emit_solver_range_constraint(
@@ -8337,6 +8597,7 @@ impl Emitter {
                     &field_info,
                     target_root,
                     blocking,
+                    solver_width,
                     depth + 1,
                 );
             }
@@ -8354,6 +8615,7 @@ impl Emitter {
                     target_root,
                     blocking,
                     &list_unroll_bounds,
+                    solver_width,
                     depth + 1,
                 );
                 continue;
@@ -8363,6 +8625,7 @@ impl Emitter {
             self.emit_constraint_expr_with_list_bounds(
                 c,
                 &field_info,
+                solver_width,
                 target_root,
                 blocking,
                 &list_unroll_bounds,
@@ -8526,11 +8789,12 @@ impl Emitter {
         // iterations to push the solver away from previously-seen answers.
         for f in &free_fields {
             let c_name = c_ident(&f.name);
+            let value_ty = txn_field_solver_c_type(f);
             self.pad(depth + 1);
             writeln!(
                 self.out,
-                "static std::vector<uint64_t> {cache_tag}_{};",
-                c_name
+                "static std::vector<{}> {cache_tag}_{};",
+                value_ty, c_name
             )
             .ok();
         }
@@ -8706,6 +8970,12 @@ impl Emitter {
                 .map(Vec::as_slice)
                 .or_else(|| field_attr_dist_entries(f).map(Vec::as_slice));
             if let Some(entries) = dist_entries {
+                if f.width > 64 {
+                    self.errors.push(format!(
+                        "randomize({ty}) [dist] on >64-bit field `{}` is not supported yet",
+                        f.name
+                    ));
+                }
                 write!(
                     self.out,
                     "uint64_t _pref_{cache_tag}_{} = (uint64_t)harc_rng_dist({{",
@@ -8725,13 +8995,13 @@ impl Emitter {
             } else if f.signed && f.width > 0 && f.width < 63 {
                 writeln!(
                     self.out,
-                    "uint64_t _pref_{cache_tag}_{} = (uint64_t)harc_rng_range(-(1LL << {}), (1LL << {}) - 1);",
+                    "int64_t _pref_{cache_tag}_{} = harc_rng_range(-(1LL << {}), (1LL << {}) - 1);",
                     c_name,
                     f.width.saturating_sub(1),
                     f.width.saturating_sub(1)
                 )
                 .ok();
-            } else if f.width < 64 {
+            } else if f.width <= 64 {
                 writeln!(
                     self.out,
                     "uint64_t _pref_{cache_tag}_{} = harc_rng_uint({});",
@@ -8739,10 +9009,12 @@ impl Emitter {
                 )
                 .ok();
             } else {
+                let value_ty = txn_field_solver_c_type(f);
+                let expr = emit_random_pref_expr(f);
                 writeln!(
                     self.out,
-                    "uint64_t _pref_{cache_tag}_{} = harc_rng_next();",
-                    c_name
+                    "{} _pref_{cache_tag}_{} = {};",
+                    value_ty, c_name, expr
                 )
                 .ok();
             }
@@ -8789,27 +9061,23 @@ impl Emitter {
             )
             .ok();
             self.pad(depth + 5);
+            let a_ty = auto_value_array_type(a, &field_info);
             writeln!(
                 self.out,
-                "static const uint64_t _auto_vals_{cache_tag}_{}[] = {{{}}};",
+                "static const {} _auto_vals_{cache_tag}_{}[] = {{{}}};",
+                a_ty,
                 a.c_field,
-                a.values
-                    .iter()
-                    .map(|v| v.c_expr.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                auto_value_initializer(&a.values)
             )
             .ok();
             self.pad(depth + 5);
+            let b_ty = auto_value_array_type(b, &field_info);
             writeln!(
                 self.out,
-                "static const uint64_t _auto_vals_{cache_tag}_{}[] = {{{}}};",
+                "static const {} _auto_vals_{cache_tag}_{}[] = {{{}}};",
+                b_ty,
                 b.c_field,
-                b.values
-                    .iter()
-                    .map(|v| v.c_expr.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                auto_value_initializer(&b.values)
             )
             .ok();
             self.pad(depth + 5);
@@ -8853,15 +9121,13 @@ impl Emitter {
             self.pad(depth + 1);
             writeln!(self.out, "if (!_auto_cov_pref_{cache_tag}) {{").ok();
             self.pad(depth + 2);
+            let value_ty = auto_value_array_type(goal, &field_info);
             writeln!(
                 self.out,
-                "static const uint64_t _auto_vals_{cache_tag}_{}[] = {{{}}};",
+                "static const {} _auto_vals_{cache_tag}_{}[] = {{{}}};",
+                value_ty,
                 goal.c_field,
-                goal.values
-                    .iter()
-                    .map(|v| v.c_expr.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                auto_value_initializer(&goal.values)
             )
             .ok();
             self.pad(depth + 2);
@@ -8894,8 +9160,8 @@ impl Emitter {
             self.pad(depth + 1);
             writeln!(
                 self.out,
-                "_s.add(_z_{} == _ctx.bv_val(_pref_{cache_tag}_{}, 64));",
-                c_name, c_name
+                "_s.add(_z_{} == harc_z3_bv_value(_ctx, _pref_{cache_tag}_{}, {}));",
+                c_name, c_name, solver_width
             )
             .ok();
         }
@@ -8935,8 +9201,8 @@ impl Emitter {
                 self.pad(depth + 1);
                 writeln!(
                     self.out,
-                    "for (auto _v : {cache_tag}_{}) _s.add(_z_{} != _ctx.bv_val(_v, 64));   // [unique] policy: no repeat until exhausted",
-                    c_name, c_name
+                    "for (auto _v : {cache_tag}_{}) _s.add(_z_{} != harc_z3_bv_value(_ctx, _v, {}));   // [unique] policy: no repeat until exhausted",
+                    c_name, c_name, solver_width
                 )
                 .ok();
                 continue;
@@ -8951,8 +9217,8 @@ impl Emitter {
             self.pad(depth + 1);
             writeln!(
                 self.out,
-                "for (auto _v : {cache_tag}_{}) _s.add(_z_{} != _ctx.bv_val(_v, 64));",
-                c_name, c_name
+                "for (auto _v : {cache_tag}_{}) _s.add(_z_{} != harc_z3_bv_value(_ctx, _v, {}));",
+                c_name, c_name, solver_width
             )
             .ok();
         }
@@ -9078,7 +9344,6 @@ impl Emitter {
             // pinned fields take their constrained value; free fields take
             // a Z3-chosen satisfying value. Only free fields get pushed
             // into the diversity cache.
-            let val_ty = if f.signed { "int64_t" } else { "uint64_t" };
             self.pad(depth + 2);
             writeln!(
                 self.out,
@@ -9086,33 +9351,66 @@ impl Emitter {
                 c_name, c_name
             )
             .ok();
-            self.pad(depth + 2);
-            writeln!(self.out, "uint64_t _raw_{} = 0;", c_name).ok();
-            self.pad(depth + 2);
-            writeln!(
-                self.out,
-                "if (!_eval_{}.is_numeral_u64(_raw_{})) {{",
-                c_name, c_name
-            )
-            .ok();
-            self.pad(depth + 3);
-            writeln!(
-                self.out,
-                "sim_log_line(\"FAIL\", \"randomize(t) with: solver model for field '{}' is not a uint64 numeral\");",
-                escape_c(&f.name)
-            )
-            .ok();
-            self.pad(depth + 3);
-            writeln!(self.out, "errors++;").ok();
-            self.pad(depth + 2);
-            writeln!(self.out, "}}").ok();
-            self.pad(depth + 2);
-            writeln!(
-                self.out,
-                "{} _val_{} = ({})_raw_{};",
-                val_ty, c_name, val_ty, c_name
-            )
-            .ok();
+            if f.width <= 64 {
+                let val_ty = if f.signed { "int64_t" } else { "uint64_t" };
+                self.pad(depth + 2);
+                writeln!(self.out, "uint64_t _raw_{} = 0;", c_name).ok();
+                self.pad(depth + 2);
+                writeln!(
+                    self.out,
+                    "if (!_eval_{}.is_numeral_u64(_raw_{})) {{",
+                    c_name, c_name
+                )
+                .ok();
+                self.pad(depth + 3);
+                writeln!(
+                    self.out,
+                    "sim_log_line(\"FAIL\", \"randomize(t) with: solver model for field '{}' is not a uint64 numeral\");",
+                    escape_c(&f.name)
+                )
+                .ok();
+                self.pad(depth + 3);
+                writeln!(self.out, "errors++;").ok();
+                self.pad(depth + 2);
+                writeln!(self.out, "}}").ok();
+                self.pad(depth + 2);
+                writeln!(
+                    self.out,
+                    "{} _val_{} = ({})_raw_{};",
+                    val_ty, c_name, val_ty, c_name
+                )
+                .ok();
+            } else {
+                let val_ty = txn_field_solver_c_type(f);
+                let words = f.width.div_ceil(32);
+                self.pad(depth + 2);
+                writeln!(
+                    self.out,
+                    "const char* _bin_{} = Z3_get_numeral_binary_string(_ctx, _eval_{});",
+                    c_name, c_name
+                )
+                .ok();
+                self.pad(depth + 2);
+                writeln!(self.out, "if (_bin_{} == nullptr) {{", c_name).ok();
+                self.pad(depth + 3);
+                writeln!(
+                    self.out,
+                    "sim_log_line(\"FAIL\", \"randomize(t) with: solver model for field '{}' is not a binary numeral\");",
+                    escape_c(&f.name)
+                )
+                .ok();
+                self.pad(depth + 3);
+                writeln!(self.out, "errors++;").ok();
+                self.pad(depth + 2);
+                writeln!(self.out, "}}").ok();
+                self.pad(depth + 2);
+                writeln!(
+                    self.out,
+                    "{} _val_{} = ({})harc_rt::harc_wide_from_binary<{}>(_bin_{});",
+                    val_ty, c_name, val_ty, words, c_name
+                )
+                .ok();
+            }
             self.pad(depth + 2);
             write!(self.out, "").ok();
             self.emit_target_field_access(target, f);
@@ -9132,7 +9430,7 @@ impl Emitter {
                 self.pad(depth + 2);
                 writeln!(
                     self.out,
-                    "if ((uint64_t)_val_{} == {}) {{ _auto_cov_{cache_tag}_{}[{}] = true; _auto_cov_blocked_{cache_tag}_{}[{}] = false; }}",
+                    "if (_val_{} == {}) {{ _auto_cov_{cache_tag}_{}[{}] = true; _auto_cov_blocked_{cache_tag}_{}[{}] = false; }}",
                     goal.c_field, value.c_expr, goal.c_field, idx, goal.c_field, idx
                 )
                 .ok();
@@ -9144,7 +9442,7 @@ impl Emitter {
                     self.pad(depth + 2);
                     writeln!(
                         self.out,
-                        "if ((uint64_t)_val_{} == {} && (uint64_t)_val_{} == {}) {{ _auto_cross_{cache_tag}_{}__{}[{}][{}] = true; _auto_cross_blocked_{cache_tag}_{}__{}[{}][{}] = false; }}",
+                        "if (_val_{} == {} && _val_{} == {}) {{ _auto_cross_{cache_tag}_{}__{}[{}][{}] = true; _auto_cross_blocked_{cache_tag}_{}__{}[{}][{}] = false; }}",
                         a.c_field, av.c_expr, b.c_field, bv.c_expr, a.c_field, b.c_field, i, j, a.c_field, b.c_field, i, j
                     )
                     .ok();
@@ -9204,6 +9502,7 @@ impl Emitter {
         &mut self,
         e: &Expr,
         field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+        width: u32,
         target_root: Option<&str>,
         blocking: bool,
         list_unroll_bounds: &std::collections::HashMap<String, usize>,
@@ -9211,7 +9510,7 @@ impl Emitter {
         self.emit_constraint_expr_w(
             e,
             field_info,
-            64,
+            width,
             target_root,
             blocking,
             &list_unroll_bounds,
@@ -9229,6 +9528,7 @@ impl Emitter {
         target_root: Option<&str>,
         blocking: bool,
         list_unroll_bounds: &std::collections::HashMap<String, usize>,
+        solver_width: u32,
         depth: usize,
     ) {
         let Some(field) = list_field_name_from_expr(iter, field_info, target_root) else {
@@ -9259,13 +9559,14 @@ impl Emitter {
                 self.pad(depth);
                 write!(
                     self.out,
-                    "_s.add(z3::ule(_z_{}_len, _ctx.bv_val((uint64_t){i}, 64)) || (",
-                    c_field
+                    "_s.add(z3::ule(_z_{}_len, _ctx.bv_val((uint64_t){i}, {})) || (",
+                    c_field, solver_width
                 )
                 .ok();
                 self.emit_constraint_expr_with_list_bounds(
                     &lowered,
                     field_info,
+                    solver_width,
                     target_root,
                     blocking,
                     list_unroll_bounds,
@@ -9279,6 +9580,7 @@ impl Emitter {
         &mut self,
         e: &Expr,
         field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+        width: u32,
         target_root: Option<&str>,
         list_unroll_bounds: &std::collections::HashMap<String, usize>,
     ) -> bool {
@@ -9323,7 +9625,15 @@ impl Emitter {
                 (field, None, None)
             }
         };
-        self.emit_constraint_list_sum(&field, lo, hi, field_info, target_root, list_unroll_bounds);
+        self.emit_constraint_list_sum(
+            &field,
+            lo,
+            hi,
+            field_info,
+            width,
+            target_root,
+            list_unroll_bounds,
+        );
         true
     }
 
@@ -9333,11 +9643,12 @@ impl Emitter {
         lo: Option<&Expr>,
         hi: Option<&Expr>,
         field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+        width: u32,
         target_root: Option<&str>,
         list_unroll_bounds: &std::collections::HashMap<String, usize>,
     ) {
         let Some(_) = field_info.get(field).and_then(|f| f.list.as_ref()) else {
-            write!(self.out, "_ctx.bv_val((uint64_t)0, 64)").ok();
+            write!(self.out, "_ctx.bv_val((uint64_t)0, {width})").ok();
             return;
         };
         let max_len = list_unroll_bounds.get(field).copied().unwrap_or(0);
@@ -9365,8 +9676,8 @@ impl Emitter {
             if hi_is_len || hi.is_none() {
                 write!(
                     self.out,
-                    "z3::ite(z3::ugt(_z_{}_len, _ctx.bv_val((uint64_t){i}, 64)), _z_{}_{i}, _ctx.bv_val((uint64_t)0, 64))",
-                    c_field, c_field
+                    "z3::ite(z3::ugt(_z_{}_len, _ctx.bv_val((uint64_t){i}, {})), _z_{}_{i}, _ctx.bv_val((uint64_t)0, {}))",
+                    c_field, width, c_field, width
                 )
                 .ok();
             } else {
@@ -9375,7 +9686,7 @@ impl Emitter {
             emitted = true;
         }
         if !emitted {
-            write!(self.out, "_ctx.bv_val((uint64_t)0, 64)").ok();
+            write!(self.out, "_ctx.bv_val((uint64_t)0, {width})").ok();
         }
         write!(self.out, ")").ok();
     }
@@ -9400,6 +9711,7 @@ impl Emitter {
                 if self.try_emit_constraint_list_call(
                     e,
                     field_info,
+                    width,
                     target_root,
                     list_unroll_bounds,
                 ) {
@@ -14675,10 +14987,10 @@ fn txn_field_has_solver_policy(f: &Field, enum_names: &std::collections::HashSet
     match &f.ty {
         TypeExpr::Builtin { name, args, .. } => match name {
             BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => true,
-            BuiltinTy::Bits => type_arg_width(args) == Some(1),
-            BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::SInt | BuiltinTy::SIntCap => {
-                type_arg_width(args).is_some_and(|w| w <= 64)
+            BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => {
+                type_arg_width(args).is_some_and(|w| w <= 1024)
             }
+            BuiltinTy::SInt | BuiltinTy::SIntCap => type_arg_width(args).is_some_and(|w| w <= 64),
             _ => false,
         },
         TypeExpr::Named { name, .. } => name
