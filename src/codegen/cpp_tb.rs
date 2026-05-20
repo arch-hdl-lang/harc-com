@@ -654,8 +654,21 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "{INDENT}uint32_t words[2] = {{static_cast<uint32_t>(v), static_cast<uint32_t>(v >> 32)}};").ok();
         writeln!(e.out, "{INDENT}return harc_z3_bv_words(ctx, words, 2, width);").ok();
         writeln!(e.out, "}}").ok();
+        writeln!(e.out, "static inline z3::expr harc_z3_bv_signed_value(z3::context& ctx, int64_t v, unsigned width) {{").ok();
+        writeln!(e.out, "{INDENT}uint32_t words[32] = {{}};").ok();
+        writeln!(e.out, "{INDENT}size_t word_count = (width + 31) / 32;").ok();
+        writeln!(e.out, "{INDENT}if (word_count > 32) word_count = 32;").ok();
+        writeln!(e.out, "{INDENT}uint32_t fill = v < 0 ? 0xffffffffu : 0u;").ok();
+        writeln!(e.out, "{INDENT}for (size_t i = 0; i < word_count; ++i) words[i] = fill;").ok();
+        writeln!(e.out, "{INDENT}uint64_t raw = static_cast<uint64_t>(v);").ok();
+        writeln!(e.out, "{INDENT}if (word_count > 0) words[0] = static_cast<uint32_t>(raw);").ok();
+        writeln!(e.out, "{INDENT}if (word_count > 1) words[1] = static_cast<uint32_t>(raw >> 32);").ok();
+        writeln!(e.out, "{INDENT}unsigned rem = width % 32;").ok();
+        writeln!(e.out, "{INDENT}if (rem != 0 && word_count > 0) words[word_count - 1] &= ((1u << rem) - 1u);").ok();
+        writeln!(e.out, "{INDENT}return harc_z3_bv_words(ctx, words, word_count, width);").ok();
+        writeln!(e.out, "}}").ok();
         writeln!(e.out, "static inline z3::expr harc_z3_bv_value(z3::context& ctx, int64_t v, unsigned width) {{").ok();
-        writeln!(e.out, "{INDENT}return harc_z3_bv_value(ctx, static_cast<uint64_t>(v), width);").ok();
+        writeln!(e.out, "{INDENT}return harc_z3_bv_signed_value(ctx, v, width);").ok();
         writeln!(e.out, "}}").ok();
         writeln!(e.out, "static inline z3::expr harc_z3_bv_value(z3::context& ctx, _harc_u128 v, unsigned width) {{").ok();
         writeln!(e.out, "{INDENT}uint32_t words[4] = {{static_cast<uint32_t>(v), static_cast<uint32_t>(v >> 32), static_cast<uint32_t>(v >> 64), static_cast<uint32_t>(v >> 96)}};").ok();
@@ -664,6 +677,18 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "template<size_t N>").ok();
         writeln!(e.out, "static inline z3::expr harc_z3_bv_value(z3::context& ctx, const harc_rt::HarcWide<N>& v, unsigned width) {{").ok();
         writeln!(e.out, "{INDENT}return harc_z3_bv_words(ctx, v.words.data(), v.words.size(), width);").ok();
+        writeln!(e.out, "}}").ok();
+        writeln!(e.out, "static inline uint64_t harc_z3_bv_low_u64(z3::context& ctx, const z3::expr& value) {{").ok();
+        writeln!(e.out, "{INDENT}uint64_t raw = 0;").ok();
+        writeln!(e.out, "{INDENT}z3::expr simplified = value.simplify();").ok();
+        writeln!(e.out, "{INDENT}if (simplified.is_numeral_u64(raw)) return raw;").ok();
+        writeln!(e.out, "{INDENT}const char* bits = Z3_get_numeral_binary_string(ctx, simplified);").ok();
+        writeln!(e.out, "{INDENT}if (!bits) return 0;").ok();
+        writeln!(e.out, "{INDENT}size_t len = 0; while (bits[len] != '\\0') ++len;").ok();
+        writeln!(e.out, "{INDENT}for (size_t src = 0; src < len && src < 64; ++src) {{").ok();
+        writeln!(e.out, "{INDENT}{INDENT}if (bits[len - 1 - src] == '1') raw |= (uint64_t{{1}} << src);").ok();
+        writeln!(e.out, "{INDENT}}}").ok();
+        writeln!(e.out, "{INDENT}return raw;").ok();
         writeln!(e.out, "}}").ok();
     }
     writeln!(e.out, "").ok();
@@ -2853,6 +2878,14 @@ fn txn_field_solver_c_type(f: &TxnFieldInfo) -> String {
     }
 }
 
+fn solver_scalar_c_type(width: u32, signed: bool) -> String {
+    if signed {
+        cpp_sint_for_width(Some(width))
+    } else {
+        cpp_uint_for_width(Some(width))
+    }
+}
+
 fn auto_value_array_type(goal: &AutoCoverageGoal, field_info: &std::collections::HashMap<String, TxnFieldInfo>) -> String {
     field_info
         .get(&goal.field)
@@ -2899,6 +2932,15 @@ fn emit_random_unsigned_expr(width: u32) -> String {
             }
         }
         format!("harc_rt::HarcWide<{}>({{{}}})", words, parts.join(", "))
+    }
+}
+
+fn c_solver_int_literal(s: &str) -> String {
+    let value = c_value_literal(s);
+    if value.starts_with("harc_rt::HarcWide<") || value.contains("_harc_u128") {
+        value
+    } else {
+        format!("(int64_t)({})", c_int_literal(s))
     }
 }
 
@@ -7874,14 +7916,24 @@ impl Emitter {
                     }
                     BuiltinTy::SInt | BuiltinTy::SIntCap => {
                         let w = type_arg_width(args).unwrap_or(32);
-                        writeln!(
-                            self.out,
-                            "{INDENT}{INDENT}t->{}[_i] = harc_rng_range(-(1LL << {}), (1LL << {}) - 1);",
-                            f.name.name,
-                            w.saturating_sub(1),
-                            w.saturating_sub(1)
-                        )
-                        .ok();
+                        if w < 63 {
+                            writeln!(
+                                self.out,
+                                "{INDENT}{INDENT}t->{}[_i] = harc_rng_range(-(1LL << {}), (1LL << {}) - 1);",
+                                f.name.name,
+                                w.saturating_sub(1),
+                                w.saturating_sub(1)
+                            )
+                            .ok();
+                        } else {
+                            writeln!(
+                                self.out,
+                                "{INDENT}{INDENT}t->{}[_i] = {};",
+                                f.name.name,
+                                emit_random_unsigned_expr(w)
+                            )
+                            .ok();
+                        }
                     }
                     BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => {
                         writeln!(
@@ -7958,14 +8010,24 @@ impl Emitter {
                     }
                     BuiltinTy::SInt | BuiltinTy::SIntCap => {
                         let w = width.unwrap_or(32);
-                        writeln!(
-                            self.out,
-                            "{INDENT}t->{} = harc_rng_range(-(1LL << {}), (1LL << {}) - 1);",
-                            f.name.name,
-                            w - 1,
-                            w - 1
-                        )
-                        .ok();
+                        if w < 63 {
+                            writeln!(
+                                self.out,
+                                "{INDENT}t->{} = harc_rng_range(-(1LL << {}), (1LL << {}) - 1);",
+                                f.name.name,
+                                w - 1,
+                                w - 1
+                            )
+                            .ok();
+                        } else {
+                            writeln!(
+                                self.out,
+                                "{INDENT}t->{} = {};",
+                                f.name.name,
+                                emit_random_unsigned_expr(w)
+                            )
+                            .ok();
+                        }
                     }
                     BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => {
                         writeln!(
@@ -8469,25 +8531,43 @@ impl Emitter {
                         c_name, c_name, solver_width
                     )
                     .ok();
-                    if list.elem_signed && list.elem_width < 63 {
+                    if list.elem_signed && list.elem_width <= 64 && list.elem_width < solver_width {
                         self.pad(depth + 1);
-                        writeln!(
-                            self.out,
-                            "_s.add(_z_{}_{i} >= _ctx.bv_val((uint64_t)(-(1LL << {})), {}));",
-                            c_name,
-                            list.elem_width.saturating_sub(1),
-                            solver_width
-                        )
-                        .ok();
+                        if list.elem_width == 64 {
+                            writeln!(
+                                self.out,
+                                "_s.add(_z_{}_{i} >= harc_z3_bv_value(_ctx, INT64_MIN, {}));",
+                                c_name, solver_width
+                            )
+                            .ok();
+                        } else {
+                            writeln!(
+                                self.out,
+                                "_s.add(_z_{}_{i} >= harc_z3_bv_value(_ctx, (int64_t)(-(1LL << {})), {}));",
+                                c_name,
+                                list.elem_width.saturating_sub(1),
+                                solver_width
+                            )
+                            .ok();
+                        }
                         self.pad(depth + 1);
-                        writeln!(
-                            self.out,
-                            "_s.add(_z_{}_{i} <= _ctx.bv_val((uint64_t)((1LL << {}) - 1), {}));",
-                            c_name,
-                            list.elem_width.saturating_sub(1),
-                            solver_width
-                        )
-                        .ok();
+                        if list.elem_width == 64 {
+                            writeln!(
+                                self.out,
+                                "_s.add(_z_{}_{i} <= harc_z3_bv_value(_ctx, INT64_MAX, {}));",
+                                c_name, solver_width
+                            )
+                            .ok();
+                        } else {
+                            writeln!(
+                                self.out,
+                                "_s.add(_z_{}_{i} <= harc_z3_bv_value(_ctx, (int64_t)((1LL << {}) - 1), {}));",
+                                c_name,
+                                list.elem_width.saturating_sub(1),
+                                solver_width
+                            )
+                            .ok();
+                        }
                     } else if !list.elem_signed && list.elem_width < solver_width {
                         self.pad(depth + 1);
                         writeln!(
@@ -8504,12 +8584,12 @@ impl Emitter {
                         if list.elem_width <= 64 {
                             write!(
                                 self.out,
-                                ".size() > {i}) _s.add(_z_{}_{i} == _ctx.bv_val((uint64_t)(",
+                                ".size() > {i}) _s.add(_z_{}_{i} == harc_z3_bv_value(_ctx, ",
                                 c_name
                             )
                             .ok();
                             self.emit_target_field_access(target, f);
-                            writeln!(self.out, "[{i}]), {}));", solver_width).ok();
+                            writeln!(self.out, "[{i}], {}));", solver_width).ok();
                         } else {
                             write!(
                                 self.out,
@@ -8544,25 +8624,43 @@ impl Emitter {
                     solver_width
                 )
                 .ok();
-            } else if f.signed && f.width < 63 {
+            } else if f.signed && f.width <= 64 && f.width < solver_width {
                 self.pad(depth + 1);
-                writeln!(
-                    self.out,
-                    "_s.add(_z_{} >= _ctx.bv_val((uint64_t)(-(1LL << {})), {}));",
-                    c_name,
-                    f.width.saturating_sub(1),
-                    solver_width
-                )
-                .ok();
+                if f.width == 64 {
+                    writeln!(
+                        self.out,
+                        "_s.add(_z_{} >= harc_z3_bv_value(_ctx, INT64_MIN, {}));",
+                        c_name, solver_width
+                    )
+                    .ok();
+                } else {
+                    writeln!(
+                        self.out,
+                        "_s.add(_z_{} >= harc_z3_bv_value(_ctx, (int64_t)(-(1LL << {})), {}));",
+                        c_name,
+                        f.width.saturating_sub(1),
+                        solver_width
+                    )
+                    .ok();
+                }
                 self.pad(depth + 1);
-                writeln!(
-                    self.out,
-                    "_s.add(_z_{} <= _ctx.bv_val((uint64_t)((1LL << {}) - 1), {}));",
-                    c_name,
-                    f.width.saturating_sub(1),
-                    solver_width
-                )
-                .ok();
+                if f.width == 64 {
+                    writeln!(
+                        self.out,
+                        "_s.add(_z_{} <= harc_z3_bv_value(_ctx, INT64_MAX, {}));",
+                        c_name, solver_width
+                    )
+                    .ok();
+                } else {
+                    writeln!(
+                        self.out,
+                        "_s.add(_z_{} <= harc_z3_bv_value(_ctx, (int64_t)((1LL << {}) - 1), {}));",
+                        c_name,
+                        f.width.saturating_sub(1),
+                        solver_width
+                    )
+                    .ok();
+                }
             } else if !f.signed && f.width < solver_width {
                 self.pad(depth + 1);
                 writeln!(
@@ -8575,9 +8673,9 @@ impl Emitter {
             if f.non_random {
                 self.pad(depth + 1);
                 if f.width <= 64 {
-                    write!(self.out, "_s.add(_z_{} == _ctx.bv_val((uint64_t)(", c_name).ok();
+                    write!(self.out, "_s.add(_z_{} == harc_z3_bv_value(_ctx, ", c_name).ok();
                     self.emit_target_field_access(target, f);
-                    writeln!(self.out, "), {}));", solver_width).ok();
+                    writeln!(self.out, ", {}));", solver_width).ok();
                 } else {
                     write!(
                         self.out,
@@ -9300,38 +9398,48 @@ impl Emitter {
                     )
                     .ok();
                     self.pad(depth + 3);
-                    writeln!(self.out, "uint64_t _raw_{}_{i} = 0;", c_name).ok();
-                    self.pad(depth + 3);
-                    writeln!(
-                        self.out,
-                        "if (!_eval_{}_{i}.is_numeral_u64(_raw_{}_{i})) {{",
-                        c_name, c_name
-                    )
-                    .ok();
-                    self.pad(depth + 4);
-                    writeln!(
-                        self.out,
-                        "sim_log_line(\"FAIL\", \"randomize(t) with: solver model for field '{}[{i}]' is not a uint64 numeral\");",
-                        escape_c(&f.name)
-                    )
-                    .ok();
-                    self.pad(depth + 4);
-                    writeln!(self.out, "errors++;").ok();
-                    self.pad(depth + 3);
-                    writeln!(self.out, "}}").ok();
-                    self.pad(depth + 3);
-                    self.emit_target_field_access(target, f);
-                    writeln!(
-                        self.out,
-                        "[{i}] = ({})_raw_{}_{i};",
-                        if list.elem_signed {
-                            "int64_t"
-                        } else {
-                            "uint64_t"
-                        },
-                        c_name
-                    )
-                    .ok();
+                    if list.elem_width <= 64 {
+                        let val_ty = solver_scalar_c_type(list.elem_width, list.elem_signed);
+                        writeln!(
+                            self.out,
+                            "uint64_t _raw_{}_{i} = harc_z3_bv_low_u64(_ctx, _eval_{}_{i});",
+                            c_name, c_name
+                        )
+                        .ok();
+                        self.pad(depth + 3);
+                        self.emit_target_field_access(target, f);
+                        writeln!(self.out, "[{i}] = ({})_raw_{}_{i};", val_ty, c_name).ok();
+                    } else {
+                        let val_ty = solver_scalar_c_type(list.elem_width, list.elem_signed);
+                        let words = list.elem_width.div_ceil(32);
+                        writeln!(
+                            self.out,
+                            "const char* _bin_{}_{i} = Z3_get_numeral_binary_string(_ctx, _eval_{}_{i});",
+                            c_name, c_name
+                        )
+                        .ok();
+                        self.pad(depth + 3);
+                        writeln!(self.out, "if (_bin_{}_{i} == nullptr) {{", c_name).ok();
+                        self.pad(depth + 4);
+                        writeln!(
+                            self.out,
+                            "sim_log_line(\"FAIL\", \"randomize(t) with: solver model for field '{}[{i}]' is not a binary numeral\");",
+                            escape_c(&f.name)
+                        )
+                        .ok();
+                        self.pad(depth + 4);
+                        writeln!(self.out, "errors++;").ok();
+                        self.pad(depth + 3);
+                        writeln!(self.out, "}}").ok();
+                        self.pad(depth + 3);
+                        self.emit_target_field_access(target, f);
+                        writeln!(
+                            self.out,
+                            "[{i}] = ({})harc_rt::harc_wide_from_binary<{}>(_bin_{}_{i});",
+                            val_ty, words, c_name
+                        )
+                        .ok();
+                    }
                     self.pad(depth + 2);
                     writeln!(self.out, "}}").ok();
                 }
@@ -9354,25 +9462,12 @@ impl Emitter {
             if f.width <= 64 {
                 let val_ty = if f.signed { "int64_t" } else { "uint64_t" };
                 self.pad(depth + 2);
-                writeln!(self.out, "uint64_t _raw_{} = 0;", c_name).ok();
-                self.pad(depth + 2);
                 writeln!(
                     self.out,
-                    "if (!_eval_{}.is_numeral_u64(_raw_{})) {{",
+                    "uint64_t _raw_{} = harc_z3_bv_low_u64(_ctx, _eval_{});",
                     c_name, c_name
                 )
                 .ok();
-                self.pad(depth + 3);
-                writeln!(
-                    self.out,
-                    "sim_log_line(\"FAIL\", \"randomize(t) with: solver model for field '{}' is not a uint64 numeral\");",
-                    escape_c(&f.name)
-                )
-                .ok();
-                self.pad(depth + 3);
-                writeln!(self.out, "errors++;").ok();
-                self.pad(depth + 2);
-                writeln!(self.out, "}}").ok();
                 self.pad(depth + 2);
                 writeln!(
                     self.out,
@@ -9769,9 +9864,15 @@ impl Emitter {
                             .zip(expr_field_root(e).as_deref())
                             .is_some_and(|(target, root)| root != target)
                     {
-                        write!(self.out, "_ctx.bv_val((uint64_t)(").ok();
-                        self.emit_expr(e);
-                        write!(self.out, "), {width})").ok();
+                        if width <= 64 {
+                            write!(self.out, "_ctx.bv_val((uint64_t)(").ok();
+                            self.emit_expr(e);
+                            write!(self.out, "), {width})").ok();
+                        } else {
+                            write!(self.out, "harc_z3_bv_value(_ctx, ").ok();
+                            self.emit_expr(e);
+                            write!(self.out, ", {width})").ok();
+                        }
                     } else {
                         self.errors.push(format!(
                             "constraint references unknown field `{}` (only fields of the randomize target are supported)",
@@ -9780,9 +9881,15 @@ impl Emitter {
                         write!(self.out, "_ctx.bool_val(true)").ok();
                     }
                 } else if blocking {
-                    write!(self.out, "_ctx.bv_val((uint64_t)(").ok();
-                    self.emit_expr(e);
-                    write!(self.out, "), {width})").ok();
+                    if width <= 64 {
+                        write!(self.out, "_ctx.bv_val((uint64_t)(").ok();
+                        self.emit_expr(e);
+                        write!(self.out, "), {width})").ok();
+                    } else {
+                        write!(self.out, "harc_z3_bv_value(_ctx, ").ok();
+                        self.emit_expr(e);
+                        write!(self.out, ", {width})").ok();
+                    }
                 } else {
                     self.errors.push(
                         "constraint references unsupported field path (only fields of the randomize target are supported)".into(),
@@ -9815,9 +9922,18 @@ impl Emitter {
                         write!(self.out, "_z_{}", c_ident(&id.name)).ok();
                     }
                 } else if let Some(idx) = self.enum_variants.get(&id.name).copied() {
-                    write!(self.out, "_ctx.bv_val((uint64_t){}, {})", idx, width).ok();
+                    if width <= 64 {
+                        write!(self.out, "_ctx.bv_val((uint64_t){}, {})", idx, width).ok();
+                    } else {
+                        write!(self.out, "harc_z3_bv_value(_ctx, (uint64_t){}, {})", idx, width)
+                            .ok();
+                    }
                 } else if blocking && self.let_widths.contains_key(&id.name) {
-                    write!(self.out, "_ctx.bv_val((uint64_t)({}), {})", id.name, width).ok();
+                    if width <= 64 {
+                        write!(self.out, "_ctx.bv_val((uint64_t)({}), {})", id.name, width).ok();
+                    } else {
+                        write!(self.out, "harc_z3_bv_value(_ctx, {}, {})", id.name, width).ok();
+                    }
                 } else {
                     self.errors
                         .push(format!("constraint references unknown name `{}`", id.name));
@@ -9825,13 +9941,23 @@ impl Emitter {
                 }
             }
             ExprKind::Int(s) => {
-                write!(
-                    self.out,
-                    "_ctx.bv_val((uint64_t){}, {})",
-                    c_int_literal(s),
-                    width
-                )
-                .ok();
+                if width <= 64 {
+                    write!(
+                        self.out,
+                        "_ctx.bv_val((uint64_t){}, {})",
+                        c_int_literal(s),
+                        width
+                    )
+                    .ok();
+                } else {
+                    write!(
+                        self.out,
+                        "harc_z3_bv_value(_ctx, {}, {})",
+                        c_solver_int_literal(s),
+                        width
+                    )
+                    .ok();
+                }
             }
             ExprKind::Bool(b) => {
                 write!(
