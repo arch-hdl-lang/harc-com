@@ -2221,7 +2221,7 @@ end test ListForeachWhenKeepTest"#,
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
-        cpp.contains("z3::ule(_z_items_len, _ctx.bv_val((uint64_t)0, 64)) || (!(_z_enabled) || z3::ugt(_z_items_0"),
+        cpp.contains("z3::ule(_z_items_len, _ctx.bv_val((uint64_t)0, 64)) || (!((_z_enabled != _ctx.bv_val((uint64_t)0, 64))) || z3::ugt(_z_items_0"),
         "when-guarded foreach keep should distribute the guard into each unrolled item constraint; got:\n{cpp}"
     );
 }
@@ -3293,7 +3293,7 @@ end test WhenKeepTest"#,
     let cpp = cpp_tb::emit(&parsed).expect("emit");
 
     assert!(
-        cpp.contains("!(_z_op == _ctx.bv_val((uint64_t)1, 64))")
+        cpp.contains("!((_z_op == _ctx.bv_val((uint64_t)1, 64)))")
             && cpp.contains(" || z3::ugt(_z_len, _ctx.bv_val((uint64_t)4, 64))"),
         "when keep should lower as `!guard || keep`; got:\n{cpp}"
     );
@@ -3344,9 +3344,9 @@ end test WhenSubtypeFieldTest"#,
         "when subtype fields should exist but assign only under their active guard; got:\n{cpp}",
     );
     assert!(
-        cpp.contains("!(_z_op == _ctx.bv_val((uint64_t)1, 64))")
+        cpp.contains("!((_z_op == _ctx.bv_val((uint64_t)1, 64)))")
             && cpp.contains(" || z3::ugt(_z_wdata, _ctx.bv_val((uint64_t)20, 64))")
-            && cpp.contains("!(_z_op == _ctx.bv_val((uint64_t)0, 64))")
+            && cpp.contains("!((_z_op == _ctx.bv_val((uint64_t)0, 64)))")
             && cpp.contains(" || _z_rdata == _ctx.bv_val((uint64_t)3, 64)"),
         "when subtype keeps should remain branch-guarded so inactive impossible constraints do not make the solve UNSAT; got:\n{cpp}",
     );
@@ -3381,6 +3381,74 @@ end test WhenSubtypeUnsatDiagnosticTest"#,
     assert!(
         cpp.contains("active when subtype guard `op == WRITE` participated in the solve"),
         "UNSAT diagnostics should name when subtype guards that contributed branch constraints; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn when_subtype_field_range_attributes_are_branch_guarded() {
+    let parsed = parse_source(
+        r#"enum Op { READ, WRITE }
+
+transaction T
+    op : Op
+
+    when op == WRITE
+        wdata : uint<4> with [range(8, 15)]
+    end when
+end transaction T
+
+test WhenSubtypeRangeAttrTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t) with
+            t.op == READ
+        end randomize
+    end run
+end test WhenSubtypeRangeAttrTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("_s.add(!(_z_op == _ctx.bv_val((uint64_t)1, 64)) || z3::uge(_z_wdata, _ctx.bv_val((uint64_t)8, 64)) && z3::ule(_z_wdata, _ctx.bv_val((uint64_t)15, 64)));")
+            && !cpp.contains("_s.add(z3::uge(_z_wdata, _ctx.bv_val((uint64_t)8, 64)) && z3::ule(_z_wdata, _ctx.bv_val((uint64_t)15, 64)));"),
+        "when subtype [range] attributes should only constrain the active branch; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn when_subtype_list_fields_assign_only_when_branch_active() {
+    let parsed = parse_source(
+        r#"transaction T
+    enabled : bool
+
+    when enabled
+        items : list<uint<8>>
+        keep items.len() <= 2
+        keep for item in items
+            item > 7
+        end for
+    end when
+end transaction T
+
+test WhenSubtypeListFieldTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t) with
+            t.enabled == false
+        end randomize
+    end run
+end test WhenSubtypeListFieldTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("std::vector<uint64_t> items = {};")
+            && cpp.contains("if (t.enabled) {   // active when-subtype field items")
+            && cpp.contains("t.items.resize((size_t)_raw_items_len);")
+            && cpp.contains("t.items[0] = (uint64_t)_raw_items_0;"),
+        "when subtype list fields should exist but assign only under their active guard; got:\n{cpp}",
     );
 }
 
