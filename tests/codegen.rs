@@ -2472,6 +2472,63 @@ end test WideEndpointAutoCovTest"#,
 }
 
 #[test]
+fn mixed_width_signed_solver_extracts_twos_complement_low_bits() {
+    let parsed = parse_source(
+        r#"transaction T
+    data : uint<128>
+    delta : sint<8>
+    keep data > 0
+    keep delta < 0
+end transaction T
+
+test MixedWidthSignedSolverTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test MixedWidthSignedSolverTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("z3::expr _z_delta = _ctx.bv_const(\"delta\", 128);")
+            && cpp.contains("_z_delta >= harc_z3_bv_value(_ctx, (int64_t)(-(1LL << 7)), 128)")
+            && cpp.contains("_z_delta <= harc_z3_bv_value(_ctx, (int64_t)((1LL << 7) - 1), 128)")
+            && cpp.contains("_z_delta < harc_z3_bv_value(_ctx, (int64_t)(0), 128)")
+            && cpp.contains("uint64_t _raw_delta = harc_z3_bv_low_u64(_ctx, _eval_delta);")
+            && cpp.contains("int64_t _val_delta = (int64_t)_raw_delta;"),
+        "signed narrow fields in a wide solver block should keep signed bounds and extract low two's-complement bits; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn wide_constraint_literals_do_not_truncate_through_uint64() {
+    let parsed = parse_source(
+        r#"transaction T
+    data : bits<256>
+    keep data == 256'h8000000000000000000000000000000000000000000000000000000000000001
+end transaction T
+
+test WideLiteralSolverTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test WideLiteralSolverTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("z3::expr _z_data = _ctx.bv_const(\"data\", 256);")
+            && cpp.contains("_z_data == harc_z3_bv_value(_ctx, harc_rt::HarcWide<8>")
+            && !cpp.contains("_z_data == _ctx.bv_val((uint64_t)"),
+        "wide constraint literals should lower through word values, not uint64_t truncation; got:\n{cpp}",
+    );
+}
+
+#[test]
 fn auto_coverage_caps_1024_bit_numeric_fields() {
     let parsed = parse_source(
         r#"transaction T
@@ -2551,7 +2608,7 @@ end test Uint64UniqueTest"#,
             && cpp.contains("18446744073709551615ULL")
             && cpp.contains("9223372036854775808ULL")
             && cpp.contains("z3::expr _eval_data = _m.eval(_z_data, true).simplify();")
-            && cpp.contains("if (!_eval_data.is_numeral_u64(_raw_data))")
+            && cpp.contains("uint64_t _raw_data = harc_z3_bv_low_u64(_ctx, _eval_data);")
             && cpp.contains("uint64_t _val_data = (uint64_t)_raw_data;")
             && !cpp.contains("_m.eval(_z_data).get_numeral_uint64()"),
         "uint<64> unique randomize should keep high auto-coverage endpoints and avoid assert-heavy Z3 extraction; got:\n{cpp}",
@@ -3049,8 +3106,11 @@ end test SignedKeepTest"#,
     let cpp = cpp_tb::emit(&parsed).expect("emit");
 
     assert!(
-        cpp.contains("_s.add(_z_delta >= _ctx.bv_val((uint64_t)(-(1LL << 11)), 64));")
-            && cpp.contains("_s.add(_z_delta <= _ctx.bv_val((uint64_t)((1LL << 11) - 1), 64));"),
+        cpp.contains(
+            "_s.add(_z_delta >= harc_z3_bv_value(_ctx, (int64_t)(-(1LL << 11)), 64));",
+        ) && cpp.contains(
+            "_s.add(_z_delta <= harc_z3_bv_value(_ctx, (int64_t)((1LL << 11) - 1), 64));",
+        ),
         "sint<12> should get a signed 64-bit domain projection; got:\n{cpp}"
     );
     assert!(
@@ -3060,6 +3120,7 @@ end test SignedKeepTest"#,
     );
     assert!(
         cpp.contains("z3::expr _eval_delta = _m.eval(_z_delta, true).simplify();")
+            && cpp.contains("uint64_t _raw_delta = harc_z3_bv_low_u64(_ctx, _eval_delta);")
             && cpp.contains("int64_t _val_delta = (int64_t)_raw_delta;"),
         "signed fields should materialize model values as int64_t; got:\n{cpp}"
     );
@@ -3118,7 +3179,7 @@ end test NonRandomSolverTest"#,
     let cpp = cpp_tb::emit(&parsed).expect("emit");
 
     assert!(
-        cpp.contains("_s.add(_z_mode == _ctx.bv_val((uint64_t)(t.mode), 64));"),
+        cpp.contains("_s.add(_z_mode == harc_z3_bv_value(_ctx, t.mode, 64));"),
         "non-random fields should be pinned to the current transaction value in the solver; got:\n{cpp}"
     );
     assert!(
