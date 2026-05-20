@@ -2255,7 +2255,7 @@ end test SeededSolverTest"#,
     );
     assert!(
         cpp.contains("uint64_t _pref_")
-            && cpp.contains("_s.add(_z_val == _ctx.bv_val(_pref_")
+            && cpp.contains("_s.add(_z_val == harc_z3_bv_value(_ctx, _pref_")
             && cpp.contains("retry without seeded preferences"),
         "solver-backed randomize should first try seeded free-field preferences and fall back safely; got:\n{cpp}"
     );
@@ -2397,10 +2397,10 @@ end test SignedAutoCovPrefTest"#,
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
         cpp.contains("_delta[2]")
-            && cpp.contains("{(uint64_t)(-4LL), 4ULL}")
+            && cpp.contains("{-4LL, 4LL}")
             && cpp.contains("T.delta=-4")
             && cpp.contains("T.delta=4")
-            && cpp.contains("(uint64_t)_val_delta == (uint64_t)(-4LL)"),
+            && cpp.contains("_val_delta == -4LL"),
         "signed [range] endpoints should feed auto coverage preferences and report as signed values; got:\n{cpp}",
     );
 }
@@ -2435,13 +2435,13 @@ end test NaturalEndpointAutoCovTest"#,
             && cpp.contains("T.delta=-8")
             && cpp.contains("T.delta=7")
             && cpp.contains("{0ULL, 255ULL, 1ULL, 254ULL, 2ULL, 253ULL")
-            && cpp.contains("{(uint64_t)(-8LL), 7ULL}"),
+            && cpp.contains("{-8LL, 7LL}"),
         "natural numeric min/max and walking-bit endpoints should feed auto coverage preferences without redundant [range] attrs; got:\n{cpp}",
     );
 }
 
 #[test]
-fn wide_numeric_auto_coverage_waits_for_wide_solver_support() {
+fn wide_numeric_auto_coverage_uses_full_width_solver_values() {
     let parsed = parse_source(
         r#"transaction T
     data : uint<128>
@@ -2458,8 +2458,44 @@ end test WideEndpointAutoCovTest"#,
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
-        !cpp.contains("_data[2]") && !cpp.contains("T.data=340282366920938463463374607431768211455"),
-        ">64-bit fields should not get bogus low-64 auto coverage endpoints until solver lowering supports full-width values; got:\n{cpp}",
+        cpp.contains("z3::expr _z_data = _ctx.bv_const(\"data\", 128);")
+            && cpp.contains("static std::vector<_harc_u128>")
+            && cpp.contains("_data[34]")
+            && cpp.contains("T.data=2^128-1")
+            && cpp.contains("T.data=2^127")
+            && cpp.contains("harc_z3_bv_value(_ctx, _pref")
+            && cpp.contains("Z3_get_numeral_binary_string(_ctx, _eval_data)")
+            && cpp.contains("harc_rt::harc_wide_from_binary<4>(_bin_data)")
+            && !cpp.contains("is_numeral_u64(_raw_data)"),
+        ">64-bit fields should feed full-width auto coverage preferences and model extraction; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn auto_coverage_caps_1024_bit_numeric_fields() {
+    let parsed = parse_source(
+        r#"transaction T
+    data : bits<1024>
+end transaction T
+
+test Wide1024EndpointAutoCovTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test Wide1024EndpointAutoCovTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("z3::expr _z_data = _ctx.bv_const(\"data\", 1024);")
+            && cpp.contains("harc_rt::HarcWide<32>")
+            && cpp.contains("_data[34]")
+            && cpp.contains("T.data=2^1024-1")
+            && cpp.contains("T.data=2^1023")
+            && !cpp.contains("_data[66]"),
+        "1024-bit fields should get capped min/max and walking-pattern auto coverage, not unbounded bins; got:\n{cpp}",
     );
 }
 
