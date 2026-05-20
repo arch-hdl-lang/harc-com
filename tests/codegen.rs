@@ -2472,6 +2472,68 @@ end test WideEndpointAutoCovTest"#,
 }
 
 #[test]
+fn signed_wide_auto_coverage_uses_signed_full_width_solver_values() {
+    let parsed = parse_source(
+        r#"transaction T
+    data : sint<128>
+end transaction T
+
+test SignedWideEndpointAutoCovTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test SignedWideEndpointAutoCovTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("z3::expr _z_data = _ctx.bv_const(\"data\", 128);")
+            && cpp.contains("static std::vector<_harc_u128>")
+            && cpp.contains("T.data=-2^127")
+            && cpp.contains("T.data=2^127-1")
+            && cpp.contains("harc_z3_bv_signed_value(_ctx, _pref")
+            && cpp.contains(", 128, 128)")
+            && cpp.contains("Z3_get_numeral_binary_string(_ctx, _eval_data)")
+            && cpp.contains("harc_rt::harc_wide_from_binary<4>(_bin_data)")
+            && !cpp.contains("T.data=2^128-1"),
+        "signed >64-bit fields should feed signed full-width auto coverage preferences and model extraction; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn mixed_width_signed_wide_solver_uses_sign_extended_domain_and_preferences() {
+    let parsed = parse_source(
+        r#"transaction T
+    wide : bits<256>
+    delta : sint<128>
+    keep wide != 0
+    keep delta < 0
+end transaction T
+
+test SignedWideMixedSolverTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test SignedWideMixedSolverTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("z3::expr _z_delta = _ctx.bv_const(\"delta\", 256);")
+            && cpp.contains("_z_delta >= harc_z3_bv_signed_value(_ctx, ")
+            && cpp.contains(", 128, 256)")
+            && cpp.contains("_z_delta <= harc_z3_bv_signed_value(_ctx, ")
+            && cpp.contains("_s.add(_z_delta == harc_z3_bv_signed_value(_ctx, _pref")
+            && cpp.contains(", 128, 256));"),
+        "signed wide fields in a wider solver block should sign-extend domain bounds and preferences; got:\n{cpp}",
+    );
+}
+
+#[test]
 fn mixed_width_signed_solver_extracts_twos_complement_low_bits() {
     let parsed = parse_source(
         r#"transaction T
@@ -2493,8 +2555,8 @@ end test MixedWidthSignedSolverTest"#,
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
         cpp.contains("z3::expr _z_delta = _ctx.bv_const(\"delta\", 128);")
-            && cpp.contains("_z_delta >= harc_z3_bv_value(_ctx, (int64_t)(-(1LL << 7)), 128)")
-            && cpp.contains("_z_delta <= harc_z3_bv_value(_ctx, (int64_t)((1LL << 7) - 1), 128)")
+            && cpp.contains("_z_delta >= harc_z3_bv_signed_value(_ctx, (int64_t)(-(1LL << 7)), 8, 128)")
+            && cpp.contains("_z_delta <= harc_z3_bv_signed_value(_ctx, (int64_t)((1LL << 7) - 1), 8, 128)")
             && cpp.contains("_z_delta < harc_z3_bv_value(_ctx, (int64_t)(0), 128)")
             && cpp.contains("uint64_t _raw_delta = harc_z3_bv_low_u64(_ctx, _eval_delta);")
             && cpp.contains("int64_t _val_delta = (int64_t)_raw_delta;"),
@@ -3107,9 +3169,9 @@ end test SignedKeepTest"#,
 
     assert!(
         cpp.contains(
-            "_s.add(_z_delta >= harc_z3_bv_value(_ctx, (int64_t)(-(1LL << 11)), 64));",
+            "_s.add(_z_delta >= harc_z3_bv_signed_value(_ctx, (int64_t)(-(1LL << 11)), 12, 64));",
         ) && cpp.contains(
-            "_s.add(_z_delta <= harc_z3_bv_value(_ctx, (int64_t)((1LL << 11) - 1), 64));",
+            "_s.add(_z_delta <= harc_z3_bv_signed_value(_ctx, (int64_t)((1LL << 11) - 1), 12, 64));",
         ),
         "sint<12> should get a signed 64-bit domain projection; got:\n{cpp}"
     );
