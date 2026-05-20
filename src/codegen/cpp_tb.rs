@@ -3232,6 +3232,9 @@ fn list_len_upper_bound_from_expr(
             }
         }
         ExprKind::Binary { op, lhs, rhs } => {
+            if matches!(op, BinaryOp::OrOr) && guarded_constraint_guard(e).is_some() {
+                return list_len_upper_bound_from_expr(rhs, field, field_info, target_root);
+            }
             let lhs_is_len =
                 list_len_call_field_name(lhs, field_info, target_root).as_deref() == Some(field);
             let rhs_is_len =
@@ -8277,10 +8280,33 @@ impl Emitter {
         solver_width: u32,
         depth: usize,
     ) {
-        let list_unroll_bounds = std::collections::HashMap::new();
-        let c_name = c_ident(&f.name);
         self.pad(depth);
         write!(self.out, "_s.add(").ok();
+        self.emit_solver_range_constraint_expr(
+            f,
+            lo,
+            hi,
+            field_info,
+            target_root,
+            blocking,
+            solver_width,
+            &std::collections::HashMap::new(),
+        );
+        writeln!(self.out, ");").ok();
+    }
+
+    fn emit_solver_range_constraint_expr(
+        &mut self,
+        f: &TxnFieldInfo,
+        lo: &Expr,
+        hi: &Expr,
+        field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+        target_root: Option<&str>,
+        blocking: bool,
+        solver_width: u32,
+        list_unroll_bounds: &std::collections::HashMap<String, usize>,
+    ) {
+        let c_name = c_ident(&f.name);
         if f.signed {
             write!(self.out, "_z_{} >= ", c_name).ok();
             self.emit_constraint_expr_w(
@@ -8289,7 +8315,7 @@ impl Emitter {
                 solver_width,
                 target_root,
                 blocking,
-                &list_unroll_bounds,
+                list_unroll_bounds,
             );
             write!(self.out, " && _z_{} <= ", c_name).ok();
             self.emit_constraint_expr_w(
@@ -8298,7 +8324,7 @@ impl Emitter {
                 solver_width,
                 target_root,
                 blocking,
-                &list_unroll_bounds,
+                list_unroll_bounds,
             );
         } else {
             write!(self.out, "z3::uge(_z_{}, ", c_name).ok();
@@ -8308,7 +8334,7 @@ impl Emitter {
                 solver_width,
                 target_root,
                 blocking,
-                &list_unroll_bounds,
+                list_unroll_bounds,
             );
             write!(self.out, ") && z3::ule(_z_{}, ", c_name).ok();
             self.emit_constraint_expr_w(
@@ -8317,11 +8343,10 @@ impl Emitter {
                 solver_width,
                 target_root,
                 blocking,
-                &list_unroll_bounds,
+                list_unroll_bounds,
             );
             write!(self.out, ")").ok();
         }
-        writeln!(self.out, ");").ok();
     }
 
     /// Inline a list of top-level constraint expressions, expanding
@@ -8724,6 +8749,7 @@ impl Emitter {
         // compatibility checks. The common width grows past 64 when a
         // wide field participates; each narrower field then gets a range
         // constraint enforcing its declared width.
+        let mut guarded_field_ranges = Vec::new();
         for f in &fields {
             let c_name = c_ident(&f.name);
             if let Some(list) = &f.list {
@@ -8927,6 +8953,10 @@ impl Emitter {
                 }
             }
             if let Some((lo, hi)) = field_attr_range(f) {
+                if f.when_guard.is_some() {
+                    guarded_field_ranges.push((f, lo, hi));
+                    continue;
+                }
                 self.emit_solver_range_constraint(
                     f,
                     lo,
@@ -8976,10 +9006,20 @@ impl Emitter {
             );
             writeln!(self.out, ");").ok();
         }
-        if !guarded_branch_constraints.is_empty() {
+        if !guarded_branch_constraints.is_empty() || !guarded_field_ranges.is_empty() {
             let mut discriminator_fields = std::collections::HashSet::new();
             for c in &guarded_branch_constraints {
                 if let Some(guard) = guarded_constraint_guard(c) {
+                    collect_randomize_target_field_refs(
+                        guard,
+                        &field_info,
+                        target_root,
+                        &mut discriminator_fields,
+                    );
+                }
+            }
+            for (f, _, _) in &guarded_field_ranges {
+                if let Some(guard) = &f.when_guard {
                     collect_randomize_target_field_refs(
                         guard,
                         &field_info,
@@ -9047,6 +9087,33 @@ impl Emitter {
                     solver_width,
                     target_root,
                     blocking,
+                    &list_unroll_bounds,
+                );
+                writeln!(self.out, ");").ok();
+            }
+            for (f, lo, hi) in &guarded_field_ranges {
+                let Some(guard) = &f.when_guard else {
+                    continue;
+                };
+                self.pad(depth + 1);
+                write!(self.out, "_s.add(!(").ok();
+                self.emit_constraint_bool_expr_w(
+                    guard,
+                    &field_info,
+                    solver_width,
+                    target_root,
+                    blocking,
+                    &list_unroll_bounds,
+                );
+                write!(self.out, ") || ").ok();
+                self.emit_solver_range_constraint_expr(
+                    f,
+                    lo,
+                    hi,
+                    &field_info,
+                    target_root,
+                    blocking,
+                    solver_width,
                     &list_unroll_bounds,
                 );
                 writeln!(self.out, ");").ok();
@@ -9681,54 +9748,72 @@ impl Emitter {
             }
             if let Some(list) = &f.list {
                 let max_len = list_unroll_bounds.get(&f.name).copied().unwrap_or(0);
-                self.pad(depth + 2);
+                let guard_expr = f.when_guard.as_ref().map(|guard| {
+                    self.enum_variants_as_ints(&prefix_record_keep_expr(
+                        guard,
+                        target,
+                        &field_root_names,
+                    ))
+                });
+                let list_depth = if guard_expr.is_some() {
+                    depth + 3
+                } else {
+                    depth + 2
+                };
+                if let Some(guard) = &guard_expr {
+                    self.pad(depth + 2);
+                    write!(self.out, "if (").ok();
+                    self.emit_expr(guard);
+                    writeln!(self.out, ") {{   // active when-subtype field {}", f.name).ok();
+                }
+                self.pad(list_depth);
                 writeln!(
                     self.out,
                     "z3::expr _eval_{}_len = _m.eval(_z_{}_len, true).simplify();",
                     c_name, c_name
                 )
                 .ok();
-                self.pad(depth + 2);
+                self.pad(list_depth);
                 writeln!(self.out, "uint64_t _raw_{}_len = 0;", c_name).ok();
-                self.pad(depth + 2);
+                self.pad(list_depth);
                 writeln!(
                     self.out,
                     "if (!_eval_{}_len.is_numeral_u64(_raw_{}_len)) {{",
                     c_name, c_name
                 )
                 .ok();
-                self.pad(depth + 3);
+                self.pad(list_depth + 1);
                 writeln!(
                     self.out,
                     "sim_log_line(\"FAIL\", \"randomize(t) with: solver model for field '{}.len' is not a uint64 numeral\");",
                     escape_c(&f.name)
                 )
                 .ok();
-                self.pad(depth + 3);
+                self.pad(list_depth + 1);
                 writeln!(self.out, "errors++;").ok();
-                self.pad(depth + 2);
+                self.pad(list_depth);
                 writeln!(self.out, "}}").ok();
-                self.pad(depth + 2);
+                self.pad(list_depth);
                 writeln!(
                     self.out,
                     "if (_raw_{}_len > {}) _raw_{}_len = {};",
                     c_name, max_len, c_name, max_len
                 )
                 .ok();
-                self.pad(depth + 2);
+                self.pad(list_depth);
                 self.emit_target_field_access(target, f);
                 writeln!(self.out, ".resize((size_t)_raw_{}_len);", c_name).ok();
                 for i in 0..max_len {
-                    self.pad(depth + 2);
+                    self.pad(list_depth);
                     writeln!(self.out, "if (_raw_{}_len > {i}) {{", c_name).ok();
-                    self.pad(depth + 3);
+                    self.pad(list_depth + 1);
                     writeln!(
                         self.out,
                         "z3::expr _eval_{}_{i} = _m.eval(_z_{}_{i}, true).simplify();",
                         c_name, c_name
                     )
                     .ok();
-                    self.pad(depth + 3);
+                    self.pad(list_depth + 1);
                     if list.elem_width <= 64 {
                         let val_ty = solver_scalar_c_type(list.elem_width, list.elem_signed);
                         writeln!(
@@ -9737,7 +9822,7 @@ impl Emitter {
                             c_name, c_name
                         )
                         .ok();
-                        self.pad(depth + 3);
+                        self.pad(list_depth + 1);
                         self.emit_target_field_access(target, f);
                         writeln!(self.out, "[{i}] = ({})_raw_{}_{i};", val_ty, c_name).ok();
                     } else {
@@ -9749,20 +9834,20 @@ impl Emitter {
                             c_name, c_name
                         )
                         .ok();
-                        self.pad(depth + 3);
+                        self.pad(list_depth + 1);
                         writeln!(self.out, "if (_bin_{}_{i} == nullptr) {{", c_name).ok();
-                        self.pad(depth + 4);
+                        self.pad(list_depth + 2);
                         writeln!(
                             self.out,
                             "sim_log_line(\"FAIL\", \"randomize(t) with: solver model for field '{}[{i}]' is not a binary numeral\");",
                             escape_c(&f.name)
                         )
                         .ok();
-                        self.pad(depth + 4);
+                        self.pad(list_depth + 2);
                         writeln!(self.out, "errors++;").ok();
-                        self.pad(depth + 3);
+                        self.pad(list_depth + 1);
                         writeln!(self.out, "}}").ok();
-                        self.pad(depth + 3);
+                        self.pad(list_depth + 1);
                         self.emit_target_field_access(target, f);
                         writeln!(
                             self.out,
@@ -9771,6 +9856,10 @@ impl Emitter {
                         )
                         .ok();
                     }
+                    self.pad(list_depth);
+                    writeln!(self.out, "}}").ok();
+                }
+                if guard_expr.is_some() {
                     self.pad(depth + 2);
                     writeln!(self.out, "}}").ok();
                 }
@@ -10157,6 +10246,144 @@ impl Emitter {
         write!(self.out, ")").ok();
     }
 
+    fn emit_constraint_bool_expr_w(
+        &mut self,
+        e: &Expr,
+        field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+        width: u32,
+        target_root: Option<&str>,
+        blocking: bool,
+        list_unroll_bounds: &std::collections::HashMap<String, usize>,
+    ) {
+        match &*e.kind {
+            ExprKind::Bool(b) => {
+                write!(
+                    self.out,
+                    "_ctx.bool_val({})",
+                    if *b { "true" } else { "false" }
+                )
+                .ok();
+                return;
+            }
+            ExprKind::Ident(id) => {
+                if field_info.get(&id.name).is_some_and(|f| {
+                    f.list.is_none() && f.enum_variants.is_none() && f.width == 1 && !f.signed
+                }) {
+                    write!(
+                        self.out,
+                        "_z_{} != _ctx.bv_val((uint64_t)0, {})",
+                        c_ident(&id.name),
+                        width
+                    )
+                    .ok();
+                    return;
+                }
+            }
+            ExprKind::Field { .. } => {
+                if let Some(field) = expr_field_path(e, target_root) {
+                    if field_info.get(&field).is_some_and(|f| {
+                        f.list.is_none() && f.enum_variants.is_none() && f.width == 1 && !f.signed
+                    }) {
+                        write!(
+                            self.out,
+                            "_z_{} != _ctx.bv_val((uint64_t)0, {})",
+                            c_ident(&field),
+                            width
+                        )
+                        .ok();
+                        return;
+                    }
+                }
+            }
+            ExprKind::Paren(inner) => {
+                write!(self.out, "(").ok();
+                self.emit_constraint_bool_expr_w(
+                    inner,
+                    field_info,
+                    width,
+                    target_root,
+                    blocking,
+                    list_unroll_bounds,
+                );
+                write!(self.out, ")").ok();
+                return;
+            }
+            ExprKind::Unary {
+                op: UnaryOp::Not | UnaryOp::NotKw,
+                expr,
+            } => {
+                write!(self.out, "!(").ok();
+                self.emit_constraint_bool_expr_w(
+                    expr,
+                    field_info,
+                    width,
+                    target_root,
+                    blocking,
+                    list_unroll_bounds,
+                );
+                write!(self.out, ")").ok();
+                return;
+            }
+            ExprKind::Binary {
+                op: BinaryOp::AndAnd | BinaryOp::AndKw,
+                lhs,
+                rhs,
+            } => {
+                self.emit_constraint_bool_expr_w(
+                    lhs,
+                    field_info,
+                    width,
+                    target_root,
+                    blocking,
+                    list_unroll_bounds,
+                );
+                write!(self.out, " && ").ok();
+                self.emit_constraint_bool_expr_w(
+                    rhs,
+                    field_info,
+                    width,
+                    target_root,
+                    blocking,
+                    list_unroll_bounds,
+                );
+                return;
+            }
+            ExprKind::Binary {
+                op: BinaryOp::OrOr | BinaryOp::OrKw,
+                lhs,
+                rhs,
+            } => {
+                self.emit_constraint_bool_expr_w(
+                    lhs,
+                    field_info,
+                    width,
+                    target_root,
+                    blocking,
+                    list_unroll_bounds,
+                );
+                write!(self.out, " || ").ok();
+                self.emit_constraint_bool_expr_w(
+                    rhs,
+                    field_info,
+                    width,
+                    target_root,
+                    blocking,
+                    list_unroll_bounds,
+                );
+                return;
+            }
+            _ => {}
+        }
+        self.emit_constraint_expr_w(
+            e,
+            field_info,
+            width,
+            target_root,
+            blocking,
+            list_unroll_bounds,
+        );
+    }
+
     fn emit_constraint_expr_w(
         &mut self,
         e: &Expr,
@@ -10333,8 +10560,9 @@ impl Emitter {
             ExprKind::Bool(b) => {
                 write!(
                     self.out,
-                    "_ctx.bool_val({})",
-                    if *b { "true" } else { "false" }
+                    "_ctx.bv_val((uint64_t){}, {})",
+                    if *b { 1 } else { 0 },
+                    width
                 )
                 .ok();
             }
@@ -10356,15 +10584,28 @@ impl Emitter {
                     UnaryOp::Not | UnaryOp::NotKw => "!",
                     UnaryOp::BitNot => "~",
                 };
-                write!(self.out, "{s}").ok();
-                self.emit_constraint_expr_w(
-                    expr,
-                    field_info,
-                    width,
-                    target_root,
-                    blocking,
-                    list_unroll_bounds,
-                );
+                if matches!(op, UnaryOp::Not | UnaryOp::NotKw) {
+                    write!(self.out, "!(").ok();
+                    self.emit_constraint_bool_expr_w(
+                        expr,
+                        field_info,
+                        width,
+                        target_root,
+                        blocking,
+                        list_unroll_bounds,
+                    );
+                    write!(self.out, ")").ok();
+                } else {
+                    write!(self.out, "{s}").ok();
+                    self.emit_constraint_expr_w(
+                        expr,
+                        field_info,
+                        width,
+                        target_root,
+                        blocking,
+                        list_unroll_bounds,
+                    );
+                }
             }
             // `e in <range-or-set>` parses as ExprKind::Membership
             // (not Binary(In, …) — the `in` keyword is lexed as
@@ -10429,8 +10670,46 @@ impl Emitter {
                     Gt => ("", Some("ugt")),
                     Ge if signed => (" >= ", None),
                     Ge => ("", Some("uge")),
-                    AndAnd | AndKw => (" && ", None),
-                    OrOr | OrKw => (" || ", None),
+                    AndAnd | AndKw => {
+                        self.emit_constraint_bool_expr_w(
+                            lhs,
+                            field_info,
+                            width,
+                            target_root,
+                            blocking,
+                            list_unroll_bounds,
+                        );
+                        write!(self.out, " && ").ok();
+                        self.emit_constraint_bool_expr_w(
+                            rhs,
+                            field_info,
+                            width,
+                            target_root,
+                            blocking,
+                            list_unroll_bounds,
+                        );
+                        return;
+                    }
+                    OrOr | OrKw => {
+                        self.emit_constraint_bool_expr_w(
+                            lhs,
+                            field_info,
+                            width,
+                            target_root,
+                            blocking,
+                            list_unroll_bounds,
+                        );
+                        write!(self.out, " || ").ok();
+                        self.emit_constraint_bool_expr_w(
+                            rhs,
+                            field_info,
+                            width,
+                            target_root,
+                            blocking,
+                            list_unroll_bounds,
+                        );
+                        return;
+                    }
                     BitAnd => (" & ", None),
                     BitOr => (" | ", None),
                     BitXor => (" ^ ", None),
