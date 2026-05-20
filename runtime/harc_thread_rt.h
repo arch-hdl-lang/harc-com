@@ -134,6 +134,15 @@ inline constexpr bool is_harc_wide_v = is_harc_wide<std::remove_cv_t<std::remove
 template<typename T> struct harc_wide_words;
 template<std::size_t N> struct harc_wide_words<HarcWide<N>> { static constexpr std::size_t value = N; };
 
+template<typename T>
+inline long long harc_printf_ll(const T& v) {
+    if constexpr (is_harc_wide_v<T>) {
+        return static_cast<long long>(static_cast<uint64_t>(v));
+    } else {
+        return static_cast<long long>(v);
+    }
+}
+
 template<std::size_t A, std::size_t B>
 inline bool operator==(const HarcWide<A>& lhs, const HarcWide<B>& rhs) {
     constexpr std::size_t M = (A > B) ? A : B;
