@@ -9169,7 +9169,7 @@ impl Emitter {
             );
         }
 
-        let cache_tag = format!("_div_cache_{}", target.span.start);
+        let cache_tag = format!("_solver_site_{}", target.span.start);
         let mut free_fields: Vec<&TxnFieldInfo> = fields
             .iter()
             .filter(|f| {
@@ -9273,9 +9273,14 @@ impl Emitter {
             }
         }
 
-        // One static history vector per free field — persists across loop
-        // iterations to push the solver away from previously-seen answers.
-        for f in &free_fields {
+        // History is a semantic policy now, not the default source of
+        // diversity. Ordinary random fields are sampled by seeded
+        // preferences; only explicit `[unique]` fields keep no-repeat state
+        // across calls.
+        for f in free_fields
+            .iter()
+            .filter(|f| unique_fields.contains(&f.name))
+        {
             let c_name = c_ident(&f.name);
             let value_ty = txn_field_solver_c_type(f);
             self.pad(depth + 1);
@@ -9448,7 +9453,7 @@ impl Emitter {
         // Seeded preference values. These are hard clauses only for the first
         // check; if the preferred tuple is incompatible with the user's
         // constraints, we drop the preference stack and fall back to the
-        // diversity-only/base solve. This makes solver-backed randomize
+        // base solve. This makes solver-backed randomize
         // consume the HARC seed without turning preferences into false UNSATs.
         for f in &free_fields {
             let c_name = c_ident(&f.name);
@@ -9640,7 +9645,7 @@ impl Emitter {
         self.pad(depth + 1);
         writeln!(
             self.out,
-            "_s.push();   // seeded preference + diversity clauses (free fields only)"
+            "_s.push();   // seeded candidate preferences (free fields only)"
         )
         .ok();
         for f in &free_fields {
@@ -9685,44 +9690,33 @@ impl Emitter {
         writeln!(self.out, "_s.push();   // retry without seeded preferences").ok();
         self.pad(depth + 1);
         writeln!(self.out, "}}").ok();
-        for f in &free_fields {
+        for f in free_fields
+            .iter()
+            .filter(|f| unique_fields.contains(&f.name))
+        {
             let c_name = c_ident(&f.name);
-            if unique_fields.contains(&f.name) {
-                self.pad(depth + 1);
-                let v_expr = solver_bv_value_call("_v", f.signed, f.width, solver_width);
-                writeln!(
-                    self.out,
-                    "for (auto _v : {cache_tag}_{}) _s.add(_z_{} != {});   // [unique] policy: no repeat until exhausted",
-                    c_name, c_name, v_expr
-                )
-                .ok();
-                continue;
-            }
-            self.pad(depth + 1);
-            writeln!(
-                self.out,
-                "if ({cache_tag}_{}.size() > 32) {cache_tag}_{}.clear();",
-                c_name, c_name
-            )
-            .ok();
             self.pad(depth + 1);
             let v_expr = solver_bv_value_call("_v", f.signed, f.width, solver_width);
             writeln!(
                 self.out,
-                "for (auto _v : {cache_tag}_{}) _s.add(_z_{} != {});",
+                "for (auto _v : {cache_tag}_{}) _s.add(_z_{} != {});   // [unique] policy: no repeat until exhausted",
                 c_name, c_name, v_expr
             )
             .ok();
         }
-        // First check: with blocking. If UNSAT (cache has saturated the
-        // satisfiable space), drop the blocks and clear the cache.
+        // Final check: seeded preferences have already been dropped if they
+        // conflict. If `[unique]` history saturates the satisfiable space,
+        // clear that history and retry under the original hard constraints.
         self.pad(depth + 1);
         writeln!(self.out, "_r = _s.check();").ok();
         self.pad(depth + 1);
         writeln!(self.out, "if (_r != z3::sat) {{").ok();
         self.pad(depth + 2);
         writeln!(self.out, "_s.pop();").ok();
-        for f in &free_fields {
+        for f in free_fields
+            .iter()
+            .filter(|f| unique_fields.contains(&f.name))
+        {
             let c_name = c_ident(&f.name);
             self.pad(depth + 2);
             writeln!(self.out, "{cache_tag}_{}.clear();", c_name).ok();
@@ -9884,8 +9878,8 @@ impl Emitter {
             }
             // Every declared field is assigned from the model — equality-
             // pinned fields take their constrained value; free fields take
-            // a Z3-chosen satisfying value. Only free fields get pushed
-            // into the diversity cache.
+            // a Z3-chosen satisfying value. Only explicit `[unique]` fields
+            // get pushed into persistent no-repeat history.
             self.pad(scalar_depth);
             writeln!(
                 self.out,
@@ -9945,7 +9939,7 @@ impl Emitter {
             self.emit_target_field_access(target, f);
             writeln!(self.out, " = _val_{};", c_name).ok();
             if !pinned.contains(&f.name) {
-                if f.when_guard.is_none() {
+                if f.when_guard.is_none() && unique_fields.contains(&f.name) {
                     self.pad(scalar_depth);
                     writeln!(
                         self.out,

@@ -92,6 +92,13 @@ constraints. The implementation may use rejection sampling, randomized solver
 objectives, or a hybrid strategy, but the chosen behavior must be documented
 and stable under a seed.
 
+Current v1 codegen uses deterministic seeded candidate preferences for ordinary
+solver-backed randomization. Those preferences are added on a temporary solver
+stack and dropped if they conflict with hard user constraints, so a sampled
+preference cannot create a false UNSAT. Persistent cross-call history is
+reserved for explicit policies such as `[unique]`, not used as ordinary
+diversity.
+
 `solve_order(a, b, c)` is solver scheduling metadata, not a boolean
 constraint. The v1 code generator should validate that its arguments are
 fields of the randomize target and use the metadata to order free-field
