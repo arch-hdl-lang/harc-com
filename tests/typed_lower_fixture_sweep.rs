@@ -18,6 +18,7 @@ use std::path::Path;
 use harc::constraints::elaborate_constraints;
 use harc::constraints::typed::ConstraintProblemId;
 use harc::constraints::typed_lower::lower_problem;
+use harc::constraints::typed_verify::verify_constraint_problem;
 use harc::lexer::Span;
 use harc::parser::parse_source;
 
@@ -63,7 +64,15 @@ fn lower_problem_does_not_panic_on_any_fixture() {
                 ConstraintProblemId(total_txns as u32),
             );
             match result {
-                Ok(_) => clean_lowers += 1,
+                Ok(problem) => {
+                    verify_constraint_problem(&problem).unwrap_or_else(|errors| {
+                        panic!(
+                            "typed verifier rejected cleanly lowered problem from {}: {errors:#?}",
+                            path.display()
+                        )
+                    });
+                    clean_lowers += 1;
+                }
                 Err(_) => structured_errors += 1,
             }
         }
@@ -78,6 +87,10 @@ fn lower_problem_does_not_panic_on_any_fixture() {
     // all.  We additionally require the sweep to find at least one
     // fixture and at least one transaction — guards against the test
     // silently passing when the fixture directory has moved.
-    assert!(total_fixtures > 0, "no fixtures found in {}", fixtures_dir.display());
+    assert!(
+        total_fixtures > 0,
+        "no fixtures found in {}",
+        fixtures_dir.display()
+    );
     assert!(total_txns > 0, "no transactions found in any fixture");
 }
