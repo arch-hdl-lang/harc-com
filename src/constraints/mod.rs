@@ -8,6 +8,7 @@
 
 pub mod typed;
 pub mod typed_lower;
+pub mod typed_verify;
 
 use std::collections::BTreeMap;
 
