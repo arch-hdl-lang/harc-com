@@ -2256,8 +2256,9 @@ end test SeededSolverTest"#,
     assert!(
         cpp.contains("uint64_t _pref_")
             && cpp.contains("_s.add(_z_val == harc_z3_bv_value(_ctx, _pref_")
-            && cpp.contains("retry without seeded preferences"),
-        "solver-backed randomize should first try seeded free-field preferences and fall back safely; got:\n{cpp}"
+            && cpp.contains("retry without seeded preferences")
+            && !cpp.contains("static std::vector"),
+        "ordinary solver-backed randomize should use seeded free-field preferences without persistent diversity history; got:\n{cpp}"
     );
 }
 
@@ -2459,7 +2460,7 @@ end test WideEndpointAutoCovTest"#,
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
         cpp.contains("z3::expr _z_data = _ctx.bv_const(\"data\", 128);")
-            && cpp.contains("static std::vector<_harc_u128>")
+            && cpp.contains("_harc_u128 _pref_")
             && cpp.contains("_data[34]")
             && cpp.contains("T.data=2^128-1")
             && cpp.contains("T.data=2^127")
@@ -2490,7 +2491,7 @@ end test SignedWideEndpointAutoCovTest"#,
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
         cpp.contains("z3::expr _z_data = _ctx.bv_const(\"data\", 128);")
-            && cpp.contains("static std::vector<_harc_u128>")
+            && cpp.contains("_harc_u128 _pref_")
             && cpp.contains("T.data=-2^127")
             && cpp.contains("T.data=2^127-1")
             && cpp.contains("harc_z3_bv_signed_value(_ctx, _pref")
@@ -2696,11 +2697,11 @@ end test UniqueTest"#,
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
         cpp.contains("z3::solver _s(_ctx);")
-            && cpp.contains("for (auto _v : _div_cache_")
+            && cpp.contains("for (auto _v : _solver_site_")
             && cpp.contains("// [unique] policy: no repeat until exhausted")
-            && cpp.contains("_div_cache_")
+            && cpp.contains("_solver_site_")
             && cpp.contains(".clear();")
-            && !cpp.contains("if (_div_cache_")
+            && !cpp.contains("if (_solver_site_")
             && !cpp.contains("randomize_T(&t);"),
         "unique fields should route bare randomize through recycling solver history; got:\n{cpp}",
     );
@@ -2728,13 +2729,13 @@ end test UniqueOverrideTest"#,
     assert!(
         cpp.contains("_s.add(_z_tag == _ctx.bv_val((uint64_t)7, 64));")
             && !cpp.contains("[unique] policy: no repeat until exhausted")
-            && !cpp.contains("_div_cache_"),
+            && !cpp.contains("_solver_site_"),
         "explicit constraints on a unique field should override the unique history policy; got:\n{cpp}",
     );
 }
 
 #[test]
-fn range_constrained_unique_field_skips_unique_history_policy() {
+fn range_constrained_unique_field_uses_seeded_sampling_without_history() {
     let parsed = parse_source(
         r#"transaction T
     tag : uint<8> with [unique within test]
@@ -2753,9 +2754,11 @@ end test UniqueConstrainedTest"#,
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
-        cpp.contains("_div_cache_")
+        cpp.contains("uint64_t _pref_")
+            && cpp.contains("retry without seeded preferences")
+            && !cpp.contains("static std::vector")
             && !cpp.contains("[unique] policy: no repeat until exhausted"),
-        "constraints mentioning a unique field should suppress unique history while leaving ordinary diversity available; got:\n{cpp}",
+        "constraints mentioning a unique field should suppress unique history while preserving seeded sampling; got:\n{cpp}",
     );
 }
 
@@ -3245,8 +3248,8 @@ end test NonRandomSolverTest"#,
         "non-random fields should be pinned to the current transaction value in the solver; got:\n{cpp}"
     );
     assert!(
-        !cpp.contains("_div_cache_") || !cpp.contains("_mode;"),
-        "non-random fields should not get diversity cache declarations; got:\n{cpp}"
+        !cpp.contains("_solver_site_") || !cpp.contains("_mode;"),
+        "non-random fields should not get unique-history declarations; got:\n{cpp}"
     );
     assert!(
         !cpp.contains("uint64_t _val_mode =")
@@ -3255,7 +3258,7 @@ end test NonRandomSolverTest"#,
     );
     assert!(
         !cpp.contains("_val_mode"),
-        "non-random fields should not be assigned from the solver model or diversity cache; got:\n{cpp}"
+        "non-random fields should not be assigned from the solver model or unique history; got:\n{cpp}"
     );
     assert!(
         cpp.contains("uint64_t _val_val ="),
@@ -3986,7 +3989,7 @@ end test NestedRecordSolveOrderPinTest"#,
             && cpp.contains("p.hdr.tag = _val_hdr_tag;")
             && !cpp.contains("hdr_tag.push_back")
             && !cpp.contains("[unique] policy: no repeat until exhausted"),
-        "equality-pinned nested fields should not receive diversity or unique-history clauses; got:\n{cpp}"
+        "equality-pinned nested fields should not receive unique-history clauses; got:\n{cpp}"
     );
 }
 
