@@ -700,11 +700,10 @@ end test T"#,
 
 /// `${expr:WWx}` and `${expr:WWX}` format specs with WW > 16 route
 /// through the `HarcHexBuf128` runtime helper (printf `%s`) so the
-/// full ≤128-bit value prints. The current-default narrow path
-/// `(long long)(...)` would truncate to the lower 64 bits — fine
-/// for register dumps that fit in a uint64, useless for AES blocks.
-/// Specs with width ≤ 16 stay on the legacy `%llx` / `(long long)`
-/// path.
+/// full ≤128-bit value prints. The current-default narrow path would
+/// truncate to the lower 64 bits — fine for register dumps that fit in a
+/// uint64, useless for AES blocks. Specs with width ≤ 16 stay on the
+/// legacy `%llx` path and route arguments through `harc_printf_ll`.
 #[test]
 fn wide_hex_format_spec_routes_through_hexbuf128() {
     let parsed = parse_source(
@@ -750,6 +749,11 @@ end test T"#,
     assert!(
         cpp.contains("\"narrow=0x%08llx\""),
         "expected `%08llx` for narrow `:08x` spec:\n{}",
+        cpp
+    );
+    assert!(
+        cpp.contains("harc_rt::harc_printf_ll(harc_rt::harc_read(dut->x))"),
+        "expected narrow interpolation args to use harc_printf_ll:\n{}",
         cpp
     );
     assert!(
