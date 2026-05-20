@@ -201,8 +201,11 @@ Every lowered constraint needs an origin:
 - future `when` subtype guard/body
 
 UNSAT reporting should include the transaction type, randomize site, active
-origins, and named solver assertions. Unsupported syntax should fail during
-typed lowering, before C++ emission.
+origins, and named solver assertions. Current codegen reports participating
+`keep`/`randomize with` constraints, `[range]` attributes, and active `when`
+guards on UNSAT; typed origin chains and named solver assertions remain the
+longer-term backend target. Unsupported syntax should fail during typed
+lowering, before C++ emission.
 
 ## Migration Order
 
