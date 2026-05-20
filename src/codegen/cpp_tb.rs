@@ -11159,8 +11159,12 @@ impl Emitter {
                 write!(self.out, ", {width}, {upper_str})").ok();
             }
             None => {
-                // Narrow / decimal path: cast to long long for printf.
-                write!(self.out, "(long long)(").ok();
+                // Narrow / decimal path: preserve the legacy long-long
+                // printf ABI. HarcWide<N> has both uint64_t and _harc_u128
+                // conversions, so route through a helper to avoid ambiguous
+                // C-style casts when a wide DUT signal is printed with a
+                // narrow format such as `${sig:08x}`.
+                write!(self.out, "harc_rt::harc_printf_ll(").ok();
                 match crate::parser::parse_expr_fragment(&cap.expr) {
                     Ok(e) => self.emit_expr(&e),
                     Err(_) => {
@@ -15473,16 +15477,18 @@ fn is_wide_int_literal(e: &Expr) -> Option<Vec<String>> {
 ///   `${expr:08x}`     — width + zero-pad: `%08llx` (Python/Rust f-string)
 ///   `${expr:8d}`      — width + space-pad
 ///
-/// Plain `%` is escaped to `%%`. Every captured expression is widened to
-/// `long long` at the call site. v0 limitations: bit-slice `a[7:0]` cannot
-/// appear inside `${...}` (the format separator is `:`); strings and chars
-/// are not yet supported as interpolation targets — hoist into a let.
+/// Plain `%` is escaped to `%%`. Every captured expression is routed through
+/// `harc_rt::harc_printf_ll` at the call site for the non-wide-hex path. v0
+/// limitations: bit-slice `a[7:0]` cannot appear inside `${...}` (the format
+/// separator is `:`); strings and chars are not yet supported as interpolation
+/// targets — hoist into a let.
 /// One captured `${expr:spec}` from a HARC interpolated string.
 /// `wide_hex` is `Some((width_hex_digits, upper_case))` when the spec
 /// is `:WWx` or `:WWX` with WW > 16 — those route through the
 /// `HarcHexBuf128` runtime helper at codegen time so values up to 128
 /// bits print in full instead of being truncated to a `long long`.
-/// All other specs use the legacy `(long long)(...)` cast.
+/// All other specs use the legacy long-long printf ABI via
+/// `harc_rt::harc_printf_ll(...)`.
 struct InterpCap {
     expr: String,
     wide_hex: Option<(usize, bool)>,
