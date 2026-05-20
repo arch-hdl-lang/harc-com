@@ -67,6 +67,13 @@ pub struct FieldTypeSchema {
     pub width: Option<u32>,
     pub signedness: Signedness,
     pub enum_domain: Option<EnumDomainSchema>,
+    pub list: Option<ListTypeSchema>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListTypeSchema {
+    pub elem: Box<FieldTypeSchema>,
+    pub max_len: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +85,7 @@ pub enum FieldTypeClass {
     Bit,
     Int,
     Enum,
+    List,
     Named,
     UnsupportedBuiltin(String),
 }
@@ -787,6 +795,7 @@ fn elaborate_field_type(
                 width: type_arg_width(args),
                 signedness: Signedness::Unsigned,
                 enum_domain: None,
+                list: None,
             },
             BuiltinTy::SInt | BuiltinTy::SIntCap => FieldTypeSchema {
                 class: FieldTypeClass::SInt,
@@ -794,6 +803,7 @@ fn elaborate_field_type(
                 width: type_arg_width(args),
                 signedness: Signedness::Signed,
                 enum_domain: None,
+                list: None,
             },
             BuiltinTy::Bits => FieldTypeSchema {
                 class: FieldTypeClass::Bits,
@@ -801,6 +811,7 @@ fn elaborate_field_type(
                 width: type_arg_width(args),
                 signedness: Signedness::Unsigned,
                 enum_domain: None,
+                list: None,
             },
             BuiltinTy::Bool | BuiltinTy::BoolLower => FieldTypeSchema {
                 class: FieldTypeClass::Bool,
@@ -808,6 +819,7 @@ fn elaborate_field_type(
                 width: Some(1),
                 signedness: Signedness::NotNumeric,
                 enum_domain: None,
+                list: None,
             },
             BuiltinTy::Bit => FieldTypeSchema {
                 class: FieldTypeClass::Bit,
@@ -815,6 +827,7 @@ fn elaborate_field_type(
                 width: Some(1),
                 signedness: Signedness::Unsigned,
                 enum_domain: None,
+                list: None,
             },
             BuiltinTy::Int => FieldTypeSchema {
                 class: FieldTypeClass::Int,
@@ -822,6 +835,7 @@ fn elaborate_field_type(
                 width: Some(32),
                 signedness: Signedness::Signed,
                 enum_domain: None,
+                list: None,
             },
             other => FieldTypeSchema {
                 class: FieldTypeClass::UnsupportedBuiltin(format!("{other:?}")),
@@ -829,21 +843,51 @@ fn elaborate_field_type(
                 width: None,
                 signedness: Signedness::Unknown,
                 enum_domain: None,
+                list: None,
             },
         },
-        TypeExpr::Named { name, .. } => {
+        TypeExpr::Named { name, generics, .. } => {
             let type_name = name
                 .segments
                 .last()
                 .map(|segment| segment.name.clone())
                 .unwrap_or_default();
-            if let Some(domain) = enum_domains.get(&type_name) {
+            if matches!(type_name.as_str(), "list" | "List") {
+                let elem = generics
+                    .first()
+                    .and_then(|arg| match arg {
+                        TypeArg::Type(ty) => {
+                            Some(elaborate_field_type(ty, enum_domains, &mut Vec::new()))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| FieldTypeSchema {
+                        class: FieldTypeClass::UnsupportedBuiltin("list elem".into()),
+                        type_name: None,
+                        width: None,
+                        signedness: Signedness::Unknown,
+                        enum_domain: None,
+                        list: None,
+                    });
+                FieldTypeSchema {
+                    class: FieldTypeClass::List,
+                    type_name: Some(type_name),
+                    width: None,
+                    signedness: Signedness::NotNumeric,
+                    enum_domain: None,
+                    list: Some(ListTypeSchema {
+                        elem: Box::new(elem),
+                        max_len: list_max_len(generics),
+                    }),
+                }
+            } else if let Some(domain) = enum_domains.get(&type_name) {
                 FieldTypeSchema {
                     class: FieldTypeClass::Enum,
                     type_name: Some(type_name),
                     width: enum_width(domain.variants.len()),
                     signedness: Signedness::Unsigned,
                     enum_domain: Some(domain.clone()),
+                    list: None,
                 }
             } else {
                 FieldTypeSchema {
@@ -852,6 +896,7 @@ fn elaborate_field_type(
                     width: None,
                     signedness: Signedness::Unknown,
                     enum_domain: None,
+                    list: None,
                 }
             }
         }
@@ -1311,6 +1356,29 @@ fn type_arg_width(args: &[TypeArg]) -> Option<u32> {
             crate::ast::ExprKind::Int(s) => parse_u32_literal(s),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+fn list_max_len(args: &[TypeArg]) -> Option<usize> {
+    for arg in args {
+        if let TypeArg::Named { name, value } = arg {
+            if name.name == "max" {
+                return const_usize_expr(value);
+            }
+        }
+    }
+    args.get(1).and_then(|arg| match arg {
+        TypeArg::Expr(e) => const_usize_expr(e),
+        TypeArg::Named { value, .. } => const_usize_expr(value),
+        _ => None,
+    })
+}
+
+fn const_usize_expr(e: &Expr) -> Option<usize> {
+    match &*e.kind {
+        ExprKind::Paren(inner) => const_usize_expr(inner),
+        ExprKind::Int(s) => parse_u32_literal(s).map(|v| v as usize),
         _ => None,
     }
 }
