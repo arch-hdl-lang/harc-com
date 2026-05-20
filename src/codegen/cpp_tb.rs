@@ -678,6 +678,14 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "static inline z3::expr harc_z3_bv_value(z3::context& ctx, const harc_rt::HarcWide<N>& v, unsigned width) {{").ok();
         writeln!(e.out, "{INDENT}return harc_z3_bv_words(ctx, v.words.data(), v.words.size(), width);").ok();
         writeln!(e.out, "}}").ok();
+        writeln!(e.out, "static inline z3::expr harc_z3_bv_signed_extend(z3::context& ctx, const z3::expr& value, unsigned value_width, unsigned solver_width) {{").ok();
+        writeln!(e.out, "{INDENT}if (solver_width <= value_width) return value;").ok();
+        writeln!(e.out, "{INDENT}return z3::to_expr(ctx, Z3_mk_sign_ext(ctx, solver_width - value_width, value));").ok();
+        writeln!(e.out, "}}").ok();
+        writeln!(e.out, "template<typename T>").ok();
+        writeln!(e.out, "static inline z3::expr harc_z3_bv_signed_value(z3::context& ctx, const T& v, unsigned value_width, unsigned solver_width) {{").ok();
+        writeln!(e.out, "{INDENT}return harc_z3_bv_signed_extend(ctx, harc_z3_bv_value(ctx, v, value_width), value_width, solver_width);").ok();
+        writeln!(e.out, "}}").ok();
         writeln!(e.out, "static inline uint64_t harc_z3_bv_low_u64(z3::context& ctx, const z3::expr& value) {{").ok();
         writeln!(e.out, "{INDENT}uint64_t raw = 0;").ok();
         writeln!(e.out, "{INDENT}z3::expr simplified = value.simplify();").ok();
@@ -2459,7 +2467,7 @@ impl AutoCoverageValue {
             if terms.is_empty() {
                 "(_harc_u128)0".to_string()
             } else {
-                terms.join(" | ")
+                format!("({})", terms.join(" | "))
             }
         } else {
             format!(
@@ -2711,6 +2719,20 @@ fn unsigned_max_words(width: u32) -> Vec<u32> {
     words
 }
 
+fn signed_min_words(width: u32) -> Vec<u32> {
+    let mut words = vec![0u32; (width as usize).div_ceil(32).max(1)];
+    let sign_bit = width.saturating_sub(1);
+    words[(sign_bit / 32) as usize] = 1u32 << (sign_bit % 32);
+    words
+}
+
+fn signed_max_words(width: u32) -> Vec<u32> {
+    let mut words = unsigned_max_words(width);
+    let sign_bit = width.saturating_sub(1);
+    words[(sign_bit / 32) as usize] &= !(1u32 << (sign_bit % 32));
+    words
+}
+
 fn decimal_label_for_auto_words(width: u32, words: &[u32]) -> String {
     if width <= 64 {
         let lo = words.first().copied().unwrap_or(0) as u64;
@@ -2771,6 +2793,39 @@ fn auto_coverage_unsigned_word(value_words: Vec<u32>, width: u32) -> AutoCoverag
     AutoCoverageValue::from_words(label, value_words)
 }
 
+fn auto_coverage_signed_word(value_words: Vec<u32>, width: u32, is_min: bool) -> AutoCoverageValue {
+    let label = if is_min {
+        format!("-2^{}", width.saturating_sub(1))
+    } else {
+        format!("2^{}-1", width.saturating_sub(1))
+    };
+    AutoCoverageValue::from_words(label, value_words)
+}
+
+fn signed_domain_bound_exprs(width: u32) -> (String, String) {
+    if width == 64 {
+        ("INT64_MIN".to_string(), "INT64_MAX".to_string())
+    } else if width < 64 {
+        (
+            format!("(int64_t)(-(1LL << {}))", width.saturating_sub(1)),
+            format!("(int64_t)((1LL << {}) - 1)", width.saturating_sub(1)),
+        )
+    } else {
+        (
+            AutoCoverageValue::from_words(String::new(), signed_min_words(width)).c_expr,
+            AutoCoverageValue::from_words(String::new(), signed_max_words(width)).c_expr,
+        )
+    }
+}
+
+fn solver_bv_value_call(value: &str, signed: bool, value_width: u32, solver_width: u32) -> String {
+    if signed {
+        format!("harc_z3_bv_signed_value(_ctx, {value}, {value_width}, {solver_width})")
+    } else {
+        format!("harc_z3_bv_value(_ctx, {value}, {solver_width})")
+    }
+}
+
 fn natural_auto_coverage_endpoints(f: &TxnFieldInfo) -> Vec<AutoCoverageValue> {
     if f.width == 0 {
         return Vec::new();
@@ -2778,7 +2833,10 @@ fn natural_auto_coverage_endpoints(f: &TxnFieldInfo) -> Vec<AutoCoverageValue> {
 
     if f.signed {
         if f.width > 64 {
-            return Vec::new();
+            return vec![
+                auto_coverage_signed_word(signed_min_words(f.width), f.width, true),
+                auto_coverage_signed_word(signed_max_words(f.width), f.width, false),
+            ];
         }
         let shift = f.width.saturating_sub(1);
         let lo = if shift >= 63 {
@@ -8531,43 +8589,24 @@ impl Emitter {
                         c_name, c_name, solver_width
                     )
                     .ok();
-                    if list.elem_signed && list.elem_width <= 64 && list.elem_width < solver_width {
+                    if list.elem_signed && list.elem_width < solver_width {
+                        let (lo_expr, hi_expr) = signed_domain_bound_exprs(list.elem_width);
                         self.pad(depth + 1);
-                        if list.elem_width == 64 {
-                            writeln!(
-                                self.out,
-                                "_s.add(_z_{}_{i} >= harc_z3_bv_value(_ctx, INT64_MIN, {}));",
-                                c_name, solver_width
-                            )
-                            .ok();
-                        } else {
-                            writeln!(
-                                self.out,
-                                "_s.add(_z_{}_{i} >= harc_z3_bv_value(_ctx, (int64_t)(-(1LL << {})), {}));",
-                                c_name,
-                                list.elem_width.saturating_sub(1),
-                                solver_width
-                            )
-                            .ok();
-                        }
+                        writeln!(
+                            self.out,
+                            "_s.add(_z_{}_{i} >= {});",
+                            c_name,
+                            solver_bv_value_call(&lo_expr, true, list.elem_width, solver_width)
+                        )
+                        .ok();
                         self.pad(depth + 1);
-                        if list.elem_width == 64 {
-                            writeln!(
-                                self.out,
-                                "_s.add(_z_{}_{i} <= harc_z3_bv_value(_ctx, INT64_MAX, {}));",
-                                c_name, solver_width
-                            )
-                            .ok();
-                        } else {
-                            writeln!(
-                                self.out,
-                                "_s.add(_z_{}_{i} <= harc_z3_bv_value(_ctx, (int64_t)((1LL << {}) - 1), {}));",
-                                c_name,
-                                list.elem_width.saturating_sub(1),
-                                solver_width
-                            )
-                            .ok();
-                        }
+                        writeln!(
+                            self.out,
+                            "_s.add(_z_{}_{i} <= {});",
+                            c_name,
+                            solver_bv_value_call(&hi_expr, true, list.elem_width, solver_width)
+                        )
+                        .ok();
                     } else if !list.elem_signed && list.elem_width < solver_width {
                         self.pad(depth + 1);
                         writeln!(
@@ -8582,23 +8621,43 @@ impl Emitter {
                         write!(self.out, "if (").ok();
                         self.emit_target_field_access(target, f);
                         if list.elem_width <= 64 {
-                            write!(
-                                self.out,
-                                ".size() > {i}) _s.add(_z_{}_{i} == harc_z3_bv_value(_ctx, ",
-                                c_name
-                            )
-                            .ok();
+                            write!(self.out, ".size() > {i}) _s.add(_z_{}_{i} == ", c_name)
+                                .ok();
+                            if list.elem_signed {
+                                write!(self.out, "harc_z3_bv_signed_value(_ctx, ").ok();
+                            } else {
+                                write!(self.out, "harc_z3_bv_value(_ctx, ").ok();
+                            }
                             self.emit_target_field_access(target, f);
-                            writeln!(self.out, "[{i}], {}));", solver_width).ok();
+                            if list.elem_signed {
+                                writeln!(
+                                    self.out,
+                                    "[{i}], {}, {}));",
+                                    list.elem_width, solver_width
+                                )
+                                .ok();
+                            } else {
+                                writeln!(self.out, "[{i}], {}));", solver_width).ok();
+                            }
                         } else {
-                            write!(
-                                self.out,
-                            ".size() > {i}) _s.add(_z_{}_{i} == harc_z3_bv_value(_ctx, ",
-                            c_name
-                            )
-                            .ok();
+                            write!(self.out, ".size() > {i}) _s.add(_z_{}_{i} == ", c_name)
+                                .ok();
+                            if list.elem_signed {
+                                write!(self.out, "harc_z3_bv_signed_value(_ctx, ").ok();
+                            } else {
+                                write!(self.out, "harc_z3_bv_value(_ctx, ").ok();
+                            }
                             self.emit_target_field_access(target, f);
-                            writeln!(self.out, "[{i}], {}));", solver_width).ok();
+                            if list.elem_signed {
+                                writeln!(
+                                    self.out,
+                                    "[{i}], {}, {}));",
+                                    list.elem_width, solver_width
+                                )
+                                .ok();
+                            } else {
+                                writeln!(self.out, "[{i}], {}));", solver_width).ok();
+                            }
                         }
                     }
                 }
@@ -8624,43 +8683,24 @@ impl Emitter {
                     solver_width
                 )
                 .ok();
-            } else if f.signed && f.width <= 64 && f.width < solver_width {
+            } else if f.signed && f.width < solver_width {
+                let (lo_expr, hi_expr) = signed_domain_bound_exprs(f.width);
                 self.pad(depth + 1);
-                if f.width == 64 {
-                    writeln!(
-                        self.out,
-                        "_s.add(_z_{} >= harc_z3_bv_value(_ctx, INT64_MIN, {}));",
-                        c_name, solver_width
-                    )
-                    .ok();
-                } else {
-                    writeln!(
-                        self.out,
-                        "_s.add(_z_{} >= harc_z3_bv_value(_ctx, (int64_t)(-(1LL << {})), {}));",
-                        c_name,
-                        f.width.saturating_sub(1),
-                        solver_width
-                    )
-                    .ok();
-                }
+                writeln!(
+                    self.out,
+                    "_s.add(_z_{} >= {});",
+                    c_name,
+                    solver_bv_value_call(&lo_expr, true, f.width, solver_width)
+                )
+                .ok();
                 self.pad(depth + 1);
-                if f.width == 64 {
-                    writeln!(
-                        self.out,
-                        "_s.add(_z_{} <= harc_z3_bv_value(_ctx, INT64_MAX, {}));",
-                        c_name, solver_width
-                    )
-                    .ok();
-                } else {
-                    writeln!(
-                        self.out,
-                        "_s.add(_z_{} <= harc_z3_bv_value(_ctx, (int64_t)((1LL << {}) - 1), {}));",
-                        c_name,
-                        f.width.saturating_sub(1),
-                        solver_width
-                    )
-                    .ok();
-                }
+                writeln!(
+                    self.out,
+                    "_s.add(_z_{} <= {});",
+                    c_name,
+                    solver_bv_value_call(&hi_expr, true, f.width, solver_width)
+                )
+                .ok();
             } else if !f.signed && f.width < solver_width {
                 self.pad(depth + 1);
                 writeln!(
@@ -8673,18 +8713,45 @@ impl Emitter {
             if f.non_random {
                 self.pad(depth + 1);
                 if f.width <= 64 {
-                    write!(self.out, "_s.add(_z_{} == harc_z3_bv_value(_ctx, ", c_name).ok();
+                    if f.signed {
+                        write!(
+                            self.out,
+                            "_s.add(_z_{} == harc_z3_bv_signed_value(_ctx, ",
+                            c_name
+                        )
+                        .ok();
+                    } else {
+                        write!(self.out, "_s.add(_z_{} == harc_z3_bv_value(_ctx, ", c_name)
+                            .ok();
+                    }
                     self.emit_target_field_access(target, f);
-                    writeln!(self.out, ", {}));", solver_width).ok();
+                    if f.signed {
+                        writeln!(self.out, ", {}, {}));", f.width, solver_width).ok();
+                    } else {
+                        writeln!(self.out, ", {}));", solver_width).ok();
+                    }
                 } else {
-                    write!(
-                        self.out,
-                        "_s.add(_z_{} == harc_z3_bv_value(_ctx, ",
-                        c_name
-                    )
-                    .ok();
+                    if f.signed {
+                        write!(
+                            self.out,
+                            "_s.add(_z_{} == harc_z3_bv_signed_value(_ctx, ",
+                            c_name
+                        )
+                        .ok();
+                    } else {
+                        write!(
+                            self.out,
+                            "_s.add(_z_{} == harc_z3_bv_value(_ctx, ",
+                            c_name
+                        )
+                        .ok();
+                    }
                     self.emit_target_field_access(target, f);
-                    writeln!(self.out, ", {}));", solver_width).ok();
+                    if f.signed {
+                        writeln!(self.out, ", {}, {}));", f.width, solver_width).ok();
+                    } else {
+                        writeln!(self.out, ", {}));", solver_width).ok();
+                    }
                 }
             }
             if let Some((lo, hi)) = field_attr_range(f) {
@@ -9256,10 +9323,12 @@ impl Emitter {
         for f in &free_fields {
             let c_name = c_ident(&f.name);
             self.pad(depth + 1);
+            let pref_expr = format!("_pref_{cache_tag}_{c_name}");
             writeln!(
                 self.out,
-                "_s.add(_z_{} == harc_z3_bv_value(_ctx, _pref_{cache_tag}_{}, {}));",
-                c_name, c_name, solver_width
+                "_s.add(_z_{} == {});",
+                c_name,
+                solver_bv_value_call(&pref_expr, f.signed, f.width, solver_width)
             )
             .ok();
         }
@@ -9297,10 +9366,11 @@ impl Emitter {
             let c_name = c_ident(&f.name);
             if unique_fields.contains(&f.name) {
                 self.pad(depth + 1);
+                let v_expr = solver_bv_value_call("_v", f.signed, f.width, solver_width);
                 writeln!(
                     self.out,
-                    "for (auto _v : {cache_tag}_{}) _s.add(_z_{} != harc_z3_bv_value(_ctx, _v, {}));   // [unique] policy: no repeat until exhausted",
-                    c_name, c_name, solver_width
+                    "for (auto _v : {cache_tag}_{}) _s.add(_z_{} != {});   // [unique] policy: no repeat until exhausted",
+                    c_name, c_name, v_expr
                 )
                 .ok();
                 continue;
@@ -9313,10 +9383,11 @@ impl Emitter {
             )
             .ok();
             self.pad(depth + 1);
+            let v_expr = solver_bv_value_call("_v", f.signed, f.width, solver_width);
             writeln!(
                 self.out,
-                "for (auto _v : {cache_tag}_{}) _s.add(_z_{} != harc_z3_bv_value(_ctx, _v, {}));",
-                c_name, c_name, solver_width
+                "for (auto _v : {cache_tag}_{}) _s.add(_z_{} != {});",
+                c_name, c_name, v_expr
             )
             .ok();
         }
@@ -15116,7 +15187,7 @@ fn txn_field_has_solver_policy(f: &Field, enum_names: &std::collections::HashSet
             BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => {
                 type_arg_width(args).is_some_and(|w| w <= 1024)
             }
-            BuiltinTy::SInt | BuiltinTy::SIntCap => type_arg_width(args).is_some_and(|w| w <= 64),
+            BuiltinTy::SInt | BuiltinTy::SIntCap => type_arg_width(args).is_some_and(|w| w <= 1024),
             _ => false,
         },
         TypeExpr::Named { name, .. } => name
