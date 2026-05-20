@@ -111,6 +111,22 @@ struct HarcWide {
     }
 };
 
+template<std::size_t N>
+inline HarcWide<N> harc_wide_from_binary(const char* bits) {
+    HarcWide<N> v;
+    if (!bits) return v;
+    std::size_t len = 0;
+    while (bits[len] != '\0') ++len;
+    for (std::size_t src = 0; src < len; ++src) {
+        const char ch = bits[len - 1 - src];
+        if (ch != '1') continue;
+        const std::size_t word = src / 32;
+        const std::size_t bit = src % 32;
+        if (word < N) v.words[word] |= (uint32_t{1} << bit);
+    }
+    return v;
+}
+
 template<typename T> struct is_harc_wide : std::false_type {};
 template<std::size_t N> struct is_harc_wide<HarcWide<N>> : std::true_type {};
 template<typename T>

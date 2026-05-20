@@ -115,9 +115,12 @@ treating the preference as a hard failure. The same runtime state should report
 hit/miss/blocked summaries at test end so users can see which generated
 preferences still need attention.
 
-TODO: full-width min/max and walking-pattern auto coverage for `>64`-bit fields
-requires wide solver/model extraction before generated goals can be represented
-safely without truncation.
+The current scaffold supports full-width unsigned `uint<N>`/`bits<N>` solver
+preferences and model extraction up to the language target of 1024 bits, so
+wide-bus auto min/max and walking patterns are represented structurally instead
+of being truncated through `uint64_t`. Signed values above 64 bits remain a
+typed-lowering follow-up because their comparison and division semantics need
+explicit sign-extension rules in the solver backend.
 
 Future aggregate constraints should keep the same default-random rule. A random
 list/array should look like an ordinary transaction field, not `rand list<...>`.
