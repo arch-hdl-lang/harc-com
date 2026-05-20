@@ -8777,8 +8777,9 @@ impl Emitter {
         // Context + solver. We use `z3::solver` (not `optimize`) so UNSAT
         // is reported faithfully — `optimize` can return a "best partial"
         // model when soft+hard constraints conflict, hiding real UNSAT.
-        // Diversity comes from the per-call-site blocking-clause cache
-        // built up across iterations (see below).
+        // Ordinary diversity comes from deterministic seeded candidate
+        // preferences; persistent no-repeat history is reserved for explicit
+        // `[unique]` fields.
         self.pad(depth + 1);
         writeln!(self.out, "z3::context _ctx;").ok();
         self.pad(depth + 1);
@@ -9180,10 +9181,8 @@ impl Emitter {
         }
 
         // Detect fields the user has equality-pinned (e.g. `t.addr == 24`).
-        // Those fields have only one satisfying value, so adding a blocking
-        // clause for them makes the whole problem UNSAT after the first
-        // call. We block only the *free* fields. Diversity then comes from
-        // the free-field cache.
+        // Those fields have only one satisfying value, so they are removed
+        // from free-field preference sampling and uniqueness history.
         let pinned: std::collections::HashSet<String> = hard_constraints
             .iter()
             .copied()
