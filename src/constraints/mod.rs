@@ -6,6 +6,8 @@
 //! Follow-on solver work should lower from these schemas instead of emitting
 //! Z3 directly from raw syntax.
 
+pub mod typed;
+
 use std::collections::BTreeMap;
 
 use crate::ast::{
