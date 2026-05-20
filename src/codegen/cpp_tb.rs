@@ -2781,6 +2781,32 @@ fn field_attr_unique(f: &TxnFieldInfo) -> bool {
     f.attrs.iter().any(|a| a.name.name == "unique")
 }
 
+fn field_attr_unique_scope(f: &TxnFieldInfo) -> &str {
+    f.attrs
+        .iter()
+        .find(|a| a.name.name == "unique")
+        .and_then(|a| {
+            a.args.iter().find_map(|arg| match arg {
+                AttrArg::WithinScope(scope) => Some(scope.name.as_str()),
+                _ => None,
+            })
+        })
+        .unwrap_or("test")
+}
+
+fn c_scope_ident(scope: &str) -> String {
+    scope
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn push_auto_coverage_value_unique(values: &mut Vec<AutoCoverageValue>, value: AutoCoverageValue) {
     if !values.iter().any(|v| v.words == value.words) {
         values.push(value);
@@ -8630,6 +8656,14 @@ impl Emitter {
                     if let Some(field) =
                         randomize_target_field_name(target, &field_info, target_root)
                     {
+                        if let Some(info) = field_info.get(&field) {
+                            if info.non_random || info.list.is_some() || info.width == 0 {
+                                self.errors.push(format!(
+                                    "randomize({ty}) with `dist`: target `{field}` must be a random scalar field of transaction `{ty}`"
+                                ));
+                                continue;
+                            }
+                        }
                         for entry in entries {
                             self.validate_randomize_constraint_dependencies(
                                 ty,
@@ -8667,6 +8701,22 @@ impl Emitter {
                         if let Some(field) =
                             randomize_target_field_name(arg, &field_info, target_root)
                         {
+                            if let Some(info) = field_info.get(&field) {
+                                if info.non_random {
+                                    self.errors.push(format!(
+                                        "randomize({ty}) with `solve_order`: field `{field}` is non-random and cannot be ordered"
+                                    ));
+                                    valid = false;
+                                    continue;
+                                }
+                                if info.list.is_some() || info.width == 0 {
+                                    self.errors.push(format!(
+                                        "randomize({ty}) with `solve_order`: field `{field}` must be a scalar random field"
+                                    ));
+                                    valid = false;
+                                    continue;
+                                }
+                            }
                             fields.push(field);
                         } else {
                             self.errors.push(format!(
@@ -9159,6 +9209,15 @@ impl Emitter {
                 }
             })
             .collect();
+        for ordered_fields in &solve_order_directives {
+            for field in ordered_fields {
+                if pinned.contains(field) {
+                    self.errors.push(format!(
+                        "randomize({ty}) with `solve_order`: field `{field}` is equality-pinned and cannot affect sampling order"
+                    ));
+                }
+            }
+        }
         let mut constrained_fields = std::collections::HashSet::new();
         for c in &hard_constraints {
             collect_randomize_target_field_refs(
@@ -9282,12 +9341,13 @@ impl Emitter {
             .filter(|f| unique_fields.contains(&f.name))
         {
             let c_name = c_ident(&f.name);
+            let scope = c_scope_ident(field_attr_unique_scope(f));
             let value_ty = txn_field_solver_c_type(f);
             self.pad(depth + 1);
             writeln!(
                 self.out,
-                "static std::vector<{}> {cache_tag}_{};",
-                value_ty, c_name
+                "static std::vector<{}> {cache_tag}_unique_{}_{};",
+                value_ty, scope, c_name
             )
             .ok();
         }
@@ -9695,12 +9755,16 @@ impl Emitter {
             .filter(|f| unique_fields.contains(&f.name))
         {
             let c_name = c_ident(&f.name);
+            let scope = c_scope_ident(field_attr_unique_scope(f));
             self.pad(depth + 1);
             let v_expr = solver_bv_value_call("_v", f.signed, f.width, solver_width);
             writeln!(
                 self.out,
-                "for (auto _v : {cache_tag}_{}) _s.add(_z_{} != {});   // [unique] policy: no repeat until exhausted",
-                c_name, c_name, v_expr
+                "for (auto _v : {cache_tag}_unique_{scope}_{}) _s.add(_z_{} != {});   // [unique within {}] policy: no repeat until exhausted",
+                c_name,
+                c_name,
+                v_expr,
+                escape_c(field_attr_unique_scope(f))
             )
             .ok();
         }
@@ -9718,8 +9782,9 @@ impl Emitter {
             .filter(|f| unique_fields.contains(&f.name))
         {
             let c_name = c_ident(&f.name);
+            let scope = c_scope_ident(field_attr_unique_scope(f));
             self.pad(depth + 2);
-            writeln!(self.out, "{cache_tag}_{}.clear();", c_name).ok();
+            writeln!(self.out, "{cache_tag}_unique_{scope}_{}.clear();", c_name).ok();
         }
         self.pad(depth + 2);
         writeln!(self.out, "_r = _s.check();").ok();
@@ -9940,10 +10005,11 @@ impl Emitter {
             writeln!(self.out, " = _val_{};", c_name).ok();
             if !pinned.contains(&f.name) {
                 if f.when_guard.is_none() && unique_fields.contains(&f.name) {
+                    let scope = c_scope_ident(field_attr_unique_scope(f));
                     self.pad(scalar_depth);
                     writeln!(
                         self.out,
-                        "{cache_tag}_{}.push_back(_val_{});",
+                        "{cache_tag}_unique_{scope}_{}.push_back(_val_{});",
                         c_name, c_name
                     )
                     .ok();
