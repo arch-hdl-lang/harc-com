@@ -2697,13 +2697,15 @@ end test UniqueTest"#,
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
         cpp.contains("z3::solver _s(_ctx);")
+            && cpp.contains("static std::vector<uint64_t> _solver_site_")
+            && cpp.contains("_unique_test_tag;")
             && cpp.contains("for (auto _v : _solver_site_")
-            && cpp.contains("// [unique] policy: no repeat until exhausted")
-            && cpp.contains("_solver_site_")
+            && cpp.contains("_unique_test_tag) _s.add")
+            && cpp.contains("// [unique within test] policy: no repeat until exhausted")
             && cpp.contains(".clear();")
             && !cpp.contains("if (_solver_site_")
             && !cpp.contains("randomize_T(&t);"),
-        "unique fields should route bare randomize through recycling solver history; got:\n{cpp}",
+        "unique fields should route bare randomize through scoped recycling solver history; got:\n{cpp}",
     );
 }
 
@@ -2846,6 +2848,62 @@ end test CyclicSolveOrderTest"#,
     assert!(
         err.0.contains("solve-order hints form a cycle"),
         "expected solve-order cycle diagnostic; got: {}",
+        err.0,
+    );
+}
+
+#[test]
+fn randomize_rejects_inert_solve_order_fields() {
+    let non_random = parse_source(
+        r#"transaction T
+    !mode : uint<8>
+    len : uint<8>
+end transaction T
+
+test NonRandomSolveOrderTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t) with
+            solve_order(t.mode, t.len)
+        end randomize
+    end run
+end test NonRandomSolveOrderTest"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&non_random).unwrap_err();
+    assert!(
+        err.0.contains("solve_order")
+            && err.0.contains("field `mode` is non-random")
+            && err.0.contains("cannot be ordered"),
+        "expected non-random solve_order diagnostic; got: {}",
+        err.0,
+    );
+
+    let pinned = parse_source(
+        r#"transaction T
+    addr : uint<16>
+    len : uint<8>
+end transaction T
+
+test PinnedSolveOrderTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t) with
+            solve_order(t.addr, t.len)
+            t.addr == 7
+        end randomize
+    end run
+end test PinnedSolveOrderTest"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&pinned).unwrap_err();
+    assert!(
+        err.0.contains("solve_order")
+            && err.0.contains("field `addr` is equality-pinned")
+            && err.0.contains("cannot affect sampling order"),
+        "expected pinned solve_order diagnostic; got: {}",
         err.0,
     );
 }
@@ -3085,6 +3143,37 @@ end test BlockingDistRuntimeDepTest"#,
             "harc_rng_dist({{(int64_t)(1), (int64_t)(harc_rt::harc_read(dut->max_len)), (int64_t)(10)}})"
         ),
         "blocking randomize should snapshot runtime-dependent dist entries; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn randomize_dist_directives_reject_non_random_targets() {
+    let parsed = parse_source(
+        r#"transaction T
+    !mode : uint<8>
+    items : list<uint<8>>
+    len : uint<8>
+end transaction T
+
+test BadDistPolicyTargetTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t) with
+            t.mode dist { 1 :/ 10 }
+            t.items dist { 1 :/ 10 }
+        end randomize
+    end run
+end test BadDistPolicyTargetTest"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&parsed).unwrap_err();
+    assert!(
+        err.0.contains("dist")
+            && err.0.contains("target `mode` must be a random scalar field")
+            && err.0.contains("target `items` must be a random scalar field"),
+        "expected dist policy target diagnostics; got: {}",
+        err.0,
     );
 }
 
@@ -3978,18 +4067,13 @@ test NestedRecordSolveOrderPinTest
 end test NestedRecordSolveOrderPinTest"#,
     )
     .unwrap();
-    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    let err = cpp_tb::emit(&parsed).unwrap_err();
     assert!(
-        cpp.contains("// solve_order(hdr.tag, other) accepted as solver scheduling metadata")
-            && cpp.contains("// solve-order sampling order: other"),
-        "nested solve_order args should validate as target fields and pinned nested fields should be removed from free-field ordering; got:\n{cpp}"
-    );
-    assert!(
-        cpp.contains("_z_hdr_tag == _ctx.bv_val((uint64_t)3, 64)")
-            && cpp.contains("p.hdr.tag = _val_hdr_tag;")
-            && !cpp.contains("hdr_tag.push_back")
-            && !cpp.contains("[unique] policy: no repeat until exhausted"),
-        "equality-pinned nested fields should not receive unique-history clauses; got:\n{cpp}"
+        err.0.contains("solve_order")
+            && err.0.contains("field `hdr.tag` is equality-pinned")
+            && err.0.contains("cannot affect sampling order"),
+        "pinned nested solve_order fields should get a clear diagnostic; got: {}",
+        err.0,
     );
 }
 
