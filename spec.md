@@ -150,12 +150,16 @@ New language features must preserve this property. The check is mechanical: for 
 
 **Block syntax: end-construct style throughout.** HARC follows ARCH's `end <kind> [<name>]` convention for all block bodies — no curly braces for declaration bodies, statement-block bodies, or compound expressions. A named declaration closes with `end <kind> <name>` (e.g., `end module AxiSlaveTb`); an anonymous compound block closes with `end <kind>` (e.g., `end on`, `end fork`, `end when`). The named-end form is the parser-validating, AI-codegen-friendly shape that ARCH §2.4 commits to, and HARC mirrors it. Curly braces are reserved for *value literals* — set literals (`{READ, WRITE}`), distribution literals (`dist {[0..0xFF] :/ 80}`), record/struct literals — never for blocks.
 
-**Discard pattern `_` in binding positions.** A lone underscore is a binding name that says "I need to introduce a binding here but don't intend to read it." It is not an identifier — it cannot be referenced from the body, and reusing the same `_` in nested binders does not collide. v1 admits `_` in two positions:
+**Discard pattern `_` in binding positions.** A lone underscore is a binding name that says "I need to introduce a binding here but don't intend to read it." It is not an identifier — it cannot be referenced from the body, and reusing the same `_` in nested binders does not collide. v1 admits `_` in discard-capable binders:
 
-- The for-loop variable: `for _ in 0 .. N ... end for` — repeat a body N times without naming the index.
+- Let bindings: `let _ = expr` — evaluate `expr` and intentionally discard the result.
+- Function, hookable, and event-handler parameters: `function f(_: uint<8>)`, `hookable h(_: T)`, `on ev(_)` — accept the value while signaling that the body does not read it.
+- Loop variables: `for _ in 0 .. N ... end for` and `keep for _ in items ... end for` — repeat or quantify without naming the index/item.
 - The randomize-result discard (planned, Phase 1b): `randomize(_) with ...` — when the call is for its constraint side-effect rather than the produced value.
 
 ```
+let _ = consume(1)
+
 for _ in 0 .. 10
     wait 1 cycle             // common idiom: just spin N cycles
 end for
