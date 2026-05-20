@@ -17,10 +17,10 @@
 //!   - parenthesized expressions
 //!   - `in` membership against `Set` and `Range`
 //!   - set and range literals
+//!   - relation application, including recursive alias/block expansion
 //!
 //! Explicitly out of scope for this phase (structured `LowerError`,
 //! never a panic):
-//!   - relation application (`relation_name(args)`) — Phase 2b
 //!   - field-method calls (`items.len()`)             — Phase 2b
 //!   - foreach / ForAll                                 — Phase 2c
 //!   - `when` subtype guards                            — Phase 7
@@ -31,11 +31,11 @@
 
 use std::collections::BTreeMap;
 
-use crate::ast::{BinaryOp as AstBinaryOp, Expr, ExprKind, UnaryOp as AstUnaryOp};
+use crate::ast::{BinaryOp as AstBinaryOp, CallArg, Expr, ExprKind, UnaryOp as AstUnaryOp};
 use crate::constraints::typed::*;
 use crate::constraints::{
-    ConstraintElaboration, ConstraintOrigin, EnumDomainSchema, EnumVariantSchema,
-    FieldTypeClass, FieldTypeSchema, TxnFieldSchema, TxnSchema,
+    ConstraintElaboration, ConstraintOrigin, EnumDomainSchema, EnumVariantSchema, FieldTypeClass,
+    FieldTypeSchema, RelationBodySchema, TxnFieldSchema, TxnSchema,
 };
 use crate::lexer::Span;
 
@@ -50,25 +50,58 @@ pub enum LowerError {
     /// Integer literal does not fit in the inferred / required width.
     BvLitOutOfRange { width: u32, value: u128, span: Span },
     /// Operand widths disagree on an op that requires matching widths.
-    WidthMismatch { op: &'static str, lhs_width: u32, rhs_width: u32, span: Span },
+    WidthMismatch {
+        op: &'static str,
+        lhs_width: u32,
+        rhs_width: u32,
+        span: Span,
+    },
     /// Operand signednesses disagree on an op that requires matching signs.
-    SignednessMismatch { op: &'static str, lhs_sign: Sign, rhs_sign: Sign, span: Span },
+    SignednessMismatch {
+        op: &'static str,
+        lhs_sign: Sign,
+        rhs_sign: Sign,
+        span: Span,
+    },
     /// Bare identifier resolves to neither a field nor an enum variant.
     UnresolvedIdent { name: String, span: Span },
     /// A field-path lookup against `FieldEnv` failed.
     FieldNotFound { path: String, span: Span },
     /// Operands of a logical op are not both Bool.
-    NonBoolLogical { op: &'static str, found: CType, span: Span },
+    NonBoolLogical {
+        op: &'static str,
+        found: CType,
+        span: Span,
+    },
     /// Operand of a bitwise op is not BV.
-    NonBvBitwise { op: &'static str, found: CType, span: Span },
+    NonBvBitwise {
+        op: &'static str,
+        found: CType,
+        span: Span,
+    },
     /// Shift amount has wrong type / sign.
     BadShiftAmount { found: CType, span: Span },
     /// Element of a `Set` literal does not match the inferred elem type.
-    SetElemTypeMismatch { expected: CType, found: CType, span: Span },
+    SetElemTypeMismatch {
+        expected: CType,
+        found: CType,
+        span: Span,
+    },
     /// `in` rhs is neither a Set nor a Range.
     InRhsNotSetOrRange { found: CType, span: Span },
     /// An AST construct is not supported in v1 typed lowering.
     UnsupportedV1 { feature: &'static str, span: Span },
+    /// Relation call names a relation that does not exist.
+    UnknownRelation { name: String, span: Span },
+    /// Relation call supplies the wrong number of arguments.
+    RelationArityMismatch {
+        name: String,
+        expected: usize,
+        found: usize,
+        span: Span,
+    },
+    /// Relation expansion is recursive.
+    RecursiveRelation { name: String, span: Span },
     /// Generic catch-all for AST nodes the constraint sub-language does
     /// not allow at all (e.g. string literals, fork-call, time literals).
     DisallowedInConstraint { what: &'static str, span: Span },
@@ -79,9 +112,8 @@ pub enum LowerError {
 // ─── Lowering context ───────────────────────────────────────────────
 
 struct LowerCtx<'a> {
-    /// Kept for Phase 2b (relation expansion) and Phase 7 (when-subtype
-    /// guards) — both reach back into the full elaboration.
-    #[allow(dead_code)]
+    /// Full elaboration context used for relation expansion now and
+    /// `when` subtype guards in a later phase.
     elab: &'a ConstraintElaboration,
     /// Kept for diagnostic messages that name the target record.
     #[allow(dead_code)]
@@ -145,13 +177,20 @@ pub fn lower_problem(
         if ctx.at_error_cap() {
             break;
         }
-        let expr = lower_top_clause(&mut ctx, &keep.expr);
-        let assertion_name = mint_clause_name(&mut ctx, &keep.expr);
-        clauses.push(CTypedClause {
-            origin: keep.origin.clone(),
-            expr,
-            assertion_name,
-        });
+        for (origin, expr_ast) in
+            expand_top_level_clause(&mut ctx, &keep.expr, keep.origin.clone(), &mut Vec::new())
+        {
+            if ctx.at_error_cap() {
+                break;
+            }
+            let expr = lower_top_clause(&mut ctx, &expr_ast);
+            let assertion_name = mint_clause_name(&mut ctx, &expr_ast);
+            clauses.push(CTypedClause {
+                origin,
+                expr,
+                assertion_name,
+            });
+        }
     }
 
     // 2. `randomize-with` body (if present).
@@ -160,13 +199,23 @@ pub fn lower_problem(
             if ctx.at_error_cap() {
                 break;
             }
-            let lowered = lower_top_clause(&mut ctx, expr);
-            let assertion_name = mint_clause_name(&mut ctx, expr);
-            clauses.push(CTypedClause {
-                origin: ConstraintOrigin::RandomizeWith { span: expr.span },
-                expr: lowered,
-                assertion_name,
-            });
+            for (origin, expr_ast) in expand_top_level_clause(
+                &mut ctx,
+                expr,
+                ConstraintOrigin::RandomizeWith { span: expr.span },
+                &mut Vec::new(),
+            ) {
+                if ctx.at_error_cap() {
+                    break;
+                }
+                let lowered = lower_top_clause(&mut ctx, &expr_ast);
+                let assertion_name = mint_clause_name(&mut ctx, &expr_ast);
+                clauses.push(CTypedClause {
+                    origin,
+                    expr: lowered,
+                    assertion_name,
+                });
+            }
         }
     }
 
@@ -270,7 +319,8 @@ fn collect_enum_entries(elab: &ConstraintElaboration) -> Vec<EnumDomainEntry> {
         }
     };
 
-    let walk_fields = |fields: &[TxnFieldSchema], record_domain: &mut dyn FnMut(&EnumDomainSchema)| {
+    let walk_fields = |fields: &[TxnFieldSchema],
+                       record_domain: &mut dyn FnMut(&EnumDomainSchema)| {
         for f in fields {
             if let Some(dom) = &f.ty.enum_domain {
                 record_domain(dom);
@@ -374,17 +424,30 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &Expr) -> CTypedExpr {
             ctx.bottom(span, CExprKind::BvLit { value: 0 })
         }
 
-        // Not yet supported (Phase 2b/2c).  Structured error; no panic.
-        ExprKind::Call { callee, .. } => {
-            // Distinguish relation call vs field-method call for better
-            // diagnostics.
-            let feature = match &*callee.kind {
-                ExprKind::Field { .. } => "field-method call (e.g. .len())",
-                _ => "relation application",
-            };
-            ctx.record_error(LowerError::UnsupportedV1 { feature, span });
-            ctx.bottom(span, CExprKind::BoolLit(false))
-        }
+        // Calls are limited to relation applications for now. Field
+        // methods and other call shapes remain structured errors; no panic.
+        ExprKind::Call { callee, .. } => match &*callee.kind {
+            ExprKind::Field { .. } => {
+                ctx.record_error(LowerError::UnsupportedV1 {
+                    feature: "field-method call (e.g. .len())",
+                    span,
+                });
+                ctx.bottom(span, CExprKind::BoolLit(false))
+            }
+            ExprKind::Ident(id) => {
+                match expand_relation_call_as_expr(ctx, &id.name, expr, &mut Vec::new()) {
+                    Some(expanded) => lower_expr(ctx, &expanded),
+                    None => ctx.bottom(span, CExprKind::BoolLit(false)),
+                }
+            }
+            _ => {
+                ctx.record_error(LowerError::UnsupportedV1 {
+                    feature: "constraint call callee",
+                    span,
+                });
+                ctx.bottom(span, CExprKind::BoolLit(false))
+            }
+        },
 
         // Everything else in ExprKind that doesn't belong inside a
         // constraint body: ImplicitSelf, Index, BitSlice, ForkCall, Cast,
@@ -404,7 +467,10 @@ fn lower_ident(ctx: &mut LowerCtx<'_>, name: &str, span: Span) -> CTypedExpr {
     //    resolve to enum variants when they aren't field paths.
     if let Some(&(domain, variant_idx)) = ctx.enum_variant_lookup.get(name) {
         return CTypedExpr::new(
-            CExprKind::EnumLit { domain, variant_idx },
+            CExprKind::EnumLit {
+                domain,
+                variant_idx,
+            },
             CType::Enum { domain },
             span,
         );
@@ -422,12 +488,7 @@ fn lower_ident(ctx: &mut LowerCtx<'_>, name: &str, span: Span) -> CTypedExpr {
     ctx.bottom(span, CExprKind::FieldRef(FieldPath::single(name)))
 }
 
-fn lower_field_access(
-    ctx: &mut LowerCtx<'_>,
-    target: &Expr,
-    name: &str,
-    span: Span,
-) -> CTypedExpr {
+fn lower_field_access(ctx: &mut LowerCtx<'_>, target: &Expr, name: &str, span: Span) -> CTypedExpr {
     let parts = collect_dotted(target);
     let mut path_parts = match parts {
         Some(p) => p,
@@ -488,7 +549,11 @@ fn lower_unary(ctx: &mut LowerCtx<'_>, op: AstUnaryOp, expr: &Expr, span: Span) 
         }
         (CUnaryOp::Neg, other) | (CUnaryOp::BitNot, other) => {
             ctx.record_error(LowerError::NonBvBitwise {
-                op: if matches!(cop, CUnaryOp::Neg) { "-" } else { "~" },
+                op: if matches!(cop, CUnaryOp::Neg) {
+                    "-"
+                } else {
+                    "~"
+                },
                 found: other.clone(),
                 span,
             });
@@ -605,7 +670,11 @@ fn coerce_literal(ctx: &mut LowerCtx<'_>, lit: CTypedExpr, target: CType) -> CTy
         });
         return CTypedExpr::new(CExprKind::BvLit { value }, CType::Bottom, lit.span);
     }
-    CTypedExpr::new(CExprKind::BvLit { value }, CType::BV { width, sign }, lit.span)
+    CTypedExpr::new(
+        CExprKind::BvLit { value },
+        CType::BV { width, sign },
+        lit.span,
+    )
 }
 
 fn type_check_binary(
@@ -662,7 +731,10 @@ fn type_check_binary(
                 });
                 return CType::Bottom;
             }
-            CType::BV { width: lw, sign: ls }
+            CType::BV {
+                width: lw,
+                sign: ls,
+            }
         }
         // Comparison: BV × BV → Bool (matching widths + signs); also
         // permits Bool × Bool and Enum × Enum (same domain) for Eq/Ne.
@@ -673,8 +745,7 @@ fn type_check_binary(
             }
             // Enum == Enum (same domain).
             if matches!(op, Eq | Ne) {
-                if let (CType::Enum { domain: d1 }, CType::Enum { domain: d2 }) =
-                    (&lhs.ty, &rhs.ty)
+                if let (CType::Enum { domain: d1 }, CType::Enum { domain: d2 }) = (&lhs.ty, &rhs.ty)
                 {
                     if d1 == d2 {
                         return CType::Bool;
@@ -773,17 +844,15 @@ fn type_check_binary(
                     return CType::Bottom;
                 }
             }
-            CType::BV { width: lw, sign: ls }
+            CType::BV {
+                width: lw,
+                sign: ls,
+            }
         }
     }
 }
 
-fn lower_membership(
-    ctx: &mut LowerCtx<'_>,
-    elem: &Expr,
-    rhs: &Expr,
-    span: Span,
-) -> CTypedExpr {
+fn lower_membership(ctx: &mut LowerCtx<'_>, elem: &Expr, rhs: &Expr, span: Span) -> CTypedExpr {
     let elem_lowered = lower_expr(ctx, elem);
 
     // If the elem has a concrete BV type, use it to constrain literals
@@ -797,7 +866,9 @@ fn lower_membership(
         None
     };
     let rhs_lowered = match (&*rhs.kind, &elem_hint) {
-        (ExprKind::SetLit(items), Some(hint)) => lower_set_lit_with_hint(ctx, items, hint, rhs.span),
+        (ExprKind::SetLit(items), Some(hint)) => {
+            lower_set_lit_with_hint(ctx, items, hint, rhs.span)
+        }
         (ExprKind::RangeLit { lo, hi }, Some(hint)) => {
             lower_range_lit_with_hint(ctx, lo.as_ref(), hi.as_ref(), hint, rhs.span)
         }
@@ -963,26 +1034,34 @@ fn parse_int_literal(text: &str) -> Option<u128> {
     // Strip optional sized prefix like "8'h2A" / "8'd42" / "8'b1010" /
     // "8'o17".  Spec syntax for HARC literals; matches what the lexer
     // emits.
-    let (radix, body): (u32, &str) =
-        if let Some(idx) = normalized.find('\'') {
-            let rest = &normalized[idx + 1..];
-            let (radix_char, rest) = rest.split_at(rest.chars().next().map_or(0, |c| c.len_utf8()));
-            match radix_char {
-                "h" | "H" => (16, rest),
-                "d" | "D" => (10, rest),
-                "b" | "B" => (2, rest),
-                "o" | "O" => (8, rest),
-                _ => (10, &normalized[idx + 1..]),
-            }
-        } else if let Some(stripped) = normalized.strip_prefix("0x").or_else(|| normalized.strip_prefix("0X")) {
-            (16, stripped)
-        } else if let Some(stripped) = normalized.strip_prefix("0b").or_else(|| normalized.strip_prefix("0B")) {
-            (2, stripped)
-        } else if let Some(stripped) = normalized.strip_prefix("0o").or_else(|| normalized.strip_prefix("0O")) {
-            (8, stripped)
-        } else {
-            (10, normalized.as_str())
-        };
+    let (radix, body): (u32, &str) = if let Some(idx) = normalized.find('\'') {
+        let rest = &normalized[idx + 1..];
+        let (radix_char, rest) = rest.split_at(rest.chars().next().map_or(0, |c| c.len_utf8()));
+        match radix_char {
+            "h" | "H" => (16, rest),
+            "d" | "D" => (10, rest),
+            "b" | "B" => (2, rest),
+            "o" | "O" => (8, rest),
+            _ => (10, &normalized[idx + 1..]),
+        }
+    } else if let Some(stripped) = normalized
+        .strip_prefix("0x")
+        .or_else(|| normalized.strip_prefix("0X"))
+    {
+        (16, stripped)
+    } else if let Some(stripped) = normalized
+        .strip_prefix("0b")
+        .or_else(|| normalized.strip_prefix("0B"))
+    {
+        (2, stripped)
+    } else if let Some(stripped) = normalized
+        .strip_prefix("0o")
+        .or_else(|| normalized.strip_prefix("0O"))
+    {
+        (8, stripped)
+    } else {
+        (10, normalized.as_str())
+    };
     u128::from_str_radix(body, radix).ok()
 }
 
@@ -1075,6 +1154,316 @@ fn mint_clause_name(ctx: &mut LowerCtx<'_>, _expr: &Expr) -> String {
     format!("c_{seq}")
 }
 
+// ─── Relation Expansion ────────────────────────────────────────────
+
+fn expand_top_level_clause(
+    ctx: &mut LowerCtx<'_>,
+    expr: &Expr,
+    default_origin: ConstraintOrigin,
+    stack: &mut Vec<String>,
+) -> Vec<(ConstraintOrigin, Expr)> {
+    if let ExprKind::Call { callee, .. } = &*expr.kind {
+        if let ExprKind::Ident(id) = &*callee.kind {
+            if let Some(expanded) = expand_top_level_relation_call(ctx, &id.name, expr, stack) {
+                return expanded;
+            }
+        }
+    }
+
+    vec![(default_origin, expand_relation_subtree(ctx, expr, stack))]
+}
+
+fn expand_top_level_relation_call(
+    ctx: &mut LowerCtx<'_>,
+    name: &str,
+    call: &Expr,
+    stack: &mut Vec<String>,
+) -> Option<Vec<(ConstraintOrigin, Expr)>> {
+    let rel = match ctx.elab.relation(name) {
+        Some(rel) => rel.clone(),
+        None => {
+            ctx.record_error(LowerError::UnknownRelation {
+                name: name.to_string(),
+                span: call.span,
+            });
+            return Some(Vec::new());
+        }
+    };
+    let ExprKind::Call { args, .. } = &*call.kind else {
+        return None;
+    };
+    if rel.params.len() != args.len() {
+        ctx.record_error(LowerError::RelationArityMismatch {
+            name: name.to_string(),
+            expected: rel.params.len(),
+            found: args.len(),
+            span: call.span,
+        });
+        return Some(Vec::new());
+    }
+    let subst = build_relation_subst(&rel.params, args);
+
+    if stack.iter().any(|n| n == name) {
+        ctx.record_error(LowerError::RecursiveRelation {
+            name: name.to_string(),
+            span: call.span,
+        });
+        return Some(Vec::new());
+    }
+    stack.push(name.to_string());
+
+    let mut out = Vec::new();
+    match &rel.body {
+        RelationBodySchema::Block(clauses) => {
+            for clause in clauses {
+                let substituted = substitute_relation_idents(&clause.expr, &subst);
+                out.extend(expand_top_level_clause(
+                    ctx,
+                    &substituted,
+                    clause.origin.clone(),
+                    stack,
+                ));
+            }
+        }
+        RelationBodySchema::Alias(clause) => {
+            let substituted = substitute_relation_idents(&clause.expr, &subst);
+            out.extend(expand_top_level_clause(
+                ctx,
+                &substituted,
+                clause.origin.clone(),
+                stack,
+            ));
+        }
+    }
+
+    stack.pop();
+    Some(out)
+}
+
+fn expand_relation_call_as_expr(
+    ctx: &mut LowerCtx<'_>,
+    name: &str,
+    call: &Expr,
+    stack: &mut Vec<String>,
+) -> Option<Expr> {
+    let expanded = expand_top_level_relation_call(ctx, name, call, stack)?;
+    let exprs: Vec<Expr> = expanded.into_iter().map(|(_, expr)| expr).collect();
+    Some(and_join(&exprs, call.span))
+}
+
+fn build_relation_subst(
+    params: &[crate::constraints::RelationParamSchema],
+    args: &[CallArg],
+) -> BTreeMap<String, Expr> {
+    let mut subst = BTreeMap::new();
+    for (param, arg) in params.iter().zip(args.iter()) {
+        let expr = match arg {
+            CallArg::Expr(expr) => expr.clone(),
+            CallArg::Named { value, .. } => value.clone(),
+        };
+        subst.insert(param.name.clone(), expr);
+    }
+    subst
+}
+
+fn expand_relation_subtree(ctx: &mut LowerCtx<'_>, expr: &Expr, stack: &mut Vec<String>) -> Expr {
+    let span = expr.span;
+    if let ExprKind::Call { callee, .. } = &*expr.kind {
+        if let ExprKind::Ident(id) = &*callee.kind {
+            if ctx.elab.relation(&id.name).is_some() {
+                if let Some(expanded) = expand_relation_call_as_expr(ctx, &id.name, expr, stack) {
+                    return expanded;
+                }
+            }
+        }
+    }
+
+    let kind = match &*expr.kind {
+        ExprKind::Field { target, name } => ExprKind::Field {
+            target: expand_relation_subtree(ctx, target, stack),
+            name: name.clone(),
+        },
+        ExprKind::Index { target, index } => ExprKind::Index {
+            target: expand_relation_subtree(ctx, target, stack),
+            index: expand_relation_subtree(ctx, index, stack),
+        },
+        ExprKind::BitSlice { target, hi, lo } => ExprKind::BitSlice {
+            target: expand_relation_subtree(ctx, target, stack),
+            hi: expand_relation_subtree(ctx, hi, stack),
+            lo: expand_relation_subtree(ctx, lo, stack),
+        },
+        ExprKind::Call { callee, args } => ExprKind::Call {
+            callee: expand_relation_subtree(ctx, callee, stack),
+            args: args
+                .iter()
+                .map(|arg| match arg {
+                    CallArg::Expr(e) => CallArg::Expr(expand_relation_subtree(ctx, e, stack)),
+                    CallArg::Named { name, value } => CallArg::Named {
+                        name: name.clone(),
+                        value: expand_relation_subtree(ctx, value, stack),
+                    },
+                })
+                .collect(),
+        },
+        ExprKind::ForEachConstraint { var, iter, body } => ExprKind::ForEachConstraint {
+            var: var.clone(),
+            iter: expand_relation_subtree(ctx, iter, stack),
+            body: body
+                .iter()
+                .map(|e| expand_relation_subtree(ctx, e, stack))
+                .collect(),
+        },
+        ExprKind::Cast { expr, ty } => ExprKind::Cast {
+            expr: expand_relation_subtree(ctx, expr, stack),
+            ty: ty.clone(),
+        },
+        ExprKind::Unary { op, expr } => ExprKind::Unary {
+            op: *op,
+            expr: expand_relation_subtree(ctx, expr, stack),
+        },
+        ExprKind::Binary { op, lhs, rhs } => ExprKind::Binary {
+            op: *op,
+            lhs: expand_relation_subtree(ctx, lhs, stack),
+            rhs: expand_relation_subtree(ctx, rhs, stack),
+        },
+        ExprKind::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => ExprKind::Ternary {
+            cond: expand_relation_subtree(ctx, cond, stack),
+            then_branch: expand_relation_subtree(ctx, then_branch, stack),
+            else_branch: expand_relation_subtree(ctx, else_branch, stack),
+        },
+        ExprKind::Paren(inner) => ExprKind::Paren(expand_relation_subtree(ctx, inner, stack)),
+        ExprKind::Membership { expr, set } => ExprKind::Membership {
+            expr: expand_relation_subtree(ctx, expr, stack),
+            set: expand_relation_subtree(ctx, set, stack),
+        },
+        ExprKind::SetLit(items) => ExprKind::SetLit(
+            items
+                .iter()
+                .map(|e| expand_relation_subtree(ctx, e, stack))
+                .collect(),
+        ),
+        ExprKind::RangeLit { lo, hi } => ExprKind::RangeLit {
+            lo: lo.as_ref().map(|e| expand_relation_subtree(ctx, e, stack)),
+            hi: hi.as_ref().map(|e| expand_relation_subtree(ctx, e, stack)),
+        },
+        other => other.clone(),
+    };
+    Expr::new(kind, span)
+}
+
+fn substitute_relation_idents(expr: &Expr, subst: &BTreeMap<String, Expr>) -> Expr {
+    let span = expr.span;
+    let kind = match &*expr.kind {
+        ExprKind::Ident(id) => {
+            if let Some(replacement) = subst.get(&id.name) {
+                return Expr::new((*replacement.kind).clone(), span);
+            }
+            ExprKind::Ident(id.clone())
+        }
+        ExprKind::Field { target, name } => ExprKind::Field {
+            target: substitute_relation_idents(target, subst),
+            name: name.clone(),
+        },
+        ExprKind::Index { target, index } => ExprKind::Index {
+            target: substitute_relation_idents(target, subst),
+            index: substitute_relation_idents(index, subst),
+        },
+        ExprKind::BitSlice { target, hi, lo } => ExprKind::BitSlice {
+            target: substitute_relation_idents(target, subst),
+            hi: substitute_relation_idents(hi, subst),
+            lo: substitute_relation_idents(lo, subst),
+        },
+        ExprKind::Call { callee, args } => ExprKind::Call {
+            callee: substitute_relation_idents(callee, subst),
+            args: args
+                .iter()
+                .map(|arg| match arg {
+                    CallArg::Expr(e) => CallArg::Expr(substitute_relation_idents(e, subst)),
+                    CallArg::Named { name, value } => CallArg::Named {
+                        name: name.clone(),
+                        value: substitute_relation_idents(value, subst),
+                    },
+                })
+                .collect(),
+        },
+        ExprKind::ForEachConstraint { var, iter, body } => {
+            let mut scoped = subst.clone();
+            scoped.remove(&var.name);
+            ExprKind::ForEachConstraint {
+                var: var.clone(),
+                iter: substitute_relation_idents(iter, subst),
+                body: body
+                    .iter()
+                    .map(|e| substitute_relation_idents(e, &scoped))
+                    .collect(),
+            }
+        }
+        ExprKind::Cast { expr, ty } => ExprKind::Cast {
+            expr: substitute_relation_idents(expr, subst),
+            ty: ty.clone(),
+        },
+        ExprKind::Unary { op, expr } => ExprKind::Unary {
+            op: *op,
+            expr: substitute_relation_idents(expr, subst),
+        },
+        ExprKind::Binary { op, lhs, rhs } => ExprKind::Binary {
+            op: *op,
+            lhs: substitute_relation_idents(lhs, subst),
+            rhs: substitute_relation_idents(rhs, subst),
+        },
+        ExprKind::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => ExprKind::Ternary {
+            cond: substitute_relation_idents(cond, subst),
+            then_branch: substitute_relation_idents(then_branch, subst),
+            else_branch: substitute_relation_idents(else_branch, subst),
+        },
+        ExprKind::Paren(inner) => ExprKind::Paren(substitute_relation_idents(inner, subst)),
+        ExprKind::Membership { expr, set } => ExprKind::Membership {
+            expr: substitute_relation_idents(expr, subst),
+            set: substitute_relation_idents(set, subst),
+        },
+        ExprKind::SetLit(items) => ExprKind::SetLit(
+            items
+                .iter()
+                .map(|e| substitute_relation_idents(e, subst))
+                .collect(),
+        ),
+        ExprKind::RangeLit { lo, hi } => ExprKind::RangeLit {
+            lo: lo.as_ref().map(|e| substitute_relation_idents(e, subst)),
+            hi: hi.as_ref().map(|e| substitute_relation_idents(e, subst)),
+        },
+        other => other.clone(),
+    };
+    Expr::new(kind, span)
+}
+
+fn and_join(exprs: &[Expr], span: Span) -> Expr {
+    if exprs.is_empty() {
+        return Expr::new(ExprKind::Bool(true), span);
+    }
+    let mut iter = exprs.iter().cloned();
+    let mut acc = iter.next().expect("checked non-empty");
+    for next in iter {
+        let joined_span = acc.span.merge(next.span);
+        acc = Expr::new(
+            ExprKind::Binary {
+                op: AstBinaryOp::AndAnd,
+                lhs: acc,
+                rhs: next,
+            },
+            joined_span,
+        );
+    }
+    acc
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1087,10 +1476,7 @@ mod tests {
         crate::constraints::elaborate_constraints(&file)
     }
 
-    fn lower_with_body(
-        src: &str,
-        clauses: &[&str],
-    ) -> Result<CTypedProblem, Vec<LowerError>> {
+    fn lower_with_body(src: &str, clauses: &[&str]) -> Result<CTypedProblem, Vec<LowerError>> {
         let elab = elaborate(src);
         let txn = elab
             .transactions
@@ -1126,7 +1512,10 @@ end transaction RegPair
         // FieldRef may resolve via either the bare-field or the
         // strip-target-prefix path; both yield "addr" or "p.addr"
         // textually.  Check the operator + literal coercion shape.
-        assert!(display.contains("==") && display.contains("24:u8"), "got: {display}");
+        assert!(
+            display.contains("==") && display.contains("24:u8"),
+            "got: {display}"
+        );
     }
 
     #[test]
@@ -1150,8 +1539,14 @@ end transaction X
 "#;
         let err = lower_with_body(src, &["v == 256"]).expect_err("should fail: 256 > u8::MAX");
         assert!(
-            err.iter()
-                .any(|e| matches!(e, LowerError::BvLitOutOfRange { width: 8, value: 256, .. })),
+            err.iter().any(|e| matches!(
+                e,
+                LowerError::BvLitOutOfRange {
+                    width: 8,
+                    value: 256,
+                    ..
+                }
+            )),
             "errors: {err:?}"
         );
     }
@@ -1165,7 +1560,8 @@ end transaction X
 "#;
         let err = lower_with_body(src, &["nope == 1"]).expect_err("should fail: no `nope`");
         assert!(
-            err.iter().any(|e| matches!(e, LowerError::UnresolvedIdent { name, .. } if name == "nope")),
+            err.iter()
+                .any(|e| matches!(e, LowerError::UnresolvedIdent { name, .. } if name == "nope")),
             "errors: {err:?}"
         );
     }
@@ -1181,7 +1577,8 @@ end transaction X
 "#;
         let err = lower_with_body(src, &["v"]).expect_err("should fail: clause is not bool");
         assert!(
-            err.iter().any(|e| matches!(e, LowerError::NonBoolLogical { op: "clause", .. })),
+            err.iter()
+                .any(|e| matches!(e, LowerError::NonBoolLogical { op: "clause", .. })),
             "errors: {err:?}"
         );
     }
@@ -1209,9 +1606,131 @@ end transaction RegPair
             assert_eq!(c.expr.ty, CType::Bool, "clause not Bool: {}", c.expr);
         }
         // Every assertion name is unique.
-        let names: std::collections::HashSet<&str> =
-            problem.constraints.iter().map(|c| c.assertion_name.as_str()).collect();
+        let names: std::collections::HashSet<&str> = problem
+            .constraints
+            .iter()
+            .map(|c| c.assertion_name.as_str())
+            .collect();
         assert_eq!(names.len(), problem.constraints.len());
+    }
+
+    #[test]
+    fn lowers_alias_relation_call() {
+        let src = r#"
+transaction Req
+  addr : uint<32>
+end transaction Req
+
+relation Aligned(r: Req) = r.addr % 4 == 0
+"#;
+        let problem = lower_with_body(src, &["Aligned(p)"]).expect("relation should inline");
+        assert_eq!(problem.constraints.len(), 1);
+        assert_eq!(problem.constraints[0].expr.ty, CType::Bool);
+        assert!(matches!(
+            problem.constraints[0].origin,
+            ConstraintOrigin::RelationExpansion { ref relation, .. } if relation == "Aligned"
+        ));
+        let display = format!("{}", problem.constraints[0].expr);
+        assert!(
+            display.contains("%") && display.contains("addr"),
+            "got: {display}"
+        );
+    }
+
+    #[test]
+    fn lowers_block_relation_call_to_multiple_clauses() {
+        let src = r#"
+transaction Req
+  addr : uint<32>
+  len  : uint<8>
+end transaction Req
+
+relation Bounded(r: Req)
+  r.len in [1..16]
+  r.addr % 4 == 0
+end relation Bounded
+"#;
+        let problem = lower_with_body(src, &["Bounded(p)"]).expect("relation should inline");
+        assert_eq!(problem.constraints.len(), 2);
+        assert!(
+            problem
+                .constraints
+                .iter()
+                .all(|c| c.expr.ty == CType::Bool
+                    && matches!(c.origin, ConstraintOrigin::RelationExpansion { ref relation, .. } if relation == "Bounded")),
+            "{:#?}",
+            problem.constraints
+        );
+    }
+
+    #[test]
+    fn lowers_nested_relation_call_inside_expression() {
+        let src = r#"
+transaction Req
+  addr : uint<32>
+  len  : uint<8>
+end transaction Req
+
+relation Bounded(r: Req)
+  r.len in [1..16]
+  r.addr % 4 == 0
+end relation Bounded
+
+relation HighAddr(r: Req) = r.addr >= 0x10000
+relation Legal(r: Req) = Bounded(r) && HighAddr(r)
+"#;
+        let problem = lower_with_body(src, &["Legal(p)"]).expect("relation should inline");
+        assert_eq!(problem.constraints.len(), 1);
+        assert_eq!(problem.constraints[0].expr.ty, CType::Bool);
+        let display = format!("{}", problem.constraints[0].expr);
+        assert!(
+            display.contains("&&") && display.contains("len") && display.contains("addr"),
+            "got: {display}"
+        );
+    }
+
+    #[test]
+    fn rejects_relation_arity_mismatch() {
+        let src = r#"
+transaction Req
+  addr : uint<32>
+end transaction Req
+
+relation Aligned(r: Req) = r.addr % 4 == 0
+"#;
+        let err = lower_with_body(src, &["Aligned()"]).expect_err("arity mismatch");
+        assert!(
+            err.iter().any(|e| matches!(
+                e,
+                LowerError::RelationArityMismatch {
+                    name,
+                    expected: 1,
+                    found: 0,
+                    ..
+                } if name == "Aligned"
+            )),
+            "errors: {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_recursive_relation_expansion() {
+        let src = r#"
+transaction Req
+  addr : uint<32>
+end transaction Req
+
+relation A(r: Req) = B(r)
+relation B(r: Req) = A(r)
+"#;
+        let err = lower_with_body(src, &["A(p)"]).expect_err("recursive relation");
+        assert!(
+            err.iter().any(|e| matches!(
+                e,
+                LowerError::RecursiveRelation { name, .. } if name == "A"
+            )),
+            "errors: {err:?}"
+        );
     }
 
     #[test]
