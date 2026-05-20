@@ -33,8 +33,9 @@ use std::collections::BTreeMap;
 use crate::ast::{BinaryOp as AstBinaryOp, CallArg, Expr, ExprKind, UnaryOp as AstUnaryOp};
 use crate::constraints::typed::*;
 use crate::constraints::{
-    ConstraintElaboration, ConstraintOrigin, EnumDomainSchema, EnumVariantSchema, FieldTypeClass,
-    FieldTypeSchema, RelationBodySchema, TxnFieldSchema, TxnSchema,
+    ConstraintElaboration, ConstraintOrigin, EnumDomainSchema, EnumVariantSchema,
+    FieldAttrArgSchema, FieldTypeClass, FieldTypeSchema, RelationBodySchema, TxnFieldSchema,
+    TxnSchema,
 };
 use crate::lexer::Span;
 
@@ -174,6 +175,7 @@ pub fn lower_problem(
     ctx.env.enums = collect_enum_entries(elab);
 
     let mut clauses = Vec::new();
+    let mut solve_order: Option<Vec<FieldPath>> = None;
 
     // 1. Transaction-level `keep` clauses.
     for keep in &target.keeps {
@@ -202,6 +204,10 @@ pub fn lower_problem(
             if ctx.at_error_cap() {
                 break;
             }
+            if let ExprKind::SolveOrder { args } = &*expr.kind {
+                merge_solve_order_directive(&mut ctx, args, &mut solve_order, expr.span);
+                continue;
+            }
             for (origin, expr_ast) in expand_top_level_clause(
                 &mut ctx,
                 expr,
@@ -222,9 +228,20 @@ pub fn lower_problem(
         }
     }
 
-    // 3. solve_order: not extracted from AST yet — left as None until
-    //    the AST carries a `solve_order(...)` parse node (today it's a
-    //    field attribute the runtime reads ad-hoc).
+    // 3. Field attributes that produce hard constraints. `[range]` is
+    //    solver-visible; `[dist]`, `[unique]`, and policy attributes
+    //    remain metadata for later runtime/sampling phases.
+    for field in &target.fields {
+        if ctx.at_error_cap() {
+            break;
+        }
+        for clause in lower_field_attr_constraints(&mut ctx, field) {
+            if ctx.at_error_cap() {
+                break;
+            }
+            clauses.push(clause);
+        }
+    }
 
     let origin = match randomize_with_body {
         Some(_) => ProblemOrigin::RandomizeSite {
@@ -242,7 +259,7 @@ pub fn lower_problem(
         origin,
         env: ctx.env,
         constraints: clauses,
-        solve_order: None,
+        solve_order,
     };
 
     if ctx.errors.is_empty() {
@@ -834,6 +851,154 @@ fn coerce_literal(ctx: &mut LowerCtx<'_>, lit: CTypedExpr, target: CType) -> CTy
         CType::BV { width, sign },
         lit.span,
     )
+}
+
+fn coerce_expr_to_bv_hint(ctx: &mut LowerCtx<'_>, expr: CTypedExpr, hint: &CType) -> CTypedExpr {
+    if matches!(expr.kind, CExprKind::BvLit { .. }) && expr.ty.as_bv() != hint.as_bv() {
+        return coerce_literal(ctx, expr, hint.clone());
+    }
+
+    let CExprKind::Unary { op, expr: inner } = expr.kind else {
+        return expr;
+    };
+    if !matches!(op, CUnaryOp::Neg) || !matches!(inner.kind, CExprKind::BvLit { .. }) {
+        return CTypedExpr::new(CExprKind::Unary { op, expr: inner }, expr.ty, expr.span);
+    }
+    if !matches!(
+        hint,
+        CType::BV {
+            sign: Sign::Signed,
+            ..
+        }
+    ) {
+        return CTypedExpr::new(CExprKind::Unary { op, expr: inner }, expr.ty, expr.span);
+    }
+    let coerced = coerce_literal(ctx, *inner, hint.clone());
+    CTypedExpr::new(
+        CExprKind::Unary {
+            op,
+            expr: Box::new(coerced),
+        },
+        hint.clone(),
+        expr.span,
+    )
+}
+
+fn lower_field_attr_constraints(
+    ctx: &mut LowerCtx<'_>,
+    field: &TxnFieldSchema,
+) -> Vec<CTypedClause> {
+    let mut clauses = Vec::new();
+    let path = FieldPath(field.path.clone());
+    let Some(info) = ctx.env.lookup(&path) else {
+        return clauses;
+    };
+    let field_ty = info.ty.clone();
+    if !field_ty.is_bv() {
+        return clauses;
+    }
+
+    for attr in &field.attrs {
+        if attr.name != "range" {
+            continue;
+        }
+        let (Some(FieldAttrArgSchema::Expr(lo)), Some(FieldAttrArgSchema::Expr(hi))) =
+            (attr.args.first(), attr.args.get(1))
+        else {
+            ctx.record_error(LowerError::UnsupportedV1 {
+                feature: "range attribute arguments",
+                span: attr.span,
+            });
+            continue;
+        };
+
+        let field_expr = CTypedExpr::new(
+            CExprKind::FieldRef(path.clone()),
+            field_ty.clone(),
+            field.span,
+        );
+        let lo_lowered = lower_expr(ctx, lo);
+        let hi_lowered = lower_expr(ctx, hi);
+        let lo_expr = coerce_expr_to_bv_hint(ctx, lo_lowered, &field_ty);
+        let hi_expr = coerce_expr_to_bv_hint(ctx, hi_lowered, &field_ty);
+        let expr = CTypedExpr::new(
+            CExprKind::InRange {
+                expr: Box::new(field_expr),
+                lo: Some(Box::new(lo_expr)),
+                hi: Some(Box::new(hi_expr)),
+            },
+            CType::Bool,
+            attr.span,
+        );
+        let assertion_name = mint_clause_name(ctx, lo);
+        clauses.push(CTypedClause {
+            origin: ConstraintOrigin::FieldAttribute {
+                field: field.name.clone(),
+                attr: attr.name.clone(),
+                span: attr.span,
+            },
+            expr,
+            assertion_name,
+        });
+    }
+
+    clauses
+}
+
+fn merge_solve_order_directive(
+    ctx: &mut LowerCtx<'_>,
+    args: &[Expr],
+    solve_order: &mut Option<Vec<FieldPath>>,
+    span: Span,
+) {
+    if args.len() < 2 {
+        ctx.record_error(LowerError::UnsupportedV1 {
+            feature: "solve_order with fewer than two fields",
+            span,
+        });
+        return;
+    }
+
+    let mut fields = Vec::new();
+    for arg in args {
+        match solve_order_field_path(ctx, arg) {
+            Some(path) => fields.push(path),
+            None => ctx.record_error(LowerError::UnsupportedV1 {
+                feature: "solve_order argument",
+                span: arg.span,
+            }),
+        }
+    }
+
+    if fields.is_empty() {
+        return;
+    }
+    solve_order.get_or_insert_with(Vec::new).extend(fields);
+}
+
+fn solve_order_field_path(ctx: &mut LowerCtx<'_>, expr: &Expr) -> Option<FieldPath> {
+    let mut parts = collect_dotted(expr)?;
+    if parts.is_empty() {
+        return None;
+    }
+
+    let full = FieldPath(parts.clone());
+    if ctx.env.lookup(&full).is_some() {
+        return Some(full);
+    }
+    let full_dotted = full.dotted();
+    if parts.len() >= 2 {
+        let suffix = FieldPath(parts.split_off(1));
+        if ctx.env.lookup(&suffix).is_some() {
+            return Some(suffix);
+        }
+    }
+
+    ctx.record_error(LowerError::FieldNotFound {
+        path: full_dotted,
+        span: expr.span,
+    });
+    None
 }
 
 fn type_check_binary(
@@ -1897,6 +2062,110 @@ end transaction Packet
         assert!(
             display.contains("%0:u8") && display.contains("10:u8"),
             "got: {display}"
+        );
+    }
+
+    #[test]
+    fn lowers_range_attribute_to_field_attribute_clause() {
+        let src = r#"
+transaction Packet
+  len : uint<8> with [range(1, 16)]
+end transaction Packet
+"#;
+        let problem = lower_bare_txn(src).expect("range attr should lower");
+        assert_eq!(problem.constraints.len(), 1);
+        let clause = &problem.constraints[0];
+        assert!(matches!(
+            clause.origin,
+            ConstraintOrigin::FieldAttribute {
+                ref field,
+                ref attr,
+                ..
+            } if field == "len" && attr == "range"
+        ));
+        let CExprKind::InRange { expr, lo, hi } = &clause.expr.kind else {
+            panic!("expected range constraint, got {}", clause.expr);
+        };
+        assert_eq!(expr.ty, CType::uint(8));
+        assert_eq!(lo.as_ref().expect("lo").ty, CType::uint(8));
+        assert_eq!(hi.as_ref().expect("hi").ty, CType::uint(8));
+        assert_eq!(clause.expr.ty, CType::Bool);
+    }
+
+    #[test]
+    fn lowers_signed_range_attribute_endpoints() {
+        let src = r#"
+transaction Packet
+  delta : sint<8> with [range(-4, 4)]
+end transaction Packet
+"#;
+        let problem = lower_bare_txn(src).expect("signed range attr should lower");
+        assert_eq!(problem.constraints.len(), 1);
+        let CExprKind::InRange { expr, lo, hi } = &problem.constraints[0].expr.kind else {
+            panic!(
+                "expected range constraint, got {}",
+                problem.constraints[0].expr
+            );
+        };
+        assert_eq!(expr.ty, CType::sint(8));
+        assert_eq!(lo.as_ref().expect("lo").ty, CType::sint(8));
+        assert_eq!(hi.as_ref().expect("hi").ty, CType::sint(8));
+    }
+
+    #[test]
+    fn lowers_solve_order_directive_to_problem_metadata() {
+        let src = r#"
+transaction Packet
+  addr : uint<32>
+  len  : uint<8>
+end transaction Packet
+"#;
+        let problem =
+            lower_with_body(src, &["solve_order(p.addr, p.len)", "p.addr >= 4"]).expect("ok");
+        assert_eq!(problem.constraints.len(), 1);
+        let order = problem.solve_order.expect("solve_order metadata");
+        assert_eq!(
+            order.iter().map(FieldPath::dotted).collect::<Vec<_>>(),
+            vec!["addr".to_string(), "len".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_non_field_solve_order_argument() {
+        let src = r#"
+transaction Packet
+  addr : uint<32>
+  len  : uint<8>
+end transaction Packet
+"#;
+        let err = lower_with_body(src, &["solve_order(p.addr + 1, p.len)"])
+            .expect_err("solve_order argument must be a field");
+        assert!(
+            err.iter().any(|e| matches!(
+                e,
+                LowerError::UnsupportedV1 {
+                    feature: "solve_order argument",
+                    ..
+                }
+            )),
+            "errors: {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_solve_order_field() {
+        let src = r#"
+transaction Packet
+  addr : uint<32>
+  len  : uint<8>
+end transaction Packet
+"#;
+        let err = lower_with_body(src, &["solve_order(p.addr, p.nope)"])
+            .expect_err("unknown solve_order field");
+        assert!(
+            err.iter()
+                .any(|e| matches!(e, LowerError::FieldNotFound { path, .. } if path == "p.nope")),
+            "errors: {err:?}"
         );
     }
 
