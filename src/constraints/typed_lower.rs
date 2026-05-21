@@ -19,10 +19,11 @@
 //!   - set and range literals
 //!   - relation application, including recursive alias/block expansion
 //!   - list `.len()` and foreach-list item constraints
+//!   - `when` subtype keeps/ranges as guarded implications
 //!
 //! Explicitly out of scope for this phase (structured `LowerError`,
 //! never a panic):
-//!   - `when` subtype guards                            — Phase 7
+//!   - full ADT-backed `when` subtype modeling
 //!
 //! Errors are collected (up to `MAX_ERRORS`) and returned as
 //! `Err(Vec<LowerError>)`; on a clean lowering the result is
@@ -35,7 +36,7 @@ use crate::constraints::typed::*;
 use crate::constraints::{
     ConstraintElaboration, ConstraintOrigin, EnumDomainSchema, EnumVariantSchema,
     FieldAttrArgSchema, FieldTypeClass, FieldTypeSchema, RelationBodySchema, TxnFieldSchema,
-    TxnSchema,
+    TxnSchema, WhenSubtypeSchema,
 };
 use crate::lexer::Span;
 
@@ -235,13 +236,18 @@ pub fn lower_problem(
         if ctx.at_error_cap() {
             break;
         }
-        for clause in lower_field_attr_constraints(&mut ctx, field) {
+        for clause in lower_field_attr_constraints(&mut ctx, field, None) {
             if ctx.at_error_cap() {
                 break;
             }
             clauses.push(clause);
         }
     }
+
+    // 4. `when` subtype constraints are branch-guarded: inactive
+    //    impossible branch constraints must not make the whole problem
+    //    UNSAT.
+    lower_when_subtypes(&mut ctx, &target.when_subtypes, None, &mut clauses);
 
     let origin = match randomize_with_body {
         Some(_) => ProblemOrigin::RandomizeSite {
@@ -278,7 +284,31 @@ fn build_field_env(elab: &ConstraintElaboration, target: &TxnSchema) -> FieldEnv
         .iter()
         .map(|e| (e.name.as_str(), e.id))
         .collect();
-    for f in &target.fields {
+
+    insert_schema_fields(&mut env, &target.fields, &domain_id_by_name);
+    insert_when_schema_fields(&mut env, &target.when_subtypes, &domain_id_by_name);
+
+    env.enums = enum_entries;
+    env
+}
+
+fn insert_when_schema_fields(
+    env: &mut FieldEnv,
+    subtypes: &[WhenSubtypeSchema],
+    domain_id_by_name: &BTreeMap<&str, EnumDomainId>,
+) {
+    for subtype in subtypes {
+        insert_schema_fields(env, &subtype.fields, domain_id_by_name);
+        insert_when_schema_fields(env, &subtype.when_subtypes, domain_id_by_name);
+    }
+}
+
+fn insert_schema_fields(
+    env: &mut FieldEnv,
+    fields: &[TxnFieldSchema],
+    domain_id_by_name: &BTreeMap<&str, EnumDomainId>,
+) {
+    for f in fields {
         let path = FieldPath(f.path.clone());
         let ty = ctype_from_field_schema(&f.ty, &domain_id_by_name);
         env.fields.insert(
@@ -291,8 +321,6 @@ fn build_field_env(elab: &ConstraintElaboration, target: &TxnSchema) -> FieldEnv
             },
         );
     }
-    env.enums = enum_entries;
-    env
 }
 
 fn ctype_from_field_schema(
@@ -887,6 +915,7 @@ fn coerce_expr_to_bv_hint(ctx: &mut LowerCtx<'_>, expr: CTypedExpr, hint: &CType
 fn lower_field_attr_constraints(
     ctx: &mut LowerCtx<'_>,
     field: &TxnFieldSchema,
+    guard: Option<&CTypedExpr>,
 ) -> Vec<CTypedClause> {
     let mut clauses = Vec::new();
     let path = FieldPath(field.path.clone());
@@ -930,6 +959,7 @@ fn lower_field_attr_constraints(
             CType::Bool,
             attr.span,
         );
+        let expr = apply_guard(expr, guard, attr.span);
         let assertion_name = mint_clause_name(ctx, lo);
         clauses.push(CTypedClause {
             origin: ConstraintOrigin::FieldAttribute {
@@ -943,6 +973,86 @@ fn lower_field_attr_constraints(
     }
 
     clauses
+}
+
+fn lower_when_subtypes(
+    ctx: &mut LowerCtx<'_>,
+    subtypes: &[WhenSubtypeSchema],
+    parent_guard: Option<CTypedExpr>,
+    clauses: &mut Vec<CTypedClause>,
+) {
+    for subtype in subtypes {
+        if ctx.at_error_cap() {
+            break;
+        }
+        let disc = lower_top_clause(ctx, &subtype.discriminant);
+        let guard = match parent_guard.clone() {
+            Some(parent) => and_join_typed(vec![parent, disc], subtype.span),
+            None => disc,
+        };
+
+        for keep in &subtype.keeps {
+            if ctx.at_error_cap() {
+                break;
+            }
+            for (origin, expr_ast) in
+                expand_top_level_clause(ctx, &keep.expr, keep.origin.clone(), &mut Vec::new())
+            {
+                if ctx.at_error_cap() {
+                    break;
+                }
+                let expr = lower_top_clause(ctx, &expr_ast);
+                let expr = apply_guard(expr, Some(&guard), expr_ast.span);
+                let assertion_name = mint_clause_name(ctx, &expr_ast);
+                clauses.push(CTypedClause {
+                    origin,
+                    expr,
+                    assertion_name,
+                });
+            }
+        }
+
+        for field in &subtype.fields {
+            if ctx.at_error_cap() {
+                break;
+            }
+            clauses.extend(lower_field_attr_constraints(ctx, field, Some(&guard)));
+        }
+
+        lower_when_subtypes(ctx, &subtype.when_subtypes, Some(guard), clauses);
+    }
+}
+
+fn apply_guard(expr: CTypedExpr, guard: Option<&CTypedExpr>, span: Span) -> CTypedExpr {
+    let Some(guard) = guard else {
+        return expr;
+    };
+    let not_guard = CTypedExpr::new(
+        CExprKind::Unary {
+            op: CUnaryOp::LogicalNot,
+            expr: Box::new(guard.clone()),
+        },
+        if guard.ty.is_bool() {
+            CType::Bool
+        } else {
+            CType::Bottom
+        },
+        guard.span,
+    );
+    let ty = if not_guard.ty.is_bool() && expr.ty.is_bool() {
+        CType::Bool
+    } else {
+        CType::Bottom
+    };
+    CTypedExpr::new(
+        CExprKind::Binary {
+            op: CBinaryOp::LogicalOr,
+            lhs: Box::new(not_guard),
+            rhs: Box::new(expr),
+        },
+        ty,
+        span,
+    )
 }
 
 fn merge_solve_order_directive(
@@ -2127,6 +2237,120 @@ end transaction Packet
         assert_eq!(
             order.iter().map(FieldPath::dotted).collect::<Vec<_>>(),
             vec!["addr".to_string(), "len".to_string()]
+        );
+    }
+
+    #[test]
+    fn lowers_when_keep_as_guarded_implication() {
+        let src = r#"
+enum Op { READ, WRITE }
+
+transaction Packet
+  op : Op
+  when op == WRITE
+    wdata : uint<8>
+    keep wdata != 0
+  end when
+end transaction Packet
+"#;
+        let problem = lower_bare_txn(src).expect("when keep should lower");
+        assert_eq!(problem.constraints.len(), 1);
+        assert_eq!(problem.constraints[0].expr.ty, CType::Bool);
+        let CExprKind::Binary {
+            op: CBinaryOp::LogicalOr,
+            lhs,
+            rhs,
+        } = &problem.constraints[0].expr.kind
+        else {
+            panic!("expected guarded OR, got {}", problem.constraints[0].expr);
+        };
+        assert!(matches!(
+            lhs.kind,
+            CExprKind::Unary {
+                op: CUnaryOp::LogicalNot,
+                ..
+            }
+        ));
+        assert!(matches!(
+            rhs.kind,
+            CExprKind::Binary {
+                op: CBinaryOp::Ne,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn lowers_when_range_attribute_as_guarded_clause() {
+        let src = r#"
+enum Op { READ, WRITE }
+
+transaction Packet
+  op : Op
+  when op == WRITE
+    wdata : uint<8> with [range(8, 15)]
+  end when
+end transaction Packet
+"#;
+        let problem = lower_bare_txn(src).expect("when range should lower");
+        assert_eq!(problem.constraints.len(), 1);
+        assert!(matches!(
+            problem.constraints[0].origin,
+            ConstraintOrigin::FieldAttribute {
+                ref field,
+                ref attr,
+                ..
+            } if field == "wdata" && attr == "range"
+        ));
+        let display = format!("{}", problem.constraints[0].expr);
+        assert!(
+            display.contains("||") && display.contains("in [8:u8..15:u8]"),
+            "got: {display}"
+        );
+    }
+
+    #[test]
+    fn lowers_nested_when_guards_as_conjunction() {
+        let src = r#"
+transaction Packet
+  enabled : bool
+  mode : uint<1>
+  when enabled
+    when mode == 1
+      data : uint<8>
+      keep data != 0
+    end when
+  end when
+end transaction Packet
+"#;
+        let problem = lower_bare_txn(src).expect("nested when should lower");
+        assert_eq!(problem.constraints.len(), 1);
+        let display = format!("{}", problem.constraints[0].expr);
+        assert!(
+            display.contains("&&") && display.contains("||") && display.contains("data"),
+            "got: {display}"
+        );
+    }
+
+    #[test]
+    fn lowers_when_foreach_keep_as_guarded_forall() {
+        let src = r#"
+transaction Packet
+  enabled : bool
+  when enabled
+    items : list<uint<8>>
+    keep for item in items
+      item != 0
+    end for
+  end when
+end transaction Packet
+"#;
+        let problem = lower_bare_txn(src).expect("when foreach should lower");
+        assert_eq!(problem.constraints.len(), 1);
+        let display = format!("{}", problem.constraints[0].expr);
+        assert!(
+            display.contains("||") && display.contains("forall") && display.contains("%0:u8"),
+            "got: {display}"
         );
     }
 
