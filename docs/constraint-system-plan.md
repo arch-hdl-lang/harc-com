@@ -211,11 +211,12 @@ lowering, before C++ emission.
 
 1. Add foundation IR and schema extraction without behavior changes.
 2. Lower the currently supported constraint subset into typed IR.
-3. Replace ad hoc Z3 emission with exact-width, signedness-aware solver
-   lowering.
+3. Introduce a solver backend boundary and Z3 SMT renderer over typed IR.
 4. Enforce non-random field semantics.
 5. Lower `when` subtype constraints with discriminator guards.
-6. Replace diversity blocking cache with deterministic seed-driven sampling.
-7. Implement principled `[dist]`, `[unique]`, and `solve_order`.
-8. Add queued vs `blocking randomize` architecture and runtime dependency
+6. Replace ad hoc Z3 emission with exact-width, signedness-aware solver
+   execution.
+7. Replace diversity blocking cache with deterministic seed-driven sampling.
+8. Implement principled `[dist]`, `[unique]`, and `solve_order`.
+9. Add queued vs `blocking randomize` architecture and runtime dependency
    analysis.
