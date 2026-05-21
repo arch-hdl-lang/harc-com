@@ -1183,7 +1183,7 @@ fn cmd_sim(
         // stub write and the public-flat-rd machinery — zero impact
         // on the existing fixture corpus.
         if let Some((dut_ty, probes)) = harc::codegen::cpp_tb::dut_probes(&merged) {
-            let stub_src = harc::codegen::sv_stub::emit_stub(&dut_ty, probes)
+            let stub_src = harc::codegen::sv_stub::emit_stub(&dut_ty, &probes)
                 .map_err(|e| miette::miette!("probe stub emit failed: {e}"))?;
             let stub_path = outdir_abs.join(format!("__harc_probe_{dut_ty}.sv"));
             fs::write(&stub_path, &stub_src).into_diagnostic()?;

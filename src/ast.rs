@@ -544,6 +544,12 @@ pub struct ComponentField {
     /// `agent : AxiAgent bound to BusAxi4#(...)` — per-instance binding (§11).
     pub bound_to: Option<TypeExpr>,
     pub default: Option<Expr>,
+    /// Hierarchical DUT probes when a testbench owns a probe-bearing
+    /// `let dut : Top ... end let dut` declaration. Empty for ordinary
+    /// component fields.
+    pub probes: Vec<Probe>,
+    /// Bind remaps carried by the same testbench-owned `let` surface.
+    pub bind_remap: Vec<BindRemapEntry>,
     pub span: Span,
     pub doc: Option<String>,
 }

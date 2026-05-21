@@ -545,6 +545,18 @@ fn print_component_item(out: &mut String, it: &ComponentItem, depth: usize) {
     match it {
         ComponentItem::Field(f) => {
             print_doc(out, &f.doc, depth);
+            if !f.probes.is_empty() {
+                pad(out, depth);
+                write!(out, "let {} : ", f.name.name).ok();
+                print_type(out, &f.ty);
+                writeln!(out).ok();
+                for p in &f.probes {
+                    print_probe(out, p, depth + 1);
+                }
+                pad(out, depth);
+                writeln!(out, "end let {}", f.name.name).ok();
+                return;
+            }
             pad(out, depth);
             write!(out, "{} : ", f.name.name).ok();
             if let Some(d) = f.direction {
@@ -1336,6 +1348,24 @@ fn print_let(out: &mut String, l: &LetStmt, depth: usize) {
         }
     }
     writeln!(out).ok();
+    if !l.probes.is_empty() {
+        for p in &l.probes {
+            print_probe(out, p, depth + 1);
+        }
+        pad(out, depth);
+        writeln!(out, "end let {}", l.name.name).ok();
+    }
+}
+
+fn print_probe(out: &mut String, p: &Probe, depth: usize) {
+    pad(out, depth);
+    write!(out, "probe ").ok();
+    if p.force {
+        write!(out, "force ").ok();
+    }
+    write!(out, "{} : ", p.name.name).ok();
+    print_type(out, &p.ty);
+    writeln!(out, " at {}", p.path).ok();
 }
 
 /// Pretty-print an expression appearing inside a clocking spec `@(...)`.

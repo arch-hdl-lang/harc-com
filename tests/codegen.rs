@@ -3174,8 +3174,12 @@ end test BadDistPolicyTargetTest"#,
     let err = cpp_tb::emit(&parsed).unwrap_err();
     assert!(
         err.0.contains("dist")
-            && err.0.contains("target `mode` must be a random scalar field")
-            && err.0.contains("target `items` must be a random scalar field"),
+            && err
+                .0
+                .contains("target `mode` must be a random scalar field")
+            && err
+                .0
+                .contains("target `items` must be a random scalar field"),
         "expected dist policy target diagnostics; got: {}",
         err.0,
     );
@@ -4498,6 +4502,55 @@ end impl Smoke"#,
         "expected `dut->count_out` from bare `dut.count_out`; got:\n{}",
         cpp,
     );
+}
+
+#[test]
+fn impl_for_testbench_preserves_testbench_dut_probes() {
+    let parsed = parse_source(
+        r#"testbench ProbeDutTb
+    let dut : CpuPipe
+        probe alu_a : uint<32> at alu0.a
+        probe force inject_rs1 : uint<32> at decode_rs1_val
+    end let dut
+
+    function reset()
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+    end function reset
+end testbench ProbeDutTb
+
+impl TestbenchProbeDutTest for ProbeDutTb
+    run
+        reset()
+        dut.inject_rs1 = 3735928559
+        wait 1 cycle
+        assert dut.alu_a == 3735928559
+        release dut.inject_rs1
+    end run
+end impl TestbenchProbeDutTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("testbench-owned DUT probes lower cleanly");
+    assert!(
+        cpp.contains("_tb.dut = dut"),
+        "expected impl desugaring to keep DUT wire-up; got:\n{}",
+        cpp,
+    );
+    assert!(
+        cpp.contains("alu_a") && cpp.contains("inject_rs1_drv") && cpp.contains("inject_rs1_en"),
+        "expected read and force probe accessors to be preserved; got:\n{}",
+        cpp,
+    );
+    let (dut_ty, probes) =
+        cpp_tb::dut_probes(&parsed).expect("testbench-owned probes should emit a bind stub");
+    assert_eq!(dut_ty, "CpuPipe");
+    assert_eq!(probes.len(), 2);
+    assert!(probes.iter().any(|p| p.name.name == "alu_a" && !p.force));
+    assert!(probes
+        .iter()
+        .any(|p| p.name.name == "inject_rs1" && p.force));
 }
 
 /// Classic `test T { ... }` form keeps building in this PR — the

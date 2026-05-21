@@ -63,13 +63,13 @@ internals.
 
 ```harc
 testbench CpuTb
-    dut : Cpu
+    let dut : Cpu
         probe flags  : uint<4>  at alu.flags
         probe pc     : uint<32> at fetch.pc
         probe stall  : bit      at pipeline.fsm.stall
         probe fifo_d : uint<5>  at rob.fifo.depth
         probe force ack_inject : bit at dcache.ack    // read/write opt-in
-    end dut
+    end let dut
 
     bus : BusAxiLite = bind dut
     // ...
@@ -276,9 +276,10 @@ work.
 
 ## 8. Scope of v0.1 implementation
 
-1. Parser: `probe` and `probe force` field-kind inside `dut : T { ... }`
-   in `testbench` blocks.
-2. AST: probe table on `TestbenchDecl`, threaded through to codegen.
+1. Parser: `probe` and `probe force` declarations inside
+   `let dut : T ... end let dut` in `testbench` blocks.
+2. AST: probe table on the testbench-owned DUT field, threaded through
+   to codegen and `impl <Test> for <Tb>` desugaring.
 3. SV stub emitter: emits `__harc_probe_<DutType>.sv` next to the
    generated `.cpp`.
 4. HARC signal-access lookup: extends the `dut.X` resolution path to

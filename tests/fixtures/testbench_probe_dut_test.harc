@@ -1,0 +1,28 @@
+// Regression for issue #204: a reusable testbench may own the probed
+// DUT declaration, and `impl <Test> for <Tb>` must preserve those
+// probes when it synthesizes the test-scope DUT.
+
+testbench ProbeDutTb
+    let dut : CpuPipe
+        probe alu_a : uint<32> at alu0.a
+        probe force inject_rs1 : uint<32> at decode_rs1_val
+    end let dut
+
+    function reset()
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+    end function reset
+end testbench ProbeDutTb
+
+impl TestbenchProbeDutTest for ProbeDutTb
+    run
+        reset()
+        dut.inject_rs1 = 3735928559
+        wait 1 cycle
+        assert dut.alu_a == 3735928559
+            else fail("force probe did not propagate")
+        release dut.inject_rs1
+    end run
+end impl TestbenchProbeDutTest
