@@ -1,0 +1,38 @@
+// Target-side TLM responder smoke test.
+//
+// The SV DUT is the initiator: it issues `mem.read(5)` through the
+// ARCH-compatible req/rsp wires. The HARC transactor below implements the
+// target-side method body with `thread bus.read(...)`, proving that a HARC BFM
+// can serve as a passive TLM target for either SV or ARCH/HARC initiators.
+
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmMemBus
+
+transactor TlmMemTarget bound to TlmMemBus
+    thread bus.read(addr: uint<8>)
+        wait 1 cycle
+        return 256 + addr
+    end thread
+end transactor TlmMemTarget
+
+testbench TlmTargetThreadTb
+    dut : TlmReadInitiator
+end testbench TlmTargetThreadTb
+
+impl TlmTargetThreadTest for TlmTargetThreadTb
+    let mem : TlmMemBus = bind dut
+    let target : TlmMemTarget passive = bind mem
+
+    run
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+
+        wait until dut.done == 1 timeout 40 cycles fail("DUT initiator did not receive HARC target response")
+        assert dut.result == 261
+            else fail("target TLM response mismatch got=0x${dut.result:08x}, expected 0x00000105")
+
+        log(info, "PASS: HARC target-side TLM thread served SV initiator")
+    end run
+end impl TlmTargetThreadTest

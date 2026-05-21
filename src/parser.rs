@@ -827,6 +827,9 @@ impl Parser {
             )),
             Some(TokenKind::Connect) => Ok(ComponentItem::Connect(self.parse_connect_block()?)),
             Some(TokenKind::On) => Ok(ComponentItem::OnHandler(self.parse_on_handler()?)),
+            Some(TokenKind::Thread) => Ok(ComponentItem::TargetTlmThread(
+                self.parse_target_tlm_thread()?,
+            )),
             Some(TokenKind::Hookable) => Ok(ComponentItem::Hookable(self.parse_hookable()?)),
             // `function name(...) ... end function` — non-hookable
             // method on the enclosing component. Stored in the same
@@ -870,6 +873,56 @@ impl Parser {
             bind_remap: l.bind_remap,
             span: l.span,
             doc,
+        })
+    }
+
+    /// Parse target-side TLM responder syntax inside a bound transactor:
+    ///
+    /// ```harc
+    /// thread bus.read(addr: uint<8>)
+    ///     return addr + 0x100
+    /// end thread
+    /// ```
+    fn parse_target_tlm_thread(&mut self) -> Result<TargetTlmThread, CompileError> {
+        let start = self.expect(TokenKind::Thread)?.span;
+        let method = self.parse_target_tlm_thread_path()?;
+        let params = self.parse_paren_params()?;
+        let body_start = self.peek_span();
+        let stmts = self.parse_stmt_list_until_end()?;
+        let end = self.expect_end_anon(TokenKind::Thread)?;
+        Ok(TargetTlmThread {
+            method,
+            params,
+            body: Block {
+                stmts,
+                span: body_start.merge(end),
+            },
+            span: start.merge(end),
+        })
+    }
+
+    fn parse_target_tlm_thread_path(&mut self) -> Result<Path, CompileError> {
+        let first = if self.check(TokenKind::Bus) {
+            let tok = self.advance().unwrap();
+            Ident {
+                name: "bus".into(),
+                span: tok.span,
+            }
+        } else {
+            self.expect_ident()?
+        };
+        let start = first.span;
+        let mut segments = vec![first];
+        let mut end = start;
+        while self.check(TokenKind::Dot) {
+            self.advance();
+            let id = self.expect_ident()?;
+            end = id.span;
+            segments.push(id);
+        }
+        Ok(Path {
+            segments,
+            span: start.merge(end),
         })
     }
 

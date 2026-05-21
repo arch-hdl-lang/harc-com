@@ -2255,6 +2255,60 @@ struct PendingTlmFork {
     tag: Option<u64>,
 }
 
+fn split_terminal_return(body: &Block) -> Result<(Block, Option<Expr>), String> {
+    let Some((last, prefix)) = body.stmts.split_last() else {
+        return Ok((
+            Block {
+                stmts: Vec::new(),
+                span: body.span,
+            },
+            None,
+        ));
+    };
+    if prefix.iter().any(stmt_contains_return) {
+        return Err("only a terminal `return` is supported in this lowering slice".into());
+    }
+    match &last.kind {
+        StmtKind::Return(expr) => Ok((
+            Block {
+                stmts: prefix.to_vec(),
+                span: body.span,
+            },
+            expr.clone(),
+        )),
+        _ => Ok((body.clone(), None)),
+    }
+}
+
+fn stmt_contains_return(stmt: &Stmt) -> bool {
+    match &stmt.kind {
+        StmtKind::Return(_) => true,
+        StmtKind::For(s) => s.body.stmts.iter().any(stmt_contains_return),
+        StmtKind::Repeat(s) => s.body.stmts.iter().any(stmt_contains_return),
+        StmtKind::Loop(b) => b.stmts.iter().any(stmt_contains_return),
+        StmtKind::While { body, .. } => body.stmts.iter().any(stmt_contains_return),
+        StmtKind::If(i) => {
+            i.then_block.stmts.iter().any(stmt_contains_return)
+                || i.elsifs
+                    .iter()
+                    .any(|(_, b)| b.stmts.iter().any(stmt_contains_return))
+                || i.else_block
+                    .as_ref()
+                    .is_some_and(|b| b.stmts.iter().any(stmt_contains_return))
+        }
+        StmtKind::Fork(f) => f.branches.iter().any(|b| b.stmts.iter().any(stmt_contains_return)),
+        StmtKind::Parallel(branches) | StmtKind::Schedule(branches) => {
+            branches.iter().any(|b| b.stmts.iter().any(stmt_contains_return))
+        }
+        StmtKind::Select(arms) => arms
+            .iter()
+            .any(|a| a.action.stmts.iter().any(stmt_contains_return)),
+        StmtKind::On(h) => h.body.stmts.iter().any(stmt_contains_return),
+        StmtKind::After { body, .. } => body.stmts.iter().any(stmt_contains_return),
+        _ => false,
+    }
+}
+
 enum WaitCondition<'a> {
     Expr(&'a Expr),
     Idle { instance: String, cycles: &'a Expr },
@@ -4592,6 +4646,258 @@ impl Emitter {
                 "_m_",
                 Some(binding.clone()),
             );
+        }
+    }
+
+    /// Emit `thread bus.method(args) ... return expr end thread` items in a
+    /// bound transactor as target-side TLM responder actors. The actor owns
+    /// the method's target handshake:
+    ///
+    /// 1. Assert `<method>_req_ready`.
+    /// 2. Wait for a request handshake and capture args (plus tag for OOO).
+    /// 3. Run the HARC body in coroutine context.
+    /// 4. Drive optional response payload/tag and hold `rsp_valid` until
+    ///    the DUT initiator asserts `rsp_ready`.
+    fn emit_bound_tlm_target_actors(
+        &mut self,
+        comp: &ComponentDecl,
+        instance: &str,
+        depth: usize,
+        binding: &(BusDecl, String, String),
+    ) {
+        let mut subs = std::collections::HashMap::new();
+        let mut local_event_types: Vec<(String, String)> = Vec::new();
+        for it in &comp.items {
+            if let ComponentItem::Field(f) = it {
+                subs.insert(f.name.name.clone(), format!("{instance}.{}", f.name.name));
+                if let TypeExpr::Builtin {
+                    name: BuiltinTy::Event,
+                    args,
+                    ..
+                } = &f.ty
+                {
+                    let inner = self.payload_type_for_arg(args.first());
+                    local_event_types.push((f.name.name.clone(), inner));
+                }
+            }
+        }
+
+        for it in &comp.items {
+            let ComponentItem::TargetTlmThread(t) = it else {
+                continue;
+            };
+            let Some(bus_alias) = t.method.segments.first().map(|s| s.name.as_str()) else {
+                continue;
+            };
+            if bus_alias != "bus" {
+                self.errors.push(format!(
+                    "target TLM thread in transactor `{}` must target `bus.<method>`, got `{}`",
+                    comp.name.name,
+                    t.method
+                        .segments
+                        .iter()
+                        .map(|s| s.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".")
+                ));
+                continue;
+            }
+            if t.method.segments.len() != 2 {
+                self.errors.push(format!(
+                    "target TLM thread in transactor `{}` must use `thread bus.<method>(...)`",
+                    comp.name.name
+                ));
+                continue;
+            }
+            let method_name = &t.method.segments[1].name;
+            let Some(method) = binding
+                .0
+                .tlm_methods
+                .iter()
+                .find(|m| &m.name.name == method_name)
+                .cloned()
+            else {
+                self.errors.push(format!(
+                    "target TLM thread `{}`: bus `{}` has no tlm_method `{}`",
+                    instance, binding.0.name.name, method_name
+                ));
+                continue;
+            };
+            if t.params.len() != method.args.len() {
+                self.errors.push(format!(
+                    "target TLM thread bus.{}: expected {} arg(s), got {}",
+                    method.name.name,
+                    method.args.len(),
+                    t.params.len(),
+                ));
+                continue;
+            }
+
+            let (body_prefix, ret_expr) = match split_terminal_return(&t.body) {
+                Ok(v) => v,
+                Err(msg) => {
+                    self.errors
+                        .push(format!("target TLM thread bus.{}: {msg}", method.name.name));
+                    continue;
+                }
+            };
+            if method.ret.is_some() && ret_expr.is_none() {
+                self.errors.push(format!(
+                    "target TLM thread bus.{} must end with `return <expr>` because the method returns a value",
+                    method.name.name
+                ));
+                continue;
+            }
+
+            let (_, root, sig_prefix) = binding;
+            let inst_tag = instance.replace('.', "_");
+            let method_tag = method.name.name.replace('.', "_");
+            let slot_var = format!("_{inst_tag}_{method_tag}_target_slot");
+            let sched_var = format!("_{inst_tag}_{method_tag}_target_sched");
+            let req_valid = self.bus_signal_name(sig_prefix, &method.name.name, "req_valid");
+            let req_ready = self.bus_signal_name(sig_prefix, &method.name.name, "req_ready");
+            let rsp_valid = self.bus_signal_name(sig_prefix, &method.name.name, "rsp_valid");
+            let rsp_ready = self.bus_signal_name(sig_prefix, &method.name.name, "rsp_ready");
+            let rsp_data = self.bus_signal_name(sig_prefix, &method.name.name, "rsp_data");
+            let req_tag = self.bus_signal_name(sig_prefix, &method.name.name, "req_tag");
+            let rsp_tag = self.bus_signal_name(sig_prefix, &method.name.name, "rsp_tag");
+            let tagged = method.mode.name == "out_of_order";
+            if method.mode.name != "blocking" && !tagged {
+                self.errors.push(format!(
+                    "target TLM thread bus.{} supports `blocking` and `out_of_order tags N`, not `{}`",
+                    method.name.name, method.mode.name,
+                ));
+                continue;
+            }
+
+            if self.mt {
+                self.pad(depth);
+                writeln!(self.out, "harc_rt::ThreadScheduler {sched_var};").ok();
+            }
+            self.pad(depth);
+            writeln!(self.out, "harc_rt::ThreadSlot {slot_var};").ok();
+            self.pad(depth);
+            if self.mt {
+                writeln!(self.out, "{sched_var}.slots.push_back(&{slot_var});").ok();
+                self.actor_threads
+                    .push((sched_var.clone(), slot_var.clone()));
+            } else {
+                writeln!(self.out, "sched.slots.push_back(&{slot_var});").ok();
+            }
+            self.pad(depth);
+            writeln!(
+                self.out,
+                "{slot_var}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{",
+            )
+            .ok();
+            self.pad(depth + 1);
+            writeln!(self.out, "{root}->{req_ready} = 0;").ok();
+            self.pad(depth + 1);
+            writeln!(self.out, "{root}->{rsp_valid} = 0;").ok();
+            self.pad(depth + 1);
+            writeln!(self.out, "while (true) {{").ok();
+            self.pad(depth + 2);
+            writeln!(self.out, "{root}->{req_ready} = 1;").ok();
+            self.pad(depth + 2);
+            writeln!(
+                self.out,
+                "co_await harc_rt::wait_until(_slot, [&]{{ return {root}->{req_valid} && {root}->{req_ready}; }});",
+            )
+            .ok();
+            self.pad(depth + 2);
+            writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
+            for (param, (arg_name, arg_ty)) in t.params.iter().zip(method.args.iter()) {
+                let local_name = &param.name.name;
+                let local_ty = param
+                    .ty
+                    .as_ref()
+                    .unwrap_or(arg_ty);
+                let cty = self.c_type_for_param(local_ty);
+                let arg_port = self.bus_signal_name(sig_prefix, &method.name.name, &arg_name.name);
+                self.pad(depth + 2);
+                writeln!(
+                    self.out,
+                    "{cty} {local_name} = ({cty})harc_rt::harc_read({root}->{arg_port});"
+                )
+                .ok();
+            }
+            if tagged {
+                self.pad(depth + 2);
+                writeln!(self.out, "auto _tlm_req_tag = {root}->{req_tag};").ok();
+            }
+            self.pad(depth + 2);
+            writeln!(self.out, "{root}->{req_ready} = 0;").ok();
+            self.pad(depth + 2);
+            writeln!(
+                self.out,
+                "{instance}._last_in_cycle = (uint64_t)cycle_count;"
+            )
+            .ok();
+
+            let prev_subs = std::mem::replace(&mut self.field_subs, subs.clone());
+            let mut added_events = Vec::new();
+            for (name, ty) in &local_event_types {
+                if self.event_types.insert(name.clone(), ty.clone()).is_none() {
+                    added_events.push(name.clone());
+                }
+            }
+            let prior_bus = self.bus_bindings.insert("bus".into(), binding.clone());
+            let prior_corout = self.in_coroutine;
+            self.in_coroutine = true;
+            let prior_inst = std::mem::replace(
+                &mut self.current_component_instance,
+                Some(instance.to_string()),
+            );
+            self.emit_block(&body_prefix, depth + 2);
+            self.current_component_instance = prior_inst;
+            self.in_coroutine = prior_corout;
+            match prior_bus {
+                Some(prev) => {
+                    self.bus_bindings.insert("bus".into(), prev);
+                }
+                None => {
+                    self.bus_bindings.remove("bus");
+                }
+            }
+            for n in added_events {
+                self.event_types.remove(&n);
+            }
+            self.field_subs = prev_subs;
+
+            if let Some(expr) = ret_expr {
+                self.pad(depth + 2);
+                write!(self.out, "harc_rt::harc_assign({root}->{rsp_data}, ").ok();
+                self.emit_expr(&expr);
+                writeln!(self.out, ");").ok();
+            }
+            if tagged {
+                self.pad(depth + 2);
+                writeln!(self.out, "{root}->{rsp_tag} = _tlm_req_tag;").ok();
+            }
+            self.pad(depth + 2);
+            writeln!(self.out, "{root}->{rsp_valid} = 1;").ok();
+            self.pad(depth + 2);
+            writeln!(
+                self.out,
+                "co_await harc_rt::wait_until(_slot, [&]{{ return {root}->{rsp_ready}; }});",
+            )
+            .ok();
+            self.pad(depth + 2);
+            writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
+            self.pad(depth + 2);
+            writeln!(self.out, "{root}->{rsp_valid} = 0;").ok();
+            self.pad(depth + 2);
+            writeln!(
+                self.out,
+                "{instance}._last_out_cycle = (uint64_t)cycle_count;"
+            )
+            .ok();
+            self.pad(depth + 1);
+            writeln!(self.out, "}}").ok();
+            self.pad(depth + 1);
+            writeln!(self.out, "co_return;").ok();
+            self.pad(depth);
+            writeln!(self.out, "}}(&{slot_var});").ok();
         }
     }
 
@@ -12086,6 +12392,12 @@ impl Emitter {
                                     // mode. This is the observation
                                     // half of the transactor.
                                     self.emit_bound_monitor_actors(
+                                        &synth,
+                                        &l.name.name,
+                                        depth,
+                                        &binding,
+                                    );
+                                    self.emit_bound_tlm_target_actors(
                                         &synth,
                                         &l.name.name,
                                         depth,

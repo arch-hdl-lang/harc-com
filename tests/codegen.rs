@@ -4643,6 +4643,39 @@ end test T"#,
         .expect("observer-only handler in always-on body should emit cleanly under `passive`");
 }
 
+#[test]
+fn target_tlm_thread_lowers_to_responder_actor() {
+    let parsed = parse_source(
+        r#"bus B
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus B
+
+transactor Target bound to B
+    thread bus.read(addr: uint<8>)
+        wait 1 cycle
+        return 256 + addr
+    end thread
+end transactor Target
+
+test T
+    let dut : SomeDut
+    let b : B = bind dut
+    let target : Target passive = bind b
+    run
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("target TLM thread should lower");
+    assert!(
+        cpp.contains("_target_read_target_slot")
+            && cpp.contains("dut->b_read_req_ready = 1;")
+            && cpp.contains("harc_rt::harc_assign(dut->b_read_rsp_data, 256 + addr);")
+            && cpp.contains("dut->b_read_rsp_valid = 1;"),
+        "expected target responder actor shape; got:\n{cpp}"
+    );
+}
+
 // ── Width-method intrinsics (.trunc/.zext/.sext/.resize) ────────────
 //
 // Ported from arch-com's surface (src/parser.rs:5757 +

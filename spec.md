@@ -1596,13 +1596,92 @@ explicit modes (`drv : T active`) win over inherited ones at any depth.
 - `let r = bus.<method>(args)` / `bus.<method>(args)` for a bus-level `tlm_method ... : blocking;` → ARCH-compatible request/response wire protocol. A method `read(addr) -> uint<32>` on binding `mem` lowers through `mem_read_req_valid`, `mem_read_addr`, `mem_read_req_ready`, `mem_read_rsp_valid`, `mem_read_rsp_data`, and `mem_read_rsp_ready`. Void methods omit the response payload but still wait for response completion.
 - `let r = fork bus.<method>(args)` / `fork bus.<method>(args)` for a bus-level `tlm_method` → issue only the request side now; `join_all` later drains the pending responses. For `blocking` methods, responses are consumed in issue order. For `out_of_order tags N`, the request path drives `<prefix>_<method>_req_tag` and `join_all` routes each response by `<prefix>_<method>_rsp_tag`, allowing multiple outstanding method calls in the same style as ARCH RHS-fork cohorts.
 
+**Canonical TLM transactor shape.** HARC treats `tlm_method` as the transaction-level view of an ordinary synthesizable ready/valid request/response boundary. The same HARC source shape should work whether the DUT is an ARCH/HARC-authored module reached through `harc sim --dut` or an existing SV module reached through `harc sim --sv`; only the `bind` line changes.
+
+The protocol is declared once as a `bus`:
+
+```harc
+bus BurstMem
+    tlm_method read_burst(addr: uint<32>, len: uint<4>) -> Vec<uint<32>, 4>: blocking;
+    tlm_method read_ooo(addr: uint<32>) -> uint<32>: out_of_order tags 4;
+end bus BurstMem
+```
+
+An **active initiator transactor** is the preferred HARC sequence-layer shape for driving a target implemented by either DUT backend. It receives transaction objects from a sequencer/test and calls the bus method; the method call lowers to the same req/rsp wires as ARCH TLM:
+
+```harc
+transaction ReadReq
+    addr: uint<32>
+    len: uint<4>
+end transaction ReadReq
+
+transactor MemInitiator bound to BurstMem
+    when active
+        req: in event<ReadReq>
+        done: out event<Vec<uint<32>, 4>>
+
+        on req(t)
+            let data = bus.read_burst(t.addr, t.len)
+            emit done(data)
+        end on
+    end when active
+end transactor MemInitiator
+```
+
+At test scope, an ARCH/HARC DUT with conventional flattened TLM ports binds directly:
+
+```harc
+let mem : BurstMem = bind dut
+let xact : MemInitiator active = bind mem
+```
+
+An SV DUT binds through the same `BurstMem` type with explicit remaps when the port names do not follow ARCH's flattening convention:
+
+```harc
+let mem : BurstMem = bind dut with {
+    read_burst.req_valid: "mem_req_valid",
+    read_burst.req_ready: "mem_req_ready",
+    read_burst.addr:      "mem_addr",
+    read_burst.len:       "mem_len",
+    read_burst.rsp_valid: "mem_rsp_valid",
+    read_burst.rsp_ready: "mem_rsp_ready",
+    read_burst.rsp_data:  "mem_rsp_data"
+}
+let xact : MemInitiator active = bind mem
+```
+
+This is the HARC equivalent of a synthesizable active BFM. The sequence layer sees `emit xact.req(t)` / `on xact.done(...)`; the DUT sees only wires.
+
+For the opposite direction — a DUT initiator that calls a target service — the canonical near-term shape is a **passive target transactor** at the boundary plus a HARC sequence/agent that supplies response data. The passive transactor may be an ARCH/HARC DUT-side module or an SV module exposing the same req/rsp pins; HARC binds it as `BurstMem`, observes `<method>_req_*`, drives `<method>_rsp_*`, and keeps payloads in protocol-shaped types such as `Vec<T, MAX>` or `{ data: Vec<T, MAX>, len, resp }`. Source-level Vec ports are preserved as indexed arrays in the generated C++ API (`rsp_data[0]`, `rsp_data[1]`, ...); flat lane aliases may exist for compatibility but are not the preferred HARC source style.
+
+Target-side TLM responders use `thread bus.method(args)` inside the bound transactor:
+
+```harc
+transactor MemTarget bound to BurstMem
+    thread bus.read(addr: uint<32>)
+        wait 1 cycle
+        return addr + 0x100
+    end thread
+end transactor MemTarget
+
+let target : MemTarget passive = bind mem
+```
+
+The thread lowers to a responder actor that asserts `read_req_ready`, captures request args on the req handshake, runs the body, drives `read_rsp_data`/`read_rsp_valid`, and holds the response until the DUT raises `read_rsp_ready`. For `out_of_order tags N`, the actor captures `read_req_tag` and echoes it on `read_rsp_tag`.
+
+Current shipped limits:
+
+- Direct non-fork calls lower only for `blocking` methods.
+- RHS `fork bus.method(...)` plus `join_all` lowers for `blocking` and `out_of_order tags N`.
+- Target TLM thread bodies support the linear coroutine subset used by HARC transactors: assignments, waits, and a terminal `return` for value-returning methods. Early returns from nested control flow remain a later slice.
+
 **Coroutine runtime (Phase 1, single-actor).** The test's `run` block lowers to a C++20 coroutine driven by `harc_rt::ThreadScheduler` (slim sister of arch-com's `arch_thread_rt.h`). `wait N cycles` and the bus.send/recv spin loops emit `co_await harc_rt::wait_cycles(_slot, N)`; the main loop drives one primary-clock posedge per iteration, runs post-eval services, then resumes any coroutine whose wait condition is satisfied. Checkers and clocked coverage sample after the coroutine/clk-low settle point unless bound to an explicit hook trigger. Hookable methods, `on`-event-handler closures, tseq lambdas, and free functions stay synchronous — they only execute while the run coroutine is "running" between `co_await`s, so a sync `tick()` from inside a method does not race the scheduler. Multi-clock `wait N cycles on <named-clock>` keeps its sync `eval_clocks_until` path even in coroutine context: the main loop's full-primary-period granularity is too coarse for sub-primary-cycle waits when the named clock runs faster than primary.
 
 **Multi-OS-thread runtime (Phase 3a, opt-in via `harc sim --mt`).** **Default is the cooperative single-OS-thread model.** Pass `--mt` to spawn one `std::thread` per bound-transactor coroutine actor, each with its own `harc_rt::ThreadScheduler` (the per-thread cooperative scheduler is MT-unaware internally; serialization happens between threads via dual atomic-spin `harc_rt::Barrier` instances sized to `1 + N_actors` participants). Per-cycle order under `--mt` follows the same observation boundary as cooperative mode: main performs the primary-clock edge eval, post-eval services observe/respond to the settled edge, then main runs the run-coroutine's `sched.tick()` (any `emit drv.req(t)` calls push to actor queues here), releases worker schedulers with `_start_barrier.wait()`, waits for `_end_barrier.wait()`, and finally performs the clk-low combinational settle plus `_checkers`. Main owns all `dut->eval()` calls because Verilator-generated DUT code is not MT-safe. Run-coroutine writes precede worker reads; worker DUT-input writes precede the final settle. No locks; no races on shared queues or signal state.
 
 **Why opt-in.** Per-cycle barrier sync on Apple Silicon costs tens of µs round-trip due to P/E-core scheduling jitter. With sub-µs per-cycle actor work in typical fixtures, `--mt` is *13× slower* than cooperative on the bound-transactor benchmark (cooperative ~0.02s, `--mt` ~0.27s for 30 000 cycles + 3 actors). The runtime topology is shipped for: (1) correctness validation of the multi-actor model — active and passive transactor halves genuinely run in parallel under `--mt`, surfacing any latent race that the cooperative model would have hidden; (2) future workloads (large per-cycle compute, or DUT-side parallel eval) where the parallelism win exceeds the barrier cost; (3) structural mirror with arch-com's Phase 3 — when the two runtimes converge, this is the model both sides converge on. Cycle batching (`run_cycles(K)`) to amortize barrier cost — useful for fast-forwarding through long idle drains where actors are quiet — is **Phase 3b** (deferred). Phase 3a ships the runtime topology + correctness argument; perf comes when there's a workload to justify it.
 
-Out of v0 scope: direct non-fork `out_of_order` `tlm_method` call lowering, target-side TLM implementation syntax, `credit_channel` lowering (parser accepts; codegen no-ops), DUT-side introspection to flag bus signals that the actual SV doesn't expose, env-composed `bound` sub-components (only top-level `let xact : T mode = bind axil` is supported; bound components nested inside an `env` follow), multi-input-event transactors (active transactors with multiple `in event<T>` fields fall back to the synchronous subscriber-callback path), OS-thread parallelism beyond the opt-in `--mt` flag (Phase 3b cycle batching), decimal printf for >64-bit values (`__int128` lacks native printf support), and per-word printing of >128-bit signals (would need a word-array variant of `HarcHexBuf128`).
+Out of v0 scope: direct non-fork `out_of_order` `tlm_method` call lowering, non-linear target TLM bodies with early returns from nested control flow, `credit_channel` lowering (parser accepts; codegen no-ops), DUT-side introspection to flag bus signals that the actual SV doesn't expose, env-composed `bound` sub-components (only top-level `let xact : T mode = bind axil` is supported; bound components nested inside an `env` follow), multi-input-event transactors (active transactors with multiple `in event<T>` fields fall back to the synchronous subscriber-callback path), OS-thread parallelism beyond the opt-in `--mt` flag (Phase 3b cycle batching), decimal printf for >64-bit values (`__int128` lacks native printf support), and per-word printing of >128-bit signals (would need a word-array variant of `HarcHexBuf128`).
 
 ### 8.1 `transactor`
 
@@ -2242,7 +2321,7 @@ The implicit default is `kind arch` — an ordinary `module Foo ... end module F
 
 **v1 limitations of the Verilator path:**
 
-- **Raw signal access only.** No automatic protocol grouping in v1 — `dut.s_axi_awvalid` is a raw signal, not part of a typed `bus BusAxi4`. This means HARC transactors that are written against ARCH `bus` types cannot be reused directly against SV DUTs without adapter code. v1.1 will add convention-based grouping (`<prefix>_<channel>_<signal>` patterns) and explicit binding stubs for protocol-typed access.
+- **No automatic protocol grouping.** SV ports are still discovered as raw signals first, but typed protocol access is available when the test supplies the binding: `let axi : BusAxi4 = bind dut with { aw.valid: "s_axi_awvalid", ... }`. The same rule applies to `tlm_method` req/rsp wires: a HARC transactor written against a `bus` can drive an SV DUT when every non-conventional port name is remapped explicitly. v1 does not infer `<prefix>_<channel>_<signal>` groups or generate those bindings automatically; v1.1 may add convention-based grouping and binding stubs.
 - **No `internal` access** to SV module internals beyond what Verilator's public accessors expose. Verilator can be coerced into exposing more via `/* verilator public */` annotations, but HARC v1 doesn't depend on this.
 - **No co-elaboration.** SV parameters are baked at Verilator compile time; HARC parameters can't be propagated into the SV DUT. Mixed-parameter designs need the ARCH-DUT path.
 - **No SVA on internal SV signals.** HARC `assert` / `cover` / `assume` work fine on the DUT boundary signals; reaching internal SV signals for property checking requires Verilator hierarchical access (currently limited).
@@ -2444,11 +2523,11 @@ Honest about what is not pinned down:
 
 Build order matches the data path of a working testbench: stimulus generates traffic, observer reconstructs it, checker verifies it. Properties and coverage are *additions* to a working TB, not the foundation — they're useful only once stimulus exists to exercise the DUT. Each phase delivers user-visible value standalone — no big-bang.
 
-- **Phase 1a — Per-field stimulus, no constraint solver.** Transactions with default-rand fields and per-field attributes: `[range(...)]`, `[dist {...}]` (per-field weighted distribution), `[cyclic]`, `[unique]`, `[weighted(...)]`. `when` subtypes — discriminator-based variant selection plus per-field randomization within a variant. `tseq` with composition operators (`parallel`, `schedule`, `select`, `repeat` — §17.1), `sequencer`, active `transactor` bound to ARCH `bus` and dispatching through `handshake_channel` / `credit_channel` / `tlm_method`, `buffer<T>` flow object (§17.2), basic `test` with inline `run` block, **logging with severity / verbosity / component IDs** (§7.7 — rides on the ARCH `log` primitive), **DUT backend abstraction with both ARCH co-compiled and Verilator-linked SV paths** (§10.5 — raw signal access on the SV path; protocol-typed binding deferred to v1.1). Static checker rejects any `keep` or `relation` referencing more than one field, with a clear error pointing to Phase 1b. **No SMT solver linked** — runtime is a standard PRNG library (xoshiro / PCG / Mersenne) with weighted-sample and cyclic-enumeration support. **Demo:** random valid AXI traffic drives a slave DUT through a HARC-compiled binary, against either an ARCH-native AXI slave or an existing SV AXI slave linked via Verilator; expressivity equivalent to SystemVerilog `$urandom_range` plus distributions and cyclic enumeration, with HARC's clean type system on top.
+- **Phase 1a — Per-field stimulus, no constraint solver.** Transactions with default-rand fields and per-field attributes: `[range(...)]`, `[dist {...}]` (per-field weighted distribution), `[cyclic]`, `[unique]`, `[weighted(...)]`. `when` subtypes — discriminator-based variant selection plus per-field randomization within a variant. `tseq` with composition operators (`parallel`, `schedule`, `select`, `repeat` — §17.1), `sequencer`, active `transactor` bound to a typed `bus` and dispatching through `handshake_channel` / `credit_channel` / `tlm_method`, `buffer<T>` flow object (§17.2), basic `test` with inline `run` block, **logging with severity / verbosity / component IDs** (§7.7 — rides on the ARCH `log` primitive), **DUT backend abstraction with both ARCH co-compiled and Verilator-linked SV paths** (§10.5 — raw signal access plus explicit bus/TLM remaps on the SV path; automatic protocol grouping deferred to v1.1). Static checker rejects any `keep` or `relation` referencing more than one field, with a clear error pointing to Phase 1b. **No SMT solver linked** — runtime is a standard PRNG library (xoshiro / PCG / Mersenne) with weighted-sample and cyclic-enumeration support. **Demo:** random valid AXI traffic drives a slave DUT through a HARC-compiled binary, against either an ARCH-native AXI slave or an existing SV AXI slave linked via Verilator; expressivity equivalent to SystemVerilog `$urandom_range` plus distributions and cyclic enumeration, with HARC's clean type system on top.
 
 - **Phase 1b — Constraint solver, queued randomize, full CRV.** Z3 integration (linked as off-cycle solver pool — §4.4), cross-field `keep` constraints in transactions, free-standing `relation` declarations (§4), `solve_before` / `solve_after` hints, the `dist` directive inside `randomize ... with { ... }` for cross-field weighted distributions, queued `randomize` with implicit single-shot result channel, `blocking randomize` semantics with compile-time enforcement when constraint references runtime DUT state, tagged-ADT encoding of `when` subtypes for solver pruning (§3.3 — `(declare-datatypes)` per-variant subproblems). Phase 1a code keeps working unchanged — Phase 1b lifts the cross-field restriction on the static checker and enables the solver path. **Demo:** classic AXI burst-legal generation with relational constraints (`len * size <= 4096 - addr % 4096`); solver pool sustains throughput against cycle-based simulation.
 
-- **Phase 2 — Observation.** Passive `transactor` bound to ARCH `bus` (type system enforces no-driving on a `passive` instance), transaction reconstruction from observed bus signals, `agent` as the (sequencer + active transactor + passive transactor) composition. Multi-clock domain spanning (`across`, cross-domain channels — §7.5) lands here, lowering to ARCH `synchronizer` and async `fifo`. **Demo:** observe and reconstruct the transactions the DUT actually emitted; agent groups everything per protocol.
+- **Phase 2 — Observation.** Passive `transactor` bound to a typed `bus` (type system enforces no-driving on a `passive` instance), transaction reconstruction from observed bus signals, `agent` as the (sequencer + active transactor + passive transactor) composition. Multi-clock domain spanning (`across`, cross-domain channels — §7.5) lands here, lowering to ARCH `synchronizer` and async `fifo`. **Demo:** observe and reconstruct the transactions the DUT actually emitted; agent groups everything per protocol.
 
 - **Phase 3 — Checker.** `scoreboard` construct with structural equality on transactions, `env` as the static composition root, `state<T>` flow object (§17.2) for shared scoreboard slots. **Demo:** closed-loop functional verification — random stim → DUT → passive observer → scoreboard catches mismatches end-to-end. This is the milestone that makes HARC a working testbench language.
 
@@ -2517,7 +2596,7 @@ Every HARC construct has a direct lowering to an ARCH primitive — HARC adds th
 | `ref module`                    | ARCH module with C function body via DPI             | Same as ARCH §22 reference modules                     |
 | `bus` port type                 | ARCH `bus` with `target` perspective                 | Per ARCH §24                                           |
 | ARCH DUT bind (`let dut: ArchModule = bind ...`) | Direct typed reference into ARCH IR; co-elaborated, single binary | Default fastest path                  |
-| Verilator DUT bind (`module Name kind verilator { ... }`) | `verilator --xml-only` consumed by HARC frontend; generated C++ glue maps typed signal access to `Vmodel` accessors; linked into the HARC binary alongside `Vmodel.cpp` | Raw signal access only in v1; protocol-typed binding deferred to v1.1 |
+| Verilator DUT bind (`module Name kind verilator { ... }`) | `verilator --xml-only` consumed by HARC frontend; generated C++ glue maps typed signal access to `Vmodel` accessors; linked into the HARC binary alongside `Vmodel.cpp` | Raw signal access plus explicit `bus ... = bind dut with { ... }` remaps in v1; automatic protocol grouping deferred to v1.1 |
 | Cycle-loop `dut.eval_domain(D)` | ARCH backend: direct C++ call into co-compiled module | Verilator backend: `Vmodel->eval()` |
 | `use Foo`                       | ARCH `use Foo` (per §29)                             | Same keyword, same semantic                            |
 | `apply Aspect`                  | Compile-time activation of `extend` blocks; no runtime lowering | Aspect resolution happens in HARC frontend |

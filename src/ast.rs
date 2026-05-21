@@ -495,6 +495,7 @@ pub enum ComponentItem {
     Field(ComponentField),
     Connect(ConnectBlock),
     OnHandler(OnHandler),
+    TargetTlmThread(TargetTlmThread),
     Hookable(HookableMethod),
     /// Inline `apply Name` inside a component body (rare but legal in scopes).
     Apply(ApplyDecl),
@@ -505,6 +506,18 @@ pub enum ComponentItem {
     /// aspects can attach via `on <ComponentType>.watchdog pre/post`,
     /// reusing the existing hookable-hook mechanism.
     Watchdog(WatchdogDecl),
+}
+
+/// `thread bus.method(args) ... return expr end thread` inside a
+/// `transactor ... bound to BusType`. This is HARC's target-side TLM
+/// responder surface: the body runs when the DUT initiator presents a
+/// method request on the bound req/rsp wires.
+#[derive(Debug, Clone)]
+pub struct TargetTlmThread {
+    pub method: Path,
+    pub params: Vec<Param>,
+    pub body: Block,
+    pub span: Span,
 }
 
 /// `watchdog … end watchdog` declaration (spec §8.6). All fields
