@@ -594,6 +594,16 @@ fn print_component_item(out: &mut String, it: &ComponentItem, depth: usize) {
         ComponentItem::OnHandler(h) => {
             print_on_handler(out, h, depth);
         }
+        ComponentItem::TargetTlmThread(t) => {
+            pad(out, depth);
+            write!(out, "thread ").ok();
+            print_path(out, &t.method);
+            print_paren_params(out, &t.params);
+            writeln!(out).ok();
+            print_block_inner(out, &t.body, depth + 1);
+            pad(out, depth);
+            writeln!(out, "end thread").ok();
+        }
         ComponentItem::Hookable(h) => {
             // Round-trip the introducer + the matching closer per the
             // `is_hookable` discriminator (docs/test-ergonomics.md §3.2).
