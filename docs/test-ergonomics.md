@@ -167,6 +167,11 @@ end testbench AxiLiteTb
 
 - A `testbench` field may be:
   - A DUT module (`dut : AxiLiteRegs`).
+  - A probe-bearing DUT module using the explicit let form:
+    `let dut : AxiLiteRegs ... probe ... end let dut`. When a bound
+    `impl <Test> for <Tb>` is lowered, the synthesized test-scope
+    `dut` preserves those probe declarations so Verilator bind-stub
+    generation and `dut.<probe>` access work exactly like direct tests.
   - A bus binding (`bus : BusAxiLite = bind dut`) — `bind` resolves
     against the testbench's own fields.
   - A transactor / scoreboard / env / agent — all existing component
@@ -244,7 +249,7 @@ end impl EnableToggle
 
 **Semantics.**
 - Bare-name lookup inside the bound test body falls through to the testbench instance: identifiers matching testbench fields rewrite to `_tb.<name>`, identifiers matching testbench methods (`function` or `hookable`) rewrite to `<TbType>_<name>(_tb, ...)`.
-- `dut` is reserved as the test-scope name for the DUT pointer. The desugarer synthesizes `let dut : <SVType>` at test scope from the testbench's first SV-typed field, then emits `_tb.dut = dut` so the testbench's pointer aliases the test-scope pointer (one allocation, two pointers, same instance). Bare `dut.signal` resolves through the existing pointer-var path — no `_tb.` prefix.
+- `dut` is reserved as the test-scope name for the DUT pointer. The desugarer synthesizes `let dut : <SVType>` at test scope from the testbench's first SV-typed field, preserving any probes/remaps attached to a testbench-owned `let dut : <SVType> ... end let dut`, then emits `_tb.dut = dut` so the testbench's pointer aliases the test-scope pointer (one allocation, two pointers, same instance). Bare `dut.signal` resolves through the existing pointer-var path — no `_tb.` prefix.
 - User-declared `let X` at test scope shadows any testbench field named `X` (other than `dut`, which is always synthesized).
 - The testbench instance is **fresh per test** — each `impl Foo for Tb` gets its own default-constructed `Tb` allocated at the start of that test's `main()`.
 

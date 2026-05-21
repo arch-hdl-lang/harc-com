@@ -59,6 +59,15 @@ end struct Header
 }
 
 #[test]
+fn testbench_probe_dut_round_trip() {
+    let src = include_str!("fixtures/testbench_probe_dut_test.harc");
+    let printed = parse_print_reparse(src);
+    assert!(printed.contains("let dut : CpuPipe"));
+    assert!(printed.contains("probe force inject_rs1"));
+    assert!(printed.contains("end let dut"));
+}
+
+#[test]
 fn property_assert_assume_cover() {
     let src = r#"
 property aw_valid_stable

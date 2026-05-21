@@ -81,8 +81,9 @@ pub fn dut_type_name(file: &SourceFile) -> Option<String> {
 /// If the test's `let dut : T` carries `probe ... at <path>` declarations,
 /// return `(T's simple name, &probes)`. `None` for tests without probes —
 /// callers skip the SV bind-stub emission entirely in that case.
-pub fn dut_probes(file: &SourceFile) -> Option<(String, &[Probe])> {
-    let test = file.items.iter().find_map(|it| match it {
+pub fn dut_probes(file: &SourceFile) -> Option<(String, Vec<Probe>)> {
+    let lowered = desugar_impl_for_test_in_file(file);
+    let test = lowered.items.iter().find_map(|it| match it {
         Item::Test(t) => Some(t),
         _ => None,
     })?;
@@ -90,7 +91,7 @@ pub fn dut_probes(file: &SourceFile) -> Option<(String, &[Probe])> {
         if let TestItem::Let(l) = it {
             if l.name.name == "dut" && !l.probes.is_empty() {
                 let ty = type_simple_name(l.ty.as_ref())?.to_string();
-                return Some((ty, &l.probes));
+                return Some((ty, l.probes.clone()));
             }
         }
     }
@@ -14417,7 +14418,7 @@ fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
         };
 
         // Classify testbench fields.
-        let mut dut_field: Option<(String, TypeExpr)> = None;
+        let mut dut_field: Option<ComponentField> = None;
         let mut field_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut field_is_pointer: std::collections::HashSet<String> =
             std::collections::HashSet::new();
@@ -14438,7 +14439,7 @@ fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
                         // module type). First wins for the synthesized
                         // `let dut : ...`.
                         if dut_field.is_none() {
-                            dut_field = Some((f.name.name.clone(), f.ty.clone()));
+                            dut_field = Some(f.clone());
                         }
                         field_is_pointer.insert(f.name.name.clone());
                     }
@@ -14536,18 +14537,18 @@ fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
         // (a defensive choice; today shadowing is also a HARC error
         // via duplicate-let detection).
         let mut prefix: Vec<TestItem> = Vec::new();
-        if let Some((_dut_name, dut_ty)) = &dut_field {
+        if let Some(dut) = &dut_field {
             // Synthesize: `let dut : <SVType>`
             prefix.push(TestItem::Let(LetStmt {
                 name: Ident {
                     name: "dut".into(),
                     span: tb_ident.span,
                 },
-                ty: Some(dut_ty.clone()),
+                ty: Some(dut.ty.clone()),
                 value: None,
                 bind: false,
-                probes: Vec::new(),
-                bind_remap: Vec::new(),
+                probes: dut.probes.clone(),
+                bind_remap: dut.bind_remap.clone(),
                 span: tb_ident.span,
             }));
         }

@@ -796,7 +796,7 @@ impl Parser {
         let inner_doc = self.consume_inner_doc();
         let mut items = Vec::new();
         while !self.check_end_keyword() {
-            items.push(self.parse_component_item()?);
+            items.push(self.parse_component_item(kind)?);
         }
         let end = self.expect_end(start_kw, &name.name)?;
         Ok(ComponentDecl {
@@ -811,9 +811,20 @@ impl Parser {
         })
     }
 
-    fn parse_component_item(&mut self) -> Result<ComponentItem, CompileError> {
+    fn parse_component_item(
+        &mut self,
+        component_kind: ComponentKind,
+    ) -> Result<ComponentItem, CompileError> {
         let doc = self.consume_outer_doc();
         match self.peek_kind() {
+            Some(TokenKind::Let) if component_kind == ComponentKind::Testbench => {
+                Ok(ComponentItem::Field(self.parse_testbench_let_field(doc)?))
+            }
+            Some(TokenKind::Let) => Err(CompileError::unexpected_token(
+                "`let` declarations are currently only supported directly inside `testbench` bodies",
+                "let",
+                self.peek_span(),
+            )),
             Some(TokenKind::Connect) => Ok(ComponentItem::Connect(self.parse_connect_block()?)),
             Some(TokenKind::On) => Ok(ComponentItem::OnHandler(self.parse_on_handler()?)),
             Some(TokenKind::Hookable) => Ok(ComponentItem::Hookable(self.parse_hookable()?)),
@@ -830,6 +841,36 @@ impl Parser {
             Some(TokenKind::Watchdog) => Ok(ComponentItem::Watchdog(self.parse_watchdog()?)),
             _ => Ok(ComponentItem::Field(self.parse_component_field(doc)?)),
         }
+    }
+
+    fn parse_testbench_let_field(
+        &mut self,
+        doc: Option<String>,
+    ) -> Result<ComponentField, CompileError> {
+        let l = self.parse_let_stmt()?;
+        if l.ty.is_none() {
+            return Err(CompileError::general(
+                "`let` inside a testbench must have an explicit type",
+                l.span,
+            ));
+        }
+        if l.bind || l.value.is_some() {
+            return Err(CompileError::general(
+                "`let` inside a testbench currently supports DUT declarations only; use `name : Type` for ordinary fields",
+                l.span,
+            ));
+        }
+        Ok(ComponentField {
+            name: l.name,
+            direction: None,
+            ty: l.ty.expect("checked above"),
+            bound_to: None,
+            default: None,
+            probes: l.probes,
+            bind_remap: l.bind_remap,
+            span: l.span,
+            doc,
+        })
     }
 
     /// Parse a `watchdog … end watchdog` declaration (spec §8.6).
@@ -938,13 +979,13 @@ impl Parser {
                 self.advance(); // consume `active`
                 let mut active_items: Vec<ComponentItem> = Vec::new();
                 while !(self.check(TokenKind::End) && self.peek2_kind() == Some(&TokenKind::When)) {
-                    active_items.push(self.parse_component_item()?);
+                    active_items.push(self.parse_component_item(ComponentKind::Transactor)?);
                 }
                 self.expect(TokenKind::End)?;
                 self.expect(TokenKind::When)?;
                 when_active = Some(active_items);
             } else {
-                items.push(self.parse_component_item()?);
+                items.push(self.parse_component_item(ComponentKind::Transactor)?);
             }
         }
         let end = self.expect_end(TokenKind::Transactor, &name.name)?;
@@ -1045,6 +1086,8 @@ impl Parser {
             ty,
             bound_to,
             default,
+            probes: Vec::new(),
+            bind_remap: Vec::new(),
             span: start.merge(end),
             doc,
         })
@@ -1582,7 +1625,7 @@ impl Parser {
             Some(TokenKind::Connect) | Some(TokenKind::Hookable) => {
                 let mut items = Vec::new();
                 while !self.check_end_keyword() {
-                    items.push(self.parse_component_item()?);
+                    items.push(self.parse_component_item(ComponentKind::Env)?);
                 }
                 ExtendBody::Component(items)
             }
