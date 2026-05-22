@@ -5,6 +5,7 @@
 //! verified `CTypedProblem`s so codegen can migrate one feature at a time.
 
 pub mod problem_table;
+pub mod runtime;
 pub mod z3;
 
 use std::collections::BTreeMap;
