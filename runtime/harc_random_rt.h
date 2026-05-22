@@ -9,6 +9,7 @@
 
 #include <initializer_list>
 #include <cstdint>
+#include <vector>
 
 namespace harc_rt {
 namespace random {
@@ -47,6 +48,9 @@ struct HarcDistBin {
     int64_t hi = 0;
     int64_t weight = 0;
 };
+
+template <typename T>
+using HarcUniqueHistory = std::vector<T>;
 
 enum class HarcSolveMode : uint8_t {
     Inline,
@@ -153,6 +157,24 @@ inline int64_t harc_prefer_dist(
         ++bin_salt;
     }
     return bins.begin()->lo;
+}
+
+template <typename T>
+inline const HarcUniqueHistory<T>& harc_unique_values(
+    const HarcUniqueHistory<T>& history) {
+    return history;
+}
+
+template <typename T>
+inline void harc_unique_clear(HarcUniqueHistory<T>& history) {
+    history.clear();
+}
+
+template <typename T>
+inline void harc_unique_remember(
+    HarcUniqueHistory<T>& history,
+    const T& value) {
+    history.push_back(value);
 }
 
 inline constexpr HarcSolveStatus harc_solve_status_ok() {

@@ -2831,12 +2831,15 @@ end test UniqueTest"#,
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
         cpp.contains("z3::solver _s(_ctx);")
-            && cpp.contains("static std::vector<uint64_t> _solver_site_")
+            && cpp.contains(
+                "static harc_rt::random::HarcUniqueHistory<uint64_t> _solver_site_"
+            )
             && cpp.contains("_unique_test_tag;")
-            && cpp.contains("for (auto _v : _solver_site_")
-            && cpp.contains("_unique_test_tag) _s.add")
+            && cpp.contains("for (auto _v : harc_rt::random::harc_unique_values(_solver_site_")
+            && cpp.contains("_unique_test_tag)) _s.add")
             && cpp.contains("// [unique within test] policy: no repeat until exhausted")
-            && cpp.contains(".clear();")
+            && cpp.contains("harc_rt::random::harc_unique_clear(_solver_site_")
+            && cpp.contains("harc_rt::random::harc_unique_remember(_solver_site_")
             && !cpp.contains("if (_solver_site_")
             && !cpp.contains("randomize_T(&t);"),
         "unique fields should route bare randomize through scoped recycling solver history; got:\n{cpp}",
