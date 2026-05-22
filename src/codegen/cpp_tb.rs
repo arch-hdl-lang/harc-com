@@ -9306,7 +9306,7 @@ impl Emitter {
         self.pad(depth);
         writeln!(
             self.out,
-            "{{   // {} randomize(t) with — immediate Z3 solver block",
+            "{{   // {} randomize(t) with — runtime constrained solve callback",
             if blocking { "blocking" } else { "queued" }
         )
         .ok();
@@ -9342,6 +9342,12 @@ impl Emitter {
             self.pad(depth + 1);
             writeln!(self.out, "auto _harc_rt_seed = harc_rng_next();").ok();
         }
+        self.pad(depth + 1);
+        writeln!(
+            self.out,
+            "auto _harc_rt_generated_solver = [&]() -> harc_rt::random::HarcSolveStatus {{"
+        )
+        .ok();
 
         // Context + solver. We use `z3::solver` (not `optimize`) so UNSAT
         // is reported faithfully — `optimize` can return a "best partial"
@@ -10613,6 +10619,12 @@ impl Emitter {
             }
         }
         self.emit_randomize_trace_event(ty, target, depth + 2);
+        self.pad(depth + 2);
+        writeln!(
+            self.out,
+            "return harc_rt::random::harc_solve_status_ok();"
+        )
+        .ok();
         self.pad(depth + 1);
         writeln!(self.out, "}} else {{").ok();
         self.pad(depth + 2);
@@ -10669,8 +10681,27 @@ impl Emitter {
         }
         self.pad(depth + 2);
         writeln!(self.out, "errors++;").ok();
+        self.pad(depth + 2);
+        writeln!(self.out, "return _harc_rt_status;").ok();
         self.pad(depth + 1);
         writeln!(self.out, "}}").ok();
+        self.pad(depth + 1);
+        writeln!(self.out, "}};").ok();
+        self.pad(depth + 1);
+        write!(
+            self.out,
+            "auto _harc_rt_solve_status = harc_rt::random::harc_solve_constrained("
+        )
+        .ok();
+        self.emit_expr(target);
+        writeln!(
+            self.out,
+            ", _harc_rt_problem ? _harc_rt_problem->id : 0, _harc_rt_seed, harc_rt::random::HarcSolveMode::{}, _harc_rt_generated_solver);",
+            if blocking { "Blocking" } else { "Queued" }
+        )
+        .ok();
+        self.pad(depth + 1);
+        writeln!(self.out, "(void)_harc_rt_solve_status;").ok();
 
         self.pad(depth);
         writeln!(self.out, "}}").ok();

@@ -84,9 +84,13 @@ end test RuntimeProblemTableTest
         "harc_find_call_site(_harc_runtime_random_problem_table_call_sites, _harc_runtime_random_problem_table_call_site_count, 2)"
     ));
     assert!(cpp.contains("harc_call_site_next_seed(*_harc_rt_site, harc_rng_state)"));
+    assert!(cpp
+        .contains("auto _harc_rt_generated_solver = [&]() -> harc_rt::random::HarcSolveStatus {"));
+    assert!(cpp.contains("harc_rt::random::harc_solve_constrained("));
+    assert!(cpp.contains("harc_rt::random::HarcSolveMode::Queued"));
     assert!(
         cpp.contains("z3::context _ctx;"),
-        "Phase 5B must not switch behavior away from inline Z3 yet; got:\n{cpp}"
+        "runtime constrained callback must still delegate to generated inline Z3 for now; got:\n{cpp}"
     );
 }
 
@@ -2366,6 +2370,7 @@ end test SeededSolverTest"#,
             && cpp.contains(
                 "harc_rt::random::harc_call_site_next_seed(*_harc_rt_site, harc_rng_state)"
             )
+            && cpp.contains("harc_rt::random::harc_solve_constrained(")
             && cpp.contains(
                 "_p.set(\"random_seed\", static_cast<unsigned>(_harc_rt_seed & 0x7fffffffU));"
             )
@@ -3053,7 +3058,9 @@ end test BlockingRandomizeTest"#,
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
-        cpp.contains("// blocking randomize(t) with") && cpp.contains("immediate Z3 solver block"),
+        cpp.contains("// blocking randomize(t) with")
+            && cpp.contains("runtime constrained solve callback")
+            && cpp.contains("harc_rt::random::HarcSolveMode::Blocking"),
         "blocking randomize should be visible in emitted solver path; got:\n{cpp}",
     );
 }
@@ -3627,6 +3634,8 @@ end test UnsatOriginDiagnosticTest"#,
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
         cpp.contains("harc_rt::random::harc_solve_status_unsat")
+            && cpp.contains("return _harc_rt_status;")
+            && cpp.contains("return harc_rt::random::harc_solve_status_ok();")
             && cpp.contains(
                 "sim_log_line(\"FAIL\", \"%s\", _harc_rt_status.message ? _harc_rt_status.message : \"randomize(t) with: constraint UNSAT\");"
             )

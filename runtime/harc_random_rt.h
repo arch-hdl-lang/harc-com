@@ -115,6 +115,20 @@ inline HarcSolveStatus harc_solve(
     return harc_solve_status_ok();
 }
 
+template <typename T, typename GeneratedSolveFn>
+inline HarcSolveStatus harc_solve_constrained(
+    T& target,
+    harc_problem_id problem_id,
+    harc_seed seed,
+    HarcSolveMode mode,
+    GeneratedSolveFn generated_solve_fn) {
+    (void)target;
+    (void)problem_id;
+    (void)seed;
+    (void)mode;
+    return generated_solve_fn();
+}
+
 template <typename T>
 inline HarcSolveStatus harc_solve_queued(
     T& target,

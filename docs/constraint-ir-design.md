@@ -446,8 +446,10 @@ derived in the runtime layer.
 ## Layer 4 — Runtime randomization API
 
 `runtime/harc_random_rt.h` + `runtime/harc_random_rt.cpp`. The
-generated C++ from `cpp_tb.rs` calls into this API rather than
-inlining Z3 string construction.
+generated C++ from `cpp_tb.rs` calls into this API rather than owning
+the solver boundary directly. During migration, constrained solves are
+still generated as inline Z3 code, but that code is packaged as a
+generated callback and invoked through the runtime API.
 
 ### Call shape
 
@@ -465,6 +467,16 @@ void harc_solve_queued(T& target, harc_problem_id pid, harc_seed sd);
 // the user's `blocking randomize(...)` form; codegen routes accordingly.
 template <typename T>
 void harc_solve_blocking(T& target, harc_problem_id pid, harc_seed sd);
+
+// Migration bridge: executes the generated inline Z3 body through the
+// runtime boundary until the backend can solve typed problems directly.
+template <typename T, typename GeneratedSolveFn>
+HarcSolveStatus harc_solve_constrained(
+    T& target,
+    harc_problem_id pid,
+    harc_seed sd,
+    HarcSolveMode mode,
+    GeneratedSolveFn generated_solve_fn);
 ```
 
 `harc_problem_id` is a stable handle assigned at compile time per
@@ -548,7 +560,7 @@ has a parity gate against the 56 fixtures.
 | 2 — AST → typed IR lowering | shipped | `src/constraints/typed_lower.rs`. Lowers the supported constraint subset alongside existing codegen, returning structured errors for deferred constructs. | `lower_problem` fixture sweep: no panics; clean lowerings are now verifier-checked. |
 | 3 — Verifier | shipped | `verify_constraint_problem`. Runs over every clean fixture-sweep lowering and rejects malformed hand-built IR before any solver backend consumes it. | Self-tests on hand-built IR with intentional violations + fixture sweep verifies every cleanly lowered problem. |
 | 4 — Solver backend trait + Z3 SMT scaffold | scaffold shipped | `src/solver/{mod.rs,z3.rs}` plus `src/solver/problem_table.rs`. Reads verified `CTypedProblem`s and renders an SMT-LIB/Z3-shaped problem with declarations, enum domain axioms, named assertions, and assertion-origin mapping. Rust-side Z3 execution is still deferred. | Unit tests cover unsigned/signed BV lowering, enum/range lowering, verifier handoff, unsupported aggregate declarations, and typed problem table extraction. `tests/typed_z3_fixture_sweep.rs` walks all fixtures and builds the Z3 scaffold for every clean table entry. |
-| 5 — Runtime randomization library | scaffold started | `runtime/harc_random_rt.{h,cpp}` plus `src/solver/runtime.rs`. Defines the runtime solve API shell, deterministic seed derivation helper, stable typed-problem descriptor manifest, problem lookup helper, call-site counters, C++ problem table emission, per-`randomize` metadata touches, an unconstrained-record queued runtime handoff that delegates to the existing PRNG callback, runtime-owned Z3 seeding for inline solver paths, and runtime solve-status construction for UNSAT. `cpp_tb.rs` still owns inline Z3 solving for constraints. | Unit tests verify descriptor stability, compile the C++ runtime scaffold as C++20, assert generated C++ carries/touches runtime problem/call-site metadata, assert unconstrained randomize routes through the runtime shell, assert constrained inline Z3 paths use runtime-derived seeds, and assert UNSAT constructs runtime status while preserving diagnostics. Later parity gate runs all randomize-using fixtures end-to-end after codegen starts calling the runtime solver. |
+| 5 — Runtime randomization library | scaffold started | `runtime/harc_random_rt.{h,cpp}` plus `src/solver/runtime.rs`. Defines the runtime solve API shell, deterministic seed derivation helper, stable typed-problem descriptor manifest, problem lookup helper, call-site counters, C++ problem table emission, per-`randomize` metadata touches, an unconstrained-record queued runtime handoff that delegates to the existing PRNG callback, runtime-owned Z3 seeding for inline solver paths, runtime solve-status construction for UNSAT, and a constrained-solve callback bridge. `cpp_tb.rs` still generates inline Z3 solving for constraints, but execution now goes through the runtime boundary. | Unit tests verify descriptor stability, compile the C++ runtime scaffold as C++20, assert generated C++ carries/touches runtime problem/call-site metadata, assert unconstrained randomize routes through the runtime shell, assert constrained inline Z3 paths use runtime-derived seeds and the callback bridge, and assert UNSAT constructs runtime status while preserving diagnostics. Later parity gate runs all randomize-using fixtures end-to-end after codegen starts calling the runtime solver. |
 | 6 — `[dist]` / `[unique]` / `solve_order` migration | not started | Move runtime semantics from cpp_tb.rs inline emit into harc_random_rt.cpp; codegen calls library functions. | Fixture diff: every `[dist]`-using test produces same distribution histogram over N seeds (Kolmogorov-Smirnov tolerance). |
 | 7 — `when` subtype lowering | shipped | Layer-2 expansion of `when` guards into guarded implications for keeps/range attrs, including nested `when` and foreach keeps. | Typed-lowering tests verify guarded clauses; full runtime parity still uses existing `cpp_tb.rs` path until backend execution lands. |
 | 8 — Delete v0 inline Z3 emission | not started | Remove `emit_solver_block` + helpers from `cpp_tb.rs`. | One release cycle clean on phase 4-7 work. |
