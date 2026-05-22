@@ -2255,18 +2255,38 @@ struct PendingTlmFork {
     tag: Option<u64>,
 }
 
-fn split_terminal_return(body: &Block) -> Result<(Block, Option<Expr>), String> {
+#[derive(Debug, Clone)]
+struct TargetTlmReturnBranch {
+    body: Block,
+    expr: Expr,
+}
+
+#[derive(Debug, Clone)]
+enum TargetTlmReturn {
+    None,
+    Expr(Expr),
+    If {
+        cond: Expr,
+        then_branch: TargetTlmReturnBranch,
+        elsifs: Vec<(Expr, TargetTlmReturnBranch)>,
+        else_branch: TargetTlmReturnBranch,
+    },
+}
+
+fn split_target_tlm_return(body: &Block) -> Result<(Block, TargetTlmReturn), String> {
     let Some((last, prefix)) = body.stmts.split_last() else {
         return Ok((
             Block {
                 stmts: Vec::new(),
                 span: body.span,
             },
-            None,
+            TargetTlmReturn::None,
         ));
     };
     if prefix.iter().any(stmt_contains_return) {
-        return Err("only a terminal `return` is supported in this lowering slice".into());
+        return Err(
+            "target TLM returns must be terminal; early returns are not supported yet".into(),
+        );
     }
     match &last.kind {
         StmtKind::Return(expr) => Ok((
@@ -2274,10 +2294,67 @@ fn split_terminal_return(body: &Block) -> Result<(Block, Option<Expr>), String> 
                 stmts: prefix.to_vec(),
                 span: body.span,
             },
-            expr.clone(),
+            TargetTlmReturn::Expr(
+                expr.clone()
+                    .ok_or_else(|| "target TLM return must include a value".to_string())?,
+            ),
         )),
-        _ => Ok((body.clone(), None)),
+        StmtKind::If(i) => {
+            let then_branch = split_target_tlm_return_branch(&i.then_block)?;
+            let mut elsifs = Vec::new();
+            for (cond, block) in &i.elsifs {
+                elsifs.push((cond.clone(), split_target_tlm_return_branch(block)?));
+            }
+            let else_block = i.else_block.as_ref().ok_or_else(|| {
+                "terminal target TLM `if` returning a method value must have an `else` branch"
+                    .to_string()
+            })?;
+            let else_branch = split_target_tlm_return_branch(else_block)?;
+            Ok((
+                Block {
+                    stmts: prefix.to_vec(),
+                    span: body.span,
+                },
+                TargetTlmReturn::If {
+                    cond: i.cond.clone(),
+                    then_branch,
+                    elsifs,
+                    else_branch,
+                },
+            ))
+        }
+        _ => Ok((body.clone(), TargetTlmReturn::None)),
     }
+}
+
+fn split_target_tlm_return_branch(block: &Block) -> Result<TargetTlmReturnBranch, String> {
+    let Some((last, prefix)) = block.stmts.split_last() else {
+        return Err("each terminal target TLM `if` branch must end with `return <expr>`".into());
+    };
+    if prefix.iter().any(stmt_contains_return) {
+        return Err(
+            "target TLM returns inside `if` branches must be terminal; early returns are not supported yet"
+                .into(),
+        );
+    }
+    let expr = match &last.kind {
+        StmtKind::Return(Some(expr)) => expr.clone(),
+        StmtKind::Return(None) => {
+            return Err("target TLM return must include a value".into());
+        }
+        _ => {
+            return Err(
+                "each terminal target TLM `if` branch must end with `return <expr>`".into(),
+            );
+        }
+    };
+    Ok(TargetTlmReturnBranch {
+        body: Block {
+            stmts: prefix.to_vec(),
+            span: block.span,
+        },
+        expr,
+    })
 }
 
 fn stmt_contains_return(stmt: &Stmt) -> bool {
@@ -4649,6 +4726,60 @@ impl Emitter {
         }
     }
 
+    /// Emit a terminal target TLM return plan into an already-declared
+    /// response temporary. Branch bodies have already been verified to end in
+    /// a return on every path.
+    fn emit_target_tlm_return(&mut self, ret: &TargetTlmReturn, dst: &str, depth: usize) {
+        match ret {
+            TargetTlmReturn::None => {}
+            TargetTlmReturn::Expr(expr) => {
+                self.pad(depth);
+                write!(self.out, "harc_rt::harc_assign({dst}, ").ok();
+                self.emit_expr(expr);
+                writeln!(self.out, ");").ok();
+            }
+            TargetTlmReturn::If {
+                cond,
+                then_branch,
+                elsifs,
+                else_branch,
+            } => {
+                self.pad(depth);
+                write!(self.out, "if (").ok();
+                self.emit_expr(cond);
+                writeln!(self.out, ") {{").ok();
+                self.emit_block(&then_branch.body, depth + 1);
+                self.emit_target_tlm_return(
+                    &TargetTlmReturn::Expr(then_branch.expr.clone()),
+                    dst,
+                    depth + 1,
+                );
+                for (cond, branch) in elsifs {
+                    self.pad(depth);
+                    write!(self.out, "}} else if (").ok();
+                    self.emit_expr(cond);
+                    writeln!(self.out, ") {{").ok();
+                    self.emit_block(&branch.body, depth + 1);
+                    self.emit_target_tlm_return(
+                        &TargetTlmReturn::Expr(branch.expr.clone()),
+                        dst,
+                        depth + 1,
+                    );
+                }
+                self.pad(depth);
+                writeln!(self.out, "}} else {{").ok();
+                self.emit_block(&else_branch.body, depth + 1);
+                self.emit_target_tlm_return(
+                    &TargetTlmReturn::Expr(else_branch.expr.clone()),
+                    dst,
+                    depth + 1,
+                );
+                self.pad(depth);
+                writeln!(self.out, "}}").ok();
+            }
+        }
+    }
+
     /// Emit `thread bus.method(args) ... return expr end thread` items in a
     /// bound transactor as target-side TLM responder actors. The actor owns
     /// the method's target handshake:
@@ -4733,7 +4864,7 @@ impl Emitter {
                 continue;
             }
 
-            let (body_prefix, ret_expr) = match split_terminal_return(&t.body) {
+            let (body_prefix, ret_plan) = match split_target_tlm_return(&t.body) {
                 Ok(v) => v,
                 Err(msg) => {
                     self.errors
@@ -4741,9 +4872,16 @@ impl Emitter {
                     continue;
                 }
             };
-            if method.ret.is_some() && ret_expr.is_none() {
+            if method.ret.is_some() && matches!(ret_plan, TargetTlmReturn::None) {
                 self.errors.push(format!(
                     "target TLM thread bus.{} must end with `return <expr>` because the method returns a value",
+                    method.name.name
+                ));
+                continue;
+            }
+            if method.ret.is_none() && !matches!(ret_plan, TargetTlmReturn::None) {
+                self.errors.push(format!(
+                    "target TLM thread bus.{} must not return a value because the method has no return type",
                     method.name.name
                 ));
                 continue;
@@ -4848,7 +4986,21 @@ impl Emitter {
                 &mut self.current_component_instance,
                 Some(instance.to_string()),
             );
+            if let Some(ret_ty) = &method.ret {
+                let cty = self.c_type_for_param(ret_ty);
+                self.pad(depth + 2);
+                writeln!(self.out, "{cty} _tlm_rsp_value{{}};").ok();
+            }
             self.emit_block(&body_prefix, depth + 2);
+            if method.ret.is_some() {
+                self.emit_target_tlm_return(&ret_plan, "_tlm_rsp_value", depth + 2);
+                self.pad(depth + 2);
+                writeln!(
+                    self.out,
+                    "harc_rt::harc_assign({root}->{rsp_data}, _tlm_rsp_value);"
+                )
+                .ok();
+            }
             self.current_component_instance = prior_inst;
             self.in_coroutine = prior_corout;
             match prior_bus {
@@ -4864,12 +5016,6 @@ impl Emitter {
             }
             self.field_subs = prev_subs;
 
-            if let Some(expr) = ret_expr {
-                self.pad(depth + 2);
-                write!(self.out, "harc_rt::harc_assign({root}->{rsp_data}, ").ok();
-                self.emit_expr(&expr);
-                writeln!(self.out, ");").ok();
-            }
             if tagged {
                 self.pad(depth + 2);
                 writeln!(self.out, "{root}->{rsp_tag} = _tlm_req_tag;").ok();
@@ -4879,7 +5025,7 @@ impl Emitter {
             self.pad(depth + 2);
             writeln!(
                 self.out,
-                "co_await harc_rt::wait_until(_slot, [&]{{ return {root}->{rsp_ready}; }});",
+                "if (!{root}->{rsp_ready}) co_await harc_rt::wait_until(_slot, [&]{{ return {root}->{rsp_ready}; }});",
             )
             .ok();
             self.pad(depth + 2);

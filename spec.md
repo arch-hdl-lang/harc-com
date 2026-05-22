@@ -1660,7 +1660,11 @@ Target-side TLM responders use `thread bus.method(args)` inside the bound transa
 transactor MemTarget bound to BurstMem
     thread bus.read(addr: uint<32>)
         wait 1 cycle
-        return addr + 0x100
+        if addr < 0x1000
+            return addr + 0x100
+        else
+            return 0xffff_ffff
+        end if
     end thread
 end transactor MemTarget
 
@@ -1673,7 +1677,7 @@ Current shipped limits:
 
 - Direct non-fork calls lower only for `blocking` methods.
 - RHS `fork bus.method(...)` plus `join_all` lowers for `blocking` and `out_of_order tags N`.
-- Target TLM thread bodies support the linear coroutine subset used by HARC transactors: assignments, waits, and a terminal `return` for value-returning methods. Early returns from nested control flow remain a later slice.
+- Target TLM thread bodies support assignments, waits, and terminal value returns. The terminal return may be a direct `return expr` or a terminal `if` / `elsif` / `else` whose every branch ends with `return expr`, allowing address decode and response-code branching. Early returns from nested control flow and target-side loops with returns remain later slices.
 
 **Coroutine runtime (Phase 1, single-actor).** The test's `run` block lowers to a C++20 coroutine driven by `harc_rt::ThreadScheduler` (slim sister of arch-com's `arch_thread_rt.h`). `wait N cycles` and the bus.send/recv spin loops emit `co_await harc_rt::wait_cycles(_slot, N)`; the main loop drives one primary-clock posedge per iteration, runs post-eval services, then resumes any coroutine whose wait condition is satisfied. Checkers and clocked coverage sample after the coroutine/clk-low settle point unless bound to an explicit hook trigger. Hookable methods, `on`-event-handler closures, tseq lambdas, and free functions stay synchronous — they only execute while the run coroutine is "running" between `co_await`s, so a sync `tick()` from inside a method does not race the scheduler. Multi-clock `wait N cycles on <named-clock>` keeps its sync `eval_clocks_until` path even in coroutine context: the main loop's full-primary-period granularity is too coarse for sub-primary-cycle waits when the named clock runs faster than primary.
 
@@ -1681,7 +1685,7 @@ Current shipped limits:
 
 **Why opt-in.** Per-cycle barrier sync on Apple Silicon costs tens of µs round-trip due to P/E-core scheduling jitter. With sub-µs per-cycle actor work in typical fixtures, `--mt` is *13× slower* than cooperative on the bound-transactor benchmark (cooperative ~0.02s, `--mt` ~0.27s for 30 000 cycles + 3 actors). The runtime topology is shipped for: (1) correctness validation of the multi-actor model — active and passive transactor halves genuinely run in parallel under `--mt`, surfacing any latent race that the cooperative model would have hidden; (2) future workloads (large per-cycle compute, or DUT-side parallel eval) where the parallelism win exceeds the barrier cost; (3) structural mirror with arch-com's Phase 3 — when the two runtimes converge, this is the model both sides converge on. Cycle batching (`run_cycles(K)`) to amortize barrier cost — useful for fast-forwarding through long idle drains where actors are quiet — is **Phase 3b** (deferred). Phase 3a ships the runtime topology + correctness argument; perf comes when there's a workload to justify it.
 
-Out of v0 scope: direct non-fork `out_of_order` `tlm_method` call lowering, non-linear target TLM bodies with early returns from nested control flow, `credit_channel` lowering (parser accepts; codegen no-ops), DUT-side introspection to flag bus signals that the actual SV doesn't expose, env-composed `bound` sub-components (only top-level `let xact : T mode = bind axil` is supported; bound components nested inside an `env` follow), multi-input-event transactors (active transactors with multiple `in event<T>` fields fall back to the synchronous subscriber-callback path), OS-thread parallelism beyond the opt-in `--mt` flag (Phase 3b cycle batching), decimal printf for >64-bit values (`__int128` lacks native printf support), and per-word printing of >128-bit signals (would need a word-array variant of `HarcHexBuf128`).
+Out of v0 scope: direct non-fork `out_of_order` `tlm_method` call lowering, target TLM bodies with early returns from nested control flow, target TLM loops whose body returns, `credit_channel` lowering (parser accepts; codegen no-ops), DUT-side introspection to flag bus signals that the actual SV doesn't expose, env-composed `bound` sub-components (only top-level `let xact : T mode = bind axil` is supported; bound components nested inside an `env` follow), multi-input-event transactors (active transactors with multiple `in event<T>` fields fall back to the synchronous subscriber-callback path), OS-thread parallelism beyond the opt-in `--mt` flag (Phase 3b cycle batching), decimal printf for >64-bit values (`__int128` lacks native printf support), and per-word printing of >128-bit signals (would need a word-array variant of `HarcHexBuf128`).
 
 ### 8.1 `transactor`
 

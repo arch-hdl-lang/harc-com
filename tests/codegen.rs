@@ -4670,9 +4670,45 @@ end test T"#,
     assert!(
         cpp.contains("_target_read_target_slot")
             && cpp.contains("dut->b_read_req_ready = 1;")
-            && cpp.contains("harc_rt::harc_assign(dut->b_read_rsp_data, 256 + addr);")
+            && cpp.contains("harc_rt::harc_assign(_tlm_rsp_value, 256 + addr);")
+            && cpp.contains("harc_rt::harc_assign(dut->b_read_rsp_data, _tlm_rsp_value);")
             && cpp.contains("dut->b_read_rsp_valid = 1;"),
         "expected target responder actor shape; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn target_tlm_thread_allows_terminal_if_returns() {
+    let parsed = parse_source(
+        r#"bus B
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus B
+
+transactor Target bound to B
+    thread bus.read(addr: uint<8>)
+        if addr < 8
+            return 256 + addr
+        else
+            return 512 + addr
+        end if
+    end thread
+end transactor Target
+
+test T
+    let dut : SomeDut
+    let b : B = bind dut
+    let target : Target passive = bind b
+    run
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("target TLM terminal if returns should lower");
+    assert!(
+        cpp.contains("if (addr < 8)")
+            && cpp.contains("harc_rt::harc_assign(_tlm_rsp_value, 256 + addr);")
+            && cpp.contains("harc_rt::harc_assign(_tlm_rsp_value, 512 + addr);"),
+        "expected target responder terminal if lowering; got:\n{cpp}"
     );
 }
 
