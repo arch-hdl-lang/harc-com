@@ -91,6 +91,32 @@ end test RuntimeProblemTableTest
 }
 
 #[test]
+fn unconstrained_randomize_routes_through_runtime_shell() {
+    let src = r#"
+transaction Empty
+end transaction Empty
+
+test RuntimeFastPathTest
+    let dut : Top
+    run
+        let t : Empty
+        randomize(t)
+    end run
+end test RuntimeFastPathTest
+"#;
+    let parsed = parse_source(src).unwrap();
+    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let cpp = cpp_tb::emit(&merged).expect("emit");
+
+    assert!(cpp.contains("harc_solve_queued(t, 2, _harc_rt_seed, randomize_Empty);"));
+    assert!(!cpp.contains("randomize_Empty(&t);"));
+    assert!(
+        !cpp.contains("z3::context _ctx;"),
+        "unconstrained fast path should not enter inline Z3; got:\n{cpp}"
+    );
+}
+
+#[test]
 fn waveform_trace_scaffolding_is_always_emitted_and_gated() {
     // Issue #209: every emitted TB must contain the trace
     // scaffolding (include + setup + per-cycle dump + teardown),

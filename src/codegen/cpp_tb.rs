@@ -3999,11 +3999,7 @@ impl Emitter {
     }
 
     fn emit_runtime_randomize_metadata_touch(&mut self, target: &Expr, depth: usize) {
-        let Some(problem_id) = self
-            .runtime_randomize_problem_ids
-            .get(&(target.span.start, target.span.end))
-            .copied()
-        else {
+        let Some(problem_id) = self.runtime_randomize_problem_id(target) else {
             return;
         };
         self.pad(depth);
@@ -4032,6 +4028,66 @@ impl Emitter {
         writeln!(self.out, "(void)_harc_rt_seed;").ok();
         self.pad(depth);
         writeln!(self.out, "}}").ok();
+    }
+
+    fn runtime_randomize_problem_id(&self, target: &Expr) -> Option<u32> {
+        self.runtime_randomize_problem_ids
+            .get(&(target.span.start, target.span.end))
+            .copied()
+    }
+
+    fn emit_runtime_unconstrained_randomize_call(
+        &mut self,
+        ty: &str,
+        target: &Expr,
+        depth: usize,
+    ) -> bool {
+        let Some(problem_id) = self.runtime_randomize_problem_id(target) else {
+            return false;
+        };
+        self.pad(depth);
+        writeln!(
+            self.out,
+            "{{   // runtime queued randomize scaffold for unconstrained record"
+        )
+        .ok();
+        self.pad(depth + 1);
+        writeln!(
+            self.out,
+            "auto* _harc_rt_problem = harc_rt::random::harc_find_problem(_harc_runtime_random_problem_table, {problem_id});"
+        )
+        .ok();
+        self.pad(depth + 1);
+        writeln!(
+            self.out,
+            "auto* _harc_rt_site = harc_rt::random::harc_find_call_site(_harc_runtime_random_problem_table_call_sites, _harc_runtime_random_problem_table_call_site_count, {problem_id});"
+        )
+        .ok();
+        self.pad(depth + 1);
+        writeln!(
+            self.out,
+            "auto _harc_rt_seed = _harc_rt_site ? harc_rt::random::harc_call_site_next_seed(*_harc_rt_site, harc_rng_state) : 0;"
+        )
+        .ok();
+        self.pad(depth + 1);
+        writeln!(self.out, "(void)_harc_rt_problem;").ok();
+        self.pad(depth + 1);
+        write!(
+            self.out,
+            "auto _harc_rt_status = harc_rt::random::harc_solve_queued("
+        )
+        .ok();
+        self.emit_expr(target);
+        writeln!(
+            self.out,
+            ", {problem_id}, _harc_rt_seed, randomize_{ty});"
+        )
+        .ok();
+        self.pad(depth + 1);
+        writeln!(self.out, "(void)_harc_rt_status;").ok();
+        self.pad(depth);
+        writeln!(self.out, "}}").ok();
+        true
     }
 
     /// Emit a `wait until …` statement (spec §7.9). Four shape axes:
@@ -12360,12 +12416,16 @@ impl Emitter {
                         .any(|f| field_attr_unique(f) || !auto_coverage_values(f).is_empty())
                 });
                 if combined.is_empty() && !has_solver_policy_fields {
-                    // No constraints anywhere: simple field-by-field PRNG path.
-                    self.emit_runtime_randomize_metadata_touch(target, depth);
-                    self.pad(depth);
-                    write!(self.out, "randomize_{ty}(&").ok();
-                    self.emit_expr(target);
-                    writeln!(self.out, ");").ok();
+                    // No constraints anywhere: route the former direct PRNG
+                    // call through the runtime shell. The shell currently
+                    // delegates to `randomize_T`, preserving behavior while
+                    // exercising the new boundary.
+                    if !self.emit_runtime_unconstrained_randomize_call(&ty, target, depth) {
+                        self.pad(depth);
+                        write!(self.out, "randomize_{ty}(&").ok();
+                        self.emit_expr(target);
+                        writeln!(self.out, ");").ok();
+                    }
                     self.emit_randomize_trace_event(&ty, target, depth);
                 } else {
                     // Constraint-solving path via Z3.
