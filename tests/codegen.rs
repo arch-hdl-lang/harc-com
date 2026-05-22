@@ -2468,16 +2468,17 @@ end test AutoCovPrefTest"#,
             && cpp.contains("T.len=1")
             && cpp.contains("T.len=4")
             && cpp.contains("T.op=Read x T.len=1")
-            && cpp.contains("bool _auto_cov_pref_")
+            && cpp.contains("harc_rt::random::HarcAutoCovSelection _auto_cov_selection_")
             && cpp.contains("_pref_")
             && cpp.contains(" = _auto_vals_")
             && cpp.contains("{0ULL, 1ULL}")
             && cpp.contains("{1ULL, 4ULL}")
             && cpp.contains("_auto_cov_")
-            && cpp.contains("_auto_cov_selected_kind_")
-            && cpp.contains("_auto_cov_selected_group_")
+            && cpp.contains("harc_auto_cov_select_point")
+            && cpp.contains("harc_auto_cov_select_cross")
+            && cpp.contains("harc_auto_cov_mark_blocked")
+            && cpp.contains("harc_auto_cov_mark_hit")
             && cpp.contains("retry without seeded preferences")
-            && cpp.contains(" = true;")
             && cpp.contains("_auto_cross_"),
         "auto coverage goals and pairwise crosses should feed solver preferences, hit/blocked tracking, and reporting; got:\n{cpp}",
     );

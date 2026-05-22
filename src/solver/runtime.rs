@@ -412,6 +412,12 @@ int main() {
     bool unique_has_value = false;
     for (int value : harc_unique_values(unique)) unique_has_value = unique_has_value || value == 5;
     harc_unique_clear(unique);
+    HarcAutoCovSelection auto_cov;
+    harc_auto_cov_select_cross(auto_cov, 3, 1, 2);
+    bool hit = false;
+    bool blocked = false;
+    harc_auto_cov_mark_blocked(blocked);
+    harc_auto_cov_mark_hit(hit, blocked);
     HarcSolveStatus status = harc_solve_queued(packet, 4, a, randomize_packet);
     HarcSolveStatus constrained = harc_solve_constrained(
         packet,
@@ -422,7 +428,7 @@ int main() {
     HarcSolveStatus unsat = harc_solve_status_unsat(4, b);
     bool handled_ok = harc_handle_solve_status(constrained);
     bool handled_unsat = harc_handle_solve_status(unsat);
-    return (status.ok && handled_ok && !handled_unsat && constrained.ok && !unsat.ok && unsat.problem_id == 4 && unsat.seed == b && pref_u < 64 && pref_s >= -8 && pref_s <= 7 && pref_d >= 1 && pref_d <= 9 && unique_has_value && unique.empty() && packet.value == 7 && found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
+    return (status.ok && handled_ok && !handled_unsat && constrained.ok && !unsat.ok && unsat.problem_id == 4 && unsat.seed == b && pref_u < 64 && pref_s >= -8 && pref_s <= 7 && pref_d >= 1 && pref_d <= 9 && unique_has_value && unique.empty() && harc_auto_cov_has_preference(auto_cov) && harc_auto_cov_selected_cross(auto_cov, 3) && hit && !blocked && packet.value == 7 && found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
 }
 "#,
         )
