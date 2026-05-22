@@ -1,20 +1,24 @@
 // Target-side TLM responder branch test.
 //
 // The SV DUT issues two blocking read requests. The passive HARC target
-// branches on the captured request address and returns a different response
-// range for each branch.
+// branches on the captured request address, uses a local sequence snapshot,
+// and updates persistent transactor state between calls.
 
 bus TlmMemBus
     tlm_method read(addr: uint<8>) -> uint<32>: blocking;
 end bus TlmMemBus
 
 transactor TlmMemTarget bound to TlmMemBus
+    read_count : uint<32> default 0
+
     thread bus.read(addr: uint<8>)
+        let req_seq : uint<32> = read_count
+        read_count = read_count + 1
         wait 1 cycle
         if addr < 8
-            return 256 + addr
+            return 256 + addr + req_seq
         else
-            return 512 + addr
+            return 512 + addr + req_seq
         end if
     end thread
 end transactor TlmMemTarget
@@ -35,9 +39,11 @@ impl TlmTargetThreadIfTest for TlmTargetThreadIfTb
         wait until dut.done == 1 timeout 80 cycles fail("DUT initiator did not receive both HARC target responses")
         assert dut.result0 == 261
             else fail("first target TLM response mismatch got=0x${dut.result0:08x}, expected 0x00000105")
-        assert dut.result1 == 524
-            else fail("second target TLM response mismatch got=0x${dut.result1:08x}, expected 0x0000020c")
+        assert dut.result1 == 525
+            else fail("second target TLM response mismatch got=0x${dut.result1:08x}, expected 0x0000020d")
+        assert target.read_count == 2
+            else fail("target TLM read_count mismatch got=${target.read_count}, expected 2")
 
-        log(info, "PASS: HARC target-side TLM thread branched on request address")
+        log(info, "PASS: HARC target-side TLM thread branched and updated responder state")
     end run
 end impl TlmTargetThreadIfTest

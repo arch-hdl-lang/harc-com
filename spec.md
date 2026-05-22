@@ -1658,10 +1658,14 @@ Target-side TLM responders use `thread bus.method(args)` inside the bound transa
 
 ```harc
 transactor MemTarget bound to BurstMem
+    read_count : uint<32> default 0
+
     thread bus.read(addr: uint<32>)
+        let req_seq : uint<32> = read_count
+        read_count = read_count + 1
         wait 1 cycle
         if addr < 0x1000
-            return addr + 0x100
+            return addr + 0x100 + req_seq
         else
             return 0xffff_ffff
         end if
@@ -1671,13 +1675,13 @@ end transactor MemTarget
 let target : MemTarget passive = bind mem
 ```
 
-The thread lowers to a responder actor that asserts `read_req_ready`, captures request args on the req handshake, runs the body, drives `read_rsp_data`/`read_rsp_valid`, and holds the response until the DUT raises `read_rsp_ready`. For `out_of_order tags N`, the actor captures `read_req_tag` and echoes it on `read_rsp_tag`.
+The thread lowers to a responder actor that asserts `read_req_ready`, captures request args on the req handshake, runs the body, drives `read_rsp_data`/`read_rsp_valid`, and holds the response until the DUT raises `read_rsp_ready`. Transactor fields such as `read_count` are ordinary per-instance state, so passive target BFMs can track counters, scoreboards, or backing memory metadata across method calls. For `out_of_order tags N`, the actor captures `read_req_tag` and echoes it on `read_rsp_tag`.
 
 Current shipped limits:
 
 - Direct non-fork calls lower only for `blocking` methods.
 - RHS `fork bus.method(...)` plus `join_all` lowers for `blocking` and `out_of_order tags N`.
-- Target TLM thread bodies support assignments, waits, and terminal value returns. The terminal return may be a direct `return expr` or a terminal `if` / `elsif` / `else` whose every branch ends with `return expr`, allowing address decode and response-code branching. Early returns from nested control flow and target-side loops with returns remain later slices.
+- Target TLM thread bodies support local `let`s, transactor field reads/writes, assignments, waits, and terminal value returns. The terminal return may be a direct `return expr` or a terminal `if` / `elsif` / `else` whose every branch ends with `return expr`, allowing address decode and response-code branching. Early returns from nested control flow and target-side loops with returns remain later slices.
 
 **Coroutine runtime (Phase 1, single-actor).** The test's `run` block lowers to a C++20 coroutine driven by `harc_rt::ThreadScheduler` (slim sister of arch-com's `arch_thread_rt.h`). `wait N cycles` and the bus.send/recv spin loops emit `co_await harc_rt::wait_cycles(_slot, N)`; the main loop drives one primary-clock posedge per iteration, runs post-eval services, then resumes any coroutine whose wait condition is satisfied. Checkers and clocked coverage sample after the coroutine/clk-low settle point unless bound to an explicit hook trigger. Hookable methods, `on`-event-handler closures, tseq lambdas, and free functions stay synchronous — they only execute while the run coroutine is "running" between `co_await`s, so a sync `tick()` from inside a method does not race the scheduler. Multi-clock `wait N cycles on <named-clock>` keeps its sync `eval_clocks_until` path even in coroutine context: the main loop's full-primary-period granularity is too coarse for sub-primary-cycle waits when the named clock runs faster than primary.
 
@@ -1811,7 +1815,7 @@ Same source for `AxiXactor`. Different elaboration. Different bitstream.
 
 ### 8.2 `agent` (optional)
 
-`agent` is a SW-side bundling unit that packages a sequencer + transactor + their connect bridge as a reusable triple. It is **not mandatory** — for a one-off test a transactor + sequencer at test scope works fine. Use `agent` only when the same `(sequencer, transactor, wiring)` bundle is reused across tests.
+`agent` is a SW-side bundling unit that packages a sequencer + transactor + their connect bridge as a reusable triple. It is **not mandatory** — for a one-off test a transactor + req_sequencer at test scope works fine. Use `agent` only when the same `(sequencer, transactor, wiring)` bundle is reused across tests.
 
 ```
 agent AxiAgent#(P: AxiParams)
