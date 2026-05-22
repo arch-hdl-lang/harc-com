@@ -1302,6 +1302,11 @@ fn cmd_sim(
         &rt_header_path,
         harc::codegen::cpp_tb::THREAD_RT_HEADER.as_bytes(),
     )?;
+    let random_rt_header_path = outdir.join("harc_random_rt.h");
+    write_if_changed(
+        &random_rt_header_path,
+        harc::codegen::cpp_tb::RANDOM_RT_HEADER.as_bytes(),
+    )?;
 
     if emit_only {
         return Ok(());

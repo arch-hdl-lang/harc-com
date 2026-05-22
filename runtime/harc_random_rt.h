@@ -22,6 +22,17 @@ struct HarcSolveStatus {
     const char* message = nullptr;
 };
 
+struct HarcRuntimeProblemDescriptor {
+    harc_problem_id id = 0;
+    const char* origin = nullptr;
+    const char* manifest = nullptr;
+};
+
+struct HarcRuntimeProblemTable {
+    const HarcRuntimeProblemDescriptor* problems = nullptr;
+    uint32_t len = 0;
+};
+
 enum class HarcSolveMode : uint8_t {
     Inline,
     Queued,
@@ -84,4 +95,3 @@ inline HarcSolveStatus harc_solve_blocking(
 
 } // namespace random
 } // namespace harc_rt
-

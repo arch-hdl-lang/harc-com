@@ -47,6 +47,41 @@ end test TraceTest
 }
 
 #[test]
+fn runtime_random_problem_table_emits_without_switching_solver_path() {
+    let src = r#"
+transaction Req
+    addr : uint<8>
+    keep addr != 7
+end transaction Req
+
+test RuntimeProblemTableTest
+    let dut : Top
+    run
+        let t : Req
+        randomize(t) with
+            t.addr != 9
+        end randomize
+    end run
+end test RuntimeProblemTableTest
+"#;
+    let parsed = parse_source(src).unwrap();
+    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let cpp = cpp_tb::emit(&merged).expect("emit");
+
+    assert!(cpp.contains("#include \"harc_random_rt.h\""));
+    assert!(
+        cpp.contains("HarcRuntimeProblemDescriptor _harc_runtime_random_problem_table_entries[]")
+    );
+    assert!(cpp.contains("HarcRuntimeProblemTable _harc_runtime_random_problem_table"));
+    assert!(cpp.contains("{1, \"randomize(Req)\""));
+    assert!(cpp.contains("{2, \"randomize(Req) with\""));
+    assert!(
+        cpp.contains("z3::context _ctx;"),
+        "Phase 5B must not switch behavior away from inline Z3 yet; got:\n{cpp}"
+    );
+}
+
+#[test]
 fn waveform_trace_scaffolding_is_always_emitted_and_gated() {
     // Issue #209: every emitted TB must contain the trace
     // scaffolding (include + setup + per-cycle dump + teardown),

@@ -78,6 +78,37 @@ impl RuntimeProblemTable {
         }
         out
     }
+
+    pub fn render_cpp_table(&self, symbol: &str) -> String {
+        let mut out = String::new();
+        out.push_str("// HARC typed runtime randomization problem table (Phase 5B scaffold).\n");
+        out.push_str(
+            "// Current randomization behavior still uses cpp_tb.rs inline Z3 emission.\n",
+        );
+        out.push_str("namespace {\n");
+        out.push_str("static constexpr harc_rt::random::HarcRuntimeProblemDescriptor ");
+        out.push_str(symbol);
+        out.push_str("_entries[] = {\n");
+        for problem in &self.problems {
+            out.push_str("    {");
+            out.push_str(&problem.id.to_string());
+            out.push_str(", \"");
+            out.push_str(&escape_cpp_string(&problem.origin));
+            out.push_str("\", \"");
+            out.push_str(&escape_cpp_string(&problem.manifest()));
+            out.push_str("\"},\n");
+        }
+        out.push_str("};\n");
+        out.push_str("static constexpr harc_rt::random::HarcRuntimeProblemTable ");
+        out.push_str(symbol);
+        out.push_str(" = {");
+        out.push_str(symbol);
+        out.push_str("_entries, ");
+        out.push_str(&self.problems.len().to_string());
+        out.push_str("};\n");
+        out.push_str("} // namespace\n\n");
+        out
+    }
 }
 
 impl RuntimeProblemDescriptor {
@@ -147,6 +178,22 @@ impl RuntimeProblemDescriptor {
         }
         out
     }
+}
+
+fn escape_cpp_string(s: &str) -> String {
+    let mut out = String::new();
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 impl RuntimeTypeDescriptor {
@@ -239,6 +286,35 @@ end test Smoke
         assert!(manifest.contains("field addr u8 random=true default=false attrs=[range]"));
         assert!(manifest.contains("field op enum Op {READ,WRITE}"));
         assert!(manifest.contains("field tag u4 random=false"));
+    }
+
+    #[test]
+    fn renders_cpp_problem_table_metadata() {
+        let src = r#"
+transaction Packet
+    addr : uint<8>
+    keep addr != 7
+end transaction Packet
+
+test Smoke
+    run
+        let p : Packet
+        randomize(p) with
+            p.addr != 9
+        end randomize
+    end run
+end test Smoke
+"#;
+        let parsed = parse_source(src).expect("parse");
+        let typed_table = build_typed_solver_problem_table(&parsed);
+        let runtime_table = RuntimeProblemTable::from_typed_solver_table(&typed_table);
+        let cpp = runtime_table.render_cpp_table("_harc_runtime_problem_table");
+
+        assert!(cpp.contains("HarcRuntimeProblemDescriptor _harc_runtime_problem_table_entries[]"));
+        assert!(cpp.contains("HarcRuntimeProblemTable _harc_runtime_problem_table"));
+        assert!(cpp.contains("{1, \"randomize(Packet)\""));
+        assert!(cpp.contains("{2, \"randomize(Packet) with\""));
+        assert!(cpp.contains("problem 1 randomize(Packet)\\n"));
     }
 
     #[test]
