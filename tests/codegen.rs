@@ -79,11 +79,13 @@ end test RuntimeProblemTableTest
     assert!(cpp.contains("{2, \"randomize(Req) with\""));
     assert!(cpp.contains("{1, 1, 0}"));
     assert!(cpp.contains("{2, 2, 0}"));
-    assert!(cpp.contains("harc_find_problem(_harc_runtime_random_problem_table, 2)"));
+    assert!(cpp.contains("HarcRandomizeCall _harc_runtime_random_problem_table_prepare_call"));
+    assert!(cpp.contains("harc_rt::random::harc_prepare_randomize_call("));
     assert!(cpp.contains(
-        "harc_find_call_site(_harc_runtime_random_problem_table_call_sites, _harc_runtime_random_problem_table_call_site_count, 2)"
+        "auto _harc_rt_call = _harc_runtime_random_problem_table_prepare_call(2, harc_rng_state, harc_rng_next());"
     ));
-    assert!(cpp.contains("harc_call_site_next_seed(*_harc_rt_site, harc_rng_state)"));
+    assert!(cpp.contains("auto* _harc_rt_problem = _harc_rt_call.problem;"));
+    assert!(cpp.contains("auto _harc_rt_seed = _harc_rt_call.seed;"));
     assert!(cpp
         .contains("auto _harc_rt_generated_solver = [&]() -> harc_rt::random::HarcSolveStatus {"));
     assert!(cpp.contains("harc_rt::random::harc_solve_constrained("));
@@ -112,7 +114,12 @@ end test RuntimeFastPathTest
     let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
     let cpp = cpp_tb::emit(&merged).expect("emit");
 
-    assert!(cpp.contains("harc_solve_queued(t, 2, _harc_rt_seed, randomize_Empty);"));
+    assert!(cpp.contains(
+        "auto _harc_rt_call = _harc_runtime_random_problem_table_prepare_call(2, harc_rng_state, 0);"
+    ));
+    assert!(cpp.contains(
+        "harc_solve_queued(t, _harc_rt_call.problem_id, _harc_rt_seed, randomize_Empty);"
+    ));
     assert!(cpp.contains("harc_rt::random::harc_handle_solve_status(_harc_rt_status);"));
     assert!(!cpp.contains("randomize_Empty(&t);"));
     assert!(
@@ -2369,7 +2376,7 @@ end test SeededSolverTest"#,
     assert!(
         cpp.contains("z3::params _p(_ctx);")
             && cpp.contains(
-                "harc_rt::random::harc_call_site_next_seed(*_harc_rt_site, harc_rng_state)"
+                "_harc_runtime_random_problem_table_prepare_call(2, harc_rng_state, harc_rng_next())"
             )
             && cpp.contains("harc_rt::random::harc_solve_constrained(")
             && cpp.contains("harc_rt::random::harc_handle_solve_status(")

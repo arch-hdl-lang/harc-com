@@ -122,6 +122,26 @@ impl RuntimeProblemTable {
         out.push_str("_call_site_count = ");
         out.push_str(&self.problems.len().to_string());
         out.push_str(";\n");
+        out.push_str("static inline harc_rt::random::HarcRandomizeCall ");
+        out.push_str(symbol);
+        out.push_str("_prepare_call(\n");
+        out.push_str("    harc_rt::random::harc_problem_id problem_id,\n");
+        out.push_str("    harc_rt::random::harc_seed global_seed,\n");
+        out.push_str("    harc_rt::random::harc_seed fallback_seed) {\n");
+        out.push_str("    return harc_rt::random::harc_prepare_randomize_call(\n");
+        out.push_str("        ");
+        out.push_str(symbol);
+        out.push_str(",\n");
+        out.push_str("        ");
+        out.push_str(symbol);
+        out.push_str("_call_sites,\n");
+        out.push_str("        ");
+        out.push_str(symbol);
+        out.push_str("_call_site_count,\n");
+        out.push_str("        problem_id,\n");
+        out.push_str("        global_seed,\n");
+        out.push_str("        fallback_seed);\n");
+        out.push_str("}\n");
         out.push_str("} // namespace\n\n");
         out
     }
@@ -404,6 +424,7 @@ int main() {
     HarcRuntimeCallSite* found = harc_find_call_site(sites, 2, 4);
     harc_seed a = harc_call_site_next_seed(site, 11);
     harc_seed b = harc_call_site_next_seed(site, 11);
+    HarcRandomizeCall call = harc_prepare_randomize_call(table, sites, 2, 4, 11, 99);
     uint64_t pref_u = harc_prefer_uint(a, 0, 6);
     int64_t pref_s = harc_prefer_sint(a, 1, 4);
     int64_t pref_d = harc_prefer_dist(a, 2, {{1, 2, 1}, {7, 9, 3}});
@@ -428,7 +449,7 @@ int main() {
     HarcSolveStatus unsat = harc_solve_status_unsat(4, b);
     bool handled_ok = harc_handle_solve_status(constrained);
     bool handled_unsat = harc_handle_solve_status(unsat);
-    return (status.ok && handled_ok && !handled_unsat && constrained.ok && !unsat.ok && unsat.problem_id == 4 && unsat.seed == b && pref_u < 64 && pref_s >= -8 && pref_s <= 7 && pref_d >= 1 && pref_d <= 9 && unique_has_value && unique.empty() && harc_auto_cov_has_preference(auto_cov) && harc_auto_cov_selected_cross(auto_cov, 3) && hit && !blocked && packet.value == 7 && found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
+    return (status.ok && handled_ok && !handled_unsat && constrained.ok && !unsat.ok && unsat.problem_id == 4 && unsat.seed == b && call.problem_id == 4 && call.problem && call.seed != 99 && pref_u < 64 && pref_s >= -8 && pref_s <= 7 && pref_d >= 1 && pref_d <= 9 && unique_has_value && unique.empty() && harc_auto_cov_has_preference(auto_cov) && harc_auto_cov_selected_cross(auto_cov, 3) && hit && !blocked && packet.value == 7 && found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
 }
 "#,
         )

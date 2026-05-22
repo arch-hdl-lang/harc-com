@@ -4099,23 +4099,11 @@ impl Emitter {
         self.pad(depth + 1);
         writeln!(
             self.out,
-            "auto* _harc_rt_problem = harc_rt::random::harc_find_problem(_harc_runtime_random_problem_table, {problem_id});"
+            "auto _harc_rt_call = _harc_runtime_random_problem_table_prepare_call({problem_id}, harc_rng_state, 0);"
         )
         .ok();
         self.pad(depth + 1);
-        writeln!(
-            self.out,
-            "auto* _harc_rt_site = harc_rt::random::harc_find_call_site(_harc_runtime_random_problem_table_call_sites, _harc_runtime_random_problem_table_call_site_count, {problem_id});"
-        )
-        .ok();
-        self.pad(depth + 1);
-        writeln!(
-            self.out,
-            "auto _harc_rt_seed = _harc_rt_site ? harc_rt::random::harc_call_site_next_seed(*_harc_rt_site, harc_rng_state) : 0;"
-        )
-        .ok();
-        self.pad(depth + 1);
-        writeln!(self.out, "(void)_harc_rt_problem;").ok();
+        writeln!(self.out, "auto _harc_rt_seed = _harc_rt_call.seed;").ok();
         self.pad(depth + 1);
         write!(
             self.out,
@@ -4125,7 +4113,7 @@ impl Emitter {
         self.emit_expr(target);
         writeln!(
             self.out,
-            ", {problem_id}, _harc_rt_seed, randomize_{ty});"
+            ", _harc_rt_call.problem_id, _harc_rt_seed, randomize_{ty});"
         )
         .ok();
         self.pad(depth + 1);
@@ -9465,23 +9453,13 @@ impl Emitter {
             self.pad(depth + 1);
             writeln!(
                 self.out,
-                "auto* _harc_rt_problem = harc_rt::random::harc_find_problem(_harc_runtime_random_problem_table, {problem_id});"
+                "auto _harc_rt_call = _harc_runtime_random_problem_table_prepare_call({problem_id}, harc_rng_state, harc_rng_next());"
             )
             .ok();
             self.pad(depth + 1);
-            writeln!(
-                self.out,
-                "auto* _harc_rt_site = harc_rt::random::harc_find_call_site(_harc_runtime_random_problem_table_call_sites, _harc_runtime_random_problem_table_call_site_count, {problem_id});"
-            )
-            .ok();
+            writeln!(self.out, "auto* _harc_rt_problem = _harc_rt_call.problem;").ok();
             self.pad(depth + 1);
-            writeln!(
-                self.out,
-                "auto _harc_rt_seed = _harc_rt_site ? harc_rt::random::harc_call_site_next_seed(*_harc_rt_site, harc_rng_state) : harc_rng_next();"
-            )
-            .ok();
-            self.pad(depth + 1);
-            writeln!(self.out, "(void)_harc_rt_problem;").ok();
+            writeln!(self.out, "auto _harc_rt_seed = _harc_rt_call.seed;").ok();
         } else {
             self.pad(depth + 1);
             writeln!(
