@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <initializer_list>
 #include <cstdint>
 
 namespace harc_rt {
@@ -39,6 +40,12 @@ struct HarcRuntimeCallSite {
     harc_call_site_id site_id = 0;
     harc_problem_id problem_id = 0;
     harc_call_iteration iteration = 0;
+};
+
+struct HarcDistBin {
+    int64_t lo = 0;
+    int64_t hi = 0;
+    int64_t weight = 0;
 };
 
 enum class HarcSolveMode : uint8_t {
@@ -87,6 +94,65 @@ inline harc_seed harc_call_site_next_seed(
     HarcRuntimeCallSite& site,
     harc_seed global_seed) {
     return harc_seed_from(global_seed, site.site_id, site.iteration++);
+}
+
+inline constexpr uint64_t harc_preference_draw(
+    harc_seed seed,
+    uint32_t salt) {
+    return harc_splitmix64(seed ^ (uint64_t{salt} * 0x9E3779B97F4A7C15ull));
+}
+
+inline constexpr uint64_t harc_prefer_uint(
+    harc_seed seed,
+    uint32_t salt,
+    unsigned width) {
+    uint64_t draw = harc_preference_draw(seed, salt);
+    if (width == 0) return 0;
+    if (width >= 64) return draw;
+    return draw & ((uint64_t{1} << width) - 1);
+}
+
+inline constexpr int64_t harc_prefer_range(
+    harc_seed seed,
+    uint32_t salt,
+    int64_t lo,
+    int64_t hi) {
+    if (hi <= lo) return lo;
+    uint64_t span = static_cast<uint64_t>(hi - lo) + 1;
+    return lo + static_cast<int64_t>(harc_preference_draw(seed, salt) % span);
+}
+
+inline constexpr int64_t harc_prefer_sint(
+    harc_seed seed,
+    uint32_t salt,
+    unsigned width) {
+    if (width == 0) return 0;
+    if (width >= 63) {
+        return static_cast<int64_t>(harc_preference_draw(seed, salt));
+    }
+    int64_t half = int64_t{1} << (width - 1);
+    return harc_prefer_range(seed, salt, -half, half - 1);
+}
+
+inline int64_t harc_prefer_dist(
+    harc_seed seed,
+    uint32_t salt,
+    std::initializer_list<HarcDistBin> bins) {
+    int64_t total = 0;
+    for (const auto& bin : bins) total += bin.weight;
+    if (total <= 0) return 0;
+    int64_t pick = static_cast<int64_t>(
+        harc_preference_draw(seed, salt) % static_cast<uint64_t>(total));
+    int64_t acc = 0;
+    uint32_t bin_salt = 0;
+    for (const auto& bin : bins) {
+        acc += bin.weight;
+        if (pick < acc) {
+            return harc_prefer_range(seed, salt ^ (0xA5A5A5A5u + bin_salt), bin.lo, bin.hi);
+        }
+        ++bin_salt;
+    }
+    return bins.begin()->lo;
 }
 
 inline constexpr HarcSolveStatus harc_solve_status_ok() {
