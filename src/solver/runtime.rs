@@ -404,6 +404,9 @@ int main() {
     HarcRuntimeCallSite* found = harc_find_call_site(sites, 2, 4);
     harc_seed a = harc_call_site_next_seed(site, 11);
     harc_seed b = harc_call_site_next_seed(site, 11);
+    uint64_t pref_u = harc_prefer_uint(a, 0, 6);
+    int64_t pref_s = harc_prefer_sint(a, 1, 4);
+    int64_t pref_d = harc_prefer_dist(a, 2, {{1, 2, 1}, {7, 9, 3}});
     HarcSolveStatus status = harc_solve_queued(packet, 4, a, randomize_packet);
     HarcSolveStatus constrained = harc_solve_constrained(
         packet,
@@ -414,7 +417,7 @@ int main() {
     HarcSolveStatus unsat = harc_solve_status_unsat(4, b);
     bool handled_ok = harc_handle_solve_status(constrained);
     bool handled_unsat = harc_handle_solve_status(unsat);
-    return (status.ok && handled_ok && !handled_unsat && constrained.ok && !unsat.ok && unsat.problem_id == 4 && unsat.seed == b && packet.value == 7 && found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
+    return (status.ok && handled_ok && !handled_unsat && constrained.ok && !unsat.ok && unsat.problem_id == 4 && unsat.seed == b && pref_u < 64 && pref_s >= -8 && pref_s <= 7 && pref_d >= 1 && pref_d <= 9 && packet.value == 7 && found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
 }
 "#,
         )

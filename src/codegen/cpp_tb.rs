@@ -10239,7 +10239,7 @@ impl Emitter {
         // constraints, we drop the preference stack and fall back to the
         // base solve. This makes solver-backed randomize
         // consume the HARC seed without turning preferences into false UNSATs.
-        for f in &free_fields {
+        for (pref_idx, f) in free_fields.iter().enumerate() {
             let c_name = c_ident(&f.name);
             self.pad(depth + 1);
             let dist_entries = dist_directives
@@ -10255,8 +10255,8 @@ impl Emitter {
                 }
                 write!(
                     self.out,
-                    "uint64_t _pref_{cache_tag}_{} = (uint64_t)harc_rng_dist({{",
-                    c_name
+                    "uint64_t _pref_{cache_tag}_{} = (uint64_t)harc_rt::random::harc_prefer_dist(_harc_rt_seed, {}, {{",
+                    c_name, pref_idx
                 )
                 .ok();
                 self.emit_rng_dist_entries(entries);
@@ -10264,25 +10264,26 @@ impl Emitter {
             } else if let Some(n) = f.enum_variants {
                 writeln!(
                     self.out,
-                    "uint64_t _pref_{cache_tag}_{} = (uint64_t)harc_rng_range(0, {});",
+                    "uint64_t _pref_{cache_tag}_{} = (uint64_t)harc_rt::random::harc_prefer_range(_harc_rt_seed, {}, 0, {});",
                     c_name,
+                    pref_idx,
                     n.saturating_sub(1)
                 )
                 .ok();
             } else if f.signed && f.width > 0 && f.width < 63 {
                 writeln!(
                     self.out,
-                    "int64_t _pref_{cache_tag}_{} = harc_rng_range(-(1LL << {}), (1LL << {}) - 1);",
+                    "int64_t _pref_{cache_tag}_{} = harc_rt::random::harc_prefer_sint(_harc_rt_seed, {}, {});",
                     c_name,
-                    f.width.saturating_sub(1),
-                    f.width.saturating_sub(1)
+                    pref_idx,
+                    f.width
                 )
                 .ok();
             } else if f.width <= 64 {
                 writeln!(
                     self.out,
-                    "uint64_t _pref_{cache_tag}_{} = harc_rng_uint({});",
-                    c_name, f.width
+                    "uint64_t _pref_{cache_tag}_{} = harc_rt::random::harc_prefer_uint(_harc_rt_seed, {}, {});",
+                    c_name, pref_idx, f.width
                 )
                 .ok();
             } else {

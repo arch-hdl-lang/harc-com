@@ -2422,7 +2422,9 @@ end test DistSolverTest"#,
     );
     assert!(
         cpp.contains("uint64_t _pref_")
-            && cpp.contains("harc_rng_dist({{(int64_t)(3), (int64_t)(4), (int64_t)(90)}")
+            && cpp.contains(
+                "harc_rt::random::harc_prefer_dist(_harc_rt_seed, 0, {{(int64_t)(3), (int64_t)(4), (int64_t)(90)}"
+            )
             && cpp.contains("{(int64_t)(1), (int64_t)(2), (int64_t)(10)}}"),
         "dist metadata should feed seeded solver preferences; got:\n{cpp}"
     );
@@ -2920,8 +2922,10 @@ end test SolveOrderTest"#,
     assert!(
         cpp.contains("// solve_order(addr, len) accepted as solver scheduling metadata")
             && cpp.contains("// solve-order sampling order: addr, len")
-            && cpp.find("_addr = harc_rng_uint(16)").unwrap()
-                < cpp.find("_len = harc_rng_uint(8)").unwrap()
+            && cpp.find("_addr = harc_rt::random::harc_prefer_uint(_harc_rt_seed, 0, 16)")
+                .unwrap()
+                < cpp.find("_len = harc_rt::random::harc_prefer_uint(_harc_rt_seed, 1, 8)")
+                    .unwrap()
             && cpp.contains("_s.add(z3::ugt(_z_len, _ctx.bv_val((uint64_t)0, 64)));"),
         "expected solve-order hints to order sampling metadata while ordinary constraints still lower; got:\n{cpp}",
     );
@@ -3274,7 +3278,7 @@ end test BlockingDistRuntimeDepTest"#,
     let cpp = cpp_tb::emit(&blocking).expect("blocking dist runtime dependency emits");
     assert!(
         cpp.contains(
-            "harc_rng_dist({{(int64_t)(1), (int64_t)(harc_rt::harc_read(dut->max_len)), (int64_t)(10)}})"
+            "harc_rt::random::harc_prefer_dist(_harc_rt_seed, 0, {{(int64_t)(1), (int64_t)(harc_rt::harc_read(dut->max_len)), (int64_t)(10)}})"
         ),
         "blocking randomize should snapshot runtime-dependent dist entries; got:\n{cpp}",
     );
