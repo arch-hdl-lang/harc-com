@@ -8,6 +8,7 @@
 #pragma once
 
 #include <initializer_list>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -47,6 +48,13 @@ struct HarcDistBin {
     int64_t lo = 0;
     int64_t hi = 0;
     int64_t weight = 0;
+};
+
+struct HarcAutoCovSelection {
+    uint8_t kind = 0;
+    int group = -1;
+    size_t i = 0;
+    size_t j = 0;
 };
 
 template <typename T>
@@ -175,6 +183,53 @@ inline void harc_unique_remember(
     HarcUniqueHistory<T>& history,
     const T& value) {
     history.push_back(value);
+}
+
+inline constexpr bool harc_auto_cov_has_preference(
+    const HarcAutoCovSelection& selection) {
+    return selection.kind != 0;
+}
+
+inline void harc_auto_cov_select_point(
+    HarcAutoCovSelection& selection,
+    int group,
+    size_t i) {
+    selection.kind = 1;
+    selection.group = group;
+    selection.i = i;
+    selection.j = 0;
+}
+
+inline void harc_auto_cov_select_cross(
+    HarcAutoCovSelection& selection,
+    int group,
+    size_t i,
+    size_t j) {
+    selection.kind = 2;
+    selection.group = group;
+    selection.i = i;
+    selection.j = j;
+}
+
+inline constexpr bool harc_auto_cov_selected_point(
+    const HarcAutoCovSelection& selection,
+    int group) {
+    return selection.kind == 1 && selection.group == group;
+}
+
+inline constexpr bool harc_auto_cov_selected_cross(
+    const HarcAutoCovSelection& selection,
+    int group) {
+    return selection.kind == 2 && selection.group == group;
+}
+
+inline void harc_auto_cov_mark_blocked(bool& blocked) {
+    blocked = true;
+}
+
+inline void harc_auto_cov_mark_hit(bool& hit, bool& blocked) {
+    hit = true;
+    blocked = false;
 }
 
 inline constexpr HarcSolveStatus harc_solve_status_ok() {

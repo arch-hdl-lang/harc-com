@@ -10301,21 +10301,17 @@ impl Emitter {
             self.pad(depth + 1);
             writeln!(
                 self.out,
-                "bool _auto_cov_pref_{cache_tag} = false;   // auto coverage preference"
+                "harc_rt::random::HarcAutoCovSelection _auto_cov_selection_{cache_tag};   // auto coverage preference"
             )
             .ok();
-            self.pad(depth + 1);
-            writeln!(self.out, "int _auto_cov_selected_kind_{cache_tag} = 0;").ok();
-            self.pad(depth + 1);
-            writeln!(self.out, "int _auto_cov_selected_group_{cache_tag} = -1;").ok();
-            self.pad(depth + 1);
-            writeln!(self.out, "size_t _auto_cov_selected_i_{cache_tag} = 0;").ok();
-            self.pad(depth + 1);
-            writeln!(self.out, "size_t _auto_cov_selected_j_{cache_tag} = 0;").ok();
         }
         for (group, (a, b)) in auto_crosses.iter().enumerate() {
             self.pad(depth + 1);
-            writeln!(self.out, "if (!_auto_cov_pref_{cache_tag}) {{").ok();
+            writeln!(
+                self.out,
+                "if (!harc_rt::random::harc_auto_cov_has_preference(_auto_cov_selection_{cache_tag})) {{"
+            )
+            .ok();
             self.pad(depth + 2);
             writeln!(
                 self.out,
@@ -10373,15 +10369,11 @@ impl Emitter {
             )
             .ok();
             self.pad(depth + 5);
-            writeln!(self.out, "_auto_cov_pref_{cache_tag} = true;").ok();
-            self.pad(depth + 5);
-            writeln!(self.out, "_auto_cov_selected_kind_{cache_tag} = 2;").ok();
-            self.pad(depth + 5);
-            writeln!(self.out, "_auto_cov_selected_group_{cache_tag} = {group};").ok();
-            self.pad(depth + 5);
-            writeln!(self.out, "_auto_cov_selected_i_{cache_tag} = _i;").ok();
-            self.pad(depth + 5);
-            writeln!(self.out, "_auto_cov_selected_j_{cache_tag} = _j;").ok();
+            writeln!(
+                self.out,
+                "harc_rt::random::harc_auto_cov_select_cross(_auto_cov_selection_{cache_tag}, {group}, _i, _j);"
+            )
+            .ok();
             self.pad(depth + 5);
             writeln!(self.out, "break;").ok();
             self.pad(depth + 4);
@@ -10389,7 +10381,11 @@ impl Emitter {
             self.pad(depth + 3);
             writeln!(self.out, "}}").ok();
             self.pad(depth + 3);
-            writeln!(self.out, "if (_auto_cov_pref_{cache_tag}) break;").ok();
+            writeln!(
+                self.out,
+                "if (harc_rt::random::harc_auto_cov_has_preference(_auto_cov_selection_{cache_tag})) break;"
+            )
+            .ok();
             self.pad(depth + 2);
             writeln!(self.out, "}}").ok();
             self.pad(depth + 1);
@@ -10397,7 +10393,11 @@ impl Emitter {
         }
         for (group, goal) in auto_goals.iter().enumerate() {
             self.pad(depth + 1);
-            writeln!(self.out, "if (!_auto_cov_pref_{cache_tag}) {{").ok();
+            writeln!(
+                self.out,
+                "if (!harc_rt::random::harc_auto_cov_has_preference(_auto_cov_selection_{cache_tag})) {{"
+            )
+            .ok();
             self.pad(depth + 2);
             let value_ty = auto_value_array_type(goal, &field_info);
             writeln!(
@@ -10418,7 +10418,7 @@ impl Emitter {
             self.pad(depth + 3);
             writeln!(
                 self.out,
-                "if (!_auto_cov_{cache_tag}_{}[_i] && !_auto_cov_blocked_{cache_tag}_{}[_i]) {{ _pref_{cache_tag}_{} = _auto_vals_{cache_tag}_{}[_i]; _auto_cov_pref_{cache_tag} = true; _auto_cov_selected_kind_{cache_tag} = 1; _auto_cov_selected_group_{cache_tag} = {group}; _auto_cov_selected_i_{cache_tag} = _i; break; }}",
+                "if (!_auto_cov_{cache_tag}_{}[_i] && !_auto_cov_blocked_{cache_tag}_{}[_i]) {{ _pref_{cache_tag}_{} = _auto_vals_{cache_tag}_{}[_i]; harc_rt::random::harc_auto_cov_select_point(_auto_cov_selection_{cache_tag}, {group}, _i); break; }}",
                 goal.c_field, goal.c_field, goal.c_field, goal.c_field
             )
             .ok();
@@ -10454,7 +10454,7 @@ impl Emitter {
                 self.pad(depth + 2);
                 writeln!(
                     self.out,
-                    "if (_auto_cov_selected_kind_{cache_tag} == 2 && _auto_cov_selected_group_{cache_tag} == {group}) _auto_cross_blocked_{cache_tag}_{}__{}[_auto_cov_selected_i_{cache_tag}][_auto_cov_selected_j_{cache_tag}] = true;",
+                    "if (harc_rt::random::harc_auto_cov_selected_cross(_auto_cov_selection_{cache_tag}, {group})) harc_rt::random::harc_auto_cov_mark_blocked(_auto_cross_blocked_{cache_tag}_{}__{}[_auto_cov_selection_{cache_tag}.i][_auto_cov_selection_{cache_tag}.j]);",
                     a.c_field, b.c_field
                 )
                 .ok();
@@ -10463,7 +10463,7 @@ impl Emitter {
                 self.pad(depth + 2);
                 writeln!(
                     self.out,
-                    "if (_auto_cov_selected_kind_{cache_tag} == 1 && _auto_cov_selected_group_{cache_tag} == {group}) _auto_cov_blocked_{cache_tag}_{}[_auto_cov_selected_i_{cache_tag}] = true;",
+                    "if (harc_rt::random::harc_auto_cov_selected_point(_auto_cov_selection_{cache_tag}, {group})) harc_rt::random::harc_auto_cov_mark_blocked(_auto_cov_blocked_{cache_tag}_{}[_auto_cov_selection_{cache_tag}.i]);",
                     goal.c_field
                 )
                 .ok();
@@ -10755,7 +10755,7 @@ impl Emitter {
                 self.pad(depth + 2);
                 writeln!(
                     self.out,
-                    "if (_val_{} == {}) {{ _auto_cov_{cache_tag}_{}[{}] = true; _auto_cov_blocked_{cache_tag}_{}[{}] = false; }}",
+                    "if (_val_{} == {}) {{ harc_rt::random::harc_auto_cov_mark_hit(_auto_cov_{cache_tag}_{}[{}], _auto_cov_blocked_{cache_tag}_{}[{}]); }}",
                     goal.c_field, value.c_expr, goal.c_field, idx, goal.c_field, idx
                 )
                 .ok();
@@ -10767,7 +10767,7 @@ impl Emitter {
                     self.pad(depth + 2);
                     writeln!(
                         self.out,
-                        "if (_val_{} == {} && _val_{} == {}) {{ _auto_cross_{cache_tag}_{}__{}[{}][{}] = true; _auto_cross_blocked_{cache_tag}_{}__{}[{}][{}] = false; }}",
+                        "if (_val_{} == {} && _val_{} == {}) {{ harc_rt::random::harc_auto_cov_mark_hit(_auto_cross_{cache_tag}_{}__{}[{}][{}], _auto_cross_blocked_{cache_tag}_{}__{}[{}][{}]); }}",
                         a.c_field, av.c_expr, b.c_field, bv.c_expr, a.c_field, b.c_field, i, j, a.c_field, b.c_field, i, j
                     )
                     .ok();
