@@ -1659,13 +1659,18 @@ Target-side TLM responders use `thread bus.method(args)` inside the bound transa
 ```harc
 transactor MemTarget bound to BurstMem
     read_count : uint<32> default 0
+    prep_acc : uint<32> default 0
 
     thread bus.read(addr: uint<32>)
         let req_seq : uint<32> = read_count
         read_count = read_count + 1
+        prep_acc = 0
+        for i in 0 .. 4
+            prep_acc = prep_acc + addr + i
+        end for
         wait 1 cycle
         if addr < 0x1000
-            return addr + 0x100 + req_seq
+            return addr + 0x100 + req_seq + prep_acc
         else
             return 0xffff_ffff
         end if
@@ -1681,7 +1686,7 @@ Current shipped limits:
 
 - Direct non-fork calls lower only for `blocking` methods.
 - RHS `fork bus.method(...)` plus `join_all` lowers for `blocking` and `out_of_order tags N`.
-- Target TLM thread bodies support local `let`s, transactor field reads/writes, assignments, waits, and terminal value returns. The terminal return may be a direct `return expr` or a terminal `if` / `elsif` / `else` whose every branch ends with `return expr`, allowing address decode and response-code branching. Early returns from nested control flow and target-side loops with returns remain later slices.
+- Target TLM thread bodies support local `let`s, transactor field reads/writes, assignments, bounded response-prep loops without returns, waits, and terminal value returns. The terminal return may be a direct `return expr` or a terminal `if` / `elsif` / `else` whose every branch ends with `return expr`, allowing address decode and response-code branching. Early returns from nested control flow and target-side loops with returns remain later slices.
 
 **Coroutine runtime (Phase 1, single-actor).** The test's `run` block lowers to a C++20 coroutine driven by `harc_rt::ThreadScheduler` (slim sister of arch-com's `arch_thread_rt.h`). `wait N cycles` and the bus.send/recv spin loops emit `co_await harc_rt::wait_cycles(_slot, N)`; the main loop drives one primary-clock posedge per iteration, runs post-eval services, then resumes any coroutine whose wait condition is satisfied. Checkers and clocked coverage sample after the coroutine/clk-low settle point unless bound to an explicit hook trigger. Hookable methods, `on`-event-handler closures, tseq lambdas, and free functions stay synchronous — they only execute while the run coroutine is "running" between `co_await`s, so a sync `tick()` from inside a method does not race the scheduler. Multi-clock `wait N cycles on <named-clock>` keeps its sync `eval_clocks_until` path even in coroutine context: the main loop's full-primary-period granularity is too coarse for sub-primary-cycle waits when the named clock runs faster than primary.
 

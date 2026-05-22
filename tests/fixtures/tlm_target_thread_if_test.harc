@@ -2,7 +2,8 @@
 //
 // The SV DUT issues two blocking read requests. The passive HARC target
 // branches on the captured request address, uses a local sequence snapshot,
-// and updates persistent transactor state between calls.
+// runs a bounded response-prep loop, and updates persistent transactor state
+// between calls.
 
 bus TlmMemBus
     tlm_method read(addr: uint<8>) -> uint<32>: blocking;
@@ -10,15 +11,20 @@ end bus TlmMemBus
 
 transactor TlmMemTarget bound to TlmMemBus
     read_count : uint<32> default 0
+    prep_acc : uint<32> default 0
 
     thread bus.read(addr: uint<8>)
         let req_seq : uint<32> = read_count
         read_count = read_count + 1
+        prep_acc = 0
+        for i in 0 .. 4
+            prep_acc = prep_acc + addr + i
+        end for
         wait 1 cycle
         if addr < 8
-            return 256 + addr + req_seq
+            return 256 + addr + req_seq + prep_acc
         else
-            return 512 + addr + req_seq
+            return 512 + addr + req_seq + prep_acc
         end if
     end thread
 end transactor TlmMemTarget
@@ -37,13 +43,15 @@ impl TlmTargetThreadIfTest for TlmTargetThreadIfTb
         dut.rst = 0
 
         wait until dut.done == 1 timeout 80 cycles fail("DUT initiator did not receive both HARC target responses")
-        assert dut.result0 == 261
-            else fail("first target TLM response mismatch got=0x${dut.result0:08x}, expected 0x00000105")
-        assert dut.result1 == 525
-            else fail("second target TLM response mismatch got=0x${dut.result1:08x}, expected 0x0000020d")
+        assert dut.result0 == 287
+            else fail("first target TLM response mismatch got=0x${dut.result0:08x}, expected 0x0000011f")
+        assert dut.result1 == 579
+            else fail("second target TLM response mismatch got=0x${dut.result1:08x}, expected 0x00000243")
         assert target.read_count == 2
             else fail("target TLM read_count mismatch got=${target.read_count}, expected 2")
+        assert target.prep_acc == 54
+            else fail("target TLM prep_acc mismatch got=${target.prep_acc}, expected 54")
 
-        log(info, "PASS: HARC target-side TLM thread branched and updated responder state")
+        log(info, "PASS: HARC target-side TLM thread loop-prepared response state")
     end run
 end impl TlmTargetThreadIfTest
