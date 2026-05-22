@@ -10070,7 +10070,7 @@ impl Emitter {
             self.pad(depth + 1);
             writeln!(
                 self.out,
-                "static std::vector<{}> {cache_tag}_unique_{}_{};",
+                "static harc_rt::random::HarcUniqueHistory<{}> {cache_tag}_unique_{}_{};",
                 value_ty, scope, c_name
             )
             .ok();
@@ -10485,7 +10485,7 @@ impl Emitter {
             let v_expr = solver_bv_value_call("_v", f.signed, f.width, solver_width);
             writeln!(
                 self.out,
-                "for (auto _v : {cache_tag}_unique_{scope}_{}) _s.add(_z_{} != {});   // [unique within {}] policy: no repeat until exhausted",
+                "for (auto _v : harc_rt::random::harc_unique_values({cache_tag}_unique_{scope}_{})) _s.add(_z_{} != {});   // [unique within {}] policy: no repeat until exhausted",
                 c_name,
                 c_name,
                 v_expr,
@@ -10509,7 +10509,12 @@ impl Emitter {
             let c_name = c_ident(&f.name);
             let scope = c_scope_ident(field_attr_unique_scope(f));
             self.pad(depth + 2);
-            writeln!(self.out, "{cache_tag}_unique_{scope}_{}.clear();", c_name).ok();
+            writeln!(
+                self.out,
+                "harc_rt::random::harc_unique_clear({cache_tag}_unique_{scope}_{});",
+                c_name
+            )
+            .ok();
         }
         self.pad(depth + 2);
         writeln!(self.out, "_r = _s.check();").ok();
@@ -10734,7 +10739,7 @@ impl Emitter {
                     self.pad(scalar_depth);
                     writeln!(
                         self.out,
-                        "{cache_tag}_unique_{scope}_{}.push_back(_val_{});",
+                        "harc_rt::random::harc_unique_remember({cache_tag}_unique_{scope}_{}, _val_{});",
                         c_name, c_name
                     )
                     .ok();
