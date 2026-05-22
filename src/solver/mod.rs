@@ -4,6 +4,7 @@
 //! the inline Z3 emission in `codegen/cpp_tb.rs`. Backends here consume
 //! verified `CTypedProblem`s so codegen can migrate one feature at a time.
 
+pub mod problem_table;
 pub mod z3;
 
 use std::collections::BTreeMap;

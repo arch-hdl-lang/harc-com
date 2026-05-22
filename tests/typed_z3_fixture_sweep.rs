@@ -3,22 +3,15 @@
 //! This does not execute Z3 and does not replace `cpp_tb.rs`. It proves that
 //! every fixture can be walked, every clean typed lowering can be handed to
 //! the solver backend boundary, and unsupported backend cases are reported as
-//! structured `SolverBuildError::Unsupported` entries rather than panics.
+//! structured entries rather than panics.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use harc::ast::{
-    Block, CallArg, Expr, ExprKind, Item, Stmt, StmtKind, TestDecl, TestItem, TypeExpr,
-};
-use harc::constraints::elaborate_constraints;
-use harc::constraints::typed::ConstraintProblemId;
-use harc::constraints::typed_lower::{lower_problem, LowerError};
-use harc::lexer::Span;
 use harc::parser::parse_source;
-use harc::solver::z3::Z3Backend;
-use harc::solver::{SolverBackend, SolverBuildError};
+use harc::solver::problem_table::{
+    build_typed_solver_problem_table, TypedSolverProblemBuild, TypedSolverProblemSource,
+};
 
 #[test]
 fn typed_z3_backend_builds_for_clean_fixture_lowers() {
@@ -30,13 +23,12 @@ fn typed_z3_backend_builds_for_clean_fixture_lowers() {
         .collect();
     entries.sort_by_key(|e| e.path());
 
-    let backend = Z3Backend;
     let mut total_fixtures = 0usize;
     let mut total_problems = 0usize;
     let mut z3_built = 0usize;
     let mut expected_lower_errors = Vec::new();
     let mut unexpected_lower_errors = Vec::new();
-    let mut unsupported = Vec::new();
+    let mut backend_errors = Vec::new();
 
     for entry in entries {
         let path = entry.path();
@@ -49,99 +41,43 @@ fn typed_z3_backend_builds_for_clean_fixture_lowers() {
             Err(_) => continue,
         };
         total_fixtures += 1;
-        let elab = elaborate_constraints(&parsed);
 
-        for txn in elab.transactions.clone() {
-            total_problems += 1;
-            let lower = lower_problem(
-                &elab,
-                &txn,
-                None,
-                Span::default(),
-                ConstraintProblemId(total_problems as u32),
-            );
-            match lower {
-                Ok(problem) => match backend.build(&problem) {
-                    Ok(z3) => {
-                        assert!(
-                            z3.smt.contains("(check-sat)"),
-                            "Z3 scaffold output for {} bare {} missed check-sat",
-                            path.display(),
-                            txn.name
-                        );
-                        z3_built += 1;
+        let table = build_typed_solver_problem_table(&parsed);
+        total_problems += table.entries.len();
+        for entry in table.entries {
+            match entry.build {
+                TypedSolverProblemBuild::Z3 { typed, z3 } => {
+                    assert!(
+                        z3.smt.contains("(check-sat)"),
+                        "Z3 scaffold output for {} {} missed check-sat",
+                        path.display(),
+                        source_label(&entry.source)
+                    );
+                    assert_eq!(
+                        z3.assertions.len(),
+                        typed.constraints.len(),
+                        "assertion origin map lost clauses for {} {}",
+                        path.display(),
+                        source_label(&entry.source)
+                    );
+                    z3_built += 1;
+                }
+                TypedSolverProblemBuild::LowerError(errors) => {
+                    let label = source_label(&entry.source);
+                    let rendered = format!("{} {label}: {errors:#?}", path.display());
+                    if let Some(reason) = expected_lower_error_reason(&path, &entry.source) {
+                        expected_lower_errors.push(format!("{rendered}\n  classified: {reason}"));
+                    } else {
+                        unexpected_lower_errors.push(rendered);
                     }
-                    Err(SolverBuildError::Unsupported { feature, detail }) => {
-                        unsupported.push(format!(
-                            "{} bare {}: {feature}: {detail}",
-                            path.display(),
-                            txn.name
-                        ));
-                    }
-                    Err(SolverBuildError::Verify(errors)) => {
-                        panic!(
-                            "backend verifier rejected typed-lowered bare problem from {} {}: {errors:#?}",
-                            path.display(),
-                            txn.name
-                        );
-                    }
-                },
-                Err(errors) => record_lower_error(
-                    &path,
-                    &format!("bare {}", txn.name),
-                    errors,
-                    &mut expected_lower_errors,
-                    &mut unexpected_lower_errors,
-                ),
-            }
-        }
-
-        let randomize_sites = collect_randomize_sites(&parsed.items);
-        for site in randomize_sites {
-            let Some(txn) = elab.transaction(&site.txn_name).cloned() else {
-                continue;
-            };
-            total_problems += 1;
-            let lower = lower_problem(
-                &elab,
-                &txn,
-                Some(&site.with_body),
-                site.span,
-                ConstraintProblemId(total_problems as u32),
-            );
-            match lower {
-                Ok(problem) => match backend.build(&problem) {
-                    Ok(z3) => {
-                        assert!(
-                            z3.assertions.len() == problem.constraints.len(),
-                            "assertion origin map lost clauses for {} {}",
-                            path.display(),
-                            site.context
-                        );
-                        z3_built += 1;
-                    }
-                    Err(SolverBuildError::Unsupported { feature, detail }) => {
-                        unsupported.push(format!(
-                            "{} {}: {feature}: {detail}",
-                            path.display(),
-                            site.context
-                        ));
-                    }
-                    Err(SolverBuildError::Verify(errors)) => {
-                        panic!(
-                            "backend verifier rejected typed-lowered randomize problem from {} {}: {errors:#?}",
-                            path.display(),
-                            site.context
-                        );
-                    }
-                },
-                Err(errors) => record_lower_error(
-                    &path,
-                    &site.context,
-                    errors,
-                    &mut expected_lower_errors,
-                    &mut unexpected_lower_errors,
-                ),
+                }
+                TypedSolverProblemBuild::BackendError(err) => {
+                    backend_errors.push(format!(
+                        "{} {}: {err:#?}",
+                        path.display(),
+                        source_label(&entry.source)
+                    ));
+                }
             }
         }
     }
@@ -149,10 +85,10 @@ fn typed_z3_backend_builds_for_clean_fixture_lowers() {
     eprintln!(
         "[typed_z3 sweep] fixtures={total_fixtures} problems={total_problems} \
          z3_built={z3_built} expected_lower_errors={expected_lower_errors} \
-         unexpected_lower_errors={unexpected_lower_errors} unsupported={unsupported}",
+         unexpected_lower_errors={unexpected_lower_errors} backend_errors={backend_errors}",
         expected_lower_errors = expected_lower_errors.len(),
         unexpected_lower_errors = unexpected_lower_errors.len(),
-        unsupported = unsupported.len()
+        backend_errors = backend_errors.len()
     );
     for line in expected_lower_errors.iter().take(12) {
         eprintln!("[typed_z3 expected-lower-error] {line}");
@@ -160,8 +96,8 @@ fn typed_z3_backend_builds_for_clean_fixture_lowers() {
     for line in unexpected_lower_errors.iter().take(12) {
         eprintln!("[typed_z3 unexpected-lower-error] {line}");
     }
-    for line in unsupported.iter().take(12) {
-        eprintln!("[typed_z3 unsupported] {line}");
+    for line in backend_errors.iter().take(12) {
+        eprintln!("[typed_z3 backend-error] {line}");
     }
 
     assert!(
@@ -182,31 +118,48 @@ fn typed_z3_backend_builds_for_clean_fixture_lowers() {
         "unexpected typed-lowering errors reached the typed Z3 sweep:\n{}",
         unexpected_lower_errors.join("\n")
     );
+    assert!(
+        backend_errors.is_empty(),
+        "typed Z3 backend errors reached the sweep:\n{}",
+        backend_errors.join("\n")
+    );
 }
 
-fn record_lower_error(
-    path: &Path,
-    context: &str,
-    errors: Vec<LowerError>,
-    expected: &mut Vec<String>,
-    unexpected: &mut Vec<String>,
-) {
-    let entry = format!("{} {context}: {errors:#?}", path.display());
-    if let Some(reason) = expected_lower_error_reason(path, context) {
-        expected.push(format!("{entry}\n  classified: {reason}"));
-    } else {
-        unexpected.push(entry);
+fn source_label(source: &TypedSolverProblemSource) -> String {
+    match source {
+        TypedSolverProblemSource::TransactionTemplate { transaction, .. } => {
+            format!("bare {transaction}")
+        }
+        TypedSolverProblemSource::RandomizeSite {
+            context, target, ..
+        } => {
+            if context.contains("randomize(") {
+                context.clone()
+            } else {
+                format!("{context}: randomize({target})")
+            }
+        }
     }
 }
 
-fn expected_lower_error_reason(path: &Path, context: &str) -> Option<&'static str> {
+fn expected_lower_error_reason(
+    path: &Path,
+    source: &TypedSolverProblemSource,
+) -> Option<&'static str> {
     let file = path.file_name().and_then(|s| s.to_str())?;
-    if file == "axi_agent.harc" && context == "bare AxiTxn" {
-        return Some(
-            "spec-sketch transaction uses unresolved imported enum-like types/variants \
-             (`AxiOp`, `BurstType`, `READ`, `WRITE`, `WRAP`) and illustrative AXI bounds; \
-             it is a parser/pretty fixture, not a fully typed constraint fixture",
-        );
+    if file == "axi_agent.harc" {
+        match source {
+            TypedSolverProblemSource::TransactionTemplate { transaction, .. }
+            | TypedSolverProblemSource::RandomizeSite { transaction, .. } => {
+                if transaction == "AxiTxn" {
+                    return Some(
+                        "spec-sketch transaction uses unresolved imported enum-like types/variants \
+                         (`AxiOp`, `BurstType`, `READ`, `WRITE`, `WRAP`) and illustrative AXI bounds; \
+                         it is a parser/pretty fixture, not a fully typed constraint fixture",
+                    );
+                }
+            }
+        }
     }
     None
 }
@@ -214,338 +167,31 @@ fn expected_lower_error_reason(path: &Path, context: &str) -> Option<&'static st
 #[test]
 fn classifies_axi_agent_spec_sketch_lowering_gap() {
     let path = Path::new("tests/fixtures/axi_agent.harc");
-    let reason = expected_lower_error_reason(path, "bare AxiTxn").expect("classified");
+    let source = TypedSolverProblemSource::TransactionTemplate {
+        transaction: "AxiTxn".to_string(),
+        span: Default::default(),
+    };
+    let reason = expected_lower_error_reason(path, &source).expect("classified");
     assert!(reason.contains("spec-sketch transaction"));
     assert!(reason.contains("unresolved imported enum-like types"));
-    assert!(expected_lower_error_reason(path, "SmokeTest: randomize(t)").is_none());
-}
 
-#[derive(Debug, Clone)]
-struct RandomizeSite {
-    txn_name: String,
-    with_body: Vec<Expr>,
-    span: Span,
-    context: String,
-}
-
-fn collect_randomize_sites(items: &[Item]) -> Vec<RandomizeSite> {
-    let mut out = Vec::new();
-    for item in items {
-        let Item::Test(test) = item else {
-            continue;
-        };
-        collect_test_randomize_sites(test, &mut out);
-    }
-    out
-}
-
-fn collect_test_randomize_sites(test: &TestDecl, out: &mut Vec<RandomizeSite>) {
-    let mut env = BTreeMap::new();
-    for item in &test.items {
-        if let TestItem::Let(l) = item {
-            if let Some(ty) = simple_type_name(l.ty.as_ref()) {
-                env.insert(l.name.name.clone(), ty);
-            }
-        }
-    }
-
-    for item in &test.items {
-        match item {
-            TestItem::Stmt(stmt) => collect_stmt(stmt, &mut env.clone(), &test.name.name, out),
-            TestItem::Scope(scope) => {
-                for block in [
-                    scope.setup.as_ref(),
-                    scope.run.as_ref(),
-                    scope.check.as_ref(),
-                    scope.teardown.as_ref(),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    collect_block(block, &mut env.clone(), &test.name.name, out);
-                }
-            }
-            TestItem::Phase(_, block) => {
-                collect_block(block, &mut env.clone(), &test.name.name, out)
-            }
-            TestItem::Let(_) | TestItem::Apply(_) | TestItem::Use(_) | TestItem::Clock(_) => {}
-        }
-    }
-}
-
-fn collect_block(
-    block: &Block,
-    env: &mut BTreeMap<String, String>,
-    context: &str,
-    out: &mut Vec<RandomizeSite>,
-) {
-    for stmt in &block.stmts {
-        collect_stmt(stmt, env, context, out);
-    }
-}
-
-fn collect_stmt(
-    stmt: &Stmt,
-    env: &mut BTreeMap<String, String>,
-    context: &str,
-    out: &mut Vec<RandomizeSite>,
-) {
-    match &stmt.kind {
-        StmtKind::Let(l) => {
-            if let Some(value) = &l.value {
-                collect_expr(value, env, context, out);
-            }
-            if let Some(ty) = simple_type_name(l.ty.as_ref()) {
-                env.insert(l.name.name.clone(), ty);
-            }
-        }
-        StmtKind::Randomize {
-            target, with_body, ..
-        } => {
-            collect_randomize_expr(target, with_body, env, context, out);
-            for expr in with_body {
-                collect_expr(expr, env, context, out);
-            }
-        }
-        StmtKind::Assign { target, value } | StmtKind::Send { target, value } => {
-            collect_expr(target, env, context, out);
-            collect_expr(value, env, context, out);
-        }
-        StmtKind::For(f) => {
-            collect_expr(&f.iter, env, context, out);
-            collect_block(&f.body, &mut env.clone(), context, out);
-        }
-        StmtKind::Repeat(r) => {
-            collect_expr(&r.count, env, context, out);
-            collect_block(&r.body, &mut env.clone(), context, out);
-        }
-        StmtKind::Loop(block) => collect_block(block, &mut env.clone(), context, out),
-        StmtKind::While { cond, body, .. } => {
-            collect_expr(cond, env, context, out);
-            collect_block(body, &mut env.clone(), context, out);
-        }
-        StmtKind::If(ifs) => {
-            collect_expr(&ifs.cond, env, context, out);
-            collect_block(&ifs.then_block, &mut env.clone(), context, out);
-            for (cond, block) in &ifs.elsifs {
-                collect_expr(cond, env, context, out);
-                collect_block(block, &mut env.clone(), context, out);
-            }
-            if let Some(block) = &ifs.else_block {
-                collect_block(block, &mut env.clone(), context, out);
-            }
-        }
-        StmtKind::Fork(fork) => {
-            for block in &fork.branches {
-                collect_block(block, &mut env.clone(), context, out);
-            }
-        }
-        StmtKind::Parallel(blocks) | StmtKind::Schedule(blocks) => {
-            for block in blocks {
-                collect_block(block, &mut env.clone(), context, out);
-            }
-        }
-        StmtKind::Select(arms) => {
-            for arm in arms {
-                collect_expr(&arm.event, env, context, out);
-                collect_block(&arm.action, &mut env.clone(), context, out);
-            }
-        }
-        StmtKind::On(handler) => {
-            collect_expr(&handler.event, env, context, out);
-            collect_block(&handler.body, &mut env.clone(), context, out);
-        }
-        StmtKind::Emit { args, .. } | StmtKind::Log { args, .. } | StmtKind::LogF { args, .. } => {
-            for arg in args {
-                match arg {
-                    CallArg::Expr(expr) | CallArg::Named { value: expr, .. } => {
-                        collect_expr(expr, env, context, out);
-                    }
-                }
-            }
-        }
-        StmtKind::Yield(expr) | StmtKind::Release(expr) | StmtKind::Fail { msg: expr, .. } => {
-            collect_expr(expr, env, context, out);
-        }
-        StmtKind::Return(expr) => {
-            if let Some(expr) = expr {
-                collect_expr(expr, env, context, out);
-            }
-        }
-        StmtKind::Assert(v) | StmtKind::Assume(v) | StmtKind::Cover(v) => {
-            if let Some(expr) = &v.expr {
-                collect_expr(expr, env, context, out);
-            }
-            if let Some(expr) = &v.else_fail {
-                collect_expr(expr, env, context, out);
-            }
-        }
-        StmtKind::After { duration, body, .. } => {
-            collect_expr(duration, env, context, out);
-            collect_block(body, &mut env.clone(), context, out);
-        }
-        StmtKind::Wait { duration, .. } => collect_expr(duration, env, context, out),
-        StmtKind::WaitUntil {
-            conditions,
-            timeout,
-            ..
-        } => {
-            for cond in conditions {
-                collect_expr(cond, env, context, out);
-            }
-            if let Some(timeout) = timeout {
-                collect_expr(&timeout.cycles, env, context, out);
-                if let Some(msg) = &timeout.message {
-                    collect_expr(msg, env, context, out);
-                }
-            }
-        }
-        StmtKind::Expr(expr) => collect_expr(expr, env, context, out),
-        StmtKind::Apply(_)
-        | StmtKind::Break { .. }
-        | StmtKind::Continue { .. }
-        | StmtKind::JoinAll { .. } => {}
-    }
-}
-
-fn collect_expr(
-    expr: &Expr,
-    env: &BTreeMap<String, String>,
-    context: &str,
-    out: &mut Vec<RandomizeSite>,
-) {
-    match expr.kind.as_ref() {
-        ExprKind::Randomize {
-            target, with_body, ..
-        } => {
-            collect_randomize_expr(target, with_body, env, context, out);
-            for expr in with_body {
-                collect_expr(expr, env, context, out);
-            }
-        }
-        ExprKind::Call { callee, args } => {
-            collect_expr(callee, env, context, out);
-            for arg in args {
-                match arg {
-                    CallArg::Expr(expr) | CallArg::Named { value: expr, .. } => {
-                        collect_expr(expr, env, context, out);
-                    }
-                }
-            }
-        }
-        ExprKind::Field { target, .. }
-        | ExprKind::Cast { expr: target, .. }
-        | ExprKind::Unary { expr: target, .. }
-        | ExprKind::HashHash { expr: target, .. }
-        | ExprKind::SeqRepeat { expr: target, .. }
-        | ExprKind::Paren(target) => collect_expr(target, env, context, out),
-        ExprKind::Index { target, index } => {
-            collect_expr(target, env, context, out);
-            collect_expr(index, env, context, out);
-        }
-        ExprKind::BitSlice { target, hi, lo } => {
-            collect_expr(target, env, context, out);
-            collect_expr(hi, env, context, out);
-            collect_expr(lo, env, context, out);
-        }
-        ExprKind::Send { target, value }
-        | ExprKind::Binary {
-            lhs: target,
-            rhs: value,
-            ..
-        } => {
-            collect_expr(target, env, context, out);
-            collect_expr(value, env, context, out);
-        }
-        ExprKind::ForkCall { call } => collect_expr(call, env, context, out),
-        ExprKind::Ternary {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            collect_expr(cond, env, context, out);
-            collect_expr(then_branch, env, context, out);
-            collect_expr(else_branch, env, context, out);
-        }
-        ExprKind::RangeLit { lo, hi } => {
-            if let Some(lo) = lo {
-                collect_expr(lo, env, context, out);
-            }
-            if let Some(hi) = hi {
-                collect_expr(hi, env, context, out);
-            }
-        }
-        ExprKind::SetLit(items) => {
-            for item in items {
-                collect_expr(item, env, context, out);
-            }
-        }
-        ExprKind::SystemCall { args, .. } => {
-            for arg in args {
-                collect_expr(arg, env, context, out);
-            }
-        }
-        ExprKind::ForEachConstraint { iter, body, .. } => {
-            collect_expr(iter, env, context, out);
-            for expr in body {
-                collect_expr(expr, env, context, out);
-            }
-        }
-        ExprKind::DistDirective { target, .. } => collect_expr(target, env, context, out),
-        ExprKind::NamedArg { value, .. } => collect_expr(value, env, context, out),
-        ExprKind::StructLit { fields, .. } => {
-            for field in fields {
-                collect_expr(&field.value, env, context, out);
-            }
-        }
-        ExprKind::CoverArrow { lhs, rhs, .. }
-        | ExprKind::Membership {
-            expr: lhs,
-            set: rhs,
-        } => {
-            collect_expr(lhs, env, context, out);
-            collect_expr(rhs, env, context, out);
-        }
-        ExprKind::SolveOrder { args } => {
-            for arg in args {
-                collect_expr(arg, env, context, out);
-            }
-        }
-        ExprKind::DistLit(_)
-        | ExprKind::Int(_)
-        | ExprKind::Float(_)
-        | ExprKind::Time(_)
-        | ExprKind::Bool(_)
-        | ExprKind::String(_)
-        | ExprKind::Ident(_)
-        | ExprKind::ImplicitSelf => {}
-    }
-}
-
-fn collect_randomize_expr(
-    target: &Expr,
-    with_body: &[Expr],
-    env: &BTreeMap<String, String>,
-    context: &str,
-    out: &mut Vec<RandomizeSite>,
-) {
-    let ExprKind::Ident(id) = target.kind.as_ref() else {
-        return;
+    let site = TypedSolverProblemSource::RandomizeSite {
+        context: "tseq RandomTxns".to_string(),
+        target: "t".to_string(),
+        transaction: "AxiTxn".to_string(),
+        blocking: false,
+        has_with_body: false,
+        span: Default::default(),
     };
-    let Some(txn_name) = env.get(&id.name) else {
-        return;
-    };
-    out.push(RandomizeSite {
-        txn_name: txn_name.clone(),
-        with_body: with_body.to_vec(),
-        span: target.span,
-        context: format!("{context}: randomize({})", id.name),
-    });
-}
+    assert!(expected_lower_error_reason(path, &site).is_some());
 
-fn simple_type_name(ty: Option<&TypeExpr>) -> Option<String> {
-    let Some(TypeExpr::Named { name, .. }) = ty else {
-        return None;
+    let unrelated_site = TypedSolverProblemSource::RandomizeSite {
+        context: "SmokeTest".to_string(),
+        target: "t".to_string(),
+        transaction: "OtherTxn".to_string(),
+        blocking: false,
+        has_with_body: false,
+        span: Default::default(),
     };
-    name.segments.last().map(|seg| seg.name.clone())
+    assert!(expected_lower_error_reason(path, &unrelated_site).is_none());
 }
