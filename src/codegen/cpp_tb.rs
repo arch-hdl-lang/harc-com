@@ -46,6 +46,7 @@ use std::fmt::Write;
 /// `harc sim` so the emitted `.cpp` can `#include "harc_thread_rt.h"`
 /// without a separate file dependency.
 pub const THREAD_RT_HEADER: &str = include_str!("../../runtime/harc_thread_rt.h");
+pub const RANDOM_RT_HEADER: &str = include_str!("../../runtime/harc_random_rt.h");
 
 const INDENT: &str = "    ";
 
@@ -127,6 +128,10 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // and threads through the existing pipeline unchanged.
     let file = desugar_impl_for_test_in_file(file);
     let file = &file;
+    let runtime_problem_table =
+        crate::solver::runtime::RuntimeProblemTable::from_typed_solver_table(
+            &crate::solver::problem_table::build_typed_solver_problem_table(file),
+        );
 
     // Collect ALL `test` items — every one becomes a `run_<TestName>`
     // function in the emitted binary, and the dispatcher `main()` at
@@ -584,6 +589,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // Multi-actor parallelism (driver + monitor coroutines on the same
     // bus) lands in Phase 2 on top of the same runtime.
     writeln!(e.out, "#include \"harc_thread_rt.h\"").ok();
+    writeln!(e.out, "#include \"harc_random_rt.h\"").ok();
     let uses_solver = uses_constraint_solver(file);
     if uses_solver {
         writeln!(
@@ -593,6 +599,12 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         .ok();
     }
     writeln!(e.out, "").ok();
+
+    if !runtime_problem_table.problems.is_empty() {
+        e.out.push_str(
+            &runtime_problem_table.render_cpp_table("_harc_runtime_random_problem_table"),
+        );
+    }
 
     // ── PRNG runtime ──────────────────────────────────────────────────────
     // SplitMix64 — small, fast, pure stdlib. Seed loaded from HARC_SEED.
