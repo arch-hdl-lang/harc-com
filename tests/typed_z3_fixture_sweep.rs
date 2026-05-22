@@ -14,7 +14,7 @@ use harc::ast::{
 };
 use harc::constraints::elaborate_constraints;
 use harc::constraints::typed::ConstraintProblemId;
-use harc::constraints::typed_lower::lower_problem;
+use harc::constraints::typed_lower::{lower_problem, LowerError};
 use harc::lexer::Span;
 use harc::parser::parse_source;
 use harc::solver::z3::Z3Backend;
@@ -34,7 +34,8 @@ fn typed_z3_backend_builds_for_clean_fixture_lowers() {
     let mut total_fixtures = 0usize;
     let mut total_problems = 0usize;
     let mut z3_built = 0usize;
-    let mut lower_errors = 0usize;
+    let mut expected_lower_errors = Vec::new();
+    let mut unexpected_lower_errors = Vec::new();
     let mut unsupported = Vec::new();
 
     for entry in entries {
@@ -85,7 +86,13 @@ fn typed_z3_backend_builds_for_clean_fixture_lowers() {
                         );
                     }
                 },
-                Err(_) => lower_errors += 1,
+                Err(errors) => record_lower_error(
+                    &path,
+                    &format!("bare {}", txn.name),
+                    errors,
+                    &mut expected_lower_errors,
+                    &mut unexpected_lower_errors,
+                ),
             }
         }
 
@@ -128,16 +135,31 @@ fn typed_z3_backend_builds_for_clean_fixture_lowers() {
                         );
                     }
                 },
-                Err(_) => lower_errors += 1,
+                Err(errors) => record_lower_error(
+                    &path,
+                    &site.context,
+                    errors,
+                    &mut expected_lower_errors,
+                    &mut unexpected_lower_errors,
+                ),
             }
         }
     }
 
     eprintln!(
         "[typed_z3 sweep] fixtures={total_fixtures} problems={total_problems} \
-         z3_built={z3_built} lower_errors={lower_errors} unsupported={}",
-        unsupported.len()
+         z3_built={z3_built} expected_lower_errors={expected_lower_errors} \
+         unexpected_lower_errors={unexpected_lower_errors} unsupported={unsupported}",
+        expected_lower_errors = expected_lower_errors.len(),
+        unexpected_lower_errors = unexpected_lower_errors.len(),
+        unsupported = unsupported.len()
     );
+    for line in expected_lower_errors.iter().take(12) {
+        eprintln!("[typed_z3 expected-lower-error] {line}");
+    }
+    for line in unexpected_lower_errors.iter().take(12) {
+        eprintln!("[typed_z3 unexpected-lower-error] {line}");
+    }
     for line in unsupported.iter().take(12) {
         eprintln!("[typed_z3 unsupported] {line}");
     }
@@ -155,6 +177,47 @@ fn typed_z3_backend_builds_for_clean_fixture_lowers() {
         z3_built > 0,
         "no fixture problem reached the Z3 backend scaffold"
     );
+    assert!(
+        unexpected_lower_errors.is_empty(),
+        "unexpected typed-lowering errors reached the typed Z3 sweep:\n{}",
+        unexpected_lower_errors.join("\n")
+    );
+}
+
+fn record_lower_error(
+    path: &Path,
+    context: &str,
+    errors: Vec<LowerError>,
+    expected: &mut Vec<String>,
+    unexpected: &mut Vec<String>,
+) {
+    let entry = format!("{} {context}: {errors:#?}", path.display());
+    if let Some(reason) = expected_lower_error_reason(path, context) {
+        expected.push(format!("{entry}\n  classified: {reason}"));
+    } else {
+        unexpected.push(entry);
+    }
+}
+
+fn expected_lower_error_reason(path: &Path, context: &str) -> Option<&'static str> {
+    let file = path.file_name().and_then(|s| s.to_str())?;
+    if file == "axi_agent.harc" && context == "bare AxiTxn" {
+        return Some(
+            "spec-sketch transaction uses unresolved imported enum-like types/variants \
+             (`AxiOp`, `BurstType`, `READ`, `WRITE`, `WRAP`) and illustrative AXI bounds; \
+             it is a parser/pretty fixture, not a fully typed constraint fixture",
+        );
+    }
+    None
+}
+
+#[test]
+fn classifies_axi_agent_spec_sketch_lowering_gap() {
+    let path = Path::new("tests/fixtures/axi_agent.harc");
+    let reason = expected_lower_error_reason(path, "bare AxiTxn").expect("classified");
+    assert!(reason.contains("spec-sketch transaction"));
+    assert!(reason.contains("unresolved imported enum-like types"));
+    assert!(expected_lower_error_reason(path, "SmokeTest: randomize(t)").is_none());
 }
 
 #[derive(Debug, Clone)]
