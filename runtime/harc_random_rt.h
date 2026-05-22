@@ -113,6 +113,18 @@ inline HarcSolveStatus harc_solve_queued(
     return harc_solve_status_ok();
 }
 
+template <typename T, typename RandomizeFn>
+inline HarcSolveStatus harc_solve_queued(
+    T& target,
+    harc_problem_id problem_id,
+    harc_seed seed,
+    RandomizeFn randomize_fn) {
+    (void)problem_id;
+    (void)seed;
+    randomize_fn(&target);
+    return harc_solve_status_ok();
+}
+
 template <typename T>
 inline HarcSolveStatus harc_solve_blocking(
     T& target,

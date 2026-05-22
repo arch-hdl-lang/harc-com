@@ -396,12 +396,16 @@ static_assert(harc_find_problem(table, 1)->id == 1);
 static_assert(harc_find_problem(table, 3) == nullptr);
 
 int main() {
+    struct Packet { int value = 0; };
+    auto randomize_packet = [](Packet* packet) { packet->value = 7; };
+    Packet packet;
     HarcRuntimeCallSite site{7, 2, 0};
     HarcRuntimeCallSite sites[] = {{7, 2, 0}, {8, 4, 0}};
     HarcRuntimeCallSite* found = harc_find_call_site(sites, 2, 4);
     harc_seed a = harc_call_site_next_seed(site, 11);
     harc_seed b = harc_call_site_next_seed(site, 11);
-    return (found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
+    HarcSolveStatus status = harc_solve_queued(packet, 4, a, randomize_packet);
+    return (status.ok && packet.value == 7 && found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
 }
 "#,
         )
