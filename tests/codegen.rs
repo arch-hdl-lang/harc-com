@@ -2366,7 +2366,9 @@ end test SeededSolverTest"#,
             && cpp.contains(
                 "harc_rt::random::harc_call_site_next_seed(*_harc_rt_site, harc_rng_state)"
             )
-            && cpp.contains("_p.set(\"random_seed\", static_cast<unsigned>(_harc_rt_seed & 0x7fffffffU));")
+            && cpp.contains(
+                "_p.set(\"random_seed\", static_cast<unsigned>(_harc_rt_seed & 0x7fffffffU));"
+            )
             && cpp.contains("_s.set(_p);"),
         "Z3 solver-backed randomize should consume the runtime-derived HARC seed; got:\n{cpp}"
     );
@@ -3623,6 +3625,15 @@ end test UnsatOriginDiagnosticTest"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("harc_rt::random::harc_solve_status_unsat")
+            && cpp.contains(
+                "sim_log_line(\"FAIL\", \"%s\", _harc_rt_status.message ? _harc_rt_status.message : \"randomize(t) with: constraint UNSAT\");"
+            )
+            && cpp.contains("randomize(t) with: constraint UNSAT")
+            && cpp.contains("z3::context _ctx;"),
+        "UNSAT should construct a runtime status while preserving inline Z3 and message; got:\n{cpp}",
+    );
     assert!(
         cpp.contains("constraint `len > 4` participated in the solve")
             && cpp.contains("constraint `t.len == 2` participated in the solve")

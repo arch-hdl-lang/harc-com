@@ -405,7 +405,8 @@ int main() {
     harc_seed a = harc_call_site_next_seed(site, 11);
     harc_seed b = harc_call_site_next_seed(site, 11);
     HarcSolveStatus status = harc_solve_queued(packet, 4, a, randomize_packet);
-    return (status.ok && packet.value == 7 && found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
+    HarcSolveStatus unsat = harc_solve_status_unsat(4, b);
+    return (status.ok && !unsat.ok && unsat.problem_id == 4 && unsat.seed == b && packet.value == 7 && found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
 }
 "#,
         )
