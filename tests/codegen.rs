@@ -113,6 +113,7 @@ end test RuntimeFastPathTest
     let cpp = cpp_tb::emit(&merged).expect("emit");
 
     assert!(cpp.contains("harc_solve_queued(t, 2, _harc_rt_seed, randomize_Empty);"));
+    assert!(cpp.contains("harc_rt::random::harc_handle_solve_status(_harc_rt_status);"));
     assert!(!cpp.contains("randomize_Empty(&t);"));
     assert!(
         !cpp.contains("z3::context _ctx;"),
@@ -2371,6 +2372,7 @@ end test SeededSolverTest"#,
                 "harc_rt::random::harc_call_site_next_seed(*_harc_rt_site, harc_rng_state)"
             )
             && cpp.contains("harc_rt::random::harc_solve_constrained(")
+            && cpp.contains("harc_rt::random::harc_handle_solve_status(")
             && cpp.contains(
                 "_p.set(\"random_seed\", static_cast<unsigned>(_harc_rt_seed & 0x7fffffffU));"
             )
@@ -3636,6 +3638,7 @@ end test UnsatOriginDiagnosticTest"#,
         cpp.contains("harc_rt::random::harc_solve_status_unsat")
             && cpp.contains("return _harc_rt_status;")
             && cpp.contains("return harc_rt::random::harc_solve_status_ok();")
+            && cpp.contains("harc_rt::random::harc_handle_solve_status(_harc_rt_solve_status);")
             && cpp.contains(
                 "sim_log_line(\"FAIL\", \"%s\", _harc_rt_status.message ? _harc_rt_status.message : \"randomize(t) with: constraint UNSAT\");"
             )

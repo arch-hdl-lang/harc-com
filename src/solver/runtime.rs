@@ -412,7 +412,9 @@ int main() {
         HarcSolveMode::Queued,
         []() { return harc_solve_status_ok(); });
     HarcSolveStatus unsat = harc_solve_status_unsat(4, b);
-    return (status.ok && constrained.ok && !unsat.ok && unsat.problem_id == 4 && unsat.seed == b && packet.value == 7 && found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
+    bool handled_ok = harc_handle_solve_status(constrained);
+    bool handled_unsat = harc_handle_solve_status(unsat);
+    return (status.ok && handled_ok && !handled_unsat && constrained.ok && !unsat.ok && unsat.problem_id == 4 && unsat.seed == b && packet.value == 7 && found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
 }
 "#,
         )

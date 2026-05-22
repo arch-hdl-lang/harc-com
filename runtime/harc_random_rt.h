@@ -104,6 +104,13 @@ inline constexpr HarcSolveStatus harc_solve_status_unsat(
     };
 }
 
+inline constexpr bool harc_handle_solve_status(const HarcSolveStatus& status) {
+    // During the callback migration, generated solvers still emit any
+    // user-facing diagnostics before returning a failed status. The runtime
+    // boundary owns that policy so call sites do not need to open-code it.
+    return status.ok;
+}
+
 template <typename T>
 inline HarcSolveStatus harc_solve(
     T& target,
