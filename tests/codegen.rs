@@ -4862,6 +4862,43 @@ end test T"#,
     );
 }
 
+#[test]
+fn target_tlm_thread_allows_runtime_loop_before_return() {
+    let parsed = parse_source(
+        r#"bus B
+    tlm_method read(addr: uint<8>, len: uint<4>) -> uint<32>: blocking;
+end bus B
+
+transactor Target bound to B
+    prep_acc : uint<32> default 0
+
+    thread bus.read(addr: uint<8>, len: uint<4>)
+        prep_acc = 0
+        for i in 0 .. len
+            prep_acc = prep_acc + addr + i
+        end for
+        return prep_acc
+    end thread
+end transactor Target
+
+test T
+    let dut : SomeDut
+    let b : B = bind dut
+    let target : Target passive = bind b
+    run
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("target TLM runtime loop before return should lower");
+    assert!(
+        cpp.contains("for (int64_t i = 0; i < len; i++)")
+            && cpp.contains("target.prep_acc = target.prep_acc + addr + i;")
+            && cpp.contains("harc_rt::harc_assign(_tlm_rsp_value, target.prep_acc);"),
+        "expected target responder runtime loop lowering; got:\n{cpp}"
+    );
+}
+
 // ── Width-method intrinsics (.trunc/.zext/.sext/.resize) ────────────
 //
 // Ported from arch-com's surface (src/parser.rs:5757 +

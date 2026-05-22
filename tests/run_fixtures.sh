@@ -79,6 +79,7 @@ transactor_env_mode_test | AxiLiteRegs     | AxiLiteRegs.sv         |
 tlm_method_bus_test   | TlmMemory      | TlmMemory.sv           |
 tlm_target_thread_test | TlmReadInitiator | TlmReadInitiator.sv  |
 tlm_target_thread_if_test | TlmReadInitiatorPair | TlmReadInitiatorPair.sv |
+tlm_target_thread_runtime_loop_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv |
 dma_engine_test         | DmaEngine      | dma_engine.sv          |
 pkt_queue_test          | PacketQueue    | pkt_queue.sv           |
 linklist_basic_test     | TaskQueue      | linklist_basic.sv      |
