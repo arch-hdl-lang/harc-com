@@ -9334,6 +9334,12 @@ impl Emitter {
             writeln!(self.out, "(void)_harc_rt_problem;").ok();
         } else {
             self.pad(depth + 1);
+            writeln!(
+                self.out,
+                "const harc_rt::random::HarcRuntimeProblemDescriptor* _harc_rt_problem = nullptr;"
+            )
+            .ok();
+            self.pad(depth + 1);
             writeln!(self.out, "auto _harc_rt_seed = harc_rng_next();").ok();
         }
 
@@ -10612,7 +10618,13 @@ impl Emitter {
         self.pad(depth + 2);
         writeln!(
             self.out,
-            "sim_log_line(\"FAIL\", \"randomize(t) with: constraint UNSAT\");"
+            "auto _harc_rt_status = harc_rt::random::harc_solve_status_unsat(_harc_rt_problem ? _harc_rt_problem->id : 0, _harc_rt_seed);"
+        )
+        .ok();
+        self.pad(depth + 2);
+        writeln!(
+            self.out,
+            "sim_log_line(\"FAIL\", \"%s\", _harc_rt_status.message ? _harc_rt_status.message : \"randomize(t) with: constraint UNSAT\");"
         )
         .ok();
         let mut constraint_origins: Vec<String> = hard_constraints

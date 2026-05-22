@@ -20,6 +20,8 @@ using harc_seed = uint64_t;
 struct HarcSolveStatus {
     bool ok = true;
     const char* message = nullptr;
+    harc_problem_id problem_id = 0;
+    harc_seed seed = 0;
 };
 
 struct HarcRuntimeProblemDescriptor {
@@ -88,7 +90,18 @@ inline harc_seed harc_call_site_next_seed(
 }
 
 inline constexpr HarcSolveStatus harc_solve_status_ok() {
-    return HarcSolveStatus{true, nullptr};
+    return HarcSolveStatus{true, nullptr, 0, 0};
+}
+
+inline constexpr HarcSolveStatus harc_solve_status_unsat(
+    harc_problem_id problem_id,
+    harc_seed seed) {
+    return HarcSolveStatus{
+        false,
+        "randomize(t) with: constraint UNSAT",
+        problem_id,
+        seed,
+    };
 }
 
 template <typename T>
