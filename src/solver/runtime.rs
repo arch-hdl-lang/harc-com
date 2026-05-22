@@ -117,6 +117,11 @@ impl RuntimeProblemTable {
             out.push_str(", 0},\n");
         }
         out.push_str("};\n");
+        out.push_str("static constexpr uint32_t ");
+        out.push_str(symbol);
+        out.push_str("_call_site_count = ");
+        out.push_str(&self.problems.len().to_string());
+        out.push_str(";\n");
         out.push_str("} // namespace\n\n");
         out
     }
@@ -324,6 +329,7 @@ end test Smoke
         assert!(cpp.contains("HarcRuntimeProblemDescriptor _harc_runtime_problem_table_entries[]"));
         assert!(cpp.contains("HarcRuntimeProblemTable _harc_runtime_problem_table"));
         assert!(cpp.contains("HarcRuntimeCallSite _harc_runtime_problem_table_call_sites[]"));
+        assert!(cpp.contains("_harc_runtime_problem_table_call_site_count = 2"));
         assert!(cpp.contains("{1, \"randomize(Packet)\""));
         assert!(cpp.contains("{2, \"randomize(Packet) with\""));
         assert!(cpp.contains("{1, 1, 0}"));
@@ -391,9 +397,11 @@ static_assert(harc_find_problem(table, 3) == nullptr);
 
 int main() {
     HarcRuntimeCallSite site{7, 2, 0};
+    HarcRuntimeCallSite sites[] = {{7, 2, 0}, {8, 4, 0}};
+    HarcRuntimeCallSite* found = harc_find_call_site(sites, 2, 4);
     harc_seed a = harc_call_site_next_seed(site, 11);
     harc_seed b = harc_call_site_next_seed(site, 11);
-    return (site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
+    return (found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
 }
 "#,
         )

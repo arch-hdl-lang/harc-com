@@ -128,9 +128,24 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // and threads through the existing pipeline unchanged.
     let file = desugar_impl_for_test_in_file(file);
     let file = &file;
+    let typed_solver_problem_table =
+        crate::solver::problem_table::build_typed_solver_problem_table(file);
+    let mut runtime_randomize_problem_ids = std::collections::HashMap::new();
+    for entry in &typed_solver_problem_table.entries {
+        let crate::solver::problem_table::TypedSolverProblemSource::RandomizeSite { span, .. } =
+            entry.source
+        else {
+            continue;
+        };
+        if let crate::solver::problem_table::TypedSolverProblemBuild::Z3 { typed, .. } =
+            &entry.build
+        {
+            runtime_randomize_problem_ids.insert((span.start, span.end), typed.problem_id.0);
+        }
+    }
     let runtime_problem_table =
         crate::solver::runtime::RuntimeProblemTable::from_typed_solver_table(
-            &crate::solver::problem_table::build_typed_solver_problem_table(file),
+            &typed_solver_problem_table,
         );
 
     // Collect ALL `test` items — every one becomes a `run_<TestName>`
@@ -503,6 +518,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         regblocks,
         addrmaps,
         let_helper: std::collections::HashMap::new(),
+        runtime_randomize_problem_ids,
     };
 
     // Header.
@@ -3732,6 +3748,10 @@ struct Emitter {
     /// `regs.<reg>` accessors so the emitted call resolves to
     /// `<helper>.write(addr, val)` / `<helper>.read(addr)`.
     let_helper: std::collections::HashMap<String, String>,
+    /// Runtime problem id per concrete `randomize(...)` target span.
+    /// Emitted as metadata touches only during the scaffold phase; current
+    /// behavior still uses the existing PRNG / inline Z3 solve paths.
+    runtime_randomize_problem_ids: std::collections::HashMap<(usize, usize), u32>,
     /// Free-standing `relation` declarations indexed by name (spec
     /// §4.2). `Call(Ident(R), args)` inside a constraint expression
     /// expands to R's body with formal parameters substituted by the
@@ -3974,6 +3994,42 @@ impl Emitter {
         writeln!(self.out, ");").ok();
         self.pad(depth + 1);
         writeln!(self.out, "errors++;").ok();
+        self.pad(depth);
+        writeln!(self.out, "}}").ok();
+    }
+
+    fn emit_runtime_randomize_metadata_touch(&mut self, target: &Expr, depth: usize) {
+        let Some(problem_id) = self
+            .runtime_randomize_problem_ids
+            .get(&(target.span.start, target.span.end))
+            .copied()
+        else {
+            return;
+        };
+        self.pad(depth);
+        writeln!(self.out, "{{   // runtime randomize metadata touch").ok();
+        self.pad(depth + 1);
+        writeln!(
+            self.out,
+            "auto* _harc_rt_problem = harc_rt::random::harc_find_problem(_harc_runtime_random_problem_table, {problem_id});"
+        )
+        .ok();
+        self.pad(depth + 1);
+        writeln!(
+            self.out,
+            "auto* _harc_rt_site = harc_rt::random::harc_find_call_site(_harc_runtime_random_problem_table_call_sites, _harc_runtime_random_problem_table_call_site_count, {problem_id});"
+        )
+        .ok();
+        self.pad(depth + 1);
+        writeln!(
+            self.out,
+            "auto _harc_rt_seed = _harc_rt_site ? harc_rt::random::harc_call_site_next_seed(*_harc_rt_site, harc_rng_state) : 0;"
+        )
+        .ok();
+        self.pad(depth + 1);
+        writeln!(self.out, "(void)_harc_rt_problem;").ok();
+        self.pad(depth + 1);
+        writeln!(self.out, "(void)_harc_rt_seed;").ok();
         self.pad(depth);
         writeln!(self.out, "}}").ok();
     }
@@ -12305,6 +12361,7 @@ impl Emitter {
                 });
                 if combined.is_empty() && !has_solver_policy_fields {
                     // No constraints anywhere: simple field-by-field PRNG path.
+                    self.emit_runtime_randomize_metadata_touch(target, depth);
                     self.pad(depth);
                     write!(self.out, "randomize_{ty}(&").ok();
                     self.emit_expr(target);
@@ -12312,6 +12369,7 @@ impl Emitter {
                     self.emit_randomize_trace_event(&ty, target, depth);
                 } else {
                     // Constraint-solving path via Z3.
+                    self.emit_runtime_randomize_metadata_touch(target, depth);
                     self.emit_constraint_solver_block(&ty, target, &combined, *blocking, depth);
                 }
             }

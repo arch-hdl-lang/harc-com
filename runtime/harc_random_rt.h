@@ -54,6 +54,16 @@ inline constexpr const HarcRuntimeProblemDescriptor* harc_find_problem(
     return nullptr;
 }
 
+inline HarcRuntimeCallSite* harc_find_call_site(
+    HarcRuntimeCallSite* sites,
+    uint32_t len,
+    harc_problem_id problem_id) {
+    for (uint32_t i = 0; i < len; ++i) {
+        if (sites[i].problem_id == problem_id) return &sites[i];
+    }
+    return nullptr;
+}
+
 inline constexpr uint64_t harc_splitmix64(uint64_t value) {
     value += 0x9E3779B97F4A7C15ull;
     value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ull;
