@@ -33,11 +33,26 @@ struct HarcRuntimeProblemTable {
     uint32_t len = 0;
 };
 
+struct HarcRuntimeCallSite {
+    harc_call_site_id site_id = 0;
+    harc_problem_id problem_id = 0;
+    harc_call_iteration iteration = 0;
+};
+
 enum class HarcSolveMode : uint8_t {
     Inline,
     Queued,
     Blocking,
 };
+
+inline constexpr const HarcRuntimeProblemDescriptor* harc_find_problem(
+    const HarcRuntimeProblemTable& table,
+    harc_problem_id id) {
+    for (uint32_t i = 0; i < table.len; ++i) {
+        if (table.problems[i].id == id) return &table.problems[i];
+    }
+    return nullptr;
+}
 
 inline constexpr uint64_t harc_splitmix64(uint64_t value) {
     value += 0x9E3779B97F4A7C15ull;
@@ -54,6 +69,12 @@ inline constexpr harc_seed harc_seed_from(
     mixed ^= uint64_t{site_id} * 0xD6E8FEB86659FD93ull;
     mixed ^= iteration * 0xA0761D6478BD642Full;
     return harc_splitmix64(mixed);
+}
+
+inline harc_seed harc_call_site_next_seed(
+    HarcRuntimeCallSite& site,
+    harc_seed global_seed) {
+    return harc_seed_from(global_seed, site.site_id, site.iteration++);
 }
 
 inline constexpr HarcSolveStatus harc_solve_status_ok() {
