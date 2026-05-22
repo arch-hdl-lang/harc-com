@@ -4129,7 +4129,11 @@ impl Emitter {
         )
         .ok();
         self.pad(depth + 1);
-        writeln!(self.out, "(void)_harc_rt_status;").ok();
+        writeln!(
+            self.out,
+            "(void)harc_rt::random::harc_handle_solve_status(_harc_rt_status);"
+        )
+        .ok();
         self.pad(depth);
         writeln!(self.out, "}}").ok();
         true
@@ -10847,7 +10851,11 @@ impl Emitter {
         )
         .ok();
         self.pad(depth + 1);
-        writeln!(self.out, "(void)_harc_rt_solve_status;").ok();
+        writeln!(
+            self.out,
+            "(void)harc_rt::random::harc_handle_solve_status(_harc_rt_solve_status);"
+        )
+        .ok();
 
         self.pad(depth);
         writeln!(self.out, "}}").ok();
