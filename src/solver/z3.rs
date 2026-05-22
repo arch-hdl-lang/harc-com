@@ -167,32 +167,29 @@ fn lower_expr(problem: &CTypedProblem, expr: &CTypedExpr) -> Result<String, Solv
         }
         CExprKind::InSet { expr, set } => {
             let expr_s = lower_expr(problem, expr)?;
-            let CExprKind::Set(items) = &set.kind else {
-                return unsupported("set membership", "rhs is not a set literal".to_string());
-            };
-            if items.is_empty() {
-                return Ok("false".to_string());
+            match &set.kind {
+                CExprKind::Set(items) => {
+                    if items.is_empty() {
+                        return Ok("false".to_string());
+                    }
+                    let mut parts = Vec::new();
+                    for item in items {
+                        parts.push(format!("(= {expr_s} {})", lower_expr(problem, item)?));
+                    }
+                    Ok(join_bool("or", parts))
+                }
+                CExprKind::Range { lo, hi } => {
+                    lower_range_membership(problem, expr, &expr_s, lo, hi)
+                }
+                _ => unsupported(
+                    "set membership",
+                    "rhs is not a set/range literal".to_string(),
+                ),
             }
-            let mut parts = Vec::new();
-            for item in items {
-                parts.push(format!("(= {expr_s} {})", lower_expr(problem, item)?));
-            }
-            Ok(join_bool("or", parts))
         }
         CExprKind::InRange { expr, lo, hi } => {
             let expr_s = lower_expr(problem, expr)?;
-            let le = match bv_sign(&expr.ty) {
-                Some(Sign::Signed) => "bvsle",
-                Some(Sign::Unsigned) | None => "bvule",
-            };
-            let mut parts = Vec::new();
-            if let Some(lo) = lo {
-                parts.push(format!("({le} {} {expr_s})", lower_expr(problem, lo)?));
-            }
-            if let Some(hi) = hi {
-                parts.push(format!("({le} {expr_s} {})", lower_expr(problem, hi)?));
-            }
-            Ok(join_bool("and", parts))
+            lower_range_membership(problem, expr, &expr_s, lo, hi)
         }
         CExprKind::Set(_) | CExprKind::Range { .. } => unsupported(
             "standalone aggregate expression",
@@ -229,6 +226,27 @@ fn lower_expr(problem: &CTypedProblem, expr: &CTypedExpr) -> Result<String, Solv
             ))
         }
     }
+}
+
+fn lower_range_membership(
+    problem: &CTypedProblem,
+    expr: &CTypedExpr,
+    expr_s: &str,
+    lo: &Option<Box<CTypedExpr>>,
+    hi: &Option<Box<CTypedExpr>>,
+) -> Result<String, SolverBuildError> {
+    let le = match bv_sign(&expr.ty) {
+        Some(Sign::Signed) => "bvsle",
+        Some(Sign::Unsigned) | None => "bvule",
+    };
+    let mut parts = Vec::new();
+    if let Some(lo) = lo {
+        parts.push(format!("({le} {} {expr_s})", lower_expr(problem, lo)?));
+    }
+    if let Some(hi) = hi {
+        parts.push(format!("({le} {expr_s} {})", lower_expr(problem, hi)?));
+    }
+    Ok(join_bool("and", parts))
 }
 
 fn binary_op_smt(op: CBinaryOp, lhs_ty: &CType) -> Result<&'static str, SolverBuildError> {
@@ -491,6 +509,50 @@ mod tests {
             .smt
             .contains("(assert (bvult f_op (_ bv3 2))) ; enum Op domain"));
         assert!(z3.smt.contains("(= f_op (_ bv1 2))"));
+    }
+
+    #[test]
+    fn set_membership_accepts_range_rhs() {
+        let mut env = FieldEnv::new();
+        env.fields
+            .insert(FieldPath::single("addr"), field_info(CType::uint(8)));
+        let addr = CTypedExpr::new(
+            CExprKind::FieldRef(FieldPath::single("addr")),
+            CType::uint(8),
+            Span::default(),
+        );
+        let lo = CTypedExpr::new(
+            CExprKind::BvLit { value: 4 },
+            CType::uint(8),
+            Span::default(),
+        );
+        let hi = CTypedExpr::new(
+            CExprKind::BvLit { value: 12 },
+            CType::uint(8),
+            Span::default(),
+        );
+        let range = CTypedExpr::new(
+            CExprKind::Range {
+                lo: Some(Box::new(lo)),
+                hi: Some(Box::new(hi)),
+            },
+            CType::Range {
+                elem: Box::new(CType::uint(8)),
+            },
+            Span::default(),
+        );
+        let expr = CTypedExpr::new(
+            CExprKind::InSet {
+                expr: Box::new(addr),
+                set: Box::new(range),
+            },
+            CType::Bool,
+            Span::default(),
+        );
+        let z3 = Z3Backend.build(&base_problem(env, expr)).expect("build");
+        assert!(z3
+            .smt
+            .contains("(and (bvule (_ bv4 8) f_addr) (bvule f_addr (_ bv12 8)))"));
     }
 
     #[test]
