@@ -47,6 +47,48 @@ end test TraceTest
 }
 
 #[test]
+fn waveform_trace_scaffolding_is_always_emitted_and_gated() {
+    // Issue #209: every emitted TB must contain the trace
+    // scaffolding (include + setup + per-cycle dump + teardown),
+    // gated by `HARC_TRACE_VCD` / `HARC_TRACE_FST` so non-trace
+    // builds compile it out. The codegen does NOT depend on a CLI
+    // flag — `harc sim --waves` flips the gate by defining one of
+    // the macros at Verilator compile time.
+    let src = r#"
+test WaveTest
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test WaveTest
+"#;
+    let parsed = parse_source(src).unwrap();
+    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let cpp = cpp_tb::emit(&merged).expect("emit");
+    // Format-selecting header includes.
+    assert!(
+        cpp.contains("#if defined(HARC_TRACE_VCD)") && cpp.contains("\"verilated_vcd_c.h\""),
+        "expected VCD trace header guard; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("#elif defined(HARC_TRACE_FST)") && cpp.contains("\"verilated_fst_c.h\""),
+        "expected FST trace header guard; got:\n{cpp}"
+    );
+    assert!(cpp.contains("using HarcTraceC = VerilatedVcdC;"));
+    assert!(cpp.contains("using HarcTraceC = VerilatedFstC;"));
+    // Setup, dump, teardown emitted inside the run_<TestName>
+    // function — gated by `#if HARC_TRACE_ENABLED` so they vanish
+    // in a non-waves build.
+    assert!(cpp.contains("Verilated::traceEverOn(true);"));
+    assert!(cpp.contains("HarcTraceC* tfp = new HarcTraceC;"));
+    assert!(cpp.contains("dut->trace(tfp, dp ? std::atoi(dp) : 99);"));
+    assert!(cpp.contains("std::getenv(\"HARC_WAVE_FILE\")"));
+    assert!(cpp.contains("tfp->dump(_trace_time++);"));
+    assert!(cpp.contains("tfp->close();"));
+    assert!(cpp.contains("delete tfp;"));
+}
+
+#[test]
 fn discard_binding_and_params_emit_cleanly() {
     let parsed = parse_source(
         r#"function consume(_: uint<8>, _: uint<8>)

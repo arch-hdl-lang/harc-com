@@ -142,6 +142,57 @@ enum Cmd {
         /// events such as logs, failures, and randomization results.
         #[arg(long)]
         record_trace: Option<PathBuf>,
+        /// Enable Verilator VCD/FST waveform dumping. Implies trace
+        /// codegen in the emitted C++ TB and `--trace-vcd` /
+        /// `--trace-fst` on the Verilator command. Default format is
+        /// FST (smaller + faster for large regressions); override
+        /// with `--wave-format vcd`. Wave file lands in `<outdir>`
+        /// unless `--wave-file` is given. When flipping waveforms on
+        /// after a non-waves build (or changing format), pass
+        /// `--rebuild` because Verilator reuses cached objects.
+        #[arg(long)]
+        waves: bool,
+        /// Waveform format. `vcd` is verbose but universally
+        /// readable; `fst` is compact + indexed but requires GTKWave
+        /// (or similar). Default: `fst`.
+        #[arg(long, value_parser = ["vcd", "fst"], default_value = "fst")]
+        wave_format: String,
+        /// Path for the waveform output. Default:
+        /// `<outdir>/<TestName>.<vcd|fst>` (or `<outdir>/waves.<ext>`
+        /// when no test is selected).
+        #[arg(long)]
+        wave_file: Option<PathBuf>,
+        /// Trace hierarchy depth passed to `dut->trace(tfp, N)`.
+        /// Default 99 (deep enough for any realistic DUT).
+        #[arg(long, default_value_t = 99)]
+        trace_depth: i32,
+        /// Disable expansion of packed structs in the waveform
+        /// (Verilator `--trace-structs`). Defaults to off — i.e.
+        /// when `--waves` is set, struct expansion is on by default
+        /// because flat aggregate vectors hide field-level debug.
+        /// Pass `--no-trace-structs` to fall back to vectors.
+        #[arg(long = "no-trace-structs", action = clap::ArgAction::SetTrue)]
+        no_trace_structs: bool,
+        /// Maximum traced signal width in bits (Verilator
+        /// `--trace-max-width`). Defaults to 8192 when `--waves` is
+        /// set so wide packed structs like CSR mirrors stay visible.
+        #[arg(long, default_value_t = 8192)]
+        trace_max_width: u32,
+        /// Maximum traced array size (Verilator `--trace-max-array`).
+        /// Only forwarded when set explicitly.
+        #[arg(long)]
+        trace_max_array: Option<u32>,
+        /// Additional Verilator build flag. Repeatable. Appended to
+        /// the Verilator command after HARC's defaults but before
+        /// SV inputs. Example:
+        /// `--verilator-arg --public-flat-rw --verilator-arg -Wno-UNUSEDSIGNAL`.
+        #[arg(long = "verilator-arg")]
+        verilator_args: Vec<String>,
+        /// Additional argument for the generated simulation binary
+        /// (e.g. `+plusarg=value`). Repeatable. Forwarded verbatim
+        /// after the `--test` selector.
+        #[arg(long = "sim-arg")]
+        sim_args: Vec<String>,
     },
     // ── Learning store (sister to `arch advise` and friends, port of
     // arch-com/src/learn.rs). Every `harc check` / `harc sim` records
@@ -236,6 +287,15 @@ fn main() -> Result<()> {
             z3_lib_dir,
             rebuild,
             record_trace,
+            waves,
+            wave_format,
+            wave_file,
+            trace_depth,
+            no_trace_structs,
+            trace_max_width,
+            trace_max_array,
+            verilator_args,
+            sim_args,
         } => {
             let captured = files.clone();
             learn_wrap(&captured, || {
@@ -260,6 +320,17 @@ fn main() -> Result<()> {
                     },
                     rebuild,
                     record_trace.clone(),
+                    WaveOpts {
+                        waves,
+                        format: wave_format.clone(),
+                        file: wave_file.clone(),
+                        trace_depth,
+                        trace_structs: !no_trace_structs,
+                        trace_max_width,
+                        trace_max_array,
+                        verilator_args: verilator_args.clone(),
+                        sim_args: sim_args.clone(),
+                    },
                 )
             })
         }
@@ -305,6 +376,23 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Waveform / Verilator pass-through options carried through `cmd_sim`
+/// into `run_verilator`. See `Cmd::Sim` argument docs for the per-field
+/// semantics. The struct exists so the long `cmd_sim` signature doesn't
+/// grow another nine parameters.
+#[derive(Debug, Default, Clone)]
+struct WaveOpts {
+    waves: bool,
+    format: String,
+    file: Option<PathBuf>,
+    trace_depth: i32,
+    trace_structs: bool,
+    trace_max_width: u32,
+    trace_max_array: Option<u32>,
+    verilator_args: Vec<String>,
+    sim_args: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -858,6 +946,7 @@ fn run_verilator(
     test: Option<&str>,
     rebuild: bool,
     record_trace: Option<&PathBuf>,
+    waves: &WaveOpts,
 ) -> Result<()> {
     let mdir = outdir_abs.join("obj_dir");
     // Build-reuse path (Phase 1c). When `--rebuild` is unset and the
@@ -922,6 +1011,45 @@ fn run_verilator(
         // post-processes the .dat into per-instance metrics that
         // the CVDP-style scorer reads.
         args.push("--coverage".into());
+    }
+    // Waveform support (issue #209). When `--waves` is set we ask
+    // Verilator to compile in trace support for the requested format
+    // and we activate the trace codegen in the emitted TB via a
+    // -D macro. The emitted .cpp itself stays byte-identical across
+    // trace/no-trace builds (the scaffolding is always there, gated
+    // by `#if defined(HARC_TRACE_*)`), so the rebuild-skip heuristic
+    // in cmd_sim still works for the no-trace → no-trace case. When
+    // *flipping* trace on/off, users should pass `--rebuild` because
+    // Verilator's cached object files were compiled without the
+    // trace defines and would silently link against the new .cpp.
+    if waves.waves {
+        let trace_flag = match waves.format.as_str() {
+            "vcd" => "--trace-vcd",
+            // Default plus the explicit `fst` selector.
+            _ => "--trace-fst",
+        };
+        args.push(trace_flag.into());
+        if waves.trace_structs {
+            args.push("--trace-structs".into());
+        }
+        args.push("--trace-max-width".into());
+        args.push(waves.trace_max_width.to_string());
+        if let Some(max_array) = waves.trace_max_array {
+            args.push("--trace-max-array".into());
+            args.push(max_array.to_string());
+        }
+        let define_macro = match waves.format.as_str() {
+            "vcd" => "-DHARC_TRACE_VCD",
+            _ => "-DHARC_TRACE_FST",
+        };
+        args.push("-CFLAGS".into());
+        args.push(define_macro.into());
+    }
+    // User-supplied Verilator flags (`--verilator-arg`). Appended
+    // after HARC defaults but before SV inputs so the user can
+    // override warnings, add `--public-flat-rw`, etc.
+    for extra in &waves.verilator_args {
+        args.push(extra.clone());
     }
     args.extend([
         // Force C++20 by overriding verilator's default
@@ -1049,6 +1177,37 @@ fn run_verilator(
     if let Some(t) = test {
         cmd.args(&["--test", t]);
     }
+    // Waveform runtime config. `HARC_WAVE_FILE` overrides the
+    // emitted default (`<HARC_LOG_DIR>/waves.<ext>`); the emitted
+    // TB picks the format from the `HARC_TRACE_*` compile-time
+    // macro, so we only need to forward the path + depth.
+    if waves.waves {
+        let ext = if waves.format == "vcd" { "vcd" } else { "fst" };
+        let wave_path = match &waves.file {
+            Some(p) => {
+                if p.is_absolute() {
+                    p.clone()
+                } else {
+                    std::env::current_dir().into_diagnostic()?.join(p)
+                }
+            }
+            None => {
+                let stem = test.unwrap_or("waves");
+                outdir_abs.join(format!("{stem}.{ext}"))
+            }
+        };
+        if let Some(parent) = wave_path.parent() {
+            fs::create_dir_all(parent).into_diagnostic()?;
+        }
+        cmd.env("HARC_WAVE_FILE", &wave_path);
+        cmd.env("HARC_TRACE_DEPTH", waves.trace_depth.to_string());
+        eprintln!("waveform output: {}", wave_path.display());
+    }
+    // `--sim-arg` pass-through. Forwarded verbatim after `--test`
+    // so plusargs land in argv unmodified.
+    for extra in &waves.sim_args {
+        cmd.arg(extra);
+    }
     if let Some(lib) = &z3_paths.lib_dir {
         prepend_env_path(&mut cmd, "LD_LIBRARY_PATH", lib)?;
         prepend_env_path(&mut cmd, "DYLD_LIBRARY_PATH", lib)?;
@@ -1079,6 +1238,7 @@ fn cmd_sim(
     z3_opts: Z3PathOpts,
     rebuild: bool,
     record_trace: Option<PathBuf>,
+    waves: WaveOpts,
 ) -> Result<()> {
     if dut.is_empty() && sv.is_empty() {
         return Err(miette::miette!(
@@ -1213,6 +1373,7 @@ fn cmd_sim(
             test.as_deref(),
             rebuild,
             trace_abs.as_ref(),
+            &waves,
         );
     }
 
