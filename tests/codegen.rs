@@ -2364,10 +2364,17 @@ end test SeededSolverTest"#,
     assert!(
         cpp.contains("z3::params _p(_ctx);")
             && cpp.contains(
-                "_p.set(\"random_seed\", static_cast<unsigned>(harc_rng_next() & 0x7fffffffU));"
+                "harc_rt::random::harc_call_site_next_seed(*_harc_rt_site, harc_rng_state)"
             )
+            && cpp.contains("_p.set(\"random_seed\", static_cast<unsigned>(_harc_rt_seed & 0x7fffffffU));")
             && cpp.contains("_s.set(_p);"),
-        "Z3 solver-backed randomize should consume the HARC RNG seed; got:\n{cpp}"
+        "Z3 solver-backed randomize should consume the runtime-derived HARC seed; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains(
+            "_p.set(\"random_seed\", static_cast<unsigned>(harc_rng_next() & 0x7fffffffU));"
+        ),
+        "solver seed should not bypass runtime call-site seeding; got:\n{cpp}"
     );
     assert!(
         cpp.contains("uint64_t _pref_")

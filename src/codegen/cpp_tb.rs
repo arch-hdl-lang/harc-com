@@ -3998,38 +3998,6 @@ impl Emitter {
         writeln!(self.out, "}}").ok();
     }
 
-    fn emit_runtime_randomize_metadata_touch(&mut self, target: &Expr, depth: usize) {
-        let Some(problem_id) = self.runtime_randomize_problem_id(target) else {
-            return;
-        };
-        self.pad(depth);
-        writeln!(self.out, "{{   // runtime randomize metadata touch").ok();
-        self.pad(depth + 1);
-        writeln!(
-            self.out,
-            "auto* _harc_rt_problem = harc_rt::random::harc_find_problem(_harc_runtime_random_problem_table, {problem_id});"
-        )
-        .ok();
-        self.pad(depth + 1);
-        writeln!(
-            self.out,
-            "auto* _harc_rt_site = harc_rt::random::harc_find_call_site(_harc_runtime_random_problem_table_call_sites, _harc_runtime_random_problem_table_call_site_count, {problem_id});"
-        )
-        .ok();
-        self.pad(depth + 1);
-        writeln!(
-            self.out,
-            "auto _harc_rt_seed = _harc_rt_site ? harc_rt::random::harc_call_site_next_seed(*_harc_rt_site, harc_rng_state) : 0;"
-        )
-        .ok();
-        self.pad(depth + 1);
-        writeln!(self.out, "(void)_harc_rt_problem;").ok();
-        self.pad(depth + 1);
-        writeln!(self.out, "(void)_harc_rt_seed;").ok();
-        self.pad(depth);
-        writeln!(self.out, "}}").ok();
-    }
-
     fn runtime_randomize_problem_id(&self, target: &Expr) -> Option<u32> {
         self.runtime_randomize_problem_ids
             .get(&(target.span.start, target.span.end))
@@ -9183,8 +9151,8 @@ impl Emitter {
     /// Emit an inline Z3 solver block for `randomize(t) with { ... }`.
     /// Each call builds a fresh Z3 context, declares one bitvector variable
     /// per field at its declared width, translates the constraint
-    /// expressions, sets `random_seed` from the PRNG so `--seed` flows
-    /// through, then assigns the satisfying model back into `t`. UNSAT
+    /// expressions, sets `random_seed` from the runtime call-site seed so
+    /// `--seed` flows through, then assigns the satisfying model back into `t`. UNSAT
     /// raises a FAIL log line and increments errors.
     fn emit_constraint_solver_block(
         &mut self,
@@ -9343,6 +9311,32 @@ impl Emitter {
         )
         .ok();
 
+        if let Some(problem_id) = self.runtime_randomize_problem_id(target) {
+            self.pad(depth + 1);
+            writeln!(
+                self.out,
+                "auto* _harc_rt_problem = harc_rt::random::harc_find_problem(_harc_runtime_random_problem_table, {problem_id});"
+            )
+            .ok();
+            self.pad(depth + 1);
+            writeln!(
+                self.out,
+                "auto* _harc_rt_site = harc_rt::random::harc_find_call_site(_harc_runtime_random_problem_table_call_sites, _harc_runtime_random_problem_table_call_site_count, {problem_id});"
+            )
+            .ok();
+            self.pad(depth + 1);
+            writeln!(
+                self.out,
+                "auto _harc_rt_seed = _harc_rt_site ? harc_rt::random::harc_call_site_next_seed(*_harc_rt_site, harc_rng_state) : harc_rng_next();"
+            )
+            .ok();
+            self.pad(depth + 1);
+            writeln!(self.out, "(void)_harc_rt_problem;").ok();
+        } else {
+            self.pad(depth + 1);
+            writeln!(self.out, "auto _harc_rt_seed = harc_rng_next();").ok();
+        }
+
         // Context + solver. We use `z3::solver` (not `optimize`) so UNSAT
         // is reported faithfully — `optimize` can return a "best partial"
         // model when soft+hard constraints conflict, hiding real UNSAT.
@@ -9358,7 +9352,7 @@ impl Emitter {
         self.pad(depth + 1);
         writeln!(
             self.out,
-            "_p.set(\"random_seed\", static_cast<unsigned>(harc_rng_next() & 0x7fffffffU));"
+            "_p.set(\"random_seed\", static_cast<unsigned>(_harc_rt_seed & 0x7fffffffU));"
         )
         .ok();
         self.pad(depth + 1);
@@ -12429,7 +12423,6 @@ impl Emitter {
                     self.emit_randomize_trace_event(&ty, target, depth);
                 } else {
                     // Constraint-solving path via Z3.
-                    self.emit_runtime_randomize_metadata_touch(target, depth);
                     self.emit_constraint_solver_block(&ty, target, &combined, *blocking, depth);
                 }
             }
