@@ -74,10 +74,16 @@ end test RuntimeProblemTableTest
     );
     assert!(cpp.contains("HarcRuntimeProblemTable _harc_runtime_random_problem_table"));
     assert!(cpp.contains("HarcRuntimeCallSite _harc_runtime_random_problem_table_call_sites[]"));
+    assert!(cpp.contains("_harc_runtime_random_problem_table_call_site_count = 2"));
     assert!(cpp.contains("{1, \"randomize(Req)\""));
     assert!(cpp.contains("{2, \"randomize(Req) with\""));
     assert!(cpp.contains("{1, 1, 0}"));
     assert!(cpp.contains("{2, 2, 0}"));
+    assert!(cpp.contains("harc_find_problem(_harc_runtime_random_problem_table, 2)"));
+    assert!(cpp.contains(
+        "harc_find_call_site(_harc_runtime_random_problem_table_call_sites, _harc_runtime_random_problem_table_call_site_count, 2)"
+    ));
+    assert!(cpp.contains("harc_call_site_next_seed(*_harc_rt_site, harc_rng_state)"));
     assert!(
         cpp.contains("z3::context _ctx;"),
         "Phase 5B must not switch behavior away from inline Z3 yet; got:\n{cpp}"
