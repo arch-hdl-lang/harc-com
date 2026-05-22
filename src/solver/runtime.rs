@@ -106,6 +106,17 @@ impl RuntimeProblemTable {
         out.push_str("_entries, ");
         out.push_str(&self.problems.len().to_string());
         out.push_str("};\n");
+        out.push_str("static harc_rt::random::HarcRuntimeCallSite ");
+        out.push_str(symbol);
+        out.push_str("_call_sites[] = {\n");
+        for problem in &self.problems {
+            out.push_str("    {");
+            out.push_str(&problem.id.to_string());
+            out.push_str(", ");
+            out.push_str(&problem.id.to_string());
+            out.push_str(", 0},\n");
+        }
+        out.push_str("};\n");
         out.push_str("} // namespace\n\n");
         out
     }
@@ -312,8 +323,11 @@ end test Smoke
 
         assert!(cpp.contains("HarcRuntimeProblemDescriptor _harc_runtime_problem_table_entries[]"));
         assert!(cpp.contains("HarcRuntimeProblemTable _harc_runtime_problem_table"));
+        assert!(cpp.contains("HarcRuntimeCallSite _harc_runtime_problem_table_call_sites[]"));
         assert!(cpp.contains("{1, \"randomize(Packet)\""));
         assert!(cpp.contains("{2, \"randomize(Packet) with\""));
+        assert!(cpp.contains("{1, 1, 0}"));
+        assert!(cpp.contains("{2, 2, 0}"));
         assert!(cpp.contains("problem 1 randomize(Packet)\\n"));
     }
 
@@ -349,6 +363,59 @@ end test Smoke
         assert!(
             status.success(),
             "`{cxx}` failed to compile harc_random_rt.cpp"
+        );
+    }
+
+    #[test]
+    fn random_runtime_lookup_and_callsite_helpers_compile() {
+        let cxx = std::env::var("HARC_CXX").unwrap_or_else(|_| "c++".to_string());
+        let tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("tmp");
+        std::fs::create_dir_all(&tmp).expect("create target/tmp");
+        let src = tmp.join("harc_random_rt_lookup_test.cpp");
+        let out = tmp.join("harc_random_rt_lookup_test.o");
+        std::fs::write(
+            &src,
+            r#"#include "harc_random_rt.h"
+
+using namespace harc_rt::random;
+
+static constexpr HarcRuntimeProblemDescriptor problems[] = {
+    {1, "randomize(Packet)", "problem 1"},
+    {2, "randomize(Packet) with", "problem 2"},
+};
+static constexpr HarcRuntimeProblemTable table = {problems, 2};
+static_assert(harc_find_problem(table, 1)->id == 1);
+static_assert(harc_find_problem(table, 3) == nullptr);
+
+int main() {
+    HarcRuntimeCallSite site{7, 2, 0};
+    harc_seed a = harc_call_site_next_seed(site, 11);
+    harc_seed b = harc_call_site_next_seed(site, 11);
+    return (site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
+}
+"#,
+        )
+        .expect("write lookup test");
+
+        let status = match Command::new(&cxx)
+            .args(["-std=c++20", "-Iruntime", "-c"])
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .status()
+        {
+            Ok(status) => status,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping C++ runtime lookup compile check: `{cxx}` not found");
+                return;
+            }
+            Err(err) => panic!("failed to launch `{cxx}`: {err}"),
+        };
+        assert!(
+            status.success(),
+            "`{cxx}` failed to compile runtime lookup/callsite helper test"
         );
     }
 }
