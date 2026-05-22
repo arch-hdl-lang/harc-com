@@ -44,6 +44,12 @@ struct HarcRuntimeCallSite {
     harc_call_iteration iteration = 0;
 };
 
+struct HarcRandomizeCall {
+    const HarcRuntimeProblemDescriptor* problem = nullptr;
+    harc_problem_id problem_id = 0;
+    harc_seed seed = 0;
+};
+
 struct HarcDistBin {
     int64_t lo = 0;
     int64_t hi = 0;
@@ -106,6 +112,23 @@ inline harc_seed harc_call_site_next_seed(
     HarcRuntimeCallSite& site,
     harc_seed global_seed) {
     return harc_seed_from(global_seed, site.site_id, site.iteration++);
+}
+
+inline HarcRandomizeCall harc_prepare_randomize_call(
+    const HarcRuntimeProblemTable& table,
+    HarcRuntimeCallSite* sites,
+    uint32_t site_count,
+    harc_problem_id problem_id,
+    harc_seed global_seed,
+    harc_seed fallback_seed) {
+    const HarcRuntimeProblemDescriptor* problem = harc_find_problem(table, problem_id);
+    HarcRuntimeCallSite* site = harc_find_call_site(sites, site_count, problem_id);
+    harc_seed seed = site ? harc_call_site_next_seed(*site, global_seed) : fallback_seed;
+    return HarcRandomizeCall{
+        problem,
+        problem ? problem->id : problem_id,
+        seed,
+    };
 }
 
 inline constexpr uint64_t harc_preference_draw(
