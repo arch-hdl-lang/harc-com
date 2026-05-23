@@ -47,6 +47,7 @@ use std::fmt::Write;
 /// without a separate file dependency.
 pub const THREAD_RT_HEADER: &str = include_str!("../../runtime/harc_thread_rt.h");
 pub const RANDOM_RT_HEADER: &str = include_str!("../../runtime/harc_random_rt.h");
+pub const QUEUE_RT_HEADER: &str = include_str!("../../runtime/harc_queue_rt.h");
 pub const TRACE_RT_HEADER: &str = include_str!("../../runtime/harc_trace_rt.h");
 pub const Z3_RT_HEADER: &str = include_str!("../../runtime/harc_z3_rt.h");
 
@@ -608,6 +609,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // bus) lands in Phase 2 on top of the same runtime.
     writeln!(e.out, "#include \"harc_thread_rt.h\"").ok();
     writeln!(e.out, "#include \"harc_random_rt.h\"").ok();
+    writeln!(e.out, "#include \"harc_queue_rt.h\"").ok();
     writeln!(e.out, "#include \"harc_trace_rt.h\"").ok();
     let uses_solver = uses_constraint_solver(file);
     if uses_solver {
@@ -636,29 +638,6 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     .ok();
     writeln!(e.out, "}}").ok();
     writeln!(e.out, "").ok();
-
-    // Tiny FIFO wrapper for `queue<T>` scoreboard fields. Provides pop()
-    // returning the front element (std::queue separates front/pop), and
-    // empty()/size(). Emitted only when scoreboards exist.
-    let any_scoreboard = file
-        .items
-        .iter()
-        .any(|it| matches!(it, Item::Scoreboard(_)));
-    if any_scoreboard {
-        writeln!(e.out, "#include <deque>").ok();
-        writeln!(e.out, "template<typename T> struct HarcQueue {{").ok();
-        writeln!(e.out, "{INDENT}std::deque<T> _d;").ok();
-        writeln!(e.out, "{INDENT}void push(T v) {{ _d.push_back(v); }}").ok();
-        writeln!(
-            e.out,
-            "{INDENT}T pop() {{ T v = _d.front(); _d.pop_front(); return v; }}"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}bool empty() const {{ return _d.empty(); }}").ok();
-        writeln!(e.out, "{INDENT}size_t size() const {{ return _d.size(); }}").ok();
-        writeln!(e.out, "}};").ok();
-        writeln!(e.out, "").ok();
-    }
 
     // ── Shared HVL value records ────────────────────────────────────────
     // Structs and transactions share the C++ record/equality/randomize
@@ -7805,7 +7784,7 @@ impl Emitter {
     /// which recognizes:
     ///
     /// - `event<T>` → `std::vector<std::function<void(T)>>`
-    /// - `queue<T>` → `HarcQueue<T>` (when scoreboards are also present)
+    /// - `queue<T>` → `harc_rt::HarcQueue<T>` (when scoreboards are also present)
     /// - Named DUT module → `V<Name>*` pointer (the same shape the
     ///   test-level `let dut : T` already uses)
     /// - Named sub-component → that struct directly (for `env` composing
@@ -7881,7 +7860,7 @@ impl Emitter {
                 ..
             } => {
                 let inner = self.payload_type_for_arg(args.first());
-                format!("HarcQueue<{inner}>")
+                format!("harc_rt::HarcQueue<{inner}>")
             }
             TypeExpr::Named { name, .. } => {
                 let last = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
@@ -14134,8 +14113,7 @@ pub fn uses_constraint_solver(file: &SourceFile) -> bool {
 }
 
 /// Pick a C++ representation for a scoreboard field. Mostly the same as
-/// `txn_field_c_type` but supports `queue<T>` → `HarcQueue<T>` (the small
-/// runtime template emitted at file scope when scoreboards are present).
+/// `txn_field_c_type` but supports `queue<T>` → `harc_rt::HarcQueue<T>`.
 fn scoreboard_field_c_type(t: &TypeExpr) -> String {
     if let TypeExpr::Builtin {
         name: BuiltinTy::Queue,
@@ -14150,7 +14128,7 @@ fn scoreboard_field_c_type(t: &TypeExpr) -> String {
                 _ => "uint64_t".into(),
             })
             .unwrap_or_else(|| "uint64_t".into());
-        return format!("HarcQueue<{inner}>");
+        return format!("harc_rt::HarcQueue<{inner}>");
     }
     txn_field_c_type(t)
 }
@@ -14568,7 +14546,7 @@ fn c_type_for(t: &TypeExpr) -> String {
                         _ => "uint64_t".into(),
                     })
                     .unwrap_or_else(|| "uint64_t".into());
-                format!("HarcQueue<{inner}>&")
+                format!("harc_rt::HarcQueue<{inner}>&")
             }
             // Aggregates / verification-only types fall back to the spelling
             // — caller will get a compile error pointing at the gap.

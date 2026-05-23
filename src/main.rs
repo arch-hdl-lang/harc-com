@@ -1325,6 +1325,11 @@ fn cmd_sim(
         &random_rt_header_path,
         harc::codegen::cpp_tb::RANDOM_RT_HEADER.as_bytes(),
     )?;
+    let queue_rt_header_path = outdir.join("harc_queue_rt.h");
+    write_if_changed(
+        &queue_rt_header_path,
+        harc::codegen::cpp_tb::QUEUE_RT_HEADER.as_bytes(),
+    )?;
     let trace_rt_header_path = outdir.join("harc_trace_rt.h");
     write_if_changed(
         &trace_rt_header_path,
