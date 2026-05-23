@@ -134,6 +134,14 @@ inline constexpr uint64_t harc_splitmix64(uint64_t value) {
     return value ^ (value >> 31);
 }
 
+inline uint64_t harc_rng_next_state(uint64_t& state) {
+    state += 0x9E3779B97F4A7C15ull;
+    uint64_t z = state;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
 inline constexpr harc_seed harc_seed_from(
     harc_seed global_seed,
     harc_call_site_id site_id,
