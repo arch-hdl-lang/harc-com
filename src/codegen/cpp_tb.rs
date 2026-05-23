@@ -628,7 +628,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     }
 
     // ── PRNG runtime ──────────────────────────────────────────────────────
-    // SplitMix64 — small, fast, pure stdlib. Seed loaded from HARC_SEED.
+    // Seed loaded from HARC_SEED through the random runtime helper.
     writeln!(e.out, "static uint64_t harc_rng_state = 0;").ok();
     writeln!(e.out, "static inline uint64_t harc_rng_next() {{").ok();
     writeln!(
@@ -1098,7 +1098,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "").ok();
         // Seed PRNG from HARC_SEED env (or 1 if unset). Logged after sim_log_line
         // is defined so it lands in sim.log along with normal test output.
-        writeln!(e.out, "{INDENT}{{ const char* s = std::getenv(\"HARC_SEED\"); harc_rng_state = s ? std::strtoull(s, nullptr, 0) : 1ULL; }}").ok();
+        writeln!(e.out, "{INDENT}harc_rt::random::harc_rng_seed_from_env(harc_rng_state);").ok();
         writeln!(e.out, "{INDENT}harc_rt::trace::HarcTraceWriter trace;").ok();
         writeln!(e.out, "{INDENT}trace.open_env();").ok();
         writeln!(e.out, "{INDENT}trace.meta(harc_rng_state, std::getenv(\"HARC_DUT_BACKEND\"), \"{dut_type}\", \"{}\");", test.name.name).ok();
