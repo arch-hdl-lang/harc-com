@@ -1309,10 +1309,10 @@ fn cmd_sim(
         eprintln!("reused {} (unchanged)", cpp_path.display());
     }
 
-    // Drop the coroutine runtime header alongside the emitted .cpp so
+    // Drop bundled runtime headers alongside the emitted .cpp so
     // verilator's standard `--Mdir`-relative include search picks it up
     // without needing an extra `-I` flag. The .cpp file `#include`s
-    // it as `"harc_thread_rt.h"`. Bundled as a baked-in string via
+    // them by basename. Bundled as baked-in strings via
     // `include_str!` so a binary install of `harc` ships the runtime
     // without a separate file dependency.
     let rt_header_path = outdir.join("harc_thread_rt.h");
@@ -1324,6 +1324,16 @@ fn cmd_sim(
     write_if_changed(
         &random_rt_header_path,
         harc::codegen::cpp_tb::RANDOM_RT_HEADER.as_bytes(),
+    )?;
+    let trace_rt_header_path = outdir.join("harc_trace_rt.h");
+    write_if_changed(
+        &trace_rt_header_path,
+        harc::codegen::cpp_tb::TRACE_RT_HEADER.as_bytes(),
+    )?;
+    let z3_rt_header_path = outdir.join("harc_z3_rt.h");
+    write_if_changed(
+        &z3_rt_header_path,
+        harc::codegen::cpp_tb::Z3_RT_HEADER.as_bytes(),
     )?;
 
     // `--emit-only` must still emit every generated source artifact a
