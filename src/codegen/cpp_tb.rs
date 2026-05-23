@@ -49,6 +49,7 @@ pub const THREAD_RT_HEADER: &str = include_str!("../../runtime/harc_thread_rt.h"
 pub const RANDOM_RT_HEADER: &str = include_str!("../../runtime/harc_random_rt.h");
 pub const QUEUE_RT_HEADER: &str = include_str!("../../runtime/harc_queue_rt.h");
 pub const TRACE_RT_HEADER: &str = include_str!("../../runtime/harc_trace_rt.h");
+pub const LOG_RT_HEADER: &str = include_str!("../../runtime/harc_log_rt.h");
 pub const Z3_RT_HEADER: &str = include_str!("../../runtime/harc_z3_rt.h");
 
 const INDENT: &str = "    ";
@@ -592,7 +593,6 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     writeln!(e.out, "#include <cstdarg>").ok();
     writeln!(e.out, "#include <cstring>").ok();
     writeln!(e.out, "#include <string>").ok();
-    writeln!(e.out, "#include <unordered_map>").ok();
     writeln!(e.out, "#include <vector>").ok();
     writeln!(e.out, "#include <deque>").ok();
     writeln!(e.out, "#include <functional>").ok();
@@ -611,6 +611,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     writeln!(e.out, "#include \"harc_random_rt.h\"").ok();
     writeln!(e.out, "#include \"harc_queue_rt.h\"").ok();
     writeln!(e.out, "#include \"harc_trace_rt.h\"").ok();
+    writeln!(e.out, "#include \"harc_log_rt.h\"").ok();
     let uses_solver = uses_constraint_solver(file);
     if uses_solver {
         writeln!(
@@ -1319,61 +1320,17 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             writeln!(e.out, "").ok();
         }
         // Variadic so log()/assert/fail callers can pass printf-style args
-        // produced by `${expr}` string-interpolation lowering. Format string
-        // and varargs are evaluated twice (once per sink) — no shared state.
+        // produced by `${expr}` string-interpolation lowering. The generated
+        // lambdas keep the varargs ABI; runtime helpers own the sinks.
         // Per-file log handles, opened on first reference, closed at exit.
-        // Relative paths are anchored to HARC_LOG_DIR (set by `harc sim` to the
-        // outdir) so per-component files land next to sim.log.
-        writeln!(
-            e.out,
-            "{INDENT}std::unordered_map<std::string, FILE*> log_files;"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}auto resolve_log_path = [&](const char* path) -> std::string {{"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}if (path[0] == '/') return std::string(path);"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}const char* base = std::getenv(\"HARC_LOG_DIR\");"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}if (base) return std::string(base) + \"/\" + path;"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}{INDENT}return std::string(path);").ok();
-        writeln!(e.out, "{INDENT}}};").ok();
+        // Relative paths are anchored to HARC_LOG_DIR by the runtime helper.
+        writeln!(e.out, "{INDENT}harc_rt::log::HarcLogFiles log_files;").ok();
         writeln!(
             e.out,
             "{INDENT}auto get_log_file = [&](const char* path) -> FILE* {{"
         )
         .ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}std::string resolved = resolve_log_path(path);"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}{INDENT}auto it = log_files.find(resolved);").ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}if (it != log_files.end()) return it->second;"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}FILE* f = std::fopen(resolved.c_str(), \"w\");"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}{INDENT}log_files[resolved] = f;").ok();
-        writeln!(e.out, "{INDENT}{INDENT}return f;").ok();
+        writeln!(e.out, "{INDENT}{INDENT}return log_files.get(path);").ok();
         writeln!(e.out, "{INDENT}}};").ok();
         writeln!(e.out, "").ok();
         writeln!(
@@ -1382,31 +1339,13 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         )
         .ok();
         writeln!(e.out, "{INDENT}{INDENT}va_list ap;").ok();
+        writeln!(e.out, "{INDENT}{INDENT}va_start(ap, fmt);").ok();
         writeln!(
             e.out,
-            "{INDENT}{INDENT}std::printf(\"[cycle:%d %s] \", cycle_count, sev);"
+            "{INDENT}{INDENT}harc_rt::log::harc_log_file_only_vline(f, cycle_count, sev, fmt, ap);"
         )
         .ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}va_start(ap, fmt); std::vprintf(fmt, ap); va_end(ap);"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}{INDENT}std::printf(\"\\n\");").ok();
-        writeln!(e.out, "{INDENT}{INDENT}if (f) {{").ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}{INDENT}std::fprintf(f, \"[cycle:%d %s] \", cycle_count, sev);"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}{INDENT}va_start(ap, fmt); std::vfprintf(f, fmt, ap); va_end(ap);"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}{INDENT}{INDENT}std::fprintf(f, \"\\n\");").ok();
-        writeln!(e.out, "{INDENT}{INDENT}{INDENT}std::fflush(f);").ok();
-        writeln!(e.out, "{INDENT}{INDENT}}}").ok();
+        writeln!(e.out, "{INDENT}{INDENT}va_end(ap);").ok();
         writeln!(e.out, "{INDENT}}};").ok();
         writeln!(e.out, "").ok();
         // After sim_log_line below is defined, emit the seed line so it lands
@@ -1419,36 +1358,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         )
         .ok();
         writeln!(e.out, "{INDENT}{INDENT}va_list ap;").ok();
-        writeln!(e.out, "{INDENT}{INDENT}char _trace_msg[4096];").ok();
-        writeln!(e.out, "{INDENT}{INDENT}va_start(ap, fmt); std::vsnprintf(_trace_msg, sizeof(_trace_msg), fmt, ap); va_end(ap);").ok();
+        writeln!(e.out, "{INDENT}{INDENT}char _log_msg[4096];").ok();
+        writeln!(e.out, "{INDENT}{INDENT}va_start(ap, fmt); std::vsnprintf(_log_msg, sizeof(_log_msg), fmt, ap); va_end(ap);").ok();
         writeln!(
             e.out,
-            "{INDENT}{INDENT}std::printf(\"[cycle:%d %s] \", cycle_count, sev);"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}{INDENT}std::printf(\"%s\", _trace_msg);").ok();
-        writeln!(e.out, "{INDENT}{INDENT}std::printf(\"\\n\");").ok();
-        writeln!(e.out, "{INDENT}{INDENT}if (sim_log) {{").ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}{INDENT}std::fprintf(sim_log, \"[cycle:%d %s] \", cycle_count, sev);"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}{INDENT}std::fprintf(sim_log, \"%s\", _trace_msg);"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}{INDENT}std::fprintf(sim_log, \"\\n\");"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}{INDENT}{INDENT}std::fflush(sim_log);").ok();
-        writeln!(e.out, "{INDENT}{INDENT}}}").ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}trace.log(cycle_count, sev, _trace_msg);"
+            "{INDENT}{INDENT}harc_rt::log::harc_log_line(sim_log, &trace, cycle_count, sev, _log_msg);"
         )
         .ok();
         writeln!(e.out, "{INDENT}}};").ok();
@@ -2072,7 +1986,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "{INDENT}if (sim_log) std::fclose(sim_log);").ok();
         writeln!(
             e.out,
-            "{INDENT}for (auto& kv : log_files) {{ if (kv.second) std::fclose(kv.second); }}"
+            "{INDENT}log_files.close_all();"
         )
         .ok();
         writeln!(e.out, "{INDENT}trace.raw(\"sim_end\", cycle_count, \"\\\"errors\\\":\" + std::to_string(errors));").ok();
