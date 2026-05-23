@@ -2002,6 +2002,69 @@ end impl ActivePostEvalProviderCallTest"#,
 }
 
 #[test]
+fn handler_component_field_types_do_not_overwrite_outer_let_types() {
+    let parsed = parse_source(
+        r#"struct ReadResponse
+    matched : uint<1>
+    data : uint<32>
+end struct ReadResponse
+
+transactor ProtocolModel
+    function predict_read(addr: uint<8>) -> ReadResponse
+        let r : ReadResponse
+        r.matched = 1
+        r.data = addr + 256
+        return r
+    end predict_read
+end transactor ProtocolModel
+
+transactor OuterModel
+    function check_read(addr: uint<8>) -> ReadResponse
+        let r : ReadResponse
+        r.matched = 1
+        r.data = addr + 512
+        return r
+    end check_read
+end transactor OuterModel
+
+transactor BusResponder
+    dut : ProviderDut
+    model : ProtocolModel
+
+    when active
+        on 1 cycles phase post_eval
+            if dut.req_valid != 0
+                let r : ReadResponse = model.predict_read(dut.req_addr)
+                dut.rsp_data = r.data
+            end if
+        end on
+    end when
+end transactor BusResponder
+
+test HandlerFieldTypeRestoreTest
+    let dut : ProviderDut
+    let model : OuterModel active
+    let responder : BusResponder active
+    run
+        responder.dut = dut
+        let r : ReadResponse = model.check_read(1)
+        wait 1 cycle
+    end run
+end test HandlerFieldTypeRestoreTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("OuterModel_check_read(model, 1)"),
+        "handler field type bindings must restore same-named outer lets; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("model.check_read"),
+        "outer let call must not fall through after handler type scope; got:\n{cpp}"
+    );
+}
+
+#[test]
 fn main_loop_runs_post_eval_services_before_coroutine_tick() {
     let parsed = parse_source(
         r#"test T

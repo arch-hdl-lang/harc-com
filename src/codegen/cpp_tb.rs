@@ -4426,11 +4426,10 @@ impl Emitter {
                     // Body: install field subs + bus binding, mark
                     // coroutine context, emit, restore state.
                     let prev_subs = std::mem::replace(&mut self.field_subs, subs.clone());
-                    let mut added_field_types = Vec::new();
+                    let mut saved_field_types = Vec::new();
                     for (name, ty) in &local_field_types {
-                        if self.let_types.insert(name.clone(), ty.clone()).is_none() {
-                            added_field_types.push(name.clone());
-                        }
+                        let prev = self.let_types.insert(name.clone(), ty.clone());
+                        saved_field_types.push((name.clone(), prev));
                     }
                     let mut added_events = Vec::new();
                     for (name, ty) in &local_event_types {
@@ -4461,8 +4460,15 @@ impl Emitter {
                     for n in added_events {
                         self.event_types.remove(&n);
                     }
-                    for n in added_field_types {
-                        self.let_types.remove(&n);
+                    for (name, prev) in saved_field_types {
+                        match prev {
+                            Some(ty) => {
+                                self.let_types.insert(name, ty);
+                            }
+                            None => {
+                                self.let_types.remove(&name);
+                            }
+                        }
                     }
                     self.field_subs = prev_subs;
 
@@ -4658,7 +4664,7 @@ impl Emitter {
     ) {
         let mut subs = std::collections::HashMap::new();
         let mut local_event_types: Vec<(String, String)> = Vec::new();
-        let mut added_field_types: Vec<String> = Vec::new();
+        let mut local_field_types: Vec<(String, String)> = Vec::new();
         for it in &comp.items {
             if let ComponentItem::Field(f) = it {
                 let field_ref = if self.is_dut_pointer_field_type(&f.ty)
@@ -4670,13 +4676,7 @@ impl Emitter {
                 };
                 subs.insert(f.name.name.clone(), field_ref);
                 if let Some(ty) = type_simple_name(Some(&f.ty)) {
-                    if self
-                        .let_types
-                        .insert(f.name.name.clone(), ty.to_string())
-                        .is_none()
-                    {
-                        added_field_types.push(f.name.name.clone());
-                    }
+                    local_field_types.push((f.name.name.clone(), ty.to_string()));
                 }
                 if let TypeExpr::Builtin {
                     name: BuiltinTy::Event,
@@ -4832,6 +4832,11 @@ impl Emitter {
             .ok();
 
             let prev_subs = std::mem::replace(&mut self.field_subs, subs.clone());
+            let mut saved_field_types = Vec::new();
+            for (name, ty) in &local_field_types {
+                let prev = self.let_types.insert(name.clone(), ty.clone());
+                saved_field_types.push((name.clone(), prev));
+            }
             let mut added_events = Vec::new();
             for (name, ty) in &local_event_types {
                 if self.event_types.insert(name.clone(), ty.clone()).is_none() {
@@ -4885,6 +4890,16 @@ impl Emitter {
             }
             for n in added_events {
                 self.event_types.remove(&n);
+            }
+            for (name, prev) in saved_field_types {
+                match prev {
+                    Some(ty) => {
+                        self.let_types.insert(name, ty);
+                    }
+                    None => {
+                        self.let_types.remove(&name);
+                    }
+                }
             }
             self.field_subs = prev_subs;
 
@@ -5083,7 +5098,7 @@ impl Emitter {
         // `emit <ev>(arg)` finds the right param shape.
         let mut subs = std::collections::HashMap::new();
         let mut local_event_types: Vec<(String, String)> = Vec::new();
-        let mut added_field_types: Vec<String> = Vec::new();
+        let mut saved_field_types = Vec::new();
         for it in &comp.items {
             if let ComponentItem::Field(f) = it {
                 let field_ref = if self.is_dut_pointer_field_type(&f.ty)
@@ -5095,13 +5110,9 @@ impl Emitter {
                 };
                 subs.insert(f.name.name.clone(), field_ref);
                 if let Some(ty) = type_simple_name(Some(&f.ty)) {
-                    if self
-                        .let_types
-                        .insert(f.name.name.clone(), ty.to_string())
-                        .is_none()
-                    {
-                        added_field_types.push(f.name.name.clone());
-                    }
+                    let name = f.name.name.clone();
+                    let prev = self.let_types.insert(name.clone(), ty.to_string());
+                    saved_field_types.push((name, prev));
                 }
                 if let TypeExpr::Builtin {
                     name: BuiltinTy::Event,
@@ -5151,8 +5162,15 @@ impl Emitter {
             }
         }
         self.field_subs = prev_subs;
-        for n in added_field_types {
-            self.let_types.remove(&n);
+        for (name, prev) in saved_field_types {
+            match prev {
+                Some(ty) => {
+                    self.let_types.insert(name, ty);
+                }
+                None => {
+                    self.let_types.remove(&name);
+                }
+            }
         }
         for n in added_events {
             self.event_types.remove(&n);
@@ -5206,7 +5224,7 @@ impl Emitter {
         // prefixed with the instance path.
         let mut subs = std::collections::HashMap::new();
         let mut local_event_types = Vec::new();
-        let mut added_field_types: Vec<String> = Vec::new();
+        let mut saved_field_types = Vec::new();
         let mut event_field_names: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         for it in &comp.items {
@@ -5220,13 +5238,9 @@ impl Emitter {
                 };
                 subs.insert(f.name.name.clone(), field_ref);
                 if let Some(ty) = type_simple_name(Some(&f.ty)) {
-                    if self
-                        .let_types
-                        .insert(f.name.name.clone(), ty.to_string())
-                        .is_none()
-                    {
-                        added_field_types.push(f.name.name.clone());
-                    }
+                    let name = f.name.name.clone();
+                    let prev = self.let_types.insert(name.clone(), ty.to_string());
+                    saved_field_types.push((name, prev));
                 }
                 if let TypeExpr::Builtin {
                     name: BuiltinTy::Event,
@@ -5316,8 +5330,15 @@ impl Emitter {
         }
 
         self.field_subs = prev_subs;
-        for n in added_field_types {
-            self.let_types.remove(&n);
+        for (name, prev) in saved_field_types {
+            match prev {
+                Some(ty) => {
+                    self.let_types.insert(name, ty);
+                }
+                None => {
+                    self.let_types.remove(&name);
+                }
+            }
         }
         for n in added_events {
             self.event_types.remove(&n);
@@ -7570,18 +7591,14 @@ impl Emitter {
         // pointer_vars entry so `dut.field` lowers to `dut->field`.
         let mut subs = std::collections::HashMap::new();
         let mut added_pointer_fields: Vec<String> = Vec::new();
-        let mut added_field_types: Vec<String> = Vec::new();
+        let mut saved_field_types = Vec::new();
         for ci in &c.items {
             if let ComponentItem::Field(f) = ci {
                 subs.insert(f.name.name.clone(), format!("self.{}", f.name.name));
                 if let Some(ty) = type_simple_name(Some(&f.ty)) {
-                    if self
-                        .let_types
-                        .insert(f.name.name.clone(), ty.to_string())
-                        .is_none()
-                    {
-                        added_field_types.push(f.name.name.clone());
-                    }
+                    let name = f.name.name.clone();
+                    let prev = self.let_types.insert(name.clone(), ty.to_string());
+                    saved_field_types.push((name, prev));
                 }
                 if self.is_dut_pointer_field_type(&f.ty) {
                     if self.pointer_vars.insert(f.name.name.clone()) {
@@ -7654,8 +7671,15 @@ impl Emitter {
             }
         }
         self.field_subs = prev_subs;
-        for k in added_field_types {
-            self.let_types.remove(&k);
+        for (name, prev) in saved_field_types {
+            match prev {
+                Some(ty) => {
+                    self.let_types.insert(name, ty);
+                }
+                None => {
+                    self.let_types.remove(&name);
+                }
+            }
         }
         for k in added_pointer_fields {
             self.pointer_vars.remove(&k);
