@@ -39,7 +39,7 @@ end test TraceTest
     assert!(cpp.contains("#include \"harc_trace_rt.h\""));
     assert!(cpp.contains("harc_rt::trace::HarcTraceWriter trace;"));
     assert!(cpp.contains(
-        "trace.meta(harc_rng_state, std::getenv(\"HARC_DUT_BACKEND\"), \"Top\", \"TraceTest\")"
+        "trace.meta(harc_rng.state, std::getenv(\"HARC_DUT_BACKEND\"), \"Top\", \"TraceTest\")"
     ));
     assert!(cpp.contains("trace.raw(\"randomize\", cycle_count, _trace_fields);"));
     assert!(cpp.contains("trace.log(cycle_count, sev, _trace_msg);"));
@@ -82,7 +82,7 @@ end test RuntimeProblemTableTest
     assert!(cpp.contains("HarcRandomizeCall _harc_runtime_random_problem_table_prepare_call"));
     assert!(cpp.contains("harc_rt::random::harc_prepare_randomize_call("));
     assert!(cpp.contains(
-        "auto _harc_rt_call = _harc_runtime_random_problem_table_prepare_call(2, harc_rng_state, harc_rng_next());"
+        "auto _harc_rt_call = _harc_runtime_random_problem_table_prepare_call(2, harc_rng.state, harc_rng_next());"
     ));
     assert!(cpp.contains("auto* _harc_rt_problem = _harc_rt_call.problem;"));
     assert!(cpp.contains("auto _harc_rt_seed = _harc_rt_call.seed;"));
@@ -115,7 +115,7 @@ end test RuntimeFastPathTest
     let cpp = cpp_tb::emit(&merged).expect("emit");
 
     assert!(cpp.contains(
-        "auto _harc_rt_call = _harc_runtime_random_problem_table_prepare_call(2, harc_rng_state, 0);"
+        "auto _harc_rt_call = _harc_runtime_random_problem_table_prepare_call(2, harc_rng.state, 0);"
     ));
     assert!(cpp.contains(
         "harc_solve_queued(t, _harc_rt_call.problem_id, _harc_rt_seed, randomize_Empty);"
@@ -2376,7 +2376,7 @@ end test SeededSolverTest"#,
     assert!(
         cpp.contains("z3::params _p(_ctx);")
             && cpp.contains(
-                "_harc_runtime_random_problem_table_prepare_call(2, harc_rng_state, harc_rng_next())"
+                "_harc_runtime_random_problem_table_prepare_call(2, harc_rng.state, harc_rng_next())"
             )
             && cpp.contains("harc_rt::random::harc_solve_constrained(")
             && cpp.contains("harc_rt::random::harc_handle_solve_status(")

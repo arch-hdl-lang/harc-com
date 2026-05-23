@@ -148,6 +148,18 @@ inline void harc_rng_seed_from_env(uint64_t& state, const char* env_name = "HARC
     state = (s && *s) ? std::strtoull(s, nullptr, 0) : 1ull;
 }
 
+struct HarcRng {
+    uint64_t state = 0;
+
+    void seed_from_env(const char* env_name = "HARC_SEED") {
+        harc_rng_seed_from_env(state, env_name);
+    }
+
+    uint64_t next() {
+        return harc_rng_next_state(state);
+    }
+};
+
 inline constexpr harc_seed harc_seed_from(
     harc_seed global_seed,
     harc_call_site_id site_id,
