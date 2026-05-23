@@ -76,6 +76,7 @@ transactor_active_test  | AxiLiteRegs    | AxiLiteRegs.sv         |
 transactor_passive_only_test | AxiLiteRegs | AxiLiteRegs.sv        |
 transactor_agent_mode_test | AxiLiteRegs   | AxiLiteRegs.sv         |
 transactor_env_mode_test | AxiLiteRegs     | AxiLiteRegs.sv         |
+post_eval_provider_test | PostEvalProvider | post_eval_provider.sv |
 tlm_method_bus_test   | TlmMemory      | TlmMemory.sv           |
 tlm_target_thread_test | TlmReadInitiator | TlmReadInitiator.sv  |
 tlm_target_thread_if_test | TlmReadInitiatorPair | TlmReadInitiatorPair.sv |

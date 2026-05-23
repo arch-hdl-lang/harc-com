@@ -7570,12 +7570,22 @@ impl Emitter {
         // properly in the body. Restore on exit. Transaction / enum /
         // sub-component params are by-value (not pointer-shaped).
         let mut added: Vec<String> = Vec::new();
+        let mut saved_param_types = Vec::new();
         for (i, p) in h.params.iter().enumerate() {
             let pty =
                 p.ty.as_ref()
                     .map(|t| self.c_type_for_param(t))
                     .unwrap_or_else(|| "int64_t".to_string());
             write!(self.out, ", {pty} {}", param_names[i]).ok();
+            if p.name.name != "_" {
+                if let Some(ty) = type_simple_name(p.ty.as_ref()) {
+                    if self.components.contains_key(ty) || self.transactors.contains_key(ty) {
+                        let name = p.name.name.clone();
+                        let prev = self.let_types.insert(name.clone(), ty.to_string());
+                        saved_param_types.push((name, prev));
+                    }
+                }
+            }
             if matches!(&p.ty, Some(TypeExpr::Named { .. }))
                 && self.is_dut_pointer_field_type(p.ty.as_ref().unwrap())
                 && p.name.name != "_"
@@ -7672,6 +7682,16 @@ impl Emitter {
         }
         self.field_subs = prev_subs;
         for (name, prev) in saved_field_types {
+            match prev {
+                Some(ty) => {
+                    self.let_types.insert(name, ty);
+                }
+                None => {
+                    self.let_types.remove(&name);
+                }
+            }
+        }
+        for (name, prev) in saved_param_types {
             match prev {
                 Some(ty) => {
                     self.let_types.insert(name, ty);

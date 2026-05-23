@@ -1,0 +1,132 @@
+struct ReadResponse
+    matched : uint<1>
+    data : uint<32>
+    resp : uint<2>
+    last : uint<1>
+end struct ReadResponse
+
+transactor ProtocolModel
+    function predict_read(addr: uint<8>) -> ReadResponse
+        let r : ReadResponse
+        r.matched = 1
+        r.resp = 0
+        r.last = 1
+        r.data = 0
+
+        if addr == 0x10
+            r.data = 0x11110010
+        elsif addr == 0x20
+            r.data = 0x22220020
+        elsif addr == 0x30
+            r.data = 0x33330030
+        else
+            r.matched = 0
+            r.resp = 1
+        end if
+
+        return r
+    end predict_read
+end transactor ProtocolModel
+
+scoreboard ResponseScoreboard
+    seen_count : uint<32> default 0
+    last_expected : uint<32> default 0
+
+    function observe(addr: uint<8>, model: ProtocolModel)
+        let r : ReadResponse = model.predict_read(addr)
+        assert r.matched != 0 else fail("scoreboard saw unexpected addr 0x${addr:02x}")
+        seen_count = seen_count + 1
+        last_expected = r.data
+    end observe
+end scoreboard ResponseScoreboard
+
+transactor BusResponder
+    dut : PostEvalProvider
+    model : ProtocolModel
+    sb : ResponseScoreboard
+    pending : uint<1> default 0
+    visible : uint<1> default 0
+    pending_data : uint<32> default 0
+    queued : uint<1> default 0
+    queued_data : uint<32> default 0
+
+    when active
+        on 1 cycles phase post_eval
+            if pending != 0
+                dut.rsp_valid = 1
+                dut.rsp_data = pending_data
+                visible = 1
+            else
+                dut.rsp_valid = 0
+            end if
+
+            if visible != 0 && pending != 0 && dut.rsp_ready != 0
+                pending = 0
+                visible = 0
+                dut.rsp_valid = 0
+            end if
+
+            if dut.req_valid != 0
+                let r : ReadResponse = model.predict_read(dut.req_addr)
+                assert r.matched != 0 else fail("unexpected read addr=0x${dut.req_addr:02x}")
+                sb.observe(dut.req_addr, model)
+                if pending == 0
+                    pending_data = r.data
+                    pending = 1
+                    visible = 0
+                    dut.rsp_valid = 1
+                    dut.rsp_data = r.data
+                else
+                    assert queued == 0 else fail("responder queue overflow")
+                    queued = 1
+                    queued_data = r.data
+                end if
+            end if
+
+            if pending == 0 && queued != 0
+                pending_data = queued_data
+                pending = 1
+                visible = 0
+                queued = 0
+                dut.rsp_valid = 1
+                dut.rsp_data = queued_data
+            end if
+        end on
+    end when
+end transactor BusResponder
+
+testbench PostEvalProviderTb
+    dut : PostEvalProvider
+    model : ProtocolModel active
+    sb : ResponseScoreboard
+    responder : BusResponder active
+end testbench PostEvalProviderTb
+
+impl PostEvalProviderTest for PostEvalProviderTb
+    run
+        responder.dut = dut
+        responder.model = model
+        responder.sb = sb
+
+        dut.rst = 1
+        dut.rsp_valid = 0
+        dut.rsp_data = 0
+        wait 2 cycles
+        dut.rst = 0
+
+        wait until dut.done == 1 timeout 20 cycles fail("post_eval provider DUT did not finish")
+
+        assert dut.accepted_count == 3
+            else fail("accepted ${dut.accepted_count}, expected 3")
+        assert dut.duplicate_count == 0
+            else fail("duplicate responses ${dut.duplicate_count}, expected 0")
+        assert dut.last_data == 0x33330030
+            else fail("last data 0x${dut.last_data:08x}, expected 0x33330030")
+        assert responder.sb.seen_count == 3
+            else fail("scoreboard saw ${responder.sb.seen_count}, expected 3")
+        assert responder.sb.last_expected == 0x33330030
+            else fail("scoreboard expected 0x${responder.sb.last_expected:08x}, expected 0x33330030")
+
+        log(info, "ALL TESTS PASSED - post_eval_provider_test")
+    end run
+end impl PostEvalProviderTest
