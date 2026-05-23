@@ -42,6 +42,15 @@ inline int harc_trace_depth(
     return fallback_depth;
 }
 
+inline void harc_log_wave_stderr(const std::string& wave_path) {
+    std::fprintf(stderr, "[waves] writing %s\n", wave_path.c_str());
+}
+
+inline void harc_log_wave_file(FILE* f, const std::string& wave_path) {
+    if (!f) return;
+    std::fprintf(f, "[waves] writing %s\n", wave_path.c_str());
+}
+
 inline std::string harc_coverage_output_path() {
     return harc_resolve_log_path("coverage.dat");
 }
