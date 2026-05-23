@@ -3540,10 +3540,11 @@ impl Parser {
     /// Parse a single probe declaration:
     ///     probe [force] <name> : <type> at <dotted.path>
     /// The path is parsed as a sequence of identifiers separated by `.`
-    /// and stored verbatim as a string — HARC does not validate paths
-    /// against the DUT's SV source; Verilator does. The optional
-    /// `force` modifier opts into SV-procedural-force support for
-    /// fault injection (docs/probe-signals.md §3.1).
+    /// with optional bracket selectors after each segment, and stored
+    /// verbatim as a string — HARC does not validate paths against the
+    /// DUT's SV source; Verilator does. The optional `force` modifier
+    /// opts into SV-procedural-force support for fault injection
+    /// (docs/probe-signals.md §3.1).
     fn parse_probe_decl(&mut self) -> Result<Probe, CompileError> {
         let start = self.expect(TokenKind::Probe)?.span;
         let force = if self.check(TokenKind::Force) {
@@ -3556,16 +3557,15 @@ impl Parser {
         self.expect(TokenKind::Colon)?;
         let ty = self.parse_type_expr()?;
         self.expect(TokenKind::At)?;
-        // Dotted path: ident ('.' ident)*
-        let first = self.expect_field_name()?;
-        let mut path = first.name;
-        let mut end = first.span;
+        // Dotted SV path: segment ('.' segment)*, where each segment may
+        // carry array/generate selectors such as `regs[0]`.
+        let (mut path, mut end) = self.parse_probe_path_segment()?;
         while self.check(TokenKind::Dot) {
             self.advance();
-            let next = self.expect_field_name()?;
+            let (next, next_end) = self.parse_probe_path_segment()?;
             path.push('.');
-            path.push_str(&next.name);
-            end = next.span;
+            path.push_str(&next);
+            end = next_end;
         }
         Ok(Probe {
             name,
@@ -3574,6 +3574,33 @@ impl Parser {
             force,
             span: start.merge(end),
         })
+    }
+
+    fn parse_probe_path_segment(&mut self) -> Result<(String, Span), CompileError> {
+        let first = self.expect_field_name()?;
+        let mut path = first.name;
+        let mut end = first.span;
+        while self.check(TokenKind::LBracket) {
+            self.advance();
+            path.push('[');
+            let mut saw_selector = false;
+            while !self.check(TokenKind::RBracket) {
+                let tok = self.advance().ok_or(CompileError::UnexpectedEof)?;
+                path.push_str(&tok.kind.to_string());
+                saw_selector = true;
+            }
+            if !saw_selector {
+                return Err(CompileError::unexpected_token(
+                    "probe path selector",
+                    "]",
+                    self.peek_span(),
+                ));
+            }
+            let close = self.expect(TokenKind::RBracket)?;
+            path.push(']');
+            end = close.span;
+        }
+        Ok((path, end))
     }
 
     fn parse_for_stmt(&mut self) -> Result<ForStmt, CompileError> {

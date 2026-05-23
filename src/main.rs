@@ -925,6 +925,24 @@ fn write_if_changed(path: &Path, contents: &[u8]) -> Result<bool> {
     Ok(true)
 }
 
+fn emit_probe_stub_if_needed(
+    outdir: &Path,
+    file: &harc::ast::SourceFile,
+) -> Result<Option<PathBuf>> {
+    let Some((dut_ty, probes)) = harc::codegen::cpp_tb::dut_probes(file) else {
+        return Ok(None);
+    };
+    let stub_src = harc::codegen::sv_stub::emit_stub(&dut_ty, &probes)
+        .map_err(|e| miette::miette!("probe stub emit failed: {e}"))?;
+    let stub_path = outdir.join(format!("__harc_probe_{dut_ty}.sv"));
+    if write_if_changed(&stub_path, stub_src.as_bytes())? {
+        eprintln!("emitted {}", stub_path.display());
+    } else {
+        eprintln!("reused {} (unchanged)", stub_path.display());
+    }
+    Ok(Some(stub_path))
+}
+
 fn absolutize_trace_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         return Ok(path.to_path_buf());
@@ -1308,6 +1326,10 @@ fn cmd_sim(
         harc::codegen::cpp_tb::RANDOM_RT_HEADER.as_bytes(),
     )?;
 
+    // `--emit-only` must still emit every generated source artifact a
+    // downstream Verilator build needs, including probe bind stubs.
+    let probe_stub_path = emit_probe_stub_if_needed(&outdir, &merged)?;
+
     if emit_only {
         return Ok(());
     }
@@ -1343,17 +1365,10 @@ fn cmd_sim(
         }
 
         // If the test's `let dut : T` carries `probe` declarations,
-        // emit the SV bind stub alongside the .cpp and prepend it
-        // to the verilator inputs. Probe-less tests skip both the
-        // stub write and the public-flat-rd machinery — zero impact
-        // on the existing fixture corpus.
-        if let Some((dut_ty, probes)) = harc::codegen::cpp_tb::dut_probes(&merged) {
-            let stub_src = harc::codegen::sv_stub::emit_stub(&dut_ty, &probes)
-                .map_err(|e| miette::miette!("probe stub emit failed: {e}"))?;
-            let stub_path = outdir_abs.join(format!("__harc_probe_{dut_ty}.sv"));
-            fs::write(&stub_path, &stub_src).into_diagnostic()?;
-            eprintln!("emitted {}", stub_path.display());
-            sv_abs.push(stub_path);
+        // prepend the generated SV bind stub to the verilator inputs.
+        // Probe-less tests skip the stub and public-flat-rd machinery.
+        if let Some(stub_path) = &probe_stub_path {
+            sv_abs.push(fs::canonicalize(stub_path).into_diagnostic()?);
         }
 
         // Canonicalize ref-src paths so verilator (running in obj_dir/)
@@ -1626,5 +1641,36 @@ mod tests {
         "#;
         let file = harc::parser::parse_source(src).unwrap();
         assert!(harc::codegen::cpp_tb::uses_constraint_solver(&file));
+    }
+
+    #[test]
+    fn emit_probe_stub_helper_writes_emit_only_artifact() {
+        let src = r#"
+            testbench ProbeDutTb
+                let dut : CpuPipe
+                    probe alu_a : uint<32> at alu0.a
+                end let dut
+            end testbench ProbeDutTb
+
+            impl ProbeDutTest for ProbeDutTb
+                run
+                    assert dut.alu_a == 0
+                end run
+            end impl ProbeDutTest
+        "#;
+        let file = harc::parser::parse_source(src).unwrap();
+        let base = temp_dir("probe-stub");
+        let stub = emit_probe_stub_if_needed(&base, &file)
+            .unwrap()
+            .expect("probe-bearing source should produce a stub path");
+
+        assert_eq!(
+            stub.file_name().and_then(|s| s.to_str()),
+            Some("__harc_probe_CpuPipe.sv")
+        );
+        let contents = fs::read_to_string(&stub).unwrap();
+        assert!(contents.contains("bind CpuPipe __harc_probe_CpuPipe harc_probes ();"));
+        assert!(contents.contains("assign alu_a = CpuPipe.alu0.a;"));
+        let _ = fs::remove_dir_all(base);
     }
 }
