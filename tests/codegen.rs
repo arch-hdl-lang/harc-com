@@ -2469,7 +2469,7 @@ end test AutoCovPrefTest"#,
             && cpp.contains("static bool _auto_cross_blocked_")
             && cpp.contains("__len[2][2]")
             && cpp.contains("std::vector<std::function<void()>> _auto_cov_reports;")
-            && cpp.contains("_auto_cov_reports.push_back")
+            && cpp.contains("harc_auto_cov_register_report(")
             && cpp.contains("harc_auto_cov_report_summary(\"T\"")
             && cpp.contains("harc_auto_cov_report_bin(\"T.op=Read\"")
             && cpp.contains("T.op=Read")
