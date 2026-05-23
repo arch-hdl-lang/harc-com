@@ -10384,7 +10384,7 @@ impl Emitter {
                 self.pad(depth + 2);
                 writeln!(
                     self.out,
-                    "if (harc_rt::random::harc_auto_cov_selected_cross(_auto_cov_selection_{cache_tag}, {group})) harc_rt::random::harc_auto_cov_mark_blocked(_auto_cross_blocked_{cache_tag}_{}__{}[_auto_cov_selection_{cache_tag}.i][_auto_cov_selection_{cache_tag}.j]);",
+                    "harc_rt::random::harc_auto_cov_mark_selected_cross_blocked(_auto_cov_selection_{cache_tag}, {group}, _auto_cross_blocked_{cache_tag}_{}__{}[_auto_cov_selection_{cache_tag}.i][_auto_cov_selection_{cache_tag}.j]);",
                     a.c_field, b.c_field
                 )
                 .ok();
@@ -10393,7 +10393,7 @@ impl Emitter {
                 self.pad(depth + 2);
                 writeln!(
                     self.out,
-                    "if (harc_rt::random::harc_auto_cov_selected_point(_auto_cov_selection_{cache_tag}, {group})) harc_rt::random::harc_auto_cov_mark_blocked(_auto_cov_blocked_{cache_tag}_{}[_auto_cov_selection_{cache_tag}.i]);",
+                    "harc_rt::random::harc_auto_cov_mark_selected_point_blocked(_auto_cov_selection_{cache_tag}, {group}, _auto_cov_blocked_{cache_tag}_{}[_auto_cov_selection_{cache_tag}.i]);",
                     goal.c_field
                 )
                 .ok();
@@ -10689,7 +10689,7 @@ impl Emitter {
                 self.pad(depth + 2);
                 writeln!(
                     self.out,
-                    "if (_val_{} == {}) {{ harc_rt::random::harc_auto_cov_mark_hit(_auto_cov_{cache_tag}_{}[{}], _auto_cov_blocked_{cache_tag}_{}[{}]); }}",
+                    "harc_rt::random::harc_auto_cov_mark_value_hit(_val_{}, {}, _auto_cov_{cache_tag}_{}[{}], _auto_cov_blocked_{cache_tag}_{}[{}]);",
                     goal.c_field, value.c_expr, goal.c_field, idx, goal.c_field, idx
                 )
                 .ok();
@@ -10701,7 +10701,7 @@ impl Emitter {
                     self.pad(depth + 2);
                     writeln!(
                         self.out,
-                        "if (_val_{} == {} && _val_{} == {}) {{ harc_rt::random::harc_auto_cov_mark_hit(_auto_cross_{cache_tag}_{}__{}[{}][{}], _auto_cross_blocked_{cache_tag}_{}__{}[{}][{}]); }}",
+                        "harc_rt::random::harc_auto_cov_mark_cross_hit(_val_{}, {}, _val_{}, {}, _auto_cross_{cache_tag}_{}__{}[{}][{}], _auto_cross_blocked_{cache_tag}_{}__{}[{}][{}]);",
                         a.c_field, av.c_expr, b.c_field, bv.c_expr, a.c_field, b.c_field, i, j, a.c_field, b.c_field, i, j
                     )
                     .ok();

@@ -2490,8 +2490,10 @@ end test AutoCovPrefTest"#,
             && cpp.contains("harc_auto_cov_count(_auto_cov_")
             && cpp.contains("harc_auto_cov_count(_auto_cross_")
             && cpp.contains("harc_auto_cov_state(")
-            && cpp.contains("harc_auto_cov_mark_blocked")
-            && cpp.contains("harc_auto_cov_mark_hit")
+            && cpp.contains("harc_auto_cov_mark_selected_point_blocked(")
+            && cpp.contains("harc_auto_cov_mark_selected_cross_blocked(")
+            && cpp.contains("harc_auto_cov_mark_value_hit(")
+            && cpp.contains("harc_auto_cov_mark_cross_hit(")
             && cpp.contains("harc_rt::random::harc_retry_without_preferences(")
             && cpp.contains("retry without seeded preferences")
             && cpp.contains("_auto_cross_"),
@@ -2551,7 +2553,7 @@ end test SignedAutoCovPrefTest"#,
             && cpp.contains("{-4LL, 4LL}")
             && cpp.contains("T.delta=-4")
             && cpp.contains("T.delta=4")
-            && cpp.contains("_val_delta == -4LL"),
+            && cpp.contains("harc_auto_cov_mark_value_hit(_val_delta, -4LL"),
         "signed [range] endpoints should feed auto coverage preferences and report as signed values; got:\n{cpp}",
     );
 }
