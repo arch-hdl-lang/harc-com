@@ -283,6 +283,32 @@ inline bool harc_auto_cov_first_uncovered_cross(
     return false;
 }
 
+template <size_t N>
+inline uint64_t harc_auto_cov_count(const bool (&bins)[N]) {
+    uint64_t count = 0;
+    for (size_t i = 0; i < N; ++i) {
+        if (bins[i]) ++count;
+    }
+    return count;
+}
+
+template <size_t Rows, size_t Cols>
+inline uint64_t harc_auto_cov_count(const bool (&bins)[Rows][Cols]) {
+    uint64_t count = 0;
+    for (size_t i = 0; i < Rows; ++i) {
+        for (size_t j = 0; j < Cols; ++j) {
+            if (bins[i][j]) ++count;
+        }
+    }
+    return count;
+}
+
+inline constexpr const char* harc_auto_cov_state(
+    bool hit,
+    bool blocked) {
+    return hit ? "hit" : (blocked ? "*BLOCKED*" : "*NOT HIT*");
+}
+
 inline void harc_auto_cov_mark_blocked(bool& blocked) {
     blocked = true;
 }

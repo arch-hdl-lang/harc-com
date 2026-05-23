@@ -10094,42 +10094,36 @@ impl Emitter {
             self.pad(depth + 3);
             writeln!(self.out, "uint64_t _total = {total_bins};").ok();
             for goal in &auto_goals {
-                for idx in 0..goal.values.len() {
-                    self.pad(depth + 3);
-                    writeln!(
-                        self.out,
-                        "if (_auto_cov_{cache_tag}_{}[{}]) _hit++;",
-                        goal.c_field, idx
-                    )
-                    .ok();
-                    self.pad(depth + 3);
-                    writeln!(
-                        self.out,
-                        "if (_auto_cov_blocked_{cache_tag}_{}[{}]) _blocked++;",
-                        goal.c_field, idx
-                    )
-                    .ok();
-                }
+                self.pad(depth + 3);
+                writeln!(
+                    self.out,
+                    "_hit += harc_rt::random::harc_auto_cov_count(_auto_cov_{cache_tag}_{});",
+                    goal.c_field
+                )
+                .ok();
+                self.pad(depth + 3);
+                writeln!(
+                    self.out,
+                    "_blocked += harc_rt::random::harc_auto_cov_count(_auto_cov_blocked_{cache_tag}_{});",
+                    goal.c_field
+                )
+                .ok();
             }
             for (a, b) in &auto_crosses {
-                for i in 0..a.values.len() {
-                    for j in 0..b.values.len() {
-                        self.pad(depth + 3);
-                        writeln!(
-                            self.out,
-                            "if (_auto_cross_{cache_tag}_{}__{}[{}][{}]) _hit++;",
-                            a.c_field, b.c_field, i, j
-                        )
-                        .ok();
-                        self.pad(depth + 3);
-                        writeln!(
-                            self.out,
-                            "if (_auto_cross_blocked_{cache_tag}_{}__{}[{}][{}]) _blocked++;",
-                            a.c_field, b.c_field, i, j
-                        )
-                        .ok();
-                    }
-                }
+                self.pad(depth + 3);
+                writeln!(
+                    self.out,
+                    "_hit += harc_rt::random::harc_auto_cov_count(_auto_cross_{cache_tag}_{}__{});",
+                    a.c_field, b.c_field
+                )
+                .ok();
+                self.pad(depth + 3);
+                writeln!(
+                    self.out,
+                    "_blocked += harc_rt::random::harc_auto_cov_count(_auto_cross_blocked_{cache_tag}_{}__{});",
+                    a.c_field, b.c_field
+                )
+                .ok();
             }
             self.pad(depth + 3);
             writeln!(
@@ -10144,7 +10138,7 @@ impl Emitter {
                     self.pad(depth + 3);
                     writeln!(
                         self.out,
-                        "std::printf(\"  {}.{}={} : %s\\n\", _auto_cov_{cache_tag}_{}[{}] ? \"hit\" : (_auto_cov_blocked_{cache_tag}_{}[{}] ? \"*BLOCKED*\" : \"*NOT HIT*\"));",
+                        "std::printf(\"  {}.{}={} : %s\\n\", harc_rt::random::harc_auto_cov_state(_auto_cov_{cache_tag}_{}[{}], _auto_cov_blocked_{cache_tag}_{}[{}]));",
                         escape_c(ty),
                         escape_c(&goal.field),
                         escape_c(&value.label),
@@ -10162,7 +10156,7 @@ impl Emitter {
                         self.pad(depth + 3);
                         writeln!(
                             self.out,
-                            "std::printf(\"  {}.{}={} x {}.{}={} : %s\\n\", _auto_cross_{cache_tag}_{}__{}[{}][{}] ? \"hit\" : (_auto_cross_blocked_{cache_tag}_{}__{}[{}][{}] ? \"*BLOCKED*\" : \"*NOT HIT*\"));",
+                            "std::printf(\"  {}.{}={} x {}.{}={} : %s\\n\", harc_rt::random::harc_auto_cov_state(_auto_cross_{cache_tag}_{}__{}[{}][{}], _auto_cross_blocked_{cache_tag}_{}__{}[{}][{}]));",
                             escape_c(ty),
                             escape_c(&a.field),
                             escape_c(&av.label),
