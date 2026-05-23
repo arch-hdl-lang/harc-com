@@ -1335,6 +1335,11 @@ fn cmd_sim(
         &trace_rt_header_path,
         harc::codegen::cpp_tb::TRACE_RT_HEADER.as_bytes(),
     )?;
+    let log_rt_header_path = outdir.join("harc_log_rt.h");
+    write_if_changed(
+        &log_rt_header_path,
+        harc::codegen::cpp_tb::LOG_RT_HEADER.as_bytes(),
+    )?;
     let z3_rt_header_path = outdir.join("harc_z3_rt.h");
     write_if_changed(
         &z3_rt_header_path,

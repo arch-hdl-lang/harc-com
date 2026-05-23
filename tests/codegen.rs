@@ -37,12 +37,13 @@ end test TraceTest
     let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
     let cpp = cpp_tb::emit(&merged).expect("emit");
     assert!(cpp.contains("#include \"harc_trace_rt.h\""));
+    assert!(cpp.contains("#include \"harc_log_rt.h\""));
     assert!(cpp.contains("harc_rt::trace::HarcTraceWriter trace;"));
     assert!(cpp.contains(
         "trace.meta(harc_rng.state, std::getenv(\"HARC_DUT_BACKEND\"), \"Top\", \"TraceTest\")"
     ));
     assert!(cpp.contains("trace.raw(\"randomize\", cycle_count, _trace_fields);"));
-    assert!(cpp.contains("trace.log(cycle_count, sev, _trace_msg);"));
+    assert!(cpp.contains("harc_rt::log::harc_log_line(sim_log, &trace, cycle_count, sev, _log_msg);"));
     assert!(cpp_tb::TRACE_RT_HEADER.contains("raw(\"assertion_failure\""));
 }
 
