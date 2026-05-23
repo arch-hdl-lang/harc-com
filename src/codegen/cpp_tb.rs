@@ -426,12 +426,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         match it {
             Item::Transaction(t) => {
                 transactions.insert(t.name.name.clone());
-                let fields = flatten_txn_body_field_infos(
-                    &t.body,
-                    &record_fields,
-                    &enums,
-                    &enum_domains,
-                );
+                let fields =
+                    flatten_txn_body_field_infos(&t.body, &record_fields, &enums, &enum_domains);
                 txn_fields.insert(t.name.name.clone(), fields);
                 // Collect transaction-level `keep` constraints. Keeps nested
                 // inside `when` subtype bodies lower as guarded implications:
@@ -2072,10 +2068,13 @@ fn stmt_contains_return(stmt: &Stmt) -> bool {
                     .as_ref()
                     .is_some_and(|b| b.stmts.iter().any(stmt_contains_return))
         }
-        StmtKind::Fork(f) => f.branches.iter().any(|b| b.stmts.iter().any(stmt_contains_return)),
-        StmtKind::Parallel(branches) | StmtKind::Schedule(branches) => {
-            branches.iter().any(|b| b.stmts.iter().any(stmt_contains_return))
-        }
+        StmtKind::Fork(f) => f
+            .branches
+            .iter()
+            .any(|b| b.stmts.iter().any(stmt_contains_return)),
+        StmtKind::Parallel(branches) | StmtKind::Schedule(branches) => branches
+            .iter()
+            .any(|b| b.stmts.iter().any(stmt_contains_return)),
         StmtKind::Select(arms) => arms
             .iter()
             .any(|a| a.action.stmts.iter().any(stmt_contains_return)),
@@ -2828,16 +2827,10 @@ fn natural_auto_coverage_endpoints(f: &TxnFieldInfo) -> Vec<AutoCoverageValue> {
         for bit in walking_auto_coverage_bit_positions(f.width) {
             let mut one = vec![0u32; hi_words.len()];
             one[(bit / 32) as usize] = 1u32 << (bit % 32);
-            push_auto_coverage_value_unique(
-                &mut values,
-                auto_coverage_unsigned_word(one, f.width),
-            );
+            push_auto_coverage_value_unique(&mut values, auto_coverage_unsigned_word(one, f.width));
             let mut inv = hi_words.clone();
             inv[(bit / 32) as usize] ^= 1u32 << (bit % 32);
-            push_auto_coverage_value_unique(
-                &mut values,
-                auto_coverage_unsigned_word(inv, f.width),
-            );
+            push_auto_coverage_value_unique(&mut values, auto_coverage_unsigned_word(inv, f.width));
         }
         values
     }
@@ -2904,7 +2897,10 @@ fn solver_scalar_c_type(width: u32, signed: bool) -> String {
     }
 }
 
-fn auto_value_array_type(goal: &AutoCoverageGoal, field_info: &std::collections::HashMap<String, TxnFieldInfo>) -> String {
+fn auto_value_array_type(
+    goal: &AutoCoverageGoal,
+    field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+) -> String {
     field_info
         .get(&goal.field)
         .map(txn_field_solver_c_type)
@@ -2941,7 +2937,10 @@ fn emit_random_unsigned_expr(width: u32) -> String {
         format!("harc_rt::random::harc_rng_u128(harc_rng_next, {width})")
     } else {
         let words = width.div_ceil(32);
-        format!("harc_rt::random::harc_rng_wide<{}>(harc_rng_next, {width})", words)
+        format!(
+            "harc_rt::random::harc_rng_wide<{}>(harc_rng_next, {width})",
+            words
+        )
     }
 }
 
@@ -4173,7 +4172,11 @@ impl Emitter {
 
             // Sub-component (driver/agent/env/sequencer/scoreboard).
             if let Some(sub_comp) = self.components.get(field_ty).cloned() {
-                let sub_inst = format!("{}.{}", instance_path, f.name.name);
+                let sub_inst = if instance_path == "_tb" {
+                    f.name.name.clone()
+                } else {
+                    format!("{}.{}", instance_path, f.name.name)
+                };
                 let sub_tag = format!("_{}_{}_", sub_comp.kind.keyword(), f.name.name);
                 self.emit_component_handler_registrations(&sub_comp, &sub_inst, depth, &sub_tag);
                 // Sub-component watchdog (spec §8.6) — install the
@@ -4229,7 +4232,11 @@ impl Emitter {
             // is the only path otherwise — and the desugarer doesn't
             // mint a parallel let at test scope).
             if let Some(g) = self.covergroups.get(field_ty).cloned() {
-                let sub_inst = format!("{}.{}", instance_path, f.name.name);
+                let sub_inst = if instance_path == "_tb" {
+                    f.name.name.clone()
+                } else {
+                    format!("{}.{}", instance_path, f.name.name)
+                };
                 self.emit_covergroup_sample_registration(&g, &sub_inst, depth);
                 continue;
             }
@@ -4256,7 +4263,11 @@ impl Emitter {
                 };
                 let include_active = matches!(mode, TransactorMode::Active);
                 let synth = synth_component_from_transactor(&t, include_active);
-                let sub_inst = format!("{}.{}", instance_path, f.name.name);
+                let sub_inst = if instance_path == "_tb" {
+                    f.name.name.clone()
+                } else {
+                    format!("{}.{}", instance_path, f.name.name)
+                };
                 let sub_tag = format!("_xactor_{}_", sub_inst.replace('.', "_"));
                 self.emit_component_handler_registrations(&synth, &sub_inst, depth, &sub_tag);
             }
@@ -4299,9 +4310,20 @@ impl Emitter {
         // the handler body resolve to `instance.field`.
         let mut subs = std::collections::HashMap::new();
         let mut local_event_types: Vec<(String, String)> = Vec::new();
+        let mut local_field_types: Vec<(String, String)> = Vec::new();
         for it in &mon.items {
             if let ComponentItem::Field(f) = it {
-                subs.insert(f.name.name.clone(), format!("{instance}.{}", f.name.name));
+                let field_ref = if self.is_dut_pointer_field_type(&f.ty)
+                    && self.pointer_vars.contains(&f.name.name)
+                {
+                    f.name.name.clone()
+                } else {
+                    format!("{instance}.{}", f.name.name)
+                };
+                subs.insert(f.name.name.clone(), field_ref);
+                if let Some(ty) = type_simple_name(Some(&f.ty)) {
+                    local_field_types.push((f.name.name.clone(), ty.to_string()));
+                }
                 if let TypeExpr::Builtin {
                     name: BuiltinTy::Event,
                     args,
@@ -4404,6 +4426,12 @@ impl Emitter {
                     // Body: install field subs + bus binding, mark
                     // coroutine context, emit, restore state.
                     let prev_subs = std::mem::replace(&mut self.field_subs, subs.clone());
+                    let mut added_field_types = Vec::new();
+                    for (name, ty) in &local_field_types {
+                        if self.let_types.insert(name.clone(), ty.clone()).is_none() {
+                            added_field_types.push(name.clone());
+                        }
+                    }
                     let mut added_events = Vec::new();
                     for (name, ty) in &local_event_types {
                         if self.event_types.insert(name.clone(), ty.clone()).is_none() {
@@ -4432,6 +4460,9 @@ impl Emitter {
                     }
                     for n in added_events {
                         self.event_types.remove(&n);
+                    }
+                    for n in added_field_types {
+                        self.let_types.remove(&n);
                     }
                     self.field_subs = prev_subs;
 
@@ -4627,9 +4658,26 @@ impl Emitter {
     ) {
         let mut subs = std::collections::HashMap::new();
         let mut local_event_types: Vec<(String, String)> = Vec::new();
+        let mut added_field_types: Vec<String> = Vec::new();
         for it in &comp.items {
             if let ComponentItem::Field(f) = it {
-                subs.insert(f.name.name.clone(), format!("{instance}.{}", f.name.name));
+                let field_ref = if self.is_dut_pointer_field_type(&f.ty)
+                    && self.pointer_vars.contains(&f.name.name)
+                {
+                    f.name.name.clone()
+                } else {
+                    format!("{instance}.{}", f.name.name)
+                };
+                subs.insert(f.name.name.clone(), field_ref);
+                if let Some(ty) = type_simple_name(Some(&f.ty)) {
+                    if self
+                        .let_types
+                        .insert(f.name.name.clone(), ty.to_string())
+                        .is_none()
+                    {
+                        added_field_types.push(f.name.name.clone());
+                    }
+                }
                 if let TypeExpr::Builtin {
                     name: BuiltinTy::Event,
                     args,
@@ -4760,10 +4808,7 @@ impl Emitter {
             writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
             for (param, (arg_name, arg_ty)) in t.params.iter().zip(method.args.iter()) {
                 let local_name = &param.name.name;
-                let local_ty = param
-                    .ty
-                    .as_ref()
-                    .unwrap_or(arg_ty);
+                let local_ty = param.ty.as_ref().unwrap_or(arg_ty);
                 let cty = self.c_type_for_param(local_ty);
                 let arg_port = self.bus_signal_name(sig_prefix, &method.name.name, &arg_name.name);
                 self.pad(depth + 2);
@@ -5038,9 +5083,26 @@ impl Emitter {
         // `emit <ev>(arg)` finds the right param shape.
         let mut subs = std::collections::HashMap::new();
         let mut local_event_types: Vec<(String, String)> = Vec::new();
+        let mut added_field_types: Vec<String> = Vec::new();
         for it in &comp.items {
             if let ComponentItem::Field(f) = it {
-                subs.insert(f.name.name.clone(), format!("{instance}.{}", f.name.name));
+                let field_ref = if self.is_dut_pointer_field_type(&f.ty)
+                    && self.pointer_vars.contains(&f.name.name)
+                {
+                    f.name.name.clone()
+                } else {
+                    format!("{instance}.{}", f.name.name)
+                };
+                subs.insert(f.name.name.clone(), field_ref);
+                if let Some(ty) = type_simple_name(Some(&f.ty)) {
+                    if self
+                        .let_types
+                        .insert(f.name.name.clone(), ty.to_string())
+                        .is_none()
+                    {
+                        added_field_types.push(f.name.name.clone());
+                    }
+                }
                 if let TypeExpr::Builtin {
                     name: BuiltinTy::Event,
                     args,
@@ -5089,6 +5151,9 @@ impl Emitter {
             }
         }
         self.field_subs = prev_subs;
+        for n in added_field_types {
+            self.let_types.remove(&n);
+        }
         for n in added_events {
             self.event_types.remove(&n);
         }
@@ -5141,11 +5206,28 @@ impl Emitter {
         // prefixed with the instance path.
         let mut subs = std::collections::HashMap::new();
         let mut local_event_types = Vec::new();
+        let mut added_field_types: Vec<String> = Vec::new();
         let mut event_field_names: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         for it in &comp.items {
             if let ComponentItem::Field(f) = it {
-                subs.insert(f.name.name.clone(), format!("{instance}.{}", f.name.name));
+                let field_ref = if self.is_dut_pointer_field_type(&f.ty)
+                    && self.pointer_vars.contains(&f.name.name)
+                {
+                    f.name.name.clone()
+                } else {
+                    format!("{instance}.{}", f.name.name)
+                };
+                subs.insert(f.name.name.clone(), field_ref);
+                if let Some(ty) = type_simple_name(Some(&f.ty)) {
+                    if self
+                        .let_types
+                        .insert(f.name.name.clone(), ty.to_string())
+                        .is_none()
+                    {
+                        added_field_types.push(f.name.name.clone());
+                    }
+                }
                 if let TypeExpr::Builtin {
                     name: BuiltinTy::Event,
                     args,
@@ -5234,6 +5316,9 @@ impl Emitter {
         }
 
         self.field_subs = prev_subs;
+        for n in added_field_types {
+            self.let_types.remove(&n);
+        }
         for n in added_events {
             self.event_types.remove(&n);
         }
@@ -5852,7 +5937,11 @@ impl Emitter {
             self.pad(depth);
             writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
         } else {
-            writeln!(self.out, "{{ int _b = 16; while (!{root}->{req_ready} && _b > 0) {{ tick(); _b--; }} }}").ok();
+            writeln!(
+                self.out,
+                "{{ int _b = 16; while (!{root}->{req_ready} && _b > 0) {{ tick(); _b--; }} }}"
+            )
+            .ok();
             self.pad(depth);
             writeln!(self.out, "tick();").ok();
         }
@@ -5865,13 +5954,21 @@ impl Emitter {
         if self.in_coroutine {
             writeln!(self.out, "{{ int _b = 16; while (!{root}->{rsp_valid} && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}").ok();
         } else {
-            writeln!(self.out, "{{ int _b = 16; while (!{root}->{rsp_valid} && _b > 0) {{ tick(); _b--; }} }}").ok();
+            writeln!(
+                self.out,
+                "{{ int _b = 16; while (!{root}->{rsp_valid} && _b > 0) {{ tick(); _b--; }} }}"
+            )
+            .ok();
         }
         if let Some(name) = let_name {
             if let Some(ret) = &method.ret {
                 self.pad(depth);
                 let cty = self.record_field_c_type(ret);
-                writeln!(self.out, "{cty} {name} = harc_rt::harc_read({root}->{rsp_data});").ok();
+                writeln!(
+                    self.out,
+                    "{cty} {name} = harc_rt::harc_read({root}->{rsp_data});"
+                )
+                .ok();
             }
         }
         self.pad(depth);
@@ -5982,7 +6079,12 @@ impl Emitter {
         };
 
         self.pad(depth);
-        writeln!(self.out, "// fork bus.{} tlm_method issue", method.name.name).ok();
+        writeln!(
+            self.out,
+            "// fork bus.{} tlm_method issue",
+            method.name.name
+        )
+        .ok();
         for ((arg_name, _), arg) in method.args.iter().zip(args.iter()) {
             let sig_port = self.bus_signal_name(&sig_prefix, &method.name.name, &arg_name.name);
             self.pad(depth);
@@ -6005,7 +6107,11 @@ impl Emitter {
             self.pad(depth);
             writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
         } else {
-            writeln!(self.out, "{{ int _b = 16; while (!{root}->{req_ready} && _b > 0) {{ tick(); _b--; }} }}").ok();
+            writeln!(
+                self.out,
+                "{{ int _b = 16; while (!{root}->{req_ready} && _b > 0) {{ tick(); _b--; }} }}"
+            )
+            .ok();
             self.pad(depth);
             writeln!(self.out, "tick();").ok();
         }
@@ -6050,11 +6156,21 @@ impl Emitter {
             if self.in_coroutine {
                 writeln!(self.out, "{{ int _b = 64; while (!{}->{} && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}", p.root, rsp_valid).ok();
             } else {
-                writeln!(self.out, "{{ int _b = 64; while (!{}->{} && _b > 0) {{ tick(); _b--; }} }}", p.root, rsp_valid).ok();
+                writeln!(
+                    self.out,
+                    "{{ int _b = 64; while (!{}->{} && _b > 0) {{ tick(); _b--; }} }}",
+                    p.root, rsp_valid
+                )
+                .ok();
             }
             if let Some(var) = &p.ret_var {
                 self.pad(depth);
-                writeln!(self.out, "{var} = harc_rt::harc_read({}->{});", p.root, rsp_data).ok();
+                writeln!(
+                    self.out,
+                    "{var} = harc_rt::harc_read({}->{});",
+                    p.root, rsp_data
+                )
+                .ok();
             }
             self.pad(depth);
             if self.in_coroutine {
@@ -6089,8 +6205,9 @@ impl Emitter {
         writeln!(self.out, "bool _tlm_accept = false;").ok();
         for (idx, p) in pending.iter().enumerate() {
             let Some(tag) = p.tag else {
-                self.errors
-                    .push("cannot mix tagged and untagged RHS-fork TLM calls before one join_all".into());
+                self.errors.push(
+                    "cannot mix tagged and untagged RHS-fork TLM calls before one join_all".into(),
+                );
                 continue;
             };
             let rsp_valid = self.bus_signal_name(&p.sig_prefix, &p.method, "rsp_valid");
@@ -6106,7 +6223,12 @@ impl Emitter {
             .ok();
             if let Some(var) = &p.ret_var {
                 self.pad(depth + 3);
-                writeln!(self.out, "{var} = harc_rt::harc_read({}->{});", p.root, rsp_data).ok();
+                writeln!(
+                    self.out,
+                    "{var} = harc_rt::harc_read({}->{});",
+                    p.root, rsp_data
+                )
+                .ok();
             }
             self.pad(depth + 3);
             writeln!(self.out, "{}->{} = 1;", p.root, rsp_ready).ok();
@@ -7210,7 +7332,17 @@ impl Emitter {
             return None;
         }
 
-        Some((cur_ty, path.join("."), method.name.clone()))
+        let instance = if let Some(root_sub) = self.field_subs.get(root) {
+            if path.len() == 1 {
+                root_sub.clone()
+            } else {
+                format!("{}.{}", root_sub, path[1..].join("."))
+            }
+        } else {
+            path.join(".")
+        };
+
+        Some((cur_ty, instance, method.name.clone()))
     }
 
     /// Walk the field-access chain rooted at `callee` (which must be a
@@ -7438,9 +7570,19 @@ impl Emitter {
         // pointer_vars entry so `dut.field` lowers to `dut->field`.
         let mut subs = std::collections::HashMap::new();
         let mut added_pointer_fields: Vec<String> = Vec::new();
+        let mut added_field_types: Vec<String> = Vec::new();
         for ci in &c.items {
             if let ComponentItem::Field(f) = ci {
                 subs.insert(f.name.name.clone(), format!("self.{}", f.name.name));
+                if let Some(ty) = type_simple_name(Some(&f.ty)) {
+                    if self
+                        .let_types
+                        .insert(f.name.name.clone(), ty.to_string())
+                        .is_none()
+                    {
+                        added_field_types.push(f.name.name.clone());
+                    }
+                }
                 if self.is_dut_pointer_field_type(&f.ty) {
                     if self.pointer_vars.insert(f.name.name.clone()) {
                         added_pointer_fields.push(f.name.name.clone());
@@ -7512,6 +7654,9 @@ impl Emitter {
             }
         }
         self.field_subs = prev_subs;
+        for k in added_field_types {
+            self.let_types.remove(&k);
+        }
         for k in added_pointer_fields {
             self.pointer_vars.remove(&k);
         }
@@ -8496,7 +8641,12 @@ impl Emitter {
                 "range" => {
                     if a.args.len() >= 2 {
                         if let (AttrArg::Expr(lo), AttrArg::Expr(hi)) = (&a.args[0], &a.args[1]) {
-                            write!(self.out, "{INDENT}t->{} = harc_rt::random::harc_rng_range(harc_rng_next, ", f.name.name).ok();
+                            write!(
+                                self.out,
+                                "{INDENT}t->{} = harc_rt::random::harc_rng_range(harc_rng_next, ",
+                                f.name.name
+                            )
+                            .ok();
                             self.emit_expr(lo);
                             write!(self.out, ", ").ok();
                             self.emit_expr(hi);
@@ -8511,7 +8661,12 @@ impl Emitter {
                         _ => None,
                     });
                     if let Some(entries) = dist_args {
-                        write!(self.out, "{INDENT}t->{} = harc_rt::random::harc_rng_dist(harc_rng_next, {{", f.name.name).ok();
+                        write!(
+                            self.out,
+                            "{INDENT}t->{} = harc_rt::random::harc_rng_dist(harc_rng_next, {{",
+                            f.name.name
+                        )
+                        .ok();
                         self.emit_rng_dist_entries(entries);
                         writeln!(self.out, "}});").ok();
                         handled = true;
@@ -9249,8 +9404,7 @@ impl Emitter {
                         write!(self.out, "if (").ok();
                         self.emit_target_field_access(target, f);
                         if list.elem_width <= 64 {
-                            write!(self.out, ".size() > {i}) _s.add(_z_{}_{i} == ", c_name)
-                                .ok();
+                            write!(self.out, ".size() > {i}) _s.add(_z_{}_{i} == ", c_name).ok();
                             if list.elem_signed {
                                 write!(self.out, "harc_z3_bv_signed_value(_ctx, ").ok();
                             } else {
@@ -9268,8 +9422,7 @@ impl Emitter {
                                 writeln!(self.out, "[{i}], {}));", solver_width).ok();
                             }
                         } else {
-                            write!(self.out, ".size() > {i}) _s.add(_z_{}_{i} == ", c_name)
-                                .ok();
+                            write!(self.out, ".size() > {i}) _s.add(_z_{}_{i} == ", c_name).ok();
                             if list.elem_signed {
                                 write!(self.out, "harc_z3_bv_signed_value(_ctx, ").ok();
                             } else {
@@ -9349,8 +9502,7 @@ impl Emitter {
                         )
                         .ok();
                     } else {
-                        write!(self.out, "_s.add(_z_{} == harc_z3_bv_value(_ctx, ", c_name)
-                            .ok();
+                        write!(self.out, "_s.add(_z_{} == harc_z3_bv_value(_ctx, ", c_name).ok();
                     }
                     self.emit_target_field_access(target, f);
                     if f.signed {
@@ -9367,12 +9519,7 @@ impl Emitter {
                         )
                         .ok();
                     } else {
-                        write!(
-                            self.out,
-                            "_s.add(_z_{} == harc_z3_bv_value(_ctx, ",
-                            c_name
-                        )
-                        .ok();
+                        write!(self.out, "_s.add(_z_{} == harc_z3_bv_value(_ctx, ", c_name).ok();
                     }
                     self.emit_target_field_access(target, f);
                     if f.signed {
@@ -9610,7 +9757,10 @@ impl Emitter {
         let mut free_fields: Vec<&TxnFieldInfo> = fields
             .iter()
             .filter(|f| {
-                f.list.is_none() && f.width > 0 && !f.non_random && !pinned.contains(&f.name)
+                f.list.is_none()
+                    && f.width > 0
+                    && !f.non_random
+                    && !pinned.contains(&f.name)
                     && f.when_guard.is_none()
             })
             .collect();
@@ -10251,7 +10401,11 @@ impl Emitter {
                     &field_root_names,
                 ))
             });
-            let scalar_depth = if guard_expr.is_some() { depth + 3 } else { depth + 2 };
+            let scalar_depth = if guard_expr.is_some() {
+                depth + 3
+            } else {
+                depth + 2
+            };
             if let Some(guard) = &guard_expr {
                 self.pad(depth + 2);
                 write!(self.out, "if (").ok();
@@ -10363,11 +10517,7 @@ impl Emitter {
         }
         self.emit_randomize_trace_event(ty, target, depth + 2);
         self.pad(depth + 2);
-        writeln!(
-            self.out,
-            "return harc_rt::random::harc_solve_status_ok();"
-        )
-        .ok();
+        writeln!(self.out, "return harc_rt::random::harc_solve_status_ok();").ok();
         self.pad(depth + 1);
         writeln!(self.out, "}} else {{").ok();
         self.pad(depth + 2);
@@ -10955,8 +11105,12 @@ impl Emitter {
                     if width <= 64 {
                         write!(self.out, "_ctx.bv_val((uint64_t){}, {})", idx, width).ok();
                     } else {
-                        write!(self.out, "harc_z3_bv_value(_ctx, (uint64_t){}, {})", idx, width)
-                            .ok();
+                        write!(
+                            self.out,
+                            "harc_z3_bv_value(_ctx, (uint64_t){}, {})",
+                            idx, width
+                        )
+                        .ok();
                     }
                 } else if blocking && self.let_widths.contains_key(&id.name) {
                     if width <= 64 {
@@ -12705,6 +12859,21 @@ impl Emitter {
                     // the struct. The user assigns DUT pointers and other
                     // field values explicitly afterward (`drv.dut = dut;`).
                     writeln!(self.out, "{name} {};", l.name.name).ok();
+                    if l.name.name == "_tb" {
+                        for ci in &comp.items {
+                            if let ComponentItem::Field(f) = ci {
+                                if f.name.name != "dut" {
+                                    self.pad(depth);
+                                    writeln!(
+                                        self.out,
+                                        "auto& {} = _tb.{};",
+                                        f.name.name, f.name.name
+                                    )
+                                    .ok();
+                                }
+                            }
+                        }
+                    }
                     // Register on-handlers in the body the same way
                     // monitors do — events get subscriber closures,
                     // bool exprs get cycle-trigger checkers. Tag prefix
@@ -14172,9 +14341,7 @@ fn txn_field_c_type(t: &TypeExpr) -> String {
             BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {
                 cpp_uint_for_width(int_width_from_args(args))
             }
-            BuiltinTy::SInt | BuiltinTy::SIntCap => {
-                cpp_sint_for_width(int_width_from_args(args))
-            }
+            BuiltinTy::SInt | BuiltinTy::SIntCap => cpp_sint_for_width(int_width_from_args(args)),
             BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => "bool".into(),
             _ => "uint64_t".into(),
         },
@@ -14442,9 +14609,7 @@ fn c_type_for(t: &TypeExpr) -> String {
             BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {
                 cpp_uint_for_width(int_width_from_args(args))
             }
-            BuiltinTy::SInt | BuiltinTy::SIntCap => {
-                cpp_sint_for_width(int_width_from_args(args))
-            }
+            BuiltinTy::SInt | BuiltinTy::SIntCap => cpp_sint_for_width(int_width_from_args(args)),
             BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => "bool".into(),
             BuiltinTy::String => "const char*".into(),
             BuiltinTy::Time => "uint64_t".into(),

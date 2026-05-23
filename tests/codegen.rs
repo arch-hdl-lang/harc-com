@@ -1945,6 +1945,63 @@ end test T"#,
 }
 
 #[test]
+fn active_post_eval_handler_calls_component_field_method() {
+    let parsed = parse_source(
+        r#"struct ReadResponse
+    matched : uint<1>
+    data : uint<32>
+end struct ReadResponse
+
+transactor ProtocolModel
+    function predict_read(addr: uint<8>) -> ReadResponse
+        let r : ReadResponse
+        r.matched = 1
+        r.data = addr + 256
+        return r
+    end predict_read
+end transactor ProtocolModel
+
+transactor BusResponder
+    dut : ProviderDut
+    model : ProtocolModel
+
+    when active
+        on 1 cycles phase post_eval
+            if dut.req_valid != 0
+                let r : ReadResponse = model.predict_read(dut.req_addr)
+                dut.rsp_data = r.data
+            end if
+        end on
+    end when
+end transactor BusResponder
+
+testbench Tb
+    dut : ProviderDut
+    responder : BusResponder active
+end testbench Tb
+
+impl ActivePostEvalProviderCallTest for Tb
+    run
+        responder.dut = dut
+        wait 1 cycle
+    end run
+end impl ActivePostEvalProviderCallTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains(
+            "ProtocolModel_predict_read(responder.model, harc_rt::harc_read(dut->req_addr))"
+        ),
+        "expected component-field provider call to dispatch through generated method; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("model.predict_read"),
+        "bare component field calls must not fall through to C++ member calls; got:\n{cpp}"
+    );
+}
+
+#[test]
 fn main_loop_runs_post_eval_services_before_coroutine_tick() {
     let parsed = parse_source(
         r#"test T
