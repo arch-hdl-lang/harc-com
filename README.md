@@ -201,7 +201,7 @@ The resolver checks CLI flags first, then `HARC_Z3_INCLUDE_DIR` / `HARC_Z3_LIB_D
 
 ## Examples
 
-[`tests/fixtures/`](tests/fixtures/) holds 56 runnable HARC TBs targeting DUTs vendored under [`tests/dut/`](tests/dut/). Each fixture compiles, runs through Verilator, and asserts `ALL TESTS PASSED`. A non-exhaustive tour:
+[`tests/fixtures/`](tests/fixtures/) holds runnable HARC TBs targeting DUTs vendored under [`tests/dut/`](tests/dut/). Each fixture compiles, runs through Verilator, and asserts `ALL TESTS PASSED`. A non-exhaustive tour:
 
 | Fixture | DUT | Demonstrates |
 |---|---|---|
@@ -213,6 +213,8 @@ The resolver checks CLI flags first, then `HARC_Z3_INCLUDE_DIR` / `HARC_Z3_LIB_D
 | `axilite_bus_send_test.harc` | `AxiLiteRegs.sv` | typed bus binding + `bus.<ch>.send/recv` |
 | `axilite_bound_mon_test.harc` | `AxiLiteRegs.sv` | bound monitor (`on bus.<ch>.handshake(t)`) |
 | `axilite_constraint_test.harc` | `AxiLiteRegs.sv` | `randomize(t) with …` through Z3 |
+| `dma_engine_tlm_target_test.harc` | `dma_engine_tlm_mem.sv` + `dma_engine.sv` | passive target TLM memory transactor serving an SV DMA initiator |
+| `dma_engine_tlm_mem_model_test.harc` | `dma_engine_tlm_mem.sv` + `dma_engine.sv` | stateful passive TLM memory model with final copied-data checks |
 | `keep_constraints_test.harc` | `top_counter.sv` | transaction `keep` constraints (range, modulus, enum exclusion) |
 | `relation_inlining_test.harc` | `top_counter.sv` | `relation` inlining — block + alias + composite forms |
 | `heartbeat_idle_test.harc` | `top_counter.sv` | per-agent `_last_in_cycle` heartbeats + `idle(N)` predicate |

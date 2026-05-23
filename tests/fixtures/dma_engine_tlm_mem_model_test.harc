@@ -1,0 +1,185 @@
+// DMA memory-backed passive TLM target test.
+//
+// This fixture keeps the smoke TLM fixture separate and makes the passive
+// target behave like a tiny memory model: source reads return stored payload
+// words, destination writes update target-side state, and the final assertions
+// check that the DMA copied the source region into the destination region.
+
+bus DmaMemTlmBus
+    tlm_method read(addr: uint<32>) -> uint<32>: blocking;
+    tlm_method write(addr: uint<32>, data: uint<32>): blocking;
+end bus DmaMemTlmBus
+
+transactor DmaMemModelTarget bound to DmaMemTlmBus
+    src0 : uint<32> default 160
+    src1 : uint<32> default 177
+    src2 : uint<32> default 194
+    src3 : uint<32> default 211
+    dst0 : uint<32> default 0
+    dst1 : uint<32> default 0
+    dst2 : uint<32> default 0
+    dst3 : uint<32> default 0
+    read_count : uint<32> default 0
+    write_count : uint<32> default 0
+    error_count : uint<32> default 0
+    read_checksum : uint<32> default 0
+    write_checksum : uint<32> default 0
+    prep_acc : uint<32> default 0
+
+    thread bus.read(addr: uint<32>)
+        read_count = read_count + 1
+        read_checksum = read_checksum + addr
+        prep_acc = 0
+
+        let latency : uint<32> = (addr & 1) + 1
+        for i in 0 .. latency
+            prep_acc = prep_acc + i
+        end for
+
+        if addr == 4096
+            return src0
+        end if
+        if addr == 4097
+            return src1
+        end if
+        if addr == 4098
+            return src2
+        end if
+        if addr == 4099
+            return src3
+        end if
+
+        error_count = error_count + 1
+        return 3735928559
+    end thread
+
+    thread bus.write(addr: uint<32>, data: uint<32>)
+        write_count = write_count + 1
+        write_checksum = write_checksum + addr + data
+
+        if addr == 8192
+            dst0 = data
+            return
+        end if
+        if addr == 8193
+            dst1 = data
+            return
+        end if
+        if addr == 8194
+            dst2 = data
+            return
+        end if
+        if addr == 8195
+            dst3 = data
+            return
+        end if
+
+        error_count = error_count + 1
+    end thread
+end transactor DmaMemModelTarget
+
+transactor ApbXactor
+    dut : DmaEngineTlmMem
+
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            dut.apb_sel = 1
+            dut.apb_enable = 0
+            dut.apb_write = 1
+            dut.apb_addr = addr
+            dut.apb_wdata = data
+            wait 1 cycle
+            dut.apb_enable = 1
+            wait 1 cycle
+            dut.apb_sel = 0
+            dut.apb_enable = 0
+            dut.apb_write = 0
+        end write
+
+        hookable read(addr: uint<8>) -> uint<32>
+            dut.apb_sel = 1
+            dut.apb_enable = 0
+            dut.apb_write = 0
+            dut.apb_addr = addr
+            wait 1 cycle
+            dut.apb_enable = 1
+            wait 1 cycle
+            let val = dut.apb_rdata
+            dut.apb_sel = 0
+            dut.apb_enable = 0
+            return val
+        end read
+    end when
+end transactor ApbXactor
+
+testbench DmaEngineTlmMemModelTb
+    dut : DmaEngineTlmMem
+    apb : ApbXactor active
+end testbench DmaEngineTlmMemModelTb
+
+impl DmaEngineTlmMemModelTest for DmaEngineTlmMemModelTb
+    let mem : DmaMemTlmBus = bind dut with {
+        read.req_valid: "mem_read_req_valid",
+        read.req_ready: "mem_read_req_ready",
+        read.addr: "mem_read_addr",
+        read.rsp_valid: "mem_read_rsp_valid",
+        read.rsp_ready: "mem_read_rsp_ready",
+        read.rsp_data: "mem_read_rsp_data",
+        write.req_valid: "mem_write_req_valid",
+        write.req_ready: "mem_write_req_ready",
+        write.addr: "mem_write_addr",
+        write.data: "mem_write_data",
+        write.rsp_valid: "mem_write_rsp_valid",
+        write.rsp_ready: "mem_write_rsp_ready"
+    }
+    let target : DmaMemModelTarget passive = bind mem
+
+    run
+        log(info, "DmaEngine TLM target memory-model test")
+
+        apb.dut = dut
+
+        dut.rst = 1
+        dut.apb_sel = 0
+        dut.apb_enable = 0
+        dut.apb_write = 0
+        dut.apb_addr = 0
+        dut.apb_wdata = 0
+        wait 4 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        apb.write(0, 4096)
+        apb.write(1, 8192)
+        apb.write(2, 3)
+        apb.write(3, 1)
+
+        wait until dut.irq == 1 timeout 120 cycles fail("IRQ never fired with TLM memory model")
+
+        assert target.read_count == 4
+            else fail("expected 4 TLM reads, observed ${target.read_count}")
+        assert target.write_count == 4
+            else fail("expected 4 TLM writes, observed ${target.write_count}")
+        assert target.error_count == 0
+            else fail("TLM memory model saw ${target.error_count} invalid accesses")
+        assert target.read_checksum == 16390
+            else fail("read checksum ${target.read_checksum}, expected 16390")
+        assert target.write_checksum == 33516
+            else fail("write checksum ${target.write_checksum}, expected 33516")
+
+        assert target.dst0 == target.src0
+            else fail("dst0 ${target.dst0}, expected ${target.src0}")
+        assert target.dst1 == target.src1
+            else fail("dst1 ${target.dst1}, expected ${target.src1}")
+        assert target.dst2 == target.src2
+            else fail("dst2 ${target.dst2}, expected ${target.src2}")
+        assert target.dst3 == target.src3
+            else fail("dst3 ${target.dst3}, expected ${target.src3}")
+
+        let rb_beat = apb.read(2)
+        assert rb_beat == 0
+            else fail("APB beat readback ${rb_beat}, expected 0 after completion")
+
+        log(info, "ALL TESTS PASSED - dma_engine_tlm_mem_model_test")
+    end run
+end impl DmaEngineTlmMemModelTest
