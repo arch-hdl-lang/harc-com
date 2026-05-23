@@ -4747,6 +4747,48 @@ end impl Smoke"#,
 }
 
 #[test]
+fn component_method_returns_struct_value() {
+    let parsed = parse_source(
+        r#"struct ReadResponse
+    matched : uint<1>
+    data : uint<64>
+end struct ReadResponse
+
+transactor ProtocolModel
+    function predict_read(addr: uint<64>) -> ReadResponse
+        let r : ReadResponse
+        r.matched = 1
+        r.data = addr + 16
+        return r
+    end predict_read
+end transactor ProtocolModel
+
+testbench Tb
+    dut : DummyDut
+    model : ProtocolModel active
+end testbench Tb
+
+impl ComponentMethodStructReturnTest for Tb
+    run
+        let r : ReadResponse = model.predict_read(32)
+        assert r.matched != 0 else fail("no match")
+        assert r.data == 48 else fail("bad data")
+    end run
+end impl ComponentMethodStructReturnTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("auto ProtocolModel_predict_read = [&](ProtocolModel& self, uint64_t addr) -> ReadResponse"),
+        "expected struct return value in component method; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("-> VReadResponse*"),
+        "struct returns must not lower as Verilator module pointers; got:\n{cpp}"
+    );
+}
+
+#[test]
 fn impl_for_testbench_preserves_testbench_dut_probes() {
     let parsed = parse_source(
         r#"testbench ProbeDutTb
