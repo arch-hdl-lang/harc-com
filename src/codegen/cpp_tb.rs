@@ -10084,24 +10084,26 @@ impl Emitter {
             )
             .ok();
             self.pad(depth + 1);
-            writeln!(self.out, "if (!_auto_cov_report_registered_{cache_tag}) {{").ok();
+            writeln!(
+                self.out,
+                "harc_rt::random::harc_auto_cov_register_report(_auto_cov_report_registered_{cache_tag}, _auto_cov_reports, [&]() {{"
+            )
+            .ok();
             self.pad(depth + 2);
-            writeln!(self.out, "_auto_cov_reports.push_back([&]() {{").ok();
-            self.pad(depth + 3);
             writeln!(self.out, "uint64_t _hit = 0;").ok();
-            self.pad(depth + 3);
+            self.pad(depth + 2);
             writeln!(self.out, "uint64_t _blocked = 0;").ok();
-            self.pad(depth + 3);
+            self.pad(depth + 2);
             writeln!(self.out, "uint64_t _total = {total_bins};").ok();
             for goal in &auto_goals {
-                self.pad(depth + 3);
+                self.pad(depth + 2);
                 writeln!(
                     self.out,
                     "_hit += harc_rt::random::harc_auto_cov_count(_auto_cov_{cache_tag}_{});",
                     goal.c_field
                 )
                 .ok();
-                self.pad(depth + 3);
+                self.pad(depth + 2);
                 writeln!(
                     self.out,
                     "_blocked += harc_rt::random::harc_auto_cov_count(_auto_cov_blocked_{cache_tag}_{});",
@@ -10110,14 +10112,14 @@ impl Emitter {
                 .ok();
             }
             for (a, b) in &auto_crosses {
-                self.pad(depth + 3);
+                self.pad(depth + 2);
                 writeln!(
                     self.out,
                     "_hit += harc_rt::random::harc_auto_cov_count(_auto_cross_{cache_tag}_{}__{});",
                     a.c_field, b.c_field
                 )
                 .ok();
-                self.pad(depth + 3);
+                self.pad(depth + 2);
                 writeln!(
                     self.out,
                     "_blocked += harc_rt::random::harc_auto_cov_count(_auto_cross_blocked_{cache_tag}_{}__{});",
@@ -10125,7 +10127,7 @@ impl Emitter {
                 )
                 .ok();
             }
-            self.pad(depth + 3);
+            self.pad(depth + 2);
             writeln!(
                 self.out,
                 "harc_rt::random::harc_auto_cov_report_summary(\"{}\", {}, _hit, _total, _blocked);",
@@ -10135,7 +10137,7 @@ impl Emitter {
             .ok();
             for goal in &auto_goals {
                 for (idx, value) in goal.values.iter().enumerate() {
-                    self.pad(depth + 3);
+                    self.pad(depth + 2);
                     writeln!(
                         self.out,
                         "harc_rt::random::harc_auto_cov_report_bin(\"{}.{}={}\", _auto_cov_{cache_tag}_{}[{}], _auto_cov_blocked_{cache_tag}_{}[{}]);",
@@ -10153,7 +10155,7 @@ impl Emitter {
             for (a, b) in &auto_crosses {
                 for (i, av) in a.values.iter().enumerate() {
                     for (j, bv) in b.values.iter().enumerate() {
-                        self.pad(depth + 3);
+                        self.pad(depth + 2);
                         writeln!(
                             self.out,
                             "harc_rt::random::harc_auto_cov_report_bin(\"{}.{}={} x {}.{}={}\", _auto_cross_{cache_tag}_{}__{}[{}][{}], _auto_cross_blocked_{cache_tag}_{}__{}[{}][{}]);",
@@ -10176,12 +10178,8 @@ impl Emitter {
                     }
                 }
             }
-            self.pad(depth + 2);
-            writeln!(self.out, "}});").ok();
-            self.pad(depth + 2);
-            writeln!(self.out, "_auto_cov_report_registered_{cache_tag} = true;").ok();
             self.pad(depth + 1);
-            writeln!(self.out, "}}").ok();
+            writeln!(self.out, "}});").ok();
         }
 
         // Seeded preference values. These are hard clauses only for the first
