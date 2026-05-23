@@ -6,6 +6,50 @@
 use harc::codegen::{cpp_tb, merge};
 use harc::parser::parse_source;
 
+fn compile_and_run_runtime_cpp(name: &str, body: &str) {
+    use std::fs;
+    use std::process::Command;
+
+    let dir = std::env::temp_dir().join(format!("harc_runtime_{name}_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let cpp = dir.join("test.cpp");
+    let bin = dir.join("test_bin");
+    fs::write(
+        &cpp,
+        format!(
+            "#include <cassert>\n#include <cstdint>\n#include \"{}\"\nint main() {{\n{}\nreturn 0;\n}}\n",
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("runtime/harc_thread_rt.h")
+                .display(),
+            body
+        ),
+    )
+    .unwrap();
+    let compile = Command::new("c++")
+        .arg("-std=c++20")
+        .arg(&cpp)
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .expect("spawn c++");
+    assert!(
+        compile.status.success(),
+        "compile failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&bin)
+        .output()
+        .expect("run runtime helper test");
+    assert!(
+        run.status.success(),
+        "runtime helper test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
 // Snapshot test for the all-in-one counter TB form lives in
 // `split_test_via_extend_round_trips_to_same_cpp`, which exercises the
 // split-file form and locks the same emitted C++ via insta.
@@ -5183,6 +5227,312 @@ end impl T"#,
     assert!(
         cpp.contains("0xFFFFFFFFULL"),
         "expected 32-bit mask from .trunc<32>(); got:\n{cpp}",
+    );
+}
+
+#[test]
+fn issue_215_wide_zext_128_arithmetic_emits() {
+    let parsed = parse_source(
+        r#"function calc(a: uint<48>, b: uint<16>, c: uint<32>, d: uint<48>) -> uint<32>
+    let n : uint<128> = a.zext<128>() * b.zext<128>() * c.zext<128>()
+    let q : uint<128> = n / d.zext<128>()
+    if (q >> 32) != 0
+        return 0xffffffff
+    end if
+    return q.trunc<32>()
+end function calc
+
+testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let r : uint<32> = calc(3, 5, 7, 2)
+        log(info, "${r:08x}")
+    end run
+end impl T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("issue #215 wide arithmetic should emit");
+    assert!(
+        cpp.contains("_harc_u128"),
+        "expected _harc_u128 in emitted C++:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("width must be in 1..=64"),
+        "stale width limit leaked into output:\n{cpp}"
+    );
+}
+
+#[test]
+fn wide_zext_128_minimal_repro_emits_and_truncates() {
+    let parsed = parse_source(
+        r#"function wide_zext_128_repro(a: uint<48>, b: uint<16>) -> uint<64>
+    let product : uint<128> = a.zext<128>() * b.zext<128>()
+    return product.trunc<64>()
+end function wide_zext_128_repro
+
+testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let r : uint<64> = wide_zext_128_repro(0x1234, 0x10)
+        log(info, "${r:016x}")
+    end run
+end impl T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("wide zext repro should emit");
+    assert!(
+        cpp.contains("_harc_u128"),
+        "expected _harc_u128 lowering:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("uint64_t") || cpp.contains("0xFFFFFFFFFFFFFFFF"),
+        "expected trunc<64> path:\n{cpp}"
+    );
+}
+
+#[test]
+fn wide_128_width_methods_emit_masks_and_sign_extension() {
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let narrow : uint<64> = 0xffffffffffffffff
+        let wide : uint<128> = narrow.zext<128>()
+        let resized : uint<128> = narrow.resize<128>()
+        let low96 : uint<96> = wide.trunc<96>()
+        let signed128 : uint<128> = (0xff as uint<8>).sext<128>()
+        log(info, "${low96:032x} ${resized:032x} ${signed128:032x}")
+    end run
+end impl T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("128-bit width methods should emit");
+    assert!(
+        cpp.contains("_harc_u128"),
+        "expected _harc_u128 lowering:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("harc_sext") || cpp.contains("<< 120") || cpp.contains("0xFFFFFFFF"),
+        "expected sign-extension or mask code:\n{cpp}"
+    );
+}
+
+#[test]
+fn wide_128_wrong_direction_checks_still_error() {
+    let bad_trunc = parse_source(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let v : uint<64> = 1
+        let bad = v.trunc<128>()
+        log(info, "${bad}")
+    end run
+end impl T"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&bad_trunc).unwrap_err();
+    assert!(
+        err.0.contains("trunc<128>") && err.0.contains("zext"),
+        "expected trunc wrong-direction diagnostic, got: {}",
+        err.0
+    );
+
+    let bad_zext = parse_source(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let v : uint<128> = 1
+        let bad = v.zext<64>()
+        log(info, "${bad}")
+    end run
+end impl T"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&bad_zext).unwrap_err();
+    assert!(
+        err.0.contains("zext<64>") && err.0.contains("trunc"),
+        "expected zext wrong-direction diagnostic, got: {}",
+        err.0
+    );
+}
+
+#[test]
+fn uint256_typed_local_uses_harcwide_storage() {
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let x : uint<256> = 1
+        log(info, "${x}")
+    end run
+end impl T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("uint<256> local should emit");
+    assert!(
+        cpp.contains("harc_rt::HarcWide<8> x"),
+        "expected HarcWide<8> local:\n{cpp}"
+    );
+}
+
+#[test]
+fn uint256_width_methods_emit_harcwide_helpers() {
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let small : uint<64> = 0xffffffffffffffff
+        let wide : uint<256> = small.zext<256>()
+        let low130 : uint<130> = wide.trunc<130>()
+        let sign130 : uint<130> = (0x100 as uint<9>).sext<130>()
+        log(info, "${low130} ${sign130}")
+    end run
+end impl T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("uint<256> width methods should emit");
+    assert!(
+        cpp.contains("harc_rt::HarcWide<8>"),
+        "expected HarcWide<8> for zext<256>:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("harc_wide_trunc") && cpp.contains("harc_wide_sext"),
+        "expected wide trunc/sext helpers:\n{cpp}"
+    );
+}
+
+#[test]
+fn uint256_hex_literal_local_uses_harcwide_value_expression() {
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let x : uint<256> = 0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+        log(info, "${x}")
+    end run
+end impl T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("uint<256> literal local should emit");
+    assert!(
+        cpp.contains("harc_rt::HarcWide<8> x"),
+        "expected HarcWide<8> local:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("0x1c1d1e1f") || cpp.contains("0x1C1D1E1F"),
+        "expected split 32-bit words in literal:\n{cpp}"
+    );
+}
+
+#[test]
+fn harcwide_mask_and_sign_extension_runtime() {
+    compile_and_run_runtime_cpp(
+        "mask_sext",
+        r#"
+        harc_rt::HarcWide<5> v;
+        for (auto& w : v.words) w = 0xffffffffu;
+        auto m = harc_rt::harc_wide_mask_bits(v, 130);
+        assert(m.words[0] == 0xffffffffu);
+        assert(m.words[1] == 0xffffffffu);
+        assert(m.words[2] == 0xffffffffu);
+        assert(m.words[3] == 0xffffffffu);
+        assert(m.words[4] == 0x00000003u);
+        auto s = harc_rt::harc_wide_sext<5>(0x100u, 9, 130);
+        assert(s.words[0] == 0xffffff00u);
+        assert(s.words[1] == 0xffffffffu);
+        assert(s.words[2] == 0xffffffffu);
+        assert(s.words[3] == 0xffffffffu);
+        assert(s.words[4] == 0x00000003u);
+        "#,
+    );
+}
+
+#[test]
+fn harcwide_arithmetic_runtime() {
+    compile_and_run_runtime_cpp(
+        "arith",
+        r#"
+        harc_rt::HarcWide<8> a;
+        a.words[0] = 0xffffffffu;
+        auto one = harc_rt::HarcWide<8>(1u);
+        auto sum = a + one;
+        assert(sum.words[0] == 0u);
+        assert(sum.words[1] == 1u);
+        auto diff = sum - one;
+        assert(diff.words[0] == 0xffffffffu);
+        assert(diff.words[1] == 0u);
+        auto mul = harc_rt::HarcWide<8>(0x10000u) * harc_rt::HarcWide<8>(0x10000u);
+        assert(mul.words[0] == 0u);
+        assert(mul.words[1] == 1u);
+        "#,
+    );
+}
+
+#[test]
+fn harcwide_shift_compare_div_mod_runtime() {
+    compile_and_run_runtime_cpp(
+        "shift_div",
+        r#"
+        auto one = harc_rt::HarcWide<8>(1u);
+        auto s32 = one << 32;
+        assert(s32.words[0] == 0u && s32.words[1] == 1u);
+        auto s127 = one << 127;
+        assert(s127.words[3] == 0x80000000u);
+        auto back = s127 >> 127;
+        assert(back.words[0] == 1u);
+        assert(s127 > s32);
+        auto n = harc_rt::HarcWide<8>(1000u);
+        auto d = harc_rt::HarcWide<8>(37u);
+        auto q = n / d;
+        auto r = n % d;
+        auto check = q * d + r;
+        assert(check == n);
+        assert(r < d);
+        "#,
+    );
+}
+
+#[test]
+fn uint256_arithmetic_expression_uses_harcwide_operators() {
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let a : uint<256> = 0x100000000000000000000000000000000
+        let b : uint<256> = 0x25
+        let c : uint<256> = ((a + b) * b) / b
+        let r : uint<256> = c % b
+        assert r == 0 else fail("wide modulo")
+    end run
+end impl T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("uint<256> arithmetic should emit");
+    assert!(
+        cpp.contains("harc_rt::HarcWide<8>"),
+        "expected HarcWide<8> arithmetic:\n{cpp}"
+    );
+    assert!(
+        cpp.contains(" / ") && cpp.contains(" % "),
+        "expected division and modulo operators in emitted C++:\n{cpp}"
     );
 }
 

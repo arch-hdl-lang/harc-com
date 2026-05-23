@@ -179,6 +179,232 @@ inline bool operator!=(T lhs, const HarcWide<N>& rhs) {
     return !(lhs == rhs);
 }
 
+template<std::size_t N>
+inline HarcWide<N> harc_wide_mask_bits(HarcWide<N> value, unsigned width) {
+    const unsigned total = static_cast<unsigned>(N * 32);
+    if (width >= total) return value;
+    const unsigned keep_words = width / 32;
+    const unsigned keep_bits = width % 32;
+    for (std::size_t i = keep_words + (keep_bits ? 1 : 0); i < N; ++i) value.words[i] = 0;
+    if (keep_words < N) {
+        if (keep_bits == 0) {
+            for (std::size_t i = keep_words; i < N; ++i) value.words[i] = 0;
+        } else {
+            value.words[keep_words] &= (uint32_t{1} << keep_bits) - 1u;
+        }
+    }
+    return value;
+}
+
+template<std::size_t N, typename T>
+inline HarcWide<N> harc_wide_zext(T value) {
+    return HarcWide<N>(value);
+}
+
+template<std::size_t N, std::size_t M>
+inline HarcWide<N> harc_wide_zext(const HarcWide<M>& value) {
+    HarcWide<N> out;
+    constexpr std::size_t C = (N < M) ? N : M;
+    for (std::size_t i = 0; i < C; ++i) out.words[i] = value.words[i];
+    return out;
+}
+
+template<std::size_t N, typename T>
+inline HarcWide<N> harc_wide_trunc(T value, unsigned width) {
+    return harc_wide_mask_bits(HarcWide<N>(value), width);
+}
+
+template<std::size_t N, std::size_t M>
+inline HarcWide<N> harc_wide_trunc(const HarcWide<M>& value, unsigned width) {
+    return harc_wide_mask_bits(harc_wide_zext<N>(value), width);
+}
+
+template<std::size_t N, typename T>
+inline HarcWide<N> harc_wide_sext(T value, unsigned source_width, unsigned dest_width) {
+    HarcWide<N> out(value);
+    out = harc_wide_mask_bits(out, source_width);
+    if (source_width == 0 || dest_width == 0) return HarcWide<N>();
+    const unsigned sign_bit = source_width - 1;
+    const std::size_t sign_word = sign_bit / 32;
+    const unsigned sign_off = sign_bit % 32;
+    const bool neg = sign_word < N && ((out.words[sign_word] >> sign_off) & 1u);
+    if (!neg) return harc_wide_mask_bits(out, dest_width);
+    for (unsigned bit = source_width; bit < dest_width && bit < N * 32; ++bit) {
+        out.words[bit / 32] |= uint32_t{1} << (bit % 32);
+    }
+    return harc_wide_mask_bits(out, dest_width);
+}
+
+template<std::size_t N>
+inline bool harc_wide_get_bit(const HarcWide<N>& v, unsigned bit) {
+    return bit < N * 32 && ((v.words[bit / 32] >> (bit % 32)) & 1u);
+}
+
+template<std::size_t N>
+inline void harc_wide_set_bit(HarcWide<N>& v, unsigned bit) {
+    if (bit < N * 32) v.words[bit / 32] |= uint32_t{1} << (bit % 32);
+}
+
+template<std::size_t N>
+inline HarcWide<N> operator+(const HarcWide<N>& lhs, const HarcWide<N>& rhs) {
+    HarcWide<N> out;
+    uint64_t carry = 0;
+    for (std::size_t i = 0; i < N; ++i) {
+        const uint64_t sum = static_cast<uint64_t>(lhs.words[i]) + rhs.words[i] + carry;
+        out.words[i] = static_cast<uint32_t>(sum);
+        carry = sum >> 32;
+    }
+    return out;
+}
+
+template<std::size_t N>
+inline HarcWide<N> operator-(const HarcWide<N>& lhs, const HarcWide<N>& rhs) {
+    HarcWide<N> out;
+    uint64_t borrow = 0;
+    for (std::size_t i = 0; i < N; ++i) {
+        const uint64_t l = lhs.words[i];
+        const uint64_t r = static_cast<uint64_t>(rhs.words[i]) + borrow;
+        out.words[i] = static_cast<uint32_t>(l - r);
+        borrow = l < r ? 1 : 0;
+    }
+    return out;
+}
+
+template<std::size_t N>
+inline HarcWide<N> operator*(const HarcWide<N>& lhs, const HarcWide<N>& rhs) {
+    HarcWide<N> out;
+    for (std::size_t i = 0; i < N; ++i) {
+        uint64_t carry = 0;
+        for (std::size_t j = 0; j + i < N; ++j) {
+            const uint64_t cur = static_cast<uint64_t>(out.words[i + j])
+                + static_cast<uint64_t>(lhs.words[i]) * rhs.words[j]
+                + carry;
+            out.words[i + j] = static_cast<uint32_t>(cur);
+            carry = cur >> 32;
+        }
+    }
+    return out;
+}
+
+template<std::size_t N>
+inline HarcWide<N> operator&(const HarcWide<N>& lhs, const HarcWide<N>& rhs) {
+    HarcWide<N> out;
+    for (std::size_t i = 0; i < N; ++i) out.words[i] = lhs.words[i] & rhs.words[i];
+    return out;
+}
+
+template<std::size_t N>
+inline HarcWide<N> operator|(const HarcWide<N>& lhs, const HarcWide<N>& rhs) {
+    HarcWide<N> out;
+    for (std::size_t i = 0; i < N; ++i) out.words[i] = lhs.words[i] | rhs.words[i];
+    return out;
+}
+
+template<std::size_t N>
+inline HarcWide<N> operator^(const HarcWide<N>& lhs, const HarcWide<N>& rhs) {
+    HarcWide<N> out;
+    for (std::size_t i = 0; i < N; ++i) out.words[i] = lhs.words[i] ^ rhs.words[i];
+    return out;
+}
+
+template<std::size_t N>
+inline HarcWide<N> operator~(const HarcWide<N>& value) {
+    HarcWide<N> out;
+    for (std::size_t i = 0; i < N; ++i) out.words[i] = ~value.words[i];
+    return out;
+}
+
+template<std::size_t N, typename S, typename = std::enable_if_t<std::is_integral_v<S>>>
+inline HarcWide<N> operator<<(const HarcWide<N>& value, S shift_raw) {
+    HarcWide<N> out;
+    if constexpr (std::is_signed_v<S>) {
+        if (shift_raw < 0) return out;
+    }
+    const unsigned shift = static_cast<unsigned>(shift_raw);
+    if (shift >= N * 32) return out;
+    const unsigned word_shift = shift / 32;
+    const unsigned bit_shift = shift % 32;
+    for (std::size_t i = word_shift; i < N; ++i) {
+        uint64_t part = static_cast<uint64_t>(value.words[i - word_shift]) << bit_shift;
+        out.words[i] |= static_cast<uint32_t>(part);
+        if (bit_shift && i + 1 < N) out.words[i + 1] |= static_cast<uint32_t>(part >> 32);
+    }
+    return out;
+}
+
+template<std::size_t N, typename S, typename = std::enable_if_t<std::is_integral_v<S>>>
+inline HarcWide<N> operator>>(const HarcWide<N>& value, S shift_raw) {
+    HarcWide<N> out;
+    if constexpr (std::is_signed_v<S>) {
+        if (shift_raw < 0) return out;
+    }
+    const unsigned shift = static_cast<unsigned>(shift_raw);
+    if (shift >= N * 32) return out;
+    const unsigned word_shift = shift / 32;
+    const unsigned bit_shift = shift % 32;
+    for (std::size_t i = 0; i + word_shift < N; ++i) {
+        uint64_t part = value.words[i + word_shift];
+        if (bit_shift && i + word_shift + 1 < N) part |= static_cast<uint64_t>(value.words[i + word_shift + 1]) << 32;
+        out.words[i] = static_cast<uint32_t>(part >> bit_shift);
+    }
+    return out;
+}
+
+template<std::size_t N>
+inline bool operator<(const HarcWide<N>& lhs, const HarcWide<N>& rhs) {
+    for (std::size_t i = N; i > 0; --i) {
+        if (lhs.words[i - 1] != rhs.words[i - 1]) return lhs.words[i - 1] < rhs.words[i - 1];
+    }
+    return false;
+}
+
+template<std::size_t N>
+inline bool operator>(const HarcWide<N>& lhs, const HarcWide<N>& rhs) { return rhs < lhs; }
+
+template<std::size_t N>
+inline bool operator<=(const HarcWide<N>& lhs, const HarcWide<N>& rhs) { return !(rhs < lhs); }
+
+template<std::size_t N>
+inline bool operator>=(const HarcWide<N>& lhs, const HarcWide<N>& rhs) { return !(lhs < rhs); }
+
+template<std::size_t N>
+inline bool harc_wide_is_zero(const HarcWide<N>& value) {
+    for (uint32_t word : value.words) if (word != 0) return false;
+    return true;
+}
+
+template<std::size_t N>
+inline HarcWide<N> harc_wide_divmod(const HarcWide<N>& lhs, const HarcWide<N>& rhs, HarcWide<N>* rem_out) {
+    HarcWide<N> q;
+    HarcWide<N> r;
+    if (harc_wide_is_zero(rhs)) {
+        if (rem_out) *rem_out = lhs;
+        return q;
+    }
+    for (unsigned bit = static_cast<unsigned>(N * 32); bit > 0; --bit) {
+        r = r << 1;
+        if (harc_wide_get_bit(lhs, bit - 1)) r.words[0] |= 1u;
+        if (r >= rhs) {
+            r = r - rhs;
+            harc_wide_set_bit(q, bit - 1);
+        }
+    }
+    if (rem_out) *rem_out = r;
+    return q;
+}
+
+template<std::size_t N>
+inline HarcWide<N> operator/(const HarcWide<N>& lhs, const HarcWide<N>& rhs) {
+    return harc_wide_divmod(lhs, rhs, static_cast<HarcWide<N>*>(nullptr));
+}
+
+template<std::size_t N>
+inline HarcWide<N> operator%(const HarcWide<N>& lhs, const HarcWide<N>& rhs) {
+    HarcWide<N> r;
+    (void)harc_wide_divmod(lhs, rhs, &r);
+    return r;
+}
+
 template<typename Sig, typename Val>
 inline void harc_assign(Sig& sig, Val val) {
     if constexpr (std::is_arithmetic_v<Sig>) {
@@ -222,6 +448,26 @@ inline uint64_t harc_bits(_harc_u128 value, uint32_t hi, uint32_t lo) {
     if (width >= 64) return static_cast<uint64_t>(shifted);
     const _harc_u128 mask = (static_cast<_harc_u128>(1) << width) - 1;
     return static_cast<uint64_t>(shifted & mask);
+}
+
+inline _harc_u128 harc_mask_u128(unsigned width) {
+    if (width >= 128) return ~static_cast<_harc_u128>(0);
+    if (width == 0) return 0;
+    return (static_cast<_harc_u128>(1) << width) - 1;
+}
+
+inline _harc_u128 harc_trunc_u128(_harc_u128 value, unsigned width) {
+    return value & harc_mask_u128(width);
+}
+
+inline _harc_u128 harc_sext_u128(_harc_u128 value, unsigned source_width, unsigned dest_width) {
+    value &= harc_mask_u128(source_width);
+    if (source_width == 0 || dest_width == 0) return 0;
+    if (source_width >= dest_width) return value & harc_mask_u128(dest_width);
+    const _harc_u128 sign = static_cast<_harc_u128>(1) << (source_width - 1);
+    if ((value & sign) == 0) return value & harc_mask_u128(dest_width);
+    const _harc_u128 fill = harc_mask_u128(dest_width) & ~harc_mask_u128(source_width);
+    return (value | fill) & harc_mask_u128(dest_width);
 }
 
 template<std::size_t N>

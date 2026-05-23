@@ -6620,14 +6620,9 @@ impl Emitter {
                 return true;
             }
         };
-        if width == 0 || width > 64 {
-            // arch-com supports wider (VlWide) but harc-com lowers all
-            // ≤64-bit ints to int64_t — wide-int support exists for
-            // 128-bit literals but the cast helpers used here assume
-            // ≤64. Surface the limit explicitly.
+        if width == 0 {
             self.errors.push(format!(
-                "`.{kind}<{width}>()`: width must be in 1..=64 (wide-int \
-                 narrow/extend not yet supported in harc-com)",
+                "`.{kind}<{width}>()`: width must be greater than zero",
             ));
             return true;
         }
@@ -6665,7 +6660,16 @@ impl Emitter {
         let c_unsigned = cpp_uint_for_width(Some(width));
         match kind {
             "trunc" => {
-                if width == 64 {
+                if width > 128 {
+                    let words = width.div_ceil(32);
+                    write!(self.out, "harc_rt::harc_wide_trunc<{words}>(").ok();
+                    self.emit_expr(target);
+                    write!(self.out, ", {width})").ok();
+                } else if width > 64 {
+                    write!(self.out, "harc_rt::harc_trunc_u128((_harc_u128)(").ok();
+                    self.emit_expr(target);
+                    write!(self.out, "), {width})").ok();
+                } else if width == 64 {
                     write!(self.out, "(({c_unsigned})(").ok();
                     self.emit_expr(target);
                     write!(self.out, "))").ok();
@@ -6682,9 +6686,16 @@ impl Emitter {
                 // are dropped. When source width is unknown we conservatively
                 // assume the receiver already fits in N bits — same shape
                 // as arch-com.
-                write!(self.out, "(({c_unsigned})(").ok();
-                self.emit_expr(target);
-                write!(self.out, "))").ok();
+                if width > 128 {
+                    let words = width.div_ceil(32);
+                    write!(self.out, "harc_rt::harc_wide_zext<{words}>(").ok();
+                    self.emit_expr(target);
+                    write!(self.out, ")").ok();
+                } else {
+                    write!(self.out, "(({c_unsigned})(").ok();
+                    self.emit_expr(target);
+                    write!(self.out, "))").ok();
+                }
             }
             "sext" => {
                 // Sign-extend from source width to dest width. Strategy:
@@ -6697,17 +6708,31 @@ impl Emitter {
                 // sign-bit pattern in its underlying storage.
                 if let Some(sw) = source_width {
                     if sw < width {
-                        let shift = 64 - sw;
-                        if width == 64 {
-                            // Want full 64-bit signed-extended view.
-                            write!(self.out, "((uint64_t)(((int64_t)((uint64_t)(").ok();
-                            self.emit_expr(target);
-                            write!(self.out, ") << {shift})) >> {shift}))").ok();
+                        if width > 64 {
+                            if width > 128 {
+                                let words = width.div_ceil(32);
+                                write!(self.out, "harc_rt::harc_wide_sext<{words}>(").ok();
+                                self.emit_expr(target);
+                                write!(self.out, ", {sw}, {width})").ok();
+                            } else {
+                                write!(self.out, "harc_rt::harc_sext_u128((_harc_u128)(").ok();
+                                self.emit_expr(target);
+                                write!(self.out, "), {sw}, {width})").ok();
+                            }
                         } else {
-                            let mask = (1u64 << width) - 1;
-                            write!(self.out, "(({c_unsigned})(((int64_t)((uint64_t)(").ok();
-                            self.emit_expr(target);
-                            write!(self.out, ") << {shift})) >> {shift}) & 0x{mask:X}ULL)").ok();
+                            let shift = 64 - sw;
+                            if width == 64 {
+                                // Want full 64-bit signed-extended view.
+                                write!(self.out, "((uint64_t)(((int64_t)((uint64_t)(").ok();
+                                self.emit_expr(target);
+                                write!(self.out, ") << {shift})) >> {shift}))").ok();
+                            } else {
+                                let mask = (1u64 << width) - 1;
+                                write!(self.out, "(({c_unsigned})(((int64_t)((uint64_t)(").ok();
+                                self.emit_expr(target);
+                                write!(self.out, ") << {shift})) >> {shift}) & 0x{mask:X}ULL)")
+                                    .ok();
+                            }
                         }
                     } else {
                         write!(self.out, "(({c_unsigned})(").ok();
@@ -6715,9 +6740,16 @@ impl Emitter {
                         write!(self.out, "))").ok();
                     }
                 } else {
-                    write!(self.out, "(({c_unsigned})(").ok();
-                    self.emit_expr(target);
-                    write!(self.out, "))").ok();
+                    if width > 128 {
+                        let words = width.div_ceil(32);
+                        write!(self.out, "harc_rt::harc_wide_zext<{words}>(").ok();
+                        self.emit_expr(target);
+                        write!(self.out, ")").ok();
+                    } else {
+                        write!(self.out, "(({c_unsigned})(").ok();
+                        self.emit_expr(target);
+                        write!(self.out, "))").ok();
+                    }
                 }
             }
             "resize" => {
@@ -6726,7 +6758,16 @@ impl Emitter {
                 if let Some(sw) = source_width {
                     if width < sw {
                         // Narrowing — mask + cast.
-                        if width == 64 {
+                        if width > 128 {
+                            let words = width.div_ceil(32);
+                            write!(self.out, "harc_rt::harc_wide_trunc<{words}>(").ok();
+                            self.emit_expr(target);
+                            write!(self.out, ", {width})").ok();
+                        } else if width > 64 {
+                            write!(self.out, "harc_rt::harc_trunc_u128((_harc_u128)(").ok();
+                            self.emit_expr(target);
+                            write!(self.out, "), {width})").ok();
+                        } else if width == 64 {
                             write!(self.out, "(({c_unsigned})(").ok();
                             self.emit_expr(target);
                             write!(self.out, "))").ok();
@@ -6738,15 +6779,31 @@ impl Emitter {
                         }
                     } else {
                         // Widening or same width — plain cast.
-                        write!(self.out, "(({c_unsigned})(").ok();
-                        self.emit_expr(target);
-                        write!(self.out, "))").ok();
+                        if width > 128 {
+                            let words = width.div_ceil(32);
+                            write!(self.out, "harc_rt::harc_wide_zext<{words}>(").ok();
+                            self.emit_expr(target);
+                            write!(self.out, ")").ok();
+                        } else {
+                            write!(self.out, "(({c_unsigned})(").ok();
+                            self.emit_expr(target);
+                            write!(self.out, "))").ok();
+                        }
                     }
                 } else {
                     // Unknown source width — default to mask-narrow,
                     // since `.resize<N>()` with `N <= 64` always wants
                     // a value bounded to N bits regardless of source.
-                    if width == 64 {
+                    if width > 128 {
+                        let words = width.div_ceil(32);
+                        write!(self.out, "harc_rt::harc_wide_trunc<{words}>(").ok();
+                        self.emit_expr(target);
+                        write!(self.out, ", {width})").ok();
+                    } else if width > 64 {
+                        write!(self.out, "harc_rt::harc_trunc_u128((_harc_u128)(").ok();
+                        self.emit_expr(target);
+                        write!(self.out, "), {width})").ok();
+                    } else if width == 64 {
                         write!(self.out, "(({c_unsigned})(").ok();
                         self.emit_expr(target);
                         write!(self.out, "))").ok();
