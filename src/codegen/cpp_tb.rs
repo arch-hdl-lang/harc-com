@@ -47,6 +47,8 @@ use std::fmt::Write;
 /// without a separate file dependency.
 pub const THREAD_RT_HEADER: &str = include_str!("../../runtime/harc_thread_rt.h");
 pub const RANDOM_RT_HEADER: &str = include_str!("../../runtime/harc_random_rt.h");
+pub const TRACE_RT_HEADER: &str = include_str!("../../runtime/harc_trace_rt.h");
+pub const Z3_RT_HEADER: &str = include_str!("../../runtime/harc_z3_rt.h");
 
 const INDENT: &str = "    ";
 
@@ -606,6 +608,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // bus) lands in Phase 2 on top of the same runtime.
     writeln!(e.out, "#include \"harc_thread_rt.h\"").ok();
     writeln!(e.out, "#include \"harc_random_rt.h\"").ok();
+    writeln!(e.out, "#include \"harc_trace_rt.h\"").ok();
     let uses_solver = uses_constraint_solver(file);
     if uses_solver {
         writeln!(
@@ -632,98 +635,6 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     )
     .ok();
     writeln!(e.out, "}}").ok();
-    writeln!(e.out, "").ok();
-
-    // ── Semantic trace runtime ───────────────────────────────────────────
-    // JSONL writer used by `harc sim --record-trace <path>` (plumbed as
-    // HARC_TRACE by the CLI). Keep this tiny and dependency-free so the
-    // emitted TB remains a single C++ file plus runtime header.
-    writeln!(
-        e.out,
-        "static std::string harc_trace_escape(const std::string& s) {{"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}std::string out; out.reserve(s.size() + 8);").ok();
-    writeln!(e.out, "{INDENT}for (unsigned char c : s) {{").ok();
-    writeln!(e.out, "{INDENT}{INDENT}switch (c) {{").ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}{INDENT}case '\"': out += \"\\\\\\\"\"; break;"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}{INDENT}case '\\\\': out += \"\\\\\\\\\"; break;"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}{INDENT}case '\\n': out += \"\\\\n\"; break;"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}{INDENT}case '\\r': out += \"\\\\r\"; break;"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}{INDENT}case '\\t': out += \"\\\\t\"; break;"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}{INDENT}{INDENT}default:").ok();
-    writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}if (c < 0x20) {{ char buf[7]; std::snprintf(buf, sizeof(buf), \"\\\\u%04x\", c); out += buf; }}").ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}{INDENT}{INDENT}else out.push_back((char)c);"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}{INDENT}}}").ok();
-    writeln!(e.out, "{INDENT}}}").ok();
-    writeln!(e.out, "{INDENT}return out;").ok();
-    writeln!(e.out, "}}").ok();
-    writeln!(e.out, "struct HarcTraceWriter {{").ok();
-    writeln!(e.out, "{INDENT}FILE* out = nullptr;").ok();
-    writeln!(e.out, "{INDENT}uint64_t seq = 0;").ok();
-    writeln!(e.out, "{INDENT}bool enabled = false;").ok();
-    writeln!(e.out, "{INDENT}void open_env() {{ const char* p = std::getenv(\"HARC_TRACE\"); if (p && *p) {{ out = std::fopen(p, \"w\"); enabled = (out != nullptr); }} }}").ok();
-    writeln!(e.out, "{INDENT}void close() {{ if (out) {{ std::fflush(out); std::fclose(out); out = nullptr; }} enabled = false; }}").ok();
-    writeln!(e.out, "{INDENT}uint64_t next_seq() {{ return seq++; }}").ok();
-    writeln!(e.out, "{INDENT}void meta(uint64_t seed, const char* backend, const char* top, const char* test) {{").ok();
-    writeln!(e.out, "{INDENT}{INDENT}if (!enabled) return;").ok();
-    writeln!(e.out, "{INDENT}{INDENT}std::fprintf(out, \"{{\\\"type\\\":\\\"meta\\\",\\\"schema_version\\\":1,\\\"tool\\\":\\\"harc\\\",\\\"seed\\\":%llu,\\\"dut_backend\\\":\\\"%s\\\",\\\"top\\\":\\\"%s\\\",\\\"test\\\":\\\"%s\\\"}}\\n\", (unsigned long long)seed, backend ? backend : \"unknown\", top ? top : \"\", test ? test : \"\");").ok();
-    writeln!(e.out, "{INDENT}{INDENT}std::fflush(out);").ok();
-    writeln!(e.out, "{INDENT}}}").ok();
-    writeln!(
-        e.out,
-        "{INDENT}void raw(const char* type, int cycle, const std::string& payload) {{"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}{INDENT}if (!enabled) return;").ok();
-    writeln!(e.out, "{INDENT}{INDENT}std::fprintf(out, \"{{\\\"type\\\":\\\"%s\\\",\\\"cycle\\\":%d,\\\"seq\\\":%llu%s%s}}\\n\", type, cycle, (unsigned long long)next_seq(), payload.empty() ? \"\" : \",\", payload.c_str());").ok();
-    writeln!(e.out, "{INDENT}{INDENT}std::fflush(out);").ok();
-    writeln!(e.out, "{INDENT}}}").ok();
-    writeln!(
-        e.out,
-        "{INDENT}void log(int cycle, const char* sev, const std::string& msg) {{"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}{INDENT}std::string payload = \"\\\"severity\\\":\\\"\" + harc_trace_escape(sev ? sev : \"\") + \"\\\",\\\"message\\\":\\\"\" + harc_trace_escape(msg) + \"\\\"\";").ok();
-    writeln!(e.out, "{INDENT}{INDENT}raw(\"log\", cycle, payload);").ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}if (sev && std::strcmp(sev, \"FAIL\") == 0) {{"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}{INDENT}{INDENT}std::string fail_payload = \"\\\"failure_id\\\":\\\"fail\\\",\\\"message\\\":\\\"\" + harc_trace_escape(msg) + \"\\\"\";").ok();
-    writeln!(
-        e.out,
-        "{INDENT}{INDENT}{INDENT}raw(\"assertion_failure\", cycle, fail_payload);"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}{INDENT}}}").ok();
-    writeln!(e.out, "{INDENT}}}").ok();
-    writeln!(e.out, "}};").ok();
     writeln!(e.out, "").ok();
 
     // Tiny FIFO wrapper for `queue<T>` scoreboard fields. Provides pop()
@@ -1209,7 +1120,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         // Seed PRNG from HARC_SEED env (or 1 if unset). Logged after sim_log_line
         // is defined so it lands in sim.log along with normal test output.
         writeln!(e.out, "{INDENT}{{ const char* s = std::getenv(\"HARC_SEED\"); harc_rng_state = s ? std::strtoull(s, nullptr, 0) : 1ULL; }}").ok();
-        writeln!(e.out, "{INDENT}HarcTraceWriter trace;").ok();
+        writeln!(e.out, "{INDENT}harc_rt::trace::HarcTraceWriter trace;").ok();
         writeln!(e.out, "{INDENT}trace.open_env();").ok();
         writeln!(e.out, "{INDENT}trace.meta(harc_rng_state, std::getenv(\"HARC_DUT_BACKEND\"), \"{dut_type}\", \"{}\");", test.name.name).ok();
         writeln!(
