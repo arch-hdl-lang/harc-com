@@ -1654,6 +1654,14 @@ This is the HARC equivalent of a synthesizable active BFM. The sequence layer se
 
 For the opposite direction — a DUT initiator that calls a target service — the canonical near-term shape is a **passive target transactor** at the boundary plus a HARC sequence/agent that supplies response data. The passive transactor may be an ARCH/HARC DUT-side module or an SV module exposing the same req/rsp pins; HARC binds it as `BurstMem`, observes `<method>_req_*`, drives `<method>_rsp_*`, and keeps payloads in protocol-shaped types such as `Vec<T, MAX>` or `{ data: Vec<T, MAX>, len, resp }`. Source-level Vec ports are preserved as indexed arrays in the generated C++ API (`rsp_data[0]`, `rsp_data[1]`, ...); flat lane aliases may exist for compatibility but are not the preferred HARC source style.
 
+When an SV DUT already exposes canonical TLM req/rsp pins, bind the HARC bus directly. When an existing SV DUT has a native valid/ready/data interface instead, keep that interface intact and add a small adapter wrapper that presents the canonical TLM method pins to HARC. This keeps the reusable HARC BFM at the transaction boundary while preserving a raw-signal fixture for exact native-interface regressions. The DMA fixtures are the reference pattern:
+
+- `tests/dut/dma_engine_tlm_mem.sv` wraps the existing `DmaEngine` memory read/write valid-ready interfaces as `read(addr) -> data` and `write(addr, data)` TLM methods.
+- `tests/fixtures/dma_engine_tlm_target_test.harc` binds a passive target smoke responder to the wrapper.
+- `tests/fixtures/dma_engine_tlm_mem_model_test.harc` binds a stateful passive memory model and checks that destination state matches source state after the DMA completes.
+
+Adapter timing is part of the contract. For read-like methods, hold request arguments stable until the target TLM responder captures the request, and latch returned response data if the native DUT consumes it on a different cycle from the TLM response handshake. For write-like methods, a native DUT-side write handshake can usually complete once the TLM request is accepted; the adapter may acknowledge the TLM response separately so the target responder can re-arm without stalling the DUT's native scheduler. If the goal is debugging raw pin-level timing, use the raw fixture directly; if the goal is reusable transaction behavior, put the adapter at the boundary and use a passive target TLM transactor.
+
 Target-side TLM responders use `thread bus.method(args)` inside the bound transactor:
 
 ```harc
