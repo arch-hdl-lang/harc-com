@@ -10128,7 +10128,7 @@ impl Emitter {
             self.pad(depth + 3);
             writeln!(
                 self.out,
-                "std::printf(\"[auto_cov {}@{}] %llu/%llu hit (%.1f%%), blocked=%llu\\n\", (unsigned long long)_hit, (unsigned long long)_total, _total ? (100.0 * _hit / _total) : 0.0, (unsigned long long)_blocked);",
+                "harc_rt::random::harc_auto_cov_report_summary(\"{}\", {}, _hit, _total, _blocked);",
                 escape_c(ty),
                 target.span.start
             )
@@ -10138,7 +10138,7 @@ impl Emitter {
                     self.pad(depth + 3);
                     writeln!(
                         self.out,
-                        "std::printf(\"  {}.{}={} : %s\\n\", harc_rt::random::harc_auto_cov_state(_auto_cov_{cache_tag}_{}[{}], _auto_cov_blocked_{cache_tag}_{}[{}]));",
+                        "harc_rt::random::harc_auto_cov_report_bin(\"{}.{}={}\", _auto_cov_{cache_tag}_{}[{}], _auto_cov_blocked_{cache_tag}_{}[{}]);",
                         escape_c(ty),
                         escape_c(&goal.field),
                         escape_c(&value.label),
@@ -10156,7 +10156,7 @@ impl Emitter {
                         self.pad(depth + 3);
                         writeln!(
                             self.out,
-                            "std::printf(\"  {}.{}={} x {}.{}={} : %s\\n\", harc_rt::random::harc_auto_cov_state(_auto_cross_{cache_tag}_{}__{}[{}][{}], _auto_cross_blocked_{cache_tag}_{}__{}[{}][{}]));",
+                            "harc_rt::random::harc_auto_cov_report_bin(\"{}.{}={} x {}.{}={}\", _auto_cross_{cache_tag}_{}__{}[{}][{}], _auto_cross_blocked_{cache_tag}_{}__{}[{}][{}]);",
                             escape_c(ty),
                             escape_c(&a.field),
                             escape_c(&av.label),

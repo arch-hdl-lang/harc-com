@@ -456,6 +456,8 @@ int main() {
     uint64_t cov_hits = harc_auto_cov_count(cov_hit);
     uint64_t cross_blocked_count = harc_auto_cov_count(cross_blocked);
     const char* cov_state = harc_auto_cov_state(cov_hit[1], cov_blocked[1]);
+    harc_auto_cov_report_summary("Packet", 12, cov_hits, 2, cross_blocked_count);
+    harc_auto_cov_report_bin("Packet.kind=Read", cov_hit[0], cov_blocked[0]);
     bool hit = false;
     bool blocked = false;
     harc_auto_cov_mark_blocked(blocked);

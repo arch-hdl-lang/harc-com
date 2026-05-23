@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <cstdio>
 #include <initializer_list>
 #include <cstddef>
 #include <cstdint>
@@ -343,6 +344,32 @@ inline constexpr const char* harc_auto_cov_state(
     bool hit,
     bool blocked) {
     return hit ? "hit" : (blocked ? "*BLOCKED*" : "*NOT HIT*");
+}
+
+inline void harc_auto_cov_report_summary(
+    const char* type_name,
+    uint32_t span,
+    uint64_t hit,
+    uint64_t total,
+    uint64_t blocked) {
+    std::printf(
+        "[auto_cov %s@%u] %llu/%llu hit (%.1f%%), blocked=%llu\n",
+        type_name ? type_name : "",
+        span,
+        static_cast<unsigned long long>(hit),
+        static_cast<unsigned long long>(total),
+        total ? (100.0 * hit / total) : 0.0,
+        static_cast<unsigned long long>(blocked));
+}
+
+inline void harc_auto_cov_report_bin(
+    const char* label,
+    bool hit,
+    bool blocked) {
+    std::printf(
+        "  %s : %s\n",
+        label ? label : "",
+        harc_auto_cov_state(hit, blocked));
 }
 
 inline void harc_auto_cov_mark_blocked(bool& blocked) {
