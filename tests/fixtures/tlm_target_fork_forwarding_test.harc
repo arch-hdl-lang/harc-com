@@ -1,0 +1,85 @@
+// Target-side TLM fork-forwarding smoke test.
+//
+// The SV DUT issues two blocking reads on a front TLM bus. A passive HARC
+// target implements each front read by issuing two downstream out-of-order
+// TLM reads through a second bus, joining both responses, and returning a
+// combined result.
+
+bus FrontTlmBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus FrontTlmBus
+
+bus BackTlmBus
+    tlm_method read_ooo(addr: uint<8>) -> uint<32>: out_of_order tags 2;
+end bus BackTlmBus
+
+transactor TlmForkForwardingTarget bound to FrontTlmBus
+    route_count : uint<32> default 0
+    fork_count : uint<32> default 0
+    front_checksum : uint<32> default 0
+    back_checksum : uint<32> default 0
+
+    thread bus.read(addr: uint<8>)
+        route_count = route_count + 1
+        front_checksum = front_checksum + addr
+
+        let addr0 : uint<8> = addr + 1
+        let addr1 : uint<8> = addr + 2
+        back_checksum = back_checksum + addr0 + addr1
+        fork_count = fork_count + 2
+
+        let data0 = fork back.read_ooo(addr0)
+        let data1 = fork back.read_ooo(addr1)
+        join_all
+
+        return data0 + data1 + 4096
+    end thread
+end transactor TlmForkForwardingTarget
+
+testbench TlmTargetForkForwardingTb
+    dut : TlmForkForwardingTop
+end testbench TlmTargetForkForwardingTb
+
+impl TlmTargetForkForwardingTest for TlmTargetForkForwardingTb
+    let front : FrontTlmBus = bind dut with {
+        read.req_valid: "front_read_req_valid",
+        read.req_ready: "front_read_req_ready",
+        read.addr: "front_read_addr",
+        read.rsp_valid: "front_read_rsp_valid",
+        read.rsp_ready: "front_read_rsp_ready",
+        read.rsp_data: "front_read_rsp_data"
+    }
+    let back : BackTlmBus = bind dut with {
+        read_ooo.req_valid: "back_read_ooo_req_valid",
+        read_ooo.req_ready: "back_read_ooo_req_ready",
+        read_ooo.addr: "back_read_ooo_addr",
+        read_ooo.req_tag: "back_read_ooo_req_tag",
+        read_ooo.rsp_valid: "back_read_ooo_rsp_valid",
+        read_ooo.rsp_ready: "back_read_ooo_rsp_ready",
+        read_ooo.rsp_data: "back_read_ooo_rsp_data",
+        read_ooo.rsp_tag: "back_read_ooo_rsp_tag"
+    }
+    let target : TlmForkForwardingTarget passive = bind front
+
+    run
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+
+        wait until dut.done == 1 timeout 140 cycles fail("DUT initiator did not receive fork-forwarded TLM responses")
+        assert dut.result0 == 4621
+            else fail("first fork-forwarded TLM response mismatch got=0x${dut.result0:08x}, expected 0x0000120d")
+        assert dut.result1 == 4635
+            else fail("second fork-forwarded TLM response mismatch got=0x${dut.result1:08x}, expected 0x0000121b")
+        assert target.route_count == 2
+            else fail("target route_count mismatch got=${target.route_count}, expected 2")
+        assert target.fork_count == 4
+            else fail("target fork_count mismatch got=${target.fork_count}, expected 4")
+        assert target.front_checksum == 17
+            else fail("target front_checksum mismatch got=${target.front_checksum}, expected 17")
+        assert target.back_checksum == 40
+            else fail("target back_checksum mismatch got=${target.back_checksum}, expected 40")
+
+        log(info, "ALL TESTS PASSED - tlm_target_fork_forwarding_test")
+    end run
+end impl TlmTargetForkForwardingTest
