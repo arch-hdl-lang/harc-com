@@ -1108,21 +1108,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         // sim.log captures every log()/assert/fail line with cycle + severity
         // prefix. Path is configurable via the HARC_SIM_LOG env var (so the
         // outer harness can put it in the build dir); default `sim.log` in cwd.
-        writeln!(
-            e.out,
-            "{INDENT}const char* sim_log_path = std::getenv(\"HARC_SIM_LOG\");"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}if (!sim_log_path) sim_log_path = \"sim.log\";"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}FILE* sim_log = std::fopen(sim_log_path, \"w\");"
-        )
-        .ok();
+        writeln!(e.out, "{INDENT}FILE* sim_log = harc_rt::log::harc_open_sim_log();").ok();
         // Echo the active waveform path into sim.log so post-mortem
         // log inspection links to the matching VCD/FST without
         // grepping stderr. No-op in non-trace builds.
