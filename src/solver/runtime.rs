@@ -444,6 +444,15 @@ int main() {
     size_t cross_i = 0;
     size_t cross_j = 0;
     bool found_cov_cross = harc_auto_cov_first_uncovered_cross(cross_hit, cross_blocked, cross_i, cross_j);
+    int cov_values[2] = {3, 9};
+    int cov_preference = 0;
+    bool applied_cov_point = harc_auto_cov_apply_point_preference(auto_cov, 4, cov_hit, cov_blocked, cov_values, cov_preference);
+    HarcAutoCovSelection auto_cov_apply;
+    int cross_a_values[2] = {1, 2};
+    int cross_b_values[2] = {7, 8};
+    int cross_a_preference = 0;
+    int cross_b_preference = 0;
+    bool applied_cov_cross = harc_auto_cov_apply_cross_preference(auto_cov_apply, 5, cross_hit, cross_blocked, cross_a_values, cross_b_values, cross_a_preference, cross_b_preference);
     uint64_t cov_hits = harc_auto_cov_count(cov_hit);
     uint64_t cross_blocked_count = harc_auto_cov_count(cross_blocked);
     const char* cov_state = harc_auto_cov_state(cov_hit[1], cov_blocked[1]);
@@ -472,7 +481,7 @@ int main() {
     HarcSolveStatus unsat = harc_solve_status_unsat(4, b);
     bool handled_ok = harc_handle_solve_status(constrained);
     bool handled_unsat = harc_handle_solve_status(unsat);
-    return (status.ok && handled_ok && !handled_unsat && constrained.ok && !unsat.ok && unsat.problem_id == 4 && unsat.seed == b && call.problem_id == 4 && call.problem && call.seed != 99 && pref_u < 64 && pref_s >= -8 && pref_s <= 7 && pref_d >= 1 && pref_d <= 9 && unique_has_value && unique.empty() && harc_auto_cov_has_preference(auto_cov) && harc_auto_cov_selected_cross(auto_cov, 3) && found_cov_point && cov_i == 1 && found_cov_cross && cross_i == 0 && cross_j == 1 && cov_hits == 1 && cross_blocked_count == 1 && cov_state[0] == '*' && hit && !blocked && selected_blocked && value_hit && !value_blocked && cross_hit_match && !cross_hit_blocked && retry_pref && retry_unique && retry.retried_without_preferences && retry.retried_without_unique_history && packet.value == 7 && found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
+    return (status.ok && handled_ok && !handled_unsat && constrained.ok && !unsat.ok && unsat.problem_id == 4 && unsat.seed == b && call.problem_id == 4 && call.problem && call.seed != 99 && pref_u < 64 && pref_s >= -8 && pref_s <= 7 && pref_d >= 1 && pref_d <= 9 && unique_has_value && unique.empty() && harc_auto_cov_has_preference(auto_cov) && harc_auto_cov_selected_cross(auto_cov, 3) && found_cov_point && cov_i == 1 && found_cov_cross && cross_i == 0 && cross_j == 1 && !applied_cov_point && cov_preference == 0 && applied_cov_cross && cross_a_preference == 1 && cross_b_preference == 8 && harc_auto_cov_selected_cross(auto_cov_apply, 5) && cov_hits == 1 && cross_blocked_count == 1 && cov_state[0] == '*' && hit && !blocked && selected_blocked && value_hit && !value_blocked && cross_hit_match && !cross_hit_blocked && retry_pref && retry_unique && retry.retried_without_preferences && retry.retried_without_unique_history && packet.value == 7 && found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
 }
 "#,
         )
