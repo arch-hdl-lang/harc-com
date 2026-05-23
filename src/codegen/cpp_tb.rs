@@ -628,20 +628,9 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     writeln!(e.out, "static inline uint64_t harc_rng_next() {{").ok();
     writeln!(
         e.out,
-        "{INDENT}uint64_t z = (harc_rng_state += 0x9E3779B97F4A7C15ULL);"
+        "{INDENT}return harc_rt::random::harc_rng_next_state(harc_rng_state);"
     )
     .ok();
-    writeln!(
-        e.out,
-        "{INDENT}z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}return z ^ (z >> 31);").ok();
     writeln!(e.out, "}}").ok();
     if uses_solver {
         writeln!(e.out, "static inline z3::expr harc_z3_bv_words(z3::context& ctx, const uint32_t* words, size_t word_count, unsigned width) {{").ok();
