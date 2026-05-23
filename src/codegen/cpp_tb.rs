@@ -610,7 +610,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     if uses_solver {
         writeln!(
             e.out,
-            "#include <z3++.h>   // randomize(t) with <constraints>"
+            "#include \"harc_z3_rt.h\"   // randomize(t) with <constraints>"
         )
         .ok();
     }
@@ -632,66 +632,6 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     )
     .ok();
     writeln!(e.out, "}}").ok();
-    if uses_solver {
-        writeln!(e.out, "static inline z3::expr harc_z3_bv_words(z3::context& ctx, const uint32_t* words, size_t word_count, unsigned width) {{").ok();
-        writeln!(e.out, "{INDENT}z3::expr out = ctx.bv_val((uint64_t)0, width);").ok();
-        writeln!(e.out, "{INDENT}for (size_t i = 0; i < word_count; ++i) {{").ok();
-        writeln!(e.out, "{INDENT}{INDENT}if (words[i] == 0) continue;").ok();
-        writeln!(e.out, "{INDENT}{INDENT}z3::expr part = ctx.bv_val((uint64_t)words[i], width);").ok();
-        writeln!(e.out, "{INDENT}{INDENT}if (i != 0) part = z3::shl(part, ctx.bv_val((uint64_t)(i * 32), width));").ok();
-        writeln!(e.out, "{INDENT}{INDENT}out = out | part;").ok();
-        writeln!(e.out, "{INDENT}}}").ok();
-        writeln!(e.out, "{INDENT}return out;").ok();
-        writeln!(e.out, "}}").ok();
-        writeln!(e.out, "static inline z3::expr harc_z3_bv_value(z3::context& ctx, uint64_t v, unsigned width) {{").ok();
-        writeln!(e.out, "{INDENT}uint32_t words[2] = {{static_cast<uint32_t>(v), static_cast<uint32_t>(v >> 32)}};").ok();
-        writeln!(e.out, "{INDENT}return harc_z3_bv_words(ctx, words, 2, width);").ok();
-        writeln!(e.out, "}}").ok();
-        writeln!(e.out, "static inline z3::expr harc_z3_bv_signed_value(z3::context& ctx, int64_t v, unsigned width) {{").ok();
-        writeln!(e.out, "{INDENT}uint32_t words[32] = {{}};").ok();
-        writeln!(e.out, "{INDENT}size_t word_count = (width + 31) / 32;").ok();
-        writeln!(e.out, "{INDENT}if (word_count > 32) word_count = 32;").ok();
-        writeln!(e.out, "{INDENT}uint32_t fill = v < 0 ? 0xffffffffu : 0u;").ok();
-        writeln!(e.out, "{INDENT}for (size_t i = 0; i < word_count; ++i) words[i] = fill;").ok();
-        writeln!(e.out, "{INDENT}uint64_t raw = static_cast<uint64_t>(v);").ok();
-        writeln!(e.out, "{INDENT}if (word_count > 0) words[0] = static_cast<uint32_t>(raw);").ok();
-        writeln!(e.out, "{INDENT}if (word_count > 1) words[1] = static_cast<uint32_t>(raw >> 32);").ok();
-        writeln!(e.out, "{INDENT}unsigned rem = width % 32;").ok();
-        writeln!(e.out, "{INDENT}if (rem != 0 && word_count > 0) words[word_count - 1] &= ((1u << rem) - 1u);").ok();
-        writeln!(e.out, "{INDENT}return harc_z3_bv_words(ctx, words, word_count, width);").ok();
-        writeln!(e.out, "}}").ok();
-        writeln!(e.out, "static inline z3::expr harc_z3_bv_value(z3::context& ctx, int64_t v, unsigned width) {{").ok();
-        writeln!(e.out, "{INDENT}return harc_z3_bv_signed_value(ctx, v, width);").ok();
-        writeln!(e.out, "}}").ok();
-        writeln!(e.out, "static inline z3::expr harc_z3_bv_value(z3::context& ctx, _harc_u128 v, unsigned width) {{").ok();
-        writeln!(e.out, "{INDENT}uint32_t words[4] = {{static_cast<uint32_t>(v), static_cast<uint32_t>(v >> 32), static_cast<uint32_t>(v >> 64), static_cast<uint32_t>(v >> 96)}};").ok();
-        writeln!(e.out, "{INDENT}return harc_z3_bv_words(ctx, words, 4, width);").ok();
-        writeln!(e.out, "}}").ok();
-        writeln!(e.out, "template<size_t N>").ok();
-        writeln!(e.out, "static inline z3::expr harc_z3_bv_value(z3::context& ctx, const harc_rt::HarcWide<N>& v, unsigned width) {{").ok();
-        writeln!(e.out, "{INDENT}return harc_z3_bv_words(ctx, v.words.data(), v.words.size(), width);").ok();
-        writeln!(e.out, "}}").ok();
-        writeln!(e.out, "static inline z3::expr harc_z3_bv_signed_extend(z3::context& ctx, const z3::expr& value, unsigned value_width, unsigned solver_width) {{").ok();
-        writeln!(e.out, "{INDENT}if (solver_width <= value_width) return value;").ok();
-        writeln!(e.out, "{INDENT}return z3::to_expr(ctx, Z3_mk_sign_ext(ctx, solver_width - value_width, value));").ok();
-        writeln!(e.out, "}}").ok();
-        writeln!(e.out, "template<typename T>").ok();
-        writeln!(e.out, "static inline z3::expr harc_z3_bv_signed_value(z3::context& ctx, const T& v, unsigned value_width, unsigned solver_width) {{").ok();
-        writeln!(e.out, "{INDENT}return harc_z3_bv_signed_extend(ctx, harc_z3_bv_value(ctx, v, value_width), value_width, solver_width);").ok();
-        writeln!(e.out, "}}").ok();
-        writeln!(e.out, "static inline uint64_t harc_z3_bv_low_u64(z3::context& ctx, const z3::expr& value) {{").ok();
-        writeln!(e.out, "{INDENT}uint64_t raw = 0;").ok();
-        writeln!(e.out, "{INDENT}z3::expr simplified = value.simplify();").ok();
-        writeln!(e.out, "{INDENT}if (simplified.is_numeral_u64(raw)) return raw;").ok();
-        writeln!(e.out, "{INDENT}const char* bits = Z3_get_numeral_binary_string(ctx, simplified);").ok();
-        writeln!(e.out, "{INDENT}if (!bits) return 0;").ok();
-        writeln!(e.out, "{INDENT}size_t len = 0; while (bits[len] != '\\0') ++len;").ok();
-        writeln!(e.out, "{INDENT}for (size_t src = 0; src < len && src < 64; ++src) {{").ok();
-        writeln!(e.out, "{INDENT}{INDENT}if (bits[len - 1 - src] == '1') raw |= (uint64_t{{1}} << src);").ok();
-        writeln!(e.out, "{INDENT}}}").ok();
-        writeln!(e.out, "{INDENT}return raw;").ok();
-        writeln!(e.out, "}}").ok();
-    }
     writeln!(e.out, "").ok();
 
     // ── Semantic trace runtime ───────────────────────────────────────────
@@ -14160,7 +14100,7 @@ impl Emitter {
 }
 
 /// True if any code path will emit the Z3 solver block. Drives the
-/// `<z3++.h>` include + Z3 link flags. The check needs to mirror the
+/// `harc_z3_rt.h` include + Z3 link flags. The check needs to mirror the
 /// codegen's actual decision:
 ///   * `randomize(t) with <body>` — always solver (user wrote constraints)
 ///   * bare `randomize(t)` where `t`'s transaction has `keep` items,
