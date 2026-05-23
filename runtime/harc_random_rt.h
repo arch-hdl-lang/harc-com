@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+#include "harc_thread_rt.h"
 
 namespace harc_rt {
 namespace random {
@@ -180,6 +181,37 @@ inline constexpr uint64_t harc_prefer_uint(
     if (width == 0) return 0;
     if (width >= 64) return draw;
     return draw & ((uint64_t{1} << width) - 1);
+}
+
+inline _harc_u128 harc_prefer_u128(
+    harc_seed seed,
+    uint32_t salt,
+    unsigned width) {
+    _harc_u128 value =
+        (static_cast<_harc_u128>(harc_preference_draw(seed, salt)) |
+         (static_cast<_harc_u128>(harc_preference_draw(seed, salt ^ 0x9E3779B9u)) << 64));
+    if (width == 0) return 0;
+    if (width >= 128) return value;
+    return value & ((static_cast<_harc_u128>(1) << width) - 1);
+}
+
+template <size_t N>
+inline harc_rt::HarcWide<N> harc_prefer_wide(
+    harc_seed seed,
+    uint32_t salt,
+    unsigned width) {
+    harc_rt::HarcWide<N> value;
+    for (size_t i = 0; i < N; ++i) {
+        uint64_t draw = harc_preference_draw(
+            seed,
+            salt ^ static_cast<uint32_t>(0x9E3779B9u * (i + 1)));
+        value[i] = static_cast<uint32_t>(draw);
+    }
+    unsigned last_bits = width % 32;
+    if (last_bits != 0 && N != 0) {
+        value[N - 1] &= (uint32_t{1} << last_bits) - 1u;
+    }
+    return value;
 }
 
 inline constexpr int64_t harc_prefer_range(
