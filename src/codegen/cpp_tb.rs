@@ -10031,52 +10031,127 @@ impl Emitter {
             )
             .ok();
         }
-        for goal in &auto_goals {
-            self.pad(depth + 1);
-            writeln!(
-                self.out,
-                "static bool _auto_cov_{cache_tag}_{}[{}] = {{}};",
-                goal.c_field,
-                goal.values.len()
-            )
-            .ok();
-            self.pad(depth + 1);
-            writeln!(
-                self.out,
-                "static bool _auto_cov_blocked_{cache_tag}_{}[{}] = {{}};",
-                goal.c_field,
-                goal.values.len()
-            )
-            .ok();
-        }
-        for (a, b) in &auto_crosses {
-            self.pad(depth + 1);
-            writeln!(
-                self.out,
-                "static bool _auto_cross_{cache_tag}_{}__{}[{}][{}] = {{}};",
-                a.c_field,
-                b.c_field,
-                a.values.len(),
-                b.values.len()
-            )
-            .ok();
-            self.pad(depth + 1);
-            writeln!(
-                self.out,
-                "static bool _auto_cross_blocked_{cache_tag}_{}__{}[{}][{}] = {{}};",
-                a.c_field,
-                b.c_field,
-                a.values.len(),
-                b.values.len()
-            )
-            .ok();
-        }
         if !auto_goals.is_empty() {
-            let total_bins: usize = auto_goals.iter().map(|g| g.values.len()).sum::<usize>()
-                + auto_crosses
-                    .iter()
-                    .map(|(a, b)| a.values.len() * b.values.len())
-                    .sum::<usize>();
+            for goal in &auto_goals {
+                self.pad(depth + 1);
+                write!(
+                    self.out,
+                    "static const char* _auto_cov_labels_{cache_tag}_{}[] = {{",
+                    goal.c_field
+                )
+                .ok();
+                for (idx, value) in goal.values.iter().enumerate() {
+                    if idx > 0 {
+                        write!(self.out, ", ").ok();
+                    }
+                    write!(
+                        self.out,
+                        "\"{}.{}={}\"",
+                        escape_c(ty),
+                        escape_c(&goal.field),
+                        escape_c(&value.label)
+                    )
+                    .ok();
+                }
+                writeln!(self.out, "}};").ok();
+            }
+            for (a, b) in &auto_crosses {
+                self.pad(depth + 1);
+                write!(
+                    self.out,
+                    "static const char* _auto_cross_labels_{cache_tag}_{}__{}[] = {{",
+                    a.c_field, b.c_field
+                )
+                .ok();
+                let mut first = true;
+                for av in &a.values {
+                    for bv in &b.values {
+                        if !first {
+                            write!(self.out, ", ").ok();
+                        }
+                        first = false;
+                        write!(
+                            self.out,
+                            "\"{}.{}={} x {}.{}={}\"",
+                            escape_c(ty),
+                            escape_c(&a.field),
+                            escape_c(&av.label),
+                            escape_c(ty),
+                            escape_c(&b.field),
+                            escape_c(&bv.label)
+                        )
+                        .ok();
+                    }
+                }
+                writeln!(self.out, "}};").ok();
+            }
+            self.pad(depth + 1);
+            writeln!(
+                self.out,
+                "static const harc_rt::random::HarcAutoCovPointMeta _auto_cov_points_{cache_tag}[] = {{"
+            )
+            .ok();
+            for goal in &auto_goals {
+                self.pad(depth + 2);
+                writeln!(
+                    self.out,
+                    "{{_auto_cov_labels_{cache_tag}_{}, {}}},",
+                    goal.c_field,
+                    goal.values.len()
+                )
+                .ok();
+            }
+            self.pad(depth + 1);
+            writeln!(self.out, "}};").ok();
+            if !auto_crosses.is_empty() {
+                self.pad(depth + 1);
+                writeln!(
+                    self.out,
+                    "static const harc_rt::random::HarcAutoCovCrossMeta _auto_cov_crosses_{cache_tag}[] = {{"
+                )
+                .ok();
+                for (a, b) in &auto_crosses {
+                    self.pad(depth + 2);
+                    writeln!(
+                        self.out,
+                        "{{_auto_cross_labels_{cache_tag}_{}__{}, {}, {}}},",
+                        a.c_field,
+                        b.c_field,
+                        a.values.len(),
+                        b.values.len()
+                    )
+                    .ok();
+                }
+                self.pad(depth + 1);
+                writeln!(self.out, "}};").ok();
+            }
+            self.pad(depth + 1);
+            writeln!(
+                self.out,
+                "static const harc_rt::random::HarcAutoCovPlan _auto_cov_plan_{cache_tag} = {{\"{}\", {}, _auto_cov_points_{cache_tag}, {}, {}, {}}};",
+                escape_c(ty),
+                target.span.start,
+                auto_goals.len(),
+                if auto_crosses.is_empty() {
+                    "nullptr".to_string()
+                } else {
+                    format!("_auto_cov_crosses_{cache_tag}")
+                },
+                auto_crosses.len()
+            )
+            .ok();
+            self.pad(depth + 1);
+            writeln!(
+                self.out,
+                "static harc_rt::random::HarcAutoCovState _auto_cov_state_{cache_tag};"
+            )
+            .ok();
+            self.pad(depth + 1);
+            writeln!(
+                self.out,
+                "harc_rt::random::harc_auto_cov_init(_auto_cov_plan_{cache_tag}, _auto_cov_state_{cache_tag});"
+            )
+            .ok();
             self.pad(depth + 1);
             writeln!(
                 self.out,
@@ -10090,94 +10165,11 @@ impl Emitter {
             )
             .ok();
             self.pad(depth + 2);
-            writeln!(self.out, "uint64_t _hit = 0;").ok();
-            self.pad(depth + 2);
-            writeln!(self.out, "uint64_t _blocked = 0;").ok();
-            self.pad(depth + 2);
-            writeln!(self.out, "uint64_t _total = {total_bins};").ok();
-            for goal in &auto_goals {
-                self.pad(depth + 2);
-                writeln!(
-                    self.out,
-                    "_hit += harc_rt::random::harc_auto_cov_count(_auto_cov_{cache_tag}_{});",
-                    goal.c_field
-                )
-                .ok();
-                self.pad(depth + 2);
-                writeln!(
-                    self.out,
-                    "_blocked += harc_rt::random::harc_auto_cov_count(_auto_cov_blocked_{cache_tag}_{});",
-                    goal.c_field
-                )
-                .ok();
-            }
-            for (a, b) in &auto_crosses {
-                self.pad(depth + 2);
-                writeln!(
-                    self.out,
-                    "_hit += harc_rt::random::harc_auto_cov_count(_auto_cross_{cache_tag}_{}__{});",
-                    a.c_field, b.c_field
-                )
-                .ok();
-                self.pad(depth + 2);
-                writeln!(
-                    self.out,
-                    "_blocked += harc_rt::random::harc_auto_cov_count(_auto_cross_blocked_{cache_tag}_{}__{});",
-                    a.c_field, b.c_field
-                )
-                .ok();
-            }
-            self.pad(depth + 2);
             writeln!(
                 self.out,
-                "harc_rt::random::harc_auto_cov_report_summary(\"{}\", {}, _hit, _total, _blocked);",
-                escape_c(ty),
-                target.span.start
+                "harc_rt::random::harc_auto_cov_report(_auto_cov_plan_{cache_tag}, _auto_cov_state_{cache_tag});"
             )
             .ok();
-            for goal in &auto_goals {
-                for (idx, value) in goal.values.iter().enumerate() {
-                    self.pad(depth + 2);
-                    writeln!(
-                        self.out,
-                        "harc_rt::random::harc_auto_cov_report_bin(\"{}.{}={}\", _auto_cov_{cache_tag}_{}[{}], _auto_cov_blocked_{cache_tag}_{}[{}]);",
-                        escape_c(ty),
-                        escape_c(&goal.field),
-                        escape_c(&value.label),
-                        goal.c_field,
-                        idx,
-                        goal.c_field,
-                        idx
-                    )
-                    .ok();
-                }
-            }
-            for (a, b) in &auto_crosses {
-                for (i, av) in a.values.iter().enumerate() {
-                    for (j, bv) in b.values.iter().enumerate() {
-                        self.pad(depth + 2);
-                        writeln!(
-                            self.out,
-                            "harc_rt::random::harc_auto_cov_report_bin(\"{}.{}={} x {}.{}={}\", _auto_cross_{cache_tag}_{}__{}[{}][{}], _auto_cross_blocked_{cache_tag}_{}__{}[{}][{}]);",
-                            escape_c(ty),
-                            escape_c(&a.field),
-                            escape_c(&av.label),
-                            escape_c(ty),
-                            escape_c(&b.field),
-                            escape_c(&bv.label),
-                            a.c_field,
-                            b.c_field,
-                            i,
-                            j,
-                            a.c_field,
-                            b.c_field,
-                            i,
-                            j
-                        )
-                        .ok();
-                    }
-                }
-            }
             self.pad(depth + 1);
             writeln!(self.out, "}});").ok();
         }
@@ -10281,11 +10273,7 @@ impl Emitter {
             self.pad(depth + 1);
             writeln!(
                 self.out,
-                "harc_rt::random::harc_auto_cov_apply_cross_preference(_auto_cov_selection_{cache_tag}, {group}, _auto_cross_{cache_tag}_{}__{}, _auto_cross_blocked_{cache_tag}_{}__{}, _auto_cross_vals_{cache_tag}_{}__{}_{}, _auto_cross_vals_{cache_tag}_{}__{}_{}, _pref_{cache_tag}_{}, _pref_{cache_tag}_{});",
-                a.c_field,
-                b.c_field,
-                a.c_field,
-                b.c_field,
+                "harc_rt::random::harc_auto_cov_apply_cross_preference(_auto_cov_plan_{cache_tag}, _auto_cov_state_{cache_tag}, _auto_cov_selection_{cache_tag}, {group}, _auto_cross_vals_{cache_tag}_{}__{}_{}, _auto_cross_vals_{cache_tag}_{}__{}_{}, _pref_{cache_tag}_{}, _pref_{cache_tag}_{});",
                 a.c_field,
                 b.c_field,
                 a.c_field,
@@ -10311,8 +10299,8 @@ impl Emitter {
             self.pad(depth + 1);
             writeln!(
                 self.out,
-                "harc_rt::random::harc_auto_cov_apply_point_preference(_auto_cov_selection_{cache_tag}, {group}, _auto_cov_{cache_tag}_{}, _auto_cov_blocked_{cache_tag}_{}, _auto_point_vals_{cache_tag}_{}, _pref_{cache_tag}_{});",
-                goal.c_field, goal.c_field, goal.c_field, goal.c_field
+                "harc_rt::random::harc_auto_cov_apply_point_preference(_auto_cov_plan_{cache_tag}, _auto_cov_state_{cache_tag}, _auto_cov_selection_{cache_tag}, {group}, _auto_point_vals_{cache_tag}_{}, _pref_{cache_tag}_{});",
+                goal.c_field, goal.c_field
             )
             .ok();
         }
@@ -10349,21 +10337,19 @@ impl Emitter {
         )
         .ok();
         if !auto_goals.is_empty() {
-            for (group, (a, b)) in auto_crosses.iter().enumerate() {
+            for (group, (_a, _b)) in auto_crosses.iter().enumerate() {
                 self.pad(depth + 2);
                 writeln!(
                     self.out,
-                    "harc_rt::random::harc_auto_cov_mark_selected_cross_blocked(_auto_cov_selection_{cache_tag}, {group}, _auto_cross_blocked_{cache_tag}_{}__{}[_auto_cov_selection_{cache_tag}.i][_auto_cov_selection_{cache_tag}.j]);",
-                    a.c_field, b.c_field
+                    "harc_rt::random::harc_auto_cov_mark_selected_cross_blocked(_auto_cov_plan_{cache_tag}, _auto_cov_state_{cache_tag}, _auto_cov_selection_{cache_tag}, {group});"
                 )
                 .ok();
             }
-            for (group, goal) in auto_goals.iter().enumerate() {
+            for (group, _goal) in auto_goals.iter().enumerate() {
                 self.pad(depth + 2);
                 writeln!(
                     self.out,
-                    "harc_rt::random::harc_auto_cov_mark_selected_point_blocked(_auto_cov_selection_{cache_tag}, {group}, _auto_cov_blocked_{cache_tag}_{}[_auto_cov_selection_{cache_tag}.i]);",
-                    goal.c_field
+                    "harc_rt::random::harc_auto_cov_mark_selected_point_blocked(_auto_cov_plan_{cache_tag}, _auto_cov_state_{cache_tag}, _auto_cov_selection_{cache_tag}, {group});"
                 )
                 .ok();
             }
@@ -10653,25 +10639,25 @@ impl Emitter {
                 writeln!(self.out, "}}").ok();
             }
         }
-        for goal in &auto_goals {
+        for (group, goal) in auto_goals.iter().enumerate() {
             for (idx, value) in goal.values.iter().enumerate() {
                 self.pad(depth + 2);
                 writeln!(
                     self.out,
-                    "harc_rt::random::harc_auto_cov_mark_value_hit(_val_{}, {}, _auto_cov_{cache_tag}_{}[{}], _auto_cov_blocked_{cache_tag}_{}[{}]);",
-                    goal.c_field, value.c_expr, goal.c_field, idx, goal.c_field, idx
+                    "harc_rt::random::harc_auto_cov_mark_value_hit(_val_{}, {}, _auto_cov_plan_{cache_tag}, _auto_cov_state_{cache_tag}, {}, {});",
+                    goal.c_field, value.c_expr, group, idx
                 )
                 .ok();
             }
         }
-        for (a, b) in &auto_crosses {
+        for (group, (a, b)) in auto_crosses.iter().enumerate() {
             for (i, av) in a.values.iter().enumerate() {
                 for (j, bv) in b.values.iter().enumerate() {
                     self.pad(depth + 2);
                     writeln!(
                         self.out,
-                        "harc_rt::random::harc_auto_cov_mark_cross_hit(_val_{}, {}, _val_{}, {}, _auto_cross_{cache_tag}_{}__{}[{}][{}], _auto_cross_blocked_{cache_tag}_{}__{}[{}][{}]);",
-                        a.c_field, av.c_expr, b.c_field, bv.c_expr, a.c_field, b.c_field, i, j, a.c_field, b.c_field, i, j
+                        "harc_rt::random::harc_auto_cov_mark_cross_hit(_val_{}, {}, _val_{}, {}, _auto_cov_plan_{cache_tag}, _auto_cov_state_{cache_tag}, {}, {}, {});",
+                        a.c_field, av.c_expr, b.c_field, bv.c_expr, group, i, j
                     )
                     .ok();
                 }
