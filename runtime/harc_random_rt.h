@@ -318,6 +318,48 @@ inline void harc_auto_cov_mark_hit(bool& hit, bool& blocked) {
     blocked = false;
 }
 
+inline void harc_auto_cov_mark_selected_point_blocked(
+    const HarcAutoCovSelection& selection,
+    int group,
+    bool& blocked) {
+    if (harc_auto_cov_selected_point(selection, group)) {
+        harc_auto_cov_mark_blocked(blocked);
+    }
+}
+
+inline void harc_auto_cov_mark_selected_cross_blocked(
+    const HarcAutoCovSelection& selection,
+    int group,
+    bool& blocked) {
+    if (harc_auto_cov_selected_cross(selection, group)) {
+        harc_auto_cov_mark_blocked(blocked);
+    }
+}
+
+template <typename T, typename U>
+inline void harc_auto_cov_mark_value_hit(
+    const T& value,
+    const U& expected,
+    bool& hit,
+    bool& blocked) {
+    if (value == expected) {
+        harc_auto_cov_mark_hit(hit, blocked);
+    }
+}
+
+template <typename A, typename B, typename ExpectedA, typename ExpectedB>
+inline void harc_auto_cov_mark_cross_hit(
+    const A& a,
+    const ExpectedA& expected_a,
+    const B& b,
+    const ExpectedB& expected_b,
+    bool& hit,
+    bool& blocked) {
+    if (a == expected_a && b == expected_b) {
+        harc_auto_cov_mark_hit(hit, blocked);
+    }
+}
+
 inline bool harc_retry_without_preferences(
     HarcSolverRetryPolicy& policy,
     bool solver_sat) {
