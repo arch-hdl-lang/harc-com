@@ -1953,7 +1953,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "{INDENT}delete tfp;").ok();
         writeln!(e.out, "#endif").ok();
         writeln!(e.out, "{INDENT}delete dut;").ok();
-        writeln!(e.out, "{INDENT}if (sim_log) std::fclose(sim_log);").ok();
+        writeln!(e.out, "{INDENT}harc_rt::log::harc_close_file(sim_log);").ok();
         writeln!(
             e.out,
             "{INDENT}log_files.close_all();"
