@@ -1,0 +1,155 @@
+// DMA memory-side passive TLM target test.
+//
+// This keeps the existing raw-signal DMA BFM fixture intact. The SV wrapper
+// adapts DmaEngine's memory request side to canonical TLM req/rsp pins, while
+// this HARC passive transactor serves read/write methods with stateful target
+// TLM threads.
+
+bus DmaMemTlmBus
+    tlm_method read(addr: uint<32>) -> uint<32>: blocking;
+    tlm_method write(addr: uint<32>, data: uint<32>): blocking;
+end bus DmaMemTlmBus
+
+transactor DmaMemTarget bound to DmaMemTlmBus
+    read_count : uint<32> default 0
+    write_count : uint<32> default 0
+    read_checksum : uint<32> default 0
+    write_checksum : uint<32> default 0
+    prep_acc : uint<32> default 0
+    error_count : uint<32> default 0
+
+    thread bus.read(addr: uint<32>)
+        read_count = read_count + 1
+        read_checksum = read_checksum + addr
+        prep_acc = 0
+
+        let limit : uint<32> = (addr & 3) + 1
+        for i in 0 .. limit
+            prep_acc = prep_acc + i
+            if i == limit - 1
+                return addr
+            end if
+        end for
+
+        return addr
+    end thread
+
+    thread bus.write(addr: uint<32>, data: uint<32>)
+        write_count = write_count + 1
+        write_checksum = write_checksum + addr + data
+
+        if data + 4096 != addr
+            error_count = error_count + 1
+            return
+        end if
+
+        let limit : uint<32> = (data & 3) + 1
+        prep_acc = 0
+        for i in 0 .. limit
+            prep_acc = prep_acc + i
+        end for
+    end thread
+end transactor DmaMemTarget
+
+transactor ApbXactor
+    dut : DmaEngineTlmMem
+
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            dut.apb_sel = 1
+            dut.apb_enable = 0
+            dut.apb_write = 1
+            dut.apb_addr = addr
+            dut.apb_wdata = data
+            wait 1 cycle
+            dut.apb_enable = 1
+            wait 1 cycle
+            dut.apb_sel = 0
+            dut.apb_enable = 0
+            dut.apb_write = 0
+        end write
+
+        hookable read(addr: uint<8>) -> uint<32>
+            dut.apb_sel = 1
+            dut.apb_enable = 0
+            dut.apb_write = 0
+            dut.apb_addr = addr
+            wait 1 cycle
+            dut.apb_enable = 1
+            wait 1 cycle
+            let val = dut.apb_rdata
+            dut.apb_sel = 0
+            dut.apb_enable = 0
+            return val
+        end read
+    end when
+end transactor ApbXactor
+
+testbench DmaEngineTlmTargetTb
+    dut : DmaEngineTlmMem
+    apb : ApbXactor active
+end testbench DmaEngineTlmTargetTb
+
+impl DmaEngineTlmTargetTest for DmaEngineTlmTargetTb
+    let mem : DmaMemTlmBus = bind dut with {
+        read.req_valid: "mem_read_req_valid",
+        read.req_ready: "mem_read_req_ready",
+        read.addr: "mem_read_addr",
+        read.rsp_valid: "mem_read_rsp_valid",
+        read.rsp_ready: "mem_read_rsp_ready",
+        read.rsp_data: "mem_read_rsp_data",
+        write.req_valid: "mem_write_req_valid",
+        write.req_ready: "mem_write_req_ready",
+        write.addr: "mem_write_addr",
+        write.data: "mem_write_data",
+        write.rsp_valid: "mem_write_rsp_valid",
+        write.rsp_ready: "mem_write_rsp_ready"
+    }
+    let target : DmaMemTarget passive = bind mem
+
+    run
+        log(info, "DmaEngine TLM target test - APB config plus passive memory service")
+
+        apb.dut = dut
+
+        dut.rst = 1
+        dut.apb_sel = 0
+        dut.apb_enable = 0
+        dut.apb_write = 0
+        dut.apb_addr = 0
+        dut.apb_wdata = 0
+        wait 4 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        apb.write(0, 4096)
+        apb.write(1, 8192)
+        apb.write(2, 3)
+        apb.write(3, 1)
+
+        wait until dut.irq == 1 timeout 100 cycles fail("IRQ never fired with passive TLM memory target")
+
+        assert target.read_count == 4
+            else fail("expected 4 TLM reads, observed ${target.read_count}")
+        assert target.write_count == 4
+            else fail("expected 4 TLM writes, observed ${target.write_count}")
+        assert target.error_count == 0
+            else fail("TLM write target saw ${target.error_count} data/address mismatches")
+        assert target.read_checksum == 16390
+            else fail("read checksum ${target.read_checksum}, expected 16390")
+        assert target.write_checksum == 49164
+            else fail("write checksum ${target.write_checksum}, expected 49164")
+
+        let rb_src = apb.read(0)
+        assert rb_src == 4096
+            else fail("APB src readback 0x${rb_src:08x}, expected 0x00001000")
+        let rb_dst = apb.read(1)
+        assert rb_dst == 8192
+            else fail("APB dst readback 0x${rb_dst:08x}, expected 0x00002000")
+        let rb_beat = apb.read(2)
+        assert rb_beat == 0
+            else fail("APB beat readback ${rb_beat}, expected 0 after completion")
+
+        log(info, "ALL TESTS PASSED - dma_engine_tlm_target_test")
+    end run
+end impl DmaEngineTlmTargetTest
