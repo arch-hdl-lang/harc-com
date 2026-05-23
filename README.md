@@ -215,6 +215,7 @@ The resolver checks CLI flags first, then `HARC_Z3_INCLUDE_DIR` / `HARC_Z3_LIB_D
 | `axilite_constraint_test.harc` | `AxiLiteRegs.sv` | `randomize(t) with …` through Z3 |
 | `dma_engine_tlm_target_test.harc` | `dma_engine_tlm_mem.sv` + `dma_engine.sv` | passive target TLM memory transactor serving an SV DMA initiator |
 | `dma_engine_tlm_mem_model_test.harc` | `dma_engine_tlm_mem.sv` + `dma_engine.sv` | stateful passive TLM memory model with final copied-data checks |
+| `tlm_target_forwarding_test.harc` | `TlmForwardingTop.sv` | passive target forwarding a request to a second TLM method |
 | `keep_constraints_test.harc` | `top_counter.sv` | transaction `keep` constraints (range, modulus, enum exclusion) |
 | `relation_inlining_test.harc` | `top_counter.sv` | `relation` inlining — block + alias + composite forms |
 | `heartbeat_idle_test.harc` | `top_counter.sv` | per-agent `_last_in_cycle` heartbeats + `idle(N)` predicate |
@@ -258,7 +259,7 @@ spec.md                   Language reference
 
 ```sh
 cargo test --release          # 80 cargo tests (lib + codegen + round-trip)
-./tests/run_fixtures.sh       # 56 fixtures end-to-end via Verilator
+./tests/run_fixtures.sh       # 80 fixtures end-to-end via Verilator
 ```
 
 The fixture runner builds harc, then for each entry in its manifest: runs Verilator on the vendored `.sv` DUT (linking any `--ref-src` C/C++ files), builds against the HARC-generated C++ testbench, and asserts the binary prints `ALL TESTS PASSED`. CI runs the same script on every push and PR.
@@ -272,7 +273,7 @@ HARC and ARCH share a lexer/parser style and several constructs (`domain`, `wait
 
 Bug coverage rule of thumb: if the same test passes under `--dut` but fails under `--sv`, the divergence is an ARCH backend bug — file it against `arch-com`.
 
-For protocol-level tests, define a HARC `bus` with `tlm_method` declarations and bind it to either backend. ARCH/HARC DUTs can use the conventional flattened TLM port names directly; SV DUTs use `bind dut with { method.req_valid: "...", method.rsp_data: "...", ... }` remaps. The preferred initiator shape is: sequence/test code emits transaction objects into an active transactor, the transactor calls `bus.method(args)`, and the call lowers to synthesizable req/rsp wires. For DUT-initiated traffic, use a passive target transactor/BFM with `thread bus.method(args) ... return expr end thread`; local `let`s, transactor field state, bounded response-prep loops with literal or runtime bounds, and early/nested returns are supported for address decode and response branching. Keep payloads in source-level types such as `Vec<T, MAX>` or response structs with `data`, `len`, and protocol-specific `resp` fields.
+For protocol-level tests, define a HARC `bus` with `tlm_method` declarations and bind it to either backend. ARCH/HARC DUTs can use the conventional flattened TLM port names directly; SV DUTs use `bind dut with { method.req_valid: "...", method.rsp_data: "...", ... }` remaps. The preferred initiator shape is: sequence/test code emits transaction objects into an active transactor, the transactor calls `bus.method(args)`, and the call lowers to synthesizable req/rsp wires. For DUT-initiated traffic, use a passive target transactor/BFM with `thread bus.method(args) ... return expr end thread`; local `let`s, transactor field state, bounded response-prep loops with literal or runtime bounds, early/nested returns, and serialized forwarding calls to another bound blocking TLM method are supported for address decode, routing, and response branching. Keep payloads in source-level types such as `Vec<T, MAX>` or response structs with `data`, `len`, and protocol-specific `resp` fields.
 
 Bind directly when the DUT already exposes canonical TLM pins. If an existing SV DUT has a native valid/ready/data interface instead, use a small adapter wrapper and keep the HARC transactor at the transaction boundary. The DMA examples show both sides of this pattern: [`tests/dut/dma_engine_tlm_mem.sv`](tests/dut/dma_engine_tlm_mem.sv) wraps the raw `DmaEngine` memory interface as TLM read/write methods, while [`dma_engine_tlm_target_test.harc`](tests/fixtures/dma_engine_tlm_target_test.harc) and [`dma_engine_tlm_mem_model_test.harc`](tests/fixtures/dma_engine_tlm_mem_model_test.harc) bind passive HARC targets to that wrapper. For read-like methods, the adapter must keep request arguments stable until the TLM target captures them and may need to latch response data before releasing the native DUT side. For write-like methods, the native DUT-side handshake can often complete on TLM request acceptance, with the TLM response acknowledged independently.
 

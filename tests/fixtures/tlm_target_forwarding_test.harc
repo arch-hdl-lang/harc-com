@@ -1,0 +1,70 @@
+// Target-side TLM forwarding smoke test.
+//
+// The SV DUT issues two blocking reads on a front TLM bus. A passive HARC
+// target implements that front method and forwards each request through a
+// second TLM bus to an SV memory target before returning the transformed
+// payload to the original initiator.
+
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmMemBus
+
+transactor TlmForwardingTarget bound to TlmMemBus
+    route_count : uint<32> default 0
+    front_checksum : uint<32> default 0
+    back_checksum : uint<32> default 0
+
+    thread bus.read(addr: uint<8>)
+        route_count = route_count + 1
+        front_checksum = front_checksum + addr
+        let back_addr : uint<8> = addr + 1
+        back_checksum = back_checksum + back_addr
+
+        let raw = back.read(back_addr)
+        return raw + 4096
+    end thread
+end transactor TlmForwardingTarget
+
+testbench TlmTargetForwardingTb
+    dut : TlmForwardingTop
+end testbench TlmTargetForwardingTb
+
+impl TlmTargetForwardingTest for TlmTargetForwardingTb
+    let front : TlmMemBus = bind dut with {
+        read.req_valid: "front_read_req_valid",
+        read.req_ready: "front_read_req_ready",
+        read.addr: "front_read_addr",
+        read.rsp_valid: "front_read_rsp_valid",
+        read.rsp_ready: "front_read_rsp_ready",
+        read.rsp_data: "front_read_rsp_data"
+    }
+    let back : TlmMemBus = bind dut with {
+        read.req_valid: "back_read_req_valid",
+        read.req_ready: "back_read_req_ready",
+        read.addr: "back_read_addr",
+        read.rsp_valid: "back_read_rsp_valid",
+        read.rsp_ready: "back_read_rsp_ready",
+        read.rsp_data: "back_read_rsp_data"
+    }
+    let target : TlmForwardingTarget passive = bind front
+
+    run
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+
+        wait until dut.done == 1 timeout 120 cycles fail("DUT initiator did not receive forwarded TLM responses")
+        assert dut.result0 == 4358
+            else fail("first forwarded TLM response mismatch got=0x${dut.result0:08x}, expected 0x00001106")
+        assert dut.result1 == 4365
+            else fail("second forwarded TLM response mismatch got=0x${dut.result1:08x}, expected 0x0000110d")
+        assert target.route_count == 2
+            else fail("target route_count mismatch got=${target.route_count}, expected 2")
+        assert target.front_checksum == 17
+            else fail("target front_checksum mismatch got=${target.front_checksum}, expected 17")
+        assert target.back_checksum == 19
+            else fail("target back_checksum mismatch got=${target.back_checksum}, expected 19")
+
+        log(info, "ALL TESTS PASSED - tlm_target_forwarding_test")
+    end run
+end impl TlmTargetForwardingTest
