@@ -28,6 +28,12 @@ inline FILE* harc_open_sim_log(
     return std::fopen(path, "w");
 }
 
+inline void harc_close_file(FILE*& f) {
+    if (!f) return;
+    std::fclose(f);
+    f = nullptr;
+}
+
 inline std::string harc_wave_output_path(const char* default_name) {
     const char* wave_path = std::getenv("HARC_WAVE_FILE");
     if (wave_path && *wave_path) return std::string(wave_path);
