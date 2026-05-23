@@ -1050,16 +1050,6 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             "{INDENT}{{ const char* dp = std::getenv(\"HARC_TRACE_DEPTH\"); dut->trace(tfp, dp ? std::atoi(dp) : 99); }}"
         )
         .ok();
-        writeln!(
-            e.out,
-            "{INDENT}const char* _wave_env = std::getenv(\"HARC_WAVE_FILE\");"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}const char* _wave_log_dir = std::getenv(\"HARC_LOG_DIR\");"
-        )
-        .ok();
         writeln!(e.out, "#if defined(HARC_TRACE_VCD)").ok();
         writeln!(
             e.out,
@@ -1075,7 +1065,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "#endif").ok();
         writeln!(
             e.out,
-            "{INDENT}std::string _wave_path = _wave_env ? std::string(_wave_env) : (_wave_log_dir ? (std::string(_wave_log_dir) + \"/\" + _wave_default_name) : std::string(_wave_default_name));"
+            "{INDENT}std::string _wave_path = harc_rt::log::harc_wave_output_path(_wave_default_name);"
         )
         .ok();
         writeln!(e.out, "{INDENT}tfp->open(_wave_path.c_str());").ok();
@@ -1948,13 +1938,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "{INDENT}{{").ok();
         writeln!(
             e.out,
-            "{INDENT}{INDENT}const char* _cov_dir = std::getenv(\"HARC_LOG_DIR\");"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}{INDENT}std::string _cov_path = _cov_dir ? std::string(_cov_dir) + \"/coverage.dat\" : std::string(\"coverage.dat\");").ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}Verilated::threadContextp()->coveragep()->write(_cov_path.c_str());"
+            "{INDENT}{INDENT}Verilated::threadContextp()->coveragep()->write(harc_rt::log::harc_coverage_output_path().c_str());"
         )
         .ok();
         writeln!(e.out, "{INDENT}}}").ok();
