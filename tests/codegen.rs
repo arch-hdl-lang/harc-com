@@ -811,6 +811,7 @@ end test B
             && cpp.contains("std::strcmp(test_sel, \"B\") == 0"),
         "expected dispatcher branches for both A and B; got:\n{cpp}",
     );
+    assert!(cpp.contains("const char* test_sel = harc_rt::log::harc_select_test(argc, argv);"));
     assert!(cpp.contains("harc_rt::log::harc_report_unknown_test(test_sel, \"A, B\");"));
 }
 

@@ -1984,12 +1984,9 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     writeln!(e.out, "int main(int argc, char** argv) {{").ok();
     writeln!(
         e.out,
-        "{INDENT}const char* test_sel = std::getenv(\"HARC_TEST\");"
+        "{INDENT}const char* test_sel = harc_rt::log::harc_select_test(argc, argv);"
     )
     .ok();
-    writeln!(e.out, "{INDENT}for (int i = 1; i + 1 < argc; i++) {{").ok();
-    writeln!(e.out, "{INDENT}{INDENT}if (std::strcmp(argv[i], \"--test\") == 0) {{ test_sel = argv[i + 1]; break; }}").ok();
-    writeln!(e.out, "{INDENT}}}").ok();
     // Default (no --test, no HARC_TEST) → run the first test.
     let first_test = &tests[0].name.name;
     writeln!(
