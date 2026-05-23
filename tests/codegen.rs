@@ -2610,6 +2610,7 @@ end test WideEndpointAutoCovTest"#,
     assert!(
         cpp.contains("z3::expr _z_data = _ctx.bv_const(\"data\", 128);")
             && cpp.contains("_harc_u128 _pref_")
+            && cpp.contains("harc_rt::random::harc_prefer_u128(_harc_rt_seed, 0, 128)")
             && cpp.contains("_data, 34")
             && cpp.contains("T.data=2^128-1")
             && cpp.contains("T.data=2^127")
@@ -2760,6 +2761,7 @@ end test Wide1024EndpointAutoCovTest"#,
     assert!(
         cpp.contains("z3::expr _z_data = _ctx.bv_const(\"data\", 1024);")
             && cpp.contains("harc_rt::HarcWide<32>")
+            && cpp.contains("harc_rt::random::harc_prefer_wide<32>(_harc_rt_seed, 0, 1024)")
             && cpp.contains("_data, 34")
             && cpp.contains("T.data=2^1024-1")
             && cpp.contains("T.data=2^1023")

@@ -3284,8 +3284,19 @@ fn auto_value_initializer(values: &[AutoCoverageValue]) -> String {
         .join(", ")
 }
 
-fn emit_random_pref_expr(f: &TxnFieldInfo) -> String {
-    emit_random_unsigned_expr(f.width)
+fn emit_random_pref_expr(f: &TxnFieldInfo, salt: usize) -> String {
+    if f.width <= 128 {
+        format!(
+            "harc_rt::random::harc_prefer_u128(_harc_rt_seed, {}, {})",
+            salt, f.width
+        )
+    } else {
+        let words = f.width.div_ceil(32);
+        format!(
+            "harc_rt::random::harc_prefer_wide<{}>(_harc_rt_seed, {}, {})",
+            words, salt, f.width
+        )
+    }
 }
 
 fn emit_random_unsigned_expr(width: u32) -> String {
@@ -10228,7 +10239,7 @@ impl Emitter {
                 .ok();
             } else {
                 let value_ty = txn_field_solver_c_type(f);
-                let expr = emit_random_pref_expr(f);
+                let expr = emit_random_pref_expr(f, pref_idx);
                 writeln!(
                     self.out,
                     "{} _pref_{cache_tag}_{} = {};",
