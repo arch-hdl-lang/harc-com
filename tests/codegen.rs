@@ -4710,6 +4710,37 @@ end impl TestbenchProbeDutTest"#,
         .any(|p| p.name.name == "inject_rs1" && p.force));
 }
 
+#[test]
+fn probe_paths_preserve_sv_bracket_selectors() {
+    let parsed = parse_source(
+        r#"testbench ProbeArrayTb
+    let dut : Top
+        probe lane0 : uint<8> at block.array_sig[0]
+        probe gen_state : uint<3> at gen_stage[2].u_stage.state_q
+    end let dut
+end testbench ProbeArrayTb
+
+impl ProbeArrayTest for ProbeArrayTb
+    run
+        assert dut.lane0 == 0
+    end run
+end impl ProbeArrayTest"#,
+    )
+    .unwrap();
+    let (_, probes) =
+        cpp_tb::dut_probes(&parsed).expect("array selector probes should parse as DUT probes");
+    assert!(probes
+        .iter()
+        .any(|p| p.name.name == "lane0" && p.path == "block.array_sig[0]"));
+    assert!(probes
+        .iter()
+        .any(|p| p.name.name == "gen_state" && p.path == "gen_stage[2].u_stage.state_q"));
+
+    let stub = harc::codegen::sv_stub::emit_stub("Top", &probes).unwrap();
+    assert!(stub.contains("assign lane0 = Top.block.array_sig[0];"));
+    assert!(stub.contains("assign gen_state = Top.gen_stage[2].u_stage.state_q;"));
+}
+
 /// Classic `test T { ... }` form keeps building in this PR — the
 /// parser-entry removal + the inline-source-test sweep lands as a
 /// follow-up. Mirrors PR #91 → #92's staged inline-`run` migration.
