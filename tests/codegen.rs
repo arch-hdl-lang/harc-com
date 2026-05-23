@@ -2395,6 +2395,9 @@ end test SeededSolverTest"#,
     assert!(
         cpp.contains("uint64_t _pref_")
             && cpp.contains("_s.add(_z_val == harc_z3_bv_value(_ctx, _pref_")
+            && cpp.contains("harc_rt::random::HarcSolverRetryPolicy _harc_rt_retry_policy;")
+            && cpp.contains("harc_rt::random::harc_retry_without_preferences(")
+            && cpp.contains("harc_rt::random::harc_retry_without_unique_history(")
             && cpp.contains("retry without seeded preferences")
             && !cpp.contains("static std::vector"),
         "ordinary solver-backed randomize should use seeded free-field preferences without persistent diversity history; got:\n{cpp}"
@@ -2483,8 +2486,11 @@ end test AutoCovPrefTest"#,
             && cpp.contains("_auto_cov_")
             && cpp.contains("harc_auto_cov_select_point")
             && cpp.contains("harc_auto_cov_select_cross")
+            && cpp.contains("harc_auto_cov_first_uncovered(")
+            && cpp.contains("harc_auto_cov_first_uncovered_cross(")
             && cpp.contains("harc_auto_cov_mark_blocked")
             && cpp.contains("harc_auto_cov_mark_hit")
+            && cpp.contains("harc_rt::random::harc_retry_without_preferences(")
             && cpp.contains("retry without seeded preferences")
             && cpp.contains("_auto_cross_"),
         "auto coverage goals and pairwise crosses should feed solver preferences, hit/blocked tracking, and reporting; got:\n{cpp}",
@@ -2846,6 +2852,7 @@ end test UniqueTest"#,
             && cpp.contains("for (auto _v : harc_rt::random::harc_unique_values(_solver_site_")
             && cpp.contains("_unique_test_tag)) _s.add")
             && cpp.contains("// [unique within test] policy: no repeat until exhausted")
+            && cpp.contains("harc_rt::random::harc_retry_without_unique_history(")
             && cpp.contains("harc_rt::random::harc_unique_clear(_solver_site_")
             && cpp.contains("harc_rt::random::harc_unique_remember(_solver_site_")
             && !cpp.contains("if (_solver_site_")
@@ -2902,6 +2909,7 @@ end test UniqueConstrainedTest"#,
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
         cpp.contains("uint64_t _pref_")
+            && cpp.contains("harc_rt::random::harc_retry_without_preferences(")
             && cpp.contains("retry without seeded preferences")
             && !cpp.contains("static std::vector")
             && !cpp.contains("[unique] policy: no repeat until exhausted"),

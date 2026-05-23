@@ -435,10 +435,22 @@ int main() {
     harc_unique_clear(unique);
     HarcAutoCovSelection auto_cov;
     harc_auto_cov_select_cross(auto_cov, 3, 1, 2);
+    bool cov_hit[2] = {true, false};
+    bool cov_blocked[2] = {false, false};
+    size_t cov_i = 0;
+    bool found_cov_point = harc_auto_cov_first_uncovered(cov_hit, cov_blocked, cov_i);
+    bool cross_hit[2][2] = {{true, false}, {false, false}};
+    bool cross_blocked[2][2] = {{false, false}, {true, false}};
+    size_t cross_i = 0;
+    size_t cross_j = 0;
+    bool found_cov_cross = harc_auto_cov_first_uncovered_cross(cross_hit, cross_blocked, cross_i, cross_j);
     bool hit = false;
     bool blocked = false;
     harc_auto_cov_mark_blocked(blocked);
     harc_auto_cov_mark_hit(hit, blocked);
+    HarcSolverRetryPolicy retry;
+    bool retry_pref = harc_retry_without_preferences(retry, false);
+    bool retry_unique = harc_retry_without_unique_history(retry, false);
     HarcSolveStatus status = harc_solve_queued(packet, 4, a, randomize_packet);
     HarcSolveStatus constrained = harc_solve_constrained(
         packet,
@@ -449,7 +461,7 @@ int main() {
     HarcSolveStatus unsat = harc_solve_status_unsat(4, b);
     bool handled_ok = harc_handle_solve_status(constrained);
     bool handled_unsat = harc_handle_solve_status(unsat);
-    return (status.ok && handled_ok && !handled_unsat && constrained.ok && !unsat.ok && unsat.problem_id == 4 && unsat.seed == b && call.problem_id == 4 && call.problem && call.seed != 99 && pref_u < 64 && pref_s >= -8 && pref_s <= 7 && pref_d >= 1 && pref_d <= 9 && unique_has_value && unique.empty() && harc_auto_cov_has_preference(auto_cov) && harc_auto_cov_selected_cross(auto_cov, 3) && hit && !blocked && packet.value == 7 && found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
+    return (status.ok && handled_ok && !handled_unsat && constrained.ok && !unsat.ok && unsat.problem_id == 4 && unsat.seed == b && call.problem_id == 4 && call.problem && call.seed != 99 && pref_u < 64 && pref_s >= -8 && pref_s <= 7 && pref_d >= 1 && pref_d <= 9 && unique_has_value && unique.empty() && harc_auto_cov_has_preference(auto_cov) && harc_auto_cov_selected_cross(auto_cov, 3) && found_cov_point && cov_i == 1 && found_cov_cross && cross_i == 0 && cross_j == 1 && hit && !blocked && retry_pref && retry_unique && retry.retried_without_preferences && retry.retried_without_unique_history && packet.value == 7 && found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
 }
 "#,
         )
