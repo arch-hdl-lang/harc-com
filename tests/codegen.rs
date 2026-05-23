@@ -2065,6 +2065,53 @@ end test HandlerFieldTypeRestoreTest"#,
 }
 
 #[test]
+fn component_typed_method_parameters_dispatch_provider_methods() {
+    let parsed = parse_source(
+        r#"struct ReadResponse
+    matched : uint<1>
+    data : uint<32>
+end struct ReadResponse
+
+transactor ProtocolModel
+    function predict_read(addr: uint<8>) -> ReadResponse
+        let r : ReadResponse
+        r.matched = 1
+        r.data = addr + 256
+        return r
+    end predict_read
+end transactor ProtocolModel
+
+scoreboard ResponseScoreboard
+    function observe(addr: uint<8>, model: ProtocolModel)
+        let r : ReadResponse = model.predict_read(addr)
+    end observe
+end scoreboard ResponseScoreboard
+
+testbench Tb
+    dut : DummyDut
+    sb : ResponseScoreboard
+    model : ProtocolModel active
+end testbench Tb
+
+impl ComponentParamDispatchTest for Tb
+    run
+        sb.observe(1, model)
+    end run
+end impl ComponentParamDispatchTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("ProtocolModel_predict_read(model, addr)"),
+        "component-typed method parameters must dispatch provider methods; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("model.predict_read"),
+        "component-typed method parameters must not fall through to C++ member calls; got:\n{cpp}"
+    );
+}
+
+#[test]
 fn main_loop_runs_post_eval_services_before_coroutine_tick() {
     let parsed = parse_source(
         r#"test T
