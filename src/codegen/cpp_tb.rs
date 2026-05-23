@@ -629,13 +629,9 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
 
     // ── PRNG runtime ──────────────────────────────────────────────────────
     // Seed loaded from HARC_SEED through the random runtime helper.
-    writeln!(e.out, "static uint64_t harc_rng_state = 0;").ok();
+    writeln!(e.out, "static harc_rt::random::HarcRng harc_rng;").ok();
     writeln!(e.out, "static inline uint64_t harc_rng_next() {{").ok();
-    writeln!(
-        e.out,
-        "{INDENT}return harc_rt::random::harc_rng_next_state(harc_rng_state);"
-    )
-    .ok();
+    writeln!(e.out, "{INDENT}return harc_rng.next();").ok();
     writeln!(e.out, "}}").ok();
     writeln!(e.out, "").ok();
 
@@ -1098,10 +1094,10 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "").ok();
         // Seed PRNG from HARC_SEED env (or 1 if unset). Logged after sim_log_line
         // is defined so it lands in sim.log along with normal test output.
-        writeln!(e.out, "{INDENT}harc_rt::random::harc_rng_seed_from_env(harc_rng_state);").ok();
+        writeln!(e.out, "{INDENT}harc_rng.seed_from_env();").ok();
         writeln!(e.out, "{INDENT}harc_rt::trace::HarcTraceWriter trace;").ok();
         writeln!(e.out, "{INDENT}trace.open_env();").ok();
-        writeln!(e.out, "{INDENT}trace.meta(harc_rng_state, std::getenv(\"HARC_DUT_BACKEND\"), \"{dut_type}\", \"{}\");", test.name.name).ok();
+        writeln!(e.out, "{INDENT}trace.meta(harc_rng.state, std::getenv(\"HARC_DUT_BACKEND\"), \"{dut_type}\", \"{}\");", test.name.name).ok();
         writeln!(
             e.out,
             "{INDENT}trace.raw(\"sim_start\", cycle_count, \"\");"
@@ -1461,7 +1457,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         if log_seed {
             writeln!(
                 e.out,
-                "{INDENT}sim_log_line(\"INFO\", \"seed=%llu\", (long long)harc_rng_state);"
+                "{INDENT}sim_log_line(\"INFO\", \"seed=%llu\", (long long)harc_rng.state);"
             )
             .ok();
             writeln!(e.out, "").ok();
@@ -3768,7 +3764,7 @@ impl Emitter {
         self.pad(depth + 1);
         writeln!(
             self.out,
-            "auto _harc_rt_call = _harc_runtime_random_problem_table_prepare_call({problem_id}, harc_rng_state, 0);"
+            "auto _harc_rt_call = _harc_runtime_random_problem_table_prepare_call({problem_id}, harc_rng.state, 0);"
         )
         .ok();
         self.pad(depth + 1);
@@ -9202,7 +9198,7 @@ impl Emitter {
             self.pad(depth + 1);
             writeln!(
                 self.out,
-                "auto _harc_rt_call = _harc_runtime_random_problem_table_prepare_call({problem_id}, harc_rng_state, harc_rng_next());"
+                "auto _harc_rt_call = _harc_runtime_random_problem_table_prepare_call({problem_id}, harc_rng.state, harc_rng_next());"
             )
             .ok();
             self.pad(depth + 1);
