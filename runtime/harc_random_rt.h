@@ -392,54 +392,6 @@ inline uint8_t& harc_auto_cov_cross_blocked(
     return state.cross_blocked[harc_auto_cov_cross_offset(plan, cross) + i * meta.cols + j];
 }
 
-template <size_t N>
-inline bool harc_auto_cov_first_uncovered(
-    const bool (&hit)[N],
-    const bool (&blocked)[N],
-    size_t& i) {
-    for (size_t idx = 0; idx < N; ++idx) {
-        if (!hit[idx] && !blocked[idx]) {
-            i = idx;
-            return true;
-        }
-    }
-    return false;
-}
-
-template <size_t Rows, size_t Cols>
-inline bool harc_auto_cov_first_uncovered_cross(
-    const bool (&hit)[Rows][Cols],
-    const bool (&blocked)[Rows][Cols],
-    size_t& i,
-    size_t& j) {
-    for (size_t row = 0; row < Rows; ++row) {
-        for (size_t col = 0; col < Cols; ++col) {
-            if (!hit[row][col] && !blocked[row][col]) {
-                i = row;
-                j = col;
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-template <typename T, size_t N>
-inline bool harc_auto_cov_apply_point_preference(
-    HarcAutoCovSelection& selection,
-    int group,
-    const bool (&hit)[N],
-    const bool (&blocked)[N],
-    const T (&values)[N],
-    T& preference) {
-    if (harc_auto_cov_has_preference(selection)) return false;
-    size_t i = 0;
-    if (!harc_auto_cov_first_uncovered(hit, blocked, i)) return false;
-    preference = values[i];
-    harc_auto_cov_select_point(selection, group, i);
-    return true;
-}
-
 template <typename T, size_t N>
 inline bool harc_auto_cov_apply_point_preference(
     const HarcAutoCovPlan& plan,
@@ -459,26 +411,6 @@ inline bool harc_auto_cov_apply_point_preference(
         }
     }
     return false;
-}
-
-template <typename A, typename B, size_t Rows, size_t Cols>
-inline bool harc_auto_cov_apply_cross_preference(
-    HarcAutoCovSelection& selection,
-    int group,
-    const bool (&hit)[Rows][Cols],
-    const bool (&blocked)[Rows][Cols],
-    const A (&a_values)[Rows],
-    const B (&b_values)[Cols],
-    A& a_preference,
-    B& b_preference) {
-    if (harc_auto_cov_has_preference(selection)) return false;
-    size_t i = 0;
-    size_t j = 0;
-    if (!harc_auto_cov_first_uncovered_cross(hit, blocked, i, j)) return false;
-    a_preference = a_values[i];
-    b_preference = b_values[j];
-    harc_auto_cov_select_cross(selection, group, i, j);
-    return true;
 }
 
 template <typename A, typename B, size_t Rows, size_t Cols>
@@ -507,26 +439,6 @@ inline bool harc_auto_cov_apply_cross_preference(
         }
     }
     return false;
-}
-
-template <size_t N>
-inline uint64_t harc_auto_cov_count(const bool (&bins)[N]) {
-    uint64_t count = 0;
-    for (size_t i = 0; i < N; ++i) {
-        if (bins[i]) ++count;
-    }
-    return count;
-}
-
-template <size_t Rows, size_t Cols>
-inline uint64_t harc_auto_cov_count(const bool (&bins)[Rows][Cols]) {
-    uint64_t count = 0;
-    for (size_t i = 0; i < Rows; ++i) {
-        for (size_t j = 0; j < Cols; ++j) {
-            if (bins[i][j]) ++count;
-        }
-    }
-    return count;
 }
 
 inline constexpr const char* harc_auto_cov_state(
@@ -617,15 +529,6 @@ inline void harc_auto_cov_mark_hit(HitFlag& hit, BlockedFlag& blocked) {
 }
 
 inline void harc_auto_cov_mark_selected_point_blocked(
-    const HarcAutoCovSelection& selection,
-    int group,
-    bool& blocked) {
-    if (harc_auto_cov_selected_point(selection, group)) {
-        harc_auto_cov_mark_blocked(blocked);
-    }
-}
-
-inline void harc_auto_cov_mark_selected_point_blocked(
     const HarcAutoCovPlan& plan,
     HarcAutoCovState& state,
     const HarcAutoCovSelection& selection,
@@ -633,15 +536,6 @@ inline void harc_auto_cov_mark_selected_point_blocked(
     if (harc_auto_cov_selected_point(selection, group)) {
         harc_auto_cov_mark_blocked(
             harc_auto_cov_point_blocked(plan, state, static_cast<size_t>(group), selection.i));
-    }
-}
-
-inline void harc_auto_cov_mark_selected_cross_blocked(
-    const HarcAutoCovSelection& selection,
-    int group,
-    bool& blocked) {
-    if (harc_auto_cov_selected_cross(selection, group)) {
-        harc_auto_cov_mark_blocked(blocked);
     }
 }
 
@@ -665,17 +559,6 @@ template <typename T, typename U>
 inline void harc_auto_cov_mark_value_hit(
     const T& value,
     const U& expected,
-    bool& hit,
-    bool& blocked) {
-    if (value == expected) {
-        harc_auto_cov_mark_hit(hit, blocked);
-    }
-}
-
-template <typename T, typename U>
-inline void harc_auto_cov_mark_value_hit(
-    const T& value,
-    const U& expected,
     const HarcAutoCovPlan& plan,
     HarcAutoCovState& state,
     size_t point,
@@ -684,19 +567,6 @@ inline void harc_auto_cov_mark_value_hit(
         harc_auto_cov_mark_hit(
             harc_auto_cov_point_hit(plan, state, point, i),
             harc_auto_cov_point_blocked(plan, state, point, i));
-    }
-}
-
-template <typename A, typename B, typename ExpectedA, typename ExpectedB>
-inline void harc_auto_cov_mark_cross_hit(
-    const A& a,
-    const ExpectedA& expected_a,
-    const B& b,
-    const ExpectedB& expected_b,
-    bool& hit,
-    bool& blocked) {
-    if (a == expected_a && b == expected_b) {
-        harc_auto_cov_mark_hit(hit, blocked);
     }
 }
 

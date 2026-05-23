@@ -435,31 +435,9 @@ int main() {
     bool unique_has_value = false;
     for (int value : harc_unique_values(unique)) unique_has_value = unique_has_value || value == 5;
     harc_unique_clear(unique);
-    HarcAutoCovSelection auto_cov;
-    harc_auto_cov_select_cross(auto_cov, 3, 1, 2);
-    bool cov_hit[2] = {true, false};
-    bool cov_blocked[2] = {false, false};
-    size_t cov_i = 0;
-    bool found_cov_point = harc_auto_cov_first_uncovered(cov_hit, cov_blocked, cov_i);
-    bool cross_hit[2][2] = {{true, false}, {false, false}};
-    bool cross_blocked[2][2] = {{false, false}, {true, false}};
-    size_t cross_i = 0;
-    size_t cross_j = 0;
-    bool found_cov_cross = harc_auto_cov_first_uncovered_cross(cross_hit, cross_blocked, cross_i, cross_j);
     int cov_values[2] = {3, 9};
-    int cov_preference = 0;
-    bool applied_cov_point = harc_auto_cov_apply_point_preference(auto_cov, 4, cov_hit, cov_blocked, cov_values, cov_preference);
-    HarcAutoCovSelection auto_cov_apply;
     int cross_a_values[2] = {1, 2};
     int cross_b_values[2] = {7, 8};
-    int cross_a_preference = 0;
-    int cross_b_preference = 0;
-    bool applied_cov_cross = harc_auto_cov_apply_cross_preference(auto_cov_apply, 5, cross_hit, cross_blocked, cross_a_values, cross_b_values, cross_a_preference, cross_b_preference);
-    uint64_t cov_hits = harc_auto_cov_count(cov_hit);
-    uint64_t cross_blocked_count = harc_auto_cov_count(cross_blocked);
-    const char* cov_state = harc_auto_cov_state(cov_hit[1], cov_blocked[1]);
-    harc_auto_cov_report_summary("Packet", 12, cov_hits, 2, cross_blocked_count);
-    harc_auto_cov_report_bin("Packet.kind=Read", cov_hit[0], cov_blocked[0]);
     bool report_registered = false;
     std::vector<std::function<void()>> reports;
     harc_auto_cov_register_report(report_registered, reports, []() {});
@@ -467,14 +445,6 @@ int main() {
     bool blocked = false;
     harc_auto_cov_mark_blocked(blocked);
     harc_auto_cov_mark_hit(hit, blocked);
-    bool selected_blocked = false;
-    harc_auto_cov_mark_selected_cross_blocked(auto_cov, 3, selected_blocked);
-    bool value_hit = false;
-    bool value_blocked = true;
-    harc_auto_cov_mark_value_hit(7, 7, value_hit, value_blocked);
-    bool cross_hit_match = false;
-    bool cross_hit_blocked = true;
-    harc_auto_cov_mark_cross_hit(1, 1, 2, 2, cross_hit_match, cross_hit_blocked);
     const char* point_labels[] = {"Packet.kind=Read", "Packet.kind=Write"};
     const char* cross_labels[] = {
         "Packet.kind=Read x Packet.len=1",
@@ -497,6 +467,7 @@ int main() {
     harc_auto_cov_mark_selected_cross_blocked(cov_plan, cov_state_table, state_cross_selection, 0);
     harc_auto_cov_mark_value_hit(9, 9, cov_plan, cov_state_table, 0, 1);
     harc_auto_cov_mark_cross_hit(1, 1, 8, 8, cov_plan, cov_state_table, 0, 0, 1);
+    const char* cov_state = harc_auto_cov_state(cov_state_table.point_hit[1], cov_state_table.point_blocked[1]);
     harc_auto_cov_report(cov_plan, cov_state_table);
     HarcSolverRetryPolicy retry;
     bool retry_pref = harc_retry_without_preferences(retry, false);
@@ -511,7 +482,7 @@ int main() {
     HarcSolveStatus unsat = harc_solve_status_unsat(4, b);
     bool handled_ok = harc_handle_solve_status(constrained);
     bool handled_unsat = harc_handle_solve_status(unsat);
-    return (status.ok && handled_ok && !handled_unsat && constrained.ok && !unsat.ok && unsat.problem_id == 4 && unsat.seed == b && call.problem_id == 4 && call.problem && call.seed != 99 && pref_u < 64 && pref_u128 != 0 && (pref_u128 >> 96) == 0 && pref_wide[4] < 16 && pref_s >= -8 && pref_s <= 7 && pref_d >= 1 && pref_d <= 9 && unique_has_value && unique.empty() && harc_auto_cov_has_preference(auto_cov) && harc_auto_cov_selected_cross(auto_cov, 3) && found_cov_point && cov_i == 1 && found_cov_cross && cross_i == 0 && cross_j == 1 && !applied_cov_point && cov_preference == 0 && applied_cov_cross && cross_a_preference == 1 && cross_b_preference == 8 && harc_auto_cov_selected_cross(auto_cov_apply, 5) && cov_hits == 1 && cross_blocked_count == 1 && cov_state[0] == '*' && report_registered && reports.size() == 1 && hit && !blocked && selected_blocked && value_hit && !value_blocked && cross_hit_match && !cross_hit_blocked && applied_state_point && state_point_pref == 3 && applied_state_cross && state_cross_a_pref == 1 && state_cross_b_pref == 7 && cov_state_table.point_hit[1] && !cov_state_table.point_blocked[1] && cov_state_table.cross_hit[1] && !cov_state_table.cross_blocked[1] && retry_pref && retry_unique && retry.retried_without_preferences && retry.retried_without_unique_history && packet.value == 7 && found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
+    return (status.ok && handled_ok && !handled_unsat && constrained.ok && !unsat.ok && unsat.problem_id == 4 && unsat.seed == b && call.problem_id == 4 && call.problem && call.seed != 99 && pref_u < 64 && pref_u128 != 0 && (pref_u128 >> 96) == 0 && pref_wide[4] < 16 && pref_s >= -8 && pref_s <= 7 && pref_d >= 1 && pref_d <= 9 && unique_has_value && unique.empty() && report_registered && reports.size() == 1 && hit && !blocked && applied_state_point && state_point_pref == 3 && applied_state_cross && state_cross_a_pref == 1 && state_cross_b_pref == 7 && cov_state[0] == 'h' && cov_state_table.point_blocked[0] && cov_state_table.point_hit[1] && !cov_state_table.point_blocked[1] && cov_state_table.cross_blocked[0] && cov_state_table.cross_hit[1] && !cov_state_table.cross_blocked[1] && retry_pref && retry_unique && retry.retried_without_preferences && retry.retried_without_unique_history && packet.value == 7 && found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
 }
 "#,
         )
