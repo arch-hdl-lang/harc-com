@@ -10269,28 +10269,17 @@ impl Emitter {
             )
             .ok();
             self.pad(depth + 2);
+            writeln!(self.out, "size_t _i = 0;").ok();
+            self.pad(depth + 2);
+            writeln!(self.out, "size_t _j = 0;").ok();
+            self.pad(depth + 2);
             writeln!(
                 self.out,
-                "for (size_t _i = 0; _i < {}; ++_i) {{",
-                a.values.len()
+                "if (harc_rt::random::harc_auto_cov_first_uncovered_cross(_auto_cross_{cache_tag}_{}__{}, _auto_cross_blocked_{cache_tag}_{}__{}, _i, _j)) {{",
+                a.c_field, b.c_field, a.c_field, b.c_field
             )
             .ok();
             self.pad(depth + 3);
-            writeln!(
-                self.out,
-                "for (size_t _j = 0; _j < {}; ++_j) {{",
-                b.values.len()
-            )
-            .ok();
-            self.pad(depth + 4);
-            writeln!(
-                self.out,
-                "if (!_auto_cross_{cache_tag}_{}__{}[_i][_j] && !_auto_cross_blocked_{cache_tag}_{}__{}[_i][_j]) {{",
-                a.c_field, b.c_field,
-                a.c_field, b.c_field
-            )
-            .ok();
-            self.pad(depth + 5);
             let a_ty = auto_value_array_type(a, &field_info);
             writeln!(
                 self.out,
@@ -10300,7 +10289,7 @@ impl Emitter {
                 auto_value_initializer(&a.values)
             )
             .ok();
-            self.pad(depth + 5);
+            self.pad(depth + 3);
             let b_ty = auto_value_array_type(b, &field_info);
             writeln!(
                 self.out,
@@ -10310,36 +10299,24 @@ impl Emitter {
                 auto_value_initializer(&b.values)
             )
             .ok();
-            self.pad(depth + 5);
+            self.pad(depth + 3);
             writeln!(
                 self.out,
                 "_pref_{cache_tag}_{} = _auto_vals_{cache_tag}_{}[_i];",
                 a.c_field, a.c_field
             )
             .ok();
-            self.pad(depth + 5);
+            self.pad(depth + 3);
             writeln!(
                 self.out,
                 "_pref_{cache_tag}_{} = _auto_vals_{cache_tag}_{}[_j];",
                 b.c_field, b.c_field
             )
             .ok();
-            self.pad(depth + 5);
+            self.pad(depth + 3);
             writeln!(
                 self.out,
                 "harc_rt::random::harc_auto_cov_select_cross(_auto_cov_selection_{cache_tag}, {group}, _i, _j);"
-            )
-            .ok();
-            self.pad(depth + 5);
-            writeln!(self.out, "break;").ok();
-            self.pad(depth + 4);
-            writeln!(self.out, "}}").ok();
-            self.pad(depth + 3);
-            writeln!(self.out, "}}").ok();
-            self.pad(depth + 3);
-            writeln!(
-                self.out,
-                "if (harc_rt::random::harc_auto_cov_has_preference(_auto_cov_selection_{cache_tag})) break;"
             )
             .ok();
             self.pad(depth + 2);
@@ -10365,24 +10342,23 @@ impl Emitter {
             )
             .ok();
             self.pad(depth + 2);
+            writeln!(self.out, "size_t _i = 0;").ok();
+            self.pad(depth + 2);
             writeln!(
                 self.out,
-                "for (size_t _i = 0; _i < {}; ++_i) {{",
-                goal.values.len()
-            )
-            .ok();
-            self.pad(depth + 3);
-            writeln!(
-                self.out,
-                "if (!_auto_cov_{cache_tag}_{}[_i] && !_auto_cov_blocked_{cache_tag}_{}[_i]) {{ _pref_{cache_tag}_{} = _auto_vals_{cache_tag}_{}[_i]; harc_rt::random::harc_auto_cov_select_point(_auto_cov_selection_{cache_tag}, {group}, _i); break; }}",
+                "if (harc_rt::random::harc_auto_cov_first_uncovered(_auto_cov_{cache_tag}_{}, _auto_cov_blocked_{cache_tag}_{}, _i)) {{ _pref_{cache_tag}_{} = _auto_vals_{cache_tag}_{}[_i]; harc_rt::random::harc_auto_cov_select_point(_auto_cov_selection_{cache_tag}, {group}, _i); }}",
                 goal.c_field, goal.c_field, goal.c_field, goal.c_field
             )
             .ok();
-            self.pad(depth + 2);
-            writeln!(self.out, "}}").ok();
             self.pad(depth + 1);
             writeln!(self.out, "}}").ok();
         }
+        self.pad(depth + 1);
+        writeln!(
+            self.out,
+            "harc_rt::random::HarcSolverRetryPolicy _harc_rt_retry_policy;"
+        )
+        .ok();
         self.pad(depth + 1);
         writeln!(
             self.out,
@@ -10404,7 +10380,11 @@ impl Emitter {
         self.pad(depth + 1);
         writeln!(self.out, "auto _r = _s.check();").ok();
         self.pad(depth + 1);
-        writeln!(self.out, "if (_r != z3::sat) {{").ok();
+        writeln!(
+            self.out,
+            "if (harc_rt::random::harc_retry_without_preferences(_harc_rt_retry_policy, _r == z3::sat)) {{"
+        )
+        .ok();
         if !auto_goals.is_empty() {
             for (group, (a, b)) in auto_crosses.iter().enumerate() {
                 self.pad(depth + 2);
@@ -10455,7 +10435,11 @@ impl Emitter {
         self.pad(depth + 1);
         writeln!(self.out, "_r = _s.check();").ok();
         self.pad(depth + 1);
-        writeln!(self.out, "if (_r != z3::sat) {{").ok();
+        writeln!(
+            self.out,
+            "if (harc_rt::random::harc_retry_without_unique_history(_harc_rt_retry_policy, _r == z3::sat)) {{"
+        )
+        .ok();
         self.pad(depth + 2);
         writeln!(self.out, "_s.pop();").ok();
         for f in free_fields

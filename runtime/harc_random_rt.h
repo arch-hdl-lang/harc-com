@@ -63,6 +63,11 @@ struct HarcAutoCovSelection {
     size_t j = 0;
 };
 
+struct HarcSolverRetryPolicy {
+    bool retried_without_preferences = false;
+    bool retried_without_unique_history = false;
+};
+
 template <typename T>
 using HarcUniqueHistory = std::vector<T>;
 
@@ -246,6 +251,38 @@ inline constexpr bool harc_auto_cov_selected_cross(
     return selection.kind == 2 && selection.group == group;
 }
 
+template <size_t N>
+inline bool harc_auto_cov_first_uncovered(
+    const bool (&hit)[N],
+    const bool (&blocked)[N],
+    size_t& i) {
+    for (size_t idx = 0; idx < N; ++idx) {
+        if (!hit[idx] && !blocked[idx]) {
+            i = idx;
+            return true;
+        }
+    }
+    return false;
+}
+
+template <size_t Rows, size_t Cols>
+inline bool harc_auto_cov_first_uncovered_cross(
+    const bool (&hit)[Rows][Cols],
+    const bool (&blocked)[Rows][Cols],
+    size_t& i,
+    size_t& j) {
+    for (size_t row = 0; row < Rows; ++row) {
+        for (size_t col = 0; col < Cols; ++col) {
+            if (!hit[row][col] && !blocked[row][col]) {
+                i = row;
+                j = col;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 inline void harc_auto_cov_mark_blocked(bool& blocked) {
     blocked = true;
 }
@@ -253,6 +290,22 @@ inline void harc_auto_cov_mark_blocked(bool& blocked) {
 inline void harc_auto_cov_mark_hit(bool& hit, bool& blocked) {
     hit = true;
     blocked = false;
+}
+
+inline bool harc_retry_without_preferences(
+    HarcSolverRetryPolicy& policy,
+    bool solver_sat) {
+    if (solver_sat) return false;
+    policy.retried_without_preferences = true;
+    return true;
+}
+
+inline bool harc_retry_without_unique_history(
+    HarcSolverRetryPolicy& policy,
+    bool solver_sat) {
+    if (solver_sat) return false;
+    policy.retried_without_unique_history = true;
+    return true;
 }
 
 inline constexpr HarcSolveStatus harc_solve_status_ok() {
