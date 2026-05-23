@@ -12,6 +12,7 @@
 #include <initializer_list>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 #include "harc_thread_rt.h"
 
@@ -140,6 +141,11 @@ inline uint64_t harc_rng_next_state(uint64_t& state) {
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
     return z ^ (z >> 31);
+}
+
+inline void harc_rng_seed_from_env(uint64_t& state, const char* env_name = "HARC_SEED") {
+    const char* s = std::getenv(env_name);
+    state = (s && *s) ? std::strtoull(s, nullptr, 0) : 1ull;
 }
 
 inline constexpr harc_seed harc_seed_from(
