@@ -20,6 +20,14 @@ inline std::string harc_resolve_log_path(const char* path) {
     return std::string(path ? path : "");
 }
 
+inline FILE* harc_open_sim_log(
+    const char* env_name = "HARC_SIM_LOG",
+    const char* fallback_path = "sim.log") {
+    const char* path = std::getenv(env_name);
+    if (!path || !*path) path = fallback_path;
+    return std::fopen(path, "w");
+}
+
 struct HarcLogFiles {
     std::unordered_map<std::string, FILE*> files;
 
