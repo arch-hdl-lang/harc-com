@@ -643,46 +643,6 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     .ok();
     writeln!(e.out, "{INDENT}return z ^ (z >> 31);").ok();
     writeln!(e.out, "}}").ok();
-    writeln!(
-        e.out,
-        "static inline int64_t harc_rng_range(int64_t lo, int64_t hi) {{"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}if (hi <= lo) return lo;").ok();
-    writeln!(
-        e.out,
-        "{INDENT}return lo + (int64_t)(harc_rng_next() % (uint64_t)(hi - lo + 1));"
-    )
-    .ok();
-    writeln!(e.out, "}}").ok();
-    writeln!(
-        e.out,
-        "static inline uint64_t harc_rng_uint(unsigned width) {{"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}if (width >= 64) return harc_rng_next();").ok();
-    writeln!(
-        e.out,
-        "{INDENT}return harc_rng_next() & ((1ULL << width) - 1);"
-    )
-    .ok();
-    writeln!(e.out, "}}").ok();
-    writeln!(e.out, "static inline int64_t harc_rng_dist(const std::vector<std::tuple<int64_t,int64_t,int64_t>>& bins) {{").ok();
-    writeln!(
-        e.out,
-        "{INDENT}int64_t total = 0; for (auto& b : bins) total += std::get<2>(b);"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}if (total <= 0) return 0;").ok();
-    writeln!(
-        e.out,
-        "{INDENT}int64_t pick = (int64_t)(harc_rng_next() % (uint64_t)total);"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}int64_t acc = 0;").ok();
-    writeln!(e.out, "{INDENT}for (auto& b : bins) {{ acc += std::get<2>(b); if (pick < acc) return harc_rng_range(std::get<0>(b), std::get<1>(b)); }}").ok();
-    writeln!(e.out, "{INDENT}return std::get<0>(bins.front());").ok();
-    writeln!(e.out, "}}").ok();
     if uses_solver {
         writeln!(e.out, "static inline z3::expr harc_z3_bv_words(z3::context& ctx, const uint32_t* words, size_t word_count, unsigned width) {{").ok();
         writeln!(e.out, "{INDENT}z3::expr out = ctx.bv_val((uint64_t)0, width);").ok();
@@ -3301,31 +3261,12 @@ fn emit_random_pref_expr(f: &TxnFieldInfo, salt: usize) -> String {
 
 fn emit_random_unsigned_expr(width: u32) -> String {
     if width <= 64 {
-        if width < 64 {
-            format!("harc_rng_uint({width})")
-        } else {
-            "harc_rng_next()".to_string()
-        }
+        format!("harc_rt::random::harc_rng_uint(harc_rng_next, {width})")
     } else if width <= 128 {
-        let raw = "(((_harc_u128)harc_rng_next() << 64) | (_harc_u128)harc_rng_next())";
-        if width == 128 {
-            raw.to_string()
-        } else {
-            format!("({raw} & (((_harc_u128)1 << {width}) - 1))")
-        }
+        format!("harc_rt::random::harc_rng_u128(harc_rng_next, {width})")
     } else {
         let words = width.div_ceil(32);
-        let last_bits = width % 32;
-        let mut parts = Vec::new();
-        for idx in 0..words {
-            if idx == words - 1 && last_bits != 0 {
-                let mask = (1u32 << last_bits) - 1;
-                parts.push(format!("(uint32_t)(harc_rng_next() & 0x{mask:08x}ULL)"));
-            } else {
-                parts.push("(uint32_t)harc_rng_next()".to_string());
-            }
-        }
-        format!("harc_rt::HarcWide<{}>({{{}}})", words, parts.join(", "))
+        format!("harc_rt::random::harc_rng_wide<{}>(harc_rng_next, {width})", words)
     }
 }
 
@@ -8738,7 +8679,7 @@ impl Emitter {
             let max_len = info.declared_max_len.unwrap_or(0);
             writeln!(
                 self.out,
-                "{INDENT}t->{}.resize((size_t)harc_rng_range(0, {}));",
+                "{INDENT}t->{}.resize((size_t)harc_rt::random::harc_rng_range(harc_rng_next, 0, {}));",
                 f.name.name, max_len
             )
             .ok();
@@ -8766,7 +8707,7 @@ impl Emitter {
                         if w < 63 {
                             writeln!(
                                 self.out,
-                                "{INDENT}{INDENT}t->{}[_i] = harc_rng_range(-(1LL << {}), (1LL << {}) - 1);",
+                                "{INDENT}{INDENT}t->{}[_i] = harc_rt::random::harc_rng_range(harc_rng_next, -(1LL << {}), (1LL << {}) - 1);",
                                 f.name.name,
                                 w.saturating_sub(1),
                                 w.saturating_sub(1)
@@ -8785,7 +8726,7 @@ impl Emitter {
                     BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => {
                         writeln!(
                             self.out,
-                            "{INDENT}{INDENT}t->{}[_i] = harc_rng_range(0, 1);",
+                            "{INDENT}{INDENT}t->{}[_i] = harc_rt::random::harc_rng_range(harc_rng_next, 0, 1);",
                             f.name.name
                         )
                         .ok();
@@ -8809,7 +8750,7 @@ impl Emitter {
                 "range" => {
                     if a.args.len() >= 2 {
                         if let (AttrArg::Expr(lo), AttrArg::Expr(hi)) = (&a.args[0], &a.args[1]) {
-                            write!(self.out, "{INDENT}t->{} = harc_rng_range(", f.name.name).ok();
+                            write!(self.out, "{INDENT}t->{} = harc_rt::random::harc_rng_range(harc_rng_next, ", f.name.name).ok();
                             self.emit_expr(lo);
                             write!(self.out, ", ").ok();
                             self.emit_expr(hi);
@@ -8824,7 +8765,7 @@ impl Emitter {
                         _ => None,
                     });
                     if let Some(entries) = dist_args {
-                        write!(self.out, "{INDENT}t->{} = harc_rng_dist({{", f.name.name).ok();
+                        write!(self.out, "{INDENT}t->{} = harc_rt::random::harc_rng_dist(harc_rng_next, {{", f.name.name).ok();
                         self.emit_rng_dist_entries(entries);
                         writeln!(self.out, "}});").ok();
                         handled = true;
@@ -8860,7 +8801,7 @@ impl Emitter {
                         if w < 63 {
                             writeln!(
                                 self.out,
-                                "{INDENT}t->{} = harc_rng_range(-(1LL << {}), (1LL << {}) - 1);",
+                                "{INDENT}t->{} = harc_rt::random::harc_rng_range(harc_rng_next, -(1LL << {}), (1LL << {}) - 1);",
                                 f.name.name,
                                 w - 1,
                                 w - 1
@@ -8879,7 +8820,7 @@ impl Emitter {
                     BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => {
                         writeln!(
                             self.out,
-                            "{INDENT}t->{} = harc_rng_range(0, 1);",
+                            "{INDENT}t->{} = harc_rt::random::harc_rng_range(harc_rng_next, 0, 1);",
                             f.name.name
                         )
                         .ok();
@@ -8887,7 +8828,7 @@ impl Emitter {
                     BuiltinTy::Int => {
                         writeln!(
                             self.out,
-                            "{INDENT}t->{} = harc_rng_range(0, 0x7FFFFFFF);",
+                            "{INDENT}t->{} = harc_rt::random::harc_rng_range(harc_rng_next, 0, 0x7FFFFFFF);",
                             f.name.name
                         )
                         .ok();
@@ -8908,7 +8849,7 @@ impl Emitter {
                     let hi = if n == 0 { 0 } else { (n - 1) as i64 };
                     writeln!(
                         self.out,
-                        "{INDENT}t->{} = harc_rng_range(0, {});",
+                        "{INDENT}t->{} = harc_rt::random::harc_rng_range(harc_rng_next, 0, {});",
                         f.name.name, hi
                     )
                     .ok();
