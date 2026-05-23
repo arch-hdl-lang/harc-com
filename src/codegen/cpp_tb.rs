@@ -1071,7 +1071,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "{INDENT}tfp->open(_wave_path.c_str());").ok();
         writeln!(
             e.out,
-            "{INDENT}std::fprintf(stderr, \"[waves] writing %s\\n\", _wave_path.c_str());"
+            "{INDENT}harc_rt::log::harc_log_wave_stderr(_wave_path);"
         )
         .ok();
         writeln!(e.out, "{INDENT}uint64_t _trace_time = 0;").ok();
@@ -1105,7 +1105,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "#if HARC_TRACE_ENABLED").ok();
         writeln!(
             e.out,
-            "{INDENT}if (sim_log) std::fprintf(sim_log, \"[waves] writing %s\\n\", _wave_path.c_str());"
+            "{INDENT}harc_rt::log::harc_log_wave_file(sim_log, _wave_path);"
         )
         .ok();
         writeln!(e.out, "#endif").ok();
