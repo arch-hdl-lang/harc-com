@@ -10257,95 +10257,66 @@ impl Emitter {
         }
         for (group, (a, b)) in auto_crosses.iter().enumerate() {
             self.pad(depth + 1);
-            writeln!(
-                self.out,
-                "if (!harc_rt::random::harc_auto_cov_has_preference(_auto_cov_selection_{cache_tag})) {{"
-            )
-            .ok();
-            self.pad(depth + 2);
-            writeln!(self.out, "size_t _i = 0;").ok();
-            self.pad(depth + 2);
-            writeln!(self.out, "size_t _j = 0;").ok();
-            self.pad(depth + 2);
-            writeln!(
-                self.out,
-                "if (harc_rt::random::harc_auto_cov_first_uncovered_cross(_auto_cross_{cache_tag}_{}__{}, _auto_cross_blocked_{cache_tag}_{}__{}, _i, _j)) {{",
-                a.c_field, b.c_field, a.c_field, b.c_field
-            )
-            .ok();
-            self.pad(depth + 3);
             let a_ty = auto_value_array_type(a, &field_info);
             writeln!(
                 self.out,
-                "static const {} _auto_vals_{cache_tag}_{}[] = {{{}}};",
+                "static const {} _auto_cross_vals_{cache_tag}_{}__{}_{}[] = {{{}}};",
                 a_ty,
+                a.c_field,
+                b.c_field,
                 a.c_field,
                 auto_value_initializer(&a.values)
             )
             .ok();
-            self.pad(depth + 3);
+            self.pad(depth + 1);
             let b_ty = auto_value_array_type(b, &field_info);
             writeln!(
                 self.out,
-                "static const {} _auto_vals_{cache_tag}_{}[] = {{{}}};",
+                "static const {} _auto_cross_vals_{cache_tag}_{}__{}_{}[] = {{{}}};",
                 b_ty,
+                a.c_field,
+                b.c_field,
                 b.c_field,
                 auto_value_initializer(&b.values)
             )
             .ok();
-            self.pad(depth + 3);
-            writeln!(
-                self.out,
-                "_pref_{cache_tag}_{} = _auto_vals_{cache_tag}_{}[_i];",
-                a.c_field, a.c_field
-            )
-            .ok();
-            self.pad(depth + 3);
-            writeln!(
-                self.out,
-                "_pref_{cache_tag}_{} = _auto_vals_{cache_tag}_{}[_j];",
-                b.c_field, b.c_field
-            )
-            .ok();
-            self.pad(depth + 3);
-            writeln!(
-                self.out,
-                "harc_rt::random::harc_auto_cov_select_cross(_auto_cov_selection_{cache_tag}, {group}, _i, _j);"
-            )
-            .ok();
-            self.pad(depth + 2);
-            writeln!(self.out, "}}").ok();
             self.pad(depth + 1);
-            writeln!(self.out, "}}").ok();
+            writeln!(
+                self.out,
+                "harc_rt::random::harc_auto_cov_apply_cross_preference(_auto_cov_selection_{cache_tag}, {group}, _auto_cross_{cache_tag}_{}__{}, _auto_cross_blocked_{cache_tag}_{}__{}, _auto_cross_vals_{cache_tag}_{}__{}_{}, _auto_cross_vals_{cache_tag}_{}__{}_{}, _pref_{cache_tag}_{}, _pref_{cache_tag}_{});",
+                a.c_field,
+                b.c_field,
+                a.c_field,
+                b.c_field,
+                a.c_field,
+                b.c_field,
+                a.c_field,
+                a.c_field,
+                b.c_field,
+                b.c_field,
+                a.c_field,
+                b.c_field
+            )
+            .ok();
         }
         for (group, goal) in auto_goals.iter().enumerate() {
             self.pad(depth + 1);
-            writeln!(
-                self.out,
-                "if (!harc_rt::random::harc_auto_cov_has_preference(_auto_cov_selection_{cache_tag})) {{"
-            )
-            .ok();
-            self.pad(depth + 2);
             let value_ty = auto_value_array_type(goal, &field_info);
             writeln!(
                 self.out,
-                "static const {} _auto_vals_{cache_tag}_{}[] = {{{}}};",
+                "static const {} _auto_point_vals_{cache_tag}_{}[] = {{{}}};",
                 value_ty,
                 goal.c_field,
                 auto_value_initializer(&goal.values)
             )
             .ok();
-            self.pad(depth + 2);
-            writeln!(self.out, "size_t _i = 0;").ok();
-            self.pad(depth + 2);
+            self.pad(depth + 1);
             writeln!(
                 self.out,
-                "if (harc_rt::random::harc_auto_cov_first_uncovered(_auto_cov_{cache_tag}_{}, _auto_cov_blocked_{cache_tag}_{}, _i)) {{ _pref_{cache_tag}_{} = _auto_vals_{cache_tag}_{}[_i]; harc_rt::random::harc_auto_cov_select_point(_auto_cov_selection_{cache_tag}, {group}, _i); }}",
+                "harc_rt::random::harc_auto_cov_apply_point_preference(_auto_cov_selection_{cache_tag}, {group}, _auto_cov_{cache_tag}_{}, _auto_cov_blocked_{cache_tag}_{}, _auto_point_vals_{cache_tag}_{}, _pref_{cache_tag}_{});",
                 goal.c_field, goal.c_field, goal.c_field, goal.c_field
             )
             .ok();
-            self.pad(depth + 1);
-            writeln!(self.out, "}}").ok();
         }
         self.pad(depth + 1);
         writeln!(

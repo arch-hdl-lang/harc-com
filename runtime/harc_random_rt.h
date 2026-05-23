@@ -283,6 +283,42 @@ inline bool harc_auto_cov_first_uncovered_cross(
     return false;
 }
 
+template <typename T, size_t N>
+inline bool harc_auto_cov_apply_point_preference(
+    HarcAutoCovSelection& selection,
+    int group,
+    const bool (&hit)[N],
+    const bool (&blocked)[N],
+    const T (&values)[N],
+    T& preference) {
+    if (harc_auto_cov_has_preference(selection)) return false;
+    size_t i = 0;
+    if (!harc_auto_cov_first_uncovered(hit, blocked, i)) return false;
+    preference = values[i];
+    harc_auto_cov_select_point(selection, group, i);
+    return true;
+}
+
+template <typename A, typename B, size_t Rows, size_t Cols>
+inline bool harc_auto_cov_apply_cross_preference(
+    HarcAutoCovSelection& selection,
+    int group,
+    const bool (&hit)[Rows][Cols],
+    const bool (&blocked)[Rows][Cols],
+    const A (&a_values)[Rows],
+    const B (&b_values)[Cols],
+    A& a_preference,
+    B& b_preference) {
+    if (harc_auto_cov_has_preference(selection)) return false;
+    size_t i = 0;
+    size_t j = 0;
+    if (!harc_auto_cov_first_uncovered_cross(hit, blocked, i, j)) return false;
+    a_preference = a_values[i];
+    b_preference = b_values[j];
+    harc_auto_cov_select_cross(selection, group, i, j);
+    return true;
+}
+
 template <size_t N>
 inline uint64_t harc_auto_cov_count(const bool (&bins)[N]) {
     uint64_t count = 0;
