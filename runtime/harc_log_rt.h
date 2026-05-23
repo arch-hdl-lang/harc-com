@@ -77,6 +77,15 @@ inline const char* harc_select_test(
     return test_sel;
 }
 
+inline int harc_report_test_result(int errors) {
+    if (errors == 0) {
+        std::printf("\nALL TESTS PASSED\n");
+        return 0;
+    }
+    std::printf("\n%d TESTS FAILED\n", errors);
+    return 1;
+}
+
 inline std::string harc_coverage_output_path() {
     return harc_resolve_log_path("coverage.dat");
 }

@@ -45,6 +45,7 @@ end test TraceTest
     assert!(cpp.contains("trace.raw(\"randomize\", cycle_count, _trace_fields);"));
     assert!(cpp.contains("harc_rt::log::harc_log_line(sim_log, &trace, cycle_count, sev, _log_msg);"));
     assert!(cpp.contains("harc_rt::log::harc_close_file(sim_log);"));
+    assert!(cpp.contains("return harc_rt::log::harc_report_test_result(errors);"));
     assert!(cpp_tb::TRACE_RT_HEADER.contains("raw(\"assertion_failure\""));
 }
 

@@ -1962,16 +1962,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "{INDENT}trace.raw(\"sim_end\", cycle_count, \"\\\"errors\\\":\" + std::to_string(errors));").ok();
         writeln!(e.out, "{INDENT}trace.close();").ok();
         writeln!(e.out, "").ok();
-        writeln!(
-            e.out,
-            "{INDENT}if (errors == 0) {{ std::printf(\"\\nALL TESTS PASSED\\n\"); return 0; }}"
-        )
-        .ok();
-        writeln!(
-        e.out,
-        "{INDENT}else             {{ std::printf(\"\\n%d TESTS FAILED\\n\", errors); return 1; }}"
-    )
-        .ok();
+        writeln!(e.out, "{INDENT}return harc_rt::log::harc_report_test_result(errors);").ok();
         writeln!(e.out, "}}").ok();
         writeln!(e.out, "").ok();
     } // end of `for test in &tests`
