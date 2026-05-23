@@ -1047,7 +1047,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "{INDENT}HarcTraceC* tfp = new HarcTraceC;").ok();
         writeln!(
             e.out,
-            "{INDENT}{{ const char* dp = std::getenv(\"HARC_TRACE_DEPTH\"); dut->trace(tfp, dp ? std::atoi(dp) : 99); }}"
+            "{INDENT}dut->trace(tfp, harc_rt::log::harc_trace_depth());"
         )
         .ok();
         writeln!(e.out, "#if defined(HARC_TRACE_VCD)").ok();

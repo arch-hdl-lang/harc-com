@@ -34,6 +34,14 @@ inline std::string harc_wave_output_path(const char* default_name) {
     return harc_resolve_log_path(default_name);
 }
 
+inline int harc_trace_depth(
+    const char* env_name = "HARC_TRACE_DEPTH",
+    int fallback_depth = 99) {
+    const char* depth = std::getenv(env_name);
+    if (depth && *depth) return std::atoi(depth);
+    return fallback_depth;
+}
+
 inline std::string harc_coverage_output_path() {
     return harc_resolve_log_path("coverage.dat");
 }
