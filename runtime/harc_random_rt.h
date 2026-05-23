@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdio>
+#include <functional>
 #include <initializer_list>
 #include <cstddef>
 #include <cstdint>
@@ -370,6 +371,16 @@ inline void harc_auto_cov_report_bin(
         "  %s : %s\n",
         label ? label : "",
         harc_auto_cov_state(hit, blocked));
+}
+
+template <typename ReportFn>
+inline void harc_auto_cov_register_report(
+    bool& registered,
+    std::vector<std::function<void()>>& reports,
+    ReportFn report_fn) {
+    if (registered) return;
+    reports.push_back(report_fn);
+    registered = true;
 }
 
 inline void harc_auto_cov_mark_blocked(bool& blocked) {
