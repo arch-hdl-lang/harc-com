@@ -5,6 +5,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 
@@ -63,6 +64,17 @@ inline void harc_report_unknown_test(const char* test_name, const char* availabl
         "unknown test: %s (available: %s)\n",
         test_name ? test_name : "",
         available_tests ? available_tests : "");
+}
+
+inline const char* harc_select_test(
+    int argc,
+    char** argv,
+    const char* env_name = "HARC_TEST") {
+    const char* test_sel = std::getenv(env_name);
+    for (int i = 1; i + 1 < argc; i++) {
+        if (std::strcmp(argv[i], "--test") == 0) return argv[i + 1];
+    }
+    return test_sel;
 }
 
 inline std::string harc_coverage_output_path() {
