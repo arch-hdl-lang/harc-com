@@ -1,0 +1,61 @@
+// Target-side TLM responder early-return test.
+//
+// The passive target returns from nested `if` statements inside a runtime
+// `for` loop. The responder epilogue must still drive rsp_data/rsp_valid and
+// re-arm for the next DUT-initiated request.
+
+bus TlmMemBus
+    tlm_method read(addr: uint<8>, len: uint<4>) -> uint<32>: blocking;
+end bus TlmMemBus
+
+transactor TlmMemTarget bound to TlmMemBus
+    read_count : uint<32> default 0
+    prep_acc : uint<32> default 0
+
+    thread bus.read(addr: uint<8>, len: uint<4>)
+        let req_seq : uint<32> = read_count
+        read_count = read_count + 1
+        prep_acc = 0
+        for i in 0 .. len
+            prep_acc = prep_acc + addr + i
+            if addr < 8
+                if i == 2
+                    return 1024 + prep_acc + req_seq
+                end if
+            end if
+            if addr >= 8
+                if i == 4
+                    return 2048 + prep_acc + req_seq
+                end if
+            end if
+        end for
+        return 4096 + prep_acc + req_seq
+    end thread
+end transactor TlmMemTarget
+
+testbench TlmTargetThreadEarlyReturnTb
+    dut : TlmReadInitiatorRuntimeLen
+end testbench TlmTargetThreadEarlyReturnTb
+
+impl TlmTargetThreadEarlyReturnTest for TlmTargetThreadEarlyReturnTb
+    let mem : TlmMemBus = bind dut
+    let target : TlmMemTarget passive = bind mem
+
+    run
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+
+        wait until dut.done == 1 timeout 100 cycles fail("DUT initiator did not receive both early-return target responses")
+        assert dut.result0 == 1042
+            else fail("first early-return target TLM response mismatch got=0x${dut.result0:08x}, expected 0x00000412")
+        assert dut.result1 == 2119
+            else fail("second early-return target TLM response mismatch got=0x${dut.result1:08x}, expected 0x00000847")
+        assert target.read_count == 2
+            else fail("target TLM read_count mismatch got=${target.read_count}, expected 2")
+        assert target.prep_acc == 70
+            else fail("target TLM prep_acc mismatch got=${target.prep_acc}, expected 70")
+
+        log(info, "PASS: HARC target-side TLM thread returned from nested runtime loop")
+    end run
+end impl TlmTargetThreadEarlyReturnTest
