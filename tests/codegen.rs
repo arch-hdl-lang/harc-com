@@ -2461,17 +2461,18 @@ end test AutoCovPrefTest"#,
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
-        cpp.contains("static bool _auto_cov_")
-            && cpp.contains("_op[2]")
-            && cpp.contains("_len[2]")
-            && cpp.contains("static bool _auto_cross_")
-            && cpp.contains("static bool _auto_cov_blocked_")
-            && cpp.contains("static bool _auto_cross_blocked_")
-            && cpp.contains("__len[2][2]")
+        cpp.contains("HarcAutoCovPlan _auto_cov_plan_")
+            && cpp.contains("HarcAutoCovState _auto_cov_state_")
+            && cpp.contains("HarcAutoCovPointMeta _auto_cov_points_")
+            && cpp.contains("HarcAutoCovCrossMeta _auto_cov_crosses_")
+            && cpp.contains("_auto_cov_labels_")
+            && cpp.contains("_op[]")
+            && cpp.contains("_len[]")
+            && cpp.contains("_auto_cross_labels_")
+            && cpp.contains("__len[]")
             && cpp.contains("std::vector<std::function<void()>> _auto_cov_reports;")
             && cpp.contains("harc_auto_cov_register_report(")
-            && cpp.contains("harc_auto_cov_report_summary(\"T\"")
-            && cpp.contains("harc_auto_cov_report_bin(\"T.op=Read\"")
+            && cpp.contains("harc_auto_cov_report(_auto_cov_plan_")
             && cpp.contains("T.op=Read")
             && cpp.contains("T.op=Write")
             && cpp.contains("T.len=1")
@@ -2483,18 +2484,16 @@ end test AutoCovPrefTest"#,
             && cpp.contains("_auto_cross_vals_")
             && cpp.contains("{0ULL, 1ULL}")
             && cpp.contains("{1ULL, 4ULL}")
-            && cpp.contains("_auto_cov_")
-            && cpp.contains("harc_auto_cov_apply_point_preference(")
-            && cpp.contains("harc_auto_cov_apply_cross_preference(")
-            && cpp.contains("harc_auto_cov_count(_auto_cov_")
-            && cpp.contains("harc_auto_cov_count(_auto_cross_")
-            && cpp.contains("harc_auto_cov_mark_selected_point_blocked(")
-            && cpp.contains("harc_auto_cov_mark_selected_cross_blocked(")
-            && cpp.contains("harc_auto_cov_mark_value_hit(")
-            && cpp.contains("harc_auto_cov_mark_cross_hit(")
+            && cpp.contains("harc_auto_cov_apply_point_preference(_auto_cov_plan_")
+            && cpp.contains("harc_auto_cov_apply_cross_preference(_auto_cov_plan_")
+            && cpp.contains("harc_auto_cov_mark_selected_point_blocked(_auto_cov_plan_")
+            && cpp.contains("harc_auto_cov_mark_selected_cross_blocked(_auto_cov_plan_")
+            && cpp.contains("harc_auto_cov_mark_value_hit(_val_")
+            && cpp.contains("harc_auto_cov_mark_cross_hit(_val_")
             && cpp.contains("harc_rt::random::harc_retry_without_preferences(")
             && cpp.contains("retry without seeded preferences")
-            && cpp.contains("_auto_cross_"),
+            && !cpp.contains("_auto_cov_blocked_")
+            && !cpp.contains("static bool _auto_cross_"),
         "auto coverage goals and pairwise crosses should feed solver preferences, hit/blocked tracking, and reporting; got:\n{cpp}",
     );
 }
@@ -2522,9 +2521,9 @@ end test AutoCovConstrainedTest"#,
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
-        (!cpp.contains("_auto_cov_") || !cpp.contains("_op["))
-            && cpp.contains("_len[2]")
-            && !cpp.contains("_auto_cross_"),
+        (!cpp.contains("_auto_cov_labels_") || !cpp.contains("_op[]"))
+            && cpp.contains("_len[]")
+            && !cpp.contains("_auto_cross_labels_"),
         "explicitly constrained fields should not receive auto coverage preferences or crosses; got:\n{cpp}",
     );
 }
@@ -2547,7 +2546,7 @@ end test SignedAutoCovPrefTest"#,
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
-        cpp.contains("_delta[2]")
+        cpp.contains("_delta, 2")
             && cpp.contains("{-4LL, 4LL}")
             && cpp.contains("T.delta=-4")
             && cpp.contains("T.delta=4")
@@ -2575,8 +2574,8 @@ end test NaturalEndpointAutoCovTest"#,
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
-        cpp.contains("_addr[18]")
-            && cpp.contains("_delta[2]")
+        cpp.contains("_addr, 18")
+            && cpp.contains("_delta, 2")
             && cpp.contains("T.addr=0")
             && cpp.contains("T.addr=255")
             && cpp.contains("T.addr=1")
@@ -2611,7 +2610,7 @@ end test WideEndpointAutoCovTest"#,
     assert!(
         cpp.contains("z3::expr _z_data = _ctx.bv_const(\"data\", 128);")
             && cpp.contains("_harc_u128 _pref_")
-            && cpp.contains("_data[34]")
+            && cpp.contains("_data, 34")
             && cpp.contains("T.data=2^128-1")
             && cpp.contains("T.data=2^127")
             && cpp.contains("harc_z3_bv_value(_ctx, _pref")
@@ -2761,10 +2760,10 @@ end test Wide1024EndpointAutoCovTest"#,
     assert!(
         cpp.contains("z3::expr _z_data = _ctx.bv_const(\"data\", 1024);")
             && cpp.contains("harc_rt::HarcWide<32>")
-            && cpp.contains("_data[34]")
+            && cpp.contains("_data, 34")
             && cpp.contains("T.data=2^1024-1")
             && cpp.contains("T.data=2^1023")
-            && !cpp.contains("_data[66]"),
+            && !cpp.contains("_data, 66"),
         "1024-bit fields should get capped min/max and walking-pattern auto coverage, not unbounded bins; got:\n{cpp}",
     );
 }
@@ -2787,14 +2786,14 @@ end test WalkingAutoCovPrefTest"#,
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
-        cpp.contains("_data[34]")
+        cpp.contains("_data, 34")
             && cpp.contains("T.data=0")
             && cpp.contains("T.data=4294967295")
             && cpp.contains("T.data=1")
             && cpp.contains("T.data=4294967294")
             && cpp.contains("T.data=2147483648")
             && cpp.contains("T.data=2147483647")
-            && !cpp.contains("_data[66]"),
+            && !cpp.contains("_data, 66"),
         "uint<32> should get min/max plus capped walking-one/walking-zero goals, not every bit twice without a cap; got:\n{cpp}",
     );
 }
@@ -2817,7 +2816,7 @@ end test Uint64UniqueTest"#,
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
-        cpp.contains("_data[34]")
+        cpp.contains("_data, 34")
             && cpp.contains("18446744073709551615ULL")
             && cpp.contains("9223372036854775808ULL")
             && cpp.contains("z3::expr _eval_data = _m.eval(_z_data, true).simplify();")
@@ -4302,7 +4301,7 @@ end test NestedRecordAutoCoverageTest"#,
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
-        cpp.contains("_auto_cov_") && cpp.contains("_hdr_tag["),
+        cpp.contains("_auto_cov_labels_") && cpp.contains("_hdr_tag[]"),
         "nested auto coverage should use flattened C identifiers; got:\n{cpp}"
     );
     assert!(

@@ -473,6 +473,29 @@ int main() {
     bool cross_hit_match = false;
     bool cross_hit_blocked = true;
     harc_auto_cov_mark_cross_hit(1, 1, 2, 2, cross_hit_match, cross_hit_blocked);
+    const char* point_labels[] = {"Packet.kind=Read", "Packet.kind=Write"};
+    const char* cross_labels[] = {
+        "Packet.kind=Read x Packet.len=1",
+        "Packet.kind=Read x Packet.len=4",
+        "Packet.kind=Write x Packet.len=1",
+        "Packet.kind=Write x Packet.len=4",
+    };
+    HarcAutoCovPointMeta point_meta[] = {{point_labels, 2}};
+    HarcAutoCovCrossMeta cross_meta[] = {{cross_labels, 2, 2}};
+    HarcAutoCovPlan cov_plan{"Packet", 12, point_meta, 1, cross_meta, 1};
+    HarcAutoCovState cov_state_table;
+    HarcAutoCovSelection state_selection;
+    int state_point_pref = 0;
+    int state_cross_a_pref = 0;
+    int state_cross_b_pref = 0;
+    bool applied_state_point = harc_auto_cov_apply_point_preference(cov_plan, cov_state_table, state_selection, 0, cov_values, state_point_pref);
+    harc_auto_cov_mark_selected_point_blocked(cov_plan, cov_state_table, state_selection, 0);
+    HarcAutoCovSelection state_cross_selection;
+    bool applied_state_cross = harc_auto_cov_apply_cross_preference(cov_plan, cov_state_table, state_cross_selection, 0, cross_a_values, cross_b_values, state_cross_a_pref, state_cross_b_pref);
+    harc_auto_cov_mark_selected_cross_blocked(cov_plan, cov_state_table, state_cross_selection, 0);
+    harc_auto_cov_mark_value_hit(9, 9, cov_plan, cov_state_table, 0, 1);
+    harc_auto_cov_mark_cross_hit(1, 1, 8, 8, cov_plan, cov_state_table, 0, 0, 1);
+    harc_auto_cov_report(cov_plan, cov_state_table);
     HarcSolverRetryPolicy retry;
     bool retry_pref = harc_retry_without_preferences(retry, false);
     bool retry_unique = harc_retry_without_unique_history(retry, false);
@@ -486,7 +509,7 @@ int main() {
     HarcSolveStatus unsat = harc_solve_status_unsat(4, b);
     bool handled_ok = harc_handle_solve_status(constrained);
     bool handled_unsat = harc_handle_solve_status(unsat);
-    return (status.ok && handled_ok && !handled_unsat && constrained.ok && !unsat.ok && unsat.problem_id == 4 && unsat.seed == b && call.problem_id == 4 && call.problem && call.seed != 99 && pref_u < 64 && pref_s >= -8 && pref_s <= 7 && pref_d >= 1 && pref_d <= 9 && unique_has_value && unique.empty() && harc_auto_cov_has_preference(auto_cov) && harc_auto_cov_selected_cross(auto_cov, 3) && found_cov_point && cov_i == 1 && found_cov_cross && cross_i == 0 && cross_j == 1 && !applied_cov_point && cov_preference == 0 && applied_cov_cross && cross_a_preference == 1 && cross_b_preference == 8 && harc_auto_cov_selected_cross(auto_cov_apply, 5) && cov_hits == 1 && cross_blocked_count == 1 && cov_state[0] == '*' && report_registered && reports.size() == 1 && hit && !blocked && selected_blocked && value_hit && !value_blocked && cross_hit_match && !cross_hit_blocked && retry_pref && retry_unique && retry.retried_without_preferences && retry.retried_without_unique_history && packet.value == 7 && found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
+    return (status.ok && handled_ok && !handled_unsat && constrained.ok && !unsat.ok && unsat.problem_id == 4 && unsat.seed == b && call.problem_id == 4 && call.problem && call.seed != 99 && pref_u < 64 && pref_s >= -8 && pref_s <= 7 && pref_d >= 1 && pref_d <= 9 && unique_has_value && unique.empty() && harc_auto_cov_has_preference(auto_cov) && harc_auto_cov_selected_cross(auto_cov, 3) && found_cov_point && cov_i == 1 && found_cov_cross && cross_i == 0 && cross_j == 1 && !applied_cov_point && cov_preference == 0 && applied_cov_cross && cross_a_preference == 1 && cross_b_preference == 8 && harc_auto_cov_selected_cross(auto_cov_apply, 5) && cov_hits == 1 && cross_blocked_count == 1 && cov_state[0] == '*' && report_registered && reports.size() == 1 && hit && !blocked && selected_blocked && value_hit && !value_blocked && cross_hit_match && !cross_hit_blocked && applied_state_point && state_point_pref == 3 && applied_state_cross && state_cross_a_pref == 1 && state_cross_b_pref == 7 && cov_state_table.point_hit[1] && !cov_state_table.point_blocked[1] && cov_state_table.cross_hit[1] && !cov_state_table.cross_blocked[1] && retry_pref && retry_unique && retry.retried_without_preferences && retry.retried_without_unique_history && packet.value == 7 && found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
 }
 "#,
         )
