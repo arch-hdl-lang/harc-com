@@ -57,6 +57,14 @@ inline void harc_log_wave_file(FILE* f, const std::string& wave_path) {
     std::fprintf(f, "[waves] writing %s\n", wave_path.c_str());
 }
 
+inline void harc_report_unknown_test(const char* test_name, const char* available_tests) {
+    std::fprintf(
+        stderr,
+        "unknown test: %s (available: %s)\n",
+        test_name ? test_name : "",
+        available_tests ? available_tests : "");
+}
+
 inline std::string harc_coverage_output_path() {
     return harc_resolve_log_path("coverage.dat");
 }

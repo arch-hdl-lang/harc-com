@@ -2012,7 +2012,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     let avail_csv = avail.join(", ");
     writeln!(
         e.out,
-        "{INDENT}std::fprintf(stderr, \"unknown test: %s (available: {avail_csv})\\n\", test_sel);"
+        "{INDENT}harc_rt::log::harc_report_unknown_test(test_sel, \"{avail_csv}\");"
     )
     .ok();
     writeln!(e.out, "{INDENT}return 1;").ok();
