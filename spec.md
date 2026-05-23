@@ -1693,7 +1693,7 @@ let target : MemTarget passive = bind mem
 
 The thread lowers to a responder actor that asserts `read_req_ready`, captures request args on the req handshake, runs the body, drives `read_rsp_data`/`read_rsp_valid`, and holds the response until the DUT raises `read_rsp_ready`. Transactor fields such as `read_count` are ordinary per-instance state, so passive target BFMs can track counters, scoreboards, or backing memory metadata across method calls. For `out_of_order tags N`, the actor captures `read_req_tag` and echoes it on `read_rsp_tag`.
 
-A target responder may also forward through another already-bound `blocking` TLM bus by calling it directly inside the target body. Declare the downstream binding before binding the passive target, so the generated responder actor can resolve both the target-side alias `bus` and the named downstream binding:
+A target responder may also forward through another already-bound TLM bus by calling it inside the target body. Declare the downstream binding before binding the passive target, so the generated responder actor can resolve both the target-side alias `bus` and the named downstream binding:
 
 ```harc
 transactor RouterTarget bound to BurstMem
@@ -1708,13 +1708,30 @@ let back : BurstMem = bind dut with { ... }
 let router : RouterTarget passive = bind front
 ```
 
-This shape is serialized: the front responder captures one request, blocks while the downstream `back.read(...)` req/rsp handshake completes, then responds to the original initiator. It is intended for layered BFMs and simple interconnect/routing models. Target-side forwarding of RHS-fork groups or direct non-fork `out_of_order` methods is not part of the shipped surface.
+This direct-call shape is serialized: the front responder captures one request, blocks while the downstream `back.read(...)` req/rsp handshake completes, then responds to the original initiator. For downstream methods that allow multiple outstanding calls, the responder may use the same RHS-fork and `join_all` form as initiator code:
+
+```harc
+transactor RouterTarget bound to FrontMem
+    thread bus.read(addr: uint<32>)
+        let data0 = fork back.read_ooo(addr + 4)
+        let data1 = fork back.read_ooo(addr + 8)
+        join_all
+        return data0 + data1
+    end thread
+end transactor RouterTarget
+
+let front : FrontMem = bind dut with { ... }
+let back : BackMem = bind dut with { ... } // read_ooo: out_of_order tags 2
+let router : RouterTarget passive = bind front
+```
+
+The responder still handles one front-side request at a time, but the downstream fork group can keep multiple target transactions outstanding before the front response is produced. This is intended for layered BFMs and simple interconnect/routing models. Direct non-fork `out_of_order` calls are not part of the shipped surface.
 
 Current shipped limits:
 
 - Direct non-fork calls lower only for `blocking` methods.
 - RHS `fork bus.method(...)` plus `join_all` lowers for `blocking` and `out_of_order tags N`.
-- Target TLM thread bodies support local `let`s, transactor field reads/writes, assignments, bounded response-prep loops, waits, serialized direct calls to another bound `blocking` TLM method, and value returns. Response-prep loop bounds may be runtime values captured from method arguments or transactor state. `return expr` may appear directly, in nested `if` / `elsif` / `else`, or inside a loop body; codegen lowers it through a response temp plus returned flag so the common rsp_valid/rsp_ready epilogue still runs.
+- Target TLM thread bodies support local `let`s, transactor field reads/writes, assignments, bounded response-prep loops, waits, serialized direct calls to another bound `blocking` TLM method, downstream RHS-fork groups followed by `join_all`, and value returns. Response-prep loop bounds may be runtime values captured from method arguments or transactor state. `return expr` may appear directly, in nested `if` / `elsif` / `else`, or inside a loop body; codegen lowers it through a response temp plus returned flag so the common rsp_valid/rsp_ready epilogue still runs.
 
 **Coroutine runtime (Phase 1, single-actor).** The test's `run` block lowers to a C++20 coroutine driven by `harc_rt::ThreadScheduler` (slim sister of arch-com's `arch_thread_rt.h`). `wait N cycles` and the bus.send/recv spin loops emit `co_await harc_rt::wait_cycles(_slot, N)`; the main loop drives one primary-clock posedge per iteration, runs post-eval services, then resumes any coroutine whose wait condition is satisfied. Checkers and clocked coverage sample after the coroutine/clk-low settle point unless bound to an explicit hook trigger. Hookable methods, `on`-event-handler closures, tseq lambdas, and free functions stay synchronous — they only execute while the run coroutine is "running" between `co_await`s, so a sync `tick()` from inside a method does not race the scheduler. Multi-clock `wait N cycles on <named-clock>` keeps its sync `eval_clocks_until` path even in coroutine context: the main loop's full-primary-period granularity is too coarse for sub-primary-cycle waits when the named clock runs faster than primary.
 
