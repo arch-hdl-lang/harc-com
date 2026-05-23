@@ -7344,6 +7344,24 @@ impl Emitter {
         c_type_for(t)
     }
 
+    fn c_type_for_value(&self, t: &TypeExpr) -> String {
+        if let TypeExpr::Named { name, .. } = t {
+            if let Some(last) = name.segments.last() {
+                let n = &last.name;
+                if self.is_record_type(n)
+                    || self.enums.contains_key(n)
+                    || self.components.contains_key(n)
+                    || self.scoreboards.contains(n)
+                    || self.transactors.contains_key(n)
+                    || self.covergroups.contains_key(n)
+                {
+                    return n.clone();
+                }
+            }
+        }
+        c_type_for(t)
+    }
+
     /// Emit the two `<Type>_<method>_pre` and `<Type>_<method>_post`
     /// `std::vector<std::function<void(args)>>` declarations that
     /// hold the registered hook subscribers for one hookable method.
@@ -7391,7 +7409,7 @@ impl Emitter {
         let ret = h
             .return_ty
             .as_ref()
-            .map(c_type_for)
+            .map(|t| self.c_type_for_value(t))
             .unwrap_or_else(|| "void".to_string());
         self.pad(depth);
         write!(self.out, "auto {comp_ty}_{m_name} = [&]({comp_ty}& self").ok();
