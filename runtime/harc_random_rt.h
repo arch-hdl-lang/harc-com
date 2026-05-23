@@ -257,6 +257,56 @@ inline int64_t harc_prefer_dist(
     return bins.begin()->lo;
 }
 
+template <typename Next>
+inline int64_t harc_rng_range(Next next, int64_t lo, int64_t hi) {
+    if (hi <= lo) return lo;
+    return lo + static_cast<int64_t>(next() % static_cast<uint64_t>(hi - lo + 1));
+}
+
+template <typename Next>
+inline uint64_t harc_rng_uint(Next next, unsigned width) {
+    if (width == 0) return 0;
+    if (width >= 64) return next();
+    return next() & ((uint64_t{1} << width) - 1);
+}
+
+template <typename Next>
+inline _harc_u128 harc_rng_u128(Next next, unsigned width) {
+    _harc_u128 value =
+        (static_cast<_harc_u128>(next()) |
+         (static_cast<_harc_u128>(next()) << 64));
+    if (width == 0) return 0;
+    if (width >= 128) return value;
+    return value & ((static_cast<_harc_u128>(1) << width) - 1);
+}
+
+template <size_t N, typename Next>
+inline harc_rt::HarcWide<N> harc_rng_wide(Next next, unsigned width) {
+    harc_rt::HarcWide<N> value;
+    for (size_t i = 0; i < N; ++i) {
+        value[i] = static_cast<uint32_t>(next());
+    }
+    unsigned last_bits = width % 32;
+    if (last_bits != 0 && N != 0) {
+        value[N - 1] &= (uint32_t{1} << last_bits) - 1u;
+    }
+    return value;
+}
+
+template <typename Next>
+inline int64_t harc_rng_dist(Next next, std::initializer_list<HarcDistBin> bins) {
+    int64_t total = 0;
+    for (const auto& bin : bins) total += bin.weight;
+    if (total <= 0) return 0;
+    int64_t pick = static_cast<int64_t>(next() % static_cast<uint64_t>(total));
+    int64_t acc = 0;
+    for (const auto& bin : bins) {
+        acc += bin.weight;
+        if (pick < acc) return harc_rng_range(next, bin.lo, bin.hi);
+    }
+    return bins.begin()->lo;
+}
+
 template <typename T>
 inline const HarcUniqueHistory<T>& harc_unique_values(
     const HarcUniqueHistory<T>& history) {

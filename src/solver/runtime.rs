@@ -430,6 +430,13 @@ int main() {
     harc_rt::HarcWide<5> pref_wide = harc_prefer_wide<5>(a, 4, 132);
     int64_t pref_s = harc_prefer_sint(a, 1, 4);
     int64_t pref_d = harc_prefer_dist(a, 2, {{1, 2, 1}, {7, 9, 3}});
+    uint64_t rng_state = 123;
+    auto next_draw = [&]() { return harc_splitmix64(rng_state++); };
+    int64_t rng_range = harc_rng_range(next_draw, 3, 7);
+    uint64_t rng_uint = harc_rng_uint(next_draw, 5);
+    _harc_u128 rng_u128 = harc_rng_u128(next_draw, 96);
+    harc_rt::HarcWide<5> rng_wide = harc_rng_wide<5>(next_draw, 132);
+    int64_t rng_dist = harc_rng_dist(next_draw, {{1, 2, 1}, {7, 9, 3}});
     HarcUniqueHistory<int> unique;
     harc_unique_remember(unique, 5);
     bool unique_has_value = false;
@@ -482,7 +489,7 @@ int main() {
     HarcSolveStatus unsat = harc_solve_status_unsat(4, b);
     bool handled_ok = harc_handle_solve_status(constrained);
     bool handled_unsat = harc_handle_solve_status(unsat);
-    return (status.ok && handled_ok && !handled_unsat && constrained.ok && !unsat.ok && unsat.problem_id == 4 && unsat.seed == b && call.problem_id == 4 && call.problem && call.seed != 99 && pref_u < 64 && pref_u128 != 0 && (pref_u128 >> 96) == 0 && pref_wide[4] < 16 && pref_s >= -8 && pref_s <= 7 && pref_d >= 1 && pref_d <= 9 && unique_has_value && unique.empty() && report_registered && reports.size() == 1 && hit && !blocked && applied_state_point && state_point_pref == 3 && applied_state_cross && state_cross_a_pref == 1 && state_cross_b_pref == 7 && cov_state[0] == 'h' && cov_state_table.point_blocked[0] && cov_state_table.point_hit[1] && !cov_state_table.point_blocked[1] && cov_state_table.cross_blocked[0] && cov_state_table.cross_hit[1] && !cov_state_table.cross_blocked[1] && retry_pref && retry_unique && retry.retried_without_preferences && retry.retried_without_unique_history && packet.value == 7 && found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
+    return (status.ok && handled_ok && !handled_unsat && constrained.ok && !unsat.ok && unsat.problem_id == 4 && unsat.seed == b && call.problem_id == 4 && call.problem && call.seed != 99 && pref_u < 64 && pref_u128 != 0 && (pref_u128 >> 96) == 0 && pref_wide[4] < 16 && pref_s >= -8 && pref_s <= 7 && pref_d >= 1 && pref_d <= 9 && rng_range >= 3 && rng_range <= 7 && rng_uint < 32 && rng_u128 != 0 && (rng_u128 >> 96) == 0 && rng_wide[4] < 16 && rng_dist >= 1 && rng_dist <= 9 && unique_has_value && unique.empty() && report_registered && reports.size() == 1 && hit && !blocked && applied_state_point && state_point_pref == 3 && applied_state_cross && state_cross_a_pref == 1 && state_cross_b_pref == 7 && cov_state[0] == 'h' && cov_state_table.point_blocked[0] && cov_state_table.point_hit[1] && !cov_state_table.point_blocked[1] && cov_state_table.cross_blocked[0] && cov_state_table.cross_hit[1] && !cov_state_table.cross_blocked[1] && retry_pref && retry_unique && retry.retried_without_preferences && retry.retried_without_unique_history && packet.value == 7 && found && found->site_id == 8 && site.iteration == 2 && a != b && site.problem_id == 2) ? 0 : 1;
 }
 "#,
         )
