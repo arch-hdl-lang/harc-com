@@ -85,6 +85,7 @@ tlm_target_thread_runtime_loop_test | TlmReadInitiatorRuntimeLen | TlmReadInitia
 tlm_target_thread_early_return_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv |
 tlm_target_forwarding_test | TlmForwardingTop | TlmForwardingTop.sv TlmReadInitiatorPair.sv TlmMemory.sv |
 tlm_target_fork_forwarding_test | TlmForkForwardingTop | TlmForkForwardingTop.sv TlmReadInitiatorPair.sv TlmMemory.sv |
+tlm_target_ooo_lanes_test | TlmOooReadInitiatorPair | TlmOooReadInitiatorPair.sv |
 dma_engine_test         | DmaEngine      | dma_engine.sv          |
 dma_engine_tlm_target_test | DmaEngineTlmMem | dma_engine_tlm_mem.sv dma_engine.sv |
 dma_engine_tlm_mem_model_test | DmaEngineTlmMem | dma_engine_tlm_mem.sv dma_engine.sv |

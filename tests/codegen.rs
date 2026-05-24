@@ -5543,6 +5543,41 @@ end test T"#,
     );
 }
 
+#[test]
+fn target_tlm_thread_out_of_order_lowers_lanes() {
+    let parsed = parse_source(
+        r#"bus B
+    tlm_method read(addr: uint<8>) -> uint<32>: out_of_order tags 2;
+end bus B
+
+transactor Target bound to B
+    thread bus.read(addr: uint<8>)
+        wait 1 cycle
+        return 256 + addr
+    end thread
+end transactor Target
+
+test T
+    let dut : SomeDut
+    let b : B = bind dut
+    let target : Target passive = bind b
+    run
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("target TLM OOO responder lanes should lower");
+    assert!(
+        cpp.contains("std::array<std::atomic<bool>, 2> _target_read_target_ooo_lane_busy{};")
+            && cpp.contains("_post_eval_services.push_back([&]()")
+            && cpp.contains("_target_read_target_ooo_lane0_slot")
+            && cpp.contains("_target_read_target_ooo_lane1_slot")
+            && cpp.contains("_target_read_target_ooo_arbiter_slot")
+            && cpp.contains("dut->b_read_rsp_tag = _sel;"),
+        "expected OOO target responder lane lowering; got:\n{cpp}"
+    );
+}
+
 // ── Width-method intrinsics (.trunc/.zext/.sext/.resize) ────────────
 //
 // Ported from arch-com's surface (src/parser.rs:5757 +
