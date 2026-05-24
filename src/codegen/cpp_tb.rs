@@ -1330,13 +1330,13 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         )
         .ok();
         writeln!(e.out, "{INDENT}{INDENT}va_list ap;").ok();
-        writeln!(e.out, "{INDENT}{INDENT}char _log_msg[4096];").ok();
-        writeln!(e.out, "{INDENT}{INDENT}va_start(ap, fmt); std::vsnprintf(_log_msg, sizeof(_log_msg), fmt, ap); va_end(ap);").ok();
+        writeln!(e.out, "{INDENT}{INDENT}va_start(ap, fmt);").ok();
         writeln!(
             e.out,
-            "{INDENT}{INDENT}harc_rt::log::harc_log_line(sim_log, &trace, cycle_count, sev, _log_msg);"
+            "{INDENT}{INDENT}harc_rt::log::harc_log_vline(sim_log, &trace, cycle_count, sev, fmt, ap);"
         )
         .ok();
+        writeln!(e.out, "{INDENT}{INDENT}va_end(ap);").ok();
         writeln!(e.out, "{INDENT}}};").ok();
         writeln!(e.out, "").ok();
 

@@ -136,6 +136,21 @@ inline void harc_log_line(
     if (trace) trace->log(cycle, sev, msg ? msg : "");
 }
 
+inline void harc_log_vline(
+    FILE* sim_log,
+    harc_rt::trace::HarcTraceWriter* trace,
+    int cycle,
+    const char* sev,
+    const char* fmt,
+    va_list ap) {
+    char msg[4096];
+    va_list msg_ap;
+    va_copy(msg_ap, ap);
+    std::vsnprintf(msg, sizeof(msg), fmt ? fmt : "", msg_ap);
+    va_end(msg_ap);
+    harc_log_line(sim_log, trace, cycle, sev, msg);
+}
+
 inline void harc_log_file_only_line(FILE* f, int cycle, const char* sev, const char* msg) {
     harc_log_stdout_line(cycle, sev, msg);
     harc_log_file_line(f, cycle, sev, msg);
