@@ -90,6 +90,20 @@ inline std::string harc_coverage_output_path() {
     return harc_resolve_log_path("coverage.dat");
 }
 
+template <typename CoverageT>
+inline void harc_write_coverage(CoverageT* coverage) {
+    if (!coverage) return;
+    coverage->write(harc_coverage_output_path().c_str());
+}
+
+template <typename TraceT>
+inline void harc_close_wave_trace(TraceT*& trace) {
+    if (!trace) return;
+    trace->close();
+    delete trace;
+    trace = nullptr;
+}
+
 inline double harc_percent(uint64_t hit, uint64_t total) {
     return total ? (100.0 * hit / total) : 0.0;
 }

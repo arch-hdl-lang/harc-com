@@ -1923,7 +1923,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "{INDENT}{{").ok();
         writeln!(
             e.out,
-            "{INDENT}{INDENT}Verilated::threadContextp()->coveragep()->write(harc_rt::log::harc_coverage_output_path().c_str());"
+            "{INDENT}{INDENT}harc_rt::log::harc_write_coverage(Verilated::threadContextp()->coveragep());"
         )
         .ok();
         writeln!(e.out, "{INDENT}}}").ok();
@@ -1934,8 +1934,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         // DUT root. Skipped via the same compile-time gate as
         // tracer construction.
         writeln!(e.out, "#if HARC_TRACE_ENABLED").ok();
-        writeln!(e.out, "{INDENT}tfp->close();").ok();
-        writeln!(e.out, "{INDENT}delete tfp;").ok();
+        writeln!(e.out, "{INDENT}harc_rt::log::harc_close_wave_trace(tfp);").ok();
         writeln!(e.out, "#endif").ok();
         writeln!(e.out, "{INDENT}delete dut;").ok();
         writeln!(e.out, "{INDENT}harc_rt::log::harc_close_file(sim_log);").ok();
