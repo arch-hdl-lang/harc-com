@@ -85,11 +85,9 @@ end test TraceTest
     assert!(cpp.contains("harc_rt::trace::HarcTraceWriter trace;"));
     assert!(cpp.contains("trace.meta_env(harc_rng.state, \"Top\", \"TraceTest\")"));
     assert!(cpp.contains("trace.sim_start(cycle_count);"));
-    assert!(cpp.contains("trace.sim_end(cycle_count, errors);"));
     assert!(cpp.contains("trace.randomize(cycle_count, _trace_fields);"));
     assert!(cpp.contains("harc_rt::log::harc_log_vline(sim_log, &trace, cycle_count, sev, fmt, ap);"));
-    assert!(cpp.contains("harc_rt::log::harc_close_file(sim_log);"));
-    assert!(cpp.contains("return harc_rt::log::harc_report_test_result(errors);"));
+    assert!(cpp.contains("return harc_rt::log::harc_finish_sim_run(sim_log, log_files, trace, cycle_count, errors);"));
     assert!(cpp_tb::TRACE_RT_HEADER.contains("raw(\"assertion_failure\""));
 }
 
