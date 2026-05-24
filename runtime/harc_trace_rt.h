@@ -95,6 +95,10 @@ struct HarcTraceWriter {
         raw("sim_end", cycle, "\"errors\":" + std::to_string(errors));
     }
 
+    void randomize(int cycle, const std::string& fields_payload) {
+        raw("randomize", cycle, fields_payload);
+    }
+
     void log(int cycle, const char* sev, const std::string& msg) {
         std::string payload =
             "\"severity\":\"" + harc_trace_escape(sev ? sev : "") +
