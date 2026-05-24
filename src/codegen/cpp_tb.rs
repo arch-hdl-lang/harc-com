@@ -5503,11 +5503,9 @@ impl Emitter {
             self.pad(3);
             writeln!(
                 self.out,
-                "std::printf( \"[{}] cross {}: %llu/%llu hit (%.1f%%)\\n\", (unsigned long long)_cross_hit, (unsigned long long){}, {} ? (100.0 * _cross_hit / {}) : 0.0);",
+                "harc_rt::log::harc_print_covergroup_cross_summary(\"{}\", \"cross\", \"{}\", _cross_hit, {});",
                 g.name.name,
-                cross.label,
-                cross.total_bins,
-                cross.total_bins,
+                escape_c(&cross.label),
                 cross.total_bins
             )
             .ok();
@@ -5515,17 +5513,19 @@ impl Emitter {
                 self.pad(3);
                 writeln!(
                     self.out,
-                    "if ({}[{}] == 0) {{ if (_cross_missing < {}) std::printf( \"  {}: *NOT HIT*\\n\" ); _cross_missing++; }}",
-                    cross.storage, idx, COVERGROUP_CROSS_MISSING_DETAIL_LIMIT, label
+                    "if ({}[{}] == 0) {{ if (_cross_missing < {}) harc_rt::log::harc_print_covergroup_missing_bin(\"{}\"); _cross_missing++; }}",
+                    cross.storage,
+                    idx,
+                    COVERGROUP_CROSS_MISSING_DETAIL_LIMIT,
+                    escape_c(&label)
                 )
                 .ok();
             }
             self.pad(3);
             writeln!(
                 self.out,
-                "if (_cross_missing > {}) std::printf( \"  ... %llu more missing cross bins\\n\", (unsigned long long)(_cross_missing - {}) );",
+                "harc_rt::log::harc_print_covergroup_more_missing(_cross_missing, {}, \"cross\");",
                 COVERGROUP_CROSS_MISSING_DETAIL_LIMIT,
-                COVERGROUP_CROSS_MISSING_DETAIL_LIMIT
             )
             .ok();
             self.pad(2);
@@ -5551,12 +5551,10 @@ impl Emitter {
             self.pad(3);
             writeln!(
                 self.out,
-                "std::printf( \"[{}] auto_cross {} x {}: %llu/%llu hit (%.1f%%)\\n\", (unsigned long long)_cross_hit, (unsigned long long){}, {} ? (100.0 * _cross_hit / {}) : 0.0);",
-                g.name.name,
-                a.name.name,
-                b.name.name,
-                a.bins.len() * b.bins.len(),
-                a.bins.len() * b.bins.len(),
+                "harc_rt::log::harc_print_covergroup_cross_summary(\"{}\", \"auto_cross\", \"{} x {}\", _cross_hit, {});",
+                escape_c(&g.name.name),
+                escape_c(&a.name.name),
+                escape_c(&b.name.name),
                 a.bins.len() * b.bins.len()
             )
             .ok();
@@ -5565,7 +5563,7 @@ impl Emitter {
                     self.pad(3);
                     writeln!(
                         self.out,
-                        "if (_auto_cross_{}__{}[{}][{}] == 0) {{ if (_cross_missing < {}) std::printf( \"  {}.{} x {}.{}: *NOT HIT*\\n\" ); _cross_missing++; }}",
+                        "if (_auto_cross_{}__{}[{}][{}] == 0) {{ if (_cross_missing < {}) harc_rt::log::harc_print_covergroup_missing_bin(\"{}.{} x {}.{}\"); _cross_missing++; }}",
                         a.name.name,
                         b.name.name,
                         i,
@@ -5582,9 +5580,8 @@ impl Emitter {
             self.pad(3);
             writeln!(
                 self.out,
-                "if (_cross_missing > {}) std::printf( \"  ... %llu more missing auto-cross bins\\n\", (unsigned long long)(_cross_missing - {}) );",
+                "harc_rt::log::harc_print_covergroup_more_missing(_cross_missing, {}, \"auto-cross\");",
                 COVERGROUP_CROSS_MISSING_DETAIL_LIMIT,
-                COVERGROUP_CROSS_MISSING_DETAIL_LIMIT
             )
             .ok();
             self.pad(2);

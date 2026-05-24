@@ -128,6 +128,38 @@ inline void harc_print_covergroup_bin(const char* point, const char* bin, uint64
         hits ? "" : " *NOT HIT*");
 }
 
+inline void harc_print_covergroup_cross_summary(
+    const char* group,
+    const char* kind,
+    const char* label,
+    uint64_t hit,
+    uint64_t total) {
+    std::printf(
+        "[%s] %s %s: %llu/%llu hit (%.1f%%)\n",
+        group ? group : "",
+        kind ? kind : "",
+        label ? label : "",
+        static_cast<unsigned long long>(hit),
+        static_cast<unsigned long long>(total),
+        harc_percent(hit, total));
+}
+
+inline void harc_print_covergroup_missing_bin(const char* label) {
+    std::printf("  %s: *NOT HIT*\n", label ? label : "");
+}
+
+inline void harc_print_covergroup_more_missing(
+    uint64_t missing,
+    uint64_t detail_limit,
+    const char* kind) {
+    if (missing > detail_limit) {
+        std::printf(
+            "  ... %llu more missing %s bins\n",
+            static_cast<unsigned long long>(missing - detail_limit),
+            kind ? kind : "");
+    }
+}
+
 struct HarcLogFiles {
     std::unordered_map<std::string, FILE*> files;
 
