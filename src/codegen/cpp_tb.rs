@@ -5474,14 +5474,14 @@ impl Emitter {
         }
         self.pad(2);
         writeln!(self.out,
-            "std::printf( \"[{}] coverage: %llu/%llu hit (%.1f%%)\\n\", (unsigned long long)_hit, (unsigned long long)_total, _total ? (100.0 * _hit / _total) : 0.0);",
+            "harc_rt::log::harc_print_covergroup_summary(\"{}\", _hit, _total);",
             g.name.name).ok();
         for it in &g.items {
             if let CoverItem::Point(p) = it {
                 for b in &p.bins {
                     self.pad(2);
                     writeln!(self.out,
-                        "std::printf( \"  {0} (bin) [{1}]: %llu hits%s\\n\", (unsigned long long){0}.{1}, {0}.{1} ? \"\" : \" *NOT HIT*\");",
+                        "harc_rt::log::harc_print_covergroup_bin(\"{0}\", \"{1}\", {0}.{1});",
                         p.name.name, b.name.name).ok();
                 }
             }

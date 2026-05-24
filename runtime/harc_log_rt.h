@@ -110,6 +110,24 @@ inline void harc_print_cover_point(const char* label, uint64_t hits) {
         hits ? "" : " *NOT HIT*");
 }
 
+inline void harc_print_covergroup_summary(const char* group, uint64_t hit, uint64_t total) {
+    std::printf(
+        "[%s] coverage: %llu/%llu hit (%.1f%%)\n",
+        group ? group : "",
+        static_cast<unsigned long long>(hit),
+        static_cast<unsigned long long>(total),
+        harc_percent(hit, total));
+}
+
+inline void harc_print_covergroup_bin(const char* point, const char* bin, uint64_t hits) {
+    std::printf(
+        "  %s (bin) [%s]: %llu hits%s\n",
+        point ? point : "",
+        bin ? bin : "",
+        static_cast<unsigned long long>(hits),
+        hits ? "" : " *NOT HIT*");
+}
+
 struct HarcLogFiles {
     std::unordered_map<std::string, FILE*> files;
 
