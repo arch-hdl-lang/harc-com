@@ -326,10 +326,10 @@ end test CoverAutoCrossTest"#,
             && cpp.contains("if (_cg_hit_cp_addr[_i] && _cg_hit_cp_data[_j]) cov._auto_cross_cp_addr__cp_data[_i][_j]++;")
             && cpp.contains("harc_rt::log::harc_print_covergroup_summary(\"G\", _hit, _total);")
             && cpp.contains("harc_rt::log::harc_print_covergroup_bin(\"cp_addr\", \"zero\", cp_addr.zero);")
-            && cpp.contains("[G] auto_cross cp_addr x cp_data")
-            && cpp.contains("cp_addr.zero x cp_data.small: *NOT HIT*")
+            && cpp.contains("harc_rt::log::harc_print_covergroup_cross_summary(\"G\", \"auto_cross\", \"cp_addr x cp_data\", _cross_hit, 4);")
+            && cpp.contains("harc_rt::log::harc_print_covergroup_missing_bin(\"cp_addr.zero x cp_data.small\")")
             && cpp.contains("uint64_t _cross_missing = 0;")
-            && cpp.contains("more missing auto-cross bins"),
+            && cpp.contains("harc_rt::log::harc_print_covergroup_more_missing(_cross_missing, 16, \"auto-cross\");"),
         "covergroup post-sim crosses should be updated from bins hit in the same sample record; got:\n{cpp}",
     );
 }
@@ -408,11 +408,11 @@ end test CoverDeclaredCrossTest"#,
             && cpp.contains("_cg_hit_cp_addr[0] = true;")
             && cpp.contains("_cg_hit_cp_data[1] = true;")
             && cpp.contains("cov._cross_2_cp_addr__cp_data[(_i0 * 2 + _i1)]++;")
-            && cpp.contains("[G] cross cp_addr x cp_data")
-            && !cpp.contains("[G] auto_cross cp_addr x cp_data")
-            && cpp.contains("cp_addr.zero x cp_data.small: *NOT HIT*")
+            && cpp.contains("harc_rt::log::harc_print_covergroup_cross_summary(\"G\", \"cross\", \"cp_addr x cp_data\", _cross_hit, 4);")
+            && !cpp.contains("harc_rt::log::harc_print_covergroup_cross_summary(\"G\", \"auto_cross\", \"cp_addr x cp_data\"")
+            && cpp.contains("harc_rt::log::harc_print_covergroup_missing_bin(\"cp_addr.zero x cp_data.small\")")
             && cpp.contains("uint64_t _cross_missing = 0;")
-            && cpp.contains("more missing cross bins"),
+            && cpp.contains("harc_rt::log::harc_print_covergroup_more_missing(_cross_missing, 16, \"cross\");"),
         "declared covergroup crosses should update and report sample-local bin combinations; got:\n{cpp}",
     );
 }
@@ -451,8 +451,8 @@ end test CoverDeclaredThreeWayCrossTest"#,
     assert!(
         cpp.contains("uint64_t _cross_3_cp_op__cp_burst__cp_len[8] = {};")
             && cpp.contains("cov._cross_3_cp_op__cp_burst__cp_len[((_i0 * 2 + _i1) * 2 + _i2)]++;")
-            && cpp.contains("[G] cross cp_op x cp_burst x cp_len")
-            && cpp.contains("cp_op.read x cp_burst.fixed x cp_len.single: *NOT HIT*"),
+            && cpp.contains("harc_rt::log::harc_print_covergroup_cross_summary(\"G\", \"cross\", \"cp_op x cp_burst x cp_len\", _cross_hit, 8);")
+            && cpp.contains("harc_rt::log::harc_print_covergroup_missing_bin(\"cp_op.read x cp_burst.fixed x cp_len.single\")"),
         "declared three-way crosses should flatten and report all bin tuples; got:\n{cpp}",
     );
 }
