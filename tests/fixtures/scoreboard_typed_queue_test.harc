@@ -1,0 +1,56 @@
+struct CheckerError
+    checker_id : uint<8>
+    code : uint<16>
+    got : uint<64>
+    expected : uint<64>
+end struct CheckerError
+
+scoreboard GlobalScoreboard
+    errors : queue<CheckerError>
+
+    function record_error(checker_id: uint<8>, code: uint<16>, got: uint<64>, expected: uint<64>)
+        let err : CheckerError
+        err.checker_id = checker_id
+        err.code = code
+        err.got = got
+        err.expected = expected
+        errors.push(err)
+    end record_error
+end scoreboard GlobalScoreboard
+
+transactor Checker
+    dut : ScoreboardTypedQueue
+    sb : GlobalScoreboard
+
+    when active
+        on 1 cycles phase post_eval
+            if dut.dut_value != dut.expected_value
+                sb.record_error(1, 0x1001, dut.dut_value, dut.expected_value)
+            end if
+        end on
+    end when
+end transactor Checker
+
+testbench Tb
+    dut : ScoreboardTypedQueue
+    sb : GlobalScoreboard
+    checker : Checker active
+end testbench Tb
+
+impl ScoreboardTypedQueueTest for Tb
+    run
+        checker.dut = dut
+        checker.sb = sb
+        dut.rst_n = 1
+        wait 2 cycles
+        if checker.sb.errors.size() == 0
+            fail("expected typed scoreboard error")
+        else
+            let err : CheckerError = checker.sb.errors.pop()
+            assert err.checker_id == 1 else fail("bad checker id")
+            assert err.code == 0x1001 else fail("bad error code")
+            assert err.got == 7 else fail("bad got value")
+            assert err.expected == 9 else fail("bad expected value")
+        end if
+    end run
+end impl ScoreboardTypedQueueTest

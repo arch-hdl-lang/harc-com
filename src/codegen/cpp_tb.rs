@@ -512,6 +512,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         driver_bus_for_hookables: std::collections::HashMap::new(),
         transactors,
         current_component_instance: None,
+        current_component_method: None,
         txn_keeps,
         relations,
         probes: std::collections::HashMap::new(),
@@ -3560,6 +3561,11 @@ struct Emitter {
     /// appear nested inside arbitrary expressions and need this
     /// context to know whose heartbeat to bump.
     current_component_instance: Option<String>,
+    /// While emitting a component method body, this records the HARC
+    /// component type, C++ receiver expression, method name, and
+    /// whether the method lives in `when active`, for bare sibling
+    /// method calls such as `helper()` -> `Type_helper(self)`.
+    current_component_method: Option<(String, String, String, bool)>,
 }
 
 impl Emitter {
@@ -4172,11 +4178,7 @@ impl Emitter {
 
             // Sub-component (driver/agent/env/sequencer/scoreboard).
             if let Some(sub_comp) = self.components.get(field_ty).cloned() {
-                let sub_inst = if instance_path == "_tb" {
-                    f.name.name.clone()
-                } else {
-                    format!("{}.{}", instance_path, f.name.name)
-                };
+                let sub_inst = format!("{}.{}", instance_path, f.name.name);
                 let sub_tag = format!("_{}_{}_", sub_comp.kind.keyword(), f.name.name);
                 self.emit_component_handler_registrations(&sub_comp, &sub_inst, depth, &sub_tag);
                 // Sub-component watchdog (spec §8.6) — install the
@@ -4232,11 +4234,7 @@ impl Emitter {
             // is the only path otherwise — and the desugarer doesn't
             // mint a parallel let at test scope).
             if let Some(g) = self.covergroups.get(field_ty).cloned() {
-                let sub_inst = if instance_path == "_tb" {
-                    f.name.name.clone()
-                } else {
-                    format!("{}.{}", instance_path, f.name.name)
-                };
+                let sub_inst = format!("{}.{}", instance_path, f.name.name);
                 self.emit_covergroup_sample_registration(&g, &sub_inst, depth);
                 continue;
             }
@@ -4263,11 +4261,7 @@ impl Emitter {
                 };
                 let include_active = matches!(mode, TransactorMode::Active);
                 let synth = synth_component_from_transactor(&t, include_active);
-                let sub_inst = if instance_path == "_tb" {
-                    f.name.name.clone()
-                } else {
-                    format!("{}.{}", instance_path, f.name.name)
-                };
+                let sub_inst = format!("{}.{}", instance_path, f.name.name);
                 let sub_tag = format!("_xactor_{}_", sub_inst.replace('.', "_"));
                 self.emit_component_handler_registrations(&synth, &sub_inst, depth, &sub_tag);
             }
@@ -7121,6 +7115,27 @@ impl Emitter {
         }
     }
 
+    fn resolve_bare_sibling_method_call(
+        &self,
+        callee: &Expr,
+    ) -> Option<(String, String, String, String, bool)> {
+        let ExprKind::Ident(id) = &*callee.kind else {
+            return None;
+        };
+        let (comp_ty, receiver, current_method, current_method_active) =
+            self.current_component_method.as_ref()?;
+        if self.component_has_hookable(comp_ty, &id.name) {
+            return Some((
+                comp_ty.clone(),
+                receiver.clone(),
+                id.name.clone(),
+                current_method.clone(),
+                *current_method_active,
+            ));
+        }
+        None
+    }
+
     fn collect_quiesced_paths(
         &self,
         ty: &str,
@@ -7658,7 +7673,18 @@ impl Emitter {
             .ok();
         }
 
+        let current_method_active = self.method_lives_in_when_active(comp_ty, m_name);
+        let prior_component_method = std::mem::replace(
+            &mut self.current_component_method,
+            Some((
+                comp_ty.clone(),
+                "self".to_string(),
+                m_name.clone(),
+                current_method_active,
+            )),
+        );
         self.emit_block(&h.body, depth + 1);
+        self.current_component_method = prior_component_method;
 
         if h.is_hookable {
             self.pad(depth + 1);
@@ -7996,6 +8022,20 @@ impl Emitter {
         }
     }
 
+    fn scoreboard_field_c_type(&self, t: &TypeExpr) -> String {
+        match t {
+            TypeExpr::Builtin {
+                name: BuiltinTy::Queue,
+                args,
+                ..
+            } => {
+                let inner = self.payload_type_for_arg(args.first());
+                format!("harc_rt::HarcQueue<{inner}>")
+            }
+            _ => self.record_field_c_type(t),
+        }
+    }
+
     /// Resolve a `<T>` payload arg (the inside of `event<T>`,
     /// `queue<T>`, etc.) to a C++ type name. User-declared
     /// transactions and enums get their bare name (so payloads
@@ -8031,7 +8071,7 @@ impl Emitter {
         writeln!(self.out, "struct {} {{", s.name.name).ok();
         for it in &s.items {
             if let ComponentItem::Field(f) = it {
-                let cty = scoreboard_field_c_type(&f.ty);
+                let cty = self.scoreboard_field_c_type(&f.ty);
                 let init = if let Some(d) = &f.default {
                     format!(" = {}", format_simple_expr(d))
                 } else {
@@ -12903,21 +12943,6 @@ impl Emitter {
                     // the struct. The user assigns DUT pointers and other
                     // field values explicitly afterward (`drv.dut = dut;`).
                     writeln!(self.out, "{name} {};", l.name.name).ok();
-                    if l.name.name == "_tb" {
-                        for ci in &comp.items {
-                            if let ComponentItem::Field(f) = ci {
-                                if f.name.name != "dut" {
-                                    self.pad(depth);
-                                    writeln!(
-                                        self.out,
-                                        "auto& {} = _tb.{};",
-                                        f.name.name, f.name.name
-                                    )
-                                    .ok();
-                                }
-                            }
-                        }
-                    }
                     // Register on-handlers in the body the same way
                     // monitors do — events get subscriber closures,
                     // bool exprs get cycle-trigger checkers. Tag prefix
@@ -13897,6 +13922,30 @@ impl Emitter {
                         }
                     }
                 }
+                if let Some((comp_ty, receiver, method, current_method, current_method_active)) =
+                    self.resolve_bare_sibling_method_call(callee)
+                {
+                    if self.transactors.contains_key(&comp_ty)
+                        && self.method_lives_in_when_active(&comp_ty, &method)
+                        && !current_method_active
+                    {
+                        self.errors.push(format!(
+                            "method `{comp_ty}.{current_method}(...)`: bare sibling call `{method}(...)` targets a hookable inside `when active` of transactor `{comp_ty}`. Move `{current_method}` into `when active`, or call `{method}` only from active-only code."
+                        ));
+                        write!(self.out, "/* unsupported bare active sibling call */ 0").ok();
+                        return;
+                    }
+                    write!(self.out, "{comp_ty}_{method}({receiver}").ok();
+                    for a in args.iter() {
+                        write!(self.out, ", ").ok();
+                        match a {
+                            CallArg::Expr(ex) => self.emit_expr(ex),
+                            CallArg::Named { value, .. } => self.emit_expr(value),
+                        }
+                    }
+                    write!(self.out, ")").ok();
+                    return;
+                }
                 // Env/test-level quiescence helper: `env.quiesced(N)`
                 // aggregates the built-in `idle(N)` predicate over all
                 // nested component fields registered under that component.
@@ -14250,27 +14299,6 @@ pub fn uses_constraint_solver(file: &SourceFile) -> bool {
         }),
         _ => false,
     })
-}
-
-/// Pick a C++ representation for a scoreboard field. Mostly the same as
-/// `txn_field_c_type` but supports `queue<T>` → `harc_rt::HarcQueue<T>`.
-fn scoreboard_field_c_type(t: &TypeExpr) -> String {
-    if let TypeExpr::Builtin {
-        name: BuiltinTy::Queue,
-        args,
-        ..
-    } = t
-    {
-        let inner = args
-            .first()
-            .map(|a| match a {
-                TypeArg::Type(ty) => txn_field_c_type(ty),
-                _ => "uint64_t".into(),
-            })
-            .unwrap_or_else(|| "uint64_t".into());
-        return format!("harc_rt::HarcQueue<{inner}>");
-    }
-    txn_field_c_type(t)
 }
 
 fn named_type_last_segment(t: &TypeExpr) -> Option<&str> {

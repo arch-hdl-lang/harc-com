@@ -1991,7 +1991,7 @@ end impl ActivePostEvalProviderCallTest"#,
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
         cpp.contains(
-            "ProtocolModel_predict_read(responder.model, harc_rt::harc_read(dut->req_addr))"
+            "ProtocolModel_predict_read(_tb.responder.model, harc_rt::harc_read(dut->req_addr))"
         ),
         "expected component-field provider call to dispatch through generated method; got:\n{cpp}"
     );
@@ -2108,6 +2108,238 @@ end impl ComponentParamDispatchTest"#,
     assert!(
         !cpp.contains("model.predict_read"),
         "component-typed method parameters must not fall through to C++ member calls; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn testbench_method_bare_sibling_call_dispatches_through_self() {
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : DummyDut
+
+    function write_reg(addr: uint<32>, data: uint<32>)
+        dut.addr = addr
+        dut.wdata = data
+    end write_reg
+
+    function program_defaults()
+        write_reg(0x1000, 0)
+        write_reg(0x1004, 1)
+    end program_defaults
+end testbench Tb
+
+impl BareSiblingTestbenchCallTest for Tb
+    run
+        program_defaults()
+    end run
+end impl BareSiblingTestbenchCallTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("Tb_write_reg(self, 0x1000, 0)")
+            && cpp.contains("Tb_write_reg(self, 0x1004, 1)"),
+        "testbench sibling calls should dispatch through self; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("write_reg(0x1000, 0)") && !cpp.contains("write_reg(0x1004, 1)"),
+        "testbench sibling calls must not emit as bare C++ calls; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn transactor_method_bare_sibling_call_dispatches_through_self() {
+    let parsed = parse_source(
+        r#"transactor HelperTransactor
+    function write_value(data: uint<32>)
+        last = data
+    end write_value
+
+    function program_defaults()
+        write_value(7)
+    end program_defaults
+
+    last : uint<32> default 0
+end transactor HelperTransactor
+
+testbench Tb
+    dut : DummyDut
+    helper : HelperTransactor active
+end testbench Tb
+
+impl BareSiblingTransactorCallTest for Tb
+    run
+        helper.program_defaults()
+    end run
+end impl BareSiblingTransactorCallTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("HelperTransactor_write_value(self, 7)"),
+        "transactor sibling call should dispatch through self; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("write_value(7)"),
+        "transactor sibling call must not emit as a bare C++ call; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn transactor_always_on_bare_call_to_when_active_sibling_errors_for_passive_backdoor() {
+    let parsed = parse_source(
+        r#"transactor HelperTransactor
+    function outer()
+        active_only()
+    end outer
+
+    when active
+        function active_only()
+            last = 1
+        end active_only
+    end when
+
+    last : uint<32> default 0
+end transactor HelperTransactor
+
+testbench Tb
+    dut : DummyDut
+    helper : HelperTransactor passive
+end testbench Tb
+
+impl BareSiblingActiveBackdoorTest for Tb
+    run
+        helper.outer()
+    end run
+end impl BareSiblingActiveBackdoorTest"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&parsed).unwrap_err();
+    assert!(
+        err.0.contains("active_only") && err.0.contains("when active") && err.0.contains("outer"),
+        "expected bare active sibling call diagnostic, got:\n{}",
+        err.0,
+    );
+}
+
+#[test]
+fn scoreboard_method_bare_sibling_call_dispatches_through_self() {
+    let parsed = parse_source(
+        r#"scoreboard Score
+    count : uint<32> default 0
+
+    function bump()
+        count = count + 1
+    end bump
+
+    function observe()
+        bump()
+    end observe
+end scoreboard Score
+
+testbench Tb
+    dut : DummyDut
+    sb : Score
+end testbench Tb
+
+impl BareSiblingScoreboardCallTest for Tb
+    run
+        sb.observe()
+    end run
+end impl BareSiblingScoreboardCallTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("Score_bump(self)"),
+        "scoreboard sibling call should dispatch through self; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("bump()"),
+        "scoreboard sibling call must not emit as a bare C++ call; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn scoreboard_queue_of_struct_lowers_to_typed_harc_queue() {
+    let parsed = parse_source(
+        r#"struct CheckerError
+    checker_id : uint<8>
+    code : uint<16>
+    got : uint<64>
+    expected : uint<64>
+end struct CheckerError
+
+scoreboard GlobalScoreboard
+    errors : queue<CheckerError>
+end scoreboard GlobalScoreboard
+
+testbench Tb
+    dut : DummyDut
+    sb : GlobalScoreboard
+end testbench Tb
+
+impl TypedScoreboardQueueLoweringTest for Tb
+    run
+        assert sb.errors.empty() else fail("expected empty")
+    end run
+end impl TypedScoreboardQueueLoweringTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("HarcQueue<CheckerError> errors;"),
+        "scoreboard queue<struct> should preserve record type; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("HarcQueue<uint64_t> errors;"),
+        "scoreboard queue<struct> must not fall back to uint64_t; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn scoreboard_method_pushes_struct_into_typed_queue() {
+    let parsed = parse_source(
+        r#"struct CheckerError
+    checker_id : uint<8>
+    code : uint<16>
+    got : uint<64>
+    expected : uint<64>
+end struct CheckerError
+
+scoreboard GlobalScoreboard
+    errors : queue<CheckerError>
+
+    function record_error(checker_id: uint<8>, code: uint<16>, got: uint<64>, expected: uint<64>)
+        let err : CheckerError
+        err.checker_id = checker_id
+        err.code = code
+        err.got = got
+        err.expected = expected
+        errors.push(err)
+    end record_error
+end scoreboard GlobalScoreboard
+
+testbench Tb
+    dut : DummyDut
+    sb : GlobalScoreboard
+end testbench Tb
+
+impl TypedScoreboardQueuePushTest for Tb
+    run
+        sb.record_error(1, 0x1001, 2, 3)
+    end run
+end impl TypedScoreboardQueuePushTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("HarcQueue<CheckerError> errors;"),
+        "scoreboard queue should preserve CheckerError element type; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("self.errors.push(err);"),
+        "scoreboard method should push the typed record into the queue; got:\n{cpp}"
     );
 }
 
@@ -4910,6 +5142,41 @@ end impl Smoke"#,
         cpp.contains("dut->count_out"),
         "expected `dut->count_out` from bare `dut.count_out`; got:\n{}",
         cpp,
+    );
+}
+
+#[test]
+fn impl_for_testbench_does_not_alias_fields_over_generated_locals() {
+    let parsed = parse_source(
+        r#"scoreboard ResponseScoreboard
+    count : uint<32> default 0
+end scoreboard ResponseScoreboard
+
+testbench Tb
+    dut : DummyDut
+    errors : ResponseScoreboard
+end testbench Tb
+
+impl AliasCollisionTest for Tb
+    run
+        wait 1 cycle
+        assert errors.count == 0 else fail("unexpected scoreboard count")
+    end run
+end impl AliasCollisionTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("int errors = 0;"),
+        "expected generated error counter to keep its existing name; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("auto& errors = _tb.errors;"),
+        "testbench fields must not alias over generated locals; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("_tb.errors.count"),
+        "testbench field references should be rewritten through _tb; got:\n{cpp}"
     );
 }
 
