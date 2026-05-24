@@ -58,6 +58,18 @@ inline void harc_log_wave_file(FILE* f, const std::string& wave_path) {
     std::fprintf(f, "[waves] writing %s\n", wave_path.c_str());
 }
 
+template <typename DutT, typename TraceT>
+inline std::string harc_open_wave_trace(
+    DutT* dut,
+    TraceT* trace,
+    const char* default_name) {
+    if (dut && trace) dut->trace(trace, harc_trace_depth());
+    std::string wave_path = harc_wave_output_path(default_name);
+    if (trace) trace->open(wave_path.c_str());
+    harc_log_wave_stderr(wave_path);
+    return wave_path;
+}
+
 inline void harc_report_unknown_test(const char* test_name, const char* available_tests) {
     std::fprintf(
         stderr,

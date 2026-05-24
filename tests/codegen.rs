@@ -208,9 +208,7 @@ end test WaveTest
     // in a non-waves build.
     assert!(cpp.contains("Verilated::traceEverOn(true);"));
     assert!(cpp.contains("HarcTraceC* tfp = new HarcTraceC;"));
-    assert!(cpp.contains("dut->trace(tfp, harc_rt::log::harc_trace_depth());"));
-    assert!(cpp.contains("harc_rt::log::harc_wave_output_path(_wave_default_name)"));
-    assert!(cpp.contains("harc_rt::log::harc_log_wave_stderr(_wave_path);"));
+    assert!(cpp.contains("harc_rt::log::harc_open_wave_trace(dut, tfp, _wave_default_name);"));
     assert!(cpp.contains("harc_rt::log::harc_log_wave_file(sim_log, _wave_path);"));
     assert!(cpp.contains("tfp->dump(_trace_time++);"));
     assert!(cpp.contains("harc_rt::log::harc_write_coverage(Verilated::threadContextp()->coveragep());"));
