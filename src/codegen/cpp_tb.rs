@@ -1089,11 +1089,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "{INDENT}harc_rt::trace::HarcTraceWriter trace;").ok();
         writeln!(e.out, "{INDENT}trace.open_env();").ok();
         writeln!(e.out, "{INDENT}trace.meta_env(harc_rng.state, \"{dut_type}\", \"{}\");", test.name.name).ok();
-        writeln!(
-            e.out,
-            "{INDENT}trace.raw(\"sim_start\", cycle_count, \"\");"
-        )
-        .ok();
+        writeln!(e.out, "{INDENT}trace.sim_start(cycle_count);").ok();
         writeln!(e.out, "").ok();
         // sim.log captures every log()/assert/fail line with cycle + severity
         // prefix. Path is configurable via the HARC_SIM_LOG env var (so the
@@ -1959,7 +1955,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             "{INDENT}log_files.close_all();"
         )
         .ok();
-        writeln!(e.out, "{INDENT}trace.raw(\"sim_end\", cycle_count, \"\\\"errors\\\":\" + std::to_string(errors));").ok();
+        writeln!(e.out, "{INDENT}trace.sim_end(cycle_count, errors);").ok();
         writeln!(e.out, "{INDENT}trace.close();").ok();
         writeln!(e.out, "").ok();
         writeln!(e.out, "{INDENT}return harc_rt::log::harc_report_test_result(errors);").ok();
