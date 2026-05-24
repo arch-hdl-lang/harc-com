@@ -289,6 +289,20 @@ end test CoverAutoCrossTest"#,
 }
 
 #[test]
+fn cover_statement_report_uses_runtime_helpers() {
+    let src = r#"test CoverStmtTest
+    let dut : Top
+    run
+        cover dut.done
+    end run
+end test CoverStmtTest"#;
+    let parsed = parse_source(src).unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(cpp.contains("harc_rt::log::harc_print_cover_summary(_cov_hit, _cov_total);"));
+    assert!(cpp.contains("harc_rt::log::harc_print_cover_point(\"cov_"));
+}
+
+#[test]
 fn covergroup_can_sample_dut_bit_slice() {
     let parsed = parse_source(
         r#"covergroup G @(posedge dut.clk)
