@@ -1907,10 +1907,10 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                 )
                 .ok();
             }
-            writeln!(e.out, "{INDENT}{INDENT}std::printf(\"[cover] %llu/%llu hit (%.1f%%)\\n\", (unsigned long long)_cov_hit, (unsigned long long)_cov_total, _cov_total ? (100.0 * _cov_hit / _cov_total) : 0.0);").ok();
+            writeln!(e.out, "{INDENT}{INDENT}harc_rt::log::harc_print_cover_summary(_cov_hit, _cov_total);").ok();
             for c in &covers_clone {
                 writeln!(e.out,
-                "{INDENT}{INDENT}std::printf(\"  [{label}]: %llu hits%s\\n\", (unsigned long long)_cov_{tag}_hits, _cov_{tag}_hits ? \"\" : \" *NOT HIT*\");",
+                "{INDENT}{INDENT}harc_rt::log::harc_print_cover_point(\"{label}\", _cov_{tag}_hits);",
                 tag = c.tag, label = escape_c(&c.label)).ok();
             }
             writeln!(e.out, "{INDENT}}}").ok();

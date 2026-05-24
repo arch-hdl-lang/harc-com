@@ -90,6 +90,26 @@ inline std::string harc_coverage_output_path() {
     return harc_resolve_log_path("coverage.dat");
 }
 
+inline double harc_percent(uint64_t hit, uint64_t total) {
+    return total ? (100.0 * hit / total) : 0.0;
+}
+
+inline void harc_print_cover_summary(uint64_t hit, uint64_t total) {
+    std::printf(
+        "[cover] %llu/%llu hit (%.1f%%)\n",
+        static_cast<unsigned long long>(hit),
+        static_cast<unsigned long long>(total),
+        harc_percent(hit, total));
+}
+
+inline void harc_print_cover_point(const char* label, uint64_t hits) {
+    std::printf(
+        "  [%s]: %llu hits%s\n",
+        label ? label : "",
+        static_cast<unsigned long long>(hits),
+        hits ? "" : " *NOT HIT*");
+}
+
 struct HarcLogFiles {
     std::unordered_map<std::string, FILE*> files;
 
