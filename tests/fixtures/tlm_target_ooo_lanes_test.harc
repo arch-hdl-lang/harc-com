@@ -1,0 +1,67 @@
+// Target-side out-of-order TLM lane test.
+//
+// The SV DUT issues two tagged read requests back-to-back and expects the
+// target to accept both before the first response is produced. The passive
+// HARC target uses one responder lane per tag, so tag 1 can return before tag
+// 0 while both responses still carry the correct tags.
+
+bus OooMemBus
+    tlm_method read_ooo(addr: uint<8>) -> uint<32>: out_of_order tags 2;
+end bus OooMemBus
+
+transactor OooMemTarget bound to OooMemBus
+    read_count : uint<32> default 0
+    checksum : uint<32> default 0
+
+    thread bus.read_ooo(addr: uint<8>)
+        read_count = read_count + 1
+        checksum = checksum + addr
+        if addr < 8
+            wait 5 cycles
+            return 4096 + addr
+        else
+            wait 1 cycle
+            return 8192 + addr
+        end if
+    end thread
+end transactor OooMemTarget
+
+testbench TlmTargetOooLanesTb
+    dut : TlmOooReadInitiatorPair
+end testbench TlmTargetOooLanesTb
+
+impl TlmTargetOooLanesTest for TlmTargetOooLanesTb
+    let mem : OooMemBus = bind dut with {
+        read_ooo.req_valid: "mem_read_ooo_req_valid",
+        read_ooo.req_ready: "mem_read_ooo_req_ready",
+        read_ooo.addr: "mem_read_ooo_addr",
+        read_ooo.req_tag: "mem_read_ooo_req_tag",
+        read_ooo.rsp_valid: "mem_read_ooo_rsp_valid",
+        read_ooo.rsp_ready: "mem_read_ooo_rsp_ready",
+        read_ooo.rsp_data: "mem_read_ooo_rsp_data",
+        read_ooo.rsp_tag: "mem_read_ooo_rsp_tag"
+    }
+    let target : OooMemTarget passive = bind mem
+
+    run
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+
+        wait until dut.done == 1 timeout 80 cycles fail("OOO target did not return both tagged responses")
+        assert dut.late_ready_error == 0
+            else fail("OOO target did not accept second request while first tag was outstanding")
+        assert dut.result0 == 4101
+            else fail("tag 0 response mismatch got=0x${dut.result0:08x}, expected 0x00001005")
+        assert dut.result1 == 8204
+            else fail("tag 1 response mismatch got=0x${dut.result1:08x}, expected 0x0000200c")
+        assert target.read_count == 2
+            else fail("target read_count mismatch got=${target.read_count}, expected 2")
+        assert target.checksum == 17
+            else fail("target checksum mismatch got=${target.checksum}, expected 17")
+
+        if dut.done == 1 && dut.late_ready_error == 0 && dut.result0 == 4101 && dut.result1 == 8204 && target.read_count == 2 && target.checksum == 17
+            log(info, "ALL TESTS PASSED - tlm_target_ooo_lanes_test")
+        end if
+    end run
+end impl TlmTargetOooLanesTest
