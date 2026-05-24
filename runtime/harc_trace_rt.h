@@ -87,6 +87,14 @@ struct HarcTraceWriter {
         std::fflush(out);
     }
 
+    void sim_start(int cycle) {
+        raw("sim_start", cycle, "");
+    }
+
+    void sim_end(int cycle, int errors) {
+        raw("sim_end", cycle, "\"errors\":" + std::to_string(errors));
+    }
+
     void log(int cycle, const char* sev, const std::string& msg) {
         std::string payload =
             "\"severity\":\"" + harc_trace_escape(sev ? sev : "") +
