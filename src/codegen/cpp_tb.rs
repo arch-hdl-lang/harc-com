@@ -1299,14 +1299,6 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "{INDENT}harc_rt::log::HarcLogFiles log_files;").ok();
         writeln!(
             e.out,
-            "{INDENT}auto get_log_file = [&](const char* path) -> FILE* {{"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}{INDENT}return log_files.get(path);").ok();
-        writeln!(e.out, "{INDENT}}};").ok();
-        writeln!(e.out, "").ok();
-        writeln!(
-            e.out,
             "{INDENT}auto sim_logf_line = [&](FILE* f, const char* sev, const char* fmt, ...) {{"
         )
         .ok();
@@ -11352,7 +11344,7 @@ impl Emitter {
     }
 
     /// Emit a `log` or `logf` call. When `file_path` is `Some`, lower to
-    /// `sim_logf_line(get_log_file(path), sev, fmt, args)`; otherwise lower
+    /// `sim_logf_line(log_files.get(path), sev, fmt, args)`; otherwise lower
     /// to `sim_log_line(sev, fmt, args)`. Severity / message extraction
     /// matches `log()`'s rules (first ident is severity; first string is
     /// the message).
@@ -11383,7 +11375,7 @@ impl Emitter {
             Some(p) => {
                 write!(
                     self.out,
-                    "sim_logf_line(get_log_file(\"{}\"), \"{}\", \"{}\"",
+                    "sim_logf_line(log_files.get(\"{}\"), \"{}\", \"{}\"",
                     escape_c(&p),
                     sev,
                     escape_c(&fmt)

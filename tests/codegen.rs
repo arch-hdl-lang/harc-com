@@ -1169,6 +1169,7 @@ fn log_severity_test_result_semantics() {
         log(info,  "info: no effect")
         log(warn,  "warn: no effect")
         log(debug, "debug: no effect")
+        logf("detail.log", info, "detail: no effect")
         log(error, "error: should bump counter")
         log(fatal, "fatal: should abort")
     end run
@@ -1213,6 +1214,14 @@ end test T"#,
     assert!(
         cpp.contains("_fatal = true;"),
         "expected `_fatal = true;` in FATAL lowering"
+    );
+    assert!(
+        cpp.contains("sim_logf_line(log_files.get(\"detail.log\"), \"INFO\", \"detail: no effect\");"),
+        "expected logf to resolve files through HarcLogFiles directly; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("get_log_file"),
+        "generated get_log_file forwarding lambda should not be emitted; got:\n{cpp}"
     );
 }
 
