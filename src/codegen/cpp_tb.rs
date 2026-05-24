@@ -1042,11 +1042,6 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "#if HARC_TRACE_ENABLED").ok();
         writeln!(e.out, "{INDENT}Verilated::traceEverOn(true);").ok();
         writeln!(e.out, "{INDENT}HarcTraceC* tfp = new HarcTraceC;").ok();
-        writeln!(
-            e.out,
-            "{INDENT}dut->trace(tfp, harc_rt::log::harc_trace_depth());"
-        )
-        .ok();
         writeln!(e.out, "#if defined(HARC_TRACE_VCD)").ok();
         writeln!(
             e.out,
@@ -1062,13 +1057,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "#endif").ok();
         writeln!(
             e.out,
-            "{INDENT}std::string _wave_path = harc_rt::log::harc_wave_output_path(_wave_default_name);"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}tfp->open(_wave_path.c_str());").ok();
-        writeln!(
-            e.out,
-            "{INDENT}harc_rt::log::harc_log_wave_stderr(_wave_path);"
+            "{INDENT}std::string _wave_path = harc_rt::log::harc_open_wave_trace(dut, tfp, _wave_default_name);"
         )
         .ok();
         writeln!(e.out, "{INDENT}uint64_t _trace_time = 0;").ok();
