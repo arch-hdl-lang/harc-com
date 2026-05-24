@@ -7961,11 +7961,7 @@ impl Emitter {
         self.pad(depth + 1);
         writeln!(self.out, "_trace_fields += \"}}\";").ok();
         self.pad(depth + 1);
-        writeln!(
-            self.out,
-            "trace.raw(\"randomize\", cycle_count, _trace_fields);"
-        )
-        .ok();
+        writeln!(self.out, "trace.randomize(cycle_count, _trace_fields);").ok();
         self.pad(depth);
         writeln!(self.out, "}}").ok();
     }
