@@ -1088,7 +1088,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "{INDENT}harc_rng.seed_from_env();").ok();
         writeln!(e.out, "{INDENT}harc_rt::trace::HarcTraceWriter trace;").ok();
         writeln!(e.out, "{INDENT}trace.open_env();").ok();
-        writeln!(e.out, "{INDENT}trace.meta(harc_rng.state, std::getenv(\"HARC_DUT_BACKEND\"), \"{dut_type}\", \"{}\");", test.name.name).ok();
+        writeln!(e.out, "{INDENT}trace.meta_env(harc_rng.state, \"{dut_type}\", \"{}\");", test.name.name).ok();
         writeln!(
             e.out,
             "{INDENT}trace.raw(\"sim_start\", cycle_count, \"\");"

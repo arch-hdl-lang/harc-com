@@ -39,9 +39,7 @@ end test TraceTest
     assert!(cpp.contains("#include \"harc_trace_rt.h\""));
     assert!(cpp.contains("#include \"harc_log_rt.h\""));
     assert!(cpp.contains("harc_rt::trace::HarcTraceWriter trace;"));
-    assert!(cpp.contains(
-        "trace.meta(harc_rng.state, std::getenv(\"HARC_DUT_BACKEND\"), \"Top\", \"TraceTest\")"
-    ));
+    assert!(cpp.contains("trace.meta_env(harc_rng.state, \"Top\", \"TraceTest\")"));
     assert!(cpp.contains("trace.raw(\"randomize\", cycle_count, _trace_fields);"));
     assert!(cpp.contains("harc_rt::log::harc_log_line(sim_log, &trace, cycle_count, sev, _log_msg);"));
     assert!(cpp.contains("harc_rt::log::harc_close_file(sim_log);"));

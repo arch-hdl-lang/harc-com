@@ -70,6 +70,10 @@ struct HarcTraceWriter {
         std::fflush(out);
     }
 
+    void meta_env(uint64_t seed, const char* top, const char* test) {
+        meta(seed, std::getenv("HARC_DUT_BACKEND"), top, test);
+    }
+
     void raw(const char* type, int cycle, const std::string& payload) {
         if (!enabled) return;
         std::fprintf(
