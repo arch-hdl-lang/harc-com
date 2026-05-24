@@ -1937,12 +1937,12 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "{INDENT}harc_rt::log::harc_close_wave_trace(tfp);").ok();
         writeln!(e.out, "#endif").ok();
         writeln!(e.out, "{INDENT}delete dut;").ok();
-        writeln!(e.out, "{INDENT}harc_rt::log::harc_close_file(sim_log);").ok();
-        writeln!(e.out, "{INDENT}log_files.close_all();").ok();
-        writeln!(e.out, "{INDENT}trace.sim_end(cycle_count, errors);").ok();
-        writeln!(e.out, "{INDENT}trace.close();").ok();
         writeln!(e.out, "").ok();
-        writeln!(e.out, "{INDENT}return harc_rt::log::harc_report_test_result(errors);").ok();
+        writeln!(
+            e.out,
+            "{INDENT}return harc_rt::log::harc_finish_sim_run(sim_log, log_files, trace, cycle_count, errors);"
+        )
+        .ok();
         writeln!(e.out, "}}").ok();
         writeln!(e.out, "").ok();
     } // end of `for test in &tests`

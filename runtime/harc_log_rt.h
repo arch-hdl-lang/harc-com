@@ -195,6 +195,19 @@ struct HarcLogFiles {
     }
 };
 
+inline int harc_finish_sim_run(
+    FILE*& sim_log,
+    HarcLogFiles& log_files,
+    harc_rt::trace::HarcTraceWriter& trace,
+    int cycle,
+    int errors) {
+    harc_close_file(sim_log);
+    log_files.close_all();
+    trace.sim_end(cycle, errors);
+    trace.close();
+    return harc_report_test_result(errors);
+}
+
 inline void harc_log_stdout_line(int cycle, const char* sev, const char* msg) {
     std::printf("[cycle:%d %s] ", cycle, sev ? sev : "");
     std::printf("%s", msg ? msg : "");
