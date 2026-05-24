@@ -15,7 +15,8 @@ struct Cli {
 enum Cmd {
     /// Parse and type-check HARC source file(s). Exits 0 on success.
     ///
-    /// Today: parse only. Type-checking lands with phase 1a elaboration.
+    /// Today: parse plus selected backend/codegen limitation checks.
+    /// Type-checking lands with phase 1a elaboration.
     /// Counterpart to `arch check`.
     Check {
         /// Input .harc file(s)
@@ -873,10 +874,108 @@ fn parse_file(path: &PathBuf) -> Result<harc::ast::SourceFile> {
     })
 }
 
+fn parse_file_source(path: &PathBuf, src: &str) -> Result<harc::ast::SourceFile> {
+    harc::parser::parse_source(src).map_err(|e| {
+        Report::new(e).with_source_code(NamedSource::new(
+            path.display().to_string(),
+            src.to_string(),
+        ))
+    })
+}
+
+fn width_literal_value(kind: &harc::lexer::TokenKind) -> Option<u32> {
+    match kind {
+        harc::lexer::TokenKind::DecLiteral(s) => s.replace('_', "").parse::<u32>().ok(),
+        harc::lexer::TokenKind::HexLiteral(s) => u32::from_str_radix(
+            s.trim_start_matches("0x")
+                .trim_start_matches("0X")
+                .replace('_', "")
+                .as_str(),
+            16,
+        )
+        .ok(),
+        harc::lexer::TokenKind::BinLiteral(s) => u32::from_str_radix(
+            s.trim_start_matches("0b")
+                .trim_start_matches("0B")
+                .replace('_', "")
+                .as_str(),
+            2,
+        )
+        .ok(),
+        _ => None,
+    }
+}
+
+fn is_backend_width_method(name: &str) -> bool {
+    matches!(name, "trunc" | "zext" | "sext" | "resize")
+}
+
+fn validate_check_backend_codegen_limitations(path: &PathBuf, src: &str) -> Result<()> {
+    let tokens = match harc::lexer::tokenize(src) {
+        Ok(tokens) => tokens,
+        Err(_) => return Ok(()),
+    };
+    for window_start in 0..tokens.len().saturating_sub(4) {
+        if tokens[window_start].kind != harc::lexer::TokenKind::Dot {
+            continue;
+        }
+        let harc::lexer::TokenKind::Ident(method) = &tokens[window_start + 1].kind else {
+            continue;
+        };
+        if !is_backend_width_method(method)
+            || tokens[window_start + 2].kind != harc::lexer::TokenKind::Lt
+        {
+            continue;
+        }
+
+        let Some(close_idx) = tokens
+            .iter()
+            .enumerate()
+            .skip(window_start + 3)
+            .find_map(|(idx, tok)| (tok.kind == harc::lexer::TokenKind::Gt).then_some(idx))
+        else {
+            continue;
+        };
+        let width_tokens = &tokens[window_start + 3..close_idx];
+        let width = if width_tokens.len() == 1 {
+            width_literal_value(&width_tokens[0].kind)
+        } else {
+            None
+        };
+        let Some(width) = width else {
+            let span = tokens[window_start + 1].span.merge(tokens[close_idx].span);
+            let err = harc::diagnostics::CompileError::unsupported_syntax(
+                &format!("C++ backend cannot lower `.{method}<N>()` with a non-constant width"),
+                "supported width-method forms for `harc check` and C++ codegen use a literal width in 1..=64",
+                span,
+            );
+            return Err(Report::new(err).with_source_code(NamedSource::new(
+                path.display().to_string(),
+                src.to_string(),
+            )));
+        };
+        if width == 0 || width > 64 {
+            let span = tokens[window_start + 1].span.merge(tokens[close_idx].span);
+            let err = harc::diagnostics::CompileError::unsupported_syntax(
+                &format!("C++ backend cannot lower `.{method}<{width}>()`"),
+                "supported resize widths for this backend are 1..=64; split the value into <=64-bit limbs or use an extern helper",
+                span,
+            );
+            return Err(Report::new(err).with_source_code(NamedSource::new(
+                path.display().to_string(),
+                src.to_string(),
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn cmd_check(files: Vec<PathBuf>, ast: bool) -> Result<()> {
     let mut total_items = 0;
     for file in &files {
-        let parsed = parse_file(file)?;
+        let src = fs::read_to_string(file).into_diagnostic()?;
+        let parsed = parse_file_source(file, &src)?;
+        validate_check_backend_codegen_limitations(file, &src)?;
         total_items += parsed.items.len();
         if ast {
             println!("// {}", file.display());
@@ -1692,5 +1791,35 @@ mod tests {
         assert!(contents.contains("bind CpuPipe __harc_probe_CpuPipe harc_probes ();"));
         assert!(contents.contains("assign alu_a = CpuPipe.alu0.a;"));
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn check_reports_backend_unsupported_wide_resize() {
+        let src = r#"
+            function wide_zext_128_repro(a: uint<48>, b: uint<16>) -> uint<64>
+                let product : uint<128> = a.zext<128>() * b.zext<128>()
+                return product.trunc<64>()
+            end function wide_zext_128_repro
+        "#;
+        let path = PathBuf::from("wide_zext_128_repro.harc");
+        let err = validate_check_backend_codegen_limitations(&path, src).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("C++ backend cannot lower `.zext<128>()`")
+                && msg.contains("supported resize widths"),
+            "expected backend unsupported-width diagnostic; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn check_accepts_backend_supported_resize_widths() {
+        let src = r#"
+            function narrow_ok(a: uint<48>, b: uint<16>) -> uint<64>
+                let product : uint<64> = a.zext<64>() * b.zext<64>()
+                return product.trunc<32>().zext<64>()
+            end function narrow_ok
+        "#;
+        let path = PathBuf::from("narrow_ok.harc");
+        validate_check_backend_codegen_limitations(&path, src).unwrap();
     }
 }
