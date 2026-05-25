@@ -1,0 +1,58 @@
+//! ---
+//! tags: [tlm_method, harc, conformance, bounded_burst]
+//! refs:
+//!   - "HARC/ARCH bounded Vec response pairing fixture"
+//! ---
+//!
+//! ARCH initiator used by HARC conformance tests for canonical bounded burst
+//! response payloads served by a HARC target transactor.
+
+/// Canonical bounded burst response shared by ARCH and HARC tests.
+struct BurstResp32x4
+  data: Vec<UInt<32>, 4>;
+  len: UInt<3>;
+  resp: UInt<2>;
+end struct BurstResp32x4
+
+/// Burst-like memory read contract returning a bounded response struct.
+bus PairingBurstBus
+  tlm_method read_burst(addr: UInt<32>, len: UInt<3>) -> BurstResp32x4: blocking;
+end bus PairingBurstBus
+
+/// Bring the pairing TLM bus into scope for module ports.
+use PairingBurstBus;
+
+/// ARCH initiator that captures a bounded burst response from HARC.
+module TlmPairingArchBurstInitiator
+  port clk: in Clock<SysDomain>;
+  port rst: in Reset<Sync>;
+  port start: in Bool;
+  port mem: initiator PairingBurstBus;
+  port done: out Bool;
+  port data0: out UInt<32>;
+  port data1: out UInt<32>;
+  port data2: out UInt<32>;
+  port data3: out UInt<32>;
+  port len_o: out UInt<3>;
+  port resp_o: out UInt<2>;
+
+  reg done_r: Bool reset rst => false;
+  reg rsp_r: BurstResp32x4 reset rst => 0;
+
+  comb
+    done = done_r;
+    data0 = rsp_r.data[0];
+    data1 = rsp_r.data[1];
+    data2 = rsp_r.data[2];
+    data3 = rsp_r.data[3];
+    len_o = rsp_r.len;
+    resp_o = rsp_r.resp;
+  end comb
+
+  thread issue on clk rising, rst high
+    if start and not done_r
+      rsp_r <= mem.read_burst(32'h0000_0040, 3'd4);
+      done_r <= true;
+    end if
+  end thread issue
+end module TlmPairingArchBurstInitiator

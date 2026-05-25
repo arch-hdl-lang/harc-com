@@ -1,0 +1,57 @@
+//! ---
+//! tags: [tlm_method, harc, conformance, bounded_burst]
+//! refs:
+//!   - "HARC/ARCH bounded Vec response pairing fixture"
+//! ---
+//!
+//! ARCH target responder used by HARC conformance tests for canonical bounded
+//! burst response payloads: fixed Vec data plus runtime length and response
+//! code fields.
+
+/// Canonical bounded burst response shared by ARCH and HARC tests.
+struct BurstResp32x4
+  data: Vec<UInt<32>, 4>;
+  len: UInt<3>;
+  resp: UInt<2>;
+end struct BurstResp32x4
+
+/// Burst-like memory read contract returning a bounded response struct.
+bus PairingBurstBus
+  tlm_method read_burst(addr: UInt<32>, len: UInt<3>) -> BurstResp32x4: blocking;
+end bus PairingBurstBus
+
+/// Bring the pairing TLM bus into scope for module ports.
+use PairingBurstBus;
+
+/// ARCH target that synthesizes a deterministic bounded burst response.
+module TlmPairingArchBurstTarget
+  port clk: in Clock<SysDomain>;
+  port rst: in Reset<Sync>;
+  port mem: target PairingBurstBus;
+  port read_count: out UInt<8>;
+  port last_addr: out UInt<32>;
+  port last_len: out UInt<3>;
+
+  reg read_count_r: UInt<8> reset rst => 0;
+  reg last_addr_r: UInt<32> reset rst => 0;
+  reg last_len_r: UInt<3> reset rst => 0;
+  reg rsp_r: BurstResp32x4 reset rst => 0;
+
+  let read_count = read_count_r;
+  let last_addr = last_addr_r;
+  let last_len = last_len_r;
+
+  thread mem.read_burst(addr, len) on clk rising, rst high
+    read_count_r <= read_count_r +% 8'd1;
+    last_addr_r <= addr;
+    last_len_r <= len;
+    rsp_r.data[0] <= 32'h0000_0020;
+    rsp_r.data[1] <= 32'h0000_0024;
+    rsp_r.data[2] <= 32'h0000_0028;
+    rsp_r.data[3] <= 32'h0000_002c;
+    rsp_r.len <= 3'd3;
+    rsp_r.resp <= 2'd0;
+    wait 1 cycle;
+    return rsp_r;
+  end thread mem.read_burst
+end module TlmPairingArchBurstTarget

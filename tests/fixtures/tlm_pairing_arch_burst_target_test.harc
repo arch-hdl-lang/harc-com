@@ -1,0 +1,53 @@
+// HARC initiator to ARCH bounded-burst TLM target conformance test.
+//
+// The ARCH DUT returns a canonical response struct: fixed Vec payload,
+// runtime length, and protocol response code. HARC unpacks the lowered packed
+// response pin back into the same source-level struct shape.
+
+struct HarcBurstResp32x4
+    data : Vec<uint<32>, 4>
+    len : uint<3>
+    resp : uint<2>
+end struct HarcBurstResp32x4
+
+bus PairingBurstBus
+    tlm_method read_burst(addr: uint<32>, len: uint<3>) -> HarcBurstResp32x4: blocking;
+end bus PairingBurstBus
+
+testbench TlmPairingArchBurstTargetTb
+    dut : TlmPairingArchBurstTarget
+end testbench TlmPairingArchBurstTargetTb
+
+impl TlmPairingArchBurstTargetTest for TlmPairingArchBurstTargetTb
+    let mem : PairingBurstBus = bind dut
+
+    run
+        dut.rst = 1
+        wait 3 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        let rsp = mem.read_burst(0x20, 3)
+        assert rsp.data[0] == 0x20
+            else fail("ARCH burst target data0 mismatch got=0x${rsp.data[0]:08x}")
+        assert rsp.data[1] == 0x24
+            else fail("ARCH burst target data1 mismatch got=0x${rsp.data[1]:08x}")
+        assert rsp.data[2] == 0x28
+            else fail("ARCH burst target data2 mismatch got=0x${rsp.data[2]:08x}")
+        assert rsp.data[3] == 0x2c
+            else fail("ARCH burst target data3 mismatch got=0x${rsp.data[3]:08x}")
+        assert rsp.len == 3
+            else fail("ARCH burst target len mismatch got=${rsp.len}, expected 3")
+        assert rsp.resp == 0
+            else fail("ARCH burst target resp mismatch got=${rsp.resp}, expected 0")
+
+        assert dut.read_count == 1
+            else fail("ARCH burst target read_count=${dut.read_count}, expected 1")
+        assert dut.last_addr == 0x20
+            else fail("ARCH burst target last_addr=0x${dut.last_addr:08x}, expected 0x20")
+        assert dut.last_len == 3
+            else fail("ARCH burst target last_len=${dut.last_len}, expected 3")
+
+        log(info, "ALL TESTS PASSED - tlm_pairing_arch_burst_target_test")
+    end run
+end impl TlmPairingArchBurstTargetTest
