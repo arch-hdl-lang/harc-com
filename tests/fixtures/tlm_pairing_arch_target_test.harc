@@ -7,6 +7,7 @@
 bus PairingMemBus
     tlm_method read(addr: uint<8>) -> uint<32>: blocking;
     tlm_method write(addr: uint<8>, data: uint<32>) -> bool: blocking;
+    tlm_method read_ooo(addr: uint<8>) -> uint<32>: out_of_order tags 2;
 end bus PairingMemBus
 
 testbench TlmPairingArchTargetTb
@@ -40,6 +41,20 @@ impl TlmPairingArchTargetTest for TlmPairingArchTargetTb
             else fail("ARCH target write_count=${dut.write_count}, expected 1")
         assert dut.write_checksum == 0xABCDEF00
             else fail("ARCH target checksum got=0x${dut.write_checksum:08x}, expected 0xABCDEF00")
+
+        let ooo0 = fork mem.read_ooo(11)
+        wait 1 cycle
+        let ooo1 = fork mem.read_ooo(12)
+        join_all
+
+        assert ooo0 == 0x3000000B
+            else fail("ARCH target OOO response 0 mismatch got=0x${ooo0:08x}, expected 0x3000000B")
+        assert ooo1 == 0x4000000C
+            else fail("ARCH target OOO response 1 mismatch got=0x${ooo1:08x}, expected 0x4000000C")
+        assert dut.ooo0_count == 1
+            else fail("ARCH target ooo0_count=${dut.ooo0_count}, expected 1")
+        assert dut.ooo1_count == 1
+            else fail("ARCH target ooo1_count=${dut.ooo1_count}, expected 1")
 
         log(info, "ALL TESTS PASSED - tlm_pairing_arch_target_test")
     end run

@@ -7,12 +7,15 @@
 bus PairingMemBus
     tlm_method read(addr: uint<8>) -> uint<32>: blocking;
     tlm_method write(addr: uint<8>, data: uint<32>) -> bool: blocking;
+    tlm_method read_ooo(addr: uint<8>) -> uint<32>: out_of_order tags 2;
 end bus PairingMemBus
 
 transactor PairingMemTarget bound to PairingMemBus
     read_count : uint<8> default 0
     write_count : uint<8> default 0
     write_checksum : uint<32> default 0
+    ooo_count : uint<8> default 0
+    ooo_checksum : uint<32> default 0
 
     thread bus.read(addr: uint<8>)
         read_count = read_count + 1
@@ -25,6 +28,18 @@ transactor PairingMemTarget bound to PairingMemBus
         write_checksum = write_checksum + (data ^ addr)
         wait 1 cycle
         return (data & 0xFF) == addr
+    end thread
+
+    thread bus.read_ooo(addr: uint<8>)
+        ooo_count = ooo_count + 1
+        ooo_checksum = ooo_checksum + addr
+        if addr < 12
+            wait 4 cycles
+            return 0x50000000 + addr
+        else
+            wait 1 cycle
+            return 0x60000000 + addr
+        end if
     end thread
 end transactor PairingMemTarget
 
@@ -59,6 +74,15 @@ impl TlmPairingArchInitiatorTest for TlmPairingArchInitiatorTb
             else fail("HARC target write_count=${target.write_count}, expected 1")
         assert target.write_checksum == 0xABCDEF00
             else fail("HARC target checksum got=0x${target.write_checksum:08x}, expected 0xABCDEF00")
+
+        assert dut.ooo0 == 0x5000000B
+            else fail("ARCH initiator OOO read0 mismatch got=0x${dut.ooo0:08x}, expected 0x5000000B")
+        assert dut.ooo1 == 0x6000000C
+            else fail("ARCH initiator OOO read1 mismatch got=0x${dut.ooo1:08x}, expected 0x6000000C")
+        assert target.ooo_count == 2
+            else fail("HARC target ooo_count=${target.ooo_count}, expected 2")
+        assert target.ooo_checksum == 23
+            else fail("HARC target ooo_checksum=${target.ooo_checksum}, expected 23")
 
         log(info, "ALL TESTS PASSED - tlm_pairing_arch_initiator_test")
     end run

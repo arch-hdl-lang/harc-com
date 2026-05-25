@@ -12,6 +12,7 @@
 bus PairingMemBus
   tlm_method read(addr: UInt<8>) -> UInt<32>: blocking;
   tlm_method write(addr: UInt<8>, data: UInt<32>) -> Bool: blocking;
+  tlm_method read_ooo(addr: UInt<8>) -> UInt<32>: out_of_order tags 2;
 end bus PairingMemBus
 
 /// Bring the pairing TLM bus into scope for module ports.
@@ -25,14 +26,20 @@ module TlmPairingArchTarget
   port read_count: out UInt<8>;
   port write_count: out UInt<8>;
   port write_checksum: out UInt<32>;
+  port ooo0_count: out UInt<8>;
+  port ooo1_count: out UInt<8>;
 
   reg read_count_r: UInt<8> reset rst => 0;
   reg write_count_r: UInt<8> reset rst => 0;
   reg write_checksum_r: UInt<32> reset rst => 0;
+  reg ooo0_count_r: UInt<8> reset rst => 0;
+  reg ooo1_count_r: UInt<8> reset rst => 0;
 
   let read_count = read_count_r;
   let write_count = write_count_r;
   let write_checksum = write_checksum_r;
+  let ooo0_count = ooo0_count_r;
+  let ooo1_count = ooo1_count_r;
 
   thread mem.read(addr) on clk rising, rst high
     read_count_r <= read_count_r +% 8'd1;
@@ -46,4 +53,16 @@ module TlmPairingArchTarget
     wait 1 cycle;
     return data[7:0] == addr;
   end thread mem.write
+
+  thread mem.read_ooo[0](addr) on clk rising, rst high
+    ooo0_count_r <= ooo0_count_r +% 8'd1;
+    wait 4 cycle;
+    return 32'h3000_0000 +% addr.zext<32>();
+  end thread mem.read_ooo
+
+  thread mem.read_ooo[1](addr) on clk rising, rst high
+    ooo1_count_r <= ooo1_count_r +% 8'd1;
+    wait 1 cycle;
+    return 32'h4000_0000 +% addr.zext<32>();
+  end thread mem.read_ooo
 end module TlmPairingArchTarget
