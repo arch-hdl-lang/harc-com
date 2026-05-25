@@ -202,16 +202,15 @@ end test WaveTest
     );
     assert!(cpp.contains("using HarcTraceC = VerilatedVcdC;"));
     assert!(cpp.contains("using HarcTraceC = VerilatedFstC;"));
-    // Setup, dump, teardown emitted inside the run_<TestName>
-    // function — gated by `#if HARC_TRACE_ENABLED` so they vanish
-    // in a non-waves build.
+    // Setup is gated by `#if HARC_TRACE_ENABLED`; dump/log/teardown call
+    // runtime macros that compile away in a non-waves build.
     assert!(cpp.contains("Verilated::traceEverOn(true);"));
     assert!(cpp.contains("HarcTraceC* tfp = new HarcTraceC;"));
     assert!(cpp.contains("harc_rt::log::harc_open_wave_trace(dut, tfp, harc_rt::log::harc_wave_default_name());"));
-    assert!(cpp.contains("harc_rt::log::harc_log_wave_file(log_ctx.sim_log, _wave_path);"));
-    assert!(cpp.contains("harc_rt::log::harc_dump_wave_trace(tfp, _trace_time++);"));
+    assert!(cpp.contains("HARC_RT_LOG_WAVE_FILE(log_ctx.sim_log, _wave_path);"));
+    assert!(cpp.contains("HARC_RT_DUMP_WAVE_TRACE(tfp, _trace_time++);"));
     assert!(cpp.contains("HARC_RT_WRITE_COVERAGE(Verilated::threadContextp()->coveragep());"));
-    assert!(cpp.contains("harc_rt::log::harc_close_wave_trace(tfp);"));
+    assert!(cpp.contains("HARC_RT_CLOSE_WAVE_TRACE(tfp);"));
 }
 
 #[test]
