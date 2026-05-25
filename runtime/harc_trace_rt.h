@@ -112,5 +112,16 @@ struct HarcTraceWriter {
     }
 };
 
+inline void harc_start_trace(
+    HarcTraceWriter& trace,
+    uint64_t seed,
+    const char* top,
+    const char* test,
+    int cycle) {
+    trace.open_env();
+    trace.meta_env(seed, top, test);
+    trace.sim_start(cycle);
+}
+
 } // namespace trace
 } // namespace harc_rt
