@@ -5413,12 +5413,30 @@ end test T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("target TLM thread should lower");
+    let capture_pos = cpp
+        .find("uint64_t addr = (uint64_t)harc_rt::harc_read(dut->b_read_addr);")
+        .expect("target responder should capture request args");
+    let edge_wait_pos = capture_pos
+        + cpp[capture_pos..]
+            .find("co_await harc_rt::wait_cycles(_slot, 1);")
+            .expect("target responder should keep req_ready high through a sampling edge");
+    let ready_low_pos = edge_wait_pos
+        + cpp[edge_wait_pos..]
+            .find("dut->b_read_req_ready = 0;")
+            .expect("target responder should deassert req_ready after the sampling edge");
+    let body_wait_pos = ready_low_pos
+        + cpp[ready_low_pos..]
+            .find("co_await harc_rt::wait_cycles(_slot, 1);")
+            .expect("target responder should preserve body wait statements after request capture");
     assert!(
         cpp.contains("_target_read_target_slot")
             && cpp.contains("dut->b_read_req_ready = 1;")
             && cpp.contains("harc_rt::harc_assign(_tlm_rsp_value, 256 + addr);")
             && cpp.contains("harc_rt::harc_assign(dut->b_read_rsp_data, _tlm_rsp_value);")
-            && cpp.contains("dut->b_read_rsp_valid = 1;"),
+            && cpp.contains("dut->b_read_rsp_valid = 1;")
+            && capture_pos < edge_wait_pos
+            && edge_wait_pos < ready_low_pos
+            && ready_low_pos < body_wait_pos,
         "expected target responder actor shape; got:\n{cpp}"
     );
 }
