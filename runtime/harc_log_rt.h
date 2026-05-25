@@ -41,6 +41,16 @@ inline std::string harc_wave_output_path(const char* default_name) {
     return harc_resolve_log_path(default_name);
 }
 
+inline const char* harc_wave_default_name() {
+#if defined(HARC_TRACE_VCD)
+    return "waves.vcd";
+#elif defined(HARC_TRACE_FST)
+    return "waves.fst";
+#else
+    return "waves.vcd";
+#endif
+}
+
 inline int harc_trace_depth(
     const char* env_name = "HARC_TRACE_DEPTH",
     int fallback_depth = 99) {
