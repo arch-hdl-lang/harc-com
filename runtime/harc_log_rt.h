@@ -70,6 +70,12 @@ inline std::string harc_open_wave_trace(
     return wave_path;
 }
 
+template <typename TraceT>
+inline void harc_dump_wave_trace(TraceT* trace, uint64_t timestamp) {
+    if (!trace) return;
+    trace->dump(timestamp);
+}
+
 inline void harc_report_unknown_test(const char* test_name, const char* available_tests) {
     std::fprintf(
         stderr,

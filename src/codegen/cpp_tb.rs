@@ -1036,8 +1036,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         // selects the output path; `HARC_TRACE_DEPTH` selects the
         // hierarchy depth passed to `dut->trace()`. `_trace_time` is
         // a monotonically increasing dump cursor — its absolute
-        // units do not matter, only that successive `tfp->dump`
-        // calls receive strictly-increasing values so GTKWave /
+        // units do not matter, only that successive dump helper calls
+        // receive strictly-increasing values so GTKWave /
         // surfer can order events.
         writeln!(e.out, "#if HARC_TRACE_ENABLED").ok();
         writeln!(e.out, "{INDENT}Verilated::traceEverOn(true);").ok();
@@ -1121,13 +1121,13 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             writeln!(e.out, "{INDENT}{INDENT}dut->clk = 0; dut->eval();").ok();
             writeln!(
                 e.out,
-                "#if HARC_TRACE_ENABLED\n{INDENT}{INDENT}tfp->dump(_trace_time++);\n#endif"
+                "#if HARC_TRACE_ENABLED\n{INDENT}{INDENT}harc_rt::log::harc_dump_wave_trace(tfp, _trace_time++);\n#endif"
             )
             .ok();
             writeln!(e.out, "{INDENT}{INDENT}dut->clk = 1; dut->eval();").ok();
             writeln!(
                 e.out,
-                "#if HARC_TRACE_ENABLED\n{INDENT}{INDENT}tfp->dump(_trace_time++);\n#endif"
+                "#if HARC_TRACE_ENABLED\n{INDENT}{INDENT}harc_rt::log::harc_dump_wave_trace(tfp, _trace_time++);\n#endif"
             )
             .ok();
             writeln!(e.out, "{INDENT}{INDENT}cycle_count++;").ok();
@@ -1143,7 +1143,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             .ok();
             writeln!(
                 e.out,
-                "#if HARC_TRACE_ENABLED\n{INDENT}{INDENT}if (!_post_eval_services.empty()) tfp->dump(_trace_time++);\n#endif"
+                "#if HARC_TRACE_ENABLED\n{INDENT}{INDENT}if (!_post_eval_services.empty()) harc_rt::log::harc_dump_wave_trace(tfp, _trace_time++);\n#endif"
             )
             .ok();
             writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
@@ -1248,7 +1248,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             writeln!(e.out, "{INDENT}{INDENT}{INDENT}dut->eval();").ok();
             writeln!(
                 e.out,
-                "#if HARC_TRACE_ENABLED\n{INDENT}{INDENT}{INDENT}tfp->dump((uint64_t)now_ps);\n#endif"
+                "#if HARC_TRACE_ENABLED\n{INDENT}{INDENT}{INDENT}harc_rt::log::harc_dump_wave_trace(tfp, (uint64_t)now_ps);\n#endif"
             )
             .ok();
             writeln!(
@@ -1258,7 +1258,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             .ok();
             writeln!(
                 e.out,
-                "#if HARC_TRACE_ENABLED\n{INDENT}{INDENT}{INDENT}if (_primary_rising && !_post_eval_services.empty()) tfp->dump((uint64_t)now_ps);\n#endif"
+                "#if HARC_TRACE_ENABLED\n{INDENT}{INDENT}{INDENT}if (_primary_rising && !_post_eval_services.empty()) harc_rt::log::harc_dump_wave_trace(tfp, (uint64_t)now_ps);\n#endif"
             )
             .ok();
             writeln!(e.out, "{INDENT}{INDENT}}}").ok();
@@ -1774,7 +1774,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             writeln!(e.out, "{INDENT}dut->clk = 0; dut->eval();").ok();
             writeln!(
                 e.out,
-                "#if HARC_TRACE_ENABLED\n{INDENT}tfp->dump(_trace_time++);\n#endif"
+                "#if HARC_TRACE_ENABLED\n{INDENT}harc_rt::log::harc_dump_wave_trace(tfp, _trace_time++);\n#endif"
             )
             .ok();
             writeln!(
@@ -1786,7 +1786,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             writeln!(e.out, "{INDENT}{INDENT}dut->clk = 1; dut->eval();").ok();
             writeln!(
                 e.out,
-                "#if HARC_TRACE_ENABLED\n{INDENT}{INDENT}tfp->dump(_trace_time++);\n#endif"
+                "#if HARC_TRACE_ENABLED\n{INDENT}{INDENT}harc_rt::log::harc_dump_wave_trace(tfp, _trace_time++);\n#endif"
             )
             .ok();
             writeln!(e.out, "{INDENT}{INDENT}cycle_count++;").ok();
@@ -1802,7 +1802,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             .ok();
             writeln!(
                 e.out,
-                "#if HARC_TRACE_ENABLED\n{INDENT}{INDENT}if (!_post_eval_services.empty()) tfp->dump(_trace_time++);\n#endif"
+                "#if HARC_TRACE_ENABLED\n{INDENT}{INDENT}if (!_post_eval_services.empty()) harc_rt::log::harc_dump_wave_trace(tfp, _trace_time++);\n#endif"
             )
             .ok();
             // Then advance the run coroutine for the next cycle's inputs.
@@ -1815,7 +1815,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             writeln!(e.out, "{INDENT}{INDENT}dut->clk = 0; dut->eval();").ok();
             writeln!(
                 e.out,
-                "#if HARC_TRACE_ENABLED\n{INDENT}{INDENT}tfp->dump(_trace_time++);\n#endif"
+                "#if HARC_TRACE_ENABLED\n{INDENT}{INDENT}harc_rt::log::harc_dump_wave_trace(tfp, _trace_time++);\n#endif"
             )
             .ok();
             writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
@@ -1834,7 +1834,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             writeln!(e.out, "{INDENT}dut->eval();").ok();
             writeln!(
                 e.out,
-                "#if HARC_TRACE_ENABLED\n{INDENT}tfp->dump((uint64_t)now_ps);\n#endif"
+                "#if HARC_TRACE_ENABLED\n{INDENT}harc_rt::log::harc_dump_wave_trace(tfp, (uint64_t)now_ps);\n#endif"
             )
             .ok();
             writeln!(
