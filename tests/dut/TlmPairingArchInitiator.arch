@@ -12,12 +12,13 @@
 bus PairingMemBus
   tlm_method read(addr: UInt<8>) -> UInt<32>: blocking;
   tlm_method write(addr: UInt<8>, data: UInt<32>) -> Bool: blocking;
+  tlm_method read_ooo(addr: UInt<8>) -> UInt<32>: out_of_order tags 2;
 end bus PairingMemBus
 
 /// Bring the pairing TLM bus into scope for module ports.
 use PairingMemBus;
 
-/// ARCH initiator that issues serialized read/write TLM calls.
+/// ARCH initiator that issues one-shot read/write and tagged OOO TLM calls.
 module TlmPairingArchInitiator
   port clk: in Clock<SysDomain>;
   port rst: in Reset<Sync>;
@@ -27,23 +28,39 @@ module TlmPairingArchInitiator
   port read0: out UInt<32>;
   port read1: out UInt<32>;
   port write_ack: out Bool;
+  port ooo0: out UInt<32>;
+  port ooo1: out UInt<32>;
 
-  reg done_r: Bool reset rst => false;
+  reg rw_done_r: Bool reset rst => false;
+  reg ooo_done_r: Bool reset rst => false;
   reg read0_r: UInt<32> reset rst => 0;
   reg read1_r: UInt<32> reset rst => 0;
   reg write_ack_r: Bool reset rst => false;
+  reg ooo0_r: UInt<32> reset rst => 0;
+  reg ooo1_r: UInt<32> reset rst => 0;
 
-  let done = done_r;
+  let done = rw_done_r and ooo_done_r;
   let read0 = read0_r;
   let read1 = read1_r;
   let write_ack = write_ack_r;
+  let ooo0 = ooo0_r;
+  let ooo1 = ooo1_r;
 
-  thread driver on clk rising, rst high
-    if start and not done_r
+  thread rw_driver on clk rising, rst high
+    if start and not rw_done_r
       read0_r <= mem.read(8'd5);
       write_ack_r <= mem.write(8'd9, 32'hABCD_EF09);
       read1_r <= mem.read(8'd7);
-      done_r <= true;
+      rw_done_r <= true;
     end if
-  end thread driver
+  end thread rw_driver
+
+  thread ooo_driver on clk rising, rst high
+    wait 5 cycle;
+    ooo0_r <= fork mem.read_ooo(8'd11);
+    wait 3 cycle;
+    ooo1_r <= fork mem.read_ooo(8'd12);
+    join all;
+    ooo_done_r <= true;
+  end thread ooo_driver
 end module TlmPairingArchInitiator

@@ -218,8 +218,8 @@ The resolver checks CLI flags first, then `HARC_Z3_INCLUDE_DIR` / `HARC_Z3_LIB_D
 | `tlm_target_forwarding_test.harc` | `TlmForwardingTop.sv` | target responder forwarding a request to a second TLM method |
 | `tlm_target_fork_forwarding_test.harc` | `TlmForkForwardingTop.sv` | target responder issuing downstream OOO TLM calls before responding |
 | `tlm_target_ooo_lanes_test.harc` | `TlmOooReadInitiatorPair.sv` | OOO target responder accepting multiple front-side tagged requests |
-| `tlm_pairing_arch_target_test.harc` | `TlmPairingArchTarget.sv` | HARC initiator driving an ARCH-authored TLM target responder |
-| `tlm_pairing_arch_initiator_test.harc` | `TlmPairingArchInitiator.sv` | ARCH-authored TLM initiator served by a HARC target responder |
+| `tlm_pairing_arch_target_test.harc` | `TlmPairingArchTarget.sv` | HARC initiator driving ARCH-authored blocking and tagged-OOO TLM target responders |
+| `tlm_pairing_arch_initiator_test.harc` | `TlmPairingArchInitiator.sv` | ARCH-authored blocking and tagged-OOO TLM initiators served by HARC target responders |
 | `keep_constraints_test.harc` | `top_counter.sv` | transaction `keep` constraints (range, modulus, enum exclusion) |
 | `relation_inlining_test.harc` | `top_counter.sv` | `relation` inlining — block + alias + composite forms |
 | `heartbeat_idle_test.harc` | `top_counter.sv` | per-agent `_last_in_cycle` heartbeats + `idle(N)` predicate |

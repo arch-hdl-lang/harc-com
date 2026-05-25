@@ -26,8 +26,8 @@ These SystemVerilog files are snapshots of the corresponding modules in [`arch-h
 | `linklist_basic.sv` | `arch-com/examples/linklist_basic.sv` |
 | `cam_basic.sv` | `arch-com/tests/cam_basic.sv` |
 | `AxiLiteRegs.sv` | `arch-com/tests/axi_dma/AxiLiteRegs.sv` |
-| `TlmPairingArchTarget.sv` | `tests/dut/TlmPairingArchTarget.arch` via `arch build` |
-| `TlmPairingArchInitiator.sv` | `tests/dut/TlmPairingArchInitiator.arch` via `arch build` |
+| `TlmPairingArchTarget.sv` | `tests/dut/TlmPairingArchTarget.arch` via `arch build`; blocking and tagged-OOO TLM target responder conformance |
+| `TlmPairingArchInitiator.sv` | `tests/dut/TlmPairingArchInitiator.arch` via `arch build`; blocking and tagged-OOO TLM initiator conformance |
 
 ## Refreshing
 
