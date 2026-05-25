@@ -21,7 +21,7 @@ HARC's bet is that you can get UVM's language affordances (transactions, constra
 
 ## Status
 
-Pre-1.0. Stimulus → observation → scoreboard → properties/coverage → reference-model comparison → watchdog termination are all usable end-to-end. 56 fixtures pass against real Verilator-compiled SystemVerilog DUTs in CI. The ARCH cosim path (`--dut`) shares the same C++ TB emission and runs alongside `arch sim` for ARCH-authored DUTs.
+Pre-1.0. Stimulus → observation → scoreboard → properties/coverage → reference-model comparison → watchdog termination are all usable end-to-end. 86 fixtures pass against real Verilator-compiled SystemVerilog DUTs in CI. The ARCH cosim path (`--dut`) shares the same C++ TB emission and runs alongside `arch sim` for ARCH-authored DUTs.
 
 ## Install
 
@@ -165,7 +165,7 @@ graph LR
     style EmulPlatform stroke-dasharray: 5 5
 ```
 
-One `harc sim` invocation drives the v0 path (solid): it parses the `.harc` source (folding any sibling `extend test T` files), emits a single C++ testbench via the `cpp_tb` codegen, then chains through either Verilator (`--sv`) or `arch sim` (`--dut`) to compile the DUT alongside the TB, the runtime header, and any `--ref-src` reference models. The resulting binary self-tests at run time, exits zero on `ALL TESTS PASSED`, and writes per-test logs + an optional coverage database. CI runs [`tests/run_fixtures.sh`](tests/run_fixtures.sh) which does this for all 56 fixtures.
+One `harc sim` invocation drives the v0 path (solid): it parses the `.harc` source (folding any sibling `extend test T` files), emits a single C++ testbench via the `cpp_tb` codegen, then chains through either Verilator (`--sv`) or `arch sim` (`--dut`) to compile the DUT alongside the TB, the runtime header, and any `--ref-src` reference models. The resulting binary self-tests at run time, exits zero on `ALL TESTS PASSED`, and writes per-test logs + an optional coverage database. CI runs [`tests/run_fixtures.sh`](tests/run_fixtures.sh) which does this for all 86 fixtures.
 
 The dashed paths share the same parser + AST + IR; they branch at codegen by emitting a different target representation. Spec §10 documents the contracts (what survives the transpile cleanly, what's lossy) and the lowering tables. None of the three ship in v0 — the diagram exists so the reader can see where the language is going, not what it does today.
 
@@ -218,6 +218,8 @@ The resolver checks CLI flags first, then `HARC_Z3_INCLUDE_DIR` / `HARC_Z3_LIB_D
 | `tlm_target_forwarding_test.harc` | `TlmForwardingTop.sv` | target responder forwarding a request to a second TLM method |
 | `tlm_target_fork_forwarding_test.harc` | `TlmForkForwardingTop.sv` | target responder issuing downstream OOO TLM calls before responding |
 | `tlm_target_ooo_lanes_test.harc` | `TlmOooReadInitiatorPair.sv` | OOO target responder accepting multiple front-side tagged requests |
+| `tlm_pairing_arch_target_test.harc` | `TlmPairingArchTarget.sv` | HARC initiator driving an ARCH-authored TLM target responder |
+| `tlm_pairing_arch_initiator_test.harc` | `TlmPairingArchInitiator.sv` | ARCH-authored TLM initiator served by a HARC target responder |
 | `keep_constraints_test.harc` | `top_counter.sv` | transaction `keep` constraints (range, modulus, enum exclusion) |
 | `relation_inlining_test.harc` | `top_counter.sv` | `relation` inlining — block + alias + composite forms |
 | `heartbeat_idle_test.harc` | `top_counter.sv` | per-agent `_last_in_cycle` heartbeats + `idle(N)` predicate |
@@ -261,7 +263,8 @@ spec.md                   Language reference
 
 ```sh
 cargo test --release          # cargo tests (lib + codegen + round-trip)
-./tests/run_fixtures.sh       # 84 fixtures end-to-end via Verilator
+./tests/run_fixtures.sh       # 86 fixtures end-to-end via Verilator
+./tests/run_arch_dut_fixtures.sh  # optional ARCH --dut co-sim fixtures
 ```
 
 The fixture runner builds harc, then for each entry in its manifest: runs Verilator on the vendored `.sv` DUT (linking any `--ref-src` C/C++ files), builds against the HARC-generated C++ testbench, and asserts the binary prints `ALL TESTS PASSED`. CI runs the same script on every push and PR.

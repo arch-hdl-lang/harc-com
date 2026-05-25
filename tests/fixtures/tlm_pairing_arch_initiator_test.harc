@@ -1,0 +1,65 @@
+// ARCH initiator to HARC TLM target responder conformance test.
+//
+// The DUT is authored in ARCH and issues serialized TLM method calls from a
+// thread-lowered initiator. The HARC target responder serves those calls using
+// the same canonical req/rsp contract.
+
+bus PairingMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+    tlm_method write(addr: uint<8>, data: uint<32>) -> bool: blocking;
+end bus PairingMemBus
+
+transactor PairingMemTarget bound to PairingMemBus
+    read_count : uint<8> default 0
+    write_count : uint<8> default 0
+    write_checksum : uint<32> default 0
+
+    thread bus.read(addr: uint<8>)
+        read_count = read_count + 1
+        wait 1 cycle
+        return 0x20000000 + addr
+    end thread
+
+    thread bus.write(addr: uint<8>, data: uint<32>)
+        write_count = write_count + 1
+        write_checksum = write_checksum + (data ^ addr)
+        wait 1 cycle
+        return (data & 0xFF) == addr
+    end thread
+end transactor PairingMemTarget
+
+testbench TlmPairingArchInitiatorTb
+    dut : TlmPairingArchInitiator
+end testbench TlmPairingArchInitiatorTb
+
+impl TlmPairingArchInitiatorTest for TlmPairingArchInitiatorTb
+    let mem : PairingMemBus = bind dut
+    let target : PairingMemTarget passive = bind mem
+
+    run
+        dut.rst = 1
+        dut.start = 0
+        wait 3 cycles
+        dut.rst = 0
+        wait 1 cycle
+        dut.start = 1
+
+        wait until dut.done == 1 timeout 80 cycles fail("ARCH initiator did not complete HARC-served TLM calls")
+
+        assert dut.read0 == 0x20000005
+            else fail("ARCH initiator read0 mismatch got=0x${dut.read0:08x}, expected 0x20000005")
+        assert dut.write_ack
+            else fail("ARCH initiator write_ack was false")
+        assert dut.read1 == 0x20000007
+            else fail("ARCH initiator read1 mismatch got=0x${dut.read1:08x}, expected 0x20000007")
+
+        assert target.read_count == 2
+            else fail("HARC target read_count=${target.read_count}, expected 2")
+        assert target.write_count == 1
+            else fail("HARC target write_count=${target.write_count}, expected 1")
+        assert target.write_checksum == 0xABCDEF00
+            else fail("HARC target checksum got=0x${target.write_checksum:08x}, expected 0xABCDEF00")
+
+        log(info, "ALL TESTS PASSED - tlm_pairing_arch_initiator_test")
+    end run
+end impl TlmPairingArchInitiatorTest

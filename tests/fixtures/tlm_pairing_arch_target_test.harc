@@ -1,0 +1,46 @@
+// HARC initiator to ARCH TLM target responder conformance test.
+//
+// The DUT is authored in ARCH and exposes canonical TLM req/rsp pins after
+// lowering. The HARC test binds the same method contract and drives it as a
+// transaction-level initiator.
+
+bus PairingMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+    tlm_method write(addr: uint<8>, data: uint<32>) -> bool: blocking;
+end bus PairingMemBus
+
+testbench TlmPairingArchTargetTb
+    dut : TlmPairingArchTarget
+end testbench TlmPairingArchTargetTb
+
+impl TlmPairingArchTargetTest for TlmPairingArchTargetTb
+    let mem : PairingMemBus = bind dut
+
+    run
+        dut.rst = 1
+        wait 3 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        let read0 = mem.read(5)
+        assert read0 == 0x10000005
+            else fail("ARCH target read0 mismatch got=0x${read0:08x}, expected 0x10000005")
+
+        let ack = mem.write(9, 0xABCDEF09)
+        assert ack
+            else fail("ARCH target write ack was false")
+
+        let read1 = mem.read(7)
+        assert read1 == 0x10000007
+            else fail("ARCH target read1 mismatch got=0x${read1:08x}, expected 0x10000007")
+
+        assert dut.read_count == 2
+            else fail("ARCH target read_count=${dut.read_count}, expected 2")
+        assert dut.write_count == 1
+            else fail("ARCH target write_count=${dut.write_count}, expected 1")
+        assert dut.write_checksum == 0xABCDEF00
+            else fail("ARCH target checksum got=0x${dut.write_checksum:08x}, expected 0xABCDEF00")
+
+        log(info, "ALL TESTS PASSED - tlm_pairing_arch_target_test")
+    end run
+end impl TlmPairingArchTargetTest

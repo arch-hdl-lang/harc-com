@@ -1,0 +1,49 @@
+//! ---
+//! tags: [tlm_method, harc, conformance]
+//! refs:
+//!   - "HARC TLM pairing conformance fixture"
+//! ---
+//!
+//! ARCH TLM initiator used by HARC conformance tests. HARC binds a target
+//! responder to the canonical method pins and serves the ARCH thread-lowered
+//! read/write calls through the same synthesizable transaction contract.
+
+/// Small memory-like TLM bus shared by ARCH and HARC pairing tests.
+bus PairingMemBus
+  tlm_method read(addr: UInt<8>) -> UInt<32>: blocking;
+  tlm_method write(addr: UInt<8>, data: UInt<32>) -> Bool: blocking;
+end bus PairingMemBus
+
+/// Bring the pairing TLM bus into scope for module ports.
+use PairingMemBus;
+
+/// ARCH initiator that issues serialized read/write TLM calls.
+module TlmPairingArchInitiator
+  port clk: in Clock<SysDomain>;
+  port rst: in Reset<Sync>;
+  port start: in Bool;
+  port mem: initiator PairingMemBus;
+  port done: out Bool;
+  port read0: out UInt<32>;
+  port read1: out UInt<32>;
+  port write_ack: out Bool;
+
+  reg done_r: Bool reset rst => false;
+  reg read0_r: UInt<32> reset rst => 0;
+  reg read1_r: UInt<32> reset rst => 0;
+  reg write_ack_r: Bool reset rst => false;
+
+  let done = done_r;
+  let read0 = read0_r;
+  let read1 = read1_r;
+  let write_ack = write_ack_r;
+
+  thread driver on clk rising, rst high
+    if start and not done_r
+      read0_r <= mem.read(8'd5);
+      write_ack_r <= mem.write(8'd9, 32'hABCD_EF09);
+      read1_r <= mem.read(8'd7);
+      done_r <= true;
+    end if
+  end thread driver
+end module TlmPairingArchInitiator

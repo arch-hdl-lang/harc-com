@@ -1,0 +1,49 @@
+//! ---
+//! tags: [tlm_method, harc, conformance]
+//! refs:
+//!   - "HARC TLM pairing conformance fixture"
+//! ---
+//!
+//! ARCH target responder used by HARC conformance tests. The module exposes
+//! canonical TLM req/rsp pins after lowering so HARC can bind the same method
+//! contract through either arch sim or Verilator-built SystemVerilog.
+
+/// Small memory-like TLM bus shared by ARCH and HARC pairing tests.
+bus PairingMemBus
+  tlm_method read(addr: UInt<8>) -> UInt<32>: blocking;
+  tlm_method write(addr: UInt<8>, data: UInt<32>) -> Bool: blocking;
+end bus PairingMemBus
+
+/// Bring the pairing TLM bus into scope for module ports.
+use PairingMemBus;
+
+/// ARCH target responder for HARC initiator-side TLM calls.
+module TlmPairingArchTarget
+  port clk: in Clock<SysDomain>;
+  port rst: in Reset<Sync>;
+  port mem: target PairingMemBus;
+  port read_count: out UInt<8>;
+  port write_count: out UInt<8>;
+  port write_checksum: out UInt<32>;
+
+  reg read_count_r: UInt<8> reset rst => 0;
+  reg write_count_r: UInt<8> reset rst => 0;
+  reg write_checksum_r: UInt<32> reset rst => 0;
+
+  let read_count = read_count_r;
+  let write_count = write_count_r;
+  let write_checksum = write_checksum_r;
+
+  thread mem.read(addr) on clk rising, rst high
+    read_count_r <= read_count_r +% 8'd1;
+    wait 1 cycle;
+    return 32'h1000_0000 +% addr.zext<32>();
+  end thread mem.read
+
+  thread mem.write(addr, data) on clk rising, rst high
+    write_count_r <= write_count_r +% 8'd1;
+    write_checksum_r <= write_checksum_r +% (data ^ addr.zext<32>());
+    wait 1 cycle;
+    return data[7:0] == addr;
+  end thread mem.write
+end module TlmPairingArchTarget

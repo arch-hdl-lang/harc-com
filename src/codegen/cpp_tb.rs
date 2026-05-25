@@ -4791,8 +4791,6 @@ impl Emitter {
                 "co_await harc_rt::wait_until(_slot, [&]{{ return {root}->{req_valid} && {root}->{req_ready}; }});",
             )
             .ok();
-            self.pad(depth + 2);
-            writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
             for (param, (arg_name, arg_ty)) in t.params.iter().zip(method.args.iter()) {
                 let local_name = &param.name.name;
                 let local_ty = param.ty.as_ref().unwrap_or(arg_ty);
@@ -4809,6 +4807,8 @@ impl Emitter {
                 self.pad(depth + 2);
                 writeln!(self.out, "auto _tlm_req_tag = {root}->{req_tag};").ok();
             }
+            self.pad(depth + 2);
+            writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
             self.pad(depth + 2);
             writeln!(self.out, "{root}->{req_ready} = 0;").ok();
             self.pad(depth + 2);
