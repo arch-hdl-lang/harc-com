@@ -85,8 +85,8 @@ end test TraceTest
     assert!(cpp.contains("harc_rt::trace::HarcTraceWriter trace;"));
     assert!(cpp.contains("harc_rt::trace::harc_start_trace(trace, harc_rng.state, \"Top\", \"TraceTest\", cycle_count);"));
     assert!(cpp.contains("trace.randomize(cycle_count, _trace_fields);"));
-    assert!(cpp.contains("HARC_RT_LOG_PRINTF(sim_log, &trace, cycle_count, sev, fmt);"));
-    assert!(cpp.contains("return harc_rt::log::harc_finish_sim_run(sim_log, log_files, trace, cycle_count, errors);"));
+    assert!(cpp.contains("HARC_RT_LOG_PRINTF(log_ctx.sim_log, &trace, cycle_count, sev, fmt);"));
+    assert!(cpp.contains("return harc_rt::log::harc_finish_sim_run(log_ctx, trace, cycle_count, errors);"));
     assert!(cpp_tb::TRACE_RT_HEADER.contains("raw(\"assertion_failure\""));
 }
 
@@ -208,7 +208,7 @@ end test WaveTest
     assert!(cpp.contains("Verilated::traceEverOn(true);"));
     assert!(cpp.contains("HarcTraceC* tfp = new HarcTraceC;"));
     assert!(cpp.contains("harc_rt::log::harc_open_wave_trace(dut, tfp, _wave_default_name);"));
-    assert!(cpp.contains("harc_rt::log::harc_log_wave_file(sim_log, _wave_path);"));
+    assert!(cpp.contains("harc_rt::log::harc_log_wave_file(log_ctx.sim_log, _wave_path);"));
     assert!(cpp.contains("harc_rt::log::harc_dump_wave_trace(tfp, _trace_time++);"));
     assert!(cpp.contains("harc_rt::log::harc_write_coverage(Verilated::threadContextp()->coveragep());"));
     assert!(cpp.contains("harc_rt::log::harc_close_wave_trace(tfp);"));
@@ -1271,8 +1271,8 @@ end test T"#,
         "expected `_fatal = true;` in FATAL lowering"
     );
     assert!(
-        cpp.contains("sim_logf_line(log_files.get(\"detail.log\"), \"INFO\", \"detail: no effect\");"),
-        "expected logf to resolve files through HarcLogFiles directly; got:\n{cpp}"
+        cpp.contains("sim_logf_line(log_ctx.file(\"detail.log\"), \"INFO\", \"detail: no effect\");"),
+        "expected logf to resolve files through HarcLogContext directly; got:\n{cpp}"
     );
     assert!(
         !cpp.contains("get_log_file"),
