@@ -1073,9 +1073,12 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         // is defined so it lands in sim.log along with normal test output.
         writeln!(e.out, "{INDENT}harc_rng.seed_from_env();").ok();
         writeln!(e.out, "{INDENT}harc_rt::trace::HarcTraceWriter trace;").ok();
-        writeln!(e.out, "{INDENT}trace.open_env();").ok();
-        writeln!(e.out, "{INDENT}trace.meta_env(harc_rng.state, \"{dut_type}\", \"{}\");", test.name.name).ok();
-        writeln!(e.out, "{INDENT}trace.sim_start(cycle_count);").ok();
+        writeln!(
+            e.out,
+            "{INDENT}harc_rt::trace::harc_start_trace(trace, harc_rng.state, \"{dut_type}\", \"{}\", cycle_count);",
+            test.name.name
+        )
+        .ok();
         writeln!(e.out, "").ok();
         // sim.log captures every log()/assert/fail line with cycle + severity
         // prefix. Path is configurable via the HARC_SIM_LOG env var (so the
