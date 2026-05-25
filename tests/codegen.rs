@@ -5219,6 +5219,43 @@ end impl ComponentMethodStructReturnTest"#,
 }
 
 #[test]
+fn record_vec_field_lowers_to_array_and_pack_helpers() {
+    let parsed = parse_source(
+        r#"struct BurstResp
+    data : Vec<uint<32>, 4>
+    len : uint<3>
+    resp : uint<2>
+end struct BurstResp
+
+test VecRecordTest
+    let dut : DummyDut
+    run
+        let r : BurstResp
+        r.data[0] = 0x10
+        r.data[1] = 0x20
+        r.len = 2
+        r.resp = 0
+        assert r.data[0] == 0x10 else fail("bad d0")
+    end run
+end test VecRecordTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("std::array<uint64_t, 4> data = {};"),
+        "Vec record field should lower to fixed C++ array; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("static harc_rt::HarcWide<5> harc_pack_BurstResp"),
+        "bounded response records should get a packed bridge helper; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("value.data[3] = (uint64_t)harc_rt::harc_bits(_packed, 132, 101);"),
+        "bounded response records should unpack Vec lanes at ARCH packed offsets; got:\n{cpp}"
+    );
+}
+
+#[test]
 fn impl_for_testbench_preserves_testbench_dut_probes() {
     let parsed = parse_source(
         r#"testbench ProbeDutTb

@@ -24,6 +24,8 @@ fi
 read -r -d '' FIXTURES <<'EOF' || true
 tlm_pairing_arch_target_test    | TlmPairingArchTarget    | TlmPairingArchTarget.arch
 tlm_pairing_arch_initiator_test | TlmPairingArchInitiator | TlmPairingArchInitiator.arch
+tlm_pairing_arch_burst_target_test    | TlmPairingArchBurstTarget    | TlmPairingArchBurstTarget.arch
+tlm_pairing_arch_burst_initiator_test | TlmPairingArchBurstInitiator | TlmPairingArchBurstInitiator.arch
 EOF
 
 PASS=0

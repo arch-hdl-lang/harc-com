@@ -491,6 +491,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         components,
         covergroups,
         txn_fields,
+        record_fields,
         enums,
         enum_variants,
         properties,
@@ -590,6 +591,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     writeln!(e.out, "#include <cstdarg>").ok();
     writeln!(e.out, "#include <cstring>").ok();
     writeln!(e.out, "#include <string>").ok();
+    writeln!(e.out, "#include <array>").ok();
     writeln!(e.out, "#include <vector>").ok();
     writeln!(e.out, "#include <deque>").ok();
     writeln!(e.out, "#include <functional>").ok();
@@ -1982,6 +1984,7 @@ struct PendingTlmFork {
     method: String,
     sig_prefix: String,
     ret_var: Option<String>,
+    ret_ty: Option<TypeExpr>,
     tag: Option<u64>,
 }
 
@@ -3253,6 +3256,9 @@ struct Emitter {
     /// before main-body emission so the solver block can declare Z3 vars
     /// of the right widths and walk only the fields it should write back.
     txn_fields: std::collections::HashMap<String, Vec<TxnFieldInfo>>,
+    /// Struct/transaction name → direct declared fields. Used for value-record
+    /// C++ type lowering and packed TLM bridge helpers.
+    record_fields: std::collections::HashMap<String, Vec<Field>>,
     /// Per-transaction `keep` constraints (spec §4). `randomize(t)`
     /// — bare or with `with …` — merges these into the Z3 solver
     /// block so the constraints are enforced. Empty entry / missing
@@ -4810,12 +4816,21 @@ impl Emitter {
                     method.name.name
                 )
                 .ok();
+                let rsp_stmt = method
+                    .ret
+                    .as_ref()
+                    .map(|ret| {
+                        self.record_drive_stmt(
+                            ret,
+                            &format!("{root}->{rsp_data}"),
+                            "_tlm_rsp_value",
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        format!("harc_rt::harc_assign({root}->{rsp_data}, _tlm_rsp_value);")
+                    });
                 self.pad(depth + 2);
-                writeln!(
-                    self.out,
-                    "harc_rt::harc_assign({root}->{rsp_data}, _tlm_rsp_value);"
-                )
-                .ok();
+                writeln!(self.out, "{rsp_stmt}").ok();
             }
             self.current_component_instance = prior_inst;
             self.in_coroutine = prior_corout;
@@ -5233,12 +5248,23 @@ impl Emitter {
         self.pad(depth + 2);
         writeln!(self.out, "if (_sel >= 0) {{").ok();
         if method.ret.is_some() {
+            let rsp_stmt = method
+                .ret
+                .as_ref()
+                .map(|ret| {
+                    self.record_drive_stmt(
+                        ret,
+                        &format!("{root}->{rsp_data}"),
+                        &format!("{lane_rsp_data}[(size_t)_sel]"),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "harc_rt::harc_assign({root}->{rsp_data}, {lane_rsp_data}[(size_t)_sel]);"
+                    )
+                });
             self.pad(depth + 3);
-            writeln!(
-                self.out,
-                "harc_rt::harc_assign({root}->{rsp_data}, {lane_rsp_data}[(size_t)_sel]);"
-            )
-            .ok();
+            writeln!(self.out, "{rsp_stmt}").ok();
         }
         self.pad(depth + 3);
         writeln!(self.out, "{root}->{rsp_tag} = _sel;").ok();
@@ -6330,11 +6356,8 @@ impl Emitter {
             if let Some(ret) = &method.ret {
                 self.pad(depth);
                 let cty = self.record_field_c_type(ret);
-                writeln!(
-                    self.out,
-                    "{cty} {name} = harc_rt::harc_read({root}->{rsp_data});"
-                )
-                .ok();
+                let read_expr = self.record_unpack_expr(ret, &format!("{root}->{rsp_data}"));
+                writeln!(self.out, "{cty} {name} = {read_expr};").ok();
             }
         }
         self.pad(depth);
@@ -6489,6 +6512,7 @@ impl Emitter {
             method: method.name.name,
             sig_prefix,
             ret_var: let_name.map(|s| s.to_string()),
+            ret_ty: method.ret.clone(),
             tag,
         });
         true
@@ -6530,13 +6554,13 @@ impl Emitter {
                 .ok();
             }
             if let Some(var) = &p.ret_var {
+                let read_expr = p
+                    .ret_ty
+                    .as_ref()
+                    .map(|ty| self.record_unpack_expr(ty, &format!("{}->{}", p.root, rsp_data)))
+                    .unwrap_or_else(|| format!("harc_rt::harc_read({}->{})", p.root, rsp_data));
                 self.pad(depth);
-                writeln!(
-                    self.out,
-                    "{var} = harc_rt::harc_read({}->{});",
-                    p.root, rsp_data
-                )
-                .ok();
+                writeln!(self.out, "{var} = {read_expr};").ok();
             }
             self.pad(depth);
             if self.in_coroutine {
@@ -6588,13 +6612,13 @@ impl Emitter {
             )
             .ok();
             if let Some(var) = &p.ret_var {
+                let read_expr = p
+                    .ret_ty
+                    .as_ref()
+                    .map(|ty| self.record_unpack_expr(ty, &format!("{}->{}", p.root, rsp_data)))
+                    .unwrap_or_else(|| format!("harc_rt::harc_read({}->{})", p.root, rsp_data));
                 self.pad(depth + 3);
-                writeln!(
-                    self.out,
-                    "{var} = harc_rt::harc_read({}->{});",
-                    p.root, rsp_data
-                )
-                .ok();
+                writeln!(self.out, "{var} = {read_expr};").ok();
             }
             self.pad(depth + 3);
             writeln!(self.out, "{}->{} = 1;", p.root, rsp_ready).ok();
@@ -7850,6 +7874,7 @@ impl Emitter {
             if let Some(last) = name.segments.last() {
                 let n = &last.name;
                 if self.transactions.contains(n)
+                    || self.structs.contains(n)
                     || self.enums.contains_key(n)
                     || self.components.contains_key(n)
                     || self.scoreboards.contains(n)
@@ -8452,6 +8477,10 @@ impl Emitter {
                 .unwrap_or_else(|| "uint64_t".into());
             return format!("std::vector<{inner}>");
         }
+        if let Some((elem, len)) = fixed_vec_type_args(t) {
+            let inner = self.record_field_c_type(elem);
+            return format!("std::array<{inner}, {len}>");
+        }
         if let TypeExpr::Named { name, .. } = t {
             if let Some(last) = name.segments.last().map(|s| s.name.as_str()) {
                 if self.is_record_type(last) {
@@ -8460,6 +8489,252 @@ impl Emitter {
             }
         }
         txn_field_c_type(t)
+    }
+
+    fn packed_record_name(&self, t: &TypeExpr) -> Option<String> {
+        let TypeExpr::Named { name, .. } = t else {
+            return None;
+        };
+        let last = name.segments.last()?.name.clone();
+        self.is_record_type(&last).then_some(last)
+    }
+
+    fn packed_width(&self, t: &TypeExpr) -> Option<usize> {
+        if let Some((elem, len)) = fixed_vec_type_args(t) {
+            return self.packed_width(elem).map(|w| w * len);
+        }
+        match t {
+            TypeExpr::Builtin { name, args, .. } => match name {
+                BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => {
+                    Some(int_width_from_args(args).unwrap_or(64) as usize)
+                }
+                BuiltinTy::SInt | BuiltinTy::SIntCap => {
+                    Some(int_width_from_args(args).unwrap_or(64) as usize)
+                }
+                BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => Some(1),
+                BuiltinTy::Int => Some(32),
+                _ => None,
+            },
+            TypeExpr::Named { name, .. } => {
+                let last = name.segments.last()?.name.as_str();
+                let fields = self.record_fields.get(last)?;
+                fields
+                    .iter()
+                    .try_fold(0usize, |acc, f| self.packed_width(&f.ty).map(|w| acc + w))
+            }
+        }
+    }
+
+    fn record_drive_stmt(&self, ty: &TypeExpr, dst_expr: &str, value_expr: &str) -> String {
+        if let Some(name) = self.packed_record_name(ty) {
+            format!("harc_drive_{name}({dst_expr}, {value_expr});")
+        } else {
+            format!("harc_rt::harc_assign({dst_expr}, {value_expr});")
+        }
+    }
+
+    fn record_unpack_expr(&self, ty: &TypeExpr, raw_expr: &str) -> String {
+        if let Some(name) = self.packed_record_name(ty) {
+            format!("harc_unpack_{name}({raw_expr})")
+        } else {
+            format!("harc_rt::harc_read({raw_expr})")
+        }
+    }
+
+    fn emit_pack_bits(&mut self, ty: &TypeExpr, value_expr: &str, offset: usize, depth: usize) {
+        if let Some((elem, len)) = fixed_vec_type_args(ty) {
+            let Some(elem_w) = self.packed_width(elem) else {
+                return;
+            };
+            for i in 0..len {
+                self.emit_pack_bits(
+                    elem,
+                    &format!("{value_expr}[{i}]"),
+                    offset + i * elem_w,
+                    depth,
+                );
+            }
+            return;
+        }
+        if let Some(name) = self.packed_record_name(ty) {
+            let Some(width) = self.packed_width(ty) else {
+                return;
+            };
+            self.pad(depth);
+            writeln!(
+                self.out,
+                "harc_rt::harc_wide_write_bits(_packed, {offset}, {width}, harc_pack_{name}({value_expr}));"
+            )
+            .ok();
+            return;
+        }
+        let Some(width) = self.packed_width(ty) else {
+            return;
+        };
+        self.pad(depth);
+        writeln!(
+            self.out,
+            "harc_rt::harc_wide_write_bits(_packed, {offset}, {width}, {value_expr});"
+        )
+        .ok();
+    }
+
+    fn emit_unpack_bits(&mut self, ty: &TypeExpr, target_expr: &str, offset: usize, depth: usize) {
+        if let Some((elem, len)) = fixed_vec_type_args(ty) {
+            let Some(elem_w) = self.packed_width(elem) else {
+                return;
+            };
+            for i in 0..len {
+                self.emit_unpack_bits(
+                    elem,
+                    &format!("{target_expr}[{i}]"),
+                    offset + i * elem_w,
+                    depth,
+                );
+            }
+            return;
+        }
+        let Some(width) = self.packed_width(ty) else {
+            return;
+        };
+        let cty = self.record_field_c_type(ty);
+        self.pad(depth);
+        writeln!(
+            self.out,
+            "{target_expr} = ({cty})harc_rt::harc_bits(_packed, {hi}, {offset});",
+            hi = offset + width - 1
+        )
+        .ok();
+    }
+
+    fn emit_record_pack_helpers(&mut self, name: &str, fields: &[Field]) {
+        let Some(width) = fields
+            .iter()
+            .try_fold(0usize, |acc, f| self.packed_width(&f.ty).map(|w| acc + w))
+        else {
+            return;
+        };
+        let words = width.div_ceil(32).max(1);
+        writeln!(
+            self.out,
+            "static harc_rt::HarcWide<{words}> harc_pack_{name}(const {name}& value) {{"
+        )
+        .ok();
+        self.pad(1);
+        writeln!(self.out, "harc_rt::HarcWide<{words}> _packed{{}};").ok();
+        let mut offset = 0usize;
+        for f in fields.iter().rev() {
+            self.emit_pack_bits(&f.ty, &format!("value.{}", f.name.name), offset, 1);
+            offset += self.packed_width(&f.ty).unwrap_or(0);
+        }
+        self.pad(1);
+        writeln!(self.out, "return _packed;").ok();
+        writeln!(self.out, "}}").ok();
+        writeln!(
+            self.out,
+            "template<typename Raw> static {name} harc_unpack_{name}(const Raw& raw) {{"
+        )
+        .ok();
+        let raw_checks: Vec<String> = fields
+            .iter()
+            .map(|f| format!("raw.{}", f.name.name))
+            .collect();
+        if !raw_checks.is_empty() {
+            self.pad(1);
+            writeln!(
+                self.out,
+                "if constexpr (requires {{ {}; }}) {{",
+                raw_checks.join("; ")
+            )
+            .ok();
+            self.pad(2);
+            writeln!(self.out, "{name} value{{}};").ok();
+            for f in fields {
+                if let Some((_, len)) = fixed_vec_type_args(&f.ty) {
+                    for i in 0..len {
+                        self.pad(2);
+                        writeln!(
+                            self.out,
+                            "value.{0}[{i}] = raw.{0}[{i}];",
+                            f.name.name
+                        )
+                        .ok();
+                    }
+                } else {
+                    self.pad(2);
+                    writeln!(self.out, "value.{0} = raw.{0};", f.name.name).ok();
+                }
+            }
+            self.pad(2);
+            writeln!(self.out, "return value;").ok();
+            self.pad(1);
+            writeln!(self.out, "}} else {{").ok();
+        }
+        self.pad(1);
+        writeln!(
+            self.out,
+            "auto _packed = harc_rt::harc_wide_zext<{words}>(harc_rt::harc_read(raw));"
+        )
+        .ok();
+        self.pad(1);
+        writeln!(self.out, "{name} value{{}};").ok();
+        let mut offset = 0usize;
+        for f in fields.iter().rev() {
+            self.emit_unpack_bits(&f.ty, &format!("value.{}", f.name.name), offset, 1);
+            offset += self.packed_width(&f.ty).unwrap_or(0);
+        }
+        self.pad(1);
+        writeln!(self.out, "return value;").ok();
+        if !raw_checks.is_empty() {
+            self.pad(1);
+            writeln!(self.out, "}}").ok();
+        }
+        writeln!(self.out, "}}").ok();
+        writeln!(
+            self.out,
+            "template<typename Sig> static void harc_drive_{name}(Sig& sig, const {name}& value) {{"
+        )
+        .ok();
+        if !raw_checks.is_empty() {
+            self.pad(1);
+            writeln!(
+                self.out,
+                "if constexpr (requires {{ {}; }}) {{",
+                raw_checks
+                    .iter()
+                    .map(|s| s.replacen("raw.", "sig.", 1))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+            .ok();
+            for f in fields {
+                if let Some((_, len)) = fixed_vec_type_args(&f.ty) {
+                    for i in 0..len {
+                        self.pad(2);
+                        writeln!(
+                            self.out,
+                            "sig.{0}[{i}] = value.{0}[{i}];",
+                            f.name.name
+                        )
+                        .ok();
+                    }
+                } else {
+                    self.pad(2);
+                    writeln!(self.out, "sig.{0} = value.{0};", f.name.name).ok();
+                }
+            }
+            self.pad(1);
+            writeln!(self.out, "}} else {{").ok();
+            self.pad(2);
+            writeln!(self.out, "harc_rt::harc_assign(sig, harc_pack_{name}(value));").ok();
+            self.pad(1);
+            writeln!(self.out, "}}").ok();
+        } else {
+            self.pad(1);
+            writeln!(self.out, "harc_rt::harc_assign(sig, harc_pack_{name}(value));").ok();
+        }
+        writeln!(self.out, "}}").ok();
+        writeln!(self.out, "").ok();
     }
 
     fn local_value_c_type(&self, t: &TypeExpr) -> String {
@@ -8532,6 +8807,7 @@ impl Emitter {
         )
         .ok();
         writeln!(self.out, "").ok();
+        self.emit_record_pack_helpers(name, fields);
     }
 
     fn emit_record_randomize_fn(&mut self, name: &str, fields: &[Field]) {
@@ -14677,6 +14953,23 @@ fn list_elem_type(t: &TypeExpr) -> Option<&TypeExpr> {
     })
 }
 
+fn fixed_vec_type_args(t: &TypeExpr) -> Option<(&TypeExpr, usize)> {
+    let TypeExpr::Builtin {
+        name: BuiltinTy::Vec,
+        args,
+        ..
+    } = t
+    else {
+        return None;
+    };
+    let elem = match args.first()? {
+        TypeArg::Type(ty) => ty,
+        _ => return None,
+    };
+    let len = args.get(1).and_then(type_arg_const_usize)?;
+    Some((elem, len))
+}
+
 fn type_arg_const_usize(arg: &TypeArg) -> Option<usize> {
     match arg {
         TypeArg::Expr(e) => const_usize_expr(e),
@@ -14759,6 +15052,10 @@ fn txn_field_c_type(t: &TypeExpr) -> String {
             .unwrap_or_else(|| "uint64_t".into());
         return format!("std::vector<{inner}>");
     }
+    if let Some((elem, len)) = fixed_vec_type_args(t) {
+        let inner = txn_field_c_type(elem);
+        return format!("std::array<{inner}, {len}>");
+    }
     match t {
         TypeExpr::Builtin { name, args, .. } => match name {
             BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {
@@ -14782,7 +15079,7 @@ fn field_default(f: &Field) -> String {
     if let Some(d) = &f.default {
         return format_simple_expr(d);
     }
-    if is_list_type(&f.ty) {
+    if is_list_type(&f.ty) || fixed_vec_type_args(&f.ty).is_some() {
         return "{}".into();
     }
     match &f.ty {
@@ -15024,7 +15321,7 @@ fn cpp_sint_for_width(w: Option<u32>) -> String {
 }
 
 fn c_type_for(t: &TypeExpr) -> String {
-    if is_list_type(t) {
+    if is_list_type(t) || fixed_vec_type_args(t).is_some() {
         return txn_field_c_type(t);
     }
     match t {

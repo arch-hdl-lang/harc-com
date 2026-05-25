@@ -28,6 +28,8 @@ These SystemVerilog files are snapshots of the corresponding modules in [`arch-h
 | `AxiLiteRegs.sv` | `arch-com/tests/axi_dma/AxiLiteRegs.sv` |
 | `TlmPairingArchTarget.sv` | `tests/dut/TlmPairingArchTarget.arch` via `arch build`; blocking and tagged-OOO TLM target responder conformance |
 | `TlmPairingArchInitiator.sv` | `tests/dut/TlmPairingArchInitiator.arch` via `arch build`; blocking and tagged-OOO TLM initiator conformance |
+| `TlmPairingArchBurstTarget.sv` | `tests/dut/TlmPairingArchBurstTarget.arch` via `arch build`; bounded Vec+len+resp TLM target responder conformance |
+| `TlmPairingArchBurstInitiator.sv` | `tests/dut/TlmPairingArchBurstInitiator.arch` via `arch build`; bounded Vec+len+resp TLM initiator conformance |
 
 ## Refreshing
 

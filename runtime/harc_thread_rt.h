@@ -246,6 +246,29 @@ inline void harc_wide_set_bit(HarcWide<N>& v, unsigned bit) {
 }
 
 template<std::size_t N>
+inline void harc_wide_clear_bit(HarcWide<N>& v, unsigned bit) {
+    if (bit < N * 32) v.words[bit / 32] &= ~(uint32_t{1} << (bit % 32));
+}
+
+template<std::size_t N, typename Val>
+inline void harc_wide_write_bits(HarcWide<N>& dst, unsigned lo, unsigned width, const Val& value) {
+    for (unsigned b = 0; b < width && lo + b < N * 32; ++b) {
+        bool bit = false;
+        if constexpr (is_harc_wide_v<std::remove_cv_t<std::remove_reference_t<Val>>>) {
+            bit = harc_wide_get_bit(value, b);
+        } else {
+            const _harc_u128 raw = static_cast<_harc_u128>(value);
+            bit = b < 128 && ((raw >> b) & 1u);
+        }
+        if (bit) {
+            harc_wide_set_bit(dst, lo + b);
+        } else {
+            harc_wide_clear_bit(dst, lo + b);
+        }
+    }
+}
+
+template<std::size_t N>
 inline HarcWide<N> operator+(const HarcWide<N>& lhs, const HarcWide<N>& rhs) {
     HarcWide<N> out;
     uint64_t carry = 0;
@@ -407,7 +430,9 @@ inline HarcWide<N> operator%(const HarcWide<N>& lhs, const HarcWide<N>& rhs) {
 
 template<typename Sig, typename Val>
 inline void harc_assign(Sig& sig, Val val) {
-    if constexpr (std::is_arithmetic_v<Sig>) {
+    if constexpr (std::is_assignable_v<Sig&, Val>) {
+        sig = val;
+    } else if constexpr (std::is_arithmetic_v<Sig>) {
         if constexpr (is_harc_wide_v<Val>) {
             sig = static_cast<Sig>(static_cast<uint64_t>(val));
         } else {

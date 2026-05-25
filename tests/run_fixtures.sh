@@ -88,6 +88,8 @@ tlm_target_fork_forwarding_test | TlmForkForwardingTop | TlmForkForwardingTop.sv
 tlm_target_ooo_lanes_test | TlmOooReadInitiatorPair | TlmOooReadInitiatorPair.sv |
 tlm_pairing_arch_target_test | TlmPairingArchTarget | TlmPairingArchTarget.sv |
 tlm_pairing_arch_initiator_test | TlmPairingArchInitiator | TlmPairingArchInitiator.sv |
+tlm_pairing_arch_burst_target_test | TlmPairingArchBurstTarget | TlmPairingArchBurstTarget.sv |
+tlm_pairing_arch_burst_initiator_test | TlmPairingArchBurstInitiator | TlmPairingArchBurstInitiator.sv |
 dma_engine_test         | DmaEngine      | dma_engine.sv          |
 dma_engine_tlm_target_test | DmaEngineTlmMem | dma_engine_tlm_mem.sv dma_engine.sv |
 dma_engine_tlm_mem_model_test | DmaEngineTlmMem | dma_engine_tlm_mem.sv dma_engine.sv |

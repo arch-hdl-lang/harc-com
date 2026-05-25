@@ -1,0 +1,78 @@
+// ARCH initiator to HARC bounded-burst TLM target conformance test.
+//
+// The HARC transactor serves the same canonical response struct that ARCH uses
+// for bounded bursts. HARC packs the struct onto the lowered response pin and
+// the ARCH DUT unpacks it through its TLM method return.
+
+struct HarcBurstResp32x4
+    data : Vec<uint<32>, 4>
+    len : uint<3>
+    resp : uint<2>
+end struct HarcBurstResp32x4
+
+bus PairingBurstBus
+    tlm_method read_burst(addr: uint<32>, len: uint<3>) -> HarcBurstResp32x4: blocking;
+end bus PairingBurstBus
+
+transactor PairingBurstTarget bound to PairingBurstBus
+    read_count : uint<8> default 0
+    last_addr : uint<32> default 0
+    last_len : uint<3> default 0
+
+    thread bus.read_burst(addr: uint<32>, len: uint<3>)
+        read_count = read_count + 1
+        last_addr = addr
+        last_len = len
+        let rsp : HarcBurstResp32x4
+        rsp.data[0] = addr + 0x10
+        rsp.data[1] = addr + 0x14
+        rsp.data[2] = addr + 0x18
+        rsp.data[3] = addr + 0x1c
+        rsp.len = len
+        rsp.resp = 2
+        wait 1 cycle
+        return rsp
+    end thread
+end transactor PairingBurstTarget
+
+testbench TlmPairingArchBurstInitiatorTb
+    dut : TlmPairingArchBurstInitiator
+end testbench TlmPairingArchBurstInitiatorTb
+
+impl TlmPairingArchBurstInitiatorTest for TlmPairingArchBurstInitiatorTb
+    let mem : PairingBurstBus = bind dut
+    let target : PairingBurstTarget passive = bind mem
+
+    run
+        dut.rst = 1
+        dut.start = 0
+        wait 3 cycles
+        dut.rst = 0
+        wait 1 cycle
+        dut.start = 1
+
+        wait until dut.done == 1 timeout 80 cycles fail("ARCH burst initiator did not complete")
+
+        assert dut.data0 == 0x50
+            else fail("ARCH burst initiator data0 mismatch got=0x${dut.data0:08x}")
+        assert dut.data1 == 0x54
+            else fail("ARCH burst initiator data1 mismatch got=0x${dut.data1:08x}")
+        assert dut.data2 == 0x58
+            else fail("ARCH burst initiator data2 mismatch got=0x${dut.data2:08x}")
+        assert dut.data3 == 0x5c
+            else fail("ARCH burst initiator data3 mismatch got=0x${dut.data3:08x}")
+        assert dut.len_o == 4
+            else fail("ARCH burst initiator len mismatch got=${dut.len_o}, expected 4")
+        assert dut.resp_o == 2
+            else fail("ARCH burst initiator resp mismatch got=${dut.resp_o}, expected 2")
+
+        assert target.read_count == 1
+            else fail("HARC burst target read_count=${target.read_count}, expected 1")
+        assert target.last_addr == 0x40
+            else fail("HARC burst target last_addr=0x${target.last_addr:08x}, expected 0x40")
+        assert target.last_len == 4
+            else fail("HARC burst target last_len=${target.last_len}, expected 4")
+
+        log(info, "ALL TESTS PASSED - tlm_pairing_arch_burst_initiator_test")
+    end run
+end impl TlmPairingArchBurstInitiatorTest
