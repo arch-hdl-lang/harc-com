@@ -1981,6 +1981,8 @@ struct CoverInfo {
 #[derive(Debug, Clone)]
 struct PendingTlmFork {
     root: String,
+    component: String,
+    bus: String,
     method: String,
     sig_prefix: String,
     ret_var: Option<String>,
@@ -4775,6 +4777,15 @@ impl Emitter {
                 "{instance}._last_in_cycle = (uint64_t)cycle_count;"
             )
             .ok();
+            self.emit_tlm_call_trace_event(
+                instance,
+                "bus",
+                &method.name.name,
+                "request",
+                "target",
+                None,
+                depth + 2,
+            );
 
             let prev_subs = std::mem::replace(&mut self.field_subs, subs.clone());
             let mut saved_field_types = Vec::new();
@@ -4861,6 +4872,15 @@ impl Emitter {
                 self.pad(depth + 2);
                 writeln!(self.out, "{root}->{rsp_tag} = _tlm_req_tag;").ok();
             }
+            self.emit_tlm_call_trace_event(
+                instance,
+                "bus",
+                &method.name.name,
+                "response",
+                "target",
+                None,
+                depth + 2,
+            );
             self.pad(depth + 2);
             writeln!(self.out, "{root}->{rsp_valid} = 1;").ok();
             self.pad(depth + 2);
@@ -5064,6 +5084,15 @@ impl Emitter {
             "{instance}._last_in_cycle = (uint64_t)cycle_count;"
         )
         .ok();
+        self.emit_tlm_call_trace_event(
+            instance,
+            "bus",
+            &method.name.name,
+            "request",
+            "target",
+            Some("_tag"),
+            depth + 3,
+        );
         self.pad(depth + 2);
         writeln!(self.out, "}}").ok();
         self.pad(depth + 2);
@@ -5268,6 +5297,15 @@ impl Emitter {
         }
         self.pad(depth + 3);
         writeln!(self.out, "{root}->{rsp_tag} = _sel;").ok();
+        self.emit_tlm_call_trace_event(
+            instance,
+            "bus",
+            &method.name.name,
+            "response",
+            "target",
+            Some("_sel"),
+            depth + 3,
+        );
         self.pad(depth + 3);
         writeln!(self.out, "{root}->{rsp_valid} = 1;").ok();
         self.pad(depth + 3);
@@ -6308,6 +6346,7 @@ impl Emitter {
         let rsp_valid = self.bus_signal_name(&sig_prefix, &method.name.name, "rsp_valid");
         let rsp_ready = self.bus_signal_name(&sig_prefix, &method.name.name, "rsp_ready");
         let rsp_data = self.bus_signal_name(&sig_prefix, &method.name.name, "rsp_data");
+        let component = self.trace_component_context();
 
         self.pad(depth);
         writeln!(self.out, "// bus.{} tlm_method", method.name.name).ok();
@@ -6321,6 +6360,15 @@ impl Emitter {
             }
             writeln!(self.out, ");").ok();
         }
+        self.emit_tlm_call_trace_event(
+            &component,
+            &id.name,
+            &method.name.name,
+            "request",
+            "initiator",
+            None,
+            depth,
+        );
         self.pad(depth);
         writeln!(self.out, "{root}->{req_valid} = 1;").ok();
         self.pad(depth);
@@ -6352,6 +6400,15 @@ impl Emitter {
             )
             .ok();
         }
+        self.emit_tlm_call_trace_event(
+            &component,
+            &id.name,
+            &method.name.name,
+            "response",
+            "initiator",
+            None,
+            depth,
+        );
         if let Some(name) = let_name {
             if let Some(ret) = &method.ret {
                 self.pad(depth);
@@ -6434,6 +6491,7 @@ impl Emitter {
         }
 
         let ret_type = method.ret.as_ref().map(|t| self.record_field_c_type(t));
+        let component = self.trace_component_context();
         if let Some(name) = let_name {
             let cty = ret_type.clone().unwrap_or_else(|| "uint64_t".into());
             self.pad(depth);
@@ -6488,6 +6546,16 @@ impl Emitter {
             self.pad(depth);
             writeln!(self.out, "{root}->{req_tag} = {tag};").ok();
         }
+        let req_tag_expr = tag.map(|_| format!("{root}->{req_tag}"));
+        self.emit_tlm_call_trace_event(
+            &component,
+            &id.name,
+            &method.name.name,
+            "request",
+            "initiator",
+            req_tag_expr.as_deref(),
+            depth,
+        );
         self.pad(depth);
         writeln!(self.out, "{root}->{req_valid} = 1;").ok();
         self.pad(depth);
@@ -6509,6 +6577,8 @@ impl Emitter {
 
         self.pending_tlm_forks.push(PendingTlmFork {
             root,
+            component,
+            bus: id.name.clone(),
             method: method.name.name,
             sig_prefix,
             ret_var: let_name.map(|s| s.to_string()),
@@ -6562,6 +6632,15 @@ impl Emitter {
                 self.pad(depth);
                 writeln!(self.out, "{var} = {read_expr};").ok();
             }
+            self.emit_tlm_call_trace_event(
+                &p.component,
+                &p.bus,
+                &p.method,
+                "response",
+                "initiator",
+                None,
+                depth,
+            );
             self.pad(depth);
             if self.in_coroutine {
                 writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
@@ -6620,6 +6699,16 @@ impl Emitter {
                 self.pad(depth + 3);
                 writeln!(self.out, "{var} = {read_expr};").ok();
             }
+            let tag_expr = tag.to_string();
+            self.emit_tlm_call_trace_event(
+                &p.component,
+                &p.bus,
+                &p.method,
+                "response",
+                "initiator",
+                Some(&tag_expr),
+                depth + 3,
+            );
             self.pad(depth + 3);
             writeln!(self.out, "{}->{} = 1;", p.root, rsp_ready).ok();
             self.pad(depth + 3);
@@ -8887,6 +8976,37 @@ impl Emitter {
         writeln!(self.out, "trace.randomize(cycle_count, _trace_fields);").ok();
         self.pad(depth);
         writeln!(self.out, "}}").ok();
+    }
+
+    fn trace_component_context(&self) -> String {
+        self.current_component_instance.clone().unwrap_or_default()
+    }
+
+    fn emit_tlm_call_trace_event(
+        &mut self,
+        component: &str,
+        bus: &str,
+        method: &str,
+        phase: &str,
+        direction: &str,
+        tag: Option<&str>,
+        depth: usize,
+    ) {
+        self.pad(depth);
+        write!(
+            self.out,
+            "trace.tlm_call(cycle_count, \"{}\", \"{}\", \"{}\", \"{}\", \"{}\"",
+            escape_c(component),
+            escape_c(bus),
+            escape_c(method),
+            escape_c(phase),
+            escape_c(direction),
+        )
+        .ok();
+        if let Some(tag) = tag {
+            write!(self.out, ", (int64_t)({tag})").ok();
+        }
+        writeln!(self.out, ");").ok();
     }
 
     fn report_runtime_dependent_randomize_field_attrs(&mut self, ty: &str) {

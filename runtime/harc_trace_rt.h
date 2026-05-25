@@ -99,6 +99,26 @@ struct HarcTraceWriter {
         raw("randomize", cycle, fields_payload);
     }
 
+    void tlm_call(
+        int cycle,
+        const char* component,
+        const char* bus,
+        const char* method,
+        const char* phase,
+        const char* direction,
+        int64_t tag = -1) {
+        std::string payload =
+            "\"component\":\"" + harc_trace_escape(component ? component : "") +
+            "\",\"bus\":\"" + harc_trace_escape(bus ? bus : "") +
+            "\",\"method\":\"" + harc_trace_escape(method ? method : "") +
+            "\",\"phase\":\"" + harc_trace_escape(phase ? phase : "") +
+            "\",\"direction\":\"" + harc_trace_escape(direction ? direction : "") + "\"";
+        if (tag >= 0) {
+            payload += ",\"tag\":" + std::to_string(tag);
+        }
+        raw("tlm_call", cycle, payload);
+    }
+
     void log(int cycle, const char* sev, const std::string& msg) {
         std::string payload =
             "\"severity\":\"" + harc_trace_escape(sev ? sev : "") +
