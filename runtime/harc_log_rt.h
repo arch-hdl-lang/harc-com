@@ -213,14 +213,26 @@ struct HarcLogFiles {
     }
 };
 
+struct HarcLogContext {
+    FILE* sim_log = harc_open_sim_log();
+    HarcLogFiles files;
+
+    FILE* file(const char* path) {
+        return files.get(path);
+    }
+
+    void close_all() {
+        harc_close_file(sim_log);
+        files.close_all();
+    }
+};
+
 inline int harc_finish_sim_run(
-    FILE*& sim_log,
-    HarcLogFiles& log_files,
+    HarcLogContext& log,
     harc_rt::trace::HarcTraceWriter& trace,
     int cycle,
     int errors) {
-    harc_close_file(sim_log);
-    log_files.close_all();
+    log.close_all();
     trace.sim_end(cycle, errors);
     trace.close();
     return harc_report_test_result(errors);

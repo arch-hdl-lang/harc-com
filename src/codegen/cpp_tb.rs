@@ -1083,14 +1083,14 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         // sim.log captures every log()/assert/fail line with cycle + severity
         // prefix. Path is configurable via the HARC_SIM_LOG env var (so the
         // outer harness can put it in the build dir); default `sim.log` in cwd.
-        writeln!(e.out, "{INDENT}FILE* sim_log = harc_rt::log::harc_open_sim_log();").ok();
+        writeln!(e.out, "{INDENT}harc_rt::log::HarcLogContext log_ctx;").ok();
         // Echo the active waveform path into sim.log so post-mortem
         // log inspection links to the matching VCD/FST without
         // grepping stderr. No-op in non-trace builds.
         writeln!(e.out, "#if HARC_TRACE_ENABLED").ok();
         writeln!(
             e.out,
-            "{INDENT}harc_rt::log::harc_log_wave_file(sim_log, _wave_path);"
+            "{INDENT}harc_rt::log::harc_log_wave_file(log_ctx.sim_log, _wave_path);"
         )
         .ok();
         writeln!(e.out, "#endif").ok();
@@ -1285,7 +1285,6 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         // lambdas keep the varargs ABI; runtime helpers own the sinks.
         // Per-file log handles, opened on first reference, closed at exit.
         // Relative paths are anchored to HARC_LOG_DIR by the runtime helper.
-        writeln!(e.out, "{INDENT}harc_rt::log::HarcLogFiles log_files;").ok();
         writeln!(
             e.out,
             "{INDENT}auto sim_logf_line = [&](FILE* f, const char* sev, const char* fmt, ...) {{"
@@ -1309,7 +1308,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         .ok();
         writeln!(
             e.out,
-            "{INDENT}{INDENT}HARC_RT_LOG_PRINTF(sim_log, &trace, cycle_count, sev, fmt);"
+            "{INDENT}{INDENT}HARC_RT_LOG_PRINTF(log_ctx.sim_log, &trace, cycle_count, sev, fmt);"
         )
         .ok();
         writeln!(e.out, "{INDENT}}};").ok();
@@ -1926,7 +1925,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "").ok();
         writeln!(
             e.out,
-            "{INDENT}return harc_rt::log::harc_finish_sim_run(sim_log, log_files, trace, cycle_count, errors);"
+            "{INDENT}return harc_rt::log::harc_finish_sim_run(log_ctx, trace, cycle_count, errors);"
         )
         .ok();
         writeln!(e.out, "}}").ok();
@@ -12057,7 +12056,7 @@ impl Emitter {
     }
 
     /// Emit a `log` or `logf` call. When `file_path` is `Some`, lower to
-    /// `sim_logf_line(log_files.get(path), sev, fmt, args)`; otherwise lower
+    /// `sim_logf_line(log_ctx.file(path), sev, fmt, args)`; otherwise lower
     /// to `sim_log_line(sev, fmt, args)`. Severity / message extraction
     /// matches `log()`'s rules (first ident is severity; first string is
     /// the message).
@@ -12088,7 +12087,7 @@ impl Emitter {
             Some(p) => {
                 write!(
                     self.out,
-                    "sim_logf_line(log_files.get(\"{}\"), \"{}\", \"{}\"",
+                    "sim_logf_line(log_ctx.file(\"{}\"), \"{}\", \"{}\"",
                     escape_c(&p),
                     sev,
                     escape_c(&fmt)
