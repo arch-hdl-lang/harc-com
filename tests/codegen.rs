@@ -210,7 +210,7 @@ end test WaveTest
     assert!(cpp.contains("harc_rt::log::harc_open_wave_trace(dut, tfp, harc_rt::log::harc_wave_default_name());"));
     assert!(cpp.contains("harc_rt::log::harc_log_wave_file(log_ctx.sim_log, _wave_path);"));
     assert!(cpp.contains("harc_rt::log::harc_dump_wave_trace(tfp, _trace_time++);"));
-    assert!(cpp.contains("harc_rt::log::harc_write_coverage(Verilated::threadContextp()->coveragep());"));
+    assert!(cpp.contains("HARC_RT_WRITE_COVERAGE(Verilated::threadContextp()->coveragep());"));
     assert!(cpp.contains("harc_rt::log::harc_close_wave_trace(tfp);"));
 }
 

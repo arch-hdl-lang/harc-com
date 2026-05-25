@@ -336,3 +336,14 @@ inline void harc_log_file_only_vline(
         harc_rt::log::harc_log_file_only_vline(file, cycle, sev, fmt, _harc_log_ap); \
         va_end(_harc_log_ap); \
     } while (0)
+
+#if VM_COVERAGE
+#define HARC_RT_WRITE_COVERAGE(coverage) \
+    do { \
+        harc_rt::log::harc_write_coverage(coverage); \
+    } while (0)
+#else
+#define HARC_RT_WRITE_COVERAGE(coverage) \
+    do { \
+    } while (0)
+#endif
