@@ -1885,21 +1885,14 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             writeln!(e.out, "{INDENT}}}").ok();
         }
         writeln!(e.out, "{INDENT}dut->final();").ok();
-        // Verilator coverage write — only does anything when the TB was
-        // built with `harc sim --coverage` (which sets `--coverage` on
-        // verilator → defines `VM_COVERAGE=1`). The .dat file lands in
-        // $HARC_LOG_DIR (set by `harc sim`) so the CVDP-style scorer can
-        // post-process it with `verilator_coverage`. Always-emitted-but-
-        // ifdef'd so a coverage-built TB is the only difference.
-        writeln!(e.out, "#if VM_COVERAGE").ok();
-        writeln!(e.out, "{INDENT}{{").ok();
+        // Verilator coverage write — the runtime macro is a no-op unless the
+        // TB was built with `harc sim --coverage` (which sets `--coverage` on
+        // verilator → defines `VM_COVERAGE=1`).
         writeln!(
             e.out,
-            "{INDENT}{INDENT}harc_rt::log::harc_write_coverage(Verilated::threadContextp()->coveragep());"
+            "{INDENT}HARC_RT_WRITE_COVERAGE(Verilated::threadContextp()->coveragep());"
         )
         .ok();
-        writeln!(e.out, "{INDENT}}}").ok();
-        writeln!(e.out, "#endif").ok();
         // Waveform tracer teardown (issue #209). Must precede
         // `delete dut` because `tfp->close()` writes the
         // end-of-trace marker via the trace dispatcher held by the
