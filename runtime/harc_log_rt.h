@@ -296,3 +296,22 @@ inline void harc_log_file_only_vline(
 
 } // namespace log
 } // namespace harc_rt
+
+// These macros must run inside a variadic function or lambda; C++ cannot
+// portably forward `...` through a normal helper without first materializing
+// a va_list at the original call frame.
+#define HARC_RT_LOG_PRINTF(sim_log, trace, cycle, sev, fmt) \
+    do { \
+        va_list _harc_log_ap; \
+        va_start(_harc_log_ap, fmt); \
+        harc_rt::log::harc_log_vline(sim_log, trace, cycle, sev, fmt, _harc_log_ap); \
+        va_end(_harc_log_ap); \
+    } while (0)
+
+#define HARC_RT_LOG_FILE_ONLY_PRINTF(file, cycle, sev, fmt) \
+    do { \
+        va_list _harc_log_ap; \
+        va_start(_harc_log_ap, fmt); \
+        harc_rt::log::harc_log_file_only_vline(file, cycle, sev, fmt, _harc_log_ap); \
+        va_end(_harc_log_ap); \
+    } while (0)
