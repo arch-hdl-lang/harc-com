@@ -347,3 +347,28 @@ inline void harc_log_file_only_vline(
     do { \
     } while (0)
 #endif
+
+#if HARC_TRACE_ENABLED
+#define HARC_RT_LOG_WAVE_FILE(file, path) \
+    do { \
+        harc_rt::log::harc_log_wave_file(file, path); \
+    } while (0)
+#define HARC_RT_DUMP_WAVE_TRACE(trace, timestamp) \
+    do { \
+        harc_rt::log::harc_dump_wave_trace(trace, timestamp); \
+    } while (0)
+#define HARC_RT_CLOSE_WAVE_TRACE(trace) \
+    do { \
+        harc_rt::log::harc_close_wave_trace(trace); \
+    } while (0)
+#else
+#define HARC_RT_LOG_WAVE_FILE(file, path) \
+    do { \
+    } while (0)
+#define HARC_RT_DUMP_WAVE_TRACE(trace, timestamp) \
+    do { \
+    } while (0)
+#define HARC_RT_CLOSE_WAVE_TRACE(trace) \
+    do { \
+    } while (0)
+#endif
