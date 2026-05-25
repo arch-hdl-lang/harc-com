@@ -1,7 +1,7 @@
 // Target-side TLM fork-forwarding smoke test.
 //
-// The SV DUT issues two blocking reads on a front TLM bus. A passive HARC
-// target implements each front read by issuing two downstream out-of-order
+// The SV DUT issues two blocking reads on a front TLM bus. A HARC target
+// responder implements each front read by issuing two downstream out-of-order
 // TLM reads through a second bus, joining both responses, and returning a
 // combined result.
 

@@ -1,6 +1,6 @@
 // Target-side TLM responder early-return test.
 //
-// The passive target returns from nested `if` statements inside a runtime
+// The target responder returns from nested `if` statements inside a runtime
 // `for` loop. The responder epilogue must still drive rsp_data/rsp_valid and
 // re-arm for the next DUT-initiated request.
 

@@ -1,6 +1,6 @@
 // Target-side TLM responder branch test.
 //
-// The SV DUT issues two blocking read requests. The passive HARC target
+// The SV DUT issues two blocking read requests. The HARC target responder
 // branches on the captured request address, uses a local sequence snapshot,
 // runs a bounded response-prep loop, and updates persistent transactor state
 // between calls.

@@ -1,7 +1,7 @@
-// DMA memory-backed passive TLM target test.
+// DMA memory-backed TLM target responder test.
 //
-// This fixture keeps the smoke TLM fixture separate and makes the passive
-// target behave like a tiny memory model: source reads return stored payload
+// This fixture keeps the smoke TLM fixture separate and makes the target
+// responder behave like a tiny memory model: source reads return stored payload
 // words, destination writes update target-side state, and the final assertions
 // check that the DMA copied the source region into the destination region.
 

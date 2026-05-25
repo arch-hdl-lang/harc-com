@@ -1,7 +1,7 @@
 // Target-side TLM responder runtime-loop test.
 //
 // The SV DUT issues two blocking read requests with different runtime `len`
-// values. The passive HARC target computes a response accumulator with
+// values. The HARC target responder computes a response accumulator with
 // `for i in 0 .. len` before the terminal conditional return.
 
 bus TlmMemBus

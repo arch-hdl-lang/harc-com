@@ -1,9 +1,9 @@
 // Target-side out-of-order TLM lane test.
 //
 // The SV DUT issues two tagged read requests back-to-back and expects the
-// target to accept both before the first response is produced. The passive
-// HARC target uses one responder lane per tag, so tag 1 can return before tag
-// 0 while both responses still carry the correct tags.
+// target to accept both before the first response is produced. The HARC
+// target responder uses one lane per tag, so tag 1 can return before tag 0
+// while both responses still carry the correct tags.
 
 bus OooMemBus
     tlm_method read_ooo(addr: uint<8>) -> uint<32>: out_of_order tags 2;
