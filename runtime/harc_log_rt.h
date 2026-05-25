@@ -243,8 +243,7 @@ inline int harc_finish_sim_run(
     int cycle,
     int errors) {
     log.close_all();
-    trace.sim_end(cycle, errors);
-    trace.close();
+    harc_rt::trace::harc_finish_trace(trace, cycle, errors);
     return harc_report_test_result(errors);
 }
 

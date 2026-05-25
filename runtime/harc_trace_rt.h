@@ -123,5 +123,10 @@ inline void harc_start_trace(
     trace.sim_start(cycle);
 }
 
+inline void harc_finish_trace(HarcTraceWriter& trace, int cycle, int errors) {
+    trace.sim_end(cycle, errors);
+    trace.close();
+}
+
 } // namespace trace
 } // namespace harc_rt
