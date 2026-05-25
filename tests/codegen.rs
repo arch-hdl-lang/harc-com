@@ -88,6 +88,36 @@ end test TraceTest
     assert!(cpp.contains("HARC_RT_LOG_PRINTF(log_ctx.sim_log, &trace, cycle_count, sev, fmt);"));
     assert!(cpp.contains("return harc_rt::log::harc_finish_sim_run(log_ctx, trace, cycle_count, errors);"));
     assert!(cpp_tb::TRACE_RT_HEADER.contains("raw(\"assertion_failure\""));
+    assert!(cpp_tb::TRACE_RT_HEADER.contains("raw(\"tlm_call\""));
+}
+
+#[test]
+fn semantic_trace_tlm_method_calls_emit() {
+    let parsed = parse_source(
+        r#"bus B
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+    tlm_method read_ooo(addr: uint<8>) -> uint<32>: out_of_order tags 2;
+end bus B
+
+test T
+    let dut : SomeDut
+    let b : B = bind dut
+    run
+        let got = b.read(3)
+        let later = fork b.read_ooo(4)
+        join_all
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("trace.tlm_call(cycle_count, \"\", \"b\", \"read\", \"request\", \"initiator\");")
+            && cpp.contains("trace.tlm_call(cycle_count, \"\", \"b\", \"read\", \"response\", \"initiator\");")
+            && cpp.contains("trace.tlm_call(cycle_count, \"\", \"b\", \"read_ooo\", \"request\", \"initiator\", (int64_t)(dut->b_read_ooo_req_tag));")
+            && cpp.contains("trace.tlm_call(cycle_count, \"\", \"b\", \"read_ooo\", \"response\", \"initiator\", (int64_t)(0));"),
+        "expected initiator TLM trace events; got:\n{cpp}"
+    );
 }
 
 #[test]
@@ -5469,6 +5499,8 @@ end test T"#,
             && cpp.contains("dut->b_read_req_ready = 1;")
             && cpp.contains("harc_rt::harc_assign(_tlm_rsp_value, 256 + addr);")
             && cpp.contains("harc_rt::harc_assign(dut->b_read_rsp_data, _tlm_rsp_value);")
+            && cpp.contains("trace.tlm_call(cycle_count, \"target\", \"bus\", \"read\", \"request\", \"target\");")
+            && cpp.contains("trace.tlm_call(cycle_count, \"target\", \"bus\", \"read\", \"response\", \"target\");")
             && cpp.contains("dut->b_read_rsp_valid = 1;")
             && capture_pos < edge_wait_pos
             && edge_wait_pos < ready_low_pos
@@ -5622,6 +5654,8 @@ end test T"#,
             && cpp.contains("_target_read_target_ooo_lane0_slot")
             && cpp.contains("_target_read_target_ooo_lane1_slot")
             && cpp.contains("_target_read_target_ooo_arbiter_slot")
+            && cpp.contains("trace.tlm_call(cycle_count, \"target\", \"bus\", \"read\", \"request\", \"target\", (int64_t)(_tag));")
+            && cpp.contains("trace.tlm_call(cycle_count, \"target\", \"bus\", \"read\", \"response\", \"target\", (int64_t)(_sel));")
             && cpp.contains("dut->b_read_rsp_tag = _sel;"),
         "expected OOO target responder lane lowering; got:\n{cpp}"
     );
