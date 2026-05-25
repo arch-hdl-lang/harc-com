@@ -1291,14 +1291,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             "{INDENT}auto sim_logf_line = [&](FILE* f, const char* sev, const char* fmt, ...) {{"
         )
         .ok();
-        writeln!(e.out, "{INDENT}{INDENT}va_list ap;").ok();
-        writeln!(e.out, "{INDENT}{INDENT}va_start(ap, fmt);").ok();
         writeln!(
             e.out,
-            "{INDENT}{INDENT}harc_rt::log::harc_log_file_only_vline(f, cycle_count, sev, fmt, ap);"
+            "{INDENT}{INDENT}HARC_RT_LOG_FILE_ONLY_PRINTF(f, cycle_count, sev, fmt);"
         )
         .ok();
-        writeln!(e.out, "{INDENT}{INDENT}va_end(ap);").ok();
         writeln!(e.out, "{INDENT}}};").ok();
         writeln!(e.out, "").ok();
         // After sim_log_line below is defined, emit the seed line so it lands
@@ -1310,14 +1307,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             "{INDENT}auto sim_log_line = [&](const char* sev, const char* fmt, ...) {{"
         )
         .ok();
-        writeln!(e.out, "{INDENT}{INDENT}va_list ap;").ok();
-        writeln!(e.out, "{INDENT}{INDENT}va_start(ap, fmt);").ok();
         writeln!(
             e.out,
-            "{INDENT}{INDENT}harc_rt::log::harc_log_vline(sim_log, &trace, cycle_count, sev, fmt, ap);"
+            "{INDENT}{INDENT}HARC_RT_LOG_PRINTF(sim_log, &trace, cycle_count, sev, fmt);"
         )
         .ok();
-        writeln!(e.out, "{INDENT}{INDENT}va_end(ap);").ok();
         writeln!(e.out, "{INDENT}}};").ok();
         writeln!(e.out, "").ok();
 
