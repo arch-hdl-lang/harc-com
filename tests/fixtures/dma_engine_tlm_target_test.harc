@@ -1,8 +1,8 @@
-// DMA memory-side passive TLM target test.
+// DMA memory-side TLM target responder test.
 //
 // This keeps the existing raw-signal DMA BFM fixture intact. The SV wrapper
 // adapts DmaEngine's memory request side to canonical TLM req/rsp pins, while
-// this HARC passive transactor serves read/write methods with stateful target
+// this HARC target responder serves read/write methods with stateful target
 // TLM threads.
 
 bus DmaMemTlmBus
@@ -108,7 +108,7 @@ impl DmaEngineTlmTargetTest for DmaEngineTlmTargetTb
     let target : DmaMemTarget passive = bind mem
 
     run
-        log(info, "DmaEngine TLM target test - APB config plus passive memory service")
+        log(info, "DmaEngine TLM target responder test - APB config plus memory service")
 
         apb.dut = dut
 
@@ -127,7 +127,7 @@ impl DmaEngineTlmTargetTest for DmaEngineTlmTargetTb
         apb.write(2, 3)
         apb.write(3, 1)
 
-        wait until dut.irq == 1 timeout 100 cycles fail("IRQ never fired with passive TLM memory target")
+        wait until dut.irq == 1 timeout 100 cycles fail("IRQ never fired with TLM memory target responder")
 
         assert target.read_count == 4
             else fail("expected 4 TLM reads, observed ${target.read_count}")

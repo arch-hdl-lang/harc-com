@@ -1660,15 +1660,15 @@ let xact : MemInitiator active = bind mem
 
 This is the HARC equivalent of a synthesizable active BFM. The sequence layer sees `emit xact.req(t)` / `on xact.done(...)`; the DUT sees only wires.
 
-For the opposite direction — a DUT initiator that calls a target service — the canonical near-term shape is a **passive target transactor** at the boundary plus a HARC sequence/agent that supplies response data. The passive transactor may be an ARCH/HARC DUT-side module or an SV module exposing the same req/rsp pins; HARC binds it as `BurstMem`, observes `<method>_req_*`, drives `<method>_rsp_*`, and keeps payloads in protocol-shaped types such as `Vec<T, MAX>` or `{ data: Vec<T, MAX>, len, resp }`. Source-level Vec ports are preserved as indexed arrays in the generated C++ API (`rsp_data[0]`, `rsp_data[1]`, ...); flat lane aliases may exist for compatibility but are not the preferred HARC source style.
+For the opposite direction — a DUT initiator that calls a target service — the canonical near-term shape is a **target responder transactor/BFM** at the boundary. The responder may be an ARCH/HARC DUT-side module or an SV module exposing the same req/rsp pins; HARC binds it as `BurstMem`, observes `<method>_req_*`, drives `<method>_rsp_*`, and keeps payloads in protocol-shaped types such as `Vec<T, MAX>` or `{ data: Vec<T, MAX>, len, resp }`. Source-level Vec ports are preserved as indexed arrays in the generated C++ API (`rsp_data[0]`, `rsp_data[1]`, ...); flat lane aliases may exist for compatibility but are not the preferred HARC source style. These responders are commonly instantiated with HARC `passive` mode because they have no sequence-driven initiator half. That mode is not UVM passive/observe-only semantics: target responders drive ready/response pins, while passive monitors only observe.
 
 When an SV DUT already exposes canonical TLM req/rsp pins, bind the HARC bus directly. When an existing SV DUT has a native valid/ready/data interface instead, keep that interface intact and add a small adapter wrapper that presents the canonical TLM method pins to HARC. This keeps the reusable HARC BFM at the transaction boundary while preserving a raw-signal fixture for exact native-interface regressions. The DMA fixtures are the reference pattern:
 
 - `tests/dut/dma_engine_tlm_mem.sv` wraps the existing `DmaEngine` memory read/write valid-ready interfaces as `read(addr) -> data` and `write(addr, data)` TLM methods.
-- `tests/fixtures/dma_engine_tlm_target_test.harc` binds a passive target smoke responder to the wrapper.
-- `tests/fixtures/dma_engine_tlm_mem_model_test.harc` binds a stateful passive memory model and checks that destination state matches source state after the DMA completes.
+- `tests/fixtures/dma_engine_tlm_target_test.harc` binds a target responder smoke BFM to the wrapper.
+- `tests/fixtures/dma_engine_tlm_mem_model_test.harc` binds a stateful target-side memory model and checks that destination state matches source state after the DMA completes.
 
-Adapter timing is part of the contract. For read-like methods, hold request arguments stable until the target TLM responder captures the request, and latch returned response data if the native DUT consumes it on a different cycle from the TLM response handshake. For write-like methods, a native DUT-side write handshake can usually complete once the TLM request is accepted; the adapter may acknowledge the TLM response separately so the target responder can re-arm without stalling the DUT's native scheduler. If the goal is debugging raw pin-level timing, use the raw fixture directly; if the goal is reusable transaction behavior, put the adapter at the boundary and use a passive target TLM transactor.
+Adapter timing is part of the contract. For read-like methods, hold request arguments stable until the target TLM responder captures the request, and latch returned response data if the native DUT consumes it on a different cycle from the TLM response handshake. For write-like methods, a native DUT-side write handshake can usually complete once the TLM request is accepted; the adapter may acknowledge the TLM response separately so the target responder can re-arm without stalling the DUT's native scheduler. If the goal is debugging raw pin-level timing, use the raw fixture directly; if the goal is reusable transaction behavior, put the adapter at the boundary and use a target responder TLM transactor.
 
 Target-side TLM responders use `thread bus.method(args)` inside the bound transactor:
 
@@ -1699,11 +1699,11 @@ end transactor MemTarget
 let target : MemTarget passive = bind mem
 ```
 
-For `blocking` methods, the thread lowers to a responder actor that asserts `read_req_ready`, captures request args on the req handshake, runs the body, drives `read_rsp_data`/`read_rsp_valid`, and holds the response until the DUT raises `read_rsp_ready`. Transactor fields such as `read_count` are ordinary per-instance state, so passive target BFMs can track counters, scoreboards, or backing memory metadata across method calls.
+For `blocking` methods, the thread lowers to a responder actor that asserts `read_req_ready`, captures request args on the req handshake, runs the body, drives `read_rsp_data`/`read_rsp_valid`, and holds the response until the DUT raises `read_rsp_ready`. Transactor fields such as `read_count` are ordinary per-instance state, so target responder BFMs can track counters, scoreboards, or backing memory metadata across method calls.
 
 For `out_of_order tags N`, the target lowers to one responder lane per tag plus a shared request dispatcher and response arbiter. The dispatcher accepts a request when the lane named by `req_tag` is free, captures the method args into that lane, and immediately re-arms so a different free tag can be accepted before the first response completes. Each lane runs the same `thread bus.method(...)` body independently. The response arbiter emits completed lanes on the shared response channel and drives the matching `rsp_tag`. Initiators must not reuse a tag while that tag is still outstanding.
 
-A target responder may also forward through another already-bound TLM bus by calling it inside the target body. Declare the downstream binding before binding the passive target, so the generated responder actor can resolve both the target-side alias `bus` and the named downstream binding:
+A target responder may also forward through another already-bound TLM bus by calling it inside the target body. Declare the downstream binding before binding the target responder, so the generated responder actor can resolve both the target-side alias `bus` and the named downstream binding:
 
 ```harc
 transactor RouterTarget bound to BurstMem
@@ -1785,14 +1785,16 @@ end transactor AxiXactor
 
 ```
 let xact_a : AxiXactor active  = bind axi   // drives + observes
-let xact_p : AxiXactor passive = bind axi   // observe only
+let xact_p : AxiXactor passive = bind axi   // observe only for this monitor/driver pair
 ```
 
 No default — mode is mandatory at the let site. Forces every reuse to declare its role explicitly.
 
+Terminology note: HARC `passive` is an elaboration mode that disables the `when active` body. It does not mean every passive-mode transactor is a UVM passive monitor. Monitor-style transactors use passive mode to observe only, while TLM target responders may also use passive mode when they have no sequence-driven initiator half but still drive method ready/response pins. Call those components target responders/BFMs, and reserve passive monitor for observe-only components.
+
 **Type checking with mode.** Field access is mode-sensitive at the binding site. `emit xact.req(t)` is an error when `xact` is passive (the `req` field doesn't exist in passive mode). `connect seq.dispatched -> xact.req` likewise errors at elaboration when `xact` is passive. `xact.completed` works on both — the field is in the always-present body.
 
-**Drive code lives in `when active`, not the always-on body.** A passive instance literally has its `when active` body elided at codegen (`synth_component_from_transactor` drops it). The always-on body is shared by both modes, so anything in it executes on passive instances too. To preserve the contract that **a passive instance cannot drive the DUT** — the foundational invariant for block-level→chip-level TB reuse, where the same transactor declaration acts as the active BFM at block level and a passive observer at chip level — the compiler rejects any hookable or `on`-handler in the always-on body that:
+**Monitor-style drive code lives in `when active`, not the always-on body.** A passive instance literally has its `when active` body elided at codegen (`synth_component_from_transactor` drops it). The always-on body is shared by both modes, so anything in it executes on passive instances too. To preserve the monitor-style contract that **a passive monitor instance cannot drive the DUT** — the foundational invariant for block-level→chip-level TB reuse, where the same transactor declaration acts as the active BFM at block level and a passive observer at chip level — the compiler rejects any hookable or `on`-handler in the always-on body that:
 
 - assigns to a `<dut-pointer-field>.<port>` (where the field's type is a non-HARC named type — i.e. a DUT module),
 - assigns to `bus.<ch>.<sig>` (for `bound to BusType` transactors),

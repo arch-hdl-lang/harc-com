@@ -3,7 +3,7 @@
 // The SV DUT is the initiator: it issues `mem.read(5)` through the
 // ARCH-compatible req/rsp wires. The HARC transactor below implements the
 // target-side method body with `thread bus.read(...)`, proving that a HARC BFM
-// can serve as a passive TLM target for either SV or ARCH/HARC initiators.
+// can serve as a TLM target responder for either SV or ARCH/HARC initiators.
 
 bus TlmMemBus
     tlm_method read(addr: uint<8>) -> uint<32>: blocking;
