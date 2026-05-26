@@ -1074,7 +1074,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         )
         .ok();
         writeln!(e.out, "{INDENT}{INDENT}uint64_t t = _trace_time++;").ok();
-        writeln!(e.out, "{INDENT}{INDENT}trace.set_timing(t, clock, clock_cycle);").ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}trace.set_timing(t, clock, clock_cycle);"
+        )
+        .ok();
         writeln!(e.out, "{INDENT}{INDENT}HARC_RT_DUMP_WAVE_TRACE(tfp, t);").ok();
         writeln!(e.out, "{INDENT}}};").ok();
         writeln!(
@@ -1082,7 +1086,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             "{INDENT}auto _harc_trace_dump_at = [&](uint64_t t, const char* clock, uint64_t clock_cycle) {{"
         )
         .ok();
-        writeln!(e.out, "{INDENT}{INDENT}trace.set_timing(t, clock, clock_cycle);").ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}trace.set_timing(t, clock, clock_cycle);"
+        )
+        .ok();
         writeln!(e.out, "{INDENT}{INDENT}HARC_RT_DUMP_WAVE_TRACE(tfp, t);").ok();
         writeln!(e.out, "{INDENT}}};").ok();
         writeln!(e.out, "").ok();
@@ -1093,7 +1101,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         // Echo the active waveform path into sim.log so post-mortem
         // log inspection links to the matching VCD/FST without
         // grepping stderr. No-op in non-trace builds.
-        writeln!(e.out, "{INDENT}HARC_RT_LOG_WAVE_FILE(log_ctx.sim_log, _wave_path);").ok();
+        writeln!(
+            e.out,
+            "{INDENT}HARC_RT_LOG_WAVE_FILE(log_ctx.sim_log, _wave_path);"
+        )
+        .ok();
         writeln!(e.out, "").ok();
         // Concurrent assertion hook — every `assert property <expr>` /
         // `assert property NAME` registers a closure here; tick() invokes the
@@ -1122,9 +1134,17 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             // `clock <name> = <period>` items.
             writeln!(e.out, "{INDENT}auto tick = [&]() {{").ok();
             writeln!(e.out, "{INDENT}{INDENT}dut->clk = 0; dut->eval();").ok();
-            writeln!(e.out, "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)cycle_count);").ok();
+            writeln!(
+                e.out,
+                "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)cycle_count);"
+            )
+            .ok();
             writeln!(e.out, "{INDENT}{INDENT}dut->clk = 1; dut->eval();").ok();
-            writeln!(e.out, "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)(cycle_count + 1));").ok();
+            writeln!(
+                e.out,
+                "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)(cycle_count + 1));"
+            )
+            .ok();
             writeln!(e.out, "{INDENT}{INDENT}cycle_count++;").ok();
             writeln!(
                 e.out,
@@ -1780,7 +1800,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             // Initial comb settle — bootstrap's inputs propagate through
             // combinational logic before the first posedge.
             writeln!(e.out, "{INDENT}dut->clk = 0; dut->eval();").ok();
-            writeln!(e.out, "{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)cycle_count);").ok();
+            writeln!(
+                e.out,
+                "{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)cycle_count);"
+            )
+            .ok();
             writeln!(
                 e.out,
                 "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {{"
@@ -1788,7 +1812,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             .ok();
             // Posedge first — latches current input values.
             writeln!(e.out, "{INDENT}{INDENT}dut->clk = 1; dut->eval();").ok();
-            writeln!(e.out, "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)(cycle_count + 1));").ok();
+            writeln!(
+                e.out,
+                "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)(cycle_count + 1));"
+            )
+            .ok();
             writeln!(e.out, "{INDENT}{INDENT}cycle_count++;").ok();
             writeln!(
                 e.out,
@@ -1813,7 +1841,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             }
             // Falling edge + comb resettle with the new inputs.
             writeln!(e.out, "{INDENT}{INDENT}dut->clk = 0; dut->eval();").ok();
-            writeln!(e.out, "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)cycle_count);").ok();
+            writeln!(
+                e.out,
+                "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)cycle_count);"
+            )
+            .ok();
             writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
             writeln!(e.out, "{INDENT}}}").ok();
         } else {
@@ -1828,7 +1860,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             // first edge. Same effect as the single-clock branch, just
             // with the clock toggling factored into eval_clocks_until.
             writeln!(e.out, "{INDENT}dut->eval();").ok();
-            writeln!(e.out, "{INDENT}_harc_trace_dump_at((uint64_t)now_ps, \"\", 0);").ok();
+            writeln!(
+                e.out,
+                "{INDENT}_harc_trace_dump_at((uint64_t)now_ps, \"\", 0);"
+            )
+            .ok();
             writeln!(
                 e.out,
                 "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {{"
@@ -1885,7 +1921,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                 )
                 .ok();
             }
-            writeln!(e.out, "{INDENT}{INDENT}harc_rt::log::harc_print_cover_summary(_cov_hit, _cov_total);").ok();
+            writeln!(
+                e.out,
+                "{INDENT}{INDENT}harc_rt::log::harc_print_cover_summary(_cov_hit, _cov_total);"
+            )
+            .ok();
             for c in &covers_clone {
                 writeln!(e.out,
                 "{INDENT}{INDENT}harc_rt::log::harc_print_cover_point(\"{label}\", _cov_{tag}_hits);",
@@ -5352,11 +5392,7 @@ impl Emitter {
         self.pad(depth + 3);
         writeln!(self.out, "{root}->{rsp_valid} = 0;").ok();
         self.pad(depth + 3);
-        writeln!(
-            self.out,
-            "{lane_rsp_valid}[(size_t)_sel].store(false);"
-        )
-        .ok();
+        writeln!(self.out, "{lane_rsp_valid}[(size_t)_sel].store(false);").ok();
         self.pad(depth + 3);
         writeln!(
             self.out,
@@ -8775,12 +8811,7 @@ impl Emitter {
                 if let Some((_, len)) = fixed_vec_type_args(&f.ty) {
                     for i in 0..len {
                         self.pad(2);
-                        writeln!(
-                            self.out,
-                            "value.{0}[{i}] = raw.{0}[{i}];",
-                            f.name.name
-                        )
-                        .ok();
+                        writeln!(self.out, "value.{0}[{i}] = raw.{0}[{i}];", f.name.name).ok();
                     }
                 } else {
                     self.pad(2);
@@ -8833,12 +8864,7 @@ impl Emitter {
                 if let Some((_, len)) = fixed_vec_type_args(&f.ty) {
                     for i in 0..len {
                         self.pad(2);
-                        writeln!(
-                            self.out,
-                            "sig.{0}[{i}] = value.{0}[{i}];",
-                            f.name.name
-                        )
-                        .ok();
+                        writeln!(self.out, "sig.{0}[{i}] = value.{0}[{i}];", f.name.name).ok();
                     }
                 } else {
                     self.pad(2);
@@ -8848,12 +8874,20 @@ impl Emitter {
             self.pad(1);
             writeln!(self.out, "}} else {{").ok();
             self.pad(2);
-            writeln!(self.out, "harc_rt::harc_assign(sig, harc_pack_{name}(value));").ok();
+            writeln!(
+                self.out,
+                "harc_rt::harc_assign(sig, harc_pack_{name}(value));"
+            )
+            .ok();
             self.pad(1);
             writeln!(self.out, "}}").ok();
         } else {
             self.pad(1);
-            writeln!(self.out, "harc_rt::harc_assign(sig, harc_pack_{name}(value));").ok();
+            writeln!(
+                self.out,
+                "harc_rt::harc_assign(sig, harc_pack_{name}(value));"
+            )
+            .ok();
         }
         writeln!(self.out, "}}").ok();
         writeln!(self.out, "").ok();
@@ -15855,6 +15889,32 @@ fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
             }
         }
 
+        let mut tb_lifecycle = ScopeDecl {
+            name: Ident {
+                name: "sim".into(),
+                span: tb_ident.span,
+            },
+            setup: None,
+            run: None,
+            check: None,
+            teardown: None,
+            span: tb_ident.span,
+        };
+        for ci in &tb.items {
+            if let ComponentItem::Lifecycle(sc) = ci {
+                if sc.setup.is_some() {
+                    tb_lifecycle.setup = sc.setup.clone();
+                }
+                if sc.check.is_some() {
+                    tb_lifecycle.check = sc.check.clone();
+                }
+                if sc.teardown.is_some() {
+                    tb_lifecycle.teardown = sc.teardown.clone();
+                }
+                tb_lifecycle.span = sc.span;
+            }
+        }
+
         // Build the rewriter's "skip set" — names that must NOT be
         // rewritten because they shadow testbench fields at test
         // scope. `dut` always shadows (we synthesize `let dut : ...`
@@ -15929,6 +15989,15 @@ fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
                 _ => {}
             }
         }
+        if let Some(b) = tb_lifecycle.setup.as_mut() {
+            rewrite_block_for_impl(b, &field_names, &method_names, &field_is_pointer, &shadow);
+        }
+        if let Some(b) = tb_lifecycle.check.as_mut() {
+            rewrite_block_for_impl(b, &field_names, &method_names, &field_is_pointer, &shadow);
+        }
+        if let Some(b) = tb_lifecycle.teardown.as_mut() {
+            rewrite_block_for_impl(b, &field_names, &method_names, &field_is_pointer, &shadow);
+        }
 
         // Prepend synthesized lets. Order: `let dut : Top` (so the
         // Verilator-init path sees it as a top-level DUT pointer),
@@ -15978,27 +16047,94 @@ fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
         // Splice synthesized lets at the head, preserving the rest
         // of the items in original order.
         let original: Vec<TestItem> = std::mem::take(&mut t.items);
+        let has_scope = original.iter().any(|ti| matches!(ti, TestItem::Scope(_)));
+        let mut bare_run_stmts: Vec<Stmt> = Vec::new();
         t.items = prefix;
         for ti in original {
-            // Inject `_tb.dut = dut` as the first stmt of the
-            // run block so the wiring happens before any user code.
-            if dut_field.is_some() {
-                if let TestItem::Scope(sc) = &ti {
-                    if let Some(run) = &sc.run {
-                        let mut sc = sc.clone();
+            if !has_scope {
+                if let TestItem::Stmt(s) = &ti {
+                    bare_run_stmts.push(s.clone());
+                    continue;
+                }
+            }
+            if let TestItem::Scope(sc) = &ti {
+                let mut sc = sc.clone();
+                let wire_stmt = dut_field
+                    .as_ref()
+                    .map(|_| make_wire_dut_stmt(tb_ident.span));
+                let setup_needs_wire =
+                    wire_stmt.is_some() && (tb_lifecycle.setup.is_some() || sc.setup.is_some());
+
+                sc.setup = merge_lifecycle_blocks(
+                    tb_lifecycle.setup.clone(),
+                    sc.setup.clone(),
+                    setup_needs_wire.then(|| wire_stmt.clone().expect("checked above")),
+                    tb_ident.span,
+                );
+                sc.check = merge_lifecycle_blocks(
+                    tb_lifecycle.check.clone(),
+                    sc.check.clone(),
+                    None,
+                    tb_ident.span,
+                );
+                sc.teardown = merge_lifecycle_blocks(
+                    sc.teardown.clone(),
+                    tb_lifecycle.teardown.clone(),
+                    None,
+                    tb_ident.span,
+                );
+
+                // If there was no setup block, inject `_tb.dut = dut`
+                // as the first run statement so the testbench DUT
+                // pointer is still wired before user stimulus.
+                if !setup_needs_wire {
+                    if let (Some(stmt), Some(run)) = (wire_stmt, sc.run.as_ref()) {
                         let mut new_stmts = Vec::with_capacity(run.stmts.len() + 1);
-                        new_stmts.push(make_wire_dut_stmt(tb_ident.span));
+                        new_stmts.push(stmt);
                         new_stmts.extend(run.stmts.iter().cloned());
                         sc.run = Some(Block {
                             stmts: new_stmts,
                             span: run.span,
                         });
-                        t.items.push(TestItem::Scope(sc));
-                        continue;
                     }
                 }
+                t.items.push(TestItem::Scope(sc));
+                continue;
             }
             t.items.push(ti);
+        }
+        if !bare_run_stmts.is_empty() {
+            let wire_stmt = dut_field
+                .as_ref()
+                .map(|_| make_wire_dut_stmt(tb_ident.span));
+            let setup_needs_wire = wire_stmt.is_some() && tb_lifecycle.setup.is_some();
+            let setup = merge_lifecycle_blocks(
+                tb_lifecycle.setup.clone(),
+                None,
+                setup_needs_wire.then(|| wire_stmt.clone().expect("checked above")),
+                tb_ident.span,
+            );
+            let mut run_stmts = Vec::new();
+            if !setup_needs_wire {
+                if let Some(stmt) = wire_stmt {
+                    run_stmts.push(stmt);
+                }
+            }
+            run_stmts.extend(bare_run_stmts);
+            t.items.push(TestItem::Scope(ScopeDecl {
+                name: Ident {
+                    name: "sim".into(),
+                    span: tb_ident.span,
+                },
+                setup,
+                run: Some(Block {
+                    stmts: run_stmts,
+                    span: tb_ident.span,
+                }),
+                check: tb_lifecycle.check.clone(),
+                teardown: tb_lifecycle.teardown.clone(),
+                span: tb_ident.span,
+            }));
         }
 
         // Mark as desugared so any downstream consumer (pretty-
@@ -16006,6 +16142,31 @@ fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
         t.for_testbench = None;
     }
     out
+}
+
+fn merge_lifecycle_blocks(
+    first: Option<Block>,
+    second: Option<Block>,
+    prefix_stmt: Option<Stmt>,
+    fallback_span: Span,
+) -> Option<Block> {
+    if first.is_none() && second.is_none() && prefix_stmt.is_none() {
+        return None;
+    }
+    let mut stmts = Vec::new();
+    if let Some(s) = prefix_stmt {
+        stmts.push(s);
+    }
+    let mut span = fallback_span;
+    if let Some(b) = first {
+        span = b.span;
+        stmts.extend(b.stmts);
+    }
+    if let Some(b) = second {
+        span = b.span;
+        stmts.extend(b.stmts);
+    }
+    Some(Block { stmts, span })
 }
 
 /// Build the synthetic `_tb.dut = dut` statement that wires the

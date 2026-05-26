@@ -87,7 +87,9 @@ end test TraceTest
     assert!(cpp.contains("trace.set_timing(t, clock, clock_cycle);"));
     assert!(cpp.contains("trace.randomize(cycle_count, _trace_fields);"));
     assert!(cpp.contains("HARC_RT_LOG_PRINTF(log_ctx.sim_log, &trace, cycle_count, sev, fmt);"));
-    assert!(cpp.contains("return harc_rt::log::harc_finish_sim_run(log_ctx, trace, cycle_count, errors);"));
+    assert!(cpp.contains(
+        "return harc_rt::log::harc_finish_sim_run(log_ctx, trace, cycle_count, errors);"
+    ));
     assert!(cpp_tb::TRACE_RT_HEADER.contains("vcd_time"));
     assert!(cpp_tb::TRACE_RT_HEADER.contains("clock_cycle"));
     assert!(cpp_tb::TRACE_RT_HEADER.contains("raw(\"assertion_failure\""));
@@ -239,7 +241,9 @@ end test WaveTest
     // runtime macros that compile away in a non-waves build.
     assert!(cpp.contains("Verilated::traceEverOn(true);"));
     assert!(cpp.contains("HarcTraceC* tfp = new HarcTraceC;"));
-    assert!(cpp.contains("harc_rt::log::harc_open_wave_trace(dut, tfp, harc_rt::log::harc_wave_default_name());"));
+    assert!(cpp.contains(
+        "harc_rt::log::harc_open_wave_trace(dut, tfp, harc_rt::log::harc_wave_default_name());"
+    ));
     assert!(cpp.contains("HARC_RT_LOG_WAVE_FILE(log_ctx.sim_log, _wave_path);"));
     assert!(cpp.contains("HARC_RT_DUMP_WAVE_TRACE(tfp, t);"));
     assert!(cpp.contains("_harc_trace_dump_next(\"clk\", (uint64_t)(cycle_count + 1));"));
@@ -1304,7 +1308,9 @@ end test T"#,
         "expected `_fatal = true;` in FATAL lowering"
     );
     assert!(
-        cpp.contains("sim_logf_line(log_ctx.file(\"detail.log\"), \"INFO\", \"detail: no effect\");"),
+        cpp.contains(
+            "sim_logf_line(log_ctx.file(\"detail.log\"), \"INFO\", \"detail: no effect\");"
+        ),
         "expected logf to resolve files through HarcLogContext directly; got:\n{cpp}"
     );
     assert!(
@@ -1359,6 +1365,112 @@ end test T"#,
     assert!(
         phase_pos < bootstrap_pos,
         "custom phase lambda must be emitted before sched.bootstrap()"
+    );
+}
+
+#[test]
+fn bound_test_inherits_testbench_check_without_local_check() {
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : DummyDut
+    check
+        log(info, "tb final check")
+    end check
+end testbench Tb
+
+impl Smoke for Tb
+    run
+        log(info, "test run")
+    end run
+end impl Smoke"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("tb final check"),
+        "testbench check should be emitted:\n{cpp}"
+    );
+    let run_pos = cpp.find("test run").unwrap();
+    let check_pos = cpp.find("tb final check").unwrap();
+    assert!(
+        run_pos < check_pos,
+        "testbench check must run after test run:\n{cpp}"
+    );
+}
+
+#[test]
+fn testbench_and_test_lifecycle_blocks_emit_in_order() {
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : DummyDut
+    setup
+        log(info, "tb setup")
+    end setup
+    check
+        log(info, "tb check")
+    end check
+    teardown
+        log(info, "tb teardown")
+    end teardown
+end testbench Tb
+
+impl Smoke for Tb
+    setup
+        log(info, "test setup")
+    end setup
+    run
+        log(info, "test run")
+    end run
+    check
+        log(info, "test check")
+    end check
+    teardown
+        log(info, "test teardown")
+    end teardown
+end impl Smoke"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    let ordered = [
+        "tb setup",
+        "test setup",
+        "test run",
+        "tb check",
+        "test check",
+        "test teardown",
+        "tb teardown",
+    ];
+    let mut last = 0usize;
+    for needle in ordered {
+        let pos = cpp
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing `{needle}` in:\n{cpp}"));
+        assert!(pos >= last, "`{needle}` emitted out of order in:\n{cpp}");
+        last = pos;
+    }
+}
+
+#[test]
+fn testbench_lifecycle_wraps_bare_statement_impl_run() {
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : DummyDut
+    check
+        log(info, "tb check")
+    end check
+end testbench Tb
+
+impl Smoke for Tb
+    log(info, "bare run")
+end impl Smoke"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    let run_pos = cpp.find("bare run").unwrap();
+    let check_pos = cpp.find("tb check").unwrap();
+    assert!(
+        run_pos < check_pos,
+        "testbench check must run after bare-statement run body:\n{cpp}"
     );
 }
 
