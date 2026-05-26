@@ -101,6 +101,57 @@ The cycle-based runtime (§7.1, §10.1) calls `dut.eval_domain(D)` on every cycl
 
 **Shared elaboration.** Generics, traits, type-level naturals — same machinery. A protocol type's handshake sequencing is what the HARC transactor is *derived from*; you do not re-author the protocol.
 
+**HARC/ARCH Interop ABI.** HARC and ARCH share a stable external
+representation for values that cross HARC, ARCH sim, ARCH-generated SV, and
+hand-written SV boundaries. The ABI intentionally follows standard
+SystemVerilog packed layout so generated and manually written SV can
+interoperate without custom shims:
+
+- **Scalars.** `Bool`/`bool` and `Bit` are 1 bit. `UInt<N>`/`uint<N>` and
+  `SInt<N>`/`sint<N>` are exactly `N` bits; signed values use two's-complement
+  representation. There is no implicit padding or widening at an interop
+  boundary.
+- **Structs, transactions, and records.** Fields are packed in declaration
+  order with no padding. The first declared field occupies the
+  most-significant bits; the last declared field occupies the
+  least-significant bits. Nested records recurse with the same rule.
+- **Fixed vectors.** `Vec<T, N>` is a fixed packed array. Within a vector
+  field, `vec[0]` occupies the least-significant element slot and `vec[N-1]`
+  occupies the most-significant element slot, matching ARCH SV emission as
+  `logic [N-1:0] ...`.
+- **C++ carriers.** Scalar values up to the runtime's native width may use
+  integer carriers; wider packed values use the runtime wide-value carrier.
+  Fixed `Vec` fields inside HARC records are preserved as
+  `std::array<elem, N>` at the C++ source level, then packed or unpacked when
+  crossing a packed SV port.
+- **TLM method pins.** Lowered method ports use the canonical names
+  `<bus>_<method>_req_valid`, `<bus>_<method>_req_ready`,
+  `<bus>_<method>_req_arg_<arg>`, `<bus>_<method>_rsp_valid`,
+  `<bus>_<method>_rsp_ready`, and `<bus>_<method>_rsp_data`. Tagged
+  out-of-order methods also use `<bus>_<method>_req_tag` and
+  `<bus>_<method>_rsp_tag`.
+
+For example, this response record:
+
+```harc
+struct BurstResp
+    data : Vec<uint<32>, 4>
+    len  : uint<3>
+    resp : uint<2>
+end struct BurstResp
+```
+
+has this packed layout:
+
+```
+bits [132:101] data[3]
+bits [100:69]  data[2]
+bits [68:37]   data[1]
+bits [36:5]    data[0]
+bits [4:2]     len
+bits [1:0]     resp
+```
+
 **What HARC adds, lexically.** New keywords, reserved only in `.harc` files (so existing ARCH code is unaffected):
 
 ```
