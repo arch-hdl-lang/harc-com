@@ -1,0 +1,40 @@
+testbench CounterLifecycleTb
+    dut : Top
+    expected : uint<32> default 0
+
+    function reset()
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+    end function reset
+
+    setup
+        reset()
+    end setup
+
+    check
+        assert dut.count_out == expected
+            else fail("shared final check: count_out=${dut.count_out}, expected=${expected}")
+        log(info, "shared final check passed")
+    end check
+end testbench CounterLifecycleTb
+
+impl LifecycleBumpThree for CounterLifecycleTb
+    run
+        dut.en = 1
+        wait 3 cycles
+        dut.en = 0
+        expected = 3
+    end run
+end impl LifecycleBumpThree
+
+impl LifecycleBumpFive for CounterLifecycleTb
+    run
+        dut.en = 1
+        wait 5 cycles
+        dut.en = 0
+        expected = 5
+    end run
+end impl LifecycleBumpFive
