@@ -84,9 +84,12 @@ end test TraceTest
     assert!(cpp.contains("#include \"harc_log_rt.h\""));
     assert!(cpp.contains("harc_rt::trace::HarcTraceWriter trace;"));
     assert!(cpp.contains("harc_rt::trace::harc_start_trace(trace, harc_rng.state, \"Top\", \"TraceTest\", cycle_count);"));
+    assert!(cpp.contains("trace.set_timing(t, clock, clock_cycle);"));
     assert!(cpp.contains("trace.randomize(cycle_count, _trace_fields);"));
     assert!(cpp.contains("HARC_RT_LOG_PRINTF(log_ctx.sim_log, &trace, cycle_count, sev, fmt);"));
     assert!(cpp.contains("return harc_rt::log::harc_finish_sim_run(log_ctx, trace, cycle_count, errors);"));
+    assert!(cpp_tb::TRACE_RT_HEADER.contains("vcd_time"));
+    assert!(cpp_tb::TRACE_RT_HEADER.contains("clock_cycle"));
     assert!(cpp_tb::TRACE_RT_HEADER.contains("raw(\"assertion_failure\""));
     assert!(cpp_tb::TRACE_RT_HEADER.contains("raw(\"tlm_call\""));
 }
@@ -238,7 +241,8 @@ end test WaveTest
     assert!(cpp.contains("HarcTraceC* tfp = new HarcTraceC;"));
     assert!(cpp.contains("harc_rt::log::harc_open_wave_trace(dut, tfp, harc_rt::log::harc_wave_default_name());"));
     assert!(cpp.contains("HARC_RT_LOG_WAVE_FILE(log_ctx.sim_log, _wave_path);"));
-    assert!(cpp.contains("HARC_RT_DUMP_WAVE_TRACE(tfp, _trace_time++);"));
+    assert!(cpp.contains("HARC_RT_DUMP_WAVE_TRACE(tfp, t);"));
+    assert!(cpp.contains("_harc_trace_dump_next(\"clk\", (uint64_t)(cycle_count + 1));"));
     assert!(cpp.contains("HARC_RT_WRITE_COVERAGE(Verilated::threadContextp()->coveragep());"));
     assert!(cpp.contains("HARC_RT_CLOSE_WAVE_TRACE(tfp);"));
 }
