@@ -1099,7 +1099,27 @@ end test SimpleTest
 
 Each test stands alone — no inheritance, no `super` chain, no shared mutable state across tests.
 
-`setup` / `run` / `check` / `teardown` are *blocks*, not virtual methods. No `super.build_phase()` ceremony, no objection counting, no end-of-test deadlock. `run` ends when its body completes (or when a `stop` is signalled); `check` runs after. **In v0 only `run` actually lowers** — `setup` / `check` / `teardown` parse and reserve the keyword but emit nothing yet (the surface is locked so fixtures don't need migration when codegen catches up).
+`setup` / `run` / `check` / `teardown` are *blocks*, not virtual methods.
+No `super.build_phase()` ceremony, no objection counting, no end-of-test
+deadlock. `run` ends when its body completes; `check` runs after. In the
+shipped C++ backend, all four lifecycle blocks lower into the generated
+test coroutine. A bound `impl <Test> for <Tb>` also inherits
+`setup`, `check`, and `teardown` blocks declared by the bound
+`testbench`. The fixed composition order is:
+
+```
+testbench.setup
+test.setup
+test.run
+testbench.check
+test.check
+test.teardown
+testbench.teardown
+```
+
+`run` is intentionally not legal inside `testbench`: stimulus belongs to
+the testcase. Testbench lifecycle blocks are compile-time composition,
+not a runtime phase registry.
 
 #### Custom phases — `phase <name>`
 
@@ -1535,6 +1555,7 @@ This is where the "wide" scope decision pays off. Each verification role becomes
 | Bus boundary | `transactor` | Pin-touching BFM. Drives + observes the protocol. Synthesizable to RTL — runs in-process under `harc sim`, in the FPGA bitstream under emulation. | Yes for any bus-interfaced DUT |
 | Stimulus generation | `sequencer` + `tseq` | Generates transactions. SW-only — `randomize`, file I/O, etc. allowed. | When stimulus is non-trivial |
 | Composition | `env` | Multi-transactor composition unit. Holds shared scoreboards, cross-bus checks. | When the DUT has more than one bus / when state is shared across transactors |
+| DUT-specific shell | `testbench` | Owns the DUT field plus DUT-specific helpers and shared lifecycle checks. | When multiple tests share reset/final-check/cleanup infrastructure |
 | Glue | `agent` | Optional sugar: bundles a sequencer + transactor + their connect bridge as a reusable unit. | Only when the same `(sequencer, transactor, wiring)` triple is reused across tests |
 | Top | `test` | Test entry — instantiates the DUT, the env, picks the stimulus, asserts final outcomes. | Always |
 
@@ -2601,7 +2622,7 @@ Carrying forward the April-13 list, with rationale specific to the sister-langua
 - **Class hierarchies for transactions.** ADTs with structural equality, `when` subtypes (§3.3), and `extend` aspects (§3.6) cover every `extends` use case more cleanly.
 - **`uvm_config_db`.** Static composition + generic parameters cover every legitimate use; the rest were UVM workarounds for SV's missing module-system features ARCH already has.
 - **Virtual interfaces.** `bound to ProtocolType` with typed cross-module references replaces the entire `vif` indirection.
-- **Phase macros (`build_phase`, `connect_phase`, etc.).** Replaced by inline `test` lifecycle blocks (§7.2): `setup` / `run` / `check` / `teardown` plus optional `phase <name>` user helpers. No phase-objection model — only `run` is a runtime entry point.
+- **Phase macros (`build_phase`, `connect_phase`, etc.).** Replaced by inline `test` lifecycle blocks (§7.2): `setup` / `run` / `check` / `teardown`, optional `testbench`-owned `setup` / `check` / `teardown` for shared infrastructure, and optional `phase <name>` user helpers. No phase-objection model — only the composed test coroutine is a runtime entry point.
 - **Factory registration.** Generic parameters and explicit instantiation. No `uvm_object_utils`.
 - **Field automation (`uvm_field_*`).** ADT-derived deep equality, pack/unpack, and pretty-printing.
 - **TLM as a separate type hierarchy.** TLM is `event<T>` and `TSeq<T>` over typed values.
