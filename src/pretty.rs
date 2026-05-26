@@ -631,6 +631,9 @@ fn print_component_item(out: &mut String, it: &ComponentItem, depth: usize) {
                 writeln!(out, "end function {}", h.name.name).ok();
             }
         }
+        ComponentItem::Lifecycle(s) => {
+            print_lifecycle_scope(out, s, depth);
+        }
         ComponentItem::Apply(a) => {
             pad(out, depth);
             write!(out, "apply ").ok();
@@ -640,6 +643,37 @@ fn print_component_item(out: &mut String, it: &ComponentItem, depth: usize) {
         ComponentItem::Watchdog(w) => {
             print_watchdog(out, w, depth);
         }
+    }
+}
+
+fn print_lifecycle_scope(out: &mut String, s: &ScopeDecl, depth: usize) {
+    if let Some(b) = &s.setup {
+        pad(out, depth);
+        writeln!(out, "setup").ok();
+        print_block_inner(out, b, depth + 1);
+        pad(out, depth);
+        writeln!(out, "end setup").ok();
+    }
+    if let Some(b) = &s.run {
+        pad(out, depth);
+        writeln!(out, "run").ok();
+        print_block_inner(out, b, depth + 1);
+        pad(out, depth);
+        writeln!(out, "end run").ok();
+    }
+    if let Some(b) = &s.check {
+        pad(out, depth);
+        writeln!(out, "check").ok();
+        print_block_inner(out, b, depth + 1);
+        pad(out, depth);
+        writeln!(out, "end check").ok();
+    }
+    if let Some(b) = &s.teardown {
+        pad(out, depth);
+        writeln!(out, "teardown").ok();
+        print_block_inner(out, b, depth + 1);
+        pad(out, depth);
+        writeln!(out, "end teardown").ok();
     }
 }
 
@@ -721,34 +755,7 @@ fn print_test_item(out: &mut String, it: &TestItem, depth: usize) {
             // outer `scope sim ... end scope sim` wrapper. The
             // round-trip discipline relies on this matching the
             // parser's accepted shape (parse_test).
-            if let Some(b) = &s.setup {
-                pad(out, depth);
-                writeln!(out, "setup").ok();
-                print_block_inner(out, b, depth + 1);
-                pad(out, depth);
-                writeln!(out, "end setup").ok();
-            }
-            if let Some(b) = &s.run {
-                pad(out, depth);
-                writeln!(out, "run").ok();
-                print_block_inner(out, b, depth + 1);
-                pad(out, depth);
-                writeln!(out, "end run").ok();
-            }
-            if let Some(b) = &s.check {
-                pad(out, depth);
-                writeln!(out, "check").ok();
-                print_block_inner(out, b, depth + 1);
-                pad(out, depth);
-                writeln!(out, "end check").ok();
-            }
-            if let Some(b) = &s.teardown {
-                pad(out, depth);
-                writeln!(out, "teardown").ok();
-                print_block_inner(out, b, depth + 1);
-                pad(out, depth);
-                writeln!(out, "end teardown").ok();
-            }
+            print_lifecycle_scope(out, s, depth);
         }
         TestItem::Phase(name, body) => {
             pad(out, depth);

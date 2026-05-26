@@ -497,6 +497,10 @@ pub enum ComponentItem {
     OnHandler(OnHandler),
     TargetTlmThread(TargetTlmThread),
     Hookable(HookableMethod),
+    /// `setup` / `check` / `teardown` blocks declared inside a
+    /// `testbench`. Stored as `ScopeDecl` so codegen can reuse the
+    /// existing test lifecycle block machinery.
+    Lifecycle(ScopeDecl),
     /// Inline `apply Name` inside a component body (rare but legal in scopes).
     Apply(ApplyDecl),
     /// Built-in watchdog (spec §8.6). At elaboration time this desugars
