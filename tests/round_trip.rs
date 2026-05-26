@@ -68,6 +68,86 @@ fn testbench_probe_dut_round_trip() {
 }
 
 #[test]
+fn testbench_lifecycle_blocks_round_trip() {
+    let src = r#"
+testbench Tb
+    dut : DummyDut
+
+    setup
+        dut.rst = 1
+    end setup
+
+    check
+        assert dut.done == 1 else fail("not done")
+    end check
+
+    teardown
+        log(info, "tb teardown")
+    end teardown
+end testbench Tb
+
+impl Smoke for Tb
+    run
+        wait 1 cycle
+    end run
+end impl Smoke
+"#;
+    let printed = parse_print_reparse(src);
+    assert!(printed.contains("setup\n        dut.rst = 1\n    end setup"));
+    assert!(printed
+        .contains("check\n        assert dut.done == 1 else fail(\"not done\")\n    end check"));
+    assert!(printed.contains("teardown\n        log(info, \"tb teardown\")\n    end teardown"));
+}
+
+#[test]
+fn testbench_rejects_run_lifecycle_block() {
+    let src = r#"
+testbench Tb
+    dut : DummyDut
+    run
+        wait 1 cycle
+    end run
+end testbench Tb
+"#;
+    let err = parse_source(src).expect_err("run inside testbench should be rejected");
+    assert!(err.to_string().contains("`run` belongs to a testcase"));
+}
+
+#[test]
+fn non_testbench_component_rejects_lifecycle_block() {
+    let src = r#"
+env Env
+    check
+        log(info, "bad")
+    end check
+end env Env
+"#;
+    let err = parse_source(src).expect_err("env lifecycle block should be rejected");
+    assert!(err.to_string().contains(
+        "lifecycle blocks are currently supported only inside `test`/`impl` and `testbench`"
+    ));
+}
+
+#[test]
+fn duplicate_testbench_lifecycle_block_is_rejected() {
+    let src = r#"
+testbench Tb
+    dut : DummyDut
+    check
+        log(info, "first")
+    end check
+    check
+        log(info, "second")
+    end check
+end testbench Tb
+"#;
+    let err = parse_source(src).expect_err("duplicate testbench check should be rejected");
+    assert!(err
+        .to_string()
+        .contains("duplicate `check` block in testbench `Tb`"));
+}
+
+#[test]
 fn property_assert_assume_cover() {
     let src = r#"
 property aw_valid_stable

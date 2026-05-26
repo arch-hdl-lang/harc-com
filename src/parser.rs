@@ -796,7 +796,7 @@ impl Parser {
         let inner_doc = self.consume_inner_doc();
         let mut items = Vec::new();
         while !self.check_end_keyword() {
-            items.push(self.parse_component_item(kind)?);
+            items.push(self.parse_component_item(kind, &name.name, &items)?);
         }
         let end = self.expect_end(start_kw, &name.name)?;
         Ok(ComponentDecl {
@@ -814,9 +814,28 @@ impl Parser {
     fn parse_component_item(
         &mut self,
         component_kind: ComponentKind,
+        component_name: &str,
+        existing_items: &[ComponentItem],
     ) -> Result<ComponentItem, CompileError> {
         let doc = self.consume_outer_doc();
         match self.peek_kind() {
+            Some(TokenKind::Setup | TokenKind::Check | TokenKind::Teardown)
+                if component_kind == ComponentKind::Testbench =>
+            {
+                self.parse_testbench_lifecycle(component_name, existing_items)
+            }
+            Some(TokenKind::Run) if component_kind == ComponentKind::Testbench => {
+                Err(CompileError::general(
+                    "`run` belongs to a testcase; use `setup`, `check`, or `teardown` in `testbench`",
+                    self.peek_span(),
+                ))
+            }
+            Some(TokenKind::Setup | TokenKind::Check | TokenKind::Teardown | TokenKind::Run) => {
+                Err(CompileError::general(
+                    "lifecycle blocks are currently supported only inside `test`/`impl` and `testbench`",
+                    self.peek_span(),
+                ))
+            }
             Some(TokenKind::Let) if component_kind == ComponentKind::Testbench => {
                 Ok(ComponentItem::Field(self.parse_testbench_let_field(doc)?))
             }
@@ -1032,13 +1051,21 @@ impl Parser {
                 self.advance(); // consume `active`
                 let mut active_items: Vec<ComponentItem> = Vec::new();
                 while !(self.check(TokenKind::End) && self.peek2_kind() == Some(&TokenKind::When)) {
-                    active_items.push(self.parse_component_item(ComponentKind::Transactor)?);
+                    active_items.push(self.parse_component_item(
+                        ComponentKind::Transactor,
+                        &name.name,
+                        &active_items,
+                    )?);
                 }
                 self.expect(TokenKind::End)?;
                 self.expect(TokenKind::When)?;
                 when_active = Some(active_items);
             } else {
-                items.push(self.parse_component_item(ComponentKind::Transactor)?);
+                items.push(self.parse_component_item(
+                    ComponentKind::Transactor,
+                    &name.name,
+                    &items,
+                )?);
             }
         }
         let end = self.expect_end(TokenKind::Transactor, &name.name)?;
@@ -1606,6 +1633,74 @@ impl Parser {
         }
     }
 
+    fn parse_testbench_lifecycle(
+        &mut self,
+        component_name: &str,
+        existing_items: &[ComponentItem],
+    ) -> Result<ComponentItem, CompileError> {
+        let start = self.peek_span();
+        let (kind, stmts, end_span) = match self.peek_kind() {
+            Some(TokenKind::Setup) => {
+                self.advance();
+                let stmts = self.parse_stmt_list_until_end()?;
+                let end_span = self.expect_end_anon(TokenKind::Setup)?;
+                ("setup", stmts, end_span)
+            }
+            Some(TokenKind::Check) => {
+                self.advance();
+                let stmts = self.parse_stmt_list_until_end()?;
+                let end_span = self.expect_end_anon(TokenKind::Check)?;
+                ("check", stmts, end_span)
+            }
+            Some(TokenKind::Teardown) => {
+                self.advance();
+                let stmts = self.parse_stmt_list_until_end()?;
+                let end_span = self.expect_end_anon(TokenKind::Teardown)?;
+                ("teardown", stmts, end_span)
+            }
+            _ => unreachable!("parse_testbench_lifecycle called for non-lifecycle token"),
+        };
+
+        let duplicate = existing_items.iter().any(|it| match it {
+            ComponentItem::Lifecycle(scope) => match kind {
+                "setup" => scope.setup.is_some(),
+                "check" => scope.check.is_some(),
+                "teardown" => scope.teardown.is_some(),
+                _ => false,
+            },
+            _ => false,
+        });
+        if duplicate {
+            return Err(CompileError::general(
+                &format!("duplicate `{kind}` block in testbench `{component_name}`"),
+                start,
+            ));
+        }
+
+        let body = Block {
+            stmts,
+            span: end_span,
+        };
+        let mut scope = ScopeDecl {
+            name: Ident {
+                name: "sim".into(),
+                span: start,
+            },
+            setup: None,
+            run: None,
+            check: None,
+            teardown: None,
+            span: end_span,
+        };
+        match kind {
+            "setup" => scope.setup = Some(body),
+            "check" => scope.check = Some(body),
+            "teardown" => scope.teardown = Some(body),
+            _ => unreachable!(),
+        }
+        Ok(ComponentItem::Lifecycle(scope))
+    }
+
     fn parse_clock_decl(&mut self) -> Result<ClockDecl, CompileError> {
         let start = self.expect(TokenKind::ClockGen)?.span;
         let name = self.expect_field_name()?;
@@ -1678,7 +1773,11 @@ impl Parser {
             Some(TokenKind::Connect) | Some(TokenKind::Hookable) => {
                 let mut items = Vec::new();
                 while !self.check_end_keyword() {
-                    items.push(self.parse_component_item(ComponentKind::Env)?);
+                    items.push(self.parse_component_item(
+                        ComponentKind::Env,
+                        "<extend>",
+                        &items,
+                    )?);
                 }
                 ExtendBody::Component(items)
             }
