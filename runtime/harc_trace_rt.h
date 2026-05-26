@@ -37,6 +37,9 @@ inline std::string harc_trace_escape(const std::string& s) {
 struct HarcTraceWriter {
     FILE* out = nullptr;
     uint64_t seq = 0;
+    uint64_t vcd_time = 0;
+    uint64_t clock_cycle = 0;
+    std::string clock;
     bool enabled = false;
 
     void open_env() {
@@ -58,6 +61,12 @@ struct HarcTraceWriter {
 
     uint64_t next_seq() { return seq++; }
 
+    void set_timing(uint64_t new_vcd_time, const char* new_clock, uint64_t new_clock_cycle) {
+        vcd_time = new_vcd_time;
+        clock = new_clock ? new_clock : "";
+        clock_cycle = new_clock_cycle;
+    }
+
     void meta(uint64_t seed, const char* backend, const char* top, const char* test) {
         if (!enabled) return;
         std::fprintf(
@@ -78,10 +87,13 @@ struct HarcTraceWriter {
         if (!enabled) return;
         std::fprintf(
             out,
-            "{\"type\":\"%s\",\"cycle\":%d,\"seq\":%llu%s%s}\n",
+            "{\"type\":\"%s\",\"cycle\":%d,\"seq\":%llu,\"vcd_time\":%llu,\"clock\":\"%s\",\"clock_cycle\":%llu%s%s}\n",
             type,
             cycle,
             static_cast<unsigned long long>(next_seq()),
+            static_cast<unsigned long long>(vcd_time),
+            harc_trace_escape(clock).c_str(),
+            static_cast<unsigned long long>(clock_cycle),
             payload.empty() ? "" : ",",
             payload.c_str());
         std::fflush(out);
