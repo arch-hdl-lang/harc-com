@@ -5,8 +5,8 @@
 landed.
 **Scope:** Two related changes to remove ceremony from HARC test files:
 (1) a `testbench` block that owns the DUT, bus binding, transactor/scoreboard
-composition, and shared setup methods — so multiple tests reuse one
-structural skeleton; (2) inline `run` inside `test`, replacing the
+composition, shared helper methods, and shared lifecycle checks — so multiple
+tests reuse one structural skeleton; (2) inline `run` inside `test`, replacing the
 two-block `test T { ... } / impl sim for T { run ... }` form.
 
 ## Implementation status
@@ -19,6 +19,7 @@ two-block `test T { ... } / impl sim for T { run ... }` form.
 | Backend selection via CLI subcommand only | **Shipped** | implied by parser removal — no per-test annotation surface |
 | `testbench` block (shared structural skeleton + helper methods) | **Shipped** | Parser entry pre-existing; `function` keyword + codegen suppression of hook vectors landed in PR #109. Bus-binding-as-field (`bus : Bus = bind dut`) and `hookable function` deferred. |
 | `impl <name> for <Tb> ... end impl <name>` — testbench-bound test form | **Shipped** | Parser + AST + pre-emission desugaring. Canary fixture: `testbench_basic_test.harc`. Phase 2 (separate PR) sweeps the 70-fixture corpus and removes the classic `test T { let dut; ... }` form. |
+| `setup` / `check` / `teardown` lifecycle blocks inside `testbench` | **Shipped** | Shared bench setup/final-check/cleanup blocks compose into every bound `impl <Test> for <Tb>`. Canary fixture: `testbench_lifecycle_test.harc`. |
 | Dead-code prune (`Item::Impl`, `ImplDecl`, `ImplItem`, legacy `parse_impl`) | **Shipped** | Legacy two-block impl AST/parser removed. The remaining `impl <name> for <Tb>` parser is the new testbench-bound test form. |
 
 ## 1. Motivation
@@ -110,9 +111,9 @@ paid to a feature that wasn't used and won't need to be used.
    compile-time.
 3. Multi-impl-per-test machinery. Dropped entirely; replaced by
    different tests with different names targeting different backends.
-4. Implicit reset / auto-setup. Reset stays explicit at the top of every
-   `run` (`tb.reset()`), consistent with HARC's "no UVM phase machinery"
-   stance.
+4. UVM-style distributed phase registration. Shared testbench lifecycle
+   blocks are compile-time composition into a bound test's fixed lifecycle
+   order, not a runtime phase executor or objection model.
 
 ## 3. Surface — `testbench`  *(Shipped)*
 
@@ -133,7 +134,8 @@ testbench AxiLiteTb
     drv : AxilXactor passive = bind bus
     sb  : AxilSb
 
-    // Shared procedural helpers — callable from any test's run.
+    // Shared procedural helpers — callable from testbench lifecycle
+    // blocks or from any bound test's run/check/teardown.
     function reset()
         dut.rst = 1
         dut.axil_aw_valid = 0
@@ -158,6 +160,10 @@ testbench AxiLiteTb
             end if
         end for
     end function drive_random
+
+    check
+        assert sb.errors == 0 else fail("scoreboard errors=${sb.errors}")
+    end check
 end testbench AxiLiteTb
 ```
 
@@ -188,7 +194,65 @@ end testbench AxiLiteTb
 - Functions are **not hookable**: no `<Type>_<method>_pre` / `<Type>_<method>_post` vectors are emitted, and the method body has no fan-out wrapper. Lowering: a free `[&]`-capturing lambda named `<Type>_<method>`, called as `<Type>_<method>(tb, args)` at every `tb.method(args)` call site (`resolve_component_method_call` walks the same path as for hookables).
 - If a testbench function needs the pre/post hook machinery, declare it `hookable` instead of `function` — same body shape, plus the hook vectors.
 
-### 3.3 Why a new keyword (`testbench`) instead of extending `env`?
+### 3.3 Lifecycle semantics
+
+A `testbench` may declare `setup`, `check`, and `teardown` blocks.
+These blocks are inherited by every bound test:
+
+```harc
+testbench CounterLifecycleTb
+    dut : Top
+    expected : uint<32> default 0
+
+    function reset()
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+    end function reset
+
+    setup
+        reset()
+    end setup
+
+    check
+        assert dut.count_out == expected
+            else fail("count_out=${dut.count_out}, expected=${expected}")
+    end check
+end testbench CounterLifecycleTb
+
+impl BumpThree for CounterLifecycleTb
+    run
+        dut.en = 1
+        wait 3 cycles
+        dut.en = 0
+        expected = 3
+    end run
+end impl BumpThree
+```
+
+The generated order for a bound test is deterministic:
+
+```text
+testbench.setup
+test.setup
+test.run
+testbench.check
+test.check
+test.teardown
+testbench.teardown
+```
+
+This solves shared end-of-test checks such as scoreboard emptiness,
+checker-drain accounting, interrupt/perf/debug accounting, and liveness
+cleanup without requiring each testcase author to remember a helper call.
+
+`run` is intentionally rejected inside `testbench`: stimulus belongs to
+the testcase. User-defined `phase <name>` blocks remain test-local helper
+blocks and are not auto-fired.
+
+### 3.4 Why a new keyword (`testbench`) instead of extending `env`?
 
 The `testbench` keyword is already reserved in spec §2 (shared with
 ARCH) and is the lowering target for `test`. Promoting it from "lowering
@@ -197,16 +261,16 @@ model.
 
 The split between `env` and `testbench` becomes meaningful:
 
-| Construct | Owns DUT? | Reusable across DUTs? | Has setup methods? |
+| Construct | Owns DUT? | Reusable across DUTs? | Has setup/final-check blocks? |
 |---|---|---|---|
 | `env` | No | Yes (same env type works against any DUT that exposes the right bus) | No — pure composition |
-| `testbench` | Yes | No (bound to a specific DUT type) | Yes (`fn reset`, `fn preload`, etc.) |
+| `testbench` | Yes | No (bound to a specific DUT type) | Yes (`function reset`, `check`, `teardown`, etc.) |
 
 A `testbench` typically *contains* an `env`. The env stays DUT-agnostic
 and reusable across testbenches; the testbench is the DUT-specific
 binding point.
 
-### 3.3 Testbench-bound test form — `impl <name> for <Tb>`
+### 3.5 Testbench-bound test form — `impl <name> for <Tb>`
 
 The classic `test T { let dut; let tb; run; }` form forces every test to repeat the same instantiation boilerplate (and the awkward `tb.dut = dut` wire-up). The bound form folds the testbench into the test's scope:
 
@@ -253,9 +317,13 @@ end impl EnableToggle
 - User-declared `let X` at test scope shadows any testbench field named `X` (other than `dut`, which is always synthesized).
 - The testbench instance is **fresh per test** — each `impl Foo for Tb` gets its own default-constructed `Tb` allocated at the start of that test's `main()`.
 
-**Lowering.** A pre-emission AST pass (`desugar_impl_for_test_in_file`) expands each `TestDecl` with `for_testbench: Some(...)` into the classic shape: prepend `let dut : <SVType>` and `let _tb : <TbType>`, prepend `_tb.dut = dut` to the run block, and rewrite bare-name references in run / setup / check / teardown / phase bodies. Once desugared, the test threads through the same codegen as a classic-form test.
+**Lowering.** A pre-emission AST pass (`desugar_impl_for_test_in_file`) expands each `TestDecl` with `for_testbench: Some(...)` into the classic shape: prepend `let dut : <SVType>` and `let _tb : <TbType>`, wire `_tb.dut = dut` before the first lifecycle body, merge any `testbench` lifecycle blocks into the test's own `setup` / `check` / `teardown` blocks, and rewrite bare-name references in run / setup / check / teardown / phase bodies. Once desugared, the test threads through the same codegen as a classic-form test.
 
-**Status.** Surface + canary fixture shipped. Phase 2 (a separate PR) sweeps the remaining 69 fixtures from `test T { ... }` to `impl T for SomeTb { ... }` and then removes the classic-form parser entry.
+**Status.** Surface + canary fixtures shipped: `testbench_basic_test.harc`
+for helper reuse and `testbench_lifecycle_test.harc` for inherited
+setup/check behavior. Phase 2 (a separate PR) sweeps the remaining
+fixtures from `test T { ... }` to `impl T for SomeTb { ... }` and then
+removes the classic-form parser entry.
 
 ## 4. Surface — inline `run` inside `test`  *(shipped in PR #91 + #92)*
 
@@ -321,8 +389,8 @@ previously synthesized from `Item::Impl` — so generated C++ for the
 
 A small AST addition shipped alongside: `TestItem::Phase(Ident, Block)`
 captures inline `phase <name>` blocks (the `env_quiesced_phase_test`
-fixture uses one). The codegen `custom_phases` table now reads from
-both that variant and the legacy `ImplItem::Phase` for parity.
+fixture uses one). The codegen `custom_phases` table reads from that
+variant.
 
 ### 4.2 No compatibility with the old form
 
@@ -362,10 +430,13 @@ backend annotations in the source*.
 
 ## 6. Lowering
 
-### 6.1 `testbench`  *(Phase 3, not yet implemented)*
+### 6.1 `testbench`  *(shipped subset)*
 
 A `testbench` declaration lowers to a C++ struct whose fields are the
-component composition, plus methods for each `fn`:
+component composition, plus methods for each `function` or `hookable`.
+The currently shipped C++ backend emits helper methods as capture-by-
+reference lambdas and composes lifecycle blocks into each bound test's
+run coroutine:
 
 ```cpp
 struct AxiLiteTb {
@@ -374,21 +445,15 @@ struct AxiLiteTb {
     AxilXactor    drv;
     AxilSb        sb;
 
-    HarcCoro<void> reset() {
-        dut.rst = 1;
-        // ...
-        co_await wait_cycles(2);
-        dut.rst = 0;
-        co_await wait_cycles(1);
-    }
-
-    HarcCoro<void> drive_random(int n) { /* ... */ }
+    // HARC helper methods lower as free lambdas that take AxiLiteTb&.
+    // HARC lifecycle blocks are spliced into each impl's coroutine.
 };
 ```
 
-Bus bindings and the DUT-to-component wiring are resolved at codegen
-time using field-relative `bind` resolution, the same machinery already
-used for `env` composition.
+Bus bindings and the DUT-to-component wiring are resolved at codegen time
+using the same machinery already used for `env` composition. Lifecycle
+blocks are not runtime registrations; the desugar pass merges them before
+the existing C++ testbench emitter sees the test.
 
 ### 6.2 `test` with inline `run`  *(shipped)*
 
@@ -408,8 +473,9 @@ struct AxiLiteSmokeTest {
 };
 ```
 
-`setup`, `check`, `teardown` lower to additional coroutine methods on
-the same struct, called by the runtime in fixed order per spec §7.2.
+`setup`, `check`, and `teardown` lower into the same generated coroutine
+as `run`, called in fixed order per spec §7.2. For bound tests, any
+testbench lifecycle blocks are already spliced into that order.
 
 ## 7. Migration  *(shipped)*
 
@@ -527,7 +593,8 @@ source-order = invocation-order for readability?
 
 Recommended: no enforcement. The runtime order is documented; the
 source author can group phases by relevance to whatever they're
-emphasizing in that test. Same flexibility as today's `impl sim for T`.
+emphasizing in that test. Same flexibility as inline lifecycle blocks
+inside `test` and `impl <Name> for <Tb>`.
 
 ## 9. Trade-offs accepted
 

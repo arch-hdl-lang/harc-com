@@ -70,9 +70,7 @@ end covergroup FifoCov
 test SyncFifoTest
     let dut : TxQueue
     let cov : FifoCov
-end test SyncFifoTest
 
-impl sim for SyncFifoTest
     run
         // Reset.
         dut.rst = 1
@@ -108,13 +106,22 @@ impl sim for SyncFifoTest
         assert cov.cp_empty.yes > 0 else fail("empty=1 coverage hole")
         assert cov.cp_full.yes  > 0 else fail("full=1 coverage hole")
     end check
-end impl SyncFifoTest
+end test SyncFifoTest
 ```
 
-Two top-level constructs:
+The `test` declares both structure and behavior:
 
-- **`test SyncFifoTest`** declares the test's lets (DUT pointer, covergroup instance, env, etc.) — what to *instantiate*.
-- **`impl sim for SyncFifoTest`** declares the per-target phases (`run`, `check`, `setup`, `teardown`, user `phase <name>`) — what to *do*. Multiple impls per test can target different backends (`impl sim`, `impl emu`, `impl formal` — only `sim` lowered today). The split lets the same instantiation feed different backends without rewriting the body.
+- `let` items instantiate the DUT pointer, covergroups, envs, agents, and
+  scoreboards.
+- `run` is the main stimulus coroutine.
+- Optional `setup`, `check`, and `teardown` blocks run around `run`.
+- User `phase <name>` blocks are named helpers called explicitly from
+  `run` or other phases.
+
+For shared DUT-specific infrastructure, use a `testbench` and bind tests
+with `impl <Name> for <Tb>`. A testbench may own common `setup`, `check`,
+and `teardown` blocks; those blocks automatically compose into every bound
+test, which is useful for shared final scoreboard and drain checks.
 
 Run it:
 
