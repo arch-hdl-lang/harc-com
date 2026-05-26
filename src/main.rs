@@ -4,6 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod trace_merge;
+
 #[derive(Parser, Debug)]
 #[command(name = "harc", version, about = "HARC verification language compiler")]
 struct Cli {
@@ -195,6 +197,21 @@ enum Cmd {
         #[arg(long = "sim-arg")]
         sim_args: Vec<String>,
     },
+    /// Merge a semantic JSONL trace into a signal VCD as synthetic events.
+    TraceMerge {
+        /// Signal waveform VCD produced by `harc sim --waves --wave-format vcd`.
+        #[arg(long)]
+        vcd: PathBuf,
+        /// Semantic JSONL trace produced by `harc sim --record-trace`.
+        #[arg(long)]
+        trace: PathBuf,
+        /// Output merged VCD path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Optional JSON sidecar mapping numeric waveform IDs back to strings.
+        #[arg(long)]
+        map_out: Option<PathBuf>,
+    },
     // ── Learning store (sister to `arch advise` and friends, port of
     // arch-com/src/learn.rs). Every `harc check` / `harc sim` records
     // its failure→fix pairs into `~/.harc/learn/events.jsonl`; the
@@ -335,6 +352,12 @@ fn main() -> Result<()> {
                 )
             })
         }
+        Cmd::TraceMerge {
+            vcd,
+            trace,
+            out,
+            map_out,
+        } => trace_merge::cmd_trace_merge(&vcd, &trace, &out, map_out.as_deref()),
         Cmd::Advise {
             query,
             top,
