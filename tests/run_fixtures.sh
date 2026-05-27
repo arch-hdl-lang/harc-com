@@ -114,6 +114,7 @@ buf_mgr_sm_test         | BufMgrSm       | buf_mgr_sm.sv data_mem_sm.sv free_lis
 aes_cipher_top_test     | AesCipherTop   | aes_cipher_top.sv aes_key_expand_128.sv xtime.sv |
 wide_reg_test           | WideReg        | wide_reg.sv            |
 buf_mgr_test            | BufMgr         | buf_mgr.sv data_mem.sv next_ptr_mem.sv free_list_bank.sv setup_counter.sv |
+sha256_test             | Sha256         | sha256.sv              |
 EOF
 
 PASS=0
@@ -150,7 +151,7 @@ run_one() {
     local out
     # `${ref_args[@]:-}` tolerates an empty array under `set -u` (most
     # fixtures don't pass any --ref-src).
-    out="$("$HARC" sim "${sv_args[@]}" ${ref_args[@]:+"${ref_args[@]}"} "${harc_files[@]}" --top "$top" ${test_args[@]:+"${test_args[@]}"} 2>&1)" || true
+    out="$("$HARC" sim "${sv_args[@]}" ${ref_args[@]+"${ref_args[@]}"} "${harc_files[@]}" --top "$top" ${test_args[@]+"${test_args[@]}"} 2>&1)" || true
 
     if echo "$out" | grep -q "ALL TESTS PASSED"; then
         echo "  PASS  $test"
