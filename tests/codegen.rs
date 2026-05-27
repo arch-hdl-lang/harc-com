@@ -6447,3 +6447,69 @@ fn transactor_field_forward_reference_emits_in_dependency_order() {
          `ProducerXact_count(self.src)`; got:\n{cpp}",
     );
 }
+
+#[test]
+fn regblock_record_write_read_and_callbacks_lower() {
+    // Feature (b): passive address-keyed record API. Feature (c):
+    // per-register write callbacks. See docs/ral-support.md §3.2.
+    let parsed = parse_source(
+        r#"regblock R via H width 32
+    register A @ 0x00 access rw
+    register B @ 0x04 access rw
+end regblock R
+
+test T
+    let dut : SomeDut
+    let regs : R = bind helper
+    run
+        on regs.A
+            log(info, "A written")
+        end on
+        regs.record_write(0x04, 123)
+        let x = regs.record_read(0x00)
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let cpp = cpp_tb::emit(&merged).expect("emit");
+
+    // (b) file-scope decode artifacts: callback holder struct +
+    // passive record_read free function owning the address ladder.
+    assert!(
+        cpp.contains("struct R_Callbacks {")
+            && cpp.contains("std::function<void(uint64_t)> A;")
+            && cpp.contains("std::function<void(uint64_t)> B;"),
+        "expected R_Callbacks struct with a slot per register; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("static inline uint64_t R_record_read(const R_Mirror& m, uint64_t addr)"),
+        "expected generated R_record_read decode function; got:\n{cpp}"
+    );
+
+    // Callback holder instantiated next to the mirror at the binding.
+    assert!(
+        cpp.contains("R_Callbacks regs_cbs;"),
+        "expected per-binding callback holder; got:\n{cpp}"
+    );
+
+    // (c) `on regs.A ... end on` registers a void(uint64_t data) closure.
+    assert!(
+        cpp.contains("regs_cbs.A = [&](uint64_t data) {"),
+        "expected per-register write callback registration; got:\n{cpp}"
+    );
+
+    // (b) record_write decodes the address and updates the matching
+    // mirror cell (masked to width), then fires the register's callback.
+    assert!(
+        cpp.contains("regs.B = (uint32_t)(_rec_data & 0xffffffffull);")
+            && cpp.contains("if (regs_cbs.B) regs_cbs.B(_rec_data);"),
+        "expected record_write mirror update + callback dispatch for B; got:\n{cpp}"
+    );
+
+    // (b) record_read lowers to a call into the generated decode.
+    assert!(
+        cpp.contains("R_record_read(regs, (uint64_t)("),
+        "expected record_read to call the generated decode; got:\n{cpp}"
+    );
+}
