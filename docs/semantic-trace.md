@@ -24,29 +24,25 @@ merged.vcd` overlays those events into a synthetic `harc_semantic` VCD scope.
 
 ## TODOs
 
-1. Add an end-to-end regression fixture that runs `harc sim --waves
-   --wave-format vcd --record-trace`, then runs `harc trace-merge`, and checks
-   that the merged VCD contains the expected semantic scope and event pulses.
-
-2. Capture TLM argument and return values in `tlm_call` events. This needs a
+1. Capture TLM argument and return values in `tlm_call` events. This needs a
    typed serializer that handles scalar, wide, enum, list/vector, and record
    payloads consistently across initiator, fork/join, and target-responder
    paths.
 
-3. Add a direct convenience flow for users who already requested both
+2. Add a direct convenience flow for users who already requested both
    `--waves` and `--record-trace`, for example an opt-in `--merge-trace`
    flag that writes `<wave>.semantic.vcd` automatically after simulation.
 
-4. Improve viewer ergonomics with a generated GTKWave/Surfer save file that
+3. Improve viewer ergonomics with a generated GTKWave/Surfer save file that
    groups `harc_semantic` lanes, shows valid pulses first, and keeps ID fields
    near their string-map comments.
 
-5. Document the FST workflow explicitly. `trace-merge` operates on VCD, so FST
+4. Document the FST workflow explicitly. `trace-merge` operates on VCD, so FST
    users should either request `--wave-format vcd` for semantic overlays or
    convert FST to VCD before merging. A future helper may automate that
    conversion when the required external tool is available.
 
-6. Consider richer event families once the current trace surface has enough
+5. Consider richer event families once the current trace surface has enough
    real fixture use:
    - coverage sample / bin-hit events
    - covergroup hook entry events
