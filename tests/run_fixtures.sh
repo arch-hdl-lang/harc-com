@@ -32,6 +32,7 @@ sync_fifo_test          | TxQueue        | sync_fifo.sv           |
 pipe_reg_test           | PipeRegTest    | pipe_reg_test.sv       |
 single_port_ram_test    | SimpleMem      | single_port_ram.sv     |
 int_regs_test           | IntRegs        | int_regs.sv            |
+dot_product_engine_test | DotProductEngine | dot_product_engine.sv  |
 top_counter_test        | Top            | top_counter.sv         |
 heartbeat_idle_test     | Top            | top_counter.sv         |
 wait_until_quiesce_test | Top            | top_counter.sv         |

@@ -1,0 +1,160 @@
+// HARC TB for dot_product_engine — 8-element signed INT8 dot product engine.
+// DUT: arch-com/examples/dot_product_engine.arch (SV snapshot in tests/dut/).
+//
+// Timing: 1-cycle registered output.
+//   Cycle N  : inputs + valid_in=1 presented.
+//   Cycle N+1: valid_out=1, result holds dot product from cycle N.
+//
+// Run:
+//   harc sim --sv tests/dut/dot_product_engine.sv \
+//             tests/fixtures/dot_product_engine_test.harc \
+//             --top DotProductEngine
+
+testbench DotProductEngineTb
+    dut : DotProductEngine
+end testbench DotProductEngineTb
+
+impl DotProductEngineTest for DotProductEngineTb
+    run
+        // Hold reset; zero-initialise all inputs.
+        dut.rst      = 1
+        dut.valid_in = 0
+        dut.a0 = 0
+        dut.a1 = 0
+        dut.a2 = 0
+        dut.a3 = 0
+        dut.a4 = 0
+        dut.a5 = 0
+        dut.a6 = 0
+        dut.a7 = 0
+        dut.b0 = 0
+        dut.b1 = 0
+        dut.b2 = 0
+        dut.b3 = 0
+        dut.b4 = 0
+        dut.b5 = 0
+        dut.b6 = 0
+        dut.b7 = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // ── Test 1: zero vector ────────────────────────────────────────────
+        // [0,0,0,0,0,0,0,0] · [0,0,0,0,0,0,0,0] = 0
+        dut.valid_in = 1
+        wait 1 cycle
+        dut.valid_in = 0
+        assert dut.valid_out == 1
+            else fail("Test 1: valid_out not asserted")
+        assert dut.result == 0
+            else fail("Test 1: expected 0, got ${dut.result}")
+        log(info, "PASS Test 1: zero-vector dot product = 0")
+
+        // ── Test 2: all-ones × [1,2,3,4,5,6,7,8] = 36 ────────────────────
+        // 1+2+3+4+5+6+7+8 = 36
+        dut.a0 = 1
+        dut.a1 = 1
+        dut.a2 = 1
+        dut.a3 = 1
+        dut.a4 = 1
+        dut.a5 = 1
+        dut.a6 = 1
+        dut.a7 = 1
+        dut.b0 = 1
+        dut.b1 = 2
+        dut.b2 = 3
+        dut.b3 = 4
+        dut.b4 = 5
+        dut.b5 = 6
+        dut.b6 = 7
+        dut.b7 = 8
+        dut.valid_in = 1
+        wait 1 cycle
+        dut.valid_in = 0
+        assert dut.valid_out == 1
+            else fail("Test 2: valid_out not asserted")
+        assert dut.result == 36
+            else fail("Test 2: expected 36, got ${dut.result}")
+        log(info, "PASS Test 2: [1,...,1]·[1,...,8] = 36")
+
+        // ── Test 3: squared-norm of [1,2,3,4,5,6,7,8] = 204 ──────────────
+        // 1²+2²+3²+4²+5²+6²+7²+8² = 1+4+9+16+25+36+49+64 = 204
+        dut.a0 = 1
+        dut.a1 = 2
+        dut.a2 = 3
+        dut.a3 = 4
+        dut.a4 = 5
+        dut.a5 = 6
+        dut.a6 = 7
+        dut.a7 = 8
+        dut.b0 = 1
+        dut.b1 = 2
+        dut.b2 = 3
+        dut.b3 = 4
+        dut.b4 = 5
+        dut.b5 = 6
+        dut.b6 = 7
+        dut.b7 = 8
+        dut.valid_in = 1
+        wait 1 cycle
+        dut.valid_in = 0
+        assert dut.valid_out == 1
+            else fail("Test 3: valid_out not asserted")
+        assert dut.result == 204
+            else fail("Test 3: expected 204, got ${dut.result}")
+        log(info, "PASS Test 3: [1,...,8]·[1,...,8] = 204")
+
+        // ── Test 4: large uniform values [127,...] · [1,...] = 1016 ───────
+        // 8 × 127 = 1016
+        dut.a0 = 127
+        dut.a1 = 127
+        dut.a2 = 127
+        dut.a3 = 127
+        dut.a4 = 127
+        dut.a5 = 127
+        dut.a6 = 127
+        dut.a7 = 127
+        dut.b0 = 1
+        dut.b1 = 1
+        dut.b2 = 1
+        dut.b3 = 1
+        dut.b4 = 1
+        dut.b5 = 1
+        dut.b6 = 1
+        dut.b7 = 1
+        dut.valid_in = 1
+        wait 1 cycle
+        dut.valid_in = 0
+        assert dut.valid_out == 1
+            else fail("Test 4: valid_out not asserted")
+        assert dut.result == 1016
+            else fail("Test 4: expected 1016, got ${dut.result}")
+        log(info, "PASS Test 4: [127,...,127]·[1,...,1] = 1016")
+
+        // ── Test 5: maximum product [127,...] · [127,...] = 129032 ─────────
+        // 8 × 127 × 127 = 129,032 — exercises the full accumulator range.
+        dut.b0 = 127
+        dut.b1 = 127
+        dut.b2 = 127
+        dut.b3 = 127
+        dut.b4 = 127
+        dut.b5 = 127
+        dut.b6 = 127
+        dut.b7 = 127
+        dut.valid_in = 1
+        wait 1 cycle
+        dut.valid_in = 0
+        assert dut.valid_out == 1
+            else fail("Test 5: valid_out not asserted")
+        assert dut.result == 129032
+            else fail("Test 5: expected 129032, got ${dut.result}")
+        log(info, "PASS Test 5: [127,...,127]·[127,...,127] = 129032")
+
+        // ── Test 6: valid_out deasserts one cycle after valid_in deasserts ─
+        wait 1 cycle
+        assert dut.valid_out == 0
+            else fail("Test 6: valid_out should be 0 after valid_in deasserted")
+        log(info, "PASS Test 6: valid_out deasserts correctly")
+
+    end run
+end impl DotProductEngineTest
