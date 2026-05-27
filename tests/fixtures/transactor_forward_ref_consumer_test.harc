@@ -1,0 +1,39 @@
+// Regression for issue #301. The field-owning transactor
+// (`ConsumerXact.src : ProducerXact`) appears first in the source
+// list; `ProducerXact` is declared in
+// `transactor_forward_ref_consumer_test_sim.harc` which comes later.
+//
+// Pre-fix: `harc check` accepted the forward reference but C++
+// codegen emitted `ConsumerXact`'s struct before `ProducerXact`'s
+// (and the `ConsumerXact_observed_count` lambda referenced
+// `ProducerXact_count` before its declaration), producing
+// "ProducerXact_count was not declared in this scope" at C++
+// compile time. The codegen-side fix is a topological sort over
+// component / transactor structs and their hookable-method lambdas,
+// keyed on by-value field-type references.
+//
+// The test in tests/codegen.rs asserts the emitted C++ declares
+// `ProducerXact` (and `ProducerXact_count`) before `ConsumerXact`
+// (and `ConsumerXact_observed_count`), regardless of file order
+// in the source list.
+
+transactor ConsumerXact
+    src : ProducerXact
+
+    hookable observed_count() -> uint<32>
+        return src.count()
+    end observed_count
+end transactor ConsumerXact
+
+testbench ConsumerProducerTb
+    dut : Top
+end testbench ConsumerProducerTb
+
+impl ConsumerProducerTest for ConsumerProducerTb
+    let cons : ConsumerXact passive
+
+    run
+        let v = cons.observed_count()
+        wait 1 cycle
+    end run
+end impl ConsumerProducerTest

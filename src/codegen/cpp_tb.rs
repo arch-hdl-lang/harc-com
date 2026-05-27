@@ -650,9 +650,24 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         }
     }
 
-    // ── Scoreboard structs (just data + default-init; methods inline) ────
-    for it in &file.items {
-        if let Item::Scoreboard(s) = it {
+    // ── Scoreboard / component / transactor structs ─────────────────────
+    // Emitted in field-dependency order so a transactor / component
+    // field whose type is another transactor / component declared
+    // later in the source list still finds a complete C++ type at
+    // its declaration site. See `topo_sort_component_indices` for
+    // the dependency rule and cycle-recovery behaviour, and issue
+    // #301 for the symptom this prevents (transactor field forward
+    // reference passed `harc check` but emitted undeclared C++).
+    //
+    // Scoreboards emit before regular components / transactors in
+    // the source-order pass below ONLY when they have no incoming
+    // edges from a transactor's fields — the topo sort handles the
+    // mixed case correctly. Covergroups still emit earlier (above)
+    // because covergroups are leaf observables that never name a
+    // component or transactor.
+    let component_order = topo_sort_component_indices(file);
+    for &idx in &component_order {
+        if let Item::Scoreboard(s) = &file.items[idx] {
             e.emit_scoreboard(s);
         }
     }
@@ -808,8 +823,13 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // plain field-bearing structs. `hookable` methods are emitted
     // separately as free `[&]`-capturing lambdas (below) so the
     // method body sees `dut` / `tick` / `_checkers` from the test scope.
-    for it in &file.items {
-        match it {
+    //
+    // Emission order: dependency-sorted (`component_order` computed
+    // above). A transactor whose field references another transactor
+    // / component declared later in the source list emits after its
+    // dependency — fixes #301.
+    for &idx in &component_order {
+        match &file.items[idx] {
             Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) => {
                 e.emit_component_struct(c);
             }
@@ -1382,8 +1402,17 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         // test-scope `on obj.method pre/post` registrations) can `[&]`-
         // capture them. Empty vectors are no-ops; the wrap is unconditional.
         let mut emitted_any_method = false;
-        for it in &file.items {
-            match it {
+        // Hook vectors emit in dependency order so that a method
+        // body which calls into another transactor / component's
+        // method finds the corresponding `<Type>_<method>_pre/_post`
+        // vector already declared at its capture site. The vectors
+        // themselves don't reference each other, but the method
+        // lambdas below — which `[&]`-capture these vectors — do
+        // call across component boundaries; co-locating hook
+        // vectors and methods in the same order keeps the capture
+        // graph acyclic. See `topo_sort_component_indices` (#301).
+        for &idx in &component_order {
+            match &file.items[idx] {
                 Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c) => {
                     for ci in &c.items {
                         if let ComponentItem::Hookable(h) = ci {
@@ -1495,8 +1524,17 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         // sequencer / scoreboard) plus transactors. Transactor hookables
         // are emitted via the synth ComponentDecl so the existing
         // emit_component_method path finds the same struct shape.
-        for it in &file.items {
-            match it {
+        //
+        // Emission order: dependency-sorted (`component_order` from
+        // above) — a method body that calls `field.method(...)`
+        // lowers to `<FieldType>_<method>(self.field, ...)`, so the
+        // referenced lambda must be declared before the calling
+        // lambda's `[&]` capture. Source-order emission breaks for
+        // a transactor whose field type appears later in the file
+        // (issue #301); the topo sort guarantees the callee's
+        // lambda is in scope at the caller's capture.
+        for &idx in &component_order {
+            match &file.items[idx] {
                 Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c) => {
                     for ci in &c.items {
                         if let ComponentItem::Hookable(h) = ci {
@@ -2042,6 +2080,160 @@ fn type_simple_name(t: Option<&TypeExpr>) -> Option<&str> {
         TypeExpr::Named { name, .. } => name.segments.last().map(|s| s.name.as_str()),
         _ => None,
     }
+}
+
+/// Topologically sort the indices of `file.items` that hold a
+/// component-shaped declaration (`Agent` / `Env` / `Sequencer` /
+/// `Scoreboard` / `Transactor`) so that every by-value field-type
+/// reference between two items in the set names a type emitted
+/// earlier in the returned order. Items whose types are not part of
+/// the set (DUT modules, transactions, structs, enums, covergroups)
+/// are ignored for dependency purposes — those have their own emit
+/// ordering before this set lands. Non-matching items are dropped
+/// entirely from the result; the caller iterates and pattern-matches
+/// to dispatch (consumers do `match` on `Item::Agent(_) | Item::Env(_)
+/// | Item::Sequencer(_) | Item::Scoreboard(_) | Item::Transactor(_)`).
+///
+/// Ordering rule (Kahn-style with source-order tie-breaking): an item
+/// appears before another item iff the second's field list references
+/// the first's type by simple name. Source order breaks ties so
+/// fixtures with no cross-dependencies still emit in the order users
+/// wrote them — diffs against the pre-sort emitter stay minimal.
+///
+/// Cycle handling: a by-value cycle (`A { b : B }` ↔ `B { a : A }`)
+/// is structurally invalid C++ (infinite size) and rejected by the
+/// language-level check elsewhere; if one slips through, the
+/// remaining nodes fall through in source order so codegen still
+/// emits something and the C++ compiler surfaces the cycle as a
+/// downstream error rather than us silently dropping items.
+///
+/// This sort fixes issue #301: a transactor field whose type is
+/// another transactor defined later in the source list. Prior to
+/// this, both the C++ struct definition and the hookable-method
+/// lambda for the owning transactor referenced the later type as
+/// an undeclared symbol.
+fn topo_sort_component_indices(file: &SourceFile) -> Vec<usize> {
+    // First pass: enumerate eligible items and build the name → index
+    // map. Eligibility = anything we emit a C++ `struct` and/or
+    // hookable-method lambdas for.
+    let mut name_to_idx: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut eligible: Vec<usize> = Vec::new();
+    for (i, it) in file.items.iter().enumerate() {
+        let name = match it {
+            Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c) => {
+                c.name.name.clone()
+            }
+            Item::Transactor(t) => t.name.name.clone(),
+            _ => continue,
+        };
+        name_to_idx.insert(name, i);
+        eligible.push(i);
+    }
+    // Second pass: collect outgoing edges (i depends on j when item i
+    // has a field whose simple type name matches item j's name).
+    let mut deps: std::collections::HashMap<usize, std::collections::HashSet<usize>> =
+        std::collections::HashMap::new();
+    for &i in &eligible {
+        let items: &[ComponentItem] = match &file.items[i] {
+            Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c) => &c.items,
+            Item::Transactor(t) => &t.items,
+            _ => continue,
+        };
+        // Transactors also have an active-only body; field references
+        // there matter too (e.g. an `active` driver might hold a
+        // helper transactor instance).
+        let when_active_items: Option<&[ComponentItem]> = match &file.items[i] {
+            Item::Transactor(t) => t.when_active.as_deref(),
+            _ => None,
+        };
+        let mut entry = std::collections::HashSet::new();
+        let record = |t: &TypeExpr, entry: &mut std::collections::HashSet<usize>| {
+            if let Some(n) = type_simple_name(Some(t)) {
+                if let Some(&j) = name_to_idx.get(n) {
+                    if j != i {
+                        entry.insert(j);
+                    }
+                }
+            }
+        };
+        for ci in items.iter().chain(when_active_items.into_iter().flatten()) {
+            if let ComponentItem::Field(f) = ci {
+                record(&f.ty, &mut entry);
+            }
+        }
+        deps.insert(i, entry);
+    }
+    // Kahn's algorithm with source-order tie-breaking. Indegrees are
+    // taken from the reverse of `deps` (an edge j → i means j must
+    // be emitted before i). We seed the work-list with indegree-0
+    // nodes in source order; popping always takes the smallest-index
+    // ready node so unrelated items keep their source position.
+    let mut indegree: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for &i in &eligible {
+        indegree.insert(i, 0);
+    }
+    for &i in &eligible {
+        if let Some(d) = deps.get(&i) {
+            for _ in d {
+                // Each dep j → i adds one incoming edge to i.
+            }
+            // count properly:
+            *indegree.entry(i).or_insert(0) += d.len();
+        }
+    }
+    // Build the reverse adjacency: for each j, which i's depend on j?
+    let mut reverse: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for &i in &eligible {
+        if let Some(d) = deps.get(&i) {
+            for &j in d {
+                reverse.entry(j).or_default().push(i);
+            }
+        }
+    }
+    let mut ready: Vec<usize> = eligible
+        .iter()
+        .copied()
+        .filter(|i| indegree.get(i).copied().unwrap_or(0) == 0)
+        .collect();
+    ready.sort();
+    let mut order: Vec<usize> = Vec::with_capacity(eligible.len());
+    while let Some(pos) = ready
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, &idx)| idx)
+        .map(|(p, _)| p)
+    {
+        let i = ready.remove(pos);
+        order.push(i);
+        if let Some(children) = reverse.get(&i) {
+            for &c in children {
+                if let Some(deg) = indegree.get_mut(&c) {
+                    if *deg > 0 {
+                        *deg -= 1;
+                        if *deg == 0 {
+                            ready.push(c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if order.len() < eligible.len() {
+        // Cycle in the field-type graph. Recover by appending any
+        // still-unprocessed items in source order so emission isn't
+        // silently truncated; the resulting C++ will surface the
+        // cycle as an "incomplete type" error at the offending field
+        // — which is the structurally correct diagnostic for a
+        // by-value cycle.
+        for &i in &eligible {
+            if !order.contains(&i) {
+                order.push(i);
+            }
+        }
+    }
+    order
 }
 
 /// One registered cover point — what gets reported at end of test.

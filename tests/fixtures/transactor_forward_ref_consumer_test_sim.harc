@@ -1,0 +1,16 @@
+// Companion fixture for `transactor_forward_ref_consumer_test.harc`
+// (issue #301). This file declares `ProducerXact`, the transactor
+// type referenced by `ConsumerXact.src` in the consumer fixture.
+// It appears LATER in the source list — that's the regression
+// trigger.
+//
+// Named with the `_sim.harc` suffix so the `all_fixtures_emit_cleanly`
+// sweep and the `runtime_randomize_boundary_sweep` auto-pair it with
+// its base file (consumer first, sim sibling second) — preserving the
+// source-order ordering that triggers the bug.
+
+transactor ProducerXact
+    hookable count() -> uint<32>
+        return 0u32
+    end count
+end transactor ProducerXact

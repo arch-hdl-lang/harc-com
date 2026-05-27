@@ -6321,3 +6321,81 @@ end impl T"#,
         "expected 1024-bit hex interpolation to use HarcHexBufWide; got:\n{cpp}",
     );
 }
+
+/// Regression for issue #301: a transactor whose field type is another
+/// transactor declared later in the source list previously emitted
+/// undeclared C++ symbols. `harc check` accepted the forward reference,
+/// but the C++ struct definition for the owning transactor put a
+/// by-value member of the as-yet-undeclared type, and the corresponding
+/// hookable-method lambda referenced the referenced transactor's
+/// `<Type>_<method>` helper before its `[&]`-captured declaration.
+///
+/// The fixtures live at
+/// `tests/fixtures/transactor_forward_ref_consumer_test.harc` (declares
+/// `ConsumerXact` with `src : ProducerXact`) and
+/// `tests/fixtures/transactor_forward_ref_producer_test.harc`. The
+/// consumer fixture is loaded FIRST so the regression's source-order
+/// trigger is preserved.
+///
+/// Acceptance: the emitted C++ declares `ProducerXact` before
+/// `ConsumerXact`, and `ProducerXact_count` before
+/// `ConsumerXact_observed_count`. The fix is a topological sort over
+/// component / transactor structs and their hookable-method lambdas
+/// keyed on by-value field-type references; see
+/// `topo_sort_component_indices` in `src/codegen/cpp_tb.rs`.
+#[test]
+fn transactor_field_forward_reference_emits_in_dependency_order() {
+    use std::fs;
+    use std::path::PathBuf;
+
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let consumer_src = fs::read_to_string(fixtures.join("transactor_forward_ref_consumer_test.harc"))
+        .expect("read consumer fixture");
+    let producer_src = fs::read_to_string(
+        fixtures.join("transactor_forward_ref_consumer_test_sim.harc"),
+    )
+    .expect("read producer fixture");
+    // Consumer FIRST — that's the source-order trigger from the bug.
+    let consumer = parse_source(&consumer_src).expect("parse consumer");
+    let producer = parse_source(&producer_src).expect("parse producer");
+    let merged = merge::merge_for_sim(&[consumer, producer], None).expect("merge");
+    let cpp = cpp_tb::emit(&merged).expect("emit");
+
+    let producer_struct = cpp
+        .find("struct ProducerXact")
+        .expect("ProducerXact struct missing from emitted C++");
+    let consumer_struct = cpp
+        .find("struct ConsumerXact")
+        .expect("ConsumerXact struct missing from emitted C++");
+    assert!(
+        producer_struct < consumer_struct,
+        "struct order regressed: ProducerXact must precede ConsumerXact \
+         so the by-value field `src : ProducerXact` resolves to a \
+         complete type. ProducerXact at {producer_struct}, ConsumerXact \
+         at {consumer_struct}",
+    );
+
+    let producer_method = cpp
+        .find("auto ProducerXact_count = ")
+        .expect("ProducerXact_count lambda missing from emitted C++");
+    let consumer_method = cpp
+        .find("auto ConsumerXact_observed_count = ")
+        .expect("ConsumerXact_observed_count lambda missing from emitted C++");
+    assert!(
+        producer_method < consumer_method,
+        "method-lambda order regressed: ProducerXact_count must be \
+         declared before ConsumerXact_observed_count, which calls \
+         ProducerXact_count from its `[&]`-captured body. \
+         ProducerXact_count at {producer_method}, \
+         ConsumerXact_observed_count at {consumer_method}",
+    );
+
+    // Sanity: the call site inside ConsumerXact_observed_count's body
+    // should resolve to ProducerXact_count(self.src) — confirms the
+    // ordering above isn't a hollow win against a different bug path.
+    assert!(
+        cpp.contains("ProducerXact_count(self.src)"),
+        "expected `source.count()` to lower to \
+         `ProducerXact_count(self.src)`; got:\n{cpp}",
+    );
+}
