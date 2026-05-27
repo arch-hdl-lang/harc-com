@@ -1,0 +1,27 @@
+// Regression for issue #300: a transactor-local `hookable` method
+// called from the same transactor's reactive `on N cycles phase
+// post_eval` handler must lower to the qualified
+// `<Type>_<method>(<instance>, ...)` form so the helper symbol is in
+// scope at the call site. Pre-fix, the on-handler body emitted a bare
+// `sample_value()` ident which made the downstream C++ compile fail.
+
+transactor LocalMonitor
+    hookable sample_value() -> uint<32>
+        return 0
+    end sample_value
+
+    on 1 cycles phase post_eval
+        let observed_value = sample_value()
+    end on
+end transactor LocalMonitor
+
+testbench LocalHookablePostEvalTb
+    dut : DummyDut
+    monitor : LocalMonitor active
+end testbench LocalHookablePostEvalTb
+
+impl LocalHookablePostEvalTest for LocalHookablePostEvalTb
+    run
+        wait 2 cycles
+    end run
+end impl LocalHookablePostEvalTest

@@ -5738,8 +5738,27 @@ impl Emitter {
             }
         }
 
+        let comp_ty = comp.name.name.clone();
         for it in &comp.items {
             if let ComponentItem::OnHandler(h) = it {
+                // While emitting a transactor's `on`-handler body, expose
+                // the same `current_component_method` context that
+                // ordinary methods do — receiver = instance path —
+                // so a bare-ident call to a transactor-local
+                // `hookable` rewrites to `<Type>_<method>(<instance>,
+                // …)` (issue #300). Without this, the call emits as a
+                // raw identifier and the generated C++ fails to
+                // compile because the helper symbol isn't in scope.
+                let handler_active = self.handler_lives_in_when_active(&comp_ty, h);
+                let prior_method = std::mem::replace(
+                    &mut self.current_component_method,
+                    Some((
+                        comp_ty.clone(),
+                        instance.to_string(),
+                        format!("on_{}_{}", h.span.start, h.span.end),
+                        handler_active,
+                    )),
+                );
                 if let Some((event_name, arg_name)) = extract_event_subscription(&h.event) {
                     if event_field_names.contains(&event_name) {
                         // Subscriber to a component event field.
@@ -5796,11 +5815,19 @@ impl Emitter {
                         self.current_component_instance = prior_inst;
                         self.pad(depth);
                         writeln!(self.out, "}});").ok();
+                        self.current_component_method = prior_method;
                         continue;
                     }
                 }
-                // Fallback: bool-expression cycle trigger (monitors).
+                // Fallback: bool-expression cycle trigger (monitors) or
+                // periodic `on N cycles` trigger (post_eval / checker).
+                let prior_inst = std::mem::replace(
+                    &mut self.current_component_instance,
+                    Some(instance.to_string()),
+                );
                 self.emit_cycle_trigger(h, depth, tag_prefix);
+                self.current_component_instance = prior_inst;
+                self.current_component_method = prior_method;
             }
         }
 
@@ -8012,6 +8039,24 @@ impl Emitter {
         when_active
             .iter()
             .any(|it| matches!(it, ComponentItem::Hookable(h) if h.name.name == method_name))
+    }
+
+    /// True iff the given `on`-handler is declared inside
+    /// `transactor_name`'s `when active { ... }` block. Identified by
+    /// span equality against the original transactor decl so the check
+    /// works after `synth_component_from_transactor` flattens the items
+    /// list. Returns `false` for non-transactor components, which never
+    /// have a `when active` block.
+    fn handler_lives_in_when_active(&self, comp_ty: &str, handler: &OnHandler) -> bool {
+        let Some(t) = self.transactors.get(comp_ty) else {
+            return false;
+        };
+        let Some(when_active) = &t.when_active else {
+            return false;
+        };
+        when_active.iter().any(|it| {
+            matches!(it, ComponentItem::OnHandler(h) if h.span == handler.span)
+        })
     }
 
     /// Emit a single `hookable` method on a component as a free

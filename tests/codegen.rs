@@ -2143,6 +2143,54 @@ end impl ActivePostEvalProviderCallTest"#,
     );
 }
 
+/// Issue #300 regression: a transactor-local `hookable` method
+/// called from that same transactor's reactive `on N cycles phase
+/// post_eval` handler must lower to the qualified
+/// `<Type>_<method>(<instance>, ...)` form. Without the qualification
+/// the generated C++ emits a bare `<method>()` identifier whose helper
+/// symbol isn't in scope at the emit site, and the downstream C++
+/// compile fails with `'<method>' was not declared in this scope`.
+#[test]
+fn transactor_local_hookable_call_from_post_eval_handler_is_qualified() {
+    let parsed = parse_source(
+        r#"transactor LocalMonitor
+    hookable sample_value() -> uint<32>
+        return 0
+    end sample_value
+
+    on 1 cycles phase post_eval
+        let observed_value = sample_value()
+    end on
+end transactor LocalMonitor
+
+testbench LocalHookableTb
+    dut : DummyDut
+    monitor : LocalMonitor active
+end testbench LocalHookableTb
+
+impl LocalHookableTest for LocalHookableTb
+    run
+        wait 2 cycles
+    end run
+end impl LocalHookableTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("LocalMonitor_sample_value(_tb.monitor)"),
+        "transactor-local hookable call from a periodic post_eval \
+         handler must lower to the qualified \
+         `<Type>_<method>(<instance>)` form; got:\n{cpp}"
+    );
+    // And the bug pattern — a bare `sample_value()` call inside the
+    // post_eval service closure — must not appear, since that's the
+    // exact form that left the downstream C++ compile broken in #300.
+    assert!(
+        !cpp.contains("= sample_value();"),
+        "post-eval body must not emit an unqualified bare-ident hookable call; got:\n{cpp}"
+    );
+}
+
 #[test]
 fn handler_component_field_types_do_not_overwrite_outer_let_types() {
     let parsed = parse_source(
