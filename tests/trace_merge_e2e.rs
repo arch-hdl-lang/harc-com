@@ -35,8 +35,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Minimum number of TLM-call events we expect in the trace. The fixture
-/// drives `read`, `poke`, two `read_ooo` requests, and the matching
-/// responses, so ≥ 8 events is the realistic floor.
+/// drives two `read`s, one `poke`, and two `read_ooo` requests, so the
+/// observed floor in the current trace mode is 6 events (some
+/// request/response pairs may merge into a single recorded edge).
 const MIN_TLM_EVENTS: usize = 6;
 
 fn workspace_root() -> PathBuf {
@@ -206,7 +207,7 @@ fn tlm_call_pulse_times(merged_vcd: &str) -> Vec<u64> {
             // Match `1<id>` exactly (no extra fields after the id).
             for vid in &valid_ids {
                 let needle = format!("1{vid}");
-                if l == needle && seen_at_time.insert(t.wrapping_mul(1000) + 0) {
+                if l == needle && seen_at_time.insert(t) {
                     // record once per timestamp (independent of which lane)
                     pulses.push(t);
                     break;
