@@ -1474,6 +1474,113 @@ end impl Smoke"#,
     );
 }
 
+/// Code-review finding A on PR arch-hdl-lang/harc-com#306: the
+/// `_tb.dut = dut` wire-up MUST precede the first read of
+/// `_tb.dut.*` in ANY lifecycle block. Earlier shape only injected
+/// the wire when at least one `setup` block existed, otherwise put
+/// it at the start of `run` — but `tb.check` and `tb.teardown` can
+/// also dereference `_tb.dut.*`, and run hasn't executed when check
+/// reads at end-of-test in the "no setup anywhere" case. This test
+/// nails down the load-bearing invariant: a tb-only `check` that
+/// reads `dut.*` must still see a wired `_tb.dut` even when neither
+/// testbench nor impl declared a setup.
+#[test]
+fn dut_wire_precedes_lifecycle_reads_with_no_user_setup() {
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : DummyDut
+    check
+        assert dut.done == 1 else fail("dut.done in tb.check")
+    end check
+end testbench Tb
+
+impl Smoke for Tb
+    run
+        wait 1 cycle
+    end run
+end impl Smoke"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    let wire_pos = cpp
+        .find("_tb.dut = dut")
+        .unwrap_or_else(|| panic!("missing `_tb.dut = dut` wire-up; got:\n{cpp}"));
+    // The `tb.check` block reads `_tb.dut->done` (bare `dut.done`
+    // rewritten to point at the testbench's `_tb.dut` view, since
+    // `check` lives on the testbench field-rewrite side, not the
+    // synthesized test-scope `let dut` side).
+    let read_pos = cpp.find("dut->done").unwrap_or_else(|| {
+        panic!("missing `dut->done` read in lowered check; got:\n{cpp}")
+    });
+    assert!(
+        wire_pos < read_pos,
+        "`_tb.dut = dut` wire-up (at {wire_pos}) must precede first \
+         `dut->done` read (at {read_pos}); got:\n{cpp}",
+    );
+}
+
+/// Code-review finding B on PR arch-hdl-lang/harc-com#306: the
+/// bare-statement form of `impl ... for Tb` (no `setup`/`run`/
+/// `check`/`teardown` scopes) MUST go through the same bare-name
+/// rewrite as the scoped form. A bare body that references a
+/// testbench field by bare name must be rewritten to `_tb.<name>`,
+/// just like the scoped form does. This test pins the equivalence.
+#[test]
+fn bare_statement_impl_rewrites_testbench_field_references() {
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : DummyDut
+    expected : uint<32> default 7
+end testbench Tb
+
+impl Smoke for Tb
+    assert expected == 7 else fail("expected not rewritten")
+end impl Smoke"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    // The bare `expected` identifier must be rewritten to
+    // `_tb.expected`, mirroring how the scoped form rewrites
+    // testbench fields inside lifecycle bodies.
+    assert!(
+        cpp.contains("_tb.expected"),
+        "bare-stmt body must rewrite `expected` to `_tb.expected`; got:\n{cpp}",
+    );
+}
+
+/// Code-review finding B follow-on: bare-statement impl bodies
+/// compose with `tb.teardown` in the same emit order as the scoped
+/// form (the scoped form's ordering is covered by
+/// `testbench_and_test_lifecycle_blocks_emit_in_order`). The bare
+/// run stmts must execute before `tb.teardown`.
+#[test]
+fn bare_statement_impl_runs_before_tb_teardown() {
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : DummyDut
+    teardown
+        log(info, "tb teardown after bare")
+    end teardown
+end testbench Tb
+
+impl Smoke for Tb
+    log(info, "bare run body")
+end impl Smoke"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    let run_pos = cpp
+        .find("bare run body")
+        .unwrap_or_else(|| panic!("missing bare run body in:\n{cpp}"));
+    let td_pos = cpp
+        .find("tb teardown after bare")
+        .unwrap_or_else(|| panic!("missing tb teardown in:\n{cpp}"));
+    assert!(
+        run_pos < td_pos,
+        "bare-stmt run must execute before tb.teardown; got:\n{cpp}",
+    );
+}
+
 // The legacy `impl <target> for <Test>` form was removed in Phase 2
 // of docs/test-ergonomics.md, so an emu-only impl is no longer
 // expressible at parse time. Backend selection moves to CLI
