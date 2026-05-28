@@ -3814,6 +3814,61 @@ struct Emitter {
     current_component_method: Option<(String, String, String, bool)>,
 }
 
+/// RAII guard that temporarily overrides a single
+/// `Option<(String, String, String, bool)>` slot — specifically
+/// `Emitter::current_component_method` — and restores the prior
+/// value on drop. Makes the install/restore invariant
+/// compiler-enforced: any control-flow exit from the scope holding
+/// the guard — `continue`, `return`, panic, `?`, fall-through —
+/// runs the restore.
+///
+/// Used in `emit_component_handler_registrations_bound` where each
+/// per-handler iteration has multiple exit paths (the
+/// event-subscription `continue` arm and the fall-through
+/// cycle-trigger arm), so that a future maintainer adding a third
+/// exit doesn't have to remember a manual restore line.
+///
+/// The guard owns `&mut Emitter` and exposes it via
+/// `Deref`/`DerefMut`, so the caller can keep using all of
+/// `Emitter`'s API for the lifetime of the override. The per-handler
+/// emit work is factored into a sibling helper (`emit_single_on_handler_bound`)
+/// that takes `&mut self`; the caller drives that helper through the
+/// guard, and restoration happens on drop after the helper returns
+/// (or panics, or `?`s).
+struct CurrentMethodGuard<'a> {
+    emitter: &'a mut Emitter,
+    saved: Option<(String, String, String, bool)>,
+}
+
+impl<'a> CurrentMethodGuard<'a> {
+    fn new(
+        emitter: &'a mut Emitter,
+        new_value: Option<(String, String, String, bool)>,
+    ) -> Self {
+        let saved = std::mem::replace(&mut emitter.current_component_method, new_value);
+        Self { emitter, saved }
+    }
+}
+
+impl<'a> std::ops::Deref for CurrentMethodGuard<'a> {
+    type Target = Emitter;
+    fn deref(&self) -> &Emitter {
+        self.emitter
+    }
+}
+
+impl<'a> std::ops::DerefMut for CurrentMethodGuard<'a> {
+    fn deref_mut(&mut self) -> &mut Emitter {
+        self.emitter
+    }
+}
+
+impl<'a> Drop for CurrentMethodGuard<'a> {
+    fn drop(&mut self) {
+        self.emitter.current_component_method = self.saved.take();
+    }
+}
+
 impl Emitter {
     fn pad(&mut self, depth: usize) {
         for _ in 0..depth {
@@ -5982,9 +6037,17 @@ impl Emitter {
                 // …)` (issue #300). Without this, the call emits as a
                 // raw identifier and the generated C++ fails to
                 // compile because the helper symbol isn't in scope.
+                //
+                // The override is installed via `CurrentMethodGuard`
+                // so restoration happens on drop — any exit path
+                // from `emit_single_on_handler_bound` (early
+                // `return`, `?`, panic, fall-through) cannot leak
+                // the override into the next iteration. A future
+                // maintainer adding a new exit gets the restore for
+                // free, no manual line to remember.
                 let handler_active = self.handler_lives_in_when_active(&comp_ty, h);
-                let prior_method = std::mem::replace(
-                    &mut self.current_component_method,
+                let mut method_guard = CurrentMethodGuard::new(
+                    self,
                     Some((
                         comp_ty.clone(),
                         instance.to_string(),
@@ -5992,75 +6055,14 @@ impl Emitter {
                         handler_active,
                     )),
                 );
-                if let Some((event_name, arg_name)) = extract_event_subscription(&h.event) {
-                    if event_field_names.contains(&event_name) {
-                        // Subscriber to a component event field.
-                        let arg_ty = self
-                            .event_types
-                            .get(&event_name)
-                            .cloned()
-                            .unwrap_or_else(|| "int64_t".into());
-                        self.pad(depth);
-                        writeln!(
-                            self.out,
-                            "{instance}.{event_name}.push_back([&]({arg_ty} {arg_name}) {{",
-                        )
-                        .ok();
-                        // Activity tracking (spec §7.x): an incoming event
-                        // counts as an "in" for the component instance —
-                        // bump _last_in_cycle to the current cycle. The
-                        // current-component-instance scope is also set
-                        // so any `emit`/`bus.send`/`bus.recv` *inside*
-                        // this body bumps the same instance's
-                        // _last_out_cycle (those sites can't see the
-                        // static `instance` parameter directly).
-                        self.pad(depth + 1);
-                        writeln!(
-                            self.out,
-                            "{instance}._last_in_cycle = (uint64_t)cycle_count;"
-                        )
-                        .ok();
-                        let prior_inst = std::mem::replace(
-                            &mut self.current_component_instance,
-                            Some(instance.to_string()),
-                        );
-                        // For `bound to BusType` components, expose the
-                        // driver's bus binding inside the handler body
-                        // as the bare identifier `bus`. Same root +
-                        // BusDecl as the test-scope binding it was
-                        // bound from, so `bus.<ch>.send/recv` and
-                        // `bus.<ch>.<sig>` lower through the existing
-                        // bus_handshake / bus_field_access paths.
-                        let prior_bus = bound_bus
-                            .as_ref()
-                            .and_then(|b| self.bus_bindings.insert("bus".into(), b.clone()));
-                        self.emit_block(&h.body, depth + 1);
-                        if bound_bus.is_some() {
-                            match prior_bus {
-                                Some(prev) => {
-                                    self.bus_bindings.insert("bus".into(), prev);
-                                }
-                                None => {
-                                    self.bus_bindings.remove("bus");
-                                }
-                            }
-                        }
-                        self.current_component_instance = prior_inst;
-                        self.pad(depth);
-                        writeln!(self.out, "}});").ok();
-                        self.current_component_method = prior_method;
-                        continue;
-                    }
-                }
-                // Fallback: bool-expression cycle trigger (monitors) or
-                // periodic `on N cycles` trigger (post_eval / checker).
-                let prior_inst = std::mem::replace(
-                    &mut self.current_component_instance,
-                    Some(instance.to_string()),
+                method_guard.emit_single_on_handler_bound(
+                    h,
+                    instance,
+                    depth,
+                    tag_prefix,
+                    &event_field_names,
+                    bound_bus.as_ref(),
                 );
-                self.emit_cycle_trigger(h, depth, tag_prefix);
-                self.current_component_instance = prior_inst;
-                self.current_component_method = prior_method;
             }
         }
 
@@ -6078,6 +6080,97 @@ impl Emitter {
         for n in added_events {
             self.event_types.remove(&n);
         }
+    }
+
+    /// Emit a single `on`-handler registration for a bound component
+    /// instance. Picks one of two shapes based on the trigger:
+    ///   * event subscription (`on field { ... }`) — push a closure
+    ///     into the field's subscriber list.
+    ///   * bool-expression cycle trigger / periodic `on N cycles`
+    ///     trigger (monitors, post_eval/checker) — fall through to
+    ///     `emit_cycle_trigger`.
+    ///
+    /// Caller is responsible for installing
+    /// `current_component_method` for this handler (via
+    /// `CurrentMethodGuard`) before invoking; this helper only
+    /// manages the `current_component_instance` scope local to its
+    /// own arms.
+    fn emit_single_on_handler_bound(
+        &mut self,
+        h: &OnHandler,
+        instance: &str,
+        depth: usize,
+        tag_prefix: &str,
+        event_field_names: &std::collections::HashSet<String>,
+        bound_bus: Option<&(BusDecl, String, String)>,
+    ) {
+        if let Some((event_name, arg_name)) = extract_event_subscription(&h.event) {
+            if event_field_names.contains(&event_name) {
+                // Subscriber to a component event field.
+                let arg_ty = self
+                    .event_types
+                    .get(&event_name)
+                    .cloned()
+                    .unwrap_or_else(|| "int64_t".into());
+                self.pad(depth);
+                writeln!(
+                    self.out,
+                    "{instance}.{event_name}.push_back([&]({arg_ty} {arg_name}) {{",
+                )
+                .ok();
+                // Activity tracking (spec §7.x): an incoming event
+                // counts as an "in" for the component instance —
+                // bump _last_in_cycle to the current cycle. The
+                // current-component-instance scope is also set
+                // so any `emit`/`bus.send`/`bus.recv` *inside*
+                // this body bumps the same instance's
+                // _last_out_cycle (those sites can't see the
+                // static `instance` parameter directly).
+                self.pad(depth + 1);
+                writeln!(
+                    self.out,
+                    "{instance}._last_in_cycle = (uint64_t)cycle_count;"
+                )
+                .ok();
+                let prior_inst = std::mem::replace(
+                    &mut self.current_component_instance,
+                    Some(instance.to_string()),
+                );
+                // For `bound to BusType` components, expose the
+                // driver's bus binding inside the handler body
+                // as the bare identifier `bus`. Same root +
+                // BusDecl as the test-scope binding it was
+                // bound from, so `bus.<ch>.send/recv` and
+                // `bus.<ch>.<sig>` lower through the existing
+                // bus_handshake / bus_field_access paths.
+                let prior_bus = bound_bus
+                    .as_ref()
+                    .and_then(|b| self.bus_bindings.insert("bus".into(), (*b).clone()));
+                self.emit_block(&h.body, depth + 1);
+                if bound_bus.is_some() {
+                    match prior_bus {
+                        Some(prev) => {
+                            self.bus_bindings.insert("bus".into(), prev);
+                        }
+                        None => {
+                            self.bus_bindings.remove("bus");
+                        }
+                    }
+                }
+                self.current_component_instance = prior_inst;
+                self.pad(depth);
+                writeln!(self.out, "}});").ok();
+                return;
+            }
+        }
+        // Fallback: bool-expression cycle trigger (monitors) or
+        // periodic `on N cycles` trigger (post_eval / checker).
+        let prior_inst = std::mem::replace(
+            &mut self.current_component_instance,
+            Some(instance.to_string()),
+        );
+        self.emit_cycle_trigger(h, depth, tag_prefix);
+        self.current_component_instance = prior_inst;
     }
 
     /// Emit the C++ boolean expression for "is `_v` in this bin?".
