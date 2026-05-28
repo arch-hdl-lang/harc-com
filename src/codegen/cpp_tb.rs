@@ -2216,10 +2216,9 @@ fn topo_sort_component_indices(file: &SourceFile) -> Vec<usize> {
     }
     for &i in &eligible {
         if let Some(d) = deps.get(&i) {
-            for _ in d {
-                // Each dep j → i adds one incoming edge to i.
-            }
-            // count properly:
+            // `deps[i]` is the set of items i depends on (i must be
+            // emitted after each j ∈ deps[i]). Treating those as edges
+            // j → i, i's indegree is exactly |deps[i]|.
             *indegree.entry(i).or_insert(0) += d.len();
         }
     }
