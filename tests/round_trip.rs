@@ -687,3 +687,19 @@ end test DiscardTest"#;
     assert!(printed.contains("on in_ev(_)"));
     assert!(printed.contains("let _ = 1"));
 }
+
+#[test]
+fn regblock_array_round_trips() {
+    // The `register NAME[N] @ base stride S` array syntax must survive
+    // pretty-printing (docs/ral-support.md §3.3).
+    let src = r#"regblock R via H width 64
+    register CONFIG[5] @ 0x80 stride 0x8 access rw
+        field ENABLE : uint<1> @ 63
+    end register CONFIG
+end regblock R"#;
+    let printed = parse_print_reparse(src);
+    assert!(
+        printed.contains("register CONFIG[5] @ 0x80 stride 0x8"),
+        "array length + stride should survive round-trip; got:\n{printed}"
+    );
+}

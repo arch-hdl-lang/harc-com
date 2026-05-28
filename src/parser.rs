@@ -2284,15 +2284,31 @@ impl Parser {
         let doc = self.consume_outer_doc();
         let start = self.expect(TokenKind::Register)?.span;
         let name = self.expect_ident()?;
+        // `register NAME[N] @ ...` — optional array dimension. Declares an
+        // indexed register array of N elements (docs/ral-support.md §3.3).
+        let array_len = if self.check(TokenKind::LBracket) {
+            self.advance();
+            let n = self.expect_uint_literal("register array length")?;
+            self.expect(TokenKind::RBracket)?;
+            Some(n)
+        } else {
+            None
+        };
         self.expect(TokenKind::AtSign)?;
         let offset = self.parse_expr()?;
 
         let mut width: Option<u32> = None;
         let mut reset: Option<Expr> = None;
         let mut access = RegAccess::Rw;
+        let mut stride: Option<Expr> = None;
         let mut end = offset.span;
         loop {
-            if self.check_ident("width") {
+            if self.check_ident("stride") {
+                self.advance();
+                let e = self.parse_expr()?;
+                end = e.span;
+                stride = Some(e);
+            } else if self.check_ident("width") {
                 self.advance();
                 width = Some(self.expect_uint_literal("width")?);
                 end = self.prev_span_or(end);
@@ -2338,6 +2354,17 @@ impl Parser {
             end = self.expect_end(TokenKind::Register, &name.name)?;
         }
 
+        if stride.is_some() && array_len.is_none() {
+            return Err(CompileError::general(
+                &format!(
+                    "register `{}` has a `stride` but is not an array; \
+                     declare it as `register {}[N] @ ...` or drop `stride`",
+                    name.name, name.name,
+                ),
+                start.merge(end),
+            ));
+        }
+
         Ok(RegisterDecl {
             name,
             offset,
@@ -2345,6 +2372,8 @@ impl Parser {
             reset,
             access,
             fields,
+            array_len,
+            stride,
             span: start.merge(end),
             doc,
         })

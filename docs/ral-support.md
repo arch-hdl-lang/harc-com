@@ -19,6 +19,7 @@ runtime-metaprogramming model of UVM RAL.
 | `addrmap` composition (flat) — multiple regblock instances at distinct bases | **Shipped** | PR #100 (Phase 1e) |
 | Passive `record_write(addr,data)` / `record_read(addr)` mirror API | **Shipped** | Phase 1f |
 | Per-register write callbacks (`on regs.REG ... end on`) | **Shipped** | Phase 1f |
+| Indexed register arrays (`register NAME[N] @ base stride S`) | **Shipped** | Phase 1g |
 | `w1c` / `w1s` / `wclr` / `wset` / `rc` / `rs` policies | **Proposed (deferred)** | testability problem — needs W1C-aware DUT |
 | `alias of` instance aliasing | **Proposed** | Phase 2 |
 | Nested `addrmap`s (addrmap inside addrmap) | **Proposed** | Phase 2 |
@@ -236,6 +237,72 @@ scoreboards/counters.
   write-1 clears) lands with the `w1c`/`w1s`/`rc`/`rs` keyword set.
 
 See `tests/fixtures/regblock_record_test.harc` for the end-to-end shape.
+
+### 3.3 Indexed register arrays  *(shipped, Phase 1g)*
+
+A register declared with an array dimension expands into `N` elements
+sharing one width / reset / access / field layout, located at
+`base + i*stride`:
+
+```harc
+regblock DeviceRegs via AxiLiteCsrBfm width 64
+    register CONTROL @ 0x00
+        field START : uint<1> @ 0
+    end register CONTROL
+
+    register CONFIG[5] @ 0x80 stride 0x8 reset 0x0 access rw
+        field ENABLE : uint<1>  @ 63
+        field MODE   : uint<2>  @ 61
+        field COUNT  : uint<5>  @ 56
+        field BASE   : uint<41> @ 0
+    end register CONFIG
+end regblock DeviceRegs
+```
+
+`stride` is the byte distance between consecutive elements; when omitted
+it defaults to the register's byte size (`ceil(width/8)`). It is only
+valid on an array register.
+
+Elements are accessed by index — the index may be a runtime value:
+
+```harc
+let cfg = regs.CONFIG[slot]            // element read (frontdoor bus read)
+if regs.CONFIG[slot].ENABLE != 0       // element field read
+    regs.CONFIG[slot].MODE = 1         // element field write (read-modify-write)
+end if
+regs.CONFIG[2] = 0xABCD                // element write at a constant index
+```
+
+Each accessor lowers exactly like its scalar counterpart (mirror update,
+read-side predict, `ro`/`wo` policy) but on the indexed mirror cell
+`regs.CONFIG[i]`, with the bus offset computed as `base + i*stride`.
+Arrays also participate in the passive API and `bitbash`:
+
+- `record_write(addr, data)` / `record_read(addr)` decode reaches every
+  element (the generated decode unrolls one branch per element).
+- `bitbash(regs)` walks each element of each RW array register.
+
+**Per-element write callbacks** use a constant index (the callback slot
+must be statically known):
+
+```harc
+on regs.CONFIG[1]                       // fires when element 1 is recorded
+    log(info, "CONFIG[1] = ${data}")
+end on
+```
+
+**Scope and limitations (Phase 1g):**
+
+- **Single dimension.** No nested / multi-dimensional arrays
+  (`NAME[A][B]`); a packed group is modelled with fields, a strided group
+  with the array.
+- **Constant length and stride.** `N` and `stride` are compile-time
+  literals (they fold into the mirror size and address decode).
+- **Constant-index callbacks only.** Reads/writes accept a runtime index;
+  `on regs.NAME[i]` callback registration needs a literal `i`.
+- **Slices** (`regs.NAME[m..n]`) are not supported.
+
+See `tests/fixtures/regblock_array_test.harc` for the end-to-end shape.
 
 ## 4. Surface — `addrmap`  *(Phase 1e shipped, advanced composition pending)*
 

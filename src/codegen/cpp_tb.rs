@@ -727,11 +727,21 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             for reg in &r.registers {
                 let w = reg.width.unwrap_or(default_w);
                 let cty = mirror_field_c_type(w);
-                let init = match &reg.reset {
-                    Some(rv) => format!(" = {}", c_int_literal_from(&rv.kind)),
-                    None => " = 0".to_string(),
+                let one = match &reg.reset {
+                    Some(rv) => c_int_literal_from(&rv.kind),
+                    None => "0".to_string(),
                 };
-                writeln!(e.out, "{INDENT}{cty} {}{};", reg.name.name, init).ok();
+                if let Some(n) = reg.array_len {
+                    let inits = vec![one.as_str(); n as usize].join(", ");
+                    writeln!(
+                        e.out,
+                        "{INDENT}{cty} {}[{n}] = {{ {inits} }};",
+                        reg.name.name,
+                    )
+                    .ok();
+                } else {
+                    writeln!(e.out, "{INDENT}{cty} {} = {one};", reg.name.name).ok();
+                }
             }
             writeln!(e.out, "}};").ok();
             writeln!(e.out, "").ok();
@@ -754,13 +764,25 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             .ok();
             for reg in &r.registers {
                 let w = reg.width.unwrap_or(default_w);
-                let off = c_int_literal_from(&reg.offset.kind);
-                writeln!(
-                    e.out,
-                    "{INDENT}{{ \"{name}\", {off}, {w} }},",
-                    name = reg.name.name,
-                )
-                .ok();
+                if let Some(n) = reg.array_len {
+                    for i in 0..n {
+                        let off = reg_elem_offset(reg, default_w, i);
+                        writeln!(
+                            e.out,
+                            "{INDENT}{{ \"{name}[{i}]\", {off}, {w} }},",
+                            name = reg.name.name,
+                        )
+                        .ok();
+                    }
+                } else {
+                    let off = c_int_literal_from(&reg.offset.kind);
+                    writeln!(
+                        e.out,
+                        "{INDENT}{{ \"{name}\", {off}, {w} }},",
+                        name = reg.name.name,
+                    )
+                    .ok();
+                }
             }
             writeln!(e.out, "}};").ok();
             writeln!(e.out, "").ok();
@@ -777,12 +799,21 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             // See docs/ral-support.md §3.2.
             writeln!(e.out, "struct {}_Callbacks {{", r.name.name).ok();
             for reg in &r.registers {
-                writeln!(
-                    e.out,
-                    "{INDENT}std::function<void(uint64_t)> {};",
-                    reg.name.name,
-                )
-                .ok();
+                if let Some(n) = reg.array_len {
+                    writeln!(
+                        e.out,
+                        "{INDENT}std::function<void(uint64_t)> {}[{n}];",
+                        reg.name.name,
+                    )
+                    .ok();
+                } else {
+                    writeln!(
+                        e.out,
+                        "{INDENT}std::function<void(uint64_t)> {};",
+                        reg.name.name,
+                    )
+                    .ok();
+                }
             }
             writeln!(e.out, "}};").ok();
             writeln!(e.out, "").ok();
@@ -794,13 +825,25 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             )
             .ok();
             for reg in &r.registers {
-                let off = c_int_literal_from(&reg.offset.kind);
-                writeln!(
-                    e.out,
-                    "{INDENT}if (addr == (uint64_t)({off})) return (uint64_t)m.{};",
-                    reg.name.name,
-                )
-                .ok();
+                if let Some(n) = reg.array_len {
+                    for i in 0..n {
+                        let off = reg_elem_offset(reg, default_w, i);
+                        writeln!(
+                            e.out,
+                            "{INDENT}if (addr == (uint64_t)({off})) return (uint64_t)m.{}[{i}];",
+                            reg.name.name,
+                        )
+                        .ok();
+                    }
+                } else {
+                    let off = c_int_literal_from(&reg.offset.kind);
+                    writeln!(
+                        e.out,
+                        "{INDENT}if (addr == (uint64_t)({off})) return (uint64_t)m.{};",
+                        reg.name.name,
+                    )
+                    .ok();
+                }
             }
             writeln!(e.out, "{INDENT}return 0;").ok();
             writeln!(e.out, "}}").ok();
@@ -13452,33 +13495,22 @@ impl Emitter {
                 // before the cycle-trigger fallback (a regblock register
                 // has no meaningful boolean-trigger reading — that would
                 // issue a bus read every cycle). See docs/ral-support.md §3.2.
+                // Also accepts `on regs.NAME[K] ... end on` for an array
+                // register element (constant index K); the slot is
+                // `<regs>_cbs.NAME[K]`. Variable-index registration isn't
+                // supported (the slot must be statically known).
                 if h.hook.is_none() && !h.periodic {
-                    if let ExprKind::Field {
-                        target,
-                        name: reg_name,
-                    } = &*h.event.kind
-                    {
-                        if let ExprKind::Ident(regs_id) = &*target.kind {
-                            let is_reg = self
-                                .let_types
-                                .get(&regs_id.name)
-                                .and_then(|ty| self.regblocks.get(ty))
-                                .map(|b| b.registers.iter().any(|r| r.name.name == reg_name.name))
-                                .unwrap_or(false);
-                            if is_reg {
-                                self.pad(depth);
-                                writeln!(
-                                    self.out,
-                                    "{}_cbs.{} = [&](uint64_t data) {{",
-                                    regs_id.name, reg_name.name,
-                                )
-                                .ok();
-                                self.emit_block(&h.body, depth + 1);
-                                self.pad(depth);
-                                writeln!(self.out, "}};").ok();
-                                return;
-                            }
-                        }
+                    if let Some((regs_var, slot)) = self.resolve_regblock_callback_slot(&h.event) {
+                        self.pad(depth);
+                        writeln!(
+                            self.out,
+                            "{regs_var}_cbs.{slot} = [&](uint64_t data) {{",
+                        )
+                        .ok();
+                        self.emit_block(&h.body, depth + 1);
+                        self.pad(depth);
+                        writeln!(self.out, "}};").ok();
+                        return;
                     }
                 }
                 if let ExprKind::Call { callee, args } = &*h.event.kind {
@@ -14240,7 +14272,6 @@ impl Emitter {
         for reg in &block.registers {
             let w = reg.width.unwrap_or(default_w);
             let mask: u64 = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-            let off = c_int_literal_from(&reg.offset.kind);
             let regname = &reg.name.name;
             if !reg.access.writes_to_bus() || !reg.access.reads_from_bus() {
                 self.pad(depth);
@@ -14253,33 +14284,43 @@ impl Emitter {
                 .ok();
                 continue;
             }
-            // Two patterns: all-ones (masked to register width), then
-            // zero. Each pair: write → read → compare → bump errors
-            // if mismatch + sim_log.
-            for (pat_label, pat) in [("ones", mask), ("zero", 0u64)] {
-                self.pad(depth);
-                writeln!(self.out, "{{").ok();
-                self.pad(depth + 1);
-                writeln!(self.out, "uint64_t _bb_pat = 0x{pat:x}ull;").ok();
-                self.pad(depth + 1);
-                writeln!(self.out, "{helper_ty}_write({helper_var}, {off}, _bb_pat);").ok();
-                self.pad(depth + 1);
-                writeln!(
-                    self.out,
-                    "uint64_t _bb_got = {helper_ty}_read({helper_var}, {off});"
-                )
-                .ok();
-                self.pad(depth + 1);
-                writeln!(self.out, "if (_bb_got != _bb_pat) {{").ok();
-                self.pad(depth + 2);
-                writeln!(self.out,
-                    "sim_log_line(\"FAIL\", \"bitbash {regname} {pat_label}: wrote 0x%llx, got 0x%llx\", (long long)_bb_pat, (long long)_bb_got);").ok();
-                self.pad(depth + 2);
-                writeln!(self.out, "errors++;").ok();
-                self.pad(depth + 1);
-                writeln!(self.out, "}}").ok();
-                self.pad(depth);
-                writeln!(self.out, "}}").ok();
+            // One walk per element; scalar registers walk a single
+            // "element" at the base offset with an empty index label.
+            let elems: Vec<(String, String)> = match reg.array_len {
+                Some(n) => (0..n)
+                    .map(|i| (reg_elem_offset(reg, default_w, i), format!("[{i}]")))
+                    .collect(),
+                None => vec![(c_int_literal_from(&reg.offset.kind), String::new())],
+            };
+            for (off, idx) in &elems {
+                // Two patterns: all-ones (masked to register width), then
+                // zero. Each pair: write → read → compare → bump errors
+                // if mismatch + sim_log.
+                for (pat_label, pat) in [("ones", mask), ("zero", 0u64)] {
+                    self.pad(depth);
+                    writeln!(self.out, "{{").ok();
+                    self.pad(depth + 1);
+                    writeln!(self.out, "uint64_t _bb_pat = 0x{pat:x}ull;").ok();
+                    self.pad(depth + 1);
+                    writeln!(self.out, "{helper_ty}_write({helper_var}, {off}, _bb_pat);").ok();
+                    self.pad(depth + 1);
+                    writeln!(
+                        self.out,
+                        "uint64_t _bb_got = {helper_ty}_read({helper_var}, {off});"
+                    )
+                    .ok();
+                    self.pad(depth + 1);
+                    writeln!(self.out, "if (_bb_got != _bb_pat) {{").ok();
+                    self.pad(depth + 2);
+                    writeln!(self.out,
+                        "sim_log_line(\"FAIL\", \"bitbash {regname}{idx} {pat_label}: wrote 0x%llx, got 0x%llx\", (long long)_bb_pat, (long long)_bb_got);").ok();
+                    self.pad(depth + 2);
+                    writeln!(self.out, "errors++;").ok();
+                    self.pad(depth + 1);
+                    writeln!(self.out, "}}").ok();
+                    self.pad(depth);
+                    writeln!(self.out, "}}").ok();
+                }
             }
         }
         true
@@ -14336,14 +14377,24 @@ impl Emitter {
             let w = reg.width.unwrap_or(default_w);
             let mask: u64 = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
             let cty = mirror_field_c_type(w);
-            let off = c_int_literal_from(&reg.offset.kind);
             let regname = &reg.name.name;
-            self.pad(depth + 1);
-            writeln!(
-                self.out,
-                "if (_rec_addr == (uint64_t)({off})) {{ {regs_var}.{regname} = ({cty})(_rec_data & 0x{mask:x}ull); if ({regs_var}_cbs.{regname}) {regs_var}_cbs.{regname}(_rec_data); }}",
-            )
-            .ok();
+            // Each branch keys a runtime address against a compile-time
+            // element offset, so array dispatch (and its per-element
+            // callback) is just an unrolled set of scalar branches.
+            let elems: Vec<(String, String)> = match reg.array_len {
+                Some(n) => (0..n)
+                    .map(|i| (reg_elem_offset(reg, default_w, i), format!("[{i}]")))
+                    .collect(),
+                None => vec![(c_int_literal_from(&reg.offset.kind), String::new())],
+            };
+            for (off, idx) in elems {
+                self.pad(depth + 1);
+                writeln!(
+                    self.out,
+                    "if (_rec_addr == (uint64_t)({off})) {{ {regs_var}.{regname}{idx} = ({cty})(_rec_data & 0x{mask:x}ull); if ({regs_var}_cbs.{regname}{idx}) {regs_var}_cbs.{regname}{idx}(_rec_data); }}",
+                )
+                .ok();
+            }
         }
         self.pad(depth);
         writeln!(self.out, "}}").ok();
@@ -14509,6 +14560,11 @@ impl Emitter {
         let regs_ty = self.let_types.get(&regs_id.name)?;
         let block = self.regblocks.get(regs_ty)?;
         let reg = block.registers.iter().find(|r| r.name.name == name.name)?;
+        // Array registers must be indexed (`regs.NAME[i]`); the bare form
+        // is handled by the array accessor paths, not here.
+        if reg.array_len.is_some() {
+            return None;
+        }
         let helper_var = self.let_helper.get(&regs_id.name)?.clone();
         let helper_ty = self.let_types.get(&helper_var)?.clone();
         let offset_lit = c_int_literal_from(&reg.offset.kind);
@@ -14526,6 +14582,128 @@ impl Emitter {
         target: &Expr,
     ) -> Option<(String, String, String, String, RegAccess)> {
         self.resolve_regblock_field_lookup(target)
+    }
+
+    /// Match `regs.NAME[i]` where `regs` is a regblock binding and NAME
+    /// is an array register. Returns `(regs_var, helper_var, helper_ty,
+    /// reg_clone, reg_width, base_offset_lit, stride_expr, &index_expr)`.
+    /// The index expression is returned by reference so the caller emits
+    /// it inline (it can be a runtime value, e.g. `regs.CONFIG[slot]`).
+    /// See docs/ral-support.md §3.3.
+    fn match_regblock_array_register<'e>(
+        &self,
+        e: &'e Expr,
+    ) -> Option<(String, String, String, RegisterDecl, u32, String, String, &'e Expr)> {
+        let ExprKind::Index { target, index } = &*e.kind else {
+            return None;
+        };
+        let ExprKind::Field {
+            target: outer,
+            name,
+        } = &*target.kind
+        else {
+            return None;
+        };
+        let ExprKind::Ident(regs_id) = &*outer.kind else {
+            return None;
+        };
+        let regs_ty = self.let_types.get(&regs_id.name)?;
+        let block = self.regblocks.get(regs_ty)?;
+        let reg = block.registers.iter().find(|r| r.name.name == name.name)?;
+        reg.array_len?;
+        let default_w = block.default_width.unwrap_or(32);
+        let w = reg.width.unwrap_or(default_w);
+        let helper_var = self.let_helper.get(&regs_id.name)?.clone();
+        let helper_ty = self.let_types.get(&helper_var)?.clone();
+        let base = c_int_literal_from(&reg.offset.kind);
+        let stride = reg_array_stride(reg, default_w);
+        Some((
+            regs_id.name.clone(),
+            helper_var,
+            helper_ty,
+            reg.clone(),
+            w,
+            base,
+            stride,
+            index,
+        ))
+    }
+
+    /// Match `regs.NAME[i].FIELD` — an array register element's field.
+    /// Returns the register metadata from `match_regblock_array_register`
+    /// plus the resolved `FieldDecl`.
+    fn match_regblock_array_field<'e>(
+        &self,
+        e: &'e Expr,
+    ) -> Option<(
+        String,
+        String,
+        String,
+        RegisterDecl,
+        u32,
+        String,
+        String,
+        &'e Expr,
+        FieldDecl,
+    )> {
+        let ExprKind::Field {
+            target: inner,
+            name: fld_name,
+        } = &*e.kind
+        else {
+            return None;
+        };
+        let (regs_var, helper_var, helper_ty, reg, w, base, stride, index) =
+            self.match_regblock_array_register(inner)?;
+        let fld = reg.fields.iter().find(|f| f.name.name == fld_name.name)?.clone();
+        Some((
+            regs_var, helper_var, helper_ty, reg, w, base, stride, index, fld,
+        ))
+    }
+
+    /// Resolve a write-callback event (`on regs.REG ...` / `on
+    /// regs.ARR[K] ...`) to `(regs_var, slot)` where `slot` is the
+    /// `<regs>_cbs` member to assign: `REG` for a scalar register or
+    /// `ARR[K]` for an array element at constant index `K`. Returns
+    /// `None` for any other event shape (cycle triggers, events, etc.).
+    fn resolve_regblock_callback_slot(&self, event: &Expr) -> Option<(String, String)> {
+        // Scalar: `regs.NAME`.
+        if let ExprKind::Field { target, name } = &*event.kind {
+            if let ExprKind::Ident(regs_id) = &*target.kind {
+                let block = self
+                    .let_types
+                    .get(&regs_id.name)
+                    .and_then(|ty| self.regblocks.get(ty))?;
+                let reg = block.registers.iter().find(|r| r.name.name == name.name)?;
+                // Array registers need an index — handled below.
+                return reg
+                    .array_len
+                    .is_none()
+                    .then(|| (regs_id.name.clone(), name.name.clone()));
+            }
+        }
+        // Array element: `regs.NAME[K]` with a constant K in range.
+        if let ExprKind::Index { target, index } = &*event.kind {
+            if let ExprKind::Field {
+                target: outer,
+                name,
+            } = &*target.kind
+            {
+                if let ExprKind::Ident(regs_id) = &*outer.kind {
+                    let block = self
+                        .let_types
+                        .get(&regs_id.name)
+                        .and_then(|ty| self.regblocks.get(ty))?;
+                    let reg = block.registers.iter().find(|r| r.name.name == name.name)?;
+                    let n = reg.array_len?;
+                    let k = const_u32_literal(index)?;
+                    if k < n {
+                        return Some((regs_id.name.clone(), format!("{}[{k}]", name.name)));
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// If `target` is a 3-level `regs.REG.FIELD` access where `regs`
@@ -14570,6 +14748,11 @@ impl Emitter {
             .registers
             .iter()
             .find(|r| r.name.name == reg_name.name)?;
+        // Array-register fields are reached via `regs.NAME[i].FIELD`, not
+        // this 3-level scalar path.
+        if reg.array_len.is_some() {
+            return None;
+        }
         let fld = reg.fields.iter().find(|f| f.name.name == fld_name.name)?;
         let helper_var = self.let_helper.get(&regs_id.name)?.clone();
         let helper_ty = self.let_types.get(&helper_var)?.clone();
@@ -14732,6 +14915,80 @@ impl Emitter {
                 writeln!(
                     self.out,
                     "// RO register — write to bus suppressed (mirror updated)"
+                )
+                .ok();
+            }
+            return;
+        }
+
+        // RAL array-register field write: `regs.NAME[i].FIELD = expr`.
+        // Read-modify-write on the indexed mirror cell + a bus write of
+        // the full element word at `base + i*stride`. Checked before the
+        // array register-level write (more specific). See §3.3.
+        if let Some((regs_var, helper_var, helper_ty, reg, _w, base, stride, index, fld)) =
+            self.match_regblock_array_field(target)
+        {
+            let reg_c_type = mirror_field_c_type(reg.width.unwrap_or(32).max(1));
+            let reg_name = &reg.name.name;
+            let bit_pos = fld.bit_pos;
+            let bit_width = field_bit_width(&fld.ty);
+            let mask = field_mask_literal(bit_width);
+            write!(self.out, "{regs_var}.{reg_name}[").ok();
+            self.emit_expr(index);
+            write!(
+                self.out,
+                "] = ({regs_var}.{reg_name}[",
+            )
+            .ok();
+            self.emit_expr(index);
+            write!(
+                self.out,
+                "] & ~(({reg_c_type})0x{mask:x}u << {bit_pos})) | (((({reg_c_type})(",
+            )
+            .ok();
+            self.emit_expr(value);
+            writeln!(self.out, ")) & 0x{mask:x}u) << {bit_pos});").ok();
+            if fld.access.writes_to_bus() {
+                self.pad(depth);
+                write!(self.out, "{helper_ty}_write({helper_var}, ({base} + (").ok();
+                self.emit_expr(index);
+                write!(self.out, ")*{stride}), {regs_var}.{reg_name}[").ok();
+                self.emit_expr(index);
+                writeln!(self.out, "]);").ok();
+            } else {
+                self.pad(depth);
+                writeln!(
+                    self.out,
+                    "// RO field — write to bus suppressed (array mirror still updated)"
+                )
+                .ok();
+            }
+            return;
+        }
+
+        // RAL array register-level write: `regs.NAME[i] = expr`. Mirror
+        // cell update + bus write at `base + i*stride`. See §3.3.
+        if let Some((regs_var, helper_var, helper_ty, reg, _w, base, stride, index)) =
+            self.match_regblock_array_register(target)
+        {
+            let reg_name = &reg.name.name;
+            write!(self.out, "{regs_var}.{reg_name}[").ok();
+            self.emit_expr(index);
+            write!(self.out, "] = ").ok();
+            self.emit_expr(value);
+            writeln!(self.out, ";").ok();
+            if reg.access.writes_to_bus() {
+                self.pad(depth);
+                write!(self.out, "{helper_ty}_write({helper_var}, ({base} + (").ok();
+                self.emit_expr(index);
+                write!(self.out, ")*{stride}), ").ok();
+                self.emit_expr(value);
+                writeln!(self.out, ");").ok();
+            } else {
+                self.pad(depth);
+                writeln!(
+                    self.out,
+                    "// RO register — write to bus suppressed (array mirror updated)"
                 )
                 .ok();
             }
@@ -14969,6 +15226,43 @@ impl Emitter {
                         return;
                     }
                 }
+                // RAL array-register field read: `regs.NAME[i].FIELD`.
+                // Same shape as the scalar field read but on the indexed
+                // mirror cell, with the element bus offset. See §3.3.
+                if !lvalue {
+                    if let Some((
+                        regs_var,
+                        helper_var,
+                        helper_ty,
+                        reg,
+                        _w,
+                        base,
+                        stride,
+                        index,
+                        fld,
+                    )) = self.match_regblock_array_field(e)
+                    {
+                        let reg_name = &reg.name.name;
+                        let bit_pos = fld.bit_pos;
+                        let mask = field_mask_literal(field_bit_width(&fld.ty));
+                        if fld.access.reads_from_bus() {
+                            write!(self.out, "((({regs_var}.{reg_name}[").ok();
+                            self.emit_expr(index);
+                            write!(
+                                self.out,
+                                "] = {helper_ty}_read({helper_var}, ({base} + (",
+                            )
+                            .ok();
+                            self.emit_expr(index);
+                            write!(self.out, ")*{stride}))) >> {bit_pos}) & 0x{mask:x}u)").ok();
+                        } else {
+                            write!(self.out, "(({regs_var}.{reg_name}[").ok();
+                            self.emit_expr(index);
+                            write!(self.out, "] >> {bit_pos}) & 0x{mask:x}u)").ok();
+                        }
+                        return;
+                    }
+                }
                 // RAL frontdoor field-level read: `regs.REG.FIELD`.
                 // For RW/RO: `((regs.REG = <H>_read(helper, OFFSET)) >> POS) & MASK`
                 // — bus read updates the mirror (read-side predict) AND
@@ -15095,6 +15389,34 @@ impl Emitter {
                 }
             }
             ExprKind::Index { target, index } => {
+                // RAL array register-level read: `regs.NAME[i]` rvalue.
+                // RW/RO: `(regs.NAME[i] = <H>_read(helper, base+i*stride))`
+                // — assignment-expression form so the mirror updates and
+                // the expression yields the value. WO: serve from mirror.
+                // See docs/ral-support.md §3.3.
+                if !lvalue {
+                    if let Some((regs_var, helper_var, helper_ty, reg, _w, base, stride, idx)) =
+                        self.match_regblock_array_register(e)
+                    {
+                        let reg_name = &reg.name.name;
+                        if reg.access.reads_from_bus() {
+                            write!(self.out, "({regs_var}.{reg_name}[").ok();
+                            self.emit_expr(idx);
+                            write!(
+                                self.out,
+                                "] = {helper_ty}_read({helper_var}, ({base} + (",
+                            )
+                            .ok();
+                            self.emit_expr(idx);
+                            write!(self.out, ")*{stride})))").ok();
+                        } else {
+                            write!(self.out, "{regs_var}.{reg_name}[").ok();
+                            self.emit_expr(idx);
+                            write!(self.out, "]").ok();
+                        }
+                        return;
+                    }
+                }
                 // Pass `lvalue=true` to suppress the `harc_rt::harc_read`
                 // wrap on a pointer-rooted Field target. Indexing a
                 // wide signal (VlWide<N>) needs the raw `dut->field`
@@ -17327,6 +17649,49 @@ fn c_int_literal_from(k: &ExprKind) -> String {
     match k {
         ExprKind::Int(s) => c_int_literal(s),
         _ => "0".to_string(),
+    }
+}
+
+/// Evaluate an integer-literal expression to a `u32` (decimal / `0x` /
+/// `0b`, underscores allowed). Returns `None` for non-literal exprs —
+/// used for constant array indices that must be known at codegen time.
+fn const_u32_literal(e: &Expr) -> Option<u32> {
+    let ExprKind::Int(s) = &*e.kind else {
+        return None;
+    };
+    let t = s.replace('_', "");
+    let v = if let Some(r) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u64::from_str_radix(r, 16).ok()
+    } else if let Some(r) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+        u64::from_str_radix(r, 2).ok()
+    } else {
+        t.parse::<u64>().ok()
+    };
+    v.and_then(|v| u32::try_from(v).ok())
+}
+
+/// Byte stride between elements of an array register, as a C expr string.
+/// An explicit `stride` clause wins; otherwise default to the register's
+/// byte size (`ceil(width/8)`).
+fn reg_array_stride(reg: &RegisterDecl, default_w: u32) -> String {
+    match &reg.stride {
+        Some(s) => c_int_literal_from(&s.kind),
+        None => {
+            let w = reg.width.unwrap_or(default_w);
+            format!("{}", (w + 7) / 8)
+        }
+    }
+}
+
+/// Byte offset of element `i` of a (possibly array) register, as a C expr
+/// string. Scalar registers ignore `i` and yield the base offset literal.
+fn reg_elem_offset(reg: &RegisterDecl, default_w: u32, i: u32) -> String {
+    let base = c_int_literal_from(&reg.offset.kind);
+    if reg.array_len.is_some() {
+        let stride = reg_array_stride(reg, default_w);
+        format!("({base} + {i}*{stride})")
+    } else {
+        base
     }
 }
 

@@ -204,6 +204,16 @@ pub struct RegisterDecl {
     /// Field-level bit-slice declarations. Empty for the single-line
     /// register form. See `FieldDecl` and docs/ral-support.md §3.1.
     pub fields: Vec<FieldDecl>,
+    /// `register NAME[N] @ ...` — indexed register array. `None` means a
+    /// scalar register; `Some(n)` declares `n` elements sharing the same
+    /// width/reset/access/field layout, located at `offset + i*stride`.
+    /// Accessed as `regs.NAME[i]` / `regs.NAME[i].FIELD`. See
+    /// docs/ral-support.md §3.3.
+    pub array_len: Option<u32>,
+    /// Byte stride between array elements. `None` with `array_len` set
+    /// defaults to the register's byte size (`ceil(width/8)`). Ignored
+    /// for scalar registers.
+    pub stride: Option<Expr>,
     pub span: Span,
     pub doc: Option<String>,
 }

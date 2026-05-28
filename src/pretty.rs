@@ -193,8 +193,16 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
             for reg in &r.registers {
                 print_doc(out, &reg.doc, depth + 1);
                 pad(out, depth + 1);
-                write!(out, "register {} @ ", reg.name.name).ok();
+                write!(out, "register {}", reg.name.name).ok();
+                if let Some(n) = reg.array_len {
+                    write!(out, "[{n}]").ok();
+                }
+                write!(out, " @ ").ok();
                 print_expr(out, &reg.offset);
+                if let Some(s) = &reg.stride {
+                    write!(out, " stride ").ok();
+                    print_expr(out, s);
+                }
                 if let Some(w) = reg.width {
                     write!(out, " width {w}").ok();
                 }

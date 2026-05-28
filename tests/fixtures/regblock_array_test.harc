@@ -1,0 +1,110 @@
+// RAL indexed register arrays (docs/ral-support.md §3.3).
+//
+// A `register NAME[N] @ base stride S` declares N elements sharing one
+// width/reset/access/field layout, located at `base + i*S`. This kills
+// the "dozens of repeated scalar fields + manual address ladder" pattern
+// from issue #218: declare the array once, access it as `regs.NAME[i]`.
+//
+//   regs.CONFIG[2] = v              // element write (active frontdoor)
+//   regs.CONFIG[slot].MODE = m      // element field write (runtime index)
+//   let c = regs.CONFIG[slot]       // element read
+//   let e = regs.CONFIG[i].ENABLE   // element field read
+//   on regs.CONFIG[1] ... end on    // per-element write callback (const i)
+//   regs.record_write(addr, data)   // passive decode reaches array elems
+//
+// The element index may be a runtime value for reads/writes; callback
+// registration needs a constant index (the slot is static).
+
+use BusAxiLite
+
+transactor AxilHelper bound to BusAxiLite
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            bus.aw.addr = addr
+            bus.aw.valid = 1
+            bus.w.send(data, 15)
+            bus.aw.valid = 0
+            wait 1 cycle
+        end write
+
+        hookable read(addr: uint<8>) -> uint<32>
+            bus.ar.addr = addr
+            bus.ar.valid = 1
+            let r = bus.r.recv()
+            bus.ar.valid = 0
+            wait 1 cycle
+            return r.data
+        end read
+    end when
+end transactor AxilHelper
+
+regblock DmaRegs via AxilHelper width 32
+    /// Scalar control register (coexists with the array below).
+    register CONTROL @ 0x00 access rw
+        field RUN : uint<1> @ 0
+    end register CONTROL
+
+    /// 4-element configuration array at 0x40, 0x44, 0x48, 0x4c.
+    register CONFIG[4] @ 0x40 stride 0x4 access rw
+        field ENABLE : uint<1> @ 31
+        field MODE   : uint<2> @ 28
+        field COUNT  : uint<8> @ 0
+    end register CONFIG
+end regblock DmaRegs
+
+testbench RegblockArrayTb
+    dut : AxiLiteRegs
+end testbench RegblockArrayTb
+
+impl RegblockArrayTest for RegblockArrayTb
+    let axil   : BusAxiLite = bind dut
+    let helper : AxilHelper active = bind axil
+    let regs   : DmaRegs = bind helper
+
+    // Per-element write callback (constant index). Fires from inside
+    // record_write when element 1 of CONFIG is recorded.
+    on regs.CONFIG[1]
+        log(info, "CONFIG[1] observed: ${data}")
+    end on
+
+    run
+        dut.rst = 1
+        axil.aw.valid = 0
+        axil.w.valid = 0
+        axil.b.ready = 1
+        axil.ar.valid = 0
+        axil.r.ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        let slot = 2
+
+        // Element write (constant + runtime index) and field write.
+        regs.CONFIG[2] = 286331153          // 0x11111111
+        regs.CONFIG[slot].MODE = 1
+        regs.CONFIG[0].COUNT = 7
+
+        // Element read (runtime index) and field read.
+        let a = regs.CONFIG[slot]
+        let en = regs.CONFIG[3].ENABLE
+
+        // Passive record decodes array element addresses too.
+        regs.record_write(0x44, 4660)       // 0x1234 -> CONFIG[1], fires callback
+        let r = regs.record_read(0x44)
+        assert r == 4660
+            else fail("record_read CONFIG[1] (got 0x${r:08x})")
+
+        log(info, "PASS: indexed register array access, field decode, and passive record")
+    end run
+end impl RegblockArrayTest

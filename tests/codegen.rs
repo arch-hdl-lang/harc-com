@@ -6513,3 +6513,66 @@ end test T"#,
         "expected record_read to call the generated decode; got:\n{cpp}"
     );
 }
+
+#[test]
+fn regblock_array_register_lowers_mirror_table_and_record() {
+    // Indexed register arrays (regarray) — docs/ral-support.md §3.3.
+    // Covers the helper-independent paths: mirror array member, per-
+    // element address table, callback slots, record_read/record_write
+    // decode, and per-element write-callback registration.
+    let parsed = parse_source(
+        r#"regblock R via H width 64
+    register CONFIG[4] @ 0x80 stride 0x8 access rw
+        field ENABLE : uint<1> @ 63
+        field MODE : uint<2> @ 61
+    end register CONFIG
+end regblock R
+
+test T
+    let dut : SomeDut
+    let regs : R = bind helper
+    on regs.CONFIG[1]
+        log(info, "cfg1")
+    end on
+    run
+        regs.record_write(0x88, 7)
+        let c = regs.record_read(0x80)
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let cpp = cpp_tb::emit(&merged).expect("emit");
+
+    // Mirror: a C array with per-element reset init.
+    assert!(
+        cpp.contains("uint64_t CONFIG[4] = { 0, 0, 0, 0 };"),
+        "expected array mirror member; got:\n{cpp}"
+    );
+    // Address table: one entry per element at base + i*stride.
+    assert!(
+        cpp.contains("{ \"CONFIG[0]\", (0x80 + 0*0x8), 64 },")
+            && cpp.contains("{ \"CONFIG[3]\", (0x80 + 3*0x8), 64 },"),
+        "expected per-element address table rows; got:\n{cpp}"
+    );
+    // Callback holder: per-element slots.
+    assert!(
+        cpp.contains("std::function<void(uint64_t)> CONFIG[4];"),
+        "expected per-element callback slots; got:\n{cpp}"
+    );
+    // record_read decode reaches each element's mirror cell.
+    assert!(
+        cpp.contains("if (addr == (uint64_t)((0x80 + 1*0x8))) return (uint64_t)m.CONFIG[1];"),
+        "expected per-element record_read decode; got:\n{cpp}"
+    );
+    // record_write decode updates the indexed cell + fires its callback.
+    assert!(
+        cpp.contains("if (_rec_addr == (uint64_t)((0x80 + 2*0x8))) { regs.CONFIG[2] = (uint64_t)(_rec_data & 0xffffffffffffffffull); if (regs_cbs.CONFIG[2]) regs_cbs.CONFIG[2](_rec_data); }"),
+        "expected per-element record_write decode + callback dispatch; got:\n{cpp}"
+    );
+    // Constant-index callback registration targets the right slot.
+    assert!(
+        cpp.contains("regs_cbs.CONFIG[1] = [&](uint64_t data) {"),
+        "expected per-element callback registration; got:\n{cpp}"
+    );
+}
