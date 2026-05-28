@@ -1,0 +1,106 @@
+// RAL passive record API + per-register write callbacks
+// (docs/ral-support.md §3.2).
+//
+// Motivating use case (issue #218): a checker that *observes* bus
+// traffic and shadows CSR state. Instead of a hand-written address
+// `if/elsif` decode ladder, the checker calls:
+//
+//   regs.record_write(addr, data)   // decode + mirror update, no bus
+//   let v = regs.record_read(addr)  // decode + mirror read, no bus
+//
+// and registers per-register callbacks to recompute derived state on
+// write:
+//
+//   on regs.REG ... end on          // body sees the written `data`
+//
+// `record_write` / `record_read` are *passive* — they never drive the
+// bus (the monitor already saw the transaction). They differ from the
+// active frontdoor (`regs.REG = v`), which issues a bus access.
+
+use BusAxiLite
+
+transactor AxilHelper bound to BusAxiLite
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            bus.aw.addr = addr
+            bus.aw.valid = 1
+            bus.w.send(data, 15)
+            bus.aw.valid = 0
+            wait 1 cycle
+        end write
+
+        hookable read(addr: uint<8>) -> uint<32>
+            bus.ar.addr = addr
+            bus.ar.valid = 1
+            let r = bus.r.recv()
+            bus.ar.valid = 0
+            wait 1 cycle
+            return r.data
+        end read
+    end when
+end transactor AxilHelper
+
+regblock DmaRegs via AxilHelper width 32
+    register MM2S_SA   @ 0x18 access rw
+    register MM2S_LEN  @ 0x28 access rw
+    register S2MM_SA   @ 0x20 access rw
+end regblock DmaRegs
+
+testbench RegblockRecordTb
+    dut : AxiLiteRegs
+end testbench RegblockRecordTb
+
+impl RegblockRecordTest for RegblockRecordTb
+    let axil   : BusAxiLite = bind dut
+    let helper : AxilHelper active = bind axil
+    let regs   : DmaRegs = bind helper
+
+    // Per-register write callback: when an MM2S_SA write is observed,
+    // mirror a derived value into MM2S_LEN. The body sees the observed
+    // value as `data`. The codegen owns the address decode — no
+    // `if addr == ...` ladder here.
+    on regs.MM2S_SA
+        regs.record_write(0x28, data)
+    end on
+
+    run
+        dut.rst = 1
+        axil.aw.valid = 0
+        axil.w.valid = 0
+        axil.b.ready = 1
+        axil.ar.valid = 0
+        axil.r.ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Observe two bus writes passively (e.g. forwarded from a bus
+        // monitor). No bus traffic is issued; only the mirror updates.
+        regs.record_write(0x18, 305419896)    // 0x12345678 -> MM2S_SA
+        regs.record_write(0x20, 64)           // -> S2MM_SA
+
+        // Read the shadow back by address — pure mirror, no bus read.
+        let sa  = regs.record_read(0x18)
+        let s2  = regs.record_read(0x20)
+        let len = regs.record_read(0x28)      // set by the callback
+
+        assert sa == 305419896
+            else fail("record_read MM2S_SA (got 0x${sa:08x})")
+        assert s2 == 64
+            else fail("record_read S2MM_SA (got 0x${s2:08x})")
+        assert len == 305419896
+            else fail("callback-derived MM2S_LEN (got 0x${len:08x})")
+
+        log(info, "PASS: passive record_write/read decode + per-register write callback")
+    end run
+end impl RegblockRecordTest

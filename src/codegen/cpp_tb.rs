@@ -764,6 +764,47 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             }
             writeln!(e.out, "}};").ok();
             writeln!(e.out, "").ok();
+
+            // ── RAL per-register write callbacks + passive record API ──
+            // `<Name>_Callbacks` holds one optional `void(uint64_t)`
+            // closure per register. `on regs.REG ... end on` populates a
+            // slot; `regs.record_write(addr, data)` fires the matching
+            // slot after updating the mirror. `<Name>_record_read(m, addr)`
+            // is the passive read counterpart — it decodes the address to
+            // the mirror cell with no bus traffic. Both own the address
+            // decode at codegen time so a checker observing bus traffic
+            // never hand-writes an `if/elsif` address ladder.
+            // See docs/ral-support.md §3.2.
+            writeln!(e.out, "struct {}_Callbacks {{", r.name.name).ok();
+            for reg in &r.registers {
+                writeln!(
+                    e.out,
+                    "{INDENT}std::function<void(uint64_t)> {};",
+                    reg.name.name,
+                )
+                .ok();
+            }
+            writeln!(e.out, "}};").ok();
+            writeln!(e.out, "").ok();
+
+            writeln!(
+                e.out,
+                "static inline uint64_t {name}_record_read(const {name}_Mirror& m, uint64_t addr) {{",
+                name = r.name.name,
+            )
+            .ok();
+            for reg in &r.registers {
+                let off = c_int_literal_from(&reg.offset.kind);
+                writeln!(
+                    e.out,
+                    "{INDENT}if (addr == (uint64_t)({off})) return (uint64_t)m.{};",
+                    reg.name.name,
+                )
+                .ok();
+            }
+            writeln!(e.out, "{INDENT}return 0;").ok();
+            writeln!(e.out, "}}").ok();
+            writeln!(e.out, "").ok();
         }
     }
 
@@ -13259,6 +13300,12 @@ impl Emitter {
                 if self.try_emit_bitbash(e, depth) {
                     return;
                 }
+                // `regs.record_write(addr, data)` — passive mirror update
+                // keyed by address, with per-register write-callback
+                // dispatch. Codegen owns the address decode.
+                if self.try_emit_record_write(e, depth) {
+                    return;
+                }
                 self.pad(depth);
                 self.emit_expr(e);
                 writeln!(self.out, ";").ok();
@@ -13394,6 +13441,44 @@ impl Emitter {
                             "on <obj>.<method> pre/post: obj.method must resolve to a `hookable` on a known component type".into()
                         );
                         return;
+                    }
+                }
+                // RAL per-register write callback: `on regs.REG ... end on`
+                // where `regs` is a regblock binding and REG is one of its
+                // registers. Lowers to a `void(uint64_t data)` closure
+                // stored in `<regs>_cbs.REG`; `record_write` fires it after
+                // updating the mirror cell. The body sees the written value
+                // as the local `data`. No hook side / period. Recognized
+                // before the cycle-trigger fallback (a regblock register
+                // has no meaningful boolean-trigger reading — that would
+                // issue a bus read every cycle). See docs/ral-support.md §3.2.
+                if h.hook.is_none() && !h.periodic {
+                    if let ExprKind::Field {
+                        target,
+                        name: reg_name,
+                    } = &*h.event.kind
+                    {
+                        if let ExprKind::Ident(regs_id) = &*target.kind {
+                            let is_reg = self
+                                .let_types
+                                .get(&regs_id.name)
+                                .and_then(|ty| self.regblocks.get(ty))
+                                .map(|b| b.registers.iter().any(|r| r.name.name == reg_name.name))
+                                .unwrap_or(false);
+                            if is_reg {
+                                self.pad(depth);
+                                writeln!(
+                                    self.out,
+                                    "{}_cbs.{} = [&](uint64_t data) {{",
+                                    regs_id.name, reg_name.name,
+                                )
+                                .ok();
+                                self.emit_block(&h.body, depth + 1);
+                                self.pad(depth);
+                                writeln!(self.out, "}};").ok();
+                                return;
+                            }
+                        }
                     }
                 }
                 if let ExprKind::Call { callee, args } = &*h.event.kind {
@@ -13654,6 +13739,10 @@ impl Emitter {
                 }
                 self.pad(depth);
                 writeln!(self.out, "{simple}_Mirror {};", l.name.name).ok();
+                // Per-register write-callback holder; slots are filled by
+                // `on regs.REG ... end on` and fired from `record_write`.
+                self.pad(depth);
+                writeln!(self.out, "{simple}_Callbacks {}_cbs;", l.name.name).ok();
                 return;
             }
         }
@@ -14193,6 +14282,71 @@ impl Emitter {
                 writeln!(self.out, "}}").ok();
             }
         }
+        true
+    }
+
+    /// `regs.record_write(addr, data)` — passive, mirror-only record of
+    /// an observed bus write, keyed by address. Decodes `addr` against
+    /// the regblock's register offsets at codegen time (no bus traffic —
+    /// the checker already saw the transaction), updates the matching
+    /// mirror cell masked to the register width, then fires
+    /// `<regs>_cbs.REG(data)` if a per-register callback is registered.
+    /// Returns false (no-op) if the call shape isn't a record_write on a
+    /// regblock binding. See docs/ral-support.md §3.2.
+    fn try_emit_record_write(&mut self, e: &Expr, depth: usize) -> bool {
+        let ExprKind::Call { callee, args } = &*e.kind else {
+            return false;
+        };
+        let ExprKind::Field { target, name } = &*callee.kind else {
+            return false;
+        };
+        if name.name != "record_write" || args.len() != 2 {
+            return false;
+        }
+        let ExprKind::Ident(regs_id) = &*target.kind else {
+            return false;
+        };
+        let Some(regs_ty) = self.let_types.get(&regs_id.name).cloned() else {
+            return false;
+        };
+        let Some(block) = self.regblocks.get(&regs_ty).cloned() else {
+            return false;
+        };
+        let addr = match &args[0] {
+            CallArg::Expr(ex) => ex,
+            CallArg::Named { value, .. } => value,
+        };
+        let data = match &args[1] {
+            CallArg::Expr(ex) => ex,
+            CallArg::Named { value, .. } => value,
+        };
+        let regs_var = &regs_id.name;
+        let default_w = block.default_width.unwrap_or(32);
+        self.pad(depth);
+        writeln!(self.out, "{{").ok();
+        self.pad(depth + 1);
+        write!(self.out, "uint64_t _rec_addr = (uint64_t)(").ok();
+        self.emit_expr(addr);
+        writeln!(self.out, ");").ok();
+        self.pad(depth + 1);
+        write!(self.out, "uint64_t _rec_data = (uint64_t)(").ok();
+        self.emit_expr(data);
+        writeln!(self.out, ");").ok();
+        for reg in &block.registers {
+            let w = reg.width.unwrap_or(default_w);
+            let mask: u64 = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+            let cty = mirror_field_c_type(w);
+            let off = c_int_literal_from(&reg.offset.kind);
+            let regname = &reg.name.name;
+            self.pad(depth + 1);
+            writeln!(
+                self.out,
+                "if (_rec_addr == (uint64_t)({off})) {{ {regs_var}.{regname} = ({cty})(_rec_data & 0x{mask:x}ull); if ({regs_var}_cbs.{regname}) {regs_var}_cbs.{regname}(_rec_data); }}",
+            )
+            .ok();
+        }
+        self.pad(depth);
+        writeln!(self.out, "}}").ok();
         true
     }
 
@@ -14970,6 +15124,36 @@ impl Emitter {
                             self.emit_expr(target);
                             write!(self.out, ".size()").ok();
                             return;
+                        }
+                    }
+                }
+                // RAL passive read: `regs.record_read(addr)` — decode the
+                // address to the mirror cell with no bus traffic. Lowers
+                // to the generated `<Regblock>_record_read` free function.
+                if args.len() == 1 {
+                    if let ExprKind::Field { target, name } = &*callee.kind {
+                        if name.name == "record_read" {
+                            if let ExprKind::Ident(regs_id) = &*target.kind {
+                                if let Some(regs_ty) =
+                                    self.let_types.get(&regs_id.name).cloned()
+                                {
+                                    if self.regblocks.contains_key(&regs_ty) {
+                                        let arg = match &args[0] {
+                                            CallArg::Expr(ex) => ex,
+                                            CallArg::Named { value, .. } => value,
+                                        };
+                                        write!(
+                                            self.out,
+                                            "{regs_ty}_record_read({}, (uint64_t)(",
+                                            regs_id.name,
+                                        )
+                                        .ok();
+                                        self.emit_expr(arg);
+                                        write!(self.out, "))").ok();
+                                        return;
+                                    }
+                                }
+                            }
                         }
                     }
                 }

@@ -17,6 +17,8 @@ runtime-metaprogramming model of UVM RAL.
 | `rw` / `ro` / `wo` access policies | **Shipped** | PR #98 (Phase 1c) |
 | `bitbash(regs)` compile-time-unrolled walk-all | **Shipped** | PR #99 (Phase 1d) |
 | `addrmap` composition (flat) — multiple regblock instances at distinct bases | **Shipped** | PR #100 (Phase 1e) |
+| Passive `record_write(addr,data)` / `record_read(addr)` mirror API | **Shipped** | Phase 1f |
+| Per-register write callbacks (`on regs.REG ... end on`) | **Shipped** | Phase 1f |
 | `w1c` / `w1s` / `wclr` / `wset` / `rc` / `rs` policies | **Proposed (deferred)** | testability problem — needs W1C-aware DUT |
 | `alias of` instance aliasing | **Proposed** | Phase 2 |
 | Nested `addrmap`s (addrmap inside addrmap) | **Proposed** | Phase 2 |
@@ -162,6 +164,78 @@ end register
 
 Reset values are part of the decl and form the initial mirror state. Width
 is checked against the declared field type at compile time.
+
+### 3.2 Passive record API + per-register write callbacks  *(shipped, Phase 1f)*
+
+The Phase 1a frontdoor (`regs.REG = v` / `let x = regs.REG`) is *active*:
+each access issues a bus transaction through the `via` helper. A large
+class of DV code is instead *passive* — a checker observes bus traffic
+(forwarded from a monitor) and shadows CSR state without driving the
+bus. Before Phase 1f that meant a hand-written address-decode ladder:
+
+```harc
+if addr == CONTROL_REG
+    csr_shadow.control = data
+elsif addr == config_group_addr(0)
+    csr_shadow.config_group0 = data
+// ... one branch per register ...
+end if
+```
+
+Phase 1f gives the checker the decode for free:
+
+```harc
+regs.record_write(addr, data)     // decode addr -> mirror cell, update it
+let v = regs.record_read(addr)    // decode addr -> mirror cell, read it
+```
+
+Both are **passive and mirror-only** — they never touch the bus (the
+monitor already saw the transaction). `record_write` masks the value to
+the register width and updates the matching mirror cell; `record_read`
+returns the mirror cell for that address (or `0` for an unmapped
+address). The address decode is folded at codegen time into a generated
+`<Regblock>_record_read` function and an inline `record_write` ladder, so
+the checker never enumerates registers by hand and can't forget one when
+a register is added to the block.
+
+**Per-register write callbacks** let a checker recompute derived state
+when a register is recorded:
+
+```harc
+// impl/test scope, alongside the `let` bindings (not inside `run`).
+on regs.CONTROL
+    // body runs after record_write updates the CONTROL mirror cell.
+    // the observed value is bound to `data` (a uint64).
+    if data != 0
+        ...
+    end if
+end on
+```
+
+A callback fires from inside `record_write`'s decode for exactly the
+matching register — there is no `if addr == ...` switch in the body. The
+body captures the enclosing scope by reference (same `[&]` model as the
+existing `on obj.method pre/post` hooks) so it can mutate test-scope
+scoreboards/counters.
+
+**Scope and limitations (intentional for Phase 1f):**
+
+- **Register granularity only.** Callbacks attach to a register, not a
+  field. Field-level callbacks would need a synthesized per-field
+  dispatch; deferred. (This was a deliberate call — see the design
+  discussion: a *per-method* hook that forces the user to re-decode the
+  address inside the body would reintroduce the very ladder this feature
+  removes, so the dispatch is folded per-register by the codegen.)
+- **Regblock bindings only.** `record_write` / `record_read` resolve
+  against a `let regs : <Regblock> = bind <helper>` binding. Addrmap-level
+  passive record (`chip.record_write(addr, data)` decoding across
+  instances) is a natural follow-up but not in this slice.
+- **Policy-agnostic.** A passive record stores what the monitor observed,
+  regardless of `ro`/`wo` (the DUT did whatever it did on the wire — the
+  mirror reflects that). Policy-aware *prediction* (e.g. `w1c` observed
+  write-1 clears) lands with the `w1c`/`w1s`/`rc`/`rs` keyword set.
+
+See `tests/fixtures/regblock_record_test.harc` for the end-to-end shape.
 
 ## 4. Surface — `addrmap`  *(Phase 1e shipped, advanced composition pending)*
 
