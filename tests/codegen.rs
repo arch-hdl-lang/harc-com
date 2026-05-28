@@ -6555,6 +6555,90 @@ fn transactor_field_forward_reference_emits_in_dependency_order() {
     );
 }
 
+/// arch-com#447 §8 regression: `topo_sort_component_indices` used
+/// to walk only by-value field-type edges, which under-approximated
+/// the real cross-transactor dependency graph. A hookable-call
+/// target that wasn't ALSO reachable via a field-type chain produced
+/// no edge — source order was the only thing keeping the emitted
+/// C++ in dependency order, and any rename or interleave silently
+/// reintroduced the issue arch-com#301 / harc-com#309 already
+/// solved for the field case.
+///
+/// This fixture pins down the call-edge rule directly. Both
+/// transactors share a referee field (`HelperCommon`) so the
+/// field-type rule is symmetric. The only asymmetry is that
+/// `CallerXact.observed_count` calls `produce_value()`, a hookable
+/// owned solely by `ProducerXact`. The call-edge rule must add an
+/// edge `CallerXact -> ProducerXact` even though Caller has no
+/// field of type ProducerXact, so the sort returns ProducerXact
+/// before CallerXact despite their source order being reversed.
+#[test]
+fn transactor_topo_sort_honors_hookable_call_edges() {
+    use harc::ast::Item;
+    use std::fs;
+    use std::path::PathBuf;
+
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let src = fs::read_to_string(
+        fixtures.join("transactor_hookable_call_graph_edge_test.harc"),
+    )
+    .expect("read call-graph fixture");
+    let parsed = parse_source(&src).expect("parse call-graph fixture");
+
+    // Sanity: CallerXact (the one that calls produce_value) must
+    // appear in source BEFORE ProducerXact (the hookable owner).
+    // If a future edit reorders the fixture this test would become
+    // a tautology — guard with an assertion.
+    let name_for = |it: &Item| match it {
+        Item::Transactor(t) => Some(t.name.name.clone()),
+        _ => None,
+    };
+    let source_names: Vec<String> = parsed
+        .items
+        .iter()
+        .filter_map(name_for)
+        .collect();
+    let src_caller = source_names
+        .iter()
+        .position(|n| n == "CallerXact")
+        .expect("CallerXact missing");
+    let src_producer = source_names
+        .iter()
+        .position(|n| n == "ProducerXact")
+        .expect("ProducerXact missing");
+    assert!(
+        src_caller < src_producer,
+        "fixture lost its source-order trigger: CallerXact must come \
+         before ProducerXact in the .harc file. CallerXact at \
+         source position {src_caller}, ProducerXact at {src_producer}",
+    );
+
+    let order = cpp_tb::topo_sort_component_indices(&parsed);
+    let sorted_names: Vec<&str> = order
+        .iter()
+        .map(|&i| match &parsed.items[i] {
+            Item::Transactor(t) => t.name.name.as_str(),
+            _ => "<non-transactor>",
+        })
+        .collect();
+    let sort_caller = sorted_names
+        .iter()
+        .position(|n| *n == "CallerXact")
+        .expect("CallerXact missing from sort output");
+    let sort_producer = sorted_names
+        .iter()
+        .position(|n| *n == "ProducerXact")
+        .expect("ProducerXact missing from sort output");
+    assert!(
+        sort_producer < sort_caller,
+        "topo sort regressed: ProducerXact must be ordered BEFORE \
+         CallerXact because CallerXact.observed_count calls \
+         produce_value() (a hookable declared on ProducerXact). \
+         Sort produced: {sorted_names:?}. Under-approximated graph \
+         would leave them in source order [CallerXact, ProducerXact].",
+    );
+}
+
 #[test]
 fn regblock_record_write_read_and_callbacks_lower() {
     // Feature (b): passive address-keyed record API. Feature (c):
