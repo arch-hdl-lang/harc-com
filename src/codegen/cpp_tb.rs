@@ -720,6 +720,23 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // `let x = regs.NAME`) lower to mirror update + helper.write/read
     // — see docs/ral-support.md §7.4 (frontdoor lowering). Phase 1a
     // keeps the mirror flat — no nested addrmap composition yet.
+    let any_regblock = file
+        .items
+        .iter()
+        .any(|it| matches!(it, Item::Regblock(_)));
+    if any_regblock {
+        // Recursion-guard depth limit for `regs.record_write` callbacks.
+        // A callback body invoking `record_write` re-enters the same
+        // decode block synchronously; without a bound, a self-write
+        // (`on regs.A { regs.record_write(0x00, ...) }`) grows the
+        // stack unboundedly. 16 leaves plenty of room for realistic
+        // nested CSR cascades while catching runaway recursion fast.
+        // See docs/ral-support.md §3.2.
+        writeln!(e.out, "#ifndef HARC_RAL_CB_MAX_DEPTH").ok();
+        writeln!(e.out, "static constexpr uint32_t HARC_RAL_CB_MAX_DEPTH = 16;").ok();
+        writeln!(e.out, "#endif").ok();
+        writeln!(e.out, "").ok();
+    }
     for it in &file.items {
         if let Item::Regblock(r) = it {
             let default_w = r.default_width.unwrap_or(32);
@@ -13836,6 +13853,12 @@ impl Emitter {
                 // `on regs.REG ... end on` and fired from `record_write`.
                 self.pad(depth);
                 writeln!(self.out, "{simple}_Callbacks {}_cbs;", l.name.name).ok();
+                // Recursion-depth counter for `record_write` -> callback ->
+                // `record_write` cascades. Each entry into the decode block
+                // bumps this, and we abort if it exceeds
+                // `HARC_RAL_CB_MAX_DEPTH`. See docs/ral-support.md §3.2.
+                self.pad(depth);
+                writeln!(self.out, "uint32_t {}_cb_depth = 0;", l.name.name).ok();
                 return;
             }
         }
@@ -14425,6 +14448,20 @@ impl Emitter {
         write!(self.out, "uint64_t _rec_data = (uint64_t)(").ok();
         self.emit_expr(data);
         writeln!(self.out, ");").ok();
+        // Recursion guard: a callback body can call `record_write` again
+        // (legitimately, to model a CSR side-effect that writes another
+        // register, or accidentally, to write the same register). Bump
+        // a per-binding depth counter on entry and abort if it crosses
+        // `HARC_RAL_CB_MAX_DEPTH` — without the bound a self-write
+        // would blow the stack. See docs/ral-support.md §3.2.
+        self.pad(depth + 1);
+        writeln!(
+            self.out,
+            "if ({regs_var}_cb_depth >= HARC_RAL_CB_MAX_DEPTH) {{ sim_log_line(\"FATAL\", \"RAL record_write callback recursion exceeded HARC_RAL_CB_MAX_DEPTH (%u) on binding `{regs_var}` at addr 0x%llx\", (unsigned)HARC_RAL_CB_MAX_DEPTH, (unsigned long long)_rec_addr); errors++; _fatal = true; }} else {{",
+        )
+        .ok();
+        self.pad(depth + 2);
+        writeln!(self.out, "{regs_var}_cb_depth++;").ok();
         // Emit an if/else-if chain so a single addr matches at most one
         // register. Register offsets *should* be unique, but the regblock
         // parser doesn't enforce uniqueness here, so chaining keeps
@@ -14437,7 +14474,7 @@ impl Emitter {
             let cty = mirror_field_c_type(w);
             let off = c_int_literal_from(&reg.offset.kind);
             let regname = &reg.name.name;
-            self.pad(depth + 1);
+            self.pad(depth + 2);
             let kw = if i == 0 { "if" } else { "else if" };
             writeln!(
                 self.out,
@@ -14445,6 +14482,10 @@ impl Emitter {
             )
             .ok();
         }
+        self.pad(depth + 2);
+        writeln!(self.out, "{regs_var}_cb_depth--;").ok();
+        self.pad(depth + 1);
+        writeln!(self.out, "}}").ok();
         self.pad(depth);
         writeln!(self.out, "}}").ok();
         true
