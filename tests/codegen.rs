@@ -6835,3 +6835,37 @@ end test T"#,
         "expected at least 3 decode-site bumps for the A->B->C chain; got {bumps}:\n{cpp}"
     );
 }
+
+/// Exercises the `w >= 64` branch in `try_emit_record_write` at
+/// `cpp_tb.rs:14436`. For widths < 64 the mask is `(1u64 << w) - 1`;
+/// for width 64 the shift would overflow, so the codegen branches to
+/// `u64::MAX` (`0xffffffffffffffffull`). Without a width-64 register
+/// anywhere in the test corpus this branch was unexercised.
+///
+/// Also pins the mirror-field C type: a 64-bit register lowers to
+/// `uint64_t` storage (`mirror_field_c_type` width buckets at
+/// `cpp_tb.rs:17431`).
+#[test]
+fn regblock_record_write_width_64_uses_u64_max_mask() {
+    let parsed = parse_source(
+        r#"regblock R via H width 32
+    register WIDE @ 0x10 width 64 access rw
+end regblock R
+
+test T
+    let dut : SomeDut
+    let regs : R = bind helper
+    run
+        regs.record_write(0x10, 0xdeadbeefcafebabe)
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let cpp = cpp_tb::emit(&merged).expect("emit");
+
+    assert!(
+        cpp.contains("regs.WIDE = (uint64_t)(_rec_data & 0xffffffffffffffffull);"),
+        "expected width-64 record_write mirror update with u64::MAX mask; got:\n{cpp}"
+    );
+}
