@@ -16357,11 +16357,17 @@ fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
             }
         }
 
-        // Rewrite every Stmt / Expr in the test body.
+        // Rewrite every Stmt / Expr in the test body. Bare-statement
+        // items (the `impl ... for Tb` form with no `setup`/`run`/
+        // `check`/`teardown` scopes) are routed through the same
+        // `rewrite_stmts_for_impl` helper as scoped blocks below, so
+        // any future rewrite behavior applies to both paths by
+        // construction (PR address: code-review finding B on PR
+        // arch-hdl-lang/harc-com#306).
         for ti in t.items.iter_mut() {
             match ti {
-                TestItem::Stmt(s) => rewrite_stmt_for_impl(
-                    s,
+                TestItem::Stmt(s) => rewrite_stmts_for_impl(
+                    std::slice::from_mut(s),
                     &field_names,
                     &method_names,
                     &field_is_pointer,
@@ -16487,16 +16493,32 @@ fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
             }
             if let TestItem::Scope(sc) = &ti {
                 let mut sc = sc.clone();
+                // INVARIANT (load-bearing): the synthesized
+                // `_tb.dut = dut` wire MUST precede the first read of
+                // `_tb.dut.*` anywhere in the lowered test (any
+                // lifecycle block or `run`). We achieve this by
+                // always materializing a `setup` block to host the
+                // wire as its very first statement — even if neither
+                // the testbench nor the impl declared a setup. Setup
+                // is by spec the earliest user-visible phase, so the
+                // wire is guaranteed to run before any other phase
+                // body that could dereference `_tb.dut.*`.
+                //
+                // If a new phase is later added that runs BEFORE
+                // setup, the wire site MUST move with it (or the
+                // new phase must be threaded through this same
+                // merge). Conditional emission ("only inject if
+                // setup already exists") was the previous shape;
+                // that made the invariant implicit and order-
+                // sensitive — silent zero-reads on regression.
                 let wire_stmt = dut_field
                     .as_ref()
                     .map(|_| make_wire_dut_stmt(tb_ident.span));
-                let setup_needs_wire =
-                    wire_stmt.is_some() && (tb_lifecycle.setup.is_some() || sc.setup.is_some());
 
                 sc.setup = merge_lifecycle_blocks(
                     tb_lifecycle.setup.clone(),
                     sc.setup.clone(),
-                    setup_needs_wire.then(|| wire_stmt.clone().expect("checked above")),
+                    wire_stmt,
                     tb_ident.span,
                 );
                 sc.check = merge_lifecycle_blocks(
@@ -16511,44 +16533,26 @@ fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
                     None,
                     tb_ident.span,
                 );
-
-                // If there was no setup block, inject `_tb.dut = dut`
-                // as the first run statement so the testbench DUT
-                // pointer is still wired before user stimulus.
-                if !setup_needs_wire {
-                    if let (Some(stmt), Some(run)) = (wire_stmt, sc.run.as_ref()) {
-                        let mut new_stmts = Vec::with_capacity(run.stmts.len() + 1);
-                        new_stmts.push(stmt);
-                        new_stmts.extend(run.stmts.iter().cloned());
-                        sc.run = Some(Block {
-                            stmts: new_stmts,
-                            span: run.span,
-                        });
-                    }
-                }
                 t.items.push(TestItem::Scope(sc));
                 continue;
             }
             t.items.push(ti);
         }
         if !bare_run_stmts.is_empty() {
+            // Same invariant as the scoped branch: always materialize
+            // a setup block to host the `_tb.dut = dut` wire as its
+            // first statement. See the scoped-branch comment above
+            // for the load-bearing rationale.
             let wire_stmt = dut_field
                 .as_ref()
                 .map(|_| make_wire_dut_stmt(tb_ident.span));
-            let setup_needs_wire = wire_stmt.is_some() && tb_lifecycle.setup.is_some();
             let setup = merge_lifecycle_blocks(
                 tb_lifecycle.setup.clone(),
                 None,
-                setup_needs_wire.then(|| wire_stmt.clone().expect("checked above")),
+                wire_stmt,
                 tb_ident.span,
             );
-            let mut run_stmts = Vec::new();
-            if !setup_needs_wire {
-                if let Some(stmt) = wire_stmt {
-                    run_stmts.push(stmt);
-                }
-            }
-            run_stmts.extend(bare_run_stmts);
+            let run_stmts = bare_run_stmts;
             t.items.push(TestItem::Scope(ScopeDecl {
                 name: Ident {
                     name: "sim".into(),
@@ -16645,7 +16649,23 @@ fn rewrite_block_for_impl(
     pointers: &std::collections::HashSet<String>,
     shadow: &std::collections::HashSet<String>,
 ) {
-    for s in b.stmts.iter_mut() {
+    rewrite_stmts_for_impl(&mut b.stmts, fields, methods, pointers, shadow);
+}
+
+/// Statement-list variant of `rewrite_block_for_impl`. Both the
+/// scoped form (per-`Block` walk) and the bare-statement form
+/// (`impl ... for Tb` with a flat `Stmt` list, no `setup`/`run`/
+/// `check`/`teardown` scopes) share this helper so that bare bodies
+/// can never structurally diverge from scoped bodies. New rewrite
+/// behavior added here applies to both paths by construction.
+fn rewrite_stmts_for_impl(
+    stmts: &mut [Stmt],
+    fields: &std::collections::HashSet<String>,
+    methods: &std::collections::HashSet<String>,
+    pointers: &std::collections::HashSet<String>,
+    shadow: &std::collections::HashSet<String>,
+) {
+    for s in stmts.iter_mut() {
         rewrite_stmt_for_impl(s, fields, methods, pointers, shadow);
     }
 }
