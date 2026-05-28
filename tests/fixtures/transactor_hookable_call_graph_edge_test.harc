@@ -1,0 +1,53 @@
+// Regression for arch-com#447 §8 (under-approximated transactor
+// topo sort): the topo sort used to walk only `ComponentItem::Field`
+// edges, missing cross-transactor hookable-call dependencies that
+// the field rule didn't already imply.
+//
+// Without the call-edge rule, the only thing keeping `Producer`
+// emitted before `Caller` in a fixture like this one is the
+// source order — rename, reorder, or insert anything in between
+// and the C++ struct/lambda ordering silently breaks.
+//
+// This fixture is deliberately laid out so the call-edge rule, and
+// only that rule, fires. Both transactors share a referee field
+// (`HelperCommon`) so the field rule is symmetric; the asymmetric
+// part is `CallerXact.observed_count`'s body calling
+// `helper.produce_value()`, which routes through a hookable owned
+// solely by `ProducerXact`. The companion unit test in
+// tests/codegen.rs asserts `topo_sort_component_indices` orders
+// ProducerXact before CallerXact regardless of source order.
+
+transactor CallerXact
+    helper : HelperCommon
+
+    hookable observed_count() -> uint<32>
+        return helper.produce_value()
+    end observed_count
+end transactor CallerXact
+
+transactor ProducerXact
+    helper : HelperCommon
+
+    hookable produce_value() -> uint<32>
+        return 7u32
+    end produce_value
+end transactor ProducerXact
+
+transactor HelperCommon
+    hookable noop() -> uint<32>
+        return 0u32
+    end noop
+end transactor HelperCommon
+
+testbench CallGraphTb
+    dut : DummyDut
+end testbench CallGraphTb
+
+impl CallGraphTest for CallGraphTb
+    let prod : ProducerXact passive
+    let caller : CallerXact passive
+
+    run
+        wait 1 cycle
+    end run
+end impl CallGraphTest

@@ -2140,6 +2140,178 @@ fn type_simple_name(t: Option<&TypeExpr>) -> Option<&str> {
     }
 }
 
+/// Collect every method-name string that appears as the callee of
+/// a `Call { callee: Field { name, .. }, .. }` expression anywhere
+/// inside the given block (recursively). Used by
+/// `topo_sort_component_indices` to discover cross-component
+/// hookable calls that don't go through a field-typed receiver — see
+/// arch-com#447 §8.
+fn collect_called_method_names(block: &Block, out: &mut std::collections::HashSet<String>) {
+    fn visit_expr(e: &Expr, out: &mut std::collections::HashSet<String>) {
+        if let ExprKind::Call { callee, args } = &*e.kind {
+            if let ExprKind::Field { name, .. } = &*callee.kind {
+                out.insert(name.name.clone());
+            }
+            visit_expr(callee, out);
+            for a in args {
+                let arg_expr = match a {
+                    CallArg::Expr(ex) => ex,
+                    CallArg::Named { value, .. } => value,
+                };
+                visit_expr(arg_expr, out);
+            }
+            return;
+        }
+        match &*e.kind {
+            ExprKind::Field { target, .. }
+            | ExprKind::Cast { expr: target, .. }
+            | ExprKind::Unary { expr: target, .. }
+            | ExprKind::HashHash { expr: target, .. }
+            | ExprKind::SeqRepeat { expr: target, .. }
+            | ExprKind::ForkCall { call: target } => {
+                visit_expr(target, out);
+            }
+            ExprKind::Index { target, index } => {
+                visit_expr(target, out);
+                visit_expr(index, out);
+            }
+            ExprKind::BitSlice { target, hi, lo } => {
+                visit_expr(target, out);
+                visit_expr(hi, out);
+                visit_expr(lo, out);
+            }
+            ExprKind::Send { target, value } => {
+                visit_expr(target, out);
+                visit_expr(value, out);
+            }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                visit_expr(lhs, out);
+                visit_expr(rhs, out);
+            }
+            ExprKind::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                visit_expr(cond, out);
+                visit_expr(then_branch, out);
+                visit_expr(else_branch, out);
+            }
+            ExprKind::RangeLit { lo, hi } => {
+                if let Some(e) = lo {
+                    visit_expr(e, out);
+                }
+                if let Some(e) = hi {
+                    visit_expr(e, out);
+                }
+            }
+            // Leaf / unsupported-for-our-purposes kinds — no nested
+            // `Expr` children that could host a call we'd care about,
+            // or non-call shapes (literals, idents, etc.).
+            _ => {}
+        }
+    }
+    fn visit_block(b: &Block, out: &mut std::collections::HashSet<String>) {
+        for s in &b.stmts {
+            visit_stmt(s, out);
+        }
+    }
+    fn visit_stmt(s: &Stmt, out: &mut std::collections::HashSet<String>) {
+        match &s.kind {
+            StmtKind::Let(l) => {
+                if let Some(e) = &l.value {
+                    visit_expr(e, out);
+                }
+            }
+            StmtKind::Assign { target, value } | StmtKind::Send { target, value } => {
+                visit_expr(target, out);
+                visit_expr(value, out);
+            }
+            StmtKind::For(f) => {
+                visit_expr(&f.iter, out);
+                visit_block(&f.body, out);
+            }
+            StmtKind::Repeat(r) => {
+                visit_expr(&r.count, out);
+                visit_block(&r.body, out);
+            }
+            StmtKind::Loop(b) => visit_block(b, out),
+            StmtKind::While { cond, body, .. } => {
+                visit_expr(cond, out);
+                visit_block(body, out);
+            }
+            StmtKind::If(i) => {
+                visit_expr(&i.cond, out);
+                visit_block(&i.then_block, out);
+                for (c, b) in &i.elsifs {
+                    visit_expr(c, out);
+                    visit_block(b, out);
+                }
+                if let Some(b) = &i.else_block {
+                    visit_block(b, out);
+                }
+            }
+            StmtKind::Fork(f) => {
+                for b in &f.branches {
+                    visit_block(b, out);
+                }
+            }
+            StmtKind::Parallel(bs) | StmtKind::Schedule(bs) => {
+                for b in bs {
+                    visit_block(b, out);
+                }
+            }
+            StmtKind::Select(arms) => {
+                for arm in arms {
+                    visit_expr(&arm.event, out);
+                    visit_block(&arm.action, out);
+                }
+            }
+            StmtKind::Emit { args, .. } | StmtKind::Log { args, .. } | StmtKind::LogF { args, .. } => {
+                for a in args {
+                    let e = match a {
+                        CallArg::Expr(ex) => ex,
+                        CallArg::Named { value, .. } => value,
+                    };
+                    visit_expr(e, out);
+                }
+            }
+            StmtKind::Yield(e) | StmtKind::Release(e) => visit_expr(e, out),
+            StmtKind::Return(opt) => {
+                if let Some(e) = opt {
+                    visit_expr(e, out);
+                }
+            }
+            StmtKind::Randomize { target, with_body, .. } => {
+                visit_expr(target, out);
+                for e in with_body {
+                    visit_expr(e, out);
+                }
+            }
+            StmtKind::Expr(e) => visit_expr(e, out),
+            StmtKind::After { duration, body, .. } => {
+                visit_expr(duration, out);
+                visit_block(body, out);
+            }
+            StmtKind::Assert(v) | StmtKind::Assume(v) | StmtKind::Cover(v) => {
+                if let Some(e) = &v.expr {
+                    visit_expr(e, out);
+                }
+            }
+            StmtKind::On(h) => {
+                visit_block(&h.body, out);
+            }
+            // `JoinAll`, `Break`, `Continue`, `Apply` have no Expr/Block
+            // children we need to visit for call discovery; ditto for
+            // any future variant — when a new variant lands the topo
+            // sort safely under-covers it (existing field-type edges
+            // still apply).
+            _ => {}
+        }
+    }
+    visit_block(block, out);
+}
+
 /// Topologically sort the indices of `file.items` that hold a
 /// component-shaped declaration (`Agent` / `Env` / `Sequencer` /
 /// `Scoreboard` / `Transactor`) so that every by-value field-type
@@ -2152,11 +2324,24 @@ fn type_simple_name(t: Option<&TypeExpr>) -> Option<&str> {
 /// to dispatch (consumers do `match` on `Item::Agent(_) | Item::Env(_)
 /// | Item::Sequencer(_) | Item::Scoreboard(_) | Item::Transactor(_)`).
 ///
-/// Ordering rule (Kahn-style with source-order tie-breaking): an item
-/// appears before another item iff the second's field list references
-/// the first's type by simple name. Source order breaks ties so
-/// fixtures with no cross-dependencies still emit in the order users
-/// wrote them — diffs against the pre-sort emitter stay minimal.
+/// Ordering rules (Kahn-style with source-order tie-breaking):
+/// 1. By-value field types: an item appears before another item iff
+///    the second's field list references the first's type by simple
+///    name.
+/// 2. Hookable-call targets (arch-com#447 §8): if an item's body
+///    contains a call `<recv>.<method>()` and exactly one *other*
+///    eligible item declares a `hookable` named `<method>`, an edge
+///    from that item to the caller is added. This catches call
+///    dependencies that don't manifest as field-type references —
+///    e.g. a transactor body resolving the receiver via an outer
+///    scope or a future cross-scope binding. Rule (1) already
+///    transitively covers the field-rooted call chains; rule (2) is
+///    the safety net for the non-field case the existing graph
+///    didn't model.
+///
+/// Source order breaks ties so fixtures with no cross-dependencies
+/// still emit in the order users wrote them — diffs against the
+/// pre-sort emitter stay minimal.
 ///
 /// Cycle handling: a by-value cycle (`A { b : B }` ↔ `B { a : A }`)
 /// is structurally invalid C++ (infinite size) and rejected by the
@@ -2170,7 +2355,7 @@ fn type_simple_name(t: Option<&TypeExpr>) -> Option<&str> {
 /// this, both the C++ struct definition and the hookable-method
 /// lambda for the owning transactor referenced the later type as
 /// an undeclared symbol.
-fn topo_sort_component_indices(file: &SourceFile) -> Vec<usize> {
+pub fn topo_sort_component_indices(file: &SourceFile) -> Vec<usize> {
     // First pass: enumerate eligible items and build the name → index
     // map. Eligibility = anything we emit a C++ `struct` and/or
     // hookable-method lambdas for.
@@ -2188,8 +2373,49 @@ fn topo_sort_component_indices(file: &SourceFile) -> Vec<usize> {
         name_to_idx.insert(name, i);
         eligible.push(i);
     }
-    // Second pass: collect outgoing edges (i depends on j when item i
-    // has a field whose simple type name matches item j's name).
+    // Build `method_owners`: hookable-method-name → set of eligible
+    // item indices that declare a `hookable` (or `function` —
+    // `is_hookable=false`) with that name. Consulted by the
+    // call-target edge rule below. Includes `when_active` items for
+    // transactors so an active-only hookable still counts.
+    let mut method_owners: std::collections::HashMap<String, std::collections::HashSet<usize>> =
+        std::collections::HashMap::new();
+    for &i in &eligible {
+        let items: &[ComponentItem] = match &file.items[i] {
+            Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c) => &c.items,
+            Item::Transactor(t) => &t.items,
+            _ => continue,
+        };
+        let when_active_items: Option<&[ComponentItem]> = match &file.items[i] {
+            Item::Transactor(t) => t.when_active.as_deref(),
+            _ => None,
+        };
+        for ci in items.iter().chain(when_active_items.into_iter().flatten()) {
+            if let ComponentItem::Hookable(h) = ci {
+                method_owners
+                    .entry(h.name.name.clone())
+                    .or_default()
+                    .insert(i);
+            }
+        }
+    }
+    // Second pass: collect outgoing edges. Two rules:
+    //  (1) field-type rule — i depends on j when item i has a field
+    //      whose simple type name matches item j's name. This is the
+    //      structural cause: a by-value field needs the callee
+    //      `struct` complete at the use site.
+    //  (2) call-target rule (arch-com#447 §8) — i depends on j when
+    //      i's body contains a call `<recv>.<method>()` and exactly
+    //      one *other* eligible item j declares a `hookable` named
+    //      `<method>`. This catches cross-item call edges that don't
+    //      manifest as field-type references — without it, source
+    //      order is the only thing keeping the C++ lambdas in
+    //      dependency order. Ambiguous methods (multiple owners)
+    //      are skipped, since which owner the call actually resolves
+    //      to is decided at emit time by `resolve_component_method_call`
+    //      against the current scope, and we don't have scope here.
+    //      An ambiguous case will still resolve correctly if the
+    //      receiver's type is reachable through fields (rule 1).
     let mut deps: std::collections::HashMap<usize, std::collections::HashSet<usize>> =
         std::collections::HashMap::new();
     for &i in &eligible {
@@ -2215,9 +2441,46 @@ fn topo_sort_component_indices(file: &SourceFile) -> Vec<usize> {
                 }
             }
         };
+        let mut called_methods: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for ci in items.iter().chain(when_active_items.into_iter().flatten()) {
-            if let ComponentItem::Field(f) = ci {
-                record(&f.ty, &mut entry);
+            match ci {
+                ComponentItem::Field(f) => {
+                    record(&f.ty, &mut entry);
+                }
+                ComponentItem::Hookable(h) => {
+                    collect_called_method_names(&h.body, &mut called_methods);
+                }
+                ComponentItem::OnHandler(h) => {
+                    collect_called_method_names(&h.body, &mut called_methods);
+                }
+                ComponentItem::TargetTlmThread(t) => {
+                    collect_called_method_names(&t.body, &mut called_methods);
+                }
+                ComponentItem::Lifecycle(s) => {
+                    for blk in [&s.setup, &s.run, &s.check, &s.teardown]
+                        .into_iter()
+                        .flatten()
+                    {
+                        collect_called_method_names(blk, &mut called_methods);
+                    }
+                }
+                ComponentItem::Watchdog(w) => {
+                    collect_called_method_names(&w.body, &mut called_methods);
+                }
+                ComponentItem::Connect(_) | ComponentItem::Apply(_) => {}
+            }
+        }
+        // Apply rule (2): for each method called, if exactly one
+        // *other* component owns a hookable by that name, add the
+        // edge. Self-edges (same i) are skipped — same-component
+        // calls are intra-item and don't reorder structs.
+        for m in &called_methods {
+            if let Some(owners) = method_owners.get(m) {
+                let externals: Vec<usize> = owners.iter().copied().filter(|&j| j != i).collect();
+                if externals.len() == 1 {
+                    entry.insert(externals[0]);
+                }
             }
         }
         deps.insert(i, entry);
@@ -2233,10 +2496,9 @@ fn topo_sort_component_indices(file: &SourceFile) -> Vec<usize> {
     }
     for &i in &eligible {
         if let Some(d) = deps.get(&i) {
-            for _ in d {
-                // Each dep j → i adds one incoming edge to i.
-            }
-            // count properly:
+            // `deps[i]` is the set of items i depends on (i must be
+            // emitted after each j ∈ deps[i]). Treating those as edges
+            // j → i, i's indegree is exactly |deps[i]|.
             *indegree.entry(i).or_insert(0) += d.len();
         }
     }
