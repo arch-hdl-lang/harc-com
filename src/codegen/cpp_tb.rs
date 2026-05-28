@@ -14332,16 +14332,23 @@ impl Emitter {
         write!(self.out, "uint64_t _rec_data = (uint64_t)(").ok();
         self.emit_expr(data);
         writeln!(self.out, ");").ok();
-        for reg in &block.registers {
+        // Emit an if/else-if chain so a single addr matches at most one
+        // register. Register offsets *should* be unique, but the regblock
+        // parser doesn't enforce uniqueness here, so chaining keeps
+        // record_write semantics deterministic if a duplicate slips
+        // through (the first-declared register wins, matching
+        // first-match dispatch elsewhere in cpp_tb).
+        for (i, reg) in block.registers.iter().enumerate() {
             let w = reg.width.unwrap_or(default_w);
             let mask: u64 = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
             let cty = mirror_field_c_type(w);
             let off = c_int_literal_from(&reg.offset.kind);
             let regname = &reg.name.name;
             self.pad(depth + 1);
+            let kw = if i == 0 { "if" } else { "else if" };
             writeln!(
                 self.out,
-                "if (_rec_addr == (uint64_t)({off})) {{ {regs_var}.{regname} = ({cty})(_rec_data & 0x{mask:x}ull); if ({regs_var}_cbs.{regname}) {regs_var}_cbs.{regname}(_rec_data); }}",
+                "{kw} (_rec_addr == (uint64_t)({off})) {{ {regs_var}.{regname} = ({cty})(_rec_data & 0x{mask:x}ull); if ({regs_var}_cbs.{regname}) {regs_var}_cbs.{regname}(_rec_data); }}",
             )
             .ok();
         }
