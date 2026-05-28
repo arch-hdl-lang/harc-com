@@ -6620,3 +6620,134 @@ end test T"#,
         "expected record_read to call the generated decode; got:\n{cpp}"
     );
 }
+
+#[test]
+fn regblock_record_write_emits_recursion_guard() {
+    // record_write callbacks can re-enter the decode block. The
+    // codegen wraps each decode in a per-binding depth counter and
+    // aborts (FATAL) if `HARC_RAL_CB_MAX_DEPTH` is exceeded. Guards
+    // a self-write (`on regs.A { regs.record_write(0x00, ...) }`)
+    // from blowing the stack. See docs/ral-support.md §3.2.
+    let parsed = parse_source(
+        r#"regblock R via H width 32
+    register A @ 0x00 access rw
+    register B @ 0x04 access rw
+end regblock R
+
+test T
+    let dut : SomeDut
+    let regs : R = bind helper
+    run
+        on regs.A
+            regs.record_write(0x00, data)
+        end on
+        regs.record_write(0x00, 1)
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let cpp = cpp_tb::emit(&merged).expect("emit");
+
+    // Depth-limit constant is emitted once per file when any
+    // regblock exists. Guarded with #ifndef so a TU with multiple
+    // generated TBs doesn't redefine.
+    assert!(
+        cpp.contains("#ifndef HARC_RAL_CB_MAX_DEPTH")
+            && cpp.contains("static constexpr uint32_t HARC_RAL_CB_MAX_DEPTH = 16;"),
+        "expected HARC_RAL_CB_MAX_DEPTH constant emitted with #ifndef guard; got:\n{cpp}"
+    );
+
+    // Per-binding depth counter initialized alongside the cbs holder.
+    assert!(
+        cpp.contains("uint32_t regs_cb_depth = 0;"),
+        "expected per-binding `regs_cb_depth` counter; got:\n{cpp}"
+    );
+
+    // Decode block bumps the counter, runs the chain, decrements,
+    // and FATALs when the limit is hit.
+    assert!(
+        cpp.contains("if (regs_cb_depth >= HARC_RAL_CB_MAX_DEPTH)"),
+        "expected depth-limit check before decode; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("regs_cb_depth++;") && cpp.contains("regs_cb_depth--;"),
+        "expected depth-counter bump/unbump around decode; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("sim_log_line(\"FATAL\", \"RAL record_write callback recursion exceeded HARC_RAL_CB_MAX_DEPTH"),
+        "expected FATAL log on depth overflow; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("errors++; _fatal = true;"),
+        "expected errors++ / _fatal = true on overflow path (mirrors log(fatal, ...) semantics); got:\n{cpp}"
+    );
+}
+
+#[test]
+fn regblock_record_write_callback_cross_register_chain() {
+    // A legal cross-register cascade (A -> B -> C) at depth 3
+    // should compile cleanly: each callback simply invokes the
+    // same decode (now guarded by the depth counter) on a
+    // different address. Compile-to-string only — running the
+    // sim end-to-end is out of scope here.
+    let parsed = parse_source(
+        r#"regblock R via H width 32
+    register A @ 0x00 access rw
+    register B @ 0x04 access rw
+    register C @ 0x08 access rw
+end regblock R
+
+test T
+    let dut : SomeDut
+    let regs : R = bind helper
+    run
+        on regs.A
+            regs.record_write(0x04, data)
+        end on
+        on regs.B
+            regs.record_write(0x08, data)
+        end on
+        on regs.C
+            log(info, "C settled")
+        end on
+        regs.record_write(0x00, 7)
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let cpp = cpp_tb::emit(&merged).expect("emit");
+
+    // All three callbacks register against the single binding.
+    assert!(
+        cpp.contains("regs_cbs.A = [&](uint64_t data) {")
+            && cpp.contains("regs_cbs.B = [&](uint64_t data) {")
+            && cpp.contains("regs_cbs.C = [&](uint64_t data) {"),
+        "expected three callback registrations; got:\n{cpp}"
+    );
+
+    // One depth counter shared across the chain (per-binding, not
+    // per-register) — confirms the guard scope is correct so that
+    // a legal depth-3 cascade against the same binding all bumps
+    // the same counter and stays under the 16-cap.
+    let counter_decls = cpp.matches("uint32_t regs_cb_depth = 0;").count();
+    assert_eq!(
+        counter_decls, 1,
+        "expected exactly one depth counter for the binding; got {counter_decls}:\n{cpp}"
+    );
+
+    // Bump/unbump pairs appear once per decode call site. The body
+    // has 3 callback bodies each containing a `record_write`, plus
+    // the top-level `record_write`, so 4 bump+unbump pairs.
+    let bumps = cpp.matches("regs_cb_depth++;").count();
+    let unbumps = cpp.matches("regs_cb_depth--;").count();
+    assert_eq!(
+        bumps, unbumps,
+        "bump/unbump counts must balance; got bumps={bumps} unbumps={unbumps}:\n{cpp}"
+    );
+    assert!(
+        bumps >= 3,
+        "expected at least 3 decode-site bumps for the A->B->C chain; got {bumps}:\n{cpp}"
+    );
+}

@@ -235,6 +235,57 @@ scoreboards/counters.
   mirror reflects that). Policy-aware *prediction* (e.g. `w1c` observed
   write-1 clears) lands with the `w1c`/`w1s`/`rc`/`rs` keyword set.
 
+**Behaviour and footguns:**
+
+The Phase 1f API has a handful of edges that aren't obvious from the
+surface syntax. They're listed here so you don't trip over them.
+
+- **The active frontdoor does not fire callbacks.** `regs.A = v` issues
+  a bus write through the `via` helper but does *not* invoke
+  `regs_cbs.A` — callbacks are wired only to the passive
+  `regs.record_write(addr, data)` decode. The split is intentional: a
+  callback exists to recompute checker state when a *monitor-observed*
+  write lands in the mirror, and the active path is meant for stimulus
+  scripts that already know what they wrote. If you want a single hook
+  that fires for both, drive the active path then call `record_write`
+  with the same `(addr, data)` from the stimulus thread.
+- **Re-registering an `on regs.REG` body silently overwrites.** The
+  callback holder is a single `std::function` per register; the last
+  `on regs.REG ... end on` in lexical order wins. There is no warning.
+  If two test components both want to observe the same register, fold
+  their bodies into one `on` block (or split the regblock).
+- **Unmapped addresses are no-ops.** `regs.record_write(0xFFFF, v)` on
+  an address that isn't a declared register falls through every branch
+  of the decode and updates nothing; the corresponding
+  `regs.record_read(0xFFFF)` returns `0`. This matches the "checker
+  shadows what the monitor saw" model — an unrecognized address is the
+  checker's problem, not the monitor's — but it means a typo in an
+  address literal won't surface as a sim error. Cross-check addresses
+  against `<Regblock>_AddrTable` when you suspect drift.
+- **DUT reset is not auto-propagated.** When the DUT resets, the
+  shadow mirror keeps whatever values it had — the mirror's reset
+  values (from `register A @ 0x00 reset 0x...`) are applied only at
+  test construction, not on subsequent DUT reset events. If your DUT
+  has a runtime reset that should clear shadow state, drive
+  `record_write` for each register from the reset-observing logic.
+- **Callback recursion is bounded by `HARC_RAL_CB_MAX_DEPTH = 16`.** A
+  callback body can itself call `record_write` — common when a CSR
+  write triggers a derived-state write to another register. The
+  codegen wraps each decode in a per-binding depth counter; if the
+  counter crosses 16, the TB logs a `FATAL` (`sim_log_line("FATAL",
+  ...); errors++; _fatal = true`) and the current test instance
+  aborts at end of cycle. 16 is deep enough for realistic CSR
+  cascades and shallow enough to catch a self-write
+  (`on regs.A { regs.record_write(0x00, data) }`) before the C++
+  stack blows. Override at compile time by defining
+  `HARC_RAL_CB_MAX_DEPTH` before the generated TU is compiled. (The
+  `static constexpr` declaration is guarded with `#ifndef`.)
+- **Closures capture by `[&]`.** Same model as `on obj.method` hooks
+  (cross-ref harc-com#316). Mutation of test-scope scoreboards from a
+  callback is the intended use; sharing scoreboard state across
+  threads needs the same locking as any other `[&]` capture in the
+  run scope.
+
 See `tests/fixtures/regblock_record_test.harc` for the end-to-end shape.
 
 ## 4. Surface — `addrmap`  *(Phase 1e shipped, advanced composition pending)*
