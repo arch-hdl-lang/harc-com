@@ -57,16 +57,18 @@ enum Cmd {
         #[arg(required = true)]
         files: Vec<PathBuf>,
         /// ARCH DUT source file(s) — repeat for designs with packages /
-        /// shared bus definitions. Conflicts with `--sv`.
-        #[arg(long, conflicts_with = "sv")]
+        /// shared bus definitions. Conflicts with `--sv` unless
+        /// `--check-backends` is set (in which case both are required).
+        #[arg(long)]
         dut: Vec<PathBuf>,
         /// SystemVerilog DUT source file(s). Drives Verilator directly,
-        /// bypassing `arch sim`. Conflicts with `--dut`.
+        /// bypassing `arch sim`. Conflicts with `--dut` unless
+        /// `--check-backends` is set (in which case both are required).
         #[arg(long)]
         sv: Vec<PathBuf>,
         /// Verilator control file(s), typically `.vlt` waivers or coverage
         /// controls. Forwarded to Verilator before the SV DUT files.
-        #[arg(long, conflicts_with = "dut")]
+        #[arg(long)]
         vlt: Vec<PathBuf>,
         /// SV top-module name (Verilator `--top-module`). Defaults to the
         /// type of `let dut : <Type>` in the HARC source.
@@ -196,6 +198,17 @@ enum Cmd {
         /// after the `--test` selector.
         #[arg(long = "sim-arg")]
         sim_args: Vec<String>,
+        /// Run the test under BOTH backends (Verilator from `--sv` and
+        /// ARCH native sim from `--dut`) with the same seed and diff
+        /// their per-cycle semantic traces. Requires both `--dut` and
+        /// `--sv` to be specified. Exits non-zero on any divergence.
+        ///
+        /// This is the regression net described in
+        /// `docs/2026-05-28-backend-equivalence-gap.md`: catches the
+        /// class of bug where one backend silently disagrees with the
+        /// other (arch-com#437) before it reaches users.
+        #[arg(long)]
+        check_backends: bool,
     },
     /// Merge a semantic JSONL trace into a signal VCD as synthetic events.
     TraceMerge {
@@ -314,42 +327,65 @@ fn main() -> Result<()> {
             trace_max_array,
             verilator_args,
             sim_args,
+            check_backends,
         } => {
             let captured = files.clone();
             learn_wrap(&captured, || {
-                cmd_sim(
-                    files.clone(),
-                    dut.clone(),
-                    sv.clone(),
-                    vlt.clone(),
-                    top.clone(),
-                    test.clone(),
-                    outdir.clone(),
-                    seed,
-                    emit_only,
-                    arch_bin.clone(),
-                    mt,
-                    coverage,
-                    ref_src.clone(),
-                    Z3PathOpts {
-                        root: z3_root.clone(),
-                        include_dir: z3_include_dir.clone(),
-                        lib_dir: z3_lib_dir.clone(),
-                    },
-                    rebuild,
-                    record_trace.clone(),
-                    WaveOpts {
-                        waves,
-                        format: wave_format.clone(),
-                        file: wave_file.clone(),
-                        trace_depth,
-                        trace_structs: !no_trace_structs,
-                        trace_max_width,
-                        trace_max_array,
-                        verilator_args: verilator_args.clone(),
-                        sim_args: sim_args.clone(),
-                    },
-                )
+                let wave_opts = WaveOpts {
+                    waves,
+                    format: wave_format.clone(),
+                    file: wave_file.clone(),
+                    trace_depth,
+                    trace_structs: !no_trace_structs,
+                    trace_max_width,
+                    trace_max_array,
+                    verilator_args: verilator_args.clone(),
+                    sim_args: sim_args.clone(),
+                };
+                let z3_opts = Z3PathOpts {
+                    root: z3_root.clone(),
+                    include_dir: z3_include_dir.clone(),
+                    lib_dir: z3_lib_dir.clone(),
+                };
+                if check_backends {
+                    cmd_sim_check_backends(
+                        files.clone(),
+                        dut.clone(),
+                        sv.clone(),
+                        vlt.clone(),
+                        top.clone(),
+                        test.clone(),
+                        outdir.clone(),
+                        seed,
+                        arch_bin.clone(),
+                        mt,
+                        coverage,
+                        ref_src.clone(),
+                        z3_opts,
+                        rebuild,
+                        wave_opts,
+                    )
+                } else {
+                    cmd_sim(
+                        files.clone(),
+                        dut.clone(),
+                        sv.clone(),
+                        vlt.clone(),
+                        top.clone(),
+                        test.clone(),
+                        outdir.clone(),
+                        seed,
+                        emit_only,
+                        arch_bin.clone(),
+                        mt,
+                        coverage,
+                        ref_src.clone(),
+                        z3_opts,
+                        rebuild,
+                        record_trace.clone(),
+                        wave_opts,
+                    )
+                }
             })
         }
         Cmd::TraceMerge {
@@ -1385,6 +1421,12 @@ fn cmd_sim(
             "pass either --dut <file.arch> or --sv <file.sv>"
         ));
     }
+    if !dut.is_empty() && !sv.is_empty() {
+        return Err(miette::miette!(
+            "pass either --dut <file.arch> or --sv <file.sv>, not both \
+             (use --check-backends to run under both backends)"
+        ));
+    }
 
     // Parse every input file, then fold `extend test T` blocks into their
     // matching base test before codegen.
@@ -1619,6 +1661,116 @@ fn cmd_sim(
         return Err(miette::miette!("arch sim exited with status {status}"));
     }
     Ok(())
+}
+
+/// `harc sim --check-backends`: run the test under BOTH the ARCH native
+/// sim (`--dut`) and Verilator (`--sv`) using the same seed, then diff
+/// their semantic JSONL traces. Surfaces backend divergence early — the
+/// regression net described in `docs/2026-05-28-backend-equivalence-gap.md`.
+#[allow(clippy::too_many_arguments)]
+fn cmd_sim_check_backends(
+    files: Vec<PathBuf>,
+    dut: Vec<PathBuf>,
+    sv: Vec<PathBuf>,
+    vlt: Vec<PathBuf>,
+    top: Option<String>,
+    test: Option<String>,
+    outdir: Option<PathBuf>,
+    seed: Option<u64>,
+    arch_bin: Option<PathBuf>,
+    mt: bool,
+    coverage: bool,
+    ref_src: Vec<PathBuf>,
+    z3_opts: Z3PathOpts,
+    rebuild: bool,
+    waves: WaveOpts,
+) -> Result<()> {
+    if dut.is_empty() || sv.is_empty() {
+        return Err(miette::miette!(
+            "--check-backends requires BOTH --dut <file.arch> and --sv <file.sv>"
+        ));
+    }
+
+    // Resolve outdir up front so both runs land in the same place and the
+    // two trace files sit side-by-side for the diff.
+    let outdir = outdir.unwrap_or_else(|| PathBuf::from("harc_sim_build"));
+    fs::create_dir_all(&outdir).into_diagnostic()?;
+    let arch_trace = fs::canonicalize(&outdir)
+        .into_diagnostic()?
+        .join("trace_arch.jsonl");
+    let sv_trace = fs::canonicalize(&outdir)
+        .into_diagnostic()?
+        .join("trace_sv.jsonl");
+
+    // Same seed for both runs — randomize() output must match for the
+    // diff to be meaningful. Default matches cmd_sim's default.
+    let resolved_seed = seed.or_else(|| {
+        std::env::var("HARC_SEED").ok().and_then(|v| v.parse().ok())
+    }).or(Some(1));
+
+    eprintln!("--check-backends: running ARCH (`arch sim`) backend...");
+    cmd_sim(
+        files.clone(),
+        dut.clone(),
+        Vec::new(),
+        Vec::new(),
+        top.clone(),
+        test.clone(),
+        Some(outdir.clone()),
+        resolved_seed,
+        false,
+        arch_bin.clone(),
+        mt,
+        coverage,
+        ref_src.clone(),
+        z3_opts.clone(),
+        rebuild,
+        Some(arch_trace.clone()),
+        waves.clone(),
+    )?;
+
+    eprintln!("--check-backends: running Verilator (`--sv`) backend...");
+    cmd_sim(
+        files.clone(),
+        Vec::new(),
+        sv.clone(),
+        vlt.clone(),
+        top.clone(),
+        test.clone(),
+        Some(outdir.clone()),
+        resolved_seed,
+        false,
+        arch_bin.clone(),
+        mt,
+        coverage,
+        ref_src.clone(),
+        z3_opts.clone(),
+        rebuild,
+        Some(sv_trace.clone()),
+        waves.clone(),
+    )?;
+
+    eprintln!(
+        "--check-backends: diffing {} against {}...",
+        arch_trace.display(),
+        sv_trace.display()
+    );
+    let divs = harc::check_backends::diff_traces(&arch_trace, &sv_trace)
+        .map_err(|e| miette::miette!("{}", e))?;
+    if divs.is_empty() {
+        eprintln!("--check-backends: traces match across backends (no divergence)");
+        Ok(())
+    } else {
+        eprintln!("--check-backends: {} divergence(s) detected:", divs.len());
+        for d in &divs {
+            eprintln!("  {}", d.fmt());
+        }
+        Err(miette::miette!(
+            "backends diverge: see {} and {} for full traces",
+            arch_trace.display(),
+            sv_trace.display()
+        ))
+    }
 }
 
 #[cfg(test)]
