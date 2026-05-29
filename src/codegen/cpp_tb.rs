@@ -14663,14 +14663,24 @@ impl Emitter {
         true
     }
 
-    /// `regs.record_write(addr, data)` — passive, mirror-only record of
-    /// an observed bus write, keyed by address. Decodes `addr` against
-    /// the regblock's register offsets at codegen time (no bus traffic —
-    /// the checker already saw the transaction), updates the matching
-    /// mirror cell masked to the register width, then fires
-    /// `<regs>_cbs.REG(data)` if a per-register callback is registered.
-    /// Returns false (no-op) if the call shape isn't a record_write on a
-    /// regblock binding. See docs/ral-support.md §3.2.
+    /// `regs.record_write(addr, data)` — **PASSIVE PATH** mirror-only
+    /// record of an observed bus write, keyed by address. Decodes
+    /// `addr` against the regblock's register offsets at codegen time
+    /// (no bus traffic — the checker already saw the transaction),
+    /// updates the matching mirror cell masked to the register width,
+    /// **then fires `<regs>_cbs.REG(data)` if a per-register callback
+    /// is registered**.
+    ///
+    /// This is the only emission site that dispatches RAL callbacks.
+    /// The two ACTIVE frontdoor write paths above (`regs.NAME = expr`
+    /// and `regs.REG.FIELD = expr`) intentionally do NOT dispatch —
+    /// see their comments and `docs/ral-support.md` §3.2 for why.
+    /// The asymmetry is locked from silent drift by the
+    /// `regblock_active_frontdoor_write_does_not_dispatch_callback`
+    /// test in `tests/codegen.rs`.
+    ///
+    /// Returns false (no-op) if the call shape isn't a record_write on
+    /// a regblock binding.
     fn try_emit_record_write(&mut self, e: &Expr, depth: usize) -> bool {
         let ExprKind::Call { callee, args } = &*e.kind else {
             return false;
@@ -15147,6 +15157,15 @@ impl Emitter {
         // write of the full register word. Checked before the
         // register-level path because it's strictly more specific
         // (3-level Field expr vs 2-level).
+        //
+        // **ACTIVE PATH — no callback dispatch.** `on regs.REG`
+        // callbacks fire only on the PASSIVE `record_write` decode
+        // (see `try_emit_record_write` below). The active frontdoor
+        // is intentionally silent: callbacks are for observing
+        // externally-driven mirror updates, not the test's own
+        // writes. See `docs/ral-support.md` §3.2 (active-vs-passive
+        // asymmetry). If you add callback dispatch here you'll
+        // double-fire on any test that mixes both paths.
         if let Some((
             regs_var,
             helper_var,
@@ -15189,6 +15208,12 @@ impl Emitter {
         // RAL frontdoor write: `regs.NAME = expr` where `regs` is a
         // `let regs : <Regblock> = bind <helper>` instantiation. Lowers
         // to mirror update + `<HelperType>_write(helper, OFFSET, expr)`.
+        //
+        // **ACTIVE PATH — no callback dispatch.** Same asymmetry as
+        // the field-level frontdoor above: `on regs.NAME` callbacks
+        // are passive-only, fired by `record_write` decode. Adding
+        // dispatch here would double-fire and break the documented
+        // contract — see `docs/ral-support.md` §3.2.
         if let Some((regs_var, helper_var, helper_ty, offset_lit, access)) =
             self.resolve_regblock_field_write(target)
         {

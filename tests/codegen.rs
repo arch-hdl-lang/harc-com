@@ -6706,6 +6706,73 @@ end test T"#,
 }
 
 #[test]
+fn regblock_active_frontdoor_write_does_not_dispatch_callback() {
+    // Locks the documented active/passive asymmetry from silent
+    // drift: `regs.NAME = expr` (active path) updates the mirror and
+    // writes to the bus, but does NOT fire `on regs.NAME` callbacks.
+    // Only `regs.record_write(addr, data)` (passive path) dispatches
+    // them. See docs/ral-support.md §3.2 and the comments at the two
+    // active sites in `cpp_tb.rs::emit_assign`.
+    //
+    // Repro pattern: register a callback AND drive an active write
+    // to the same register. The emitted active write must NOT
+    // contain `_cbs.<name>` callback dispatch. Closes §6 from
+    // arch-com#463.
+    let parsed = parse_source(
+        r#"regblock R via H width 32
+    register A @ 0x00 access rw
+end regblock R
+
+test T
+    let dut : SomeDut
+    let regs : R = bind helper
+    run
+        on regs.A
+            log(info, "A written")
+        end on
+        regs.A = 1
+        regs.record_write(0x00, 2)
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let cpp = cpp_tb::emit(&merged).expect("emit");
+
+    // Sanity: the callback is registered, the active write updates
+    // the mirror, the passive record_write dispatches the callback.
+    assert!(
+        cpp.contains("regs_cbs.A = [&](uint64_t data) {"),
+        "expected `on regs.A` to register a callback closure; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("regs.A = 1;"),
+        "expected the active write `regs.A = 1` to emit a mirror \
+         update; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("if (regs_cbs.A) regs_cbs.A(_rec_data);"),
+        "expected the passive record_write to dispatch the A callback; got:\n{cpp}"
+    );
+
+    // The asymmetry: count the `regs_cbs.A(...)` dispatch occurrences.
+    // There must be exactly one — fired by `record_write`, NOT by
+    // the active assign. If a future codegen edit accidentally adds
+    // dispatch to the active path, this count rises to 2 and the
+    // test fails loud. (The registration site `regs_cbs.A = [&]...`
+    // uses `=`, not `(`, so it is structurally different and not
+    // counted here.)
+    let dispatch_count = cpp.matches("regs_cbs.A(_rec_data)").count();
+    assert_eq!(
+        dispatch_count, 1,
+        "expected exactly one `regs_cbs.A(_rec_data)` dispatch site \
+         (the passive record_write decode); found {dispatch_count}. \
+         The active frontdoor write path must NOT dispatch callbacks \
+         per docs/ral-support.md §3.2. Full output:\n{cpp}"
+    );
+}
+
+#[test]
 fn regblock_record_write_emits_recursion_guard() {
     // record_write callbacks can re-enter the decode block. The
     // codegen wraps each decode in a per-binding depth counter and
