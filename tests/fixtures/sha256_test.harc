@@ -1,0 +1,80 @@
+// HARC verification of arch-com/examples/sha256.arch
+//
+// Tests SHA-256 with NIST FIPS 180-4 known-answer vectors.
+// Vec<UInt<32>,N> ports are packed as a single uint<N*32> value;
+// element 0 occupies the low bits (Verilator [N-1:0][31:0] convention).
+//
+// msg packing:   W[15] at bits[511:480] ... W[0] at bits[31:0]
+// digest packing: H[7] at bits[255:224] ... H[0] at bits[31:0]
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench Sha256Tb
+    dut : Sha256
+end testbench Sha256Tb
+
+impl Sha256Test for Sha256Tb
+    clock clk = SysDomain
+
+    run
+        // Reset
+        dut.rst   = 1
+        dut.start = 0
+        dut.msg   = 0
+        wait 3 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // ---------------------------------------------------------------
+        // Test 1: SHA-256("abc")
+        //   Padded block: W[0]=0x61626380, W[1..14]=0, W[15]=0x00000018
+        //   Expected:     ba7816bf 8f01cfe4 ab65dba5 2e9ce3de
+        //                 70e19464 56218d83 95b64636 0f5c7243
+        // ---------------------------------------------------------------
+        dut.msg   = 0x0000001800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000061626380
+        dut.start = 1
+        wait 1 cycle
+        dut.start = 0
+
+        let t1 = 0
+        while !dut.done && t1 < 100
+            wait 1 cycle
+            t1 = t1 + 1
+        end while
+
+        assert dut.done
+            else fail("SHA-256(abc): done not asserted within 100 cycles")
+        assert dut.digest == 0x0f5c724395b6463656218d8370e194642e9ce3deab65dba58f01cfe4ba7816bf
+            else fail("SHA-256(abc): digest mismatch")
+        wait 1 cycle
+
+        log(info, "PASS: SHA-256(abc)")
+
+        // ---------------------------------------------------------------
+        // Test 2: SHA-256("")
+        //   Padded block: W[0]=0x80000000, W[1..15]=0
+        //   Expected:     e3b0c442 98fc1c14 9afbf4c8 996fb924
+        //                 27ae41e4 649b934c a495991b 7852b855
+        // ---------------------------------------------------------------
+        dut.msg   = 0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000080000000
+        dut.start = 1
+        wait 1 cycle
+        dut.start = 0
+
+        let t2 = 0
+        while !dut.done && t2 < 100
+            wait 1 cycle
+            t2 = t2 + 1
+        end while
+
+        assert dut.done
+            else fail("SHA-256(empty): done not asserted within 100 cycles")
+        assert dut.digest == 0x7852b855a495991b649b934c27ae41e4996fb9249afbf4c898fc1c14e3b0c442
+            else fail("SHA-256(empty): digest mismatch")
+        wait 1 cycle
+
+        log(info, "PASS: SHA-256(empty)")
+    end run
+end impl Sha256Test
