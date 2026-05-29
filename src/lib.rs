@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod check_backends;
 pub mod codegen;
 pub mod constraints;
 pub mod diagnostics;
