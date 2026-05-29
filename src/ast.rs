@@ -498,9 +498,14 @@ pub enum ComponentItem {
     TargetTlmThread(TargetTlmThread),
     Hookable(HookableMethod),
     /// `setup` / `check` / `teardown` blocks declared inside a
-    /// `testbench`. Stored as `ScopeDecl` so codegen can reuse the
-    /// existing test lifecycle block machinery.
-    Lifecycle(ScopeDecl),
+    /// `testbench`. Each phase keyword produces one `Lifecycle(phase,
+    /// body)` AST node; the typed `LifecyclePhase` enum replaces the
+    /// pre-§7-tightening field-overload `ScopeDecl` shape (3 of 4
+    /// phase fields always `None`, exact phase encoded by which one
+    /// was populated). The duplicate-check at parse time and the
+    /// aggregation in `cpp_tb.rs` are tighter as a result.
+    /// See arch-com#463 §7 for the cleanup rationale.
+    Lifecycle(LifecyclePhase, Block),
     /// Inline `apply Name` inside a component body (rare but legal in scopes).
     Apply(ApplyDecl),
     /// Built-in watchdog (spec §8.6). At elaboration time this desugars
@@ -724,6 +729,35 @@ pub struct ScopeDecl {
     pub check: Option<Block>,
     pub teardown: Option<Block>,
     pub span: Span,
+}
+
+/// The three testbench lifecycle phase keywords. `LifecyclePhase` is
+/// the load-bearing distinguishing tag on `ComponentItem::Lifecycle`
+/// after the §7 cleanup — pre-cleanup, the phase was encoded by which
+/// of `ScopeDecl::{setup,check,teardown}` was populated, an implicit
+/// invariant that the parser duplicate-check, codegen aggregator, and
+/// round-trip ordering all depended on.
+///
+/// `run` is NOT in this enum — the `run` body for a `test` is
+/// represented as `TestItem::Stmt` at the test level, not as a
+/// component lifecycle phase. See `parse_test_item` in `src/parser.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LifecyclePhase {
+    Setup,
+    Check,
+    Teardown,
+}
+
+impl LifecyclePhase {
+    /// Spec/source-form keyword for this phase, for error messages
+    /// and the pretty-printer.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            LifecyclePhase::Setup => "setup",
+            LifecyclePhase::Check => "check",
+            LifecyclePhase::Teardown => "teardown",
+        }
+    }
 }
 
 // ── Extend aspect (§3.6) ──────────────────────────────────────────────────────

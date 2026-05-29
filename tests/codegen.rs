@@ -1519,6 +1519,111 @@ end impl Smoke"#,
     );
 }
 
+/// Locks the **source-order independence** of testbench lifecycle
+/// blocks (`setup` / `check` / `teardown`). Per the §7 cleanup
+/// (arch-com#463), each phase keyword produces a typed
+/// `ComponentItem::Lifecycle(LifecyclePhase, Block)` node, and the
+/// codegen aggregator routes by phase tag — never by source position.
+/// So declaring `check` source-before `setup` must produce the same
+/// emitted lifecycle ordering as the canonical setup → check →
+/// teardown order.
+///
+/// Without this test, a future refactor that started consuming
+/// source order (e.g. an iterator that took the first Lifecycle
+/// node it saw as authoritative) would slip through silently.
+#[test]
+fn testbench_lifecycle_phases_are_source_order_independent() {
+    // Canonical order: setup, check, teardown.
+    let canonical = parse_source(
+        r#"testbench Tb
+    dut : DummyDut
+    setup
+        log(info, "set up")
+    end setup
+    check
+        assert dut.done == 1 else fail("dut.done in tb.check")
+    end check
+    teardown
+        log(info, "torn down")
+    end teardown
+end testbench Tb
+
+impl Smoke for Tb
+    run
+        wait 1 cycle
+    end run
+end impl Smoke"#,
+    )
+    .expect("canonical-order parse");
+
+    // Reversed-source order: teardown, check, setup. Same three
+    // phase bodies, same content — only the declaration order
+    // differs in the .harc source.
+    let reversed = parse_source(
+        r#"testbench Tb
+    dut : DummyDut
+    teardown
+        log(info, "torn down")
+    end teardown
+    check
+        assert dut.done == 1 else fail("dut.done in tb.check")
+    end check
+    setup
+        log(info, "set up")
+    end setup
+end testbench Tb
+
+impl Smoke for Tb
+    run
+        wait 1 cycle
+    end run
+end impl Smoke"#,
+    )
+    .expect("reversed-order parse");
+
+    let canonical_cpp = cpp_tb::emit(&canonical).expect("emit canonical");
+    let reversed_cpp = cpp_tb::emit(&reversed).expect("emit reversed");
+
+    // The emit-time phase order is determined by the tb_lifecycle
+    // aggregator in cpp_tb.rs, which writes phase fields by tag —
+    // never by source position. So:
+    //   1. The canonical fixture emits setup → check → teardown.
+    //   2. The reversed fixture (source order: teardown → check →
+    //      setup) ALSO emits setup → check → teardown.
+    // The property is proven by the two having identical relative
+    // emit-order despite different declaration orders.
+    let phase_order = |cpp: &str, label: &str| -> (usize, usize, usize) {
+        let setup_pos = cpp
+            .find("\"set up\"")
+            .unwrap_or_else(|| panic!("{label}: setup body missing in:\n{cpp}"));
+        let check_pos = cpp
+            .find("dut.done in tb.check")
+            .unwrap_or_else(|| panic!("{label}: check body missing in:\n{cpp}"));
+        let teardown_pos = cpp
+            .find("\"torn down\"")
+            .unwrap_or_else(|| panic!("{label}: teardown body missing in:\n{cpp}"));
+        (setup_pos, check_pos, teardown_pos)
+    };
+
+    let (c_setup, c_check, c_teardown) = phase_order(&canonical_cpp, "canonical");
+    let (r_setup, r_check, r_teardown) = phase_order(&reversed_cpp, "reversed");
+
+    assert!(
+        c_setup < c_check && c_check < c_teardown,
+        "canonical fixture: emit-order should be setup → check → \
+         teardown. Got byte positions setup={c_setup} check={c_check} \
+         teardown={c_teardown}.\n{canonical_cpp}"
+    );
+    assert!(
+        r_setup < r_check && r_check < r_teardown,
+        "reversed fixture: emit-order MUST still be setup → check → \
+         teardown despite the source order being reversed. If this \
+         fails, the lifecycle aggregator regressed to consuming \
+         source position. Got byte positions setup={r_setup} \
+         check={r_check} teardown={r_teardown}.\n{reversed_cpp}"
+    );
+}
+
 /// Code-review finding B on PR arch-hdl-lang/harc-com#306: the
 /// bare-statement form of `impl ... for Tb` (no `setup`/`run`/
 /// `check`/`teardown` scopes) MUST go through the same bare-name
@@ -6639,6 +6744,90 @@ fn transactor_topo_sort_honors_hookable_call_edges() {
     );
 }
 
+/// Pins the *current conservative behaviour* when a called hookable
+/// name has multiple external owners: the call-edge rule (rule 2 in
+/// `topo_sort_component_indices`) silently does not add the edge,
+/// and the sort falls back to field-edges + source order.
+///
+/// This locks the test gap §8 in arch-com#463 flagged: without this
+/// fixture, a future visitor change that started adding edges to
+/// ALL ambiguous owners — or to none at all — would slip through
+/// silently. With this fixture in place, both directions trip the
+/// test.
+///
+/// The open design decision (widen dispatch by receiver-type vs
+/// emit a compile error on ambiguous unrooted calls) is intentionally
+/// left undecided here — the in-source TODO at the dispatch site is
+/// the tracking marker. This test only pins what the codegen does
+/// *today*, so the decision can be made deliberately later instead
+/// of being forced by a regression.
+#[test]
+fn transactor_topo_sort_skips_ambiguous_hookable_call_edges() {
+    use harc::ast::Item;
+    use std::fs;
+    use std::path::PathBuf;
+
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let src = fs::read_to_string(
+        fixtures.join("transactor_hookable_call_ambiguous_owner_test.harc"),
+    )
+    .expect("read ambiguous-owner fixture");
+    let parsed = parse_source(&src).expect("parse ambiguous-owner fixture");
+
+    let order = cpp_tb::topo_sort_component_indices(&parsed);
+    let sorted_names: Vec<&str> = order
+        .iter()
+        .map(|&i| match &parsed.items[i] {
+            Item::Transactor(t) => t.name.name.as_str(),
+            _ => "<non-transactor>",
+        })
+        .collect();
+
+    // Source order is: CallerXact, HelperA, HelperB. Caller's body
+    // calls `produce_value()`, owned by *both* HelperA and HelperB.
+    // The call-edge rule skips ambiguous owners. Caller has a field
+    // of type HelperA (a field-edge), so the field rule still puts
+    // HelperA before Caller. There is NO edge from Caller to
+    // HelperB (no field, no resolved call-edge), so HelperB is free
+    // to sort in source order — which puts it last.
+    let pos = |name: &str| -> usize {
+        sorted_names
+            .iter()
+            .position(|n| *n == name)
+            .unwrap_or_else(|| panic!("{name} missing from sort output: {sorted_names:?}"))
+    };
+    let caller = pos("CallerXact");
+    let helper_a = pos("HelperA");
+    let helper_b = pos("HelperB");
+
+    // Locked invariant 1: field-edge from Caller to HelperA is
+    // honoured (HelperA appears before Caller).
+    assert!(
+        helper_a < caller,
+        "field-edge rule should still order HelperA before CallerXact \
+         (Caller has `helper : HelperA`); got: {sorted_names:?}",
+    );
+
+    // Locked invariant 2: NO edge from Caller to HelperB. The
+    // ambiguous call-edge is silently dropped (current behaviour).
+    // If a future change started adding both edges, HelperB would
+    // move before Caller and this would fail. If a future change
+    // emitted a compile error instead, `topo_sort_component_indices`
+    // would never be called and this test would have a different
+    // shape — bump it then.
+    assert!(
+        caller < helper_b,
+        "ambiguous-owner call-edge should NOT be added today \
+         (rule 2 requires exactly one external owner). With no \
+         edge from Caller to HelperB, source order should keep \
+         HelperB after CallerXact. Got: {sorted_names:?}. If you \
+         intentionally widened the call-edge rule to emit edges \
+         for ALL ambiguous owners, see the TODO at \
+         `cpp_tb.rs::topo_sort_component_indices` and bump this \
+         test deliberately.",
+    );
+}
+
 #[test]
 fn regblock_record_write_read_and_callbacks_lower() {
     // Feature (b): passive address-keyed record API. Feature (c):
@@ -6702,6 +6891,73 @@ end test T"#,
     assert!(
         cpp.contains("R_record_read(regs, (uint64_t)("),
         "expected record_read to call the generated decode; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn regblock_active_frontdoor_write_does_not_dispatch_callback() {
+    // Locks the documented active/passive asymmetry from silent
+    // drift: `regs.NAME = expr` (active path) updates the mirror and
+    // writes to the bus, but does NOT fire `on regs.NAME` callbacks.
+    // Only `regs.record_write(addr, data)` (passive path) dispatches
+    // them. See docs/ral-support.md §3.2 and the comments at the two
+    // active sites in `cpp_tb.rs::emit_assign`.
+    //
+    // Repro pattern: register a callback AND drive an active write
+    // to the same register. The emitted active write must NOT
+    // contain `_cbs.<name>` callback dispatch. Closes §6 from
+    // arch-com#463.
+    let parsed = parse_source(
+        r#"regblock R via H width 32
+    register A @ 0x00 access rw
+end regblock R
+
+test T
+    let dut : SomeDut
+    let regs : R = bind helper
+    run
+        on regs.A
+            log(info, "A written")
+        end on
+        regs.A = 1
+        regs.record_write(0x00, 2)
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let cpp = cpp_tb::emit(&merged).expect("emit");
+
+    // Sanity: the callback is registered, the active write updates
+    // the mirror, the passive record_write dispatches the callback.
+    assert!(
+        cpp.contains("regs_cbs.A = [&](uint64_t data) {"),
+        "expected `on regs.A` to register a callback closure; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("regs.A = 1;"),
+        "expected the active write `regs.A = 1` to emit a mirror \
+         update; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("if (regs_cbs.A) regs_cbs.A(_rec_data);"),
+        "expected the passive record_write to dispatch the A callback; got:\n{cpp}"
+    );
+
+    // The asymmetry: count the `regs_cbs.A(...)` dispatch occurrences.
+    // There must be exactly one — fired by `record_write`, NOT by
+    // the active assign. If a future codegen edit accidentally adds
+    // dispatch to the active path, this count rises to 2 and the
+    // test fails loud. (The registration site `regs_cbs.A = [&]...`
+    // uses `=`, not `(`, so it is structurally different and not
+    // counted here.)
+    let dispatch_count = cpp.matches("regs_cbs.A(_rec_data)").count();
+    assert_eq!(
+        dispatch_count, 1,
+        "expected exactly one `regs_cbs.A(_rec_data)` dispatch site \
+         (the passive record_write decode); found {dispatch_count}. \
+         The active frontdoor write path must NOT dispatch callbacks \
+         per docs/ral-support.md §3.2. Full output:\n{cpp}"
     );
 }
 

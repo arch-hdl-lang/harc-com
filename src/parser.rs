@@ -1639,40 +1639,39 @@ impl Parser {
         existing_items: &[ComponentItem],
     ) -> Result<ComponentItem, CompileError> {
         let start = self.peek_span();
-        let (kind, stmts, end_span) = match self.peek_kind() {
+        let (phase, stmts, end_span) = match self.peek_kind() {
             Some(TokenKind::Setup) => {
                 self.advance();
                 let stmts = self.parse_stmt_list_until_end()?;
                 let end_span = self.expect_end_anon(TokenKind::Setup)?;
-                ("setup", stmts, end_span)
+                (LifecyclePhase::Setup, stmts, end_span)
             }
             Some(TokenKind::Check) => {
                 self.advance();
                 let stmts = self.parse_stmt_list_until_end()?;
                 let end_span = self.expect_end_anon(TokenKind::Check)?;
-                ("check", stmts, end_span)
+                (LifecyclePhase::Check, stmts, end_span)
             }
             Some(TokenKind::Teardown) => {
                 self.advance();
                 let stmts = self.parse_stmt_list_until_end()?;
                 let end_span = self.expect_end_anon(TokenKind::Teardown)?;
-                ("teardown", stmts, end_span)
+                (LifecyclePhase::Teardown, stmts, end_span)
             }
             _ => unreachable!("parse_testbench_lifecycle called for non-lifecycle token"),
         };
 
-        let duplicate = existing_items.iter().any(|it| match it {
-            ComponentItem::Lifecycle(scope) => match kind {
-                "setup" => scope.setup.is_some(),
-                "check" => scope.check.is_some(),
-                "teardown" => scope.teardown.is_some(),
-                _ => false,
-            },
-            _ => false,
+        // Typed duplicate check: with the new variant shape this is a
+        // direct phase comparison, no field-of-ScopeDecl inspection.
+        let duplicate = existing_items.iter().any(|it| {
+            matches!(it, ComponentItem::Lifecycle(p, _) if *p == phase)
         });
         if duplicate {
             return Err(CompileError::general(
-                &format!("duplicate `{kind}` block in testbench `{component_name}`"),
+                &format!(
+                    "duplicate `{}` block in testbench `{component_name}`",
+                    phase.keyword(),
+                ),
                 start,
             ));
         }
@@ -1681,24 +1680,7 @@ impl Parser {
             stmts,
             span: end_span,
         };
-        let mut scope = ScopeDecl {
-            name: Ident {
-                name: "sim".into(),
-                span: start,
-            },
-            setup: None,
-            run: None,
-            check: None,
-            teardown: None,
-            span: end_span,
-        };
-        match kind {
-            "setup" => scope.setup = Some(body),
-            "check" => scope.check = Some(body),
-            "teardown" => scope.teardown = Some(body),
-            _ => unreachable!(),
-        }
-        Ok(ComponentItem::Lifecycle(scope))
+        Ok(ComponentItem::Lifecycle(phase, body))
     }
 
     fn parse_clock_decl(&mut self) -> Result<ClockDecl, CompileError> {

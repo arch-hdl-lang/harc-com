@@ -1,0 +1,50 @@
+// Locks the current conservative behaviour of
+// `topo_sort_component_indices` when a called hookable name is owned
+// by more than one external component. The rule at
+// `src/codegen/cpp_tb.rs::topo_sort_component_indices` (rule 2) is:
+//
+//   "for each method called, if exactly one *other* component owns
+//    a hookable by that name, add the edge."
+//
+// When two (or more) external components own the same hookable name,
+// the edge is silently NOT added — the sort falls back to the field
+// rule + source order. This is conservative-correct under the
+// current emit-time dispatch (`resolve_component_method_call` picks
+// the receiver-type-matching owner), but it does mean that if the
+// ambiguous case is ALSO not field-edge reachable, dependency order
+// degrades to source order.
+//
+// The companion unit test in tests/codegen.rs pins the current
+// behaviour: when two externals own `produce_value`, NO call-edge
+// is added regardless of which owner the call's receiver type
+// actually matches. Closes the test-gap half of arch-com#463 §8.
+// The design decision — widen dispatch by receiver type vs. emit
+// a compile error on ambiguous unrooted calls — is tracked
+// in-source as a TODO at the dispatch site.
+
+transactor CallerXact
+    helper : HelperA
+
+    // The call below resolves to `HelperA.produce_value` at emit
+    // time because `helper`'s declared type is `HelperA`. The topo
+    // sort, however, only sees the method name `produce_value`
+    // and the global set of owners — and there are two.
+    hookable observed_count() -> uint<32>
+        return helper.produce_value()
+    end observed_count
+end transactor CallerXact
+
+transactor HelperA
+    hookable produce_value() -> uint<32>
+        return 1u32
+    end produce_value
+end transactor HelperA
+
+transactor HelperB
+    // Same name, different owner. This is what triggers the
+    // ambiguous-owner branch (`externals.len() > 1`) and causes
+    // rule 2 to skip the edge.
+    hookable produce_value() -> uint<32>
+        return 2u32
+    end produce_value
+end transactor HelperB
