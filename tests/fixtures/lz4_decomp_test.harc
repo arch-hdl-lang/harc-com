@@ -1,0 +1,164 @@
+// HARC TB for arch-com/examples/lz4_decomp.arch — an LZ4 block
+// decompressor (CAST LZ4SNP-D style). The DUT consumes a compressed
+// byte stream over a valid/ready interface, decodes it into a 256-byte
+// history/output buffer, and streams the decoded bytes back out.
+//
+// `drive_block` is a single feeder that, each cycle: presents the next
+// compressed byte while in_ready holds, samples the input/output
+// handshake, advances the clock, then checks any produced byte against
+// the expected-output queue and retires the consumed input byte. The
+// last compressed byte of a block carries in_last.
+//
+// Four cases cover the LZ4 sequence grammar:
+//   1. all-literal block
+//   2. back-reference match copy (offset 2, length 4)
+//   3. RLE overlap (offset 1) + extended match length
+//   4. extended literal length (token nibble 15 + continuation byte)
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+// Hold the DUT in reset, then release. Active-high synchronous reset.
+function reset_dut(dut: Lz4Decomp)
+    dut.rst = 1
+    dut.in_valid = 0
+    dut.in_data = 0
+    dut.in_last = 0
+    dut.out_ready = 0
+    wait 2 cycles
+    dut.rst = 0
+    wait 1 cycle
+end function reset_dut
+
+// Feed every byte of `cin` into the DUT and check every produced byte
+// against `eout`. The sink is always ready; the last input byte is
+// flagged with in_last. Loops until all expected output has been seen.
+function drive_block(dut: Lz4Decomp, cin: queue<uint<8>>, eout: queue<uint<8>>, cid: uint<8>)
+    let have_byte = 0
+    let cur_byte : uint<8> = 0
+    let cur_last = 0
+    let guard = 0
+    dut.out_ready = 1
+    dut.in_valid = 0
+    dut.in_last = 0
+    while !eout.empty() && guard < 8000
+        // Latch the next compressed byte once the previous one retired.
+        if have_byte == 0 && !cin.empty()
+            cur_byte = cin.pop()
+            cur_last = cin.empty() ? 1 : 0
+            have_byte = 1
+        end if
+        if have_byte == 1
+            dut.in_valid = 1
+            dut.in_data = cur_byte
+            dut.in_last = cur_last
+        else
+            dut.in_valid = 0
+            dut.in_last = 0
+        end if
+        // Sample this cycle's handshake before advancing the clock.
+        let consume = (have_byte == 1) && (dut.in_ready == 1)
+        let produce = dut.out_valid == 1
+        let obyte = dut.out_data
+        wait 1 cycle
+        if produce == 1
+            let exp = eout.pop()
+            assert obyte == exp
+                else fail("case ${cid}: byte mismatch got 0x${obyte:02x} want 0x${exp:02x}")
+        end if
+        if consume == 1
+            have_byte = 0
+        end if
+        guard = guard + 1
+    end while
+    dut.in_valid = 0
+    dut.in_last = 0
+    assert guard < 8000
+        else fail("case ${cid}: decompression timed out")
+end function drive_block
+
+testbench Lz4DecompTb
+    dut : Lz4Decomp
+end testbench Lz4DecompTb
+
+impl Lz4DecompTest for Lz4DecompTb
+    clock clk = SysDomain
+
+    run
+        reset_dut(dut)
+
+        // Case 1: all-literal block "ABC" (token 0x30 = 3 literals).
+        let cin1 : queue<uint<8>>
+        let eout1 : queue<uint<8>>
+        cin1.push(0x30)
+        cin1.push(0x41)
+        cin1.push(0x42)
+        cin1.push(0x43)
+        eout1.push(0x41)
+        eout1.push(0x42)
+        eout1.push(0x43)
+        drive_block(dut, cin1, eout1, 1)
+        log(info, "PASS case 1: all-literal block -> ABC")
+
+        reset_dut(dut)
+
+        // Case 2: literal "AB" + match(offset 2, length 4) + literal "C"
+        //         -> A B A B A B C
+        let cin2 : queue<uint<8>>
+        let eout2 : queue<uint<8>>
+        cin2.push(0x20)   // token: 2 literals, match nibble 0 (length 4)
+        cin2.push(0x41)   // 'A'
+        cin2.push(0x42)   // 'B'
+        cin2.push(0x02)   // offset low byte = 2
+        cin2.push(0x00)   // offset high byte
+        cin2.push(0x10)   // final token: 1 literal
+        cin2.push(0x43)   // 'C'
+        eout2.push(0x41)
+        eout2.push(0x42)
+        eout2.push(0x41)
+        eout2.push(0x42)
+        eout2.push(0x41)
+        eout2.push(0x42)
+        eout2.push(0x43)
+        drive_block(dut, cin2, eout2, 2)
+        log(info, "PASS case 2: back-reference match -> ABABABC")
+
+        reset_dut(dut)
+
+        // Case 3: RLE via offset 1 + extended match length.
+        //   literal 'X', then match offset=1 length=19 -> 20x 'X', then 'Y'.
+        let cin3 : queue<uint<8>>
+        let eout3 : queue<uint<8>>
+        cin3.push(0x1F)   // token: 1 literal, match nibble 15 (extended)
+        cin3.push(0x58)   // 'X'
+        cin3.push(0x01)   // offset low byte = 1
+        cin3.push(0x00)   // offset high byte
+        cin3.push(0x00)   // extra match-len byte (length = 15 + 4 + 0 = 19)
+        cin3.push(0x10)   // final token: 1 literal
+        cin3.push(0x59)   // 'Y'
+        for _ in 0 .. 20
+            eout3.push(0x58)
+        end for
+        eout3.push(0x59)
+        drive_block(dut, cin3, eout3, 3)
+        log(info, "PASS case 3: RLE + extended match length -> 20x X, Y")
+
+        reset_dut(dut)
+
+        // Case 4: extended literal length (token nibble 15 + 1 extra byte).
+        //   15 + 3 = 18 literal bytes, all-literal block.
+        let cin4 : queue<uint<8>>
+        let eout4 : queue<uint<8>>
+        cin4.push(0xF0)   // token: literal nibble 15 (extended), match nibble 0
+        cin4.push(0x03)   // extra literal-len byte -> 18 literals total
+        for i in 0 .. 18
+            cin4.push(i)
+            eout4.push(i)
+        end for
+        drive_block(dut, cin4, eout4, 4)
+        log(info, "PASS case 4: extended literal length -> 18 literals")
+
+        log(info, "PASS: all 4 LZ4 decompression cases")
+    end run
+end impl Lz4DecompTest

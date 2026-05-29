@@ -114,6 +114,7 @@ buf_mgr_sm_test         | BufMgrSm       | buf_mgr_sm.sv data_mem_sm.sv free_lis
 aes_cipher_top_test     | AesCipherTop   | aes_cipher_top.sv aes_key_expand_128.sv xtime.sv |
 wide_reg_test           | WideReg        | wide_reg.sv            |
 buf_mgr_test            | BufMgr         | buf_mgr.sv data_mem.sv next_ptr_mem.sv free_list_bank.sv setup_counter.sv |
+lz4_decomp_test         | Lz4Decomp      | lz4_decomp.sv          |
 EOF
 
 PASS=0
