@@ -2457,13 +2457,8 @@ pub fn topo_sort_component_indices(file: &SourceFile) -> Vec<usize> {
                 ComponentItem::TargetTlmThread(t) => {
                     collect_called_method_names(&t.body, &mut called_methods);
                 }
-                ComponentItem::Lifecycle(s) => {
-                    for blk in [&s.setup, &s.run, &s.check, &s.teardown]
-                        .into_iter()
-                        .flatten()
-                    {
-                        collect_called_method_names(blk, &mut called_methods);
-                    }
+                ComponentItem::Lifecycle(_phase, body) => {
+                    collect_called_method_names(body, &mut called_methods);
                 }
                 ComponentItem::Watchdog(w) => {
                     collect_called_method_names(&w.body, &mut called_methods);
@@ -2475,6 +2470,25 @@ pub fn topo_sort_component_indices(file: &SourceFile) -> Vec<usize> {
         // *other* component owns a hookable by that name, add the
         // edge. Self-edges (same i) are skipped — same-component
         // calls are intra-item and don't reorder structs.
+        //
+        // TODO(arch-com#463 §8): the ambiguous-owner branch
+        // (`externals.len() > 1`) currently drops the edge
+        // silently. This is conservative-correct today because
+        // `resolve_component_method_call` picks the receiver-
+        // type-matching owner at emit time and the field rule
+        // will have already added an edge to that owner — provided
+        // the receiver's type is field-reachable. If the receiver
+        // is NOT field-reachable (e.g. obtained via another
+        // hookable call), the dependency degrades to source order.
+        // Two design choices on the table:
+        //   (a) widen rule 2 to resolve the receiver's type at
+        //       graph-build time and add the resolved owner's
+        //       edge, OR
+        //   (b) emit a compile error on ambiguous unrooted calls.
+        // Pinned by `transactor_topo_sort_skips_ambiguous_hookable_call_edges`
+        // in `tests/codegen.rs`; pick a direction before any
+        // codegen feature lands that legitimately wants the
+        // edge added.
         for m in &called_methods {
             if let Some(owners) = method_owners.get(m) {
                 let externals: Vec<usize> = owners.iter().copied().filter(|&j| j != i).collect();
@@ -16749,18 +16763,19 @@ fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
             teardown: None,
             span: tb_ident.span,
         };
+        // Aggregate phase bodies into the synthetic tb_lifecycle
+        // ScopeDecl the rest of cpp_tb's lifecycle machinery
+        // consumes. With the §7 cleanup each `Lifecycle(phase, body)`
+        // node carries exactly one phase, so this loop just routes by
+        // phase tag — no field-of-ScopeDecl inspection needed.
         for ci in &tb.items {
-            if let ComponentItem::Lifecycle(sc) = ci {
-                if sc.setup.is_some() {
-                    tb_lifecycle.setup = sc.setup.clone();
+            if let ComponentItem::Lifecycle(phase, body) = ci {
+                match phase {
+                    LifecyclePhase::Setup => tb_lifecycle.setup = Some(body.clone()),
+                    LifecyclePhase::Check => tb_lifecycle.check = Some(body.clone()),
+                    LifecyclePhase::Teardown => tb_lifecycle.teardown = Some(body.clone()),
                 }
-                if sc.check.is_some() {
-                    tb_lifecycle.check = sc.check.clone();
-                }
-                if sc.teardown.is_some() {
-                    tb_lifecycle.teardown = sc.teardown.clone();
-                }
-                tb_lifecycle.span = sc.span;
+                tb_lifecycle.span = body.span;
             }
         }
 

@@ -631,8 +631,8 @@ fn print_component_item(out: &mut String, it: &ComponentItem, depth: usize) {
                 writeln!(out, "end function {}", h.name.name).ok();
             }
         }
-        ComponentItem::Lifecycle(s) => {
-            print_lifecycle_scope(out, s, depth);
+        ComponentItem::Lifecycle(phase, body) => {
+            print_lifecycle_phase(out, *phase, body, depth);
         }
         ComponentItem::Apply(a) => {
             pad(out, depth);
@@ -646,6 +646,19 @@ fn print_component_item(out: &mut String, it: &ComponentItem, depth: usize) {
     }
 }
 
+fn print_lifecycle_phase(out: &mut String, phase: LifecyclePhase, body: &Block, depth: usize) {
+    let kw = phase.keyword();
+    pad(out, depth);
+    writeln!(out, "{kw}").ok();
+    print_block_inner(out, body, depth + 1);
+    pad(out, depth);
+    writeln!(out, "end {kw}").ok();
+}
+
+/// Legacy inline `scope sim` body used by `TestItem::Scope`. Walks all
+/// four phase fields in declaration order. (The component-level
+/// `ComponentItem::Lifecycle` case now uses the tighter typed
+/// `print_lifecycle_phase` above — see arch-com#463 §7.)
 fn print_lifecycle_scope(out: &mut String, s: &ScopeDecl, depth: usize) {
     if let Some(b) = &s.setup {
         pad(out, depth);
