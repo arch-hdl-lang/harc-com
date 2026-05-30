@@ -93,10 +93,53 @@ the workflow.
 
 ---
 
+## Limitations of the MVP
+
+`--check-backends` (as shipped in [harc-com#321](https://github.com/arch-hdl-lang/harc-com/pull/321))
+makes one load-bearing assumption: **backends emit trace events in a
+deterministic, stable order**. The diff in `src/check_backends.rs` walks
+both traces by line index after normalization; any cross-backend
+reordering — even of two semantically equivalent events on the same
+cycle — reports as divergence.
+
+This is correct for the current backend pair:
+
+- **ARCH native sim** — single-threaded C++ event loop; trace lines are
+  emitted from one place in the tick loop, in fixed order.
+- **Verilator** — single-threaded VPI tick; trace emission is serialized
+  through the same callback chain on every tick.
+
+The assumption breaks if either of these shifts:
+
+1. `arch sim --thread-sim parallel` grows native trace support (today
+   it goes through the same fsm-lowered path under `--thread-sim both`,
+   so this is moot).
+2. A multi-threaded SV simulator is added as a third backend.
+3. The trace format is extended with events that are *cycle-tagged but
+   intra-cycle-unordered* (e.g. multi-port writes).
+
+When that happens, two recovery paths exist:
+
+- **Preferred — force determinism at the writer.** Add a stable
+  intra-cycle sort key (cycle, event_type, component, method) to the
+  emitter, *not* the diff. Keeps `diff_trace_strings` dumb, fast, and
+  obviously correct.
+- **Fallback — cycle-bucketed compare.** Group lines by cycle stamp,
+  sort each bucket by a stable key before comparison. ~30 lines of
+  code in `diff_trace_strings`; requires per-event-type rules for what
+  counts as "equivalent" (log lines are usually order-sensitive, TLM
+  request/response pairs are not).
+
+The CLI flag's help text and the `diff_trace_strings` doc comment both
+flag this assumption so future maintainers see it before extending the
+tool.
+
+---
+
 ## Action items
 
 - [ ] **arch-com** — implement SFG + thread sole-writer query (arch-com proposal)
 - [ ] **arch-com** — apply exit-fold optimization for #306, which also fixes #437 class of bugs
-- [ ] **harc-com** — add `harc sim --check-backends` as a minimum-viable dual-backend check
+- [x] **harc-com** — add `harc sim --check-backends` as a minimum-viable dual-backend check ([harc-com#321](https://github.com/arch-hdl-lang/harc-com/pull/321))
 - [ ] **harc-com** — add a fixture that covers the first-output boundary scenario from #437
       (a design with a thread-lowered registered output, checked on both backends)
