@@ -1,0 +1,177 @@
+// HARC TB for arch-com/examples/huff_enc.arch
+//
+// Fixed-table Huffman literal encoder for bytes 0-255 (RFC 1951 DEFLATE).
+// Verifies: reset, boundary codes, s_last propagation, streaming throughput,
+// and back-pressure stall behaviour.
+
+covergroup HuffCov @(posedge dut.clk)
+    cp_len : cover dut.m_len
+        bins
+            len8 = {8}
+            len9 = {9}
+        end bins
+    cp_valid : cover dut.m_valid
+        bins
+            active = {1}
+            idle   = {0}
+        end bins
+end covergroup HuffCov
+
+testbench HuffEncTb
+    dut : HuffEnc
+    cov : HuffCov
+end testbench HuffEncTb
+
+impl HuffEncTest for HuffEncTb
+    run
+        // ---- Reset ----
+        dut.rst     = 1
+        dut.s_valid = 0
+        dut.s_data  = 0
+        dut.s_last  = 0
+        dut.m_ready = 1
+        wait 2 cycles
+        assert dut.m_valid == 0
+            else fail("after reset, m_valid should be 0")
+        dut.rst = 0
+        wait 1 cycle
+
+        // ---- Symbol 0: code=48 (0x030), len=8 ----
+        dut.s_valid = 1
+        dut.s_data  = 0
+        dut.s_last  = 0
+        assert dut.s_ready == 1
+            else fail("sym 0: s_ready should be 1")
+        wait 1 cycle
+        dut.s_valid = 0
+        assert dut.m_valid == 1
+            else fail("sym 0: m_valid not asserted after 1 cycle")
+        assert dut.m_code == 48
+            else fail("sym 0: expected code 48 (0x030), got ${dut.m_code}")
+        assert dut.m_len == 8
+            else fail("sym 0: expected len 8, got ${dut.m_len}")
+        assert dut.m_last == 0
+            else fail("sym 0: m_last should be 0")
+        wait 1 cycle
+
+        // ---- Symbol 143: code=191 (0x0BF), len=8 ----
+        dut.s_valid = 1
+        dut.s_data  = 143
+        wait 1 cycle
+        dut.s_valid = 0
+        assert dut.m_valid == 1
+            else fail("sym 143: m_valid not asserted")
+        assert dut.m_code == 191
+            else fail("sym 143: expected code 191 (0x0BF), got ${dut.m_code}")
+        assert dut.m_len == 8
+            else fail("sym 143: expected len 8, got ${dut.m_len}")
+        wait 1 cycle
+
+        // ---- Symbol 144: code=400 (0x190), len=9 ----
+        dut.s_valid = 1
+        dut.s_data  = 144
+        wait 1 cycle
+        dut.s_valid = 0
+        assert dut.m_valid == 1
+            else fail("sym 144: m_valid not asserted")
+        assert dut.m_code == 400
+            else fail("sym 144: expected code 400 (0x190), got ${dut.m_code}")
+        assert dut.m_len == 9
+            else fail("sym 144: expected len 9, got ${dut.m_len}")
+        wait 1 cycle
+
+        // ---- Symbol 255: code=511 (0x1FF), len=9, last propagation ----
+        dut.s_valid = 1
+        dut.s_data  = 255
+        dut.s_last  = 1
+        wait 1 cycle
+        dut.s_valid = 0
+        dut.s_last  = 0
+        assert dut.m_valid == 1
+            else fail("sym 255: m_valid not asserted")
+        assert dut.m_code == 511
+            else fail("sym 255: expected code 511 (0x1FF), got ${dut.m_code}")
+        assert dut.m_len == 9
+            else fail("sym 255: expected len 9, got ${dut.m_len}")
+        assert dut.m_last == 1
+            else fail("sym 255: m_last should propagate s_last=1")
+        wait 1 cycle
+
+        log(info, "PASS: boundary checks (sym 0, 143, 144, 255)")
+
+        // ---- Streaming: A(65)->code 113, B(66)->code 114, sym150->code 406 ----
+        // Symbols are fed back-to-back; outputs trail by 1 cycle.
+        // A:   65 + 48  = 113, len 8
+        // B:   66 + 48  = 114, len 8
+        // 150: 150 + 256 = 406, len 9
+
+        dut.s_valid = 1
+        dut.s_data  = 65
+        wait 1 cycle
+        dut.s_data  = 66
+        assert dut.m_valid == 1
+            else fail("stream A: m_valid not asserted")
+        assert dut.m_code == 113
+            else fail("stream A: expected code 113, got ${dut.m_code}")
+        assert dut.m_len == 8
+            else fail("stream A: expected len 8, got ${dut.m_len}")
+        wait 1 cycle
+        dut.s_data  = 150
+        assert dut.m_code == 114
+            else fail("stream B: expected code 114, got ${dut.m_code}")
+        assert dut.m_len == 8
+            else fail("stream B: expected len 8, got ${dut.m_len}")
+        wait 1 cycle
+        dut.s_valid = 0
+        assert dut.m_code == 406
+            else fail("stream sym150: expected code 406, got ${dut.m_code}")
+        assert dut.m_len == 9
+            else fail("stream sym150: expected len 9, got ${dut.m_len}")
+        wait 1 cycle
+
+        log(info, "PASS: back-to-back streaming (A, B, sym150)")
+
+        // ---- Back-pressure: m_ready=0 stalls pipeline ----
+        // sym 72 'H': 72 + 48 = 120, len 8
+
+        dut.m_ready = 0
+        dut.s_valid = 1
+        dut.s_data  = 72
+        assert dut.s_ready == 1
+            else fail("backpressure: s_ready should be 1 before first latch")
+        wait 1 cycle
+        // valid_r=1, code_r=120; stall = valid_r & ~m_ready = 1
+        dut.s_valid = 0
+        assert dut.m_valid == 1
+            else fail("backpressure: m_valid should be 1 when stalled")
+        assert dut.m_code == 120
+            else fail("backpressure: expected code 120 ('H'), got ${dut.m_code}")
+        assert dut.m_len == 8
+            else fail("backpressure: expected len 8, got ${dut.m_len}")
+        assert dut.s_ready == 0
+            else fail("backpressure: s_ready should be 0 while output stalled")
+        wait 1 cycle
+        // Registers frozen for second stall cycle
+        assert dut.m_valid == 1
+            else fail("backpressure: m_valid should stay 1 during sustained stall")
+        assert dut.m_code == 120
+            else fail("backpressure: output code unstable during stall, got ${dut.m_code}")
+        // Release back-pressure
+        dut.m_ready = 1
+        wait 1 cycle
+        assert dut.m_valid == 0
+            else fail("backpressure: m_valid should clear after drain")
+
+        log(info, "PASS: back-pressure stall and release")
+    end run
+
+    check
+        cov.report()
+        assert cov.cp_len.len8 > 0
+            else fail("len=8 codes (symbols 0-143) never covered")
+        assert cov.cp_len.len9 > 0
+            else fail("len=9 codes (symbols 144-255) never covered")
+        assert cov.cp_valid.active > 0
+            else fail("m_valid never asserted — encoder produced no output")
+    end check
+end impl HuffEncTest

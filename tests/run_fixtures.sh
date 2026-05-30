@@ -116,6 +116,7 @@ aes_cipher_top_test     | AesCipherTop   | aes_cipher_top.sv aes_key_expand_128.
 wide_reg_test           | WideReg        | wide_reg.sv            |
 buf_mgr_test            | BufMgr         | buf_mgr.sv data_mem.sv next_ptr_mem.sv free_list_bank.sv setup_counter.sv |
 sha256_test             | Sha256         | sha256.sv              |
+huff_enc_test           | HuffEnc        | huff_enc.sv            |
 EOF
 
 PASS=0
