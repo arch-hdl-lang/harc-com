@@ -63,6 +63,24 @@ pub fn diff_traces(arch_trace: &Path, sv_trace: &Path) -> Result<Vec<Divergence>
 
 /// Same as [`diff_traces`] but operates on in-memory trace text — used by
 /// unit tests so they don't need to materialize files on disk.
+///
+/// REQUIRES: deterministic, stable cross-backend event order.
+///
+/// Both inputs are walked by line index after normalization (see
+/// [`normalize_lines`]); a backend that emits two semantically
+/// equivalent events on the same cycle in a different order than the
+/// other backend WILL produce a false-positive divergence. Today this
+/// holds — the only two backends are the ARCH native sim (single-
+/// threaded C++ event loop) and Verilator (single-threaded VPI tick),
+/// both of which serialize trace emission. If a future backend (e.g.
+/// `arch sim --thread-sim parallel` once it grows native trace
+/// support, or a multi-threaded SV simulator) breaks this assumption,
+/// either:
+///   1. Force the trace writer back into a deterministic order
+///      (preferred — keeps the diff dumb and fast), or
+///   2. Replace the per-line comparison with cycle-bucketed,
+///      stable-sorted compare (see Limitations in
+///      `docs/2026-05-28-backend-equivalence-gap.md`).
 pub fn diff_trace_strings(arch_text: &str, sv_text: &str) -> Result<Vec<Divergence>, String> {
     let arch_lines = normalize_lines(arch_text);
     let sv_lines = normalize_lines(sv_text);

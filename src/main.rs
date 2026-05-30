@@ -207,6 +207,11 @@ enum Cmd {
         /// `docs/2026-05-28-backend-equivalence-gap.md`: catches the
         /// class of bug where one backend silently disagrees with the
         /// other (arch-com#437) before it reaches users.
+        ///
+        /// REQUIRES: backends must emit trace events in a deterministic,
+        /// stable order. The diff compares line-by-line; any reordering
+        /// across backends (even of semantically equivalent events on
+        /// the same cycle) reports as divergence.
         #[arg(long)]
         check_backends: bool,
     },
