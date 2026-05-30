@@ -7024,6 +7024,148 @@ end test T"#,
     );
 }
 
+/// Structural counterpart to `regblock_record_write_emits_recursion_guard`.
+/// The substring checks in that test confirm the right pieces appear
+/// *somewhere* in the emitted C++, but they don't pin down how the
+/// pieces fit together — two regression classes the substring view
+/// silently accepts:
+///
+/// 1. **Off-by-one in the comparison**: flipping `>=` to `>` keeps
+///    every substring intact but raises the effective cap from 16 to
+///    17 (depth 16 no longer aborts; depth 17 does). Pinned here by
+///    matching the literal `regs_cb_depth >= HARC_RAL_CB_MAX_DEPTH`
+///    token — any rewrite of the operator breaks the assertion.
+///
+/// 2. **Unbump escaping the else arm**: moving `regs_cb_depth--;`
+///    out of the `else { ... }` body makes the decrement run on the
+///    FATAL path too, leaving the counter in a stale state after a
+///    legitimate-but-recursive callback chain aborts mid-flight.
+///    Pinned here by asserting that the FATAL line's `} else {` head
+///    sits *before* the `regs_cb_depth--;` in the source, and that
+///    after the FATAL block there is no top-level `regs_cb_depth--;`
+///    floating outside an `else` arm.
+///
+/// Compile-to-string only — paired with the
+/// `regblock_record_recursion_test` fixture (run via
+/// `tests/run_negative_fixtures.sh`) which exercises the same path
+/// at runtime.
+#[test]
+fn regblock_record_write_recursion_guard_structure() {
+    let parsed = parse_source(
+        r#"regblock R via H width 32
+    register A @ 0x00 access rw
+end regblock R
+
+test T
+    let dut : SomeDut
+    let regs : R = bind helper
+    run
+        on regs.A
+            regs.record_write(0x00, data)
+        end on
+        regs.record_write(0x00, 1)
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let cpp = cpp_tb::emit(&merged).expect("emit");
+
+    // (1) Comparison operator is exactly `>=`. Catches `>` (cap
+    // shifts from 16 to 17) and `<` / `==` / etc.
+    assert!(
+        cpp.contains("if (regs_cb_depth >= HARC_RAL_CB_MAX_DEPTH)"),
+        "expected literal `>=` comparison against the depth cap; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("if (regs_cb_depth > HARC_RAL_CB_MAX_DEPTH)"),
+        "found `>` comparison — should be `>=`; got:\n{cpp}"
+    );
+
+    // (2) Unbump (`regs_cb_depth--;`) must sit *strictly inside* the
+    // success `else { ... }` arm — not at the same indentation as
+    // the `if/else` header (which would mean it runs on both the
+    // FATAL path and the success path, leaking decrements onto the
+    // abort path and breaking the counter after a legitimate
+    // recursive cascade aborts).
+    //
+    // We pin this by lining up indentations: for every line that
+    // contains `regs_cb_depth--;`, its leading-whitespace prefix
+    // must be *strictly deeper* than the leading-whitespace prefix
+    // of the closest preceding line containing the
+    // `if (regs_cb_depth >= HARC_RAL_CB_MAX_DEPTH)` guard header
+    // (which is also the `} else {` line in single-line emission).
+    let total_unbumps = cpp.matches("regs_cb_depth--;").count();
+    let total_bumps = cpp.matches("regs_cb_depth++;").count();
+    assert_eq!(
+        total_unbumps, total_bumps,
+        "bump/unbump must be balanced; got bumps={total_bumps} unbumps={total_unbumps}:\n{cpp}"
+    );
+    assert!(
+        total_unbumps >= 1,
+        "expected at least one decode site with bump/unbump:\n{cpp}"
+    );
+
+    fn leading_ws(s: &str) -> usize {
+        s.chars().take_while(|c| *c == ' ' || *c == '\t').count()
+    }
+
+    let lines: Vec<&str> = cpp.lines().collect();
+    let mut current_guard_indent: Option<usize> = None;
+    let mut current_guard_line: Option<usize> = None;
+    let mut last_bump_line: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if line.contains("if (regs_cb_depth >= HARC_RAL_CB_MAX_DEPTH)") {
+            current_guard_indent = Some(leading_ws(line));
+            current_guard_line = Some(i);
+            last_bump_line = None;
+        }
+        if line.contains("regs_cb_depth++;") {
+            last_bump_line = Some(i);
+            let g_ind = current_guard_indent.expect(
+                "saw `regs_cb_depth++;` before any guard header — bump leaked above the guard",
+            );
+            let b_ind = leading_ws(line);
+            assert!(
+                b_ind > g_ind,
+                "bump on line {} (indent {}) is not deeper than guard header on line {} (indent {}) — \
+                 bump leaked out of the success else arm:\n{}",
+                i + 1,
+                b_ind,
+                current_guard_line.unwrap() + 1,
+                g_ind,
+                cpp
+            );
+        }
+        if line.contains("regs_cb_depth--;") {
+            let g_ind = current_guard_indent.expect(
+                "saw `regs_cb_depth--;` before any guard header — unbump leaked above the guard",
+            );
+            let u_ind = leading_ws(line);
+            assert!(
+                u_ind > g_ind,
+                "unbump on line {} (indent {}) is not deeper than guard header on line {} (indent {}) — \
+                 unbump leaked out of the success else arm (would also run on FATAL path):\n{}",
+                i + 1,
+                u_ind,
+                current_guard_line.unwrap() + 1,
+                g_ind,
+                cpp
+            );
+            let bump_line = last_bump_line.expect(
+                "saw `regs_cb_depth--;` without a preceding `regs_cb_depth++;` in the same decode block",
+            );
+            assert!(
+                bump_line < i,
+                "bump on line {} must precede unbump on line {} within the same decode block:\n{}",
+                bump_line + 1,
+                i + 1,
+                cpp
+            );
+        }
+    }
+}
+
 #[test]
 fn regblock_record_write_callback_cross_register_chain() {
     // A legal cross-register cascade (A -> B -> C) at depth 3

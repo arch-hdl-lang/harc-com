@@ -172,3 +172,8 @@ jobs:
           # propagates via -MAKEFLAGS into the verilator makefile.
           HARC_CXX: clang++
         run: ./tests/run_fixtures.sh
+
+      - name: Run negative-fixture runner (expects FATAL / abort)
+        env:
+          HARC_CXX: clang++
+        run: ./tests/run_negative_fixtures.sh
