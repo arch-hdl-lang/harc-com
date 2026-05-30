@@ -1,0 +1,110 @@
+// RAL passive record API — recursion guard end-to-end exercise.
+//
+// PR #317 added a per-binding depth counter (`regs_cb_depth`) and a
+// FATAL abort at `HARC_RAL_CB_MAX_DEPTH = 16` to keep a recursive
+// `record_write` callback from blowing the C++ stack. The existing
+// codegen test `regblock_record_write_emits_recursion_guard` proves
+// the code is *emitted*; this fixture proves the guard actually
+// *fires at runtime* — so a regression that breaks the depth tracking
+// (e.g. flipping `>=` to `>` and also moving the unbump out of the
+// `else` arm) is caught, not just one that changes the textual shape.
+//
+// Pass criterion: harc sim emits a FATAL log line containing
+//   "RAL record_write callback recursion exceeded HARC_RAL_CB_MAX_DEPTH"
+// and the run is reported as failed (errors > 0). This fixture is
+// therefore *not* runnable via the standard run_fixtures.sh
+// "ALL TESTS PASSED" check — see tests/run_negative_fixtures.sh.
+//
+// Mechanism: a self-write callback on register A re-invokes
+// record_write(0x00) on every fire. Each entry bumps regs_cb_depth;
+// without the guard the recursion is unbounded and crashes. With the
+// guard the 16th re-entry triggers the FATAL+abort path.
+//
+// docs/ral-support.md §3.2.
+
+use BusAxiLite
+
+transactor AxilHelper bound to BusAxiLite
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            bus.aw.addr = addr
+            bus.aw.valid = 1
+            bus.w.send(data, 15)
+            bus.aw.valid = 0
+            wait 1 cycle
+        end write
+
+        hookable read(addr: uint<8>) -> uint<32>
+            bus.ar.addr = addr
+            bus.ar.valid = 1
+            let r = bus.r.recv()
+            bus.ar.valid = 0
+            wait 1 cycle
+            return r.data
+        end read
+    end when
+end transactor AxilHelper
+
+regblock DmaRegs via AxilHelper width 32
+    register MM2S_SA   @ 0x18 access rw
+    register MM2S_LEN  @ 0x28 access rw
+    register S2MM_SA   @ 0x20 access rw
+end regblock DmaRegs
+
+testbench RegblockRecordRecursionTb
+    dut : AxiLiteRegs
+end testbench RegblockRecordRecursionTb
+
+impl RegblockRecordRecursionTest for RegblockRecordRecursionTb
+    let axil   : BusAxiLite = bind dut
+    let helper : AxilHelper active = bind axil
+    let regs   : DmaRegs = bind helper
+
+    // Self-write callback: every record_write on MM2S_SA recursively
+    // invokes record_write on the same address. With the guard in
+    // place this re-enters up to HARC_RAL_CB_MAX_DEPTH (16) deep and
+    // then aborts via FATAL; without the guard the recursion is
+    // unbounded and the C++ stack blows.
+    on regs.MM2S_SA
+        regs.record_write(0x18, data)
+    end on
+
+    run
+        dut.rst = 1
+        axil.aw.valid = 0
+        axil.w.valid = 0
+        axil.b.ready = 1
+        axil.ar.valid = 0
+        axil.r.ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Single seed call: this is the depth-1 entry. The callback
+        // body re-enters record_write on the same address; depth
+        // climbs 1 -> 2 -> ... -> 16. The depth-16 entry trips the
+        // guard:
+        //   FATAL: RAL record_write callback recursion exceeded
+        //   HARC_RAL_CB_MAX_DEPTH (16) on binding `regs` at addr 0x18
+        // and the run terminates with errors > 0.
+        regs.record_write(0x18, 305419896)
+
+        // The FATAL above sets `_fatal` and increments `errors`, but
+        // does *not* unwind the current `run` body — the rest of this
+        // run still executes (only future runs / outer loops bail).
+        // The negative-fixture runner asserts on the FATAL log line
+        // and on the absence of "ALL TESTS PASSED", so a missing
+        // FATAL is caught regardless of what runs after this point.
+        log(info, "recursion-guard test reached end of run body")
+    end run
+end impl RegblockRecordRecursionTest
