@@ -28,12 +28,12 @@ impl Sha256Test for Sha256Tb
         wait 1 cycle
 
         // ---------------------------------------------------------------
-        // Test 1: SHA-256("abc")
+        // Test 1: SHA-256("abc")   — FIPS 180-4 Appendix B.1
         //   Padded block: W[0]=0x61626380, W[1..14]=0, W[15]=0x00000018
-        //   Expected:     ba7816bf 8f01cfe4 ab65dba5 2e9ce3de
-        //                 70e19464 56218d83 95b64636 0f5c7243
+        //   Expected:     ba7816bf 8f01cfea 414140de 5dae2223
+        //                 b00361a3 96177a9c b410ff61 f20015ad
         // ---------------------------------------------------------------
-        dut.msg   = 0x0000001800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000061626380
+        dut.msg   = 0x00000018000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000061626380
         dut.start = 1
         wait 1 cycle
         dut.start = 0
@@ -46,7 +46,11 @@ impl Sha256Test for Sha256Tb
 
         assert dut.done
             else fail("SHA-256(abc): done not asserted within 100 cycles")
-        assert dut.digest == 0x0f5c724395b6463656218d8370e194642e9ce3deab65dba58f01cfe4ba7816bf
+        // FIPS 180-4 Appendix B.1 known-answer vector for SHA-256("abc"):
+        //   H[0..7] = ba7816bf 8f01cfea 414140de 5dae2223
+        //             b00361a3 96177a9c b410ff61 f20015ad
+        // Packed low-to-high (H[0] at bits [31:0], H[7] at bits [255:224]):
+        assert dut.digest == 0xf20015adb410ff6196177a9cb00361a35dae2223414140de8f01cfeaba7816bf
             else fail("SHA-256(abc): digest mismatch")
         wait 1 cycle
 
@@ -58,7 +62,7 @@ impl Sha256Test for Sha256Tb
         //   Expected:     e3b0c442 98fc1c14 9afbf4c8 996fb924
         //                 27ae41e4 649b934c a495991b 7852b855
         // ---------------------------------------------------------------
-        dut.msg   = 0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000080000000
+        dut.msg   = 0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000080000000
         dut.start = 1
         wait 1 cycle
         dut.start = 0
