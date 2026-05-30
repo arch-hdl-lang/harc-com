@@ -71,6 +71,7 @@ regblock_access_test    | AxiLiteRegs    | AxiLiteRegs.sv         |
 regblock_bitbash_test   | AxiLiteRegs    | AxiLiteRegs.sv         |
 regblock_addrmap_test   | AxiLiteRegs    | AxiLiteRegs.sv         |
 regblock_alias_test     | AxiLiteRegs    | AxiLiteRegs.sv         |
+regblock_record_test    | AxiLiteRegs    | AxiLiteRegs.sv         |
 bind_remap_test         | axil_amba      | axil_amba.sv           |
 axilite_constraint_test | AxiLiteRegs    | AxiLiteRegs.sv         | axilite_regs_test.harc | | AxiLiteConstraintTest
 transactor_parse_test   | AxiLiteRegs    | AxiLiteRegs.sv         |
