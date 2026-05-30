@@ -544,6 +544,41 @@ inline void harc_assign_words(Sig& sig, std::initializer_list<uint32_t> words) {
     }
 }
 
+// Number of 32-bit words a signal can physically hold. For Verilator
+// `VlWide<N>` ports this is `N`; for plain arithmetic signals it is the
+// `sizeof`-derived word count (1 for ≤32b, 2 for ≤64b).
+template<typename Sig>
+inline constexpr std::size_t harc_sig_word_capacity() {
+    if constexpr (std::is_arithmetic_v<Sig>) {
+        return sizeof(Sig) / sizeof(uint32_t) == 0 ? 1
+             : sizeof(Sig) / sizeof(uint32_t);
+    } else {
+        return sizeof(Sig) / sizeof(uint32_t);
+    }
+}
+
+// Over-width guard for word-list assignment. `ReqWords` is the number of
+// 32-bit words the *value* of the literal actually needs (i.e. the index
+// of its highest set bit, divided into words and rounded up). The codegen
+// computes it from the literal's value — leading-zero words do NOT count,
+// so a literal written wider than necessary but whose value fits is fine.
+//
+// When `ReqWords` exceeds the signal's physical word capacity the
+// `static_assert` fails at C++ compile time, turning a previously-silent
+// truncation (high words dropped / data misaligned) into a hard,
+// named build error. See `docs` and the HARC-side diagnostic that
+// precomputes `ReqWords` in `cpp_tb.rs`.
+template<std::size_t ReqWords, typename Sig>
+inline void harc_assign_words_checked(Sig& sig,
+                                      std::initializer_list<uint32_t> words) {
+    static_assert(ReqWords <= harc_sig_word_capacity<Sig>(),
+                  "HARC: literal value is too wide for the target port/signal "
+                  "(its required bit width exceeds the port width); the high "
+                  "bits would be silently dropped. Narrow the literal so its "
+                  "value fits, or widen the port.");
+    harc_assign_words(sig, words);
+}
+
 // Inline hex formatter for 65–128-bit values used by the printf-style
 // interpolation lowering. Constructed as a temporary in the printf
 // arg list:
