@@ -1173,9 +1173,8 @@ end test T"#,
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
 
-    // Initial comb settle: `dut->clk = 0; dut->eval();` BEFORE the loop
-    // opens. There must be NO `clk = 1; eval();` between bootstrap and
-    // the loop (no posedge before loop).
+    // Initial comb settle: `_harc_eval_negedge(dut)` BEFORE the loop
+    // opens. There must be NO posedge call between bootstrap and the loop.
     let bootstrap_pos = cpp
         .find("sched.bootstrap()")
         .expect("expected sched.bootstrap() call");
@@ -1185,31 +1184,31 @@ end test T"#,
     assert!(bootstrap_pos < loop_pos);
     let between = &cpp[bootstrap_pos..loop_pos];
     assert!(
-        between.contains("dut->clk = 0; dut->eval();"),
-        "expected initial `dut->clk = 0; dut->eval();` between bootstrap and loop:\n{}",
+        between.contains("_harc_eval_negedge(dut);"),
+        "expected initial `_harc_eval_negedge(dut);` between bootstrap and loop:\n{}",
         between
     );
     assert!(
-        !between.contains("dut->clk = 1; dut->eval();"),
+        !between.contains("_harc_eval_posedge(dut);"),
         "no posedge should appear between bootstrap and loop:\n{}",
         between
     );
 
-    // Inside the loop body, the order must be: clk=1 eval (posedge)
-    // FIRST, then sched.tick(), then clk=0 eval (falling).
+    // Inside the loop body, the order must be: posedge (clk=1 guarded eval)
+    // FIRST, then sched.tick(), then negedge (clk=0 guarded eval).
     let loop_body_end = cpp[loop_pos..]
         .find("\n    }\n")
         .map(|p| loop_pos + p)
         .expect("expected loop close");
     let body = &cpp[loop_pos..loop_body_end];
     let posedge_pos = body
-        .find("dut->clk = 1; dut->eval();")
+        .find("_harc_eval_posedge(dut);")
         .expect("expected posedge inside loop");
     let tick_pos = body
         .find("sched.tick();")
         .expect("expected sched.tick() inside loop");
     let falling_pos = body
-        .find("dut->clk = 0; dut->eval();")
+        .find("_harc_eval_negedge(dut);")
         .expect("expected falling edge inside loop");
     assert!(
         posedge_pos < tick_pos && tick_pos < falling_pos,
@@ -2847,7 +2846,7 @@ end test T"#,
         .expect("expected loop close");
     let body = &cpp[loop_pos..loop_body_end];
     let posedge_pos = body
-        .find("dut->clk = 1; dut->eval();")
+        .find("_harc_eval_posedge(dut);")
         .expect("expected posedge eval inside loop");
     let service_pos = body
         .find("for (auto& _svc : _post_eval_services) _svc();")
@@ -2856,7 +2855,7 @@ end test T"#,
         .find("sched.tick();")
         .expect("expected scheduler tick inside loop");
     let low_settle_pos = body
-        .find("dut->clk = 0; dut->eval();")
+        .find("_harc_eval_negedge(dut);")
         .expect("expected clk-low settle inside loop");
     assert!(
         posedge_pos < service_pos && service_pos < tick_pos && tick_pos < low_settle_pos,

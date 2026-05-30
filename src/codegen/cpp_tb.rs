@@ -620,6 +620,23 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         .ok();
     }
     writeln!(e.out, "").ok();
+    // Template helpers that gate clock toggling on whether the DUT exposes a
+    // `clk` member. `if constexpr (requires {{ ... }})` only suppresses the
+    // discarded branch inside a template body; moving the `dut->clk` write
+    // into a template function means calling it from `main()` or a lambda
+    // instantiates the right specialisation and the ill-formed branch for
+    // combinational DUTs is never compiled.
+    writeln!(e.out, "template<typename DUT>").ok();
+    writeln!(e.out, "static void _harc_eval_negedge(DUT* dut) {{").ok();
+    writeln!(e.out, "{INDENT}if constexpr (requires {{ dut->clk; }}) {{ dut->clk = 0; }}").ok();
+    writeln!(e.out, "{INDENT}dut->eval();").ok();
+    writeln!(e.out, "}}").ok();
+    writeln!(e.out, "template<typename DUT>").ok();
+    writeln!(e.out, "static void _harc_eval_posedge(DUT* dut) {{").ok();
+    writeln!(e.out, "{INDENT}if constexpr (requires {{ dut->clk; }}) {{ dut->clk = 1; }}").ok();
+    writeln!(e.out, "{INDENT}dut->eval();").ok();
+    writeln!(e.out, "}}").ok();
+    writeln!(e.out, "").ok();
 
     if !runtime_problem_table.problems.is_empty() {
         e.out.push_str(
@@ -1207,17 +1224,19 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "").ok();
 
         if clocks.is_empty() {
-            // Single-clock backward-compat path: drives `dut->clk`. cycle_count
-            // increments once per tick. Used by tests that don't declare any
-            // `clock <name> = <period>` items.
+            // Single-clock backward-compat path: drives `dut->clk` when the DUT
+            // has that member (clocked modules). Purely combinational DUTs have no
+            // `clk` port, so `_harc_eval_{negedge,posedge}` silently skip the
+            // assignment via `if constexpr (requires { dut->clk; })`.
+            // cycle_count increments once per tick.
             writeln!(e.out, "{INDENT}auto tick = [&]() {{").ok();
-            writeln!(e.out, "{INDENT}{INDENT}dut->clk = 0; dut->eval();").ok();
+            writeln!(e.out, "{INDENT}{INDENT}_harc_eval_negedge(dut);").ok();
             writeln!(
                 e.out,
                 "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)cycle_count);"
             )
             .ok();
-            writeln!(e.out, "{INDENT}{INDENT}dut->clk = 1; dut->eval();").ok();
+            writeln!(e.out, "{INDENT}{INDENT}_harc_eval_posedge(dut);").ok();
             writeln!(
                 e.out,
                 "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)(cycle_count + 1));"
@@ -1895,7 +1914,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         if clocks.is_empty() {
             // Initial comb settle — bootstrap's inputs propagate through
             // combinational logic before the first posedge.
-            writeln!(e.out, "{INDENT}dut->clk = 0; dut->eval();").ok();
+            writeln!(e.out, "{INDENT}_harc_eval_negedge(dut);").ok();
             writeln!(
                 e.out,
                 "{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)cycle_count);"
@@ -1907,7 +1926,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             )
             .ok();
             // Posedge first — latches current input values.
-            writeln!(e.out, "{INDENT}{INDENT}dut->clk = 1; dut->eval();").ok();
+            writeln!(e.out, "{INDENT}{INDENT}_harc_eval_posedge(dut);").ok();
             writeln!(
                 e.out,
                 "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)(cycle_count + 1));"
@@ -1936,7 +1955,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                 writeln!(e.out, "{INDENT}{INDENT}_end_barrier.wait();").ok();
             }
             // Falling edge + comb resettle with the new inputs.
-            writeln!(e.out, "{INDENT}{INDENT}dut->clk = 0; dut->eval();").ok();
+            writeln!(e.out, "{INDENT}{INDENT}_harc_eval_negedge(dut);").ok();
             writeln!(
                 e.out,
                 "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)cycle_count);"
