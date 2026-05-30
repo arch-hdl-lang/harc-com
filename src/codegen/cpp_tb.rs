@@ -15260,7 +15260,20 @@ impl Emitter {
         match (pointer_rooted, wide_words) {
             (true, Some(words)) => {
                 // > 128-bit literal into a wide signal — word-list path.
-                write!(self.out, "harc_rt::harc_assign_words(").ok();
+                // Route through the *checked* helper, parameterized by the
+                // number of 32-bit words the literal's value actually needs
+                // (`significant_word_count`). The helper `static_assert`s
+                // that this fits the target signal's word capacity, turning
+                // a previously-silent over-width truncation (high words
+                // dropped / message misaligned) into a hard, named C++
+                // compile error. Leading-zero high words don't count, so a
+                // value that fits a wider-than-necessary literal is fine.
+                let req_words = significant_word_count(&words);
+                write!(
+                    self.out,
+                    "harc_rt::harc_assign_words_checked<{req_words}>("
+                )
+                .ok();
                 self.emit_lvalue(target);
                 write!(self.out, ", {{").ok();
                 for (i, w) in words.iter().enumerate() {
@@ -17896,6 +17909,29 @@ fn c_wide_lit_words(s: &str) -> Option<Vec<String>> {
         remaining = start;
     }
     Some(words)
+}
+
+/// Number of 32-bit words the *value* of a `c_wide_lit_words` word list
+/// actually needs — i.e. one past the index of the highest non-zero
+/// word (minimum 1). This is the value-based "required width" used by
+/// the over-width assignment guard: leading-zero high words (a literal
+/// written wider than necessary) do NOT inflate the count, so a value
+/// that fits the port is never flagged, while a value with set bits
+/// above the port width is.
+///
+/// `words` are LSB-first `uint32_t` hex literals like `"0x1800u"`, as
+/// produced by `c_wide_lit_words`.
+fn significant_word_count(words: &[String]) -> usize {
+    for (i, w) in words.iter().enumerate().rev() {
+        let digits = w
+            .trim_end_matches(['u', 'U'])
+            .trim_start_matches("0x")
+            .trim_start_matches("0X");
+        if u32::from_str_radix(digits, 16).unwrap_or(0) != 0 {
+            return i + 1;
+        }
+    }
+    1
 }
 
 /// Returns true if `e` is an `Int` literal whose value is wider than

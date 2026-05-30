@@ -1012,14 +1012,89 @@ end test T"#,
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
 
-    // Assignment: harc_assign_words with 8 LSB-first words.
-    assert!(cpp.contains("harc_rt::harc_assign_words(dut->data, {0x66778899u, 0x22334455u, 0xeeff0011u, 0xaabbccddu, 0x76543210u, 0xfedcba98u, 0x89abcdefu, 0x01234567u})"),
-        "expected harc_assign_words call with LSB-first words:\n{}", cpp);
+    // Assignment: harc_assign_words_checked with 8 LSB-first words and a
+    // <8> required-word-count template arg (highest non-zero word is at
+    // index 7 — 0x01234567 — so the value needs all 8 words).
+    assert!(cpp.contains("harc_rt::harc_assign_words_checked<8>(dut->data, {0x66778899u, 0x22334455u, 0xeeff0011u, 0xaabbccddu, 0x76543210u, 0xfedcba98u, 0x89abcdefu, 0x01234567u})"),
+        "expected harc_assign_words_checked call with LSB-first words:\n{}", cpp);
 
     // Equality: harc_eq_words with 8 LSB-first words from the
     // compared literal.
     assert!(cpp.contains("harc_rt::harc_eq_words(dut->data, {0x66778899u, 0x22334455u, 0xeeff0011u, 0xaabbccddu, 0x00000000u, 0x00000000u, 0xffffffffu, 0xffffffffu})"),
         "expected harc_eq_words call with LSB-first words:\n{}", cpp);
+}
+
+/// Over-width literal guard (value-based).
+///
+/// Regression for the SHA-256 fixture bug: a hex literal written *wider*
+/// than the target port — with set bits above the port's top bit — was
+/// silently chunked into one too many 32-bit words. The high word was
+/// then dropped at runtime by `harc_assign_words`, misaligning the
+/// message; harc emitted no error.
+///
+/// The fix routes wide-literal assignments through
+/// `harc_assign_words_checked<ReqWords>`, where `ReqWords` is the number
+/// of 32-bit words the literal's *value* actually needs (one past its
+/// highest non-zero word). The runtime helper `static_assert`s that
+/// `ReqWords` fits the signal's physical word capacity, so an over-width
+/// literal fails the C++ build with a named diagnostic instead of
+/// corrupting data silently.
+///
+/// This test pins the value-based word count the codegen emits. Here the
+/// 17-word "abc" SHA-256 block (highest non-zero word — the 0x18 length
+/// field — sits at index 16) yields `<17>`, which a 16-word `[15:0][31:0]`
+/// `msg` port then rejects via the `static_assert`.
+#[test]
+fn over_width_wide_literal_emits_value_based_word_count_guard() {
+    let parsed = parse_source(
+        r#"test T
+    let dut : DummyDut
+    run
+        // 544-bit literal (136 hex digits → 17 words). The meaningful
+        // 0x18 length word lands in word 16, one past a 512-bit port.
+        dut.msg = 0x0000001800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000061626380
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+
+    // The required-word-count template arg counts the value's significant
+    // words: highest non-zero word is index 16 (0x18) → 17.
+    assert!(
+        cpp.contains("harc_rt::harc_assign_words_checked<17>(dut->msg,"),
+        "expected over-width literal to emit a <17>-word guard:\n{}",
+        cpp
+    );
+}
+
+/// Companion to `over_width_wide_literal_emits_value_based_word_count_guard`:
+/// a literal whose value FITS the port but is written with extra leading
+/// zero words must NOT inflate the required-word count — leading-zero high
+/// words don't count. This is the false-positive guard: the "empty"
+/// SHA-256 block (only 0x80000000 in word 0, the rest zero) needs just one
+/// word and must lower to `<1>`, even though it occupies a 16-word port.
+#[test]
+fn fitting_wide_literal_does_not_overcount_leading_zero_words() {
+    let parsed = parse_source(
+        r#"test T
+    let dut : DummyDut
+    run
+        // 512-bit literal whose only set bits are in word 0 (0x80000000).
+        dut.msg = 0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000080000000
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+
+    // Value needs a single word, so the guard is <1> — well within any
+    // wide port; no static_assert fires.
+    assert!(
+        cpp.contains("harc_rt::harc_assign_words_checked<1>(dut->msg,"),
+        "expected leading-zero-only literal to emit a <1>-word guard:\n{}",
+        cpp
+    );
 }
 
 /// Hex literals wider than 64 bits (>16 hex digits) lower to a
