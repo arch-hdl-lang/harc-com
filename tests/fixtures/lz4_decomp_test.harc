@@ -1,0 +1,197 @@
+// HARC verification of the LZ4 block decompressor.
+//
+// DUT: Lz4Decomp (arch-com/examples/lz4_decomp/Lz4Decomp.arch)
+//
+// Interface:
+//   clk, rst             — 100 MHz, synchronous active-high reset
+//   s_valid/s_data/s_last/s_ready — compressed input stream
+//   m_valid/m_data/m_last/m_ready — decompressed output stream
+//   done                 — pulses one cycle when the block ends
+//
+// LZ4 block sequence format:
+//   [token][lit_ext*][literals][offset_lo][offset_hi][match_ext*]
+//   Token high nibble = lit_len (15 → extend), low nibble = match_len-4
+//   Last sequence has no match part; s_last is on the last input byte.
+//
+// Test 1: literals-only "Hello"
+//   Stream: 0x50 'H' 'e' 'l' 'l' 'o'(s_last)
+//   token 0x50 = lit_len=5, match_nibble=0; s_last on 'o' → done
+//
+// Test 2: back-reference "abababab"
+//   Stream: 0x22 'a' 'b' 0x02 0x00  0x00(s_last)
+//   token 0x22 = lit_len=2, match_nibble=2 → match_len=6, offset=2
+//   Last-sequence token 0x00 (s_last=1) → done
+
+testbench Lz4DecompTb
+    dut : Lz4Decomp
+end testbench Lz4DecompTb
+
+impl Lz4DecompTest for Lz4DecompTb
+    run
+        log(info, "LZ4 decompressor test")
+
+        // Always accept output so the DUT never stalls on back-pressure.
+        dut.m_ready = 1
+
+        // ── Reset ──────────────────────────────────────────────────────
+        dut.rst     = 1
+        dut.s_valid = 0
+        dut.s_data  = 0
+        dut.s_last  = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+        // DUT now in S_TOKEN
+
+        // ── Test 1: literals-only "Hello" ──────────────────────────────
+        // token 0x50 (lit_len=5, match_nibble=0, last sequence)
+        dut.s_valid = 1
+        dut.s_data  = 0x50
+        dut.s_last  = 0
+        wait 1 cycle
+        // DUT accepted token → S_LIT_IN (s_valid still 1)
+
+        // 'H' = 0x48
+        dut.s_data = 0x48
+        wait 1 cycle
+        // DUT latched 'H' → S_LIT_OUT; comb: m_valid=1, m_data='H'
+        assert dut.m_valid == 1   else fail("Test1 H: m_valid not asserted")
+        assert dut.m_data  == 0x48 else fail("Test1 H: wrong byte")
+        dut.s_valid = 0
+        wait 1 cycle
+        // m_ready=1: DUT outputs 'H', wr_ptr=1, lit_len=4 → S_LIT_IN
+
+        // 'e' = 0x65
+        dut.s_valid = 1
+        dut.s_data  = 0x65
+        wait 1 cycle
+        assert dut.m_valid == 1   else fail("Test1 e: m_valid not asserted")
+        assert dut.m_data  == 0x65 else fail("Test1 e: wrong byte")
+        dut.s_valid = 0
+        wait 1 cycle
+
+        // 'l' = 0x6C (first)
+        dut.s_valid = 1
+        dut.s_data  = 0x6C
+        wait 1 cycle
+        assert dut.m_valid == 1   else fail("Test1 l1: m_valid not asserted")
+        assert dut.m_data  == 0x6C else fail("Test1 l1: wrong byte")
+        dut.s_valid = 0
+        wait 1 cycle
+
+        // 'l' = 0x6C (second)
+        dut.s_valid = 1
+        dut.s_data  = 0x6C
+        wait 1 cycle
+        assert dut.m_valid == 1   else fail("Test1 l2: m_valid not asserted")
+        assert dut.m_data  == 0x6C else fail("Test1 l2: wrong byte")
+        dut.s_valid = 0
+        wait 1 cycle
+
+        // 'o' = 0x6F  (s_last=1: last byte of block)
+        dut.s_valid = 1
+        dut.s_data  = 0x6F
+        dut.s_last  = 1
+        wait 1 cycle
+        // DUT latched 'o' with last_byte=1 → S_LIT_OUT
+        assert dut.m_valid == 1   else fail("Test1 o: m_valid not asserted")
+        assert dut.m_data  == 0x6F else fail("Test1 o: wrong byte")
+        dut.s_valid = 0
+        dut.s_last  = 0
+        wait 1 cycle
+        // lit_len was 1; last_byte=1 → done_r=1, state→S_DONE
+        assert dut.done == 1 else fail("Test1: done not asserted after last literal")
+        log(info, "Test 1 PASS: Hello")
+
+        // ── Test 2: back-reference "abababab" ──────────────────────────
+        // Reset for second run.
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // token 0x22  (lit_len=2, match_nibble=2 → match_len=6)
+        dut.s_valid = 1
+        dut.s_data  = 0x22
+        dut.s_last  = 0
+        wait 1 cycle
+        // DUT → S_LIT_IN, lit_len=2, match_len=6
+
+        // 'a' = 0x61
+        dut.s_data = 0x61
+        wait 1 cycle
+        assert dut.m_valid == 1   else fail("Test2 a: m_valid not asserted")
+        assert dut.m_data  == 0x61 else fail("Test2 a: wrong byte")
+        dut.s_valid = 0
+        wait 1 cycle
+        // wr_ptr=1, lit_len=1 → S_LIT_IN
+
+        // 'b' = 0x62  (last literal; last_byte=0 since this is not s_last)
+        dut.s_valid = 1
+        dut.s_data  = 0x62
+        dut.s_last  = 0
+        wait 1 cycle
+        assert dut.m_valid == 1   else fail("Test2 b: m_valid not asserted")
+        assert dut.m_data  == 0x62 else fail("Test2 b: wrong byte")
+        dut.s_valid = 0
+        wait 1 cycle
+        // wr_ptr=2, lit_len=0, last_byte=0 → S_MATCH_OFF0
+
+        // offset_lo = 0x02
+        dut.s_valid = 1
+        dut.s_data  = 0x02
+        wait 1 cycle
+        // DUT → S_MATCH_OFF1, match_off[7:0]=0x02
+
+        // offset_hi = 0x00  (match_nibble=2 ≠ 0xF → next is S_MATCH_OUT)
+        dut.s_data = 0x00
+        wait 1 cycle
+        // DUT → S_MATCH_OUT; match_off=0x0002
+        // Iteration 1: hist_rd_addr = wr_ptr(2) - 2 = 0 → hist[0]='a'
+        assert dut.m_valid == 1   else fail("Test2 match[0]: m_valid not asserted")
+        assert dut.m_data  == 0x61 else fail("Test2 match[0]: expected 'a'")
+        dut.s_valid = 0
+
+        // m_ready=1 advances the DUT each cycle; assert one byte per cycle.
+        wait 1 cycle
+        // wr_ptr=3, match_len=5; hist_rd_addr=3-2=1 → hist[1]='b'
+        assert dut.m_valid == 1   else fail("Test2 match[1]: m_valid not asserted")
+        assert dut.m_data  == 0x62 else fail("Test2 match[1]: expected 'b'")
+
+        wait 1 cycle
+        // wr_ptr=4, match_len=4; hist_rd_addr=4-2=2 → hist[2]='a' (written by copy)
+        assert dut.m_valid == 1   else fail("Test2 match[2]: m_valid not asserted")
+        assert dut.m_data  == 0x61 else fail("Test2 match[2]: expected 'a'")
+
+        wait 1 cycle
+        // wr_ptr=5, match_len=3; hist_rd_addr=5-2=3 → hist[3]='b'
+        assert dut.m_valid == 1   else fail("Test2 match[3]: m_valid not asserted")
+        assert dut.m_data  == 0x62 else fail("Test2 match[3]: expected 'b'")
+
+        wait 1 cycle
+        // wr_ptr=6, match_len=2; hist_rd_addr=6-2=4 → hist[4]='a'
+        assert dut.m_valid == 1   else fail("Test2 match[4]: m_valid not asserted")
+        assert dut.m_data  == 0x61 else fail("Test2 match[4]: expected 'a'")
+
+        wait 1 cycle
+        // wr_ptr=7, match_len=1 (last); hist_rd_addr=7-2=5 → hist[5]='b'
+        assert dut.m_valid == 1   else fail("Test2 match[5]: m_valid not asserted")
+        assert dut.m_data  == 0x62 else fail("Test2 match[5]: expected 'b'")
+
+        wait 1 cycle
+        // match_len was 1 → DUT → S_TOKEN; wr_ptr=8
+
+        // Last-sequence token 0x00 (s_last=1): lit_len=0, no match → done
+        dut.s_valid = 1
+        dut.s_data  = 0x00
+        dut.s_last  = 1
+        wait 1 cycle
+        // DUT: lit_len=0, last_byte=1 → done_r=1, state→S_DONE
+        assert dut.done == 1 else fail("Test2: done not asserted after last-sequence token")
+        dut.s_valid = 0
+        dut.s_last  = 0
+
+        log(info, "Test 2 PASS: abababab back-reference")
+        log(info, "ALL TESTS PASSED")
+    end run
+end impl Lz4DecompTest
