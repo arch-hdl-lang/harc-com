@@ -1091,6 +1091,69 @@ end test B
         .expect("suite__shard1.cpp missing");
     assert!(shard1.contents.contains("int run_A(int argc"));
     assert!(shard1.contents.contains("int run_B(int argc"));
+    assert!(!shard1.contents.contains("suite__common_suffix"));
+}
+
+#[test]
+fn grouped_split_reemits_per_test_suffixes() {
+    let f = parse_source(
+        r#"transaction Req
+    addr : uint<8>
+end transaction Req
+
+test A
+    let dut : X
+    run
+        let r : Req
+        randomize(r) with
+            r.addr == 1
+        end randomize
+    end run
+end test A
+
+test B
+    let dut : X
+    run
+        let r : Req
+        randomize(r) with
+            r.addr == 2
+        end randomize
+        randomize(r) with
+            r.addr == 3
+        end randomize
+    end run
+end test B
+"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(&[f], None).expect("merge keeps both tests");
+    let grouped = cpp_tb::emit_split_tests_with_file_prefix(
+        &merged,
+        cpp_tb::EmitOpts::default(),
+        "suite__",
+        2,
+    )
+    .expect("grouped split emit should succeed");
+    let shard = grouped
+        .files
+        .iter()
+        .find(|f| f.filename == "suite__shard1.cpp")
+        .expect("suite__shard1.cpp missing");
+
+    assert_eq!(
+        grouped.files.len(),
+        2,
+        "grouped split should emit dispatcher plus one coherent shard"
+    );
+    assert!(shard.contents.contains("int run_A(int argc"));
+    assert!(shard.contents.contains("int run_B(int argc"));
+    assert!(shard.contents.contains("r.addr == 1"));
+    assert!(shard.contents.contains("r.addr == 2"));
+    assert!(shard.contents.contains("r.addr == 3"));
+    assert!(!shard.contents.contains("suite__common_suffix"));
+    assert!(shard.contents.contains(
+        "static inline harc_rt::random::HarcRandomizeCall _harc_runtime_random_problem_table_prepare_call("
+    ));
 }
 
 #[test]
