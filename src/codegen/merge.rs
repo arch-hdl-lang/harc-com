@@ -92,3 +92,31 @@ pub fn merge_for_sim(files: &[SourceFile], pick: Option<&str>) -> Result<SourceF
         frontmatter: None,
     })
 }
+
+/// Return a synthetic source file containing all non-test items and only the
+/// selected test. `merge_for_sim` intentionally keeps every test for the
+/// default build-once-run-many path; focused codegen uses this helper after
+/// that validation/merge step when the user explicitly asks for a test-only
+/// compile.
+pub fn filter_tests_for_codegen(file: &SourceFile, pick: &str) -> Result<SourceFile, String> {
+    let mut found = false;
+    let mut items = Vec::with_capacity(file.items.len());
+    for item in &file.items {
+        match item {
+            Item::Test(t) if t.name.name == pick => {
+                found = true;
+                items.push(item.clone());
+            }
+            Item::Test(_) => {}
+            _ => items.push(item.clone()),
+        }
+    }
+    if !found {
+        return Err(format!("no test named `{pick}` in input files"));
+    }
+    Ok(SourceFile {
+        items,
+        inner_doc: file.inner_doc.clone(),
+        frontmatter: file.frontmatter.clone(),
+    })
+}
