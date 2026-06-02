@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, NamedSource, Report, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,6 +11,24 @@ mod trace_merge;
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum CompileScope {
+    /// Emit all tests into the generated build artifact.
+    #[default]
+    Suite,
+    /// Require `--test` and emit only that selected test.
+    Test,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum CppSplit {
+    /// Preserve the current single generated C++ translation unit.
+    #[default]
+    Off,
+    /// Emit one dispatcher C++ file plus one C++ translation unit per test.
+    Tests,
 }
 
 #[derive(Subcommand, Debug)]
@@ -77,6 +95,20 @@ enum Cmd {
         /// Pick a specific test by name (when input contains more than one).
         #[arg(long)]
         test: Option<String>,
+        /// Codegen scope. `suite` keeps the current build-once-run-many
+        /// binary; `test` requires `--test` and compiles only that test.
+        #[arg(long, value_enum, default_value_t = CompileScope::Suite)]
+        compile_scope: CompileScope,
+        /// Split generated C++ output. `tests` writes one dispatcher plus
+        /// grouped C++ translation units for the tests so Verilator can
+        /// compile generated HARC test objects independently.
+        #[arg(long, value_enum, default_value_t = CppSplit::Off)]
+        cpp_split: CppSplit,
+        /// Number of tests per generated split C++ shard. Higher values
+        /// reduce compiler startup/header parse overhead; lower values
+        /// improve per-test incremental granularity.
+        #[arg(long, default_value_t = 4)]
+        cpp_split_group_size: usize,
         /// Output directory for the generated C++ TB and arch_sim_build/
         #[arg(long)]
         outdir: Option<PathBuf>,
@@ -193,6 +225,10 @@ enum Cmd {
         /// `--verilator-arg --public-flat-rw --verilator-arg -Wno-UNUSEDSIGNAL`.
         #[arg(long = "verilator-arg")]
         verilator_args: Vec<String>,
+        /// Verilator build parallelism. Forwarded as `-j N`; use `0`
+        /// to let Verilator choose based on available CPUs.
+        #[arg(long)]
+        jobs: Option<u32>,
         /// Additional argument for the generated simulation binary
         /// (e.g. `+plusarg=value`). Repeatable. Forwarded verbatim
         /// after the `--test` selector.
@@ -311,6 +347,9 @@ fn main() -> Result<()> {
             vlt,
             top,
             test,
+            compile_scope,
+            cpp_split,
+            cpp_split_group_size,
             outdir,
             seed,
             emit_only,
@@ -331,6 +370,7 @@ fn main() -> Result<()> {
             trace_max_width,
             trace_max_array,
             verilator_args,
+            jobs,
             sim_args,
             check_backends,
         } => {
@@ -345,6 +385,7 @@ fn main() -> Result<()> {
                     trace_max_width,
                     trace_max_array,
                     verilator_args: verilator_args.clone(),
+                    jobs,
                     sim_args: sim_args.clone(),
                 };
                 let z3_opts = Z3PathOpts {
@@ -378,6 +419,9 @@ fn main() -> Result<()> {
                         vlt.clone(),
                         top.clone(),
                         test.clone(),
+                        compile_scope,
+                        cpp_split,
+                        cpp_split_group_size,
                         outdir.clone(),
                         seed,
                         emit_only,
@@ -457,6 +501,7 @@ struct WaveOpts {
     trace_max_width: u32,
     trace_max_array: Option<u32>,
     verilator_args: Vec<String>,
+    jobs: Option<u32>,
     sim_args: Vec<String>,
 }
 
@@ -1088,6 +1133,22 @@ fn write_if_changed(path: &Path, contents: &[u8]) -> Result<bool> {
     Ok(true)
 }
 
+fn sanitize_file_component(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "test".to_string()
+    } else {
+        out
+    }
+}
+
 fn emit_probe_stub_if_needed(
     outdir: &Path,
     file: &harc::ast::SourceFile,
@@ -1117,7 +1178,7 @@ fn run_verilator(
     top: &str,
     sv: &[PathBuf],
     vlt: &[PathBuf],
-    cpp: &PathBuf,
+    cpp: &[PathBuf],
     outdir_abs: &PathBuf,
     sim_log_path: &PathBuf,
     seed: Option<u64>,
@@ -1232,6 +1293,10 @@ fn run_verilator(
     for extra in &waves.verilator_args {
         args.push(extra.clone());
     }
+    if let Some(jobs) = waves.jobs {
+        args.push("-j".into());
+        args.push(jobs.to_string());
+    }
     args.extend([
         // Force C++20 by overriding verilator's default
         // `CFG_CXXFLAGS_STD = -std=gnu++17` Makefile variable, so
@@ -1306,7 +1371,9 @@ fn run_verilator(
     for r in ref_src {
         args.push(r.display().to_string());
     }
-    args.push(cpp.display().to_string());
+    for c in cpp {
+        args.push(c.display().to_string());
+    }
 
     let build_log_path = outdir_abs.join("build.log");
     eprintln!("running: verilator {}", args.join(" "));
@@ -1409,6 +1476,9 @@ fn cmd_sim(
     vlt: Vec<PathBuf>,
     top: Option<String>,
     test: Option<String>,
+    compile_scope: CompileScope,
+    cpp_split: CppSplit,
+    cpp_split_group_size: usize,
     outdir: Option<PathBuf>,
     seed: Option<u64>,
     emit_only: bool,
@@ -1432,6 +1502,11 @@ fn cmd_sim(
              (use --check-backends to run under both backends)"
         ));
     }
+    if !dut.is_empty() && cpp_split == CppSplit::Tests {
+        return Err(miette::miette!(
+            "--cpp-split tests is currently supported only with --sv / Verilator builds"
+        ));
+    }
 
     // Parse every input file, then fold `extend test T` blocks into their
     // matching base test before codegen.
@@ -1453,10 +1528,18 @@ fn cmd_sim(
     let merged = harc::codegen::merge::merge_for_sim(&all_files, test.as_deref())
         .map_err(|e| miette::miette!("{}", e))?;
 
-    let cpp =
-        harc::codegen::cpp_tb::emit_with_opts(&merged, harc::codegen::cpp_tb::EmitOpts { mt })
-            .map_err(|e| miette::miette!("{}", e))?;
-    let uses_solver = harc::codegen::cpp_tb::uses_constraint_solver(&merged);
+    let codegen_source = match compile_scope {
+        CompileScope::Suite => merged.clone(),
+        CompileScope::Test => {
+            let selected = test
+                .as_deref()
+                .ok_or_else(|| miette::miette!("--compile-scope test requires --test <name>"))?;
+            harc::codegen::merge::filter_tests_for_codegen(&merged, selected)
+                .map_err(|e| miette::miette!("{}", e))?
+        }
+    };
+
+    let uses_solver = harc::codegen::cpp_tb::uses_constraint_solver(&codegen_source);
     let z3_paths = resolve_z3_paths(&z3_opts);
 
     let outdir = outdir.unwrap_or_else(|| PathBuf::from("harc_sim_build"));
@@ -1465,17 +1548,52 @@ fn cmd_sim(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("harc_tb");
-    let cpp_path = outdir.join(format!("{stem}.cpp"));
-    // Only rewrite the .cpp when its content actually changed. Phase
-    // 1c: keeps mtime stable so Verilator's Make skips the rebuild
-    // when the same source is re-emitted with a different `--test`
-    // selection (the dispatcher's branch list is what changes; the
-    // emitted code is byte-identical).
-    let cpp_changed = write_if_changed(&cpp_path, cpp.as_bytes())?;
-    if cpp_changed {
-        eprintln!("emitted {}", cpp_path.display());
-    } else {
-        eprintln!("reused {} (unchanged)", cpp_path.display());
+    let emit_opts = harc::codegen::cpp_tb::EmitOpts { mt };
+    let mut cpp_paths = Vec::new();
+    match cpp_split {
+        CppSplit::Off => {
+            let cpp = harc::codegen::cpp_tb::emit_with_opts(&codegen_source, emit_opts)
+                .map_err(|e| miette::miette!("{}", e))?;
+            let cpp_filename = match compile_scope {
+                CompileScope::Suite => format!("{stem}.cpp"),
+                CompileScope::Test => {
+                    let selected = test.as_deref().unwrap_or("test");
+                    format!("{stem}__test_{}.cpp", sanitize_file_component(selected))
+                }
+            };
+            let cpp_path = outdir.join(cpp_filename);
+            // Only rewrite generated sources when content actually changed.
+            // Phase 1c: keeps mtimes stable so Verilator's Make skips
+            // recompilation when runtime-only selectors change.
+            let cpp_changed = write_if_changed(&cpp_path, cpp.as_bytes())?;
+            if cpp_changed {
+                eprintln!("emitted {}", cpp_path.display());
+            } else {
+                eprintln!("reused {} (unchanged)", cpp_path.display());
+            }
+            cpp_paths.push(cpp_path);
+        }
+        CppSplit::Tests => {
+            let split = harc::codegen::cpp_tb::emit_split_tests_with_file_prefix(
+                &codegen_source,
+                emit_opts,
+                &format!("{stem}__"),
+                cpp_split_group_size,
+            )
+            .map_err(|e| miette::miette!("{}", e))?;
+            for generated in split.files {
+                let cpp_path = outdir.join(generated.filename);
+                let cpp_changed = write_if_changed(&cpp_path, generated.contents.as_bytes())?;
+                if cpp_changed {
+                    eprintln!("emitted {}", cpp_path.display());
+                } else {
+                    eprintln!("reused {} (unchanged)", cpp_path.display());
+                }
+                if cpp_path.extension().is_some_and(|ext| ext == "cpp") {
+                    cpp_paths.push(cpp_path);
+                }
+            }
+        }
     }
 
     // Drop bundled runtime headers alongside the emitted .cpp so
@@ -1517,13 +1635,16 @@ fn cmd_sim(
 
     // `--emit-only` must still emit every generated source artifact a
     // downstream Verilator build needs, including probe bind stubs.
-    let probe_stub_path = emit_probe_stub_if_needed(&outdir, &merged)?;
+    let probe_stub_path = emit_probe_stub_if_needed(&outdir, &codegen_source)?;
 
     if emit_only {
         return Ok(());
     }
 
-    let cpp_abs = fs::canonicalize(&cpp_path).into_diagnostic()?;
+    let mut cpp_abs = Vec::with_capacity(cpp_paths.len());
+    for cpp_path in &cpp_paths {
+        cpp_abs.push(fs::canonicalize(cpp_path).into_diagnostic()?);
+    }
     let outdir_abs = fs::canonicalize(&outdir).into_diagnostic()?;
     let sim_log_path = outdir_abs.join("sim.log");
     let trace_abs = record_trace
@@ -1538,7 +1659,7 @@ fn cmd_sim(
         // SV / Verilator path — no `arch sim` involvement. Resolves the top
         // module name from `--top` if given, else from the HARC `let dut : T`.
         let top_name = top
-            .or_else(|| harc::codegen::cpp_tb::dut_type_name(&merged))
+            .or_else(|| harc::codegen::cpp_tb::dut_type_name(&codegen_source))
             .ok_or_else(|| {
                 miette::miette!(
                     "could not determine SV top module — pass --top or declare `let dut : T`"
@@ -1625,7 +1746,10 @@ fn cmd_sim(
         prefix_args.push(d.display().to_string());
     }
     prefix_args.push("--tb".into());
-    prefix_args.push(cpp_abs.display().to_string());
+    let cpp_tb = cpp_abs
+        .first()
+        .ok_or_else(|| miette::miette!("internal error: no generated C++ testbench emitted"))?;
+    prefix_args.push(cpp_tb.display().to_string());
     prefix_args.push("--outdir".into());
     prefix_args.push(outdir_abs.display().to_string());
     // Coverage passthrough: `arch sim` supports both `--coverage`
@@ -1709,9 +1833,9 @@ fn cmd_sim_check_backends(
 
     // Same seed for both runs — randomize() output must match for the
     // diff to be meaningful. Default matches cmd_sim's default.
-    let resolved_seed = seed.or_else(|| {
-        std::env::var("HARC_SEED").ok().and_then(|v| v.parse().ok())
-    }).or(Some(1));
+    let resolved_seed = seed
+        .or_else(|| std::env::var("HARC_SEED").ok().and_then(|v| v.parse().ok()))
+        .or(Some(1));
 
     eprintln!("--check-backends: running ARCH (`arch sim`) backend...");
     cmd_sim(
@@ -1721,6 +1845,9 @@ fn cmd_sim_check_backends(
         Vec::new(),
         top.clone(),
         test.clone(),
+        CompileScope::Suite,
+        CppSplit::Off,
+        1,
         Some(outdir.clone()),
         resolved_seed,
         false,
@@ -1742,6 +1869,9 @@ fn cmd_sim_check_backends(
         vlt.clone(),
         top.clone(),
         test.clone(),
+        CompileScope::Suite,
+        CppSplit::Off,
+        1,
         Some(outdir.clone()),
         resolved_seed,
         false,
