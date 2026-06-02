@@ -1,0 +1,247 @@
+// HARC verification of arch-com/examples/lz4_decomp.arch
+//
+// Tests the LZ4 block decompressor against three hand-crafted byte-vectors
+// whose correct output can be verified by inspection.
+//
+// Output bytes are captured by a passive transactor (`on dut.out_valid`)
+// into a scoreboard queue; the run block pops and compares after each block.
+//
+// ── Test vectors ─────────────────────────────────────────────────────────────
+//
+// Test 1 — "HELLO" (all-literal sequence, no match)
+//   Compressed: [0x50, 0x48, 0x45, 0x4C, 0x4C, 0x4F]
+//   Token 0x50: lit_nibble=5, match_nibble=0 (last sequence — no match).
+//   in_eob asserted with final literal 'O'.
+//   Expected decompressed: H E L L O  (5 bytes)
+//
+// Test 2 — "AAAAAAA" (1 literal + overlapping 6-byte match, offset 1)
+//   Compressed: [0x12, 0x41, 0x01, 0x00]
+//   Token 0x12: lit_nibble=1, match_nibble=2 → match_len=6.
+//   Offset 0x0001; in_eob with offset-high byte 0x00.
+//   Expected decompressed: A A A A A A A  (7 bytes)
+//
+// Test 3 — "ABCABCABC" (3 literals + 6-byte match, offset 3)
+//   Compressed: [0x32, 0x41, 0x42, 0x43, 0x03, 0x00]
+//   Token 0x32: lit_nibble=3, match_nibble=2 → match_len=6.
+//   Offset 0x0003; in_eob with offset-high byte 0x00.
+//   Expected decompressed: A B C A B C A B C  (9 bytes)
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+// ── Output byte capture ───────────────────────────────────────────────────────
+
+scoreboard Lz4OutSb
+    bytes : queue<uint<8>>
+end scoreboard Lz4OutSb
+
+// Passive monitor: fires every cycle out_valid is high; pushes the output byte.
+transactor Lz4OutCapture
+    sb : Lz4OutSb
+
+    on dut.out_valid level
+        sb.bytes.push(dut.out_data)
+    end on
+end transactor Lz4OutCapture
+
+// ── Testbench declaration ─────────────────────────────────────────────────────
+
+testbench Lz4DecompTb
+    dut : Lz4Decomp
+    cap : Lz4OutCapture passive
+end testbench Lz4DecompTb
+
+// ── Test implementation ───────────────────────────────────────────────────────
+
+impl Lz4DecompTest for Lz4DecompTb
+    clock clk = SysDomain
+
+    run
+        // ── Reset ────────────────────────────────────────────────────────────
+        dut.rst      = 1
+        dut.in_valid = 0
+        dut.in_data  = 0
+        dut.in_eob   = 0
+        wait 3 cycles
+        dut.rst      = 0
+        wait 1 cycle
+
+        // ── Test 1: "HELLO" — 5 all-literal bytes ────────────────────────────
+        //
+        // Cycle timing (state shown at START of cycle after prior edge):
+        //   C1  ReadToken   → send token 0x50  → seq: state=CopyLit(lit_len=5)
+        //   C2  CopyLit     → send 'H' 0x48    → out 'H'; lit_len=4
+        //   C3  CopyLit     → send 'E' 0x45    → out 'E'; lit_len=3
+        //   C4  CopyLit     → send 'L' 0x4C    → out 'L'; lit_len=2
+        //   C5  CopyLit     → send 'L' 0x4C    → out 'L'; lit_len=1
+        //   C6  CopyLit     → send 'O'+eob     → out 'O'; → Done
+        //   C7  Done        →                  → done=1; → ReadToken
+
+        dut.in_valid = 1
+        dut.in_data  = 0x50   // token: lit_nibble=5, match_nibble=0
+        dut.in_eob   = 0
+        wait 1 cycle          // → CopyLit (lit_len=5)
+
+        dut.in_data  = 0x48   // 'H'
+        wait 1 cycle          // out 'H'; lit_len→4
+
+        dut.in_data  = 0x45   // 'E'
+        wait 1 cycle          // out 'E'; lit_len→3
+
+        dut.in_data  = 0x4C   // 'L'
+        wait 1 cycle          // out 'L'; lit_len→2
+
+        dut.in_data  = 0x4C   // 'L'
+        wait 1 cycle          // out 'L'; lit_len→1
+
+        dut.in_data  = 0x4F   // 'O'
+        dut.in_eob   = 1
+        wait 1 cycle          // out 'O'; → Done (eob_seen|in_eob → Done)
+
+        // State is now Done; done should be high.
+        assert dut.done
+            else fail("Test1: done not asserted after last literal")
+
+        dut.in_valid = 0
+        dut.in_eob   = 0
+        wait 1 cycle          // Done → ReadToken; done pulses low
+
+        assert !dut.done
+            else fail("Test1: done should clear after one cycle")
+
+        // Verify captured output sequence.
+        assert cap.sb.bytes.size() == 5
+            else fail("Test1: expected 5 output bytes, got ${cap.sb.bytes.size()}")
+        assert cap.sb.bytes.pop() == 0x48
+            else fail("Test1: byte 0 — expected 'H' (0x48)")
+        assert cap.sb.bytes.pop() == 0x45
+            else fail("Test1: byte 1 — expected 'E' (0x45)")
+        assert cap.sb.bytes.pop() == 0x4C
+            else fail("Test1: byte 2 — expected 'L' (0x4C)")
+        assert cap.sb.bytes.pop() == 0x4C
+            else fail("Test1: byte 3 — expected 'L' (0x4C)")
+        assert cap.sb.bytes.pop() == 0x4F
+            else fail("Test1: byte 4 — expected 'O' (0x4F)")
+
+        log(info, "PASS: Test1 'HELLO' — all-literal block")
+
+        // ── Test 2: "AAAAAAA" — 1 literal + 6-byte overlapping match ─────────
+        //
+        //   C1  ReadToken   → send token 0x12   → CopyLit(lit_len=1,match_nib=2)
+        //   C2  CopyLit     → send 'A'           → out 'A'; → ReadOffLo
+        //   C3  ReadOffLo   → send 0x01          → ReadOffHi(offset_lo=1)
+        //   C4  ReadOffHi   → send 0x00+eob      → CopyMatch(off=1,match=6,eob=1)
+        //   C5..C10 CopyMatch (6 cycles)         → out 'A' × 6
+        //   C11 Done (after last match byte)     → done=1 → ReadToken
+
+        dut.in_valid = 1
+        dut.in_data  = 0x12   // token: lit_nibble=1, match_nibble=2
+        dut.in_eob   = 0
+        wait 1 cycle          // → CopyLit (lit_len=1, match_nibble=2)
+
+        dut.in_data  = 0x41   // 'A' (sole literal)
+        wait 1 cycle          // out 'A'; lit_len→1 → ReadOffLo
+
+        dut.in_data  = 0x01   // offset low byte
+        wait 1 cycle          // → ReadOffHi (offset=0x01)
+
+        dut.in_data  = 0x00   // offset high byte (last compressed byte)
+        dut.in_eob   = 1
+        wait 1 cycle          // → CopyMatch (full_off=1, match_len=6, eob_seen=1)
+
+        dut.in_valid = 0
+        dut.in_eob   = 0
+
+        // Wait for the 6 match-copy cycles then the Done pulse.
+        let t2 = 0
+        while !dut.done && t2 < 20
+            wait 1 cycle
+            t2 = t2 + 1
+        end while
+
+        assert dut.done
+            else fail("Test2: done not asserted within 20 cycles")
+
+        wait 1 cycle          // Done → ReadToken
+
+        assert !dut.done
+            else fail("Test2: done should clear after one cycle")
+
+        assert cap.sb.bytes.size() == 7
+            else fail("Test2: expected 7 output bytes, got ${cap.sb.bytes.size()}")
+        for _ in 0 .. 7
+            assert cap.sb.bytes.pop() == 0x41
+                else fail("Test2: expected 'A' (0x41)")
+        end for
+
+        log(info, "PASS: Test2 'AAAAAAA' — 1 literal + 6-byte overlapping match")
+
+        // ── Test 3: "ABCABCABC" — 3 literals + 6-byte match, offset 3 ────────
+        //
+        //   C1  ReadToken   → send token 0x32   → CopyLit(lit_len=3,match_nib=2)
+        //   C2  CopyLit     → send 'A' 0x41     → out 'A'; lit_len→2
+        //   C3  CopyLit     → send 'B' 0x42     → out 'B'; lit_len→1
+        //   C4  CopyLit     → send 'C' 0x43     → out 'C'; → ReadOffLo
+        //   C5  ReadOffLo   → send 0x03          → ReadOffHi(offset_lo=3)
+        //   C6  ReadOffHi   → send 0x00+eob      → CopyMatch(off=3,match=6,eob=1)
+        //   C7..C12 CopyMatch (6 cycles)         → out A B C A B C
+        //   C13 Done                             → done=1 → ReadToken
+
+        dut.in_valid = 1
+        dut.in_data  = 0x32   // token: lit_nibble=3, match_nibble=2
+        dut.in_eob   = 0
+        wait 1 cycle          // → CopyLit (lit_len=3, match_nibble=2)
+
+        dut.in_data  = 0x41   // 'A'
+        wait 1 cycle          // out 'A'; lit_len→2
+
+        dut.in_data  = 0x42   // 'B'
+        wait 1 cycle          // out 'B'; lit_len→1
+
+        dut.in_data  = 0x43   // 'C' (last literal of this sequence)
+        wait 1 cycle          // out 'C'; → ReadOffLo
+
+        dut.in_data  = 0x03   // offset low byte
+        wait 1 cycle          // → ReadOffHi (offset=0x03)
+
+        dut.in_data  = 0x00   // offset high byte (last compressed byte)
+        dut.in_eob   = 1
+        wait 1 cycle          // → CopyMatch (full_off=3, match_len=6, eob_seen=1)
+
+        dut.in_valid = 0
+        dut.in_eob   = 0
+
+        let t3 = 0
+        while !dut.done && t3 < 20
+            wait 1 cycle
+            t3 = t3 + 1
+        end while
+
+        assert dut.done
+            else fail("Test3: done not asserted within 20 cycles")
+
+        wait 1 cycle          // Done → ReadToken
+
+        assert !dut.done
+            else fail("Test3: done should clear after one cycle")
+
+        assert cap.sb.bytes.size() == 9
+            else fail("Test3: expected 9 output bytes, got ${cap.sb.bytes.size()}")
+
+        // literals
+        assert cap.sb.bytes.pop() == 0x41 else fail("Test3: byte 0 — expected 'A'")
+        assert cap.sb.bytes.pop() == 0x42 else fail("Test3: byte 1 — expected 'B'")
+        assert cap.sb.bytes.pop() == 0x43 else fail("Test3: byte 2 — expected 'C'")
+        // match: 6 bytes repeating ABC from offset 3
+        assert cap.sb.bytes.pop() == 0x41 else fail("Test3: byte 3 — expected 'A'")
+        assert cap.sb.bytes.pop() == 0x42 else fail("Test3: byte 4 — expected 'B'")
+        assert cap.sb.bytes.pop() == 0x43 else fail("Test3: byte 5 — expected 'C'")
+        assert cap.sb.bytes.pop() == 0x41 else fail("Test3: byte 6 — expected 'A'")
+        assert cap.sb.bytes.pop() == 0x42 else fail("Test3: byte 7 — expected 'B'")
+        assert cap.sb.bytes.pop() == 0x43 else fail("Test3: byte 8 — expected 'C'")
+
+        log(info, "PASS: Test3 'ABCABCABC' — 3 literals + 6-byte match, offset 3")
+
+    end run
+end impl Lz4DecompTest

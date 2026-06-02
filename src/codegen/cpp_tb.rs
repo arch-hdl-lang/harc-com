@@ -2191,9 +2191,14 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         // since the test is over.
         writeln!(e.out, "{INDENT}harc_rt::ThreadSlot _run_slot;").ok();
         writeln!(e.out, "{INDENT}sched.slots.push_back(&_run_slot);").ok();
+        // Store the lambda in a named local so the closure object lives for
+        // the entire function, not just until the end of the assignment expression.
+        // An immediately-invoked temporary lambda (`[&]{...}(&_run_slot)`) has its
+        // closure destroyed at the semicolon, leaving the coroutine with dangling
+        // references to every captured variable (stack-use-after-scope).
         writeln!(
             e.out,
-            "{INDENT}_run_slot.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+            "{INDENT}auto _run_coro_fn = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
         )
         .ok();
 
@@ -2221,7 +2226,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         e.in_coroutine = false;
 
         writeln!(e.out, "{INDENT}{INDENT}co_return;").ok();
-        writeln!(e.out, "{INDENT}}}(&_run_slot);").ok();
+        writeln!(e.out, "{INDENT}}};").ok();
+        writeln!(e.out, "{INDENT}_run_slot.thread = _run_coro_fn(&_run_slot);").ok();
         writeln!(e.out, "").ok();
 
         // `actor_threads` is populated only when `--mt` is set (cooperative
@@ -2485,6 +2491,16 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                 writeln!(e.out, "{INDENT}{INDENT}_start_barrier.wait();").ok();
                 writeln!(e.out, "{INDENT}{INDENT}_end_barrier.wait();").ok();
             }
+            // Recompute combinational outputs with the inputs tick() just set
+            // before checkers sample them. tick() may have changed input ports
+            // (e.g. in_data, in_valid) without calling eval(); without this,
+            // a level-triggered checker would see stale comb values from the
+            // previous cycle's negedge — in particular, combinational outputs
+            // like out_valid that depend on both state and inputs would reflect
+            // the new state with the OLD inputs, producing phantom captures
+            // (e.g. the DUT just transitioned into CopyLit; out_valid=1 but
+            // out_data is still the token byte, not the first literal).
+            writeln!(e.out, "{INDENT}{INDENT}dut->eval_comb();").ok();
             writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
             writeln!(e.out, "{INDENT}}}").ok();
         }
