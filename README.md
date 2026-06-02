@@ -196,6 +196,8 @@ Common `harc sim` flags:
 - `--record-trace <file.jsonl>` — write a semantic JSONL trace for the run. The trace includes metadata, `sim_start` / `sim_end`, `log` events, assertion-failure events derived from `fail` logs, concrete `randomize` results, and TLM method call request/response events. Runtime events carry VCD-alignment metadata (`vcd_time`, `clock`, and `clock_cycle`) for post-run waveform correlation. This is intended for debugging and post-run analysis without scraping stdout
 - `--mt` — opt into the per-actor multi-OS-thread runtime (default is cooperative single-thread, typically faster on real fixtures)
 
+See [`docs/harc-sim-cli.md`](docs/harc-sim-cli.md) for the complete `harc sim` option reference.
+
 Use `harc trace-merge --vcd wave.vcd --trace trace.jsonl --out merged.vcd` to overlay semantic trace events into a signal VCD. The merged VCD adds a synthetic `harc_semantic` scope with event lanes and embeds string-ID mappings as VCD comments; pass `--map-out trace-map.json` for the same mappings as a JSON sidecar. See [`docs/semantic-trace.md`](docs/semantic-trace.md) for status and follow-on TODOs.
 
 Z3 is required for constraint-randomized tests (`randomize(t) with ...` and transaction `keep` constraints). System installs are auto-detected, and custom installs can be selected with a root prefix or explicit include/lib directories:
