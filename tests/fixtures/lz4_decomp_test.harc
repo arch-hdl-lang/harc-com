@@ -1,0 +1,140 @@
+// LZ4 block decompressor testbench.
+// DUT: arch-com/tests/lz4_decomp/Lz4Decomp.arch
+//
+// LZ4 block format:
+//   token byte: [lit_len_hi(4) | match_pref_lo(4)]
+//   extended lit len bytes (if lit_len_hi==15)
+//   literal bytes
+//   offset-lo, offset-hi (little-endian, unless last sequence)
+//   extended match len bytes (if match_pref_lo==15)
+//
+// Tests:
+//   1. Pure-literals block: [0x20, 'A', 'B'(last)] -> "AB"
+//   2. Literal+match block:
+//      seq1: [0x20, 'a', 'a', off-lo=2, off-hi=0]  -> 2 literals + 4 match
+//      seq2: [0x10, 'b'(last)]                       -> 1 literal
+//      -> "aaaaaab"
+//
+// The decompressor has a blocking output: it will not accept the next
+// compressed byte until the current output byte has been consumed.
+// Feeds and receives must therefore be interleaved at literal/match
+// boundaries to avoid deadlock.
+
+// Feed one compressed byte.  Polls s_ready (up to 200 cycles), drives the
+// byte for one cycle with s_valid, then releases.
+function lz4_feed(dut: Lz4Decomp, data: uint<8>, last: uint<8>)
+    let _w = 0
+    while !dut.s_ready && _w < 200
+        wait 1 cycle
+        _w = _w + 1
+    end while
+    assert dut.s_ready else fail("s_ready never asserted — decompressor stalled on input")
+    dut.s_valid = 1
+    dut.s_data  = data
+    dut.s_last  = last
+    wait 1 cycle   // detect cycle: FSM sees s_valid in wait_until state → moves to action state
+    wait 1 cycle   // capture cycle: action state latches s_data/s_last
+    dut.s_valid = 0
+    dut.s_last  = 0
+end function lz4_feed
+
+// Receive one decompressed byte.  Polls m_valid (up to 200 cycles), drives
+// m_ready for one cycle to consume the byte, then releases.
+function lz4_recv(dut: Lz4Decomp) -> uint<8>
+    let _w = 0
+    while !dut.m_valid && _w < 200
+        wait 1 cycle
+        _w = _w + 1
+    end while
+    assert dut.m_valid else fail("m_valid never asserted — decompressor stalled on output")
+    let got = dut.m_data
+    dut.m_ready = 1
+    wait 1 cycle
+    dut.m_ready = 0
+    return got
+end function lz4_recv
+
+testbench Lz4DecompTb
+    dut : Lz4Decomp
+end testbench Lz4DecompTb
+
+impl Lz4DecompTest for Lz4DecompTb
+    run
+        // ── Reset ────────────────────────────────────────────────────────
+        dut.rst     = 1
+        dut.s_valid = 0
+        dut.s_data  = 0
+        dut.s_last  = 0
+        dut.m_ready = 0
+        wait 4 cycles
+        dut.rst = 0
+        wait 2 cycles
+
+        // ── Test 1: pure-literals "AB" ───────────────────────────────────
+        // Compressed stream: token=0x20 (lit_len=2, match_pref=0),
+        //                    'A'=0x41, 'B'=0x42 (s_last=1, last sequence).
+        // Expected output: 0x41, 0x42
+        //
+        // Feed and receive must interleave: after each literal is fed, the
+        // decompressor blocks on m_ready before accepting the next byte.
+        log(info, "test 1: pure-literals 'AB'")
+        lz4_feed(dut, 32, 0)     // token 0x20
+        lz4_feed(dut, 65, 0)     // 'A' = 0x41
+        let t1b0 = lz4_recv(dut)
+        assert t1b0 == 65 else fail("test1[0]: got=${t1b0:02x} want=0x41 ('A')")
+        lz4_feed(dut, 66, 1)     // 'B' = 0x42, s_last=1
+        let t1b1 = lz4_recv(dut)
+        assert t1b1 == 66 else fail("test1[1]: got=${t1b1:02x} want=0x42 ('B')")
+        log(info, "PASS test 1: 'AB' decompressed correctly")
+        wait 4 cycles
+
+        // ── Test 2: literal + match → "aaaaaab" ─────────────────────────
+        // Sequence 1: token=0x20 (lit_len=2, match_pref=0)
+        //   2 literals 'a','a'
+        //   offset-lo=2, offset-hi=0
+        //   match_len = match_pref(0) + MINMATCH(4) = 4
+        //   → copies hist[wr_ptr-2] four times  → 4 more 'a' bytes
+        // Sequence 2: token=0x10 (lit_len=1, match_pref=0, last sequence)
+        //   1 literal 'b' (s_last=1)
+        //
+        // Output: a a a a a a b  (6 × 'a', 1 × 'b')
+        //
+        // The two offset bytes produce no output and do not block on
+        // m_ready, so they can be fed back-to-back after the literals.
+        // Match-copy output (4 × 'a') comes after offset-hi is consumed.
+        log(info, "test 2: literal+match 'aaaaaab'")
+
+        // Sequence 1 — token
+        lz4_feed(dut, 32,  0)    // seq1 token 0x20
+
+        // Literal 1: feed 'a', receive 'a'
+        lz4_feed(dut, 97,  0)    // 'a' = 0x61
+        let t2a0 = lz4_recv(dut)
+        assert t2a0 == 97 else fail("test2 lit[0]: got=${t2a0:02x} want=0x61 ('a')")
+
+        // Literal 2: feed 'a', receive 'a'
+        lz4_feed(dut, 97,  0)    // 'a' = 0x61
+        let t2a1 = lz4_recv(dut)
+        assert t2a1 == 97 else fail("test2 lit[1]: got=${t2a1:02x} want=0x61 ('a')")
+
+        // Match offset bytes (no output produced)
+        lz4_feed(dut,  2,  0)    // offset-lo = 2
+        lz4_feed(dut,  0,  0)    // offset-hi = 0
+
+        // 4 match-copy bytes (all 'a')
+        for mi in 0 .. 4
+            let t2m = lz4_recv(dut)
+            assert t2m == 97 else fail("test2 match[${mi}]: got=${t2m:02x} want=0x61 ('a')")
+        end for
+
+        // Sequence 2 — token then final literal 'b'
+        lz4_feed(dut, 16,  0)    // seq2 token 0x10 (lit_len=1, match_pref=0)
+        lz4_feed(dut, 98,  1)    // 'b' = 0x62, s_last=1
+        let t2b = lz4_recv(dut)
+        assert t2b == 98 else fail("test2 final: got=${t2b:02x} want=0x62 ('b')")
+
+        log(info, "PASS test 2: 'aaaaaab' decompressed correctly")
+
+        log(info, "ALL TESTS PASSED")
+    end run
+end impl Lz4DecompTest
