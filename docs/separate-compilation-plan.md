@@ -14,25 +14,38 @@ Status: **In progress.**
 
 The remainder of this doc describes phase 2 — the end state.
 
-Phase 1d is a bridge, not the final member-function architecture:
-per-test generated `.cpp` files compile to separate objects and link
-through one dispatcher binary. Byte-identical shared generated slices
-are factored into generated headers, and byte-identical run-function
-prologue/epilogue slices are factored into generated `.inc` snippets,
-but C++ still parses those includes once per split translation unit
-because the inline run bodies need complete generated record/component
-types. To balance compiler startup/header-parse overhead against
-incremental granularity, `--cpp-split tests` groups tests into shards
-(`--cpp-split-group-size`, default 4). That gives useful test-edit
-granularity, smaller emitted split sources, and faster clean builds on
-the SRAM FD 8-test benchmark while preserving the existing single-file
-default and leaving the deeper context/member refactor for Phase 2. The
-first phase-2 bridge is also in place:
-each `run_<TestName>` now creates a generated `HarcTestContext` and
-binds legacy local names (`dut`, `_checkers`, coverage/report vectors,
-trace/log state, `errors`, `_fatal`, `cycle_count`) as references to
-context fields, so shared helpers can be migrated to explicit
-`HarcTestContext&` parameters incrementally.
+Phase 1d is a bridge, not the final member-function architecture.
+`--cpp-split tests` emits a dispatcher `main.cpp` plus one or more
+**self-contained** shard translation units, each produced by running the
+normal emitter over a source filtered to that shard's tests and stripping
+the dispatcher `main()`. Every shard re-emits the full file-scope
+scaffolding, but it all has internal linkage, so the shards link cleanly
+alongside the dispatcher — the only external symbols are the per-test
+`run_<TestName>` functions (each unique to one shard) and `main`.
+
+Incremental granularity comes entirely from `write_if_changed`: a shard's
+emitted bytes depend only on the tests it contains, so editing one test
+leaves every other shard byte-identical and Make skips their objects.
+`--cpp-split-group-size` (default 4) trades that granularity against the
+per-translation-unit cost of re-parsing the shared scaffolding. Group size
+1 emits one `test_<name>.cpp` per test (finest granularity); larger groups
+bundle N tests per `shard<N>.cpp`. On the SRAM FD 8-test benchmark the
+default group of 4 gave the fastest clean and incremental builds.
+
+(An earlier 1d iteration factored the byte-identical scaffolding into
+shared `.hpp`/`.inc` files. That was removed: because the includes are
+still compiled once per translation unit, the factoring bought no
+build-time win over self-contained shards and gave identical incremental
+granularity, at the cost of a large, intricate common-prefix/suffix
+string-slicing pass. The phase-2 member/context refactor — not source
+factoring — is the path to real per-`.o` separation.)
+
+The first phase-2 bridge is also in place: each `run_<TestName>` now
+creates a generated `HarcTestContext` and binds legacy local names
+(`dut`, `_checkers`, coverage/report vectors, trace/log state, `errors`,
+`_fatal`, `cycle_count`) as references to context fields, so shared
+helpers can be migrated to explicit `HarcTestContext&` parameters
+incrementally.
 
 ## Goal
 

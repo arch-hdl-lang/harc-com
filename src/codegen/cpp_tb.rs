@@ -131,16 +131,26 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
     emit_with_opts(file, EmitOpts::default())
 }
 
-/// Emit a dispatcher plus one generated C++ translation unit per test.
+/// Emit a dispatcher plus one or more generated C++ translation units for
+/// the tests, so Verilator/Make can compile and recompile them
+/// independently.
 ///
-/// The split output factors byte-identical shared code out into generated
-/// headers. Per-test files include the common prefix/suffix and keep only the
-/// test-specific middle plus their `run_<TestName>` function, so unchanged
-/// shared scaffolding has stable mtimes and the generated test `.cpp`s are
-/// much smaller. Some definitions still have to live in headers because the
-/// inline run bodies instantiate generated record/component types directly;
-/// moving those behind a compiled common object requires a deeper context
-/// object refactor.
+/// Each shard is a self-contained translation unit: `emit_with_opts` over a
+/// source filtered to that shard's tests, with the dispatcher `main()`
+/// stripped off. The full file-scope scaffolding (the `HarcTestContext`
+/// struct, `static`/template helpers, `harc_rng`, …) is re-emitted into every
+/// shard, but it all has internal linkage, so the shards link cleanly
+/// alongside the generated `main.cpp` dispatcher — the only external symbols
+/// are the per-test `run_<TestName>` functions (each unique to one shard) and
+/// `main`.
+///
+/// Incremental granularity comes from `write_if_changed` at the call site
+/// (`src/main.rs`): a shard's emitted bytes depend only on the tests it
+/// contains, so editing one test leaves every other shard byte-identical and
+/// Make skips their objects. `group_size` (default 4) trades that granularity
+/// against the per-translation-unit cost of re-parsing the shared
+/// scaffolding: `group_size == 1` emits one `test_<name>.cpp` per test (finest
+/// granularity); larger groups bundle `group_size` tests per `shard<N>.cpp`.
 pub fn emit_split_tests(file: &SourceFile, opts: EmitOpts) -> Result<SplitCppOutput, EmitError> {
     emit_split_tests_with_file_prefix(file, opts, "", 1)
 }
@@ -166,270 +176,33 @@ pub fn emit_split_tests_with_file_prefix(
     }
     validate_split_tests_share_dut(&lowered, &test_names)?;
 
-    if group_size > 1 {
-        let shard_count = test_names.len().div_ceil(group_size);
-        let mut files = Vec::with_capacity(shard_count + 1);
-        files.push(GeneratedCppFile {
-            filename: format!("{file_prefix}main.cpp"),
-            contents: emit_split_dispatcher(&test_names),
-        });
-
-        for (shard_idx, shard_names) in test_names.chunks(group_size).enumerate() {
-            let shard_file = filter_source_to_tests(&lowered, shard_names);
-            let cpp = emit_with_opts(&shard_file, opts)?;
-            files.push(GeneratedCppFile {
-                filename: format!("{file_prefix}shard{}.cpp", shard_idx + 1),
-                contents: strip_generated_dispatcher(&cpp)?,
-            });
-        }
-
-        return Ok(SplitCppOutput { files, test_names });
-    }
-
-    let mut split_units = Vec::with_capacity(test_names.len());
-    for name in &test_names {
-        let one_test = filter_source_to_test(&lowered, name);
-        let cpp = emit_with_opts(&one_test, opts)?;
-        let contents = strip_generated_dispatcher(&cpp)?;
-        split_units.push(split_single_test_cpp(name, &contents)?);
-    }
-
-    let prefixes: Vec<String> = split_units.iter().map(|unit| unit.prefix.clone()).collect();
-    let common = common_split_prefixes(&prefixes);
-
     let shard_count = test_names.len().div_ceil(group_size);
-    let mut files = Vec::with_capacity(shard_count + 5);
+    let mut files = Vec::with_capacity(shard_count + 1);
     files.push(GeneratedCppFile {
         filename: format!("{file_prefix}main.cpp"),
         contents: emit_split_dispatcher(&test_names),
     });
-    let common_prefix_filename = format!("{file_prefix}common_prefix.hpp");
-    let common_suffix_filename = format!("{file_prefix}common_suffix.hpp");
-    let common_run_prefix_filename = format!("{file_prefix}common_run_prefix.inc");
-    let common_run_suffix_filename = format!("{file_prefix}common_run_suffix.inc");
-    files.push(GeneratedCppFile {
-        filename: common_prefix_filename.clone(),
-        contents: emit_split_header("common prefix", &common.prefix),
-    });
-    files.push(GeneratedCppFile {
-        filename: common_suffix_filename.clone(),
-        contents: emit_split_header("common suffix", &common.suffix),
-    });
 
-    let run_inners: Vec<String> = split_units
-        .iter()
-        .map(|unit| unit.run_inner.clone())
-        .collect();
-    let common_run = common_split_prefixes(&run_inners);
-    files.push(GeneratedCppFile {
-        filename: common_run_prefix_filename.clone(),
-        contents: emit_split_include("common run prefix", &common_run.prefix),
-    });
-    files.push(GeneratedCppFile {
-        filename: common_run_suffix_filename.clone(),
-        contents: emit_split_include("common run suffix", &common_run.suffix),
-    });
-
-    for (shard_idx, shard) in split_units.chunks(group_size).enumerate() {
-        let mut contents = String::new();
-        writeln!(contents, "// Auto-generated by harc — do not edit.").ok();
-        let shard_names =
-            test_names[shard_idx * group_size..(shard_idx * group_size + shard.len())].join(", ");
-        writeln!(
-            contents,
-            "// HARC split-test shard {}: {shard_names}",
-            shard_idx + 1
-        )
-        .ok();
-        writeln!(contents).ok();
-        for unit in shard.iter() {
-            let local_end = unit.prefix.len() - common.suffix.len();
-            let local_prefix = &unit.prefix[common.prefix.len()..local_end];
-            let local_run_end = unit.run_inner.len() - common_run.suffix.len();
-            let local_run_inner = &unit.run_inner[common_run.prefix.len()..local_run_end];
-            writeln!(contents, "#include \"{common_prefix_filename}\"").ok();
-            if !local_prefix.is_empty() {
-                contents.push_str(local_prefix);
-                if !contents.ends_with('\n') {
-                    contents.push('\n');
-                }
-            }
-            writeln!(contents, "#include \"{common_suffix_filename}\"").ok();
-            writeln!(contents).ok();
-            contents.push_str(&unit.run_open);
-            writeln!(contents, "#include \"{common_run_prefix_filename}\"").ok();
-            if !local_run_inner.is_empty() {
-                contents.push_str(local_run_inner);
-                if !contents.ends_with('\n') {
-                    contents.push('\n');
-                }
-            }
-            writeln!(contents, "#include \"{common_run_suffix_filename}\"").ok();
-            writeln!(contents, "}}").ok();
-            writeln!(contents).ok();
-        }
+    for (shard_idx, shard_names) in test_names.chunks(group_size).enumerate() {
+        let shard_file = filter_source_to_tests(&lowered, shard_names);
+        let cpp = emit_with_opts(&shard_file, opts)?;
+        // One test per shard reads better as `test_<name>.cpp`; a bundled
+        // shard has no single owning test, so it gets `shard<N>.cpp`.
+        let filename = if group_size == 1 {
+            format!(
+                "{file_prefix}test_{}.cpp",
+                sanitize_file_component(&shard_names[0])
+            )
+        } else {
+            format!("{file_prefix}shard{}.cpp", shard_idx + 1)
+        };
         files.push(GeneratedCppFile {
-            filename: if group_size == 1 {
-                let name = &test_names[shard_idx];
-                format!("{file_prefix}test_{}.cpp", sanitize_file_component(name))
-            } else {
-                format!("{file_prefix}shard{}.cpp", shard_idx + 1)
-            },
-            contents,
+            filename,
+            contents: strip_generated_dispatcher(&cpp)?,
         });
     }
 
     Ok(SplitCppOutput { files, test_names })
-}
-
-#[derive(Debug)]
-struct SplitSingleTestCpp {
-    prefix: String,
-    run_open: String,
-    run_inner: String,
-}
-
-#[derive(Debug)]
-struct CommonPrefixSplit {
-    prefix: String,
-    suffix: String,
-}
-
-fn split_single_test_cpp(test_name: &str, cpp: &str) -> Result<SplitSingleTestCpp, EmitError> {
-    let marker = format!("int run_{test_name}(int argc, char** argv) {{");
-    let Some(idx) = cpp.find(&marker) else {
-        return Err(EmitError(format!(
-            "internal error: generated split C++ for `{test_name}` did not contain run function"
-        )));
-    };
-    let run_function = &cpp[idx..];
-    let open_end = run_function.find('\n').map(|i| i + 1).ok_or_else(|| {
-        EmitError(format!(
-            "internal error: generated split C++ for `{test_name}` has malformed run function"
-        ))
-    })?;
-    let close_start = run_function.rfind("\n}").ok_or_else(|| {
-        EmitError(format!(
-            "internal error: generated split C++ for `{test_name}` has unterminated run function"
-        ))
-    })?;
-    Ok(SplitSingleTestCpp {
-        prefix: cpp[..idx].to_string(),
-        run_open: run_function[..open_end].to_string(),
-        run_inner: run_function[open_end..=close_start].to_string(),
-    })
-}
-
-fn emit_split_include(label: &str, body: &str) -> String {
-    let mut out = String::new();
-    writeln!(out, "// Auto-generated by harc — do not edit.").ok();
-    writeln!(out, "// HARC split-test {label}.").ok();
-    writeln!(out).ok();
-    out.push_str(body);
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
-}
-
-fn emit_split_header(label: &str, body: &str) -> String {
-    let mut out = String::new();
-    writeln!(out, "// Auto-generated by harc — do not edit.").ok();
-    writeln!(out, "// HARC split-test {label}.").ok();
-    writeln!(out, "#pragma once").ok();
-    writeln!(out).ok();
-    out.push_str(body);
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
-}
-
-fn common_split_prefixes(prefixes: &[String]) -> CommonPrefixSplit {
-    if prefixes.is_empty() {
-        return CommonPrefixSplit {
-            prefix: String::new(),
-            suffix: String::new(),
-        };
-    }
-    let prefix_len = common_line_prefix_len(prefixes);
-    let suffix_len = common_line_suffix_len(prefixes, prefix_len);
-    let first = &prefixes[0];
-    CommonPrefixSplit {
-        prefix: first[..prefix_len].to_string(),
-        suffix: first[first.len() - suffix_len..].to_string(),
-    }
-}
-
-fn common_line_prefix_len(strings: &[String]) -> usize {
-    let min_len = strings.iter().map(|s| s.len()).min().unwrap_or(0);
-    let mut raw = 0;
-    'outer: while raw < min_len {
-        let b = strings[0].as_bytes()[raw];
-        for s in &strings[1..] {
-            if s.as_bytes()[raw] != b {
-                break 'outer;
-            }
-        }
-        raw += 1;
-    }
-    while raw > 0 && !strings[0].is_char_boundary(raw) {
-        raw -= 1;
-    }
-    strings[0][..raw]
-        .rfind('\n')
-        .map(|idx| idx + 1)
-        .unwrap_or(0)
-}
-
-fn common_line_suffix_len(strings: &[String], prefix_len: usize) -> usize {
-    let min_available = strings
-        .iter()
-        .map(|s| s.len().saturating_sub(prefix_len))
-        .min()
-        .unwrap_or(0);
-    let mut raw = 0;
-    'outer: while raw < min_available {
-        let idx = strings[0].len() - 1 - raw;
-        let b = strings[0].as_bytes()[idx];
-        for s in &strings[1..] {
-            let other_idx = s.len() - 1 - raw;
-            if s.as_bytes()[other_idx] != b {
-                break 'outer;
-            }
-        }
-        raw += 1;
-    }
-    let first = &strings[0];
-    let mut start = first.len() - raw;
-    while start < first.len() && !first.is_char_boundary(start) {
-        start += 1;
-    }
-    if start > prefix_len {
-        if let Some(off) = first[start..].find('\n') {
-            start += off + 1;
-        } else {
-            start = first.len();
-        }
-    }
-    first.len() - start
-}
-
-fn filter_source_to_test(file: &SourceFile, test_name: &str) -> SourceFile {
-    let items = file
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            Item::Test(t) if t.name.name == test_name => Some(item.clone()),
-            Item::Test(_) => None,
-            _ => Some(item.clone()),
-        })
-        .collect();
-    SourceFile {
-        items,
-        inner_doc: file.inner_doc.clone(),
-        frontmatter: file.frontmatter.clone(),
-    }
 }
 
 fn filter_source_to_tests(file: &SourceFile, test_names: &[String]) -> SourceFile {
