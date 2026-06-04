@@ -26,6 +26,7 @@ These SystemVerilog files are snapshots of the corresponding modules in [`arch-h
 | `linklist_basic.sv` | `arch-com/examples/linklist_basic.sv` |
 | `cam_basic.sv` | `arch-com/tests/cam_basic.sv` |
 | `AxiLiteRegs.sv` | `arch-com/tests/axi_dma/AxiLiteRegs.sv` |
+| `Lz4Decomp.sv` | `arch-com/tests/lz4_decomp/lz4_decomp.arch` via `arch build`; LZ4 block decompressor (CAST LZ4SNP-D style) |
 | `TlmPairingArchTarget.sv` | `tests/dut/TlmPairingArchTarget.arch` via `arch build`; blocking and tagged-OOO TLM target responder conformance |
 | `TlmPairingArchInitiator.sv` | `tests/dut/TlmPairingArchInitiator.arch` via `arch build`; blocking and tagged-OOO TLM initiator conformance |
 | `TlmPairingArchBurstTarget.sv` | `tests/dut/TlmPairingArchBurstTarget.arch` via `arch build`; bounded Vec+len+resp TLM target responder conformance |
