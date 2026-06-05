@@ -41,6 +41,26 @@ cargo build --release
 
 The binary lands at `target/release/harc`. Add it to your `PATH` or invoke via `cargo run --bin harc -- ...`.
 
+### PR review gate
+
+Install the versioned local git hooks with:
+
+```sh
+git config core.hooksPath .githooks
+chmod +x .githooks/pre-push scripts/pre_pr_review.sh
+```
+
+Before opening a PR, run a code-review pass against the branch diff, address or
+accept the findings, then record the reviewed HEAD:
+
+```sh
+scripts/pre_pr_review.sh mark
+scripts/pre_pr_review.sh check
+```
+
+The installed `pre-push` hook checks `codex/*` branches and blocks the push when
+the review marker is missing or stale, so review happens before PR creation.
+
 ## A first test
 
 Given a SystemVerilog DUT — `tests/dut/sync_fifo.sv`, a 16-deep single-clock FIFO — write a HARC test:
