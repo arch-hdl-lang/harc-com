@@ -1,0 +1,63 @@
+// Event-to-sink connect smoke test. A source component publishes one typed
+// observation stream, and two independent component-shaped subscribers consume
+// it through hookable sink methods.
+
+transactor AnalysisSource
+    observed : out event<uint<8>>
+
+    hookable publish(v: uint<8>)
+        emit observed(v)
+    end publish
+end transactor AnalysisSource
+
+scoreboard AnalysisSb
+    count : uint<32> default 0
+    sum   : uint<32> default 0
+
+    hookable write_obs(v: uint<8>)
+        count = count + 1
+        sum = sum + v
+    end write_obs
+end scoreboard AnalysisSb
+
+scoreboard AnalysisCovCollector
+    samples : uint<32> default 0
+    sum     : uint<32> default 0
+
+    hookable sample_obs(v: uint<8>)
+        samples = samples + 1
+        sum = sum + v
+    end sample_obs
+end scoreboard AnalysisCovCollector
+
+env AnalysisEnv
+    source : AnalysisSource passive
+    sb     : AnalysisSb
+    cov    : AnalysisCovCollector
+
+    connect
+        source.observed -> sb.write_obs
+        source.observed -> cov.sample_obs
+    end connect
+end env AnalysisEnv
+
+test AnalysisSinkConnectTest
+    let dut : Top
+    let env : AnalysisEnv
+
+    run
+        env.source.publish(3)
+        env.source.publish(5)
+
+        assert env.sb.count == 2
+            else fail("scoreboard count=${env.sb.count}")
+        assert env.sb.sum == 8
+            else fail("scoreboard sum=${env.sb.sum}")
+        assert env.cov.samples == 2
+            else fail("coverage samples=${env.cov.samples}")
+        assert env.cov.sum == 8
+            else fail("coverage sum=${env.cov.sum}")
+
+        log(info, "PASS: analysis event connected to scoreboard and coverage-style sinks")
+    end run
+end test AnalysisSinkConnectTest

@@ -2862,6 +2862,12 @@ struct CoverInfo {
     label: String,
 }
 
+struct ConnectHookableSink {
+    comp_ty: String,
+    instance: String,
+    method: String,
+}
+
 #[derive(Debug, Clone)]
 struct PendingTlmFork {
     root: String,
@@ -5007,6 +5013,149 @@ impl Emitter {
         self.emit_component_handler_registrations_bound(comp, instance, depth, tag_prefix, None);
     }
 
+    fn field_type_in_component_type(&self, ty: &str, field: &str) -> Option<String> {
+        let lookup = |items: &[ComponentItem]| -> Option<String> {
+            items.iter().find_map(|it| {
+                if let ComponentItem::Field(f) = it {
+                    if f.name.name == field {
+                        return type_simple_name(Some(&f.ty)).map(String::from);
+                    }
+                }
+                None
+            })
+        };
+        if let Some(comp) = self.components.get(ty) {
+            lookup(&comp.items)
+        } else if let Some(t) = self.transactors.get(ty) {
+            let synth = synth_component_from_transactor(t, /*include_active*/ true);
+            lookup(&synth.items)
+        } else {
+            None
+        }
+    }
+
+    fn hookable_method_info(&self, ty: &str, method: &str) -> Option<(usize, bool)> {
+        let lookup = |items: &[ComponentItem]| -> Option<(usize, bool)> {
+            items.iter().find_map(|it| {
+                if let ComponentItem::Hookable(h) = it {
+                    if h.is_hookable && h.name.name == method {
+                        return Some((h.params.len(), h.return_ty.is_some()));
+                    }
+                }
+                None
+            })
+        };
+        if let Some(comp) = self.components.get(ty) {
+            lookup(&comp.items)
+        } else if let Some(t) = self.transactors.get(ty) {
+            let synth = synth_component_from_transactor(t, /*include_active*/ true);
+            lookup(&synth.items)
+        } else {
+            None
+        }
+    }
+
+    fn resolve_connect_hookable_sink(
+        &mut self,
+        owner: &ComponentDecl,
+        instance: &str,
+        to_path: &str,
+    ) -> Option<ConnectHookableSink> {
+        let parts: Vec<&str> = to_path.split('.').collect();
+        let method = parts.last()?;
+        let mut cur_ty = owner.name.name.clone();
+        let mut target_instance = instance.to_string();
+        for seg in &parts[..parts.len().saturating_sub(1)] {
+            let Some(next_ty) = self.field_type_in_component_type(&cur_ty, seg) else {
+                return None;
+            };
+            target_instance.push('.');
+            target_instance.push_str(seg);
+            cur_ty = next_ty;
+        }
+        let Some((param_count, has_return)) = self.hookable_method_info(&cur_ty, method) else {
+            return None;
+        };
+        let mut sink_path: Vec<String> = instance.split('.').map(String::from).collect();
+        sink_path.extend(
+            parts[..parts.len().saturating_sub(1)]
+                .iter()
+                .map(|seg| (*seg).to_string()),
+        );
+        if self.method_lives_in_when_active(&cur_ty, method) {
+            if let Some(TransactorMode::Passive) = self.resolve_path_mode(&sink_path) {
+                self.errors.push(format!(
+                    "connect: hookable sink `{}.{}` lives inside `when active` of transactor `{}`, \
+                     so it does not exist on a passive instance. Change the let-binding or field to `{} active`, \
+                     or remove the connect edge. See spec §8.1.",
+                    target_instance, method, cur_ty, cur_ty,
+                ));
+                return Some(ConnectHookableSink {
+                    comp_ty: cur_ty,
+                    instance: target_instance,
+                    method: (*method).to_string(),
+                });
+            }
+        }
+        if param_count != 1 {
+            self.errors.push(format!(
+                "connect: hookable sink `{to_path}` must take exactly one payload argument, got {param_count}"
+            ));
+            return Some(ConnectHookableSink {
+                comp_ty: cur_ty,
+                instance: target_instance,
+                method: (*method).to_string(),
+            });
+        }
+        if has_return {
+            self.errors.push(format!(
+                "connect: hookable sink `{to_path}` must return void"
+            ));
+            return Some(ConnectHookableSink {
+                comp_ty: cur_ty,
+                instance: target_instance,
+                method: (*method).to_string(),
+            });
+        }
+        Some(ConnectHookableSink {
+            comp_ty: cur_ty,
+            instance: target_instance,
+            method: (*method).to_string(),
+        })
+    }
+
+    fn emit_connect_edge(
+        &mut self,
+        owner: &ComponentDecl,
+        instance: &str,
+        edge: &ConnectEdge,
+        depth: usize,
+    ) {
+        let from = expr_path_str(&edge.from);
+        let to = expr_path_str(&edge.to);
+        let (Some(from), Some(to)) = (from, to) else {
+            self.errors
+                .push("connect: edge endpoints must be plain field paths in v0 cpp_tb".into());
+            return;
+        };
+        self.pad(depth);
+        if let Some(sink) = self.resolve_connect_hookable_sink(owner, instance, &to) {
+            writeln!(
+                self.out,
+                "{}.{}.push_back([&](auto _t) {{ {}_{}({}, _t); }});",
+                instance, from, sink.comp_ty, sink.method, sink.instance,
+            )
+            .ok();
+        } else {
+            writeln!(
+                self.out,
+                "{}.{}.push_back([&](auto _t) {{ for (auto& _s : {}.{}) _s(_t); }});",
+                instance, from, instance, to,
+            )
+            .ok();
+        }
+    }
+
     /// Recursively walk a component's `Field`s and register handlers
     /// for each sub-component or sub-transactor. Mode flows down the
     /// inheritance chain via `inherited_mode`:
@@ -5081,20 +5230,7 @@ impl Emitter {
                 for sub_ci in &sub_comp.items {
                     if let ComponentItem::Connect(cb) = sub_ci {
                         for edge in &cb.edges {
-                            let from = expr_path_str(&edge.from);
-                            let to = expr_path_str(&edge.to);
-                            if let (Some(from), Some(to)) = (from, to) {
-                                self.pad(depth);
-                                writeln!(
-                                    self.out,
-                                    "{}.{}.push_back([&](auto _t) {{ for (auto& _s : {}.{}) _s(_t); }});",
-                                    sub_inst, from, sub_inst, to,
-                                ).ok();
-                            } else {
-                                self.errors.push(format!(
-                                    "connect: edge endpoints must be plain field paths in v0 cpp_tb"
-                                ));
-                            }
+                            self.emit_connect_edge(&sub_comp, &sub_inst, edge, depth);
                         }
                     }
                 }
@@ -14802,20 +14938,7 @@ impl Emitter {
                     for ci in &comp.items {
                         if let ComponentItem::Connect(cb) = ci {
                             for edge in &cb.edges {
-                                let from = expr_path_str(&edge.from);
-                                let to = expr_path_str(&edge.to);
-                                if let (Some(from), Some(to)) = (from, to) {
-                                    self.pad(depth);
-                                    writeln!(
-                                        self.out,
-                                        "{}.{}.push_back([&](auto _t) {{ for (auto& _s : {}.{}) _s(_t); }});",
-                                        l.name.name, from, l.name.name, to,
-                                    ).ok();
-                                } else {
-                                    self.errors.push(format!(
-                                        "connect: edge endpoints must be plain field paths in v0 cpp_tb"
-                                    ));
-                                }
+                                self.emit_connect_edge(&comp, &l.name.name, edge, depth);
                             }
                         }
                     }

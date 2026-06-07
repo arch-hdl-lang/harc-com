@@ -5482,6 +5482,112 @@ end test NestedRecordAutoCoverageTest"#,
     );
 }
 
+#[test]
+fn connect_event_to_hookable_sinks_emits_direct_fanout_calls() {
+    let parsed = parse_source(
+        r#"transactor Source
+    observed : out event<uint<8>>
+
+    hookable publish(v: uint<8>)
+        emit observed(v)
+    end publish
+end transactor Source
+
+scoreboard AnalysisSb
+    count : uint<32> default 0
+
+    hookable write_obs(v: uint<8>)
+        count = count + 1
+    end write_obs
+end scoreboard AnalysisSb
+
+scoreboard AnalysisCov
+    samples : uint<32> default 0
+
+    hookable sample_obs(v: uint<8>)
+        samples = samples + 1
+    end sample_obs
+end scoreboard AnalysisCov
+
+env AnalysisEnv
+    source : Source passive
+    sb     : AnalysisSb
+    cov    : AnalysisCov
+
+    connect
+        source.observed -> sb.write_obs
+        source.observed -> cov.sample_obs
+    end connect
+end env AnalysisEnv
+
+test AnalysisSinkConnectTest
+    let dut : Top
+    let env : AnalysisEnv
+    run
+        env.source.publish(3)
+    end run
+end test AnalysisSinkConnectTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains(
+            "env.source.observed.push_back([&](auto _t) { AnalysisSb_write_obs(env.sb, _t); });"
+        ),
+        "connect should lower event -> scoreboard sink as a direct method bridge; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains(
+            "env.source.observed.push_back([&](auto _t) { AnalysisCov_sample_obs(env.cov, _t); });"
+        ),
+        "connect should lower event -> coverage-style sink as a direct method bridge; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn connect_to_when_active_hookable_on_passive_instance_errors_clearly() {
+    let parsed = parse_source(
+        r#"transactor Source
+    observed : out event<uint<8>>
+end transactor Source
+
+transactor Sink
+    when active
+        hookable write_obs(v: uint<8>)
+        end write_obs
+    end when
+end transactor Sink
+
+env AnalysisEnv
+    source : Source passive
+    sink   : Sink passive
+
+    connect
+        source.observed -> sink.write_obs
+    end connect
+end env AnalysisEnv
+
+test AnalysisSinkConnectPassiveErrorTest
+    let dut : Top
+    let env : AnalysisEnv
+    run
+        wait 1 cycle
+    end run
+end test AnalysisSinkConnectPassiveErrorTest"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&parsed).unwrap_err();
+    assert!(
+        err.0.contains("connect")
+            && err.0.contains("env.sink.write_obs")
+            && err.0.contains("when active")
+            && err.0.contains("transactor `Sink`")
+            && err.0.contains("Sink active"),
+        "expected connect passive error naming env.sink.write_obs, when active, Sink, and the fix; got: {}",
+        err.0,
+    );
+}
+
 // ── Passive-transactor enforcement ──────────────────────────────────────
 //
 // A transactor's always-on body (anything NOT under `when active`) must
