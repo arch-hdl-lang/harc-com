@@ -34,6 +34,7 @@ single_port_ram_test    | SimpleMem      | single_port_ram.sv     |
 int_regs_test           | IntRegs        | int_regs.sv            |
 top_counter_test        | Top            | top_counter.sv         |
 heartbeat_idle_test     | Top            | top_counter.sv         |
+analysis_sink_connect_test | Top         | top_counter.sv         |
 wait_until_quiesce_test | Top            | top_counter.sv         |
 watchdog_quiesce_test   | Top            | top_counter.sv         |
 env_quiesced_phase_test | Top            | top_counter.sv         |

@@ -5482,6 +5482,68 @@ end test NestedRecordAutoCoverageTest"#,
     );
 }
 
+#[test]
+fn connect_event_to_hookable_sinks_emits_direct_fanout_calls() {
+    let parsed = parse_source(
+        r#"transactor Source
+    observed : out event<uint<8>>
+
+    hookable publish(v: uint<8>)
+        emit observed(v)
+    end publish
+end transactor Source
+
+scoreboard AnalysisSb
+    count : uint<32> default 0
+
+    hookable write_obs(v: uint<8>)
+        count = count + 1
+    end write_obs
+end scoreboard AnalysisSb
+
+scoreboard AnalysisCov
+    samples : uint<32> default 0
+
+    hookable sample_obs(v: uint<8>)
+        samples = samples + 1
+    end sample_obs
+end scoreboard AnalysisCov
+
+env AnalysisEnv
+    source : Source passive
+    sb     : AnalysisSb
+    cov    : AnalysisCov
+
+    connect
+        source.observed -> sb.write_obs
+        source.observed -> cov.sample_obs
+    end connect
+end env AnalysisEnv
+
+test AnalysisSinkConnectTest
+    let dut : Top
+    let env : AnalysisEnv
+    run
+        env.source.publish(3)
+    end run
+end test AnalysisSinkConnectTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains(
+            "env.source.observed.push_back([&](auto _t) { AnalysisSb_write_obs(env.sb, _t); });"
+        ),
+        "connect should lower event -> scoreboard sink as a direct method bridge; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains(
+            "env.source.observed.push_back([&](auto _t) { AnalysisCov_sample_obs(env.cov, _t); });"
+        ),
+        "connect should lower event -> coverage-style sink as a direct method bridge; got:\n{cpp}"
+    );
+}
+
 // ── Passive-transactor enforcement ──────────────────────────────────────
 //
 // A transactor's always-on body (anything NOT under `when active`) must
