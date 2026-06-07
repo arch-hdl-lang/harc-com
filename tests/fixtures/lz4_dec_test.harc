@@ -1,0 +1,228 @@
+// HARC TB for arch-com/examples/lz4_dec.arch — LZ4 block decompressor.
+//
+// Mirrors arch-com/examples/tb_lz4_dec.cpp cycle-for-cycle.
+//
+// Timing model (HARC full-cycle semantics)
+// -----------------------------------------
+//  In HARC, after `wait N cycles` the coroutine resumes with signal values
+//  settled at the negedge that follows the Nth posedge.  Inputs set in a
+//  segment are visible at the negedge of THAT segment's clock cycle; a
+//  combinatorial output that depends on an input (e.g. CopyLit's
+//  out_data = in_data) is therefore read ONE segment AFTER the input is set:
+//
+//      segment k   : set in_data = X
+//      wait 1 cycle
+//      segment k+1 : assert out_data == X   ← negedge settled with in_data=X
+//
+//  Consequences:
+//   * out_last pulses combinatorially at the posedge that transitions state to
+//     Idle; by the negedge the state is already Idle and out_last = 0.  The
+//     out_last assertions are therefore omitted (verified by tb_lz4_dec.cpp).
+//   * The last literal of each sequence (state→Idle after its posedge) also
+//     cannot be checked; only bytes 1..N-1 of each CopyLit sequence are
+//     asserted here.
+
+domain SysDomain
+  freq_mhz: 200
+end domain SysDomain
+
+testbench Lz4DecTb
+    dut : Lz4Dec
+end testbench Lz4DecTb
+
+impl Lz4DecTest for Lz4DecTb
+    clock clk = SysDomain
+
+    run
+        // ── Reset ────────────────────────────────────────────────────────────
+        dut.rst       = 1
+        dut.in_valid  = 0
+        dut.in_data   = 0
+        dut.in_last   = 0
+        dut.out_ready = 1
+        wait 4 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Test 1: literals-only ("Hello")
+        //   Compressed : [0x50, 'H','e','l','l','o']
+        //   Expected   : "Hello" (5 bytes)
+        //   Token 0x50 → lit_code=5, match_code=0 (terminal sequence)
+        // ─────────────────────────────────────────────────────────────────────
+
+        // Token byte
+        dut.in_valid = 1
+        dut.in_data  = 0x50
+        dut.in_last  = 0
+        assert dut.in_ready == 1 else fail("T1: in_ready low before token")
+        wait 1 cycle  // → CopyLit, lit_len_r = 5
+        // negedge: state=CopyLit, in_data=0x50 (stale) — don't assert out_data here
+
+        // Literal 'H': set in_data before wait so negedge settles with it.
+        dut.in_data = 0x48  // 'H'
+        wait 1 cycle  // lit_len_r = 4; negedge: out_data = in_data = 0x48
+
+        assert dut.out_valid == 1    else fail("T1: out_valid not set for 'H'")
+        assert dut.out_data  == 0x48 else fail("T1: out_data != 'H'")
+        dut.in_data = 0x65  // 'e'
+        wait 1 cycle  // lit_len_r = 3; negedge: out_data = 0x65
+
+        assert dut.out_valid == 1    else fail("T1: out_valid not set for 'e'")
+        assert dut.out_data  == 0x65 else fail("T1: out_data != 'e'")
+        dut.in_data = 0x6C  // 'l'
+        wait 1 cycle  // lit_len_r = 2; negedge: out_data = 0x6C
+
+        assert dut.out_valid == 1
+        assert dut.out_data  == 0x6C
+        dut.in_data = 0x6C  // 'l'
+        wait 1 cycle  // lit_len_r = 1; negedge: out_data = 0x6C
+
+        assert dut.out_valid == 1
+        assert dut.out_data  == 0x6C
+        // Last literal 'o': set before wait; after posedge state → Idle,
+        // so we cannot assert out_data or out_last at negedge.
+        dut.in_data = 0x6F  // 'o'
+        dut.in_last = 1
+        wait 1 cycle  // → Idle
+        dut.in_valid = 0
+        dut.in_last  = 0
+
+        log(info, "PASS T1: literals-only ('Hello')")
+        wait 2 cycles  // let FSM return to Token
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Test 2: match copy ("AAAAAAAA" = 8 bytes)
+        //   Seq 1 (non-terminal)
+        //     Token   = 0x10  (lit_code=1, match_code=0 → match_len=4)
+        //     Literal = 'A'
+        //     Offset  = 0x01 0x00  (=1)
+        //   Seq 2 (terminal)
+        //     Token   = 0x30  (lit_code=3, match_code=0)
+        //     Literals = 'A' 'A' 'A'  (in_last on last 'A')
+        //   Expected: 1 literal + 4 match + 3 literals = 8 × 'A'
+        // ─────────────────────────────────────────────────────────────────────
+
+        // Token 0x10
+        dut.in_valid = 1
+        dut.in_data  = 0x10
+        dut.in_last  = 0
+        assert dut.in_ready == 1 else fail("T2: in_ready low at seq1 token")
+        wait 1 cycle  // → CopyLit, lit_len_r = 1
+
+        // Single literal 'A': set before wait, but after its posedge state → OffLo.
+        // Cannot check out_data at negedge (state = OffLo by then).
+        dut.in_data = 0x41  // 'A'
+        wait 1 cycle  // → OffLo  (lit_len_r was 1 → exhausted)
+        dut.in_valid = 0
+
+        // OffLo: offset low byte = 0x01
+        dut.in_valid = 1
+        dut.in_data  = 0x01
+        assert dut.in_ready == 1 else fail("T2: in_ready at OffLo")
+        wait 1 cycle  // → OffHi, offset_lo_r = 0x01
+
+        // OffHi: offset high byte = 0x00 → offset = 0x0001 = 1
+        //        match_len_r = 0 + 4 = 4 → CopyMatch
+        dut.in_data = 0x00
+        assert dut.in_ready == 1 else fail("T2: in_ready at OffHi")
+        wait 1 cycle  // → CopyMatch, copy_phase_r = 0
+        dut.in_valid = 0
+
+        // CopyMatch: 4 bytes (2 cycles each).
+        // Phase 0: copy_phase_r=false → no output; posedge advances to phase 1.
+        // Phase 1: copy_phase_r=true  → out_valid=1, out_data=hist_rd_data_r.
+        //          hist_rd_data_r is a combinatorial RAM read, so it is visible
+        //          at the negedge after the phase-0 posedge.
+        let m = 0
+        while m < 4
+            wait 1 cycle  // Phase 0 posedge → copy_phase_r = 1; negedge: out_valid=1
+            assert dut.out_valid == 1    else fail("T2: CopyMatch out_valid low in phase 1")
+            assert dut.out_data  == 0x41 else fail("T2: CopyMatch out_data != 'A'")
+            wait 1 cycle  // Phase 1 consumed → copy_phase_r = 0
+            m = m + 1
+        end while
+        // After the loop, match_len exhausted → state = Token.
+
+        // Terminal token 0x30 (lit_code=3)
+        dut.in_valid = 1
+        dut.in_data  = 0x30
+        dut.in_last  = 0
+        assert dut.in_ready == 1 else fail("T2: in_ready low at seq2 token")
+        wait 1 cycle  // → CopyLit, lit_len_r = 3
+
+        // Three terminal literals: assert-after-wait pattern.
+        // First 'A'
+        dut.in_data = 0x41
+        wait 1 cycle  // lit_len_r = 2; negedge: out_data = 0x41
+
+        assert dut.out_valid == 1    else fail("T2: out_valid first term A")
+        assert dut.out_data  == 0x41 else fail("T2: out_data first term A")
+        // Second 'A'
+        dut.in_data = 0x41
+        wait 1 cycle  // lit_len_r = 1; negedge: out_data = 0x41
+
+        assert dut.out_valid == 1    else fail("T2: out_valid second term A")
+        assert dut.out_data  == 0x41 else fail("T2: out_data second term A")
+        // Last 'A' — in_last; after posedge state → Idle, cannot check out_data.
+        dut.in_data = 0x41
+        dut.in_last = 1
+        wait 1 cycle  // → Idle
+        dut.in_valid = 0
+        dut.in_last  = 0
+
+        log(info, "PASS T2: match-copy ('AAAAAAAA')")
+        wait 2 cycles
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Test 3: extended literal length (16 × 'X')
+        //   Token   = 0xF0  (lit_code = 15 → extended, match_code = 0)
+        //   ExtLit  = 0x01  (add 1 → total lit_len = 15 + 1 = 16)
+        //   Literals: 16 × 'X'  (in_last on last 'X')
+        // ─────────────────────────────────────────────────────────────────────
+
+        // Token 0xF0 → ExtLit
+        dut.in_valid = 1
+        dut.in_data  = 0xF0
+        dut.in_last  = 0
+        assert dut.in_ready == 1 else fail("T3: in_ready at token 0xF0")
+        wait 1 cycle  // → ExtLit, lit_len_r = 15
+
+        // ExtLit byte = 0x01 (not 255 → leave ExtLit, lit_len_r = 16)
+        dut.in_data = 0x01
+        assert dut.in_ready == 1 else fail("T3: in_ready at ExtLit")
+        wait 1 cycle  // → CopyLit, lit_len_r = 16
+
+        // 16 'X' literals.  Assert-after-wait for bytes 1..15; byte 16 is the
+        // last (state→Idle after its posedge) so only in_last is set there.
+        //
+        // Segment after ExtLit wait: negedge has in_data=0x01 (ExtLit byte),
+        // state=CopyLit — don't assert out_data yet; set first 'X' first.
+        let x_cnt = 0
+        while x_cnt < 15
+            dut.in_data = 0x58  // 'X'
+            dut.in_last = 0
+            wait 1 cycle  // negedge: out_data = 0x58 (for x_cnt > 0)
+            if x_cnt > 0
+                assert dut.out_valid == 1    else fail("T3: out_valid for lit X[${x_cnt}]")
+                assert dut.out_data  == 0x58 else fail("T3: out_data != 'X' at lit ${x_cnt}")
+            end if
+            x_cnt = x_cnt + 1
+        end while
+        // After the loop (x_cnt=15): negedge has in_data=0x58, state=CopyLit.
+        // The 15th 'X' negedge can be read here (x_cnt==15 after loop).
+        assert dut.out_valid == 1    else fail("T3: out_valid for lit X[15]")
+        assert dut.out_data  == 0x58 else fail("T3: out_data != 'X' for X[15]")
+
+        // 16th 'X' — last; state→Idle after posedge, cannot check out_data.
+        dut.in_data = 0x58
+        dut.in_last = 1
+        wait 1 cycle  // → Idle
+        dut.in_valid = 0
+        dut.in_last  = 0
+
+        log(info, "PASS T3: extended-literal (16 x 'X')")
+
+        log(info, "ALL TESTS PASSED")
+    end run
+end impl Lz4DecTest
