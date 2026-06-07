@@ -243,35 +243,9 @@ The resolver checks CLI flags first, then `HARC_Z3_INCLUDE_DIR` / `HARC_Z3_LIB_D
 
 See [`spec.md`](spec.md) for the full language reference and [`tests/run_fixtures.sh`](tests/run_fixtures.sh) for the complete fixture manifest.
 
-## AI assistant support
-
-This repo includes two optional Codex-facing helpers:
-
-- [`mcp/`](mcp/) — an MVP HARC MCP server that exposes compiler-backed tools
-  for syntax lookup, feature-status checks, fixture retrieval, `harc check`,
-  `harc sim --emit-only`, and `harc advise`.
-- [`skills/harc-programming`](skills/harc-programming/) — an installable Codex
-  skill with bundled HARC reference snapshots and a workflow that prefers the
-  MCP server when available.
-
-Install the skill into the default Codex skill directory with:
-
-```sh
-mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
-cp -R skills/harc-programming "${CODEX_HOME:-$HOME/.codex}/skills/"
-```
-
-Register the MCP server separately by following [`mcp/README.md`](mcp/README.md).
-
 ## Layout
 
 ```
-mcp/
-  harc_mcp_server.py      Codex/AI MCP tools backed by HARC docs, fixtures, and compiler
-
-skills/
-  harc-programming/       Installable Codex skill for `.harc` authoring/debugging
-
 src/
   ast.rs                  AST types
   lexer.rs                Logos-based tokenizer
