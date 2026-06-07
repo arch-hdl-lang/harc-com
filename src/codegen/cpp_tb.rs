@@ -5076,6 +5076,27 @@ impl Emitter {
         let Some((param_count, has_return)) = self.hookable_method_info(&cur_ty, method) else {
             return None;
         };
+        let mut sink_path: Vec<String> = instance.split('.').map(String::from).collect();
+        sink_path.extend(
+            parts[..parts.len().saturating_sub(1)]
+                .iter()
+                .map(|seg| (*seg).to_string()),
+        );
+        if self.method_lives_in_when_active(&cur_ty, method) {
+            if let Some(TransactorMode::Passive) = self.resolve_path_mode(&sink_path) {
+                self.errors.push(format!(
+                    "connect: hookable sink `{}.{}` lives inside `when active` of transactor `{}`, \
+                     so it does not exist on a passive instance. Change the let-binding or field to `{} active`, \
+                     or remove the connect edge. See spec §8.1.",
+                    target_instance, method, cur_ty, cur_ty,
+                ));
+                return Some(ConnectHookableSink {
+                    comp_ty: cur_ty,
+                    instance: target_instance,
+                    method: (*method).to_string(),
+                });
+            }
+        }
         if param_count != 1 {
             self.errors.push(format!(
                 "connect: hookable sink `{to_path}` must take exactly one payload argument, got {param_count}"

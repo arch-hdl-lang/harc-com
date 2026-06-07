@@ -5544,6 +5544,50 @@ end test AnalysisSinkConnectTest"#,
     );
 }
 
+#[test]
+fn connect_to_when_active_hookable_on_passive_instance_errors_clearly() {
+    let parsed = parse_source(
+        r#"transactor Source
+    observed : out event<uint<8>>
+end transactor Source
+
+transactor Sink
+    when active
+        hookable write_obs(v: uint<8>)
+        end write_obs
+    end when
+end transactor Sink
+
+env AnalysisEnv
+    source : Source passive
+    sink   : Sink passive
+
+    connect
+        source.observed -> sink.write_obs
+    end connect
+end env AnalysisEnv
+
+test AnalysisSinkConnectPassiveErrorTest
+    let dut : Top
+    let env : AnalysisEnv
+    run
+        wait 1 cycle
+    end run
+end test AnalysisSinkConnectPassiveErrorTest"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&parsed).unwrap_err();
+    assert!(
+        err.0.contains("connect")
+            && err.0.contains("env.sink.write_obs")
+            && err.0.contains("when active")
+            && err.0.contains("transactor `Sink`")
+            && err.0.contains("Sink active"),
+        "expected connect passive error naming env.sink.write_obs, when active, Sink, and the fix; got: {}",
+        err.0,
+    );
+}
+
 // ── Passive-transactor enforcement ──────────────────────────────────────
 //
 // A transactor's always-on body (anything NOT under `when active`) must

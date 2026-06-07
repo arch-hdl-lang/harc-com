@@ -12,17 +12,19 @@ references; then open questions, then a brief summary and validation gaps.
 Address or explicitly accept any findings before opening the PR.
 
 After the independent review pass is complete, record the reviewed HEAD with
-reviewer provenance:
+reviewer provenance attestation:
 
 ```bash
 scripts/pre_pr_review.sh mark --reviewer-kind separate-agent --reviewer <agent-or-thread-id>
 ```
 
-Use `--reviewer-kind human --reviewer <reviewer-name>` for human reviews. Run
-`scripts/pre_pr_review.sh check` before creating the PR. Use
-`git config core.hooksPath .githooks` in local clones to install the versioned
-`.githooks/pre-push` hook. The hook blocks pushes from `codex/*` branches when
-the review marker is missing, stale, or lacks independent reviewer provenance.
+Use `--reviewer-kind human --reviewer <reviewer-name>` for human reviews. The
+hook validates the attestation fields and reviewed SHA; it cannot independently
+prove reviewer identity. Run `scripts/pre_pr_review.sh check` before creating
+the PR. Use `git config core.hooksPath .githooks` in local clones to install the
+versioned `.githooks/pre-push` hook. The hook blocks pushes from `codex/*`
+branches when the review marker is missing, stale, or lacks reviewer provenance
+attestation.
 
 ## Commit Conventions
 

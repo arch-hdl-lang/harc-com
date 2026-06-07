@@ -11,7 +11,9 @@ Usage:
 Records or checks that the current branch HEAD has received a code-review pass
 before it is pushed/opened as a PR. The review must be performed by an
 independent reviewer: either a separate agent/thread or a human reviewer.
-Review markers are local and stored under .git/pre-pr-reviews/.
+Review markers are local attestations stored under .git/pre-pr-reviews/. This
+script validates that the attestation exists, is current, and names a reviewer;
+it cannot independently prove reviewer identity.
 
 Environment alternatives:
   PRE_PR_REVIEWER_KIND=separate-agent PRE_PR_REVIEWER=<id> scripts/pre_pr_review.sh mark
@@ -118,7 +120,7 @@ fi
 if [[ "$mode" == "mark" ]]; then
   if [[ -z "$reviewer_kind" || -z "$reviewer" ]]; then
     cat >&2 <<EOF
-pre-pr-review: mark requires independent reviewer provenance.
+pre-pr-review: mark requires independent reviewer provenance attestation.
 
 Run an independent review in a separate agent/thread or by a human reviewer,
 then record it with one of:
@@ -190,7 +192,7 @@ marker_reviewer_kind="$(marker_field reviewer_kind "$marker")"
 marker_reviewer="$(marker_field reviewer "$marker")"
 if [[ -z "$marker_reviewer_kind" || -z "$marker_reviewer" ]]; then
   cat >&2 <<EOF
-pre-pr-review: marker for ${branch} lacks independent reviewer provenance.
+pre-pr-review: marker for ${branch} lacks independent reviewer provenance attestation.
 
 Old same-session markers are no longer accepted. Run an independent review,
 then record it with:
@@ -204,4 +206,4 @@ if ! validate_reviewer_kind "$marker_reviewer_kind"; then
   exit 1
 fi
 
-echo "pre-pr-review: review marker is current for ${branch} (${marker_reviewer_kind}: ${marker_reviewer})"
+echo "pre-pr-review: review attestation is current for ${branch} (${marker_reviewer_kind}: ${marker_reviewer})"
