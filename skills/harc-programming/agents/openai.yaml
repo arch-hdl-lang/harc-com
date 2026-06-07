@@ -1,0 +1,4 @@
+interface:
+  display_name: "HARC Programming"
+  short_description: "Write and debug HARC verification code."
+  default_prompt: "Use the harc-programming skill to implement or debug a HARC verification component."
