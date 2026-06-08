@@ -177,3 +177,111 @@ jobs:
         env:
           HARC_CXX: clang++
         run: ./tests/run_negative_fixtures.sh
+
+  check-backends:
+    # sim<->SV equivalence net: run representative arch-com designs under
+    # BOTH backends (ARCH native sim via --dut, Verilator via --sv) with
+    # `harc sim --check-backends` and assert the per-cycle traces match.
+    # This is the standing invariant that catches the silent-divergence
+    # class (e.g. a mutex policy or Vec<Bus> lowering that one backend
+    # disagrees with the other). Needs BOTH compilers, so it checks out
+    # and builds arch-com alongside harc.
+    name: harc sim<->SV parity
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pin the ARCH compiler to a released version. The prebuilt binary is
+      # installed below via cargo-dist (no slow source build); this sparse,
+      # shallow checkout only fetches the example .arch/.harc design files
+      # the parity net runs, at the SAME tag so designs match the binary.
+      # Bump ARCH_VERSION (here + the installer step) to test against a newer
+      # released arch.
+      - name: Check out arch-com example designs (pinned, sparse)
+        uses: actions/checkout@v4
+        with:
+          repository: arch-hdl-lang/arch-com
+          ref: v0.70.3
+          path: arch-com
+          fetch-depth: 1
+          sparse-checkout: examples/nic400
+          sparse-checkout-cone-mode: true
+
+      - name: Install Z3 + clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libz3-dev clang \
+                                  git make autoconf flex bison g++ help2man perl python3 \
+                                  numactl perl-doc libfl2 libfl-dev zlib1g zlib1g-dev
+
+      - name: Cache Verilator
+        id: cache-verilator
+        uses: actions/cache@v4
+        with:
+          path: /opt/verilator
+          key: verilator-v5.034-ubuntu-${{ runner.os }}
+
+      - name: Build Verilator from source (cache miss)
+        if: steps.cache-verilator.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --branch v5.034 --depth 1 https://github.com/verilator/verilator.git /tmp/verilator-src
+          cd /tmp/verilator-src
+          autoconf
+          ./configure --prefix=/opt/verilator
+          make -j"$(nproc)"
+          sudo make install
+
+      - name: Add Verilator to PATH
+        run: |
+          echo "/opt/verilator/bin" >> "$GITHUB_PATH"
+          /opt/verilator/bin/verilator --version
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build harc
+        run: cargo build --release --bin harc
+
+      # Install the prebuilt ARCH compiler via cargo-dist — a few-second
+      # binary download instead of a ~1-2 min source build. Pinned to the
+      # same tag as the design checkout above.
+      - name: Install arch v0.70.3 (cargo-dist prebuilt)
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/arch-hdl-lang/arch-com/releases/download/v0.70.3/arch-installer.sh | sh
+          "$HOME/.cargo/bin/arch" --version
+
+      # `arch sim` hard-codes `g++` to compile the generated C++ testbench
+      # (arch-com src/main.rs, no compiler override env in v0.70.3). On
+      # Linux that's real GCC, which miscompiles the harc TB's C++20
+      # coroutine scheduler — the same miscompile run-fixtures avoids with
+      # HARC_CXX=clang++. (On macOS `g++` is clang, so it passes locally.)
+      # Shim `g++` -> `clang++` on PATH for the parity step so arch sim's
+      # TB compile uses clang. Placed after the harc build so harc's own
+      # cargo/cc build is unaffected. TODO: drop once a released arch
+      # supports an ARCH_CXX override.
+      - name: Shim g++ -> clang++ for arch sim's TB compile
+        run: |
+          mkdir -p "$HOME/gxx-shim"
+          printf '#!/bin/sh\nexec clang++ "$@"\n' > "$HOME/gxx-shim/g++"
+          chmod +x "$HOME/gxx-shim/g++"
+          echo "$HOME/gxx-shim" >> "$GITHUB_PATH"
+
+      - name: Run sim<->SV parity net
+        env:
+          HARC_CXX: clang++
+          ARCH_COM: arch-com
+        run: |
+          # Absolute path avoids coreutils `arch` (prints machine arch) shadowing.
+          export ARCH="$HOME/.cargo/bin/arch"
+          command -v g++ && g++ --version | head -1   # sanity: should be the clang++ shim
+          ./tests/run_check_backends.sh
