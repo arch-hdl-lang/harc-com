@@ -1,0 +1,84 @@
+// Regression test for indexed access of flattened packed `Vec<Bus, N>`
+// DUT ports on the Verilator (`--sv`) backend.
+//
+// Before the fix, `dut.lane_id[i]` lowered to a raw C++ array subscript
+// `dut->lane_id[i]`, which works against the ARCH native sim (port IS a
+// C++ array) but fails to COMPILE against Verilator, where the flattened
+// port is a single packed scalar (`error: subscripted value is not an
+// array`). The fix routes packed-Vec lane access through
+// `harc_rt::harc_vec_lane_{read,write}<W>` so the same HARC source builds
+// and runs on both backends.
+//
+// DUT: tests/dut/packed_vec_lane.sv (top `PackedVecLane`, N=3, W=5).
+//   lane_valid : 1-bit lane  (single packed dim)
+//   lane_id    : 5-bit lane  (2-D packed)
+//   lane_data  : 32-bit lane (2-D packed, 96b total → VlWide<3>)
+//   pass_uvec  : TRUE unpacked array — must stay array-indexed (not
+//                bit-extracted) on both backends.
+
+testbench PackedVecLaneTb
+    dut : PackedVecLane
+end testbench PackedVecLaneTb
+
+impl PackedVecLaneTest for PackedVecLaneTb
+    run
+        log(info, "packed Vec<Bus> lane-access regression")
+
+        dut.rst = 1
+        wait 1 cycle
+        dut.rst = 0
+
+        // Drive distinct per-lane values across all four port shapes.
+        dut.lane_valid_in[0] = 1
+        dut.lane_valid_in[1] = 0
+        dut.lane_valid_in[2] = 1
+
+        dut.lane_id_in[0] = 3
+        dut.lane_id_in[1] = 9
+        dut.lane_id_in[2] = 17
+
+        dut.lane_data_in[0] = 0x11111111
+        dut.lane_data_in[1] = 0x22222222
+        dut.lane_data_in[2] = 0x33333333
+
+        dut.pass_uvec_in[0] = 0x40
+        dut.pass_uvec_in[1] = 0x50
+        dut.pass_uvec_in[2] = 0x60
+
+        wait 1 cycle
+
+        // ── 1-bit lane: out == in, addressed per lane ────────────────────
+        assert dut.lane_valid_out[0] == 1
+            else fail("lane_valid[0] = 1 (got ${dut.lane_valid_out[0]})")
+        assert dut.lane_valid_out[1] == 0
+            else fail("lane_valid[1] = 0 (got ${dut.lane_valid_out[1]})")
+        assert dut.lane_valid_out[2] == 1
+            else fail("lane_valid[2] = 1 (got ${dut.lane_valid_out[2]})")
+
+        // ── 5-bit lane: out == in + 1, masked to W=5 ─────────────────────
+        assert dut.lane_id_out[0] == 4
+            else fail("lane_id[0] = 4 (got ${dut.lane_id_out[0]})")
+        assert dut.lane_id_out[1] == 10
+            else fail("lane_id[1] = 10 (got ${dut.lane_id_out[1]})")
+        assert dut.lane_id_out[2] == 18
+            else fail("lane_id[2] = 18 (got ${dut.lane_id_out[2]})")
+
+        // ── 32-bit lane (VlWide path): out == in + lane_index ────────────
+        assert dut.lane_data_out[0] == 0x11111111
+            else fail("lane_data[0] = 0x11111111 (got 0x${dut.lane_data_out[0]:08x})")
+        assert dut.lane_data_out[1] == 0x22222223
+            else fail("lane_data[1] = 0x22222223 (got 0x${dut.lane_data_out[1]:08x})")
+        assert dut.lane_data_out[2] == 0x33333335
+            else fail("lane_data[2] = 0x33333335 (got 0x${dut.lane_data_out[2]:08x})")
+
+        // ── unpacked array: stays array-indexed; out == in + 2 ───────────
+        assert dut.pass_uvec_out[0] == 0x42
+            else fail("pass_uvec[0] = 0x42 (got 0x${dut.pass_uvec_out[0]:02x})")
+        assert dut.pass_uvec_out[1] == 0x52
+            else fail("pass_uvec[1] = 0x52 (got 0x${dut.pass_uvec_out[1]:02x})")
+        assert dut.pass_uvec_out[2] == 0x62
+            else fail("pass_uvec[2] = 0x62 (got 0x${dut.pass_uvec_out[2]:02x})")
+
+        log(info, "PASS: packed Vec<Bus> lanes + unpacked array index correctly on --sv")
+    end run
+end impl PackedVecLaneTest
