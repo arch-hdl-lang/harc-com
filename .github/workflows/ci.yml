@@ -192,11 +192,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check out arch-com (for the arch compiler + example designs)
+      # Pin the ARCH compiler to a released version. The prebuilt binary is
+      # installed below via cargo-dist (no slow source build); this sparse,
+      # shallow checkout only fetches the example .arch/.harc design files
+      # the parity net runs, at the SAME tag so designs match the binary.
+      # Bump ARCH_VERSION (here + the installer step) to test against a newer
+      # released arch.
+      - name: Check out arch-com example designs (pinned, sparse)
         uses: actions/checkout@v4
         with:
           repository: arch-hdl-lang/arch-com
+          ref: v0.70.3
           path: arch-com
+          fetch-depth: 1
+          sparse-checkout: examples/nic400
+          sparse-checkout-cone-mode: true
 
       - name: Install Z3 + clang
         run: |
@@ -241,11 +251,20 @@ jobs:
       - name: Build harc
         run: cargo build --release --bin harc
 
-      - name: Build arch (the ARCH compiler from arch-com)
-        run: cargo build --release --bin arch --manifest-path arch-com/Cargo.toml
+      # Install the prebuilt ARCH compiler via cargo-dist — a few-second
+      # binary download instead of a ~1-2 min source build. Pinned to the
+      # same tag as the design checkout above.
+      - name: Install arch v0.70.3 (cargo-dist prebuilt)
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/arch-hdl-lang/arch-com/releases/download/v0.70.3/arch-installer.sh | sh
+          "$HOME/.cargo/bin/arch" --version
 
       - name: Run sim<->SV parity net
         env:
           HARC_CXX: clang++
           ARCH_COM: arch-com
-        run: ./tests/run_check_backends.sh
+        run: |
+          # Absolute path avoids coreutils `arch` (prints machine arch) shadowing.
+          export ARCH="$HOME/.cargo/bin/arch"
+          ./tests/run_check_backends.sh
