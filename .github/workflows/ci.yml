@@ -202,7 +202,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: arch-hdl-lang/arch-com
-          ref: v0.70.3
+          ref: v0.70.4
           path: arch-com
           fetch-depth: 1
           sparse-checkout: examples/nic400
@@ -254,34 +254,22 @@ jobs:
       # Install the prebuilt ARCH compiler via cargo-dist — a few-second
       # binary download instead of a ~1-2 min source build. Pinned to the
       # same tag as the design checkout above.
-      - name: Install arch v0.70.3 (cargo-dist prebuilt)
+      - name: Install arch v0.70.4 (cargo-dist prebuilt)
         run: |
           curl --proto '=https' --tlsv1.2 -LsSf \
-            https://github.com/arch-hdl-lang/arch-com/releases/download/v0.70.3/arch-installer.sh | sh
+            https://github.com/arch-hdl-lang/arch-com/releases/download/v0.70.4/arch-installer.sh | sh
           "$HOME/.cargo/bin/arch" --version
-
-      # `arch sim` hard-codes `g++` to compile the generated C++ testbench
-      # (arch-com src/main.rs, no compiler override env in v0.70.3). On
-      # Linux that's real GCC, which miscompiles the harc TB's C++20
-      # coroutine scheduler — the same miscompile run-fixtures avoids with
-      # HARC_CXX=clang++. (On macOS `g++` is clang, so it passes locally.)
-      # Shim `g++` -> `clang++` on PATH for the parity step so arch sim's
-      # TB compile uses clang. Placed after the harc build so harc's own
-      # cargo/cc build is unaffected. TODO: drop once a released arch
-      # supports an ARCH_CXX override.
-      - name: Shim g++ -> clang++ for arch sim's TB compile
-        run: |
-          mkdir -p "$HOME/gxx-shim"
-          printf '#!/bin/sh\nexec clang++ "$@"\n' > "$HOME/gxx-shim/g++"
-          chmod +x "$HOME/gxx-shim/g++"
-          echo "$HOME/gxx-shim" >> "$GITHUB_PATH"
 
       - name: Run sim<->SV parity net
         env:
           HARC_CXX: clang++
+          # arch sim's TB compile defaults to g++, which on Linux is real GCC
+          # and miscompiles the C++20 coroutine testbench scheduler. v0.70.4+
+          # honors ARCH_CXX (mirrors HARC_CXX) — select clang++. (Replaced the
+          # earlier g++ -> clang++ PATH shim once arch-com#538 shipped.)
+          ARCH_CXX: clang++
           ARCH_COM: arch-com
         run: |
           # Absolute path avoids coreutils `arch` (prints machine arch) shadowing.
           export ARCH="$HOME/.cargo/bin/arch"
-          command -v g++ && g++ --version | head -1   # sanity: should be the clang++ shim
           ./tests/run_check_backends.sh
