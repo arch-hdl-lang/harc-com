@@ -1,0 +1,203 @@
+// HARC testbench for arch-com/tests/lz4/Lz4BlockDecomp.arch
+//
+// Verifies the LZ4 block decompressor with a two-sequence block:
+//
+//   Sequence 1: lit_len=4, match_len=4, match_offset=4
+//     Token:    0x40  (high-nibble=4, low-nibble=0 → base match_len=4)
+//     Literals: 'A'=0x41 'B'=0x42 'C'=0x43 'D'=0x44
+//     Offset:   0x04 0x00  (= 4 LE)
+//     Match:    4 bytes from history[-4] = A B C D
+//
+//   Sequence 2 (last, no match section):
+//     Token:    0x40
+//     Literals: 'E'=0x45 'F'=0x46 'G'=0x47 'H'=0x48  (in_last on H)
+//
+// Expected output:  A B C D A B C D E F G H
+//                   with out_last=1 on the final H.
+//
+// Timing note: the DUT uses thread-based FSM lowering where
+// in_ready is asserted in the "action" state — one cycle AFTER
+// in_valid satisfied the wait-until condition.  The TB must hold
+// in_data stable across both cycles.
+// Concretely, each send helper:
+//   1. Drives in_valid=1, in_data=X (and optionally out_ready=1).
+//   2. Waits in a while-loop until in_ready=1 (DUT in action state).
+//   3. Reads combinational outputs (out_data, out_last) while they
+//      are valid in the action state.
+//   4. Waits one more cycle so the posedge latches the registers.
+//   5. De-asserts in_valid.
+
+// ── Helper: send one non-literal input byte ───────────────────────────────
+// Used for token bytes, offset bytes, and extension bytes.
+function send_byte(dut: Lz4BlockDecomp, data: uint<8>, last: uint<1>)
+    dut.in_valid = 1
+    dut.in_data  = data
+    dut.in_last  = last
+    let timeout = 0
+    while dut.in_ready == 0 && timeout < 300
+        wait 1 cycle
+        timeout = timeout + 1
+    end while
+    assert dut.in_ready == 1
+        else fail("send_byte: in_ready never 1 (data=0x${data})")
+    wait 1 cycle
+    dut.in_valid = 0
+    dut.in_last  = 0
+end function send_byte
+
+// ── Helper: send a literal byte and capture the mirrored output ──────────
+// COPY_LIT action state asserts both in_ready and out_valid in the same
+// cycle.  in_last=0, expects out_last=0.
+function send_recv_lit(dut: Lz4BlockDecomp, data: uint<8>) -> uint<8>
+    dut.in_valid  = 1
+    dut.in_data   = data
+    dut.in_last   = 0
+    dut.out_ready = 1
+    let timeout = 0
+    while dut.in_ready == 0 && timeout < 300
+        wait 1 cycle
+        timeout = timeout + 1
+    end while
+    assert dut.in_ready == 1
+        else fail("send_recv_lit: in_ready never 1 (data=0x${data})")
+    assert dut.out_valid == 1
+        else fail("send_recv_lit: out_valid not 1 in action state (data=0x${data})")
+    assert dut.out_last == 0
+        else fail("send_recv_lit: unexpected out_last=1 (data=0x${data})")
+    let captured = dut.out_data
+    wait 1 cycle
+    dut.in_valid = 0
+    return captured
+end function send_recv_lit
+
+// ── Helper: send the LAST literal byte, verify out_last, return data ─────
+// in_last=1; expects out_last=1.
+function send_recv_last_lit(dut: Lz4BlockDecomp, data: uint<8>) -> uint<8>
+    dut.in_valid  = 1
+    dut.in_data   = data
+    dut.in_last   = 1
+    dut.out_ready = 1
+    let timeout = 0
+    while dut.in_ready == 0 && timeout < 300
+        wait 1 cycle
+        timeout = timeout + 1
+    end while
+    assert dut.in_ready == 1
+        else fail("send_recv_last_lit: in_ready never 1 (data=0x${data})")
+    assert dut.out_valid == 1
+        else fail("send_recv_last_lit: out_valid not 1 in action state")
+    assert dut.out_last == 1
+        else fail("send_recv_last_lit: out_last not 1 on last byte")
+    let captured = dut.out_data
+    wait 1 cycle
+    dut.in_valid = 0
+    dut.in_last  = 0
+    return captured
+end function send_recv_last_lit
+
+// ── Helper: receive one match-copy output byte ───────────────────────────
+// Waits for out_valid (P_MATCH_OUT action state) then returns the byte.
+function recv_match(dut: Lz4BlockDecomp) -> uint<8>
+    dut.out_ready = 1
+    let timeout = 0
+    while dut.out_valid == 0 && timeout < 300
+        wait 1 cycle
+        timeout = timeout + 1
+    end while
+    assert dut.out_valid == 1
+        else fail("recv_match: out_valid never 1")
+    let captured = dut.out_data
+    wait 1 cycle
+    return captured
+end function recv_match
+
+// ── Coverage ──────────────────────────────────────────────────────────────
+covergroup Lz4Cov @(posedge dut.clk)
+    cp_in_ready  : cover dut.in_ready  bins hi={1} lo={0} end bins
+    cp_out_valid : cover dut.out_valid bins hi={1} lo={0} end bins
+    cp_out_last  : cover dut.out_last  bins hi={1} lo={0} end bins
+end covergroup Lz4Cov
+
+testbench Lz4Tb
+    dut : Lz4BlockDecomp
+    cov : Lz4Cov
+end testbench Lz4Tb
+
+impl Lz4BlockDecompTest for Lz4Tb
+    run
+        // ── Reset ─────────────────────────────────────────────────
+        dut.rst       = 1
+        dut.in_valid  = 0
+        dut.in_data   = 0
+        dut.in_last   = 0
+        dut.out_ready = 1
+        wait 4 cycles
+        dut.rst = 0
+        wait 2 cycles
+        log(info, "LZ4: reset complete")
+
+        // ── Sequence 1 ────────────────────────────────────────────
+        // Token byte: lit_len_base=4, match_len_base=4
+        send_byte(dut, 0x40, 0)
+        log(info, "LZ4: seq1 token OK")
+
+        // Literals A B C D — output mirrors input in COPY_LIT
+        let l0 = send_recv_lit(dut, 0x41)
+        assert l0 == 0x41 else fail("seq1 lit 0: got 0x${l0}, want 0x41 (A)")
+        let l1 = send_recv_lit(dut, 0x42)
+        assert l1 == 0x42 else fail("seq1 lit 1: got 0x${l1}, want 0x42 (B)")
+        let l2 = send_recv_lit(dut, 0x43)
+        assert l2 == 0x43 else fail("seq1 lit 2: got 0x${l2}, want 0x43 (C)")
+        let l3 = send_recv_lit(dut, 0x44)
+        assert l3 == 0x44 else fail("seq1 lit 3: got 0x${l3}, want 0x44 (D)")
+        log(info, "LZ4: seq1 literals A-D OK")
+
+        // Match offset 4 (0x0004 LE)
+        send_byte(dut, 0x04, 0)
+        send_byte(dut, 0x00, 0)
+        log(info, "LZ4: seq1 offset OK")
+
+        // Match copy: 4 bytes from history[-4] = A B C D
+        let m0 = recv_match(dut)
+        assert m0 == 0x41 else fail("seq1 match 0: got 0x${m0}, want 0x41 (A)")
+        let m1 = recv_match(dut)
+        assert m1 == 0x42 else fail("seq1 match 1: got 0x${m1}, want 0x42 (B)")
+        let m2 = recv_match(dut)
+        assert m2 == 0x43 else fail("seq1 match 2: got 0x${m2}, want 0x43 (C)")
+        let m3 = recv_match(dut)
+        assert m3 == 0x44 else fail("seq1 match 3: got 0x${m3}, want 0x44 (D)")
+        log(info, "LZ4: seq1 match A-D OK")
+
+        // ── Sequence 2 (last — no match section) ──────────────────
+        send_byte(dut, 0x40, 0)
+        log(info, "LZ4: seq2 token OK")
+
+        let l4 = send_recv_lit(dut, 0x45)
+        assert l4 == 0x45 else fail("seq2 lit 0: got 0x${l4}, want 0x45 (E)")
+        let l5 = send_recv_lit(dut, 0x46)
+        assert l5 == 0x46 else fail("seq2 lit 1: got 0x${l5}, want 0x46 (F)")
+        let l6 = send_recv_lit(dut, 0x47)
+        assert l6 == 0x47 else fail("seq2 lit 2: got 0x${l6}, want 0x47 (G)")
+
+        // Last byte: in_last=1, out_last must be 1
+        let l7 = send_recv_last_lit(dut, 0x48)
+        assert l7 == 0x48 else fail("seq2 lit 3 (last): got 0x${l7}, want 0x48 (H)")
+        log(info, "LZ4: seq2 literals E-H OK, out_last verified")
+
+        // ── Post-decode sanity: DUT idles back in P_TOKEN ─────────
+        // After EOS the DUT should be back waiting in P_TOKEN (in_ready=0,
+        // out_valid=0) and not spuriously asserting any output.
+        wait 20 cycles
+        assert dut.out_valid == 0
+            else fail("out_valid should be 0 after decode complete")
+
+        log(info, "ALL TESTS PASSED")
+    end run
+
+    check
+        cov.report()
+        assert cov.cp_in_ready.hi  > 0 else fail("in_ready=1 never observed")
+        assert cov.cp_out_valid.hi > 0 else fail("out_valid=1 never observed")
+        assert cov.cp_out_last.hi  > 0 else fail("out_last=1 never observed")
+    end check
+end impl Lz4BlockDecompTest
