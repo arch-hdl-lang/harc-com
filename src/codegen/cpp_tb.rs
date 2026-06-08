@@ -83,6 +83,236 @@ pub fn dut_type_name(file: &SourceFile) -> Option<String> {
     None
 }
 
+/// Scan a generated SystemVerilog DUT for the `--top` module and return a
+/// map of `port-name → per-lane bit-width` for every port that flattens
+/// to a PACKED 2-D / multi-lane vector — i.e. the SV shapes ARCH's
+/// `arch build` emits for `Vec<Bus, N>` (and other multi-lane bus) ports:
+///
+///   input  logic [2:0]                  m_ar_valid   → lane width 1
+///   input  logic [2:0][MASTER_ID_W-1:0] m_ar_id      → lane width MASTER_ID_W
+///   output logic [3:0][SLAVE_ID_W-1:0]  s_ar_id      → lane width SLAVE_ID_W
+///
+/// Lane `i` of such a port occupies bits `[i*W +: W]` of the packed
+/// scalar Verilator exposes. The TB codegen consults this map so a HARC
+/// `dut.<port>[i]` index lowers to a bit-extract / bit-deposit on the
+/// `--sv` backend instead of a (broken) C++ array subscript.
+///
+/// This is a deliberately small, tolerant textual scan — NOT a full SV
+/// parser. It resolves `parameter int NAME = <int>;` defaults declared in
+/// the same module header so width references like `[MASTER_ID_W-1:0]`
+/// fold to a concrete `W`. Anything it can't fold concretely is skipped
+/// (the port simply isn't added to the map; the codegen then falls back
+/// to the legacy direct-index path, preserving prior behavior).
+///
+/// Note: a *single*-dimension port (`logic [2:0] foo`) is ambiguous in
+/// pure SV — it could be a 3-lane 1-bit Vec or a plain 3-bit scalar — but
+/// for a 1-bit lane width the two interpretations coincide (`(foo>>i)&1`),
+/// so recording W=1 is always correct for an indexed access. Multi-bit
+/// lanes are only ever produced by the 2-D shape, which is unambiguous.
+pub fn vec_lane_widths_from_sv(
+    sv_sources: &[std::path::PathBuf],
+    top: &str,
+) -> std::collections::HashMap<String, u32> {
+    let mut out = std::collections::HashMap::new();
+    for path in sv_sources {
+        let Ok(src) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if let Some(map) = scan_sv_module_lane_widths(&src, top) {
+            // First module to define `top` wins; merge any others
+            // defensively without overwriting concrete entries.
+            for (k, v) in map {
+                out.entry(k).or_insert(v);
+            }
+        }
+    }
+    out
+}
+
+/// Core of `vec_lane_widths_from_sv` over a single SV source string.
+/// Returns `None` if `top` isn't declared in this source.
+fn scan_sv_module_lane_widths(
+    src: &str,
+    top: &str,
+) -> Option<std::collections::HashMap<String, u32>> {
+    let lines: Vec<&str> = src.lines().collect();
+    // Find `module <top>` — match the bare module keyword + name, not a
+    // substring of some other identifier.
+    let start = lines.iter().position(|l| {
+        let t = l.trim_start();
+        if let Some(rest) = t.strip_prefix("module ") {
+            rest.trim_start()
+                .strip_prefix(top)
+                .is_some_and(|after| {
+                    after
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+                })
+        } else {
+            false
+        }
+    })?;
+
+    // Collect the module body up to the matching `endmodule`.
+    let body = &lines[start..];
+    let end_rel = body
+        .iter()
+        .position(|l| l.trim_start().starts_with("endmodule"))
+        .unwrap_or(body.len());
+    let body = &body[..end_rel];
+
+    // Resolve `parameter int NAME = <int>;` (and `localparam`) defaults so
+    // width expressions like `[MASTER_ID_W-1:0]` fold to a number.
+    let mut params: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for l in body {
+        let t = l.trim();
+        for kw in ["parameter int ", "parameter ", "localparam int ", "localparam "] {
+            if let Some(rest) = t.strip_prefix(kw) {
+                if let Some(eq) = rest.find('=') {
+                    let name = rest[..eq].trim().trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                    let name = name.split_whitespace().last().unwrap_or(name);
+                    let val_str: String = rest[eq + 1..]
+                        .trim()
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit() || *c == '-')
+                        .collect();
+                    if let Ok(v) = val_str.parse::<i64>() {
+                        params.insert(name.to_string(), v);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    let mut out = std::collections::HashMap::new();
+    for l in body {
+        if let Some((name, w)) = parse_sv_port_lane_width(l, &params) {
+            out.insert(name, w);
+        }
+    }
+    Some(out)
+}
+
+/// Parse one SV port declaration line into `(port_name, lane_width)` when
+/// it has the flattened multi-lane shape, else `None`. Handles:
+///   `input  logic [N-1:0] name,`               → lane width 1
+///   `input  logic [N-1:0][W-1:0] name,`        → lane width W
+///   `output logic signed [N-1:0][W-1:0] name,` → lane width W
+/// Width expressions fold against `params`. A range `[hi:lo]` yields
+/// width `hi-lo+1`.
+fn parse_sv_port_lane_width(
+    line: &str,
+    params: &std::collections::HashMap<String, i64>,
+) -> Option<(String, u32)> {
+    let t = line.trim();
+    let after_dir = t
+        .strip_prefix("input ")
+        .or_else(|| t.strip_prefix("output "))
+        .or_else(|| t.strip_prefix("inout "))?;
+    // Drop optional `logic`/`wire`/`reg`/`signed`/`unsigned` qualifiers.
+    let mut rest = after_dir.trim();
+    for q in ["logic", "wire", "reg", "bit", "signed", "unsigned"] {
+        if let Some(r) = rest.strip_prefix(q) {
+            // Only strip when followed by whitespace/`[` (a real qualifier,
+            // not the start of an identifier).
+            if r.starts_with(|c: char| c.is_whitespace() || c == '[') {
+                rest = r.trim_start();
+            }
+        }
+    }
+    // Collect leading `[..]` dimension groups.
+    let mut dims: Vec<String> = Vec::new();
+    let mut cur = rest;
+    while cur.starts_with('[') {
+        let close = cur.find(']')?;
+        dims.push(cur[1..close].to_string());
+        cur = cur[close + 1..].trim_start();
+    }
+    if dims.is_empty() {
+        return None; // scalar 1-bit port — not indexable as a lane vector
+    }
+    // Remaining text is the port name (strip trailing `,`/`)`/`;`).
+    let name: String = cur
+        .trim()
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    // Reject ports with a *trailing* (unpacked) dimension after the name,
+    // e.g. `logic [7:0] foo [N]`. Those are genuine SystemVerilog unpacked
+    // arrays — Verilator keeps them as C++ arrays (`VlUnpacked`), so the
+    // HARC `dut.foo[i]` index must stay a real element subscript, NOT a
+    // bit-extract. Excluding them from the map leaves the legacy direct-
+    // index path in place (correct on both backends).
+    let after_name = cur[name.len()..].trim_start();
+    if after_name.starts_with('[') {
+        return None;
+    }
+    // Pre-name dims only: the outer dim is the lane count (unused here);
+    // the inner dim, if present, is the per-lane width. A single packed
+    // dim ⇒ 1-bit lanes (also correct as a bit-select on a plain scalar).
+    let lane_w = if dims.len() >= 2 {
+        sv_range_width(&dims[dims.len() - 1], params)?
+    } else {
+        1
+    };
+    if lane_w == 0 {
+        return None;
+    }
+    Some((name, lane_w))
+}
+
+/// Fold an SV packed range `"hi:lo"` (e.g. `"MASTER_ID_W-1:0"`, `"7:0"`)
+/// to its bit width `hi-lo+1`, resolving param names and simple `-1`
+/// offsets against `params`. Returns `None` if it can't fold concretely.
+fn sv_range_width(
+    range: &str,
+    params: &std::collections::HashMap<String, i64>,
+) -> Option<u32> {
+    let (hi_s, lo_s) = range.split_once(':')?;
+    let hi = eval_sv_index_expr(hi_s.trim(), params)?;
+    let lo = eval_sv_index_expr(lo_s.trim(), params)?;
+    if hi < lo {
+        return None;
+    }
+    Some((hi - lo + 1) as u32)
+}
+
+/// Evaluate a tiny SV index expression: an integer, a param name, or
+/// `<param-or-int> ± <int>` (covers `W-1`, `8`, `MASTER_ID_W`). Returns
+/// `None` for anything more complex (e.g. multiplications) — the port is
+/// then conservatively skipped.
+fn eval_sv_index_expr(
+    e: &str,
+    params: &std::collections::HashMap<String, i64>,
+) -> Option<i64> {
+    let e = e.trim();
+    if let Ok(v) = e.parse::<i64>() {
+        return Some(v);
+    }
+    if let Some(&v) = params.get(e) {
+        return Some(v);
+    }
+    for (op, sign) in [('+', 1i64), ('-', -1i64)] {
+        if let Some(idx) = e.rfind(op) {
+            // Avoid splitting a leading unary minus / empty lhs.
+            if idx == 0 {
+                continue;
+            }
+            let lhs = e[..idx].trim();
+            let rhs = e[idx + 1..].trim();
+            let lv = eval_sv_index_expr(lhs, params)?;
+            let rv: i64 = rhs.parse().ok().or_else(|| params.get(rhs).copied())?;
+            return Some(lv + sign * rv);
+        }
+    }
+    None
+}
+
 /// If the test's `let dut : T` carries `probe ... at <path>` declarations,
 /// return `(T's simple name, &probes)`. `None` for tests without probes —
 /// callers skip the SV bind-stub emission entirely in that case.
@@ -107,12 +337,23 @@ pub fn dut_probes(file: &SourceFile) -> Option<(String, Vec<Probe>)> {
 /// Per-emit options. Currently just the `--mt` opt-in for Phase 3a's
 /// per-actor OS thread topology; defaults to cooperative
 /// (single-OS-thread, faster on real fixtures).
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 pub struct EmitOpts {
     /// Spawn one `std::thread` per bound coroutine actor with dual-
     /// barrier sync per posedge. Off → all coroutines share `sched`
     /// and tick cooperatively in the main thread.
     pub mt: bool,
+    /// Map of DUT top-module port-name → per-lane bit-width for ports
+    /// that flatten to a PACKED SystemVerilog vector (a `Vec<Bus, N>`
+    /// or any multi-lane bus port). Populated from the `--sv` DUT port
+    /// table (see `vec_lane_widths_from_sv`). When a HARC `dut.port[i]`
+    /// index targets a port in this map, the codegen routes through
+    /// `harc_rt::harc_vec_lane_{read,write}<W>` so the lane access works
+    /// against Verilator's packed scalar (bit-extract) as well as the
+    /// ARCH native sim's C++ array (direct index). Empty on the `--dut`
+    /// path — there the existing direct `port[i]` array indexing is
+    /// already correct.
+    pub vec_lane_widths: std::collections::HashMap<String, u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -185,7 +426,7 @@ pub fn emit_split_tests_with_file_prefix(
 
     for (shard_idx, shard_names) in test_names.chunks(group_size).enumerate() {
         let shard_file = filter_source_to_tests(&lowered, shard_names);
-        let cpp = emit_with_opts(&shard_file, opts)?;
+        let cpp = emit_with_opts(&shard_file, opts.clone())?;
         // One test per shard reads better as `test_<name>.cpp`; a bundled
         // shard has no single owning test, so it gets `shard<N>.cpp`.
         let filename = if group_size == 1 {
@@ -699,6 +940,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         pointer_vars: std::collections::HashSet::new(),
         let_types: std::collections::HashMap::new(),
         let_widths: std::collections::HashMap::new(),
+        vec_lane_widths: opts.vec_lane_widths.clone(),
         let_modes: std::collections::HashMap::new(),
         transactions,
         structs,
@@ -4211,6 +4453,14 @@ struct Emitter {
     /// map — width-direction checks then fall back to best-effort
     /// inference on the RHS expression.
     let_widths: std::collections::HashMap<String, u32>,
+    /// DUT top-module port-name → per-lane bit-width for ports that
+    /// flatten to a PACKED SystemVerilog vector (`Vec<Bus, N>` /
+    /// multi-lane bus ports). Forwarded from `EmitOpts::vec_lane_widths`
+    /// (built from the `--sv` port table). A `dut.port[i]` index whose
+    /// port is in this map lowers via `harc_rt::harc_vec_lane_*<W>` so
+    /// the lane access bit-extracts against Verilator's packed scalar
+    /// while still indexing the ARCH native sim's C++ array.
+    vec_lane_widths: std::collections::HashMap<String, u32>,
     /// Identifier → transactor mode, for let-bindings that carry a mode
     /// annotation (`let x : T active`, `let env : E passive`). The mode
     /// is recorded for the root let-name and forms the inheritance root
@@ -15462,7 +15712,54 @@ impl Emitter {
         }
     }
 
+    /// If `e` is an index into a DUT port that flattens to a packed
+    /// multi-lane SV vector (i.e. `dut.<port>[i]` with `<port>` recorded
+    /// in `vec_lane_widths`), return `(port-name, lane-width, &index)`.
+    /// Used to route the lane access through the backend-agnostic
+    /// `harc_rt::harc_vec_lane_*` helpers instead of a raw C++ subscript
+    /// (which only works on the ARCH native sim's array port, not on
+    /// Verilator's packed scalar). Returns `None` for any other shape —
+    /// including indexing a true unpacked-`Vec` port (those aren't in the
+    /// map; their direct `port[i]` array index is correct on both
+    /// backends).
+    fn dut_packed_lane<'e>(&self, e: &'e Expr) -> Option<(String, String, u32, &'e Expr)> {
+        let ExprKind::Index { target, index } = &*e.kind else {
+            return None;
+        };
+        let ExprKind::Field {
+            target: root,
+            name: port,
+        } = &*target.kind
+        else {
+            return None;
+        };
+        let ExprKind::Ident(root_id) = &*root.kind else {
+            return None;
+        };
+        if !self.pointer_vars.contains(&root_id.name) {
+            return None;
+        }
+        // The map is keyed by top-module DUT port names (from the `--sv`
+        // port table); only the DUT pointer's ports can match.
+        let w = *self.vec_lane_widths.get(&port.name)?;
+        Some((root_id.name.clone(), port.name.clone(), w, index))
+    }
+
     fn emit_signal_assignment(&mut self, target: &Expr, value: &Expr, depth: usize) {
+        // Packed multi-lane `Vec<Bus>` port lane write: `dut.<port>[i] =
+        // expr`. On the `--sv` (Verilator) backend `<port>` is a single
+        // packed scalar, so a raw `dut-><port>[i] = …` subscript won't
+        // compile; route through `harc_vec_lane_write<W>` which bit-
+        // deposits the lane (and still array-indexes the ARCH native sim
+        // port via `if constexpr`). See `vec_lane_widths_from_sv`.
+        if let Some((root, port, w, index)) = self.dut_packed_lane(target) {
+            write!(self.out, "harc_rt::harc_vec_lane_write<{w}>({root}->{port}, (std::size_t)(").ok();
+            self.emit_expr(index);
+            write!(self.out, "), ").ok();
+            self.emit_expr(value);
+            writeln!(self.out, ");").ok();
+            return;
+        }
         // `probe force <name>` write: lower to a paired store of
         // `<name>_drv = expr` and `<name>_en = 1`. See
         // docs/probe-signals.md. The bound SV stub's `always_comb`
@@ -15951,6 +16248,30 @@ impl Emitter {
                 }
             }
             ExprKind::Index { target, index } => {
+                // Packed multi-lane `Vec<Bus>` port lane read:
+                // `dut.<port>[i]`. On Verilator `<port>` is a packed
+                // scalar, so a raw `dut-><port>[i]` subscript won't
+                // compile; route the lane read through
+                // `harc_vec_lane_read<W>` (bit-extract on the packed
+                // scalar, direct index on the ARCH native sim array).
+                // Only fires for ports recorded in `vec_lane_widths`
+                // (built from the `--sv` port table) — genuine
+                // unpacked-`Vec` ports and wide-signal `VlWide` word
+                // indexing fall through to the legacy subscript below.
+                // Read (R-value) only: `harc_vec_lane_read` is not an
+                // l-value, so the write side is handled separately in
+                // `emit_signal_assignment` (via `harc_vec_lane_write`).
+                // Guarding on `!lvalue` keeps any l-value request on the
+                // legacy subscript path rather than emitting a
+                // non-assignable call.
+                if !lvalue {
+                    if let Some((root, port, w, idx)) = self.dut_packed_lane(e) {
+                        write!(self.out, "harc_rt::harc_vec_lane_read<{w}>({root}->{port}, (std::size_t)(").ok();
+                        self.emit_expr(idx);
+                        write!(self.out, "))").ok();
+                        return;
+                    }
+                }
                 // Pass `lvalue=true` to suppress the `harc_rt::harc_read`
                 // wrap on a pointer-rooted Field target. Indexing a
                 // wide signal (VlWide<N>) needs the raw `dut->field`
@@ -19079,4 +19400,61 @@ fn substitute_idents(expr: &Expr, subst: &std::collections::HashMap<String, Expr
         other => other.clone(),
     };
     Expr::new(new_kind, span)
+}
+
+#[cfg(test)]
+mod vec_lane_sv_scan_tests {
+    use super::scan_sv_module_lane_widths;
+
+    fn scan(src: &str, top: &str) -> std::collections::HashMap<String, u32> {
+        scan_sv_module_lane_widths(src, top).unwrap_or_default()
+    }
+
+    #[test]
+    fn packed_one_dim_lane_is_width_one() {
+        let sv = "module M (\n  input logic [2:0] valid,\n);\nendmodule\n";
+        let m = scan(sv, "M");
+        assert_eq!(m.get("valid"), Some(&1));
+    }
+
+    #[test]
+    fn packed_two_dim_lane_resolves_inner_width() {
+        let sv = "module M (\n  input logic [2:0] [7:0] data,\n  input logic [3:0] [1:0] resp,\n);\nendmodule\n";
+        let m = scan(sv, "M");
+        assert_eq!(m.get("data"), Some(&8));
+        assert_eq!(m.get("resp"), Some(&2));
+    }
+
+    #[test]
+    fn lane_width_folds_against_module_params() {
+        let sv = "module M #(\n  parameter int W = 5\n) (\n  input logic [2:0] [W-1:0] id,\n);\nendmodule\n";
+        let m = scan(sv, "M");
+        assert_eq!(m.get("id"), Some(&5));
+    }
+
+    #[test]
+    fn unpacked_array_port_is_excluded() {
+        // `logic [7:0] uvec [N]` — packed [7:0] before the name, UNPACKED
+        // [N] after the name. This is a real SV unpacked array and must
+        // NOT be recorded as a packed lane vector.
+        let sv = "module M #(\n  parameter int N = 3\n) (\n  input logic [7:0] uvec [N],\n);\nendmodule\n";
+        let m = scan(sv, "M");
+        assert_eq!(m.get("uvec"), None);
+    }
+
+    #[test]
+    fn plain_clk_rst_scalars_are_excluded() {
+        let sv = "module M (\n  input logic clk,\n  input logic rst,\n);\nendmodule\n";
+        let m = scan(sv, "M");
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn only_named_top_module_is_scanned() {
+        let sv = "module Other (\n  input logic [2:0] [7:0] data,\n);\nendmodule\nmodule M (\n  input logic [3:0] flag,\n);\nendmodule\n";
+        let m = scan(sv, "M");
+        assert_eq!(m.get("flag"), Some(&1));
+        // `data` belongs to `Other`, not `M`.
+        assert_eq!(m.get("data"), None);
+    }
 }

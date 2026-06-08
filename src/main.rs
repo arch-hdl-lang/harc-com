@@ -1548,7 +1548,29 @@ fn cmd_sim(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("harc_tb");
-    let emit_opts = harc::codegen::cpp_tb::EmitOpts { mt };
+    // On the `--sv` (Verilator) path, scan the SV DUT for ports that
+    // flatten to a packed multi-lane vector (`Vec<Bus, N>` / multi-lane
+    // bus ports) and record their per-lane bit-width. The TB codegen
+    // uses this to lower `dut.<port>[i]` lane accesses to bit-extract /
+    // bit-deposit against Verilator's packed scalar — a raw C++ array
+    // subscript only works against the ARCH native sim's array port.
+    // Empty on the `--dut` path (no SV to scan, and direct indexing is
+    // already correct there).
+    let vec_lane_widths = if !sv.is_empty() {
+        let top_for_scan = top
+            .clone()
+            .or_else(|| harc::codegen::cpp_tb::dut_type_name(&codegen_source));
+        match top_for_scan {
+            Some(t) => harc::codegen::cpp_tb::vec_lane_widths_from_sv(&sv, &t),
+            None => std::collections::HashMap::new(),
+        }
+    } else {
+        std::collections::HashMap::new()
+    };
+    let emit_opts = harc::codegen::cpp_tb::EmitOpts {
+        mt,
+        vec_lane_widths,
+    };
     let mut cpp_paths = Vec::new();
     match cpp_split {
         CppSplit::Off => {

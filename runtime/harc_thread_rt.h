@@ -510,6 +510,103 @@ inline uint64_t harc_bits(const HarcWide<N>& value, uint32_t hi, uint32_t lo) {
     return out;
 }
 
+// ── Flattened `Vec<Bus, N>` / multi-lane port lane access ────────────
+// A `Vec<Bus, N>` port (or any multi-lane bus port) flattens in
+// `arch build`'s SystemVerilog to a PACKED vector that Verilator
+// exposes as a single packed C++ scalar (`CData`/`SData`/`IData`/…):
+//
+//   input logic [2:0]                 m_ar_valid   → uint8_t  m_ar_valid;   (W=1)
+//   input logic [2:0][MASTER_ID_W-1:0] m_ar_id     → uint16_t m_ar_id;      (W=3)
+//
+// Lane `i` lives at bits `[i*W +: W]`. The ARCH native sim, by contrast,
+// exposes the very same port as a true C++ array (`uint8_t m_ar_id[3]`),
+// where lane `i` is just `m_ar_id[i]`. The HARC source writes
+// `dut.m_ar_id[i]` for both; these helpers make that lower correctly
+// against either backend from the *same* generated C++ by branching on
+// whether the port type is array-indexable at compile time.
+//
+// `W` is the per-lane bit-width, supplied by the TB codegen from the SV
+// port shape (defaults to 1 for single-dimension lanes). The packed
+// branch read-extracts / read-modify-writes the `W`-bit field; the
+// array branch ignores `W` and indexes directly (so genuine unpacked
+// `Vec` ports — which Verilator keeps as C++ arrays — are untouched).
+
+// A packed port whose total width exceeds 64 bits is exposed by
+// Verilator as a `VlWide<NW>` (array of 32-bit words), which is neither
+// a C array nor an arithmetic scalar. `harc_vec_lane_is_word_array`
+// detects that case so the lane helpers extract/deposit word-by-word
+// instead of going through `_harc_u128` (which can't hold the whole
+// signal). Detection: not an array, not arithmetic, and indexable with
+// `[]` yielding a word.
+template<typename Sig, typename = void>
+struct harc_vec_lane_is_word_array : std::false_type {};
+template<typename Sig>
+struct harc_vec_lane_is_word_array<
+    Sig,
+    std::void_t<decltype(std::declval<const Sig&>()[0])>>
+    : std::bool_constant<!std::is_array_v<Sig> && !std::is_arithmetic_v<Sig>> {};
+
+template<unsigned W, typename Sig>
+inline auto harc_vec_lane_read(const Sig& sig, std::size_t lane) {
+    if constexpr (std::is_array_v<Sig>) {
+        // Native-sim array port (and Verilator `unpacked Vec` ports):
+        // lane is a real element.
+        return harc_read(sig[lane]);
+    } else if constexpr (harc_vec_lane_is_word_array<Sig>::value) {
+        // Verilator packed-vector port wider than 64b (`VlWide<NW>`):
+        // extract the `W`-bit lane field word-by-word. `W` for such
+        // ports is ≤64 (per-lane payload), so a uint64 result suffices.
+        const unsigned lo = static_cast<unsigned>(lane) * W;
+        uint64_t out = 0;
+        const unsigned capped = W > 64 ? 64 : W;
+        for (unsigned b = 0; b < capped; ++b) {
+            const unsigned src = lo + b;
+            const unsigned word = src / 32;
+            const unsigned bit = src % 32;
+            if ((static_cast<uint32_t>(sig[word]) >> bit) & 1u) {
+                out |= (uint64_t{1} << b);
+            }
+        }
+        return out;
+    } else {
+        // Verilator packed-vector port ≤64b: lane is a `W`-bit field.
+        const _harc_u128 v = static_cast<_harc_u128>(sig);
+        const _harc_u128 shifted = v >> (static_cast<_harc_u128>(lane) * W);
+        return static_cast<_harc_u128>(shifted & harc_mask_u128(W));
+    }
+}
+
+template<unsigned W, typename Sig, typename Val>
+inline void harc_vec_lane_write(Sig& sig, std::size_t lane, Val val) {
+    if constexpr (std::is_array_v<Sig>) {
+        harc_assign(sig[lane], val);
+    } else if constexpr (harc_vec_lane_is_word_array<Sig>::value) {
+        // Read-modify-write the `W`-bit lane field of a `VlWide<NW>`
+        // port, word-by-word.
+        const unsigned lo = static_cast<unsigned>(lane) * W;
+        const uint64_t v = static_cast<uint64_t>(val);
+        const unsigned capped = W > 64 ? 64 : W;
+        for (unsigned b = 0; b < capped; ++b) {
+            const unsigned src = lo + b;
+            const unsigned word = src / 32;
+            const unsigned bit = src % 32;
+            const uint32_t bitval = static_cast<uint32_t>((v >> b) & 1u);
+            uint32_t w = static_cast<uint32_t>(sig[word]);
+            w = (w & ~(uint32_t{1} << bit)) | (bitval << bit);
+            sig[word] = w;
+        }
+    } else {
+        // Read-modify-write the `W`-bit lane field in the packed scalar.
+        using Bare = std::remove_cv_t<std::remove_reference_t<Sig>>;
+        const unsigned shift = static_cast<unsigned>(lane) * W;
+        const _harc_u128 field_mask = harc_mask_u128(W) << shift;
+        const _harc_u128 ins =
+            (static_cast<_harc_u128>(static_cast<uint64_t>(val)) & harc_mask_u128(W)) << shift;
+        const _harc_u128 cur = static_cast<_harc_u128>(sig);
+        sig = static_cast<Bare>((cur & ~field_mask) | ins);
+    }
+}
+
 // ── Wider-than-128-bit support ───────────────────────────────────────
 // 65–128b values flow through `_harc_u128` (above). For wider signals
 // (256, 512, 1024, … up to arbitrary `VlWide<N>`), the natural surface
