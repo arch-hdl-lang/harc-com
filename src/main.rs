@@ -1814,6 +1814,23 @@ fn cmd_sim(
     Ok(())
 }
 
+/// Per-backend build sub-directories for a `--check-backends` run.
+///
+/// The two backends MUST NOT share a build directory: the ARCH (`arch
+/// sim`) backend drops a stub `V<Top>.h` plus an arch-sim compatibility
+/// shim `verilated.h` / `verilated.cpp` into its outdir root, and the
+/// Verilator backend puts the outdir root on its C++ `-I` include path
+/// (so the emitted TB's `harc_*_rt.h` includes resolve). If they share a
+/// dir, those ARCH stubs shadow Verilator's real generated header and
+/// runtime — `#include "V<Top>.h"` / `#include "verilated.h"` pick up the
+/// stubs and the link fails with unresolved `Verilated::s_lastContextp`,
+/// `V<Top>::eval()`, etc. Returning sibling sub-dirs keeps each backend's
+/// headers off the other's include path. The parent `outdir` still holds
+/// the two shared trace files for the diff.
+fn check_backends_subdirs(outdir: &Path) -> (PathBuf, PathBuf) {
+    (outdir.join("arch_backend"), outdir.join("sv_backend"))
+}
+
 /// `harc sim --check-backends`: run the test under BOTH the ARCH native
 /// sim (`--dut`) and Verilator (`--sv`) using the same seed, then diff
 /// their semantic JSONL traces. Surfaces backend divergence early — the
@@ -1842,16 +1859,21 @@ fn cmd_sim_check_backends(
         ));
     }
 
-    // Resolve outdir up front so both runs land in the same place and the
+    // Resolve outdir up front so both runs land under the same place and the
     // two trace files sit side-by-side for the diff.
     let outdir = outdir.unwrap_or_else(|| PathBuf::from("harc_sim_build"));
     fs::create_dir_all(&outdir).into_diagnostic()?;
-    let arch_trace = fs::canonicalize(&outdir)
-        .into_diagnostic()?
-        .join("trace_arch.jsonl");
-    let sv_trace = fs::canonicalize(&outdir)
-        .into_diagnostic()?
-        .join("trace_sv.jsonl");
+    let outdir_abs = fs::canonicalize(&outdir).into_diagnostic()?;
+    let arch_trace = outdir_abs.join("trace_arch.jsonl");
+    let sv_trace = outdir_abs.join("trace_sv.jsonl");
+
+    // Give each backend its OWN build sub-directory so the ARCH-sim stub
+    // `V<Top>.h` / `verilated.*` shim cannot shadow Verilator's real
+    // generated header + runtime on the shared include path. See
+    // `check_backends_subdirs` for the full failure mode.
+    let (arch_outdir, sv_outdir) = check_backends_subdirs(&outdir);
+    fs::create_dir_all(&arch_outdir).into_diagnostic()?;
+    fs::create_dir_all(&sv_outdir).into_diagnostic()?;
 
     // Same seed for both runs — randomize() output must match for the
     // diff to be meaningful. Default matches cmd_sim's default.
@@ -1870,7 +1892,7 @@ fn cmd_sim_check_backends(
         CompileScope::Suite,
         CppSplit::Off,
         1,
-        Some(outdir.clone()),
+        Some(arch_outdir.clone()),
         resolved_seed,
         false,
         arch_bin.clone(),
@@ -1894,7 +1916,7 @@ fn cmd_sim_check_backends(
         CompileScope::Suite,
         CppSplit::Off,
         1,
-        Some(outdir.clone()),
+        Some(sv_outdir.clone()),
         resolved_seed,
         false,
         arch_bin.clone(),
@@ -1933,6 +1955,36 @@ fn cmd_sim_check_backends(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression guard for the `--check-backends` self-poisoning bug:
+    /// both backends used to share one outdir, so the ARCH-sim stub
+    /// `V<Top>.h` / `verilated.*` shadowed Verilator's real header +
+    /// runtime on the shared `-I` include path and the link failed
+    /// (unresolved `Verilated::s_lastContextp`, `V<Top>::eval()`, ...).
+    /// The two backends MUST resolve to distinct sub-dirs, and both MUST
+    /// live UNDER the parent outdir (where the shared trace files sit).
+    #[test]
+    fn check_backends_isolates_backend_outdirs() {
+        let parent = PathBuf::from("/tmp/some_outdir");
+        let (arch_dir, sv_dir) = check_backends_subdirs(&parent);
+        assert_ne!(
+            arch_dir, sv_dir,
+            "the two backends must not share a build directory"
+        );
+        assert!(
+            arch_dir.starts_with(&parent),
+            "arch backend dir must live under the parent outdir"
+        );
+        assert!(
+            sv_dir.starts_with(&parent),
+            "sv backend dir must live under the parent outdir"
+        );
+        // Neither backend's dir is the parent itself — the parent holds
+        // the shared trace_*.jsonl files and must stay free of either
+        // backend's shadowing headers.
+        assert_ne!(arch_dir, parent);
+        assert_ne!(sv_dir, parent);
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
