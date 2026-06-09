@@ -1,0 +1,199 @@
+// HARC verification for the Lz4Dec block decompressor.
+//
+// Tests the ARCH implementation of the CAST LZ4SNP-D IP core.
+//
+// Design under test: Lz4Dec — byte-stream LZ4 block decompressor,
+// 256-byte history window, 7-state FSM.
+//
+// Output bytes are reactive: a passive transactor captures every
+// out_valid pulse into a scoreboard queue, sidestepping the need for
+// a concurrent recv loop while send_byte handles back-pressure.
+
+// ── Output scoreboard ──────────────────────────────────────────────────────
+
+scoreboard Lz4Sb
+    out_bytes: queue<uint<8>>
+end scoreboard Lz4Sb
+
+// ── Passive output monitor ─────────────────────────────────────────────────
+
+transactor Lz4OutMon
+    sb: Lz4Sb
+
+    // Fire on every cycle that out_valid is high; push the byte into
+    // the scoreboard so the active test can verify it later.
+    on dut.out_valid
+        sb.out_bytes.push(dut.out_data)
+    end on
+end transactor Lz4OutMon
+
+// ── Input driver helper (in active transactor) ─────────────────────────────
+
+transactor Lz4InDrv
+    dut : Lz4Dec
+
+    when active
+        // Drive one byte; spin on in_ready=0 before the clock edge.
+        // The extra gap cycle after deassert lets out_valid_reg fall to 0 so
+        // consecutive bytes each produce a clean rising edge for the monitor.
+        hookable send_byte(b: uint<8>, last: bool)
+            dut.in_data  = b
+            dut.in_last  = last
+            dut.in_valid = 1
+            while dut.in_ready == 0
+                wait 1 cycle
+            end while
+            wait 1 cycle
+            dut.in_valid = 0
+            dut.in_last  = 0
+            wait 1 cycle
+        end send_byte
+
+        // Wait for the decoder to signal done (or timeout at 200 cycles).
+        hookable wait_done() -> bool
+            let cycles = 0
+            while dut.done == 0
+                wait 1 cycle
+                cycles = cycles + 1
+                if cycles == 200
+                    return false
+                end if
+            end while
+            return true
+        end wait_done
+
+        // Reset the DUT for two cycles then release.
+        hookable reset()
+            dut.rst      = 1
+            dut.in_valid = 0
+            dut.in_data  = 0
+            dut.in_last  = 0
+            wait 2 cycles
+            dut.rst = 0
+            wait 1 cycle
+        end reset
+    end when
+end transactor Lz4InDrv
+
+// ── Testbench ──────────────────────────────────────────────────────────────
+
+testbench Lz4DecTb
+    dut : Lz4Dec
+    drv : Lz4InDrv  active
+    mon : Lz4OutMon passive
+end testbench Lz4DecTb
+
+// ── Test implementation ────────────────────────────────────────────────────
+
+impl Lz4DecTest for Lz4DecTb
+    run
+        drv.dut = dut
+
+        // ────────────────────────────────────────────────────────────────────
+        // Test 1: pure-literal sequence → "HELLO" (5 bytes)
+        //
+        //   token = 0x50  (llen=5, mlen nibble ignored — last sequence)
+        //   literals: H(48) E(45) L(4C) L(4C) O(4F)
+        //   in_last on the final literal byte
+        // ────────────────────────────────────────────────────────────────────
+        log(info, "Test 1: pure literals HELLO")
+        drv.reset()
+
+        drv.send_byte(0x50, false)   // token: llen=5
+        drv.send_byte(0x48, false)   // 'H'
+        drv.send_byte(0x45, false)   // 'E'
+        drv.send_byte(0x4C, false)   // 'L'
+        drv.send_byte(0x4C, false)   // 'L'
+        drv.send_byte(0x4F, true)    // 'O', last byte of block
+
+        let t1_ok = drv.wait_done()
+        assert t1_ok else fail("T1: done not asserted within 200 cycles")
+
+        assert mon.sb.out_bytes.size() == 5
+            else fail("T1: expected 5 output bytes, got ${mon.sb.out_bytes.size()}")
+        assert mon.sb.out_bytes.pop() == 0x48 else fail("T1[0] want 'H'")
+        assert mon.sb.out_bytes.pop() == 0x45 else fail("T1[1] want 'E'")
+        assert mon.sb.out_bytes.pop() == 0x4C else fail("T1[2] want 'L'")
+        assert mon.sb.out_bytes.pop() == 0x4C else fail("T1[3] want 'L'")
+        assert mon.sb.out_bytes.pop() == 0x4F else fail("T1[4] want 'O'")
+        log(info, "Test 1 PASS: HELLO decoded correctly")
+
+        // ────────────────────────────────────────────────────────────────────
+        // Test 2: 1 literal + 4-byte match + 1 final literal → "AAAAAA"
+        //
+        //   Seq 1: token=0x10 (llen=1, mlen=4)
+        //          literal: A (0x41)
+        //          offset:  0x01 0x00  (offset = 1 byte back)
+        //          match:   4 bytes → AAAA
+        //
+        //   Seq 2 (last): token=0x10 (llen=1, mlen nibble ignored)
+        //          literal: A (in_last)
+        //
+        //   Passive monitor captures literal + 4 match bytes while
+        //   send_byte spins on the MATCH_REQ/MATCH_RECV back-pressure.
+        // ────────────────────────────────────────────────────────────────────
+        log(info, "Test 2: literal+match+literal → AAAAAA")
+        drv.reset()
+
+        drv.send_byte(0x10, false)   // seq1 token: llen=1, mlen=4
+        drv.send_byte(0x41, false)   // literal 'A'
+        drv.send_byte(0x01, false)   // offset lo = 1
+        drv.send_byte(0x00, false)   // offset hi = 0
+        // match copy (4×A) runs internally; in_ready stays 0 until done
+        drv.send_byte(0x10, false)   // seq2 token: llen=1
+        drv.send_byte(0x41, true)    // literal 'A', last byte of block
+
+        let t2_ok = drv.wait_done()
+        assert t2_ok else fail("T2: done not asserted within 200 cycles")
+
+        assert mon.sb.out_bytes.size() == 6
+            else fail("T2: expected 6 output bytes, got ${mon.sb.out_bytes.size()}")
+        for i in 0 .. 6
+            let got = mon.sb.out_bytes.pop()
+            assert got == 0x41 else fail("T2[${i}] got 0x${got:02x}, want 0x41 ('A')")
+        end for
+        log(info, "Test 2 PASS: AAAAAA decoded correctly")
+
+        // ────────────────────────────────────────────────────────────────────
+        // Test 3: 3 literals + 6-byte match → "ABCABCABC" (9 bytes)
+        //
+        //   Seq 1: token=0x32 (llen=3, mlen_nibble=2 → mlen=6)
+        //          literals: A(41) B(42) C(43)
+        //          offset:   0x03 0x00  (3 bytes back → position 0)
+        //          match:    A B C A B C  (6 bytes, run-length from position 0)
+        //
+        //   Seq 2 (last): token=0x00 (llen=0, in_last) → DONE immediately
+        // ────────────────────────────────────────────────────────────────────
+        log(info, "Test 3: 3 literals + 6-byte match → ABCABCABC")
+        drv.reset()
+
+        drv.send_byte(0x32, false)   // seq1 token: llen=3, mlen=6
+        drv.send_byte(0x41, false)   // 'A'
+        drv.send_byte(0x42, false)   // 'B'
+        drv.send_byte(0x43, false)   // 'C'
+        drv.send_byte(0x03, false)   // offset lo = 3
+        drv.send_byte(0x00, false)   // offset hi = 0
+        // 6 match bytes output internally before in_ready returns
+        drv.send_byte(0x00, true)    // final token: llen=0, in_last → DONE
+
+        let t3_ok = drv.wait_done()
+        assert t3_ok else fail("T3: done not asserted within 200 cycles")
+
+        assert mon.sb.out_bytes.size() == 9
+            else fail("T3: expected 9 output bytes, got ${mon.sb.out_bytes.size()}")
+
+        // Expected pattern: A B C repeated three times
+        assert mon.sb.out_bytes.pop() == 0x41 else fail("T3[0] want A")
+        assert mon.sb.out_bytes.pop() == 0x42 else fail("T3[1] want B")
+        assert mon.sb.out_bytes.pop() == 0x43 else fail("T3[2] want C")
+        assert mon.sb.out_bytes.pop() == 0x41 else fail("T3[3] want A")
+        assert mon.sb.out_bytes.pop() == 0x42 else fail("T3[4] want B")
+        assert mon.sb.out_bytes.pop() == 0x43 else fail("T3[5] want C")
+        assert mon.sb.out_bytes.pop() == 0x41 else fail("T3[6] want A")
+        assert mon.sb.out_bytes.pop() == 0x42 else fail("T3[7] want B")
+        assert mon.sb.out_bytes.pop() == 0x43 else fail("T3[8] want C")
+        log(info, "Test 3 PASS: ABCABCABC decoded correctly")
+
+        log(info, "ALL TESTS PASSED — Lz4Dec block decompressor")
+    end run
+end impl Lz4DecTest
