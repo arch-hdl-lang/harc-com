@@ -1,0 +1,259 @@
+// HARC TB for arch-com/examples/lz4_block_dec.arch — LZ4 block decompressor.
+//
+// Tests two LZ4 sequences using the raw-block byte stream protocol:
+//   Test 1: pure literals "HELLO"  (no match section)
+//   Test 2: literals + match "ABCDABCD"  (4-byte literal run + 4-byte copy)
+//
+// Handshake: in_valid/in_data/in_ready for compressed input;
+//            out_valid/out_data/out_ready for decompressed output.
+// last_seq must be asserted simultaneously with the final sequence's token byte.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench Lz4BlockDecTb
+    dut : Lz4BlockDec
+end testbench Lz4BlockDecTb
+
+impl Lz4BlockDecTest for Lz4BlockDecTb
+    clock clk = SysDomain
+
+    run
+        // ------------------------------------------------------------------
+        // Reset
+        // ------------------------------------------------------------------
+        dut.rst      = 1
+        dut.in_valid = 0
+        dut.in_data  = 0
+        dut.last_seq = 0
+        dut.out_ready = 0
+        wait 3 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // ------------------------------------------------------------------
+        // Test 1: pure literals "HELLO" (5 bytes, last_seq=1, no match)
+        //
+        // LZ4 token 0x50: high-nibble=5 (litlen=5), low-nibble=0 (matlen=4
+        // but irrelevant — last sequence has no offset/match section).
+        // ------------------------------------------------------------------
+        dut.in_valid = 1
+        dut.in_data  = 80        // 0x50 token
+        dut.last_seq = 1
+        wait 1 cycle             // state 0 → 1 (LIT_WAIT); lit_len=5, is_last=1
+        dut.last_seq = 0
+
+        // 'H' = 72
+        dut.in_data  = 72
+        wait 1 cycle             // state 1 → 2 (LIT_EMIT); byte_r='H'
+        assert dut.out_valid
+            else fail("test1: out_valid expected for H")
+        assert dut.out_data == 72
+            else fail("test1: expected 72 ('H'), got ${dut.out_data}")
+        dut.in_valid  = 0
+        dut.out_ready = 1
+        wait 1 cycle             // state 2 → 1; output accepted
+        dut.out_ready = 0
+
+        // 'E' = 69
+        dut.in_valid = 1
+        dut.in_data  = 69
+        wait 1 cycle
+        assert dut.out_valid
+            else fail("test1: out_valid expected for E")
+        assert dut.out_data == 69
+            else fail("test1: expected 69 ('E'), got ${dut.out_data}")
+        dut.in_valid  = 0
+        dut.out_ready = 1
+        wait 1 cycle
+        dut.out_ready = 0
+
+        // 'L' = 76  (first)
+        dut.in_valid = 1
+        dut.in_data  = 76
+        wait 1 cycle
+        assert dut.out_valid
+            else fail("test1: out_valid expected for first L")
+        assert dut.out_data == 76
+            else fail("test1: expected 76 ('L'), got ${dut.out_data}")
+        dut.in_valid  = 0
+        dut.out_ready = 1
+        wait 1 cycle
+        dut.out_ready = 0
+
+        // 'L' = 76  (second)
+        dut.in_valid = 1
+        dut.in_data  = 76
+        wait 1 cycle
+        assert dut.out_valid
+            else fail("test1: out_valid expected for second L")
+        assert dut.out_data == 76
+            else fail("test1: expected 76 ('L'), got ${dut.out_data}")
+        dut.in_valid  = 0
+        dut.out_ready = 1
+        wait 1 cycle
+        dut.out_ready = 0
+
+        // 'O' = 79  (last literal; is_last=1 → state 7 after accept)
+        dut.in_valid = 1
+        dut.in_data  = 79
+        wait 1 cycle
+        assert dut.out_valid
+            else fail("test1: out_valid expected for O")
+        assert dut.out_data == 79
+            else fail("test1: expected 79 ('O'), got ${dut.out_data}")
+        dut.in_valid  = 0
+        dut.out_ready = 1
+        wait 1 cycle             // state 2 → 7 (DONE); done=1 (comb)
+        dut.out_ready = 0
+        assert dut.done
+            else fail("test1: done not asserted after HELLO")
+        wait 1 cycle             // state 7 → 0
+        log(info, "PASS test1: HELLO decoded correctly")
+
+        // ------------------------------------------------------------------
+        // Reset before test 2 so wr_ptr and history are clean
+        // ------------------------------------------------------------------
+        dut.rst       = 1
+        dut.in_valid  = 0
+        dut.last_seq  = 0
+        dut.out_ready = 0
+        wait 3 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // ------------------------------------------------------------------
+        // Test 2: literals + match "ABCDABCD"
+        //
+        // Sequence 1 (not last): token 0x40 (litlen=4, mat-nibble=0 → matchlen=4)
+        //   Literals: A B C D
+        //   Offset (LE 16-bit): low=0x04, high=0x00  →  off12=4
+        //   Match: copy 4 bytes from history[-4] = A B C D
+        //
+        // Sequence 2 (last): token 0x00 (litlen=0, last_seq=1) → DONE
+        // ------------------------------------------------------------------
+        dut.in_valid = 1
+        dut.in_data  = 64        // 0x40 token: high-nibble=4, low-nibble=0
+        dut.last_seq = 0
+        wait 1 cycle             // state 0 → 1; lit_len=4, mat_len=4
+
+        // 'A' = 65
+        dut.in_data  = 65
+        wait 1 cycle
+        assert dut.out_valid
+            else fail("test2: out_valid expected for A (lit)")
+        assert dut.out_data == 65
+            else fail("test2: expected 65 ('A' lit), got ${dut.out_data}")
+        dut.in_valid  = 0
+        dut.out_ready = 1
+        wait 1 cycle
+        dut.out_ready = 0
+
+        // 'B' = 66
+        dut.in_valid = 1
+        dut.in_data  = 66
+        wait 1 cycle
+        assert dut.out_valid
+            else fail("test2: out_valid expected for B (lit)")
+        assert dut.out_data == 66
+            else fail("test2: expected 66 ('B' lit), got ${dut.out_data}")
+        dut.in_valid  = 0
+        dut.out_ready = 1
+        wait 1 cycle
+        dut.out_ready = 0
+
+        // 'C' = 67
+        dut.in_valid = 1
+        dut.in_data  = 67
+        wait 1 cycle
+        assert dut.out_valid
+            else fail("test2: out_valid expected for C (lit)")
+        assert dut.out_data == 67
+            else fail("test2: expected 67 ('C' lit), got ${dut.out_data}")
+        dut.in_valid  = 0
+        dut.out_ready = 1
+        wait 1 cycle
+        dut.out_ready = 0
+
+        // 'D' = 68  (last literal; is_last=0 → state 3 after accept)
+        dut.in_valid = 1
+        dut.in_data  = 68
+        wait 1 cycle
+        assert dut.out_valid
+            else fail("test2: out_valid expected for D (lit)")
+        assert dut.out_data == 68
+            else fail("test2: expected 68 ('D' lit), got ${dut.out_data}")
+        dut.in_valid  = 0
+        dut.out_ready = 1
+        wait 1 cycle             // state 2 → 3 (OFF_BYTE0)
+        dut.out_ready = 0
+
+        // Offset low byte = 4  (back-reference distance = 4)
+        dut.in_valid = 1
+        dut.in_data  = 4
+        wait 1 cycle             // state 3 → 4 (OFF_BYTE1); off_lo=4
+
+        // Offset high byte = 0  →  off12 = {0, 4} = 4
+        // rd_ptr = wr_ptr(4) − 4 = 0
+        dut.in_data  = 0
+        wait 1 cycle             // state 4 → 5 (MAT_RD); rd_ptr=0
+        dut.in_valid = 0
+
+        // State 5 (MAT_RD): HistBuf clocks mem[0]='A' into rd_port_data_r
+        wait 1 cycle             // state 5 → 6 (MAT_EMIT); hist_rd_data='A'
+
+        // Match 'A' = 65
+        assert dut.out_valid
+            else fail("test2: out_valid expected for A (match)")
+        assert dut.out_data == 65
+            else fail("test2: expected 65 ('A' match), got ${dut.out_data}")
+        dut.out_ready = 1
+        wait 1 cycle             // state 6 → 5; mat_len=3
+        dut.out_ready = 0
+
+        // Match 'B' = 66
+        wait 1 cycle             // state 5 → 6; hist_rd_data=mem[1]='B'
+        assert dut.out_valid
+            else fail("test2: out_valid expected for B (match)")
+        assert dut.out_data == 66
+            else fail("test2: expected 66 ('B' match), got ${dut.out_data}")
+        dut.out_ready = 1
+        wait 1 cycle             // state 6 → 5; mat_len=2
+        dut.out_ready = 0
+
+        // Match 'C' = 67
+        wait 1 cycle             // state 5 → 6; hist_rd_data=mem[2]='C'
+        assert dut.out_valid
+            else fail("test2: out_valid expected for C (match)")
+        assert dut.out_data == 67
+            else fail("test2: expected 67 ('C' match), got ${dut.out_data}")
+        dut.out_ready = 1
+        wait 1 cycle             // state 6 → 5; mat_len=1
+        dut.out_ready = 0
+
+        // Match 'D' = 68  (mat_len=1 ≤ 1 → state 0 after accept)
+        wait 1 cycle             // state 5 → 6; hist_rd_data=mem[3]='D'
+        assert dut.out_valid
+            else fail("test2: out_valid expected for D (match)")
+        assert dut.out_data == 68
+            else fail("test2: expected 68 ('D' match), got ${dut.out_data}")
+        dut.out_ready = 1
+        wait 1 cycle             // state 6 → 0; mat_len=0
+        dut.out_ready = 0
+
+        // Sequence 2: final token 0x00 (litlen=0) with last_seq=1 → DONE
+        dut.in_valid = 1
+        dut.in_data  = 0
+        dut.last_seq = 1
+        wait 1 cycle             // state 0 → 7 (DONE): tok_nib_hi==0 && last_seq
+        dut.in_valid = 0
+        dut.last_seq = 0
+        assert dut.done
+            else fail("test2: done not asserted after ABCDABCD")
+        wait 1 cycle             // state 7 → 0
+        log(info, "PASS test2: ABCDABCD decoded correctly")
+
+        log(info, "ALL TESTS PASSED")
+    end run
+end impl Lz4BlockDecTest
