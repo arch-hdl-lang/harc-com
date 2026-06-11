@@ -1,0 +1,12 @@
+module RwTarget
+  port clk: in Clock<SysDomain>;
+  port rst: in Reset<Async, Low>;
+  port s: target BusRw<WRITE=0>;
+  port busy: out Bool;
+  comb
+    s.ar_ready = 1;
+    s.r_valid  = s.ar_valid;
+    s.r_data   = s.ar_addr;
+    busy       = s.ar_valid;
+  end comb
+end module RwTarget

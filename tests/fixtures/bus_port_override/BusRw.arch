@@ -1,0 +1,22 @@
+bus BusRw
+  param ADDR_W: const = 32;
+  param DATA_W: const = 32;
+  param READ:  const = 1;
+  param WRITE: const = 1;
+  generate_if WRITE
+    aw_valid: out Bool;
+    aw_ready: in  Bool;
+    aw_addr:  out UInt<ADDR_W>;
+    w_valid:  out Bool;
+    w_ready:  in  Bool;
+    w_data:   out UInt<DATA_W>;
+  end generate_if
+  generate_if READ
+    ar_valid: out Bool;
+    ar_ready: in  Bool;
+    ar_addr:  out UInt<ADDR_W>;
+    r_valid:  in  Bool;
+    r_ready:  out Bool;
+    r_data:   in  UInt<DATA_W>;
+  end generate_if
+end bus BusRw

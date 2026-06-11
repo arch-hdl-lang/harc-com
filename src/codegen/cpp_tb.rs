@@ -353,6 +353,23 @@ pub struct EmitOpts {
     /// path — there the existing direct `port[i]` array indexing is
     /// already correct.
     pub vec_lane_widths: std::collections::HashMap<String, u32>,
+    /// DUT-port-level bus param overrides, keyed by DUT port name (which by
+    /// convention equals the HARC `let <name> : Bus = bind dut` bind name and
+    /// the flattened SV signal prefix). Inner map is `param-name → folded i64`.
+    ///
+    /// Sourced by parsing the DUT's `.arch`/`.archi` interface (see
+    /// `dut_bus_port_overrides_from_files`). When a DUT module declares
+    /// `port s: target BusRw<WRITE=0>`, `arch build` flattens `s` *without* the
+    /// WRITE-gated channels, so a harc bus-bind on `s` must model the same port
+    /// set. These overrides are layered onto the bus defaults (and any HARC-TB
+    /// bind-site generic) at the `bus_param_envs` population sites — see
+    /// `bus_param_env_with_port_override`. The DUT port's own override is
+    /// authoritative for that port (it reflects what `arch build` actually
+    /// synthesized), so it wins over a bind-site generic if both name the same
+    /// param. Empty when no DUT interface is available, in which case the
+    /// pre-existing conservative defaults-only behavior is unchanged.
+    pub dut_bus_port_overrides:
+        std::collections::HashMap<String, std::collections::HashMap<String, i64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -961,6 +978,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         buses,
         bus_bindings: std::collections::HashMap::new(),
         bus_param_envs: std::collections::HashMap::new(),
+        dut_bus_port_overrides: opts.dut_bus_port_overrides.clone(),
         bus_remap: std::collections::HashMap::new(),
         pending_tlm_forks: Vec::new(),
         next_tlm_fork_tag: std::collections::HashMap::new(),
@@ -2041,8 +2059,17 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                                 let prefix = l.name.name.clone();
                                 // Effective param env for `generate_if` gate
                                 // evaluation: bus defaults overlaid with the
-                                // bind-site generic overrides (`BusAxi4#(READ=0)`).
-                                let env = bus_param_env(&bus_decl, l.ty.as_ref());
+                                // bind-site generic overrides (`BusAxi4#(READ=0)`)
+                                // and then the DUT port's own override
+                                // (`port s: target BusAxi4<WRITE=0>`), which is
+                                // authoritative for which gated channels
+                                // `arch build` actually flattened. The bind name
+                                // equals the DUT port name by convention.
+                                let env = bus_param_env_with_port_override(
+                                    &bus_decl,
+                                    l.ty.as_ref(),
+                                    e.dut_bus_port_overrides.get(&l.name.name),
+                                );
                                 e.bus_param_envs.insert(l.name.name.clone(), env);
                                 e.bus_bindings
                                     .insert(l.name.name.clone(), (bus_decl, buf, prefix.clone()));
@@ -2706,6 +2733,216 @@ fn bus_param_env(
         }
     }
     env
+}
+
+/// Like `bus_param_env`, but additionally layers a DUT-port-level override
+/// (`port s: target BusRw<WRITE=0>` in the DUT's `.arch`/`.archi`) onto the env.
+///
+/// Precedence, lowest to highest:
+///   1. bus param defaults,
+///   2. HARC-TB bind-site generic (`let s : BusRw<...> = bind dut`, the `...`),
+///   3. DUT-port override (the port's own `<...>`).
+///
+/// The DUT port's override is authoritative because it reflects which
+/// `generate_if`-gated channels `arch build` *actually* flattened into the SV
+/// port set for that port. In the realistic case the DUT carries the override
+/// and the harc TB does not restate it, so (2) is empty and (3) is the only
+/// non-default layer; when both name the same param, (3) wins so harc agrees
+/// with `arch build` rather than with a stale TB restatement. Overrides that
+/// can't be folded are simply not inserted, leaving the gate conservatively
+/// PRESENT (same fallback as `gate_passes`).
+fn bus_param_env_with_port_override(
+    bus: &BusDecl,
+    bind_ty: Option<&TypeExpr>,
+    port_override: Option<&std::collections::HashMap<String, i64>>,
+) -> std::collections::HashMap<String, i64> {
+    let mut env = bus_param_env(bus, bind_ty);
+    if let Some(ov) = port_override {
+        for (k, v) in ov {
+            env.insert(k.clone(), *v);
+        }
+    }
+    env
+}
+
+/// Parse DUT `.arch`/`.archi` interface files and extract per-port bus param
+/// overrides, keyed by DUT port name. A port declaration of the form
+///
+///   port <name>: <initiator|target> <BusName>[<P=v, ...>] [as Vec<...>];
+///   port <name>: <initiator|target> Vec<BusName<P=v, ...>, N>;
+///
+/// contributes `{ <name>: { P: v, ... } }`. The structural prefix
+/// (`port <name>: <persp>`) is matched line-wise; the type tail
+/// (`BusName<...>` / `Vec<BusName<...>, N>`) is handed to the real type-expr
+/// parser (`parse_type_expr_fragment`) so the `<P=v>` and `Vec<>` forms are
+/// parsed by the same grammar harc#344/#345 already rely on, not a regex.
+///
+/// `.archi` is preferred when a sibling exists next to a `.arch` input, since
+/// it is the post-elaboration authoritative interface (#567). When only the
+/// `.arch` source is present, its port declaration carries the identical
+/// override line, so scanning it directly is equally correct.
+///
+/// Only named value params that fold to an i64 are recorded — anything that
+/// can't be folded is dropped, leaving the gate conservatively PRESENT.
+pub fn dut_bus_port_overrides_from_files(
+    dut_files: &[std::path::PathBuf],
+) -> std::collections::HashMap<String, std::collections::HashMap<String, i64>> {
+    let mut out: std::collections::HashMap<String, std::collections::HashMap<String, i64>> =
+        std::collections::HashMap::new();
+    // Resolve each `.arch` input to its sibling `.archi` if present.
+    let mut seen: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+    for f in dut_files {
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if f.extension().and_then(|e| e.to_str()) == Some("arch") {
+            let archi = f.with_extension("archi");
+            if archi.exists() {
+                candidates.push(archi);
+            }
+        }
+        candidates.push(f.clone());
+        for cand in candidates {
+            if !seen.insert(cand.clone()) {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(&cand) else {
+                continue;
+            };
+            collect_port_overrides_from_src(&src, &mut out);
+            // First successfully-read candidate (prefer .archi) is enough for
+            // this input; the .arch fallback only matters when no .archi.
+            break;
+        }
+    }
+    out
+}
+
+/// Scan one interface source string for `port <name>: <persp> <bus-ty>;` lines
+/// and fold any bus param overrides into `out`. Defined separately so the
+/// unit tests can drive it with an in-memory string.
+fn collect_port_overrides_from_src(
+    src: &str,
+    out: &mut std::collections::HashMap<String, std::collections::HashMap<String, i64>>,
+) {
+    for raw in src.lines() {
+        // Strip line comments and trim.
+        let line = match raw.find("//") {
+            Some(i) => &raw[..i],
+            None => raw,
+        };
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("port ") else {
+            continue;
+        };
+        // `<name>: <persp> <ty>;`
+        let Some(colon) = rest.find(':') else {
+            continue;
+        };
+        let name = rest[..colon].trim();
+        if name.is_empty() || !is_simple_ident(name) {
+            continue;
+        }
+        let after_colon = rest[colon + 1..].trim();
+        // Perspective keyword distinguishes a bus port from a scalar/vec port.
+        let ty_tail = if let Some(t) = after_colon.strip_prefix("initiator ") {
+            t
+        } else if let Some(t) = after_colon.strip_prefix("target ") {
+            t
+        } else {
+            continue;
+        };
+        // Drop the trailing `;` and anything after it; also drop a trailing
+        // `as Vec<...>` / `comb_dep_on(...)` decoration — only the bus type
+        // (and its `<P=v>`) carries the override.
+        let ty_tail = ty_tail.trim();
+        let ty_tail = ty_tail.split(';').next().unwrap_or(ty_tail).trim();
+        if ty_tail.is_empty() {
+            continue;
+        }
+        // Unwrap a `Vec<ELEM, N>` array-of-bus form down to its element bus
+        // type. harc's type-arg grammar does not accept a nested
+        // `BusName<P=v>` as a Vec element (it parses the element as a value
+        // expression), so we strip the `Vec<` / trailing `, N>` wrapper
+        // textually and hand the element string to the real type-expr parser —
+        // which DOES parse a top-level `BusName<P=v>` correctly. The structural
+        // unwrap is trivial; the `<P=v>` parse stays with the parser.
+        let elem_str = vec_element_type_str(ty_tail).unwrap_or_else(|| ty_tail.to_string());
+        let Ok(te) = crate::parser::parse_type_expr_fragment(&elem_str) else {
+            continue;
+        };
+        let generics = bus_port_generics(&te);
+        let Some(generics) = generics else {
+            continue;
+        };
+        let mut env: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        // Fold in declaration order so a later param may reference an earlier
+        // one (mirrors `bus_param_env`'s default-folding pass).
+        for g in generics {
+            if let TypeArg::Named { name: pn, value } = g {
+                if let Some(v) = eval_const_i64(value, &env) {
+                    env.insert(pn.name.clone(), v);
+                }
+            }
+        }
+        if !env.is_empty() {
+            out.entry(name.to_string()).or_default().extend(env);
+        }
+    }
+}
+
+/// Extract the bus element's generic-arg list from a parsed port type:
+/// `BusName<...>` → its generics; `Vec<BusName<...>, N>` → the element's
+/// generics. Returns `None` for non-bus/non-generic forms.
+fn bus_port_generics(te: &TypeExpr) -> Option<&[TypeArg]> {
+    match te {
+        TypeExpr::Named { generics, .. } => Some(generics.as_slice()),
+        TypeExpr::Builtin {
+            name: BuiltinTy::Vec,
+            args,
+            ..
+        } => {
+            // First type-arg is the element type; descend into it.
+            args.iter().find_map(|a| match a {
+                TypeArg::Type(inner) => bus_port_generics(inner),
+                _ => None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// If `ty` is a `Vec<ELEM, N>` array-of-bus form, return the `ELEM` substring
+/// (the element bus type, e.g. `BusAxi4<WRITE=0>`). The element is everything
+/// inside the outer `Vec<...>` up to the LAST top-level comma (the `, N` count).
+/// Angle-bracket depth is tracked so a nested `BusName<P=v>` is not split.
+/// Returns `None` if `ty` is not a `Vec<...>` form (a bare `BusName<...>` port
+/// type passes straight through to the parser unchanged).
+fn vec_element_type_str(ty: &str) -> Option<String> {
+    let inner = ty.strip_prefix("Vec")?.trim_start();
+    let inner = inner.strip_prefix('<')?;
+    let inner = inner.strip_suffix('>')?;
+    // Find the last top-level (depth-0) comma — separates ELEM from the count.
+    let mut depth = 0i32;
+    let mut last_comma: Option<usize> = None;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => last_comma = Some(i),
+            _ => {}
+        }
+    }
+    let cut = last_comma?;
+    Some(inner[..cut].trim().to_string())
+}
+
+/// `true` iff `s` is a single ARCH identifier (no whitespace / punctuation).
+fn is_simple_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Decide whether a gated bus signal is present under an effective param env.
@@ -4697,6 +4934,15 @@ struct Emitter {
     /// signal is absent (matches `arch build`'s flatten). Missing entry ⇒
     /// fall back to the bus's defaults via `bus_param_env(&bus, None)`.
     bus_param_envs: std::collections::HashMap<String, std::collections::HashMap<String, i64>>,
+    /// DUT-port-level bus param overrides, keyed by DUT port name (== bind
+    /// name == SV signal prefix). Forwarded from `EmitOpts::dut_bus_port_overrides`,
+    /// which is filled by parsing the DUT's `.arch`/`.archi` interface. Layered
+    /// onto the bus defaults + bind-site generic when computing `bus_param_envs`
+    /// for a bind whose name matches a DUT port — the port's own override is
+    /// authoritative for which `generate_if`-gated channels `arch build`
+    /// actually flattened. See `bus_param_env_with_port_override`.
+    dut_bus_port_overrides:
+        std::collections::HashMap<String, std::collections::HashMap<String, i64>>,
     /// Per-bind per-signal name override table populated from
     /// `bind <dut> with { ch.sig: "port" }` clauses. Outer key is
     /// the bind variable name (matching the `sig_prefix` field of
@@ -14885,8 +15131,15 @@ impl Emitter {
                     // `emit_component_handler_registrations_bound`.
                     let prefix = l.name.name.clone();
                     // Effective param env for `generate_if` gate evaluation:
-                    // bus defaults overlaid with bind-site generic overrides.
-                    let env = bus_param_env(&bus, l.ty.as_ref());
+                    // bus defaults overlaid with bind-site generic overrides and
+                    // then the DUT port's own override (authoritative for which
+                    // gated channels `arch build` flattened — bind name == DUT
+                    // port name by convention).
+                    let env = bus_param_env_with_port_override(
+                        &bus,
+                        l.ty.as_ref(),
+                        self.dut_bus_port_overrides.get(&l.name.name),
+                    );
                     self.bus_param_envs.insert(l.name.name.clone(), env);
                     self.bus_bindings
                         .insert(l.name.name.clone(), (bus, buf, prefix.clone()));
@@ -19713,6 +19966,121 @@ end bus B"#,
         );
         let env = bus_param_env(&bus, None); // no UNKNOWN binding
         assert!(gate_passes(gate_for(&bus, "x").as_ref(), &env));
+    }
+
+    // ── DUT-port-level override ingestion (fix/bus-port-override-from-archi) ──
+
+    use super::{
+        bus_param_env_with_port_override, collect_port_overrides_from_src,
+        dut_bus_port_overrides_from_files,
+    };
+
+    /// The realistic case: the DUT module's own port carries the override
+    /// (`port s: target BusAxiG<WRITE=0>`, as recorded in its `.arch`/`.archi`),
+    /// and the harc TB does NOT restate it at the bind site. The override must
+    /// be ingested from the interface line and drop the WRITE-gated channel from
+    /// the modeled port set, agreeing with `arch build`'s flatten.
+    #[test]
+    fn dut_port_override_from_archi_drops_gated_channel_no_tb_generic() {
+        let bus = bus_of(GATED_BUS);
+        // `.archi` interface line shape emitted by arch#567.
+        let archi = "module RwTarget\n  port clk: in Clock<SysDomain>;\n  port s: target BusAxiG<WRITE=0>;\nend module RwTarget\n";
+        let mut overrides = std::collections::HashMap::new();
+        collect_port_overrides_from_src(archi, &mut overrides);
+        // Override keyed by DUT port name `s`.
+        let s_ov = overrides.get("s").expect("port s override ingested");
+        assert_eq!(s_ov.get("WRITE"), Some(&0));
+
+        // No harc-TB bind-site generic (bind_ty = None) — the DUT port override
+        // is the ONLY non-default layer.
+        let env = bus_param_env_with_port_override(&bus, None, Some(s_ov));
+        assert_eq!(env.get("WRITE"), Some(&0));
+        // WRITE=0 ⇒ AW channel gated OFF (absent), matching `arch build`.
+        assert!(!gate_passes(gate_for(&bus, "aw_valid").as_ref(), &env));
+        // READ still defaults to 1 ⇒ AR/R channel present.
+        assert!(gate_passes(gate_for(&bus, "ar_valid").as_ref(), &env));
+        assert!(gate_passes(gate_for(&bus, "r_valid").as_ref(), &env));
+        // Ungated signal unaffected.
+        assert!(gate_passes(gate_for(&bus, "hready").as_ref(), &env));
+    }
+
+    /// Precedence: when the DUT port override AND a harc-TB bind-site generic
+    /// name the same param, the DUT port's override wins (it reflects what
+    /// `arch build` actually synthesized).
+    #[test]
+    fn dut_port_override_wins_over_tb_bind_generic() {
+        let bus = bus_of(GATED_BUS);
+        // TB restates WRITE=1, but the DUT port was built WRITE=0.
+        let tb_ty = bind_ty("BusAxiG#(WRITE=1)");
+        let mut ov = std::collections::HashMap::new();
+        ov.insert("WRITE".to_string(), 0i64);
+        let env = bus_param_env_with_port_override(&bus, Some(&tb_ty), Some(&ov));
+        assert_eq!(env.get("WRITE"), Some(&0));
+        assert!(!gate_passes(gate_for(&bus, "aw_valid").as_ref(), &env));
+    }
+
+    /// `Vec<BusName<P=v>, N>` array-of-bus port form (arch#567) ingests the
+    /// element bus's override.
+    #[test]
+    fn vec_of_bus_port_override_is_ingested() {
+        let archi = "module M\n  port outs: initiator Vec<BusAxiG<READ=0>, 4>;\nend module M\n";
+        let mut overrides = std::collections::HashMap::new();
+        collect_port_overrides_from_src(archi, &mut overrides);
+        let ov = overrides.get("outs").expect("vec-of-bus override ingested");
+        assert_eq!(ov.get("READ"), Some(&0));
+    }
+
+    /// A port with no override contributes nothing (no spurious entry).
+    #[test]
+    fn plain_bus_port_contributes_no_override() {
+        let archi = "module M\n  port s: target BusAxiG;\n  port busy: out Bool;\nend module M\n";
+        let mut overrides = std::collections::HashMap::new();
+        collect_port_overrides_from_src(archi, &mut overrides);
+        assert!(overrides.is_empty());
+    }
+
+    /// A `.arch` source on disk (no sibling `.archi`) is scanned directly — the
+    /// source port decl carries the identical override line.
+    #[test]
+    fn override_read_from_arch_source_on_disk() {
+        let dir =
+            std::env::temp_dir().join(format!("harc_archi_override_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let arch = dir.join("RwTarget.arch");
+        std::fs::write(
+            &arch,
+            "module RwTarget\n  port clk: in Clock<SysDomain>;\n  port s: target BusAxiG<WRITE=0>;\nend module RwTarget\n",
+        )
+        .unwrap();
+        let overrides = dut_bus_port_overrides_from_files(&[arch.clone()]);
+        assert_eq!(overrides.get("s").and_then(|m| m.get("WRITE")), Some(&0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `.archi` sibling is preferred over the `.arch` source when both exist.
+    #[test]
+    fn archi_sibling_preferred_over_arch_source() {
+        let dir = std::env::temp_dir().join(format!("harc_archi_pref_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let arch = dir.join("M.arch");
+        // .arch says WRITE=1; .archi (authoritative, post-elaboration) says WRITE=0.
+        std::fs::write(
+            &arch,
+            "module M\n  port s: target BusAxiG<WRITE=1>;\nend module M\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("M.archi"),
+            "module M\n  port s: target BusAxiG<WRITE=0>;\nend module M\n",
+        )
+        .unwrap();
+        let overrides = dut_bus_port_overrides_from_files(&[arch]);
+        assert_eq!(
+            overrides.get("s").and_then(|m| m.get("WRITE")),
+            Some(&0),
+            "the .archi sibling override should win"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

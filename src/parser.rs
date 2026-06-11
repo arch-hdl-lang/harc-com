@@ -29,6 +29,21 @@ pub fn parse_expr_fragment(source: &str) -> Result<Expr, CompileError> {
     p.parse_expr()
 }
 
+/// Parse a standalone type-expression fragment (e.g. `BusAxi4<WRITE=0>` or
+/// `Vec<BusRw<READ=1>, 4>`). Used to ingest the bus-port override carried on a
+/// DUT module's port declaration in its `.arch`/`.archi` interface, reusing the
+/// real type-expr grammar rather than scraping the `<...>` substring by hand.
+pub fn parse_type_expr_fragment(source: &str) -> Result<TypeExpr, CompileError> {
+    let tokens = crate::lexer::tokenize(source).map_err(|spans| {
+        let span = spans.first().copied().unwrap_or(Span::new(0, 0));
+        CompileError::LexerError {
+            span: crate::diagnostics::span_to_source_span(span),
+        }
+    })?;
+    let mut p = Parser::new(tokens, source);
+    p.parse_type_expr()
+}
+
 pub fn parse_source(source: &str) -> Result<SourceFile, CompileError> {
     let tokens = crate::lexer::tokenize(source).map_err(|spans| {
         let span = spans.first().copied().unwrap_or(Span::new(0, 0));
