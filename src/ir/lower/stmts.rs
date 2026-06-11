@@ -106,6 +106,24 @@ impl FuncBuilder<'_> {
             StmtKind::Assume(_) => Err(unsupported("`assume`", "")),
             StmtKind::Cover(_) => Err(unsupported("`cover`", "")),
             StmtKind::Expr(e) => {
+                // `cov.report()` (post-desugar `_tb.cov.report()`) on a
+                // covergroup-typed testbench field → CovReport.
+                if let ExprKind::Call { callee, args } = &*e.kind {
+                    if let ExprKind::Field { target, name } = &*callee.kind {
+                        if name.name == "report" && args.is_empty() {
+                            if let Some((field, rest)) = self.as_cov_field_path(target) {
+                                if rest.is_empty() {
+                                    let covgroup = self.ctx.cov_fields[&field];
+                                    self.push(Stmt::CovReport(crate::ir::CovgroupInstance {
+                                        tb_field: field,
+                                        covgroup,
+                                    }));
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
                 let what = match &*e.kind {
                     ExprKind::Call { callee, .. } => match &*callee.kind {
                         ExprKind::Ident(id) => format!("helper call `{}(...)`", id.name),

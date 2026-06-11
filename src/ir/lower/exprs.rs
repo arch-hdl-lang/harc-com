@@ -43,6 +43,9 @@ impl FuncBuilder<'_> {
                 if let Some(port) = self.as_port_ref(e)? {
                     return Ok(Expr::Port(port));
                 }
+                if let Some(cov_bin) = self.as_cov_bin(e)? {
+                    return Ok(cov_bin);
+                }
                 Err(unsupported("field access on a non-DUT value", ""))
             }
             ExprKind::Paren(inner) => self.lower_expr(inner),
@@ -174,6 +177,12 @@ impl FuncBuilder<'_> {
                     if Some(root.name.as_str()) == self.ctx.tb_field.as_deref()
                         && !segments.is_empty()
                     {
+                        // Covergroup-field paths (`_tb.cov...`) are not
+                        // ports — `lower_expr` resolves them as
+                        // `Expr::CovBin` via `as_cov_bin`.
+                        if self.ctx.cov_fields.contains_key(segments.last().unwrap()) {
+                            return Ok(None);
+                        }
                         return Err(unsupported(
                             &format!("testbench field access `_tb.{}`", segments.last().unwrap()),
                             "",
@@ -183,6 +192,77 @@ impl FuncBuilder<'_> {
                 }
                 ExprKind::Paren(inner) => cur = inner,
                 _ => return Ok(None),
+            }
+        }
+    }
+
+    /// `Some(Expr::CovBin)` when the expression is a check-phase bin
+    /// read on a covergroup-typed testbench field: `_tb.cov.cp_x.yes`
+    /// (the impl-for desugaring already rewrote `cov.` → `_tb.cov.`).
+    /// Unknown point/bin names are hard errors — v1 would surface them
+    /// as C++ compile failures; the IR rejects them at lowering.
+    pub(crate) fn as_cov_bin(&self, e: &AstExpr) -> Result<Option<Expr>, LowerError> {
+        let Some((field, rest)) = self.as_cov_field_path(e) else {
+            return Ok(None);
+        };
+        let covgroup = self.ctx.cov_fields[&field];
+        let schema = &self.ctx.covgroups[covgroup.index()];
+        let [point, bin] = rest.as_slice() else {
+            return Err(unsupported(
+                &format!(
+                    "covergroup field access `{field}.{}` (expected `{field}.<point>.<bin>`)",
+                    rest.join(".")
+                ),
+                "",
+            ));
+        };
+        let Some(p) = schema.points.iter().find(|p| p.name == *point) else {
+            return Err(LowerError::Invalid(format!(
+                "covergroup `{}` has no coverpoint `{point}`",
+                schema.name
+            )));
+        };
+        if !p.bins.iter().any(|b| b.name == *bin) {
+            return Err(LowerError::Invalid(format!(
+                "coverpoint `{}.{point}` has no bin `{bin}`",
+                schema.name
+            )));
+        }
+        Ok(Some(Expr::CovBin {
+            inst: crate::ir::CovgroupInstance {
+                tb_field: field,
+                covgroup,
+            },
+            point: point.clone(),
+            bin: bin.clone(),
+        }))
+    }
+
+    /// Decompose a dotted path rooted at a covergroup-typed testbench
+    /// field: `_tb.cov.a.b` → `Some(("cov", ["a", "b"]))`.
+    pub(crate) fn as_cov_field_path(&self, e: &AstExpr) -> Option<(String, Vec<String>)> {
+        let tb_field = self.ctx.tb_field.as_deref()?;
+        let mut segments: Vec<String> = Vec::new();
+        let mut cur = e;
+        loop {
+            match &*cur.kind {
+                ExprKind::Field { target, name } => {
+                    segments.push(name.name.clone());
+                    cur = target;
+                }
+                ExprKind::Paren(inner) => cur = inner,
+                ExprKind::Ident(root) => {
+                    if root.name != tb_field {
+                        return None;
+                    }
+                    segments.reverse();
+                    let field = segments.first()?.clone();
+                    if !self.ctx.cov_fields.contains_key(&field) {
+                        return None;
+                    }
+                    return Some((field, segments[1..].to_vec()));
+                }
+                _ => return None,
             }
         }
     }
@@ -223,7 +303,7 @@ fn lower_bin_op(op: BinaryOp) -> Result<BinOp, LowerError> {
 
 /// Parse a plain integer literal (decimal / 0x / 0b / 0o, `_`
 /// separators). Verilog-style sized literals are not lowered.
-fn parse_int_literal(s: &str) -> Option<u64> {
+pub(crate) fn parse_int_literal(s: &str) -> Option<u64> {
     let t = s.replace('_', "");
     if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
         u64::from_str_radix(hex, 16).ok()

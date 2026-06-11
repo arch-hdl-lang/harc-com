@@ -1,0 +1,101 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 SyncFifoTb { dut: TxQueue } cov cov=cg0
+  test SyncFifoTest tb=tb0 run=fn1 check=fn2
+  covgroup cg0 FifoCov @posedge(dut.clk)
+    point cp_empty <- dut.empty: yes={1} no={0}
+    point cp_full <- dut.full: yes={1} no={0}
+
+fn fn0 sample_SyncFifoTest_cov [kind=SamplerAuto(cg0), owner=tb0]
+  entry = b0
+
+  b0:
+    -> Return
+
+fn fn1 run_SyncFifoTest [kind=Run, owner=tb0]
+  locals:
+    %0 i : unknown
+    %1 i_2 : unknown
+    %2 expected : unknown
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.push_valid, 0)
+    DutWrite(dut.pop_ready, 0)
+    DutWrite(dut.push_data, 0)
+    -> WaitCycles(2, b1)
+
+  b1:
+    AssertCheck { cond: (dut.empty == 1), on_fail: "after reset, empty should be 1" }
+    AssertCheck { cond: (dut.full == 0), on_fail: "after reset, full should be 0" }
+    Log(info, "PASS: reset Ã¢Â\u{86}Â\u{92} empty FIFO")
+    DutWrite(dut.rst, 0)
+    Assign(%i, 0)
+    -> Jump(b2)
+
+  b2:
+    -> Branch((%i < 16), b3, b5)
+
+  b3:
+    DutWrite(dut.push_valid, 1)
+    DutWrite(dut.push_data, (%i + 1))
+    DutWrite(dut.pop_ready, 0)
+    AssertCheck { cond: (dut.push_ready == 1), on_fail: "FIFO unexpectedly full at push %lld", %i }
+    -> WaitCycles(1, b6)
+
+  b4:
+    Assign(%i, (%i + 1))
+    -> Jump(b2)
+
+  b5:
+    DutWrite(dut.push_valid, 0)
+    -> WaitCycles(1, b7)
+
+  b6:
+    -> Jump(b4)
+
+  b7:
+    AssertCheck { cond: (dut.full == 1), on_fail: "FIFO should be full after 16 pushes" }
+    AssertCheck { cond: (dut.push_ready == 0), on_fail: "push_ready should be 0 when full" }
+    Log(info, "PASS: FIFO full after 16 pushes")
+    Assign(%i_2, 0)
+    -> Jump(b8)
+
+  b8:
+    -> Branch((%i_2 < 16), b9, b11)
+
+  b9:
+    DutWrite(dut.pop_ready, 1)
+    AssertCheck { cond: (dut.pop_valid == 1), on_fail: "pop_valid unexpectedly low at pop %lld", %i_2 }
+    Assign(%expected, (%i_2 + 1))
+    AssertCheck { cond: (dut.pop_data == %expected), on_fail: "pop %lld: got %lld, expected %lld", %i_2, dut.pop_data, %expected }
+    -> WaitCycles(1, b12)
+
+  b10:
+    Assign(%i_2, (%i_2 + 1))
+    -> Jump(b8)
+
+  b11:
+    DutWrite(dut.pop_ready, 0)
+    -> WaitCycles(1, b13)
+
+  b12:
+    -> Jump(b10)
+
+  b13:
+    AssertCheck { cond: (dut.empty == 1), on_fail: "FIFO should be empty after popping all items" }
+    Log(info, "PASS: 16 items popped in FIFO order, empty after drain")
+    -> Return
+
+fn fn2 check_SyncFifoTest [kind=Check, owner=tb0]
+  entry = b0
+
+  b0:
+    CovReport(cov.cg0)
+    AssertCheck { cond: (CovBin(cov.cg0, cp_empty, yes) > 0), on_fail: "empty=1 coverage hole" }
+    AssertCheck { cond: (CovBin(cov.cg0, cp_full, yes) > 0), on_fail: "full=1  coverage hole" }
+    -> Return

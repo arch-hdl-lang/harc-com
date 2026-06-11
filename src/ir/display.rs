@@ -43,7 +43,23 @@ impl Display for TbProgram {
             writeln!(f)?;
         }
         for (i, cg) in self.covgroups.iter().enumerate() {
-            writeln!(f, "  covgroup cg{} {}", i, cg.name)?;
+            let trig = match cg.trigger {
+                CovTrigger::PosedgeDutClk => "@posedge(dut.clk)",
+            };
+            writeln!(f, "  covgroup cg{} {} {}", i, cg.name, trig)?;
+            for p in &cg.points {
+                write!(f, "    point {} <- {}:", p.name, port_str(&p.target))?;
+                for b in &p.bins {
+                    let vals = b
+                        .values
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    write!(f, " {}={{{vals}}}", b.name)?;
+                }
+                writeln!(f)?;
+            }
         }
         for func in &self.functions {
             writeln!(f)?;

@@ -186,11 +186,8 @@ fn emit_stmt(
             writeln!(out, "{pad}{INDENT}errors++;").ok();
             writeln!(out, "{pad}}}").ok();
         }
-        Stmt::CovReport(_) => {
-            return Err(EmitError(
-                "tbir: CovReport is not emitted yet (lowering should have rejected it)"
-                    .to_string(),
-            ));
+        Stmt::CovReport(inst) => {
+            writeln!(out, "{pad}_tb.{}.report();", inst.tb_field).ok();
         }
     }
     Ok(())

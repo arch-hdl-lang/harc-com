@@ -331,9 +331,10 @@ pub enum PortAccess {
     Force,
 }
 
-/// Covergroup schema handle (MVP placeholder — covergroups are an
-/// unsupported lowering construct today, the schema exists so
-/// `CovgroupId` resolves once they land).
+/// Covergroup schema: one `covergroup` declaration, lowered. Sampling
+/// is schema-driven at emission (per-point bin counters plus the v1
+/// auto-cross matrices); `FunctionKind::SamplerAuto` functions record
+/// the per-testbench-field registration order.
 #[derive(Debug, Clone)]
 pub struct CovgroupSchema {
     pub name: String,
@@ -349,7 +350,11 @@ pub enum CovTrigger {
 #[derive(Debug, Clone)]
 pub struct CoverPointSchema {
     pub name: String,
-    pub target: String,
+    /// Sampled DUT signal (`cover dut.empty` → port `empty`). Lowering
+    /// restricts targets to direct DUT port reads; the design doc's
+    /// free-form `target: String` is structured here so emission never
+    /// re-parses signal names.
+    pub target: PortRef,
     pub bins: Vec<CoverBinSchema>,
 }
 
