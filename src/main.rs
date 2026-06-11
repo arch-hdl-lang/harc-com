@@ -433,6 +433,9 @@ fn main() -> Result<()> {
                         rebuild,
                         record_trace.clone(),
                         wave_opts,
+                        // Plain `--dut`/`--sv` path: the DUT `.arch` inputs are
+                        // the interface source for port-override ingestion.
+                        dut.clone(),
                     )
                 }
             })
@@ -1469,6 +1472,7 @@ fn run_verilator(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_sim(
     files: Vec<PathBuf>,
     dut: Vec<PathBuf>,
@@ -1490,6 +1494,13 @@ fn cmd_sim(
     rebuild: bool,
     record_trace: Option<PathBuf>,
     waves: WaveOpts,
+    // DUT `.arch`/`.archi` interface files used ONLY to ingest port-level bus
+    // param overrides (`port s: target BusRw<WRITE=0>`) for `generate_if`-gate
+    // modeling. Distinct from `dut` (which also selects the ARCH-sim backend):
+    // on the `--check-backends` SV backend run `dut` is empty but the override
+    // still must be applied so both backends model the same flattened port set.
+    // On the plain `--dut` path this equals `dut`.
+    dut_iface: Vec<PathBuf>,
 ) -> Result<()> {
     if dut.is_empty() && sv.is_empty() {
         return Err(miette::miette!(
@@ -1567,9 +1578,17 @@ fn cmd_sim(
     } else {
         std::collections::HashMap::new()
     };
+    // Ingest DUT-port-level bus param overrides from the DUT `.arch`/`.archi`
+    // interface (the authoritative source post arch#567). When a DUT module
+    // declares `port s: target BusRw<WRITE=0>`, `arch build` flattens `s`
+    // without the WRITE-gated channels; folding the override into the bus bind's
+    // effective param env makes harc model the same port set as both backends.
+    let dut_bus_port_overrides =
+        harc::codegen::cpp_tb::dut_bus_port_overrides_from_files(&dut_iface);
     let emit_opts = harc::codegen::cpp_tb::EmitOpts {
         mt,
         vec_lane_widths,
+        dut_bus_port_overrides,
     };
     let mut cpp_paths = Vec::new();
     match cpp_split {
@@ -1903,6 +1922,7 @@ fn cmd_sim_check_backends(
         rebuild,
         Some(arch_trace.clone()),
         waves.clone(),
+        dut.clone(),
     )?;
 
     eprintln!("--check-backends: running Verilator (`--sv`) backend...");
@@ -1927,6 +1947,10 @@ fn cmd_sim_check_backends(
         rebuild,
         Some(sv_trace.clone()),
         waves.clone(),
+        // SV backend run: `dut` is intentionally empty (selects Verilator), but
+        // the DUT `.arch` interface still supplies the port-level override so
+        // BOTH backends model the same flattened bus port set.
+        dut.clone(),
     )?;
 
     eprintln!(
