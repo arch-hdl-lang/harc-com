@@ -1,0 +1,22 @@
+# TB-IR equivalence-fixture registry — consumed by tests/run_tbir_equiv.sh.
+#
+# Each row names a fixture that must produce IDENTICAL semantic traces
+# under BOTH C++ emitters (`harc sim --codegen v1` and `--codegen tbir`).
+#
+# Format (pipe-separated, one row per fixture):
+#
+#     test_name | top | sv_files
+#
+#   test_name  HARC fixture stem — tests/fixtures/<test_name>.harc
+#   top        SV top-module name, passed via --top
+#   sv_files   space-separated DUT files relative to tests/dut/
+#
+# Lines starting with '#' and blank lines are ignored.
+#
+# This file is APPEND-ONLY: each PR that brings a fixture into the TB-IR
+# subset (covergroups, helpers, wait-until, ...) adds its rows here in the
+# same PR. Merge conflicts resolve as the line union of both sides. Do not
+# add rows for constructs your PR does not enable — the harness fails the
+# whole run if any listed fixture does not pass under `--codegen tbir`.
+
+top_counter_test | Top | top_counter.sv

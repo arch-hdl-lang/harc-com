@@ -178,6 +178,17 @@ jobs:
           HARC_CXX: clang++
         run: ./tests/run_negative_fixtures.sh
 
+      - name: v1-vs-tbir codegen equivalence harness
+        # Every registered fixture (tests/tbir_equiv_fixtures.txt) must
+        # produce identical semantic traces under both C++ emitters
+        # (`--codegen v1` and `--codegen tbir`). Lives in this job to
+        # reuse the Verilator install/cache and harc build above.
+        # ARCH_BIN is intentionally NOT set here (no arch checkout in
+        # this job), so the optional --dut sweep self-skips.
+        env:
+          HARC_CXX: clang++
+        run: ./tests/run_tbir_equiv.sh
+
   check-backends:
     # sim<->SV equivalence net: run representative arch-com designs under
     # BOTH backends (ARCH native sim via --dut, Verilator via --sv) with

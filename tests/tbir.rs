@@ -22,6 +22,33 @@ fn lower_src(src: &str) -> Result<ir::TbProgram, lower::LowerError> {
     lower::lower_program(&merged)
 }
 
+/// Multi-file variant for fixtures that split helpers across files
+/// (mirrors how run_fixtures.sh loads them).
+fn lower_fixtures(names: &[&str]) -> Result<ir::TbProgram, lower::LowerError> {
+    let parsed: Vec<_> = names
+        .iter()
+        .map(|n| parse_source(&fixture(n)).unwrap_or_else(|e| panic!("{n} parses: {e:?}")))
+        .collect();
+    let merged = merge::merge_for_sim(&parsed, None).expect("merge");
+    lower::lower_program(&merged)
+}
+
+/// The negative-test contract: every out-of-subset fixture must produce
+/// `LowerError::Unsupported` whose rendered message names the offending
+/// construct and points the user at `--codegen v1`.
+fn assert_unsupported(err: &lower::LowerError) -> String {
+    assert!(
+        matches!(err, lower::LowerError::Unsupported { .. }),
+        "must be LowerError::Unsupported: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("--codegen v1"),
+        "unsupported error must suggest --codegen v1: {msg}"
+    );
+    msg
+}
+
 /// Locks the dump-ir text for the tracer-bullet fixture: testbench /
 /// test schemas, block structure, port hoisting, loop shapes,
 /// interpolated format args.
@@ -37,12 +64,34 @@ fn top_counter_dump_ir_snapshot() {
 #[test]
 fn transactor_fixture_is_unsupported() {
     let err = lower_src(&fixture("axilite_seqdrv_test.harc")).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("--codegen v1"),
-        "unsupported error must suggest --codegen v1: {msg}"
-    );
+    let msg = assert_unsupported(&err);
     insta::assert_snapshot!("axilite_seqdrv_unsupported", msg);
+}
+
+/// Randomize/constraint fixture (`randomize(t) with` + Z3 constraints,
+/// loaded together with its helper file exactly as run_fixtures.sh
+/// does) is outside the MVP subset. Today the item-level scan trips
+/// first on the fixture's `transaction` declaration — when a sibling
+/// PR brings `transaction` into the subset, the snapshot will shift
+/// to name `randomize` instead (statement-level rejection, covered by
+/// `randomize_is_unsupported` below).
+#[test]
+fn randomize_fixture_is_unsupported() {
+    let err = lower_fixtures(&["axilite_constraint_test.harc", "axilite_regs_test.harc"])
+        .unwrap_err();
+    let msg = assert_unsupported(&err);
+    insta::assert_snapshot!("axilite_constraint_unsupported", msg);
+}
+
+/// Agent/event fixture (`agent`, `event<T>`, `wait until ... timeout`)
+/// is outside the MVP subset. The fixture's `transaction` item is the
+/// first rejection today; `wait_until_is_unsupported` below locks the
+/// statement-level `wait until` message independently.
+#[test]
+fn wait_until_quiesce_fixture_is_unsupported() {
+    let err = lower_src(&fixture("wait_until_quiesce_test.harc")).unwrap_err();
+    let msg = assert_unsupported(&err);
+    insta::assert_snapshot!("wait_until_quiesce_unsupported", msg);
 }
 
 #[test]
@@ -252,6 +301,39 @@ fn tbir_emit_scaffolding_contract() {
     ] {
         assert!(cpp.contains(marker), "missing scaffolding marker `{marker}`");
     }
+}
+
+/// The harness's divergence detector (`harc trace-diff` wraps this):
+/// one changed log line between two otherwise identical JSONL traces
+/// must surface as a divergence.
+#[test]
+fn trace_diff_flags_single_log_line_change() {
+    let a = r#"{"type":"meta","seq":0,"dut_backend":"verilator","top":"Top","test":"T","seed":1}
+{"type":"log","seq":1,"cycle":3,"severity":"INFO","message":"PASS: counter counts"}
+{"type":"log","seq":2,"cycle":7,"severity":"INFO","message":"PASS: counter holds"}
+{"type":"sim_end","seq":3,"cycle":9,"errors":0}
+"#;
+    let b = a.replace("PASS: counter holds", "FAIL: counter wedged");
+    let divs = harc::check_backends::diff_trace_strings(a, &b).expect("diff runs");
+    assert_eq!(divs.len(), 1, "exactly the changed line diverges: {divs:?}");
+    assert_eq!(divs[0].event_type, "log");
+    assert_eq!(divs[0].cycle, Some(7));
+    assert!(divs[0].arch_line.contains("counter holds"), "{divs:?}");
+    assert!(divs[0].sv_line.contains("counter wedged"), "{divs:?}");
+}
+
+/// Backend-implementation noise (`seq` numbering) must NOT count as
+/// divergence: traces identical modulo `seq` compare clean.
+#[test]
+fn trace_diff_ignores_seq_field() {
+    let a = r#"{"type":"log","seq":1,"cycle":3,"severity":"INFO","message":"PASS: counter counts"}
+{"type":"sim_end","seq":2,"cycle":9,"errors":0}
+"#;
+    let b = r#"{"type":"log","seq":41,"cycle":3,"severity":"INFO","message":"PASS: counter counts"}
+{"type":"sim_end","seq":42,"cycle":9,"errors":0}
+"#;
+    let divs = harc::check_backends::diff_trace_strings(a, b).expect("diff runs");
+    assert!(divs.is_empty(), "seq-only differences are noise: {divs:?}");
 }
 
 /// `--mt` is rejected by the tbir emitter (also rejected upstream by
