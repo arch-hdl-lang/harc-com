@@ -71,4 +71,10 @@ copy tests/buf_mgr/next_ptr_mem.sv     next_ptr_mem.sv
 copy tests/buf_mgr/free_list_bank.sv   free_list_bank.sv
 copy tests/buf_mgr/setup_counter.sv    setup_counter.sv
 
+# ARCH-native DUT sources for the `harc sim --dut` path.
+copy examples/top_counter.arch         top_counter.arch
+copy examples/sync_fifo.arch           sync_fifo.arch
+copy examples/rom_lut.arch             rom_lut.arch
+copy examples/bus_arbiter.arch         bus_arbiter.arch
+
 echo "Done."

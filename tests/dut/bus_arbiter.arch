@@ -1,0 +1,25 @@
+//! ---
+//! tags: [arbiter, round_robin, basic, tutorial, handshake_channel]
+//! ---
+//!
+//! Built-in round-robin arbiter — minimal example showing the
+//! `policy round_robin` shorthand and the `handshake_channel` sub-construct
+//! in an arbiter port list. The handshake_channel form collapses the
+//! valid/ready pair into a single declaration; the desugared SV is
+//! byte-identical to the older hand-rolled `ports[N] request { valid:
+//! in Bool; ready: out Bool; }` shape.
+
+/// 4-requester round-robin bus arbiter.
+///
+/// Picks among `NUM_REQ` requesters with a rotating priority pointer so
+/// each requester gets fair bandwidth on the shared bus.
+arbiter BusArbiter
+  policy round_robin;
+  param NUM_REQ: const = 4;
+  port clk: in Clock<SysDomain>;
+  port rst: in Reset<Sync>;
+  handshake_channel request[NUM_REQ]: receive kind: valid_ready
+  end handshake_channel request
+  port grant_valid: out Bool;
+  port grant_requester: out UInt<2>;
+end arbiter BusArbiter

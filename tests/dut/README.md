@@ -30,6 +30,10 @@ These SystemVerilog files are snapshots of the corresponding modules in [`arch-h
 | `TlmPairingArchInitiator.sv` | `tests/dut/TlmPairingArchInitiator.arch` via `arch build`; blocking and tagged-OOO TLM initiator conformance |
 | `TlmPairingArchBurstTarget.sv` | `tests/dut/TlmPairingArchBurstTarget.arch` via `arch build`; bounded Vec+len+resp TLM target responder conformance |
 | `TlmPairingArchBurstInitiator.sv` | `tests/dut/TlmPairingArchBurstInitiator.arch` via `arch build`; bounded Vec+len+resp TLM initiator conformance |
+| `top_counter.arch` | `arch-com/examples/top_counter.arch` — ARCH-native DUT for `harc sim --dut` |
+| `sync_fifo.arch` | `arch-com/examples/sync_fifo.arch` — ARCH-native DUT for `harc sim --dut` |
+| `rom_lut.arch` | `arch-com/examples/rom_lut.arch` — ARCH-native DUT for `harc sim --dut` |
+| `bus_arbiter.arch` | `arch-com/examples/bus_arbiter.arch` — ARCH-native DUT for `harc sim --dut` |
 
 ## Refreshing
 
