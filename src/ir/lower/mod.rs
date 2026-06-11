@@ -14,6 +14,7 @@
 mod control;
 mod covergroups;
 mod exprs;
+mod helpers;
 mod stmts;
 
 use crate::ast::{
@@ -121,12 +122,16 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             covgroups.push(schema);
         }
     }
+    // Helper functions: categorize pure vs impure, reject recursion.
+    // Pure helpers lower eagerly below; impure helpers are CFG-inlined
+    // at each call site during body lowering.
+    let helper_registry = helpers::HelperRegistry::build(&file)?;
 
     // File-level construct gate: anything outside the MVP subset is an
     // explicit Unsupported, never silently dropped.
     for it in &file.items {
         match it {
-            Item::Use(_) | Item::Domain(_) | Item::Test(_) | Item::Covergroup(_) => {}
+            Item::Use(_) | Item::Domain(_) | Item::Test(_) | Item::Covergroup(_) | Item::Function(_) => {}
             // `extend` was already folded by merge_for_sim; a survivor
             // means the merge didn't apply (e.g. dump-ir on a lone
             // extension file).
@@ -160,9 +165,32 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         ..TbProgram::default()
     };
 
+    // Eagerly lower pure helpers (declaration order) so call sites can
+    // stay `Expr::Call` and backends emit them as plain C++ functions.
+    let helper_ctx = LowerCtx {
+        dut_field: "dut".to_string(),
+        tb_field: None,
+        cov_fields: HashMap::new(),
+        covgroups: Vec::new(),
+    };
+    for it in &file.items {
+        let Item::Function(fd) = it else { continue };
+        let Some(entry) = helper_registry.get(&fd.name.name) else {
+            continue;
+        };
+        // On duplicate names the registry keeps the last declaration;
+        // only lower that one (single definition per name downstream).
+        if !entry.pure || !std::ptr::eq(entry.decl, fd) {
+            continue;
+        }
+        let id = FunctionId(prog.functions.len() as u32);
+        let f = helpers::lower_pure_helper(id, fd, &helper_registry, &helper_ctx)?;
+        prog.functions.push(f);
+    }
+
     for it in &file.items {
         let Item::Test(t) = it else { continue };
-        lower_test(t, &tb_of_test, &components, &domains, &covgroup_ids, &mut prog)?;
+        lower_test(t, &tb_of_test, &components, &domains, &covgroup_ids, &helper_registry, &mut prog)?;
     }
 
     if prog.tests.is_empty() {
@@ -260,6 +288,7 @@ fn lower_test(
     components: &HashMap<String, &ComponentDecl>,
     domains: &HashMap<String, i64>,
     covgroup_ids: &HashMap<String, CovgroupId>,
+    helpers: &helpers::HelperRegistry<'_>,
     prog: &mut TbProgram,
 ) -> Result<(), LowerError> {
     if !t.params.is_empty() {
@@ -459,6 +488,7 @@ fn lower_test(
             }],
             entry: BlockId(0),
             owner: Some(tb_id),
+            ret: None,
         });
     }
 
@@ -470,6 +500,7 @@ fn lower_test(
         Some(tb_id),
         &run_stmts,
         &ctx,
+        helpers,
     )?;
     prog.functions.push(run_fn);
 
@@ -484,6 +515,7 @@ fn lower_test(
             Some(tb_id),
             &check_stmts,
             &ctx,
+            helpers,
         )?;
         prog.functions.push(check_fn);
         Some(check_id)
@@ -567,6 +599,25 @@ pub(crate) struct LoopFrame {
     pub break_to: BlockId,
 }
 
+/// One in-flight helper inline (innermost last). While a frame is
+/// active, name lookup is fenced to scopes opened inside the frame
+/// (helpers are free functions — they do not capture caller locals),
+/// `break`/`continue` cannot bind to caller loops, and `return e`
+/// becomes `Assign(ret_dest, e); Jump(ret_cont)`.
+pub(crate) struct InlineFrame {
+    /// Helper name, for recursion detection.
+    pub(crate) name: String,
+    /// Param names bound to the caller's DUT — `as_port_ref` resolves
+    /// `<alias>.<port>` exactly like `dut.<port>`.
+    pub(crate) dut_aliases: HashSet<String>,
+    pub(crate) ret_dest: LocalId,
+    pub(crate) ret_cont: BlockId,
+    /// `scopes.len()` at frame entry — lookup floor.
+    pub(crate) scope_floor: usize,
+    /// `loop_stack.len()` at frame entry — break/continue floor.
+    pub(crate) loop_floor: usize,
+}
+
 struct BlockInProgress {
     stmts: Vec<ir::Stmt>,
     term: Option<Terminator>,
@@ -574,6 +625,7 @@ struct BlockInProgress {
 
 pub(crate) struct FuncBuilder<'a> {
     pub(crate) ctx: &'a LowerCtx,
+    pub(crate) helpers: &'a helpers::HelperRegistry<'a>,
     locals: Vec<TypedLocal>,
     local_names: HashSet<String>,
     scopes: Vec<HashMap<String, LocalId>>,
@@ -581,29 +633,26 @@ pub(crate) struct FuncBuilder<'a> {
     current: usize,
     pub(crate) loop_stack: Vec<LoopFrame>,
     temp_counter: u32,
+    pub(crate) inline_frames: Vec<InlineFrame>,
+    /// Return slot when lowering a standalone pure-helper body.
+    pub(crate) helper_ret: Option<LocalId>,
+    /// True while lowering `${...}` captures of a log/fail message —
+    /// impure helper calls cannot inline there (messages evaluate
+    /// lazily at the failure site).
+    pub(crate) in_fmt_args: bool,
 }
 
-fn lower_function(
+#[allow(clippy::too_many_arguments)]
+fn lower_function<'a>(
     id: FunctionId,
     name: String,
     kind: FunctionKind,
     owner: Option<TestbenchId>,
     stmts: &[&AstStmt],
-    ctx: &LowerCtx,
+    ctx: &'a LowerCtx,
+    helpers: &'a helpers::HelperRegistry<'a>,
 ) -> Result<TbFunction, LowerError> {
-    let mut b = FuncBuilder {
-        ctx,
-        locals: Vec::new(),
-        local_names: HashSet::new(),
-        scopes: vec![HashMap::new()],
-        blocks: vec![BlockInProgress {
-            stmts: Vec::new(),
-            term: None,
-        }],
-        current: 0,
-        loop_stack: Vec::new(),
-        temp_counter: 0,
-    };
+    let mut b = FuncBuilder::new(ctx, helpers);
     for s in stmts {
         b.lower_stmt(s)?;
     }
@@ -611,6 +660,28 @@ fn lower_function(
         b.terminate(Terminator::Return);
     }
     b.finish(id, name, kind, owner)
+}
+
+impl<'a> FuncBuilder<'a> {
+    pub(crate) fn new(ctx: &'a LowerCtx, helpers: &'a helpers::HelperRegistry<'a>) -> Self {
+        FuncBuilder {
+            ctx,
+            helpers,
+            locals: Vec::new(),
+            local_names: HashSet::new(),
+            scopes: vec![HashMap::new()],
+            blocks: vec![BlockInProgress {
+                stmts: Vec::new(),
+                term: None,
+            }],
+            current: 0,
+            loop_stack: Vec::new(),
+            temp_counter: 0,
+            inline_frames: Vec::new(),
+            helper_ret: None,
+            in_fmt_args: false,
+        }
+    }
 }
 
 impl FuncBuilder<'_> {
@@ -661,6 +732,23 @@ impl FuncBuilder<'_> {
         self.scopes.pop();
     }
 
+    pub(crate) fn scope_depth(&self) -> usize {
+        self.scopes.len()
+    }
+
+    /// True when `name` refers to the caller's DUT in the current
+    /// context: the test-scope DUT field itself (helpers see it the
+    /// way v1's `[&]`-capturing lambdas do), or — inside an inline
+    /// frame — a helper parameter bound to the DUT at the call site.
+    pub(crate) fn is_dut_name(&self, name: &str) -> bool {
+        if let Some(f) = self.inline_frames.last() {
+            if f.dut_aliases.contains(name) {
+                return true;
+            }
+        }
+        name == self.ctx.dut_field
+    }
+
     /// Declare a new local for a source name. Shadowed / reused names
     /// get a deduplicated stored name so backends can emit them as
     /// identifiers directly.
@@ -704,13 +792,25 @@ impl FuncBuilder<'_> {
         id
     }
 
+    /// Name resolution, fenced at the innermost inline frame: helpers
+    /// are free functions, so an inlined body must not see the caller's
+    /// locals — only scopes opened inside the frame (its params and its
+    /// own `let`s) resolve.
     pub(crate) fn lookup(&self, name: &str) -> Option<LocalId> {
-        for scope in self.scopes.iter().rev() {
+        let floor = self
+            .inline_frames
+            .last()
+            .map_or(0, |f| f.scope_floor.min(self.scopes.len()));
+        for scope in self.scopes[floor..].iter().rev() {
             if let Some(id) = scope.get(name) {
                 return Some(*id);
             }
         }
         None
+    }
+
+    pub(crate) fn set_local_type(&mut self, l: LocalId, ty: IrType) {
+        self.locals[l.index()].ty = ty;
     }
 
     /// Seal all blocks, prune the ones unreachable from the entry
@@ -763,6 +863,7 @@ impl FuncBuilder<'_> {
             blocks: kept,
             entry: BlockId(0),
             owner,
+            ret: self.helper_ret,
         })
     }
 }

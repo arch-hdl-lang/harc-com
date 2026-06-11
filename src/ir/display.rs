@@ -88,6 +88,9 @@ impl Display for TbFunction {
                 writeln!(f, "    %{i} {} : {}", l.name, type_str(&l.ty))?;
             }
         }
+        if let Some(r) = self.ret {
+            writeln!(f, "  ret = %{}", self.local(r).name)?;
+        }
         writeln!(f, "  entry = b{}", self.entry.0)?;
         for (i, b) in self.blocks.iter().enumerate() {
             writeln!(f)?;

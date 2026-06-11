@@ -20,7 +20,7 @@
 //! to the same `co_await harc_rt::wait_cycles(_slot, ...)` suspension
 //! v1 uses — identical scheduler interaction, identical cycle timing.
 
-use super::expr::{escape_c, expr_cpp, fmt_arg_cpp, port_lvalue, port_read};
+use super::expr::{escape_c, expr_cpp, fmt_arg_cpp, helper_cpp_name, port_lvalue, port_read};
 use crate::codegen::cpp_tb::EmitError;
 use crate::ir::{FileLogLevel, FmtArgs, LogLevel, PredSrc, Stmt, TbFunction, Terminator};
 use std::fmt::Write as _;
@@ -160,6 +160,104 @@ pub(super) fn emit_function(
     writeln!(out, "{pad2}}}").ok();
     writeln!(out, "{pad1}}}").ok();
     writeln!(out, "{pad}}}").ok();
+    Ok(())
+}
+
+/// Forward declaration for a lowered pure helper, so source-order
+/// emission supports helper-to-helper calls in any order.
+pub(super) fn emit_helper_prototype(out: &mut String, func: &TbFunction) {
+    let names = cpp_local_names(func);
+    let ret_ty = if func.ret.is_some() { "uint64_t" } else { "void" };
+    let params = names[..func.params.len()]
+        .iter()
+        .map(|n| format!("uint64_t {n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(out, "static {ret_ty} {}({params});", helper_cpp_name(&func.name)).ok();
+}
+
+/// Emit one `FunctionKind::Helper` function (a lowered *pure* helper)
+/// as a file-scope C++ function. Pure helpers contain only scalar
+/// computation — no DUT access, no logging, no suspension — so the
+/// loop-switch body is restricted to `Assign` statements and
+/// `Jump`/`Branch`/`Return` terminators; anything else is a lowering
+/// bug surfaced as an `EmitError`.
+///
+/// Signature convention: the first `params.len()` locals ARE the
+/// parameters (TB-IR convention), so they emit as parameters and are
+/// not re-declared in the body. Everything is `uint64_t`, matching the
+/// loop-switch local model.
+pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Result<(), EmitError> {
+    let names = cpp_local_names(func);
+    let nparams = func.params.len();
+
+    let ret_ty = if func.ret.is_some() { "uint64_t" } else { "void" };
+    let params = names[..nparams]
+        .iter()
+        .map(|n| format!("uint64_t {n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(out, "static {ret_ty} {}({params}) {{", helper_cpp_name(&func.name)).ok();
+    for n in &names[nparams..] {
+        writeln!(out, "{INDENT}uint64_t {n} = 0; (void){n};").ok();
+    }
+    writeln!(out, "{INDENT}int __bb = {};", func.entry.0).ok();
+    writeln!(out, "{INDENT}while (true) {{").ok();
+    writeln!(out, "{INDENT}{INDENT}switch (__bb) {{").ok();
+    let pad2 = INDENT.repeat(2);
+    let pad3 = INDENT.repeat(3);
+    for (bi, block) in func.blocks.iter().enumerate() {
+        writeln!(out, "{pad2}case {bi}: {{").ok();
+        for s in &block.stmts {
+            match s {
+                Stmt::Assign(l, e) => {
+                    let name = &names[l.index()];
+                    let e = expr_cpp(func, &names, e)?;
+                    writeln!(out, "{pad3}{name} = {e};").ok();
+                }
+                other => {
+                    return Err(EmitError(format!(
+                        "tbir: pure helper `{}` contains a non-Assign statement ({other:?}) — \
+                         categorization bug",
+                        func.name
+                    )));
+                }
+            }
+        }
+        match &block.terminator {
+            Terminator::Jump(b) => {
+                writeln!(out, "{pad3}__bb = {};", b.0).ok();
+            }
+            Terminator::Branch(c, t, f) => {
+                let cond = expr_cpp(func, &names, c)?;
+                writeln!(out, "{pad3}if ({cond}) {{ __bb = {}; }} else {{ __bb = {}; }}", t.0, f.0)
+                    .ok();
+            }
+            Terminator::Return => match func.ret {
+                Some(r) => {
+                    writeln!(out, "{pad3}return {};", names[r.index()]).ok();
+                }
+                None => {
+                    writeln!(out, "{pad3}return;").ok();
+                }
+            },
+            other => {
+                return Err(EmitError(format!(
+                    "tbir: pure helper `{}` contains terminator {other:?} — categorization bug",
+                    func.name
+                )));
+            }
+        }
+        writeln!(out, "{pad3}break;").ok();
+        writeln!(out, "{pad2}}}").ok();
+    }
+    match func.ret {
+        Some(_) => writeln!(out, "{pad2}default: return 0;").ok(),
+        None => writeln!(out, "{pad2}default: return;").ok(),
+    };
+    writeln!(out, "{INDENT}{INDENT}}}").ok();
+    writeln!(out, "{INDENT}}}").ok();
+    writeln!(out, "}}").ok();
     Ok(())
 }
 

@@ -28,7 +28,7 @@ impl FuncBuilder<'_> {
                 if let Some(local) = self.lookup(&id.name) {
                     return Ok(Expr::Local(local));
                 }
-                if id.name == self.ctx.dut_field {
+                if self.is_dut_name(&id.name) {
                     return Err(unsupported(
                         "a bare DUT reference",
                         "DUT access must name a port (`dut.<port>`)",
@@ -65,9 +65,14 @@ impl FuncBuilder<'_> {
                 Ok(Expr::Binary(ir_op, Box::new(l), Box::new(r)))
             }
             ExprKind::Ternary { .. } => Err(unsupported("ternary expressions", "")),
-            ExprKind::Call { callee, .. } => {
+            ExprKind::Call { callee, args } => {
                 let what = match &*callee.kind {
-                    ExprKind::Ident(id) => format!("helper call `{}(...)`", id.name),
+                    ExprKind::Ident(id) => {
+                        if self.helpers.contains(&id.name) {
+                            return self.lower_helper_call(&id.name, args);
+                        }
+                        format!("helper call `{}(...)`", id.name)
+                    }
                     ExprKind::Field { name, .. } => {
                         format!("transactor/method call `.{}(...)`", name.name)
                     }
@@ -115,7 +120,7 @@ impl FuncBuilder<'_> {
         Ok(self.hoist_ports(ir))
     }
 
-    fn hoist_ports(&mut self, e: Expr) -> Expr {
+    pub(crate) fn hoist_ports(&mut self, e: Expr) -> Expr {
         match e {
             Expr::Port(p) => {
                 let t = self.fresh_temp();
@@ -152,7 +157,10 @@ impl FuncBuilder<'_> {
                     cur = target;
                 }
                 ExprKind::Ident(root) => {
-                    if root.name == self.ctx.dut_field {
+                    // The DUT field itself, or — inside an inlined
+                    // helper — a parameter bound to the DUT. Either way
+                    // the `PortRef` is rooted at the caller's DUT field.
+                    if self.is_dut_name(&root.name) {
                         if segments.is_empty() {
                             return Ok(None);
                         }

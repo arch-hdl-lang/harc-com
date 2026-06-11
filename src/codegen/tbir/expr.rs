@@ -1,8 +1,15 @@
 //! TB-IR expression → C++ text.
 
 use crate::codegen::cpp_tb::EmitError;
-use crate::ir::{BinOp, Expr, FmtArg, PortRef, TbFunction, UnOp};
+use crate::ir::{BinOp, CallTarget, Expr, FmtArg, PortRef, TbFunction, UnOp};
 use std::fmt::Write as _;
+
+/// C++ symbol for a lowered pure-helper function. Prefixed so a HARC
+/// helper name can never collide with scaffolding identifiers or C++
+/// keywords.
+pub(super) fn helper_cpp_name(name: &str) -> String {
+    format!("harc_helper_{name}")
+}
 
 /// C-escape a string for placement inside a C++ string literal.
 pub(super) fn escape_c(s: &str) -> String {
@@ -59,11 +66,22 @@ pub(super) fn expr_cpp(
         Expr::CovBin { inst, point, bin } => {
             format!("_tb.{}.{point}.{bin}", inst.tb_field)
         }
-        Expr::Call(..) => {
-            return Err(EmitError(
-                "tbir: call expressions are not emitted yet (lowering should have rejected them)"
-                    .to_string(),
-            ));
+        Expr::Call(target, args) => {
+            let name = match target {
+                CallTarget::Helper(n) => helper_cpp_name(n),
+                CallTarget::Builtin(_) | CallTarget::TransactorMethod { .. } => {
+                    return Err(EmitError(
+                        "tbir: builtin/transactor calls are not emitted yet (lowering should \
+                         have rejected them)"
+                            .to_string(),
+                    ));
+                }
+            };
+            let mut rendered = Vec::with_capacity(args.len());
+            for a in args {
+                rendered.push(expr_cpp(func, names, a)?);
+            }
+            format!("{name}({})", rendered.join(", "))
         }
     })
 }
