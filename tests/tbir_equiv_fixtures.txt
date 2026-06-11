@@ -20,3 +20,5 @@
 # whole run if any listed fixture does not pass under `--codegen tbir`.
 
 top_counter_test | Top | top_counter.sv
+sync_fifo_test | TxQueue | sync_fifo.sv
+bus_arbiter_test | BusArbiter | bus_arbiter.sv

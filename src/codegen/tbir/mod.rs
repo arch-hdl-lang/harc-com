@@ -11,6 +11,7 @@
 //! Function bodies use a loop-switch over `BlockId` instead of
 //! re-structured control flow; see `func.rs`.
 
+mod covergroup;
 mod expr;
 mod func;
 mod runtime;
@@ -49,11 +50,20 @@ pub fn emit(prog: &TbProgram, opts: &EmitOpts) -> Result<String, EmitError> {
     let mut out = String::new();
     runtime::preamble(&mut out, &dut_type, &test_names);
 
-    // One struct per unique non-synthetic testbench.
+    // Covergroup structs (leaf observables — they never name a TB or
+    // DUT type), then one struct per unique non-synthetic testbench.
+    for cg in &prog.covgroups {
+        covergroup::covgroup_struct(&mut out, cg);
+    }
     let mut seen = HashSet::new();
     for tb in &prog.testbenches {
         if !tb.synthetic && seen.insert(tb.name.clone()) {
-            runtime::tb_struct(&mut out, &tb.name, &dut_type);
+            let cov_fields: Vec<(String, String)> = tb
+                .cov_fields
+                .iter()
+                .map(|(f, cg)| (f.clone(), prog.covgroups[cg.index()].name.clone()))
+                .collect();
+            runtime::tb_struct(&mut out, &tb.name, &dut_type, &cov_fields);
         }
     }
     runtime::context_struct(&mut out, &dut_type);
@@ -85,6 +95,43 @@ fn emit_test(
 
     if !tb.synthetic {
         writeln!(out, "{INDENT}{} _tb;", tb.name).ok();
+    }
+    // Covergroup auto-sampler registration, in testbench-field
+    // declaration order — the same `_checkers` slot v1 uses, so
+    // sampling happens at the identical point in the cycle. Lowering
+    // synthesized one SamplerAuto function per cov field; cross-check
+    // the pairing so a lowering drift fails loudly here.
+    let samplers: Vec<&ir::TbFunction> = prog
+        .functions
+        .iter()
+        .filter(|f| {
+            f.owner == Some(test.testbench)
+                && matches!(f.kind, ir::FunctionKind::SamplerAuto { .. })
+        })
+        .collect();
+    if samplers.len() != tb.cov_fields.len() {
+        return Err(EmitError(format!(
+            "tbir: test `{}` has {} cov field(s) but {} SamplerAuto function(s)",
+            test.name,
+            tb.cov_fields.len(),
+            samplers.len()
+        )));
+    }
+    for ((field, cg), sampler) in tb.cov_fields.iter().zip(&samplers) {
+        let ir::FunctionKind::SamplerAuto { covgroup } = &sampler.kind else {
+            unreachable!("filtered to SamplerAuto above");
+        };
+        if covgroup != cg {
+            return Err(EmitError(format!(
+                "tbir: sampler `{}` is bound to cg{} but field `{field}` expects cg{}",
+                sampler.name, covgroup.0, cg.0
+            )));
+        }
+        covergroup::sampler_registration(
+            out,
+            &prog.covgroups[cg.index()],
+            &format!("_tb.{field}"),
+        );
     }
     writeln!(out, "{INDENT}harc_rt::ThreadSlot _run_slot;").ok();
     writeln!(out, "{INDENT}sched.slots.push_back(&_run_slot);").ok();

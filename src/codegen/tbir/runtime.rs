@@ -72,9 +72,20 @@ static inline uint64_t harc_rng_next() {
 }
 
 /// One testbench struct (only for non-synthetic testbenches).
-pub(super) fn tb_struct(out: &mut String, tb_name: &str, dut_type: &str) {
+/// `cov_fields` are (field name, covergroup struct name) pairs in
+/// declaration order, emitted after the DUT pointer — same member
+/// layout as v1.
+pub(super) fn tb_struct(
+    out: &mut String,
+    tb_name: &str,
+    dut_type: &str,
+    cov_fields: &[(String, String)],
+) {
     writeln!(out, "struct {tb_name} {{").ok();
     writeln!(out, "{INDENT}V{dut_type}* dut = nullptr;").ok();
+    for (field, cg_name) in cov_fields {
+        writeln!(out, "{INDENT}{cg_name} {field};").ok();
+    }
     writeln!(out, "{INDENT}uint64_t _last_in_cycle = 0;").ok();
     writeln!(out, "{INDENT}uint64_t _last_out_cycle = 0;").ok();
     writeln!(out, "}};").ok();

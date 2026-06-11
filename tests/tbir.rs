@@ -336,6 +336,186 @@ fn trace_diff_ignores_seq_field() {
     assert!(divs.is_empty(), "seq-only differences are noise: {divs:?}");
 }
 
+/// Locks the dump-ir text for the covergroup fixture: covgroup schema
+/// (points, bins, trigger), the testbench cov field, the synthesized
+/// SamplerAuto function, and check-phase CovReport / CovBin reads.
+#[test]
+fn sync_fifo_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("sync_fifo_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("sync_fifo_dump_ir", format!("{prog}"));
+}
+
+/// Bin-spec lowering: set literals and bare integer literals flatten
+/// into the schema's finite value sets, in declaration order.
+#[test]
+fn covergroup_bin_specs_lower_to_value_sets() {
+    let src = r#"
+covergroup Cov @(posedge dut.clk)
+    cp_mode : cover dut.mode
+        bins
+            idle = {0}
+            busy = {1, 2, 3}
+            hexy = {0x10, 0b101}
+        end bins
+end covergroup Cov
+
+testbench Tb
+    dut : Top
+    cov : Cov
+end testbench Tb
+
+impl CovTest for Tb
+    run
+        dut.en = 1
+        wait 1 cycle
+    end run
+    check
+        cov.report()
+        assert cov.cp_mode.idle > 0 else fail("idle hole")
+    end check
+end impl CovTest
+"#;
+    let prog = lower_src(src).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    assert_eq!(prog.covgroups.len(), 1);
+    let cg = &prog.covgroups[0];
+    assert_eq!(cg.name, "Cov");
+    assert_eq!(cg.points.len(), 1);
+    let p = &cg.points[0];
+    assert_eq!(p.name, "cp_mode");
+    assert_eq!(p.target.port_path, vec!["mode".to_string()]);
+    let bins: Vec<(&str, &[u64])> = p
+        .bins
+        .iter()
+        .map(|b| (b.name.as_str(), b.values.as_slice()))
+        .collect();
+    assert_eq!(
+        bins,
+        vec![
+            ("idle", &[0][..]),
+            ("busy", &[1, 2, 3][..]),
+            ("hexy", &[0x10, 0b101][..]),
+        ]
+    );
+    // Testbench schema records the cov field; lowering synthesized one
+    // SamplerAuto bound to the same covgroup.
+    let tb = prog.testbench(prog.tests[0].testbench);
+    assert_eq!(tb.cov_fields, vec![("cov".to_string(), ir::CovgroupId(0))]);
+    let samplers: Vec<_> = prog
+        .functions
+        .iter()
+        .filter(|f| matches!(f.kind, ir::FunctionKind::SamplerAuto { .. }))
+        .collect();
+    assert_eq!(samplers.len(), 1);
+}
+
+/// Range bin specs (`[a..b]`) are outside the subset — reject, never
+/// silently mis-lower. The axilite_cov fixture carries one (plus a
+/// declared cross); the range bin in `cp_addr` trips first.
+#[test]
+fn covergroup_range_bins_unsupported() {
+    let err = lower_src(&fixture("axilite_cov_test.harc")).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("range"), "names range specs: {msg}");
+}
+
+/// Declared `cross` items are outside the subset.
+#[test]
+fn covergroup_cross_unsupported() {
+    let src = r#"
+covergroup Cov @(posedge dut.clk)
+    cp_a : cover dut.a
+        bins
+            on = {1}
+        end bins
+    cp_b : cover dut.b
+        bins
+            on = {1}
+        end bins
+    cross cp_a, cp_b
+end covergroup Cov
+
+testbench Tb
+    dut : Top
+    cov : Cov
+end testbench Tb
+
+impl CovTest for Tb
+    run
+        wait 1 cycle
+    end run
+end impl CovTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("cross"), "names cross bins: {msg}");
+}
+
+/// A check-phase read of an unknown point or bin is a hard lowering
+/// error (v1 deferred this to a C++ compile failure).
+#[test]
+fn covergroup_unknown_bin_read_is_invalid() {
+    let src = r#"
+covergroup Cov @(posedge dut.clk)
+    cp_mode : cover dut.mode
+        bins
+            idle = {0}
+        end bins
+end covergroup Cov
+
+testbench Tb
+    dut : Top
+    cov : Cov
+end testbench Tb
+
+impl CovTest for Tb
+    run
+        wait 1 cycle
+    end run
+    check
+        assert cov.cp_mode.nope > 0 else fail("hole")
+    end check
+end impl CovTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)),
+        "unknown bin is Invalid, not Unsupported: {err:?}"
+    );
+    assert!(msg.contains("nope"), "names the bin: {msg}");
+}
+
+/// tbir emission carries the covergroup contract markers: the struct
+/// with bin counters and auto-cross matrix, report() print calls, the
+/// `_checkers` sampler registration, and the check-phase report/bin
+/// reads — all shapes that must match v1's runtime-observable output.
+#[test]
+fn tbir_emit_covergroup_contract() {
+    let prog = lower_src(&fixture("sync_fifo_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let cpp = tbir::emit(&prog, &cpp_tb::EmitOpts::default()).expect("emits");
+    for marker in [
+        "struct FifoCov {",
+        "uint64_t yes = 0;",
+        "} cp_empty;",
+        "uint64_t _auto_cross_cp_empty__cp_full[2][2] = {};",
+        "harc_rt::log::harc_print_covergroup_summary(\"FifoCov\", _hit, _total);",
+        "harc_rt::log::harc_print_covergroup_bin(\"cp_full\", \"no\", cp_full.no);",
+        "harc_rt::log::harc_print_covergroup_cross_summary(\"FifoCov\", \"auto_cross\", \"cp_empty x cp_full\", _cross_hit, 4);",
+        "FifoCov cov;",
+        "_checkers.push_back([&]() {",
+        "uint64_t _v = (uint64_t)(harc_rt::harc_read(dut->empty));",
+        "if (((_v == 1))) { _tb.cov.cp_empty.yes++; _cg_hit_cp_empty[0] = true; }",
+        "if (_cg_hit_cp_empty[_i] && _cg_hit_cp_full[_j]) _tb.cov._auto_cross_cp_empty__cp_full[_i][_j]++;",
+        "_tb.cov.report();",
+        "if (!((_tb.cov.cp_empty.yes > 0))) {",
+    ] {
+        assert!(cpp.contains(marker), "missing covergroup marker `{marker}`");
+    }
+}
+
 /// `--mt` is rejected by the tbir emitter (also rejected upstream by
 /// the CLI; this locks the library-level contract).
 #[test]

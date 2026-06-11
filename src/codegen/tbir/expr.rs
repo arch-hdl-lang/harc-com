@@ -53,10 +53,11 @@ pub(super) fn expr_cpp(
             let a = expr_cpp(func, names, a)?;
             format!("{}({a})", un_op_cpp(*op))
         }
-        Expr::CovBin { .. } => {
-            return Err(EmitError(
-                "tbir: coverage-bin expressions are not emitted yet".to_string(),
-            ));
+        // Check-phase bin counter read — the covergroup instance lives
+        // in the `_tb` struct (cov fields exist only on non-synthetic
+        // testbenches, so `_tb` is always in scope here).
+        Expr::CovBin { inst, point, bin } => {
+            format!("_tb.{}.{point}.{bin}", inst.tb_field)
         }
         Expr::Call(..) => {
             return Err(EmitError(

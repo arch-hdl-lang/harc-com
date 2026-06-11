@@ -10,6 +10,7 @@
 //! direct AST → C++ path for unsupported constructs.
 
 mod control;
+mod covergroups;
 mod exprs;
 mod stmts;
 
@@ -18,8 +19,9 @@ use crate::ast::{
     Stmt as AstStmt, StmtKind, TestDecl, TestItem, TypeExpr,
 };
 use crate::ir::{
-    self, BasicBlock, BlockId, ClockSpec, FunctionId, FunctionKind, IrType, LocalId, TbFunction,
-    TbProgram, TestSchema, TestbenchId, TestbenchSchema, Terminator, TypedLocal, TypedParam,
+    self, BasicBlock, BlockId, ClockSpec, CovgroupId, CovgroupSchema, FunctionId, FunctionKind,
+    IrType, LocalId, TbFunction, TbProgram, TestSchema, TestbenchId, TestbenchSchema, Terminator,
+    TypedLocal, TypedParam,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -105,11 +107,24 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     }
     let used_tbs: HashSet<&String> = tb_of_test.values().collect();
 
+    // Covergroup schemas, in file order. All declarations lower (even
+    // unreferenced ones — v1 emits a struct for each), so unsupported
+    // covergroup features are rejected here rather than dropped.
+    let mut covgroup_ids: HashMap<String, CovgroupId> = HashMap::new();
+    let mut covgroups: Vec<CovgroupSchema> = Vec::new();
+    for it in &file.items {
+        if let Item::Covergroup(g) = it {
+            let schema = covergroups::lower_covergroup(g)?;
+            covgroup_ids.insert(g.name.name.clone(), CovgroupId(covgroups.len() as u32));
+            covgroups.push(schema);
+        }
+    }
+
     // File-level construct gate: anything outside the MVP subset is an
     // explicit Unsupported, never silently dropped.
     for it in &file.items {
         match it {
-            Item::Use(_) | Item::Domain(_) | Item::Test(_) => {}
+            Item::Use(_) | Item::Domain(_) | Item::Test(_) | Item::Covergroup(_) => {}
             // `extend` was already folded by merge_for_sim; a survivor
             // means the merge didn't apply (e.g. dump-ir on a lone
             // extension file).
@@ -121,7 +136,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             }
             Item::Env(c) => {
                 if used_tbs.contains(&c.name.name) {
-                    validate_testbench_component(c, &components)?;
+                    validate_testbench_component(c, &components, &covgroup_ids)?;
                 } else {
                     return Err(unsupported(
                         &format!("env/component `{}`", c.name.name),
@@ -138,11 +153,14 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         }
     }
 
-    let mut prog = TbProgram::default();
+    let mut prog = TbProgram {
+        covgroups,
+        ..TbProgram::default()
+    };
 
     for it in &file.items {
         let Item::Test(t) = it else { continue };
-        lower_test(t, &tb_of_test, &components, &domains, &mut prog)?;
+        lower_test(t, &tb_of_test, &components, &domains, &covgroup_ids, &mut prog)?;
     }
 
     if prog.tests.is_empty() {
@@ -154,17 +172,21 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
 }
 
 /// MVP testbench-component validation: every field must be the DUT
-/// field (a non-HARC type, i.e. a Verilator module type). Covergroup /
-/// scoreboard / transactor fields are post-MVP.
+/// field (a non-HARC type, i.e. a Verilator module type) or a
+/// covergroup instance. Scoreboard / transactor fields are post-MVP.
 fn validate_testbench_component(
     c: &ComponentDecl,
     components: &HashMap<String, &ComponentDecl>,
+    covgroup_ids: &HashMap<String, CovgroupId>,
 ) -> Result<(), LowerError> {
     for ci in &c.items {
         match ci {
             ComponentItem::Field(f) => {
                 if let TypeExpr::Named { name, .. } = &f.ty {
                     let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+                    if covgroup_ids.contains_key(simple) {
+                        continue;
+                    }
                     if components.contains_key(simple) {
                         return Err(unsupported(
                             &format!(
@@ -235,6 +257,7 @@ fn lower_test(
     tb_of_test: &HashMap<String, String>,
     components: &HashMap<String, &ComponentDecl>,
     domains: &HashMap<String, i64>,
+    covgroup_ids: &HashMap<String, CovgroupId>,
     prog: &mut TbProgram,
 ) -> Result<(), LowerError> {
     if !t.params.is_empty() {
@@ -343,12 +366,31 @@ fn lower_test(
             )));
         }
     }
+    // Covergroup-typed testbench fields, in declaration order — that
+    // order is the sampler registration order (must match v1).
+    let mut cov_fields: Vec<(String, CovgroupId)> = Vec::new();
+    if let Some(tbn) = &tb_name {
+        if let Some(c) = components.get(tbn) {
+            for ci in &c.items {
+                if let ComponentItem::Field(f) = ci {
+                    if let TypeExpr::Named { name, .. } = &f.ty {
+                        let simple =
+                            name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+                        if let Some(id) = covgroup_ids.get(simple) {
+                            cov_fields.push((f.name.name.clone(), *id));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let tb_id = TestbenchId(prog.testbenches.len() as u32);
     prog.testbenches.push(TestbenchSchema {
         name: tb_schema_name,
         dut_field: "dut".to_string(),
         dut_type,
-        cov_fields: Vec::new(),
+        cov_fields: cov_fields.clone(),
         synthetic,
     });
 
@@ -392,7 +434,31 @@ fn lower_test(
     let ctx = LowerCtx {
         dut_field: "dut".to_string(),
         tb_field: if synthetic { None } else { Some("_tb".to_string()) },
+        cov_fields: cov_fields.iter().cloned().collect(),
+        covgroups: prog.covgroups.clone(),
     };
+
+    // Synthesized auto-sampler functions, one per covergroup field, in
+    // declaration order. Sampling is schema-driven (the bin counters
+    // live in the emitted covergroup struct, outside IR locals), so
+    // the function body is empty — the function records the
+    // registration slot and covgroup binding for backends.
+    for (field, cg) in &cov_fields {
+        let id = FunctionId(prog.functions.len() as u32);
+        prog.functions.push(TbFunction {
+            id,
+            name: format!("sample_{}_{}", t.name.name, field),
+            kind: FunctionKind::SamplerAuto { covgroup: *cg },
+            params: Vec::new(),
+            locals: Vec::new(),
+            blocks: vec![BasicBlock {
+                stmts: Vec::new(),
+                terminator: Terminator::Return,
+            }],
+            entry: BlockId(0),
+            owner: Some(tb_id),
+        });
+    }
 
     let run_id = FunctionId(prog.functions.len() as u32);
     let run_fn = lower_function(
@@ -487,6 +553,11 @@ pub(crate) struct LowerCtx {
     pub dut_field: String,
     /// `Some("_tb")` for impl-form tests (testbench-bound).
     pub tb_field: Option<String>,
+    /// Covergroup-typed testbench fields (`cov` → covgroup id).
+    pub cov_fields: HashMap<String, ir::CovgroupId>,
+    /// Snapshot of the program's covgroup schemas, for point/bin
+    /// validation at `cov.<point>.<bin>` lowering sites.
+    pub covgroups: Vec<CovgroupSchema>,
 }
 
 pub(crate) struct LoopFrame {
