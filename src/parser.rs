@@ -199,6 +199,13 @@ impl Parser {
         self.check(TokenKind::End)
     }
 
+    /// True at `end bus` specifically. Used by `parse_bus` so the body loop
+    /// keeps going past an inner `end generate_if` (which also starts with
+    /// `End`) and stops only at the bus's own terminator.
+    fn check_end_bus(&self) -> bool {
+        self.check(TokenKind::End) && matches!(self.peek2_kind(), Some(TokenKind::Bus))
+    }
+
     /// Match `end <kw>` or `end <kw> <name>` and verify the name matches.
     fn expect_end(&mut self, expected_kw: TokenKind, name: &str) -> Result<Span, CompileError> {
         let end_tok = self.expect(TokenKind::End)?;
@@ -2013,7 +2020,31 @@ impl Parser {
         let mut signals = Vec::new();
         let mut handshakes = Vec::new();
         let mut tlm_methods = Vec::new();
-        while !self.check_end_keyword() {
+        // Stop only at `end bus`; `end generate_if` is consumed inline (see the
+        // generate_if arm below) so the bus body can wrap signal groups in
+        // `generate_if <param> ... end generate_if` blocks (ARCH bus param-gated
+        // channels, e.g. BusAxi4's READ/WRITE-gated AR/AW groups).
+        while !self.check_end_bus() {
+            // `generate_if <cond> ... end generate_if` — param-gated signal
+            // group. HARC's bus model ignores bus params (v0), so every gated
+            // signal is included unconditionally: the header condition and the
+            // matching `end generate_if` are consumed, and the inner signals
+            // fall through to the normal signal arms below. This matches the
+            // way `arch build` flattens BusAxi4 with READ=1/WRITE=1 (both
+            // groups present) — the form every NIC-400 DUT uses.
+            if self.check_ident("generate_if") {
+                self.advance();
+                let _cond = self.parse_expr()?;
+                continue;
+            }
+            // `end generate_if` closing a param-gated group opened above.
+            if self.check(TokenKind::End)
+                && matches!(self.peek2_kind(), Some(TokenKind::Ident(n)) if n == "generate_if")
+            {
+                self.advance(); // End
+                self.advance(); // generate_if
+                continue;
+            }
             // `param NAME: const = default;` — bus-level parameter.
             // Parsed but ignored at the AST level for v0; the stdlib
             // bus types (BusAxiLite, BusApb, BusAxiStream) all ship
@@ -2103,7 +2134,10 @@ impl Parser {
             // Plain signal: `name: in|out Type;`
             let s_name = self.expect_ident()?;
             self.expect(TokenKind::Colon)?;
-            let direction = if self.check_ident("in") {
+            // `in` lexes as the reserved keyword `TokenKind::In`; `out` lexes
+            // as a plain ident. Accept both forms for either direction so bus
+            // signal declarations like `ar_ready: in Bool;` parse correctly.
+            let direction = if self.check(TokenKind::In) || self.check_ident("in") {
                 self.advance();
                 Direction::In
             } else if self.check_ident("out") {
@@ -4815,5 +4849,44 @@ end scoreboard SB"#;
     end randomize
 end tseq Foo"#;
         parse(src).unwrap();
+    }
+
+    // Regression: a `bus` whose signal groups are wrapped in `generate_if`
+    // (ARCH bus param-gated channels, e.g. BusAxi4's READ/WRITE gating) and
+    // whose signals use the `in` keyword for direction. Both forms must parse:
+    // `generate_if <cond> ... end generate_if` is transparent (every gated
+    // signal is included — HARC's bus model is param-agnostic in v0), and
+    // `in` lexes as the reserved keyword token, not a soft ident.
+    #[test]
+    fn bus_generate_if_and_in_keyword() {
+        let src = r#"bus BusGated
+  param ADDR_W: const = 32;
+  param READ: const = 1;
+  generate_if READ
+    ar_valid: out Bool;
+    ar_ready: in  Bool;
+    ar_addr:  out UInt<ADDR_W>;
+    r_valid:  in  Bool;
+    r_ready:  out Bool;
+  end generate_if
+  hready: in Bool;
+end bus BusGated"#;
+        let f = parse(src).unwrap();
+        if let Item::Bus(b) = &f.items[0] {
+            // All five gated signals plus the trailing ungated one are present.
+            let names: Vec<&str> = b.signals.iter().map(|s| s.name.name.as_str()).collect();
+            assert_eq!(
+                names,
+                vec!["ar_valid", "ar_ready", "ar_addr", "r_valid", "r_ready", "hready"],
+                "generate_if body signals must be flattened in declaration order"
+            );
+            // `in` keyword parsed as Direction::In.
+            let ar_ready = b.signals.iter().find(|s| s.name.name == "ar_ready").unwrap();
+            assert!(matches!(ar_ready.direction, Direction::In));
+            let ar_valid = b.signals.iter().find(|s| s.name.name == "ar_valid").unwrap();
+            assert!(matches!(ar_valid.direction, Direction::Out));
+        } else {
+            panic!("expected Item::Bus, got {:?}", f.items[0]);
+        }
     }
 }
