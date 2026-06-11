@@ -22,7 +22,7 @@
 
 use super::expr::{escape_c, expr_cpp, fmt_arg_cpp, port_lvalue, port_read};
 use crate::codegen::cpp_tb::EmitError;
-use crate::ir::{FileLogLevel, FmtArgs, LogLevel, Stmt, TbFunction, Terminator};
+use crate::ir::{FileLogLevel, FmtArgs, LogLevel, PredSrc, Stmt, TbFunction, Terminator};
 use std::fmt::Write as _;
 
 const INDENT: &str = "    ";
@@ -35,7 +35,7 @@ const RESERVED: &[&str] = &[
     "argv", "now_ps", "clocks_", "target", "harc_rng", "test_sel", "sim_log_line", "sim_logf_line",
     "eval_clocks_until", "_tb", "_fatal", "_trace_time", "_wave_path", "_checkers",
     "_post_eval_services", "_auto_cov_reports", "_run_slot", "_slot", "_harc_trace_dump_next",
-    "_harc_trace_dump_at", "__bb", "__done",
+    "_harc_trace_dump_at", "__bb", "__done", "_wu_budget", "_wu_satisfied",
     // C++ keywords that are plausible HARC identifiers.
     "auto", "bool", "break", "case", "char", "class", "const", "continue", "default", "delete",
     "do", "double", "else", "enum", "false", "float", "for", "if", "int", "long", "namespace",
@@ -112,11 +112,45 @@ pub(super) fn emit_function(
                 writeln!(out, "{pad3}errors++; _fatal = true;").ok();
                 writeln!(out, "{pad3}__done = true;").ok();
             }
-            Terminator::WaitUntil { .. } | Terminator::WaitUntilTimeout { .. } => {
-                return Err(EmitError(format!(
-                    "tbir: `wait until` reached codegen in {} — lowering should have rejected it",
-                    func.name
-                )));
+            Terminator::WaitUntil { preds, succ, .. } => {
+                // Mirrors v1's untimed coroutine path: one awaiter,
+                // predicate re-evaluated by the scheduler each cycle.
+                let cond = preds_cpp(func, &names, preds)?;
+                writeln!(
+                    out,
+                    "{pad3}co_await harc_rt::wait_until(_slot, [&]{{ return {cond}; }});"
+                )
+                .ok();
+                writeln!(out, "{pad3}__bb = {};", succ.0).ok();
+            }
+            Terminator::WaitUntilTimeout {
+                preds,
+                cycles,
+                on_fire,
+                on_timeout,
+                ..
+            } => {
+                // Mirrors v1's timed coroutine path: budget evaluated
+                // once, single `wait_until_timeout` awaiter returning
+                // pred-fired (true) vs timed-out (false). v1 bumps
+                // `errors` exactly once per timed-out wait; that bump
+                // rides the timeout edge here so the `on_timeout`
+                // block carries only the diagnostic text (FailDiag).
+                let cond = preds_cpp(func, &names, preds)?;
+                let n = expr_cpp(func, &names, cycles)?;
+                writeln!(out, "{pad3}int64_t _wu_budget = (int64_t)({n});").ok();
+                writeln!(
+                    out,
+                    "{pad3}bool _wu_satisfied = co_await harc_rt::wait_until_timeout(_slot, \
+                     [&]{{ return {cond}; }}, (uint32_t)_wu_budget);"
+                )
+                .ok();
+                writeln!(
+                    out,
+                    "{pad3}if (_wu_satisfied) {{ __bb = {}; }} else {{ errors++; __bb = {}; }}",
+                    on_fire.0, on_timeout.0
+                )
+                .ok();
             }
         }
         writeln!(out, "{pad3}break;").ok();
@@ -189,8 +223,49 @@ fn emit_stmt(
         Stmt::CovReport(inst) => {
             writeln!(out, "{pad}_tb.{}.report();", inst.tb_field).ok();
         }
+        Stmt::FailDiag { guard, args } => match guard {
+            // Per-sub-predicate breakdown: log only if the predicate
+            // is STILL false at timeout (v1's "not yet true:" lines).
+            // No errors++ — the WaitUntilTimeout terminator already
+            // bumped it once on the timeout edge.
+            Some(g) => {
+                let g = expr_cpp(func, names, g)?;
+                writeln!(out, "{pad}if (!({g})) {{").ok();
+                emit_log_call(out, func, names, "FAIL", None, args, depth + 1)?;
+                writeln!(out, "{pad}}}").ok();
+            }
+            None => emit_log_call(out, func, names, "FAIL", None, args, depth)?,
+        },
     }
     Ok(())
+}
+
+/// `&&`-join wait-until sub-predicates the way v1 does: a single
+/// predicate emits bare; multiple (`all of`) emit as a parenthesized
+/// conjunction.
+fn preds_cpp(
+    func: &TbFunction,
+    names: &[String],
+    preds: &[PredSrc],
+) -> Result<String, EmitError> {
+    if preds.is_empty() {
+        return Err(EmitError(format!(
+            "tbir: wait-until terminator with no predicates in {} — lowering bug",
+            func.name
+        )));
+    }
+    if preds.len() == 1 {
+        return expr_cpp(func, names, &preds[0].expr);
+    }
+    let parts = preds
+        .iter()
+        .map(|p| expr_cpp(func, names, &p.expr))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(parts
+        .iter()
+        .map(|p| format!("({p})"))
+        .collect::<Vec<_>>()
+        .join(" && "))
 }
 
 /// `sim_log_line("SEV", "fmt", args...)` or the `sim_logf_line` file

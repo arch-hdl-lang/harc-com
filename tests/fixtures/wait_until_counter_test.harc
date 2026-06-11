@@ -1,0 +1,50 @@
+// `wait until … timeout … fail("…")` against the counter DUT (`Top`
+// from top_counter_test) — the fixture behind the TB-IR backend's
+// wait-until lowering/emission (spec §7.9). Exercises both supported
+// quantifier shapes:
+//
+//   (a) single predicate:  wait until dut.count_out == 8
+//   (b) all-of:            wait until all of dut.count_out >= 12, dut.en == 1
+//
+// Both carry a 100-cycle timeout safety net that must NOT fire in
+// steady state (the counter increments once per cycle, so each wait
+// completes well inside the budget). Uses only the v1-supported
+// surface, so the same file passes under `--codegen v1` and
+// `--codegen tbir`; the equivalence harness trace-diffs the two.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench WaitUntilCounterTb
+    dut : Top
+end testbench WaitUntilCounterTb
+
+impl WaitUntilCounterTest for WaitUntilCounterTb
+    clock clk = SysDomain        // 100 MHz
+
+    run
+        // Reset for 3 cycles, then count.
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        assert dut.count_out == 0
+            else fail("after reset: count_out=${dut.count_out}, expected 0")
+        dut.rst = 0
+        dut.en = 1
+        log(info, "released reset, counting toward 8")
+
+        // (a) Single-predicate wait with a timeout safety net.
+        wait until dut.count_out == 8 timeout 100 cycles fail("count never reached 8")
+        assert dut.count_out == 8
+            else fail("after wait: count_out=${dut.count_out}, expected 8")
+        log(info, "PASS: count reached 8 (count_out=${dut.count_out})")
+
+        // (b) All-of wait: counter past 12 while still enabled.
+        wait until all of dut.count_out >= 12, dut.en == 1
+            timeout 100 cycles fail("quiesce conditions not met")
+        assert dut.count_out >= 12
+            else fail("after all-of wait: count_out=${dut.count_out}, expected >= 12")
+        log(info, "PASS: all-of wait quiesced at count_out=${dut.count_out}")
+    end run
+end impl WaitUntilCounterTest

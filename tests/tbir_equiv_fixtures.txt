@@ -22,3 +22,4 @@
 top_counter_test | Top | top_counter.sv
 sync_fifo_test | TxQueue | sync_fifo.sv
 bus_arbiter_test | BusArbiter | bus_arbiter.sv
+wait_until_counter_test | Top | top_counter.sv

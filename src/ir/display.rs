@@ -137,6 +137,14 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         Stmt::CovReport(inst) => {
             format!("CovReport({}.cg{})", inst.tb_field, inst.covgroup.0)
         }
+        Stmt::FailDiag { guard, args } => match guard {
+            Some(g) => format!(
+                "FailDiag {{ unless: {}, {} }}",
+                expr_str(func, g),
+                fmt_args_str(func, args)
+            ),
+            None => format!("FailDiag {{ {} }}", fmt_args_str(func, args)),
+        },
     }
 }
 

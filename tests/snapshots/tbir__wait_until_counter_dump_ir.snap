@@ -1,0 +1,48 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 WaitUntilCounterTb { dut: Top }
+  test WaitUntilCounterTest tb=tb0 run=fn0 check=- clock=clk@10000ps(SysDomain)
+
+fn fn0 run_WaitUntilCounterTest [kind=Run, owner=tb0]
+  locals:
+    %0 __t0 : unknown
+    %1 __t1 : unknown
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.en, 0)
+    -> WaitCycles(3, b1)
+
+  b1:
+    AssertCheck { cond: (dut.count_out == 0), on_fail: "after reset: count_out=%lld, expected 0", dut.count_out }
+    DutWrite(dut.rst, 0)
+    DutWrite(dut.en, 1)
+    Log(info, "released reset, counting toward 8")
+    Assign(%__t0, 100)
+    -> WaitUntilTimeout { (dut.count_out == 8) [single], cycles: %__t0, fire: b2, timeout: b3 }
+
+  b2:
+    AssertCheck { cond: (dut.count_out == 8), on_fail: "after wait: count_out=%lld, expected 8", dut.count_out }
+    Log(info, "PASS: count reached 8 (count_out=%lld)", dut.count_out)
+    Assign(%__t1, 100)
+    -> WaitUntilTimeout { (dut.count_out >= 12), (dut.en == 1) [all_of], cycles: %__t1, fire: b4, timeout: b5 }
+
+  b3:
+    FailDiag { "count never reached 8" }
+    FailDiag { unless: (dut.count_out == 8), "  not yet true: dut.count_out == 8" }
+    -> Jump(b2)
+
+  b4:
+    AssertCheck { cond: (dut.count_out >= 12), on_fail: "after all-of wait: count_out=%lld, expected >= 12", dut.count_out }
+    Log(info, "PASS: all-of wait quiesced at count_out=%lld", dut.count_out)
+    -> Return
+
+  b5:
+    FailDiag { "quiesce conditions not met" }
+    FailDiag { unless: (dut.count_out >= 12), "  not yet true: dut.count_out >= 12" }
+    FailDiag { unless: (dut.en == 1), "  not yet true: dut.en == 1" }
+    -> Jump(b4)
