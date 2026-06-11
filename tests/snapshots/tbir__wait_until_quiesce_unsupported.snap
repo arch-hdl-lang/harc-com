@@ -1,0 +1,5 @@
+---
+source: tests/tbir.rs
+expression: msg
+---
+TB-IR lowering does not support the `transaction` construct yet; re-run with `--codegen v1`
