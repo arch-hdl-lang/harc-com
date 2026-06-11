@@ -1,7 +1,10 @@
 # Design: TB-IR — typed control-flow IR for HARC testbenches
 
 Status: **Proposed (RFC, not yet implemented).**
-Date logged: 2026-05-20.
+Date logged: 2026-05-20. Revised 2026-06-10: multi-target placement
+amendments — placement tiers + timing-sensitivity classes, transactor
+call edges, port access classes, capability-checked `wait until`
+predicates.
 Companion: [tb-ir-plan.md](tb-ir-plan.md) (delivery plan, motivation),
 [constraint-system-plan.md](constraint-system-plan.md) (typed
 constraint IR).
@@ -18,10 +21,14 @@ HARC's AST and codegen.** It is internal to the compiler — no
 user-visible syntax or semantics change. The IR is consumed by:
 
 - `codegen/cpp_tb.rs` (current C++ backend, after the refactor)
-- `codegen/cuda_tb.rs` (future GPU backend)
+- Future placement-split backends — accelerated simulation and
+  embedded/emulation execution (spec §10 roadmap). These run different
+  parts of the TB at different execution sites, which is why the IR
+  carries placement and timing metadata (see "Multi-target placement
+  model" below).
 - `codegen/sv_stub.rs` (existing SV-probe bind emitter, lifted onto the
   IR)
-- Internal analysis passes (`classify_sync`, `randomize_analysis`,
+- Internal analysis passes (`placement`, `randomize_analysis`,
   `extract_port_set`, …) that produce reports or side-tables
 
 The TB-IR does **not** own:
@@ -55,23 +62,103 @@ The TB-IR does **not** own:
    ┌───▼───┐                     ┌───▼───┐
    │passes │                     │codegen│
    └───────┘                     └───────┘
-   classify_sync                 cpp_tb
-   lower_coroutine               cuda_tb (future)
-   randomize_analysis            sv_stub
+   placement                     cpp_tb
+   lower_coroutine               sv_stub
+   randomize_analysis            (placement-split backends, §10)
    hoist_stimulus
    extract_port_set
 ```
 
 The TB-IR is the only thing codegen consumes. Passes either:
 
-- Produce annotations attached to the IR (`classify_sync` adds a
-  `BlockClass` to every block), or
+- Produce annotations attached to the IR (`placement` adds a
+  placement + timing class to every block), or
 - Mutate the IR (`lower_coroutine` rewrites `TbFunction` into a tagged
   FSM shape), or
 - Produce side-tables (`extract_port_set` returns a `PortSet`;
   `randomize_analysis` returns a `RandomizeBudget` map).
 
 Every mutation must preserve `verify` well-formedness.
+
+## Multi-target placement model
+
+The spec §10 roadmap targets do not all execute the TB in one place.
+A placement-split backend runs different regions of the same test at
+different execution sites, separated by real latency boundaries. The
+IR models this with two orthogonal per-region classifications computed
+by the `placement` pass against a backend-supplied `TargetProfile`.
+
+### Placement tiers
+
+| Tier | Meaning | Examples per backend |
+|---|---|---|
+| 0 — co-located with DUT | runs in lockstep with DUT evaluation; can interact pin-accurately every cycle | host: inline in the eval loop; emulation: generated BFM/monitor hardware; accelerated sim: code in the simulation kernel |
+| 1 — near processor | transaction-level control: sequences, scoreboards, coverage updates, FSM-lowered actors | host: coroutine; emulation: firmware task; accelerated sim: per-instance FSM stepped by the kernel |
+| 2 — host services | constraint solving, log formatting, file I/O, fatal handling | always the workstation; reached via queues / status words / exit codes |
+
+`cpp_tb`'s profile places everything at one site, so the pass is a
+no-op there. Placement-split profiles define which tiers exist, the
+sync cost between them, and which capabilities each tier has (see
+`TargetProfile` below).
+
+### Timing-sensitivity classes
+
+Placement alone is not enough, because targets differ in whether
+Tier 1 runs cycle-locked to the DUT. On a cycle-stepped backend the
+near processor advances in lockstep with DUT cycles; on a free-running
+emulation backend, firmware executes asynchronously and only Tier-0
+hardware sees individual cycles.
+
+Every region therefore also carries a timing class:
+
+- **`CycleExact`** — the region's interaction with the DUT is
+  cycle-precise *by semantic necessity*: pin-level drive/sample
+  patterns where protocol correctness depends on exact cycle
+  relationships (assert for exactly one cycle, sample N cycles after
+  an event, back-to-back handshakes).
+- **`TimingTolerant`** — the region's reads/writes are order-sensitive
+  but not cycle-count-sensitive ("write reg, wait until done bit, read
+  result" works at any sync granularity). Transaction-level sync is
+  legal and preferred for speed.
+- **`Unknown`** — neither proven; treated conservatively per target.
+
+The governing principle: **when transaction-level sync does not change
+the nature of the test, use it — it is the speed path. Per-cycle sync
+is reserved for regions where the TB/DUT interaction requires it to
+work at all.** The classifier defaults conservative (`wait N cycles`
+between raw pin accesses ⇒ `CycleExact` unless proven otherwise), and
+two structural facts do most of the real work:
+
+1. Any interaction routed through a transactor method call is
+   `TimingTolerant` at the call boundary *by construction* — the
+   cycle-exact half lives inside the transactor body, which is the
+   natural Tier-0 candidate.
+2. `wait until <pred>` / scoreboard / coverage regions are
+   `TimingTolerant` unless the predicate or a neighboring access is
+   itself cycle-anchored.
+
+A target whose Tier 1 is not cycle-locked must place `CycleExact`
+regions at Tier 0 or reject them with a capability diagnostic
+("this pin-level sequence needs a generated BFM on this target —
+or restructure through a transactor"). A surface annotation for users
+to assert `TimingTolerant` on a region the classifier can't prove is
+an open question (below) — it is a spec-level addition and is not
+invented here.
+
+### `TargetProfile`
+
+The placement pass takes a declarative profile describing the target:
+which tiers exist, per-tier capabilities (which `PortAccess` classes
+are reachable, whether Tier 1 is cycle-locked, which constraint-solve
+strategies are available), and cross-tier sync costs. The profile
+*schema* is part of this IR contract; concrete profiles are
+backend-owned and live with their backends. `cpp_tb` ships the trivial
+single-site profile.
+
+The pass output is both an annotation table (placement + timing class
+per block) and a diagnostic list: constructs that cannot be placed
+under the profile fail at compile time with an explanation, before any
+emission.
 
 ## Core types
 
@@ -203,8 +290,19 @@ pub enum Expr {
 pub enum CallTarget {
     Helper(Symbol),                         // user-defined helper function
     Builtin(BuiltinFn),                     // crc, log2, etc.
+    TransactorMethod {                      // sequence → transactor call edge
+        transactor: Symbol,
+        method: MethodId,
+    },
 }
 ```
+
+`TransactorMethod` is deliberately a *call edge*, never inlined at the
+IR level (see "Helper calls" below). The sequence→transactor boundary
+is the Tier-1/Tier-0 cut point for placement-split backends: one
+backend lowers it to a direct call, another to a command sent across a
+queue to the transactor's execution site. Pre-inlining would erase the
+seam every split backend needs.
 
 `Expr` deliberately does **not** include `DutRead`, `Randomize`, or
 anything else with a side effect or sync semantics. Those are
@@ -224,6 +322,15 @@ pub struct PortRef {
     pub port_path: Vec<Symbol>,             // ["axil_aw_valid"], or ["bus", "req"]
     pub direction: PortDirection,           // In/Out — set during lower from DUT schema
     pub width: u32,                         // resolved width
+    pub access: PortAccess,                 // how this signal is reachable
+}
+
+pub enum PortAccess {
+    Port,       // architectural top-level port of the DUT
+    Probe,      // DUT-internal signal surfaced via a declared probe
+                // (see probe-signals.md); read-only
+    Force,      // wrapper-visible pin overridden via a declared force
+                // point; write-only
 }
 ```
 
@@ -231,6 +338,14 @@ pub struct PortRef {
 resolves dotted DUT access against the DUT's port list (Verilator
 header for `--sv`, ARCH `.archi` for `--dut`) and produces a typed
 `PortRef`. Codegen never re-parses port names.
+
+`PortAccess` matters to placement: architectural ports are reachable
+from every tier on every target, but probes and forces are *declared
+resources* that a target realizes differently (SV `bind` stubs on the
+host path; generated probe/force hardware on split targets) — and a
+profile may not support them at all tiers. The placement pass
+capability-checks every `DutRead`/`DutWrite` against the profile's
+reachable access classes.
 
 ## Invariants
 
@@ -272,14 +387,22 @@ fail. The list is the spec.
     method, args, .. }`: `bus_handle` has type `bus<...>` and `method`
     is declared on that bus.
 12. Every `PortRef` resolves against its `Testbench`'s DUT schema with
-    matching width and direction.
+    matching width and direction; `Probe` access only in `DutRead`,
+    `Force` access only in `DutWrite`.
+13. Every `WaitUntil` / `WaitUntilTimeout` predicate references only
+    boundary-visible state: `PortRef`s (any access class) and TB
+    locals. No `Call` with side effects, no scoreboard reads. This is
+    what lets a backend evaluate the predicate *at the DUT's execution
+    site* — polled, synthesized into a monitor, or checked in the
+    simulation kernel — instead of round-tripping to the TB processor
+    every cycle.
 
 **Type-level:**
 
-13. `Expr::BinOp` operand types match (after explicit `Cast`).
-14. `Assign(local, expr)`: `expr`'s type matches `local`'s declared
+14. `Expr::BinOp` operand types match (after explicit `Cast`).
+15. `Assign(local, expr)`: `expr`'s type matches `local`'s declared
     type.
-15. `Terminator::Branch(cond, _, _)`: `cond` is `bool`-typed.
+16. `Terminator::Branch(cond, _, _)`: `cond` is `bool`-typed.
 
 Violations are programmer errors (lowering bugs or pass bugs), not user
 errors. User errors are caught earlier by the type checker on the AST.
@@ -390,23 +513,36 @@ pub fn run(prog: &mut TbProgram) -> PassOutput;        // mutating pass
 
 The detailed signatures for the initial pass set:
 
-### `classify_sync` (read-only)
+### `placement` (read-only)
 
 ```rust
-pub enum BlockClass {
-    DeviceOnly,        // no DutRead in stmts, terminator does not suspend
-    DutObserving,      // contains DutRead but does not host-sync
-    HostSyncing,       // log/fatal/randomize-call-that-needs-host
+pub enum PlacementTier {
+    Tier0CoLocated,    // must run in lockstep with DUT evaluation
+    Tier1NearProcessor,// transaction-level control flow
+    Tier2HostService,  // log sink / fatal / host-solved randomize
 }
 
-pub struct ClassificationTable {
-    pub blocks: HashMap<(FunctionId, BlockId), BlockClass>,
+pub enum TimingClass {
+    CycleExact,        // cycle-precise DUT interaction is semantic
+    TimingTolerant,    // order-sensitive but not cycle-count-sensitive
+    Unknown,           // unproven; per-target conservative default
 }
 
-pub fn run(prog: &TbProgram) -> ClassificationTable;
+pub struct PlacementTable {
+    pub blocks: HashMap<(FunctionId, BlockId), (PlacementTier, TimingClass)>,
+    pub diagnostics: Vec<PlacementDiag>,   // capability violations under the profile
+}
+
+pub fn run(prog: &TbProgram, profile: &TargetProfile) -> PlacementTable;
 ```
 
-Walks each block's stmts and terminator once. O(IR size).
+Walks each block's stmts and terminator once against the profile's
+capability model. O(IR size). With `cpp_tb`'s single-site profile the
+tier assignment is trivial and `diagnostics` is always empty; split
+profiles get real placement plus compile-time errors for constructs
+the target cannot execute (e.g., a `CycleExact` region on a target
+whose Tier 1 is not cycle-locked and that has no Tier-0 capability to
+absorb it).
 
 ### `lower_coroutine` (mutating)
 
@@ -424,9 +560,11 @@ into a normalized form where every terminator either:
 - Jumps within the same "state" (block chain with no suspend), or
 - Suspends and lists its resume successor by `BlockId`.
 
-The `state_enum` lets `cuda_tb.rs` emit `switch (tb->state) { case N: ... }`
-directly. `cpp_tb.rs` is free to ignore the metadata and continue
-emitting coroutine `co_await`s.
+The `state_enum` lets a placement-split backend emit
+`switch (tb->state) { case N: ... }` directly — the same tagged-FSM
+artifact serves a per-instance FSM stepped by a simulation kernel and
+a cooperative firmware task scheduler alike. `cpp_tb.rs` is free to
+ignore the metadata and continue emitting coroutine `co_await`s.
 
 ### `randomize_analysis` (read-only)
 
@@ -449,9 +587,12 @@ where `N` is a const) count as bounded; loops with DUT-dependent or
 parameter-dependent bounds are flagged as `Unbounded`.
 
 The constraint runtime uses `StaticallyBounded(n)` to batch-precompute
-`n` solver calls; `Unbounded` falls back to per-call solving. The GPU
-backend uses the same data to decide whether a host sync is required
-on randomize.
+`n` solver calls; `Unbounded` falls back to per-call solving.
+Placement-split backends use the same data to choose a solve strategy
+per call site: pre-solved replay tables uploaded ahead of execution
+for bounded sites, a Tier-2 host sync for unbounded or live-state-
+dependent ones, or a local PRNG path where the profile proves simple
+constraints solvable in place.
 
 ### `hoist_stimulus` (mutating)
 
@@ -465,11 +606,12 @@ pub struct StimulusBuffer {
 pub fn run(prog: &mut TbProgram) -> Vec<StimulusBuffer>;
 ```
 
-Identifies maximal connected subgraphs of `DeviceOnly` blocks that
-write to locals later consumed by `DutWrite`s. Rewrites them to read
-from a synthesized per-iteration stimulus buffer instead of computing
-inline. The buffer is filled at TB-init time (CPU) or uploaded once
-(GPU). Used by the GPU backend; opt-in for CPU.
+Identifies maximal connected subgraphs of pure-stimulus blocks (no
+`DutRead`, no Tier-2 statement) that write to locals later consumed by
+`DutWrite`s. Rewrites them to read from a synthesized per-iteration
+stimulus buffer instead of computing inline. The buffer is filled at
+TB-init time on the host path, or staged to the execution site ahead
+of a run on split targets. Used by split backends; opt-in for cpp_tb.
 
 ### `extract_port_set` (read-only)
 
@@ -534,10 +676,12 @@ fn run_SyncFifoTest [kind=Run, owner=SyncFifoTb]
     -> Return
 ```
 
-Block classifications (`classify_sync`):
-- `b0`: DeviceOnly (no DutRead, terminator WaitCycles is *device-allowed*)
-- `b1`: DutObserving (DutRead present)
-- `b2`: DeviceOnly (empty, Return)
+Placement under a split profile (`placement`):
+- `b0`: Tier 1, `CycleExact` conservatively — raw pin writes followed
+  by a 2-cycle wait; a free-running target must absorb this into Tier 0
+  (reset is a classic BFM duty) or run it through a force point.
+- `b1`: Tier 1, `TimingTolerant` — the read+assert has no cycle anchor.
+- `b2`: Tier 1 (empty, Return).
 
 ### Example 2: randomize in a loop
 
@@ -604,10 +748,15 @@ b_exit:
 `randomize_analysis` on this function returns `StaticallyBounded(4)` —
 loop count is a literal, randomize fires once per iteration.
 
-`classify_sync`:
-- `b_init`, `b_header`, `b_after_rand`, `b_after_write`, `b_exit`: DeviceOnly
-- `b_body`: HostSyncing (Randomize terminator)
-- `b_after_read`: DutObserving (helper-inlined DutRead from axil_read)
+`placement`:
+- `b_init`, `b_header`, `b_after_rand`, `b_after_write`, `b_exit`:
+  Tier 1, `TimingTolerant`
+- `b_body`: Tier 2 (Randomize terminator — solve strategy per
+  `randomize_analysis`: this site is `StaticallyBounded(4)`, so a
+  split backend pre-solves a 4-entry replay table instead of syncing)
+- `b_after_read`: Tier 1, `TimingTolerant` (`axil_write`/`axil_read`
+  are transactor-mediated, so the cycle-exact AXI handshake lives in
+  the transactor body, not here)
 
 ### Example 3: fork over bus methods
 
@@ -662,11 +811,21 @@ A `Call(CallTarget::Helper(sym), args)` in an expression position
 (e.g., `let got = axil_read(dut, addr)`) needs careful handling because
 the helper itself contains `DutRead`/`DutWrite`/sync.
 
-**Rule:** every helper call site is inlined into the caller's CFG at
-lowering time. The helper's `TbFunction` remains in the IR (some
-backends may emit it as a separate emitted function for debug
+**Rule:** every *plain helper* call site is inlined into the caller's
+CFG at lowering time. The helper's `TbFunction` remains in the IR
+(some backends may emit it as a separate emitted function for debug
 readability), but the *control flow* is inlined so the verifier and
 analysis passes see one CFG per `run`.
+
+**Exception — transactor methods are never inlined.** A
+`CallTarget::TransactorMethod` edge stays a call edge in the IR. The
+sequence→transactor boundary is the placement cut every split backend
+relies on: the caller side is Tier-1 transaction-level by
+construction, the transactor body is the Tier-0 candidate, and the
+backend decides whether the edge lowers to a direct call (single-site
+profiles) or a typed command across a queue (split profiles).
+Inlining would fuse the two tiers and force the whole region to the
+stricter timing class.
 
 Inlining substitutes:
 - The helper's `params` for the call site's `args` (typed `LocalId`s).
@@ -691,8 +850,11 @@ worked examples above. The form is:
 - Readable enough for human debugging.
 
 CLI: `harc dump-ir Foo.harc` prints the IR after lowering and verify.
-`harc dump-ir --pass classify_sync Foo.harc` prints the IR plus the
-classification annotations. Used in CI and during local development.
+`harc dump-ir --pass placement Foo.harc` prints the IR plus the
+placement + timing annotations (single-site profile by default; a
+`--profile` flag selects a target profile so users can see capability
+diagnostics without invoking a backend). Used in CI and during local
+development.
 
 ## Open questions
 
@@ -726,10 +888,32 @@ decision before phase 1 lands:
 
 5. **Inlining transactor `hookable` bodies.** Today `cpp_tb.rs` uses
    `field_subs` to substitute hookable method bodies inline at the
-   callsite of `transactor.method()`. The IR equivalent is to keep the
-   `TbFunction` separate and emit a function call — but the scheduler
-   integration may need inlining to preserve fork semantics. Decision
+   callsite of `transactor.method()`. At the IR level the call edge
+   stays (`CallTarget::TransactorMethod` is never inlined — see
+   "Helper calls"); the open part is whether `cpp_tb`'s *emission* of
+   that edge keeps the substitution approach or moves to a real
+   function call, and how hooks compose with fork semantics. Decision
    pending a small experiment on `axi_agent.harc`.
+
+6. **Surface annotation for timing tolerance.** The placement
+   classifier defaults `Unknown` regions to conservative. A user
+   assertion ("this wait is pacing, not protocol") would let split
+   targets run more of a test at transaction-level speed. This is a
+   language-surface change — needs a spec proposal, not an IR
+   decision. Until then, restructuring through a transactor is the
+   supported way to mark a region transaction-level.
+
+7. **Transactor↔BFM binding metadata.** Split backends need to know
+   which generated hardware (or kernel-side block) realizes a given
+   transactor's Tier-0 half, without new surface syntax. Proposed:
+   backend-side binding tables keyed by `(transactor, method)` —
+   the same shape as the existing `bind dut with { ... }` remaps —
+   attached at profile load, not in the IR.
+
+8. **`TargetProfile` schema home.** The schema is referenced by the
+   `placement` pass contract, so its *type* lives with the IR; the
+   serialization format and concrete profiles are backend-owned.
+   Phase-1 ships the type + the trivial `cpp_tb` profile only.
 
 ## Decision log
 
@@ -740,3 +924,18 @@ decision before phase 1 lands:
   independent work. "TB-IR only for randomize" was explored and
   rejected because `Terminator::Randomize` splits a block and forces
   its successors to also be IR, so a half-IR'd function is incoherent.
+- 2026-06-10: Amended for multi-target placement after reconciling the
+  spec §10 roadmap execution targets against the IR shape. Four
+  structural changes: (a) `CallTarget::TransactorMethod` stays a call
+  edge — the sequence→transactor boundary is the placement cut, and
+  per-backend lowering (direct call vs queued command) requires the
+  seam to survive; (b) `WaitUntil` predicates restricted to
+  boundary-visible state so they can evaluate at the DUT's execution
+  site; (c) `classify_sync` generalized to `placement` over a
+  `TargetProfile`, producing tier + timing-class annotations and
+  capability diagnostics; (d) `PortRef` gains access classes
+  (port/probe/force) as capability-checked declared resources.
+  Governing timing principle: transaction-level sync wherever it does
+  not change the nature of the test (speed); per-cycle sync only where
+  the TB/DUT interaction requires it (the classifier defaults
+  conservative, transactor mediation is the structural escape).
