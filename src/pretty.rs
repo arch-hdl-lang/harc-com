@@ -425,14 +425,58 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
         Item::Bus(b) => {
             print_doc(out, &b.doc, depth);
             pad(out, depth);
-            write!(out, "bus {}", b.name.name).ok();
-            if !b.params.is_empty() {
-                print_paren_params(out, &b.params);
-            }
-            writeln!(out).ok();
+            // Bus params use block syntax (`param X: const = N;`), not the
+            // paren form — emit them as body lines so the printed bus
+            // re-parses through `parse_bus`.
+            writeln!(out, "bus {}", b.name.name).ok();
             print_inner_doc(out, &b.inner_doc, depth + 1);
-            for s in &b.signals {
+            for p in &b.params {
                 pad(out, depth + 1);
+                write!(out, "param {}: const", p.name.name).ok();
+                if let Some(d) = &p.default {
+                    write!(out, " = ").ok();
+                    print_expr(out, d);
+                }
+                writeln!(out, ";").ok();
+            }
+            // Group signals by their `generate_if` gate. ARCH bus bodies use
+            // flat (non-nested) gated groups in declaration order, so emit a
+            // `generate_if <cond> ... end generate_if` wrapper whenever the
+            // gate changes from the previous signal. This round-trips the
+            // param-gated channels (e.g. BusAxi4's READ/WRITE groups).
+            let mut open_gate: Option<&Expr> = None;
+            let same_gate = |a: Option<&Expr>, b: Option<&Expr>| -> bool {
+                match (a, b) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => {
+                        let (mut sx, mut sy) = (String::new(), String::new());
+                        print_expr(&mut sx, x);
+                        print_expr(&mut sy, y);
+                        sx == sy
+                    }
+                    _ => false,
+                }
+            };
+            for s in &b.signals {
+                if !same_gate(open_gate, s.gate.as_ref()) {
+                    if open_gate.is_some() {
+                        pad(out, depth + 1);
+                        writeln!(out, "end generate_if").ok();
+                    }
+                    if let Some(g) = s.gate.as_ref() {
+                        pad(out, depth + 1);
+                        write!(out, "generate_if ").ok();
+                        print_expr(out, g);
+                        writeln!(out).ok();
+                    }
+                    open_gate = s.gate.as_ref();
+                }
+                let inner = if s.gate.is_some() {
+                    depth + 2
+                } else {
+                    depth + 1
+                };
+                pad(out, inner);
                 let dir = match s.direction {
                     Direction::In => "in",
                     Direction::Out => "out",
@@ -441,6 +485,10 @@ fn print_item(out: &mut String, item: &Item, depth: usize) {
                 write!(out, "{}: {} ", s.name.name, dir).ok();
                 print_type(out, &s.ty);
                 writeln!(out).ok();
+            }
+            if open_gate.is_some() {
+                pad(out, depth + 1);
+                writeln!(out, "end generate_if").ok();
             }
             for h in &b.handshakes {
                 pad(out, depth + 1);

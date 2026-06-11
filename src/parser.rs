@@ -1670,9 +1670,9 @@ impl Parser {
 
         // Typed duplicate check: with the new variant shape this is a
         // direct phase comparison, no field-of-ScopeDecl inspection.
-        let duplicate = existing_items.iter().any(|it| {
-            matches!(it, ComponentItem::Lifecycle(p, _) if *p == phase)
-        });
+        let duplicate = existing_items
+            .iter()
+            .any(|it| matches!(it, ComponentItem::Lifecycle(p, _) if *p == phase));
         if duplicate {
             return Err(CompileError::general(
                 &format!(
@@ -2017,24 +2017,32 @@ impl Parser {
         let start = self.expect(TokenKind::Bus)?.span;
         let name = self.expect_ident()?;
         let inner_doc = self.consume_inner_doc();
+        let mut params: Vec<Param> = Vec::new();
         let mut signals = Vec::new();
         let mut handshakes = Vec::new();
         let mut tlm_methods = Vec::new();
+        // Condition of the `generate_if` group currently open, if any. ARCH bus
+        // bodies use flat (non-nested) `generate_if <cond> ... end generate_if`
+        // groups, so a single Option suffices; nesting would need a stack. Each
+        // signal declared while this is `Some` records the gate on its
+        // `BusSignal`, and the bind-site param values decide presence later
+        // (see `bus_param_env` / `gate_passes` in cpp_tb). This is how HARC
+        // matches `arch build`'s flatten: a channel gated OFF is absent.
+        let mut current_gate: Option<Expr> = None;
         // Stop only at `end bus`; `end generate_if` is consumed inline (see the
         // generate_if arm below) so the bus body can wrap signal groups in
         // `generate_if <param> ... end generate_if` blocks (ARCH bus param-gated
         // channels, e.g. BusAxi4's READ/WRITE-gated AR/AW groups).
         while !self.check_end_bus() {
             // `generate_if <cond> ... end generate_if` — param-gated signal
-            // group. HARC's bus model ignores bus params (v0), so every gated
-            // signal is included unconditionally: the header condition and the
-            // matching `end generate_if` are consumed, and the inner signals
-            // fall through to the normal signal arms below. This matches the
-            // way `arch build` flattens BusAxi4 with READ=1/WRITE=1 (both
-            // groups present) — the form every NIC-400 DUT uses.
+            // group. The condition is recorded as the gate on every signal
+            // declared inside the group; presence is decided at the bind site
+            // against the bus's effective param values, matching how
+            // `arch build` flattens the channel (gated-OFF ⇒ port omitted).
             if self.check_ident("generate_if") {
                 self.advance();
-                let _cond = self.parse_expr()?;
+                let cond = self.parse_expr()?;
+                current_gate = Some(cond);
                 continue;
             }
             // `end generate_if` closing a param-gated group opened above.
@@ -2043,25 +2051,39 @@ impl Parser {
             {
                 self.advance(); // End
                 self.advance(); // generate_if
+                current_gate = None;
                 continue;
             }
-            // `param NAME: const = default;` — bus-level parameter.
-            // Parsed but ignored at the AST level for v0; the stdlib
-            // bus types (BusAxiLite, BusApb, BusAxiStream) all ship
-            // with these and we want extern-import to succeed.
+            // `param NAME: const = default;` — bus-level parameter. Defaults
+            // are retained (in `params`) so the gate evaluator has a fallback
+            // env when the bind site doesn't override a param. `param … : type`
+            // (type params) carry no const default and are skipped from the env.
             if self.check(TokenKind::Param) {
                 self.advance();
-                self.expect_ident()?; // param name
+                let p_name = self.expect_ident()?;
                 self.expect(TokenKind::Colon)?;
+                let mut is_const = false;
                 if self.check(TokenKind::Const) {
                     self.advance();
+                    is_const = true;
                 } else if self.check(TokenKind::Type) {
                     self.advance();
                 }
+                let mut default = None;
                 if self.check(TokenKind::Eq) {
                     self.advance();
-                    let _default = self.parse_expr()?;
+                    let d = self.parse_expr()?;
+                    if is_const {
+                        default = Some(d);
+                    }
                 }
+                let p_span = p_name.span;
+                params.push(Param {
+                    name: p_name,
+                    ty: None,
+                    default,
+                    span: p_span,
+                });
                 if self.check(TokenKind::Semi) {
                     self.advance();
                 }
@@ -2106,6 +2128,7 @@ impl Parser {
                         name: s_name,
                         direction: Direction::Out, // role flips at lower-time
                         ty,
+                        gate: None,
                         span,
                     });
                 }
@@ -2159,13 +2182,14 @@ impl Parser {
                 name: s_name,
                 direction,
                 ty,
+                gate: current_gate.clone(),
                 span,
             });
         }
         let end = self.expect_end(TokenKind::Bus, &name.name)?;
         Ok(BusDecl {
             name,
-            params: Vec::new(),
+            params,
             signals,
             handshakes,
             tlm_methods,
@@ -4881,12 +4905,76 @@ end bus BusGated"#;
                 "generate_if body signals must be flattened in declaration order"
             );
             // `in` keyword parsed as Direction::In.
-            let ar_ready = b.signals.iter().find(|s| s.name.name == "ar_ready").unwrap();
+            let ar_ready = b
+                .signals
+                .iter()
+                .find(|s| s.name.name == "ar_ready")
+                .unwrap();
             assert!(matches!(ar_ready.direction, Direction::In));
-            let ar_valid = b.signals.iter().find(|s| s.name.name == "ar_valid").unwrap();
+            let ar_valid = b
+                .signals
+                .iter()
+                .find(|s| s.name.name == "ar_valid")
+                .unwrap();
             assert!(matches!(ar_valid.direction, Direction::Out));
+            // Each gated signal records its `generate_if` condition; the
+            // trailing ungated signal records none. Presence is decided later
+            // against the bind's effective params (cpp_tb gate eval).
+            for g in ["ar_valid", "ar_ready", "ar_addr", "r_valid", "r_ready"] {
+                let s = b.signals.iter().find(|s| s.name.name == g).unwrap();
+                assert!(s.gate.is_some(), "gated signal `{g}` must carry its gate");
+            }
+            let hready = b.signals.iter().find(|s| s.name.name == "hready").unwrap();
+            assert!(hready.gate.is_none(), "ungated signal must carry no gate");
+            // Bus params (with defaults) are retained for gate evaluation.
+            let pnames: Vec<&str> = b.params.iter().map(|p| p.name.name.as_str()).collect();
+            assert_eq!(pnames, vec!["ADDR_W", "READ"]);
         } else {
             panic!("expected Item::Bus, got {:?}", f.items[0]);
         }
+    }
+
+    // The pretty-printer must round-trip a param-gated bus: bus params emit as
+    // `param X: const = N;` block lines and gated groups re-emit the
+    // `generate_if <cond> ... end generate_if` wrapper, so re-parsing yields
+    // the same signal/gate/param shape.
+    #[test]
+    fn bus_generate_if_pretty_round_trips() {
+        let src = r#"bus BusGated
+  param READ: const = 1;
+  param WRITE: const = 0;
+  generate_if READ
+    ar_valid: out Bool;
+    ar_ready: in  Bool;
+  end generate_if
+  generate_if WRITE
+    aw_valid: out Bool;
+    aw_ready: in  Bool;
+  end generate_if
+  hready: in Bool;
+end bus BusGated"#;
+        let f = parse(src).unwrap();
+        let printed = crate::pretty::print(&f);
+        let f2 = parse(&printed).unwrap_or_else(|e| {
+            panic!("re-parse of pretty bus failed: {e:?}\n--- printed ---\n{printed}")
+        });
+        let (Item::Bus(b1), Item::Bus(b2)) = (&f.items[0], &f2.items[0]) else {
+            panic!("expected two buses");
+        };
+        let names1: Vec<&str> = b1.signals.iter().map(|s| s.name.name.as_str()).collect();
+        let names2: Vec<&str> = b2.signals.iter().map(|s| s.name.name.as_str()).collect();
+        assert_eq!(names1, names2, "signal order must survive round-trip");
+        // Gate presence/absence survives.
+        for (s1, s2) in b1.signals.iter().zip(b2.signals.iter()) {
+            assert_eq!(
+                s1.gate.is_some(),
+                s2.gate.is_some(),
+                "gate presence for `{}` must survive round-trip",
+                s1.name.name
+            );
+        }
+        let p1: Vec<&str> = b1.params.iter().map(|p| p.name.name.as_str()).collect();
+        let p2: Vec<&str> = b2.params.iter().map(|p| p.name.name.as_str()).collect();
+        assert_eq!(p1, p2, "params must survive round-trip");
     }
 }

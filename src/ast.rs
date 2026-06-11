@@ -899,6 +899,14 @@ pub struct BusSignal {
     pub name: Ident,
     pub direction: Direction,
     pub ty: TypeExpr,
+    /// `generate_if <cond>` gate the signal was declared under, if any.
+    /// `None` for an ungated signal (always present). When `Some(cond)`,
+    /// the signal is present only when `cond` evaluates truthy against the
+    /// bus's effective param values at the bind site — matching how
+    /// `arch build` flattens a param-gated channel (e.g. `BusAxi4`'s
+    /// READ/WRITE-gated AR/AW groups). HARC honors the gate at signal-access
+    /// resolution time (see `bus_param_env` / `gate_passes` in `cpp_tb`).
+    pub gate: Option<Expr>,
     pub span: Span,
 }
 

@@ -141,14 +141,12 @@ fn scan_sv_module_lane_widths(
     let start = lines.iter().position(|l| {
         let t = l.trim_start();
         if let Some(rest) = t.strip_prefix("module ") {
-            rest.trim_start()
-                .strip_prefix(top)
-                .is_some_and(|after| {
-                    after
-                        .chars()
-                        .next()
-                        .is_none_or(|c| !c.is_alphanumeric() && c != '_')
-                })
+            rest.trim_start().strip_prefix(top).is_some_and(|after| {
+                after
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+            })
         } else {
             false
         }
@@ -167,10 +165,17 @@ fn scan_sv_module_lane_widths(
     let mut params: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for l in body {
         let t = l.trim();
-        for kw in ["parameter int ", "parameter ", "localparam int ", "localparam "] {
+        for kw in [
+            "parameter int ",
+            "parameter ",
+            "localparam int ",
+            "localparam ",
+        ] {
             if let Some(rest) = t.strip_prefix(kw) {
                 if let Some(eq) = rest.find('=') {
-                    let name = rest[..eq].trim().trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                    let name = rest[..eq]
+                        .trim()
+                        .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
                     let name = name.split_whitespace().last().unwrap_or(name);
                     let val_str: String = rest[eq + 1..]
                         .trim()
@@ -269,10 +274,7 @@ fn parse_sv_port_lane_width(
 /// Fold an SV packed range `"hi:lo"` (e.g. `"MASTER_ID_W-1:0"`, `"7:0"`)
 /// to its bit width `hi-lo+1`, resolving param names and simple `-1`
 /// offsets against `params`. Returns `None` if it can't fold concretely.
-fn sv_range_width(
-    range: &str,
-    params: &std::collections::HashMap<String, i64>,
-) -> Option<u32> {
+fn sv_range_width(range: &str, params: &std::collections::HashMap<String, i64>) -> Option<u32> {
     let (hi_s, lo_s) = range.split_once(':')?;
     let hi = eval_sv_index_expr(hi_s.trim(), params)?;
     let lo = eval_sv_index_expr(lo_s.trim(), params)?;
@@ -286,10 +288,7 @@ fn sv_range_width(
 /// `<param-or-int> ± <int>` (covers `W-1`, `8`, `MASTER_ID_W`). Returns
 /// `None` for anything more complex (e.g. multiplications) — the port is
 /// then conservatively skipped.
-fn eval_sv_index_expr(
-    e: &str,
-    params: &std::collections::HashMap<String, i64>,
-) -> Option<i64> {
+fn eval_sv_index_expr(e: &str, params: &std::collections::HashMap<String, i64>) -> Option<i64> {
     let e = e.trim();
     if let Ok(v) = e.parse::<i64>() {
         return Some(v);
@@ -961,6 +960,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         tseq_names: tseqs.iter().map(|t| t.name.name.clone()).collect(),
         buses,
         bus_bindings: std::collections::HashMap::new(),
+        bus_param_envs: std::collections::HashMap::new(),
         bus_remap: std::collections::HashMap::new(),
         pending_tlm_forks: Vec::new(),
         next_tlm_fork_tag: std::collections::HashMap::new(),
@@ -1517,6 +1517,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         e.pointer_vars.clear();
         e.pointer_vars.insert("dut".to_string());
         e.bus_bindings.clear();
+        e.bus_param_envs.clear();
         e.bus_remap.clear();
         e.pending_tlm_forks.clear();
         e.next_tlm_fork_tag.clear();
@@ -2038,6 +2039,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                                 e.emit_expr(v);
                                 std::mem::swap(&mut e.out, &mut buf);
                                 let prefix = l.name.name.clone();
+                                // Effective param env for `generate_if` gate
+                                // evaluation: bus defaults overlaid with the
+                                // bind-site generic overrides (`BusAxi4#(READ=0)`).
+                                let env = bus_param_env(&bus_decl, l.ty.as_ref());
+                                e.bus_param_envs.insert(l.name.name.clone(), env);
                                 e.bus_bindings
                                     .insert(l.name.name.clone(), (bus_decl, buf, prefix.clone()));
                                 // Populate the per-bind signal remap so hookable-
@@ -2659,6 +2665,128 @@ fn synth_component_from_transactor(t: &TransactorDecl, include_active: bool) -> 
 fn type_simple_name(t: Option<&TypeExpr>) -> Option<&str> {
     match t? {
         TypeExpr::Named { name, .. } => name.segments.last().map(|s| s.name.as_str()),
+        _ => None,
+    }
+}
+
+/// Compute a bus's effective const-param environment at a bind site.
+///
+/// Starts from the bus declaration's param defaults (`BusDecl::params`) and
+/// applies any named generic overrides from the bind-site type expression
+/// (`BusAxi4#(READ=0, WRITE=1)` → {READ:0, WRITE:1}). This is the env the
+/// `generate_if` gate is evaluated against, so HARC's notion of which gated
+/// signals are present matches `arch build`'s flatten exactly.
+///
+/// Only const-foldable params land in the env (literals / arithmetic over
+/// other params). A param whose value can't be folded is omitted; a gate
+/// referencing it then fails to evaluate and the signal is conservatively
+/// treated as PRESENT (see `gate_passes`) — never silently dropped.
+fn bus_param_env(
+    bus: &BusDecl,
+    bind_ty: Option<&TypeExpr>,
+) -> std::collections::HashMap<String, i64> {
+    let mut env: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    // Defaults first, in declaration order (later params may reference earlier
+    // ones, e.g. `STRB_W = DATA_W/8`).
+    for p in &bus.params {
+        if let Some(d) = &p.default {
+            if let Some(v) = eval_const_i64(d, &env) {
+                env.insert(p.name.name.clone(), v);
+            }
+        }
+    }
+    // Bind-site named overrides win over defaults.
+    if let Some(TypeExpr::Named { generics, .. }) = bind_ty {
+        for g in generics {
+            if let TypeArg::Named { name, value } = g {
+                if let Some(v) = eval_const_i64(value, &env) {
+                    env.insert(name.name.clone(), v);
+                }
+            }
+        }
+    }
+    env
+}
+
+/// Decide whether a gated bus signal is present under an effective param env.
+///
+/// `None` gate ⇒ ungated ⇒ always present. `Some(cond)` ⇒ present iff `cond`
+/// folds to a non-zero value. If the condition can't be folded (references a
+/// param not in the env, or uses an operator the mini-evaluator doesn't
+/// handle), we return `true` (present) — the same conservative default the
+/// pre-fix behavior had, so we never regress a working corpus design into a
+/// missing-port error. The common ARCH forms (`generate_if READ`,
+/// `generate_if WRITE`, `generate_if READ > 0`) all fold.
+fn gate_passes(gate: Option<&Expr>, env: &std::collections::HashMap<String, i64>) -> bool {
+    match gate {
+        None => true,
+        Some(cond) => match eval_const_i64(cond, env) {
+            Some(v) => v != 0,
+            None => true,
+        },
+    }
+}
+
+/// Minimal const-expression evaluator over an i64 param env. Handles the
+/// literal/identifier/paren/unary/binary forms that appear in bus param
+/// defaults and `generate_if` conditions. Returns `None` for anything it
+/// can't fold (unknown ident, unsupported op, division by zero) so callers
+/// fall back to their conservative default.
+fn eval_const_i64(e: &Expr, env: &std::collections::HashMap<String, i64>) -> Option<i64> {
+    match &*e.kind {
+        ExprKind::Paren(inner) => eval_const_i64(inner, env),
+        ExprKind::Ident(id) => env.get(&id.name).copied(),
+        ExprKind::Int(s) => {
+            let stripped = s.replace('_', "");
+            if let Some(rest) = stripped
+                .strip_prefix("0x")
+                .or_else(|| stripped.strip_prefix("0X"))
+            {
+                i64::from_str_radix(rest, 16).ok()
+            } else if let Some(rest) = stripped
+                .strip_prefix("0b")
+                .or_else(|| stripped.strip_prefix("0B"))
+            {
+                i64::from_str_radix(rest, 2).ok()
+            } else {
+                stripped.parse::<i64>().ok()
+            }
+        }
+        ExprKind::Bool(b) => Some(if *b { 1 } else { 0 }),
+        ExprKind::Unary { op, expr } => {
+            let v = eval_const_i64(expr, env)?;
+            match op {
+                UnaryOp::Neg => Some(v.wrapping_neg()),
+                UnaryOp::Not | UnaryOp::NotKw => Some(if v == 0 { 1 } else { 0 }),
+                UnaryOp::BitNot => Some(!v),
+            }
+        }
+        ExprKind::Binary { op, lhs, rhs } => {
+            let a = eval_const_i64(lhs, env)?;
+            let b = eval_const_i64(rhs, env)?;
+            let bool_i = |x: bool| Some(if x { 1 } else { 0 });
+            match op {
+                BinaryOp::Add => Some(a.wrapping_add(b)),
+                BinaryOp::Sub => Some(a.wrapping_sub(b)),
+                BinaryOp::Mul => Some(a.wrapping_mul(b)),
+                BinaryOp::Div => (b != 0).then(|| a / b),
+                BinaryOp::Mod => (b != 0).then(|| a % b),
+                BinaryOp::Shl => Some(a.wrapping_shl(b as u32)),
+                BinaryOp::Shr => Some(a.wrapping_shr(b as u32)),
+                BinaryOp::BitAnd => Some(a & b),
+                BinaryOp::BitOr => Some(a | b),
+                BinaryOp::BitXor => Some(a ^ b),
+                BinaryOp::Eq => bool_i(a == b),
+                BinaryOp::Ne => bool_i(a != b),
+                BinaryOp::Lt => bool_i(a < b),
+                BinaryOp::Le => bool_i(a <= b),
+                BinaryOp::Gt => bool_i(a > b),
+                BinaryOp::Ge => bool_i(a >= b),
+                BinaryOp::AndAnd | BinaryOp::AndKw => bool_i(a != 0 && b != 0),
+                BinaryOp::OrOr | BinaryOp::OrKw => bool_i(a != 0 || b != 0),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -4561,6 +4689,14 @@ struct Emitter {
     /// names. Distinguishing the lookup key from the prefix is what
     /// makes the alias work.
     bus_bindings: std::collections::HashMap<String, (BusDecl, String, String)>,
+    /// Effective const-param environment per bus bind, keyed by the same
+    /// binding name as `bus_bindings`. Computed once at the real bind site
+    /// from the bus's param defaults overlaid with the bind-site generic
+    /// overrides (`BusAxi4#(READ=0)`). Consulted when resolving a bus signal
+    /// access to evaluate the signal's `generate_if` gate — a gated-OFF
+    /// signal is absent (matches `arch build`'s flatten). Missing entry ⇒
+    /// fall back to the bus's defaults via `bus_param_env(&bus, None)`.
+    bus_param_envs: std::collections::HashMap<String, std::collections::HashMap<String, i64>>,
     /// Per-bind per-signal name override table populated from
     /// `bind <dut> with { ch.sig: "port" }` clauses. Outer key is
     /// the bind variable name (matching the `sig_prefix` field of
@@ -8609,11 +8745,40 @@ impl Emitter {
         matches!(name, "trunc" | "zext" | "sext" | "resize")
     }
 
+    /// Is a plain bus signal present (not gated OFF) at this bind site?
+    ///
+    /// Looks up the named signal on the bus; if it carries a `generate_if`
+    /// gate, evaluates it against the bind's effective param env (falling back
+    /// to the bus's param defaults if no explicit env was recorded). Returns
+    /// `false` only when the signal exists but its gate is provably false —
+    /// i.e. `arch build` would have omitted the port. Unknown signal ⇒ `false`
+    /// (let the caller's not-found path fire). Unfoldable gate ⇒ `true`
+    /// (conservative: present, never a silent drop).
+    fn bus_signal_present(&self, binding_key: &str, bus: &BusDecl, sig_name: &str) -> bool {
+        let Some(sig) = bus.signals.iter().find(|s| s.name.name == sig_name) else {
+            return false;
+        };
+        let owned_env;
+        let env = match self.bus_param_envs.get(binding_key) {
+            Some(e) => e,
+            None => {
+                owned_env = bus_param_env(bus, None);
+                &owned_env
+            }
+        };
+        gate_passes(sig.gate.as_ref(), env)
+    }
+
     fn try_emit_bus_field_access(&mut self, target: &Expr, name: &Ident) -> Option<String> {
         // <binding>.<signal>
         if let ExprKind::Ident(id) = &*target.kind {
             if let Some((bus, root, sig_prefix)) = self.bus_bindings.get(&id.name).cloned() {
-                if bus.signals.iter().any(|s| s.name.name == name.name) {
+                // Honor the signal's `generate_if` gate: a signal gated OFF
+                // under this bind's effective params is absent (the DUT built
+                // by `arch build` has no such port), so it falls through to
+                // the not-found error below rather than resolving to a phantom
+                // port — which would silently diverge from the SV backend.
+                if self.bus_signal_present(&id.name, &bus, &name.name) {
                     return Some(format!("{root}->{}_{}", sig_prefix, name.name));
                 }
                 // Already-flattened `<chan>_<sig>` form (or `<chan>_valid`
@@ -8635,10 +8800,22 @@ impl Emitter {
                 if bus.handshakes.iter().any(|h| h.name.name == name.name) {
                     return None;
                 }
-                self.errors.push(format!(
-                    "bus `{}` (binding `{}`) has no signal or channel named `{}`",
-                    bus.name.name, id.name, name.name,
-                ));
+                // Distinguish "gated OFF" from "never declared": a gated-OFF
+                // access is a real TB bug (it drives a channel the DUT was
+                // built without), so name it precisely.
+                if bus.signals.iter().any(|s| s.name.name == name.name) {
+                    self.errors.push(format!(
+                        "bus `{}` (binding `{}`) signal `{}` is gated OFF by its \
+                         `generate_if` condition under the bind's params — `arch build` \
+                         omits this port, so the testbench must not access it",
+                        bus.name.name, id.name, name.name,
+                    ));
+                } else {
+                    self.errors.push(format!(
+                        "bus `{}` (binding `{}`) has no signal or channel named `{}`",
+                        bus.name.name, id.name, name.name,
+                    ));
+                }
                 return Some(format!("/* unresolved: {}.{} */ 0", id.name, name.name));
             }
         }
@@ -14707,6 +14884,10 @@ impl Emitter {
                     // this prefix when registering — see
                     // `emit_component_handler_registrations_bound`.
                     let prefix = l.name.name.clone();
+                    // Effective param env for `generate_if` gate evaluation:
+                    // bus defaults overlaid with bind-site generic overrides.
+                    let env = bus_param_env(&bus, l.ty.as_ref());
+                    self.bus_param_envs.insert(l.name.name.clone(), env);
                     self.bus_bindings
                         .insert(l.name.name.clone(), (bus, buf, prefix.clone()));
                     // Translate the AST's bind_remap entries into a
@@ -15753,7 +15934,11 @@ impl Emitter {
         // deposits the lane (and still array-indexes the ARCH native sim
         // port via `if constexpr`). See `vec_lane_widths_from_sv`.
         if let Some((root, port, w, index)) = self.dut_packed_lane(target) {
-            write!(self.out, "harc_rt::harc_vec_lane_write<{w}>({root}->{port}, (std::size_t)(").ok();
+            write!(
+                self.out,
+                "harc_rt::harc_vec_lane_write<{w}>({root}->{port}, (std::size_t)("
+            )
+            .ok();
             self.emit_expr(index);
             write!(self.out, "), ").ok();
             self.emit_expr(value);
@@ -16266,7 +16451,11 @@ impl Emitter {
                 // non-assignable call.
                 if !lvalue {
                     if let Some((root, port, w, idx)) = self.dut_packed_lane(e) {
-                        write!(self.out, "harc_rt::harc_vec_lane_read<{w}>({root}->{port}, (std::size_t)(").ok();
+                        write!(
+                            self.out,
+                            "harc_rt::harc_vec_lane_read<{w}>({root}->{port}, (std::size_t)("
+                        )
+                        .ok();
                         self.emit_expr(idx);
                         write!(self.out, "))").ok();
                         return;
@@ -19400,6 +19589,131 @@ fn substitute_idents(expr: &Expr, subst: &std::collections::HashMap<String, Expr
         other => other.clone(),
     };
     Expr::new(new_kind, span)
+}
+
+#[cfg(test)]
+mod bus_gate_tests {
+    use super::{bus_param_env, gate_passes};
+    use crate::ast::{Item, TypeExpr};
+    use crate::parser::parse_source;
+
+    fn bus_of(src: &str) -> crate::ast::BusDecl {
+        let f = parse_source(src).expect("parse");
+        match f.items.into_iter().next().expect("one item") {
+            Item::Bus(b) => b,
+            other => panic!("expected bus, got {other:?}"),
+        }
+    }
+
+    fn bind_ty(src: &str) -> TypeExpr {
+        // Parse a component field `x : <Type>` so the generic args land in a
+        // TypeExpr::Named we can hand to bus_param_env (mirrors the bind-site
+        // type the real codegen reads off a `let`/field). `testbench` parses to
+        // Item::Env (a ComponentDecl); its fields are ComponentItem::Field.
+        let full = format!("testbench Tb\n  x : {src}\nend testbench Tb");
+        let f = parse_source(&full).expect("parse tb");
+        for it in &f.items {
+            if let Item::Env(c) = it {
+                for ci in &c.items {
+                    if let crate::ast::ComponentItem::Field(fd) = ci {
+                        return fd.ty.clone();
+                    }
+                }
+            }
+        }
+        panic!("no field type found");
+    }
+
+    const GATED_BUS: &str = r#"bus BusAxiG
+  param ADDR_W: const = 32;
+  param READ: const = 1;
+  param WRITE: const = 1;
+  generate_if READ
+    ar_valid: out Bool;
+    r_valid:  in  Bool;
+  end generate_if
+  generate_if WRITE
+    aw_valid: out Bool;
+  end generate_if
+  hready: in Bool;
+end bus BusAxiG"#;
+
+    fn gate_for(bus: &crate::ast::BusDecl, sig: &str) -> Option<crate::ast::Expr> {
+        bus.signals
+            .iter()
+            .find(|s| s.name.name == sig)
+            .and_then(|s| s.gate.clone())
+    }
+
+    #[test]
+    fn defaults_keep_both_channels_present() {
+        let bus = bus_of(GATED_BUS);
+        let env = bus_param_env(&bus, None);
+        assert_eq!(env.get("READ"), Some(&1));
+        assert_eq!(env.get("WRITE"), Some(&1));
+        // With READ=WRITE=1 defaults, every gated signal is present.
+        assert!(gate_passes(gate_for(&bus, "ar_valid").as_ref(), &env));
+        assert!(gate_passes(gate_for(&bus, "aw_valid").as_ref(), &env));
+        // Ungated signal is always present.
+        assert!(gate_passes(gate_for(&bus, "hready").as_ref(), &env));
+    }
+
+    #[test]
+    fn read_zero_override_drops_read_channel() {
+        let bus = bus_of(GATED_BUS);
+        let ty = bind_ty("BusAxiG#(READ=0)");
+        let env = bus_param_env(&bus, Some(&ty));
+        assert_eq!(env.get("READ"), Some(&0));
+        // READ=0 ⇒ the AR/R channel is gated OFF (absent), matching arch build.
+        assert!(!gate_passes(gate_for(&bus, "ar_valid").as_ref(), &env));
+        assert!(!gate_passes(gate_for(&bus, "r_valid").as_ref(), &env));
+        // WRITE still defaults to 1 ⇒ AW channel present.
+        assert!(gate_passes(gate_for(&bus, "aw_valid").as_ref(), &env));
+        // Ungated signal unaffected.
+        assert!(gate_passes(gate_for(&bus, "hready").as_ref(), &env));
+    }
+
+    #[test]
+    fn write_zero_override_drops_write_channel() {
+        let bus = bus_of(GATED_BUS);
+        let ty = bind_ty("BusAxiG#(WRITE=0)");
+        let env = bus_param_env(&bus, Some(&ty));
+        assert!(!gate_passes(gate_for(&bus, "aw_valid").as_ref(), &env));
+        assert!(gate_passes(gate_for(&bus, "ar_valid").as_ref(), &env));
+    }
+
+    #[test]
+    fn default_off_param_drops_channel_with_no_override() {
+        // A bus whose default gates a channel OFF must model it absent even
+        // without any bind-site override.
+        let bus = bus_of(
+            r#"bus B
+  param EN: const = 0;
+  generate_if EN
+    x: out Bool;
+  end generate_if
+  y: in Bool;
+end bus B"#,
+        );
+        let env = bus_param_env(&bus, None);
+        assert!(!gate_passes(gate_for(&bus, "x").as_ref(), &env));
+        assert!(gate_passes(gate_for(&bus, "y").as_ref(), &env));
+    }
+
+    #[test]
+    fn unfoldable_gate_is_conservatively_present() {
+        // A gate referencing an unknown param can't fold; we keep the signal
+        // present rather than silently dropping it.
+        let bus = bus_of(
+            r#"bus B
+  generate_if UNKNOWN
+    x: out Bool;
+  end generate_if
+end bus B"#,
+        );
+        let env = bus_param_env(&bus, None); // no UNKNOWN binding
+        assert!(gate_passes(gate_for(&bus, "x").as_ref(), &env));
+    }
 }
 
 #[cfg(test)]
