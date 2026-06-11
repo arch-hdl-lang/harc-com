@@ -146,14 +146,14 @@ that entirely.
 
 - **`DutRead` is its own `Stmt`, not an expression.** Most important
   shape decision in the IR. It makes "this block depends on a DUT
-  observation" a *syntactic* property — `classify_sync` is one walk over
+  observation" a *syntactic* property — `placement` is one walk over
   `stmts`. Treating DUT reads as expressions would force every codegen
   and every pass to bottom-out into expression traversal to find them.
 
 - **`Randomize` is a terminator, not a `Stmt`.** It's a potential
-  host-sync point on the GPU backend; placing it in the terminator slot
-  forces every backend to make an explicit decision about it instead
-  of having it slip through inside a block.
+  host-sync point on any placement-split backend; placing it in the
+  terminator slot forces every backend to make an explicit decision
+  about it instead of having it slip through inside a block.
 
 - **Locals interned in `IndexVec<LocalId, _>`.** Lets transformation
   passes rewrite locals without touching every `Expr`. Names live in the
@@ -176,16 +176,17 @@ src/
     lower.rs                     # AST → IR
     verify.rs                    # well-formedness checks
     passes/
-      classify_sync.rs           # annotate blocks: DeviceOnly / DutObserving / HostSyncing
-      lower_coroutine.rs         # CFG → tagged FSM (GPU backend's input)
+      placement.rs               # placement tier + timing class per block,
+                                 # capability-checked against a TargetProfile
+      lower_coroutine.rs         # CFG → tagged FSM (split backends' input)
       randomize_analysis.rs      # statically-bounded vs unbounded randomize counts
       hoist_stimulus.rs          # pure-stimulus subgraphs → upload buffers
       extract_port_set.rs        # DUT ports the TB reads/writes (sparse trace)
   codegen/
     cpp_tb.rs                    # IR → C++ (existing monolith, shrinks)
-    cuda_tb.rs                   # IR → CUDA (new, lands after refactor)
     sv_stub.rs                   # IR → SV bind stubs (existing, refactor to IR)
     merge.rs                     # unchanged
+    (placement-split backends consume the same IR; spec §10 roadmap)
 ```
 
 Each pass is independently testable and ~100-300 lines. Today every
@@ -284,10 +285,10 @@ discipline that makes the second backend cheap.
 
 | Pass | Purpose | Consumed by |
 |---|---|---|
-| `classify_sync` | Tag each block `DeviceOnly` / `DutObserving` / `HostSyncing`. One walk over stmts + terminators. | `cuda_tb` partitioning, future schedulers |
-| `lower_coroutine` | CFG → tagged FSM. Adds explicit state IDs to each block, computes transition table. | `cuda_tb` directly; `cpp_tb` continues to use the CFG as coroutine source. |
-| `randomize_analysis` | For each `Terminator::Randomize`, prove static upper bound on call count per `run`. If unbounded, mark for host-sync. | `cuda_tb` batch-precompute decision; reports to user. |
-| `hoist_stimulus` | Identify connected subgraphs containing only `DeviceOnly` blocks; group as upload buffers. | `cuda_tb` stimulus pre-staging. |
+| `placement` | Tag each block with a placement tier (co-located / near-processor / host-service) + timing class (cycle-exact / timing-tolerant), capability-checked against a `TargetProfile`. One walk over stmts + terminators. | placement-split backends; `harc dump-ir --pass placement` diagnostics |
+| `lower_coroutine` | CFG → tagged FSM. Adds explicit state IDs to each block, computes transition table. | split backends directly; `cpp_tb` continues to use the CFG as coroutine source. |
+| `randomize_analysis` | For each `Terminator::Randomize`, prove static upper bound on call count per `run`. If unbounded, mark for host-sync. | split backends' solve-strategy selection (replay table vs host sync); reports to user. |
+| `hoist_stimulus` | Identify pure-stimulus connected subgraphs; group as upload buffers. | split backends' stimulus pre-staging. |
 | `extract_port_set` | DUT ports actually read/written. | sparse trace declarations; SV-probe `bind` stub generation. |
 | `verify` | Well-formedness: entry reachable, terminator successors valid, locals SSA-ish in scope, etc. | Runs on every IR mutation in debug builds. |
 
@@ -308,8 +309,8 @@ the load-bearing safety net.
 | 4 — IR → C++ behind `--codegen-v2` | not started | New module reads IR, emits C++. Must produce **byte-identical** `.cpp` to current `cpp_tb.rs` for all 56 fixtures. CI job diffs `--codegen-v2` vs default. |
 | 5 — Flip default to v2 | not started | After two release cycles of clean parity CI. Keep v1 reachable via `--codegen-v1` as escape hatch. |
 | 6 — Delete v1 emission | not started | After one release cycle of v2-as-default with no escapes. |
-| 7 — Passes land | parallel to 4-6 | `classify_sync`, `randomize_analysis`, `extract_port_set`. These are net-new functionality and don't need parity gates; gate on their own unit tests. |
-| 8 — `codegen/cuda_tb.rs` consuming IR | unblocked after 5 | The GPU backend. Out of scope for this plan; covered in `gpu-cosim-plan.md` (TBD). |
+| 7 — Passes land | parallel to 4-6 | `placement`, `randomize_analysis`, `extract_port_set`. These are net-new functionality and don't need parity gates; gate on their own unit tests. |
+| 8 — Placement-split backends consuming IR | unblocked after 5 | The spec §10 roadmap execution targets. Out of scope for this plan; each backend carries its own plan + `TargetProfile`. |
 
 Phase 4 is the long pole. Every fixture is a potential parity bug, and
 the difference between "v2 is correct" and "v2 produces *different but
@@ -358,12 +359,12 @@ Three concrete pain points worth flagging:
 - IR → C++ with byte-parity CI on 56 fixtures: 6-8 weeks. The long
   pole. Every fixture is a possible parity bug.
 - v1 deletion: 1-2 weeks after a clean release cycle.
-- Passes (`classify_sync`, `randomize_analysis`, `extract_port_set`):
+- Passes (`placement`, `randomize_analysis`, `extract_port_set`):
   ~1 week each, can land in parallel with the parity work since they
   consume the IR and don't perturb the C++ output.
 
-Out of scope here but follows directly: `codegen/cuda_tb.rs` lands
-after phase 5 and is estimated at 6-10 weeks given the IR exists.
+Out of scope here but follows directly: placement-split backends land
+after phase 5; each is estimated at 6-10 weeks given the IR exists.
 
 ## Open questions
 
