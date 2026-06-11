@@ -1,9 +1,14 @@
-//! Control-flow lowering — `if`/`for`/`while`/`repeat`/`loop` into the
-//! block shapes specified in docs/tb-ir-design.md §"Control flow".
+//! Control-flow lowering — `if`/`for`/`while`/`repeat`/`loop`/`wait
+//! until` into the block shapes specified in docs/tb-ir-design.md
+//! §"Control flow".
 
 use super::{FuncBuilder, LoopFrame, LowerError, unsupported};
-use crate::ast::{Block, Expr as AstExpr, ExprKind, ForStmt, IfStmt, RepeatStmt};
-use crate::ir::{BinOp, BlockId, Expr, IrType, Stmt, Terminator};
+use crate::ast::{
+    Block, Expr as AstExpr, ExprKind, ForStmt, IfStmt, RepeatStmt, WaitTimeout, WaitUntilMode,
+};
+use crate::ir::{
+    BinOp, BlockId, Expr, FmtArg, FmtArgs, IrType, PredSrc, Stmt, Terminator, WaitMode,
+};
 
 impl FuncBuilder<'_> {
     pub(crate) fn lower_if(&mut self, i: &IfStmt) -> Result<(), LowerError> {
@@ -218,6 +223,124 @@ impl FuncBuilder<'_> {
         // `loop` without a `break` never reaches `exit`; the
         // reachability prune in `finish` removes it.
         self.start_block(exit);
+        Ok(())
+    }
+
+    /// `wait until …` (spec §7.9) — `Single`/`AllOf` forms, with or
+    /// without `timeout N cycles fail("…")`. `AnyOf` stays explicitly
+    /// unsupported. Mirrors v1's `emit_wait_until` observable
+    /// contract: on timeout the diagnostics are the FAIL header (the
+    /// user's `fail(...)` message, or "<label> timed out after N
+    /// cycles") followed by one "  not yet true: <src>" line per
+    /// still-false sub-predicate, with `errors` bumped exactly once
+    /// (the bump rides the terminator's timeout edge — see
+    /// `codegen::tbir::func`).
+    pub(crate) fn lower_wait_until(
+        &mut self,
+        mode: WaitUntilMode,
+        conditions: &[AstExpr],
+        timeout: Option<&WaitTimeout>,
+    ) -> Result<(), LowerError> {
+        let ir_mode = match mode {
+            WaitUntilMode::Single => WaitMode::Single,
+            WaitUntilMode::AllOf => WaitMode::AllOf,
+            WaitUntilMode::AnyOf => {
+                return Err(unsupported("`any of` wait conditions", ""));
+            }
+        };
+        if conditions.is_empty() {
+            return Err(LowerError::Invalid(
+                "wait until: at least one condition required".to_string(),
+            ));
+        }
+        let mut preds = Vec::with_capacity(conditions.len());
+        for c in conditions {
+            // Ports stay inline — the scheduler re-samples the DUT on
+            // every cycle inside the predicate closure. The source
+            // text rides along for the timeout breakdown, rendered by
+            // the same pretty-printer v1's diagnostics use.
+            let expr = self.lower_expr(c)?;
+            preds.push(PredSrc {
+                expr,
+                src_text: crate::codegen::cpp_tb::expr_source_str(c),
+            });
+        }
+
+        let Some(to) = timeout else {
+            let succ = self.new_block();
+            self.terminate(Terminator::WaitUntil {
+                preds,
+                mode: ir_mode,
+                succ,
+            });
+            self.start_block(succ);
+            return Ok(());
+        };
+
+        // Budget evaluated once, before the wait (v1's `_wu_budget`),
+        // so the default timeout header reports the same value the
+        // countdown used.
+        let cycles_ir = self.lower_expr_no_ports(&to.cycles)?;
+        let budget = self.fresh_temp();
+        self.push(Stmt::Assign(budget, cycles_ir));
+
+        // Header line — the user's `fail("…")` message, or v1's
+        // default "<label> timed out after N cycles".
+        let header = match &to.message {
+            Some(m) => match &*m.kind {
+                ExprKind::String(s) => self.lower_fmt(s)?,
+                _ => {
+                    return Err(unsupported(
+                        "non-string-literal timeout `fail(...)` message",
+                        "",
+                    ));
+                }
+            },
+            None => {
+                let label = match ir_mode {
+                    WaitMode::Single => "wait until",
+                    WaitMode::AllOf => "wait until all of",
+                };
+                FmtArgs {
+                    fmt: format!("{label} timed out after %lld cycles"),
+                    args: vec![FmtArg {
+                        expr: Expr::Local(budget),
+                        wide_hex: None,
+                    }],
+                }
+            }
+        };
+
+        let on_fire = self.new_block();
+        let on_timeout = self.new_block();
+        self.terminate(Terminator::WaitUntilTimeout {
+            preds: preds.clone(),
+            mode: ir_mode,
+            cycles: Expr::Local(budget),
+            on_fire,
+            on_timeout,
+        });
+
+        // Timeout arm: header + per-sub-predicate breakdown, then
+        // rejoin the success path (a timed-out wait fails the test
+        // via the error count but does not abort the run — v1
+        // semantics).
+        self.start_block(on_timeout);
+        self.push(Stmt::FailDiag {
+            guard: None,
+            args: header,
+        });
+        for p in &preds {
+            self.push(Stmt::FailDiag {
+                guard: Some(p.expr.clone()),
+                args: FmtArgs {
+                    fmt: format!("  not yet true: {}", p.src_text),
+                    args: Vec::new(),
+                },
+            });
+        }
+        self.terminate(Terminator::Jump(on_fire));
+        self.start_block(on_fire);
         Ok(())
     }
 

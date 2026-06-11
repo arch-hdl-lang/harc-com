@@ -19441,10 +19441,11 @@ fn escape_c(s: &str) -> String {
 }
 
 /// Render a HARC `Expr` back to source-level text via the pretty
-/// printer. Used by `wait until` codegen to label each sub-predicate
-/// in the timeout diagnostic with the user's original expression
+/// printer. Used by `wait until` codegen (v1 emission and TB-IR
+/// lowering's `PredSrc::src_text`) to label each sub-predicate in the
+/// timeout diagnostic with the user's original expression
 /// (e.g. `env.agent.idle(100)` rather than a synthetic index).
-fn expr_source_str(e: &Expr) -> String {
+pub(crate) fn expr_source_str(e: &Expr) -> String {
     let mut buf = String::new();
     crate::pretty::print_expr(&mut buf, e);
     buf

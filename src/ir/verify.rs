@@ -1,7 +1,8 @@
 //! TB-IR structural verifier — design-doc invariants 1-8, 10, 15 plus
 //! the port-position rule (an `Expr::Port` may appear only in wait
 //! predicates, format-arg expressions, `DutRead`/`DutWrite` operands,
-//! and `AssertCheck` condition subtrees).
+//! `AssertCheck` condition subtrees, and `FailDiag` guards — which
+//! re-evaluate a wait predicate after the wait timed out).
 //!
 //! Violations are programmer errors (lowering bugs or pass bugs), not
 //! user errors — user errors are rejected earlier by the lowering pass.
@@ -293,6 +294,12 @@ impl Checker<'_> {
                     self.check_fmt_args(on_fail);
                 }
                 Stmt::CovReport(inst) => self.check_covgroup(inst.covgroup),
+                Stmt::FailDiag { guard, args } => {
+                    if let Some(g) = guard {
+                        self.check_expr(g, true, "FailDiag guard");
+                    }
+                    self.check_fmt_args(args);
+                }
             }
         }
         match &b.terminator {
@@ -498,6 +505,14 @@ fn check_def_before_use(
                     }
                 }
                 Stmt::CovReport(_) => {}
+                Stmt::FailDiag { guard, args } => {
+                    if let Some(g) = guard {
+                        check_e(g, &defined, errs);
+                    }
+                    for a in &args.args {
+                        check_e(&a.expr, &defined, errs);
+                    }
+                }
             }
         }
         match &b.terminator {

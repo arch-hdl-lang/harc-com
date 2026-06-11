@@ -167,6 +167,16 @@ pub enum Stmt {
     Log { level: LogLevel, args: FmtArgs },
     AssertCheck { cond: Expr, on_fail: FmtArgs },
     CovReport(CovgroupInstance),
+    /// One `wait until … timeout` failure-diagnostic line: a
+    /// `sim_log_line("FAIL", …)` that does NOT bump the error counter
+    /// (v1 bumps `errors` exactly once per timed-out wait — that bump
+    /// rides the `WaitUntilTimeout` terminator's timeout edge, not the
+    /// per-line diagnostics). `guard: Some(pred)` prints only while
+    /// the predicate is still false (`if (!(pred)) …` — the
+    /// per-sub-predicate "not yet true:" breakdown); `guard: None`
+    /// prints unconditionally (the header line). Lives only in
+    /// `on_timeout` successor blocks.
+    FailDiag { guard: Option<Expr>, args: FmtArgs },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -3,8 +3,10 @@
 //! MVP scope: classic-form and impl-for testbench-bound tests with a
 //! single DUT, declared clocks, and the core statement subset (DUT
 //! port read/write, `let`/assign, `log`/`logf`, inline `assert ...
-//! else fail`, `fail`, `wait N cycles`, `if`/`for`/`while`/`repeat`/
-//! `loop`/`break`/`continue`). Everything else is rejected with
+//! else fail`, `fail`, `wait N cycles`, `wait until` in its single
+//! and `all of` forms with optional `timeout`, `if`/`for`/`while`/
+//! `repeat`/`loop`/`break`/`continue`). Everything else is rejected
+//! with
 //! `LowerError::Unsupported` naming the construct — lowering NEVER
 //! silently mis-lowers. Re-run with `--codegen v1` to use the legacy
 //! direct AST → C++ path for unsupported constructs.

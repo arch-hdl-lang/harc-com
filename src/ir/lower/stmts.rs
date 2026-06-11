@@ -83,15 +83,13 @@ impl FuncBuilder<'_> {
                 };
                 self.lower_log(args, Some(path))
             }
+            StmtKind::WaitUntil {
+                mode,
+                conditions,
+                timeout,
+                ..
+            } => self.lower_wait_until(*mode, conditions, timeout.as_ref()),
             // ── Explicit unsupported stubs (MVP) ────────────────────
-            StmtKind::WaitUntil { timeout, .. } => Err(unsupported(
-                if timeout.is_some() {
-                    "`wait until ... timeout`"
-                } else {
-                    "`wait until`"
-                },
-                "",
-            )),
             StmtKind::After { .. } => Err(unsupported("`after N cycles` blocks", "")),
             StmtKind::Randomize { .. } => Err(unsupported("`randomize`", "")),
             StmtKind::Fork(_) | StmtKind::JoinAll { .. } => Err(unsupported("`fork`/`join`", "")),

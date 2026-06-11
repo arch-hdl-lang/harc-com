@@ -83,10 +83,10 @@ fn randomize_fixture_is_unsupported() {
     insta::assert_snapshot!("axilite_constraint_unsupported", msg);
 }
 
-/// Agent/event fixture (`agent`, `event<T>`, `wait until ... timeout`)
-/// is outside the MVP subset. The fixture's `transaction` item is the
-/// first rejection today; `wait_until_is_unsupported` below locks the
-/// statement-level `wait until` message independently.
+/// Agent/event fixture (`agent`, `event<T>`) is outside the MVP
+/// subset. The fixture's `transaction` item is the first rejection
+/// today (its `wait until ... timeout` statements are now in-subset;
+/// `wait_until_counter_test` covers them positively).
 #[test]
 fn wait_until_quiesce_fixture_is_unsupported() {
     let err = lower_src(&fixture("wait_until_quiesce_test.harc")).unwrap_err();
@@ -94,20 +94,181 @@ fn wait_until_quiesce_fixture_is_unsupported() {
     insta::assert_snapshot!("wait_until_quiesce_unsupported", msg);
 }
 
+/// `any of` stays outside the lowered subset (Single/AllOf landed).
 #[test]
-fn wait_until_is_unsupported() {
+fn wait_until_any_of_is_unsupported() {
     let src = r#"
-test WaitUntilTest
+test WaitUntilAnyTest
     let dut : Top
     run
-        wait until dut.ready == 1
+        wait until any of dut.ready == 1, dut.count_out == 2
     end run
-end test WaitUntilTest
+end test WaitUntilAnyTest
 "#;
     let err = lower_src(src).unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("wait until"), "names the construct: {msg}");
+    assert!(msg.contains("any of"), "names the construct: {msg}");
     assert!(msg.contains("--codegen v1"), "suggests v1: {msg}");
+}
+
+/// Untimed single-predicate `wait until` becomes a `WaitUntil`
+/// terminator with the port read kept inline (re-sampled each cycle)
+/// and the source text captured for diagnostics.
+#[test]
+fn wait_until_single_lowers_to_wait_until_terminator() {
+    let src = r#"
+test WaitSingleTest
+    let dut : Top
+    run
+        wait until dut.ready == 1
+        dut.en = 0
+    end run
+end test WaitSingleTest
+"#;
+    let prog = lower_src(src).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let f = prog.function(prog.tests[0].run);
+    let ir::Terminator::WaitUntil { preds, mode, succ } = &f.blocks[0].terminator else {
+        panic!("expected WaitUntil terminator:\n{f}");
+    };
+    assert_eq!(*mode, ir::WaitMode::Single);
+    assert_eq!(preds.len(), 1);
+    assert_eq!(preds[0].src_text, "dut.ready == 1");
+    assert!(
+        matches!(&preds[0].expr, ir::Expr::Binary(ir::BinOp::Eq, l, _)
+            if matches!(&**l, ir::Expr::Port(_))),
+        "port stays inline in the wait predicate:\n{f}"
+    );
+    // Successor carries the post-wait statements.
+    assert!(
+        f.block(*succ)
+            .stmts
+            .iter()
+            .any(|s| matches!(s, ir::Stmt::DutWrite(..))),
+        "wait successor continues the body:\n{f}"
+    );
+}
+
+/// `wait until ... timeout N cycles fail("...")` becomes a
+/// `WaitUntilTimeout` whose `on_timeout` block carries the v1
+/// diagnostic shape: unconditional FAIL header (the user's message),
+/// one guarded "not yet true:" line per sub-predicate, then a rejoin
+/// to the success path.
+#[test]
+fn wait_until_timeout_lowers_diag_block() {
+    let src = r#"
+test WaitTimeoutTest
+    let dut : Top
+    run
+        wait until all of dut.count_out >= 12, dut.en == 1 timeout 100 cycles fail("quiesce conditions not met")
+    end run
+end test WaitTimeoutTest
+"#;
+    let prog = lower_src(src).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let f = prog.function(prog.tests[0].run);
+    let ir::Terminator::WaitUntilTimeout {
+        preds,
+        mode,
+        cycles,
+        on_fire,
+        on_timeout,
+    } = &f.blocks[0].terminator
+    else {
+        panic!("expected WaitUntilTimeout terminator:\n{f}");
+    };
+    assert_eq!(*mode, ir::WaitMode::AllOf);
+    assert_eq!(preds.len(), 2);
+    assert_eq!(preds[0].src_text, "dut.count_out >= 12");
+    assert_eq!(preds[1].src_text, "dut.en == 1");
+    // Budget is evaluated once into a local before the wait.
+    assert!(
+        matches!(cycles, ir::Expr::Local(_)),
+        "budget stashed in a local:\n{f}"
+    );
+
+    let diag = f.block(*on_timeout);
+    assert_eq!(diag.stmts.len(), 3, "header + 2 breakdown lines:\n{f}");
+    let ir::Stmt::FailDiag { guard: None, args } = &diag.stmts[0] else {
+        panic!("first diag stmt is the unguarded header:\n{f}");
+    };
+    assert_eq!(args.fmt, "quiesce conditions not met");
+    let ir::Stmt::FailDiag {
+        guard: Some(_),
+        args,
+    } = &diag.stmts[1]
+    else {
+        panic!("second diag stmt is a guarded breakdown line:\n{f}");
+    };
+    assert_eq!(args.fmt, "  not yet true: dut.count_out >= 12");
+    let ir::Stmt::FailDiag {
+        guard: Some(_),
+        args,
+    } = &diag.stmts[2]
+    else {
+        panic!("third diag stmt is a guarded breakdown line:\n{f}");
+    };
+    assert_eq!(args.fmt, "  not yet true: dut.en == 1");
+    // Timeout arm rejoins the success path.
+    assert!(
+        matches!(diag.terminator, ir::Terminator::Jump(b) if b == *on_fire),
+        "on_timeout rejoins on_fire:\n{f}"
+    );
+}
+
+/// Default (message-less) timeout header mirrors v1's
+/// "<label> timed out after %lld cycles" text, with the budget local
+/// as the format argument.
+#[test]
+fn wait_until_timeout_default_header() {
+    let src = r#"
+test WaitDefaultHeaderTest
+    let dut : Top
+    run
+        wait until dut.ready == 1 timeout 50 cycles
+    end run
+end test WaitDefaultHeaderTest
+"#;
+    let prog = lower_src(src).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let f = prog.function(prog.tests[0].run);
+    let ir::Terminator::WaitUntilTimeout { on_timeout, .. } = &f.blocks[0].terminator else {
+        panic!("expected WaitUntilTimeout terminator:\n{f}");
+    };
+    let ir::Stmt::FailDiag { guard: None, args } = &f.block(*on_timeout).stmts[0] else {
+        panic!("first diag stmt is the header:\n{f}");
+    };
+    assert_eq!(args.fmt, "wait until timed out after %lld cycles");
+    assert_eq!(args.args.len(), 1);
+    assert!(matches!(args.args[0].expr, ir::Expr::Local(_)));
+}
+
+/// Locks the dump-ir text for the wait-until fixture (terminator
+/// shapes, PredSrc source text, timeout diagnostic blocks).
+#[test]
+fn wait_until_counter_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("wait_until_counter_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("wait_until_counter_dump_ir", format!("{prog}"));
+}
+
+/// tbir emission of the wait-until fixture carries the v1 runtime
+/// calls: untimed/timed awaiters and the timeout diagnostic text.
+#[test]
+fn tbir_emit_wait_until_runtime_calls() {
+    let prog = lower_src(&fixture("wait_until_counter_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let cpp = tbir::emit(&prog, &cpp_tb::EmitOpts::default()).expect("emits");
+    for marker in [
+        "bool _wu_satisfied = co_await harc_rt::wait_until_timeout(_slot, \
+         [&]{ return (harc_rt::harc_read(dut->count_out) == 8); }, (uint32_t)_wu_budget);",
+        "[&]{ return ((harc_rt::harc_read(dut->count_out) >= 12)) && \
+         ((harc_rt::harc_read(dut->en) == 1)); }",
+        "sim_log_line(\"FAIL\", \"count never reached 8\");",
+        "sim_log_line(\"FAIL\", \"  not yet true: dut.count_out >= 12\");",
+    ] {
+        assert!(cpp.contains(marker), "missing wait-until marker `{marker}`");
+    }
 }
 
 #[test]
