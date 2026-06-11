@@ -1948,6 +1948,13 @@ fn cmd_sim(
         // arch-com/ (where the binary actually runs from).
         .env("HARC_LOG_DIR", &outdir_abs)
         .env("HARC_DUT_BACKEND", "arch");
+    // Forward HARC_CXX → ARCH_CXX so the same compiler is used for both
+    // the HARC TB (compiled by harc) and the ARCH DUT (compiled by arch sim).
+    // On Linux, GCC miscompiles C++20 coroutines; users set HARC_CXX=clang++
+    // and that preference must propagate into arch sim's compilation step.
+    if let Ok(cxx) = std::env::var("HARC_CXX") {
+        cmd.env("ARCH_CXX", &cxx);
+    }
     if let Some(path) = &trace_abs {
         cmd.env("HARC_TRACE", path);
     }

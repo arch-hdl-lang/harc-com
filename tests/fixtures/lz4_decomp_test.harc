@@ -1,0 +1,200 @@
+// HARC TB for arch-com/examples/lz4_decomp.arch — LZ4 block decompressor.
+//
+// Corresponds to the CAST Inc. LZ4SNP-D LZ4/Snappy Data Decompressor IP.
+//
+// Three test cases:
+//   Test 1: All-literal block — "HELLO" (5 bytes, no match copies).
+//           Compressed: [0x50, 0x48, 0x45, 0x4C, 0x4C, 0x4F]
+//           Token 0x50 = lit_len nibble 5, no match (last sequence).
+//
+//   Test 2: Block with a match copy — "ABCDABCD" (8 bytes).
+//           Sequence 1: 4 literals "ABCD" + match(offset=4, len=4).
+//           Sequence 2 (last): 0 literals, token 0x00 with in_last.
+//           Compressed: [0x40, 0x41, 0x42, 0x43, 0x44, 0x04, 0x00, 0x00]
+//
+//   Test 3: Overlapping match ("fill" pattern) — "AAAAAAA" (7 bytes).
+//           1 literal 'A' + match(offset=1, len=6).
+//           Uses LZ4's overlapping-copy semantics: each byte is copied from
+//           the byte written one position earlier, producing a run of 'A's.
+//           Compressed: [0x12, 0x41, 0x01, 0x00, 0x00]
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+// Send one compressed byte to the decompressor.
+// Waits for in_ready (up to 64 cycles) before presenting the byte,
+// then advances one clock so the module consumes it.
+function lz4_send(dut: Lz4Decomp, b: uint<8>, last: bool)
+    let _w = 0
+    while !dut.in_ready && _w < 64
+        wait 1 cycle
+        _w = _w + 1
+    end while
+    assert dut.in_ready else fail("lz4_send: in_ready stuck low (byte=${b:02x})")
+    dut.in_valid = 1
+    dut.in_data  = b
+    dut.in_last  = last
+    wait 1 cycle
+    dut.in_valid = 0
+    dut.in_last  = 0
+end function lz4_send
+
+// Receive one decompressed byte from the output stream.
+// Waits for out_valid (up to 64 cycles), captures out_data, then
+// advances one clock so the module consumes the out_ready handshake.
+// Caller must hold out_ready = 1 throughout.
+function lz4_recv(dut: Lz4Decomp) -> uint<8>
+    let _w = 0
+    while !dut.out_valid && _w < 64
+        wait 1 cycle
+        _w = _w + 1
+    end while
+    assert dut.out_valid else fail("lz4_recv: out_valid stuck low")
+    let data = dut.out_data
+    wait 1 cycle
+    return data
+end function lz4_recv
+
+// Send a literal byte and immediately receive the corresponding output byte.
+// Convenience wrapper for sequences where in and out interleave one-for-one.
+function lz4_send_recv(dut: Lz4Decomp, b: uint<8>, last: bool) -> uint<8>
+    lz4_send(dut, b, last)
+    return lz4_recv(dut)
+end function lz4_send_recv
+
+// ── Testbench ─────────────────────────────────────────────────────────────────
+
+testbench Lz4DecompTb
+    dut : Lz4Decomp
+end testbench Lz4DecompTb
+
+impl Lz4DecompTest for Lz4DecompTb
+    clock clk = SysDomain
+
+    run
+        // Initialise all inputs; hold reset for 3 cycles.
+        dut.rst       = 1
+        dut.in_valid  = 0
+        dut.in_data   = 0
+        dut.in_last   = 0
+        dut.out_ready = 1
+        wait 3 cycles
+        dut.rst = 0
+        // Two cycles let the module transition Idle→RdToken (state 0→1).
+        wait 2 cycles
+
+        // ── Test 1: all-literal block "HELLO" ────────────────────────────────
+
+        log(info, "=== Test 1: all-literal 'HELLO' ===")
+
+        // Token 0x50: lit_len nibble = 5 (no match — last sequence).
+        lz4_send(dut, 0x50, false)
+
+        // Each literal byte: send into LitIn, receive from LitOut.
+        let got_h  = lz4_send_recv(dut, 0x48, false)   // 'H'
+        let got_e  = lz4_send_recv(dut, 0x45, false)   // 'E'
+        let got_l1 = lz4_send_recv(dut, 0x4C, false)   // 'L'
+        let got_l2 = lz4_send_recv(dut, 0x4C, false)   // 'L'
+        let got_o  = lz4_send_recv(dut, 0x4F, true)    // 'O'  (in_last)
+
+        assert got_h  == 0x48 else fail("HELLO[0]: expected 0x48 'H', got ${got_h:02x}")
+        assert got_e  == 0x45 else fail("HELLO[1]: expected 0x45 'E', got ${got_e:02x}")
+        assert got_l1 == 0x4C else fail("HELLO[2]: expected 0x4C 'L', got ${got_l1:02x}")
+        assert got_l2 == 0x4C else fail("HELLO[3]: expected 0x4C 'L', got ${got_l2:02x}")
+        assert got_o  == 0x4F else fail("HELLO[4]: expected 0x4F 'O', got ${got_o:02x}")
+
+        // done pulses the cycle after the last output byte was consumed.
+        assert dut.done == 1 else fail("Test 1: done not asserted after 'HELLO'")
+        log(info, "PASS: 'HELLO' decompressed correctly")
+
+        // Let the module return to RdToken before the next block.
+        wait 2 cycles
+
+        // ── Test 2: match copy "ABCDABCD" ────────────────────────────────────
+
+        log(info, "=== Test 2: match-copy 'ABCDABCD' ===")
+
+        // Compressed: [0x40, 0x41, 0x42, 0x43, 0x44, 0x04, 0x00, 0x00]
+        //   0x40 = token: lit_len nibble 4, match nibble 0 (len=4)
+        //   0x41..0x44 = literals A B C D
+        //   0x04 0x00  = offset = 4 (little-endian 16-bit)
+        //   0x00       = last-sequence token (0 literals, in_last)
+
+        // Token byte: 4 literals, match nibble=0 → match_len=4.
+        lz4_send(dut, 0x40, false)
+
+        // Four literal bytes (A B C D) interleaved with their outputs.
+        let g_a = lz4_send_recv(dut, 0x41, false)   // 'A'
+        let g_b = lz4_send_recv(dut, 0x42, false)   // 'B'
+        let g_c = lz4_send_recv(dut, 0x43, false)   // 'C'
+        let g_d = lz4_send_recv(dut, 0x44, false)   // 'D'
+
+        assert g_a == 0x41 else fail("ABCDABCD lit[0]: expected 'A', got ${g_a:02x}")
+        assert g_b == 0x42 else fail("ABCDABCD lit[1]: expected 'B', got ${g_b:02x}")
+        assert g_c == 0x43 else fail("ABCDABCD lit[2]: expected 'C', got ${g_c:02x}")
+        assert g_d == 0x44 else fail("ABCDABCD lit[3]: expected 'D', got ${g_d:02x}")
+
+        // Match offset bytes (consumed, no output).
+        lz4_send(dut, 0x04, false)   // offset_lo = 4
+        lz4_send(dut, 0x00, false)   // offset_hi = 0
+
+        // Collect four match bytes (module drives them internally — no input needed).
+        let m_a = lz4_recv(dut)   // copy of 'A' from history
+        let m_b = lz4_recv(dut)   // copy of 'B'
+        let m_c = lz4_recv(dut)   // copy of 'C'
+        let m_d = lz4_recv(dut)   // copy of 'D'
+
+        assert m_a == 0x41 else fail("ABCDABCD match[0]: expected 'A', got ${m_a:02x}")
+        assert m_b == 0x42 else fail("ABCDABCD match[1]: expected 'B', got ${m_b:02x}")
+        assert m_c == 0x43 else fail("ABCDABCD match[2]: expected 'C', got ${m_c:02x}")
+        assert m_d == 0x44 else fail("ABCDABCD match[3]: expected 'D', got ${m_d:02x}")
+
+        // Final 0-literal last-sequence token with in_last.
+        lz4_send(dut, 0x00, true)
+
+        assert dut.done == 1 else fail("Test 2: done not asserted after 'ABCDABCD'")
+        log(info, "PASS: 'ABCDABCD' decompressed correctly (literals + match copy)")
+
+        wait 2 cycles
+
+        // ── Test 3: overlapping match "AAAAAAA" ──────────────────────────────
+
+        log(info, "=== Test 3: overlapping-match fill 'AAAAAAA' ===")
+
+        // Compressed: [0x12, 0x41, 0x01, 0x00, 0x00]
+        //   0x12 = token: lit_len nibble 1, match nibble 2 (len=6)
+        //   0x41 = literal 'A'
+        //   0x01 0x00 = offset = 1 (copies from one byte behind write_ptr)
+        //   0x00      = last-sequence token (0 literals, in_last)
+        //
+        // Expected output: A A A A A A A (7 bytes)
+        // Each match byte reads from hist[write_ptr - 1] = the byte just
+        // written, so the pattern repeats identically — the "fill" use case.
+
+        lz4_send(dut, 0x12, false)
+
+        let f0 = lz4_send_recv(dut, 0x41, false)   // 1 literal 'A'
+        assert f0 == 0x41 else fail("fill lit[0]: expected 'A', got ${f0:02x}")
+
+        // Offset bytes.
+        lz4_send(dut, 0x01, false)   // offset_lo = 1
+        lz4_send(dut, 0x00, false)   // offset_hi = 0
+
+        // 6 match bytes, all 'A'.
+        for i in 0 .. 6
+            let mb = lz4_recv(dut)
+            assert mb == 0x41 else fail("fill match[${i}]: expected 'A', got ${mb:02x}")
+        end for
+
+        // Final 0-literal last-sequence token with in_last.
+        lz4_send(dut, 0x00, true)
+
+        assert dut.done == 1 else fail("Test 3: done not asserted after fill 'AAAAAAA'")
+        log(info, "PASS: 'AAAAAAA' fill pattern decompressed correctly")
+
+        log(info, "ALL TESTS PASSED")
+    end run
+end impl Lz4DecompTest
