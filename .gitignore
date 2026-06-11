@@ -3,6 +3,7 @@
 /harc_sim_build
 /harc_sim_build*/
 /harc_tbir_equiv_build/
+/harc_arch_dut_build/
 /third_party/z3/
 Cargo.lock
 *.swp
