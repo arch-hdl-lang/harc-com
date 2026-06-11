@@ -1,6 +1,11 @@
 # Plan: TB-IR — typed intermediate representation between AST and codegen
 
-Status: **Proposed (RFC, not yet implemented).**
+Status: **In delivery.** MVP subset shipped (PRs #347–#351, 2026-06):
+IR types + lowering + verifier + a parallel `--codegen tbir` C++
+backend gated on behavioral trace-equivalence. See
+[tbir-mvp.md](tbir-mvp.md) for the shipped scope and documented
+divergences. The byte-parity v1 migration (phases 4–6) and the passes
+(phase 7) remain open — phase statuses annotated in the table below.
 Date logged: 2026-05-20.
 Scope: Insert a typed, CFG-shaped testbench IR between HARC's AST and
 the C++ codegen so that multiple backends (the current C++ TB, a future
@@ -303,13 +308,13 @@ the load-bearing safety net.
 
 | Phase | Status | Scope |
 |---|---|---|
-| 1 — IR types module | not started | `src/ir/mod.rs` + `Display` impl + unit tests on hand-built IR snippets. Reviewable on its own; no production code uses it yet. |
-| 2 — AST → IR lowering | not started | `src/ir/lower.rs`. New `harc dump-ir Foo.harc` CLI for manual inspection. `cpp_tb.rs` still emits from AST. |
-| 3 — IR verifier | not started | `src/ir/verify.rs`. Runs after every `lower` in debug builds. |
-| 4 — IR → C++ behind `--codegen-v2` | not started | New module reads IR, emits C++. Must produce **byte-identical** `.cpp` to current `cpp_tb.rs` for all 56 fixtures. CI job diffs `--codegen-v2` vs default. |
+| 1 — IR types module | **done for the MVP subset** (PR #347) | `src/ir/mod.rs` + `Display` impl + unit tests on hand-built IR snippets. Reviewable on its own; no production code uses it yet. |
+| 2 — AST → IR lowering | **done for the MVP subset** (PRs #347, #349–#351; `src/ir/lower/`, `harc dump-ir` shipped) | `src/ir/lower.rs`. New `harc dump-ir Foo.harc` CLI for manual inspection. `cpp_tb.rs` still emits from AST. |
+| 3 — IR verifier | **done for the MVP subset** (PR #347; runs unconditionally before every tbir emission, not only debug builds) | `src/ir/verify.rs`. Runs after every `lower` in debug builds. |
+| 4 — IR → C++ behind `--codegen-v2` | **not started as specified.** A *parallel* loop-switch backend shipped instead (`--codegen tbir`, PRs #347–#351), gated on behavioral trace-equivalence over 5 fixtures (`tests/run_tbir_equiv.sh`, in CI) — see [tbir-mvp.md](tbir-mvp.md) for why that gate differs and why it does not discharge this phase. The byte-identical migration of v1's emission remains open. | New module reads IR, emits C++. Must produce **byte-identical** `.cpp` to current `cpp_tb.rs` for all 56 fixtures. CI job diffs `--codegen-v2` vs default. |
 | 5 — Flip default to v2 | not started | After two release cycles of clean parity CI. Keep v1 reachable via `--codegen-v1` as escape hatch. |
 | 6 — Delete v1 emission | not started | After one release cycle of v2-as-default with no escapes. |
-| 7 — Passes land | parallel to 4-6 | `placement`, `randomize_analysis`, `extract_port_set`. These are net-new functionality and don't need parity gates; gate on their own unit tests. |
+| 7 — Passes land | not started (`src/ir/passes/` does not exist yet) | `placement`, `randomize_analysis`, `extract_port_set`. These are net-new functionality and don't need parity gates; gate on their own unit tests. |
 | 8 — Placement-split backends consuming IR | unblocked after 5 | The spec §10 roadmap execution targets. Out of scope for this plan; each backend carries its own plan + `TargetProfile`. |
 
 Phase 4 is the long pole. Every fixture is a potential parity bug, and

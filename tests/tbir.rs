@@ -33,6 +33,15 @@ fn lower_fixtures(names: &[&str]) -> Result<ir::TbProgram, lower::LowerError> {
     lower::lower_program(&merged)
 }
 
+/// Lower + verify + emit one registry fixture through the tbir backend
+/// with default options (the `--sv` Verilator path the equivalence
+/// harness exercises).
+fn emit_fixture_cpp(name: &str) -> String {
+    let prog = lower_src(&fixture(name)).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    tbir::emit(&prog, &cpp_tb::EmitOpts::default()).expect("emits")
+}
+
 /// The negative-test contract: every out-of-subset fixture must produce
 /// `LowerError::Unsupported` whose rendered message names the offending
 /// construct and points the user at `--codegen v1`.
@@ -57,6 +66,71 @@ fn top_counter_dump_ir_snapshot() {
     let prog = lower_src(&fixture("top_counter_test.harc")).expect("lowers");
     verify::verify_program(&prog).expect("verifies");
     insta::assert_snapshot!("top_counter_dump_ir", format!("{prog}"));
+}
+
+/// Locks the dump-ir text for the arbiter fixture: request-mask
+/// writes with single-cycle waits, grant asserts carrying inline port
+/// reads, a two-point covergroup, and check-phase CovBin reads.
+#[test]
+fn bus_arbiter_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("bus_arbiter_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("bus_arbiter_dump_ir", format!("{prog}"));
+}
+
+/// Locks the dump-ir text for the ROM fixture: an impure helper
+/// (`read_addr`) CFG-inlined at every call site, a full-address-space
+/// covergroup, and the check-phase bin reads.
+#[test]
+fn rom_lut_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("rom_lut_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("rom_lut_dump_ir", format!("{prog}"));
+}
+
+// ── Emitted-C++ snapshots — the emission surface for the 5-fixture
+//    equivalence matrix (tests/tbir_equiv_fixtures.txt). Full files,
+//    so any future emitter refactor diffs visibly here instead of
+//    silently shifting shapes the marker tests don't cover. ──────────
+
+#[test]
+fn top_counter_emitted_cpp_snapshot() {
+    insta::assert_snapshot!(
+        "top_counter_emitted_cpp",
+        emit_fixture_cpp("top_counter_test.harc")
+    );
+}
+
+#[test]
+fn sync_fifo_emitted_cpp_snapshot() {
+    insta::assert_snapshot!(
+        "sync_fifo_emitted_cpp",
+        emit_fixture_cpp("sync_fifo_test.harc")
+    );
+}
+
+#[test]
+fn bus_arbiter_emitted_cpp_snapshot() {
+    insta::assert_snapshot!(
+        "bus_arbiter_emitted_cpp",
+        emit_fixture_cpp("bus_arbiter_test.harc")
+    );
+}
+
+#[test]
+fn wait_until_counter_emitted_cpp_snapshot() {
+    insta::assert_snapshot!(
+        "wait_until_counter_emitted_cpp",
+        emit_fixture_cpp("wait_until_counter_test.harc")
+    );
+}
+
+#[test]
+fn rom_lut_emitted_cpp_snapshot() {
+    insta::assert_snapshot!(
+        "rom_lut_emitted_cpp",
+        emit_fixture_cpp("rom_lut_test.harc")
+    );
 }
 
 /// Transactor fixtures are outside the MVP subset — the error must
