@@ -23,6 +23,18 @@ enum CompileScope {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum CodegenKind {
+    /// Legacy direct AST → C++ emitter (`codegen/cpp_tb.rs`).
+    #[default]
+    V1,
+    /// Typed TB-IR pipeline: AST → IR (lower + verify) → C++
+    /// loop-switch emitter (`src/ir/` + `codegen/tbir/`). MVP subset;
+    /// unsupported constructs fail with a structured error naming the
+    /// construct.
+    Tbir,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 enum CppSplit {
     /// Preserve the current single generated C++ translation unit.
     #[default]
@@ -99,6 +111,14 @@ enum Cmd {
         /// binary; `test` requires `--test` and compiles only that test.
         #[arg(long, value_enum, default_value_t = CompileScope::Suite)]
         compile_scope: CompileScope,
+        /// C++ emitter selection. `v1` (default) is the legacy direct
+        /// AST → C++ path; `tbir` routes through the typed TB-IR
+        /// (lower → verify → emit). `tbir` covers the MVP statement
+        /// subset and rejects everything else with a structured error.
+        /// Not combinable with `--mt`, `--cpp-split tests`, or
+        /// `--check-backends`.
+        #[arg(long, value_enum, default_value_t = CodegenKind::V1)]
+        codegen: CodegenKind,
         /// Split generated C++ output. `tests` writes one dispatcher plus
         /// grouped C++ translation units for the tests so Verilator can
         /// compile generated HARC test objects independently.
@@ -251,6 +271,23 @@ enum Cmd {
         #[arg(long)]
         check_backends: bool,
     },
+    /// Parse + merge HARC source file(s), lower to the typed TB-IR,
+    /// verify it, and print the textual IR form. Exits 1 with a
+    /// structured error when a construct is outside the TB-IR subset.
+    DumpIr {
+        /// Input .harc file(s) — base test plus any extension files.
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+    },
+    /// Diff two semantic JSONL traces (e.g. v1 vs tbir backends, or
+    /// arch vs Verilator) after normalizing backend-specific noise.
+    /// Prints divergences and exits 1 if any are found.
+    TraceDiff {
+        /// First trace (reported in the `arch:` column).
+        a: PathBuf,
+        /// Second trace (reported in the `sv:` column).
+        b: PathBuf,
+    },
     /// Merge a semantic JSONL trace into a signal VCD as synthetic events.
     TraceMerge {
         /// Signal waveform VCD produced by `harc sim --waves --wave-format vcd`.
@@ -348,6 +385,7 @@ fn main() -> Result<()> {
             top,
             test,
             compile_scope,
+            codegen,
             cpp_split,
             cpp_split_group_size,
             outdir,
@@ -393,6 +431,12 @@ fn main() -> Result<()> {
                     include_dir: z3_include_dir.clone(),
                     lib_dir: z3_lib_dir.clone(),
                 };
+                if check_backends && codegen == CodegenKind::Tbir {
+                    return Err(miette::miette!(
+                        "--check-backends is not supported with --codegen tbir yet; \
+                         re-run with --codegen v1"
+                    ));
+                }
                 if check_backends {
                     cmd_sim_check_backends(
                         files.clone(),
@@ -420,6 +464,7 @@ fn main() -> Result<()> {
                         top.clone(),
                         test.clone(),
                         compile_scope,
+                        codegen,
                         cpp_split,
                         cpp_split_group_size,
                         outdir.clone(),
@@ -437,6 +482,8 @@ fn main() -> Result<()> {
                 }
             })
         }
+        Cmd::DumpIr { files } => cmd_dump_ir(files),
+        Cmd::TraceDiff { a, b } => cmd_trace_diff(&a, &b),
         Cmd::TraceMerge {
             vcd,
             trace,
@@ -1101,6 +1148,58 @@ fn cmd_check(files: Vec<PathBuf>, ast: bool) -> Result<()> {
     Ok(())
 }
 
+/// `harc dump-ir <files...>` — parse, fold extends (merge_for_sim),
+/// lower to TB-IR, verify, and print the textual IR form.
+fn cmd_dump_ir(files: Vec<PathBuf>) -> Result<()> {
+    let mut parsed_files = Vec::with_capacity(files.len());
+    for f in &files {
+        parsed_files.push(parse_file(f)?);
+    }
+    let extra_files = resolve_use_imports(&parsed_files, files.first());
+    let mut all_files = parsed_files;
+    all_files.extend(extra_files);
+    let merged = harc::codegen::merge::merge_for_sim(&all_files, None)
+        .map_err(|e| miette::miette!("{}", e))?;
+    let prog = harc::ir::lower::lower_program(&merged).map_err(|e| miette::miette!("{}", e))?;
+    harc::ir::verify::verify_program(&prog).map_err(|errs| {
+        let lines: Vec<String> = errs.iter().map(|e| format!("  - {e}")).collect();
+        miette::miette!(
+            "internal error: TB-IR failed verification after lowering:\n{}",
+            lines.join("\n")
+        )
+    })?;
+    print!("{prog}");
+    Ok(())
+}
+
+/// `harc trace-diff <a.jsonl> <b.jsonl>` — normalize + diff two
+/// semantic traces; exit 1 on any divergence.
+fn cmd_trace_diff(a: &Path, b: &Path) -> Result<()> {
+    let divergences =
+        harc::check_backends::diff_traces(a, b).map_err(|e| miette::miette!("{}", e))?;
+    if divergences.is_empty() {
+        println!(
+            "traces match: {} == {}",
+            a.display(),
+            b.display()
+        );
+        return Ok(());
+    }
+    eprintln!(
+        "{} divergence(s) between {} and {}:",
+        divergences.len(),
+        a.display(),
+        b.display()
+    );
+    for d in &divergences {
+        eprintln!("  {}", d.fmt());
+    }
+    Err(miette::miette!(
+        "traces diverge ({} difference(s) shown)",
+        divergences.len()
+    ))
+}
+
 fn cmd_fmt(file: PathBuf, write: bool) -> Result<()> {
     let parsed = parse_file(&file)?;
     let out = harc::pretty::print(&parsed);
@@ -1477,6 +1576,7 @@ fn cmd_sim(
     top: Option<String>,
     test: Option<String>,
     compile_scope: CompileScope,
+    codegen: CodegenKind,
     cpp_split: CppSplit,
     cpp_split_group_size: usize,
     outdir: Option<PathBuf>,
@@ -1506,6 +1606,19 @@ fn cmd_sim(
         return Err(miette::miette!(
             "--cpp-split tests is currently supported only with --sv / Verilator builds"
         ));
+    }
+    if codegen == CodegenKind::Tbir {
+        if mt {
+            return Err(miette::miette!(
+                "--mt is not supported with --codegen tbir yet; re-run with --codegen v1"
+            ));
+        }
+        if cpp_split == CppSplit::Tests {
+            return Err(miette::miette!(
+                "--cpp-split tests is not supported with --codegen tbir yet; \
+                 re-run with --codegen v1"
+            ));
+        }
     }
 
     // Parse every input file, then fold `extend test T` blocks into their
@@ -1574,8 +1687,26 @@ fn cmd_sim(
     let mut cpp_paths = Vec::new();
     match cpp_split {
         CppSplit::Off => {
-            let cpp = harc::codegen::cpp_tb::emit_with_opts(&codegen_source, emit_opts)
-                .map_err(|e| miette::miette!("{}", e))?;
+            let cpp = match codegen {
+                CodegenKind::V1 => {
+                    harc::codegen::cpp_tb::emit_with_opts(&codegen_source, emit_opts)
+                        .map_err(|e| miette::miette!("{}", e))?
+                }
+                CodegenKind::Tbir => {
+                    let prog = harc::ir::lower::lower_program(&codegen_source)
+                        .map_err(|e| miette::miette!("{}", e))?;
+                    harc::ir::verify::verify_program(&prog).map_err(|errs| {
+                        let lines: Vec<String> =
+                            errs.iter().map(|e| format!("  - {e}")).collect();
+                        miette::miette!(
+                            "internal error: TB-IR failed verification after lowering:\n{}",
+                            lines.join("\n")
+                        )
+                    })?;
+                    harc::codegen::tbir::emit(&prog, &emit_opts)
+                        .map_err(|e| miette::miette!("{}", e))?
+                }
+            };
             let cpp_filename = match compile_scope {
                 CompileScope::Suite => format!("{stem}.cpp"),
                 CompileScope::Test => {
@@ -1890,6 +2021,7 @@ fn cmd_sim_check_backends(
         top.clone(),
         test.clone(),
         CompileScope::Suite,
+        CodegenKind::V1,
         CppSplit::Off,
         1,
         Some(arch_outdir.clone()),
@@ -1914,6 +2046,7 @@ fn cmd_sim_check_backends(
         top.clone(),
         test.clone(),
         CompileScope::Suite,
+        CodegenKind::V1,
         CppSplit::Off,
         1,
         Some(sv_outdir.clone()),
