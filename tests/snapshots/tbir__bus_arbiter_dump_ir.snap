@@ -1,0 +1,59 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 BusArbiterTb { dut: BusArbiter } cov cov=cg0
+  test BusArbiterTest tb=tb0 run=fn1 check=fn2
+  covgroup cg0 ArbCov @posedge(dut.clk)
+    point cp_grant <- dut.grant_requester: r0={0} r1={1} r2={2} r3={3}
+    point cp_valid <- dut.grant_valid: granted={1} no_request={0}
+
+fn fn0 sample_BusArbiterTest_cov [kind=SamplerAuto(cg0), owner=tb0]
+  entry = b0
+
+  b0:
+    -> Return
+
+fn fn1 run_BusArbiterTest [kind=Run, owner=tb0]
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.request_valid, 0)
+    -> WaitCycles(2, b1)
+
+  b1:
+    DutWrite(dut.rst, 0)
+    DutWrite(dut.request_valid, 1)
+    -> WaitCycles(1, b2)
+
+  b2:
+    AssertCheck { cond: (dut.grant_valid == 1), on_fail: "single req0: grant_valid should be 1" }
+    AssertCheck { cond: (dut.grant_requester == 0), on_fail: "single req0: got grant_requester=%lld", dut.grant_requester }
+    Log(info, "PASS: single requester 0 granted")
+    DutWrite(dut.request_valid, 4)
+    -> WaitCycles(1, b3)
+
+  b3:
+    AssertCheck { cond: (dut.grant_valid == 1), on_fail: "single req2: grant_valid should be 1" }
+    AssertCheck { cond: (dut.grant_requester == 2), on_fail: "single req2: got grant_requester=%lld", dut.grant_requester }
+    Log(info, "PASS: single requester 2 granted")
+    DutWrite(dut.request_valid, 0)
+    -> WaitCycles(1, b4)
+
+  b4:
+    AssertCheck { cond: (dut.grant_valid == 0), on_fail: "no request: grant_valid should be 0" }
+    Log(info, "PASS: no grant when no request")
+    -> Return
+
+fn fn2 check_BusArbiterTest [kind=Check, owner=tb0]
+  entry = b0
+
+  b0:
+    CovReport(cov.cg0)
+    AssertCheck { cond: (CovBin(cov.cg0, cp_grant, r0) > 0), on_fail: "R0 grant coverage hole" }
+    AssertCheck { cond: (CovBin(cov.cg0, cp_grant, r2) > 0), on_fail: "R2 grant coverage hole" }
+    AssertCheck { cond: (CovBin(cov.cg0, cp_valid, granted) > 0), on_fail: "granted coverage hole" }
+    AssertCheck { cond: (CovBin(cov.cg0, cp_valid, no_request) > 0), on_fail: "no-request coverage hole" }
+    -> Return

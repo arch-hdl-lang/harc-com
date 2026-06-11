@@ -1,0 +1,149 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 RomLutTb { dut: RomLut } cov cov=cg0
+  test RomLutTest tb=tb0 run=fn1 check=fn2
+  covgroup cg0 RomCov @posedge(dut.clk)
+    point cp_addr <- dut.rd_addr: a0={0} a1={1} a2={2} a3={3} a4={4} a5={5} a6={6} a7={7}
+
+fn fn0 sample_RomLutTest_cov [kind=SamplerAuto(cg0), owner=tb0]
+  entry = b0
+
+  b0:
+    -> Return
+
+fn fn1 run_RomLutTest [kind=Run, owner=tb0]
+  locals:
+    %0 __t0 : unknown
+    %1 addr : unknown
+    %2 __t1 : unknown
+    %3 addr_2 : unknown
+    %4 __t2 : unknown
+    %5 addr_3 : unknown
+    %6 __t3 : unknown
+    %7 addr_4 : unknown
+    %8 __t4 : unknown
+    %9 addr_5 : unknown
+    %10 __t5 : unknown
+    %11 addr_6 : unknown
+    %12 __t6 : unknown
+    %13 addr_7 : unknown
+    %14 __t7 : unknown
+    %15 addr_8 : unknown
+  entry = b0
+
+  b0:
+    DutWrite(dut.rd_addr, 0)
+    DutWrite(dut.rd_en, 0)
+    -> WaitCycles(1, b1)
+
+  b1:
+    Assign(%__t0, 0)
+    Assign(%addr, 0)
+    DutWrite(dut.rd_addr, %addr)
+    DutWrite(dut.rd_en, 1)
+    -> WaitCycles(1, b3)
+
+  b2:
+    AssertCheck { cond: (%__t0 == 0), on_fail: "addr 0: got 0x%02llx", dut.rd_data }
+    Assign(%__t1, 0)
+    Assign(%addr_2, 1)
+    DutWrite(dut.rd_addr, %addr_2)
+    DutWrite(dut.rd_en, 1)
+    -> WaitCycles(1, b5)
+
+  b3:
+    DutRead(%__t0, dut.rd_data)
+    -> Jump(b2)
+
+  b4:
+    AssertCheck { cond: (%__t1 == 49), on_fail: "addr 1: got 0x%02llx", dut.rd_data }
+    Assign(%__t2, 0)
+    Assign(%addr_3, 2)
+    DutWrite(dut.rd_addr, %addr_3)
+    DutWrite(dut.rd_en, 1)
+    -> WaitCycles(1, b7)
+
+  b5:
+    DutRead(%__t1, dut.rd_data)
+    -> Jump(b4)
+
+  b6:
+    AssertCheck { cond: (%__t2 == 90), on_fail: "addr 2: got 0x%02llx", dut.rd_data }
+    Assign(%__t3, 0)
+    Assign(%addr_4, 3)
+    DutWrite(dut.rd_addr, %addr_4)
+    DutWrite(dut.rd_en, 1)
+    -> WaitCycles(1, b9)
+
+  b7:
+    DutRead(%__t2, dut.rd_data)
+    -> Jump(b6)
+
+  b8:
+    AssertCheck { cond: (%__t3 == 118), on_fail: "addr 3: got 0x%02llx", dut.rd_data }
+    Assign(%__t4, 0)
+    Assign(%addr_5, 4)
+    DutWrite(dut.rd_addr, %addr_5)
+    DutWrite(dut.rd_en, 1)
+    -> WaitCycles(1, b11)
+
+  b9:
+    DutRead(%__t3, dut.rd_data)
+    -> Jump(b8)
+
+  b10:
+    AssertCheck { cond: (%__t4 == 127), on_fail: "addr 4: got 0x%02llx", dut.rd_data }
+    Assign(%__t5, 0)
+    Assign(%addr_6, 5)
+    DutWrite(dut.rd_addr, %addr_6)
+    DutWrite(dut.rd_en, 1)
+    -> WaitCycles(1, b13)
+
+  b11:
+    DutRead(%__t4, dut.rd_data)
+    -> Jump(b10)
+
+  b12:
+    AssertCheck { cond: (%__t5 == 118), on_fail: "addr 5: got 0x%02llx", dut.rd_data }
+    Assign(%__t6, 0)
+    Assign(%addr_7, 6)
+    DutWrite(dut.rd_addr, %addr_7)
+    DutWrite(dut.rd_en, 1)
+    -> WaitCycles(1, b15)
+
+  b13:
+    DutRead(%__t5, dut.rd_data)
+    -> Jump(b12)
+
+  b14:
+    AssertCheck { cond: (%__t6 == 90), on_fail: "addr 6: got 0x%02llx", dut.rd_data }
+    Assign(%__t7, 0)
+    Assign(%addr_8, 7)
+    DutWrite(dut.rd_addr, %addr_8)
+    DutWrite(dut.rd_en, 1)
+    -> WaitCycles(1, b17)
+
+  b15:
+    DutRead(%__t6, dut.rd_data)
+    -> Jump(b14)
+
+  b16:
+    AssertCheck { cond: (%__t7 == 49), on_fail: "addr 7: got 0x%02llx", dut.rd_data }
+    Log(info, "PASS: 8 ROM entries match the inline-init pattern")
+    -> Return
+
+  b17:
+    DutRead(%__t7, dut.rd_data)
+    -> Jump(b16)
+
+fn fn2 check_RomLutTest [kind=Check, owner=tb0]
+  entry = b0
+
+  b0:
+    CovReport(cov.cg0)
+    AssertCheck { cond: (CovBin(cov.cg0, cp_addr, a0) > 0), on_fail: "addr 0 coverage hole" }
+    AssertCheck { cond: (CovBin(cov.cg0, cp_addr, a7) > 0), on_fail: "addr 7 coverage hole" }
+    -> Return
