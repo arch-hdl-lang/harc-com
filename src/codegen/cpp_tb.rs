@@ -17814,7 +17814,7 @@ fn check_addrmap_overlap(a: &AddrmapDecl) -> Option<String> {
 ///
 /// Tests with `for_testbench: None` (classic form) pass through
 /// unchanged.
-fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
+pub(crate) fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
     // Index components by name so the desugarer can resolve the
     // bound testbench's field list without re-walking the file.
     let mut components: std::collections::HashMap<String, ComponentDecl> =
@@ -19129,12 +19129,12 @@ fn is_wide_int_literal(e: &Expr) -> Option<Vec<String>> {
 /// bits print in full instead of being truncated to a `long long`.
 /// All other specs use the legacy long-long printf ABI via
 /// `harc_rt::harc_printf_ll(...)`.
-struct InterpCap {
-    expr: String,
-    wide_hex: Option<(usize, bool)>,
+pub(crate) struct InterpCap {
+    pub(crate) expr: String,
+    pub(crate) wide_hex: Option<(usize, bool)>,
 }
 
-fn process_interp(s: &str) -> (String, Vec<InterpCap>) {
+pub(crate) fn process_interp(s: &str) -> (String, Vec<InterpCap>) {
     let mut fmt = String::with_capacity(s.len());
     let mut captures: Vec<InterpCap> = Vec::new();
     let bytes = s.as_bytes();
@@ -19179,7 +19179,7 @@ fn process_interp(s: &str) -> (String, Vec<InterpCap>) {
 /// - `wide_hex_info` is `Some((width, upper))` when the spec is hex
 ///   wider than 16 digits — the caller must emit the value via
 ///   `HarcHexBuf128` so it prints in full 128-bit precision.
-fn translate_fmt_spec(spec: &str) -> (String, Option<(usize, bool)>) {
+pub(crate) fn translate_fmt_spec(spec: &str) -> (String, Option<(usize, bool)>) {
     if spec.is_empty() {
         return ("%lld".to_string(), None);
     }

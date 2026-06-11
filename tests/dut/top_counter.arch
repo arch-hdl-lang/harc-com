@@ -1,0 +1,47 @@
+//! ---
+//! tags: [module, counter, instantiation, tutorial]
+//! ---
+//!
+//! Module-instantiation tutorial: a parameterized `Counter` module
+//! instantiated by a `Top` wrapper. Demonstrates `inst`, parameter
+//! override, and port direction-arrow syntax (`<-` input, `->` output).
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+/// Parameterized increment-on-enable counter.
+///
+/// Width is set at instantiation via `param WIDTH`. Increments by 1 each
+/// cycle while `en` is high; wraps within WIDTH bits via `.trunc<WIDTH>()`.
+module Counter
+  param WIDTH: const = 8;
+  port clk: in Clock<SysDomain>;
+  port rst: in Reset<Sync>;
+  port en: in Bool;
+  port count: out UInt<WIDTH>;
+  reg count_r: UInt<WIDTH> reset rst => 0;
+  seq on clk rising
+    if en
+      count_r <= (count_r + 1).trunc<WIDTH>();
+    end if
+  end seq
+  comb
+    count = count_r;
+  end comb
+end module Counter
+
+/// Top wrapper: instantiates a single `Counter` and exposes its outputs.
+module Top
+  port clk: in Clock<SysDomain>;
+  port rst: in Reset<Sync>;
+  port en: in Bool;
+  port count_out: out UInt<8>;
+  inst ctr: Counter
+    param WIDTH = 8;
+    clk <- clk;
+    rst <- rst;
+    en <- en;
+    count -> count_out;
+  end inst ctr
+end module Top
