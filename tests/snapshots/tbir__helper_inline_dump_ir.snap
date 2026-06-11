@@ -1,0 +1,57 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 HelperMixTest_tb (synthetic) { dut: Top }
+  test HelperMixTest tb=tb0 run=fn1 check=-
+
+fn fn0 double_it [kind=Helper]
+  params:
+    x : uint<8>
+  locals:
+    %0 x : uint<8>
+    %1 __ret : unknown
+  ret = %__ret
+  entry = b0
+
+  b0:
+    Assign(%__ret, (%x + %x))
+    -> Return
+
+fn fn1 run_HelperMixTest [kind=Run, owner=tb0]
+  locals:
+    %0 __t0 : unknown
+    %1 addr : unknown
+    %2 __t1 : unknown
+    %3 addr_2 : unknown
+    %4 d : unknown
+  entry = b0
+
+  b0:
+    Assign(%__t0, 0)
+    Assign(%addr, 2)
+    DutWrite(dut.rd_addr, %addr)
+    DutWrite(dut.rd_en, 1)
+    -> WaitCycles(1, b2)
+
+  b1:
+    AssertCheck { cond: (%__t0 == 90), on_fail: "bad rom value" }
+    Assign(%__t1, 0)
+    Assign(%addr_2, 3)
+    DutWrite(dut.rd_addr, %addr_2)
+    DutWrite(dut.rd_en, 1)
+    -> WaitCycles(1, b4)
+
+  b2:
+    DutRead(%__t0, dut.rd_data)
+    -> Jump(b1)
+
+  b3:
+    Assign(%d, double_it(%__t1))
+    AssertCheck { cond: (%d == 236), on_fail: "bad doubled value" }
+    -> Return
+
+  b4:
+    DutRead(%__t1, dut.rd_data)
+    -> Jump(b3)

@@ -308,6 +308,218 @@ end test HelperTest
     assert!(msg.contains("--codegen v1"), "suggests v1: {msg}");
 }
 
+// ── Helper functions: pure C++ calls vs CFG inlining ────────────────
+
+/// Source with one impure helper (DUT access + `wait` + `return`),
+/// called twice, plus one pure helper called from the run body.
+const HELPER_MIX_SRC: &str = r#"
+function read_addr(d: Top, addr: uint<3>) -> uint<8>
+    d.rd_addr = addr
+    d.rd_en = 1
+    wait 1 cycle
+    return d.rd_data
+end function read_addr
+
+function double_it(x: uint<8>) -> uint<8>
+    return x + x
+end function double_it
+
+test HelperMixTest
+    let dut : Top
+    run
+        assert read_addr(dut, 2) == 90 else fail("bad rom value")
+        let d = double_it(read_addr(dut, 3))
+        assert d == 236 else fail("bad doubled value")
+    end run
+end test HelperMixTest
+"#;
+
+/// Locks the inlined-CFG dump-ir text: the impure helper's body
+/// (DutWrite / WaitCycles / DutRead-return) appears inline in the run
+/// function with remapped blocks and deduplicated param locals, while
+/// the pure helper stays a standalone `Helper` function invoked via
+/// `Expr::Call`.
+#[test]
+fn helper_inline_dump_ir_snapshot() {
+    let prog = lower_src(HELPER_MIX_SRC).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("helper_inline_dump_ir", format!("{prog}"));
+}
+
+/// Categorization: DUT/sync-touching helpers are inlined (no standalone
+/// function); pure helpers lower once as `FunctionKind::Helper` and the
+/// call site stays `Expr::Call(CallTarget::Helper, ...)`.
+#[test]
+fn helper_categorization_pure_vs_impure() {
+    let prog = lower_src(HELPER_MIX_SRC).expect("lowers");
+    let helper_fns: Vec<&ir::TbFunction> = prog
+        .functions
+        .iter()
+        .filter(|f| f.kind == ir::FunctionKind::Helper)
+        .collect();
+    assert_eq!(helper_fns.len(), 1, "only the pure helper is standalone");
+    assert_eq!(helper_fns[0].name, "double_it");
+    assert!(helper_fns[0].ret.is_some(), "pure helper carries a ret slot");
+
+    // The run body inlined read_addr (WaitCycles from the helper body)
+    // and calls double_it by name.
+    let run = prog.function(prog.tests[0].run);
+    let waits = run
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.terminator, ir::Terminator::WaitCycles(..)))
+        .count();
+    assert_eq!(waits, 2, "one inlined wait per read_addr call:\n{run}");
+    let calls_double_it = run.blocks.iter().any(|b| {
+        b.stmts.iter().any(|s| {
+            matches!(s, ir::Stmt::Assign(_, e)
+                if format!("{:?}", e).contains("Helper(\"double_it\")"))
+        })
+    });
+    assert!(calls_double_it, "pure call survives as Expr::Call:\n{run}");
+}
+
+/// Param remapping: each inline site gets fresh locals for the helper's
+/// params — two calls must not share the `addr` slot.
+#[test]
+fn helper_inline_param_remapping() {
+    let prog = lower_src(HELPER_MIX_SRC).expect("lowers");
+    let run = prog.function(prog.tests[0].run);
+    let addr_locals: Vec<&str> = run
+        .locals
+        .iter()
+        .map(|l| l.name.as_str())
+        .filter(|n| n.starts_with("addr"))
+        .collect();
+    assert_eq!(
+        addr_locals,
+        vec!["addr", "addr_2"],
+        "each inline site declares its own param local:\n{run}"
+    );
+}
+
+/// Direct recursion is rejected up front with the cycle path.
+#[test]
+fn helper_direct_recursion_is_unsupported() {
+    let src = r#"
+function spin(d: Top) -> uint<8>
+    return spin(d)
+end function spin
+
+test RecTest
+    let dut : Top
+    run
+        let x = spin(dut)
+    end run
+end test RecTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("recursive helper functions"), "{msg}");
+    assert!(msg.contains("spin -> spin"), "names the cycle: {msg}");
+}
+
+/// Mutual recursion is rejected even when the helpers are never called
+/// (the call-graph DFS runs before any body lowers).
+#[test]
+fn helper_mutual_recursion_is_unsupported() {
+    let src = r#"
+function ping(x: uint<8>) -> uint<8>
+    return pong(x)
+end function ping
+
+function pong(x: uint<8>) -> uint<8>
+    return ping(x)
+end function pong
+
+test MutRecTest
+    let dut : Top
+    run
+        dut.en = 1
+    end run
+end test MutRecTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("recursive helper functions"), "{msg}");
+    assert!(
+        msg.contains("ping -> pong -> ping") || msg.contains("pong -> ping -> pong"),
+        "names the cycle: {msg}"
+    );
+}
+
+/// An impure helper call inside a `${...}` message capture cannot be
+/// inlined (messages evaluate lazily at the failure site).
+#[test]
+fn helper_impure_call_in_message_is_unsupported() {
+    let src = r#"
+function peek(d: Top) -> uint<8>
+    wait 1 cycle
+    return d.rd_data
+end function peek
+
+test FmtTest
+    let dut : Top
+    run
+        assert dut.rd_data == 0 else fail("got ${peek(dut)}")
+    end run
+end test FmtTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("peek"), "names the helper: {msg}");
+    assert!(msg.contains("--codegen v1"), "suggests v1: {msg}");
+}
+
+/// `break` inside an inlined helper body must not bind to a loop open
+/// at the call site — helpers are free functions.
+#[test]
+fn helper_inline_break_cannot_bind_caller_loop() {
+    let src = r#"
+function bail(d: Top)
+    d.en = 0
+    break
+end function bail
+
+test BreakTest
+    let dut : Top
+    run
+        for i in 0 .. 4
+            bail(dut)
+        end for
+    end run
+end test BreakTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)),
+        "break outside a loop is a structural error: {err:?}"
+    );
+    assert!(err.to_string().contains("break"), "{err}");
+}
+
+/// tbir emission for the helper mix: the pure helper becomes a
+/// file-scope C++ function; the impure helper's wait shows up as a
+/// co_await in the run coroutine (CFG-inlined, not a call).
+#[test]
+fn tbir_emit_helper_mix() {
+    let prog = lower_src(HELPER_MIX_SRC).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let cpp = tbir::emit(&prog, &cpp_tb::EmitOpts::default()).expect("emits");
+    for marker in [
+        "static uint64_t harc_helper_double_it(uint64_t x);",
+        "static uint64_t harc_helper_double_it(uint64_t x) {",
+        "harc_helper_double_it(__t",
+        "co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));",
+    ] {
+        assert!(cpp.contains(marker), "missing marker `{marker}` in:\n{cpp}");
+    }
+    assert!(
+        !cpp.contains("read_addr"),
+        "impure helper must be fully inlined, not emitted as a function"
+    );
+}
+
 /// Core lowering shape: a `for` loop becomes init / header-branch /
 /// body / latch / exit, with the counter init outside the loop.
 #[test]

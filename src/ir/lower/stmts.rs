@@ -18,14 +18,18 @@ impl FuncBuilder<'_> {
             StmtKind::Loop(b) => self.lower_loop(b),
             StmtKind::While { cond, body, .. } => self.lower_while(cond, body),
             StmtKind::Break { .. } => {
-                let Some(frame) = self.loop_stack.last() else {
+                // Loops opened in a caller are off-limits to an inlined
+                // helper body — same floor rule as name lookup.
+                let floor = self.inline_frames.last().map_or(0, |f| f.loop_floor);
+                let Some(frame) = self.loop_stack.get(floor..).and_then(|s| s.last()) else {
                     return Err(LowerError::Invalid("`break` outside a loop".to_string()));
                 };
                 self.terminate(Terminator::Jump(frame.break_to));
                 Ok(())
             }
             StmtKind::Continue { .. } => {
-                let Some(frame) = self.loop_stack.last() else {
+                let floor = self.inline_frames.last().map_or(0, |f| f.loop_floor);
+                let Some(frame) = self.loop_stack.get(floor..).and_then(|s| s.last()) else {
                     return Err(LowerError::Invalid(
                         "`continue` outside a loop".to_string(),
                     ));
@@ -47,10 +51,21 @@ impl FuncBuilder<'_> {
                 Ok(())
             }
             StmtKind::Return(None) => {
+                if self.lower_helper_return(None)? {
+                    return Ok(());
+                }
                 self.terminate(Terminator::Return);
                 Ok(())
             }
-            StmtKind::Return(Some(_)) => Err(unsupported("`return <expr>`", "")),
+            StmtKind::Return(Some(e)) => {
+                if self.lower_helper_return(Some(e))? {
+                    return Ok(());
+                }
+                Err(unsupported(
+                    "`return <expr>`",
+                    "run/check bodies do not return a value",
+                ))
+            }
             StmtKind::Assert(v) => self.lower_assert(v),
             StmtKind::Fail { msg, .. } => {
                 // Unconditional failure — design doc: `fail` is a
@@ -123,8 +138,25 @@ impl FuncBuilder<'_> {
                     }
                 }
                 let what = match &*e.kind {
-                    ExprKind::Call { callee, .. } => match &*callee.kind {
-                        ExprKind::Ident(id) => format!("helper call `{}(...)`", id.name),
+                    ExprKind::Call { callee, args } => match &*callee.kind {
+                        ExprKind::Ident(id) => {
+                            if self.helpers.contains(&id.name) {
+                                // Statement-position helper call: lower
+                                // for effect, discard the value. Impure
+                                // helpers inline to an `Expr::Local`
+                                // (already evaluated); pure calls keep
+                                // the `Expr::Call` in a discard temp so
+                                // the C++ call survives, mirroring v1.
+                                let val = self.lower_helper_call(&id.name, args)?;
+                                if !matches!(val, crate::ir::Expr::Local(_)) {
+                                    let val = self.hoist_ports(val);
+                                    let t = self.fresh_temp();
+                                    self.push(Stmt::Assign(t, val));
+                                }
+                                return Ok(());
+                            }
+                            format!("helper call `{}(...)`", id.name)
+                        }
                         ExprKind::Field { name, .. } => {
                             format!("method call `.{}(...)`", name.name)
                         }
@@ -289,7 +321,14 @@ impl FuncBuilder<'_> {
                     format!("`${{{}}}` does not parse as an expression", c.expr),
                 )
             })?;
-            let expr = self.lower_expr(&parsed)?; // ports allowed in format args
+            // Ports are allowed in format args, but DUT/sync-touching
+            // helper calls are not — messages evaluate lazily at the
+            // log/failure site, and an inlined CFG cannot.
+            let was = self.in_fmt_args;
+            self.in_fmt_args = true;
+            let lowered = self.lower_expr(&parsed);
+            self.in_fmt_args = was;
+            let expr = lowered?;
             args.push(FmtArg {
                 expr,
                 wide_hex: c.wide_hex,

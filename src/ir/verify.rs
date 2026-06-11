@@ -401,8 +401,14 @@ fn check_def_before_use(
     }
     // Bitsets as Vec<bool> — function sizes are tiny.
     let full = vec![true; nlocals];
+    // Params count as defined at entry: by convention the first
+    // `params.len()` locals mirror the function's parameters.
+    let mut entry_in = vec![false; nlocals];
+    for slot in entry_in.iter_mut().take(func.params.len()) {
+        *slot = true;
+    }
     let mut ins: Vec<Vec<bool>> = vec![full.clone(); nblocks];
-    ins[func.entry.index()] = vec![false; nlocals];
+    ins[func.entry.index()] = entry_in.clone();
 
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nblocks];
     for (bi, b) in func.blocks.iter().enumerate() {
@@ -434,7 +440,7 @@ fn check_def_before_use(
                 continue;
             }
             let new_in = if bi == func.entry.index() {
-                vec![false; nlocals]
+                entry_in.clone()
             } else {
                 let mut acc = full.clone();
                 let mut any = false;

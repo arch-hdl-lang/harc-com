@@ -55,6 +55,26 @@ pub fn emit(prog: &TbProgram, opts: &EmitOpts) -> Result<String, EmitError> {
     for cg in &prog.covgroups {
         covergroup::covgroup_struct(&mut out, cg);
     }
+    // Lowered pure helpers — file-scope C++ functions. Declaration
+    // order is source order, which is not necessarily topological for
+    // helper-to-helper calls, so prototypes go first.
+    let helpers: Vec<&ir::TbFunction> = prog
+        .functions
+        .iter()
+        .filter(|f| f.kind == ir::FunctionKind::Helper)
+        .collect();
+    for h in &helpers {
+        func::emit_helper_prototype(&mut out, h);
+    }
+    if !helpers.is_empty() {
+        writeln!(out).ok();
+    }
+    for h in &helpers {
+        func::emit_helper_function(&mut out, h)?;
+        writeln!(out).ok();
+    }
+
+    // One struct per unique non-synthetic testbench.
     let mut seen = HashSet::new();
     for tb in &prog.testbenches {
         if !tb.synthetic && seen.insert(tb.name.clone()) {

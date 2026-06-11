@@ -143,11 +143,20 @@ pub struct TbFunction {
     pub id: FunctionId,
     pub name: String,
     pub kind: FunctionKind,
+    /// Declared parameters. Convention: the first `params.len()` entries
+    /// of `locals` mirror the params one-to-one (same order), so a
+    /// `LocalId(i)` with `i < params.len()` *is* the i-th parameter.
+    /// The verifier treats those locals as defined at entry.
     pub params: Vec<TypedParam>,
     pub locals: Vec<TypedLocal>,
     pub blocks: Vec<BasicBlock>,
     pub entry: BlockId,
     pub owner: Option<TestbenchId>,
+    /// Return-value slot for `kind == Helper` functions with a declared
+    /// return type: `return e` lowers to `Assign(ret, e); Return`, and
+    /// the backend emits `return <ret>;` at `Terminator::Return`.
+    /// `None` for run/check functions (their `Return` carries no value).
+    pub ret: Option<LocalId>,
 }
 
 /// Straight-line statements + exactly one terminator. No statement may
