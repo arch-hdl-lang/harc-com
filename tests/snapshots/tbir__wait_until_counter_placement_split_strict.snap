@@ -1,0 +1,15 @@
+---
+source: tests/tbir.rs
+assertion_line: 1081
+expression: "format!(\"{}\", table.display(&prog, &profile))"
+---
+placement [profile=split-strict]
+  fn0 run_WaitUntilCounterTest
+    b0: tier1-near-processor, cycle-exact
+    b1: tier1-near-processor, timing-tolerant
+    b2: tier1-near-processor, timing-tolerant
+    b3: tier1-near-processor, timing-tolerant
+    b4: tier1-near-processor, timing-tolerant
+    b5: tier1-near-processor, timing-tolerant
+  diagnostics:
+    fn0 run_WaitUntilCounterTest b0: cycle-exact DUT interaction, but profile `split-strict` has no cycle-locked execution site (Tier 1 is free-running and there is no Tier 0 to absorb it) — route the pin-level half through a transactor

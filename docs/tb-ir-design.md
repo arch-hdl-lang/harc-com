@@ -544,6 +544,22 @@ the target cannot execute (e.g., a `CycleExact` region on a target
 whose Tier 1 is not cycle-locked and that has no Tier-0 capability to
 absorb it).
 
+> **Shipped shape (2026-06-12, `src/ir/passes/placement.rs`).**
+> Read-only, types in the pass file per the `lower_coroutine`
+> precedent; `PlacementTable.blocks` is a `BTreeMap` (not the
+> `HashMap` above) so the rendered dump is byte-stable. `TargetProfile`
+> shipped as the schema struct plus **named built-in profiles only**:
+> `single_site()` (default — capability checks cannot fire, tested)
+> and `split_strict()` (no Tier 0, free-running Tier 1, probes/forces
+> unreachable, host-sync solving only — the diagnostic demo). A
+> file-based profile format is deliberately deferred; concrete
+> profiles remain backend-owned. Timing classifier is block-local and
+> conservative: pin stmts anchored by `WaitCycles` ⇒ `CycleExact`;
+> `wait until` regions and transactor-call boundaries ⇒
+> `TimingTolerant`; un-anchored pin access ⇒ `Unknown` (cross-block
+> refinement is future work). Diagnostic CLI:
+> `harc dump-ir --pass placement [--profile single-site|split-strict]`.
+
 ### `lower_coroutine` (mutating)
 
 ```rust

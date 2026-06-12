@@ -280,9 +280,17 @@ enum Cmd {
         files: Vec<PathBuf>,
         /// Run a TB-IR pass after lowering + verify and print its
         /// result after the regular IR dump. Available:
-        /// `lower-coroutine` (CFG → tagged-FSM metadata).
+        /// `lower-coroutine` (CFG → tagged-FSM metadata),
+        /// `placement` (per-block tier + timing class, capability-
+        /// checked against `--profile`).
         #[arg(long)]
         pass: Option<String>,
+        /// Target profile for `--pass placement`. Built-ins:
+        /// `single-site` (default; the cpp_tb profile — never
+        /// diagnoses) and `split-strict` (constrained demo profile
+        /// that surfaces capability diagnostics).
+        #[arg(long)]
+        profile: Option<String>,
     },
     /// Diff two semantic JSONL traces (e.g. v1 vs tbir backends, or
     /// arch vs Verilator) after normalizing backend-specific noise.
@@ -490,7 +498,11 @@ fn main() -> Result<()> {
                 }
             })
         }
-        Cmd::DumpIr { files, pass } => cmd_dump_ir(files, pass),
+        Cmd::DumpIr {
+            files,
+            pass,
+            profile,
+        } => cmd_dump_ir(files, pass, profile),
         Cmd::TraceDiff { a, b } => cmd_trace_diff(&a, &b),
         Cmd::TraceMerge {
             vcd,
@@ -1160,14 +1172,35 @@ fn cmd_check(files: Vec<PathBuf>, ast: bool) -> Result<()> {
 /// (merge_for_sim), lower to TB-IR, verify, and print the textual IR
 /// form. With `--pass`, additionally run the named TB-IR pass and
 /// print its result after the IR dump.
-fn cmd_dump_ir(files: Vec<PathBuf>, pass: Option<String>) -> Result<()> {
+fn cmd_dump_ir(files: Vec<PathBuf>, pass: Option<String>, profile: Option<String>) -> Result<()> {
+    use harc::ir::passes::placement::TargetProfile;
     // Validate the pass name up front so a typo fails before the dump.
-    let run_lower_coroutine = match pass.as_deref() {
-        None => false,
-        Some("lower-coroutine") | Some("lower_coroutine") => true,
+    enum DumpPass {
+        None,
+        LowerCoroutine,
+        Placement,
+    }
+    let dump_pass = match pass.as_deref() {
+        None => DumpPass::None,
+        Some("lower-coroutine") | Some("lower_coroutine") => DumpPass::LowerCoroutine,
+        Some("placement") => DumpPass::Placement,
         Some(other) => {
             return Err(miette::miette!(
-                "unknown pass `{other}` (available: lower-coroutine)"
+                "unknown pass `{other}` (available: lower-coroutine, placement)"
+            ));
+        }
+    };
+    // Validate the profile up front too; it only applies to placement.
+    let target_profile = match (&dump_pass, profile.as_deref()) {
+        (_, None) => TargetProfile::single_site(),
+        (DumpPass::Placement, Some(name)) => TargetProfile::by_name(name).ok_or_else(|| {
+            miette::miette!(
+                "unknown profile `{name}` (built-ins: single-site, split-strict)"
+            )
+        })?,
+        (_, Some(_)) => {
+            return Err(miette::miette!(
+                "--profile only applies to `--pass placement`"
             ));
         }
     };
@@ -1189,11 +1222,19 @@ fn cmd_dump_ir(files: Vec<PathBuf>, pass: Option<String>) -> Result<()> {
         )
     })?;
     print!("{prog}");
-    if run_lower_coroutine {
-        let meta =
-            harc::ir::passes::lower_coroutine::run(&prog).map_err(|e| miette::miette!("{}", e))?;
-        println!();
-        print!("{}", meta.display(&prog));
+    match dump_pass {
+        DumpPass::None => {}
+        DumpPass::LowerCoroutine => {
+            let meta = harc::ir::passes::lower_coroutine::run(&prog)
+                .map_err(|e| miette::miette!("{}", e))?;
+            println!();
+            print!("{}", meta.display(&prog));
+        }
+        DumpPass::Placement => {
+            let table = harc::ir::passes::placement::run(&prog, &target_profile);
+            println!();
+            print!("{}", table.display(&prog, &target_profile));
+        }
     }
     Ok(())
 }

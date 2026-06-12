@@ -7,3 +7,4 @@
 //! mutating pass must leave the program `verify`-clean.
 
 pub mod lower_coroutine;
+pub mod placement;
