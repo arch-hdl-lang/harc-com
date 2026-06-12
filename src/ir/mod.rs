@@ -46,6 +46,10 @@ ir_id!(
     /// Index into `TbProgram::testbenches`.
     TestbenchId
 );
+ir_id!(
+    /// Index into `TbProgram::records`.
+    RecordId
+);
 
 /// Whole-program IR for one merged HARC source file (post
 /// `merge_for_sim` + impl-for desugaring).
@@ -55,6 +59,55 @@ pub struct TbProgram {
     pub testbenches: Vec<TestbenchSchema>,
     pub tests: Vec<TestSchema>,
     pub covgroups: Vec<CovgroupSchema>,
+    /// Value-record schemas (`transaction` declarations), in file
+    /// order. The design doc's records table; see `RecordSchema`.
+    pub records: Vec<RecordSchema>,
+}
+
+/// One `transaction` declaration, lowered to its structural shape:
+/// fields with names/types/defaults in declaration order. Both
+/// backends emit this as a C++ value-record struct (v1's
+/// `emit_record_struct` shape is the behavior reference).
+///
+/// Constraint metadata is **carried but inert**: `keeps` and the
+/// per-field `attr_src` strings hold pretty-printed source text for
+/// dump-ir/diagnostics only. When `randomize` lands, constraints will
+/// NOT be lowered from these strings — the constraint-IR layer
+/// (`src/constraints`, `elaborate_constraints` → `CTypedProblem`)
+/// re-elaborates from the AST and the randomize terminator will carry
+/// a `ConstraintRef` handle into that layer, per the design doc.
+#[derive(Debug, Clone)]
+pub struct RecordSchema {
+    pub name: String,
+    pub fields: Vec<RecordFieldSchema>,
+    /// `keep <expr>` constraint clauses, pretty-printed. Inert (see
+    /// the struct doc); randomize-free usage never evaluates them,
+    /// which matches v1 (keeps emit zero C++ unless randomized).
+    pub keeps: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordFieldSchema {
+    pub name: String,
+    /// Scalar field type. Lowering rejects non-scalar field types
+    /// (nested records, enums, lists, vecs) and widths above 64 bits.
+    pub ty: IrType,
+    /// Declared `default <lit>` value (int/bool literals only), or
+    /// `None` for the type-appropriate zero — same fallback as v1.
+    pub default: Option<u64>,
+    /// `!` prefix — pinned during randomization. Inert until the
+    /// randomize slice lands; carried for the constraint seam.
+    pub non_random: bool,
+    /// `with [...]` field attributes, pretty-printed and inert (see
+    /// `RecordSchema` doc — the constraint layer re-elaborates these
+    /// from the AST when randomize lands).
+    pub attr_src: Vec<String>,
+}
+
+impl RecordSchema {
+    pub fn field(&self, name: &str) -> Option<&RecordFieldSchema> {
+        self.fields.iter().find(|f| f.name == name)
+    }
 }
 
 /// One `test` (or `impl <Test> for <Tb>`) declaration.
@@ -136,6 +189,8 @@ pub enum IrType {
     UInt(Option<u32>),
     SInt(Option<u32>),
     Bool,
+    /// A transaction value-record local (`let t : TxnType`).
+    Record(RecordId),
     Unknown,
 }
 
@@ -174,6 +229,19 @@ pub enum Stmt {
     Assign(LocalId, Expr),
     DutWrite(PortRef, Expr),
     DutRead(LocalId, PortRef),
+    /// (Re-)default-construct a record-typed local at its `let` site.
+    /// Emitted as an explicit assignment (not just the hoisted
+    /// declaration's initializer) because v1 declares the struct at
+    /// the source `let` position — a `let t : Txn` inside a loop body
+    /// re-runs the field defaults every iteration.
+    RecordInit(LocalId, RecordId),
+    /// `t.field = value` on a record-typed local. The value is
+    /// port-hoisted like `Assign` (no inline DUT reads).
+    RecordFieldWrite {
+        local: LocalId,
+        field: String,
+        value: Expr,
+    },
     Log { level: LogLevel, args: FmtArgs },
     AssertCheck { cond: Expr, on_fail: FmtArgs },
     CovReport(CovgroupInstance),
@@ -292,6 +360,9 @@ pub enum Expr {
     Literal { value: u64, ty: IrType },
     Local(LocalId),
     Port(PortRef),
+    /// `t.field` read on a record-typed local. Host state, not DUT
+    /// state — allowed in every expression position a `Local` is.
+    RecordField { local: LocalId, field: String },
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Unary(UnOp, Box<Expr>),
     CovBin {
@@ -435,6 +506,10 @@ impl TbProgram {
 
     pub fn testbench(&self, id: TestbenchId) -> &TestbenchSchema {
         &self.testbenches[id.index()]
+    }
+
+    pub fn record(&self, id: RecordId) -> &RecordSchema {
+        &self.records[id.index()]
     }
 }
 

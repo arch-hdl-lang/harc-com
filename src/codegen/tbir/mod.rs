@@ -50,6 +50,17 @@ pub fn emit(prog: &TbProgram, opts: &EmitOpts) -> Result<String, EmitError> {
     let mut out = String::new();
     runtime::preamble(&mut out, &dut_type, &test_names);
 
+    // Transaction value-record structs, in declaration order. Mirrors
+    // v1's `emit_record_struct` shape (field defaults as member
+    // initializers, `operator==`/`!=`). v1's other record companions
+    // — `randomize_<T>` and the pack/unpack helpers — are NOT emitted:
+    // every construct that could reach them (`randomize`, bus sends)
+    // is rejected at lowering, so they would be dead text here. They
+    // land with their constructs.
+    for r in &prog.records {
+        record_struct(&mut out, r);
+    }
+
     // Covergroup structs (leaf observables — they never name a TB or
     // DUT type), then one struct per unique non-synthetic testbench.
     for cg in &prog.covgroups {
@@ -94,6 +105,53 @@ pub fn emit(prog: &TbProgram, opts: &EmitOpts) -> Result<String, EmitError> {
 
     runtime::dispatcher(&mut out, &test_names);
     Ok(out)
+}
+
+/// One transaction value-record struct. Field C types follow v1's
+/// `txn_field_c_type` for the lowered (≤64-bit scalar) subset:
+/// unsigned → `uint64_t`, signed → `int64_t`, bool/bit → `bool`.
+fn record_struct(out: &mut String, r: &ir::RecordSchema) {
+    writeln!(out, "struct {} {{", r.name).ok();
+    for f in &r.fields {
+        let (cty, init) = match f.ty {
+            ir::IrType::Bool => (
+                "bool",
+                if f.default.is_some_and(|d| d != 0) { "true" } else { "false" }.to_string(),
+            ),
+            ir::IrType::SInt(_) => ("int64_t", f.default.unwrap_or(0).to_string()),
+            _ => ("uint64_t", f.default.unwrap_or(0).to_string()),
+        };
+        writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
+    }
+    writeln!(out, "}};").ok();
+    if r.fields.is_empty() {
+        writeln!(
+            out,
+            "inline bool operator==(const {0}& a, const {0}& b) {{ (void)a; (void)b; return true; }}",
+            r.name
+        )
+        .ok();
+    } else {
+        let eq = r
+            .fields
+            .iter()
+            .map(|f| format!("a.{0} == b.{0}", f.name))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        writeln!(
+            out,
+            "inline bool operator==(const {0}& a, const {0}& b) {{ return {eq}; }}",
+            r.name
+        )
+        .ok();
+    }
+    writeln!(
+        out,
+        "inline bool operator!=(const {0}& a, const {0}& b) {{ return !(a == b); }}",
+        r.name
+    )
+    .ok();
+    writeln!(out).ok();
 }
 
 fn emit_test(
@@ -163,9 +221,9 @@ fn emit_test(
     if !tb.synthetic {
         writeln!(out, "{INDENT}{INDENT}_tb.dut = dut;").ok();
     }
-    func::emit_function(out, prog.function(test.run), 2)?;
+    func::emit_function(out, prog.function(test.run), &prog.records, 2)?;
     if let Some(check) = test.check {
-        func::emit_function(out, prog.function(check), 2)?;
+        func::emit_function(out, prog.function(check), &prog.records, 2)?;
     }
     writeln!(out, "{INDENT}{INDENT}co_return;").ok();
     writeln!(out, "{INDENT}}}(&_run_slot);").ok();

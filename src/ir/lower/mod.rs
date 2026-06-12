@@ -15,6 +15,7 @@ mod control;
 mod covergroups;
 mod exprs;
 mod helpers;
+mod records;
 mod stmts;
 
 use crate::ast::{
@@ -23,8 +24,8 @@ use crate::ast::{
 };
 use crate::ir::{
     self, BasicBlock, BlockId, ClockSpec, CovgroupId, CovgroupSchema, FunctionId, FunctionKind,
-    IrType, LocalId, TbFunction, TbProgram, TestSchema, TestbenchId, TestbenchSchema, Terminator,
-    TypedLocal, TypedParam,
+    IrType, LocalId, RecordId, RecordSchema, TbFunction, TbProgram, TestSchema, TestbenchId,
+    TestbenchSchema, Terminator, TypedLocal, TypedParam,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -122,6 +123,20 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             covgroups.push(schema);
         }
     }
+    // Record schemas (`transaction` declarations), in file order. All
+    // declarations lower (even unreferenced ones — v1 emits a struct
+    // for each), so unsupported transaction shapes are rejected here
+    // rather than dropped.
+    let mut record_ids: HashMap<String, RecordId> = HashMap::new();
+    let mut record_schemas: Vec<RecordSchema> = Vec::new();
+    for it in &file.items {
+        if let Item::Transaction(t) = it {
+            let schema = records::lower_transaction(t)?;
+            record_ids.insert(t.name.name.clone(), RecordId(record_schemas.len() as u32));
+            record_schemas.push(schema);
+        }
+    }
+
     // Helper functions: categorize pure vs impure, reject recursion.
     // Pure helpers lower eagerly below; impure helpers are CFG-inlined
     // at each call site during body lowering.
@@ -131,7 +146,12 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // explicit Unsupported, never silently dropped.
     for it in &file.items {
         match it {
-            Item::Use(_) | Item::Domain(_) | Item::Test(_) | Item::Covergroup(_) | Item::Function(_) => {}
+            Item::Use(_)
+            | Item::Domain(_)
+            | Item::Test(_)
+            | Item::Covergroup(_)
+            | Item::Function(_)
+            | Item::Transaction(_) => {}
             // `extend` was already folded by merge_for_sim; a survivor
             // means the merge didn't apply (e.g. dump-ir on a lone
             // extension file).
@@ -143,7 +163,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             }
             Item::Env(c) => {
                 if used_tbs.contains(&c.name.name) {
-                    validate_testbench_component(c, &components, &covgroup_ids)?;
+                    validate_testbench_component(c, &components, &covgroup_ids, &record_ids)?;
                 } else {
                     return Err(unsupported(
                         &format!("env/component `{}`", c.name.name),
@@ -162,17 +182,22 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
 
     let mut prog = TbProgram {
         covgroups,
+        records: record_schemas,
         ..TbProgram::default()
     };
 
     // Eagerly lower pure helpers (declaration order) so call sites can
     // stay `Expr::Call` and backends emit them as plain C++ functions.
+    // Records are visible (for precise rejection messages), but pure
+    // helpers cannot hold record locals — see `lower_let`.
     let helper_ctx = LowerCtx {
         dut_field: "dut".to_string(),
         tb_field: None,
         cov_fields: HashMap::new(),
         covgroups: Vec::new(),
         clock_names: Vec::new(),
+        record_ids: record_ids.clone(),
+        records: prog.records.clone(),
     };
     for it in &file.items {
         let Item::Function(fd) = it else { continue };
@@ -191,7 +216,16 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
 
     for it in &file.items {
         let Item::Test(t) = it else { continue };
-        lower_test(t, &tb_of_test, &components, &domains, &covgroup_ids, &helper_registry, &mut prog)?;
+        lower_test(
+            t,
+            &tb_of_test,
+            &components,
+            &domains,
+            &covgroup_ids,
+            &record_ids,
+            &helper_registry,
+            &mut prog,
+        )?;
     }
 
     if prog.tests.is_empty() {
@@ -209,6 +243,7 @@ fn validate_testbench_component(
     c: &ComponentDecl,
     components: &HashMap<String, &ComponentDecl>,
     covgroup_ids: &HashMap<String, CovgroupId>,
+    record_ids: &HashMap<String, RecordId>,
 ) -> Result<(), LowerError> {
     for ci in &c.items {
         match ci {
@@ -217,6 +252,18 @@ fn validate_testbench_component(
                     let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
                     if covgroup_ids.contains_key(simple) {
                         continue;
+                    }
+                    // Without this gate a transaction-typed field would
+                    // fall through to the "assume DUT module type" arm
+                    // and mis-lower.
+                    if record_ids.contains_key(simple) {
+                        return Err(unsupported(
+                            &format!(
+                                "testbench field `{}` of transaction type `{}`",
+                                f.name.name, simple
+                            ),
+                            "",
+                        ));
                     }
                     if components.contains_key(simple) {
                         return Err(unsupported(
@@ -283,12 +330,14 @@ fn item_label(it: &Item) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_test(
     t: &TestDecl,
     tb_of_test: &HashMap<String, String>,
     components: &HashMap<String, &ComponentDecl>,
     domains: &HashMap<String, i64>,
     covgroup_ids: &HashMap<String, CovgroupId>,
+    record_ids: &HashMap<String, RecordId>,
     helpers: &helpers::HelperRegistry<'_>,
     prog: &mut TbProgram,
 ) -> Result<(), LowerError> {
@@ -469,6 +518,8 @@ fn lower_test(
         cov_fields: cov_fields.iter().cloned().collect(),
         covgroups: prog.covgroups.clone(),
         clock_names: clock_specs.iter().map(|c| c.name.clone()).collect(),
+        record_ids: record_ids.clone(),
+        records: prog.records.clone(),
     };
 
     // Synthesized auto-sampler functions, one per covergroup field, in
@@ -617,6 +668,13 @@ pub(crate) struct LowerCtx {
     /// never contain a wait — waits make a helper impure, so it is
     /// CFG-inlined under the calling test's context instead).
     pub clock_names: Vec<String>,
+    /// Transaction record names → ids, for `let t : TxnType`
+    /// resolution (the IR mirror of v1's `transactions` set seeding
+    /// let-type resolution).
+    pub record_ids: HashMap<String, RecordId>,
+    /// Snapshot of the program's record schemas, for field validation
+    /// at `t.<field>` lowering sites.
+    pub records: Vec<RecordSchema>,
 }
 
 pub(crate) struct LoopFrame {
@@ -661,6 +719,10 @@ pub(crate) struct FuncBuilder<'a> {
     pub(crate) inline_frames: Vec<InlineFrame>,
     /// Return slot when lowering a standalone pure-helper body.
     pub(crate) helper_ret: Option<LocalId>,
+    /// True while lowering a standalone pure-helper body — record
+    /// locals are rejected there (pure helpers emit as file-scope
+    /// uint64-only C++ functions in the tbir backend).
+    pub(crate) in_pure_helper: bool,
     /// True while lowering `${...}` captures of a log/fail message —
     /// impure helper calls cannot inline there (messages evaluate
     /// lazily at the failure site).
@@ -704,6 +766,7 @@ impl<'a> FuncBuilder<'a> {
             temp_counter: 0,
             inline_frames: Vec::new(),
             helper_ret: None,
+            in_pure_helper: false,
             in_fmt_args: false,
         }
     }
@@ -836,6 +899,14 @@ impl FuncBuilder<'_> {
 
     pub(crate) fn set_local_type(&mut self, l: LocalId, ty: IrType) {
         self.locals[l.index()].ty = ty;
+    }
+
+    /// `Some(record)` when the local is record-typed (`let t : Txn`).
+    pub(crate) fn record_of_local(&self, l: LocalId) -> Option<ir::RecordId> {
+        match self.locals[l.index()].ty {
+            IrType::Record(r) => Some(r),
+            _ => None,
+        }
     }
 
     /// Seal all blocks, prune the ones unreachable from the entry

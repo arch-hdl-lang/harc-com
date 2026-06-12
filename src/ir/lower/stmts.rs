@@ -2,7 +2,7 @@
 //! §"Statements within a run / check / transactor body").
 
 use super::{FuncBuilder, LowerError, unsupported};
-use crate::ast::{CallArg, ExprKind, Stmt as AstStmt, StmtKind};
+use crate::ast::{CallArg, ExprKind, Stmt as AstStmt, StmtKind, TypeExpr};
 use crate::ir::{Expr, FileLogLevel, FmtArg, FmtArgs, IrType, LogLevel, Stmt, Terminator};
 
 impl FuncBuilder<'_> {
@@ -131,7 +131,11 @@ impl FuncBuilder<'_> {
             } => self.lower_wait_until(*mode, conditions, timeout.as_ref()),
             // ── Explicit unsupported stubs (MVP) ────────────────────
             StmtKind::After { .. } => Err(unsupported("`after N cycles` blocks", "")),
-            StmtKind::Randomize { .. } => Err(unsupported("`randomize`", "")),
+            StmtKind::Randomize { .. } => Err(unsupported(
+                "`randomize`",
+                "transaction randomization awaits the constraint-IR seam \
+                 (`ConstraintRef` into src/constraints)",
+            )),
             StmtKind::Fork(_) | StmtKind::JoinAll { .. } => Err(unsupported("`fork`/`join`", "")),
             StmtKind::Parallel(_) => Err(unsupported("`parallel`", "")),
             StmtKind::Schedule(_) => Err(unsupported("`schedule`", "")),
@@ -201,6 +205,30 @@ impl FuncBuilder<'_> {
         if l.bind {
             return Err(unsupported("`= bind ...` declarations", ""));
         }
+        // Record-typed local: `let t : TxnType` default-constructs (v1
+        // declares the struct at the let site, so field defaults re-run
+        // on every loop iteration — RecordInit mirrors that).
+        if let Some(TypeExpr::Named { name, .. }) = l.ty.as_ref() {
+            let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+            if let Some(&rid) = self.ctx.record_ids.get(simple) {
+                if self.in_pure_helper {
+                    return Err(unsupported(
+                        &format!("transaction-typed local `let {}` in a pure helper function", l.name.name),
+                        "pure helpers emit as scalar-only file-scope functions",
+                    ));
+                }
+                if l.value.is_some() {
+                    return Err(unsupported(
+                        &format!("`let {} : {simple} = ...` with an initializer", l.name.name),
+                        "transaction locals default-construct; assign fields individually",
+                    ));
+                }
+                let id = self.declare(&l.name.name);
+                self.set_local_type(id, IrType::Record(rid));
+                self.push(Stmt::RecordInit(id, rid));
+                return Ok(());
+            }
+        }
         let Some(value) = &l.value else {
             return Err(unsupported(
                 &format!("uninitialized `let {}`", l.name.name),
@@ -232,6 +260,24 @@ impl FuncBuilder<'_> {
         if let ExprKind::Ident(id) = &*target.kind {
             if let Some(local) = self.lookup(&id.name) {
                 let e = self.lower_expr_no_ports(value)?;
+                // Whole-record assignment: only a same-typed record
+                // local copies (`t = u` — C++ struct assignment in
+                // both backends). Anything else would otherwise
+                // surface as a verifier TypeMismatch (the internal-
+                // bug channel) or a C++ compile error.
+                if let Some(rid) = self.record_of_local(local) {
+                    let same = matches!(&e, Expr::Local(src)
+                        if self.record_of_local(*src) == Some(rid));
+                    if !same {
+                        return Err(unsupported(
+                            &format!(
+                                "assignment of a non-`{}` value to transaction local `{}`",
+                                self.ctx.records[rid.index()].name, id.name
+                            ),
+                            "assign fields individually, or copy from a same-typed transaction local",
+                        ));
+                    }
+                }
                 self.push(Stmt::Assign(local, e));
                 return Ok(());
             }
@@ -239,6 +285,29 @@ impl FuncBuilder<'_> {
                 &format!("assignment to unknown name `{}`", id.name),
                 "",
             ));
+        }
+        // `t.field = value` on a record-typed local.
+        if let ExprKind::Field { target: ft, name } = &*target.kind {
+            if let ExprKind::Ident(root) = &*ft.kind {
+                if let Some(local) = self.lookup(&root.name) {
+                    if let Some(rid) = self.record_of_local(local) {
+                        let schema = &self.ctx.records[rid.index()];
+                        if schema.field(&name.name).is_none() {
+                            return Err(LowerError::Invalid(format!(
+                                "transaction `{}` has no field `{}`",
+                                schema.name, name.name
+                            )));
+                        }
+                        let e = self.lower_expr_no_ports(value)?;
+                        self.push(Stmt::RecordFieldWrite {
+                            local,
+                            field: name.name.clone(),
+                            value: e,
+                        });
+                        return Ok(());
+                    }
+                }
+            }
         }
         Err(unsupported("assignment to a non-port, non-local target", ""))
     }

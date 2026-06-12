@@ -1,0 +1,95 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 TxnBasicTb { dut: Top }
+  test TransactionBasicTest tb=tb0 run=fn0 check=- clock=clk@10000ps(SysDomain)
+  record r0 CountCmd
+    ticks : uint<8> default 2 [range(1, 9)] (inert)
+    flag : bool default true
+    !tag : uint<16> default 7
+    expect : uint<32>
+    keep ticks in [1..16] (inert)
+
+fn fn0 run_TransactionBasicTest [kind=Run, owner=tb0]
+  locals:
+    %0 total : unknown
+    %1 i : unknown
+    %2 cmd : record(r0)
+    %3 _anon : unknown
+    %4 __t0 : unknown
+    %5 got : unknown
+    %6 final_cmd : record(r0)
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.en, 0)
+    -> WaitCycles(3, b1)
+
+  b1:
+    AssertCheck { cond: (dut.count_out == 0), on_fail: "after reset: count_out=%lld, expected 0", dut.count_out }
+    DutWrite(dut.rst, 0)
+    Assign(%total, 0)
+    Assign(%i, 0)
+    -> Jump(b2)
+
+  b2:
+    -> Branch((%i < 3), b3, b5)
+
+  b3:
+    RecordInit(%cmd, r0)
+    AssertCheck { cond: (%cmd.ticks == 2), on_fail: "cmd[%lld]: default ticks=%lld, expected 2", %i, %cmd.ticks }
+    AssertCheck { cond: (%cmd.tag == 7), on_fail: "cmd[%lld]: default tag=%lld, expected 7", %i, %cmd.tag }
+    AssertCheck { cond: (%cmd.expect == 0), on_fail: "cmd[%lld]: expect not re-zeroed (%lld)", %i, %cmd.expect }
+    RecordFieldWrite(%cmd.ticks, (%cmd.ticks + %i))
+    Assign(%total, (%total + %cmd.ticks))
+    RecordFieldWrite(%cmd.expect, %total)
+    -> Branch(%cmd.flag, b7, b8)
+
+  b4:
+    Assign(%i, (%i + 1))
+    -> Jump(b2)
+
+  b5:
+    DutWrite(dut.en, 0)
+    RecordInit(%final_cmd, r0)
+    RecordFieldWrite(%final_cmd.expect, %total)
+    -> WaitCycles(2, b14)
+
+  b6:
+    Assign(%_anon, 0)
+    Assign(%__t0, %cmd.ticks)
+    -> Jump(b9)
+
+  b7:
+    DutWrite(dut.en, 1)
+    -> Jump(b6)
+
+  b8:
+    -> Jump(b6)
+
+  b9:
+    -> Branch((%_anon < %__t0), b10, b12)
+
+  b10:
+    -> WaitCycles(1, b13)
+
+  b11:
+    Assign(%_anon, (%_anon + 1))
+    -> Jump(b9)
+
+  b12:
+    DutRead(%got, dut.count_out)
+    AssertCheck { cond: (%got == %cmd.expect), on_fail: "cmd[%lld]: count_out=%lld, expected %lld", %i, %got, %cmd.expect }
+    Log(info, "cmd[%lld] ticks=%lld tag=%lld -> count_out=%lld", %i, %cmd.ticks, %cmd.tag, %got)
+    -> Jump(b4)
+
+  b13:
+    -> Jump(b11)
+
+  b14:
+    AssertCheck { cond: (dut.count_out == %final_cmd.expect), on_fail: "hold: count_out=%lld, expected %lld", dut.count_out, %final_cmd.expect }
+    Log(info, "PASS: 3 commands, total=%lld", %final_cmd.expect)
+    -> Return

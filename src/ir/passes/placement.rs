@@ -278,6 +278,13 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 }
                 visit_fmt(args, &mut accesses, &mut transactor);
             }
+            Stmt::RecordInit(_, _) => {
+                host_service_only = false;
+            }
+            Stmt::RecordFieldWrite { value, .. } => {
+                host_service_only = false;
+                visit_expr(value, &mut accesses, &mut transactor);
+            }
             Stmt::CovReport(_) => {}
         }
     }
@@ -337,7 +344,7 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
                 visit_expr(a, accesses, transactor);
             }
         }
-        Expr::Literal { .. } | Expr::Local(_) | Expr::CovBin { .. } => {}
+        Expr::Literal { .. } | Expr::Local(_) | Expr::RecordField { .. } | Expr::CovBin { .. } => {}
     }
 }
 

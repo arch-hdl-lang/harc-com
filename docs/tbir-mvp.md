@@ -21,6 +21,7 @@ checked against the code at the cited location.
 | #349 | Covergroup lowering + emission (`CovgroupSchema`, `SamplerAuto` functions, `CovReport`/`CovBin`, auto-cross matrices). |
 | #350 | Helper handling: pure helpers stay `Expr::Call` and emit as file-scope C++ functions; impure helpers (DUT access or sync) CFG-inline at every call site; recursion rejected with the cycle path. |
 | #351 | `wait until` lowering + emission: `Single`/`AllOf` modes, optional `timeout N cycles [fail("...")]` with the v1 diagnostic block shape, plus the `wait_until_counter_test` fixture. |
+| #364 | `transaction` declarations + non-randomize usage: `RecordSchema` records table on `TbProgram`, record-typed locals (`let t : TxnType` default construction with let-site re-init), field writes/reads (`RecordFieldWrite` / `Expr::RecordField`), value-record struct emission, plus the `transaction_basic_test` fixture. `randomize` stays rejected at statement level, pointing at the constraint-IR seam. |
 
 ### Construct subset
 
@@ -38,9 +39,19 @@ sub-primary-cycle precision and checker timing are identical),
 `wait until` (single, `all of`, and `any of`, optional timeout),
 `if`/`for`/`while`/`repeat`/`loop`/`break`/`continue`, covergroups
 with set-literal and range (`[a..b]`, inclusive, open bounds allowed)
-bins plus declared `cross` items, and helper functions. Everything
-else — `transaction`, `randomize`, `agent`/`event`, transactors,
-buses, scoreboards, `fork`, ... —
+bins plus declared `cross` items, helper functions, and `transaction`
+value-records in their non-randomize usage: declarations lower into
+the `TbProgram::records` table (scalar fields ≤64 bits with literal
+defaults; `keep`/attr constraint metadata carried as inert source
+text), `let t : TxnType` default-constructs (re-running field
+defaults at the let site, so loop iterations re-initialize like v1's
+in-place declaration), and `t.field` reads/writes work everywhere a
+scalar local does — including format args, branch conditions, and
+loop bounds. Everything else —
+`randomize` (awaits the constraint-IR `ConstraintRef` seam),
+`agent`/`event`, transactors, buses, scoreboards, `fork`,
+transaction `when` subtype blocks, non-scalar / wider-than-64-bit
+transaction fields, ... —
 is rejected at lowering time with `LowerError::Unsupported` naming the
 construct and pointing at `--codegen v1`. Lowering never silently
 mis-lowers; that property is load-bearing and tested
@@ -69,6 +80,7 @@ none — `extra_harc` joins additional `tests/fixtures/` files to the
 | `cov_cross_bins_test` | `Top` | `top_counter.sv` | pass | declared `cross`, range + open-bound bins |
 | `wait_any_of_test` | `Top` | `top_counter.sv` | pass | `any of` wait (untimed + timed, fires) |
 | `wait_any_of_timeout_test` | `Top` | `top_counter.sv` | fail | `any of` timeout: "none of:" diags ×2 headers |
+| `transaction_basic_test` | `Top` | `top_counter.sv` | pass | record declaration/defaults, let-site re-init in a loop, field reads/writes, inert keep/attr |
 
 (The registry has since grown past this table via the backfill sweep —
 see [tbir-coverage.md](tbir-coverage.md); the registry file is the
@@ -79,7 +91,8 @@ nonzero with a real `N TESTS FAILED` verdict (never `ALL TESTS
 PASSED`), and the two traces must still trace-diff clean — a
 deliberate failure has to fail *identically* under both emitters.
 
-The original five fixtures also have full-file insta snapshots locking
+The original five fixtures and `transaction_basic_test` have
+full-file insta snapshots locking
 both the dump-ir text and the emitted tbir C++ (`tests/tbir.rs`,
 `tests/snapshots/tbir__*`), so emitter refactors diff visibly; the two
 log-path fixtures lock their dump-ir text.
@@ -230,6 +243,38 @@ reason. Code locations are authoritative.
    WW > 16 needs the digit width and the case to route through the
    wide-hex runtime helper, so the flag is widened to carry both.
 
+9. **`TbProgram.records` holds structural `RecordSchema`s; constraint
+   metadata is carried as inert text, not a `ConstraintIrRef`.** The
+   design sketches `records: ConstraintIrRef` ("owned by
+   constraint-system layer"); the plan doc names the table
+   `IndexVec<RecordId, RecordSchema>` "from constraint IR". What
+   shipped is the structural half only: name + fields
+   (type/default/`!` flag) in declaration order — exactly what the
+   backends need to emit v1's value-record struct shape. `keep`
+   clauses and `with [...]` field attributes are pretty-printed into
+   inert strings (`RecordSchema::keeps`, `RecordFieldSchema::
+   attr_src`) for dump-ir visibility; nothing may interpret them.
+   When `randomize` lands, the constraint layer (`src/constraints`,
+   `elaborate_constraints` → `CTypedProblem`) re-elaborates from the
+   AST and the randomize terminator carries a `ConstraintRef` handle
+   into that layer — the inert strings are *not* the seam. Three
+   subset edges, all explicit rejections (never silent): `when`
+   subtype blocks (v1 flattens their fields into the struct;
+   deferred until the tagged-ADT story lands with randomize),
+   non-scalar / wider-than-64-bit fields and non-literal defaults
+   (v1 lowers enums/lists/wide ints; the tbir expression model is
+   u64), and record locals in *pure* helpers (those emit as
+   scalar-only file-scope C++ functions; impure helpers CFG-inline,
+   where record locals are fine). Emission-side delta: tbir emits the
+   struct + `operator==`/`!=` only — v1 also emits `randomize_<T>`
+   and pack/unpack helpers, which are unreachable dead text under
+   this subset and land with their constructs (`randomize`, bus
+   sends). One IR node carries the v1 timing contract:
+   `Stmt::RecordInit` re-default-constructs at the source `let` site,
+   because the loop-switch hoists declarations to function top while
+   v1 declares in place — without it, a `let t : Txn` inside a loop
+   would keep stale field values across iterations.
+
 Minor, same spirit: `IndexVec` is a plain `Vec` plus typed id structs;
 `FunctionKind` has no `TransactorBody` (transactors are out of
 subset); the design's `AssertFail` enum collapsed into a single
@@ -250,14 +295,21 @@ locally-determinable `Assign` types are compared).
 
 The randomize fixture (`axilite_constraint_test.harc`) and the
 agent/event fixture (`wait_until_quiesce_test.harc`) are registered as
-must-reject tests, but today both trip the **item-level** gate on
-their `transaction` declarations before any statement-level construct
-(`randomize`, `agent`, `event<T>`) is reached — the file-level scan in
-`src/ir/lower/mod.rs` runs before body lowering. The snapshot text
-therefore names `transaction`, not the deeper construct. When a future
-PR brings `transaction` into the subset, those snapshots will shift to
-the statement-level rejection; `tests/tbir.rs` documents this at each
-test site so the shift is expected, not alarming.
+must-reject tests. Until the transaction slice, both tripped the
+**item-level** gate on their `transaction` declarations before any
+deeper construct was reached — the file-level scan in
+`src/ir/lower/mod.rs` runs before body lowering — so the snapshot
+text named `transaction`. That predicted shift has now happened:
+with `transaction` in the subset, `wait_until_quiesce_unsupported`
+names the `agent` construct (next item in file order),
+`axilite_seqdrv_unsupported` names `transactor`, and
+`axilite_constraint_unsupported` is the statement-level `randomize`
+rejection pointing at the constraint-IR seam. The same mechanics
+apply to the next construct slice: a fixture's snapshot always names
+whichever out-of-subset construct lowering hits first, and shifts
+deeper as slices land. The per-fixture residual map for the whole
+former `transaction` group lives in
+[tbir-coverage.md](tbir-coverage.md).
 
 ## Next steps
 
@@ -271,11 +323,12 @@ see its decision log):
 - **Passes** (plan phase 7): `placement` over a `TargetProfile`,
   `randomize_analysis`, `extract_port_set`, `hoist_stimulus`,
   `lower_coroutine` for FSM-shaped backends.
-- **Subset growth**: transactions/randomize (needs the constraint-IR
-  `ConstraintRef` seam), transactors (`CallTarget::TransactorMethod`
-  is already declared in `src/ir/mod.rs` but nothing produces it),
-  `fork`, scoreboards. (Range/cross bins and `any of` landed
-  2026-06-12.)
+- **Subset growth**: randomize (needs the constraint-IR
+  `ConstraintRef` seam; transaction *declarations* and non-randomize
+  record usage landed 2026-06-12, as did range/cross bins and
+  `any of`), transactors (`CallTarget::TransactorMethod` is already
+  declared in `src/ir/mod.rs` but nothing produces it), `fork`,
+  scoreboards, agents/events.
 - **Placement-split backends** proceed per the multi-target placement
   model in [tb-ir-design.md](tb-ir-design.md) (tiers, timing classes,
   `TargetProfile` capability checks) once the passes exist.

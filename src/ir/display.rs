@@ -42,6 +42,32 @@ impl Display for TbProgram {
             }
             writeln!(f)?;
         }
+        for (i, r) in self.records.iter().enumerate() {
+            writeln!(f, "  record r{} {}", i, r.name)?;
+            for fld in &r.fields {
+                write!(
+                    f,
+                    "    {}{} : {}",
+                    if fld.non_random { "!" } else { "" },
+                    fld.name,
+                    type_str(&fld.ty)
+                )?;
+                if let Some(d) = fld.default {
+                    if fld.ty == IrType::Bool {
+                        write!(f, " default {}", d != 0)?;
+                    } else {
+                        write!(f, " default {d}")?;
+                    }
+                }
+                for a in &fld.attr_src {
+                    write!(f, " {a} (inert)")?;
+                }
+                writeln!(f)?;
+            }
+            for k in &r.keeps {
+                writeln!(f, "    keep {k} (inert)")?;
+            }
+        }
         for (i, cg) in self.covgroups.iter().enumerate() {
             let trig = match cg.trigger {
                 CovTrigger::PosedgeDutClk => "@posedge(dut.clk)",
@@ -129,6 +155,7 @@ fn type_str(t: &IrType) -> String {
         IrType::SInt(Some(w)) => format!("sint<{w}>"),
         IrType::SInt(None) => "sint".to_string(),
         IrType::Bool => "bool".to_string(),
+        IrType::Record(r) => format!("record(r{})", r.0),
         IrType::Unknown => "unknown".to_string(),
     }
 }
@@ -138,6 +165,12 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         Stmt::Assign(l, e) => format!("Assign({}, {})", local_str(func, *l), expr_str(func, e)),
         Stmt::DutWrite(p, e) => format!("DutWrite({}, {})", port_str(p), expr_str(func, e)),
         Stmt::DutRead(l, p) => format!("DutRead({}, {})", local_str(func, *l), port_str(p)),
+        Stmt::RecordInit(l, r) => format!("RecordInit({}, r{})", local_str(func, *l), r.0),
+        Stmt::RecordFieldWrite { local, field, value } => format!(
+            "RecordFieldWrite({}.{field}, {})",
+            local_str(func, *local),
+            expr_str(func, value)
+        ),
         Stmt::Log { level, args } => {
             format!("Log({}, {})", level_str(level), fmt_args_str(func, args))
         }
@@ -271,6 +304,9 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         Expr::Literal { value, .. } => format!("{value}"),
         Expr::Local(l) => local_str(func, *l),
         Expr::Port(p) => port_str(p),
+        Expr::RecordField { local, field } => {
+            format!("{}.{field}", local_str(func, *local))
+        }
         Expr::Binary(op, a, b) => format!(
             "({} {} {})",
             expr_str(func, a),

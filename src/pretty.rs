@@ -886,7 +886,7 @@ fn print_field(out: &mut String, f: &Field, depth: usize) {
     writeln!(out).ok();
 }
 
-fn print_attr(out: &mut String, a: &Attr) {
+pub(crate) fn print_attr(out: &mut String, a: &Attr) {
     write!(out, "[{}", a.name.name).ok();
     if !a.args.is_empty() {
         let mut started = false;

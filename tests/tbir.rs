@@ -158,6 +158,8 @@ fn fatal_path_dump_ir_snapshot() {
 
 /// Transactor fixtures are outside the MVP subset — the error must
 /// name the construct and point at `--codegen v1`, never mis-lower.
+/// The fixture's `transaction` items now lower (records slice); the
+/// item-level scan trips on the `transactor` declaration instead.
 #[test]
 fn transactor_fixture_is_unsupported() {
     let err = lower_src(&fixture("axilite_seqdrv_test.harc")).unwrap_err();
@@ -167,11 +169,11 @@ fn transactor_fixture_is_unsupported() {
 
 /// Randomize/constraint fixture (`randomize(t) with` + Z3 constraints,
 /// loaded together with its helper file exactly as run_fixtures.sh
-/// does) is outside the MVP subset. Today the item-level scan trips
-/// first on the fixture's `transaction` declaration — when a sibling
-/// PR brings `transaction` into the subset, the snapshot will shift
-/// to name `randomize` instead (statement-level rejection, covered by
-/// `randomize_is_unsupported` below).
+/// does) is outside the MVP subset. Its `transaction` declaration now
+/// lowers (records slice), so the rejection shifted to the
+/// statement-level `randomize` gate pointing at the constraint-IR
+/// seam — exactly the shift docs/tbir-mvp.md §"Negative tests"
+/// predicted.
 #[test]
 fn randomize_fixture_is_unsupported() {
     let err = lower_fixtures(&["axilite_constraint_test.harc", "axilite_regs_test.harc"])
@@ -181,9 +183,8 @@ fn randomize_fixture_is_unsupported() {
 }
 
 /// Agent/event fixture (`agent`, `event<T>`) is outside the MVP
-/// subset. The fixture's `transaction` item is the first rejection
-/// today (its `wait until ... timeout` statements are now in-subset;
-/// `wait_until_counter_test` covers them positively).
+/// subset. Its `transaction` item now lowers (records slice), so the
+/// item-level scan trips on the `agent` declaration instead.
 #[test]
 fn wait_until_quiesce_fixture_is_unsupported() {
     let err = lower_src(&fixture("wait_until_quiesce_test.harc")).unwrap_err();
@@ -513,8 +514,255 @@ end test RandTest
 "#;
     let err = lower_src(src).unwrap_err();
     let msg = err.to_string();
-    // The `transaction` item itself is already outside the subset.
+    // The `transaction` declaration and the `let t : Req` lower fine
+    // now (records slice); the statement-level `randomize` gate fires
+    // and points at the constraint-IR seam.
+    assert!(msg.contains("`randomize`"), "names randomize: {msg}");
+    assert!(
+        msg.contains("constraint-IR seam"),
+        "points at the constraint seam: {msg}"
+    );
     assert!(msg.contains("--codegen v1"), "suggests v1: {msg}");
+}
+
+// ── Transaction value-records (non-randomize usage) ─────────────────
+
+/// Locks the dump-ir text for the transaction fixture: the records
+/// table (defaults, `!` fields, inert keep/attr text), `RecordInit`
+/// inside the loop body, `RecordFieldWrite`, and field reads in
+/// asserts / branch conditions / loop bounds / format args.
+#[test]
+fn transaction_basic_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("transaction_basic_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("transaction_basic_dump_ir", format!("{prog}"));
+}
+
+/// Locks the emitted tbir C++ for the transaction fixture: the
+/// value-record struct (member-initializer defaults, operator==/!=),
+/// the record-typed hoisted local, and the let-site re-init.
+#[test]
+fn transaction_basic_emitted_cpp_snapshot() {
+    insta::assert_snapshot!(
+        "transaction_basic_emitted_cpp",
+        emit_fixture_cpp("transaction_basic_test.harc")
+    );
+}
+
+/// A record let inside a loop re-runs the defaults each iteration:
+/// the lowering must place a `RecordInit` at the let site (loop
+/// body), not rely on the hoisted declaration's one-time initializer.
+#[test]
+fn record_let_in_loop_reinitializes() {
+    let src = r#"
+transaction Req
+    addr : uint<32> default 5
+end transaction Req
+
+test ReinitTest
+    let dut : Top
+    run
+        for i in 0 .. 2
+            let t : Req
+            t.addr = t.addr + i
+        end for
+    end run
+end test ReinitTest
+"#;
+    let prog = lower_src(src).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let run = prog.function(prog.tests[0].run);
+    // The loop body block carries RecordInit then RecordFieldWrite.
+    let body = run
+        .blocks
+        .iter()
+        .find(|b| {
+            b.stmts
+                .iter()
+                .any(|s| matches!(s, ir::Stmt::RecordInit(..)))
+        })
+        .expect("a block carries RecordInit");
+    let init_pos = body
+        .stmts
+        .iter()
+        .position(|s| matches!(s, ir::Stmt::RecordInit(..)))
+        .unwrap();
+    let write_pos = body
+        .stmts
+        .iter()
+        .position(|s| matches!(s, ir::Stmt::RecordFieldWrite { .. }))
+        .expect("field write lowered");
+    assert!(init_pos < write_pos, "init precedes the write:\n{run}");
+    // The body block is a loop participant (reachable from the header
+    // branch), so the init re-runs per iteration by construction.
+    assert!(
+        matches!(prog.records[0].fields[0].default, Some(5)),
+        "default carried into the schema"
+    );
+}
+
+/// A DUT read in a record-field-write value hoists through a DutRead
+/// temp — same no-inline-ports discipline as `Assign`.
+#[test]
+fn record_field_write_hoists_dut_reads() {
+    let src = r#"
+transaction Req
+    addr : uint<32>
+end transaction Req
+
+test HoistTest
+    let dut : Top
+    run
+        let t : Req
+        t.addr = dut.count_out
+    end run
+end test HoistTest
+"#;
+    let prog = lower_src(src).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let run = prog.function(prog.tests[0].run);
+    let b = &run.blocks[0];
+    assert!(
+        matches!(b.stmts[1], ir::Stmt::DutRead(..)),
+        "port hoisted before the field write:\n{run}"
+    );
+    assert!(
+        matches!(
+            &b.stmts[2],
+            ir::Stmt::RecordFieldWrite { value: ir::Expr::Local(_), .. }
+        ),
+        "field write consumes the hoisted temp:\n{run}"
+    );
+}
+
+/// Unknown fields are hard lowering errors (v1 would defer to a C++
+/// compile failure; the IR rejects at lowering) — both on writes and
+/// on reads.
+#[test]
+fn record_unknown_field_is_invalid() {
+    let src = r#"
+transaction Req
+    addr : uint<32>
+end transaction Req
+
+test BadFieldTest
+    let dut : Top
+    run
+        let t : Req
+        t.nosuch = 1
+    end run
+end test BadFieldTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)),
+        "hard error, not Unsupported: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("no field `nosuch`"),
+        "names the field: {err}"
+    );
+}
+
+/// Whole-record assignment: a same-typed record-local copy lowers
+/// (C++ struct assignment in both backends); anything else is a
+/// precise lowering rejection, not a verifier error or C++ compile
+/// failure.
+#[test]
+fn record_whole_value_assignment_rules() {
+    let copy_src = r#"
+transaction Req
+    addr : uint<32> default 3
+end transaction Req
+
+test CopyTest
+    let dut : Top
+    run
+        let t : Req
+        let u : Req
+        t.addr = 9
+        u = t
+        assert u.addr == 9 else fail("copy lost addr=${u.addr}")
+    end run
+end test CopyTest
+"#;
+    let prog = lower_src(copy_src).expect("record-to-record copy lowers");
+    verify::verify_program(&prog).expect("verifies");
+
+    let bad_src = r#"
+transaction Req
+    addr : uint<32>
+end transaction Req
+
+test BadCopyTest
+    let dut : Top
+    run
+        let t : Req
+        t = true
+    end run
+end test BadCopyTest
+"#;
+    let err = lower_src(bad_src).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("non-`Req` value"),
+        "names the record type: {msg}"
+    );
+}
+
+/// `when` subtype blocks stay outside the lowered record shape.
+#[test]
+fn record_when_subtype_is_unsupported() {
+    let src = r#"
+transaction Req
+    op : uint<2>
+    when op == 1
+        addr : uint<32>
+    end when
+end transaction Req
+
+test WhenTest
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test WhenTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("`when` subtype"), "names the construct: {msg}");
+}
+
+/// Record locals cannot live in *pure* helpers (they emit as
+/// scalar-only file-scope C++ functions in the tbir backend). Note the
+/// body must stay inside the pure scan subset to reach this gate — a
+/// field access would classify the helper impure and CFG-inline it,
+/// where record locals are legal.
+#[test]
+fn record_let_in_pure_helper_is_unsupported() {
+    let src = r#"
+transaction Req
+    addr : uint<32> default 9
+end transaction Req
+
+function mk() -> uint<32>
+    let t : Req
+    return 1
+end function mk
+
+test PureHelperTest
+    let dut : Top
+    run
+        let x = mk()
+    end run
+end test PureHelperTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("pure helper"),
+        "names the helper context: {msg}"
+    );
 }
 
 #[test]

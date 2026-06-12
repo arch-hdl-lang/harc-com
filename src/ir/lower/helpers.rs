@@ -126,6 +126,7 @@ pub(crate) fn lower_pure_helper<'a>(
     ctx: &'a LowerCtx,
 ) -> Result<TbFunction, LowerError> {
     let mut b = FuncBuilder::new(ctx, helpers);
+    b.in_pure_helper = true;
     let mut params = Vec::with_capacity(decl.params.len());
     for p in &decl.params {
         let ty = ir_type_of(p.ty.as_ref());
