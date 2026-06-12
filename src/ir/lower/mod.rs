@@ -11,6 +11,7 @@
 //! silently mis-lowers. Re-run with `--codegen v1` to use the legacy
 //! direct AST → C++ path for unsupported constructs.
 
+mod bus;
 mod control;
 mod covergroups;
 mod exprs;
@@ -19,8 +20,8 @@ mod records;
 mod stmts;
 
 use crate::ast::{
-    Block, ClockDecl, ComponentDecl, ComponentItem, ExprKind, Item, ScopeDecl, SourceFile,
-    Stmt as AstStmt, StmtKind, TestDecl, TestItem, TypeExpr,
+    Block, BusDecl, ClockDecl, ComponentDecl, ComponentItem, ExprKind, Item, ScopeDecl,
+    SourceFile, Stmt as AstStmt, StmtKind, TestDecl, TestItem, TypeExpr,
 };
 use crate::ir::{
     self, BasicBlock, BlockId, ClockSpec, CovgroupId, CovgroupSchema, FunctionId, FunctionKind,
@@ -109,6 +110,18 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             components.insert(c.name.name.clone(), c);
         }
     }
+
+    // Bus declarations (inline or `use`-imported — the import resolver
+    // appended the parsed stdlib file before merge_for_sim, so both
+    // arrive here as plain items). Declarations are inert until a test
+    // binds them; unsupported bus features are rejected at the bind /
+    // access site, not here.
+    let mut buses: HashMap<String, &BusDecl> = HashMap::new();
+    for it in &file.items {
+        if let Item::Bus(b) = it {
+            buses.insert(b.name.name.clone(), b);
+        }
+    }
     let used_tbs: HashSet<&String> = tb_of_test.values().collect();
 
     // Covergroup schemas, in file order. All declarations lower (even
@@ -151,7 +164,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             | Item::Test(_)
             | Item::Covergroup(_)
             | Item::Function(_)
-            | Item::Transaction(_) => {}
+            | Item::Transaction(_)
+            | Item::Bus(_) => {}
             // `extend` was already folded by merge_for_sim; a survivor
             // means the merge didn't apply (e.g. dump-ir on a lone
             // extension file).
@@ -198,6 +212,11 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         clock_names: Vec::new(),
         record_ids: record_ids.clone(),
         records: prog.records.clone(),
+        // Deliberately empty: bus bindings are test-scope, so a pure
+        // helper body can never resolve one — which structurally
+        // enforces the design seam rule that `TransactorMethod` call
+        // edges never appear in pure-helper bodies.
+        bus_bindings: HashMap::new(),
     };
     for it in &file.items {
         let Item::Function(fd) = it else { continue };
@@ -223,6 +242,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &domains,
             &covgroup_ids,
             &record_ids,
+            &buses,
             &helper_registry,
             &mut prog,
         )?;
@@ -338,6 +358,7 @@ fn lower_test(
     domains: &HashMap<String, i64>,
     covgroup_ids: &HashMap<String, CovgroupId>,
     record_ids: &HashMap<String, RecordId>,
+    buses: &HashMap<String, &BusDecl>,
     helpers: &helpers::HelperRegistry<'_>,
     prog: &mut TbProgram,
 ) -> Result<(), LowerError> {
@@ -349,6 +370,8 @@ fn lower_test(
     let mut clocks: Vec<&ClockDecl> = Vec::new();
     let mut scope: Option<&ScopeDecl> = None;
     let mut bare_stmts: Vec<&AstStmt> = Vec::new();
+    let mut bus_bindings: Vec<ir::BusBindingSchema> = Vec::new();
+    let mut bus_binding_decls: HashMap<String, BusDecl> = HashMap::new();
     let tb_name = tb_of_test.get(&t.name.name).cloned();
 
     for it in &t.items {
@@ -375,10 +398,32 @@ fn lower_test(
             // The desugared impl-form synthesizes `let _tb : <TbType>`;
             // the TB instance is scaffolding-owned in the IR backend.
             TestItem::Let(l) if l.name.name == "_tb" => {}
+            // Bus binding: `let axil : BusAxiLite = bind dut`.
+            TestItem::Let(l)
+                if l.bind
+                    && type_simple_name(l.ty.as_ref())
+                        .is_some_and(|n| buses.contains_key(n)) =>
+            {
+                let bus_name = type_simple_name(l.ty.as_ref()).unwrap();
+                let decl = buses[bus_name];
+                let (schema, owned) = bus::lower_bus_binding(l, decl)?;
+                if bus_binding_decls.contains_key(&l.name.name) {
+                    // Two bindings with one name would resolve
+                    // ambiguously (v1's map silently keeps the last;
+                    // the IR schema would keep both) — reject.
+                    return Err(LowerError::Invalid(format!(
+                        "duplicate bus binding `{}` in test `{}`",
+                        l.name.name, t.name.name
+                    )));
+                }
+                bus_bindings.push(schema);
+                bus_binding_decls.insert(l.name.name.clone(), owned);
+            }
             TestItem::Let(l) => {
                 return Err(unsupported(
                     &format!("test-scope `let {}`", l.name.name),
-                    "only `let dut : <Type>` is lowered at test scope",
+                    "only `let dut : <Type>` and bus bindings \
+                     (`let <name> : <Bus> = bind dut`) are lowered at test scope",
                 ));
             }
             TestItem::Clock(c) => clocks.push(c),
@@ -472,6 +517,7 @@ fn lower_test(
         dut_field: "dut".to_string(),
         dut_type,
         cov_fields: cov_fields.clone(),
+        bus_bindings: bus_bindings.clone(),
         synthetic,
     });
 
@@ -520,6 +566,7 @@ fn lower_test(
         clock_names: clock_specs.iter().map(|c| c.name.clone()).collect(),
         record_ids: record_ids.clone(),
         records: prog.records.clone(),
+        bus_bindings: bus_binding_decls,
     };
 
     // Synthesized auto-sampler functions, one per covergroup field, in
@@ -594,6 +641,14 @@ fn collect_stmts<'a>(b: &'a Block, skip_tb_wire: bool, out: &mut Vec<&'a AstStmt
             continue;
         }
         out.push(s);
+    }
+}
+
+/// Simple (last-segment) name of a `Named` type expression, if any.
+fn type_simple_name(t: Option<&TypeExpr>) -> Option<&str> {
+    match t? {
+        TypeExpr::Named { name, .. } => name.segments.last().map(|s| s.name.as_str()),
+        _ => None,
     }
 }
 
@@ -675,6 +730,13 @@ pub(crate) struct LowerCtx {
     /// Snapshot of the program's record schemas, for field validation
     /// at `t.<field>` lowering sites.
     pub records: Vec<RecordSchema>,
+    /// Test-scope bus bindings: binding name → bus declaration (with
+    /// any unsupported features already rejected at the bind site).
+    /// Empty for the file-level pure-helper context, so a pure helper
+    /// can never resolve a bus access — which structurally keeps
+    /// `TransactorMethod` call edges out of pure-helper bodies (design
+    /// seam rule).
+    pub bus_bindings: HashMap<String, crate::ast::BusDecl>,
 }
 
 pub(crate) struct LoopFrame {

@@ -64,6 +64,10 @@ impl FuncBuilder<'_> {
                         }
                     }
                 }
+                // Bus-bound signal access (`<bind>.<sig>`, `<bind>.<ch>.<sig>`).
+                if let Some(port) = self.as_bus_port_ref(e)? {
+                    return Ok(Expr::Port(port));
+                }
                 Err(unsupported("field access on a non-DUT value", ""))
             }
             ExprKind::Paren(inner) => self.lower_expr(inner),
@@ -92,13 +96,31 @@ impl FuncBuilder<'_> {
                         format!("helper call `{}(...)`", id.name)
                     }
                     ExprKind::Field { name, .. } => {
+                        // Bus calls (tlm_method / send / recv) suspend,
+                        // so they are statement-level only — `let x =
+                        // bus.m(...)` and `x = bus.m(...)` lower via
+                        // `try_lower_bus_call`; anything nested deeper
+                        // gets this precise rejection.
+                        if let Some(bind) = self.bus_call_root(callee) {
+                            return Err(unsupported(
+                                "bus method calls in expression position",
+                                format!(
+                                    "only `let x = {bind}.{}(...)` and statement \
+                                     position are lowered (v1's surface)",
+                                    name.name
+                                ),
+                            ));
+                        }
                         format!("transactor/method call `.{}(...)`", name.name)
                     }
                     _ => "a call expression".to_string(),
                 };
                 Err(unsupported(&what, ""))
             }
-            ExprKind::ForkCall { .. } => Err(unsupported("`fork` bus-method calls", "")),
+            ExprKind::ForkCall { .. } => Err(unsupported(
+                "`fork` bus-method calls",
+                "out-of-order TLM issue/join_all lanes are not lowered yet",
+            )),
             ExprKind::Randomize { .. } => Err(unsupported("`randomize` expressions", "")),
             ExprKind::Cast { .. } => Err(unsupported("`as` casts", "")),
             ExprKind::Index { .. } => Err(unsupported("index expressions", "")),

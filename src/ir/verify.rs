@@ -2,7 +2,23 @@
 //! the port-position rule (an `Expr::Port` may appear only in wait
 //! predicates, format-arg expressions, `DutRead`/`DutWrite` operands,
 //! `AssertCheck` condition subtrees, and `FailDiag` guards — which
-//! re-evaluate a wait predicate after the wait timed out).
+//! re-evaluate a wait predicate after the wait timed out) and the
+//! transactor-call seam rule (below).
+//!
+//! **Transactor-call seam rule.** A `CallTarget::TransactorMethod`
+//! call edge is deliberately never inlined at the IR level — the
+//! sequence→transactor boundary is the placement cut every split
+//! backend needs (design doc §CallTarget). The verifier pins the edge
+//! to the one position backends expand: the ENTIRE right-hand side of
+//! a `Stmt::Assign` in a `Run`/`Check` function, with a `bus_field`/
+//! `method` pair that resolves against the owning testbench's
+//! `bus_bindings` at the declared arity. Anywhere else — nested in an
+//! expression, in a format arg or wait predicate, or inside a
+//! `Helper`/`SamplerAuto` body (pure helpers must stay suspension-
+//! free and placement-neutral) — is a lowering bug. The edge is also
+//! the sanctioned exception to "no statement may suspend": its
+//! suspension lives behind the call boundary, which placement
+//! classifies as timing-tolerant by construction.
 //!
 //! Violations are programmer errors (lowering bugs or pass bugs), not
 //! user errors — user errors are rejected earlier by the lowering pass.
@@ -87,6 +103,15 @@ pub enum VerifyError {
         block: BlockId,
         context: &'static str,
     },
+    /// Transactor-call seam rule (module docs): a `TransactorMethod`
+    /// call edge outside the top of an `Assign` RHS in a Run/Check
+    /// function, or one that does not resolve against the owning
+    /// testbench's bus bindings.
+    BadTransactorCall {
+        func: FunctionId,
+        block: BlockId,
+        what: String,
+    },
     /// Cross-IR: a test's run/check FunctionId or TestbenchId resolves.
     BadProgramRef { what: String },
 }
@@ -166,6 +191,11 @@ impl std::fmt::Display for VerifyError {
             } => write!(
                 f,
                 "fn{}: b{} contains a DUT port read in a disallowed position ({context})",
+                func.0, block.0
+            ),
+            VerifyError::BadTransactorCall { func, block, what } => write!(
+                f,
+                "fn{}: b{} transactor-call seam violation: {what}",
                 func.0, block.0
             ),
             VerifyError::BadProgramRef { what } => write!(f, "program: {what}"),
@@ -363,6 +393,16 @@ impl Checker<'_> {
             match s {
                 Stmt::Assign(l, e) => {
                     self.check_local(*l);
+                    // Transactor-call seam rule: the one sanctioned
+                    // position for a TransactorMethod call edge is the
+                    // entire Assign RHS of a Run/Check function. Args
+                    // are checked individually (no ports, no nesting);
+                    // `check_expr` rejects the target everywhere else.
+                    if let Expr::Call(CallTarget::TransactorMethod { bus_field, method }, args) = e
+                    {
+                        self.check_transactor_call(bus_field, method, args);
+                        continue;
+                    }
                     self.check_expr(e, false, "Assign value");
                     // Invariant 15.
                     if self.func.locals.get(l.index()).is_some() {
@@ -509,11 +549,77 @@ impl Checker<'_> {
                 self.check_record_field(*local, field);
             }
             Expr::CovBin { inst, .. } => self.check_covgroup(inst.covgroup),
-            Expr::Call(_, args) => {
+            Expr::Call(target, args) => {
+                // Seam rule: TransactorMethod is valid ONLY as the
+                // top-level Assign RHS, which `check_block` consumes
+                // before recursing — reaching one here means it is
+                // nested or in a disallowed statement position.
+                if let CallTarget::TransactorMethod { bus_field, method } = target {
+                    self.errs.push(VerifyError::BadTransactorCall {
+                        func: self.fid,
+                        block: self.bid,
+                        what: format!(
+                            "`{bus_field}.{method}` call edge in a disallowed position \
+                             ({context}) — must be the entire RHS of an Assign"
+                        ),
+                    });
+                }
                 for a in args {
                     self.check_expr(a, ports_ok, context);
                 }
             }
+        }
+    }
+
+    fn bad_transactor(&mut self, what: String) {
+        self.errs.push(VerifyError::BadTransactorCall {
+            func: self.fid,
+            block: self.bid,
+            what,
+        });
+    }
+
+    /// Validate one sanctioned `TransactorMethod` call edge: function
+    /// kind, binding resolution on the owning testbench, method
+    /// existence, arity, and argument purity (no ports, no nesting).
+    fn check_transactor_call(&mut self, bus_field: &str, method: &str, args: &[Expr]) {
+        if !matches!(self.func.kind, FunctionKind::Run | FunctionKind::Check) {
+            self.bad_transactor(format!(
+                "`{bus_field}.{method}` call edge in a {:?}-kind function \
+                 (allowed only in Run/Check bodies)",
+                self.func.kind
+            ));
+        } else {
+            let binding = self
+                .func
+                .owner
+                .and_then(|tb| self.prog.testbenches.get(tb.index()))
+                .and_then(|tb| tb.bus_bindings.iter().find(|b| b.field == bus_field));
+            let diag = match binding {
+                None => Some(format!(
+                    "`{bus_field}.{method}` does not resolve: owning testbench has no \
+                     bus binding `{bus_field}`"
+                )),
+                Some(b) => match b.methods.iter().find(|m| m.name == method) {
+                    None => Some(format!(
+                        "bus `{}` (binding `{bus_field}`) has no tlm_method `{method}`",
+                        b.bus
+                    )),
+                    Some(m) if m.args.len() != args.len() => Some(format!(
+                        "`{bus_field}.{method}` arity mismatch: schema declares {} \
+                         arg(s), call carries {}",
+                        m.args.len(),
+                        args.len()
+                    )),
+                    Some(_) => None,
+                },
+            };
+            if let Some(what) = diag {
+                self.bad_transactor(what);
+            }
+        }
+        for a in args {
+            self.check_expr(a, false, "TransactorMethod arg");
         }
     }
 }

@@ -29,10 +29,12 @@ if [ ! -f "$REGISTRY" ]; then
     exit 1
 fi
 
-# TLM fixtures: run once with the default (v1) codegen. TB-IR lowering
-# does not support the `bus` construct yet, so these stay v1-only and
-# are NOT equivalence fixtures — they keep their own table here rather
-# than living in the equivalence registry.
+# TLM fixtures: run once with the default (v1) codegen. These four
+# still carry TB-IR blockers past the bus slice (`fork`/`join_all` TLM
+# issue for the pairing pair, `struct` for the burst pair — see
+# docs/tbir-coverage.md), so they stay v1-only and are NOT equivalence
+# fixtures — they keep their own table here rather than living in the
+# equivalence registry.
 read -r -d '' FIXTURES <<'EOF' || true
 tlm_pairing_arch_target_test    | TlmPairingArchTarget    | TlmPairingArchTarget.arch
 tlm_pairing_arch_initiator_test | TlmPairingArchInitiator | TlmPairingArchInitiator.arch

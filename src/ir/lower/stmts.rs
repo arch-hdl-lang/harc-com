@@ -148,6 +148,12 @@ impl FuncBuilder<'_> {
             StmtKind::Assume(_) => Err(unsupported("`assume`", "")),
             StmtKind::Cover(_) => Err(unsupported("`cover`", "")),
             StmtKind::Expr(e) => {
+                // Statement-position bus calls: `mem.poke(a, d)` (call
+                // edge, result-less or discarded) and bare
+                // `axil.w.send(...)` / `axil.r.recv()` handshakes.
+                if self.try_lower_bus_call(e, super::bus::BusCallDest::Discard)? {
+                    return Ok(());
+                }
                 // `cov.report()` (post-desugar `_tb.cov.report()`) on a
                 // covergroup-typed testbench field → CovReport.
                 if let ExprKind::Call { callee, args } = &*e.kind {
@@ -241,6 +247,20 @@ impl FuncBuilder<'_> {
             self.push(Stmt::DutRead(id, port));
             return Ok(());
         }
+        // Bus-bound signal read (`let x = axil.r.data`) — same shape.
+        if let Some(port) = self.as_bus_port_ref(value)? {
+            let id = self.declare(&l.name.name);
+            self.push(Stmt::DutRead(id, port));
+            return Ok(());
+        }
+        // Bus call RHS: `let x = mem.read(a)` (TransactorMethod call
+        // edge) or `let x = axil.r.recv()` (CFG-inlined handshake).
+        if self.try_lower_bus_call(
+            value,
+            super::bus::BusCallDest::Declare(&l.name.name),
+        )? {
+            return Ok(());
+        }
         let e = self.lower_expr_no_ports(value)?;
         let id = self.declare(&l.name.name);
         self.push(Stmt::Assign(id, e));
@@ -257,8 +277,19 @@ impl FuncBuilder<'_> {
             self.push(Stmt::DutWrite(port, e));
             return Ok(());
         }
+        // Bus-bound signal write: `axil.aw.valid = 1`.
+        if let Some(port) = self.as_bus_port_ref(target)? {
+            let e = self.lower_expr(value)?;
+            self.push(Stmt::DutWrite(port, e));
+            return Ok(());
+        }
         if let ExprKind::Ident(id) = &*target.kind {
             if let Some(local) = self.lookup(&id.name) {
+                // NOTE: `x = bus.m(...)` (bus call into an existing
+                // local) is deliberately NOT lowered — v1 supports bus
+                // calls only in `let`-RHS and statement position, and
+                // the reference surface is v1's. The value lowering
+                // below rejects it with a precise message.
                 let e = self.lower_expr_no_ports(value)?;
                 // Whole-record assignment: only a same-typed record
                 // local copies (`t = u` — C++ struct assignment in
