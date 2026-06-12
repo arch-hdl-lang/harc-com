@@ -38,3 +38,13 @@ wait_until_counter_test | Top | top_counter.sv | top_counter.arch | pass
 rom_lut_test | RomLut | rom_lut.sv | rom_lut.arch | pass
 log_paths_test | Top | top_counter.sv | top_counter.arch | pass
 fatal_path_test | Top | top_counter.sv | top_counter.arch | fail
+rom_lut_inline_test | RomLut | rom_lut.sv | rom_lut.arch | pass
+traffic_light_test | TrafficLight | traffic_light.sv | - | pass
+single_port_ram_test | SimpleMem | single_port_ram.sv | - | pass
+int_regs_test | IntRegs | int_regs.sv | - | pass
+fsm_counter_test | FsmCounter | fsm_counter.sv | - | pass
+clk_div_counter_test | ClkDivCounter | clk_div_counter.sv clk_divider.sv | - | pass
+synchronizer_handshake_test | BusSync | synchronizer_handshake.sv | - | pass
+pkt_queue_test | PacketQueue | pkt_queue.sv | - | pass
+cam_basic_test | Mshr_Addr_Cam | cam_basic.sv | - | pass
+inst_vec_port_regression_test | Top | inst_vec_port_regression.sv | - | pass
