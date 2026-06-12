@@ -1,0 +1,65 @@
+---
+source: tests/tbir.rs
+assertion_line: 1242
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 CovCrossTb { dut: Top } cov cov=cg0
+  test CovCrossBinsTest tb=tb0 run=fn1 check=fn2 clock=clk@10000ps(SysDomain)
+  covgroup cg0 CountCov @posedge(dut.clk)
+    point cp_count <- dut.count_out: low={[0..3]} mid={[4..9]} high={[10..14],15}
+    point cp_en <- dut.en: en0={0} en1={1}
+    cross cp_count x cp_en
+
+fn fn0 sample_CovCrossBinsTest_cov [kind=SamplerAuto(cg0), owner=tb0]
+  entry = b0
+
+  b0:
+    -> Return
+
+fn fn1 run_CovCrossBinsTest [kind=Run, owner=tb0]
+  locals:
+    %0 __t0 : unknown
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.en, 0)
+    -> WaitCycles(3, b1)
+
+  b1:
+    AssertCheck { cond: (dut.count_out == 0), on_fail: "after reset: count_out=%lld, expected 0", dut.count_out }
+    DutWrite(dut.rst, 0)
+    -> WaitCycles(2, b2)
+
+  b2:
+    DutWrite(dut.en, 1)
+    Assign(%__t0, 100)
+    -> WaitUntilTimeout { (dut.count_out == 15) [single], cycles: %__t0, fire: b3, timeout: b4 }
+
+  b3:
+    AssertCheck { cond: (dut.count_out == 15), on_fail: "after wait: count_out=%lld, expected 15", dut.count_out }
+    DutWrite(dut.en, 0)
+    -> WaitCycles(2, b5)
+
+  b4:
+    FailDiag { "count never reached 15" }
+    FailDiag { unless: (dut.count_out == 15), "  not yet true: dut.count_out == 15" }
+    -> Jump(b3)
+
+  b5:
+    Log(info, "PASS: walked 0..15, en toggled at both ends")
+    -> Return
+
+fn fn2 check_CovCrossBinsTest [kind=Check, owner=tb0]
+  entry = b0
+
+  b0:
+    CovReport(cov.cg0)
+    AssertCheck { cond: (CovBin(cov.cg0, cp_count, low) > 0), on_fail: "low range bin hole" }
+    AssertCheck { cond: (CovBin(cov.cg0, cp_count, mid) > 0), on_fail: "mid range bin hole" }
+    AssertCheck { cond: (CovBin(cov.cg0, cp_count, high) > 0), on_fail: "high range bin hole" }
+    AssertCheck { cond: (CovBin(cov.cg0, cp_en, en0) > 0), on_fail: "en=0 bin hole" }
+    AssertCheck { cond: (CovBin(cov.cg0, cp_en, en1) > 0), on_fail: "en=1 bin hole" }
+    Log(info, "coverage assertions passed")
+    -> Return

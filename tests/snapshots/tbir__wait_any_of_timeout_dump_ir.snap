@@ -1,0 +1,46 @@
+---
+source: tests/tbir.rs
+assertion_line: 427
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 WaitAnyOfTimeoutTb { dut: Top }
+  test WaitAnyOfTimeoutTest tb=tb0 run=fn0 check=- clock=clk@10000ps(SysDomain)
+
+fn fn0 run_WaitAnyOfTimeoutTest [kind=Run, owner=tb0]
+  locals:
+    %0 __t0 : unknown
+    %1 __t1 : unknown
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.en, 0)
+    -> WaitCycles(3, b1)
+
+  b1:
+    DutWrite(dut.rst, 0)
+    -> WaitCycles(1, b2)
+
+  b2:
+    Assign(%__t0, 10)
+    -> WaitUntilTimeout { (dut.count_out == 5), (dut.count_out == 9) [any_of], cycles: %__t0, fire: b3, timeout: b4 }
+
+  b3:
+    Log(info, "still running after first timeout: count_out=%lld", dut.count_out)
+    Assign(%__t1, 5)
+    -> WaitUntilTimeout { (dut.count_out == 7), (dut.count_out == 11) [any_of], cycles: %__t1, fire: b5, timeout: b6 }
+
+  b4:
+    FailDiag { "wait until any of timed out after %lld cycles", %__t0 }
+    FailDiag { "  none of: dut.count_out == 5, dut.count_out == 9" }
+    -> Jump(b3)
+
+  b5:
+    Log(info, "still running after second timeout: count_out=%lld", dut.count_out)
+    -> Return
+
+  b6:
+    FailDiag { "neither target count was reached" }
+    FailDiag { "  none of: dut.count_out == 7, dut.count_out == 11" }
+    -> Jump(b5)

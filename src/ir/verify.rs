@@ -197,6 +197,32 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             }
         }
     }
+    // Covergroup schemas: declared crosses must reference 2+ existing
+    // points, all binned (lowering validates this; a pass that edits
+    // schemas must not break it — emission indexes `points` directly).
+    for (ci, cg) in prog.covgroups.iter().enumerate() {
+        for cross in &cg.crosses {
+            if cross.point_indices.len() < 2 {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!("cg{ci} cross has fewer than two points"),
+                });
+            }
+            for &pi in &cross.point_indices {
+                if pi >= cg.points.len() {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!("cg{ci} cross references missing point index {pi}"),
+                    });
+                } else if cg.points[pi].bins.is_empty() {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "cg{ci} cross references binless point `{}`",
+                            cg.points[pi].name
+                        ),
+                    });
+                }
+            }
+        }
+    }
     for (i, func) in prog.functions.iter().enumerate() {
         if func.id.index() != i {
             errs.push(VerifyError::BadProgramRef {

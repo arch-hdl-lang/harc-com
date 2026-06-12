@@ -53,12 +53,21 @@ impl Display for TbProgram {
                     let vals = b
                         .values
                         .iter()
-                        .map(|v| v.to_string())
+                        .map(bin_value_str)
                         .collect::<Vec<_>>()
                         .join(",");
                     write!(f, " {}={{{vals}}}", b.name)?;
                 }
                 writeln!(f)?;
+            }
+            for c in &cg.crosses {
+                let names = c
+                    .point_indices
+                    .iter()
+                    .map(|&i| cg.points[i].name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" x ");
+                writeln!(f, "    cross {names}")?;
             }
         }
         for func in &self.functions {
@@ -198,6 +207,18 @@ pub(crate) fn mode_str(m: &WaitMode) -> &'static str {
     match m {
         WaitMode::Single => "single",
         WaitMode::AllOf => "all_of",
+        WaitMode::AnyOf => "any_of",
+    }
+}
+
+fn bin_value_str(v: &CovBinValue) -> String {
+    match v {
+        CovBinValue::Eq(x) => x.to_string(),
+        CovBinValue::Range { lo, hi } => format!(
+            "[{}..{}]",
+            lo.map(|x| x.to_string()).unwrap_or_default(),
+            hi.map(|x| x.to_string()).unwrap_or_default()
+        ),
     }
 }
 

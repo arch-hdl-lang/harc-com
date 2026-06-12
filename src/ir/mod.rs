@@ -284,6 +284,7 @@ pub struct PredSrc {
 pub enum WaitMode {
     Single,
     AllOf,
+    AnyOf,
 }
 
 #[derive(Debug, Clone)]
@@ -376,6 +377,10 @@ pub struct CovgroupSchema {
     pub name: String,
     pub trigger: CovTrigger,
     pub points: Vec<CoverPointSchema>,
+    /// Declared `cross` items, in declaration order. Lowering resolved
+    /// and validated the referenced coverpoints (2+ points, all with
+    /// bins, bin product fits `usize`).
+    pub crosses: Vec<CoverCrossSchema>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -397,7 +402,30 @@ pub struct CoverPointSchema {
 #[derive(Debug, Clone)]
 pub struct CoverBinSchema {
     pub name: String,
-    pub values: Vec<u64>,
+    pub values: Vec<CovBinValue>,
+}
+
+/// One member of a bin's value set: an exact value (`{3}`) or an
+/// inclusive range (`[a..b]`, with either bound open). A bin spec like
+/// `{[1..3], 7}` lowers to `[Range{1,3}, Eq(7)]`. Range bounds are
+/// inclusive on both ends — v1's hit test is `_v >= lo && _v <= hi`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CovBinValue {
+    Eq(u64),
+    Range { lo: Option<u64>, hi: Option<u64> },
+}
+
+/// One declared `cross` item, resolved against the owning schema's
+/// `points`. Storage/label naming is derived at emission, mirroring
+/// v1's `_cross_<item_index>_<p1>__<p2>` flat-array convention.
+#[derive(Debug, Clone)]
+pub struct CoverCrossSchema {
+    /// Position of the `cross` among ALL of the covergroup's items
+    /// (points and crosses) — v1's storage-name discriminator.
+    pub item_index: usize,
+    /// Indices into `CovgroupSchema::points`, in the order the cross
+    /// names them. Always 2+ entries; every referenced point has bins.
+    pub point_indices: Vec<usize>,
 }
 
 impl TbProgram {

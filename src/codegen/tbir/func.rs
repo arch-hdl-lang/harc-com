@@ -22,7 +22,9 @@
 
 use super::expr::{escape_c, expr_cpp, fmt_arg_cpp, helper_cpp_name, port_lvalue, port_read};
 use crate::codegen::cpp_tb::EmitError;
-use crate::ir::{FileLogLevel, FmtArgs, LogLevel, PredSrc, Stmt, TbFunction, Terminator};
+use crate::ir::{
+    FileLogLevel, FmtArgs, LogLevel, PredSrc, Stmt, TbFunction, Terminator, WaitMode,
+};
 use std::fmt::Write as _;
 
 const INDENT: &str = "    ";
@@ -148,10 +150,10 @@ pub(super) fn emit_function(
                 writeln!(out, "{pad3}errors++; _fatal = true;").ok();
                 writeln!(out, "{pad3}__done = true;").ok();
             }
-            Terminator::WaitUntil { preds, succ, .. } => {
+            Terminator::WaitUntil { preds, mode, succ } => {
                 // Mirrors v1's untimed coroutine path: one awaiter,
                 // predicate re-evaluated by the scheduler each cycle.
-                let cond = preds_cpp(func, &names, preds)?;
+                let cond = preds_cpp(func, &names, preds, *mode)?;
                 writeln!(
                     out,
                     "{pad3}co_await harc_rt::wait_until(_slot, [&]{{ return {cond}; }});"
@@ -161,10 +163,10 @@ pub(super) fn emit_function(
             }
             Terminator::WaitUntilTimeout {
                 preds,
+                mode,
                 cycles,
                 on_fire,
                 on_timeout,
-                ..
             } => {
                 // Mirrors v1's timed coroutine path: budget evaluated
                 // once, single `wait_until_timeout` awaiter returning
@@ -172,7 +174,7 @@ pub(super) fn emit_function(
                 // `errors` exactly once per timed-out wait; that bump
                 // rides the timeout edge here so the `on_timeout`
                 // block carries only the diagnostic text (FailDiag).
-                let cond = preds_cpp(func, &names, preds)?;
+                let cond = preds_cpp(func, &names, preds, *mode)?;
                 let n = expr_cpp(func, &names, cycles)?;
                 writeln!(out, "{pad3}int64_t _wu_budget = (int64_t)({n});").ok();
                 writeln!(
@@ -374,13 +376,14 @@ fn emit_stmt(
     Ok(())
 }
 
-/// `&&`-join wait-until sub-predicates the way v1 does: a single
-/// predicate emits bare; multiple (`all of`) emit as a parenthesized
-/// conjunction.
+/// Join wait-until sub-predicates the way v1 does: a single predicate
+/// emits bare; multiple emit as a parenthesized `&&` chain (`all of`)
+/// or `||` chain (`any of`).
 fn preds_cpp(
     func: &TbFunction,
     names: &[String],
     preds: &[PredSrc],
+    mode: WaitMode,
 ) -> Result<String, EmitError> {
     if preds.is_empty() {
         return Err(EmitError(format!(
@@ -391,6 +394,10 @@ fn preds_cpp(
     if preds.len() == 1 {
         return expr_cpp(func, names, &preds[0].expr);
     }
+    let joiner = match mode {
+        WaitMode::Single | WaitMode::AllOf => " && ",
+        WaitMode::AnyOf => " || ",
+    };
     let parts = preds
         .iter()
         .map(|p| expr_cpp(func, names, &p.expr))
@@ -399,7 +406,7 @@ fn preds_cpp(
         .iter()
         .map(|p| format!("({p})"))
         .collect::<Vec<_>>()
-        .join(" && "))
+        .join(joiner))
 }
 
 /// `sim_log_line("SEV", "fmt", args...)` or the `sim_logf_line` file
