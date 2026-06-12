@@ -93,12 +93,19 @@ known local-only Verilator 5.048-vs-CI-5.034 SVA verdict issue on this
 fixture never reached the equivalence stage; from CI's perspective it is
 simply bus-blocked like its siblings.
 
-### `wait N cycles on <clock>` — 5 fixtures
+### `wait N cycles on <clock>` — 5 fixtures — **RESOLVED 2026-06-12**
 
 > TB-IR lowering does not support `wait N cycles on <clock>` yet
 
 `synchronizer_gray_test`, `synchronizer_reset_test`,
 `synchronizer_wide_test`, `synchronizer_pulse_test`, `multi_clock_test`
+
+**Resolved**: clock-qualified waits now lower (the `WaitCycles`
+terminator carries an `Option<WaitClock>` resolved against the test's
+declared clocks; tbir emission mirrors v1's inline `eval_clocks_until`
+loop). All five fixtures lower cleanly, pass the full v1-vs-tbir
+equivalence pair, and are registered (no deeper blockers surfaced —
+the group was exactly as advertised).
 
 ### `struct` construct — 4 fixtures
 
@@ -156,29 +163,38 @@ both constructs are needed.)
 | `packed_vec_lane_test` | TB-IR lowering does not support assignment to a non-port, non-local target yet |
 | `if_wait_for_in_then_test` | TB-IR lowering does not support test-scope `let done_pulses` yet (only `let dut : <Type>` is lowered at test scope) |
 
-## Registry-schema gap (not a lowering gap)
+## Registry-schema gap (not a lowering gap) — **RESOLVED 2026-06-12**
 
 `synchronizer_basic_test` lowers cleanly and passes the full
-v1-vs-tbir equivalence pair (verdicts + trace-diff clean), but cannot
-be registered: it needs a second HARC file
+v1-vs-tbir equivalence pair (verdicts + trace-diff clean), but could
+not be registered: it needs a second HARC file
 (`async_fifo_domains.harc`), and registry schema v2
-(`test_name | top | sv_files | arch_dut | expect`) has no extra-files
-column — `run_tbir_equiv.sh` builds `HARC_FILES` from `test_name`
-alone. The same schema gap will eventually bite `--test`-selecting
-fixtures (`testbench_basic_test`, `testbench_lifecycle_test`,
+(`test_name | top | sv_files | arch_dut | expect`) had no extra-files
+column — `run_tbir_equiv.sh` built `HARC_FILES` from `test_name`
+alone.
+
+**Resolved**: schema v3 shipped with the wait-on-clock slice —
+optional trailing `extra_harc | ref_src | test_struct` columns (`-` =
+none; 5-column v2 rows parse unchanged in both consumers,
+`run_tbir_equiv.sh` and `run_arch_dut_fixtures.sh`).
+`synchronizer_basic_test` is registered with its domains file, as are
+the wait-on-clock fixtures needing extras (`synchronizer_pulse_test`,
+`multi_clock_test`). `ref_src` and `test_struct` are wired through to
+`--ref-src` / `--test` so the `--test`-selecting fixtures
+(`testbench_basic_test`, `testbench_lifecycle_test`,
 `axilite_constraint_test`) and the `--ref-src` fixture
-(`extern_fn_ref_test`) once their constructs land. A schema v3 with
-optional `extra_harc | ref_src | test_struct` columns should ship with
-whichever construct slice first unlocks one of these fixtures.
+(`extern_fn_ref_test`) can register as soon as their constructs land —
+no schema v4 needed.
 
 ## Suggested sequencing for construct workers
 
 1. **`transaction` → `transactor`** (17 + 19 fixtures): the two
    biggest groups, and `transactor` depends on `transaction`.
 2. **`bus`** (15 fixtures): unlocks the entire TLM family.
-3. **`wait N cycles on <clock>`** (5) + the registry schema v3 row
+3. ~~**`wait N cycles on <clock>`** (5) + the registry schema v3 row
    format: together they unlock the synchronizer/multi-clock family
-   (incl. the schema-blocked `synchronizer_basic_test`).
+   (incl. the schema-blocked `synchronizer_basic_test`).~~ **DONE
+   2026-06-12** — all six fixtures registered.
 4. **`struct`** (4, two of which also need `bus`).
 5. Singletons opportunistically — `.reset(...)`, non-named testbench
    field types, wide literals, `property`, `enum`, `const`,

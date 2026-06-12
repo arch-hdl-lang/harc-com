@@ -41,12 +41,37 @@ impl FuncBuilder<'_> {
             StmtKind::Wait {
                 duration, clock, ..
             } => {
-                if clock.is_some() {
-                    return Err(unsupported("`wait N cycles on <clock>`", ""));
-                }
+                // `wait N cycles [on <clock>]`. The clock qualifier
+                // resolves against the test's declared clocks HERE —
+                // v1 deferred the unknown-clock error to emission; the
+                // IR pipeline rejects it at lowering with the same
+                // message shape plus the declared-clock list.
+                let clock = match clock {
+                    Some(c) => {
+                        let Some(index) =
+                            self.ctx.clock_names.iter().position(|n| n == &c.name)
+                        else {
+                            let declared = if self.ctx.clock_names.is_empty() {
+                                "none".to_string()
+                            } else {
+                                self.ctx.clock_names.join(", ")
+                            };
+                            return Err(LowerError::Invalid(format!(
+                                "wait ... on {}: no clock named `{}` declared in this \
+                                 test (declared clocks: {declared})",
+                                c.name, c.name
+                            )));
+                        };
+                        Some(crate::ir::WaitClock {
+                            name: c.name.clone(),
+                            index,
+                        })
+                    }
+                    None => None,
+                };
                 let n = self.lower_expr_no_ports(duration)?;
                 let next = self.new_block();
-                self.terminate(Terminator::WaitCycles(n, next));
+                self.terminate(Terminator::WaitCycles(n, clock, next));
                 self.start_block(next);
                 Ok(())
             }

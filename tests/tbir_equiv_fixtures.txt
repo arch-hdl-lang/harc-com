@@ -6,21 +6,31 @@
 # emitters (`harc sim --codegen v1` and `--codegen tbir`): same verdict,
 # and zero `harc trace-diff` divergences between the semantic traces.
 #
-# Format (pipe-separated, one row per fixture — schema v2):
+# Format (pipe-separated, one row per fixture — schema v3; the last
+# three columns are optional and may be omitted entirely, `-` = none;
+# 5-column schema-v2 rows keep parsing unchanged):
 #
-#     test_name | top | sv_files | arch_dut | expect
+#     test_name | top | sv_files | arch_dut | expect | extra_harc | ref_src | test_struct
 #
-#   test_name  HARC fixture stem — tests/fixtures/<test_name>.harc
-#   top        SV top-module name, passed via --top
-#   sv_files   space-separated DUT files relative to tests/dut/
-#   arch_dut   ARCH DUT source relative to tests/dut/ for the optional
-#              ARCH-native sweep (`harc sim --dut`, needs ARCH_BIN), or
-#              `-` when no proven .arch sibling exists (sweep skips row)
-#   expect     `pass` — both codegens must print ALL TESTS PASSED;
-#              `fail` — both codegens must exit nonzero WITHOUT printing
-#              ALL TESTS PASSED (deliberate-failure fixtures, e.g. the
-#              log(fatal, ...) path). Either way the two traces must
-#              trace-diff clean: the failure must be recorded identically.
+#   test_name   HARC fixture stem — tests/fixtures/<test_name>.harc
+#   top         SV top-module name, passed via --top
+#   sv_files    space-separated DUT files relative to tests/dut/
+#   arch_dut    ARCH DUT source relative to tests/dut/ for the optional
+#               ARCH-native sweep (`harc sim --dut`, needs ARCH_BIN), or
+#               `-` when no proven .arch sibling exists (sweep skips row)
+#   expect      `pass` — both codegens must print ALL TESTS PASSED;
+#               `fail` — both codegens must exit nonzero WITHOUT printing
+#               ALL TESTS PASSED (deliberate-failure fixtures, e.g. the
+#               log(fatal, ...) path). Either way the two traces must
+#               trace-diff clean: the failure must be recorded identically.
+#   extra_harc  space-separated ADDITIONAL .harc files relative to
+#               tests/fixtures/, loaded after <test_name>.harc (e.g.
+#               shared `domain` declaration files)
+#   ref_src     space-separated C/C++ reference-model sources relative
+#               to tests/dut/, passed via `--ref-src` (extern-fn
+#               fixtures; mirrors the run_fixtures.sh manifest column)
+#   test_struct test struct name passed via `--test`, for fixture files
+#               declaring more than one test struct
 #
 # Lines starting with '#' and blank lines are ignored.
 #
@@ -48,3 +58,9 @@ synchronizer_handshake_test | BusSync | synchronizer_handshake.sv | - | pass
 pkt_queue_test | PacketQueue | pkt_queue.sv | - | pass
 cam_basic_test | Mshr_Addr_Cam | cam_basic.sv | - | pass
 inst_vec_port_regression_test | Top | inst_vec_port_regression.sv | - | pass
+synchronizer_basic_test | FlagSync | synchronizer_basic.sv | - | pass | async_fifo_domains.harc
+synchronizer_gray_test | PtrSync | synchronizer_gray.sv | - | pass
+synchronizer_reset_test | RstSync | synchronizer_reset.sv | - | pass
+synchronizer_wide_test | DataSync | synchronizer_wide.sv | - | pass
+synchronizer_pulse_test | EventSync | synchronizer_pulse.sv | - | pass | synchronizer_pulse_domains.harc
+multi_clock_test | MultiClockSync | multi_clock.sv | - | pass | async_fifo_domains.harc

@@ -157,9 +157,10 @@ fn term_str(func: &TbFunction, t: &Terminator) -> String {
         Terminator::Branch(c, bt, bf) => {
             format!("Branch({}, b{}, b{})", expr_str(func, c), bt.0, bf.0)
         }
-        Terminator::WaitCycles(e, b) => {
-            format!("WaitCycles({}, b{})", expr_str(func, e), b.0)
-        }
+        Terminator::WaitCycles(e, clock, b) => match clock {
+            Some(c) => format!("WaitCycles({} on {}, b{})", expr_str(func, e), c.name, b.0),
+            None => format!("WaitCycles({}, b{})", expr_str(func, e), b.0),
+        },
         Terminator::WaitUntil { preds, mode, succ } => format!(
             "WaitUntil {{ {} [{}], b{} }}",
             preds_str(func, preds),

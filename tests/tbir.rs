@@ -667,6 +667,132 @@ fn tbir_emit_helper_mix() {
     );
 }
 
+// ── `wait N cycles on <clock>` ──────────────────────────────────────
+
+const WAIT_ON_CLOCK_SRC: &str = r#"
+test WaitOnClockTest
+    let dut : Top
+    clock clk = 10ns
+    clock aux_clk = 4ns
+    run
+        wait 2 cycles on aux_clk
+        dut.en = 1
+    end run
+end test WaitOnClockTest
+"#;
+
+/// A clock-qualified wait lowers to `WaitCycles` carrying the resolved
+/// `WaitClock` (declaration-order index == runtime scheduler index);
+/// the dump-ir text names the clock; the lower_coroutine trigger
+/// renders it too.
+#[test]
+fn wait_on_clock_lowers_with_clock_qualifier() {
+    let prog = lower_src(WAIT_ON_CLOCK_SRC).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let f = prog.function(prog.tests[0].run);
+    let ir::Terminator::WaitCycles(_, Some(clock), _) = &f.blocks[0].terminator else {
+        panic!("expected clock-qualified WaitCycles terminator:\n{f}");
+    };
+    assert_eq!(clock.name, "aux_clk");
+    assert_eq!(clock.index, 1, "declaration-order index into TestSchema::clocks");
+    assert!(
+        format!("{f}").contains("WaitCycles(2 on aux_clk, b1)"),
+        "display names the clock:\n{f}"
+    );
+    let meta = lower_coroutine::run(&prog).expect("tags");
+    assert!(
+        format!("{}", meta.display(&prog)).contains("wait_cycles(2 on aux_clk)"),
+        "pass trigger names the clock:\n{}",
+        meta.display(&prog)
+    );
+}
+
+/// An unknown clock after `on` is a structured lowering error naming
+/// the clock and the declared ones (v1 deferred this to emission).
+#[test]
+fn wait_on_unknown_clock_is_invalid() {
+    let src = r#"
+test WaitBadClockTest
+    let dut : Top
+    clock clk = 10ns
+    clock aux_clk = 4ns
+    run
+        wait 1 cycle on nope
+    end run
+end test WaitBadClockTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)),
+        "unknown clock is Invalid, not Unsupported: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("no clock named `nope`"), "names the clock: {msg}");
+    assert!(
+        msg.contains("declared clocks: clk, aux_clk"),
+        "lists the declared clocks: {msg}"
+    );
+}
+
+/// The verifier cross-checks every clock-qualified wait against the
+/// test's declared clocks: an out-of-range index (which codegen would
+/// turn into an out-of-bounds `clocks_[i]` access) or an index/name
+/// disagreement is a programmer-error verify failure.
+#[test]
+fn verifier_catches_bad_wait_clock() {
+    let prog = lower_src(WAIT_ON_CLOCK_SRC).expect("lowers");
+    let run_idx = prog.tests[0].run.index();
+
+    let mut broken = prog.clone();
+    for b in &mut broken.functions[run_idx].blocks {
+        if let ir::Terminator::WaitCycles(_, Some(wc), _) = &mut b.terminator {
+            wc.index = 7; // out of range — only 2 clocks declared
+        }
+    }
+    let errs = verify::verify_program(&broken).unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.to_string().contains("only 2 clock(s) are declared")),
+        "{errs:?}"
+    );
+
+    let mut broken = prog;
+    for b in &mut broken.functions[run_idx].blocks {
+        if let ir::Terminator::WaitCycles(_, Some(wc), _) = &mut b.terminator {
+            wc.index = 0; // valid slot, but it is `clk`, not `aux_clk`
+        }
+    }
+    let errs = verify::verify_program(&broken).unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.to_string().contains("that slot is `clk`")),
+        "{errs:?}"
+    );
+}
+
+/// tbir emission of a clock-qualified wait mirrors v1's inline
+/// eval_clocks_until loop (no coroutine yield): advance to whichever
+/// clock's next edge is sooner until the named clock has seen N more
+/// rising edges, then run the checkers.
+#[test]
+fn tbir_emit_wait_on_clock_inline_loop() {
+    let prog = lower_src(WAIT_ON_CLOCK_SRC).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let cpp = tbir::emit(&prog, &cpp_tb::EmitOpts::default()).expect("emits");
+    for marker in [
+        "{ long long _target = clocks_[1].rising_count + (long long)(2); \
+         while (clocks_[1].rising_count < _target) {",
+        "long long _next = clocks_[0].next_edge_ps;",
+        "for (auto& _ck : clocks_) if (_ck.next_edge_ps < _next) _next = _ck.next_edge_ps;",
+        "eval_clocks_until(_next);",
+        "} for (auto& _c : _checkers) _c(); }",
+    ] {
+        assert!(cpp.contains(marker), "missing wait-on-clock marker `{marker}` in:\n{cpp}");
+    }
+    assert!(
+        !cpp.contains("co_await harc_rt::wait_cycles"),
+        "clock-qualified wait must not yield to the scheduler (v1 parity)"
+    );
+}
+
 /// Core lowering shape: a `for` loop becomes init / header-branch /
 /// body / latch / exit, with the counter init outside the loop.
 #[test]

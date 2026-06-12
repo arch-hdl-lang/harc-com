@@ -29,7 +29,8 @@
 //! call-by-value functions, never as coroutines.
 
 use super::super::{
-    BlockId, Expr, FunctionId, FunctionKind, PredSrc, TbFunction, TbProgram, Terminator, WaitMode,
+    BlockId, Expr, FunctionId, FunctionKind, PredSrc, TbFunction, TbProgram, Terminator,
+    WaitClock, WaitMode,
 };
 use crate::ir::display::{expr_str, mode_str};
 use std::collections::BTreeMap;
@@ -80,8 +81,11 @@ pub struct GuardTerm {
 /// The suspend (or termination) event that fires a transition.
 #[derive(Debug, Clone)]
 pub enum Trigger {
-    /// `WaitCycles(n)` elapsed.
-    CyclesElapsed(Expr),
+    /// `WaitCycles(n)` elapsed. The clock qualifier (None = primary
+    /// clock) only affects which clock's rising edges are counted —
+    /// the FSM shape is identical, so the pass treats both forms the
+    /// same and the qualifier surfaces only in the rendered trigger.
+    CyclesElapsed(Expr, Option<WaitClock>),
     /// `WaitUntil` / `WaitUntilTimeout` predicate(s) became true.
     PredsHold { preds: Vec<PredSrc>, mode: WaitMode },
     /// `WaitUntilTimeout` cycle budget expired first.
@@ -152,7 +156,7 @@ pub fn run(prog: &TbProgram) -> Result<CoroutineMetadata, LowerCoroutineError> {
 /// non-suspending kinds).
 fn resume_successors(t: &Terminator) -> Vec<BlockId> {
     match t {
-        Terminator::WaitCycles(_, succ) | Terminator::WaitUntil { succ, .. } => vec![*succ],
+        Terminator::WaitCycles(_, _, succ) | Terminator::WaitUntil { succ, .. } => vec![*succ],
         Terminator::WaitUntilTimeout {
             on_fire,
             on_timeout,
@@ -249,10 +253,10 @@ fn collapse(
             collapse(func, from, *else_b, guard, path, state_of, out)?;
             guard.pop();
         }
-        Terminator::WaitCycles(cycles, succ) => out.push(Transition {
+        Terminator::WaitCycles(cycles, clock, succ) => out.push(Transition {
             from,
             guard: guard.clone(),
-            trigger: Trigger::CyclesElapsed(cycles.clone()),
+            trigger: Trigger::CyclesElapsed(cycles.clone(), clock.clone()),
             to: state_at(*succ),
         }),
         Terminator::WaitUntil { preds, mode, succ } => out.push(Transition {
@@ -360,7 +364,10 @@ impl Display for CoroutineMetadataDisplay<'_> {
 
 fn trigger_str(func: &TbFunction, t: &Trigger) -> String {
     match t {
-        Trigger::CyclesElapsed(e) => format!("wait_cycles({})", expr_str(func, e)),
+        Trigger::CyclesElapsed(e, clock) => match clock {
+            Some(c) => format!("wait_cycles({} on {})", expr_str(func, e), c.name),
+            None => format!("wait_cycles({})", expr_str(func, e)),
+        },
         Trigger::PredsHold { preds, mode } => {
             let ps: Vec<String> = preds.iter().map(|p| expr_str(func, &p.expr)).collect();
             format!("preds({}) [{}]", ps.join(", "), mode_str(mode))
@@ -420,7 +427,7 @@ mod tests {
         // b0: WaitCycles(2) -> b1; b1: Return.
         let prog = prog_with_run(
             vec![
-                block(vec![], Terminator::WaitCycles(lit(2), BlockId(1))),
+                block(vec![], Terminator::WaitCycles(lit(2), None, BlockId(1))),
                 block(vec![], Terminator::Return),
             ],
             vec![],
@@ -432,7 +439,7 @@ mod tests {
         assert_eq!(ts.len(), 2);
         assert_eq!(ts[0].from, StateId(0));
         assert_eq!(ts[0].to, Some(StateId(1)));
-        assert!(matches!(ts[0].trigger, Trigger::CyclesElapsed(_)));
+        assert!(matches!(ts[0].trigger, Trigger::CyclesElapsed(..)));
         assert!(ts[0].guard.is_empty());
         assert_eq!(ts[1].from, StateId(1));
         assert_eq!(ts[1].to, None);
@@ -450,8 +457,8 @@ mod tests {
                     vec![],
                     Terminator::Branch(local_cond(0), BlockId(1), BlockId(2)),
                 ),
-                block(vec![], Terminator::WaitCycles(lit(1), BlockId(3))),
-                block(vec![], Terminator::WaitCycles(lit(5), BlockId(3))),
+                block(vec![], Terminator::WaitCycles(lit(1), None, BlockId(3))),
+                block(vec![], Terminator::WaitCycles(lit(5), None, BlockId(3))),
                 block(vec![], Terminator::Return),
             ],
             vec![flag_local("c")],
@@ -486,7 +493,7 @@ mod tests {
                     vec![],
                     Terminator::Branch(local_cond(0), BlockId(2), BlockId(4)),
                 ),
-                block(vec![], Terminator::WaitCycles(lit(1), BlockId(3))),
+                block(vec![], Terminator::WaitCycles(lit(1), None, BlockId(3))),
                 block(vec![], Terminator::Jump(BlockId(1))),
                 block(vec![], Terminator::Return),
             ],
@@ -599,7 +606,7 @@ mod tests {
         // b0: WaitCycles -> b1; b1: Fatal — terminal, no target state.
         let prog = prog_with_run(
             vec![
-                block(vec![], Terminator::WaitCycles(lit(1), BlockId(1))),
+                block(vec![], Terminator::WaitCycles(lit(1), None, BlockId(1))),
                 block(
                     vec![crate::ir::Stmt::Log {
                         level: crate::ir::LogLevel::Fatal,

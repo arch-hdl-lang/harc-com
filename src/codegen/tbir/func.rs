@@ -95,13 +95,49 @@ pub(super) fn emit_function(
                 writeln!(out, "{pad3}if ({cond}) {{ __bb = {}; }} else {{ __bb = {}; }}", t.0, f.0)
                     .ok();
             }
-            Terminator::WaitCycles(n, b) => {
+            Terminator::WaitCycles(n, clock, b) => {
                 let n = expr_cpp(func, &names, n)?;
-                writeln!(
-                    out,
-                    "{pad3}co_await harc_rt::wait_cycles(_slot, (uint32_t)({n}));"
-                )
-                .ok();
+                match clock {
+                    None => {
+                        writeln!(
+                            out,
+                            "{pad3}co_await harc_rt::wait_cycles(_slot, (uint32_t)({n}));"
+                        )
+                        .ok();
+                    }
+                    Some(c) => {
+                        // `wait N cycles on <clock>` — mirror v1's
+                        // inline eval_clocks_until loop (cpp_tb.rs,
+                        // StmtKind::Wait with a clock): advance
+                        // simulated time edge-by-edge until the named
+                        // clock has seen N more rising edges, then run
+                        // the checkers. v1 emits this inline (no
+                        // coroutine yield) regardless of coroutine
+                        // context — the main loop's full-primary-period
+                        // stride is too coarse when the named clock is
+                        // faster than the primary — so the loop-switch
+                        // does the same: no co_await, identical
+                        // scheduler interaction, identical cycle
+                        // timing.
+                        let idx = c.index;
+                        writeln!(
+                            out,
+                            "{pad3}{{ long long _target = clocks_[{idx}].rising_count + \
+                             (long long)({n}); while (clocks_[{idx}].rising_count < _target) {{"
+                        )
+                        .ok();
+                        writeln!(out, "{pad3}{INDENT}long long _next = clocks_[0].next_edge_ps;")
+                            .ok();
+                        writeln!(
+                            out,
+                            "{pad3}{INDENT}for (auto& _ck : clocks_) if (_ck.next_edge_ps < \
+                             _next) _next = _ck.next_edge_ps;"
+                        )
+                        .ok();
+                        writeln!(out, "{pad3}{INDENT}eval_clocks_until(_next);").ok();
+                        writeln!(out, "{pad3}}} for (auto& _c : _checkers) _c(); }}").ok();
+                    }
+                }
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::Return => {
