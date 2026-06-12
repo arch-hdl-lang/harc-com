@@ -1,15 +1,26 @@
-# TB-IR equivalence-fixture registry — consumed by tests/run_tbir_equiv.sh.
+# TB-IR equivalence-fixture registry — consumed by tests/run_tbir_equiv.sh
+# and tests/run_arch_dut_fixtures.sh (single source of truth for the
+# equivalence matrix; do not duplicate these rows in scripts).
 #
-# Each row names a fixture that must produce IDENTICAL semantic traces
-# under BOTH C++ emitters (`harc sim --codegen v1` and `--codegen tbir`).
+# Each row names a fixture that must behave IDENTICALLY under BOTH C++
+# emitters (`harc sim --codegen v1` and `--codegen tbir`): same verdict,
+# and zero `harc trace-diff` divergences between the semantic traces.
 #
-# Format (pipe-separated, one row per fixture):
+# Format (pipe-separated, one row per fixture — schema v2):
 #
-#     test_name | top | sv_files
+#     test_name | top | sv_files | arch_dut | expect
 #
 #   test_name  HARC fixture stem — tests/fixtures/<test_name>.harc
 #   top        SV top-module name, passed via --top
 #   sv_files   space-separated DUT files relative to tests/dut/
+#   arch_dut   ARCH DUT source relative to tests/dut/ for the optional
+#              ARCH-native sweep (`harc sim --dut`, needs ARCH_BIN), or
+#              `-` when no proven .arch sibling exists (sweep skips row)
+#   expect     `pass` — both codegens must print ALL TESTS PASSED;
+#              `fail` — both codegens must exit nonzero WITHOUT printing
+#              ALL TESTS PASSED (deliberate-failure fixtures, e.g. the
+#              log(fatal, ...) path). Either way the two traces must
+#              trace-diff clean: the failure must be recorded identically.
 #
 # Lines starting with '#' and blank lines are ignored.
 #
@@ -17,10 +28,13 @@
 # subset (covergroups, helpers, wait-until, ...) adds its rows here in the
 # same PR. Merge conflicts resolve as the line union of both sides. Do not
 # add rows for constructs your PR does not enable — the harness fails the
-# whole run if any listed fixture does not pass under `--codegen tbir`.
+# whole run if any listed fixture does not behave as its `expect` column
+# specifies under `--codegen tbir`.
 
-top_counter_test | Top | top_counter.sv
-sync_fifo_test | TxQueue | sync_fifo.sv
-bus_arbiter_test | BusArbiter | bus_arbiter.sv
-wait_until_counter_test | Top | top_counter.sv
-rom_lut_test | RomLut | rom_lut.sv
+top_counter_test | Top | top_counter.sv | top_counter.arch | pass
+sync_fifo_test | TxQueue | sync_fifo.sv | sync_fifo.arch | pass
+bus_arbiter_test | BusArbiter | bus_arbiter.sv | bus_arbiter.arch | pass
+wait_until_counter_test | Top | top_counter.sv | top_counter.arch | pass
+rom_lut_test | RomLut | rom_lut.sv | rom_lut.arch | pass
+log_paths_test | Top | top_counter.sv | top_counter.arch | pass
+fatal_path_test | Top | top_counter.sv | top_counter.arch | fail

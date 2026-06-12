@@ -1,0 +1,49 @@
+// Fatal-path coverage for the v1-vs-tbir equivalence matrix:
+// `log(fatal, ...)` must — in BOTH C++ emitters — increment the error
+// counter AND set `_fatal`, so the main drive loop exits at the end of
+// the current cycle (spec §7.7: this test instance aborts; others in a
+// regression continue). The statement after the post-fatal `wait` must
+// therefore NEVER execute: if `_fatal` were dropped by either codegen,
+// the extra `log(error, ...)` would bump `errors` to 2 and add a trace
+// line, and `harc trace-diff` / the verdict check would flag it.
+//
+// Registry row (tests/tbir_equiv_fixtures.txt): expect=fail — both
+// codegens must exit nonzero WITHOUT printing ALL TESTS PASSED, and
+// their semantic traces must still match line-for-line.
+//
+// Deliberately NOT listed in run_fixtures.sh: that harness requires
+// every row to print ALL TESTS PASSED, and this fixture exists to fail.
+// Only tests/run_tbir_equiv.sh (and the registry-driven sweep in
+// tests/run_arch_dut_fixtures.sh) runs it, under expect=fail rules.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench FatalPathTb
+    dut : Top
+end testbench FatalPathTb
+
+impl FatalPathTest for FatalPathTb
+    clock clk = SysDomain        // 100 MHz
+
+    run
+        // Reset, then count two cycles so the fatal fires at a
+        // deterministic non-zero count (count_out == 2).
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        assert dut.count_out == 0
+            else fail("after reset: count_out=${dut.count_out}, expected 0")
+        dut.rst = 0
+        dut.en = 1
+        wait 2 cycles
+        log(info, "about to abort at count_out=${dut.count_out}")
+
+        // errors++ AND _fatal = true — the drive loop must exit at the
+        // next wait point, before the statement below the wait runs.
+        log(fatal, "deliberate fatal at count_out=${dut.count_out}")
+        wait 1 cycle
+        log(error, "UNREACHABLE: _fatal must abort the run before this line")
+    end run
+end impl FatalPathTest

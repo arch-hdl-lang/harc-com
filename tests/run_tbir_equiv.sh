@@ -3,9 +3,16 @@
 #
 # For every fixture row in tests/tbir_equiv_fixtures.txt, run the HARC
 # testbench through BOTH C++ emitters (`harc sim --codegen v1` and
-# `--codegen tbir`) against the vendored SV DUT, assert "ALL TESTS
-# PASSED" under each, then `harc trace-diff` the two semantic JSONL
-# traces. Any test failure or trace divergence fails the run.
+# `--codegen tbir`) against the vendored SV DUT, assert the row's
+# expected verdict under each, then `harc trace-diff` the two semantic
+# JSONL traces. Any verdict mismatch or trace divergence fails the run.
+#
+# Verdicts (registry `expect` column, schema v2):
+#   pass — each sim must print "ALL TESTS PASSED".
+#   fail — each sim must exit nonzero AND not print "ALL TESTS PASSED"
+#          (deliberate-failure fixtures, e.g. the log(fatal, ...) path).
+# In both cases the v1/tbir traces must trace-diff clean — a failing
+# fixture must fail IDENTICALLY under both codegens.
 #
 # Run from harc-com repo root:
 #     ./tests/run_tbir_equiv.sh
@@ -15,10 +22,10 @@
 # from `cargo build --release --bin harc`).
 #
 # Optional ARCH-native-DUT sweep: when ARCH_BIN points at an `arch`
-# binary AND a matching tests/dut/<stem>.arch exists for every SV file
-# in a row, the same v1/tbir pair also runs through `harc sim --dut`
-# (ARCH native sim backend) and is trace-diffed. Skipped silently
-# otherwise — CI has no arch checkout.
+# binary AND the row's arch_dut column names a tests/dut/<file>.arch
+# source (rows with `-` self-skip), the same v1/tbir pair also runs
+# through `harc sim --dut` (ARCH native sim backend) and is trace-diffed.
+# Skipped silently when ARCH_BIN is unset — CI has no arch checkout.
 set -uo pipefail
 
 HARC="${HARC:-./target/release/harc}"
@@ -46,12 +53,13 @@ FAIL=0
 FAILED_NAMES=()
 
 # run_sim <verdict_tag> <outdir> <codegen> <dut|sv> <top> <files...>
-# Runs one `harc sim` invocation, requiring "ALL TESTS PASSED" in the
-# output. Reads the HARC_FILES global array (the .harc inputs for the
-# current registry row, set by run_one). Each codegen gets its OWN outdir: harc's write_if_changed /
-# obj_dir reuse keys off the emitted .cpp in the outdir, so sharing one
-# directory across codegens would alternate rebuilds and risk stale-
-# object confusion.
+# Runs one `harc sim` invocation, requiring the verdict named by the
+# ROW_EXPECT global (`pass` or `fail`, set by run_one from the registry
+# row). Reads the HARC_FILES global array (the .harc inputs for the
+# current registry row, set by run_one). Each codegen gets its OWN
+# outdir: harc's write_if_changed / obj_dir reuse keys off the emitted
+# .cpp in the outdir, so sharing one directory across codegens would
+# alternate rebuilds and risk stale-object confusion.
 run_sim() {
     local tag="$1" dir="$2" cg="$3" backend="$4" top="$5"
     shift 5
@@ -63,10 +71,31 @@ run_sim() {
     fi
 
     mkdir -p "$dir"
-    local out
+    local out rc
     out="$("$HARC" sim "${backend_args[@]}" "${HARC_FILES[@]}" --top "$top" \
         --codegen "$cg" --seed "$SEED" --outdir "$dir" \
-        --record-trace "$dir/t.jsonl" 2>&1)" || true
+        --record-trace "$dir/t.jsonl" 2>&1)"
+    rc=$?
+
+    if [ "$ROW_EXPECT" = "fail" ]; then
+        # Expect-fail row: the sim must exit nonzero and must NOT claim
+        # success. Requiring the "N TESTS FAILED" verdict line separates
+        # a deliberate test failure from infrastructure breakage (compile
+        # error, Verilator failure). The trace-diff in run_pair then
+        # asserts the failure was recorded identically under both
+        # codegens.
+        if [ "$rc" -eq 0 ] || echo "$out" | grep -q "ALL TESTS PASSED"; then
+            echo "  FAIL  $tag (sim --codegen $cg passed, but registry expects fail)"
+            echo "$out" | tail -20 | sed 's/^/      /'
+            return 1
+        fi
+        if ! echo "$out" | grep -q "TESTS FAILED"; then
+            echo "  FAIL  $tag (sim --codegen $cg broke before reaching a test verdict)"
+            echo "$out" | tail -20 | sed 's/^/      /'
+            return 1
+        fi
+        return 0
+    fi
 
     if ! echo "$out" | grep -q "ALL TESTS PASSED"; then
         echo "  FAIL  $tag (sim --codegen $cg did not pass)"
@@ -98,13 +127,16 @@ run_pair() {
 
 run_one() {
     local row="$1"
-    local test top sv
-    IFS='|' read -r test top sv <<<"$row"
+    local test top sv arch_dut expect
+    IFS='|' read -r test top sv arch_dut expect <<<"$row"
     test="$(echo "$test" | xargs)"
     top="$(echo "$top" | xargs)"
     sv="$(echo "$sv" | xargs)"
+    arch_dut="$(echo "$arch_dut" | xargs)"
+    expect="$(echo "$expect" | xargs)"
     [ -z "$test" ] && return 0
-    if [ -z "$top" ] || [ -z "$sv" ]; then
+    if [ -z "$top" ] || [ -z "$sv" ] || [ -z "$arch_dut" ] \
+        || { [ "$expect" != "pass" ] && [ "$expect" != "fail" ]; }; then
         echo "  FAIL  $test (malformed registry row: '$row')"
         FAIL=$((FAIL + 1))
         FAILED_NAMES+=("$test")
@@ -112,6 +144,7 @@ run_one() {
     fi
 
     HARC_FILES=("$FIX_DIR/$test.harc")
+    ROW_EXPECT="$expect"
 
     local sv_files=()
     local f
@@ -122,24 +155,24 @@ run_one() {
         FAILED_NAMES+=("$test")
         return 0
     fi
-    echo "  PASS  $test (v1 == tbir)"
+    echo "  PASS  $test (v1 == tbir, expect=$expect)"
     PASS=$((PASS + 1))
 
-    # Optional ARCH-native-DUT sweep. Only when ARCH_BIN is set AND every
-    # SV file has a sibling .arch source; skip silently otherwise.
-    if [ -n "${ARCH_BIN:-}" ] && [ -x "${ARCH_BIN:-}" ]; then
-        local arch_files=()
-        for f in $sv; do
-            local a="$DUT_DIR/${f%.sv}.arch"
-            [ -f "$a" ] || return 0
-            arch_files+=("$a")
-        done
-        if ! run_pair "$test [arch-dut]" "$OUT/${test}__arch_dut" dut "$top" "${arch_files[@]}"; then
+    # Optional ARCH-native-DUT sweep. Only when ARCH_BIN is set AND the
+    # row names an arch_dut source; skip silently otherwise.
+    if [ -n "${ARCH_BIN:-}" ] && [ -x "${ARCH_BIN:-}" ] && [ "$arch_dut" != "-" ]; then
+        if [ ! -f "$DUT_DIR/$arch_dut" ]; then
+            echo "  FAIL  $test [arch-dut] (registry arch_dut '$arch_dut' not found in $DUT_DIR)"
             FAIL=$((FAIL + 1))
             FAILED_NAMES+=("$test [arch-dut]")
             return 0
         fi
-        echo "  PASS  $test [arch-dut] (v1 == tbir)"
+        if ! run_pair "$test [arch-dut]" "$OUT/${test}__arch_dut" dut "$top" "$DUT_DIR/$arch_dut"; then
+            FAIL=$((FAIL + 1))
+            FAILED_NAMES+=("$test [arch-dut]")
+            return 0
+        fi
+        echo "  PASS  $test [arch-dut] (v1 == tbir, expect=$expect)"
         PASS=$((PASS + 1))
     fi
 }
