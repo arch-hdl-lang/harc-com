@@ -1,0 +1,26 @@
+---
+source: tests/tbir.rs
+assertion_line: 1066
+expression: "format!(\"{}\", table.display(&prog, &profile))"
+---
+placement [profile=single-site]
+  fn0 run_TopCounterTest
+    b0: tier0-co-located, cycle-exact
+    b1: tier0-co-located, unknown
+    b2: tier2-host-service, timing-tolerant
+    b3: tier2-host-service, timing-tolerant
+    b4: tier1-near-processor, timing-tolerant
+    b5: tier0-co-located, unknown
+    b6: tier0-co-located, timing-tolerant
+    b7: tier2-host-service, timing-tolerant
+    b8: tier2-host-service, timing-tolerant
+    b9: tier1-near-processor, timing-tolerant
+    b10: tier0-co-located, unknown
+    b11: tier0-co-located, timing-tolerant
+    b12: tier2-host-service, timing-tolerant
+    b13: tier2-host-service, timing-tolerant
+    b14: tier1-near-processor, timing-tolerant
+    b15: tier0-co-located, cycle-exact
+    b16: tier0-co-located, timing-tolerant
+    b17: tier0-co-located, timing-tolerant
+  diagnostics: none

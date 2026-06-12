@@ -5,7 +5,7 @@
 //! lock the in-process shapes.
 
 use harc::codegen::{cpp_tb, merge, tbir};
-use harc::ir::passes::lower_coroutine;
+use harc::ir::passes::{lower_coroutine, placement};
 use harc::ir::{self, lower, verify};
 use harc::parser::parse_source;
 use std::path::Path;
@@ -1047,4 +1047,52 @@ fn tbir_emit_rejects_mt() {
     };
     let err = tbir::emit(&prog, &opts).unwrap_err();
     assert!(err.0.contains("--mt"), "{}", err.0);
+}
+
+// ── placement pass snapshots — tier/timing annotation per block plus
+//    the capability-diagnostic surface under both built-in profiles. ─
+
+/// top_counter under the default single-site profile: pin-driving
+/// blocks anchored by WaitCycles classify cycle-exact / Tier 0; pure
+/// logging blocks land in Tier 2. Diagnostics must be `none` — the
+/// single-site profile can never diagnose (design-doc guarantee).
+#[test]
+fn top_counter_placement_snapshot() {
+    let prog = lower_src(&fixture("top_counter_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let profile = placement::TargetProfile::single_site();
+    let table = placement::run(&prog, &profile);
+    assert!(table.diagnostics.is_empty(), "single-site never diagnoses");
+    insta::assert_snapshot!(
+        "top_counter_placement",
+        format!("{}", table.display(&prog, &profile))
+    );
+}
+
+/// wait_until_counter under split-strict: wait-until regions are
+/// timing-tolerant over architectural ports, so even the constrained
+/// profile must place them diagnostic-free.
+#[test]
+fn wait_until_counter_placement_split_strict_snapshot() {
+    let prog = lower_src(&fixture("wait_until_counter_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let profile = placement::TargetProfile::split_strict();
+    let table = placement::run(&prog, &profile);
+    insta::assert_snapshot!(
+        "wait_until_counter_placement_split_strict",
+        format!("{}", table.display(&prog, &profile))
+    );
+}
+
+/// The pass is a side-table: running it must not perturb the IR, and
+/// its rendering is byte-stable across runs.
+#[test]
+fn placement_leaves_ir_untouched_and_is_deterministic() {
+    let prog = lower_src(&fixture("top_counter_test.harc")).expect("lowers");
+    let before = format!("{prog}");
+    let profile = placement::TargetProfile::single_site();
+    let a = format!("{}", placement::run(&prog, &profile).display(&prog, &profile));
+    let b = format!("{}", placement::run(&prog, &profile).display(&prog, &profile));
+    assert_eq!(a, b, "rendering must be byte-stable");
+    assert_eq!(before, format!("{prog}"), "pass must not perturb the IR");
 }
