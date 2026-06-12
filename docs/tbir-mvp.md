@@ -126,18 +126,38 @@ reason. Code locations are authoritative.
    across `case` arms). v1 emits declared-width C types for typed
    lets (`local_value_c_type`: `uint<75>` → `_harc_u128`, narrow
    widths → narrow C types) and `int64_t` for untyped integer lets.
-   Two observable deltas follow: (a) a typed narrow local that
+   Three observable deltas follow: (a) a typed narrow local that
    overflows its declared width truncates on assignment under v1 but
    not under tbir — **narrowing semantics differ**; (b) untyped lets
    holding negative intermediates are signed under v1, unsigned under
-   tbir. None of the five fixtures exercises either case, so the
-   behavioral gate cannot see this; it is a known, latent divergence.
-   Fix path: `IrType` already carries `UInt(Option<u32>)` /
+   tbir; (c) **a read of a DUT port wider than 64 bits truncates to 64
+   bits** — `let got : uint<96> = dut.q` lands in a `uint64_t` local, so
+   the upper bits are dropped. This (c) case is the highest-impact one
+   in practice (AXI data, wide registers, hash/cipher state) and is
+   *not* surface-rejected: `as_port_ref` (`src/ir/lower/exprs.rs`)
+   builds the `PortRef` with `width: None`, so lowering cannot tell the
+   port is wide and emits a silently-truncating `DutRead` rather than an
+   "unsupported — re-run with `--codegen v1`" error like every other
+   out-of-subset construct. Reproduced on a fresh binary against a
+   96-bit DUT (`96'hFFFFFFFF_00000000_DEADBEEF`): v1 reads
+   `0xffffffff00000000deadbeef`, tbir reads `0x0000000000000000deadbeef`
+   (`harc trace-diff` exit 1). None of the five equivalence fixtures —
+   nor any fixture in `tests/tbir_equiv_fixtures.txt` — exercises a
+   signal wider than 64 bits, even though purpose-built wide DUTs exist
+   (`tests/dut/wide_reg.sv` is 256-bit; `wide1024_tlm.sv`,
+   `synchronizer_wide.sv`, `sha256.sv`, `aes_cipher_top.sv`). So the
+   behavioral gate cannot see any of (a)/(b)/(c); they are known, latent
+   divergences. Fix path: `IrType` already carries `UInt(Option<u32>)` /
    `SInt(Option<u32>)`; lowering currently leaves locals
    `IrType::Unknown`. Populating widths at lowering (from `let`
-   type annotations, as v1's `let_widths` pass does) and emitting
-   width-faithful types — or masking at `Assign` — closes it without
-   IR shape changes.
+   type annotations and DUT-port widths, as v1's `let_widths` pass does)
+   and emitting width-faithful types — or masking at `Assign` — closes
+   (a)/(b) and the local-storage side of (c) without IR shape changes;
+   plumbing the DUT-port width into `PortRef` additionally lets lowering
+   *reject* wide reads as out-of-subset until a wide-faithful `DutRead`
+   lands, which is the conservative interim that matches how the rest of
+   the MVP handles unsupported constructs. A `wide_reg` row in the
+   equivalence registry would pin whichever fix is chosen.
 
 5. **Invariant 8 amended in the verifier.** The design's literal text:
    "No block is empty unless its terminator is `Return` or `Jump`."
