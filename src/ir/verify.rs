@@ -159,6 +159,43 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 });
             }
         }
+        // Cross-IR: every clock-qualified WaitCycles in the test's
+        // functions must name a clock the test actually declares
+        // (index in range AND name agreement — lowering resolves both
+        // together, so disagreement means a pass corrupted the IR).
+        // Codegen indexes the runtime clock vector with `index`
+        // unchecked; this is the net that keeps that sound.
+        for fid in [Some(t.run), t.check].into_iter().flatten() {
+            let Some(func) = prog.functions.get(fid.index()) else {
+                continue; // missing fn already reported above
+            };
+            for (bi, b) in func.blocks.iter().enumerate() {
+                let Terminator::WaitCycles(_, Some(wc), _) = &b.terminator else {
+                    continue;
+                };
+                match t.clocks.get(wc.index) {
+                    Some(spec) if spec.name == wc.name => {}
+                    Some(spec) => errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "test {}: fn{} b{bi} waits on clock `{}` at index {} but \
+                             that slot is `{}`",
+                            t.name, fid.0, wc.name, wc.index, spec.name
+                        ),
+                    }),
+                    None => errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "test {}: fn{} b{bi} waits on clock `{}` at index {} but \
+                             only {} clock(s) are declared",
+                            t.name,
+                            fid.0,
+                            wc.name,
+                            wc.index,
+                            t.clocks.len()
+                        ),
+                    }),
+                }
+            }
+        }
     }
     for (i, func) in prog.functions.iter().enumerate() {
         if func.id.index() != i {
@@ -304,7 +341,7 @@ impl Checker<'_> {
         }
         match &b.terminator {
             Terminator::Branch(c, _, _) => self.check_expr(c, false, "Branch cond"),
-            Terminator::WaitCycles(e, _) => self.check_expr(e, false, "WaitCycles count"),
+            Terminator::WaitCycles(e, _, _) => self.check_expr(e, false, "WaitCycles count"),
             Terminator::WaitUntil { preds, .. } => {
                 for p in preds {
                     self.check_expr(&p.expr, true, "WaitUntil pred");
@@ -523,7 +560,7 @@ fn check_def_before_use(
         }
         match &b.terminator {
             Terminator::Branch(c, _, _) => check_e(c, &defined, errs),
-            Terminator::WaitCycles(e, _) => check_e(e, &defined, errs),
+            Terminator::WaitCycles(e, _, _) => check_e(e, &defined, errs),
             Terminator::WaitUntil { preds, .. } => {
                 for p in preds {
                     check_e(&p.expr, &defined, errs);

@@ -238,8 +238,12 @@ pub struct CovgroupInstance {
 pub enum Terminator {
     Jump(BlockId),
     Branch(Expr, BlockId, BlockId),
-    /// Suspend for N primary-clock cycles, then resume at the successor.
-    WaitCycles(Expr, BlockId),
+    /// Suspend for N clock cycles, then resume at the successor.
+    /// `None` clock = the primary clock (plain `wait N cycles`);
+    /// `Some(WaitClock)` = `wait N cycles on <clock>` — N rising edges
+    /// of the named clock, with all other clocks ticking at their
+    /// natural rate.
+    WaitCycles(Expr, Option<WaitClock>, BlockId),
     WaitUntil {
         preds: Vec<PredSrc>,
         mode: WaitMode,
@@ -254,6 +258,18 @@ pub enum Terminator {
     },
     Return,
     Fatal(FmtArgs),
+}
+
+/// Clock qualifier of a `wait N cycles on <clock>` suspension,
+/// resolved at lowering against the test's declared clocks (an unknown
+/// clock name is a lowering error, never a deferred codegen error).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitClock {
+    /// Declared clock name, as written after `on` (display text).
+    pub name: String,
+    /// Index into `TestSchema::clocks` — declaration order, which is
+    /// also the runtime clock-scheduler (`clocks_`) index.
+    pub index: usize,
 }
 
 /// One `wait until` sub-predicate plus its pretty-printed source text
@@ -410,7 +426,7 @@ impl Terminator {
         match self {
             Terminator::Jump(b) => vec![*b],
             Terminator::Branch(_, t, f) => vec![*t, *f],
-            Terminator::WaitCycles(_, b) => vec![*b],
+            Terminator::WaitCycles(_, _, b) => vec![*b],
             Terminator::WaitUntil { succ, .. } => vec![*succ],
             Terminator::WaitUntilTimeout {
                 on_fire,

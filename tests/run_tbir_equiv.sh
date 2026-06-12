@@ -7,7 +7,7 @@
 # expected verdict under each, then `harc trace-diff` the two semantic
 # JSONL traces. Any verdict mismatch or trace divergence fails the run.
 #
-# Verdicts (registry `expect` column, schema v2):
+# Verdicts (registry `expect` column, schema v3):
 #   pass — each sim must print "ALL TESTS PASSED".
 #   fail — each sim must exit nonzero AND not print "ALL TESTS PASSED"
 #          (deliberate-failure fixtures, e.g. the log(fatal, ...) path).
@@ -55,11 +55,12 @@ FAILED_NAMES=()
 # run_sim <verdict_tag> <outdir> <codegen> <dut|sv> <top> <files...>
 # Runs one `harc sim` invocation, requiring the verdict named by the
 # ROW_EXPECT global (`pass` or `fail`, set by run_one from the registry
-# row). Reads the HARC_FILES global array (the .harc inputs for the
-# current registry row, set by run_one). Each codegen gets its OWN
-# outdir: harc's write_if_changed / obj_dir reuse keys off the emitted
-# .cpp in the outdir, so sharing one directory across codegens would
-# alternate rebuilds and risk stale-object confusion.
+# row). Reads the HARC_FILES and ROW_EXTRA_ARGS global arrays (the
+# .harc inputs and the row's --ref-src/--test plumbing, set by
+# run_one). Each codegen gets its OWN outdir: harc's write_if_changed /
+# obj_dir reuse keys off the emitted .cpp in the outdir, so sharing one
+# directory across codegens would alternate rebuilds and risk
+# stale-object confusion.
 run_sim() {
     local tag="$1" dir="$2" cg="$3" backend="$4" top="$5"
     shift 5
@@ -72,7 +73,10 @@ run_sim() {
 
     mkdir -p "$dir"
     local out rc
+    # `${ROW_EXTRA_ARGS[@]+...}` tolerates an empty array under `set -u`
+    # (most rows carry no --ref-src/--test extras).
     out="$("$HARC" sim "${backend_args[@]}" "${HARC_FILES[@]}" --top "$top" \
+        ${ROW_EXTRA_ARGS[@]+"${ROW_EXTRA_ARGS[@]}"} \
         --codegen "$cg" --seed "$SEED" --outdir "$dir" \
         --record-trace "$dir/t.jsonl" 2>&1)"
     rc=$?
@@ -127,13 +131,21 @@ run_pair() {
 
 run_one() {
     local row="$1"
-    local test top sv arch_dut expect
-    IFS='|' read -r test top sv arch_dut expect <<<"$row"
+    # Schema v3: the last three columns are optional (empty when a v2
+    # row omits them; `-` = none).
+    local test top sv arch_dut expect extra_harc ref_src test_struct
+    IFS='|' read -r test top sv arch_dut expect extra_harc ref_src test_struct <<<"$row"
     test="$(echo "$test" | xargs)"
     top="$(echo "$top" | xargs)"
     sv="$(echo "$sv" | xargs)"
     arch_dut="$(echo "$arch_dut" | xargs)"
     expect="$(echo "$expect" | xargs)"
+    extra_harc="$(echo "$extra_harc" | xargs)"
+    ref_src="$(echo "$ref_src" | xargs)"
+    test_struct="$(echo "$test_struct" | xargs)"
+    [ "$extra_harc" = "-" ] && extra_harc=""
+    [ "$ref_src" = "-" ] && ref_src=""
+    [ "$test_struct" = "-" ] && test_struct=""
     [ -z "$test" ] && return 0
     if [ -z "$top" ] || [ -z "$sv" ] || [ -z "$arch_dut" ] \
         || { [ "$expect" != "pass" ] && [ "$expect" != "fail" ]; }; then
@@ -144,35 +156,43 @@ run_one() {
     fi
 
     HARC_FILES=("$FIX_DIR/$test.harc")
+    local f
+    for f in $extra_harc; do HARC_FILES+=("$FIX_DIR/$f"); done
+    ROW_EXTRA_ARGS=()
+    for f in $ref_src; do ROW_EXTRA_ARGS+=("--ref-src" "$DUT_DIR/$f"); done
+    [ -n "$test_struct" ] && ROW_EXTRA_ARGS+=("--test" "$test_struct")
     ROW_EXPECT="$expect"
 
     local sv_files=()
-    local f
     for f in $sv; do sv_files+=("$DUT_DIR/$f"); done
 
-    if ! run_pair "$test" "$OUT/$test" sv "$top" "${sv_files[@]}"; then
+    # A fixture file with multiple test structs registers one row per
+    # struct — suffix the label/outdir so the runs don't collide.
+    local label="$test${test_struct:+ [$test_struct]}"
+    local pair_dir="$OUT/$test${test_struct:+__$test_struct}"
+    if ! run_pair "$label" "$pair_dir" sv "$top" "${sv_files[@]}"; then
         FAIL=$((FAIL + 1))
-        FAILED_NAMES+=("$test")
+        FAILED_NAMES+=("$label")
         return 0
     fi
-    echo "  PASS  $test (v1 == tbir, expect=$expect)"
+    echo "  PASS  $label (v1 == tbir, expect=$expect)"
     PASS=$((PASS + 1))
 
     # Optional ARCH-native-DUT sweep. Only when ARCH_BIN is set AND the
     # row names an arch_dut source; skip silently otherwise.
     if [ -n "${ARCH_BIN:-}" ] && [ -x "${ARCH_BIN:-}" ] && [ "$arch_dut" != "-" ]; then
         if [ ! -f "$DUT_DIR/$arch_dut" ]; then
-            echo "  FAIL  $test [arch-dut] (registry arch_dut '$arch_dut' not found in $DUT_DIR)"
+            echo "  FAIL  $label [arch-dut] (registry arch_dut '$arch_dut' not found in $DUT_DIR)"
             FAIL=$((FAIL + 1))
-            FAILED_NAMES+=("$test [arch-dut]")
+            FAILED_NAMES+=("$label [arch-dut]")
             return 0
         fi
-        if ! run_pair "$test [arch-dut]" "$OUT/${test}__arch_dut" dut "$top" "$DUT_DIR/$arch_dut"; then
+        if ! run_pair "$label [arch-dut]" "${pair_dir}__arch_dut" dut "$top" "$DUT_DIR/$arch_dut"; then
             FAIL=$((FAIL + 1))
-            FAILED_NAMES+=("$test [arch-dut]")
+            FAILED_NAMES+=("$label [arch-dut]")
             return 0
         fi
-        echo "  PASS  $test [arch-dut] (v1 == tbir, expect=$expect)"
+        echo "  PASS  $label [arch-dut] (v1 == tbir, expect=$expect)"
         PASS=$((PASS + 1))
     fi
 }

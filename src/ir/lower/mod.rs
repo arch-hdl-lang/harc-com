@@ -172,6 +172,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         tb_field: None,
         cov_fields: HashMap::new(),
         covgroups: Vec::new(),
+        clock_names: Vec::new(),
     };
     for it in &file.items {
         let Item::Function(fd) = it else { continue };
@@ -467,6 +468,7 @@ fn lower_test(
         tb_field: if synthetic { None } else { Some("_tb".to_string()) },
         cov_fields: cov_fields.iter().cloned().collect(),
         covgroups: prog.covgroups.clone(),
+        clock_names: clock_specs.iter().map(|c| c.name.clone()).collect(),
     };
 
     // Synthesized auto-sampler functions, one per covergroup field, in
@@ -608,6 +610,13 @@ pub(crate) struct LowerCtx {
     /// Snapshot of the program's covgroup schemas, for point/bin
     /// validation at `cov.<point>.<bin>` lowering sites.
     pub covgroups: Vec<CovgroupSchema>,
+    /// Declared clock names in declaration order (index == the
+    /// `TestSchema::clocks` / runtime scheduler index). Consulted by
+    /// `wait N cycles on <clock>` lowering; empty for clockless tests
+    /// and for the file-level pure-helper context (a pure helper can
+    /// never contain a wait — waits make a helper impure, so it is
+    /// CFG-inlined under the calling test's context instead).
+    pub clock_names: Vec<String>,
 }
 
 pub(crate) struct LoopFrame {
@@ -892,7 +901,7 @@ fn remap_terminator(t: &mut Terminator, remap: &[BlockId]) {
             m(a);
             m(b);
         }
-        Terminator::WaitCycles(_, b) => m(b),
+        Terminator::WaitCycles(_, _, b) => m(b),
         Terminator::WaitUntil { succ, .. } => m(succ),
         Terminator::WaitUntilTimeout {
             on_fire,

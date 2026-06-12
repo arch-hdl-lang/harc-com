@@ -282,7 +282,7 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
         }
     }
     match &block.terminator {
-        Terminator::WaitCycles(n, _) => {
+        Terminator::WaitCycles(n, _, _) => {
             suspends_cycles = true;
             visit_expr(n, &mut accesses, &mut transactor);
         }
@@ -542,7 +542,7 @@ mod tests {
             vec![
                 block(
                     vec![Stmt::DutWrite(port(PortAccess::Port), lit(1))],
-                    Terminator::WaitCycles(lit(3), BlockId(1)),
+                    Terminator::WaitCycles(lit(3), None, BlockId(1)),
                 ),
                 block(vec![], Terminator::Return),
             ],
@@ -624,7 +624,7 @@ mod tests {
                         Stmt::DutRead(crate::ir::LocalId(0), port(PortAccess::Probe)),
                         Stmt::DutWrite(port(PortAccess::Force), lit(1)),
                     ],
-                    Terminator::WaitCycles(lit(1), BlockId(1)),
+                    Terminator::WaitCycles(lit(1), None, BlockId(1)),
                 ),
                 block(vec![], Terminator::Return),
             ],
@@ -650,7 +650,7 @@ mod tests {
                         Stmt::DutRead(crate::ir::LocalId(0), port(PortAccess::Probe)),
                         Stmt::DutWrite(port(PortAccess::Force), lit(1)),
                     ],
-                    Terminator::WaitCycles(lit(1), BlockId(1)),
+                    Terminator::WaitCycles(lit(1), None, BlockId(1)),
                 ),
                 block(vec![], Terminator::Return),
             ],

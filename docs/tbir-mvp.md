@@ -28,7 +28,14 @@ From `src/ir/lower/mod.rs`: classic-form and impl-for testbench-bound
 tests with a single DUT, declared clocks (time-literal or `domain`
 periods), and the core statement set — DUT port read/write,
 `let`/assign, `log`/`logf`, inline `assert ... else fail`, `fail`,
-`wait N cycles`, `wait until` (single and `all of`, optional timeout),
+`wait N cycles` (plain and clock-qualified `wait N cycles on <clock>`
+— the qualifier rides as an `Option<WaitClock>` on the `WaitCycles`
+terminator, resolved at lowering against the test's declared clocks;
+an unknown clock name is a structured lowering error listing the
+declared clocks, where v1 deferred it to emission. Emission mirrors
+v1's inline `eval_clocks_until` loop — no coroutine yield — so
+sub-primary-cycle precision and checker timing are identical),
+`wait until` (single and `all of`, optional timeout),
 `if`/`for`/`while`/`repeat`/`loop`/`break`/`continue`, covergroups
 with set-literal bins, and helper functions. Everything else —
 `transaction`, `randomize`, `agent`/`event`, transactors, buses,
@@ -42,8 +49,12 @@ mis-lowers; that property is load-bearing and tested
 
 `tests/tbir_equiv_fixtures.txt` (append-only registry consumed by
 `tests/run_tbir_equiv.sh` — wired into CI — and by the registry-driven
-sweep in `tests/run_arch_dut_fixtures.sh`; schema v2 rows are
-`test_name | top | sv_files | arch_dut | expect`):
+sweep in `tests/run_arch_dut_fixtures.sh`; schema v3 rows are
+`test_name | top | sv_files | arch_dut | expect | extra_harc |
+ref_src | test_struct`, the last three columns optional with `-` =
+none — `extra_harc` joins additional `tests/fixtures/` files to the
+.harc input list, `ref_src`/`test_struct` plumb `--ref-src`/`--test`;
+5-column v2 rows parse unchanged):
 
 | Fixture | Top | DUT | Expect | Exercises |
 |---|---|---|---|---|

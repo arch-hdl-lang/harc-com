@@ -41,12 +41,17 @@ tlm_pairing_arch_burst_initiator_test | TlmPairingArchBurstInitiator | TlmPairin
 EOF
 
 # TB-IR-capable fixtures: read from the equivalence registry
-# (tests/tbir_equiv_fixtures.txt — single source of truth; schema v2:
-# test_name | top | sv_files | arch_dut | expect). Every row whose
-# arch_dut column is not `-` runs under BOTH codegens (v1 and tbir)
-# against the ARCH-native DUT, then `harc trace-diff` the two semantic
-# traces — same structure as tests/run_tbir_equiv.sh, but on the
-# `--dut` backend.
+# (tests/tbir_equiv_fixtures.txt — single source of truth; schema v3:
+# test_name | top | sv_files | arch_dut | expect | extra_harc | ref_src
+# | test_struct, where the last three columns are optional and `-` =
+# none; v2 5-column rows parse unchanged). Every row whose arch_dut
+# column is not `-` runs under BOTH codegens (v1 and tbir) against the
+# ARCH-native DUT, then `harc trace-diff` the two semantic traces —
+# same structure as tests/run_tbir_equiv.sh, but on the `--dut`
+# backend. extra_harc files join the .harc input list and test_struct
+# is passed via `--test`; ref_src is parsed but ignored here (it names
+# C/C++ reference models for the Verilator path — not applicable to
+# the ARCH-native backend).
 
 PASS=0
 FAIL=0
@@ -86,8 +91,11 @@ run_equiv_sim() {
     local tag="$1" dir="$2" cg="$3" test="$4" top="$5" dut="$6" expect="$7"
     mkdir -p "$dir"
     local out rc
+    # HARC_FILES / ROW_TEST_ARGS are set per-row by run_equiv_one
+    # (schema-v3 extra_harc files and the optional --test selector).
     out="$("$HARC" sim --arch-bin "$ARCH_BIN" --dut "$DUT_DIR/$dut" \
-        "$FIX_DIR/$test.harc" --top "$top" \
+        "${HARC_FILES[@]}" --top "$top" \
+        ${ROW_TEST_ARGS[@]+"${ROW_TEST_ARGS[@]}"} \
         --codegen "$cg" --seed "$SEED" --outdir "$dir" \
         --record-trace "$dir/t.jsonl" 2>&1)"
     rc=$?
@@ -118,12 +126,20 @@ run_equiv_sim() {
 
 run_equiv_one() {
     local row="$1"
-    local test top sv arch_dut expect
-    IFS='|' read -r test top sv arch_dut expect <<<"$row"
+    # Schema v3: the last three columns are optional (empty when a v2
+    # row omits them; `-` = none).
+    local test top sv arch_dut expect extra_harc ref_src test_struct
+    IFS='|' read -r test top sv arch_dut expect extra_harc ref_src test_struct <<<"$row"
     test="$(echo "$test" | xargs)"
     top="$(echo "$top" | xargs)"
     arch_dut="$(echo "$arch_dut" | xargs)"
     expect="$(echo "$expect" | xargs)"
+    extra_harc="$(echo "$extra_harc" | xargs)"
+    test_struct="$(echo "$test_struct" | xargs)"
+    [ "$extra_harc" = "-" ] && extra_harc=""
+    [ "$test_struct" = "-" ] && test_struct=""
+    # ref_src intentionally unused here — see the registry-consumer
+    # comment above.
     [ -z "$test" ] && return 0
     if [ -z "$top" ] || [ -z "$arch_dut" ] \
         || { [ "$expect" != "pass" ] && [ "$expect" != "fail" ]; }; then
@@ -141,8 +157,14 @@ run_equiv_one() {
         return 0
     fi
 
-    local pair_dir="$OUT/$test"
-    local tag="$test [arch-dut]"
+    HARC_FILES=("$FIX_DIR/$test.harc")
+    local f
+    for f in $extra_harc; do HARC_FILES+=("$FIX_DIR/$f"); done
+    ROW_TEST_ARGS=()
+    [ -n "$test_struct" ] && ROW_TEST_ARGS+=("--test" "$test_struct")
+
+    local pair_dir="$OUT/$test${test_struct:+__$test_struct}"
+    local tag="$test${test_struct:+ [$test_struct]} [arch-dut]"
     if ! run_equiv_sim "$tag" "$pair_dir/v1" v1 "$test" "$top" "$arch_dut" "$expect" \
         || ! run_equiv_sim "$tag" "$pair_dir/tbir" tbir "$test" "$top" "$arch_dut" "$expect"; then
         FAIL=$((FAIL + 1))
