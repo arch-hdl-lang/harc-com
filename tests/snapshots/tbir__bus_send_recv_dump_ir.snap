@@ -1,0 +1,63 @@
+---
+source: tests/tbir.rs
+assertion_line: 1552
+expression: text
+---
+tb-ir program
+  testbench tb0 PingTb { dut: PingDut } bus p=PingBus
+  test PingTest tb=tb0 run=fn0 check=-
+
+fn fn0 run_PingTest [kind=Run, owner=tb0]
+  locals:
+    %0 __t0 : unknown
+    %1 __t1 : unknown
+    %2 __t2 : unknown
+    %3 __t3 : unknown
+    %4 v : unknown
+  entry = b0
+
+  b0:
+    DutWrite(dut.p.tx.data, 7)
+    DutWrite(dut.p.tx.valid, 1)
+    Assign(%__t0, 16)
+    -> Jump(b1)
+
+  b1:
+    DutRead(%__t1, dut.p.tx.ready)
+    -> Branch((!%__t1 && (%__t0 > 0)), b2, b4)
+
+  b2:
+    -> WaitCycles(1, b3)
+
+  b3:
+    Assign(%__t0, (%__t0 - 1))
+    -> Jump(b1)
+
+  b4:
+    -> WaitCycles(1, b5)
+
+  b5:
+    DutWrite(dut.p.tx.valid, 0)
+    DutWrite(dut.p.rx.ready, 1)
+    Assign(%__t2, 16)
+    -> Jump(b6)
+
+  b6:
+    DutRead(%__t3, dut.p.rx.valid)
+    -> Branch((!%__t3 && (%__t2 > 0)), b7, b9)
+
+  b7:
+    -> WaitCycles(1, b8)
+
+  b8:
+    Assign(%__t2, (%__t2 - 1))
+    -> Jump(b6)
+
+  b9:
+    DutRead(%v, dut.p.rx.data)
+    -> WaitCycles(1, b10)
+
+  b10:
+    DutWrite(dut.p.rx.ready, 0)
+    AssertCheck { cond: (%v == 7), on_fail: "got %lld", %v }
+    -> Return

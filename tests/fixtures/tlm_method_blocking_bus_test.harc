@@ -1,0 +1,53 @@
+// Blocking-only bus `tlm_method` test — the TB-IR call-edge subset.
+//
+// Mirrors tlm_method_bus_test.harc minus the fork/join_all OOO lanes
+// (those stay v1-only until the IR grows a Fork terminator), so the
+// TransactorMethod call edge is provable end-to-end on its own:
+// under `--codegen tbir` every call below lowers to
+// `Assign(dest, Call(TransactorMethod { bus_field, method }, args))`
+// and both emitters expand it to the same canonical ARCH-compatible
+// req/rsp wire protocol (mem_read_req_valid, mem_read_addr, ...).
+
+bus TlmMemBlockingBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+    tlm_method poke(addr: uint<8>, data: uint<32>): blocking;
+end bus TlmMemBlockingBus
+
+testbench TlmMethodBlockingBusTb
+    dut : TlmMemory
+end testbench TlmMethodBlockingBusTb
+
+impl TlmMethodBlockingBusTest for TlmMethodBlockingBusTb
+    let mem : TlmMemBlockingBus = bind dut
+
+    run
+        dut.rst = 1
+        dut.mem_read_req_valid = 0
+        dut.mem_read_rsp_ready = 0
+        dut.mem_read_ooo_req_valid = 0
+        dut.mem_read_ooo_rsp_ready = 0
+        dut.mem_poke_req_valid = 0
+        dut.mem_poke_rsp_ready = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // `let x = bus.method(...)` call-edge form.
+        let initial = mem.read(5)
+        assert initial == 261
+            else fail("initial read got 0x${initial:08x}, expected 0x00000105")
+
+        // Statement-position void method.
+        mem.poke(8, 3405691582)
+        let updated = mem.read(8)
+        assert updated == 3405691582
+            else fail("updated read got 0x${updated:08x}, expected 0xCAFEBABE")
+
+        // A second value-returning call edge after the void poke.
+        let reread = mem.read(5)
+        assert reread == 261
+            else fail("re-read got 0x${reread:08x}, expected 0x00000105")
+
+        log(info, "PASS: blocking bus tlm_method read/poke call edges")
+    end run
+end impl TlmMethodBlockingBusTest

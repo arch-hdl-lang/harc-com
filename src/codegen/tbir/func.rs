@@ -23,8 +23,8 @@
 use super::expr::{escape_c, expr_cpp, fmt_arg_cpp, helper_cpp_name, port_lvalue, port_read};
 use crate::codegen::cpp_tb::EmitError;
 use crate::ir::{
-    FileLogLevel, FmtArgs, IrType, LogLevel, PredSrc, RecordSchema, Stmt, TbFunction, Terminator,
-    WaitMode,
+    BusBindingSchema, CallTarget, Expr, FileLogLevel, FmtArgs, IrType, LogLevel, PredSrc,
+    RecordSchema, Stmt, TbFunction, Terminator, WaitMode,
 };
 use std::fmt::Write as _;
 
@@ -64,11 +64,15 @@ fn cpp_local_names(func: &TbFunction) -> Vec<String> {
 
 /// Emit one function as a loop-switch at `depth` indentation levels,
 /// wrapped in its own brace scope so multiple functions (run + check)
-/// can share one coroutine body without name collisions.
+/// can share one coroutine body without name collisions. `bindings`
+/// is the owning testbench's bus-binding table — the metadata that
+/// expands `CallTarget::TransactorMethod` call edges into the
+/// canonical req/rsp wire protocol.
 pub(super) fn emit_function(
     out: &mut String,
     func: &TbFunction,
     records: &[RecordSchema],
+    bindings: &[BusBindingSchema],
     depth: usize,
 ) -> Result<(), EmitError> {
     let names = cpp_local_names(func);
@@ -102,7 +106,7 @@ pub(super) fn emit_function(
     for (bi, block) in func.blocks.iter().enumerate() {
         writeln!(out, "{pad2}case {bi}: {{").ok();
         for s in &block.stmts {
-            emit_stmt(out, func, records, &names, s, depth + 3)?;
+            emit_stmt(out, func, records, &names, bindings, s, depth + 3)?;
         }
         match &block.terminator {
             Terminator::Jump(b) => {
@@ -320,12 +324,22 @@ fn emit_stmt(
     func: &TbFunction,
     records: &[RecordSchema],
     names: &[String],
+    bindings: &[BusBindingSchema],
     s: &Stmt,
     depth: usize,
 ) -> Result<(), EmitError> {
     let pad = INDENT.repeat(depth);
     match s {
         Stmt::Assign(l, e) => {
+            // TransactorMethod call edge — the IR carries only the
+            // call; the single-site backend expands it here into v1's
+            // blocking req/rsp wire protocol (the verifier pinned the
+            // edge to exactly this position).
+            if let Expr::Call(CallTarget::TransactorMethod { bus_field, method }, args) = e {
+                return emit_transactor_call(
+                    out, func, names, bindings, *l, bus_field, method, args, depth,
+                );
+            }
             let name = &names[l.index()];
             let e = expr_cpp(func, names, e)?;
             writeln!(out, "{pad}{name} = {e};").ok();
@@ -405,6 +419,98 @@ fn emit_stmt(
             None => emit_log_call(out, func, names, "FAIL", None, args, depth)?,
         },
     }
+    Ok(())
+}
+
+/// Expand one sanctioned `TransactorMethod` call edge into v1's
+/// blocking req/rsp wire protocol (cpp_tb `try_emit_bus_tlm_method`,
+/// coroutine path): drive arg wires, raise `req_valid`, budget-wait
+/// for `req_ready`, tick, drop `req_valid`; raise `rsp_ready`,
+/// budget-wait for `rsp_valid`, capture `rsp_data` (value-returning
+/// methods), tick, drop `rsp_ready`. Trace events bracket the wire
+/// activity with the same `tlm_call` payloads v1 records (component
+/// context is empty — test-run scope), so `harc trace-diff` sees
+/// identical request/response edges.
+#[allow(clippy::too_many_arguments)]
+fn emit_transactor_call(
+    out: &mut String,
+    func: &TbFunction,
+    names: &[String],
+    bindings: &[BusBindingSchema],
+    dest: crate::ir::LocalId,
+    bus_field: &str,
+    method: &str,
+    args: &[Expr],
+    depth: usize,
+) -> Result<(), EmitError> {
+    let pad = INDENT.repeat(depth);
+    let schema = bindings
+        .iter()
+        .find(|b| b.field == bus_field)
+        .and_then(|b| b.methods.iter().find(|m| m.name == method))
+        .ok_or_else(|| {
+            EmitError(format!(
+                "tbir: unresolved transactor call `{bus_field}.{method}` in {} — \
+                 verifier should have rejected it",
+                func.name
+            ))
+        })?;
+    if schema.args.len() != args.len() {
+        return Err(EmitError(format!(
+            "tbir: `{bus_field}.{method}` arity drift ({} schema vs {} call args) in {}",
+            schema.args.len(),
+            args.len(),
+            func.name
+        )));
+    }
+    let wire = |sig: &str| format!("dut->{bus_field}_{method}_{sig}");
+    let budget_wait = |out: &mut String, sig: &str| {
+        writeln!(
+            out,
+            "{pad}{{ int _b = 16; while (!{} && _b > 0) {{ co_await \
+             harc_rt::wait_cycles(_slot, 1); _b--; }} }}",
+            wire(sig)
+        )
+        .ok();
+    };
+    let trace_event = |out: &mut String, phase: &str| {
+        writeln!(
+            out,
+            "{pad}trace.tlm_call(cycle_count, \"\", \"{}\", \"{}\", \"{phase}\", \"initiator\");",
+            escape_c(bus_field),
+            escape_c(method)
+        )
+        .ok();
+    };
+
+    writeln!(out, "{pad}// bus.{method} tlm_method").ok();
+    for (arg_name, arg) in schema.args.iter().zip(args.iter()) {
+        let v = expr_cpp(func, names, arg)?;
+        writeln!(out, "{pad}harc_rt::harc_assign({}, {v});", wire(arg_name)).ok();
+    }
+    trace_event(out, "request");
+    writeln!(out, "{pad}{} = 1;", wire("req_valid")).ok();
+    budget_wait(out, "req_ready");
+    writeln!(out, "{pad}co_await harc_rt::wait_cycles(_slot, 1);").ok();
+    writeln!(out, "{pad}{} = 0;", wire("req_valid")).ok();
+    writeln!(out, "{pad}{} = 1;", wire("rsp_ready")).ok();
+    budget_wait(out, "rsp_valid");
+    trace_event(out, "response");
+    if schema.has_ret {
+        // Capture BEFORE the trailing tick — rsp_data is valid in the
+        // same cycle as rsp_valid (mirrors v1; for result-less or
+        // discarded calls v1 skips the capture but still completes the
+        // rsp handshake).
+        writeln!(
+            out,
+            "{pad}{} = harc_rt::harc_read({});",
+            names[dest.index()],
+            wire("rsp_data")
+        )
+        .ok();
+    }
+    writeln!(out, "{pad}co_await harc_rt::wait_cycles(_slot, 1);").ok();
+    writeln!(out, "{pad}{} = 0;", wire("rsp_ready")).ok();
     Ok(())
 }
 

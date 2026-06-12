@@ -1,0 +1,106 @@
+---
+source: tests/tbir.rs
+assertion_line: 1480
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 AxiLiteBusTb { dut: AxiLiteRegs } bus axil=AxiLiteBus
+  test AxiLiteBusTest tb=tb0 run=fn0 check=-
+
+fn fn0 run_AxiLiteBusTest [kind=Run, owner=tb0]
+  locals:
+    %0 val : unknown
+    %1 saw : unknown
+    %2 _anon : unknown
+    %3 __t0 : unknown
+    %4 __t1 : unknown
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.axil.aw.valid, 0)
+    DutWrite(dut.axil.w.valid, 0)
+    DutWrite(dut.axil.b.ready, 1)
+    DutWrite(dut.axil.ar.valid, 0)
+    DutWrite(dut.axil.r.ready, 1)
+    DutWrite(dut.mm2s_done, 0)
+    DutWrite(dut.mm2s_halted, 1)
+    DutWrite(dut.mm2s_idle, 1)
+    DutWrite(dut.s2mm_done, 0)
+    DutWrite(dut.s2mm_halted, 1)
+    DutWrite(dut.s2mm_idle, 1)
+    DutWrite(dut.mm2s_sg_done, 0)
+    DutWrite(dut.s2mm_sg_done, 0)
+    DutWrite(dut.mm2s_sg_active, 0)
+    DutWrite(dut.s2mm_sg_active, 0)
+    -> WaitCycles(2, b1)
+
+  b1:
+    DutWrite(dut.rst, 0)
+    -> WaitCycles(1, b2)
+
+  b2:
+    DutWrite(dut.axil.aw.addr, 24)
+    DutWrite(dut.axil.aw.valid, 1)
+    DutWrite(dut.axil.w.data, 3405691582)
+    DutWrite(dut.axil.w.strb, 15)
+    DutWrite(dut.axil.w.valid, 1)
+    -> WaitCycles(10, b3)
+
+  b3:
+    DutWrite(dut.axil.aw.valid, 0)
+    DutWrite(dut.axil.w.valid, 0)
+    -> WaitCycles(2, b4)
+
+  b4:
+    Assign(%val, 0)
+    Assign(%saw, 0)
+    DutWrite(dut.axil.ar.addr, 24)
+    DutWrite(dut.axil.ar.valid, 1)
+    Assign(%_anon, 0)
+    -> Jump(b5)
+
+  b5:
+    -> Branch((%_anon < 10), b6, b8)
+
+  b6:
+    -> WaitCycles(1, b9)
+
+  b7:
+    Assign(%_anon, (%_anon + 1))
+    -> Jump(b5)
+
+  b8:
+    DutWrite(dut.axil.ar.valid, 0)
+    -> WaitCycles(1, b16)
+
+  b9:
+    DutRead(%__t0, dut.axil.r.valid)
+    -> Branch(%__t0, b11, b12)
+
+  b10:
+    -> Jump(b7)
+
+  b11:
+    -> Branch((%saw == 0), b14, b15)
+
+  b12:
+    -> Jump(b10)
+
+  b13:
+    -> Jump(b10)
+
+  b14:
+    DutRead(%__t1, dut.axil.r.data)
+    Assign(%val, %__t1)
+    DutWrite(dut.axil.ar.valid, 0)
+    Assign(%saw, 1)
+    -> Jump(b13)
+
+  b15:
+    -> Jump(b13)
+
+  b16:
+    AssertCheck { cond: (%val == 3405691582), on_fail: "read got 0x%08llx, expected 0xCAFEBABE", %val }
+    Log(info, "PASS: bus-typed AXI-Lite write/read round-trip")
+    -> Return

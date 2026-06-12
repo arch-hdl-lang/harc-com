@@ -39,7 +39,7 @@ sub-primary-cycle precision and checker timing are identical),
 `wait until` (single, `all of`, and `any of`, optional timeout),
 `if`/`for`/`while`/`repeat`/`loop`/`break`/`continue`, covergroups
 with set-literal and range (`[a..b]`, inclusive, open bounds allowed)
-bins plus declared `cross` items, helper functions, and `transaction`
+bins plus declared `cross` items, helper functions, `transaction`
 value-records in their non-randomize usage: declarations lower into
 the `TbProgram::records` table (scalar fields ≤64 bits with literal
 defaults; `keep`/attr constraint metadata carried as inert source
@@ -47,11 +47,21 @@ text), `let t : TxnType` default-constructs (re-running field
 defaults at the let site, so loop iterations re-initialize like v1's
 in-place declaration), and `t.field` reads/writes work everywhere a
 scalar local does — including format args, branch conditions, and
-loop bounds. Everything else —
+loop bounds; and the `bus`
+construct subset (added 2026-06-12, `src/ir/lower/bus.rs`):
+declarations (inline or `use`-imported), test-scope `= bind dut`
+bindings, protocol-typed signal access (`<bind>.<sig>`,
+`<bind>.<ch>.<sig>`, pre-flattened `<bind>.<ch>_<sig>`), channel
+auto-handshakes (`<bind>.<ch>.send(...)` / `.recv()`, CFG-inlined to
+v1's 16-cycle-budget valid/ready dance), and **blocking `tlm_method`
+calls**, which lower to `Expr::Call(CallTarget::TransactorMethod {
+bus_field, method }, args)` — the design doc's sequence→transactor
+call edge, never inlined at the IR level. Everything else —
 `randomize` (awaits the constraint-IR `ConstraintRef` seam),
-`agent`/`event`, transactors, buses, scoreboards, `fork`,
-transaction `when` subtype blocks, non-scalar / wider-than-64-bit
-transaction fields, ... —
+`agent`/`event`, transactors, scoreboards, `fork` (including
+`fork bus.method(...)`/`join_all` TLM issue), out-of-order TLM lanes,
+bus bind remaps/generics, transaction `when` subtype blocks,
+non-scalar / wider-than-64-bit transaction fields, ... —
 is rejected at lowering time with `LowerError::Unsupported` naming the
 construct and pointing at `--codegen v1`. Lowering never silently
 mis-lowers; that property is load-bearing and tested
@@ -81,6 +91,10 @@ none — `extra_harc` joins additional `tests/fixtures/` files to the
 | `wait_any_of_test` | `Top` | `top_counter.sv` | pass | `any of` wait (untimed + timed, fires) |
 | `wait_any_of_timeout_test` | `Top` | `top_counter.sv` | fail | `any of` timeout: "none of:" diags ×2 headers |
 | `transaction_basic_test` | `Top` | `top_counter.sv` | pass | record declaration/defaults, let-site re-init in a loop, field reads/writes, inert keep/attr |
+| `axilite_bus_test` | `AxiLiteRegs` | `AxiLiteRegs.sv` | pass | bus bind, protocol signal access |
+| `axilite_bus_extern_test` | `AxiLiteRegs` | `AxiLiteRegs.sv` | pass | use-imported bus declaration |
+| `axilite_bus_send_test` | `AxiLiteRegs` | `AxiLiteRegs.sv` | pass | channel send/recv auto-handshakes |
+| `tlm_method_blocking_bus_test` | `TlmMemory` | `TlmMemory.sv` | pass | blocking tlm_method → TransactorMethod call edge |
 
 (The registry has since grown past this table via the backfill sweep —
 see [tbir-coverage.md](tbir-coverage.md); the registry file is the
@@ -274,22 +288,65 @@ reason. Code locations are authoritative.
    because the loop-switch hoists declarations to function top while
    v1 declares in place — without it, a `let t : Txn` inside a loop
    would keep stale field values across iterations.
+9. **Bus subset (2026-06-12): schema placement, two lowering shapes,
+   and v1-surface boundaries.**
+   - *Binding schema lives on `TestbenchSchema.bus_bindings`* (`field`
+     = binding name = flat signal prefix, plus per-method
+     `TlmMethodSchema { name, args, has_ret }`), not in a program-
+     level `BusId` table as the design skeleton sketches. Bindings are
+     per-test, and the schema is exactly what a backend needs to
+     expand a `TransactorMethod` call edge into wire names — same
+     "extended by compilation necessity" rationale as `ClockSpec`.
+   - *Two lowering shapes, deliberately different.* Channel
+     `send`/`recv` handshakes CFG-inline (they are pin-level protocol
+     the TB performs itself; placement correctly sees cycle-anchored
+     Tier-0 pin work). `tlm_method` calls stay **call edges** —
+     `Assign(dest, Call(TransactorMethod, args))`, pinned by a new
+     verifier rule (see `src/ir/verify.rs` module docs): whole-Assign-
+     RHS position only, Run/Check functions only, binding + method +
+     arity resolved against the owning testbench. The edge is the
+     sanctioned exception to "no statement may suspend" — its
+     suspension lives behind the call boundary, which placement
+     classifies timing-tolerant by construction. The tbir backend
+     expands the edge to v1's blocking req/rsp wire protocol
+     (`emit_transactor_call` in `src/codegen/tbir/func.rs`),
+     including both `tlm_call` trace events.
+   - *`recv()` captures the first payload signal*, not v1's generated
+     `<Bus>_<ch>_payload` struct. Observably equivalent for everything
+     the IR can express: scalar reads see the first field either way
+     (v1's struct converts implicitly to it), and named payload-field
+     access (`v.resp`) is rejected at lowering, never mis-lowered.
+   - *v1's call-position surface is kept*: bus calls lower only in
+     `let`-RHS and statement position. `x = bus.m(...)` into an
+     existing local is rejected (v1 errors on that form too);
+     expression-nested calls get a precise rejection.
+   - *Rejected at the bind/call site* (emission-side metadata the IR
+     does not carry, or machinery deferred): `bind ... with { ... }`
+     remaps, bind-site generics (`Bus#(P=...)`), buses with
+     `generate_if`-gated signals (gate evaluation needs the DUT-port
+     param-override layering only `EmitOpts` has), `out_of_order`
+     method calls, and `fork`/`join_all` TLM issue (needs the design's
+     `Terminator::Fork` + `ForkArmKind::BusMethodCall`).
 
 Minor, same spirit: `IndexVec` is a plain `Vec` plus typed id structs;
-`FunctionKind` has no `TransactorBody` (transactors are out of
-subset); the design's `AssertFail` enum collapsed into a single
+`FunctionKind` has no `TransactorBody` (the `transactor` construct is
+out of subset); the design's `AssertFail` enum collapsed into a single
 `FmtArgs on_fail` because both source forms bump `errors` identically
 in v1.
 
 ### Verifier coverage summary
 
 Implemented: invariants 1–4, 6, 8 (amended), 10, 15, plus the
-port-position rule. By construction: 5, 7. Not implemented: 9 (no
-`ConstraintRef` in the IR yet), 11 (no `Fork`), 12 (no DUT port table
-— see divergence 1), 13 (not separately checked; the port-position
-rule covers the `PortRef` half), 14 and 16 (the v0 front end does not
-type-check, so `IrType::Unknown` is the common case and only
-locally-determinable `Assign` types are compared).
+port-position rule and the transactor-call seam rule (divergence 9 —
+position, function kind, binding/method/arity resolution; the
+seam-rule half of design invariant 11's intent, ported from `Fork`
+arms to the call-edge form actually produced). By construction: 5, 7
+(with the documented `TransactorMethod` exception). Not implemented:
+9 (no `ConstraintRef` in the IR yet), 11 (no `Fork`), 12 (no DUT port
+table — see divergence 1), 13 (not separately checked; the
+port-position rule covers the `PortRef` half), 14 and 16 (the v0
+front end does not type-check, so `IrType::Unknown` is the common
+case and only locally-determinable `Assign` types are compared).
 
 ## Negative tests: where rejection actually fires
 
@@ -324,11 +381,14 @@ see its decision log):
   `randomize_analysis`, `extract_port_set`, `hoist_stimulus`,
   `lower_coroutine` for FSM-shaped backends.
 - **Subset growth**: randomize (needs the constraint-IR
-  `ConstraintRef` seam; transaction *declarations* and non-randomize
-  record usage landed 2026-06-12, as did range/cross bins and
-  `any of`), transactors (`CallTarget::TransactorMethod` is already
-  declared in `src/ir/mod.rs` but nothing produces it), `fork`,
-  scoreboards, agents/events.
+  `ConstraintRef` seam), the `transactor` construct (target-side TLM
+  method threads → `FunctionKind::TransactorBody` per the design;
+  the initiator-side `CallTarget::TransactorMethod` call edge is
+  produced by bus `tlm_method` lowering since 2026-06-12), `fork`
+  (incl. `ForkArmKind::BusMethodCall` for the OOO TLM lanes),
+  scoreboards, agents/events. (Transaction declarations/non-randomize
+  records, range/cross bins, `any of`, and the bus subset all landed
+  2026-06-12.)
 - **Placement-split backends** proceed per the multi-target placement
   model in [tb-ir-design.md](tb-ir-design.md) (tiers, timing classes,
   `TargetProfile` capability checks) once the passes exist.

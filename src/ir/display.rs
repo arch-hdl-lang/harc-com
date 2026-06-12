@@ -22,6 +22,25 @@ impl Display for TbProgram {
             for (field, cov) in &tb.cov_fields {
                 write!(f, " cov {field}=cg{}", cov.0)?;
             }
+            for b in &tb.bus_bindings {
+                write!(f, " bus {}={}", b.field, b.bus)?;
+                if !b.methods.is_empty() {
+                    let ms = b
+                        .methods
+                        .iter()
+                        .map(|m| {
+                            format!(
+                                "{}({}){}",
+                                m.name,
+                                m.args.join(","),
+                                if m.has_ret { "->r" } else { "" }
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    write!(f, "[{ms}]")?;
+                }
+            }
             writeln!(f)?;
         }
         for t in &self.tests {

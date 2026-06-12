@@ -152,10 +152,47 @@ pub struct TestbenchSchema {
     pub dut_type: String,
     /// Covergroup-typed testbench fields (field name, covgroup).
     pub cov_fields: Vec<(String, CovgroupId)>,
+    /// Test-scope bus bindings (`let <field> : <Bus> = bind dut`), in
+    /// declaration order. Carried on the schema (like `cov_fields`)
+    /// because `CallTarget::TransactorMethod { bus_field, .. }` call
+    /// edges are deliberately NOT inlined at the IR level — emission
+    /// resolves the edge against this table to learn the method's wire
+    /// names. The design doc's skeleton hangs bus metadata off a
+    /// `BusId` table; v0 inlines the (small) per-binding method list
+    /// here instead since bindings are per-test, not global.
+    pub bus_bindings: Vec<BusBindingSchema>,
     /// True when no `testbench` declaration existed in source and this
     /// schema was synthesized for a classic-form test. Codegen skips
     /// the `_tb` struct + wire statement for synthetic testbenches.
     pub synthetic: bool,
+}
+
+/// One test-scope bus binding (`let axil : BusAxiLite = bind dut`).
+/// The binding name doubles as the flat signal prefix on the DUT
+/// (`axil` → `axil_aw_valid`, `axil_read_req_valid`, ...), mirroring
+/// arch-com §19.6 / v1's `bus_bindings` convention.
+#[derive(Debug, Clone)]
+pub struct BusBindingSchema {
+    /// Binding field name == flat DUT signal prefix.
+    pub field: String,
+    /// Bus type name (diagnostics + trace events).
+    pub bus: String,
+    /// `tlm_method` declarations on the bus, in declaration order.
+    pub methods: Vec<TlmMethodSchema>,
+}
+
+/// One `tlm_method` on a bound bus — the call-edge metadata emission
+/// needs to expand a `CallTarget::TransactorMethod` into the canonical
+/// ARCH-compatible req/rsp wire protocol.
+#[derive(Debug, Clone)]
+pub struct TlmMethodSchema {
+    pub name: String,
+    /// Declared argument names, in order. Each maps to the request
+    /// payload wire `<binding>_<method>_<arg>`.
+    pub args: Vec<String>,
+    /// True when the method declares a return type — the response
+    /// carries a `<binding>_<method>_rsp_data` wire.
+    pub has_ret: bool,
 }
 
 /// Function kinds. `Run`/`Check` are test phases; `SamplerAuto` is the

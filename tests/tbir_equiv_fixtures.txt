@@ -68,3 +68,7 @@ cov_cross_bins_test | Top | top_counter.sv | top_counter.arch | pass
 wait_any_of_test | Top | top_counter.sv | top_counter.arch | pass
 wait_any_of_timeout_test | Top | top_counter.sv | top_counter.arch | fail
 transaction_basic_test | Top | top_counter.sv | top_counter.arch | pass
+axilite_bus_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
+axilite_bus_extern_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
+axilite_bus_send_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
+tlm_method_blocking_bus_test | TlmMemory | TlmMemory.sv | - | pass

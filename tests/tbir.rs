@@ -1713,3 +1713,358 @@ fn placement_leaves_ir_untouched_and_is_deterministic() {
     assert_eq!(a, b, "rendering must be byte-stable");
     assert_eq!(before, format!("{prog}"), "pass must not perturb the IR");
 }
+
+// ── Bus construct: bindings, protocol-typed signal access, channel
+//    handshakes, and TLM method-call edges ───────────────────────────
+
+/// Locks the dump-ir text for the Scope-A bus fixture: an inline bus
+/// declaration, a `bind dut` binding on the testbench schema, and
+/// two-level `<bind>.<ch>.<sig>` accesses lowering to flat-path
+/// DutRead/DutWrite (`dut.axil.aw.valid` → `axil_aw_valid`).
+#[test]
+fn axilite_bus_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("axilite_bus_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("axilite_bus_dump_ir", format!("{prog}"));
+}
+
+/// Locks the dump-ir text for the blocking TLM fixture: the
+/// `TransactorMethod` call edges survive lowering UNINLINED — each
+/// `mem.read`/`mem.poke` is `Assign(dest, mem.<method>(args))`, and
+/// the binding's method schemas ride the testbench line.
+#[test]
+fn tlm_blocking_bus_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("tlm_method_blocking_bus_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let text = format!("{prog}");
+    assert!(
+        text.contains("mem.read(5)") && text.contains("mem.poke(8, 3405691582)"),
+        "call edges must stay visible (never inlined) in the IR:\n{text}"
+    );
+    insta::assert_snapshot!("tlm_blocking_bus_dump_ir", text);
+}
+
+/// Locks the emitted C++ for the blocking TLM fixture: the call edge
+/// expands to v1's req/rsp wire protocol (arg wires, valid/ready
+/// budget loops, rsp_data capture, tlm_call trace events).
+#[test]
+fn tlm_blocking_bus_emitted_cpp_snapshot() {
+    insta::assert_snapshot!(
+        "tlm_blocking_bus_emitted_cpp",
+        emit_fixture_cpp("tlm_method_blocking_bus_test.harc")
+    );
+}
+
+const SEND_RECV_SRC: &str = r#"
+bus PingBus
+    handshake_channel tx: send kind: valid_ready
+        data: uint<32>
+    end handshake_channel tx
+
+    handshake_channel rx: receive kind: valid_ready
+        data: uint<32>
+        resp: uint<2>
+    end handshake_channel rx
+end bus PingBus
+
+testbench PingTb
+    dut : PingDut
+end testbench PingTb
+
+impl PingTest for PingTb
+    let p : PingBus = bind dut
+
+    run
+        p.tx.send(7)
+        let v = p.rx.recv()
+        assert v == 7 else fail("got ${v}")
+    end run
+end impl PingTest
+"#;
+
+/// `bus.<ch>.send/recv` CFG-inline to v1's auto-handshake: drive
+/// payload + valid (send) / ready (recv), 16-cycle budget loop on the
+/// opposite signal, capture-before-tick (recv), trailing tick, drop.
+/// The recv capture reads the FIRST payload signal (documented
+/// divergence from v1's payload struct — equivalent for everything
+/// the IR can express).
+#[test]
+fn bus_send_recv_dump_ir_snapshot() {
+    let prog = lower_src(SEND_RECV_SRC).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let text = format!("{prog}");
+    assert!(
+        text.contains("DutRead(%v, dut.p.rx.data)"),
+        "recv must capture the first payload signal before the tick:\n{text}"
+    );
+    insta::assert_snapshot!("bus_send_recv_dump_ir", text);
+}
+
+/// fork/join_all TLM issue is outside the subset — precise rejection
+/// (blocks tlm_method_bus_test + tlm_pairing_arch_target_test).
+#[test]
+fn bus_fork_join_is_unsupported() {
+    let err = lower_src(&fixture("tlm_method_bus_test.harc")).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("`fork` bus-method calls"), "{msg}");
+}
+
+/// A direct (non-fork) call of an `out_of_order` method is rejected by
+/// mode, naming the mode and the call site.
+#[test]
+fn bus_ooo_direct_call_is_unsupported() {
+    let src = r#"
+bus OooBus
+    tlm_method read_ooo(addr: uint<8>) -> uint<32>: out_of_order tags 2;
+end bus OooBus
+
+testbench OooTb
+    dut : TlmMemory
+end testbench OooTb
+
+impl OooTest for OooTb
+    let mem : OooBus = bind dut
+    run
+        let x = mem.read_ooo(9)
+    end run
+end impl OooTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("`out_of_order` tlm_method calls") && msg.contains("mem.read_ooo"),
+        "{msg}"
+    );
+}
+
+/// Bus calls suspend, so they are statement-level only: nesting one in
+/// an expression is a precise rejection, not the generic method-call
+/// message.
+#[test]
+fn bus_call_in_expression_position_is_unsupported() {
+    let src = r#"
+bus MemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus MemBus
+
+testbench ExprTb
+    dut : TlmMemory
+end testbench ExprTb
+
+impl ExprTest for ExprTb
+    let mem : MemBus = bind dut
+    run
+        assert mem.read(5) == 261 else fail("nope")
+    end run
+end impl ExprTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("bus method calls in expression position"),
+        "{msg}"
+    );
+}
+
+/// `bind ... with { ... }` signal remaps are emission-side metadata the
+/// IR does not carry yet — rejected at the bind site.
+#[test]
+fn bus_bind_remap_is_unsupported() {
+    let src = r#"
+bus RemapBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus RemapBus
+
+testbench RemapTb
+    dut : TlmMemory
+end testbench RemapTb
+
+impl RemapTest for RemapTb
+    let mem : RemapBus = bind dut with {
+        read.req_valid: "mem_read_req_valid"
+    }
+    run
+        let x = mem.read(5)
+    end run
+end impl RemapTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("bus bind signal remaps"), "{msg}");
+}
+
+/// Unknown channel signals are hard errors with v1's diagnostic text
+/// (v1 surfaces them as codegen errors; the IR rejects at lowering).
+#[test]
+fn bus_unknown_signal_is_invalid() {
+    let src = r#"
+bus TypoBus
+    handshake_channel aw: send kind: valid_ready
+        addr: uint<8>
+    end handshake_channel aw
+end bus TypoBus
+
+testbench TypoTb
+    dut : AxiLiteRegs
+end testbench TypoTb
+
+impl TypoTest for TypoTb
+    let axil : TypoBus = bind dut
+    run
+        axil.aw.addrr = 24
+    end run
+end impl TypoTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)),
+        "typo must be a hard error: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("channel `aw` has no signal `addrr`")
+            && msg.contains("valid: valid, ready, addr"),
+        "{msg}"
+    );
+}
+
+/// The target-side TLM fixtures now stop at their REAL next blocker —
+/// the `transactor` construct — instead of the bus file gate.
+#[test]
+fn tlm_target_fixture_blocked_by_transactor() {
+    let err = lower_src(&fixture("tlm_target_thread_test.harc")).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("the `transactor` construct"), "{msg}");
+}
+
+/// Transactor-call seam rule, verifier side: the call edge is pinned
+/// to the whole-Assign-RHS position in Run/Check functions and must
+/// resolve against the owning testbench's bus bindings.
+#[test]
+fn verifier_pins_transactor_call_seam() {
+    let prog = lower_src(&fixture("tlm_method_blocking_bus_test.harc")).expect("lowers");
+    let run_fn = prog.tests[0].run.index();
+
+    // Locate an Assign whose RHS is a TransactorMethod call.
+    let find_call = |f: &ir::TbFunction| -> (usize, usize) {
+        for (bi, b) in f.blocks.iter().enumerate() {
+            for (si, s) in b.stmts.iter().enumerate() {
+                if let ir::Stmt::Assign(_, ir::Expr::Call(ir::CallTarget::TransactorMethod { .. }, _)) = s
+                {
+                    return (bi, si);
+                }
+            }
+        }
+        panic!("no TransactorMethod Assign found");
+    };
+
+    // 1. Nested in an expression → seam violation.
+    let mut broken = prog.clone();
+    {
+        let f = &mut broken.functions[run_fn];
+        let (bi, si) = find_call(f);
+        let ir::Stmt::Assign(l, call) = f.blocks[bi].stmts[si].clone() else {
+            unreachable!()
+        };
+        f.blocks[bi].stmts[si] = ir::Stmt::Assign(
+            l,
+            ir::Expr::Binary(
+                ir::BinOp::Add,
+                Box::new(call),
+                Box::new(ir::Expr::Literal {
+                    value: 1,
+                    ty: ir::IrType::Unknown,
+                }),
+            ),
+        );
+    }
+    let errs = verify::verify_program(&broken).unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, verify::VerifyError::BadTransactorCall { .. })),
+        "{errs:?}"
+    );
+
+    // 2. Unresolved binding → seam violation.
+    let mut broken = prog.clone();
+    {
+        let f = &mut broken.functions[run_fn];
+        let (bi, si) = find_call(f);
+        if let ir::Stmt::Assign(
+            _,
+            ir::Expr::Call(ir::CallTarget::TransactorMethod { bus_field, .. }, _),
+        ) = &mut f.blocks[bi].stmts[si]
+        {
+            *bus_field = "ghost".to_string();
+        }
+    }
+    let errs = verify::verify_program(&broken).unwrap_err();
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            verify::VerifyError::BadTransactorCall { what, .. } if what.contains("no bus binding `ghost`")
+        )),
+        "{errs:?}"
+    );
+
+    // 3. Arity drift against the schema → seam violation.
+    let mut broken = prog.clone();
+    {
+        let f = &mut broken.functions[run_fn];
+        let (bi, si) = find_call(f);
+        if let ir::Stmt::Assign(_, ir::Expr::Call(_, args)) = &mut f.blocks[bi].stmts[si] {
+            args.push(ir::Expr::Literal {
+                value: 0,
+                ty: ir::IrType::Unknown,
+            });
+        }
+    }
+    let errs = verify::verify_program(&broken).unwrap_err();
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            verify::VerifyError::BadTransactorCall { what, .. } if what.contains("arity mismatch")
+        )),
+        "{errs:?}"
+    );
+
+    // 4. Call edge in a non-Run/Check function → seam violation
+    //    (pure helpers must stay suspension-free and placement-neutral).
+    let mut broken = prog.clone();
+    broken.functions[run_fn].kind = ir::FunctionKind::Helper;
+    let errs = verify::verify_program(&broken).unwrap_err();
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            verify::VerifyError::BadTransactorCall { what, .. } if what.contains("Helper")
+        )),
+        "{errs:?}"
+    );
+}
+
+/// Placement classifies blocks carrying a transactor call edge as
+/// timing-tolerant — the boundary the lowering now actually produces.
+#[test]
+fn placement_classifies_transactor_call_block_timing_tolerant() {
+    let prog = lower_src(&fixture("tlm_method_blocking_bus_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let profile = placement::TargetProfile::single_site();
+    let table = placement::run(&prog, &profile);
+    let run_id = prog.tests[0].run;
+    let f = prog.function(run_id);
+    let (bi, _) = f
+        .blocks
+        .iter()
+        .enumerate()
+        .find(|(_, b)| {
+            b.stmts.iter().any(|s| {
+                matches!(
+                    s,
+                    ir::Stmt::Assign(_, ir::Expr::Call(ir::CallTarget::TransactorMethod { .. }, _))
+                )
+            })
+        })
+        .expect("a block carries the call edge");
+    let (_, timing) = table.blocks[&(run_id, ir::BlockId(bi as u32))];
+    assert_eq!(timing, placement::TimingClass::TimingTolerant);
+}

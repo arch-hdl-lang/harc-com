@@ -77,12 +77,21 @@ pub(super) fn expr_cpp(
         Expr::Call(target, args) => {
             let name = match target {
                 CallTarget::Helper(n) => helper_cpp_name(n),
-                CallTarget::Builtin(_) | CallTarget::TransactorMethod { .. } => {
+                CallTarget::Builtin(_) => {
                     return Err(EmitError(
-                        "tbir: builtin/transactor calls are not emitted yet (lowering should \
+                        "tbir: builtin calls are not emitted yet (lowering should \
                          have rejected them)"
                             .to_string(),
                     ));
+                }
+                CallTarget::TransactorMethod { bus_field, method } => {
+                    // Emitted only as a whole Assign RHS (func.rs
+                    // `emit_transactor_call`); reaching expression
+                    // emission means the seam invariant was violated.
+                    return Err(EmitError(format!(
+                        "tbir: transactor call edge `{bus_field}.{method}` in expression \
+                         position — verifier pins it to Assign-RHS (lowering/pass bug)"
+                    )));
                 }
             };
             let mut rendered = Vec::with_capacity(args.len());

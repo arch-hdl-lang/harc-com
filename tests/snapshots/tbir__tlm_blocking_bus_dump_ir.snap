@@ -1,0 +1,41 @@
+---
+source: tests/tbir.rs
+assertion_line: 1496
+expression: text
+---
+tb-ir program
+  testbench tb0 TlmMethodBlockingBusTb { dut: TlmMemory } bus mem=TlmMemBlockingBus[read(addr)->r poke(addr,data)]
+  test TlmMethodBlockingBusTest tb=tb0 run=fn0 check=-
+
+fn fn0 run_TlmMethodBlockingBusTest [kind=Run, owner=tb0]
+  locals:
+    %0 initial : unknown
+    %1 __t0 : unknown
+    %2 updated : unknown
+    %3 reread : unknown
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.mem_read_req_valid, 0)
+    DutWrite(dut.mem_read_rsp_ready, 0)
+    DutWrite(dut.mem_read_ooo_req_valid, 0)
+    DutWrite(dut.mem_read_ooo_rsp_ready, 0)
+    DutWrite(dut.mem_poke_req_valid, 0)
+    DutWrite(dut.mem_poke_rsp_ready, 0)
+    -> WaitCycles(2, b1)
+
+  b1:
+    DutWrite(dut.rst, 0)
+    -> WaitCycles(1, b2)
+
+  b2:
+    Assign(%initial, mem.read(5))
+    AssertCheck { cond: (%initial == 261), on_fail: "initial read got 0x%08llx, expected 0x00000105", %initial }
+    Assign(%__t0, mem.poke(8, 3405691582))
+    Assign(%updated, mem.read(8))
+    AssertCheck { cond: (%updated == 3405691582), on_fail: "updated read got 0x%08llx, expected 0xCAFEBABE", %updated }
+    Assign(%reread, mem.read(5))
+    AssertCheck { cond: (%reread == 261), on_fail: "re-read got 0x%08llx, expected 0x00000105", %reread }
+    Log(info, "PASS: blocking bus tlm_method read/poke call edges")
+    -> Return

@@ -90,22 +90,39 @@ shifting as `agent`/`scoreboard`/`sequencer` slices land — most of
 these fixtures need several of those constructs at once (they are
 full env/agent stacks).
 
-### `bus` construct — 15 fixtures
+### `bus` construct — 15 fixtures — **PARTIALLY RESOLVED 2026-06-12**
 
-> TB-IR lowering does not support the `bus` construct yet
+> ~~TB-IR lowering does not support the `bus` construct yet~~
 
-`axilite_bus_test`, `axilite_bus_extern_test`, `axilite_bus_send_test`,
-`tlm_method_bus_test`, `tlm_target_thread_test`,
-`tlm_target_thread_if_test`, `tlm_target_thread_runtime_loop_test`,
-`tlm_target_thread_early_return_test`, `tlm_target_forwarding_test`,
-`tlm_target_fork_forwarding_test`, `tlm_target_ooo_lanes_test`,
-`tlm_pairing_arch_target_test`*, `tlm_pairing_arch_initiator_test`,
-`dma_engine_tlm_target_test`, `dma_engine_tlm_mem_model_test`
+The bus slice landed (declarations, `= bind dut` bindings, signal
+access, `send`/`recv` auto-handshakes CFG-inlined, blocking
+`tlm_method` calls as `CallTarget::TransactorMethod` call edges —
+see docs/tbir-mvp.md divergence 9). **Registered**: 3 of the 15
+unlocked fully and pass the v1-vs-tbir equivalence pair —
+`axilite_bus_test`, `axilite_bus_extern_test`,
+`axilite_bus_send_test` — plus a new corpus fixture
+`tlm_method_blocking_bus_test` (blocking-only twin of
+`tlm_method_bus_test`) authored to prove the TransactorMethod call
+edge end-to-end, since every pre-existing TLM fixture also carries a
+deeper blocker.
 
-\* `tlm_pairing_arch_target_test` does not lower (bus construct), so the
-known local-only Verilator 5.048-vs-CI-5.034 SVA verdict issue on this
-fixture never reached the equivalence stage; from CI's perspective it is
-simply bus-blocked like its siblings.
+Residual map for the other 12 (each now stops at its REAL next
+blocker; exact `Unsupported` message in parentheses):
+
+| Next blocker | Fixtures |
+|---|---|
+| `transactor` construct (target-side TLM method threads → `FunctionKind::TransactorBody`) | `tlm_target_thread_test`, `tlm_target_thread_if_test`, `tlm_target_thread_runtime_loop_test`, `tlm_target_thread_early_return_test`, `tlm_target_forwarding_test`, `tlm_target_fork_forwarding_test`, `tlm_target_ooo_lanes_test`, `tlm_pairing_arch_initiator_test`, `dma_engine_tlm_target_test`, `dma_engine_tlm_mem_model_test` ("the `transactor` construct") |
+| `fork`/`join_all` TLM issue (needs `Terminator::Fork` + `ForkArmKind::BusMethodCall`) | `tlm_method_bus_test`, `tlm_pairing_arch_target_test`* ("`fork` bus-method calls") |
+
+Both groups' bus prerequisites are in place: the transactor group
+will additionally need `bind ... with { ... }` remaps
+(`dma_engine_tlm_*`) and per-instance state fields; the fork group's
+blocking-call halves already lower.
+
+\* `tlm_pairing_arch_target_test` still does not reach the equivalence
+stage (now fork-blocked rather than bus-blocked), so the known
+local-only Verilator 5.048-vs-CI-5.034 SVA verdict issue on this
+fixture remains moot from CI's perspective.
 
 ### `wait N cycles on <clock>` — 5 fixtures — **RESOLVED 2026-06-12**
 
@@ -209,8 +226,11 @@ no schema v4 needed.
    prerequisite, but note the residual map — the former
    `transaction`-group fixtures need `agent`/`scoreboard`/`sequencer`
    too, so the transactor worker should expect the same
-   first-blocker churn.*
-2. **`bus`** (15 fixtures): unlocks the entire TLM family.
+   first-blocker churn. The `transactor` slice now ALSO unlocks 10
+   of the TLM-family fixtures (see the bus group's residual map).*
+2. ~~**`bus`** (15 fixtures): unlocks the entire TLM family.~~
+   **LANDED 2026-06-12** — 3 fixtures + 1 new fixture registered;
+   12 residuals moved to `transactor` (10) and `fork` (2).
 3. ~~**`wait N cycles on <clock>`** (5) + the registry schema v3 row
    format: together they unlock the synchronizer/multi-clock family
    (incl. the schema-blocked `synchronizer_basic_test`).~~ **DONE

@@ -221,9 +221,9 @@ fn emit_test(
     if !tb.synthetic {
         writeln!(out, "{INDENT}{INDENT}_tb.dut = dut;").ok();
     }
-    func::emit_function(out, prog.function(test.run), &prog.records, 2)?;
+    func::emit_function(out, prog.function(test.run), &prog.records, &tb.bus_bindings, 2)?;
     if let Some(check) = test.check {
-        func::emit_function(out, prog.function(check), &prog.records, 2)?;
+        func::emit_function(out, prog.function(check), &prog.records, &tb.bus_bindings, 2)?;
     }
     writeln!(out, "{INDENT}{INDENT}co_return;").ok();
     writeln!(out, "{INDENT}}}(&_run_slot);").ok();
