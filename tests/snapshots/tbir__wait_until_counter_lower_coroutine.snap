@@ -1,0 +1,22 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{}\", meta.display(&prog))"
+---
+coroutine-fsm fn0 run_WaitUntilCounterTest
+  states:
+    s0 = b0 (entry)
+    s1 = b1
+    s2 = b2
+    s3 = b3
+    s4 = b4
+    s5 = b5
+  transitions:
+    s0 -> s1 on wait_cycles(3)
+    s1 -> s2 on preds((dut.count_out == 8)) [single]
+    s1 -> s3 on timeout(%__t0)
+    s2 -> s4 on preds((dut.count_out >= 12), (dut.en == 1)) [all_of]
+    s2 -> s5 on timeout(%__t1)
+    s3 -> s4 on preds((dut.count_out >= 12), (dut.en == 1)) [all_of]
+    s3 -> s5 on timeout(%__t1)
+    s4 -> end on return
+    s5 -> end on return

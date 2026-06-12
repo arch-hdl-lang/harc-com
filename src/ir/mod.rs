@@ -9,6 +9,7 @@
 
 pub mod display;
 pub mod lower;
+pub mod passes;
 pub mod verify;
 
 macro_rules! ir_id {
