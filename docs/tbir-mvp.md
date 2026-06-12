@@ -78,8 +78,14 @@ clock scheduler, log/trace plumbing, dispatcher `main()`) does mirror
 the v1 contract closely (see `src/codegen/tbir/mod.rs` and
 `runtime.rs`), which is what makes the traces line up cycle-exactly.
 
-The byte-parity gate therefore remains owed by the still-pending
-phase-4/5 migration; nothing in the MVP discharges it.
+> **Superseded 2026-06-12.** The plan's phase-4 gate was redefined to
+> behavioral equivalence + full construct coverage (see the
+> [tb-ir-plan.md](tb-ir-plan.md) decision log). The byte-parity
+> requirement is dropped; this section is kept as the record of why the
+> MVP's gate differed from the plan as originally written. Under the
+> redefined gate, the tbir backend *is* the phase-4 deliverable, and
+> what it owes is coverage (empty `Unsupported` list for v1's feature
+> set, full fixture corpus in the equivalence registry), not parity.
 
 ## Documented divergences from tb-ir-design.md
 
@@ -223,12 +229,13 @@ test site so the shift is expected, not alarming.
 
 ## Next steps
 
-The remaining work is the plan doc's, unchanged in substance:
+The remaining work is the plan doc's (gate redefined 2026-06-12 —
+see its decision log):
 
-- **Byte-parity migration** (plan phases 4–6): rebuild v1's emission
-  on the IR with a literal byte-diff CI over all fixtures, flip the
-  default, delete v1. The MVP's parallel backend neither starts nor
-  shortcuts this.
+- **Phase-4 completion** (plan phases 4–6): grow the tbir backend to
+  v1's full feature set with equivalence-registry rows (including
+  expect-fail) for the whole fixture corpus, flip the default to tbir,
+  delete v1. No byte-parity step.
 - **Passes** (plan phase 7): `placement` over a `TargetProfile`,
   `randomize_analysis`, `extract_port_set`, `hoist_stimulus`,
   `lower_coroutine` for FSM-shaped backends.
