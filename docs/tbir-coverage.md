@@ -2,6 +2,8 @@
 
 Snapshot date: **2026-06-12** (registry backfill sweep, full
 `tests/run_fixtures.sh` manifest vs `harc dump-ir` / `--codegen tbir`).
+Amended the same day by the `transaction` slice — see the resolved
+`transaction` group below for its residual blocker map.
 
 **This file is a snapshot, not a source of truth.** The registry
 (`tests/tbir_equiv_fixtures.txt`) is the source of truth for what is
@@ -58,23 +60,35 @@ within each group.
 `mac_table_test`, `noc_credit_test`, `buf_mgr_sm_test`,
 `aes_cipher_top_test`, `buf_mgr_test`
 
-### `transaction` construct — 17 fixtures
+### `transaction` construct — RESOLVED 2026-06-12 (transaction slice)
 
-> TB-IR lowering does not support the `transaction` construct yet
+`transaction` declarations and non-randomize record usage now lower
+(records table + `RecordInit`/`RecordFieldWrite`/`Expr::RecordField`;
+see docs/tbir-mvp.md). The first-blocker caveat applied in full:
+**zero** of the 17 fixtures in this group became fully lowerable —
+every one revealed a deeper blocker behind its `transaction`
+declaration. Since the group produced no registrable corpus row, the
+slice added a new fixture, `transaction_basic_test` (declaration +
+defaults + let-site re-init in a loop + field reads/writes + inert
+keep/attr), registered in the equivalence registry
+(`top_counter.sv` / `top_counter.arch`, pass).
 
-`heartbeat_idle_test`, `wait_until_quiesce_test`,
-`watchdog_quiesce_test`, `env_quiesced_phase_test`,
-`relation_inlining_test`, `axilite_env_test`, `axilite_seqdrv_test`,
-`axilite_connect_test`, `axilite_hooks_test`, `axilite_bound_mon_test`,
-`axilite_multi_payload_test`, `axilite_constraint_test`
-(`AxiLiteConstraintTest`), `transactor_parse_test`,
-`transactor_active_test`, `transactor_passive_only_test`,
-`transactor_agent_mode_test`, `transactor_env_mode_test`
+Residual first-blocker map (re-run of `harc dump-ir`, 2026-06-12):
 
-Note: many `transactor`-group fixtures also declare `transaction`s (the
-message reports whichever construct lowering hits first), so the
-`transaction` slice is the natural prerequisite for the `transactor`
-slice.
+| Moved to group | Fixtures |
+|---|---|
+| `agent` (4) | `heartbeat_idle_test`, `wait_until_quiesce_test`, `watchdog_quiesce_test`, `env_quiesced_phase_test` |
+| `transactor` (5) | `axilite_env_test`, `axilite_seqdrv_test`, `axilite_hooks_test`, `transactor_parse_test`, `transactor_active_test` |
+| `scoreboard` (5) | `axilite_bound_mon_test`, `axilite_multi_payload_test`, `transactor_passive_only_test`, `transactor_agent_mode_test`, `transactor_env_mode_test` |
+| `sequencer` (1) | `axilite_connect_test` |
+| `relation` (1) | `relation_inlining_test` |
+| `randomize` (statement-level, 1) | `axilite_constraint_test` (`AxiLiteConstraintTest`) — now reaches the body and stops at `randomize(p) with`, which points at the constraint-IR seam |
+
+The blocker message reports whichever construct lowering hits first
+in file order, so the `transactor`-group counts above will keep
+shifting as `agent`/`scoreboard`/`sequencer` slices land — most of
+these fixtures need several of those constructs at once (they are
+full env/agent stacks).
 
 ### `bus` construct — 15 fixtures
 
@@ -190,6 +204,12 @@ no schema v4 needed.
 
 1. **`transaction` → `transactor`** (17 + 19 fixtures): the two
    biggest groups, and `transactor` depends on `transaction`.
+   *Update 2026-06-12: the `transaction` half is DONE (see the
+   resolved group above). The `transactor` slice now has its
+   prerequisite, but note the residual map — the former
+   `transaction`-group fixtures need `agent`/`scoreboard`/`sequencer`
+   too, so the transactor worker should expect the same
+   first-blocker churn.*
 2. **`bus`** (15 fixtures): unlocks the entire TLM family.
 3. ~~**`wait N cycles on <clock>`** (5) + the registry schema v3 row
    format: together they unlock the synchronizer/multi-clock family

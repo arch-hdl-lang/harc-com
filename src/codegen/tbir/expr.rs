@@ -51,6 +51,14 @@ pub(super) fn expr_cpp(
             .cloned()
             .ok_or_else(|| EmitError(format!("tbir: dangling local %{} in {}", l.0, func.name)))?,
         Expr::Port(p) => port_read(p),
+        // Record-field read on a record-typed local: `t.tag`. The
+        // lowering validated the field against the schema.
+        Expr::RecordField { local, field } => {
+            let name = names.get(local.index()).cloned().ok_or_else(|| {
+                EmitError(format!("tbir: dangling local %{} in {}", local.0, func.name))
+            })?;
+            format!("{name}.{field}")
+        }
         Expr::Binary(op, a, b) => {
             let a = expr_cpp(func, names, a)?;
             let b = expr_cpp(func, names, b)?;

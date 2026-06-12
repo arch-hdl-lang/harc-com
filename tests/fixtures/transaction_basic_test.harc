@@ -1,0 +1,88 @@
+// `transaction` value-records without randomize — the fixture behind
+// the TB-IR backend's record lowering/emission (spec §3.1, structural
+// shape only). Exercises, against the counter DUT (`Top` from
+// top_counter_test):
+//
+//   1. Declaration: scalar fields with literal defaults, a `!`
+//      non-random field, an inert `with [range(...)]` attribute, and
+//      an inert `keep` clause (constraint metadata is carried but
+//      never evaluated without `randomize` — identical in v1).
+//   2. Construction: `let cmd : CountCmd` default-constructs at the
+//      let site, INSIDE a loop — field defaults must re-run on every
+//      iteration (v1 declares the struct at the source position).
+//   3. Field writes from literals, locals, and other fields; field
+//      reads in arithmetic, branch conditions, assert conditions,
+//      loop bounds, and log/fail format args.
+//
+// Uses only the v1-supported surface, so the same file passes under
+// `--codegen v1` and `--codegen tbir`; the equivalence harness
+// trace-diffs the two.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction CountCmd
+    ticks  : uint<8>  default 2  with [range(1, 9)]
+    flag   : bool     default true
+    !tag   : uint<16> default 7
+    expect : uint<32>
+
+    keep ticks in [1..16]
+end transaction CountCmd
+
+testbench TxnBasicTb
+    dut : Top
+end testbench TxnBasicTb
+
+impl TransactionBasicTest for TxnBasicTb
+    clock clk = SysDomain        // 100 MHz
+
+    run
+        // Reset for 3 cycles.
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        assert dut.count_out == 0
+            else fail("after reset: count_out=${dut.count_out}, expected 0")
+        dut.rst = 0
+
+        // Three commands; each enables the counter for cmd.ticks
+        // cycles (2, 3, 4) and checks the running total.
+        let total = 0
+        for i in 0 .. 3
+            let cmd : CountCmd
+            assert cmd.ticks == 2
+                else fail("cmd[${i}]: default ticks=${cmd.ticks}, expected 2")
+            assert cmd.tag == 7
+                else fail("cmd[${i}]: default tag=${cmd.tag}, expected 7")
+            assert cmd.expect == 0
+                else fail("cmd[${i}]: expect not re-zeroed (${cmd.expect})")
+
+            cmd.ticks = cmd.ticks + i        // 2, 3, 4
+            total = total + cmd.ticks
+            cmd.expect = total
+
+            if cmd.flag
+                dut.en = 1
+            end if
+            for _ in 0 .. cmd.ticks
+                wait 1 cycle
+            end for
+
+            let got = dut.count_out
+            assert got == cmd.expect
+                else fail("cmd[${i}]: count_out=${got}, expected ${cmd.expect}")
+            log(info, "cmd[${i}] ticks=${cmd.ticks} tag=${cmd.tag} -> count_out=${got}")
+        end for
+
+        // Hold: en=0 → count must stay at the last expectation.
+        dut.en = 0
+        let final_cmd : CountCmd
+        final_cmd.expect = total
+        wait 2 cycles
+        assert dut.count_out == final_cmd.expect
+            else fail("hold: count_out=${dut.count_out}, expected ${final_cmd.expect}")
+        log(info, "PASS: 3 commands, total=${final_cmd.expect}")
+    end run
+end impl TransactionBasicTest

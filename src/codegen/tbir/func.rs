@@ -23,7 +23,8 @@
 use super::expr::{escape_c, expr_cpp, fmt_arg_cpp, helper_cpp_name, port_lvalue, port_read};
 use crate::codegen::cpp_tb::EmitError;
 use crate::ir::{
-    FileLogLevel, FmtArgs, LogLevel, PredSrc, Stmt, TbFunction, Terminator, WaitMode,
+    FileLogLevel, FmtArgs, IrType, LogLevel, PredSrc, RecordSchema, Stmt, TbFunction, Terminator,
+    WaitMode,
 };
 use std::fmt::Write as _;
 
@@ -67,6 +68,7 @@ fn cpp_local_names(func: &TbFunction) -> Vec<String> {
 pub(super) fn emit_function(
     out: &mut String,
     func: &TbFunction,
+    records: &[RecordSchema],
     depth: usize,
 ) -> Result<(), EmitError> {
     let names = cpp_local_names(func);
@@ -76,8 +78,22 @@ pub(super) fn emit_function(
     let pad3 = INDENT.repeat(depth + 3);
 
     writeln!(out, "{pad}{{ // {} (TB-IR loop-switch)", func.name).ok();
-    for n in &names {
-        writeln!(out, "{pad1}uint64_t {n} = 0; (void){n};").ok();
+    for (l, n) in func.locals.iter().zip(&names) {
+        // Record-typed locals hoist as default-constructed structs;
+        // the `RecordInit` at the source `let` site re-runs the field
+        // defaults (v1 declares at the let site, so loop iterations
+        // re-default-construct).
+        if let IrType::Record(r) = l.ty {
+            let rec = records.get(r.index()).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: local `{n}` in {} references missing record r{}",
+                    func.name, r.0
+                ))
+            })?;
+            writeln!(out, "{pad1}{} {n}{{}}; (void){n};", rec.name).ok();
+        } else {
+            writeln!(out, "{pad1}uint64_t {n} = 0; (void){n};").ok();
+        }
     }
     writeln!(out, "{pad1}int __bb = {};", func.entry.0).ok();
     writeln!(out, "{pad1}bool __done = false;").ok();
@@ -86,7 +102,7 @@ pub(super) fn emit_function(
     for (bi, block) in func.blocks.iter().enumerate() {
         writeln!(out, "{pad2}case {bi}: {{").ok();
         for s in &block.stmts {
-            emit_stmt(out, func, &names, s, depth + 3)?;
+            emit_stmt(out, func, records, &names, s, depth + 3)?;
         }
         match &block.terminator {
             Terminator::Jump(b) => {
@@ -302,6 +318,7 @@ pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Resul
 fn emit_stmt(
     out: &mut String,
     func: &TbFunction,
+    records: &[RecordSchema],
     names: &[String],
     s: &Stmt,
     depth: usize,
@@ -312,6 +329,21 @@ fn emit_stmt(
             let name = &names[l.index()];
             let e = expr_cpp(func, names, e)?;
             writeln!(out, "{pad}{name} = {e};").ok();
+        }
+        Stmt::RecordInit(l, r) => {
+            let name = &names[l.index()];
+            let rec = records.get(r.index()).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: RecordInit of `{name}` in {} references missing record r{}",
+                    func.name, r.0
+                ))
+            })?;
+            writeln!(out, "{pad}{name} = {}{{}};", rec.name).ok();
+        }
+        Stmt::RecordFieldWrite { local, field, value } => {
+            let name = &names[local.index()];
+            let e = expr_cpp(func, names, value)?;
+            writeln!(out, "{pad}{name}.{field} = {e};").ok();
         }
         Stmt::DutWrite(p, e) => {
             let e = expr_cpp(func, names, e)?;

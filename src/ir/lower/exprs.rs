@@ -39,12 +39,30 @@ impl FuncBuilder<'_> {
                     "",
                 ))
             }
-            ExprKind::Field { .. } => {
+            ExprKind::Field { target, name } => {
                 if let Some(port) = self.as_port_ref(e)? {
                     return Ok(Expr::Port(port));
                 }
                 if let Some(cov_bin) = self.as_cov_bin(e)? {
                     return Ok(cov_bin);
+                }
+                // `t.field` read on a record-typed local.
+                if let ExprKind::Ident(root) = &*target.kind {
+                    if let Some(local) = self.lookup(&root.name) {
+                        if let Some(rid) = self.record_of_local(local) {
+                            let schema = &self.ctx.records[rid.index()];
+                            if schema.field(&name.name).is_none() {
+                                return Err(LowerError::Invalid(format!(
+                                    "transaction `{}` has no field `{}`",
+                                    schema.name, name.name
+                                )));
+                            }
+                            return Ok(Expr::RecordField {
+                                local,
+                                field: name.name.clone(),
+                            });
+                        }
+                    }
                 }
                 Err(unsupported("field access on a non-DUT value", ""))
             }
@@ -140,7 +158,10 @@ impl FuncBuilder<'_> {
                 let args = args.into_iter().map(|a| self.hoist_ports(a)).collect();
                 Expr::Call(t, args)
             }
-            other @ (Expr::Literal { .. } | Expr::Local(_) | Expr::CovBin { .. }) => other,
+            other @ (Expr::Literal { .. }
+            | Expr::Local(_)
+            | Expr::RecordField { .. }
+            | Expr::CovBin { .. }) => other,
         }
     }
 

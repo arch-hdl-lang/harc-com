@@ -66,6 +66,21 @@ pub enum VerifyError {
         expected: IrType,
         actual: IrType,
     },
+    /// Record references resolve: the `RecordId` indexes the records
+    /// table and record-typed locals carry the matching `IrType`.
+    BadRecord {
+        func: FunctionId,
+        block: BlockId,
+        record: RecordId,
+    },
+    /// A record field access names a field the schema does not have,
+    /// or targets a local that is not record-typed.
+    BadRecordField {
+        func: FunctionId,
+        block: BlockId,
+        local: LocalId,
+        field: String,
+    },
     /// Port-position rule: `Expr::Port` outside an allowed position.
     PortInDisallowedPosition {
         func: FunctionId,
@@ -124,6 +139,25 @@ impl std::fmt::Display for VerifyError {
                 f,
                 "fn{}: b{} assigns {:?} into local %{} declared {:?}",
                 func.0, block.0, actual, local.0, expected
+            ),
+            VerifyError::BadRecord {
+                func,
+                block,
+                record,
+            } => write!(
+                f,
+                "fn{}: b{} references missing or mismatched record r{}",
+                func.0, block.0, record.0
+            ),
+            VerifyError::BadRecordField {
+                func,
+                block,
+                local,
+                field,
+            } => write!(
+                f,
+                "fn{}: b{} accesses field `{field}` on local %{} (not a record-typed local or no such field)",
+                func.0, block.0, local.0
             ),
             VerifyError::PortInDisallowedPosition {
                 func,
@@ -351,6 +385,27 @@ impl Checker<'_> {
                 }
                 Stmt::DutWrite(_, e) => self.check_expr(e, true, "DutWrite value"),
                 Stmt::DutRead(l, _) => self.check_local(*l),
+                Stmt::RecordInit(l, r) => {
+                    self.check_local(*l);
+                    if r.index() >= self.prog.records.len()
+                        || self
+                            .func
+                            .locals
+                            .get(l.index())
+                            .is_some_and(|tl| tl.ty != IrType::Record(*r))
+                    {
+                        self.errs.push(VerifyError::BadRecord {
+                            func: self.fid,
+                            block: self.bid,
+                            record: *r,
+                        });
+                    }
+                }
+                Stmt::RecordFieldWrite { local, field, value } => {
+                    self.check_local(*local);
+                    self.check_record_field(*local, field);
+                    self.check_expr(value, false, "RecordFieldWrite value");
+                }
                 Stmt::Log { args, .. } => self.check_fmt_args(args),
                 Stmt::AssertCheck { cond, on_fail } => {
                     self.check_expr(cond, true, "AssertCheck cond");
@@ -400,6 +455,27 @@ impl Checker<'_> {
         }
     }
 
+    /// `local` must be record-typed and its schema must declare `field`.
+    fn check_record_field(&mut self, local: LocalId, field: &str) {
+        let ok = self
+            .func
+            .locals
+            .get(local.index())
+            .and_then(|tl| match tl.ty {
+                IrType::Record(r) => self.prog.records.get(r.index()),
+                _ => None,
+            })
+            .is_some_and(|schema| schema.field(field).is_some());
+        if !ok {
+            self.errs.push(VerifyError::BadRecordField {
+                func: self.fid,
+                block: self.bid,
+                local,
+                field: field.to_string(),
+            });
+        }
+    }
+
     fn check_covgroup(&mut self, c: CovgroupId) {
         if c.index() >= self.prog.covgroups.len() {
             self.errs.push(VerifyError::BadCovgroup {
@@ -428,6 +504,10 @@ impl Checker<'_> {
                 self.check_expr(b, ports_ok, context);
             }
             Expr::Unary(_, a) => self.check_expr(a, ports_ok, context),
+            Expr::RecordField { local, field } => {
+                self.check_local(*local);
+                self.check_record_field(*local, field);
+            }
             Expr::CovBin { inst, .. } => self.check_covgroup(inst.covgroup),
             Expr::Call(_, args) => {
                 for a in args {
@@ -484,7 +564,7 @@ fn check_def_before_use(
         let mut d = start.to_vec();
         for s in &b.stmts {
             match s {
-                Stmt::Assign(l, _) | Stmt::DutRead(l, _) => {
+                Stmt::Assign(l, _) | Stmt::DutRead(l, _) | Stmt::RecordInit(l, _) => {
                     if l.index() < d.len() {
                         d[l.index()] = true;
                     }
@@ -556,10 +636,22 @@ fn check_def_before_use(
                         defined[l.index()] = true;
                     }
                 }
-                Stmt::DutRead(l, _) => {
+                Stmt::DutRead(l, _) | Stmt::RecordInit(l, _) => {
                     if l.index() < defined.len() {
                         defined[l.index()] = true;
                     }
+                }
+                Stmt::RecordFieldWrite { local, value, .. } => {
+                    // Writing a field READS the record local (it must
+                    // be initialized first — RecordInit defines it).
+                    if local.index() < defined.len() && !defined[local.index()] {
+                        errs.push(VerifyError::LocalUseBeforeDef {
+                            func: fid,
+                            block: bid,
+                            local: *local,
+                        });
+                    }
+                    check_e(value, &defined, errs);
                 }
                 Stmt::DutWrite(_, e) => check_e(e, &defined, errs),
                 Stmt::Log { args, .. } => {
@@ -612,6 +704,7 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
     match e {
         Expr::Literal { .. } | Expr::Port(_) => {}
         Expr::Local(l) => f(*l),
+        Expr::RecordField { local, .. } => f(*local),
         Expr::Binary(_, a, b) => {
             for_each_local(a, f);
             for_each_local(b, f);
