@@ -4,9 +4,11 @@ Status: **In delivery.** MVP subset shipped (PRs #347–#351, 2026-06):
 IR types + lowering + verifier + a parallel `--codegen tbir` C++
 backend gated on behavioral trace-equivalence. See
 [tbir-mvp.md](tbir-mvp.md) for the shipped scope and documented
-divergences. The byte-parity v1 migration (phases 4–6) and the passes
-(phase 7) remain open — phase statuses annotated in the table below.
-Date logged: 2026-05-20.
+divergences. The phase-4 gate was redefined on 2026-06-12 (see the
+decision log): behavioral trace-equivalence + full construct coverage,
+not byte parity. Phases 4–6 (close coverage, flip default, delete v1)
+and the passes (phase 7) remain open — statuses annotated in the table
+below. Date logged: 2026-05-20; gate amended 2026-06-12.
 Scope: Insert a typed, CFG-shaped testbench IR between HARC's AST and
 the C++ codegen so that multiple backends (the current C++ TB, a future
 CUDA backend for GPU sim, and the existing SV-bind stub emitter) consume
@@ -302,28 +304,38 @@ against fixtures.
 
 ## Migration / staged delivery
 
-Adopt the same parity-gated rollout pattern the constraint-system plan
-proposes. Bit-identical C++ output against the existing 56 fixtures is
-the load-bearing safety net.
+Staged rollout, equivalence-gated. The load-bearing safety net is
+**behavioral trace-equivalence**: for every fixture, v1 and tbir at the
+same seed must both reach the same verdict (`ALL TESTS PASSED`, or the
+same expected failure for expect-fail rows) and their normalized JSONL
+traces must compare clean under `harc trace-diff`
+(`tests/run_tbir_equiv.sh`, enforced in CI). This replaces the original
+byte-identical-`.cpp` gate — see the 2026-06-12 decision-log entry for
+the rationale.
 
 | Phase | Status | Scope |
 |---|---|---|
 | 1 — IR types module | **done for the MVP subset** (PR #347) | `src/ir/mod.rs` + `Display` impl + unit tests on hand-built IR snippets. Reviewable on its own; no production code uses it yet. |
 | 2 — AST → IR lowering | **done for the MVP subset** (PRs #347, #349–#351; `src/ir/lower/`, `harc dump-ir` shipped) | `src/ir/lower.rs`. New `harc dump-ir Foo.harc` CLI for manual inspection. `cpp_tb.rs` still emits from AST. |
 | 3 — IR verifier | **done for the MVP subset** (PR #347; runs unconditionally before every tbir emission, not only debug builds) | `src/ir/verify.rs`. Runs after every `lower` in debug builds. |
-| 4 — IR → C++ behind `--codegen-v2` | **not started as specified.** A *parallel* loop-switch backend shipped instead (`--codegen tbir`, PRs #347–#351), gated on behavioral trace-equivalence over 5 fixtures (`tests/run_tbir_equiv.sh`, in CI) — see [tbir-mvp.md](tbir-mvp.md) for why that gate differs and why it does not discharge this phase. The byte-identical migration of v1's emission remains open. | New module reads IR, emits C++. Must produce **byte-identical** `.cpp` to current `cpp_tb.rs` for all 56 fixtures. CI job diffs `--codegen-v2` vs default. |
-| 5 — Flip default to v2 | not started | After two release cycles of clean parity CI. Keep v1 reachable via `--codegen-v1` as escape hatch. |
-| 6 — Delete v1 emission | not started | After one release cycle of v2-as-default with no escapes. |
+| 4 — IR → C++ (`--codegen tbir`) | **in delivery.** The loop-switch backend shipped (PRs #347–#351) and IS this phase's deliverable — gate redefined 2026-06-12 (decision log). Behavioral trace-equivalence enforced in CI over the registry (`tests/tbir_equiv_fixtures.txt`); coverage growing. | Phase-complete when: (a) every fixture in the full corpus is in the equivalence registry — including expect-fail rows so fatal/assert paths are compared, not just passing runs; (b) the lowering's `Unsupported` list is empty for v1's feature set (transactions/randomize, transactors, fork, scoreboards, agents/events, range/cross bins, `any of`, `--mt`/split); (c) `run_tbir_equiv.sh` green in CI across all of it. **No byte-parity requirement** — the trace-equivalence harness is the safety net. |
+| 5 — Flip default to tbir | not started; unblocked by phase 4 | After one release cycle of clean equivalence CI at full coverage. Keep v1 reachable via `--codegen v1` as escape hatch for one release. |
+| 6 — Delete v1 emission | not started | After one release cycle of tbir-as-default with no escapes. Deletes `cpp_tb.rs` emission paths; shared scaffolding consolidated per issue [#355](https://github.com/arch-hdl-lang/harc-com/issues/355). |
 | 7 — Passes land | not started (`src/ir/passes/` does not exist yet) | `placement`, `randomize_analysis`, `extract_port_set`. These are net-new functionality and don't need parity gates; gate on their own unit tests. |
 | 8 — Placement-split backends consuming IR | unblocked after 5 | The spec §10 roadmap execution targets. Out of scope for this plan; each backend carries its own plan + `TargetProfile`. |
 
-Phase 4 is the long pole. Every fixture is a potential parity bug, and
-the difference between "v2 is correct" and "v2 produces *different but
-also correct* C++" is exactly where this kind of refactor stalls for
-months. The CI must be a literal byte-diff of the emitted `.cpp`, not
-a behavioral diff of the compiled binary's stdout — the latter hides
-shape differences that become real regressions when a future feature
-touches the same code path.
+Phase 4 is the long pole — now paced by construct coverage, not parity
+debugging. The original plan prescribed a byte-identical `.cpp` diff
+and warned that a behavioral stdout diff "hides shape differences".
+Both halves of that reasoning were superseded by what actually shipped:
+the tbir backend's loop-switch shape makes byte parity with v1
+impossible by construction (forcing it would mean writing a relooper
+first, pure overhead for a shape we intend to delete), and the
+equivalence harness is not a stdout diff — it compares normalized
+semantic JSONL traces per fixture per seed, including expect-fail rows
+that pin down fatal/assert behavior. Byte parity was always a *means*
+(catch silent behavior change during migration); the trace harness now
+provides that end directly, against both DUT backends.
 
 ## What's hard
 
@@ -361,11 +373,14 @@ Three concrete pain points worth flagging:
 ~2-4 months of focused work for one engineer, paced by:
 
 - IR types + AST → IR lowering: 3-4 weeks.
-- IR → C++ with byte-parity CI on 56 fixtures: 6-8 weeks. The long
-  pole. Every fixture is a possible parity bug.
+- IR → C++ to full construct coverage with equivalence CI over the
+  whole fixture corpus: 6-8 weeks. The long pole. Each remaining
+  construct (transactions/randomize, transactors, fork, scoreboards,
+  agents/events, range/cross bins, `--mt`/split) is a lowering slice +
+  emission slice + registry rows.
 - v1 deletion: 1-2 weeks after a clean release cycle.
 - Passes (`placement`, `randomize_analysis`, `extract_port_set`):
-  ~1 week each, can land in parallel with the parity work since they
+  ~1 week each, can land in parallel with the coverage work since they
   consume the IR and don't perturb the C++ output.
 
 Out of scope here but follows directly: placement-split backends land
@@ -403,3 +418,21 @@ after phase 5; each is estimated at 6-10 weeks given the IR exists.
   Constraint-system plan and separate-compilation plan both already
   pull in the same direction (typed IR between syntax and backend);
   this plan covers the control-flow side.
+- 2026-06-12: **Phase-4 gate redefined** (maintainer decision):
+  behavioral equivalence + full construct coverage, dropping the
+  byte-identical-`.cpp` requirement. The MVP (PRs #347–#353) shipped a
+  parallel loop-switch backend for which byte parity with v1 is
+  impossible by construction; the alternative — migrating v1's exact
+  emission shape onto the IR — would reproduce, on top of the IR, the
+  re-structured control flow we intend to delete in phase 6. The
+  byte-parity gate's purpose (catch silent behavior change) is served
+  directly by the normalized trace-equivalence harness
+  (`harc trace-diff` over `tests/run_tbir_equiv.sh`, in CI), extended
+  with expect-fail rows so fatal/assert paths are compared too.
+  Consequence: the shipped tbir backend is no longer a "parallel
+  detour" — it *is* phase 4, and phases 5–6 (flip default, delete v1)
+  gate on its coverage reaching v1's full feature set. The structural
+  dedup items in issue
+  [#355](https://github.com/arch-hdl-lang/harc-com/issues/355)
+  (scaffolding raw-string duplication, loop-switch emitter dup) become
+  live phase-4/6 work rather than optional cleanup.
