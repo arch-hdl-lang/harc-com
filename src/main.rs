@@ -278,6 +278,11 @@ enum Cmd {
         /// Input .harc file(s) — base test plus any extension files.
         #[arg(required = true)]
         files: Vec<PathBuf>,
+        /// Run a TB-IR pass after lowering + verify and print its
+        /// result after the regular IR dump. Available:
+        /// `lower-coroutine` (CFG → tagged-FSM metadata).
+        #[arg(long)]
+        pass: Option<String>,
     },
     /// Diff two semantic JSONL traces (e.g. v1 vs tbir backends, or
     /// arch vs Verilator) after normalizing backend-specific noise.
@@ -485,7 +490,7 @@ fn main() -> Result<()> {
                 }
             })
         }
-        Cmd::DumpIr { files } => cmd_dump_ir(files),
+        Cmd::DumpIr { files, pass } => cmd_dump_ir(files, pass),
         Cmd::TraceDiff { a, b } => cmd_trace_diff(&a, &b),
         Cmd::TraceMerge {
             vcd,
@@ -1151,9 +1156,21 @@ fn cmd_check(files: Vec<PathBuf>, ast: bool) -> Result<()> {
     Ok(())
 }
 
-/// `harc dump-ir <files...>` — parse, fold extends (merge_for_sim),
-/// lower to TB-IR, verify, and print the textual IR form.
-fn cmd_dump_ir(files: Vec<PathBuf>) -> Result<()> {
+/// `harc dump-ir [--pass <name>] <files...>` — parse, fold extends
+/// (merge_for_sim), lower to TB-IR, verify, and print the textual IR
+/// form. With `--pass`, additionally run the named TB-IR pass and
+/// print its result after the IR dump.
+fn cmd_dump_ir(files: Vec<PathBuf>, pass: Option<String>) -> Result<()> {
+    // Validate the pass name up front so a typo fails before the dump.
+    let run_lower_coroutine = match pass.as_deref() {
+        None => false,
+        Some("lower-coroutine") | Some("lower_coroutine") => true,
+        Some(other) => {
+            return Err(miette::miette!(
+                "unknown pass `{other}` (available: lower-coroutine)"
+            ));
+        }
+    };
     let mut parsed_files = Vec::with_capacity(files.len());
     for f in &files {
         parsed_files.push(parse_file(f)?);
@@ -1172,6 +1189,12 @@ fn cmd_dump_ir(files: Vec<PathBuf>) -> Result<()> {
         )
     })?;
     print!("{prog}");
+    if run_lower_coroutine {
+        let meta =
+            harc::ir::passes::lower_coroutine::run(&prog).map_err(|e| miette::miette!("{}", e))?;
+        println!();
+        print!("{}", meta.display(&prog));
+    }
     Ok(())
 }
 

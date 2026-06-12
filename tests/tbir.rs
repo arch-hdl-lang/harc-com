@@ -5,6 +5,7 @@
 //! lock the in-process shapes.
 
 use harc::codegen::{cpp_tb, merge, tbir};
+use harc::ir::passes::lower_coroutine;
 use harc::ir::{self, lower, verify};
 use harc::parser::parse_source;
 use std::path::Path;
@@ -346,6 +347,56 @@ fn wait_until_counter_dump_ir_snapshot() {
     let prog = lower_src(&fixture("wait_until_counter_test.harc")).expect("lowers");
     verify::verify_program(&prog).expect("verifies");
     insta::assert_snapshot!("wait_until_counter_dump_ir", format!("{prog}"));
+}
+
+// ── lower_coroutine pass: CFG → tagged-FSM metadata. Snapshots lock
+//    the `harc dump-ir --pass lower-coroutine` suffix (the metadata
+//    section the pass appends after the regular IR dump, which the
+//    *_dump_ir snapshots above already lock). ───────────────────────
+
+/// top_counter: three wait-1-cycle loops + a trailing reset wait.
+/// Locks resume-point state numbering and the collapsed loop /
+/// loop-exit transitions with their branch-condition summaries.
+#[test]
+fn top_counter_lower_coroutine_snapshot() {
+    let prog = lower_src(&fixture("top_counter_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let meta = lower_coroutine::run(&prog).expect("tags");
+    insta::assert_snapshot!(
+        "top_counter_lower_coroutine",
+        format!("{}", meta.display(&prog))
+    );
+}
+
+/// wait_until_counter: chained `WaitUntilTimeout`s. Locks the paired
+/// fire/timeout edges and the timeout-handler states falling through
+/// to the success path.
+#[test]
+fn wait_until_counter_lower_coroutine_snapshot() {
+    let prog = lower_src(&fixture("wait_until_counter_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let meta = lower_coroutine::run(&prog).expect("tags");
+    insta::assert_snapshot!(
+        "wait_until_counter_lower_coroutine",
+        format!("{}", meta.display(&prog))
+    );
+}
+
+/// The pass is a side-table: running it must not perturb the IR (the
+/// `dump-ir` text is byte-identical before and after), and its own
+/// rendering is byte-stable across runs.
+#[test]
+fn lower_coroutine_leaves_ir_untouched_and_is_deterministic() {
+    let prog = lower_src(&fixture("top_counter_test.harc")).expect("lowers");
+    let before = format!("{prog}");
+    let meta_a = lower_coroutine::run(&prog).expect("tags");
+    let meta_b = lower_coroutine::run(&prog).expect("tags");
+    assert_eq!(format!("{prog}"), before, "pass must not mutate the IR");
+    assert_eq!(
+        format!("{}", meta_a.display(&prog)),
+        format!("{}", meta_b.display(&prog)),
+        "metadata rendering must be byte-stable across runs"
+    );
 }
 
 /// tbir emission of the wait-until fixture carries the v1 runtime

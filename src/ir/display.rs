@@ -193,7 +193,7 @@ fn preds_str(func: &TbFunction, preds: &[PredSrc]) -> String {
         .join(", ")
 }
 
-fn mode_str(m: &WaitMode) -> &'static str {
+pub(crate) fn mode_str(m: &WaitMode) -> &'static str {
     match m {
         WaitMode::Single => "single",
         WaitMode::AllOf => "all_of",

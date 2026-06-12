@@ -566,6 +566,22 @@ artifact serves a per-instance FSM stepped by a simulation kernel and
 a cooperative firmware task scheduler alike. `cpp_tb.rs` is free to
 ignore the metadata and continue emitting coroutine `co_await`s.
 
+> **Shipped shape (2026-06-12,
+> `src/ir/passes/lower_coroutine.rs`).** On the MVP IR the normalized
+> form above already holds by construction — suspends are
+> `Terminator`s and name their resume successors — so the pass has
+> nothing to rewrite. It shipped read-only:
+> `pub fn run(prog: &TbProgram) -> Result<CoroutineMetadata,
+> LowerCoroutineError>`, returning the side-table (`BTreeMap`-keyed
+> for deterministic iteration) and leaving `TbFunction` untouched.
+> States are *resume points* (entry + every suspend successor);
+> suspend-free `Jump`/`Branch` chains between them collapse into
+> `Transition { from, guard, trigger, to }` entries where `guard` is
+> the branch-condition summary of the collapsed path. A `Jump`/
+> `Branch` cycle with no suspend on it is rejected with a structured
+> `UnsuspendedLoop` error. Diagnostic CLI:
+> `harc dump-ir --pass lower-coroutine Foo.harc`.
+
 ### `randomize_analysis` (read-only)
 
 ```rust
