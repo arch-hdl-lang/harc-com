@@ -1,0 +1,47 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 LogPathsTb { dut: Top }
+  test LogPathsTest tb=tb0 run=fn0 check=- clock=clk@10000ps(SysDomain)
+
+fn fn0 run_LogPathsTest [kind=Run, owner=tb0]
+  locals:
+    %0 i : unknown
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.en, 0)
+    -> WaitCycles(3, b1)
+
+  b1:
+    AssertCheck { cond: (dut.count_out == 0), on_fail: "after reset: count_out=%lld, expected 0", dut.count_out }
+    Log(file("log_paths.log", info), "reset released at count_out=%lld", dut.count_out)
+    DutWrite(dut.rst, 0)
+    DutWrite(dut.en, 1)
+    Assign(%i, 1)
+    -> Jump(b2)
+
+  b2:
+    -> Branch((%i < 5), b3, b5)
+
+  b3:
+    -> WaitCycles(1, b6)
+
+  b4:
+    Assign(%i, (%i + 1))
+    -> Jump(b2)
+
+  b5:
+    Log(info, "PASS: counted to %lld with per-file logging", dut.count_out)
+    Log(warn, "console warn: no test-result effect")
+    Log(file("log_paths.log", warn), "file warn at count_out=%lld", dut.count_out)
+    Log(info, "PASS: warn severities logged without failing the test")
+    -> Return
+
+  b6:
+    AssertCheck { cond: (dut.count_out == %i), on_fail: "cycle %lld: count_out=%lld, expected %lld", %i, dut.count_out, %i }
+    Log(file("log_paths.log", info), "cycle %lld: count_out=%lld", %i, dut.count_out)
+    -> Jump(b4)

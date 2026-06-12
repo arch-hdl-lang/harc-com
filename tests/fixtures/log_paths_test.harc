@@ -1,0 +1,46 @@
+// File-target log coverage for the v1-vs-tbir equivalence matrix:
+// `logf("path.log", sev, "...")` lowers to `sim_logf_line` (per-file
+// stream, opened on first reference, anchored to HARC_LOG_DIR) in BOTH
+// C++ emitters — this fixture pins that path, which no other
+// equivalence fixture exercises. Also mixes console `log(info, ...)` /
+// `log(warn, ...)` (warn has no test-result effect, spec §7.7) and a
+// passing assert, against the counter DUT (`Top` from
+// top_counter_test). Registry row: expect=pass.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench LogPathsTb
+    dut : Top
+end testbench LogPathsTb
+
+impl LogPathsTest for LogPathsTb
+    clock clk = SysDomain        // 100 MHz
+
+    run
+        // Reset for 3 cycles.
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        assert dut.count_out == 0
+            else fail("after reset: count_out=${dut.count_out}, expected 0")
+        logf("log_paths.log", info, "reset released at count_out=${dut.count_out}")
+
+        // Count 1..4, streaming each step to the per-file log.
+        dut.rst = 0
+        dut.en = 1
+        for i in 1 .. 5
+            wait 1 cycle
+            assert dut.count_out == i
+                else fail("cycle ${i}: count_out=${dut.count_out}, expected ${i}")
+            logf("log_paths.log", info, "cycle ${i}: count_out=${dut.count_out}")
+        end for
+        log(info, "PASS: counted to ${dut.count_out} with per-file logging")
+
+        // warn — console and file — must not affect the test result.
+        log(warn, "console warn: no test-result effect")
+        logf("log_paths.log", warn, "file warn at count_out=${dut.count_out}")
+        log(info, "PASS: warn severities logged without failing the test")
+    end run
+end impl LogPathsTest

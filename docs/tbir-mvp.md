@@ -38,22 +38,32 @@ construct and pointing at `--codegen v1`. Lowering never silently
 mis-lowers; that property is load-bearing and tested
 (`tests/tbir.rs`).
 
-### The 5-fixture equivalence matrix
+### The equivalence matrix
 
 `tests/tbir_equiv_fixtures.txt` (append-only registry consumed by
-`tests/run_tbir_equiv.sh`, wired into CI):
+`tests/run_tbir_equiv.sh` — wired into CI — and by the registry-driven
+sweep in `tests/run_arch_dut_fixtures.sh`; schema v2 rows are
+`test_name | top | sv_files | arch_dut | expect`):
 
-| Fixture | Top | DUT | Exercises |
-|---|---|---|---|
-| `top_counter_test` | `Top` | `top_counter.sv` | resets, loops, asserts, format args |
-| `sync_fifo_test` | `TxQueue` | `sync_fifo.sv` | covergroups, auto-cross, check phase |
-| `bus_arbiter_test` | `BusArbiter` | `bus_arbiter.sv` | multi-point covergroup, CovBin reads |
-| `wait_until_counter_test` | `Top` | `top_counter.sv` | wait-until single/all-of + timeout diags |
-| `rom_lut_test` | `RomLut` | `rom_lut.sv` | impure-helper CFG inlining ×8, coverage |
+| Fixture | Top | DUT | Expect | Exercises |
+|---|---|---|---|---|
+| `top_counter_test` | `Top` | `top_counter.sv` | pass | resets, loops, asserts, format args |
+| `sync_fifo_test` | `TxQueue` | `sync_fifo.sv` | pass | covergroups, auto-cross, check phase |
+| `bus_arbiter_test` | `BusArbiter` | `bus_arbiter.sv` | pass | multi-point covergroup, CovBin reads |
+| `wait_until_counter_test` | `Top` | `top_counter.sv` | pass | wait-until single/all-of + timeout diags |
+| `rom_lut_test` | `RomLut` | `rom_lut.sv` | pass | impure-helper CFG inlining ×8, coverage |
+| `log_paths_test` | `Top` | `top_counter.sv` | pass | `logf` per-file streams, warn severities |
+| `fatal_path_test` | `Top` | `top_counter.sv` | fail | `log(fatal)` → errors++ + `_fatal` loop exit |
 
-All five also have full-file insta snapshots locking both the dump-ir
-text and the emitted tbir C++ (`tests/tbir.rs`,
-`tests/snapshots/tbir__*`), so emitter refactors diff visibly.
+`expect=fail` rows invert the verdict check: both codegens must exit
+nonzero with a real `N TESTS FAILED` verdict (never `ALL TESTS
+PASSED`), and the two traces must still trace-diff clean — a
+deliberate failure has to fail *identically* under both emitters.
+
+The original five fixtures also have full-file insta snapshots locking
+both the dump-ir text and the emitted tbir C++ (`tests/tbir.rs`,
+`tests/snapshots/tbir__*`), so emitter refactors diff visibly; the two
+log-path fixtures lock their dump-ir text.
 
 ## The behavioral gate vs the plan's byte-identical gate
 

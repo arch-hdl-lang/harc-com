@@ -88,8 +88,9 @@ fn rom_lut_dump_ir_snapshot() {
     insta::assert_snapshot!("rom_lut_dump_ir", format!("{prog}"));
 }
 
-// ── Emitted-C++ snapshots — the emission surface for the 5-fixture
-//    equivalence matrix (tests/tbir_equiv_fixtures.txt). Full files,
+// ── Emitted-C++ snapshots — the emission surface for the original
+//    five fixtures of the equivalence matrix
+//    (tests/tbir_equiv_fixtures.txt). Full files,
 //    so any future emitter refactor diffs visibly here instead of
 //    silently shifting shapes the marker tests don't cover. ──────────
 
@@ -131,6 +132,27 @@ fn rom_lut_emitted_cpp_snapshot() {
         "rom_lut_emitted_cpp",
         emit_fixture_cpp("rom_lut_test.harc")
     );
+}
+
+/// Locks the dump-ir text for the file-log fixture: `logf` statements
+/// carrying `LogLevel::File` (path + severity) alongside console
+/// info/warn logs with interpolated port reads.
+#[test]
+fn log_paths_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("log_paths_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("log_paths_dump_ir", format!("{prog}"));
+}
+
+/// Locks the dump-ir text for the fatal-path fixture: the
+/// `LogLevel::Fatal` statement (errors++ AND `_fatal = true` in both
+/// emitters) followed by a wait and a post-fatal statement that the
+/// drive loop must never reach.
+#[test]
+fn fatal_path_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("fatal_path_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("fatal_path_dump_ir", format!("{prog}"));
 }
 
 /// Transactor fixtures are outside the MVP subset — the error must

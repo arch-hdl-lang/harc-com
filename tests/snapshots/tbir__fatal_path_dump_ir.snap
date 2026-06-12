@@ -1,0 +1,30 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 FatalPathTb { dut: Top }
+  test FatalPathTest tb=tb0 run=fn0 check=- clock=clk@10000ps(SysDomain)
+
+fn fn0 run_FatalPathTest [kind=Run, owner=tb0]
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.en, 0)
+    -> WaitCycles(3, b1)
+
+  b1:
+    AssertCheck { cond: (dut.count_out == 0), on_fail: "after reset: count_out=%lld, expected 0", dut.count_out }
+    DutWrite(dut.rst, 0)
+    DutWrite(dut.en, 1)
+    -> WaitCycles(2, b2)
+
+  b2:
+    Log(info, "about to abort at count_out=%lld", dut.count_out)
+    Log(fatal, "deliberate fatal at count_out=%lld", dut.count_out)
+    -> WaitCycles(1, b3)
+
+  b3:
+    Log(error, "UNREACHABLE: _fatal must abort the run before this line")
+    -> Return
