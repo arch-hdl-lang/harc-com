@@ -1,0 +1,41 @@
+---
+source: tests/tbir.rs
+assertion_line: 409
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 WaitAnyOfTb { dut: Top }
+  test WaitAnyOfTest tb=tb0 run=fn0 check=- clock=clk@10000ps(SysDomain)
+
+fn fn0 run_WaitAnyOfTest [kind=Run, owner=tb0]
+  locals:
+    %0 __t0 : unknown
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.en, 0)
+    -> WaitCycles(3, b1)
+
+  b1:
+    AssertCheck { cond: (dut.count_out == 0), on_fail: "after reset: count_out=%lld, expected 0", dut.count_out }
+    DutWrite(dut.rst, 0)
+    DutWrite(dut.en, 1)
+    Log(info, "released reset, counting")
+    -> WaitUntil { (dut.count_out == 200), (dut.count_out == 6) [any_of], b2 }
+
+  b2:
+    AssertCheck { cond: (dut.count_out == 6), on_fail: "after any-of wait: count_out=%lld, expected 6", dut.count_out }
+    Log(info, "PASS: any-of fired on count==6")
+    Assign(%__t0, 100)
+    -> WaitUntilTimeout { (dut.count_out == 10), (dut.count_out == 250) [any_of], cycles: %__t0, fire: b3, timeout: b4 }
+
+  b3:
+    AssertCheck { cond: (dut.count_out == 10), on_fail: "after timed any-of: count_out=%lld, expected 10", dut.count_out }
+    Log(info, "PASS: timed any-of fired at count_out=%lld", dut.count_out)
+    -> Return
+
+  b4:
+    FailDiag { "any-of conditions never fired" }
+    FailDiag { "  none of: dut.count_out == 10, dut.count_out == 250" }
+    -> Jump(b3)

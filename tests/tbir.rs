@@ -191,9 +191,11 @@ fn wait_until_quiesce_fixture_is_unsupported() {
     insta::assert_snapshot!("wait_until_quiesce_unsupported", msg);
 }
 
-/// `any of` stays outside the lowered subset (Single/AllOf landed).
+/// Untimed `any of` lowers to a `WaitUntil` terminator in `AnyOf`
+/// mode with every sub-predicate kept inline (the emitter `||`-joins
+/// them, matching v1's disjunction).
 #[test]
-fn wait_until_any_of_is_unsupported() {
+fn wait_until_any_of_lowers_to_any_of_mode() {
     let src = r#"
 test WaitUntilAnyTest
     let dut : Top
@@ -202,10 +204,58 @@ test WaitUntilAnyTest
     end run
 end test WaitUntilAnyTest
 "#;
-    let err = lower_src(src).unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("any of"), "names the construct: {msg}");
-    assert!(msg.contains("--codegen v1"), "suggests v1: {msg}");
+    let prog = lower_src(src).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let f = prog.function(prog.tests[0].run);
+    let ir::Terminator::WaitUntil { preds, mode, .. } = &f.blocks[0].terminator else {
+        panic!("expected WaitUntil terminator:\n{f}");
+    };
+    assert_eq!(*mode, ir::WaitMode::AnyOf);
+    assert_eq!(preds.len(), 2);
+    assert_eq!(preds[0].src_text, "dut.ready == 1");
+    assert_eq!(preds[1].src_text, "dut.count_out == 2");
+}
+
+/// Timed `any of` carries v1's any-of timeout diagnostics: the default
+/// header is "wait until any of timed out after %lld cycles" and the
+/// breakdown is ONE unguarded "  none of: <src1>, <src2>" line (a
+/// timed-out any-of means no predicate ever fired — v1 lists them all
+/// without re-checking), not the per-predicate "not yet true:" lines.
+#[test]
+fn wait_until_any_of_timeout_diag_block() {
+    let src = r#"
+test WaitAnyTimeoutTest
+    let dut : Top
+    run
+        wait until any of dut.ready == 1, dut.count_out == 2 timeout 50 cycles
+    end run
+end test WaitAnyTimeoutTest
+"#;
+    let prog = lower_src(src).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let f = prog.function(prog.tests[0].run);
+    let ir::Terminator::WaitUntilTimeout {
+        mode, on_timeout, on_fire, ..
+    } = &f.blocks[0].terminator
+    else {
+        panic!("expected WaitUntilTimeout terminator:\n{f}");
+    };
+    assert_eq!(*mode, ir::WaitMode::AnyOf);
+    let diag = f.block(*on_timeout);
+    assert_eq!(diag.stmts.len(), 2, "header + one none-of line:\n{f}");
+    let ir::Stmt::FailDiag { guard: None, args } = &diag.stmts[0] else {
+        panic!("first diag stmt is the unguarded header:\n{f}");
+    };
+    assert_eq!(args.fmt, "wait until any of timed out after %lld cycles");
+    let ir::Stmt::FailDiag { guard: None, args } = &diag.stmts[1] else {
+        panic!("second diag stmt is the unguarded none-of line:\n{f}");
+    };
+    assert_eq!(args.fmt, "  none of: dut.ready == 1, dut.count_out == 2");
+    assert!(args.args.is_empty());
+    assert!(
+        matches!(diag.terminator, ir::Terminator::Jump(b) if b == *on_fire),
+        "on_timeout rejoins on_fire:\n{f}"
+    );
 }
 
 /// Untimed single-predicate `wait until` becomes a `WaitUntil`
@@ -347,6 +397,34 @@ fn wait_until_counter_dump_ir_snapshot() {
     let prog = lower_src(&fixture("wait_until_counter_test.harc")).expect("lowers");
     verify::verify_program(&prog).expect("verifies");
     insta::assert_snapshot!("wait_until_counter_dump_ir", format!("{prog}"));
+}
+
+/// Locks the dump-ir text for the any-of fixture (`AnyOf` wait modes,
+/// untimed + timed) and its emitted C++ (the `||`-joined awaiter
+/// predicates).
+#[test]
+fn wait_any_of_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("wait_any_of_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("wait_any_of_dump_ir", format!("{prog}"));
+}
+
+#[test]
+fn wait_any_of_emitted_cpp_snapshot() {
+    insta::assert_snapshot!(
+        "wait_any_of_emitted_cpp",
+        emit_fixture_cpp("wait_any_of_test.harc")
+    );
+}
+
+/// Locks the dump-ir text for the deliberately-failing any-of timeout
+/// fixture: both timeout diagnostic blocks (default header and user
+/// `fail("…")` header) carry the single unguarded "none of:" line.
+#[test]
+fn wait_any_of_timeout_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("wait_any_of_timeout_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("wait_any_of_timeout_dump_ir", format!("{prog}"));
 }
 
 // ── lower_coroutine pass: CFG → tagged-FSM metadata. Snapshots lock
@@ -1031,7 +1109,8 @@ end impl CovTest
     let p = &cg.points[0];
     assert_eq!(p.name, "cp_mode");
     assert_eq!(p.target.port_path, vec!["mode".to_string()]);
-    let bins: Vec<(&str, &[u64])> = p
+    use ir::CovBinValue::Eq;
+    let bins: Vec<(&str, &[ir::CovBinValue])> = p
         .bins
         .iter()
         .map(|b| (b.name.as_str(), b.values.as_slice()))
@@ -1039,9 +1118,9 @@ end impl CovTest
     assert_eq!(
         bins,
         vec![
-            ("idle", &[0][..]),
-            ("busy", &[1, 2, 3][..]),
-            ("hexy", &[0x10, 0b101][..]),
+            ("idle", &[Eq(0)][..]),
+            ("busy", &[Eq(1), Eq(2), Eq(3)][..]),
+            ("hexy", &[Eq(0x10), Eq(0b101)][..]),
         ]
     );
     // Testbench schema records the cov field; lowering synthesized one
@@ -1056,30 +1135,63 @@ end impl CovTest
     assert_eq!(samplers.len(), 1);
 }
 
-/// Range bin specs (`[a..b]`) are outside the subset — reject, never
-/// silently mis-lower. The axilite_cov fixture carries one (plus a
-/// declared cross); the range bin in `cp_addr` trips first.
+/// Range bin specs lower to inclusive `CovBinValue::Range` entries:
+/// closed (`[a..b]`), open-low (`[..b]`), and the set-of-ranges mix
+/// (`{[1..3], 7}`). (Open-high `[a..]` does not parse — the `..` infix
+/// requires a right operand; only the bracket-prefix `[..b]`/`[..]`
+/// forms produce open bounds.) Bounds match v1's hit test
+/// (`_v >= lo && _v <= hi` — inclusive on both ends).
 #[test]
-fn covergroup_range_bins_unsupported() {
-    let err = lower_src(&fixture("axilite_cov_test.harc")).unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("range"), "names range specs: {msg}");
-}
-
-/// Declared `cross` items are outside the subset.
-#[test]
-fn covergroup_cross_unsupported() {
+fn covergroup_range_bins_lower() {
     let src = r#"
 covergroup Cov @(posedge dut.clk)
-    cp_a : cover dut.a
+    cp_mode : cover dut.mode
         bins
-            on = {1}
+            closed   = [4..9]
+            openlow  = [..3]
+            mixed    = {[1..3], 7}
         end bins
-    cp_b : cover dut.b
+end covergroup Cov
+
+testbench Tb
+    dut : Top
+    cov : Cov
+end testbench Tb
+
+impl CovTest for Tb
+    run
+        wait 1 cycle
+    end run
+end impl CovTest
+"#;
+    let prog = lower_src(src).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    use ir::CovBinValue::{Eq, Range};
+    let bins: Vec<(&str, &[ir::CovBinValue])> = prog.covgroups[0].points[0]
+        .bins
+        .iter()
+        .map(|b| (b.name.as_str(), b.values.as_slice()))
+        .collect();
+    assert_eq!(
+        bins,
+        vec![
+            ("closed", &[Range { lo: Some(4), hi: Some(9) }][..]),
+            ("openlow", &[Range { lo: None, hi: Some(3) }][..]),
+            ("mixed", &[Range { lo: Some(1), hi: Some(3) }, Eq(7)][..]),
+        ]
+    );
+}
+
+/// A range bound that is not a plain integer literal stays rejected
+/// (reject, never silently mis-lower).
+#[test]
+fn covergroup_non_literal_range_bound_unsupported() {
+    let src = r#"
+covergroup Cov @(posedge dut.clk)
+    cp_mode : cover dut.mode
         bins
-            on = {1}
+            bad = [dut.lo..9]
         end bins
-    cross cp_a, cp_b
 end covergroup Cov
 
 testbench Tb
@@ -1095,7 +1207,91 @@ end impl CovTest
 "#;
     let err = lower_src(src).unwrap_err();
     let msg = assert_unsupported(&err);
-    assert!(msg.contains("cross"), "names cross bins: {msg}");
+    assert!(msg.contains("range bound"), "names the bound: {msg}");
+}
+
+/// The axilite_cov fixture (range bins + declared cross + randomize)
+/// previously tripped on its range bins; those now lower, so the
+/// rejection shifted to the first construct still out of subset — the
+/// cross-file `axil_write(...)` helper call (the fixture's helper and
+/// `RegData` transaction live in axilite_regs_test.harc). When helpers
+/// across registries land, this shifts again to `randomize`.
+#[test]
+fn axilite_cov_fixture_still_unsupported() {
+    let err = lower_src(&fixture("axilite_cov_test.harc")).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("axil_write"), "names the helper call: {msg}");
+}
+
+/// Declared `cross` items lower into `CovgroupSchema::crosses`,
+/// resolving point names to indices and keeping the item position
+/// (v1's storage-name discriminator).
+#[test]
+fn covergroup_cross_lowers_to_schema() {
+    let src = r#"
+covergroup Cov @(posedge dut.clk)
+    cp_a : cover dut.a
+        bins
+            hi = {1}
+        end bins
+    cp_b : cover dut.b
+        bins
+            hi = {1}
+            lo = {0}
+        end bins
+    cross cp_a, cp_b
+end covergroup Cov
+
+testbench Tb
+    dut : Top
+    cov : Cov
+end testbench Tb
+
+impl CovTest for Tb
+    run
+        wait 1 cycle
+    end run
+end impl CovTest
+"#;
+    let prog = lower_src(src).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let cg = &prog.covgroups[0];
+    assert_eq!(cg.crosses.len(), 1);
+    // Item index 2: the cross follows the two point items.
+    assert_eq!(cg.crosses[0].item_index, 2);
+    assert_eq!(cg.crosses[0].point_indices, vec![0, 1]);
+}
+
+/// A cross naming an unknown coverpoint is a hard lowering error
+/// (v1 pushes the same complaint into its emission error list).
+#[test]
+fn covergroup_cross_unknown_point_is_invalid() {
+    let src = r#"
+covergroup Cov @(posedge dut.clk)
+    cp_a : cover dut.a
+        bins
+            hi = {1}
+        end bins
+    cross cp_a, cp_nope
+end covergroup Cov
+
+testbench Tb
+    dut : Top
+    cov : Cov
+end testbench Tb
+
+impl CovTest for Tb
+    run
+        wait 1 cycle
+    end run
+end impl CovTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)),
+        "unknown cross point is Invalid, not Unsupported: {err:?}"
+    );
+    assert!(err.to_string().contains("cp_nope"), "{err}");
 }
 
 /// A check-phase read of an unknown point or bin is a hard lowering
@@ -1160,6 +1356,53 @@ fn tbir_emit_covergroup_contract() {
     ] {
         assert!(cpp.contains(marker), "missing covergroup marker `{marker}`");
     }
+}
+
+/// Locks the dump-ir text for the declared-cross + range-bin fixture
+/// (schema crosses line, range bin rendering) and its emitted C++
+/// (flat `_cross_*` storage, range hit tests, "cross" report blocks).
+#[test]
+fn cov_cross_bins_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("cov_cross_bins_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("cov_cross_bins_dump_ir", format!("{prog}"));
+}
+
+#[test]
+fn cov_cross_bins_emitted_cpp_snapshot() {
+    insta::assert_snapshot!(
+        "cov_cross_bins_emitted_cpp",
+        emit_fixture_cpp("cov_cross_bins_test.harc")
+    );
+}
+
+/// tbir emission carries the declared-cross contract markers mirrored
+/// from v1's `emit_covergroup_struct` / sample path: flat storage named
+/// `_cross_<item_idx>_<p1>__<p2>`, the inclusive range hit test, the
+/// "cross" (not "auto_cross") report summary, the suppressed auto-cross
+/// for the declared pair, and the row-major sample update.
+#[test]
+fn tbir_emit_declared_cross_contract() {
+    let prog = lower_src(&fixture("cov_cross_bins_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let cpp = tbir::emit(&prog, &cpp_tb::EmitOpts::default()).expect("emits");
+    for marker in [
+        "uint64_t _cross_2_cp_count__cp_en[6] = {};",
+        "if (((_v >= 0 && _v <= 3))) { _tb.cov.cp_count.low++; _cg_hit_cp_count[0] = true; }",
+        "if (((_v >= 10 && _v <= 14) || (_v == 15))) { _tb.cov.cp_count.high++; _cg_hit_cp_count[2] = true; }",
+        "harc_rt::log::harc_print_covergroup_cross_summary(\"CountCov\", \"cross\", \"cp_count x cp_en\", _cross_hit, 6);",
+        "harc_rt::log::harc_print_covergroup_missing_bin(\"cp_count.low x cp_en.en0\")",
+        "harc_rt::log::harc_print_covergroup_more_missing(_cross_missing, 16, \"cross\");",
+        "if (_cg_hit_cp_count[_i0] && _cg_hit_cp_en[_i1]) {",
+        "_tb.cov._cross_2_cp_count__cp_en[(_i0 * 2 + _i1)]++;",
+    ] {
+        assert!(cpp.contains(marker), "missing declared-cross marker `{marker}`");
+    }
+    // The declared pair suppresses its auto-cross.
+    assert!(
+        !cpp.contains("_auto_cross_cp_count__cp_en"),
+        "declared cp_count x cp_en cross must suppress the auto-cross"
+    );
 }
 
 /// `--mt` is rejected by the tbir emitter (also rejected upstream by

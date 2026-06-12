@@ -1,0 +1,51 @@
+// `wait until any of …` against the counter DUT (`Top` from
+// top_counter_test) — the fixture behind the TB-IR backend's any-of
+// wait-until lowering/emission (spec §7.9). Complements
+// wait_until_counter_test (single / all-of shapes).
+//
+//   (a) untimed any-of:  the SECOND predicate fires first (count==6
+//       arrives long before count==200), proving the ||-join.
+//   (b) timed any-of:    fires well inside the 100-cycle budget, so
+//       the timeout diagnostics must NOT print.
+//
+// The deliberately-timing-out any-of lives in wait_any_of_timeout_test
+// (expect=fail). Uses only the v1-supported surface, so the same file
+// passes under `--codegen v1` and `--codegen tbir`; the equivalence
+// harness trace-diffs the two.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench WaitAnyOfTb
+    dut : Top
+end testbench WaitAnyOfTb
+
+impl WaitAnyOfTest for WaitAnyOfTb
+    clock clk = SysDomain        // 100 MHz
+
+    run
+        // Reset for 3 cycles, then count.
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        assert dut.count_out == 0
+            else fail("after reset: count_out=${dut.count_out}, expected 0")
+        dut.rst = 0
+        dut.en = 1
+        log(info, "released reset, counting")
+
+        // (a) Untimed any-of: count==6 fires first.
+        wait until any of dut.count_out == 200, dut.count_out == 6
+        assert dut.count_out == 6
+            else fail("after any-of wait: count_out=${dut.count_out}, expected 6")
+        log(info, "PASS: any-of fired on count==6")
+
+        // (b) Timed any-of: count==10 fires inside the budget.
+        wait until any of dut.count_out == 10, dut.count_out == 250
+            timeout 100 cycles fail("any-of conditions never fired")
+        assert dut.count_out == 10
+            else fail("after timed any-of: count_out=${dut.count_out}, expected 10")
+        log(info, "PASS: timed any-of fired at count_out=${dut.count_out}")
+    end run
+end impl WaitAnyOfTest

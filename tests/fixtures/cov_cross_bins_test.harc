@@ -1,0 +1,81 @@
+// Declared `cross` + range bin specs against the counter DUT (`Top`
+// from top_counter_test) — the fixture behind the TB-IR backend's
+// declared-cross and range-bin lowering/emission (spec §6).
+//
+// `cp_count` mixes the three bin-spec shapes: a closed range
+// (`[0..3]`), another closed range, and a set-of-ranges
+// (`{[10..14], 15}`). `cp_en` is a plain two-bin set point. The
+// declared `cross cp_count, cp_en` records (count-bin, en-bin)
+// combinations hit in the SAME sample — and, because the pair is
+// declared, it suppresses the implicit auto-cross for cp_count×cp_en.
+//
+// Fully deterministic (no randomize): the counter walks 0→15 with
+// en toggled off at both ends, so every cp_count bin and both cp_en
+// bins are guaranteed hits. Uses only the v1-supported surface, so the
+// same file passes under `--codegen v1` and `--codegen tbir`; the
+// equivalence harness trace-diffs the two.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+covergroup CountCov @(posedge dut.clk)
+    cp_count : cover dut.count_out
+        bins
+            low  = [0..3]
+            mid  = [4..9]
+            high = {[10..14], 15}
+        end bins
+    cp_en : cover dut.en
+        bins
+            en0 = {0}
+            en1 = {1}
+        end bins
+    cross cp_count, cp_en
+end covergroup CountCov
+
+testbench CovCrossTb
+    dut : Top
+    cov : CountCov
+end testbench CovCrossTb
+
+impl CovCrossBinsTest for CovCrossTb
+    clock clk = SysDomain        // 100 MHz
+
+    run
+        // Reset, then idle two cycles with en=0 → samples (low, off).
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        assert dut.count_out == 0
+            else fail("after reset: count_out=${dut.count_out}, expected 0")
+        dut.rst = 0
+        wait 2 cycles
+
+        // Count 0→15 with en=1 → samples every cp_count bin with on.
+        dut.en = 1
+        wait until dut.count_out == 15 timeout 100 cycles
+            fail("count never reached 15")
+        assert dut.count_out == 15
+            else fail("after wait: count_out=${dut.count_out}, expected 15")
+
+        // Hold at 15 with en=0 → samples (high, off).
+        dut.en = 0
+        wait 2 cycles
+        log(info, "PASS: walked 0..15, en toggled at both ends")
+    end run
+
+    check
+        // report() prints per-bin counts plus the declared-cross
+        // summary ("cross" kind, not "auto_cross") and its missing-bin
+        // detail lines.
+        cov.report()
+
+        assert cov.cp_count.low  > 0 else fail("low range bin hole")
+        assert cov.cp_count.mid  > 0 else fail("mid range bin hole")
+        assert cov.cp_count.high > 0 else fail("high range bin hole")
+        assert cov.cp_en.en0 > 0 else fail("en=0 bin hole")
+        assert cov.cp_en.en1 > 0 else fail("en=1 bin hole")
+        log(info, "coverage assertions passed")
+    end check
+end impl CovCrossBinsTest

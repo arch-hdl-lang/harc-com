@@ -35,11 +35,12 @@ an unknown clock name is a structured lowering error listing the
 declared clocks, where v1 deferred it to emission. Emission mirrors
 v1's inline `eval_clocks_until` loop — no coroutine yield — so
 sub-primary-cycle precision and checker timing are identical),
-`wait until` (single and `all of`, optional timeout),
+`wait until` (single, `all of`, and `any of`, optional timeout),
 `if`/`for`/`while`/`repeat`/`loop`/`break`/`continue`, covergroups
-with set-literal bins, and helper functions. Everything else —
-`transaction`, `randomize`, `agent`/`event`, transactors, buses,
-scoreboards, range bins, declared `cross`, `any of`, `fork`, ... —
+with set-literal and range (`[a..b]`, inclusive, open bounds allowed)
+bins plus declared `cross` items, and helper functions. Everything
+else — `transaction`, `randomize`, `agent`/`event`, transactors,
+buses, scoreboards, `fork`, ... —
 is rejected at lowering time with `LowerError::Unsupported` naming the
 construct and pointing at `--codegen v1`. Lowering never silently
 mis-lowers; that property is load-bearing and tested
@@ -65,6 +66,13 @@ none — `extra_harc` joins additional `tests/fixtures/` files to the
 | `rom_lut_test` | `RomLut` | `rom_lut.sv` | pass | impure-helper CFG inlining ×8, coverage |
 | `log_paths_test` | `Top` | `top_counter.sv` | pass | `logf` per-file streams, warn severities |
 | `fatal_path_test` | `Top` | `top_counter.sv` | fail | `log(fatal)` → errors++ + `_fatal` loop exit |
+| `cov_cross_bins_test` | `Top` | `top_counter.sv` | pass | declared `cross`, range + open-bound bins |
+| `wait_any_of_test` | `Top` | `top_counter.sv` | pass | `any of` wait (untimed + timed, fires) |
+| `wait_any_of_timeout_test` | `Top` | `top_counter.sv` | fail | `any of` timeout: "none of:" diags ×2 headers |
+
+(The registry has since grown past this table via the backfill sweep —
+see [tbir-coverage.md](tbir-coverage.md); the registry file is the
+source of truth, this table documents the construct-slice fixtures.)
 
 `expect=fail` rows invert the verdict check: both codegens must exit
 nonzero with a real `N TESTS FAILED` verdict (never `ALL TESTS
@@ -199,10 +207,13 @@ reason. Code locations are authoritative.
      registration markers. Unknown point/bin names are hard lowering
      errors — v1 deferred those to a C++ compile failure.
    - `WaitUntil`/`WaitUntilTimeout` carry `Vec<PredSrc>` + `WaitMode`
-     (`Single`/`AllOf`) instead of the design's single `pred: Expr`.
-     `PredSrc` keeps each sub-predicate's pretty-printed source text so
-     the timeout breakdown names the user's expressions exactly as v1
-     does. `any of` stays rejected. The `on_timeout` block also
+     (`Single`/`AllOf`/`AnyOf`) instead of the design's single
+     `pred: Expr`. `PredSrc` keeps each sub-predicate's pretty-printed
+     source text so the timeout breakdown names the user's expressions
+     exactly as v1 does (`AllOf`: one "not yet true:" line per
+     still-false predicate; `AnyOf`: one "none of:" line listing them
+     all, since a timed-out any-of means nothing fired). The
+     `on_timeout` block also
      **rejoins `on_fire`** rather than terminating in `Return` as the
      design's synthesized-fail-handler rule prescribed — v1 semantics
      are log-FAIL, bump errors once, and continue the test.
@@ -263,7 +274,8 @@ see its decision log):
 - **Subset growth**: transactions/randomize (needs the constraint-IR
   `ConstraintRef` seam), transactors (`CallTarget::TransactorMethod`
   is already declared in `src/ir/mod.rs` but nothing produces it),
-  `fork`, scoreboards, range/cross bins, `any of`.
+  `fork`, scoreboards. (Range/cross bins and `any of` landed
+  2026-06-12.)
 - **Placement-split backends** proceed per the multi-target placement
   model in [tb-ir-design.md](tb-ir-design.md) (tiers, timing classes,
   `TargetProfile` capability checks) once the passes exist.

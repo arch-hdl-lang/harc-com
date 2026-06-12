@@ -1,0 +1,44 @@
+// Deliberate `wait until any of … timeout` failures against the
+// counter DUT (`Top` from top_counter_test) — the expect=fail row that
+// pins the any-of timeout diagnostics (spec §7.9): the FAIL header
+// (default text AND user `fail("…")` text) followed by the single
+// "  none of: <src1>, <src2>" breakdown line, with `errors` bumped
+// exactly once per timed-out wait and the run CONTINUING (a timed-out
+// wait fails the test but does not abort it).
+//
+// Deterministic: en stays 0 after reset, so count_out is pinned at 0
+// and neither predicate can ever fire. Both codegens must fail
+// IDENTICALLY (2 errors, same FAIL lines, trace-diff clean).
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench WaitAnyOfTimeoutTb
+    dut : Top
+end testbench WaitAnyOfTimeoutTb
+
+impl WaitAnyOfTimeoutTest for WaitAnyOfTimeoutTb
+    clock clk = SysDomain        // 100 MHz
+
+    run
+        // Reset, then hold en=0 — the counter never moves.
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // (a) Default-header timeout: "wait until any of timed out
+        //     after %lld cycles" + the "none of:" breakdown.
+        wait until any of dut.count_out == 5, dut.count_out == 9
+            timeout 10 cycles
+        log(info, "still running after first timeout: count_out=${dut.count_out}")
+
+        // (b) User-message timeout: the fail("…") text replaces the
+        //     default header; the breakdown line is identical in shape.
+        wait until any of dut.count_out == 7, dut.count_out == 11
+            timeout 5 cycles fail("neither target count was reached")
+        log(info, "still running after second timeout: count_out=${dut.count_out}")
+    end run
+end impl WaitAnyOfTimeoutTest

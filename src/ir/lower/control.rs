@@ -226,15 +226,17 @@ impl FuncBuilder<'_> {
         Ok(())
     }
 
-    /// `wait until …` (spec §7.9) — `Single`/`AllOf` forms, with or
-    /// without `timeout N cycles fail("…")`. `AnyOf` stays explicitly
-    /// unsupported. Mirrors v1's `emit_wait_until` observable
-    /// contract: on timeout the diagnostics are the FAIL header (the
-    /// user's `fail(...)` message, or "<label> timed out after N
-    /// cycles") followed by one "  not yet true: <src>" line per
-    /// still-false sub-predicate, with `errors` bumped exactly once
-    /// (the bump rides the terminator's timeout edge — see
-    /// `codegen::tbir::func`).
+    /// `wait until …` (spec §7.9) — `Single`/`AllOf`/`AnyOf` forms,
+    /// with or without `timeout N cycles fail("…")`. Mirrors v1's
+    /// `emit_wait_until` observable contract: on timeout the
+    /// diagnostics are the FAIL header (the user's `fail(...)`
+    /// message, or "<label> timed out after N cycles") followed by the
+    /// per-mode breakdown — one "  not yet true: <src>" line per
+    /// still-false sub-predicate for `Single`/`AllOf`, or a single
+    /// "  none of: <src1>, <src2>, …" line for `AnyOf` (a timed-out
+    /// any-of means NO predicate ever fired, so v1 lists them all
+    /// unconditionally). `errors` is bumped exactly once (the bump
+    /// rides the terminator's timeout edge — see `codegen::tbir::func`).
     pub(crate) fn lower_wait_until(
         &mut self,
         mode: WaitUntilMode,
@@ -244,9 +246,7 @@ impl FuncBuilder<'_> {
         let ir_mode = match mode {
             WaitUntilMode::Single => WaitMode::Single,
             WaitUntilMode::AllOf => WaitMode::AllOf,
-            WaitUntilMode::AnyOf => {
-                return Err(unsupported("`any of` wait conditions", ""));
-            }
+            WaitUntilMode::AnyOf => WaitMode::AnyOf,
         };
         if conditions.is_empty() {
             return Err(LowerError::Invalid(
@@ -300,6 +300,7 @@ impl FuncBuilder<'_> {
                 let label = match ir_mode {
                     WaitMode::Single => "wait until",
                     WaitMode::AllOf => "wait until all of",
+                    WaitMode::AnyOf => "wait until any of",
                 };
                 FmtArgs {
                     fmt: format!("{label} timed out after %lld cycles"),
@@ -321,23 +322,42 @@ impl FuncBuilder<'_> {
             on_timeout,
         });
 
-        // Timeout arm: header + per-sub-predicate breakdown, then
-        // rejoin the success path (a timed-out wait fails the test
-        // via the error count but does not abort the run — v1
-        // semantics).
+        // Timeout arm: header + per-mode breakdown, then rejoin the
+        // success path (a timed-out wait fails the test via the error
+        // count but does not abort the run — v1 semantics).
         self.start_block(on_timeout);
         self.push(Stmt::FailDiag {
             guard: None,
             args: header,
         });
-        for p in &preds {
-            self.push(Stmt::FailDiag {
-                guard: Some(p.expr.clone()),
-                args: FmtArgs {
-                    fmt: format!("  not yet true: {}", p.src_text),
-                    args: Vec::new(),
-                },
-            });
+        match ir_mode {
+            WaitMode::Single | WaitMode::AllOf => {
+                for p in &preds {
+                    self.push(Stmt::FailDiag {
+                        guard: Some(p.expr.clone()),
+                        args: FmtArgs {
+                            fmt: format!("  not yet true: {}", p.src_text),
+                            args: Vec::new(),
+                        },
+                    });
+                }
+            }
+            WaitMode::AnyOf => {
+                // None became true — list everything that was being
+                // waited on, unguarded (v1's single "none of:" line).
+                let joined = preds
+                    .iter()
+                    .map(|p| p.src_text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.push(Stmt::FailDiag {
+                    guard: None,
+                    args: FmtArgs {
+                        fmt: format!("  none of: {joined}"),
+                        args: Vec::new(),
+                    },
+                });
+            }
         }
         self.terminate(Terminator::Jump(on_fire));
         self.start_block(on_fire);
