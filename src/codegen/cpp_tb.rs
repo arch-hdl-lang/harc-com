@@ -19223,20 +19223,36 @@ fn time_literal_to_ps(s: &str) -> Result<i64, String> {
         .take_while(|c| c.is_ascii_digit() || *c == '_')
         .collect();
     let unit: String = s.chars().skip(digits.len()).collect();
-    let n: i64 = digits
-        .replace('_', "")
-        .parse()
-        .map_err(|_| format!("bad number in time literal `{s}`"))?;
-    match unit.as_str() {
-        "ps" => Ok(n),
-        "ns" => Ok(n * 1_000),
-        "us" => Ok(n * 1_000_000),
-        "ms" => Ok(n * 1_000_000_000),
-        "s" => Ok(n * 1_000_000_000_000),
-        other => Err(format!(
-            "unsupported time unit `{other}` in `{s}` (expected ps/ns/us/ms/s)"
-        )),
-    }
+    let factor: i64 = match unit.as_str() {
+        "ps" => 1,
+        "ns" => 1_000,
+        "us" => 1_000_000,
+        "ms" => 1_000_000_000,
+        "s" => 1_000_000_000_000,
+        other => {
+            return Err(format!(
+                "unsupported time unit `{other}` in `{s}` (expected ps/ns/us/ms/s)"
+            ));
+        }
+    };
+    // i64 picoseconds caps each unit at i64::MAX / factor (e.g. 9_223_372 s).
+    let overflow = || {
+        format!(
+            "time literal `{s}` overflows the picosecond range (max {}{unit})",
+            i64::MAX / factor
+        )
+    };
+    let n: i64 = digits.replace('_', "").parse().map_err(|e| {
+        if matches!(
+            std::num::ParseIntError::kind(&e),
+            std::num::IntErrorKind::PosOverflow
+        ) {
+            overflow()
+        } else {
+            format!("bad number in time literal `{s}`")
+        }
+    })?;
+    n.checked_mul(factor).ok_or_else(overflow)
 }
 
 /// Recognise a temporal helper call in either form — bare `Call` AST with
@@ -20139,5 +20155,57 @@ mod vec_lane_sv_scan_tests {
         assert_eq!(m.get("flag"), Some(&1));
         // `data` belongs to `Other`, not `M`.
         assert_eq!(m.get("data"), None);
+    }
+}
+
+#[cfg(test)]
+mod time_literal_tests {
+    use super::time_literal_to_ps;
+
+    /// Largest value per unit whose picosecond conversion still fits in
+    /// i64 (i64::MAX / factor), and the smallest rejected (one above).
+    /// Mirrors `ir::lower::time_literal_tests` — the two emitters must
+    /// accept/reject identically.
+    #[test]
+    fn boundary_per_unit() {
+        let cases = [
+            ("ps", 9_223_372_036_854_775_807i64, 1i64),
+            ("ns", 9_223_372_036_854_775, 1_000),
+            ("us", 9_223_372_036_854, 1_000_000),
+            ("ms", 9_223_372_036, 1_000_000_000),
+            ("s", 9_223_372, 1_000_000_000_000),
+        ];
+        for (unit, max, factor) in cases {
+            let ok = format!("{max}{unit}");
+            assert_eq!(
+                time_literal_to_ps(&ok),
+                Ok(max.checked_mul(factor).unwrap()),
+                "largest accepted value for {unit}"
+            );
+            // Smallest rejected: max+1 (for ps this overflows i64 itself,
+            // so build the digit string from u64 instead).
+            let over = format!("{}{unit}", (max as u64) + 1);
+            let err = time_literal_to_ps(&over).expect_err("must reject");
+            assert_eq!(
+                err,
+                format!("time literal `{over}` overflows the picosecond range (max {max}{unit})")
+            );
+        }
+    }
+
+    #[test]
+    fn review_finding_repro_9300000s() {
+        let err = time_literal_to_ps("9300000s").expect_err("must reject");
+        assert_eq!(
+            err,
+            "time literal `9300000s` overflows the picosecond range (max 9223372s)"
+        );
+    }
+
+    #[test]
+    fn underscores_and_units_still_accepted() {
+        assert_eq!(time_literal_to_ps("1_000ns"), Ok(1_000_000));
+        assert_eq!(time_literal_to_ps("5ns"), Ok(5_000));
+        assert!(time_literal_to_ps("5cycles").is_err());
     }
 }
