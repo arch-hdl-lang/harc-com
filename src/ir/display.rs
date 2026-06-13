@@ -53,6 +53,13 @@ impl Display for TbProgram {
             for (field, x) in &tb.transactor_fields {
                 write!(f, " xactor {field}=x{}", x.0)?;
             }
+            for b in &tb.regblock_bindings {
+                write!(
+                    f,
+                    " regblock {}=rb{} via {}",
+                    b.field, b.regblock.0, b.helper_field
+                )?;
+            }
             writeln!(f)?;
         }
         for t in &self.tests {
@@ -114,6 +121,19 @@ impl Display for TbProgram {
                     if m.n_params == 1 { "" } else { "s" },
                     if m.has_ret { " -> ret" } else { "" },
                     m.function.0
+                )?;
+            }
+        }
+        for (i, rb) in self.regblocks.iter().enumerate() {
+            writeln!(f, "  regblock rb{} {} mirror=r{}", i, rb.name, rb.record.0)?;
+            for reg in &rb.registers {
+                writeln!(
+                    f,
+                    "    register {} @ 0x{:x} width {} access {}",
+                    reg.name,
+                    reg.offset,
+                    reg.width,
+                    reg.access.keyword()
                 )?;
             }
         }

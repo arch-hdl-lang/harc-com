@@ -394,6 +394,14 @@ impl FuncBuilder<'_> {
                 return Ok(());
             }
         }
+        // RAL frontdoor register-level read: `let v = regs.NAME`.
+        if self.try_lower_regblock_read_let(&l.name.name, value)? {
+            return Ok(());
+        }
+        // Any other regblock-binding access in `let`-RHS position
+        // (field-level `regs.REG.FIELD`, an unknown register) is out of
+        // subset — reject precisely.
+        self.reject_out_of_subset_regblock_access(value, "read")?;
         // Testbench method call RHS: `let x = _tb.m(...)`, CFG-inlined.
         if self.try_lower_tb_method_let(&l.name.name, value)? {
             return Ok(());
@@ -449,6 +457,15 @@ impl FuncBuilder<'_> {
                 return Ok(());
             }
         }
+        // RAL frontdoor register-level write: `regs.NAME = expr`.
+        if self.try_lower_regblock_write(target, value)? {
+            return Ok(());
+        }
+        // A write to a regblock binding that is NOT a known register
+        // (`regs.FOO = ...` for an undeclared register, or a field-level
+        // `regs.REG.FIELD = ...` access) is out of subset — reject
+        // precisely rather than fall through and mis-lower.
+        self.reject_out_of_subset_regblock_access(target, "write")?;
         if self.lower_transactor_dut_bind(target, value)? {
             return Ok(());
         }
@@ -766,23 +783,28 @@ impl FuncBuilder<'_> {
         target: &crate::ast::Expr,
         value: &crate::ast::Expr,
     ) -> Result<bool, LowerError> {
-        let Some(tb_field) = self.ctx.tb_field.as_deref() else {
-            return Ok(false);
-        };
-        // target = Field { Field { Ident(_tb), xfield }, sub }
+        // target = `_tb.<xfield>.<sub>` (testbench-field instance) or
+        // `<xfield>.<sub>` (test-scope-let instance, bare name).
         let ExprKind::Field { target: mid, name: sub } = &*target.kind else {
             return Ok(false);
         };
-        let ExprKind::Field { target: root_expr, name: xfield } = &*mid.kind else {
-            return Ok(false);
+        let xfield_name = match &*mid.kind {
+            ExprKind::Field { target: root_expr, name: xfield } => {
+                let ExprKind::Ident(root) = &*root_expr.kind else {
+                    return Ok(false);
+                };
+                if Some(root.name.as_str()) != self.ctx.tb_field.as_deref() {
+                    return Ok(false);
+                }
+                xfield.name.clone()
+            }
+            ExprKind::Ident(id) if self.ctx.bare_transactor_fields.contains(&id.name) => {
+                id.name.clone()
+            }
+            _ => return Ok(false),
         };
-        let ExprKind::Ident(root) = &*root_expr.kind else {
-            return Ok(false);
-        };
-        if root.name != tb_field {
-            return Ok(false);
-        }
-        let Some(&xid) = self.ctx.transactor_fields.get(&xfield.name) else {
+        let xfield = &xfield_name;
+        let Some(&xid) = self.ctx.transactor_fields.get(xfield) else {
             return Ok(false);
         };
         let schema = &self.ctx.transactors[xid.index()];
@@ -790,7 +812,7 @@ impl FuncBuilder<'_> {
             return Err(unsupported(
                 &format!(
                     "assignment to transactor field `{}.{}`",
-                    xfield.name, sub.name
+                    xfield, sub.name
                 ),
                 "only the module-typed DUT bind is lowered",
             ));
@@ -804,7 +826,7 @@ impl FuncBuilder<'_> {
             return Err(unsupported(
                 &format!(
                     "binding `{}.{}` to something other than the test DUT",
-                    xfield.name, sub.name
+                    xfield, sub.name
                 ),
                 "",
             ));

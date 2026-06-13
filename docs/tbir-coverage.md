@@ -87,7 +87,7 @@ Residual first-blocker map for the other 16 (re-run of
 | Moved to group | Fixtures |
 |---|---|
 | `bus` (3) | `axilite_regs_full_test`, `bind_remap_test`, `transactor_parse_test` |
-| `regblock` (7) | `regblock_basic_test`, `regblock_fields_test`, `regblock_access_test`, `regblock_bitbash_test`, `regblock_addrmap_test`, `regblock_alias_test`, `regblock_record_test` |
+| `regblock` (7) | `regblock_basic_test`, `regblock_fields_test`, `regblock_access_test`, `regblock_bitbash_test`, `regblock_addrmap_test`, `regblock_alias_test`, `regblock_record_test` — **regblock slice landed 2026-06-12; see the `regblock` construct group below for the per-fixture residual map (all 7 still blocked on the bus-bound `via` helper / field-level access / addrmap).** |
 | `scoreboard` (2) | `analysis_sink_connect_test`, `axilite_env_test` |
 | `tseq` (2) | `axilite_seqdrv_test`, `transactor_active_test` |
 | transactor state fields (1) | `axilite_hooks_test` — "transactor `HookXactor` state field `last_read`" (scalar state on the transactor; needs instance-state materialization) |
@@ -102,6 +102,46 @@ with this construct's owner.
 *+ `mshr_cocotb_test` (moved here 2026-06-12 by the singleton batch:
 its former `const` blocker is resolved, the next blocker is its
 `MshrXactor` transactor).*
+
+### `regblock` construct — PARTIALLY RESOLVED 2026-06-12 (regblock slice)
+
+The `regblock` register-level frontdoor subset now lowers (synthetic
+mirror value-record + `RegblockSchema`; `regs.NAME = v` / `let x =
+regs.NAME` → mirror `RecordFieldWrite`/`Expr::RecordField` + the
+existing `CallTarget::TransactorMethod` `write`/`read` call edges; rw/ro/
+wo policies + reset values + read-side mirror predict; test-scope
+unbound-transactor helper). No new IR variants — see docs/tbir-mvp.md
+divergence 12.
+
+The first-blocker caveat applied in full: **zero** of the 7 corpus
+fixtures became fully lowerable — every one's `via` helper is a
+`transactor ... bound to BusAxiLite`, the **bus-bound helper form** that
+is the dominant residual blocker (its method bodies resolve the `bus`
+keyword against a test-scope bus binding, which the IR pipeline does not
+model yet). Since the group produced no registrable corpus row, the
+slice added a new fixture, `regblock_subset_test` (`top_counter.sv`,
+pass — rw/ro/wo + reset + frontdoor + read-predict + WO mirror-read,
+over a test-scope unbound-transactor helper), registered in the
+equivalence registry.
+
+Residual first-blocker map (re-run of `harc dump-ir`, 2026-06-12):
+
+| Next blocker | Fixtures |
+|---|---|
+| bus-bound `via` helper (`transactor AxilHelper bound to BusAxiLite`) | `regblock_basic_test`, `regblock_access_test`, `regblock_bitbash_test`, `regblock_record_test` |
+| field-level decomposition (`field <name> : <ty> @ <bit>` + `regs.REG.FIELD`) | `regblock_fields_test`, `regblock_addrmap_test` |
+| `addrmap` construct (chip-level composition) | `regblock_alias_test` |
+
+The blocker reported is whichever out-of-subset construct lowering hits
+first in file order. `regblock_fields_test` / `regblock_addrmap_test`
+reach their `field` declarations before the (also-blocking) bus-bound
+helper because the regblock decl now lowers far enough to parse fields;
+`regblock_alias_test` has no `field`s and reaches its `addrmap`. All 7
+ultimately need the bus-bound helper; `fields`/`addrmap` additionally
+need field-level access (and `addrmap`/`alias` need the `addrmap`
+construct + `alias of`). The passive `record_*` API + per-register `on`
+callbacks (`regblock_record_test`) and `bitbash` (`regblock_bitbash_test`)
+are further deferred features behind the bus-bound helper.
 
 ### `transaction` construct — RESOLVED 2026-06-12 (transaction slice)
 

@@ -17,6 +17,7 @@ mod covergroups;
 mod exprs;
 mod helpers;
 mod records;
+mod regblock;
 mod scoreboards;
 mod stmts;
 mod transactors;
@@ -28,9 +29,9 @@ use crate::ast::{
 };
 use crate::ir::{
     self, BasicBlock, BlockId, ClockSpec, CovgroupId, CovgroupSchema, FunctionId, FunctionKind,
-    IrType, LocalId, RecordId, RecordSchema, ScoreboardId, ScoreboardSchema, TbFunction, TbProgram,
-    TestSchema, TestbenchId, TestbenchSchema, Terminator, TransactorId, TransactorSchema,
-    TypedLocal, TypedParam,
+    IrType, LocalId, RecordId, RecordSchema, RegblockId, ScoreboardId, ScoreboardSchema,
+    TbFunction, TbProgram, TestSchema, TestbenchId, TestbenchSchema, Terminator, TransactorId,
+    TransactorSchema, TypedLocal, TypedParam,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -202,6 +203,32 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             record_schemas.push(schema);
         }
     }
+    // Regblock schemas (`regblock` declarations), in file order. The
+    // mirror is a synthetic value-record (one scalar field per
+    // register), pushed into the records table right after the
+    // transactions so its `RecordId` is stable; the `RegblockSchema`
+    // carries the offset/width/access metadata access lowering needs.
+    // The regblock name doubles as the mirror record's name, so a
+    // `let regs : R` resolves `R` to the synthetic record via
+    // `record_ids` exactly like a transaction local.
+    let mut regblock_ids: HashMap<String, RegblockId> = HashMap::new();
+    let mut regblock_schemas: Vec<ir::RegblockSchema> = Vec::new();
+    for it in &file.items {
+        if let Item::Regblock(r) = it {
+            let name = &r.name.name;
+            if record_ids.contains_key(name) {
+                return Err(LowerError::Invalid(format!(
+                    "regblock `{name}` collides with a transaction of the same name"
+                )));
+            }
+            let rec_id = RecordId(record_schemas.len() as u32);
+            let (rec, schema) = regblock::lower_regblock(r, rec_id)?;
+            record_ids.insert(name.clone(), rec_id);
+            record_schemas.push(rec);
+            regblock_ids.insert(name.clone(), RegblockId(regblock_schemas.len() as u32));
+            regblock_schemas.push(schema);
+        }
+    }
 
     // Helper functions: categorize pure vs impure, reject recursion.
     // Pure helpers lower eagerly below; impure helpers are CFG-inlined
@@ -266,7 +293,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             // Scoreboard declarations already lowered to schemas above
             // (with their own Unsupported rejections); they are inert
             // until a testbench binds one as a field.
-            | Item::Scoreboard(_) => {}
+            | Item::Scoreboard(_)
+            | Item::Regblock(_) => {}
             // `extend` was already folded by merge_for_sim; a survivor
             // means the merge didn't apply (e.g. dump-ir on a lone
             // extension file).
@@ -306,6 +334,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         covgroups,
         records: record_schemas,
         scoreboards: scoreboard_schemas,
+        regblocks: regblock_schemas,
         ..TbProgram::default()
     };
 
@@ -335,6 +364,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         tb_scalar_fields: HashSet::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
+        regblock_bindings: HashMap::new(),
+        regblock_init_order: Vec::new(),
+        bare_transactor_fields: HashSet::new(),
     };
     for it in &file.items {
         let Item::Function(fd) = it else { continue };
@@ -379,6 +411,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &domains,
             &covgroup_ids,
             &record_ids,
+            &regblock_ids,
             &buses,
             &consts,
             &helper_registry,
@@ -540,6 +573,7 @@ fn lower_test(
     domains: &HashMap<String, i64>,
     covgroup_ids: &HashMap<String, CovgroupId>,
     record_ids: &HashMap<String, RecordId>,
+    regblock_ids: &HashMap<String, RegblockId>,
     buses: &HashMap<String, &BusDecl>,
     consts: &HashMap<String, u64>,
     helpers: &helpers::HelperRegistry<'_>,
@@ -555,6 +589,15 @@ fn lower_test(
     let mut bare_stmts: Vec<&AstStmt> = Vec::new();
     let mut bus_bindings: Vec<ir::BusBindingSchema> = Vec::new();
     let mut bus_binding_decls: HashMap<String, BusDecl> = HashMap::new();
+    // Regblock bindings (`let regs : R = bind <helper>`), collected here
+    // and validated after the testbench's transactor fields are known
+    // (the `<helper>` must be an active transactor field). Each tuple is
+    // (binding name, regblock id, helper field name).
+    let mut regblock_binds: Vec<(String, RegblockId, String)> = Vec::new();
+    // Test-scope unbound-transactor instances (`let h : Xactor active`),
+    // accessed by bare name. Merged into `transactor_fields` after the
+    // testbench-field walk; collected here as (name, transactor id).
+    let mut test_scope_xactors: Vec<(String, TransactorId)> = Vec::new();
     // Test-scope `let`s (beyond `dut`/`_tb`/bus binds), hoisted to the
     // head of the run body in item order — v1 hoists them to `main`
     // scope before the coroutine, initialized once, and the coroutine
@@ -610,6 +653,107 @@ fn lower_test(
                 }
                 bus_bindings.push(schema);
                 bus_binding_decls.insert(l.name.name.clone(), owned);
+            }
+            // Regblock binding: `let regs : DmaRegs = bind <helper>`.
+            TestItem::Let(l)
+                if l.bind
+                    && type_simple_name(l.ty.as_ref())
+                        .is_some_and(|n| regblock_ids.contains_key(n)) =>
+            {
+                if !l.probes.is_empty() {
+                    return Err(unsupported("probe declarations on a regblock binding", ""));
+                }
+                if !l.bind_remap.is_empty() {
+                    return Err(unsupported("bind remaps on a regblock binding", ""));
+                }
+                let rb_name = type_simple_name(l.ty.as_ref()).unwrap();
+                let rbid = regblock_ids[rb_name];
+                // RHS must be a bare helper-instance identifier (the
+                // transactor field the frontdoor routes through).
+                let helper_field = match l.value.as_ref().map(|v| &*v.kind) {
+                    Some(ExprKind::Ident(id)) => id.name.clone(),
+                    _ => {
+                        return Err(unsupported(
+                            &format!(
+                                "regblock binding `{}` to a non-identifier helper",
+                                l.name.name
+                            ),
+                            "only `= bind <helper>` (a transactor instance) is lowered",
+                        ));
+                    }
+                };
+                regblock_binds.push((l.name.name.clone(), rbid, helper_field));
+            }
+            // Test-scope unbound-transactor instance: `let h : MemHelper
+            // active` (no `= bind`). v1 routes regblock frontdoor calls
+            // and bare `h.method(...)` through a test-scope-let helper
+            // (it lives in v1's `let_types`), so the IR registers it as a
+            // transactor instance accessed by its BARE name (not
+            // `_tb.h` — test-scope lets aren't rewritten by the impl-for
+            // desugaring). The DUT bind `h.dut = dut` and method calls
+            // resolve through the same `transactor_fields` machinery as a
+            // testbench-field instance.
+            TestItem::Let(l)
+                if !l.bind
+                    && type_simple_name(l.ty.as_ref())
+                        .is_some_and(|n| prog.transactors.iter().any(|x| x.name == n)) =>
+            {
+                if !l.probes.is_empty() {
+                    return Err(unsupported(
+                        "probe declarations on a transactor instance",
+                        "",
+                    ));
+                }
+                if l.value.is_some() {
+                    return Err(unsupported(
+                        &format!("transactor instance `let {}` with an initializer", l.name.name),
+                        "transactor instances default-construct; bind the DUT with \
+                         `{}.dut = dut` in the body",
+                    ));
+                }
+                let simple = type_simple_name(l.ty.as_ref()).unwrap();
+                // Require an explicit `active` mode (matching the
+                // testbench-field rule: every method lives in `when
+                // active`, so a passive instance has none).
+                match l.ty.as_ref() {
+                    Some(TypeExpr::Named { mode: Some(TransactorMode::Active), .. }) => {}
+                    Some(TypeExpr::Named { mode: Some(TransactorMode::Passive), .. }) => {
+                        return Err(unsupported(
+                            &format!(
+                                "passive transactor instance `let {} : {simple} passive`",
+                                l.name.name
+                            ),
+                            "methods inside `when active` do not exist on a passive instance",
+                        ));
+                    }
+                    _ => {
+                        return Err(unsupported(
+                            &format!(
+                                "transactor instance `let {} : {simple}` without an \
+                                 `active`/`passive` mode",
+                                l.name.name
+                            ),
+                            "",
+                        ));
+                    }
+                }
+                let xid = ir::TransactorId(
+                    prog.transactors.iter().position(|x| x.name == simple).unwrap() as u32,
+                );
+                let xdut = &prog.transactors[xid.index()].dut_type;
+                if let Some(dt) = &dut_type {
+                    if xdut != dt {
+                        return Err(unsupported(
+                            &format!(
+                                "transactor instance `{}` whose DUT field type `{xdut}` \
+                                 differs from the test DUT type `{dt}`",
+                                l.name.name
+                            ),
+                            "",
+                        ));
+                    }
+                }
+                test_scope_xactors.push((l.name.name.clone(), xid));
             }
             TestItem::Let(l) => {
                 if !l.probes.is_empty() || l.bind {
@@ -781,6 +925,23 @@ fn lower_test(
             }
         }
     }
+    // Merge test-scope-let transactor instances into the transactor
+    // field set so the call/bind/regblock machinery resolves them
+    // uniformly. They are accessed by their BARE name (test-scope lets
+    // aren't `_tb`-prefixed by the desugaring), recorded separately so
+    // resolution knows which access shape to expect.
+    let bare_transactor_fields: HashSet<String> =
+        test_scope_xactors.iter().map(|(n, _)| n.clone()).collect();
+    for (name, xid) in &test_scope_xactors {
+        if transactor_fields.iter().any(|(f, _)| f == name) {
+            return Err(LowerError::Invalid(format!(
+                "name `{name}` is both a testbench transactor field and a test-scope \
+                 transactor instance in test `{}`",
+                t.name.name
+            )));
+        }
+        transactor_fields.push((name.clone(), *xid));
+    }
     // Bus bindings (test-scope `let`s) and transactor fields (testbench
     // component fields) share the `CallTarget::TransactorMethod`
     // bus_field namespace; a name living in both would dispatch
@@ -795,6 +956,86 @@ fn lower_test(
         }
     }
 
+    // Resolve regblock bindings now the transactor fields are known: the
+    // `via <helper>` instance must be an active transactor field, and
+    // that transactor must declare the frontdoor `write(addr, data)` /
+    // `read(addr) -> data` methods. Build the per-binding access context
+    // (carried in `LowerCtx`) plus the schema (carried for dump-ir).
+    let transactor_field_ids: HashMap<&str, ir::TransactorId> = transactor_fields
+        .iter()
+        .map(|(f, x)| (f.as_str(), *x))
+        .collect();
+    let mut regblock_bindings_map: HashMap<String, regblock::RegblockBindingCtx> = HashMap::new();
+    let mut regblock_binding_schemas: Vec<ir::RegblockBinding> = Vec::new();
+    let mut regblock_init_order: Vec<String> = Vec::new();
+    for (binding, rbid, helper_field) in &regblock_binds {
+        if regblock_bindings_map.contains_key(binding) {
+            return Err(LowerError::Invalid(format!(
+                "duplicate regblock binding `{binding}` in test `{}`",
+                t.name.name
+            )));
+        }
+        // The binding name doubles as the mirror local; a name shared
+        // with a bus binding, a transactor field, or a plain test-scope
+        // let would shadow ambiguously at the access site. Reject.
+        if bus_binding_decls.contains_key(binding)
+            || transactor_fields.iter().any(|(f, _)| f == binding)
+            || test_let_names.contains(binding)
+        {
+            return Err(LowerError::Invalid(format!(
+                "name `{binding}` is a regblock binding and also a bus binding, transactor \
+                 instance, or test-scope let in test `{}` — rename one",
+                t.name.name
+            )));
+        }
+        let Some(&xid) = transactor_field_ids.get(helper_field.as_str()) else {
+            return Err(unsupported(
+                &format!(
+                    "regblock binding `{binding}` via `{helper_field}` (not an active \
+                     transactor field of the testbench)"
+                ),
+                "the `via` helper must be a `transactor` instance that pokes the DUT; the \
+                 bus-bound helper form is a follow-up slice",
+            ));
+        };
+        // Validate the frontdoor methods exist at the expected arity so
+        // a malformed helper fails at lowering, not at C++ compile.
+        let xschema = &prog.transactors[xid.index()];
+        for (m, n) in [("write", 2usize), ("read", 1usize)] {
+            match xschema.method(m) {
+                Some(ms) if ms.n_params == n => {}
+                Some(ms) => {
+                    return Err(LowerError::Invalid(format!(
+                        "regblock `via` helper `{}` method `{m}` takes {} argument(s), \
+                         the frontdoor needs {n}",
+                        xschema.name, ms.n_params
+                    )));
+                }
+                None => {
+                    return Err(LowerError::Invalid(format!(
+                        "regblock `via` helper `{}` has no `{m}(addr, data)`-style method",
+                        xschema.name
+                    )));
+                }
+            }
+        }
+        let rb = &prog.regblocks[rbid.index()];
+        regblock_bindings_map.insert(
+            binding.clone(),
+            regblock::RegblockBindingCtx {
+                record: rb.record,
+                helper_field: helper_field.clone(),
+                registers: rb.registers.clone(),
+            },
+        );
+        regblock_binding_schemas.push(ir::RegblockBinding {
+            field: binding.clone(),
+            regblock: *rbid,
+            helper_field: helper_field.clone(),
+        });
+        regblock_init_order.push(binding.clone());
+    }
+
     let tb_id = TestbenchId(prog.testbenches.len() as u32);
     prog.testbenches.push(TestbenchSchema {
         name: tb_schema_name,
@@ -805,6 +1046,7 @@ fn lower_test(
         bus_bindings: bus_bindings.clone(),
         transactor_fields: transactor_fields.clone(),
         scoreboard_fields: scoreboard_fields.clone(),
+        regblock_bindings: regblock_binding_schemas,
         synthetic,
     });
 
@@ -866,6 +1108,9 @@ fn lower_test(
         tb_scalar_fields: scalar_fields.iter().map(|f| f.name.clone()).collect(),
         tb_methods,
         test_scope_lets: test_let_names,
+        regblock_bindings: regblock_bindings_map,
+        regblock_init_order,
+        bare_transactor_fields,
     };
 
     // Synthesized auto-sampler functions, one per covergroup field, in
@@ -1099,6 +1344,23 @@ pub(crate) struct LowerCtx {
     /// and check are separate IR functions, so v1's shared-capture
     /// scoping is not representable.
     pub test_scope_lets: HashSet<String>,
+    /// Register-block bindings (`let regs : R = bind <helper>`) →
+    /// per-binding access context (mirror record, helper field,
+    /// registers). Empty for helper/method/synthetic contexts.
+    pub regblock_bindings: HashMap<String, regblock::RegblockBindingCtx>,
+    /// Regblock binding names in declaration order. The Run function
+    /// declares + `RecordInit`s each mirror local at entry, in this
+    /// order — v1 declares the `<Name>_Mirror` struct once at the
+    /// hoisted-let site. The mirror is run-scoped (a check-phase access
+    /// is a precise rejection, like a test-scope let).
+    pub regblock_init_order: Vec<String>,
+    /// Transactor instances declared as test-scope lets (`let h :
+    /// Xactor active`) rather than testbench fields. Accessed by their
+    /// BARE name (`h.method(...)`, `h.dut = dut`) — the impl-for
+    /// desugaring rewrites testbench-field access to `_tb.<field>` but
+    /// leaves test-scope lets unqualified, so resolution must accept
+    /// both shapes. A subset of `transactor_fields` keys.
+    pub bare_transactor_fields: HashSet<String>,
 }
 
 pub(crate) struct LoopFrame {
@@ -1181,6 +1443,19 @@ fn lower_function<'a>(
 ) -> Result<TbFunction, LowerError> {
     let mut b = FuncBuilder::new(ctx, helpers);
     b.in_check = kind == FunctionKind::Check;
+    // Regblock mirror locals: declared + default-constructed (to their
+    // reset values) at the head of the Run function, mirroring v1's
+    // single `<Name>_Mirror regs;` declaration at the hoisted-let site.
+    // Run-scoped — a check-phase regblock access fails the binding
+    // lookup and is rejected precisely (like a test-scope let).
+    if kind == FunctionKind::Run {
+        for binding in &ctx.regblock_init_order {
+            let rec = ctx.regblock_bindings[binding].record;
+            let id = b.declare(binding);
+            b.set_local_type(id, IrType::Record(rec));
+            b.push(ir::Stmt::RecordInit(id, rec));
+        }
+    }
     for s in stmts {
         b.lower_stmt(s)?;
     }

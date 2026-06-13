@@ -62,6 +62,19 @@ v1's 16-cycle-budget valid/ready dance), and **blocking `tlm_method`
 calls**, which lower to `Expr::Call(CallTarget::TransactorMethod {
 bus_field, method }, args)` — the design doc's sequence→transactor
 call edge, never inlined at the IR level.
+The `regblock`
+construct subset (added 2026-06-12, `src/ir/lower/regblock.rs`):
+register-block declarations (`register NAME @ ADDR [reset V] access
+rw|ro|wo`) lower to a synthetic mirror value-record plus a
+`RegblockSchema`; `let regs : R = bind <helper>` over a test-scope
+unbound-transactor helper; and the **register-level frontdoor** —
+`regs.NAME = v` (mirror update + `Helper.write` call edge, RO
+suppressed) and `let x = regs.NAME` (`Helper.read` call edge + mirror
+predict, WO served from mirror). No new IR variants: the mirror is an
+`IrType::Record` and traffic reuses the `CallTarget::TransactorMethod`
+edge. Field-level access, `bitbash`, the `record_*` passive API,
+per-register `on` callbacks, `addrmap`, and the bus-bound `via` helper
+are explicit rejections (see divergence 12).
 `transactor` declarations lower in their **unbound DUT-poking BFM
 subset**: no `bound to <BusType>`, no generics, exactly one
 module-typed field (the DUT handle — its type must match the test's
@@ -190,6 +203,7 @@ none — `extra_harc` joins additional `tests/fixtures/` files to the
 | `buf_mgr_sm_test` | `BufMgrSm` | `buf_mgr_sm.sv` + 3 | pass | transactor: `if` inside `for` with waits, multi-file DUT |
 | `buf_mgr_test` | `BufMgr` | `buf_mgr.sv` + 4 | pass | transactor: `while` over port read, `return dut.port`, assert in method |
 | `scoreboard_basic_test` | `Top` | `top_counter.sv` | pass | scoreboard: queue push/pop/size/empty, scalar counter read/write, run↔check-shared `_tb` instance |
+| `regblock_subset_test` | `Top` | `top_counter.sv` | pass | regblock: rw/ro/wo + reset, register-level frontdoor (mirror + Helper.write/read call edges), read-predict, WO mirror-read, test-scope-let helper |
 
 (The registry has since grown past this table via the backfill sweep —
 see [tbir-coverage.md](tbir-coverage.md); the registry file is the
@@ -422,6 +436,65 @@ reason. Code locations are authoritative.
      param-override layering only `EmitOpts` has), `out_of_order`
      method calls, and `fork`/`join_all` TLM issue (needs the design's
      `Terminator::Fork` + `ForkArmKind::BusMethodCall`).
+
+12. **Regblock subset (2026-06-12): register-level frontdoor over a
+    transactor helper, with the mirror modeled as a synthetic record.**
+    (`src/ir/lower/regblock.rs`, `RegblockSchema` in `src/ir/mod.rs`.)
+    - *No new IR variants.* A `regblock R via <Helper> [width N]`
+      lowers to a synthetic value-record (`TbProgram::records`, one
+      scalar field per register, defaulting to its reset value) plus a
+      `RegblockSchema` carrying offset/width/access metadata. The mirror
+      local is an `IrType::Record`, so the host-side state rides the
+      existing `RecordInit` / `RecordFieldWrite` / `Expr::RecordField`
+      machinery — exactly the shape v1's `<Name>_Mirror` POD struct
+      holds. Frontdoor traffic lowers to the existing
+      `Stmt::TransactorCall` (`CallTarget::TransactorMethod`) edge.
+      So no Stmt/Expr/Terminator variant was added; the verifier and
+      both backends inherit regblock for free.
+    - *Two access shapes lowered, register-level only.*
+      `regs.NAME = v` → mirror `RecordFieldWrite` then a discarded
+      `Helper.write(off, v)` call edge (RW/WO); RO suppresses the bus
+      write (mirror update only). `let x = regs.NAME` → a
+      `Helper.read(off)` call edge into the new local then a
+      read-predict `RecordFieldWrite` (RW/RO); WO serves from the mirror
+      with no bus traffic. This mirrors v1's `resolve_regblock_field_*` +
+      `RegAccess::{reads,writes}_to_bus` emission and its read-side
+      predict.
+    - *Register reads only lower in `let`-RHS position.* v1 reads the
+      bus inline at every read site (a C++ assignment-expression
+      `(regs.NAME = read())` usable in any rvalue position, evaluating
+      the message arm lazily). The IR's statement model can't represent
+      that without a hoist that changes the bus-read count, so a
+      register read in an assert condition, log/fail message, or branch
+      operand is an explicit `Unsupported` — never silently rewritten to
+      a mirror read (the mirror IS a record local, so the record-field
+      path would otherwise pick it up). Hoist the read into a `let`
+      first.
+    - *Test-scope unbound-transactor helper.* v1 routes the regblock
+      frontdoor only through a helper that lives in its `let_types`
+      (i.e. a test-scope `let h : Helper active`), not a testbench
+      field. The IR previously modeled transactor instances only as
+      testbench fields, so this slice also added test-scope-let
+      transactor instances (`let h : Xactor active`, accessed by bare
+      name — the impl-for desugaring leaves test-scope lets unqualified,
+      where testbench fields become `_tb.<field>`), merged into the same
+      `transactor_fields` machinery (`bare_transactor_fields` records
+      which shape to expect). The mirror is **run-scoped**: a
+      check-phase regblock access fails the binding lookup and is a
+      precise rejection, like a test-scope let.
+    - *Rejected, never mis-lowered:* the **bus-bound `via` helper**
+      (`transactor H bound to BusT` — the dominant residual blocker for
+      the corpus `regblock_*` fixtures, whose method bodies resolve
+      `bus` against a test-scope bus binding), field-level decomposition
+      (`regs.REG.FIELD`), `bitbash(regs)`, the passive
+      `record_write`/`record_read` API, per-register `on regs.REG`
+      callbacks, `addrmap` composition (incl. `alias of`), non-literal
+      register offsets/reset values, and >64-bit register widths. Each
+      is an `Unsupported` naming the deferred feature. New fixture:
+      `regblock_subset_test` (`top_counter.sv`, pass) exercises
+      rw/ro/wo + reset values + mirror predict + WO mirror-read +
+      test-scope-let helper routing, registered in the equivalence
+      registry.
 
 10. **Transactor instance state is not materialized.** v1 emits a
     per-transactor C++ struct (DUT pointer member + heartbeat fields),

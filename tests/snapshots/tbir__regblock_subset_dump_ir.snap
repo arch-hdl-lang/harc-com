@@ -1,0 +1,83 @@
+---
+source: tests/tbir.rs
+assertion_line: 2517
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 RegblockTb { dut: Top } xactor h=x0 regblock regs=rb0 via h
+  test RegblockSubsetTest tb=tb0 run=fn2 check=- clock=clk@10000ps(SysDomain)
+  record r0 DmaRegs
+    CTRL : uint<32> default 7
+    SRC : uint<32>
+    STATUS : uint<32>
+    CMD : uint<32>
+  transactor x0 RegHelper { dut: Top }
+    method write(2 args) = fn0
+    method read(1 arg) -> ret = fn1
+  regblock rb0 DmaRegs mirror=r0
+    register CTRL @ 0x0 width 32 access rw
+    register SRC @ 0x18 width 32 access rw
+    register STATUS @ 0x4 width 32 access ro
+    register CMD @ 0x20 width 32 access wo
+
+fn fn0 RegHelper_write [kind=TransactorBody(x0)]
+  params:
+    addr : uint<8>
+    data : uint<32>
+  locals:
+    %0 addr : uint<8>
+    %1 data : uint<32>
+  entry = b0
+
+  b0:
+    DutWrite(dut.en, 1)
+    -> Return
+
+fn fn1 RegHelper_read [kind=TransactorBody(x0)]
+  params:
+    addr : uint<8>
+  locals:
+    %0 addr : uint<8>
+    %1 __ret : unknown
+  ret = %__ret
+  entry = b0
+
+  b0:
+    DutWrite(dut.en, 0)
+    Assign(%__ret, %addr)
+    -> Return
+
+fn fn2 run_RegblockSubsetTest [kind=Run, owner=tb0]
+  locals:
+    %0 regs : record(r0)
+    %1 src : unknown
+    %2 st : unknown
+    %3 cmd : unknown
+  entry = b0
+
+  b0:
+    RecordInit(%regs, r0)
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.en, 0)
+    -> WaitCycles(2, b1)
+
+  b1:
+    DutWrite(dut.rst, 0)
+    -> WaitCycles(1, b2)
+
+  b2:
+    RecordFieldWrite(%regs.SRC, 305419896)
+    TransactorCall(h.write(24, 305419896))
+    TransactorCall(%src = h.read(24))
+    RecordFieldWrite(%regs.SRC, %src)
+    AssertCheck { cond: (%src == 24), on_fail: "SRC frontdoor read mismatch" }
+    RecordFieldWrite(%regs.STATUS, 99)
+    TransactorCall(%st = h.read(4))
+    RecordFieldWrite(%regs.STATUS, %st)
+    AssertCheck { cond: (%st == 4), on_fail: "STATUS RO read mismatch" }
+    RecordFieldWrite(%regs.CMD, 42)
+    TransactorCall(h.write(32, 42))
+    Assign(%cmd, %regs.CMD)
+    AssertCheck { cond: (%cmd == 42), on_fail: "CMD WO mirror read mismatch" }
+    Log(info, "PASS: src=%lld st=%lld cmd=%lld", %src, %st, %cmd)
+    -> Return

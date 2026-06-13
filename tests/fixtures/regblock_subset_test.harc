@@ -1,0 +1,82 @@
+// TB-IR regblock subset fixture — register-level frontdoor over an
+// unbound DUT-poking helper (docs/tbir-mvp.md §regblock).
+//
+// Exercises: regblock declaration with reset values + rw/ro/wo access
+// policies; mirror init (RecordInit) to reset values; register-level
+// write (`regs.NAME = v` → mirror RecordFieldWrite + Helper.write call
+// edge, RO suppressed); register-level read (`let x = regs.NAME` →
+// Helper.read call edge + mirror predict, WO served from mirror); and a
+// test-scope unbound-transactor `let h : Helper active` routed through
+// the same transactor-call machinery as a testbench-field instance.
+//
+// Helper methods are wait-free pure pokes (matching cpu_pipeline_test's
+// pattern) so the v1/tbir trace timing is identical; `read` echoes the
+// register offset so the round-trip value is deterministic under both
+// codegens (no DUT post-write eval-timing dependence).
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor RegHelper
+    dut : Top
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            dut.en = 1
+        end write
+
+        hookable read(addr: uint<8>) -> uint<32>
+            dut.en = 0
+            return addr
+        end read
+    end when
+end transactor RegHelper
+
+regblock DmaRegs via RegHelper width 32
+    register CTRL    @ 0x00 reset 7 access rw
+    register SRC     @ 0x18 access rw
+    register STATUS  @ 0x04 access ro
+    register CMD     @ 0x20 access wo
+end regblock DmaRegs
+
+testbench RegblockTb
+    dut : Top
+end testbench RegblockTb
+
+impl RegblockSubsetTest for RegblockTb
+    clock clk = SysDomain
+    let h    : RegHelper active
+    let regs : DmaRegs = bind h
+
+    run
+        h.dut = dut
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // RW round-trip: write then read back. The read returns the
+        // register's offset (0x18) via the echo helper.
+        regs.SRC = 305419896           // 0x12345678 — drives the bus
+        let src = regs.SRC
+        assert src == 0x18
+            else fail("SRC frontdoor read mismatch")
+
+        // RO write is suppressed (mirror updated, no bus traffic); the
+        // read still goes to the bus and returns the offset 0x04.
+        regs.STATUS = 99
+        let st = regs.STATUS
+        assert st == 0x04
+            else fail("STATUS RO read mismatch")
+
+        // WO read serves from the mirror (no bus traffic) — returns the
+        // value just written, not the bus echo.
+        regs.CMD = 42
+        let cmd = regs.CMD
+        assert cmd == 42
+            else fail("CMD WO mirror read mismatch")
+
+        log(info, "PASS: src=${src} st=${st} cmd=${cmd}")
+    end run
+end impl RegblockSubsetTest
