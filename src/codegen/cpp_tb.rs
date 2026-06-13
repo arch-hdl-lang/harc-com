@@ -591,6 +591,185 @@ fn sanitize_file_component(name: &str) -> String {
     }
 }
 
+/// Build a *focused* `Emitter` for the TB-IR backend's randomize seam.
+///
+/// The tbir backend (`codegen/tbir`) lowers `randomize` through
+/// `Terminator::Randomize`, but the actual Z3-solve emission is v1's
+/// (`emit_constraint_solver_block` & friends) — "the constraint runtime
+/// is shared; only the call site moves to the IR backend". This builds
+/// the minimal Emitter those methods read from: transaction field
+/// metadata, enum domains, relation declarations, and the runtime
+/// problem-id table. Everything else is empty — the randomize emission
+/// touches no other Emitter state. (Listing every field explicitly is
+/// deliberate: a future field addition fails to compile here, forcing a
+/// reviewer to decide whether the randomize path needs it.)
+fn build_randomize_emitter(file: &SourceFile, opts: &EmitOpts) -> Emitter {
+    // The tbir backend already desugars impl-for before lowering, so the
+    // `file` handed here is classic-form; desugar again is idempotent and
+    // keeps the problem-table spans aligned with v1.
+    let file = desugar_impl_for_test_in_file(file);
+    let file = &file;
+
+    let typed_solver_problem_table =
+        crate::solver::problem_table::build_typed_solver_problem_table(file);
+    let mut runtime_randomize_problem_ids = std::collections::HashMap::new();
+    for entry in &typed_solver_problem_table.entries {
+        let crate::solver::problem_table::TypedSolverProblemSource::RandomizeSite { span, .. } =
+            entry.source
+        else {
+            continue;
+        };
+        if let crate::solver::problem_table::TypedSolverProblemBuild::Z3 { typed, .. } =
+            &entry.build
+        {
+            runtime_randomize_problem_ids.insert((span.start, span.end), typed.problem_id.0);
+        }
+    }
+
+    // Record-field metadata: same collection the main emission path runs
+    // (record_fields/record_bodies → flatten_*_field_infos), restricted
+    // to the inputs the constraint solver block consumes.
+    let mut record_fields: std::collections::HashMap<String, Vec<Field>> =
+        std::collections::HashMap::new();
+    let mut enum_domains: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut enums: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut enum_variants: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
+    let mut relations: std::collections::HashMap<String, RelationDecl> =
+        std::collections::HashMap::new();
+    for it in &file.items {
+        match it {
+            Item::Enum(e) => {
+                enums.insert(e.name.name.clone(), e.variants.len());
+                enum_domains.insert(
+                    e.name.name.clone(),
+                    e.variants.iter().map(|v| v.name.clone()).collect(),
+                );
+                for (i, v) in e.variants.iter().enumerate() {
+                    enum_variants.entry(v.name.clone()).or_insert(i as i64);
+                }
+            }
+            Item::Relation(r) => {
+                relations.insert(r.name.name.clone(), r.clone());
+            }
+            _ => {}
+        }
+    }
+    for it in &file.items {
+        match it {
+            Item::Struct(s) => {
+                record_fields.insert(s.name.name.clone(), s.fields.clone());
+            }
+            Item::Transaction(t) => {
+                record_fields.insert(t.name.name.clone(), txn_direct_fields(&t.body));
+            }
+            _ => {}
+        }
+    }
+    let mut txn_fields: std::collections::HashMap<String, Vec<TxnFieldInfo>> =
+        std::collections::HashMap::new();
+    for it in &file.items {
+        match it {
+            Item::Transaction(t) => {
+                txn_fields.insert(
+                    t.name.name.clone(),
+                    flatten_txn_body_field_infos(&t.body, &record_fields, &enums, &enum_domains),
+                );
+            }
+            Item::Struct(s) => {
+                txn_fields.insert(
+                    s.name.name.clone(),
+                    flatten_record_field_infos(&s.fields, &record_fields, &enums, &enum_domains),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    Emitter {
+        out: String::new(),
+        errors: Vec::new(),
+        txn_fields,
+        record_fields,
+        txn_keeps: std::collections::HashMap::new(),
+        probes: std::collections::HashMap::new(),
+        regblocks: std::collections::HashMap::new(),
+        addrmaps: std::collections::HashMap::new(),
+        let_helper: std::collections::HashMap::new(),
+        runtime_randomize_problem_ids,
+        relations,
+        pointer_vars: std::collections::HashSet::new(),
+        let_types: std::collections::HashMap::new(),
+        let_widths: std::collections::HashMap::new(),
+        vec_lane_widths: opts.vec_lane_widths.clone(),
+        let_modes: std::collections::HashMap::new(),
+        transactions: std::collections::HashSet::new(),
+        structs: std::collections::HashSet::new(),
+        scoreboards: std::collections::HashSet::new(),
+        covergroups: std::collections::HashMap::new(),
+        covers: Vec::new(),
+        field_subs: std::collections::HashMap::new(),
+        enums,
+        enum_variants,
+        properties: std::collections::HashMap::new(),
+        prop_subs: std::collections::HashMap::new(),
+        event_types: std::collections::HashMap::new(),
+        clock_names: Vec::new(),
+        current_yield_target: None,
+        tseq_names: std::collections::HashSet::new(),
+        components: std::collections::HashMap::new(),
+        buses: std::collections::HashMap::new(),
+        bus_bindings: std::collections::HashMap::new(),
+        bus_param_envs: std::collections::HashMap::new(),
+        dut_bus_port_overrides: opts.dut_bus_port_overrides.clone(),
+        bus_remap: std::collections::HashMap::new(),
+        pending_tlm_forks: Vec::new(),
+        next_tlm_fork_tag: std::collections::HashMap::new(),
+        in_coroutine: false,
+        actor_threads: Vec::new(),
+        mt: opts.mt,
+        driver_bus_for_hookables: std::collections::HashMap::new(),
+        transactors: std::collections::HashMap::new(),
+        current_component_instance: None,
+        current_component_method: None,
+    }
+}
+
+/// Emit the v1 Z3-solve C++ snippet for each TB-IR `ConstraintSite`, in
+/// table order. The returned `Vec` is indexed by `ConstraintRef.0`, so a
+/// `Terminator::Randomize { constraints: ConstraintRef(i), .. }` splices
+/// in `snippets[i]`. Each snippet is emitted at `depth` indentation
+/// levels and is byte-identical to what v1 emits at the same site (the
+/// constraints arrive pre-merged from lowering — transaction keeps ahead
+/// of the `with {...}` body — so this path runs v1's dispatch without
+/// re-doing the merge). `Err` if any site reports an emission error.
+pub fn emit_randomize_snippets(
+    file: &SourceFile,
+    opts: &EmitOpts,
+    sites: &[crate::ir::ConstraintSite],
+    depth: usize,
+) -> Result<Vec<String>, EmitError> {
+    if sites.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut e = build_randomize_emitter(file, opts);
+    let mut out = Vec::with_capacity(sites.len());
+    for site in sites {
+        e.out.clear();
+        e.errors.clear();
+        e.emit_randomize_for_site(site, depth);
+        if let Some(err) = e.errors.first() {
+            return Err(EmitError(format!(
+                "tbir randomize({}): {err}",
+                site.record
+            )));
+        }
+        out.push(std::mem::take(&mut e.out));
+    }
+    Ok(out)
+}
+
 pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitError> {
     // Desugar `impl <name> for <TbType>` tests into the classic
     // `test <name>` form before any other emission work runs. The
@@ -5086,6 +5265,38 @@ impl Emitter {
     fn pad(&mut self, depth: usize) {
         for _ in 0..depth {
             self.out.push_str(INDENT);
+        }
+    }
+
+    /// Emit one TB-IR `ConstraintSite` as the v1 randomize C++ snippet.
+    ///
+    /// Mirrors v1's `StmtKind::Randomize` dispatch *after* the
+    /// transaction-keep merge (the IR lowering already merged keeps ahead
+    /// of the `with {...}` body and stored the result in `site`). So this
+    /// runs the same `report_runtime_dependent_randomize_field_attrs`
+    /// validation, the same solver-policy-field check, and routes to the
+    /// same unconstrained-PRNG-shell or `emit_constraint_solver_block`
+    /// path — producing byte-identical output to v1 for the site.
+    pub(crate) fn emit_randomize_for_site(&mut self, site: &crate::ir::ConstraintSite, depth: usize) {
+        let ty = site.record.clone();
+        let target = &site.target;
+        let combined = &site.constraints;
+        self.report_runtime_dependent_randomize_field_attrs(&ty);
+        let has_solver_policy_fields = self.txn_fields.get(&ty).is_some_and(|fields| {
+            fields
+                .iter()
+                .any(|f| field_attr_unique(f) || !auto_coverage_values(f).is_empty())
+        });
+        if combined.is_empty() && !has_solver_policy_fields {
+            if !self.emit_runtime_unconstrained_randomize_call(&ty, target, depth) {
+                self.pad(depth);
+                write!(self.out, "randomize_{ty}(&").ok();
+                self.emit_expr(target);
+                writeln!(self.out, ");").ok();
+            }
+            self.emit_randomize_trace_event(&ty, target, depth);
+        } else {
+            self.emit_constraint_solver_block(&ty, target, combined, site.blocking, depth);
         }
     }
 

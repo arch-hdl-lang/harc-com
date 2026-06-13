@@ -23,6 +23,13 @@ fn lower_src(src: &str) -> Result<ir::TbProgram, lower::LowerError> {
     lower::lower_program(&merged)
 }
 
+/// Merged `SourceFile` for one source string (the input `tbir::emit`
+/// needs for the constraint-IR / randomize seam — empty otherwise).
+fn merged_src(src: &str) -> harc::ast::SourceFile {
+    let parsed = parse_source(src).expect("fixture parses");
+    merge::merge_for_sim(std::slice::from_ref(&parsed), None).expect("merge")
+}
+
 /// Multi-file variant for fixtures that split helpers across files
 /// (mirrors how run_fixtures.sh loads them).
 fn lower_fixtures(names: &[&str]) -> Result<ir::TbProgram, lower::LowerError> {
@@ -38,9 +45,10 @@ fn lower_fixtures(names: &[&str]) -> Result<ir::TbProgram, lower::LowerError> {
 /// with default options (the `--sv` Verilator path the equivalence
 /// harness exercises).
 fn emit_fixture_cpp(name: &str) -> String {
-    let prog = lower_src(&fixture(name)).expect("lowers");
+    let merged = merged_src(&fixture(name));
+    let prog = lower::lower_program(&merged).expect("lowers");
     verify::verify_program(&prog).expect("verifies");
-    tbir::emit(&prog, &cpp_tb::EmitOpts::default()).expect("emits")
+    tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits")
 }
 
 /// The negative-test contract: every out-of-subset fixture must produce
@@ -173,17 +181,25 @@ fn transactor_fixture_is_unsupported() {
 
 /// Randomize/constraint fixture (`randomize(t) with` + Z3 constraints,
 /// loaded together with its helper file exactly as run_fixtures.sh
-/// does) is outside the MVP subset. Its `transaction` declaration now
-/// lowers (records slice), so the rejection shifted to the
-/// statement-level `randomize` gate pointing at the constraint-IR
-/// seam — exactly the shift docs/tbir-mvp.md §"Negative tests"
-/// predicted.
+/// does) now lowers through the constraint-IR seam: every `randomize`
+/// site becomes a `Terminator::Randomize` carrying a `ConstraintRef`.
+/// (Was a negative test before this slice; see git history.)
 #[test]
-fn randomize_fixture_is_unsupported() {
-    let err = lower_fixtures(&["axilite_constraint_test.harc", "axilite_regs_test.harc"])
-        .unwrap_err();
-    let msg = assert_unsupported(&err);
-    insta::assert_snapshot!("axilite_constraint_unsupported", msg);
+fn randomize_fixture_lowers() {
+    let prog = lower_fixtures(&["axilite_constraint_test.harc", "axilite_regs_test.harc"])
+        .expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    assert!(
+        !prog.constraint_sites.is_empty(),
+        "the `randomize(p) with` site lowered into a constraint site"
+    );
+    let randomize_blocks = prog
+        .functions
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .filter(|b| matches!(b.terminator, ir::Terminator::Randomize { .. }))
+        .count();
+    assert!(randomize_blocks >= 1, "a Randomize terminator is present");
 }
 
 /// Agent/event fixture (`agent`, `event<T>`) is outside the MVP
@@ -486,9 +502,10 @@ fn lower_coroutine_leaves_ir_untouched_and_is_deterministic() {
 /// calls: untimed/timed awaiters and the timeout diagnostic text.
 #[test]
 fn tbir_emit_wait_until_runtime_calls() {
-    let prog = lower_src(&fixture("wait_until_counter_test.harc")).expect("lowers");
+    let merged = merged_src(&fixture("wait_until_counter_test.harc"));
+    let prog = lower::lower_program(&merged).expect("lowers");
     verify::verify_program(&prog).expect("verifies");
-    let cpp = tbir::emit(&prog, &cpp_tb::EmitOpts::default()).expect("emits");
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
     for marker in [
         "bool _wu_satisfied = co_await harc_rt::wait_until_timeout(_slot, \
          [&]{ return (harc_rt::harc_read(dut->count_out) == 8); }, (uint32_t)_wu_budget);",
@@ -501,11 +518,17 @@ fn tbir_emit_wait_until_runtime_calls() {
     }
 }
 
+/// `randomize(t)` now lowers to a `Terminator::Randomize` carrying a
+/// `ConstraintRef` into the program's constraint-site table, and the
+/// tbir backend splices in v1's Z3-solve snippet (the constraint-IR
+/// seam — `docs/tbir-mvp.md` §"randomize"). A bare `randomize(t)` of a
+/// keep-free transaction routes through the unconstrained-PRNG shell.
 #[test]
-fn randomize_is_unsupported() {
+fn randomize_lowers_to_terminator() {
     let src = r#"
 transaction Req
     addr : uint<32>
+    keep addr % 4 == 0
 end transaction Req
 
 test RandTest
@@ -516,17 +539,34 @@ test RandTest
     end run
 end test RandTest
 "#;
-    let err = lower_src(src).unwrap_err();
-    let msg = err.to_string();
-    // The `transaction` declaration and the `let t : Req` lower fine
-    // now (records slice); the statement-level `randomize` gate fires
-    // and points at the constraint-IR seam.
-    assert!(msg.contains("`randomize`"), "names randomize: {msg}");
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    // One constraint site, carrying the merged keep set and a problem id.
+    assert_eq!(prog.constraint_sites.len(), 1, "one randomize site");
+    let site = &prog.constraint_sites[0];
+    assert_eq!(site.record, "Req");
+    assert_eq!(site.constraints.len(), 1, "transaction keep merged in");
+    assert!(site.problem_id.is_some(), "Z3-ready problem id");
+    // The run function ends a block with a Randomize terminator.
+    let run = prog.function(prog.tests[0].run);
     assert!(
-        msg.contains("constraint-IR seam"),
-        "points at the constraint seam: {msg}"
+        run.blocks
+            .iter()
+            .any(|b| matches!(b.terminator, ir::Terminator::Randomize { .. })),
+        "a Randomize terminator is present"
     );
-    assert!(msg.contains("--codegen v1"), "suggests v1: {msg}");
+    // tbir emits the v1 Z3-solve block (constraint-IR seam reused).
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
+    assert!(cpp.contains("z3::solver"), "Z3 solve block emitted");
+    assert!(
+        cpp.contains("#include \"harc_z3_rt.h\""),
+        "z3 runtime header included"
+    );
+    assert!(
+        cpp.contains("trace.randomize("),
+        "randomize trace event emitted"
+    );
 }
 
 // ── Transaction value-records (non-randomize usage) ─────────────────
@@ -1184,9 +1224,10 @@ end test BreakTest
 /// call — and sync, not co_await, mirroring v1's lambda-body waits).
 #[test]
 fn tbir_emit_helper_mix() {
-    let prog = lower_src(HELPER_MIX_SRC).expect("lowers");
+    let merged = merged_src(HELPER_MIX_SRC);
+    let prog = lower::lower_program(&merged).expect("lowers");
     verify::verify_program(&prog).expect("verifies");
-    let cpp = tbir::emit(&prog, &cpp_tb::EmitOpts::default()).expect("emits");
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
     for marker in [
         "static uint64_t harc_helper_double_it(uint64_t x);",
         "static uint64_t harc_helper_double_it(uint64_t x) {",
@@ -1308,9 +1349,10 @@ fn verifier_catches_bad_wait_clock() {
 /// rising edges, then run the checkers.
 #[test]
 fn tbir_emit_wait_on_clock_inline_loop() {
-    let prog = lower_src(WAIT_ON_CLOCK_SRC).expect("lowers");
+    let merged = merged_src(WAIT_ON_CLOCK_SRC);
+    let prog = lower::lower_program(&merged).expect("lowers");
     verify::verify_program(&prog).expect("verifies");
-    let cpp = tbir::emit(&prog, &cpp_tb::EmitOpts::default()).expect("emits");
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
     for marker in [
         "{ long long _target = clocks_[1].rising_count + (long long)(2); \
          while (clocks_[1].rising_count < _target) {",
@@ -1462,9 +1504,10 @@ fn verifier_rejects_port_in_assign_value() {
 /// struct, seed log, coroutine slot, loop-switch, dispatcher main.
 #[test]
 fn tbir_emit_scaffolding_contract() {
-    let prog = lower_src(&fixture("top_counter_test.harc")).expect("lowers");
+    let merged = merged_src(&fixture("top_counter_test.harc"));
+    let prog = lower::lower_program(&merged).expect("lowers");
     verify::verify_program(&prog).expect("verifies");
-    let cpp = tbir::emit(&prog, &cpp_tb::EmitOpts::default()).expect("emits");
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
     for marker in [
         "#include \"VTop.h\"",
         "struct HarcTestContext {",
@@ -1793,9 +1836,10 @@ end impl CovTest
 /// reads — all shapes that must match v1's runtime-observable output.
 #[test]
 fn tbir_emit_covergroup_contract() {
-    let prog = lower_src(&fixture("sync_fifo_test.harc")).expect("lowers");
+    let merged = merged_src(&fixture("sync_fifo_test.harc"));
+    let prog = lower::lower_program(&merged).expect("lowers");
     verify::verify_program(&prog).expect("verifies");
-    let cpp = tbir::emit(&prog, &cpp_tb::EmitOpts::default()).expect("emits");
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
     for marker in [
         "struct FifoCov {",
         "uint64_t yes = 0;",
@@ -1841,9 +1885,10 @@ fn cov_cross_bins_emitted_cpp_snapshot() {
 /// for the declared pair, and the row-major sample update.
 #[test]
 fn tbir_emit_declared_cross_contract() {
-    let prog = lower_src(&fixture("cov_cross_bins_test.harc")).expect("lowers");
+    let merged = merged_src(&fixture("cov_cross_bins_test.harc"));
+    let prog = lower::lower_program(&merged).expect("lowers");
     verify::verify_program(&prog).expect("verifies");
-    let cpp = tbir::emit(&prog, &cpp_tb::EmitOpts::default()).expect("emits");
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
     for marker in [
         "uint64_t _cross_2_cp_count__cp_en[6] = {};",
         "if (((_v >= 0 && _v <= 3))) { _tb.cov.cp_count.low++; _cg_hit_cp_count[0] = true; }",
@@ -1867,12 +1912,13 @@ fn tbir_emit_declared_cross_contract() {
 /// the CLI; this locks the library-level contract).
 #[test]
 fn tbir_emit_rejects_mt() {
-    let prog = lower_src(&fixture("top_counter_test.harc")).expect("lowers");
+    let merged = merged_src(&fixture("top_counter_test.harc"));
+    let prog = lower::lower_program(&merged).expect("lowers");
     let opts = cpp_tb::EmitOpts {
         mt: true,
         ..Default::default()
     };
-    let err = tbir::emit(&prog, &opts).unwrap_err();
+    let err = tbir::emit(&prog, &merged, &opts).unwrap_err();
     assert!(err.0.contains("--mt"), "{}", err.0);
 }
 

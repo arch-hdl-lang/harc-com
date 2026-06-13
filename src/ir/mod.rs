@@ -66,6 +66,12 @@ ir_id!(
     /// Index into `TbProgram::components`.
     ComponentId
 );
+ir_id!(
+    /// Index into `TbProgram::constraint_sites` — the handle a
+    /// `Terminator::Randomize` carries into the constraint-IR layer.
+    /// See `ConstraintSite` and the `Terminator::Randomize` doc.
+    ConstraintRef
+);
 
 /// Whole-program IR for one merged HARC source file (post
 /// `merge_for_sim` + impl-for desugaring).
@@ -92,6 +98,50 @@ pub struct TbProgram {
     /// and the `env`s that compose them), in file order. See
     /// `ComponentSchema`.
     pub components: Vec<ComponentSchema>,
+    /// Constraint-IR sites — the table a `Terminator::Randomize`'s
+    /// `ConstraintRef` indexes. One entry per lowered `randomize(t)` /
+    /// `randomize(t) with {...}` site. See `ConstraintSite`.
+    pub constraint_sites: Vec<ConstraintSite>,
+}
+
+/// One `randomize` site, resolved into the constraint-IR layer.
+///
+/// This is the data a `Terminator::Randomize`'s `ConstraintRef` resolves
+/// to. The design pins `ConstraintRef` as "a handle into the constraint
+/// IR, not a copy"; `problem_id` IS that handle (an index into the
+/// `build_typed_solver_problem_table` problem table). The remaining
+/// fields are the *emission inputs* v1's constraint-solver codegen
+/// already consumes (`emit_constraint_solver_block`): the source
+/// `target` expression, the combined constraint set (transaction-level
+/// `keep`s merged ahead of the call-site `with {...}` body, exactly as
+/// v1 merges them), the record type name, and the blocking flag.
+///
+/// **Divergence from the AST-free ideal (documented):** the IR core
+/// otherwise holds no `ast::Expr`. The randomize seam carries the AST
+/// constraint expressions because v1's Z3 emission is AST-driven and the
+/// slice reuses it verbatim ("the constraint runtime is shared; only the
+/// call site moves to the IR backend") rather than reimplementing the
+/// solver. See `docs/tbir-mvp.md` for the divergence record.
+#[derive(Debug, Clone)]
+pub struct ConstraintSite {
+    /// Record type name (`transaction`/`struct`) of the target local.
+    pub record: String,
+    /// Source `randomize(t)` target expression — the join key v1 uses
+    /// for the per-site solver cache tag and the problem-table lookup.
+    pub target: crate::ast::Expr,
+    /// Combined constraint set: transaction `keep`s first, then the
+    /// call-site `with {...}` body (v1's merge order). Empty for a bare
+    /// `randomize(t)` of a keep-free transaction (the unconstrained
+    /// PRNG-shell path).
+    pub constraints: Vec<crate::ast::Expr>,
+    /// `randomize(t)` (false) vs blocking `randomize(t) with ...` (the
+    /// AST `blocking` flag) — selects v1's queued vs blocking solve shell.
+    pub blocking: bool,
+    /// Problem-table handle (`ConstraintProblemId.0`) when the typed
+    /// constraint IR built a Z3-ready problem for this site; `None` when
+    /// the site has no solver problem (lower/backend error — v1 then
+    /// emits the nullptr-descriptor fallback, mirrored here).
+    pub problem_id: Option<u32>,
 }
 
 /// One `regblock` declaration, lowered to its register-level subset
@@ -933,6 +983,19 @@ pub enum Terminator {
         on_fire: BlockId,
         on_timeout: BlockId,
     },
+    /// `randomize(t)` / `randomize(t) with {...}` — solve the target
+    /// record's constraint set and write the solved field values back
+    /// into the `target` local, then resume at `succ`.
+    ///
+    /// A terminator (not a `Stmt`) per the design: it is a potential
+    /// host-sync point on any placement-split backend, so every backend
+    /// must make an explicit decision about it. `constraints` is the
+    /// handle into the constraint-IR layer (`TbProgram::constraint_sites`).
+    Randomize {
+        target: LocalId,
+        constraints: ConstraintRef,
+        succ: BlockId,
+    },
     Return,
     Fatal(FmtArgs),
 }
@@ -1237,6 +1300,7 @@ impl Terminator {
                 on_timeout,
                 ..
             } => vec![*on_fire, *on_timeout],
+            Terminator::Randomize { succ, .. } => vec![*succ],
             Terminator::Return | Terminator::Fatal(_) => vec![],
         }
     }

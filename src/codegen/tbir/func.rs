@@ -73,6 +73,7 @@ fn cpp_local_names(func: &TbFunction) -> Vec<String> {
 /// is the owning testbench's bus-binding table — the metadata that
 /// expands `CallTarget::TransactorMethod` call edges into the
 /// canonical req/rsp wire protocol.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_function(
     out: &mut String,
     prog: &TbProgram,
@@ -80,6 +81,7 @@ pub(super) fn emit_function(
     records: &[RecordSchema],
     bindings: &[BusBindingSchema],
     lanes: &HashMap<String, u32>,
+    randomize_snippets: &[String],
     depth: usize,
 ) -> Result<(), EmitError> {
     let names = cpp_local_names(func);
@@ -216,6 +218,23 @@ pub(super) fn emit_function(
                     on_fire.0, on_timeout.0
                 )
                 .ok();
+            }
+            Terminator::Randomize {
+                constraints, succ, ..
+            } => {
+                // Splice in v1's Z3-solve snippet for this site (built by
+                // `cpp_tb::emit_randomize_snippets`, indexed by the
+                // `ConstraintRef`, pre-indented at this body depth). The
+                // solve writes the record fields back into the target
+                // local and emits the trace event, exactly like v1.
+                let snippet = randomize_snippets.get(constraints.index()).ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: Randomize in {} references missing constraint snippet c{}",
+                        func.name, constraints.0
+                    ))
+                })?;
+                out.push_str(snippet);
+                writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
         }
         writeln!(out, "{pad3}break;").ok();
@@ -814,9 +833,13 @@ pub(super) fn emit_method(
             | Terminator::WaitCyclesSync(_, _)
             | Terminator::WaitTimePs(_, _)
             | Terminator::WaitUntilTimeout { .. }
+            | Terminator::Randomize { .. }
             | Terminator::Fatal(_)) => {
                 // Lowering rejects these inside method bodies (or, for
-                // Fatal, never produces the terminator at all).
+                // Fatal, never produces the terminator at all). A
+                // `randomize` in a method body is out of subset — the
+                // constraint-IR problem table only catalogs test/tseq
+                // sites, so a method-body solve has no problem-id.
                 return Err(EmitError(format!(
                     "tbir: transactor method `{}` contains terminator {other:?} — \
                      lowering gate failed",
@@ -922,6 +945,7 @@ pub(super) fn emit_component_method(
             | Terminator::WaitCyclesSync(_, _)
             | Terminator::WaitTimePs(_, _)
             | Terminator::WaitUntilTimeout { .. }
+            | Terminator::Randomize { .. }
             | Terminator::Fatal(_)) => {
                 return Err(EmitError(format!(
                     "tbir: component method `{}` contains terminator {other:?} — \

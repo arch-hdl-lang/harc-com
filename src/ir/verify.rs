@@ -135,6 +135,14 @@ pub enum VerifyError {
     },
     /// Cross-IR: a test's run/check FunctionId or TestbenchId resolves.
     BadProgramRef { what: String },
+    /// Invariant 9: a `Terminator::Randomize`'s `ConstraintRef` must
+    /// index `TbProgram::constraint_sites`, and its `target` local must
+    /// be record-typed (the solver writes record fields back into it).
+    DanglingConstraintRef {
+        func: FunctionId,
+        block: BlockId,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for VerifyError {
@@ -235,6 +243,15 @@ impl std::fmt::Display for VerifyError {
                 func.0, block.0
             ),
             VerifyError::BadProgramRef { what } => write!(f, "program: {what}"),
+            VerifyError::DanglingConstraintRef {
+                func,
+                block,
+                detail,
+            } => write!(
+                f,
+                "f{} b{}: dangling Randomize constraint ref ({detail})",
+                func.0, block.0
+            ),
         }
     }
 }
@@ -603,6 +620,35 @@ impl Checker<'_> {
                     self.check_expr(&p.expr, true, "WaitUntilTimeout pred");
                 }
                 self.check_expr(cycles, false, "WaitUntilTimeout cycles");
+            }
+            Terminator::Randomize {
+                target,
+                constraints,
+                ..
+            } => {
+                self.check_local(*target);
+                // Target must be record-typed: the solver writes the
+                // record's fields back into it.
+                if let Some(l) = self.func.locals.get(target.index()) {
+                    if !matches!(l.ty, IrType::Record(_)) {
+                        self.errs.push(VerifyError::DanglingConstraintRef {
+                            func: self.fid,
+                            block: self.bid,
+                            detail: format!(
+                                "target local `{}` is not record-typed",
+                                l.name
+                            ),
+                        });
+                    }
+                }
+                // Invariant 9: the ConstraintRef resolves.
+                if constraints.index() >= self.prog.constraint_sites.len() {
+                    self.errs.push(VerifyError::DanglingConstraintRef {
+                        func: self.fid,
+                        block: self.bid,
+                        detail: format!("c{} out of range", constraints.0),
+                    });
+                }
             }
             Terminator::Fatal(args) => self.check_fmt_args(args),
             Terminator::Jump(_) | Terminator::Return => {}
@@ -1167,6 +1213,14 @@ fn check_def_before_use(
             Terminator::Fatal(args) => {
                 for a in &args.args {
                     check_e(&a.expr, &defined, errs);
+                }
+            }
+            Terminator::Randomize { target, .. } => {
+                // The solver writes the record fields back into `target`;
+                // it is a def, not a use (the record local was already
+                // defined at its `let` RecordInit site).
+                if target.index() < defined.len() {
+                    defined[target.index()] = true;
                 }
             }
             Terminator::Jump(_) | Terminator::Return => {}

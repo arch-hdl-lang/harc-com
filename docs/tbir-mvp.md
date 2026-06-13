@@ -25,6 +25,7 @@ checked against the code at the cited location.
 | #366 | `transactor` declarations (unbound DUT-poking BFM subset): `TransactorSchema` table on `TbProgram`, one `TbFunction` per method (`kind: TransactorBody` — v1's `field_subs` substitution replaced by lowering-time DUT resolution), `Stmt::TransactorCall` carrying the never-inlined `Expr::Call(CallTarget::TransactorMethod ..)` edge, sync-wait method-lambda emission, ternary expressions (`Expr::Ternary`), plus 8 corpus fixtures registered. |
 | #368 | `scoreboard` declarations (data-only host-state subset): `ScoreboardSchema` table on `TbProgram`, scalar-counter + `queue<T>` fields, `Stmt::ScoreboardOp` (`QueuePush`/`QueuePop`/`ScalarWrite`) and `Expr::ScoreboardQuery` (scalar read / `size()` / `empty()`), scoreboard-instance struct emission (`harc_rt::HarcQueue<T>` members) held on the `_tb` struct, plus the self-proving `scoreboard_basic_test` fixture. Scoreboard methods, event-driven `on`/`connect` wiring, and `queue<Struct>` payloads stay rejected (see the divergence note). |
 | env-composition slice (2026-06-13) | env/agent cluster's flat-struct core: `ComponentSchema` table on `TbProgram` (method-bearing scoreboards, analysis-source transactors, composing `env`s), `FunctionKind::ComponentMethod`, `Stmt::{ComponentFieldWrite, ComponentEmit, ComponentCall}`, `Expr::ComponentField`, `ConnectEdgeSchema`. `connect` (analysis-port → scoreboard sink), scoreboard methods (instance state materialized), and `out event`/`emit` lower; the `analysis_sink_connect_test` corpus fixture is registered. `agent`/`on`-handlers, `sequencer`/`tseq`, watchdog/phase, `idle`/`quiesced` predicates stay rejected (divergence 14). |
+| #372 | `randomize` via the constraint-IR seam: `Terminator::Randomize { target, constraints: ConstraintRef, succ }` + a `TbProgram::constraint_sites` table (the `ConstraintRef` handle resolves into it). Lowering merges transaction `keep`s ahead of the call-site `with {...}` body (spec §4) and records each site with its `ConstraintProblemId` handle. The tbir backend reuses v1's Z3-solve emission verbatim (`cpp_tb::emit_randomize_snippets` → `emit_constraint_solver_block` / unconstrained-PRNG shell / `emit_randomize_trace_event`) — "the constraint runtime is shared; only the call site moves to the IR backend." The runtime problem table + `harc_z3_rt.h` include are emitted iff a site exists. New passes wiring: `lower_coroutine` treats Randomize as a host-sync transition (`Trigger::Solved`); `placement` tiers a solve block at Tier-2 host-service and capability-checks `solve_*`. Fixtures: `keep_constraints_test` (bare `randomize(t)` + transaction keeps), `axilite_constraint_test` (`randomize(p) with` + Z3 cross-field constraints). Both trace-diff clean v1↔tbir at seed 1. `randomize` *expressions* (`let v = randomize(t)`), scoreboard-`.push`/`tseq`-gated randomize fixtures, and method-body randomize stay rejected (residual map below). |
 
 ### Construct subset
 
@@ -174,8 +175,11 @@ and rejected at the field/decl, never mis-lowered: non-scalar /
 >64-bit fields (`Vec<...>`, nested structs — the residual blocker for
 the `tlm_pairing_arch_burst_*` fixtures), non-literal defaults, and
 `keep`/`when` items in a struct body (constraint / tagged-ADT
-machinery deferred with `randomize`). Everything else —
-`randomize` (awaits the constraint-IR `ConstraintRef` seam),
+machinery deferred with `randomize`; transaction-body `keep`s now lower
+into the constraint-IR seam, but struct-body `keep`/`when` still don't).
+Everything else —
+`randomize` *expressions* (`let v = randomize(t)` — only the
+statement/terminator form lowers in #372) and method-body `randomize`,
 `agent`/`event`, bus-bound/event-driven transactors, transactor state
 fields, passive instances, scoreboard *methods* / event-driven
 `on`/`connect` wiring / `queue<Struct>` payloads (the data-only
@@ -434,10 +438,11 @@ reason. Code locations are authoritative.
    clauses and `with [...]` field attributes are pretty-printed into
    inert strings (`RecordSchema::keeps`, `RecordFieldSchema::
    attr_src`) for dump-ir visibility; nothing may interpret them.
-   When `randomize` lands, the constraint layer (`src/constraints`,
-   `elaborate_constraints` → `CTypedProblem`) re-elaborates from the
-   AST and the randomize terminator carries a `ConstraintRef` handle
-   into that layer — the inert strings are *not* the seam. Three
+   `randomize` (#372) re-elaborates constraints from the AST through
+   the constraint layer (`src/constraints`, `elaborate_constraints` →
+   `CTypedProblem`); the randomize terminator carries a `ConstraintRef`
+   handle into `TbProgram::constraint_sites` — the inert `RecordSchema`
+   strings are *not* the seam (see divergence 13). Three
    subset edges, all explicit rejections (never silent): `when`
    subtype blocks (v1 flattens their fields into the struct;
    deferred until the tagged-ADT story lands with randomize),
@@ -716,6 +721,33 @@ reason. Code locations are authoritative.
       `analysis_sink_connect_test` (`top_counter.sv`, pass) — env + two
       method-bearing scoreboards + analysis source + two connect edges,
       registered in the equivalence registry.
+14. **Randomize seam carries AST constraints (2026-06-13).** The design
+    pins `ConstraintRef` as "a handle into the constraint IR, not a
+    copy." The shipped `ConstraintRef` IS a pure handle — `ConstraintRef(u32)`
+    indexing `TbProgram::constraint_sites` — and the *true* solver handle
+    it pairs with is `ConstraintSite::problem_id`, the
+    `ConstraintProblemId` into `build_typed_solver_problem_table`. **But**
+    each `ConstraintSite` also carries the AST `target` expression and the
+    merged AST constraint set (`Vec<ast::Expr>`). This is a deliberate
+    divergence from the IR's otherwise AST-free discipline: v1's Z3-solve
+    codegen (`emit_constraint_solver_block`) is AST-driven, and this slice
+    *reuses it verbatim* ("the constraint runtime is shared; only the call
+    site moves to the IR backend") rather than reimplementing the solver
+    over the typed constraint IR. The tbir backend builds a focused v1
+    `Emitter` (`build_randomize_emitter`) and splices the per-site snippet
+    (`emit_randomize_snippets`, indexed by `ConstraintRef`) into the
+    loop-switch. Consequences: (a) the IR core gains one `ast::Expr`
+    dependency, confined to `ConstraintSite`; (b) the target local's
+    emitted C++ name must equal its source name (true for all record
+    locals — they are never on the loop-switch `RESERVED` list); (c)
+    transaction `keep`s are merged into the site at lowering (spec §4),
+    so the v1 dispatch runs keep-free of its own merge. When the typed
+    constraint IR grows a complete AST-free Z3 emitter, this AST payload
+    can be dropped and `emit_randomize_for_site` retargeted at
+    `problem_id` alone. Verifier invariant 9 is now checked (the
+    `ConstraintRef` resolves and the target is record-typed —
+    `DanglingConstraintRef`). `keep_constraints_test` and
+    `axilite_constraint_test` trace-diff clean v1↔tbir.
 
 Minor, same spirit: `IndexVec` is a plain `Vec` plus typed id structs;
 the design's `AssertFail` enum collapsed into a single
@@ -732,9 +764,12 @@ Implemented: invariants 1–4, 6, 8 (amended), 10, 15, plus the
 port-position rule and the transactor-call seam rule (divergence 9 —
 position, function kind, binding/method/arity resolution; the
 seam-rule half of design invariant 11's intent, ported from `Fork`
-arms to the call-edge form actually produced). By construction: 5, 7
+arms to the call-edge form actually produced). Invariant 9 (every
+`Terminator::Randomize`'s `ConstraintRef` resolves, and its target is
+record-typed) is now checked via `DanglingConstraintRef` (divergence
+14). By construction: 5, 7
 (with the documented `TransactorMethod` exception). Not implemented:
-9 (no `ConstraintRef` in the IR yet), 11 (no `Fork`), 12 (no DUT port
+11 (no `Fork`), 12 (no DUT port
 table — see divergence 1), 13 (not separately checked; the
 port-position rule covers the `PortRef` half), 14 and 16 (the v0
 front end does not type-check, so `IrType::Unknown` is the common
@@ -742,9 +777,12 @@ case and only locally-determinable `Assign` types are compared).
 
 ## Negative tests: where rejection actually fires
 
-The randomize fixture (`axilite_constraint_test.harc`) and the
-agent/event fixture (`wait_until_quiesce_test.harc`) are registered as
-must-reject tests. Until the transaction slice, both tripped the
+As of #372 the randomize fixtures are no longer must-reject: both
+`keep_constraints_test` and `axilite_constraint_test` lower and
+trace-diff clean against v1 (the old `axilite_constraint_unsupported`
+snapshot was retired). The agent/event fixture
+(`wait_until_quiesce_test.harc`) remains a registered must-reject test.
+Until the transaction slice, both tripped the
 **item-level** gate on their `transaction` declarations before any
 deeper construct was reached — the file-level scan in
 `src/ir/lower/mod.rs` runs before body lowering — so the snapshot
@@ -755,10 +793,9 @@ names the `agent` construct (next item in file order),
 with the transactor slice: that fixture's transactor now passes the
 item gate, so the snapshot names `tseq` (its event-driven transactor
 body would also reject, but `tseq` sits earlier in the file-gate
-order) — and
-`axilite_constraint_unsupported` is the statement-level `randomize`
-rejection pointing at the constraint-IR seam. The same mechanics
-apply to the next construct slice: a fixture's snapshot always names
+order). The `axilite_constraint` fixture was the last member of this
+group and has since left it — `randomize` lowers as of #372. The same
+mechanics apply to the next construct slice: a fixture's snapshot always names
 whichever out-of-subset construct lowering hits first, and shifts
 deeper as slices land. The per-fixture residual map for the whole
 former `transaction` group lives in
@@ -776,15 +813,19 @@ see its decision log):
 - **Passes** (plan phase 7): `placement` over a `TargetProfile`,
   `randomize_analysis`, `extract_port_set`, `hoist_stimulus`,
   `lower_coroutine` for FSM-shaped backends.
-- **Subset growth**: randomize (needs the constraint-IR
-  `ConstraintRef` seam; transaction *declarations* and non-randomize
-  record usage landed 2026-06-12, as did range/cross bins, `any of`,
-  the bus subset, and unbound DUT-poking transactors — the
-  initiator-side `CallTarget::TransactorMethod` call edge is produced
-  by both bus `tlm_method` lowering and transactor-field call
-  lowering; bus-bound and event-driven transactor forms await the
-  event slice), `fork` (incl. `ForkArmKind::BusMethodCall` for the
-  OOO TLM lanes), scoreboards, agents/events.
+- **Subset growth**: randomize statement/terminator form + the
+  constraint-IR `ConstraintRef` seam landed 2026-06-13 (#372); the
+  residual randomize edges are the *expression* form (`let v =
+  randomize(t)`), method-body randomize, and randomize sites gated
+  behind not-yet-lowered constructs (`tseq`, scoreboard `.push`). Other
+  growth: transaction *declarations* and non-randomize record usage
+  landed 2026-06-12, as did range/cross bins, `any of`, the bus subset,
+  and unbound DUT-poking transactors — the initiator-side
+  `CallTarget::TransactorMethod` call edge is produced by both bus
+  `tlm_method` lowering and transactor-field call lowering; bus-bound
+  and event-driven transactor forms await the event slice. Remaining:
+  `fork` (incl. `ForkArmKind::BusMethodCall` for the OOO TLM lanes),
+  agents/events.
 - **Placement-split backends** proceed per the multi-target placement
   model in [tb-ir-design.md](tb-ir-design.md) (tiers, timing classes,
   `TargetProfile` capability checks) once the passes exist.

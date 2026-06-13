@@ -170,11 +170,11 @@ impl FuncBuilder<'_> {
             } => self.lower_wait_until(*mode, conditions, timeout.as_ref()),
             // ── Explicit unsupported stubs (MVP) ────────────────────
             StmtKind::After { .. } => Err(unsupported("`after N cycles` blocks", "")),
-            StmtKind::Randomize { .. } => Err(unsupported(
-                "`randomize`",
-                "transaction randomization awaits the constraint-IR seam \
-                 (`ConstraintRef` into src/constraints)",
-            )),
+            StmtKind::Randomize {
+                blocking,
+                target,
+                with_body,
+            } => self.lower_randomize(*blocking, target, with_body),
             StmtKind::Fork(_) | StmtKind::JoinAll { .. } => Err(unsupported("`fork`/`join`", "")),
             StmtKind::Parallel(_) => Err(unsupported("`parallel`", "")),
             StmtKind::Schedule(_) => Err(unsupported("`schedule`", "")),
@@ -896,6 +896,78 @@ impl FuncBuilder<'_> {
             ));
         }
         Ok(true)
+    }
+
+    /// `randomize(t)` / `randomize(t) with {...}` → `Terminator::Randomize`.
+    ///
+    /// Resolves the target record local, builds the constraint-IR site
+    /// (transaction `keep`s merged ahead of the `with {...}` body — v1's
+    /// spec-§4 merge order — plus the typed-problem-id handle), records
+    /// it in the program-wide constraint table, and terminates the
+    /// current block with `Randomize { target, constraints, succ }`.
+    fn lower_randomize(
+        &mut self,
+        blocking: bool,
+        target: &crate::ast::Expr,
+        with_body: &[crate::ast::Expr],
+    ) -> Result<(), LowerError> {
+        // The target must be a bare record-typed local (`let t : Txn`).
+        // v1 rejects non-ident / non-record targets with the same intent;
+        // mirror that as a precise lowering error.
+        let ExprKind::Ident(id) = &*target.kind else {
+            return Err(unsupported(
+                "`randomize` of a non-identifier target",
+                "randomize a record-typed local declared with `let t : <Transaction>`",
+            ));
+        };
+        let Some(local) = self.lookup(&id.name) else {
+            return Err(LowerError::Invalid(format!(
+                "randomize({}): `{}` is not in scope",
+                id.name, id.name
+            )));
+        };
+        let Some(record_id) = self.record_of_local(local) else {
+            return Err(LowerError::Invalid(format!(
+                "randomize({0}): `{0}` is not a transaction/struct local — declare it with \
+                 `let {0} : <Transaction>`",
+                id.name
+            )));
+        };
+        let record = self.ctx.records[record_id.index()].name.clone();
+
+        // Spec §4: transaction-level `keep`s are part of every
+        // `randomize(t)` of that type. Merge them ahead of the call-site
+        // `with {...}` body, exactly as v1's `StmtKind::Randomize` arm.
+        let mut constraints: Vec<crate::ast::Expr> = Vec::new();
+        if let Some(keeps) = self.ctx.txn_keeps.get(&record) {
+            constraints.extend(keeps.iter().cloned());
+        }
+        constraints.extend(with_body.iter().cloned());
+
+        // Problem-id handle (constraint-IR layer), keyed by target span
+        // exactly like v1's `runtime_randomize_problem_id`.
+        let problem_id = self
+            .ctx
+            .randomize_problem_ids
+            .get(&(target.span.start, target.span.end))
+            .copied();
+
+        let constraints_ref = self.push_constraint_site(crate::ir::ConstraintSite {
+            record,
+            target: target.clone(),
+            constraints,
+            blocking,
+            problem_id,
+        });
+
+        let succ = self.new_block();
+        self.terminate(Terminator::Randomize {
+            target: local,
+            constraints: constraints_ref,
+            succ,
+        });
+        self.start_block(succ);
+        Ok(())
     }
 
     fn lower_assert(&mut self, v: &crate::ast::Verify) -> Result<(), LowerError> {

@@ -37,8 +37,10 @@ use crate::ast::{
     Stmt as AstStmt, StmtKind, TypeArg, TypeExpr,
 };
 use crate::ir::{
-    CallTarget, Expr, FunctionId, FunctionKind, IrType, Stmt, TbFunction, Terminator, TypedParam,
+    CallTarget, ConstraintSite, Expr, FunctionId, FunctionKind, IrType, Stmt, TbFunction,
+    Terminator, TypedParam,
 };
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 pub(crate) struct HelperEntry<'a> {
@@ -124,8 +126,9 @@ pub(crate) fn lower_pure_helper<'a>(
     decl: &FunctionDecl,
     helpers: &'a HelperRegistry<'a>,
     ctx: &'a LowerCtx,
+    constraint_sites: &'a RefCell<Vec<ConstraintSite>>,
 ) -> Result<TbFunction, LowerError> {
-    let mut b = FuncBuilder::new(ctx, helpers);
+    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
     b.in_pure_helper = true;
     let mut params = Vec::with_capacity(decl.params.len());
     for p in &decl.params {

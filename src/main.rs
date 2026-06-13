@@ -1786,7 +1786,7 @@ fn cmd_sim(
                             lines.join("\n")
                         )
                     })?;
-                    harc::codegen::tbir::emit(&prog, &emit_opts)
+                    harc::codegen::tbir::emit(&prog, &codegen_source, &emit_opts)
                         .map_err(|e| miette::miette!("{}", e))?
                 }
             };

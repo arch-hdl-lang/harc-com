@@ -16,6 +16,7 @@ mod expr;
 mod func;
 mod runtime;
 
+use crate::ast::SourceFile;
 use crate::codegen::cpp_tb::{EmitError, EmitOpts};
 use crate::ir::{self, TbProgram};
 use std::collections::HashSet;
@@ -23,7 +24,7 @@ use std::fmt::Write as _;
 
 const INDENT: &str = "    ";
 
-pub fn emit(prog: &TbProgram, opts: &EmitOpts) -> Result<String, EmitError> {
+pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<String, EmitError> {
     if opts.mt {
         return Err(EmitError(
             "--mt is not supported with --codegen tbir; re-run with --codegen v1".to_string(),
@@ -47,8 +48,32 @@ pub fn emit(prog: &TbProgram, opts: &EmitOpts) -> Result<String, EmitError> {
     }
 
     let test_names: Vec<String> = prog.tests.iter().map(|t| t.name.clone()).collect();
+
+    // Constraint-solver wiring (randomize sites). The runtime problem
+    // table + per-site Z3-solve snippets are emitted by v1's shared
+    // constraint codegen ("only the call site moves to the IR backend").
+    // Empty when the program has no randomize site — the TB then never
+    // links Z3, exactly like v1.
+    let problem_table_cpp = if prog.constraint_sites.is_empty() {
+        String::new()
+    } else {
+        let solver_table =
+            crate::solver::problem_table::build_typed_solver_problem_table(file);
+        let runtime_table =
+            crate::solver::runtime::RuntimeProblemTable::from_typed_solver_table(&solver_table);
+        if runtime_table.problems.is_empty() {
+            String::new()
+        } else {
+            runtime_table.render_cpp_table("_harc_runtime_random_problem_table")
+        }
+    };
+    // Per-`ConstraintRef` Z3-solve snippets, emitted at the loop-switch
+    // body depth (run/check fn = depth 2 → block stmts at depth 5).
+    let randomize_snippets =
+        crate::codegen::cpp_tb::emit_randomize_snippets(file, opts, &prog.constraint_sites, 5)?;
+
     let mut out = String::new();
-    runtime::preamble(&mut out, &dut_type, &test_names);
+    runtime::preamble(&mut out, &dut_type, &test_names, &problem_table_cpp);
 
     // Transaction value-record structs, in declaration order. Mirrors
     // v1's `emit_record_struct` shape (field defaults as member
@@ -127,7 +152,7 @@ pub fn emit(prog: &TbProgram, opts: &EmitOpts) -> Result<String, EmitError> {
     runtime::context_struct(&mut out, &dut_type);
 
     for t in &prog.tests {
-        emit_test(&mut out, prog, t, &dut_type, opts)?;
+        emit_test(&mut out, prog, t, &dut_type, opts, &randomize_snippets)?;
     }
 
     runtime::dispatcher(&mut out, &test_names);
@@ -220,6 +245,7 @@ fn emit_test(
     test: &ir::TestSchema,
     dut_type: &str,
     opts: &EmitOpts,
+    randomize_snippets: &[String],
 ) -> Result<(), EmitError> {
     let tb = prog.testbench(test.testbench);
     let clocked = !test.clocks.is_empty();
@@ -356,6 +382,7 @@ fn emit_test(
         &prog.records,
         &tb.bus_bindings,
         &opts.vec_lane_widths,
+        randomize_snippets,
         2,
     )?;
     if let Some(check) = test.check {
@@ -366,6 +393,7 @@ fn emit_test(
             &prog.records,
             &tb.bus_bindings,
             &opts.vec_lane_widths,
+            randomize_snippets,
             2,
         )?;
     }
