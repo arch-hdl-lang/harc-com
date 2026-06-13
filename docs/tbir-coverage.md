@@ -189,23 +189,43 @@ unlocked fully and pass the v1-vs-tbir equivalence pair —
 edge end-to-end, since every pre-existing TLM fixture also carries a
 deeper blocker.
 
-Residual map for the other 12 (each now stops at its REAL next
-blocker; exact `Unsupported` message in parentheses):
+### target-side TLM / bus-bound transactor — RESOLVED 2026-06-12 (target-TLM slice)
+
+> ~~TB-IR lowering does not support transactor `X` bound to a bus type yet~~
+
+The blocking target-side TLM responder form lowers: `transactor X bound
+to <Bus>` with `thread bus.<method>(...)` responder threads, persistent
+scalar state fields (read/written in the body **and** read from the test
+as `target.<field>`), and the per-instance state struct + one
+background-coroutine actor per target method. See docs/tbir-mvp.md
+divergence 11.
+
+**Registered** (4, all pass the v1-vs-tbir equivalence pair, trace-diff
+clean): `tlm_target_thread_test`, `tlm_target_thread_if_test`,
+`tlm_target_thread_runtime_loop_test`,
+`tlm_target_thread_early_return_test`.
+
+Residual map for the remaining TLM fixtures (each now stops at its REAL
+next blocker; exact `Unsupported` message in parentheses):
 
 | Next blocker | Fixtures |
 |---|---|
-| `transactor` construct (target-side TLM method threads → `FunctionKind::TransactorBody`) | `tlm_target_thread_test`, `tlm_target_thread_if_test`, `tlm_target_thread_runtime_loop_test`, `tlm_target_thread_early_return_test`, `tlm_target_forwarding_test`, `tlm_target_fork_forwarding_test`, `tlm_target_ooo_lanes_test`, `tlm_pairing_arch_initiator_test`, `dma_engine_tlm_target_test`, `dma_engine_tlm_mem_model_test` ("the `transactor` construct") |
-| `fork`/`join_all` TLM issue (needs `Terminator::Fork` + `ForkArmKind::BusMethodCall`) | `tlm_method_bus_test`, `tlm_pairing_arch_target_test`* ("`fork` bus-method calls") |
+| `fork`/`join_all` TLM issue (needs `Terminator::Fork` + `ForkArmKind::BusMethodCall`) | `tlm_method_bus_test`, `tlm_target_fork_forwarding_test`, `tlm_pairing_arch_target_test`* ("`fork` bus-method calls") |
+| `out_of_order tags N` target threads (hidden tag wires + multi-lane response router) | `tlm_target_ooo_lanes_test`, `tlm_pairing_arch_initiator_test` ("serving a `out_of_order` method") |
+| `bind ... with { ... }` signal remaps | `dma_engine_tlm_target_test`, `dma_engine_tlm_mem_model_test` ("bus bind signal remaps") |
+| nested transactor/method call inside a responder body (forwarding to another target) | `tlm_target_forwarding_test` ("transactor/method call `.read(...)`") |
+| initiator-side bus-bound BFM (`hookable` bodies driving handshake channels) | `regblock_basic_test`, `regblock_access_test`, `regblock_bitbash_test`, `regblock_record_test` ("`hookable` (initiator-side method)") |
 
-Both groups' bus prerequisites are in place: the transactor group
-will additionally need `bind ... with { ... }` remaps
-(`dma_engine_tlm_*`) and per-instance state fields; the fork group's
-blocking-call halves already lower.
+The fork group's blocking-call halves already lower; the OOO group needs
+the tagged responder lanes; the remap group needs custom wire naming;
+the forwarding fixture needs nested call edges inside a responder; the
+regblock `via` helpers are the *initiator-side* BFM, a separate slice
+from this target-side responder work.
 
 \* `tlm_pairing_arch_target_test` still does not reach the equivalence
-stage (now fork-blocked rather than bus-blocked), so the known
-local-only Verilator 5.048-vs-CI-5.034 SVA verdict issue on this
-fixture remains moot from CI's perspective.
+stage (fork-blocked), so the known local-only Verilator
+5.048-vs-CI-5.034 SVA verdict issue on this fixture remains moot from
+CI's perspective.
 
 ### `wait N cycles on <clock>` — 5 fixtures — **RESOLVED 2026-06-12**
 

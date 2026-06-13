@@ -227,6 +227,10 @@ none — `extra_harc` joins additional `tests/fixtures/` files to the
 | `scoreboard_basic_test` | `Top` | `top_counter.sv` | pass | scoreboard: queue push/pop/size/empty, scalar counter read/write, run↔check-shared `_tb` instance |
 | `regblock_subset_test` | `Top` | `top_counter.sv` | pass | regblock: rw/ro/wo + reset, register-level frontdoor (mirror + Helper.write/read call edges), read-predict, WO mirror-read, test-scope-let helper |
 | `struct_basic_test` | `Top` | `top_counter.sv` | pass | struct: scalar fields (uint/sint/bool) + literal defaults, default-construct in a loop (re-init), field reads/writes in arithmetic/branch/assert/format args (reuses the transaction record machinery) |
+| `tlm_target_thread_test` | `TlmReadInitiator` | `TlmReadInitiator.sv` | pass | target-side TLM: blocking `thread bus.read` responder actor, single-cycle wait, value return |
+| `tlm_target_thread_if_test` | `TlmReadInitiatorPair` | `TlmReadInitiatorPair.sv` | pass | target-side TLM: persistent state fields (read in body + from test), `for` loop, `if`/`else` return |
+| `tlm_target_thread_runtime_loop_test` | `TlmReadInitiatorRuntimeLen` | `TlmReadInitiatorRuntimeLen.sv` | pass | target-side TLM: runtime `for i in 0..len` loop bound |
+| `tlm_target_thread_early_return_test` | `TlmReadInitiatorRuntimeLen` | `TlmReadInitiatorRuntimeLen.sv` | pass | target-side TLM: early `return` from nested `if` inside a runtime loop |
 
 (The registry has since grown past this table via the backfill sweep —
 see [tbir-coverage.md](tbir-coverage.md); the registry file is the
@@ -613,13 +617,45 @@ reason. Code locations are authoritative.
     observable behavior for the covered subset: `scoreboard_basic_test`
     trace-diffs clean against v1.
 
+13. **Target-side TLM / bus-bound transactor (2026-06-12).** A
+    `transactor X bound to <Bus>` whose body is one or more `thread
+    bus.<method>(...)` responder threads now lowers (blocking methods
+    only). Each thread lowers to a `TbFunction` (kind `TransactorBody`),
+    `params` = the method args; persistent scalar state fields
+    (`read_count : uint<32> default 0`) carry on `TransactorSchema::
+    state_fields`. Two new IR nodes model state access:
+    `Expr::TransactorState { instance, field }` and
+    `Stmt::TransactorStateWrite { instance, field, value }` — host state,
+    allowed wherever a `Local` is. Inside the responder body the
+    `instance` is lowered as an empty placeholder (the bind is not yet
+    known) and filled at the test-binding stage
+    (`fill_transactor_state_instance`); the subset has exactly one
+    `passive` instance per bound transactor per file, so the fill is
+    unambiguous. Emission (`emit_target_actor`, mirroring v1's
+    `emit_bound_tlm_target_actors` blocking path) generates a test-scope
+    per-instance state struct (state fields + `_last_in/out_cycle`
+    activity stamps) plus one background-coroutine actor per target
+    method: hold `req_ready=0/rsp_valid=0`, await `req_valid&&req_ready`,
+    capture args, tick, drop `req_ready`, trace `request`, run the body
+    loop-switch (a real coroutine — its waits `co_await` the scheduler),
+    drive `rsp_data`, trace `response`, raise `rsp_valid`, await
+    `rsp_ready`, tick, drop `rsp_valid`. Trace payloads match v1 exactly
+    (`tlm_call(cycle, instance, "bus", method, phase, "target")`), so the
+    four registered fixtures trace-diff clean. **Out of subset** (precise
+    rejections): `out_of_order tags N` target threads (tagged responder
+    lanes), `fork`-based concurrent issue, `bind ... with { ... }` signal
+    remaps, nested transactor/method calls inside a responder
+    (forwarding), and the *initiator-side* bus-bound BFM (`hookable`
+    bodies driving handshake channels — the regblock `via` helpers).
+
 Minor, same spirit: `IndexVec` is a plain `Vec` plus typed id structs;
 the design's `AssertFail` enum collapsed into a single
 `FmtArgs on_fail` because both source forms bump `errors` identically
-in v1. (`FunctionKind::TransactorBody` exists since the transactor
-slice, carrying `transactor: TransactorId` rather than the design's
-`{ bus, method }` pair — the lowered subset is the *unbound* form, so
-there is no bus to name, and the method name lives in the schema.)
+in v1. (`FunctionKind::TransactorBody` carries `transactor: TransactorId`
+rather than the design's `{ bus, method }` pair — both the unbound BFM
+and the bound-to target-responder forms reuse it; the method name lives
+in the schema, and for a bound target the served bus is on
+`TransactorSchema::bound_bus`.)
 
 ### Verifier coverage summary
 

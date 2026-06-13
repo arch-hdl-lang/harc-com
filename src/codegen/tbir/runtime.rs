@@ -82,6 +82,36 @@ static inline uint64_t harc_rng_next() {
 /// `_last_in/out_cycle` heartbeat fields v1 injects are NOT emitted —
 /// the data-only subset never reads them (`sb.idle(N)` is an event-
 /// driven predicate, out of this slice's scope).
+/// One bound-to target-TLM responder instance: a test-scope local
+/// struct (state fields + activity stamps) plus its instance, mirroring
+/// v1's per-instance component struct. Declared inside the test function
+/// so the run/check coroutine and the actor coroutines share it by `[&]`
+/// reference. Emitted at one indent level (inside the test fn body).
+pub(super) fn target_state_struct_inst(
+    out: &mut String,
+    schema: &crate::ir::TransactorSchema,
+    instance: &str,
+) {
+    let ty = format!("_{}_{}_state", schema.name, instance);
+    writeln!(out, "{INDENT}struct {ty} {{").ok();
+    for f in &schema.state_fields {
+        let (cty, init) = match f.ty {
+            crate::ir::IrType::Bool => (
+                "bool",
+                if f.default != 0 { "true" } else { "false" }.to_string(),
+            ),
+            crate::ir::IrType::SInt(_) => ("int64_t", f.default.to_string()),
+            _ => ("uint64_t", f.default.to_string()),
+        };
+        writeln!(out, "{INDENT}{INDENT}{cty} {} = {init};", f.name).ok();
+    }
+    // Activity stamps, mirroring v1's auto-injected component fields
+    // (`idle()`/`idle_in()`/`idle_out()` predicate backing).
+    writeln!(out, "{INDENT}{INDENT}uint64_t _last_in_cycle = 0;").ok();
+    writeln!(out, "{INDENT}{INDENT}uint64_t _last_out_cycle = 0;").ok();
+    writeln!(out, "{INDENT}}} {instance};").ok();
+}
+
 pub(super) fn scoreboard_struct(out: &mut String, sb: &crate::ir::ScoreboardSchema) {
     writeln!(out, "struct {} {{", sb.name).ok();
     for f in &sb.fields {

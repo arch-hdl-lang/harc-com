@@ -181,6 +181,44 @@ pub struct TransactorSchema {
     /// `when active` body — all methods require an `active` instance
     /// in this subset, so the distinction carries no behavior here).
     pub methods: Vec<TransactorMethodSchema>,
+    /// `Some(<BusType>)` for a target-side TLM transactor declared
+    /// `transactor X bound to <BusType>`; `None` for the unbound
+    /// DUT-poking BFM form. When set, `target_methods` carries the
+    /// `thread bus.<method>(...)` responder bodies and `dut_field`/
+    /// `dut_type` are unused (target transactors drive the bound bus's
+    /// req/rsp wires on the DUT instance, not a private DUT handle).
+    pub bound_bus: Option<String>,
+    /// Persistent scalar state fields (`read_count : uint<32> default
+    /// 0`) of a bound-to target transactor. They live on a generated
+    /// per-instance C++ struct (mirroring v1's component-instance
+    /// struct), readable/writable from the responder bodies and from
+    /// the test (`target.read_count`). Empty for the unbound BFM form
+    /// (whose state fields are still rejected in that path).
+    pub state_fields: Vec<TbScalarFieldSchema>,
+    /// Target-side TLM responder threads (`thread bus.<method>(...)`),
+    /// in declaration order. Each has one lowered `TbFunction` body
+    /// whose state-field accesses reference `state_fields` by bare name;
+    /// the actor-emission site resolves them against the bound instance.
+    pub target_methods: Vec<TargetTlmMethodSchema>,
+}
+
+/// One target-side TLM responder thread (`thread bus.read(addr) ...
+/// return data`). The body runs as a background coroutine actor that
+/// serves the bound bus's blocking req/rsp wire protocol on the DUT.
+#[derive(Debug, Clone)]
+pub struct TargetTlmMethodSchema {
+    /// `tlm_method` name on the bound bus (`read`, `write`, ...).
+    pub name: String,
+    /// The lowered responder body (`kind: TransactorBody`). Its
+    /// `params` mirror the thread's declared parameters and its `ret`
+    /// is the return-value slot for value-returning methods.
+    pub function: FunctionId,
+    /// Declared argument names (one per thread parameter), in order —
+    /// the request-payload wire bases (`<bus>_<method>_<arg>`).
+    pub args: Vec<String>,
+    /// True for value-returning methods (`-> T`): the responder drives
+    /// a `<bus>_<method>_rsp_data` wire after the body returns.
+    pub has_ret: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -365,10 +403,32 @@ pub struct TestbenchSchema {
     /// `RecordFieldWrite` / `Expr::RecordField` plus helper
     /// `Stmt::TransactorCall` edges, so emission needs nothing here.
     pub regblock_bindings: Vec<RegblockBinding>,
+    /// Bound-to target-side TLM responder actors (`let target : X
+    /// passive = bind <busbinding>`), in declaration order. Each names a
+    /// passive instance of a `transactor X bound to <Bus>` transactor
+    /// and the test-scope bus binding it serves; emission generates a
+    /// per-instance state struct plus one background-coroutine actor per
+    /// target method.
+    pub target_tlm_actors: Vec<TargetTlmActorSchema>,
     /// True when no `testbench` declaration existed in source and this
     /// schema was synthesized for a classic-form test. Codegen skips
     /// the `_tb` struct + wire statement for synthetic testbenches.
     pub synthetic: bool,
+}
+
+/// One bound-to target-side TLM responder instance (`let target :
+/// MemTarget passive = bind mem`). The actor coroutines serve the bound
+/// bus binding's blocking req/rsp wire protocol on the DUT.
+#[derive(Debug, Clone)]
+pub struct TargetTlmActorSchema {
+    /// Passive instance name (the per-instance struct + actor prefix).
+    pub instance: String,
+    /// The test-scope bus-binding field this responder serves — also
+    /// the flat DUT signal prefix (`mem` → `mem_read_req_valid`, ...).
+    pub bus_field: String,
+    /// The bound-to transactor type providing the responder bodies and
+    /// state fields (`TbProgram::transactors[transactor]`).
+    pub transactor: TransactorId,
 }
 
 /// One `let regs : R = bind <helper>` register-block binding. The
@@ -514,6 +574,17 @@ pub enum Stmt {
     /// shared host state — see `TestbenchSchema::scalar_fields`). The
     /// value is port-hoisted like `Assign`.
     TbFieldWrite { field: String, value: Expr },
+    /// `read_count = read_count + 1` inside a target-responder body
+    /// (or `target.read_count = ...` from the test): write a bound-to
+    /// target transactor's persistent state field. `instance` names the
+    /// bound testbench-field instance; emission produces
+    /// `<instance>.<field> = <value>`. The value is port-hoisted like
+    /// `Assign` (no inline DUT reads).
+    TransactorStateWrite {
+        instance: String,
+        field: String,
+        value: Expr,
+    },
     Log { level: LogLevel, args: FmtArgs },
     AssertCheck { cond: Expr, on_fail: FmtArgs },
     CovReport(CovgroupInstance),
@@ -710,6 +781,13 @@ pub enum Expr {
     /// `_tb.<field>` read on a scalar testbench field. Host state —
     /// allowed in every expression position a `Local` is.
     TbField(String),
+    /// A read of a bound-to target transactor's persistent state field,
+    /// either from a responder body (`read_count`) or from the test
+    /// (`target.read_count`). `instance` is the bound testbench-field
+    /// instance name (e.g. `target`); emission produces
+    /// `<instance>.<field>` against the generated per-instance struct.
+    /// Host state — allowed in every position a `Local` is.
+    TransactorState { instance: String, field: String },
     /// A value-producing scoreboard read on a scoreboard-typed testbench
     /// field: `sb.writes` (scalar), `sb.expected.size()`,
     /// `sb.expected.empty()`. Host state — allowed wherever a `Local`
