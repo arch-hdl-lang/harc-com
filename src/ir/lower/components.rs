@@ -27,8 +27,8 @@ use crate::ast::{
 };
 use crate::ir::{
     ComponentFieldKind, ComponentFieldSchema, ComponentId, ComponentKindTag,
-    ComponentMethodSchema, ComponentSchema, ConnectEdgeSchema, FunctionId, FunctionKind, IrType,
-    TbFunction, Terminator, TypedParam,
+    ComponentMethodSchema, ComponentSchema, ConnectEdgeSchema, EventPayload, FunctionId,
+    FunctionKind, IrType, RecordId, TbFunction, Terminator, TypedParam,
 };
 use std::collections::HashMap;
 
@@ -97,6 +97,7 @@ pub(crate) enum CompSource<'a> {
 pub(crate) fn lower_component_schema(
     src: &CompSource<'_>,
     ids: &HashMap<String, ComponentId>,
+    record_ids: &HashMap<String, RecordId>,
     next_fn: &mut u32,
 ) -> Result<ComponentSchema, LowerError> {
     let (name, kind, items, when_active): (
@@ -150,7 +151,7 @@ pub(crate) fn lower_component_schema(
     for it in items.iter().chain(when_active.into_iter().flatten()) {
         match it {
             ComponentItem::Field(f) => {
-                let fk = lower_field(name, f, ids)?;
+                let fk = lower_field(name, f, ids, record_ids)?;
                 if fields.iter().any(|x| x.name == f.name.name) {
                     return Err(LowerError::Invalid(format!(
                         "component `{name}` declares field `{}` more than once",
@@ -200,12 +201,12 @@ pub(crate) fn lower_component_schema(
     // FunctionId is reserved here; the body lowers in pass 2.
     let mut on_handlers: Vec<crate::ir::OnHandlerSchema> = Vec::new();
     for h in &on_asts {
-        let (event, arg_signed) = resolve_on_handler_event(name, h, &fields)?;
+        let (event, arg_payload) = resolve_on_handler_event(name, h, &fields)?;
         let fid = FunctionId(*next_fn);
         *next_fn += 1;
         on_handlers.push(crate::ir::OnHandlerSchema {
             event,
-            arg_signed,
+            arg_payload,
             function: fid,
         });
     }
@@ -224,12 +225,12 @@ pub(crate) fn lower_component_schema(
 /// Validate an `on <event>(arg) ... end on` handler: it must be a bare
 /// event-subscription (`on in_ev(t)`) to a self `event<scalar>` field,
 /// with no `pre`/`post` hook side, no edge/periodic trigger. Returns the
-/// `(event_field_name, arg_signed)`.
+/// `(event_field_name, arg_payload)`.
 fn resolve_on_handler_event(
     comp: &str,
     h: &crate::ast::OnHandler,
     fields: &[ComponentFieldSchema],
-) -> Result<(String, bool), LowerError> {
+) -> Result<(String, EventPayload), LowerError> {
     if h.hook.is_some() {
         return Err(unsupported(
             &format!("a `pre`/`post` hook `on` handler on `{comp}`"),
@@ -264,9 +265,9 @@ fn resolve_on_handler_event(
             "event handlers take exactly one payload argument",
         ));
     }
-    // The event must name a self `event<scalar>` field.
+    // The event must name a self `event<...>` field.
     match fields.iter().find(|f| f.name == event).map(|f| &f.kind) {
-        Some(ComponentFieldKind::Event { signed }) => Ok((event, *signed)),
+        Some(ComponentFieldKind::Event { payload }) => Ok((event, *payload)),
         Some(_) => Err(unsupported(
             &format!("`on {event}` — `{comp}.{event}` is not an `event` field"),
             "",
@@ -282,6 +283,7 @@ fn lower_field(
     comp: &str,
     f: &ComponentField,
     ids: &HashMap<String, ComponentId>,
+    record_ids: &HashMap<String, RecordId>,
 ) -> Result<ComponentFieldKind, LowerError> {
     let fname = &f.name.name;
     if f.bound_to.is_some() {
@@ -307,37 +309,8 @@ fn lower_field(
                      self-events are lowered",
                 ));
             }
-            let signed = match args.first() {
-                Some(TypeArg::Type(ty)) => match scalar_ir_type(ty) {
-                    Some(IrType::SInt(_)) => true,
-                    Some(IrType::UInt(_)) | Some(IrType::Bool) => false,
-                    _ => {
-                        return Err(unsupported(
-                            &format!("a non-scalar event payload on `{comp}.{fname}`"),
-                            "only event<scalar ≤ 64 bits> ports are lowered",
-                        ));
-                    }
-                },
-                // `event<TinyTxn>` parses the payload as `TypeArg::Expr`
-                // (a bare identifier — every scalar payload `uint<W>` /
-                // `bool` parses as `TypeArg::Type`). A user-named type is
-                // a transaction/struct payload: v1 emits a typed callback
-                // (`std::function<void(TinyTxn)>`), but the IR's event
-                // model carries a single ≤64-bit scalar, so an `emit
-                // <ev>(struct)` would mis-lower to a scalar callback and
-                // fail at C++ compile. Reject precisely — transaction-
-                // payload events gate on the event-struct-payload slice.
-                Some(TypeArg::Expr(_)) | Some(TypeArg::Named { .. }) => {
-                    return Err(unsupported(
-                        &format!("a non-scalar (transaction/struct) event payload on \
-                                  `{comp}.{fname}`"),
-                        "only event<scalar ≤ 64 bits> payloads are lowered; \
-                         transaction-payload events gate on a later slice",
-                    ));
-                }
-                None => false,
-            };
-            Ok(ComponentFieldKind::Event { signed })
+            let payload = lower_event_payload(comp, fname, args.first(), record_ids)?;
+            Ok(ComponentFieldKind::Event { payload })
         }
         // `expected : queue<T>` FIFO.
         TypeExpr::Builtin {
@@ -459,12 +432,15 @@ fn lower_on_handler_body(
 ) -> Result<TbFunction, LowerError> {
     let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
     b.self_component = Some(cid);
-    // The handler's single argument (from `on <event>(<arg>)`).
+    // The handler's single argument (from `on <event>(<arg>)`). The
+    // param type mirrors the subscribed event's payload: a scalar
+    // (signed per the schema) or a value-record (so `t.field` reads in
+    // the body resolve against the record schema).
     let arg_name = on_handler_arg_name(h);
-    let ty = if oh.arg_signed {
-        IrType::SInt(None)
-    } else {
-        IrType::UInt(None)
+    let ty = match oh.arg_payload {
+        EventPayload::Scalar { signed: true } => IrType::SInt(None),
+        EventPayload::Scalar { signed: false } => IrType::UInt(None),
+        EventPayload::Record(rid) => IrType::Record(rid),
     };
     let local = b.declare(&arg_name);
     b.set_local_type(local, ty.clone());
@@ -702,6 +678,83 @@ fn dotted_path(e: &crate::ast::Expr) -> Option<Vec<String>> {
             Some(p)
         }
         ExprKind::Paren(inner) => dotted_path(inner),
+        _ => None,
+    }
+}
+
+/// Resolve the `<T>` inside an `event<T>` analysis-port field to its
+/// `EventPayload`. Mirrors v1's `payload_type_for_arg` for the lowered
+/// subset:
+///   * a scalar (`uint<W>`/`sint<W>`/`bool` ≤ 64 bits) → `Scalar`;
+///   * a user-named `transaction`/`struct` → `Record` (carried by value
+///     as the record struct, matching v1's `std::function<void(Txn)>`).
+///
+/// A scalar payload parses as `TypeArg::Type`; a user-named record
+/// payload parses as a bare identifier — `TypeArg::Expr(Ident)` (the
+/// common case) or `TypeArg::Named`. A named type that is neither a
+/// scalar nor a known record (enum / Vec / nested / unknown) is rejected
+/// precisely — those genuinely unsupported payload shapes gate on later
+/// slices.
+fn lower_event_payload(
+    comp: &str,
+    fname: &str,
+    arg: Option<&TypeArg>,
+    record_ids: &HashMap<String, RecordId>,
+) -> Result<EventPayload, LowerError> {
+    let reject_named = |named: &str| -> LowerError {
+        unsupported(
+            &format!("a non-record event payload `{named}` on `{comp}.{fname}`"),
+            "only event<scalar ≤ 64 bits> and event<transaction|struct> payloads \
+             are lowered; enum/Vec/nested payloads gate on a later slice",
+        )
+    };
+    match arg {
+        // Scalar payload (`event<uint<8>>`) or a single-segment named
+        // type that the type-arg layer happened to parse as a Type.
+        Some(TypeArg::Type(ty)) => {
+            if let Some(name) = type_arg_simple_name(ty) {
+                if let Some(rid) = record_ids.get(name) {
+                    return Ok(EventPayload::Record(*rid));
+                }
+            }
+            match scalar_ir_type(ty) {
+                Some(IrType::SInt(_)) => Ok(EventPayload::Scalar { signed: true }),
+                Some(IrType::UInt(_)) | Some(IrType::Bool) => {
+                    Ok(EventPayload::Scalar { signed: false })
+                }
+                _ => Err(reject_named(
+                    type_arg_simple_name(ty).unwrap_or("<expr>"),
+                )),
+            }
+        }
+        // `event<TinyTxn>` parses the payload as a bare identifier.
+        Some(TypeArg::Expr(e)) => {
+            if let ExprKind::Ident(id) = &*e.kind {
+                if let Some(rid) = record_ids.get(&id.name) {
+                    return Ok(EventPayload::Record(*rid));
+                }
+                return Err(reject_named(&id.name));
+            }
+            Err(unsupported(
+                &format!("a non-identifier event payload on `{comp}.{fname}`"),
+                "only event<scalar ≤ 64 bits> and event<transaction|struct> payloads are lowered",
+            ))
+        }
+        // `TypeArg::Named` is a keyword-style arg (`depth=16`), never a
+        // payload type reference — reject it precisely.
+        Some(TypeArg::Named { name, .. }) => Err(reject_named(&name.name)),
+        // A bare `event` with no payload defaults to an unsigned scalar
+        // (matches the prior behavior).
+        None => Ok(EventPayload::Scalar { signed: false }),
+    }
+}
+
+/// The simple (last-segment) name of a bare named `TypeExpr`
+/// (`TinyTxn`), or `None` for a builtin — used to spot a record payload
+/// that parsed as `TypeArg::Type(Named)`.
+fn type_arg_simple_name(t: &TypeExpr) -> Option<&str> {
+    match t {
+        TypeExpr::Named { name, .. } => name.segments.last().map(|s| s.name.as_str()),
         _ => None,
     }
 }

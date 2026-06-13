@@ -98,7 +98,7 @@ pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<Stri
     // a user may declare the env first — so emit in dependency order
     // (DFS over `Sub` fields), mirroring v1's `topo_sort_component_indices`.
     for ci in component_emit_order(prog) {
-        runtime::component_struct(&mut out, &prog.components[ci], &prog.components);
+        runtime::component_struct(&mut out, &prog.components[ci], &prog.components, &prog.records);
     }
 
     // Covergroup structs (leaf observables — they never name a TB or

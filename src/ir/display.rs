@@ -169,8 +169,14 @@ impl Display for TbProgram {
                     ComponentFieldKind::Queue { signed } => {
                         format!("queue<{}>", if *signed { "sint" } else { "uint" })
                     }
-                    ComponentFieldKind::Event { signed } => {
-                        format!("out event<{}>", if *signed { "sint" } else { "uint" })
+                    ComponentFieldKind::Event { payload } => {
+                        use crate::ir::EventPayload;
+                        let inner = match payload {
+                            EventPayload::Scalar { signed: true } => "sint".to_string(),
+                            EventPayload::Scalar { signed: false } => "uint".to_string(),
+                            EventPayload::Record(r) => self.records[r.index()].name.clone(),
+                        };
+                        format!("out event<{inner}>")
                     }
                     ComponentFieldKind::Sub { component } => format!("sub c{}", component.0),
                 };

@@ -641,7 +641,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // count (after pure helpers + transactor methods).
     let mut next_fn = prog.functions.len() as u32;
     for src in &comp_sources {
-        let schema = components::lower_component_schema(src, &component_ids, &mut next_fn)?;
+        let schema =
+            components::lower_component_schema(src, &component_ids, &record_ids, &mut next_fn)?;
         prog.components.push(schema);
     }
     // Pass 1b: resolve `connect` edges (env components only), now that

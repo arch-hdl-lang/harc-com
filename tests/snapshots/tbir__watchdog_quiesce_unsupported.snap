@@ -1,0 +1,5 @@
+---
+source: tests/tbir.rs
+expression: msg
+---
+TB-IR lowering does not support a `watchdog` on `Producer` yet (watchdog/phase orchestration gates on a later slice); re-run with `--codegen v1`
