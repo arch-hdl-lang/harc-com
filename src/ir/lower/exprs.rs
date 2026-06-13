@@ -132,6 +132,30 @@ impl FuncBuilder<'_> {
                 if let Some(ce) = self.as_component_field_read(e)? {
                     return Ok(ce);
                 }
+                // `r.field` read on a `recv()`-captured payload local
+                // (`let r = bus.<ch>.recv(); ... r.data`). Each payload
+                // signal was captured into its own local at recv time;
+                // resolve the named field to that local. v1 reads the
+                // field off the captured payload struct.
+                if let ExprKind::Ident(root) = &*target.kind {
+                    if let Some(local) = self.lookup(&root.name) {
+                        if let Some(fields) = self.recv_payloads.get(&local) {
+                            return match fields.iter().find(|(f, _)| f == &name.name) {
+                                Some((_, fid)) => Ok(Expr::Local(*fid)),
+                                None => Err(LowerError::Invalid(format!(
+                                    "recv payload `{}` has no field `{}` (valid: {})",
+                                    root.name,
+                                    name.name,
+                                    fields
+                                        .iter()
+                                        .map(|(f, _)| f.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ))),
+                            };
+                        }
+                    }
+                }
                 // `t.field` read on a record-typed local.
                 if let ExprKind::Ident(root) = &*target.kind {
                     if let Some(local) = self.lookup(&root.name) {

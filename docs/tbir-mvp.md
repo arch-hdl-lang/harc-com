@@ -26,6 +26,7 @@ checked against the code at the cited location.
 | #368 | `scoreboard` declarations (data-only host-state subset): `ScoreboardSchema` table on `TbProgram`, scalar-counter + `queue<T>` fields, `Stmt::ScoreboardOp` (`QueuePush`/`QueuePop`/`ScalarWrite`) and `Expr::ScoreboardQuery` (scalar read / `size()` / `empty()`), scoreboard-instance struct emission (`harc_rt::HarcQueue<T>` members) held on the `_tb` struct, plus the self-proving `scoreboard_basic_test` fixture. Scoreboard methods, event-driven `on`/`connect` wiring, and `queue<Struct>` payloads stay rejected (see the divergence note). |
 | env-composition slice (2026-06-13) | env/agent cluster's flat-struct core: `ComponentSchema` table on `TbProgram` (method-bearing scoreboards, analysis-source transactors, composing `env`s), `FunctionKind::ComponentMethod`, `Stmt::{ComponentFieldWrite, ComponentEmit, ComponentCall}`, `Expr::ComponentField`, `ConnectEdgeSchema`. `connect` (analysis-port → scoreboard sink), scoreboard methods (instance state materialized), and `out event`/`emit` lower; the `analysis_sink_connect_test` corpus fixture is registered. `agent`/`on`-handlers, `sequencer`/`tseq`, watchdog/phase, `idle`/`quiesced` predicates stay rejected (divergence 14). |
 | agent/on-handler slice (2026-06-13) | `agent` composition + `on <ev>(arg)` event handlers (builds on the env-composition core, `src/ir/lower/components.rs`): `ComponentKindTag::Agent`, `ComponentSchema::on_handlers` (`OnHandlerSchema { event, arg_signed, function }`), `Stmt::ComponentEmit` extended with a `base: ComponentBase` (test-scope path-emit `emit tagger.in_ev(v)` + self-relative both lower), and `Expr::ComponentIdle { base, kind: IdleKind::{In,Out,Both}, n }` for the `idle`/`idle_in`/`idle_out` heartbeat predicates. An `on in_ev(t)` handler lowers as a one-param `ComponentMethod` and registers at component construction as a subscriber closure that bumps `_last_in_cycle` then runs the handler body (mirrors v1's `on`-subscriber registration); registration recurses into by-value sub-components. Directionless `event<scalar>` self-events join the existing `out event` analysis-port form on `ComponentFieldKind::Event`. Fixture: `agent_on_handler_test` (`top_counter.sv`, pass) — agent + on-handler + path-emit + `idle_in`, trace-diff clean v1↔tbir at seed 1. `event<Struct/transaction>` payloads, testbench-field-bound components, `quiesced(N)`, `watchdog`, `phase`, `on <N> cycles`/cycle-trigger handlers, `wait until` with heartbeat predicates, and `sequencer`/`tseq` stay rejected (divergence 15). |
+| initiator-BFM slice (2026-06-13) | initiator-side bus-bound BFM: a `transactor X bound to <Bus>` whose `hookable` methods drive the bound bus's handshake channels (the regblock `via <Helper>` form). Lowered in `src/ir/lower/transactors.rs` (`lower_bound_initiator_transactor`) — methods become `TransactorBody` `TbFunction`s on `TransactorSchema::methods`, `bus` resolves through a placeholder-keyed binding filled at test-bind time (`fill_initiator_bus_prefix`), and `recv()` field access (`r.data`) is supported via per-field capture. No new IR variants. Fixture `regblock_access_test` registered (trace-diff clean). See divergence 15. |
 | #372 | `randomize` via the constraint-IR seam: `Terminator::Randomize { target, constraints: ConstraintRef, succ }` + a `TbProgram::constraint_sites` table (the `ConstraintRef` handle resolves into it). Lowering merges transaction `keep`s ahead of the call-site `with {...}` body (spec §4) and records each site with its `ConstraintProblemId` handle. The tbir backend reuses v1's Z3-solve emission verbatim (`cpp_tb::emit_randomize_snippets` → `emit_constraint_solver_block` / unconstrained-PRNG shell / `emit_randomize_trace_event`) — "the constraint runtime is shared; only the call site moves to the IR backend." The runtime problem table + `harc_z3_rt.h` include are emitted iff a site exists. New passes wiring: `lower_coroutine` treats Randomize as a host-sync transition (`Trigger::Solved`); `placement` tiers a solve block at Tier-2 host-service and capability-checks `solve_*`. Fixtures: `keep_constraints_test` (bare `randomize(t)` + transaction keeps), `axilite_constraint_test` (`randomize(p) with` + Z3 cross-field constraints). Both trace-diff clean v1↔tbir at seed 1. `randomize` *expressions* (`let v = randomize(t)`), scoreboard-`.push`/`tseq`-gated randomize fixtures, and method-body randomize stay rejected (residual map below). |
 
 ### Construct subset
@@ -692,9 +693,10 @@ reason. Code locations are authoritative.
     four registered fixtures trace-diff clean. **Out of subset** (precise
     rejections): `out_of_order tags N` target threads (tagged responder
     lanes), `fork`-based concurrent issue, `bind ... with { ... }` signal
-    remaps, nested transactor/method calls inside a responder
-    (forwarding), and the *initiator-side* bus-bound BFM (`hookable`
-    bodies driving handshake channels — the regblock `via` helpers).
+    remaps, and nested transactor/method calls inside a responder
+    (forwarding). The complementary *initiator-side* bus-bound BFM
+    (`hookable` bodies driving handshake channels — the regblock `via`
+    helpers) landed 2026-06-13; see divergence 15.
 
 14. **Env-composition (analysis-connect) subset (2026-06-13).** The
     env/agent cluster's flat-struct core lowers
@@ -799,14 +801,61 @@ reason. Code locations are authoritative.
     `DanglingConstraintRef`). `keep_constraints_test` and
     `axilite_constraint_test` trace-diff clean v1↔tbir.
 
+15. **Initiator-side bus-bound BFM (2026-06-13).** The complement of the
+    target-side responder (divergence 13): a `transactor X bound to
+    <Bus>` whose `hookable write(addr,data)` / `read(addr)->data` methods
+    DRIVE the bound bus through handshake channels now lowers (this is the
+    regblock `via <Helper>` form and the TLM-initiator BFM). Dispatched
+    from `lower_transactor` by item shape — a bound-to transactor with any
+    `hookable` is the initiator form, one with `thread bus.<m>(...)`
+    bodies is the target form (a file mixing both is rejected).
+    - *No new IR variants.* Each `hookable` lowers like the unbound
+      DUT-poking BFM — a `TbFunction` (kind `TransactorBody`) recorded on
+      `TransactorSchema::methods`, with `bound_bus = Some(<Bus>)`. So a
+      regblock frontdoor's `Helper.write`/`read` call edges (#369,
+      divergence 12) and bare `helper.method(...)` calls resolve through
+      the existing `CallTarget::TransactorMethod` dispatch; the tbir
+      backend emits the method via `emit_method` (the synchronous-hookable
+      lambda — waits are `tick()` loops), and the regblock mirror +
+      read-predict ride unchanged.
+    - *`bus` resolves via a placeholder-keyed binding.* The method body
+      is lowered before the test's `let helper = bind <axil>` names the
+      binding, so the body's `bus_bindings` map is keyed by the bare `bus`
+      keyword (`transactors::INITIATOR_BUS_PLACEHOLDER`, matching v1's
+      `driver_bus_for_hookables` where `bus` inside a hookable resolves to
+      the parent's binding). Every `bus.<ch>.send/recv` /
+      `bus.<ch>.<sig>` access lowers through the **existing** channel-
+      handshake machinery (CFG-inlined 16-cycle-budget valid/ready dance);
+      the resulting `PortRef`s carry `bus` as their flat prefix. At test-
+      binding time `fill_initiator_bus_prefix` rewrites that prefix to the
+      real binding name (`axil` → `axil_aw_valid`, the arch-com §19.6 flat
+      name). The bodies are shared per transactor TYPE, so the subset is
+      one bound instance per type per file — a second bind to a different
+      binding is rejected (mirrors the target-responder one-instance
+      gate).
+    - *`recv()` field access.* v1 captures the whole `<Bus>_<ch>_payload`
+      struct and reads `.data`/`.resp` off it. The IR's scalar model
+      captures the FIRST payload signal into the bound local (preserving
+      bare-scalar `let v = bus.r.recv(); v == ...`) AND each remaining
+      payload signal into a `<recv>__<field>` local at recv time,
+      recorded in `recv_payloads` so a later `r.<field>` read resolves to
+      the matching local — same capture cycle as v1.
+    - *Out of subset* (precise rejections): per-instance BFM state
+      fields, `out_of_order` channels, `fork`-issue, `bind ... with {
+      ... }` remaps, nested transactor calls inside a BFM body, and a
+      second bound instance of one BFM type. New fixture:
+      `regblock_access_test` (`AxiLiteRegs.sv`, pass) — register-level RW/
+      RO/WO frontdoor over the bus-bound `via` helper, trace-diff clean
+      v1↔tbir.
+
 Minor, same spirit: `IndexVec` is a plain `Vec` plus typed id structs;
 the design's `AssertFail` enum collapsed into a single
 `FmtArgs on_fail` because both source forms bump `errors` identically
 in v1. (`FunctionKind::TransactorBody` carries `transactor: TransactorId`
-rather than the design's `{ bus, method }` pair — both the unbound BFM
-and the bound-to target-responder forms reuse it; the method name lives
-in the schema, and for a bound target the served bus is on
-`TransactorSchema::bound_bus`.)
+rather than the design's `{ bus, method }` pair — the unbound BFM, the
+bound-to target-responder, and the bound-to initiator-BFM forms all reuse
+it; the method name lives in the schema, and for a bound transactor the
+served bus is on `TransactorSchema::bound_bus`.)
 
 ### Verifier coverage summary
 

@@ -41,6 +41,21 @@ fn lower_fixtures(names: &[&str]) -> Result<ir::TbProgram, lower::LowerError> {
     lower::lower_program(&merged)
 }
 
+/// Lower one fixture that `use`s a stdlib bus (`use BusAxiLite`),
+/// providing the bus decl by parsing `stdlib/<Bus>.arch` alongside it —
+/// mirroring the CLI's `resolve_use_imports` (which `lower_src` /
+/// `lower_fixtures` do not perform). Only the parsed bus items survive
+/// `merge_for_sim`, like the CLI path.
+fn lower_with_stdlib_bus(fixture_name: &str, bus_file: &str) -> Result<ir::TbProgram, lower::LowerError> {
+    let fix = parse_source(&fixture(fixture_name)).expect("fixture parses");
+    let bus_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("stdlib").join(bus_file);
+    let bus_src = std::fs::read_to_string(&bus_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", bus_path.display()));
+    let bus = parse_source(&bus_src).expect("stdlib bus parses");
+    let merged = merge::merge_for_sim(&[fix, bus], None).expect("merge");
+    lower::lower_program(&merged)
+}
+
 /// Lower + verify + emit one registry fixture through the tbir backend
 /// with default options (the `--sv` Verilator path the equivalence
 /// harness exercises).
@@ -3137,19 +3152,43 @@ end impl Test
     );
 }
 
-/// The corpus `regblock_basic_test` fixture's `via` helper is a
-/// `transactor ... bound to BusAxiLite` whose methods are `hookable`
-/// bodies driving the bus's handshake channels — the *initiator-side*
-/// bus-bound BFM form. That is the documented residual blocker after
-/// the target-side TLM slice; lowering rejects it precisely (it now
-/// reaches the bound-to transactor path and names the hookable),
-/// never mis-lowers.
+/// The corpus `regblock_basic_test` fixture's `via` helper — a
+/// `transactor ... bound to BusAxiLite` whose `hookable` bodies drive
+/// the bus's handshake channels (the initiator-side BFM form) — now
+/// lowers (this slice). The fixture's *remaining* blocker is a regblock
+/// residual, NOT the BFM: it reads registers in assert conditions and
+/// `${...}` format args (`assert (regs.DMACR & 1) == 1`), and the
+/// regblock subset lowers register reads only in `let`-RHS position
+/// (divergence 12). Lowering rejects that precisely, never mis-lowers.
 #[test]
-fn regblock_basic_corpus_blocked_on_initiator_side_bfm() {
-    let err = lower_src(&fixture("regblock_basic_test.harc")).unwrap_err();
+fn regblock_basic_corpus_blocked_on_register_read_position() {
+    let err =
+        lower_with_stdlib_bus("regblock_basic_test.harc", "BusAxiLite.arch").unwrap_err();
     let msg = assert_unsupported(&err);
     assert!(
-        msg.contains("initiator-side method") || msg.contains("hookable"),
-        "expected the initiator-side BFM residual blocker: {msg}"
+        msg.contains("register read") && msg.contains("outside a `let`"),
+        "expected the register-read-position residual (BFM now lowers): {msg}"
     );
+}
+
+/// The corpus `regblock_access_test` fixture — same initiator-side BFM
+/// `via` helper, but every register read sits in `let`-RHS position
+/// (`let v = regs.MM2S_LEN`) — FULLY lowers with this slice: the BFM
+/// helper's `hookable write/read` bodies drive the bound AXI-Lite bus
+/// channels and the regblock frontdoor's `Helper.write`/`read` call
+/// edges resolve. (The end-to-end v1↔tbir trace equivalence is gated by
+/// the registry harness; this asserts lowering succeeds.)
+#[test]
+fn regblock_access_corpus_lowers_with_initiator_bfm() {
+    let prog =
+        lower_with_stdlib_bus("regblock_access_test.harc", "BusAxiLite.arch").expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    // The BFM helper is a bound-to initiator transactor with write+read.
+    let helper = prog
+        .transactors
+        .iter()
+        .find(|x| x.name == "AxilHelper")
+        .expect("AxilHelper transactor lowered");
+    assert_eq!(helper.bound_bus.as_deref(), Some("BusAxiLite"));
+    assert!(helper.method("write").is_some() && helper.method("read").is_some());
 }

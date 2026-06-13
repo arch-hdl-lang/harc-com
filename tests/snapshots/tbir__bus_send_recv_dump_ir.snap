@@ -1,6 +1,6 @@
 ---
 source: tests/tbir.rs
-assertion_line: 1552
+assertion_line: 2056
 expression: text
 ---
 tb-ir program
@@ -14,6 +14,7 @@ fn fn0 run_PingTest [kind=Run, owner=tb0]
     %2 __t2 : unknown
     %3 __t3 : unknown
     %4 v : unknown
+    %5 v__resp : unknown
   entry = b0
 
   b0:
@@ -55,6 +56,7 @@ fn fn0 run_PingTest [kind=Run, owner=tb0]
 
   b9:
     DutRead(%v, dut.p.rx.data)
+    DutRead(%v__resp, dut.p.rx.resp)
     -> WaitCycles(1, b10)
 
   b10:

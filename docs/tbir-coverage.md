@@ -96,7 +96,7 @@ Residual first-blocker map for the other 16 (re-run of
 | Moved to group | Fixtures |
 |---|---|
 | `bus` (3) | `axilite_regs_full_test`, `bind_remap_test`, `transactor_parse_test` |
-| `regblock` (7) | `regblock_basic_test`, `regblock_fields_test`, `regblock_access_test`, `regblock_bitbash_test`, `regblock_addrmap_test`, `regblock_alias_test`, `regblock_record_test` — **regblock slice landed 2026-06-12; see the `regblock` construct group below for the per-fixture residual map (all 7 still blocked on the bus-bound `via` helper / field-level access / addrmap).** |
+| `regblock` (7) | `regblock_basic_test`, `regblock_fields_test`, `regblock_access_test`, `regblock_bitbash_test`, `regblock_addrmap_test`, `regblock_alias_test`, `regblock_record_test` — **regblock slice landed 2026-06-12; the bus-bound `via` helper landed 2026-06-13 (initiator-side BFM). `regblock_access_test` now fully lowers and is registered; the other six advance to deeper regblock residuals — see the `regblock` construct group below.** |
 | `scoreboard` (2) | `analysis_sink_connect_test`, `axilite_env_test` |
 | `tseq` (2) | `axilite_seqdrv_test`, `transactor_active_test` |
 | transactor state fields (1) | `axilite_hooks_test` — "transactor `HookXactor` state field `last_read`" (scalar state on the transactor; needs instance-state materialization) |
@@ -133,24 +133,36 @@ pass — rw/ro/wo + reset + frontdoor + read-predict + WO mirror-read,
 over a test-scope unbound-transactor helper), registered in the
 equivalence registry.
 
-Residual first-blocker map (re-run of `harc dump-ir`, 2026-06-12):
+**Update 2026-06-13 (initiator-side BFM slice).** The bus-bound `via`
+helper (`transactor AxilHelper bound to BusAxiLite`, `hookable` bodies
+driving the bus's handshake channels) now lowers — see the *initiator-
+side bus-bound BFM* section below and docs/tbir-mvp.md divergence 15.
+With that residual cleared, **`regblock_access_test` fully lowers and is
+registered** (`AxiLiteRegs.sv`, pass — same BFM helper, but every
+register read sits in `let`-RHS position, which the regblock subset
+lowers). The other three BFM-helper fixtures advance to their *next*
+regblock residual (none is the BFM any more).
+
+Residual first-blocker map (re-run of `harc dump-ir`, 2026-06-13):
 
 | Next blocker | Fixtures |
 |---|---|
-| bus-bound `via` helper (`transactor AxilHelper bound to BusAxiLite`) | `regblock_basic_test`, `regblock_access_test`, `regblock_bitbash_test`, `regblock_record_test` |
+| **(resolved)** initiator-side bus-bound `via` helper | ~~all four below~~ — now lowers |
+| register read outside `let`-RHS (assert/`${...}` format arg) | `regblock_basic_test` |
+| `bitbash(regs)` compile-time walk-all | `regblock_bitbash_test` |
+| passive `record_write`/`record_read` API + per-register `on regs.REG` (mixed bare/scope statements) | `regblock_record_test` |
 | field-level decomposition (`field <name> : <ty> @ <bit>` + `regs.REG.FIELD`) | `regblock_fields_test`, `regblock_addrmap_test` |
 | `addrmap` construct (chip-level composition) | `regblock_alias_test` |
 
 The blocker reported is whichever out-of-subset construct lowering hits
-first in file order. `regblock_fields_test` / `regblock_addrmap_test`
-reach their `field` declarations before the (also-blocking) bus-bound
-helper because the regblock decl now lowers far enough to parse fields;
-`regblock_alias_test` has no `field`s and reaches its `addrmap`. All 7
-ultimately need the bus-bound helper; `fields`/`addrmap` additionally
-need field-level access (and `addrmap`/`alias` need the `addrmap`
-construct + `alias of`). The passive `record_*` API + per-register `on`
-callbacks (`regblock_record_test`) and `bitbash` (`regblock_bitbash_test`)
-are further deferred features behind the bus-bound helper.
+first in file order. `regblock_access_test` (registered, pass) is the
+only one of the seven that fully lowers — its reads are all `let`-bound.
+`regblock_basic_test` reads registers in assert conditions / format args
+(divergence 12 — register reads lower only in `let`-RHS position).
+`regblock_bitbash_test` needs `bitbash`; `regblock_record_test` needs the
+passive `record_*` API + per-register `on` callbacks; `fields`/`addrmap`
+need field-level access (and `addrmap`/`alias` the `addrmap` construct +
+`alias of`). Each is a precise `Unsupported`, never mis-lowered.
 
 ### `transaction` construct — RESOLVED 2026-06-12 (transaction slice)
 
@@ -223,13 +235,46 @@ next blocker; exact `Unsupported` message in parentheses):
 | `out_of_order tags N` target threads (hidden tag wires + multi-lane response router) | `tlm_target_ooo_lanes_test`, `tlm_pairing_arch_initiator_test` ("serving a `out_of_order` method") |
 | `bind ... with { ... }` signal remaps | `dma_engine_tlm_target_test`, `dma_engine_tlm_mem_model_test` ("bus bind signal remaps") |
 | nested transactor/method call inside a responder body (forwarding to another target) | `tlm_target_forwarding_test` ("transactor/method call `.read(...)`") |
-| initiator-side bus-bound BFM (`hookable` bodies driving handshake channels) | `regblock_basic_test`, `regblock_access_test`, `regblock_bitbash_test`, `regblock_record_test` ("`hookable` (initiator-side method)") |
+| **(resolved 2026-06-13)** initiator-side bus-bound BFM (`hookable` bodies driving handshake channels) | ~~`regblock_*`~~ — see the initiator-side BFM section below |
 
 The fork group's blocking-call halves already lower; the OOO group needs
 the tagged responder lanes; the remap group needs custom wire naming;
-the forwarding fixture needs nested call edges inside a responder; the
-regblock `via` helpers are the *initiator-side* BFM, a separate slice
-from this target-side responder work.
+the forwarding fixture needs nested call edges inside a responder. The
+regblock `via` helpers are the *initiator-side* BFM, lowered by the
+separate slice below.
+
+### initiator-side bus-bound BFM — RESOLVED 2026-06-13
+
+> ~~initiator-side bus-bound BFM (`hookable` bodies driving handshake channels)~~
+
+The complementary form of the target-side TLM responder: `transactor X
+bound to <Bus>` whose `hookable write(addr,data)` / `read(addr)->data`
+methods DRIVE the bound bus through handshake channels (`bus.<ch>.send` /
+`.recv()` / `bus.<ch>.<sig> = ...`). This is the regblock `via <Helper>`
+form. Each hookable lowers to a `TbFunction` (kind `TransactorBody`)
+recorded on `TransactorSchema::methods` (NOT `target_methods`), so the
+regblock frontdoor's `Helper.write`/`read` call edges (#369) and bare
+`helper.method(...)` calls resolve through the existing
+`CallTarget::TransactorMethod` dispatch — **no new IR variants**. Inside
+the body the bare `bus` keyword (v1's `driver_bus_for_hookables`)
+resolves via a placeholder-keyed bus binding, so the existing channel-
+handshake lowering applies verbatim; the placeholder flat prefix is
+rewritten to the real `let helper = bind <axil>` binding name at test-
+binding time. `recv()` now captures every payload signal into a per-field
+local (`r.data` / `r.resp`), preserving the bare-scalar `recv()` read.
+See docs/tbir-mvp.md divergence 15.
+
+**Registered** (1, passes the v1-vs-tbir equivalence pair, trace-diff
+clean): `regblock_access_test`. The other three BFM-helper fixtures
+(`regblock_basic_test`, `regblock_bitbash_test`, `regblock_record_test`)
+now lower their `via` helper but stop at deeper regblock residuals (see
+the `regblock` construct group above).
+
+**Out of subset** (precise rejections): per-instance BFM state fields,
+`out_of_order` channels, `fork`-issue, `bind ... with { ... }` remaps,
+nested transactor calls inside a BFM body, multiple bound instances of
+one BFM type per file. `tlm_pairing_arch_initiator_test` is a TLM-
+initiator fixture but stops earlier on `out_of_order tags N`.
 
 \* `tlm_pairing_arch_target_test` still does not reach the equivalence
 stage (fork-blocked), so the known local-only Verilator
