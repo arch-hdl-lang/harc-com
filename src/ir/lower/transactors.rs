@@ -59,6 +59,7 @@ pub(crate) fn lower_transactor(
     helper_registry: &helpers::HelperRegistry<'_>,
     record_ctx: &LowerCtx,
     buses: &HashMap<String, &BusDecl>,
+    downstream_binds: &HashMap<String, BusDecl>,
     constraint_sites: &RefCell<Vec<ConstraintSite>>,
 ) -> Result<(TransactorSchema, Vec<TbFunction>), LowerError> {
     let tname = &t.name.name;
@@ -99,6 +100,7 @@ pub(crate) fn lower_transactor(
             helper_registry,
             record_ctx,
             buses,
+            downstream_binds,
             constraint_sites,
         );
     }
@@ -346,6 +348,7 @@ fn lower_bound_target_transactor(
     helper_registry: &helpers::HelperRegistry<'_>,
     record_ctx: &LowerCtx,
     buses: &HashMap<String, &BusDecl>,
+    downstream_binds: &HashMap<String, BusDecl>,
     constraint_sites: &RefCell<Vec<ConstraintSite>>,
 ) -> Result<(TransactorSchema, Vec<TbFunction>), LowerError> {
     let tname = &t.name.name;
@@ -447,8 +450,23 @@ fn lower_bound_target_transactor(
     };
 
     // Responder bodies see file-scope consts and records; no testbench,
-    // no bus bindings, no sibling instances. State fields resolve via
+    // no sibling instances. State fields resolve via
     // `FuncBuilder::target_state_fields`, not the ctx.
+    //
+    // Downstream bus bindings ARE visible: a responder may re-issue a
+    // TLM call against a test-scope bus binding (nested forwarding —
+    // `let raw = back.read(addr)`, or `let d = fork back.read_ooo(addr)`
+    // + `join_all`). The pre-scanned `name -> BusDecl` map makes `back`
+    // resolve through the SAME initiator-side call machinery the run/check
+    // body uses: `try_lower_bus_call` (blocking → a `TransactorMethod`
+    // call edge) or `try_lower_tlm_fork` (`out_of_order` → `Stmt::TlmFork`
+    // / `TlmJoinAll`), instead of the generic transactor-method
+    // rejection. Either edge is resolved against the test's `bus_bindings`
+    // at emit (the bound responder runs in test scope, where every
+    // binding is live). What this does NOT enable is the responder
+    // SERVING an `out_of_order` method (the OOO-RESPONDER LANE form,
+    // gated below) — that is the multi-lane dispatcher/arbiter, a
+    // follow-up slice distinct from re-issuing a downstream OOO call.
     let body_ctx = LowerCtx {
         dut_field: String::new(),
         tb_field: None,
@@ -457,7 +475,7 @@ fn lower_bound_target_transactor(
         clock_names: Vec::new(),
         record_ids: record_ctx.record_ids.clone(),
         records: record_ctx.records.clone(),
-        bus_bindings: HashMap::new(),
+        bus_bindings: downstream_binds.clone(),
         transactor_fields: HashMap::new(),
         transactors: Vec::new(),
         scoreboard_fields: HashMap::new(),

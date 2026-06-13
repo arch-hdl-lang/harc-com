@@ -3090,8 +3090,52 @@ fn tlm_target_state_fields_lower() {
     assert!(filled, "responder body must carry instance-filled state writes");
 }
 
+/// Nested forwarding: a bound-to responder re-issues a downstream
+/// blocking TLM call (`let raw = back.read(addr)`) against a test-scope
+/// bus binding. The pre-scanned downstream binding makes `back` resolve
+/// to a `TransactorMethod` call edge inside the responder body, instead
+/// of the generic transactor-method rejection.
+#[test]
+fn tlm_target_nested_forwarding_lowers() {
+    let prog = lower_src(&fixture("tlm_target_forwarding_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let x = &prog.transactors[0];
+    let body = prog.function(x.target_methods[0].function);
+    // The responder body carries a downstream `back.read` blocking call
+    // edge (Assign-RHS TransactorMethod), the nested-forwarding shape.
+    let has_downstream = body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+        matches!(
+            s,
+            ir::Stmt::Assign(_, ir::Expr::Call(
+                ir::CallTarget::TransactorMethod { bus_field, method },
+                _,
+            )) if bus_field == "back" && method == "read"
+        )
+    });
+    assert!(has_downstream, "responder body must carry the downstream back.read edge");
+}
+
+/// Fork-forwarding: a responder issues two downstream `fork
+/// back.read_ooo(...)` requests and `join_all`s them. The #390
+/// fork/join machinery composes inside the responder body once the
+/// downstream OOO binding is in scope.
+#[test]
+fn tlm_target_fork_forwarding_lowers() {
+    let prog = lower_src(&fixture("tlm_target_fork_forwarding_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let x = &prog.transactors[0];
+    let body = prog.function(x.target_methods[0].function);
+    let stmts: Vec<&ir::Stmt> = body.blocks.iter().flat_map(|b| &b.stmts).collect();
+    let forks = stmts.iter().filter(|s| matches!(s, ir::Stmt::TlmFork(_))).count();
+    let joins = stmts.iter().filter(|s| matches!(s, ir::Stmt::TlmJoinAll(_))).count();
+    assert_eq!(forks, 2, "responder body must carry two downstream forks");
+    assert_eq!(joins, 1, "responder body must carry one join_all");
+}
+
 /// `out_of_order tags N` target threads stay out of subset (only
-/// `blocking` responders are lowered).
+/// `blocking` responders are lowered). The downstream-binding pre-scan
+/// does NOT enable a responder SERVING an OOO method — that needs the
+/// multi-lane dispatcher/arbiter (a follow-up slice).
 #[test]
 fn tlm_target_ooo_responder_unsupported() {
     let err = lower_src(&fixture("tlm_pairing_arch_initiator_test.harc")).unwrap_err();

@@ -271,16 +271,48 @@ next blocker; exact `Unsupported` message in parentheses):
 | Next blocker | Fixtures |
 |---|---|
 | **(resolved 2026-06-13)** initiator-side `fork`/`join_all` TLM issue | ~~`tlm_method_bus_test`~~ (registered, pass) — see the initiator-side fork/join_all section below |
-| a `fork` INSIDE a transactor responder body (target re-issuing a downstream TLM call — fork-forwarding; needs request arbiter + response router) | `tlm_target_fork_forwarding_test` ("`fork` bus-method calls in expression position"), `tlm_target_forwarding_test` ("transactor/method call `.read(...)`") |
+| **(resolved 2026-06-13)** a `fork`/blocking call INSIDE a transactor responder body (nested forwarding — target re-issuing a downstream TLM call) | ~~`tlm_target_forwarding_test`, `tlm_target_fork_forwarding_test`~~ (both registered, pass) — see the nested-forwarding section below |
 | target-side `out_of_order tags N` RESPONDER threads (hidden tag wires + multi-lane response router) | `tlm_target_ooo_lanes_test`, `tlm_pairing_arch_initiator_test` ("serving a `out_of_order` method") |
 | **(equivalence-proven, gate-blocked)** `tlm_pairing_arch_target_test` | LOWERS + v1↔tbir trace-diff clean, but its ARCH-DUT auto-emitted `_auto_tlm_*_req_stable` TLM SVA `$fatal`s under local Verilator 5.048 for BOTH codegens identically — known local-only artifact, NOT registered |
 | **(resolved 2026-06-13)** `bind ... with { ... }` signal remaps | ~~`dma_engine_tlm_target_test`, `dma_engine_tlm_mem_model_test`~~ — see the bus-bind-remap section below |
 | **(resolved 2026-06-13)** initiator-side bus-bound BFM (`hookable` bodies driving handshake channels) | ~~`regblock_*`~~ — see the initiator-side BFM section below |
 
-The remaining fork-forwarding fixtures need a responder to act as both
-target AND initiator (request arbiter + response router); the OOO group
-needs the tagged RESPONDER lanes. The regblock `via` helpers are the
-*initiator-side* BFM, lowered by the separate slice below.
+The remaining OOO-responder group (`tlm_target_ooo_lanes_test`,
+`tlm_pairing_arch_initiator_test`) needs the tagged RESPONDER lanes
+(per-tag dispatcher + lane coroutines + arbiter); the regblock `via`
+helpers are the *initiator-side* BFM, lowered by the separate slice
+below.
+
+### nested forwarding (responder re-issues a downstream TLM call) — RESOLVED 2026-06-13
+
+> ~~a `fork`/blocking call INSIDE a transactor responder body~~
+
+A bound-to TARGET responder body may re-issue a downstream TLM call
+against a *test-scope* bus binding it does not itself declare —
+`thread bus.read(addr) ... let raw = back.read(addr); return raw + ...`
+(nested forwarding: front bus → another bus). The responder is lowered
+before any test, so the downstream binding's bus type is not in scope at
+responder-lowering time. A file-level **pre-scan** of every (desugared)
+test's `let <name> : <Bus> = bind ...` declarations builds a
+`name → BusDecl` map that is handed to the bound-target responder body's
+`bus_bindings` ctx (`src/ir/lower/{mod,transactors}.rs`); the downstream
+`back.read(...)` then lowers through the existing `try_lower_bus_call`
+(blocking → `TransactorMethod` call edge) or `try_lower_tlm_fork` (OOO →
+`Stmt::TlmFork`/`TlmJoinAll`) — the SAME #390 machinery, composed inside
+the responder coroutine. **No new IR variants.** The verifier permits a
+bus-call edge in an owner-less `TransactorBody` (resolution defers to
+emit, which has the test's `bus_bindings`); the tbir backend now passes
+the test bindings into the responder loop-switch `emit_stmt` and tags the
+downstream `tlm_call` trace event with the responder-instance name
+(`ECx::trace_component`, mirroring v1's `current_component_instance`) so
+the semantic trace diffs clean. **Registered** (2, each passes the
+v1-vs-tbir equivalence pair, trace-diff clean):
+`tlm_target_forwarding_test` (blocking downstream `back.read`),
+`tlm_target_fork_forwarding_test` (two `fork back.read_ooo` + `join_all`
+over an OOO downstream bus). See docs/tbir-mvp.md, the nested-forwarding
+slice. **Still rejected**: a responder SERVING an `out_of_order tags N`
+method (the OOO-responder LANE form — distinct from forwarding) and the
+known-artifact `tlm_pairing_arch_target_test`.
 
 ### initiator-side `fork`/`join_all` TLM issue — RESOLVED 2026-06-13
 
@@ -296,8 +328,9 @@ method gets a per-`(field,method)` monotonic request tag and drains by
 list survives `wait` between blocks; a dangling `fork` and a mixed
 tagged/untagged barrier are both rejected at lowering. **Registered** (1,
 pass, trace-diff clean): `tlm_method_bus_test`. See docs/tbir-mvp.md, the
-initiator-side fork/join_all slice. Still rejected: a `fork` inside a
-RESPONDER body (fork-forwarding) and target-side OOO responder lanes.
+initiator-side fork/join_all slice. (A `fork` inside a RESPONDER body —
+nested forwarding — is now resolved too; see the nested-forwarding
+section above.) Still rejected: target-side OOO responder lanes.
 
 ### bus `bind ... with { ... }` signal remaps — RESOLVED 2026-06-13
 
