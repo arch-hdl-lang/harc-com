@@ -126,3 +126,5 @@ tlm_bind_remap_test | TlmMemory | TlmMemory.sv | - | pass
 probe_basic_test | CpuPipe | cpu_pipeline.sv | - | pass
 probe_force_test | CpuPipe | cpu_pipeline.sv | - | pass
 testbench_probe_dut_test | CpuPipe | cpu_pipeline.sv | - | pass
+axilite_connect_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
+mshr_cocotb_test | cache_mshr | cache_mshr.sv | - | pass
