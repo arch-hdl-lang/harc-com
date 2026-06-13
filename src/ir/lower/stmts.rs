@@ -181,7 +181,7 @@ impl FuncBuilder<'_> {
             StmtKind::Select(_) => Err(unsupported("`select`", "")),
             StmtKind::On(_) => Err(unsupported("`on` handlers", "")),
             StmtKind::Emit { name, args, .. } => self.lower_emit(name, args),
-            StmtKind::Yield(_) => Err(unsupported("`yield`", "")),
+            StmtKind::Yield(e) => self.lower_yield(e),
             StmtKind::Apply(_) => Err(unsupported("`apply`", "")),
             StmtKind::Release(_) => Err(unsupported("probe `release`", "")),
             StmtKind::Assume(_) => Err(unsupported("`assume`", "")),
@@ -399,6 +399,22 @@ impl FuncBuilder<'_> {
                 op: crate::ir::ScoreboardOp::QueuePop { queue, dest: id },
             });
             return Ok(());
+        }
+        // `let txns = RandomTxns(5)` — a tseq generator call. The result
+        // is an `IrType::RecordSeq` assigned into a fresh test-scope local;
+        // the call edge is a `CallTarget::Tseq` whose args lower like any
+        // scalar call. Checked before the transactor-call form (a tseq
+        // name and a transactor field are disjoint namespaces).
+        if let ExprKind::Call { callee, args } = &*value.kind {
+            if let ExprKind::Ident(name) = &*callee.kind {
+                if let Some(&record) = self.ctx.tseqs.get(&name.name) {
+                    let call = self.lower_tseq_call(&name.name, args)?;
+                    let id = self.declare(&l.name.name);
+                    self.set_local_type(id, IrType::RecordSeq(record));
+                    self.push(Stmt::Assign(id, call));
+                    return Ok(());
+                }
+            }
         }
         // `let v = xact.method(...)` — a transactor call edge with a
         // result destination.
@@ -967,6 +983,79 @@ impl FuncBuilder<'_> {
             succ,
         });
         self.start_block(succ);
+        Ok(())
+    }
+
+    /// Lower a tseq generator call (`RandomTxns(5)`) into a
+    /// `CallTarget::Tseq` edge. Args are scalar expressions, lowered (and
+    /// port-hoisted) like any call argument; named args are rejected
+    /// (tseq params are positional, matching v1).
+    fn lower_tseq_call(
+        &mut self,
+        name: &str,
+        args: &[crate::ast::CallArg],
+    ) -> Result<Expr, LowerError> {
+        let mut lowered = Vec::with_capacity(args.len());
+        for a in args {
+            let crate::ast::CallArg::Expr(e) = a else {
+                return Err(unsupported(
+                    &format!("named argument in tseq call `{name}`"),
+                    "tseq parameters are positional",
+                ));
+            };
+            lowered.push(self.lower_expr_no_ports(e)?);
+        }
+        Ok(Expr::Call(crate::ir::CallTarget::Tseq(name.to_string()), lowered))
+    }
+
+    /// `yield t` inside a `tseq` body — append a record value onto the
+    /// sequence accumulator. The accumulator is the tseq function's `ret`
+    /// local (set by `tseqs::lower_tseq` via `set_tseq_result`); the
+    /// yielded value must be a record local whose type matches the
+    /// accumulator's element record (v1 emits `_result.push_back(t)`,
+    /// which would fail to compile on a type mismatch).
+    fn lower_yield(&mut self, value: &crate::ast::Expr) -> Result<(), LowerError> {
+        let Some(seq) = self.tseq_result else {
+            // Mirrors v1's "`yield` outside a `tseq` body" diagnostic.
+            return Err(unsupported(
+                "`yield` outside a `tseq` body",
+                "yield is only valid inside a `tseq ... end tseq` body",
+            ));
+        };
+        let elem = self
+            .seq_of_local(seq)
+            .expect("tseq accumulator is always RecordSeq-typed");
+        // The yielded value must be a bare record-typed local of the
+        // element type — the only thing `push_back` accepts.
+        let ExprKind::Ident(id) = &*value.kind else {
+            return Err(unsupported(
+                "`yield` of a non-identifier value",
+                "yield a record-typed local declared with `let t : <Transaction>`",
+            ));
+        };
+        let Some(local) = self.lookup(&id.name) else {
+            return Err(LowerError::Invalid(format!(
+                "yield {0}: `{0}` is not in scope",
+                id.name
+            )));
+        };
+        match self.record_of_local(local) {
+            Some(rid) if rid == elem => {}
+            _ => {
+                return Err(unsupported(
+                    &format!(
+                        "`yield {}` whose value is not a `{}` record local",
+                        id.name,
+                        self.ctx.records[elem.index()].name
+                    ),
+                    "yield a same-typed transaction local",
+                ));
+            }
+        }
+        self.push(Stmt::SeqPush {
+            seq,
+            value: Expr::Local(local),
+        });
         Ok(())
     }
 

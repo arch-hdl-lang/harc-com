@@ -403,6 +403,13 @@ impl FuncBuilder<'_> {
                     n: Box::new(n),
                 }
             }
+            Expr::SeqIndex { seq, index } => {
+                let index = self.hoist_ports(*index);
+                Expr::SeqIndex {
+                    seq,
+                    index: Box::new(index),
+                }
+            }
             other @ (Expr::Literal { .. }
             | Expr::WideLiteral(_)
             | Expr::Local(_)
@@ -414,6 +421,8 @@ impl FuncBuilder<'_> {
             | Expr::ScoreboardQuery { .. }
             // Component fields are host state — no DUT port inside.
             | Expr::ComponentField { .. }
+            // Sequence length is host state — no DUT port inside.
+            | Expr::SeqLen(_)
             | Expr::CovBin { .. }) => other,
         }
     }

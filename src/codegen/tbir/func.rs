@@ -247,6 +247,146 @@ pub(super) fn emit_function(
     Ok(())
 }
 
+/// Emit one `tseq` body as a `[&]`-capturing lambda named after the tseq,
+/// returning `std::vector<Record>` — v1's `emit_tseq` shape. The body is
+/// the same loop-switch as a method, but `Return` returns the `RecordSeq`
+/// accumulator (`ret`), `SeqPush` appends to it, and `Randomize` splices
+/// the shared Z3-solve snippet (tseq randomize sites live in the same
+/// global constraint table as test-body sites). A tseq body is host-side
+/// (randomize + yield + literal-range loops) — synchronous waits emit as
+/// `tick()` loops (v1's lambda semantics), and coroutine-only suspensions
+/// are a lowering-gate failure.
+pub(super) fn emit_tseq(
+    out: &mut String,
+    prog: &TbProgram,
+    func: &TbFunction,
+    records: &[RecordSchema],
+    randomize_snippets: &[String],
+    depth: usize,
+) -> Result<(), EmitError> {
+    let names = cpp_local_names(func);
+    // tseq bodies hold no packed-lane DUT access (no DUT at all).
+    let empty_lanes = HashMap::new();
+    let cx = ECx {
+        func,
+        names: &names,
+        lanes: &empty_lanes,
+    };
+    let nparams = func.params.len();
+    let pad = INDENT.repeat(depth);
+    let pad1 = INDENT.repeat(depth + 1);
+    let pad2 = INDENT.repeat(depth + 2);
+    let pad3 = INDENT.repeat(depth + 3);
+
+    // The element record name (for the `std::vector<Record>` return type).
+    let IrType::RecordSeq(rid) = func
+        .ret
+        .map(|r| func.local(r).ty.clone())
+        .unwrap_or(IrType::Unknown)
+    else {
+        return Err(EmitError(format!(
+            "tbir: tseq `{}` has no RecordSeq return accumulator (lowering bug)",
+            func.name
+        )));
+    };
+    let elem = records
+        .get(rid.index())
+        .ok_or_else(|| {
+            EmitError(format!(
+                "tbir: tseq `{}` references missing element record r{}",
+                func.name, rid.0
+            ))
+        })?
+        .name
+        .clone();
+
+    let params = names[..nparams]
+        .iter()
+        .map(|n| format!("uint64_t {n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(
+        out,
+        "{pad}auto {} = [&]({params}) -> std::vector<{elem}> {{",
+        func.name
+    )
+    .ok();
+    declare_locals(out, prog, func, &names, nparams, depth + 1)?;
+    writeln!(out, "{pad1}int __bb = {};", func.entry.0).ok();
+    writeln!(out, "{pad1}while (true) {{").ok();
+    writeln!(out, "{pad2}switch (__bb) {{").ok();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        writeln!(out, "{pad2}case {bi}: {{").ok();
+        for s in &block.stmts {
+            // tseq bodies have no testbench bus-binding scope.
+            emit_stmt(out, prog, &cx, records, &[], s, depth + 3)?;
+        }
+        match &block.terminator {
+            Terminator::Jump(b) => {
+                writeln!(out, "{pad3}__bb = {};", b.0).ok();
+            }
+            Terminator::Branch(c, t, f) => {
+                let cond = expr_cpp(&cx, c)?;
+                writeln!(out, "{pad3}if ({cond}) {{ __bb = {}; }} else {{ __bb = {}; }}", t.0, f.0)
+                    .ok();
+            }
+            Terminator::WaitCycles(n, None, b) | Terminator::WaitCyclesSync(n, b) => {
+                // v1's synchronous lambda wait: one tick() per cycle.
+                let n = expr_cpp(&cx, n)?;
+                writeln!(
+                    out,
+                    "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) tick();"
+                )
+                .ok();
+                writeln!(out, "{pad3}__bb = {};", b.0).ok();
+            }
+            Terminator::WaitUntil { preds, mode, succ } => {
+                let cond = preds_cpp(&cx, preds, *mode)?;
+                writeln!(out, "{pad3}while (!({cond})) tick();").ok();
+                writeln!(out, "{pad3}__bb = {};", succ.0).ok();
+            }
+            Terminator::Randomize {
+                constraints, succ, ..
+            } => {
+                let snippet = randomize_snippets.get(constraints.index()).ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: Randomize in tseq {} references missing constraint snippet c{}",
+                        func.name, constraints.0
+                    ))
+                })?;
+                out.push_str(snippet);
+                writeln!(out, "{pad3}__bb = {};", succ.0).ok();
+            }
+            Terminator::Return => match func.ret {
+                Some(r) => {
+                    writeln!(out, "{pad3}return {};", names[r.index()]).ok();
+                }
+                None => {
+                    // A tseq always has a RecordSeq accumulator; defend
+                    // anyway with an empty return.
+                    writeln!(out, "{pad3}return {{}};").ok();
+                }
+            },
+            other @ (Terminator::WaitCycles(_, Some(_), _)
+            | Terminator::WaitTimePs(_, _)
+            | Terminator::WaitUntilTimeout { .. }
+            | Terminator::Fatal(_)) => {
+                return Err(EmitError(format!(
+                    "tbir: tseq `{}` contains terminator {other:?} — lowering gate failed",
+                    func.name
+                )));
+            }
+        }
+        writeln!(out, "{pad3}break;").ok();
+        writeln!(out, "{pad2}}}").ok();
+    }
+    writeln!(out, "{pad2}default: return {{}};").ok();
+    writeln!(out, "{pad2}}}").ok();
+    writeln!(out, "{pad1}}}").ok();
+    writeln!(out, "{pad}}};").ok();
+    Ok(())
+}
+
 /// Forward declaration for a lowered pure helper, so source-order
 /// emission supports helper-to-helper calls in any order.
 pub(super) fn emit_helper_prototype(out: &mut String, func: &TbFunction) {
@@ -604,6 +744,13 @@ fn emit_stmt(
                 }
             }
         }
+        // `yield t` — append a record value to the sequence accumulator
+        // (v1's `_result.push_back(t)`).
+        Stmt::SeqPush { seq, value } => {
+            let name = &names[seq.index()];
+            let v = expr_cpp(cx, value)?;
+            writeln!(out, "{pad}{name}.push_back({v});").ok();
+        }
     }
     Ok(())
 }
@@ -717,16 +864,30 @@ fn declare_locals(
 ) -> Result<(), EmitError> {
     let pad = INDENT.repeat(depth);
     for (l, n) in func.locals.iter().zip(names).skip(skip) {
-        if let IrType::Record(r) = l.ty {
-            let rec = prog.records.get(r.index()).ok_or_else(|| {
-                EmitError(format!(
-                    "tbir: local `{n}` in {} references missing record r{}",
-                    func.name, r.0
-                ))
-            })?;
-            writeln!(out, "{pad}{} {n}{{}}; (void){n};", rec.name).ok();
-        } else {
-            writeln!(out, "{pad}uint64_t {n} = 0; (void){n};").ok();
+        match l.ty {
+            IrType::Record(r) => {
+                let rec = prog.records.get(r.index()).ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: local `{n}` in {} references missing record r{}",
+                        func.name, r.0
+                    ))
+                })?;
+                writeln!(out, "{pad}{} {n}{{}}; (void){n};", rec.name).ok();
+            }
+            // A transaction-sequence local — `std::vector<Record>`, v1's
+            // tseq accumulator / call-result shape.
+            IrType::RecordSeq(r) => {
+                let rec = prog.records.get(r.index()).ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: seq local `{n}` in {} references missing record r{}",
+                        func.name, r.0
+                    ))
+                })?;
+                writeln!(out, "{pad}std::vector<{}> {n}{{}}; (void){n};", rec.name).ok();
+            }
+            _ => {
+                writeln!(out, "{pad}uint64_t {n} = 0; (void){n};").ok();
+            }
         }
     }
     Ok(())

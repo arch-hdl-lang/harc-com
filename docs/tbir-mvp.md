@@ -29,6 +29,7 @@ checked against the code at the cited location.
 | initiator-BFM slice (2026-06-13) | initiator-side bus-bound BFM: a `transactor X bound to <Bus>` whose `hookable` methods drive the bound bus's handshake channels (the regblock `via <Helper>` form). Lowered in `src/ir/lower/transactors.rs` (`lower_bound_initiator_transactor`) — methods become `TransactorBody` `TbFunction`s on `TransactorSchema::methods`, `bus` resolves through a placeholder-keyed binding filled at test-bind time (`fill_initiator_bus_prefix`), and `recv()` field access (`r.data`) is supported via per-field capture. No new IR variants. Fixture `regblock_access_test` registered (trace-diff clean). See divergence 15. |
 | #372 | `randomize` via the constraint-IR seam: `Terminator::Randomize { target, constraints: ConstraintRef, succ }` + a `TbProgram::constraint_sites` table (the `ConstraintRef` handle resolves into it). Lowering merges transaction `keep`s ahead of the call-site `with {...}` body (spec §4) and records each site with its `ConstraintProblemId` handle. The tbir backend reuses v1's Z3-solve emission verbatim (`cpp_tb::emit_randomize_snippets` → `emit_constraint_solver_block` / unconstrained-PRNG shell / `emit_randomize_trace_event`) — "the constraint runtime is shared; only the call site moves to the IR backend." The runtime problem table + `harc_z3_rt.h` include are emitted iff a site exists. New passes wiring: `lower_coroutine` treats Randomize as a host-sync transition (`Trigger::Solved`); `placement` tiers a solve block at Tier-2 host-service and capability-checks `solve_*`. Fixtures: `keep_constraints_test` (bare `randomize(t)` + transaction keeps), `axilite_constraint_test` (`randomize(p) with` + Z3 cross-field constraints). Both trace-diff clean v1↔tbir at seed 1. `randomize` *expressions* (`let v = randomize(t)`), scoreboard-`.push`/`tseq`-gated randomize fixtures, and method-body randomize stay rejected (residual map below). |
 | tb-component-field slice (2026-06-13) | composite-component **testbench-field binding** — a component bound as a `testbench` FIELD (`prod : Producer` / `sb : Sb` / `top : HeartbeatEnv` inside the `testbench` block, alongside `dut : Top`), the complement of the already-shipped test-scope `let env : <Env>` binding. NO new IR variants: the testbench-field walk in `lower/mod.rs` routes a component-typed field into the SAME `test_scope_components` collector a test-scope `let` uses, so it flows into `ComponentFieldBinding`/`component_fields` and lowers to a default-constructed run-scope instance identically. The impl-for desugaring prefixes a testbench-field access with `_tb` (`prod.in_ev` → `_tb.prod.in_ev`); a new `FuncBuilder::strip_tb_prefix` helper (`components.rs`) strips that prefix in every component-access path (`as_component_method_call`, `as_component_field_{target,read}`, `lower_emit`, `as_component_idle`) and `as_port_ref` skips a `_tb.<component>` root, so `emit`/`idle_in`/field reads/writes all resolve to the bare-name instance. `validate_testbench_component` now ACCEPTS a component-typed field (a `mode` keyword on one is rejected — it's a transactor concept). Hardening: `event<transaction/struct>` payloads now reject precisely at component-schema lowering (`event<TinyTxn>` parses the payload as `TypeArg::Expr`/`Named`, previously mis-lowered to a scalar callback and failed at C++ compile). Fixture `tb_field_agent_test` (`top_counter.sv`, pass) — the agent from `agent_on_handler_test` bound as a testbench field instead of a test-scope let; trace-diff clean v1↔tbir at seed 1. See divergence 16. `event<transaction>` payloads, `quiesced(N)`, `watchdog`, named `phase`, `on <N> cycles`, scoreboard-`queue` SUB-components in an env, and `wait until` with heartbeat predicates stay rejected (residual map below). |
+| tseq slice (2026-06-13) | `tseq` (transaction-sequence) construct (`src/ir/lower/tseqs.rs`): a named generator of a sequence of transaction values, iterated with `for t in <TSeq>`. New IR (minimal): `IrType::RecordSeq(RecordId)`, `FunctionKind::Tseq { record }`, `CallTarget::Tseq(name)`, `Stmt::SeqPush`, `Expr::SeqLen`/`Expr::SeqIndex`. The generator lowers to a `[&]`-lambda returning `std::vector<Record>` (v1's `emit_tseq`); `yield t` → `SeqPush`; `randomize(t)` reuses the merged constraint-IR seam (#372 — the solver problem table already catalogs tseq randomize sites); `let txns = Gen(5)` → a `CallTarget::Tseq` edge typing the local `RecordSeq`; `for t in txns` → a counted loop copying `txns[i]` into the record loop variable each iteration (reusable — the sequence is materialized once). Fixtures: `tseq_basic_test` (self-proving — randomize + override + reusable double-iteration) and `axilite_fuzz_test` (corpus fuzz test, `--test AxiLiteFuzzTest` + helpers) — both trace-diff clean v1↔tbir at seed 1, both need Z3. The three sequencer corpus fixtures lower their tseq but stop at deeper blockers (transactor state field — divergence 10; agent-mode multi-DUT-handle); those stay rejected (divergence 17). |
 | sequencer slice (2026-06-13) | `sequencer` construct (builds on the env-composition + agent/on-handler core, `src/ir/lower/components.rs`): a `sequencer` is the analysis-source component shape — an `out event<T>` analysis port plus `hookable` methods that generate a stimulus stream and `emit` each item on that port. It routes through the same `CompSource`/`ComponentSchema` machinery as a method-bearing scoreboard or analysis-source transactor; the only addition is `ComponentKindTag::Sequencer` (+ `CompSource::Sequencer`) for dump-ir/diagnostics. A `connect <sqr>.dispatched -> <drv>.<sink>` edge inside the composing env wires the emitted stream into a sink method (the UVM sequencer/driver bridge). No new IR variants, no new statement/expr forms — sequencer methods, `emit`, and `connect` all reuse the existing component lowering. Fixture: `sequencer_connect_test` (`top_counter.sv`/`top_counter.arch`, pass) — a `dispatch(n)` hookable emitting over a literal-range `for i in 0 .. n` loop, connected to a scoreboard sink; trace-diff clean v1↔tbir at seed 1. The three corpus sequencer fixtures (`axilite_connect_test`, `transactor_agent_mode_test`, `transactor_env_mode_test`) stay blocked: each iterates a `tseq` (`for t in <TSeq>` + `randomize`) inside its `dispatch`, and the agent/env fixtures additionally stack mode-inheritance + cycle-trigger `on dut.x && dut.y` handlers; those gate on the `tseq`/`randomize-in-tseq` + agent-mode slices (divergence 16). |
 
 ### Construct subset
@@ -962,6 +963,77 @@ reason. Code locations are authoritative.
       handlers, which need the agent-mode + cycle-trigger slices. None of
       the three fully unlock from the sequencer construct alone.
 
+17. **`tseq` (transaction-sequence) construct (2026-06-13).** A `tseq`
+    is a named generator of a sequence of transaction values, iterated
+    with `for t in <TSeq>`. v1 (`cpp_tb::emit_tseq`) lowers it to a
+    `[&]`-capturing lambda filling a `std::vector<T> _result` via `yield
+    t` and returning it; `for t in <TSeq>` then range-iterates the
+    vector. The TB-IR mirrors this with one element-record-typed
+    sequence and the existing randomize seam — `src/ir/lower/tseqs.rs`.
+    - *New IR (minimal).* `IrType::RecordSeq(RecordId)` (a
+      `std::vector<Record>` local), `FunctionKind::Tseq { record }` (the
+      generator body, whose `ret` slot is the RecordSeq accumulator),
+      `CallTarget::Tseq(name)` (the generator call edge),
+      `Stmt::SeqPush { seq, value }` (`yield t`), and two value forms for
+      iteration: `Expr::SeqLen(seq)` (`seq.size()`, the loop bound) and
+      `Expr::SeqIndex { seq, index }` (`seq[i]`, the record-valued
+      element). All exhaustive matches (display/verify/passes/codegen)
+      carry the new arms.
+    - *Randomize reuse.* `randomize(t)` inside a tseq body lowers through
+      the SAME `Terminator::Randomize` + `ConstraintRef` seam as a
+      test-body randomize (#372): the typed solver problem table already
+      catalogs tseq randomize sites
+      (`problem_table::collect_tseq_randomize_sites`), so a tseq site
+      resolves its `problem_id` by span exactly like a test-body site,
+      and the tbir backend splices v1's shared Z3-solve snippet. No
+      second constraint path.
+    - *Generator lowering.* A `tseq Gen(n) -> TSeq<Req>` becomes a
+      `FunctionKind::Tseq` function: params first (locals 0..nparams), a
+      `RecordSeq` accumulator (`__result`, the `ret` slot, live from
+      entry since the backend always default-constructs it), then the
+      body. `yield t` is `SeqPush(__result, t)` (the value must be a
+      same-typed record local, else a precise rejection — v1's
+      `_result.push_back(t)` would fail to compile otherwise);
+      `Terminator::Return` returns `__result`. Emitted as a
+      `[&]`-capturing lambda `auto Gen = [&](uint64_t n) ->
+      std::vector<Req> { … };` declared before the run coroutine (v1's
+      `emit_tseq` placement) so the `[&]` capture sees it.
+    - *Call + iteration.* `let txns = Gen(5)` is
+      `Assign(txns, Call(Tseq("Gen"), [5]))` with `txns` typed
+      `RecordSeq` — emitted as a direct `Gen(5)` lambda call. `for t in
+      txns` lowers to a counted loop `i = 0 .. SeqLen(txns)` whose body
+      first copies `txns[i]` (`SeqIndex`) into the record-typed loop
+      variable, then runs the user body. The sequence is materialized
+      once and may be iterated repeatedly (a reusable value, not a
+      consumed stream) — the `tseq_basic_test` fixture iterates the same
+      `txns` twice.
+    - *Element type must be a record.* `tseq_element_name` requires
+      `-> TSeq<Record>` where `Record` is a declared
+      `transaction`/`struct`; a missing return type, a non-`TSeq`
+      return, or a `TSeq<scalar>` is a precise `Unsupported` at
+      `collect_tseq_records` (the IR's sequence-element model is a
+      value-record). `yield` outside a tseq body is rejected with v1's
+      "`yield` outside a `tseq` body" intent.
+    - *Fixtures.* `tseq_basic_test` (`top_counter.sv`/`top_counter.arch`,
+      pass) — a self-proving `Gen(5)` with `randomize` + a post-randomize
+      field override + reusable double-iteration; trace-diff clean
+      v1↔tbir at seed 1. `axilite_fuzz_test` (`AxiLiteRegs.sv`, pass,
+      `--test AxiLiteFuzzTest` + `axilite_regs_test.harc` helpers) — the
+      corpus fuzz test fully unlocks: `tseq RandomRegs(5)` of random
+      `RegData` writes/reads driven through the `axil_write`/`axil_read`
+      impure helpers; trace-diff clean at seed 1. Both need Z3.
+    - *Corpus residuals (deeper, NOT unlocked by tseq alone).* The three
+      sequencer corpus fixtures still stop past the tseq: `tseq` now
+      lowers in each, but `axilite_connect_test`/
+      `transactor_agent_mode_test`/`transactor_env_mode_test` next trip
+      on a transactor **state field** (`last_read : uint<32>` — needs
+      per-instance state materialization, divergence 10) and, for the
+      agent/env forms, a transactor with **more than one module-typed
+      field** (agent-mode DUT-handle inheritance). Those are separate
+      slices. `axilite_seqdrv_test` likewise lowers its tseq and now
+      trips on the transactor state field (the negative-test snapshot
+      shifted from `tseq` to that message).
+
 Minor, same spirit: `IndexVec` is a plain `Vec` plus typed id structs;
 the design's `AssertFail` enum collapsed into a single
 `FmtArgs on_fail` because both source forms bump `errors` identically
@@ -1003,10 +1075,11 @@ text named `transaction`. That predicted shift has now happened:
 with `transaction` in the subset, `wait_until_quiesce_unsupported`
 names the `agent` construct (next item in file order),
 `axilite_seqdrv_unsupported` named `transactor` — and shifted again
-with the transactor slice: that fixture's transactor now passes the
-item gate, so the snapshot names `tseq` (its event-driven transactor
-body would also reject, but `tseq` sits earlier in the file-gate
-order). The `axilite_constraint` fixture was the last member of this
+with the transactor slice (snapshot named `tseq`), then again with the
+tseq slice: that fixture's `tseq` now lowers, so the snapshot names the
+transactor **state field** `last_read` (per-instance state
+materialization, divergence 10, deferred). The `axilite_constraint`
+fixture was the last member of this
 group and has since left it — `randomize` lowers as of #372. The same
 mechanics apply to the next construct slice: a fixture's snapshot always names
 whichever out-of-subset construct lowering hits first, and shifts
@@ -1029,8 +1102,9 @@ see its decision log):
 - **Subset growth**: randomize statement/terminator form + the
   constraint-IR `ConstraintRef` seam landed 2026-06-13 (#372); the
   residual randomize edges are the *expression* form (`let v =
-  randomize(t)`), method-body randomize, and randomize sites gated
-  behind not-yet-lowered constructs (`tseq`, scoreboard `.push`). Other
+  randomize(t)`) and method-body randomize. `tseq` (transaction-sequence
+  iteration + `randomize`-in-tseq) landed 2026-06-13 (divergence 17) —
+  the `tseq`-gated randomize edge is now lowered. Other
   growth: transaction *declarations* and non-randomize record usage
   landed 2026-06-12, as did range/cross bins, `any of`, the bus subset,
   and unbound DUT-poking transactors — the initiator-side

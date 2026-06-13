@@ -237,6 +237,7 @@ pub(crate) fn lower_transactor(
         // (the nullptr-descriptor fallback, matching v1).
         txn_keeps: HashMap::new(),
         randomize_problem_ids: HashMap::new(),
+    tseqs: HashMap::new(),
     };
 
     let mut funcs = Vec::new();
@@ -436,6 +437,7 @@ fn lower_bound_target_transactor(
         // problem table; a `randomize` here lowers with no problem-id.
         txn_keeps: HashMap::new(),
         randomize_problem_ids: HashMap::new(),
+    tseqs: HashMap::new(),
     };
 
     let mut funcs = Vec::new();
@@ -715,6 +717,7 @@ fn lower_bound_initiator_transactor(
         component_fields: HashMap::new(),
         txn_keeps: HashMap::new(),
         randomize_problem_ids: HashMap::new(),
+    tseqs: HashMap::new(),
     };
 
     let mut funcs = Vec::new();

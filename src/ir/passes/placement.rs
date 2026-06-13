@@ -338,6 +338,12 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                     visit_expr(a, &mut accesses, &mut transactor);
                 }
             }
+            Stmt::SeqPush { value, .. } => {
+                // `yield t` inside a tseq body — host-side accumulation, no
+                // pin access of its own; the value may carry inline reads.
+                host_service_only = false;
+                visit_expr(value, &mut accesses, &mut transactor);
+            }
         }
     }
     match &block.terminator {
@@ -411,6 +417,7 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
         }
         Expr::WidthCast { inner, .. } => visit_expr(inner, accesses, transactor),
         Expr::ComponentIdle { n, .. } => visit_expr(n, accesses, transactor),
+        Expr::SeqIndex { index, .. } => visit_expr(index, accesses, transactor),
         Expr::Call(target, args) => {
             if matches!(target, CallTarget::TransactorMethod { .. }) {
                 *transactor = true;
@@ -427,6 +434,7 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
         | Expr::TransactorState { .. }
         | Expr::ScoreboardQuery { .. }
         | Expr::ComponentField { .. }
+        | Expr::SeqLen(_)
         | Expr::CovBin { .. } => {}
     }
 }

@@ -21,6 +21,7 @@ mod records;
 mod regblock;
 mod scoreboards;
 mod stmts;
+mod tseqs;
 mod transactors;
 
 use crate::ast::{
@@ -252,6 +253,14 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         }
     }
 
+    // `tseq` (transaction-sequence) declarations: name → element record
+    // type. Validated up front (the element type must be a declared
+    // record); the bodies lower to `FunctionKind::Tseq` functions after
+    // the pure helpers (so FunctionIds stay sequential). Threaded into
+    // every `LowerCtx` so a `let txns = Name(...)` resolves the call edge
+    // and a `for t in txns` resolves the iteration.
+    let tseq_records = tseqs::collect_tseq_records(&file, &record_ids)?;
+
     // Helper functions: categorize pure vs impure, reject recursion.
     // Pure helpers lower eagerly below; impure helpers are CFG-inlined
     // at each call site during body lowering.
@@ -375,6 +384,10 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             // (a sequencer testbench field is rejected via
             // `component_type_names`); inert at this gate.
             Item::Sequencer(_) => {}
+            // `tseq` declarations are validated by `collect_tseq_records`
+            // (element type must be a declared record) and lowered to
+            // `FunctionKind::Tseq` functions below — inert at this gate.
+            Item::Tseq(_) => {}
             Item::Env(c) | Item::Agent(c) => {
                 if used_tbs.contains(&c.name.name) {
                     validate_testbench_component(
@@ -504,6 +517,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         // never fire in one — these maps stay inert here.
         txn_keeps: HashMap::new(),
         randomize_problem_ids: HashMap::new(),
+        tseqs: HashMap::new(),
     };
     for it in &file.items {
         let Item::Function(fd) = it else { continue };
@@ -517,6 +531,47 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         }
         let id = FunctionId(prog.functions.len() as u32);
         let f = helpers::lower_pure_helper(id, fd, &helper_registry, &helper_ctx, &constraint_sites)?;
+        prog.functions.push(f);
+    }
+
+    // `tseq` bodies, in file order: one `FunctionKind::Tseq` function
+    // each, recorded as `name → FunctionId` so the test body can resolve
+    // a `let txns = Name(...)` call edge. A tseq body holds record locals
+    // and `randomize`, so its ctx carries the records / keep / problem-id
+    // / tseq tables — but no test-scope bindings (a tseq cannot poke the
+    // DUT, a bus, or a transactor field; those are test-scope only).
+    let tseq_ctx = LowerCtx {
+        dut_field: "dut".to_string(),
+        tb_field: None,
+        cov_fields: HashMap::new(),
+        covgroups: Vec::new(),
+        clock_names: Vec::new(),
+        record_ids: record_ids.clone(),
+        records: prog.records.clone(),
+        bus_bindings: HashMap::new(),
+        transactor_fields: HashMap::new(),
+        transactors: Vec::new(),
+        scoreboard_fields: HashMap::new(),
+        scoreboards: Vec::new(),
+        consts: consts.clone(),
+        tb_scalar_fields: HashSet::new(),
+        tb_methods: HashMap::new(),
+        test_scope_lets: HashSet::new(),
+        regblock_bindings: HashMap::new(),
+        regblock_init_order: Vec::new(),
+        bare_transactor_fields: HashSet::new(),
+        target_state: HashMap::new(),
+        components: Vec::new(),
+        component_fields: HashMap::new(),
+        txn_keeps: txn_keeps.clone(),
+        randomize_problem_ids: randomize_problem_ids.clone(),
+        tseqs: tseq_records.clone(),
+    };
+    for it in &file.items {
+        let Item::Tseq(decl) = it else { continue };
+        let record = tseq_records[&decl.name.name];
+        let id = FunctionId(prog.functions.len() as u32);
+        let f = tseqs::lower_tseq(id, decl, record, &tseq_ctx, &helper_registry, &constraint_sites)?;
         prog.functions.push(f);
     }
 
@@ -632,6 +687,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         // problem-id (v1's nullptr-descriptor fallback).
         txn_keeps: HashMap::new(),
         randomize_problem_ids: HashMap::new(),
+        // Component methods cannot call a tseq generator (test-scope only).
+        tseqs: HashMap::new(),
     };
     let mut method_funcs: Vec<TbFunction> = Vec::new();
     for (i, src) in comp_sources.iter().enumerate() {
@@ -675,6 +732,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &helper_registry,
             &txn_keeps,
             &randomize_problem_ids,
+            &tseq_records,
             &constraint_sites,
             &mut prog,
         )?;
@@ -870,6 +928,7 @@ fn lower_test(
     helpers: &helpers::HelperRegistry<'_>,
     txn_keeps: &HashMap<String, Vec<crate::ast::Expr>>,
     randomize_problem_ids: &HashMap<(usize, usize), u32>,
+    tseq_records: &HashMap<String, RecordId>,
     constraint_sites: &RefCell<Vec<ConstraintSite>>,
     prog: &mut TbProgram,
 ) -> Result<(), LowerError> {
@@ -1751,6 +1810,7 @@ fn lower_test(
         component_fields: component_field_map,
         txn_keeps: txn_keeps.clone(),
         randomize_problem_ids: randomize_problem_ids.clone(),
+        tseqs: tseq_records.clone(),
     };
 
     // Synthesized auto-sampler functions, one per covergroup field, in
@@ -2028,6 +2088,11 @@ pub(crate) struct LowerCtx {
     /// site, keyed exactly like v1's `runtime_randomize_problem_ids`.
     /// `None` at a site means no Z3-ready problem (lower/backend error).
     pub randomize_problem_ids: HashMap<(usize, usize), u32>,
+    /// `tseq` name → element record type. A `let txns = Name(args)` whose
+    /// callee is in this map lowers to a `CallTarget::Tseq` whose result
+    /// types the local as `IrType::RecordSeq(record)`, and a `for t in
+    /// txns` over such a local lowers to a counted loop over `txns`.
+    pub tseqs: HashMap<String, RecordId>,
 }
 
 pub(crate) struct LoopFrame {
@@ -2123,6 +2188,13 @@ pub(crate) struct FuncBuilder<'a> {
     /// reads (`let v = bus.r.recv(); assert v == ...`) — so this map is
     /// consulted only for the dotted `r.<field>` form.
     pub(crate) recv_payloads: HashMap<LocalId, Vec<(String, LocalId)>>,
+
+    /// The `RecordSeq` accumulator local of the `tseq` body currently
+    /// being lowered (`Some` only inside a `FunctionKind::Tseq` body). A
+    /// `yield t` lowers to `Stmt::SeqPush { seq: this, value: t }`; a
+    /// `yield` reaching lowering with `None` is rejected (yield outside a
+    /// tseq), matching v1's "`yield` outside a `tseq` body" error.
+    pub(crate) tseq_result: Option<LocalId>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2190,7 +2262,14 @@ impl<'a> FuncBuilder<'a> {
             self_component: None,
             constraint_sites,
             recv_payloads: HashMap::new(),
+            tseq_result: None,
         }
+    }
+
+    /// Mark the `RecordSeq` accumulator of the tseq body being lowered, so
+    /// `yield` knows its push target.
+    pub(crate) fn set_tseq_result(&mut self, acc: LocalId) {
+        self.tseq_result = Some(acc);
     }
 }
 
@@ -2327,6 +2406,15 @@ impl FuncBuilder<'_> {
     pub(crate) fn record_of_local(&self, l: LocalId) -> Option<ir::RecordId> {
         match self.locals[l.index()].ty {
             IrType::Record(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// `Some(record)` when the local is a transaction-sequence
+    /// (`let txns = SomeTseq(...)`, typed `RecordSeq`).
+    pub(crate) fn seq_of_local(&self, l: LocalId) -> Option<ir::RecordId> {
+        match self.locals[l.index()].ty {
+            IrType::RecordSeq(r) => Some(r),
             _ => None,
         }
     }
@@ -2488,6 +2576,10 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 ir::Stmt::ComponentFieldWrite { value, .. } => in_expr(value),
                 ir::Stmt::ComponentEmit { args, .. } => args.iter().find_map(in_expr),
                 ir::Stmt::ComponentCall { args, .. } => args.iter().find_map(in_expr),
+                // tseq bodies never appear in a bound-to responder body
+                // (transactor-method randomize / tseq is out of subset),
+                // so the yielded value holds no transactor-state node.
+                ir::Stmt::SeqPush { value, .. } => in_expr(value),
                 ir::Stmt::DutRead(_, _) | ir::Stmt::RecordInit(_, _) | ir::Stmt::CovReport(_) => {
                     None
                 }
@@ -2522,6 +2614,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             }
             ir::Expr::WidthCast { inner, .. } => fill_expr(inner, instance),
             ir::Expr::ComponentIdle { n, .. } => fill_expr(n, instance),
+            ir::Expr::SeqIndex { index, .. } => fill_expr(index, instance),
             ir::Expr::Call(_, args) => {
                 for a in args {
                     fill_expr(a, instance);
@@ -2535,6 +2628,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             | ir::Expr::TbField(_)
             | ir::Expr::ComponentField { .. }
             | ir::Expr::ScoreboardQuery { .. }
+            | ir::Expr::SeqLen(_)
             | ir::Expr::CovBin { .. } => {}
         }
     }
@@ -2612,6 +2706,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                         fill_expr(a, instance);
                     }
                 }
+                ir::Stmt::SeqPush { value, .. } => fill_expr(value, instance),
                 ir::Stmt::DutRead(_, _) | ir::Stmt::RecordInit(_, _) | ir::Stmt::CovReport(_) => {}
             }
         }
@@ -2696,6 +2791,9 @@ fn fill_initiator_bus_prefix(func: &mut TbFunction, binding: &str) -> Result<(),
                     visit_expr(a, placeholder, binding, rewrite, conflict);
                 }
             }
+            Expr::SeqIndex { index, .. } => {
+                visit_expr(index, placeholder, binding, rewrite, conflict)
+            }
             Expr::Literal { .. }
             | Expr::WideLiteral(_)
             | Expr::Local(_)
@@ -2704,6 +2802,7 @@ fn fill_initiator_bus_prefix(func: &mut TbFunction, binding: &str) -> Result<(),
             | Expr::TransactorState { .. }
             | Expr::ComponentField { .. }
             | Expr::ScoreboardQuery { .. }
+            | Expr::SeqLen(_)
             | Expr::CovBin { .. } => {}
         }
     }
@@ -2751,6 +2850,9 @@ fn fill_initiator_bus_prefix(func: &mut TbFunction, binding: &str) -> Result<(),
                         for a in args {
                             visit_expr(a, placeholder, binding, rewrite, &mut conflict);
                         }
+                    }
+                    Stmt::SeqPush { value, .. } => {
+                        visit_expr(value, placeholder, binding, rewrite, &mut conflict)
                     }
                     Stmt::RecordInit(_, _) | Stmt::CovReport(_) => {}
                 }

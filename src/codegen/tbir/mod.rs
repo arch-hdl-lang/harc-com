@@ -323,6 +323,15 @@ fn emit_test(
             &format!("_tb.{field}"),
         );
     }
+    // tseq generator lambdas — one `<Name>` per `tseq` declaration in the
+    // file, declared before the run coroutine so its `[&]` capture sees
+    // them (v1's `emit_tseq` placement). Each returns a
+    // `std::vector<Record>` and runs the body's randomize/yield loop.
+    for f in &prog.functions {
+        if let ir::FunctionKind::Tseq { .. } = f.kind {
+            func::emit_tseq(out, prog, f, &prog.records, randomize_snippets, 1)?;
+        }
+    }
     // Transactor method lambdas — one `<Type>_<method>` per method of
     // every transactor the testbench instantiates, declared before the
     // run coroutine so its `[&]` capture sees them (v1 emission order).

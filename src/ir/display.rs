@@ -282,6 +282,7 @@ fn kind_str(k: &FunctionKind) -> String {
         FunctionKind::ComponentMethod { component } => {
             format!("ComponentMethod(c{})", component.0)
         }
+        FunctionKind::Tseq { record } => format!("Tseq(r{})", record.0),
     }
 }
 
@@ -293,6 +294,7 @@ fn type_str(t: &IrType) -> String {
         IrType::SInt(None) => "sint".to_string(),
         IrType::Bool => "bool".to_string(),
         IrType::Record(r) => format!("record(r{})", r.0),
+        IrType::RecordSeq(r) => format!("seq(r{})", r.0),
         IrType::Unknown => "unknown".to_string(),
     }
 }
@@ -361,6 +363,11 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
                 None => format!("ComponentCall({call})"),
             }
         }
+        Stmt::SeqPush { seq, value } => format!(
+            "SeqPush({}, {})",
+            local_str(func, *seq),
+            expr_str(func, value)
+        ),
     }
 }
 
@@ -587,6 +594,10 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         Expr::CovBin { inst, point, bin } => {
             format!("CovBin({}.cg{}, {point}, {bin})", inst.tb_field, inst.covgroup.0)
         }
+        Expr::SeqLen(l) => format!("SeqLen({})", local_str(func, *l)),
+        Expr::SeqIndex { seq, index } => {
+            format!("SeqIndex({}, {})", local_str(func, *seq), expr_str(func, index))
+        }
         Expr::Call(target, args) => {
             let t = match target {
                 CallTarget::Helper(n) => n.clone(),
@@ -594,6 +605,7 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
                 CallTarget::TransactorMethod { bus_field, method } => {
                     format!("{bus_field}.{method}")
                 }
+                CallTarget::Tseq(n) => format!("tseq:{n}"),
             };
             let a = args
                 .iter()

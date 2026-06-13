@@ -102,7 +102,7 @@ Residual first-blocker map for the other 16 (re-run of
 | `bus` (3) | `axilite_regs_full_test`, `bind_remap_test`, `transactor_parse_test` |
 | `regblock` (7) | `regblock_basic_test`, `regblock_fields_test`, `regblock_access_test`, `regblock_bitbash_test`, `regblock_addrmap_test`, `regblock_alias_test`, `regblock_record_test` — **regblock slice landed 2026-06-12; the bus-bound `via` helper landed 2026-06-13 (initiator-side BFM). `regblock_access_test` now fully lowers and is registered; the other six advance to deeper regblock residuals — see the `regblock` construct group below.** |
 | `scoreboard` (2) | `analysis_sink_connect_test`, `axilite_env_test` |
-| `tseq` (2) | `axilite_seqdrv_test`, `transactor_active_test` |
+| ~~`tseq` (2)~~ → deeper | `axilite_seqdrv_test`, `transactor_active_test` — **tseq slice landed 2026-06-13; both lower their `tseq` now and advance to deeper residuals — `axilite_seqdrv_test` → transactor state field, `transactor_active_test` → bound-to transactor event field — see the `tseq` construct group below** |
 | transactor state fields (1) | `axilite_hooks_test` — "transactor `HookXactor` state field `last_read`" (scalar state on the transactor; needs instance-state materialization) |
 | >64-bit method params (1) | `aes_cipher_top_test` — "transactor method `AesXactor.load_block` parameter `key` wider than 64 bits (uint<128>)" (the tbir value model is u64) |
 
@@ -318,9 +318,9 @@ dump-ir`, 2026-06-13):
 | Next blocker | Fixtures |
 |---|---|
 | `agent` construct + `on <ev>` event handlers | `heartbeat_idle_test`, `wait_until_quiesce_test`, `watchdog_quiesce_test`, `watchdog_trip_diagnostic_test`, `env_quiesced_phase_test` (also need `phase`, `idle(N)`/`quiesced(N)` predicates, watchdog) |
-| ~~`sequencer` construct~~ → now **`tseq`** | `axilite_connect_test`, `transactor_agent_mode_test`, `transactor_env_mode_test` — **`sequencer` lowers since the sequencer slice (2026-06-13)**; each now stops at the `tseq` (`for t in <TSeq>` + `randomize`) inside its `dispatch`, and the agent/env pair additionally stack mode-inheritance + cycle-trigger `on dut.x && dut.y` handlers |
-| `tseq` construct | `axilite_bound_mon_test` |
-| `tseq` + `randomize` | `axilite_env_test` (env composition itself now lowers; the `RandomTxns` tseq + `randomize(t)` in the run body are the next blockers) |
+| ~~`sequencer` construct~~ → ~~`tseq`~~ → now **transactor state field / agent-mode** | `axilite_connect_test`, `transactor_agent_mode_test`, `transactor_env_mode_test` — **`sequencer` lowers (sequencer slice) and `tseq` lowers (tseq slice, 2026-06-13)**; each now stops at a transactor **state field** (`axilite_connect_test`) or a transactor with **>1 module-typed field** (the agent/env pair), and the agent/env pair additionally stack mode-inheritance + cycle-trigger `on dut.x && dut.y` handlers — see the `tseq` construct group |
+| ~~`tseq` construct~~ → bound-to transactor | `axilite_bound_mon_test` — **`tseq` slice landed**; now stops at a bound-to transactor **state field** (the bound-monitor/responder state, divergence 10/13) |
+| ~~`tseq` + `randomize`~~ → sub-component field | `axilite_env_test` — **its `tseq` + `randomize(t)` now lower (tseq slice)**; now stops at an env **sub-component field** type (a deeper env-composition feature, not tseq) |
 
 The env-composition machinery (component structs, methods with instance
 state, connect wiring, emit fan-out) is now in place; the residual
@@ -382,20 +382,51 @@ env `connect` → scoreboard sink) authored for this slice, lowering
 cleanly, passing the v1-vs-tbir pair, trace-diff clean at seed 1.
 
 The three corpus sequencer fixtures no longer reject on `sequencer` —
-each lowers its `sequencer` now but rejects one level deeper. Residual
-first-blocker map (re-run of `harc dump-ir`, 2026-06-13):
+each lowers its `sequencer` now but rejects one level deeper. After the
+**tseq slice** (below) their `tseq` lowers too, so they shift one more
+level deeper (see the tseq residual map).
+
+### `tseq` construct — **RESOLVED 2026-06-13 (tseq slice)**
+
+> ~~TB-IR lowering does not support the `tseq` construct yet~~
+
+The `tseq` (transaction-sequence) construct now lowers
+(`src/ir/lower/tseqs.rs`; see docs/tbir-mvp.md divergence 17). A `tseq` is
+a named generator of a sequence of transaction values iterated with `for
+t in <TSeq>`. New IR (minimal): `IrType::RecordSeq(RecordId)`,
+`FunctionKind::Tseq { record }`, `CallTarget::Tseq(name)`,
+`Stmt::SeqPush`, `Expr::SeqLen`/`Expr::SeqIndex`. The generator lowers to
+a `[&]`-lambda returning `std::vector<Record>` (v1's `emit_tseq`); `yield
+t` → `SeqPush`; `randomize(t)` inside the body reuses the merged
+constraint-IR seam (#372 — the solver problem table already catalogs tseq
+randomize sites); `let txns = Gen(5)` → a `CallTarget::Tseq` edge typing
+the local `RecordSeq`; `for t in txns` → a counted loop copying `txns[i]`
+into the record loop variable each iteration (the sequence is
+materialized once and may be re-iterated). **Registered**:
+`tseq_basic_test` — a self-proving fixture (randomize + post-randomize
+field override + reusable double-iteration), and `axilite_fuzz_test` —
+the corpus fuzz test (`--test AxiLiteFuzzTest` + `axilite_regs_test.harc`
+helpers), a `tseq RandomRegs(5)` of random writes/reads through the
+`axil_write`/`axil_read` impure helpers. Both trace-diff clean v1↔tbir at
+seed 1; both need Z3.
+
+The remaining corpus tseq fixtures lower their tseq now but reject one
+level deeper. Residual first-blocker map (re-run of `harc dump-ir`,
+2026-06-13):
 
 | Next blocker | Fixtures |
 |---|---|
-| `tseq` construct (each `dispatch` iterates `for t in <TSeq>` over a `let txns = RandomTxns(5)`, with `randomize(t)` inside the `tseq`) | `axilite_connect_test`, `transactor_agent_mode_test`, `transactor_env_mode_test` |
+| transactor **state field** (`last_read : uint<32>` — per-instance state, divergence 10) | `axilite_connect_test`, `axilite_seqdrv_test` |
+| transactor with **>1 module-typed field** (agent-mode DUT-handle inheritance) | `transactor_agent_mode_test`, `transactor_env_mode_test` |
+| `tseq` construct (data-stream tseq with no record element — needs the scalar/non-record element seam) | `axilite_bound_mon_test` |
 
 `axilite_connect_test` additionally binds its `env : AxilEnv` as a
-**testbench field** (the binding slice above), and the two
-`transactor_*_mode` fixtures stack mode-inheritance (`active`/`passive`
-flowing env→agent→transactor) + cycle-trigger `on dut.x && dut.y`
-handlers inside the transactor. So none fully unlock from the sequencer
-construct alone; they own the `tseq` + agent-mode + testbench-field
-slices.
+**testbench field** (the binding slice above) and stacks env→agent→driver
+`connect` wiring; the two `transactor_*_mode` fixtures stack
+mode-inheritance (`active`/`passive` flowing env→agent→transactor) +
+cycle-trigger `on dut.x && dut.y` handlers inside the transactor. So none
+of those three fully unlock from the tseq construct alone; they own the
+transactor-state + agent-mode + testbench-field slices.
 
 ### `scoreboard` construct — **PARTIALLY RESOLVED 2026-06-12 (scoreboard slice)**
 
