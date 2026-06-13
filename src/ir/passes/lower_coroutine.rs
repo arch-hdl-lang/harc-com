@@ -23,10 +23,11 @@
 //! as a side-table keyed by function. `cpp_tb`/tbir keep consuming the
 //! CFG directly and ignore the metadata.
 //!
-//! Tagged kinds: `Run`, `Check`, and `SamplerAuto` (the coroutine-
-//! shaped functions). `Helper` functions are skipped — impure helpers
-//! are CFG-inlined at lowering time and pure helpers emit as plain
-//! call-by-value functions, never as coroutines.
+//! Tagged kinds: `Run`, `Check`, `SamplerAuto`, and `TransactorBody`
+//! (the suspension-shaped functions — a transactor method is the
+//! Tier-0 FSM candidate by construction). `Helper` functions are
+//! skipped — impure helpers are CFG-inlined at lowering time and pure
+//! helpers emit as plain call-by-value functions, never as coroutines.
 
 use super::super::{
     BlockId, Expr, FunctionId, FunctionKind, PredSrc, TbFunction, TbProgram, Terminator,
@@ -139,9 +140,18 @@ impl std::error::Error for LowerCoroutineError {}
 pub fn run(prog: &TbProgram) -> Result<CoroutineMetadata, LowerCoroutineError> {
     let mut meta = CoroutineMetadata::default();
     for func in &prog.functions {
+        // Transactor method bodies are included: a method body is the
+        // Tier-0 FSM candidate by construction (design doc §placement),
+        // and its suspension structure (`wait` → resume point) is
+        // exactly what FSM-shaped backends need tagged. Helpers stay
+        // skipped — impure ones are CFG-inlined, pure ones are plain
+        // call-by-value functions.
         if !matches!(
             func.kind,
-            FunctionKind::Run | FunctionKind::Check | FunctionKind::SamplerAuto { .. }
+            FunctionKind::Run
+                | FunctionKind::Check
+                | FunctionKind::SamplerAuto { .. }
+                | FunctionKind::TransactorBody { .. }
         ) {
             continue;
         }

@@ -103,14 +103,19 @@ pub enum VerifyError {
         block: BlockId,
         context: &'static str,
     },
-    /// Transactor-call seam rule (module docs): a `TransactorMethod`
-    /// call edge outside the top of an `Assign` RHS in a Run/Check
-    /// function, or one that does not resolve against the owning
-    /// testbench's bus bindings.
+    /// Transactor-call seam rule (module docs). A
+    /// `CallTarget::TransactorMethod` edge must resolve in exactly one
+    /// namespace of the owning testbench, in its sanctioned position:
+    /// bus binding → the entire `Assign` RHS of a Run/Check function;
+    /// transactor field → the payload of a `Stmt::TransactorCall`.
+    /// Violations: an edge nested in expression position (it can
+    /// advance simulated time — never an expression value), a
+    /// `Stmt::TransactorCall` payload that is not a call edge, or an
+    /// edge that resolves in neither/the wrong namespace.
     BadTransactorCall {
         func: FunctionId,
         block: BlockId,
-        what: String,
+        detail: String,
     },
     /// Cross-IR: a test's run/check FunctionId or TestbenchId resolves.
     BadProgramRef { what: String },
@@ -193,9 +198,13 @@ impl std::fmt::Display for VerifyError {
                 "fn{}: b{} contains a DUT port read in a disallowed position ({context})",
                 func.0, block.0
             ),
-            VerifyError::BadTransactorCall { func, block, what } => write!(
+            VerifyError::BadTransactorCall {
+                func,
+                block,
+                detail,
+            } => write!(
                 f,
-                "fn{}: b{} transactor-call seam violation: {what}",
+                "fn{}: b{} transactor-call seam violation: {detail}",
                 func.0, block.0
             ),
             VerifyError::BadProgramRef { what } => write!(f, "program: {what}"),
@@ -284,6 +293,45 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                         ),
                     });
                 }
+            }
+        }
+    }
+    // Transactor schemas: every method's FunctionId resolves to a
+    // function tagged `TransactorBody` for that transactor, and every
+    // testbench transactor field resolves. Emission indexes both
+    // tables directly off these links.
+    for (xi, x) in prog.transactors.iter().enumerate() {
+        for m in &x.methods {
+            match prog.functions.get(m.function.index()) {
+                Some(f)
+                    if f.kind
+                        == (FunctionKind::TransactorBody {
+                            transactor: TransactorId(xi as u32),
+                        }) => {}
+                Some(f) => errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "transactor x{xi} method `{}` points at fn{} with kind {:?}",
+                        m.name, m.function.0, f.kind
+                    ),
+                }),
+                None => errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "transactor x{xi} method `{}` references missing fn{}",
+                        m.name, m.function.0
+                    ),
+                }),
+            }
+        }
+    }
+    for (ti, tb) in prog.testbenches.iter().enumerate() {
+        for (field, xid) in &tb.transactor_fields {
+            if xid.index() >= prog.transactors.len() {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} transactor field `{field}` references missing x{}",
+                        xid.0
+                    ),
+                });
             }
         }
     }
@@ -400,7 +448,7 @@ impl Checker<'_> {
                     // `check_expr` rejects the target everywhere else.
                     if let Expr::Call(CallTarget::TransactorMethod { bus_field, method }, args) = e
                     {
-                        self.check_transactor_call(bus_field, method, args);
+                        self.check_bus_call_edge(bus_field, method, args);
                         continue;
                     }
                     self.check_expr(e, false, "Assign value");
@@ -452,6 +500,12 @@ impl Checker<'_> {
                     self.check_fmt_args(on_fail);
                 }
                 Stmt::CovReport(inst) => self.check_covgroup(inst.covgroup),
+                Stmt::TransactorCall { dest, call } => {
+                    if let Some(d) = dest {
+                        self.check_local(*d);
+                    }
+                    self.check_transactor_call(call);
+                }
                 Stmt::FailDiag { guard, args } => {
                     if let Some(g) = guard {
                         self.check_expr(g, true, "FailDiag guard");
@@ -516,6 +570,68 @@ impl Checker<'_> {
         }
     }
 
+    /// The `Stmt::TransactorCall` payload: must be a `TransactorMethod`
+    /// call edge whose `bus_field`/`method` resolve through the owner
+    /// testbench's transactor fields. Args follow the no-inline-ports
+    /// rule (they are hoisted at lowering, like `Assign` values).
+    fn check_transactor_call(&mut self, call: &Expr) {
+        let (fid, bid) = (self.fid, self.bid);
+        let bad = move |detail: String| VerifyError::BadTransactorCall {
+            func: fid,
+            block: bid,
+            detail,
+        };
+        let Expr::Call(CallTarget::TransactorMethod { bus_field, method }, args) = call else {
+            self.errs
+                .push(bad("payload is not a TransactorMethod call edge".to_string()));
+            return;
+        };
+        for a in args {
+            self.check_expr(a, false, "TransactorCall arg");
+        }
+        let Some(owner) = self.func.owner else {
+            self.errs.push(bad(format!(
+                "`{bus_field}.{method}` called from a function with no owner testbench"
+            )));
+            return;
+        };
+        let Some(tb) = self.prog.testbenches.get(owner.index()) else {
+            self.errs
+                .push(bad(format!("owner tb{} does not resolve", owner.0)));
+            return;
+        };
+        let Some((_, xid)) = tb
+            .transactor_fields
+            .iter()
+            .find(|(f, _)| f == bus_field)
+        else {
+            if tb.bus_bindings.iter().any(|b| &b.field == bus_field) {
+                self.errs.push(bad(format!(
+                    "`{bus_field}.{method}` names a bus binding but rides a \
+                     Stmt::TransactorCall — bus-bound edges must be the entire \
+                     RHS of an Assign"
+                )));
+            } else {
+                self.errs.push(bad(format!(
+                    "testbench `{}` has no transactor field `{bus_field}`",
+                    tb.name
+                )));
+            }
+            return;
+        };
+        let Some(schema) = self.prog.transactors.get(xid.index()) else {
+            self.errs
+                .push(bad(format!("transactor x{} does not resolve", xid.0)));
+            return;
+        };
+        if schema.method(method).is_none() {
+            self.errs.push(bad(format!(
+                "transactor `{}` has no method `{method}`",
+                schema.name
+            )));
+        }
+    }
+
     fn check_covgroup(&mut self, c: CovgroupId) {
         if c.index() >= self.prog.covgroups.len() {
             self.errs.push(VerifyError::BadCovgroup {
@@ -548,19 +664,27 @@ impl Checker<'_> {
                 self.check_local(*local);
                 self.check_record_field(*local, field);
             }
+            Expr::Ternary(c, t, e) => {
+                self.check_expr(c, ports_ok, context);
+                self.check_expr(t, ports_ok, context);
+                self.check_expr(e, ports_ok, context);
+            }
             Expr::CovBin { inst, .. } => self.check_covgroup(inst.covgroup),
             Expr::Call(target, args) => {
-                // Seam rule: TransactorMethod is valid ONLY as the
-                // top-level Assign RHS, which `check_block` consumes
-                // before recursing — reaching one here means it is
-                // nested or in a disallowed statement position.
+                // Seam rule: a call edge is never an expression VALUE.
+                // It reaches the verifier only as the top-level Assign
+                // RHS (bus) or the root payload of `Stmt::TransactorCall`
+                // (transactor) — both consumed by `check_block` before
+                // recursing. Reaching one here means it is nested or in
+                // a disallowed statement position.
                 if let CallTarget::TransactorMethod { bus_field, method } = target {
                     self.errs.push(VerifyError::BadTransactorCall {
                         func: self.fid,
                         block: self.bid,
-                        what: format!(
+                        detail: format!(
                             "`{bus_field}.{method}` call edge in a disallowed position \
-                             ({context}) — must be the entire RHS of an Assign"
+                             ({context}) — must be the entire RHS of an Assign (bus) \
+                             or the payload of a Stmt::TransactorCall (transactor)"
                         ),
                     });
                 }
@@ -571,18 +695,21 @@ impl Checker<'_> {
         }
     }
 
-    fn bad_transactor(&mut self, what: String) {
+    fn bad_transactor(&mut self, detail: String) {
         self.errs.push(VerifyError::BadTransactorCall {
             func: self.fid,
             block: self.bid,
-            what,
+            detail,
         });
     }
 
-    /// Validate one sanctioned `TransactorMethod` call edge: function
-    /// kind, binding resolution on the owning testbench, method
-    /// existence, arity, and argument purity (no ports, no nesting).
-    fn check_transactor_call(&mut self, bus_field: &str, method: &str, args: &[Expr]) {
+    /// Validate one sanctioned bus-bound `TransactorMethod` call edge
+    /// (Assign-RHS position): function kind, bus-binding resolution on
+    /// the owning testbench, method existence, arity, and argument
+    /// purity (no ports, no nesting). Transactor-field edges never take
+    /// this position — they ride `Stmt::TransactorCall` and are checked
+    /// by `check_transactor_call`.
+    fn check_bus_call_edge(&mut self, bus_field: &str, method: &str, args: &[Expr]) {
         if !matches!(self.func.kind, FunctionKind::Run | FunctionKind::Check) {
             self.bad_transactor(format!(
                 "`{bus_field}.{method}` call edge in a {:?}-kind function \
@@ -590,12 +717,22 @@ impl Checker<'_> {
                 self.func.kind
             ));
         } else {
-            let binding = self
+            let owner_tb = self
                 .func
                 .owner
-                .and_then(|tb| self.prog.testbenches.get(tb.index()))
-                .and_then(|tb| tb.bus_bindings.iter().find(|b| b.field == bus_field));
+                .and_then(|tb| self.prog.testbenches.get(tb.index()));
+            let binding =
+                owner_tb.and_then(|tb| tb.bus_bindings.iter().find(|b| b.field == bus_field));
             let diag = match binding {
+                None if owner_tb
+                    .is_some_and(|tb| tb.transactor_fields.iter().any(|(f, _)| f == bus_field)) =>
+                {
+                    Some(format!(
+                        "`{bus_field}.{method}` names a transactor field but rides an \
+                         Assign RHS — transactor-bound edges must be a \
+                         Stmt::TransactorCall payload"
+                    ))
+                }
                 None => Some(format!(
                     "`{bus_field}.{method}` does not resolve: owning testbench has no \
                      bus binding `{bus_field}`"
@@ -671,6 +808,11 @@ fn check_def_before_use(
         for s in &b.stmts {
             match s {
                 Stmt::Assign(l, _) | Stmt::DutRead(l, _) | Stmt::RecordInit(l, _) => {
+                    if l.index() < d.len() {
+                        d[l.index()] = true;
+                    }
+                }
+                Stmt::TransactorCall { dest: Some(l), .. } => {
                     if l.index() < d.len() {
                         d[l.index()] = true;
                     }
@@ -760,6 +902,14 @@ fn check_def_before_use(
                     check_e(value, &defined, errs);
                 }
                 Stmt::DutWrite(_, e) => check_e(e, &defined, errs),
+                Stmt::TransactorCall { dest, call } => {
+                    check_e(call, &defined, errs);
+                    if let Some(l) = dest {
+                        if l.index() < defined.len() {
+                            defined[l.index()] = true;
+                        }
+                    }
+                }
                 Stmt::Log { args, .. } => {
                     for a in &args.args {
                         check_e(&a.expr, &defined, errs);
@@ -816,6 +966,11 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
             for_each_local(b, f);
         }
         Expr::Unary(_, a) => for_each_local(a, f),
+        Expr::Ternary(c, t, e) => {
+            for_each_local(c, f);
+            for_each_local(t, f);
+            for_each_local(e, f);
+        }
         Expr::CovBin { .. } => {}
         Expr::Call(_, args) => {
             for a in args {

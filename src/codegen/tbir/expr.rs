@@ -68,6 +68,12 @@ pub(super) fn expr_cpp(
             let a = expr_cpp(func, names, a)?;
             format!("{}({a})", un_op_cpp(*op))
         }
+        Expr::Ternary(c, t, e) => {
+            let c = expr_cpp(func, names, c)?;
+            let t = expr_cpp(func, names, t)?;
+            let e = expr_cpp(func, names, e)?;
+            format!("({c} ? {t} : {e})")
+        }
         // Check-phase bin counter read — the covergroup instance lives
         // in the `_tb` struct (cov fields exist only on non-synthetic
         // testbenches, so `_tb` is always in scope here).
@@ -85,12 +91,15 @@ pub(super) fn expr_cpp(
                     ));
                 }
                 CallTarget::TransactorMethod { bus_field, method } => {
-                    // Emitted only as a whole Assign RHS (func.rs
-                    // `emit_transactor_call`); reaching expression
-                    // emission means the seam invariant was violated.
+                    // Call edges never emit from expression position:
+                    // bus-bound edges emit only as a whole Assign RHS
+                    // (func.rs `emit_transactor_call`), transactor-bound
+                    // edges only as `Stmt::TransactorCall`. Reaching here
+                    // means the verifier's invariant was bypassed.
                     return Err(EmitError(format!(
                         "tbir: transactor call edge `{bus_field}.{method}` in expression \
-                         position — verifier pins it to Assign-RHS (lowering/pass bug)"
+                         position — verifier pins it to Assign-RHS / TransactorCall \
+                         (lowering/pass bug)"
                     )));
                 }
             };

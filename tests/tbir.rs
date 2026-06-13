@@ -158,8 +158,12 @@ fn fatal_path_dump_ir_snapshot() {
 
 /// Transactor fixtures are outside the MVP subset — the error must
 /// name the construct and point at `--codegen v1`, never mis-lower.
-/// The fixture's `transaction` items now lower (records slice); the
-/// item-level scan trips on the `transactor` declaration instead.
+/// The fixture's `transaction` items now lower (records slice), and
+/// its `transactor` declaration now passes the item-level scan
+/// (transactor slice); the scan trips on the `tseq` declaration
+/// instead. (The transactor itself would also be rejected — its
+/// `req : in event<RegOp>` field is out of subset — but `tseq` sits
+/// earlier in the file-gate order.)
 #[test]
 fn transactor_fixture_is_unsupported() {
     let err = lower_src(&fixture("axilite_seqdrv_test.harc")).unwrap_err();
@@ -1837,6 +1841,218 @@ end impl OooTest
     );
 }
 
+// ── Transactor declarations + method call edges ─────────────────────
+
+/// Shared inline fixture: an unbound DUT-poking transactor with a
+/// void method and a value-returning method, instantiated `active`
+/// on the testbench, bound and called from `run`.
+const XACTOR_SRC: &str = r#"
+transactor Xt
+    dut : Top
+
+    when active
+        hookable pulse(n: uint<8>)
+            dut.en = 1
+            wait 1 cycle
+            dut.en = 0
+        end pulse
+
+        hookable readv() -> uint<32>
+            wait 1 cycle
+            return dut.count_out
+        end readv
+    end when
+end transactor Xt
+
+testbench XtTb
+    dut : Top
+    xt  : Xt active
+end testbench XtTb
+
+impl XtTest for XtTb
+    run
+        xt.dut = dut
+        xt.pulse(3)
+        let v = xt.readv()
+        assert v == 0 else fail("v=${v}")
+    end run
+end impl XtTest
+"#;
+
+/// The structural contract: one schema per transactor, one
+/// `TbFunction` (kind `TransactorBody`) per method with mirrored
+/// params and a `ret` slot for `-> T` methods; calls lower to
+/// `Stmt::TransactorCall` (statement form `dest: None`, let form
+/// `dest: Some`), with the call edge never inlined; the
+/// `xt.dut = dut` bind is validated and erased.
+#[test]
+fn transactor_methods_lower_to_functions_and_call_edges() {
+    let prog = lower_src(XACTOR_SRC).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+
+    assert_eq!(prog.transactors.len(), 1);
+    let x = &prog.transactors[0];
+    assert_eq!((x.name.as_str(), x.dut_field.as_str(), x.dut_type.as_str()), ("Xt", "dut", "Top"));
+    assert_eq!(x.methods.len(), 2);
+    let pulse = x.method("pulse").expect("pulse");
+    let readv = x.method("readv").expect("readv");
+    assert_eq!((pulse.n_params, pulse.has_ret), (1, false));
+    assert_eq!((readv.n_params, readv.has_ret), (0, true));
+
+    let pf = prog.function(pulse.function);
+    assert_eq!(
+        pf.kind,
+        ir::FunctionKind::TransactorBody { transactor: ir::TransactorId(0) }
+    );
+    assert_eq!(pf.params.len(), 1);
+    assert_eq!(pf.locals[0].name, "n");
+    assert!(pf.ret.is_none());
+    // The body suspends (wait 1 cycle) and drives the DUT.
+    assert!(
+        pf.blocks
+            .iter()
+            .any(|b| matches!(b.terminator, ir::Terminator::WaitCycles(..))),
+        "pulse body keeps its wait:\n{pf}"
+    );
+    let rf = prog.function(readv.function);
+    assert!(rf.ret.is_some(), "-> T method carries a ret slot");
+
+    // The testbench schema records the instance field.
+    let tb = prog.testbench(prog.tests[0].testbench);
+    assert_eq!(tb.transactor_fields, vec![("xt".to_string(), ir::TransactorId(0))]);
+
+    // Run body: the bind is erased; the calls are TransactorCall stmts.
+    let run = prog.function(prog.tests[0].run);
+    let calls: Vec<&ir::Stmt> = run
+        .blocks
+        .iter()
+        .flat_map(|b| &b.stmts)
+        .filter(|s| matches!(s, ir::Stmt::TransactorCall { .. }))
+        .collect();
+    assert_eq!(calls.len(), 2, "two call edges:\n{run}");
+    let ir::Stmt::TransactorCall { dest: d0, call: c0 } = calls[0] else { unreachable!() };
+    assert!(d0.is_none(), "statement call discards");
+    let ir::Expr::Call(ir::CallTarget::TransactorMethod { bus_field, method }, args) = c0 else {
+        panic!("call edge payload: {c0:?}");
+    };
+    assert_eq!((bus_field.as_str(), method.as_str(), args.len()), ("xt", "pulse", 1));
+    let ir::Stmt::TransactorCall { dest: d1, .. } = calls[1] else { unreachable!() };
+    assert!(d1.is_some(), "let call binds the result");
+}
+
+/// Locks the dump-ir text for the smallest corpus transactor fixture:
+/// the transactor table, `TransactorBody` functions with mirrored
+/// params, erased DUT bind, and TransactorCall statements.
+#[test]
+fn cam_value_basic_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("cam_value_basic_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("cam_value_basic_dump_ir", format!("{prog}"));
+}
+
+/// Locks the emitted tbir C++ for the same fixture: `<Type>_<method>`
+/// lambdas with synchronous waits (`for (...) tick();` — v1's hookable
+/// contract, no co_await), plain `return`, and direct call sites in
+/// the run coroutine.
+#[test]
+fn cam_value_basic_emitted_cpp_snapshot() {
+    insta::assert_snapshot!(
+        "cam_value_basic_emitted_cpp",
+        emit_fixture_cpp("cam_value_basic_test.harc")
+    );
+}
+
+/// A transactor method call is never an expression VALUE — it can
+/// advance simulated time, which only statement order can represent.
+#[test]
+fn transactor_call_in_expression_position_rejected() {
+    let src = XACTOR_SRC.replace("let v = xt.readv()", "let v = xt.readv() + 1");
+    let err = lower_src(&src).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("expression position"), "{msg}");
+    assert!(msg.contains("hoist it into a `let`"), "{msg}");
+}
+
+/// ...and not inside lazily-evaluated log/fail messages either.
+#[test]
+fn transactor_call_in_message_rejected() {
+    let src = XACTOR_SRC.replace("fail(\"v=${v}\")", "fail(\"v=${xt.readv()}\")");
+    let err = lower_src(&src).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("inside a message"), "{msg}");
+}
+
+/// Mode rules at the instance field: passive instances structurally
+/// lack their `when active` methods; mode-less fields have nothing to
+/// inherit from at testbench scope.
+#[test]
+fn transactor_instance_mode_rules() {
+    let passive = XACTOR_SRC.replace("xt  : Xt active", "xt  : Xt passive");
+    let msg = assert_unsupported(&lower_src(&passive).unwrap_err());
+    assert!(msg.contains("passive transactor instance"), "{msg}");
+
+    let modeless = XACTOR_SRC.replace("xt  : Xt active", "xt  : Xt");
+    let msg = assert_unsupported(&lower_src(&modeless).unwrap_err());
+    assert!(msg.contains("without an `active`/`passive` mode"), "{msg}");
+}
+
+/// Unknown methods and arity mismatches are hard lowering errors —
+/// v1 deferred both to C++ compile failures.
+#[test]
+fn transactor_call_resolution_is_checked() {
+    let unknown = XACTOR_SRC.replace("xt.pulse(3)", "xt.nosuch(3)");
+    let err = lower_src(&unknown).unwrap_err();
+    assert!(matches!(err, lower::LowerError::Invalid(_)), "{err:?}");
+    assert!(err.to_string().contains("no method `nosuch`"), "{err}");
+
+    let arity = XACTOR_SRC.replace("xt.pulse(3)", "xt.pulse(3, 4)");
+    let err = lower_src(&arity).unwrap_err();
+    assert!(matches!(err, lower::LowerError::Invalid(_)), "{err:?}");
+    assert!(
+        err.to_string().contains("takes 1 argument(s), call passes 2"),
+        "{err}"
+    );
+
+    let void_let = XACTOR_SRC.replace("let v = xt.readv()", "let v = xt.pulse(3)");
+    let err = lower_src(&void_let).unwrap_err();
+    assert!(err.to_string().contains("returns no value"), "{err}");
+}
+
+/// The DUT bind statement is validated: the target must be the
+/// transactor's module-typed field and the value must be the test DUT.
+#[test]
+fn transactor_dut_bind_is_validated() {
+    let src = XACTOR_SRC.replace("xt.dut = dut", "xt.dut = 5");
+    let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+    assert!(msg.contains("something other than the test DUT"), "{msg}");
+}
+
+/// Methods keep v1's synchronous hookable semantics, so the suspension
+/// forms whose sync emission is out of this slice are rejected at
+/// lowering with method-specific messages.
+#[test]
+fn transactor_method_sync_only_waits() {
+    let timed = XACTOR_SRC.replace(
+        "wait 1 cycle\n            dut.en = 0",
+        "wait until dut.count_out == 1 timeout 5 cycles\n            dut.en = 0",
+    );
+    let msg = assert_unsupported(&lower_src(&timed).unwrap_err());
+    assert!(
+        msg.contains("`wait until ... timeout` inside a transactor method"),
+        "{msg}"
+    );
+
+    let clocked = XACTOR_SRC.replace(
+        "wait 1 cycle\n            dut.en = 0",
+        "wait 1 cycle on clk\n            dut.en = 0",
+    );
+    let msg = assert_unsupported(&lower_src(&clocked).unwrap_err());
+    assert!(
+        msg.contains("`wait N cycles on <clock>` inside a transactor method"),
+        "{msg}"
+    );
+}
+
 /// Bus calls suspend, so they are statement-level only: nesting one in
 /// an expression is a precise rejection, not the generic method-call
 /// message.
@@ -1929,12 +2145,13 @@ end impl TypoTest
 }
 
 /// The target-side TLM fixtures now stop at their REAL next blocker —
-/// the `transactor` construct — instead of the bus file gate.
+/// the bus-bound transactor form — instead of the bus file gate (and,
+/// before the transactor slice, the transactor construct gate).
 #[test]
-fn tlm_target_fixture_blocked_by_transactor() {
+fn tlm_target_fixture_blocked_by_bus_bound_transactor() {
     let err = lower_src(&fixture("tlm_target_thread_test.harc")).unwrap_err();
     let msg = assert_unsupported(&err);
-    assert!(msg.contains("the `transactor` construct"), "{msg}");
+    assert!(msg.contains("bound to a bus type"), "{msg}");
 }
 
 /// Transactor-call seam rule, verifier side: the call edge is pinned
@@ -2002,7 +2219,7 @@ fn verifier_pins_transactor_call_seam() {
     assert!(
         errs.iter().any(|e| matches!(
             e,
-            verify::VerifyError::BadTransactorCall { what, .. } if what.contains("no bus binding `ghost`")
+            verify::VerifyError::BadTransactorCall { detail, .. } if detail.contains("no bus binding `ghost`")
         )),
         "{errs:?}"
     );
@@ -2023,7 +2240,7 @@ fn verifier_pins_transactor_call_seam() {
     assert!(
         errs.iter().any(|e| matches!(
             e,
-            verify::VerifyError::BadTransactorCall { what, .. } if what.contains("arity mismatch")
+            verify::VerifyError::BadTransactorCall { detail, .. } if detail.contains("arity mismatch")
         )),
         "{errs:?}"
     );
@@ -2036,7 +2253,7 @@ fn verifier_pins_transactor_call_seam() {
     assert!(
         errs.iter().any(|e| matches!(
             e,
-            verify::VerifyError::BadTransactorCall { what, .. } if what.contains("Helper")
+            verify::VerifyError::BadTransactorCall { detail, .. } if detail.contains("Helper")
         )),
         "{errs:?}"
     );
@@ -2067,4 +2284,131 @@ fn placement_classifies_transactor_call_block_timing_tolerant() {
         .expect("a block carries the call edge");
     let (_, timing) = table.blocks[&(run_id, ir::BlockId(bi as u32))];
     assert_eq!(timing, placement::TimingClass::TimingTolerant);
+}
+
+/// Out-of-subset transactor shapes reject with precise messages:
+/// event fields (the sequencer-driven form), scalar state fields, and
+/// >64-bit method params (the tbir value model is u64).
+#[test]
+fn transactor_shape_rejections() {
+    let event_src = r#"
+transaction Req
+    addr : uint<8>
+end transaction Req
+
+transactor Ev
+    dut : Top
+
+    when active
+        req : in event<Req>
+    end when
+end transactor Ev
+
+testbench EvTb
+    dut : Top
+    ev  : Ev active
+end testbench EvTb
+
+impl EvTest for EvTb
+    run
+        wait 1 cycle
+    end run
+end impl EvTest
+"#;
+    let msg = assert_unsupported(&lower_src(event_src).unwrap_err());
+    assert!(msg.contains("event/directional field `req`"), "{msg}");
+
+    let state_src = event_src.replace("req : in event<Req>", "count : uint<32>");
+    let msg = assert_unsupported(&lower_src(&state_src).unwrap_err());
+    assert!(msg.contains("state field `count`"), "{msg}");
+
+    // The corpus fixture with uint<128> method params.
+    let err = lower_src(&fixture("aes_cipher_top_test.harc")).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("wider than 64 bits"), "{msg}");
+}
+
+/// Verifier net: a `TransactorMethod` call edge nested in expression
+/// position (i.e. anywhere but the root of `Stmt::TransactorCall`) is
+/// a `BadTransactorCall` — lowering never produces it, so reaching it
+/// means a pass corrupted the IR.
+#[test]
+fn verifier_rejects_call_edge_in_expression_position() {
+    let mut prog = lower_src(XACTOR_SRC).expect("lowers");
+    verify::verify_program(&prog).expect("clean before mutation");
+    // Rewrite the first TransactorCall into a plain Assign of the
+    // call-edge expression.
+    let run_id = prog.tests[0].run;
+    let run = &mut prog.functions[run_id.index()];
+    let mut mutated = false;
+    for b in &mut run.blocks {
+        for s in &mut b.stmts {
+            if let ir::Stmt::TransactorCall { call, .. } = s {
+                let dest = ir::LocalId(0);
+                *s = ir::Stmt::Assign(dest, call.clone());
+                mutated = true;
+                break;
+            }
+        }
+        if mutated {
+            break;
+        }
+    }
+    assert!(mutated, "fixture carries a TransactorCall");
+    let errs = verify::verify_program(&prog).unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, verify::VerifyError::BadTransactorCall { .. })),
+        "expected BadTransactorCall, got: {errs:?}"
+    );
+}
+
+/// `lower_coroutine` tags transactor method bodies (they are the
+/// Tier-0 FSM candidates): the suspension inside `pulse` becomes a
+/// state boundary.
+#[test]
+fn lower_coroutine_tags_transactor_bodies() {
+    let prog = lower_src(XACTOR_SRC).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let meta = lower_coroutine::run(&prog).expect("pass runs");
+    let pulse = prog.transactors[0].method("pulse").unwrap().function;
+    let states = meta.state_enum.get(&pulse).expect("pulse tagged");
+    assert!(states.len() >= 2, "wait creates a resume state: {states:?}");
+}
+
+/// A method param (or any local) that shadows the DUT field name is
+/// host state — `dut.x` through it must NOT silently lower to a DUT
+/// access (v1 surfaces the shadowing as a C++ compile error; the IR
+/// rejects at lowering).
+#[test]
+fn local_shadowing_dut_name_does_not_mislower() {
+    let src = r#"
+transactor Sh
+    dut : Top
+
+    when active
+        hookable poke(dut: uint<8>)
+            dut.en = 1
+        end poke
+    end when
+end transactor Sh
+
+testbench ShTb
+    dut : Top
+    sh  : Sh active
+end testbench ShTb
+
+impl ShTest for ShTb
+    run
+        sh.dut = dut
+        sh.poke(1)
+    end run
+end impl ShTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("assignment to a non-port, non-local target"),
+        "shadowed name must not resolve to the DUT: {msg}"
+    );
 }

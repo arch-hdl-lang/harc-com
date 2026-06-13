@@ -313,7 +313,7 @@ fn is_dut_ident(b: &FuncBuilder<'_>, e: &AstExpr) -> bool {
     }
 }
 
-fn ir_type_of(ty: Option<&TypeExpr>) -> IrType {
+pub(crate) fn ir_type_of(ty: Option<&TypeExpr>) -> IrType {
     let Some(TypeExpr::Builtin { name, args, .. }) = ty else {
         return IrType::Unknown;
     };

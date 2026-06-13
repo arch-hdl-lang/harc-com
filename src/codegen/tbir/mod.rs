@@ -211,6 +211,21 @@ fn emit_test(
             &format!("_tb.{field}"),
         );
     }
+    // Transactor method lambdas — one `<Type>_<method>` per method of
+    // every transactor the testbench instantiates, declared before the
+    // run coroutine so its `[&]` capture sees them (v1 emission order).
+    // Two fields of the same transactor type share one lambda set: the
+    // subset carries no per-instance state (the DUT bind is static).
+    let mut emitted_xactors = HashSet::new();
+    for (_, xid) in &tb.transactor_fields {
+        if !emitted_xactors.insert(*xid) {
+            continue;
+        }
+        let schema = prog.transactor(*xid);
+        for m in &schema.methods {
+            func::emit_method(out, prog, schema, m, 1)?;
+        }
+    }
     writeln!(out, "{INDENT}harc_rt::ThreadSlot _run_slot;").ok();
     writeln!(out, "{INDENT}sched.slots.push_back(&_run_slot);").ok();
     writeln!(
@@ -221,9 +236,9 @@ fn emit_test(
     if !tb.synthetic {
         writeln!(out, "{INDENT}{INDENT}_tb.dut = dut;").ok();
     }
-    func::emit_function(out, prog.function(test.run), &prog.records, &tb.bus_bindings, 2)?;
+    func::emit_function(out, prog, prog.function(test.run), &tb.bus_bindings, 2)?;
     if let Some(check) = test.check {
-        func::emit_function(out, prog.function(check), &prog.records, &tb.bus_bindings, 2)?;
+        func::emit_function(out, prog, prog.function(check), &tb.bus_bindings, 2)?;
     }
     writeln!(out, "{INDENT}{INDENT}co_return;").ok();
     writeln!(out, "{INDENT}}}(&_run_slot);").ok();

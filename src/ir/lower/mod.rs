@@ -18,15 +18,16 @@ mod exprs;
 mod helpers;
 mod records;
 mod stmts;
+mod transactors;
 
 use crate::ast::{
     Block, BusDecl, ClockDecl, ComponentDecl, ComponentItem, ExprKind, Item, ScopeDecl,
-    SourceFile, Stmt as AstStmt, StmtKind, TestDecl, TestItem, TypeExpr,
+    SourceFile, Stmt as AstStmt, StmtKind, TestDecl, TestItem, TransactorMode, TypeExpr,
 };
 use crate::ir::{
     self, BasicBlock, BlockId, ClockSpec, CovgroupId, CovgroupSchema, FunctionId, FunctionKind,
     IrType, LocalId, RecordId, RecordSchema, TbFunction, TbProgram, TestSchema, TestbenchId,
-    TestbenchSchema, Terminator, TypedLocal, TypedParam,
+    TestbenchSchema, Terminator, TransactorId, TransactorSchema, TypedLocal, TypedParam,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -155,6 +156,25 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // at each call site during body lowering.
     let helper_registry = helpers::HelperRegistry::build(&file)?;
 
+    // Transactor names, for the file gate + testbench-field validation
+    // (schemas lower after pure helpers so FunctionIds line up).
+    let mut transactor_ids: HashMap<String, TransactorId> = HashMap::new();
+    let mut n_transactors = 0u32;
+    for it in &file.items {
+        if let Item::Transactor(t) = it {
+            if transactor_ids
+                .insert(t.name.name.clone(), TransactorId(n_transactors))
+                .is_some()
+            {
+                return Err(LowerError::Invalid(format!(
+                    "duplicate transactor declaration `{}`",
+                    t.name.name
+                )));
+            }
+            n_transactors += 1;
+        }
+    }
+
     // File-level construct gate: anything outside the MVP subset is an
     // explicit Unsupported, never silently dropped.
     for it in &file.items {
@@ -165,7 +185,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             | Item::Covergroup(_)
             | Item::Function(_)
             | Item::Transaction(_)
-            | Item::Bus(_) => {}
+            | Item::Bus(_)
+            | Item::Transactor(_) => {}
             // `extend` was already folded by merge_for_sim; a survivor
             // means the merge didn't apply (e.g. dump-ir on a lone
             // extension file).
@@ -177,7 +198,13 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             }
             Item::Env(c) => {
                 if used_tbs.contains(&c.name.name) {
-                    validate_testbench_component(c, &components, &covgroup_ids, &record_ids)?;
+                    validate_testbench_component(
+                        c,
+                        &components,
+                        &covgroup_ids,
+                        &record_ids,
+                        &transactor_ids,
+                    )?;
                 } else {
                     return Err(unsupported(
                         &format!("env/component `{}`", c.name.name),
@@ -212,11 +239,14 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         clock_names: Vec::new(),
         record_ids: record_ids.clone(),
         records: prog.records.clone(),
-        // Deliberately empty: bus bindings are test-scope, so a pure
-        // helper body can never resolve one — which structurally
-        // enforces the design seam rule that `TransactorMethod` call
-        // edges never appear in pure-helper bodies.
+        // Deliberately empty: bus bindings and transactor fields are
+        // test-scope, so a pure helper body can never resolve one —
+        // which structurally enforces the design seam rule that
+        // `TransactorMethod` call edges never appear in pure-helper
+        // bodies.
         bus_bindings: HashMap::new(),
+        transactor_fields: HashMap::new(),
+        transactors: Vec::new(),
     };
     for it in &file.items {
         let Item::Function(fd) = it else { continue };
@@ -231,6 +261,25 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         let id = FunctionId(prog.functions.len() as u32);
         let f = helpers::lower_pure_helper(id, fd, &helper_registry, &helper_ctx)?;
         prog.functions.push(f);
+    }
+
+    // Transactor declarations, in file order: one schema each plus one
+    // `TbFunction` (kind `TransactorBody`) per method. All declarations
+    // lower (even unreferenced ones), so unsupported transactor shapes
+    // are rejected here rather than dropped.
+    for it in &file.items {
+        let Item::Transactor(t) = it else { continue };
+        let id = TransactorId(prog.transactors.len() as u32);
+        debug_assert_eq!(Some(&id), transactor_ids.get(&t.name.name));
+        let (schema, funcs) = transactors::lower_transactor(
+            id,
+            t,
+            FunctionId(prog.functions.len() as u32),
+            &helper_registry,
+            &helper_ctx,
+        )?;
+        prog.transactors.push(schema);
+        prog.functions.extend(funcs);
     }
 
     for it in &file.items {
@@ -257,21 +306,53 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
 }
 
 /// MVP testbench-component validation: every field must be the DUT
-/// field (a non-HARC type, i.e. a Verilator module type) or a
-/// covergroup instance. Scoreboard / transactor fields are post-MVP.
+/// field (a non-HARC type, i.e. a Verilator module type), a covergroup
+/// instance, or an `active` transactor instance. Scoreboard / agent /
+/// env fields are post-MVP.
 fn validate_testbench_component(
     c: &ComponentDecl,
     components: &HashMap<String, &ComponentDecl>,
     covgroup_ids: &HashMap<String, CovgroupId>,
     record_ids: &HashMap<String, RecordId>,
+    transactor_ids: &HashMap<String, TransactorId>,
 ) -> Result<(), LowerError> {
     for ci in &c.items {
         match ci {
             ComponentItem::Field(f) => {
-                if let TypeExpr::Named { name, .. } = &f.ty {
+                if let TypeExpr::Named { name, mode, .. } = &f.ty {
                     let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
                     if covgroup_ids.contains_key(simple) {
                         continue;
+                    }
+                    if transactor_ids.contains_key(simple) {
+                        // Mode rules mirror v1: a mode-less transactor
+                        // field has nothing to inherit from at testbench
+                        // scope, and a passive instance structurally
+                        // lacks its `when active` methods — every method
+                        // in this subset lives there.
+                        match mode {
+                            Some(TransactorMode::Active) => continue,
+                            Some(TransactorMode::Passive) => {
+                                return Err(unsupported(
+                                    &format!(
+                                        "passive transactor instance `{}.{} : {simple} passive`",
+                                        c.name.name, f.name.name
+                                    ),
+                                    "methods inside `when active` do not exist on a passive \
+                                     instance",
+                                ));
+                            }
+                            None => {
+                                return Err(unsupported(
+                                    &format!(
+                                        "transactor field `{}.{} : {simple}` without an \
+                                         `active`/`passive` mode",
+                                        c.name.name, f.name.name
+                                    ),
+                                    "",
+                                ));
+                            }
+                        }
                     }
                     // Without this gate a transaction-typed field would
                     // fall through to the "assume DUT module type" arm
@@ -492,9 +573,11 @@ fn lower_test(
             )));
         }
     }
-    // Covergroup-typed testbench fields, in declaration order — that
-    // order is the sampler registration order (must match v1).
+    // Covergroup- and transactor-typed testbench fields, in declaration
+    // order — cov order is the sampler registration order (must match
+    // v1); transactor order is the method-lambda emission order.
     let mut cov_fields: Vec<(String, CovgroupId)> = Vec::new();
+    let mut transactor_fields: Vec<(String, TransactorId)> = Vec::new();
     if let Some(tbn) = &tb_name {
         if let Some(c) = components.get(tbn) {
             for ci in &c.items {
@@ -505,9 +588,44 @@ fn lower_test(
                         if let Some(id) = covgroup_ids.get(simple) {
                             cov_fields.push((f.name.name.clone(), *id));
                         }
+                        if let Some(idx) =
+                            prog.transactors.iter().position(|t| t.name == simple)
+                        {
+                            let xid = TransactorId(idx as u32);
+                            // The transactor's module-typed field must
+                            // drive the same DUT type this test
+                            // instantiates — the IR's single-DUT model
+                            // makes the bind static.
+                            let xdut = &prog.transactors[idx].dut_type;
+                            if *xdut != dut_type {
+                                return Err(unsupported(
+                                    &format!(
+                                        "transactor field `{tbn}.{} : {simple}` whose \
+                                         `{}` field type `{xdut}` differs from the test \
+                                         DUT type `{dut_type}`",
+                                        f.name.name, prog.transactors[idx].dut_field
+                                    ),
+                                    "",
+                                ));
+                            }
+                            transactor_fields.push((f.name.name.clone(), xid));
+                        }
                     }
                 }
             }
+        }
+    }
+    // Bus bindings (test-scope `let`s) and transactor fields (testbench
+    // component fields) share the `CallTarget::TransactorMethod`
+    // bus_field namespace; a name living in both would dispatch
+    // ambiguously, so reject it here rather than shadow.
+    for (field, _) in &transactor_fields {
+        if bus_binding_decls.contains_key(field) {
+            return Err(LowerError::Invalid(format!(
+                "name `{field}` is both a bus binding and a transactor field in test `{}` — \
+                 rename one; method calls through it would be ambiguous",
+                t.name.name
+            )));
         }
     }
 
@@ -518,6 +636,7 @@ fn lower_test(
         dut_type,
         cov_fields: cov_fields.clone(),
         bus_bindings: bus_bindings.clone(),
+        transactor_fields: transactor_fields.clone(),
         synthetic,
     });
 
@@ -567,6 +686,8 @@ fn lower_test(
         record_ids: record_ids.clone(),
         records: prog.records.clone(),
         bus_bindings: bus_binding_decls,
+        transactor_fields: transactor_fields.iter().cloned().collect(),
+        transactors: prog.transactors.clone(),
     };
 
     // Synthesized auto-sampler functions, one per covergroup field, in
@@ -737,6 +858,15 @@ pub(crate) struct LowerCtx {
     /// `TransactorMethod` call edges out of pure-helper bodies (design
     /// seam rule).
     pub bus_bindings: HashMap<String, crate::ast::BusDecl>,
+    /// Transactor-typed testbench fields (`xact` → transactor id), for
+    /// `xact.method(...)` call resolution and the `xact.dut = dut`
+    /// bind. Disjoint from `bus_bindings` (collision rejected at
+    /// testbench-schema construction). Empty for synthetic testbenches,
+    /// helper contexts, and transactor method bodies.
+    pub transactor_fields: HashMap<String, ir::TransactorId>,
+    /// Snapshot of the program's transactor schemas, for method
+    /// validation at call sites.
+    pub transactors: Vec<TransactorSchema>,
 }
 
 pub(crate) struct LoopFrame {
@@ -789,6 +919,12 @@ pub(crate) struct FuncBuilder<'a> {
     /// impure helper calls cannot inline there (messages evaluate
     /// lazily at the failure site).
     pub(crate) in_fmt_args: bool,
+    /// True while lowering a transactor method body. Methods keep v1's
+    /// synchronous hookable semantics (waits emit as `tick()` loops),
+    /// so the constructs whose sync emission is out of this slice —
+    /// clock-qualified waits and timed `wait until` — are rejected
+    /// here, as are nested transactor calls.
+    pub(crate) in_transactor_method: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -830,6 +966,7 @@ impl<'a> FuncBuilder<'a> {
             helper_ret: None,
             in_pure_helper: false,
             in_fmt_args: false,
+            in_transactor_method: false,
         }
     }
 }

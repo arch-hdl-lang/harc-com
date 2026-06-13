@@ -2,4 +2,4 @@
 source: tests/tbir.rs
 expression: msg
 ---
-TB-IR lowering does not support the `transactor` construct yet; re-run with `--codegen v1`
+TB-IR lowering does not support the `tseq` construct yet; re-run with `--codegen v1`

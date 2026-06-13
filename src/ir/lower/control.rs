@@ -277,6 +277,17 @@ impl FuncBuilder<'_> {
             return Ok(());
         };
 
+        // Timed waits inside transactor method bodies are out of this
+        // slice: methods run synchronously (v1's polling-loop shape,
+        // not the coroutine awaiter) and the sync timeout emission is
+        // not mirrored yet.
+        if self.in_transactor_method {
+            return Err(unsupported(
+                "`wait until ... timeout` inside a transactor method",
+                "use an untimed `wait until`, or a counting loop",
+            ));
+        }
+
         // Budget evaluated once, before the wait (v1's `_wu_budget`),
         // so the default timeout header reports the same value the
         // countdown used.

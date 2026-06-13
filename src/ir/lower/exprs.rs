@@ -86,7 +86,16 @@ impl FuncBuilder<'_> {
                 let r = self.lower_expr(rhs)?;
                 Ok(Expr::Binary(ir_op, Box::new(l), Box::new(r)))
             }
-            ExprKind::Ternary { .. } => Err(unsupported("ternary expressions", "")),
+            ExprKind::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                let c = self.lower_expr(cond)?;
+                let t = self.lower_expr(then_branch)?;
+                let e = self.lower_expr(else_branch)?;
+                Ok(Expr::Ternary(Box::new(c), Box::new(t), Box::new(e)))
+            }
             ExprKind::Call { callee, args } => {
                 let what = match &*callee.kind {
                     ExprKind::Ident(id) => {
@@ -109,6 +118,29 @@ impl FuncBuilder<'_> {
                                      position are lowered (v1's surface)",
                                     name.name
                                 ),
+                            ));
+                        }
+                        // Transactor method calls are call EDGES, never
+                        // expression values — they may advance simulated
+                        // time, which an expression position cannot
+                        // represent (statement order is the contract).
+                        if self.as_transactor_call(callee)?.is_some() {
+                            if self.in_fmt_args {
+                                return Err(unsupported(
+                                    &format!(
+                                        "transactor method call `.{}(...)` inside a message",
+                                        name.name
+                                    ),
+                                    "log/fail messages evaluate lazily; hoist the call into \
+                                     a `let` first",
+                                ));
+                            }
+                            return Err(unsupported(
+                                &format!(
+                                    "transactor method call `.{}(...)` in expression position",
+                                    name.name
+                                ),
+                                "hoist it into a `let` first",
                             ));
                         }
                         format!("transactor/method call `.{}(...)`", name.name)
@@ -176,6 +208,12 @@ impl FuncBuilder<'_> {
                 let a = self.hoist_ports(*a);
                 Expr::Unary(op, Box::new(a))
             }
+            Expr::Ternary(c, t, e) => {
+                let c = self.hoist_ports(*c);
+                let t = self.hoist_ports(*t);
+                let e = self.hoist_ports(*e);
+                Expr::Ternary(Box::new(c), Box::new(t), Box::new(e))
+            }
             Expr::Call(t, args) => {
                 let args = args.into_iter().map(|a| self.hoist_ports(a)).collect();
                 Expr::Call(t, args)
@@ -203,7 +241,14 @@ impl FuncBuilder<'_> {
                     // The DUT field itself, or — inside an inlined
                     // helper — a parameter bound to the DUT. Either way
                     // the `PortRef` is rooted at the caller's DUT field.
-                    if self.is_dut_name(&root.name) {
+                    // A declared local SHADOWS the DUT name (a method
+                    // param or `let` named like the DUT field is host
+                    // state, not the DUT — v1 surfaces such shadowing
+                    // as a C++ compile error; without this guard the
+                    // access would silently mis-lower to a DutWrite/
+                    // DutRead). DUT-bound inline-helper params are not
+                    // declared as locals, so they pass through.
+                    if self.lookup(&root.name).is_none() && self.is_dut_name(&root.name) {
                         if segments.is_empty() {
                             return Ok(None);
                         }
@@ -230,8 +275,15 @@ impl FuncBuilder<'_> {
                     {
                         // Covergroup-field paths (`_tb.cov...`) are not
                         // ports — `lower_expr` resolves them as
-                        // `Expr::CovBin` via `as_cov_bin`.
-                        if self.ctx.cov_fields.contains_key(segments.last().unwrap()) {
+                        // `Expr::CovBin` via `as_cov_bin`. Transactor-
+                        // field paths (`_tb.xact...`) are call/bind
+                        // surfaces handled by their statement forms.
+                        if self.ctx.cov_fields.contains_key(segments.last().unwrap())
+                            || self
+                                .ctx
+                                .transactor_fields
+                                .contains_key(segments.last().unwrap())
+                        {
                             return Ok(None);
                         }
                         return Err(unsupported(
@@ -245,6 +297,52 @@ impl FuncBuilder<'_> {
                 _ => return Ok(None),
             }
         }
+    }
+
+    /// `Some((tb_field, transactor, method))` when `callee` is a
+    /// method access on a transactor-typed testbench field:
+    /// `_tb.xact.write1` (the impl-for desugaring already rewrote
+    /// `xact.` → `_tb.xact.`). An access to a method the transactor
+    /// does not declare is a hard error — v1 would surface it as a
+    /// C++ compile failure; the IR rejects it at lowering.
+    pub(crate) fn as_transactor_call(
+        &self,
+        callee: &AstExpr,
+    ) -> Result<Option<(String, crate::ir::TransactorId, String)>, LowerError> {
+        let Some(tb_field) = self.ctx.tb_field.as_deref() else {
+            return Ok(None);
+        };
+        let ExprKind::Field {
+            target,
+            name: method,
+        } = &*callee.kind
+        else {
+            return Ok(None);
+        };
+        let ExprKind::Field {
+            target: root_expr,
+            name: field,
+        } = &*target.kind
+        else {
+            return Ok(None);
+        };
+        let ExprKind::Ident(root) = &*root_expr.kind else {
+            return Ok(None);
+        };
+        if root.name != tb_field {
+            return Ok(None);
+        }
+        let Some(&xid) = self.ctx.transactor_fields.get(&field.name) else {
+            return Ok(None);
+        };
+        let schema = &self.ctx.transactors[xid.index()];
+        if schema.method(&method.name).is_none() {
+            return Err(LowerError::Invalid(format!(
+                "transactor `{}` has no method `{}`",
+                schema.name, method.name
+            )));
+        }
+        Ok(Some((field.name.clone(), xid, method.name.clone())))
     }
 
     /// `Some(Expr::CovBin)` when the expression is a check-phase bin
