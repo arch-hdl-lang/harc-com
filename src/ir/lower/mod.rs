@@ -11,6 +11,7 @@
 //! silently mis-lowers. Re-run with `--codegen v1` to use the legacy
 //! direct AST → C++ path for unsupported constructs.
 
+mod addrmap;
 mod bus;
 mod components;
 mod control;
@@ -25,7 +26,7 @@ mod tseqs;
 mod transactors;
 
 use crate::ast::{
-    Block, BuiltinTy, BusDecl, ClockDecl, ComponentDecl, ComponentItem, ExprKind,
+    AddrmapDecl, Block, BuiltinTy, BusDecl, ClockDecl, ComponentDecl, ComponentItem, ExprKind,
     HookableMethod, Item, ScopeDecl, SourceFile, Stmt as AstStmt, StmtKind, TestDecl, TestItem,
     TransactorMode, TypeExpr,
 };
@@ -253,6 +254,31 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         }
     }
 
+    // Addrmap declarations (`addrmap A via H { instance ... }`), in file
+    // order. Resolved per-binding at the `let chip : A = bind helper`
+    // site (each instance becomes its own shifted-offset mirror local).
+    // No `TbProgram`-level schema: the binding context carries everything
+    // access lowering and the Run-function mirror inits need, and dump-ir
+    // surfaces it through the regblock binding list. See
+    // `src/ir/lower/addrmap.rs`.
+    let mut addrmap_decls: HashMap<String, &AddrmapDecl> = HashMap::new();
+    for it in &file.items {
+        if let Item::Addrmap(a) = it {
+            let name = &a.name.name;
+            if regblock_ids.contains_key(name) || record_ids.contains_key(name) {
+                return Err(LowerError::Invalid(format!(
+                    "addrmap `{name}` collides with a regblock, transaction, or struct of \
+                     the same name"
+                )));
+            }
+            if addrmap_decls.insert(name.clone(), a).is_some() {
+                return Err(LowerError::Invalid(format!(
+                    "addrmap `{name}` is declared more than once"
+                )));
+            }
+        }
+    }
+
     // `tseq` (transaction-sequence) declarations: name → element record
     // type. Validated up front (the element type must be a declared
     // record); the bodies lower to `FunctionKind::Tseq` functions after
@@ -384,7 +410,12 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             // (with their own Unsupported rejections); they are inert
             // until a testbench binds one as a field.
             | Item::Scoreboard(_)
-            | Item::Regblock(_) => {}
+            | Item::Regblock(_)
+            // Addrmap declarations are collected into `addrmap_decls`
+            // above and resolved per `let chip : A = bind helper`
+            // binding (each instance becomes its own shifted-offset
+            // mirror local); inert at this gate.
+            | Item::Addrmap(_) => {}
             // `extend` was already folded by merge_for_sim; a survivor
             // means the merge didn't apply (e.g. dump-ir on a lone
             // extension file).
@@ -527,6 +558,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         test_scope_lets: HashSet::new(),
         regblock_bindings: HashMap::new(),
         regblock_init_order: Vec::new(),
+        addrmap_bindings: HashMap::new(),
+        addrmap_init_order: Vec::new(),
         bare_transactor_fields: HashSet::new(),
         target_state: HashMap::new(),
         components: Vec::new(),
@@ -579,6 +612,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         test_scope_lets: HashSet::new(),
         regblock_bindings: HashMap::new(),
         regblock_init_order: Vec::new(),
+        addrmap_bindings: HashMap::new(),
+        addrmap_init_order: Vec::new(),
         bare_transactor_fields: HashSet::new(),
         target_state: HashMap::new(),
         components: Vec::new(),
@@ -713,6 +748,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         test_scope_lets: HashSet::new(),
         regblock_bindings: HashMap::new(),
         regblock_init_order: Vec::new(),
+        addrmap_bindings: HashMap::new(),
+        addrmap_init_order: Vec::new(),
         bare_transactor_fields: HashSet::new(),
         target_state: HashMap::new(),
         components: prog.components.clone(),
@@ -822,6 +859,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &covgroup_ids,
             &record_ids,
             &regblock_ids,
+            &addrmap_decls,
             &buses,
             &consts,
             &helper_registry,
@@ -1050,6 +1088,7 @@ fn lower_test(
     covgroup_ids: &HashMap<String, CovgroupId>,
     record_ids: &HashMap<String, RecordId>,
     regblock_ids: &HashMap<String, RegblockId>,
+    addrmap_decls: &HashMap<String, &AddrmapDecl>,
     buses: &HashMap<String, &BusDecl>,
     consts: &HashMap<String, u64>,
     helpers: &helpers::HelperRegistry<'_>,
@@ -1085,6 +1124,10 @@ fn lower_test(
     // (the `<helper>` must be an active transactor field). Each tuple is
     // (binding name, regblock id, helper field name).
     let mut regblock_binds: Vec<(String, RegblockId, String)> = Vec::new();
+    // Addrmap bindings (`let chip : A = bind <helper>`), collected here
+    // and resolved after the testbench's transactor fields are known.
+    // Each tuple is (binding name, addrmap type name, helper field name).
+    let mut addrmap_binds: Vec<(String, String, String)> = Vec::new();
     // Test-scope unbound-transactor instances (`let h : Xactor active`),
     // accessed by bare name. Merged into `transactor_fields` after the
     // testbench-field walk; collected here as (name, transactor id).
@@ -1224,6 +1267,34 @@ fn lower_test(
                     }
                 };
                 regblock_binds.push((l.name.name.clone(), rbid, helper_field));
+            }
+            // Addrmap binding: `let chip : Soc = bind <helper>`.
+            TestItem::Let(l)
+                if l.bind
+                    && type_simple_name(l.ty.as_ref())
+                        .is_some_and(|n| addrmap_decls.contains_key(n)) =>
+            {
+                if !l.probes.is_empty() {
+                    return Err(unsupported("probe declarations on an addrmap binding", ""));
+                }
+                if !l.bind_remap.is_empty() {
+                    return Err(unsupported("bind remaps on an addrmap binding", ""));
+                }
+                let amap_name = type_simple_name(l.ty.as_ref()).unwrap().to_string();
+                // RHS must be a bare helper-instance identifier.
+                let helper_field = match l.value.as_ref().map(|v| &*v.kind) {
+                    Some(ExprKind::Ident(id)) => id.name.clone(),
+                    _ => {
+                        return Err(unsupported(
+                            &format!(
+                                "addrmap binding `{}` to a non-identifier helper",
+                                l.name.name
+                            ),
+                            "only `= bind <helper>` (a transactor instance) is lowered",
+                        ));
+                    }
+                };
+                addrmap_binds.push((l.name.name.clone(), amap_name, helper_field));
             }
             // Bound-to initiator-side BFM: `let helper : AxilHelper
             // active = bind <busbinding>`. The helper's `hookable`
@@ -1969,6 +2040,83 @@ fn lower_test(
         regblock_init_order.push(binding.clone());
     }
 
+    // Resolve addrmap bindings: build one shifted-offset mirror local per
+    // (non-aliased) instance, sharing the addrmap's `via` helper. The
+    // helper validation mirrors the regblock path (must be an active
+    // transactor field declaring `write(addr,data)` / `read(addr)`).
+    let mut addrmap_bindings_map: HashMap<String, addrmap::AddrmapBindingCtx> = HashMap::new();
+    let mut addrmap_init_order: Vec<(String, RecordId)> = Vec::new();
+    // Helper maps for instance resolution: regblock type → mirror record
+    // id and register table.
+    let regblock_record_of: HashMap<String, RecordId> = regblock_ids
+        .keys()
+        .map(|n| (n.clone(), record_ids[n]))
+        .collect();
+    let regblock_registers: HashMap<String, Vec<ir::RegRegisterSchema>> = regblock_ids
+        .iter()
+        .map(|(n, rbid)| (n.clone(), prog.regblocks[rbid.index()].registers.clone()))
+        .collect();
+    for (binding, amap_name, helper_field) in &addrmap_binds {
+        if regblock_bindings_map.contains_key(binding)
+            || addrmap_bindings_map.contains_key(binding)
+        {
+            return Err(LowerError::Invalid(format!(
+                "duplicate regblock/addrmap binding `{binding}` in test `{}`",
+                t.name.name
+            )));
+        }
+        if bus_binding_decls.contains_key(binding)
+            || transactor_fields.iter().any(|(f, _)| f == binding)
+            || test_let_names.contains(binding)
+        {
+            return Err(LowerError::Invalid(format!(
+                "name `{binding}` is an addrmap binding and also a bus binding, transactor \
+                 instance, or test-scope let in test `{}` — rename one",
+                t.name.name
+            )));
+        }
+        let Some(&xid) = transactor_field_ids.get(helper_field.as_str()) else {
+            return Err(unsupported(
+                &format!(
+                    "addrmap binding `{binding}` via `{helper_field}` (not an active \
+                     transactor field of the testbench)"
+                ),
+                "the `via` helper must be a `transactor` instance that pokes the DUT",
+            ));
+        };
+        let xschema = &prog.transactors[xid.index()];
+        for (m, n) in [("write", 2usize), ("read", 1usize)] {
+            match xschema.method(m) {
+                Some(ms) if ms.n_params == n => {}
+                Some(ms) => {
+                    return Err(LowerError::Invalid(format!(
+                        "addrmap `via` helper `{}` method `{m}` takes {} argument(s), \
+                         the frontdoor needs {n}",
+                        xschema.name, ms.n_params
+                    )));
+                }
+                None => {
+                    return Err(LowerError::Invalid(format!(
+                        "addrmap `via` helper `{}` has no `{m}(addr, data)`-style method",
+                        xschema.name
+                    )));
+                }
+            }
+        }
+        let decl = addrmap_decls[amap_name];
+        let actx = addrmap::build_binding_ctx(
+            binding,
+            decl,
+            helper_field,
+            &regblock_record_of,
+            &regblock_registers,
+        )?;
+        for (key, rec) in &actx.mirror_inits {
+            addrmap_init_order.push((key.clone(), *rec));
+        }
+        addrmap_bindings_map.insert(binding.clone(), actx);
+    }
+
     // Resolve bound-to target-TLM responder binds: the bound bus binding
     // must exist in this test, its bus type must match the transactor's
     // `bound to` bus, and the instance name must be unique. Build the
@@ -2238,6 +2386,8 @@ fn lower_test(
         test_scope_lets: test_let_names,
         regblock_bindings: regblock_bindings_map,
         regblock_init_order,
+        addrmap_bindings: addrmap_bindings_map,
+        addrmap_init_order,
         bare_transactor_fields,
         target_state,
         components: prog.components.clone(),
@@ -2563,6 +2713,16 @@ pub(crate) struct LowerCtx {
     /// hoisted-let site. The mirror is run-scoped (a check-phase access
     /// is a precise rejection, like a test-scope let).
     pub regblock_init_order: Vec<String>,
+    /// Addrmap bindings (`let chip : A = bind <helper>`) → per-binding
+    /// access context (per-instance mirror locals + shifted register
+    /// tables + alias sharing). Empty for helper/method/synthetic
+    /// contexts.
+    pub addrmap_bindings: HashMap<String, addrmap::AddrmapBindingCtx>,
+    /// Distinct addrmap mirror locals to declare + `RecordInit` at the
+    /// head of the Run function, in declaration order: `(mangled local
+    /// name, mirror record id)`. Aliased instances are absent (they
+    /// share their target's local).
+    pub addrmap_init_order: Vec<(String, RecordId)>,
     /// Transactor instances declared as test-scope lets (`let h :
     /// Xactor active`) rather than testbench fields. Accessed by their
     /// BARE name (`h.method(...)`, `h.dut = dut`) — the impl-for
@@ -2756,6 +2916,15 @@ fn lower_function<'a>(
             let id = b.declare(binding);
             b.set_local_type(id, IrType::Record(rec));
             b.push(ir::Stmt::RecordInit(id, rec));
+        }
+        // Addrmap per-instance mirror locals: one default-constructed
+        // record local per non-aliased instance (alias instances share
+        // their target's cell). Declared with the mangled
+        // `__addrmap_<chip>_<inst>` name the access resolution computes.
+        for (key, rec) in &ctx.addrmap_init_order {
+            let id = b.declare(key);
+            b.set_local_type(id, IrType::Record(*rec));
+            b.push(ir::Stmt::RecordInit(id, *rec));
         }
     }
     for s in stmts {

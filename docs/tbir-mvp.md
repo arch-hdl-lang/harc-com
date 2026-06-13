@@ -102,11 +102,29 @@ verifier-pinned call edge); and (b) **`bitbash(regs)`** —
 compile-time-unrolled walk-all over the RW registers (write/read both
 patterns + compare; RO/WO skipped), unrolled into the existing
 `TransactorCall`/`AssertCheck` statements, plus a new `Expr::ErrorCount`
-framework value for the trailing `assert errors == 0`. Field-level
-access, the passive `record_write`/`record_read` API, per-register `on
-regs.REG` callbacks (rejected precisely via
-`regblock::detect_regblock_residual`), and `addrmap` composition stay
-out of subset (see divergence 12).
+framework value for the trailing `assert errors == 0`. The
+**field-level + addrmap slice** (2026-06-13, divergence 12) adds the
+remaining regblock residuals: (a) **field-level decomposition**
+(`regs.REG.FIELD`) — a register split into named bit-fields lowers to a
+masked read-modify-write on the whole-register mirror cell
+(`(mirror.REG & ~(mask<<pos)) | ((v & mask)<<pos)`) plus a
+full-register bus write, and a shifted-extract read
+(`((mirror.REG = <H>_read(off)) >> pos) & mask` for RW/RO,
+`(mirror.REG >> pos) & mask` for WO) — v1's bit-slice insert/extract,
+composed entirely from existing IR (`RecordFieldWrite` / `RegRead` /
+`RecordField` / `Binary` / `Unary`), no new variant; (b) the
+**`addrmap` construct** (incl. **`alias of`**) — each `instance NAME :
+R @ BASE [size S] [alias of OTHER]` becomes its own whole-register
+mirror local (mangled `__addrmap_<chip>_<inst>`) with a register table
+whose offsets are pre-shifted to `base + reg_off`, reusing the flat-
+regblock register/field access lowering verbatim; an `alias of` instance
+shares its target's mirror local (one storage cell across windows) while
+keeping its own base for bus traffic. Alias/overlap validation mirrors
+v1's `check_addrmap_aliases`/`check_addrmap_overlap`
+(`src/ir/lower/addrmap.rs`). The passive `record_write`/`record_read`
+API and per-register `on regs.REG` callbacks (rejected precisely via
+`regblock::detect_regblock_residual`) remain the only out-of-subset
+regblock residuals (see divergence 12).
 `transactor` declarations lower in their **unbound DUT-poking BFM
 subset**: no `bound to <BusType>`, no generics, exactly one
 module-typed field (the DUT handle — its type must match the test's
@@ -383,6 +401,9 @@ none — `extra_harc` joins additional `tests/fixtures/` files to the
 | `regblock_subset_test` | `Top` | `top_counter.sv` | pass | regblock: rw/ro/wo + reset, register-level frontdoor (mirror + Helper.write/read call edges), read-predict, WO mirror-read, test-scope-let helper |
 | `regblock_basic_test` | `AxiLiteRegs` | `AxiLiteRegs.sv` | pass | regblock: initiator-BFM `via` helper + register read in assert conditions AND `${...}` fail-message format args (`Expr::RegRead`, divergence 12) — one bus read per textual occurrence (eager cond, lazy fail-branch) |
 | `regblock_bitbash_test` | `AxiLiteRegs` | `AxiLiteRegs.sv` | pass | regblock: `bitbash(regs)` compile-time-unrolled walk-all over 3 RW regs (write/read ones+zero + compare; RO/WO skipped) + `assert errors == 0` (`Expr::ErrorCount`) |
+| `regblock_fields_test` | `AxiLiteRegs` | `AxiLiteRegs.sv` | pass | regblock: field-level decomposition (`regs.DMACR.RS`/`.MODE`) — masked RMW on the whole-register mirror + full-register bus write; shifted-extract read (`Expr::RegRead`); coexists with whole-register access (`regs.MM2S_SA`) (divergence 12) |
+| `regblock_addrmap_test` | `AxiLiteRegs` | `AxiLiteRegs.sv` | pass | addrmap: two `DmaChan` instances at distinct bases; 3-level `chip.inst.REG` + 4-level `chip.inst.REG.FIELD` access; per-instance shifted-offset mirror locals route each window independently (divergence 12) |
+| `regblock_alias_test` | `AxiLiteRegs` | `AxiLiteRegs.sv` | pass | addrmap `alias of`: `mm2s_view` shares `mm2s`'s mirror cell (one storage local) while issuing bus traffic at its own base — write via the alias moves the shared mirror (divergence 12) |
 | `struct_basic_test` | `Top` | `top_counter.sv` | pass | struct: scalar fields (uint/sint/bool) + literal defaults, default-construct in a loop (re-init), field reads/writes in arithmetic/branch/assert/format args (reuses the transaction record machinery) |
 | `tlm_target_thread_test` | `TlmReadInitiator` | `TlmReadInitiator.sv` | pass | target-side TLM: blocking `thread bus.read` responder actor, single-cycle wait, value return |
 | `tlm_target_thread_if_test` | `TlmReadInitiatorPair` | `TlmReadInitiatorPair.sv` | pass | target-side TLM: persistent state fields (read in body + from test), `for` loop, `if`/`else` return |
@@ -692,15 +713,21 @@ reason. Code locations are authoritative.
       which shape to expect). The mirror is **run-scoped**: a
       check-phase regblock access fails the binding lookup and is a
       precise rejection, like a test-scope let.
-    - *Rejected, never mis-lowered:* the **bus-bound `via` helper**
-      (`transactor H bound to BusT` — the dominant residual blocker for
-      the corpus `regblock_*` fixtures, whose method bodies resolve
-      `bus` against a test-scope bus binding), field-level decomposition
-      (`regs.REG.FIELD`), `bitbash(regs)`, the passive
-      `record_write`/`record_read` API, per-register `on regs.REG`
-      callbacks, `addrmap` composition (incl. `alias of`), non-literal
-      register offsets/reset values, and >64-bit register widths. Each
-      is an `Unsupported` naming the deferred feature. New fixture:
+    - *Rejected, never mis-lowered (at this first slice):* the
+      **bus-bound `via` helper** (`transactor H bound to BusT` — the
+      dominant residual blocker for the corpus `regblock_*` fixtures,
+      whose method bodies resolve `bus` against a test-scope bus
+      binding), field-level decomposition (`regs.REG.FIELD`),
+      `bitbash(regs)`, the passive `record_write`/`record_read` API,
+      per-register `on regs.REG` callbacks, `addrmap` composition (incl.
+      `alias of`), non-literal register offsets/reset values, and
+      >64-bit register widths. Each is an `Unsupported` naming the
+      deferred feature. **Subsequently closed:** the bus-bound helper
+      (initiator-BFM slice), `bitbash` + register-read-in-assert
+      (regblock-residuals slice), and field-level decomposition +
+      `addrmap` + `alias of` (field-level/addrmap slice, 2026-06-13).
+      Only the passive `record_*` API and `on regs.REG` callbacks remain
+      rejected. New fixture:
       `regblock_subset_test` (`top_counter.sv`, pass) exercises
       rw/ro/wo + reset values + mirror predict + WO mirror-read +
       test-scope-let helper routing, registered in the equivalence
@@ -1362,7 +1389,55 @@ reason. Code locations are authoritative.
       names the callback/record-API feature before the generic
       bare-statement/scope mixing error fires. Field-level
       `regs.REG.FIELD` access and `addrmap` composition (incl. `alias of`)
-      also stay rejected.
+      stayed rejected at this slice — closed by slice 21 below.
+
+21. **Regblock residuals: field-level decomposition + `addrmap` +
+    `alias of` (2026-06-13, divergence 12).** The remaining regblock
+    residual blockers (`regblock_fields_test`, `regblock_addrmap_test`,
+    `regblock_alias_test`). Builds on the register-level frontdoor (#369)
+    and the residuals slice (#385).
+    - *No new IR variants.* Field-level access composes entirely from
+      existing IR. Each register grows a `RegRegisterSchema::fields`
+      table (`RegFieldSchema { name, bit_pos, bit_width, access }`).
+      `regs.REG.FIELD = v` lowers to a masked read-modify-write on the
+      whole-register mirror cell —
+      `RecordFieldWrite(mirror.REG, (RecordField & ~(mask<<pos)) | ((v &
+      mask)<<pos))` — followed by a full-register `Helper.write(off,
+      mirror.REG)` (v1 writes the updated whole word, not the field; RO
+      fields update the mirror only). A field read is the shifted extract
+      `((mirror.REG = <H>_read(off)) >> pos) & mask` (RW/RO, reusing
+      `Expr::RegRead`) or `(mirror.REG >> pos) & mask` (WO, mirror-only)
+      — same one-bus-read-per-occurrence semantics as the whole-register
+      form. Masks clamp at 32 bits (v1's `field_mask_literal`); the
+      64-bit IR mirror makes the clamp value-identical for the corpus.
+    - *`addrmap` + `alias of`* (`src/ir/lower/addrmap.rs`). Each
+      `instance NAME : R @ BASE [size S] [alias of OTHER]` becomes its
+      own whole-register mirror local (type = the regblock's synthetic
+      mirror record), declared with the mangled name
+      `__addrmap_<chip>_<inst>`, with a per-instance register table whose
+      offsets are pre-shifted to `base + reg_off`. The 3-level
+      `chip.inst.REG` and 4-level `chip.inst.REG.FIELD` accesses resolve
+      to that local + shifted table and then reuse the flat-regblock
+      register/field write/read lowering verbatim (`lower_reg_write` /
+      `lower_reg_read_let` / `reg_read_expr` / `lower_field_write` /
+      `field_read_expr`, refactored out of the regblock path). An
+      `alias of OTHER` instance shares OTHER's mirror local — only one
+      storage cell is declared (no per-alias mirror), matching v1's
+      "shares mirror" comment — while keeping its OWN base for bus
+      traffic. Validation mirrors v1: alias targets must exist, must not
+      themselves be aliases (no chains), must reference the same regblock
+      type; sized non-aliased windows must not overlap.
+    - *Binding.* `let chip : A = bind <helper>` is recognized alongside
+      the regblock binding; the helper validation (active transactor
+      field with `write(addr,data)`/`read(addr)`) and the per-instance
+      mirror-local init (declared + `RecordInit` at the head of the Run
+      function) mirror the regblock path.
+    - *Fixtures.* `regblock_fields_test`, `regblock_addrmap_test`,
+      `regblock_alias_test` (all `AxiLiteRegs.sv`, `pass`, trace-diff
+      clean v1↔tbir at seed 1; all registered).
+    - *Out of subset* (still rejected, precisely): the passive
+      `record_write`/`record_read` API and per-register `on regs.REG`
+      write callbacks remain the only regblock residuals.
 
 21. **Bound-to event-driven driver (2026-06-13).** Composes the
     event-driven-transactor consumer (divergence 11, unbound) with the

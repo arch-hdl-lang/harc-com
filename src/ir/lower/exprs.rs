@@ -134,7 +134,19 @@ impl FuncBuilder<'_> {
                 if let Some((binding, reg)) = self.as_regblock_register(e) {
                     return self.lower_regblock_read_expr(&binding, &reg);
                 }
+                // Field-level read in expression position
+                // (`regs.REG.FIELD` in an assert/format arg). Same
+                // read-count semantics as the whole-register form.
+                if let Some((binding, reg, fld)) = self.as_regblock_subfield(e) {
+                    return self.lower_regblock_subfield_read_expr(&binding, &reg.name, &fld.name);
+                }
+                // Addrmap access in expression position
+                // (`chip.inst.REG[.FIELD]`).
+                if let Some(ax) = self.lower_addrmap_read_expr(e)? {
+                    return Ok(ax);
+                }
                 self.reject_out_of_subset_regblock_access(e, "read")?;
+                self.reject_out_of_subset_addrmap_access(e, "read")?;
                 // Composite-component scalar field read via a test-scope
                 // path (`env.sb.count`).
                 if let Some(ce) = self.as_component_field_read(e)? {

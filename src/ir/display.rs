@@ -165,6 +165,16 @@ impl Display for TbProgram {
                     reg.width,
                     reg.access.keyword()
                 )?;
+                for fld in &reg.fields {
+                    writeln!(
+                        f,
+                        "      field {} [{}+:{}] access {}",
+                        fld.name,
+                        fld.bit_pos,
+                        fld.bit_width,
+                        fld.access.keyword()
+                    )?;
+                }
             }
         }
         for (i, c) in self.components.iter().enumerate() {

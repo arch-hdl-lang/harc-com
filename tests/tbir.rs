@@ -3604,10 +3604,13 @@ end impl Test
     );
 }
 
-/// Field-level access (`regs.REG.FIELD`) is out of subset — rejected
-/// with a precise message, never mis-lowered into a mirror read.
+/// Field-level access (`regs.REG.FIELD`) lowers to a masked read-modify-
+/// write on the whole-register mirror cell plus a full-register bus
+/// write — v1's bit-slice insert. The mirror cell stays whole-register
+/// (one `RecordFieldWrite` of the new word); a bus-writing field then
+/// fires `H.write(off, mirror.REG)`.
 #[test]
-fn regblock_field_level_access_is_unsupported() {
+fn regblock_field_level_write_lowers_to_masked_rmw_plus_bus_write() {
     let src = r#"
 transactor H
     dut : Top
@@ -3623,6 +3626,7 @@ end transactor H
 regblock R via H width 32
     register A @ 0x00 access rw
         field F : bit @ 0 access rw
+        field G : uint<3> @ 4 access rw
     end register A
 end regblock R
 testbench Tb
@@ -3634,14 +3638,74 @@ impl Test for Tb
     run
         h.dut = dut
         regs.A.F = 1
+        regs.A.G = 5
+        assert regs.A.G == 5 else fail("g")
     end run
 end impl Test
 "#;
-    let err = lower_src(src).unwrap_err();
-    let msg = assert_unsupported(&err);
+    let prog = lower_src(src).expect("field-level lowers");
+    let dump = format!("{prog}");
+    // The masked RMW writes the whole-register mirror field `A`, then the
+    // bus write carries the updated whole-register word — never the
+    // field. A shifted-extract read appears in the assert condition.
     assert!(
-        msg.contains("field-level"),
-        "expected a field-level-decomposition rejection: {msg}"
+        dump.contains("RecordFieldWrite(%regs.A"),
+        "expected a whole-register mirror RecordFieldWrite of `A`: {dump}"
+    );
+    assert!(
+        dump.contains("RegRead"),
+        "expected a field read to compose over an inline RegRead: {dump}"
+    );
+}
+
+/// An RO field's write updates the mirror but suppresses the bus write
+/// (v1's `ro` semantics); a WO field's read serves from the mirror cell
+/// without bus traffic.
+#[test]
+fn regblock_field_level_ro_wo_policies() {
+    let src = r#"
+transactor H
+    dut : Top
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            dut.en = 1
+        end write
+        hookable read(addr: uint<8>) -> uint<32>
+            return addr
+        end read
+    end when
+end transactor H
+regblock R via H width 32
+    register A @ 0x00 access rw
+        field RO : bit @ 0 access ro
+        field WO : bit @ 1 access wo
+    end register A
+end regblock R
+testbench Tb
+    dut : Top
+end testbench Tb
+impl Test for Tb
+    let h : H active
+    let regs : R = bind h
+    run
+        h.dut = dut
+        regs.A.RO = 1
+        let w = regs.A.WO
+    end run
+end impl Test
+"#;
+    let prog = lower_src(src).expect("ro/wo fields lower");
+    let dump = format!("{prog}");
+    // The RO write still updates the mirror (RecordFieldWrite of A).
+    assert!(
+        dump.contains("RecordFieldWrite(%regs.A"),
+        "expected a mirror RecordFieldWrite even for the RO field: {dump}"
+    );
+    // The WO read must NOT issue a bus read — it serves from the mirror
+    // cell (a shifted RecordField extract), so no RegRead is emitted.
+    assert!(
+        !dump.contains("RegRead"),
+        "WO field read must serve from the mirror, not the bus: {dump}"
     );
 }
 
@@ -3890,5 +3954,57 @@ fn regblock_record_corpus_rejects_precisely() {
     assert!(
         !msg.contains("mixing bare statements"),
         "should not fall through to the generic mixing error: {msg}"
+    );
+}
+
+/// The corpus `regblock_fields_test` fixture — field-level decomposition
+/// (`regs.DMACR.RS` / `regs.DMACR.MODE`) coexisting with whole-register
+/// access (`regs.MM2S_SA`) — FULLY lowers. Closes the field-level half of
+/// divergence 12.
+#[test]
+fn regblock_fields_corpus_lowers() {
+    let prog =
+        lower_with_stdlib_bus("regblock_fields_test.harc", "BusAxiLite.arch").expect("lowers");
+    let dump = format!("{prog}");
+    // Masked RMW on the whole-register mirror `DMACR`, plus an inline
+    // RegRead for the bus-reading field extracts.
+    assert!(dump.contains("DMACR ="), "expected mirror RMW of DMACR: {dump}");
+    assert!(dump.contains("RegRead"), "expected an inline field RegRead: {dump}");
+}
+
+/// The corpus `regblock_addrmap_test` fixture — two `DmaChan` instances
+/// at distinct bases composed by an `addrmap`, accessed 3-level
+/// (`chip.inst.REG`) and 4-level (`chip.inst.REG.FIELD`) — FULLY lowers.
+/// Closes the addrmap half of divergence 12.
+#[test]
+fn regblock_addrmap_corpus_lowers() {
+    let prog =
+        lower_with_stdlib_bus("regblock_addrmap_test.harc", "BusAxiLite.arch").expect("lowers");
+    let dump = format!("{prog}");
+    // Two distinct per-instance mirror locals (mangled), not one.
+    assert!(
+        dump.contains("__addrmap_chip_mm2s") && dump.contains("__addrmap_chip_s2mm"),
+        "expected two per-instance addrmap mirror locals: {dump}"
+    );
+}
+
+/// The corpus `regblock_alias_test` fixture — `instance mm2s_view :
+/// DmaChan @ 0x30 alias of mm2s` shares the primary's mirror cell while
+/// keeping its own bus base — FULLY lowers. Closes the `alias of` half
+/// of the addrmap residual.
+#[test]
+fn regblock_alias_corpus_lowers() {
+    let prog =
+        lower_with_stdlib_bus("regblock_alias_test.harc", "BusAxiLite.arch").expect("lowers");
+    let dump = format!("{prog}");
+    // The alias instance shares the primary's mirror — only ONE mirror
+    // local is declared (no `__addrmap_chip_mm2s_view`).
+    assert!(
+        dump.contains("__addrmap_chip_mm2s"),
+        "expected the primary mirror local: {dump}"
+    );
+    assert!(
+        !dump.contains("__addrmap_chip_mm2s_view"),
+        "alias must NOT get its own mirror local (shares the target's cell): {dump}"
     );
 }
