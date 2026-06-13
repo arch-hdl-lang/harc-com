@@ -354,8 +354,11 @@ machinery as the unbound and bound-target forms. Self-proving fixture
 `transactor_bound_initiator_state_test` (`AxiLiteRegs.sv`, pass, trace-diff
 clean). One stateful instance per BFM type per file.
 
-**Out of subset** (precise rejections): event/directional fields
-(`req : in event<T>` — the bound-to event-driven driver form),
+**Out of subset for THIS (hookable-BFM) path** (precise rejections):
+event/directional fields — a `req : in event<T>` + `on req` transactor is
+the **bound-to event-driven driver**, which routes through the
+composite-component path instead (RESOLVED 2026-06-13; see the
+event-driven-transactor group). The hookable-BFM path itself still rejects
 `out_of_order` channels, `fork`-issue, nested transactor calls inside a
 BFM body, multiple bound instances of one BFM type per file. A
 `bind ... with { ... }` remap on a *handshake-channel* bus (which an
@@ -408,7 +411,7 @@ dump-ir`, 2026-06-13):
 |---|---|
 | `agent` construct + `on <ev>` event handlers | `heartbeat_idle_test`, `wait_until_quiesce_test`, `watchdog_quiesce_test`, `watchdog_trip_diagnostic_test`, `env_quiesced_phase_test` (also need `phase`, `idle(N)`/`quiesced(N)` predicates, watchdog) |
 | ~~`sequencer`~~ → ~~`tseq`~~ → ~~state field~~ → now **event field / agent-mode** | `axilite_connect_test`, `transactor_agent_mode_test`, `transactor_env_mode_test` — **`sequencer` lowers (sequencer slice), `tseq` lowers (tseq slice), and transactor scalar STATE fields lower (state-field slice, 2026-06-13)**; each now stops at the NEXT tier: `axilite_connect_test` → `req : in event<RegOp>` directional field (event-driven unbound transactor); the agent/env pair → a transactor with **>1 module-typed field** (`dut` + `sb`, agent-mode DUT-handle inheritance), additionally stacking mode-inheritance + cycle-trigger `on dut.x && dut.y` handlers — see the `tseq` construct group |
-| ~~`tseq` construct~~ → ~~bound-to state field~~ → bound-to **agent surface** | `axilite_bound_mon_test`, `axilite_multi_payload_test`, `transactor_passive_only_test` — **`tseq` slice landed; the bound-to *scalar* state field now lowers (bound-initiator-state slice, 2026-06-13)**; these now stop at a bound-to transactor **sub-component field** (`sb : AxilSb`), additionally stacking `on bus.<ch>.handshake` MONITOR handlers + `in event<RegOp>` + `on req(t)` driving the bound bus — the full bound-to event-driven AGENT surface, a deeper slice |
+| ~~`tseq` construct~~ → ~~bound-to state field~~ → ~~bound-to driver~~ → bound-to **MONITOR surface** | `axilite_bound_mon_test`, `axilite_multi_payload_test`, `transactor_passive_only_test` — **`tseq` slice landed; the bound-to *scalar* state field lowers (bound-initiator-state slice, 2026-06-13); the bound-to event-driven DRIVER (`in event` + `on req` driving the bound bus) lowers (bound-to event-driven-driver slice, 2026-06-13)**; these now stop at the passive bound-to **MONITOR** half — a bound-to transactor **sub-component field** (`sb : AxilSb`) + `on bus.<ch>.handshake` MONITOR handlers, which need the monitor-actor coroutine topology + `ScoreboardSub` on a bound transactor — a deeper slice (rejected precisely) |
 | ~~`tseq` + `randomize`~~ → sub-component field | `axilite_env_test` — **its `tseq` + `randomize(t)` now lower (tseq slice)**; now stops at an env **sub-component field** type (a deeper env-composition feature, not tseq) |
 
 The env-composition machinery (component structs, methods with instance
@@ -561,9 +564,9 @@ map (re-run of `harc dump-ir`, 2026-06-13):
 
 | Next blocker | Fixtures |
 |---|---|
-| ~~transactor **event field** (`req : in event<RegOp>`)~~ → **RESOLVED 2026-06-13** for the UNBOUND form (event-driven-transactor slice); `axilite_seqdrv_test` now **PASSES** (registered). `axilite_connect_test` advanced past the event field to a data-only `scoreboard` SUB-component in its env (see below); `transactor_active_test` is the BOUND-to event form (separate slice). | `axilite_connect_test` (env data-scoreboard sub), `transactor_active_test` (bound-to actor) |
+| ~~transactor **event field** (`req : in event<RegOp>`)~~ → **RESOLVED 2026-06-13** for the UNBOUND form (event-driven-transactor slice) AND the BOUND form (bound-to event-driven-driver slice, 2026-06-13); `axilite_seqdrv_test` + `transactor_active_test` now **PASS** (registered). `axilite_connect_test` advanced past the event field to a data-only `scoreboard` SUB-component in its env (see below). | `axilite_connect_test` (env data-scoreboard sub) |
 | transactor with **>1 module-typed field** (`dut` + `sb` — agent-mode DUT-handle inheritance) | `transactor_agent_mode_test`, `transactor_env_mode_test` |
-| bound-to **agent surface** (`sb` sub-component field + `on bus.<ch>.handshake` monitor handlers + `in event` + `on req` driving the bound bus) — the bound-to scalar state field itself now lowers (bound-initiator-state slice, 2026-06-13) | `axilite_bound_mon_test`, `axilite_multi_payload_test`, `transactor_passive_only_test`, `transactor_parse_test` |
+| bound-to **monitor/agent surface** (`sb` sub-component field + `on bus.<ch>.handshake` MONITOR handlers) — the bound-to scalar state field (bound-initiator-state slice) AND the bound-to event-driven DRIVER (`in event` + `on req` driving the bound bus; bound-to event-driven-driver slice, 2026-06-13) now lower; what remains is the passive handshake-MONITOR actor + the `sb` scoreboard SUB-component on a bound transactor | `axilite_bound_mon_test`, `axilite_multi_payload_test`, `transactor_passive_only_test`, `transactor_parse_test` |
 
 The **event-driven-transactor slice** (2026-06-13) lowers the consumer
 side: an unbound `transactor` with an `in event<T>` pipe + `on req(t)`
@@ -571,13 +574,34 @@ handler routes through the composite-component table, with a
 `ComponentFieldKind::Dut` handle the synchronous handler pokes and a
 `ConnectSink::Event` variant for sequencer→transactor `connect` event
 bridges. Proven by `event_driven_transactor_test` (self-proving) +
-`axilite_seqdrv_test` (corpus). Residual:
+`axilite_seqdrv_test` (corpus).
 
-- `transactor_active_test` — the **bound-to** form (`transactor X bound to
-  BusAxiLite` + `on req` driving bus channels). This needs the
-  coroutine-actor + bus-binding driver (v1's `try_emit_bound_driver_actor`
-  queue topology), a distinct slice. It still rejects precisely (the
-  external `BusAxiLite` bus also isn't in scope when lowered standalone).
+The **bound-to event-driven-driver slice** (2026-06-13) extends this to
+the *bound* form: a `transactor X bound to <Bus>` with an `in event<T>`
+pipe + `on req(t)` handler whose body drives the bound bus's handshake
+channels (`bus.<ch>.send/recv`, `bus.<ch>.<sig>`) instead of a private
+DUT handle. It routes through the same composite-component table, now
+carrying `ComponentSchema::bound_bus`; the `on req` handler body lowers
+with the bound `BusDecl` visible under the placeholder prefix
+(`transactors::INITIATOR_BUS_PLACEHOLDER`), so `send`/`recv` CFG-inline to
+the same bounded valid/ready spin loops as the bound-initiator BFM. At
+test scope, `let xact : X active = bind axil` validates the binding and
+fills the placeholder prefix with the real binding name; `emit xact.req(t)`
+fires the handler synchronously, `xact.<state>` reads the per-instance
+scalar state. Proven by `transactor_active_test` (corpus, registered,
+trace-clean v1↔tbir). Reuses no new tbir codegen — the synchronous
+on-handler dispatch + the existing handshake send/recv lowering compose.
+Residual:
+
+- The passive **handshake-MONITOR** half (`on bus.<ch>.handshake(arg)`
+  observers sampling valid&&ready per channel into a sub-scoreboard) is a
+  distinct slice — it needs the monitor-actor coroutine topology (v1's
+  `emit_bound_monitor_actors`) + a `ScoreboardSub` field on a bound
+  transactor. `lower_component_schema` now rejects it precisely (no
+  mis-lower) and the rejection names that slice. Blocks
+  `axilite_bound_mon_test`, `axilite_multi_payload_test`,
+  `transactor_passive_only_test`, `transactor_parse_test` (the last is
+  check-only — `harc check` passes; only `harc sim` reaches the rejection).
 - `axilite_connect_test` — its `env AxilEnv` holds a **data-only
   `scoreboard` SUB-component** (`sb : AxilSb`, queue + scalar, no methods)
   accessed through the env (`env.sb.expected.push/pop`). Queue access

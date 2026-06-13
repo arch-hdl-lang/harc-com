@@ -468,6 +468,15 @@ pub struct ComponentSchema {
     /// NOT been idle (`_last_in_cycle`/`_last_out_cycle`) for `max_idle`
     /// cycles. `None` means no watchdog.
     pub watchdog: Option<WatchdogSchema>,
+    /// `transactor X bound to <Bus>` — the bus this event-driven
+    /// transactor's `on <ev>` handler bodies drive (via `bus.<ch>.send/
+    /// recv`/`<ch>.<sig>` handshake accesses, CFG-inlined exactly like the
+    /// bound-initiator BFM). `None` for env/scoreboard/agent/sequencer and
+    /// for an UNBOUND event-driven transactor (which pokes a private DUT
+    /// handle instead). When `Some`, the handler bodies carry the
+    /// placeholder bus prefix (`transactors::INITIATOR_BUS_PLACEHOLDER`),
+    /// filled with the real binding name at test-binding time.
+    pub bound_bus: Option<String>,
 }
 
 /// One `on <N> cycles ... end on` periodic handler (spec §7.10). Fires

@@ -275,19 +275,38 @@ fn event_driven_transactor_fixture_lowers() {
 }
 
 /// The *bound-to* event-driven transactor (`transactor X bound to
-/// BusAxiLite` + `req : in event` + `on req` driving bus channels) is
-/// still out of subset — it needs the coroutine-actor + bus-binding
-/// form, a separate slice. Lowering must reject it (here the bus type is
-/// an external `use`, so the error is the bus-resolution failure rather
-/// than a subset `Unsupported`; either way it never mis-lowers).
+/// BusAxiLite` + `req : in event` + `on req` driving the bound bus's
+/// handshake channels) now lowers: it routes to the composite-component
+/// table with a `bound_bus`, its `on req` handler body resolves
+/// `bus.<ch>.send/recv` against the bound binding (CFG-inlined valid/
+/// ready spin loops), and the test-scope `let xact : X active = bind
+/// axil` fills the placeholder bus prefix with the real binding name.
 #[test]
-fn bound_event_driven_transactor_is_rejected() {
-    let err = lower_src(&fixture("transactor_active_test.harc")).unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("AxilXactor") || msg.contains("BusAxiLite"),
-        "unexpected error: {msg}"
-    );
+fn bound_event_driven_transactor_lowers() {
+    let prog = lower_with_stdlib_bus("transactor_active_test.harc", "BusAxiLite.arch")
+        .expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let comp = prog
+        .components
+        .iter()
+        .find(|c| c.name == "AxilXactor")
+        .expect("AxilXactor component");
+    // Bound to a bus, with an `in event` input pipe + one `on` handler,
+    // a scalar state field, and NO private DUT handle (drives the bus).
+    assert_eq!(comp.bound_bus.as_deref(), Some("BusAxiLite"));
+    assert!(comp.fields.iter().any(|f| matches!(
+        f.kind,
+        ir::ComponentFieldKind::Event { .. }
+    )));
+    assert!(comp.fields.iter().any(|f| matches!(
+        f.kind,
+        ir::ComponentFieldKind::Scalar { .. }
+    )));
+    assert!(!comp.fields.iter().any(|f| matches!(
+        f.kind,
+        ir::ComponentFieldKind::Dut { .. }
+    )));
+    assert_eq!(comp.on_handlers.len(), 1);
 }
 
 /// Randomize/constraint fixture (`randomize(t) with` + Z3 constraints,

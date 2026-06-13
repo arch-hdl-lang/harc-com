@@ -732,11 +732,37 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     for (i, src) in comp_sources.iter().enumerate() {
         let cid = ir::ComponentId(i as u32);
         let schema = prog.components[i].clone();
+        // A bound-bus event-driven transactor's `on <ev>` handler bodies
+        // drive the bound bus's handshake channels (`bus.<ch>.send/recv`,
+        // `bus.<ch>.<sig>`). They lower exactly like the bound-initiator
+        // BFM: the bound `BusDecl` is visible under the placeholder prefix
+        // (`transactors::INITIATOR_BUS_PLACEHOLDER`), filled with the real
+        // binding name at test-binding time. Inject a per-component ctx
+        // carrying that binding; everything else mirrors `method_ctx`.
+        let bound_ctx;
+        let body_ctx: &LowerCtx = if let Some(bus_name) = schema.bound_bus.as_deref() {
+            let Some(bus) = buses.get(bus_name) else {
+                return Err(LowerError::Invalid(format!(
+                    "event-driven transactor `{}` is bound to `{bus_name}`, which is not a \
+                     `bus` declaration",
+                    schema.name
+                )));
+            };
+            let mut bb = method_ctx.clone();
+            bb.bus_bindings.insert(
+                transactors::INITIATOR_BUS_PLACEHOLDER.to_string(),
+                (*bus).clone(),
+            );
+            bound_ctx = bb;
+            &bound_ctx
+        } else {
+            &method_ctx
+        };
         let bodies = components::lower_component_bodies(
             src,
             cid,
             &schema,
-            &method_ctx,
+            body_ctx,
             &helper_registry,
             &constraint_sites,
         )?;
@@ -1078,6 +1104,14 @@ fn lower_test(
     // regblock `via` frontdoor and bare `helper.method(...)` calls
     // resolve. Validated after the bus bindings are known.
     let mut initiator_bfm_binds: Vec<(String, TransactorId, String)> = Vec::new();
+    // Bound-to event-driven component instances (`let xact : X active =
+    // bind <busbinding>`), collected as (instance, component id, bus-
+    // binding field). The component's `on <ev>` handler bodies drive the
+    // bound bus's channels; the placeholder bus prefix in those bodies is
+    // filled with the real binding name (like the initiator-BFM path), and
+    // the instance is registered as a component field. Validated after the
+    // bus bindings are known.
+    let mut bound_event_component_binds: Vec<(String, ir::ComponentId, String)> = Vec::new();
     // Test-scope `let`s (beyond `dut`/`_tb`/bus binds), hoisted to the
     // head of the run body in item order — v1 hoists them to `main`
     // scope before the coroutine, initialized once, and the coroutine
@@ -1257,6 +1291,82 @@ fn lower_test(
                     prog.transactors.iter().position(|x| x.name == simple).unwrap() as u32,
                 );
                 initiator_bfm_binds.push((l.name.name.clone(), xid, bus_field));
+            }
+            // Bound-to event-driven component instance: `let xact :
+            // AxilXactor active = bind axil`. The transactor routes to a
+            // `ComponentSchema` (event-driven consumer BFM) AND carries a
+            // `bound_bus`; its `on <ev>` handler bodies drive the bound
+            // bus's handshake channels. The bind RHS must be a bus binding
+            // declared earlier in the test (validated after the walk). A
+            // mode is required: the `on req` handler lives under `when
+            // active`, so a `passive` instance has no driver. (The passive
+            // monitor-only form — `on bus.<ch>.handshake` observers — is a
+            // follow-up slice.)
+            TestItem::Let(l)
+                if l.bind
+                    && type_simple_name(l.ty.as_ref()).is_some_and(|n| {
+                        component_ids.get(n).is_some_and(|cid| {
+                            prog.components[cid.index()].bound_bus.is_some()
+                        })
+                    }) =>
+            {
+                if !l.probes.is_empty() {
+                    return Err(unsupported(
+                        "probe declarations on a bound-to event-driven transactor instance",
+                        "",
+                    ));
+                }
+                if !l.bind_remap.is_empty() {
+                    return Err(unsupported(
+                        "bind remaps on a bound-to event-driven transactor instance",
+                        "the default `<binding>_<ch>_<sig>` wire convention is lowered; custom \
+                         signal remaps are a follow-up slice",
+                    ));
+                }
+                let simple = type_simple_name(l.ty.as_ref()).unwrap();
+                // The instance must be `active` — the `on req` driver lives
+                // under `when active`. A `passive` instance has no driver
+                // half in this subset.
+                match l.ty.as_ref() {
+                    Some(TypeExpr::Named { mode: Some(TransactorMode::Active), .. }) => {}
+                    Some(TypeExpr::Named { mode: Some(TransactorMode::Passive), .. }) => {
+                        return Err(unsupported(
+                            &format!(
+                                "passive bound-to event-driven transactor instance `let {} : \
+                                 {simple} passive`",
+                                l.name.name
+                            ),
+                            "the `on <ev>` driver lives under `when active`; the passive \
+                             monitor-only form (`on bus.<ch>.handshake` observers) is a \
+                             follow-up slice",
+                        ));
+                    }
+                    _ => {
+                        return Err(unsupported(
+                            &format!(
+                                "bound-to event-driven transactor instance `let {} : {simple}` \
+                                 without an `active`/`passive` mode",
+                                l.name.name
+                            ),
+                            "annotate the instance `active`",
+                        ));
+                    }
+                }
+                // RHS must be a bare bus-binding identifier.
+                let bus_field = match l.value.as_ref().map(|v| &*v.kind) {
+                    Some(ExprKind::Ident(id)) => id.name.clone(),
+                    _ => {
+                        return Err(unsupported(
+                            &format!(
+                                "bound-to event-driven transactor `{}` bound to a non-identifier",
+                                l.name.name
+                            ),
+                            "only `= bind <bus-binding>` is lowered",
+                        ));
+                    }
+                };
+                let cid = component_ids[simple];
+                bound_event_component_binds.push((l.name.name.clone(), cid, bus_field));
             }
             // Bound-to target-side TLM responder: `let target : MemTarget
             // passive = bind <busbinding>`. The instance is a passive
@@ -1683,6 +1793,64 @@ fn lower_test(
         }
         transactor_fields.push((instance.clone(), *xid));
         bare_transactor_fields.insert(instance.clone());
+    }
+    // Bound-to event-driven component instances (`let xact : X active =
+    // bind axil`). Validate the bound bus binding matches the component's
+    // `bound_bus`, fill the placeholder bus prefix in the (TYPE-shared)
+    // on-handler bodies with the real binding name, and register the
+    // instance as a composite-component field so `emit xact.req(t)` and
+    // `xact.<state>` read-backs resolve through the component machinery.
+    // The handler bodies are shared per component TYPE, so the subset is
+    // one bound instance per type per file — a second bind to a different
+    // binding would clobber the first's filled prefix, so reject it.
+    for (instance, cid, bus_field) in &bound_event_component_binds {
+        // The bound bus binding must be a `let <bus_field> : <Bus> =
+        // bind dut` declared in this test, of the component's bound bus.
+        let Some(binding) = bus_bindings.iter().find(|b| &b.field == bus_field) else {
+            return Err(LowerError::Invalid(format!(
+                "bound-to event-driven transactor `{instance}` is bound to `{bus_field}`, which \
+                 is not a bus binding in test `{}`",
+                t.name.name
+            )));
+        };
+        let cschema = &prog.components[cid.index()];
+        if cschema.bound_bus.as_deref() != Some(binding.bus.as_str()) {
+            return Err(LowerError::Invalid(format!(
+                "bound-to event-driven transactor `{instance} : {}` is bound to bus binding \
+                 `{bus_field}` of bus `{}`, but the transactor is `bound to {}`",
+                cschema.name,
+                binding.bus,
+                cschema.bound_bus.as_deref().unwrap_or("<none>"),
+            )));
+        }
+        // Fill the placeholder bus prefix in every on-handler body (the
+        // `on req` driver). Periodic/cycle/method/watchdog bodies of a
+        // bound event-driven transactor are out of subset, but fill them
+        // too for uniformity — the fill is a no-op when no placeholder
+        // ref is present.
+        let body_fns: Vec<usize> = cschema
+            .on_handlers
+            .iter()
+            .map(|h| h.function.index())
+            .chain(cschema.methods.iter().map(|m| m.function.index()))
+            .collect();
+        let cname = cschema.name.clone();
+        for fidx in body_fns {
+            if let Err(prev) = fill_initiator_bus_prefix(&mut prog.functions[fidx], bus_field) {
+                return Err(unsupported(
+                    &format!(
+                        "bound-to event-driven transactor `{cname}` bound to more than one bus \
+                         binding (`{prev}`, `{bus_field}`)"
+                    ),
+                    "the bound event-driven subset shares one handler body per transactor type; \
+                     multiple instances need per-instance bodies",
+                ));
+            }
+        }
+        // Register as a composite-component instance (same machinery as
+        // `let env : AnalysisEnv`): `emit xact.req(t)` fires the handler,
+        // `xact.<state>` reads the per-instance state.
+        test_scope_components.push((instance.clone(), *cid));
     }
     // Composite-component instances → schema bindings (with the env's
     // resolved `connect` edges). A name collision with another binding
@@ -2317,6 +2485,7 @@ fn probe_scalar_width(t: &TypeExpr) -> Option<u32> {
 // ── Function builder ─────────────────────────────────────────────────
 
 /// Per-test lowering context shared by all of the test's functions.
+#[derive(Clone)]
 pub(crate) struct LowerCtx {
     /// Test-scope DUT field name (`"dut"`).
     pub dut_field: String,
