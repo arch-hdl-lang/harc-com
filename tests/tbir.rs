@@ -3148,6 +3148,62 @@ end impl RemapTest
     );
 }
 
+/// `bind ... with { ch.sig: "port" }` on a HANDSHAKE-CHANNEL bus now
+/// lowers (previously rejected as a follow-up slice). A mapped
+/// `<channel>.<signal>` access collapses to the single-segment override
+/// flat name (`aw.valid` → `s_axi_awvalid`); an UNMAPPED channel signal
+/// keeps the `<bind>_<ch>_<sig>` convention, and the already-flattened
+/// `<ch>_<sig>` form is never remapped — mirroring v1's
+/// `try_emit_bus_field_access`, which remaps the channel form only.
+#[test]
+fn bus_bind_remap_handshake_channel_lowers() {
+    let src = r#"
+bus HsBus
+    handshake_channel aw: send kind: valid_ready
+        addr: uint<8>
+    end handshake_channel aw
+end bus HsBus
+
+testbench HsTb
+    dut : AxiLiteRegs
+end testbench HsTb
+
+impl HsTest for HsTb
+    let s_axi : HsBus = bind dut with {
+        aw.valid: "s_axi_awvalid", aw.addr: "s_axi_awaddr"
+    }
+    run
+        s_axi.aw.addr = 7
+        s_axi.aw.valid = 1
+        s_axi.aw.ready = 0
+    end run
+end impl HsTest
+"#;
+    let prog = lower_src(src).expect("lowers");
+    let dump = format!("{prog}");
+    // Mapped channel signals collapse to the override flat name (a
+    // single-segment path — dump-ir renders it verbatim).
+    assert!(dump.contains("DutWrite(dut.s_axi_awaddr, 7)"), "{dump}");
+    assert!(dump.contains("DutWrite(dut.s_axi_awvalid, 1)"), "{dump}");
+    // Unmapped channel signal (`ready`) keeps the canonical 3-segment
+    // path (dump-ir renders segments dotted; the backend joins with `_`
+    // → `s_axi_aw_ready`).
+    assert!(dump.contains("DutWrite(dut.s_axi.aw.ready, 0)"), "{dump}");
+}
+
+/// Locks the dump-ir text for the AMBA bind-remap fixture: a
+/// handshake-channel `BusAxiLite` bound `with { ch.sig: "port" }` to a
+/// DUT using AMBA one-word port names, exercised through both a
+/// bound-transactor BFM (placeholder-prefix fill) and direct test-scope
+/// channel access. Every mapped wire resolves to the AMBA name.
+#[test]
+fn bind_remap_dump_ir_snapshot() {
+    let prog =
+        lower_with_stdlib_bus("bind_remap_test.harc", "BusAxiLite.arch").expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("bind_remap_dump_ir", format!("{prog}"));
+}
+
 /// Unknown channel signals are hard errors with v1's diagnostic text
 /// (v1 surfaces them as codegen errors; the IR rejects at lowering).
 #[test]

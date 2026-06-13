@@ -241,6 +241,7 @@ pub(crate) fn lower_transactor(
         // instances — both are test-scope; nested call edges stay out
         // of method bodies structurally.
         bus_bindings: HashMap::new(),
+        bus_remaps: HashMap::new(),
         transactor_fields: HashMap::new(),
         transactors: Vec::new(),
         // Method bodies see no scoreboards either — scoreboards are
@@ -476,6 +477,9 @@ fn lower_bound_target_transactor(
         record_ids: record_ctx.record_ids.clone(),
         records: record_ctx.records.clone(),
         bus_bindings: downstream_binds.clone(),
+        // Responder bodies carry the placeholder bus prefix; remaps are
+        // applied at bind time by `fill_initiator_bus_prefix`.
+        bus_remaps: HashMap::new(),
         transactor_fields: HashMap::new(),
         transactors: Vec::new(),
         scoreboard_fields: HashMap::new(),
@@ -854,6 +858,9 @@ fn lower_bound_initiator_transactor(
         record_ids: record_ctx.record_ids.clone(),
         records: record_ctx.records.clone(),
         bus_bindings,
+        // Initiator-BFM method bodies carry the placeholder bus prefix;
+        // remaps are applied at bind time by `fill_initiator_bus_prefix`.
+        bus_remaps: HashMap::new(),
         transactor_fields: HashMap::new(),
         transactors: Vec::new(),
         scoreboard_fields: HashMap::new(),

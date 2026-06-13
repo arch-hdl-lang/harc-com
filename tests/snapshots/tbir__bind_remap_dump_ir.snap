@@ -1,0 +1,126 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 BindRemapTb { dut: axil_amba } bus s_axi=BusAxiLite with{ar.addr=s_axi_araddr ar.ready=s_axi_arready ar.valid=s_axi_arvalid aw.addr=s_axi_awaddr aw.ready=s_axi_awready aw.valid=s_axi_awvalid b.ready=s_axi_bready b.resp=s_axi_bresp b.valid=s_axi_bvalid r.data=s_axi_rdata r.ready=s_axi_rready r.resp=s_axi_rresp r.valid=s_axi_rvalid w.data=s_axi_wdata w.ready=s_axi_wready w.strb=s_axi_wstrb w.valid=s_axi_wvalid} xactor helper=x0
+  test BindRemapTest tb=tb0 run=fn2 check=-
+  transactor x0 AxilHelper bound to BusAxiLite
+    method write(2 args) = fn0
+    method read(1 arg) -> ret = fn1
+
+fn fn0 AxilHelper_write [kind=TransactorBody(x0)]
+  params:
+    addr : uint<8>
+    data : uint<32>
+  locals:
+    %0 addr : uint<8>
+    %1 data : uint<32>
+    %2 __t0 : unknown
+    %3 __t1 : unknown
+  entry = b0
+
+  b0:
+    DutWrite(dut.s_axi_awaddr, %addr)
+    DutWrite(dut.s_axi_awvalid, 1)
+    DutWrite(dut.s_axi_wdata, %data)
+    DutWrite(dut.s_axi_wstrb, 15)
+    DutWrite(dut.s_axi_wvalid, 1)
+    Assign(%__t0, 16)
+    -> Jump(b1)
+
+  b1:
+    DutRead(%__t1, dut.s_axi_wready)
+    -> Branch((!%__t1 && (%__t0 > 0)), b2, b4)
+
+  b2:
+    -> WaitCycles(1, b3)
+
+  b3:
+    Assign(%__t0, (%__t0 - 1))
+    -> Jump(b1)
+
+  b4:
+    -> WaitCycles(1, b5)
+
+  b5:
+    DutWrite(dut.s_axi_wvalid, 0)
+    DutWrite(dut.s_axi_awvalid, 0)
+    -> WaitCycles(1, b6)
+
+  b6:
+    -> Return
+
+fn fn1 AxilHelper_read [kind=TransactorBody(x0)]
+  params:
+    addr : uint<8>
+  locals:
+    %0 addr : uint<8>
+    %1 __ret : unknown
+    %2 __t0 : unknown
+    %3 __t1 : unknown
+    %4 r : unknown
+    %5 r__resp : unknown
+  ret = %__ret
+  entry = b0
+
+  b0:
+    DutWrite(dut.s_axi_araddr, %addr)
+    DutWrite(dut.s_axi_arvalid, 1)
+    DutWrite(dut.s_axi_rready, 1)
+    Assign(%__t0, 16)
+    -> Jump(b1)
+
+  b1:
+    DutRead(%__t1, dut.s_axi_rvalid)
+    -> Branch((!%__t1 && (%__t0 > 0)), b2, b4)
+
+  b2:
+    -> WaitCycles(1, b3)
+
+  b3:
+    Assign(%__t0, (%__t0 - 1))
+    -> Jump(b1)
+
+  b4:
+    DutRead(%r, dut.s_axi_rdata)
+    DutRead(%r__resp, dut.s_axi_rresp)
+    -> WaitCycles(1, b5)
+
+  b5:
+    DutWrite(dut.s_axi_rready, 0)
+    DutWrite(dut.s_axi_arvalid, 0)
+    -> WaitCycles(1, b6)
+
+  b6:
+    Assign(%__ret, %r)
+    -> Return
+
+fn fn2 run_BindRemapTest [kind=Run, owner=tb0]
+  locals:
+    %0 v : unknown
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.s_axi_awvalid, 0)
+    DutWrite(dut.s_axi_wvalid, 0)
+    DutWrite(dut.s_axi_bready, 1)
+    DutWrite(dut.s_axi_arvalid, 0)
+    DutWrite(dut.s_axi_rready, 1)
+    -> WaitCycles(2, b1)
+
+  b1:
+    DutWrite(dut.rst, 0)
+    -> WaitCycles(1, b2)
+
+  b2:
+    TransactorCall(helper.write(0, 3735879680))
+    -> WaitCycles(2, b3)
+
+  b3:
+    AssertCheck { cond: (dut.storage_out == 3735879680), on_fail: "storage didn't catch the bus write Ã¢Â\u{80}Â\u{94} remap drop somewhere; storage=0x%08llx", dut.storage_out }
+    TransactorCall(%v = helper.read(0))
+    AssertCheck { cond: (%v == 3735879680), on_fail: "bus readback differs from write (got 0x%08llx)", %v }
+    Log(info, "PASS: bind remap routed all 5 channels to AMBA-style port names")
+    -> Return

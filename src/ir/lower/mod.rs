@@ -629,6 +629,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         // `TransactorMethod` call edges never appear in pure-helper
         // bodies.
         bus_bindings: HashMap::new(),
+        bus_remaps: HashMap::new(),
         transactor_fields: HashMap::new(),
         transactors: Vec::new(),
         scoreboard_fields: HashMap::new(),
@@ -686,6 +687,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         record_ids: record_ids.clone(),
         records: prog.records.clone(),
         bus_bindings: HashMap::new(),
+        bus_remaps: HashMap::new(),
         transactor_fields: HashMap::new(),
         transactors: Vec::new(),
         scoreboard_fields: HashMap::new(),
@@ -820,6 +822,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         record_ids: record_ids.clone(),
         records: prog.records.clone(),
         bus_bindings: HashMap::new(),
+        bus_remaps: HashMap::new(),
         transactor_fields: HashMap::new(),
         transactors: Vec::new(),
         scoreboard_fields: HashMap::new(),
@@ -1969,9 +1972,10 @@ fn lower_test(
         let method_fns: Vec<usize> =
             xschema.methods.iter().map(|m| m.function.index()).collect();
         let xname = xschema.name.clone();
+        let remap = binding.remap.clone();
         for fidx in method_fns {
             if let Err(prev) =
-                fill_initiator_bus_prefix(&mut prog.functions[fidx], bus_field)
+                fill_initiator_bus_prefix(&mut prog.functions[fidx], bus_field, &remap)
             {
                 return Err(unsupported(
                     &format!(
@@ -2029,8 +2033,9 @@ fn lower_test(
             .chain(cschema.methods.iter().map(|m| m.function.index()))
             .collect();
         let cname = cschema.name.clone();
+        let remap = binding.remap.clone();
         for fidx in body_fns {
-            if let Err(prev) = fill_initiator_bus_prefix(&mut prog.functions[fidx], bus_field) {
+            if let Err(prev) = fill_initiator_bus_prefix(&mut prog.functions[fidx], bus_field, &remap) {
                 return Err(unsupported(
                     &format!(
                         "bound-to event-driven transactor `{cname}` bound to more than one bus \
@@ -2047,7 +2052,7 @@ fn lower_test(
         // so the body fill above does not reach them.
         for ch in prog.components[cid.index()].cycle_handlers.iter_mut() {
             if ch.monitor_channel.is_some() {
-                if let Err(prev) = fill_initiator_bus_prefix_expr(&mut ch.trigger, bus_field) {
+                if let Err(prev) = fill_initiator_bus_prefix_expr(&mut ch.trigger, bus_field, &remap) {
                     return Err(unsupported(
                         &format!(
                             "bound-to event-driven transactor `{cname}` bound to more than one \
@@ -2519,6 +2524,11 @@ fn lower_test(
         record_ids: record_ids.clone(),
         records: prog.records.clone(),
         bus_bindings: bus_binding_decls,
+        bus_remaps: bus_bindings
+            .iter()
+            .filter(|b| !b.remap.is_empty())
+            .map(|b| (b.field.clone(), b.remap.clone()))
+            .collect(),
         transactor_fields: transactor_fields.iter().cloned().collect(),
         transactors: prog.transactors.clone(),
         scoreboard_fields: scoreboard_fields.iter().cloned().collect(),
@@ -2811,6 +2821,16 @@ pub(crate) struct LowerCtx {
     /// `TransactorMethod` call edges out of pure-helper bodies (design
     /// seam rule).
     pub bus_bindings: HashMap<String, crate::ast::BusDecl>,
+    /// Per-binding `bind ... with { ch.sig: "port" }` signal remaps
+    /// (binding name → v1's `(channel, signal) → flat_port` table).
+    /// Consulted when lowering a `<binding>.<channel>.<signal>`
+    /// handshake access so the emitted flat name honors the override
+    /// instead of the `<binding>_<channel>_<signal>` convention. Empty
+    /// for bindings without a `with { ... }` clause and for every
+    /// non-test context (helper/method bodies, which carry the
+    /// placeholder bus prefix — those are remapped at bind time by
+    /// `fill_initiator_bus_prefix`).
+    pub bus_remaps: HashMap<String, Vec<((String, String), String)>>,
     /// Transactor-typed testbench fields (`xact` → transactor id), for
     /// `xact.method(...)` call resolution and the `xact.dut = dut`
     /// bind. Disjoint from `bus_bindings` (collision rejected at
@@ -3631,12 +3651,29 @@ fn fill_visit_port(
     p: &mut crate::ir::PortRef,
     placeholder: &str,
     binding: &str,
+    remap: &[((String, String), String)],
     rewrite: bool,
     conflict: &mut Option<String>,
 ) {
     match p.port_path.first() {
         Some(seg) if seg == placeholder => {
             if rewrite {
+                // A 3-segment `[placeholder, channel, signal]` handshake
+                // path collapses to the `bind ... with { ch.sig: "port" }`
+                // override — a single-segment full flat port name — when
+                // `(channel, signal)` is mapped; otherwise the placeholder
+                // is rewritten to the binding name (the canonical
+                // `<bind>_<ch>_<sig>` convention). Mirrors v1's
+                // `bus_signal_name`, which remaps the channel form only.
+                if p.port_path.len() == 3 {
+                    if let Some((_, port)) = remap
+                        .iter()
+                        .find(|((rch, rsig), _)| rch == &p.port_path[1] && rsig == &p.port_path[2])
+                    {
+                        p.port_path = vec![port.clone()];
+                        return;
+                    }
+                }
                 p.port_path[0] = binding.to_string();
             }
         }
@@ -3655,36 +3692,37 @@ fn fill_visit_expr(
     e: &mut crate::ir::Expr,
     placeholder: &str,
     binding: &str,
+    remap: &[((String, String), String)],
     rewrite: bool,
     conflict: &mut Option<String>,
 ) {
     use crate::ir::Expr;
     match e {
-        Expr::Port(p) => fill_visit_port(p, placeholder, binding, rewrite, conflict),
+        Expr::Port(p) => fill_visit_port(p, placeholder, binding, remap, rewrite, conflict),
         Expr::Binary(_, a, b) => {
-            fill_visit_expr(a, placeholder, binding, rewrite, conflict);
-            fill_visit_expr(b, placeholder, binding, rewrite, conflict);
+            fill_visit_expr(a, placeholder, binding, remap, rewrite, conflict);
+            fill_visit_expr(b, placeholder, binding, remap, rewrite, conflict);
         }
         Expr::Unary(_, a)
         | Expr::WidthCast { inner: a, .. }
         | Expr::ComponentIdle { n: a, .. } => {
-            fill_visit_expr(a, placeholder, binding, rewrite, conflict)
+            fill_visit_expr(a, placeholder, binding, remap, rewrite, conflict)
         }
         Expr::Ternary(c, t, f) => {
-            fill_visit_expr(c, placeholder, binding, rewrite, conflict);
-            fill_visit_expr(t, placeholder, binding, rewrite, conflict);
-            fill_visit_expr(f, placeholder, binding, rewrite, conflict);
+            fill_visit_expr(c, placeholder, binding, remap, rewrite, conflict);
+            fill_visit_expr(t, placeholder, binding, remap, rewrite, conflict);
+            fill_visit_expr(f, placeholder, binding, remap, rewrite, conflict);
         }
         Expr::Call(_, args) => {
             for a in args {
-                fill_visit_expr(a, placeholder, binding, rewrite, conflict);
+                fill_visit_expr(a, placeholder, binding, remap, rewrite, conflict);
             }
         }
         Expr::SeqIndex { index, .. } => {
-            fill_visit_expr(index, placeholder, binding, rewrite, conflict)
+            fill_visit_expr(index, placeholder, binding, remap, rewrite, conflict)
         }
         Expr::RecordField { index: Some(idx), .. } => {
-            fill_visit_expr(idx, placeholder, binding, rewrite, conflict)
+            fill_visit_expr(idx, placeholder, binding, remap, rewrite, conflict)
         }
         Expr::Literal { .. }
         | Expr::WideLiteral(_)
@@ -3707,18 +3745,26 @@ fn fill_visit_expr(
 /// lives on the schema rather than in a function body, so the body-walking
 /// `fill_initiator_bus_prefix` does not reach it). Same one-instance-per-
 /// type conflict gate.
-fn fill_initiator_bus_prefix_expr(e: &mut crate::ir::Expr, binding: &str) -> Result<(), String> {
+fn fill_initiator_bus_prefix_expr(
+    e: &mut crate::ir::Expr,
+    binding: &str,
+    remap: &[((String, String), String)],
+) -> Result<(), String> {
     let placeholder = transactors::INITIATOR_BUS_PLACEHOLDER;
     let mut conflict = None;
-    fill_visit_expr(e, placeholder, binding, false, &mut conflict);
+    fill_visit_expr(e, placeholder, binding, remap, false, &mut conflict);
     if let Some(prev) = conflict {
         return Err(prev);
     }
-    fill_visit_expr(e, placeholder, binding, true, &mut conflict);
+    fill_visit_expr(e, placeholder, binding, remap, true, &mut conflict);
     Ok(())
 }
 
-fn fill_initiator_bus_prefix(func: &mut TbFunction, binding: &str) -> Result<(), String> {
+fn fill_initiator_bus_prefix(
+    func: &mut TbFunction,
+    binding: &str,
+    remap: &[((String, String), String)],
+) -> Result<(), String> {
     use crate::ir::Stmt;
     let placeholder = transactors::INITIATOR_BUS_PLACEHOLDER;
 
@@ -3743,57 +3789,57 @@ fn fill_initiator_bus_prefix(func: &mut TbFunction, binding: &str) -> Result<(),
             for s in &mut block.stmts {
                 match s {
                     Stmt::DutWrite(p, e) => {
-                        visit_port(p, placeholder, binding, rewrite, &mut conflict);
-                        visit_expr(e, placeholder, binding, rewrite, &mut conflict);
+                        visit_port(p, placeholder, binding, remap, rewrite, &mut conflict);
+                        visit_expr(e, placeholder, binding, remap, rewrite, &mut conflict);
                     }
                     Stmt::DutRead(_, p) | Stmt::ProbeRelease(p) => {
-                        visit_port(p, placeholder, binding, rewrite, &mut conflict)
+                        visit_port(p, placeholder, binding, remap, rewrite, &mut conflict)
                     }
                     Stmt::Assign(_, e)
                     | Stmt::RecordFieldWrite { value: e, .. }
                     | Stmt::TbFieldWrite { value: e, .. }
                     | Stmt::TransactorStateWrite { value: e, .. }
                     | Stmt::ComponentFieldWrite { value: e, .. } => {
-                        visit_expr(e, placeholder, binding, rewrite, &mut conflict)
+                        visit_expr(e, placeholder, binding, remap, rewrite, &mut conflict)
                     }
                     Stmt::AssertCheck { cond, on_fail } => {
-                        visit_expr(cond, placeholder, binding, rewrite, &mut conflict);
+                        visit_expr(cond, placeholder, binding, remap, rewrite, &mut conflict);
                         for a in &mut on_fail.args {
-                            visit_expr(&mut a.expr, placeholder, binding, rewrite, &mut conflict);
+                            visit_expr(&mut a.expr, placeholder, binding, remap, rewrite, &mut conflict);
                         }
                     }
                     Stmt::Log { args, .. } | Stmt::FailDiag { args, .. } => {
                         for a in &mut args.args {
-                            visit_expr(&mut a.expr, placeholder, binding, rewrite, &mut conflict);
+                            visit_expr(&mut a.expr, placeholder, binding, remap, rewrite, &mut conflict);
                         }
                     }
                     Stmt::TransactorCall { call, .. } => {
-                        visit_expr(call, placeholder, binding, rewrite, &mut conflict)
+                        visit_expr(call, placeholder, binding, remap, rewrite, &mut conflict)
                     }
                     Stmt::ScoreboardOp { op, .. } => match op {
                         ir::ScoreboardOp::QueuePush { value, .. }
                         | ir::ScoreboardOp::ScalarWrite { value, .. } => {
-                            visit_expr(value, placeholder, binding, rewrite, &mut conflict)
+                            visit_expr(value, placeholder, binding, remap, rewrite, &mut conflict)
                         }
                         ir::ScoreboardOp::QueuePop { .. } => {}
                     },
                     Stmt::ComponentEmit { args, .. } | Stmt::ComponentCall { args, .. } => {
                         for a in args {
-                            visit_expr(a, placeholder, binding, rewrite, &mut conflict);
+                            visit_expr(a, placeholder, binding, remap, rewrite, &mut conflict);
                         }
                     }
                     Stmt::SeqPush { value, .. } => {
-                        visit_expr(value, placeholder, binding, rewrite, &mut conflict)
+                        visit_expr(value, placeholder, binding, remap, rewrite, &mut conflict)
                     }
                     Stmt::TlmFork(desc) => {
                         for a in &mut desc.args {
-                            visit_expr(a, placeholder, binding, rewrite, &mut conflict);
+                            visit_expr(a, placeholder, binding, remap, rewrite, &mut conflict);
                         }
                     }
                     Stmt::TlmJoinAll(pending) => {
                         for p in pending {
                             for a in &mut p.args {
-                                visit_expr(a, placeholder, binding, rewrite, &mut conflict);
+                                visit_expr(a, placeholder, binding, remap, rewrite, &mut conflict);
                             }
                         }
                     }
@@ -3802,25 +3848,25 @@ fn fill_initiator_bus_prefix(func: &mut TbFunction, binding: &str) -> Result<(),
             }
             match &mut block.terminator {
                 Terminator::Branch(c, _, _) => {
-                    visit_expr(c, placeholder, binding, rewrite, &mut conflict)
+                    visit_expr(c, placeholder, binding, remap, rewrite, &mut conflict)
                 }
                 Terminator::WaitCycles(n, _, _) | Terminator::WaitCyclesSync(n, _) => {
-                    visit_expr(n, placeholder, binding, rewrite, &mut conflict)
+                    visit_expr(n, placeholder, binding, remap, rewrite, &mut conflict)
                 }
                 Terminator::WaitUntil { preds, .. } => {
                     for p in preds {
-                        visit_expr(&mut p.expr, placeholder, binding, rewrite, &mut conflict);
+                        visit_expr(&mut p.expr, placeholder, binding, remap, rewrite, &mut conflict);
                     }
                 }
                 Terminator::WaitUntilTimeout { preds, cycles, .. } => {
                     for p in preds {
-                        visit_expr(&mut p.expr, placeholder, binding, rewrite, &mut conflict);
+                        visit_expr(&mut p.expr, placeholder, binding, remap, rewrite, &mut conflict);
                     }
-                    visit_expr(cycles, placeholder, binding, rewrite, &mut conflict);
+                    visit_expr(cycles, placeholder, binding, remap, rewrite, &mut conflict);
                 }
                 Terminator::Fatal(args) => {
                     for a in &mut args.args {
-                        visit_expr(&mut a.expr, placeholder, binding, rewrite, &mut conflict);
+                        visit_expr(&mut a.expr, placeholder, binding, remap, rewrite, &mut conflict);
                     }
                 }
                 Terminator::Randomize { .. }
