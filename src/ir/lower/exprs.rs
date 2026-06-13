@@ -45,6 +45,13 @@ impl FuncBuilder<'_> {
                 if id.name == "cycle_count" {
                     return Ok(Expr::CycleCount);
                 }
+                // The framework error counter (`errors`), referenced from
+                // `assert errors == 0` / `${errors}` after a walk like
+                // `bitbash(regs)`. Locals shadow (checked above). v1 emits
+                // the in-scope `errors` variable.
+                if id.name == "errors" {
+                    return Ok(Expr::ErrorCount);
+                }
                 // Persistent state field of a bound-to target responder
                 // body — a bare ident (locals shadow, checked above).
                 // `instance` is a placeholder; the test-binding stage
@@ -125,14 +132,7 @@ impl FuncBuilder<'_> {
                 // here sits in a value position the IR can't represent
                 // without a hoist that changes the bus-read count.
                 if let Some((binding, reg)) = self.as_regblock_register(e) {
-                    return Err(unsupported(
-                        &format!(
-                            "register read `{binding}.{reg}` outside a `let` binding"
-                        ),
-                        "v1 reads the bus inline (and predicts the mirror) at every read \
-                         site; the IR lowers register reads only in `let x = regs.NAME` \
-                         position — hoist the read into a `let` first",
-                    ));
+                    return self.lower_regblock_read_expr(&binding, &reg);
                 }
                 self.reject_out_of_subset_regblock_access(e, "read")?;
                 // Composite-component scalar field read via a test-scope
@@ -426,8 +426,10 @@ impl FuncBuilder<'_> {
             other @ (Expr::Literal { .. }
             | Expr::WideLiteral(_)
             | Expr::Local(_)
-            // The global cycle counter — a framework value, no DUT port.
+            // The global cycle counter / error counter — framework
+            // values, no DUT port.
             | Expr::CycleCount
+            | Expr::ErrorCount
             | Expr::RecordField { .. }
             | Expr::TbField(_)
             // Transactor-instance state is host state — no DUT port inside.
@@ -438,6 +440,10 @@ impl FuncBuilder<'_> {
             | Expr::ComponentField { .. }
             // Sequence length is host state — no DUT port inside.
             | Expr::SeqLen(_)
+            // A register-level frontdoor read carries no DUT *port*
+            // subtree — its bus read routes through the helper lambda,
+            // emitted inline. Nothing to hoist.
+            | Expr::RegRead { .. }
             | Expr::CovBin { .. }) => other,
         }
     }

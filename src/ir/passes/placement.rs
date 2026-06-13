@@ -426,10 +426,20 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
                 visit_expr(a, accesses, transactor);
             }
         }
+        // A bus-reading register frontdoor read drives the helper (which
+        // may advance the clock), so it touches the transactor seam just
+        // like a `TransactorMethod` call edge. A WO read serves from the
+        // mirror (pure host state) — no transactor contact.
+        Expr::RegRead { reads_bus, .. } => {
+            if *reads_bus {
+                *transactor = true;
+            }
+        }
         Expr::Literal { .. }
         | Expr::WideLiteral(_)
         | Expr::Local(_)
         | Expr::CycleCount
+        | Expr::ErrorCount
         | Expr::RecordField { .. }
         | Expr::TbField(_)
         | Expr::TransactorState { .. }

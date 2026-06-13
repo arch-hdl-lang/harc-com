@@ -193,6 +193,11 @@ impl FuncBuilder<'_> {
                 if self.try_lower_bus_call(e, super::bus::BusCallDest::Discard)? {
                     return Ok(());
                 }
+                // `bitbash(regs)` — RAL walk-all over the regblock's RW
+                // registers (write/read both patterns + compare).
+                if self.try_lower_bitbash(e)? {
+                    return Ok(());
+                }
                 // Testbench helper method call (`_tb.reset()`), CFG-
                 // inlined like an impure helper; statement position
                 // discards the (usually void) result.
