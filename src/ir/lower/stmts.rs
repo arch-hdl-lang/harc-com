@@ -175,7 +175,14 @@ impl FuncBuilder<'_> {
                 target,
                 with_body,
             } => self.lower_randomize(*blocking, target, with_body),
-            StmtKind::Fork(_) | StmtKind::JoinAll { .. } => Err(unsupported("`fork`/`join`", "")),
+            // `join_all` drains the RHS-fork TLM barrier (`let x = fork
+            // bus.m(...)`); the block-form `fork ... and ... join`
+            // statement is out of subset.
+            StmtKind::JoinAll { .. } => self.lower_tlm_join_all(),
+            StmtKind::Fork(_) => Err(unsupported(
+                "block-form `fork ... and ... join`",
+                "only RHS-fork TLM (`let x = fork bus.m(...)`) + `join_all` is lowered",
+            )),
             StmtKind::Parallel(_) => Err(unsupported("`parallel`", "")),
             StmtKind::Schedule(_) => Err(unsupported("`schedule`", "")),
             StmtKind::Select(_) => Err(unsupported("`select`", "")),
@@ -187,6 +194,11 @@ impl FuncBuilder<'_> {
             StmtKind::Assume(_) => Err(unsupported("`assume`", "")),
             StmtKind::Cover(_) => Err(unsupported("`cover`", "")),
             StmtKind::Expr(e) => {
+                // Statement-position `fork bus.m(...)` — issue the request
+                // now and discard the response at the next `join_all`.
+                if self.try_lower_tlm_fork(e, super::bus::BusCallDest::Discard)? {
+                    return Ok(());
+                }
                 // Statement-position bus calls: `mem.poke(a, d)` (call
                 // edge, result-less or discarded) and bare
                 // `axil.w.send(...)` / `axil.r.recv()` handshakes.
@@ -381,6 +393,15 @@ impl FuncBuilder<'_> {
                 self.let_widths.insert(id, w);
             }
             self.push(Stmt::DutRead(id, port));
+            return Ok(());
+        }
+        // `let x = fork bus.<method>(a)` — issue the request now, defer
+        // the response capture to the next `join_all`. Checked before the
+        // plain bus call (a `ForkCall` RHS is never a plain `Call`).
+        if self.try_lower_tlm_fork(
+            value,
+            super::bus::BusCallDest::Declare(&l.name.name),
+        )? {
             return Ok(());
         }
         // Bus call RHS: `let x = mem.read(a)` (TransactorMethod call

@@ -331,10 +331,13 @@ pub(crate) fn lower_transactor(
 /// `TransactorBody`) whose state accesses reference the state fields by
 /// bare name (the instance is filled at test-binding time).
 ///
-/// Subset gate: only `blocking` `tlm_method`s are served. `out_of_order
-/// tags N` and `fork`-based concurrent workers are rejected precisely —
-/// their v1 lowering (hidden tag wires / multi-lane response routers) is
-/// a follow-up slice.
+/// Subset gate: only `blocking` `tlm_method`s are SERVED here.
+/// Target-side `out_of_order tags N` responder lanes (hidden tag wires /
+/// multi-lane response routers) and `fork`-based responder workers
+/// (a responder re-issuing a downstream TLM call) are rejected precisely
+/// — both are a follow-up slice. (Initiator-side `fork`/`join_all` over
+/// bus methods — test-scope `let x = fork mem.read_ooo(...)` — IS
+/// lowered; see `bus::try_lower_tlm_fork`.)
 fn lower_bound_target_transactor(
     t: &TransactorDecl,
     next_fn: FunctionId,
@@ -509,8 +512,9 @@ fn lower_bound_target_transactor(
                     "transactor `{tname}` target thread `bus.{mname}` serving a `{}` method",
                     method.mode.name
                 ),
-                "only `blocking` target threads are lowered; `out_of_order tags N` responder \
-                 lanes (hidden tag wires + multi-lane response routing) are a follow-up slice",
+                "initiator-side `out_of_order` forks (`let x = fork mem.read_ooo(...)` + \
+                 `join_all`) ARE lowered; target-side `out_of_order tags N` RESPONDER lanes \
+                 (hidden tag wires + multi-lane response routing) are a follow-up slice",
             ));
         }
         if th.params.len() != method.args.len() {

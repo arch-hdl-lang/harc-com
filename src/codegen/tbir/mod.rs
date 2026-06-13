@@ -228,6 +228,8 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
         },
         ComponentEmit { args, .. } | ComponentCall { args, .. } => args.iter().any(expr_has_probe),
         SeqPush { value, .. } => expr_has_probe(value),
+        TlmFork(desc) => desc.args.iter().any(expr_has_probe),
+        TlmJoinAll(pending) => pending.iter().any(|p| p.args.iter().any(expr_has_probe)),
         RecordInit(_, _) | CovReport(_) => false,
     }
 }

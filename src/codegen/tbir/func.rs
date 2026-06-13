@@ -790,8 +790,249 @@ fn emit_stmt(
             let v = expr_cpp(cx, value)?;
             writeln!(out, "{pad}{name}.push_back({v});").ok();
         }
+        Stmt::TlmFork(desc) => emit_tlm_fork(out, cx, bindings, desc, depth)?,
+        Stmt::TlmJoinAll(pending) => emit_tlm_join_all(out, cx, bindings, pending, depth)?,
     }
     Ok(())
+}
+
+/// Expand one `fork bus.<method>(args)` request issue (v1's
+/// `try_emit_bus_tlm_fork`, coroutine path): the dest local was hoisted +
+/// zero-init at the function head, so this emits ONLY the request side
+/// (drive arg wires + optional req_tag, raise `req_valid`, budget-wait
+/// `req_ready`, tick, drop `req_valid`). The response is drained at the
+/// matching `Stmt::TlmJoinAll`. The `request` trace event carries the OOO
+/// tag when present, matching v1's payload so `harc trace-diff` is clean.
+fn emit_tlm_fork(
+    out: &mut String,
+    cx: &ECx<'_>,
+    bindings: &[BusBindingSchema],
+    desc: &crate::ir::TlmForkDesc,
+    depth: usize,
+) -> Result<(), EmitError> {
+    let pad = INDENT.repeat(depth);
+    let binding = resolve_binding(bindings, &desc.bus_field, &desc.method, cx.func)?;
+    let wire = |sig: &str| format!("dut->{}", binding.wire_name(&desc.method, sig));
+    writeln!(out, "{pad}// fork bus.{} tlm_method issue", desc.method).ok();
+    let schema = binding
+        .methods
+        .iter()
+        .find(|m| m.name == desc.method)
+        .ok_or_else(|| {
+            EmitError(format!(
+                "tbir: fork `{}.{}` arity drift in {}",
+                desc.bus_field, desc.method, cx.func.name
+            ))
+        })?;
+    if schema.args.len() != desc.args.len() {
+        return Err(EmitError(format!(
+            "tbir: fork `{}.{}` arity drift ({} schema vs {} call args) in {}",
+            desc.bus_field,
+            desc.method,
+            schema.args.len(),
+            desc.args.len(),
+            cx.func.name
+        )));
+    }
+    for (arg_name, arg) in schema.args.iter().zip(desc.args.iter()) {
+        let v = expr_cpp(cx, arg)?;
+        writeln!(out, "{pad}harc_rt::harc_assign({}, {v});", wire(arg_name)).ok();
+    }
+    if let Some(tag) = desc.tag {
+        writeln!(out, "{pad}{} = {tag};", wire("req_tag")).ok();
+    }
+    let tag_arg = desc.tag.map(|t| format!("(int64_t){t}"));
+    emit_tlm_trace(out, &pad, &desc.bus_field, &desc.method, "request", "initiator", tag_arg.as_deref());
+    writeln!(out, "{pad}{} = 1;", wire("req_valid")).ok();
+    writeln!(
+        out,
+        "{pad}{{ int _b = 16; while (!{} && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}",
+        wire("req_ready")
+    )
+    .ok();
+    writeln!(out, "{pad}co_await harc_rt::wait_cycles(_slot, 1);").ok();
+    writeln!(out, "{pad}{} = 0;", wire("req_valid")).ok();
+    Ok(())
+}
+
+/// Drain the pending forks at a `join_all` (v1's `emit_tlm_join_all`):
+/// all-untagged forks route by issue order (FIFO), all-tagged forks by
+/// `rsp_tag` match. An empty list is a no-op. Lowering already rejected a
+/// mixed tagged/untagged set, so a single `tagged` test suffices.
+fn emit_tlm_join_all(
+    out: &mut String,
+    cx: &ECx<'_>,
+    bindings: &[BusBindingSchema],
+    pending: &[crate::ir::TlmForkDesc],
+    depth: usize,
+) -> Result<(), EmitError> {
+    let pad = INDENT.repeat(depth);
+    if pending.is_empty() {
+        writeln!(out, "{pad}// join_all: no pending forked TLM calls").ok();
+        return Ok(());
+    }
+    let tagged = pending.iter().any(|p| p.tag.is_some());
+    if tagged {
+        emit_tagged_tlm_join_all(out, cx, bindings, pending, depth)
+    } else {
+        emit_ordered_tlm_join_all(out, cx, bindings, pending, depth)
+    }
+}
+
+/// Issue-order FIFO drain for `blocking` forks (v1's
+/// `emit_ordered_tlm_join_all`): for each pending fork in issue order,
+/// raise `rsp_ready`, budget-wait `rsp_valid` (64-cycle), capture
+/// `rsp_data` into the dest, tick, drop `rsp_ready`.
+fn emit_ordered_tlm_join_all(
+    out: &mut String,
+    cx: &ECx<'_>,
+    bindings: &[BusBindingSchema],
+    pending: &[crate::ir::TlmForkDesc],
+    depth: usize,
+) -> Result<(), EmitError> {
+    let pad = INDENT.repeat(depth);
+    let names = cx.names;
+    for p in pending {
+        let binding = resolve_binding(bindings, &p.bus_field, &p.method, cx.func)?;
+        let wire = |sig: &str| format!("dut->{}", binding.wire_name(&p.method, sig));
+        writeln!(out, "{pad}// join_all bus.{} response", p.method).ok();
+        writeln!(out, "{pad}{} = 1;", wire("rsp_ready")).ok();
+        writeln!(
+            out,
+            "{pad}{{ int _b = 64; while (!{} && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}",
+            wire("rsp_valid")
+        )
+        .ok();
+        if let (Some(dest), true) = (p.dest, p.has_ret) {
+            writeln!(
+                out,
+                "{pad}{} = harc_rt::harc_read({});",
+                names[dest.index()],
+                wire("rsp_data")
+            )
+            .ok();
+        }
+        emit_tlm_trace(out, &pad, &p.bus_field, &p.method, "response", "initiator", None);
+        writeln!(out, "{pad}co_await harc_rt::wait_cycles(_slot, 1);").ok();
+        writeln!(out, "{pad}{} = 0;", wire("rsp_ready")).ok();
+    }
+    Ok(())
+}
+
+/// Multi-lane tag-routed drain for `out_of_order tags N` forks (v1's
+/// `emit_tagged_tlm_join_all`): poll every lane each tick, accepting any
+/// response whose `rsp_tag` matches a not-yet-seen fork's tag (so tag 1
+/// can land before tag 0). Captures into each dest, ticks once per poll
+/// round, and bounds the wait with a 256-cycle budget.
+fn emit_tagged_tlm_join_all(
+    out: &mut String,
+    cx: &ECx<'_>,
+    bindings: &[BusBindingSchema],
+    pending: &[crate::ir::TlmForkDesc],
+    depth: usize,
+) -> Result<(), EmitError> {
+    let pad = INDENT.repeat(depth);
+    let pad1 = INDENT.repeat(depth + 1);
+    let pad2 = INDENT.repeat(depth + 2);
+    let pad3 = INDENT.repeat(depth + 3);
+    let names = cx.names;
+    writeln!(out, "{pad}{{").ok();
+    writeln!(out, "{pad1}int _tlm_pending = {};", pending.len()).ok();
+    for idx in 0..pending.len() {
+        writeln!(out, "{pad1}bool _tlm_seen_{idx} = false;").ok();
+    }
+    writeln!(out, "{pad1}int _tlm_budget = 256;").ok();
+    writeln!(out, "{pad1}while (_tlm_pending > 0 && _tlm_budget > 0) {{").ok();
+    for p in pending {
+        let binding = resolve_binding(bindings, &p.bus_field, &p.method, cx.func)?;
+        writeln!(out, "{pad2}dut->{} = 0;", binding.wire_name(&p.method, "rsp_ready")).ok();
+    }
+    writeln!(out, "{pad2}bool _tlm_accept = false;").ok();
+    for (idx, p) in pending.iter().enumerate() {
+        let tag = p.tag.ok_or_else(|| {
+            EmitError(format!(
+                "tbir: tagged join_all in {} carries an untagged fork \
+                 (lowering should have rejected the mix)",
+                cx.func.name
+            ))
+        })?;
+        let binding = resolve_binding(bindings, &p.bus_field, &p.method, cx.func)?;
+        let wire = |sig: &str| format!("dut->{}", binding.wire_name(&p.method, sig));
+        writeln!(
+            out,
+            "{pad2}if (!_tlm_seen_{idx} && {} && {} == {tag}) {{",
+            wire("rsp_valid"),
+            wire("rsp_tag")
+        )
+        .ok();
+        if let (Some(dest), true) = (p.dest, p.has_ret) {
+            writeln!(
+                out,
+                "{pad3}{} = harc_rt::harc_read({});",
+                names[dest.index()],
+                wire("rsp_data")
+            )
+            .ok();
+        }
+        emit_tlm_trace(out, &pad3, &p.bus_field, &p.method, "response", "initiator", Some(&format!("(int64_t){tag}")));
+        writeln!(out, "{pad3}{} = 1;", wire("rsp_ready")).ok();
+        writeln!(out, "{pad3}_tlm_seen_{idx} = true;").ok();
+        writeln!(out, "{pad3}_tlm_pending--;").ok();
+        writeln!(out, "{pad3}_tlm_accept = true;").ok();
+        writeln!(out, "{pad2}}}").ok();
+    }
+    writeln!(out, "{pad2}co_await harc_rt::wait_cycles(_slot, 1);").ok();
+    writeln!(out, "{pad2}if (!_tlm_accept) _tlm_budget--;").ok();
+    writeln!(out, "{pad1}}}").ok();
+    for p in pending {
+        let binding = resolve_binding(bindings, &p.bus_field, &p.method, cx.func)?;
+        writeln!(out, "{pad1}dut->{} = 0;", binding.wire_name(&p.method, "rsp_ready")).ok();
+    }
+    writeln!(out, "{pad}}}").ok();
+    Ok(())
+}
+
+/// Resolve a bus binding for a fork/join wire emission, with the same
+/// "verifier should have rejected it" hard-error contract as
+/// `emit_transactor_call`.
+fn resolve_binding<'a>(
+    bindings: &'a [BusBindingSchema],
+    bus_field: &str,
+    method: &str,
+    func: &TbFunction,
+) -> Result<&'a BusBindingSchema, EmitError> {
+    bindings.iter().find(|b| b.field == bus_field).ok_or_else(|| {
+        EmitError(format!(
+            "tbir: unresolved fork/join binding `{bus_field}.{method}` in {} — \
+             verifier should have rejected it",
+            func.name
+        ))
+    })
+}
+
+/// One `trace.tlm_call(...)` line, with the OOO tag appended when present
+/// (mirrors v1's `emit_tlm_call_trace_event`). Component context is empty
+/// (test-run scope), matching the blocking-call trace payloads.
+fn emit_tlm_trace(
+    out: &mut String,
+    pad: &str,
+    bus: &str,
+    method: &str,
+    phase: &str,
+    direction: &str,
+    tag: Option<&str>,
+) {
+    write!(
+        out,
+        "{pad}trace.tlm_call(cycle_count, \"\", \"{}\", \"{}\", \"{phase}\", \"{direction}\"",
+        escape_c(bus),
+        escape_c(method)
+    )
+    .ok();
+    if let Some(t) = tag {
+        write!(out, ", {t}").ok();
+    }
+    writeln!(out, ");").ok();
 }
 
 /// Expand one sanctioned bus-bound `TransactorMethod` call edge into v1's

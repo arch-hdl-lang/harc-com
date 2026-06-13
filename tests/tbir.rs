@@ -2490,13 +2490,89 @@ fn bus_send_recv_dump_ir_snapshot() {
     insta::assert_snapshot!("bus_send_recv_dump_ir", text);
 }
 
-/// fork/join_all TLM issue is outside the subset — precise rejection
-/// (blocks tlm_method_bus_test + tlm_pairing_arch_target_test).
+/// Initiator-side fork/join_all TLM issue lowers to `TlmFork` request
+/// statements + a `TlmJoinAll` drain (unblocks tlm_method_bus_test).
+/// `out_of_order` forks get monotonic per-(field,method) tags; the
+/// join_all carries every pending descriptor self-contained.
 #[test]
-fn bus_fork_join_is_unsupported() {
-    let err = lower_src(&fixture("tlm_method_bus_test.harc")).unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("`fork` bus-method calls"), "{msg}");
+fn bus_fork_join_lowers() {
+    let prog = lower_src(&fixture("tlm_method_bus_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let text = format!("{prog}");
+    // Two OOO forks, tags allocated 0 then 1, drained by one join_all.
+    assert!(
+        text.contains("TlmFork(%forked0 = mem.read_ooo([9]) tag=0)"),
+        "first fork must carry tag 0:\n{text}"
+    );
+    assert!(
+        text.contains("TlmFork(%forked1 = mem.read_ooo([10]) tag=1)"),
+        "second fork must carry tag 1:\n{text}"
+    );
+    assert!(
+        text.contains(
+            "TlmJoinAll([%forked0 = mem.read_ooo([9]) tag=0, \
+             %forked1 = mem.read_ooo([10]) tag=1])"
+        ),
+        "join_all must drain both pending forks:\n{text}"
+    );
+}
+
+/// A `fork` with no matching `join_all` leaves its request side hanging
+/// — rejected precisely at the end of the function rather than
+/// mis-lowered.
+#[test]
+fn bus_fork_without_join_all_is_rejected() {
+    let src = r#"
+bus OooBus
+    tlm_method read_ooo(addr: uint<8>) -> uint<32>: out_of_order tags 2;
+end bus OooBus
+
+testbench OooTb
+    dut : TlmMemory
+end testbench OooTb
+
+impl OooTest for OooTb
+    let mem : OooBus = bind dut
+    run
+        let x = fork mem.read_ooo(9)
+    end run
+end impl OooTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("has no matching `join_all`") && msg.contains("read_ooo"),
+        "{msg}"
+    );
+}
+
+/// Mixing a `blocking` (untagged) fork and an `out_of_order` (tagged)
+/// fork before one `join_all` is rejected — the two routing strategies
+/// (issue-order FIFO vs tag-match) cannot share a barrier.
+#[test]
+fn bus_fork_mixed_tagged_untagged_is_rejected() {
+    let src = r#"
+bus MixBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+    tlm_method read_ooo(addr: uint<8>) -> uint<32>: out_of_order tags 2;
+end bus MixBus
+
+testbench MixTb
+    dut : TlmMemory
+end testbench MixTb
+
+impl MixTest for MixTb
+    let mem : MixBus = bind dut
+    run
+        let a = fork mem.read(1)
+        let b = fork mem.read_ooo(2)
+        join_all
+    end run
+end impl MixTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("mix tagged") && msg.contains("untagged"), "{msg}");
 }
 
 /// A direct (non-fork) call of an `out_of_order` method is rejected by

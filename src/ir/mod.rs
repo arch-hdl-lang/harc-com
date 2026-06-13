@@ -1110,6 +1110,51 @@ pub enum Stmt {
     /// local; `value` is `Expr::Local(record)` (the yielded record).
     /// Emitted as `<seq>.push_back(<value>);` (v1's `_result.push_back`).
     SeqPush { seq: LocalId, value: Expr },
+    /// `let x = fork bus.<method>(args)` — issue the REQUEST side of a
+    /// bus-bound `tlm_method` call now, deferring the response capture to
+    /// the next `Stmt::TlmJoinAll` (v1's `try_emit_bus_tlm_fork`). The
+    /// descriptor carries the request payload (`args`), the response
+    /// destination (`dest`, declared/zero-init at the fork site), and the
+    /// OOO lane `tag` (`None` for a `blocking` method = issue-order FIFO
+    /// routing, `Some` for `out_of_order tags N` = hidden-tag routing).
+    /// The wire protocol (req_valid/req_ready + optional req_tag) is
+    /// backend-owned, mirroring v1.
+    TlmFork(TlmForkDesc),
+    /// `join_all` — drain every `Stmt::TlmFork` issued since the previous
+    /// `join_all`, capturing each response into its `dest`. Carries the
+    /// full pending-fork list (lowering accumulates it; the IR is self-
+    /// contained so backends never replay lowering state). All-untagged
+    /// forks route by issue order (`emit_ordered_tlm_join_all`); all-
+    /// tagged forks route by `rsp_tag` match (`emit_tagged_tlm_join_all`).
+    /// Mixing tagged and untagged forks before one join_all is rejected
+    /// at lowering. An empty list is a no-op (v1's "no pending forks").
+    TlmJoinAll(Vec<TlmForkDesc>),
+}
+
+/// One deferred bus-bound `tlm_method` fork: the request payload plus
+/// the metadata both `Stmt::TlmFork` (request emission) and
+/// `Stmt::TlmJoinAll` (response capture) need. Self-contained so the
+/// join statement carries its own descriptors (no cross-statement
+/// lowering replay in the backend), mirroring v1's `PendingTlmFork`.
+#[derive(Debug, Clone)]
+pub struct TlmForkDesc {
+    /// Bus-binding field name (== flat DUT signal prefix).
+    pub bus_field: String,
+    /// `tlm_method` name on the bound bus.
+    pub method: String,
+    /// Request payload expressions, in declared-arg order. Port-hoisted
+    /// like a blocking `tlm_method` call's args (no inline DUT reads).
+    pub args: Vec<Expr>,
+    /// Response destination local (declared + zero-init at the fork
+    /// site); `None` when the fork result is discarded.
+    pub dest: Option<LocalId>,
+    /// True when the method declares a return type (a `rsp_data` wire to
+    /// capture).
+    pub has_ret: bool,
+    /// OOO lane tag: `None` for a `blocking` method (issue-order FIFO),
+    /// `Some(n)` for `out_of_order tags N` (the per-`(field, method)`
+    /// monotonically allocated request tag, routed by `rsp_tag` match).
+    pub tag: Option<u64>,
 }
 
 /// How a composite-component field/method access names its receiver.

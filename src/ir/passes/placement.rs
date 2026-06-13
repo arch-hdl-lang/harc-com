@@ -352,6 +352,26 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 host_service_only = false;
                 visit_expr(value, &mut accesses, &mut transactor);
             }
+            Stmt::TlmFork(desc) => {
+                // A `fork bus.m(...)` request issue is the TLM seam, like a
+                // blocking transactor call: timing-tolerant at the call
+                // boundary. The arg exprs may carry inline reads.
+                host_service_only = false;
+                transactor = true;
+                for a in &desc.args {
+                    visit_expr(a, &mut accesses, &mut transactor);
+                }
+            }
+            Stmt::TlmJoinAll(pending) => {
+                // The matching response drain — also the TLM seam.
+                host_service_only = false;
+                transactor = true;
+                for p in pending {
+                    for a in &p.args {
+                        visit_expr(a, &mut accesses, &mut transactor);
+                    }
+                }
+            }
         }
     }
     match &block.terminator {

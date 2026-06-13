@@ -2550,6 +2550,17 @@ pub(crate) struct FuncBuilder<'a> {
     /// `yield` reaching lowering with `None` is rejected (yield outside a
     /// tseq), matching v1's "`yield` outside a `tseq` body" error.
     pub(crate) tseq_result: Option<LocalId>,
+
+    /// `fork bus.<method>(...)` descriptors issued since the last
+    /// `join_all`, in issue order — drained into the next
+    /// `Stmt::TlmJoinAll` (v1's `pending_tlm_forks`). Empty between
+    /// join_alls.
+    pub(crate) pending_tlm_forks: Vec<crate::ir::TlmForkDesc>,
+    /// Next OOO request tag per `(bus_field, method)`, allocated when a
+    /// fork issues against an `out_of_order tags N` method (v1's
+    /// `next_tlm_fork_tag`). Function-scoped — a fresh builder starts at
+    /// 0, matching v1's per-test reset.
+    pub(crate) next_tlm_fork_tag: HashMap<(String, String), u64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2618,6 +2629,8 @@ impl<'a> FuncBuilder<'a> {
             constraint_sites,
             recv_payloads: HashMap::new(),
             tseq_result: None,
+            pending_tlm_forks: Vec::new(),
+            next_tlm_fork_tag: HashMap::new(),
         }
     }
 
@@ -2792,6 +2805,16 @@ impl FuncBuilder<'_> {
         kind: FunctionKind,
         owner: Option<TestbenchId>,
     ) -> Result<TbFunction, LowerError> {
+        // A `fork bus.<m>(...)` with no matching `join_all` would leave
+        // its request side hanging forever (the response is never
+        // drained). v1 silently drops un-joined forks at test end; the
+        // IR rejects precisely instead of mis-lowering.
+        if let Some(p) = self.pending_tlm_forks.first() {
+            return Err(LowerError::Invalid(format!(
+                "`fork {}.{}(...)` has no matching `join_all` before the end of `{name}`",
+                p.bus_field, p.method
+            )));
+        }
         let sealed: Vec<BasicBlock> = self
             .blocks
             .into_iter()
@@ -2935,6 +2958,12 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 // (transactor-method randomize / tseq is out of subset),
                 // so the yielded value holds no transactor-state node.
                 ir::Stmt::SeqPush { value, .. } => in_expr(value),
+                // Fork/join descriptors carry their request payload exprs;
+                // a responder body never forks, but scan for completeness.
+                ir::Stmt::TlmFork(desc) => desc.args.iter().find_map(in_expr),
+                ir::Stmt::TlmJoinAll(pending) => {
+                    pending.iter().find_map(|p| p.args.iter().find_map(in_expr))
+                }
                 ir::Stmt::DutRead(_, _)
                 | ir::Stmt::RecordInit(_, _)
                 | ir::Stmt::CovReport(_)
@@ -3066,6 +3095,18 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                     }
                 }
                 ir::Stmt::SeqPush { value, .. } => fill_expr(value, instance),
+                ir::Stmt::TlmFork(desc) => {
+                    for a in &mut desc.args {
+                        fill_expr(a, instance);
+                    }
+                }
+                ir::Stmt::TlmJoinAll(pending) => {
+                    for p in pending {
+                        for a in &mut p.args {
+                            fill_expr(a, instance);
+                        }
+                    }
+                }
                 ir::Stmt::DutRead(_, _)
                 | ir::Stmt::RecordInit(_, _)
                 | ir::Stmt::CovReport(_)
@@ -3218,6 +3259,18 @@ fn fill_initiator_bus_prefix(func: &mut TbFunction, binding: &str) -> Result<(),
                     }
                     Stmt::SeqPush { value, .. } => {
                         visit_expr(value, placeholder, binding, rewrite, &mut conflict)
+                    }
+                    Stmt::TlmFork(desc) => {
+                        for a in &mut desc.args {
+                            visit_expr(a, placeholder, binding, rewrite, &mut conflict);
+                        }
+                    }
+                    Stmt::TlmJoinAll(pending) => {
+                        for p in pending {
+                            for a in &mut p.args {
+                                visit_expr(a, placeholder, binding, rewrite, &mut conflict);
+                            }
+                        }
                     }
                     Stmt::RecordInit(_, _) | Stmt::CovReport(_) => {}
                 }

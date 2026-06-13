@@ -532,6 +532,133 @@ impl FuncBuilder<'_> {
         Ok(())
     }
 
+    /// `let x = fork <bind>.<method>(args)` / `fork <bind>.<method>(args)`
+    /// — the non-blocking REQUEST issue of a bus-bound `tlm_method`. The
+    /// response capture defers to the next `join_all` (`lower_tlm_join_all`
+    /// drains the accumulated descriptors). Mirrors v1's
+    /// `try_emit_bus_tlm_fork`: `blocking` methods get no tag (issue-order
+    /// FIFO drain), `out_of_order tags N` methods get a per-(field,method)
+    /// monotonically allocated request tag. Returns `Ok(true)` when `e`
+    /// was a `fork bus.<method>(...)` and was lowered.
+    pub(crate) fn try_lower_tlm_fork(
+        &mut self,
+        e: &AstExpr,
+        dest: BusCallDest<'_>,
+    ) -> Result<bool, LowerError> {
+        let ExprKind::ForkCall { call } = &*e.kind else {
+            return Ok(false);
+        };
+        let ExprKind::Call { callee, args } = &*call.kind else {
+            return Err(unsupported(
+                "`fork` RHS that is not a direct bus tlm_method call",
+                "only `fork <bus>.<method>(args)` is lowered",
+            ));
+        };
+        let ExprKind::Field { target, name: method } = &*callee.kind else {
+            return Err(unsupported(
+                "`fork` RHS that is not `<bus>.<method>(args)`",
+                "",
+            ));
+        };
+        let ExprKind::Ident(id) = &*target.kind else {
+            return Err(unsupported(
+                "`fork` RHS that is not rooted at a bus binding",
+                "",
+            ));
+        };
+        let Some(bus) = self.ctx.bus_bindings.get(&id.name) else {
+            return Ok(false);
+        };
+        let Some(m) = bus
+            .tlm_methods
+            .iter()
+            .find(|m| m.name.name == method.name)
+            .cloned()
+        else {
+            return Err(LowerError::Invalid(format!(
+                "bus `{}` has no tlm_method `{}`",
+                bus.name.name, method.name
+            )));
+        };
+        let bind = id.name.clone();
+        // The RHS-fork lowering supports `blocking` (issue-order) and
+        // `out_of_order tags N` (tagged-lane) methods, matching v1.
+        let tag = match m.mode.name.as_str() {
+            "blocking" => None,
+            "out_of_order" => {
+                let key = (bind.clone(), m.name.name.clone());
+                let next = self.next_tlm_fork_tag.entry(key).or_insert(0);
+                let tag = *next;
+                *next += 1;
+                Some(tag)
+            }
+            other => {
+                return Err(unsupported(
+                    &format!("`fork {bind}.{}` on a `{other}` tlm_method", m.name.name),
+                    "fork supports `blocking` and `out_of_order tags N` methods",
+                ));
+            }
+        };
+        if args.len() != m.args.len() {
+            return Err(LowerError::Invalid(format!(
+                "bus.{}: expected {} arg(s), got {}",
+                m.name.name,
+                m.args.len(),
+                args.len()
+            )));
+        }
+        if m.ret.is_none() && !matches!(dest, BusCallDest::Discard) {
+            return Err(LowerError::Invalid(format!(
+                "bus.{} returns no value; `fork` it as a statement",
+                m.name.name
+            )));
+        }
+        // Request payload evaluates now (same cycle as the request, no
+        // tick between args and req_valid — v1's inline arg emission).
+        let mut lowered = Vec::with_capacity(args.len());
+        for a in args {
+            lowered.push(self.lower_expr_no_ports(call_arg_expr(a))?);
+        }
+        // The response destination is declared + zero-init at the fork
+        // site (v1 emits `T x = {};`), so reads between fork and join_all
+        // see a defined-but-zero local. `Discard` carries no dest.
+        let dest_local = match dest {
+            BusCallDest::Declare(name) => Some(self.declare(name)),
+            BusCallDest::Discard => None,
+        };
+        let desc = crate::ir::TlmForkDesc {
+            bus_field: bind,
+            method: m.name.name.clone(),
+            args: lowered,
+            dest: dest_local,
+            has_ret: m.ret.is_some(),
+            tag,
+        };
+        self.push(Stmt::TlmFork(desc.clone()));
+        self.pending_tlm_forks.push(desc);
+        Ok(true)
+    }
+
+    /// `join_all` — drain every pending `fork` issued since the last
+    /// join_all into a single `Stmt::TlmJoinAll`. Mixing tagged
+    /// (`out_of_order`) and untagged (`blocking`) forks before one
+    /// join_all is rejected — v1 reports it at emission, the IR rejects at
+    /// lowering. An empty pending set lowers to an empty `TlmJoinAll`
+    /// (a no-op, matching v1's "no pending forks" comment).
+    pub(crate) fn lower_tlm_join_all(&mut self) -> Result<(), LowerError> {
+        let pending = std::mem::take(&mut self.pending_tlm_forks);
+        let tagged = pending.iter().filter(|p| p.tag.is_some()).count();
+        if tagged != 0 && tagged != pending.len() {
+            return Err(LowerError::Invalid(
+                "cannot mix tagged (`out_of_order`) and untagged (`blocking`) \
+                 fork TLM calls before one `join_all`"
+                    .to_string(),
+            ));
+        }
+        self.push(Stmt::TlmJoinAll(pending));
+        Ok(())
+    }
+
     /// v1's bounded handshake wait, CFG shape of
     /// `{ int _b = 16; while (!<sig> && _b > 0) { co_await wait_cycles(1); _b--; } }`:
     ///

@@ -263,16 +263,34 @@ next blocker; exact `Unsupported` message in parentheses):
 
 | Next blocker | Fixtures |
 |---|---|
-| `fork`/`join_all` TLM issue (needs `Terminator::Fork` + `ForkArmKind::BusMethodCall`) | `tlm_method_bus_test`, `tlm_target_fork_forwarding_test`, `tlm_pairing_arch_target_test`* ("`fork` bus-method calls") |
-| `out_of_order tags N` target threads (hidden tag wires + multi-lane response router) | `tlm_target_ooo_lanes_test`, `tlm_pairing_arch_initiator_test` ("serving a `out_of_order` method") |
-| nested transactor/method call inside a responder body (forwarding to another target) | `tlm_target_forwarding_test` ("transactor/method call `.read(...)`") |
+| **(resolved 2026-06-13)** initiator-side `fork`/`join_all` TLM issue | ~~`tlm_method_bus_test`~~ (registered, pass) — see the initiator-side fork/join_all section below |
+| a `fork` INSIDE a transactor responder body (target re-issuing a downstream TLM call — fork-forwarding; needs request arbiter + response router) | `tlm_target_fork_forwarding_test` ("`fork` bus-method calls in expression position"), `tlm_target_forwarding_test` ("transactor/method call `.read(...)`") |
+| target-side `out_of_order tags N` RESPONDER threads (hidden tag wires + multi-lane response router) | `tlm_target_ooo_lanes_test`, `tlm_pairing_arch_initiator_test` ("serving a `out_of_order` method") |
+| **(equivalence-proven, gate-blocked)** `tlm_pairing_arch_target_test` | LOWERS + v1↔tbir trace-diff clean, but its ARCH-DUT auto-emitted `_auto_tlm_*_req_stable` TLM SVA `$fatal`s under local Verilator 5.048 for BOTH codegens identically — known local-only artifact, NOT registered |
 | **(resolved 2026-06-13)** `bind ... with { ... }` signal remaps | ~~`dma_engine_tlm_target_test`, `dma_engine_tlm_mem_model_test`~~ — see the bus-bind-remap section below |
 | **(resolved 2026-06-13)** initiator-side bus-bound BFM (`hookable` bodies driving handshake channels) | ~~`regblock_*`~~ — see the initiator-side BFM section below |
 
-The fork group's blocking-call halves already lower; the OOO group needs
-the tagged responder lanes; the forwarding fixture needs nested call
-edges inside a responder. The regblock `via` helpers are the
+The remaining fork-forwarding fixtures need a responder to act as both
+target AND initiator (request arbiter + response router); the OOO group
+needs the tagged RESPONDER lanes. The regblock `via` helpers are the
 *initiator-side* BFM, lowered by the separate slice below.
+
+### initiator-side `fork`/`join_all` TLM issue — RESOLVED 2026-06-13
+
+> ~~`fork` bus-method calls~~ (initiator side)
+
+A test-scope `let x = fork bus.<method>(args)` issues only the request
+side of a bus `tlm_method` and defers the response capture to the next
+`join_all`. New IR `Stmt::TlmFork(TlmForkDesc)` + `Stmt::TlmJoinAll(Vec<
+TlmForkDesc>)` mirror v1's `try_emit_bus_tlm_fork` / `emit_tlm_join_all`:
+a `blocking` method drains issue-order FIFO; an `out_of_order tags N`
+method gets a per-`(field,method)` monotonic request tag and drains by
+`rsp_tag`-match (multi-lane, so tag 1 can land before tag 0). The pending
+list survives `wait` between blocks; a dangling `fork` and a mixed
+tagged/untagged barrier are both rejected at lowering. **Registered** (1,
+pass, trace-diff clean): `tlm_method_bus_test`. See docs/tbir-mvp.md, the
+initiator-side fork/join_all slice. Still rejected: a `fork` inside a
+RESPONDER body (fork-forwarding) and target-side OOO responder lanes.
 
 ### bus `bind ... with { ... }` signal remaps — RESOLVED 2026-06-13
 
@@ -347,10 +365,14 @@ access bypasses `wire_name` (`bind_remap_test` exercises exactly this and
 stays rejected). `tlm_pairing_arch_initiator_test` is a TLM-initiator
 fixture but stops earlier on `out_of_order tags N`.
 
-\* `tlm_pairing_arch_target_test` still does not reach the equivalence
-stage (fork-blocked), so the known local-only Verilator
-5.048-vs-CI-5.034 SVA verdict issue on this fixture remains moot from
-CI's perspective.
+\* `tlm_pairing_arch_target_test` now LOWERS through the initiator-side
+fork/join_all slice and is v1↔tbir trace-diff clean, but its ARCH-DUT
+auto-emitted `_auto_tlm_mem_read_ooo_req_stable` TLM SVA `$fatal`s under
+local Verilator 5.048 for BOTH codegens identically (the known local-only
+5.048-vs-CI-5.034 SVA verdict issue). It is NOT registered — the local
+equivalence gate cannot be satisfied — but the equivalence itself is
+proven (identical verdict + clean trace-diff). It should pass on CI's
+Verilator; register it there once confirmed.
 
 ### `wait N cycles on <clock>` — 5 fixtures — **RESOLVED 2026-06-12**
 
