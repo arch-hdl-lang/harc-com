@@ -332,6 +332,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             Item::Agent(c) if matches!(c.kind, crate::ast::ComponentKind::Agent) => {
                 Some(c.name.name.clone())
             }
+            Item::Sequencer(c) => Some(c.name.name.clone()),
             _ => None,
         })
         .collect();
@@ -367,6 +368,13 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                     "pass the base test file alongside the extension",
                 ));
             }
+            // A `sequencer` is a composite component (analysis-source
+            // shape: `out event<T>` + hookable `emit` methods). It is
+            // lowered through the component-cluster path below and binds
+            // only as a test-scope component or an env/agent sub-component
+            // (a sequencer testbench field is rejected via
+            // `component_type_names`); inert at this gate.
+            Item::Sequencer(_) => {}
             Item::Env(c) | Item::Agent(c) => {
                 if used_tbs.contains(&c.name.name) {
                     validate_testbench_component(
@@ -563,12 +571,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             Item::Agent(c) if matches!(c.kind, crate::ast::ComponentKind::Agent) => {
                 (&c.name.name, components::CompSource::Agent(c))
             }
-            Item::Sequencer(c) => {
-                return Err(unsupported(
-                    &format!("the `sequencer` construct (`{}`)", c.name.name),
-                    "",
-                ));
-            }
+            Item::Sequencer(c) => (&c.name.name, components::CompSource::Sequencer(c)),
             _ => continue,
         };
         let cid = ir::ComponentId(comp_sources.len() as u32);

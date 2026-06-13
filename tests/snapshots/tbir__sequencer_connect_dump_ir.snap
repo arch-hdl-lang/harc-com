@@ -1,0 +1,66 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 SequencerConnectTest_tb (synthetic) { dut: Top }
+  test SequencerConnectTest tb=tb0 run=fn2 check=-
+  component c0 CountSeq (sequencer)
+    field dispatched : out event<uint>
+    method dispatch(1 arg) = fn0
+  component c1 SeqSb (scoreboard)
+    field count : scalar = 0
+    field sum : scalar = 0
+    method sink(1 arg) = fn1
+  component c2 SeqEnv (env)
+    field sqr : sub c0
+    field sb : sub c1
+    connect sqr.dispatched -> sb.sink (c1)
+
+fn fn0 comp_method_0 [kind=ComponentMethod(c0)]
+  params:
+    n : uint<8>
+  locals:
+    %0 n : uint<8>
+    %1 i : unknown
+  entry = b0
+
+  b0:
+    Assign(%i, 0)
+    -> Jump(b1)
+
+  b1:
+    -> Branch((%i < %n), b2, b4)
+
+  b2:
+    ComponentEmit(self.dispatched, [%i])
+    -> Jump(b3)
+
+  b3:
+    Assign(%i, (%i + 1))
+    -> Jump(b1)
+
+  b4:
+    -> Return
+
+fn fn1 comp_method_1 [kind=ComponentMethod(c1)]
+  params:
+    v : uint<8>
+  locals:
+    %0 v : uint<8>
+  entry = b0
+
+  b0:
+    ComponentFieldWrite(self.count, (self.count + 1))
+    ComponentFieldWrite(self.sum, (self.sum + %v))
+    -> Return
+
+fn fn2 run_SequencerConnectTest [kind=Run, owner=tb0]
+  entry = b0
+
+  b0:
+    ComponentCall(env.sqr.c0::dispatch([5]))
+    AssertCheck { cond: (env.sb.count == 5), on_fail: "sequencer dispatched %lld items, expected 5", env.sb.count }
+    AssertCheck { cond: (env.sb.sum == 10), on_fail: "sequencer item sum=%lld, expected 10", env.sb.sum }
+    Log(info, "PASS: sequencer dispatch stream connected to scoreboard sink")
+    -> Return

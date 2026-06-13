@@ -762,6 +762,30 @@ fn agent_on_handler_emitted_cpp_snapshot() {
     );
 }
 
+/// Sequencer slice: a `sequencer` lowers as a composite component (the
+/// analysis-source shape — `out event<T>` port + a hookable method that
+/// `emit`s the generated stream), connected inside an env to a scoreboard
+/// sink. Locks the dump-ir: the component schema with `(sequencer)` kind,
+/// the literal-range dispatch loop emitting on the self event, and the
+/// env's resolved `connect` edge (sequencer.dispatched -> sb.sink).
+#[test]
+fn sequencer_connect_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("sequencer_connect_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("sequencer_connect_dump_ir", format!("{prog}"));
+}
+
+/// Locks the emitted tbir C++ for the sequencer fixture: the sequencer
+/// component struct (event-callback vector), the dispatch lambda, and the
+/// env local + connect push_back wiring the sequencer stream to the sink.
+#[test]
+fn sequencer_connect_emitted_cpp_snapshot() {
+    insta::assert_snapshot!(
+        "sequencer_connect_emitted_cpp",
+        emit_fixture_cpp("sequencer_connect_test.harc")
+    );
+}
+
 /// A method-bearing scoreboard lowers as a composite component
 /// (per-instance state materialized). Since the testbench-field-binding
 /// slice it binds BOTH as a test-scope `let` AND as a `testbench` FIELD

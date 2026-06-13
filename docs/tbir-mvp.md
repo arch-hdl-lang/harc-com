@@ -29,6 +29,7 @@ checked against the code at the cited location.
 | initiator-BFM slice (2026-06-13) | initiator-side bus-bound BFM: a `transactor X bound to <Bus>` whose `hookable` methods drive the bound bus's handshake channels (the regblock `via <Helper>` form). Lowered in `src/ir/lower/transactors.rs` (`lower_bound_initiator_transactor`) — methods become `TransactorBody` `TbFunction`s on `TransactorSchema::methods`, `bus` resolves through a placeholder-keyed binding filled at test-bind time (`fill_initiator_bus_prefix`), and `recv()` field access (`r.data`) is supported via per-field capture. No new IR variants. Fixture `regblock_access_test` registered (trace-diff clean). See divergence 15. |
 | #372 | `randomize` via the constraint-IR seam: `Terminator::Randomize { target, constraints: ConstraintRef, succ }` + a `TbProgram::constraint_sites` table (the `ConstraintRef` handle resolves into it). Lowering merges transaction `keep`s ahead of the call-site `with {...}` body (spec §4) and records each site with its `ConstraintProblemId` handle. The tbir backend reuses v1's Z3-solve emission verbatim (`cpp_tb::emit_randomize_snippets` → `emit_constraint_solver_block` / unconstrained-PRNG shell / `emit_randomize_trace_event`) — "the constraint runtime is shared; only the call site moves to the IR backend." The runtime problem table + `harc_z3_rt.h` include are emitted iff a site exists. New passes wiring: `lower_coroutine` treats Randomize as a host-sync transition (`Trigger::Solved`); `placement` tiers a solve block at Tier-2 host-service and capability-checks `solve_*`. Fixtures: `keep_constraints_test` (bare `randomize(t)` + transaction keeps), `axilite_constraint_test` (`randomize(p) with` + Z3 cross-field constraints). Both trace-diff clean v1↔tbir at seed 1. `randomize` *expressions* (`let v = randomize(t)`), scoreboard-`.push`/`tseq`-gated randomize fixtures, and method-body randomize stay rejected (residual map below). |
 | tb-component-field slice (2026-06-13) | composite-component **testbench-field binding** — a component bound as a `testbench` FIELD (`prod : Producer` / `sb : Sb` / `top : HeartbeatEnv` inside the `testbench` block, alongside `dut : Top`), the complement of the already-shipped test-scope `let env : <Env>` binding. NO new IR variants: the testbench-field walk in `lower/mod.rs` routes a component-typed field into the SAME `test_scope_components` collector a test-scope `let` uses, so it flows into `ComponentFieldBinding`/`component_fields` and lowers to a default-constructed run-scope instance identically. The impl-for desugaring prefixes a testbench-field access with `_tb` (`prod.in_ev` → `_tb.prod.in_ev`); a new `FuncBuilder::strip_tb_prefix` helper (`components.rs`) strips that prefix in every component-access path (`as_component_method_call`, `as_component_field_{target,read}`, `lower_emit`, `as_component_idle`) and `as_port_ref` skips a `_tb.<component>` root, so `emit`/`idle_in`/field reads/writes all resolve to the bare-name instance. `validate_testbench_component` now ACCEPTS a component-typed field (a `mode` keyword on one is rejected — it's a transactor concept). Hardening: `event<transaction/struct>` payloads now reject precisely at component-schema lowering (`event<TinyTxn>` parses the payload as `TypeArg::Expr`/`Named`, previously mis-lowered to a scalar callback and failed at C++ compile). Fixture `tb_field_agent_test` (`top_counter.sv`, pass) — the agent from `agent_on_handler_test` bound as a testbench field instead of a test-scope let; trace-diff clean v1↔tbir at seed 1. See divergence 16. `event<transaction>` payloads, `quiesced(N)`, `watchdog`, named `phase`, `on <N> cycles`, scoreboard-`queue` SUB-components in an env, and `wait until` with heartbeat predicates stay rejected (residual map below). |
+| sequencer slice (2026-06-13) | `sequencer` construct (builds on the env-composition + agent/on-handler core, `src/ir/lower/components.rs`): a `sequencer` is the analysis-source component shape — an `out event<T>` analysis port plus `hookable` methods that generate a stimulus stream and `emit` each item on that port. It routes through the same `CompSource`/`ComponentSchema` machinery as a method-bearing scoreboard or analysis-source transactor; the only addition is `ComponentKindTag::Sequencer` (+ `CompSource::Sequencer`) for dump-ir/diagnostics. A `connect <sqr>.dispatched -> <drv>.<sink>` edge inside the composing env wires the emitted stream into a sink method (the UVM sequencer/driver bridge). No new IR variants, no new statement/expr forms — sequencer methods, `emit`, and `connect` all reuse the existing component lowering. Fixture: `sequencer_connect_test` (`top_counter.sv`/`top_counter.arch`, pass) — a `dispatch(n)` hookable emitting over a literal-range `for i in 0 .. n` loop, connected to a scoreboard sink; trace-diff clean v1↔tbir at seed 1. The three corpus sequencer fixtures (`axilite_connect_test`, `transactor_agent_mode_test`, `transactor_env_mode_test`) stay blocked: each iterates a `tseq` (`for t in <TSeq>` + `randomize`) inside its `dispatch`, and the agent/env fixtures additionally stack mode-inheritance + cycle-trigger `on dut.x && dut.y` handlers; those gate on the `tseq`/`randomize-in-tseq` + agent-mode slices (divergence 16). |
 
 ### Construct subset
 
@@ -248,6 +249,12 @@ mis-lowered to a scalar callback), `quiesced(N)`, `watchdog`, named
 `phase`, `wait until` with heartbeat predicates, `on <expr>`/`on <N>
 cycles` triggers, a `queue` SUB-component inside an env, `sequencer`/
 `tseq`. Those gate on later slices.
+clean. **Out of subset** (precise rejections): `event<Struct/transaction>`
+payloads, composite-component *testbench fields* (the heartbeat fixtures'
+`prod : Producer` binding — separate slice), `quiesced(N)`, `watchdog`,
+named `phase`, `wait until` with heartbeat predicates, `on <expr>`/`on
+<N> cycles` triggers, `tseq` (`sequencer` lowers since divergence 16).
+Those gate on later slices.
 
 ### The equivalence matrix
 
@@ -782,7 +789,8 @@ reason. Code locations are authoritative.
       composite-component *testbench fields* (now LIFTED — divergence 16
       lowers `prod : Producer` testbench-field binding),
       `quiesced(N)` (env heartbeat aggregation), `watchdog`, named
-      `phase`, `wait until` with heartbeat predicates, `sequencer`/`tseq`.
+      `phase`, `wait until` with heartbeat predicates, `sequencer`/`tseq`
+      (`sequencer` has since lifted — divergence 16; `tseq` still pends).
       New fixture: `agent_on_handler_test` (`top_counter.sv`, pass) —
       agent + on-handler + path-emit + `idle_in`, registered in the
       equivalence registry; trace-diffs clean v1↔tbir at seed 1.
@@ -918,6 +926,41 @@ reason. Code locations are authoritative.
       `agent_on_handler_test` agent bound as a testbench field instead of
       a test-scope let; registered in the equivalence registry,
       trace-diffs clean v1↔tbir at seed 1.
+16. **Sequencer construct (2026-06-13).** A `sequencer` is the stimulus-
+    source half of the UVM sequencer/driver pattern. Structurally it is
+    the analysis-source component shape the env-composition slice already
+    lowers: an `out event<T>` analysis port plus `hookable` methods that
+    generate a stream and `emit` each item on that port. It therefore
+    reuses the existing `CompSource`/`ComponentSchema`/`ComponentMethod`
+    machinery wholesale.
+    - *Only addition is a tag.* `ComponentKindTag::Sequencer` (+
+      `CompSource::Sequencer`) — used only for dump-ir / diagnostics and
+      the testbench-field precise-rejection set. No new IR variant, no new
+      statement/expr form, no new codegen path: sequencer methods, `emit`,
+      and the env's `connect <sqr>.<event> -> <drv>.<sink>` bridge all
+      flow through the same lowering as a method-bearing scoreboard or
+      analysis-source transactor. The connect bridge feeds the emitted
+      stream into the sink (here a scoreboard tally standing in for a
+      driver's `req` sink).
+    - *Binding scope.* A sequencer binds as an env/agent sub-component or
+      a test-scope `let`; a sequencer **testbench field** is a precise
+      rejection (it joins `component_type_names`), mirroring divergence 14
+      for other composite components.
+    - *Fixture:* `sequencer_connect_test` (`top_counter.sv`/
+      `top_counter.arch`, pass) — a `dispatch(n)` hookable emitting over a
+      literal-range `for i in 0 .. n` loop, connected to a scoreboard
+      sink; trace-diff clean v1↔tbir at seed 1.
+    - *Out of subset (corpus residuals).* The three corpus sequencer
+      fixtures (`axilite_connect_test`, `transactor_agent_mode_test`,
+      `transactor_env_mode_test`) each lower their `sequencer` now but
+      stop at the **next** blocker: every `dispatch` body iterates a
+      `tseq` (`for t in <TSeq>` over a `let txns = RandomTxns(5)`, with
+      `randomize(t)` inside the `tseq`), which needs the `tseq` /
+      `TSeq<T>`-value / `randomize-in-tseq` slice. The agent/env fixtures
+      additionally stack mode-inheritance (`active`/`passive` flowing
+      through env→agent→transactor) and cycle-trigger `on dut.x && dut.y`
+      handlers, which need the agent-mode + cycle-trigger slices. None of
+      the three fully unlock from the sequencer construct alone.
 
 Minor, same spirit: `IndexVec` is a plain `Vec` plus typed id structs;
 the design's `AssertFail` enum collapsed into a single

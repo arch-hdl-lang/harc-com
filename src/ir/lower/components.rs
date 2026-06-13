@@ -82,6 +82,11 @@ pub(crate) enum CompSource<'a> {
     /// `agent` — composes `on <ev>` self-subscriptions. Same
     /// `ComponentDecl` shape as env/scoreboard.
     Agent(&'a ComponentDecl),
+    /// `sequencer` — a stimulus source. Same `ComponentDecl` shape as
+    /// env/scoreboard: `out event<T>` ports + hookable methods that
+    /// `emit` the generated stream (lowered exactly like an
+    /// analysis-source transactor).
+    Sequencer(&'a ComponentDecl),
 }
 
 /// Lower one component's STRUCTURE (fields + method signatures), without
@@ -102,6 +107,9 @@ pub(crate) fn lower_component_schema(
     ) = match src {
         CompSource::Env(c) => (&c.name.name, ComponentKindTag::Env, &c.items, None),
         CompSource::Agent(c) => (&c.name.name, ComponentKindTag::Agent, &c.items, None),
+        CompSource::Sequencer(c) => {
+            (&c.name.name, ComponentKindTag::Sequencer, &c.items, None)
+        }
         CompSource::Scoreboard(c) => {
             (&c.name.name, ComponentKindTag::Scoreboard, &c.items, None)
         }
@@ -120,7 +128,11 @@ pub(crate) fn lower_component_schema(
             ));
         }
     }
-    if let CompSource::Env(c) | CompSource::Scoreboard(c) | CompSource::Agent(c) = src {
+    if let CompSource::Env(c)
+    | CompSource::Scoreboard(c)
+    | CompSource::Agent(c)
+    | CompSource::Sequencer(c) = src
+    {
         if !c.params.is_empty() {
             return Err(unsupported(&format!("parameters on `{name}`"), ""));
         }
@@ -399,7 +411,10 @@ pub(crate) fn lower_component_bodies(
     constraint_sites: &std::cell::RefCell<Vec<crate::ir::ConstraintSite>>,
 ) -> Result<Vec<TbFunction>, LowerError> {
     let (items, when_active): (&[ComponentItem], Option<&[ComponentItem]>) = match src {
-        CompSource::Env(c) | CompSource::Scoreboard(c) | CompSource::Agent(c) => (&c.items, None),
+        CompSource::Env(c)
+        | CompSource::Scoreboard(c)
+        | CompSource::Agent(c)
+        | CompSource::Sequencer(c) => (&c.items, None),
         CompSource::Transactor(t) => (&t.items, t.when_active.as_deref()),
     };
     // Pass 1 reserved FunctionIds METHODS-first, then ON-HANDLERS (see

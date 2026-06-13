@@ -318,7 +318,7 @@ dump-ir`, 2026-06-13):
 | Next blocker | Fixtures |
 |---|---|
 | `agent` construct + `on <ev>` event handlers | `heartbeat_idle_test`, `wait_until_quiesce_test`, `watchdog_quiesce_test`, `watchdog_trip_diagnostic_test`, `env_quiesced_phase_test` (also need `phase`, `idle(N)`/`quiesced(N)` predicates, watchdog) |
-| `sequencer` construct | `axilite_connect_test`, `transactor_agent_mode_test`, `transactor_env_mode_test` |
+| ~~`sequencer` construct~~ → now **`tseq`** | `axilite_connect_test`, `transactor_agent_mode_test`, `transactor_env_mode_test` — **`sequencer` lowers since the sequencer slice (2026-06-13)**; each now stops at the `tseq` (`for t in <TSeq>` + `randomize`) inside its `dispatch`, and the agent/env pair additionally stack mode-inheritance + cycle-trigger `on dut.x && dut.y` handlers |
 | `tseq` construct | `axilite_bound_mon_test` |
 | `tseq` + `randomize` | `axilite_env_test` (env composition itself now lowers; the `RandomTxns` tseq + `randomize(t)` in the run body are the next blockers) |
 
@@ -365,6 +365,37 @@ over sub-components), `on <N> cycles` periodic triggers, named `phase`,
 `wait until <preds> timeout fail` with heartbeat predicates, and a
 `queue` SUB-component inside an env (`env_quiesced_phase_test`'s `DrainSb`
 holds `expected : queue<uint<8>>`). Those are the next layered slices.
+
+### `sequencer` construct — **RESOLVED 2026-06-13 (sequencer slice)**
+
+The `sequencer` construct now lowers (`ComponentKindTag::Sequencer`,
+`CompSource::Sequencer`; see docs/tbir-mvp.md divergence 16). A
+`sequencer` is the analysis-source component shape the env-composition
+slice already lowers — an `out event<T>` analysis port + `hookable`
+methods that generate a stimulus stream and `emit` each item on that
+port — so it routes through the existing `ComponentSchema` machinery with
+no new IR variants. A `connect <sqr>.<event> -> <drv>.<sink>` edge inside
+the composing env wires the emitted stream into a sink method (the UVM
+sequencer/driver bridge). **Registered**: `sequencer_connect_test` — a
+self-proving fixture (sequencer + literal-range `dispatch(n)` emit loop +
+env `connect` → scoreboard sink) authored for this slice, lowering
+cleanly, passing the v1-vs-tbir pair, trace-diff clean at seed 1.
+
+The three corpus sequencer fixtures no longer reject on `sequencer` —
+each lowers its `sequencer` now but rejects one level deeper. Residual
+first-blocker map (re-run of `harc dump-ir`, 2026-06-13):
+
+| Next blocker | Fixtures |
+|---|---|
+| `tseq` construct (each `dispatch` iterates `for t in <TSeq>` over a `let txns = RandomTxns(5)`, with `randomize(t)` inside the `tseq`) | `axilite_connect_test`, `transactor_agent_mode_test`, `transactor_env_mode_test` |
+
+`axilite_connect_test` additionally binds its `env : AxilEnv` as a
+**testbench field** (the binding slice above), and the two
+`transactor_*_mode` fixtures stack mode-inheritance (`active`/`passive`
+flowing env→agent→transactor) + cycle-trigger `on dut.x && dut.y`
+handlers inside the transactor. So none fully unlock from the sequencer
+construct alone; they own the `tseq` + agent-mode + testbench-field
+slices.
 
 ### `scoreboard` construct — **PARTIALLY RESOLVED 2026-06-12 (scoreboard slice)**
 
