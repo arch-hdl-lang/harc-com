@@ -29,11 +29,12 @@ use crate::ast::{
     TransactorMode, TypeExpr,
 };
 use crate::ir::{
-    self, BasicBlock, BlockId, ClockSpec, ComponentSchema, CovgroupId, CovgroupSchema, FunctionId,
-    FunctionKind, IrType, LocalId, RecordId, RecordSchema, RegblockId, ScoreboardId,
-    ScoreboardSchema, TbFunction, TbProgram, TestSchema, TestbenchId, TestbenchSchema, Terminator,
-    TransactorId, TransactorSchema, TypedLocal, TypedParam,
+    self, BasicBlock, BlockId, ClockSpec, ComponentSchema, ConstraintRef, ConstraintSite,
+    CovgroupId, CovgroupSchema, FunctionId, FunctionKind, IrType, LocalId, RecordId, RecordSchema,
+    RegblockId, ScoreboardId, ScoreboardSchema, TbFunction, TbProgram, TestSchema, TestbenchId,
+    TestbenchSchema, Terminator, TransactorId, TransactorSchema, TypedLocal, TypedParam,
 };
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -403,6 +404,55 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         ..TbProgram::default()
     };
 
+    // Program-wide constraint-site accumulator. Shared by reference
+    // across every function lowered below so a `Terminator::Randomize`'s
+    // `ConstraintRef` is a globally-unique index into one table. Drained
+    // into `prog.constraint_sites` once all functions are lowered.
+    let constraint_sites: RefCell<Vec<ConstraintSite>> = RefCell::new(Vec::new());
+    // Typed solver problem table (constraint-IR layer) — the source of
+    // the per-site `problem_id` handle. Built from the SAME desugared
+    // `file` v1 uses (`cpp_tb` desugars, then builds the table), so the
+    // randomize-target spans this table is keyed by match the spans the
+    // lowering sees. Drives `ConstraintSite::problem_id`.
+    let solver_table = crate::solver::problem_table::build_typed_solver_problem_table(&file);
+
+    // Randomize-target span → problem-id, keyed exactly like v1's
+    // `runtime_randomize_problem_ids` (only Z3-ready sites populate).
+    let mut randomize_problem_ids: HashMap<(usize, usize), u32> = HashMap::new();
+    for entry in &solver_table.entries {
+        let crate::solver::problem_table::TypedSolverProblemSource::RandomizeSite { span, .. } =
+            entry.source
+        else {
+            continue;
+        };
+        if let crate::solver::problem_table::TypedSolverProblemBuild::Z3 { typed, .. } =
+            &entry.build
+        {
+            randomize_problem_ids.insert((span.start, span.end), typed.problem_id.0);
+        }
+    }
+
+    // Transaction-level `keep` clauses as AST exprs, by transaction
+    // name. Spec §4: these are part of every `randomize(t)` of that
+    // type, merged ahead of any call-site `with {...}` body (v1's
+    // `txn_keeps` merge in `StmtKind::Randomize`).
+    let mut txn_keeps: HashMap<String, Vec<crate::ast::Expr>> = HashMap::new();
+    for it in &file.items {
+        if let Item::Transaction(t) = it {
+            let keeps: Vec<crate::ast::Expr> = t
+                .body
+                .iter()
+                .filter_map(|item| match item {
+                    crate::ast::TxnBodyItem::Keep(k) => Some(k.expr.clone()),
+                    _ => None,
+                })
+                .collect();
+            if !keeps.is_empty() {
+                txn_keeps.insert(t.name.name.clone(), keeps);
+            }
+        }
+    }
+
     // Eagerly lower pure helpers (declaration order) so call sites can
     // stay `ir::Expr::Call` and backends emit them as plain C++ functions.
     // Records are visible (for precise rejection messages), but pure
@@ -435,6 +485,10 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         target_state: HashMap::new(),
         components: Vec::new(),
         component_fields: HashMap::new(),
+        // Pure helpers cannot hold record locals, so `randomize` can
+        // never fire in one — these maps stay inert here.
+        txn_keeps: HashMap::new(),
+        randomize_problem_ids: HashMap::new(),
     };
     for it in &file.items {
         let Item::Function(fd) = it else { continue };
@@ -447,7 +501,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             continue;
         }
         let id = FunctionId(prog.functions.len() as u32);
-        let f = helpers::lower_pure_helper(id, fd, &helper_registry, &helper_ctx)?;
+        let f = helpers::lower_pure_helper(id, fd, &helper_registry, &helper_ctx, &constraint_sites)?;
         prog.functions.push(f);
     }
 
@@ -469,6 +523,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &helper_registry,
             &helper_ctx,
             &buses,
+            &constraint_sites,
         )?;
         prog.transactors.push(schema);
         prog.functions.extend(funcs);
@@ -566,13 +621,24 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         target_state: HashMap::new(),
         components: prog.components.clone(),
         component_fields: HashMap::new(),
+        // Component method bodies are not cataloged in the constraint-IR
+        // problem table; a `randomize` inside one lowers with no
+        // problem-id (v1's nullptr-descriptor fallback).
+        txn_keeps: HashMap::new(),
+        randomize_problem_ids: HashMap::new(),
     };
     let mut method_funcs: Vec<TbFunction> = Vec::new();
     for (i, src) in comp_sources.iter().enumerate() {
         let cid = ir::ComponentId(i as u32);
         let schema = prog.components[i].clone();
-        let funcs =
-            components::lower_component_bodies(src, cid, &schema, &method_ctx, &helper_registry)?;
+        let funcs = components::lower_component_bodies(
+            src,
+            cid,
+            &schema,
+            &method_ctx,
+            &helper_registry,
+            &constraint_sites,
+        )?;
         method_funcs.extend(funcs);
     }
     // The reserved FunctionIds must be contiguous from `start_fn`.
@@ -601,6 +667,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &buses,
             &consts,
             &helper_registry,
+            &txn_keeps,
+            &randomize_problem_ids,
+            &constraint_sites,
             &mut prog,
         )?;
     }
@@ -610,6 +679,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             "no `test` declaration found".to_string(),
         ));
     }
+    prog.constraint_sites = constraint_sites.into_inner();
     Ok(prog)
 }
 
@@ -782,6 +852,9 @@ fn lower_test(
     buses: &HashMap<String, &BusDecl>,
     consts: &HashMap<String, u64>,
     helpers: &helpers::HelperRegistry<'_>,
+    txn_keeps: &HashMap<String, Vec<crate::ast::Expr>>,
+    randomize_problem_ids: &HashMap<(usize, usize), u32>,
+    constraint_sites: &RefCell<Vec<ConstraintSite>>,
     prog: &mut TbProgram,
 ) -> Result<(), LowerError> {
     if !t.params.is_empty() {
@@ -1510,6 +1583,8 @@ fn lower_test(
         target_state,
         components: prog.components.clone(),
         component_fields: component_field_map,
+        txn_keeps: txn_keeps.clone(),
+        randomize_problem_ids: randomize_problem_ids.clone(),
     };
 
     // Synthesized auto-sampler functions, one per covergroup field, in
@@ -1544,6 +1619,7 @@ fn lower_test(
         &run_stmts,
         &ctx,
         helpers,
+        constraint_sites,
     )?;
     prog.functions.push(run_fn);
 
@@ -1559,6 +1635,7 @@ fn lower_test(
             &check_stmts,
             &ctx,
             helpers,
+            constraint_sites,
         )?;
         prog.functions.push(check_fn);
         Some(check_id)
@@ -1774,6 +1851,17 @@ pub(crate) struct LowerCtx {
     /// resolves through the component path machinery (`env.source.publish`,
     /// `env.sb.count`). Empty in helper/method/transactor contexts.
     pub component_fields: HashMap<String, ir::ComponentId>,
+    /// Per-transaction `keep` constraint clauses as AST expressions, by
+    /// transaction name. Merged ahead of a `randomize(t)` call-site
+    /// `with {...}` body (v1's spec-§4 merge) when building the
+    /// `ConstraintSite`. Empty for keep-free transactions and for
+    /// contexts that cannot host a `randomize` (pure helpers).
+    pub txn_keeps: HashMap<String, Vec<crate::ast::Expr>>,
+    /// Randomize-target span → typed constraint-problem id. The handle
+    /// (`ConstraintProblemId.0`) the constraint-IR layer assigned to the
+    /// site, keyed exactly like v1's `runtime_randomize_problem_ids`.
+    /// `None` at a site means no Z3-ready problem (lower/backend error).
+    pub randomize_problem_ids: HashMap<(usize, usize), u32>,
 }
 
 pub(crate) struct LoopFrame {
@@ -1854,6 +1942,12 @@ pub(crate) struct FuncBuilder<'a> {
     /// relatively (`Expr::ComponentField { base: SelfField }`), and
     /// `emit <ev>(...)` resolves against the body's `out event` fields.
     pub(crate) self_component: Option<ir::ComponentId>,
+    /// Program-wide constraint-site table, shared across every function
+    /// lowered for one program so `ConstraintRef` indices are globally
+    /// unique. A `randomize` site appends here and the resulting index
+    /// becomes the terminator's `ConstraintRef`. `lower_program` drains
+    /// it into `TbProgram::constraint_sites` after all functions lower.
+    pub(crate) constraint_sites: &'a RefCell<Vec<ConstraintSite>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1865,8 +1959,9 @@ fn lower_function<'a>(
     stmts: &[&AstStmt],
     ctx: &'a LowerCtx,
     helpers: &'a helpers::HelperRegistry<'a>,
+    constraint_sites: &'a RefCell<Vec<ConstraintSite>>,
 ) -> Result<TbFunction, LowerError> {
-    let mut b = FuncBuilder::new(ctx, helpers);
+    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
     b.in_check = kind == FunctionKind::Check;
     // Regblock mirror locals: declared + default-constructed (to their
     // reset values) at the head of the Run function, mirroring v1's
@@ -1891,7 +1986,11 @@ fn lower_function<'a>(
 }
 
 impl<'a> FuncBuilder<'a> {
-    pub(crate) fn new(ctx: &'a LowerCtx, helpers: &'a helpers::HelperRegistry<'a>) -> Self {
+    pub(crate) fn new(
+        ctx: &'a LowerCtx,
+        helpers: &'a helpers::HelperRegistry<'a>,
+        constraint_sites: &'a RefCell<Vec<ConstraintSite>>,
+    ) -> Self {
         FuncBuilder {
             ctx,
             helpers,
@@ -1914,6 +2013,7 @@ impl<'a> FuncBuilder<'a> {
             in_check: false,
             let_widths: HashMap::new(),
             self_component: None,
+            constraint_sites,
         }
     }
 }
@@ -2055,6 +2155,15 @@ impl FuncBuilder<'_> {
         }
     }
 
+    /// Append a constraint site to the program-wide table and return its
+    /// `ConstraintRef` handle (the index). Used by `randomize` lowering.
+    pub(crate) fn push_constraint_site(&self, site: ConstraintSite) -> ConstraintRef {
+        let mut sites = self.constraint_sites.borrow_mut();
+        let id = ConstraintRef(sites.len() as u32);
+        sites.push(site);
+        id
+    }
+
     /// Seal all blocks, prune the ones unreachable from the entry
     /// (block 0), and remap successor ids.
     fn finish(
@@ -2130,6 +2239,7 @@ fn remap_terminator(t: &mut Terminator, remap: &[BlockId]) {
             m(on_fire);
             m(on_timeout);
         }
+        Terminator::Randomize { succ, .. } => m(succ),
         Terminator::Return | Terminator::Fatal(_) => {}
     }
 }
@@ -2273,7 +2383,13 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                     fill_expr(&mut a.expr, instance);
                 }
             }
-            Terminator::Jump(_) | Terminator::WaitTimePs(_, _) | Terminator::Return => {}
+            // Randomize carries no `TransactorState` placeholders, and
+            // never appears in a responder body (transactor-method
+            // randomize is out of subset) — nothing to fill.
+            Terminator::Randomize { .. }
+            | Terminator::Jump(_)
+            | Terminator::WaitTimePs(_, _)
+            | Terminator::Return => {}
         }
     }
     for block in &mut func.blocks {

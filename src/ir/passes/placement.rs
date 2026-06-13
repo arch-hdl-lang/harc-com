@@ -233,6 +233,8 @@ struct BlockFeatures {
     /// Terminator shape.
     suspends_cycles: bool,
     suspends_until: bool,
+    /// Block ends in `Terminator::Randomize` — a host-sync solve point.
+    solves: bool,
 }
 
 fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
@@ -242,6 +244,7 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
     let mut host_service_only = true;
     let mut suspends_cycles = false;
     let mut suspends_until = false;
+    let mut solves = false;
     fn touch(accesses: &mut Vec<PortAccess>, a: PortAccess) {
         if !accesses.contains(&a) {
             accesses.push(a);
@@ -370,6 +373,12 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
         Terminator::Fatal(args) => {
             visit_fmt(args, &mut accesses, &mut transactor);
         }
+        Terminator::Randomize { .. } => {
+            // Constraint solve is a host-service event: no DUT pins, no
+            // clock suspension. The solve runs on the host (or a
+            // pre-solved replay table) and control resumes at `succ`.
+            solves = true;
+        }
         Terminator::Jump(_) | Terminator::Return => {}
     }
     BlockFeatures {
@@ -379,6 +388,7 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
         has_transactor_call: transactor,
         suspends_cycles,
         suspends_until,
+        solves,
     }
 }
 
@@ -457,6 +467,12 @@ fn classify_tier(feat: &BlockFeatures, profile: &TargetProfile) -> PlacementTier
             PlacementTier::Tier1NearProcessor
         };
     }
+    // A constraint solve is a host service (the design's Example 2 places
+    // the Randomize block at Tier 2). It outranks the host-service-only
+    // check below, but cannot override a pin-bearing block above.
+    if feat.solves {
+        return PlacementTier::Tier2HostService;
+    }
     if feat.host_service_only {
         return PlacementTier::Tier2HostService;
     }
@@ -500,6 +516,23 @@ fn capability_check(
                 "cycle-exact DUT interaction, but profile `{}` has no cycle-locked \
                  execution site (Tier 1 is free-running and there is no Tier 0 to \
                  absorb it) — route the pin-level half through a transactor",
+                profile.name
+            ),
+        });
+    }
+    if feat.solves
+        && !profile.solve_device_rejection
+        && !profile.solve_replay_table
+        && !profile.solve_host_sync
+    {
+        out.push(PlacementDiag {
+            func: func.id,
+            func_name: func.name.clone(),
+            block,
+            message: format!(
+                "constraint solve (`randomize`), but profile `{}` offers no solve \
+                 strategy (no device-rejection, replay-table, or host-sync) — \
+                 pre-solve the stimulus or re-place this region",
                 profile.name
             ),
         });

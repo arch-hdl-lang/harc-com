@@ -298,6 +298,7 @@ pub(crate) fn lower_component_bodies(
     schema: &ComponentSchema,
     ctx: &LowerCtx,
     helpers: &helpers::HelperRegistry<'_>,
+    constraint_sites: &std::cell::RefCell<Vec<crate::ir::ConstraintSite>>,
 ) -> Result<Vec<TbFunction>, LowerError> {
     let (items, when_active): (&[ComponentItem], Option<&[ComponentItem]>) = match src {
         CompSource::Env(c) | CompSource::Scoreboard(c) => (&c.items, None),
@@ -311,7 +312,7 @@ pub(crate) fn lower_component_bodies(
         };
         let m = &schema.methods[method_idx];
         method_idx += 1;
-        let f = lower_method_body(h, m.function, cid, ctx, helpers)?;
+        let f = lower_method_body(h, m.function, cid, ctx, helpers, constraint_sites)?;
         funcs.push(f);
     }
     Ok(funcs)
@@ -323,8 +324,9 @@ fn lower_method_body(
     cid: ComponentId,
     ctx: &LowerCtx,
     helpers: &helpers::HelperRegistry<'_>,
+    constraint_sites: &std::cell::RefCell<Vec<crate::ir::ConstraintSite>>,
 ) -> Result<TbFunction, LowerError> {
-    let mut b = FuncBuilder::new(ctx, helpers);
+    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
     b.self_component = Some(cid);
     // Bind parameters as the first locals (the run/check convention: a
     // LocalId < params.len() *is* the i-th param). Same shape as a

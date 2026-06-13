@@ -35,9 +35,11 @@ use crate::ast::{
     TypeArg, TypeExpr,
 };
 use crate::ir::{
-    FunctionId, FunctionKind, TargetTlmMethodSchema, TbFunction, TbScalarFieldSchema, Terminator,
-    TransactorId, TransactorMethodSchema, TransactorSchema, TypedParam,
+    ConstraintSite, FunctionId, FunctionKind, TargetTlmMethodSchema, TbFunction,
+    TbScalarFieldSchema, Terminator, TransactorId, TransactorMethodSchema, TransactorSchema,
+    TypedParam,
 };
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 /// Lower one `transactor` declaration into a schema plus one
@@ -51,6 +53,7 @@ pub(crate) fn lower_transactor(
     helper_registry: &helpers::HelperRegistry<'_>,
     record_ctx: &LowerCtx,
     buses: &HashMap<String, &BusDecl>,
+    constraint_sites: &RefCell<Vec<ConstraintSite>>,
 ) -> Result<(TransactorSchema, Vec<TbFunction>), LowerError> {
     let tname = &t.name.name;
     if !t.params.is_empty() {
@@ -60,7 +63,14 @@ pub(crate) fn lower_transactor(
         ));
     }
     if t.bound_to.is_some() {
-        return lower_bound_target_transactor(t, next_fn, helper_registry, record_ctx, buses);
+        return lower_bound_target_transactor(
+            t,
+            next_fn,
+            helper_registry,
+            record_ctx,
+            buses,
+            constraint_sites,
+        );
     }
 
     // Walk always-on items then the `when active` body — the same
@@ -197,6 +207,12 @@ pub(crate) fn lower_transactor(
         target_state: HashMap::new(),
         components: Vec::new(),
         component_fields: HashMap::new(),
+        // A method body could host `randomize`, but the constraint-IR
+        // problem table only catalogs test/tseq sites — so these stay
+        // empty and a method-body `randomize` lowers with no problem-id
+        // (the nullptr-descriptor fallback, matching v1).
+        txn_keeps: HashMap::new(),
+        randomize_problem_ids: HashMap::new(),
     };
 
     let mut funcs = Vec::new();
@@ -210,7 +226,7 @@ pub(crate) fn lower_transactor(
         check_scalar_ty(tname, mname, "return type", h.return_ty.as_ref())?;
 
         let fid = FunctionId(next_fn.0 + funcs.len() as u32);
-        let mut b = FuncBuilder::new(&method_ctx, helper_registry);
+        let mut b = FuncBuilder::new(&method_ctx, helper_registry, constraint_sites);
         b.in_transactor_method = true;
         let mut params = Vec::with_capacity(h.params.len());
         for p in &h.params {
@@ -266,6 +282,7 @@ fn lower_bound_target_transactor(
     helper_registry: &helpers::HelperRegistry<'_>,
     record_ctx: &LowerCtx,
     buses: &HashMap<String, &BusDecl>,
+    constraint_sites: &RefCell<Vec<ConstraintSite>>,
 ) -> Result<(TransactorSchema, Vec<TbFunction>), LowerError> {
     let tname = &t.name.name;
     // Resolve the bound bus.
@@ -411,6 +428,10 @@ fn lower_bound_target_transactor(
         target_state: HashMap::new(),
         components: Vec::new(),
         component_fields: HashMap::new(),
+        // Responder bodies are not cataloged in the constraint-IR
+        // problem table; a `randomize` here lowers with no problem-id.
+        txn_keeps: HashMap::new(),
+        randomize_problem_ids: HashMap::new(),
     };
 
     let mut funcs = Vec::new();
@@ -468,7 +489,7 @@ fn lower_bound_target_transactor(
         }
 
         let fid = FunctionId(next_fn.0 + funcs.len() as u32);
-        let mut b = FuncBuilder::new(&body_ctx, helper_registry);
+        let mut b = FuncBuilder::new(&body_ctx, helper_registry, constraint_sites);
         b.target_state_fields = state_names.clone();
         let mut params = Vec::with_capacity(th.params.len());
         for p in &th.params {

@@ -169,7 +169,7 @@ Residual first-blocker map (re-run of `harc dump-ir`, 2026-06-12):
 | `scoreboard` (5) | `axilite_bound_mon_test`, `axilite_multi_payload_test`, `transactor_passive_only_test`, `transactor_agent_mode_test`, `transactor_env_mode_test` |
 | `sequencer` (1) | `axilite_connect_test` |
 | `relation` (1) | `relation_inlining_test` |
-| `randomize` (statement-level, 1) | `axilite_constraint_test` (`AxiLiteConstraintTest`) — now reaches the body and stops at `randomize(p) with`, which points at the constraint-IR seam |
+| `randomize` (statement-level, 1) | `axilite_constraint_test` (`AxiLiteConstraintTest`) — **RESOLVED 2026-06-13 by the randomize slice; registered, trace-clean. See the `randomize` group below.** |
 
 The blocker message reports whichever construct lowering hits first
 in file order, so the `transactor`-group counts above will keep
@@ -305,6 +305,9 @@ each fixture now stops at its REAL next blocker):
 |---|---|
 | `randomize` (constraint-IR seam) | `axilite_sb_test` |
 | `env` / `connect` composition + scoreboard methods | ~~`analysis_sink_connect_test`~~ **RESOLVED + registered 2026-06-13 (env-composition slice — scoreboard methods now lower as components)**; `axilite_env_test` (env now lowers; next blocker is `tseq`/`randomize`) |
+| `randomize` (constraint-IR seam) — **landed 2026-06-13**, but `axilite_sb_test`'s first blocker is the scoreboard `.push` method, not randomize | `axilite_sb_test` |
+| `env` / `connect` composition | `axilite_env_test`, `analysis_sink_connect_test` (also needs scoreboard methods + `event`/`emit`) |
+| scoreboard **methods** (per-instance state materialization — out of the data-only subset) | `analysis_sink_connect_test` |
 | passive transactor `on`-handlers (event-driven monitor) | `dma_engine_test` |
 | `queue<Struct>` element type (record-payload-in-queue seam) + transactor `on ... phase` | `scoreboard_typed_queue_test` |
 | `tseq` construct | `axilite_bound_mon_test`, `axilite_multi_payload_test` |
@@ -315,6 +318,40 @@ composite `ComponentSchema` with materialized instance state, unblocking
 `analysis_sink_connect_test`. The `queue<Struct>`
 (`scoreboard_typed_queue_test`) residual stays with this construct's
 owner; the rest belong to the `randomize` / `agent` / `tseq` slices.
+
+### `randomize` construct — **RESOLVED 2026-06-13 (randomize slice)**
+
+> ~~TB-IR lowering does not support `randomize` yet~~
+
+The randomize slice landed the **statement/terminator form** through the
+constraint-IR seam: `Terminator::Randomize { target, constraints:
+ConstraintRef, succ }` + a `TbProgram::constraint_sites` table the
+`ConstraintRef` indexes. Lowering merges transaction `keep`s ahead of
+the call-site `with {...}` body (spec §4) and records the
+`ConstraintProblemId` handle per site. The tbir backend reuses v1's
+Z3-solve emission verbatim (`cpp_tb::emit_randomize_snippets`) — see
+docs/tbir-mvp.md divergence 14.
+
+Two fixtures registered (both trace-clean v1↔tbir at seed 1):
+
+| Fixture | Form exercised |
+|---|---|
+| `keep_constraints_test` | bare `randomize(t)` + transaction-level `keep`s (range membership, `% 4 == 0` alignment, enum exclusion); 30 iterations, host-side asserts |
+| `axilite_constraint_test` (`AxiLiteConstraintTest`, + `axilite_regs_test.harc` helpers) | `randomize(p) with` cross-field Z3 constraints, drives AXI-Lite writes/reads |
+
+Residual randomize blockers (the stacked fixtures the seam does **not**
+yet unlock — each stops at a DIFFERENT construct's gate, not randomize):
+
+| Next blocker | Fixtures |
+|---|---|
+| scoreboard `.push(...)` method (per-instance state — out of the data-only scoreboard subset) | `axilite_sb_test` |
+| `tseq` construct | `axilite_fuzz_test` |
+| no SV DUT in the corpus (`let dut : DummyDut`; lowers + emits both codegens, but the equivalence harness needs a Verilator-buildable DUT) | `uint64_unique_randomize_test` |
+
+Also residual within the construct itself (precise rejections, not in
+these fixtures): the `randomize` **expression** form (`let v =
+randomize(t)`) and method-body randomize (the constraint-IR problem
+table only catalogs test/tseq sites).
 
 ### `struct` construct — 4 fixtures — **RESOLVED 2026-06-12 (struct slice)**
 

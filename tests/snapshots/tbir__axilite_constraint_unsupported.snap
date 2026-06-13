@@ -1,5 +1,0 @@
----
-source: tests/tbir.rs
-expression: msg
----
-TB-IR lowering does not support `randomize` yet (transaction randomization awaits the constraint-IR seam (`ConstraintRef` into src/constraints)); re-run with `--codegen v1`

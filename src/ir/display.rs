@@ -430,6 +430,16 @@ fn term_str(func: &TbFunction, t: &Terminator) -> String {
             on_fire.0,
             on_timeout.0
         ),
+        Terminator::Randomize {
+            target,
+            constraints,
+            succ,
+        } => format!(
+            "Randomize {{ {}, constraints: c{}, b{} }}",
+            local_str(func, *target),
+            constraints.0,
+            succ.0
+        ),
         Terminator::Return => "Return".to_string(),
         Terminator::Fatal(args) => format!("Fatal({})", fmt_args_str(func, args)),
     }

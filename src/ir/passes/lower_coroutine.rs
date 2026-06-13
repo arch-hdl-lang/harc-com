@@ -93,6 +93,11 @@ pub enum Trigger {
     PredsHold { preds: Vec<PredSrc>, mode: WaitMode },
     /// `WaitUntilTimeout` cycle budget expired first.
     Timeout { cycles: Expr },
+    /// `Randomize` reached — a potential host-sync point. On a
+    /// split backend the constraint solve runs at the host service tier
+    /// (or a pre-solved replay table), then control resumes; the
+    /// `ConstraintRef` names the solve site.
+    Solved { constraints: crate::ir::ConstraintRef },
     /// `Return` reached — coroutine finished.
     Done,
     /// `Fatal` reached — simulation aborts.
@@ -177,6 +182,8 @@ fn resume_successors(t: &Terminator) -> Vec<BlockId> {
             on_timeout,
             ..
         } => vec![*on_fire, *on_timeout],
+        // Randomize is a host-sync point: its `succ` is a resume block.
+        Terminator::Randomize { succ, .. } => vec![*succ],
         Terminator::Jump(_)
         | Terminator::Branch(..)
         | Terminator::Return
@@ -320,6 +327,16 @@ fn collapse(
                 to: state_at(*on_timeout),
             });
         }
+        Terminator::Randomize {
+            constraints, succ, ..
+        } => out.push(Transition {
+            from,
+            guard: guard.clone(),
+            trigger: Trigger::Solved {
+                constraints: *constraints,
+            },
+            to: state_at(*succ),
+        }),
         Terminator::Return => out.push(Transition {
             from,
             guard: guard.clone(),
@@ -401,6 +418,7 @@ fn trigger_str(func: &TbFunction, t: &Trigger) -> String {
             format!("preds({}) [{}]", ps.join(", "), mode_str(mode))
         }
         Trigger::Timeout { cycles } => format!("timeout({})", expr_str(func, cycles)),
+        Trigger::Solved { constraints } => format!("randomize(c{})", constraints.0),
         Trigger::Done => "return".to_string(),
         Trigger::Fatal => "fatal".to_string(),
     }
