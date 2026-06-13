@@ -128,3 +128,4 @@ probe_force_test | CpuPipe | cpu_pipeline.sv | - | pass
 testbench_probe_dut_test | CpuPipe | cpu_pipeline.sv | - | pass
 axilite_connect_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 mshr_cocotb_test | cache_mshr | cache_mshr.sv | - | pass
+transactor_bound_initiator_state_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass

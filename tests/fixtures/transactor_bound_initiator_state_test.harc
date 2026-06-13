@@ -1,0 +1,118 @@
+// Self-proving bound-to INITIATOR BFM transactor that ALSO carries
+// persistent scalar state.
+//
+// PR #375 added the bound-to initiator BFM (`transactor X bound to
+// <Bus>` with `hookable` methods that drive the bound bus's handshake
+// channels), but it rejected any state field. PR #381 added scalar
+// state for the UNBOUND DUT-poking form, and #371 for the bound-to
+// TARGET responder. This fixture closes the remaining gap: a bound-to
+// INITIATOR BFM that caches a per-instance scalar (`last_read`,
+// `read_count`) across method calls.
+//
+// `AxilHelper bound to BusAxiLite` exposes `write(addr, data)` and
+// `read(addr) -> data`. The `read` body, besides returning the bus
+// readback, latches it into `last_read` and bumps `read_count`. The
+// test then reads those state fields back as `helper.last_read` /
+// `helper.read_count` — proving the per-instance state struct is
+// shared between the (type-shared) method body and the test scope,
+// exactly like the unbound and bound-target forms.
+//
+// Both C++ emitters (`--codegen v1` and `--codegen tbir`) must agree:
+// same verdict + zero trace-diff divergences.
+
+use BusAxiLite
+
+transactor AxilHelper bound to BusAxiLite
+    // Persistent per-instance state, carried across `read` calls.
+    last_read  : uint<32> default 0
+    read_count : uint<32> default 0
+
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            bus.aw.addr = addr
+            bus.aw.valid = 1
+            bus.w.send(data, 15)         // data, strb=0xF (full word write)
+            bus.aw.valid = 0
+            wait 1 cycle
+        end write
+
+        hookable read(addr: uint<8>) -> uint<32>
+            bus.ar.addr = addr
+            bus.ar.valid = 1
+            let r = bus.r.recv()         // struct { data, resp }
+            bus.ar.valid = 0
+            wait 1 cycle
+            // Cache the readback into per-instance state before
+            // returning it.
+            last_read = r.data
+            read_count = read_count + 1
+            return r.data
+        end read
+    end when
+end transactor AxilHelper
+
+testbench TransactorBoundInitiatorStateTb
+    dut : AxiLiteRegs
+end testbench TransactorBoundInitiatorStateTb
+
+impl TransactorBoundInitiatorStateTest for TransactorBoundInitiatorStateTb
+    let axil   : BusAxiLite = bind dut
+    let helper : AxilHelper active = bind axil
+
+    run
+        // ── Reset ────────────────────────────────────────────────
+        dut.rst = 1
+        axil.aw.valid = 0
+        axil.w.valid = 0
+        axil.b.ready = 1
+        axil.ar.valid = 0
+        axil.r.ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Before any read, the state fields hold their declared
+        // defaults.
+        assert helper.last_read == 0
+            else fail("pre-read last_read=${helper.last_read}, expected 0")
+        assert helper.read_count == 0
+            else fail("pre-read read_count=${helper.read_count}, expected 0")
+
+        // Write then read back MM2S_SA = 0xDEAD1000.
+        helper.write(24, 3735879680)
+        let sa = helper.read(24)
+        assert sa == 3735879680
+            else fail("MM2S_SA readback=${sa}, expected 0xDEAD1000")
+
+        // The read body cached the readback into `last_read` and
+        // bumped `read_count` — observable at test scope.
+        assert helper.last_read == 3735879680
+            else fail("last_read=${helper.last_read}, expected 0xDEAD1000")
+        assert helper.read_count == 1
+            else fail("read_count=${helper.read_count}, expected 1")
+
+        // Write then read back MM2S_LENGTH = 16.
+        helper.write(40, 16)
+        let len = helper.read(40)
+        assert len == 16
+            else fail("MM2S_LENGTH readback=${len}, expected 16")
+
+        // State updated again: most-recent readback + one more count.
+        assert helper.last_read == 16
+            else fail("last_read=${helper.last_read}, expected 16")
+        assert helper.read_count == 2
+            else fail("read_count=${helper.read_count}, expected 2")
+
+        log(info, "PASS: bound-to initiator BFM cached state across read calls")
+    end run
+end impl TransactorBoundInitiatorStateTest

@@ -1892,20 +1892,24 @@ fn lower_test(
     let mut stateful_type_seen: HashMap<u32, String> = HashMap::new();
     for (field, xid) in &transactor_fields {
         let xschema = &prog.transactors[xid.index()];
-        // Bound-to target instances are handled above (they appear in
-        // `target_state`, not `transactor_fields`); a stateless unbound
-        // transactor has no per-instance struct.
-        if xschema.bound_bus.is_some() || xschema.state_fields.is_empty() {
+        // Bound-to TARGET instances are handled above (they appear in
+        // `target_state` via `target_tlm_binds`, NOT in
+        // `transactor_fields`); a stateless transactor has no per-instance
+        // struct. The only `bound_bus.is_some()` entries here are bound-to
+        // INITIATOR BFMs (added to `transactor_fields` alongside the bus-
+        // prefix fill), so they share this per-instance state machinery
+        // with the unbound DUT-poking form.
+        if xschema.state_fields.is_empty() {
             continue;
         }
         let xname = xschema.name.clone();
         if let Some(prev) = stateful_type_seen.get(&xid.0) {
             return Err(unsupported(
                 &format!(
-                    "stateful unbound transactor `{xname}` instantiated more than once \
+                    "stateful transactor `{xname}` instantiated more than once \
                      (`{prev}`, `{field}`)"
                 ),
-                "the unbound state-field subset shares one method body per transactor \
+                "the state-field subset shares one method body per transactor \
                  type; multiple stateful instances need per-instance bodies",
             ));
         }
@@ -1934,10 +1938,10 @@ fn lower_test(
             {
                 return Err(unsupported(
                     &format!(
-                        "stateful unbound transactor `{xname}` instantiated more than once \
+                        "stateful transactor `{xname}` instantiated more than once \
                          (`{prev}`, `{field}`)"
                     ),
-                    "the unbound state-field subset shares one method body per transactor \
+                    "the state-field subset shares one method body per transactor \
                      type; multiple stateful instances need per-instance bodies",
                 ));
             }
