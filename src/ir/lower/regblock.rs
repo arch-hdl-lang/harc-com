@@ -45,7 +45,7 @@ use super::{LowerError, unsupported};
 use crate::ast::{CallArg, ExprKind, RegAccess as AstRegAccess, RegblockDecl};
 use crate::ir::{
     self, BinOp, Expr, FmtArg, FmtArgs, IrType, RecordFieldSchema, RecordId, RecordSchema,
-    RegAccess, RegRegisterSchema, RegblockSchema, Stmt,
+    RegAccess, RegFieldSchema, RegRegisterSchema, RegblockSchema, Stmt, UnOp,
 };
 
 /// Per-binding context for register access resolution. Built at the
@@ -80,18 +80,48 @@ pub(crate) fn lower_regblock(
                 "regblock `{name}` declares register `{rname}` more than once"
             )));
         }
-        if !reg.fields.is_empty() {
-            return Err(unsupported(
-                &format!("field-level decomposition in regblock `{name}` register `{rname}`"),
-                "only register-level access (`regs.NAME`) is lowered",
-            ));
-        }
         let width = reg.width.unwrap_or(default_w);
         if width == 0 || width > 64 {
             return Err(unsupported(
                 &format!("regblock `{name}` register `{rname}` width {width}"),
                 "the tbir value model is 64-bit; register widths must be 1..=64",
             ));
+        }
+        // Field-level decomposition: lower each `field N : T @ <pos>`
+        // into its mask/shift metadata. The mirror stays whole-register
+        // (one record field per register); field access is a masked
+        // read-modify-write on that cell, mirroring v1's bit-slice
+        // extract/insert.
+        let mut reg_fields: Vec<RegFieldSchema> = Vec::new();
+        for fld in &reg.fields {
+            let fname = &fld.name.name;
+            if reg_fields.iter().any(|x| x.name == *fname) {
+                return Err(LowerError::Invalid(format!(
+                    "regblock `{name}` register `{rname}` declares field `{fname}` more than once"
+                )));
+            }
+            let bit_width = field_bit_width(&fld.ty);
+            if bit_width == 0 {
+                return Err(unsupported(
+                    &format!(
+                        "regblock `{name}` register `{rname}` field `{fname}` of zero width"
+                    ),
+                    "",
+                ));
+            }
+            if fld.bit_pos as u64 + bit_width as u64 > width as u64 {
+                return Err(LowerError::Invalid(format!(
+                    "regblock `{name}` register `{rname}` field `{fname}` ([{}+:{bit_width}]) \
+                     exceeds the register width {width}",
+                    fld.bit_pos
+                )));
+            }
+            reg_fields.push(RegFieldSchema {
+                name: fname.clone(),
+                bit_pos: fld.bit_pos,
+                bit_width,
+                access: lower_access(fld.access),
+            });
         }
         let offset = fold_offset(name, rname, &reg.offset)?;
         let reset = match &reg.reset {
@@ -125,6 +155,7 @@ pub(crate) fn lower_regblock(
             offset,
             width,
             access,
+            fields: reg_fields,
         });
     }
     if registers.is_empty() {
@@ -143,6 +174,29 @@ pub(crate) fn lower_regblock(
         registers,
     };
     Ok((record_schema, schema))
+}
+
+/// Field bit-width from its type, mirroring v1's `field_bit_width`:
+/// `bit`/`bool` → 1; `uint<N>`/`sint<N>`/`bits<N>` → N; any other shape
+/// → 1 (the conservative single-bit fallback v1 also uses, e.g. for an
+/// unparameterized or enum-typed field). Width is folded only from a
+/// plain integer literal type-arg — the corpus uses literals exclusively.
+fn field_bit_width(t: &crate::ast::TypeExpr) -> u32 {
+    use crate::ast::{BuiltinTy, TypeArg, TypeExpr};
+    let TypeExpr::Builtin { name, args, .. } = t else {
+        return 1;
+    };
+    match name {
+        BuiltinTy::Bit | BuiltinTy::Bool | BuiltinTy::BoolLower => 1,
+        BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits => match args.first() {
+            Some(TypeArg::Expr(e)) => match &*e.kind {
+                ExprKind::Int(s) => s.replace('_', "").parse::<u32>().unwrap_or(1),
+                _ => 1,
+            },
+            _ => 1,
+        },
+        _ => 1,
+    }
 }
 
 fn lower_access(a: AstRegAccess) -> RegAccess {
@@ -204,6 +258,24 @@ impl super::FuncBuilder<'_> {
                 "regblock binding `{binding}` is not in scope at its write site"
             )));
         };
+        self.lower_reg_write(local, &bctx.helper_field, &reg, value)
+    }
+
+    /// Shared register-level write lowering for the flat regblock
+    /// (`regs.REG`) and addrmap (`chip.inst.REG`) paths. `mirror` is the
+    /// whole-register mirror local; `reg.offset` is the effective bus
+    /// offset.
+    ///
+    /// Lowering (RW/WO): mirror `RecordFieldWrite` then a discarded
+    /// `Helper.write(off, value)` call edge. RO: mirror update only —
+    /// the bus write is suppressed (v1's `ro` semantics).
+    pub(crate) fn lower_reg_write(
+        &mut self,
+        mirror: ir::LocalId,
+        helper_field: &str,
+        reg: &RegRegisterSchema,
+        value: &crate::ast::Expr,
+    ) -> Result<bool, LowerError> {
         // Lower the value ONCE (port-hoisted like Assign), into a temp
         // when needed so both the mirror update and the frontdoor write
         // observe the same value. v1 emits the user expression at both
@@ -221,15 +293,207 @@ impl super::FuncBuilder<'_> {
             v
         };
         self.push(Stmt::RecordFieldWrite {
-            local,
+            local: mirror,
             field: reg.name.clone(),
             value: v.clone(),
         });
         if writes_bus {
-            let call = self.regblock_call(&bctx.helper_field, "write", vec![lit(reg.offset), v])?;
+            let call = self.regblock_call(helper_field, "write", vec![lit(reg.offset), v])?;
             self.push(Stmt::TransactorCall { dest: None, call });
         }
         Ok(true)
+    }
+
+    /// `regs.REG.FIELD = value` field-level frontdoor write. Returns
+    /// `Ok(true)` when `target` is a field write on a regblock binding
+    /// (and lowers it), `Ok(false)` when `target` is not a regblock
+    /// field access.
+    ///
+    /// Lowering mirrors v1's bit-slice insert: read-modify-write the
+    /// whole-register mirror cell (mask out the FIELD bits, OR in the
+    /// new value shifted to POS) then, for a bus-writing field, a
+    /// full-register `Helper.write(off, mirror.REG)` (v1 writes the
+    /// updated whole-register word, not the field). RO fields update the
+    /// mirror only — the bus write is suppressed.
+    pub(crate) fn try_lower_regblock_subfield_write(
+        &mut self,
+        target: &crate::ast::Expr,
+        value: &crate::ast::Expr,
+    ) -> Result<bool, LowerError> {
+        let Some((binding, reg, fld)) = self.as_regblock_subfield(target) else {
+            return Ok(false);
+        };
+        let bctx = self.ctx.regblock_bindings[&binding].clone();
+        let Some(local) = self.lookup(&binding) else {
+            return Err(LowerError::Invalid(format!(
+                "regblock binding `{binding}` is not in scope at its field-write site"
+            )));
+        };
+        self.lower_field_write(local, &bctx.helper_field, &reg, &fld, value)
+    }
+
+    /// Shared field-level write lowering for both the flat regblock
+    /// (`regs.REG.FIELD`) and addrmap (`chip.inst.REG.FIELD`) paths.
+    /// `mirror` is the whole-register mirror local; `offset` is the
+    /// effective bus offset (regblock: reg offset; addrmap: base +
+    /// reg offset).
+    pub(crate) fn lower_field_write(
+        &mut self,
+        mirror: ir::LocalId,
+        helper_field: &str,
+        reg: &RegRegisterSchema,
+        fld: &RegFieldSchema,
+        value: &crate::ast::Expr,
+    ) -> Result<bool, LowerError> {
+        let v = self.lower_expr_no_ports(value)?;
+        let mask = field_mask(fld.bit_width);
+        let pos = fld.bit_pos as u64;
+        let cur = Expr::RecordField {
+            local: mirror,
+            field: reg.name.clone(),
+        };
+        // (mirror.REG & ~(mask << pos)) | ((v & mask) << pos)
+        let cleared = bin(
+            BinOp::BitAnd,
+            cur,
+            Expr::Unary(UnOp::BitNot, Box::new(lit(mask << pos))),
+        );
+        let inserted = bin(
+            BinOp::Shl,
+            bin(BinOp::BitAnd, v, lit(mask)),
+            lit(pos),
+        );
+        let new_word = bin(BinOp::BitOr, cleared, inserted);
+        self.push(Stmt::RecordFieldWrite {
+            local: mirror,
+            field: reg.name.clone(),
+            value: new_word,
+        });
+        if fld.access.writes_to_bus() {
+            // Full-register bus write of the updated mirror word.
+            let word = Expr::RecordField {
+                local: mirror,
+                field: reg.name.clone(),
+            };
+            let call = self.regblock_call(helper_field, "write", vec![lit(reg.offset), word])?;
+            self.push(Stmt::TransactorCall { dest: None, call });
+        }
+        Ok(true)
+    }
+
+    /// `let x = regs.REG.FIELD` field-level frontdoor read, declaring a
+    /// fresh local `dest_name`. Returns `Ok(true)` when `value` is a
+    /// field read on a regblock binding.
+    pub(crate) fn try_lower_regblock_subfield_read_let(
+        &mut self,
+        dest_name: &str,
+        value: &crate::ast::Expr,
+    ) -> Result<bool, LowerError> {
+        let Some((binding, reg, fld)) = self.as_regblock_subfield(value) else {
+            return Ok(false);
+        };
+        let bctx = self.ctx.regblock_bindings[&binding].clone();
+        let Some(mirror) = self.lookup(&binding) else {
+            return Err(LowerError::Invalid(format!(
+                "regblock binding `{binding}` is not in scope at its field-read site"
+            )));
+        };
+        let helper_ty = self.regblock_helper_type(&bctx.helper_field, "read", 1)?;
+        let extract = self.field_read_expr(mirror, &helper_ty, &reg, &fld);
+        let id = self.declare(dest_name);
+        self.push(Stmt::Assign(id, extract));
+        Ok(true)
+    }
+
+    /// Build the field-extract expression: `((mirror.REG = <H>_read(off))
+    /// >> POS) & MASK` for a bus-reading field (one bus read + mirror
+    /// predict, then bit-extract), or `(mirror.REG >> POS) & MASK` for a
+    /// WO field (mirror-only). Mirrors v1's shifted read.
+    pub(crate) fn field_read_expr(
+        &self,
+        mirror: ir::LocalId,
+        helper_ty: &str,
+        reg: &RegRegisterSchema,
+        fld: &RegFieldSchema,
+    ) -> Expr {
+        let mask = field_mask(fld.bit_width);
+        let pos = fld.bit_pos as u64;
+        let word = if fld.access.reads_from_bus() {
+            Expr::RegRead {
+                mirror,
+                helper_ty: helper_ty.to_string(),
+                field: reg.name.clone(),
+                offset: reg.offset,
+                reads_bus: true,
+            }
+        } else {
+            Expr::RecordField {
+                local: mirror,
+                field: reg.name.clone(),
+            }
+        };
+        bin(BinOp::BitAnd, bin(BinOp::Shr, word, lit(pos)), lit(mask))
+    }
+
+    /// Lower a field read in a general EXPRESSION position (assert
+    /// condition / format arg) — `regs.REG.FIELD` that is NOT a
+    /// `let`-RHS. Returns the field-extract expression. The bus-read
+    /// count matches v1: one read per textual occurrence.
+    pub(crate) fn lower_regblock_subfield_read_expr(
+        &self,
+        binding: &str,
+        reg_name: &str,
+        fld_name: &str,
+    ) -> Result<Expr, LowerError> {
+        let bctx = &self.ctx.regblock_bindings[binding];
+        let reg = bctx
+            .registers
+            .iter()
+            .find(|r| r.name == reg_name)
+            .expect("as_regblock_subfield validated the register");
+        let fld = reg
+            .fields
+            .iter()
+            .find(|f| f.name == fld_name)
+            .expect("as_regblock_subfield validated the field")
+            .clone();
+        let Some(mirror) = self.lookup(binding) else {
+            return Err(LowerError::Invalid(format!(
+                "regblock binding `{binding}` is not in scope at its field-read site"
+            )));
+        };
+        let helper_ty = self.regblock_helper_type(&bctx.helper_field, "read", 1)?;
+        Ok(self.field_read_expr(mirror, &helper_ty, reg, &fld))
+    }
+
+    /// `Some((binding, register, field))` when `e` is a three-level
+    /// `<binding>.<REG>.<FIELD>` access on a regblock binding where REG
+    /// is a register and FIELD is one of its declared fields.
+    pub(crate) fn as_regblock_subfield(
+        &self,
+        e: &crate::ast::Expr,
+    ) -> Option<(String, RegRegisterSchema, RegFieldSchema)> {
+        let ExprKind::Field {
+            target: mid,
+            name: fld_name,
+        } = &*e.kind
+        else {
+            return None;
+        };
+        let ExprKind::Field {
+            target: outer,
+            name: reg_name,
+        } = &*mid.kind
+        else {
+            return None;
+        };
+        let ExprKind::Ident(id) = &*outer.kind else {
+            return None;
+        };
+        let bctx = self.ctx.regblock_bindings.get(&id.name)?;
+        let reg = bctx.registers.iter().find(|r| r.name == reg_name.name)?;
+        let fld = reg.fields.iter().find(|f| f.name == fld_name.name)?;
+        Some((id.name.clone(), reg.clone(), fld.clone()))
     }
 
     /// `bitbash(regs)` — compile-time-unrolled walk-all over the
@@ -346,8 +610,23 @@ impl super::FuncBuilder<'_> {
                 "regblock binding `{binding}` is not in scope at its read site"
             )));
         };
+        self.lower_reg_read_let(mirror, &bctx.helper_field, dest_name, &reg)?;
+        Ok(true)
+    }
+
+    /// Shared register-level `let`-read lowering for the flat regblock
+    /// (`regs.REG`) and addrmap (`chip.inst.REG`) paths. `mirror` is the
+    /// whole-register mirror local; `reg.offset` is the effective bus
+    /// offset.
+    pub(crate) fn lower_reg_read_let(
+        &mut self,
+        mirror: ir::LocalId,
+        helper_field: &str,
+        dest_name: &str,
+        reg: &RegRegisterSchema,
+    ) -> Result<(), LowerError> {
         if reg.access.reads_from_bus() {
-            let call = self.regblock_call(&bctx.helper_field, "read", vec![lit(reg.offset)])?;
+            let call = self.regblock_call(helper_field, "read", vec![lit(reg.offset)])?;
             let id = self.declare(dest_name);
             self.push(Stmt::TransactorCall {
                 dest: Some(id),
@@ -370,7 +649,7 @@ impl super::FuncBuilder<'_> {
                 },
             ));
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Lower a register read in a general EXPRESSION position (an assert
@@ -404,14 +683,38 @@ impl super::FuncBuilder<'_> {
         // `<helper_ty>_read`) and validate the `read` method/arity, the
         // same way `regblock_call` does for the statement paths.
         let helper_ty = self.regblock_helper_type(&bctx.helper_field, "read", 1)?;
-        Ok(Expr::RegRead {
+        Ok(self.reg_read_expr(mirror, &helper_ty, reg))
+    }
+
+    /// Shared register-level read-expression for the flat regblock
+    /// (`regs.REG`) and addrmap (`chip.inst.REG`) paths. Returns v1's
+    /// inline assignment-expression `RegRead`.
+    pub(crate) fn reg_read_expr(
+        &self,
+        mirror: ir::LocalId,
+        helper_ty: &str,
+        reg: &RegRegisterSchema,
+    ) -> Expr {
+        Expr::RegRead {
             mirror,
-            helper_ty,
+            helper_ty: helper_ty.to_string(),
             field: reg.name.clone(),
             offset: reg.offset,
             reads_bus: reg.access.reads_from_bus(),
-        })
+        }
     }
+
+    /// Public accessor for the `via`-helper type resolution, shared with
+    /// the addrmap path.
+    pub(crate) fn regblock_helper_type_pub(
+        &self,
+        helper_field: &str,
+        method: &str,
+        arity: usize,
+    ) -> Result<String, LowerError> {
+        self.regblock_helper_type(helper_field, method, arity)
+    }
+
 
     /// Resolve a regblock `via` helper field to its transactor TYPE name,
     /// validating the named method exists at `arity`. Shared by the
@@ -525,9 +828,14 @@ impl super::FuncBuilder<'_> {
                 }
                 _ => "a call on a regblock binding".to_string(),
             },
-            // `regs.REG.FIELD` — three-level field-level access.
+            // `regs.REG.FIELD` — three-level field-level access. Reaches
+            // here only when the register or the field is undeclared
+            // (valid fields are lowered upstream).
             ExprKind::Field { target, name } if matches!(&*target.kind, ExprKind::Field { .. }) => {
-                format!("field-level access `regs.<reg>.{}`", name.name)
+                format!(
+                    "field-level access `regs.<reg>.{}` (no such register/field)",
+                    name.name
+                )
             }
             ExprKind::Field { name, .. } => format!(
                 "access to `{}.{}` (not a declared register)",
@@ -537,10 +845,10 @@ impl super::FuncBuilder<'_> {
         };
         Err(unsupported(
             &format!("{detail} (regblock `{binding}`)"),
-            "register-level `regs.NAME = v` writes, `regs.NAME` reads (incl. assert/format \
-             positions), and `bitbash(regs)` are lowered; field-level access, the \
-             `record_write`/`record_read` API, per-register `on` callbacks, and `addrmap` \
-             composition are follow-up slices",
+            "register-level `regs.NAME = v` writes/`regs.NAME` reads, field-level \
+             `regs.REG.FIELD` writes/reads (incl. assert/format positions), and \
+             `bitbash(regs)` are lowered; the `record_write`/`record_read` API and \
+             per-register `on` callbacks are follow-up slices",
         ))
     }
 
@@ -588,6 +896,22 @@ fn lit(v: u64) -> Expr {
     Expr::Literal {
         value: v,
         ty: IrType::Unknown,
+    }
+}
+
+fn bin(op: BinOp, a: Expr, b: Expr) -> Expr {
+    Expr::Binary(op, Box::new(a), Box::new(b))
+}
+
+/// Right-aligned bit mask for a `width`-bit field. Mirrors v1's
+/// `field_mask_literal`: clamped at 32 bits (Phase 1b fields cap at
+/// register width 32, so a wider mask never arises in the corpus; the
+/// 64-bit mirror makes the clamp value-identical for the fixtures).
+fn field_mask(width: u32) -> u64 {
+    if width >= 32 {
+        0xFFFF_FFFF
+    } else {
+        (1u64 << width) - 1
     }
 }
 

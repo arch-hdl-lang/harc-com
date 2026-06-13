@@ -183,6 +183,28 @@ pub struct RegRegisterSchema {
     /// Register width in bits (explicit `width` or the regblock default).
     pub width: u32,
     pub access: RegAccess,
+    /// Named bit-fields declared inside the register (`field N : T @
+    /// <pos>`), in declaration order. Empty for the single-line register
+    /// form. Field-level access (`regs.REG.FIELD`) lowers to a masked
+    /// read-modify-write on the whole-register mirror cell plus
+    /// full-register bus traffic, mirroring v1's bit-slice
+    /// extract/insert. See `src/ir/lower/regblock.rs`.
+    pub fields: Vec<RegFieldSchema>,
+}
+
+/// One named bit-field inside a register (`field NAME : T @ <pos>
+/// [access P]`). The mirror stays whole-register; this carries the
+/// mask/shift metadata the field-level access lowering needs.
+#[derive(Debug, Clone)]
+pub struct RegFieldSchema {
+    pub name: String,
+    /// LSB bit position inside the parent register.
+    pub bit_pos: u32,
+    /// Field width in bits (derived from the field type).
+    pub bit_width: u32,
+    /// Field access policy (the field's own, defaulting to the
+    /// register's policy when the field decl omits an `access` clause).
+    pub access: RegAccess,
 }
 
 /// Register access policy, mirroring `ast::RegAccess`. Duplicated into

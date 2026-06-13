@@ -479,10 +479,18 @@ impl FuncBuilder<'_> {
         if self.try_lower_regblock_read_let(&l.name.name, value)? {
             return Ok(());
         }
+        // RAL frontdoor field-level read: `let v = regs.REG.FIELD`.
+        if self.try_lower_regblock_subfield_read_let(&l.name.name, value)? {
+            return Ok(());
+        }
+        // RAL addrmap read: `let v = chip.inst.REG[.FIELD]`.
+        if self.try_lower_addrmap_read_let(&l.name.name, value)? {
+            return Ok(());
+        }
         // Any other regblock-binding access in `let`-RHS position
-        // (field-level `regs.REG.FIELD`, an unknown register) is out of
-        // subset — reject precisely.
+        // (an unknown register) is out of subset — reject precisely.
         self.reject_out_of_subset_regblock_access(value, "read")?;
+        self.reject_out_of_subset_addrmap_access(value, "read")?;
         // Testbench method call RHS: `let x = _tb.m(...)`, CFG-inlined.
         if self.try_lower_tb_method_let(&l.name.name, value)? {
             return Ok(());
@@ -579,11 +587,20 @@ impl FuncBuilder<'_> {
         if self.try_lower_regblock_write(target, value)? {
             return Ok(());
         }
+        // RAL frontdoor field-level write: `regs.REG.FIELD = expr`.
+        if self.try_lower_regblock_subfield_write(target, value)? {
+            return Ok(());
+        }
+        // RAL addrmap write: `chip.inst.REG[.FIELD] = expr`.
+        if self.try_lower_addrmap_write(target, value)? {
+            return Ok(());
+        }
         // A write to a regblock binding that is NOT a known register
-        // (`regs.FOO = ...` for an undeclared register, or a field-level
-        // `regs.REG.FIELD = ...` access) is out of subset — reject
-        // precisely rather than fall through and mis-lower.
+        // (`regs.FOO = ...` for an undeclared register) is out of
+        // subset — reject precisely rather than fall through and
+        // mis-lower.
         self.reject_out_of_subset_regblock_access(target, "write")?;
+        self.reject_out_of_subset_addrmap_access(target, "write")?;
         if self.lower_transactor_dut_bind(target, value)? {
             return Ok(());
         }

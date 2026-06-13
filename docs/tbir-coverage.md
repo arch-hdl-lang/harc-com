@@ -121,7 +121,7 @@ Residual first-blocker map for the other 16 (re-run of
 | Moved to group | Fixtures |
 |---|---|
 | `bus` (3) | `axilite_regs_full_test`, `bind_remap_test`, `transactor_parse_test` |
-| `regblock` (7) | `regblock_basic_test`, `regblock_fields_test`, `regblock_access_test`, `regblock_bitbash_test`, `regblock_addrmap_test`, `regblock_alias_test`, `regblock_record_test` — **regblock slice landed 2026-06-12; bus-bound `via` helper (initiator-side BFM) + the regblock-residuals slice (register read in assert/format → `Expr::RegRead`; `bitbash(regs)`) landed 2026-06-13. `regblock_access_test`, `regblock_basic_test`, and `regblock_bitbash_test` now fully lower and are registered; the rest advance to deeper regblock residuals (record-API/callbacks, field-level, addrmap) — see the `regblock` construct group below.** |
+| `regblock` (7) | `regblock_basic_test`, `regblock_fields_test`, `regblock_access_test`, `regblock_bitbash_test`, `regblock_addrmap_test`, `regblock_alias_test`, `regblock_record_test` — **regblock slice landed 2026-06-12; bus-bound `via` helper (initiator-side BFM) + the regblock-residuals slice (register read in assert/format → `Expr::RegRead`; `bitbash(regs)`) + the field-level/addrmap slice (`regs.REG.FIELD` masked RMW; `addrmap` 3-/4-level access; `alias of`) landed 2026-06-13. SIX of the eight regblock fixtures now fully lower and are registered (`access`, `basic`, `bitbash`, `fields`, `addrmap`, `alias`); only `record_test`/`record_recursion_test` (passive `record_*` API + `on regs.REG` callbacks) remain residual — see the `regblock` construct group below.** |
 | `scoreboard` (2) | `analysis_sink_connect_test`, `axilite_env_test` |
 | ~~`tseq` (2)~~ → deeper | `axilite_seqdrv_test`, `transactor_active_test` — **tseq slice landed 2026-06-13; both lower their `tseq` now, and the transactor-state-field slice (2026-06-13) advanced `axilite_seqdrv_test` past its state field too — both now stop at an event field: `axilite_seqdrv_test` → `req : in event<RegOp>` (event-driven unbound transactor), `transactor_active_test` → bound-to transactor event field — see the `tseq` construct group below** |
 | ~~transactor state fields (1)~~ → deeper | `axilite_hooks_test` — **transactor-state-field slice landed 2026-06-13; the `last_read` state field now lowers, advancing to the next blocker: a record-typed (transaction) method param `send(t: RegOp)` + statement-level pre/post hooks** |
@@ -138,7 +138,7 @@ with this construct's owner.
 its former `const` blocker is resolved, the next blocker is its
 `MshrXactor` transactor).*
 
-### `regblock` construct — PARTIALLY RESOLVED (regblock slice 2026-06-12; bus-bound BFM + residuals 2026-06-13)
+### `regblock` construct — PARTIALLY RESOLVED (regblock slice 2026-06-12; bus-bound BFM + residuals + field-level/addrmap 2026-06-13)
 
 The `regblock` register-level frontdoor subset now lowers (synthetic
 mirror value-record + `RegblockSchema`; `regs.NAME = v` / `let x =
@@ -148,7 +148,13 @@ wo policies + reset values + read-side mirror predict; both test-scope
 unbound-transactor AND bus-bound initiator-BFM helpers). The
 **regblock-residuals slice (2026-06-13)** added register reads in
 assert/`${...}` format positions (`Expr::RegRead`) and `bitbash(regs)`
-(plus `Expr::ErrorCount`) — see docs/tbir-mvp.md divergences 12 + 20.
+(plus `Expr::ErrorCount`). The **field-level/addrmap slice (2026-06-13)**
+added field-level decomposition (`regs.REG.FIELD` — masked RMW on the
+whole-register mirror + full-register bus write; shifted extract read;
+no new IR), the `addrmap` construct (3-level `chip.inst.REG` + 4-level
+`chip.inst.REG.FIELD`, each instance a shifted-offset mirror local), and
+`alias of` (the alias shares its target's mirror cell). See
+docs/tbir-mvp.md divergences 12 + 20 + 21.
 
 The first-blocker caveat applied in full: **zero** of the 7 corpus
 fixtures became fully lowerable — every one's `via` helper is a
@@ -172,29 +178,30 @@ lowers). The other three BFM-helper fixtures advance to their *next*
 regblock residual (none is the BFM any more).
 
 Residual first-blocker map (re-run of `harc dump-ir`, 2026-06-13, after
-the regblock-residuals slice):
+the field-level/addrmap slice):
 
 | Next blocker | Fixtures |
 |---|---|
 | **(resolved)** initiator-side bus-bound `via` helper | ~~all below~~ — lowers |
 | **(resolved)** register read outside `let`-RHS (assert/`${...}` format arg) | `regblock_basic_test` — now lowers (`Expr::RegRead`, registered, pass) |
 | **(resolved)** `bitbash(regs)` compile-time walk-all | `regblock_bitbash_test` — now lowers (registered, pass) |
+| **(resolved)** field-level decomposition (`field <name> : <ty> @ <bit>` + `regs.REG.FIELD`) | `regblock_fields_test`, `regblock_addrmap_test` — now lower (masked RMW + shifted extract; no new IR; registered, pass) |
+| **(resolved)** `addrmap` construct (chip-level composition) + `alias of` | `regblock_addrmap_test`, `regblock_alias_test` — now lower (per-instance shifted-offset mirror locals; alias shares the target's cell; registered, pass) |
 | passive `record_write`/`record_read` API + per-register `on regs.REG` callbacks | `regblock_record_test`, `regblock_record_recursion_test` |
-| field-level decomposition (`field <name> : <ty> @ <bit>` + `regs.REG.FIELD`) | `regblock_fields_test`, `regblock_addrmap_test` |
-| `addrmap` construct (chip-level composition) | `regblock_alias_test` |
 
 The blocker reported is whichever out-of-subset construct lowering hits
-first in file order. Now THREE of the eight regblock fixtures fully
-lower and are registered (`pass`, trace-diff clean): `regblock_access_test`
+first in file order. Now SIX of the eight regblock fixtures fully lower
+and are registered (`pass`, trace-diff clean): `regblock_access_test`
 (reads all `let`-bound), `regblock_basic_test` (register reads in assert
-conditions / `${...}` format args — divergence 12, `Expr::RegRead`), and
+conditions / `${...}` format args — divergence 12, `Expr::RegRead`),
 `regblock_bitbash_test` (`bitbash(regs)` walk-all + `assert errors == 0`
-via `Expr::ErrorCount`). The remaining residuals are precise
-`Unsupported` rejections, never mis-lowered: `record_test`/
+via `Expr::ErrorCount`), `regblock_fields_test` (field-level
+decomposition), `regblock_addrmap_test` (`addrmap` 3-/4-level access),
+and `regblock_alias_test` (`alias of`). The only remaining residuals are
+precise `Unsupported` rejections, never mis-lowered: `record_test`/
 `record_recursion_test` need the passive `record_*` API + per-register
 `on regs.REG` write callbacks (`regblock::detect_regblock_residual` names
-this before the generic bare/scope mixing error); `fields`/`addrmap` need
-field-level access; `alias` needs the `addrmap` construct + `alias of`.
+this before the generic bare/scope mixing error).
 
 ### `transaction` construct — RESOLVED 2026-06-12 (transaction slice)
 
