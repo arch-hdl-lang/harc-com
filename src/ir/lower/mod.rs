@@ -695,7 +695,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     for (i, src) in comp_sources.iter().enumerate() {
         let cid = ir::ComponentId(i as u32);
         let schema = prog.components[i].clone();
-        let funcs = components::lower_component_bodies(
+        let bodies = components::lower_component_bodies(
             src,
             cid,
             &schema,
@@ -703,7 +703,27 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &helper_registry,
             &constraint_sites,
         )?;
-        method_funcs.extend(funcs);
+        // Patch the schema's pass-1 clause placeholders with the
+        // resolved period/max_idle expressions (they could only lower
+        // once a body context existed).
+        debug_assert_eq!(
+            bodies.periodic_periods.len(),
+            prog.components[i].periodic_handlers.len()
+        );
+        for (ph, period) in prog.components[i]
+            .periodic_handlers
+            .iter_mut()
+            .zip(bodies.periodic_periods)
+        {
+            ph.period = period;
+        }
+        if let (Some(ws), Some((period, max_idle))) =
+            (prog.components[i].watchdog.as_mut(), bodies.watchdog_clauses)
+        {
+            ws.period = period;
+            ws.max_idle = max_idle;
+        }
+        method_funcs.extend(bodies.funcs);
     }
     // The reserved FunctionIds must be contiguous from `start_fn`.
     debug_assert_eq!(
@@ -2624,6 +2644,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             ir::Expr::Literal { .. }
             | ir::Expr::WideLiteral(_)
             | ir::Expr::Local(_)
+            | ir::Expr::CycleCount
             | ir::Expr::Port(_)
             | ir::Expr::RecordField { .. }
             | ir::Expr::TbField(_)
@@ -2798,6 +2819,7 @@ fn fill_initiator_bus_prefix(func: &mut TbFunction, binding: &str) -> Result<(),
             Expr::Literal { .. }
             | Expr::WideLiteral(_)
             | Expr::Local(_)
+            | Expr::CycleCount
             | Expr::RecordField { .. }
             | Expr::TbField(_)
             | Expr::TransactorState { .. }

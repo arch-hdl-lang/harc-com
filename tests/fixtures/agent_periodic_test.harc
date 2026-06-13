@@ -1,0 +1,49 @@
+// End-to-end demo of an `on <N> cycles` periodic handler (spec §7.10)
+// inside an `agent`. This is the time-driven sibling of the
+// event-subscription `on <event>(arg)` handler (heartbeat_idle_test):
+// instead of firing when an event fans out, the body fires once every
+// `N` primary-clock cycles, dispatched from a `_checkers` closure that
+// gates on a per-instance last-fire stamp.
+//
+// The agent `Ticker` declares `on 10 cycles`, incrementing `beats` and
+// logging a heartbeat on each firing. The test parks the DUT, runs 35
+// cycles past reset, and asserts the handler fired exactly 3 times (at
+// cycles 10, 20, 30) — a deterministic, self-proving cadence. The DUT
+// is the shared `Top` counter (irrelevant here beyond keeping a clock
+// running), so the fixture rides the existing verilator regression.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent Ticker
+    beats : uint<32> default 0
+
+    on 10 cycles
+        beats = beats + 1
+        log(info, "[tick ${cycle_count}] beats=${beats}")
+    end on
+end agent Ticker
+
+test AgentPeriodicTest
+    let dut : Top
+    let tk  : Ticker
+
+    clock clk = SysDomain
+
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+
+        // Run 35 cycles: the periodic handler fires at cycles 10, 20, 30
+        // (the cycle counter is reset-relative-agnostic — it counts
+        // global primary-clock rising edges from time 0).
+        wait 35 cycles
+
+        assert tk.beats == 3
+            else fail("expected 3 periodic firings, got ${tk.beats}")
+        log(info, "PASS: periodic handler fired ${tk.beats} times")
+    end run
+end test AgentPeriodicTest

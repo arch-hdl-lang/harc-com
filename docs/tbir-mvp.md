@@ -32,6 +32,7 @@ checked against the code at the cited location.
 | tseq slice (2026-06-13) | `tseq` (transaction-sequence) construct (`src/ir/lower/tseqs.rs`): a named generator of a sequence of transaction values, iterated with `for t in <TSeq>`. New IR (minimal): `IrType::RecordSeq(RecordId)`, `FunctionKind::Tseq { record }`, `CallTarget::Tseq(name)`, `Stmt::SeqPush`, `Expr::SeqLen`/`Expr::SeqIndex`. The generator lowers to a `[&]`-lambda returning `std::vector<Record>` (v1's `emit_tseq`); `yield t` → `SeqPush`; `randomize(t)` reuses the merged constraint-IR seam (#372 — the solver problem table already catalogs tseq randomize sites); `let txns = Gen(5)` → a `CallTarget::Tseq` edge typing the local `RecordSeq`; `for t in txns` → a counted loop copying `txns[i]` into the record loop variable each iteration (reusable — the sequence is materialized once). Fixtures: `tseq_basic_test` (self-proving — randomize + override + reusable double-iteration) and `axilite_fuzz_test` (corpus fuzz test, `--test AxiLiteFuzzTest` + helpers) — both trace-diff clean v1↔tbir at seed 1, both need Z3. The three sequencer corpus fixtures lower their tseq but stop at deeper blockers (transactor state field — divergence 10; agent-mode multi-DUT-handle); those stay rejected (divergence 17). |
 | sequencer slice (2026-06-13) | `sequencer` construct (builds on the env-composition + agent/on-handler core, `src/ir/lower/components.rs`): a `sequencer` is the analysis-source component shape — an `out event<T>` analysis port plus `hookable` methods that generate a stimulus stream and `emit` each item on that port. It routes through the same `CompSource`/`ComponentSchema` machinery as a method-bearing scoreboard or analysis-source transactor; the only addition is `ComponentKindTag::Sequencer` (+ `CompSource::Sequencer`) for dump-ir/diagnostics. A `connect <sqr>.dispatched -> <drv>.<sink>` edge inside the composing env wires the emitted stream into a sink method (the UVM sequencer/driver bridge). No new IR variants, no new statement/expr forms — sequencer methods, `emit`, and `connect` all reuse the existing component lowering. Fixture: `sequencer_connect_test` (`top_counter.sv`/`top_counter.arch`, pass) — a `dispatch(n)` hookable emitting over a literal-range `for i in 0 .. n` loop, connected to a scoreboard sink; trace-diff clean v1↔tbir at seed 1. The three corpus sequencer fixtures (`axilite_connect_test`, `transactor_agent_mode_test`, `transactor_env_mode_test`) stay blocked: each iterates a `tseq` (`for t in <TSeq>` + `randomize`) inside its `dispatch`, and the agent/env fixtures additionally stack mode-inheritance + cycle-trigger `on dut.x && dut.y` handlers; those gate on the `tseq`/`randomize-in-tseq` + agent-mode slices (divergence 16). |
 | event-record-payload slice (2026-06-13) | `event<transaction>` / `event<struct>` analysis ports — **non-scalar event channels carrying a value-record payload** (the heartbeat/quiesce cluster's blocker; #376 rejected these as a soundness measure). `ComponentFieldKind::Event` now carries an `EventPayload` (`Scalar { signed }` \| `Record(RecordId)`) instead of a bare `signed: bool`, and `OnHandlerSchema::arg_signed` becomes `arg_payload: EventPayload`. Field lowering (`lower_event_payload`, `src/ir/lower/components.rs`) resolves a payload that parses as `TypeArg::Type(Named)` or `TypeArg::Expr(Ident)` against the `record_ids` table — a known transaction/struct → `Record`, a scalar ≤ 64 bits → `Scalar`, anything else (enum/Vec/nested/`TypeArg::Named` keyword arg) is rejected precisely. An `on in_ev(t)` handler whose event is a record now binds a record-typed param (`IrType::Record(rid)`), so `t.field` reads in the body resolve against the schema; `emit prod.in_ev(t)` carries the record local. The tbir backend mirrors v1's `payload_type_for_arg`: the event field becomes `std::vector<std::function<void(<RecordName>)>>` (`runtime::event_payload_cty`) and the component-fn lambda renders a record param by value (`func.rs`); the `[&](auto _t)` subscriber/connect lambdas were already payload-generic. No new statement/expr forms — `emit`/`on`/`connect` reuse the existing component lowering. Fixtures unlocked (both `top_counter.sv`, pass, trace-diff clean v1↔tbir at seed 1): `heartbeat_idle_test` (agent + record-payload event + `on` handler + `idle_in` poll) and `wait_until_quiesce_test` (same + `wait until all of … timeout`, already supported by the agent slice). `watchdog_quiesce_test` (a `watchdog` directive) and `env_quiesced_phase_test` (a data-only `scoreboard` SUB-component in an env + `phase` + `quiesced(N)`) stay rejected — separate slices. See divergence 17. |
+| watchdog + periodic slice (2026-06-13) | `watchdog ... end watchdog` lifecycle directive (spec §8.6) + `on <N> cycles` periodic handlers (spec §7.10) in the agent/component subset (`src/ir/lower/components.rs`). New IR: `ComponentSchema::watchdog: Option<WatchdogSchema>` (`period`/`max_idle` clause exprs + a zero-arg body `function`), `ComponentSchema::periodic_handlers: Vec<PeriodicHandlerSchema>` (`period` expr + body `function`), and `Expr::CycleCount` (a bare `cycle_count` ident — the framework cycle counter, conventionally referenced from `${cycle_count}` in a watchdog/log diagnostic). Lowering: a `watchdog` lowers to a zero-arg `ComponentMethod` body (the user heartbeat statements; field reads self-relative); `period`/`max_idle` lower in the same self-component context (a field-backed clause reads `self.<field>`). A `disabled` watchdog emits nothing (no FunctionId, no schema entry — mirrors v1's `emit_watchdog` early return). An `on <N> cycles` handler lowers to a zero-arg `ComponentMethod` body + its period expr; pass-1 reserves FunctionIds methods→event-on-handlers→periodic→watchdog so the table stays monotonic. The tbir backend installs one per-instance `_checkers` closure per watchdog/periodic (recursing into sub-components), gated on a uniquely-named `static` last-fire stamp; the watchdog closure runs the body then the idle check (`_last_in_cycle`/`_last_out_cycle` ≥ `max_idle` ⇒ `FAIL` + `errors++`). The period/max_idle exprs render against the instance path via `ECx::self_subst` (`SelfField` → instance, since the closure has no `self`). Fixtures (all `top_counter.sv`, trace-diff clean v1↔tbir at seed 1): `watchdog_quiesce_test` (agent + watchdog over a record-payload event, never trips — pass), `watchdog_trip_diagnostic_test` (silent agent, watchdog trips every firing from cycle 200 — `fail`, 9 identical FAIL lines), `agent_periodic_test` (self-proving `on 10 cycles` firing 3× in 35 cycles — pass). `quiesced(N)` env aggregation and named `phase` orchestration stay rejected (`env_quiesced_phase_test` still blocked). See divergence 18. |
 
 ### Construct subset
 
@@ -259,10 +260,25 @@ payload makes the field a `std::vector<std::function<void(<RecordName>)>>`
 and binds a record-typed `on`-handler argument so `t.field` reads resolve.
 This mirrors v1's `payload_type_for_arg` exactly. New fixtures
 `heartbeat_idle_test` and `wait_until_quiesce_test` trace-diff clean.
+
+The **watchdog + periodic subset** (added 2026-06-13, same file,
+divergence 18) lowers the `watchdog` lifecycle directive (spec §8.6) and
+`on <N> cycles` periodic handlers (spec §7.10) in the agent/component
+subset. A `watchdog` becomes a zero-arg `ComponentMethod` body (the
+heartbeat statements) plus a `WatchdogSchema` (`period`/`max_idle` clause
+exprs); the tbir backend installs a per-instance `_checkers` closure that
+gates on a `static` last-fire stamp, runs the body, then the idle check
+(`_last_in_cycle`/`_last_out_cycle` ≥ `max_idle` ⇒ `FAIL` + `errors++`).
+An `on <N> cycles` handler lowers the same way (period-gated checker, no
+idle check). `Expr::CycleCount` carries the framework `cycle_count` for
+`${cycle_count}` diagnostics. New fixtures `watchdog_quiesce_test` (pass,
+never trips), `watchdog_trip_diagnostic_test` (fail, trips from cycle
+200), `agent_periodic_test` (pass, self-proving 3×) trace-diff clean.
+
 **Out of subset** (precise rejections): non-record/non-scalar event
-payloads (enum / Vec / nested), `quiesced(N)`, `watchdog`, named `phase`,
+payloads (enum / Vec / nested), `quiesced(N)`, named `phase`,
 a data-only `scoreboard`/`queue` SUB-component inside an env, `on
-<expr>`/`on <N> cycles` triggers, `tseq`. Those gate on later slices.
+<expr>` cycle-trigger handlers, `tseq`. Those gate on later slices.
 
 ### The equivalence matrix
 
@@ -1074,6 +1090,62 @@ reason. Code locations are authoritative.
       slices. `axilite_seqdrv_test` likewise lowers its tseq and now
       trips on the transactor state field (the negative-test snapshot
       shifted from `tseq` to that message).
+
+18. **`watchdog` + `on <N> cycles` periodic handlers (2026-06-13).**
+    Lowers the `watchdog` lifecycle directive (spec §8.6) and the
+    periodic time-trigger handler (spec §7.10) in the agent/component
+    subset (`src/ir/lower/components.rs`) — the heartbeat cluster's
+    remaining blocker (`watchdog_quiesce_test`,
+    `watchdog_trip_diagnostic_test`).
+    - *New IR.* `ComponentSchema::watchdog: Option<WatchdogSchema>`
+      (`period`/`max_idle` clause exprs + a zero-arg body `function`) and
+      `ComponentSchema::periodic_handlers: Vec<PeriodicHandlerSchema>`
+      (`period` expr + body `function`). `Expr::CycleCount` represents the
+      framework cycle counter — a bare `cycle_count` ident (conventionally
+      `${cycle_count}` in a watchdog/log diagnostic) resolves here; a
+      same-named local shadows it. All exhaustive matches (display,
+      verify, hoist-ports, transactor-state fill, regblock-fill,
+      placement) updated.
+    - *Lowering.* A `watchdog` lowers to a zero-arg `ComponentMethod` body
+      (the user heartbeat statements; field reads self-relative). Its
+      `period`/`max_idle` clauses lower in the SAME self-component context
+      (a field-backed clause reads `self.<field>`), so they could only be
+      lowered once a body builder existed — pass 2 resolves them and
+      patches the pass-1 schema placeholders. A `disabled` watchdog emits
+      nothing (no FunctionId, no schema entry; mirrors v1's `emit_watchdog`
+      early return). An `on <N> cycles` handler (`h.periodic`) lowers to a
+      zero-arg `ComponentMethod` body + its period expr (the parser stashes
+      the cycle count in `h.event`). Pass 1 reserves FunctionIds
+      methods → event-on-handlers → periodic → watchdog so the function
+      table stays monotonic.
+    - *Codegen.* The tbir backend installs one per-instance `_checkers`
+      closure per watchdog/periodic (recursing into by-value
+      sub-components), gated on a uniquely-named `static` last-fire stamp
+      (one closure per instance, so the static is effectively per-instance
+      — v1 uses the same shape). The watchdog closure re-reads the period
+      each cycle, fires the body when due, then runs the idle check
+      (`(cycle_count - _last_in_cycle) >= max_idle` AND likewise
+      `_last_out_cycle` ⇒ `sim_log_line("FAIL", "watchdog: <Comp> has been
+      idle for >= %lld cycles", …)` + `errors++`). The period/max_idle
+      exprs render against the instance path via a new `ECx::self_subst`
+      (`SelfField` → instance, since the `_checkers` closure has no `self`
+      in scope). **Implementation divergence from v1 only:** v1 emits the
+      idle check INSIDE the `<Comp>_watchdog` method and the period gating
+      in the checker via a `field_subs`-rewritten period; tbir emits the
+      idle check + period gating in the checker (the lowered body holds
+      only the user statements). Behavior is identical — same FAIL text,
+      same firing cycles, same `errors++` — verified by trace-diff.
+    - *Fixtures* (all `top_counter.sv`, trace-diff clean v1↔tbir at
+      seed 1): `watchdog_quiesce_test` (agent + watchdog over a
+      record-payload event; never trips — `pass`),
+      `watchdog_trip_diagnostic_test` (silent agent, watchdog trips every
+      firing from cycle 200 — `fail`, 9 identical FAIL lines, NOT in the
+      pass regression), `agent_periodic_test` (self-proving `on 10 cycles`
+      firing exactly 3× in 35 cycles — `pass`). All registered.
+    - *Out of subset* (still rejected, separate slices):
+      `quiesced(N)` env aggregation and named `phase` orchestration —
+      `env_quiesced_phase_test` (a data-only `scoreboard` SUB-component in
+      an env + `phase` + `quiesced(N)`) stays blocked.
 
 Minor, same spirit: `IndexVec` is a plain `Vec` plus typed id structs;
 the design's `AssertFail` enum collapsed into a single

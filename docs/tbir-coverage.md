@@ -26,9 +26,13 @@ registered. Amended again 2026-06-13 by the **event-record-payload
 slice** — see the heartbeat/quiesce cluster section below:
 `event<transaction>`/`event<struct>` analysis-port payloads now lower
 (value-record by value), fully unlocking `heartbeat_idle_test` and
-`wait_until_quiesce_test` (both registered); `watchdog_quiesce_test` and
-`env_quiesced_phase_test` reject one level deeper (`watchdog` /
-data-only-`scoreboard` sub-component + `phase`).
+`wait_until_quiesce_test` (both registered). The **watchdog + periodic
+slice (2026-06-13)** then lowers the `watchdog` lifecycle directive
+(§8.6) + `on <N> cycles` periodic handlers (§7.10), fully unlocking
+`watchdog_quiesce_test` (pass), `watchdog_trip_diagnostic_test` (fail —
+trips from cycle 200), and the self-proving `agent_periodic_test` (pass).
+Only `env_quiesced_phase_test` remains blocked, one level deeper
+(data-only-`scoreboard` sub-component in an env + `phase` + `quiesced(N)`).
 
 **This file is a snapshot, not a source of truth.** The registry
 (`tests/tbir_equiv_fixtures.txt`) is the source of truth for what is
@@ -373,12 +377,14 @@ table; the event field becomes `std::vector<std::function<void(
 |---|---|---|
 | `heartbeat_idle_test` | agent + `event<TinyTxn>` + `on in_ev(t)` + `idle_in` poll | — **FULLY UNLOCKED** |
 | `wait_until_quiesce_test` | same + `wait until all of … timeout` (agent slice) | — **FULLY UNLOCKED** |
+| `watchdog_quiesce_test` | agent + `watchdog period/max_idle` over a record-payload event + `${cycle_count}` log (never trips) | — **FULLY UNLOCKED** (watchdog slice) |
+| `watchdog_trip_diagnostic_test` | silent agent + `watchdog` that trips from cycle 200 (`fail`, 9 FAIL lines) | — **FULLY UNLOCKED** (watchdog slice; expect=fail) |
+| `agent_periodic_test` | self-proving `on 10 cycles` periodic handler (fires 3× in 35 cycles) | — **FULLY UNLOCKED** (watchdog slice) |
 
 **Still blocked (residual first-blocker map, `harc dump-ir` 2026-06-13):**
 
 | Next blocker | Fixtures |
 |---|---|
-| `watchdog` (`period`/`max_idle` + the idle-trip assertion) + `on <N> cycles` periodic trigger | `watchdog_quiesce_test`, `watchdog_trip_diagnostic_test` |
 | data-only `scoreboard` SUB-component in an env (`DrainSb` held by `HeartbeatEnv`) + named `phase` + `quiesced(N)` env heartbeat aggregation | `env_quiesced_phase_test` |
 
 `env_quiesced_phase_test` trips first on the `DrainSb` scoreboard

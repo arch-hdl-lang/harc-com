@@ -853,6 +853,9 @@ impl Checker<'_> {
     fn check_expr(&mut self, e: &Expr, ports_ok: bool, context: &'static str) {
         match e {
             Expr::Literal { .. } | Expr::WideLiteral(_) => {}
+            // The global cycle counter — a framework value, no
+            // local/port dependency to verify.
+            Expr::CycleCount => {}
             Expr::Local(l) => self.check_local(*l),
             Expr::TbField(field) => self.check_tb_field(field),
             // Transactor-instance state — host state, resolved at
@@ -1273,6 +1276,7 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
     match e {
         Expr::Literal { .. }
         | Expr::WideLiteral(_)
+        | Expr::CycleCount
         | Expr::Port(_)
         | Expr::TbField(_)
         | Expr::TransactorState { .. }

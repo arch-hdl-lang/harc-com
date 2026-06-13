@@ -1,0 +1,35 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 AgentPeriodicTest_tb (synthetic) { dut: Top }
+  test AgentPeriodicTest tb=tb0 run=fn1 check=- clock=clk@10000ps(SysDomain)
+  component c0 Ticker (agent)
+    field beats : scalar = 0
+    on 10 cycles = fn0
+
+fn fn0 comp_periodic_0 [kind=ComponentMethod(c0)]
+  entry = b0
+
+  b0:
+    ComponentFieldWrite(self.beats, (self.beats + 1))
+    Log(info, "[tick %lld] beats=%lld", cycle_count, self.beats)
+    -> Return
+
+fn fn1 run_AgentPeriodicTest [kind=Run, owner=tb0]
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.en, 0)
+    -> WaitCycles(2, b1)
+
+  b1:
+    DutWrite(dut.rst, 0)
+    -> WaitCycles(35, b2)
+
+  b2:
+    AssertCheck { cond: (tk.beats == 3), on_fail: "expected 3 periodic firings, got %lld", tk.beats }
+    Log(info, "PASS: periodic handler fired %lld times", tk.beats)
+    -> Return

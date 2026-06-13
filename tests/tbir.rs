@@ -320,13 +320,55 @@ fn heartbeat_idle_dump_ir_snapshot() {
 }
 
 /// `watchdog_quiesce_test` stacks a `watchdog` directive on top of the
-/// record-payload event — that gates on the watchdog/phase slice and
-/// is still rejected precisely (the next blocker behind this slice).
+/// record-payload event. The watchdog lowers to a zero-arg
+/// `comp_watchdog_*` body (the user heartbeat log; the period/max_idle
+/// idle check is emitted in the per-instance `_checkers` closure) plus a
+/// `watchdog period 500 max_idle 1000` schema line. Locks the dump-ir.
 #[test]
-fn watchdog_quiesce_fixture_is_unsupported() {
-    let err = lower_src(&fixture("watchdog_quiesce_test.harc")).unwrap_err();
-    let msg = assert_unsupported(&err);
-    insta::assert_snapshot!("watchdog_quiesce_unsupported", msg);
+fn watchdog_quiesce_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("watchdog_quiesce_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let agent = prog
+        .components
+        .iter()
+        .find(|c| c.name == "Producer")
+        .expect("Producer agent");
+    let w = agent.watchdog.as_ref().expect("watchdog schema");
+    // The body references `cycle_count` (a framework value) and a self
+    // field (`seen`), both lowered in the component-self context.
+    let body = prog.function(w.function);
+    assert!(body.params.is_empty(), "watchdog body takes only `self`");
+    insta::assert_snapshot!("watchdog_quiesce_dump_ir", format!("{prog}"));
+}
+
+/// Locks the emitted tbir C++ for the watchdog fixture: the zero-arg
+/// `<Comp>_watchdog<fid>` body lambda, and the per-instance `_checkers`
+/// closure that gates on the period static, runs the body, then the
+/// `max_idle` idle check + FAIL diagnostic.
+#[test]
+fn watchdog_quiesce_emitted_cpp_snapshot() {
+    insta::assert_snapshot!(
+        "watchdog_quiesce_emitted_cpp",
+        emit_fixture_cpp("watchdog_quiesce_test.harc")
+    );
+}
+
+/// `on <N> cycles` periodic handler in an `agent`: lowers to a zero-arg
+/// `comp_periodic_*` body and an `on 10 cycles = fn0` schema line.
+#[test]
+fn agent_periodic_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("agent_periodic_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let agent = prog
+        .components
+        .iter()
+        .find(|c| c.name == "Ticker")
+        .expect("Ticker agent");
+    assert_eq!(agent.periodic_handlers.len(), 1, "one periodic handler");
+    let ph = &agent.periodic_handlers[0];
+    let body = prog.function(ph.function);
+    assert!(body.params.is_empty(), "periodic body takes only `self`");
+    insta::assert_snapshot!("agent_periodic_dump_ir", format!("{prog}"));
 }
 
 /// Untimed `any of` lowers to a `WaitUntil` terminator in `AnyOf`

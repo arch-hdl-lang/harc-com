@@ -429,6 +429,7 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
         Expr::Literal { .. }
         | Expr::WideLiteral(_)
         | Expr::Local(_)
+        | Expr::CycleCount
         | Expr::RecordField { .. }
         | Expr::TbField(_)
         | Expr::TransactorState { .. }

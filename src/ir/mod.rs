@@ -443,6 +443,53 @@ pub struct ComponentSchema {
     /// bumps `_last_in_cycle` and runs the handler body. The handler body
     /// is lowered as a one-param `ComponentMethod` function.
     pub on_handlers: Vec<OnHandlerSchema>,
+    /// `on <N> cycles ... end on` periodic handlers (agent subset). Each
+    /// fires its body once every `period` primary-clock cycles, dispatched
+    /// from a `_checkers` closure that gates on a per-instance last-fire
+    /// stamp. The body is lowered as a zero-arg `ComponentMethod`
+    /// function (`self` only); bare field reads resolve self-relatively.
+    pub periodic_handlers: Vec<PeriodicHandlerSchema>,
+    /// `watchdog ... end watchdog` lifecycle directive (spec §8.6), at
+    /// most one per component. `None` when the component declares none (or
+    /// declares `watchdog disabled` — opt-out suppresses all codegen).
+    /// Dispatched from a `_checkers` closure that gates on a per-instance
+    /// last-fire stamp, runs the user body, then asserts the component has
+    /// NOT been idle (`_last_in_cycle`/`_last_out_cycle`) for `max_idle`
+    /// cycles. `None` means no watchdog.
+    pub watchdog: Option<WatchdogSchema>,
+}
+
+/// One `on <N> cycles ... end on` periodic handler (spec §7.10). Fires
+/// its body once every `period` primary-clock cycles. The codegen
+/// installs a `_checkers` closure that compares `cycle_count` against a
+/// per-instance last-fire stamp; the period is re-read each cycle so a
+/// field-backed period can be overridden from the test scope.
+#[derive(Debug, Clone)]
+pub struct PeriodicHandlerSchema {
+    /// Firing period in primary-clock cycles. Lowered in the component's
+    /// `SelfField` context (a field-backed period reads `self.<field>`).
+    pub period: Expr,
+    /// Lowered handler body (`kind: ComponentMethod`, zero params — `self`
+    /// only). Bare field names resolve self-relatively.
+    pub function: FunctionId,
+}
+
+/// A `watchdog ... end watchdog` directive (spec §8.6). At most one per
+/// component. `period`/`max_idle` lower in the component's `SelfField`
+/// context (field-backed clauses read `self.<field>`); both default to
+/// `None` (the codegen substitutes the spec defaults: 1000 / 10000
+/// cycles). The body runs BEFORE the idle check on each firing
+/// (conventionally a debug `log`).
+#[derive(Debug, Clone)]
+pub struct WatchdogSchema {
+    /// `period <expr> cycles` — firing cadence. `None` → default 1000.
+    pub period: Option<Expr>,
+    /// `max_idle <expr> cycles` — idle threshold that trips the FAIL
+    /// diagnostic. `None` → default 10000.
+    pub max_idle: Option<Expr>,
+    /// Lowered watchdog body (`kind: ComponentMethod`, zero params —
+    /// `self` only), run before the idle check on each firing.
+    pub function: FunctionId,
 }
 
 impl ComponentSchema {
@@ -1159,6 +1206,13 @@ pub enum Expr {
         kind: IdleKind,
         n: Box<Expr>,
     },
+    /// The global simulation cycle counter (`cycle_count`). A bare
+    /// `cycle_count` ident resolves here (it is a framework-provided
+    /// value, not a user local). Both backends emit the in-scope
+    /// `cycle_count` variable; allowed wherever a `Local` is — its
+    /// canonical use is `${cycle_count}` inside a `log`/`watchdog`
+    /// diagnostic. uint64_t-valued.
+    CycleCount,
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Unary(UnOp, Box<Expr>),
     /// `cond ? a : b`. Both backends emit the C++ ternary; port reads
