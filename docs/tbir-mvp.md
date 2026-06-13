@@ -33,6 +33,7 @@ checked against the code at the cited location.
 | sequencer slice (2026-06-13) | `sequencer` construct (builds on the env-composition + agent/on-handler core, `src/ir/lower/components.rs`): a `sequencer` is the analysis-source component shape — an `out event<T>` analysis port plus `hookable` methods that generate a stimulus stream and `emit` each item on that port. It routes through the same `CompSource`/`ComponentSchema` machinery as a method-bearing scoreboard or analysis-source transactor; the only addition is `ComponentKindTag::Sequencer` (+ `CompSource::Sequencer`) for dump-ir/diagnostics. A `connect <sqr>.dispatched -> <drv>.<sink>` edge inside the composing env wires the emitted stream into a sink method (the UVM sequencer/driver bridge). No new IR variants, no new statement/expr forms — sequencer methods, `emit`, and `connect` all reuse the existing component lowering. Fixture: `sequencer_connect_test` (`top_counter.sv`/`top_counter.arch`, pass) — a `dispatch(n)` hookable emitting over a literal-range `for i in 0 .. n` loop, connected to a scoreboard sink; trace-diff clean v1↔tbir at seed 1. The three corpus sequencer fixtures (`axilite_connect_test`, `transactor_agent_mode_test`, `transactor_env_mode_test`) stay blocked: each iterates a `tseq` (`for t in <TSeq>` + `randomize`) inside its `dispatch`, and the agent/env fixtures additionally stack mode-inheritance + cycle-trigger `on dut.x && dut.y` handlers; those gate on the `tseq`/`randomize-in-tseq` + agent-mode slices (divergence 16). |
 | event-record-payload slice (2026-06-13) | `event<transaction>` / `event<struct>` analysis ports — **non-scalar event channels carrying a value-record payload** (the heartbeat/quiesce cluster's blocker; #376 rejected these as a soundness measure). `ComponentFieldKind::Event` now carries an `EventPayload` (`Scalar { signed }` \| `Record(RecordId)`) instead of a bare `signed: bool`, and `OnHandlerSchema::arg_signed` becomes `arg_payload: EventPayload`. Field lowering (`lower_event_payload`, `src/ir/lower/components.rs`) resolves a payload that parses as `TypeArg::Type(Named)` or `TypeArg::Expr(Ident)` against the `record_ids` table — a known transaction/struct → `Record`, a scalar ≤ 64 bits → `Scalar`, anything else (enum/Vec/nested/`TypeArg::Named` keyword arg) is rejected precisely. An `on in_ev(t)` handler whose event is a record now binds a record-typed param (`IrType::Record(rid)`), so `t.field` reads in the body resolve against the schema; `emit prod.in_ev(t)` carries the record local. The tbir backend mirrors v1's `payload_type_for_arg`: the event field becomes `std::vector<std::function<void(<RecordName>)>>` (`runtime::event_payload_cty`) and the component-fn lambda renders a record param by value (`func.rs`); the `[&](auto _t)` subscriber/connect lambdas were already payload-generic. No new statement/expr forms — `emit`/`on`/`connect` reuse the existing component lowering. Fixtures unlocked (both `top_counter.sv`, pass, trace-diff clean v1↔tbir at seed 1): `heartbeat_idle_test` (agent + record-payload event + `on` handler + `idle_in` poll) and `wait_until_quiesce_test` (same + `wait until all of … timeout`, already supported by the agent slice). `watchdog_quiesce_test` (a `watchdog` directive) and `env_quiesced_phase_test` (a data-only `scoreboard` SUB-component in an env + `phase` + `quiesced(N)`) stay rejected — separate slices. See divergence 17. |
 | watchdog + periodic slice (2026-06-13) | `watchdog ... end watchdog` lifecycle directive (spec §8.6) + `on <N> cycles` periodic handlers (spec §7.10) in the agent/component subset (`src/ir/lower/components.rs`). New IR: `ComponentSchema::watchdog: Option<WatchdogSchema>` (`period`/`max_idle` clause exprs + a zero-arg body `function`), `ComponentSchema::periodic_handlers: Vec<PeriodicHandlerSchema>` (`period` expr + body `function`), and `Expr::CycleCount` (a bare `cycle_count` ident — the framework cycle counter, conventionally referenced from `${cycle_count}` in a watchdog/log diagnostic). Lowering: a `watchdog` lowers to a zero-arg `ComponentMethod` body (the user heartbeat statements; field reads self-relative); `period`/`max_idle` lower in the same self-component context (a field-backed clause reads `self.<field>`). A `disabled` watchdog emits nothing (no FunctionId, no schema entry — mirrors v1's `emit_watchdog` early return). An `on <N> cycles` handler lowers to a zero-arg `ComponentMethod` body + its period expr; pass-1 reserves FunctionIds methods→event-on-handlers→periodic→watchdog so the table stays monotonic. The tbir backend installs one per-instance `_checkers` closure per watchdog/periodic (recursing into sub-components), gated on a uniquely-named `static` last-fire stamp; the watchdog closure runs the body then the idle check (`_last_in_cycle`/`_last_out_cycle` ≥ `max_idle` ⇒ `FAIL` + `errors++`). The period/max_idle exprs render against the instance path via `ECx::self_subst` (`SelfField` → instance, since the closure has no `self`). Fixtures (all `top_counter.sv`, trace-diff clean v1↔tbir at seed 1): `watchdog_quiesce_test` (agent + watchdog over a record-payload event, never trips — pass), `watchdog_trip_diagnostic_test` (silent agent, watchdog trips every firing from cycle 200 — `fail`, 9 identical FAIL lines), `agent_periodic_test` (self-proving `on 10 cycles` firing 3× in 35 cycles — pass). `quiesced(N)` env aggregation and named `phase` orchestration stay rejected (`env_quiesced_phase_test` still blocked). See divergence 18. |
+| transactor-state-field slice (2026-06-13) | persistent **scalar STATE fields on the unbound DUT-poking transactor** (`transactor SeqXactor { dut : DUT; last_read : uint<32> default 0; ... }`) — divergence 10. The bound-to TARGET responder form already materialized state fields (#371); this extends the SAME machinery (`TbScalarFieldSchema`, `Expr::TransactorState` / `Stmt::TransactorStateWrite`, `target_state_struct_inst`) to the unbound BFM. No new IR variants. `lower/transactors.rs` (unbound path) now classifies a `Builtin`-typed field as scalar state (vs the single `Named` module-typed DUT handle) via the shared `lower_state_field`, and sets each method builder's `target_state_fields` so bare-name reads/writes (`last_read = dut.x`; `n = n + 1`) lower to `TransactorState`/`TransactorStateWrite` with an empty instance placeholder. At test-binding (`lower/mod.rs`) each stateful unbound instance registers in the `target_state` map (so the test reads `xact.last_read`) and fills its name into the type-shared method bodies; `as_transactor_state` (`lower/exprs.rs`) now also resolves the impl-for-desugared `_tb.<instance>.<field>` shape. Emission (`codegen/tbir/mod.rs`) declares one per-instance state struct (`runtime::target_state_struct_inst`) BEFORE the method lambdas, so the `[&]`-captured lambdas and the run/check coroutine share it. New `TestbenchSchema::unbound_state_actors` records which instances need a struct. Subset: ONE stateful instance per transactor type per file (the bodies are type-shared) — a second is rejected precisely (`stateful_type_seen` guard, independent of whether the type has methods). Fixture: `transactor_state_field_test` (self-proving, `cam_dual_basic.sv`, pass) — a CAM BFM whose `do_probe(key)` stashes `dut.search_first`/`dut.search_any` into state and bumps a `probe_count` accumulator, read back at test scope; trace-diff clean v1↔tbir at seed 1. The three sequencer/mode corpus fixtures advance past the state-field blocker but stop at their NEXT tier (residual map below): `axilite_seqdrv_test`/`axilite_connect_test` on the `req : in event<RegOp>` directional field (event-driven transactor); `transactor_active_test` on the bound-to event field; `axilite_hooks_test` on a record-typed (transaction) method param + pre/post hooks; `transactor_agent_mode_test`/`transactor_env_mode_test` on the multi-module-field (`dut` + `sb`) agent-mode form. |
 
 ### Construct subset
 
@@ -187,8 +188,10 @@ into the constraint-IR seam, but struct-body `keep`/`when` still don't).
 Everything else —
 `randomize` *expressions* (`let v = randomize(t)` — only the
 statement/terminator form lowers in #372) and method-body `randomize`,
-`agent`/`event`, bus-bound/event-driven transactors, transactor state
-fields, passive instances, scoreboard *methods* / event-driven
+`agent`/`event`, bus-bound/event-driven transactors (an UNBOUND
+DUT-poking transactor's scalar STATE fields now lower — see divergence
+10; bound-initiator and event-driven state still don't), passive
+instances, scoreboard *methods* / event-driven
 `on`/`connect` wiring / `queue<Struct>` payloads (the data-only
 scoreboard subset lowers — see below), `fork` (including
 `fork bus.method(...)`/`join_all` TLM issue), out-of-order TLM lanes,
@@ -616,22 +619,32 @@ reason. Code locations are authoritative.
       test-scope-let helper routing, registered in the equivalence
       registry.
 
-10. **Transactor instance state is not materialized.** v1 emits a
-    per-transactor C++ struct (DUT pointer member + heartbeat fields),
-    a testbench member for each instance, `<Type>_<method>_pre`/`_post`
-    hook vectors with fan-out loops in every method lambda, and the
-    `xact.dut = dut` pointer copy. The tbir backend emits none of
-    those: the lowered subset has no transactor state (the only field
-    is the DUT handle, statically bound), statement-level
-    `on obj.method pre/post` hooks are rejected at lowering (so the
-    vectors would be permanently empty), and `idle()` predicates are
-    out of subset (so the heartbeat stamps are unread). Method lambdas
-    take no `self`; `Stmt::TransactorCall` emits a direct
-    `<Type>_<method>(args)` call. Observable only on broken programs:
-    a method call without a preceding `xact.dut = dut` null-derefs
-    under v1 but drives the DUT under tbir (lowering validates the
-    bind statement *when present* — binding anything other than the
-    test DUT is rejected).
+10. **Transactor instance state — scalar STATE fields now materialize
+    (2026-06-13); heartbeat stamps + pre/post hook vectors still don't.**
+    v1 emits a per-transactor C++ struct (DUT pointer member + heartbeat
+    fields + state fields), a testbench member for each instance,
+    `<Type>_<method>_pre`/`_post` hook vectors with fan-out loops in
+    every method lambda, and the `xact.dut = dut` pointer copy.
+    *Scalar state fields* (`last_read : uint<32> default 0`) on the
+    UNBOUND DUT-poking transactor now lower (transactor-state-field
+    slice): each stateful instance gets a per-instance state struct
+    (`runtime::target_state_struct_inst`, the same machinery as the
+    bound-to target responder), bare-name reads/writes in method bodies
+    lower to `Expr::TransactorState`/`Stmt::TransactorStateWrite` (filled
+    with the instance name at test-bind), and the test reads them back
+    via `xact.last_read`. The method lambdas still take no `self` — the
+    body references `<instance>.<field>` directly (filled at bind), so
+    the subset is ONE stateful instance per transactor type per file
+    (the bodies are type-shared); a second is rejected precisely. Still
+    NOT emitted: the `_last_in/out_cycle` HEARTBEAT stamps are carried on
+    the struct but unread (`idle()` predicates are out of subset), and
+    statement-level `on obj.method pre/post` HOOK vectors are rejected at
+    lowering (so they would be permanently empty). `Stmt::TransactorCall`
+    emits a direct `<Type>_<method>(args)` call. Observable only on
+    broken programs: a method call without a preceding `xact.dut = dut`
+    null-derefs under v1 but drives the DUT under tbir (lowering
+    validates the bind statement *when present* — binding anything other
+    than the test DUT is rejected).
 
 11. **`sim_end` clock attribution when the run body never suspends.**
     Found via the ternary addition: `linklist_basic_test` now lowers
@@ -1079,17 +1092,16 @@ reason. Code locations are authoritative.
       corpus fuzz test fully unlocks: `tseq RandomRegs(5)` of random
       `RegData` writes/reads driven through the `axil_write`/`axil_read`
       impure helpers; trace-diff clean at seed 1. Both need Z3.
-    - *Corpus residuals (deeper, NOT unlocked by tseq alone).* The three
-      sequencer corpus fixtures still stop past the tseq: `tseq` now
-      lowers in each, but `axilite_connect_test`/
-      `transactor_agent_mode_test`/`transactor_env_mode_test` next trip
-      on a transactor **state field** (`last_read : uint<32>` — needs
-      per-instance state materialization, divergence 10) and, for the
-      agent/env forms, a transactor with **more than one module-typed
-      field** (agent-mode DUT-handle inheritance). Those are separate
-      slices. `axilite_seqdrv_test` likewise lowers its tseq and now
-      trips on the transactor state field (the negative-test snapshot
-      shifted from `tseq` to that message).
+    - *Corpus residuals (deeper, NOT unlocked by tseq alone).* The
+      sequencer corpus fixtures still stop past the tseq, and the
+      transactor-state-field slice (2026-06-13) advanced them one more
+      tier. State fields (`last_read : uint<32>`) now lower in each, so
+      the next blockers are: `axilite_connect_test` and
+      `axilite_seqdrv_test` on the `req : in event<RegOp>` directional
+      field (the event-driven sequencer → transactor.req form);
+      `transactor_agent_mode_test`/`transactor_env_mode_test` on a
+      transactor with **more than one module-typed field** (`dut` + `sb`
+      — agent-mode DUT-handle inheritance). Those are separate slices.
 
 18. **`watchdog` + `on <N> cycles` periodic handlers (2026-06-13).**
     Lowers the `watchdog` lifecycle directive (spec §8.6) and the
@@ -1189,9 +1201,11 @@ with `transaction` in the subset, `wait_until_quiesce_unsupported`
 names the `agent` construct (next item in file order),
 `axilite_seqdrv_unsupported` named `transactor` — and shifted again
 with the transactor slice (snapshot named `tseq`), then again with the
-tseq slice: that fixture's `tseq` now lowers, so the snapshot names the
-transactor **state field** `last_read` (per-instance state
-materialization, divergence 10, deferred). The `axilite_constraint`
+tseq slice (snapshot named the transactor **state field** `last_read`),
+then again with the transactor-state-field slice (2026-06-13): that
+fixture's state field now lowers, so the snapshot names the `req : in
+event<RegOp>` directional field — the event-driven transactor form
+(deferred). The `axilite_constraint`
 fixture was the last member of this
 group and has since left it — `randomize` lowers as of #372. The same
 mechanics apply to the next construct slice: a fixture's snapshot always names

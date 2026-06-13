@@ -112,3 +112,4 @@ wait_until_quiesce_test | Top | top_counter.sv | - | pass
 agent_periodic_test | Top | top_counter.sv | - | pass
 watchdog_quiesce_test | Top | top_counter.sv | - | pass
 watchdog_trip_diagnostic_test | Top | top_counter.sv | - | fail
+transactor_state_field_test | Mshr_Addr_Cam_Dual | cam_dual_basic.sv | - | pass

@@ -731,13 +731,30 @@ impl FuncBuilder<'_> {
         let ExprKind::Field { target, name } = &*e.kind else {
             return None;
         };
-        let ExprKind::Ident(root) = &*target.kind else {
-            return None;
+        // Two access shapes carry transactor state:
+        //   * `target.read_count` — a test-scope `let` bound-to responder
+        //     (not `_tb`-prefixed by the impl-for desugaring), so the
+        //     root is the instance name directly;
+        //   * `_tb.xact.last_read` — a testbench transactor FIELD (the
+        //     impl-for desugaring prepends `_tb`), so the instance name
+        //     is the middle segment.
+        let instance = match &*target.kind {
+            ExprKind::Ident(root) => root.name.clone(),
+            ExprKind::Field { target: inner, name: mid } => {
+                let ExprKind::Ident(root) = &*inner.kind else {
+                    return None;
+                };
+                if Some(root.name.as_str()) != self.ctx.tb_field.as_deref() {
+                    return None;
+                }
+                mid.name.clone()
+            }
+            _ => return None,
         };
-        let fields = self.ctx.target_state.get(&root.name)?;
+        let fields = self.ctx.target_state.get(&instance)?;
         fields
             .contains(&name.name)
-            .then(|| (root.name.clone(), name.name.clone()))
+            .then(|| (instance, name.name.clone()))
     }
 
     /// `Some(PortRef)` (with `lane`) when the expression is a

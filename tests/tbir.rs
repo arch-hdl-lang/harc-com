@@ -183,10 +183,12 @@ fn fatal_path_dump_ir_snapshot() {
 /// name the construct and point at `--codegen v1`, never mis-lower.
 /// The fixture's `transaction` items now lower (records slice), its
 /// `transactor` declaration passes the item-level scan (transactor
-/// slice), and its `tseq` declaration now lowers too (tseq slice); the
-/// next blocker is the transactor's persistent STATE field, which needs
-/// per-instance state materialization (divergence 10, deferred). The
-/// rejection still names the construct precisely and never mis-lowers.
+/// slice), its `tseq` declaration lowers (tseq slice), and its scalar
+/// STATE field `last_read` now materializes too (state-field slice,
+/// divergence 10). The next blocker is the transactor's `req : in
+/// event<RegOp>` directional field — the event-driven (sequencer →
+/// transactor.req) form, which awaits the event slice. The rejection
+/// still names the construct precisely and never mis-lowers.
 #[test]
 fn transactor_fixture_is_unsupported() {
     let err = lower_src(&fixture("axilite_seqdrv_test.harc")).unwrap_err();
@@ -2953,8 +2955,9 @@ fn placement_classifies_transactor_call_block_timing_tolerant() {
 }
 
 /// Out-of-subset transactor shapes reject with precise messages:
-/// event fields (the sequencer-driven form), scalar state fields, and
-/// >64-bit method params (the tbir value model is u64).
+/// event fields (the sequencer-driven form) and >64-bit method params
+/// (the tbir value model is u64). Scalar STATE fields, by contrast, now
+/// lower (state-field slice) — asserted positively here.
 #[test]
 fn transactor_shape_rejections() {
     let event_src = r#"
@@ -2984,9 +2987,26 @@ end impl EvTest
     let msg = assert_unsupported(&lower_src(event_src).unwrap_err());
     assert!(msg.contains("event/directional field `req`"), "{msg}");
 
+    // A scalar state field now lowers: the transactor carries it on its
+    // schema and the testbench records the instance for per-instance
+    // state materialization (state-field slice).
     let state_src = event_src.replace("req : in event<Req>", "count : uint<32>");
-    let msg = assert_unsupported(&lower_src(&state_src).unwrap_err());
-    assert!(msg.contains("state field `count`"), "{msg}");
+    let prog = lower_src(&state_src).expect("scalar state field lowers");
+    let xs = &prog.transactors[0];
+    assert_eq!(xs.state_fields.len(), 1, "state field on schema");
+    assert_eq!(xs.state_fields[0].name, "count");
+    assert_eq!(
+        prog.testbenches[0].unbound_state_actors,
+        vec![("ev".to_string(), ir::TransactorId(0))],
+        "stateful instance recorded for per-instance materialization",
+    );
+
+    // A second stateful instance of the same type is rejected precisely
+    // (the method bodies are shared per type; one stateful instance per
+    // type in this subset).
+    let two_src = state_src.replace("    ev  : Ev active", "    ev  : Ev active\n    ev2 : Ev active");
+    let msg = assert_unsupported(&lower_src(&two_src).unwrap_err());
+    assert!(msg.contains("instantiated more than once"), "{msg}");
 
     // The corpus fixture with uint<128> method params.
     let err = lower_src(&fixture("aes_cipher_top_test.harc")).unwrap_err();

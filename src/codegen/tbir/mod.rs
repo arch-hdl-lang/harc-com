@@ -438,6 +438,18 @@ fn emit_test(
     // run coroutine so its `[&]` capture sees them (v1 emission order).
     // Two fields of the same transactor type share one lambda set: the
     // subset carries no per-instance state (the DUT bind is static).
+    // Per-instance state structs for the unbound DUT-poking transactors
+    // that carry persistent scalar state (`drv.last_read`). Declared
+    // BEFORE the method lambdas so the lambdas' `[&]` capture binds the
+    // instance struct the method bodies write (`drv.last_read = ...`) and
+    // the run/check coroutine reads. Same per-instance struct shape as
+    // the bound-to target form. The subset is one stateful instance per
+    // transactor type (enforced at lowering), so the type-shared method
+    // lambda references exactly this one instance.
+    for (instance, xid) in &tb.unbound_state_actors {
+        let schema = prog.transactor(*xid);
+        runtime::target_state_struct_inst(out, schema, instance);
+    }
     let mut emitted_xactors = HashSet::new();
     for (_, xid) in &tb.transactor_fields {
         if !emitted_xactors.insert(*xid) {
