@@ -555,6 +555,18 @@ impl FuncBuilder<'_> {
             self.push(Stmt::TbFieldWrite { field, value: e });
             return Ok(());
         }
+        // Closure-hook host-state promotion: a bare ident assignment to a
+        // promoted test-scope let (`pre_count = pre_count + 1`) writes the
+        // shared `_tb` host cell. Locals shadow (a real local of the same
+        // name would have resolved earlier in this fn); only a promoted
+        // name with no shadowing local reaches here.
+        if let crate::ast::ExprKind::Ident(id) = &*target.kind {
+            if self.ctx.promoted_tb_lets.contains(&id.name) && self.lookup(&id.name).is_none() {
+                let e = self.lower_expr_no_ports(value)?;
+                self.push(Stmt::TbFieldWrite { field: id.name.clone(), value: e });
+                return Ok(());
+            }
+        }
         // Test-scope write of a bound-to target responder's persistent
         // state field: `target.read_count = 0`.
         if let Some((instance, field)) = self.as_transactor_state(target) {

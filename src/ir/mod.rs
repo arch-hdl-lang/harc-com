@@ -327,6 +327,20 @@ pub struct TransactorMethodSchema {
     pub n_params: usize,
     /// True for `-> T` methods (the function carries a `ret` slot).
     pub has_ret: bool,
+    /// Test-scope `on <obj>.<method> pre` hook bodies, registration
+    /// order. Each is a `FunctionKind::TransactorBody` function sharing
+    /// the method's parameter signature (the hook sees the same args).
+    /// The hook bodies mutate promoted host state (`_tb` scalar fields)
+    /// by reference and read the firing instance's transactor state
+    /// (`drv.last_read`); host-state promotion (a captured run-scope
+    /// `let` becomes a `_tb` field) is what lets the function-per-CFG IR
+    /// express v1's `[&]`-capturing hook closure. Fired BEFORE the body
+    /// at the `emit_method` call site (mirrors v1's `<Type>_<method>_pre`
+    /// fan-out loop). Empty for a method with no registered hooks.
+    pub pre_hooks: Vec<FunctionId>,
+    /// Test-scope `on <obj>.<method> post` hook bodies — fired AFTER the
+    /// body. See `pre_hooks`.
+    pub post_hooks: Vec<FunctionId>,
 }
 
 impl TransactorSchema {
@@ -889,6 +903,15 @@ pub struct RegblockBinding {
     pub field: String,
     pub regblock: RegblockId,
     pub helper_field: String,
+    /// Per-register `on regs.REG` write callbacks: `(register-name,
+    /// callback-function)`, registration order. Each callback is a
+    /// one-param (`data : uint`) `FunctionKind::TransactorBody` function;
+    /// `record_write` fires the matching register's callback after the
+    /// mirror update, with a per-binding recursion-depth guard (v1's
+    /// `<regs>_cb_depth` / `HARC_RAL_CB_MAX_DEPTH`). Empty when the test
+    /// registers no callbacks on this binding (then `record_write` emits a
+    /// plain mirror `RecordFieldWrite` with no guard, the prior behavior).
+    pub callbacks: Vec<(String, FunctionId)>,
 }
 
 /// One scalar testbench field (`expected : uint<32> default 0`).
@@ -982,6 +1005,19 @@ pub enum FunctionKind {
     /// Called via `CallTarget::Tseq` from a test-scope `let txns =
     /// Name(args)`.
     Tseq { record: RecordId },
+    /// A test-scope closure-hook body — either an `on <obj>.<method>
+    /// pre/post` method hook or an `on regs.REG` per-register write
+    /// callback. Lowered with the firing context's surface (the method's
+    /// params / a single `data` param) but in the TEST scope's
+    /// `LowerCtx`, so it resolves promoted `_tb` host fields, the firing
+    /// transactor's state (`drv.last_read`), regblock bindings, and the
+    /// passive `record_*` API. Emitted as a free `[&]`-capturing lambda
+    /// named by `TbFunction::name`, called from the firing site
+    /// (`emit_method` pre/post fan-out, or `Stmt::RecordWriteCb`
+    /// dispatch). This is the host-state-promotion mechanism that lets
+    /// the function-per-CFG IR express v1's reference-capturing hook
+    /// closures.
+    TestHook,
 }
 
 #[derive(Debug, Clone)]
@@ -1075,6 +1111,35 @@ pub enum Stmt {
         field: String,
         index: Option<Expr>,
         value: Expr,
+    },
+    /// `regs.record_write(addr, data)` where the binding has a per-register
+    /// `on regs.REG` write callback registered — the firing form of the
+    /// passive RAL record API. The address was const-decoded at lowering to
+    /// the single target register, so the mirror update is a `RecordFieldWrite`
+    /// in disguise (same `local`/`field`/masked `value`); the addition is the
+    /// recursion-depth guard + callback dispatch. Emission mirrors v1's
+    /// `try_emit_record_write`: bump `<binding>_cb_depth`, FATAL+`errors++`
+    /// past `HARC_RAL_CB_MAX_DEPTH`, else write the mirror cell and (when
+    /// `callback` is `Some`) call the callback with the observed value, then
+    /// un-bump. A `record_write` whose register has NO callback but whose
+    /// BINDING has callbacks on OTHER registers still routes here (carrying
+    /// `callback: None`) so its mirror write is depth-counted consistently
+    /// (matches v1, which wraps the whole decode chain in one guard).
+    RecordWriteCb {
+        /// Mirror record local (the `<Block>_Mirror` instance).
+        local: LocalId,
+        /// Per-binding recursion-depth counter base name (`<binding>`).
+        binding: String,
+        /// Target register name (the const-decoded register).
+        field: String,
+        /// The const-decoded register byte offset — used verbatim in the
+        /// recursion-guard FATAL message so it matches v1's `at addr 0x..`.
+        offset: u64,
+        /// Masked observed value to store in the mirror cell.
+        value: Expr,
+        /// Callback for this register, fired after the mirror update.
+        /// `None` when only other registers in the binding carry callbacks.
+        callback: Option<FunctionId>,
     },
     /// `_tb.<field> = value` on a scalar testbench field (run/check-
     /// shared host state — see `TestbenchSchema::scalar_fields`). The

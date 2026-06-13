@@ -27,8 +27,8 @@ mod transactors;
 
 use crate::ast::{
     AddrmapDecl, Block, BuiltinTy, BusDecl, ClockDecl, ComponentDecl, ComponentItem, ExprKind,
-    HookableMethod, Item, ScopeDecl, SourceFile, Stmt as AstStmt, StmtKind, TestDecl, TestItem,
-    TransactorMode, TypeExpr,
+    HookSide, HookableMethod, Item, OnPhase, ScopeDecl, SourceFile, Stmt as AstStmt, StmtKind,
+    TestDecl, TestItem, TransactorMode, TypeExpr,
 };
 use crate::ir::{
     self, BasicBlock, BlockId, ClockSpec, ComponentSchema, ConstraintRef, ConstraintSite,
@@ -636,6 +636,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         scoreboards: Vec::new(),
         consts: consts.clone(),
         tb_scalar_fields: HashSet::new(),
+        promoted_tb_lets: HashSet::new(),
+        regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
         regblock_bindings: HashMap::new(),
@@ -694,6 +696,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         scoreboards: Vec::new(),
         consts: consts.clone(),
         tb_scalar_fields: HashSet::new(),
+        promoted_tb_lets: HashSet::new(),
+        regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
         regblock_bindings: HashMap::new(),
@@ -833,6 +837,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         scoreboards: prog.scoreboards.clone(),
         consts: consts.clone(),
         tb_scalar_fields: HashSet::new(),
+        promoted_tb_lets: HashSet::new(),
+        regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
         regblock_bindings: HashMap::new(),
@@ -1202,6 +1208,16 @@ fn lower_test(
     let mut clocks: Vec<&ClockDecl> = Vec::new();
     let mut scope: Option<&ScopeDecl> = None;
     let mut bare_stmts: Vec<&AstStmt> = Vec::new();
+    // Test-scope `on <obj>.<method> pre/post` method hooks, in source
+    // order. Resolved to a transactor field + method and lowered as
+    // `FunctionKind::TestHook` bodies once the test ctx is built.
+    let mut method_hook_asts: Vec<(HookSide, &crate::ast::OnHandler)> = Vec::new();
+    // Candidate `on regs.REG` per-register write callbacks (`on
+    // <ident>.<name>`, no hook side / period), carried as whole
+    // statements so a non-regblock candidate can fall back to the
+    // bare-statement path. Resolved against the regblock bindings +
+    // lowered as `FunctionKind::TestHook` callbacks.
+    let mut reg_cb_asts: Vec<&AstStmt> = Vec::new();
     // Named `phase <name> ... end phase <name>` blocks (spec §7.2). Each
     // is callable by `<name>()` from the run/check body; the call site is
     // INLINED with the phase block's statements (v1 emits a `[&]() ->
@@ -1723,21 +1739,36 @@ fn lower_test(
             }
             TestItem::Stmt(s) => {
                 // Test-scope pre/post method hook (`on drv.send pre ...
-                // end on`): a hookable-method hook registration. Out of
-                // the TB-IR subset — the hook body is a `[&]`-capturing
-                // closure that mutates test-scope `let`s by reference, and
-                // the function-per-CFG IR has no way to express a closure
-                // lexically nested in the run coroutine capturing its
-                // locals (v1 emits it directly as C++). A precise reject
-                // here pre-empts the generic bare-statement/scope mixing
-                // error below, which would otherwise bury the real reason.
+                // end on`): a hookable-method hook registration. Collected
+                // here and lowered as a `FunctionKind::TestHook` body after
+                // the test ctx is built (host-state promotion lets the
+                // function-per-CFG IR express v1's `[&]`-capturing hook
+                // closure — captured run-scope `let`s become `_tb` fields).
+                // Routing it out of `bare_stmts` also pre-empts the generic
+                // bare-statement/scope mixing error below.
                 if let StmtKind::On(h) = &s.kind {
-                    if h.hook.is_some() {
-                        return Err(unsupported(
-                            "a test-scope `on <obj>.<method> pre/post` method hook",
-                            "pre/post method hooks register a `[&]`-capturing closure that \
-                             mutates test-scope state by reference; lower this with `--codegen v1`",
-                        ));
+                    if let Some(side) = h.hook {
+                        if h.phase == OnPhase::PostEval {
+                            return Err(unsupported(
+                                "a test-scope `on <obj>.<method> phase post_eval` hook",
+                                "only `pre`/`post` method hooks are lowered",
+                            ));
+                        }
+                        method_hook_asts.push((side, h));
+                        continue;
+                    }
+                    // Candidate per-register `on regs.REG` write callback
+                    // (`on <ident>.<name>`, no hook side / period): collect
+                    // for resolution once regblock bindings are known. A
+                    // non-regblock `<ident>.<name>` cycle-trigger falls back
+                    // to bare_stmts (it never matches a regblock binding).
+                    if h.hook.is_none() && !h.periodic {
+                        if let ExprKind::Field { target, .. } = &*h.event.kind {
+                            if matches!(&*target.kind, ExprKind::Ident(_)) {
+                                reg_cb_asts.push(s);
+                                continue;
+                            }
+                        }
                     }
                 }
                 bare_stmts.push(s)
@@ -2182,6 +2213,10 @@ fn lower_test(
             field: binding.clone(),
             regblock: *rbid,
             helper_field: helper_field.clone(),
+            // Per-register `on regs.REG` write callbacks are lowered after
+            // the run/check bodies (their bodies share the test ctx) and
+            // back-patched into this entry; empty until then.
+            callbacks: Vec::new(),
         });
         regblock_init_order.push(binding.clone());
     }
@@ -2411,6 +2446,149 @@ fn lower_test(
         unbound_state_actors.push((field.clone(), *xid));
     }
 
+    // ── Closure-hook cluster: `on <obj>.<method> pre/post` method hooks ──
+    //
+    // Resolve each collected hook to its transactor field + method, then
+    // promote the test-scope `let`s the hook bodies capture by reference
+    // into `_tb` scalar host fields (host-state promotion). The hook
+    // bodies are lowered as `FunctionKind::TestHook` functions AFTER the
+    // ctx is built (below, alongside run/check) so they share the same
+    // resolution (`_tb.<field>` host state, the firing transactor's
+    // `_tb.drv.last_read` state, the method's by-value params). v1 emits
+    // these as `<Type>_<method>_pre/_post` `[&]`-capturing closures; the
+    // promotion is what lets the function-per-CFG IR express them.
+    let transactor_field_map: HashMap<String, TransactorId> =
+        transactor_fields.iter().cloned().collect();
+    // Resolved hooks: (transactor, method, side, &OnHandler).
+    let mut resolved_hooks: Vec<(TransactorId, String, HookSide, &crate::ast::OnHandler)> =
+        Vec::new();
+    let mut promoted_lets: HashSet<String> = HashSet::new();
+    for (side, h) in &method_hook_asts {
+        let (xfield, method) = resolve_method_hook_target(&h.event).ok_or_else(|| {
+            unsupported(
+                "an `on <obj>.<method> pre/post` hook whose `<obj>.<method>` is not \
+                 a `<transactor-field>.<method>` access",
+                "the hook target must resolve to a method on a transactor testbench field",
+            )
+        })?;
+        let xid = transactor_field_map.get(&xfield).copied().ok_or_else(|| {
+            LowerError::Invalid(format!(
+                "`on {xfield}.{method}` hook: `{xfield}` is not a transactor testbench field"
+            ))
+        })?;
+        let xschema = prog.transactor(xid);
+        if xschema.method(&method).is_none() {
+            return Err(LowerError::Invalid(format!(
+                "`on {xfield}.{method}` hook: transactor `{}` declares no method `{method}`",
+                xschema.name
+            )));
+        }
+        // Captured run-scope lets referenced (bare) in the hook body,
+        // minus the hook's OWN locals (which shadow a same-named test let).
+        let mut captured = HashSet::new();
+        collect_idents_in_block(&h.body, &mut captured);
+        let mut hook_locals = HashSet::new();
+        collect_local_decls_in_block(&h.body, &mut hook_locals);
+        for name in &captured {
+            if test_let_names.contains(name) && !hook_locals.contains(name) {
+                promoted_lets.insert(name.clone());
+            }
+        }
+        resolved_hooks.push((xid, method, *side, h));
+    }
+    // Resolve `on regs.REG` per-register write callbacks against the
+    // regblock bindings. A candidate `on <ident>.<name>` whose `<ident>`
+    // is not a regblock binding is NOT a callback — push it back to
+    // bare_stmts (it is a cycle-trigger handler, handled there).
+    // Resolved callbacks: (binding, register, &OnHandler).
+    let mut resolved_reg_cbs: Vec<(String, String, &crate::ast::OnHandler)> = Vec::new();
+    for s in &reg_cb_asts {
+        let StmtKind::On(h) = &s.kind else {
+            unreachable!("collected only StmtKind::On candidates");
+        };
+        let (binding, reg) = match &*h.event.kind {
+            ExprKind::Field { target, name } => match &*target.kind {
+                ExprKind::Ident(id) => (id.name.clone(), name.name.clone()),
+                _ => unreachable!("collected only `on <ident>.<name>` shapes"),
+            },
+            _ => unreachable!("collected only `on <ident>.<name>` shapes"),
+        };
+        let Some(bctx) = regblock_bindings_map.get(&binding) else {
+            // Not a regblock binding → a cycle-trigger handler; leave it
+            // for the bare-statement path.
+            bare_stmts.push(s);
+            continue;
+        };
+        if !bctx.registers.iter().any(|r| r.name == reg) {
+            return Err(LowerError::Invalid(format!(
+                "`on {binding}.{reg}`: regblock binding `{binding}` declares no register `{reg}`"
+            )));
+        }
+        // A callback body may capture run-scope lets too (host-state
+        // promotion, same as method hooks), minus its own locals.
+        let mut captured = HashSet::new();
+        collect_idents_in_block(&h.body, &mut captured);
+        let mut hook_locals = HashSet::new();
+        collect_local_decls_in_block(&h.body, &mut hook_locals);
+        for name in &captured {
+            if test_let_names.contains(name) && !hook_locals.contains(name) {
+                promoted_lets.insert(name.clone());
+            }
+        }
+        resolved_reg_cbs.push((binding, reg, h));
+    }
+    // Promote each captured let: drop its `let` declaration (it becomes a
+    // `_tb` field with a default) and register it as a scalar host field.
+    // The init must be a compile-time constant (the field's `default`);
+    // v1's captured lets in these fixtures all init to literals.
+    if !promoted_lets.is_empty() {
+        // Register one `_tb` scalar field per promoted let, in declaration
+        // order (deterministic schema order).
+        for s in &test_let_stmts {
+            let StmtKind::Let(l) = &s.kind else { continue };
+            if !promoted_lets.contains(&l.name.name) {
+                continue;
+            }
+            let ty = l
+                .ty
+                .as_ref()
+                .and_then(tb_scalar_field_ir_type)
+                .unwrap_or(IrType::UInt(None));
+            let default = match l.value.as_ref().map(|v| &*v.kind) {
+                Some(ExprKind::Int(s)) => {
+                    s.replace('_', "").parse::<u64>().map_err(|_| {
+                        LowerError::Invalid(format!(
+                            "promoted hook-captured `let {}` has a non-integer initializer",
+                            l.name.name
+                        ))
+                    })?
+                }
+                None => 0,
+                _ => {
+                    return Err(unsupported(
+                        &format!(
+                            "a hook-captured `let {}` with a non-constant initializer",
+                            l.name.name
+                        ),
+                        "a closure-hook-captured test-scope let is promoted to a `_tb` host \
+                         field whose default must be a compile-time constant",
+                    ));
+                }
+            };
+            scalar_fields.push(ir::TbScalarFieldSchema {
+                name: l.name.name.clone(),
+                ty,
+                default,
+            });
+        }
+        // Drop the promoted lets from the hoisted-let list — they are now
+        // `_tb` host fields, not run-function locals.
+        test_let_stmts.retain(|s| match &s.kind {
+            StmtKind::Let(l) => !promoted_lets.contains(&l.name.name),
+            _ => true,
+        });
+    }
+
     let tb_id = TestbenchId(prog.testbenches.len() as u32);
     prog.testbenches.push(TestbenchSchema {
         name: tb_schema_name,
@@ -2515,6 +2693,27 @@ fn lower_test(
         check_stmts = expanded_check;
     }
 
+    // Reserve `FunctionId`s for the `on regs.REG` write callbacks so
+    // `try_lower_record_write` (run during run/check/callback lowering)
+    // can reference the matching callback that hasn't been lowered yet.
+    // Pushes after the ctx, in this order: samplers, run, check?, method
+    // hooks, then reg callbacks — so the callback base is fixed now.
+    let mut regblock_callbacks: HashMap<String, Vec<(String, FunctionId)>> = HashMap::new();
+    {
+        let n_check = if check_stmts.is_empty() { 0 } else { 1 };
+        let cb_base = prog.functions.len()
+            + cov_fields.len()
+            + 1 // run
+            + n_check
+            + resolved_hooks.len();
+        for (i, (binding, reg, _)) in resolved_reg_cbs.iter().enumerate() {
+            regblock_callbacks
+                .entry(binding.clone())
+                .or_default()
+                .push((reg.clone(), FunctionId((cb_base + i) as u32)));
+        }
+    }
+
     let ctx = LowerCtx {
         dut_field: "dut".to_string(),
         tb_field: if synthetic { None } else { Some("_tb".to_string()) },
@@ -2535,6 +2734,8 @@ fn lower_test(
         scoreboards: prog.scoreboards.clone(),
         consts: consts.clone(),
         tb_scalar_fields: scalar_fields.iter().map(|f| f.name.clone()).collect(),
+        promoted_tb_lets: promoted_lets.clone(),
+        regblock_callbacks: regblock_callbacks.clone(),
         tb_methods,
         test_scope_lets: test_let_names,
         regblock_bindings: regblock_bindings_map,
@@ -2606,6 +2807,89 @@ fn lower_test(
         Some(check_id)
     };
 
+    // Lower each `on <obj>.<method> pre/post` hook body as a
+    // `FunctionKind::TestHook` function sharing the method's parameter
+    // signature, then back-patch its FunctionId onto the target method's
+    // `pre_hooks`/`post_hooks` (fired at the `emit_method` call site).
+    for (xid, method, side, h) in &resolved_hooks {
+        // Snapshot the method's typed params (names + IR types) from its
+        // lowered body — the hook sees the same args by the same names.
+        let mparams: Vec<TypedParam> = {
+            let xschema = prog.transactor(*xid);
+            let m = xschema.method(method).expect("hook method resolved above");
+            prog.function(m.function).params.clone()
+        };
+        let hook_id = FunctionId(prog.functions.len() as u32);
+        let hook_fn = lower_method_hook_body(
+            hook_id,
+            format!(
+                "{}_{method}_{}",
+                prog.transactor(*xid).name,
+                match side {
+                    HookSide::Pre => "pre",
+                    HookSide::Post => "post",
+                }
+            ),
+            Some(tb_id),
+            &mparams,
+            &h.body,
+            &ctx,
+            helpers,
+            constraint_sites,
+        )?;
+        prog.functions.push(hook_fn);
+        // Back-patch onto the method schema.
+        let xschema = &mut prog.transactors[xid.index()];
+        let m = xschema
+            .methods
+            .iter_mut()
+            .find(|m| &m.name == method)
+            .expect("hook method resolved above");
+        match side {
+            HookSide::Pre => m.pre_hooks.push(hook_id),
+            HookSide::Post => m.post_hooks.push(hook_id),
+        }
+    }
+
+    // Lower each `on regs.REG` per-register write callback as a
+    // `FunctionKind::TestHook` function (single `data` param), then
+    // back-patch its FunctionId onto the binding's `callbacks` table.
+    // `record_write` dispatches the matching callback after the mirror
+    // update, guarded by a per-binding recursion-depth counter.
+    for (binding, reg, h) in &resolved_reg_cbs {
+        let cb_id = FunctionId(prog.functions.len() as u32);
+        // Must match the id reserved into `ctx.regblock_callbacks` so the
+        // `RecordWriteCb` firing sites reference this exact callback.
+        debug_assert!(
+            regblock_callbacks
+                .get(binding)
+                .is_some_and(|v| v.iter().any(|(r, f)| r == reg && *f == cb_id)),
+            "reg callback id drift for {binding}.{reg}"
+        );
+        let cb_fn = lower_reg_cb_body(
+            cb_id,
+            format!("{}_{binding}_{reg}_cb", t.name.name),
+            Some(tb_id),
+            &h.body,
+            &ctx,
+            helpers,
+            constraint_sites,
+        )?;
+        prog.functions.push(cb_fn);
+        let tb = &mut prog.testbenches[tb_id.index()];
+        let b = tb
+            .regblock_bindings
+            .iter_mut()
+            .find(|b| &b.field == binding)
+            .expect("regblock binding resolved above");
+        if b.callbacks.iter().any(|(r, _)| r == reg) {
+            return Err(LowerError::Invalid(format!(
+                "`on {binding}.{reg}`: register `{reg}` already has a write callback"
+            )));
+        }
+        b.callbacks.push((reg.clone(), cb_id));
+    }
+
     prog.tests.push(TestSchema {
         name: t.name.name.clone(),
         testbench: tb_id,
@@ -2674,6 +2958,210 @@ fn collect_stmts<'a>(b: &'a Block, skip_tb_wire: bool, out: &mut Vec<&'a AstStmt
             continue;
         }
         out.push(s);
+    }
+}
+
+/// Resolve an `on <obj>.<method> pre/post` hook target expression to
+/// `(transactor-field, method)`. The impl-form desugarer has already
+/// rewritten the transactor testbench field to `_tb.<field>`, so the
+/// event is either `_tb.<field>.<method>` (impl form) or `<field>.<method>`
+/// (classic form). Returns `None` for any other shape.
+fn resolve_method_hook_target(event: &crate::ast::Expr) -> Option<(String, String)> {
+    let ExprKind::Field { target, name: method } = &*event.kind else {
+        return None;
+    };
+    match &*target.kind {
+        // Classic form: `<field>.<method>`.
+        ExprKind::Ident(field) => Some((field.name.clone(), method.name.clone())),
+        // Impl form: `_tb.<field>.<method>`.
+        ExprKind::Field { target: root, name: field } => {
+            let ExprKind::Ident(root) = &*root.kind else {
+                return None;
+            };
+            if root.name != "_tb" {
+                return None;
+            }
+            Some((field.name.clone(), method.name.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Collect every bare identifier name read anywhere in a block (used to
+/// find the test-scope `let`s a closure-hook body captures by reference).
+/// Over-approximates harmlessly: a name that is also a hook-body local
+/// or a method param is still a test-scope let only if it appears in
+/// `test_let_names` (checked by the caller), so a false positive there is
+/// impossible — the intersection with the let set is what promotes.
+fn collect_idents_in_block(b: &Block, out: &mut HashSet<String>) {
+    for s in &b.stmts {
+        collect_idents_in_stmt(s, out);
+    }
+}
+
+fn collect_idents_in_stmt(s: &AstStmt, out: &mut HashSet<String>) {
+    use crate::ast::CallArg;
+    match &s.kind {
+        StmtKind::Let(l) => {
+            if let Some(v) = &l.value {
+                collect_idents_in_expr(v, out);
+            }
+        }
+        StmtKind::Assign { target, value } | StmtKind::Send { target, value } => {
+            collect_idents_in_expr(target, out);
+            collect_idents_in_expr(value, out);
+        }
+        StmtKind::Expr(e) => collect_idents_in_expr(e, out),
+        StmtKind::For(f) => {
+            collect_idents_in_expr(&f.iter, out);
+            collect_idents_in_block(&f.body, out);
+        }
+        StmtKind::Repeat(r) => {
+            collect_idents_in_expr(&r.count, out);
+            collect_idents_in_block(&r.body, out);
+        }
+        StmtKind::Loop(b) => collect_idents_in_block(b, out),
+        StmtKind::While { cond, body, .. } => {
+            collect_idents_in_expr(cond, out);
+            collect_idents_in_block(body, out);
+        }
+        StmtKind::If(ifs) => {
+            collect_idents_in_expr(&ifs.cond, out);
+            collect_idents_in_block(&ifs.then_block, out);
+            for (c, b) in &ifs.elsifs {
+                collect_idents_in_expr(c, out);
+                collect_idents_in_block(b, out);
+            }
+            if let Some(b) = &ifs.else_block {
+                collect_idents_in_block(b, out);
+            }
+        }
+        StmtKind::On(h) => {
+            collect_idents_in_expr(&h.event, out);
+            collect_idents_in_block(&h.body, out);
+        }
+        StmtKind::Assert(v) | StmtKind::Assume(v) | StmtKind::Cover(v) => {
+            if let Some(e) = &v.expr {
+                collect_idents_in_expr(e, out);
+            }
+            if let Some(e) = &v.else_fail {
+                collect_idents_in_expr(e, out);
+            }
+        }
+        StmtKind::Log { args, .. } | StmtKind::LogF { args, .. } => {
+            for a in args {
+                match a {
+                    CallArg::Expr(e) | CallArg::Named { value: e, .. } => {
+                        collect_idents_in_expr(e, out)
+                    }
+                }
+            }
+        }
+        StmtKind::Return(opt) => {
+            if let Some(e) = opt {
+                collect_idents_in_expr(e, out);
+            }
+        }
+        StmtKind::Yield(e) | StmtKind::Release(e) => collect_idents_in_expr(e, out),
+        StmtKind::Wait { duration, .. } => collect_idents_in_expr(duration, out),
+        StmtKind::WaitUntil { conditions, .. } => {
+            for c in conditions {
+                collect_idents_in_expr(c, out);
+            }
+        }
+        // Remaining statement shapes never appear inside a closure-hook
+        // body in this subset (fork/parallel/schedule/select/after/
+        // randomize/emit). A future shape that does will simply not have
+        // its idents collected — promotion would then miss a capture and
+        // the hook lowering would reject the unresolved name precisely,
+        // never silently miscompile.
+        _ => {}
+    }
+}
+
+/// Names declared by `let` anywhere in a block (including nested
+/// blocks + loop induction vars). Used to subtract a hook body's OWN
+/// locals from its captured-ident set, so a hook-local that happens to
+/// share a name with a test-scope `let` is not mistakenly promoted.
+fn collect_local_decls_in_block(b: &Block, out: &mut HashSet<String>) {
+    for s in &b.stmts {
+        collect_local_decls_in_stmt(s, out);
+    }
+}
+
+fn collect_local_decls_in_stmt(s: &AstStmt, out: &mut HashSet<String>) {
+    match &s.kind {
+        StmtKind::Let(l) => {
+            out.insert(l.name.name.clone());
+        }
+        StmtKind::For(f) => {
+            out.insert(f.var.name.clone());
+            collect_local_decls_in_block(&f.body, out);
+        }
+        StmtKind::Repeat(r) => collect_local_decls_in_block(&r.body, out),
+        StmtKind::Loop(b) => collect_local_decls_in_block(b, out),
+        StmtKind::While { body, .. } => collect_local_decls_in_block(body, out),
+        StmtKind::If(ifs) => {
+            collect_local_decls_in_block(&ifs.then_block, out);
+            for (_, b) in &ifs.elsifs {
+                collect_local_decls_in_block(b, out);
+            }
+            if let Some(b) = &ifs.else_block {
+                collect_local_decls_in_block(b, out);
+            }
+        }
+        StmtKind::On(h) => collect_local_decls_in_block(&h.body, out),
+        _ => {}
+    }
+}
+
+fn collect_idents_in_expr(e: &crate::ast::Expr, out: &mut HashSet<String>) {
+    use crate::ast::CallArg;
+    match &*e.kind {
+        ExprKind::Ident(id) => {
+            out.insert(id.name.clone());
+        }
+        ExprKind::Field { target, .. } => collect_idents_in_expr(target, out),
+        ExprKind::Index { target, index } => {
+            collect_idents_in_expr(target, out);
+            collect_idents_in_expr(index, out);
+        }
+        ExprKind::BitSlice { target, hi, lo } => {
+            collect_idents_in_expr(target, out);
+            collect_idents_in_expr(hi, out);
+            collect_idents_in_expr(lo, out);
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_idents_in_expr(lhs, out);
+            collect_idents_in_expr(rhs, out);
+        }
+        ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => {
+            collect_idents_in_expr(expr, out)
+        }
+        ExprKind::Paren(inner) => collect_idents_in_expr(inner, out),
+        ExprKind::Ternary { cond, then_branch, else_branch } => {
+            collect_idents_in_expr(cond, out);
+            collect_idents_in_expr(then_branch, out);
+            collect_idents_in_expr(else_branch, out);
+        }
+        ExprKind::Call { callee, args } => {
+            collect_idents_in_expr(callee, out);
+            for a in args {
+                match a {
+                    CallArg::Expr(x) | CallArg::Named { value: x, .. } => {
+                        collect_idents_in_expr(x, out)
+                    }
+                }
+            }
+        }
+        ExprKind::Send { target, value } => {
+            collect_idents_in_expr(target, out);
+            collect_idents_in_expr(value, out);
+        }
+        ExprKind::ForkCall { call } => collect_idents_in_expr(call, out),
+        // Literals / time / other leaf or out-of-subset forms carry no
+        // capturable run-scope ident in a closure-hook body.
+        _ => {}
     }
 }
 
@@ -2857,6 +3345,27 @@ pub(crate) struct LowerCtx {
     /// Scalar testbench field names (`TestbenchSchema::scalar_fields`),
     /// for `_tb.<field>` access lowering.
     pub tb_scalar_fields: HashSet<String>,
+    /// Test-scope `let` names PROMOTED to `_tb` scalar host fields
+    /// because a closure-hook body (`on <obj>.<method> pre/post`)
+    /// captures them by reference (host-state promotion). A bare ident
+    /// in this set resolves to `Expr::TbField`/`Stmt::TbFieldWrite`
+    /// (NOT a run-function local) so the run coroutine and the hook
+    /// function share the same `_tb` cell — the mechanism that lets the
+    /// function-per-CFG IR express v1's `[&]`-capturing hook closure.
+    /// These names are also present in `tb_scalar_fields` (the `_tb.X`
+    /// access path); the separate set drives bare-ident resolution since
+    /// the impl-form desugarer leaves test-scope lets unqualified.
+    pub promoted_tb_lets: HashSet<String>,
+    /// Per-register `on regs.REG` write callbacks, keyed by regblock
+    /// binding name → `(register, callback-FunctionId)`. Consulted by
+    /// `try_lower_record_write`: when a `record_write` targets a binding
+    /// in this map it lowers to `Stmt::RecordWriteCb` (mirror update +
+    /// recursion-depth guard + callback dispatch) instead of a plain
+    /// `RecordFieldWrite`. The callback FunctionIds are reserved before
+    /// the run/check/callback bodies are lowered so the firing sites can
+    /// reference them; the bodies are lowered (and the schema patched)
+    /// afterward at the matching reserved ids.
+    pub regblock_callbacks: HashMap<String, Vec<(String, FunctionId)>>,
     /// Testbench helper methods (`function`/`hookable` declared inside
     /// the bound testbench), CFG-inlined at `_tb.<m>(...)` call sites
     /// like impure helpers — v1 emits them as `[&]`-capturing lambdas
@@ -3107,6 +3616,92 @@ fn lower_function<'a>(
         b.terminate(Terminator::Return);
     }
     b.finish(id, name, kind, owner)
+}
+
+/// Lower one closure-hook body (`on <obj>.<method> pre/post`) as a
+/// `FunctionKind::TestHook` function. The hook sees the firing method's
+/// args by the same names, so `params` are pre-declared as locals before
+/// the body; everything else resolves through the TEST scope's `ctx`
+/// (promoted `_tb` host fields, the firing transactor's state via the
+/// desugared `_tb.<inst>.<field>` form, regblock bindings). Mirrors v1's
+/// `<Type>_<method>_pre/_post` `[&]`-capturing closure body.
+#[allow(clippy::too_many_arguments)]
+fn lower_method_hook_body<'a>(
+    id: FunctionId,
+    name: String,
+    owner: Option<TestbenchId>,
+    params: &[TypedParam],
+    body: &Block,
+    ctx: &'a LowerCtx,
+    helpers: &'a helpers::HelperRegistry<'a>,
+    constraint_sites: &'a RefCell<Vec<ConstraintSite>>,
+) -> Result<TbFunction, LowerError> {
+    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    for p in params {
+        let local = b.declare(&p.name);
+        b.set_local_type(local, p.ty.clone());
+    }
+    b.lower_block_stmts(body)?;
+    if !b.is_terminated() {
+        b.terminate(Terminator::Return);
+    }
+    let mut f = b.finish(id, name, FunctionKind::TestHook, owner)?;
+    f.params = params.to_vec();
+    Ok(f)
+}
+
+/// Lower one `on regs.REG` per-register write callback body as a
+/// `FunctionKind::TestHook` function. The callback sees the observed
+/// value as a single `data` param (v1's `[&](uint64_t data)` closure).
+/// The body calls the passive `record_write`/`record_read` API, so the
+/// regblock mirror locals are declared at entry (same as the Run
+/// function) — the backend declares the mirror struct + recursion-depth
+/// counter ONCE at test scope (shared by `[&]` capture between the run
+/// coroutine and every callback), so these per-function mirror locals
+/// resolve to that one captured struct by name.
+#[allow(clippy::too_many_arguments)]
+fn lower_reg_cb_body<'a>(
+    id: FunctionId,
+    name: String,
+    owner: Option<TestbenchId>,
+    body: &Block,
+    ctx: &'a LowerCtx,
+    helpers: &'a helpers::HelperRegistry<'a>,
+    constraint_sites: &'a RefCell<Vec<ConstraintSite>>,
+) -> Result<TbFunction, LowerError> {
+    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    // The callback param `data` — the observed write value. Declared
+    // FIRST so it is param index 0.
+    let data = b.declare("data");
+    b.set_local_type(data, IrType::UInt(None));
+    // Regblock + addrmap mirror locals, same as the Run function — the
+    // callback body's `record_write`/`record_read` resolve through them,
+    // and the RecordInit defines the local for the def/use verifier. The
+    // BACKEND skips emitting both the declaration and the RecordInit for a
+    // callback-bearing (shared) mirror: it is declared + default-
+    // constructed ONCE at test scope and captured, so re-initializing it
+    // on every callback entry would wipe the mirror mid-run.
+    for binding in &ctx.regblock_init_order {
+        let rec = ctx.regblock_bindings[binding].record;
+        let id = b.declare(binding);
+        b.set_local_type(id, IrType::Record(rec));
+        b.push(ir::Stmt::RecordInit(id, rec));
+    }
+    for (key, rec) in &ctx.addrmap_init_order {
+        let id = b.declare(key);
+        b.set_local_type(id, IrType::Record(*rec));
+        b.push(ir::Stmt::RecordInit(id, *rec));
+    }
+    b.lower_block_stmts(body)?;
+    if !b.is_terminated() {
+        b.terminate(Terminator::Return);
+    }
+    let mut f = b.finish(id, name, FunctionKind::TestHook, owner)?;
+    f.params = vec![TypedParam {
+        name: "data".to_string(),
+        ty: IrType::UInt(None),
+    }];
+    Ok(f)
 }
 
 impl<'a> FuncBuilder<'a> {
@@ -3444,9 +4039,9 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                     }
                 }
                 ir::Stmt::Assign(_, e) | ir::Stmt::DutWrite(_, e) => in_expr(e),
-                ir::Stmt::RecordFieldWrite { value, .. } | ir::Stmt::TbFieldWrite { value, .. } => {
-                    in_expr(value)
-                }
+                ir::Stmt::RecordFieldWrite { value, .. }
+                | ir::Stmt::RecordWriteCb { value, .. }
+                | ir::Stmt::TbFieldWrite { value, .. } => in_expr(value),
                 ir::Stmt::AssertCheck { cond, on_fail } => {
                     in_expr(cond).or_else(|| on_fail.args.iter().find_map(|a| in_expr(&a.expr)))
                 }
@@ -3575,9 +4170,9 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                     fill_expr(value, instance);
                 }
                 ir::Stmt::Assign(_, e) | ir::Stmt::DutWrite(_, e) => fill_expr(e, instance),
-                ir::Stmt::RecordFieldWrite { value, .. } | ir::Stmt::TbFieldWrite { value, .. } => {
-                    fill_expr(value, instance)
-                }
+                ir::Stmt::RecordFieldWrite { value, .. }
+                | ir::Stmt::RecordWriteCb { value, .. }
+                | ir::Stmt::TbFieldWrite { value, .. } => fill_expr(value, instance),
                 ir::Stmt::AssertCheck { cond, on_fail } => {
                     fill_expr(cond, instance);
                     for a in &mut on_fail.args {
@@ -3797,6 +4392,7 @@ fn fill_initiator_bus_prefix(
                     }
                     Stmt::Assign(_, e)
                     | Stmt::RecordFieldWrite { value: e, .. }
+                    | Stmt::RecordWriteCb { value: e, .. }
                     | Stmt::TbFieldWrite { value: e, .. }
                     | Stmt::TransactorStateWrite { value: e, .. }
                     | Stmt::ComponentFieldWrite { value: e, .. } => {

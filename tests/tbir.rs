@@ -4306,26 +4306,32 @@ fn regblock_bitbash_corpus_lowers() {
 }
 
 /// The corpus `regblock_record_test` fixture carries a per-register
-/// `on regs.REG` write callback — the remaining regblock residual. The
-/// passive `record_write`/`record_read` API it also uses now lowers (see
-/// `regblock_record_api_test`), but the callback lowers (in v1) to a
-/// reference-capturing closure over run-scope state fired from inside
-/// `record_write`, which the function-per-CFG IR cannot express (the
-/// same blocker as the `axilite_hooks` pre/post method hooks). Lowering
-/// rejects it with a precise message naming the callback feature (NOT
-/// the generic bare-statement/scope mixing error), never mis-lowers.
+/// `on regs.REG` write callback. It now LOWERS via host-state promotion:
+/// the callback is a `FunctionKind::TestHook` function back-patched onto
+/// the binding, and a `record_write` targeting a callback-bearing binding
+/// lowers to `Stmt::RecordWriteCb` (mirror update + recursion-depth guard
+/// + callback dispatch) instead of a plain mirror write.
 #[test]
-fn regblock_record_corpus_rejects_precisely() {
-    let err =
-        lower_with_stdlib_bus("regblock_record_test.harc", "BusAxiLite.arch").unwrap_err();
-    let msg = assert_unsupported(&err);
+fn regblock_record_corpus_lowers_with_callback() {
+    let prog = lower_with_stdlib_bus("regblock_record_test.harc", "BusAxiLite.arch")
+        .expect("regblock record callback lowers");
+    let dump = format!("{prog}");
+    // The MM2S_SA write routes through RecordWriteCb with the callback fn.
     assert!(
-        msg.contains("per-register write callback"),
-        "expected the per-register callback residual rejection: {msg}"
+        dump.contains("RecordWriteCb(%regs.MM2S_SA") && dump.contains("cb=fn"),
+        "expected a RecordWriteCb dispatching the MM2S_SA callback: {dump}"
     );
+    // The binding records the callback in its schema.
     assert!(
-        !msg.contains("mixing bare statements"),
-        "should not fall through to the generic mixing error: {msg}"
+        dump.contains("[on MM2S_SA=fn"),
+        "expected the binding to carry the MM2S_SA callback: {dump}"
+    );
+    // The callback body itself writes MM2S_LEN via record_write (still a
+    // RecordWriteCb because the binding is callback-bearing, though that
+    // register carries no own callback).
+    assert!(
+        dump.contains("TestHook") && dump.contains("RecordWriteCb(%regs.MM2S_LEN"),
+        "expected the callback body's mirror write into MM2S_LEN: {dump}"
     );
 }
 

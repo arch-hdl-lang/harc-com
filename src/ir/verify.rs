@@ -544,6 +544,11 @@ impl Checker<'_> {
                     }
                     self.check_expr(value, false, "RecordFieldWrite value");
                 }
+                Stmt::RecordWriteCb { local, field, value, .. } => {
+                    self.check_local(*local);
+                    self.check_record_field(*local, field);
+                    self.check_expr(value, false, "RecordWriteCb value");
+                }
                 Stmt::TbFieldWrite { field, value } => {
                     self.check_tb_field(field);
                     self.check_expr(value, false, "TbFieldWrite value");
@@ -1209,7 +1214,8 @@ fn check_def_before_use(
                         defined[l.index()] = true;
                     }
                 }
-                Stmt::RecordFieldWrite { local, value, .. } => {
+                Stmt::RecordFieldWrite { local, value, .. }
+                | Stmt::RecordWriteCb { local, value, .. } => {
                     // Writing a field READS the record local (it must
                     // be initialized first — RecordInit defines it).
                     if local.index() < defined.len() && !defined[local.index()] {
