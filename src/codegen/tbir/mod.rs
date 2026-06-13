@@ -270,6 +270,73 @@ fn emit_on_handler_regs(out: &mut String, prog: &TbProgram, component: ir::Compo
     }
 }
 
+/// Emit one resolved `connect` edge's subscriber push_back, rooted at
+/// `inst_path` (the instance reaching the connect's owning component).
+fn emit_one_connect(
+    out: &mut String,
+    prog: &TbProgram,
+    inst_path: &str,
+    edge: &ir::ConnectEdgeSchema,
+) {
+    let src = std::iter::once(inst_path.to_string())
+        .chain(edge.src_path.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(".");
+    let sink = std::iter::once(inst_path.to_string())
+        .chain(edge.sink_path.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(".");
+    match &edge.sink {
+        ir::ConnectSink::Method { method } => {
+            let sink_comp = &prog.components[edge.sink_component.index()].name;
+            writeln!(
+                out,
+                "{INDENT}{src}.{}.push_back([&](auto _t) {{ {sink_comp}_{method}({sink}, _t); }});",
+                edge.src_event
+            )
+            .ok();
+        }
+        ir::ConnectSink::Event { event } => {
+            // event→event bridge: forward each emit on the source event into
+            // the sink event's own subscriber list, firing the sink driver's
+            // registered `on <ev>` handler(s). Mirrors v1's
+            // `for (auto& _s : <sink>.<event>) _s(_t);` bridge closure.
+            writeln!(
+                out,
+                "{INDENT}{src}.{}.push_back([&](auto _t) {{ for (auto& _s : {sink}.{event}) _s(_t); }});",
+                edge.src_event
+            )
+            .ok();
+        }
+    }
+}
+
+/// Install the `connect` bridges of every by-value sub-component of
+/// `component` (reached via `inst_path`), recursing depth-first. Used for
+/// an env that holds an agent: the agent's own
+/// `sequencer.dispatched -> drv.req` bridge lives on the agent's schema and
+/// must be installed at `<env>.<agent>` scope. The top component's OWN
+/// connects are emitted by the caller (`cf.connects`); this only walks the
+/// nested sub-components.
+fn emit_nested_connects(
+    out: &mut String,
+    prog: &TbProgram,
+    component: ir::ComponentId,
+    inst_path: &str,
+) {
+    let comp = &prog.components[component.index()];
+    for f in &comp.fields {
+        if let ir::ComponentFieldKind::Sub { component: sub } = &f.kind {
+            let sub_path = format!("{inst_path}.{}", f.name);
+            let sub_comp = &prog.components[sub.index()];
+            for edge in &sub_comp.connects {
+                emit_one_connect(out, prog, &sub_path, edge);
+            }
+            emit_nested_connects(out, prog, *sub, &sub_path);
+        }
+    }
+}
+
 /// Default watchdog clause values (spec §8.6), applied when the source
 /// omits the `period`/`max_idle` clause. Mirror v1's
 /// `WATCHDOG_DEFAULT_PERIOD` / `WATCHDOG_DEFAULT_MAX_IDLE`.
@@ -308,6 +375,38 @@ fn emit_lifecycle_checkers(
         writeln!(out, "{INDENT}{INDENT}{INDENT}{tag}_last = (int64_t)cycle_count;").ok();
         writeln!(out, "{INDENT}{INDENT}{INDENT}{lambda}({inst_path});").ok();
         writeln!(out, "{INDENT}{INDENT}}}").ok();
+        writeln!(out, "{INDENT}}});").ok();
+    }
+
+    // Cycle-trigger handlers (`on <bool-expr>`). Each installs a
+    // `_checkers` closure that re-evaluates the trigger predicate every
+    // primary-clock cycle and fires the body when the predicate satisfies
+    // the requested edge mode. Mirrors v1's `emit_cycle_trigger`.
+    for ch in &comp.cycle_handlers {
+        let lambda = func::cycle_handler_lambda_name(comp, ch);
+        let trigger = func::clause_expr_cpp(prog, ch.function, inst_path, &ch.trigger)?;
+        let tag = format!("_cyc_{inst_tag}_{}", ch.function.0);
+        writeln!(out, "{INDENT}_checkers.push_back([&]() {{").ok();
+        match ch.edge {
+            ir::CycleEdge::Level => {
+                writeln!(out, "{INDENT}{INDENT}if ((bool)({trigger})) {{").ok();
+                writeln!(out, "{INDENT}{INDENT}{INDENT}{lambda}({inst_path});").ok();
+                writeln!(out, "{INDENT}{INDENT}}}").ok();
+            }
+            ir::CycleEdge::Rising | ir::CycleEdge::Falling => {
+                writeln!(out, "{INDENT}{INDENT}static bool {tag}_prev = false;").ok();
+                writeln!(out, "{INDENT}{INDENT}bool {tag}_curr = (bool)({trigger});").ok();
+                let cond = match ch.edge {
+                    ir::CycleEdge::Rising => format!("!{tag}_prev && {tag}_curr"),
+                    ir::CycleEdge::Falling => format!("{tag}_prev && !{tag}_curr"),
+                    ir::CycleEdge::Level => unreachable!(),
+                };
+                writeln!(out, "{INDENT}{INDENT}if ({cond}) {{").ok();
+                writeln!(out, "{INDENT}{INDENT}{INDENT}{lambda}({inst_path});").ok();
+                writeln!(out, "{INDENT}{INDENT}}}").ok();
+                writeln!(out, "{INDENT}{INDENT}{tag}_prev = {tag}_curr;").ok();
+            }
+        }
         writeln!(out, "{INDENT}}});").ok();
     }
 
@@ -495,6 +594,9 @@ fn emit_test(
         for ph in &comp.periodic_handlers {
             func::emit_component_periodic_handler(out, prog, comp, ph, 1)?;
         }
+        for ch in &comp.cycle_handlers {
+            func::emit_component_cycle_handler(out, prog, comp, ch, 1)?;
+        }
         if let Some(w) = &comp.watchdog {
             func::emit_component_watchdog(out, prog, comp, w, 1)?;
         }
@@ -508,40 +610,14 @@ fn emit_test(
     for cf in &tb.component_fields {
         let cname = &prog.components[cf.component.index()].name;
         writeln!(out, "{INDENT}{cname} {};", cf.field).ok();
+        // The top component's own `connect` edges (an env's source→sink, or
+        // an agent instantiated directly at test scope), plus any nested
+        // sub-component's connects (an env holding an agent whose own
+        // `sequencer.dispatched -> drv.req` bridge must be installed).
         for edge in &cf.connects {
-            let src = std::iter::once(cf.field.clone())
-                .chain(edge.src_path.iter().cloned())
-                .collect::<Vec<_>>()
-                .join(".");
-            let sink = std::iter::once(cf.field.clone())
-                .chain(edge.sink_path.iter().cloned())
-                .collect::<Vec<_>>()
-                .join(".");
-            match &edge.sink {
-                ir::ConnectSink::Method { method } => {
-                    let sink_comp = &prog.components[edge.sink_component.index()].name;
-                    writeln!(
-                        out,
-                        "{INDENT}{src}.{}.push_back([&](auto _t) {{ {sink_comp}_{method}({sink}, _t); }});",
-                        edge.src_event
-                    )
-                    .ok();
-                }
-                ir::ConnectSink::Event { event } => {
-                    // event→event bridge: forward each emit on the source
-                    // event into the sink event's own subscriber list,
-                    // firing the sink driver's registered `on <ev>`
-                    // handler(s). Mirrors v1's `for (auto& _s :
-                    // <sink>.<event>) _s(_t);` bridge closure.
-                    writeln!(
-                        out,
-                        "{INDENT}{src}.{}.push_back([&](auto _t) {{ for (auto& _s : {sink}.{event}) _s(_t); }});",
-                        edge.src_event
-                    )
-                    .ok();
-                }
-            }
+            emit_one_connect(out, prog, &cf.field, edge);
         }
+        emit_nested_connects(out, prog, cf.component, &cf.field);
         // `on <ev>(arg)` handler registrations, for this component and any
         // nested sub-components (an env holding an agent). Each subscribes
         // to the event field on its owning instance, bumps the instance's

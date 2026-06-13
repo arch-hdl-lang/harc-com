@@ -203,7 +203,7 @@ Residual first-blocker map (re-run of `harc dump-ir`, 2026-06-12):
 |---|---|
 | `agent` (4) | `heartbeat_idle_test`, `wait_until_quiesce_test`, `watchdog_quiesce_test`, `env_quiesced_phase_test` |
 | `transactor` (5) | `axilite_env_test`, `axilite_seqdrv_test`, `axilite_hooks_test`, `transactor_parse_test`, `transactor_active_test` |
-| `scoreboard` (5) | `axilite_bound_mon_test`, `axilite_multi_payload_test`, `transactor_passive_only_test`, `transactor_agent_mode_test`, `transactor_env_mode_test` |
+| `scoreboard` (5) | `axilite_bound_mon_test`, `axilite_multi_payload_test`, `transactor_passive_only_test`, ~~`transactor_agent_mode_test`~~, ~~`transactor_env_mode_test`~~ — **the last two RESOLVED 2026-06-13 by the agent-mode + cycle-trigger slice; both registered, trace-clean. See that group below.** |
 | `sequencer` (1) | `axilite_connect_test` |
 | `relation` (1) | `relation_inlining_test` |
 | `randomize` (statement-level, 1) | `axilite_constraint_test` (`AxiLiteConstraintTest`) — **RESOLVED 2026-06-13 by the randomize slice; registered, trace-clean. See the `randomize` group below.** |
@@ -416,6 +416,46 @@ The three corpus sequencer fixtures no longer reject on `sequencer` —
 each lowers its `sequencer` now but rejects one level deeper. After the
 **tseq slice** (below) their `tseq` lowers too, so they shift one more
 level deeper (see the tseq residual map).
+
+### agent-mode multi-DUT + cycle-trigger handlers — **RESOLVED 2026-06-13 (agent-mode slice)**
+
+The agent-mode transactor's three remaining blockers now lower
+(docs/tbir-mvp.md "agent-mode + cycle-trigger slice"):
+
+1. **Cycle-trigger `on <bool-expr>` monitor handlers** — the always-on
+   observer half of an agent-mode transactor (`on dut.axil_w_valid &&
+   dut.axil_w_ready`). New IR `ComponentSchema::cycle_handlers`
+   (`CycleTriggerHandlerSchema { trigger, edge, function }` +
+   `CycleEdge`), distinguished from `on <ev>(arg)` subscriptions by
+   `is_event_subscription`. Lowers to a zero-arg `ComponentMethod` body +
+   self-relative trigger predicate; the tbir backend installs a
+   per-instance `_checkers` closure with edge gating (mirrors v1's
+   `emit_cycle_trigger`). Present on BOTH active and passive instances.
+2. **Multi-module-field transactor + self-relative sub-scoreboard poke** —
+   the agent-mode transactor carries `dut` + `sb` (a `ScoreboardSub`) +
+   scalar state + an `in event<RegOp>` simultaneously. `sb.writes =
+   sb.writes + 1` inside a cycle/on handler resolves the sub-scoreboard
+   self-relatively (`self`-rooted `nested_path`, re-rooted via
+   `self_subst` at emission); the component method ctx now carries the
+   `scoreboards` table.
+3. **Agent + nested-env `connect` bridges** — `connect` is now resolved
+   for `Agent` decls (the agent's `sequencer.dispatched -> drv.req`
+   bridge), and the tbir backend recurses through `Sub` fields to install
+   a nested sub-component's bridges (env→agent→drv). A sequencer
+   `hookable dispatch(txns: TSeq<Record>)` param now types `RecordSeq`
+   (renders `std::vector<Record>`).
+
+**Registered**: `transactor_agent_mode_test`, `transactor_env_mode_test`
+(`AxiLiteRegs.sv`, pass) — same agent/env decl reused active + passive;
+active drives 5 AXI round-trips through sequencer→connect→`on req(t)`,
+both transactors' cycle-trigger observers tally 5 writes + 5 reads off
+the shared DUT. Both trace-diff clean v1↔tbir at seed 1.
+
+**Divergence**: hard `when active` body elision on a passive instance is
+NOT implemented (v1 does not elide for these fixtures either — passive
+correctness comes from the test never dispatching the passive
+sequencer). The `active`/`passive` mode on a composite-component
+test-scope `let` is accepted and ignored, matching v1.
 
 ### `tseq` construct — **RESOLVED 2026-06-13 (tseq slice)**
 

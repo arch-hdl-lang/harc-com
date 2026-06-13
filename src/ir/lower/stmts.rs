@@ -722,6 +722,28 @@ impl FuncBuilder<'_> {
                 if let Some(&sb) = self.ctx.scoreboard_fields.get(&root.name) {
                     return Some((sb, root.name.clone(), None));
                 }
+                // Self-relative form inside a component body: the receiver
+                // `sb` (in `sb.writes`) names a `ScoreboardSub` field of
+                // `self_component`. The cycle-trigger / on-handler body of an
+                // agent-mode transactor pokes its own sub-scoreboard. The
+                // nested path is rooted at the synthetic `self` token; the
+                // tbir emitter re-roots it at the running instance via
+                // `self_subst`. (`scoreboard_root`'s `e` is the receiver,
+                // not the full `sb.writes` field expression.)
+                if self.lookup(&root.name).is_none() {
+                    if let Some(cid) = self.self_component {
+                        let comp = &self.ctx.components[cid.index()];
+                        if let Some(crate::ir::ComponentFieldKind::ScoreboardSub { scoreboard }) =
+                            comp.field(&root.name).map(|f| &f.kind)
+                        {
+                            return Some((
+                                *scoreboard,
+                                root.name.clone(),
+                                Some(vec!["self".to_string(), root.name.clone()]),
+                            ));
+                        }
+                    }
+                }
             }
             _ => {}
         }
