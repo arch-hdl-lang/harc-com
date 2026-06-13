@@ -62,6 +62,10 @@ ir_id!(
     /// Index into `TbProgram::regblocks`.
     RegblockId
 );
+ir_id!(
+    /// Index into `TbProgram::components`.
+    ComponentId
+);
 
 /// Whole-program IR for one merged HARC source file (post
 /// `merge_for_sim` + impl-for desugaring).
@@ -83,6 +87,11 @@ pub struct TbProgram {
     /// Register-block schemas (`regblock` declarations), in file order.
     /// See `RegblockSchema`.
     pub regblocks: Vec<RegblockSchema>,
+    /// Composite-component schemas (the env/agent cluster's flat-struct
+    /// subset: method-bearing scoreboards, analysis-source transactors,
+    /// and the `env`s that compose them), in file order. See
+    /// `ComponentSchema`.
+    pub components: Vec<ComponentSchema>,
 }
 
 /// One `regblock` declaration, lowered to its register-level subset
@@ -334,6 +343,132 @@ impl ScoreboardSchema {
     }
 }
 
+/// One composite-component declaration in the env/agent cluster, lowered
+/// to v1's flat-struct + free-lambda-method shape
+/// (`emit_component_struct` / `emit_component_method`). Three source
+/// shapes lower into this one schema in the v0 env-composition subset
+/// (docs/tbir-mvp.md §env/agent):
+///
+/// - a `scoreboard` that carries `hookable`/`function` **methods** (the
+///   data-only scoreboard subset lowers method-less boards through
+///   `ScoreboardSchema` instead — a method-bearing board needs per-
+///   instance state materialized, which is exactly what a component
+///   struct provides);
+/// - a `transactor` used purely as an **analysis source** — one `out
+///   event<T>` port plus `hookable`/`function` methods that `emit` on it
+///   (the DUT-poking transactor subset stays on `TransactorSchema`);
+/// - an `env` that **composes** the two as by-value sub-component fields
+///   and `connect`s a source's event port to a sink's method.
+///
+/// Each becomes a C++ struct of its fields (scalar / `queue<T>` /
+/// `event<T>` callback vector / nested sub-component) plus the v1
+/// `_last_in_cycle`/`_last_out_cycle` heartbeat stamps, and one
+/// free `<Comp>_<method>(<Comp>& self, args)` lambda per method whose
+/// body resolves bare field names to `self.<field>`.
+///
+/// **Out of subset** (rejected, never mis-lowered): `agent` declarations
+/// and `on <ev>` event handlers, `sequencer`/`tseq`, watchdog/phase
+/// orchestration, `idle(N)`/`quiesced(N)` predicates, bus-bound source
+/// transactors, generics, and event ports carrying non-scalar payloads
+/// (`event<Struct>`). Those gate on the agent/sequencer/event slices.
+#[derive(Debug, Clone)]
+pub struct ComponentSchema {
+    pub name: String,
+    /// Source keyword, for diagnostics + dump-ir (`env`/`scoreboard`/
+    /// `transactor`).
+    pub kind: ComponentKindTag,
+    pub fields: Vec<ComponentFieldSchema>,
+    /// Methods in declaration order. Each has one lowered `TbFunction`
+    /// (`kind: ComponentMethod`) whose body addresses fields self-
+    /// relatively (`Expr::ComponentField`/`Stmt::ComponentFieldWrite`
+    /// with `ComponentBase::SelfField`).
+    pub methods: Vec<ComponentMethodSchema>,
+    /// `connect <src>.<event> -> <sink>.<method>` edges (env only; empty
+    /// for scoreboard/transactor components). Resolved against this env's
+    /// sub-component fields; emission wires them at env construction.
+    pub connects: Vec<ConnectEdgeSchema>,
+}
+
+impl ComponentSchema {
+    pub fn field(&self, name: &str) -> Option<&ComponentFieldSchema> {
+        self.fields.iter().find(|f| f.name == name)
+    }
+    pub fn method(&self, name: &str) -> Option<&ComponentMethodSchema> {
+        self.methods.iter().find(|m| m.name == name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComponentKindTag {
+    Env,
+    Scoreboard,
+    Transactor,
+}
+
+impl ComponentKindTag {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            ComponentKindTag::Env => "env",
+            ComponentKindTag::Scoreboard => "scoreboard",
+            ComponentKindTag::Transactor => "transactor",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ComponentFieldSchema {
+    pub name: String,
+    pub kind: ComponentFieldKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum ComponentFieldKind {
+    /// `count : uint<32> default 0` — a scalar host counter.
+    Scalar { ty: IrType, default: u64 },
+    /// `expected : queue<uint<32>>` — a FIFO of a scalar element type.
+    Queue { signed: bool },
+    /// `observed : out event<uint<8>>` — an analysis port. Lowers to a
+    /// `std::vector<std::function<void(<payload>)>>` member; `signed`
+    /// selects the C payload type. Sinks subscribe via `connect`.
+    Event { signed: bool },
+    /// `source : AnalysisSource passive` / `sb : AnalysisSb` — a nested
+    /// by-value sub-component. `component` indexes
+    /// `TbProgram::components`.
+    Sub { component: ComponentId },
+}
+
+#[derive(Debug, Clone)]
+pub struct ComponentMethodSchema {
+    pub name: String,
+    /// Lowered method body (`kind: ComponentMethod`).
+    pub function: FunctionId,
+    pub n_params: usize,
+    pub has_ret: bool,
+    /// True for `hookable` (emits pre/post hook vectors + fan-out);
+    /// false for `function` (no hooks). Mirrors v1's
+    /// `HookableMethod::is_hookable`.
+    pub hookable: bool,
+}
+
+/// One `connect <src>.<event> -> <sink>.<method>` edge inside an env,
+/// resolved to the paths the test uses to reach the sub-components.
+/// Emission produces `<env>.<src_path>.<event>.push_back([&](auto _t){
+/// <SinkComp>_<method>(<env>.<sink_path>, _t); })` at env construction.
+#[derive(Debug, Clone)]
+pub struct ConnectEdgeSchema {
+    /// Dotted path from the env-bound test field to the source sub-
+    /// component (e.g. `["source"]` for `env.source`).
+    pub src_path: Vec<String>,
+    /// `out event<T>` field on the source sub-component.
+    pub src_event: String,
+    /// Dotted path to the sink sub-component (`["sb"]`).
+    pub sink_path: Vec<String>,
+    /// Sink sub-component's component schema (to name `<Comp>_<method>`).
+    pub sink_component: ComponentId,
+    /// Sink method name.
+    pub sink_method: String,
+}
+
 /// One `test` (or `impl <Test> for <Tb>`) declaration.
 #[derive(Debug, Clone)]
 pub struct TestSchema {
@@ -410,10 +545,30 @@ pub struct TestbenchSchema {
     /// per-instance state struct plus one background-coroutine actor per
     /// target method.
     pub target_tlm_actors: Vec<TargetTlmActorSchema>,
+    /// Composite-component-typed test fields (`let env : AnalysisEnv` /
+    /// `env : AnalysisEnv` testbench field), in declaration order. Each
+    /// names a test-scope local that is a default-constructed instance of
+    /// `TbProgram::components[component]`. Unlike scoreboards/transactors
+    /// these are NOT held on `_tb` — they are emitted as plain run-scope
+    /// locals (v1's `AnalysisEnv env;`), so `connect` push_backs and
+    /// method calls work against the run function's `env`.
+    pub component_fields: Vec<ComponentFieldBinding>,
     /// True when no `testbench` declaration existed in source and this
     /// schema was synthesized for a classic-form test. Codegen skips
     /// the `_tb` struct + wire statement for synthetic testbenches.
     pub synthetic: bool,
+}
+
+/// One composite-component test field binding (`let env : AnalysisEnv`).
+#[derive(Debug, Clone)]
+pub struct ComponentFieldBinding {
+    /// Test-scope local name (`env`).
+    pub field: String,
+    /// The env/component type instantiated.
+    pub component: ComponentId,
+    /// `connect` edges from the env declaration, resolved to paths. Empty
+    /// for non-env components (only `env` carries a `connect` block).
+    pub connects: Vec<ConnectEdgeSchema>,
 }
 
 /// One bound-to target-side TLM responder instance (`let target :
@@ -494,6 +649,13 @@ pub enum FunctionKind {
     /// method's declared parameters; the owning transactor and the
     /// method name live in `TbProgram::transactors[transactor]`.
     TransactorBody { transactor: TransactorId },
+    /// One composite-component method body (env/agent cluster). `params`
+    /// are the method's declared parameters; bodies address fields self-
+    /// relatively via `ComponentBase::SelfField`. The owning component +
+    /// method name live in `TbProgram::components[component]`. Emitted as
+    /// a `<Comp>_<method>(<Comp>& self, args)` free lambda (v1's
+    /// `emit_component_method` shape).
+    ComponentMethod { component: ComponentId },
 }
 
 #[derive(Debug, Clone)]
@@ -629,6 +791,45 @@ pub enum Stmt {
         field: String,
         op: ScoreboardOp,
     },
+    /// Write a composite-component scalar field. `base` selects the
+    /// access form: `SelfField` (`count = count + 1` inside a method body
+    /// → `self.count = ...`) or `Path` (`env.sb.errors = ...` from the
+    /// test). The value is port-hoisted like `Assign`.
+    ComponentFieldWrite {
+        base: ComponentBase,
+        field: String,
+        value: Expr,
+    },
+    /// `emit observed(v)` inside a component method body: fan the args out
+    /// to every callback registered on the named `out event<T>` field of
+    /// `self`. Emitted as `for (auto& _s : self.<event>) _s(args);` plus
+    /// v1's `_last_out_cycle` heartbeat bump. Only valid inside a
+    /// `ComponentMethod` body (`base` is implicitly `self`).
+    ComponentEmit { event: String, args: Vec<Expr> },
+    /// A composite-component method call (`env.source.publish(3)`). `base`
+    /// resolves the receiver sub-component path; `component` is its schema
+    /// (to name `<Comp>_<method>`); `dest` receives a `-> T` return.
+    /// Emitted as `<Comp>_<method>(<receiver>, args)`.
+    ComponentCall {
+        base: ComponentBase,
+        component: ComponentId,
+        method: String,
+        args: Vec<Expr>,
+        dest: Option<LocalId>,
+    },
+}
+
+/// How a composite-component field/method access names its receiver.
+#[derive(Debug, Clone)]
+pub enum ComponentBase {
+    /// Self-relative — inside a `ComponentMethod` body, `count` resolves
+    /// to `self.count`. The body's owning component is the method's.
+    SelfField,
+    /// A dotted path from a test-scope component local
+    /// (`env.source.publish` → `path = ["env", "source"]`). The first
+    /// segment is the test field; the rest are nested sub-component
+    /// fields. Emitted as `env.source` (dot-joined, all by-value).
+    Path(Vec<String>),
 }
 
 /// A scoreboard mutation. The design doc pins this as a tagged enum
@@ -798,6 +999,13 @@ pub enum Expr {
         field: String,
         query: ScoreboardQuery,
     },
+    /// Read a composite-component scalar field. `base` is `SelfField`
+    /// (`count` inside a method → `self.count`) or `Path` (`env.sb.count`
+    /// from the test → `env.sb.count`). Host state — allowed wherever a
+    /// `Local` is. Queue/event fields are never read this way (queues use
+    /// scoreboard-style ops which are out of subset for components in v0;
+    /// events are written via `connect`/`emit` only).
+    ComponentField { base: ComponentBase, field: String },
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Unary(UnOp, Box<Expr>),
     /// `cond ? a : b`. Both backends emit the C++ ternary; port reads

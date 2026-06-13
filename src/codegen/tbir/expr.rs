@@ -159,6 +159,13 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         Expr::CovBin { inst, point, bin } => {
             format!("_tb.{}.{point}.{bin}", inst.tb_field)
         }
+        // Composite-component scalar field read: self-relative inside a
+        // method body (`self.count`) or a dotted path from a test-scope
+        // component local (`env.sb.count`). Both name plain by-value C++
+        // struct members (v1's `emit_component_struct` shape).
+        Expr::ComponentField { base, field } => {
+            format!("{}.{field}", comp_base_cpp(base))
+        }
         Expr::Call(target, args) => {
             let name = match target {
                 CallTarget::Helper(n) => helper_cpp_name(n),
@@ -357,5 +364,15 @@ fn un_op_cpp(op: UnOp) -> &'static str {
         UnOp::Neg => "-",
         UnOp::Not => "!",
         UnOp::BitNot => "~",
+    }
+}
+
+/// Render a composite-component access receiver. `SelfField` → `self`
+/// (the method lambda's first parameter); `Path` → the dot-joined
+/// test-scope path (`env.source`), all by-value struct members.
+pub(super) fn comp_base_cpp(base: &crate::ir::ComponentBase) -> String {
+    match base {
+        crate::ir::ComponentBase::SelfField => "self".to_string(),
+        crate::ir::ComponentBase::Path(path) => path.join("."),
     }
 }

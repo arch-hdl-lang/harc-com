@@ -195,6 +195,8 @@ pub(crate) fn lower_transactor(
         regblock_init_order: Vec::new(),
         bare_transactor_fields: HashSet::new(),
         target_state: HashMap::new(),
+        components: Vec::new(),
+        component_fields: HashMap::new(),
     };
 
     let mut funcs = Vec::new();
@@ -407,6 +409,8 @@ fn lower_bound_target_transactor(
         regblock_init_order: Vec::new(),
         bare_transactor_fields: HashSet::new(),
         target_state: HashMap::new(),
+        components: Vec::new(),
+        component_fields: HashMap::new(),
     };
 
     let mut funcs = Vec::new();

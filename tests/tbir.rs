@@ -576,11 +576,39 @@ fn scoreboard_basic_emitted_cpp_snapshot() {
     );
 }
 
-/// A scoreboard method is out of the data-only subset (it would need
-/// per-instance state materialization); the declaration is rejected
-/// with a precise message, not silently dropped.
+/// Env-composition subset: a `let env : AnalysisEnv` composing an
+/// analysis-source transactor (`out event` + `emit`) and two
+/// method-bearing scoreboards, wired by `connect`. Locks the dump-ir:
+/// the component schemas (sub-component fields, method signatures, the
+/// env's resolved connect edges), the self-relative method bodies
+/// (`ComponentEmit` / `ComponentFieldWrite`), and the test-body
+/// `ComponentCall` / `ComponentField` path access.
 #[test]
-fn scoreboard_method_is_rejected() {
+fn analysis_env_connect_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("analysis_sink_connect_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("analysis_env_connect_dump_ir", format!("{prog}"));
+}
+
+/// Locks the emitted tbir C++ for the env-composition fixture: the
+/// component structs (event-callback vectors, by-value sub-components),
+/// the `<Comp>_<method>` lambdas, and the env local + connect push_backs.
+#[test]
+fn analysis_env_connect_emitted_cpp_snapshot() {
+    insta::assert_snapshot!(
+        "analysis_env_connect_emitted_cpp",
+        emit_fixture_cpp("analysis_sink_connect_test.harc")
+    );
+}
+
+/// A method-bearing scoreboard now lowers as a composite component
+/// (per-instance state materialized) — but only when bound as a
+/// test-scope `let env`-style component. Bound directly as a *testbench
+/// field*, it is out of this slice and rejected precisely (composite
+/// components bind as test-scope lets), never mis-lowered to a DUT
+/// module type.
+#[test]
+fn scoreboard_method_testbench_field_is_rejected() {
     let src = r#"
 scoreboard Sb
     n : uint<32> default 0
@@ -600,10 +628,9 @@ impl T for Tb
     end run
 end impl T
 "#;
-    let err = lower_src(src).expect_err("scoreboard method must be rejected");
-    let msg = format!("{err}");
-    assert!(msg.contains("method"), "unexpected error: {msg}");
-    assert!(msg.contains("scoreboard"), "unexpected error: {msg}");
+    let err = lower_src(src).expect_err("composite-component testbench field must be rejected");
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("composite-component"), "unexpected error: {msg}");
 }
 
 /// A `queue<Struct>` element type is out of the scalar-only subset:

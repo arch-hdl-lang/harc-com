@@ -315,6 +315,26 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                     crate::ir::ScoreboardOp::QueuePop { .. } => {}
                 }
             }
+            Stmt::ComponentFieldWrite { value, .. } => {
+                // Host state on a component struct — no pin access of its
+                // own; the value may carry inline reads.
+                host_service_only = false;
+                visit_expr(value, &mut accesses, &mut transactor);
+            }
+            Stmt::ComponentEmit { args, .. } => {
+                // Analysis-port fan-out — host-side callback dispatch.
+                host_service_only = false;
+                for a in args {
+                    visit_expr(a, &mut accesses, &mut transactor);
+                }
+            }
+            Stmt::ComponentCall { args, .. } => {
+                // A component method call — host-side composition dispatch.
+                host_service_only = false;
+                for a in args {
+                    visit_expr(a, &mut accesses, &mut transactor);
+                }
+            }
         }
     }
     match &block.terminator {
@@ -395,6 +415,7 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
         | Expr::TbField(_)
         | Expr::TransactorState { .. }
         | Expr::ScoreboardQuery { .. }
+        | Expr::ComponentField { .. }
         | Expr::CovBin { .. } => {}
     }
 }

@@ -12,6 +12,7 @@
 //! direct AST → C++ path for unsupported constructs.
 
 mod bus;
+mod components;
 mod control;
 mod covergroups;
 mod exprs;
@@ -28,10 +29,10 @@ use crate::ast::{
     TransactorMode, TypeExpr,
 };
 use crate::ir::{
-    self, BasicBlock, BlockId, ClockSpec, CovgroupId, CovgroupSchema, FunctionId, FunctionKind,
-    IrType, LocalId, RecordId, RecordSchema, RegblockId, ScoreboardId, ScoreboardSchema,
-    TbFunction, TbProgram, TestSchema, TestbenchId, TestbenchSchema, Terminator, TransactorId,
-    TransactorSchema, TypedLocal, TypedParam,
+    self, BasicBlock, BlockId, ClockSpec, ComponentSchema, CovgroupId, CovgroupSchema, FunctionId,
+    FunctionKind, IrType, LocalId, RecordId, RecordSchema, RegblockId, ScoreboardId,
+    ScoreboardSchema, TbFunction, TbProgram, TestSchema, TestbenchId, TestbenchSchema, Terminator,
+    TransactorId, TransactorSchema, TypedLocal, TypedParam,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -261,6 +262,12 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     let mut n_transactors = 0u32;
     for it in &file.items {
         if let Item::Transactor(t) = it {
+            // A pure analysis-source transactor (event port + no DUT
+            // field) routes to the composite-component table instead of
+            // the DUT-poking `TransactorSchema` (classified below).
+            if components::transactor_is_component(t) {
+                continue;
+            }
             if transactor_ids
                 .insert(t.name.name.clone(), TransactorId(n_transactors))
                 .is_some()
@@ -282,6 +289,12 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     let mut scoreboard_schemas: Vec<ScoreboardSchema> = Vec::new();
     for it in &file.items {
         if let Item::Scoreboard(c) = it {
+            // A method-bearing scoreboard needs per-instance state, so it
+            // routes to the composite-component table instead of the
+            // data-only `ScoreboardSchema` (classified below).
+            if components::scoreboard_is_component(c) {
+                continue;
+            }
             let schema = scoreboards::lower_scoreboard(c)?;
             if scoreboard_ids
                 .insert(c.name.name.clone(), ScoreboardId(scoreboard_schemas.len() as u32))
@@ -295,6 +308,28 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             scoreboard_schemas.push(schema);
         }
     }
+
+    // Names of decls classified as composite components (method-bearing
+    // scoreboards, analysis-source transactors, envs). Used by the
+    // testbench-field validator to reject a component-typed testbench
+    // field precisely — in this slice components are bound only as
+    // test-scope `let env : <Env>`, never as testbench fields.
+    let component_type_names: HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Scoreboard(c) if components::scoreboard_is_component(c) => {
+                Some(c.name.name.clone())
+            }
+            Item::Transactor(t) if components::transactor_is_component(t) => {
+                Some(t.name.name.clone())
+            }
+            Item::Env(c) if matches!(c.kind, crate::ast::ComponentKind::Env) => {
+                Some(c.name.name.clone())
+            }
+            _ => None,
+        })
+        .collect();
 
     // File-level construct gate: anything outside the MVP subset is an
     // explicit Unsupported, never silently dropped.
@@ -336,7 +371,14 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                         &record_ids,
                         &transactor_ids,
                         &scoreboard_ids,
+                        &component_type_names,
                     )?;
+                } else if matches!(c.kind, crate::ast::ComponentKind::Env) {
+                    // A composite `env` used as a test-scope component
+                    // (`let env : AnalysisEnv`) is lowered through the
+                    // component-cluster path below — it is inert at this
+                    // gate (its items are validated by the component
+                    // schema builder).
                 } else {
                     return Err(unsupported(
                         &format!("env/component `{}`", c.name.name),
@@ -391,6 +433,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         regblock_init_order: Vec::new(),
         bare_transactor_fields: HashSet::new(),
         target_state: HashMap::new(),
+        components: Vec::new(),
+        component_fields: HashMap::new(),
     };
     for it in &file.items {
         let Item::Function(fd) = it else { continue };
@@ -413,6 +457,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // are rejected here rather than dropped.
     for it in &file.items {
         let Item::Transactor(t) = it else { continue };
+        if components::transactor_is_component(t) {
+            continue;
+        }
         let id = TransactorId(prog.transactors.len() as u32);
         debug_assert_eq!(Some(&id), transactor_ids.get(&t.name.name));
         let (schema, funcs) = transactors::lower_transactor(
@@ -427,12 +474,126 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         prog.functions.extend(funcs);
     }
 
+    // Composite-component declarations (env/agent cluster, flat-struct
+    // subset): method-bearing scoreboards, analysis-source transactors,
+    // and the `env`s that compose them. Classified in file order; an
+    // `env`'s sub-component fields and `connect` edges resolve against
+    // the component ids assigned here.
+    //
+    // Two passes, like transactors: (1) build schemas (fields + method
+    // signatures, reserving FunctionIds), (2) lower method bodies with a
+    // ctx that knows the component table. `agent`/`sequencer` decls are
+    // rejected precisely (they need the event-handler / sequencer slices,
+    // out of this subset).
+    let mut comp_sources: Vec<components::CompSource<'_>> = Vec::new();
+    let mut component_ids: HashMap<String, ir::ComponentId> = HashMap::new();
+    for it in &file.items {
+        let (name, src) = match it {
+            Item::Scoreboard(c) if components::scoreboard_is_component(c) => {
+                (&c.name.name, components::CompSource::Scoreboard(c))
+            }
+            Item::Transactor(t) if components::transactor_is_component(t) => {
+                (&t.name.name, components::CompSource::Transactor(t))
+            }
+            Item::Env(c) if matches!(c.kind, crate::ast::ComponentKind::Env) => {
+                (&c.name.name, components::CompSource::Env(c))
+            }
+            Item::Agent(c) => {
+                return Err(unsupported(
+                    &format!("the `agent` construct (`{}`)", c.name.name),
+                    "agents need event-handler (`on <ev>`) lowering; out of the env/env-connect \
+                     subset",
+                ));
+            }
+            Item::Sequencer(c) => {
+                return Err(unsupported(
+                    &format!("the `sequencer` construct (`{}`)", c.name.name),
+                    "",
+                ));
+            }
+            _ => continue,
+        };
+        let cid = ir::ComponentId(comp_sources.len() as u32);
+        if component_ids.insert(name.clone(), cid).is_some() {
+            return Err(LowerError::Invalid(format!(
+                "duplicate component declaration `{name}`"
+            )));
+        }
+        comp_sources.push(src);
+    }
+    // Pass 1: schemas. FunctionIds count up from the current function
+    // count (after pure helpers + transactor methods).
+    let mut next_fn = prog.functions.len() as u32;
+    for src in &comp_sources {
+        let schema = components::lower_component_schema(src, &component_ids, &mut next_fn)?;
+        prog.components.push(schema);
+    }
+    // Pass 1b: resolve `connect` edges (env components only), now that
+    // every component schema (fields + methods) exists.
+    let comp_snapshot = prog.components.clone();
+    for (i, src) in comp_sources.iter().enumerate() {
+        if let components::CompSource::Env(env) = src {
+            let connects = components::resolve_connects(env, &comp_snapshot[i], &comp_snapshot)?;
+            prog.components[i].connects = connects;
+        }
+    }
+    // Pass 2: method bodies. A method ctx knows the component table (for
+    // self-relative field access + sub-component method resolution) but
+    // no test-scope fields. Bodies are lowered into placeholder
+    // FunctionIds reserved in pass 1, then sorted into the functions
+    // table (their ids are already contiguous from `start_fn`).
+    let start_fn = prog.functions.len();
+    let method_ctx = LowerCtx {
+        dut_field: "dut".to_string(),
+        tb_field: None,
+        cov_fields: HashMap::new(),
+        covgroups: Vec::new(),
+        clock_names: Vec::new(),
+        record_ids: record_ids.clone(),
+        records: prog.records.clone(),
+        bus_bindings: HashMap::new(),
+        transactor_fields: HashMap::new(),
+        transactors: Vec::new(),
+        scoreboard_fields: HashMap::new(),
+        scoreboards: Vec::new(),
+        consts: consts.clone(),
+        tb_scalar_fields: HashSet::new(),
+        tb_methods: HashMap::new(),
+        test_scope_lets: HashSet::new(),
+        regblock_bindings: HashMap::new(),
+        regblock_init_order: Vec::new(),
+        bare_transactor_fields: HashSet::new(),
+        target_state: HashMap::new(),
+        components: prog.components.clone(),
+        component_fields: HashMap::new(),
+    };
+    let mut method_funcs: Vec<TbFunction> = Vec::new();
+    for (i, src) in comp_sources.iter().enumerate() {
+        let cid = ir::ComponentId(i as u32);
+        let schema = prog.components[i].clone();
+        let funcs =
+            components::lower_component_bodies(src, cid, &schema, &method_ctx, &helper_registry)?;
+        method_funcs.extend(funcs);
+    }
+    // The reserved FunctionIds must be contiguous from `start_fn`.
+    debug_assert_eq!(
+        method_funcs.first().map(|f| f.id.0),
+        if method_funcs.is_empty() {
+            None
+        } else {
+            Some(start_fn as u32)
+        }
+    );
+    let _ = start_fn;
+    prog.functions.extend(method_funcs);
+
     for it in &file.items {
         let Item::Test(t) = it else { continue };
         lower_test(
             t,
             &tb_of_test,
             &components,
+            &component_ids,
             &domains,
             &covgroup_ids,
             &record_ids,
@@ -464,6 +625,7 @@ fn validate_testbench_component(
     record_ids: &HashMap<String, RecordId>,
     transactor_ids: &HashMap<String, TransactorId>,
     scoreboard_ids: &HashMap<String, ScoreboardId>,
+    component_type_names: &HashSet<String>,
 ) -> Result<(), LowerError> {
     for ci in &c.items {
         match ci {
@@ -472,6 +634,23 @@ fn validate_testbench_component(
                     let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
                     if covgroup_ids.contains_key(simple) {
                         continue;
+                    }
+                    // A composite-component type (method-bearing
+                    // scoreboard, analysis-source transactor, or env) bound
+                    // as a testbench field is out of this slice — in v0
+                    // such components are bound only as test-scope `let env
+                    // : <Env>`. Reject precisely so it never mis-lowers to
+                    // the "assume DUT module type" arm below.
+                    if component_type_names.contains(simple) {
+                        return Err(unsupported(
+                            &format!(
+                                "testbench field `{}.{} : {simple}` of a composite-component \
+                                 type",
+                                c.name.name, f.name.name
+                            ),
+                            "composite components (method-bearing scoreboards, analysis \
+                             sources, envs) bind as a test-scope `let` in this subset",
+                        ));
                     }
                     if scoreboard_ids.contains_key(simple) {
                         // A scoreboard testbench field — data-only host
@@ -595,6 +774,7 @@ fn lower_test(
     t: &TestDecl,
     tb_of_test: &HashMap<String, String>,
     components: &HashMap<String, &ComponentDecl>,
+    component_ids: &HashMap<String, ir::ComponentId>,
     domains: &HashMap<String, i64>,
     covgroup_ids: &HashMap<String, CovgroupId>,
     record_ids: &HashMap<String, RecordId>,
@@ -623,6 +803,10 @@ fn lower_test(
     // accessed by bare name. Merged into `transactor_fields` after the
     // testbench-field walk; collected here as (name, transactor id).
     let mut test_scope_xactors: Vec<(String, TransactorId)> = Vec::new();
+    // Test-scope composite-component instances (`let env : AnalysisEnv`),
+    // collected as (name, component id). Emitted as plain run-scope
+    // locals + their `connect` push_backs.
+    let mut test_scope_components: Vec<(String, ir::ComponentId)> = Vec::new();
     // Bound-to target-side TLM responder instances (`let target : X
     // passive = bind <busbinding>`), collected as (instance, transactor
     // id, bus-binding field). Validated after the bus bindings are known.
@@ -773,6 +957,32 @@ fn lower_test(
                     prog.transactors.iter().position(|x| x.name == simple).unwrap() as u32,
                 );
                 target_tlm_binds.push((l.name.name.clone(), xid, bus_field));
+            }
+            // Test-scope composite-component instance: `let env :
+            // AnalysisEnv`. Emitted as a plain run-scope local (v1's
+            // `AnalysisEnv env;`), default-constructed, with its env
+            // `connect` push_backs wired right after. Accessed by bare
+            // dotted path (`env.source.publish(..)`, `env.sb.count`).
+            TestItem::Let(l)
+                if !l.bind
+                    && type_simple_name(l.ty.as_ref())
+                        .is_some_and(|n| component_ids.contains_key(n)) =>
+            {
+                if !l.probes.is_empty() {
+                    return Err(unsupported(
+                        "probe declarations on a component instance",
+                        "",
+                    ));
+                }
+                if l.value.is_some() {
+                    return Err(unsupported(
+                        &format!("component instance `let {}` with an initializer", l.name.name),
+                        "components default-construct",
+                    ));
+                }
+                let simple = type_simple_name(l.ty.as_ref()).unwrap();
+                let cid = component_ids[simple];
+                test_scope_components.push((l.name.name.clone(), cid));
             }
             // Test-scope unbound-transactor instance: `let h : MemHelper
             // active` (no `= bind`). v1 routes regblock frontdoor calls
@@ -1032,6 +1242,29 @@ fn lower_test(
         }
         transactor_fields.push((name.clone(), *xid));
     }
+    // Composite-component instances → schema bindings (with the env's
+    // resolved `connect` edges). A name collision with another binding
+    // class would resolve ambiguously, so reject it.
+    let mut component_field_map: HashMap<String, ir::ComponentId> = HashMap::new();
+    let mut component_field_bindings: Vec<ir::ComponentFieldBinding> = Vec::new();
+    for (field, cid) in &test_scope_components {
+        if transactor_fields.iter().any(|(f, _)| f == field)
+            || bus_binding_decls.contains_key(field)
+            || component_field_map.contains_key(field)
+        {
+            return Err(LowerError::Invalid(format!(
+                "name `{field}` is bound more than once in test `{}`",
+                t.name.name
+            )));
+        }
+        component_field_map.insert(field.clone(), *cid);
+        component_field_bindings.push(ir::ComponentFieldBinding {
+            field: field.clone(),
+            component: *cid,
+            connects: prog.components[cid.index()].connects.clone(),
+        });
+    }
+
     // Bus bindings (test-scope `let`s) and transactor fields (testbench
     // component fields) share the `CallTarget::TransactorMethod`
     // bus_field namespace; a name living in both would dispatch
@@ -1209,6 +1442,7 @@ fn lower_test(
         scoreboard_fields: scoreboard_fields.clone(),
         regblock_bindings: regblock_binding_schemas,
         target_tlm_actors,
+        component_fields: component_field_bindings,
         synthetic,
     });
 
@@ -1274,6 +1508,8 @@ fn lower_test(
         regblock_init_order,
         bare_transactor_fields,
         target_state,
+        components: prog.components.clone(),
+        component_fields: component_field_map,
     };
 
     // Synthesized auto-sampler functions, one per covergroup field, in
@@ -1530,6 +1766,14 @@ pub(crate) struct LowerCtx {
     /// reads/writes `target.<field>` to `ir::Expr::TransactorState` /
     /// `ir::Stmt::TransactorStateWrite`. Empty everywhere else.
     pub target_state: HashMap<String, HashSet<String>>,
+    /// Snapshot of the program's component schemas, for path/field/method
+    /// resolution at access sites.
+    pub components: Vec<ComponentSchema>,
+    /// Test-scope composite-component instances (`let env : AnalysisEnv`)
+    /// → `ComponentId`. A bare access whose head segment is in this map
+    /// resolves through the component path machinery (`env.source.publish`,
+    /// `env.sb.count`). Empty in helper/method/transactor contexts.
+    pub component_fields: HashMap<String, ir::ComponentId>,
 }
 
 pub(crate) struct LoopFrame {
@@ -1605,6 +1849,11 @@ pub(crate) struct FuncBuilder<'a> {
     /// declared `TypedLocal::ty` deliberately stays `Unknown` (see
     /// docs/tbir-mvp.md divergence 4).
     pub(crate) let_widths: HashMap<LocalId, u32>,
+    /// `Some(component)` while lowering a `ComponentMethod` body: a bare
+    /// field name that names a field of that component resolves self-
+    /// relatively (`Expr::ComponentField { base: SelfField }`), and
+    /// `emit <ev>(...)` resolves against the body's `out event` fields.
+    pub(crate) self_component: Option<ir::ComponentId>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1664,6 +1913,7 @@ impl<'a> FuncBuilder<'a> {
             target_state_fields: HashSet::new(),
             in_check: false,
             let_widths: HashMap::new(),
+            self_component: None,
         }
     }
 }
@@ -1915,6 +2165,8 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
             ir::Expr::Unary(_, a) | ir::Expr::WidthCast { inner: a, .. } => in_expr(a),
             ir::Expr::Ternary(c, t, f) => in_expr(c).or_else(|| in_expr(t)).or_else(|| in_expr(f)),
             ir::Expr::Call(_, args) => args.iter().find_map(in_expr),
+            // Component fields never carry a transactor-state instance.
+            ir::Expr::ComponentField { .. } => None,
             _ => None,
         }
     }
@@ -1944,6 +2196,12 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                     | ir::ScoreboardOp::ScalarWrite { value, .. } => in_expr(value),
                     ir::ScoreboardOp::QueuePop { .. } => None,
                 },
+                // Component-method bodies never reach this TLM target-
+                // state filler (they are not bound-to target responders);
+                // any expr they carry holds no transactor-state node.
+                ir::Stmt::ComponentFieldWrite { value, .. } => in_expr(value),
+                ir::Stmt::ComponentEmit { args, .. } => args.iter().find_map(in_expr),
+                ir::Stmt::ComponentCall { args, .. } => args.iter().find_map(in_expr),
                 ir::Stmt::DutRead(_, _) | ir::Stmt::RecordInit(_, _) | ir::Stmt::CovReport(_) => {
                     None
                 }
@@ -1988,6 +2246,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             | ir::Expr::Port(_)
             | ir::Expr::RecordField { .. }
             | ir::Expr::TbField(_)
+            | ir::Expr::ComponentField { .. }
             | ir::Expr::ScoreboardQuery { .. }
             | ir::Expr::CovBin { .. } => {}
         }
@@ -2049,6 +2308,17 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                     | ir::ScoreboardOp::ScalarWrite { value, .. } => fill_expr(value, instance),
                     ir::ScoreboardOp::QueuePop { .. } => {}
                 },
+                ir::Stmt::ComponentFieldWrite { value, .. } => fill_expr(value, instance),
+                ir::Stmt::ComponentEmit { args, .. } => {
+                    for a in args {
+                        fill_expr(a, instance);
+                    }
+                }
+                ir::Stmt::ComponentCall { args, .. } => {
+                    for a in args {
+                        fill_expr(a, instance);
+                    }
+                }
                 ir::Stmt::DutRead(_, _) | ir::Stmt::RecordInit(_, _) | ir::Stmt::CovReport(_) => {}
             }
         }
