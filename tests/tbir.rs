@@ -217,11 +217,13 @@ fn randomize_fixture_lowers() {
     assert!(randomize_blocks >= 1, "a Randomize terminator is present");
 }
 
-/// `wait_until_quiesce` composes an `agent` (now lowered — agent
-/// slice), but binds it as a TESTBENCH FIELD (`prod : Producer`) inside
-/// a `testbench` block. Composite-component testbench-field binding is a
-/// separate slice (envs/agents bind as a test-scope `let` today), so the
-/// fixture trips precisely on that residual rather than on `agent`.
+/// `wait_until_quiesce` composes an `agent`, binds it as a TESTBENCH
+/// FIELD (`prod : Producer`, now lowered — testbench-field-binding
+/// slice), and drives it with `emit prod.in_ev(t)` where the event
+/// payload is `event<TinyTxn>` — a *transaction* payload. The IR's
+/// event model carries a single ≤64-bit scalar, so the fixture now
+/// trips precisely on the transaction-payload residual (the next
+/// blocker behind the binding) rather than on `agent` or the binding.
 #[test]
 fn wait_until_quiesce_fixture_is_unsupported() {
     let err = lower_src(&fixture("wait_until_quiesce_test.harc")).unwrap_err();
@@ -713,6 +715,40 @@ end test MixedAgentTest
     }
 }
 
+/// Composite-component testbench-FIELD binding: the same agent as
+/// `agent_on_handler_test`, but bound as a `testbench` field
+/// (`tagger : Tagger`) under an `impl ... for` body rather than a
+/// test-scope `let`. The impl-for desugaring rewrites the field accesses
+/// to `_tb.tagger.*`; the component machinery strips the `_tb` prefix so
+/// `emit`/`idle_in`/field reads all resolve to the bare-name component
+/// instance — IR identical to the test-scope-let form (tbir emits every
+/// component at run scope regardless of binding shape).
+#[test]
+fn tb_field_agent_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("tb_field_agent_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let dump = format!("{prog}");
+    // The agent bound as a testbench field still lowers as a component,
+    // and every access resolved to the BARE `tagger` instance (the `_tb`
+    // prefix stripped) — not `_tb.tagger`, not a DUT port.
+    assert!(
+        dump.contains("component c0 Tagger (agent)"),
+        "expected the agent to lower as a component: {dump}"
+    );
+    assert!(
+        dump.contains("ComponentEmit(tagger.in_ev"),
+        "expected `emit` to resolve to the bare component instance: {dump}"
+    );
+    assert!(
+        dump.contains("tagger.idle_in(4)"),
+        "expected `idle_in` to resolve to the bare component instance: {dump}"
+    );
+    assert!(
+        !dump.contains("_tb.tagger"),
+        "the `_tb` prefix must be stripped from component accesses: {dump}"
+    );
+}
+
 /// Locks the emitted tbir C++ for the agent fixture: the component
 /// struct (event-callback vector + heartbeat stamps), the
 /// `<Comp>_on_h<fid>` handler lambda, the on-handler `push_back`
@@ -726,14 +762,16 @@ fn agent_on_handler_emitted_cpp_snapshot() {
     );
 }
 
-/// A method-bearing scoreboard now lowers as a composite component
-/// (per-instance state materialized) — but only when bound as a
-/// test-scope `let env`-style component. Bound directly as a *testbench
-/// field*, it is out of this slice and rejected precisely (composite
-/// components bind as test-scope lets), never mis-lowered to a DUT
-/// module type.
+/// A method-bearing scoreboard lowers as a composite component
+/// (per-instance state materialized). Since the testbench-field-binding
+/// slice it binds BOTH as a test-scope `let` AND as a `testbench` FIELD
+/// (`sb : Sb`). The impl-for desugaring rewrites the field access to
+/// `_tb.sb.n`; the component machinery strips the `_tb` prefix so the
+/// access resolves through `component_fields` by the bare name `sb`,
+/// identical to a test-scope-let binding (and never mis-lowered to a DUT
+/// module type).
 #[test]
-fn scoreboard_method_testbench_field_is_rejected() {
+fn scoreboard_method_testbench_field_lowers() {
     let src = r#"
 scoreboard Sb
     n : uint<32> default 0
@@ -753,9 +791,20 @@ impl T for Tb
     end run
 end impl T
 "#;
-    let err = lower_src(src).expect_err("composite-component testbench field must be rejected");
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("composite-component"), "unexpected error: {msg}");
+    let prog = lower_src(src).expect("composite-component testbench field lowers");
+    verify::verify_program(&prog).expect("verifies");
+    // The `sb` field is registered as a component instance, and the
+    // `sb.n` read resolved to a bare-name `ComponentField` access (the
+    // `_tb` prefix stripped) rather than a DUT port or a tb-struct field.
+    let dump = format!("{prog}");
+    assert!(
+        dump.contains("component c0 Sb (scoreboard)"),
+        "expected the scoreboard to lower as a component: {dump}"
+    );
+    assert!(
+        dump.contains("sb.n == 0"),
+        "expected the `sb.n` read to resolve through the component path: {dump}"
+    );
 }
 
 /// A `queue<Struct>` element type is out of the scalar-only subset:

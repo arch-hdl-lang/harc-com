@@ -310,11 +310,12 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         }
     }
 
-    // Names of decls classified as composite components (method-bearing
-    // scoreboards, analysis-source transactors, envs). Used by the
-    // testbench-field validator to reject a component-typed testbench
-    // field precisely — in this slice components are bound only as
-    // test-scope `let env : <Env>`, never as testbench fields.
+    // The set of every composite-component type that lowers to a
+    // `ComponentSchema` (env, method-bearing scoreboard, analysis-source
+    // transactor, agent). A field of one of these types is a
+    // composite-component binding — valid both as a test-scope `let` and
+    // (since the testbench-field-binding slice) as a `testbench` field.
+    // Must stay in lockstep with the `comp_sources` classification below.
     let component_type_names: HashSet<String> = file
         .items
         .iter()
@@ -326,6 +327,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                 Some(t.name.name.clone())
             }
             Item::Env(c) if matches!(c.kind, crate::ast::ComponentKind::Env) => {
+                Some(c.name.name.clone())
+            }
+            Item::Agent(c) if matches!(c.kind, crate::ast::ComponentKind::Agent) => {
                 Some(c.name.name.clone())
             }
             _ => None,
@@ -705,21 +709,27 @@ fn validate_testbench_component(
                         continue;
                     }
                     // A composite-component type (method-bearing
-                    // scoreboard, analysis-source transactor, or env) bound
-                    // as a testbench field is out of this slice — in v0
-                    // such components are bound only as test-scope `let env
-                    // : <Env>`. Reject precisely so it never mis-lowers to
-                    // the "assume DUT module type" arm below.
+                    // scoreboard, analysis-source transactor, env, or
+                    // agent) bound as a testbench field. Accepted by the
+                    // testbench-field-binding slice: the field routes to a
+                    // `ComponentSchema` instance just like a test-scope
+                    // `let env : <Env>` does. A `mode` (active/passive) is
+                    // meaningless on a composite component (that keyword is
+                    // a transactor concept), so reject it rather than
+                    // silently drop it.
                     if component_type_names.contains(simple) {
-                        return Err(unsupported(
-                            &format!(
-                                "testbench field `{}.{} : {simple}` of a composite-component \
-                                 type",
-                                c.name.name, f.name.name
-                            ),
-                            "composite components (method-bearing scoreboards, analysis \
-                             sources, envs) bind as a test-scope `let` in this subset",
-                        ));
+                        if mode.is_some() {
+                            return Err(unsupported(
+                                &format!(
+                                    "an `active`/`passive` mode on composite-component \
+                                     testbench field `{}.{} : {simple}`",
+                                    c.name.name, f.name.name
+                                ),
+                                "the mode keyword applies to transactor instances, not \
+                                 envs/agents/scoreboards",
+                            ));
+                        }
+                        continue;
                     }
                     if scoreboard_ids.contains_key(simple) {
                         // A scoreboard testbench field — data-only host
@@ -770,13 +780,17 @@ fn validate_testbench_component(
                             "",
                         ));
                     }
+                    // env/agent component types are accepted by the
+                    // `component_type_names` gate above; the only remaining
+                    // entry in `components` here is a `sequencer`, which is
+                    // out of the lowered subset entirely.
                     if components.contains_key(simple) {
                         return Err(unsupported(
                             &format!(
                                 "testbench field `{}` of component type `{}`",
                                 f.name.name, simple
                             ),
-                            "",
+                            "the `sequencer` construct is not in this subset",
                         ));
                     }
                 } else if tb_scalar_field_ir_type(&f.ty).is_none() {
@@ -1328,6 +1342,23 @@ fn lower_test(
                                     ));
                                 }
                                 transactor_fields.push((f.name.name.clone(), xid));
+                            }
+                            // Composite-component testbench field (`prod :
+                            // Producer` / `top : HeartbeatEnv`). Routes to
+                            // the SAME `test_scope_components` collector a
+                            // test-scope `let env : <Env>` uses — the IR
+                            // models both identically (a default-constructed
+                            // run-scope instance plus its `connect`/`on`
+                            // wiring). v1 instead holds the field on the
+                            // `_tb` struct (`_tb.prod`); this is a recorded
+                            // C++-shape divergence with identical trace
+                            // behavior (docs/tbir-mvp.md). A method-bearing
+                            // scoreboard / analysis-source transactor is in
+                            // `component_ids` (NOT `prog.scoreboards` /
+                            // `prog.transactors`), so it lands here and not
+                            // in the data-only routes above.
+                            if let Some(cid) = component_ids.get(simple) {
+                                test_scope_components.push((f.name.name.clone(), *cid));
                             }
                         } else if let Some(ty) = tb_scalar_field_ir_type(&f.ty) {
                             let default = match &f.default {

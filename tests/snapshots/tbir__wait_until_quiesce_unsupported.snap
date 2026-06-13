@@ -2,4 +2,4 @@
 source: tests/tbir.rs
 expression: msg
 ---
-TB-IR lowering does not support testbench field `prod` of component type `Producer` yet; re-run with `--codegen v1`
+TB-IR lowering does not support a non-scalar (transaction/struct) event payload on `Producer.in_ev` yet (only event<scalar ≤ 64 bits> payloads are lowered; transaction-payload events gate on a later slice); re-run with `--codegen v1`
