@@ -3676,10 +3676,36 @@ end impl EvTest
     let msg = assert_unsupported(&lower_src(&two_src).unwrap_err());
     assert!(msg.contains("instantiated more than once"), "{msg}");
 
-    // The corpus fixture with uint<128> method params.
-    let err = lower_src(&fixture("aes_cipher_top_test.harc")).unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("wider than 64 bits"), "{msg}");
+    // A method value param wider than 128 bits is out of the wide-value
+    // method-ABI subset (v1's `HarcWide<N>` register-array model) and
+    // rejected precisely — the boundary above which `_harc_u128` no
+    // longer suffices. (`uint<128>` itself now lowers; see
+    // `aes_cipher_top_dump_ir_snapshot`.)
+    let wide_src = r#"
+transactor Wx
+    dut : Top
+
+    when active
+        hookable big(v: uint<256>)
+            dut.data = v
+        end big
+    end when
+end transactor Wx
+
+testbench WxTb
+    dut : Top
+    wx  : Wx active
+end testbench WxTb
+
+impl WxTest for WxTb
+    run
+        wx.dut = dut
+        wx.big(0)
+    end run
+end impl WxTest
+"#;
+    let msg = assert_unsupported(&lower_src(wide_src).unwrap_err());
+    assert!(msg.contains("wider than 128 bits"), "{msg}");
 }
 
 /// Verifier net: a `TransactorMethod` call edge nested in expression
@@ -3797,6 +3823,28 @@ fn wide_reg_dump_ir_snapshot() {
     let prog = lower_src(&fixture("wide_reg_test.harc")).expect("lowers");
     verify::verify_program(&prog).expect("verifies");
     insta::assert_snapshot!("wide_reg_dump_ir", format!("{prog}"));
+}
+
+/// Wide-value (>64-bit) method-param ABI: `load_block(key: uint<128>,
+/// text_in: uint<128>)` lowers its params as `uint<128>` locals and the
+/// body moves them to the 128-bit DUT ports. The `_harc_u128` C++ ABI is
+/// asserted end-to-end by the registry equivalence harness.
+#[test]
+fn aes_cipher_top_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("aes_cipher_top_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    // The wide param survives as a 128-bit-typed local.
+    let m = prog.transactors[0].method("load_block").unwrap();
+    let f = prog.function(m.function);
+    assert_eq!(f.params.len(), 2, "two wide params");
+    assert_eq!(
+        f.params[0].ty,
+        ir::IrType::UInt(Some(128)),
+        "first param lowers to uint<128>",
+    );
+    // `LocalId(i)` mirrors the i-th param (TB-IR convention).
+    assert_eq!(f.locals[0].ty, ir::IrType::UInt(Some(128)), "param local is wide");
+    insta::assert_snapshot!("aes_cipher_top_dump_ir", format!("{prog}"));
 }
 
 /// 512-bit message-block literals + `while !dut.done` header re-reads.
