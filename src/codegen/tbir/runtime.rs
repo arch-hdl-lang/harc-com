@@ -165,6 +165,18 @@ pub(super) fn scoreboard_struct(out: &mut String, sb: &crate::ir::ScoreboardSche
     writeln!(out).ok();
 }
 
+/// The C++ payload type carried by an `event<T>` subscriber closure.
+/// Mirrors v1's `payload_type_for_arg`: a scalar widens to
+/// `uint64_t`/`int64_t`; a value-record payload is the record struct
+/// (carried by value).
+fn event_payload_cty(p: &crate::ir::EventPayload, records: &[crate::ir::RecordSchema]) -> String {
+    match p {
+        crate::ir::EventPayload::Scalar { signed: true } => "int64_t".to_string(),
+        crate::ir::EventPayload::Scalar { signed: false } => "uint64_t".to_string(),
+        crate::ir::EventPayload::Record(r) => records[r.index()].name.clone(),
+    }
+}
+
 /// One composite-component struct (env/agent cluster, flat-struct
 /// subset). Mirrors v1's `emit_component_struct`: scalar/queue/event/
 /// sub-component fields plus the `_last_in_cycle`/`_last_out_cycle`
@@ -175,6 +187,7 @@ pub(super) fn component_struct(
     out: &mut String,
     c: &crate::ir::ComponentSchema,
     components: &[crate::ir::ComponentSchema],
+    records: &[crate::ir::RecordSchema],
 ) {
     use crate::ir::ComponentFieldKind;
     writeln!(out, "struct {} {{", c.name).ok();
@@ -195,11 +208,11 @@ pub(super) fn component_struct(
                 let elem = if *signed { "int64_t" } else { "uint64_t" };
                 writeln!(out, "{INDENT}harc_rt::HarcQueue<{elem}> {};", f.name).ok();
             }
-            ComponentFieldKind::Event { signed } => {
-                let payload = if *signed { "int64_t" } else { "uint64_t" };
+            ComponentFieldKind::Event { payload } => {
+                let pty = event_payload_cty(payload, records);
                 writeln!(
                     out,
-                    "{INDENT}std::vector<std::function<void({payload})>> {};",
+                    "{INDENT}std::vector<std::function<void({pty})>> {};",
                     f.name
                 )
                 .ok();

@@ -1088,10 +1088,16 @@ fn emit_component_fn_lambda(
     let pad3 = INDENT.repeat(depth + 3);
 
     let ret_ty = if func.ret.is_some() { "uint64_t" } else { "void" };
-    // The receiver `self`, then one `uint64_t` per declared param.
+    // The receiver `self`, then one parameter per declared param — a
+    // record param (`on in_ev(t)` with `event<TinyTxn>`) is taken by
+    // value as the record struct; every other param widens to uint64_t.
     let mut params = vec![format!("{}& self", comp.name)];
-    for n in &names[..nparams] {
-        params.push(format!("uint64_t {n}"));
+    for (i, n) in names[..nparams].iter().enumerate() {
+        let pty = match func.locals[i].ty {
+            IrType::Record(r) => prog.records[r.index()].name.clone(),
+            _ => "uint64_t".to_string(),
+        };
+        params.push(format!("{pty} {n}"));
     }
     let params = params.join(", ");
     writeln!(out, "{pad}auto {lambda} = [&]({params}) -> {ret_ty} {{").ok();

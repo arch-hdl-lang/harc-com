@@ -107,3 +107,5 @@ tb_field_agent_test | Top | top_counter.sv | - | pass
 sequencer_connect_test | Top | top_counter.sv | top_counter.arch | pass
 tseq_basic_test | Top | top_counter.sv | top_counter.arch | pass
 axilite_fuzz_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass | axilite_regs_test.harc | - | AxiLiteFuzzTest
+heartbeat_idle_test | Top | top_counter.sv | - | pass
+wait_until_quiesce_test | Top | top_counter.sv | - | pass

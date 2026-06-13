@@ -31,6 +31,7 @@ checked against the code at the cited location.
 | tb-component-field slice (2026-06-13) | composite-component **testbench-field binding** — a component bound as a `testbench` FIELD (`prod : Producer` / `sb : Sb` / `top : HeartbeatEnv` inside the `testbench` block, alongside `dut : Top`), the complement of the already-shipped test-scope `let env : <Env>` binding. NO new IR variants: the testbench-field walk in `lower/mod.rs` routes a component-typed field into the SAME `test_scope_components` collector a test-scope `let` uses, so it flows into `ComponentFieldBinding`/`component_fields` and lowers to a default-constructed run-scope instance identically. The impl-for desugaring prefixes a testbench-field access with `_tb` (`prod.in_ev` → `_tb.prod.in_ev`); a new `FuncBuilder::strip_tb_prefix` helper (`components.rs`) strips that prefix in every component-access path (`as_component_method_call`, `as_component_field_{target,read}`, `lower_emit`, `as_component_idle`) and `as_port_ref` skips a `_tb.<component>` root, so `emit`/`idle_in`/field reads/writes all resolve to the bare-name instance. `validate_testbench_component` now ACCEPTS a component-typed field (a `mode` keyword on one is rejected — it's a transactor concept). Hardening: `event<transaction/struct>` payloads now reject precisely at component-schema lowering (`event<TinyTxn>` parses the payload as `TypeArg::Expr`/`Named`, previously mis-lowered to a scalar callback and failed at C++ compile). Fixture `tb_field_agent_test` (`top_counter.sv`, pass) — the agent from `agent_on_handler_test` bound as a testbench field instead of a test-scope let; trace-diff clean v1↔tbir at seed 1. See divergence 16. `event<transaction>` payloads, `quiesced(N)`, `watchdog`, named `phase`, `on <N> cycles`, scoreboard-`queue` SUB-components in an env, and `wait until` with heartbeat predicates stay rejected (residual map below). |
 | tseq slice (2026-06-13) | `tseq` (transaction-sequence) construct (`src/ir/lower/tseqs.rs`): a named generator of a sequence of transaction values, iterated with `for t in <TSeq>`. New IR (minimal): `IrType::RecordSeq(RecordId)`, `FunctionKind::Tseq { record }`, `CallTarget::Tseq(name)`, `Stmt::SeqPush`, `Expr::SeqLen`/`Expr::SeqIndex`. The generator lowers to a `[&]`-lambda returning `std::vector<Record>` (v1's `emit_tseq`); `yield t` → `SeqPush`; `randomize(t)` reuses the merged constraint-IR seam (#372 — the solver problem table already catalogs tseq randomize sites); `let txns = Gen(5)` → a `CallTarget::Tseq` edge typing the local `RecordSeq`; `for t in txns` → a counted loop copying `txns[i]` into the record loop variable each iteration (reusable — the sequence is materialized once). Fixtures: `tseq_basic_test` (self-proving — randomize + override + reusable double-iteration) and `axilite_fuzz_test` (corpus fuzz test, `--test AxiLiteFuzzTest` + helpers) — both trace-diff clean v1↔tbir at seed 1, both need Z3. The three sequencer corpus fixtures lower their tseq but stop at deeper blockers (transactor state field — divergence 10; agent-mode multi-DUT-handle); those stay rejected (divergence 17). |
 | sequencer slice (2026-06-13) | `sequencer` construct (builds on the env-composition + agent/on-handler core, `src/ir/lower/components.rs`): a `sequencer` is the analysis-source component shape — an `out event<T>` analysis port plus `hookable` methods that generate a stimulus stream and `emit` each item on that port. It routes through the same `CompSource`/`ComponentSchema` machinery as a method-bearing scoreboard or analysis-source transactor; the only addition is `ComponentKindTag::Sequencer` (+ `CompSource::Sequencer`) for dump-ir/diagnostics. A `connect <sqr>.dispatched -> <drv>.<sink>` edge inside the composing env wires the emitted stream into a sink method (the UVM sequencer/driver bridge). No new IR variants, no new statement/expr forms — sequencer methods, `emit`, and `connect` all reuse the existing component lowering. Fixture: `sequencer_connect_test` (`top_counter.sv`/`top_counter.arch`, pass) — a `dispatch(n)` hookable emitting over a literal-range `for i in 0 .. n` loop, connected to a scoreboard sink; trace-diff clean v1↔tbir at seed 1. The three corpus sequencer fixtures (`axilite_connect_test`, `transactor_agent_mode_test`, `transactor_env_mode_test`) stay blocked: each iterates a `tseq` (`for t in <TSeq>` + `randomize`) inside its `dispatch`, and the agent/env fixtures additionally stack mode-inheritance + cycle-trigger `on dut.x && dut.y` handlers; those gate on the `tseq`/`randomize-in-tseq` + agent-mode slices (divergence 16). |
+| event-record-payload slice (2026-06-13) | `event<transaction>` / `event<struct>` analysis ports — **non-scalar event channels carrying a value-record payload** (the heartbeat/quiesce cluster's blocker; #376 rejected these as a soundness measure). `ComponentFieldKind::Event` now carries an `EventPayload` (`Scalar { signed }` \| `Record(RecordId)`) instead of a bare `signed: bool`, and `OnHandlerSchema::arg_signed` becomes `arg_payload: EventPayload`. Field lowering (`lower_event_payload`, `src/ir/lower/components.rs`) resolves a payload that parses as `TypeArg::Type(Named)` or `TypeArg::Expr(Ident)` against the `record_ids` table — a known transaction/struct → `Record`, a scalar ≤ 64 bits → `Scalar`, anything else (enum/Vec/nested/`TypeArg::Named` keyword arg) is rejected precisely. An `on in_ev(t)` handler whose event is a record now binds a record-typed param (`IrType::Record(rid)`), so `t.field` reads in the body resolve against the schema; `emit prod.in_ev(t)` carries the record local. The tbir backend mirrors v1's `payload_type_for_arg`: the event field becomes `std::vector<std::function<void(<RecordName>)>>` (`runtime::event_payload_cty`) and the component-fn lambda renders a record param by value (`func.rs`); the `[&](auto _t)` subscriber/connect lambdas were already payload-generic. No new statement/expr forms — `emit`/`on`/`connect` reuse the existing component lowering. Fixtures unlocked (both `top_counter.sv`, pass, trace-diff clean v1↔tbir at seed 1): `heartbeat_idle_test` (agent + record-payload event + `on` handler + `idle_in` poll) and `wait_until_quiesce_test` (same + `wait until all of … timeout`, already supported by the agent slice). `watchdog_quiesce_test` (a `watchdog` directive) and `env_quiesced_phase_test` (a data-only `scoreboard` SUB-component in an env + `phase` + `quiesced(N)`) stay rejected — separate slices. See divergence 17. |
 
 ### Construct subset
 
@@ -244,18 +245,24 @@ test-scope `let`. The impl-for desugaring prefixes the access with `_tb`;
 `FuncBuilder::strip_tb_prefix` drops it in every component-access path so
 `emit`/`idle`/field reads/writes resolve to the bare-name instance. New
 fixture `tb_field_agent_test` trace-diffs clean. **Out of subset** (precise
-rejections — the residual stack behind the binding): `event<Struct/
-transaction>` payloads (now rejected at component-schema lowering — was
-mis-lowered to a scalar callback), `quiesced(N)`, `watchdog`, named
-`phase`, `wait until` with heartbeat predicates, `on <expr>`/`on <N>
-cycles` triggers, a `queue` SUB-component inside an env, `sequencer`/
-`tseq`. Those gate on later slices.
-clean. **Out of subset** (precise rejections): `event<Struct/transaction>`
-payloads, composite-component *testbench fields* (the heartbeat fixtures'
-`prod : Producer` binding — separate slice), `quiesced(N)`, `watchdog`,
-named `phase`, `wait until` with heartbeat predicates, `on <expr>`/`on
-<N> cycles` triggers, `tseq` (`sequencer` lowers since divergence 16).
-Those gate on later slices.
+rejections — the residual stack behind the binding): `quiesced(N)`,
+`watchdog`, named `phase`, `wait until` with heartbeat predicates, `on
+<expr>`/`on <N> cycles` triggers, a `queue` SUB-component inside an env,
+`sequencer`/`tseq`. Those gate on later slices.
+
+The **event-record-payload subset** (added 2026-06-13, same file,
+divergence 17) lifts the `event<transaction>` / `event<struct>` rejection
+the binding slice introduced: an analysis port whose payload is a
+value-record now lowers. `ComponentFieldKind::Event` carries an
+`EventPayload` (`Scalar { signed }` \| `Record(RecordId)`); a record
+payload makes the field a `std::vector<std::function<void(<RecordName>)>>`
+and binds a record-typed `on`-handler argument so `t.field` reads resolve.
+This mirrors v1's `payload_type_for_arg` exactly. New fixtures
+`heartbeat_idle_test` and `wait_until_quiesce_test` trace-diff clean.
+**Out of subset** (precise rejections): non-record/non-scalar event
+payloads (enum / Vec / nested), `quiesced(N)`, `watchdog`, named `phase`,
+a data-only `scoreboard`/`queue` SUB-component inside an env, `on
+<expr>`/`on <N> cycles` triggers, `tseq`. Those gate on later slices.
 
 ### The equivalence matrix
 
@@ -786,7 +793,8 @@ reason. Code locations are authoritative.
       `emit_idle_predicate` (`cycle_count - _last_{in,out}_cycle >= N`).
       A user `hookable` of the same name still wins in v1; in this IR
       subset agents carry no such override, so the built-in always applies.
-    - *Rejected, never mis-lowered:* `event<Struct/transaction>` payloads,
+    - *Rejected, never mis-lowered:* `event<Struct/transaction>` payloads
+      (now LIFTED — divergence 17 lowers record-payload events),
       composite-component *testbench fields* (now LIFTED — divergence 16
       lowers `prod : Producer` testbench-field binding),
       `quiesced(N)` (env heartbeat aggregation), `watchdog`, named
@@ -916,13 +924,12 @@ reason. Code locations are authoritative.
       precise `Unsupported` (transaction-payload events gate on a later
       slice).
     - *Out of subset* (precise rejections, the residual stack behind the
-      binding for the 5 target fixtures): `event<transaction>` payloads
-      (heartbeat_idle / wait_until_quiesce / watchdog_quiesce /
-      env_quiesced all use `event<TinyTxn>`), `watchdog` (watchdog_quiesce
+      binding for the 5 target fixtures — `event<transaction>` payloads
+      have since LIFTED in divergence 17): `watchdog` (watchdog_quiesce
       / watchdog_trip_diagnostic), `quiesced(N)` env aggregation, named
-      `phase`, `on <N> cycles`, and a `queue` SUB-component inside an env
-      (env_quiesced's `DrainSb` holds `expected : queue<uint<8>>`). None
-      of the 5 fully unlock with the binding alone. New self-proving
+      `phase`, `on <N> cycles`, and a `queue`/data-only-`scoreboard`
+      SUB-component inside an env (env_quiesced's `DrainSb` holds
+      `expected : queue<uint<8>>`). New self-proving
       fixture: `tb_field_agent_test` (`top_counter.sv`, pass) — the
       `agent_on_handler_test` agent bound as a testbench field instead of
       a test-scope let; registered in the equivalence registry,
@@ -962,6 +969,40 @@ reason. Code locations are authoritative.
       through env→agent→transactor) and cycle-trigger `on dut.x && dut.y`
       handlers, which need the agent-mode + cycle-trigger slices. None of
       the three fully unlock from the sequencer construct alone.
+17. **Event record payloads (2026-06-13).** Lifts the `event<transaction>`
+    / `event<struct>` rejection the testbench-field-binding slice
+    introduced (#376, a soundness measure). A non-scalar analysis-port
+    channel now carries a value-record payload by value.
+    - *IR change.* `ComponentFieldKind::Event { signed: bool }` becomes
+      `Event { payload: EventPayload }` where `EventPayload` is
+      `Scalar { signed }` or `Record(RecordId)`; `OnHandlerSchema::
+      arg_signed: bool` becomes `arg_payload: EventPayload`. All exhaustive
+      matches (display, lowering, runtime codegen) updated.
+    - *Lowering.* `lower_event_payload` (`src/ir/lower/components.rs`)
+      resolves the `event<T>` arg against the `record_ids` table — a
+      known transaction/struct name (parsed as `TypeArg::Type(Named)` or
+      `TypeArg::Expr(Ident)`) → `Record`, a scalar ≤ 64 bits → `Scalar`.
+      A named type that is neither (enum / Vec / nested) and the
+      keyword-style `TypeArg::Named` are rejected precisely. An
+      `on in_ev(t)` handler over a record event binds a record-typed
+      param (`IrType::Record(rid)`), so `t.field` reads resolve against
+      the schema; `emit prod.in_ev(t)` carries the record local.
+    - *Codegen.* Mirrors v1's `payload_type_for_arg`: the event field is
+      `std::vector<std::function<void(<RecordName>)>>`
+      (`runtime::event_payload_cty`) and the component-fn lambda renders
+      a record param by value (`func.rs`). The `[&](auto _t)` subscriber
+      and `connect` lambdas were already payload-generic. **This is a
+      type-name divergence only (scalar `uint64_t`/`int64_t` vs the record
+      struct); same trace behavior, verified by trace-diff.**
+    - *Fixtures unlocked* (both `top_counter.sv`, pass, trace-diff clean
+      v1↔tbir at seed 1): `heartbeat_idle_test` (agent + record-payload
+      event + `on` handler + `idle_in` poll) and `wait_until_quiesce_test`
+      (same + `wait until all of … timeout`, already supported). Registered
+      in the equivalence registry.
+    - *Out of subset* (still rejected, behind this slice): `watchdog`
+      (watchdog_quiesce_test), a data-only `scoreboard` SUB-component in an
+      env + named `phase` + `quiesced(N)` (env_quiesced_phase_test), and
+      non-record/non-scalar event payloads (enum / Vec / nested).
 
 17. **`tseq` (transaction-sequence) construct (2026-06-13).** A `tseq`
     is a named generator of a sequence of transaction values, iterated

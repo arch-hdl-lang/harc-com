@@ -269,17 +269,64 @@ fn tseq_basic_fixture_lowers() {
 }
 
 /// `wait_until_quiesce` composes an `agent`, binds it as a TESTBENCH
-/// FIELD (`prod : Producer`, now lowered — testbench-field-binding
-/// slice), and drives it with `emit prod.in_ev(t)` where the event
-/// payload is `event<TinyTxn>` — a *transaction* payload. The IR's
-/// event model carries a single ≤64-bit scalar, so the fixture now
-/// trips precisely on the transaction-payload residual (the next
-/// blocker behind the binding) rather than on `agent` or the binding.
+/// FIELD (`prod : Producer`), and drives it with `emit prod.in_ev(t)`
+/// where the event payload is `event<TinyTxn>` — a *transaction*
+/// payload. With record-payload events lowered (this slice), the
+/// fixture lowers fully: the agent's `in_ev` field carries a
+/// `Record` payload and its `on in_ev(t)` handler takes a
+/// record-typed argument.
 #[test]
-fn wait_until_quiesce_fixture_is_unsupported() {
-    let err = lower_src(&fixture("wait_until_quiesce_test.harc")).unwrap_err();
+fn wait_until_quiesce_fixture_lowers_record_event() {
+    let prog = lower_src(&fixture("wait_until_quiesce_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let agent = prog
+        .components
+        .iter()
+        .find(|c| c.name == "Producer")
+        .expect("Producer agent");
+    // The `in_ev : event<TinyTxn>` field is a record-payload event.
+    let ev = agent
+        .fields
+        .iter()
+        .find(|f| f.name == "in_ev")
+        .expect("in_ev field");
+    let rid = match &ev.kind {
+        ir::ComponentFieldKind::Event {
+            payload: ir::EventPayload::Record(r),
+        } => *r,
+        other => panic!("in_ev should be a record-payload event, got {other:?}"),
+    };
+    assert_eq!(prog.records[rid.index()].name, "TinyTxn");
+    // Its `on in_ev(t)` handler takes the same record by value.
+    let oh = agent.on_handlers.first().expect("on-handler");
+    assert_eq!(oh.arg_payload, ir::EventPayload::Record(rid));
+    let body = prog.function(oh.function);
+    assert_eq!(
+        body.params.first().map(|p| &p.ty),
+        Some(&ir::IrType::Record(rid)),
+        "handler arg is the record type"
+    );
+}
+
+/// Locks the dump-ir text for the heartbeat fixture: an `agent` with a
+/// record-payload `event<TinyTxn>` field, an `on in_ev(t)` handler
+/// taking the record by value, `emit prod.in_ev(t)` carrying a record
+/// local, and the `idle_in` heartbeat predicate poll.
+#[test]
+fn heartbeat_idle_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("heartbeat_idle_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("heartbeat_idle_dump_ir", format!("{prog}"));
+}
+
+/// `watchdog_quiesce_test` stacks a `watchdog` directive on top of the
+/// record-payload event — that gates on the watchdog/phase slice and
+/// is still rejected precisely (the next blocker behind this slice).
+#[test]
+fn watchdog_quiesce_fixture_is_unsupported() {
+    let err = lower_src(&fixture("watchdog_quiesce_test.harc")).unwrap_err();
     let msg = assert_unsupported(&err);
-    insta::assert_snapshot!("wait_until_quiesce_unsupported", msg);
+    insta::assert_snapshot!("watchdog_quiesce_unsupported", msg);
 }
 
 /// Untimed `any of` lowers to a `WaitUntil` terminator in `AnyOf`

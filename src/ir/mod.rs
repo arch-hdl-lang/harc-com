@@ -496,13 +496,29 @@ pub enum ComponentFieldKind {
     /// `expected : queue<uint<32>>` — a FIFO of a scalar element type.
     Queue { signed: bool },
     /// `observed : out event<uint<8>>` — an analysis port. Lowers to a
-    /// `std::vector<std::function<void(<payload>)>>` member; `signed`
-    /// selects the C payload type. Sinks subscribe via `connect`.
-    Event { signed: bool },
+    /// `std::vector<std::function<void(<payload>)>>` member; `payload`
+    /// selects the C payload type (scalar `uint64_t`/`int64_t` or a
+    /// value-record struct). Sinks subscribe via `connect`.
+    Event { payload: EventPayload },
     /// `source : AnalysisSource passive` / `sb : AnalysisSb` — a nested
     /// by-value sub-component. `component` indexes
     /// `TbProgram::components`.
     Sub { component: ComponentId },
+}
+
+/// The payload carried by an `event<T>` analysis port (and the matching
+/// subscriber-closure / `on`-handler argument). Mirrors v1's
+/// `payload_type_for_arg`: a scalar widens to `uint64_t`/`int64_t`; a
+/// user-named `transaction`/`struct` payload is carried by value as the
+/// record struct (`std::function<void(<RecordName>)>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventPayload {
+    /// `event<uint<8>>` / `event<sint<…>>` / `event<bool>` — a scalar
+    /// ≤ 64 bits. `signed` selects `int64_t` vs `uint64_t`.
+    Scalar { signed: bool },
+    /// `event<TinyTxn>` — a value-record payload. `RecordId` indexes
+    /// `TbProgram::records`; the C++ payload type is the record struct.
+    Record(RecordId),
 }
 
 #[derive(Debug, Clone)]
@@ -522,15 +538,15 @@ pub struct ComponentMethodSchema {
 /// component). The handler subscribes to the component's own `event`
 /// field; on every `emit`/`connect` fan-out into that field, the
 /// framework bumps `_last_in_cycle` (activity tracking) then invokes
-/// `<Comp>_on<idx>(self, arg)`. `arg_signed` selects the C payload
+/// `<Comp>_on<idx>(self, arg)`. `arg_payload` selects the C payload
 /// type for the subscriber closure parameter, mirroring the event
-/// field's `ComponentFieldKind::Event { signed }`.
+/// field's `ComponentFieldKind::Event { payload }`.
 #[derive(Debug, Clone)]
 pub struct OnHandlerSchema {
     /// The self-event field this handler subscribes to.
     pub event: String,
-    /// Signedness of the event payload scalar (matches the field).
-    pub arg_signed: bool,
+    /// Payload shape of the subscribed event (matches the field).
+    pub arg_payload: EventPayload,
     /// Lowered handler body (`kind: ComponentMethod`, exactly one param
     /// = the event argument).
     pub function: FunctionId,

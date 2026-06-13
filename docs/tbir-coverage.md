@@ -22,8 +22,13 @@ registered. Amended again 2026-06-13 by the **testbench-field-binding
 slice** — see the heartbeat/quiesce cluster section below: a
 composite component bound as a `testbench` FIELD (`prod : Producer`)
 now lowers identically to a test-scope `let`; `tb_field_agent_test` is
-registered, and the 5 heartbeat/quiesce fixtures now reject one level
-deeper still (`event<transaction>` payloads / `watchdog`).
+registered. Amended again 2026-06-13 by the **event-record-payload
+slice** — see the heartbeat/quiesce cluster section below:
+`event<transaction>`/`event<struct>` analysis-port payloads now lower
+(value-record by value), fully unlocking `heartbeat_idle_test` and
+`wait_until_quiesce_test` (both registered); `watchdog_quiesce_test` and
+`env_quiesced_phase_test` reject one level deeper (`watchdog` /
+data-only-`scoreboard` sub-component + `phase`).
 
 **This file is a snapshot, not a source of truth.** The registry
 (`tests/tbir_equiv_fixtures.txt`) is the source of truth for what is
@@ -350,21 +355,37 @@ prefix is stripped in every component-access path). **Registered**:
 agent bound as a testbench field), lowering cleanly, passing the v1-vs-tbir
 pair, trace-diff clean at seed 1.
 
-None of the 5 heartbeat/quiesce fixtures fully unlock with the binding
-alone — each stacks a deeper construct past it. Residual first-blocker
-map (re-run of `harc dump-ir`, 2026-06-13, after the binding landed):
+### `event<transaction>` / `event<struct>` payloads — **RESOLVED 2026-06-13 (event-record-payload slice)**
+
+Non-scalar analysis-port channels carrying a value-record payload now
+lower (`ComponentFieldKind::Event { payload: EventPayload }`,
+`OnHandlerSchema::arg_payload`; see docs/tbir-mvp.md divergence 17). #376
+had rejected `event<transaction>`/`event<struct>` precisely as a
+soundness measure — they parse as `TypeArg::Expr(Ident)`/`Type(Named)`
+and would otherwise mis-lower to a scalar callback and fail at C++
+compile. `lower_event_payload` resolves the payload against the records
+table; the event field becomes `std::vector<std::function<void(
+<RecordName>)>>` and `on in_ev(t)` binds a record-typed argument.
+
+**Registered (both pass, trace-diff clean v1↔tbir at seed 1):**
+
+| Fixture | Newly lowers | Next blocker |
+|---|---|---|
+| `heartbeat_idle_test` | agent + `event<TinyTxn>` + `on in_ev(t)` + `idle_in` poll | — **FULLY UNLOCKED** |
+| `wait_until_quiesce_test` | same + `wait until all of … timeout` (agent slice) | — **FULLY UNLOCKED** |
+
+**Still blocked (residual first-blocker map, `harc dump-ir` 2026-06-13):**
 
 | Next blocker | Fixtures |
 |---|---|
-| `event<transaction>` payload (`event<TinyTxn>` — the IR event model carries one ≤64-bit scalar; struct payloads now reject precisely at component-schema lowering instead of mis-lowering to a scalar callback) | `heartbeat_idle_test`, `wait_until_quiesce_test`, `watchdog_quiesce_test`, `env_quiesced_phase_test` |
-| `watchdog` (`period`/`max_idle` + the watchdog idle-trip assertion) | `watchdog_trip_diagnostic_test` (`event<int>` is scalar, so its first blocker is the watchdog) |
+| `watchdog` (`period`/`max_idle` + the idle-trip assertion) + `on <N> cycles` periodic trigger | `watchdog_quiesce_test`, `watchdog_trip_diagnostic_test` |
+| data-only `scoreboard` SUB-component in an env (`DrainSb` held by `HeartbeatEnv`) + named `phase` + `quiesced(N)` env heartbeat aggregation | `env_quiesced_phase_test` |
 
-Behind those first blockers each fixture stacks still more constructs
-this slice does not implement: `quiesced(N)` (env heartbeat aggregation
-over sub-components), `on <N> cycles` periodic triggers, named `phase`,
-`wait until <preds> timeout fail` with heartbeat predicates, and a
-`queue` SUB-component inside an env (`env_quiesced_phase_test`'s `DrainSb`
-holds `expected : queue<uint<8>>`). Those are the next layered slices.
+`env_quiesced_phase_test` trips first on the `DrainSb` scoreboard
+sub-component (a data-only `ScoreboardSchema`, not a `ComponentSchema`,
+so `lower_field`'s `Named` arm can't resolve it as a `Sub`); behind that
+it stacks `phase drain` and `top.quiesced(8)`. Those are the next layered
+slices.
 
 ### `sequencer` construct — **RESOLVED 2026-06-13 (sequencer slice)**
 
