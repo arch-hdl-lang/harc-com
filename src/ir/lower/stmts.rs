@@ -210,6 +210,11 @@ impl FuncBuilder<'_> {
                 if self.try_lower_bitbash(e)? {
                     return Ok(());
                 }
+                // `regs.record_write(addr, data)` — passive mirror update
+                // of an observed bus write (no bus, no callback).
+                if self.try_lower_record_write(e)? {
+                    return Ok(());
+                }
                 // Testbench helper method call (`_tb.reset()`), CFG-
                 // inlined like an impure helper; statement position
                 // discards the (usually void) result.
@@ -475,6 +480,10 @@ impl FuncBuilder<'_> {
                 return Ok(());
             }
         }
+        // RAL passive record read: `let v = regs.record_read(addr)`.
+        if self.try_lower_record_read_let(&l.name.name, value)? {
+            return Ok(());
+        }
         // RAL frontdoor register-level read: `let v = regs.NAME`.
         if self.try_lower_regblock_read_let(&l.name.name, value)? {
             return Ok(());
@@ -702,22 +711,73 @@ impl FuncBuilder<'_> {
                 "",
             ));
         }
+        // `t.field[i] = value` on a `Vec<T, N>` record field. Lower the
+        // index, then the value, into an indexed `RecordFieldWrite`.
+        if let ExprKind::Index { target: it, index } = &*target.kind {
+            if let ExprKind::Field { target: ft, name } = &*it.kind {
+                if let ExprKind::Ident(root) = &*ft.kind {
+                    if let Some(local) = self.lookup(&root.name) {
+                        if let Some(rid) = self.record_of_local(local) {
+                            let schema = &self.ctx.records[rid.index()];
+                            let Some(fld) = schema.field(&name.name) else {
+                                return Err(LowerError::Invalid(format!(
+                                    "transaction `{}` has no field `{}`",
+                                    schema.name, name.name
+                                )));
+                            };
+                            if fld.vec_len.is_none() {
+                                return Err(unsupported(
+                                    &format!(
+                                        "indexing the scalar record field `{}.{}`",
+                                        schema.name, name.name
+                                    ),
+                                    "only `Vec<T, N>` record fields are indexable",
+                                ));
+                            }
+                            let idx = self.lower_expr_no_ports(index)?;
+                            let e = self.lower_expr_no_ports(value)?;
+                            self.push(Stmt::RecordFieldWrite {
+                                local,
+                                field: name.name.clone(),
+                                index: Some(idx),
+                                value: e,
+                            });
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
         // `t.field = value` on a record-typed local.
         if let ExprKind::Field { target: ft, name } = &*target.kind {
             if let ExprKind::Ident(root) = &*ft.kind {
                 if let Some(local) = self.lookup(&root.name) {
                     if let Some(rid) = self.record_of_local(local) {
                         let schema = &self.ctx.records[rid.index()];
-                        if schema.field(&name.name).is_none() {
+                        let Some(fld) = schema.field(&name.name) else {
                             return Err(LowerError::Invalid(format!(
                                 "transaction `{}` has no field `{}`",
                                 schema.name, name.name
                             )));
+                        };
+                        // A whole-`Vec` field write (`rec.data = ...`)
+                        // would need an array-copy value, which this
+                        // subset has no expression for; only element
+                        // writes (handled above) are lowered.
+                        if fld.vec_len.is_some() {
+                            return Err(unsupported(
+                                &format!(
+                                    "a whole-`Vec` write of record field `{}.{}`",
+                                    schema.name, name.name
+                                ),
+                                "assign the field element-wise (`{rec}.{field}[i] = ...`)",
+                            ));
                         }
                         let e = self.lower_expr_no_ports(value)?;
                         self.push(Stmt::RecordFieldWrite {
                             local,
                             field: name.name.clone(),
+                            index: None,
                             value: e,
                         });
                         return Ok(());

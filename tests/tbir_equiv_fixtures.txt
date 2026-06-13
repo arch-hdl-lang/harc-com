@@ -147,3 +147,6 @@ pipe_reg_test | PipeRegTest | pipe_reg_test.sv | - | pass
 extern_fn_ref_test | Top | top_counter.sv | - | pass | - | extern_fn_ref.cpp
 tlm_target_ooo_lanes_test | TlmOooReadInitiatorPair | TlmOooReadInitiatorPair.sv | - | pass
 tlm_pairing_arch_initiator_test | TlmPairingArchInitiator | TlmPairingArchInitiator.sv | TlmPairingArchInitiator.arch | pass
+regblock_record_api_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
+tlm_pairing_arch_burst_target_test | TlmPairingArchBurstTarget | TlmPairingArchBurstTarget.sv | - | pass
+tlm_pairing_arch_burst_initiator_test | TlmPairingArchBurstInitiator | TlmPairingArchBurstInitiator.sv | - | pass

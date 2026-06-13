@@ -127,12 +127,33 @@ fn lower_record_field(
             "{kind} `{owner}` declares field `{fname}` more than once"
         )));
     }
-    let ty = field_ir_type(&f.ty, enum_names).ok_or_else(|| {
-        unsupported(
-            &format!("{kind} field `{owner}.{fname}` with a non-scalar type"),
-            "only uint/sint/bits/bool/bit fields up to 64 bits are lowered",
-        )
-    })?;
+    // A `Vec<T, N>` field is the one aggregate this slice lowers: a
+    // fixed-size array of a scalar element type (v1's `std::array<T, N>`
+    // record member). `ty` then carries the *element* scalar type and
+    // `vec_len` the count; everything else (bit layout, C++ storage,
+    // access) is driven off those two. A non-scalar element type, a
+    // non-literal length, or a nested aggregate is still rejected.
+    let (ty, vec_len) = match fixed_vec_field(&f.ty, enum_names) {
+        Some((elem_ty, len)) => (elem_ty, Some(len)),
+        None => {
+            let scalar = field_ir_type(&f.ty, enum_names).ok_or_else(|| {
+                unsupported(
+                    &format!("{kind} field `{owner}.{fname}` with a non-scalar type"),
+                    "only uint/sint/bits/bool/bit scalar fields up to 64 bits and \
+                     fixed `Vec<T, N>` arrays of such scalars are lowered",
+                )
+            })?;
+            (scalar, None)
+        }
+    };
+    // A `Vec<T, N>` field has no scalar `default <lit>` form (its zero
+    // value is the empty-brace array); reject a literal default on one.
+    if vec_len.is_some() && f.default.is_some() {
+        return Err(unsupported(
+            &format!("a `default` on the `Vec` field `{owner}.{fname}`"),
+            "Vec record fields default to a zero-filled array",
+        ));
+    }
     let default = match &f.default {
         None => None,
         Some(d) => Some(match &*d.kind {
@@ -160,11 +181,51 @@ fn lower_record_field(
     fields.push(RecordFieldSchema {
         name: fname.clone(),
         ty,
+        vec_len,
         default,
         non_random: f.non_random,
         attr_src,
     });
     Ok(())
+}
+
+/// Recognize a `Vec<T, N>` field whose element `T` is a scalar this
+/// slice can lower, returning `(element IrType, N)`. `None` for any
+/// non-`Vec` type, a non-literal length, or a non-scalar / nested
+/// element type (those fall through to the scalar gate and its
+/// rejection). The element width lives in the returned `IrType`; it
+/// drives both the C++ storage type and the packed-bit layout, so a
+/// `Vec` element with no explicit width (which would have no defined
+/// packed width) is rejected here.
+fn fixed_vec_field(
+    t: &TypeExpr,
+    enum_names: &std::collections::HashSet<String>,
+) -> Option<(IrType, usize)> {
+    let TypeExpr::Builtin { name: BuiltinTy::Vec, args, .. } = t else {
+        return None;
+    };
+    let elem = match args.first()? {
+        TypeArg::Type(ty) => ty,
+        _ => return None,
+    };
+    let len = match args.get(1)? {
+        TypeArg::Expr(e) => match &*e.kind {
+            ExprKind::Int(s) => s.replace('_', "").parse::<usize>().ok()?,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if len == 0 {
+        return None;
+    }
+    let elem_ty = field_ir_type(elem, enum_names)?;
+    // The packed layout needs a defined element width. A widthless
+    // scalar (`uint` with no `<N>`) maps to `IrType::UInt(None)`, which
+    // has no packed width — reject rather than guess.
+    match elem_ty {
+        IrType::UInt(Some(_)) | IrType::SInt(Some(_)) | IrType::Bool => Some((elem_ty, len)),
+        _ => None,
+    }
 }
 
 /// Scalar field-type mapping, mirroring v1's `txn_field_c_type` C-type

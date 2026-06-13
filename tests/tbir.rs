@@ -1340,10 +1340,44 @@ end test StructTest
 /// subset: rejected at the field, never mis-lowered. (This is the
 /// residual blocker for the `tlm_pairing_arch_burst_*` fixtures.)
 #[test]
-fn struct_non_scalar_field_is_rejected() {
+fn struct_vec_field_lowers_and_indexes() {
+    // A `Vec<T, N>` struct field is the one aggregate the record subset
+    // lowers (v1's `std::array<T, N>` member); element read/write
+    // (`r.data[i]`) lower to indexed `RecordField` / `RecordFieldWrite`.
     let src = r#"
 struct Resp
     data : Vec<uint<32>, 4>
+    len : uint<3>
+end struct Resp
+
+test StructVecTest
+    let dut : Top
+    run
+        let r : Resp
+        r.data[0] = 17
+        let v = r.data[0]
+        assert v == 17 else fail("data[0]")
+    end run
+end test StructVecTest
+"#;
+    let prog = lower_src(src).expect("Vec struct field lowers");
+    let dump = format!("{prog}");
+    assert!(dump.contains("data : Vec<uint<32>, 4>"), "names the Vec field: {dump}");
+    assert!(
+        dump.contains("RecordFieldWrite(%r.data[0]"),
+        "indexed element write: {dump}"
+    );
+    assert!(dump.contains("%r.data[0]"), "indexed element read: {dump}");
+}
+
+/// A record field typed as a NON-fixed aggregate (`Vec` with a
+/// widthless element, a nested record, a list) is still rejected —
+/// only fixed `Vec<scalar, N>` lowers.
+#[test]
+fn struct_non_scalar_field_is_rejected() {
+    let src = r#"
+struct Resp
+    data : Vec<uint, 4>
 end struct Resp
 
 test StructVecTest
@@ -1353,7 +1387,7 @@ test StructVecTest
     end run
 end test StructVecTest
 "#;
-    let err = lower_src(src).expect_err("Vec field must be rejected");
+    let err = lower_src(src).expect_err("widthless Vec element must be rejected");
     let msg = assert_unsupported(&err);
     assert!(msg.contains("struct field"), "names the field: {msg}");
     assert!(msg.contains("non-scalar"), "names the reason: {msg}");
@@ -4215,23 +4249,48 @@ fn regblock_bitbash_corpus_lowers() {
     assert!(has_errcount, "expected an `errors == 0` AssertCheck (ErrorCount)");
 }
 
-/// The corpus `regblock_record_test` fixture — passive `record_write`/
-/// `record_read` API plus a per-register `on regs.REG` write callback —
-/// is the remaining regblock residual: lowering rejects it with a
-/// precise message naming the callback/record-API feature (NOT the
-/// generic bare-statement/scope mixing error), never mis-lowers.
+/// The corpus `regblock_record_test` fixture carries a per-register
+/// `on regs.REG` write callback — the remaining regblock residual. The
+/// passive `record_write`/`record_read` API it also uses now lowers (see
+/// `regblock_record_api_test`), but the callback lowers (in v1) to a
+/// reference-capturing closure over run-scope state fired from inside
+/// `record_write`, which the function-per-CFG IR cannot express (the
+/// same blocker as the `axilite_hooks` pre/post method hooks). Lowering
+/// rejects it with a precise message naming the callback feature (NOT
+/// the generic bare-statement/scope mixing error), never mis-lowers.
 #[test]
 fn regblock_record_corpus_rejects_precisely() {
     let err =
         lower_with_stdlib_bus("regblock_record_test.harc", "BusAxiLite.arch").unwrap_err();
     let msg = assert_unsupported(&err);
     assert!(
-        msg.contains("per-register write callback") || msg.contains("record_"),
-        "expected the record-API/callback residual rejection: {msg}"
+        msg.contains("per-register write callback"),
+        "expected the per-register callback residual rejection: {msg}"
     );
     assert!(
         !msg.contains("mixing bare statements"),
         "should not fall through to the generic mixing error: {msg}"
+    );
+}
+
+/// The passive `record_write`/`record_read` API — WITHOUT a per-register
+/// callback — fully lowers: a constant-address `record_write` decodes to
+/// a masked mirror `RecordFieldWrite` and `record_read` to a mirror
+/// `RecordField` read, with no bus traffic and no callback dispatch.
+#[test]
+fn regblock_record_api_lowers() {
+    let prog = lower_with_stdlib_bus("regblock_record_api_test.harc", "BusAxiLite.arch")
+        .expect("passive record API lowers");
+    let dump = format!("{prog}");
+    // Masked mirror write from `record_write(0x18, 0x12345678)` and a
+    // mirror read feeding the `record_read` dest.
+    assert!(
+        dump.contains("RecordFieldWrite(%regs.MM2S_SA"),
+        "expected a mirror RecordFieldWrite from record_write: {dump}"
+    );
+    assert!(
+        dump.contains("& 4294967295"),
+        "expected the record_write value masked to the register width: {dump}"
     );
 }
 

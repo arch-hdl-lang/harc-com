@@ -520,9 +520,17 @@ impl FuncBuilder<'_> {
             },
             lowered,
         );
+        // A record-typed return (`-> SomeStruct`) makes the dest a
+        // record local, so `dest.field` / `dest.vecfield[i]` reads
+        // resolve and the backend captures via `harc_unpack_<R>`. A
+        // scalar return leaves the dest at its default scalar type.
+        let ret_record = m.ret.as_ref().and_then(|t| self.tlm_ret_record_id(t));
         match dest {
             BusCallDest::Declare(name) => {
                 let id = self.declare(name);
+                if let Some(rid) = ret_record {
+                    self.set_local_type(id, crate::ir::IrType::Record(rid));
+                }
                 self.push(Stmt::Assign(id, call));
             }
             BusCallDest::Discard => {
@@ -531,6 +539,17 @@ impl FuncBuilder<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Resolve a `tlm_method` return `TypeExpr` to a `RecordId` when it
+    /// names a lowered record (`struct`/`transaction`); `None` for a
+    /// scalar return type or an unknown name.
+    fn tlm_ret_record_id(&self, ret: &TypeExpr) -> Option<crate::ir::RecordId> {
+        let TypeExpr::Named { name, .. } = ret else {
+            return None;
+        };
+        let simple = name.segments.last().map(|s| s.name.as_str())?;
+        self.ctx.record_ids.get(simple).copied()
     }
 
     /// `let x = fork <bind>.<method>(args)` / `fork <bind>.<method>(args)`

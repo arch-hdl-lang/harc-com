@@ -244,16 +244,57 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
 /// One transaction value-record struct. Field C types follow v1's
 /// `txn_field_c_type` for the lowered (≤64-bit scalar) subset:
 /// unsigned → `uint64_t`, signed → `int64_t`, bool/bit → `bool`.
+/// C++ storage type for a record field's scalar (or Vec element) type,
+/// mirroring v1's `record_field_c_type` / `txn_field_c_type` choices:
+/// `bool` for Bool, `int64_t` for SInt, `uint64_t` otherwise.
+fn field_scalar_cty(ty: &ir::IrType) -> &'static str {
+    match ty {
+        ir::IrType::Bool => "bool",
+        ir::IrType::SInt(_) => "int64_t",
+        _ => "uint64_t",
+    }
+}
+
+/// Packed-bit width of a record field's scalar (or Vec element) type —
+/// the declared width (`Bool` → 1). Mirrors v1's `packed_width` for the
+/// scalar leaves the record subset lowers. `None` for a widthless
+/// scalar (no defined layout); lowering already rejects those for Vec
+/// fields, and scalar fields never reach the pack helpers when any sum
+/// is undefined.
+fn field_packed_width(ty: &ir::IrType) -> Option<usize> {
+    match ty {
+        ir::IrType::Bool => Some(1),
+        ir::IrType::UInt(w) | ir::IrType::SInt(w) => w.map(|w| w as usize),
+        _ => None,
+    }
+}
+
+/// Total packed-bit width of a record (sum of every field's packed
+/// width; a `Vec<T, N>` field contributes `N * width(T)`). `None` when
+/// any field has no defined packed width — the pack helpers are then
+/// skipped, exactly as v1's `try_fold` over `packed_width` does.
+fn record_packed_width(r: &ir::RecordSchema) -> Option<usize> {
+    r.fields.iter().try_fold(0usize, |acc, f| {
+        let w = field_packed_width(&f.ty)?;
+        Some(acc + w * f.vec_len.unwrap_or(1))
+    })
+}
+
 fn record_struct(out: &mut String, r: &ir::RecordSchema) {
     writeln!(out, "struct {} {{", r.name).ok();
     for f in &r.fields {
-        let (cty, init) = match f.ty {
-            ir::IrType::Bool => (
-                "bool",
-                if f.default.is_some_and(|d| d != 0) { "true" } else { "false" }.to_string(),
-            ),
-            ir::IrType::SInt(_) => ("int64_t", f.default.unwrap_or(0).to_string()),
-            _ => ("uint64_t", f.default.unwrap_or(0).to_string()),
+        let cty = field_scalar_cty(&f.ty);
+        if let Some(n) = f.vec_len {
+            // `Vec<T, N>` field → `std::array<T, N>` member, zero-filled
+            // (v1's `record_field_c_type` Vec branch + `{}` default).
+            writeln!(out, "{INDENT}std::array<{cty}, {n}> {} = {{}};", f.name).ok();
+            continue;
+        }
+        let init = match f.ty {
+            ir::IrType::Bool => {
+                if f.default.is_some_and(|d| d != 0) { "true" } else { "false" }.to_string()
+            }
+            _ => f.default.unwrap_or(0).to_string(),
         };
         writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
     }
@@ -285,6 +326,140 @@ fn record_struct(out: &mut String, r: &ir::RecordSchema) {
         r.name
     )
     .ok();
+    writeln!(out).ok();
+    record_pack_helpers(out, r);
+}
+
+/// Emit `harc_pack_<R>` / `harc_unpack_<R>` / `harc_drive_<R>` for a
+/// record that crosses a lowered TLM response pin — v1's
+/// `emit_record_pack_helpers`. `harc_pack` lays each field into a
+/// `HarcWide<words>` LSB-first in *reverse* declaration order (so the
+/// first field occupies the high bits, matching the SV packed-struct
+/// convention); `harc_unpack` / `harc_drive` carry a `requires`
+/// fast-path that copies field-wise when the response pin is exposed as
+/// a struct (Verilator packed struct), falling back to the bit layout
+/// for a flat wide wire. Skipped when the record has no defined packed
+/// width (a widthless scalar field) — exactly v1's `try_fold` guard.
+fn record_pack_helpers(out: &mut String, r: &ir::RecordSchema) {
+    let Some(width) = record_packed_width(r) else {
+        return;
+    };
+    let name = &r.name;
+    let words = width.div_ceil(32).max(1);
+
+    // harc_pack: LSB-first, reverse declaration order.
+    writeln!(out, "static harc_rt::HarcWide<{words}> harc_pack_{name}(const {name}& value) {{").ok();
+    writeln!(out, "{INDENT}harc_rt::HarcWide<{words}> _packed{{}};").ok();
+    let mut offset = 0usize;
+    for f in r.fields.iter().rev() {
+        let w = field_packed_width(&f.ty).unwrap_or(0);
+        if let Some(n) = f.vec_len {
+            for i in 0..n {
+                writeln!(
+                    out,
+                    "{INDENT}harc_rt::harc_wide_write_bits(_packed, {off}, {w}, value.{fld}[{i}]);",
+                    off = offset + i * w,
+                    fld = f.name
+                )
+                .ok();
+            }
+            offset += w * n;
+        } else {
+            writeln!(
+                out,
+                "{INDENT}harc_rt::harc_wide_write_bits(_packed, {offset}, {w}, value.{fld});",
+                fld = f.name
+            )
+            .ok();
+            offset += w;
+        }
+    }
+    writeln!(out, "{INDENT}return _packed;").ok();
+    writeln!(out, "}}").ok();
+
+    // harc_unpack: struct-shaped pin fast-path, else bit layout.
+    writeln!(out, "template<typename Raw> static {name} harc_unpack_{name}(const Raw& raw) {{").ok();
+    let raw_checks: Vec<String> = r.fields.iter().map(|f| format!("raw.{}", f.name)).collect();
+    if !raw_checks.is_empty() {
+        writeln!(out, "{INDENT}if constexpr (requires {{ {}; }}) {{", raw_checks.join("; ")).ok();
+        writeln!(out, "{0}{0}{name} value{{}};", INDENT).ok();
+        for f in &r.fields {
+            if let Some(n) = f.vec_len {
+                for i in 0..n {
+                    writeln!(out, "{0}{0}value.{1}[{i}] = raw.{1}[{i}];", INDENT, f.name).ok();
+                }
+            } else {
+                writeln!(out, "{0}{0}value.{1} = raw.{1};", INDENT, f.name).ok();
+            }
+        }
+        writeln!(out, "{0}{0}return value;", INDENT).ok();
+        writeln!(out, "{INDENT}}} else {{").ok();
+    }
+    writeln!(
+        out,
+        "{INDENT}auto _packed = harc_rt::harc_wide_zext<{words}>(harc_rt::harc_read(raw));"
+    )
+    .ok();
+    writeln!(out, "{INDENT}{name} value{{}};").ok();
+    let mut offset = 0usize;
+    for f in r.fields.iter().rev() {
+        let w = field_packed_width(&f.ty).unwrap_or(0);
+        let cty = field_scalar_cty(&f.ty);
+        if let Some(n) = f.vec_len {
+            for i in 0..n {
+                let off = offset + i * w;
+                writeln!(
+                    out,
+                    "{INDENT}value.{fld}[{i}] = ({cty})harc_rt::harc_bits(_packed, {hi}, {off});",
+                    fld = f.name,
+                    hi = off + w - 1
+                )
+                .ok();
+            }
+            offset += w * n;
+        } else {
+            writeln!(
+                out,
+                "{INDENT}value.{fld} = ({cty})harc_rt::harc_bits(_packed, {hi}, {offset});",
+                fld = f.name,
+                hi = offset + w - 1
+            )
+            .ok();
+            offset += w;
+        }
+    }
+    writeln!(out, "{INDENT}return value;").ok();
+    if !raw_checks.is_empty() {
+        writeln!(out, "{INDENT}}}").ok();
+    }
+    writeln!(out, "}}").ok();
+
+    // harc_drive: struct-shaped sig fast-path, else pack-and-assign.
+    writeln!(
+        out,
+        "template<typename Sig> static void harc_drive_{name}(Sig& sig, const {name}& value) {{"
+    )
+    .ok();
+    if !raw_checks.is_empty() {
+        let sig_checks: Vec<String> =
+            raw_checks.iter().map(|s| s.replacen("raw.", "sig.", 1)).collect();
+        writeln!(out, "{INDENT}if constexpr (requires {{ {}; }}) {{", sig_checks.join("; ")).ok();
+        for f in &r.fields {
+            if let Some(n) = f.vec_len {
+                for i in 0..n {
+                    writeln!(out, "{0}{0}sig.{1}[{i}] = value.{1}[{i}];", INDENT, f.name).ok();
+                }
+            } else {
+                writeln!(out, "{0}{0}sig.{1} = value.{1};", INDENT, f.name).ok();
+            }
+        }
+        writeln!(out, "{INDENT}}} else {{").ok();
+        writeln!(out, "{0}{0}harc_rt::harc_assign(sig, harc_pack_{name}(value));", INDENT).ok();
+        writeln!(out, "{INDENT}}}").ok();
+    } else {
+        writeln!(out, "{INDENT}harc_rt::harc_assign(sig, harc_pack_{name}(value));").ok();
+    }
+    writeln!(out, "}}").ok();
     writeln!(out).ok();
 }
 

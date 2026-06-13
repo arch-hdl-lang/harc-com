@@ -92,12 +92,15 @@ impl Display for TbProgram {
         for (i, r) in self.records.iter().enumerate() {
             writeln!(f, "  record r{} {}", i, r.name)?;
             for fld in &r.fields {
+                let ty = match fld.vec_len {
+                    Some(n) => format!("Vec<{}, {n}>", type_str(&fld.ty)),
+                    None => type_str(&fld.ty),
+                };
                 write!(
                     f,
-                    "    {}{} : {}",
+                    "    {}{} : {ty}",
                     if fld.non_random { "!" } else { "" },
                     fld.name,
-                    type_str(&fld.ty)
                 )?;
                 if let Some(d) = fld.default {
                     if fld.ty == IrType::Bool {
@@ -392,11 +395,17 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         Stmt::DutRead(l, p) => format!("DutRead({}, {})", local_str(func, *l), port_str(p)),
         Stmt::ProbeRelease(p) => format!("ProbeRelease({})", port_str(p)),
         Stmt::RecordInit(l, r) => format!("RecordInit({}, r{})", local_str(func, *l), r.0),
-        Stmt::RecordFieldWrite { local, field, value } => format!(
-            "RecordFieldWrite({}.{field}, {})",
-            local_str(func, *local),
-            expr_str(func, value)
-        ),
+        Stmt::RecordFieldWrite { local, field, index, value } => {
+            let idx = match index {
+                Some(i) => format!("[{}]", expr_str(func, i)),
+                None => String::new(),
+            };
+            format!(
+                "RecordFieldWrite({}.{field}{idx}, {})",
+                local_str(func, *local),
+                expr_str(func, value)
+            )
+        }
         Stmt::TbFieldWrite { field, value } => {
             format!("TbFieldWrite(_tb.{field}, {})", expr_str(func, value))
         }
@@ -671,8 +680,12 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         }
         Expr::Local(l) => local_str(func, *l),
         Expr::Port(p) => port_str(p),
-        Expr::RecordField { local, field } => {
-            format!("{}.{field}", local_str(func, *local))
+        Expr::RecordField { local, field, index } => {
+            let idx = match index {
+                Some(i) => format!("[{}]", expr_str(func, i)),
+                None => String::new(),
+            };
+            format!("{}.{field}{idx}", local_str(func, *local))
         }
         Expr::RegRead { mirror, helper_ty, field, offset, reads_bus } => {
             if *reads_bus {

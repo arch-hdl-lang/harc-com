@@ -181,15 +181,28 @@ impl FuncBuilder<'_> {
                     if let Some(local) = self.lookup(&root.name) {
                         if let Some(rid) = self.record_of_local(local) {
                             let schema = &self.ctx.records[rid.index()];
-                            if schema.field(&name.name).is_none() {
+                            let Some(fld) = schema.field(&name.name) else {
                                 return Err(LowerError::Invalid(format!(
                                     "transaction `{}` has no field `{}`",
                                     schema.name, name.name
                                 )));
+                            };
+                            // A whole-`Vec` field read has no scalar
+                            // value; only element access (`rec.data[i]`,
+                            // handled in the `Index` arm) is lowered.
+                            if fld.vec_len.is_some() {
+                                return Err(unsupported(
+                                    &format!(
+                                        "a whole-`Vec` read of record field `{}.{}`",
+                                        schema.name, name.name
+                                    ),
+                                    "index the field element-wise (`{rec}.{field}[i]`)",
+                                ));
                             }
                             return Ok(Expr::RecordField {
                                 local,
                                 field: name.name.clone(),
+                                index: None,
                             });
                         }
                     }
@@ -345,14 +358,22 @@ impl FuncBuilder<'_> {
                     "",
                 ))
             }
-            ExprKind::Index { .. } => {
+            ExprKind::Index { target, index } => {
+                // `rec.data[i]` — element read of a `Vec<T, N>` record
+                // field. The target is a record-field access on a
+                // record-typed local; lower it to an indexed
+                // `Expr::RecordField`.
+                if let Some(rf) = self.lower_record_vec_index(target, index)? {
+                    return Ok(rf);
+                }
                 // Constant-lane DUT port access: `dut.<port>[<const>]`.
                 if let Some(port) = self.as_lane_port_ref(e)? {
                     return Ok(Expr::Port(port));
                 }
                 Err(unsupported(
                     "index expressions",
-                    "only `dut.<port>[<constant>]` lane accesses are lowered",
+                    "only `dut.<port>[<constant>]` lane accesses and \
+                     `<rec>.<vecfield>[i]` element reads are lowered",
                 ))
             }
             ExprKind::BitSlice { .. } => Err(unsupported("bit-slice expressions", "")),
@@ -382,6 +403,53 @@ impl FuncBuilder<'_> {
                 Err(unsupported("constraint `for` comprehensions", ""))
             }
         }
+    }
+
+    /// `rec.data[i]` — element read of a `Vec<T, N>` record field.
+    /// Returns `Some(Expr::RecordField { index })` when `target` is a
+    /// field access (`rec.data`) on a record-typed local whose field is
+    /// a `Vec`; `None` if `target` is not such an access (the caller
+    /// then tries the DUT-lane and rejection paths). A scalar field
+    /// indexed like an array is a hard error (a scalar has no elements).
+    pub(crate) fn lower_record_vec_index(
+        &mut self,
+        target: &AstExpr,
+        index: &AstExpr,
+    ) -> Result<Option<Expr>, LowerError> {
+        let ExprKind::Field { target: ft, name } = &*target.kind else {
+            return Ok(None);
+        };
+        let ExprKind::Ident(root) = &*ft.kind else {
+            return Ok(None);
+        };
+        let Some(local) = self.lookup(&root.name) else {
+            return Ok(None);
+        };
+        let Some(rid) = self.record_of_local(local) else {
+            return Ok(None);
+        };
+        let schema = &self.ctx.records[rid.index()];
+        let Some(fld) = schema.field(&name.name) else {
+            return Err(LowerError::Invalid(format!(
+                "transaction `{}` has no field `{}`",
+                schema.name, name.name
+            )));
+        };
+        if fld.vec_len.is_none() {
+            return Err(unsupported(
+                &format!(
+                    "indexing the scalar record field `{}.{}`",
+                    schema.name, name.name
+                ),
+                "only `Vec<T, N>` record fields are indexable",
+            ));
+        }
+        let idx = self.lower_expr(index)?;
+        Ok(Some(Expr::RecordField {
+            local,
+            field: name.name.clone(),
+            index: Some(Box::new(idx)),
+        }))
     }
 
     /// Lower and hoist every surviving `Expr::Port` into a `DutRead`
@@ -455,6 +523,13 @@ impl FuncBuilder<'_> {
                     index: Box::new(index),
                 }
             }
+            // An indexed `Vec`-field read carries the index sub-expr,
+            // which may hold a DUT port; hoist into it. A scalar
+            // RecordField (index `None`) is the no-op host-state value.
+            Expr::RecordField { local, field, index: Some(index) } => {
+                let index = self.hoist_ports(*index);
+                Expr::RecordField { local, field, index: Some(Box::new(index)) }
+            }
             other @ (Expr::Literal { .. }
             | Expr::WideLiteral(_)
             | Expr::Local(_)
@@ -462,7 +537,7 @@ impl FuncBuilder<'_> {
             // values, no DUT port.
             | Expr::CycleCount
             | Expr::ErrorCount
-            | Expr::RecordField { .. }
+            | Expr::RecordField { index: None, .. }
             | Expr::TbField(_)
             // Transactor-instance state is host state — no DUT port inside.
             | Expr::TransactorState { .. }
@@ -914,7 +989,7 @@ impl FuncBuilder<'_> {
 
     /// Constant-evaluate a lane index: integer literal, parenthesized
     /// literal, or a `const`/enum-variant name.
-    fn const_eval_index(&self, e: &AstExpr) -> Option<u64> {
+    pub(crate) fn const_eval_index(&self, e: &AstExpr) -> Option<u64> {
         match &*e.kind {
             ExprKind::Int(s) => parse_int_literal(s),
             ExprKind::Paren(inner) => self.const_eval_index(inner),

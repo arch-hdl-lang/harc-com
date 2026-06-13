@@ -536,9 +536,12 @@ impl Checker<'_> {
                         });
                     }
                 }
-                Stmt::RecordFieldWrite { local, field, value } => {
+                Stmt::RecordFieldWrite { local, field, index, value } => {
                     self.check_local(*local);
                     self.check_record_field(*local, field);
+                    if let Some(idx) = index {
+                        self.check_expr(idx, false, "RecordFieldWrite index");
+                    }
                     self.check_expr(value, false, "RecordFieldWrite value");
                 }
                 Stmt::TbFieldWrite { field, value } => {
@@ -910,9 +913,12 @@ impl Checker<'_> {
                 self.check_expr(e2, ports_ok, context);
             }
             Expr::WidthCast { inner, .. } => self.check_expr(inner, ports_ok, context),
-            Expr::RecordField { local, field } => {
+            Expr::RecordField { local, field, index } => {
                 self.check_local(*local);
                 self.check_record_field(*local, field);
+                if let Some(idx) = index {
+                    self.check_expr(idx, ports_ok, context);
+                }
             }
             // Register-level frontdoor read in expression position. The
             // mirror is a record local; the register name must be one of
@@ -1359,7 +1365,12 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
         | Expr::ComponentField { .. }
         | Expr::ScoreboardQuery { .. } => {}
         Expr::Local(l) => f(*l),
-        Expr::RecordField { local, .. } => f(*local),
+        Expr::RecordField { local, index, .. } => {
+            f(*local);
+            if let Some(idx) = index {
+                for_each_local(idx, f);
+            }
+        }
         // The mirror record local is both used (read) and written (the
         // inline assignment-expression predict), but it was defined at
         // its `let` RecordInit site upstream — record it as a use.

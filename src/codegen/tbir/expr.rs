@@ -137,14 +137,21 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         Expr::Port(p) => port_read(cx, p),
         // Record-field read on a record-typed local: `t.tag`. The
         // lowering validated the field against the schema.
-        Expr::RecordField { local, field } => {
+        Expr::RecordField { local, field, index } => {
             let name = cx.names.get(local.index()).cloned().ok_or_else(|| {
                 EmitError(format!(
                     "tbir: dangling local %{} in {}",
                     local.0, cx.func.name
                 ))
             })?;
-            format!("{name}.{field}")
+            match index {
+                // `rec.data[i]` — `std::array` element access.
+                Some(idx) => {
+                    let i = expr_cpp(cx, idx)?;
+                    format!("{name}.{field}[{i}]")
+                }
+                None => format!("{name}.{field}"),
+            }
         }
         // Register-level frontdoor read in a general expression position
         // (assert condition / format arg). v1's inline assignment-
