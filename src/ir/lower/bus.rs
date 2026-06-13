@@ -389,11 +389,31 @@ impl FuncBuilder<'_> {
         self.lower_budget_wait_low(bus_port(bind, &[&h.name.name, "valid"]));
         // Capture BEFORE the trailing tick — payload is valid in the
         // same cycle `valid` is high (mirrors v1).
-        let data_port = bus_port(bind, &[&h.name.name, &h.payload[0].name.name]);
+        //
+        // v1 captures the whole `<Bus>_<ch>_payload` struct, with the
+        // bare local convertible to the first field. The IR's scalar
+        // local model captures the FIRST payload signal into the bound
+        // local (so a bare scalar read `let v = bus.r.recv()` sees
+        // `data`), AND — to support v1's named field access
+        // `let r = bus.r.recv(); ... r.data` — captures every payload
+        // signal into a per-field local, recorded in `recv_payloads` so
+        // a later `r.<field>` read resolves to the matching local.
         match dest {
             BusCallDest::Declare(name) => {
                 let id = self.declare(name);
-                self.push(Stmt::DutRead(id, data_port));
+                let first_port =
+                    bus_port(bind, &[&h.name.name, &h.payload[0].name.name]);
+                self.push(Stmt::DutRead(id, first_port));
+                let mut fields = Vec::with_capacity(h.payload.len());
+                // The first field aliases the bound local itself.
+                fields.push((h.payload[0].name.name.clone(), id));
+                for sig in &h.payload[1..] {
+                    let fid = self.declare(&format!("{name}__{}", sig.name.name));
+                    let port = bus_port(bind, &[&h.name.name, &sig.name.name]);
+                    self.push(Stmt::DutRead(fid, port));
+                    fields.push((sig.name.name.clone(), fid));
+                }
+                self.recv_payloads.insert(id, fields);
             }
             BusCallDest::Discard => {}
         }

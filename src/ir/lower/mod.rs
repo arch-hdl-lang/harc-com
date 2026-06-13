@@ -883,6 +883,13 @@ fn lower_test(
     // passive = bind <busbinding>`), collected as (instance, transactor
     // id, bus-binding field). Validated after the bus bindings are known.
     let mut target_tlm_binds: Vec<(String, TransactorId, String)> = Vec::new();
+    // Bound-to initiator-side BFM instances (`let helper : H active =
+    // bind <busbinding>`), collected as (instance, transactor id, bus-
+    // binding field). The helper's `hookable` methods drive the bound
+    // bus's channels; it is registered as a transactor field so the
+    // regblock `via` frontdoor and bare `helper.method(...)` calls
+    // resolve. Validated after the bus bindings are known.
+    let mut initiator_bfm_binds: Vec<(String, TransactorId, String)> = Vec::new();
     // Test-scope `let`s (beyond `dut`/`_tb`/bus binds), hoisted to the
     // head of the run body in item order — v1 hoists them to `main`
     // scope before the coroutine, initialized once, and the coroutine
@@ -968,6 +975,73 @@ fn lower_test(
                     }
                 };
                 regblock_binds.push((l.name.name.clone(), rbid, helper_field));
+            }
+            // Bound-to initiator-side BFM: `let helper : AxilHelper
+            // active = bind <busbinding>`. The helper's `hookable`
+            // methods drive the bound bus's handshake channels; it is
+            // registered as an active transactor field so the regblock
+            // `via <helper>` frontdoor (#369) and bare
+            // `helper.method(...)` calls resolve through the same
+            // `CallTarget::TransactorMethod` dispatch. The bind RHS must
+            // be a bus binding declared earlier in the test, of the bus
+            // the transactor is `bound to` (validated after the binding
+            // walk). Distinguished from the target-responder form below
+            // by carrying `methods` (initiator) rather than
+            // `target_methods` (responder).
+            TestItem::Let(l)
+                if l.bind
+                    && type_simple_name(l.ty.as_ref()).is_some_and(|n| {
+                        prog.transactors.iter().any(|x| {
+                            x.name == n && x.bound_bus.is_some() && !x.methods.is_empty()
+                        })
+                    }) =>
+            {
+                if !l.probes.is_empty() {
+                    return Err(unsupported(
+                        "probe declarations on an initiator-BFM instance",
+                        "",
+                    ));
+                }
+                if !l.bind_remap.is_empty() {
+                    return Err(unsupported(
+                        "bind remaps on an initiator-BFM instance",
+                        "the default `<binding>_<ch>_<sig>` wire convention is lowered; \
+                         custom signal remaps are a follow-up slice",
+                    ));
+                }
+                let simple = type_simple_name(l.ty.as_ref()).unwrap();
+                // The BFM host must be `active` — its methods are
+                // test-called (via the regblock frontdoor or directly).
+                match l.ty.as_ref() {
+                    Some(TypeExpr::Named { mode: Some(TransactorMode::Active), .. }) => {}
+                    _ => {
+                        return Err(unsupported(
+                            &format!(
+                                "initiator-BFM instance `let {} : {simple}` must be declared \
+                                 `active`",
+                                l.name.name
+                            ),
+                            "its hookable methods are test-called, not request-served",
+                        ));
+                    }
+                }
+                // RHS must be a bare bus-binding identifier.
+                let bus_field = match l.value.as_ref().map(|v| &*v.kind) {
+                    Some(ExprKind::Ident(id)) => id.name.clone(),
+                    _ => {
+                        return Err(unsupported(
+                            &format!(
+                                "initiator-BFM instance `{}` bound to a non-identifier",
+                                l.name.name
+                            ),
+                            "only `= bind <bus-binding>` is lowered",
+                        ));
+                    }
+                };
+                let xid = ir::TransactorId(
+                    prog.transactors.iter().position(|x| x.name == simple).unwrap() as u32,
+                );
+                initiator_bfm_binds.push((l.name.name.clone(), xid, bus_field));
             }
             // Bound-to target-side TLM responder: `let target : MemTarget
             // passive = bind <busbinding>`. The instance is a passive
@@ -1302,7 +1376,7 @@ fn lower_test(
     // uniformly. They are accessed by their BARE name (test-scope lets
     // aren't `_tb`-prefixed by the desugaring), recorded separately so
     // resolution knows which access shape to expect.
-    let bare_transactor_fields: HashSet<String> =
+    let mut bare_transactor_fields: HashSet<String> =
         test_scope_xactors.iter().map(|(n, _)| n.clone()).collect();
     for (name, xid) in &test_scope_xactors {
         if transactor_fields.iter().any(|(f, _)| f == name) {
@@ -1313,6 +1387,65 @@ fn lower_test(
             )));
         }
         transactor_fields.push((name.clone(), *xid));
+    }
+    // Bound-to initiator-side BFM instances (`let helper : H active =
+    // bind axil`). Validate the bound bus binding matches the
+    // transactor's `bound to` bus, fill the placeholder bus prefix in
+    // the (TYPE-shared) method bodies with the real binding name, and
+    // register the helper as a bare-name active transactor field so the
+    // regblock `via` frontdoor and direct method calls resolve. The
+    // method bodies are shared per transactor TYPE, so the subset is one
+    // bound instance per type per file — a second bind to a different
+    // bus binding would clobber the first's filled prefix, so reject it.
+    for (instance, xid, bus_field) in &initiator_bfm_binds {
+        if transactor_fields.iter().any(|(f, _)| f == instance) {
+            return Err(LowerError::Invalid(format!(
+                "name `{instance}` is bound more than once in test `{}`",
+                t.name.name
+            )));
+        }
+        // The bound bus binding must be a `let <bus_field> : <Bus> =
+        // bind dut` declared in this test, of the bound bus.
+        let Some(binding) = bus_bindings.iter().find(|b| &b.field == bus_field) else {
+            return Err(LowerError::Invalid(format!(
+                "initiator-BFM `{instance}` is bound to `{bus_field}`, which is not a bus \
+                 binding in test `{}`",
+                t.name.name
+            )));
+        };
+        let xschema = &prog.transactors[xid.index()];
+        if xschema.bound_bus.as_deref() != Some(binding.bus.as_str()) {
+            return Err(LowerError::Invalid(format!(
+                "initiator-BFM `{instance} : {}` is bound to bus binding `{bus_field}` of bus \
+                 `{}`, but the transactor is `bound to {}`",
+                xschema.name,
+                binding.bus,
+                xschema.bound_bus.as_deref().unwrap_or("<none>"),
+            )));
+        }
+        // Fill the placeholder bus prefix in the method bodies with the
+        // real binding name. The bodies are shared per type; a second
+        // bind to a different binding name is rejected (one instance per
+        // type per file).
+        let method_fns: Vec<usize> =
+            xschema.methods.iter().map(|m| m.function.index()).collect();
+        let xname = xschema.name.clone();
+        for fidx in method_fns {
+            if let Err(prev) =
+                fill_initiator_bus_prefix(&mut prog.functions[fidx], bus_field)
+            {
+                return Err(unsupported(
+                    &format!(
+                        "initiator-BFM transactor `{xname}` bound to more than one bus \
+                         binding (`{prev}`, `{bus_field}`)"
+                    ),
+                    "the initiator-BFM subset shares one method body per transactor type; \
+                     multiple instances need per-instance bodies",
+                ));
+            }
+        }
+        transactor_fields.push((instance.clone(), *xid));
+        bare_transactor_fields.insert(instance.clone());
     }
     // Composite-component instances → schema bindings (with the env's
     // resolved `connect` edges). A name collision with another binding
@@ -1947,6 +2080,15 @@ pub(crate) struct FuncBuilder<'a> {
     /// becomes the terminator's `ConstraintRef`. `lower_program` drains
     /// it into `TbProgram::constraint_sites` after all functions lower.
     pub(crate) constraint_sites: &'a RefCell<Vec<ConstraintSite>>,
+    /// Payload-field bindings for `recv()`-captured locals: `let r =
+    /// bus.<ch>.recv()` records `r → [(field, captured-local)]` so a
+    /// later `r.<field>` read resolves to the per-field captured local
+    /// (v1 captures the whole payload struct; the IR captures each
+    /// payload signal into its own local). The bare local (`r`) still
+    /// holds the FIRST payload signal — preserving scalar `recv()`
+    /// reads (`let v = bus.r.recv(); assert v == ...`) — so this map is
+    /// consulted only for the dotted `r.<field>` form.
+    pub(crate) recv_payloads: HashMap<LocalId, Vec<(String, LocalId)>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2013,6 +2155,7 @@ impl<'a> FuncBuilder<'a> {
             let_widths: HashMap::new(),
             self_component: None,
             constraint_sites,
+            recv_payloads: HashMap::new(),
         }
     }
 }
@@ -2440,6 +2583,183 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
         }
         fill_term(&mut block.terminator, instance);
     }
+}
+
+/// Fill the placeholder bus-binding prefix
+/// (`transactors::INITIATOR_BUS_PLACEHOLDER`) in an initiator-side BFM
+/// method body with the real bus binding name (the arch-com §19.6 flat
+/// prefix). The body was lowered before the test's `let helper = bind
+/// <binding>` named the binding, so every `bus.<ch>.<sig>` access carries
+/// a `PortRef` whose first path segment is the placeholder.
+///
+/// Idempotent under the same binding (re-filling with the identical name
+/// is a no-op). The method bodies are shared per transactor TYPE, so a
+/// second bind to a DIFFERENT binding returns the previously filled name
+/// (`Err`) — the one-instance-per-type subset gate, mirroring
+/// `fill_transactor_state_instance`.
+fn fill_initiator_bus_prefix(func: &mut TbFunction, binding: &str) -> Result<(), String> {
+    use crate::ir::{Expr, PortRef, Stmt};
+    let placeholder = transactors::INITIATOR_BUS_PLACEHOLDER;
+
+    // Every PortRef carried by the body, whether at statement level
+    // (`DutWrite`/`DutRead`), inside an expression (`Expr::Port` — bus
+    // signal reads in wait predicates / assert conditions / format args
+    // / DutWrite values), or in a terminator (a `Branch`/`WaitUntil`
+    // condition reading a bus signal), prefixes its flat path with the
+    // placeholder. A faithful fill must reach all of them — partial
+    // coverage would leave a `bus_<ch>_<sig>` name with the wrong (still-
+    // placeholder) prefix in the emitted C++.
+    //
+    // `visit` runs over both a check pass (detect a prior fill to a
+    // DIFFERENT binding → the one-instance-per-type gate) and the rewrite
+    // pass. It returns the first conflicting prefix it finds.
+    fn visit_port(
+        p: &mut PortRef,
+        placeholder: &str,
+        binding: &str,
+        rewrite: bool,
+        conflict: &mut Option<String>,
+    ) {
+        match p.port_path.first() {
+            Some(seg) if seg == placeholder => {
+                if rewrite {
+                    p.port_path[0] = binding.to_string();
+                }
+            }
+            // A non-placeholder, non-`binding` prefix means a prior bind
+            // already rewrote this shared body to a different name.
+            Some(seg) if seg != binding && conflict.is_none() => {
+                *conflict = Some(seg.clone());
+            }
+            _ => {}
+        }
+    }
+    fn visit_expr(
+        e: &mut Expr,
+        placeholder: &str,
+        binding: &str,
+        rewrite: bool,
+        conflict: &mut Option<String>,
+    ) {
+        match e {
+            Expr::Port(p) => visit_port(p, placeholder, binding, rewrite, conflict),
+            Expr::Binary(_, a, b) => {
+                visit_expr(a, placeholder, binding, rewrite, conflict);
+                visit_expr(b, placeholder, binding, rewrite, conflict);
+            }
+            Expr::Unary(_, a)
+            | Expr::WidthCast { inner: a, .. }
+            | Expr::ComponentIdle { n: a, .. } => {
+                visit_expr(a, placeholder, binding, rewrite, conflict)
+            }
+            Expr::Ternary(c, t, f) => {
+                visit_expr(c, placeholder, binding, rewrite, conflict);
+                visit_expr(t, placeholder, binding, rewrite, conflict);
+                visit_expr(f, placeholder, binding, rewrite, conflict);
+            }
+            Expr::Call(_, args) => {
+                for a in args {
+                    visit_expr(a, placeholder, binding, rewrite, conflict);
+                }
+            }
+            Expr::Literal { .. }
+            | Expr::WideLiteral(_)
+            | Expr::Local(_)
+            | Expr::RecordField { .. }
+            | Expr::TbField(_)
+            | Expr::TransactorState { .. }
+            | Expr::ComponentField { .. }
+            | Expr::ScoreboardQuery { .. }
+            | Expr::CovBin { .. } => {}
+        }
+    }
+    let mut run = |rewrite: bool| -> Option<String> {
+        let mut conflict = None;
+        for block in &mut func.blocks {
+            for s in &mut block.stmts {
+                match s {
+                    Stmt::DutWrite(p, e) => {
+                        visit_port(p, placeholder, binding, rewrite, &mut conflict);
+                        visit_expr(e, placeholder, binding, rewrite, &mut conflict);
+                    }
+                    Stmt::DutRead(_, p) => {
+                        visit_port(p, placeholder, binding, rewrite, &mut conflict)
+                    }
+                    Stmt::Assign(_, e)
+                    | Stmt::RecordFieldWrite { value: e, .. }
+                    | Stmt::TbFieldWrite { value: e, .. }
+                    | Stmt::TransactorStateWrite { value: e, .. }
+                    | Stmt::ComponentFieldWrite { value: e, .. } => {
+                        visit_expr(e, placeholder, binding, rewrite, &mut conflict)
+                    }
+                    Stmt::AssertCheck { cond, on_fail } => {
+                        visit_expr(cond, placeholder, binding, rewrite, &mut conflict);
+                        for a in &mut on_fail.args {
+                            visit_expr(&mut a.expr, placeholder, binding, rewrite, &mut conflict);
+                        }
+                    }
+                    Stmt::Log { args, .. } | Stmt::FailDiag { args, .. } => {
+                        for a in &mut args.args {
+                            visit_expr(&mut a.expr, placeholder, binding, rewrite, &mut conflict);
+                        }
+                    }
+                    Stmt::TransactorCall { call, .. } => {
+                        visit_expr(call, placeholder, binding, rewrite, &mut conflict)
+                    }
+                    Stmt::ScoreboardOp { op, .. } => match op {
+                        ir::ScoreboardOp::QueuePush { value, .. }
+                        | ir::ScoreboardOp::ScalarWrite { value, .. } => {
+                            visit_expr(value, placeholder, binding, rewrite, &mut conflict)
+                        }
+                        ir::ScoreboardOp::QueuePop { .. } => {}
+                    },
+                    Stmt::ComponentEmit { args, .. } | Stmt::ComponentCall { args, .. } => {
+                        for a in args {
+                            visit_expr(a, placeholder, binding, rewrite, &mut conflict);
+                        }
+                    }
+                    Stmt::RecordInit(_, _) | Stmt::CovReport(_) => {}
+                }
+            }
+            match &mut block.terminator {
+                Terminator::Branch(c, _, _) => {
+                    visit_expr(c, placeholder, binding, rewrite, &mut conflict)
+                }
+                Terminator::WaitCycles(n, _, _) | Terminator::WaitCyclesSync(n, _) => {
+                    visit_expr(n, placeholder, binding, rewrite, &mut conflict)
+                }
+                Terminator::WaitUntil { preds, .. } => {
+                    for p in preds {
+                        visit_expr(&mut p.expr, placeholder, binding, rewrite, &mut conflict);
+                    }
+                }
+                Terminator::WaitUntilTimeout { preds, cycles, .. } => {
+                    for p in preds {
+                        visit_expr(&mut p.expr, placeholder, binding, rewrite, &mut conflict);
+                    }
+                    visit_expr(cycles, placeholder, binding, rewrite, &mut conflict);
+                }
+                Terminator::Fatal(args) => {
+                    for a in &mut args.args {
+                        visit_expr(&mut a.expr, placeholder, binding, rewrite, &mut conflict);
+                    }
+                }
+                Terminator::Randomize { .. }
+                | Terminator::Jump(_)
+                | Terminator::WaitTimePs(_, _)
+                | Terminator::Return => {}
+            }
+        }
+        conflict
+    };
+    // Check pass: a prior fill to a different binding is the multi-
+    // instance gate. (Idempotent re-fill with the same binding is fine.)
+    if let Some(prev) = run(false) {
+        return Err(prev);
+    }
+    // Rewrite pass.
+    run(true);
+    Ok(())
 }
 
 #[cfg(test)]
