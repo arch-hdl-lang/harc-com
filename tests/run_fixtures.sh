@@ -103,6 +103,7 @@ dma_engine_tlm_mem_model_test | DmaEngineTlmMem | dma_engine_tlm_mem.sv dma_engi
 pkt_queue_test          | PacketQueue    | pkt_queue.sv           |
 linklist_basic_test     | TaskQueue      | linklist_basic.sv      |
 cam_basic_test          | Mshr_Addr_Cam  | cam_basic.sv           |
+lz4_decomp_test         | Lz4Decomp      | lz4_decomp.sv          |
 cam_dual_basic_test     | Mshr_Addr_Cam_Dual | cam_dual_basic.sv  |
 cam_value_basic_test    | Tag_Value_Cam  | cam_value_basic.sv     |
 mshr_cocotb_test        | cache_mshr     | cache_mshr.sv          |

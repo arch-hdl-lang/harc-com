@@ -1,0 +1,219 @@
+// HARC testbench for lz4_decomp.arch — LZ4 block decompressor.
+//
+// DUT: Lz4Decomp (examples/lz4_decomp.arch compiled to lz4_decomp.sv)
+// Constraints: lit_len nibble < 15, mat_len nibble < 15, match offset ≤ 15.
+//
+// Two test cases:
+//
+//   Test 1 — "hello, hello!" (literal + match + literal):
+//     Compressed (12 bytes):
+//       0x71               token: lit_len=7, mat_nibble=1 (match_len=5)
+//       "hello, "          7 literal bytes
+//       0x07 0x00          match offset=7 (LE)
+//       0x10               token: lit_len=1, mat_nibble=0 (last sequence)
+//       '!'                1 literal byte
+//     Expected output (13 bytes): "hello, hello!"
+//
+//   Test 2 — "aaaaa" (literal + overlapping match):
+//     Compressed (5 bytes):
+//       0x10               token: lit_len=1, mat_nibble=0 (match_len=4)
+//       'a'                1 literal byte
+//       0x01 0x00          match offset=1 (LE) — copy from 1 back (overlapping)
+//       0x00               token: lit_len=0, mat_nibble=0; zero-literal last seq
+//     Expected output (5 bytes): "aaaaa"
+//
+// Note on zero-literal sequence (Test 2 last token):
+//   token=0x00 has lit_len=0 and no match (last sequence flag).
+//   We set in_last on this token byte so the decompressor terminates.
+//
+// Design note: the DUT's valid/ready output handshake requires out_ready=1
+// to advance its state machine. Sending all compressed bytes before reading
+// any output would deadlock (DUT waits for out_ready while TB waits for
+// in_ready). Instead we use an active transactor that fires a post_eval
+// handler at every posedge, drives out_ready=1 whenever out_valid is high,
+// and captures each output byte into a scoreboard. The run block feeds input
+// bytes freely, then checks the scoreboard after done asserts.
+//
+// Why post_eval (not a level-triggered checker)?
+//   A `level` checker fires once per `tick()` call AND once more at the main
+//   loop boundary after sched.tick() returns — causing double-counting when
+//   the last send_byte leaves the DUT in an output state at the co_await
+//   boundary. A `post_eval` service fires exactly once per posedge inside
+//   eval_clocks_until and is never re-fired at the main-loop checker step,
+//   so there is no double-counting.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+scoreboard Lz4Sb
+    bytes : queue<uint<8>>
+end scoreboard Lz4Sb
+
+// Active monitor: fires a post_eval service at every posedge.
+// When out_valid is high, drives out_ready=1 and captures the output byte.
+// Using `on 1 cycles phase post_eval` inside `when active` makes HARC emit
+// this as a _post_eval_service.  Post-eval services fire exactly once per
+// posedge inside eval_clocks_until, never at the main-loop checker step —
+// so there is no double-counting when the last send_byte leaves the DUT in
+// an output state at the co_await boundary.
+transactor OutXactor
+    dut    : Lz4Decomp
+    sb_ref : Lz4Sb
+
+    when active
+        on 1 cycles phase post_eval
+            if dut.out_valid != 0
+                dut.out_ready = 1
+                sb_ref.bytes.push(dut.out_data)
+            end if
+        end on
+    end when
+end transactor OutXactor
+
+testbench Lz4DecompTb
+    dut : Lz4Decomp
+    mon : OutXactor active
+end testbench Lz4DecompTb
+
+// Helper: send one compressed byte into the DUT.
+// Waits until in_ready is high (at most 200 cycles) then releases.
+// out_ready is managed by the OutXactor post_eval handler.
+function send_byte(dut: Lz4Decomp, byte_val: uint<8>, is_last: uint<1>)
+    dut.in_data  = byte_val
+    dut.in_valid = 1
+    dut.in_last  = is_last
+    let _w = 0
+    while !dut.in_ready && _w < 200
+        wait 1 cycle
+        _w = _w + 1
+    end while
+    assert dut.in_ready
+        else fail("send_byte: in_ready never asserted (byte=0x${byte_val:02x})")
+    wait 1 cycle
+    dut.in_valid = 0
+    dut.in_last  = 0
+end function send_byte
+
+impl Lz4DecompTest for Lz4DecompTb
+    clock clk = SysDomain      // 100 MHz
+
+    run
+        // Bind the transactor's DUT field to the testbench's DUT.
+        mon.dut = dut
+
+        // ── Test 1: "hello, hello!" ──────────────────────────────────────────
+        log(info, "=== Test 1: 'hello, hello!' ===")
+
+        // Reset
+        dut.rst      = 1
+        dut.in_valid = 0
+        dut.in_data  = 0
+        dut.in_last  = 0
+        dut.out_ready = 1    // always ready — transactor drives/captures output
+        wait 3 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Feed compressed stream (12 bytes).
+        // Sequence 1: token 0x71, literals "hello, ", offset 7, (mat_len=5)
+        send_byte(dut, 0x71, 0)          // token: lit=7 mat=1
+        send_byte(dut, 0x68, 0)          // 'h'
+        send_byte(dut, 0x65, 0)          // 'e'
+        send_byte(dut, 0x6c, 0)          // 'l'
+        send_byte(dut, 0x6c, 0)          // 'l'
+        send_byte(dut, 0x6f, 0)          // 'o'
+        send_byte(dut, 0x2c, 0)          // ','
+        send_byte(dut, 0x20, 0)          // ' '
+        send_byte(dut, 0x07, 0)          // offset lo = 7
+        send_byte(dut, 0x00, 0)          // offset hi = 0
+        // Sequence 2 (last): token 0x10, literal '!'
+        send_byte(dut, 0x10, 0)          // token: lit=1 mat=0
+        send_byte(dut, 0x21, 1)          // '!' with in_last=1
+
+        // Wait for done (decompressor signals end-of-block).
+        let _wd = 0
+        while !dut.done && _wd < 200
+            wait 1 cycle
+            _wd = _wd + 1
+        end while
+        assert dut.done else fail("T1: done never asserted")
+
+        // Check all 13 output bytes captured by the transactor.
+        assert mon.sb_ref.bytes.size() == 13
+            else fail("T1: expected 13 output bytes, got ${mon.sb_ref.bytes.size()}")
+        let c0  = mon.sb_ref.bytes.pop()
+        assert c0  == 0x68 else fail("T1[0]  got=0x${c0:02x}  want=0x68 ('h')")
+        let c1  = mon.sb_ref.bytes.pop()
+        assert c1  == 0x65 else fail("T1[1]  got=0x${c1:02x}  want=0x65 ('e')")
+        let c2  = mon.sb_ref.bytes.pop()
+        assert c2  == 0x6c else fail("T1[2]  got=0x${c2:02x}  want=0x6c ('l')")
+        let c3  = mon.sb_ref.bytes.pop()
+        assert c3  == 0x6c else fail("T1[3]  got=0x${c3:02x}  want=0x6c ('l')")
+        let c4  = mon.sb_ref.bytes.pop()
+        assert c4  == 0x6f else fail("T1[4]  got=0x${c4:02x}  want=0x6f ('o')")
+        let c5  = mon.sb_ref.bytes.pop()
+        assert c5  == 0x2c else fail("T1[5]  got=0x${c5:02x}  want=0x2c (',')")
+        let c6  = mon.sb_ref.bytes.pop()
+        assert c6  == 0x20 else fail("T1[6]  got=0x${c6:02x}  want=0x20 (' ')")
+        let c7  = mon.sb_ref.bytes.pop()
+        assert c7  == 0x68 else fail("T1[7]  got=0x${c7:02x}  want=0x68 ('h')")
+        let c8  = mon.sb_ref.bytes.pop()
+        assert c8  == 0x65 else fail("T1[8]  got=0x${c8:02x}  want=0x65 ('e')")
+        let c9  = mon.sb_ref.bytes.pop()
+        assert c9  == 0x6c else fail("T1[9]  got=0x${c9:02x}  want=0x6c ('l')")
+        let c10 = mon.sb_ref.bytes.pop()
+        assert c10 == 0x6c else fail("T1[10] got=0x${c10:02x} want=0x6c ('l')")
+        let c11 = mon.sb_ref.bytes.pop()
+        assert c11 == 0x6f else fail("T1[11] got=0x${c11:02x} want=0x6f ('o')")
+        let c12 = mon.sb_ref.bytes.pop()
+        assert c12 == 0x21 else fail("T1[12] got=0x${c12:02x} want=0x21 ('!')")
+        log(info, "PASS test 1: 'hello, hello!' (13 bytes)")
+
+        // ── Test 2: "aaaaa" with overlapping match (offset=1) ────────────────
+        log(info, "=== Test 2: 'aaaaa' (overlapping match, offset=1) ===")
+
+        // Reset the DUT for a fresh block.
+        dut.rst      = 1
+        dut.in_valid = 0
+        dut.in_last  = 0
+        wait 3 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Sequence 1: token=0x10 (lit=1, mat_nibble=0 → match_len=4)
+        //   literal 'a', match offset=1 (copy 'a' 4 more times)
+        send_byte(dut, 0x10, 0)    // token: lit=1, mat=0
+        send_byte(dut, 0x61, 0)    // 'a' literal
+        send_byte(dut, 0x01, 0)    // match offset lo = 1
+        send_byte(dut, 0x00, 0)    // match offset hi = 0
+        // Sequence 2: token=0x00 (lit=0, mat=0 — no literals, last sequence)
+        // in_last = 1 on this last token byte terminates the block.
+        send_byte(dut, 0x00, 1)    // token: lit=0, last=1
+
+        // Wait for done.
+        let _wd2 = 0
+        while !dut.done && _wd2 < 200
+            wait 1 cycle
+            _wd2 = _wd2 + 1
+        end while
+        assert dut.done else fail("T2: done never asserted")
+
+        // Check all 5 output bytes captured by the transactor.
+        assert mon.sb_ref.bytes.size() == 5
+            else fail("T2: expected 5 output bytes, got ${mon.sb_ref.bytes.size()}")
+        let a0 = mon.sb_ref.bytes.pop()
+        assert a0 == 0x61 else fail("T2[0] got=0x${a0:02x} want=0x61 ('a')")
+        let a1 = mon.sb_ref.bytes.pop()
+        assert a1 == 0x61 else fail("T2[1] got=0x${a1:02x} want=0x61 ('a')")
+        let a2 = mon.sb_ref.bytes.pop()
+        assert a2 == 0x61 else fail("T2[2] got=0x${a2:02x} want=0x61 ('a')")
+        let a3 = mon.sb_ref.bytes.pop()
+        assert a3 == 0x61 else fail("T2[3] got=0x${a3:02x} want=0x61 ('a')")
+        let a4 = mon.sb_ref.bytes.pop()
+        assert a4 == 0x61 else fail("T2[4] got=0x${a4:02x} want=0x61 ('a')")
+        log(info, "PASS test 2: 'aaaaa' (5 bytes, overlapping match)")
+
+        log(info, "ALL TESTS PASSED")
+    end run
+end impl Lz4DecompTest
