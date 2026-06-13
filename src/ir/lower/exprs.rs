@@ -533,6 +533,21 @@ impl FuncBuilder<'_> {
                         if self.ctx.scoreboard_fields.contains_key(segments.last().unwrap()) {
                             return Ok(None);
                         }
+                        // Composite-component field paths (`_tb.prod`,
+                        // `_tb.prod.seen`, `_tb.top.prod`) are host
+                        // instances, not ports — `lower_expr` /
+                        // `lower_assign` resolve them via the component
+                        // field/method/idle/emit forms. `segments` is in
+                        // reverse path order (innermost first), so the
+                        // segment right after `_tb` — the component
+                        // instance name — is `segments.last()`.
+                        if self
+                            .ctx
+                            .component_fields
+                            .contains_key(segments.last().unwrap())
+                        {
+                            return Ok(None);
+                        }
                         if segments.len() == 1
                             && self.ctx.tb_scalar_fields.contains(&segments[0])
                         {

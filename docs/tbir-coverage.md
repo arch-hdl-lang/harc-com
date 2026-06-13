@@ -18,8 +18,12 @@ is registered. Amended again 2026-06-13 by the **agent/on-handler
 slice** — see the `agent` + `on <ev>` handlers section below: `agent`
 composition, `on <ev>(arg)` self-subscriptions, test-scope path-emit,
 and `idle*` heartbeat predicates landed; `agent_on_handler_test` is
+registered. Amended again 2026-06-13 by the **testbench-field-binding
+slice** — see the heartbeat/quiesce cluster section below: a
+composite component bound as a `testbench` FIELD (`prod : Producer`)
+now lowers identically to a test-scope `let`; `tb_field_agent_test` is
 registered, and the 5 heartbeat/quiesce fixtures now reject one level
-deeper (composite-component testbench-field binding).
+deeper still (`event<transaction>` payloads / `watchdog`).
 
 **This file is a snapshot, not a source of truth.** The registry
 (`tests/tbir_equiv_fixtures.txt`) is the source of truth for what is
@@ -337,21 +341,30 @@ predicates lower as `Expr::ComponentIdle`. **Registered**:
 path-emit + `idle_in`) authored for this slice, lowering cleanly, passing
 the v1-vs-tbir pair, trace-diff clean at seed 1.
 
-The 5 heartbeat/quiesce fixtures the env-composition slice flagged as
-"need the agent slice" no longer reject on `agent` — they now reject one
-level deeper. Residual first-blocker map (re-run of `harc dump-ir`,
-2026-06-13):
+The composite-component **testbench-field binding** the agent slice
+flagged as the 5 fixtures' first blocker landed 2026-06-13 (a component
+bound as `prod : Producer` inside a `testbench` block now lowers
+identically to a test-scope `let`; the impl-for desugaring's `_tb.`
+prefix is stripped in every component-access path). **Registered**:
+`tb_field_agent_test` — a self-proving fixture (the `agent_on_handler_test`
+agent bound as a testbench field), lowering cleanly, passing the v1-vs-tbir
+pair, trace-diff clean at seed 1.
+
+None of the 5 heartbeat/quiesce fixtures fully unlock with the binding
+alone — each stacks a deeper construct past it. Residual first-blocker
+map (re-run of `harc dump-ir`, 2026-06-13, after the binding landed):
 
 | Next blocker | Fixtures |
 |---|---|
-| composite-component **testbench field** binding (`prod : Producer` / `agent : SilentAgent` / `top : HeartbeatEnv` inside a `testbench` block — a separate binding slice; agents/envs bind test-scope `let` today) | `heartbeat_idle_test`, `wait_until_quiesce_test`, `watchdog_quiesce_test`, `watchdog_trip_diagnostic_test`, `env_quiesced_phase_test` |
+| `event<transaction>` payload (`event<TinyTxn>` — the IR event model carries one ≤64-bit scalar; struct payloads now reject precisely at component-schema lowering instead of mis-lowering to a scalar callback) | `heartbeat_idle_test`, `wait_until_quiesce_test`, `watchdog_quiesce_test`, `env_quiesced_phase_test` |
+| `watchdog` (`period`/`max_idle` + the watchdog idle-trip assertion) | `watchdog_trip_diagnostic_test` (`event<int>` is scalar, so its first blocker is the watchdog) |
 
-Once the testbench-field binding lands, these stack further constructs
-this slice does not implement: `event<TinyTxn>` (transaction/struct event
-payloads, not just scalars), `quiesced(N)` (env heartbeat aggregation
-over sub-components), `watchdog` + `on <N> cycles` periodic triggers,
-named `phase`, and `wait until <preds> timeout fail` with heartbeat
-predicates. Those are the next layered slices.
+Behind those first blockers each fixture stacks still more constructs
+this slice does not implement: `quiesced(N)` (env heartbeat aggregation
+over sub-components), `on <N> cycles` periodic triggers, named `phase`,
+`wait until <preds> timeout fail` with heartbeat predicates, and a
+`queue` SUB-component inside an env (`env_quiesced_phase_test`'s `DrainSb`
+holds `expected : queue<uint<8>>`). Those are the next layered slices.
 
 ### `scoreboard` construct — **PARTIALLY RESOLVED 2026-06-12 (scoreboard slice)**
 

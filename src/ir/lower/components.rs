@@ -306,7 +306,24 @@ fn lower_field(
                         ));
                     }
                 },
-                _ => false,
+                // `event<TinyTxn>` parses the payload as `TypeArg::Expr`
+                // (a bare identifier — every scalar payload `uint<W>` /
+                // `bool` parses as `TypeArg::Type`). A user-named type is
+                // a transaction/struct payload: v1 emits a typed callback
+                // (`std::function<void(TinyTxn)>`), but the IR's event
+                // model carries a single ≤64-bit scalar, so an `emit
+                // <ev>(struct)` would mis-lower to a scalar callback and
+                // fail at C++ compile. Reject precisely — transaction-
+                // payload events gate on the event-struct-payload slice.
+                Some(TypeArg::Expr(_)) | Some(TypeArg::Named { .. }) => {
+                    return Err(unsupported(
+                        &format!("a non-scalar (transaction/struct) event payload on \
+                                  `{comp}.{fname}`"),
+                        "only event<scalar ≤ 64 bits> payloads are lowered; \
+                         transaction-payload events gate on a later slice",
+                    ));
+                }
+                None => false,
             };
             Ok(ComponentFieldKind::Event { signed })
         }
@@ -738,6 +755,32 @@ use crate::ast::{CallArg, Expr as AstExpr};
 use crate::ir::{ComponentBase, Expr as IrExpr, Stmt as IrStmt};
 
 impl super::FuncBuilder<'_> {
+    /// Normalize a component-access dotted path to the form the component
+    /// machinery resolves: rooted at the BARE component-field name.
+    ///
+    /// Two binding shapes reach component access, and the impl-for
+    /// desugaring rewrites them differently:
+    ///   * test-scope `let env : <Env>` — left as the bare name `env`,
+    ///     so `env.source.publish` arrives unchanged.
+    ///   * `testbench` FIELD `prod : Producer` — the desugaring prepends
+    ///     the `_tb` prefix, so `prod.in_ev` arrives as `_tb.prod.in_ev`.
+    /// Both must resolve to the same `component_fields` entry (keyed by
+    /// the bare field name) and to a `ComponentBase::Path` rooted at the
+    /// bare name — tbir emits every component as a run-scope instance
+    /// regardless of its binding shape. Strip a leading `_tb` segment
+    /// (only when it matches `ctx.tb_field` AND a real component field
+    /// follows) so a user component literally named `_tb` is untouched.
+    fn strip_tb_prefix<'p>(&self, path: &'p [String]) -> &'p [String] {
+        if path.len() >= 2
+            && Some(path[0].as_str()) == self.ctx.tb_field.as_deref()
+            && self.ctx.component_fields.contains_key(&path[1])
+        {
+            &path[1..]
+        } else {
+            path
+        }
+    }
+
     /// Resolve a component-method call callee: `env.source.publish` (a
     /// dotted path rooted at a test-scope component local) or a bare
     /// `publish` self-call inside a method body. Returns
@@ -751,6 +794,7 @@ impl super::FuncBuilder<'_> {
     ) -> Result<Option<(ComponentBase, ComponentId, String)>, LowerError> {
         // Path form: `<path...>.<method>`.
         if let Some(path) = dotted_path(callee) {
+            let path = self.strip_tb_prefix(&path);
             if path.len() >= 2 {
                 if let Some(&head_cid) = self.ctx.component_fields.get(&path[0]) {
                     let (recv, method) = path.split_at(path.len() - 1);
@@ -808,6 +852,7 @@ impl super::FuncBuilder<'_> {
         }
         // Dotted path `env.sb.errors`.
         if let Some(path) = dotted_path(target) {
+            let path = self.strip_tb_prefix(&path);
             if path.len() >= 2 {
                 if let Some(&head_cid) = self.ctx.component_fields.get(&path[0]) {
                     let (recv, field) = path.split_at(path.len() - 1);
@@ -857,6 +902,7 @@ impl super::FuncBuilder<'_> {
             }
         }
         if let Some(path) = dotted_path(e) {
+            let path = self.strip_tb_prefix(&path);
             if path.len() >= 2 {
                 if let Some(&head_cid) = self.ctx.component_fields.get(&path[0]) {
                     let (recv, field) = path.split_at(path.len() - 1);
@@ -929,15 +975,17 @@ impl super::FuncBuilder<'_> {
         name: &crate::ast::Path,
         args: &[CallArg],
     ) -> Result<(), LowerError> {
-        // Path form: `emit <comp-local>.<subs...>.<event>(args)`.
-        if name.segments.len() >= 2 {
-            let head = name.segments[0].name.clone();
+        // Path form: `emit <comp-local>.<subs...>.<event>(args)`. The
+        // impl-for desugaring prefixes a testbench-field component with
+        // `_tb` (`emit _tb.prod.in_ev(..)`); strip it so both binding
+        // shapes resolve through `component_fields` by the bare name.
+        let segs: Vec<String> = name.segments.iter().map(|s| s.name.clone()).collect();
+        let segs = self.strip_tb_prefix(&segs);
+        if segs.len() >= 2 {
+            let head = segs[0].clone();
             if let Some(&head_cid) = self.ctx.component_fields.get(&head) {
-                let recv: Vec<String> = name.segments[..name.segments.len() - 1]
-                    .iter()
-                    .map(|s| s.name.clone())
-                    .collect();
-                let event = name.segments.last().unwrap().name.clone();
+                let recv: Vec<String> = segs[..segs.len() - 1].to_vec();
+                let event = segs.last().unwrap().clone();
                 let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
                 let comp = &self.ctx.components[cid.index()];
                 match comp.field(&event).map(|f| &f.kind) {
@@ -1015,11 +1063,14 @@ impl super::FuncBuilder<'_> {
             "idle_out" => crate::ir::IdleKind::Out,
             _ => return Ok(None),
         };
-        // The receiver must be a path rooted at a test-scope component
-        // local (e.g. `env.agent` or a bare `agent`).
-        let Some(path) = dotted_path(target) else {
+        // The receiver must be a path rooted at a component local — a
+        // bare `agent` / `env.agent` (test-scope let) or a `_tb`-prefixed
+        // `_tb.prod` (testbench field, after impl-for desugaring). Strip
+        // the `_tb` prefix so both resolve through `component_fields`.
+        let Some(raw) = dotted_path(target) else {
             return Ok(None);
         };
+        let path = self.strip_tb_prefix(&raw).to_vec();
         let Some(&head_cid) = path.first().and_then(|h| self.ctx.component_fields.get(h)) else {
             return Ok(None);
         };
