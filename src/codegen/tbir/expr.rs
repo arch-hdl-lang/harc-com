@@ -99,6 +99,23 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // Scalar testbench field read — a `_tb` struct member (scalar
         // fields exist only on non-synthetic testbenches).
         Expr::TbField(field) => format!("_tb.{field}"),
+        // Scoreboard read on a `_tb` struct member (scoreboard fields
+        // exist only on non-synthetic testbenches). Mirrors v1's direct
+        // struct/queue access.
+        Expr::ScoreboardQuery { field, query, .. } => {
+            use crate::ir::ScoreboardQuery;
+            match query {
+                ScoreboardQuery::Scalar { scalar } => format!("_tb.{field}.{scalar}"),
+                // size() returns size_t — cast to the IR's uint64 model
+                // so it composes uniformly in arithmetic/comparisons.
+                ScoreboardQuery::QueueSize { queue } => {
+                    format!("((uint64_t)_tb.{field}.{queue}.size())")
+                }
+                ScoreboardQuery::QueueEmpty { queue } => {
+                    format!("_tb.{field}.{queue}.empty()")
+                }
+            }
+        }
         Expr::Binary(op, a, b) => {
             // Wide-literal == / != routing: when either operand is a
             // > 128-bit literal, compare word-by-word through

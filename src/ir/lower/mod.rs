@@ -17,6 +17,7 @@ mod covergroups;
 mod exprs;
 mod helpers;
 mod records;
+mod scoreboards;
 mod stmts;
 mod transactors;
 
@@ -27,8 +28,9 @@ use crate::ast::{
 };
 use crate::ir::{
     self, BasicBlock, BlockId, ClockSpec, CovgroupId, CovgroupSchema, FunctionId, FunctionKind,
-    IrType, LocalId, RecordId, RecordSchema, TbFunction, TbProgram, TestSchema, TestbenchId,
-    TestbenchSchema, Terminator, TransactorId, TransactorSchema, TypedLocal, TypedParam,
+    IrType, LocalId, RecordId, RecordSchema, ScoreboardId, ScoreboardSchema, TbFunction, TbProgram,
+    TestSchema, TestbenchId, TestbenchSchema, Terminator, TransactorId, TransactorSchema,
+    TypedLocal, TypedParam,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -108,7 +110,10 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // Testbench components referenced by impl-form tests.
     let mut components: HashMap<String, &ComponentDecl> = HashMap::new();
     for it in &file.items {
-        if let Item::Env(c) | Item::Agent(c) | Item::Sequencer(c) | Item::Scoreboard(c) = it {
+        // Scoreboards are NOT in this map — they lower to their own
+        // schema table (`scoreboard_ids`) and bind as testbench fields,
+        // not as `impl ... for`-bound composite components.
+        if let Item::Env(c) | Item::Agent(c) | Item::Sequencer(c) = it {
             components.insert(c.name.name.clone(), c);
         }
     }
@@ -222,6 +227,28 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         }
     }
 
+    // Scoreboard schemas (`scoreboard` declarations), in file order. All
+    // declarations lower (even unreferenced ones — v1 emits a struct for
+    // each), so unsupported scoreboard shapes are rejected here rather
+    // than dropped. The ids feed the testbench-field validation below.
+    let mut scoreboard_ids: HashMap<String, ScoreboardId> = HashMap::new();
+    let mut scoreboard_schemas: Vec<ScoreboardSchema> = Vec::new();
+    for it in &file.items {
+        if let Item::Scoreboard(c) = it {
+            let schema = scoreboards::lower_scoreboard(c)?;
+            if scoreboard_ids
+                .insert(c.name.name.clone(), ScoreboardId(scoreboard_schemas.len() as u32))
+                .is_some()
+            {
+                return Err(LowerError::Invalid(format!(
+                    "duplicate scoreboard declaration `{}`",
+                    c.name.name
+                )));
+            }
+            scoreboard_schemas.push(schema);
+        }
+    }
+
     // File-level construct gate: anything outside the MVP subset is an
     // explicit Unsupported, never silently dropped.
     for it in &file.items {
@@ -235,7 +262,11 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             | Item::Const(_)
             | Item::Enum(_)
             | Item::Bus(_)
-            | Item::Transactor(_) => {}
+            | Item::Transactor(_)
+            // Scoreboard declarations already lowered to schemas above
+            // (with their own Unsupported rejections); they are inert
+            // until a testbench binds one as a field.
+            | Item::Scoreboard(_) => {}
             // `extend` was already folded by merge_for_sim; a survivor
             // means the merge didn't apply (e.g. dump-ir on a lone
             // extension file).
@@ -253,6 +284,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                         &covgroup_ids,
                         &record_ids,
                         &transactor_ids,
+                        &scoreboard_ids,
                     )?;
                 } else {
                     return Err(unsupported(
@@ -273,6 +305,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     let mut prog = TbProgram {
         covgroups,
         records: record_schemas,
+        scoreboards: scoreboard_schemas,
         ..TbProgram::default()
     };
 
@@ -296,6 +329,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         bus_bindings: HashMap::new(),
         transactor_fields: HashMap::new(),
         transactors: Vec::new(),
+        scoreboard_fields: HashMap::new(),
+        scoreboards: Vec::new(),
         consts: consts.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_methods: HashMap::new(),
@@ -370,6 +405,7 @@ fn validate_testbench_component(
     covgroup_ids: &HashMap<String, CovgroupId>,
     record_ids: &HashMap<String, RecordId>,
     transactor_ids: &HashMap<String, TransactorId>,
+    scoreboard_ids: &HashMap<String, ScoreboardId>,
 ) -> Result<(), LowerError> {
     for ci in &c.items {
         match ci {
@@ -377,6 +413,13 @@ fn validate_testbench_component(
                 if let TypeExpr::Named { name, mode, .. } = &f.ty {
                     let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
                     if covgroup_ids.contains_key(simple) {
+                        continue;
+                    }
+                    if scoreboard_ids.contains_key(simple) {
+                        // A scoreboard testbench field — data-only host
+                        // state. Always accepted (no mode); the schema's
+                        // own lowering already rejected unsupported field
+                        // shapes.
                         continue;
                     }
                     if transactor_ids.contains_key(simple) {
@@ -654,6 +697,7 @@ fn lower_test(
     // collected in the same walk.
     let mut cov_fields: Vec<(String, CovgroupId)> = Vec::new();
     let mut transactor_fields: Vec<(String, TransactorId)> = Vec::new();
+    let mut scoreboard_fields: Vec<(String, ScoreboardId)> = Vec::new();
     let mut scalar_fields: Vec<ir::TbScalarFieldSchema> = Vec::new();
     let mut tb_methods: HashMap<String, HookableMethod> = HashMap::new();
     if let Some(tbn) = &tb_name {
@@ -666,6 +710,12 @@ fn lower_test(
                                 name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
                             if let Some(id) = covgroup_ids.get(simple) {
                                 cov_fields.push((f.name.name.clone(), *id));
+                            }
+                            if let Some(idx) =
+                                prog.scoreboards.iter().position(|s| s.name == simple)
+                            {
+                                scoreboard_fields
+                                    .push((f.name.name.clone(), ScoreboardId(idx as u32)));
                             }
                             if let Some(idx) =
                                 prog.transactors.iter().position(|t| t.name == simple)
@@ -754,6 +804,7 @@ fn lower_test(
         scalar_fields: scalar_fields.clone(),
         bus_bindings: bus_bindings.clone(),
         transactor_fields: transactor_fields.clone(),
+        scoreboard_fields: scoreboard_fields.clone(),
         synthetic,
     });
 
@@ -809,6 +860,8 @@ fn lower_test(
         bus_bindings: bus_binding_decls,
         transactor_fields: transactor_fields.iter().cloned().collect(),
         transactors: prog.transactors.clone(),
+        scoreboard_fields: scoreboard_fields.iter().cloned().collect(),
+        scoreboards: prog.scoreboards.clone(),
         consts: consts.clone(),
         tb_scalar_fields: scalar_fields.iter().map(|f| f.name.clone()).collect(),
         tb_methods,
@@ -1019,6 +1072,14 @@ pub(crate) struct LowerCtx {
     /// Snapshot of the program's transactor schemas, for method
     /// validation at call sites.
     pub transactors: Vec<TransactorSchema>,
+    /// Scoreboard-typed testbench fields (`sb` → scoreboard id), for
+    /// `sb.<field>` / `sb.<queue>.push(...)` resolution. Empty for
+    /// synthetic testbenches (no `_tb` to hold the instance), helper
+    /// contexts, and transactor method bodies.
+    pub scoreboard_fields: HashMap<String, ScoreboardId>,
+    /// Snapshot of the program's scoreboard schemas, for field
+    /// validation at op/query sites.
+    pub scoreboards: Vec<ScoreboardSchema>,
     /// File-scope named integer constants: `const` declarations plus
     /// enum variant names (variant index, first definition wins —
     /// v1's `enum_variants` rule). Substituted as literals at use

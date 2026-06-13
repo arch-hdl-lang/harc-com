@@ -178,6 +178,10 @@ pub(crate) fn lower_transactor(
         bus_bindings: HashMap::new(),
         transactor_fields: HashMap::new(),
         transactors: Vec::new(),
+        // Method bodies see no scoreboards either — scoreboards are
+        // test-scope testbench fields, structurally invisible here.
+        scoreboard_fields: HashMap::new(),
+        scoreboards: Vec::new(),
         // Method bodies see file-scope consts; they have no testbench,
         // so no scalar fields, helper methods, or test-scope lets.
         consts: record_ctx.consts.clone(),

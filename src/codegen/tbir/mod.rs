@@ -61,6 +61,12 @@ pub fn emit(prog: &TbProgram, opts: &EmitOpts) -> Result<String, EmitError> {
         record_struct(&mut out, r);
     }
 
+    // Scoreboard structs (data-only host-state records — they never name
+    // a TB or DUT type), before the testbench structs that hold them.
+    for sb in &prog.scoreboards {
+        runtime::scoreboard_struct(&mut out, sb);
+    }
+
     // Covergroup structs (leaf observables — they never name a TB or
     // DUT type), then one struct per unique non-synthetic testbench.
     for cg in &prog.covgroups {
@@ -94,7 +100,19 @@ pub fn emit(prog: &TbProgram, opts: &EmitOpts) -> Result<String, EmitError> {
                 .iter()
                 .map(|(f, cg)| (f.clone(), prog.covgroups[cg.index()].name.clone()))
                 .collect();
-            runtime::tb_struct(&mut out, &tb.name, &dut_type, &cov_fields, &tb.scalar_fields);
+            let sb_fields: Vec<(String, String)> = tb
+                .scoreboard_fields
+                .iter()
+                .map(|(f, sb)| (f.clone(), prog.scoreboards[sb.index()].name.clone()))
+                .collect();
+            runtime::tb_struct(
+                &mut out,
+                &tb.name,
+                &dut_type,
+                &cov_fields,
+                &tb.scalar_fields,
+                &sb_fields,
+            );
         }
     }
     runtime::context_struct(&mut out, &dut_type);

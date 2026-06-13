@@ -77,6 +77,16 @@ impl FuncBuilder<'_> {
                 if let Some(field) = self.as_tb_scalar_field(e) {
                     return Ok(Expr::TbField(field));
                 }
+                // Scoreboard scalar-counter read (`sb.writes` /
+                // `_tb.sb.writes` after impl-form desugaring).
+                if let Some((sb, field)) = self.scoreboard_root(target) {
+                    let scalar = self.scoreboard_scalar_field(sb, &name.name)?;
+                    return Ok(Expr::ScoreboardQuery {
+                        sb,
+                        field,
+                        query: crate::ir::ScoreboardQuery::Scalar { scalar },
+                    });
+                }
                 // `t.field` read on a record-typed local.
                 if let ExprKind::Ident(root) = &*target.kind {
                     if let Some(local) = self.lookup(&root.name) {
@@ -146,6 +156,14 @@ impl FuncBuilder<'_> {
                         // `.zext<N>()` / `.sext<N>()` / `.resize<N>()`.
                         if let Some(kind) = width_cast_kind(&name.name) {
                             return self.lower_width_method(kind, &name.name, target, args);
+                        }
+                        // Scoreboard queue value-queries: `sb.q.size()`,
+                        // `sb.q.empty()`. (`sb.q.pop()` mutates and is
+                        // lowered only as a statement — reaching it here
+                        // means it was used in a deeper expression
+                        // position, which is rejected below.)
+                        if let Some(q) = self.lower_scoreboard_query_call(callee, args)? {
+                            return Ok(q);
                         }
                         // Testbench helper method call (`_tb.reset()`),
                         // CFG-inlined like an impure helper.
@@ -308,8 +326,52 @@ impl FuncBuilder<'_> {
             | Expr::Local(_)
             | Expr::RecordField { .. }
             | Expr::TbField(_)
+            // Scoreboard reads are host state — no DUT port inside.
+            | Expr::ScoreboardQuery { .. }
             | Expr::CovBin { .. }) => other,
         }
+    }
+
+    /// Lower `sb.<queue>.size()` / `sb.<queue>.empty()` into an
+    /// `Expr::ScoreboardQuery`, or `None` when `callee` is not a
+    /// scoreboard queue method access. A `pop()` reaching here (deeper
+    /// than a `let`/assign RHS) is rejected — it mutates and must be a
+    /// statement.
+    fn lower_scoreboard_query_call(
+        &self,
+        callee: &AstExpr,
+        args: &[crate::ast::CallArg],
+    ) -> Result<Option<Expr>, LowerError> {
+        let Some((sb, field, queue, method)) = self.as_scoreboard_queue_call(callee) else {
+            return Ok(None);
+        };
+        let query = match method.as_str() {
+            "size" => crate::ir::ScoreboardQuery::QueueSize {
+                queue: queue.clone(),
+            },
+            "empty" => crate::ir::ScoreboardQuery::QueueEmpty {
+                queue: queue.clone(),
+            },
+            "pop" => {
+                return Err(unsupported(
+                    &format!("scoreboard `{field}.{queue}.pop()` in a nested expression"),
+                    "bind it to its own `let` first — `pop` mutates the queue",
+                ));
+            }
+            other => {
+                return Err(unsupported(
+                    &format!("scoreboard queue method `{field}.{queue}.{other}(...)`"),
+                    "only `push`/`pop`/`size`/`empty` are lowered",
+                ));
+            }
+        };
+        if !args.is_empty() {
+            return Err(LowerError::Invalid(format!(
+                "scoreboard `{field}.{queue}.{method}()` takes no arguments"
+            )));
+        }
+        self.scoreboard_queue_field(sb, &queue)?;
+        Ok(Some(Expr::ScoreboardQuery { sb, field, query }))
     }
 
     /// `Some(PortRef)` when the expression is a dotted access rooted at
@@ -374,6 +436,15 @@ impl FuncBuilder<'_> {
                                 .transactor_fields
                                 .contains_key(segments.last().unwrap())
                         {
+                            return Ok(None);
+                        }
+                        // Scoreboard-field paths (`_tb.sb`, `_tb.sb.q`,
+                        // `_tb.sb.q.push`) are host state, not ports —
+                        // `lower_expr` / `lower_assign` resolve them via
+                        // the scoreboard op/query forms. The root field
+                        // (the segment after `_tb`) is the scoreboard
+                        // instance name.
+                        if self.ctx.scoreboard_fields.contains_key(segments.last().unwrap()) {
                             return Ok(None);
                         }
                         if segments.len() == 1

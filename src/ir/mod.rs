@@ -54,6 +54,10 @@ ir_id!(
     /// Index into `TbProgram::transactors`.
     TransactorId
 );
+ir_id!(
+    /// Index into `TbProgram::scoreboards`.
+    ScoreboardId
+);
 
 /// Whole-program IR for one merged HARC source file (post
 /// `merge_for_sim` + impl-for desugaring).
@@ -69,6 +73,9 @@ pub struct TbProgram {
     /// Transactor schemas (`transactor` declarations), in file order.
     /// See `TransactorSchema`.
     pub transactors: Vec<TransactorSchema>,
+    /// Scoreboard schemas (`scoreboard` declarations), in file order.
+    /// See `ScoreboardSchema`.
+    pub scoreboards: Vec<ScoreboardSchema>,
 }
 
 /// One `transactor` declaration, lowered to its structural shape.
@@ -167,6 +174,52 @@ impl RecordSchema {
     }
 }
 
+/// One `scoreboard` declaration, lowered to its structural shape: a
+/// host-state record of scalar counters and typed FIFO queues, in
+/// declaration order. Both backends emit this as a C++ struct (v1's
+/// `emit_scoreboard` shape is the behavior reference): scalar fields as
+/// `uint64_t`/`int64_t`/`bool` members with their declared defaults,
+/// `queue<T>` fields as `harc_rt::HarcQueue<T>` members.
+///
+/// Subset (v0): a scoreboard is a *testbench field* holding data only.
+/// Scalar fields and `queue<T>` fields where `T` is a scalar ≤ 64 bits
+/// lower; the test body manipulates them through `Stmt::ScoreboardOp`
+/// (scalar read/write, queue push/pop/size/empty). Scoreboard
+/// `hookable`/`function` methods — which mutate scoreboard instance
+/// state and therefore need per-instance materialization — are NOT
+/// lowered in this subset and are rejected at the call site with a
+/// precise message. Event-driven `on`/`connect` wiring is likewise out
+/// of scope (it gates on the agent/env/event slices).
+#[derive(Debug, Clone)]
+pub struct ScoreboardSchema {
+    pub name: String,
+    pub fields: Vec<ScoreboardFieldSchema>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScoreboardFieldSchema {
+    pub name: String,
+    pub kind: ScoreboardFieldKind,
+}
+
+/// A scoreboard field is either a scalar counter or a typed FIFO queue.
+#[derive(Debug, Clone)]
+pub enum ScoreboardFieldKind {
+    /// `writes : uint<32> default 0` — a scalar host counter. The
+    /// `default` is the declared initializer literal (0 fallback, v1).
+    Scalar { ty: IrType, default: u64 },
+    /// `expected : queue<uint<32>>` — a FIFO of a scalar element type
+    /// (≤ 64 bits; the lowered subset). `signed` selects the C element
+    /// type for diagnostics/printf width (`int64_t` vs `uint64_t`).
+    Queue { signed: bool },
+}
+
+impl ScoreboardSchema {
+    pub fn field(&self, name: &str) -> Option<&ScoreboardFieldSchema> {
+        self.fields.iter().find(|f| f.name == name)
+    }
+}
+
 /// One `test` (or `impl <Test> for <Tb>`) declaration.
 #[derive(Debug, Clone)]
 pub struct TestSchema {
@@ -226,6 +279,10 @@ pub struct TestbenchSchema {
     /// Transactor-typed testbench fields (field name, transactor), in
     /// declaration order. All instances are `active` in this subset.
     pub transactor_fields: Vec<(String, TransactorId)>,
+    /// Scoreboard-typed testbench fields (field name, scoreboard), in
+    /// declaration order. Each lowers to a default-constructed member of
+    /// the `_tb` struct (v1's by-value scoreboard instance).
+    pub scoreboard_fields: Vec<(String, ScoreboardId)>,
     /// True when no `testbench` declaration existed in source and this
     /// schema was synthesized for a classic-form test. Codegen skips
     /// the `_tb` struct + wire statement for synthetic testbenches.
@@ -394,6 +451,35 @@ pub enum Stmt {
     /// prints unconditionally (the header line). Lives only in
     /// `on_timeout` successor blocks.
     FailDiag { guard: Option<Expr>, args: FmtArgs },
+    /// A statement-position scoreboard mutation on a scoreboard-typed
+    /// testbench field (`sb.expected.push(x)`, `sb.writes = ...`). The
+    /// design doc's `Stmt::ScoreboardOp(ScoreboardId, ScoreboardOp)`,
+    /// extended with the resolved `field` (testbench-field name) so
+    /// emission resolves the `_tb.<field>` member without a second
+    /// lookup. Value-producing scoreboard reads (`.size()`, `.empty()`,
+    /// `.pop()`, scalar reads) flow through `Expr::ScoreboardQuery` and
+    /// are NOT statements (no side effect, except `.pop()` which is the
+    /// `ScoreboardOp::QueuePop` form below — always assigned).
+    ScoreboardOp {
+        sb: ScoreboardId,
+        field: String,
+        op: ScoreboardOp,
+    },
+}
+
+/// A scoreboard mutation. The design doc pins this as a tagged enum
+/// "once semantics are pinned"; v0 covers exactly the ops the corpus
+/// exercises on the data-only scoreboard subset.
+#[derive(Debug, Clone)]
+pub enum ScoreboardOp {
+    /// `sb.<queue>.push(value)`. `queue` is the queue-field name.
+    QueuePush { queue: String, value: Expr },
+    /// `let v = sb.<queue>.pop()` — pop front into a local. Always has a
+    /// destination (a bare `sb.q.pop()` discard is rejected at lowering,
+    /// matching v1, which would warn on the unused value).
+    QueuePop { queue: String, dest: LocalId },
+    /// `sb.<scalar> = value` — write a scalar counter field.
+    ScalarWrite { scalar: String, value: Expr },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -531,6 +617,16 @@ pub enum Expr {
     /// `_tb.<field>` read on a scalar testbench field. Host state —
     /// allowed in every expression position a `Local` is.
     TbField(String),
+    /// A value-producing scoreboard read on a scoreboard-typed testbench
+    /// field: `sb.writes` (scalar), `sb.expected.size()`,
+    /// `sb.expected.empty()`. Host state — allowed wherever a `Local`
+    /// is. `.pop()` is NOT here (it mutates) — it lowers to
+    /// `Stmt::ScoreboardOp { op: QueuePop, .. }`.
+    ScoreboardQuery {
+        sb: ScoreboardId,
+        field: String,
+        query: ScoreboardQuery,
+    },
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Unary(UnOp, Box<Expr>),
     /// `cond ? a : b`. Both backends emit the C++ ternary; port reads
@@ -566,6 +662,17 @@ pub enum WidthCastKind {
     Zext,
     Sext,
     Resize,
+}
+
+/// A value-producing scoreboard read (see `Expr::ScoreboardQuery`).
+#[derive(Debug, Clone)]
+pub enum ScoreboardQuery {
+    /// `sb.<scalar>` — read a scalar counter field.
+    Scalar { scalar: String },
+    /// `sb.<queue>.size()` — element count (lowers to `uint64_t`).
+    QueueSize { queue: String },
+    /// `sb.<queue>.empty()` — true when no elements (lowers to `bool`).
+    QueueEmpty { queue: String },
 }
 
 #[derive(Debug, Clone)]
@@ -716,6 +823,10 @@ impl TbProgram {
 
     pub fn transactor(&self, id: TransactorId) -> &TransactorSchema {
         &self.transactors[id.index()]
+    }
+
+    pub fn scoreboard(&self, id: ScoreboardId) -> &ScoreboardSchema {
+        &self.scoreboards[id.index()]
     }
 }
 

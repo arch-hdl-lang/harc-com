@@ -125,6 +125,14 @@ pub enum VerifyError {
         block: BlockId,
         detail: String,
     },
+    /// A scoreboard op/query references a scoreboard id, testbench field,
+    /// or scoreboard field that does not resolve (or names a queue where
+    /// a scalar is expected, or vice versa).
+    BadScoreboard {
+        func: FunctionId,
+        block: BlockId,
+        detail: String,
+    },
     /// Cross-IR: a test's run/check FunctionId or TestbenchId resolves.
     BadProgramRef { what: String },
 }
@@ -219,6 +227,11 @@ impl std::fmt::Display for VerifyError {
             } => write!(
                 f,
                 "fn{}: b{} transactor-call seam violation: {detail}",
+                func.0, block.0
+            ),
+            VerifyError::BadScoreboard { func, block, detail } => write!(
+                f,
+                "fn{}: b{} scoreboard reference error: {detail}",
                 func.0, block.0
             ),
             VerifyError::BadProgramRef { what } => write!(f, "program: {what}"),
@@ -530,6 +543,23 @@ impl Checker<'_> {
                     }
                     self.check_fmt_args(args);
                 }
+                Stmt::ScoreboardOp { sb, field, op } => {
+                    self.check_scoreboard(*sb, field);
+                    match op {
+                        crate::ir::ScoreboardOp::QueuePush { queue, value } => {
+                            self.check_scoreboard_queue(*sb, queue);
+                            self.check_expr(value, false, "ScoreboardOp push value");
+                        }
+                        crate::ir::ScoreboardOp::QueuePop { queue, dest } => {
+                            self.check_scoreboard_queue(*sb, queue);
+                            self.check_local(*dest);
+                        }
+                        crate::ir::ScoreboardOp::ScalarWrite { scalar, value } => {
+                            self.check_scoreboard_scalar(*sb, scalar);
+                            self.check_expr(value, false, "ScoreboardOp scalar value");
+                        }
+                    }
+                }
             }
         }
         match &b.terminator {
@@ -583,6 +613,70 @@ impl Checker<'_> {
                 func: self.fid,
                 block: self.bid,
                 field: field.to_string(),
+            });
+        }
+    }
+
+    /// The scoreboard id must resolve and `field` must be a
+    /// scoreboard-typed field of the owning testbench bound to it.
+    fn check_scoreboard(&mut self, sb: crate::ir::ScoreboardId, field: &str) {
+        if sb.index() >= self.prog.scoreboards.len() {
+            self.errs.push(VerifyError::BadScoreboard {
+                func: self.fid,
+                block: self.bid,
+                detail: format!("scoreboard id sb{} does not resolve", sb.0),
+            });
+            return;
+        }
+        let bound = self
+            .func
+            .owner
+            .and_then(|tb| self.prog.testbenches.get(tb.index()))
+            .is_some_and(|tb| {
+                tb.scoreboard_fields
+                    .iter()
+                    .any(|(f, id)| f == field && *id == sb)
+            });
+        if !bound {
+            self.errs.push(VerifyError::BadScoreboard {
+                func: self.fid,
+                block: self.bid,
+                detail: format!(
+                    "field `{field}` is not bound to scoreboard sb{} on the owning testbench",
+                    sb.0
+                ),
+            });
+        }
+    }
+
+    fn check_scoreboard_scalar(&mut self, sb: crate::ir::ScoreboardId, scalar: &str) {
+        let ok = self
+            .prog
+            .scoreboards
+            .get(sb.index())
+            .and_then(|s| s.field(scalar))
+            .is_some_and(|f| matches!(f.kind, crate::ir::ScoreboardFieldKind::Scalar { .. }));
+        if !ok {
+            self.errs.push(VerifyError::BadScoreboard {
+                func: self.fid,
+                block: self.bid,
+                detail: format!("scoreboard sb{} has no scalar field `{scalar}`", sb.0),
+            });
+        }
+    }
+
+    fn check_scoreboard_queue(&mut self, sb: crate::ir::ScoreboardId, queue: &str) {
+        let ok = self
+            .prog
+            .scoreboards
+            .get(sb.index())
+            .and_then(|s| s.field(queue))
+            .is_some_and(|f| matches!(f.kind, crate::ir::ScoreboardFieldKind::Queue { .. }));
+        if !ok {
+            self.errs.push(VerifyError::BadScoreboard {
+                func: self.fid,
+                block: self.bid,
+                detail: format!("scoreboard sb{} has no queue field `{queue}`", sb.0),
             });
         }
     }
@@ -710,6 +804,18 @@ impl Checker<'_> {
                 self.check_record_field(*local, field);
             }
             Expr::CovBin { inst, .. } => self.check_covgroup(inst.covgroup),
+            Expr::ScoreboardQuery { sb, field, query } => {
+                self.check_scoreboard(*sb, field);
+                match query {
+                    crate::ir::ScoreboardQuery::Scalar { scalar } => {
+                        self.check_scoreboard_scalar(*sb, scalar)
+                    }
+                    crate::ir::ScoreboardQuery::QueueSize { queue }
+                    | crate::ir::ScoreboardQuery::QueueEmpty { queue } => {
+                        self.check_scoreboard_queue(*sb, queue)
+                    }
+                }
+            }
             Expr::Call(target, args) => {
                 // Seam rule: a call edge is never an expression VALUE.
                 // It reaches the verifier only as the top-level Assign
@@ -857,6 +963,14 @@ fn check_def_before_use(
                         d[l.index()] = true;
                     }
                 }
+                Stmt::ScoreboardOp {
+                    op: crate::ir::ScoreboardOp::QueuePop { dest: l, .. },
+                    ..
+                } => {
+                    if l.index() < d.len() {
+                        d[l.index()] = true;
+                    }
+                }
                 _ => {}
             }
         }
@@ -971,6 +1085,19 @@ fn check_def_before_use(
                         check_e(&a.expr, &defined, errs);
                     }
                 }
+                Stmt::ScoreboardOp { op, .. } => match op {
+                    crate::ir::ScoreboardOp::QueuePush { value, .. } => {
+                        check_e(value, &defined, errs)
+                    }
+                    crate::ir::ScoreboardOp::ScalarWrite { value, .. } => {
+                        check_e(value, &defined, errs)
+                    }
+                    crate::ir::ScoreboardOp::QueuePop { dest, .. } => {
+                        if dest.index() < defined.len() {
+                            defined[dest.index()] = true;
+                        }
+                    }
+                },
             }
         }
         match &b.terminator {
@@ -1001,7 +1128,11 @@ fn check_def_before_use(
 
 fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
     match e {
-        Expr::Literal { .. } | Expr::WideLiteral(_) | Expr::Port(_) | Expr::TbField(_) => {}
+        Expr::Literal { .. }
+        | Expr::WideLiteral(_)
+        | Expr::Port(_)
+        | Expr::TbField(_)
+        | Expr::ScoreboardQuery { .. } => {}
         Expr::Local(l) => f(*l),
         Expr::RecordField { local, .. } => f(*local),
         Expr::Binary(_, a, b) => {

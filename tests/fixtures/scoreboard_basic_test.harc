@@ -1,0 +1,94 @@
+// `scoreboard` data-only host-state record — the fixture behind the
+// TB-IR backend's scoreboard lowering/emission (spec §8.5, structural
+// subset only). A scoreboard testbench field holds a `queue<uint<32>>`
+// of expected values plus scalar counters; the test body pushes each
+// expected count, pops it back, and compares against the DUT, then a
+// `check` phase drains the queue and reconciles the counters.
+//
+// Exercises, against the counter DUT (`Top` from top_counter_test):
+//   1. Declaration: a `queue<uint<32>>` field and scalar counter fields
+//      with literal defaults, bound as a testbench field.
+//   2. Queue ops: `sb.expected.push(x)` (statement), `let v =
+//      sb.expected.pop()` (let-RHS), `sb.expected.size()` /
+//      `sb.expected.empty()` (value queries in assert/log positions).
+//   3. Scalar ops: `sb.writes = sb.writes + 1` (read + write a scalar
+//      counter), scalar reads in arithmetic, assert conditions, and
+//      log/fail format args.
+//   4. The `check` phase reads scoreboard state after `run` finishes
+//      (the scoreboard lives on the `_tb` struct, shared run↔check).
+//
+// Uses only the v1-supported surface, so the same file passes under
+// `--codegen v1` and `--codegen tbir`; the equivalence harness
+// trace-diffs the two.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+scoreboard CountSb
+    expected : queue<uint<32>>
+    writes   : uint<32> default 0
+    reads    : uint<32> default 0
+end scoreboard CountSb
+
+testbench ScoreboardBasicTb
+    dut : Top
+    sb  : CountSb
+end testbench ScoreboardBasicTb
+
+impl ScoreboardBasicTest for ScoreboardBasicTb
+    clock clk = SysDomain        // 100 MHz
+
+    run
+        log(info, "scoreboard basic: queue + counters on counter DUT")
+
+        // Reset for 3 cycles.
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        assert dut.count_out == 0
+            else fail("after reset: count_out=${dut.count_out}, expected 0")
+        dut.rst = 0
+
+        // Three runs; run i enables the counter for (i+1) more cycles.
+        // The expected running total is pushed before the DUT advances,
+        // then popped back and compared after.
+        let total = 0
+        for i in 0 .. 3
+            let bump = i + 1               // 1, 2, 3 cycles of en
+            total = total + bump
+            sb.expected.push(total)
+            sb.writes = sb.writes + 1
+
+            dut.en = 1
+            for _ in 0 .. bump
+                wait 1 cycle
+            end for
+            dut.en = 0
+            wait 1 cycle                   // let the last count settle
+
+            let want = sb.expected.pop()
+            sb.reads = sb.reads + 1
+            let got = dut.count_out
+            assert got == want
+                else fail("run[${i}]: count_out=${got}, expected ${want}")
+            log(info, "run[${i}] bump=${bump} count_out=${got} matched expected=${want}")
+        end for
+
+        // Queue must be drained at the end of run.
+        assert sb.expected.empty()
+            else fail("queue not drained: ${sb.expected.size()} value(s) left")
+    end run
+
+    // End-of-test invariants — auto-fire after `run`. The scoreboard
+    // lives on the shared `_tb` struct, so check sees run's mutations.
+    check
+        assert sb.expected.size() == 0
+            else fail("scoreboard left ${sb.expected.size()} expected value(s)")
+        assert sb.writes == sb.reads
+            else fail("counter drift: writes=${sb.writes} reads=${sb.reads}")
+        assert sb.writes == 3
+            else fail("expected 3 writes, got ${sb.writes}")
+        log(info, "PASS: scoreboard drained, ${sb.reads} reads matched ${sb.writes} writes")
+    end check
+end impl ScoreboardBasicTest

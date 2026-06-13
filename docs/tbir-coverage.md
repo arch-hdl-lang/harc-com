@@ -181,6 +181,48 @@ loop). All five fixtures lower cleanly, pass the full v1-vs-tbir
 equivalence pair, and are registered (no deeper blockers surfaced —
 the group was exactly as advertised).
 
+### `scoreboard` construct — **PARTIALLY RESOLVED 2026-06-12 (scoreboard slice)**
+
+> ~~TB-IR lowering does not support the `scoreboard` construct yet~~
+
+The scoreboard slice landed the **data-only host-state subset**:
+`ScoreboardSchema` (scalar counters + `queue<T>` of a scalar element
+type), `Stmt::ScoreboardOp` (`QueuePush`/`QueuePop`/`ScalarWrite`),
+`Expr::ScoreboardQuery` (scalar read / `size()` / `empty()`), and
+scoreboard-instance struct emission held on the `_tb` struct
+(`harc_rt::HarcQueue<T>` members; v1's `emit_scoreboard` shape — see
+docs/tbir-mvp.md divergence 12).
+
+**First-blocker caveat applied in full.** `scoreboard` was the first
+*item-scan* reject in all of its fixtures, masking deeper blockers.
+With the gate lifted, **zero** of the corpus fixtures gated on
+`scoreboard` became fully lowerable — every one stacks a further
+construct behind the scoreboard declaration. The slice therefore added
+a self-proving fixture, `scoreboard_basic_test` (queue push/pop/size/
+empty + scalar counter read/write, run↔check-shared instance, against
+the `Top` counter DUT), registered in the equivalence registry
+(`top_counter.sv`, pass).
+
+Residual first-blocker map (re-run of `harc dump-ir`, 2026-06-12 —
+each fixture now stops at its REAL next blocker):
+
+| Next blocker | Fixtures |
+|---|---|
+| `randomize` (constraint-IR seam) | `axilite_sb_test` |
+| `env` / `connect` composition | `axilite_env_test`, `analysis_sink_connect_test` (also needs scoreboard methods + `event`/`emit`) |
+| scoreboard **methods** (per-instance state materialization — out of the data-only subset) | `analysis_sink_connect_test` |
+| passive transactor `on`-handlers (event-driven monitor) | `dma_engine_test` |
+| `queue<Struct>` element type (record-payload-in-queue seam) + transactor `on ... phase` | `scoreboard_typed_queue_test` |
+| `tseq` construct | `axilite_bound_mon_test`, `axilite_multi_payload_test` |
+
+The two scoreboard-specific residuals — scoreboard methods
+(`analysis_sink_connect_test`) and `queue<Struct>`
+(`scoreboard_typed_queue_test`) — stay with this construct's owner; the
+rest belong to the `randomize` / `env` / `agent` / `tseq` slices and
+will clear when those land. As predicted in the suggested-sequencing
+note, scoreboard alone unlocks no corpus fixture because every one is a
+full env/agent/sequencer stack.
+
 ### `struct` construct — 4 fixtures
 
 > TB-IR lowering does not support the `struct` construct yet
@@ -241,7 +283,7 @@ lists; emission mirrors v1 (`_harc_u128` composite ≤ 128 bits,
 | `keep_constraints_test` | TB-IR lowering does not support the `enum` construct yet |
 | `extern_fn_ref_test` | TB-IR lowering does not support the `extern fn` construct yet |
 | `async_fifo_test` | TB-IR lowering does not support time literals in expression position yet |
-| `dma_engine_test` | TB-IR lowering does not support the `scoreboard` construct yet |
+| `dma_engine_test` | ~~`scoreboard` construct~~ **scoreboard gate lifted (slice 2026-06-12); next blocker is the passive transactor `on`-handler monitor** — see the scoreboard group's residual map |
 | `linklist_basic_test` | ~~ternary expressions~~ **lowers since the transactor slice (ternary landed), but diverges**: v1 stamps `sim_end` with `clock:""` because the fixture's run body has no top-level wait — under v1's sync-helper model the whole test runs inside `sched.bootstrap()` and the pre-loop settle dump is the last timing update. tbir's CFG-inlined helpers suspend for real and stamp `"clk"`. Verdict + all other events identical; unregistered pending trace-normalization reconciliation (docs/tbir-mvp.md divergence 11) |
 | `mshr_cocotb_test` | TB-IR lowering does not support the `const` construct yet |
 | `packed_vec_lane_test` | TB-IR lowering does not support assignment to a non-port, non-local target yet |
@@ -255,7 +297,7 @@ Status after the singleton-blocker batch (2026-06-12):
 | `keep_constraints_test` | `enum` construct | **enum RESOLVED; deeper blocker** — enums lower as named integer constants (variant index, first definition wins) and enum-typed transaction fields as scalar indices; the fixture now stops at statement-level `randomize` (constraint-IR seam) |
 | `extern_fn_ref_test` | `extern fn` construct | **Skipped** — needs `--ref-src` end-to-end; deferred with the registry plumbing already in place |
 | `async_fifo_test` | time literals in expression position | **RESOLVED + registered** — `wait 80ns` lowers to `Terminator::WaitTimePs` (ps resolved at lowering; v1's inline `eval_clocks_until(now_ps + N)`); `log(debug, ...)` severity also landed here |
-| `dma_engine_test` | `scoreboard` construct | **Skipped** — wave-4 construct |
+| `dma_engine_test` | `scoreboard` construct | **scoreboard RESOLVED (data-only subset); deeper blocker** — the scoreboard now lowers; the fixture stops at its passive `MemXactor` transactor's event-driven `on`-handlers (moved to the scoreboard group's residual map) |
 | `linklist_basic_test` | ternary expressions | **RESOLVED + registered** — `Expr::Ternary` emits the C++ `?:`; also forced the `WaitCyclesSync` terminator (waits inlined from helper bodies take v1's synchronous `tick()` path, fixing a `sim_end` clock-attribution trace delta) |
 | `mshr_cocotb_test` | `const` construct | **const RESOLVED; deeper blocker** — file-scope `const` (integer-literal initializers) substitutes at use sites; the fixture now stops at the `transactor` construct (moved to that group) |
 | `packed_vec_lane_test` | assignment to a non-port, non-local target | **RESOLVED + registered** — constant-lane `dut.<port>[i]` reads/writes lower via `PortRef::lane`; emission splits packed lanes (`harc_vec_lane_*<W>` via the `--sv` lane table) from unpacked-array subscripts, like v1 |
@@ -303,6 +345,13 @@ no schema v4 needed.
    (incl. the schema-blocked `synchronizer_basic_test`).~~ **DONE
    2026-06-12** — all six fixtures registered.
 4. **`struct`** (4, two of which also need `bus`).
+   - ~~**`scoreboard`** (data-only host-state subset)~~ **LANDED
+     2026-06-12** — `ScoreboardSchema` + `Stmt::ScoreboardOp` +
+     `Expr::ScoreboardQuery`; self-proving `scoreboard_basic_test`
+     registered. No corpus fixture unlocked fully (every one stacks
+     env/agent/tseq/randomize/struct/`on`-handlers); residuals owed to
+     this slice: scoreboard methods + `queue<Struct>` (see the
+     scoreboard group above).
 5. ~~Singletons opportunistically — `.reset(...)`, non-named testbench
    field types, wide literals, `property`, `enum`, `const`,
    `extern fn`, `scoreboard`, ternary, probes, time-literal exprs,
