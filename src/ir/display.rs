@@ -204,6 +204,33 @@ impl Display for TbProgram {
                     e.sink_component.0
                 )?;
             }
+            for ph in &c.periodic_handlers {
+                // Bodies print as their own `fn` blocks below; the
+                // summary line records the period source.
+                writeln!(
+                    f,
+                    "    on {} cycles = fn{}",
+                    expr_str_for_component(self, ph.function, &ph.period),
+                    ph.function.0
+                )?;
+            }
+            if let Some(w) = &c.watchdog {
+                let period = w
+                    .period
+                    .as_ref()
+                    .map(|e| expr_str_for_component(self, w.function, e))
+                    .unwrap_or_else(|| "default".to_string());
+                let max_idle = w
+                    .max_idle
+                    .as_ref()
+                    .map(|e| expr_str_for_component(self, w.function, e))
+                    .unwrap_or_else(|| "default".to_string());
+                writeln!(
+                    f,
+                    "    watchdog period {period} max_idle {max_idle} = fn{}",
+                    w.function.0
+                )?;
+            }
         }
         for (i, cg) in self.covgroups.iter().enumerate() {
             let trig = match cg.trigger {
@@ -534,9 +561,22 @@ fn port_str(p: &PortRef) -> String {
     out
 }
 
+/// Render a period/max_idle clause expr (which lowered in the same
+/// builder as the component body `function`) using that function for any
+/// local-name resolution. Field reads render as `self.<field>`; literals
+/// and `cycle_count` need no function context.
+fn expr_str_for_component(
+    prog: &crate::ir::TbProgram,
+    function: crate::ir::FunctionId,
+    e: &Expr,
+) -> String {
+    expr_str(prog.function(function), e)
+}
+
 pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
     match e {
         Expr::Literal { value, .. } => format!("{value}"),
+        Expr::CycleCount => "cycle_count".to_string(),
         Expr::WideLiteral(words) => {
             // MSB-first hex dump of the word list (deterministic,
             // reparse-free — the IR has no surface syntax).

@@ -14,6 +14,12 @@ pub(super) struct ECx<'a> {
     pub func: &'a TbFunction,
     pub names: &'a [String],
     pub lanes: &'a HashMap<String, u32>,
+    /// When `Some`, a `ComponentField`/`ComponentIdle` with a `SelfField`
+    /// base renders against this instance path instead of the literal
+    /// `self`. Used when a watchdog/periodic clause expr (lowered in the
+    /// component-self context) is emitted inside a per-instance
+    /// `_checkers` closure, which has no `self` in scope.
+    pub self_subst: Option<&'a str>,
 }
 
 /// C++ symbol for a lowered pure-helper function. Prefixed so a HARC
@@ -76,6 +82,10 @@ pub(super) fn lane_width(cx: &ECx<'_>, p: &PortRef) -> Option<u32> {
 pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
     Ok(match e {
         Expr::Literal { value, .. } => format!("{value}"),
+        // The framework-provided cycle counter — emitted as the in-scope
+        // `cycle_count` (a captured `ctx.cycle_count` reference), matching
+        // v1's bare-ident emission of `cycle_count`.
+        Expr::CycleCount => "(uint64_t)cycle_count".to_string(),
         Expr::WideLiteral(words) => wide_literal_cpp(words),
         Expr::Local(l) => cx
             .names
@@ -164,13 +174,13 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // component local (`env.sb.count`). Both name plain by-value C++
         // struct members (v1's `emit_component_struct` shape).
         Expr::ComponentField { base, field } => {
-            format!("{}.{field}", comp_base_cpp(base))
+            format!("{}.{field}", comp_base_cpp_subst(base, cx.self_subst))
         }
         // Heartbeat-idle predicate on a component instance — mirrors v1's
         // `emit_idle_predicate`: compares `cycle_count` minus the
         // `_last_in_cycle`/`_last_out_cycle` stamp against the threshold.
         Expr::ComponentIdle { base, kind, n } => {
-            let recv = comp_base_cpp(base);
+            let recv = comp_base_cpp_subst(base, cx.self_subst);
             let n = expr_cpp(cx, n)?;
             match kind {
                 crate::ir::IdleKind::In => format!(
@@ -412,8 +422,21 @@ fn un_op_cpp(op: UnOp) -> &'static str {
 /// (the method lambda's first parameter); `Path` → the dot-joined
 /// test-scope path (`env.source`), all by-value struct members.
 pub(super) fn comp_base_cpp(base: &crate::ir::ComponentBase) -> String {
+    comp_base_cpp_subst(base, None)
+}
+
+/// As `comp_base_cpp`, but `self_subst = Some(inst)` renders a
+/// `SelfField` base as the instance path `inst` instead of `self` — for
+/// clause exprs lowered self-relatively but emitted in a `_checkers`
+/// closure that has no `self` (watchdog/periodic period + max_idle).
+pub(super) fn comp_base_cpp_subst(
+    base: &crate::ir::ComponentBase,
+    self_subst: Option<&str>,
+) -> String {
     match base {
-        crate::ir::ComponentBase::SelfField => "self".to_string(),
+        crate::ir::ComponentBase::SelfField => {
+            self_subst.unwrap_or("self").to_string()
+        }
         crate::ir::ComponentBase::Path(path) => path.join("."),
     }
 }

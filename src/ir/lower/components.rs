@@ -146,8 +146,13 @@ pub(crate) fn lower_component_schema(
     let mut methods: Vec<ComponentMethodSchema> = Vec::new();
     // On-handler ASTs are collected here and resolved after the field
     // loop, so a handler may textually precede the event field it
-    // subscribes to (field lookup needs the full field set).
+    // subscribes to (field lookup needs the full field set). Event-
+    // subscription (`on ev(arg)`) and periodic (`on N cycles`) forms are
+    // split so each reserves its FunctionId in the right contiguous block.
     let mut on_asts: Vec<&crate::ast::OnHandler> = Vec::new();
+    let mut periodic_asts: Vec<&crate::ast::OnHandler> = Vec::new();
+    // At most one `watchdog` per component (the second is rejected).
+    let mut watchdog_ast: Option<&crate::ast::WatchdogDecl> = None;
     for it in items.iter().chain(when_active.into_iter().flatten()) {
         match it {
             ComponentItem::Field(f) => {
@@ -179,13 +184,18 @@ pub(crate) fn lower_component_schema(
             // Connect blocks are resolved separately (env-binding stage).
             ComponentItem::Connect(_) => {}
             ComponentItem::Lifecycle(..) => {}
+            ComponentItem::OnHandler(h) if h.periodic => periodic_asts.push(h),
             ComponentItem::OnHandler(h) => on_asts.push(h),
-            ComponentItem::Watchdog(_) => {
-                return Err(unsupported(
-                    &format!("a `watchdog` on `{name}`"),
-                    "watchdog/phase orchestration gates on a later slice",
-                ));
+            ComponentItem::Watchdog(w) => {
+                if watchdog_ast.is_some() {
+                    return Err(unsupported(
+                        &format!("a second `watchdog` on `{name}`"),
+                        "a component may declare at most one `watchdog`",
+                    ));
+                }
+                watchdog_ast = Some(w);
             }
+
             ComponentItem::TargetTlmThread(_) | ComponentItem::Apply(_) => {
                 return Err(unsupported(
                     &format!("an unsupported item in component `{name}`"),
@@ -211,6 +221,39 @@ pub(crate) fn lower_component_schema(
         });
     }
 
+    // Periodic handlers (`on <N> cycles`). Reserved AFTER the event
+    // handlers so the FunctionId blocks stay contiguous in pass-2
+    // declaration order (methods → event on-handlers → periodic → watchdog).
+    // The period expression lowers in pass 2 (it may reference component
+    // fields); pass 1 records a placeholder.
+    let mut periodic_handlers: Vec<crate::ir::PeriodicHandlerSchema> = Vec::new();
+    for h in &periodic_asts {
+        validate_periodic_handler(name, h)?;
+        let fid = FunctionId(*next_fn);
+        *next_fn += 1;
+        periodic_handlers.push(crate::ir::PeriodicHandlerSchema {
+            period: crate::ir::Expr::CycleCount, // placeholder; pass 2 fills it
+            function: fid,
+        });
+    }
+
+    // Watchdog (at most one). A `disabled` watchdog emits nothing — no
+    // FunctionId, no schema entry (mirrors v1's `emit_watchdog` early
+    // return). The body FunctionId is reserved LAST; period/max_idle
+    // lower in pass 2.
+    let watchdog = match watchdog_ast {
+        Some(w) if !w.disabled => {
+            let fid = FunctionId(*next_fn);
+            *next_fn += 1;
+            Some(crate::ir::WatchdogSchema {
+                period: None,   // pass 2 fills from `w.period`
+                max_idle: None, // pass 2 fills from `w.max_idle`
+                function: fid,
+            })
+        }
+        _ => None,
+    };
+
     Ok(ComponentSchema {
         name: name.to_string(),
         kind,
@@ -219,7 +262,33 @@ pub(crate) fn lower_component_schema(
         // Connects resolved in a third pass once all schemas exist.
         connects: Vec::new(),
         on_handlers,
+        periodic_handlers,
+        watchdog,
     })
+}
+
+/// Validate an `on <N> cycles ... end on` periodic handler: it must carry
+/// no `pre`/`post` hook side and (in this component subset) the default
+/// `Checker` phase. A `post_eval`-phased periodic handler is a transactor/
+/// monitor reactive form handled by the transactor lowering, not the
+/// agent-component path here.
+fn validate_periodic_handler(
+    comp: &str,
+    h: &crate::ast::OnHandler,
+) -> Result<(), LowerError> {
+    if h.hook.is_some() {
+        return Err(unsupported(
+            &format!("a `pre`/`post` hook on an `on <N> cycles` handler on `{comp}`"),
+            "periodic handlers take no hook side",
+        ));
+    }
+    if !matches!(h.phase, crate::ast::OnPhase::Checker) {
+        return Err(unsupported(
+            &format!("a non-default-phase `on <N> cycles` handler on `{comp}`"),
+            "only the default (checker) phase is lowered for component periodic handlers",
+        ));
+    }
+    Ok(())
 }
 
 /// Validate an `on <event>(arg) ... end on` handler: it must be a bare
@@ -370,6 +439,19 @@ fn lower_field(
     }
 }
 
+/// The output of pass-2 body lowering for one component: the lowered
+/// `TbFunction`s (in FunctionId order) plus the period/max_idle clause
+/// expressions that could only be lowered once a body context existed.
+/// The caller patches the resolved clauses back into the schema.
+pub(crate) struct ComponentBodies {
+    pub funcs: Vec<TbFunction>,
+    /// Resolved `period` expr for each periodic handler, in schema order.
+    pub periodic_periods: Vec<crate::ir::Expr>,
+    /// Resolved `(period, max_idle)` watchdog clauses (`None` per clause
+    /// when the source omitted it). `None` overall when no watchdog.
+    pub watchdog_clauses: Option<(Option<crate::ir::Expr>, Option<crate::ir::Expr>)>,
+}
+
 /// Lower one component's method BODIES, returning the lowered
 /// `TbFunction`s in declaration order (their ids match the schema's
 /// `function` slots, assigned in pass 1). The body context resolves bare
@@ -382,7 +464,7 @@ pub(crate) fn lower_component_bodies(
     ctx: &LowerCtx,
     helpers: &helpers::HelperRegistry<'_>,
     constraint_sites: &std::cell::RefCell<Vec<crate::ir::ConstraintSite>>,
-) -> Result<Vec<TbFunction>, LowerError> {
+) -> Result<ComponentBodies, LowerError> {
     let (items, when_active): (&[ComponentItem], Option<&[ComponentItem]>) = match src {
         CompSource::Env(c)
         | CompSource::Scoreboard(c)
@@ -390,15 +472,15 @@ pub(crate) fn lower_component_bodies(
         | CompSource::Sequencer(c) => (&c.items, None),
         CompSource::Transactor(t) => (&t.items, t.when_active.as_deref()),
     };
-    // Pass 1 reserved FunctionIds METHODS-first, then ON-HANDLERS (see
+    // Pass 1 reserved FunctionIds METHODS-first, then EVENT ON-HANDLERS,
+    // then PERIODIC HANDLERS, then the WATCHDOG body (see
     // `lower_component_schema`). `prog.functions` is indexed by
     // FunctionId, so the returned bodies MUST come out in that same
-    // FunctionId order — NOT source-declaration order (a component that
-    // declares `on` before `hookable` would otherwise emit the
-    // higher-id handler body before the lower-id method body, corrupting
-    // every later `prog.function(id)` index). Two ordered sub-passes
+    // FunctionId order — NOT source-declaration order. Ordered sub-passes
     // guarantee monotonic ids.
-    let mut funcs = Vec::with_capacity(schema.methods.len() + schema.on_handlers.len());
+    let mut funcs = Vec::with_capacity(
+        schema.methods.len() + schema.on_handlers.len() + schema.periodic_handlers.len() + 1,
+    );
     let mut method_idx = 0usize;
     for it in items.iter().chain(when_active.into_iter().flatten()) {
         if let ComponentItem::Hookable(h) = it {
@@ -409,13 +491,133 @@ pub(crate) fn lower_component_bodies(
     }
     let mut on_idx = 0usize;
     for it in items.iter().chain(when_active.into_iter().flatten()) {
+        // Only EVENT-subscription handlers live in `schema.on_handlers`;
+        // periodic (`on N cycles`) handlers are a separate block.
         if let ComponentItem::OnHandler(h) = it {
+            if h.periodic {
+                continue;
+            }
             let oh = &schema.on_handlers[on_idx];
             on_idx += 1;
             funcs.push(lower_on_handler_body(h, oh, cid, ctx, helpers, constraint_sites)?);
         }
     }
-    Ok(funcs)
+    // Periodic handlers: lower the zero-arg body AND the period expr (the
+    // period reads fields self-relatively, so it lowers in the same
+    // component context).
+    let mut periodic_periods = Vec::with_capacity(schema.periodic_handlers.len());
+    let mut per_idx = 0usize;
+    for it in items.iter().chain(when_active.into_iter().flatten()) {
+        if let ComponentItem::OnHandler(h) = it {
+            if !h.periodic {
+                continue;
+            }
+            let ph = &schema.periodic_handlers[per_idx];
+            per_idx += 1;
+            let (body, period) =
+                lower_periodic_body(h, ph.function, cid, ctx, helpers, constraint_sites)?;
+            funcs.push(body);
+            periodic_periods.push(period);
+        }
+    }
+    // Watchdog body + clauses (at most one). A `disabled` watchdog left no
+    // schema entry, so skip it here too.
+    let mut watchdog_clauses = None;
+    if let Some(ws) = &schema.watchdog {
+        for it in items.iter().chain(when_active.into_iter().flatten()) {
+            if let ComponentItem::Watchdog(w) = it {
+                if w.disabled {
+                    continue;
+                }
+                let (body, period, max_idle) =
+                    lower_watchdog_body(w, ws.function, cid, ctx, helpers, constraint_sites)?;
+                funcs.push(body);
+                watchdog_clauses = Some((period, max_idle));
+                break;
+            }
+        }
+    }
+    Ok(ComponentBodies {
+        funcs,
+        periodic_periods,
+        watchdog_clauses,
+    })
+}
+
+/// Lower an `on <N> cycles ... end on` periodic-handler body as a zero-
+/// param `ComponentMethod` (`self` only) and lower its period expression
+/// in the same self-component context. Returns `(body, period_expr)`.
+fn lower_periodic_body(
+    h: &crate::ast::OnHandler,
+    fid: FunctionId,
+    cid: ComponentId,
+    ctx: &LowerCtx,
+    helpers: &helpers::HelperRegistry<'_>,
+    constraint_sites: &std::cell::RefCell<Vec<crate::ir::ConstraintSite>>,
+) -> Result<(TbFunction, crate::ir::Expr), LowerError> {
+    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    b.self_component = Some(cid);
+    // The period is `h.event` in the periodic form (parser stashes the
+    // cycle count there). Lower with `lower_expr` (NOT `_no_ports`): the
+    // period is rendered standalone in the per-instance `_checkers`
+    // closure, not appended to this body, so it must NOT hoist a port
+    // read into a body-only temp local (that local would dangle in the
+    // checker). A field-backed period resolves self-relatively here and
+    // is re-rooted at the instance path at emission. (A DUT port in a
+    // period is unusual but renders inline via `port_read` in the
+    // checker's test scope.)
+    let period = b.lower_expr(&h.event)?;
+    b.lower_block_stmts(&h.body)?;
+    if !b.is_terminated() {
+        b.terminate(Terminator::Return);
+    }
+    let f = b.finish(
+        fid,
+        format!("comp_periodic_{}", fid.0),
+        FunctionKind::ComponentMethod { component: cid },
+        None,
+    )?;
+    Ok((f, period))
+}
+
+/// Lower a `watchdog ... end watchdog` body as a zero-param
+/// `ComponentMethod` (`self` only) and lower its `period`/`max_idle`
+/// clause expressions in the same self-component context. Returns
+/// `(body, period_opt, max_idle_opt)`.
+fn lower_watchdog_body(
+    w: &crate::ast::WatchdogDecl,
+    fid: FunctionId,
+    cid: ComponentId,
+    ctx: &LowerCtx,
+    helpers: &helpers::HelperRegistry<'_>,
+    constraint_sites: &std::cell::RefCell<Vec<crate::ir::ConstraintSite>>,
+) -> Result<(TbFunction, Option<crate::ir::Expr>, Option<crate::ir::Expr>), LowerError> {
+    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    b.self_component = Some(cid);
+    // `lower_expr` (NOT `_no_ports`): period/max_idle render standalone in
+    // the per-instance `_checkers` closure, never appended to this body —
+    // hoisting a port read into a body-only temp would dangle in the
+    // checker. Field reads resolve self-relatively and re-root at the
+    // instance path at emission.
+    let period = match &w.period {
+        Some(e) => Some(b.lower_expr(e)?),
+        None => None,
+    };
+    let max_idle = match &w.max_idle {
+        Some(e) => Some(b.lower_expr(e)?),
+        None => None,
+    };
+    b.lower_block_stmts(&w.body)?;
+    if !b.is_terminated() {
+        b.terminate(Terminator::Return);
+    }
+    let f = b.finish(
+        fid,
+        format!("comp_watchdog_{}", fid.0),
+        FunctionKind::ComponentMethod { component: cid },
+        None,
+    )?;
+    Ok((f, period, max_idle))
 }
 
 /// Lower an `on <event>(arg) ... end on` handler body as a one-param

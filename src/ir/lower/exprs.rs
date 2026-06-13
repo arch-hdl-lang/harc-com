@@ -38,6 +38,13 @@ impl FuncBuilder<'_> {
                 if let Some(local) = self.lookup(&id.name) {
                     return Ok(Expr::Local(local));
                 }
+                // The framework cycle counter (`cycle_count`), conventionally
+                // referenced from `${cycle_count}` in a watchdog/log
+                // diagnostic. A local of the same name shadows it (checked
+                // above). v1 emits the in-scope `cycle_count` variable.
+                if id.name == "cycle_count" {
+                    return Ok(Expr::CycleCount);
+                }
                 // Persistent state field of a bound-to target responder
                 // body — a bare ident (locals shadow, checked above).
                 // `instance` is a placeholder; the test-binding stage
@@ -413,6 +420,8 @@ impl FuncBuilder<'_> {
             other @ (Expr::Literal { .. }
             | Expr::WideLiteral(_)
             | Expr::Local(_)
+            // The global cycle counter — a framework value, no DUT port.
+            | Expr::CycleCount
             | Expr::RecordField { .. }
             | Expr::TbField(_)
             // Transactor-instance state is host state — no DUT port inside.

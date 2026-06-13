@@ -85,7 +85,7 @@ pub(super) fn emit_function(
     depth: usize,
 ) -> Result<(), EmitError> {
     let names = cpp_local_names(func);
-    let cx = ECx { func, names: &names, lanes };
+    let cx = ECx { func, names: &names, lanes, self_subst: None };
     let pad = INDENT.repeat(depth);
     let pad1 = INDENT.repeat(depth + 1);
     let pad2 = INDENT.repeat(depth + 2);
@@ -271,6 +271,7 @@ pub(super) fn emit_tseq(
         func,
         names: &names,
         lanes: &empty_lanes,
+        self_subst: None,
     };
     let nparams = func.params.len();
     let pad = INDENT.repeat(depth);
@@ -415,7 +416,7 @@ pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Resul
     let names = cpp_local_names(func);
     // Pure helpers are scalar-only: no DUT access, so no lane table.
     let empty_lanes = HashMap::new();
-    let cx = ECx { func, names: &names, lanes: &empty_lanes };
+    let cx = ECx { func, names: &names, lanes: &empty_lanes, self_subst: None };
     let nparams = func.params.len();
 
     let ret_ty = if func.ret.is_some() { "uint64_t" } else { "void" };
@@ -927,6 +928,7 @@ pub(super) fn emit_method(
         func,
         names: &names,
         lanes: &empty_lanes,
+        self_subst: None,
     };
     let nparams = func.params.len();
     let pad = INDENT.repeat(depth);
@@ -1063,6 +1065,76 @@ pub(super) fn on_handler_lambda_name(
     format!("{}_on_h{}", comp.name, oh.function.0)
 }
 
+/// Emit one `on <N> cycles` periodic-handler body as a free
+/// `<Comp>_periodic_h<fid>(<Comp>& self)` lambda (zero params besides
+/// `self`), mirroring the on-handler lambda shape.
+pub(super) fn emit_component_periodic_handler(
+    out: &mut String,
+    prog: &TbProgram,
+    comp: &crate::ir::ComponentSchema,
+    ph: &crate::ir::PeriodicHandlerSchema,
+    depth: usize,
+) -> Result<(), EmitError> {
+    let lambda = periodic_handler_lambda_name(comp, ph);
+    emit_component_fn_lambda(out, prog, comp, ph.function, &lambda, depth)
+}
+
+/// The free-lambda name for a periodic handler (`<Comp>_periodic_h<fid>`).
+pub(super) fn periodic_handler_lambda_name(
+    comp: &crate::ir::ComponentSchema,
+    ph: &crate::ir::PeriodicHandlerSchema,
+) -> String {
+    format!("{}_periodic_h{}", comp.name, ph.function.0)
+}
+
+/// Emit a component's `watchdog` body as a free
+/// `<Comp>_watchdog<fid>(<Comp>& self)` lambda (zero params besides
+/// `self`). Only the user body runs here; the idle check + period gating
+/// are emitted in the per-instance `_checkers` closure (see
+/// `mod::emit_lifecycle_checkers`), so a field-backed max_idle/period read
+/// stays self-relative there too.
+pub(super) fn emit_component_watchdog(
+    out: &mut String,
+    prog: &TbProgram,
+    comp: &crate::ir::ComponentSchema,
+    w: &crate::ir::WatchdogSchema,
+    depth: usize,
+) -> Result<(), EmitError> {
+    let lambda = watchdog_lambda_name(comp, w);
+    emit_component_fn_lambda(out, prog, comp, w.function, &lambda, depth)
+}
+
+/// The free-lambda name for a watchdog body (`<Comp>_watchdog<fid>`).
+pub(super) fn watchdog_lambda_name(
+    comp: &crate::ir::ComponentSchema,
+    w: &crate::ir::WatchdogSchema,
+) -> String {
+    format!("{}_watchdog{}", comp.name, w.function.0)
+}
+
+/// Render a watchdog/periodic clause expr (`period` / `max_idle`) for
+/// emission inside a per-instance `_checkers` closure. The clause was
+/// lowered in `function`'s self-component context, so a field read is a
+/// `ComponentField { SelfField }`; `instance` substitutes for `self`
+/// since the closure has no `self` in scope.
+pub(super) fn clause_expr_cpp(
+    prog: &TbProgram,
+    function: crate::ir::FunctionId,
+    instance: &str,
+    e: &Expr,
+) -> Result<String, EmitError> {
+    let func = prog.function(function);
+    let names = cpp_local_names(func);
+    let empty_lanes = HashMap::new();
+    let cx = ECx {
+        func,
+        names: &names,
+        lanes: &empty_lanes,
+        self_subst: Some(instance),
+    };
+    expr_cpp(&cx, e)
+}
+
 /// Shared lambda emission for component methods and on-handlers: a free
 /// `<lambda>(<Comp>& self, args...)` loop-switch over the lowered CFG.
 fn emit_component_fn_lambda(
@@ -1080,6 +1152,7 @@ fn emit_component_fn_lambda(
         func,
         names: &names,
         lanes: &empty_lanes,
+        self_subst: None,
     };
     let nparams = func.params.len();
     let pad = INDENT.repeat(depth);
@@ -1198,7 +1271,7 @@ pub(super) fn emit_target_actor(
         let func = prog.function(tm.function);
         let names = cpp_local_names(func);
         let empty_lanes = HashMap::new();
-        let cx = ECx { func, names: &names, lanes: &empty_lanes };
+        let cx = ECx { func, names: &names, lanes: &empty_lanes, self_subst: None };
         let wire = |sig: &str| format!("dut->{bus_field}_{method}_{sig}");
         let slot_var = format!("_{instance}_{method}_target_slot");
         let trace_event = |out: &mut String, phase: &str, d: usize| {

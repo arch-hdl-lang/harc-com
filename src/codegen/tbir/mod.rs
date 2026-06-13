@@ -264,6 +264,107 @@ fn emit_on_handler_regs(out: &mut String, prog: &TbProgram, component: ir::Compo
     }
 }
 
+/// Default watchdog clause values (spec §8.6), applied when the source
+/// omits the `period`/`max_idle` clause. Mirror v1's
+/// `WATCHDOG_DEFAULT_PERIOD` / `WATCHDOG_DEFAULT_MAX_IDLE`.
+const WATCHDOG_DEFAULT_PERIOD: i64 = 1000;
+const WATCHDOG_DEFAULT_MAX_IDLE: i64 = 10000;
+
+/// Install the `_checkers` closures for a component's `on <N> cycles`
+/// periodic handlers and its `watchdog` (and those of any nested
+/// sub-component), each gated on a per-instance static last-fire stamp.
+/// Mirrors v1's `emit_watchdog_checker` / periodic `_checkers` shape:
+/// every cycle the closure re-reads the period (so a field-backed period
+/// stays test-overridable), fires once it is due, and — for the watchdog
+/// — runs the user body then the idle check.
+fn emit_lifecycle_checkers(
+    out: &mut String,
+    prog: &TbProgram,
+    component: ir::ComponentId,
+    inst_path: &str,
+) -> Result<(), EmitError> {
+    let comp = &prog.components[component.index()];
+    // A valid C++ identifier for the static tag (`env.agent` → `env_agent`).
+    let inst_tag = inst_path.replace('.', "_");
+
+    for ph in &comp.periodic_handlers {
+        let lambda = func::periodic_handler_lambda_name(comp, ph);
+        let period = func::clause_expr_cpp(prog, ph.function, inst_path, &ph.period)?;
+        let tag = format!("_per_{inst_tag}_{}", ph.function.0);
+        writeln!(out, "{INDENT}_checkers.push_back([&]() {{").ok();
+        writeln!(out, "{INDENT}{INDENT}static int64_t {tag}_last = 0;").ok();
+        writeln!(out, "{INDENT}{INDENT}int64_t {tag}_period = (int64_t)({period});").ok();
+        writeln!(
+            out,
+            "{INDENT}{INDENT}if ({tag}_period > 0 && (int64_t)cycle_count - {tag}_last >= {tag}_period) {{"
+        )
+        .ok();
+        writeln!(out, "{INDENT}{INDENT}{INDENT}{tag}_last = (int64_t)cycle_count;").ok();
+        writeln!(out, "{INDENT}{INDENT}{INDENT}{lambda}({inst_path});").ok();
+        writeln!(out, "{INDENT}{INDENT}}}").ok();
+        writeln!(out, "{INDENT}}});").ok();
+    }
+
+    if let Some(w) = &comp.watchdog {
+        let lambda = func::watchdog_lambda_name(comp, w);
+        let period = match &w.period {
+            Some(e) => func::clause_expr_cpp(prog, w.function, inst_path, e)?,
+            None => WATCHDOG_DEFAULT_PERIOD.to_string(),
+        };
+        let max_idle = match &w.max_idle {
+            Some(e) => func::clause_expr_cpp(prog, w.function, inst_path, e)?,
+            None => WATCHDOG_DEFAULT_MAX_IDLE.to_string(),
+        };
+        let tag = format!("_wdog_{inst_tag}_{}", w.function.0);
+        writeln!(out, "{INDENT}_checkers.push_back([&]() {{").ok();
+        writeln!(out, "{INDENT}{INDENT}static int64_t {tag}_last = 0;").ok();
+        writeln!(out, "{INDENT}{INDENT}int64_t {tag}_period = (int64_t)({period});").ok();
+        writeln!(
+            out,
+            "{INDENT}{INDENT}if ({tag}_period > 0 && (int64_t)cycle_count - {tag}_last >= {tag}_period) {{"
+        )
+        .ok();
+        writeln!(out, "{INDENT}{INDENT}{INDENT}{tag}_last = (int64_t)cycle_count;").ok();
+        // 1. User body (typically a heartbeat log).
+        writeln!(out, "{INDENT}{INDENT}{INDENT}{lambda}({inst_path});").ok();
+        // 2. Idle check — trips FAIL when BOTH activity stamps are
+        //    `max_idle` cycles behind. Mirrors v1's emit_watchdog idle
+        //    block (errors++ on trip).
+        writeln!(
+            out,
+            "{INDENT}{INDENT}{INDENT}int64_t {tag}_max_idle = (int64_t)({max_idle});"
+        )
+        .ok();
+        writeln!(
+            out,
+            "{INDENT}{INDENT}{INDENT}if ({tag}_max_idle > 0 \
+             && (int64_t)((uint64_t)cycle_count - {inst_path}._last_in_cycle) >= {tag}_max_idle \
+             && (int64_t)((uint64_t)cycle_count - {inst_path}._last_out_cycle) >= {tag}_max_idle) {{"
+        )
+        .ok();
+        writeln!(
+            out,
+            "{INDENT}{INDENT}{INDENT}{INDENT}sim_log_line(\"FAIL\", \"watchdog: {} has been idle for >= %lld cycles\", (long long){tag}_max_idle);",
+            comp.name
+        )
+        .ok();
+        writeln!(out, "{INDENT}{INDENT}{INDENT}{INDENT}errors++;").ok();
+        writeln!(out, "{INDENT}{INDENT}{INDENT}}}").ok();
+        writeln!(out, "{INDENT}{INDENT}}}").ok();
+        writeln!(out, "{INDENT}}});").ok();
+    }
+
+    // Recurse into by-value sub-components (an env holding an agent that
+    // carries a watchdog / periodic handler).
+    for f in &comp.fields {
+        if let ir::ComponentFieldKind::Sub { component: sub } = &f.kind {
+            let sub_path = format!("{inst_path}.{}", f.name);
+            emit_lifecycle_checkers(out, prog, *sub, &sub_path)?;
+        }
+    }
+    Ok(())
+}
+
 fn emit_test(
     out: &mut String,
     prog: &TbProgram,
@@ -373,6 +474,12 @@ fn emit_test(
         for oh in &comp.on_handlers {
             func::emit_component_on_handler(out, prog, comp, oh, 1)?;
         }
+        for ph in &comp.periodic_handlers {
+            func::emit_component_periodic_handler(out, prog, comp, ph, 1)?;
+        }
+        if let Some(w) = &comp.watchdog {
+            func::emit_component_watchdog(out, prog, comp, w, 1)?;
+        }
     }
     // Composite-component test-scope instances (`let env : AnalysisEnv`):
     // a default-constructed run-scope local, then its env `connect`
@@ -406,6 +513,9 @@ fn emit_test(
         // `_last_in_cycle` activity stamp, then runs the handler body —
         // mirroring v1's `on`-subscriber registration.
         emit_on_handler_regs(out, prog, cf.component, &cf.field);
+        // `on <N> cycles` periodic + `watchdog` lifecycle `_checkers`
+        // closures, for this component and any nested sub-components.
+        emit_lifecycle_checkers(out, prog, cf.component, &cf.field)?;
     }
 
     writeln!(out, "{INDENT}harc_rt::ThreadSlot _run_slot;").ok();
