@@ -689,6 +689,97 @@ end test ReinitTest
     );
 }
 
+/// A `struct` declaration lowers into the same records table as a
+/// transaction — a `let s : S` default-constructs and `s.field`
+/// reads/writes reuse the record machinery (no struct-specific IR).
+#[test]
+fn struct_lowers_as_value_record() {
+    let src = r#"
+struct Pkt
+    flag  : bool    default true
+    count : uint<16> default 7
+    spare : uint<8>
+end struct Pkt
+
+test StructTest
+    let dut : Top
+    run
+        let p : Pkt
+        p.count = p.count + 1
+        assert p.flag else fail("flag")
+    end run
+end test StructTest
+"#;
+    let prog = lower_src(src).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    // One record schema, fields in declaration order with defaults.
+    assert_eq!(prog.records.len(), 1, "struct → one record schema");
+    let rec = &prog.records[0];
+    assert_eq!(rec.name, "Pkt");
+    assert_eq!(rec.fields.len(), 3, "fields not double-counted from body");
+    assert_eq!(rec.fields[0].default, Some(1), "bool true → 1");
+    assert_eq!(rec.fields[1].default, Some(7));
+    assert_eq!(rec.fields[2].default, None, "undefaulted field re-zeroes");
+    // The body carries RecordInit + a RecordFieldWrite for `p.count`.
+    let run = prog.function(prog.tests[0].run);
+    assert!(
+        run.blocks
+            .iter()
+            .any(|b| b.stmts.iter().any(|s| matches!(s, ir::Stmt::RecordInit(..)))),
+        "struct local default-constructs via RecordInit:\n{run}"
+    );
+}
+
+/// A non-scalar struct field (here a `Vec`) is out of the scalar-only
+/// subset: rejected at the field, never mis-lowered. (This is the
+/// residual blocker for the `tlm_pairing_arch_burst_*` fixtures.)
+#[test]
+fn struct_non_scalar_field_is_rejected() {
+    let src = r#"
+struct Resp
+    data : Vec<uint<32>, 4>
+end struct Resp
+
+test StructVecTest
+    let dut : Top
+    run
+        let r : Resp
+    end run
+end test StructVecTest
+"#;
+    let err = lower_src(src).expect_err("Vec field must be rejected");
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("struct field"), "names the field: {msg}");
+    assert!(msg.contains("non-scalar"), "names the reason: {msg}");
+}
+
+/// A `struct` and a `transaction` sharing a name would resolve
+/// ambiguously through `record_ids`; reject the collision.
+#[test]
+fn struct_name_collides_with_transaction() {
+    let src = r#"
+transaction Dup
+    a : uint<8>
+end transaction Dup
+
+struct Dup
+    b : uint<8>
+end struct Dup
+
+test C
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test C
+"#;
+    let err = lower_src(src).expect_err("name collision must be rejected");
+    assert!(
+        format!("{err}").contains("collides"),
+        "names the collision: {err}"
+    );
+}
+
 /// A DUT read in a record-field-write value hoists through a DutRead
 /// temp — same no-inline-ports discipline as `Assign`.
 #[test]

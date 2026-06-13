@@ -263,16 +263,45 @@ will clear when those land. As predicted in the suggested-sequencing
 note, scoreboard alone unlocks no corpus fixture because every one is a
 full env/agent/sequencer stack.
 
-### `struct` construct — 4 fixtures
+### `struct` construct — 4 fixtures — **RESOLVED 2026-06-12 (struct slice)**
 
-> TB-IR lowering does not support the `struct` construct yet
+> ~~TB-IR lowering does not support the `struct` construct yet~~
 
-`post_eval_provider_test`, `scoreboard_typed_queue_test`,
-`tlm_pairing_arch_burst_target_test`,
-`tlm_pairing_arch_burst_initiator_test`
+The struct slice landed the **shared value-record subset**: a `struct`
+lowers into the same `TbProgram::records` table (`RecordSchema`) a
+`transaction` uses — v1's `emit_struct_record` already routes through
+the same `emit_record_struct` — so it reuses every record-local op
+(`RecordInit` / `RecordFieldWrite` / `Expr::RecordField`) with **no new
+IR variants** (field lowering shared via `lower_record_field`). See
+docs/tbir-mvp.md (the `struct` construct subset note).
 
-(The two `tlm_pairing_arch_burst_*` fixtures hit `struct` before `bus`;
-both constructs are needed.)
+**First-blocker caveat applied in full.** With the struct gate lifted,
+**zero** of the four corpus fixtures became fully lowerable — every one
+stacks a further already-rejected blocker behind its `struct` decl
+(confirmed by re-running `harc dump-ir`). Two of them
+(`post_eval_provider_test`, `scoreboard_typed_queue_test`) never even
+reached the struct gate — their scoreboard internals reject earlier in
+the pipeline. The slice therefore added a self-proving fixture,
+`struct_basic_test` (scalar fields + literal defaults, default-construct
+in a loop, field reads/writes in arithmetic / branch / assert / format
+args, against the `Top` counter DUT), registered in the equivalence
+registry (`top_counter.sv`, pass).
+
+Residual first-blocker map (re-run of `harc dump-ir`, 2026-06-12 — each
+fixture now stops at its REAL next blocker):
+
+| Next blocker | Fixtures |
+|---|---|
+| scoreboard **methods** (`observe`; per-instance state materialization — out of the data-only scoreboard subset) | `post_eval_provider_test` (also needs transactor state fields, transactor-typed transactor/scoreboard fields, and `on ... phase post_eval` event handlers) |
+| `queue<Struct>` element type (record-payload-in-queue seam) | `scoreboard_typed_queue_test` (also needs scoreboard methods + transactor `on ... phase` handlers) |
+| non-scalar struct field (`data : Vec<uint<32>, 4>`) | `tlm_pairing_arch_burst_target_test`, `tlm_pairing_arch_burst_initiator_test` (both also need the bus-bound / struct-returning `tlm_method` path: target-TLM `thread bus.method` and named struct-field `recv()` capture / `rsp.data[i]`) |
+
+All four residuals belong to other slices — the data-only-scoreboard
+owner (methods + `queue<Struct>`), the record-payload-in-queue seam, and
+the target-TLM / non-scalar-record-field seam (`Vec`-typed struct
+fields + struct-returning `tlm_method`). As predicted in the
+suggested-sequencing note, `struct` alone unlocks no corpus fixture
+because each one is a deeper construct stack.
 
 ### Probe declarations on `let dut` — 3 fixtures
 
@@ -384,7 +413,12 @@ no schema v4 needed.
    format: together they unlock the synchronizer/multi-clock family
    (incl. the schema-blocked `synchronizer_basic_test`).~~ **DONE
    2026-06-12** — all six fixtures registered.
-4. **`struct`** (4, two of which also need `bus`).
+4. ~~**`struct`** (4, two of which also need `bus`).~~ **LANDED
+   2026-06-12** — shared value-record subset (reuses the transaction
+   record machinery; no new IR variants); self-proving
+   `struct_basic_test` registered. No corpus fixture unlocked fully
+   (each stacks scoreboard methods / `queue<Struct>` / non-scalar
+   `Vec` struct fields + target-TLM); see the `struct` group above.
    - ~~**`scoreboard`** (data-only host-state subset)~~ **LANDED
      2026-06-12** — `ScoreboardSchema` + `Stmt::ScoreboardOp` +
      `Expr::ScoreboardQuery`; self-proving `scoreboard_basic_test`

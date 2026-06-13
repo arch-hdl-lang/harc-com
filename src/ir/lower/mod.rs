@@ -203,6 +203,26 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             record_schemas.push(schema);
         }
     }
+    // `struct` declarations lower into the SAME records table — a struct is
+    // the shared value-record shape (v1's `emit_struct_record` routes
+    // through `emit_record_struct`, exactly as transactions do), so a
+    // `let r : S` resolves `S` via `record_ids` and every record-local op
+    // (`RecordInit` / `RecordFieldWrite` / `Expr::RecordField`) works for
+    // free. A name shared with a transaction would resolve ambiguously, so
+    // reject the collision rather than shadow.
+    for it in &file.items {
+        if let Item::Struct(s) = it {
+            let name = &s.name.name;
+            if record_ids.contains_key(name) {
+                return Err(LowerError::Invalid(format!(
+                    "struct `{name}` collides with a transaction or struct of the same name"
+                )));
+            }
+            let schema = records::lower_struct(s, &enum_names)?;
+            record_ids.insert(name.clone(), RecordId(record_schemas.len() as u32));
+            record_schemas.push(schema);
+        }
+    }
     // Regblock schemas (`regblock` declarations), in file order. The
     // mirror is a synthetic value-record (one scalar field per
     // register), pushed into the records table right after the
@@ -218,7 +238,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             let name = &r.name.name;
             if record_ids.contains_key(name) {
                 return Err(LowerError::Invalid(format!(
-                    "regblock `{name}` collides with a transaction of the same name"
+                    "regblock `{name}` collides with a transaction or struct of the same name"
                 )));
             }
             let rec_id = RecordId(record_schemas.len() as u32);
@@ -288,6 +308,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             | Item::Transaction(_)
             | Item::Const(_)
             | Item::Enum(_)
+            // Struct declarations already lowered to record schemas above
+            // (with their own Unsupported rejections); inert here.
+            | Item::Struct(_)
             | Item::Bus(_)
             | Item::Transactor(_)
             // Scoreboard declarations already lowered to schemas above

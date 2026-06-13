@@ -151,7 +151,29 @@ method-bearing scoreboard is rejected at the declaration (not silently
 dropped). Event-driven `on`/`connect` wiring and non-scalar
 (`queue<Struct>`, >64-bit) field types are likewise rejected at the
 field/site — those gate on the agent/env/event slices and the
-record-payload-in-queue seam respectively. Everything else —
+record-payload-in-queue seam respectively.
+The `struct` construct subset (added 2026-06-12,
+`src/ir/lower/records.rs`): a `struct` is the **shared value-record
+shape** — v1's `emit_struct_record` routes through the same
+`emit_record_struct` a `transaction` uses, so a struct lowers into the
+SAME `TbProgram::records` table (`RecordSchema`) and reuses every
+record-local operation with **no new IR variants**: `let s : S`
+default-constructs (`Stmt::RecordInit`), `s.field = v` writes
+(`Stmt::RecordFieldWrite`), and `s.field` reads (`Expr::RecordField`)
+work everywhere a transaction local does. Field lowering (scalar
+uint/sint/bits/bool/bit ≤ 64 bits, literal defaults, inert `with [...]`
+attribute text, enum-typed fields as scalar variant indices) is shared
+with transactions (`lower_record_field`). The parser fills
+`StructDecl::fields` as a filtered copy of the `Field` items in
+`StructDecl::body`, so lowering reads `fields` only (matching v1) and
+scans the body solely to reject non-field items. A name shared with a
+transaction, struct, or regblock resolves ambiguously through
+`record_ids`, so the collision is rejected, not shadowed. Out of subset
+and rejected at the field/decl, never mis-lowered: non-scalar /
+>64-bit fields (`Vec<...>`, nested structs — the residual blocker for
+the `tlm_pairing_arch_burst_*` fixtures), non-literal defaults, and
+`keep`/`when` items in a struct body (constraint / tagged-ADT
+machinery deferred with `randomize`). Everything else —
 `randomize` (awaits the constraint-IR `ConstraintRef` seam),
 `agent`/`event`, bus-bound/event-driven transactors, transactor state
 fields, passive instances, scoreboard *methods* / event-driven
@@ -204,6 +226,7 @@ none — `extra_harc` joins additional `tests/fixtures/` files to the
 | `buf_mgr_test` | `BufMgr` | `buf_mgr.sv` + 4 | pass | transactor: `while` over port read, `return dut.port`, assert in method |
 | `scoreboard_basic_test` | `Top` | `top_counter.sv` | pass | scoreboard: queue push/pop/size/empty, scalar counter read/write, run↔check-shared `_tb` instance |
 | `regblock_subset_test` | `Top` | `top_counter.sv` | pass | regblock: rw/ro/wo + reset, register-level frontdoor (mirror + Helper.write/read call edges), read-predict, WO mirror-read, test-scope-let helper |
+| `struct_basic_test` | `Top` | `top_counter.sv` | pass | struct: scalar fields (uint/sint/bool) + literal defaults, default-construct in a loop (re-init), field reads/writes in arithmetic/branch/assert/format args (reuses the transaction record machinery) |
 
 (The registry has since grown past this table via the backfill sweep —
 see [tbir-coverage.md](tbir-coverage.md); the registry file is the

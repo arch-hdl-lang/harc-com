@@ -1,0 +1,87 @@
+// `struct` value-records — the fixture behind the TB-IR backend's
+// struct lowering (spec §3, structural shape only). A `struct` is the
+// shared value-record shape (v1's `emit_struct_record` routes through
+// the same `emit_record_struct` a transaction uses), so it lowers into
+// the same records table and reuses every record-local operation
+// (default-construct, field write, field read). Exercises, against the
+// counter DUT (`Top` from top_counter_test):
+//
+//   1. Declaration: scalar fields (uint/sint/bool/bits) with literal
+//      defaults, and an undefaulted field (re-zeroed each construction).
+//   2. Construction: `let s : CountPlan` default-constructs at the let
+//      site, INSIDE a loop — field defaults must re-run on every
+//      iteration (v1 declares the struct at the source position).
+//   3. Field writes from literals, locals, and other fields; field
+//      reads in arithmetic, branch conditions, assert conditions, loop
+//      bounds, and log/fail format args.
+//
+// Uses only the v1-supported surface, so the same file passes under
+// `--codegen v1` and `--codegen tbir`; the equivalence harness
+// trace-diffs the two.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+struct CountPlan
+    ticks   : uint<8>  default 2
+    enabled : bool     default true
+    bias    : sint<8>  default 0
+    expect  : uint<32>
+end struct CountPlan
+
+testbench StructBasicTb
+    dut : Top
+end testbench StructBasicTb
+
+impl StructBasicTest for StructBasicTb
+    clock clk = SysDomain        // 100 MHz
+
+    run
+        // Reset for 3 cycles.
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        assert dut.count_out == 0
+            else fail("after reset: count_out=${dut.count_out}, expected 0")
+        dut.rst = 0
+
+        // Three plans; each enables the counter for plan.ticks cycles
+        // (2, 3, 4) and checks the running total.
+        let total = 0
+        for i in 0 .. 3
+            let plan : CountPlan
+            assert plan.ticks == 2
+                else fail("plan[${i}]: default ticks=${plan.ticks}, expected 2")
+            assert plan.enabled
+                else fail("plan[${i}]: default enabled false")
+            assert plan.expect == 0
+                else fail("plan[${i}]: expect not re-zeroed (${plan.expect})")
+
+            plan.ticks = plan.ticks + i        // 2, 3, 4
+            total = total + plan.ticks
+            plan.expect = total
+
+            if plan.enabled
+                dut.en = 1
+            end if
+            for _ in 0 .. plan.ticks
+                wait 1 cycle
+            end for
+
+            let got = dut.count_out
+            assert got == plan.expect
+                else fail("plan[${i}]: count_out=${got}, expected ${plan.expect}")
+            log(info, "plan[${i}] ticks=${plan.ticks} bias=${plan.bias} -> count_out=${got}")
+        end for
+
+        // Hold: en=0 → count must stay at the last expectation.
+        dut.en = 0
+        let final_plan : CountPlan
+        final_plan.expect = total
+        wait 2 cycles
+        assert dut.count_out == final_plan.expect
+            else fail("hold: count_out=${dut.count_out}, expected ${final_plan.expect}")
+        log(info, "PASS: 3 plans, total=${final_plan.expect}")
+    end run
+end impl StructBasicTest

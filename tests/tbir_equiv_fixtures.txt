@@ -93,3 +93,4 @@ testbench_lifecycle_test | Top | top_counter.sv | - | pass | - | - | LifecycleBu
 testbench_lifecycle_test | Top | top_counter.sv | - | pass | - | - | LifecycleBumpFive
 scoreboard_basic_test | Top | top_counter.sv | - | pass
 regblock_subset_test | Top | top_counter.sv | - | pass
+struct_basic_test | Top | top_counter.sv | - | pass
