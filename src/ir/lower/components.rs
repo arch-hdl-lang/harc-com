@@ -41,26 +41,73 @@ pub(crate) fn scoreboard_is_component(c: &ComponentDecl) -> bool {
         .any(|it| matches!(it, ComponentItem::Hookable(_)))
 }
 
-/// True when a `transactor` declaration is a pure analysis source: it
-/// has at least one `out event<T>` field and NO module-typed DUT field.
-/// (A DUT-poking BFM has exactly one module-typed field and no event
-/// port; a `bound to` target responder is excluded too.)
+/// True when a `transactor` declaration routes to the composite-component
+/// table rather than the DUT-poking `TransactorSchema`. Two shapes:
+///   * pure analysis source — at least one `event<T>` field and NO
+///     module-typed DUT field (`out event<T>` ports + emit-only methods);
+///   * event-driven (consumer-side) transactor — an `in event<T>` field
+///     with a matching `on <ev>(t)` handler, optionally plus a single
+///     module-typed DUT field the handler pokes. This is the unbound
+///     consumer BFM: `emit drv.req(t)` (or a `connect` bridge) fires the
+///     handler synchronously, which drives the DUT.
+/// A `bound to` target responder is excluded (separate TLM path).
 pub(crate) fn transactor_is_component(t: &TransactorDecl) -> bool {
     if t.bound_to.is_some() {
         return false;
     }
     let mut has_event = false;
+    let mut has_in_event = false;
+    let mut has_on_handler = false;
     let mut has_module_field = false;
     for it in t.items.iter().chain(t.when_active.iter().flatten()) {
-        if let ComponentItem::Field(f) = it {
-            if is_event_field(f) {
-                has_event = true;
-            } else if matches!(&f.ty, TypeExpr::Named { .. }) {
-                has_module_field = true;
+        match it {
+            ComponentItem::Field(f) => {
+                if is_event_field(f) {
+                    has_event = true;
+                    if matches!(f.direction, Some(crate::ast::Direction::In)) {
+                        has_in_event = true;
+                    }
+                } else if matches!(&f.ty, TypeExpr::Named { .. }) {
+                    has_module_field = true;
+                }
             }
+            ComponentItem::OnHandler(h) if !h.periodic => has_on_handler = true,
+            _ => {}
         }
     }
-    has_event && !has_module_field
+    // Pure analysis source: events, no DUT.
+    if has_event && !has_module_field {
+        return true;
+    }
+    // Event-driven consumer transactor: an `in event` + a subscribing
+    // `on` handler (the DUT field, if any, is the handler's poke target).
+    has_in_event && has_on_handler
+}
+
+/// True when a transactor is an *event-driven consumer* — it has an
+/// `in event<T>` field and a subscribing `on <ev>` handler. These accept
+/// an `active`/`passive` instance mode (a transactor concept) even though
+/// they route to the composite-component table; a pure analysis source
+/// (out-event only, no DUT, no `on`) does not.
+pub(crate) fn transactor_is_event_driven(t: &TransactorDecl) -> bool {
+    if t.bound_to.is_some() {
+        return false;
+    }
+    let mut has_in_event = false;
+    let mut has_on_handler = false;
+    for it in t.items.iter().chain(t.when_active.iter().flatten()) {
+        match it {
+            ComponentItem::Field(f)
+                if is_event_field(f)
+                    && matches!(f.direction, Some(crate::ast::Direction::In)) =>
+            {
+                has_in_event = true;
+            }
+            ComponentItem::OnHandler(h) if !h.periodic => has_on_handler = true,
+            _ => {}
+        }
+    }
+    has_in_event && has_on_handler
 }
 
 fn is_event_field(f: &ComponentField) -> bool {
@@ -153,10 +200,15 @@ pub(crate) fn lower_component_schema(
     let mut periodic_asts: Vec<&crate::ast::OnHandler> = Vec::new();
     // At most one `watchdog` per component (the second is rejected).
     let mut watchdog_ast: Option<&crate::ast::WatchdogDecl> = None;
+    // An event-driven transactor may carry a module-typed DUT handle field
+    // (`dut : AxiLiteRegs`); a Named non-component type is then a DUT
+    // pointer rather than an unknown sub-component. Only transactors host
+    // a DUT field — env/scoreboard/agent/sequencer never do.
+    let is_transactor = matches!(src, CompSource::Transactor(_));
     for it in items.iter().chain(when_active.into_iter().flatten()) {
         match it {
             ComponentItem::Field(f) => {
-                let fk = lower_field(name, f, ids, record_ids)?;
+                let fk = lower_field(name, f, ids, record_ids, is_transactor)?;
                 if fields.iter().any(|x| x.name == f.name.name) {
                     return Err(LowerError::Invalid(format!(
                         "component `{name}` declares field `{}` more than once",
@@ -202,6 +254,35 @@ pub(crate) fn lower_component_schema(
                     "",
                 ));
             }
+        }
+    }
+
+    // An event-driven transactor pokes its DUT through the `on`-handler
+    // body's `ctx.dut_field` (conventionally `dut`). The handler body
+    // ctx hardwires that name, so a DUT field must be named `dut` and
+    // there can be at most one — anything else would silently fail to
+    // lower a `<field>.<sig>` access as a DUT port write.
+    let dut_fields: Vec<&str> = fields
+        .iter()
+        .filter(|f| matches!(f.kind, ComponentFieldKind::Dut { .. }))
+        .map(|f| f.name.as_str())
+        .collect();
+    if dut_fields.len() > 1 {
+        return Err(unsupported(
+            &format!(
+                "an event-driven transactor `{name}` with more than one DUT handle field \
+                 ({})",
+                dut_fields.join(", ")
+            ),
+            "the consumer BFM drives exactly one DUT instance",
+        ));
+    }
+    if let Some(&df) = dut_fields.first() {
+        if df != "dut" {
+            return Err(unsupported(
+                &format!("an event-driven transactor DUT handle field named `{df}`"),
+                "name the DUT handle `dut` (the handler body resolves DUT pokes through it)",
+            ));
         }
     }
 
@@ -353,6 +434,7 @@ fn lower_field(
     f: &ComponentField,
     ids: &HashMap<String, ComponentId>,
     record_ids: &HashMap<String, RecordId>,
+    is_transactor: bool,
 ) -> Result<ComponentFieldKind, LowerError> {
     let fname = &f.name.name;
     if f.bound_to.is_some() {
@@ -362,20 +444,34 @@ fn lower_field(
         ));
     }
     match &f.ty {
-        // `observed : out event<T>` analysis port, or a directionless
-        // `in_ev : event<T>` agent self-event (subscribed via `on`).
-        // Both lower to a `std::vector<std::function<void(T)>>` callback
-        // list. An `in`/`inout` event is a bus/driver form (out of subset).
+        // `observed : out event<T>` analysis port, a directionless
+        // `in_ev : event<T>` agent self-event, or an `in event<T>` input
+        // pipe on an event-driven transactor (subscribed via `on`). All
+        // lower to the same `std::vector<std::function<void(T)>>` callback
+        // list — direction is a source-level role marker (producer vs
+        // consumer), not a distinct runtime shape: the consumer's `on`
+        // handler registers a subscriber, and an `emit`/`connect` bridge
+        // fans out over that same list. An `inout` event remains out of
+        // subset. An `in event` is accepted only on a transactor (the
+        // consumer-BFM form); on an env/scoreboard/agent/sequencer it is
+        // still rejected.
         TypeExpr::Builtin {
             name: BuiltinTy::Event,
             args,
             ..
         } => {
-            if matches!(f.direction, Some(Direction::In) | Some(Direction::InOut)) {
+            if matches!(f.direction, Some(Direction::InOut)) {
                 return Err(unsupported(
-                    &format!("an `in`/`inout` event field `{comp}.{fname}`"),
-                    "only `out event<T>` analysis ports and directionless agent \
-                     self-events are lowered",
+                    &format!("an `inout` event field `{comp}.{fname}`"),
+                    "only `out event<T>` analysis ports, directionless agent \
+                     self-events, and `in event<T>` transactor input pipes are lowered",
+                ));
+            }
+            if matches!(f.direction, Some(Direction::In)) && !is_transactor {
+                return Err(unsupported(
+                    &format!("an `in` event field `{comp}.{fname}`"),
+                    "an `in event<T>` input pipe is only lowered on an event-driven \
+                     transactor (consumer BFM); use a directionless self-event elsewhere",
                 ));
             }
             let payload = lower_event_payload(comp, fname, args.first(), record_ids)?;
@@ -427,14 +523,36 @@ fn lower_field(
             Ok(ComponentFieldKind::Scalar { ty, default })
         }
         TypeExpr::Named { name, .. } => {
+            if f.direction.is_some() {
+                return Err(unsupported(
+                    &format!("a directional named-type field `{comp}.{fname}`"),
+                    "",
+                ));
+            }
             let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
-            let cid = *ids.get(simple).ok_or_else(|| {
-                unsupported(
-                    &format!("sub-component field `{comp}.{fname}` of type `{simple}`"),
-                    "only env/method-scoreboard/analysis-source sub-components are lowered",
-                )
-            })?;
-            Ok(ComponentFieldKind::Sub { component: cid })
+            // A known component type is a nested sub-component (`source :
+            // AnalysisSource`); anything else, on a transactor, is the
+            // module-typed DUT handle (`dut : AxiLiteRegs`) the `on`
+            // handler pokes. On a non-transactor an unknown named type is
+            // an unsupported sub-component (unchanged).
+            if let Some(cid) = ids.get(simple) {
+                return Ok(ComponentFieldKind::Sub { component: *cid });
+            }
+            if is_transactor {
+                if f.default.is_some() {
+                    return Err(unsupported(
+                        &format!("a default value on DUT-handle field `{comp}.{fname}`"),
+                        "the DUT handle is bound by the test (`<inst>.<dut> = dut`)",
+                    ));
+                }
+                return Ok(ComponentFieldKind::Dut {
+                    dut_type: simple.to_string(),
+                });
+            }
+            Err(unsupported(
+                &format!("sub-component field `{comp}.{fname}` of type `{simple}`"),
+                "only env/method-scoreboard/analysis-source sub-components are lowered",
+            ))
         }
     }
 }
@@ -784,8 +902,8 @@ fn resolve_one_connect(
             "",
         ));
     }
-    let (sink_path, sink_method) = to.split_at(to.len() - 1);
-    let sink_method = sink_method[0].clone();
+    let (sink_path, sink_name) = to.split_at(to.len() - 1);
+    let sink_name = sink_name[0].clone();
 
     // Resolve the source sub-component and verify it exposes `src_event`.
     let src_cid = resolve_sub_path(env_schema, components, src_path)?;
@@ -806,34 +924,44 @@ fn resolve_one_connect(
         }
     }
 
-    // Resolve the sink sub-component and verify it exposes the method.
+    // Resolve the sink sub-component. The final segment is either a
+    // hookable sink method (`sb.write_obs`) or an `in event<T>` field on
+    // an event-driven transactor (`drv.req`); pick the matching sink shape.
     let sink_cid = resolve_sub_path(env_schema, components, sink_path)?;
     let sink_comp = &components[sink_cid.index()];
-    let sm = sink_comp.method(&sink_method).ok_or_else(|| {
-        unsupported(
+    let sink = if let Some(sm) = sink_comp.method(&sink_name) {
+        if sm.n_params != 1 {
+            return Err(unsupported(
+                &format!(
+                    "a `connect` sink method `{sink_name}` with {} parameters",
+                    sm.n_params
+                ),
+                "analysis sinks take exactly one payload parameter",
+            ));
+        }
+        crate::ir::ConnectSink::Method { method: sink_name }
+    } else if matches!(
+        sink_comp.field(&sink_name).map(|f| &f.kind),
+        Some(ComponentFieldKind::Event { .. })
+    ) {
+        crate::ir::ConnectSink::Event { event: sink_name }
+    } else {
+        return Err(unsupported(
             &format!(
-                "a `connect` sink method `{}.{sink_method}` that does not exist",
+                "a `connect` sink `{}.{sink_name}` that is neither a sink method nor an \
+                 `event` field",
                 sink_path.join(".")
             ),
             "",
-        )
-    })?;
-    if sm.n_params != 1 {
-        return Err(unsupported(
-            &format!(
-                "a `connect` sink method `{sink_method}` with {} parameters",
-                sm.n_params
-            ),
-            "analysis sinks take exactly one payload parameter",
         ));
-    }
+    };
 
     Ok(ConnectEdgeSchema {
         src_path: src_path.to_vec(),
         src_event,
         sink_path: sink_path.to_vec(),
         sink_component: sink_cid,
-        sink_method,
+        sink,
     })
 }
 
@@ -1101,6 +1229,54 @@ impl super::FuncBuilder<'_> {
     /// `count` (self-relative, inside a method body) or a dotted path
     /// `env.sb.errors` (test scope). Returns `(base, field)` when it
     /// resolves to a scalar field of a component.
+    /// `<inst>.dut = dut` / `env.<drv>.dut = dut` — bind an event-driven
+    /// transactor component's `Dut` handle field to the test DUT. Erased
+    /// (returns `true` when consumed): the on-handler body's `DutWrite`s
+    /// resolve directly to the test's `dut`, so no IR is emitted. Rejects
+    /// a bind of a `Dut` field to anything other than the test DUT.
+    pub(crate) fn lower_component_dut_bind(
+        &self,
+        target: &AstExpr,
+        value: &AstExpr,
+    ) -> Result<bool, LowerError> {
+        let Some(path) = dotted_path(target) else {
+            return Ok(false);
+        };
+        let path = self.strip_tb_prefix(&path);
+        if path.len() < 2 {
+            return Ok(false);
+        }
+        let Some(&head_cid) = self.ctx.component_fields.get(&path[0]) else {
+            return Ok(false);
+        };
+        let (recv, field) = path.split_at(path.len() - 1);
+        let field = &field[0];
+        let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
+        let comp = &self.ctx.components[cid.index()];
+        if !matches!(
+            comp.field(field).map(|f| &f.kind),
+            Some(ComponentFieldKind::Dut { .. })
+        ) {
+            return Ok(false);
+        }
+        // RHS must be the test DUT.
+        let is_dut = match &*value.kind {
+            ExprKind::Ident(id) => self.is_dut_name(&id.name),
+            _ => false,
+        };
+        if !is_dut {
+            return Err(unsupported(
+                &format!(
+                    "binding event-driven transactor DUT handle `{}` to something other \
+                     than the test DUT",
+                    path.join(".")
+                ),
+                "",
+            ));
+        }
+        Ok(true)
+    }
+
     pub(crate) fn as_component_field_target(
         &self,
         target: &AstExpr,

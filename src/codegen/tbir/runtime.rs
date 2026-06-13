@@ -221,6 +221,13 @@ pub(super) fn component_struct(
                 let cname = &components[component.index()].name;
                 writeln!(out, "{INDENT}{cname} {};", f.name).ok();
             }
+            ComponentFieldKind::Dut { dut_type } => {
+                // The DUT handle on an event-driven transactor: a Verilator
+                // instance pointer the test binds (`drv.dut = dut`) and the
+                // `on <ev>` handler pokes through. Matches v1's
+                // `V<dut_type>* dut = nullptr;`.
+                writeln!(out, "{INDENT}V{dut_type}* {} = nullptr;", f.name).ok();
+            }
         }
     }
     // v1's activity-tracking heartbeat stamps (read by idle predicates,

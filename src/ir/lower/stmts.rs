@@ -503,6 +503,16 @@ impl FuncBuilder<'_> {
             self.push(Stmt::TransactorStateWrite { instance, field, value: e });
             return Ok(());
         }
+        // Event-driven transactor DUT bind (`drv.dut = dut` /
+        // `env.drv.dut = dut`): the component's `Dut` handle field is bound
+        // to the test DUT. Erased like the `TransactorSchema` DUT bind —
+        // the on-handler body's `DutWrite`s already resolve to the test's
+        // `dut` pointer (tbir's `port_signal` emits `dut->...`), so the
+        // copy is cosmetic; v1 emits `_tb.drv.dut = dut;` with no
+        // observable effect on a well-formed program.
+        if self.lower_component_dut_bind(target, value)? {
+            return Ok(());
+        }
         // Composite-component scalar field write — self-relative inside a
         // method body (`count = ...`) or a dotted path from a test-scope
         // component local (`env.sb.errors = ...`).

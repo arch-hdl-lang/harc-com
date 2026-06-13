@@ -1,5 +1,0 @@
----
-source: tests/tbir.rs
-expression: msg
----
-TB-IR lowering does not support transactor `SeqXactor` event/directional field `req` yet (event-driven transactors await the event slice); re-run with `--codegen v1`

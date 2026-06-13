@@ -511,13 +511,30 @@ fn emit_test(
                 .chain(edge.sink_path.iter().cloned())
                 .collect::<Vec<_>>()
                 .join(".");
-            let sink_comp = &prog.components[edge.sink_component.index()].name;
-            writeln!(
-                out,
-                "{INDENT}{src}.{}.push_back([&](auto _t) {{ {sink_comp}_{}({sink}, _t); }});",
-                edge.src_event, edge.sink_method
-            )
-            .ok();
+            match &edge.sink {
+                ir::ConnectSink::Method { method } => {
+                    let sink_comp = &prog.components[edge.sink_component.index()].name;
+                    writeln!(
+                        out,
+                        "{INDENT}{src}.{}.push_back([&](auto _t) {{ {sink_comp}_{method}({sink}, _t); }});",
+                        edge.src_event
+                    )
+                    .ok();
+                }
+                ir::ConnectSink::Event { event } => {
+                    // event→event bridge: forward each emit on the source
+                    // event into the sink event's own subscriber list,
+                    // firing the sink driver's registered `on <ev>`
+                    // handler(s). Mirrors v1's `for (auto& _s :
+                    // <sink>.<event>) _s(_t);` bridge closure.
+                    writeln!(
+                        out,
+                        "{INDENT}{src}.{}.push_back([&](auto _t) {{ for (auto& _s : {sink}.{event}) _s(_t); }});",
+                        edge.src_event
+                    )
+                    .ok();
+                }
+            }
         }
         // `on <ev>(arg)` handler registrations, for this component and any
         // nested sub-components (an env holding an agent). Each subscribes

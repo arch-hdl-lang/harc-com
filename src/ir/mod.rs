@@ -551,6 +551,12 @@ pub enum ComponentFieldKind {
     /// by-value sub-component. `component` indexes
     /// `TbProgram::components`.
     Sub { component: ComponentId },
+    /// `dut : AxiLiteRegs` — the module-typed DUT handle field on an
+    /// event-driven transactor (consumer side). Lowers to a
+    /// `V<dut_type>* <name> = nullptr;` pointer member; the test binds it
+    /// (`drv.dut = dut`) and the `on <ev>` handler body pokes DUT signals
+    /// through it. `dut_type` is the SV module name (e.g. `AxiLiteRegs`).
+    Dut { dut_type: String },
 }
 
 /// The payload carried by an `event<T>` analysis port (and the matching
@@ -599,10 +605,15 @@ pub struct OnHandlerSchema {
     pub function: FunctionId,
 }
 
-/// One `connect <src>.<event> -> <sink>.<method>` edge inside an env,
-/// resolved to the paths the test uses to reach the sub-components.
-/// Emission produces `<env>.<src_path>.<event>.push_back([&](auto _t){
-/// <SinkComp>_<method>(<env>.<sink_path>, _t); })` at env construction.
+/// One `connect <src>.<event> -> <sink>.<method|event>` edge inside an
+/// env, resolved to the paths the test uses to reach the sub-components.
+/// Two sink shapes (see `ConnectSink`):
+///   * method sink — `<env>.<src_path>.<event>.push_back([&](auto _t){
+///     <SinkComp>_<method>(<env>.<sink_path>, _t); })`
+///   * event sink — `<env>.<src_path>.<event>.push_back([&](auto _t){
+///     for (auto& _s : <env>.<sink_path>.<event>) _s(_t); })` (forwards
+///     into the sink event field's own subscriber list, i.e. an
+///     event→event bridge feeding a driver's `in event` handler).
 #[derive(Debug, Clone)]
 pub struct ConnectEdgeSchema {
     /// Dotted path from the env-bound test field to the source sub-
@@ -614,8 +625,21 @@ pub struct ConnectEdgeSchema {
     pub sink_path: Vec<String>,
     /// Sink sub-component's component schema (to name `<Comp>_<method>`).
     pub sink_component: ComponentId,
-    /// Sink method name.
-    pub sink_method: String,
+    /// What the edge feeds on the sink sub-component.
+    pub sink: ConnectSink,
+}
+
+/// The sink end of a `connect` edge.
+#[derive(Debug, Clone)]
+pub enum ConnectSink {
+    /// `-> sb.write_obs` — a hookable sink method. Emission calls
+    /// `<SinkComp>_<method>(<sink>, _t)`.
+    Method { method: String },
+    /// `-> drv.req` — an `in event<T>` field on the sink (an
+    /// event-driven transactor's input pipe). Emission fans out over the
+    /// sink event's own subscriber list, driving its registered
+    /// `on <ev>` handler(s).
+    Event { event: String },
 }
 
 /// One `test` (or `impl <Test> for <Tb>`) declaration.
