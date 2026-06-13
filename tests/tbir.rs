@@ -309,6 +309,92 @@ fn bound_event_driven_transactor_lowers() {
     assert_eq!(comp.on_handlers.len(), 1);
 }
 
+/// The bound-to MONITOR surface: a transactor's always-on
+/// `on bus.<ch>.handshake(arg)` observer handlers (the passive half of
+/// the bound-to-agent cluster) lower into monitor cycle-trigger handlers,
+/// and a `passive` bound instance is accepted. Each monitor handler:
+///   * carries `monitor_channel = Some(<ch>)`, rising edge;
+///   * has a body capturing the channel payload into `arg` (+ per-field
+///     aliases) then feeding the sub-scoreboard.
+#[test]
+fn bound_monitor_handshake_handlers_lower_passive() {
+    let prog = lower_with_stdlib_bus("transactor_passive_only_test.harc", "BusAxiLite.arch")
+        .expect("passive-only bound monitor lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let comp = prog
+        .components
+        .iter()
+        .find(|c| c.name == "AxilXactor")
+        .expect("AxilXactor component");
+    assert_eq!(comp.bound_bus.as_deref(), Some("BusAxiLite"));
+    // Two `on bus.<ch>.handshake` observers → two monitor cycle handlers
+    // (channels `w` and `r`), both rising-edge.
+    let monitors: Vec<&ir::CycleTriggerHandlerSchema> = comp
+        .cycle_handlers
+        .iter()
+        .filter(|ch| ch.monitor_channel.is_some())
+        .collect();
+    assert_eq!(monitors.len(), 2, "expected w + r handshake monitors");
+    assert!(monitors.iter().all(|ch| ch.edge == ir::CycleEdge::Rising));
+    let channels: std::collections::HashSet<&str> = monitors
+        .iter()
+        .map(|ch| ch.monitor_channel.as_deref().unwrap())
+        .collect();
+    assert!(channels.contains("w") && channels.contains("r"));
+    // The synthesized trigger must read the BOUND binding's wires, not
+    // the placeholder (`axil_w_valid`, not `bus_w_valid`).
+    let w_mon = monitors
+        .iter()
+        .find(|ch| ch.monitor_channel.as_deref() == Some("w"))
+        .unwrap();
+    let trig = format!("{prog}");
+    assert!(
+        trig.contains("dut.axil.w.valid") && trig.contains("dut.axil.w.ready"),
+        "monitor trigger should read the bound binding wires, got dump:\n{trig}"
+    );
+    let _ = w_mon;
+}
+
+/// A `passive` bound instance of a PURE-DRIVER transactor (no monitor
+/// half) is inert and must be rejected precisely (the driver lives under
+/// `when active`; a passive instance would observe nothing).
+#[test]
+fn passive_bound_instance_without_monitor_rejected() {
+    let prog = lower_with_stdlib_bus("transactor_active_test.harc", "BusAxiLite.arch");
+    // transactor_active_test binds `active`, so it lowers — sanity that
+    // the fixture itself is fine; the rejection is exercised by the unit
+    // source below (active fixture mutated to passive).
+    assert!(prog.is_ok());
+    let src = r#"bus B
+    handshake_channel ch: send kind: valid_ready
+        data: uint<32>;
+    end handshake_channel ch
+end bus B
+
+transactor Drv bound to B
+    when active
+        req : in event<uint<32>>
+        on req(t)
+            bus.ch.send(t)
+        end on
+    end when
+end transactor Drv
+
+test T
+    let dut : SomeDut
+    let b : B = bind dut
+    let drv : Drv passive = bind b
+    run
+    end run
+end test T"#;
+    let err = lower_src(src).expect_err("passive pure-driver must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("passive") && msg.contains("no monitor half"),
+        "rejection should name the inert passive-no-monitor case: {msg}"
+    );
+}
+
 /// Randomize/constraint fixture (`randomize(t) with` + Z3 constraints,
 /// loaded together with its helper file exactly as run_fixtures.sh
 /// does) now lowers through the constraint-IR seam: every `randomize`

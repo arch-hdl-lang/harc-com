@@ -247,12 +247,21 @@ impl Display for TbProgram {
                     crate::ir::CycleEdge::Falling => "falling",
                     crate::ir::CycleEdge::Level => "level",
                 };
-                writeln!(
-                    f,
-                    "    on {} ({edge}) = fn{}",
-                    expr_str_for_component(self, ch.function, &ch.trigger),
-                    ch.function.0
-                )?;
+                if let Some(channel) = &ch.monitor_channel {
+                    writeln!(
+                        f,
+                        "    on bus.{channel}.handshake [{}] ({edge}) = fn{}",
+                        expr_str_for_component(self, ch.function, &ch.trigger),
+                        ch.function.0
+                    )?;
+                } else {
+                    writeln!(
+                        f,
+                        "    on {} ({edge}) = fn{}",
+                        expr_str_for_component(self, ch.function, &ch.trigger),
+                        ch.function.0
+                    )?;
+                }
             }
             if let Some(w) = &c.watchdog {
                 let period = w

@@ -241,8 +241,12 @@ pub(crate) fn lower_component_schema(
     // Cycle-trigger handlers (`on <bool-expr> ... end on`) — the monitor
     // half. Distinguished from event-subscription `on ev(arg)` by the
     // trigger expression shape (a non-`Call`, or a `Call` whose callee is
-    // not a self-event field). Resolved after the field loop.
-    let mut cycle_asts: Vec<&crate::ast::OnHandler> = Vec::new();
+    // not a self-event field). Resolved after the field loop. The
+    // `Option<String>` is the bound-bus channel for an `on
+    // bus.<ch>.handshake(arg)` handshake-monitor (`None` for an agent-mode
+    // raw-signal `on <bool-expr>`); a monitor handler synthesizes its
+    // `valid && ready` trigger + payload capture in pass 2.
+    let mut cycle_asts: Vec<(&crate::ast::OnHandler, Option<String>)> = Vec::new();
     // At most one `watchdog` per component (the second is rejected).
     let mut watchdog_ast: Option<&crate::ast::WatchdogDecl> = None;
     // An event-driven transactor may carry a module-typed DUT handle field
@@ -284,24 +288,11 @@ pub(crate) fn lower_component_schema(
             ComponentItem::OnHandler(h) if h.periodic => periodic_asts.push(h),
             // `on bus.<ch>.handshake(arg)` — the passive bus-monitor half
             // of a bound transactor (v1's `emit_bound_monitor_actors`).
-            // This needs the handshake-monitor actor topology (a coroutine
-            // sampling valid&&ready on each channel, capturing the payload
-            // into a sub-scoreboard) which is a follow-up slice — reject it
-            // precisely rather than mis-lower the dotted-path event as a
-            // cycle-trigger predicate (which would fail on the bus method
-            // call in expression position).
-            ComponentItem::OnHandler(h) if is_bus_handshake_monitor(h) => {
-                return Err(unsupported(
-                    &format!(
-                        "an `on bus.<ch>.handshake(...)` passive monitor handler on bound \
-                         transactor `{name}`"
-                    ),
-                    "the handshake-monitor actor form (a coroutine sampling valid&&ready per \
-                     channel into a sub-scoreboard) is a follow-up slice; the bound-bus \
-                     event-driven DRIVER (`in event` + `on <ev>` driving `bus.<ch>.send/recv`) \
-                     is lowered",
-                ));
-            }
+            // Collected into `on_asts` like every other non-periodic
+            // handler; the classification loop below desugars it into a
+            // cycle-trigger handler. Keeping all non-periodic handlers in
+            // one source-ordered list is what lets pass-1 FunctionId
+            // reservation and pass-2 body lowering re-classify identically.
             ComponentItem::OnHandler(h) => on_asts.push(h),
             ComponentItem::Watchdog(w) => {
                 if watchdog_ast.is_some() {
@@ -374,7 +365,28 @@ pub(crate) fn lower_component_schema(
     // theirs AFTER the periodic block (kept contiguous for pass 2).
     let mut on_handlers: Vec<crate::ir::OnHandlerSchema> = Vec::new();
     for h in &on_asts {
-        if is_event_subscription(h, &fields) {
+        if is_bus_handshake_monitor(h) {
+            // `on bus.<ch>.handshake(arg)` — desugars to a cycle-trigger
+            // handler (valid && ready, rising edge) observing the bound
+            // bus channel. Only valid on a `bound to <Bus>` transactor.
+            if bound_bus.is_none() {
+                return Err(unsupported(
+                    &format!(
+                        "an `on bus.<ch>.handshake(...)` handshake-monitor handler on \
+                         non-bound component `{name}`"
+                    ),
+                    "handshake-monitor handlers observe a `bound to <Bus>` transactor's \
+                     channels; an unbound component has no bus to observe",
+                ));
+            }
+            let channel = bus_handshake_monitor_channel(h).ok_or_else(|| {
+                unsupported(
+                    &format!("a malformed `on bus.<ch>.handshake(...)` handler on `{name}`"),
+                    "the trigger must be `bus.<channel>.handshake(<arg>)`",
+                )
+            })?;
+            cycle_asts.push((h, Some(channel)));
+        } else if is_event_subscription(h, &fields) {
             let (event, arg_payload) = resolve_on_handler_event(name, h, &fields)?;
             let fid = FunctionId(*next_fn);
             *next_fn += 1;
@@ -384,7 +396,7 @@ pub(crate) fn lower_component_schema(
                 function: fid,
             });
         } else {
-            cycle_asts.push(h);
+            cycle_asts.push((h, None));
         }
     }
 
@@ -410,14 +422,23 @@ pub(crate) fn lower_component_schema(
     // cycle-trigger → watchdog). The trigger predicate lowers in pass 2
     // (it reads DUT/component fields); pass 1 records a placeholder.
     let mut cycle_handlers: Vec<crate::ir::CycleTriggerHandlerSchema> = Vec::new();
-    for h in &cycle_asts {
+    for (h, monitor_channel) in &cycle_asts {
         validate_cycle_handler(name, h)?;
         let fid = FunctionId(*next_fn);
         *next_fn += 1;
+        // A handshake-monitor synthesizes a rising-edge `valid && ready`
+        // trigger (the user wrote no explicit edge); an agent-mode
+        // `on <bool-expr>` honors the source edge mode.
+        let edge = if monitor_channel.is_some() {
+            crate::ir::CycleEdge::Rising
+        } else {
+            edge_to_ir(h.edge)
+        };
         cycle_handlers.push(crate::ir::CycleTriggerHandlerSchema {
             trigger: crate::ir::Expr::CycleCount, // placeholder; pass 2 fills it
-            edge: edge_to_ir(h.edge),
+            edge,
             function: fid,
+            monitor_channel: monitor_channel.clone(),
         });
     }
 
@@ -486,6 +507,39 @@ fn is_bus_handshake_monitor(h: &crate::ast::OnHandler) -> bool {
     }
     // `<x>.<ch>.handshake` — the target must itself be a `<x>.<ch>` field.
     matches!(&*target.kind, ExprKind::Field { .. })
+}
+
+/// The channel name of an `on bus.<ch>.handshake(arg)` monitor handler
+/// (`<ch>` from the `<bus>.<ch>.handshake` callee), or `None` if `h` is
+/// not a well-formed handshake-monitor.
+fn bus_handshake_monitor_channel(h: &crate::ast::OnHandler) -> Option<String> {
+    let ExprKind::Call { callee, .. } = &*h.event.kind else {
+        return None;
+    };
+    // callee = `<bus>.<ch>.handshake`; its target is `<bus>.<ch>`.
+    let ExprKind::Field { target, name: method } = &*callee.kind else {
+        return None;
+    };
+    if method.name != "handshake" {
+        return None;
+    }
+    let ExprKind::Field { name: ch, .. } = &*target.kind else {
+        return None;
+    };
+    Some(ch.name.clone())
+}
+
+/// The argument name of an `on bus.<ch>.handshake(<arg>)` monitor handler
+/// (`_beat` when not a plain identifier).
+fn bus_handshake_monitor_arg_name(h: &crate::ast::OnHandler) -> String {
+    if let ExprKind::Call { args, .. } = &*h.event.kind {
+        if let Some(crate::ast::CallArg::Expr(e)) = args.first() {
+            if let ExprKind::Ident(id) = &*e.kind {
+                return id.name.clone();
+            }
+        }
+    }
+    "_beat".to_string()
 }
 
 /// Map the AST edge mode onto the IR cycle-edge enum.
@@ -839,8 +893,19 @@ pub(crate) fn lower_component_bodies(
             }
             let ch = &schema.cycle_handlers[cyc_idx];
             cyc_idx += 1;
-            let (body, trigger) =
-                lower_cycle_body(h, ch.function, cid, ctx, helpers, constraint_sites)?;
+            let (body, trigger) = if let Some(channel) = &ch.monitor_channel {
+                lower_monitor_handshake_body(
+                    h,
+                    channel,
+                    ch.function,
+                    cid,
+                    ctx,
+                    helpers,
+                    constraint_sites,
+                )?
+            } else {
+                lower_cycle_body(h, ch.function, cid, ctx, helpers, constraint_sites)?
+            };
             funcs.push(body);
             cycle_triggers.push(trigger);
         }
@@ -902,6 +967,123 @@ fn lower_cycle_body(
         FunctionKind::ComponentMethod { component: cid },
         None,
     )?;
+    Ok((f, trigger))
+}
+
+/// A bound-bus placeholder `PortRef` for `bus.<ch>.<sig>` — the same flat
+/// `bus_<ch>_<sig>` shape `bus::bus_port` builds, with the placeholder bus
+/// prefix (`transactors::INITIATOR_BUS_PLACEHOLDER`) at `port_path[0]`.
+/// `fill_initiator_bus_prefix` rewrites the prefix to the real binding name
+/// at test-binding time, exactly as for the driver's `bus.<ch>.send/recv`
+/// bodies and trigger.
+fn monitor_bus_port(channel: &str, signal: &str) -> crate::ir::PortRef {
+    crate::ir::PortRef {
+        testbench_field: "dut".to_string(),
+        port_path: vec![
+            super::transactors::INITIATOR_BUS_PLACEHOLDER.to_string(),
+            channel.to_string(),
+            signal.to_string(),
+        ],
+        direction: None,
+        width: None,
+        access: crate::ir::PortAccess::Port,
+        lane: None,
+    }
+}
+
+/// Lower an `on bus.<ch>.handshake(arg) ... end on` passive bus-monitor
+/// handler (v1's `emit_bound_monitor_actors`) into a cycle-trigger body +
+/// synthesized trigger. The trigger is the channel's `valid && ready`
+/// (rising edge, applied by the `_checkers` closure). The body captures
+/// the channel payload into the handler's `arg` local — the first payload
+/// signal aliases `arg` itself (so a scalar `sb.q.push(arg)` push sees it,
+/// matching v1's implicit-conversion-to-first-field), and every payload
+/// signal also lands in a per-field alias recorded in `recv_payloads` (so
+/// `arg.<field>` reads, e.g. `beat.data`/`beat.resp`, resolve) — then the
+/// user body runs. The payload reads use the bound-bus placeholder prefix,
+/// rewritten to the real binding at test-binding time.
+fn lower_monitor_handshake_body(
+    h: &crate::ast::OnHandler,
+    channel: &str,
+    fid: FunctionId,
+    cid: ComponentId,
+    ctx: &LowerCtx,
+    helpers: &helpers::HelperRegistry<'_>,
+    constraint_sites: &std::cell::RefCell<Vec<crate::ir::ConstraintSite>>,
+) -> Result<(TbFunction, crate::ir::Expr), LowerError> {
+    // Resolve the channel's payload signals from the bound bus (visible in
+    // this context under the placeholder prefix, injected at the per-
+    // component body ctx). An empty payload has nothing to observe.
+    let bus = ctx
+        .bus_bindings
+        .get(super::transactors::INITIATOR_BUS_PLACEHOLDER)
+        .ok_or_else(|| {
+            unsupported(
+                "an `on bus.<ch>.handshake(...)` handler with no bound bus in scope",
+                "",
+            )
+        })?;
+    let hs = bus
+        .handshakes
+        .iter()
+        .find(|hs| hs.name.name == channel)
+        .ok_or_else(|| {
+            LowerError::Invalid(format!(
+                "bus `{}` has no handshake channel `{channel}` for `on bus.{channel}.handshake`",
+                bus.name.name
+            ))
+        })?;
+    if hs.payload.is_empty() {
+        return Err(LowerError::Invalid(format!(
+            "bus `{}` channel `{channel}` has no payload signals to observe",
+            bus.name.name
+        )));
+    }
+    let payload_sigs: Vec<String> = hs.payload.iter().map(|s| s.name.name.clone()).collect();
+
+    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    b.self_component = Some(cid);
+
+    // Capture the channel payload BEFORE the user body (the payload is
+    // valid in the cycle valid && ready holds). The bound `arg` local is
+    // the first payload field; each remaining field gets an alias local,
+    // all recorded in `recv_payloads` so `arg.<field>` reads resolve.
+    let arg_name = bus_handshake_monitor_arg_name(h);
+    let arg_local = b.declare(&arg_name);
+    b.push(crate::ir::Stmt::DutRead(
+        arg_local,
+        monitor_bus_port(channel, &payload_sigs[0]),
+    ));
+    b.set_local_type(arg_local, IrType::UInt(None));
+    let mut fields = Vec::with_capacity(payload_sigs.len());
+    fields.push((payload_sigs[0].clone(), arg_local));
+    for sig in &payload_sigs[1..] {
+        let fl = b.declare(&format!("{arg_name}__{sig}"));
+        b.push(crate::ir::Stmt::DutRead(fl, monitor_bus_port(channel, sig)));
+        b.set_local_type(fl, IrType::UInt(None));
+        fields.push((sig.clone(), fl));
+    }
+    b.recv_payloads.insert(arg_local, fields);
+
+    b.lower_block_stmts(&h.body)?;
+    if !b.is_terminated() {
+        b.terminate(Terminator::Return);
+    }
+    let f = b.finish(
+        fid,
+        format!("comp_monitor_{}", fid.0),
+        FunctionKind::ComponentMethod { component: cid },
+        None,
+    )?;
+
+    // Trigger: `bus.<ch>.valid && bus.<ch>.ready` (rising edge applied by
+    // the checker). Synthesized — the source `h.event` is the
+    // `handshake(arg)` call, not a predicate.
+    let trigger = crate::ir::Expr::Binary(
+        crate::ir::BinOp::And,
+        Box::new(crate::ir::Expr::Port(monitor_bus_port(channel, "valid"))),
+        Box::new(crate::ir::Expr::Port(monitor_bus_port(channel, "ready"))),
+    );
     Ok((f, trigger))
 }
 

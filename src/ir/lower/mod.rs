@@ -1395,22 +1395,34 @@ fn lower_test(
                     ));
                 }
                 let simple = type_simple_name(l.ty.as_ref()).unwrap();
-                // The instance must be `active` — the `on req` driver lives
-                // under `when active`. A `passive` instance has no driver
-                // half in this subset.
+                let cid_probe = component_ids[simple];
+                let has_monitor = prog.components[cid_probe.index()]
+                    .cycle_handlers
+                    .iter()
+                    .any(|ch| ch.monitor_channel.is_some());
+                // Mode rules:
+                //   * `active`  — the `on <ev>` driver (under `when active`)
+                //     fires on `emit <inst>.<ev>`. Always permitted.
+                //   * `passive` — no driver; only the always-on
+                //     `on bus.<ch>.handshake` monitor observers fire. Valid
+                //     only when the transactor declares monitor handlers (a
+                //     pure-driver transactor with no monitor half has nothing
+                //     for a passive instance to do).
                 match l.ty.as_ref() {
                     Some(TypeExpr::Named { mode: Some(TransactorMode::Active), .. }) => {}
                     Some(TypeExpr::Named { mode: Some(TransactorMode::Passive), .. }) => {
-                        return Err(unsupported(
-                            &format!(
-                                "passive bound-to event-driven transactor instance `let {} : \
-                                 {simple} passive`",
-                                l.name.name
-                            ),
-                            "the `on <ev>` driver lives under `when active`; the passive \
-                             monitor-only form (`on bus.<ch>.handshake` observers) is a \
-                             follow-up slice",
-                        ));
+                        if !has_monitor {
+                            return Err(unsupported(
+                                &format!(
+                                    "passive bound-to event-driven transactor instance `let {} : \
+                                     {simple} passive` with no monitor half",
+                                    l.name.name
+                                ),
+                                "a `passive` instance only runs the always-on \
+                                 `on bus.<ch>.handshake(...)` observers; this transactor declares \
+                                 none, so a passive instance is inert — annotate it `active`",
+                            ));
+                        }
                     }
                     _ => {
                         return Err(unsupported(
@@ -1419,7 +1431,7 @@ fn lower_test(
                                  without an `active`/`passive` mode",
                                 l.name.name
                             ),
-                            "annotate the instance `active`",
+                            "annotate the instance `active` (driver) or `passive` (monitor)",
                         ));
                     }
                 }
@@ -1894,15 +1906,17 @@ fn lower_test(
                 cschema.bound_bus.as_deref().unwrap_or("<none>"),
             )));
         }
-        // Fill the placeholder bus prefix in every on-handler body (the
-        // `on req` driver). Periodic/cycle/method/watchdog bodies of a
-        // bound event-driven transactor are out of subset, but fill them
-        // too for uniformity — the fill is a no-op when no placeholder
-        // ref is present.
+        // Fill the placeholder bus prefix in every handler body: the
+        // `on req` driver (on-handlers), the `on bus.<ch>.handshake`
+        // monitor bodies (cycle-handlers — their payload-capture DutReads
+        // carry the placeholder prefix), and any methods. The fill is a
+        // no-op when a body carries no placeholder ref (an agent-mode
+        // `dut.<sig>` cycle handler, a non-bus method).
         let body_fns: Vec<usize> = cschema
             .on_handlers
             .iter()
             .map(|h| h.function.index())
+            .chain(cschema.cycle_handlers.iter().map(|c| c.function.index()))
             .chain(cschema.methods.iter().map(|m| m.function.index()))
             .collect();
         let cname = cschema.name.clone();
@@ -1916,6 +1930,24 @@ fn lower_test(
                     "the bound event-driven subset shares one handler body per transactor type; \
                      multiple instances need per-instance bodies",
                 ));
+            }
+        }
+        // Fill the monitor cycle-handlers' synthesized `valid && ready`
+        // triggers too — they live on the schema (rendered standalone in
+        // the per-instance `_checkers` closure), not in the function body,
+        // so the body fill above does not reach them.
+        for ch in prog.components[cid.index()].cycle_handlers.iter_mut() {
+            if ch.monitor_channel.is_some() {
+                if let Err(prev) = fill_initiator_bus_prefix_expr(&mut ch.trigger, bus_field) {
+                    return Err(unsupported(
+                        &format!(
+                            "bound-to event-driven transactor `{cname}` bound to more than one \
+                             bus binding (`{prev}`, `{bus_field}`)"
+                        ),
+                        "the bound event-driven subset shares one handler body per transactor \
+                         type; multiple instances need per-instance bodies",
+                    ));
+                }
             }
         }
         // Register as a composite-component instance (same machinery as
@@ -3467,8 +3499,102 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
 /// second bind to a DIFFERENT binding returns the previously filled name
 /// (`Err`) — the one-instance-per-type subset gate, mirroring
 /// `fill_transactor_state_instance`.
+/// Rewrite (or check, when `rewrite == false`) the placeholder bus prefix
+/// of a single `PortRef`. Shared by `fill_initiator_bus_prefix` (function
+/// bodies) and `fill_initiator_bus_prefix_expr` (schema-resident exprs
+/// like a monitor cycle-handler's synthesized trigger). Returns the first
+/// conflicting (already-rewritten-to-a-different-binding) prefix it sees
+/// via `conflict`.
+fn fill_visit_port(
+    p: &mut crate::ir::PortRef,
+    placeholder: &str,
+    binding: &str,
+    rewrite: bool,
+    conflict: &mut Option<String>,
+) {
+    match p.port_path.first() {
+        Some(seg) if seg == placeholder => {
+            if rewrite {
+                p.port_path[0] = binding.to_string();
+            }
+        }
+        // A non-placeholder, non-`binding` prefix means a prior bind
+        // already rewrote this shared body to a different name.
+        Some(seg) if seg != binding && conflict.is_none() => {
+            *conflict = Some(seg.clone());
+        }
+        _ => {}
+    }
+}
+
+/// Recursively fill/check the placeholder bus prefix of every `PortRef`
+/// inside an `Expr`. See `fill_visit_port`.
+fn fill_visit_expr(
+    e: &mut crate::ir::Expr,
+    placeholder: &str,
+    binding: &str,
+    rewrite: bool,
+    conflict: &mut Option<String>,
+) {
+    use crate::ir::Expr;
+    match e {
+        Expr::Port(p) => fill_visit_port(p, placeholder, binding, rewrite, conflict),
+        Expr::Binary(_, a, b) => {
+            fill_visit_expr(a, placeholder, binding, rewrite, conflict);
+            fill_visit_expr(b, placeholder, binding, rewrite, conflict);
+        }
+        Expr::Unary(_, a)
+        | Expr::WidthCast { inner: a, .. }
+        | Expr::ComponentIdle { n: a, .. } => {
+            fill_visit_expr(a, placeholder, binding, rewrite, conflict)
+        }
+        Expr::Ternary(c, t, f) => {
+            fill_visit_expr(c, placeholder, binding, rewrite, conflict);
+            fill_visit_expr(t, placeholder, binding, rewrite, conflict);
+            fill_visit_expr(f, placeholder, binding, rewrite, conflict);
+        }
+        Expr::Call(_, args) => {
+            for a in args {
+                fill_visit_expr(a, placeholder, binding, rewrite, conflict);
+            }
+        }
+        Expr::SeqIndex { index, .. } => {
+            fill_visit_expr(index, placeholder, binding, rewrite, conflict)
+        }
+        Expr::Literal { .. }
+        | Expr::WideLiteral(_)
+        | Expr::Local(_)
+        | Expr::CycleCount
+        | Expr::ErrorCount
+        | Expr::RecordField { .. }
+        | Expr::TbField(_)
+        | Expr::TransactorState { .. }
+        | Expr::ComponentField { .. }
+        | Expr::ScoreboardQuery { .. }
+        | Expr::SeqLen(_)
+        | Expr::RegRead { .. }
+        | Expr::CovBin { .. } => {}
+    }
+}
+
+/// Fill the placeholder bus prefix in a single schema-resident expression
+/// (a monitor cycle-handler's synthesized `valid && ready` trigger, which
+/// lives on the schema rather than in a function body, so the body-walking
+/// `fill_initiator_bus_prefix` does not reach it). Same one-instance-per-
+/// type conflict gate.
+fn fill_initiator_bus_prefix_expr(e: &mut crate::ir::Expr, binding: &str) -> Result<(), String> {
+    let placeholder = transactors::INITIATOR_BUS_PLACEHOLDER;
+    let mut conflict = None;
+    fill_visit_expr(e, placeholder, binding, false, &mut conflict);
+    if let Some(prev) = conflict {
+        return Err(prev);
+    }
+    fill_visit_expr(e, placeholder, binding, true, &mut conflict);
+    Ok(())
+}
+
 fn fill_initiator_bus_prefix(func: &mut TbFunction, binding: &str) -> Result<(), String> {
-    use crate::ir::{Expr, PortRef, Stmt};
+    use crate::ir::Stmt;
     let placeholder = transactors::INITIATOR_BUS_PLACEHOLDER;
 
     // Every PortRef carried by the body, whether at statement level
@@ -3480,76 +3606,12 @@ fn fill_initiator_bus_prefix(func: &mut TbFunction, binding: &str) -> Result<(),
     // coverage would leave a `bus_<ch>_<sig>` name with the wrong (still-
     // placeholder) prefix in the emitted C++.
     //
-    // `visit` runs over both a check pass (detect a prior fill to a
-    // DIFFERENT binding → the one-instance-per-type gate) and the rewrite
-    // pass. It returns the first conflicting prefix it finds.
-    fn visit_port(
-        p: &mut PortRef,
-        placeholder: &str,
-        binding: &str,
-        rewrite: bool,
-        conflict: &mut Option<String>,
-    ) {
-        match p.port_path.first() {
-            Some(seg) if seg == placeholder => {
-                if rewrite {
-                    p.port_path[0] = binding.to_string();
-                }
-            }
-            // A non-placeholder, non-`binding` prefix means a prior bind
-            // already rewrote this shared body to a different name.
-            Some(seg) if seg != binding && conflict.is_none() => {
-                *conflict = Some(seg.clone());
-            }
-            _ => {}
-        }
-    }
-    fn visit_expr(
-        e: &mut Expr,
-        placeholder: &str,
-        binding: &str,
-        rewrite: bool,
-        conflict: &mut Option<String>,
-    ) {
-        match e {
-            Expr::Port(p) => visit_port(p, placeholder, binding, rewrite, conflict),
-            Expr::Binary(_, a, b) => {
-                visit_expr(a, placeholder, binding, rewrite, conflict);
-                visit_expr(b, placeholder, binding, rewrite, conflict);
-            }
-            Expr::Unary(_, a)
-            | Expr::WidthCast { inner: a, .. }
-            | Expr::ComponentIdle { n: a, .. } => {
-                visit_expr(a, placeholder, binding, rewrite, conflict)
-            }
-            Expr::Ternary(c, t, f) => {
-                visit_expr(c, placeholder, binding, rewrite, conflict);
-                visit_expr(t, placeholder, binding, rewrite, conflict);
-                visit_expr(f, placeholder, binding, rewrite, conflict);
-            }
-            Expr::Call(_, args) => {
-                for a in args {
-                    visit_expr(a, placeholder, binding, rewrite, conflict);
-                }
-            }
-            Expr::SeqIndex { index, .. } => {
-                visit_expr(index, placeholder, binding, rewrite, conflict)
-            }
-            Expr::Literal { .. }
-            | Expr::WideLiteral(_)
-            | Expr::Local(_)
-            | Expr::CycleCount
-            | Expr::ErrorCount
-            | Expr::RecordField { .. }
-            | Expr::TbField(_)
-            | Expr::TransactorState { .. }
-            | Expr::ComponentField { .. }
-            | Expr::ScoreboardQuery { .. }
-            | Expr::SeqLen(_)
-            | Expr::RegRead { .. }
-            | Expr::CovBin { .. } => {}
-        }
-    }
+    // `run` walks every PortRef the body carries (statements + expressions
+    // + terminators) via the shared `fill_visit_*` helpers, over both a
+    // check pass (detect a prior fill to a DIFFERENT binding → the one-
+    // instance-per-type gate) and the rewrite pass.
+    let visit_port = fill_visit_port;
+    let visit_expr = fill_visit_expr;
     let mut run = |rewrite: bool| -> Option<String> {
         let mut conflict = None;
         for block in &mut func.blocks {
