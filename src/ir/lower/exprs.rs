@@ -87,6 +87,26 @@ impl FuncBuilder<'_> {
                         query: crate::ir::ScoreboardQuery::Scalar { scalar },
                     });
                 }
+                // Regblock-binding access in expression position. The
+                // mirror IS a record local, so `regs.NAME` would
+                // otherwise fall into the record-field path below and
+                // silently read the mirror — but a RW/RO register read
+                // must go to the bus (v1's frontdoor + read-predict).
+                // Register reads are only lowered in `let`-RHS position
+                // (`let v = regs.NAME`), so any register read reaching
+                // here sits in a value position the IR can't represent
+                // without a hoist that changes the bus-read count.
+                if let Some((binding, reg)) = self.as_regblock_register(e) {
+                    return Err(unsupported(
+                        &format!(
+                            "register read `{binding}.{reg}` outside a `let` binding"
+                        ),
+                        "v1 reads the bus inline (and predicts the mirror) at every read \
+                         site; the IR lowers register reads only in `let x = regs.NAME` \
+                         position — hoist the read into a `let` first",
+                    ));
+                }
+                self.reject_out_of_subset_regblock_access(e, "read")?;
                 // `t.field` read on a record-typed local.
                 if let ExprKind::Ident(root) = &*target.kind {
                     if let Some(local) = self.lookup(&root.name) {
@@ -475,9 +495,6 @@ impl FuncBuilder<'_> {
         &self,
         callee: &AstExpr,
     ) -> Result<Option<(String, crate::ir::TransactorId, String)>, LowerError> {
-        let Some(tb_field) = self.ctx.tb_field.as_deref() else {
-            return Ok(None);
-        };
         let ExprKind::Field {
             target,
             name: method,
@@ -485,20 +502,30 @@ impl FuncBuilder<'_> {
         else {
             return Ok(None);
         };
-        let ExprKind::Field {
-            target: root_expr,
-            name: field,
-        } = &*target.kind
-        else {
-            return Ok(None);
+        // Two access shapes resolve to a transactor field:
+        //   `_tb.<field>.<method>` — testbench-field instance (the
+        //     impl-for desugaring rewrote `xact.` → `_tb.xact.`).
+        //   `<field>.<method>`     — test-scope-let instance, accessed
+        //     by its bare name (left unqualified by the desugaring).
+        let field_name = match &*target.kind {
+            ExprKind::Field {
+                target: root_expr,
+                name: field,
+            } => {
+                let ExprKind::Ident(root) = &*root_expr.kind else {
+                    return Ok(None);
+                };
+                if Some(root.name.as_str()) != self.ctx.tb_field.as_deref() {
+                    return Ok(None);
+                }
+                field.name.clone()
+            }
+            ExprKind::Ident(id) if self.ctx.bare_transactor_fields.contains(&id.name) => {
+                id.name.clone()
+            }
+            _ => return Ok(None),
         };
-        let ExprKind::Ident(root) = &*root_expr.kind else {
-            return Ok(None);
-        };
-        if root.name != tb_field {
-            return Ok(None);
-        }
-        let Some(&xid) = self.ctx.transactor_fields.get(&field.name) else {
+        let Some(&xid) = self.ctx.transactor_fields.get(&field_name) else {
             return Ok(None);
         };
         let schema = &self.ctx.transactors[xid.index()];
@@ -508,7 +535,7 @@ impl FuncBuilder<'_> {
                 schema.name, method.name
             )));
         }
-        Ok(Some((field.name.clone(), xid, method.name.clone())))
+        Ok(Some((field_name, xid, method.name.clone())))
     }
 
     /// `Some(Expr::CovBin)` when the expression is a check-phase bin

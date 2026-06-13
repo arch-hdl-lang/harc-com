@@ -58,6 +58,10 @@ ir_id!(
     /// Index into `TbProgram::scoreboards`.
     ScoreboardId
 );
+ir_id!(
+    /// Index into `TbProgram::regblocks`.
+    RegblockId
+);
 
 /// Whole-program IR for one merged HARC source file (post
 /// `merge_for_sim` + impl-for desugaring).
@@ -76,6 +80,78 @@ pub struct TbProgram {
     /// Scoreboard schemas (`scoreboard` declarations), in file order.
     /// See `ScoreboardSchema`.
     pub scoreboards: Vec<ScoreboardSchema>,
+    /// Register-block schemas (`regblock` declarations), in file order.
+    /// See `RegblockSchema`.
+    pub regblocks: Vec<RegblockSchema>,
+}
+
+/// One `regblock` declaration, lowered to its register-level subset
+/// (docs/tbir-mvp.md §regblock). The mirror is modeled as a synthetic
+/// value-record (`record`, one scalar field per register), so the
+/// existing `IrType::Record` / `RecordInit` / `RecordFieldWrite` /
+/// `Expr::RecordField` machinery carries the host-side mirror state with
+/// no new IR variants — exactly the shape v1's `<Name>_Mirror` POD
+/// struct holds. The `registers` table carries the offset / width /
+/// access metadata register-level access lowering needs.
+///
+/// Subset (the register-level frontdoor): `register NAME @ ADDR [reset
+/// V] access rw|ro|wo`, accessed register-level (`regs.NAME = v`,
+/// `let x = regs.NAME`) through the `via <Helper>` transactor's
+/// `write(addr, data)` / `read(addr) -> data` methods. Field-level
+/// decomposition, `bitbash`, the passive `record_write`/`record_read`
+/// API, per-register `on` callbacks, and `addrmap` composition are
+/// explicit `Unsupported` rejections (see `src/ir/lower/regblock.rs`).
+/// The `via` helper must be an unbound DUT-poking transactor; the
+/// bus-bound helper form is the documented residual blocker for the
+/// corpus `regblock_*` fixtures.
+#[derive(Debug, Clone)]
+pub struct RegblockSchema {
+    pub name: String,
+    /// Mirror record: the synthetic `RecordSchema` (in `TbProgram::
+    /// records`) whose fields are the registers in declaration order,
+    /// each defaulting to its reset value.
+    pub record: RecordId,
+    /// Registers in declaration order.
+    pub registers: Vec<RegRegisterSchema>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegRegisterSchema {
+    pub name: String,
+    /// Byte offset within the regblock (folded from the `@ <addr>`
+    /// literal at lowering).
+    pub offset: u64,
+    /// Register width in bits (explicit `width` or the regblock default).
+    pub width: u32,
+    pub access: RegAccess,
+}
+
+/// Register access policy, mirroring `ast::RegAccess`. Duplicated into
+/// the IR so the IR stays self-contained (backends never reach back into
+/// the AST). v1's `writes_to_bus` / `reads_from_bus` semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegAccess {
+    Rw,
+    Ro,
+    Wo,
+}
+
+impl RegAccess {
+    /// Whether a write to this register reaches the bus (RW/WO).
+    pub fn writes_to_bus(self) -> bool {
+        matches!(self, RegAccess::Rw | RegAccess::Wo)
+    }
+    /// Whether a read of this register reaches the bus (RW/RO).
+    pub fn reads_from_bus(self) -> bool {
+        matches!(self, RegAccess::Rw | RegAccess::Ro)
+    }
+    pub fn keyword(self) -> &'static str {
+        match self {
+            RegAccess::Rw => "rw",
+            RegAccess::Ro => "ro",
+            RegAccess::Wo => "wo",
+        }
+    }
 }
 
 /// One `transactor` declaration, lowered to its structural shape.
@@ -283,10 +359,27 @@ pub struct TestbenchSchema {
     /// declaration order. Each lowers to a default-constructed member of
     /// the `_tb` struct (v1's by-value scoreboard instance).
     pub scoreboard_fields: Vec<(String, ScoreboardId)>,
+    /// Register-block bindings (`let regs : R = bind <helper>`), in
+    /// declaration order. Carried for dump-ir visibility; register
+    /// access is fully resolved at lowering into mirror
+    /// `RecordFieldWrite` / `Expr::RecordField` plus helper
+    /// `Stmt::TransactorCall` edges, so emission needs nothing here.
+    pub regblock_bindings: Vec<RegblockBinding>,
     /// True when no `testbench` declaration existed in source and this
     /// schema was synthesized for a classic-form test. Codegen skips
     /// the `_tb` struct + wire statement for synthetic testbenches.
     pub synthetic: bool,
+}
+
+/// One `let regs : R = bind <helper>` register-block binding. The
+/// binding name `field` is the mirror local's source name; `regblock`
+/// indexes `TbProgram::regblocks`; `helper_field` is the transactor
+/// instance the frontdoor `write`/`read` calls route through.
+#[derive(Debug, Clone)]
+pub struct RegblockBinding {
+    pub field: String,
+    pub regblock: RegblockId,
+    pub helper_field: String,
 }
 
 /// One scalar testbench field (`expected : uint<32> default 0`).
@@ -827,6 +920,9 @@ impl TbProgram {
 
     pub fn scoreboard(&self, id: ScoreboardId) -> &ScoreboardSchema {
         &self.scoreboards[id.index()]
+    }
+    pub fn regblock(&self, id: RegblockId) -> &RegblockSchema {
+        &self.regblocks[id.index()]
     }
 }
 

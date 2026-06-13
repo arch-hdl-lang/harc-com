@@ -2584,3 +2584,219 @@ fn width_methods_dump_ir_snapshot() {
     verify::verify_program(&prog).expect("verifies");
     insta::assert_snapshot!("width_methods_dump_ir", format!("{prog}"));
 }
+
+// ── regblock construct (register-level frontdoor subset) ─────────────
+
+/// The regblock subset fixture lowers cleanly: a `regblock` declaration
+/// becomes a synthetic mirror record (one scalar field per register,
+/// defaulting to its reset value) plus a `RegblockSchema`; the
+/// test-scope unbound-transactor `let h : RegHelper active` registers as
+/// a transactor instance; and register-level access lowers to mirror
+/// `RecordFieldWrite` / reads plus `Helper.write`/`read`
+/// `TransactorCall` edges. Snapshotted end-to-end.
+#[test]
+fn regblock_subset_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("regblock_subset_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("regblock_subset_dump_ir", format!("{prog}"));
+}
+
+/// Register-level write/read lowering shapes. A RW write emits the
+/// mirror `RecordFieldWrite` then the helper `write` call edge; a RW
+/// read emits the helper `read` call edge into the destination local
+/// then a mirror-predict `RecordFieldWrite`.
+#[test]
+fn regblock_rw_write_then_read_lowers_to_mirror_plus_call_edge() {
+    let src = r#"
+transactor H
+    dut : Top
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            dut.en = 1
+        end write
+        hookable read(addr: uint<8>) -> uint<32>
+            return addr
+        end read
+    end when
+end transactor H
+regblock R via H width 32
+    register A @ 0x10 access rw
+end regblock R
+testbench Tb
+    dut : Top
+end testbench Tb
+impl Test for Tb
+    let h : H active
+    let regs : R = bind h
+    run
+        h.dut = dut
+        regs.A = 5
+        let v = regs.A
+    end run
+end impl Test
+"#;
+    let prog = lower_src(src).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let run = prog.function(prog.tests[0].run);
+    let body = run
+        .blocks
+        .iter()
+        .map(|b| format!("{b:?}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Mirror init at entry, write = mirror + call edge, read = call edge
+    // + mirror predict.
+    assert!(body.contains("RecordInit"), "mirror init missing:\n{body}");
+    assert!(
+        body.matches("RecordFieldWrite").count() >= 2,
+        "expected a write-side mirror update and a read-side predict:\n{body}"
+    );
+    assert!(
+        body.matches("TransactorMethod").count() >= 2,
+        "expected write + read frontdoor call edges:\n{body}"
+    );
+}
+
+/// RO write suppresses the bus traffic (mirror update only); WO read
+/// serves from the mirror (no bus traffic).
+#[test]
+fn regblock_ro_write_and_wo_read_skip_the_bus() {
+    let src = r#"
+transactor H
+    dut : Top
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            dut.en = 1
+        end write
+        hookable read(addr: uint<8>) -> uint<32>
+            return addr
+        end read
+    end when
+end transactor H
+regblock R via H width 32
+    register RO @ 0x00 access ro
+    register WO @ 0x04 access wo
+end regblock R
+testbench Tb
+    dut : Top
+end testbench Tb
+impl Test for Tb
+    let h : H active
+    let regs : R = bind h
+    run
+        h.dut = dut
+        regs.RO = 1
+        let w = regs.WO
+    end run
+end impl Test
+"#;
+    let prog = lower_src(src).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let run = prog.function(prog.tests[0].run);
+    let body = run
+        .blocks
+        .iter()
+        .map(|b| format!("{b:?}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // RO write + WO read make NO frontdoor call edges (both stay local).
+    assert!(
+        !body.contains("TransactorMethod"),
+        "RO write and WO read must not reach the bus:\n{body}"
+    );
+}
+
+/// Field-level access (`regs.REG.FIELD`) is out of subset — rejected
+/// with a precise message, never mis-lowered into a mirror read.
+#[test]
+fn regblock_field_level_access_is_unsupported() {
+    let src = r#"
+transactor H
+    dut : Top
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            dut.en = 1
+        end write
+        hookable read(addr: uint<8>) -> uint<32>
+            return addr
+        end read
+    end when
+end transactor H
+regblock R via H width 32
+    register A @ 0x00 access rw
+        field F : bit @ 0 access rw
+    end register A
+end regblock R
+testbench Tb
+    dut : Top
+end testbench Tb
+impl Test for Tb
+    let h : H active
+    let regs : R = bind h
+    run
+        h.dut = dut
+        regs.A.F = 1
+    end run
+end impl Test
+"#;
+    let err = lower_src(src).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("field-level"),
+        "expected a field-level-decomposition rejection: {msg}"
+    );
+}
+
+/// A register read outside `let`-RHS position (here an assert condition)
+/// is rejected — v1 reads the bus inline at every read site, which the
+/// IR's statement model can't represent without changing the read count.
+#[test]
+fn regblock_read_in_assert_is_unsupported() {
+    let src = r#"
+transactor H
+    dut : Top
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            dut.en = 1
+        end write
+        hookable read(addr: uint<8>) -> uint<32>
+            return addr
+        end read
+    end when
+end transactor H
+regblock R via H width 32
+    register A @ 0x00 access rw
+end regblock R
+testbench Tb
+    dut : Top
+end testbench Tb
+impl Test for Tb
+    let h : H active
+    let regs : R = bind h
+    run
+        h.dut = dut
+        assert regs.A == 1 else fail("x")
+    end run
+end impl Test
+"#;
+    let err = lower_src(src).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("outside a `let`"),
+        "expected an out-of-let read rejection: {msg}"
+    );
+}
+
+/// The corpus `regblock_basic_test` fixture's `via` helper is a
+/// `transactor ... bound to BusAxiLite` — the bus-bound helper form is
+/// the documented residual blocker. Lowering rejects it (the file-level
+/// gate hits the bus-bound transactor first), never mis-lowers.
+#[test]
+fn regblock_basic_corpus_blocked_on_bus_bound_helper() {
+    let err = lower_src(&fixture("regblock_basic_test.harc")).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("bound to a bus"),
+        "expected the bus-bound-helper residual blocker: {msg}"
+    );
+}

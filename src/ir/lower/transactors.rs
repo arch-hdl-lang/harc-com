@@ -188,6 +188,9 @@ pub(crate) fn lower_transactor(
         tb_scalar_fields: HashSet::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
+        regblock_bindings: HashMap::new(),
+        regblock_init_order: Vec::new(),
+        bare_transactor_fields: HashSet::new(),
     };
 
     let mut funcs = Vec::new();
