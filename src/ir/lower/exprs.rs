@@ -1127,6 +1127,18 @@ pub(crate) fn parse_wide_hex_literal(s: &str) -> Option<Vec<u32>> {
     Some(words)
 }
 
+/// Fold an AST expression to a `u64` when it is an integer literal
+/// (optionally parenthesized). Used by the target-side `out_of_order
+/// tags N` responder lowering to range-check the literal tag count;
+/// mirrors v1's `fold_int_literal` over the same surface.
+pub(crate) fn parse_int_literal_expr(e: &crate::ast::Expr) -> Option<u64> {
+    match &*e.kind {
+        crate::ast::ExprKind::Int(s) => parse_int_literal(s),
+        crate::ast::ExprKind::Paren(inner) => parse_int_literal_expr(inner),
+        _ => None,
+    }
+}
+
 /// Parse a plain integer literal (decimal / 0x / 0b / 0o, `_`
 /// separators). Verilog-style sized literals are not lowered.
 pub(crate) fn parse_int_literal(s: &str) -> Option<u64> {

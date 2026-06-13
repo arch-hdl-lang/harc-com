@@ -274,16 +274,49 @@ next blocker; exact `Unsupported` message in parentheses):
 |---|---|
 | **(resolved 2026-06-13)** initiator-side `fork`/`join_all` TLM issue | ~~`tlm_method_bus_test`~~ (registered, pass) — see the initiator-side fork/join_all section below |
 | **(resolved 2026-06-13)** a `fork`/blocking call INSIDE a transactor responder body (nested forwarding — target re-issuing a downstream TLM call) | ~~`tlm_target_forwarding_test`, `tlm_target_fork_forwarding_test`~~ (both registered, pass) — see the nested-forwarding section below |
-| target-side `out_of_order tags N` RESPONDER threads (hidden tag wires + multi-lane response router) | `tlm_target_ooo_lanes_test`, `tlm_pairing_arch_initiator_test` ("serving a `out_of_order` method") |
+| **(resolved 2026-06-13)** target-side `out_of_order tags N` RESPONDER threads (hidden tag wires + multi-lane response router) | ~~`tlm_target_ooo_lanes_test`, `tlm_pairing_arch_initiator_test`~~ (both registered, pass) — see the OOO-responder lanes section below |
 | **(equivalence-proven, gate-blocked)** `tlm_pairing_arch_target_test` | LOWERS + v1↔tbir trace-diff clean, but its ARCH-DUT auto-emitted `_auto_tlm_*_req_stable` TLM SVA `$fatal`s under local Verilator 5.048 for BOTH codegens identically — known local-only artifact, NOT registered |
 | **(resolved 2026-06-13)** `bind ... with { ... }` signal remaps | ~~`dma_engine_tlm_target_test`, `dma_engine_tlm_mem_model_test`~~ — see the bus-bind-remap section below |
 | **(resolved 2026-06-13)** initiator-side bus-bound BFM (`hookable` bodies driving handshake channels) | ~~`regblock_*`~~ — see the initiator-side BFM section below |
 
-The remaining OOO-responder group (`tlm_target_ooo_lanes_test`,
-`tlm_pairing_arch_initiator_test`) needs the tagged RESPONDER lanes
-(per-tag dispatcher + lane coroutines + arbiter); the regblock `via`
-helpers are the *initiator-side* BFM, lowered by the separate slice
-below.
+The OOO-responder group (`tlm_target_ooo_lanes_test`,
+`tlm_pairing_arch_initiator_test`) is now lowered with the tagged
+RESPONDER lanes (per-tag dispatcher + lane coroutines + arbiter); see the
+OOO-responder lanes section below. The regblock `via` helpers are the
+*initiator-side* BFM, lowered by the separate slice further down.
+
+### target-side `out_of_order tags N` RESPONDER lanes — RESOLVED 2026-06-13
+
+> ~~target-side `out_of_order tags N` RESPONDER threads~~
+
+A bound-to TARGET responder serving an `out_of_order tags N` method now
+lowers to the multi-lane topology mirroring v1's
+`emit_bound_tagged_tlm_target_actors`: a per-tag **dispatcher** (a
+combinational `req_ready` accept gate via `_post_eval_services` + a
+coroutine that latches the request args and `req_tag` into a free lane),
+**N lane coroutines** (each runs the SAME responder loop-switch body as
+the blocking form, then publishes its result + `lane_rsp_valid`), and an
+**arbiter** coroutine that routes the highest-index ready lane's response
+back on the hidden `rsp_data`/`rsp_tag` wires, so tag 1 can complete
+before tag 0. **One new IR field** — `TargetTlmMethodSchema::ooo_tags:
+Option<u64>` (folded + range-checked `1..=64` at lowering, `None` for
+blocking) — no new IR variants; the lowered responder `function` is
+identical to the blocking form, only the surrounding actor topology
+differs. The responder body loop-switch is factored into a shared
+`emit_responder_loop_switch` reused by the blocking actor and each lane.
+The `tlm_call` trace payloads (request edge tagged with the accepted
+`_tag`, response edge with the selected `_sel`) match v1 byte-for-byte
+(`(int64_t)(...)` cast), so `harc trace-diff` is clean. **Registered**
+(2, each passes the v1-vs-tbir equivalence pair, trace-diff clean;
+`tlm_pairing_arch_initiator_test` also passes the ARCH-native-DUT sweep):
+`tlm_target_ooo_lanes_test` (pure OOO responder, 2 lanes, out-of-order
+completion), `tlm_pairing_arch_initiator_test` (mixed `blocking` +
+`out_of_order tags 2` responders against an ARCH-authored OOO initiator).
+See docs/tbir-mvp.md, the OOO-responder lanes slice. **Divergence from
+v1:** the per-tag arg/response arrays are `uint64_t` (the TB-IR value
+model) rather than v1's precise per-method C-types — the runtime
+`harc_read`/`harc_assign` helpers still width-correct the bus wires, so
+behavior and traces are identical.
 
 ### nested forwarding (responder re-issues a downstream TLM call) — RESOLVED 2026-06-13
 
@@ -312,9 +345,10 @@ v1-vs-tbir equivalence pair, trace-diff clean):
 `tlm_target_forwarding_test` (blocking downstream `back.read`),
 `tlm_target_fork_forwarding_test` (two `fork back.read_ooo` + `join_all`
 over an OOO downstream bus). See docs/tbir-mvp.md, the nested-forwarding
-slice. **Still rejected**: a responder SERVING an `out_of_order tags N`
-method (the OOO-responder LANE form — distinct from forwarding) and the
-known-artifact `tlm_pairing_arch_target_test`.
+slice. A responder SERVING an `out_of_order tags N` method (the
+OOO-responder LANE form — distinct from forwarding) is now resolved too;
+see the OOO-responder lanes section above. **Still gate-blocked** (not a
+lowering gap): the known-artifact `tlm_pairing_arch_target_test`.
 
 ### initiator-side `fork`/`join_all` TLM issue — RESOLVED 2026-06-13
 
@@ -332,7 +366,8 @@ tagged/untagged barrier are both rejected at lowering. **Registered** (1,
 pass, trace-diff clean): `tlm_method_bus_test`. See docs/tbir-mvp.md, the
 initiator-side fork/join_all slice. (A `fork` inside a RESPONDER body —
 nested forwarding — is now resolved too; see the nested-forwarding
-section above.) Still rejected: target-side OOO responder lanes.
+section above.) Target-side OOO responder lanes are now resolved as well
+— see the OOO-responder lanes section above.
 
 ### bus `bind ... with { ... }` signal remaps — RESOLVED 2026-06-13
 
@@ -407,8 +442,10 @@ BFM body, multiple bound instances of one BFM type per file. A
 initiator BFM is, e.g. BusAxiLite) is rejected: the bus-bind-remap slice
 honors remaps only on `tlm_method`-only buses, since handshake-channel
 access bypasses `wire_name` (`bind_remap_test` exercises exactly this and
-stays rejected). `tlm_pairing_arch_initiator_test` is a TLM-initiator
-fixture but stops earlier on `out_of_order tags N`.
+stays rejected). `tlm_pairing_arch_initiator_test` (a TLM-initiator
+fixture pairing an ARCH OOO initiator with HARC `blocking` +
+`out_of_order tags 2` RESPONDERS) is now fully lowered and registered —
+see the OOO-responder lanes section above.
 
 \* `tlm_pairing_arch_target_test` now LOWERS through the initiator-side
 fork/join_all slice and is v1↔tbir trace-diff clean, but its ARCH-DUT

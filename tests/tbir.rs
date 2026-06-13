@@ -3232,15 +3232,63 @@ fn tlm_target_fork_forwarding_lowers() {
     assert_eq!(joins, 1, "responder body must carry one join_all");
 }
 
-/// `out_of_order tags N` target threads stay out of subset (only
-/// `blocking` responders are lowered). The downstream-binding pre-scan
-/// does NOT enable a responder SERVING an OOO method — that needs the
-/// multi-lane dispatcher/arbiter (a follow-up slice).
+/// `out_of_order tags N` target threads ARE lowered: the responder
+/// method carries the folded, range-checked tag count on
+/// `TargetTlmMethodSchema::ooo_tags` (emission generates the per-tag
+/// dispatcher + N lane coroutines + arbiter). The blocking siblings keep
+/// `ooo_tags == None`. The mixed-mode pairing fixture exercises both.
 #[test]
-fn tlm_target_ooo_responder_unsupported() {
-    let err = lower_src(&fixture("tlm_pairing_arch_initiator_test.harc")).unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("out_of_order"), "{msg}");
+fn tlm_target_ooo_responder_lowers() {
+    let prog = lower_src(&fixture("tlm_pairing_arch_initiator_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let x = &prog.transactors[0];
+    let ooo = x
+        .target_methods
+        .iter()
+        .find(|m| m.name == "read_ooo")
+        .expect("read_ooo responder present");
+    assert_eq!(ooo.ooo_tags, Some(2), "read_ooo carries `out_of_order tags 2`");
+    // The blocking responders stay single-lane (no tag count).
+    for m in x.target_methods.iter().filter(|m| m.name != "read_ooo") {
+        assert_eq!(m.ooo_tags, None, "blocking responder `{}` has no tags", m.name);
+    }
+}
+
+/// A zero / out-of-range literal tag count is rejected at lowering
+/// (matching v1's 1..=64 gate), never silently emitted as a 0-lane or
+/// 65-lane responder.
+#[test]
+fn tlm_target_ooo_responder_tag_count_range() {
+    let mk = |tags: &str| {
+        format!(
+            r#"
+bus MemBus
+    tlm_method read_ooo(addr: uint<8>) -> uint<32>: out_of_order tags {tags};
+end bus MemBus
+
+transactor MemTarget bound to MemBus
+    thread bus.read_ooo(addr: uint<8>)
+        return 256 + addr
+    end thread
+end transactor MemTarget
+
+testbench Tb
+    dut : Dummy
+end testbench Tb
+
+impl T for Tb
+    let mem : MemBus = bind dut
+    let target : MemTarget passive = bind mem
+    run
+        wait 1 cycle
+    end run
+end impl T
+"#
+        )
+    };
+    assert!(lower_src(&mk("0")).is_err(), "tags 0 must be rejected");
+    assert!(lower_src(&mk("65")).is_err(), "tags 65 must be rejected");
+    assert!(lower_src(&mk("2")).is_ok(), "tags 2 must lower");
 }
 
 /// The responder `TbFunction`s are shared per transactor TYPE; binding

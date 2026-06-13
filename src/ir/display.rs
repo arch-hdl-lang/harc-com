@@ -145,11 +145,15 @@ impl Display for TbProgram {
             for tm in &x.target_methods {
                 writeln!(
                     f,
-                    "    target thread bus.{}({} arg{}){} = fn{}",
+                    "    target thread bus.{}({} arg{}){}{} = fn{}",
                     tm.name,
                     tm.args.len(),
                     if tm.args.len() == 1 { "" } else { "s" },
                     if tm.has_ret { " -> ret" } else { "" },
+                    match tm.ooo_tags {
+                        Some(n) => format!(" ooo tags {n}"),
+                        None => String::new(),
+                    },
                     tm.function.0
                 )?;
             }

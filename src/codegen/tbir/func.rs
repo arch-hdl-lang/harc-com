@@ -1647,6 +1647,28 @@ pub(super) fn emit_target_actor(
             .ok();
         };
 
+        // `out_of_order tags N` responder: emit the multi-lane topology
+        // (per-tag dispatcher + N lane coroutines + arbiter routing by
+        // hidden tag wires), mirroring v1's
+        // `emit_bound_tagged_tlm_target_actors`. The blocking path below
+        // is the single in-order responder coroutine.
+        if let Some(tag_count) = tm.ooo_tags {
+            emit_tagged_target_actors(
+                out,
+                prog,
+                &cx,
+                func,
+                &names,
+                tm,
+                instance,
+                &wire,
+                tag_count as usize,
+                bindings,
+                depth,
+            )?;
+            continue;
+        }
+
         writeln!(out, "{pad}harc_rt::ThreadSlot {slot_var};").ok();
         writeln!(out, "{pad}sched.slots.push_back(&{slot_var});").ok();
         writeln!(
@@ -1686,59 +1708,7 @@ pub(super) fn emit_target_actor(
         // slot) and run the switch. `Return` sets `__done`; the captured
         // ret local survives the loop for the response drive.
         writeln!(out, "{pad2}{{ // {} (TB-IR responder loop-switch)", func.name).ok();
-        declare_locals(out, prog, func, &names, nparams, depth + 3)?;
-        writeln!(out, "{}int __bb = {};", INDENT.repeat(depth + 3), func.entry.0).ok();
-        writeln!(out, "{}bool __done = false;", INDENT.repeat(depth + 3)).ok();
-        writeln!(out, "{}while (!__done) {{", INDENT.repeat(depth + 3)).ok();
-        writeln!(out, "{}switch (__bb) {{", INDENT.repeat(depth + 4)).ok();
-        let pad4 = INDENT.repeat(depth + 4);
-        let pad5 = INDENT.repeat(depth + 5);
-        for (bi, block) in func.blocks.iter().enumerate() {
-            writeln!(out, "{pad4}case {bi}: {{").ok();
-            for s in &block.stmts {
-                // The responder body runs in test scope: a downstream
-                // blocking TLM call edge (`back.read(...)` — nested
-                // forwarding) resolves against the test's bus bindings,
-                // so pass them through. `emit_transactor_call` uses
-                // `co_await` (the responder body is a coroutine), and an
-                // unresolved `back` surfaces as an EmitError there.
-                emit_stmt(out, prog, &cx, &[], bindings, s, depth + 5)?;
-            }
-            match &block.terminator {
-                Terminator::Jump(b) => {
-                    writeln!(out, "{pad5}__bb = {};", b.0).ok();
-                }
-                Terminator::Branch(c, t, f) => {
-                    let cond = expr_cpp(&cx, c)?;
-                    writeln!(out, "{pad5}if ({cond}) {{ __bb = {}; }} else {{ __bb = {}; }}", t.0, f.0).ok();
-                }
-                Terminator::WaitCycles(n, None, b) => {
-                    let n = expr_cpp(&cx, n)?;
-                    writeln!(out, "{pad5}co_await harc_rt::wait_cycles(_slot, (uint32_t)({n}));").ok();
-                    writeln!(out, "{pad5}__bb = {};", b.0).ok();
-                }
-                Terminator::WaitUntil { preds, mode, succ } => {
-                    let cond = preds_cpp(&cx, preds, *mode)?;
-                    writeln!(out, "{pad5}co_await harc_rt::wait_until(_slot, [&]{{ return {cond}; }});").ok();
-                    writeln!(out, "{pad5}__bb = {};", succ.0).ok();
-                }
-                Terminator::Return => {
-                    writeln!(out, "{pad5}__done = true;").ok();
-                }
-                other => {
-                    return Err(EmitError(format!(
-                        "tbir: target responder `{}` contains terminator {other:?} — \
-                         lowering gate failed",
-                        func.name
-                    )));
-                }
-            }
-            writeln!(out, "{pad5}break;").ok();
-            writeln!(out, "{pad4}}}").ok();
-        }
-        writeln!(out, "{pad4}default: __done = true; break;").ok();
-        writeln!(out, "{}}}", INDENT.repeat(depth + 4)).ok(); // switch
-        writeln!(out, "{}}}", INDENT.repeat(depth + 3)).ok(); // while
+        emit_responder_loop_switch(out, prog, &cx, func, &names, nparams, bindings, depth + 3)?;
         // Drive the response payload, trace, handshake.
         if tm.has_ret {
             let ret = func.ret.ok_or_else(|| {
@@ -1772,6 +1742,364 @@ pub(super) fn emit_target_actor(
         writeln!(out, "{pad1}co_return;").ok();
         writeln!(out, "{pad}}}(&{slot_var});").ok();
     }
+    Ok(())
+}
+
+/// Emit the responder body as a coroutine loop-switch into the current
+/// scope. The request-arg locals (`func.params`) are assumed already
+/// declared by the caller; this declares the remaining locals (incl. the
+/// `ret` slot, which survives the loop for the caller's response drive),
+/// then runs a `while (!__done) switch (__bb)` over the lowered blocks.
+/// A `Return` terminator sets `__done`; `wait`/`wait until` terminators
+/// `co_await` the scheduler (the responder body is a coroutine). Shared
+/// verbatim by the blocking single-responder path and each OOO lane.
+#[allow(clippy::too_many_arguments)]
+fn emit_responder_loop_switch(
+    out: &mut String,
+    prog: &TbProgram,
+    cx: &ECx<'_>,
+    func: &TbFunction,
+    names: &[String],
+    nparams: usize,
+    bindings: &[BusBindingSchema],
+    depth: usize,
+) -> Result<(), EmitError> {
+    declare_locals(out, prog, func, names, nparams, depth)?;
+    writeln!(out, "{}int __bb = {};", INDENT.repeat(depth), func.entry.0).ok();
+    writeln!(out, "{}bool __done = false;", INDENT.repeat(depth)).ok();
+    writeln!(out, "{}while (!__done) {{", INDENT.repeat(depth)).ok();
+    writeln!(out, "{}switch (__bb) {{", INDENT.repeat(depth + 1)).ok();
+    let pad_case = INDENT.repeat(depth + 1);
+    let pad_body = INDENT.repeat(depth + 2);
+    for (bi, block) in func.blocks.iter().enumerate() {
+        writeln!(out, "{pad_case}case {bi}: {{").ok();
+        for s in &block.stmts {
+            // The responder body runs in test scope: a downstream
+            // blocking TLM call edge (`back.read(...)` — nested
+            // forwarding) resolves against the test's bus bindings, so
+            // pass them through. `emit_transactor_call` uses `co_await`
+            // (the responder body is a coroutine), and an unresolved
+            // `back` surfaces as an EmitError there.
+            emit_stmt(out, prog, cx, &[], bindings, s, depth + 2)?;
+        }
+        match &block.terminator {
+            Terminator::Jump(b) => {
+                writeln!(out, "{pad_body}__bb = {};", b.0).ok();
+            }
+            Terminator::Branch(c, t, f) => {
+                let cond = expr_cpp(cx, c)?;
+                writeln!(
+                    out,
+                    "{pad_body}if ({cond}) {{ __bb = {}; }} else {{ __bb = {}; }}",
+                    t.0, f.0
+                )
+                .ok();
+            }
+            Terminator::WaitCycles(n, None, b) => {
+                let n = expr_cpp(cx, n)?;
+                writeln!(
+                    out,
+                    "{pad_body}co_await harc_rt::wait_cycles(_slot, (uint32_t)({n}));"
+                )
+                .ok();
+                writeln!(out, "{pad_body}__bb = {};", b.0).ok();
+            }
+            Terminator::WaitUntil { preds, mode, succ } => {
+                let cond = preds_cpp(cx, preds, *mode)?;
+                writeln!(
+                    out,
+                    "{pad_body}co_await harc_rt::wait_until(_slot, [&]{{ return {cond}; }});"
+                )
+                .ok();
+                writeln!(out, "{pad_body}__bb = {};", succ.0).ok();
+            }
+            Terminator::Return => {
+                writeln!(out, "{pad_body}__done = true;").ok();
+            }
+            other => {
+                return Err(EmitError(format!(
+                    "tbir: target responder `{}` contains terminator {other:?} — \
+                     lowering gate failed",
+                    func.name
+                )));
+            }
+        }
+        writeln!(out, "{pad_body}break;").ok();
+        writeln!(out, "{pad_case}}}").ok();
+    }
+    writeln!(out, "{pad_case}default: __done = true; break;").ok();
+    writeln!(out, "{}}}", INDENT.repeat(depth + 1)).ok(); // switch
+    writeln!(out, "{}}}", INDENT.repeat(depth)).ok(); // while
+    Ok(())
+}
+
+/// Emit the `out_of_order tags N` RESPONDER topology for one target
+/// method, mirroring v1's `emit_bound_tagged_tlm_target_actors`:
+///
+///  1. Per-tag shared state arrays (`std::array<…, N>`): `lane_busy`,
+///     `lane_req_valid`, `lane_rsp_valid`, one arg array per request arg,
+///     and (value methods) a `lane_rsp_data` array. The TB-IR value model
+///     is uniformly `uint64_t` (unlike v1's precise C-types), so every
+///     array element is `uint64_t` / `bool`; the runtime `harc_read`/
+///     `harc_assign` helpers still width-correct the bus wires.
+///  2. A combinational `_post_eval_services` closure that drives
+///     `req_ready` = "a lane is free for the requested (or any) tag",
+///     matching v1's dispatcher accept gate.
+///  3. A dispatcher coroutine: awaits an accepted request, latches the
+///     args + tag into the lane's slot, marks it busy/pending, traces the
+///     `request` edge (with `_tag`), ticks.
+///  4. N lane coroutines: each awaits its `lane_req_valid`, binds the
+///     latched args, runs the responder body (loop-switch), stores the
+///     return into `lane_rsp_data`, raises `lane_rsp_valid`, awaits the
+///     arbiter clearing it, drops `lane_busy`.
+///  5. An arbiter coroutine: awaits any lane response, selects the
+///     highest-index ready lane (v1's order), drives `rsp_data`/`rsp_tag`,
+///     traces the `response` edge (with `_sel`), runs the rsp handshake,
+///     clears the lane.
+///
+/// The TB-IR sim path is single-threaded (no `--mt`), so every coroutine
+/// pushes onto the shared `sched`. Trace payloads (incl. the routed tag)
+/// match v1 byte-for-byte so `harc trace-diff` stays clean.
+#[allow(clippy::too_many_arguments)]
+fn emit_tagged_target_actors(
+    out: &mut String,
+    prog: &TbProgram,
+    cx: &ECx<'_>,
+    func: &TbFunction,
+    names: &[String],
+    tm: &crate::ir::TargetTlmMethodSchema,
+    instance: &str,
+    wire: &dyn Fn(&str) -> String,
+    tag_count: usize,
+    bindings: &[BusBindingSchema],
+    depth: usize,
+) -> Result<(), EmitError> {
+    let method = &tm.name;
+    let pad = INDENT.repeat(depth);
+    let prefix = format!("_{instance}_{method}_target_ooo");
+    let lane_busy = format!("{prefix}_lane_busy");
+    let lane_req_valid = format!("{prefix}_lane_req_valid");
+    let lane_rsp_valid = format!("{prefix}_lane_rsp_valid");
+    let lane_rsp_data = format!("{prefix}_lane_rsp_data");
+    let dispatcher_slot = format!("{prefix}_dispatcher_slot");
+    let arbiter_slot = format!("{prefix}_arbiter_slot");
+
+    // --- (1) Per-tag shared state arrays. ---
+    writeln!(
+        out,
+        "{pad}std::array<std::atomic<bool>, {tag_count}> {lane_busy}{{}};"
+    )
+    .ok();
+    writeln!(
+        out,
+        "{pad}std::array<std::atomic<bool>, {tag_count}> {lane_req_valid}{{}};"
+    )
+    .ok();
+    writeln!(
+        out,
+        "{pad}std::array<std::atomic<bool>, {tag_count}> {lane_rsp_valid}{{}};"
+    )
+    .ok();
+    for arg in &tm.args {
+        let arr = format!("{prefix}_arg_{arg}");
+        writeln!(out, "{pad}std::array<uint64_t, {tag_count}> {arr}{{}};").ok();
+    }
+    if tm.has_ret {
+        writeln!(
+            out,
+            "{pad}std::array<uint64_t, {tag_count}> {lane_rsp_data}{{}};"
+        )
+        .ok();
+    }
+
+    // --- (2) Combinational dispatcher accept gate (`req_ready`). ---
+    writeln!(out, "{pad}_post_eval_services.push_back([&]() {{").ok();
+    let pad1 = INDENT.repeat(depth + 1);
+    let pad2 = INDENT.repeat(depth + 2);
+    writeln!(out, "{pad1}bool _tlm_ready = false;").ok();
+    writeln!(out, "{pad1}if ({}) {{", wire("req_valid")).ok();
+    writeln!(out, "{pad2}auto _tag = (size_t){};", wire("req_tag")).ok();
+    writeln!(
+        out,
+        "{pad2}_tlm_ready = _tag < {tag_count} && !{lane_busy}[_tag].load() && !{lane_req_valid}[_tag].load();"
+    )
+    .ok();
+    writeln!(out, "{pad1}}} else {{").ok();
+    writeln!(
+        out,
+        "{pad2}for (size_t i = 0; i < {tag_count}; ++i) if (!{lane_busy}[i].load() && !{lane_req_valid}[i].load()) {{ _tlm_ready = true; break; }}"
+    )
+    .ok();
+    writeln!(out, "{pad1}}}").ok();
+    writeln!(out, "{pad1}{} = _tlm_ready;", wire("req_ready")).ok();
+    writeln!(out, "{pad}}});").ok();
+
+    // --- (3) Dispatcher coroutine. ---
+    writeln!(out, "{pad}harc_rt::ThreadSlot {dispatcher_slot};").ok();
+    writeln!(out, "{pad}sched.slots.push_back(&{dispatcher_slot});").ok();
+    writeln!(
+        out,
+        "{pad}{dispatcher_slot}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+    )
+    .ok();
+    writeln!(out, "{pad1}{} = 0;", wire("req_ready")).ok();
+    writeln!(out, "{pad1}while (true) {{").ok();
+    writeln!(
+        out,
+        "{pad2}co_await harc_rt::wait_until(_slot, [&]{{ return {} && {}; }});",
+        wire("req_valid"),
+        wire("req_ready")
+    )
+    .ok();
+    writeln!(out, "{pad2}{{").ok();
+    let pad3 = INDENT.repeat(depth + 3);
+    writeln!(out, "{pad3}auto _tag = (size_t){};", wire("req_tag")).ok();
+    for arg in &tm.args {
+        let arr = format!("{prefix}_arg_{arg}");
+        writeln!(
+            out,
+            "{pad3}{arr}[_tag] = harc_rt::harc_read({});",
+            wire(arg)
+        )
+        .ok();
+    }
+    writeln!(out, "{pad3}{lane_busy}[_tag].store(true);").ok();
+    writeln!(out, "{pad3}{lane_req_valid}[_tag].store(true);").ok();
+    writeln!(
+        out,
+        "{pad3}{instance}._last_in_cycle = (uint64_t)cycle_count;"
+    )
+    .ok();
+    writeln!(
+        out,
+        "{pad3}trace.tlm_call(cycle_count, \"{}\", \"bus\", \"{}\", \"request\", \"target\", (int64_t)(_tag));",
+        escape_c(instance),
+        escape_c(method)
+    )
+    .ok();
+    writeln!(out, "{pad2}}}").ok();
+    writeln!(out, "{pad2}co_await harc_rt::wait_cycles(_slot, 1);").ok();
+    writeln!(out, "{pad1}}}").ok();
+    writeln!(out, "{pad1}co_return;").ok();
+    writeln!(out, "{pad}}}(&{dispatcher_slot});").ok();
+
+    // --- (4) Lane coroutines. ---
+    let nparams = func.params.len();
+    for lane in 0..tag_count {
+        let lane_slot = format!("{prefix}_lane{lane}_slot");
+        writeln!(out, "{pad}harc_rt::ThreadSlot {lane_slot};").ok();
+        writeln!(out, "{pad}sched.slots.push_back(&{lane_slot});").ok();
+        writeln!(
+            out,
+            "{pad}{lane_slot}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+        )
+        .ok();
+        writeln!(out, "{pad1}while (true) {{").ok();
+        writeln!(
+            out,
+            "{pad2}co_await harc_rt::wait_until(_slot, [&]{{ return {lane_req_valid}[{lane}].load(); }});"
+        )
+        .ok();
+        writeln!(out, "{pad2}{lane_req_valid}[{lane}].store(false);").ok();
+        // Bind the latched request args into the body's parameter locals.
+        for (i, arg) in tm.args.iter().enumerate() {
+            let local = &names[i];
+            let arr = format!("{prefix}_arg_{arg}");
+            writeln!(out, "{pad2}uint64_t {local} = {arr}[{lane}];").ok();
+        }
+        // Responder body loop-switch (shared with the blocking path).
+        writeln!(
+            out,
+            "{pad2}{{ // {} (TB-IR OOO lane {lane} loop-switch)",
+            func.name
+        )
+        .ok();
+        emit_responder_loop_switch(out, prog, cx, func, names, nparams, bindings, depth + 3)?;
+        if tm.has_ret {
+            let ret = func.ret.ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: OOO target responder `{}` declares a return but carries no ret slot",
+                    func.name
+                ))
+            })?;
+            writeln!(
+                out,
+                "{pad3}{lane_rsp_data}[{lane}] = {};",
+                &names[ret.index()]
+            )
+            .ok();
+        }
+        writeln!(out, "{pad2}}}").ok(); // body scope
+        writeln!(out, "{pad2}{lane_rsp_valid}[{lane}].store(true);").ok();
+        writeln!(
+            out,
+            "{pad2}co_await harc_rt::wait_until(_slot, [&]{{ return !{lane_rsp_valid}[{lane}].load(); }});"
+        )
+        .ok();
+        writeln!(out, "{pad2}{lane_busy}[{lane}].store(false);").ok();
+        writeln!(out, "{pad1}}}").ok();
+        writeln!(out, "{pad1}co_return;").ok();
+        writeln!(out, "{pad}}}(&{lane_slot});").ok();
+    }
+
+    // --- (5) Arbiter coroutine. ---
+    writeln!(out, "{pad}harc_rt::ThreadSlot {arbiter_slot};").ok();
+    writeln!(out, "{pad}sched.slots.push_back(&{arbiter_slot});").ok();
+    writeln!(
+        out,
+        "{pad}{arbiter_slot}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+    )
+    .ok();
+    writeln!(out, "{pad1}{} = 0;", wire("rsp_valid")).ok();
+    writeln!(out, "{pad1}while (true) {{").ok();
+    writeln!(
+        out,
+        "{pad2}co_await harc_rt::wait_until(_slot, [&]{{ for (size_t i = 0; i < {tag_count}; ++i) if ({lane_rsp_valid}[i].load()) return true; return false; }});"
+    )
+    .ok();
+    writeln!(out, "{pad2}int _sel = -1;").ok();
+    writeln!(
+        out,
+        "{pad2}for (int i = {tag_count} - 1; i >= 0; --i) if ({lane_rsp_valid}[(size_t)i].load()) {{ _sel = i; break; }}"
+    )
+    .ok();
+    writeln!(out, "{pad2}if (_sel >= 0) {{").ok();
+    if tm.has_ret {
+        writeln!(
+            out,
+            "{pad3}harc_rt::harc_assign({}, {lane_rsp_data}[(size_t)_sel]);",
+            wire("rsp_data")
+        )
+        .ok();
+    }
+    writeln!(out, "{pad3}{} = _sel;", wire("rsp_tag")).ok();
+    writeln!(
+        out,
+        "{pad3}trace.tlm_call(cycle_count, \"{}\", \"bus\", \"{}\", \"response\", \"target\", (int64_t)(_sel));",
+        escape_c(instance),
+        escape_c(method)
+    )
+    .ok();
+    writeln!(out, "{pad3}{} = 1;", wire("rsp_valid")).ok();
+    writeln!(
+        out,
+        "{pad3}if (!{}) co_await harc_rt::wait_until(_slot, [&]{{ return {}; }});",
+        wire("rsp_ready"),
+        wire("rsp_ready")
+    )
+    .ok();
+    writeln!(out, "{pad3}co_await harc_rt::wait_cycles(_slot, 1);").ok();
+    writeln!(out, "{pad3}{} = 0;", wire("rsp_valid")).ok();
+    writeln!(out, "{pad3}{lane_rsp_valid}[(size_t)_sel].store(false);").ok();
+    writeln!(
+        out,
+        "{pad3}{instance}._last_out_cycle = (uint64_t)cycle_count;"
+    )
+    .ok();
+    writeln!(out, "{pad2}}}").ok();
+    writeln!(out, "{pad1}}}").ok();
+    writeln!(out, "{pad1}co_return;").ok();
+    writeln!(out, "{pad}}}(&{arbiter_slot});").ok();
     Ok(())
 }
 
