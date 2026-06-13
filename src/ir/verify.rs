@@ -992,10 +992,24 @@ impl Checker<'_> {
     /// this position — they ride `Stmt::TransactorCall` and are checked
     /// by `check_transactor_call`.
     fn check_bus_call_edge(&mut self, bus_field: &str, method: &str, args: &[Expr]) {
-        if !matches!(self.func.kind, FunctionKind::Run | FunctionKind::Check) {
+        // A `TransactorBody` function may carry a downstream blocking
+        // bus-call edge when it is a bound-to target responder
+        // re-issuing a TLM call (nested forwarding). The responder body
+        // is lowered standalone (no owner testbench), so the binding's
+        // wire names cannot be resolved here — emission resolves the edge
+        // against the binding testbench's `bus_bindings` (raising an
+        // EmitError if the downstream binding is absent). Only argument
+        // purity is checked here (below); the Run/Check resolution arm is
+        // skipped for the owner-less responder case.
+        if matches!(self.func.kind, FunctionKind::TransactorBody { .. })
+            && self.func.owner.is_none()
+        {
+            // Downstream forwarding edge — defer wire resolution to emit.
+        } else if !matches!(self.func.kind, FunctionKind::Run | FunctionKind::Check) {
             self.bad_transactor(format!(
                 "`{bus_field}.{method}` call edge in a {:?}-kind function \
-                 (allowed only in Run/Check bodies)",
+                 (allowed only in Run/Check bodies or a bound-to responder \
+                 forwarding a downstream call)",
                 self.func.kind
             ));
         } else {

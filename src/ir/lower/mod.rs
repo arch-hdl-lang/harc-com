@@ -136,6 +136,42 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     }
     let used_tbs: HashSet<&String> = tb_of_test.values().collect();
 
+    // Pre-scan of test-scope bus bindings (`let <name> : <Bus> = bind
+    // ...`) across every (desugared) test, keyed by binding name. A
+    // bound-to target responder body may re-issue a downstream blocking
+    // TLM call (`let raw = back.read(addr)` — nested forwarding) against
+    // a bus binding that the test, not the transactor, declares. The
+    // transactor is lowered before any test (so its responder bodies are
+    // ready when a test binds the actor), so the downstream binding's
+    // bus type is not yet in scope at responder-lowering time. This
+    // pre-scan makes those bindings visible to the responder body so the
+    // downstream call lowers to a `TransactorMethod` call edge (resolved
+    // against the test's `bus_bindings` at emit), instead of falling
+    // through to the generic transactor-method rejection.
+    //
+    // First binding name wins on a cross-test collision (the responder
+    // body is shared, so its downstream bus type must be unambiguous; a
+    // genuine type clash surfaces as a wire-resolution error at emit).
+    let mut downstream_bus_binds: HashMap<String, BusDecl> = HashMap::new();
+    for it in &file.items {
+        let Item::Test(t) = it else { continue };
+        for ti in &t.items {
+            let TestItem::Let(l) = ti else { continue };
+            if !l.bind {
+                continue;
+            }
+            let Some(bus_name) = type_simple_name(l.ty.as_ref()) else {
+                continue;
+            };
+            let Some(decl) = buses.get(bus_name) else {
+                continue;
+            };
+            downstream_bus_binds
+                .entry(l.name.name.clone())
+                .or_insert_with(|| (*decl).clone());
+        }
+    }
+
     // File-scope named integer constants: `const NAME : Ty = <lit>`
     // (v1: `static constexpr <cty> NAME = <expr>;`) and `enum Color {
     // RED, ... }` variant names (v1: variant index, first definition
@@ -650,6 +686,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &helper_registry,
             &helper_ctx,
             &buses,
+            &downstream_bus_binds,
             &constraint_sites,
         )?;
         prog.transactors.push(schema);

@@ -86,7 +86,7 @@ pub(super) fn emit_function(
     depth: usize,
 ) -> Result<(), EmitError> {
     let names = cpp_local_names(func);
-    let cx = ECx { func, names: &names, lanes, self_subst: None, dut_type };
+    let cx = ECx { func, names: &names, lanes, self_subst: None, dut_type, trace_component: "" };
     let pad = INDENT.repeat(depth);
     let pad1 = INDENT.repeat(depth + 1);
     let pad2 = INDENT.repeat(depth + 2);
@@ -275,6 +275,7 @@ pub(super) fn emit_tseq(
         lanes: &empty_lanes,
         self_subst: None,
         dut_type: "",
+        trace_component: "",
     };
     let nparams = func.params.len();
     let pad = INDENT.repeat(depth);
@@ -420,7 +421,7 @@ pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Resul
     // Pure helpers are scalar-only: no DUT access, so no lane table and
     // no probe access (`dut_type` unused → `""`).
     let empty_lanes = HashMap::new();
-    let cx = ECx { func, names: &names, lanes: &empty_lanes, self_subst: None, dut_type: "" };
+    let cx = ECx { func, names: &names, lanes: &empty_lanes, self_subst: None, dut_type: "", trace_component: "" };
     let nparams = func.params.len();
 
     let ret_ty = if func.ret.is_some() { "uint64_t" } else { "void" };
@@ -842,7 +843,7 @@ fn emit_tlm_fork(
         writeln!(out, "{pad}{} = {tag};", wire("req_tag")).ok();
     }
     let tag_arg = desc.tag.map(|t| format!("(int64_t){t}"));
-    emit_tlm_trace(out, &pad, &desc.bus_field, &desc.method, "request", "initiator", tag_arg.as_deref());
+    emit_tlm_trace(out, &pad, cx.trace_component, &desc.bus_field, &desc.method, "request", "initiator", tag_arg.as_deref());
     writeln!(out, "{pad}{} = 1;", wire("req_valid")).ok();
     writeln!(
         out,
@@ -912,7 +913,7 @@ fn emit_ordered_tlm_join_all(
             )
             .ok();
         }
-        emit_tlm_trace(out, &pad, &p.bus_field, &p.method, "response", "initiator", None);
+        emit_tlm_trace(out, &pad, cx.trace_component, &p.bus_field, &p.method, "response", "initiator", None);
         writeln!(out, "{pad}co_await harc_rt::wait_cycles(_slot, 1);").ok();
         writeln!(out, "{pad}{} = 0;", wire("rsp_ready")).ok();
     }
@@ -974,7 +975,7 @@ fn emit_tagged_tlm_join_all(
             )
             .ok();
         }
-        emit_tlm_trace(out, &pad3, &p.bus_field, &p.method, "response", "initiator", Some(&format!("(int64_t){tag}")));
+        emit_tlm_trace(out, &pad3, cx.trace_component, &p.bus_field, &p.method, "response", "initiator", Some(&format!("(int64_t){tag}")));
         writeln!(out, "{pad3}{} = 1;", wire("rsp_ready")).ok();
         writeln!(out, "{pad3}_tlm_seen_{idx} = true;").ok();
         writeln!(out, "{pad3}_tlm_pending--;").ok();
@@ -1011,11 +1012,15 @@ fn resolve_binding<'a>(
 }
 
 /// One `trace.tlm_call(...)` line, with the OOO tag appended when present
-/// (mirrors v1's `emit_tlm_call_trace_event`). Component context is empty
-/// (test-run scope), matching the blocking-call trace payloads.
+/// (mirrors v1's `emit_tlm_call_trace_event`). `component` is empty at
+/// test-run scope, or the responder-instance name when the fork/join is
+/// emitted inside a bound-target responder body (nested fork-forwarding)
+/// — matching v1's `current_component_instance` so the trace diffs clean.
+#[allow(clippy::too_many_arguments)]
 fn emit_tlm_trace(
     out: &mut String,
     pad: &str,
+    component: &str,
     bus: &str,
     method: &str,
     phase: &str,
@@ -1024,7 +1029,8 @@ fn emit_tlm_trace(
 ) {
     write!(
         out,
-        "{pad}trace.tlm_call(cycle_count, \"\", \"{}\", \"{}\", \"{phase}\", \"{direction}\"",
+        "{pad}trace.tlm_call(cycle_count, \"{}\", \"{}\", \"{}\", \"{phase}\", \"{direction}\"",
+        escape_c(component),
         escape_c(bus),
         escape_c(method)
     )
@@ -1096,7 +1102,8 @@ fn emit_transactor_call(
     let trace_event = |out: &mut String, phase: &str| {
         writeln!(
             out,
-            "{pad}trace.tlm_call(cycle_count, \"\", \"{}\", \"{}\", \"{phase}\", \"initiator\");",
+            "{pad}trace.tlm_call(cycle_count, \"{}\", \"{}\", \"{}\", \"{phase}\", \"initiator\");",
+            escape_c(cx.trace_component),
             escape_c(bus_field),
             escape_c(method)
         )
@@ -1218,6 +1225,7 @@ pub(super) fn emit_method(
         lanes: &empty_lanes,
         self_subst: None,
         dut_type: &schema.dut_type,
+        trace_component: "",
     };
     let nparams = func.params.len();
     let pad = INDENT.repeat(depth);
@@ -1446,6 +1454,7 @@ pub(super) fn clause_expr_cpp(
         lanes: &empty_lanes,
         self_subst: Some(instance),
         dut_type: "",
+        trace_component: "",
     };
     expr_cpp(&cx, e)
 }
@@ -1470,6 +1479,7 @@ fn emit_component_fn_lambda(
         lanes: &empty_lanes,
         self_subst: None,
         dut_type: "",
+        trace_component: "",
     };
     let nparams = func.params.len();
     let pad = INDENT.repeat(depth);
@@ -1598,7 +1608,17 @@ pub(super) fn emit_target_actor(
         let names = cpp_local_names(func);
         let empty_lanes = HashMap::new();
         // Target-TLM responder bodies are wire-protocol only; no probes.
-        let cx = ECx { func, names: &names, lanes: &empty_lanes, self_subst: None, dut_type: "" };
+        // A downstream forwarded `back.read(...)` initiator trace event
+        // carries the responder-instance name in its `component` field
+        // (v1's `current_component_instance`), so set the trace context.
+        let cx = ECx {
+            func,
+            names: &names,
+            lanes: &empty_lanes,
+            self_subst: None,
+            dut_type: "",
+            trace_component: instance,
+        };
         let wire = |sig: &str| match binding {
             Some(b) => format!("dut->{}", b.wire_name(method, sig)),
             None => format!("dut->{bus_field}_{method}_{sig}"),
@@ -1664,10 +1684,13 @@ pub(super) fn emit_target_actor(
         for (bi, block) in func.blocks.iter().enumerate() {
             writeln!(out, "{pad4}case {bi}: {{").ok();
             for s in &block.stmts {
-                // Responder bodies have no testbench bus-binding scope;
-                // an empty binding table is correct (any call edge here
-                // is a lowering bug → errors in emit_stmt).
-                emit_stmt(out, prog, &cx, &[], &[], s, depth + 5)?;
+                // The responder body runs in test scope: a downstream
+                // blocking TLM call edge (`back.read(...)` — nested
+                // forwarding) resolves against the test's bus bindings,
+                // so pass them through. `emit_transactor_call` uses
+                // `co_await` (the responder body is a coroutine), and an
+                // unresolved `back` surfaces as an EmitError there.
+                emit_stmt(out, prog, &cx, &[], bindings, s, depth + 5)?;
             }
             match &block.terminator {
                 Terminator::Jump(b) => {

@@ -28,6 +28,15 @@ pub(super) struct ECx<'a> {
     /// component-self context) is emitted inside a per-instance
     /// `_checkers` closure, which has no `self` in scope.
     pub self_subst: Option<&'a str>,
+    /// Component-instance context for `tlm_call` trace events emitted by
+    /// a bus-call edge inside this body (v1's
+    /// `current_component_instance`). Empty (`""`) at test-run scope; the
+    /// responder-instance name (`"target"`) when emitting a bound-to
+    /// target responder body, so a downstream forwarded `back.read(...)`
+    /// initiator trace event carries the same `component` field v1
+    /// records. Most ECx sites can never host such an edge and leave it
+    /// `""`.
+    pub trace_component: &'a str,
 }
 
 /// C++ symbol for a lowered pure-helper function. Prefixed so a HARC

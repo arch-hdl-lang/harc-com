@@ -137,3 +137,5 @@ transactor_active_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 transactor_passive_only_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 axilite_bound_mon_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 axilite_multi_payload_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
+tlm_target_forwarding_test | TlmForwardingTop | TlmForwardingTop.sv TlmMemory.sv TlmReadInitiatorPair.sv | - | pass
+tlm_target_fork_forwarding_test | TlmForkForwardingTop | TlmForkForwardingTop.sv TlmMemory.sv TlmReadInitiatorPair.sv | - | pass
