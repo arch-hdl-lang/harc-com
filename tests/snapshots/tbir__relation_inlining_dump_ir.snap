@@ -1,0 +1,50 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 RelationInliningTb { dut: Top }
+  test RelationInliningTest tb=tb0 run=fn0 check=- clock=clk@10000ps(SysDomain)
+  record r0 Req
+    addr : uint<32>
+    len : uint<8>
+
+fn fn0 run_RelationInliningTest [kind=Run, owner=tb0]
+  locals:
+    %0 i : unknown
+    %1 r : record(r0)
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.en, 0)
+    -> WaitCycles(2, b1)
+
+  b1:
+    DutWrite(dut.rst, 0)
+    -> WaitCycles(1, b2)
+
+  b2:
+    Assign(%i, 0)
+    -> Jump(b3)
+
+  b3:
+    -> Branch((%i < 20), b4, b6)
+
+  b4:
+    RecordInit(%r, r0)
+    -> Randomize { %r, constraints: c0, b7 }
+
+  b5:
+    Assign(%i, (%i + 1))
+    -> Jump(b3)
+
+  b6:
+    Log(info, "PASS: 20 randomize-with-relation calls satisfied all 3 inlined constraints")
+    -> Return
+
+  b7:
+    AssertCheck { cond: ((%r.len >= 1) && (%r.len <= 16)), on_fail: "iter %lld: len=%lld violates `r.len in [1..16]`", %i, %r.len }
+    AssertCheck { cond: ((%r.addr % 4) == 0), on_fail: "iter %lld: addr=0x%08llx not 4-aligned", %i, %r.addr }
+    AssertCheck { cond: (%r.addr >= 65536), on_fail: "iter %lld: addr=0x%08llx below 0x10000", %i, %r.addr }
+    -> Jump(b5)

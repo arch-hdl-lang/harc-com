@@ -226,7 +226,7 @@ Residual first-blocker map (re-run of `harc dump-ir`, 2026-06-12):
 | `transactor` (5) | `axilite_env_test`, `axilite_seqdrv_test`, `axilite_hooks_test`, `transactor_parse_test`, `transactor_active_test` |
 | ~~`scoreboard` (5)~~ → **ALL RESOLVED 2026-06-13** | ~~`axilite_bound_mon_test`~~, ~~`axilite_multi_payload_test`~~, ~~`transactor_passive_only_test`~~ (bound-to monitor slice), ~~`transactor_agent_mode_test`~~, ~~`transactor_env_mode_test`~~ (agent-mode + cycle-trigger slice) — **all five RESOLVED 2026-06-13; registered, trace-clean.** |
 | `sequencer` (1) | `axilite_connect_test` |
-| `relation` (1) | `relation_inlining_test` |
+| ~~`relation` (1)~~ → **RESOLVED 2026-06-13 (singletons batch 2)** | ~~`relation_inlining_test`~~ — registered, trace-clean. `relation` decls are inert at the file gate; `randomize(r) with R(r)` inlines all three relations' constraints in the typed solver backend (block + alias + alias-of-relations). |
 | `randomize` (statement-level, 1) | `axilite_constraint_test` (`AxiLiteConstraintTest`) — **RESOLVED 2026-06-13 by the randomize slice; registered, trace-clean. See the `randomize` group below.** |
 
 The blocker message reports whichever construct lowering hits first
@@ -859,16 +859,27 @@ Status after the singleton-blocker batch (2026-06-12):
 
 | Fixture | Was blocked on | Outcome |
 |---|---|---|
-| `pipe_reg_test` | `property` construct | **Skipped** — SVA-shaped, belongs to its own slice |
+| `pipe_reg_test` | `property` construct | **RESOLVED + registered (singletons batch 2, 2026-06-13)** — an SVA-style `property NAME ... end property` declaration is accepted at the file gate but inert: it is only observable via an `assert property NAME` / named-property `assert` reference, both of which the test-body lowering still rejects. The fixture's property is unreferenced, so it is a no-op under both codegens — mirrors v1, which only emits a check at a reference site. |
 | `width_methods_test` | `.trunc(...)` method call | **RESOLVED + registered** — `.trunc/.zext/.sext/.resize` lower to `Expr::WidthCast` (≤ 64-bit, v1's mask/cast/shift-fill shapes + direction checks); scalar `as uint<W>` casts lower as width relabels |
 | `keep_constraints_test` | `enum` construct | **enum RESOLVED; deeper blocker** — enums lower as named integer constants (variant index, first definition wins) and enum-typed transaction fields as scalar indices; the fixture now stops at statement-level `randomize` (constraint-IR seam) |
-| `extern_fn_ref_test` | `extern fn` construct | **Skipped** — needs `--ref-src` end-to-end; deferred with the registry plumbing already in place |
+| `extern_fn_ref_test` | `extern fn` construct | **RESOLVED + registered (singletons batch 2, 2026-06-13)** — `extern function name(...) -> ret` (spec §9) is inert at the file gate; a call lowers to `CallTarget::ExternFn` (raw symbol name, no `harc_helper_` mangling) so it links against the user's `extern "C"` definition supplied via `--ref-src`. The file-scope `extern "C" { … }` forward-declaration block is shared with v1 (`cpp_tb::emit_extern_fn_decls`). Registered via the existing `ref_src` registry column. |
 | `async_fifo_test` | time literals in expression position | **RESOLVED + registered** — `wait 80ns` lowers to `Terminator::WaitTimePs` (ps resolved at lowering; v1's inline `eval_clocks_until(now_ps + N)`); `log(debug, ...)` severity also landed here |
 | `dma_engine_test` | `scoreboard` construct | **scoreboard RESOLVED (data-only subset); deeper blocker** — the scoreboard now lowers; the fixture stops at its passive `MemXactor` transactor's event-driven `on`-handlers (moved to the scoreboard group's residual map) |
 | `linklist_basic_test` | ternary expressions | **RESOLVED + registered** — `Expr::Ternary` emits the C++ `?:`; also forced the `WaitCyclesSync` terminator (waits inlined from helper bodies take v1's synchronous `tick()` path, fixing a `sim_end` clock-attribution trace delta) |
 | `mshr_cocotb_test` | `const` construct | **const RESOLVED; deeper blocker** — file-scope `const` (integer-literal initializers) substitutes at use sites; the fixture now stops at the `transactor` construct (moved to that group) |
 | `packed_vec_lane_test` | assignment to a non-port, non-local target | **RESOLVED + registered** — constant-lane `dut.<port>[i]` reads/writes lower via `PortRef::lane`; emission splits packed lanes (`harc_vec_lane_*<W>` via the `--sv` lane table) from unpacked-array subscripts, like v1 |
 | `if_wait_for_in_then_test` | test-scope `let done_pulses` | **RESOLVED + registered** — plain test-scope lets hoist to the head of the run function (v1 hoists to `main` scope before the coroutine); a check-phase reference is a precise rejection (run/check are separate IR functions, so v1's shared-capture scoping is not representable) |
+
+### Singletons batch 2 (2026-06-13)
+
+Three standalone constructs + one free registration, landed in one PR:
+
+| Fixture | Was blocked on | Outcome |
+|---|---|---|
+| `relation_inlining_test` | `relation` construct | **RESOLVED + registered** — relation decls inert at the gate; constraint inlining already handled by `constraints::typed_lower` |
+| `pipe_reg_test` | `property` construct | **RESOLVED + registered** — property decl inert at the gate; `assert property` references still rejected (unreferenced property is a no-op, mirrors v1) |
+| `extern_fn_ref_test` | `extern fn` construct | **RESOLVED + registered** — `CallTarget::ExternFn` (raw symbol) + shared file-scope `extern "C"` block (`cpp_tb::emit_extern_fn_decls`); links via `--ref-src` |
+| `transactor_parse_test` | (lowered clean on main, but `tbir::emit` failed) | **RESOLVED + registered** — a TB-IR codegen bug emitted component method / `on`-handler bodies with an EMPTY record table, so a body-local `RecordInit` (`let c : Completion`) errored "references missing record"; both lambda emitters now pass `&prog.records`. |
 
 ## Registry-schema gap (not a lowering gap) — **RESOLVED 2026-06-12**
 

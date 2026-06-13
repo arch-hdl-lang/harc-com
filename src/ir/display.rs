@@ -741,6 +741,7 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
             let t = match target {
                 CallTarget::Helper(n) => n.clone(),
                 CallTarget::Builtin(n) => format!("builtin:{n}"),
+                CallTarget::ExternFn(n) => format!("extern:{n}"),
                 CallTarget::TransactorMethod { bus_field, method } => {
                     format!("{bus_field}.{method}")
                 }

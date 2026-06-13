@@ -136,6 +136,13 @@ pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<Stri
         writeln!(out).ok();
     }
 
+    // File-scope `extern "C" { … }` forward declarations for every
+    // `extern function name(...) -> ret` (spec §9). Shared with v1 so
+    // both codegens emit byte-identical declarations; the call sites
+    // resolve to `CallTarget::ExternFn` (raw symbol name). Writes
+    // nothing when the program declares no extern fns.
+    crate::codegen::cpp_tb::emit_extern_fn_decls(&mut out, file);
+
     // One struct per unique non-synthetic testbench.
     let mut seen = HashSet::new();
     for tb in &prog.testbenches {

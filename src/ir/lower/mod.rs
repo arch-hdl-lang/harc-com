@@ -207,6 +207,20 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             _ => {}
         }
     }
+    // `extern function name(...) -> ret` (spec §9) names — calls to
+    // these lower to `CallTarget::ExternFn`; the file-scope `extern "C"`
+    // forward declarations are emitted by `emit_extern_fn_decls`. Shared
+    // across every lowering context (an extern fn is a pure scalar C
+    // call, callable wherever a pure helper is).
+    let extern_fns: HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::ExternFn(f) => Some(f.name.name.clone()),
+            _ => None,
+        })
+        .collect();
+
     // Enum names, so transaction fields of enum type lower as scalars
     // (v1 flattens them to `int64_t` members with index values).
     let enum_names: HashSet<String> = file
@@ -441,6 +455,37 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             // (with their own Unsupported rejections); inert here.
             | Item::Struct(_)
             | Item::Bus(_)
+            // Free-standing `relation` declarations (spec §4.2) are
+            // reusable constraint sets. They are inert at this gate: a
+            // relation only contributes constraints when a
+            // `randomize(t) with R(t)` call inlines its body, and that
+            // inlining happens entirely in the typed constraint backend
+            // (`constraints::typed_lower` expands relation calls — block
+            // and alias forms, recursively — before Z3). The TB-IR
+            // randomize lowering keys off the solver problem table
+            // (`randomize_problem_ids`), which is built from the same
+            // expanded constraints v1 sees, so the relation declaration
+            // itself needs no IR shape — only acceptance here.
+            | Item::Relation(_)
+            // SVA-style `property NAME ... end property` declarations
+            // (spec). A property is inert until referenced by an
+            // `assert property NAME` / `cover property NAME` site; v1
+            // builds a name→body table up front and only emits an
+            // executable concurrent check at the reference site. The
+            // TB-IR test-body lowering rejects `assert property` and
+            // named-property `assert` (see `stmts.rs`), so an accepted
+            // property declaration can only be observed via a reference
+            // that is itself still rejected — i.e. an unreferenced
+            // property is observably inert under both codegens. Accept
+            // the declaration here; the reference gate stays closed.
+            | Item::Property(_)
+            // `extern function name(...) -> ret` (spec §9) — a C
+            // reference model linked via `--ref-src`. Inert at this
+            // gate: the file-scope `extern "C"` forward declaration is
+            // emitted by `emit_extern_fn_decls`, and call sites resolve
+            // through `extern_fns` to a `CallTarget::ExternFn` (raw
+            // symbol name). The declaration itself carries no IR shape.
+            | Item::ExternFn(_)
             | Item::Transactor(_)
             // Scoreboard declarations already lowered to schemas above
             // (with their own Unsupported rejections); they are inert
@@ -607,6 +652,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         tseqs: HashMap::new(),
         // Pure helpers never access the DUT (probes are test-scope only).
         probes: HashMap::new(),
+        // Extern fns are pure scalar C calls — callable from a pure
+        // helper body.
+        extern_fns: extern_fns.clone(),
     };
     for it in &file.items {
         let Item::Function(fd) = it else { continue };
@@ -659,6 +707,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         tseqs: tseq_records.clone(),
         // tseq generator bodies never access the DUT.
         probes: HashMap::new(),
+        extern_fns: extern_fns.clone(),
     };
     for it in &file.items {
         let Item::Tseq(decl) = it else { continue };
@@ -801,6 +850,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         // Component/transactor method bodies access the bound DUT but
         // never test-scope probes (probes live on `let dut`).
         probes: HashMap::new(),
+        extern_fns: extern_fns.clone(),
     };
     let mut method_funcs: Vec<TbFunction> = Vec::new();
     for (i, src) in comp_sources.iter().enumerate() {
@@ -899,6 +949,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &addrmap_decls,
             &buses,
             &consts,
+            &extern_fns,
             &helper_registry,
             &txn_keeps,
             &randomize_problem_ids,
@@ -1128,6 +1179,7 @@ fn lower_test(
     addrmap_decls: &HashMap<String, &AddrmapDecl>,
     buses: &HashMap<String, &BusDecl>,
     consts: &HashMap<String, u64>,
+    extern_fns: &HashSet<String>,
     helpers: &helpers::HelperRegistry<'_>,
     txn_keeps: &HashMap<String, Vec<crate::ast::Expr>>,
     randomize_problem_ids: &HashMap<(usize, usize), u32>,
@@ -2485,6 +2537,7 @@ fn lower_test(
         randomize_problem_ids: randomize_problem_ids.clone(),
         tseqs: tseq_records.clone(),
         probes: probes.clone(),
+        extern_fns: extern_fns.clone(),
     };
 
     // Synthesized auto-sampler functions, one per covergroup field, in
@@ -2856,6 +2909,15 @@ pub(crate) struct LowerCtx {
     /// the default `Port`. Empty for probe-less tests and every non-test
     /// context (helpers, methods). See docs/probe-signals.md.
     pub probes: HashMap<String, ProbeMeta>,
+    /// `extern function name(...) -> ret` (spec §9) names. A call whose
+    /// callee is in this set lowers to `CallTarget::ExternFn` and emits
+    /// with the RAW symbol name (resolved at link via `--ref-src`); the
+    /// forward declaration is emitted file-scope by
+    /// `emit_extern_fn_decls`. Visible in EVERY context (test bodies,
+    /// helpers, methods) — an extern fn is a pure scalar C function, so
+    /// it is callable wherever a pure helper is. Empty when the program
+    /// declares no extern fns.
+    pub extern_fns: HashSet<String>,
 }
 
 /// Lowered metadata for one `probe` / `probe force` declaration on
