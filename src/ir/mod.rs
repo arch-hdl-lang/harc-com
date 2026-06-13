@@ -657,7 +657,11 @@ pub struct ComponentFieldSchema {
 pub enum ComponentFieldKind {
     /// `count : uint<32> default 0` — a scalar host counter.
     Scalar { ty: IrType, default: u64 },
-    /// `expected : queue<uint<32>>` — a FIFO of a scalar element type.
+    /// `expected : queue<uint<32>>` — a FIFO of a scalar element type
+    /// (≤ 64 bits; the lowered subset). `signed` selects the C element
+    /// type (`int64_t` vs `uint64_t`). A `queue<Record>` element is out of
+    /// the lowered subset (it needs the component-queue-op + record-payload
+    /// seam) — rejected precisely at field lowering.
     Queue { signed: bool },
     /// `observed : out event<uint<8>>` — an analysis port. Lowers to a
     /// `std::vector<std::function<void(<payload>)>>` member; `payload`

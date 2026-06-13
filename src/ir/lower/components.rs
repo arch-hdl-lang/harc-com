@@ -62,6 +62,7 @@ pub(crate) fn transactor_is_component(t: &TransactorDecl) -> bool {
     let mut has_event = false;
     let mut has_in_event = false;
     let mut has_on_handler = false;
+    let mut has_periodic_handler = false;
     let mut has_module_field = false;
     for it in t.items.iter().chain(t.when_active.iter().flatten()) {
         match it {
@@ -76,6 +77,7 @@ pub(crate) fn transactor_is_component(t: &TransactorDecl) -> bool {
                 }
             }
             ComponentItem::OnHandler(h) if !h.periodic => has_on_handler = true,
+            ComponentItem::OnHandler(_) => has_periodic_handler = true,
             _ => {}
         }
     }
@@ -92,14 +94,27 @@ pub(crate) fn transactor_is_component(t: &TransactorDecl) -> bool {
     }
     // Event-driven consumer transactor: an `in event` + a subscribing
     // `on` handler (the DUT field, if any, is the handler's poke target).
-    has_in_event && has_on_handler
+    if has_in_event && has_on_handler {
+        return true;
+    }
+    // Reactive monitor / checker transactor with NO `in event`: a
+    // cycle-trigger (`on dut.<sig>`, `on <expr> level`) or periodic
+    // (`on <N> cycles`) handler. The component path already lowers these
+    // handler shapes (against an optional `dut` handle + scoreboard/sub
+    // fields); they reach it here even without an event pipe. A purely
+    // structural transactor with only hookable methods and a DUT handle
+    // (no `on` at all) stays on the dedicated DUT-poking `TransactorSchema`
+    // path.
+    has_on_handler || has_periodic_handler
 }
 
 /// True when a transactor is an *event-driven consumer* — it has an
 /// `in event<T>` field and a subscribing `on <ev>` handler. These accept
 /// an `active`/`passive` instance mode (a transactor concept) even though
 /// they route to the composite-component table; a pure analysis source
-/// (out-event only, no DUT, no `on`) does not.
+/// (out-event only, no DUT, no `on`) does not. (A reactive monitor /
+/// checker — `on` handlers but no `in event` — is classified separately by
+/// `transactor_is_reactive_monitor`; it accepts a `passive` instance too.)
 pub(crate) fn transactor_is_event_driven(t: &TransactorDecl) -> bool {
     let mut has_in_event = false;
     let mut has_on_handler = false;
@@ -116,6 +131,33 @@ pub(crate) fn transactor_is_event_driven(t: &TransactorDecl) -> bool {
         }
     }
     has_in_event && has_on_handler
+}
+
+/// True when a composite-component transactor is a *reactive monitor /
+/// checker* — it has cycle-trigger and/or periodic `on` handlers but NO
+/// `in event<T>` consumer pipe. Such an instance is purely observational
+/// (its handlers are always-on, registered regardless of instance mode),
+/// so unlike an event-driven consumer it accepts a `passive` instance —
+/// there is no `when active` half whose `on req` registration a passive
+/// instance would suppress.
+pub(crate) fn transactor_is_reactive_monitor(t: &TransactorDecl) -> bool {
+    let mut has_in_event = false;
+    let mut has_on_handler = false;
+    let mut has_periodic_handler = false;
+    for it in t.items.iter().chain(t.when_active.iter().flatten()) {
+        match it {
+            ComponentItem::Field(f)
+                if is_event_field(f)
+                    && matches!(f.direction, Some(crate::ast::Direction::In)) =>
+            {
+                has_in_event = true;
+            }
+            ComponentItem::OnHandler(h) if !h.periodic => has_on_handler = true,
+            ComponentItem::OnHandler(_) => has_periodic_handler = true,
+            _ => {}
+        }
+    }
+    !has_in_event && (has_on_handler || has_periodic_handler)
 }
 
 fn is_event_field(f: &ComponentField) -> bool {
@@ -713,18 +755,20 @@ fn lower_field(
                     "",
                 ));
             }
-            let signed = match args.first() {
-                Some(TypeArg::Type(ty)) => match scalar_ir_type(ty) {
-                    Some(IrType::SInt(_)) => true,
-                    Some(IrType::UInt(_)) | Some(IrType::Bool) => false,
-                    _ => {
-                        return Err(unsupported(
-                            &format!("a non-scalar queue element on `{comp}.{fname}`"),
-                            "",
-                        ));
-                    }
-                },
-                _ => false,
+            // The element type must be a scalar ≤ 64 bits in this subset. A
+            // `queue<Record>` element (`errors : queue<CheckerError>`) needs
+            // the component-queue-op + record-payload seam — reject it
+            // precisely rather than silently mis-lowering a named element as
+            // an unsigned scalar (the prior `_ => false` fall-through).
+            let signed = match queue_elem_signedness(args.first()) {
+                Some(s) => s,
+                None => {
+                    return Err(unsupported(
+                        &format!("a non-scalar queue element on `{comp}.{fname}`"),
+                        "only `queue<scalar ≤ 64 bits>` is lowered; a `queue<Record>` \
+                         element gates on the component-queue record-payload slice",
+                    ));
+                }
             };
             Ok(ComponentFieldKind::Queue { signed })
         }
@@ -1471,6 +1515,32 @@ pub(crate) fn dotted_path(e: &crate::ast::Expr) -> Option<Vec<String>> {
         }
         ExprKind::Paren(inner) => dotted_path(inner),
         _ => None,
+    }
+}
+
+/// The signedness of a `queue<scalar>` component-field element, or `None`
+/// when the element is not a scalar ≤ 64 bits. A named element — a record
+/// (`queue<CheckerError>`) or an unknown type — returns `None` whether it
+/// parsed as `TypeArg::Type(Named)`, `TypeArg::Expr(Ident)`, or
+/// `TypeArg::Named`; the caller rejects it precisely. This must NOT
+/// silently fall through to "unsigned scalar" (the prior `_ => false`
+/// behavior, which mis-lowered a `queue<Record>` element as `uint64_t`).
+fn queue_elem_signedness(arg: Option<&TypeArg>) -> Option<bool> {
+    match arg {
+        Some(TypeArg::Type(ty)) => {
+            // A named element (record or any other named type) is not a
+            // scalar — `scalar_ir_type` only resolves builtins, returning
+            // `None` for a `Named` type, so the match below rejects it.
+            match scalar_ir_type(ty) {
+                Some(IrType::SInt(_)) => Some(true),
+                Some(IrType::UInt(_)) | Some(IrType::Bool) => Some(false),
+                _ => None,
+            }
+        }
+        // A bare-identifier (`queue<CheckerError>`) or keyword-style arg is
+        // never a scalar element in this subset.
+        Some(TypeArg::Expr(_)) | Some(TypeArg::Named { .. }) => None,
+        None => Some(false),
     }
 }
 
