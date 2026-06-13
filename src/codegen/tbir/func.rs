@@ -1262,8 +1262,10 @@ pub(super) fn emit_method(
         for s in &block.stmts {
             // Method bodies have no testbench bus-binding scope — a
             // bus-bound call edge in here is a lowering bug and errors
-            // inside `emit_stmt` (empty binding table).
-            emit_stmt(out, prog, &cx, &[], &[], s, depth + 3)?;
+            // inside `emit_stmt` (empty binding table). They CAN init a
+            // record local (`let c : Completion` in an `on` handler), so
+            // the record table must be visible for `RecordInit`.
+            emit_stmt(out, prog, &cx, &prog.records, &[], s, depth + 3)?;
         }
         match &block.terminator {
             Terminator::Jump(b) => {
@@ -1520,7 +1522,9 @@ fn emit_component_fn_lambda(
     for (bi, block) in func.blocks.iter().enumerate() {
         writeln!(out, "{pad2}case {bi}: {{").ok();
         for s in &block.stmts {
-            emit_stmt(out, prog, &cx, &[], &[], s, depth + 3)?;
+            // Record table visible so an `on`-handler body that inits a
+            // record local (`let c : Completion`) resolves `RecordInit`.
+            emit_stmt(out, prog, &cx, &prog.records, &[], s, depth + 3)?;
         }
         match &block.terminator {
             Terminator::Jump(b) => {

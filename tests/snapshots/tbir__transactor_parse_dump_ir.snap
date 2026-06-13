@@ -1,0 +1,94 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 TransactorParseTb { dut: AxiLiteRegs } bus axil=BusAxiLite
+  test TransactorParseTest tb=tb0 run=fn3 check=-
+  record r0 RegOp
+    addr : uint<8>
+    value : uint<32>
+  record r1 Completion
+    resp : uint<2>
+  component c0 AxilXactor (transactor)
+    field completed : out event<Completion>
+    field req : out event<RegOp>
+    on bus.b.handshake [(dut.axil.b.valid && dut.axil.b.ready)] (rising) = fn1
+    on bus.r.handshake [(dut.axil.r.valid && dut.axil.r.ready)] (rising) = fn2
+
+fn fn0 comp_on_0 [kind=ComponentMethod(c0)]
+  params:
+    t : record(r0)
+  locals:
+    %0 t : record(r0)
+    %1 __t0 : unknown
+    %2 __t1 : unknown
+  entry = b0
+
+  b0:
+    DutWrite(dut.axil.aw.addr, %t.addr)
+    DutWrite(dut.axil.aw.valid, 1)
+    DutWrite(dut.axil.w.data, %t.value)
+    DutWrite(dut.axil.w.strb, 15)
+    DutWrite(dut.axil.w.valid, 1)
+    Assign(%__t0, 16)
+    -> Jump(b1)
+
+  b1:
+    DutRead(%__t1, dut.axil.w.ready)
+    -> Branch((!%__t1 && (%__t0 > 0)), b2, b4)
+
+  b2:
+    -> WaitCycles(1, b3)
+
+  b3:
+    Assign(%__t0, (%__t0 - 1))
+    -> Jump(b1)
+
+  b4:
+    -> WaitCycles(1, b5)
+
+  b5:
+    DutWrite(dut.axil.w.valid, 0)
+    DutWrite(dut.axil.aw.valid, 0)
+    -> WaitCycles(2, b6)
+
+  b6:
+    -> Return
+
+fn fn1 comp_monitor_1 [kind=ComponentMethod(c0)]
+  locals:
+    %0 b : uint
+    %1 c : record(r1)
+  entry = b0
+
+  b0:
+    DutRead(%b, dut.axil.b.resp)
+    RecordInit(%c, r1)
+    RecordFieldWrite(%c.resp, %b)
+    ComponentEmit(self.completed, [%c])
+    -> Return
+
+fn fn2 comp_monitor_2 [kind=ComponentMethod(c0)]
+  locals:
+    %0 r : uint
+    %1 r__resp : uint
+    %2 c : record(r1)
+  entry = b0
+
+  b0:
+    DutRead(%r, dut.axil.r.data)
+    DutRead(%r__resp, dut.axil.r.resp)
+    RecordInit(%c, r1)
+    RecordFieldWrite(%c.resp, %r__resp)
+    ComponentEmit(self.completed, [%c])
+    -> Return
+
+fn fn3 run_TransactorParseTest [kind=Run, owner=tb0]
+  entry = b0
+
+  b0:
+    -> WaitCycles(1, b1)
+
+  b1:
+    -> Return

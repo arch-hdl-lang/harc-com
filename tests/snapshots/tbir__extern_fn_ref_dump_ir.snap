@@ -1,0 +1,91 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 ExternFnRefTb { dut: Top }
+  test ExternFnRefTest tb=tb0 run=fn1 check=- clock=clk@10000ps(SysDomain)
+
+fn fn0 harc_crc8_step [kind=Helper]
+  params:
+    crc : uint<8>
+    byte : uint<8>
+  locals:
+    %0 crc : uint<8>
+    %1 byte : uint<8>
+    %2 __ret : unknown
+    %3 x : unknown
+    %4 _anon : unknown
+  ret = %__ret
+  entry = b0
+
+  b0:
+    Assign(%x, (%crc ^ %byte))
+    Assign(%_anon, 0)
+    -> Jump(b1)
+
+  b1:
+    -> Branch((%_anon < 8), b2, b4)
+
+  b2:
+    -> Branch(((%x & 128) != 0), b6, b7)
+
+  b3:
+    Assign(%_anon, (%_anon + 1))
+    -> Jump(b1)
+
+  b4:
+    Assign(%__ret, %x)
+    -> Return
+
+  b5:
+    -> Jump(b3)
+
+  b6:
+    Assign(%x, (((%x << 1) ^ 7) & 255))
+    -> Jump(b5)
+
+  b7:
+    Assign(%x, ((%x << 1) & 255))
+    -> Jump(b5)
+
+fn fn1 run_ExternFnRefTest [kind=Run, owner=tb0]
+  locals:
+    %0 crc_ref : unknown
+    %1 crc_harc : unknown
+    %2 i : unknown
+    %3 b : unknown
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.en, 0)
+    -> WaitCycles(2, b1)
+
+  b1:
+    DutWrite(dut.rst, 0)
+    -> WaitCycles(1, b2)
+
+  b2:
+    Assign(%crc_ref, 255)
+    Assign(%crc_harc, 255)
+    Assign(%i, 0)
+    -> Jump(b3)
+
+  b3:
+    -> Branch((%i < 16), b4, b6)
+
+  b4:
+    Assign(%b, (((%i * 17) + 42) & 255))
+    Assign(%crc_ref, extern:ref_crc8_step(%crc_ref, %b))
+    Assign(%crc_harc, harc_crc8_step(%crc_harc, %b))
+    AssertCheck { cond: (%crc_ref == %crc_harc), on_fail: "byte %lld: ref=0x%02llx harc=0x%02llx", %i, %crc_ref, %crc_harc }
+    -> Jump(b5)
+
+  b5:
+    Assign(%i, (%i + 1))
+    -> Jump(b3)
+
+  b6:
+    Log(info, "PASS: 16-byte CRC-8 round-trip matched C reference; final=0x%02llx", %crc_ref)
+    -> Return

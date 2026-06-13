@@ -1614,53 +1614,9 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // `extern function name(params) -> ret` (spec §9) — emit C-linkage
     // forward declarations at file scope so the user's `--ref-src
     // <file>.cpp` can satisfy the linker without HARC needing to know
-    // its implementation. Wrap in a single `extern "C" { … }` block
-    // so even C++ source files that don't add their own `extern "C"`
-    // get the right calling convention.
-    let extern_fns: Vec<&ExternFnDecl> = file
-        .items
-        .iter()
-        .filter_map(|it| match it {
-            Item::ExternFn(f) => Some(f),
-            _ => None,
-        })
-        .collect();
-    if !extern_fns.is_empty() {
-        writeln!(
-            e.out,
-            "// extern reference functions (spec §9) — implementations"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "// supplied via `harc sim --ref-src <file>` and linked into the"
-        )
-        .ok();
-        writeln!(e.out, "// verilator-built binary.").ok();
-        writeln!(e.out, "extern \"C\" {{").ok();
-        for f in &extern_fns {
-            let param_names = cpp_param_names(&f.params);
-            let ret = f
-                .return_ty
-                .as_ref()
-                .map(c_type_for)
-                .unwrap_or_else(|| "void".to_string());
-            write!(e.out, "{INDENT}{ret} {}(", f.name.name).ok();
-            for (i, p) in f.params.iter().enumerate() {
-                if i > 0 {
-                    write!(e.out, ", ").ok();
-                }
-                let pty =
-                    p.ty.as_ref()
-                        .map(c_type_for)
-                        .unwrap_or_else(|| "int64_t".to_string());
-                write!(e.out, "{pty} {}", param_names[i]).ok();
-            }
-            writeln!(e.out, ");").ok();
-        }
-        writeln!(e.out, "}}").ok();
-        writeln!(e.out, "").ok();
-    }
+    // its implementation. Shared with the TB-IR codegen so both emit
+    // byte-identical `extern "C"` blocks (`emit_extern_fn_decls`).
+    emit_extern_fn_decls(&mut e.out, file);
 
     // Shared per-run state. This is the first step toward the phase-2
     // member/context refactor: generated run bodies still use the
@@ -17754,6 +17710,59 @@ fn cpp_sint_for_width(w: Option<u32>) -> String {
         Some(n) if n > 64 => "_harc_u128".into(),
         _ => "int64_t".into(),
     }
+}
+
+/// Emit the file-scope `extern "C" { … }` forward-declaration block for
+/// every `extern function name(params) -> ret` (spec §9) in `file`, so a
+/// user-supplied `--ref-src <file>.cpp` resolves at link time. Shared by
+/// the v1 (`cpp_tb`) and TB-IR codegens so both produce byte-identical
+/// declarations. Writes nothing when the program declares no extern fns.
+pub(crate) fn emit_extern_fn_decls(out: &mut String, file: &SourceFile) {
+    let extern_fns: Vec<&ExternFnDecl> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::ExternFn(f) => Some(f),
+            _ => None,
+        })
+        .collect();
+    if extern_fns.is_empty() {
+        return;
+    }
+    writeln!(
+        out,
+        "// extern reference functions (spec §9) — implementations"
+    )
+    .ok();
+    writeln!(
+        out,
+        "// supplied via `harc sim --ref-src <file>` and linked into the"
+    )
+    .ok();
+    writeln!(out, "// verilator-built binary.").ok();
+    writeln!(out, "extern \"C\" {{").ok();
+    for f in &extern_fns {
+        let param_names = cpp_param_names(&f.params);
+        let ret = f
+            .return_ty
+            .as_ref()
+            .map(c_type_for)
+            .unwrap_or_else(|| "void".to_string());
+        write!(out, "{INDENT}{ret} {}(", f.name.name).ok();
+        for (i, p) in f.params.iter().enumerate() {
+            if i > 0 {
+                write!(out, ", ").ok();
+            }
+            let pty =
+                p.ty.as_ref()
+                    .map(c_type_for)
+                    .unwrap_or_else(|| "int64_t".to_string());
+            write!(out, "{pty} {}", param_names[i]).ok();
+        }
+        writeln!(out, ");").ok();
+    }
+    writeln!(out, "}}").ok();
+    writeln!(out, "").ok();
 }
 
 fn c_type_for(t: &TypeExpr) -> String {

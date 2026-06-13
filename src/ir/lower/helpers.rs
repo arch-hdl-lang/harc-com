@@ -277,6 +277,33 @@ impl FuncBuilder<'_> {
         Ok(Expr::Local(dest))
     }
 
+    /// Lower a call to an `extern function name(...) -> ret` (spec §9).
+    /// Mirrors v1: arguments lower as plain scalar values and the call
+    /// stays an `Expr::Call(CallTarget::ExternFn, ...)`, emitted with the
+    /// RAW symbol name so it binds to the user's `extern "C"` definition
+    /// linked via `--ref-src`. Extern fns are pure scalar C functions, so
+    /// (unlike impure helpers) the call never CFG-inlines and never takes
+    /// a DUT handle — arguments are lowered without port access.
+    pub(crate) fn lower_extern_fn_call(
+        &mut self,
+        name: &str,
+        args: &[CallArg],
+    ) -> Result<Expr, LowerError> {
+        let mut lowered = Vec::with_capacity(args.len());
+        for a in args {
+            match a {
+                CallArg::Expr(e) => lowered.push(self.lower_expr_no_ports(e)?),
+                CallArg::Named { .. } => {
+                    return Err(unsupported(
+                        &format!("named arguments in extern fn call `{name}(...)`"),
+                        "",
+                    ));
+                }
+            }
+        }
+        Ok(Expr::Call(CallTarget::ExternFn(name.to_string()), lowered))
+    }
+
     /// `Some(method)` when `callee` is a call target of the form
     /// `_tb.<m>` for a testbench helper method (`function`/`hookable`
     /// declared in the bound testbench).

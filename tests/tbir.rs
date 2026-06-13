@@ -4238,3 +4238,58 @@ fn regblock_alias_corpus_lowers() {
         "alias must NOT get its own mirror local (shares the target's cell): {dump}"
     );
 }
+
+// ── singletons batch 2: relation / property / extern fn / transactor ──
+
+/// `relation_inlining_test` — free-standing `relation` declarations are
+/// inert at the file gate; a `randomize(r) with BoundedAndHigh(r)` call
+/// inlines all three relations' constraints in the typed solver backend
+/// (block + alias + alias-of-relations forms). The IR records only the
+/// `Randomize` terminator with a `ConstraintRef`; the relation decls
+/// themselves carry no IR shape. Snapshotted end-to-end.
+#[test]
+fn relation_inlining_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("relation_inlining_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("relation_inlining_dump_ir", format!("{prog}"));
+}
+
+/// `pipe_reg_test` — an SVA-style `property pipe_depth_3 ... end
+/// property` declaration is accepted at the file gate but inert: it is
+/// never referenced via `assert property` (which the test-body lowering
+/// still rejects), so it contributes no IR. The run body is plain
+/// wait/assert against the DUT. Locks that the property declaration is
+/// observably a no-op.
+#[test]
+fn pipe_reg_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("pipe_reg_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("pipe_reg_dump_ir", format!("{prog}"));
+}
+
+/// `extern_fn_ref_test` — an `extern function ref_crc8_step(...) -> ...`
+/// (spec §9) call lowers to `CallTarget::ExternFn` (raw symbol name,
+/// emitted `extern:ref_crc8_step(...)` in the dump), distinct from the
+/// plain HARC helper `harc_crc8_step` call beside it. The forward
+/// declaration is emitted file-scope at codegen; the decl is inert at
+/// the gate.
+#[test]
+fn extern_fn_ref_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("extern_fn_ref_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("extern_fn_ref_dump_ir", format!("{prog}"));
+}
+
+/// `transactor_parse_test` — the spec §8.1 transactor surface (two
+/// `on bus.<ch>.handshake` monitor bodies each doing `let c :
+/// Completion` + `emit`, plus a `when active` `on req` body) lowers and
+/// emits cleanly. Locks the component schema + on-handler/method-body
+/// `RecordInit` shapes that the record-table-visibility codegen fix
+/// unblocked.
+#[test]
+fn transactor_parse_dump_ir_snapshot() {
+    let prog = lower_with_stdlib_bus("transactor_parse_test.harc", "BusAxiLite.arch")
+        .expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("transactor_parse_dump_ir", format!("{prog}"));
+}

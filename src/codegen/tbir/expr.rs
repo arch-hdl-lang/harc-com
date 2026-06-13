@@ -290,6 +290,11 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         Expr::Call(target, args) => {
             let name = match target {
                 CallTarget::Helper(n) => helper_cpp_name(n),
+                // Extern reference functions emit with the RAW symbol
+                // name (no `harc_helper_` mangling) so the call binds to
+                // the user's `extern "C"` definition supplied via
+                // `--ref-src`; the forward decl is emitted file-scope.
+                CallTarget::ExternFn(n) => n.clone(),
                 CallTarget::Builtin(_) => {
                     return Err(EmitError(
                         "tbir: builtin calls are not emitted yet (lowering should \

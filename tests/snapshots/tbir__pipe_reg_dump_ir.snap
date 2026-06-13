@@ -1,0 +1,46 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 PipeRegTb { dut: PipeRegTest }
+  test PipeRegTest tb=tb0 run=fn0 check=-
+
+fn fn0 run_PipeRegTest [kind=Run, owner=tb0]
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.data_in, 0)
+    -> WaitCycles(2, b1)
+
+  b1:
+    DutWrite(dut.rst, 0)
+    DutWrite(dut.data_in, 66)
+    -> WaitCycles(1, b2)
+
+  b2:
+    AssertCheck { cond: (dut.data_out == 0), on_fail: "cycle 1: data_out=%lld expected 0x00", dut.data_out }
+    -> WaitCycles(1, b3)
+
+  b3:
+    AssertCheck { cond: (dut.data_out == 0), on_fail: "cycle 2: data_out=%lld expected 0x00", dut.data_out }
+    -> WaitCycles(1, b4)
+
+  b4:
+    AssertCheck { cond: (dut.data_out == 189), on_fail: "cycle 3: data_out=%lld expected 0xBD", dut.data_out }
+    DutWrite(dut.data_in, 0)
+    -> WaitCycles(1, b5)
+
+  b5:
+    AssertCheck { cond: (dut.data_out == 189), on_fail: "cycle 4: data_out=%lld expected 0xBD", dut.data_out }
+    -> WaitCycles(1, b6)
+
+  b6:
+    AssertCheck { cond: (dut.data_out == 189), on_fail: "cycle 5: data_out=%lld expected 0xBD", dut.data_out }
+    -> WaitCycles(1, b7)
+
+  b7:
+    AssertCheck { cond: (dut.data_out == 255), on_fail: "cycle 6: data_out=%lld expected 0xFF", dut.data_out }
+    Log(info, "PASS: 3-stage pipeline propagates with correct delay")
+    -> Return

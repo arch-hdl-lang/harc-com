@@ -270,6 +270,7 @@ pub(crate) fn lower_transactor(
     tseqs: HashMap::new(),
         // Transactor-context lowering never resolves test-scope probes.
     probes: HashMap::new(),
+        extern_fns: record_ctx.extern_fns.clone(),
     };
 
     let mut funcs = Vec::new();
@@ -498,6 +499,7 @@ fn lower_bound_target_transactor(
     tseqs: HashMap::new(),
         // Transactor-context lowering never resolves test-scope probes.
     probes: HashMap::new(),
+        extern_fns: record_ctx.extern_fns.clone(),
     };
 
     let mut funcs = Vec::new();
@@ -825,6 +827,7 @@ fn lower_bound_initiator_transactor(
     tseqs: HashMap::new(),
         // Transactor-context lowering never resolves test-scope probes.
     probes: HashMap::new(),
+        extern_fns: record_ctx.extern_fns.clone(),
     };
 
     let mut funcs = Vec::new();

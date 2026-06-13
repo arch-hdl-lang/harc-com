@@ -1535,6 +1535,12 @@ pub enum ScoreboardQuery {
 pub enum CallTarget {
     Helper(String),
     Builtin(String),
+    /// Call to a `extern function name(...) -> ret` (spec §9) — a C
+    /// reference model linked in via `--ref-src`. Emitted with the RAW
+    /// symbol name (no `harc_helper_` mangling) so it resolves against
+    /// the user-provided `extern "C"` definition; the forward
+    /// declaration is emitted file-scope by `emit_extern_fn_decls`.
+    ExternFn(String),
     TransactorMethod { bus_field: String, method: String },
     /// Call a `tseq` generator by name — `let txns = RandomTxns(5)`.
     /// Resolves to the `FunctionKind::Tseq` function of that name; the
