@@ -22,25 +22,30 @@
 //! (`CallTarget::TransactorMethod { bus_field: helper, method }`) edge,
 //! the same call edge bus `tlm_method`s and transactor-field calls use.
 //!
-//! Out of subset — explicit `Unsupported`, never silent mis-lowering:
+//! Also lowered (later slices, all matching v1's bus semantics):
 //!   * **bus-bound `via` helper** (`transactor H bound to BusT`): the
-//!     corpus `regblock_*` fixtures all use this form; lowering its
-//!     method bodies (where `bus` resolves to a test-scope bus binding)
-//!     is the documented residual blocker.
+//!     corpus `regblock_*` fixtures use this form; its `hookable`
+//!     bodies drive the bound bus's handshake channels (initiator BFM).
+//!   * **register reads outside `let`-RHS** (assert conditions,
+//!     `log`/`fail` format args): lower to `Expr::RegRead`, v1's inline
+//!     assignment-expression — one bus read per textual occurrence
+//!     (eager in conditions, lazy in fail messages). The `via` helper's
+//!     `read` is a plain hookable lambda (not the TLM seam), so it is a
+//!     legitimate sub-expression value.
+//!   * **`bitbash(regs)`**: compile-time-unrolled walk-all over the RW
+//!     registers (write/read both patterns + compare; RO/WO skipped).
+//!
+//! Out of subset — explicit `Unsupported`, never silent mis-lowering:
 //!   * field-level decomposition (`regs.REG.FIELD`),
-//!   * `bitbash(regs)`, the passive `record_write`/`record_read` API,
-//!     per-register `on regs.REG` callbacks, and `addrmap` composition
-//!     (incl. `alias of`),
-//!   * register reads outside `let`-RHS position (assert conditions,
-//!     log/fail messages): v1 evaluates them inline/lazily as C++
-//!     assignment-expressions, which the IR's statement model cannot
-//!     represent without a hoist that changes the read count.
+//!   * the passive `record_write`/`record_read` API and per-register
+//!     `on regs.REG` write callbacks (see `detect_regblock_residual`),
+//!   * `addrmap` composition (incl. `alias of`).
 
 use super::{LowerError, unsupported};
-use crate::ast::{ExprKind, RegAccess as AstRegAccess, RegblockDecl};
+use crate::ast::{CallArg, ExprKind, RegAccess as AstRegAccess, RegblockDecl};
 use crate::ir::{
-    self, Expr, IrType, RecordFieldSchema, RecordId, RecordSchema, RegAccess, RegRegisterSchema,
-    RegblockSchema, Stmt,
+    self, BinOp, Expr, FmtArg, FmtArgs, IrType, RecordFieldSchema, RecordId, RecordSchema,
+    RegAccess, RegRegisterSchema, RegblockSchema, Stmt,
 };
 
 /// Per-binding context for register access resolution. Built at the
@@ -227,6 +232,92 @@ impl super::FuncBuilder<'_> {
         Ok(true)
     }
 
+    /// `bitbash(regs)` — compile-time-unrolled walk-all over the
+    /// regblock's RW registers. For each RW register and each of the two
+    /// patterns (all-ones masked to width, then zero), emit
+    /// `Helper.write(off, pat)`, `let got = Helper.read(off)`, and an
+    /// `assert got == pat else fail("bitbash …")`. RO/WO registers are
+    /// skipped (RO can't accept the write; WO reads are mirror-only) —
+    /// matching v1's `try_emit_bitbash`. Returns `Ok(false)` when `e` is
+    /// not a `bitbash(<regblock-binding>)` call.
+    pub(crate) fn try_lower_bitbash(
+        &mut self,
+        e: &crate::ast::Expr,
+    ) -> Result<bool, LowerError> {
+        let ExprKind::Call { callee, args } = &*e.kind else {
+            return Ok(false);
+        };
+        let ExprKind::Ident(name) = &*callee.kind else {
+            return Ok(false);
+        };
+        if name.name != "bitbash" {
+            return Ok(false);
+        }
+        if args.len() != 1 {
+            return Err(LowerError::Invalid(
+                "bitbash(regs) takes exactly one argument (the regblock binding)".to_string(),
+            ));
+        }
+        let arg = match &args[0] {
+            CallArg::Expr(ex) => ex,
+            CallArg::Named { value, .. } => value,
+        };
+        let ExprKind::Ident(regs_id) = &*arg.kind else {
+            return Err(unsupported(
+                "bitbash(<expr>) over a non-identifier argument",
+                "pass the regblock binding directly: `bitbash(regs)`",
+            ));
+        };
+        if !self.is_regblock_binding(&regs_id.name) {
+            // Not a regblock binding — let the generic statement path
+            // produce its own (more apt) diagnostic.
+            return Ok(false);
+        }
+        let binding = regs_id.name.clone();
+        let bctx = self.ctx.regblock_bindings[&binding].clone();
+        for reg in &bctx.registers {
+            // Skip non-RW registers exactly like v1 (RW is the only
+            // policy where both the write and the read reach the bus).
+            if !reg.access.writes_to_bus() || !reg.access.reads_from_bus() {
+                continue;
+            }
+            let mask: u64 = if reg.width >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << reg.width) - 1
+            };
+            for (pat_label, pat) in [("ones", mask), ("zero", 0u64)] {
+                // Helper.write(off, pat)
+                let wcall =
+                    self.regblock_call(&bctx.helper_field, "write", vec![lit(reg.offset), lit(pat)])?;
+                self.push(Stmt::TransactorCall { dest: None, call: wcall });
+                // got = Helper.read(off)
+                let rcall = self.regblock_call(&bctx.helper_field, "read", vec![lit(reg.offset)])?;
+                let got = self.fresh_temp();
+                self.push(Stmt::TransactorCall { dest: Some(got), call: rcall });
+                // assert got == pat else fail("bitbash REG label: wrote 0x.., got 0x..")
+                let cond = Expr::Binary(BinOp::Eq, Box::new(Expr::Local(got)), Box::new(lit(pat)));
+                // v1's exact message: `bitbash <reg> <label>: wrote
+                // 0x%llx, got 0x%llx` with long-long hex args. The
+                // non-wide-hex (`harc_printf_ll`) arg path is the
+                // long-long ABI v1's `(long long)` cast also uses, so
+                // the rendered text is byte-identical across backends.
+                let on_fail = FmtArgs {
+                    fmt: format!(
+                        "bitbash {} {pat_label}: wrote 0x%llx, got 0x%llx",
+                        reg.name
+                    ),
+                    args: vec![
+                        FmtArg { expr: lit(pat), wide_hex: None },
+                        FmtArg { expr: Expr::Local(got), wide_hex: None },
+                    ],
+                };
+                self.push(Stmt::AssertCheck { cond, on_fail });
+            }
+        }
+        Ok(true)
+    }
+
     /// `let x = regs.NAME` register-level frontdoor read, declaring a
     /// fresh local `dest_name`. Returns `Ok(true)` when `value` is a
     /// register read on a regblock binding (and lowers it).
@@ -282,6 +373,77 @@ impl super::FuncBuilder<'_> {
         Ok(true)
     }
 
+    /// Lower a register read in a general EXPRESSION position (an assert
+    /// condition, a `log`/`fail` format arg) — `regs.NAME` that is NOT a
+    /// `let`-RHS. Returns an `Expr::RegRead` that emits v1's inline
+    /// assignment-expression: RW/RO fires the bus read and predicts the
+    /// mirror in one expression; WO serves from the mirror cell.
+    ///
+    /// The bus-read count matches v1 exactly: one read per textual
+    /// occurrence, fired eagerly in conditions and lazily in fail
+    /// messages (which both backends emit inside the `if (!cond)`
+    /// branch). No statement hoist is needed because the `via` helper's
+    /// `read` is an ordinary hookable lambda, not the bus wire protocol.
+    pub(crate) fn lower_regblock_read_expr(
+        &self,
+        binding: &str,
+        reg_name: &str,
+    ) -> Result<Expr, LowerError> {
+        let bctx = &self.ctx.regblock_bindings[binding];
+        let reg = bctx
+            .registers
+            .iter()
+            .find(|r| r.name == reg_name)
+            .expect("as_regblock_register validated the register");
+        let Some(mirror) = self.lookup(binding) else {
+            return Err(LowerError::Invalid(format!(
+                "regblock binding `{binding}` is not in scope at its read site"
+            )));
+        };
+        // Resolve the helper TYPE name (the emitted lambda is
+        // `<helper_ty>_read`) and validate the `read` method/arity, the
+        // same way `regblock_call` does for the statement paths.
+        let helper_ty = self.regblock_helper_type(&bctx.helper_field, "read", 1)?;
+        Ok(Expr::RegRead {
+            mirror,
+            helper_ty,
+            field: reg.name.clone(),
+            offset: reg.offset,
+            reads_bus: reg.access.reads_from_bus(),
+        })
+    }
+
+    /// Resolve a regblock `via` helper field to its transactor TYPE name,
+    /// validating the named method exists at `arity`. Shared by the
+    /// statement call-edge path and the expression-position `RegRead`.
+    fn regblock_helper_type(
+        &self,
+        helper_field: &str,
+        method: &str,
+        arity: usize,
+    ) -> Result<String, LowerError> {
+        let Some(&xid) = self.ctx.transactor_fields.get(helper_field) else {
+            return Err(LowerError::Invalid(format!(
+                "regblock `via` helper `{helper_field}` is not an active transactor field"
+            )));
+        };
+        let schema = &self.ctx.transactors[xid.index()];
+        let Some(m) = schema.method(method) else {
+            return Err(LowerError::Invalid(format!(
+                "regblock `via` helper `{}` has no `{method}` method",
+                schema.name
+            )));
+        };
+        if m.n_params != arity {
+            return Err(LowerError::Invalid(format!(
+                "regblock `via` helper `{}` method `{method}` takes {} argument(s), \
+                 the frontdoor passes {arity}",
+                schema.name, m.n_params,
+            )));
+        }
+        Ok(schema.name.clone())
+    }
+
     /// `Some((binding, register))` when `e` is a two-level
     /// `<binding>.<REG>` access where `<binding>` is a regblock binding
     /// and `<REG>` is one of its registers. A binding access to an
@@ -306,9 +468,10 @@ impl super::FuncBuilder<'_> {
     }
 
     /// `true` when `id` names a regblock binding in scope — used by
-    /// callers to give a precise rejection for out-of-subset shapes
-    /// (field-level access, reads in non-`let` positions) before falling
-    /// through to a generic error.
+    /// callers to recognize the in-subset register-level read/write and
+    /// `bitbash` shapes, and to give a precise rejection for the
+    /// remaining out-of-subset shapes (field-level access, the passive
+    /// `record_*` API) before falling through to a generic error.
     pub(crate) fn is_regblock_binding(&self, name: &str) -> bool {
         self.ctx.regblock_bindings.contains_key(name)
     }
@@ -335,11 +498,12 @@ impl super::FuncBuilder<'_> {
 
     /// Reject an out-of-subset access on a regblock binding with a
     /// precise message naming the deferred feature. Called after the
-    /// in-subset register-level read/write paths have declined `e`, so
-    /// reaching here means `e` is rooted at a regblock binding but is
-    /// NOT a plain `<binding>.<register>` access: a field-level
-    /// `regs.REG.FIELD`, an unknown register, `bitbash`, the passive
-    /// `record_*` API, or a register read outside `let`-RHS position.
+    /// in-subset register-level read/write paths (and `bitbash`) have
+    /// declined `e`, so reaching here means `e` is rooted at a regblock
+    /// binding but is NOT an in-subset access: a field-level
+    /// `regs.REG.FIELD`, an unknown register, or the passive `record_*`
+    /// API. (A plain register read outside `let`-RHS is now lowered to
+    /// `Expr::RegRead` upstream and never reaches here.)
     /// A no-op (`Ok(())`) when `e` is not a regblock access at all.
     pub(crate) fn reject_out_of_subset_regblock_access(
         &self,
@@ -373,9 +537,10 @@ impl super::FuncBuilder<'_> {
         };
         Err(unsupported(
             &format!("{detail} (regblock `{binding}`)"),
-            "only register-level `regs.NAME = v` writes and `let x = regs.NAME` reads are \
-             lowered; field-level access, `bitbash`, the `record_write`/`record_read` API, \
-             per-register `on` callbacks, and `addrmap` composition are follow-up slices",
+            "register-level `regs.NAME = v` writes, `regs.NAME` reads (incl. assert/format \
+             positions), and `bitbash(regs)` are lowered; field-level access, the \
+             `record_write`/`record_read` API, per-register `on` callbacks, and `addrmap` \
+             composition are follow-up slices",
         ))
     }
 
@@ -423,5 +588,57 @@ fn lit(v: u64) -> Expr {
     Expr::Literal {
         value: v,
         ty: IrType::Unknown,
+    }
+}
+
+/// `Some(detail)` when `s` is a regblock record-API / per-register
+/// callback residual rooted at one of `bindings` — the deferred slice.
+/// Distinguishes the two shapes for an actionable message:
+///   * `on regs.REG ... end on` — a per-register write callback.
+///   * `regs.record_write(...)` / `let v = regs.record_read(...)` — the
+///     passive record API.
+/// `None` for any other statement (including in-subset register-level
+/// reads/writes and `bitbash`).
+pub(crate) fn detect_regblock_residual(
+    s: &crate::ast::Stmt,
+    bindings: &std::collections::HashSet<&str>,
+) -> Option<String> {
+    use crate::ast::StmtKind;
+    // `regs.record_write(...)` / `regs.record_read(...)` call on a
+    // regblock binding (in any expression — statement or `let`-RHS).
+    fn record_api_call(e: &crate::ast::Expr, bindings: &std::collections::HashSet<&str>) -> Option<String> {
+        let ExprKind::Call { callee, .. } = &*e.kind else {
+            return None;
+        };
+        let ExprKind::Field { target, name } = &*callee.kind else {
+            return None;
+        };
+        let ExprKind::Ident(id) = &*target.kind else {
+            return None;
+        };
+        if !bindings.contains(id.name.as_str()) {
+            return None;
+        }
+        (name.name == "record_write" || name.name == "record_read")
+            .then(|| format!("the passive `{}.{}(...)` API", id.name, name.name))
+    }
+    match &s.kind {
+        // `on regs.REG ... end on` — event is the `regs.REG` access.
+        StmtKind::On(h) => {
+            if let ExprKind::Field { target, name } = &*h.event.kind {
+                if let ExprKind::Ident(id) = &*target.kind {
+                    if bindings.contains(id.name.as_str()) {
+                        return Some(format!(
+                            "a per-register write callback `on {}.{}`",
+                            id.name, name.name
+                        ));
+                    }
+                }
+            }
+            None
+        }
+        StmtKind::Expr(e) => record_api_call(e, bindings),
+        StmtKind::Let(l) => l.value.as_ref().and_then(|v| record_api_call(v, bindings)),
+        _ => None,
     }
 }

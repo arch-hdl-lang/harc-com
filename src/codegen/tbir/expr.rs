@@ -86,6 +86,10 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // `cycle_count` (a captured `ctx.cycle_count` reference), matching
         // v1's bare-ident emission of `cycle_count`.
         Expr::CycleCount => "(uint64_t)cycle_count".to_string(),
+        // The framework error counter — emitted as the in-scope `errors`
+        // variable (a captured `ctx.errors` reference), matching v1's
+        // bare-ident emission of `errors`.
+        Expr::ErrorCount => "errors".to_string(),
         Expr::WideLiteral(words) => wide_literal_cpp(words),
         Expr::Local(l) => cx
             .names
@@ -105,6 +109,25 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                 ))
             })?;
             format!("{name}.{field}")
+        }
+        // Register-level frontdoor read in a general expression position
+        // (assert condition / format arg). v1's inline assignment-
+        // expression: RW/RO does the bus read AND predicts the mirror in
+        // one expression (`(regs.NAME = <Helper>_read(off))`); WO serves
+        // from the mirror cell. The `read` lambda is a plain C++ call —
+        // not the bus wire protocol — so this is a legitimate value.
+        Expr::RegRead { mirror, helper_ty, field, offset, reads_bus } => {
+            let name = cx.names.get(mirror.index()).cloned().ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: dangling mirror local %{} in {}",
+                    mirror.0, cx.func.name
+                ))
+            })?;
+            if *reads_bus {
+                format!("({name}.{field} = {helper_ty}_read({offset}))")
+            } else {
+                format!("{name}.{field}")
+            }
         }
         // Scalar testbench field read — a `_tb` struct member (scalar
         // fields exist only on non-synthetic testbenches).

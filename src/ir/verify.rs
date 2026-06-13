@@ -862,7 +862,7 @@ impl Checker<'_> {
             Expr::Literal { .. } | Expr::WideLiteral(_) => {}
             // The global cycle counter — a framework value, no
             // local/port dependency to verify.
-            Expr::CycleCount => {}
+            Expr::CycleCount | Expr::ErrorCount => {}
             Expr::Local(l) => self.check_local(*l),
             Expr::TbField(field) => self.check_tb_field(field),
             // Transactor-instance state — host state, resolved at
@@ -892,6 +892,15 @@ impl Checker<'_> {
             Expr::RecordField { local, field } => {
                 self.check_local(*local);
                 self.check_record_field(*local, field);
+            }
+            // Register-level frontdoor read in expression position. The
+            // mirror is a record local; the register name must be one of
+            // its fields. The helper read is a plain lambda call (not the
+            // TLM seam), so it is a legitimate sub-expression value —
+            // nothing in the seam rule forbids it here.
+            Expr::RegRead { mirror, field, .. } => {
+                self.check_local(*mirror);
+                self.check_record_field(*mirror, field);
             }
             Expr::CovBin { inst, .. } => self.check_covgroup(inst.covgroup),
             // Component host state — resolved at lowering against the
@@ -1284,6 +1293,7 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
         Expr::Literal { .. }
         | Expr::WideLiteral(_)
         | Expr::CycleCount
+        | Expr::ErrorCount
         | Expr::Port(_)
         | Expr::TbField(_)
         | Expr::TransactorState { .. }
@@ -1291,6 +1301,10 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
         | Expr::ScoreboardQuery { .. } => {}
         Expr::Local(l) => f(*l),
         Expr::RecordField { local, .. } => f(*local),
+        // The mirror record local is both used (read) and written (the
+        // inline assignment-expression predict), but it was defined at
+        // its `let` RecordInit site upstream — record it as a use.
+        Expr::RegRead { mirror, .. } => f(*mirror),
         Expr::Binary(_, a, b) => {
             for_each_local(a, f);
             for_each_local(b, f);

@@ -1948,6 +1948,32 @@ fn lower_test(
             collect_stmts(b, false, &mut check_stmts);
         }
     }
+    // Precise rejection for the regblock record-API + per-register
+    // callback residual: an `on regs.REG ... end on` handler or a
+    // `regs.record_*(...)` call at test scope. These are out of the
+    // TB-IR subset (see `regblock::detect_regblock_residual`); without
+    // this pass a `record_test`-shaped test trips the generic
+    // bare-statement/scope mixing error below, which buries the real
+    // (regblock-residual) reason. Scan both bare statements and the
+    // scope blocks' bodies.
+    {
+        let binding_names: std::collections::HashSet<&str> =
+            regblock_bindings_map.keys().map(|s| s.as_str()).collect();
+        let mut scan: Vec<&AstStmt> = bare_stmts.clone();
+        scan.extend(run_stmts.iter().copied().skip(n_hoisted_lets));
+        scan.extend(check_stmts.iter().copied());
+        for s in &scan {
+            if let Some(detail) = regblock::detect_regblock_residual(s, &binding_names) {
+                return Err(unsupported(
+                    &detail,
+                    "the passive `record_write`/`record_read` API and per-register \
+                     `on regs.REG` write callbacks are a follow-up regblock slice; \
+                     register-level frontdoor reads/writes and `bitbash(regs)` are \
+                     supported",
+                ));
+            }
+        }
+    }
     if scope.is_some() && !bare_stmts.is_empty() {
         // v1 interleaves bare statements with scope blocks in item
         // order; the IR's run/check split cannot represent that
@@ -2870,12 +2896,14 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             | ir::Expr::WideLiteral(_)
             | ir::Expr::Local(_)
             | ir::Expr::CycleCount
+            | ir::Expr::ErrorCount
             | ir::Expr::Port(_)
             | ir::Expr::RecordField { .. }
             | ir::Expr::TbField(_)
             | ir::Expr::ComponentField { .. }
             | ir::Expr::ScoreboardQuery { .. }
             | ir::Expr::SeqLen(_)
+            | ir::Expr::RegRead { .. }
             | ir::Expr::CovBin { .. } => {}
         }
     }
@@ -3045,12 +3073,14 @@ fn fill_initiator_bus_prefix(func: &mut TbFunction, binding: &str) -> Result<(),
             | Expr::WideLiteral(_)
             | Expr::Local(_)
             | Expr::CycleCount
+            | Expr::ErrorCount
             | Expr::RecordField { .. }
             | Expr::TbField(_)
             | Expr::TransactorState { .. }
             | Expr::ComponentField { .. }
             | Expr::ScoreboardQuery { .. }
             | Expr::SeqLen(_)
+            | Expr::RegRead { .. }
             | Expr::CovBin { .. } => {}
         }
     }

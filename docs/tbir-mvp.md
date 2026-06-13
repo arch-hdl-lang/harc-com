@@ -84,11 +84,25 @@ rw|ro|wo`) lower to a synthetic mirror value-record plus a
 unbound-transactor helper; and the **register-level frontdoor** —
 `regs.NAME = v` (mirror update + `Helper.write` call edge, RO
 suppressed) and `let x = regs.NAME` (`Helper.read` call edge + mirror
-predict, WO served from mirror). No new IR variants: the mirror is an
-`IrType::Record` and traffic reuses the `CallTarget::TransactorMethod`
-edge. Field-level access, `bitbash`, the `record_*` passive API,
-per-register `on` callbacks, `addrmap`, and the bus-bound `via` helper
-are explicit rejections (see divergence 12).
+predict, WO served from mirror). The mirror is an `IrType::Record` and
+the let-RHS/statement traffic reuses the `CallTarget::TransactorMethod`
+edge. The bus-bound `via` helper form lowers via the initiator-BFM
+slice. The **regblock-residuals slice** (2026-06-13, divergence 12)
+adds two more: (a) **register reads outside `let`-RHS** — assert
+conditions and `log`/`fail` format args — lower to a new `Expr::RegRead`
+(v1's inline assignment-expression `(regs.NAME = <Helper>_read(off))`
+for RW/RO, `regs.NAME` for WO), firing exactly one bus read per textual
+occurrence (the `via` helper's `read` is a plain hookable lambda, not
+the TLM seam, so it is a legitimate sub-expression value — unlike the
+verifier-pinned call edge); and (b) **`bitbash(regs)`** —
+compile-time-unrolled walk-all over the RW registers (write/read both
+patterns + compare; RO/WO skipped), unrolled into the existing
+`TransactorCall`/`AssertCheck` statements, plus a new `Expr::ErrorCount`
+framework value for the trailing `assert errors == 0`. Field-level
+access, the passive `record_write`/`record_read` API, per-register `on
+regs.REG` callbacks (rejected precisely via
+`regblock::detect_regblock_residual`), and `addrmap` composition stay
+out of subset (see divergence 12).
 `transactor` declarations lower in their **unbound DUT-poking BFM
 subset**: no `bound to <BusType>`, no generics, exactly one
 module-typed field (the DUT handle — its type must match the test's
@@ -358,6 +372,8 @@ none — `extra_harc` joins additional `tests/fixtures/` files to the
 | `buf_mgr_test` | `BufMgr` | `buf_mgr.sv` + 4 | pass | transactor: `while` over port read, `return dut.port`, assert in method |
 | `scoreboard_basic_test` | `Top` | `top_counter.sv` | pass | scoreboard: queue push/pop/size/empty, scalar counter read/write, run↔check-shared `_tb` instance |
 | `regblock_subset_test` | `Top` | `top_counter.sv` | pass | regblock: rw/ro/wo + reset, register-level frontdoor (mirror + Helper.write/read call edges), read-predict, WO mirror-read, test-scope-let helper |
+| `regblock_basic_test` | `AxiLiteRegs` | `AxiLiteRegs.sv` | pass | regblock: initiator-BFM `via` helper + register read in assert conditions AND `${...}` fail-message format args (`Expr::RegRead`, divergence 12) — one bus read per textual occurrence (eager cond, lazy fail-branch) |
+| `regblock_bitbash_test` | `AxiLiteRegs` | `AxiLiteRegs.sv` | pass | regblock: `bitbash(regs)` compile-time-unrolled walk-all over 3 RW regs (write/read ones+zero + compare; RO/WO skipped) + `assert errors == 0` (`Expr::ErrorCount`) |
 | `struct_basic_test` | `Top` | `top_counter.sv` | pass | struct: scalar fields (uint/sint/bool) + literal defaults, default-construct in a loop (re-init), field reads/writes in arithmetic/branch/assert/format args (reuses the transaction record machinery) |
 | `tlm_target_thread_test` | `TlmReadInitiator` | `TlmReadInitiator.sv` | pass | target-side TLM: blocking `thread bus.read` responder actor, single-cycle wait, value return |
 | `tlm_target_thread_if_test` | `TlmReadInitiatorPair` | `TlmReadInitiatorPair.sv` | pass | target-side TLM: persistent state fields (read in body + from test), `for` loop, `if`/`else` return |
@@ -1248,6 +1264,51 @@ reason. Code locations are authoritative.
       at seed 1; registered.
     - *Out of subset* (still rejected): `event<enum/Vec/nested>` payloads,
       `on <expr>` cycle-trigger handlers, `tseq`.
+
+20. **Regblock residuals: register read in assert/format position +
+    `bitbash(regs)` (2026-06-13, divergence 12).** Two of the three
+    regblock-residual blockers (`regblock_basic_test`,
+    `regblock_bitbash_test`). Builds on the register-level frontdoor
+    (#369) and the initiator-BFM `via` helper (#375).
+    - *New IR.* `Expr::RegRead { mirror, helper_ty, field, offset,
+      reads_bus }` — a register-level frontdoor read in a general
+      EXPRESSION position (assert condition, `log`/`fail` format arg),
+      NOT a `let`-RHS. Emits v1's inline assignment-expression: RW/RO →
+      `(regs.NAME = <Helper>_read(off))` (bus read + mirror predict in
+      one expression), WO → `regs.NAME` (mirror only). This is deliberately
+      NOT a `CallTarget::TransactorMethod` call edge — the `via` helper's
+      `read` lowers to an ordinary hookable lambda (a plain C++ call), not
+      the bus req/rsp wire protocol, so it is a legitimate sub-expression
+      value; the verifier's seam rule (which pins call edges to statement
+      position) does not apply. The inline form fires exactly one bus read
+      per textual occurrence — matching v1's read-count semantics (eager
+      in conditions, lazy in fail messages, which both backends emit inside
+      the `if (!cond)` branch). Also `Expr::ErrorCount` — a bare `errors`
+      ident (the framework error counter, bumped by `AssertCheck`/error
+      logs), for the trailing `assert errors == 0` after a `bitbash` walk.
+    - *`bitbash(regs)`.* Lowered (`try_lower_bitbash`, `regblock.rs`) by
+      compile-time unrolling — NO new statement form. For each RW register
+      and each pattern (all-ones masked to width, then zero):
+      `TransactorCall(Helper.write(off, pat))`, `TransactorCall(got =
+      Helper.read(off))`, `AssertCheck { got == pat, "bitbash <reg>
+      <label>: wrote 0x%llx, got 0x%llx" }`. RO/WO registers are skipped
+      (RO can't accept the write; WO reads are mirror-only) — matching v1's
+      `try_emit_bitbash`.
+    - *Placement.* `Expr::RegRead { reads_bus: true }` marks the block
+      transactor-touching (the helper read may advance the clock), same as
+      a `TransactorMethod` call edge; a WO read is pure host state.
+    - *Fixtures.* `regblock_basic_test` (register read in assert cond +
+      `${...}` fail-message format arg) and `regblock_bitbash_test`
+      (`bitbash(regs)` over 3 RW + 1 RO + 1 WO). Both `AxiLiteRegs.sv`,
+      `pass`, trace-diff clean v1↔tbir at seed 1; both registered.
+    - *Out of subset* (still rejected, precisely): the passive
+      `record_write`/`record_read` API and per-register `on regs.REG`
+      write callbacks (`regblock_record_test`,
+      `regblock_record_recursion_test`) — `regblock::detect_regblock_residual`
+      names the callback/record-API feature before the generic
+      bare-statement/scope mixing error fires. Field-level
+      `regs.REG.FIELD` access and `addrmap` composition (incl. `alias of`)
+      also stay rejected.
 
 Minor, same spirit: `IndexVec` is a plain `Vec` plus typed id structs;
 the design's `AssertFail` enum collapsed into a single

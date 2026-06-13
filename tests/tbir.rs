@@ -3413,10 +3413,12 @@ end impl Test
 }
 
 /// A register read outside `let`-RHS position (here an assert condition)
-/// is rejected — v1 reads the bus inline at every read site, which the
-/// IR's statement model can't represent without changing the read count.
+/// now lowers to an `Expr::RegRead` — v1's inline assignment-expression
+/// (`(regs.A = H_read(off))`), which fires exactly one bus read per
+/// textual occurrence. The `via` helper's `read` is a plain hookable
+/// lambda (not the TLM seam), so it is a legitimate sub-expression value.
 #[test]
-fn regblock_read_in_assert_is_unsupported() {
+fn regblock_read_in_assert_lowers_to_regread() {
     let src = r#"
 transactor H
     dut : Top
@@ -3444,30 +3446,79 @@ impl Test for Tb
     end run
 end impl Test
 "#;
-    let err = lower_src(src).unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(
-        msg.contains("outside a `let`"),
-        "expected an out-of-let read rejection: {msg}"
-    );
+    let prog = lower_src(src).expect("read-in-assert lowers");
+    verify::verify_program(&prog).expect("verifies");
+    // The run function's AssertCheck condition must carry a RegRead
+    // that reads the bus and predicts the mirror.
+    let run = prog
+        .functions
+        .iter()
+        .find(|f| matches!(f.kind, ir::FunctionKind::Run))
+        .expect("run function");
+    let has_regread = run.blocks.iter().any(|b| {
+        b.stmts.iter().any(|s| {
+            if let ir::Stmt::AssertCheck { cond, .. } = s {
+                fn contains_regread(e: &ir::Expr) -> bool {
+                    match e {
+                        ir::Expr::RegRead { reads_bus, .. } => *reads_bus,
+                        ir::Expr::Binary(_, a, b) => contains_regread(a) || contains_regread(b),
+                        ir::Expr::Unary(_, a) => contains_regread(a),
+                        _ => false,
+                    }
+                }
+                contains_regread(cond)
+            } else {
+                false
+            }
+        })
+    });
+    assert!(has_regread, "expected a bus-reading RegRead in the assert condition");
 }
 
-/// The corpus `regblock_basic_test` fixture's `via` helper — a
-/// `transactor ... bound to BusAxiLite` whose `hookable` bodies drive
-/// the bus's handshake channels (the initiator-side BFM form) — now
-/// lowers (this slice). The fixture's *remaining* blocker is a regblock
-/// residual, NOT the BFM: it reads registers in assert conditions and
-/// `${...}` format args (`assert (regs.DMACR & 1) == 1`), and the
-/// regblock subset lowers register reads only in `let`-RHS position
-/// (divergence 12). Lowering rejects that precisely, never mis-lowers.
+/// The corpus `regblock_basic_test` fixture — initiator-side BFM `via`
+/// helper PLUS register reads in assert conditions and `${...}` format
+/// args (`assert (regs.DMACR & 1) == 1 else fail("...0x${regs.DMACR}")`)
+/// — now FULLY lowers (this slice). Register reads outside `let`-RHS
+/// lower to `Expr::RegRead` (v1's inline assignment-expression), so the
+/// fixture's last regblock residual (divergence 12) is closed.
 #[test]
-fn regblock_basic_corpus_blocked_on_register_read_position() {
-    let err =
-        lower_with_stdlib_bus("regblock_basic_test.harc", "BusAxiLite.arch").unwrap_err();
-    let msg = assert_unsupported(&err);
+fn regblock_basic_corpus_lowers_with_register_read_in_assert() {
+    let prog =
+        lower_with_stdlib_bus("regblock_basic_test.harc", "BusAxiLite.arch").expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    // Both an assert condition AND a fail-message format arg carry a
+    // bus-reading RegRead (eager in the cond, lazy in the fail branch).
+    let run = prog
+        .functions
+        .iter()
+        .find(|f| matches!(f.kind, ir::FunctionKind::Run))
+        .expect("run function");
+    let mut cond_reads = 0usize;
+    let mut fail_arg_reads = 0usize;
+    fn is_bus_regread(e: &ir::Expr) -> bool {
+        match e {
+            ir::Expr::RegRead { reads_bus, .. } => *reads_bus,
+            ir::Expr::Binary(_, a, b) => is_bus_regread(a) || is_bus_regread(b),
+            ir::Expr::Unary(_, a) => is_bus_regread(a),
+            _ => false,
+        }
+    }
+    for b in &run.blocks {
+        for s in &b.stmts {
+            if let ir::Stmt::AssertCheck { cond, on_fail } = s {
+                if is_bus_regread(cond) {
+                    cond_reads += 1;
+                }
+                if on_fail.args.iter().any(|a| is_bus_regread(&a.expr)) {
+                    fail_arg_reads += 1;
+                }
+            }
+        }
+    }
+    assert!(cond_reads >= 3, "expected ≥3 assert-cond RegReads, got {cond_reads}");
     assert!(
-        msg.contains("register read") && msg.contains("outside a `let`"),
-        "expected the register-read-position residual (BFM now lowers): {msg}"
+        fail_arg_reads >= 3,
+        "expected ≥3 fail-message RegReads, got {fail_arg_reads}"
     );
 }
 
@@ -3491,4 +3542,69 @@ fn regblock_access_corpus_lowers_with_initiator_bfm() {
         .expect("AxilHelper transactor lowered");
     assert_eq!(helper.bound_bus.as_deref(), Some("BusAxiLite"));
     assert!(helper.method("write").is_some() && helper.method("read").is_some());
+}
+
+/// The corpus `regblock_bitbash_test` fixture — `bitbash(regs)` over a
+/// regblock with 3 RW + 1 RO + 1 WO register — FULLY lowers (this
+/// slice). The walk unrolls to write/read both patterns + compare per
+/// RW register; RO/WO are skipped. The trailing `assert errors == 0`
+/// lowers via the new `Expr::ErrorCount` framework value.
+#[test]
+fn regblock_bitbash_corpus_lowers() {
+    let prog =
+        lower_with_stdlib_bus("regblock_bitbash_test.harc", "BusAxiLite.arch").expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let run = prog
+        .functions
+        .iter()
+        .find(|f| matches!(f.kind, ir::FunctionKind::Run))
+        .expect("run function");
+    // 3 RW registers × 2 patterns = 6 write+read pairs. Count the
+    // discarded `Helper.write(...)` call edges (dest=None) the bitbash
+    // walk emits (RO/WO skipped → exactly 6).
+    let writes = run
+        .blocks
+        .iter()
+        .flat_map(|b| &b.stmts)
+        .filter(|s| matches!(s, ir::Stmt::TransactorCall { dest: None, .. }))
+        .count();
+    assert_eq!(writes, 6, "expected 6 bitbash write call edges (3 RW × 2 patterns)");
+    // The `errors == 0` check resolves the framework counter.
+    let has_errcount = run.blocks.iter().any(|b| {
+        b.stmts.iter().any(|s| {
+            if let ir::Stmt::AssertCheck { cond, .. } = s {
+                fn has(e: &ir::Expr) -> bool {
+                    match e {
+                        ir::Expr::ErrorCount => true,
+                        ir::Expr::Binary(_, a, b) => has(a) || has(b),
+                        _ => false,
+                    }
+                }
+                has(cond)
+            } else {
+                false
+            }
+        })
+    });
+    assert!(has_errcount, "expected an `errors == 0` AssertCheck (ErrorCount)");
+}
+
+/// The corpus `regblock_record_test` fixture — passive `record_write`/
+/// `record_read` API plus a per-register `on regs.REG` write callback —
+/// is the remaining regblock residual: lowering rejects it with a
+/// precise message naming the callback/record-API feature (NOT the
+/// generic bare-statement/scope mixing error), never mis-lowers.
+#[test]
+fn regblock_record_corpus_rejects_precisely() {
+    let err =
+        lower_with_stdlib_bus("regblock_record_test.harc", "BusAxiLite.arch").unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("per-register write callback") || msg.contains("record_"),
+        "expected the record-API/callback residual rejection: {msg}"
+    );
+    assert!(
+        !msg.contains("mixing bare statements"),
+        "should not fall through to the generic mixing error: {msg}"
+    );
 }

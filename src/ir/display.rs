@@ -602,6 +602,7 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
     match e {
         Expr::Literal { value, .. } => format!("{value}"),
         Expr::CycleCount => "cycle_count".to_string(),
+        Expr::ErrorCount => "errors".to_string(),
         Expr::WideLiteral(words) => {
             // MSB-first hex dump of the word list (deterministic,
             // reparse-free — the IR has no surface syntax).
@@ -615,6 +616,16 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         Expr::Port(p) => port_str(p),
         Expr::RecordField { local, field } => {
             format!("{}.{field}", local_str(func, *local))
+        }
+        Expr::RegRead { mirror, helper_ty, field, offset, reads_bus } => {
+            if *reads_bus {
+                format!(
+                    "RegRead({}.{field} = {helper_ty}.read({offset}))",
+                    local_str(func, *mirror)
+                )
+            } else {
+                format!("RegRead({}.{field})", local_str(func, *mirror))
+            }
         }
         Expr::TbField(field) => format!("_tb.{field}"),
         Expr::TransactorState { instance, field } => format!("{instance}.{field}"),

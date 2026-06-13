@@ -1306,6 +1306,13 @@ pub enum Expr {
     /// canonical use is `${cycle_count}` inside a `log`/`watchdog`
     /// diagnostic. uint64_t-valued.
     CycleCount,
+    /// The framework error counter (`errors`). A bare `errors` ident
+    /// resolves here — it is a framework-provided counter (bumped by
+    /// `AssertCheck`/`Log(error|fatal)`), not a user local. Both
+    /// backends emit the in-scope `errors` variable; allowed wherever a
+    /// `Local` is. Canonical use: `assert errors == 0` after a
+    /// compile-time-unrolled walk like `bitbash(regs)`. int-valued.
+    ErrorCount,
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Unary(UnOp, Box<Expr>),
     /// `cond ? a : b`. Both backends emit the C++ ternary; port reads
@@ -1342,6 +1349,36 @@ pub enum Expr {
     /// variable). Emitted as `<seq>[<index>]`.
     SeqIndex { seq: LocalId, index: Box<Expr> },
     Call(CallTarget, Vec<Expr>),
+    /// A register-level frontdoor READ on a regblock binding in a
+    /// general expression position — `regs.NAME` outside `let`-RHS
+    /// (an assert condition, a `log`/`fail` format arg). Emits v1's
+    /// inline assignment-expression:
+    ///
+    /// ```text
+    /// RW/RO: (mirror.field = <HelperTy>_read(off))   // bus read + predict
+    /// WO:    mirror.field                            // mirror only
+    /// ```
+    ///
+    /// This is NOT a `CallTarget::TransactorMethod` call edge: the
+    /// regblock `via` helper's `read` lowers to an ordinary hookable
+    /// lambda (a plain C++ function call), not the bus req/rsp wire
+    /// protocol, so it is a legitimate sub-expression value — unlike
+    /// the TLM seam, which the verifier pins to statement position. The
+    /// inline form fires exactly one bus read per textual occurrence,
+    /// matching v1's read-count semantics (eager in conditions, lazy
+    /// in fail messages emitted inside the `if (!cond)` branch).
+    ///
+    /// `helper_ty` is the resolved transactor TYPE name (the emitted
+    /// lambda is `<helper_ty>_read`); `mirror` is the synthetic mirror
+    /// record local; `field` is the register name; `offset` is the
+    /// folded byte offset; `reads_bus` is `RegAccess::reads_from_bus`.
+    RegRead {
+        mirror: LocalId,
+        helper_ty: String,
+        field: String,
+        offset: u64,
+        reads_bus: bool,
+    },
 }
 
 /// Which heartbeat stamp(s) an `Expr::ComponentIdle` predicate reads.
