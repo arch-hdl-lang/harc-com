@@ -146,6 +146,7 @@ pub(crate) fn lower_regblock(
         fields.push(RecordFieldSchema {
             name: rname.clone(),
             ty: IrType::UInt(Some(width)),
+            vec_len: None,
             default: reset,
             non_random: false,
             attr_src: Vec::new(),
@@ -295,6 +296,7 @@ impl super::FuncBuilder<'_> {
         self.push(Stmt::RecordFieldWrite {
             local: mirror,
             field: reg.name.clone(),
+            index: None,
             value: v.clone(),
         });
         if writes_bus {
@@ -351,6 +353,7 @@ impl super::FuncBuilder<'_> {
         let cur = Expr::RecordField {
             local: mirror,
             field: reg.name.clone(),
+            index: None,
         };
         // (mirror.REG & ~(mask << pos)) | ((v & mask) << pos)
         let cleared = bin(
@@ -367,6 +370,7 @@ impl super::FuncBuilder<'_> {
         self.push(Stmt::RecordFieldWrite {
             local: mirror,
             field: reg.name.clone(),
+            index: None,
             value: new_word,
         });
         if fld.access.writes_to_bus() {
@@ -374,6 +378,7 @@ impl super::FuncBuilder<'_> {
             let word = Expr::RecordField {
                 local: mirror,
                 field: reg.name.clone(),
+                index: None,
             };
             let call = self.regblock_call(helper_field, "write", vec![lit(reg.offset), word])?;
             self.push(Stmt::TransactorCall { dest: None, call });
@@ -430,6 +435,7 @@ impl super::FuncBuilder<'_> {
             Expr::RecordField {
                 local: mirror,
                 field: reg.name.clone(),
+                index: None,
             }
         };
         bin(BinOp::BitAnd, bin(BinOp::Shr, word, lit(pos)), lit(mask))
@@ -636,6 +642,7 @@ impl super::FuncBuilder<'_> {
             self.push(Stmt::RecordFieldWrite {
                 local: mirror,
                 field: reg.name.clone(),
+                index: None,
                 value: Expr::Local(id),
             });
         } else {
@@ -646,6 +653,7 @@ impl super::FuncBuilder<'_> {
                 Expr::RecordField {
                     local: mirror,
                     field: reg.name.clone(),
+                    index: None,
                 },
             ));
         }
@@ -768,6 +776,152 @@ impl super::FuncBuilder<'_> {
             .iter()
             .any(|r| r.name == name.name)
             .then(|| (id.name.clone(), name.name.clone()))
+    }
+
+    /// `regs.record_write(addr, data)` — **passive** mirror update of an
+    /// observed bus write (no bus traffic; the monitor already saw it).
+    /// Returns `Ok(true)` when `e` is a `record_write` call on a regblock
+    /// binding (and lowers it), `Ok(false)` when it is not.
+    ///
+    /// Lowering: with a compile-time-constant `addr`, decode it to the
+    /// matching register at lowering time and emit a single masked mirror
+    /// `RecordFieldWrite` (`mirror.REG = data & mask`). No callback
+    /// dispatch — the per-register `on regs.REG` callback is a `[&]`-
+    /// capturing closure over run-scope locals, which the function-per-
+    /// CFG IR cannot express (rejected precisely upstream, like the
+    /// `axilite_hooks` pre/post method hooks). A non-constant `addr` (a
+    /// runtime decode chain) and an `addr` that matches no register are
+    /// rejected precisely.
+    pub(crate) fn try_lower_record_write(
+        &mut self,
+        e: &crate::ast::Expr,
+    ) -> Result<bool, LowerError> {
+        let Some((binding, name, args)) = self.as_record_api_call(e) else {
+            return Ok(false);
+        };
+        if name != "record_write" {
+            return Ok(false);
+        }
+        if args.len() != 2 {
+            return Err(LowerError::Invalid(format!(
+                "`{binding}.record_write` takes (addr, data) — got {} argument(s)",
+                args.len()
+            )));
+        }
+        let reg = self.resolve_record_api_reg(&binding, "record_write", call_arg(&args[0]))?;
+        let Some(mirror) = self.lookup(&binding) else {
+            return Err(LowerError::Invalid(format!(
+                "regblock binding `{binding}` is not in scope at its record_write site"
+            )));
+        };
+        // Mask the observed value to the register width before mirroring
+        // (v1 stores `data & mask`), so a `record_read` of the same
+        // address reflects the truncated cell.
+        let v = self.lower_expr_no_ports(call_arg(&args[1]))?;
+        let mask = if reg.width >= 64 { u64::MAX } else { (1u64 << reg.width) - 1 };
+        let masked = bin(BinOp::BitAnd, v, lit(mask));
+        self.push(Stmt::RecordFieldWrite {
+            local: mirror,
+            field: reg.name.clone(),
+            index: None,
+            value: masked,
+        });
+        Ok(true)
+    }
+
+    /// `let v = regs.record_read(addr)` — **passive** mirror read keyed
+    /// by address (decode + mirror read, no bus). Returns `Ok(true)` when
+    /// `value` is a `record_read` call on a regblock binding (and lowers
+    /// it into `dest_name`), `Ok(false)` when it is not. A non-constant
+    /// `addr` or an `addr` matching no register is rejected precisely.
+    pub(crate) fn try_lower_record_read_let(
+        &mut self,
+        dest_name: &str,
+        value: &crate::ast::Expr,
+    ) -> Result<bool, LowerError> {
+        let Some((binding, name, args)) = self.as_record_api_call(value) else {
+            return Ok(false);
+        };
+        if name != "record_read" {
+            return Ok(false);
+        }
+        if args.len() != 1 {
+            return Err(LowerError::Invalid(format!(
+                "`{binding}.record_read` takes (addr) — got {} argument(s)",
+                args.len()
+            )));
+        }
+        let reg = self.resolve_record_api_reg(&binding, "record_read", call_arg(&args[0]))?;
+        let Some(mirror) = self.lookup(&binding) else {
+            return Err(LowerError::Invalid(format!(
+                "regblock binding `{binding}` is not in scope at its record_read site"
+            )));
+        };
+        let id = self.declare(dest_name);
+        self.push(Stmt::Assign(
+            id,
+            Expr::RecordField {
+                local: mirror,
+                field: reg.name.clone(),
+                index: None,
+            },
+        ));
+        Ok(true)
+    }
+
+    /// Decode a `record_*` address argument to its register. Requires a
+    /// compile-time-constant address (literal / const) that matches a
+    /// declared register offset; rejects a runtime address (the v1
+    /// runtime decode chain is not lowered in this subset) and an
+    /// unmatched address precisely.
+    fn resolve_record_api_reg(
+        &self,
+        binding: &str,
+        api: &str,
+        addr: &crate::ast::Expr,
+    ) -> Result<RegRegisterSchema, LowerError> {
+        let Some(addr_val) = self.const_eval_index(addr) else {
+            return Err(unsupported(
+                &format!("`{binding}.{api}(...)` with a non-constant address"),
+                "the passive record API decodes the address at compile time; \
+                 pass a literal or const offset",
+            ));
+        };
+        let bctx = &self.ctx.regblock_bindings[binding];
+        bctx.registers
+            .iter()
+            .find(|r| r.offset == addr_val)
+            .cloned()
+            .ok_or_else(|| {
+                LowerError::Invalid(format!(
+                    "`{binding}.{api}(0x{addr_val:x}, ...)`: address matches no register \
+                     offset in the regblock"
+                ))
+            })
+    }
+
+    /// `Some((binding, method, args))` when `e` is a `<binding>.<method>(
+    /// args)` call on a regblock binding (`method` ∈ record API names).
+    fn as_record_api_call<'a>(
+        &self,
+        e: &'a crate::ast::Expr,
+    ) -> Option<(String, String, &'a [CallArg])> {
+        let ExprKind::Call { callee, args } = &*e.kind else {
+            return None;
+        };
+        let ExprKind::Field { target, name } = &*callee.kind else {
+            return None;
+        };
+        let ExprKind::Ident(id) = &*target.kind else {
+            return None;
+        };
+        if !self.is_regblock_binding(&id.name) {
+            return None;
+        }
+        if name.name != "record_write" && name.name != "record_read" {
+            return None;
+        }
+        Some((id.name.clone(), name.name.clone(), args.as_slice()))
     }
 
     /// `true` when `id` names a regblock binding in scope — used by
@@ -899,6 +1053,15 @@ fn lit(v: u64) -> Expr {
     }
 }
 
+/// The positional expression of a call argument (`record_*` calls take
+/// only positional args; a named arg's value is used the same way).
+fn call_arg(a: &CallArg) -> &crate::ast::Expr {
+    match a {
+        CallArg::Expr(e) => e,
+        CallArg::Named { value, .. } => value,
+    }
+}
+
 fn bin(op: BinOp, a: Expr, b: Expr) -> Expr {
     Expr::Binary(op, Box::new(a), Box::new(b))
 }
@@ -915,37 +1078,24 @@ fn field_mask(width: u32) -> u64 {
     }
 }
 
-/// `Some(detail)` when `s` is a regblock record-API / per-register
-/// callback residual rooted at one of `bindings` — the deferred slice.
-/// Distinguishes the two shapes for an actionable message:
-///   * `on regs.REG ... end on` — a per-register write callback.
-///   * `regs.record_write(...)` / `let v = regs.record_read(...)` — the
-///     passive record API.
+/// `Some(detail)` when `s` is a per-register `on regs.REG ... end on`
+/// write callback rooted at one of `bindings` — the deferred slice.
+///
+/// The passive `record_write`/`record_read` API IS lowered (mirror-only,
+/// constant-address decode), so it is no longer flagged here. The
+/// callback, by contrast, lowers (in v1) to a `[&]`-capturing closure
+/// over run-scope locals (the mirror cell, the callbacks holder, the
+/// recursion-depth counter) that fires from inside `record_write`. The
+/// function-per-CFG TB-IR cannot express a closure lexically nested in
+/// the run coroutine capturing its locals — the SAME blocker as the
+/// `axilite_hooks` pre/post method hooks — so it is rejected precisely.
 /// `None` for any other statement (including in-subset register-level
-/// reads/writes and `bitbash`).
+/// reads/writes, `bitbash`, and the passive record API).
 pub(crate) fn detect_regblock_residual(
     s: &crate::ast::Stmt,
     bindings: &std::collections::HashSet<&str>,
 ) -> Option<String> {
     use crate::ast::StmtKind;
-    // `regs.record_write(...)` / `regs.record_read(...)` call on a
-    // regblock binding (in any expression — statement or `let`-RHS).
-    fn record_api_call(e: &crate::ast::Expr, bindings: &std::collections::HashSet<&str>) -> Option<String> {
-        let ExprKind::Call { callee, .. } = &*e.kind else {
-            return None;
-        };
-        let ExprKind::Field { target, name } = &*callee.kind else {
-            return None;
-        };
-        let ExprKind::Ident(id) = &*target.kind else {
-            return None;
-        };
-        if !bindings.contains(id.name.as_str()) {
-            return None;
-        }
-        (name.name == "record_write" || name.name == "record_read")
-            .then(|| format!("the passive `{}.{}(...)` API", id.name, name.name))
-    }
     match &s.kind {
         // `on regs.REG ... end on` — event is the `regs.REG` access.
         StmtKind::On(h) => {
@@ -961,8 +1111,6 @@ pub(crate) fn detect_regblock_residual(
             }
             None
         }
-        StmtKind::Expr(e) => record_api_call(e, bindings),
-        StmtKind::Let(l) => l.value.as_ref().and_then(|v| record_api_call(v, bindings)),
         _ => None,
     }
 }

@@ -44,6 +44,7 @@ checked against the code at the cited location.
 | agent-mode + cycle-trigger slice (2026-06-13) | **agent-mode multi-DUT-handle transactor + cycle-trigger `on <expr>` monitor handlers + agent/env `connect` bridges** (`src/ir/lower/{components,stmts,mod}.rs`, `src/codegen/tbir/{mod,func,expr}.rs`). Three pieces, each unlocking the `transactor_agent_mode_test`/`transactor_env_mode_test` corpus fixtures: (1) **cycle-trigger handlers** — new `ComponentSchema::cycle_handlers: Vec<CycleTriggerHandlerSchema>` (`trigger` predicate expr + `CycleEdge { Rising \| Falling \| Level }` + zero-arg body `function`). An `on <bool-expr> ... end on` handler (distinguished from `on <ev>(arg)` by `is_event_subscription` — a `Call` whose callee names a self `event` field is a subscription; anything else is a cycle-trigger) lowers to a zero-arg `ComponentMethod` body + its trigger predicate (lowered self-relatively, so `dut.<sig>` reads route to the DUT handle and bare field reads resolve self-relative). Pass-1 reserves FunctionIds methods→event-on-handlers→periodic→cycle-trigger→watchdog (monotonic). The tbir backend installs one per-instance `_checkers` closure per cycle-handler (recursing into sub-components), gated on a uniquely-named `static` prev-state for edge detection (mirrors v1's `emit_cycle_trigger`). It is the always-on OBSERVER half — present on BOTH active and passive instances. (2) **self-relative sub-scoreboard poke** — `sb.writes = sb.writes + 1` inside a transactor body, where `sb` is a `ScoreboardSub` field of the self component: `scoreboard_root` (`stmts.rs`) now resolves a `ScoreboardSub` receiver of `self_component` to a `self`-rooted `nested_path`, and the tbir `ScoreboardOp`/`ScoreboardQuery` emission re-roots `self` at the running instance via `self_subst`. The component method ctx (`mod.rs`) now carries the `scoreboards` table so the scalar-field validation succeeds. (3) **agent + nested-env `connect` bridges** — `connect` edges are now resolved for `Agent` decls (not only `Env`), and the tbir backend recurses through `Sub` fields to install a nested sub-component's bridges (`emit_nested_connects`), so an env→agent→drv `sequencer.dispatched -> drv.req` bridge wires at `<env>.<agent>` scope. Plus: a sequencer's `hookable dispatch(txns: TSeq<Record>)` param now types as `RecordSeq` (`method_param_ir_type` resolves the `TSeq<RegOp>` element against `record_ids`, handling both `TypeArg::Type(Named)` and the bare-ident `TypeArg::Expr` parse), so `for t in txns` iterates it and the C++ param renders `std::vector<Record>`. The `active`/`passive` mode on a composite-component test-scope `let` (`let act : AxilAgent active`) is accepted (and ignored, matching v1 — the fixtures' passive correctness comes from the test never dispatching the passive sequencer, not from hard `when active` elision). Fixtures: `transactor_agent_mode_test` + `transactor_env_mode_test` (`AxiLiteRegs.sv`, pass) — same agent/env decl reused active + passive, active drives 5 AXI round-trips via sequencer→connect→`on req(t)`, both transactors' cycle-trigger observers tally 5 writes + 5 reads off the shared DUT; trace-diff clean v1↔tbir at seed 1. **Divergence**: hard `when active` body elision on a passive instance is NOT implemented (v1 doesn't elide for these fixtures either; the body is structurally present but never stimulated on passive). A `post_eval`-phased or hooked cycle-trigger is rejected precisely (checker phase only). |
 | bound-to monitor slice (2026-06-13) | **bound-to event-driven transactor's passive MONITOR surface — `on bus.<ch>.handshake(arg)` observers + `sb` ScoreboardSub feed + a `passive` bound instance** (`src/ir/lower/{components,mod}.rs`, `src/ir/{mod,display}.rs`). The deferred passive half of the bound-to-agent cluster (PR #391 landed the DRIVER half). An `on bus.<ch>.handshake(arg)` handler on a `bound to <Bus>` transactor desugars into a `CycleTriggerHandlerSchema` with a new `monitor_channel: Some(<ch>)` flag: the synthesized trigger is the channel's `<ch>.valid && <ch>.ready` (rising edge), and the body preamble captures the channel payload into the handler's `arg` local — first payload signal aliases `arg` (scalar `sb.q.push(arg)`), every signal also a per-field alias in `recv_payloads` (so `beat.data`/`beat.resp` resolve, like a `recv()` capture) — then the user body feeds the sub-scoreboard. `lower_monitor_handshake_body` reads the channel payload from the bound `BusDecl` (placeholder-prefixed in the per-component body ctx). **No new actor IR / no new tbir codegen** — reuses the agent-mode cycle-trigger `_checkers` machinery; the monitor triggers live on the schema, so a new `fill_initiator_bus_prefix_expr` (sharing the `fill_visit_*` walkers factored out of `fill_initiator_bus_prefix`) fills their placeholder bus prefix. A `passive` bound instance is now accepted when the transactor declares monitor handlers (pure-driver-no-monitor passive still rejected — inert); both modes register the always-on monitors, `active` adds the `on req` driver. **Divergence**: v1 emits a per-channel coroutine ACTOR (`emit_bound_monitor_actors`); the IR uses a rising-edge cycle-trigger instead — observably equivalent for single-beat valid/ready handshakes (the lowered subset; they'd diverge only for a multi-cycle held handshake, out of subset). Fixtures: `transactor_passive_only_test` (pure monitor), `axilite_bound_mon_test` (active driver + passive monitor concurrent), `axilite_multi_payload_test` (multi-payload `beat.data`/`beat.resp`) — all `AxiLiteRegs.sv`, pass, trace-diff clean v1↔tbir at seed 1. Closes the bound-to-agent cluster. |
 | probe/force slice (2026-06-13) | **DUT-internal signal access via declared probes (read) and force points (write)** (`src/ir/{mod,lower/{mod,stmts,exprs},passes/placement,verify,display}.rs`, `src/codegen/tbir/{mod,runtime,func,expr}.rs`). Makes the long-reserved `PortAccess::Probe`/`Force` real (was always `Port`, divergence 1). A `probe <name> : <T> at <path>` / `probe force <name> : <T> at <path>` on `let dut` (classic OR testbench-owned, the impl-for desugar preserves probes) is collected into `LowerCtx::probes` (name → `{force, width}`); a single-segment `dut.<name>` whose name is a probe lowers `as_port_ref` to a `PortRef` with `access = Probe`/`Force` + the declared scalar width. New IR: `Stmt::ProbeRelease(PortRef)` for `release dut.<probe>`. Lowering enforces the access discipline: writing a read-only probe, or `release`-ing a non-force probe / ordinary port, is a precise hard error. The tbir backend mirrors v1's `Emitter::probes`: a `Probe`/`Force` read routes through `dut->rootp-><DutType>__DOT__harc_probes__DOT__<name>` (the SV bind-stub accessor, `expr::port_signal`/`probe_read_accessor`); a `Force` write emits the `_drv = expr; _en = 1;` pair (`func.rs`); `ProbeRelease` emits `_en = 0;`. The preamble pulls in `V<DutType>___024root.h` when any probe is used (`program_has_probes`, gated like v1's `aggregated_probes`). The SV stub (`__harc_probe_<DutType>.sv`) is emitted by the shared `emit_probe_stub_if_needed` path — identical for both codegens. Fixtures (all `cpu_pipeline.sv`, pass, trace-diff clean v1↔tbir at seed 1): `probe_basic_test` (3 read-only probes hoisting `alu0.{a,b,result}`), `probe_force_test` (read probe + `probe force` write/release fault-injection), `testbench_probe_dut_test` (testbench-OWNED probed DUT + `function reset()`, regression for the impl-for desugar). **Subset / divergence**: probe types must be scalar (`uint<N>`/`sint<N>`/`bits<N>`/`bit`/`bool` — the SV stub only surfaces scalar logic); an aggregate probe type is rejected precisely. Multi-segment probe paths (`at alu0.a`) are stored verbatim in the stub `at`-target and validated by Verilator, NOT harc (mirrors v1; docs/probe-signals.md §4.4). Probing inside an ARCH-compiled DUT (`--dut`) is out of scope — these fixtures self-skip the arch-DUT sweep (`-` in the registry, no `.arch` sibling). |
+| regblock passive record API + struct `Vec` fields (2026-06-13) | **(A) the passive `record_write`/`record_read` RAL API (constant-address decode), and (B) a `Vec<T, N>` record/struct field** (`src/ir/lower/{records,regblock,bus,transactors,stmts,exprs,mod}.rs`, `src/codegen/tbir/{mod,func,expr}.rs`, `src/ir/{mod,verify,display,passes/placement}.rs`). **(A)** `regs.record_write(addr, data)` decodes a compile-time-constant `addr` to its register at lowering time and emits a masked mirror `RecordFieldWrite` (no bus traffic — the monitor already saw the write); `let v = regs.record_read(addr)` emits a mirror `RecordField` read. No new IR — reuses the regblock mirror record. A non-constant address (the v1 runtime decode chain) and an unmatched address are rejected precisely. The per-register `on regs.REG` write callback is STILL rejected: it lowers (in v1) to a `[&]`-capturing closure over run-scope state (mirror cell, callbacks holder, `cb_depth`) fired from inside `record_write`, which the function-per-CFG IR cannot express (the SAME blocker as the `axilite_hooks` pre/post method hooks). So the callback-bearing corpus fixtures (`regblock_record_test`, `regblock_record_recursion_test`) stay residual; the API on its own is proven by the self-authored `regblock_record_api_test`. **(B)** `RecordFieldSchema` gains `vec_len: Option<usize>` — a `Vec<scalar, N>` field lowers to a `std::array<T, N>` member (v1's `record_field_c_type` Vec branch); element access `rec.data[i]` lowers to an indexed `Expr::RecordField` / `Stmt::RecordFieldWrite` (both gain `index: Option<…>`). `record_struct` now emits v1's `harc_pack_<R>` / `harc_unpack_<R>` / `harc_drive_<R>` helpers for EVERY record with a defined packed width (matching v1's unconditional `emit_record_pack_helpers`); a record-returning `tlm_method` captures via `harc_unpack_<R>` (initiator) and the responder drives the response pin via `harc_drive_<R>` (target) — the dest/ret record type is carried on the local (`bus.rs` sets the `let` dest type, `transactors.rs` the responder ret slot). Fixtures (pass, trace-diff clean v1↔tbir at seed 1): `regblock_record_api_test` (`AxiLiteRegs.sv`), `tlm_pairing_arch_burst_target_test` (HARC initiator unpacks the ARCH struct response, `TlmPairingArchBurstTarget.sv`), `tlm_pairing_arch_burst_initiator_test` (HARC target builds + packs the struct response, `TlmPairingArchBurstInitiator.sv`). **Still rejected** (residual map): the per-register `on regs.REG` write callback (closure-capture, as deep as `axilite_hooks`); a non-constant `record_*` address; a widthless / nested / list `Vec` element type; a whole-`Vec` field read/write (only element access lowers). |
 | record-typed method params + value-returning method call in expression position (2026-06-13) | **(a) a transactor method param typed as a declared `transaction`/`struct` record (`hookable run_for(cmd: RunCmd)`) — passed BY VALUE; (b) a value-returning transactor method call in EXPRESSION position (`(helper.read(0) & 1) == 1`, `assert helper.read(24) == ...`)** (`src/ir/lower/{transactors,exprs,stmts,mod}.rs`, `src/codegen/tbir/func.rs`). **(a)** `method_param_ir_type` (in `transactors.rs`) resolves a `Named` param type that names a record (via the method ctx's `record_ids`) to `IrType::Record(rid)` — applied to both the unbound and bound-to method-lowering loops — instead of the prior scalar-only `check_scalar_ty` + `ir_type_of`. The param local is record-typed (default-constructed at entry like any record local), and the body reads its fields via the existing `Expr::RecordField` machinery (#364). The tbir `emit_method` renders a record/recordseq param as the by-value struct (`<Record> n` / `std::vector<Record> n`), mirroring `emit_component_method`'s already-record-aware signature. No new IR variants — reuses `RecordSchema`/`IrType::Record`. **(b)** A value-bearing `CallTarget::TransactorMethod` edge in expression position is now hoisted into its own `Stmt::TransactorCall { dest: Some(temp), .. }` and the result temp substituted — the seam rule's sanctioned home (the edge never stays nested), and the call's internal `tick()` runs at the hoist point in SOURCE ORDER. The hoist lives in `hoist_ports` (`Expr::Call` arm → `hoist_transactor_edge`) for the `lower_expr_no_ports` two-phase path (correct interleaving with DUT-port reads), and in a sibling `hoist_transactor_calls` walk invoked by `lower_assert` (where DUT ports stay inline/lazy but a transactor edge still cannot stay nested). `lower_expr`'s Call arm now builds the edge (`lower_transactor_call(.., need_ret=true)` — a void method used as a value is rejected, mirroring v1's C++ type error) instead of rejecting; the `in_fmt_args` rejection (call inside a lazily-evaluated log/fail message) is preserved. Fixtures (pass, trace-diff clean v1↔tbir at seed 1): `transactor_record_param_test` (self-proving record-by-value param, `top_counter.sv`), `axilite_regs_full_test` (`helper.read(addr)` in assert/`&`/`>>` expression positions across 6 sub-tests, `AxiLiteRegs.sv`). **Still rejected** (residual map): test-scope `on <obj>.<method> pre/post` METHOD HOOKS (`axilite_hooks_test`) — the hook body is a `[&]`-capturing closure that mutates test-scope `let`s by reference, which the function-per-CFG IR cannot express as a closure lexically nested in the run coroutine; a >64-bit method param (`aes_cipher_top_test` `load_block(key: uint<128>)`) — the tbir value model is 64-bit (needs the wide-value method ABI); a transactor method call inside a log/fail message (lazy eval). |
 | TLM OOO-responder lanes slice (2026-06-13) | **a bound-to TARGET responder SERVING an `out_of_order tags N` method — the multi-lane RESPONDER topology** (`src/ir/{mod,display}.rs`, `src/ir/lower/{transactors,exprs}.rs`, `src/codegen/tbir/func.rs`). The last deferred TLM residual (the OOO-RESPONDER LANE form, distinct from the nested-forwarding slice's downstream-OOO-call). A `thread bus.read_ooo(addr) ... return ...` serving an `out_of_order tags N` `tlm_method` lowers to v1's `emit_bound_tagged_tlm_target_actors` topology: a per-tag **dispatcher** (a combinational `req_ready` accept gate pushed onto `_post_eval_services` + a coroutine latching args/`req_tag` into a free lane), **N lane coroutines** (each runs the responder loop-switch body, publishes its result + `lane_rsp_valid`), and an **arbiter** routing the highest-index ready lane's response back on the hidden `rsp_data`/`rsp_tag` wires — so tag 1 can complete before tag 0. **One new IR field** — `TargetTlmMethodSchema::ooo_tags: Option<u64>` (folded by a new `exprs::parse_int_literal_expr`, range-checked `1..=64` at lowering; `None` = blocking single-responder). No new IR variants: the lowered responder `function` is byte-identical to the blocking form; the blocking rejection in `lower_bound_target_transactor` becomes a fold+validate. The responder loop-switch body is factored into a shared `emit_responder_loop_switch` reused by the blocking actor and each lane. **Divergence**: the per-tag arg/response arrays are `uint64_t` (the TB-IR value model), not v1's precise per-method C-types — the runtime `harc_read`/`harc_assign` helpers still width-correct the bus wires, so behavior + traces are identical. The `tlm_call` trace payloads (request edge tagged with the accepted `_tag`, response with the selected `_sel`, `(int64_t)(...)` cast) match v1 byte-for-byte. Fixtures (both pass, trace-diff clean v1↔tbir at seed 1): `tlm_target_ooo_lanes_test` (pure 2-lane OOO responder, out-of-order completion), `tlm_pairing_arch_initiator_test` (mixed `blocking` + `out_of_order tags 2` responders against an ARCH OOO initiator — also passes the ARCH-native-DUT sweep). Closes the TLM residual map; the only remaining TLM holdout is `tlm_pairing_arch_target_test` (LOWERS + trace-diff clean, gate-blocked by a local-Verilator-5.048 TLM-SVA `$fatal` artifact, NOT a lowering gap). |
 
@@ -125,10 +126,17 @@ regblock register/field access lowering verbatim; an `alias of` instance
 shares its target's mirror local (one storage cell across windows) while
 keeping its own base for bus traffic. Alias/overlap validation mirrors
 v1's `check_addrmap_aliases`/`check_addrmap_overlap`
-(`src/ir/lower/addrmap.rs`). The passive `record_write`/`record_read`
-API and per-register `on regs.REG` callbacks (rejected precisely via
-`regblock::detect_regblock_residual`) remain the only out-of-subset
-regblock residuals (see divergence 12).
+(`src/ir/lower/addrmap.rs`). The **passive `record_write`/`record_read`
+API** also lowers now (2026-06-13, divergence 12): a constant-address
+`record_write(addr, data)` decodes to a masked mirror `RecordFieldWrite`
+and `record_read(addr)` to a mirror `RecordField` read, both with no bus
+traffic — `regblock_record_api_test`. The per-register `on regs.REG`
+write callback remains the only out-of-subset regblock residual
+(rejected precisely via `regblock::detect_regblock_residual`): it lowers
+to a reference-capturing closure over run-scope state fired from inside
+`record_write`, the same blocker as the `axilite_hooks` pre/post method
+hooks, so the callback-bearing corpus fixtures
+(`regblock_record_test`/`regblock_record_recursion_test`) stay residual.
 `transactor` declarations lower in their **unbound DUT-poking BFM
 subset**: no `bound to <BusType>`, no generics, exactly one
 module-typed field (the DUT handle — its type must match the test's
@@ -222,10 +230,13 @@ with transactions (`lower_record_field`). The parser fills
 `StructDecl::body`, so lowering reads `fields` only (matching v1) and
 scans the body solely to reject non-field items. A name shared with a
 transaction, struct, or regblock resolves ambiguously through
-`record_ids`, so the collision is rejected, not shadowed. Out of subset
-and rejected at the field/decl, never mis-lowered: non-scalar /
->64-bit fields (`Vec<...>`, nested structs — the residual blocker for
-the `tlm_pairing_arch_burst_*` fixtures), non-literal defaults, and
+`record_ids`, so the collision is rejected, not shadowed. A
+`Vec<scalar, N>` field DOES lower (a `std::array<T, N>` member with
+indexed `rec.data[i]` element access — the struct `Vec`-field slice,
+2026-06-13; it unblocked the `tlm_pairing_arch_burst_*` fixtures). Out of
+subset and rejected at the field/decl, never mis-lowered: a widthless /
+nested / list `Vec` element type, other non-scalar / >64-bit fields
+(nested structs), non-literal defaults, and
 `keep`/`when` items in a struct body (constraint / tagged-ADT
 machinery deferred with `randomize`; transaction-body `keep`s now lower
 into the constraint-IR seam, but struct-body `keep`/`when` still don't).
@@ -411,6 +422,9 @@ none — `extra_harc` joins additional `tests/fixtures/` files to the
 | `regblock_addrmap_test` | `AxiLiteRegs` | `AxiLiteRegs.sv` | pass | addrmap: two `DmaChan` instances at distinct bases; 3-level `chip.inst.REG` + 4-level `chip.inst.REG.FIELD` access; per-instance shifted-offset mirror locals route each window independently (divergence 12) |
 | `regblock_alias_test` | `AxiLiteRegs` | `AxiLiteRegs.sv` | pass | addrmap `alias of`: `mm2s_view` shares `mm2s`'s mirror cell (one storage local) while issuing bus traffic at its own base — write via the alias moves the shared mirror (divergence 12) |
 | `struct_basic_test` | `Top` | `top_counter.sv` | pass | struct: scalar fields (uint/sint/bool) + literal defaults, default-construct in a loop (re-init), field reads/writes in arithmetic/branch/assert/format args (reuses the transaction record machinery) |
+| `regblock_record_api_test` | `AxiLiteRegs` | `AxiLiteRegs.sv` | pass | regblock: passive `record_write(addr, data)` (masked mirror write, constant-addr decode) + `let v = record_read(addr)` (mirror read), NO bus traffic, NO `on regs.REG` callback (divergence 12) |
+| `tlm_pairing_arch_burst_target_test` | `TlmPairingArchBurstTarget` | `TlmPairingArchBurstTarget.sv` | pass | struct `Vec` field: HARC initiator calls a record-returning `tlm_method`, unpacks the `HarcBurstResp32x4 { data : Vec<uint<32>,4>; len; resp }` response pin via `harc_unpack_<R>`, reads `rsp.data[i]` |
+| `tlm_pairing_arch_burst_initiator_test` | `TlmPairingArchBurstInitiator` | `TlmPairingArchBurstInitiator.sv` | pass | struct `Vec` field: HARC target responder builds the record field-wise (`rsp.data[i] = …`) and packs it onto the response pin via `harc_drive_<R>`; ARCH DUT initiator unpacks through its TLM return |
 | `tlm_target_thread_test` | `TlmReadInitiator` | `TlmReadInitiator.sv` | pass | target-side TLM: blocking `thread bus.read` responder actor, single-cycle wait, value return |
 | `tlm_target_thread_if_test` | `TlmReadInitiatorPair` | `TlmReadInitiatorPair.sv` | pass | target-side TLM: persistent state fields (read in body + from test), `for` loop, `if`/`else` return |
 | `tlm_target_thread_runtime_loop_test` | `TlmReadInitiatorRuntimeLen` | `TlmReadInitiatorRuntimeLen.sv` | pass | target-side TLM: runtime `for i in 0..len` loop bound |
@@ -615,12 +629,16 @@ reason. Code locations are authoritative.
    subset edges, all explicit rejections (never silent): `when`
    subtype blocks (v1 flattens their fields into the struct;
    deferred until the tagged-ADT story lands with randomize),
-   non-scalar / wider-than-64-bit fields and non-literal defaults
+   non-scalar (other than `Vec<scalar, N>`, which DOES lower as a
+   `std::array<T, N>` member — the struct `Vec`-field slice) /
+   wider-than-64-bit fields and non-literal defaults
    (v1 lowers enums/lists/wide ints; the tbir expression model is
    u64), and record locals in *pure* helpers (those emit as
    scalar-only file-scope C++ functions; impure helpers CFG-inline,
-   where record locals are fine). Emission-side delta: tbir emits the
-   struct + `operator==`/`!=` only — v1 also emits `randomize_<T>`
+   where record locals are fine). Emission-side delta: tbir now emits the
+   struct + `operator==`/`!=` + the `harc_pack_<R>`/`harc_unpack_<R>`/
+   `harc_drive_<R>` pack helpers (matching v1's unconditional
+   `emit_record_pack_helpers`) — v1 also emits `randomize_<T>`
    and pack/unpack helpers, which are unreachable dead text under
    this subset and land with their constructs (`randomize`, bus
    sends). One IR node carries the v1 timing contract:
@@ -1397,12 +1415,10 @@ reason. Code locations are authoritative.
       `${...}` fail-message format arg) and `regblock_bitbash_test`
       (`bitbash(regs)` over 3 RW + 1 RO + 1 WO). Both `AxiLiteRegs.sv`,
       `pass`, trace-diff clean v1↔tbir at seed 1; both registered.
-    - *Out of subset* (still rejected, precisely): the passive
-      `record_write`/`record_read` API and per-register `on regs.REG`
-      write callbacks (`regblock_record_test`,
-      `regblock_record_recursion_test`) — `regblock::detect_regblock_residual`
-      names the callback/record-API feature before the generic
-      bare-statement/scope mixing error fires. Field-level
+    - *Out of subset* (still rejected, precisely at this slice): the
+      passive `record_write`/`record_read` API and per-register
+      `on regs.REG` write callbacks — the passive API was closed by slice
+      22 below; the callback stays rejected. Field-level
       `regs.REG.FIELD` access and `addrmap` composition (incl. `alias of`)
       stayed rejected at this slice — closed by slice 21 below.
 
@@ -1450,9 +1466,66 @@ reason. Code locations are authoritative.
     - *Fixtures.* `regblock_fields_test`, `regblock_addrmap_test`,
       `regblock_alias_test` (all `AxiLiteRegs.sv`, `pass`, trace-diff
       clean v1↔tbir at seed 1; all registered).
-    - *Out of subset* (still rejected, precisely): the passive
-      `record_write`/`record_read` API and per-register `on regs.REG`
-      write callbacks remain the only regblock residuals.
+    - *Out of subset* (still rejected, precisely at this slice): the
+      passive `record_write`/`record_read` API (closed by slice 22) and
+      per-register `on regs.REG` write callbacks (the remaining residual).
+
+22. **Regblock passive record API + struct `Vec` fields (2026-06-13,
+    divergence 12 + the `tlm_pairing_arch_burst_*` non-scalar-field
+    blocker).** Two independent features.
+    - *(A) Passive `record_write`/`record_read` API.* `regs.record_write(
+      addr, data)` and `let v = regs.record_read(addr)`
+      (`regblock::try_lower_record_write` / `try_lower_record_read_let`).
+      With a compile-time-constant `addr`, the register is decoded at
+      lowering time (`const_eval_index`) and the op lowers to existing IR:
+      a masked mirror `RecordFieldWrite(mirror.REG, data & width_mask)`
+      (no bus traffic — the monitor already observed the write) for
+      `record_write`, and a mirror `RecordField` read for `record_read`.
+      A non-constant address (v1's runtime decode chain) and an address
+      matching no register offset are rejected precisely. **No callback
+      dispatch** — the per-register `on regs.REG` write callback lowers
+      (in v1) to a `[&]`-capturing closure over run-scope state (the
+      mirror cell, the `_Callbacks` holder, the `cb_depth` counter) fired
+      from inside `record_write`, which the function-per-CFG IR cannot
+      express as a closure lexically nested in the run coroutine capturing
+      its locals — the SAME blocker as the `axilite_hooks` pre/post
+      method hooks. So `detect_regblock_residual` now flags ONLY the
+      callback; the callback-bearing corpus fixtures
+      (`regblock_record_test`, `regblock_record_recursion_test`) stay
+      rejected, and the API on its own is proven by the self-authored
+      `regblock_record_api_test` (`AxiLiteRegs.sv`, pass, trace-diff clean
+      v1↔tbir — the record decode + mirror op is pure host state with no
+      trace events, so both backends record identical activity).
+    - *(B) `Vec<T, N>` record/struct field.* `RecordFieldSchema` gains
+      `vec_len: Option<usize>` (the element scalar type/width stays in
+      `ty`). `records::fixed_vec_field` recognizes a `Vec<scalar, N>`
+      field (rejecting a widthless / nested / list element). Emission
+      (`tbir/mod.rs record_struct`) renders it as a `std::array<T, N>`
+      member (v1's `record_field_c_type` Vec branch). `Expr::RecordField`
+      and `Stmt::RecordFieldWrite` gain `index: Option<…>` so
+      `rec.data[i]` reads/writes lower to indexed element access (a
+      whole-`Vec` read/write is rejected — no array-copy expression in
+      the subset). `record_struct` now emits v1's
+      `harc_pack_<R>`/`harc_unpack_<R>`/`harc_drive_<R>` helpers for every
+      record with a defined packed width (matching v1's unconditional
+      `emit_record_pack_helpers`; the pack lays fields LSB-first in
+      reverse declaration order, the unpack/drive carry the `requires`
+      struct-pin fast-path). A record-returning `tlm_method` captures the
+      response pin via `harc_unpack_<R>` (initiator,
+      `tlm_capture_expr`) and the bound-target responder drives it via
+      `harc_drive_<R>` (target) — the dest/ret record type is carried on
+      the local (`bus.rs` sets the `let` dest type via `tlm_ret_record_id`;
+      `transactors.rs` sets the responder ret slot via
+      `record_id_of_type`, and allows a record return type past the
+      scalar-only gate). Fixtures: `tlm_pairing_arch_burst_target_test`
+      (HARC initiator unpacks the `HarcBurstResp32x4 { data : Vec<uint<32>,
+      4>; len; resp }` response) and `tlm_pairing_arch_burst_initiator_test`
+      (HARC target builds the record field-wise + packs it) — both `pass`,
+      trace-diff clean v1↔tbir at seed 1.
+    - *Out of subset* (still rejected, precisely): the per-register
+      `on regs.REG` write callback (closure-capture, as deep as
+      `axilite_hooks`); a non-constant `record_*` address; a widthless /
+      nested / list `Vec` element type; a whole-`Vec` field read/write.
 
 21. **Bound-to event-driven driver (2026-06-13).** Composes the
     event-driven-transactor consumer (divergence 11, unbound) with the

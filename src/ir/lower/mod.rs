@@ -2447,14 +2447,13 @@ fn lower_test(
             collect_stmts(b, false, &mut check_stmts);
         }
     }
-    // Precise rejection for the regblock record-API + per-register
-    // callback residual: an `on regs.REG ... end on` handler or a
-    // `regs.record_*(...)` call at test scope. These are out of the
-    // TB-IR subset (see `regblock::detect_regblock_residual`); without
-    // this pass a `record_test`-shaped test trips the generic
-    // bare-statement/scope mixing error below, which buries the real
-    // (regblock-residual) reason. Scan both bare statements and the
-    // scope blocks' bodies.
+    // Precise rejection for the per-register `on regs.REG ... end on`
+    // write callback residual at test scope. This is out of the TB-IR
+    // subset (see `regblock::detect_regblock_residual`); without this
+    // pass a `record_test`-shaped test trips the generic bare-statement/
+    // scope mixing error below, which buries the real reason. The passive
+    // `record_write`/`record_read` API itself IS lowered. Scan both bare
+    // statements and the scope blocks' bodies.
     {
         let binding_names: std::collections::HashSet<&str> =
             regblock_bindings_map.keys().map(|s| s.as_str()).collect();
@@ -2465,9 +2464,12 @@ fn lower_test(
             if let Some(detail) = regblock::detect_regblock_residual(s, &binding_names) {
                 return Err(unsupported(
                     &detail,
-                    "the passive `record_write`/`record_read` API and per-register \
-                     `on regs.REG` write callbacks are a follow-up regblock slice; \
-                     register-level frontdoor reads/writes and `bitbash(regs)` are \
+                    "a per-register `on regs.REG` write callback lowers to a \
+                     reference-capturing closure over run-scope state fired from \
+                     inside `record_write`, which the function-per-CFG IR cannot \
+                     express (the same blocker as the `axilite_hooks` pre/post \
+                     method hooks); the passive `record_write`/`record_read` API, \
+                     register-level frontdoor reads/writes, and `bitbash(regs)` ARE \
                      supported",
                 ));
             }
@@ -3489,6 +3491,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             ir::Expr::WidthCast { inner, .. } => fill_expr(inner, instance),
             ir::Expr::ComponentIdle { n, .. } => fill_expr(n, instance),
             ir::Expr::SeqIndex { index, .. } => fill_expr(index, instance),
+            ir::Expr::RecordField { index: Some(idx), .. } => fill_expr(idx, instance),
             ir::Expr::Call(_, args) => {
                 for a in args {
                     fill_expr(a, instance);
@@ -3500,7 +3503,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             | ir::Expr::CycleCount
             | ir::Expr::ErrorCount
             | ir::Expr::Port(_)
-            | ir::Expr::RecordField { .. }
+            | ir::Expr::RecordField { index: None, .. }
             | ir::Expr::TbField(_)
             | ir::Expr::ComponentField { .. }
             | ir::Expr::ScoreboardQuery { .. }
@@ -3680,12 +3683,15 @@ fn fill_visit_expr(
         Expr::SeqIndex { index, .. } => {
             fill_visit_expr(index, placeholder, binding, rewrite, conflict)
         }
+        Expr::RecordField { index: Some(idx), .. } => {
+            fill_visit_expr(idx, placeholder, binding, rewrite, conflict)
+        }
         Expr::Literal { .. }
         | Expr::WideLiteral(_)
         | Expr::Local(_)
         | Expr::CycleCount
         | Expr::ErrorCount
-        | Expr::RecordField { .. }
+        | Expr::RecordField { index: None, .. }
         | Expr::TbField(_)
         | Expr::TransactorState { .. }
         | Expr::ComponentField { .. }

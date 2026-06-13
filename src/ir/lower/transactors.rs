@@ -583,8 +583,19 @@ fn lower_bound_target_transactor(
             // the bus method's declared arg type too.
             check_scalar_ty(tname, mname, &format!("argument `{}`", name.0.name), Some(&name.1))?;
         }
+        // The return type may be a record (`-> HarcBurstResp32x4`): the
+        // responder builds it field-wise and the backend packs it onto
+        // the response pin (`harc_drive_<R>`). A scalar return goes
+        // through the ≤64-bit gate; any other non-scalar type is
+        // rejected.
+        let ret_record = method
+            .ret
+            .as_ref()
+            .and_then(|t| record_id_of_type(&body_ctx, t));
         if let Some(ret) = method.ret.as_ref() {
-            check_scalar_ty(tname, mname, "return type", Some(ret))?;
+            if ret_record.is_none() {
+                check_scalar_ty(tname, mname, "return type", Some(ret))?;
+            }
         }
 
         let fid = FunctionId(next_fn.0 + funcs.len() as u32);
@@ -600,6 +611,12 @@ fn lower_bound_target_transactor(
         let has_ret = method.ret.is_some();
         if has_ret {
             let ret = b.declare("__ret");
+            // A record return slot carries its record type so the
+            // backend drives it through the pack helper, and so a
+            // `return <record-local>` type-checks (whole-record copy).
+            if let Some(rid) = ret_record {
+                b.set_local_type(ret, crate::ir::IrType::Record(rid));
+            }
             b.helper_ret = Some(ret);
         }
         b.lower_block_stmts(&th.body)?;
@@ -1003,6 +1020,16 @@ fn check_scalar_ty(
             "",
         )),
     }
+}
+
+/// `Some(rid)` when `t` names a lowered record (`struct`/`transaction`)
+/// in the given context; `None` for a scalar/aggregate/unknown type.
+fn record_id_of_type(ctx: &super::LowerCtx, t: &TypeExpr) -> Option<ir::RecordId> {
+    let TypeExpr::Named { name, .. } = t else {
+        return None;
+    };
+    let simple = name.segments.last().map(|s| s.name.as_str())?;
+    ctx.record_ids.get(simple).copied()
 }
 
 /// Resolve a method parameter's `IrType`. A `Named` type that names a

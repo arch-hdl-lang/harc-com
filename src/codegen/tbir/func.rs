@@ -514,7 +514,7 @@ fn emit_stmt(
             // edge to exactly this position).
             if let Expr::Call(CallTarget::TransactorMethod { bus_field, method }, args) = e {
                 return emit_transactor_call(
-                    out, cx, bindings, *l, bus_field, method, args, depth,
+                    out, cx, records, bindings, *l, bus_field, method, args, depth,
                 );
             }
             let name = &names[l.index()];
@@ -573,10 +573,19 @@ fn emit_stmt(
                 }
             }
         }
-        Stmt::RecordFieldWrite { local, field, value } => {
+        Stmt::RecordFieldWrite { local, field, index, value } => {
             let name = &names[local.index()];
             let e = expr_cpp(cx, value)?;
-            writeln!(out, "{pad}{name}.{field} = {e};").ok();
+            match index {
+                // `rec.data[i] = value` — `std::array` element store.
+                Some(idx) => {
+                    let i = expr_cpp(cx, idx)?;
+                    writeln!(out, "{pad}{name}.{field}[{i}] = {e};").ok();
+                }
+                None => {
+                    writeln!(out, "{pad}{name}.{field} = {e};").ok();
+                }
+            }
         }
         Stmt::TbFieldWrite { field, value } => {
             let e = expr_cpp(cx, value)?;
@@ -792,7 +801,7 @@ fn emit_stmt(
             writeln!(out, "{pad}{name}.push_back({v});").ok();
         }
         Stmt::TlmFork(desc) => emit_tlm_fork(out, cx, bindings, desc, depth)?,
-        Stmt::TlmJoinAll(pending) => emit_tlm_join_all(out, cx, bindings, pending, depth)?,
+        Stmt::TlmJoinAll(pending) => emit_tlm_join_all(out, cx, records, bindings, pending, depth)?,
     }
     Ok(())
 }
@@ -863,6 +872,7 @@ fn emit_tlm_fork(
 fn emit_tlm_join_all(
     out: &mut String,
     cx: &ECx<'_>,
+    records: &[RecordSchema],
     bindings: &[BusBindingSchema],
     pending: &[crate::ir::TlmForkDesc],
     depth: usize,
@@ -874,9 +884,9 @@ fn emit_tlm_join_all(
     }
     let tagged = pending.iter().any(|p| p.tag.is_some());
     if tagged {
-        emit_tagged_tlm_join_all(out, cx, bindings, pending, depth)
+        emit_tagged_tlm_join_all(out, cx, records, bindings, pending, depth)
     } else {
-        emit_ordered_tlm_join_all(out, cx, bindings, pending, depth)
+        emit_ordered_tlm_join_all(out, cx, records, bindings, pending, depth)
     }
 }
 
@@ -887,6 +897,7 @@ fn emit_tlm_join_all(
 fn emit_ordered_tlm_join_all(
     out: &mut String,
     cx: &ECx<'_>,
+    records: &[RecordSchema],
     bindings: &[BusBindingSchema],
     pending: &[crate::ir::TlmForkDesc],
     depth: usize,
@@ -905,13 +916,8 @@ fn emit_ordered_tlm_join_all(
         )
         .ok();
         if let (Some(dest), true) = (p.dest, p.has_ret) {
-            writeln!(
-                out,
-                "{pad}{} = harc_rt::harc_read({});",
-                names[dest.index()],
-                wire("rsp_data")
-            )
-            .ok();
+            let capture = tlm_capture_expr(cx, records, dest, &wire("rsp_data"));
+            writeln!(out, "{pad}{} = {capture};", names[dest.index()]).ok();
         }
         emit_tlm_trace(out, &pad, cx.trace_component, &p.bus_field, &p.method, "response", "initiator", None);
         writeln!(out, "{pad}co_await harc_rt::wait_cycles(_slot, 1);").ok();
@@ -928,6 +934,7 @@ fn emit_ordered_tlm_join_all(
 fn emit_tagged_tlm_join_all(
     out: &mut String,
     cx: &ECx<'_>,
+    records: &[RecordSchema],
     bindings: &[BusBindingSchema],
     pending: &[crate::ir::TlmForkDesc],
     depth: usize,
@@ -967,13 +974,8 @@ fn emit_tagged_tlm_join_all(
         )
         .ok();
         if let (Some(dest), true) = (p.dest, p.has_ret) {
-            writeln!(
-                out,
-                "{pad3}{} = harc_rt::harc_read({});",
-                names[dest.index()],
-                wire("rsp_data")
-            )
-            .ok();
+            let capture = tlm_capture_expr(cx, records, dest, &wire("rsp_data"));
+            writeln!(out, "{pad3}{} = {capture};", names[dest.index()]).ok();
         }
         emit_tlm_trace(out, &pad3, cx.trace_component, &p.bus_field, &p.method, "response", "initiator", Some(&format!("(int64_t){tag}")));
         writeln!(out, "{pad3}{} = 1;", wire("rsp_ready")).ok();
@@ -991,6 +993,24 @@ fn emit_tagged_tlm_join_all(
     }
     writeln!(out, "{pad}}}").ok();
     Ok(())
+}
+
+/// The C++ expression that captures a TLM response pin (`rsp_data`)
+/// into a value-returning call's `dest` local. A record-typed dest is
+/// bit-unpacked through the record's generated `harc_unpack_<R>` helper
+/// (v1's `record_unpack_expr`); any other type is a plain scalar read.
+fn tlm_capture_expr(
+    cx: &ECx<'_>,
+    records: &[RecordSchema],
+    dest: crate::ir::LocalId,
+    raw_wire: &str,
+) -> String {
+    if let Some(IrType::Record(rid)) = cx.func.locals.get(dest.index()).map(|l| &l.ty) {
+        if let Some(rec) = records.get(rid.index()) {
+            return format!("harc_unpack_{}({raw_wire})", rec.name);
+        }
+    }
+    format!("harc_rt::harc_read({raw_wire})")
 }
 
 /// Resolve a bus binding for a fork/join wire emission, with the same
@@ -1054,6 +1074,7 @@ fn emit_tlm_trace(
 fn emit_transactor_call(
     out: &mut String,
     cx: &ECx<'_>,
+    records: &[RecordSchema],
     bindings: &[BusBindingSchema],
     dest: crate::ir::LocalId,
     bus_field: &str,
@@ -1127,14 +1148,10 @@ fn emit_transactor_call(
         // Capture BEFORE the trailing tick — rsp_data is valid in the
         // same cycle as rsp_valid (mirrors v1; for result-less or
         // discarded calls v1 skips the capture but still completes the
-        // rsp handshake).
-        writeln!(
-            out,
-            "{pad}{} = harc_rt::harc_read({});",
-            names[dest.index()],
-            wire("rsp_data")
-        )
-        .ok();
+        // rsp handshake). A record-typed return is bit-unpacked from the
+        // lowered response pin (v1's `record_unpack_expr`).
+        let capture = tlm_capture_expr(cx, records, dest, &wire("rsp_data"));
+        writeln!(out, "{pad}{} = {capture};", names[dest.index()]).ok();
     }
     writeln!(out, "{pad}co_await harc_rt::wait_cycles(_slot, 1);").ok();
     writeln!(out, "{pad}{} = 0;", wire("rsp_ready")).ok();
@@ -1717,13 +1734,32 @@ pub(super) fn emit_target_actor(
                     func.name
                 ))
             })?;
-            writeln!(
-                out,
-                "{pad2}{INDENT}harc_rt::harc_assign({}, {});",
-                wire("rsp_data"),
-                &names[ret.index()]
-            )
-            .ok();
+            // A record-typed return is packed onto the lowered response
+            // pin through the record's generated `harc_drive_<R>` helper
+            // (v1's `record_drive_stmt`); a scalar is a plain assign.
+            let drive = if let Some(IrType::Record(rid)) =
+                func.locals.get(ret.index()).map(|l| &l.ty)
+            {
+                let rec = prog.records.get(rid.index()).ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: target responder `{}` returns missing record r{}",
+                        func.name, rid.0
+                    ))
+                })?;
+                format!(
+                    "harc_drive_{}({}, {});",
+                    rec.name,
+                    wire("rsp_data"),
+                    &names[ret.index()]
+                )
+            } else {
+                format!(
+                    "harc_rt::harc_assign({}, {});",
+                    wire("rsp_data"),
+                    &names[ret.index()]
+                )
+            };
+            writeln!(out, "{pad2}{INDENT}{drive}").ok();
         }
         writeln!(out, "{pad2}}}").ok(); // body scope
         trace_event(out, "response", depth + 2);
@@ -1779,8 +1815,10 @@ fn emit_responder_loop_switch(
             // forwarding) resolves against the test's bus bindings, so
             // pass them through. `emit_transactor_call` uses `co_await`
             // (the responder body is a coroutine), and an unresolved
-            // `back` surfaces as an EmitError there.
-            emit_stmt(out, prog, cx, &[], bindings, s, depth + 2)?;
+            // `back` surfaces as an EmitError there. The records table
+            // is needed for `RecordInit` of a record-returning responder
+            // (e.g. a burst read building its `rsp` record).
+            emit_stmt(out, prog, cx, &prog.records, bindings, s, depth + 2)?;
         }
         match &block.terminator {
             Terminator::Jump(b) => {

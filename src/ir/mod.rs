@@ -360,9 +360,17 @@ pub struct RecordSchema {
 #[derive(Debug, Clone)]
 pub struct RecordFieldSchema {
     pub name: String,
-    /// Scalar field type. Lowering rejects non-scalar field types
-    /// (nested records, enums, lists, vecs) and widths above 64 bits.
+    /// Field element type. For a scalar field this is the field's own
+    /// scalar type; for a `Vec<T, N>` field (`vec_len = Some(N)`) it is
+    /// the *element* scalar type `T` (its width drives both the C++
+    /// storage type and the packed-bit layout). Lowering rejects field
+    /// element types that are not scalar uint/sint/bits/bool/bit ≤ 64
+    /// bits (nested records, enums, lists).
     pub ty: IrType,
+    /// `Some(N)` when the field is a fixed-size `Vec<T, N>` aggregate
+    /// (v1's `std::array<T, N>` record member); `None` for a scalar
+    /// field. The element type/width is carried in `ty`.
+    pub vec_len: Option<usize>,
     /// Declared `default <lit>` value (int/bool literals only), or
     /// `None` for the type-appropriate zero — same fallback as v1.
     pub default: Option<u64>,
@@ -1059,10 +1067,13 @@ pub enum Stmt {
     /// re-runs the field defaults every iteration.
     RecordInit(LocalId, RecordId),
     /// `t.field = value` on a record-typed local. The value is
-    /// port-hoisted like `Assign` (no inline DUT reads).
+    /// port-hoisted like `Assign` (no inline DUT reads). `index: Some(e)`
+    /// writes a `Vec<T, N>` field element (`rec.data[e] = value`); `None`
+    /// writes a scalar field.
     RecordFieldWrite {
         local: LocalId,
         field: String,
+        index: Option<Expr>,
         value: Expr,
     },
     /// `_tb.<field> = value` on a scalar testbench field (run/check-
@@ -1385,7 +1396,9 @@ pub enum Expr {
     Port(PortRef),
     /// `t.field` read on a record-typed local. Host state, not DUT
     /// state — allowed in every expression position a `Local` is.
-    RecordField { local: LocalId, field: String },
+    /// `index: Some(e)` reads a `Vec<T, N>` field element (`rec.data[e]`,
+    /// emitted as `local.field[e]`); `None` reads a scalar field.
+    RecordField { local: LocalId, field: String, index: Option<Box<Expr>> },
     /// `_tb.<field>` read on a scalar testbench field. Host state —
     /// allowed in every expression position a `Local` is.
     TbField(String),

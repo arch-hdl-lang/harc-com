@@ -292,8 +292,11 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
             Stmt::RecordInit(_, _) => {
                 host_service_only = false;
             }
-            Stmt::RecordFieldWrite { value, .. } => {
+            Stmt::RecordFieldWrite { index, value, .. } => {
                 host_service_only = false;
+                if let Some(idx) = index {
+                    visit_expr(idx, &mut accesses, &mut transactor);
+                }
                 visit_expr(value, &mut accesses, &mut transactor);
             }
             Stmt::TransactorCall { call, .. } => {

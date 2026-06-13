@@ -121,7 +121,7 @@ Residual first-blocker map for the other 16 (re-run of
 | Moved to group | Fixtures |
 |---|---|
 | `bus` (2) | `bind_remap_test`, `transactor_parse_test` — **`axilite_regs_full_test` REGISTERED 2026-06-13 by the expression-position-call slice: `helper.read(addr)` in assert/bitwise expression positions now hoists into a preceding `Stmt::TransactorCall`; `AxiLiteRegs.sv`, pass, trace-diff clean v1↔tbir** |
-| `regblock` (7) | `regblock_basic_test`, `regblock_fields_test`, `regblock_access_test`, `regblock_bitbash_test`, `regblock_addrmap_test`, `regblock_alias_test`, `regblock_record_test` — **regblock slice landed 2026-06-12; bus-bound `via` helper (initiator-side BFM) + the regblock-residuals slice (register read in assert/format → `Expr::RegRead`; `bitbash(regs)`) + the field-level/addrmap slice (`regs.REG.FIELD` masked RMW; `addrmap` 3-/4-level access; `alias of`) landed 2026-06-13. SIX of the eight regblock fixtures now fully lower and are registered (`access`, `basic`, `bitbash`, `fields`, `addrmap`, `alias`); only `record_test`/`record_recursion_test` (passive `record_*` API + `on regs.REG` callbacks) remain residual — see the `regblock` construct group below.** |
+| `regblock` (8) | `regblock_basic_test`, `regblock_fields_test`, `regblock_access_test`, `regblock_bitbash_test`, `regblock_addrmap_test`, `regblock_alias_test`, `regblock_record_api_test`, `regblock_record_test` — **regblock slice landed 2026-06-12; bus-bound `via` helper (initiator-side BFM) + the regblock-residuals slice (register read in assert/format → `Expr::RegRead`; `bitbash(regs)`) + the field-level/addrmap slice (`regs.REG.FIELD` masked RMW; `addrmap` 3-/4-level access; `alias of`) landed 2026-06-13. The passive `record_write`/`record_read` API (constant-address decode → masked mirror op, no bus) also landed 2026-06-13 — proven by the self-authored `regblock_record_api_test`. SEVEN fixtures now fully lower and are registered; only the callback-bearing `record_test`/`record_recursion_test` remain residual (the per-register `on regs.REG` write callback is a `[&]`-capturing closure over run-scope state, as deep as `axilite_hooks`) — see the `regblock` construct group below.** |
 | `scoreboard` (2) | `analysis_sink_connect_test`, `axilite_env_test` |
 | ~~`tseq` (2)~~ → deeper | `axilite_seqdrv_test`, `transactor_active_test` — **tseq slice landed 2026-06-13; both lower their `tseq` now, and the transactor-state-field slice (2026-06-13) advanced `axilite_seqdrv_test` past its state field too — both now stop at an event field: `axilite_seqdrv_test` → `req : in event<RegOp>` (event-driven unbound transactor), `transactor_active_test` → bound-to transactor event field — see the `tseq` construct group below** |
 | ~~transactor state fields~~ → ~~record param~~ → pre/post hooks (1) | `axilite_hooks_test` — **the record-typed method param `send(t: RegOp)` now lowers (record-param slice 2026-06-13); the SOLE remaining blocker is the test-scope `on drv.send pre/post` method hooks: "a test-scope `on <obj>.<method> pre/post` method hook" (the hook body is a `[&]`-capturing closure mutating test-scope `let`s by reference — the function-per-CFG IR cannot express a closure lexically nested in the run coroutine capturing its locals; v1 emits it as raw C++)** |
@@ -189,21 +189,27 @@ the field-level/addrmap slice):
 | **(resolved)** `bitbash(regs)` compile-time walk-all | `regblock_bitbash_test` — now lowers (registered, pass) |
 | **(resolved)** field-level decomposition (`field <name> : <ty> @ <bit>` + `regs.REG.FIELD`) | `regblock_fields_test`, `regblock_addrmap_test` — now lower (masked RMW + shifted extract; no new IR; registered, pass) |
 | **(resolved)** `addrmap` construct (chip-level composition) + `alias of` | `regblock_addrmap_test`, `regblock_alias_test` — now lower (per-instance shifted-offset mirror locals; alias shares the target's cell; registered, pass) |
-| passive `record_write`/`record_read` API + per-register `on regs.REG` callbacks | `regblock_record_test`, `regblock_record_recursion_test` |
+| **(resolved)** passive `record_write`/`record_read` API | `regblock_record_api_test` — now lowers (constant-address decode → masked mirror op, no bus; self-authored, registered, pass) |
+| per-register `on regs.REG` write callback | `regblock_record_test`, `regblock_record_recursion_test` |
 
 The blocker reported is whichever out-of-subset construct lowering hits
-first in file order. Now SIX of the eight regblock fixtures fully lower
-and are registered (`pass`, trace-diff clean): `regblock_access_test`
-(reads all `let`-bound), `regblock_basic_test` (register reads in assert
-conditions / `${...}` format args — divergence 12, `Expr::RegRead`),
+first in file order. Now SEVEN regblock fixtures fully lower and are
+registered (`pass`, trace-diff clean): `regblock_access_test` (reads all
+`let`-bound), `regblock_basic_test` (register reads in assert conditions
+/ `${...}` format args — divergence 12, `Expr::RegRead`),
 `regblock_bitbash_test` (`bitbash(regs)` walk-all + `assert errors == 0`
 via `Expr::ErrorCount`), `regblock_fields_test` (field-level
 decomposition), `regblock_addrmap_test` (`addrmap` 3-/4-level access),
-and `regblock_alias_test` (`alias of`). The only remaining residuals are
-precise `Unsupported` rejections, never mis-lowered: `record_test`/
-`record_recursion_test` need the passive `record_*` API + per-register
-`on regs.REG` write callbacks (`regblock::detect_regblock_residual` names
-this before the generic bare/scope mixing error).
+`regblock_alias_test` (`alias of`), and `regblock_record_api_test` (the
+passive `record_write`/`record_read` API). The only remaining residual
+is a precise `Unsupported` rejection, never mis-lowered: the
+callback-bearing `record_test`/`record_recursion_test` need the
+per-register `on regs.REG` write callback — a `[&]`-capturing closure
+over run-scope state (the mirror cell, the callbacks holder, the
+`cb_depth` counter) fired from inside `record_write`, which the
+function-per-CFG IR cannot express (the same blocker as the
+`axilite_hooks` pre/post method hooks; `regblock::detect_regblock_residual`
+names it before the generic bare/scope mixing error).
 
 ### `transaction` construct — RESOLVED 2026-06-12 (transaction slice)
 
@@ -812,14 +818,16 @@ fixture now stops at its REAL next blocker):
 |---|---|
 | scoreboard **methods** (`observe`; per-instance state materialization — out of the data-only scoreboard subset) | `post_eval_provider_test` (also needs transactor state fields, transactor-typed transactor/scoreboard fields, and `on ... phase post_eval` event handlers) |
 | `queue<Struct>` element type (record-payload-in-queue seam) | `scoreboard_typed_queue_test` (also needs scoreboard methods + transactor `on ... phase` handlers) |
-| non-scalar struct field (`data : Vec<uint<32>, 4>`) | `tlm_pairing_arch_burst_target_test`, `tlm_pairing_arch_burst_initiator_test` (both also need the bus-bound / struct-returning `tlm_method` path: target-TLM `thread bus.method` and named struct-field `recv()` capture / `rsp.data[i]`) |
+| **(resolved)** non-scalar struct field (`data : Vec<uint<32>, 4>`) | `tlm_pairing_arch_burst_target_test`, `tlm_pairing_arch_burst_initiator_test` — now lower (struct `Vec`-field slice, 2026-06-13: `std::array<T, N>` member + indexed `rec.data[i]` + record-returning `tlm_method` pack/unpack; both registered, pass) |
 
-All four residuals belong to other slices — the data-only-scoreboard
-owner (methods + `queue<Struct>`), the record-payload-in-queue seam, and
-the target-TLM / non-scalar-record-field seam (`Vec`-typed struct
-fields + struct-returning `tlm_method`). As predicted in the
-suggested-sequencing note, `struct` alone unlocks no corpus fixture
-because each one is a deeper construct stack.
+The two scoreboard residuals belong to the data-only-scoreboard owner
+(methods + `queue<Struct>`) and the record-payload-in-queue seam. The
+`Vec`-typed struct field + record-returning `tlm_method` seam is now
+CLOSED (struct `Vec`-field slice): a `Vec<scalar, N>` field lowers to a
+`std::array<T, N>` member with indexed `rec.data[i]` access, and a
+record-returning `tlm_method` packs/unpacks the response pin through the
+generated `harc_pack_<R>`/`harc_unpack_<R>`/`harc_drive_<R>` helpers —
+unblocking both `tlm_pairing_arch_burst_*` fixtures.
 
 ### Probe declarations on `let dut` — 3 fixtures — **RESOLVED 2026-06-13 (probe/force slice)**
 
