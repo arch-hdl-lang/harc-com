@@ -296,6 +296,19 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 visit_expr(value, &mut accesses, &mut transactor);
             }
             Stmt::CovReport(_) => {}
+            Stmt::ScoreboardOp { op, .. } => {
+                // Host state on the scoreboard struct — no pin access of
+                // its own; the value expression (push/scalar-write) may
+                // carry inline reads.
+                host_service_only = false;
+                match op {
+                    crate::ir::ScoreboardOp::QueuePush { value, .. }
+                    | crate::ir::ScoreboardOp::ScalarWrite { value, .. } => {
+                        visit_expr(value, &mut accesses, &mut transactor);
+                    }
+                    crate::ir::ScoreboardOp::QueuePop { .. } => {}
+                }
+            }
         }
     }
     match &block.terminator {
@@ -374,6 +387,7 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
         | Expr::Local(_)
         | Expr::RecordField { .. }
         | Expr::TbField(_)
+        | Expr::ScoreboardQuery { .. }
         | Expr::CovBin { .. } => {}
     }
 }

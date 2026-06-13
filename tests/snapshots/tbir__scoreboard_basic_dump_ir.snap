@@ -1,0 +1,85 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 ScoreboardBasicTb { dut: Top }
+  test ScoreboardBasicTest tb=tb0 run=fn0 check=fn1 clock=clk@10000ps(SysDomain)
+
+fn fn0 run_ScoreboardBasicTest [kind=Run, owner=tb0]
+  locals:
+    %0 total : unknown
+    %1 i : unknown
+    %2 bump : unknown
+    %3 _anon : unknown
+    %4 want : unknown
+    %5 got : unknown
+  entry = b0
+
+  b0:
+    Log(info, "scoreboard basic: queue + counters on counter DUT")
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.en, 0)
+    -> WaitCycles(3, b1)
+
+  b1:
+    AssertCheck { cond: (dut.count_out == 0), on_fail: "after reset: count_out=%lld, expected 0", dut.count_out }
+    DutWrite(dut.rst, 0)
+    Assign(%total, 0)
+    Assign(%i, 0)
+    -> Jump(b2)
+
+  b2:
+    -> Branch((%i < 3), b3, b5)
+
+  b3:
+    Assign(%bump, (%i + 1))
+    Assign(%total, (%total + %bump))
+    ScoreboardOp(sb0.sb, expected.push(%total))
+    ScoreboardOp(sb0.sb, writes = (ScoreboardQuery(sb0.sb.writes) + 1))
+    DutWrite(dut.en, 1)
+    Assign(%_anon, 0)
+    -> Jump(b6)
+
+  b4:
+    Assign(%i, (%i + 1))
+    -> Jump(b2)
+
+  b5:
+    AssertCheck { cond: ScoreboardQuery(sb0.sb.expected.empty()), on_fail: "queue not drained: %lld value(s) left", ScoreboardQuery(sb0.sb.expected.size()) }
+    -> Return
+
+  b6:
+    -> Branch((%_anon < %bump), b7, b9)
+
+  b7:
+    -> WaitCycles(1, b10)
+
+  b8:
+    Assign(%_anon, (%_anon + 1))
+    -> Jump(b6)
+
+  b9:
+    DutWrite(dut.en, 0)
+    -> WaitCycles(1, b11)
+
+  b10:
+    -> Jump(b8)
+
+  b11:
+    ScoreboardOp(sb0.sb, %want = expected.pop())
+    ScoreboardOp(sb0.sb, reads = (ScoreboardQuery(sb0.sb.reads) + 1))
+    DutRead(%got, dut.count_out)
+    AssertCheck { cond: (%got == %want), on_fail: "run[%lld]: count_out=%lld, expected %lld", %i, %got, %want }
+    Log(info, "run[%lld] bump=%lld count_out=%lld matched expected=%lld", %i, %bump, %got, %want)
+    -> Jump(b4)
+
+fn fn1 check_ScoreboardBasicTest [kind=Check, owner=tb0]
+  entry = b0
+
+  b0:
+    AssertCheck { cond: (ScoreboardQuery(sb0.sb.expected.size()) == 0), on_fail: "scoreboard left %lld expected value(s)", ScoreboardQuery(sb0.sb.expected.size()) }
+    AssertCheck { cond: (ScoreboardQuery(sb0.sb.writes) == ScoreboardQuery(sb0.sb.reads)), on_fail: "counter drift: writes=%lld reads=%lld", ScoreboardQuery(sb0.sb.writes), ScoreboardQuery(sb0.sb.reads) }
+    AssertCheck { cond: (ScoreboardQuery(sb0.sb.writes) == 3), on_fail: "expected 3 writes, got %lld", ScoreboardQuery(sb0.sb.writes) }
+    Log(info, "PASS: scoreboard drained, %lld reads matched %lld writes", ScoreboardQuery(sb0.sb.reads), ScoreboardQuery(sb0.sb.writes))
+    -> Return

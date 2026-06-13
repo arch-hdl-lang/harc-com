@@ -253,6 +253,33 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
             ),
             None => format!("FailDiag {{ {} }}", fmt_args_str(func, args)),
         },
+        Stmt::ScoreboardOp { sb, field, op } => {
+            format!("ScoreboardOp(sb{}.{field}, {})", sb.0, sb_op_str(func, op))
+        }
+    }
+}
+
+fn sb_op_str(func: &TbFunction, op: &crate::ir::ScoreboardOp) -> String {
+    use crate::ir::ScoreboardOp;
+    match op {
+        ScoreboardOp::QueuePush { queue, value } => {
+            format!("{queue}.push({})", expr_str(func, value))
+        }
+        ScoreboardOp::QueuePop { queue, dest } => {
+            format!("{} = {queue}.pop()", local_str(func, *dest))
+        }
+        ScoreboardOp::ScalarWrite { scalar, value } => {
+            format!("{scalar} = {}", expr_str(func, value))
+        }
+    }
+}
+
+fn sb_query_str(query: &crate::ir::ScoreboardQuery) -> String {
+    use crate::ir::ScoreboardQuery;
+    match query {
+        ScoreboardQuery::Scalar { scalar } => scalar.clone(),
+        ScoreboardQuery::QueueSize { queue } => format!("{queue}.size()"),
+        ScoreboardQuery::QueueEmpty { queue } => format!("{queue}.empty()"),
     }
 }
 
@@ -389,6 +416,9 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
             format!("{}.{field}", local_str(func, *local))
         }
         Expr::TbField(field) => format!("_tb.{field}"),
+        Expr::ScoreboardQuery { sb, field, query } => {
+            format!("ScoreboardQuery(sb{}.{field}.{})", sb.0, sb_query_str(query))
+        }
         Expr::Binary(op, a, b) => format!(
             "({} {} {})",
             expr_str(func, a),

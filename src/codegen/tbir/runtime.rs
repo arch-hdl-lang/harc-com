@@ -76,17 +76,52 @@ static inline uint64_t harc_rng_next() {
 /// declaration order, emitted after the DUT pointer — same member
 /// layout as v1. `scalar_fields` are run/check-shared scalar members
 /// (`expected : uint<32> default 0`), with v1's C-type mapping.
+/// One scoreboard declaration → C++ struct (v1's `emit_scoreboard`
+/// shape): scalar counters with their declared defaults, `queue<T>`
+/// fields as `harc_rt::HarcQueue<T>` members. The activity-tracking
+/// `_last_in/out_cycle` heartbeat fields v1 injects are NOT emitted —
+/// the data-only subset never reads them (`sb.idle(N)` is an event-
+/// driven predicate, out of this slice's scope).
+pub(super) fn scoreboard_struct(out: &mut String, sb: &crate::ir::ScoreboardSchema) {
+    writeln!(out, "struct {} {{", sb.name).ok();
+    for f in &sb.fields {
+        match &f.kind {
+            crate::ir::ScoreboardFieldKind::Scalar { ty, default } => {
+                let (cty, init) = match ty {
+                    crate::ir::IrType::Bool => (
+                        "bool",
+                        if *default != 0 { "true" } else { "false" }.to_string(),
+                    ),
+                    crate::ir::IrType::SInt(_) => ("int64_t", default.to_string()),
+                    _ => ("uint64_t", default.to_string()),
+                };
+                writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
+            }
+            crate::ir::ScoreboardFieldKind::Queue { signed } => {
+                let elem = if *signed { "int64_t" } else { "uint64_t" };
+                writeln!(out, "{INDENT}harc_rt::HarcQueue<{elem}> {};", f.name).ok();
+            }
+        }
+    }
+    writeln!(out, "}};").ok();
+    writeln!(out).ok();
+}
+
 pub(super) fn tb_struct(
     out: &mut String,
     tb_name: &str,
     dut_type: &str,
     cov_fields: &[(String, String)],
     scalar_fields: &[crate::ir::TbScalarFieldSchema],
+    scoreboard_fields: &[(String, String)],
 ) {
     writeln!(out, "struct {tb_name} {{").ok();
     writeln!(out, "{INDENT}V{dut_type}* dut = nullptr;").ok();
     for (field, cg_name) in cov_fields {
         writeln!(out, "{INDENT}{cg_name} {field};").ok();
+    }
+    for (field, sb_type) in scoreboard_fields {
+        writeln!(out, "{INDENT}{sb_type} {field};").ok();
     }
     for f in scalar_fields {
         let (cty, init) = match f.ty {

@@ -220,6 +220,45 @@ impl FuncBuilder<'_> {
                         }
                     }
                 }
+                // Statement-position scoreboard queue op:
+                // `sb.expected.push(x)`. `.pop()` in statement position is
+                // rejected below (its value must be bound).
+                if let ExprKind::Call { callee, args } = &*e.kind {
+                    if let Some((sb, field, queue, method)) =
+                        self.as_scoreboard_queue_call(callee)
+                    {
+                        if method == "push" {
+                            // Validate `queue` is a declared queue field
+                            // (a scalar/unknown field would mis-lower to
+                            // `_tb.<sb>.<scalar>.push(...)` — invalid C++).
+                            self.scoreboard_queue_field(sb, &queue)?;
+                            let [CallArg::Expr(arg)] = args.as_slice() else {
+                                return Err(LowerError::Invalid(format!(
+                                    "scoreboard `{field}.{queue}.push` takes exactly one \
+                                     positional argument"
+                                )));
+                            };
+                            let value = self.lower_expr_no_ports(arg)?;
+                            self.push(Stmt::ScoreboardOp {
+                                sb,
+                                field,
+                                op: crate::ir::ScoreboardOp::QueuePush { queue, value },
+                            });
+                            return Ok(());
+                        }
+                        if method == "pop" {
+                            return Err(unsupported(
+                                &format!("a discarded `{field}.{queue}.pop()`"),
+                                "bind the popped value: `let v = {field}.{queue}.pop()`",
+                            ));
+                        }
+                        return Err(unsupported(
+                            &format!("scoreboard queue method `{field}.{queue}.{method}(...)` in \
+                                      statement position"),
+                            "",
+                        ));
+                    }
+                }
                 // Statement-position transactor method call:
                 // `xact.write1(2, 17, true)` — call for effect, result
                 // (if any) discarded, mirroring v1.
@@ -330,6 +369,19 @@ impl FuncBuilder<'_> {
         )? {
             return Ok(());
         }
+        // `let v = sb.q.pop()` — pop the queue front into a new local.
+        if let Some((sb, field, queue)) = self.as_scoreboard_pop(value)? {
+            let id = self.declare(&l.name.name);
+            if let Some(w) = declared_width {
+                self.let_widths.insert(id, w);
+            }
+            self.push(Stmt::ScoreboardOp {
+                sb,
+                field,
+                op: crate::ir::ScoreboardOp::QueuePop { queue, dest: id },
+            });
+            return Ok(());
+        }
         // `let v = xact.method(...)` — a transactor call edge with a
         // result destination.
         if let ExprKind::Call { callee, args } = &*value.kind {
@@ -383,6 +435,20 @@ impl FuncBuilder<'_> {
             self.push(Stmt::TbFieldWrite { field, value: e });
             return Ok(());
         }
+        // Scoreboard scalar-counter write: `sb.writes = sb.writes + 1`
+        // (classic) / `_tb.sb.writes = ...` (impl-form, post-desugar).
+        if let ExprKind::Field { target: ft, name } = &*target.kind {
+            if let Some((sb, field)) = self.scoreboard_root(ft) {
+                let scalar = self.scoreboard_scalar_field(sb, &name.name)?;
+                let e = self.lower_expr_no_ports(value)?;
+                self.push(Stmt::ScoreboardOp {
+                    sb,
+                    field,
+                    op: crate::ir::ScoreboardOp::ScalarWrite { scalar, value: e },
+                });
+                return Ok(());
+            }
+        }
         if self.lower_transactor_dut_bind(target, value)? {
             return Ok(());
         }
@@ -393,6 +459,25 @@ impl FuncBuilder<'_> {
                 // calls only in `let`-RHS and statement position, and
                 // the reference surface is v1's. The value lowering
                 // below rejects it with a precise message.
+                // `v = sb.q.pop()` — pop into an existing local.
+                if let Some((sb, field, queue)) = self.as_scoreboard_pop(value)? {
+                    if self.record_of_local(local).is_some() {
+                        return Err(unsupported(
+                            &format!(
+                                "assignment of a scoreboard `pop()` result to transaction \
+                                 local `{}`",
+                                id.name
+                            ),
+                            "",
+                        ));
+                    }
+                    self.push(Stmt::ScoreboardOp {
+                        sb,
+                        field,
+                        op: crate::ir::ScoreboardOp::QueuePop { queue, dest: local },
+                    });
+                    return Ok(());
+                }
                 // `v = xact.method(...)` — call edge into an existing
                 // local.
                 if let ExprKind::Call { callee, args } = &*value.kind {
@@ -473,6 +558,133 @@ impl FuncBuilder<'_> {
             }
         }
         Err(unsupported("assignment to a non-port, non-local target", ""))
+    }
+
+    /// Recognize a scoreboard queue method access `sb.<queue>.<method>`
+    /// (the callee of a call expression). Returns `(sb id, field name,
+    /// queue field name, method)` when `sb` is a scoreboard testbench
+    /// field and `<queue>` is one of its `queue<T>` fields. Validates
+    /// the queue field exists (an unknown field is a hard error, not a
+    /// silent `None` fall-through — that would mis-route to v1's
+    /// "method call" rejection and lose the precise message).
+    pub(crate) fn as_scoreboard_queue_call(
+        &self,
+        callee: &crate::ast::Expr,
+    ) -> Option<(crate::ir::ScoreboardId, String, String, String)> {
+        let ExprKind::Field { target, name: method } = &*callee.kind else {
+            return None;
+        };
+        let ExprKind::Field { target: sb_t, name: queue } = &*target.kind else {
+            return None;
+        };
+        let (sb, field) = self.scoreboard_root(sb_t)?;
+        Some((sb, field, queue.name.clone(), method.name.clone()))
+    }
+
+    /// Resolve a scoreboard-field access root: `sb` (classic form) or
+    /// `_tb.sb` (impl-form, after the desugaring rewrote the field
+    /// prefix). Returns `(scoreboard id, field name)` when `sb` is a
+    /// scoreboard testbench field of this test.
+    pub(crate) fn scoreboard_root(
+        &self,
+        e: &crate::ast::Expr,
+    ) -> Option<(crate::ir::ScoreboardId, String)> {
+        match &*e.kind {
+            // Impl-form: `_tb.sb`.
+            ExprKind::Field { target, name } => {
+                let tb_field = self.ctx.tb_field.as_deref()?;
+                let ExprKind::Ident(root) = &*target.kind else {
+                    return None;
+                };
+                if root.name != tb_field {
+                    return None;
+                }
+                let &sb = self.ctx.scoreboard_fields.get(&name.name)?;
+                Some((sb, name.name.clone()))
+            }
+            // Classic form (no testbench desugaring): bare `sb`.
+            ExprKind::Ident(root) => {
+                let &sb = self.ctx.scoreboard_fields.get(&root.name)?;
+                Some((sb, root.name.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Recognize `sb.<queue>.pop()` as a value expression and validate
+    /// it: the field must be a declared `queue<T>` of the scoreboard.
+    /// Returns `(sb id, field name, queue field name)`.
+    fn as_scoreboard_pop(
+        &self,
+        e: &crate::ast::Expr,
+    ) -> Result<Option<(crate::ir::ScoreboardId, String, String)>, LowerError> {
+        let ExprKind::Call { callee, args } = &*e.kind else {
+            return Ok(None);
+        };
+        let Some((sb, field, queue, method)) = self.as_scoreboard_queue_call(callee) else {
+            return Ok(None);
+        };
+        if method != "pop" {
+            // size()/empty() are value-producing reads, not pop — those
+            // lower as `Expr::ScoreboardQuery` in expression position.
+            // Anything else on a queue is unsupported here.
+            return Ok(None);
+        }
+        if !args.is_empty() {
+            return Err(LowerError::Invalid(format!(
+                "scoreboard `{field}.{queue}.pop()` takes no arguments"
+            )));
+        }
+        // Validate the queue field exists and is a queue.
+        self.scoreboard_queue_field(sb, &queue)?;
+        Ok(Some((sb, field, queue)))
+    }
+
+    /// Validate that `<field>` is a declared scalar field of scoreboard
+    /// `sb`; returns the field name (clone) on success.
+    pub(crate) fn scoreboard_scalar_field(
+        &self,
+        sb: crate::ir::ScoreboardId,
+        field: &str,
+    ) -> Result<String, LowerError> {
+        let schema = &self.ctx.scoreboards[sb.index()];
+        match schema.field(field) {
+            Some(f) => match &f.kind {
+                crate::ir::ScoreboardFieldKind::Scalar { .. } => Ok(field.to_string()),
+                crate::ir::ScoreboardFieldKind::Queue { .. } => Err(LowerError::Invalid(format!(
+                    "scoreboard `{}` field `{field}` is a queue, not a scalar — assign via \
+                     `push`/`pop`",
+                    schema.name
+                ))),
+            },
+            None => Err(LowerError::Invalid(format!(
+                "scoreboard `{}` has no field `{field}`",
+                schema.name
+            ))),
+        }
+    }
+
+    /// Validate that `<field>` is a declared queue field of scoreboard
+    /// `sb`.
+    pub(crate) fn scoreboard_queue_field(
+        &self,
+        sb: crate::ir::ScoreboardId,
+        field: &str,
+    ) -> Result<(), LowerError> {
+        let schema = &self.ctx.scoreboards[sb.index()];
+        match schema.field(field) {
+            Some(f) => match &f.kind {
+                crate::ir::ScoreboardFieldKind::Queue { .. } => Ok(()),
+                crate::ir::ScoreboardFieldKind::Scalar { .. } => Err(LowerError::Invalid(format!(
+                    "scoreboard `{}` field `{field}` is a scalar, not a queue",
+                    schema.name
+                ))),
+            },
+            None => Err(LowerError::Invalid(format!(
+                "scoreboard `{}` has no field `{field}`",
+                schema.name
+            ))),
+        }
     }
 
     /// Lower `callee(args)` into the `Expr::Call(TransactorMethod ..)`

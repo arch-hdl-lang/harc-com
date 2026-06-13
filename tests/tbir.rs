@@ -553,6 +553,90 @@ fn transaction_basic_emitted_cpp_snapshot() {
     );
 }
 
+/// Scoreboard data-only subset: the schema's scalar/queue fields, the
+/// queue push (statement) / pop (let-RHS, then assign), scalar
+/// read/write ops, and the size()/empty() value-queries in
+/// assert/log positions, across run and check.
+#[test]
+fn scoreboard_basic_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("scoreboard_basic_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("scoreboard_basic_dump_ir", format!("{prog}"));
+}
+
+/// Locks the emitted tbir C++ for the scoreboard fixture: the
+/// scoreboard struct (scalar defaults + `harc_rt::HarcQueue<T>`
+/// members), the `_tb`-held instance, and the push/pop/size/empty/
+/// scalar accessors.
+#[test]
+fn scoreboard_basic_emitted_cpp_snapshot() {
+    insta::assert_snapshot!(
+        "scoreboard_basic_emitted_cpp",
+        emit_fixture_cpp("scoreboard_basic_test.harc")
+    );
+}
+
+/// A scoreboard method is out of the data-only subset (it would need
+/// per-instance state materialization); the declaration is rejected
+/// with a precise message, not silently dropped.
+#[test]
+fn scoreboard_method_is_rejected() {
+    let src = r#"
+scoreboard Sb
+    n : uint<32> default 0
+    hookable bump()
+        n = n + 1
+    end bump
+end scoreboard Sb
+
+testbench Tb
+    dut : Top
+    sb  : Sb
+end testbench Tb
+
+impl T for Tb
+    run
+        assert sb.n == 0 else fail("x")
+    end run
+end impl T
+"#;
+    let err = lower_src(src).expect_err("scoreboard method must be rejected");
+    let msg = format!("{err}");
+    assert!(msg.contains("method"), "unexpected error: {msg}");
+    assert!(msg.contains("scoreboard"), "unexpected error: {msg}");
+}
+
+/// A `queue<Struct>` element type is out of the scalar-only subset:
+/// rejected at the field, not mis-lowered.
+#[test]
+fn scoreboard_struct_queue_is_rejected() {
+    let src = r#"
+struct Pkt
+    a : uint<8>
+end struct Pkt
+
+scoreboard Sb
+    q : queue<Pkt>
+end scoreboard Sb
+
+testbench Tb
+    dut : Top
+    sb  : Sb
+end testbench Tb
+
+impl T for Tb
+    run
+        assert sb.q.empty() else fail("x")
+    end run
+end impl T
+"#;
+    let err = lower_src(src).expect_err("queue<struct> must be rejected");
+    assert!(
+        format!("{err}").contains("scoreboard field"),
+        "unexpected error: {err}"
+    );
+}
+
 /// A record let inside a loop re-runs the defaults each iteration:
 /// the lowering must place a `RecordInit` at the let site (loop
 /// body), not rely on the hoisted declaration's one-time initializer.

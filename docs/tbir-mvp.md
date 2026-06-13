@@ -23,6 +23,7 @@ checked against the code at the cited location.
 | #351 | `wait until` lowering + emission: `Single`/`AllOf` modes, optional `timeout N cycles [fail("...")]` with the v1 diagnostic block shape, plus the `wait_until_counter_test` fixture. |
 | #364 | `transaction` declarations + non-randomize usage: `RecordSchema` records table on `TbProgram`, record-typed locals (`let t : TxnType` default construction with let-site re-init), field writes/reads (`RecordFieldWrite` / `Expr::RecordField`), value-record struct emission, plus the `transaction_basic_test` fixture. `randomize` stays rejected at statement level, pointing at the constraint-IR seam. |
 | #366 | `transactor` declarations (unbound DUT-poking BFM subset): `TransactorSchema` table on `TbProgram`, one `TbFunction` per method (`kind: TransactorBody` — v1's `field_subs` substitution replaced by lowering-time DUT resolution), `Stmt::TransactorCall` carrying the never-inlined `Expr::Call(CallTarget::TransactorMethod ..)` edge, sync-wait method-lambda emission, ternary expressions (`Expr::Ternary`), plus 8 corpus fixtures registered. |
+| #368 | `scoreboard` declarations (data-only host-state subset): `ScoreboardSchema` table on `TbProgram`, scalar-counter + `queue<T>` fields, `Stmt::ScoreboardOp` (`QueuePush`/`QueuePop`/`ScalarWrite`) and `Expr::ScoreboardQuery` (scalar read / `size()` / `empty()`), scoreboard-instance struct emission (`harc_rt::HarcQueue<T>` members) held on the `_tb` struct, plus the self-proving `scoreboard_basic_test` fixture. Scoreboard methods, event-driven `on`/`connect` wiring, and `queue<Struct>` payloads stay rejected (see the divergence note). |
 
 ### Construct subset
 
@@ -114,10 +115,35 @@ mirroring v1's mask/cast/shift-fill emission and direction checks,
 with v1's best-effort receiver-width inference from typed lets /
 casts / chained methods / literals), and scalar `as uint<W>`-family
 casts (≤ 64-bit width relabels — value-identity in the uint64 local
-model, exactly v1's same-storage C cast). Everything else —
+model, exactly v1's same-storage C cast).
+The `scoreboard` construct subset (added 2026-06-12,
+`src/ir/lower/scoreboards.rs`): a scoreboard is a **data-only
+host-state record** — a testbench field holding scalar counters
+(uint/sint/bits/bool ≤ 64 bits with literal defaults) and `queue<T>`
+FIFOs of a scalar element type. Declarations lower into the
+`TbProgram::scoreboards` table (`ScoreboardSchema`); a scoreboard-typed
+testbench field becomes a default-constructed member of the `_tb`
+struct (`TestbenchSchema::scoreboard_fields`), so run and check share
+it. The test body manipulates it through `Stmt::ScoreboardOp`
+(`sb.q.push(x)` statement, `let v = sb.q.pop()` / `v = sb.q.pop()`
+bind, `sb.counter = ...` scalar write) and `Expr::ScoreboardQuery`
+(`sb.counter` scalar read, `sb.q.size()`, `sb.q.empty()` — value
+positions everywhere a scalar local is allowed). Emission mirrors
+v1's `emit_scoreboard`: a C++ struct with the scalar members and
+`harc_rt::HarcQueue<T>` queues, accessed as direct `_tb.<sb>.<field>`
+member ops — so the two codegens trace-diff clean. Scoreboard
+`hookable`/`function` **methods** are out of this subset: they mutate
+scoreboard instance state, which v0 does not materialize, so a
+method-bearing scoreboard is rejected at the declaration (not silently
+dropped). Event-driven `on`/`connect` wiring and non-scalar
+(`queue<Struct>`, >64-bit) field types are likewise rejected at the
+field/site — those gate on the agent/env/event slices and the
+record-payload-in-queue seam respectively. Everything else —
 `randomize` (awaits the constraint-IR `ConstraintRef` seam),
 `agent`/`event`, bus-bound/event-driven transactors, transactor state
-fields, passive instances, scoreboards, `fork` (including
+fields, passive instances, scoreboard *methods* / event-driven
+`on`/`connect` wiring / `queue<Struct>` payloads (the data-only
+scoreboard subset lowers — see below), `fork` (including
 `fork bus.method(...)`/`join_all` TLM issue), out-of-order TLM lanes,
 bus bind remaps/generics, transaction `when` subtype blocks,
 non-scalar / wider-than-64-bit transaction fields and method
@@ -163,6 +189,7 @@ none — `extra_harc` joins additional `tests/fixtures/` files to the
 | `noc_credit_test` | `NocCreditTop` | `noc_credit.sv` | pass | transactor: `for`-loop waits with param bounds |
 | `buf_mgr_sm_test` | `BufMgrSm` | `buf_mgr_sm.sv` + 3 | pass | transactor: `if` inside `for` with waits, multi-file DUT |
 | `buf_mgr_test` | `BufMgr` | `buf_mgr.sv` + 4 | pass | transactor: `while` over port read, `return dut.port`, assert in method |
+| `scoreboard_basic_test` | `Top` | `top_counter.sv` | pass | scoreboard: queue push/pop/size/empty, scalar counter read/write, run↔check-shared `_tb` instance |
 
 (The registry has since grown past this table via the backfill sweep —
 see [tbir-coverage.md](tbir-coverage.md); the registry file is the
@@ -466,6 +493,29 @@ reason. Code locations are authoritative.
       or `const`/enum name). v1 accepts arbitrary index expressions;
       a variable index is an explicit rejection until a fixture
       needs it.
+
+12. **Scoreboard data-only subset (2026-06-12).** The design doc's
+    `Stmt::ScoreboardOp(ScoreboardId, ScoreboardOp)` is implemented
+    with `ScoreboardOp` as `QueuePush`/`QueuePop`/`ScalarWrite` (plus
+    a sibling `Expr::ScoreboardQuery` for the value-producing reads
+    `size`/`empty`/scalar). The implemented op carries the resolved
+    `field` (testbench-field name) alongside the `ScoreboardId` so
+    emission resolves `_tb.<field>` without a second lookup — a
+    compilation-necessity extension of the design's two-tuple. The
+    subset is **data-only**: a scoreboard is a struct of scalar
+    counters and `queue<T>` FIFOs of a scalar element type, held as a
+    `_tb` member, mutated directly from the run/check body (v1's
+    `emit_scoreboard` shape). Scoreboard `hookable`/`function`
+    **methods** are NOT lowered — they mutate scoreboard instance state,
+    which would need the same per-instance materialization deferred for
+    transactor state (divergence 10); a method-bearing scoreboard is
+    rejected at the declaration so it never lowers to a struct missing
+    its methods. Event-driven `on`/`connect` wiring (gates on the
+    agent/env/event slices) and non-scalar field/element types
+    (`queue<Struct>`, > 64-bit — needs the record-payload-in-queue
+    seam) are likewise rejected at the field/site. No divergence in
+    observable behavior for the covered subset: `scoreboard_basic_test`
+    trace-diffs clean against v1.
 
 Minor, same spirit: `IndexVec` is a plain `Vec` plus typed id structs;
 the design's `AssertFail` enum collapsed into a single
