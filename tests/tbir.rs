@@ -3682,6 +3682,57 @@ fn regblock_access_corpus_lowers_with_initiator_bfm() {
     assert!(helper.method("write").is_some() && helper.method("read").is_some());
 }
 
+/// The bound-to INITIATOR BFM now carries persistent scalar STATE fields
+/// (this slice): `AxilHelper bound to BusAxiLite` with a `read` method
+/// that caches `last_read`/`read_count` across calls. The schema records
+/// the state fields, the method body's bare-name writes lower to
+/// `TransactorStateWrite` instance-filled with the bound instance name,
+/// and the testbench records the instance in `unbound_state_actors` so
+/// emission materializes one per-instance state struct (shared with the
+/// bus-driving method lambdas). End-to-end v1↔tbir trace equivalence is
+/// gated by the registry harness; this asserts lowering structure.
+#[test]
+fn bound_initiator_transactor_with_state_lowers() {
+    let prog = lower_with_stdlib_bus(
+        "transactor_bound_initiator_state_test.harc",
+        "BusAxiLite.arch",
+    )
+    .expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+
+    let helper = prog
+        .transactors
+        .iter()
+        .find(|x| x.name == "AxilHelper")
+        .expect("AxilHelper transactor lowered");
+    assert_eq!(helper.bound_bus.as_deref(), Some("BusAxiLite"));
+    let names: Vec<&str> = helper.state_fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, vec!["last_read", "read_count"], "state fields on schema");
+
+    // The stateful bound-initiator instance is recorded for per-instance
+    // state materialization (the same table the unbound form uses).
+    assert_eq!(
+        prog.testbenches[0].unbound_state_actors,
+        vec![("helper".to_string(), ir::TransactorId(0))],
+        "stateful bound-initiator instance recorded for materialization",
+    );
+
+    // The `read` body's state writes are instance-filled with `helper`
+    // (the bound instance name), not the empty pre-bind placeholder.
+    let read_fn = prog
+        .functions
+        .iter()
+        .find(|f| f.name == "AxilHelper_read")
+        .expect("read method function");
+    let state_writes = read_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.stmts)
+        .filter(|s| matches!(s, ir::Stmt::TransactorStateWrite { instance, .. } if instance == "helper"))
+        .count();
+    assert_eq!(state_writes, 2, "two instance-filled state writes in read body");
+}
+
 /// The corpus `regblock_bitbash_test` fixture — `bitbash(regs)` over a
 /// regblock with 3 RW + 1 RO + 1 WO register — FULLY lowers (this
 /// slice). The walk unrolls to write/read both patterns + compare per

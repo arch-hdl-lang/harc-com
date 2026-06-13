@@ -320,13 +320,24 @@ binding time. `recv()` now captures every payload signal into a per-field
 local (`r.data` / `r.resp`), preserving the bare-scalar `recv()` read.
 See docs/tbir-mvp.md divergence 15.
 
-**Registered** (1, passes the v1-vs-tbir equivalence pair, trace-diff
-clean): `regblock_access_test`. The other three BFM-helper fixtures
-(`regblock_basic_test`, `regblock_bitbash_test`, `regblock_record_test`)
-now lower their `via` helper but stop at deeper regblock residuals (see
-the `regblock` construct group above).
+**Registered** (2, pass the v1-vs-tbir equivalence pair, trace-diff
+clean): `regblock_access_test`, and `transactor_bound_initiator_state_test`
+(bound-initiator-state slice, 2026-06-13 — a BFM whose `read` caches the
+bus readback in a `last_read`/`read_count` state struct). The other three
+BFM-helper fixtures (`regblock_basic_test`, `regblock_bitbash_test`,
+`regblock_record_test`) now lower their `via` helper but stop at deeper
+regblock residuals (see the `regblock` construct group above).
 
-**Out of subset** (precise rejections): per-instance BFM state fields,
+Per-instance scalar **STATE fields** on the bound-to initiator BFM now
+lower (bound-initiator-state slice, 2026-06-13): a `hookable read(addr)`
+body can cache the bus readback into a `last_read : uint<32>` field, read
+back at test scope as `helper.last_read` — same `target_state_struct_inst`
+machinery as the unbound and bound-target forms. Self-proving fixture
+`transactor_bound_initiator_state_test` (`AxiLiteRegs.sv`, pass, trace-diff
+clean). One stateful instance per BFM type per file.
+
+**Out of subset** (precise rejections): event/directional fields
+(`req : in event<T>` — the bound-to event-driven driver form),
 `out_of_order` channels, `fork`-issue, nested transactor calls inside a
 BFM body, multiple bound instances of one BFM type per file. A
 `bind ... with { ... }` remap on a *handshake-channel* bus (which an
@@ -375,7 +386,7 @@ dump-ir`, 2026-06-13):
 |---|---|
 | `agent` construct + `on <ev>` event handlers | `heartbeat_idle_test`, `wait_until_quiesce_test`, `watchdog_quiesce_test`, `watchdog_trip_diagnostic_test`, `env_quiesced_phase_test` (also need `phase`, `idle(N)`/`quiesced(N)` predicates, watchdog) |
 | ~~`sequencer`~~ → ~~`tseq`~~ → ~~state field~~ → now **event field / agent-mode** | `axilite_connect_test`, `transactor_agent_mode_test`, `transactor_env_mode_test` — **`sequencer` lowers (sequencer slice), `tseq` lowers (tseq slice), and transactor scalar STATE fields lower (state-field slice, 2026-06-13)**; each now stops at the NEXT tier: `axilite_connect_test` → `req : in event<RegOp>` directional field (event-driven unbound transactor); the agent/env pair → a transactor with **>1 module-typed field** (`dut` + `sb`, agent-mode DUT-handle inheritance), additionally stacking mode-inheritance + cycle-trigger `on dut.x && dut.y` handlers — see the `tseq` construct group |
-| ~~`tseq` construct~~ → bound-to transactor | `axilite_bound_mon_test` — **`tseq` slice landed**; now stops at a bound-to transactor **state field** (the bound-monitor/responder state, divergence 10/13) |
+| ~~`tseq` construct~~ → ~~bound-to state field~~ → bound-to **agent surface** | `axilite_bound_mon_test`, `axilite_multi_payload_test`, `transactor_passive_only_test` — **`tseq` slice landed; the bound-to *scalar* state field now lowers (bound-initiator-state slice, 2026-06-13)**; these now stop at a bound-to transactor **sub-component field** (`sb : AxilSb`), additionally stacking `on bus.<ch>.handshake` MONITOR handlers + `in event<RegOp>` + `on req(t)` driving the bound bus — the full bound-to event-driven AGENT surface, a deeper slice |
 | ~~`tseq` + `randomize`~~ → sub-component field | `axilite_env_test` — **its `tseq` + `randomize(t)` now lower (tseq slice)**; now stops at an env **sub-component field** type (a deeper env-composition feature, not tseq) |
 
 The env-composition machinery (component structs, methods with instance
@@ -530,7 +541,7 @@ map (re-run of `harc dump-ir`, 2026-06-13):
 |---|---|
 | ~~transactor **event field** (`req : in event<RegOp>`)~~ → **RESOLVED 2026-06-13** for the UNBOUND form (event-driven-transactor slice); `axilite_seqdrv_test` now **PASSES** (registered). `axilite_connect_test` advanced past the event field to a data-only `scoreboard` SUB-component in its env (see below); `transactor_active_test` is the BOUND-to event form (separate slice). | `axilite_connect_test` (env data-scoreboard sub), `transactor_active_test` (bound-to actor) |
 | transactor with **>1 module-typed field** (`dut` + `sb` — agent-mode DUT-handle inheritance) | `transactor_agent_mode_test`, `transactor_env_mode_test` |
-| `tseq` construct (data-stream tseq with no record element — needs the scalar/non-record element seam) | `axilite_bound_mon_test` |
+| bound-to **agent surface** (`sb` sub-component field + `on bus.<ch>.handshake` monitor handlers + `in event` + `on req` driving the bound bus) — the bound-to scalar state field itself now lowers (bound-initiator-state slice, 2026-06-13) | `axilite_bound_mon_test`, `axilite_multi_payload_test`, `transactor_passive_only_test`, `transactor_parse_test` |
 
 The **event-driven-transactor slice** (2026-06-13) lowers the consumer
 side: an unbound `transactor` with an `in event<T>` pipe + `on req(t)`

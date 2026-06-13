@@ -606,11 +606,19 @@ pub(crate) const INITIATOR_BUS_PLACEHOLDER: &str = "bus";
 /// filled with the real binding name at test-binding time
 /// (`fill_initiator_bus_prefix`).
 ///
+/// Persistent scalar state fields (`last_read : uint<32> default 0`)
+/// materialize on a per-instance state struct, exactly like the bound-to
+/// target and unbound DUT-poking forms: method bodies read/write them by
+/// bare name and the test reads them back as `<instance>.<field>`. The
+/// per-instance state map and the body `TransactorState` placeholders are
+/// filled at test-binding time, alongside the bus prefix.
+///
 /// Method waits keep v1's synchronous hookable semantics (the tbir
 /// backend emits them as `tick()` loops). Out of subset, rejected
-/// precisely: state fields (no per-instance materialization for an
-/// initiator BFM yet), `out_of_order` channels, `fork`-issue,
-/// `bind ... with { ... }` remaps, and nested transactor calls.
+/// precisely: event/directional fields (`in event<T>` + `on <ev>` driving
+/// the bound bus — a follow-up slice), `out_of_order` channels,
+/// `fork`-issue, `bind ... with { ... }` remaps, and nested transactor
+/// calls.
 fn lower_bound_initiator_transactor(
     t: &TransactorDecl,
     next_fn: FunctionId,
@@ -644,21 +652,55 @@ fn lower_bound_initiator_transactor(
     };
 
     // Walk always-on + `when active` items: collect the hookable
-    // methods; reject every out-of-subset item shape precisely.
+    // methods and persistent scalar state fields; reject every
+    // out-of-subset item shape precisely.
     let mut methods_ast: Vec<&HookableMethod> = Vec::new();
+    // Persistent scalar state fields (`last_read : uint<32> default 0`)
+    // materialize on a per-instance state struct, exactly like the
+    // bound-to target and unbound DUT-poking forms. Method bodies
+    // read/write them by bare name (routed to `TransactorState`/
+    // `TransactorStateWrite` via the builder's `target_state_fields`
+    // set); the test reads them back as `<instance>.<field>`. The
+    // per-instance state map + body placeholders are filled at
+    // test-binding time, alongside the bus prefix.
+    let mut state_fields: Vec<TbScalarFieldSchema> = Vec::new();
+    let mut state_names: HashSet<String> = HashSet::new();
     let all_items = t.items.iter().chain(t.when_active.iter().flatten());
     for ci in all_items {
         match ci {
             ComponentItem::Hookable(h) => methods_ast.push(h),
             ComponentItem::Field(f) => {
-                return Err(unsupported(
-                    &format!(
-                        "initiator-side bound-to transactor `{tname}` state field `{}`",
-                        f.name.name
-                    ),
-                    "the initiator BFM subset carries no per-instance state; \
-                     persistent state fields are a follow-up slice",
-                ));
+                // An event/directional field (`req : in event<T>`) on a
+                // bound-to transactor is the event-driven driver form —
+                // it routes to the component path, which does not yet
+                // carry the bound-bus handshake context. Reject it
+                // precisely (the unbound event-driven form is #382;
+                // bound-to event-driven is a follow-up slice).
+                if f.direction.is_some() {
+                    return Err(unsupported(
+                        &format!(
+                            "initiator-side bound-to transactor `{tname}` event/directional \
+                             field `{}`",
+                            f.name.name
+                        ),
+                        "event-driven bound-to transactors (`in event<T>` + `on <ev>` driving \
+                         the bound bus) are a follow-up slice; only `hookable`-method BFMs \
+                         with scalar state are lowered",
+                    ));
+                }
+                // A scalar persistent state field (`uint<N>`/`sint<N>`/
+                // `bool` ≤64 bits with a plain-literal default). Reuse the
+                // bound-to target state-field lowering; reject module/
+                // transaction-typed and non-scalar fields inside it.
+                let sf = lower_state_field(tname, f)?;
+                if !state_names.insert(sf.name.clone()) {
+                    return Err(LowerError::Invalid(format!(
+                        "initiator-side bound-to transactor `{tname}` declares state field \
+                         `{}` more than once",
+                        sf.name
+                    )));
+                }
+                state_fields.push(sf);
             }
             ComponentItem::TargetTlmThread(th) => {
                 return Err(unsupported(
@@ -717,7 +759,7 @@ fn lower_bound_initiator_transactor(
         dut_type: String::new(),
         methods: Vec::new(),
         bound_bus: Some(bus_name.clone()),
-        state_fields: Vec::new(),
+        state_fields,
         target_methods: Vec::new(),
     };
 
@@ -771,6 +813,12 @@ fn lower_bound_initiator_transactor(
         let fid = FunctionId(next_fn.0 + funcs.len() as u32);
         let mut b = FuncBuilder::new(&method_ctx, helper_registry, constraint_sites);
         b.in_transactor_method = true;
+        // Bare-name reads/writes of a state field route to
+        // `TransactorState`/`TransactorStateWrite` with an empty instance
+        // placeholder, filled at test-binding time (same as the unbound
+        // and bound-to target forms). Method params shadow state names
+        // (declared below, looked up first), so this is safe up front.
+        b.target_state_fields = state_names.clone();
         let mut params = Vec::with_capacity(h.params.len());
         for p in &h.params {
             check_scalar_ty(tname, mname, &format!("parameter `{}`", p.name.name), p.ty.as_ref())?;
