@@ -436,7 +436,31 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
             local_str(func, *seq),
             expr_str(func, value)
         ),
+        Stmt::TlmFork(desc) => format!("TlmFork({})", tlm_fork_desc_str(func, desc)),
+        Stmt::TlmJoinAll(pending) => {
+            let descs: Vec<String> =
+                pending.iter().map(|d| tlm_fork_desc_str(func, d)).collect();
+            format!("TlmJoinAll([{}])", descs.join(", "))
+        }
     }
+}
+
+fn tlm_fork_desc_str(func: &crate::ir::TbFunction, desc: &crate::ir::TlmForkDesc) -> String {
+    let a: Vec<String> = desc.args.iter().map(|e| expr_str(func, e)).collect();
+    let dest = match desc.dest {
+        Some(d) => format!("{} = ", local_str(func, d)),
+        None => String::new(),
+    };
+    let tag = match desc.tag {
+        Some(t) => format!(" tag={t}"),
+        None => String::new(),
+    };
+    format!(
+        "{dest}{}.{}([{}]){tag}",
+        desc.bus_field,
+        desc.method,
+        a.join(", ")
+    )
 }
 
 fn comp_base_str(base: &crate::ir::ComponentBase) -> String {

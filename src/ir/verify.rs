@@ -610,6 +610,24 @@ impl Checker<'_> {
                     // no-inline-port rule like any host-state assignment.
                     self.check_expr(value, false, "SeqPush value");
                 }
+                Stmt::TlmFork(desc) => {
+                    if let Some(d) = desc.dest {
+                        self.check_local(d);
+                    }
+                    // A fork is a bus-bound TLM seam, same resolution rules
+                    // as a blocking Assign-RHS edge (Run/Check only, binding
+                    // resolves on the owner tb, method exists, arg arity +
+                    // purity). The args are no-inline-port.
+                    self.check_bus_call_edge(&desc.bus_field, &desc.method, &desc.args);
+                }
+                Stmt::TlmJoinAll(pending) => {
+                    for p in pending {
+                        if let Some(d) = p.dest {
+                            self.check_local(d);
+                        }
+                        self.check_bus_call_edge(&p.bus_field, &p.method, &p.args);
+                    }
+                }
             }
         }
         match &b.terminator {
@@ -1255,6 +1273,29 @@ fn check_def_before_use(
                         });
                     }
                     check_e(value, &defined, errs);
+                }
+                Stmt::TlmFork(desc) => {
+                    // Args read at the fork site; the dest is defined here
+                    // (v1 declares + zero-inits `T x = {};` at the fork,
+                    // so reads between fork and join_all see a defined
+                    // local), and re-assigned at the matching join_all.
+                    for a in &desc.args {
+                        check_e(a, &defined, errs);
+                    }
+                    if let Some(l) = desc.dest {
+                        if l.index() < defined.len() {
+                            defined[l.index()] = true;
+                        }
+                    }
+                }
+                Stmt::TlmJoinAll(pending) => {
+                    for p in pending {
+                        if let Some(l) = p.dest {
+                            if l.index() < defined.len() {
+                                defined[l.index()] = true;
+                            }
+                        }
+                    }
                 }
             }
         }

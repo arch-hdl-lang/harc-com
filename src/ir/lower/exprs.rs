@@ -302,8 +302,10 @@ impl FuncBuilder<'_> {
                 Err(unsupported(&what, ""))
             }
             ExprKind::ForkCall { .. } => Err(unsupported(
-                "`fork` bus-method calls",
-                "out-of-order TLM issue/join_all lanes are not lowered yet",
+                "`fork` bus-method calls in expression position",
+                "test-scope `let x = fork bus.m(...)` (initiator-side issue) IS lowered; a \
+                 `fork` INSIDE a transactor responder body (target re-issuing a downstream \
+                 TLM call — fork-forwarding) is a follow-up slice",
             )),
             ExprKind::Randomize { .. } => Err(unsupported("`randomize` expressions", "")),
             ExprKind::Cast { expr, ty } => {
