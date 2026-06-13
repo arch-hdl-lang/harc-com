@@ -181,12 +181,12 @@ fn fatal_path_dump_ir_snapshot() {
 
 /// Transactor fixtures are outside the MVP subset — the error must
 /// name the construct and point at `--codegen v1`, never mis-lower.
-/// The fixture's `transaction` items now lower (records slice), and
-/// its `transactor` declaration now passes the item-level scan
-/// (transactor slice); the scan trips on the `tseq` declaration
-/// instead. (The transactor itself would also be rejected — its
-/// `req : in event<RegOp>` field is out of subset — but `tseq` sits
-/// earlier in the file-gate order.)
+/// The fixture's `transaction` items now lower (records slice), its
+/// `transactor` declaration passes the item-level scan (transactor
+/// slice), and its `tseq` declaration now lowers too (tseq slice); the
+/// next blocker is the transactor's persistent STATE field, which needs
+/// per-instance state materialization (divergence 10, deferred). The
+/// rejection still names the construct precisely and never mis-lowers.
 #[test]
 fn transactor_fixture_is_unsupported() {
     let err = lower_src(&fixture("axilite_seqdrv_test.harc")).unwrap_err();
@@ -215,6 +215,57 @@ fn randomize_fixture_lowers() {
         .filter(|b| matches!(b.terminator, ir::Terminator::Randomize { .. }))
         .count();
     assert!(randomize_blocks >= 1, "a Randomize terminator is present");
+}
+
+/// `tseq` (transaction-sequence) lowers: the generator becomes a
+/// `FunctionKind::Tseq` function whose body carries `SeqPush` (`yield`)
+/// and a `Randomize` terminator, and the test body iterates the
+/// materialized `RecordSeq` with a `SeqLen`/`SeqIndex` counted loop.
+#[test]
+fn tseq_basic_fixture_lowers() {
+    let prog = lower_src(&fixture("tseq_basic_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+
+    // Exactly one Tseq function, with a RecordSeq accumulator and a
+    // SeqPush statement in its body.
+    let tseq_fn = prog
+        .functions
+        .iter()
+        .find(|f| matches!(f.kind, ir::FunctionKind::Tseq { .. }))
+        .expect("a FunctionKind::Tseq function is present");
+    assert!(
+        matches!(tseq_fn.ret.map(|r| &tseq_fn.local(r).ty), Some(ir::IrType::RecordSeq(_))),
+        "the tseq `ret` accumulator is RecordSeq-typed"
+    );
+    let has_seq_push = tseq_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.stmts)
+        .any(|s| matches!(s, ir::Stmt::SeqPush { .. }));
+    assert!(has_seq_push, "`yield t` lowered to a SeqPush");
+    let has_randomize = tseq_fn
+        .blocks
+        .iter()
+        .any(|b| matches!(b.terminator, ir::Terminator::Randomize { .. }));
+    assert!(has_randomize, "`randomize(t)` inside the tseq lowered");
+
+    // The run body has a RecordSeq local (the `let txns = Gen(5)` result),
+    // a Tseq call edge, and a SeqLen/SeqIndex iteration.
+    let run = prog.function(prog.tests[0].run);
+    assert!(
+        run.locals.iter().any(|l| matches!(l.ty, ir::IrType::RecordSeq(_))),
+        "the materialized sequence local is RecordSeq-typed"
+    );
+    let has_tseq_call = run.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+        matches!(s, ir::Stmt::Assign(_, ir::Expr::Call(ir::CallTarget::Tseq(_), _)))
+    });
+    assert!(has_tseq_call, "`let txns = Gen(5)` is a CallTarget::Tseq edge");
+    let has_seq_index = run
+        .blocks
+        .iter()
+        .flat_map(|b| &b.stmts)
+        .any(|s| matches!(s, ir::Stmt::Assign(_, ir::Expr::SeqIndex { .. })));
+    assert!(has_seq_index, "`for t in txns` binds t to seq[i] via SeqIndex");
 }
 
 /// `wait_until_quiesce` composes an `agent`, binds it as a TESTBENCH

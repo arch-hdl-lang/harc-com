@@ -601,6 +601,12 @@ impl Checker<'_> {
                         self.check_local(*d);
                     }
                 }
+                Stmt::SeqPush { seq, value } => {
+                    self.check_local(*seq);
+                    // The yielded value (a record `Local`) follows the
+                    // no-inline-port rule like any host-state assignment.
+                    self.check_expr(value, false, "SeqPush value");
+                }
             }
         }
         match &b.terminator {
@@ -896,6 +902,16 @@ impl Checker<'_> {
                     }
                 }
             }
+            // Sequence length: the seq local must resolve. Host state —
+            // no port/value dependency beyond the local.
+            Expr::SeqLen(seq) => self.check_local(*seq),
+            // Sequence element read (`seq[i]`): the seq local must resolve;
+            // the index follows the same port rules as the surrounding
+            // context.
+            Expr::SeqIndex { seq, index } => {
+                self.check_local(*seq);
+                self.check_expr(index, ports_ok, context);
+            }
             Expr::Call(target, args) => {
                 // Seam rule: a call edge is never an expression VALUE.
                 // It reaches the verifier only as the top-level Assign
@@ -1018,6 +1034,16 @@ fn check_def_before_use(
     let mut entry_in = vec![false; nlocals];
     for slot in entry_in.iter_mut().take(func.params.len()) {
         *slot = true;
+    }
+    // A `RecordSeq` accumulator (the tseq `ret` slot) is always
+    // default-constructed by the backend at function top — `declare_locals`
+    // emits `std::vector<Record> r{};` — so it is live from entry. Mark it
+    // defined so the `yield`/`SeqPush` accumulator read never trips
+    // use-before-def.
+    for (i, l) in func.locals.iter().enumerate() {
+        if matches!(l.ty, IrType::RecordSeq(_)) {
+            entry_in[i] = true;
+        }
     }
     let mut ins: Vec<Vec<bool>> = vec![full.clone(); nblocks];
     ins[func.entry.index()] = entry_in.clone();
@@ -1195,6 +1221,18 @@ fn check_def_before_use(
                         }
                     }
                 }
+                Stmt::SeqPush { seq, value } => {
+                    // `yield t` reads both the accumulator (defined at the
+                    // tseq function entry) and the yielded value.
+                    if seq.index() < defined.len() && !defined[seq.index()] {
+                        errs.push(VerifyError::LocalUseBeforeDef {
+                            func: fid,
+                            block: bid,
+                            local: *seq,
+                        });
+                    }
+                    check_e(value, &defined, errs);
+                }
             }
         }
         match &b.terminator {
@@ -1255,6 +1293,11 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
         Expr::WidthCast { inner, .. } => for_each_local(inner, f),
         Expr::ComponentIdle { n, .. } => for_each_local(n, f),
         Expr::CovBin { .. } => {}
+        Expr::SeqLen(l) => f(*l),
+        Expr::SeqIndex { seq, index } => {
+            f(*seq);
+            for_each_local(index, f);
+        }
         Expr::Call(_, args) => {
             for a in args {
                 for_each_local(a, f);

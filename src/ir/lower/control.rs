@@ -6,8 +6,9 @@ use super::{FuncBuilder, LoopFrame, LowerError, unsupported};
 use crate::ast::{
     Block, Expr as AstExpr, ExprKind, ForStmt, IfStmt, RepeatStmt, WaitTimeout, WaitUntilMode,
 };
+use crate::ir;
 use crate::ir::{
-    BinOp, BlockId, Expr, FmtArg, FmtArgs, IrType, PredSrc, Stmt, Terminator, WaitMode,
+    BinOp, BlockId, Expr, FmtArg, FmtArgs, IrType, LocalId, PredSrc, Stmt, Terminator, WaitMode,
 };
 
 impl FuncBuilder<'_> {
@@ -60,6 +61,17 @@ impl FuncBuilder<'_> {
     }
 
     pub(crate) fn lower_for(&mut self, f: &ForStmt) -> Result<(), LowerError> {
+        // `for t in <seq>` — iterate a transaction-sequence local (the
+        // result of a tseq call). Each iteration binds `t` to the i-th
+        // record (`seq[i]`) over `0 .. seq.size()`, mirroring v1's
+        // `for (auto& t : txns)` range-for.
+        if let ExprKind::Ident(id) = &*f.iter.kind {
+            if let Some(seq) = self.lookup(&id.name) {
+                if let Some(elem) = self.seq_of_local(seq) {
+                    return self.lower_for_in_seq(f, seq, elem);
+                }
+            }
+        }
         let ExprKind::RangeLit {
             lo: Some(lo),
             hi: Some(hi),
@@ -67,7 +79,7 @@ impl FuncBuilder<'_> {
         else {
             return Err(unsupported(
                 "`for x in <sequence>`",
-                "only literal ranges `for i in lo .. hi` are lowered",
+                "only literal ranges `for i in lo .. hi` and `for t in <tseq-result>` are lowered",
             ));
         };
 
@@ -98,6 +110,62 @@ impl FuncBuilder<'_> {
             ),
         );
         self.lower_counted_loop(cond, step, &f.body)?;
+        self.pop_scope();
+        Ok(())
+    }
+
+    /// `for t in <seq>` over a `RecordSeq` local. Lowers to a counted
+    /// loop `for (i = 0; i < seq.size(); i++)` whose body first copies
+    /// `seq[i]` into the record-typed loop variable `t`, then runs the
+    /// user body. The whole-record copy (`Assign(t, SeqIndex{..})`) is
+    /// the IR's record-assignment form (v1 binds `t` by `auto&`; a copy
+    /// is observably identical for read-only iteration, and the IR has
+    /// no by-reference local model).
+    fn lower_for_in_seq(
+        &mut self,
+        f: &ForStmt,
+        seq: LocalId,
+        elem: ir::RecordId,
+    ) -> Result<(), LowerError> {
+        self.push_scope();
+        // Hidden counter, initialized once outside the loop.
+        let counter = self.fresh_temp();
+        self.push(Stmt::Assign(
+            counter,
+            Expr::Literal {
+                value: 0,
+                ty: IrType::Unknown,
+            },
+        ));
+        let cond = Expr::Binary(
+            BinOp::Lt,
+            Box::new(Expr::Local(counter)),
+            Box::new(Expr::SeqLen(seq)),
+        );
+        let step = Stmt::Assign(
+            counter,
+            Expr::Binary(
+                BinOp::Add,
+                Box::new(Expr::Local(counter)),
+                Box::new(Expr::Literal {
+                    value: 1,
+                    ty: IrType::Unknown,
+                }),
+            ),
+        );
+        // The loop variable is a record local copied from `seq[i]` at the
+        // top of each iteration. Declared inside the loop scope so each
+        // iteration's read sees the fresh element (and `_` is anonymized).
+        let var = self.declare(&f.var.name);
+        self.set_local_type(var, IrType::Record(elem));
+        let bind = Stmt::Assign(
+            var,
+            Expr::SeqIndex {
+                seq,
+                index: Box::new(Expr::Local(counter)),
+            },
+        );
+        self.lower_counted_loop_with_prologue(cond, step, bind, &f.body)?;
         self.pop_scope();
         Ok(())
     }
@@ -143,6 +211,29 @@ impl FuncBuilder<'_> {
         latch_step: Stmt,
         body: &Block,
     ) -> Result<(), LowerError> {
+        self.lower_counted_loop_impl(header_cond, latch_step, None, body)
+    }
+
+    /// `lower_counted_loop` with a prologue statement injected at the top
+    /// of the body block, before the user statements (used by `for t in
+    /// <seq>` to copy `seq[i]` into the loop variable each iteration).
+    fn lower_counted_loop_with_prologue(
+        &mut self,
+        header_cond: Expr,
+        latch_step: Stmt,
+        prologue: Stmt,
+        body: &Block,
+    ) -> Result<(), LowerError> {
+        self.lower_counted_loop_impl(header_cond, latch_step, Some(prologue), body)
+    }
+
+    fn lower_counted_loop_impl(
+        &mut self,
+        header_cond: Expr,
+        latch_step: Stmt,
+        prologue: Option<Stmt>,
+        body: &Block,
+    ) -> Result<(), LowerError> {
         let header = self.new_block();
         let body_b = self.new_block();
         let latch = self.new_block();
@@ -158,6 +249,9 @@ impl FuncBuilder<'_> {
         });
         self.start_block(body_b);
         self.push_scope();
+        if let Some(p) = prologue {
+            self.push(p);
+        }
         self.lower_block_stmts(body)?;
         self.pop_scope();
         if !self.is_terminated() {

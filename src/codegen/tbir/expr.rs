@@ -185,6 +185,24 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                 ),
             }
         }
+        // `<seq>.size()` — element count of a RecordSeq local. Cast to the
+        // uint64 model so it composes in the loop bound comparison.
+        Expr::SeqLen(l) => {
+            let name = cx.names.get(l.index()).cloned().ok_or_else(|| {
+                EmitError(format!("tbir: dangling local %{} in {}", l.0, cx.func.name))
+            })?;
+            format!("((uint64_t){name}.size())")
+        }
+        // `<seq>[<index>]` — record value at `index` in a RecordSeq local
+        // (v1's `txns[i]` subscript). Record-valued; used as the RHS of the
+        // `for t in <seq>` loop-variable copy.
+        Expr::SeqIndex { seq, index } => {
+            let name = cx.names.get(seq.index()).cloned().ok_or_else(|| {
+                EmitError(format!("tbir: dangling local %{} in {}", seq.0, cx.func.name))
+            })?;
+            let idx = expr_cpp(cx, index)?;
+            format!("{name}[{idx}]")
+        }
         Expr::Call(target, args) => {
             let name = match target {
                 CallTarget::Helper(n) => helper_cpp_name(n),
@@ -195,6 +213,10 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                             .to_string(),
                     ));
                 }
+                // A tseq generator call — `RandomTxns(5)`. Emitted as a
+                // direct lambda call (v1's tseq lambda). The result is a
+                // `std::vector<Record>` assigned into a RecordSeq local.
+                CallTarget::Tseq(n) => n.clone(),
                 CallTarget::TransactorMethod { bus_field, method } => {
                     // Call edges never emit from expression position:
                     // bus-bound edges emit only as a whole Assign RHS

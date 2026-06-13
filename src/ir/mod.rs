@@ -742,6 +742,15 @@ pub enum FunctionKind {
     /// a `<Comp>_<method>(<Comp>& self, args)` free lambda (v1's
     /// `emit_component_method` shape).
     ComponentMethod { component: ComponentId },
+    /// One `tseq` declaration body — a transaction-sequence generator.
+    /// `record` is the element record type (`TSeq<Record>`); the
+    /// function's `ret` slot holds the `IrType::RecordSeq(record)`
+    /// accumulator, each `yield` pushes onto it (`Stmt::SeqPush`), and
+    /// `Terminator::Return` returns it. Emitted as a `[&]`-capturing
+    /// lambda returning `std::vector<Record>` (v1's `emit_tseq` shape).
+    /// Called via `CallTarget::Tseq` from a test-scope `let txns =
+    /// Name(args)`.
+    Tseq { record: RecordId },
 }
 
 #[derive(Debug, Clone)]
@@ -767,6 +776,13 @@ pub enum IrType {
     Bool,
     /// A transaction value-record local (`let t : TxnType`).
     Record(RecordId),
+    /// A transaction-sequence local: an ordered list of record values
+    /// (`let txns = SomeTseq(...)`, typed `TSeq<Record>`). Emitted as
+    /// `std::vector<Record>` — v1's tseq accumulator shape. Built by a
+    /// `FunctionKind::Tseq` body (each `yield` is a `Stmt::SeqPush`),
+    /// consumed by `for t in <seq>` iteration (`Expr::SeqLen` +
+    /// `Expr::SeqIndex`).
+    RecordSeq(RecordId),
     Unknown,
 }
 
@@ -909,6 +925,11 @@ pub enum Stmt {
         args: Vec<Expr>,
         dest: Option<LocalId>,
     },
+    /// `yield t` inside a `tseq` body — append a record value onto the
+    /// sequence accumulator. `seq` is the function's `RecordSeq` `ret`
+    /// local; `value` is `Expr::Local(record)` (the yielded record).
+    /// Emitted as `<seq>.push_back(<value>);` (v1's `_result.push_back`).
+    SeqPush { seq: LocalId, value: Expr },
 }
 
 /// How a composite-component field/method access names its receiver.
@@ -1148,6 +1169,15 @@ pub enum Expr {
         point: String,
         bin: String,
     },
+    /// `<seq>.size()` — element count of a `RecordSeq` local, used as the
+    /// upper bound of a `for t in <seq>` loop. Lowers to `uint64_t`
+    /// (emitted as `<seq>.size()`).
+    SeqLen(LocalId),
+    /// `<seq>[<index>]` — the record value at `index` in a `RecordSeq`
+    /// local. Record-valued (allowed wherever a record `Local` is —
+    /// notably the `Stmt::Assign` that binds the `for t in <seq>` loop
+    /// variable). Emitted as `<seq>[<index>]`.
+    SeqIndex { seq: LocalId, index: Box<Expr> },
     Call(CallTarget, Vec<Expr>),
 }
 
@@ -1186,6 +1216,11 @@ pub enum CallTarget {
     Helper(String),
     Builtin(String),
     TransactorMethod { bus_field: String, method: String },
+    /// Call a `tseq` generator by name — `let txns = RandomTxns(5)`.
+    /// Resolves to the `FunctionKind::Tseq` function of that name; the
+    /// result is an `IrType::RecordSeq` assigned into a test-scope local.
+    /// Emitted as a direct `<name>(args)` lambda call (v1's tseq lambda).
+    Tseq(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

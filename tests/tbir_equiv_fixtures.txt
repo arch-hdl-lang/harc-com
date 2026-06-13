@@ -105,3 +105,5 @@ agent_on_handler_test | Top | top_counter.sv | - | pass
 regblock_access_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 tb_field_agent_test | Top | top_counter.sv | - | pass
 sequencer_connect_test | Top | top_counter.sv | top_counter.arch | pass
+tseq_basic_test | Top | top_counter.sv | top_counter.arch | pass
+axilite_fuzz_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass | axilite_regs_test.harc | - | AxiLiteFuzzTest

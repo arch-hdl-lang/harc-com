@@ -1,0 +1,83 @@
+// Minimal self-proving demo of the `tseq` (transaction-sequence)
+// construct: a named generator iterated with `for t in <TSeq>`, each
+// item `randomize`d under transaction `keep`s plus a per-item override.
+//
+// Exercises the whole tseq surface in one fixture:
+//   - a `tseq Gen(n) -> TSeq<Req>` declaration with a parameter,
+//   - a `for _ in 0 .. n` loop body that `let t : Req` / `randomize(t)`
+//     / overrides a field / `yield t`,
+//   - a test-scope `let txns = Gen(5)` call (the sequence is
+//     materialized once),
+//   - TWO `for t in txns` iterations over the SAME materialized
+//     sequence (the second proves the result is a reusable value, not
+//     a one-shot stream), asserting each item satisfies the keeps and
+//     the override.
+//
+// The DUT is unused (no pins driven); `Top` is chosen for its clock,
+// like keep_constraints_test. randomize ⇒ Z3; fixed seed ⇒ deterministic.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Req
+    len   : uint<8>
+    addr  : uint<32>
+
+    // 1..16 inclusive, and 4-byte aligned.
+    keep len in [1..16]
+    keep addr % 4 == 0
+end transaction Req
+
+// Generator: yields N randomized Req values, each with addr forced to a
+// fixed sentinel after solving (proves a post-randomize field write
+// inside a tseq body composes with the constraint seam).
+tseq Gen(n: int) -> TSeq<Req>
+    for _ in 0 .. n
+        let t : Req
+        randomize(t)
+        t.addr = 64
+        yield t
+    end for
+end tseq Gen
+
+testbench TseqBasicTb
+    dut : Top
+end testbench TseqBasicTb
+
+impl TseqBasicTest for TseqBasicTb
+    clock clk = SysDomain
+
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Materialize the sequence once.
+        let txns = Gen(5)
+
+        // First pass: every item satisfies the keeps and the override.
+        let count = 0
+        for t in txns
+            assert t.len >= 1 && t.len <= 16
+                else fail("len=${t.len} violates `keep len in [1..16]`")
+            assert t.addr == 64
+                else fail("addr=${t.addr} was not overridden to 64")
+            count = count + 1
+        end for
+        assert count == 5 else fail("expected 5 generated txns, saw ${count}")
+
+        // Second pass over the SAME materialized sequence — proves the
+        // tseq result is a reusable value, not a consumed stream.
+        let sum_len = 0
+        for t in txns
+            sum_len = sum_len + t.len
+        end for
+        assert sum_len >= 5 && sum_len <= 80
+            else fail("sum of 5 lens (each 1..16) out of range: ${sum_len}")
+
+        log(info, "PASS: tseq Gen(5) — randomize + override + reusable for-iteration")
+    end run
+end impl TseqBasicTest
