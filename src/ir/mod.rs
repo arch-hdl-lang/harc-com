@@ -463,6 +463,12 @@ pub enum ComponentKindTag {
     /// subscribing component. Same flat-struct shape as env/scoreboard;
     /// the distinguishing capability is on-handler registration.
     Agent,
+    /// `sequencer` — generates a stimulus stream. Same flat-struct shape
+    /// as the analysis-source transactor (`out event<T>` ports + hookable
+    /// methods that `emit` on them); a `connect` edge feeds the emitted
+    /// stream into a driver's sink method (the UVM sequencer/driver
+    /// pattern). It carries no DUT field of its own.
+    Sequencer,
 }
 
 impl ComponentKindTag {
@@ -472,6 +478,7 @@ impl ComponentKindTag {
             ComponentKindTag::Scoreboard => "scoreboard",
             ComponentKindTag::Transactor => "transactor",
             ComponentKindTag::Agent => "agent",
+            ComponentKindTag::Sequencer => "sequencer",
         }
     }
 }

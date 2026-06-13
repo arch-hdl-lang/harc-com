@@ -1,0 +1,67 @@
+// Self-proving `sequencer` smoke test (sequencer construct slice).
+//
+// A `sequencer` is the stimulus-source half of the UVM sequencer/driver
+// pattern: it owns an `out event<T>` analysis port and a hookable method
+// that generates a transaction stream and `emit`s each item on that port.
+// A `connect` edge inside the env wires the sequencer's `dispatched`
+// event to a sink method (here a scoreboard tally — standing in for a
+// driver's `req` sink), so calling `env.sqr.dispatch(n)` drives the
+// stream through the connect bridge without any test-scope `emit`.
+//
+// This fixture deliberately stays inside the sequencer slice's surface:
+// the dispatch loop is a literal-range `for i in 0 .. n` (NOT a `for t in
+// <tseq>` iteration), so it needs neither `tseq`/`TSeq<T>` values nor
+// `randomize`. Those stack on later slices; the three corpus sequencer
+// fixtures (axilite_connect_test, transactor_agent_mode_test,
+// transactor_env_mode_test) all need them and so remain blocked behind
+// `tseq` even with the sequencer construct lowering in place.
+
+sequencer CountSeq
+    dispatched : out event<uint<8>>
+
+    // Generate `n` items (value == index) and emit each on `dispatched`.
+    // Literal-range loop only — no TSeq iteration in this subset.
+    hookable dispatch(n: uint<8>)
+        for i in 0 .. n
+            emit dispatched(i)
+        end for
+    end dispatch
+end sequencer CountSeq
+
+scoreboard SeqSb
+    count : uint<32> default 0
+    sum   : uint<32> default 0
+
+    hookable sink(v: uint<8>)
+        count = count + 1
+        sum = sum + v
+    end sink
+end scoreboard SeqSb
+
+env SeqEnv
+    sqr : CountSeq
+    sb  : SeqSb
+
+    connect
+        sqr.dispatched -> sb.sink
+    end connect
+end env SeqEnv
+
+test SequencerConnectTest
+    let dut : Top
+    let env : SeqEnv
+
+    run
+        // Dispatch 5 items (values 0..4). The connect bridge forwards
+        // each emit into the scoreboard sink.
+        env.sqr.dispatch(5)
+
+        assert env.sb.count == 5
+            else fail("sequencer dispatched ${env.sb.count} items, expected 5")
+        // 0 + 1 + 2 + 3 + 4 == 10
+        assert env.sb.sum == 10
+            else fail("sequencer item sum=${env.sb.sum}, expected 10")
+
+        log(info, "PASS: sequencer dispatch stream connected to scoreboard sink")
+    end run
+end test SequencerConnectTest
