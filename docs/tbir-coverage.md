@@ -14,7 +14,12 @@ new registry rows across 9 fixtures; `mshr_cocotb_test` moved to the
 slice** — see the resolved `env`/`agent` composition cluster section
 below: the flat-struct core (env + connect + scoreboard methods +
 analysis `out event`/`emit`) landed and `analysis_sink_connect_test`
-is registered.
+is registered. Amended again 2026-06-13 by the **agent/on-handler
+slice** — see the `agent` + `on <ev>` handlers section below: `agent`
+composition, `on <ev>(arg)` self-subscriptions, test-scope path-emit,
+and `idle*` heartbeat predicates landed; `agent_on_handler_test` is
+registered, and the 5 heartbeat/quiesce fixtures now reject one level
+deeper (composite-component testbench-field binding).
 
 **This file is a snapshot, not a source of truth.** The registry
 (`tests/tbir_equiv_fixtures.txt`) is the source of truth for what is
@@ -271,10 +276,37 @@ dump-ir`, 2026-06-13):
 The env-composition machinery (component structs, methods with instance
 state, connect wiring, emit fan-out) is now in place; the residual
 fixtures need the **event-handler** (`agent` + `on`), **sequencer**, and
-**tseq/randomize** slices layered on top. The impl-form env-typed
-*testbench field* (`top : HeartbeatEnv`) used by the `*_quiesce`/
-`heartbeat` family is part of the agent slice (those reject at `agent`
-before reaching the field).
+**tseq/randomize** slices layered on top.
+
+### `agent` + `on <ev>` handlers — **PARTIALLY RESOLVED 2026-06-13 (agent/on-handler slice)**
+
+The `agent` construct and `on <ev>(arg)` event handlers now lower
+(`ComponentKindTag::Agent`, `ComponentSchema::on_handlers`,
+`Stmt::ComponentEmit` with a `base`, `Expr::ComponentIdle`; see
+docs/tbir-mvp.md divergence 15). An `agent` composes an `event<scalar>`
+self-event + an `on in_ev(t)` handler that registers as a subscriber
+closure (with the `_last_in_cycle` activity bump), driven by a test-scope
+path `emit tagger.in_ev(v)`; the `idle`/`idle_in`/`idle_out` heartbeat
+predicates lower as `Expr::ComponentIdle`. **Registered**:
+`agent_on_handler_test` — a self-proving fixture (agent + on-handler +
+path-emit + `idle_in`) authored for this slice, lowering cleanly, passing
+the v1-vs-tbir pair, trace-diff clean at seed 1.
+
+The 5 heartbeat/quiesce fixtures the env-composition slice flagged as
+"need the agent slice" no longer reject on `agent` — they now reject one
+level deeper. Residual first-blocker map (re-run of `harc dump-ir`,
+2026-06-13):
+
+| Next blocker | Fixtures |
+|---|---|
+| composite-component **testbench field** binding (`prod : Producer` / `agent : SilentAgent` / `top : HeartbeatEnv` inside a `testbench` block — a separate binding slice; agents/envs bind test-scope `let` today) | `heartbeat_idle_test`, `wait_until_quiesce_test`, `watchdog_quiesce_test`, `watchdog_trip_diagnostic_test`, `env_quiesced_phase_test` |
+
+Once the testbench-field binding lands, these stack further constructs
+this slice does not implement: `event<TinyTxn>` (transaction/struct event
+payloads, not just scalars), `quiesced(N)` (env heartbeat aggregation
+over sub-components), `watchdog` + `on <N> cycles` periodic triggers,
+named `phase`, and `wait until <preds> timeout fail` with heartbeat
+predicates. Those are the next layered slices.
 
 ### `scoreboard` construct — **PARTIALLY RESOLVED 2026-06-12 (scoreboard slice)**
 

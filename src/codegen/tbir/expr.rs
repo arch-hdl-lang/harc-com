@@ -166,6 +166,25 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         Expr::ComponentField { base, field } => {
             format!("{}.{field}", comp_base_cpp(base))
         }
+        // Heartbeat-idle predicate on a component instance — mirrors v1's
+        // `emit_idle_predicate`: compares `cycle_count` minus the
+        // `_last_in_cycle`/`_last_out_cycle` stamp against the threshold.
+        Expr::ComponentIdle { base, kind, n } => {
+            let recv = comp_base_cpp(base);
+            let n = expr_cpp(cx, n)?;
+            match kind {
+                crate::ir::IdleKind::In => format!(
+                    "(((uint64_t)cycle_count - {recv}._last_in_cycle) >= (uint64_t)({n}))"
+                ),
+                crate::ir::IdleKind::Out => format!(
+                    "(((uint64_t)cycle_count - {recv}._last_out_cycle) >= (uint64_t)({n}))"
+                ),
+                crate::ir::IdleKind::Both => format!(
+                    "((((uint64_t)cycle_count - {recv}._last_in_cycle) >= (uint64_t)({n})) \
+                     && (((uint64_t)cycle_count - {recv}._last_out_cycle) >= (uint64_t)({n})))"
+                ),
+            }
+        }
         Expr::Call(target, args) => {
             let name = match target {
                 CallTarget::Helper(n) => helper_cpp_name(n),

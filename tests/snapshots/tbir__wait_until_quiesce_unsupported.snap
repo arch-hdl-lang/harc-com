@@ -2,4 +2,4 @@
 source: tests/tbir.rs
 expression: msg
 ---
-TB-IR lowering does not support the `agent` construct yet; re-run with `--codegen v1`
+TB-IR lowering does not support testbench field `prod` of component type `Producer` yet; re-run with `--codegen v1`

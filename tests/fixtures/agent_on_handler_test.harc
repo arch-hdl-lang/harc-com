@@ -1,0 +1,73 @@
+// Minimal `agent` + `on <ev>` handler smoke test — the TB-IR agent
+// composition sub-slice (spec §7.x agents; docs/tbir-mvp.md §agent).
+//
+// An `agent` declares an `event<uint<8>>` self-event plus a scalar
+// counter, and an `on in_ev(t)` handler that runs on every fan-out into
+// that event. The test drives the agent by `emit`-ing transactions onto
+// `agent.in_ev` (dotted-path emit from test scope), spaced over the
+// clock, then:
+//   1. asserts the handler ran for every emit (`agent.seen`);
+//   2. asserts the heartbeat `idle_in(N)` predicate flips true once N
+//      cycles elapse with no further input activity.
+//
+// The DUT is `Top` (the counter from top_counter_test) used purely as a
+// background clock source — the agent logic runs host-side.
+//
+// Uses only the v1-supported surface, so the same file passes under
+// `--codegen v1` and `--codegen tbir`; the equivalence harness
+// trace-diffs the two.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent Tagger
+    in_ev : event<uint<8>>
+    seen  : uint<32> default 0
+    last  : uint<8>  default 0
+
+    on in_ev(t)
+        seen = seen + 1
+        last = t
+    end on
+end agent Tagger
+
+test AgentOnHandlerTest
+    let dut    : Top
+    let tagger : Tagger
+
+    clock clk = SysDomain
+
+    run
+        // Park the DUT — only the clock matters here.
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Drive 3 transactions spaced 2 cycles apart. Each `emit` fans
+        // out to the agent's `on in_ev` handler synchronously.
+        for i in 0 .. 3
+            emit tagger.in_ev(i + 1)
+            wait 2 cycles
+        end for
+
+        assert tagger.seen == 3
+            else fail("expected 3 handled events, got ${tagger.seen}")
+        assert tagger.last == 3
+            else fail("expected last payload 3, got ${tagger.last}")
+
+        // After the last emit, let the input go quiet; idle_in must flip
+        // true once >= 4 cycles have elapsed since the last emit.
+        let waited = 0
+        while !tagger.idle_in(4) && waited < 100
+            wait 1 cycle
+            waited = waited + 1
+        end while
+
+        assert tagger.idle_in(4)
+            else fail("agent never reported idle_in(4); waited=${waited}")
+        log(info, "PASS: agent handled ${tagger.seen} events, idle_in(4) after ${waited} cycles")
+    end run
+end test AgentOnHandlerTest

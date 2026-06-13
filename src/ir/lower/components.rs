@@ -79,6 +79,9 @@ pub(crate) enum CompSource<'a> {
     Env(&'a ComponentDecl),
     Scoreboard(&'a ComponentDecl),
     Transactor(&'a TransactorDecl),
+    /// `agent` — composes `on <ev>` self-subscriptions. Same
+    /// `ComponentDecl` shape as env/scoreboard.
+    Agent(&'a ComponentDecl),
 }
 
 /// Lower one component's STRUCTURE (fields + method signatures), without
@@ -98,6 +101,7 @@ pub(crate) fn lower_component_schema(
         Option<&[ComponentItem]>,
     ) = match src {
         CompSource::Env(c) => (&c.name.name, ComponentKindTag::Env, &c.items, None),
+        CompSource::Agent(c) => (&c.name.name, ComponentKindTag::Agent, &c.items, None),
         CompSource::Scoreboard(c) => {
             (&c.name.name, ComponentKindTag::Scoreboard, &c.items, None)
         }
@@ -116,7 +120,7 @@ pub(crate) fn lower_component_schema(
             ));
         }
     }
-    if let CompSource::Env(c) | CompSource::Scoreboard(c) = src {
+    if let CompSource::Env(c) | CompSource::Scoreboard(c) | CompSource::Agent(c) = src {
         if !c.params.is_empty() {
             return Err(unsupported(&format!("parameters on `{name}`"), ""));
         }
@@ -127,6 +131,10 @@ pub(crate) fn lower_component_schema(
 
     let mut fields: Vec<ComponentFieldSchema> = Vec::new();
     let mut methods: Vec<ComponentMethodSchema> = Vec::new();
+    // On-handler ASTs are collected here and resolved after the field
+    // loop, so a handler may textually precede the event field it
+    // subscribes to (field lookup needs the full field set).
+    let mut on_asts: Vec<&crate::ast::OnHandler> = Vec::new();
     for it in items.iter().chain(when_active.into_iter().flatten()) {
         match it {
             ComponentItem::Field(f) => {
@@ -158,16 +166,11 @@ pub(crate) fn lower_component_schema(
             // Connect blocks are resolved separately (env-binding stage).
             ComponentItem::Connect(_) => {}
             ComponentItem::Lifecycle(..) => {}
-            ComponentItem::OnHandler(_) => {
-                return Err(unsupported(
-                    &format!("`on <ev>` event handlers on `{name}`"),
-                    "event handlers gate on the agent slice",
-                ));
-            }
+            ComponentItem::OnHandler(h) => on_asts.push(h),
             ComponentItem::Watchdog(_) => {
                 return Err(unsupported(
                     &format!("a `watchdog` on `{name}`"),
-                    "watchdog/phase orchestration gates on the agent slice",
+                    "watchdog/phase orchestration gates on a later slice",
                 ));
             }
             ComponentItem::TargetTlmThread(_) | ComponentItem::Apply(_) => {
@@ -179,6 +182,22 @@ pub(crate) fn lower_component_schema(
         }
     }
 
+    // Resolve on-handlers: each must be an `on <event>(arg)` subscription
+    // to a self `event<scalar>` field. Cycle-trigger / periodic / hook /
+    // bus-handshake handler forms are deferred (later slices). The body
+    // FunctionId is reserved here; the body lowers in pass 2.
+    let mut on_handlers: Vec<crate::ir::OnHandlerSchema> = Vec::new();
+    for h in &on_asts {
+        let (event, arg_signed) = resolve_on_handler_event(name, h, &fields)?;
+        let fid = FunctionId(*next_fn);
+        *next_fn += 1;
+        on_handlers.push(crate::ir::OnHandlerSchema {
+            event,
+            arg_signed,
+            function: fid,
+        });
+    }
+
     Ok(ComponentSchema {
         name: name.to_string(),
         kind,
@@ -186,7 +205,65 @@ pub(crate) fn lower_component_schema(
         methods,
         // Connects resolved in a third pass once all schemas exist.
         connects: Vec::new(),
+        on_handlers,
     })
+}
+
+/// Validate an `on <event>(arg) ... end on` handler: it must be a bare
+/// event-subscription (`on in_ev(t)`) to a self `event<scalar>` field,
+/// with no `pre`/`post` hook side, no edge/periodic trigger. Returns the
+/// `(event_field_name, arg_signed)`.
+fn resolve_on_handler_event(
+    comp: &str,
+    h: &crate::ast::OnHandler,
+    fields: &[ComponentFieldSchema],
+) -> Result<(String, bool), LowerError> {
+    if h.hook.is_some() {
+        return Err(unsupported(
+            &format!("a `pre`/`post` hook `on` handler on `{comp}`"),
+            "only bare `on <event>(arg)` self-subscriptions are lowered",
+        ));
+    }
+    if h.periodic {
+        return Err(unsupported(
+            &format!("an `on <N> cycles` periodic handler on `{comp}`"),
+            "periodic/cycle-trigger handlers gate on a later slice",
+        ));
+    }
+    // Event-subscription shape: `on <event>(<arg>)`.
+    let ExprKind::Call { callee, args } = &*h.event.kind else {
+        return Err(unsupported(
+            &format!("a cycle-trigger `on <expr>` handler on `{comp}`"),
+            "only `on <event>(arg)` self-subscriptions are lowered",
+        ));
+    };
+    let event = match &*callee.kind {
+        ExprKind::Ident(id) => id.name.clone(),
+        _ => {
+            return Err(unsupported(
+                &format!("a dotted-path `on` handler event on `{comp}`"),
+                "only a bare self-event name is lowered",
+            ));
+        }
+    };
+    if args.len() != 1 {
+        return Err(unsupported(
+            &format!("an `on {event}(...)` handler with {} arguments", args.len()),
+            "event handlers take exactly one payload argument",
+        ));
+    }
+    // The event must name a self `event<scalar>` field.
+    match fields.iter().find(|f| f.name == event).map(|f| &f.kind) {
+        Some(ComponentFieldKind::Event { signed }) => Ok((event, *signed)),
+        Some(_) => Err(unsupported(
+            &format!("`on {event}` — `{comp}.{event}` is not an `event` field"),
+            "",
+        )),
+        None => Err(unsupported(
+            &format!("`on {event}` — `{comp}` has no field `{event}`"),
+            "",
+        )),
+    }
 }
 
 fn lower_field(
@@ -202,16 +279,20 @@ fn lower_field(
         ));
     }
     match &f.ty {
-        // `observed : out event<T>` analysis port.
+        // `observed : out event<T>` analysis port, or a directionless
+        // `in_ev : event<T>` agent self-event (subscribed via `on`).
+        // Both lower to a `std::vector<std::function<void(T)>>` callback
+        // list. An `in`/`inout` event is a bus/driver form (out of subset).
         TypeExpr::Builtin {
             name: BuiltinTy::Event,
             args,
             ..
         } => {
-            if f.direction != Some(Direction::Out) {
+            if matches!(f.direction, Some(Direction::In) | Some(Direction::InOut)) {
                 return Err(unsupported(
-                    &format!("a non-`out` event field `{comp}.{fname}`"),
-                    "only `out event<T>` analysis ports are lowered",
+                    &format!("an `in`/`inout` event field `{comp}.{fname}`"),
+                    "only `out event<T>` analysis ports and directionless agent \
+                     self-events are lowered",
                 ));
             }
             let signed = match args.first() {
@@ -301,21 +382,89 @@ pub(crate) fn lower_component_bodies(
     constraint_sites: &std::cell::RefCell<Vec<crate::ir::ConstraintSite>>,
 ) -> Result<Vec<TbFunction>, LowerError> {
     let (items, when_active): (&[ComponentItem], Option<&[ComponentItem]>) = match src {
-        CompSource::Env(c) | CompSource::Scoreboard(c) => (&c.items, None),
+        CompSource::Env(c) | CompSource::Scoreboard(c) | CompSource::Agent(c) => (&c.items, None),
         CompSource::Transactor(t) => (&t.items, t.when_active.as_deref()),
     };
-    let mut funcs = Vec::new();
+    // Pass 1 reserved FunctionIds METHODS-first, then ON-HANDLERS (see
+    // `lower_component_schema`). `prog.functions` is indexed by
+    // FunctionId, so the returned bodies MUST come out in that same
+    // FunctionId order — NOT source-declaration order (a component that
+    // declares `on` before `hookable` would otherwise emit the
+    // higher-id handler body before the lower-id method body, corrupting
+    // every later `prog.function(id)` index). Two ordered sub-passes
+    // guarantee monotonic ids.
+    let mut funcs = Vec::with_capacity(schema.methods.len() + schema.on_handlers.len());
     let mut method_idx = 0usize;
     for it in items.iter().chain(when_active.into_iter().flatten()) {
-        let ComponentItem::Hookable(h) = it else {
-            continue;
-        };
-        let m = &schema.methods[method_idx];
-        method_idx += 1;
-        let f = lower_method_body(h, m.function, cid, ctx, helpers, constraint_sites)?;
-        funcs.push(f);
+        if let ComponentItem::Hookable(h) = it {
+            let m = &schema.methods[method_idx];
+            method_idx += 1;
+            funcs.push(lower_method_body(h, m.function, cid, ctx, helpers, constraint_sites)?);
+        }
+    }
+    let mut on_idx = 0usize;
+    for it in items.iter().chain(when_active.into_iter().flatten()) {
+        if let ComponentItem::OnHandler(h) = it {
+            let oh = &schema.on_handlers[on_idx];
+            on_idx += 1;
+            funcs.push(lower_on_handler_body(h, oh, cid, ctx, helpers, constraint_sites)?);
+        }
     }
     Ok(funcs)
+}
+
+/// Lower an `on <event>(arg) ... end on` handler body as a one-param
+/// `ComponentMethod` function. The single param is the event argument,
+/// typed to the event payload (signed selected by the schema). Bare field
+/// names resolve self-relatively; `emit`/`idle` work as in any method.
+fn lower_on_handler_body(
+    h: &crate::ast::OnHandler,
+    oh: &crate::ir::OnHandlerSchema,
+    cid: ComponentId,
+    ctx: &LowerCtx,
+    helpers: &helpers::HelperRegistry<'_>,
+    constraint_sites: &std::cell::RefCell<Vec<crate::ir::ConstraintSite>>,
+) -> Result<TbFunction, LowerError> {
+    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    b.self_component = Some(cid);
+    // The handler's single argument (from `on <event>(<arg>)`).
+    let arg_name = on_handler_arg_name(h);
+    let ty = if oh.arg_signed {
+        IrType::SInt(None)
+    } else {
+        IrType::UInt(None)
+    };
+    let local = b.declare(&arg_name);
+    b.set_local_type(local, ty.clone());
+    let params = vec![TypedParam {
+        name: arg_name,
+        ty,
+    }];
+    b.lower_block_stmts(&h.body)?;
+    if !b.is_terminated() {
+        b.terminate(Terminator::Return);
+    }
+    let mut f = b.finish(
+        oh.function,
+        format!("comp_on_{}", oh.function.0),
+        FunctionKind::ComponentMethod { component: cid },
+        None,
+    )?;
+    f.params = params;
+    Ok(f)
+}
+
+/// The bare argument name of an `on <event>(<arg>)` handler (`_v` when
+/// not a plain identifier).
+fn on_handler_arg_name(h: &crate::ast::OnHandler) -> String {
+    if let ExprKind::Call { args, .. } = &*h.event.kind {
+        if let Some(CallArg::Expr(e)) = args.first() {
+            if let ExprKind::Ident(id) = &*e.kind {
+                return id.name.clone();
+            }
+        }
+    }
+    "_v".to_string()
 }
 
 fn lower_method_body(
@@ -769,27 +918,62 @@ impl super::FuncBuilder<'_> {
         Ok(out)
     }
 
-    /// Lower `emit <event>(args)` inside a component method body to a
-    /// `Stmt::ComponentEmit` (self-relative analysis-port fan-out).
+    /// Lower `emit <event>(args)` to a `Stmt::ComponentEmit`. Two forms:
+    ///   * self-relative `emit observed(v)` inside a method/on-handler body
+    ///     (`base = SelfField`, single segment);
+    ///   * test-scope path `emit env.agent.in_ev(v)` (`base = Path`, head
+    ///     segment is a test-scope component local, trailing segment is the
+    ///     event field of the resolved sub-component).
     pub(crate) fn lower_emit(
         &mut self,
         name: &crate::ast::Path,
         args: &[CallArg],
     ) -> Result<(), LowerError> {
+        // Path form: `emit <comp-local>.<subs...>.<event>(args)`.
+        if name.segments.len() >= 2 {
+            let head = name.segments[0].name.clone();
+            if let Some(&head_cid) = self.ctx.component_fields.get(&head) {
+                let recv: Vec<String> = name.segments[..name.segments.len() - 1]
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect();
+                let event = name.segments.last().unwrap().name.clone();
+                let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
+                let comp = &self.ctx.components[cid.index()];
+                match comp.field(&event).map(|f| &f.kind) {
+                    Some(ComponentFieldKind::Event { .. }) => {}
+                    _ => {
+                        return Err(unsupported(
+                            &format!(
+                                "`emit {}` — `{}.{event}` is not an `event` field",
+                                path_str(name),
+                                comp.name
+                            ),
+                            "",
+                        ));
+                    }
+                }
+                let lowered = self.lower_component_call_args(args)?;
+                self.push(IrStmt::ComponentEmit {
+                    base: ComponentBase::Path(recv),
+                    event,
+                    args: lowered,
+                });
+                return Ok(());
+            }
+        }
+        // Self-relative form, inside a method/on-handler body.
         let cid = self.self_component.ok_or_else(|| {
             unsupported(
                 "`emit` outside a component method body",
-                "only analysis-source `out event` ports support `emit` in this subset",
+                "only a component event field supports `emit` in this subset",
             )
         })?;
-        // The event must be a single bare segment naming an `out event`
-        // field of the body's component. `emit top.prod.in_ev(t)` (a
-        // path to a nested component's event) is the agent-slice form and
-        // is rejected precisely.
         if name.segments.len() != 1 {
             return Err(unsupported(
                 &format!("`emit {}` to a dotted event path", path_str(name)),
-                "only self-relative `emit <event>(...)` is lowered",
+                "only self-relative `emit <event>(...)` or a test-scope \
+                 `emit <comp>.<event>(...)` is lowered",
             ));
         }
         let event = name.segments[0].name.clone();
@@ -798,17 +982,68 @@ impl super::FuncBuilder<'_> {
             Some(ComponentFieldKind::Event { .. }) => {}
             _ => {
                 return Err(unsupported(
-                    &format!("`emit {event}` — not an `out event` field of `{}`", comp.name),
+                    &format!("`emit {event}` — not an `event` field of `{}`", comp.name),
                     "",
                 ));
             }
         }
         let lowered = self.lower_component_call_args(args)?;
         self.push(IrStmt::ComponentEmit {
+            base: ComponentBase::SelfField,
             event,
             args: lowered,
         });
         Ok(())
+    }
+
+    /// Lower `<comp>.idle(N)` / `.idle_in(N)` / `.idle_out(N)` to an
+    /// `Expr::ComponentIdle` when the callee resolves to a component
+    /// instance path. Returns `None` when the callee is not an idle
+    /// predicate on a known component (caller falls through to other
+    /// call-lowering paths).
+    pub(crate) fn as_component_idle(
+        &mut self,
+        callee: &AstExpr,
+        args: &[CallArg],
+    ) -> Result<Option<IrExpr>, LowerError> {
+        let ExprKind::Field { target, name } = &*callee.kind else {
+            return Ok(None);
+        };
+        let kind = match name.name.as_str() {
+            "idle" => crate::ir::IdleKind::Both,
+            "idle_in" => crate::ir::IdleKind::In,
+            "idle_out" => crate::ir::IdleKind::Out,
+            _ => return Ok(None),
+        };
+        // The receiver must be a path rooted at a test-scope component
+        // local (e.g. `env.agent` or a bare `agent`).
+        let Some(path) = dotted_path(target) else {
+            return Ok(None);
+        };
+        let Some(&head_cid) = path.first().and_then(|h| self.ctx.component_fields.get(h)) else {
+            return Ok(None);
+        };
+        // Walk sub-component segments to confirm the path resolves to a
+        // component (the idle stamps live on every component struct).
+        self.resolve_component_recv(head_cid, &path[1..])?;
+        if args.len() != 1 {
+            return Err(unsupported(
+                &format!("`{}(...)` with {} arguments", name.name, args.len()),
+                "idle predicates take exactly one cycle-count argument",
+            ));
+        }
+        let CallArg::Expr(n_expr) = &args[0] else {
+            return Err(unsupported(
+                &format!("a named argument to `{}`", name.name),
+                "",
+            ));
+        };
+        let n = self.lower_expr_no_ports(n_expr)?;
+        Ok(Some(IrExpr::ComponentIdle {
+            base: ComponentBase::Path(path),
+            kind,
+            n: Box::new(n),
+        }))
     }
 }
 
