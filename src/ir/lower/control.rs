@@ -354,6 +354,19 @@ impl FuncBuilder<'_> {
             // text rides along for the timeout breakdown, rendered by
             // the same pretty-printer v1's diagnostics use.
             let expr = self.lower_expr(c)?;
+            // A transactor method call cannot live in a `wait until`
+            // predicate: the scheduler re-evaluates the predicate every
+            // cycle, but the call advances simulated time (and may have
+            // side effects) — running it per re-evaluation is nonsensical.
+            // Reject precisely (hoisting would run it exactly once, the
+            // wrong semantics).
+            if super::exprs::expr_has_transactor_edge(&expr) {
+                return Err(unsupported(
+                    "a transactor method call inside a `wait until` predicate",
+                    "the predicate is re-evaluated every cycle; hoist the call into a `let` \
+                     before the `wait until`",
+                ));
+            }
             preds.push(PredSrc {
                 expr,
                 src_text: crate::codegen::cpp_tb::expr_source_str(c),

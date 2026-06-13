@@ -522,18 +522,21 @@ impl FuncBuilder<'_> {
                 )));
             }
             let e = self.lower_expr(value)?; // ports allowed in DutWrite values
+            let e = self.hoist_transactor_calls(e);
             self.push(Stmt::DutWrite(port, e));
             return Ok(());
         }
         // Bus-bound signal write: `axil.aw.valid = 1`.
         if let Some(port) = self.as_bus_port_ref(target)? {
             let e = self.lower_expr(value)?;
+            let e = self.hoist_transactor_calls(e);
             self.push(Stmt::DutWrite(port, e));
             return Ok(());
         }
         // Constant-lane DUT port write: `dut.lane_id_in[1] = 9`.
         if let Some(port) = self.as_lane_port_ref(target)? {
             let e = self.lower_expr(value)?;
+            let e = self.hoist_transactor_calls(e);
             self.push(Stmt::DutWrite(port, e));
             return Ok(());
         }
@@ -961,7 +964,7 @@ impl FuncBuilder<'_> {
     /// not a transactor-method access. `need_ret` enforces that a
     /// result-binding site calls a `-> T` method (v1 surfaces that as
     /// a C++ compile error; the IR rejects at lowering).
-    fn lower_transactor_call(
+    pub(crate) fn lower_transactor_call(
         &mut self,
         callee: &crate::ast::Expr,
         args: &[CallArg],
@@ -1241,7 +1244,12 @@ impl FuncBuilder<'_> {
         let Some(expr) = &v.expr else {
             return Err(LowerError::Invalid("assert without expression".to_string()));
         };
+        // Ports stay inline (lazy assert eval), but a transactor-method
+        // call edge cannot stay nested in the condition — hoist it into a
+        // preceding `Stmt::TransactorCall` (the seam rule, and the call may
+        // advance simulated time). `(helper.read(0) & 1) == 1`.
         let cond = self.lower_expr(expr)?; // ports allowed in assert conditions
+        let cond = self.hoist_transactor_calls(cond);
         let msg = match v.else_fail.as_ref() {
             Some(e) => match &*e.kind {
                 ExprKind::String(s) => s.clone(),

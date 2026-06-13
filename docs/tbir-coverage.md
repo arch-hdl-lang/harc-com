@@ -120,18 +120,20 @@ Residual first-blocker map for the other 16 (re-run of
 
 | Moved to group | Fixtures |
 |---|---|
-| `bus` (3) | `axilite_regs_full_test`, `bind_remap_test`, `transactor_parse_test` |
+| `bus` (2) | `bind_remap_test`, `transactor_parse_test` — **`axilite_regs_full_test` REGISTERED 2026-06-13 by the expression-position-call slice: `helper.read(addr)` in assert/bitwise expression positions now hoists into a preceding `Stmt::TransactorCall`; `AxiLiteRegs.sv`, pass, trace-diff clean v1↔tbir** |
 | `regblock` (7) | `regblock_basic_test`, `regblock_fields_test`, `regblock_access_test`, `regblock_bitbash_test`, `regblock_addrmap_test`, `regblock_alias_test`, `regblock_record_test` — **regblock slice landed 2026-06-12; bus-bound `via` helper (initiator-side BFM) + the regblock-residuals slice (register read in assert/format → `Expr::RegRead`; `bitbash(regs)`) + the field-level/addrmap slice (`regs.REG.FIELD` masked RMW; `addrmap` 3-/4-level access; `alias of`) landed 2026-06-13. SIX of the eight regblock fixtures now fully lower and are registered (`access`, `basic`, `bitbash`, `fields`, `addrmap`, `alias`); only `record_test`/`record_recursion_test` (passive `record_*` API + `on regs.REG` callbacks) remain residual — see the `regblock` construct group below.** |
 | `scoreboard` (2) | `analysis_sink_connect_test`, `axilite_env_test` |
 | ~~`tseq` (2)~~ → deeper | `axilite_seqdrv_test`, `transactor_active_test` — **tseq slice landed 2026-06-13; both lower their `tseq` now, and the transactor-state-field slice (2026-06-13) advanced `axilite_seqdrv_test` past its state field too — both now stop at an event field: `axilite_seqdrv_test` → `req : in event<RegOp>` (event-driven unbound transactor), `transactor_active_test` → bound-to transactor event field — see the `tseq` construct group below** |
-| ~~transactor state fields (1)~~ → deeper | `axilite_hooks_test` — **transactor-state-field slice landed 2026-06-13; the `last_read` state field now lowers, advancing to the next blocker: a record-typed (transaction) method param `send(t: RegOp)` + statement-level pre/post hooks** |
+| ~~transactor state fields~~ → ~~record param~~ → pre/post hooks (1) | `axilite_hooks_test` — **the record-typed method param `send(t: RegOp)` now lowers (record-param slice 2026-06-13); the SOLE remaining blocker is the test-scope `on drv.send pre/post` method hooks: "a test-scope `on <obj>.<method> pre/post` method hook" (the hook body is a `[&]`-capturing closure mutating test-scope `let`s by reference — the function-per-CFG IR cannot express a closure lexically nested in the run coroutine capturing its locals; v1 emits it as raw C++)** |
 | transactor state fields (self-proving) | `transactor_state_field_test` — **REGISTERED 2026-06-13** (`cam_dual_basic.sv`, pass): scalar state on the unbound DUT-poking transactor, written + read in method bodies and read back at test scope; trace-diff clean v1↔tbir |
-| >64-bit method params (1) | `aes_cipher_top_test` — "transactor method `AesXactor.load_block` parameter `key` wider than 64 bits (uint<128>)" (the tbir value model is u64) |
+| record-typed method params (self-proving) | `transactor_record_param_test` — **REGISTERED 2026-06-13** (`top_counter.sv`, pass): a `run_for(cmd: RunCmd)` method takes a `transaction` record by value, reads `cmd.ticks` in the body; trace-diff clean v1↔tbir |
+| >64-bit method params (1) | `aes_cipher_top_test` — "transactor method `AesXactor.load_block` parameter `key` wider than 64 bits (uint<128>)" (the tbir value model is u64; needs the wide-value method ABI) |
 
 As with the `transaction` slice, most of the moved fixtures stack
 several constructs (bus + scoreboard + sequencer + events); the
 counts will keep shifting as those slices land. The 2 transactor-
-specific residuals (`axilite_hooks_test`, `aes_cipher_top_test`) stay
+specific residuals (`axilite_hooks_test` — now narrowed to pre/post
+method hooks only; `aes_cipher_top_test` — >64-bit param) stay
 with this construct's owner.
 
 *+ `mshr_cocotb_test` (moved here 2026-06-12 by the singleton batch:

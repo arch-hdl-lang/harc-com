@@ -380,6 +380,7 @@ impl FuncBuilder<'_> {
         }
         for (sig, arg) in h.payload.iter().zip(args.iter()) {
             let value = self.lower_expr(call_arg_expr(arg))?; // ports OK in DutWrite values
+            let value = self.hoist_transactor_calls(value);
             self.push(Stmt::DutWrite(
                 bus_port(bind, &[&h.name.name, &sig.name.name]),
                 value,

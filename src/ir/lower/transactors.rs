@@ -37,11 +37,11 @@
 
 use super::{FuncBuilder, LowerCtx, LowerError, helpers, unsupported};
 use crate::ast::{
-    BusDecl, ComponentField, ComponentItem, HookableMethod, TargetTlmThread, TransactorDecl,
-    TypeArg, TypeExpr,
+    BusDecl, ComponentField, ComponentItem, HookableMethod, Param, TargetTlmThread,
+    TransactorDecl, TypeArg, TypeExpr,
 };
 use crate::ir::{
-    ConstraintSite, FunctionId, FunctionKind, TargetTlmMethodSchema, TbFunction,
+    self, ConstraintSite, FunctionId, FunctionKind, IrType, TargetTlmMethodSchema, TbFunction,
     TbScalarFieldSchema, Terminator, TransactorId, TransactorMethodSchema, TransactorSchema,
     TypedParam,
 };
@@ -293,8 +293,7 @@ pub(crate) fn lower_transactor(
         b.target_state_fields = state_names.clone();
         let mut params = Vec::with_capacity(h.params.len());
         for p in &h.params {
-            check_scalar_ty(tname, mname, &format!("parameter `{}`", p.name.name), p.ty.as_ref())?;
-            let ty = helpers::ir_type_of(p.ty.as_ref());
+            let ty = method_param_ir_type(tname, mname, p, &method_ctx.record_ids)?;
             let local = b.declare(&p.name.name);
             b.set_local_type(local, ty.clone());
             params.push(TypedParam {
@@ -849,8 +848,7 @@ fn lower_bound_initiator_transactor(
         b.target_state_fields = state_names.clone();
         let mut params = Vec::with_capacity(h.params.len());
         for p in &h.params {
-            check_scalar_ty(tname, mname, &format!("parameter `{}`", p.name.name), p.ty.as_ref())?;
-            let ty = helpers::ir_type_of(p.ty.as_ref());
+            let ty = method_param_ir_type(tname, mname, p, &method_ctx.record_ids)?;
             let local = b.declare(&p.name.name);
             b.set_local_type(local, ty.clone());
             params.push(TypedParam {
@@ -971,4 +969,33 @@ fn check_scalar_ty(
             "",
         )),
     }
+}
+
+/// Resolve a method parameter's `IrType`. A `Named` type that names a
+/// declared `transaction`/`struct` lowers to `IrType::Record` (passed
+/// by value — the method body binds the record param and reads its
+/// fields, mirroring v1's by-value struct param). Everything else goes
+/// through `check_scalar_ty` and lowers as a scalar (`uint<N>`/`sint<N>`/
+/// `bool`, ≤64 bits) — a wider width or other non-scalar type is rejected
+/// precisely there. The `Vec`-of-record / nested-record cases are not
+/// reachable: a record param is a flat value-record, exactly as v1 emits.
+fn method_param_ir_type(
+    tname: &str,
+    mname: &str,
+    p: &Param,
+    record_ids: &HashMap<String, ir::RecordId>,
+) -> Result<IrType, LowerError> {
+    if let Some(TypeExpr::Named { name, .. }) = p.ty.as_ref() {
+        let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+        if let Some(&rid) = record_ids.get(simple) {
+            return Ok(IrType::Record(rid));
+        }
+    }
+    check_scalar_ty(
+        tname,
+        mname,
+        &format!("parameter `{}`", p.name.name),
+        p.ty.as_ref(),
+    )?;
+    Ok(helpers::ir_type_of(p.ty.as_ref()))
 }
