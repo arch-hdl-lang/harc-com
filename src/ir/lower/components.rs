@@ -50,11 +50,15 @@ pub(crate) fn scoreboard_is_component(c: &ComponentDecl) -> bool {
 ///     module-typed DUT field the handler pokes. This is the unbound
 ///     consumer BFM: `emit drv.req(t)` (or a `connect` bridge) fires the
 ///     handler synchronously, which drives the DUT.
-/// A `bound to` target responder is excluded (separate TLM path).
+///   * event-driven (consumer-side) transactor **bound to a bus** — an
+///     `in event<T>` field with a matching `on <ev>(t)` handler whose body
+///     drives the bound bus's handshake channels (`bus.<ch>.send/recv`)
+///     instead of a private DUT handle. This is the bound consumer BFM:
+///     `emit drv.req(t)` fires the handler synchronously, which drives the
+///     bound bus's wires on the test DUT.
+/// A `bound to` target responder (`thread bus.<m>(...)` bodies, no event
+/// field) is excluded — it stays on the separate TLM responder path.
 pub(crate) fn transactor_is_component(t: &TransactorDecl) -> bool {
-    if t.bound_to.is_some() {
-        return false;
-    }
     let mut has_event = false;
     let mut has_in_event = false;
     let mut has_on_handler = false;
@@ -75,6 +79,13 @@ pub(crate) fn transactor_is_component(t: &TransactorDecl) -> bool {
             _ => {}
         }
     }
+    // A `bound to` transactor routes here ONLY when it is event-driven (an
+    // `in event` + a subscribing `on` handler). A `bound to` transactor
+    // with no event field (a hookable-method initiator BFM or a `thread
+    // bus.<m>` target responder) stays on the dedicated transactor path.
+    if t.bound_to.is_some() {
+        return has_in_event && has_on_handler;
+    }
     // Pure analysis source: events, no DUT.
     if has_event && !has_module_field {
         return true;
@@ -90,9 +101,6 @@ pub(crate) fn transactor_is_component(t: &TransactorDecl) -> bool {
 /// they route to the composite-component table; a pure analysis source
 /// (out-event only, no DUT, no `on`) does not.
 pub(crate) fn transactor_is_event_driven(t: &TransactorDecl) -> bool {
-    if t.bound_to.is_some() {
-        return false;
-    }
     let mut has_in_event = false;
     let mut has_on_handler = false;
     for it in t.items.iter().chain(t.when_active.iter().flatten()) {
@@ -169,12 +177,43 @@ pub(crate) fn lower_component_schema(
             t.when_active.as_deref(),
         ),
     };
+    // A `bound to <Bus>` transactor that routes here is the bound-bus
+    // event-driven consumer BFM: its `on <ev>` handler bodies drive the
+    // bound bus's handshake channels instead of a private DUT handle.
+    // Resolve the bus name (validated against the test's bus binding at
+    // test-binding time, mirroring the bound-initiator path); reject the
+    // out-of-subset generic-applied / non-named bound type precisely.
+    let mut bound_bus: Option<String> = None;
     if let CompSource::Transactor(t) = src {
         if !t.params.is_empty() {
             return Err(unsupported(
                 &format!("generic parameters on analysis-source `{name}`"),
                 "",
             ));
+        }
+        if let Some(bt) = t.bound_to.as_ref() {
+            match bt {
+                TypeExpr::Named { name: bn, generics, .. } => {
+                    if !generics.is_empty() {
+                        return Err(unsupported(
+                            &format!(
+                                "event-driven transactor `{name}` bound to a generic-applied \
+                                 bus type"
+                            ),
+                            "",
+                        ));
+                    }
+                    bound_bus = Some(
+                        bn.segments.last().map(|s| s.name.clone()).unwrap_or_default(),
+                    );
+                }
+                _ => {
+                    return Err(unsupported(
+                        &format!("event-driven transactor `{name}` bound to a non-named bus type"),
+                        "",
+                    ));
+                }
+            }
         }
     }
     if let CompSource::Env(c)
@@ -243,6 +282,26 @@ pub(crate) fn lower_component_schema(
             ComponentItem::Connect(_) => {}
             ComponentItem::Lifecycle(..) => {}
             ComponentItem::OnHandler(h) if h.periodic => periodic_asts.push(h),
+            // `on bus.<ch>.handshake(arg)` — the passive bus-monitor half
+            // of a bound transactor (v1's `emit_bound_monitor_actors`).
+            // This needs the handshake-monitor actor topology (a coroutine
+            // sampling valid&&ready on each channel, capturing the payload
+            // into a sub-scoreboard) which is a follow-up slice — reject it
+            // precisely rather than mis-lower the dotted-path event as a
+            // cycle-trigger predicate (which would fail on the bus method
+            // call in expression position).
+            ComponentItem::OnHandler(h) if is_bus_handshake_monitor(h) => {
+                return Err(unsupported(
+                    &format!(
+                        "an `on bus.<ch>.handshake(...)` passive monitor handler on bound \
+                         transactor `{name}`"
+                    ),
+                    "the handshake-monitor actor form (a coroutine sampling valid&&ready per \
+                     channel into a sub-scoreboard) is a follow-up slice; the bound-bus \
+                     event-driven DRIVER (`in event` + `on <ev>` driving `bus.<ch>.send/recv`) \
+                     is lowered",
+                ));
+            }
             ComponentItem::OnHandler(h) => on_asts.push(h),
             ComponentItem::Watchdog(w) => {
                 if watchdog_ast.is_some() {
@@ -273,6 +332,19 @@ pub(crate) fn lower_component_schema(
         .filter(|f| matches!(f.kind, ComponentFieldKind::Dut { .. }))
         .map(|f| f.name.as_str())
         .collect();
+    // A bound-bus event-driven transactor drives the bound bus's wires, not
+    // a private DUT handle — a module-typed field on it is ambiguous.
+    if bound_bus.is_some() && !dut_fields.is_empty() {
+        return Err(unsupported(
+            &format!(
+                "bound-to event-driven transactor `{name}` with a module-typed (DUT handle) \
+                 field ({})",
+                dut_fields.join(", ")
+            ),
+            "a bound-to transactor drives the bound bus's wires on the test DUT; it has no \
+             private DUT handle",
+        ));
+    }
     if dut_fields.len() > 1 {
         return Err(unsupported(
             &format!(
@@ -377,6 +449,7 @@ pub(crate) fn lower_component_schema(
         periodic_handlers,
         cycle_handlers,
         watchdog,
+        bound_bus,
     })
 }
 
@@ -394,6 +467,25 @@ fn is_event_subscription(h: &crate::ast::OnHandler, fields: &[ComponentFieldSche
     fields
         .iter()
         .any(|f| f.name == id.name && matches!(f.kind, ComponentFieldKind::Event { .. }))
+}
+
+/// True when `h` is an `on bus.<ch>.handshake(arg)` passive bus-monitor
+/// handler: its trigger is a `Call` whose callee is a `<bus>.<ch>.handshake`
+/// field-path. (The `bus` head is the bound-bus placeholder keyword inside
+/// a bound transactor; any dotted `.handshake(...)` call is the monitor
+/// shape — distinct from a bare-ident event subscription.)
+fn is_bus_handshake_monitor(h: &crate::ast::OnHandler) -> bool {
+    let ExprKind::Call { callee, .. } = &*h.event.kind else {
+        return false;
+    };
+    let ExprKind::Field { target, name: method } = &*callee.kind else {
+        return false;
+    };
+    if method.name != "handshake" {
+        return false;
+    }
+    // `<x>.<ch>.handshake` — the target must itself be a `<x>.<ch>` field.
+    matches!(&*target.kind, ExprKind::Field { .. })
 }
 
 /// Map the AST edge mode onto the IR cycle-edge enum.

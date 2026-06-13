@@ -1364,6 +1364,50 @@ reason. Code locations are authoritative.
       `regs.REG.FIELD` access and `addrmap` composition (incl. `alias of`)
       also stay rejected.
 
+21. **Bound-to event-driven driver (2026-06-13).** Composes the
+    event-driven-transactor consumer (divergence 11, unbound) with the
+    bound-bus handshake driver (divergence 15, hookable-BFM): a
+    `transactor X bound to <Bus>` with an `in event<T>` pipe + `on req(t)`
+    handler whose body drives the bound bus's handshake channels
+    (`bus.<ch>.send/recv`, `bus.<ch>.<sig>`) instead of a private DUT
+    handle. The full UVM-style sequencer→driver over a bound bus.
+    - *New schema field.* `ComponentSchema::bound_bus: Option<String>` —
+      the bus a bound event-driven transactor's `on <ev>` handler bodies
+      drive. `transactor_is_component`/`transactor_is_event_driven` now
+      route a `bound to` transactor to the composite-component table when
+      (and only when) it is event-driven (`in event` + `on` handler); a
+      bound hookable-BFM or `thread bus.<m>` responder still takes the
+      dedicated transactor path. A module-typed (DUT) field on a bound
+      transactor is rejected (it drives the bus, not a private DUT).
+    - *Body lowering.* No new IR and no new tbir codegen — the `on req`
+      handler is a synchronous component subscriber (divergence 11), and
+      its `bus.<ch>.send/recv` accesses CFG-inline to the same bounded
+      valid/ready spin loops as the bound-initiator BFM (divergence 15).
+      `lower_program` injects a per-component `LowerCtx` (now `#[derive(
+      Clone)]`) carrying the bound `BusDecl` under the placeholder prefix
+      (`transactors::INITIATOR_BUS_PLACEHOLDER`); the bodies otherwise
+      mirror the shared `method_ctx`.
+    - *Test binding.* `let xact : X active = bind axil` validates the
+      binding matches `bound_bus`, fills the placeholder prefix in the
+      (type-shared) on-handler bodies with the real binding name (reusing
+      `fill_initiator_bus_prefix`), and registers the instance as a
+      composite-component field. `active` mode required (the `on req`
+      driver lives under `when active`); one bound instance per type per
+      file (shared bodies). `emit xact.req(t)` fires the handler;
+      `xact.<state>` reads per-instance scalar state.
+    - *Fixture.* `transactor_active_test` (`AxiLiteRegs.sv`, pass,
+      trace-diff clean v1↔tbir at seed 1; registered).
+    - *Out of subset* (still rejected, precisely): the passive
+      handshake-MONITOR half (`on bus.<ch>.handshake(arg)` observers
+      sampling valid&&ready per channel into a sub-scoreboard — needs v1's
+      `emit_bound_monitor_actors` coroutine topology + a `ScoreboardSub`
+      field on a bound transactor) and a `passive` bound event-driven
+      instance. `lower_component_schema` names the monitor slice in its
+      rejection. Blocks `axilite_bound_mon_test`,
+      `axilite_multi_payload_test`, `transactor_passive_only_test`, and
+      (at `harc sim`) `transactor_parse_test` — the last is check-only, so
+      `harc check` passes.
+
 Minor, same spirit: `IndexVec` is a plain `Vec` plus typed id structs;
 the design's `AssertFail` enum collapsed into a single
 `FmtArgs on_fail` because both source forms bump `errors` identically
