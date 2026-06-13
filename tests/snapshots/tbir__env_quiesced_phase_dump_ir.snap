@@ -1,0 +1,98 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 EnvQuiescedPhaseTb { dut: Top }
+  test EnvQuiescedPhaseTest tb=tb0 run=fn1 check=fn2 clock=clk@10000ps(SysDomain)
+  record r0 TinyTxn
+    tag : uint<8>
+  component c0 Producer (agent)
+    field in_ev : out event<TinyTxn>
+    field seen : scalar = 0
+  component c1 HeartbeatEnv (env)
+    field prod : sub c0
+    field sb : sub scoreboard sb0
+
+fn fn0 comp_on_0 [kind=ComponentMethod(c0)]
+  params:
+    t : record(r0)
+  locals:
+    %0 t : record(r0)
+  entry = b0
+
+  b0:
+    ComponentFieldWrite(self.seen, (self.seen + 1))
+    -> Return
+
+fn fn1 run_EnvQuiescedPhaseTest [kind=Run, owner=tb0]
+  locals:
+    %0 i : unknown
+    %1 t : record(r0)
+    %2 drained : unknown
+    %3 __t0 : unknown
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.en, 0)
+    -> WaitCycles(2, b1)
+
+  b1:
+    DutWrite(dut.rst, 0)
+    -> WaitCycles(1, b2)
+
+  b2:
+    Assign(%i, 0)
+    -> Jump(b3)
+
+  b3:
+    -> Branch((%i < 3), b4, b6)
+
+  b4:
+    RecordInit(%t, r0)
+    RecordFieldWrite(%t.tag, %i)
+    ComponentEmit(top.prod.in_ev, [%t])
+    ScoreboardOp(top.sb, expected.push(%t.tag))
+    -> WaitCycles(3, b7)
+
+  b5:
+    Assign(%i, (%i + 1))
+    -> Jump(b3)
+
+  b6:
+    -> Jump(b8)
+
+  b7:
+    -> Jump(b5)
+
+  b8:
+    -> Branch(!ScoreboardQuery(top.sb.expected.empty()), b9, b10)
+
+  b9:
+    ScoreboardOp(top.sb, %drained = expected.pop())
+    ScoreboardOp(top.sb, popped = (ScoreboardQuery(top.sb.popped) + 1))
+    -> Jump(b8)
+
+  b10:
+    Assign(%__t0, 200)
+    -> WaitUntilTimeout { (top.prod.idle(8) && top.sb.idle(8)), (top.prod.seen == 3) [all_of], cycles: %__t0, fire: b11, timeout: b12 }
+
+  b11:
+    -> Return
+
+  b12:
+    FailDiag { "environment did not quiesce" }
+    FailDiag { unless: (top.prod.idle(8) && top.sb.idle(8)), "  not yet true: _tb.top.quiesced(8)" }
+    FailDiag { unless: (top.prod.seen == 3), "  not yet true: _tb.top.prod.seen == 3" }
+    -> Jump(b11)
+
+fn fn2 check_EnvQuiescedPhaseTest [kind=Check, owner=tb0]
+  entry = b0
+
+  b0:
+    AssertCheck { cond: (top.prod.seen == 3), on_fail: "expected producer to see 3 transactions, got %lld", top.prod.seen }
+    AssertCheck { cond: ScoreboardQuery(top.sb.expected.empty()), on_fail: "scoreboard queue did not drain" }
+    AssertCheck { cond: (ScoreboardQuery(top.sb.popped) == 3), on_fail: "expected 3 pops, got %lld", ScoreboardQuery(top.sb.popped) }
+    Log(info, "PASS: environment drain/check phases completed")
+    -> Return

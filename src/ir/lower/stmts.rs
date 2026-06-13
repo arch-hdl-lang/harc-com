@@ -224,7 +224,7 @@ impl FuncBuilder<'_> {
                 // `sb.expected.push(x)`. `.pop()` in statement position is
                 // rejected below (its value must be bound).
                 if let ExprKind::Call { callee, args } = &*e.kind {
-                    if let Some((sb, field, queue, method)) =
+                    if let Some((sb, field, queue, method, nested_path)) =
                         self.as_scoreboard_queue_call(callee)
                     {
                         if method == "push" {
@@ -243,6 +243,7 @@ impl FuncBuilder<'_> {
                                 sb,
                                 field,
                                 op: crate::ir::ScoreboardOp::QueuePush { queue, value },
+                                nested_path,
                             });
                             return Ok(());
                         }
@@ -388,7 +389,7 @@ impl FuncBuilder<'_> {
             return Ok(());
         }
         // `let v = sb.q.pop()` — pop the queue front into a new local.
-        if let Some((sb, field, queue)) = self.as_scoreboard_pop(value)? {
+        if let Some((sb, field, queue, nested_path)) = self.as_scoreboard_pop(value)? {
             let id = self.declare(&l.name.name);
             if let Some(w) = declared_width {
                 self.let_widths.insert(id, w);
@@ -397,6 +398,7 @@ impl FuncBuilder<'_> {
                 sb,
                 field,
                 op: crate::ir::ScoreboardOp::QueuePop { queue, dest: id },
+                nested_path,
             });
             return Ok(());
         }
@@ -524,13 +526,14 @@ impl FuncBuilder<'_> {
         // Scoreboard scalar-counter write: `sb.writes = sb.writes + 1`
         // (classic) / `_tb.sb.writes = ...` (impl-form, post-desugar).
         if let ExprKind::Field { target: ft, name } = &*target.kind {
-            if let Some((sb, field)) = self.scoreboard_root(ft) {
+            if let Some((sb, field, nested_path)) = self.scoreboard_root(ft) {
                 let scalar = self.scoreboard_scalar_field(sb, &name.name)?;
                 let e = self.lower_expr_no_ports(value)?;
                 self.push(Stmt::ScoreboardOp {
                     sb,
                     field,
                     op: crate::ir::ScoreboardOp::ScalarWrite { scalar, value: e },
+                    nested_path,
                 });
                 return Ok(());
             }
@@ -555,7 +558,7 @@ impl FuncBuilder<'_> {
                 // the reference surface is v1's. The value lowering
                 // below rejects it with a precise message.
                 // `v = sb.q.pop()` — pop into an existing local.
-                if let Some((sb, field, queue)) = self.as_scoreboard_pop(value)? {
+                if let Some((sb, field, queue, nested_path)) = self.as_scoreboard_pop(value)? {
                     if self.record_of_local(local).is_some() {
                         return Err(unsupported(
                             &format!(
@@ -570,6 +573,7 @@ impl FuncBuilder<'_> {
                         sb,
                         field,
                         op: crate::ir::ScoreboardOp::QueuePop { queue, dest: local },
+                        nested_path,
                     });
                     return Ok(());
                 }
@@ -677,45 +681,95 @@ impl FuncBuilder<'_> {
     pub(crate) fn as_scoreboard_queue_call(
         &self,
         callee: &crate::ast::Expr,
-    ) -> Option<(crate::ir::ScoreboardId, String, String, String)> {
+    ) -> Option<(crate::ir::ScoreboardId, String, String, String, Option<Vec<String>>)> {
         let ExprKind::Field { target, name: method } = &*callee.kind else {
             return None;
         };
         let ExprKind::Field { target: sb_t, name: queue } = &*target.kind else {
             return None;
         };
-        let (sb, field) = self.scoreboard_root(sb_t)?;
-        Some((sb, field, queue.name.clone(), method.name.clone()))
+        let (sb, field, nested) = self.scoreboard_root(sb_t)?;
+        Some((sb, field, queue.name.clone(), method.name.clone(), nested))
     }
 
-    /// Resolve a scoreboard-field access root: `sb` (classic form) or
-    /// `_tb.sb` (impl-form, after the desugaring rewrote the field
-    /// prefix). Returns `(scoreboard id, field name)` when `sb` is a
-    /// scoreboard testbench field of this test.
+    /// Resolve a scoreboard-field access root. Three forms:
+    ///   * `sb` (classic) / `_tb.sb` (impl) — a scoreboard TESTBENCH
+    ///     field; returns `nested_path = None` (emission uses `_tb.<sb>`).
+    ///   * `top.sb` / `_tb.top.sb` — a data-only scoreboard held as an
+    ///     ENV sub-component; returns `nested_path = Some(["top","sb"])`
+    ///     (emission uses the dotted run-scope path verbatim).
+    /// The returned `field` is the resolved access leg name (the last
+    /// segment) — used only for the testbench-field-form diagnostics.
     pub(crate) fn scoreboard_root(
         &self,
         e: &crate::ast::Expr,
-    ) -> Option<(crate::ir::ScoreboardId, String)> {
+    ) -> Option<(crate::ir::ScoreboardId, String, Option<Vec<String>>)> {
+        // Testbench-field form first (single-segment, possibly `_tb`-
+        // prefixed): keeps the established `_tb.<field>` emission.
         match &*e.kind {
-            // Impl-form: `_tb.sb`.
             ExprKind::Field { target, name } => {
-                let tb_field = self.ctx.tb_field.as_deref()?;
-                let ExprKind::Ident(root) = &*target.kind else {
-                    return None;
-                };
-                if root.name != tb_field {
-                    return None;
+                if let Some(tb_field) = self.ctx.tb_field.as_deref() {
+                    if let ExprKind::Ident(root) = &*target.kind {
+                        if root.name == tb_field {
+                            if let Some(&sb) = self.ctx.scoreboard_fields.get(&name.name) {
+                                return Some((sb, name.name.clone(), None));
+                            }
+                        }
+                    }
                 }
-                let &sb = self.ctx.scoreboard_fields.get(&name.name)?;
-                Some((sb, name.name.clone()))
             }
-            // Classic form (no testbench desugaring): bare `sb`.
             ExprKind::Ident(root) => {
-                let &sb = self.ctx.scoreboard_fields.get(&root.name)?;
-                Some((sb, root.name.clone()))
+                if let Some(&sb) = self.ctx.scoreboard_fields.get(&root.name) {
+                    return Some((sb, root.name.clone(), None));
+                }
             }
-            _ => None,
+            _ => {}
         }
+        // Env-nested form: `<env-local>.<subs...>.<scoreboard-sub>`. The
+        // impl-for desugaring prefixes a testbench-field env with `_tb`
+        // (`_tb.top.sb`) — strip it so both bindings resolve through
+        // `component_fields` by the bare head name.
+        let raw = super::components::dotted_path(e)?;
+        let path = self.strip_tb_prefix(&raw).to_vec();
+        if path.len() < 2 {
+            return None;
+        }
+        let &head_cid = self.ctx.component_fields.get(&path[0])?;
+        let (sid, nested) = self.resolve_scoreboard_sub(head_cid, &path[1..], path[0].clone())?;
+        Some((sid, path.last().unwrap().clone(), Some(nested)))
+    }
+
+    /// Walk a sub-component path from an env head down to a data-only
+    /// `ScoreboardSub` leaf. `segs` is the path after the head local;
+    /// `acc` accumulates the full dotted access path (starting with the
+    /// head local name). Returns the leaf scoreboard id + the full path.
+    fn resolve_scoreboard_sub(
+        &self,
+        head: crate::ir::ComponentId,
+        segs: &[String],
+        acc_head: String,
+    ) -> Option<(crate::ir::ScoreboardId, Vec<String>)> {
+        let mut cid = head;
+        let mut acc = vec![acc_head];
+        for (i, seg) in segs.iter().enumerate() {
+            let comp = &self.ctx.components[cid.index()];
+            match comp.field(seg).map(|f| &f.kind) {
+                Some(crate::ir::ComponentFieldKind::Sub { component }) => {
+                    cid = *component;
+                    acc.push(seg.clone());
+                }
+                Some(crate::ir::ComponentFieldKind::ScoreboardSub { scoreboard }) => {
+                    // A scoreboard sub must be the terminal segment.
+                    if i != segs.len() - 1 {
+                        return None;
+                    }
+                    acc.push(seg.clone());
+                    return Some((*scoreboard, acc));
+                }
+                _ => return None,
+            }
+        }
+        None
     }
 
     /// Recognize `sb.<queue>.pop()` as a value expression and validate
@@ -724,11 +778,12 @@ impl FuncBuilder<'_> {
     fn as_scoreboard_pop(
         &self,
         e: &crate::ast::Expr,
-    ) -> Result<Option<(crate::ir::ScoreboardId, String, String)>, LowerError> {
+    ) -> Result<Option<(crate::ir::ScoreboardId, String, String, Option<Vec<String>>)>, LowerError>
+    {
         let ExprKind::Call { callee, args } = &*e.kind else {
             return Ok(None);
         };
-        let Some((sb, field, queue, method)) = self.as_scoreboard_queue_call(callee) else {
+        let Some((sb, field, queue, method, nested)) = self.as_scoreboard_queue_call(callee) else {
             return Ok(None);
         };
         if method != "pop" {
@@ -744,7 +799,7 @@ impl FuncBuilder<'_> {
         }
         // Validate the queue field exists and is a queue.
         self.scoreboard_queue_field(sb, &queue)?;
-        Ok(Some((sb, field, queue)))
+        Ok(Some((sb, field, queue, nested)))
     }
 
     /// Validate that `<field>` is a declared scalar field of scoreboard

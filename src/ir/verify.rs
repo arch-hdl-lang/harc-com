@@ -566,8 +566,8 @@ impl Checker<'_> {
                     }
                     self.check_fmt_args(args);
                 }
-                Stmt::ScoreboardOp { sb, field, op } => {
-                    self.check_scoreboard(*sb, field);
+                Stmt::ScoreboardOp { sb, field, op, nested_path } => {
+                    self.check_scoreboard(*sb, field, nested_path.is_some());
                     match op {
                         crate::ir::ScoreboardOp::QueuePush { queue, value } => {
                             self.check_scoreboard_queue(*sb, queue);
@@ -695,13 +695,20 @@ impl Checker<'_> {
 
     /// The scoreboard id must resolve and `field` must be a
     /// scoreboard-typed field of the owning testbench bound to it.
-    fn check_scoreboard(&mut self, sb: crate::ir::ScoreboardId, field: &str) {
+    fn check_scoreboard(&mut self, sb: crate::ir::ScoreboardId, field: &str, nested: bool) {
         if sb.index() >= self.prog.scoreboards.len() {
             self.errs.push(VerifyError::BadScoreboard {
                 func: self.fid,
                 block: self.bid,
                 detail: format!("scoreboard id sb{} does not resolve", sb.0),
             });
+            return;
+        }
+        // An env-nested data scoreboard (`top.sb`) is a sub-component of
+        // the env local, not a testbench field — the binding check below
+        // only applies to the `_tb.<field>` form. The sb id already
+        // resolved above; that is sufficient for the nested form.
+        if nested {
             return;
         }
         let bound = self
@@ -893,8 +900,8 @@ impl Checker<'_> {
             // Idle predicate: the base/kind are resolved at lowering; only
             // the threshold sub-expression carries verifiable structure.
             Expr::ComponentIdle { n, .. } => self.check_expr(n, ports_ok, context),
-            Expr::ScoreboardQuery { sb, field, query } => {
-                self.check_scoreboard(*sb, field);
+            Expr::ScoreboardQuery { sb, field, query, nested_path } => {
+                self.check_scoreboard(*sb, field, nested_path.is_some());
                 match query {
                     crate::ir::ScoreboardQuery::Scalar { scalar } => {
                         self.check_scoreboard_scalar(*sb, scalar)

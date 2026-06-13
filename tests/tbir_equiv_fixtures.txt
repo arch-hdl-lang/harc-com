@@ -112,6 +112,7 @@ wait_until_quiesce_test | Top | top_counter.sv | - | pass
 agent_periodic_test | Top | top_counter.sv | - | pass
 watchdog_quiesce_test | Top | top_counter.sv | - | pass
 watchdog_trip_diagnostic_test | Top | top_counter.sv | - | fail
+env_quiesced_phase_test | Top | top_counter.sv | - | pass
 transactor_state_field_test | Mshr_Addr_Cam_Dual | cam_dual_basic.sv | - | pass
 axilite_seqdrv_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 event_driven_transactor_test | Top | top_counter.sv | top_counter.arch | pass

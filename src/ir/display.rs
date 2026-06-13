@@ -180,6 +180,9 @@ impl Display for TbProgram {
                     }
                     ComponentFieldKind::Sub { component } => format!("sub c{}", component.0),
                     ComponentFieldKind::Dut { dut_type } => format!("dut {dut_type}"),
+                    ComponentFieldKind::ScoreboardSub { scoreboard } => {
+                        format!("sub scoreboard sb{}", scoreboard.0)
+                    }
                 };
                 writeln!(f, "    field {} : {desc}", fld.name)?;
             }
@@ -381,8 +384,12 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
             ),
             None => format!("FailDiag {{ {} }}", fmt_args_str(func, args)),
         },
-        Stmt::ScoreboardOp { sb, field, op } => {
-            format!("ScoreboardOp(sb{}.{field}, {})", sb.0, sb_op_str(func, op))
+        Stmt::ScoreboardOp { sb, field, op, nested_path } => {
+            let access = match nested_path {
+                Some(p) => p.join("."),
+                None => format!("sb{}.{field}", sb.0),
+            };
+            format!("ScoreboardOp({access}, {})", sb_op_str(func, op))
         }
         Stmt::ComponentFieldWrite { base, field, value } => format!(
             "ComponentFieldWrite({}.{field}, {})",
@@ -598,8 +605,12 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         }
         Expr::TbField(field) => format!("_tb.{field}"),
         Expr::TransactorState { instance, field } => format!("{instance}.{field}"),
-        Expr::ScoreboardQuery { sb, field, query } => {
-            format!("ScoreboardQuery(sb{}.{field}.{})", sb.0, sb_query_str(query))
+        Expr::ScoreboardQuery { sb, field, query, nested_path } => {
+            let access = match nested_path {
+                Some(p) => p.join("."),
+                None => format!("sb{}.{field}", sb.0),
+            };
+            format!("ScoreboardQuery({access}.{})", sb_query_str(query))
         }
         Expr::ComponentField { base, field } => {
             format!("{}.{field}", comp_base_str(base))

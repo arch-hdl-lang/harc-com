@@ -33,6 +33,7 @@ checked against the code at the cited location.
 | sequencer slice (2026-06-13) | `sequencer` construct (builds on the env-composition + agent/on-handler core, `src/ir/lower/components.rs`): a `sequencer` is the analysis-source component shape — an `out event<T>` analysis port plus `hookable` methods that generate a stimulus stream and `emit` each item on that port. It routes through the same `CompSource`/`ComponentSchema` machinery as a method-bearing scoreboard or analysis-source transactor; the only addition is `ComponentKindTag::Sequencer` (+ `CompSource::Sequencer`) for dump-ir/diagnostics. A `connect <sqr>.dispatched -> <drv>.<sink>` edge inside the composing env wires the emitted stream into a sink method (the UVM sequencer/driver bridge). No new IR variants, no new statement/expr forms — sequencer methods, `emit`, and `connect` all reuse the existing component lowering. Fixture: `sequencer_connect_test` (`top_counter.sv`/`top_counter.arch`, pass) — a `dispatch(n)` hookable emitting over a literal-range `for i in 0 .. n` loop, connected to a scoreboard sink; trace-diff clean v1↔tbir at seed 1. The three corpus sequencer fixtures (`axilite_connect_test`, `transactor_agent_mode_test`, `transactor_env_mode_test`) stay blocked: each iterates a `tseq` (`for t in <TSeq>` + `randomize`) inside its `dispatch`, and the agent/env fixtures additionally stack mode-inheritance + cycle-trigger `on dut.x && dut.y` handlers; those gate on the `tseq`/`randomize-in-tseq` + agent-mode slices (divergence 16). |
 | event-record-payload slice (2026-06-13) | `event<transaction>` / `event<struct>` analysis ports — **non-scalar event channels carrying a value-record payload** (the heartbeat/quiesce cluster's blocker; #376 rejected these as a soundness measure). `ComponentFieldKind::Event` now carries an `EventPayload` (`Scalar { signed }` \| `Record(RecordId)`) instead of a bare `signed: bool`, and `OnHandlerSchema::arg_signed` becomes `arg_payload: EventPayload`. Field lowering (`lower_event_payload`, `src/ir/lower/components.rs`) resolves a payload that parses as `TypeArg::Type(Named)` or `TypeArg::Expr(Ident)` against the `record_ids` table — a known transaction/struct → `Record`, a scalar ≤ 64 bits → `Scalar`, anything else (enum/Vec/nested/`TypeArg::Named` keyword arg) is rejected precisely. An `on in_ev(t)` handler whose event is a record now binds a record-typed param (`IrType::Record(rid)`), so `t.field` reads in the body resolve against the schema; `emit prod.in_ev(t)` carries the record local. The tbir backend mirrors v1's `payload_type_for_arg`: the event field becomes `std::vector<std::function<void(<RecordName>)>>` (`runtime::event_payload_cty`) and the component-fn lambda renders a record param by value (`func.rs`); the `[&](auto _t)` subscriber/connect lambdas were already payload-generic. No new statement/expr forms — `emit`/`on`/`connect` reuse the existing component lowering. Fixtures unlocked (both `top_counter.sv`, pass, trace-diff clean v1↔tbir at seed 1): `heartbeat_idle_test` (agent + record-payload event + `on` handler + `idle_in` poll) and `wait_until_quiesce_test` (same + `wait until all of … timeout`, already supported by the agent slice). `watchdog_quiesce_test` (a `watchdog` directive) and `env_quiesced_phase_test` (a data-only `scoreboard` SUB-component in an env + `phase` + `quiesced(N)`) stay rejected — separate slices. See divergence 17. |
 | watchdog + periodic slice (2026-06-13) | `watchdog ... end watchdog` lifecycle directive (spec §8.6) + `on <N> cycles` periodic handlers (spec §7.10) in the agent/component subset (`src/ir/lower/components.rs`). New IR: `ComponentSchema::watchdog: Option<WatchdogSchema>` (`period`/`max_idle` clause exprs + a zero-arg body `function`), `ComponentSchema::periodic_handlers: Vec<PeriodicHandlerSchema>` (`period` expr + body `function`), and `Expr::CycleCount` (a bare `cycle_count` ident — the framework cycle counter, conventionally referenced from `${cycle_count}` in a watchdog/log diagnostic). Lowering: a `watchdog` lowers to a zero-arg `ComponentMethod` body (the user heartbeat statements; field reads self-relative); `period`/`max_idle` lower in the same self-component context (a field-backed clause reads `self.<field>`). A `disabled` watchdog emits nothing (no FunctionId, no schema entry — mirrors v1's `emit_watchdog` early return). An `on <N> cycles` handler lowers to a zero-arg `ComponentMethod` body + its period expr; pass-1 reserves FunctionIds methods→event-on-handlers→periodic→watchdog so the table stays monotonic. The tbir backend installs one per-instance `_checkers` closure per watchdog/periodic (recursing into sub-components), gated on a uniquely-named `static` last-fire stamp; the watchdog closure runs the body then the idle check (`_last_in_cycle`/`_last_out_cycle` ≥ `max_idle` ⇒ `FAIL` + `errors++`). The period/max_idle exprs render against the instance path via `ECx::self_subst` (`SelfField` → instance, since the closure has no `self`). Fixtures (all `top_counter.sv`, trace-diff clean v1↔tbir at seed 1): `watchdog_quiesce_test` (agent + watchdog over a record-payload event, never trips — pass), `watchdog_trip_diagnostic_test` (silent agent, watchdog trips every firing from cycle 200 — `fail`, 9 identical FAIL lines), `agent_periodic_test` (self-proving `on 10 cycles` firing 3× in 35 cycles — pass). `quiesced(N)` env aggregation and named `phase` orchestration stay rejected (`env_quiesced_phase_test` still blocked). See divergence 18. |
+| env quiesced + phase + data-scoreboard-sub slice (2026-06-13) | the heartbeat/quiesce cluster's last three blockers (`src/ir/lower/{components,stmts,mod}.rs`, divergence 19): (1) **data-only `scoreboard` as an env SUB-component** — new `ComponentFieldKind::ScoreboardSub { scoreboard: ScoreboardId }` (field lowering resolves a `Named` type against `scoreboard_ids` before the component table), accessed by the nested run-scope path via a new `nested_path: Option<Vec<String>>` on `Stmt::ScoreboardOp` / `Expr::ScoreboardQuery` (`None` = the established `_tb.<field>` form, `Some(path)` = the dotted env-nested path `top.sb`); the scoreboard struct now always emits `_last_in/out_cycle` (matching v1's unconditional `emit_scoreboard` — a latent tbir omission this slice also closes); (2) **`<env>.quiesced(N)`** — no new IR variant: `as_component_quiesced` + `collect_quiesce_leaves` walk the receiver's sub-component tree (mirroring v1's `collect_quiesced_paths`) and expand to an AND of `Expr::ComponentIdle { kind: Both }` over every leaf (`top.quiesced(8)` → `top.prod.idle(8) && top.sb.idle(8)`); (3) **named `phase <name>`** — no new IR variant: each phase block is collected into a name→block map and a `<name>()` call site in the run/check body is INLINED with the phase's statements (recursively; a cycle is rejected), matching v1's captured-lambda-plus-call (the body runs at the call site inside the coroutine). Fixture `env_quiesced_phase_test` (`top_counter.sv`, pass) exercises all three; trace-diff clean v1↔tbir at seed 1. `event<enum/Vec/nested>` payloads, `on <expr>` cycle-trigger handlers, and `tseq` stay rejected. |
 | transactor-state-field slice (2026-06-13) | persistent **scalar STATE fields on the unbound DUT-poking transactor** (`transactor SeqXactor { dut : DUT; last_read : uint<32> default 0; ... }`) — divergence 10. The bound-to TARGET responder form already materialized state fields (#371); this extends the SAME machinery (`TbScalarFieldSchema`, `Expr::TransactorState` / `Stmt::TransactorStateWrite`, `target_state_struct_inst`) to the unbound BFM. No new IR variants. `lower/transactors.rs` (unbound path) now classifies a `Builtin`-typed field as scalar state (vs the single `Named` module-typed DUT handle) via the shared `lower_state_field`, and sets each method builder's `target_state_fields` so bare-name reads/writes (`last_read = dut.x`; `n = n + 1`) lower to `TransactorState`/`TransactorStateWrite` with an empty instance placeholder. At test-binding (`lower/mod.rs`) each stateful unbound instance registers in the `target_state` map (so the test reads `xact.last_read`) and fills its name into the type-shared method bodies; `as_transactor_state` (`lower/exprs.rs`) now also resolves the impl-for-desugared `_tb.<instance>.<field>` shape. Emission (`codegen/tbir/mod.rs`) declares one per-instance state struct (`runtime::target_state_struct_inst`) BEFORE the method lambdas, so the `[&]`-captured lambdas and the run/check coroutine share it. New `TestbenchSchema::unbound_state_actors` records which instances need a struct. Subset: ONE stateful instance per transactor type per file (the bodies are type-shared) — a second is rejected precisely (`stateful_type_seen` guard, independent of whether the type has methods). Fixture: `transactor_state_field_test` (self-proving, `cam_dual_basic.sv`, pass) — a CAM BFM whose `do_probe(key)` stashes `dut.search_first`/`dut.search_any` into state and bumps a `probe_count` accumulator, read back at test scope; trace-diff clean v1↔tbir at seed 1. The three sequencer/mode corpus fixtures advance past the state-field blocker but stop at their NEXT tier (residual map below): `axilite_seqdrv_test`/`axilite_connect_test` on the `req : in event<RegOp>` directional field (event-driven transactor); `transactor_active_test` on the bound-to event field; `axilite_hooks_test` on a record-typed (transaction) method param + pre/post hooks; `transactor_agent_mode_test`/`transactor_env_mode_test` on the multi-module-field (`dut` + `sb`) agent-mode form. |
 | event-driven-transactor slice (2026-06-13) | **consumer side of the analysis-event machinery** — an unbound `transactor` with an `in event<T>` input pipe driven by an `on req(t)` handler (the UVM driver's `req` sink). `transactor_is_component` now routes such a transactor through the **composite-component** table (it already supports `event` fields, `on` handlers, `emit`, and `connect`) rather than the DUT-poking `TransactorSchema` — even when the transactor carries a module-typed DUT handle field. New IR: `ComponentFieldKind::Dut { dut_type }` (the `V<dut_type>* dut = nullptr;` handle the handler pokes), and `ConnectEdgeSchema::sink` becomes a `ConnectSink { Method { method } \| Event { event } }` enum so a `connect` edge can feed an `in event` pipe (event→event bridge) as well as a hookable sink. Field lowering (`lower/components.rs`) accepts `in event<T>` ON A TRANSACTOR (still rejected elsewhere) and a non-component `Named` type as the single DUT handle (named `dut`); the `on` handler body reuses the component-method lowering, so its `wait N cycles` lower to `WaitCycles(n, None, …)` → v1's synchronous `for(_w) tick();` (the handler is a sync subscriber, not a coroutine actor) and `dut.<sig> = x` lower to `DutWrite` via the shared `ctx.dut_field = "dut"`. `emit drv.req(t)` (test scope) → `ComponentEmit` fan-out over the pipe's subscriber list; `connect <sqr>.dispatched -> <drv>.req` → the source event's bridge closure iterates the sink event's subscribers (`for(auto& _s : drv.req) _s(_t);`). The DUT bind (`drv.dut = dut`) is erased like the `TransactorSchema` bind — the handler's `DutWrite`s already target the test `dut` pointer. An `active`/`passive` mode IS accepted on these (a transactor concept): `active` required, `passive` rejected. Fixtures: `event_driven_transactor_test` (self-proving, `top_counter.sv`/`top_counter.arch`, pass) — direct `emit drv.req(n)` + a sequencer→transactor `connect` event bridge, both pulsing `en` and latching `count_out`; `axilite_seqdrv_test` (corpus, `AxiLiteRegs.sv`, pass) — sequencer→transactor full AXI-Lite write/read round-trip via direct emit. Both trace-diff clean v1↔tbir at seed 1. **Still rejected** (residual map): `transactor_active_test` (bound-to `transactor X bound to <Bus>` event-driven form — needs the coroutine-actor + bus-binding driver, a separate slice) and `axilite_connect_test` (its env holds a data-only `scoreboard` SUB-component with through-env `queue` access — the env-field-binding/data-scoreboard-sub slice, not the event-driven-transactor surface). |
 
@@ -279,10 +280,43 @@ idle check). `Expr::CycleCount` carries the framework `cycle_count` for
 never trips), `watchdog_trip_diagnostic_test` (fail, trips from cycle
 200), `agent_periodic_test` (pass, self-proving 3×) trace-diff clean.
 
+The **env quiesced(N) + phase + data-scoreboard-sub subset** (added
+2026-06-13, `src/ir/lower/{components,stmts,mod}.rs`, divergence 19)
+closes the heartbeat/quiesce cluster's last three blockers:
+
+1. **Data-only `scoreboard` as an env SUB-component** — a method-less
+   `scoreboard` (a `ScoreboardSchema`, not a `ComponentSchema`) bound as
+   an env field (`sb : DrainSb`). New IR
+   `ComponentFieldKind::ScoreboardSub { scoreboard: ScoreboardId }`
+   (distinct from `Sub`, which references a `ComponentId`). Field
+   lowering resolves a `Named` type against the `scoreboard_ids` table
+   before the component table. Access uses the nested run-scope path
+   (`top.sb.expected.push(...)`, not `_tb.sb`): `Stmt::ScoreboardOp` and
+   `Expr::ScoreboardQuery` carry a new `nested_path: Option<Vec<String>>`
+   (`None` = the established `_tb.<field>` testbench-field form,
+   `Some(path)` = the dotted env-nested path). The scoreboard struct now
+   always emits the `_last_in/out_cycle` activity stamps (matching v1's
+   unconditional `emit_scoreboard` — tbir previously omitted them, a
+   latent divergence this slice also closes).
+2. **`<env>.quiesced(N)`** — env-level aggregation, no new IR variant.
+   `as_component_quiesced` walks the receiver's sub-component tree
+   (`collect_quiesce_leaves`, mirroring v1's `collect_quiesced_paths`)
+   and expands to an AND of `Expr::ComponentIdle { kind: Both }` over
+   every LEAF (a component with no sub-components, or a `ScoreboardSub`),
+   e.g. `top.quiesced(8)` → `top.prod.idle(8) && top.sb.idle(8)`.
+3. **Named `phase <name>`** — orchestration, no new IR variant. Each
+   `phase` block is collected into a name→block map; a `<name>()` call
+   site in the run/check body is INLINED with the phase's statements
+   (recursively; a cycle is rejected). v1 emits a captured `[&]() ->
+   void` lambda + a plain call — observably identical, since the body
+   runs at the call site inside the run/check coroutine.
+
+Fixture `env_quiesced_phase_test` (`top_counter.sv`, pass) exercises all
+three; trace-diff clean v1↔tbir at seed 1.
+
 **Out of subset** (precise rejections): non-record/non-scalar event
-payloads (enum / Vec / nested), `quiesced(N)`, named `phase`,
-a data-only `scoreboard`/`queue` SUB-component inside an env, `on
-<expr>` cycle-trigger handlers, `tseq`. Those gate on later slices.
+payloads (enum / Vec / nested), `on <expr>` cycle-trigger handlers,
+`tseq`. Those gate on later slices.
 
 ### The equivalence matrix
 
@@ -1159,6 +1193,59 @@ reason. Code locations are authoritative.
       `quiesced(N)` env aggregation and named `phase` orchestration —
       `env_quiesced_phase_test` (a data-only `scoreboard` SUB-component in
       an env + `phase` + `quiesced(N)`) stays blocked.
+
+19. **Env `quiesced(N)` + named `phase` + data-only `scoreboard`
+    SUB-component (2026-06-13).** Closes the heartbeat/quiesce cluster's
+    last three blockers (`env_quiesced_phase_test`).
+    - *New IR.* `ComponentFieldKind::ScoreboardSub { scoreboard:
+      ScoreboardId }` — a data-only `scoreboard` (a `ScoreboardSchema`,
+      NOT a `ComponentSchema`) held as an env sub-component; distinct from
+      `Sub` (which references a `ComponentId`) because the two lower to
+      different schema tables. `Stmt::ScoreboardOp` and
+      `Expr::ScoreboardQuery` gain `nested_path: Option<Vec<String>>`
+      (`None` = the established `_tb.<field>` testbench-field access,
+      `Some(path)` = the dotted env-nested path, e.g. `["top","sb"]`).
+      `quiesced(N)` and `phase` add NO IR variants. All exhaustive matches
+      (display, verify, tbir codegen, field lowering) updated.
+    - *Lowering.* Field lowering resolves a `Named` type against the
+      `scoreboard_ids` table BEFORE the component table (a data board
+      becomes `ScoreboardSub`, a method-bearing one stays `Sub`).
+      `scoreboard_root` (`stmts.rs`) gained an env-nested arm: it strips a
+      `_tb` prefix, resolves the head through `component_fields`, walks
+      `Sub` segments to a terminal `ScoreboardSub`, and returns the full
+      dotted access path as `nested_path`. `as_component_quiesced`
+      (`components.rs`) walks the receiver sub-component tree
+      (`collect_quiesce_leaves`, mirroring v1's `collect_quiesced_paths`)
+      and expands `<env>.quiesced(N)` to an AND of `Expr::ComponentIdle {
+      kind: Both }` over every leaf (a component with no sub-components, or
+      a `ScoreboardSub`): `top.quiesced(8)` → `top.prod.idle(8) &&
+      top.sb.idle(8)`. Named `phase` blocks are collected into a name→block
+      map; `expand_phase_calls` (`mod.rs`) inlines each `<name>()` call
+      site in the run/check stmt list with the phase body (recursively; a
+      cycle is rejected). `verify::check_scoreboard` skips the
+      testbench-field binding check when `nested_path.is_some()` (the board
+      lives inside the env, not on `_tb`).
+    - *Codegen.* The tbir scoreboard struct now always emits the
+      `_last_in/out_cycle` activity stamps (v1's `emit_scoreboard` always
+      did — tbir previously omitted them, a latent divergence this slice
+      closes; the stamps are needed because `quiesced` reads
+      `top.sb._last_in_cycle`). `ScoreboardOp`/`ScoreboardQuery` emission
+      joins `nested_path` directly when present, else falls back to
+      `_tb.<field>`. The env `component_struct` emits a `ScoreboardSub`
+      field by its scoreboard-struct name.
+    - *Implementation divergence from v1 only.* v1 emits each `phase` as a
+      captured `[&]() -> void` lambda plus a `<name>()` call; tbir inlines
+      the phase body at the call site. Observably identical — the body runs
+      in the run/check coroutine context either way — verified by
+      trace-diff.
+    - *Fixture.* `env_quiesced_phase_test` (`top_counter.sv`, `pass`):
+      a `Producer` agent + a `DrainSb` data scoreboard as env subs, a
+      `phase drain` doing `wait until all of top.quiesced(8),
+      top.prod.seen == 3 timeout 200 cycles`, the run filling/draining
+      `top.sb.expected` and calling `drain()`. Trace-diff clean v1↔tbir
+      at seed 1; registered.
+    - *Out of subset* (still rejected): `event<enum/Vec/nested>` payloads,
+      `on <expr>` cycle-trigger handlers, `tseq`.
 
 Minor, same spirit: `IndexVec` is a plain `Vec` plus typed id structs;
 the design's `AssertFail` enum collapsed into a single

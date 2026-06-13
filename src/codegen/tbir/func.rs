@@ -686,20 +686,26 @@ fn emit_stmt(
             }
             None => emit_log_call(out, cx, "FAIL", None, args, depth)?,
         },
-        Stmt::ScoreboardOp { field, op, .. } => {
+        Stmt::ScoreboardOp { field, op, nested_path, .. } => {
             use crate::ir::ScoreboardOp;
+            // `None` → testbench field (`_tb.<field>`); `Some(path)` →
+            // env-nested data scoreboard, accessed by the run-scope path.
+            let base = match nested_path {
+                Some(p) => p.join("."),
+                None => format!("_tb.{field}"),
+            };
             match op {
                 ScoreboardOp::QueuePush { queue, value } => {
                     let e = expr_cpp(cx, value)?;
-                    writeln!(out, "{pad}_tb.{field}.{queue}.push({e});").ok();
+                    writeln!(out, "{pad}{base}.{queue}.push({e});").ok();
                 }
                 ScoreboardOp::QueuePop { queue, dest } => {
                     let name = &names[dest.index()];
-                    writeln!(out, "{pad}{name} = _tb.{field}.{queue}.pop();").ok();
+                    writeln!(out, "{pad}{name} = {base}.{queue}.pop();").ok();
                 }
                 ScoreboardOp::ScalarWrite { scalar, value } => {
                     let e = expr_cpp(cx, value)?;
-                    writeln!(out, "{pad}_tb.{field}.{scalar} = {e};").ok();
+                    writeln!(out, "{pad}{base}.{scalar} = {e};").ok();
                 }
             }
         }

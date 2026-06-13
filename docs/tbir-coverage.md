@@ -31,8 +31,14 @@ slice (2026-06-13)** then lowers the `watchdog` lifecycle directive
 (§8.6) + `on <N> cycles` periodic handlers (§7.10), fully unlocking
 `watchdog_quiesce_test` (pass), `watchdog_trip_diagnostic_test` (fail —
 trips from cycle 200), and the self-proving `agent_periodic_test` (pass).
-Only `env_quiesced_phase_test` remains blocked, one level deeper
-(data-only-`scoreboard` sub-component in an env + `phase` + `quiesced(N)`).
+Finally the **env quiesced + phase + data-scoreboard-sub slice
+(2026-06-13)** closes the cluster: a data-only `scoreboard` bound as an
+env SUB-component (`ComponentFieldKind::ScoreboardSub`, accessed by the
+nested run-scope path via `ScoreboardOp`/`ScoreboardQuery`'s new
+`nested_path`), `<env>.quiesced(N)` (expands to an AND of `idle(N)` over
+every leaf sub-component), and named `phase` (call sites inlined). The
+heartbeat/quiesce cluster is now FULLY UNLOCKED — `env_quiesced_phase_test`
+is registered, trace-diff clean v1↔tbir at seed 1.
 
 **This file is a snapshot, not a source of truth.** The registry
 (`tests/tbir_equiv_fixtures.txt`) is the source of truth for what is
@@ -381,18 +387,15 @@ table; the event field becomes `std::vector<std::function<void(
 | `watchdog_quiesce_test` | agent + `watchdog period/max_idle` over a record-payload event + `${cycle_count}` log (never trips) | — **FULLY UNLOCKED** (watchdog slice) |
 | `watchdog_trip_diagnostic_test` | silent agent + `watchdog` that trips from cycle 200 (`fail`, 9 FAIL lines) | — **FULLY UNLOCKED** (watchdog slice; expect=fail) |
 | `agent_periodic_test` | self-proving `on 10 cycles` periodic handler (fires 3× in 35 cycles) | — **FULLY UNLOCKED** (watchdog slice) |
+| `env_quiesced_phase_test` | data-only `scoreboard` SUB-component in an env (`DrainSb` held by `HeartbeatEnv`) + named `phase` + `quiesced(N)` env heartbeat aggregation | — **FULLY UNLOCKED** (env quiesced + phase + data-scoreboard-sub slice) |
 
-**Still blocked (residual first-blocker map, `harc dump-ir` 2026-06-13):**
-
-| Next blocker | Fixtures |
-|---|---|
-| data-only `scoreboard` SUB-component in an env (`DrainSb` held by `HeartbeatEnv`) + named `phase` + `quiesced(N)` env heartbeat aggregation | `env_quiesced_phase_test` |
-
-`env_quiesced_phase_test` trips first on the `DrainSb` scoreboard
-sub-component (a data-only `ScoreboardSchema`, not a `ComponentSchema`,
-so `lower_field`'s `Named` arm can't resolve it as a `Sub`); behind that
-it stacks `phase drain` and `top.quiesced(8)`. Those are the next layered
-slices.
+The heartbeat/quiesce cluster is now FULLY UNLOCKED — every cluster
+fixture is registered and trace-diff clean v1↔tbir at seed 1. The env
+quiesced + phase + data-scoreboard-sub slice (docs/tbir-mvp.md
+divergence 19) closed the last three blockers:
+`ComponentFieldKind::ScoreboardSub` (data board as env sub),
+`<env>.quiesced(N)` (AND of `idle(N)` over leaf sub-components), and
+named `phase` (call sites inlined).
 
 ### `sequencer` construct — **RESOLVED 2026-06-13 (sequencer slice)**
 

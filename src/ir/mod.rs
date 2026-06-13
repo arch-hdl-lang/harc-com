@@ -557,6 +557,14 @@ pub enum ComponentFieldKind {
     /// (`drv.dut = dut`) and the `on <ev>` handler body pokes DUT signals
     /// through it. `dut_type` is the SV module name (e.g. `AxiLiteRegs`).
     Dut { dut_type: String },
+    /// `sb : DrainSb` where `DrainSb` is a DATA-ONLY `scoreboard` (no
+    /// methods) — a nested by-value scoreboard sub-component. `scoreboard`
+    /// indexes `TbProgram::scoreboards`. Distinct from `Sub` because a
+    /// data-only board lowers to a `ScoreboardSchema`, not a
+    /// `ComponentSchema`; it is always a quiesce LEAF (it has no further
+    /// sub-components). Mirrors v1, where a `scoreboard` is held by value
+    /// inside the env struct and carries the `_last_in/out_cycle` stamps.
+    ScoreboardSub { scoreboard: ScoreboardId },
 }
 
 /// The payload carried by an `event<T>` analysis port (and the matching
@@ -989,6 +997,11 @@ pub enum Stmt {
         sb: ScoreboardId,
         field: String,
         op: ScoreboardOp,
+        /// `None` → a scoreboard-typed TESTBENCH field, accessed as
+        /// `_tb.<field>`. `Some(path)` → a data-only scoreboard held as
+        /// an ENV sub-component (`top.sb`), accessed by the full dotted
+        /// `path` against the run-scope env local. See `ScoreboardQuery`.
+        nested_path: Option<Vec<String>>,
     },
     /// Write a composite-component scalar field. `base` selects the
     /// access form: `SelfField` (`count = count + 1` inside a method body
@@ -1221,6 +1234,13 @@ pub enum Expr {
         sb: ScoreboardId,
         field: String,
         query: ScoreboardQuery,
+        /// `None` → a scoreboard-typed TESTBENCH field, accessed as
+        /// `_tb.<field>`. `Some(path)` → a data-only scoreboard held as
+        /// an ENV sub-component (`top.sb`), accessed by the full dotted
+        /// `path` (e.g. `["top","sb"]`) against the run-scope env local.
+        /// Validation skips the testbench-field binding check for the
+        /// nested form (the board lives inside the env, not on `_tb`).
+        nested_path: Option<Vec<String>>,
     },
     /// Read a composite-component scalar field. `base` is `SelfField`
     /// (`count` inside a method → `self.count`) or `Path` (`env.sb.count`

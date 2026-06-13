@@ -22,6 +22,7 @@ end agent Producer
 
 scoreboard DrainSb
     expected : queue<uint<8>>
+    popped   : uint<32> default 0
 end scoreboard DrainSb
 
 env HeartbeatEnv
@@ -59,6 +60,7 @@ impl EnvQuiescedPhaseTest for EnvQuiescedPhaseTb
 
         while !top.sb.expected.empty()
             let drained = top.sb.expected.pop()
+            top.sb.popped = top.sb.popped + 1
         end while
 
         drain()
@@ -69,6 +71,8 @@ impl EnvQuiescedPhaseTest for EnvQuiescedPhaseTb
             else fail("expected producer to see 3 transactions, got ${top.prod.seen}")
         assert top.sb.expected.empty()
             else fail("scoreboard queue did not drain")
+        assert top.sb.popped == 3
+            else fail("expected 3 pops, got ${top.sb.popped}")
         log(info, "PASS: environment drain/check phases completed")
     end check
 end impl EnvQuiescedPhaseTest
