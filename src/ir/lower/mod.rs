@@ -346,6 +346,23 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         })
         .collect();
 
+    // The subset of composite-component types that are event-driven
+    // *transactors* (`in event<T>` + `on <ev>` consumer BFM). They route
+    // to a `ComponentSchema` but, being transactors, accept an
+    // `active`/`passive` instance mode at a binding site (the mode just
+    // selects whether the `when active` body is included — always, in
+    // this subset, so `active` is required and `passive` rejected).
+    let event_driven_transactor_names: HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Transactor(t) if components::transactor_is_event_driven(t) => {
+                Some(t.name.name.clone())
+            }
+            _ => None,
+        })
+        .collect();
+
     // File-level construct gate: anything outside the MVP subset is an
     // explicit Unsupported, never silently dropped.
     for it in &file.items {
@@ -398,6 +415,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                         &transactor_ids,
                         &scoreboard_ids,
                         &component_type_names,
+                        &event_driven_transactor_names,
                     )?;
                 } else if matches!(
                     c.kind,
@@ -781,6 +799,7 @@ fn validate_testbench_component(
     transactor_ids: &HashMap<String, TransactorId>,
     scoreboard_ids: &HashMap<String, ScoreboardId>,
     component_type_names: &HashSet<String>,
+    event_driven_transactor_names: &HashSet<String>,
 ) -> Result<(), LowerError> {
     for ci in &c.items {
         match ci {
@@ -789,6 +808,37 @@ fn validate_testbench_component(
                     let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
                     if covgroup_ids.contains_key(simple) {
                         continue;
+                    }
+                    // An event-driven transactor field (`drv : SeqXactor
+                    // active`) routes to a `ComponentSchema` but is still a
+                    // transactor: it requires an explicit `active` mode (a
+                    // `passive` instance has no `when active` body — its
+                    // `on` handler never registers, so it can't consume).
+                    if event_driven_transactor_names.contains(simple) {
+                        match mode {
+                            Some(TransactorMode::Active) => continue,
+                            Some(TransactorMode::Passive) => {
+                                return Err(unsupported(
+                                    &format!(
+                                        "a passive event-driven transactor field `{}.{} : \
+                                         {simple} passive`",
+                                        c.name.name, f.name.name
+                                    ),
+                                    "the consumer's `on` handler only registers on an \
+                                     `active` instance",
+                                ));
+                            }
+                            None => {
+                                return Err(unsupported(
+                                    &format!(
+                                        "an event-driven transactor field `{}.{} : {simple}` \
+                                         without an `active`/`passive` mode",
+                                        c.name.name, f.name.name
+                                    ),
+                                    "annotate the instance `active`",
+                                ));
+                            }
+                        }
                     }
                     // A composite-component type (method-bearing
                     // scoreboard, analysis-source transactor, env, or

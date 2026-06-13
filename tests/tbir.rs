@@ -179,21 +179,48 @@ fn fatal_path_dump_ir_snapshot() {
     insta::assert_snapshot!("fatal_path_dump_ir", format!("{prog}"));
 }
 
-/// Transactor fixtures are outside the MVP subset — the error must
-/// name the construct and point at `--codegen v1`, never mis-lower.
-/// The fixture's `transaction` items now lower (records slice), its
-/// `transactor` declaration passes the item-level scan (transactor
-/// slice), its `tseq` declaration lowers (tseq slice), and its scalar
-/// STATE field `last_read` now materializes too (state-field slice,
-/// divergence 10). The next blocker is the transactor's `req : in
-/// event<RegOp>` directional field — the event-driven (sequencer →
-/// transactor.req) form, which awaits the event slice. The rejection
-/// still names the construct precisely and never mis-lowers.
+/// The unbound event-driven transactor (`req : in event<RegOp>` +
+/// `on req(t)` driving raw DUT signals, `emit drv.req(t)` from the test
+/// scope) now lowers: the transactor routes to the composite-component
+/// table, its `in event` field becomes a subscriber-callback vector, the
+/// `on` handler body lowers as a synchronous component subscriber (waits
+/// → sync tick loops), and the DUT handle field pokes the test DUT.
 #[test]
-fn transactor_fixture_is_unsupported() {
-    let err = lower_src(&fixture("axilite_seqdrv_test.harc")).unwrap_err();
-    let msg = assert_unsupported(&err);
-    insta::assert_snapshot!("axilite_seqdrv_unsupported", msg);
+fn event_driven_transactor_fixture_lowers() {
+    let prog = lower_src(&fixture("axilite_seqdrv_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    // The transactor lowered to a component with a DUT handle, a scalar
+    // state field, and an `event` input pipe with one `on` handler.
+    let comp = prog
+        .components
+        .iter()
+        .find(|c| c.name == "SeqXactor")
+        .expect("SeqXactor component");
+    assert!(comp.fields.iter().any(|f| matches!(
+        f.kind,
+        ir::ComponentFieldKind::Dut { .. }
+    )));
+    assert!(comp.fields.iter().any(|f| matches!(
+        f.kind,
+        ir::ComponentFieldKind::Event { .. }
+    )));
+    assert_eq!(comp.on_handlers.len(), 1);
+}
+
+/// The *bound-to* event-driven transactor (`transactor X bound to
+/// BusAxiLite` + `req : in event` + `on req` driving bus channels) is
+/// still out of subset — it needs the coroutine-actor + bus-binding
+/// form, a separate slice. Lowering must reject it (here the bus type is
+/// an external `use`, so the error is the bus-resolution failure rather
+/// than a subset `Unsupported`; either way it never mis-lowers).
+#[test]
+fn bound_event_driven_transactor_is_rejected() {
+    let err = lower_src(&fixture("transactor_active_test.harc")).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("AxilXactor") || msg.contains("BusAxiLite"),
+        "unexpected error: {msg}"
+    );
 }
 
 /// Randomize/constraint fixture (`randomize(t) with` + Z3 constraints,

@@ -179,6 +179,7 @@ impl Display for TbProgram {
                         format!("out event<{inner}>")
                     }
                     ComponentFieldKind::Sub { component } => format!("sub c{}", component.0),
+                    ComponentFieldKind::Dut { dut_type } => format!("dut {dut_type}"),
                 };
                 writeln!(f, "    field {} : {desc}", fld.name)?;
             }
@@ -194,13 +195,17 @@ impl Display for TbProgram {
                 )?;
             }
             for e in &c.connects {
+                let sink = match &e.sink {
+                    crate::ir::ConnectSink::Method { method } => format!("{method} (method)"),
+                    crate::ir::ConnectSink::Event { event } => format!("{event} (event)"),
+                };
                 writeln!(
                     f,
                     "    connect {}.{} -> {}.{} (c{})",
                     e.src_path.join("."),
                     e.src_event,
                     e.sink_path.join("."),
-                    e.sink_method,
+                    sink,
                     e.sink_component.0
                 )?;
             }

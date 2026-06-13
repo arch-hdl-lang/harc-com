@@ -445,26 +445,45 @@ map (re-run of `harc dump-ir`, 2026-06-13):
 
 | Next blocker | Fixtures |
 |---|---|
-| transactor **event field** (`req : in event<RegOp>` — the event-driven unbound transactor / sequencer→transactor.req form) | `axilite_connect_test`, `axilite_seqdrv_test` |
+| ~~transactor **event field** (`req : in event<RegOp>`)~~ → **RESOLVED 2026-06-13** for the UNBOUND form (event-driven-transactor slice); `axilite_seqdrv_test` now **PASSES** (registered). `axilite_connect_test` advanced past the event field to a data-only `scoreboard` SUB-component in its env (see below); `transactor_active_test` is the BOUND-to event form (separate slice). | `axilite_connect_test` (env data-scoreboard sub), `transactor_active_test` (bound-to actor) |
 | transactor with **>1 module-typed field** (`dut` + `sb` — agent-mode DUT-handle inheritance) | `transactor_agent_mode_test`, `transactor_env_mode_test` |
 | `tseq` construct (data-stream tseq with no record element — needs the scalar/non-record element seam) | `axilite_bound_mon_test` |
 
+The **event-driven-transactor slice** (2026-06-13) lowers the consumer
+side: an unbound `transactor` with an `in event<T>` pipe + `on req(t)`
+handler routes through the composite-component table, with a
+`ComponentFieldKind::Dut` handle the synchronous handler pokes and a
+`ConnectSink::Event` variant for sequencer→transactor `connect` event
+bridges. Proven by `event_driven_transactor_test` (self-proving) +
+`axilite_seqdrv_test` (corpus). Residual:
+
+- `transactor_active_test` — the **bound-to** form (`transactor X bound to
+  BusAxiLite` + `on req` driving bus channels). This needs the
+  coroutine-actor + bus-binding driver (v1's `try_emit_bound_driver_actor`
+  queue topology), a distinct slice. It still rejects precisely (the
+  external `BusAxiLite` bus also isn't in scope when lowered standalone).
+- `axilite_connect_test` — its `env AxilEnv` holds a **data-only
+  `scoreboard` SUB-component** (`sb : AxilSb`, queue + scalar, no methods)
+  accessed through the env (`env.sb.expected.push/pop`). Queue access
+  routes through `ScoreboardOp`, tied to `ScoreboardSchema`, not the
+  component path — so an env-held data-scoreboard with through-env queue
+  ops is the **env-field-binding / data-scoreboard-sub** slice, not the
+  event-driven-transactor surface. The event→event `connect` bridge it
+  needs IS implemented (and exercised by `event_driven_transactor_test`).
+
 The transactor-state-field slice (divergence 10) materialized scalar
 STATE fields on the UNBOUND DUT-poking transactor (per-instance state
-struct, written/read in method bodies + read back at test scope). It is
-proven by the self-proving `transactor_state_field_test` and advanced
-`axilite_seqdrv_test`/`axilite_connect_test` past their state field to
-the event-field blocker above. Still deferred: state on the *bound-to
-initiator* BFM, *event-driven* transactor state, the `_last_in/out_cycle`
-heartbeat stamps (idle predicates), and statement-level pre/post hooks.
+struct, written/read in method bodies + read back at test scope) — the
+event-driven transactor reuses the same scalar-state field shape
+(`last_read`/`fires`) through the component path's `Scalar` field kind.
+Still deferred: state on the *bound-to initiator* BFM, the
+`_last_in/out_cycle` heartbeat stamps (idle predicates), and
+statement-level pre/post hooks.
 
-`axilite_connect_test` additionally binds its `env : AxilEnv` as a
-**testbench field** (the binding slice above) and stacks env→agent→driver
-`connect` wiring; the two `transactor_*_mode` fixtures stack
-mode-inheritance (`active`/`passive` flowing env→agent→transactor) +
-cycle-trigger `on dut.x && dut.y` handlers inside the transactor. So none
-of those three fully unlock from the tseq construct alone; they own the
-transactor-state + agent-mode + testbench-field slices.
+The two `transactor_*_mode` fixtures stack mode-inheritance
+(`active`/`passive` flowing env→agent→transactor) + cycle-trigger `on
+dut.x && dut.y` handlers + the multi-module-field (`dut` + `sb`)
+agent-mode form inside the transactor — they own the agent-mode slice.
 
 ### `scoreboard` construct — **PARTIALLY RESOLVED 2026-06-12 (scoreboard slice)**
 

@@ -15,7 +15,7 @@ tb-ir program
   component c2 SeqEnv (env)
     field sqr : sub c0
     field sb : sub c1
-    connect sqr.dispatched -> sb.sink (c1)
+    connect sqr.dispatched -> sb.sink (method) (c1)
 
 fn fn0 comp_method_0 [kind=ComponentMethod(c0)]
   params:

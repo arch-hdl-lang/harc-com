@@ -1,0 +1,115 @@
+// Self-proving event-driven-transactor demo (consumer side of the
+// analysis-event machinery): a `transactor` with an `in event<T>` port
+// driven by an `on req(t)` handler. Two dispatch surfaces are exercised
+// in ONE fixture, both against the `Top` counter DUT:
+//
+//   1. Direct test-scope `emit drv.req(t)` onto the transactor's input
+//      pipe (the unbound consumer BFM). The active half fires the
+//      handler synchronously: it pulses `en` for `t` cycles, then
+//      latches `count_out` into `last_count`.
+//
+//   2. A `connect` event→event bridge inside an `env`: the sequencer's
+//      `out event<uint<8>>` is wired to a second transactor's `in
+//      event` port, so `env.sqr.dispatch(...)` indirectly fires the
+//      consumer handler with no test-scope `emit`.
+//
+// Each handler increments a persistent `fires` counter and records the
+// observed counter value, so the test can assert the round-trip
+// arithmetic deterministically (no randomize — the DUT is purely
+// counted, so v1 and tbir agree cycle-for-cycle).
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+// ── Surface 1: direct-emit unbound consumer BFM ──────────────────────
+transactor CounterDrv
+    dut        : Top
+    last_count : uint<8>  default 0
+    fires      : uint<8>  default 0
+
+    when active
+        req : in event<uint<8>>
+
+        // Pulse `en` high for `n` cycles, then sample `count_out`. The
+        // body runs synchronously per `emit`, so `wait` lowers to a
+        // sync tick loop (no scheduler suspension).
+        on req(n)
+            fires = fires + 1
+            dut.en = 1
+            wait n cycles
+            dut.en = 0
+            wait 1 cycle
+            last_count = dut.count_out
+        end on
+    end when
+end transactor CounterDrv
+
+// ── Surface 2: sequencer + connect event→event bridge ────────────────
+sequencer PulseSeq
+    dispatched : out event<uint<8>>
+
+    hookable dispatch(n: uint<8>)
+        for i in 0 .. n
+            emit dispatched(i)
+        end for
+    end dispatch
+end sequencer PulseSeq
+
+env DrvEnv
+    sqr : PulseSeq
+    drv : CounterDrv active
+
+    connect
+        sqr.dispatched -> drv.req
+    end connect
+end env DrvEnv
+
+testbench EventDrivenTransactorTb
+    dut : Top
+    drv : CounterDrv active
+    env : DrvEnv
+end testbench EventDrivenTransactorTb
+
+impl EventDrivenTransactorTest for EventDrivenTransactorTb
+    clock clk = SysDomain
+
+    run
+        log(info, "event-driven transactor: direct emit + connect bridge")
+        drv.dut = dut
+        env.drv.dut = dut
+
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // ── Surface 1: direct emit. Pulse `en` for 3 cycles; the
+        // counter advances by exactly 3 from its reset value of 0.
+        emit drv.req(3)
+        assert drv.fires == 1
+            else fail("direct: handler fired ${drv.fires} times, expected 1")
+        assert drv.last_count == 3
+            else fail("direct: count=${drv.last_count}, expected 3")
+
+        // A second direct emit pulses 2 more cycles → 3 + 2 == 5.
+        emit drv.req(2)
+        assert drv.fires == 2
+            else fail("direct: handler fired ${drv.fires} times, expected 2")
+        assert drv.last_count == 5
+            else fail("direct: count=${drv.last_count}, expected 5")
+
+        // ── Surface 2: connect bridge. dispatch(4) emits values
+        // 0,1,2,3 onto env.sqr.dispatched, each forwarded into
+        // env.drv.req. The counter (already at 5) advances by
+        // 0+1+2+3 == 6 → final 11; the handler fires 4 times.
+        env.sqr.dispatch(4)
+        assert env.drv.fires == 4
+            else fail("bridge: handler fired ${env.drv.fires} times, expected 4")
+        assert env.drv.last_count == 11
+            else fail("bridge: count=${env.drv.last_count}, expected 11")
+
+        log(info, "PASS: event-driven transactor — direct emit + connect event bridge")
+    end run
+end impl EventDrivenTransactorTest

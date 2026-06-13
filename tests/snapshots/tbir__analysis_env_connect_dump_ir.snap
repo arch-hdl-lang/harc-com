@@ -20,8 +20,8 @@ tb-ir program
     field source : sub c0
     field sb : sub c1
     field cov : sub c2
-    connect source.observed -> sb.write_obs (c1)
-    connect source.observed -> cov.sample_obs (c2)
+    connect source.observed -> sb.write_obs (method) (c1)
+    connect source.observed -> cov.sample_obs (method) (c2)
 
 fn fn0 comp_method_0 [kind=ComponentMethod(c0)]
   params:
