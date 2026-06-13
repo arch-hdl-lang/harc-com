@@ -284,10 +284,20 @@ impl FuncBuilder<'_> {
                                 ),
                             ));
                         }
-                        // Transactor method calls are call EDGES, never
-                        // expression values — they may advance simulated
-                        // time, which an expression position cannot
-                        // represent (statement order is the contract).
+                        // Transactor method calls are call EDGES that may
+                        // advance simulated time (v1 hookables run
+                        // synchronously — their internal `wait`s `tick()`
+                        // directly). In expression position the edge is
+                        // value-bearing (`(helper.read(0) & 1) == 1`): we
+                        // build the call edge here and let `hoist_ports`
+                        // pull it into a `Stmt::TransactorCall { dest:
+                        // Some(temp), .. }` in the SAME left-to-right pass
+                        // as DUT-port reads, so the `tick()` lands in
+                        // source order and the seam rule (a TransactorMethod
+                        // edge only ever lives in a TransactorCall stmt or a
+                        // top-level Assign RHS) is preserved. A void method
+                        // used as a value is rejected by `lower_transactor_call`
+                        // (`need_ret = true`), mirroring v1's C++ type error.
                         if self.as_transactor_call(callee)?.is_some() {
                             if self.in_fmt_args {
                                 return Err(unsupported(
@@ -299,13 +309,9 @@ impl FuncBuilder<'_> {
                                      a `let` first",
                                 ));
                             }
-                            return Err(unsupported(
-                                &format!(
-                                    "transactor method call `.{}(...)` in expression position",
-                                    name.name
-                                ),
-                                "hoist it into a `let` first",
-                            ));
+                            if let Some(call) = self.lower_transactor_call(callee, args, true)? {
+                                return Ok(call);
+                            }
                         }
                         format!("transactor/method call `.{}(...)`", name.name)
                     }
@@ -420,7 +426,16 @@ impl FuncBuilder<'_> {
             }
             Expr::Call(t, args) => {
                 let args = args.into_iter().map(|a| self.hoist_ports(a)).collect();
-                Expr::Call(t, args)
+                // A value-bearing transactor-method call in expression
+                // position: pull the call edge into its own
+                // `Stmt::TransactorCall { dest: Some(temp), .. }` (the
+                // seam rule's sanctioned home) and substitute the result
+                // temp. Args (and sibling ports, since this is the same
+                // left-to-right pass as `Expr::Port` hoisting) are already
+                // lifted above, so the `tick()` inside the call lands in
+                // source order. Helper/Builtin/Tseq targets are ordinary
+                // inline values.
+                self.hoist_transactor_edge(Expr::Call(t, args))
             }
             Expr::ComponentIdle { base, kind, n } => {
                 let n = self.hoist_ports(*n);
@@ -459,6 +474,72 @@ impl FuncBuilder<'_> {
             // emitted inline. Nothing to hoist.
             | Expr::RegRead { .. }
             | Expr::CovBin { .. }) => other,
+        }
+    }
+
+    /// If `e` is a value-bearing `CallTarget::TransactorMethod` edge,
+    /// pull it into a fresh `Stmt::TransactorCall { dest: Some(temp), .. }`
+    /// and return `Expr::Local(temp)`; otherwise return `e` unchanged.
+    /// This is the seam rule's sanctioned home for a transactor edge that
+    /// surfaced in expression position (e.g. `(helper.read(0) & 1) == 1`):
+    /// the edge never lives nested in another expression, and the call's
+    /// internal `tick()` runs at the hoist point (source order, because the
+    /// callers traverse left-to-right).
+    fn hoist_transactor_edge(&mut self, e: Expr) -> Expr {
+        if matches!(&e, Expr::Call(crate::ir::CallTarget::TransactorMethod { .. }, _)) {
+            let temp = self.fresh_temp();
+            self.push(Stmt::TransactorCall { dest: Some(temp), call: e });
+            Expr::Local(temp)
+        } else {
+            e
+        }
+    }
+
+    /// Hoist every value-bearing transactor-method call edge out of `e`
+    /// into preceding `Stmt::TransactorCall` statements, leaving DUT
+    /// `Expr::Port` leaves INLINE (unlike `hoist_ports`). Used where ports
+    /// are intentionally left lazy — assert conditions — but a transactor
+    /// edge still cannot stay nested (the seam rule, and the call may
+    /// advance simulated time). Traverses left-to-right so the synthesized
+    /// `TransactorCall`s land in source order.
+    ///
+    /// Subset note: an expression that mixes a hoisted port read with a
+    /// transactor call is not exercised by any fixture; here ports stay
+    /// inline (lazy assert eval) so there is no port/tick reordering.
+    pub(crate) fn hoist_transactor_calls(&mut self, e: Expr) -> Expr {
+        match e {
+            Expr::Binary(op, a, b) => {
+                let a = self.hoist_transactor_calls(*a);
+                let b = self.hoist_transactor_calls(*b);
+                Expr::Binary(op, Box::new(a), Box::new(b))
+            }
+            Expr::Unary(op, a) => {
+                let a = self.hoist_transactor_calls(*a);
+                Expr::Unary(op, Box::new(a))
+            }
+            Expr::Ternary(c, t, f) => {
+                let c = self.hoist_transactor_calls(*c);
+                let t = self.hoist_transactor_calls(*t);
+                let f = self.hoist_transactor_calls(*f);
+                Expr::Ternary(Box::new(c), Box::new(t), Box::new(f))
+            }
+            Expr::WidthCast { kind, width, src_width, inner } => {
+                let inner = self.hoist_transactor_calls(*inner);
+                Expr::WidthCast { kind, width, src_width, inner: Box::new(inner) }
+            }
+            Expr::ComponentIdle { base, kind, n } => {
+                let n = self.hoist_transactor_calls(*n);
+                Expr::ComponentIdle { base, kind, n: Box::new(n) }
+            }
+            Expr::SeqIndex { seq, index } => {
+                let index = self.hoist_transactor_calls(*index);
+                Expr::SeqIndex { seq, index: Box::new(index) }
+            }
+            Expr::Call(t, args) => {
+                let args = args.into_iter().map(|a| self.hoist_transactor_calls(a)).collect();
+                self.hoist_transactor_edge(Expr::Call(t, args))
+            }
+            other => other,
         }
     }
 
@@ -1055,5 +1136,28 @@ pub(crate) fn parse_int_literal(s: &str) -> Option<u64> {
         u64::from_str_radix(oct, 8).ok()
     } else {
         t.parse::<u64>().ok()
+    }
+}
+
+/// True when `e` contains a (nested) `CallTarget::TransactorMethod` call
+/// edge anywhere. Used to reject a transactor method call in positions
+/// that cannot hoist it into a preceding `Stmt::TransactorCall` — notably
+/// a `wait until` predicate, which the scheduler re-evaluates every cycle
+/// (a per-cycle call would be nonsensical).
+pub(crate) fn expr_has_transactor_edge(e: &Expr) -> bool {
+    match e {
+        Expr::Call(crate::ir::CallTarget::TransactorMethod { .. }, _) => true,
+        Expr::Call(_, args) => args.iter().any(expr_has_transactor_edge),
+        Expr::Binary(_, a, b) => expr_has_transactor_edge(a) || expr_has_transactor_edge(b),
+        Expr::Unary(_, a) => expr_has_transactor_edge(a),
+        Expr::Ternary(c, t, f) => {
+            expr_has_transactor_edge(c)
+                || expr_has_transactor_edge(t)
+                || expr_has_transactor_edge(f)
+        }
+        Expr::WidthCast { inner, .. } => expr_has_transactor_edge(inner),
+        Expr::ComponentIdle { n, .. } => expr_has_transactor_edge(n),
+        Expr::SeqIndex { index, .. } => expr_has_transactor_edge(index),
+        _ => false,
     }
 }

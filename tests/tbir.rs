@@ -2829,15 +2829,115 @@ fn cam_value_basic_emitted_cpp_snapshot() {
     );
 }
 
-/// A transactor method call is never an expression VALUE — it can
-/// advance simulated time, which only statement order can represent.
+/// A value-returning transactor method call in expression position
+/// (`let v = xt.readv() + 1`) is hoisted into its own
+/// `Stmt::TransactorCall { dest: Some(temp), .. }` and the result temp
+/// substituted in the expression — the seam rule's sanctioned home (the
+/// call edge never stays nested) and the call's internal `tick()` runs
+/// at the hoist point, in source order. v1 emits the equivalent inline.
 #[test]
-fn transactor_call_in_expression_position_rejected() {
+fn transactor_call_in_expression_position_hoisted() {
     let src = XACTOR_SRC.replace("let v = xt.readv()", "let v = xt.readv() + 1");
-    let err = lower_src(&src).unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("expression position"), "{msg}");
-    assert!(msg.contains("hoist it into a `let`"), "{msg}");
+    let prog = lower_src(&src).expect("expression-position call lowers via hoist");
+    verify::verify_program(&prog).expect("verifies");
+
+    let run = prog.function(prog.tests[0].run);
+    // Two call edges: the `xt.pulse(3)` statement call (discards) and
+    // the hoisted `xt.readv()` (binds a fresh temp), both as
+    // TransactorCall statements.
+    let binds: Vec<&ir::Stmt> = run
+        .blocks
+        .iter()
+        .flat_map(|b| &b.stmts)
+        .filter(|s| {
+            matches!(
+                s,
+                ir::Stmt::TransactorCall { dest: Some(_), call: ir::Expr::Call(
+                    ir::CallTarget::TransactorMethod { method, .. }, _
+                ) } if method == "readv"
+            )
+        })
+        .collect();
+    assert_eq!(binds.len(), 1, "readv() hoisted into a result-binding TransactorCall:\n{run}");
+    // No bare TransactorMethod call edge survives nested in an Assign.
+    for s in run.blocks.iter().flat_map(|b| &b.stmts) {
+        if let ir::Stmt::Assign(_, e) = s {
+            assert!(
+                !matches!(e, ir::Expr::Call(ir::CallTarget::TransactorMethod { .. }, _)),
+                "no bare transactor call edge as an Assign RHS"
+            );
+        }
+    }
+}
+
+/// A method param typed as a declared `transaction`/`struct` record
+/// lowers to `IrType::Record` and is passed by value: the method body
+/// binds the record param and reads its fields. The call site passes the
+/// caller's record local as a `Stmt::TransactorCall` argument.
+#[test]
+fn transactor_record_typed_method_param_lowers() {
+    let src = r#"
+transaction RunCmd
+    ticks  : uint<8>  default 1
+    expect : uint<32> default 0
+end transaction RunCmd
+
+transactor Drv
+    dut : Top
+
+    when active
+        hookable run_for(cmd: RunCmd)
+            dut.en = 1
+            for _ in 0 .. cmd.ticks
+                wait 1 cycle
+            end for
+            dut.en = 0
+        end run_for
+    end when
+end transactor Drv
+
+testbench DrvTb
+    dut : Top
+    drv : Drv active
+end testbench DrvTb
+
+impl DrvTest for DrvTb
+    run
+        drv.dut = dut
+        let cmd : RunCmd
+        cmd.ticks = 3
+        drv.run_for(cmd)
+    end run
+end impl DrvTest
+"#;
+    let prog = lower_src(src).expect("record-typed method param lowers");
+    verify::verify_program(&prog).expect("verifies");
+
+    // The record exists; the method's single param is record-typed.
+    assert_eq!(prog.records.len(), 1, "one transaction record");
+    let rid = ir::RecordId(0);
+    let x = &prog.transactors[0];
+    let m = x.method("run_for").expect("run_for");
+    assert_eq!(m.n_params, 1);
+    let mf = prog.function(m.function);
+    assert_eq!(mf.params.len(), 1);
+    assert_eq!(mf.params[0].ty, ir::IrType::Record(rid), "param is by-value record");
+    // The first local mirrors the record param (TB-IR convention) and is
+    // record-typed; the body reads `cmd.ticks` (visible in the IR text).
+    assert_eq!(mf.locals[0].ty, ir::IrType::Record(rid), "param local is the record");
+    assert!(
+        format!("{mf}").contains("%cmd.ticks"),
+        "run_for body reads cmd.ticks:\n{mf}"
+    );
+
+    // The call passes the caller's record local as an argument.
+    let run = prog.function(prog.tests[0].run);
+    let arg_is_local = run.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+        matches!(s, ir::Stmt::TransactorCall {
+            call: ir::Expr::Call(ir::CallTarget::TransactorMethod { method, .. }, args), ..
+        } if method == "run_for" && matches!(args.as_slice(), [ir::Expr::Local(_)]))
+    });
+    assert!(arg_is_local, "run_for call passes the record local by value:\n{run}");
 }
 
 /// ...and not inside lazily-evaluated log/fail messages either.

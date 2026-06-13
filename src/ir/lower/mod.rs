@@ -1666,7 +1666,27 @@ fn lower_test(
                 }
                 scope = Some(s);
             }
-            TestItem::Stmt(s) => bare_stmts.push(s),
+            TestItem::Stmt(s) => {
+                // Test-scope pre/post method hook (`on drv.send pre ...
+                // end on`): a hookable-method hook registration. Out of
+                // the TB-IR subset — the hook body is a `[&]`-capturing
+                // closure that mutates test-scope `let`s by reference, and
+                // the function-per-CFG IR has no way to express a closure
+                // lexically nested in the run coroutine capturing its
+                // locals (v1 emits it directly as C++). A precise reject
+                // here pre-empts the generic bare-statement/scope mixing
+                // error below, which would otherwise bury the real reason.
+                if let StmtKind::On(h) = &s.kind {
+                    if h.hook.is_some() {
+                        return Err(unsupported(
+                            "a test-scope `on <obj>.<method> pre/post` method hook",
+                            "pre/post method hooks register a `[&]`-capturing closure that \
+                             mutates test-scope state by reference; lower this with `--codegen v1`",
+                        ));
+                    }
+                }
+                bare_stmts.push(s)
+            }
             TestItem::Phase(name, body) => {
                 if phases.insert(name.name.clone(), body).is_some() {
                     return Err(LowerError::Invalid(format!(

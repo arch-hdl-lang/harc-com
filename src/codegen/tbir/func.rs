@@ -1234,9 +1234,17 @@ pub(super) fn emit_method(
     let pad3 = INDENT.repeat(depth + 3);
 
     let ret_ty = if func.ret.is_some() { "uint64_t" } else { "void" };
+    // A record-typed param (`send(t: RegOp)`) is taken by value as the
+    // record struct — the body binds it and reads its fields, mirroring
+    // v1's by-value struct param; every scalar param widens to uint64_t.
     let params = names[..nparams]
         .iter()
-        .map(|n| format!("uint64_t {n}"))
+        .enumerate()
+        .map(|(i, n)| match func.locals[i].ty {
+            IrType::Record(r) => format!("{} {n}", prog.records[r.index()].name),
+            IrType::RecordSeq(r) => format!("std::vector<{}> {n}", prog.records[r.index()].name),
+            _ => format!("uint64_t {n}"),
+        })
         .collect::<Vec<_>>()
         .join(", ");
     writeln!(

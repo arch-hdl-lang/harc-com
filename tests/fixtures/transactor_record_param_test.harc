@@ -1,0 +1,87 @@
+// Record-typed (transaction) transactor-method parameter — passed by
+// value. The TB-IR backend lowers a method param typed as a declared
+// `transaction`/`struct` to `IrType::Record` and emits it by value as
+// the record struct (mirroring v1's by-value struct param); the body
+// binds the record param and reads its fields.
+//
+// The `Counter` DUT (`Top` from top_counter_test) counts up while `en`
+// is high. The transactor's `run_for(cmd: RunCmd)` method pulses `en`
+// for `cmd.ticks` cycles, then the test cross-checks the running total
+// against `cmd.expect`.
+//
+// Uses only the v1-supported surface (record-by-value method param), so
+// the same file passes under `--codegen v1` and `--codegen tbir`; the
+// equivalence harness trace-diffs the two.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction RunCmd
+    ticks  : uint<8>  default 1
+    expect : uint<32> default 0
+end transaction RunCmd
+
+transactor CounterDriver
+    dut : Top
+
+    when active
+        // Drive `en` high for `cmd.ticks` cycles, then drop it. Reads
+        // the record param `cmd` by value inside the body.
+        hookable run_for(cmd: RunCmd)
+            dut.en = 1
+            for _ in 0 .. cmd.ticks
+                wait 1 cycle
+            end for
+            dut.en = 0
+            wait 1 cycle
+        end run_for
+    end when
+end transactor CounterDriver
+
+testbench TransactorRecordParamTb
+    dut : Top
+    drv : CounterDriver active
+end testbench TransactorRecordParamTb
+
+impl TransactorRecordParamTest for TransactorRecordParamTb
+    clock clk = SysDomain        // 100 MHz
+
+    run
+        log(info, "record-typed transactor-method param test")
+        drv.dut = dut
+
+        // Reset for 3 cycles.
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        assert dut.count_out == 0
+            else fail("after reset: count_out=${dut.count_out}, expected 0")
+        dut.rst = 0
+        wait 1 cycle
+
+        // Three commands of increasing length (1, 2, 3 ticks). Each
+        // bumps the running total; `run_for` consumes the record by
+        // value and pulses `en` for `cmd.ticks` cycles.
+        let total = 0
+        for i in 0 .. 3
+            let cmd : RunCmd
+            assert cmd.ticks == 1
+                else fail("cmd[${i}]: default ticks=${cmd.ticks}, expected 1")
+            assert cmd.expect == 0
+                else fail("cmd[${i}]: expect not re-zeroed (${cmd.expect})")
+
+            cmd.ticks = cmd.ticks + i        // 1, 2, 3
+            total = total + cmd.ticks
+            cmd.expect = total
+
+            drv.run_for(cmd)
+
+            assert dut.count_out == cmd.expect
+                else fail("cmd[${i}]: count_out=${dut.count_out}, expected ${cmd.expect}")
+            log(info, "cmd[${i}] ticks=${cmd.ticks} -> count_out=${dut.count_out}")
+        end for
+
+        log(info, "ALL TESTS PASSED")
+    end run
+end impl TransactorRecordParamTest
