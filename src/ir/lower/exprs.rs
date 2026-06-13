@@ -106,12 +106,13 @@ impl FuncBuilder<'_> {
                 }
                 // Scoreboard scalar-counter read (`sb.writes` /
                 // `_tb.sb.writes` after impl-form desugaring).
-                if let Some((sb, field)) = self.scoreboard_root(target) {
+                if let Some((sb, field, nested_path)) = self.scoreboard_root(target) {
                     let scalar = self.scoreboard_scalar_field(sb, &name.name)?;
                     return Ok(Expr::ScoreboardQuery {
                         sb,
                         field,
                         query: crate::ir::ScoreboardQuery::Scalar { scalar },
+                        nested_path,
                     });
                 }
                 // Regblock-binding access in expression position. The
@@ -237,6 +238,11 @@ impl FuncBuilder<'_> {
                         // `agent.idle_in(N)`, `.idle_out(N)`, `.idle(N)`.
                         if let Some(idle) = self.as_component_idle(callee, args)? {
                             return Ok(idle);
+                        }
+                        // Env-level aggregation: `<env>.quiesced(N)` expands
+                        // to an AND of `idle(N)` over every leaf sub-component.
+                        if let Some(q) = self.as_component_quiesced(callee, args)? {
+                            return Ok(q);
                         }
                         // Scoreboard queue value-queries: `sb.q.size()`,
                         // `sb.q.empty()`. (`sb.q.pop()` mutates and is
@@ -446,7 +452,8 @@ impl FuncBuilder<'_> {
         callee: &AstExpr,
         args: &[crate::ast::CallArg],
     ) -> Result<Option<Expr>, LowerError> {
-        let Some((sb, field, queue, method)) = self.as_scoreboard_queue_call(callee) else {
+        let Some((sb, field, queue, method, nested_path)) = self.as_scoreboard_queue_call(callee)
+        else {
             return Ok(None);
         };
         let query = match method.as_str() {
@@ -475,7 +482,7 @@ impl FuncBuilder<'_> {
             )));
         }
         self.scoreboard_queue_field(sb, &queue)?;
-        Ok(Some(Expr::ScoreboardQuery { sb, field, query }))
+        Ok(Some(Expr::ScoreboardQuery { sb, field, query, nested_path }))
     }
 
     /// `Some(PortRef)` when the expression is a dotted access rooted at

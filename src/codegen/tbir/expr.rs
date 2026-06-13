@@ -117,17 +117,23 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // Scoreboard read on a `_tb` struct member (scoreboard fields
         // exist only on non-synthetic testbenches). Mirrors v1's direct
         // struct/queue access.
-        Expr::ScoreboardQuery { field, query, .. } => {
+        Expr::ScoreboardQuery { field, query, nested_path, .. } => {
             use crate::ir::ScoreboardQuery;
+            // `None` → testbench field (`_tb.<field>`); `Some(path)` →
+            // env-nested data scoreboard, accessed by the run-scope path.
+            let base = match nested_path {
+                Some(p) => p.join("."),
+                None => format!("_tb.{field}"),
+            };
             match query {
-                ScoreboardQuery::Scalar { scalar } => format!("_tb.{field}.{scalar}"),
+                ScoreboardQuery::Scalar { scalar } => format!("{base}.{scalar}"),
                 // size() returns size_t — cast to the IR's uint64 model
                 // so it composes uniformly in arithmetic/comparisons.
                 ScoreboardQuery::QueueSize { queue } => {
-                    format!("((uint64_t)_tb.{field}.{queue}.size())")
+                    format!("((uint64_t){base}.{queue}.size())")
                 }
                 ScoreboardQuery::QueueEmpty { queue } => {
-                    format!("_tb.{field}.{queue}.empty()")
+                    format!("{base}.{queue}.empty()")
                 }
             }
         }

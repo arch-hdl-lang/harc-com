@@ -106,10 +106,9 @@ static inline uint64_t harc_rng_next() {
 /// (`expected : uint<32> default 0`), with v1's C-type mapping.
 /// One scoreboard declaration → C++ struct (v1's `emit_scoreboard`
 /// shape): scalar counters with their declared defaults, `queue<T>`
-/// fields as `harc_rt::HarcQueue<T>` members. The activity-tracking
-/// `_last_in/out_cycle` heartbeat fields v1 injects are NOT emitted —
-/// the data-only subset never reads them (`sb.idle(N)` is an event-
-/// driven predicate, out of this slice's scope).
+/// fields as `harc_rt::HarcQueue<T>` members, plus the activity-tracking
+/// `_last_in/out_cycle` heartbeat stamps v1 always injects (read by
+/// `<env>.quiesced(N)` when the board is an env sub-component).
 /// One bound-to target-TLM responder instance: a test-scope local
 /// struct (state fields + activity stamps) plus its instance, mirroring
 /// v1's per-instance component struct. Declared inside the test function
@@ -161,6 +160,12 @@ pub(super) fn scoreboard_struct(out: &mut String, sb: &crate::ir::ScoreboardSche
             }
         }
     }
+    // Auto-injected activity-tracking stamps, matching v1's
+    // `emit_scoreboard`. A data-only scoreboard counts as a component for
+    // heartbeat purposes, so `<env>.quiesced(N)` (which expands to
+    // `sb.idle(N)`) reads these stamps on a scoreboard sub-component.
+    writeln!(out, "{INDENT}uint64_t _last_in_cycle = 0;").ok();
+    writeln!(out, "{INDENT}uint64_t _last_out_cycle = 0;").ok();
     writeln!(out, "}};").ok();
     writeln!(out).ok();
 }
@@ -187,6 +192,7 @@ pub(super) fn component_struct(
     out: &mut String,
     c: &crate::ir::ComponentSchema,
     components: &[crate::ir::ComponentSchema],
+    scoreboards: &[crate::ir::ScoreboardSchema],
     records: &[crate::ir::RecordSchema],
 ) {
     use crate::ir::ComponentFieldKind;
@@ -227,6 +233,10 @@ pub(super) fn component_struct(
                 // `on <ev>` handler pokes through. Matches v1's
                 // `V<dut_type>* dut = nullptr;`.
                 writeln!(out, "{INDENT}V{dut_type}* {} = nullptr;", f.name).ok();
+            }
+            ComponentFieldKind::ScoreboardSub { scoreboard } => {
+                let sname = &scoreboards[scoreboard.index()].name;
+                writeln!(out, "{INDENT}{sname} {};", f.name).ok();
             }
         }
     }

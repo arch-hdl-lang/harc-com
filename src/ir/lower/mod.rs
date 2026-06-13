@@ -660,7 +660,13 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     let mut next_fn = prog.functions.len() as u32;
     for src in &comp_sources {
         let schema =
-            components::lower_component_schema(src, &component_ids, &record_ids, &mut next_fn)?;
+            components::lower_component_schema(
+                src,
+                &component_ids,
+                &scoreboard_ids,
+                &record_ids,
+                &mut next_fn,
+            )?;
         prog.components.push(schema);
     }
     // Pass 1b: resolve `connect` edges (env components only), now that
@@ -1011,6 +1017,13 @@ fn lower_test(
     let mut clocks: Vec<&ClockDecl> = Vec::new();
     let mut scope: Option<&ScopeDecl> = None;
     let mut bare_stmts: Vec<&AstStmt> = Vec::new();
+    // Named `phase <name> ... end phase <name>` blocks (spec §7.2). Each
+    // is callable by `<name>()` from the run/check body; the call site is
+    // INLINED with the phase block's statements (v1 emits a `[&]() ->
+    // void` lambda + a plain call — identical observable behavior, since
+    // the body runs at the call site inside the run coroutine). Collected
+    // in declaration order so a redeclaration is rejected.
+    let mut phases: HashMap<String, &Block> = HashMap::new();
     let mut bus_bindings: Vec<ir::BusBindingSchema> = Vec::new();
     let mut bus_binding_decls: HashMap<String, BusDecl> = HashMap::new();
     // Regblock bindings (`let regs : R = bind <helper>`), collected here
@@ -1369,8 +1382,13 @@ fn lower_test(
                 scope = Some(s);
             }
             TestItem::Stmt(s) => bare_stmts.push(s),
-            TestItem::Phase(name, _) => {
-                return Err(unsupported(&format!("custom phase `{}`", name.name), ""));
+            TestItem::Phase(name, body) => {
+                if phases.insert(name.name.clone(), body).is_some() {
+                    return Err(LowerError::Invalid(format!(
+                        "test `{}` declares phase `{}` more than once",
+                        t.name.name, name.name
+                    )));
+                }
             }
             TestItem::Apply(_) => return Err(unsupported("apply", "")),
             TestItem::Use(_) => {}
@@ -1930,6 +1948,24 @@ fn lower_test(
         )));
     }
 
+    // Inline `<phase>()` call sites with the phase block's statements. v1
+    // emits each phase as a captured `[&]() -> void` lambda + a plain
+    // call; the IR splices the body at the call site (observably identical
+    // — the phase body runs in the run/check coroutine context). Recurses
+    // so a phase may call another; a cycle is rejected.
+    if !phases.is_empty() {
+        let mut expanded_run = Vec::with_capacity(run_stmts.len());
+        for s in &run_stmts {
+            expand_phase_calls(s, &phases, &mut Vec::new(), &mut expanded_run, &t.name.name)?;
+        }
+        run_stmts = expanded_run;
+        let mut expanded_check = Vec::with_capacity(check_stmts.len());
+        for s in &check_stmts {
+            expand_phase_calls(s, &phases, &mut Vec::new(), &mut expanded_check, &t.name.name)?;
+        }
+        check_stmts = expanded_check;
+    }
+
     let ctx = LowerCtx {
         dut_field: "dut".to_string(),
         tb_field: if synthetic { None } else { Some("_tb".to_string()) },
@@ -2020,6 +2056,54 @@ fn lower_test(
         clock_domain: clock_specs.first().and_then(|c| c.domain.clone()),
         clocks: clock_specs,
     });
+    Ok(())
+}
+
+/// Recognize a bare phase-call statement `<name>()` — `StmtKind::Expr`
+/// of a zero-arg `Call` whose callee is a plain identifier naming a
+/// declared `phase`. Returns the phase name on a match.
+fn phase_call_name<'a>(s: &AstStmt, phases: &HashMap<String, &'a Block>) -> Option<String> {
+    let StmtKind::Expr(e) = &s.kind else {
+        return None;
+    };
+    let ExprKind::Call { callee, args } = &*e.kind else {
+        return None;
+    };
+    if !args.is_empty() {
+        return None;
+    }
+    let ExprKind::Ident(id) = &*callee.kind else {
+        return None;
+    };
+    phases.contains_key(&id.name).then(|| id.name.clone())
+}
+
+/// Inline a single statement into `out`, expanding any `<phase>()` call
+/// site with the phase block's statements (recursively, so a phase may
+/// call another). `active` tracks the phase-expansion stack to reject a
+/// recursive cycle. A non-phase-call statement is pushed unchanged.
+fn expand_phase_calls<'a>(
+    s: &'a AstStmt,
+    phases: &HashMap<String, &'a Block>,
+    active: &mut Vec<String>,
+    out: &mut Vec<&'a AstStmt>,
+    test_name: &str,
+) -> Result<(), LowerError> {
+    if let Some(name) = phase_call_name(s, phases) {
+        if active.contains(&name) {
+            return Err(LowerError::Invalid(format!(
+                "phase `{name}` is called recursively in test `{test_name}`"
+            )));
+        }
+        active.push(name.clone());
+        let body = phases[&name];
+        for inner in &body.stmts {
+            expand_phase_calls(inner, phases, active, out, test_name)?;
+        }
+        active.pop();
+        return Ok(());
+    }
+    out.push(s);
     Ok(())
 }
 

@@ -382,6 +382,46 @@ fn watchdog_quiesce_emitted_cpp_snapshot() {
     );
 }
 
+/// `env_quiesced_phase_test` exercises three TB-IR constructs together:
+///   1. a DATA-ONLY `scoreboard` (`DrainSb`) bound as an env SUB-component
+///      (`ComponentFieldKind::ScoreboardSub`) — accessed by the nested
+///      run-scope path `top.sb.expected` (not `_tb.sb`);
+///   2. `<env>.quiesced(N)` — expands to an AND of `idle(N)` over every
+///      leaf sub-component (`top.prod.idle(8) && top.sb.idle(8)`);
+///   3. a named `phase drain` whose body is INLINED at the `drain()` call
+///      site in the run body.
+/// Locks the dump-ir for all three.
+#[test]
+fn env_quiesced_phase_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("env_quiesced_phase_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    // The env holds the data scoreboard as a `ScoreboardSub` field.
+    let env = prog
+        .components
+        .iter()
+        .find(|c| c.name == "HeartbeatEnv")
+        .expect("HeartbeatEnv env");
+    assert!(
+        env.fields
+            .iter()
+            .any(|f| matches!(f.kind, ir::ComponentFieldKind::ScoreboardSub { .. })),
+        "env should hold the data scoreboard as a ScoreboardSub field"
+    );
+    insta::assert_snapshot!("env_quiesced_phase_dump_ir", format!("{prog}"));
+}
+
+/// Locks the emitted tbir C++ for the env-quiesce-phase fixture: the
+/// nested `top.sb.expected.push/pop/empty` access, the `quiesced(8)`
+/// idle conjunction inside the `wait_until_timeout` predicate, and the
+/// inlined `drain` phase body.
+#[test]
+fn env_quiesced_phase_emitted_cpp_snapshot() {
+    insta::assert_snapshot!(
+        "env_quiesced_phase_emitted_cpp",
+        emit_fixture_cpp("env_quiesced_phase_test.harc")
+    );
+}
+
 /// `on <N> cycles` periodic handler in an `agent`: lowers to a zero-arg
 /// `comp_periodic_*` body and an `on 10 cycles = fn0` schema line.
 #[test]

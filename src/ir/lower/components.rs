@@ -28,7 +28,7 @@ use crate::ast::{
 use crate::ir::{
     ComponentFieldKind, ComponentFieldSchema, ComponentId, ComponentKindTag,
     ComponentMethodSchema, ComponentSchema, ConnectEdgeSchema, EventPayload, FunctionId,
-    FunctionKind, IrType, RecordId, TbFunction, Terminator, TypedParam,
+    FunctionKind, IrType, RecordId, ScoreboardId, TbFunction, Terminator, TypedParam,
 };
 use std::collections::HashMap;
 
@@ -144,6 +144,7 @@ pub(crate) enum CompSource<'a> {
 pub(crate) fn lower_component_schema(
     src: &CompSource<'_>,
     ids: &HashMap<String, ComponentId>,
+    scoreboard_ids: &HashMap<String, ScoreboardId>,
     record_ids: &HashMap<String, RecordId>,
     next_fn: &mut u32,
 ) -> Result<ComponentSchema, LowerError> {
@@ -208,7 +209,7 @@ pub(crate) fn lower_component_schema(
     for it in items.iter().chain(when_active.into_iter().flatten()) {
         match it {
             ComponentItem::Field(f) => {
-                let fk = lower_field(name, f, ids, record_ids, is_transactor)?;
+                let fk = lower_field(name, f, ids, scoreboard_ids, record_ids, is_transactor)?;
                 if fields.iter().any(|x| x.name == f.name.name) {
                     return Err(LowerError::Invalid(format!(
                         "component `{name}` declares field `{}` more than once",
@@ -433,6 +434,7 @@ fn lower_field(
     comp: &str,
     f: &ComponentField,
     ids: &HashMap<String, ComponentId>,
+    scoreboard_ids: &HashMap<String, ScoreboardId>,
     record_ids: &HashMap<String, RecordId>,
     is_transactor: bool,
 ) -> Result<ComponentFieldKind, LowerError> {
@@ -530,14 +532,21 @@ fn lower_field(
                 ));
             }
             let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+            // A data-only `scoreboard` (no methods) lowers to a
+            // `ScoreboardSchema`, not a `ComponentSchema`, so it never
+            // appears in `ids`. Resolve it as a by-value scoreboard
+            // sub-component (a quiesce leaf) — mirrors v1, which holds the
+            // board struct inside the env by value.
+            if let Some(sid) = scoreboard_ids.get(simple) {
+                return Ok(ComponentFieldKind::ScoreboardSub { scoreboard: *sid });
+            }
             // A known component type is a nested sub-component (`source :
-            // AnalysisSource`); anything else, on a transactor, is the
-            // module-typed DUT handle (`dut : AxiLiteRegs`) the `on`
-            // handler pokes. On a non-transactor an unknown named type is
-            // an unsupported sub-component (unchanged).
+            // AnalysisSource`).
             if let Some(cid) = ids.get(simple) {
                 return Ok(ComponentFieldKind::Sub { component: *cid });
             }
+            // On a transactor, an unknown named type is the module-typed
+            // DUT handle (`dut : AxiLiteRegs`) the `on` handler pokes.
             if is_transactor {
                 if f.default.is_some() {
                     return Err(unsupported(
@@ -551,7 +560,8 @@ fn lower_field(
             }
             Err(unsupported(
                 &format!("sub-component field `{comp}.{fname}` of type `{simple}`"),
-                "only env/method-scoreboard/analysis-source sub-components are lowered",
+                "only env/method-scoreboard/data-scoreboard/analysis-source \
+                 sub-components are lowered",
             ))
         }
     }
@@ -999,7 +1009,7 @@ fn resolve_sub_path(
 
 /// Flatten `a.b.c` (Field nodes over an Ident root) into a dotted path,
 /// or `None` for anything else.
-fn dotted_path(e: &crate::ast::Expr) -> Option<Vec<String>> {
+pub(crate) fn dotted_path(e: &crate::ast::Expr) -> Option<Vec<String>> {
     match &*e.kind {
         ExprKind::Ident(id) => Some(vec![id.name.clone()]),
         ExprKind::Field { target, name } => {
@@ -1168,7 +1178,7 @@ impl super::FuncBuilder<'_> {
     /// regardless of its binding shape. Strip a leading `_tb` segment
     /// (only when it matches `ctx.tb_field` AND a real component field
     /// follows) so a user component literally named `_tb` is untouched.
-    fn strip_tb_prefix<'p>(&self, path: &'p [String]) -> &'p [String] {
+    pub(crate) fn strip_tb_prefix<'p>(&self, path: &'p [String]) -> &'p [String] {
         if path.len() >= 2
             && Some(path[0].as_str()) == self.ctx.tb_field.as_deref()
             && self.ctx.component_fields.contains_key(&path[1])
@@ -1197,6 +1207,13 @@ impl super::FuncBuilder<'_> {
                 if let Some(&head_cid) = self.ctx.component_fields.get(&path[0]) {
                     let (recv, method) = path.split_at(path.len() - 1);
                     let method = method[0].clone();
+                    // A path through a data-only scoreboard sub-component
+                    // (`top.sb.expected.push(...)`) is a scoreboard op, not
+                    // a component method call — let the scoreboard handlers
+                    // claim it instead of erroring in resolve_component_recv.
+                    if self.recv_is_scoreboard_sub(head_cid, &recv[1..]) {
+                        return Ok(None);
+                    }
                     let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
                     let comp = &self.ctx.components[cid.index()];
                     if comp.method(&method).is_none() {
@@ -1251,6 +1268,11 @@ impl super::FuncBuilder<'_> {
         };
         let (recv, field) = path.split_at(path.len() - 1);
         let field = &field[0];
+        // A path through a data-only scoreboard sub-component is not a
+        // `Dut`-handle bind — let the scoreboard handlers claim it.
+        if self.recv_is_scoreboard_sub(head_cid, &recv[1..]) {
+            return Ok(false);
+        }
         let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
         let comp = &self.ctx.components[cid.index()];
         if !matches!(
@@ -1303,6 +1325,13 @@ impl super::FuncBuilder<'_> {
                 if let Some(&head_cid) = self.ctx.component_fields.get(&path[0]) {
                     let (recv, field) = path.split_at(path.len() - 1);
                     let field = field[0].clone();
+                    // A receiver ending in a data-only scoreboard sub
+                    // (`top.sb.<scalar>`) is NOT a component-field write —
+                    // fall through so the scoreboard scalar-write path
+                    // (`scoreboard_root`) handles it.
+                    if self.recv_is_scoreboard_sub(head_cid, &recv[1..]) {
+                        return Ok(None);
+                    }
                     let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
                     let comp = &self.ctx.components[cid.index()];
                     match comp.field(&field).map(|f| &f.kind) {
@@ -1353,6 +1382,12 @@ impl super::FuncBuilder<'_> {
                 if let Some(&head_cid) = self.ctx.component_fields.get(&path[0]) {
                     let (recv, field) = path.split_at(path.len() - 1);
                     let field = field[0].clone();
+                    // A receiver ending in a data-only scoreboard sub
+                    // (`top.sb.<scalar>`) is a scoreboard read, not a
+                    // component-field read — fall through to `scoreboard_root`.
+                    if self.recv_is_scoreboard_sub(head_cid, &recv[1..]) {
+                        return Ok(None);
+                    }
                     let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
                     let comp = &self.ctx.components[cid.index()];
                     if matches!(
@@ -1368,6 +1403,28 @@ impl super::FuncBuilder<'_> {
             }
         }
         Ok(None)
+    }
+
+    /// True when the receiver path `segs` (relative to `head`) terminates
+    /// at a data-only scoreboard sub-component field (`top.sb`). Such a
+    /// path is a scoreboard access, not a component-field path — the
+    /// component-field resolvers fall through so `scoreboard_root` handles
+    /// it. A non-terminal `ScoreboardSub` (a board can hold no subs) or an
+    /// unresolvable segment returns false (the normal resolver then
+    /// produces the precise error).
+    fn recv_is_scoreboard_sub(&self, head: ComponentId, segs: &[String]) -> bool {
+        let mut cid = head;
+        for (i, seg) in segs.iter().enumerate() {
+            let comp = &self.ctx.components[cid.index()];
+            match comp.field(seg).map(|f| &f.kind) {
+                Some(ComponentFieldKind::Sub { component }) => cid = *component,
+                Some(ComponentFieldKind::ScoreboardSub { .. }) => {
+                    return i == segs.len() - 1;
+                }
+                _ => return false,
+            }
+        }
+        false
     }
 
     /// Walk a sub-component receiver path from a head component down
@@ -1541,6 +1598,116 @@ impl super::FuncBuilder<'_> {
             kind,
             n: Box::new(n),
         }))
+    }
+
+    /// Lower `<env>.quiesced(N)` to a conjunction of `idle(N)` predicates
+    /// over every LEAF sub-component reachable from the receiver — the
+    /// env-level aggregation form (spec §8.x). Mirrors v1's
+    /// `resolve_component_quiesced_predicate` + `collect_quiesced_paths`:
+    /// the receiver's sub-component tree is walked, and each leaf (a
+    /// component with no further sub-components, or a data-only scoreboard
+    /// sub) contributes one `idle(N)` term. A receiver with no
+    /// sub-components is itself the single leaf. Returns `None` when the
+    /// callee is not a `quiesced` predicate on a known component instance.
+    pub(crate) fn as_component_quiesced(
+        &mut self,
+        callee: &AstExpr,
+        args: &[CallArg],
+    ) -> Result<Option<IrExpr>, LowerError> {
+        let ExprKind::Field { target, name } = &*callee.kind else {
+            return Ok(None);
+        };
+        if name.name != "quiesced" {
+            return Ok(None);
+        }
+        let Some(raw) = dotted_path(target) else {
+            return Ok(None);
+        };
+        let path = self.strip_tb_prefix(&raw).to_vec();
+        let Some(&head_cid) = path.first().and_then(|h| self.ctx.component_fields.get(h)) else {
+            return Ok(None);
+        };
+        // Resolve the receiver to its component (errors if a mid-path
+        // segment is not a sub-component).
+        let recv_cid = self.resolve_component_recv(head_cid, &path[1..])?;
+        if args.len() != 1 {
+            return Err(unsupported(
+                &format!("`quiesced(...)` with {} arguments", args.len()),
+                "the quiesce predicate takes exactly one cycle-count argument",
+            ));
+        }
+        let CallArg::Expr(n_expr) = &args[0] else {
+            return Err(unsupported("a named argument to `quiesced`", ""));
+        };
+        let n = self.lower_expr_no_ports(n_expr)?;
+
+        // Collect every leaf sub-component instance path under the receiver.
+        let mut leaves: Vec<Vec<String>> = Vec::new();
+        let mut stack: std::collections::HashSet<ComponentId> = std::collections::HashSet::new();
+        self.collect_quiesce_leaves(recv_cid, path.clone(), &mut stack, &mut leaves);
+
+        // Each leaf → `idle(N)` (both stamps). AND them together. A single
+        // leaf yields a bare `ComponentIdle` (no redundant `&& true`),
+        // matching v1's per-condition expansion.
+        let mut terms = leaves.into_iter().map(|leaf| IrExpr::ComponentIdle {
+            base: ComponentBase::Path(leaf),
+            kind: crate::ir::IdleKind::Both,
+            n: Box::new(n.clone()),
+        });
+        let first = terms.next().expect(
+            "collect_quiesce_leaves always yields at least the receiver as a leaf",
+        );
+        let conj = terms.fold(first, |acc, t| {
+            IrExpr::Binary(crate::ir::BinOp::And, Box::new(acc), Box::new(t))
+        });
+        Ok(Some(conj))
+    }
+
+    /// Walk the sub-component tree rooted at `cid`/`inst_path`, pushing one
+    /// instance path per LEAF. A component with at least one sub-component
+    /// (`Sub` or `ScoreboardSub`) is NOT a leaf — only its descendants are.
+    /// A component with no sub-components, or a data-only scoreboard sub, is
+    /// a leaf. Mirrors v1's `collect_quiesced_paths`, including its
+    /// cycle guard: a by-value component cycle is not C++-constructible but
+    /// IS expressible in the schema (all component ids are registered before
+    /// field lowering, so two envs can name each other), so a revisited
+    /// component terminates as a leaf instead of recursing forever.
+    fn collect_quiesce_leaves(
+        &self,
+        cid: ComponentId,
+        inst_path: Vec<String>,
+        stack: &mut std::collections::HashSet<ComponentId>,
+        out: &mut Vec<Vec<String>>,
+    ) {
+        if !stack.insert(cid) {
+            out.push(inst_path);
+            return;
+        }
+        let comp = &self.ctx.components[cid.index()];
+        let mut found_sub = false;
+        for f in &comp.fields {
+            match &f.kind {
+                ComponentFieldKind::Sub { component } => {
+                    found_sub = true;
+                    let mut sub_path = inst_path.clone();
+                    sub_path.push(f.name.clone());
+                    self.collect_quiesce_leaves(*component, sub_path, stack, out);
+                }
+                ComponentFieldKind::ScoreboardSub { .. } => {
+                    // A data-only scoreboard is always a leaf (it has no
+                    // sub-components of its own).
+                    found_sub = true;
+                    let mut sub_path = inst_path.clone();
+                    sub_path.push(f.name.clone());
+                    out.push(sub_path);
+                }
+                _ => {}
+            }
+        }
+        if !found_sub {
+            out.push(inst_path);
+        }
+        stack.remove(&cid);
     }
 }
 
