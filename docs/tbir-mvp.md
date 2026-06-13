@@ -22,6 +22,7 @@ checked against the code at the cited location.
 | #350 | Helper handling: pure helpers stay `Expr::Call` and emit as file-scope C++ functions; impure helpers (DUT access or sync) CFG-inline at every call site; recursion rejected with the cycle path. |
 | #351 | `wait until` lowering + emission: `Single`/`AllOf` modes, optional `timeout N cycles [fail("...")]` with the v1 diagnostic block shape, plus the `wait_until_counter_test` fixture. |
 | #364 | `transaction` declarations + non-randomize usage: `RecordSchema` records table on `TbProgram`, record-typed locals (`let t : TxnType` default construction with let-site re-init), field writes/reads (`RecordFieldWrite` / `Expr::RecordField`), value-record struct emission, plus the `transaction_basic_test` fixture. `randomize` stays rejected at statement level, pointing at the constraint-IR seam. |
+| #366 | `transactor` declarations (unbound DUT-poking BFM subset): `TransactorSchema` table on `TbProgram`, one `TbFunction` per method (`kind: TransactorBody` — v1's `field_subs` substitution replaced by lowering-time DUT resolution), `Stmt::TransactorCall` carrying the never-inlined `Expr::Call(CallTarget::TransactorMethod ..)` edge, sync-wait method-lambda emission, ternary expressions (`Expr::Ternary`), plus 8 corpus fixtures registered. |
 
 ### Construct subset
 
@@ -47,7 +48,10 @@ text), `let t : TxnType` default-constructs (re-running field
 defaults at the let site, so loop iterations re-initialize like v1's
 in-place declaration), and `t.field` reads/writes work everywhere a
 scalar local does — including format args, branch conditions, and
-loop bounds; and the `bus`
+loop bounds. Ternary expressions (`cond ? a : b`) lower to
+`Expr::Ternary` (both backends emit the C++ ternary; the port-hoisted
+form evaluates both arms' side-effect-free port reads eagerly).
+The `bus`
 construct subset (added 2026-06-12, `src/ir/lower/bus.rs`):
 declarations (inline or `use`-imported), test-scope `= bind dut`
 bindings, protocol-typed signal access (`<bind>.<sig>`,
@@ -56,12 +60,40 @@ auto-handshakes (`<bind>.<ch>.send(...)` / `.recv()`, CFG-inlined to
 v1's 16-cycle-budget valid/ready dance), and **blocking `tlm_method`
 calls**, which lower to `Expr::Call(CallTarget::TransactorMethod {
 bus_field, method }, args)` — the design doc's sequence→transactor
-call edge, never inlined at the IR level. Everything else —
+call edge, never inlined at the IR level.
+`transactor` declarations lower in their **unbound DUT-poking BFM
+subset**: no `bound to <BusType>`, no generics, exactly one
+module-typed field (the DUT handle — its type must match the test's
+DUT, since the IR keeps the single-DUT model), and
+`hookable`/`function` methods with scalar (≤64-bit) params and
+optional scalar return. Each method body lowers to its own
+`TbFunction` (`kind: TransactorBody`) with the transactor's DUT field
+as the body's DUT name — v1's emission-time `field_subs` substitution
+moved to lowering-time resolution, per the design doc. Instances are
+`active`-mode testbench fields; `<inst>.dut = dut` is validated and
+erased (the bind is static); calls lower to `Stmt::TransactorCall`
+carrying the `Expr::Call(CallTarget::TransactorMethod { .. })` edge —
+**never inlined** (the Tier-1/Tier-0 placement seam; the placement
+pass classifies call-carrying blocks `TimingTolerant`, and
+`lower_coroutine` tags method bodies as Tier-0 FSM candidates).
+Methods keep v1's synchronous hookable semantics — their waits emit
+as `tick()` loops, never scheduler suspensions — so clock-qualified
+waits and timed `wait until` are rejected *inside method bodies*
+(untimed `wait until` emits v1's `while (!(pred)) tick();`).
+The `CallTarget::TransactorMethod` edge thus has TWO sanctioned
+homes, dispatched by which testbench namespace `bus_field` resolves
+in (the namespaces are disjoint — a name collision is rejected at
+lowering): a bus binding → the entire Assign RHS, expanded by the
+tbir backend into v1's req/rsp wire protocol; a transactor field →
+the `Stmt::TransactorCall` payload, emitted as a direct
+`<Type>_<method>` lambda call. Everything else —
 `randomize` (awaits the constraint-IR `ConstraintRef` seam),
-`agent`/`event`, transactors, scoreboards, `fork` (including
+`agent`/`event`, bus-bound/event-driven transactors, transactor state
+fields, passive instances, scoreboards, `fork` (including
 `fork bus.method(...)`/`join_all` TLM issue), out-of-order TLM lanes,
 bus bind remaps/generics, transaction `when` subtype blocks,
-non-scalar / wider-than-64-bit transaction fields, ... —
+non-scalar / wider-than-64-bit transaction fields and method
+params, ... —
 is rejected at lowering time with `LowerError::Unsupported` naming the
 construct and pointing at `--codegen v1`. Lowering never silently
 mis-lowers; that property is load-bearing and tested
@@ -95,6 +127,14 @@ none — `extra_harc` joins additional `tests/fixtures/` files to the
 | `axilite_bus_extern_test` | `AxiLiteRegs` | `AxiLiteRegs.sv` | pass | use-imported bus declaration |
 | `axilite_bus_send_test` | `AxiLiteRegs` | `AxiLiteRegs.sv` | pass | channel send/recv auto-handshakes |
 | `tlm_method_blocking_bus_test` | `TlmMemory` | `TlmMemory.sv` | pass | blocking tlm_method → TransactorMethod call edge |
+| `cam_dual_basic_test` | `Mshr_Addr_Cam_Dual` | `cam_dual_basic.sv` | pass | transactor: void methods, sync waits, statement calls |
+| `cam_value_basic_test` | `Tag_Value_Cam` | `cam_value_basic.sv` | pass | transactor: bool/wide-scalar params, reset pulse method |
+| `cpu_pipeline_test` | `CpuPipe` | `cpu_pipeline.sv` | pass | transactor: wait-less methods (pure pokes) |
+| `linklist_doubly_test` | `SchedList` | `linklist_doubly.sv` | pass | transactor: `-> T` methods, ternary over port reads, let-bound calls |
+| `mac_table_test` | `mac_table` | `mac_table.sv` | pass | transactor: 48-bit args, lowercase module type |
+| `noc_credit_test` | `NocCreditTop` | `noc_credit.sv` | pass | transactor: `for`-loop waits with param bounds |
+| `buf_mgr_sm_test` | `BufMgrSm` | `buf_mgr_sm.sv` + 3 | pass | transactor: `if` inside `for` with waits, multi-file DUT |
+| `buf_mgr_test` | `BufMgr` | `buf_mgr.sv` + 4 | pass | transactor: `while` over port read, `return dut.port`, assert in method |
 
 (The registry has since grown past this table via the backfill sweep —
 see [tbir-coverage.md](tbir-coverage.md); the registry file is the
@@ -328,11 +368,47 @@ reason. Code locations are authoritative.
      method calls, and `fork`/`join_all` TLM issue (needs the design's
      `Terminator::Fork` + `ForkArmKind::BusMethodCall`).
 
+10. **Transactor instance state is not materialized.** v1 emits a
+    per-transactor C++ struct (DUT pointer member + heartbeat fields),
+    a testbench member for each instance, `<Type>_<method>_pre`/`_post`
+    hook vectors with fan-out loops in every method lambda, and the
+    `xact.dut = dut` pointer copy. The tbir backend emits none of
+    those: the lowered subset has no transactor state (the only field
+    is the DUT handle, statically bound), statement-level
+    `on obj.method pre/post` hooks are rejected at lowering (so the
+    vectors would be permanently empty), and `idle()` predicates are
+    out of subset (so the heartbeat stamps are unread). Method lambdas
+    take no `self`; `Stmt::TransactorCall` emits a direct
+    `<Type>_<method>(args)` call. Observable only on broken programs:
+    a method call without a preceding `xact.dut = dut` null-derefs
+    under v1 but drives the DUT under tbir (lowering validates the
+    bind statement *when present* — binding anything other than the
+    test DUT is rejected).
+
+11. **`sim_end` clock attribution when the run body never suspends.**
+    Found via the ternary addition: `linklist_basic_test` now lowers
+    and matches v1 on verdict and on every trace event except the
+    final `sim_end`, whose `clock`/`clock_cycle` fields are `""`/`0`
+    under v1 but `"clk"`/`N` under tbir. Root cause is the
+    helper-handling split (divergence of PR #350, latent until now):
+    that fixture's `run` body contains no top-level wait — every wait
+    lives inside impure helpers, which v1 emits as synchronous
+    lambdas — so under v1 the entire test executes inside
+    `sched.bootstrap()` and the pre-loop settle dump
+    (`_harc_trace_dump_at(now_ps, "", 0)`) is the *last* timing
+    update before `sim_end`. Under tbir the helpers are CFG-inlined,
+    the run coroutine suspends for real, and the drive loop's final
+    edge stamps `"clk"`. Verdicts and all other events are identical;
+    the fixture stays **unregistered** until the trace-diff
+    normalization (or v1's pre-loop stamp) is reconciled.
+
 Minor, same spirit: `IndexVec` is a plain `Vec` plus typed id structs;
-`FunctionKind` has no `TransactorBody` (the `transactor` construct is
-out of subset); the design's `AssertFail` enum collapsed into a single
+the design's `AssertFail` enum collapsed into a single
 `FmtArgs on_fail` because both source forms bump `errors` identically
-in v1.
+in v1. (`FunctionKind::TransactorBody` exists since the transactor
+slice, carrying `transactor: TransactorId` rather than the design's
+`{ bus, method }` pair — the lowered subset is the *unbound* form, so
+there is no bus to name, and the method name lives in the schema.)
 
 ### Verifier coverage summary
 
@@ -359,7 +435,11 @@ deeper construct was reached — the file-level scan in
 text named `transaction`. That predicted shift has now happened:
 with `transaction` in the subset, `wait_until_quiesce_unsupported`
 names the `agent` construct (next item in file order),
-`axilite_seqdrv_unsupported` names `transactor`, and
+`axilite_seqdrv_unsupported` named `transactor` — and shifted again
+with the transactor slice: that fixture's transactor now passes the
+item gate, so the snapshot names `tseq` (its event-driven transactor
+body would also reject, but `tseq` sits earlier in the file-gate
+order) — and
 `axilite_constraint_unsupported` is the statement-level `randomize`
 rejection pointing at the constraint-IR seam. The same mechanics
 apply to the next construct slice: a fixture's snapshot always names
@@ -381,14 +461,14 @@ see its decision log):
   `randomize_analysis`, `extract_port_set`, `hoist_stimulus`,
   `lower_coroutine` for FSM-shaped backends.
 - **Subset growth**: randomize (needs the constraint-IR
-  `ConstraintRef` seam), the `transactor` construct (target-side TLM
-  method threads → `FunctionKind::TransactorBody` per the design;
-  the initiator-side `CallTarget::TransactorMethod` call edge is
-  produced by bus `tlm_method` lowering since 2026-06-12), `fork`
-  (incl. `ForkArmKind::BusMethodCall` for the OOO TLM lanes),
-  scoreboards, agents/events. (Transaction declarations/non-randomize
-  records, range/cross bins, `any of`, and the bus subset all landed
-  2026-06-12.)
+  `ConstraintRef` seam; transaction *declarations* and non-randomize
+  record usage landed 2026-06-12, as did range/cross bins, `any of`,
+  the bus subset, and unbound DUT-poking transactors — the
+  initiator-side `CallTarget::TransactorMethod` call edge is produced
+  by both bus `tlm_method` lowering and transactor-field call
+  lowering; bus-bound and event-driven transactor forms await the
+  event slice), `fork` (incl. `ForkArmKind::BusMethodCall` for the
+  OOO TLM lanes), scoreboards, agents/events.
 - **Placement-split backends** proceed per the multi-target placement
   model in [tb-ir-design.md](tb-ir-design.md) (tiers, timing classes,
   `TargetProfile` capability checks) once the passes exist.

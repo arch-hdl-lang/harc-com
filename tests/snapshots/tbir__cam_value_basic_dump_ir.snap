@@ -1,0 +1,121 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 CamValueBasicTb { dut: Tag_Value_Cam } xactor xact=x0
+  test CamValueBasicTest tb=tb0 run=fn2 check=- clock=clk@10000ps(SysDomain)
+  transactor x0 CamValueXactor { dut: Tag_Value_Cam }
+    method write(4 args) = fn0
+    method reset_dut(0 args) = fn1
+
+fn fn0 CamValueXactor_write [kind=TransactorBody(x0)]
+  params:
+    idx : uint<3>
+    key : uint<16>
+    value : uint<32>
+    set : bool
+  locals:
+    %0 idx : uint<3>
+    %1 key : uint<16>
+    %2 value : uint<32>
+    %3 set : bool
+  entry = b0
+
+  b0:
+    DutWrite(dut.write_valid, 1)
+    DutWrite(dut.write_idx, %idx)
+    DutWrite(dut.write_key, %key)
+    DutWrite(dut.write_value, %value)
+    DutWrite(dut.write_set, %set)
+    -> WaitCycles(1, b1)
+
+  b1:
+    DutWrite(dut.write_valid, 0)
+    -> Return
+
+fn fn1 CamValueXactor_reset_dut [kind=TransactorBody(x0)]
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.write_valid, 0)
+    -> WaitCycles(2, b1)
+
+  b1:
+    DutWrite(dut.rst, 0)
+    -> WaitCycles(1, b2)
+
+  b2:
+    -> Return
+
+fn fn2 run_CamValueBasicTest [kind=Run, owner=tb0]
+  entry = b0
+
+  b0:
+    Log(info, "Tag_Value_Cam value-payload CAM test")
+    TransactorCall(xact.reset_dut())
+    -> WaitCycles(1, b1)
+
+  b1:
+    DutWrite(dut.search_key, 256)
+    -> WaitCycles(1, b2)
+
+  b2:
+    AssertCheck { cond: (dut.search_any == 0), on_fail: "empty: search_any=%lld, expected 0", dut.search_any }
+    Log(info, "PASS: empty CAM rejects all searches")
+    TransactorCall(xact.write(0, 256, 3735879680, 1))
+    TransactorCall(xact.write(1, 512, 3735879681, 1))
+    TransactorCall(xact.write(2, 768, 3735879682, 1))
+    DutWrite(dut.search_key, 256)
+    -> WaitCycles(1, b3)
+
+  b3:
+    AssertCheck { cond: (dut.search_any == 1), on_fail: "key=0x100: search_any=%lld, expected 1", dut.search_any }
+    AssertCheck { cond: (dut.search_first == 0), on_fail: "key=0x100: first=%lld, expected 0", dut.search_first }
+    AssertCheck { cond: (dut.read_value == 3735879680), on_fail: "key=0x100: read_value=%lld, expected 0xDEAD0000", dut.read_value }
+    Log(info, "PASS: key=0x100 Ã¢Â\u{86}Â\u{92} idx 0, value 0xDEAD0000")
+    DutWrite(dut.search_key, 512)
+    -> WaitCycles(1, b4)
+
+  b4:
+    AssertCheck { cond: (dut.search_any == 1), on_fail: "key=0x200: search_any=%lld, expected 1", dut.search_any }
+    AssertCheck { cond: (dut.search_first == 1), on_fail: "key=0x200: first=%lld, expected 1", dut.search_first }
+    AssertCheck { cond: (dut.read_value == 3735879681), on_fail: "key=0x200: read_value=%lld, expected 0xDEAD0001", dut.read_value }
+    Log(info, "PASS: key=0x200 Ã¢Â\u{86}Â\u{92} idx 1, value 0xDEAD0001")
+    DutWrite(dut.search_key, 768)
+    -> WaitCycles(1, b5)
+
+  b5:
+    AssertCheck { cond: (dut.search_any == 1), on_fail: "key=0x300: search_any=%lld, expected 1", dut.search_any }
+    AssertCheck { cond: (dut.search_first == 2), on_fail: "key=0x300: first=%lld, expected 2", dut.search_first }
+    AssertCheck { cond: (dut.read_value == 3735879682), on_fail: "key=0x300: read_value=%lld, expected 0xDEAD0002", dut.read_value }
+    Log(info, "PASS: key=0x300 Ã¢Â\u{86}Â\u{92} idx 2, value 0xDEAD0002")
+    DutWrite(dut.search_key, 2457)
+    -> WaitCycles(1, b6)
+
+  b6:
+    AssertCheck { cond: (dut.search_any == 0), on_fail: "unknown key: search_any=%lld, expected 0", dut.search_any }
+    Log(info, "PASS: unknown key Ã¢Â\u{86}Â\u{92} search_any == 0")
+    TransactorCall(xact.write(1, 512, 3405939234, 1))
+    DutWrite(dut.search_key, 512)
+    -> WaitCycles(1, b7)
+
+  b7:
+    AssertCheck { cond: (dut.read_value == 3405939234), on_fail: "update slot 1: read_value=%lld, expected 0xCAFE2222", dut.read_value }
+    Log(info, "PASS: update slot 1 value to 0xCAFE2222")
+    TransactorCall(xact.write(0, 0, 0, 0))
+    DutWrite(dut.search_key, 256)
+    -> WaitCycles(1, b8)
+
+  b8:
+    AssertCheck { cond: (dut.search_any == 0), on_fail: "post-clear: key 0x100 search_any=%lld, expected 0", dut.search_any }
+    Log(info, "PASS: post-clear: key 0x100 misses")
+    TransactorCall(xact.reset_dut())
+    DutWrite(dut.search_key, 512)
+    -> WaitCycles(1, b9)
+
+  b9:
+    AssertCheck { cond: (dut.search_any == 0), on_fail: "post-reset: search_any=%lld, expected 0", dut.search_any }
+    Log(info, "PASS: post-reset: empty")
+    -> Return

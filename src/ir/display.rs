@@ -41,6 +41,9 @@ impl Display for TbProgram {
                     write!(f, "[{ms}]")?;
                 }
             }
+            for (field, x) in &tb.transactor_fields {
+                write!(f, " xactor {field}=x{}", x.0)?;
+            }
             writeln!(f)?;
         }
         for t in &self.tests {
@@ -85,6 +88,24 @@ impl Display for TbProgram {
             }
             for k in &r.keeps {
                 writeln!(f, "    keep {k} (inert)")?;
+            }
+        }
+        for (i, x) in self.transactors.iter().enumerate() {
+            writeln!(
+                f,
+                "  transactor x{} {} {{ {}: {} }}",
+                i, x.name, x.dut_field, x.dut_type
+            )?;
+            for m in &x.methods {
+                writeln!(
+                    f,
+                    "    method {}({} arg{}){} = fn{}",
+                    m.name,
+                    m.n_params,
+                    if m.n_params == 1 { "" } else { "s" },
+                    if m.has_ret { " -> ret" } else { "" },
+                    m.function.0
+                )?;
             }
         }
         for (i, cg) in self.covgroups.iter().enumerate() {
@@ -164,6 +185,9 @@ fn kind_str(k: &FunctionKind) -> String {
         FunctionKind::Check => "Check".to_string(),
         FunctionKind::SamplerAuto { covgroup } => format!("SamplerAuto(cg{})", covgroup.0),
         FunctionKind::Helper => "Helper".to_string(),
+        FunctionKind::TransactorBody { transactor } => {
+            format!("TransactorBody(x{})", transactor.0)
+        }
     }
 }
 
@@ -201,6 +225,14 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         Stmt::CovReport(inst) => {
             format!("CovReport({}.cg{})", inst.tb_field, inst.covgroup.0)
         }
+        Stmt::TransactorCall { dest, call } => match dest {
+            Some(d) => format!(
+                "TransactorCall({} = {})",
+                local_str(func, *d),
+                expr_str(func, call)
+            ),
+            None => format!("TransactorCall({})", expr_str(func, call)),
+        },
         Stmt::FailDiag { guard, args } => match guard {
             Some(g) => format!(
                 "FailDiag {{ unless: {}, {} }}",
@@ -333,6 +365,12 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
             expr_str(func, b)
         ),
         Expr::Unary(op, a) => format!("{}{}", un_op_str(*op), expr_str(func, a)),
+        Expr::Ternary(c, t, e) => format!(
+            "({} ? {} : {})",
+            expr_str(func, c),
+            expr_str(func, t),
+            expr_str(func, e)
+        ),
         Expr::CovBin { inst, point, bin } => {
             format!("CovBin({}.cg{}, {point}, {bin})", inst.tb_field, inst.covgroup.0)
         }

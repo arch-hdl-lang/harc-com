@@ -3,7 +3,10 @@
 Snapshot date: **2026-06-12** (registry backfill sweep, full
 `tests/run_fixtures.sh` manifest vs `harc dump-ir` / `--codegen tbir`).
 Amended the same day by the `transaction` slice — see the resolved
-`transaction` group below for its residual blocker map.
+`transaction` group below for its residual blocker map — and by the
+`transactor` slice (resolved group + residual map below; 8 fixtures
+registered, plus one newly-lowerable-but-divergent fixture recorded
+under the singleton table).
 
 **This file is a snapshot, not a source of truth.** The registry
 (`tests/tbir_equiv_fixtures.txt`) is the source of truth for what is
@@ -24,6 +27,13 @@ outdirs, `harc trace-diff`).
 | Blocked by `LowerError::Unsupported` | 79 |
 | Lowerable but diverges (v1 ≠ tbir) | **0** |
 | Manifest rows total (incl. two double-`--test` fixtures) | 96 |
+
+*(Amended by the transactor slice: the divergence count is no longer
+zero — `linklist_basic_test`, unblocked by ternary support, lowers
+cleanly but trace-diverges on the final `sim_end` event's clock
+attribution. See the singleton table and docs/tbir-mvp.md
+divergence 11. It is the only known lowerable-but-divergent fixture
+and stays out of the registry.)*
 
 (The registry held 7 rows before this sweep; the 7th, `fatal_path_test`,
 is registry-only — a deliberate-failure fixture cannot appear in
@@ -48,17 +58,42 @@ blocks. A construct worker picking up a group unlocks exactly the
 fixtures listed; fixtures appear in `run_fixtures.sh` manifest order
 within each group.
 
-### `transactor` construct — 19 fixtures
+### `transactor` construct — RESOLVED 2026-06-12 (transactor slice)
 
-> TB-IR lowering does not support the `transactor` construct yet
+`transactor` declarations now lower in their unbound DUT-poking BFM
+subset (one module-typed field, `active` instances, hookable methods
+with scalar ≤64-bit params, synchronous waits; see docs/tbir-mvp.md).
+Of the 24 fixtures gated on `transactor` at slice start (the 19 below
+plus the 5 the `transaction` slice moved into this group), **8 became
+fully lowerable**, passed the v1-vs-tbir equivalence pair, and are
+registered:
 
-`analysis_sink_connect_test`, `axilite_regs_full_test`,
-`regblock_basic_test`, `regblock_fields_test`, `regblock_access_test`,
-`regblock_bitbash_test`, `regblock_addrmap_test`, `regblock_alias_test`,
-`regblock_record_test`, `bind_remap_test`, `cam_dual_basic_test`,
-`cam_value_basic_test`, `cpu_pipeline_test`, `linklist_doubly_test`,
-`mac_table_test`, `noc_credit_test`, `buf_mgr_sm_test`,
-`aes_cipher_top_test`, `buf_mgr_test`
+`cam_dual_basic_test`, `cam_value_basic_test`, `cpu_pipeline_test`,
+`linklist_doubly_test`, `mac_table_test`, `noc_credit_test`,
+`buf_mgr_sm_test`, `buf_mgr_test`
+
+The slice also brought ternary expressions into the subset (needed by
+`linklist_doubly_test`'s method bodies), which moved the singleton
+`linklist_basic_test` out of its ternary blocker — see the singleton
+table for its new (divergence, not lowering) status.
+
+Residual first-blocker map for the other 16 (re-run of
+`harc dump-ir`, 2026-06-12):
+
+| Moved to group | Fixtures |
+|---|---|
+| `bus` (3) | `axilite_regs_full_test`, `bind_remap_test`, `transactor_parse_test` |
+| `regblock` (7) | `regblock_basic_test`, `regblock_fields_test`, `regblock_access_test`, `regblock_bitbash_test`, `regblock_addrmap_test`, `regblock_alias_test`, `regblock_record_test` |
+| `scoreboard` (2) | `analysis_sink_connect_test`, `axilite_env_test` |
+| `tseq` (2) | `axilite_seqdrv_test`, `transactor_active_test` |
+| transactor state fields (1) | `axilite_hooks_test` — "transactor `HookXactor` state field `last_read`" (scalar state on the transactor; needs instance-state materialization) |
+| >64-bit method params (1) | `aes_cipher_top_test` — "transactor method `AesXactor.load_block` parameter `key` wider than 64 bits (uint<128>)" (the tbir value model is u64) |
+
+As with the `transaction` slice, most of the moved fixtures stack
+several constructs (bus + scoreboard + sequencer + events); the
+counts will keep shifting as those slices land. The 2 transactor-
+specific residuals (`axilite_hooks_test`, `aes_cipher_top_test`) stay
+with this construct's owner.
 
 ### `transaction` construct — RESOLVED 2026-06-12 (transaction slice)
 
@@ -189,7 +224,7 @@ both constructs are needed.)
 | `extern_fn_ref_test` | TB-IR lowering does not support the `extern fn` construct yet |
 | `async_fifo_test` | TB-IR lowering does not support time literals in expression position yet |
 | `dma_engine_test` | TB-IR lowering does not support the `scoreboard` construct yet |
-| `linklist_basic_test` | TB-IR lowering does not support ternary expressions yet |
+| `linklist_basic_test` | ~~ternary expressions~~ **lowers since the transactor slice (ternary landed), but diverges**: v1 stamps `sim_end` with `clock:""` because the fixture's run body has no top-level wait — under v1's sync-helper model the whole test runs inside `sched.bootstrap()` and the pre-loop settle dump is the last timing update. tbir's CFG-inlined helpers suspend for real and stamp `"clk"`. Verdict + all other events identical; unregistered pending trace-normalization reconciliation (docs/tbir-mvp.md divergence 11) |
 | `mshr_cocotb_test` | TB-IR lowering does not support the `const` construct yet |
 | `packed_vec_lane_test` | TB-IR lowering does not support assignment to a non-port, non-local target yet |
 | `if_wait_for_in_then_test` | TB-IR lowering does not support test-scope `let done_pulses` yet (only `let dut : <Type>` is lowered at test scope) |
@@ -219,15 +254,15 @@ no schema v4 needed.
 
 ## Suggested sequencing for construct workers
 
-1. **`transaction` → `transactor`** (17 + 19 fixtures): the two
-   biggest groups, and `transactor` depends on `transaction`.
-   *Update 2026-06-12: the `transaction` half is DONE (see the
-   resolved group above). The `transactor` slice now has its
-   prerequisite, but note the residual map — the former
-   `transaction`-group fixtures need `agent`/`scoreboard`/`sequencer`
-   too, so the transactor worker should expect the same
-   first-blocker churn. The `transactor` slice now ALSO unlocks 10
-   of the TLM-family fixtures (see the bus group's residual map).*
+1. ~~**`transaction` → `transactor`** (17 + 19 fixtures): the two
+   biggest groups, and `transactor` depends on `transaction`.~~
+   **BOTH DONE 2026-06-12** — `transaction` slice (see its resolved
+   group), then `transactor` slice (8 fixtures registered; the
+   predicted first-blocker churn happened — see its residual map.
+   Transactor-specific follow-ups still owed: scalar state fields on
+   transactors and >64-bit method params). The `transactor` slice
+   also unlocks 10 of the TLM-family fixtures (see the bus group's
+   residual map).
 2. ~~**`bus`** (15 fixtures): unlocks the entire TLM family.~~
    **LANDED 2026-06-12** — 3 fixtures + 1 new fixture registered;
    12 residuals moved to `transactor` (10) and `fork` (2).

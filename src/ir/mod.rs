@@ -50,6 +50,10 @@ ir_id!(
     /// Index into `TbProgram::records`.
     RecordId
 );
+ir_id!(
+    /// Index into `TbProgram::transactors`.
+    TransactorId
+);
 
 /// Whole-program IR for one merged HARC source file (post
 /// `merge_for_sim` + impl-for desugaring).
@@ -62,6 +66,59 @@ pub struct TbProgram {
     /// Value-record schemas (`transaction` declarations), in file
     /// order. The design doc's records table; see `RecordSchema`.
     pub records: Vec<RecordSchema>,
+    /// Transactor schemas (`transactor` declarations), in file order.
+    /// See `TransactorSchema`.
+    pub transactors: Vec<TransactorSchema>,
+}
+
+/// One `transactor` declaration, lowered to its structural shape.
+///
+/// Subset (the unbound DUT-poking BFM form): no generics, no
+/// `bound to <BusType>` clause, exactly one module-typed field (the
+/// DUT handle the methods drive), and `hookable`/`function` methods.
+/// Each method body lowers to its own `TbFunction` with
+/// `kind: TransactorBody` — the design doc's "one TbFunction per
+/// method" rule, with v1's `field_subs` substitution replaced by
+/// lowering-time resolution (the method body's DUT accesses resolve
+/// against `dut_field` and lower to ordinary `PortRef`s).
+///
+/// The IR keeps the single-DUT model: the instance's `<inst>.dut = dut`
+/// bind in the test body is validated at lowering (it must wire the
+/// test's DUT) and then erased — the static bind is the schema itself.
+#[derive(Debug, Clone)]
+pub struct TransactorSchema {
+    pub name: String,
+    /// Name of the module-typed field the method bodies drive
+    /// (`dut` by convention).
+    pub dut_field: String,
+    /// The field's declared module type. Cross-checked against the
+    /// testbench's DUT type when an instance field is lowered.
+    pub dut_type: String,
+    /// Methods in declaration order (always-on body first, then the
+    /// `when active` body — all methods require an `active` instance
+    /// in this subset, so the distinction carries no behavior here).
+    pub methods: Vec<TransactorMethodSchema>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransactorMethodSchema {
+    pub name: String,
+    /// The lowered method body (`kind: TransactorBody`). Its `params`
+    /// mirror the method's declared parameters and its `ret` is the
+    /// return-value slot for `-> T` methods.
+    pub function: FunctionId,
+    /// Declared parameter count — duplicated from the function so call
+    /// sites (which lower under a schema snapshot, without the
+    /// functions table) can check arity.
+    pub n_params: usize,
+    /// True for `-> T` methods (the function carries a `ret` slot).
+    pub has_ret: bool,
+}
+
+impl TransactorSchema {
+    pub fn method(&self, name: &str) -> Option<&TransactorMethodSchema> {
+        self.methods.iter().find(|m| m.name == name)
+    }
 }
 
 /// One `transaction` declaration, lowered to its structural shape:
@@ -161,6 +218,9 @@ pub struct TestbenchSchema {
     /// `BusId` table; v0 inlines the (small) per-binding method list
     /// here instead since bindings are per-test, not global.
     pub bus_bindings: Vec<BusBindingSchema>,
+    /// Transactor-typed testbench fields (field name, transactor), in
+    /// declaration order. All instances are `active` in this subset.
+    pub transactor_fields: Vec<(String, TransactorId)>,
     /// True when no `testbench` declaration existed in source and this
     /// schema was synthesized for a classic-form test. Codegen skips
     /// the `_tb` struct + wire statement for synthetic testbenches.
@@ -203,6 +263,11 @@ pub enum FunctionKind {
     Check,
     SamplerAuto { covgroup: CovgroupId },
     Helper,
+    /// One transactor method body (design doc §"Function-kind
+    /// handling": one `TbFunction` per method). `params` are the
+    /// method's declared parameters; the owning transactor and the
+    /// method name live in `TbProgram::transactors[transactor]`.
+    TransactorBody { transactor: TransactorId },
 }
 
 #[derive(Debug, Clone)]
@@ -282,6 +347,23 @@ pub enum Stmt {
     Log { level: LogLevel, args: FmtArgs },
     AssertCheck { cond: Expr, on_fail: FmtArgs },
     CovReport(CovgroupInstance),
+    /// A sequence→transactor method call — the Tier-1/Tier-0 placement
+    /// seam. `call` is ALWAYS `Expr::Call(CallTarget::TransactorMethod
+    /// { .. }, args)` (verifier-enforced) and is never inlined at the
+    /// IR level. `dest` receives the method's return value
+    /// (`let v = xact.m(...)`); `None` for void methods / discarded
+    /// results.
+    ///
+    /// Suspension nuance: the callee follows v1's synchronous hookable
+    /// model — its internal `wait`s advance the clock directly
+    /// (`tick()`), so simulated time may pass inside the call, but the
+    /// calling coroutine never yields to the scheduler. Invariant 7
+    /// ("no statement may suspend") is about scheduler suspension, so
+    /// a `Stmt` is the faithful shape.
+    TransactorCall {
+        dest: Option<LocalId>,
+        call: Expr,
+    },
     /// One `wait until … timeout` failure-diagnostic line: a
     /// `sim_log_line("FAIL", …)` that does NOT bump the error counter
     /// (v1 bumps `errors` exactly once per timed-out wait — that bump
@@ -402,6 +484,13 @@ pub enum Expr {
     RecordField { local: LocalId, field: String },
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Unary(UnOp, Box<Expr>),
+    /// `cond ? a : b`. Both backends emit the C++ ternary; port reads
+    /// inside follow the same position rules as any other subtree
+    /// (hoisted everywhere except the port-allowed positions). Note
+    /// the hoisted form evaluates both arms' port reads before
+    /// selecting — port reads are side-effect-free, so this is
+    /// observably identical to v1's lazy C++ ternary.
+    Ternary(Box<Expr>, Box<Expr>, Box<Expr>),
     CovBin {
         inst: CovgroupInstance,
         point: String,
@@ -547,6 +636,10 @@ impl TbProgram {
 
     pub fn record(&self, id: RecordId) -> &RecordSchema {
         &self.records[id.index()]
+    }
+
+    pub fn transactor(&self, id: TransactorId) -> &TransactorSchema {
+        &self.transactors[id.index()]
     }
 }
 

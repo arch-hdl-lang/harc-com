@@ -46,6 +46,12 @@ impl FuncBuilder<'_> {
                 // v1 deferred the unknown-clock error to emission; the
                 // IR pipeline rejects it at lowering with the same
                 // message shape plus the declared-clock list.
+                if self.in_transactor_method && clock.is_some() {
+                    return Err(unsupported(
+                        "`wait N cycles on <clock>` inside a transactor method",
+                        "method bodies run synchronously and know no test clocks",
+                    ));
+                }
                 let clock = match clock {
                     Some(c) => {
                         let Some(index) =
@@ -172,6 +178,15 @@ impl FuncBuilder<'_> {
                         }
                     }
                 }
+                // Statement-position transactor method call:
+                // `xact.write1(2, 17, true)` — call for effect, result
+                // (if any) discarded, mirroring v1.
+                if let ExprKind::Call { callee, args } = &*e.kind {
+                    if let Some(call) = self.lower_transactor_call(callee, args, false)? {
+                        self.push(Stmt::TransactorCall { dest: None, call });
+                        return Ok(());
+                    }
+                }
                 let what = match &*e.kind {
                     ExprKind::Call { callee, args } => match &*callee.kind {
                         ExprKind::Ident(id) => {
@@ -255,11 +270,25 @@ impl FuncBuilder<'_> {
         }
         // Bus call RHS: `let x = mem.read(a)` (TransactorMethod call
         // edge) or `let x = axil.r.recv()` (CFG-inlined handshake).
+        // Checked before transactor fields: the namespaces are
+        // disjoint (collision rejected at testbench construction).
         if self.try_lower_bus_call(
             value,
             super::bus::BusCallDest::Declare(&l.name.name),
         )? {
             return Ok(());
+        }
+        // `let v = xact.method(...)` — a transactor call edge with a
+        // result destination.
+        if let ExprKind::Call { callee, args } = &*value.kind {
+            if let Some(call) = self.lower_transactor_call(callee, args, true)? {
+                let id = self.declare(&l.name.name);
+                self.push(Stmt::TransactorCall {
+                    dest: Some(id),
+                    call,
+                });
+                return Ok(());
+            }
         }
         let e = self.lower_expr_no_ports(value)?;
         let id = self.declare(&l.name.name);
@@ -283,6 +312,9 @@ impl FuncBuilder<'_> {
             self.push(Stmt::DutWrite(port, e));
             return Ok(());
         }
+        if self.lower_transactor_dut_bind(target, value)? {
+            return Ok(());
+        }
         if let ExprKind::Ident(id) = &*target.kind {
             if let Some(local) = self.lookup(&id.name) {
                 // NOTE: `x = bus.m(...)` (bus call into an existing
@@ -290,6 +322,27 @@ impl FuncBuilder<'_> {
                 // calls only in `let`-RHS and statement position, and
                 // the reference surface is v1's. The value lowering
                 // below rejects it with a precise message.
+                // `v = xact.method(...)` — call edge into an existing
+                // local.
+                if let ExprKind::Call { callee, args } = &*value.kind {
+                    if let Some(call) = self.lower_transactor_call(callee, args, true)? {
+                        if self.record_of_local(local).is_some() {
+                            return Err(unsupported(
+                                &format!(
+                                    "assignment of a transactor method result to \
+                                     transaction local `{}`",
+                                    id.name
+                                ),
+                                "",
+                            ));
+                        }
+                        self.push(Stmt::TransactorCall {
+                            dest: Some(local),
+                            call,
+                        });
+                        return Ok(());
+                    }
+                }
                 let e = self.lower_expr_no_ports(value)?;
                 // Whole-record assignment: only a same-typed record
                 // local copies (`t = u` — C++ struct assignment in
@@ -341,6 +394,131 @@ impl FuncBuilder<'_> {
             }
         }
         Err(unsupported("assignment to a non-port, non-local target", ""))
+    }
+
+    /// Lower `callee(args)` into the `Expr::Call(TransactorMethod ..)`
+    /// payload of a `Stmt::TransactorCall`, or `None` when `callee` is
+    /// not a transactor-method access. `need_ret` enforces that a
+    /// result-binding site calls a `-> T` method (v1 surfaces that as
+    /// a C++ compile error; the IR rejects at lowering).
+    fn lower_transactor_call(
+        &mut self,
+        callee: &crate::ast::Expr,
+        args: &[CallArg],
+        need_ret: bool,
+    ) -> Result<Option<Expr>, LowerError> {
+        let Some((tb_field, xid, method)) = self.as_transactor_call(callee)? else {
+            return Ok(None);
+        };
+        if self.in_fmt_args {
+            return Err(unsupported(
+                &format!("transactor method call `{tb_field}.{method}(...)` inside a message"),
+                "log/fail messages evaluate lazily; hoist the call into a `let` first",
+            ));
+        }
+        // Detach the schema borrow from `self` (the arg loop below
+        // lowers through `&mut self`).
+        let ctx: &crate::ir::lower::LowerCtx = self.ctx;
+        let schema = &ctx.transactors[xid.index()];
+        let m = schema
+            .method(&method)
+            .expect("as_transactor_call validated the method");
+        if args.len() != m.n_params {
+            return Err(LowerError::Invalid(format!(
+                "transactor method `{}.{method}` takes {} argument(s), call passes {}",
+                schema.name,
+                m.n_params,
+                args.len()
+            )));
+        }
+        if need_ret && !m.has_ret {
+            return Err(LowerError::Invalid(format!(
+                "transactor method `{}.{method}` returns no value",
+                schema.name
+            )));
+        }
+        let mut lowered = Vec::with_capacity(args.len());
+        for a in args {
+            let e = match a {
+                CallArg::Expr(e) => e,
+                CallArg::Named { .. } => {
+                    return Err(unsupported(
+                        &format!(
+                            "named arguments in transactor method call \
+                             `{tb_field}.{method}(...)`"
+                        ),
+                        "",
+                    ));
+                }
+            };
+            lowered.push(self.lower_expr_no_ports(e)?);
+        }
+        Ok(Some(Expr::Call(
+            crate::ir::CallTarget::TransactorMethod {
+                bus_field: tb_field,
+                method,
+            },
+            lowered,
+        )))
+    }
+
+    /// `_tb.<xfield>.<dut_field> = dut` — the instance's DUT bind.
+    /// Validated, then erased: the IR's single-DUT model makes the
+    /// bind static (the method bodies' `PortRef`s already resolve to
+    /// the test's DUT). v1 emits a pointer copy here; the only
+    /// observable difference is on broken programs that CALL a method
+    /// without ever binding — v1 dereferences null, the IR backend
+    /// drives the DUT anyway. Returns `true` when the statement was
+    /// consumed.
+    fn lower_transactor_dut_bind(
+        &mut self,
+        target: &crate::ast::Expr,
+        value: &crate::ast::Expr,
+    ) -> Result<bool, LowerError> {
+        let Some(tb_field) = self.ctx.tb_field.as_deref() else {
+            return Ok(false);
+        };
+        // target = Field { Field { Ident(_tb), xfield }, sub }
+        let ExprKind::Field { target: mid, name: sub } = &*target.kind else {
+            return Ok(false);
+        };
+        let ExprKind::Field { target: root_expr, name: xfield } = &*mid.kind else {
+            return Ok(false);
+        };
+        let ExprKind::Ident(root) = &*root_expr.kind else {
+            return Ok(false);
+        };
+        if root.name != tb_field {
+            return Ok(false);
+        }
+        let Some(&xid) = self.ctx.transactor_fields.get(&xfield.name) else {
+            return Ok(false);
+        };
+        let schema = &self.ctx.transactors[xid.index()];
+        if sub.name != schema.dut_field {
+            return Err(unsupported(
+                &format!(
+                    "assignment to transactor field `{}.{}`",
+                    xfield.name, sub.name
+                ),
+                "only the module-typed DUT bind is lowered",
+            ));
+        }
+        // RHS must be the test's DUT.
+        let is_dut = match &*value.kind {
+            ExprKind::Ident(id) => self.is_dut_name(&id.name),
+            _ => false,
+        };
+        if !is_dut {
+            return Err(unsupported(
+                &format!(
+                    "binding `{}.{}` to something other than the test DUT",
+                    xfield.name, sub.name
+                ),
+                "",
+            ));
+        }
+        Ok(true)
     }
 
     fn lower_assert(&mut self, v: &crate::ast::Verify) -> Result<(), LowerError> {

@@ -285,6 +285,10 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 host_service_only = false;
                 visit_expr(value, &mut accesses, &mut transactor);
             }
+            Stmt::TransactorCall { call, .. } => {
+                host_service_only = false;
+                visit_expr(call, &mut accesses, &mut transactor);
+            }
             Stmt::CovReport(_) => {}
         }
     }
@@ -336,6 +340,11 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
             visit_expr(b, accesses, transactor);
         }
         Expr::Unary(_, a) => visit_expr(a, accesses, transactor),
+        Expr::Ternary(c, t, e) => {
+            visit_expr(c, accesses, transactor);
+            visit_expr(t, accesses, transactor);
+            visit_expr(e, accesses, transactor);
+        }
         Expr::Call(target, args) => {
             if matches!(target, CallTarget::TransactorMethod { .. }) {
                 *transactor = true;

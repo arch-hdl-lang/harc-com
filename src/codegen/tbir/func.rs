@@ -23,8 +23,8 @@
 use super::expr::{escape_c, expr_cpp, fmt_arg_cpp, helper_cpp_name, port_lvalue, port_read};
 use crate::codegen::cpp_tb::EmitError;
 use crate::ir::{
-    BusBindingSchema, CallTarget, Expr, FileLogLevel, FmtArgs, IrType, LogLevel, PredSrc,
-    RecordSchema, Stmt, TbFunction, Terminator, WaitMode,
+    BusBindingSchema, CallTarget, Expr, FileLogLevel, FmtArgs, IrType, LogLevel, PredSrc, Stmt,
+    TbFunction, TbProgram, Terminator, TransactorMethodSchema, TransactorSchema, WaitMode,
 };
 use std::fmt::Write as _;
 
@@ -70,8 +70,8 @@ fn cpp_local_names(func: &TbFunction) -> Vec<String> {
 /// canonical req/rsp wire protocol.
 pub(super) fn emit_function(
     out: &mut String,
+    prog: &TbProgram,
     func: &TbFunction,
-    records: &[RecordSchema],
     bindings: &[BusBindingSchema],
     depth: usize,
 ) -> Result<(), EmitError> {
@@ -82,23 +82,7 @@ pub(super) fn emit_function(
     let pad3 = INDENT.repeat(depth + 3);
 
     writeln!(out, "{pad}{{ // {} (TB-IR loop-switch)", func.name).ok();
-    for (l, n) in func.locals.iter().zip(&names) {
-        // Record-typed locals hoist as default-constructed structs;
-        // the `RecordInit` at the source `let` site re-runs the field
-        // defaults (v1 declares at the let site, so loop iterations
-        // re-default-construct).
-        if let IrType::Record(r) = l.ty {
-            let rec = records.get(r.index()).ok_or_else(|| {
-                EmitError(format!(
-                    "tbir: local `{n}` in {} references missing record r{}",
-                    func.name, r.0
-                ))
-            })?;
-            writeln!(out, "{pad1}{} {n}{{}}; (void){n};", rec.name).ok();
-        } else {
-            writeln!(out, "{pad1}uint64_t {n} = 0; (void){n};").ok();
-        }
-    }
+    declare_locals(out, prog, func, &names, 0, depth + 1)?;
     writeln!(out, "{pad1}int __bb = {};", func.entry.0).ok();
     writeln!(out, "{pad1}bool __done = false;").ok();
     writeln!(out, "{pad1}while (!__done) {{").ok();
@@ -106,7 +90,7 @@ pub(super) fn emit_function(
     for (bi, block) in func.blocks.iter().enumerate() {
         writeln!(out, "{pad2}case {bi}: {{").ok();
         for s in &block.stmts {
-            emit_stmt(out, func, records, &names, bindings, s, depth + 3)?;
+            emit_stmt(out, prog, func, &names, bindings, s, depth + 3)?;
         }
         match &block.terminator {
             Terminator::Jump(b) => {
@@ -321,8 +305,8 @@ pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Resul
 
 fn emit_stmt(
     out: &mut String,
+    prog: &TbProgram,
     func: &TbFunction,
-    records: &[RecordSchema],
     names: &[String],
     bindings: &[BusBindingSchema],
     s: &Stmt,
@@ -346,13 +330,55 @@ fn emit_stmt(
         }
         Stmt::RecordInit(l, r) => {
             let name = &names[l.index()];
-            let rec = records.get(r.index()).ok_or_else(|| {
+            let rec = prog.records.get(r.index()).ok_or_else(|| {
                 EmitError(format!(
                     "tbir: RecordInit of `{name}` in {} references missing record r{}",
                     func.name, r.0
                 ))
             })?;
             writeln!(out, "{pad}{name} = {}{{}};", rec.name).ok();
+        }
+        Stmt::TransactorCall { dest, call } => {
+            let Expr::Call(CallTarget::TransactorMethod { bus_field, method }, args) = call
+            else {
+                return Err(EmitError(format!(
+                    "tbir: TransactorCall in {} carries a non-call-edge payload \
+                     (verifier invariant violated)",
+                    func.name
+                )));
+            };
+            // Resolve the instance field to its transactor type via the
+            // owner testbench — the lambda is named `<Type>_<method>`,
+            // mirroring v1's hookable lambda naming.
+            let xname = func
+                .owner
+                .and_then(|o| prog.testbenches.get(o.index()))
+                .and_then(|tb| {
+                    tb.transactor_fields
+                        .iter()
+                        .find(|(f, _)| f == bus_field)
+                        .map(|(_, xid)| prog.transactor(*xid).name.as_str())
+                })
+                .ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: TransactorCall `{bus_field}.{method}` in {} does not \
+                         resolve through the owner testbench",
+                        func.name
+                    ))
+                })?;
+            let mut rendered = Vec::with_capacity(args.len());
+            for a in args {
+                rendered.push(expr_cpp(func, names, a)?);
+            }
+            let invoke = format!("{xname}_{method}({})", rendered.join(", "));
+            match dest {
+                Some(d) => {
+                    writeln!(out, "{pad}{} = {invoke};", &names[d.index()]).ok();
+                }
+                None => {
+                    writeln!(out, "{pad}{invoke};").ok();
+                }
+            }
         }
         Stmt::RecordFieldWrite { local, field, value } => {
             let name = &names[local.index()];
@@ -422,7 +448,7 @@ fn emit_stmt(
     Ok(())
 }
 
-/// Expand one sanctioned `TransactorMethod` call edge into v1's
+/// Expand one sanctioned bus-bound `TransactorMethod` call edge into v1's
 /// blocking req/rsp wire protocol (cpp_tb `try_emit_bus_tlm_method`,
 /// coroutine path): drive arg wires, raise `req_valid`, budget-wait
 /// for `req_ready`, tick, drop `req_valid`; raise `rsp_ready`,
@@ -511,6 +537,150 @@ fn emit_transactor_call(
     }
     writeln!(out, "{pad}co_await harc_rt::wait_cycles(_slot, 1);").ok();
     writeln!(out, "{pad}{} = 0;", wire("rsp_ready")).ok();
+    Ok(())
+}
+
+/// Hoisted local declarations for a loop-switch body, skipping the
+/// first `skip` locals (function parameters — they arrive as C++
+/// parameters and must not be re-declared). Record-typed locals hoist
+/// as default-constructed structs; the `RecordInit` at the source
+/// `let` site re-runs the field defaults (v1 declares at the let
+/// site, so loop iterations re-default-construct).
+fn declare_locals(
+    out: &mut String,
+    prog: &TbProgram,
+    func: &TbFunction,
+    names: &[String],
+    skip: usize,
+    depth: usize,
+) -> Result<(), EmitError> {
+    let pad = INDENT.repeat(depth);
+    for (l, n) in func.locals.iter().zip(names).skip(skip) {
+        if let IrType::Record(r) = l.ty {
+            let rec = prog.records.get(r.index()).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: local `{n}` in {} references missing record r{}",
+                    func.name, r.0
+                ))
+            })?;
+            writeln!(out, "{pad}{} {n}{{}}; (void){n};", rec.name).ok();
+        } else {
+            writeln!(out, "{pad}uint64_t {n} = 0; (void){n};").ok();
+        }
+    }
+    Ok(())
+}
+
+/// Emit one transactor method body as a `[&]`-capturing lambda named
+/// `<Transactor>_<method>` — the same naming and synchronous-call
+/// contract as v1's hookable lambdas, with the body as a loop-switch.
+///
+/// Key delta from `emit_function`: this is a PLAIN function body, not
+/// a coroutine. v1 hookables run synchronously — their waits advance
+/// the clock directly instead of yielding to the scheduler — so the
+/// suspension terminators emit v1's sync shapes (`for (...) tick();`,
+/// `while (!(pred)) tick();`) and `Return` is a real `return`.
+///
+/// Deliberately NOT emitted (v1 emits them, but they are inert dead
+/// text under this subset and land with their constructs): the
+/// `<Type>_<method>_pre`/`_post` hook vectors and their fan-out loops
+/// (statement-level `on obj.method pre/post` hooks are rejected at
+/// lowering), the transactor instance struct, and the per-instance
+/// heartbeat stamps (no `idle()` predicates in the subset).
+pub(super) fn emit_method(
+    out: &mut String,
+    prog: &TbProgram,
+    schema: &TransactorSchema,
+    m: &TransactorMethodSchema,
+    depth: usize,
+) -> Result<(), EmitError> {
+    let func = prog.function(m.function);
+    let names = cpp_local_names(func);
+    let nparams = func.params.len();
+    let pad = INDENT.repeat(depth);
+    let pad1 = INDENT.repeat(depth + 1);
+    let pad2 = INDENT.repeat(depth + 2);
+    let pad3 = INDENT.repeat(depth + 3);
+
+    let ret_ty = if func.ret.is_some() { "uint64_t" } else { "void" };
+    let params = names[..nparams]
+        .iter()
+        .map(|n| format!("uint64_t {n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(
+        out,
+        "{pad}auto {}_{} = [&]({params}) -> {ret_ty} {{",
+        schema.name, m.name
+    )
+    .ok();
+    declare_locals(out, prog, func, &names, nparams, depth + 1)?;
+    writeln!(out, "{pad1}int __bb = {};", func.entry.0).ok();
+    writeln!(out, "{pad1}while (true) {{").ok();
+    writeln!(out, "{pad2}switch (__bb) {{").ok();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        writeln!(out, "{pad2}case {bi}: {{").ok();
+        for s in &block.stmts {
+            // Method bodies have no testbench bus-binding scope — a
+            // bus-bound call edge in here is a lowering bug and errors
+            // inside `emit_stmt` (empty binding table).
+            emit_stmt(out, prog, func, &names, &[], s, depth + 3)?;
+        }
+        match &block.terminator {
+            Terminator::Jump(b) => {
+                writeln!(out, "{pad3}__bb = {};", b.0).ok();
+            }
+            Terminator::Branch(c, t, f) => {
+                let cond = expr_cpp(func, &names, c)?;
+                writeln!(out, "{pad3}if ({cond}) {{ __bb = {}; }} else {{ __bb = {}; }}", t.0, f.0)
+                    .ok();
+            }
+            Terminator::WaitCycles(n, None, b) => {
+                // v1's synchronous wait: one tick() per cycle.
+                let n = expr_cpp(func, &names, n)?;
+                writeln!(
+                    out,
+                    "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) tick();"
+                )
+                .ok();
+                writeln!(out, "{pad3}__bb = {};", b.0).ok();
+            }
+            Terminator::WaitUntil { preds, mode, succ } => {
+                // v1's synchronous polling loop.
+                let cond = preds_cpp(func, &names, preds, *mode)?;
+                writeln!(out, "{pad3}while (!({cond})) tick();").ok();
+                writeln!(out, "{pad3}__bb = {};", succ.0).ok();
+            }
+            Terminator::Return => match func.ret {
+                Some(r) => {
+                    writeln!(out, "{pad3}return {};", names[r.index()]).ok();
+                }
+                None => {
+                    writeln!(out, "{pad3}return;").ok();
+                }
+            },
+            other @ (Terminator::WaitCycles(_, Some(_), _)
+            | Terminator::WaitUntilTimeout { .. }
+            | Terminator::Fatal(_)) => {
+                // Lowering rejects these inside method bodies (or, for
+                // Fatal, never produces the terminator at all).
+                return Err(EmitError(format!(
+                    "tbir: transactor method `{}` contains terminator {other:?} — \
+                     lowering gate failed",
+                    func.name
+                )));
+            }
+        }
+        writeln!(out, "{pad3}break;").ok();
+        writeln!(out, "{pad2}}}").ok();
+    }
+    match func.ret {
+        Some(_) => writeln!(out, "{pad2}default: return 0;").ok(),
+        None => writeln!(out, "{pad2}default: return;").ok(),
+    };
+    writeln!(out, "{pad2}}}").ok(); // switch
+    writeln!(out, "{pad1}}}").ok(); // while
+    writeln!(out, "{pad}}};").ok(); // lambda
     Ok(())
 }
 
