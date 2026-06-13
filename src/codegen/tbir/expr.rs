@@ -99,6 +99,11 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // Scalar testbench field read — a `_tb` struct member (scalar
         // fields exist only on non-synthetic testbenches).
         Expr::TbField(field) => format!("_tb.{field}"),
+        // Bound-to target transactor instance state — a member of the
+        // generated per-instance struct (`<instance>.<field>`), matching
+        // v1's `field_subs` substitution at the responder body and the
+        // direct struct access at the test-scope read.
+        Expr::TransactorState { instance, field } => format!("{instance}.{field}"),
         // Scoreboard read on a `_tb` struct member (scoreboard fields
         // exist only on non-synthetic testbenches). Mirrors v1's direct
         // struct/queue access.

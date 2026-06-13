@@ -38,6 +38,16 @@ impl FuncBuilder<'_> {
                 if let Some(local) = self.lookup(&id.name) {
                     return Ok(Expr::Local(local));
                 }
+                // Persistent state field of a bound-to target responder
+                // body — a bare ident (locals shadow, checked above).
+                // `instance` is a placeholder; the test-binding stage
+                // fills it once the passive instance is resolved.
+                if self.target_state_fields.contains(&id.name) {
+                    return Ok(Expr::TransactorState {
+                        instance: String::new(),
+                        field: id.name.clone(),
+                    });
+                }
                 if self.is_dut_name(&id.name) {
                     return Err(unsupported(
                         "a bare DUT reference",
@@ -76,6 +86,11 @@ impl FuncBuilder<'_> {
                 // Scalar testbench field read (`_tb.expected`).
                 if let Some(field) = self.as_tb_scalar_field(e) {
                     return Ok(Expr::TbField(field));
+                }
+                // Test-scope read of a bound-to target responder's
+                // persistent state (`target.read_count`).
+                if let Some((instance, field)) = self.as_transactor_state(e) {
+                    return Ok(Expr::TransactorState { instance, field });
                 }
                 // Scoreboard scalar-counter read (`sb.writes` /
                 // `_tb.sb.writes` after impl-form desugaring).
@@ -346,6 +361,8 @@ impl FuncBuilder<'_> {
             | Expr::Local(_)
             | Expr::RecordField { .. }
             | Expr::TbField(_)
+            // Transactor-instance state is host state — no DUT port inside.
+            | Expr::TransactorState { .. }
             // Scoreboard reads are host state — no DUT port inside.
             | Expr::ScoreboardQuery { .. }
             | Expr::CovBin { .. }) => other,
@@ -620,6 +637,25 @@ impl FuncBuilder<'_> {
         };
         (root.name == tb_field && self.ctx.tb_scalar_fields.contains(&name.name))
             .then(|| name.name.clone())
+    }
+
+    /// `Some((instance, field))` when the expression is a test-scope
+    /// access to a bound-to target responder's persistent state field:
+    /// `target.read_count`. The instance is a passive responder bound
+    /// in this test; the field must be one of its declared state fields
+    /// (an unknown field is a hard error, surfaced precisely). Returns
+    /// `None` for any non-matching shape so the caller falls through.
+    pub(crate) fn as_transactor_state(&self, e: &AstExpr) -> Option<(String, String)> {
+        let ExprKind::Field { target, name } = &*e.kind else {
+            return None;
+        };
+        let ExprKind::Ident(root) = &*target.kind else {
+            return None;
+        };
+        let fields = self.ctx.target_state.get(&root.name)?;
+        fields
+            .contains(&name.name)
+            .then(|| (root.name.clone(), name.name.clone()))
     }
 
     /// `Some(PortRef)` (with `lane`) when the expression is a

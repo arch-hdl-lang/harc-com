@@ -107,11 +107,21 @@ impl Display for TbProgram {
             }
         }
         for (i, x) in self.transactors.iter().enumerate() {
-            writeln!(
-                f,
-                "  transactor x{} {} {{ {}: {} }}",
-                i, x.name, x.dut_field, x.dut_type
-            )?;
+            match &x.bound_bus {
+                Some(bus) => {
+                    writeln!(f, "  transactor x{} {} bound to {}", i, x.name, bus)?;
+                }
+                None => {
+                    writeln!(
+                        f,
+                        "  transactor x{} {} {{ {}: {} }}",
+                        i, x.name, x.dut_field, x.dut_type
+                    )?;
+                }
+            }
+            for sf in &x.state_fields {
+                writeln!(f, "    state {} = {}", sf.name, sf.default)?;
+            }
             for m in &x.methods {
                 writeln!(
                     f,
@@ -121,6 +131,17 @@ impl Display for TbProgram {
                     if m.n_params == 1 { "" } else { "s" },
                     if m.has_ret { " -> ret" } else { "" },
                     m.function.0
+                )?;
+            }
+            for tm in &x.target_methods {
+                writeln!(
+                    f,
+                    "    target thread bus.{}({} arg{}){} = fn{}",
+                    tm.name,
+                    tm.args.len(),
+                    if tm.args.len() == 1 { "" } else { "s" },
+                    if tm.has_ret { " -> ret" } else { "" },
+                    tm.function.0
                 )?;
             }
         }
@@ -245,6 +266,9 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         ),
         Stmt::TbFieldWrite { field, value } => {
             format!("TbFieldWrite(_tb.{field}, {})", expr_str(func, value))
+        }
+        Stmt::TransactorStateWrite { instance, field, value } => {
+            format!("TransactorStateWrite({instance}.{field}, {})", expr_str(func, value))
         }
         Stmt::Log { level, args } => {
             format!("Log({}, {})", level_str(level), fmt_args_str(func, args))
@@ -436,6 +460,7 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
             format!("{}.{field}", local_str(func, *local))
         }
         Expr::TbField(field) => format!("_tb.{field}"),
+        Expr::TransactorState { instance, field } => format!("{instance}.{field}"),
         Expr::ScoreboardQuery { sb, field, query } => {
             format!("ScoreboardQuery(sb{}.{field}.{})", sb.0, sb_query_str(query))
         }

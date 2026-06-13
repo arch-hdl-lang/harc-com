@@ -30,10 +30,13 @@
 //! threads, watchdogs — is an explicit `Unsupported`.
 
 use super::{FuncBuilder, LowerCtx, LowerError, helpers, unsupported};
-use crate::ast::{ComponentItem, HookableMethod, TransactorDecl, TypeArg, TypeExpr};
+use crate::ast::{
+    BusDecl, ComponentField, ComponentItem, HookableMethod, TargetTlmThread, TransactorDecl,
+    TypeArg, TypeExpr,
+};
 use crate::ir::{
-    FunctionId, FunctionKind, TbFunction, Terminator, TransactorId, TransactorMethodSchema,
-    TransactorSchema, TypedParam,
+    FunctionId, FunctionKind, TargetTlmMethodSchema, TbFunction, TbScalarFieldSchema, Terminator,
+    TransactorId, TransactorMethodSchema, TransactorSchema, TypedParam,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -47,6 +50,7 @@ pub(crate) fn lower_transactor(
     next_fn: FunctionId,
     helper_registry: &helpers::HelperRegistry<'_>,
     record_ctx: &LowerCtx,
+    buses: &HashMap<String, &BusDecl>,
 ) -> Result<(TransactorSchema, Vec<TbFunction>), LowerError> {
     let tname = &t.name.name;
     if !t.params.is_empty() {
@@ -56,11 +60,7 @@ pub(crate) fn lower_transactor(
         ));
     }
     if t.bound_to.is_some() {
-        return Err(unsupported(
-            &format!("transactor `{tname}` bound to a bus type"),
-            "only unbound DUT-poking transactors are lowered; the bus-bound \
-             (target-side TLM) form is a follow-up slice",
-        ));
+        return lower_bound_target_transactor(t, next_fn, helper_registry, record_ctx, buses);
     }
 
     // Walk always-on items then the `when active` body — the same
@@ -160,6 +160,9 @@ pub(crate) fn lower_transactor(
         dut_field: dut_field.clone(),
         dut_type,
         methods: Vec::new(),
+        bound_bus: None,
+        state_fields: Vec::new(),
+        target_methods: Vec::new(),
     };
     // Method bodies resolve DUT accesses against the transactor's own
     // module-typed field name; everything else mirrors the file-level
@@ -191,6 +194,7 @@ pub(crate) fn lower_transactor(
         regblock_bindings: HashMap::new(),
         regblock_init_order: Vec::new(),
         bare_transactor_fields: HashSet::new(),
+        target_state: HashMap::new(),
     };
 
     let mut funcs = Vec::new();
@@ -242,6 +246,308 @@ pub(crate) fn lower_transactor(
     }
 
     Ok((schema, funcs))
+}
+
+/// Lower a bound-to target-side TLM transactor (`transactor X bound to
+/// <Bus>`): collect persistent scalar state fields and lower each
+/// `thread bus.<method>(...)` responder body into a `TbFunction` (kind
+/// `TransactorBody`) whose state accesses reference the state fields by
+/// bare name (the instance is filled at test-binding time).
+///
+/// Subset gate: only `blocking` `tlm_method`s are served. `out_of_order
+/// tags N` and `fork`-based concurrent workers are rejected precisely —
+/// their v1 lowering (hidden tag wires / multi-lane response routers) is
+/// a follow-up slice.
+fn lower_bound_target_transactor(
+    t: &TransactorDecl,
+    next_fn: FunctionId,
+    helper_registry: &helpers::HelperRegistry<'_>,
+    record_ctx: &LowerCtx,
+    buses: &HashMap<String, &BusDecl>,
+) -> Result<(TransactorSchema, Vec<TbFunction>), LowerError> {
+    let tname = &t.name.name;
+    // Resolve the bound bus.
+    let bus_name = match t.bound_to.as_ref() {
+        Some(TypeExpr::Named { name, generics, .. }) => {
+            if !generics.is_empty() {
+                return Err(unsupported(
+                    &format!("transactor `{tname}` bound to a generic-applied bus type"),
+                    "",
+                ));
+            }
+            name.segments.last().map(|s| s.name.clone()).unwrap_or_default()
+        }
+        _ => {
+            return Err(unsupported(
+                &format!("transactor `{tname}` bound to a non-named bus type"),
+                "",
+            ));
+        }
+    };
+    // Item-shape gate first (independent of bus resolution): a bound-to
+    // transactor whose methods are `hookable` bodies is the *initiator-
+    // side* BFM form (driving handshake channels), the documented
+    // residual blocker after this target-side slice. Reject it before
+    // resolving the bus so the message is precise even when the bus is
+    // imported via `use` (not in this file's bus table).
+    for ci in t.items.iter().chain(t.when_active.iter().flatten()) {
+        if let ComponentItem::Hookable(h) = ci {
+            return Err(unsupported(
+                &format!(
+                    "bound-to transactor `{tname}` `hookable {}` (initiator-side method)",
+                    h.name.name
+                ),
+                "the bus-bound BFM (initiator) form — driving handshake channels from \
+                 hookable bodies — is a follow-up slice; only target-side `thread \
+                 bus.<m>(...)` responders are lowered",
+            ));
+        }
+    }
+
+    let Some(bus) = buses.get(&bus_name) else {
+        return Err(LowerError::Invalid(format!(
+            "transactor `{tname}` is bound to `{bus_name}`, which is not a `bus` declaration"
+        )));
+    };
+
+    // Walk items (and the optional `when active` body, though target
+    // responders live as always-on items): collect state fields and
+    // target threads; reject the out-of-subset shapes precisely.
+    let mut state_fields: Vec<TbScalarFieldSchema> = Vec::new();
+    let mut state_names: HashSet<String> = HashSet::new();
+    let mut threads_ast: Vec<&TargetTlmThread> = Vec::new();
+    let all_items = t.items.iter().chain(t.when_active.iter().flatten());
+    for ci in all_items {
+        match ci {
+            ComponentItem::Field(f) => {
+                let sf = lower_state_field(tname, f)?;
+                if !state_names.insert(sf.name.clone()) {
+                    return Err(LowerError::Invalid(format!(
+                        "transactor `{tname}` declares state field `{}` more than once",
+                        sf.name
+                    )));
+                }
+                state_fields.push(sf);
+            }
+            ComponentItem::TargetTlmThread(th) => threads_ast.push(th),
+            ComponentItem::Hookable(h) => {
+                return Err(unsupported(
+                    &format!(
+                        "bound-to transactor `{tname}` `hookable {}` (initiator-side method)",
+                        h.name.name
+                    ),
+                    "the bus-bound BFM (initiator) form — driving handshake channels from \
+                     hookable bodies — is a follow-up slice; only target-side `thread \
+                     bus.<m>(...)` responders are lowered",
+                ));
+            }
+            ComponentItem::OnHandler(_) => {
+                return Err(unsupported(
+                    &format!("bound-to transactor `{tname}` `on` handlers"),
+                    "event-driven transactors await the event slice",
+                ));
+            }
+            ComponentItem::Watchdog(_) => {
+                return Err(unsupported(&format!("bound-to transactor `{tname}` watchdogs"), ""));
+            }
+            ComponentItem::Connect(_) => {
+                return Err(unsupported(
+                    &format!("bound-to transactor `{tname}` connect blocks"),
+                    "",
+                ));
+            }
+            ComponentItem::Lifecycle(..) | ComponentItem::Apply(_) => {
+                return Err(unsupported(
+                    &format!("bound-to transactor `{tname}` lifecycle/apply items"),
+                    "",
+                ));
+            }
+        }
+    }
+    if threads_ast.is_empty() {
+        return Err(unsupported(
+            &format!("bound-to transactor `{tname}` without any `thread bus.<method>(...)` responder"),
+            "a target-side TLM transactor must serve at least one bus method",
+        ));
+    }
+
+    let mut schema = TransactorSchema {
+        name: tname.clone(),
+        // A bound target transactor has no private DUT handle; the
+        // responder drives the bound bus's wires on the test DUT.
+        dut_field: String::new(),
+        dut_type: String::new(),
+        methods: Vec::new(),
+        bound_bus: Some(bus_name.clone()),
+        state_fields,
+        target_methods: Vec::new(),
+    };
+
+    // Responder bodies see file-scope consts and records; no testbench,
+    // no bus bindings, no sibling instances. State fields resolve via
+    // `FuncBuilder::target_state_fields`, not the ctx.
+    let body_ctx = LowerCtx {
+        dut_field: String::new(),
+        tb_field: None,
+        cov_fields: HashMap::new(),
+        covgroups: Vec::new(),
+        clock_names: Vec::new(),
+        record_ids: record_ctx.record_ids.clone(),
+        records: record_ctx.records.clone(),
+        bus_bindings: HashMap::new(),
+        transactor_fields: HashMap::new(),
+        transactors: Vec::new(),
+        scoreboard_fields: HashMap::new(),
+        scoreboards: Vec::new(),
+        consts: record_ctx.consts.clone(),
+        tb_scalar_fields: HashSet::new(),
+        tb_methods: HashMap::new(),
+        test_scope_lets: HashSet::new(),
+        regblock_bindings: HashMap::new(),
+        regblock_init_order: Vec::new(),
+        bare_transactor_fields: HashSet::new(),
+        target_state: HashMap::new(),
+    };
+
+    let mut funcs = Vec::new();
+    for th in threads_ast {
+        // `thread bus.<method>(...)`: the method path is `bus.<method>`.
+        let segs: Vec<&str> = th.method.segments.iter().map(|s| s.name.as_str()).collect();
+        if segs.len() != 2 || segs[0] != "bus" {
+            return Err(unsupported(
+                &format!(
+                    "transactor `{tname}` target thread `{}` (expected `thread bus.<method>(...)`)",
+                    segs.join(".")
+                ),
+                "",
+            ));
+        }
+        let mname = segs[1];
+        if schema.target_methods.iter().any(|m| m.name == mname) {
+            return Err(LowerError::Invalid(format!(
+                "transactor `{tname}` declares target thread `bus.{mname}` more than once"
+            )));
+        }
+        // The bus must declare a matching `tlm_method`, and it must be
+        // `blocking` in this subset.
+        let Some(method) = bus.tlm_methods.iter().find(|m| m.name.name == mname) else {
+            return Err(LowerError::Invalid(format!(
+                "transactor `{tname}` target thread `bus.{mname}`: bus `{bus_name}` has no \
+                 `tlm_method {mname}`"
+            )));
+        };
+        if method.mode.name != "blocking" {
+            return Err(unsupported(
+                &format!(
+                    "transactor `{tname}` target thread `bus.{mname}` serving a `{}` method",
+                    method.mode.name
+                ),
+                "only `blocking` target threads are lowered; `out_of_order tags N` responder \
+                 lanes (hidden tag wires + multi-lane response routing) are a follow-up slice",
+            ));
+        }
+        if th.params.len() != method.args.len() {
+            return Err(LowerError::Invalid(format!(
+                "transactor `{tname}` target thread `bus.{mname}`: expected {} arg(s), got {}",
+                method.args.len(),
+                th.params.len()
+            )));
+        }
+        for (p, name) in th.params.iter().zip(method.args.iter()) {
+            check_scalar_ty(tname, mname, &format!("parameter `{}`", p.name.name), p.ty.as_ref())?;
+            // Cross-check the declared widths fit the u64 value model via
+            // the bus method's declared arg type too.
+            check_scalar_ty(tname, mname, &format!("argument `{}`", name.0.name), Some(&name.1))?;
+        }
+        if let Some(ret) = method.ret.as_ref() {
+            check_scalar_ty(tname, mname, "return type", Some(ret))?;
+        }
+
+        let fid = FunctionId(next_fn.0 + funcs.len() as u32);
+        let mut b = FuncBuilder::new(&body_ctx, helper_registry);
+        b.target_state_fields = state_names.clone();
+        let mut params = Vec::with_capacity(th.params.len());
+        for p in &th.params {
+            let ty = helpers::ir_type_of(p.ty.as_ref());
+            let local = b.declare(&p.name.name);
+            b.set_local_type(local, ty.clone());
+            params.push(TypedParam { name: p.name.name.clone(), ty });
+        }
+        let has_ret = method.ret.is_some();
+        if has_ret {
+            let ret = b.declare("__ret");
+            b.helper_ret = Some(ret);
+        }
+        b.lower_block_stmts(&th.body)?;
+        if !b.is_terminated() {
+            b.terminate(Terminator::Return);
+        }
+        let mut f = b.finish(
+            fid,
+            format!("{tname}_target_{mname}"),
+            FunctionKind::TransactorBody { transactor: TransactorId(0) },
+            None,
+        )?;
+        // The transactor id is fixed up by the caller's push order; the
+        // body never reads its own kind's id, so the placeholder is inert.
+        if let FunctionKind::TransactorBody { transactor } = &mut f.kind {
+            *transactor = TransactorId(record_ctx.transactors.len() as u32);
+        }
+        f.params = params;
+        schema.target_methods.push(TargetTlmMethodSchema {
+            name: mname.to_string(),
+            function: fid,
+            args: method.args.iter().map(|(n, _)| n.name.clone()).collect(),
+            has_ret,
+        });
+        funcs.push(f);
+    }
+
+    Ok((schema, funcs))
+}
+
+/// Lower one persistent scalar state field of a bound-to target
+/// transactor (`read_count : uint<32> default 0`). Must be a scalar
+/// ≤64-bit type with a plain-integer/bool default (or no default → 0);
+/// event/directional fields, module/transaction-typed fields, and
+/// `guard`/`reset` clauses are out of subset.
+fn lower_state_field(tname: &str, f: &ComponentField) -> Result<TbScalarFieldSchema, LowerError> {
+    let fname = &f.name.name;
+    if f.direction.is_some() {
+        return Err(unsupported(
+            &format!("bound-to transactor `{tname}` event/directional field `{fname}`"),
+            "",
+        ));
+    }
+    let Some(ty) = super::tb_scalar_field_ir_type(&f.ty) else {
+        return Err(unsupported(
+            &format!("bound-to transactor `{tname}` state field `{fname}` with a non-scalar type"),
+            "target-transactor state must be a scalar `uint<N>`/`sint<N>`/`bool` (≤64 bits)",
+        ));
+    };
+    let default = match &f.default {
+        None => 0,
+        Some(d) => match &*d.kind {
+            crate::ast::ExprKind::Int(s) => super::exprs::parse_int_literal(s).ok_or_else(|| {
+                unsupported(
+                    &format!(
+                        "bound-to transactor `{tname}` state field `{fname} default {s}`"
+                    ),
+                    "default must be a plain integer literal",
+                )
+            })?,
+            crate::ast::ExprKind::Bool(bv) => *bv as u64,
+            _ => {
+                return Err(unsupported(
+                    &format!(
+                        "bound-to transactor `{tname}` state field `{fname}` with a non-literal default"
+                    ),
+                    "",
+                ));
+            }
+        },
+    };
+    Ok(TbScalarFieldSchema { name: fname.clone(), ty, default })
 }
 
 /// Method params and returns must be scalar (bool / uint / sint) and

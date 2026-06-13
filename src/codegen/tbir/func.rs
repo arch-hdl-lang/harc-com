@@ -417,6 +417,10 @@ fn emit_stmt(
             let e = expr_cpp(cx, value)?;
             writeln!(out, "{pad}_tb.{field} = {e};").ok();
         }
+        Stmt::TransactorStateWrite { instance, field, value } => {
+            let e = expr_cpp(cx, value)?;
+            writeln!(out, "{pad}{instance}.{field} = {e};").ok();
+        }
         Stmt::DutWrite(p, e) => {
             let sig = port_signal(p);
             match p.lane {
@@ -789,6 +793,176 @@ pub(super) fn emit_method(
     writeln!(out, "{pad2}}}").ok(); // switch
     writeln!(out, "{pad1}}}").ok(); // while
     writeln!(out, "{pad}}};").ok(); // lambda
+    Ok(())
+}
+
+/// Emit one bound-to target-side TLM responder as a background-coroutine
+/// actor (one `ThreadSlot` per target method), mirroring v1's
+/// `emit_bound_tlm_target_actors` blocking path. Each actor:
+///   1. holds `req_ready=0, rsp_valid=0`, then loops;
+///   2. raises `req_ready`, awaits `req_valid && req_ready`, captures the
+///      request args off the payload wires;
+///   3. ticks, drops `req_ready`, traces the `request` edge;
+///   4. runs the lowered responder body (a coroutine loop-switch — its
+///      waits `co_await` the scheduler) capturing the return value;
+///   5. drives `rsp_data` (value methods), traces `response`, raises
+///      `rsp_valid`, awaits `rsp_ready`, ticks, drops `rsp_valid`.
+/// Trace payloads match v1 exactly (`tlm_call(cycle, instance, "bus",
+/// method, phase, "target")`) so the semantic trace diffs clean.
+pub(super) fn emit_target_actor(
+    out: &mut String,
+    prog: &TbProgram,
+    actor: &crate::ir::TargetTlmActorSchema,
+    depth: usize,
+) -> Result<(), EmitError> {
+    let schema = prog.transactor(actor.transactor);
+    let instance = &actor.instance;
+    let bus_field = &actor.bus_field;
+    let pad = INDENT.repeat(depth);
+    let pad1 = INDENT.repeat(depth + 1);
+    let pad2 = INDENT.repeat(depth + 2);
+
+    for tm in &schema.target_methods {
+        let method = &tm.name;
+        let func = prog.function(tm.function);
+        let names = cpp_local_names(func);
+        let empty_lanes = HashMap::new();
+        let cx = ECx { func, names: &names, lanes: &empty_lanes };
+        let wire = |sig: &str| format!("dut->{bus_field}_{method}_{sig}");
+        let slot_var = format!("_{instance}_{method}_target_slot");
+        let trace_event = |out: &mut String, phase: &str, d: usize| {
+            writeln!(
+                out,
+                "{}trace.tlm_call(cycle_count, \"{}\", \"bus\", \"{}\", \"{phase}\", \"target\");",
+                INDENT.repeat(d),
+                escape_c(instance),
+                escape_c(method)
+            )
+            .ok();
+        };
+
+        writeln!(out, "{pad}harc_rt::ThreadSlot {slot_var};").ok();
+        writeln!(out, "{pad}sched.slots.push_back(&{slot_var});").ok();
+        writeln!(
+            out,
+            "{pad}{slot_var}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+        )
+        .ok();
+        writeln!(out, "{pad1}{} = 0;", wire("req_ready")).ok();
+        writeln!(out, "{pad1}{} = 0;", wire("rsp_valid")).ok();
+        writeln!(out, "{pad1}while (true) {{").ok();
+        writeln!(out, "{pad2}{} = 1;", wire("req_ready")).ok();
+        writeln!(
+            out,
+            "{pad2}co_await harc_rt::wait_until(_slot, [&]{{ return {} && {}; }});",
+            wire("req_valid"),
+            wire("req_ready")
+        )
+        .ok();
+        // Capture request args into the body's parameter locals.
+        let nparams = func.params.len();
+        for (i, arg) in tm.args.iter().enumerate() {
+            let local = &names[i];
+            writeln!(
+                out,
+                "{pad2}uint64_t {local} = harc_rt::harc_read({});",
+                wire(arg)
+            )
+            .ok();
+        }
+        writeln!(out, "{pad2}co_await harc_rt::wait_cycles(_slot, 1);").ok();
+        writeln!(out, "{pad2}{} = 0;", wire("req_ready")).ok();
+        writeln!(out, "{pad2}{instance}._last_in_cycle = (uint64_t)cycle_count;").ok();
+        trace_event(out, "request", depth + 2);
+
+        // Responder body as a coroutine loop-switch. The args are already
+        // declared above; declare the remaining locals (incl. the ret
+        // slot) and run the switch. `Return` sets `__done`; the captured
+        // ret local survives the loop for the response drive.
+        writeln!(out, "{pad2}{{ // {} (TB-IR responder loop-switch)", func.name).ok();
+        declare_locals(out, prog, func, &names, nparams, depth + 3)?;
+        writeln!(out, "{}int __bb = {};", INDENT.repeat(depth + 3), func.entry.0).ok();
+        writeln!(out, "{}bool __done = false;", INDENT.repeat(depth + 3)).ok();
+        writeln!(out, "{}while (!__done) {{", INDENT.repeat(depth + 3)).ok();
+        writeln!(out, "{}switch (__bb) {{", INDENT.repeat(depth + 4)).ok();
+        let pad4 = INDENT.repeat(depth + 4);
+        let pad5 = INDENT.repeat(depth + 5);
+        for (bi, block) in func.blocks.iter().enumerate() {
+            writeln!(out, "{pad4}case {bi}: {{").ok();
+            for s in &block.stmts {
+                // Responder bodies have no testbench bus-binding scope;
+                // an empty binding table is correct (any call edge here
+                // is a lowering bug → errors in emit_stmt).
+                emit_stmt(out, prog, &cx, &[], &[], s, depth + 5)?;
+            }
+            match &block.terminator {
+                Terminator::Jump(b) => {
+                    writeln!(out, "{pad5}__bb = {};", b.0).ok();
+                }
+                Terminator::Branch(c, t, f) => {
+                    let cond = expr_cpp(&cx, c)?;
+                    writeln!(out, "{pad5}if ({cond}) {{ __bb = {}; }} else {{ __bb = {}; }}", t.0, f.0).ok();
+                }
+                Terminator::WaitCycles(n, None, b) => {
+                    let n = expr_cpp(&cx, n)?;
+                    writeln!(out, "{pad5}co_await harc_rt::wait_cycles(_slot, (uint32_t)({n}));").ok();
+                    writeln!(out, "{pad5}__bb = {};", b.0).ok();
+                }
+                Terminator::WaitUntil { preds, mode, succ } => {
+                    let cond = preds_cpp(&cx, preds, *mode)?;
+                    writeln!(out, "{pad5}co_await harc_rt::wait_until(_slot, [&]{{ return {cond}; }});").ok();
+                    writeln!(out, "{pad5}__bb = {};", succ.0).ok();
+                }
+                Terminator::Return => {
+                    writeln!(out, "{pad5}__done = true;").ok();
+                }
+                other => {
+                    return Err(EmitError(format!(
+                        "tbir: target responder `{}` contains terminator {other:?} — \
+                         lowering gate failed",
+                        func.name
+                    )));
+                }
+            }
+            writeln!(out, "{pad5}break;").ok();
+            writeln!(out, "{pad4}}}").ok();
+        }
+        writeln!(out, "{pad4}default: __done = true; break;").ok();
+        writeln!(out, "{}}}", INDENT.repeat(depth + 4)).ok(); // switch
+        writeln!(out, "{}}}", INDENT.repeat(depth + 3)).ok(); // while
+        // Drive the response payload, trace, handshake.
+        if tm.has_ret {
+            let ret = func.ret.ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: target responder `{}` declares a return but carries no ret slot",
+                    func.name
+                ))
+            })?;
+            writeln!(
+                out,
+                "{pad2}{INDENT}harc_rt::harc_assign({}, {});",
+                wire("rsp_data"),
+                &names[ret.index()]
+            )
+            .ok();
+        }
+        writeln!(out, "{pad2}}}").ok(); // body scope
+        trace_event(out, "response", depth + 2);
+        writeln!(out, "{pad2}{} = 1;", wire("rsp_valid")).ok();
+        writeln!(
+            out,
+            "{pad2}if (!{}) co_await harc_rt::wait_until(_slot, [&]{{ return {}; }});",
+            wire("rsp_ready"),
+            wire("rsp_ready")
+        )
+        .ok();
+        writeln!(out, "{pad2}co_await harc_rt::wait_cycles(_slot, 1);").ok();
+        writeln!(out, "{pad2}{} = 0;", wire("rsp_valid")).ok();
+        writeln!(out, "{pad2}{instance}._last_out_cycle = (uint64_t)cycle_count;").ok();
+        writeln!(out, "{pad1}}}").ok(); // while(true)
+        writeln!(out, "{pad1}co_return;").ok();
+        writeln!(out, "{pad}}}(&{slot_var});").ok();
+    }
     Ok(())
 }
 

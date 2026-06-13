@@ -525,6 +525,12 @@ impl Checker<'_> {
                     self.check_tb_field(field);
                     self.check_expr(value, false, "TbFieldWrite value");
                 }
+                Stmt::TransactorStateWrite { value, .. } => {
+                    // Instance/field resolution is a lowering concern
+                    // (the verifier has no transactor-binding context);
+                    // just hold the value to the no-inline-port rule.
+                    self.check_expr(value, false, "TransactorStateWrite value");
+                }
                 Stmt::Log { args, .. } => self.check_fmt_args(args),
                 Stmt::AssertCheck { cond, on_fail } => {
                     self.check_expr(cond, true, "AssertCheck cond");
@@ -779,6 +785,10 @@ impl Checker<'_> {
             Expr::Literal { .. } | Expr::WideLiteral(_) => {}
             Expr::Local(l) => self.check_local(*l),
             Expr::TbField(field) => self.check_tb_field(field),
+            // Transactor-instance state — host state, resolved at
+            // lowering against the bound instance; nothing to verify
+            // structurally here (no local/port dependency).
+            Expr::TransactorState { .. } => {}
             Expr::Port(_) => {
                 if !ports_ok {
                     self.errs.push(VerifyError::PortInDisallowedPosition {
@@ -1056,6 +1066,7 @@ fn check_def_before_use(
                     check_e(value, &defined, errs);
                 }
                 Stmt::TbFieldWrite { value, .. } => check_e(value, &defined, errs),
+                Stmt::TransactorStateWrite { value, .. } => check_e(value, &defined, errs),
                 Stmt::DutWrite(_, e) => check_e(e, &defined, errs),
                 Stmt::TransactorCall { dest, call } => {
                     check_e(call, &defined, errs);
@@ -1132,6 +1143,7 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
         | Expr::WideLiteral(_)
         | Expr::Port(_)
         | Expr::TbField(_)
+        | Expr::TransactorState { .. }
         | Expr::ScoreboardQuery { .. } => {}
         Expr::Local(l) => f(*l),
         Expr::RecordField { local, .. } => f(*local),

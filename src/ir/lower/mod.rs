@@ -362,7 +362,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     };
 
     // Eagerly lower pure helpers (declaration order) so call sites can
-    // stay `Expr::Call` and backends emit them as plain C++ functions.
+    // stay `ir::Expr::Call` and backends emit them as plain C++ functions.
     // Records are visible (for precise rejection messages), but pure
     // helpers cannot hold record locals — see `lower_let`.
     let helper_ctx = LowerCtx {
@@ -390,6 +390,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         regblock_bindings: HashMap::new(),
         regblock_init_order: Vec::new(),
         bare_transactor_fields: HashSet::new(),
+        target_state: HashMap::new(),
     };
     for it in &file.items {
         let Item::Function(fd) = it else { continue };
@@ -420,6 +421,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             FunctionId(prog.functions.len() as u32),
             &helper_registry,
             &helper_ctx,
+            &buses,
         )?;
         prog.transactors.push(schema);
         prog.functions.extend(funcs);
@@ -621,6 +623,10 @@ fn lower_test(
     // accessed by bare name. Merged into `transactor_fields` after the
     // testbench-field walk; collected here as (name, transactor id).
     let mut test_scope_xactors: Vec<(String, TransactorId)> = Vec::new();
+    // Bound-to target-side TLM responder instances (`let target : X
+    // passive = bind <busbinding>`), collected as (instance, transactor
+    // id, bus-binding field). Validated after the bus bindings are known.
+    let mut target_tlm_binds: Vec<(String, TransactorId, String)> = Vec::new();
     // Test-scope `let`s (beyond `dut`/`_tb`/bus binds), hoisted to the
     // head of the run body in item order — v1 hoists them to `main`
     // scope before the coroutine, initialized once, and the coroutine
@@ -706,6 +712,67 @@ fn lower_test(
                     }
                 };
                 regblock_binds.push((l.name.name.clone(), rbid, helper_field));
+            }
+            // Bound-to target-side TLM responder: `let target : MemTarget
+            // passive = bind <busbinding>`. The instance is a passive
+            // responder host for a `transactor X bound to <Bus>`; its
+            // `thread bus.<m>(...)` bodies serve the bound bus binding's
+            // req/rsp wires. The bind RHS must be a bus binding declared
+            // earlier in the test (validated after the binding walk).
+            TestItem::Let(l)
+                if l.bind
+                    && type_simple_name(l.ty.as_ref()).is_some_and(|n| {
+                        prog.transactors
+                            .iter()
+                            .any(|x| x.name == n && x.bound_bus.is_some())
+                    }) =>
+            {
+                if !l.probes.is_empty() {
+                    return Err(unsupported(
+                        "probe declarations on a target-TLM responder instance",
+                        "",
+                    ));
+                }
+                if !l.bind_remap.is_empty() {
+                    return Err(unsupported(
+                        "bind remaps on a target-TLM responder instance",
+                        "the default `<binding>_<method>_<sig>` wire convention is lowered; \
+                         custom signal remaps are a follow-up slice",
+                    ));
+                }
+                let simple = type_simple_name(l.ty.as_ref()).unwrap();
+                // The responder host must be `passive` — its methods are
+                // request-served, never test-called.
+                match l.ty.as_ref() {
+                    Some(TypeExpr::Named { mode: Some(TransactorMode::Passive), .. }) => {}
+                    _ => {
+                        return Err(unsupported(
+                            &format!(
+                                "target-TLM responder instance `let {} : {simple}` must be \
+                                 declared `passive`",
+                                l.name.name
+                            ),
+                            "the responder serves bus requests; its methods are not test-called",
+                        ));
+                    }
+                }
+                // RHS must be a bare bus-binding identifier.
+                let bus_field = match l.value.as_ref().map(|v| &*v.kind) {
+                    Some(ExprKind::Ident(id)) => id.name.clone(),
+                    _ => {
+                        return Err(unsupported(
+                            &format!(
+                                "target-TLM responder `{}` bound to a non-identifier",
+                                l.name.name
+                            ),
+                            "only `= bind <bus-binding>` is lowered",
+                        ));
+                    }
+                };
+                let xid = ir::TransactorId(
+                    prog.transactors.iter().position(|x| x.name == simple).unwrap() as u32,
+                );
+                target_tlm_binds.push((l.name.name.clone(), xid, bus_field));
             }
             // Test-scope unbound-transactor instance: `let h : MemHelper
             // active` (no `= bind`). v1 routes regblock frontdoor calls
@@ -1059,6 +1126,77 @@ fn lower_test(
         regblock_init_order.push(binding.clone());
     }
 
+    // Resolve bound-to target-TLM responder binds: the bound bus binding
+    // must exist in this test, its bus type must match the transactor's
+    // `bound to` bus, and the instance name must be unique. Build the
+    // per-instance state map (for test-scope `target.<field>` access) and
+    // the actor schemas, and substitute the instance name into the
+    // responder bodies' `TransactorState` placeholders (lowered with an
+    // empty instance at transactor-decl time, before the bind was known).
+    let mut target_tlm_actors: Vec<ir::TargetTlmActorSchema> = Vec::new();
+    let mut target_state: HashMap<String, HashSet<String>> = HashMap::new();
+    for (instance, xid, bus_field) in &target_tlm_binds {
+        if target_state.contains_key(instance) {
+            return Err(LowerError::Invalid(format!(
+                "duplicate target-TLM responder instance `{instance}` in test `{}`",
+                t.name.name
+            )));
+        }
+        // The bound bus binding must be a `let <bus_field> : <Bus> = bind
+        // dut` declared in this test.
+        let Some(binding) = bus_bindings.iter().find(|b| &b.field == bus_field) else {
+            return Err(LowerError::Invalid(format!(
+                "target-TLM responder `{instance}` is bound to `{bus_field}`, which is not a \
+                 bus binding in test `{}`",
+                t.name.name
+            )));
+        };
+        let xschema = &prog.transactors[xid.index()];
+        if xschema.bound_bus.as_deref() != Some(binding.bus.as_str()) {
+            return Err(LowerError::Invalid(format!(
+                "target-TLM responder `{instance} : {}` is bound to bus binding `{bus_field}` \
+                 of bus `{}`, but the transactor is `bound to {}`",
+                xschema.name,
+                binding.bus,
+                xschema.bound_bus.as_deref().unwrap_or("<none>"),
+            )));
+        }
+        // State map for test-scope `target.<field>` access.
+        target_state.insert(
+            instance.clone(),
+            xschema.state_fields.iter().map(|f| f.name.clone()).collect(),
+        );
+        // Fill the instance into the responder bodies' state-access
+        // placeholders. The responder `TbFunction`s are shared per
+        // transactor TYPE across the whole file, so a second test binding
+        // the same transactor to a DIFFERENT instance name would clobber
+        // the first test's already-filled bodies. The subset is one
+        // passive instance per bound transactor — reject the multi-
+        // instance case loudly rather than silently mis-emit.
+        let methods: Vec<usize> =
+            xschema.target_methods.iter().map(|m| m.function.index()).collect();
+        let xname = xschema.name.clone();
+        for fidx in methods {
+            if let Err(prev) =
+                fill_transactor_state_instance(&mut prog.functions[fidx], instance)
+            {
+                return Err(unsupported(
+                    &format!(
+                        "bound-to transactor `{xname}` bound to more than one instance \
+                         (`{prev}`, `{instance}`)"
+                    ),
+                    "the target-side TLM subset materializes one passive instance per bound \
+                     transactor; multiple instances need per-instance responder bodies",
+                ));
+            }
+        }
+        target_tlm_actors.push(ir::TargetTlmActorSchema {
+            instance: instance.clone(),
+            bus_field: bus_field.clone(),
+            transactor: *xid,
+        });
+    }
+
     let tb_id = TestbenchId(prog.testbenches.len() as u32);
     prog.testbenches.push(TestbenchSchema {
         name: tb_schema_name,
@@ -1070,6 +1208,7 @@ fn lower_test(
         transactor_fields: transactor_fields.clone(),
         scoreboard_fields: scoreboard_fields.clone(),
         regblock_bindings: regblock_binding_schemas,
+        target_tlm_actors,
         synthetic,
     });
 
@@ -1134,6 +1273,7 @@ fn lower_test(
         regblock_bindings: regblock_bindings_map,
         regblock_init_order,
         bare_transactor_fields,
+        target_state,
     };
 
     // Synthesized auto-sampler functions, one per covergroup field, in
@@ -1215,7 +1355,7 @@ fn collect_stmts<'a>(b: &'a Block, skip_tb_wire: bool, out: &mut Vec<&'a AstStmt
 /// or `None` when the type is outside the scalar subset. Mirrors v1's
 /// `component_field_c_type` → `txn_field_c_type` C-type choice for
 /// the ≤64-bit subset.
-fn tb_scalar_field_ir_type(t: &TypeExpr) -> Option<IrType> {
+pub(super) fn tb_scalar_field_ir_type(t: &TypeExpr) -> Option<IrType> {
     let TypeExpr::Builtin { name, args, .. } = t else {
         return None;
     };
@@ -1384,6 +1524,12 @@ pub(crate) struct LowerCtx {
     /// leaves test-scope lets unqualified, so resolution must accept
     /// both shapes. A subset of `transactor_fields` keys.
     pub bare_transactor_fields: HashSet<String>,
+    /// Bound-to target-transactor instances → their persistent state
+    /// field names. Populated at test binding for `passive` instances of
+    /// `transactor X bound to <Bus>` transactors. Resolves test-scope
+    /// reads/writes `target.<field>` to `ir::Expr::TransactorState` /
+    /// `ir::Stmt::TransactorStateWrite`. Empty everywhere else.
+    pub target_state: HashMap<String, HashSet<String>>,
 }
 
 pub(crate) struct LoopFrame {
@@ -1442,6 +1588,13 @@ pub(crate) struct FuncBuilder<'a> {
     /// clock-qualified waits and timed `wait until` — are rejected
     /// here, as are nested transactor calls.
     pub(crate) in_transactor_method: bool,
+    /// State fields visible to a bound-to target-responder body
+    /// (`thread bus.<m>(...)`). A bare ident that hits this set lowers
+    /// to `ir::Expr::TransactorState`/`ir::Stmt::TransactorStateWrite` with an
+    /// empty `instance` placeholder; the test-binding stage fills the
+    /// instance once the passive transactor field is resolved. Empty in
+    /// every non-responder context, so the resolution path is inert.
+    pub(crate) target_state_fields: HashSet<String>,
     /// True while lowering a Check-kind function — used for the
     /// precise test-scope-let rejection (see `LowerCtx::
     /// test_scope_lets`).
@@ -1508,6 +1661,7 @@ impl<'a> FuncBuilder<'a> {
             in_pure_helper: false,
             in_fmt_args: false,
             in_transactor_method: false,
+            target_state_fields: HashSet::new(),
             in_check: false,
             let_widths: HashMap::new(),
         }
@@ -1727,6 +1881,178 @@ fn remap_terminator(t: &mut Terminator, remap: &[BlockId]) {
             m(on_timeout);
         }
         Terminator::Return | Terminator::Fatal(_) => {}
+    }
+}
+
+/// Fill the bound responder instance name into a target-method body's
+/// `TransactorState` / `TransactorStateWrite` placeholders (lowered with
+/// an empty instance at transactor-decl time). The responder bodies are
+/// shared per transactor TYPE across the file, so this is idempotent for
+/// the same instance but `Err(prev)` when a state node was already filled
+/// with a DIFFERENT instance (a second test binding the same transactor
+/// to another name) — the caller turns that into an `Unsupported`. The
+/// scan-then-fill split keeps the body un-mutated on the error path.
+fn fill_transactor_state_instance(func: &mut TbFunction, instance: &str) -> Result<(), String> {
+    if let Some(prev) = existing_state_instance(func) {
+        if prev != instance {
+            return Err(prev);
+        }
+    }
+    fill_transactor_state_instance_unchecked(func, instance);
+    Ok(())
+}
+
+/// First non-empty instance name already present on any `TransactorState`
+/// / `TransactorStateWrite` node in the body, or `None` (all empty
+/// placeholders, the common single-bind case).
+fn existing_state_instance(func: &TbFunction) -> Option<String> {
+    fn in_expr(e: &ir::Expr) -> Option<String> {
+        match e {
+            ir::Expr::TransactorState { instance, .. } if !instance.is_empty() => {
+                Some(instance.clone())
+            }
+            ir::Expr::Binary(_, a, b) => in_expr(a).or_else(|| in_expr(b)),
+            ir::Expr::Unary(_, a) | ir::Expr::WidthCast { inner: a, .. } => in_expr(a),
+            ir::Expr::Ternary(c, t, f) => in_expr(c).or_else(|| in_expr(t)).or_else(|| in_expr(f)),
+            ir::Expr::Call(_, args) => args.iter().find_map(in_expr),
+            _ => None,
+        }
+    }
+    for block in &func.blocks {
+        for s in &block.stmts {
+            let found = match s {
+                ir::Stmt::TransactorStateWrite { instance, value, .. } => {
+                    if !instance.is_empty() {
+                        Some(instance.clone())
+                    } else {
+                        in_expr(value)
+                    }
+                }
+                ir::Stmt::Assign(_, e) | ir::Stmt::DutWrite(_, e) => in_expr(e),
+                ir::Stmt::RecordFieldWrite { value, .. } | ir::Stmt::TbFieldWrite { value, .. } => {
+                    in_expr(value)
+                }
+                ir::Stmt::AssertCheck { cond, on_fail } => {
+                    in_expr(cond).or_else(|| on_fail.args.iter().find_map(|a| in_expr(&a.expr)))
+                }
+                ir::Stmt::Log { args, .. } | ir::Stmt::FailDiag { args, .. } => {
+                    args.args.iter().find_map(|a| in_expr(&a.expr))
+                }
+                ir::Stmt::TransactorCall { call, .. } => in_expr(call),
+                ir::Stmt::ScoreboardOp { op, .. } => match op {
+                    ir::ScoreboardOp::QueuePush { value, .. }
+                    | ir::ScoreboardOp::ScalarWrite { value, .. } => in_expr(value),
+                    ir::ScoreboardOp::QueuePop { .. } => None,
+                },
+                ir::Stmt::DutRead(_, _) | ir::Stmt::RecordInit(_, _) | ir::Stmt::CovReport(_) => {
+                    None
+                }
+            };
+            if found.is_some() {
+                return found;
+            }
+        }
+    }
+    None
+}
+
+fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &str) {
+    fn fill_expr(e: &mut ir::Expr, instance: &str) {
+        match e {
+            ir::Expr::TransactorState { instance: i, .. } => {
+                debug_assert!(
+                    i.is_empty() || i == instance,
+                    "target-state instance already filled with a different name"
+                );
+                *i = instance.to_string();
+            }
+            ir::Expr::Binary(_, a, b) => {
+                fill_expr(a, instance);
+                fill_expr(b, instance);
+            }
+            ir::Expr::Unary(_, a) => fill_expr(a, instance),
+            ir::Expr::Ternary(c, t, f) => {
+                fill_expr(c, instance);
+                fill_expr(t, instance);
+                fill_expr(f, instance);
+            }
+            ir::Expr::WidthCast { inner, .. } => fill_expr(inner, instance),
+            ir::Expr::Call(_, args) => {
+                for a in args {
+                    fill_expr(a, instance);
+                }
+            }
+            ir::Expr::Literal { .. }
+            | ir::Expr::WideLiteral(_)
+            | ir::Expr::Local(_)
+            | ir::Expr::Port(_)
+            | ir::Expr::RecordField { .. }
+            | ir::Expr::TbField(_)
+            | ir::Expr::ScoreboardQuery { .. }
+            | ir::Expr::CovBin { .. } => {}
+        }
+    }
+    fn fill_term(t: &mut Terminator, instance: &str) {
+        match t {
+            Terminator::Branch(c, _, _) => fill_expr(c, instance),
+            Terminator::WaitCycles(n, _, _) | Terminator::WaitCyclesSync(n, _) => {
+                fill_expr(n, instance)
+            }
+            Terminator::WaitUntil { preds, .. } => {
+                for p in preds {
+                    fill_expr(&mut p.expr, instance);
+                }
+            }
+            Terminator::WaitUntilTimeout { preds, cycles, .. } => {
+                for p in preds {
+                    fill_expr(&mut p.expr, instance);
+                }
+                fill_expr(cycles, instance);
+            }
+            Terminator::Fatal(args) => {
+                for a in &mut args.args {
+                    fill_expr(&mut a.expr, instance);
+                }
+            }
+            Terminator::Jump(_) | Terminator::WaitTimePs(_, _) | Terminator::Return => {}
+        }
+    }
+    for block in &mut func.blocks {
+        for s in &mut block.stmts {
+            match s {
+                ir::Stmt::TransactorStateWrite { instance: i, value, .. } => {
+                    debug_assert!(
+                        i.is_empty() || i == instance,
+                        "target-state-write instance already filled with a different name"
+                    );
+                    *i = instance.to_string();
+                    fill_expr(value, instance);
+                }
+                ir::Stmt::Assign(_, e) | ir::Stmt::DutWrite(_, e) => fill_expr(e, instance),
+                ir::Stmt::RecordFieldWrite { value, .. } | ir::Stmt::TbFieldWrite { value, .. } => {
+                    fill_expr(value, instance)
+                }
+                ir::Stmt::AssertCheck { cond, on_fail } => {
+                    fill_expr(cond, instance);
+                    for a in &mut on_fail.args {
+                        fill_expr(&mut a.expr, instance);
+                    }
+                }
+                ir::Stmt::Log { args, .. } | ir::Stmt::FailDiag { args, .. } => {
+                    for a in &mut args.args {
+                        fill_expr(&mut a.expr, instance);
+                    }
+                }
+                ir::Stmt::TransactorCall { call, .. } => fill_expr(call, instance),
+                ir::Stmt::ScoreboardOp { op, .. } => match op {
+                    ir::ScoreboardOp::QueuePush { value, .. }
+                    | ir::ScoreboardOp::ScalarWrite { value, .. } => fill_expr(value, instance),
+                    ir::ScoreboardOp::QueuePop { .. } => {}
+                },
+                ir::Stmt::DutRead(_, _) | ir::Stmt::RecordInit(_, _) | ir::Stmt::CovReport(_) => {}
+            }
+        }
+        fill_term(&mut block.terminator, instance);
     }
 }
 

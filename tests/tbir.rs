@@ -2323,14 +2323,130 @@ end impl TypoTest
     );
 }
 
-/// The target-side TLM fixtures now stop at their REAL next blocker —
-/// the bus-bound transactor form — instead of the bus file gate (and,
-/// before the transactor slice, the transactor construct gate).
+/// The blocking target-side TLM fixtures now lower end-to-end: a
+/// `transactor X bound to <Bus>` with `thread bus.<m>(...)` responder
+/// bodies, persistent scalar state fields read from the test, and the
+/// per-instance state struct + actor schemas.
 #[test]
-fn tlm_target_fixture_blocked_by_bus_bound_transactor() {
-    let err = lower_src(&fixture("tlm_target_thread_test.harc")).unwrap_err();
+fn tlm_target_blocking_responder_lowers() {
+    let prog = lower_src(&fixture("tlm_target_thread_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    // The bound transactor carries the bus + one blocking target method.
+    let x = &prog.transactors[0];
+    assert_eq!(x.bound_bus.as_deref(), Some("TlmMemBus"));
+    assert_eq!(x.target_methods.len(), 1);
+    assert_eq!(x.target_methods[0].name, "read");
+    assert!(x.target_methods[0].has_ret);
+    // The test binds one passive responder actor on bus binding `mem`.
+    let tb = &prog.testbenches[0];
+    assert_eq!(tb.target_tlm_actors.len(), 1);
+    assert_eq!(tb.target_tlm_actors[0].instance, "target");
+    assert_eq!(tb.target_tlm_actors[0].bus_field, "mem");
+}
+
+/// State fields lower as `TransactorState` reads/writes, instance-filled
+/// at the test bind, and the test reads them back (`target.read_count`).
+#[test]
+fn tlm_target_state_fields_lower() {
+    let prog = lower_src(&fixture("tlm_target_thread_if_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let x = &prog.transactors[0];
+    let names: Vec<&str> = x.state_fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["read_count", "prep_acc"]);
+    // The responder body's state writes are instance-filled to `target`.
+    let body = prog.function(x.target_methods[0].function);
+    let filled = body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+        matches!(
+            s,
+            ir::Stmt::TransactorStateWrite { instance, .. } if instance == "target"
+        )
+    });
+    assert!(filled, "responder body must carry instance-filled state writes");
+}
+
+/// `out_of_order tags N` target threads stay out of subset (only
+/// `blocking` responders are lowered).
+#[test]
+fn tlm_target_ooo_responder_unsupported() {
+    let err = lower_src(&fixture("tlm_pairing_arch_initiator_test.harc")).unwrap_err();
     let msg = assert_unsupported(&err);
-    assert!(msg.contains("bound to a bus type"), "{msg}");
+    assert!(msg.contains("out_of_order"), "{msg}");
+}
+
+/// The responder `TbFunction`s are shared per transactor TYPE; binding
+/// the same bound transactor to two instances across two tests would
+/// clobber the first test's instance-filled bodies. The subset is one
+/// passive instance per bound transactor — lowering rejects the second
+/// bind loudly (in ALL build profiles), never silently mis-emits.
+#[test]
+fn tlm_target_multi_instance_unsupported() {
+    let src = r#"
+bus MemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus MemBus
+
+transactor MemTarget bound to MemBus
+    read_count : uint<32> default 0
+    thread bus.read(addr: uint<8>)
+        read_count = read_count + 1
+        return 256 + addr
+    end thread
+end transactor MemTarget
+
+testbench TbA
+    dut : InitA
+end testbench TbA
+
+impl TestA for TbA
+    let mem : MemBus = bind dut
+    let target : MemTarget passive = bind mem
+    run
+        dut.rst = 1
+        wait 1 cycle
+    end run
+end impl TestA
+
+testbench TbB
+    dut : InitA
+end testbench TbB
+
+impl TestB for TbB
+    let mem2 : MemBus = bind dut
+    let responder : MemTarget passive = bind mem2
+    run
+        dut.rst = 1
+        wait 1 cycle
+    end run
+end impl TestB
+"#;
+    let err = lower_src(src).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("more than one instance"),
+        "expected the multi-instance rejection: {msg}"
+    );
+}
+
+/// Locks the dump-ir text for a state-bearing target responder: the
+/// `bound to` transactor schema, the state-field list, and the responder
+/// body's `TransactorState` reads/writes + loop/branch structure.
+#[test]
+fn tlm_target_thread_if_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("tlm_target_thread_if_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("tlm_target_thread_if_dump_ir", format!("{prog}"));
+}
+
+/// Locks the emitted-cpp shape for the target responder actor: the
+/// per-instance state struct, the background-coroutine actor (req_ready/
+/// rsp_valid handshake, arg capture, body loop-switch, response drive),
+/// and the test-scope `target.<field>` reads.
+#[test]
+fn tlm_target_thread_if_emitted_cpp_snapshot() {
+    insta::assert_snapshot!(
+        "tlm_target_thread_if_emitted_cpp",
+        emit_fixture_cpp("tlm_target_thread_if_test.harc")
+    );
 }
 
 /// Transactor-call seam rule, verifier side: the call edge is pinned
@@ -2879,15 +2995,18 @@ end impl Test
 }
 
 /// The corpus `regblock_basic_test` fixture's `via` helper is a
-/// `transactor ... bound to BusAxiLite` — the bus-bound helper form is
-/// the documented residual blocker. Lowering rejects it (the file-level
-/// gate hits the bus-bound transactor first), never mis-lowers.
+/// `transactor ... bound to BusAxiLite` whose methods are `hookable`
+/// bodies driving the bus's handshake channels — the *initiator-side*
+/// bus-bound BFM form. That is the documented residual blocker after
+/// the target-side TLM slice; lowering rejects it precisely (it now
+/// reaches the bound-to transactor path and names the hookable),
+/// never mis-lowers.
 #[test]
-fn regblock_basic_corpus_blocked_on_bus_bound_helper() {
+fn regblock_basic_corpus_blocked_on_initiator_side_bfm() {
     let err = lower_src(&fixture("regblock_basic_test.harc")).unwrap_err();
     let msg = assert_unsupported(&err);
     assert!(
-        msg.contains("bound to a bus"),
-        "expected the bus-bound-helper residual blocker: {msg}"
+        msg.contains("initiator-side method") || msg.contains("hookable"),
+        "expected the initiator-side BFM residual blocker: {msg}"
     );
 }

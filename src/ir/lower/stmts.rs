@@ -443,6 +443,13 @@ impl FuncBuilder<'_> {
             self.push(Stmt::TbFieldWrite { field, value: e });
             return Ok(());
         }
+        // Test-scope write of a bound-to target responder's persistent
+        // state field: `target.read_count = 0`.
+        if let Some((instance, field)) = self.as_transactor_state(target) {
+            let e = self.lower_expr_no_ports(value)?;
+            self.push(Stmt::TransactorStateWrite { instance, field, value: e });
+            return Ok(());
+        }
         // Scoreboard scalar-counter write: `sb.writes = sb.writes + 1`
         // (classic) / `_tb.sb.writes = ...` (impl-form, post-desugar).
         if let ExprKind::Field { target: ft, name } = &*target.kind {
@@ -536,6 +543,18 @@ impl FuncBuilder<'_> {
                     }
                 }
                 self.push(Stmt::Assign(local, e));
+                return Ok(());
+            }
+            // Persistent state-field write inside a bound-to target
+            // responder body (`read_count = read_count + 1`). The
+            // instance is a placeholder filled at the test-binding stage.
+            if self.target_state_fields.contains(&id.name) {
+                let e = self.lower_expr_no_ports(value)?;
+                self.push(Stmt::TransactorStateWrite {
+                    instance: String::new(),
+                    field: id.name.clone(),
+                    value: e,
+                });
                 return Ok(());
             }
             if self.in_check && self.ctx.test_scope_lets.contains(&id.name) {

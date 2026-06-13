@@ -245,6 +245,19 @@ fn emit_test(
             func::emit_method(out, prog, schema, m, 1)?;
         }
     }
+    // Bound-to target-side TLM responder instances: one per-instance
+    // state struct (state fields + activity stamps), declared in the
+    // test scope so both the run/check coroutine (`target.read_count`)
+    // and the actor coroutines capture it by reference, then one
+    // background-coroutine actor per target method.
+    for actor in &tb.target_tlm_actors {
+        let schema = prog.transactor(actor.transactor);
+        runtime::target_state_struct_inst(out, schema, &actor.instance);
+    }
+    for actor in &tb.target_tlm_actors {
+        func::emit_target_actor(out, prog, actor, 1)?;
+    }
+
     writeln!(out, "{INDENT}harc_rt::ThreadSlot _run_slot;").ok();
     writeln!(out, "{INDENT}sched.slots.push_back(&_run_slot);").ok();
     writeln!(
