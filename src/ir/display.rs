@@ -349,9 +349,9 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
             comp_base_str(base),
             expr_str(func, value)
         ),
-        Stmt::ComponentEmit { event, args } => {
+        Stmt::ComponentEmit { base, event, args } => {
             let a: Vec<String> = args.iter().map(|e| expr_str(func, e)).collect();
-            format!("ComponentEmit({event}, [{}])", a.join(", "))
+            format!("ComponentEmit({}.{event}, [{}])", comp_base_str(base), a.join(", "))
         }
         Stmt::ComponentCall { base, component, method, args, dest } => {
             let a: Vec<String> = args.iter().map(|e| expr_str(func, e)).collect();
@@ -545,6 +545,14 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         }
         Expr::ComponentField { base, field } => {
             format!("{}.{field}", comp_base_str(base))
+        }
+        Expr::ComponentIdle { base, kind, n } => {
+            let m = match kind {
+                crate::ir::IdleKind::In => "idle_in",
+                crate::ir::IdleKind::Out => "idle_out",
+                crate::ir::IdleKind::Both => "idle",
+            };
+            format!("{}.{m}({})", comp_base_str(base), expr_str(func, n))
         }
         Expr::Binary(op, a, b) => format!(
             "({} {} {})",

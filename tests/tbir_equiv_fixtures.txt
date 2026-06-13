@@ -101,3 +101,4 @@ tlm_target_thread_early_return_test | TlmReadInitiatorRuntimeLen | TlmReadInitia
 analysis_sink_connect_test | Top | top_counter.sv | - | pass
 keep_constraints_test | Top | top_counter.sv | top_counter.arch | pass
 axilite_constraint_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass | axilite_regs_test.harc | - | AxiLiteConstraintTest
+agent_on_handler_test | Top | top_counter.sv | - | pass

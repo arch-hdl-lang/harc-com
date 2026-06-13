@@ -881,6 +881,9 @@ impl Checker<'_> {
             // Component host state — resolved at lowering against the
             // component schema; no local/port dependency to verify here.
             Expr::ComponentField { .. } => {}
+            // Idle predicate: the base/kind are resolved at lowering; only
+            // the threshold sub-expression carries verifiable structure.
+            Expr::ComponentIdle { n, .. } => self.check_expr(n, ports_ok, context),
             Expr::ScoreboardQuery { sb, field, query } => {
                 self.check_scoreboard(*sb, field);
                 match query {
@@ -1250,6 +1253,7 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
             for_each_local(e, f);
         }
         Expr::WidthCast { inner, .. } => for_each_local(inner, f),
+        Expr::ComponentIdle { n, .. } => for_each_local(n, f),
         Expr::CovBin { .. } => {}
         Expr::Call(_, args) => {
             for a in args {

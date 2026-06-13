@@ -363,7 +363,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                     "pass the base test file alongside the extension",
                 ));
             }
-            Item::Env(c) => {
+            Item::Env(c) | Item::Agent(c) => {
                 if used_tbs.contains(&c.name.name) {
                     validate_testbench_component(
                         c,
@@ -374,12 +374,15 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                         &scoreboard_ids,
                         &component_type_names,
                     )?;
-                } else if matches!(c.kind, crate::ast::ComponentKind::Env) {
-                    // A composite `env` used as a test-scope component
-                    // (`let env : AnalysisEnv`) is lowered through the
-                    // component-cluster path below — it is inert at this
-                    // gate (its items are validated by the component
-                    // schema builder).
+                } else if matches!(
+                    c.kind,
+                    crate::ast::ComponentKind::Env | crate::ast::ComponentKind::Agent
+                ) {
+                    // A composite `env`/`agent` used as a test-scope
+                    // component (`let env : AnalysisEnv` / `let tagger :
+                    // Tagger`) is lowered through the component-cluster
+                    // path below — inert at this gate (its items are
+                    // validated by the component schema builder).
                 } else {
                     return Err(unsupported(
                         &format!("env/component `{}`", c.name.name),
@@ -553,12 +556,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             Item::Env(c) if matches!(c.kind, crate::ast::ComponentKind::Env) => {
                 (&c.name.name, components::CompSource::Env(c))
             }
-            Item::Agent(c) => {
-                return Err(unsupported(
-                    &format!("the `agent` construct (`{}`)", c.name.name),
-                    "agents need event-handler (`on <ev>`) lowering; out of the env/env-connect \
-                     subset",
-                ));
+            Item::Agent(c) if matches!(c.kind, crate::ast::ComponentKind::Agent) => {
+                (&c.name.name, components::CompSource::Agent(c))
             }
             Item::Sequencer(c) => {
                 return Err(unsupported(
@@ -2345,6 +2344,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 fill_expr(f, instance);
             }
             ir::Expr::WidthCast { inner, .. } => fill_expr(inner, instance),
+            ir::Expr::ComponentIdle { n, .. } => fill_expr(n, instance),
             ir::Expr::Call(_, args) => {
                 for a in args {
                     fill_expr(a, instance);

@@ -437,6 +437,12 @@ pub struct ComponentSchema {
     /// for scoreboard/transactor components). Resolved against this env's
     /// sub-component fields; emission wires them at env construction.
     pub connects: Vec<ConnectEdgeSchema>,
+    /// `on <ev>(arg) ... end on` event handlers (agent subset; empty for
+    /// env/scoreboard/transactor). Each subscribes to a self-event field;
+    /// registered at component construction as a `push_back` closure that
+    /// bumps `_last_in_cycle` and runs the handler body. The handler body
+    /// is lowered as a one-param `ComponentMethod` function.
+    pub on_handlers: Vec<OnHandlerSchema>,
 }
 
 impl ComponentSchema {
@@ -453,6 +459,10 @@ pub enum ComponentKindTag {
     Env,
     Scoreboard,
     Transactor,
+    /// `agent` — composes event handlers (`on <ev>`) into a self-
+    /// subscribing component. Same flat-struct shape as env/scoreboard;
+    /// the distinguishing capability is on-handler registration.
+    Agent,
 }
 
 impl ComponentKindTag {
@@ -461,6 +471,7 @@ impl ComponentKindTag {
             ComponentKindTag::Env => "env",
             ComponentKindTag::Scoreboard => "scoreboard",
             ComponentKindTag::Transactor => "transactor",
+            ComponentKindTag::Agent => "agent",
         }
     }
 }
@@ -498,6 +509,24 @@ pub struct ComponentMethodSchema {
     /// false for `function` (no hooks). Mirrors v1's
     /// `HookableMethod::is_hookable`.
     pub hookable: bool,
+}
+
+/// One `on <event>(arg) ... end on` handler on an agent (or other
+/// component). The handler subscribes to the component's own `event`
+/// field; on every `emit`/`connect` fan-out into that field, the
+/// framework bumps `_last_in_cycle` (activity tracking) then invokes
+/// `<Comp>_on<idx>(self, arg)`. `arg_signed` selects the C payload
+/// type for the subscriber closure parameter, mirroring the event
+/// field's `ComponentFieldKind::Event { signed }`.
+#[derive(Debug, Clone)]
+pub struct OnHandlerSchema {
+    /// The self-event field this handler subscribes to.
+    pub event: String,
+    /// Signedness of the event payload scalar (matches the field).
+    pub arg_signed: bool,
+    /// Lowered handler body (`kind: ComponentMethod`, exactly one param
+    /// = the event argument).
+    pub function: FunctionId,
 }
 
 /// One `connect <src>.<event> -> <sink>.<method>` edge inside an env,
@@ -850,12 +879,18 @@ pub enum Stmt {
         field: String,
         value: Expr,
     },
-    /// `emit observed(v)` inside a component method body: fan the args out
-    /// to every callback registered on the named `out event<T>` field of
-    /// `self`. Emitted as `for (auto& _s : self.<event>) _s(args);` plus
-    /// v1's `_last_out_cycle` heartbeat bump. Only valid inside a
-    /// `ComponentMethod` body (`base` is implicitly `self`).
-    ComponentEmit { event: String, args: Vec<Expr> },
+    /// `emit observed(v)` — fan the args out to every callback registered
+    /// on the named `out event<T>` field of the component named by `base`.
+    /// `base = SelfField` for a self-relative `emit observed(v)` inside a
+    /// method body (`self.<event>`); `base = Path([...])` for a test-scope
+    /// `emit env.agent.in_ev(v)` (`env.agent.<event>`). Emitted as
+    /// `for (auto& _s : <base>.<event>) _s(args);` plus v1's
+    /// `_last_out_cycle` heartbeat bump on the emitting component.
+    ComponentEmit {
+        base: ComponentBase,
+        event: String,
+        args: Vec<Expr>,
+    },
     /// A composite-component method call (`env.source.publish(3)`). `base`
     /// resolves the receiver sub-component path; `component` is its schema
     /// (to name `<Comp>_<method>`); `dest` receives a `-> T` return.
@@ -1069,6 +1104,17 @@ pub enum Expr {
     /// scoreboard-style ops which are out of subset for components in v0;
     /// events are written via `connect`/`emit` only).
     ComponentField { base: ComponentBase, field: String },
+    /// A heartbeat-idle predicate on a component: `agent.idle_in(N)`,
+    /// `agent.idle_out(N)`, or `agent.idle(N)` (= both). `base` resolves
+    /// the component instance; `n` is the cycle-count threshold. Reads the
+    /// auto-injected `_last_in_cycle`/`_last_out_cycle` stamps against the
+    /// global `cycle_count` (v1's `emit_idle_predicate`). Boolean-valued —
+    /// allowed wherever a `Local` is.
+    ComponentIdle {
+        base: ComponentBase,
+        kind: IdleKind,
+        n: Box<Expr>,
+    },
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Unary(UnOp, Box<Expr>),
     /// `cond ? a : b`. Both backends emit the C++ ternary; port reads
@@ -1096,6 +1142,17 @@ pub enum Expr {
         bin: String,
     },
     Call(CallTarget, Vec<Expr>),
+}
+
+/// Which heartbeat stamp(s) an `Expr::ComponentIdle` predicate reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleKind {
+    /// `idle_in(N)` — N cycles since last input activity.
+    In,
+    /// `idle_out(N)` — N cycles since last output activity.
+    Out,
+    /// `idle(N)` — both `idle_in(N)` AND `idle_out(N)`.
+    Both,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

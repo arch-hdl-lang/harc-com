@@ -239,6 +239,31 @@ fn component_emit_order(prog: &TbProgram) -> Vec<usize> {
     order
 }
 
+/// Register every `on <ev>(arg)` handler on `component` (and nested
+/// sub-components) as a subscriber closure on the corresponding event
+/// field of the instance reached by `inst_path`. The closure bumps the
+/// owning instance's `_last_in_cycle` activity stamp, then runs the
+/// handler body lambda — mirroring v1's `on`-subscriber registration.
+fn emit_on_handler_regs(out: &mut String, prog: &TbProgram, component: ir::ComponentId, inst_path: &str) {
+    let comp = &prog.components[component.index()];
+    for oh in &comp.on_handlers {
+        let lambda = func::on_handler_lambda_name(comp, oh);
+        writeln!(
+            out,
+            "{INDENT}{inst_path}.{}.push_back([&](auto _t) {{ {inst_path}._last_in_cycle = (uint64_t)cycle_count; {lambda}({inst_path}, _t); }});",
+            oh.event
+        )
+        .ok();
+    }
+    // Recurse into by-value sub-components (an env holding an agent).
+    for f in &comp.fields {
+        if let ir::ComponentFieldKind::Sub { component: sub } = &f.kind {
+            let sub_path = format!("{inst_path}.{}", f.name);
+            emit_on_handler_regs(out, prog, *sub, &sub_path);
+        }
+    }
+}
+
 fn emit_test(
     out: &mut String,
     prog: &TbProgram,
@@ -336,6 +361,9 @@ fn emit_test(
         for m in &comp.methods {
             func::emit_component_method(out, prog, comp, m, 1)?;
         }
+        for oh in &comp.on_handlers {
+            func::emit_component_on_handler(out, prog, comp, oh, 1)?;
+        }
     }
     // Composite-component test-scope instances (`let env : AnalysisEnv`):
     // a default-constructed run-scope local, then its env `connect`
@@ -363,6 +391,12 @@ fn emit_test(
             )
             .ok();
         }
+        // `on <ev>(arg)` handler registrations, for this component and any
+        // nested sub-components (an env holding an agent). Each subscribes
+        // to the event field on its owning instance, bumps the instance's
+        // `_last_in_cycle` activity stamp, then runs the handler body —
+        // mirroring v1's `on`-subscriber registration.
+        emit_on_handler_regs(out, prog, cf.component, &cf.field);
     }
 
     writeln!(out, "{INDENT}harc_rt::ThreadSlot _run_slot;").ok();

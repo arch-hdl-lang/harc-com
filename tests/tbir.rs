@@ -202,9 +202,11 @@ fn randomize_fixture_lowers() {
     assert!(randomize_blocks >= 1, "a Randomize terminator is present");
 }
 
-/// Agent/event fixture (`agent`, `event<T>`) is outside the MVP
-/// subset. Its `transaction` item now lowers (records slice), so the
-/// item-level scan trips on the `agent` declaration instead.
+/// `wait_until_quiesce` composes an `agent` (now lowered — agent
+/// slice), but binds it as a TESTBENCH FIELD (`prod : Producer`) inside
+/// a `testbench` block. Composite-component testbench-field binding is a
+/// separate slice (envs/agents bind as a test-scope `let` today), so the
+/// fixture trips precisely on that residual rather than on `agent`.
 #[test]
 fn wait_until_quiesce_fixture_is_unsupported() {
     let err = lower_src(&fixture("wait_until_quiesce_test.harc")).unwrap_err();
@@ -638,6 +640,74 @@ fn analysis_env_connect_emitted_cpp_snapshot() {
     insta::assert_snapshot!(
         "analysis_env_connect_emitted_cpp",
         emit_fixture_cpp("analysis_sink_connect_test.harc")
+    );
+}
+
+/// Agent subset: an `agent` composing an `event<T>` self-event, an
+/// `on <ev>(arg)` handler (lowered as a one-param `ComponentMethod`),
+/// and the heartbeat `idle_in` predicate. Locks the dump-ir: the
+/// component schema with `(agent)` kind, the `comp_on_*` handler
+/// function, the test-scope path `ComponentEmit(tagger.in_ev, ...)`,
+/// and the `tagger.idle_in(N)` predicate expression.
+#[test]
+fn agent_on_handler_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("agent_on_handler_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("agent_on_handler_dump_ir", format!("{prog}"));
+}
+
+/// Regression: an agent that declares its `on <ev>` handler BEFORE a
+/// `hookable` method. Pass 1 reserves FunctionIds methods-first then
+/// on-handlers; the body-lowering pass must emit bodies in that same
+/// FunctionId order (not source order), or `prog.functions` (indexed by
+/// FunctionId) ends up non-monotonic and every later `prog.function(id)`
+/// lookup is corrupt. `verify_program` walks the function table by id,
+/// so it fails loudly on a mis-order.
+#[test]
+fn agent_on_handler_before_method_lowers_in_function_id_order() {
+    let src = r#"
+agent Mixed
+    in_ev : event<uint<8>>
+    seen  : uint<32> default 0
+
+    on in_ev(t)
+        seen = seen + 1
+        bump()
+    end on
+
+    hookable bump()
+        seen = seen + 1
+    end bump
+end agent Mixed
+
+test MixedAgentTest
+    let dut   : Top
+    let mixed : Mixed
+    run
+        emit mixed.in_ev(7)
+        assert mixed.seen == 2
+            else fail("expected 2, got ${mixed.seen}")
+    end run
+end test MixedAgentTest
+"#;
+    let prog = lower_src(src).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    // Function ids must be densely 0..N in table order.
+    for (i, f) in prog.functions.iter().enumerate() {
+        assert_eq!(f.id.0 as usize, i, "function table out of FunctionId order");
+    }
+}
+
+/// Locks the emitted tbir C++ for the agent fixture: the component
+/// struct (event-callback vector + heartbeat stamps), the
+/// `<Comp>_on_h<fid>` handler lambda, the on-handler `push_back`
+/// registration (with the `_last_in_cycle` bump), the path-based
+/// `emit` fan-out, and the `idle_in` predicate.
+#[test]
+fn agent_on_handler_emitted_cpp_snapshot() {
+    insta::assert_snapshot!(
+        "agent_on_handler_emitted_cpp",
+        emit_fixture_cpp("agent_on_handler_test.harc")
     );
 }
 

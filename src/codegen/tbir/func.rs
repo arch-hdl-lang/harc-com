@@ -571,14 +571,15 @@ fn emit_stmt(
         // `emit observed(v)` inside a method body: fan the args out to
         // every subscriber registered on `self.<event>`, then bump the
         // component's `_last_out_cycle` heartbeat (v1's emit lowering).
-        Stmt::ComponentEmit { event, args } => {
+        Stmt::ComponentEmit { base, event, args } => {
             let mut rendered = Vec::with_capacity(args.len());
             for a in args {
                 rendered.push(expr_cpp(cx, a)?);
             }
             let csv = rendered.join(", ");
-            writeln!(out, "{pad}for (auto& _s : self.{event}) _s({csv});").ok();
-            writeln!(out, "{pad}self._last_out_cycle = (uint64_t)cycle_count;").ok();
+            let recv = comp_base_cpp(base);
+            writeln!(out, "{pad}for (auto& _s : {recv}.{event}) _s({csv});").ok();
+            writeln!(out, "{pad}{recv}._last_out_cycle = (uint64_t)cycle_count;").ok();
         }
         // `env.source.publish(3)` — a free `<Comp>_<method>(receiver,
         // args)` lambda call (v1's `emit_component_method` shape).
@@ -874,7 +875,44 @@ pub(super) fn emit_component_method(
     m: &crate::ir::ComponentMethodSchema,
     depth: usize,
 ) -> Result<(), EmitError> {
-    let func = prog.function(m.function);
+    let lambda = format!("{}_{}", comp.name, m.name);
+    emit_component_fn_lambda(out, prog, comp, m.function, &lambda, depth)
+}
+
+/// Emit one `on <ev>(arg)` handler body as a free
+/// `<Comp>_on_h<fid>(<Comp>& self, uint64_t arg)` lambda — same loop-
+/// switch shape as a component method, but the lambda name is derived
+/// from the handler's FunctionId so it never collides with a user method.
+pub(super) fn emit_component_on_handler(
+    out: &mut String,
+    prog: &TbProgram,
+    comp: &crate::ir::ComponentSchema,
+    oh: &crate::ir::OnHandlerSchema,
+    depth: usize,
+) -> Result<(), EmitError> {
+    let lambda = on_handler_lambda_name(comp, oh);
+    emit_component_fn_lambda(out, prog, comp, oh.function, &lambda, depth)
+}
+
+/// The free-lambda name for an on-handler (`<Comp>_on_h<fid>`).
+pub(super) fn on_handler_lambda_name(
+    comp: &crate::ir::ComponentSchema,
+    oh: &crate::ir::OnHandlerSchema,
+) -> String {
+    format!("{}_on_h{}", comp.name, oh.function.0)
+}
+
+/// Shared lambda emission for component methods and on-handlers: a free
+/// `<lambda>(<Comp>& self, args...)` loop-switch over the lowered CFG.
+fn emit_component_fn_lambda(
+    out: &mut String,
+    prog: &TbProgram,
+    comp: &crate::ir::ComponentSchema,
+    function: crate::ir::FunctionId,
+    lambda: &str,
+    depth: usize,
+) -> Result<(), EmitError> {
+    let func = prog.function(function);
     let names = cpp_local_names(func);
     let empty_lanes = HashMap::new();
     let cx = ECx {
@@ -895,12 +933,7 @@ pub(super) fn emit_component_method(
         params.push(format!("uint64_t {n}"));
     }
     let params = params.join(", ");
-    writeln!(
-        out,
-        "{pad}auto {}_{} = [&]({params}) -> {ret_ty} {{",
-        comp.name, m.name
-    )
-    .ok();
+    writeln!(out, "{pad}auto {lambda} = [&]({params}) -> {ret_ty} {{").ok();
     declare_locals(out, prog, func, &names, nparams, depth + 1)?;
     writeln!(out, "{pad1}int __bb = {};", func.entry.0).ok();
     writeln!(out, "{pad1}while (true) {{").ok();

@@ -25,6 +25,7 @@ checked against the code at the cited location.
 | #366 | `transactor` declarations (unbound DUT-poking BFM subset): `TransactorSchema` table on `TbProgram`, one `TbFunction` per method (`kind: TransactorBody` — v1's `field_subs` substitution replaced by lowering-time DUT resolution), `Stmt::TransactorCall` carrying the never-inlined `Expr::Call(CallTarget::TransactorMethod ..)` edge, sync-wait method-lambda emission, ternary expressions (`Expr::Ternary`), plus 8 corpus fixtures registered. |
 | #368 | `scoreboard` declarations (data-only host-state subset): `ScoreboardSchema` table on `TbProgram`, scalar-counter + `queue<T>` fields, `Stmt::ScoreboardOp` (`QueuePush`/`QueuePop`/`ScalarWrite`) and `Expr::ScoreboardQuery` (scalar read / `size()` / `empty()`), scoreboard-instance struct emission (`harc_rt::HarcQueue<T>` members) held on the `_tb` struct, plus the self-proving `scoreboard_basic_test` fixture. Scoreboard methods, event-driven `on`/`connect` wiring, and `queue<Struct>` payloads stay rejected (see the divergence note). |
 | env-composition slice (2026-06-13) | env/agent cluster's flat-struct core: `ComponentSchema` table on `TbProgram` (method-bearing scoreboards, analysis-source transactors, composing `env`s), `FunctionKind::ComponentMethod`, `Stmt::{ComponentFieldWrite, ComponentEmit, ComponentCall}`, `Expr::ComponentField`, `ConnectEdgeSchema`. `connect` (analysis-port → scoreboard sink), scoreboard methods (instance state materialized), and `out event`/`emit` lower; the `analysis_sink_connect_test` corpus fixture is registered. `agent`/`on`-handlers, `sequencer`/`tseq`, watchdog/phase, `idle`/`quiesced` predicates stay rejected (divergence 14). |
+| agent/on-handler slice (2026-06-13) | `agent` composition + `on <ev>(arg)` event handlers (builds on the env-composition core, `src/ir/lower/components.rs`): `ComponentKindTag::Agent`, `ComponentSchema::on_handlers` (`OnHandlerSchema { event, arg_signed, function }`), `Stmt::ComponentEmit` extended with a `base: ComponentBase` (test-scope path-emit `emit tagger.in_ev(v)` + self-relative both lower), and `Expr::ComponentIdle { base, kind: IdleKind::{In,Out,Both}, n }` for the `idle`/`idle_in`/`idle_out` heartbeat predicates. An `on in_ev(t)` handler lowers as a one-param `ComponentMethod` and registers at component construction as a subscriber closure that bumps `_last_in_cycle` then runs the handler body (mirrors v1's `on`-subscriber registration); registration recurses into by-value sub-components. Directionless `event<scalar>` self-events join the existing `out event` analysis-port form on `ComponentFieldKind::Event`. Fixture: `agent_on_handler_test` (`top_counter.sv`, pass) — agent + on-handler + path-emit + `idle_in`, trace-diff clean v1↔tbir at seed 1. `event<Struct/transaction>` payloads, testbench-field-bound components, `quiesced(N)`, `watchdog`, `phase`, `on <N> cycles`/cycle-trigger handlers, `wait until` with heartbeat predicates, and `sequencer`/`tseq` stay rejected (divergence 15). |
 | #372 | `randomize` via the constraint-IR seam: `Terminator::Randomize { target, constraints: ConstraintRef, succ }` + a `TbProgram::constraint_sites` table (the `ConstraintRef` handle resolves into it). Lowering merges transaction `keep`s ahead of the call-site `with {...}` body (spec §4) and records each site with its `ConstraintProblemId` handle. The tbir backend reuses v1's Z3-solve emission verbatim (`cpp_tb::emit_randomize_snippets` → `emit_constraint_solver_block` / unconstrained-PRNG shell / `emit_randomize_trace_event`) — "the constraint runtime is shared; only the call site moves to the IR backend." The runtime problem table + `harc_z3_rt.h` include are emitted iff a site exists. New passes wiring: `lower_coroutine` treats Randomize as a host-sync transition (`Trigger::Solved`); `placement` tiers a solve block at Tier-2 host-service and capability-checks `solve_*`. Fixtures: `keep_constraints_test` (bare `randomize(t)` + transaction keeps), `axilite_constraint_test` (`randomize(p) with` + Z3 cross-field constraints). Both trace-diff clean v1↔tbir at seed 1. `randomize` *expressions* (`let v = randomize(t)`), scoreboard-`.push`/`tseq`-gated randomize fixtures, and method-body randomize stay rejected (residual map below). |
 
 ### Construct subset
@@ -215,12 +216,24 @@ bodies are loop-switch `<Comp>_<method>(<Comp>& self, args)` lambdas; the
 env is a run-scope local with its `connect` push_backs wired at
 construction (`<env>.<src>.<event>.push_back([&](auto _t){
 <Sink>_<m>(<env>.<sink>, _t); })`) — byte-for-byte v1's shape, so
-`analysis_sink_connect_test` trace-diffs clean. **Out of subset**
-(precise rejections): `agent` declarations and `on <ev>` event handlers,
-`sequencer`/`tseq`, watchdog/phase orchestration, `idle(N)`/`quiesced(N)`
-predicates, dotted-path `emit top.prod.in_ev(t)`, bus-bound source
-transactors, generics, and non-scalar event payloads. Those gate on the
-agent/sequencer/event slices.
+`analysis_sink_connect_test` trace-diffs clean.
+
+The **agent + on-handler subset** (added 2026-06-13, same file) extends
+this with the agent capability the env-composition slice flagged: an
+`agent` lowers as a `ComponentSchema` (`ComponentKindTag::Agent`), bound
+test-scope as `let <name> : <Agent>`. `on <ev>(arg)` handlers lower as
+one-param `ComponentMethod`s recorded in `ComponentSchema::on_handlers`
+and register at construction as subscriber closures (bump
+`_last_in_cycle`, run the `<Comp>_on_h<fid>` body) — v1's `on`-subscriber
+shape. `Stmt::ComponentEmit` now carries a `base` so a test-scope path
+`emit tagger.in_ev(v)` and a self-relative `emit observed(v)` both lower;
+`Expr::ComponentIdle` covers `idle`/`idle_in`/`idle_out` (v1's
+`emit_idle_predicate`). New fixture `agent_on_handler_test` trace-diffs
+clean. **Out of subset** (precise rejections): `event<Struct/transaction>`
+payloads, composite-component *testbench fields* (the heartbeat fixtures'
+`prod : Producer` binding — separate slice), `quiesced(N)`, `watchdog`,
+named `phase`, `wait until` with heartbeat predicates, `on <expr>`/`on
+<N> cycles` triggers, `sequencer`/`tseq`. Those gate on later slices.
 
 ### The equivalence matrix
 
@@ -713,14 +726,51 @@ reason. Code locations are authoritative.
       `Unsupported` at the field — it would otherwise mis-lower to the
       "assume DUT module type" arm. The impl-form env-typed testbench
       field (`top : HeartbeatEnv`) is the agent-slice form, not here.
-    - *Rejected, never mis-lowered:* `agent` declarations and `on <ev>`
-      handlers, `sequencer`/`tseq`, watchdog/phase orchestration,
-      `idle(N)`/`quiesced(N)` predicates, dotted-path `emit
+    - *Rejected, never mis-lowered (at this slice):* `agent` declarations
+      and `on <ev>` handlers, `sequencer`/`tseq`, watchdog/phase
+      orchestration, `idle(N)`/`quiesced(N)` predicates, dotted-path `emit
       top.prod.in_ev(t)` (cross-component emit), bus-bound source
       transactors, generics, non-scalar event payloads. New fixture:
       `analysis_sink_connect_test` (`top_counter.sv`, pass) — env + two
       method-bearing scoreboards + analysis source + two connect edges,
-      registered in the equivalence registry.
+      registered in the equivalence registry. **(`agent`, `on <ev>`,
+      test-scope path-emit, and `idle*` since lift in divergence 15.)**
+15. **Agent composition + `on <ev>` handlers (2026-06-13).** Extends
+    divergence 14 with the agent capability the env-composition slice
+    flagged as residual (`src/ir/lower/components.rs`).
+    - *`agent` is a component.* `ComponentKindTag::Agent`; an `agent`
+      lowers through the same `ComponentSchema` path as an env
+      (`CompSource::Agent`), bound test-scope as `let <name> : <Agent>`.
+      Directionless `event<scalar>` self-events join the `out event`
+      analysis-port form on `ComponentFieldKind::Event`.
+    - *`on <ev>(arg)` → subscriber + one-param method.* Each handler
+      lowers as a one-param `ComponentMethod` (the event arg) recorded in
+      `ComponentSchema::on_handlers` (`OnHandlerSchema`). At component
+      construction it registers as a `push_back` closure on the event
+      field that bumps `_last_in_cycle` (activity tracking) then runs the
+      `<Comp>_on_h<fid>` body lambda — v1's `on`-subscriber shape.
+      Registration recurses into by-value sub-components (an env holding
+      an agent). Only bare `on <event>(arg)` self-subscriptions lower;
+      `pre`/`post` hooks, `on <expr>` cycle-triggers, and `on <N> cycles`
+      periodic forms are precise `Unsupported` (later slices).
+    - *`emit` gains a base.* `Stmt::ComponentEmit` carries
+      `base: ComponentBase`: self-relative `emit observed(v)` inside a
+      body (`SelfField`) and test-scope path `emit tagger.in_ev(v)`
+      (`Path`) both lower, fanning out over `<base>.<event>` plus the
+      emitter's `_last_out_cycle` bump.
+    - *`idle` predicates.* `agent.idle_in(N)` / `.idle_out(N)` / `.idle(N)`
+      lower to `Expr::ComponentIdle { base, kind, n }`, emitted as v1's
+      `emit_idle_predicate` (`cycle_count - _last_{in,out}_cycle >= N`).
+      A user `hookable` of the same name still wins in v1; in this IR
+      subset agents carry no such override, so the built-in always applies.
+    - *Rejected, never mis-lowered:* `event<Struct/transaction>` payloads,
+      composite-component *testbench fields* (the 5 heartbeat fixtures all
+      bind `prod : Producer` this way — a separate binding slice),
+      `quiesced(N)` (env heartbeat aggregation), `watchdog`, named
+      `phase`, `wait until` with heartbeat predicates, `sequencer`/`tseq`.
+      New fixture: `agent_on_handler_test` (`top_counter.sv`, pass) —
+      agent + on-handler + path-emit + `idle_in`, registered in the
+      equivalence registry; trace-diffs clean v1↔tbir at seed 1.
 14. **Randomize seam carries AST constraints (2026-06-13).** The design
     pins `ConstraintRef` as "a handle into the constraint IR, not a
     copy." The shipped `ConstraintRef` IS a pure handle — `ConstraintRef(u32)`

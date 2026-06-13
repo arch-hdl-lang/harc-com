@@ -202,6 +202,11 @@ impl FuncBuilder<'_> {
                         if let Some(kind) = width_cast_kind(&name.name) {
                             return self.lower_width_method(kind, &name.name, target, args);
                         }
+                        // Component heartbeat-idle predicates:
+                        // `agent.idle_in(N)`, `.idle_out(N)`, `.idle(N)`.
+                        if let Some(idle) = self.as_component_idle(callee, args)? {
+                            return Ok(idle);
+                        }
                         // Scoreboard queue value-queries: `sb.q.size()`,
                         // `sb.q.empty()`. (`sb.q.pop()` mutates and is
                         // lowered only as a statement — reaching it here
@@ -365,6 +370,14 @@ impl FuncBuilder<'_> {
             Expr::Call(t, args) => {
                 let args = args.into_iter().map(|a| self.hoist_ports(a)).collect();
                 Expr::Call(t, args)
+            }
+            Expr::ComponentIdle { base, kind, n } => {
+                let n = self.hoist_ports(*n);
+                Expr::ComponentIdle {
+                    base,
+                    kind,
+                    n: Box::new(n),
+                }
             }
             other @ (Expr::Literal { .. }
             | Expr::WideLiteral(_)
