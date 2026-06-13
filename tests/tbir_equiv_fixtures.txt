@@ -150,3 +150,4 @@ tlm_pairing_arch_initiator_test | TlmPairingArchInitiator | TlmPairingArchInitia
 regblock_record_api_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 tlm_pairing_arch_burst_target_test | TlmPairingArchBurstTarget | TlmPairingArchBurstTarget.sv | - | pass
 tlm_pairing_arch_burst_initiator_test | TlmPairingArchBurstInitiator | TlmPairingArchBurstInitiator.sv | - | pass
+bind_remap_test | axil_amba | axil_amba.sv | - | pass

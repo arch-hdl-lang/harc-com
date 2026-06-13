@@ -59,25 +59,16 @@ pub(super) fn lower_bus_binding(
     // `<field>_<channel>_<signal>` flat-name convention at wire
     // emission. Sorted by key for deterministic dump-ir output.
     //
-    // Subset: only `tlm_method` wire emission (`emit_transactor_call` /
-    // `emit_target_actor`) routes through the remap's `wire_name`. A
-    // handshake-channel access (`bus.<ch>.send`/`recv`/`<ch>.<sig>`)
-    // lowers to a `PortRef` whose flat name is joined by the backend
-    // with `_`, bypassing the remap — so a remap on a bus that declares
-    // handshake channels would silently mis-name those wires. Reject it
-    // precisely rather than mis-lower (the handshake-remap path is a
-    // follow-up slice).
-    if !l.bind_remap.is_empty() && !decl.handshakes.is_empty() {
-        return Err(unsupported(
-            &format!(
-                "bus bind signal remaps (`bind ... with {{ ... }}`) on bus `{}` \
-                 with handshake channels",
-                decl.name.name
-            ),
-            "remaps are honored for `tlm_method`-only buses; handshake-channel \
-             signal remaps are a follow-up slice",
-        ));
-    }
+    // Both `tlm_method` wire emission (`emit_transactor_call` /
+    // `emit_target_actor`, via `binding.wire_name`) and handshake-channel
+    // access (`bus.<ch>.<sig>` / `.send` / `.recv`) honor the remap. A
+    // channel access lowers to a `PortRef` whose 3-segment path
+    // `[binding, channel, signal]` is collapsed to the override's flat
+    // name when `(channel, signal)` is mapped — at lowering for direct
+    // test-scope access, and at bind time (`fill_initiator_bus_prefix`)
+    // for placeholder-prefixed initiator-BFM / event-component bodies.
+    // Already-flattened `<ch>_<sig>` access and plain `<bind>.<sig>`
+    // access are NOT remapped, mirroring v1's `try_emit_bus_field_access`.
     let mut remap: Vec<((String, String), String)> = Vec::new();
     for entry in &l.bind_remap {
         if entry.path.len() != 2 {
@@ -161,6 +152,28 @@ pub(super) fn lower_bus_binding(
 }
 
 impl FuncBuilder<'_> {
+    /// PortRef for a `<bind>.<channel>.<signal>` handshake access,
+    /// honoring a `bind ... with { ch.sig: "port" }` remap. When the
+    /// binding has a `(channel, signal)` override the path collapses to
+    /// the single override flat name (so the backend's `port_path.join
+    /// ("_")` yields exactly that name); otherwise it is the canonical
+    /// 3-segment `[bind, channel, signal]` path. Mirrors v1's
+    /// `bus_signal_name`, which remaps the channel form only.
+    fn bus_channel_port(&self, bind: &str, ch: &str, sig: &str) -> PortRef {
+        if let Some(remap) = self.ctx.bus_remaps.get(bind) {
+            if let Some((_, port)) = remap
+                .iter()
+                .find(|((rch, rsig), _)| rch == ch && rsig == sig)
+            {
+                // The override is the FULL flat DUT port name — emit it
+                // as a single-segment path so `join("_")` reproduces it
+                // verbatim (no `<bind>_` prefix).
+                return bus_port_flat(port);
+            }
+        }
+        bus_port(bind, &[ch, sig])
+    }
+
     /// `Some(PortRef)` when `e` is a dotted access rooted at a bus
     /// binding: `<bind>.<sig>` (plain signal or pre-flattened
     /// `<ch>_<sig>`), or `<bind>.<ch>.<sig>` (handshake channel signal
@@ -230,7 +243,7 @@ impl FuncBuilder<'_> {
                 || name.name == "ready"
                 || h.payload.iter().any(|s| s.name.name == name.name)
             {
-                return Ok(Some(bus_port(&id.name, &[&ch.name, &name.name])));
+                return Ok(Some(self.bus_channel_port(&id.name, &ch.name, &name.name)));
             }
             let valid_options: Vec<&str> = ["valid", "ready"]
                 .into_iter()
@@ -382,18 +395,18 @@ impl FuncBuilder<'_> {
             let value = self.lower_expr(call_arg_expr(arg))?; // ports OK in DutWrite values
             let value = self.hoist_transactor_calls(value);
             self.push(Stmt::DutWrite(
-                bus_port(bind, &[&h.name.name, &sig.name.name]),
+                self.bus_channel_port(bind, &h.name.name, &sig.name.name),
                 value,
             ));
         }
         self.push(Stmt::DutWrite(
-            bus_port(bind, &[&h.name.name, "valid"]),
+            self.bus_channel_port(bind, &h.name.name, "valid"),
             lit(1),
         ));
-        self.lower_budget_wait_low(bus_port(bind, &[&h.name.name, "ready"]));
+        self.lower_budget_wait_low(self.bus_channel_port(bind, &h.name.name, "ready"));
         self.wait_one_cycle();
         self.push(Stmt::DutWrite(
-            bus_port(bind, &[&h.name.name, "valid"]),
+            self.bus_channel_port(bind, &h.name.name, "valid"),
             lit(0),
         ));
         Ok(())
@@ -431,10 +444,10 @@ impl FuncBuilder<'_> {
             )));
         }
         self.push(Stmt::DutWrite(
-            bus_port(bind, &[&h.name.name, "ready"]),
+            self.bus_channel_port(bind, &h.name.name, "ready"),
             lit(1),
         ));
-        self.lower_budget_wait_low(bus_port(bind, &[&h.name.name, "valid"]));
+        self.lower_budget_wait_low(self.bus_channel_port(bind, &h.name.name, "valid"));
         // Capture BEFORE the trailing tick — payload is valid in the
         // same cycle `valid` is high (mirrors v1).
         //
@@ -450,14 +463,14 @@ impl FuncBuilder<'_> {
             BusCallDest::Declare(name) => {
                 let id = self.declare(name);
                 let first_port =
-                    bus_port(bind, &[&h.name.name, &h.payload[0].name.name]);
+                    self.bus_channel_port(bind, &h.name.name, &h.payload[0].name.name);
                 self.push(Stmt::DutRead(id, first_port));
                 let mut fields = Vec::with_capacity(h.payload.len());
                 // The first field aliases the bound local itself.
                 fields.push((h.payload[0].name.name.clone(), id));
                 for sig in &h.payload[1..] {
                     let fid = self.declare(&format!("{name}__{}", sig.name.name));
-                    let port = bus_port(bind, &[&h.name.name, &sig.name.name]);
+                    let port = self.bus_channel_port(bind, &h.name.name, &sig.name.name);
                     self.push(Stmt::DutRead(fid, port));
                     fields.push((sig.name.name.clone(), fid));
                 }
@@ -467,7 +480,7 @@ impl FuncBuilder<'_> {
         }
         self.wait_one_cycle();
         self.push(Stmt::DutWrite(
-            bus_port(bind, &[&h.name.name, "ready"]),
+            self.bus_channel_port(bind, &h.name.name, "ready"),
             lit(0),
         ));
         Ok(())
@@ -757,6 +770,20 @@ fn bus_port(bind: &str, tail: &[&str]) -> PortRef {
     PortRef {
         testbench_field: "dut".to_string(),
         port_path,
+        direction: None,
+        width: None,
+        access: PortAccess::Port,
+        lane: None,
+    }
+}
+
+/// PortRef whose flat name is `flat` verbatim (single-segment path) —
+/// for a `bind ... with { ch.sig: "port" }` remapped handshake signal,
+/// where the override already names the full DUT port.
+pub(crate) fn bus_port_flat(flat: &str) -> PortRef {
+    PortRef {
+        testbench_field: "dut".to_string(),
+        port_path: vec![flat.to_string()],
         direction: None,
         width: None,
         access: PortAccess::Port,
