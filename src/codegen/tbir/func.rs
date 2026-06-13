@@ -21,8 +21,8 @@
 //! v1 uses — identical scheduler interaction, identical cycle timing.
 
 use super::expr::{
-    ECx, escape_c, expr_cpp, fmt_arg_cpp, helper_cpp_name, lane_width, port_read, port_signal,
-    wide_words_over_128,
+    ECx, comp_base_cpp, escape_c, expr_cpp, fmt_arg_cpp, helper_cpp_name, lane_width, port_read,
+    port_signal, wide_words_over_128,
 };
 use crate::codegen::cpp_tb::EmitError;
 use crate::ir::{
@@ -543,6 +543,47 @@ fn emit_stmt(
                 }
             }
         }
+        // Composite-component scalar field write — `self.count = ...`
+        // inside a method body, or `env.sb.errors = ...` from the test.
+        Stmt::ComponentFieldWrite { base, field, value } => {
+            let e = expr_cpp(cx, value)?;
+            writeln!(out, "{pad}{}.{field} = {e};", comp_base_cpp(base)).ok();
+        }
+        // `emit observed(v)` inside a method body: fan the args out to
+        // every subscriber registered on `self.<event>`, then bump the
+        // component's `_last_out_cycle` heartbeat (v1's emit lowering).
+        Stmt::ComponentEmit { event, args } => {
+            let mut rendered = Vec::with_capacity(args.len());
+            for a in args {
+                rendered.push(expr_cpp(cx, a)?);
+            }
+            let csv = rendered.join(", ");
+            writeln!(out, "{pad}for (auto& _s : self.{event}) _s({csv});").ok();
+            writeln!(out, "{pad}self._last_out_cycle = (uint64_t)cycle_count;").ok();
+        }
+        // `env.source.publish(3)` — a free `<Comp>_<method>(receiver,
+        // args)` lambda call (v1's `emit_component_method` shape).
+        Stmt::ComponentCall { base, component, method, args, dest } => {
+            let comp = prog.components.get(component.index()).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: ComponentCall in {} references missing component c{}",
+                    func.name, component.0
+                ))
+            })?;
+            let mut rendered = vec![comp_base_cpp(base)];
+            for a in args {
+                rendered.push(expr_cpp(cx, a)?);
+            }
+            let invoke = format!("{}_{method}({})", comp.name, rendered.join(", "));
+            match dest {
+                Some(d) => {
+                    writeln!(out, "{pad}{} = {invoke};", &names[d.index()]).ok();
+                }
+                None => {
+                    writeln!(out, "{pad}{invoke};").ok();
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -778,6 +819,112 @@ pub(super) fn emit_method(
                 // Fatal, never produces the terminator at all).
                 return Err(EmitError(format!(
                     "tbir: transactor method `{}` contains terminator {other:?} — \
+                     lowering gate failed",
+                    func.name
+                )));
+            }
+        }
+        writeln!(out, "{pad3}break;").ok();
+        writeln!(out, "{pad2}}}").ok();
+    }
+    match func.ret {
+        Some(_) => writeln!(out, "{pad2}default: return 0;").ok(),
+        None => writeln!(out, "{pad2}default: return;").ok(),
+    };
+    writeln!(out, "{pad2}}}").ok(); // switch
+    writeln!(out, "{pad1}}}").ok(); // while
+    writeln!(out, "{pad}}};").ok(); // lambda
+    Ok(())
+}
+
+/// Emit one composite-component method as a free `<Comp>_<method>(
+/// <Comp>& self, args...)` lambda (v1's `emit_component_method` shape).
+/// The body addresses fields self-relatively (`self.<field>`) and `emit`
+/// fans out over `self.<event>`; it is a loop-switch over the lowered
+/// CFG like a transactor method. The `[&]` capture sees `cycle_count`
+/// (for the emit heartbeat bump) and sibling method lambdas (file order
+/// places sub-component methods before the env's).
+pub(super) fn emit_component_method(
+    out: &mut String,
+    prog: &TbProgram,
+    comp: &crate::ir::ComponentSchema,
+    m: &crate::ir::ComponentMethodSchema,
+    depth: usize,
+) -> Result<(), EmitError> {
+    let func = prog.function(m.function);
+    let names = cpp_local_names(func);
+    let empty_lanes = HashMap::new();
+    let cx = ECx {
+        func,
+        names: &names,
+        lanes: &empty_lanes,
+    };
+    let nparams = func.params.len();
+    let pad = INDENT.repeat(depth);
+    let pad1 = INDENT.repeat(depth + 1);
+    let pad2 = INDENT.repeat(depth + 2);
+    let pad3 = INDENT.repeat(depth + 3);
+
+    let ret_ty = if func.ret.is_some() { "uint64_t" } else { "void" };
+    // The receiver `self`, then one `uint64_t` per declared param.
+    let mut params = vec![format!("{}& self", comp.name)];
+    for n in &names[..nparams] {
+        params.push(format!("uint64_t {n}"));
+    }
+    let params = params.join(", ");
+    writeln!(
+        out,
+        "{pad}auto {}_{} = [&]({params}) -> {ret_ty} {{",
+        comp.name, m.name
+    )
+    .ok();
+    declare_locals(out, prog, func, &names, nparams, depth + 1)?;
+    writeln!(out, "{pad1}int __bb = {};", func.entry.0).ok();
+    writeln!(out, "{pad1}while (true) {{").ok();
+    writeln!(out, "{pad2}switch (__bb) {{").ok();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        writeln!(out, "{pad2}case {bi}: {{").ok();
+        for s in &block.stmts {
+            emit_stmt(out, prog, &cx, &[], &[], s, depth + 3)?;
+        }
+        match &block.terminator {
+            Terminator::Jump(b) => {
+                writeln!(out, "{pad3}__bb = {};", b.0).ok();
+            }
+            Terminator::Branch(c, t, f) => {
+                let cond = expr_cpp(&cx, c)?;
+                writeln!(out, "{pad3}if ({cond}) {{ __bb = {}; }} else {{ __bb = {}; }}", t.0, f.0)
+                    .ok();
+            }
+            Terminator::WaitCycles(n, None, b) => {
+                let n = expr_cpp(&cx, n)?;
+                writeln!(
+                    out,
+                    "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) tick();"
+                )
+                .ok();
+                writeln!(out, "{pad3}__bb = {};", b.0).ok();
+            }
+            Terminator::WaitUntil { preds, mode, succ } => {
+                let cond = preds_cpp(&cx, preds, *mode)?;
+                writeln!(out, "{pad3}while (!({cond})) tick();").ok();
+                writeln!(out, "{pad3}__bb = {};", succ.0).ok();
+            }
+            Terminator::Return => match func.ret {
+                Some(r) => {
+                    writeln!(out, "{pad3}return {};", names[r.index()]).ok();
+                }
+                None => {
+                    writeln!(out, "{pad3}return;").ok();
+                }
+            },
+            other @ (Terminator::WaitCycles(_, Some(_), _)
+            | Terminator::WaitCyclesSync(_, _)
+            | Terminator::WaitTimePs(_, _)
+            | Terminator::WaitUntilTimeout { .. }
+            | Terminator::Fatal(_)) => {
+                return Err(EmitError(format!(
+                    "tbir: component method `{}` contains terminator {other:?} — \
                      lowering gate failed",
                     func.name
                 )));

@@ -180,7 +180,7 @@ impl FuncBuilder<'_> {
             StmtKind::Schedule(_) => Err(unsupported("`schedule`", "")),
             StmtKind::Select(_) => Err(unsupported("`select`", "")),
             StmtKind::On(_) => Err(unsupported("`on` handlers", "")),
-            StmtKind::Emit { .. } => Err(unsupported("event `emit`", "")),
+            StmtKind::Emit { name, args, .. } => self.lower_emit(name, args),
             StmtKind::Yield(_) => Err(unsupported("`yield`", "")),
             StmtKind::Apply(_) => Err(unsupported("`apply`", "")),
             StmtKind::Release(_) => Err(unsupported("probe `release`", "")),
@@ -257,6 +257,24 @@ impl FuncBuilder<'_> {
                                       statement position"),
                             "",
                         ));
+                    }
+                }
+                // Statement-position component method call:
+                // `env.source.publish(3)` — call for effect, result (if
+                // any) discarded.
+                if let ExprKind::Call { callee, args } = &*e.kind {
+                    if let Some((base, component, method)) =
+                        self.as_component_method_call(callee)?
+                    {
+                        let lowered = self.lower_component_call_args(args)?;
+                        self.push(Stmt::ComponentCall {
+                            base,
+                            component,
+                            method,
+                            args: lowered,
+                            dest: None,
+                        });
+                        return Ok(());
                     }
                 }
                 // Statement-position transactor method call:
@@ -394,6 +412,25 @@ impl FuncBuilder<'_> {
                 return Ok(());
             }
         }
+        // `let v = env.drv.axil_read(addr)` — a value-returning component
+        // method call into a fresh local.
+        if let ExprKind::Call { callee, args } = &*value.kind {
+            if let Some((base, component, method)) = self.as_component_method_call(callee)? {
+                let lowered = self.lower_component_call_args(args)?;
+                let id = self.declare(&l.name.name);
+                if let Some(w) = declared_width {
+                    self.let_widths.insert(id, w);
+                }
+                self.push(Stmt::ComponentCall {
+                    base,
+                    component,
+                    method,
+                    args: lowered,
+                    dest: Some(id),
+                });
+                return Ok(());
+            }
+        }
         // RAL frontdoor register-level read: `let v = regs.NAME`.
         if self.try_lower_regblock_read_let(&l.name.name, value)? {
             return Ok(());
@@ -448,6 +485,14 @@ impl FuncBuilder<'_> {
         if let Some((instance, field)) = self.as_transactor_state(target) {
             let e = self.lower_expr_no_ports(value)?;
             self.push(Stmt::TransactorStateWrite { instance, field, value: e });
+            return Ok(());
+        }
+        // Composite-component scalar field write — self-relative inside a
+        // method body (`count = ...`) or a dotted path from a test-scope
+        // component local (`env.sb.errors = ...`).
+        if let Some((base, field)) = self.as_component_field_target(target)? {
+            let e = self.lower_expr_no_ports(value)?;
+            self.push(Stmt::ComponentFieldWrite { base, field, value: e });
             return Ok(());
         }
         // Scoreboard scalar-counter write: `sb.writes = sb.writes + 1`

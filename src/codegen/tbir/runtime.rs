@@ -137,6 +137,59 @@ pub(super) fn scoreboard_struct(out: &mut String, sb: &crate::ir::ScoreboardSche
     writeln!(out).ok();
 }
 
+/// One composite-component struct (env/agent cluster, flat-struct
+/// subset). Mirrors v1's `emit_component_struct`: scalar/queue/event/
+/// sub-component fields plus the `_last_in_cycle`/`_last_out_cycle`
+/// heartbeat stamps. Sub-component fields are emitted by their component
+/// name, so file order (subs before the env that holds them) guarantees
+/// the held type is already defined.
+pub(super) fn component_struct(
+    out: &mut String,
+    c: &crate::ir::ComponentSchema,
+    components: &[crate::ir::ComponentSchema],
+) {
+    use crate::ir::ComponentFieldKind;
+    writeln!(out, "struct {} {{", c.name).ok();
+    for f in &c.fields {
+        match &f.kind {
+            ComponentFieldKind::Scalar { ty, default } => {
+                let (cty, init) = match ty {
+                    crate::ir::IrType::Bool => (
+                        "bool",
+                        if *default != 0 { "true" } else { "false" }.to_string(),
+                    ),
+                    crate::ir::IrType::SInt(_) => ("int64_t", default.to_string()),
+                    _ => ("uint64_t", default.to_string()),
+                };
+                writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
+            }
+            ComponentFieldKind::Queue { signed } => {
+                let elem = if *signed { "int64_t" } else { "uint64_t" };
+                writeln!(out, "{INDENT}harc_rt::HarcQueue<{elem}> {};", f.name).ok();
+            }
+            ComponentFieldKind::Event { signed } => {
+                let payload = if *signed { "int64_t" } else { "uint64_t" };
+                writeln!(
+                    out,
+                    "{INDENT}std::vector<std::function<void({payload})>> {};",
+                    f.name
+                )
+                .ok();
+            }
+            ComponentFieldKind::Sub { component } => {
+                let cname = &components[component.index()].name;
+                writeln!(out, "{INDENT}{cname} {};", f.name).ok();
+            }
+        }
+    }
+    // v1's activity-tracking heartbeat stamps (read by idle predicates,
+    // bumped on emit/in/out; carried for trace + future agent slice).
+    writeln!(out, "{INDENT}uint64_t _last_in_cycle = 0;").ok();
+    writeln!(out, "{INDENT}uint64_t _last_out_cycle = 0;").ok();
+    writeln!(out, "}};").ok();
+    writeln!(out).ok();
+}
+
 pub(super) fn tb_struct(
     out: &mut String,
     tb_name: &str,

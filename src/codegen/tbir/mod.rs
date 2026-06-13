@@ -67,6 +67,15 @@ pub fn emit(prog: &TbProgram, opts: &EmitOpts) -> Result<String, EmitError> {
         runtime::scoreboard_struct(&mut out, sb);
     }
 
+    // Composite-component structs (env/agent cluster). A component holds
+    // its sub-components by value, so each held type's struct must be
+    // defined first. Source order usually puts subs before the env, but
+    // a user may declare the env first — so emit in dependency order
+    // (DFS over `Sub` fields), mirroring v1's `topo_sort_component_indices`.
+    for ci in component_emit_order(prog) {
+        runtime::component_struct(&mut out, &prog.components[ci], &prog.components);
+    }
+
     // Covergroup structs (leaf observables — they never name a TB or
     // DUT type), then one struct per unique non-synthetic testbench.
     for cg in &prog.covgroups {
@@ -172,6 +181,39 @@ fn record_struct(out: &mut String, r: &ir::RecordSchema) {
     writeln!(out).ok();
 }
 
+/// Dependency order for component-struct emission: a component appears
+/// after every component it holds as a by-value `Sub` field, so the held
+/// struct is already defined. DFS post-order over the `Sub` edges, in
+/// id order for determinism (mirrors v1's `topo_sort_component_indices`).
+/// The IR rejects sub-component cycles at lowering (a by-value cycle is
+/// not constructible), so the visited-set DFS terminates.
+fn component_emit_order(prog: &TbProgram) -> Vec<usize> {
+    let n = prog.components.len();
+    let mut order = Vec::with_capacity(n);
+    let mut visited = vec![false; n];
+    fn visit(
+        i: usize,
+        prog: &TbProgram,
+        visited: &mut [bool],
+        order: &mut Vec<usize>,
+    ) {
+        if visited[i] {
+            return;
+        }
+        visited[i] = true;
+        for f in &prog.components[i].fields {
+            if let ir::ComponentFieldKind::Sub { component } = &f.kind {
+                visit(component.index(), prog, visited, order);
+            }
+        }
+        order.push(i);
+    }
+    for i in 0..n {
+        visit(i, prog, &mut visited, &mut order);
+    }
+    order
+}
+
 fn emit_test(
     out: &mut String,
     prog: &TbProgram,
@@ -256,6 +298,45 @@ fn emit_test(
     }
     for actor in &tb.target_tlm_actors {
         func::emit_target_actor(out, prog, actor, 1)?;
+    }
+
+    // Composite-component method lambdas — one `<Comp>_<method>` per
+    // method of every component in the file, declared before the run
+    // coroutine so its `[&]` capture (and the connect push_backs below)
+    // see them. Dependency order (subs before holders) so a method body
+    // that calls a sub-component's method sees that lambda first.
+    for ci in component_emit_order(prog) {
+        let comp = &prog.components[ci];
+        for m in &comp.methods {
+            func::emit_component_method(out, prog, comp, m, 1)?;
+        }
+    }
+    // Composite-component test-scope instances (`let env : AnalysisEnv`):
+    // a default-constructed run-scope local, then its env `connect`
+    // push_backs (`<env>.<src_path>.<event>.push_back([&](auto _t){
+    // <SinkComp>_<method>(<env>.<sink_path>, _t); })`). Declared at test
+    // scope (before the coroutine) so run and check share the instance —
+    // v1's `AnalysisEnv env;` placement.
+    for cf in &tb.component_fields {
+        let cname = &prog.components[cf.component.index()].name;
+        writeln!(out, "{INDENT}{cname} {};", cf.field).ok();
+        for edge in &cf.connects {
+            let src = std::iter::once(cf.field.clone())
+                .chain(edge.src_path.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(".");
+            let sink = std::iter::once(cf.field.clone())
+                .chain(edge.sink_path.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(".");
+            let sink_comp = &prog.components[edge.sink_component.index()].name;
+            writeln!(
+                out,
+                "{INDENT}{src}.{}.push_back([&](auto _t) {{ {sink_comp}_{}({sink}, _t); }});",
+                edge.src_event, edge.sink_method
+            )
+            .ok();
+        }
     }
 
     writeln!(out, "{INDENT}harc_rt::ThreadSlot _run_slot;").ok();

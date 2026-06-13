@@ -10,7 +10,11 @@ under the singleton table).
 singleton-blocker batch (see the resolved singleton table below: 11
 new registry rows across 9 fixtures; `mshr_cocotb_test` moved to the
 `transactor` group and `keep_constraints_test` to the
-`randomize` seam).
+`randomize` seam). Further amended 2026-06-13 by the **env-composition
+slice** — see the resolved `env`/`agent` composition cluster section
+below: the flat-struct core (env + connect + scoreboard methods +
+analysis `out event`/`emit`) landed and `analysis_sink_connect_test`
+is registered.
 
 **This file is a snapshot, not a source of truth.** The registry
 (`tests/tbir_equiv_fixtures.txt`) is the source of truth for what is
@@ -241,6 +245,37 @@ loop). All five fixtures lower cleanly, pass the full v1-vs-tbir
 equivalence pair, and are registered (no deeper blockers surfaced —
 the group was exactly as advertised).
 
+### `env` / `agent` composition cluster — **PARTIALLY RESOLVED 2026-06-13 (env-composition slice)**
+
+The env/agent cluster's flat-struct core landed: `env` composition +
+`connect` (analysis-port → scoreboard sink) + scoreboard **methods**
+(instance state materialized) + analysis-source `out event`/`emit`. Three
+source shapes lower into one `ComponentSchema` (see docs/tbir-mvp.md
+divergence 14). **Registered**: `analysis_sink_connect_test` — the one
+fixture in the cluster whose blocker chain is exactly env + connect +
+scoreboard-methods + event/emit (no `agent`/`tseq`/`sequencer`/
+`randomize`). It lowers cleanly, passes the v1-vs-tbir equivalence pair,
+and trace-diffs clean.
+
+The other cluster fixtures each stack a deeper construct the slice
+deliberately rejects. Residual first-blocker map (re-run of `harc
+dump-ir`, 2026-06-13):
+
+| Next blocker | Fixtures |
+|---|---|
+| `agent` construct + `on <ev>` event handlers | `heartbeat_idle_test`, `wait_until_quiesce_test`, `watchdog_quiesce_test`, `watchdog_trip_diagnostic_test`, `env_quiesced_phase_test` (also need `phase`, `idle(N)`/`quiesced(N)` predicates, watchdog) |
+| `sequencer` construct | `axilite_connect_test`, `transactor_agent_mode_test`, `transactor_env_mode_test` |
+| `tseq` construct | `axilite_bound_mon_test` |
+| `tseq` + `randomize` | `axilite_env_test` (env composition itself now lowers; the `RandomTxns` tseq + `randomize(t)` in the run body are the next blockers) |
+
+The env-composition machinery (component structs, methods with instance
+state, connect wiring, emit fan-out) is now in place; the residual
+fixtures need the **event-handler** (`agent` + `on`), **sequencer**, and
+**tseq/randomize** slices layered on top. The impl-form env-typed
+*testbench field* (`top : HeartbeatEnv`) used by the `*_quiesce`/
+`heartbeat` family is part of the agent slice (those reject at `agent`
+before reaching the field).
+
 ### `scoreboard` construct — **PARTIALLY RESOLVED 2026-06-12 (scoreboard slice)**
 
 > ~~TB-IR lowering does not support the `scoreboard` construct yet~~
@@ -269,19 +304,17 @@ each fixture now stops at its REAL next blocker):
 | Next blocker | Fixtures |
 |---|---|
 | `randomize` (constraint-IR seam) | `axilite_sb_test` |
-| `env` / `connect` composition | `axilite_env_test`, `analysis_sink_connect_test` (also needs scoreboard methods + `event`/`emit`) |
-| scoreboard **methods** (per-instance state materialization — out of the data-only subset) | `analysis_sink_connect_test` |
+| `env` / `connect` composition + scoreboard methods | ~~`analysis_sink_connect_test`~~ **RESOLVED + registered 2026-06-13 (env-composition slice — scoreboard methods now lower as components)**; `axilite_env_test` (env now lowers; next blocker is `tseq`/`randomize`) |
 | passive transactor `on`-handlers (event-driven monitor) | `dma_engine_test` |
 | `queue<Struct>` element type (record-payload-in-queue seam) + transactor `on ... phase` | `scoreboard_typed_queue_test` |
 | `tseq` construct | `axilite_bound_mon_test`, `axilite_multi_payload_test` |
 
-The two scoreboard-specific residuals — scoreboard methods
-(`analysis_sink_connect_test`) and `queue<Struct>`
-(`scoreboard_typed_queue_test`) — stay with this construct's owner; the
-rest belong to the `randomize` / `env` / `agent` / `tseq` slices and
-will clear when those land. As predicted in the suggested-sequencing
-note, scoreboard alone unlocks no corpus fixture because every one is a
-full env/agent/sequencer stack.
+The scoreboard-**methods** residual is resolved by the env-composition
+slice (2026-06-13): a method-bearing scoreboard now lowers as a
+composite `ComponentSchema` with materialized instance state, unblocking
+`analysis_sink_connect_test`. The `queue<Struct>`
+(`scoreboard_typed_queue_test`) residual stays with this construct's
+owner; the rest belong to the `randomize` / `agent` / `tseq` slices.
 
 ### `struct` construct — 4 fixtures — **RESOLVED 2026-06-12 (struct slice)**
 

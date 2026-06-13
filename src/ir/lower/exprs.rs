@@ -63,6 +63,11 @@ impl FuncBuilder<'_> {
                         ty: IrType::Unknown,
                     });
                 }
+                // Self-relative component field read inside a method body
+                // (`count` → `self.count`). Locals shadow (checked above).
+                if let Some(ce) = self.as_component_field_read(e)? {
+                    return Ok(ce);
+                }
                 if self.in_check && self.ctx.test_scope_lets.contains(&id.name) {
                     return Err(unsupported(
                         &format!("test-scope `let {}` referenced in the check phase", id.name),
@@ -122,6 +127,11 @@ impl FuncBuilder<'_> {
                     ));
                 }
                 self.reject_out_of_subset_regblock_access(e, "read")?;
+                // Composite-component scalar field read via a test-scope
+                // path (`env.sb.count`).
+                if let Some(ce) = self.as_component_field_read(e)? {
+                    return Ok(ce);
+                }
                 // `t.field` read on a record-typed local.
                 if let ExprKind::Ident(root) = &*target.kind {
                     if let Some(local) = self.lookup(&root.name) {
@@ -365,6 +375,8 @@ impl FuncBuilder<'_> {
             | Expr::TransactorState { .. }
             // Scoreboard reads are host state — no DUT port inside.
             | Expr::ScoreboardQuery { .. }
+            // Component fields are host state — no DUT port inside.
+            | Expr::ComponentField { .. }
             | Expr::CovBin { .. }) => other,
         }
     }

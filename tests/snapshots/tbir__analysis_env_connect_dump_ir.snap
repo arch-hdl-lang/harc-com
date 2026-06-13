@@ -1,0 +1,73 @@
+---
+source: tests/tbir.rs
+assertion_line: 590
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 AnalysisSinkConnectTest_tb (synthetic) { dut: Top }
+  test AnalysisSinkConnectTest tb=tb0 run=fn3 check=-
+  component c0 AnalysisSource (transactor)
+    field observed : out event<uint>
+    method publish(1 arg) = fn0
+  component c1 AnalysisSb (scoreboard)
+    field count : scalar = 0
+    field sum : scalar = 0
+    method write_obs(1 arg) = fn1
+  component c2 AnalysisCovCollector (scoreboard)
+    field samples : scalar = 0
+    field sum : scalar = 0
+    method sample_obs(1 arg) = fn2
+  component c3 AnalysisEnv (env)
+    field source : sub c0
+    field sb : sub c1
+    field cov : sub c2
+    connect source.observed -> sb.write_obs (c1)
+    connect source.observed -> cov.sample_obs (c2)
+
+fn fn0 comp_method_0 [kind=ComponentMethod(c0)]
+  params:
+    v : uint<8>
+  locals:
+    %0 v : uint<8>
+  entry = b0
+
+  b0:
+    ComponentEmit(observed, [%v])
+    -> Return
+
+fn fn1 comp_method_1 [kind=ComponentMethod(c1)]
+  params:
+    v : uint<8>
+  locals:
+    %0 v : uint<8>
+  entry = b0
+
+  b0:
+    ComponentFieldWrite(self.count, (self.count + 1))
+    ComponentFieldWrite(self.sum, (self.sum + %v))
+    -> Return
+
+fn fn2 comp_method_2 [kind=ComponentMethod(c2)]
+  params:
+    v : uint<8>
+  locals:
+    %0 v : uint<8>
+  entry = b0
+
+  b0:
+    ComponentFieldWrite(self.samples, (self.samples + 1))
+    ComponentFieldWrite(self.sum, (self.sum + %v))
+    -> Return
+
+fn fn3 run_AnalysisSinkConnectTest [kind=Run, owner=tb0]
+  entry = b0
+
+  b0:
+    ComponentCall(env.source.c0::publish([3]))
+    ComponentCall(env.source.c0::publish([5]))
+    AssertCheck { cond: (env.sb.count == 2), on_fail: "scoreboard count=%lld", env.sb.count }
+    AssertCheck { cond: (env.sb.sum == 8), on_fail: "scoreboard sum=%lld", env.sb.sum }
+    AssertCheck { cond: (env.cov.samples == 2), on_fail: "coverage samples=%lld", env.cov.samples }
+    AssertCheck { cond: (env.cov.sum == 8), on_fail: "coverage sum=%lld", env.cov.sum }
+    Log(info, "PASS: analysis event connected to scoreboard and coverage-style sinks")
+    -> Return

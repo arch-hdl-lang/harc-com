@@ -158,6 +158,47 @@ impl Display for TbProgram {
                 )?;
             }
         }
+        for (i, c) in self.components.iter().enumerate() {
+            writeln!(f, "  component c{} {} ({})", i, c.name, c.kind.keyword())?;
+            for fld in &c.fields {
+                use crate::ir::ComponentFieldKind;
+                let desc = match &fld.kind {
+                    ComponentFieldKind::Scalar { default, .. } => {
+                        format!("scalar = {default}")
+                    }
+                    ComponentFieldKind::Queue { signed } => {
+                        format!("queue<{}>", if *signed { "sint" } else { "uint" })
+                    }
+                    ComponentFieldKind::Event { signed } => {
+                        format!("out event<{}>", if *signed { "sint" } else { "uint" })
+                    }
+                    ComponentFieldKind::Sub { component } => format!("sub c{}", component.0),
+                };
+                writeln!(f, "    field {} : {desc}", fld.name)?;
+            }
+            for m in &c.methods {
+                writeln!(
+                    f,
+                    "    method {}({} arg{}){} = fn{}",
+                    m.name,
+                    m.n_params,
+                    if m.n_params == 1 { "" } else { "s" },
+                    if m.has_ret { " -> ret" } else { "" },
+                    m.function.0
+                )?;
+            }
+            for e in &c.connects {
+                writeln!(
+                    f,
+                    "    connect {}.{} -> {}.{} (c{})",
+                    e.src_path.join("."),
+                    e.src_event,
+                    e.sink_path.join("."),
+                    e.sink_method,
+                    e.sink_component.0
+                )?;
+            }
+        }
         for (i, cg) in self.covgroups.iter().enumerate() {
             let trig = match cg.trigger {
                 CovTrigger::PosedgeDutClk => "@posedge(dut.clk)",
@@ -238,6 +279,9 @@ fn kind_str(k: &FunctionKind) -> String {
         FunctionKind::TransactorBody { transactor } => {
             format!("TransactorBody(x{})", transactor.0)
         }
+        FunctionKind::ComponentMethod { component } => {
+            format!("ComponentMethod(c{})", component.0)
+        }
     }
 }
 
@@ -300,6 +344,31 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         Stmt::ScoreboardOp { sb, field, op } => {
             format!("ScoreboardOp(sb{}.{field}, {})", sb.0, sb_op_str(func, op))
         }
+        Stmt::ComponentFieldWrite { base, field, value } => format!(
+            "ComponentFieldWrite({}.{field}, {})",
+            comp_base_str(base),
+            expr_str(func, value)
+        ),
+        Stmt::ComponentEmit { event, args } => {
+            let a: Vec<String> = args.iter().map(|e| expr_str(func, e)).collect();
+            format!("ComponentEmit({event}, [{}])", a.join(", "))
+        }
+        Stmt::ComponentCall { base, component, method, args, dest } => {
+            let a: Vec<String> = args.iter().map(|e| expr_str(func, e)).collect();
+            let call = format!("{}.c{}::{method}([{}])", comp_base_str(base), component.0, a.join(", "));
+            match dest {
+                Some(d) => format!("ComponentCall({} = {call})", local_str(func, *d)),
+                None => format!("ComponentCall({call})"),
+            }
+        }
+    }
+}
+
+fn comp_base_str(base: &crate::ir::ComponentBase) -> String {
+    use crate::ir::ComponentBase;
+    match base {
+        ComponentBase::SelfField => "self".to_string(),
+        ComponentBase::Path(path) => path.join("."),
     }
 }
 
@@ -463,6 +532,9 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         Expr::TransactorState { instance, field } => format!("{instance}.{field}"),
         Expr::ScoreboardQuery { sb, field, query } => {
             format!("ScoreboardQuery(sb{}.{field}.{})", sb.0, sb_query_str(query))
+        }
+        Expr::ComponentField { base, field } => {
+            format!("{}.{field}", comp_base_str(base))
         }
         Expr::Binary(op, a, b) => format!(
             "({} {} {})",

@@ -566,6 +566,24 @@ impl Checker<'_> {
                         }
                     }
                 }
+                Stmt::ComponentFieldWrite { value, .. } => {
+                    // Component host state — the value follows the
+                    // no-inline-port rule like any Assign value.
+                    self.check_expr(value, false, "ComponentFieldWrite value");
+                }
+                Stmt::ComponentEmit { args, .. } => {
+                    for a in args {
+                        self.check_expr(a, false, "ComponentEmit arg");
+                    }
+                }
+                Stmt::ComponentCall { args, dest, .. } => {
+                    for a in args {
+                        self.check_expr(a, false, "ComponentCall arg");
+                    }
+                    if let Some(d) = dest {
+                        self.check_local(*d);
+                    }
+                }
             }
         }
         match &b.terminator {
@@ -814,6 +832,9 @@ impl Checker<'_> {
                 self.check_record_field(*local, field);
             }
             Expr::CovBin { inst, .. } => self.check_covgroup(inst.covgroup),
+            // Component host state — resolved at lowering against the
+            // component schema; no local/port dependency to verify here.
+            Expr::ComponentField { .. } => {}
             Expr::ScoreboardQuery { sb, field, query } => {
                 self.check_scoreboard(*sb, field);
                 match query {
@@ -1109,6 +1130,22 @@ fn check_def_before_use(
                         }
                     }
                 },
+                Stmt::ComponentFieldWrite { value, .. } => check_e(value, &defined, errs),
+                Stmt::ComponentEmit { args, .. } => {
+                    for a in args {
+                        check_e(a, &defined, errs);
+                    }
+                }
+                Stmt::ComponentCall { args, dest, .. } => {
+                    for a in args {
+                        check_e(a, &defined, errs);
+                    }
+                    if let Some(l) = dest {
+                        if l.index() < defined.len() {
+                            defined[l.index()] = true;
+                        }
+                    }
+                }
             }
         }
         match &b.terminator {
@@ -1144,6 +1181,7 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
         | Expr::Port(_)
         | Expr::TbField(_)
         | Expr::TransactorState { .. }
+        | Expr::ComponentField { .. }
         | Expr::ScoreboardQuery { .. } => {}
         Expr::Local(l) => f(*l),
         Expr::RecordField { local, .. } => f(*local),

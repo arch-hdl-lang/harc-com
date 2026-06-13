@@ -24,6 +24,7 @@ checked against the code at the cited location.
 | #364 | `transaction` declarations + non-randomize usage: `RecordSchema` records table on `TbProgram`, record-typed locals (`let t : TxnType` default construction with let-site re-init), field writes/reads (`RecordFieldWrite` / `Expr::RecordField`), value-record struct emission, plus the `transaction_basic_test` fixture. `randomize` stays rejected at statement level, pointing at the constraint-IR seam. |
 | #366 | `transactor` declarations (unbound DUT-poking BFM subset): `TransactorSchema` table on `TbProgram`, one `TbFunction` per method (`kind: TransactorBody` — v1's `field_subs` substitution replaced by lowering-time DUT resolution), `Stmt::TransactorCall` carrying the never-inlined `Expr::Call(CallTarget::TransactorMethod ..)` edge, sync-wait method-lambda emission, ternary expressions (`Expr::Ternary`), plus 8 corpus fixtures registered. |
 | #368 | `scoreboard` declarations (data-only host-state subset): `ScoreboardSchema` table on `TbProgram`, scalar-counter + `queue<T>` fields, `Stmt::ScoreboardOp` (`QueuePush`/`QueuePop`/`ScalarWrite`) and `Expr::ScoreboardQuery` (scalar read / `size()` / `empty()`), scoreboard-instance struct emission (`harc_rt::HarcQueue<T>` members) held on the `_tb` struct, plus the self-proving `scoreboard_basic_test` fixture. Scoreboard methods, event-driven `on`/`connect` wiring, and `queue<Struct>` payloads stay rejected (see the divergence note). |
+| env-composition slice (2026-06-13) | env/agent cluster's flat-struct core: `ComponentSchema` table on `TbProgram` (method-bearing scoreboards, analysis-source transactors, composing `env`s), `FunctionKind::ComponentMethod`, `Stmt::{ComponentFieldWrite, ComponentEmit, ComponentCall}`, `Expr::ComponentField`, `ConnectEdgeSchema`. `connect` (analysis-port → scoreboard sink), scoreboard methods (instance state materialized), and `out event`/`emit` lower; the `analysis_sink_connect_test` corpus fixture is registered. `agent`/`on`-handlers, `sequencer`/`tseq`, watchdog/phase, `idle`/`quiesced` predicates stay rejected (divergence 14). |
 
 ### Construct subset
 
@@ -187,6 +188,35 @@ is rejected at lowering time with `LowerError::Unsupported` naming the
 construct and pointing at `--codegen v1`. Lowering never silently
 mis-lowers; that property is load-bearing and tested
 (`tests/tbir.rs`).
+The **env-composition (analysis-connect) subset** (added 2026-06-13,
+`src/ir/lower/components.rs`): the env/agent cluster's flat-struct core
+— `env` composition + `connect` (analysis-port → scoreboard sink) +
+scoreboard **methods** + analysis-source `out event` / `emit`. Three
+source shapes lower into one `ComponentSchema` (`TbProgram::components`),
+mirroring v1's uniform `emit_component_struct` + `emit_component_method`
+treatment: a method-bearing `scoreboard` (the data-only board stays on
+`ScoreboardSchema`), a `transactor` used as a pure analysis source (one
+`out event<T>` port + `emit`, NO module-typed DUT field — the DUT-poking
+BFM stays on `TransactorSchema`), and an `env` that composes them as
+by-value sub-component fields and `connect`s a source event to a sink
+method. New IR: `ComponentSchema`/`ComponentFieldKind`/
+`ComponentMethodSchema`/`ConnectEdgeSchema` tables,
+`FunctionKind::ComponentMethod`, `Stmt::{ComponentFieldWrite,
+ComponentEmit, ComponentCall}`, `Expr::ComponentField`, and a
+`ComponentBase` (`SelfField` self-relative inside a method body, `Path`
+for a test-scope `env.sub.field` access). A composite `env` binds only as
+a test-scope `let env : <Env>` in this subset (a composite-component
+*testbench field* is a precise rejection — see divergence 14). Method
+bodies are loop-switch `<Comp>_<method>(<Comp>& self, args)` lambdas; the
+env is a run-scope local with its `connect` push_backs wired at
+construction (`<env>.<src>.<event>.push_back([&](auto _t){
+<Sink>_<m>(<env>.<sink>, _t); })`) — byte-for-byte v1's shape, so
+`analysis_sink_connect_test` trace-diffs clean. **Out of subset**
+(precise rejections): `agent` declarations and `on <ev>` event handlers,
+`sequencer`/`tseq`, watchdog/phase orchestration, `idle(N)`/`quiesced(N)`
+predicates, dotted-path `emit top.prod.in_ev(t)`, bus-bound source
+transactors, generics, and non-scalar event payloads. Those gate on the
+agent/sequencer/event slices.
 
 ### The equivalence matrix
 
@@ -647,6 +677,45 @@ reason. Code locations are authoritative.
     remaps, nested transactor/method calls inside a responder
     (forwarding), and the *initiator-side* bus-bound BFM (`hookable`
     bodies driving handshake channels — the regblock `via` helpers).
+
+14. **Env-composition (analysis-connect) subset (2026-06-13).** The
+    env/agent cluster's flat-struct core lowers
+    (`src/ir/lower/components.rs`, `ComponentSchema` in `src/ir/mod.rs`).
+    - *Three source shapes, one schema.* A method-bearing `scoreboard`,
+      an analysis-source `transactor` (`out event` + `emit`, no DUT
+      field), and an `env` composing them all lower into
+      `TbProgram::components` (`ComponentSchema`), routed there BEFORE the
+      `ScoreboardSchema`/`TransactorSchema` loops by
+      `components::{scoreboard_is_component, transactor_is_component}`.
+      This mirrors v1, which treats env/agent/scoreboard/transactor
+      uniformly as `ComponentDecl`s (`synth_component_from_transactor`).
+    - *Component instance state IS materialized* — the divergence-10
+      reason a data-only scoreboard could not carry methods. A component
+      is a plain C++ struct of its fields; a method is a free
+      `<Comp>_<method>(<Comp>& self, args)` lambda whose body addresses
+      fields self-relatively. So scoreboard methods (the residual the
+      scoreboard slice flagged) lower here, not on `ScoreboardSchema`.
+    - *`connect` resolves at lowering* into `ConnectEdgeSchema`s on the
+      env's `ComponentSchema`; emission wires them as v1's
+      `<env>.<src>.<event>.push_back([&](auto _t){ <Sink>_<m>(<env>.<sink>,
+      _t); })` at the env local's construction. `emit observed(v)` fans
+      out over `self.<event>` plus the `_last_out_cycle` heartbeat bump,
+      exactly v1's emit lowering.
+    - *Test-scope binding only.* A composite env binds as `let env :
+      <Env>` (a run-scope local, run/check-shared — v1's `AnalysisEnv
+      env;` placement). A composite-component *testbench field* (e.g. a
+      method-bearing scoreboard bound `sb : Sb`) is a precise
+      `Unsupported` at the field — it would otherwise mis-lower to the
+      "assume DUT module type" arm. The impl-form env-typed testbench
+      field (`top : HeartbeatEnv`) is the agent-slice form, not here.
+    - *Rejected, never mis-lowered:* `agent` declarations and `on <ev>`
+      handlers, `sequencer`/`tseq`, watchdog/phase orchestration,
+      `idle(N)`/`quiesced(N)` predicates, dotted-path `emit
+      top.prod.in_ev(t)` (cross-component emit), bus-bound source
+      transactors, generics, non-scalar event payloads. New fixture:
+      `analysis_sink_connect_test` (`top_counter.sv`, pass) — env + two
+      method-bearing scoreboards + analysis source + two connect edges,
+      registered in the equivalence registry.
 
 Minor, same spirit: `IndexVec` is a plain `Vec` plus typed id structs;
 the design's `AssertFail` enum collapsed into a single
