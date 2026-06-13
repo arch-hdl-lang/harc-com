@@ -231,7 +231,7 @@ int run_RomLutTest(int argc, char** argv) {
                     addr = 0;
                     harc_rt::harc_assign(dut->rd_addr, addr);
                     harc_rt::harc_assign(dut->rd_en, 1);
-                    co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
+                    for (int _w = 0; _w < 1; _w++) tick();
                     __bb = 3;
                     break;
                 }
@@ -244,7 +244,7 @@ int run_RomLutTest(int argc, char** argv) {
                     addr_2 = 1;
                     harc_rt::harc_assign(dut->rd_addr, addr_2);
                     harc_rt::harc_assign(dut->rd_en, 1);
-                    co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
+                    for (int _w = 0; _w < 1; _w++) tick();
                     __bb = 5;
                     break;
                 }
@@ -262,7 +262,7 @@ int run_RomLutTest(int argc, char** argv) {
                     addr_3 = 2;
                     harc_rt::harc_assign(dut->rd_addr, addr_3);
                     harc_rt::harc_assign(dut->rd_en, 1);
-                    co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
+                    for (int _w = 0; _w < 1; _w++) tick();
                     __bb = 7;
                     break;
                 }
@@ -280,7 +280,7 @@ int run_RomLutTest(int argc, char** argv) {
                     addr_4 = 3;
                     harc_rt::harc_assign(dut->rd_addr, addr_4);
                     harc_rt::harc_assign(dut->rd_en, 1);
-                    co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
+                    for (int _w = 0; _w < 1; _w++) tick();
                     __bb = 9;
                     break;
                 }
@@ -298,7 +298,7 @@ int run_RomLutTest(int argc, char** argv) {
                     addr_5 = 4;
                     harc_rt::harc_assign(dut->rd_addr, addr_5);
                     harc_rt::harc_assign(dut->rd_en, 1);
-                    co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
+                    for (int _w = 0; _w < 1; _w++) tick();
                     __bb = 11;
                     break;
                 }
@@ -316,7 +316,7 @@ int run_RomLutTest(int argc, char** argv) {
                     addr_6 = 5;
                     harc_rt::harc_assign(dut->rd_addr, addr_6);
                     harc_rt::harc_assign(dut->rd_en, 1);
-                    co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
+                    for (int _w = 0; _w < 1; _w++) tick();
                     __bb = 13;
                     break;
                 }
@@ -334,7 +334,7 @@ int run_RomLutTest(int argc, char** argv) {
                     addr_7 = 6;
                     harc_rt::harc_assign(dut->rd_addr, addr_7);
                     harc_rt::harc_assign(dut->rd_en, 1);
-                    co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
+                    for (int _w = 0; _w < 1; _w++) tick();
                     __bb = 15;
                     break;
                 }
@@ -352,7 +352,7 @@ int run_RomLutTest(int argc, char** argv) {
                     addr_8 = 7;
                     harc_rt::harc_assign(dut->rd_addr, addr_8);
                     harc_rt::harc_assign(dut->rd_en, 1);
-                    co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
+                    for (int _w = 0; _w < 1; _w++) tick();
                     __bb = 17;
                     break;
                 }

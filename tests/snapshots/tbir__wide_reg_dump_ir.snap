@@ -1,0 +1,51 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 WideRegTb { dut: WideReg }
+  test WideRegTest tb=tb0 run=fn0 check=-
+
+fn fn0 run_WideRegTest [kind=Run, owner=tb0]
+  entry = b0
+
+  b0:
+    Log(info, "wide-bit-vector test: 256-bit signal whole-signal access")
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.we, 0)
+    DutWrite(dut.data_in, 0)
+    -> WaitCycles(2, b1)
+
+  b1:
+    DutWrite(dut.rst, 0)
+    -> WaitCycles(1, b2)
+
+  b2:
+    DutWrite(dut.data_in, 0x0123456789abcdeffedcba9876543210aabbccddeeff00112233445566778899)
+    DutWrite(dut.we, 1)
+    -> WaitCycles(1, b3)
+
+  b3:
+    DutWrite(dut.we, 0)
+    DutWrite(dut.data_in, 0)
+    -> WaitCycles(1, b4)
+
+  b4:
+    AssertCheck { cond: (dut.data_out == 0x0123456789abcdeffedcba9876543210aabbccddeeff00112233445566778899), on_fail: "Test 1: 256-bit readback mismatch" }
+    Log(info, "Test 1 PASS: 256-bit pattern round-trips")
+    DutWrite(dut.data_in, 0xffffffffffffffff0000000000000000aabbccddeeff00112233445566778899)
+    DutWrite(dut.we, 1)
+    -> WaitCycles(1, b5)
+
+  b5:
+    DutWrite(dut.we, 0)
+    DutWrite(dut.data_in, 0)
+    -> WaitCycles(1, b6)
+
+  b6:
+    AssertCheck { cond: (dut.data_out == 0xffffffffffffffff0000000000000000aabbccddeeff00112233445566778899), on_fail: "Test 2: high-128b change not observed" }
+    Log(info, "Test 2 PASS: high 128 bits genuinely compared")
+    AssertCheck { cond: (dut.data_out != 0x00000000000000000000000000000000aabbccddeeff00112233445566778899), on_fail: "Test 3: != failed to spot upper-bit difference" }
+    Log(info, "Test 3 PASS: != routes through harc_eq_words too")
+    Log(info, "ALL 3 SUB-TESTS PASSED Ã¢Â\u{80}Â\u{94} wide bit-vector codegen")
+    -> Return

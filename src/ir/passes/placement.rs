@@ -289,6 +289,12 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 host_service_only = false;
                 visit_expr(call, &mut accesses, &mut transactor);
             }
+            Stmt::TbFieldWrite { value, .. } => {
+                // Host state on the _tb struct — no pin access of its
+                // own; the value expression may carry inline reads.
+                host_service_only = false;
+                visit_expr(value, &mut accesses, &mut transactor);
+            }
             Stmt::CovReport(_) => {}
         }
     }
@@ -296,6 +302,15 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
         Terminator::WaitCycles(n, _, _) => {
             suspends_cycles = true;
             visit_expr(n, &mut accesses, &mut transactor);
+        }
+        Terminator::WaitCyclesSync(n, _) => {
+            suspends_cycles = true;
+            visit_expr(n, &mut accesses, &mut transactor);
+        }
+        Terminator::WaitTimePs(..) => {
+            // Wall-clock wait: advances simulated time like a counted
+            // wait — same cycle-anchoring effect for classification.
+            suspends_cycles = true;
         }
         Terminator::WaitUntil { preds, .. } => {
             suspends_until = true;
@@ -345,6 +360,7 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
             visit_expr(t, accesses, transactor);
             visit_expr(e, accesses, transactor);
         }
+        Expr::WidthCast { inner, .. } => visit_expr(inner, accesses, transactor),
         Expr::Call(target, args) => {
             if matches!(target, CallTarget::TransactorMethod { .. }) {
                 *transactor = true;
@@ -353,7 +369,12 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
                 visit_expr(a, accesses, transactor);
             }
         }
-        Expr::Literal { .. } | Expr::Local(_) | Expr::RecordField { .. } | Expr::CovBin { .. } => {}
+        Expr::Literal { .. }
+        | Expr::WideLiteral(_)
+        | Expr::Local(_)
+        | Expr::RecordField { .. }
+        | Expr::TbField(_)
+        | Expr::CovBin { .. } => {}
     }
 }
 
@@ -517,6 +538,7 @@ mod tests {
             direction: None,
             width: None,
             access,
+            lane: None,
         }
     }
 

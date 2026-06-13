@@ -33,7 +33,7 @@ fn fn1 run_HelperMixTest [kind=Run, owner=tb0]
     Assign(%addr, 2)
     DutWrite(dut.rd_addr, %addr)
     DutWrite(dut.rd_en, 1)
-    -> WaitCycles(1, b2)
+    -> WaitCyclesSync(1, b2)
 
   b1:
     AssertCheck { cond: (%__t0 == 90), on_fail: "bad rom value" }
@@ -41,7 +41,7 @@ fn fn1 run_HelperMixTest [kind=Run, owner=tb0]
     Assign(%addr_2, 3)
     DutWrite(dut.rd_addr, %addr_2)
     DutWrite(dut.rd_en, 1)
-    -> WaitCycles(1, b4)
+    -> WaitCyclesSync(1, b4)
 
   b2:
     DutRead(%__t0, dut.rd_data)

@@ -74,17 +74,30 @@ static inline uint64_t harc_rng_next() {
 /// One testbench struct (only for non-synthetic testbenches).
 /// `cov_fields` are (field name, covergroup struct name) pairs in
 /// declaration order, emitted after the DUT pointer — same member
-/// layout as v1.
+/// layout as v1. `scalar_fields` are run/check-shared scalar members
+/// (`expected : uint<32> default 0`), with v1's C-type mapping.
 pub(super) fn tb_struct(
     out: &mut String,
     tb_name: &str,
     dut_type: &str,
     cov_fields: &[(String, String)],
+    scalar_fields: &[crate::ir::TbScalarFieldSchema],
 ) {
     writeln!(out, "struct {tb_name} {{").ok();
     writeln!(out, "{INDENT}V{dut_type}* dut = nullptr;").ok();
     for (field, cg_name) in cov_fields {
         writeln!(out, "{INDENT}{cg_name} {field};").ok();
+    }
+    for f in scalar_fields {
+        let (cty, init) = match f.ty {
+            crate::ir::IrType::Bool => (
+                "bool",
+                if f.default != 0 { "true" } else { "false" }.to_string(),
+            ),
+            crate::ir::IrType::SInt(_) => ("int64_t", f.default.to_string()),
+            _ => ("uint64_t", f.default.to_string()),
+        };
+        writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
     }
     writeln!(out, "{INDENT}uint64_t _last_in_cycle = 0;").ok();
     writeln!(out, "{INDENT}uint64_t _last_out_cycle = 0;").ok();

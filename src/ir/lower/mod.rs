@@ -21,8 +21,9 @@ mod stmts;
 mod transactors;
 
 use crate::ast::{
-    Block, BusDecl, ClockDecl, ComponentDecl, ComponentItem, ExprKind, Item, ScopeDecl,
-    SourceFile, Stmt as AstStmt, StmtKind, TestDecl, TestItem, TransactorMode, TypeExpr,
+    Block, BuiltinTy, BusDecl, ClockDecl, ComponentDecl, ComponentItem, ExprKind,
+    HookableMethod, Item, ScopeDecl, SourceFile, Stmt as AstStmt, StmtKind, TestDecl, TestItem,
+    TransactorMode, TypeExpr,
 };
 use crate::ir::{
     self, BasicBlock, BlockId, ClockSpec, CovgroupId, CovgroupSchema, FunctionId, FunctionKind,
@@ -125,6 +126,52 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     }
     let used_tbs: HashSet<&String> = tb_of_test.values().collect();
 
+    // File-scope named integer constants: `const NAME : Ty = <lit>`
+    // (v1: `static constexpr <cty> NAME = <expr>;`) and `enum Color {
+    // RED, ... }` variant names (v1: variant index, first definition
+    // wins). Both substitute as plain integer literals at use sites —
+    // observably identical to v1's constexpr/index emission. `const`
+    // initializers outside plain integer literals are rejected (v1
+    // forwards arbitrary exprs to C++; the IR subset keeps literals).
+    let mut consts: HashMap<String, u64> = HashMap::new();
+    for it in &file.items {
+        match it {
+            Item::Const(c) => {
+                let ExprKind::Int(s) = &*c.value.kind else {
+                    return Err(unsupported(
+                        &format!("`const {}` with a non-integer-literal initializer", c.name.name),
+                        "",
+                    ));
+                };
+                let Some(v) = exprs::parse_int_literal(s) else {
+                    return Err(unsupported(
+                        &format!("`const {}` initializer `{s}`", c.name.name),
+                        "not a plain integer literal",
+                    ));
+                };
+                consts.insert(c.name.name.clone(), v);
+            }
+            Item::Enum(e) => {
+                for (i, v) in e.variants.iter().enumerate() {
+                    // First definition wins across enums — v1's
+                    // `enum_variants.entry(..).or_insert(i)`.
+                    consts.entry(v.name.clone()).or_insert(i as u64);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Enum names, so transaction fields of enum type lower as scalars
+    // (v1 flattens them to `int64_t` members with index values).
+    let enum_names: HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Enum(e) => Some(e.name.name.clone()),
+            _ => None,
+        })
+        .collect();
+
     // Covergroup schemas, in file order. All declarations lower (even
     // unreferenced ones — v1 emits a struct for each), so unsupported
     // covergroup features are rejected here rather than dropped.
@@ -145,7 +192,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     let mut record_schemas: Vec<RecordSchema> = Vec::new();
     for it in &file.items {
         if let Item::Transaction(t) = it {
-            let schema = records::lower_transaction(t)?;
+            let schema = records::lower_transaction(t, &enum_names)?;
             record_ids.insert(t.name.name.clone(), RecordId(record_schemas.len() as u32));
             record_schemas.push(schema);
         }
@@ -185,6 +232,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             | Item::Covergroup(_)
             | Item::Function(_)
             | Item::Transaction(_)
+            | Item::Const(_)
+            | Item::Enum(_)
             | Item::Bus(_)
             | Item::Transactor(_) => {}
             // `extend` was already folded by merge_for_sim; a survivor
@@ -247,6 +296,10 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         bus_bindings: HashMap::new(),
         transactor_fields: HashMap::new(),
         transactors: Vec::new(),
+        consts: consts.clone(),
+        tb_scalar_fields: HashSet::new(),
+        tb_methods: HashMap::new(),
+        test_scope_lets: HashSet::new(),
     };
     for it in &file.items {
         let Item::Function(fd) = it else { continue };
@@ -292,6 +345,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &covgroup_ids,
             &record_ids,
             &buses,
+            &consts,
             &helper_registry,
             &mut prog,
         )?;
@@ -307,8 +361,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
 
 /// MVP testbench-component validation: every field must be the DUT
 /// field (a non-HARC type, i.e. a Verilator module type), a covergroup
-/// instance, or an `active` transactor instance. Scoreboard / agent /
-/// env fields are post-MVP.
+/// instance, an `active` transactor instance, or a scalar
+/// (uint/sint/bits/bool) member — run/check-shared host state on the
+/// `_tb` struct. Scoreboard / agent / env fields are post-MVP.
 fn validate_testbench_component(
     c: &ComponentDecl,
     components: &HashMap<String, &ComponentDecl>,
@@ -375,10 +430,13 @@ fn validate_testbench_component(
                             "",
                         ));
                     }
-                } else {
+                } else if tb_scalar_field_ir_type(&f.ty).is_none() {
                     return Err(unsupported(
-                        &format!("testbench field `{}` with a non-named type", f.name.name),
-                        "",
+                        &format!(
+                            "testbench field `{}` with a non-scalar, non-named type",
+                            f.name.name
+                        ),
+                        "only uint/sint/bits/bool fields up to 64 bits are lowered",
                     ));
                 }
             }
@@ -440,6 +498,7 @@ fn lower_test(
     covgroup_ids: &HashMap<String, CovgroupId>,
     record_ids: &HashMap<String, RecordId>,
     buses: &HashMap<String, &BusDecl>,
+    consts: &HashMap<String, u64>,
     helpers: &helpers::HelperRegistry<'_>,
     prog: &mut TbProgram,
 ) -> Result<(), LowerError> {
@@ -453,6 +512,15 @@ fn lower_test(
     let mut bare_stmts: Vec<&AstStmt> = Vec::new();
     let mut bus_bindings: Vec<ir::BusBindingSchema> = Vec::new();
     let mut bus_binding_decls: HashMap<String, BusDecl> = HashMap::new();
+    // Test-scope `let`s (beyond `dut`/`_tb`/bus binds), hoisted to the
+    // head of the run body in item order — v1 hoists them to `main`
+    // scope before the coroutine, initialized once, and the coroutine
+    // captures by reference; the IR lowers them as run-function locals
+    // initialized at entry. Names are recorded so a check-phase
+    // reference gets a precise rejection (run and check are separate
+    // IR functions, so the shared-state form is not representable).
+    let mut test_let_stmts: Vec<AstStmt> = Vec::new();
+    let mut test_let_names: HashSet<String> = HashSet::new();
     let tb_name = tb_of_test.get(&t.name.name).cloned();
 
     for it in &t.items {
@@ -501,11 +569,17 @@ fn lower_test(
                 bus_binding_decls.insert(l.name.name.clone(), owned);
             }
             TestItem::Let(l) => {
-                return Err(unsupported(
-                    &format!("test-scope `let {}`", l.name.name),
-                    "only `let dut : <Type>` and bus bindings \
-                     (`let <name> : <Bus> = bind dut`) are lowered at test scope",
-                ));
+                if !l.probes.is_empty() || l.bind {
+                    return Err(unsupported(
+                        &format!("test-scope `let {}` with probes or a bind", l.name.name),
+                        "only plain `let <name> [: <Ty>] = <expr>` test-scope lets are lowered",
+                    ));
+                }
+                test_let_names.insert(l.name.name.clone());
+                test_let_stmts.push(AstStmt {
+                    kind: StmtKind::Let(l.clone()),
+                    span: l.span,
+                });
             }
             TestItem::Clock(c) => clocks.push(c),
             TestItem::Scope(s) => {
@@ -575,42 +649,84 @@ fn lower_test(
     }
     // Covergroup- and transactor-typed testbench fields, in declaration
     // order — cov order is the sampler registration order (must match
-    // v1); transactor order is the method-lambda emission order.
+    // v1); transactor order is the method-lambda emission order. Scalar
+    // member fields and helper methods (`function`/`hookable`) are
+    // collected in the same walk.
     let mut cov_fields: Vec<(String, CovgroupId)> = Vec::new();
     let mut transactor_fields: Vec<(String, TransactorId)> = Vec::new();
+    let mut scalar_fields: Vec<ir::TbScalarFieldSchema> = Vec::new();
+    let mut tb_methods: HashMap<String, HookableMethod> = HashMap::new();
     if let Some(tbn) = &tb_name {
         if let Some(c) = components.get(tbn) {
             for ci in &c.items {
-                if let ComponentItem::Field(f) = ci {
-                    if let TypeExpr::Named { name, .. } = &f.ty {
-                        let simple =
-                            name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
-                        if let Some(id) = covgroup_ids.get(simple) {
-                            cov_fields.push((f.name.name.clone(), *id));
-                        }
-                        if let Some(idx) =
-                            prog.transactors.iter().position(|t| t.name == simple)
-                        {
-                            let xid = TransactorId(idx as u32);
-                            // The transactor's module-typed field must
-                            // drive the same DUT type this test
-                            // instantiates — the IR's single-DUT model
-                            // makes the bind static.
-                            let xdut = &prog.transactors[idx].dut_type;
-                            if *xdut != dut_type {
-                                return Err(unsupported(
-                                    &format!(
-                                        "transactor field `{tbn}.{} : {simple}` whose \
-                                         `{}` field type `{xdut}` differs from the test \
-                                         DUT type `{dut_type}`",
-                                        f.name.name, prog.transactors[idx].dut_field
-                                    ),
-                                    "",
-                                ));
+                match ci {
+                    ComponentItem::Field(f) => {
+                        if let TypeExpr::Named { name, .. } = &f.ty {
+                            let simple =
+                                name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+                            if let Some(id) = covgroup_ids.get(simple) {
+                                cov_fields.push((f.name.name.clone(), *id));
                             }
-                            transactor_fields.push((f.name.name.clone(), xid));
+                            if let Some(idx) =
+                                prog.transactors.iter().position(|t| t.name == simple)
+                            {
+                                let xid = TransactorId(idx as u32);
+                                // The transactor's module-typed field must
+                                // drive the same DUT type this test
+                                // instantiates — the IR's single-DUT model
+                                // makes the bind static.
+                                let xdut = &prog.transactors[idx].dut_type;
+                                if *xdut != dut_type {
+                                    return Err(unsupported(
+                                        &format!(
+                                            "transactor field `{tbn}.{} : {simple}` whose \
+                                             `{}` field type `{xdut}` differs from the test \
+                                             DUT type `{dut_type}`",
+                                            f.name.name, prog.transactors[idx].dut_field
+                                        ),
+                                        "",
+                                    ));
+                                }
+                                transactor_fields.push((f.name.name.clone(), xid));
+                            }
+                        } else if let Some(ty) = tb_scalar_field_ir_type(&f.ty) {
+                            let default = match &f.default {
+                                None => 0,
+                                Some(d) => match &*d.kind {
+                                    ExprKind::Int(s) => {
+                                        exprs::parse_int_literal(s).ok_or_else(|| {
+                                            unsupported(
+                                                &format!(
+                                                    "testbench field default `{} default {s}`",
+                                                    f.name.name
+                                                ),
+                                                "not a plain integer literal",
+                                            )
+                                        })?
+                                    }
+                                    ExprKind::Bool(b) => *b as u64,
+                                    _ => {
+                                        return Err(unsupported(
+                                            &format!(
+                                                "a non-literal default on testbench field `{}`",
+                                                f.name.name
+                                            ),
+                                            "",
+                                        ));
+                                    }
+                                },
+                            };
+                            scalar_fields.push(ir::TbScalarFieldSchema {
+                                name: f.name.name.clone(),
+                                ty,
+                                default,
+                            });
                         }
                     }
+                    ComponentItem::Hookable(h) => {
+                        tb_methods.insert(h.name.name.clone(), h.clone());
+                    }
+                    _ => {}
                 }
             }
         }
@@ -635,6 +751,7 @@ fn lower_test(
         dut_field: "dut".to_string(),
         dut_type,
         cov_fields: cov_fields.clone(),
+        scalar_fields: scalar_fields.clone(),
         bus_bindings: bus_bindings.clone(),
         transactor_fields: transactor_fields.clone(),
         synthetic,
@@ -644,7 +761,11 @@ fn lower_test(
     // executes setup → run → check → teardown sequentially; the IR
     // splits them into a Run function (setup+run) and a Check function
     // (check+teardown) that backends emit back-to-back.
-    let mut run_stmts: Vec<&AstStmt> = Vec::new();
+    // Hoisted test-scope lets first (v1 evaluates them at `main` scope
+    // before the coroutine bootstraps — i.e. before any body statement
+    // and before the first clock edge), then the body in scope order.
+    let mut run_stmts: Vec<&AstStmt> = test_let_stmts.iter().collect();
+    let n_hoisted_lets = run_stmts.len();
     let mut check_stmts: Vec<&AstStmt> = Vec::new();
     if let Some(s) = scope {
         if let Some(b) = &s.setup {
@@ -670,7 +791,7 @@ fn lower_test(
         ));
     }
     run_stmts.extend(bare_stmts.iter().copied());
-    if run_stmts.is_empty() {
+    if run_stmts.len() == n_hoisted_lets {
         return Err(LowerError::Invalid(format!(
             "test `{}` has no body — add a `scope sim`, `run`, or bare statements",
             t.name.name
@@ -688,6 +809,10 @@ fn lower_test(
         bus_bindings: bus_binding_decls,
         transactor_fields: transactor_fields.iter().cloned().collect(),
         transactors: prog.transactors.clone(),
+        consts: consts.clone(),
+        tb_scalar_fields: scalar_fields.iter().map(|f| f.name.clone()).collect(),
+        tb_methods,
+        test_scope_lets: test_let_names,
     };
 
     // Synthesized auto-sampler functions, one per covergroup field, in
@@ -765,6 +890,33 @@ fn collect_stmts<'a>(b: &'a Block, skip_tb_wire: bool, out: &mut Vec<&'a AstStmt
     }
 }
 
+/// Scalar IR type of a testbench member field (`expected : uint<32>`),
+/// or `None` when the type is outside the scalar subset. Mirrors v1's
+/// `component_field_c_type` → `txn_field_c_type` C-type choice for
+/// the ≤64-bit subset.
+fn tb_scalar_field_ir_type(t: &TypeExpr) -> Option<IrType> {
+    let TypeExpr::Builtin { name, args, .. } = t else {
+        return None;
+    };
+    let width = match args.first() {
+        Some(crate::ast::TypeArg::Expr(e)) => match &*e.kind {
+            ExprKind::Int(s) => Some(s.replace('_', "").parse::<u32>().ok()?),
+            _ => return None,
+        },
+        Some(_) => return None,
+        None => None,
+    };
+    if width.is_some_and(|w| w == 0 || w > 64) {
+        return None;
+    }
+    match name {
+        BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => Some(IrType::UInt(width)),
+        BuiltinTy::SInt | BuiltinTy::SIntCap => Some(IrType::SInt(width)),
+        BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => Some(IrType::Bool),
+        _ => None,
+    }
+}
+
 /// Simple (last-segment) name of a `Named` type expression, if any.
 fn type_simple_name(t: Option<&TypeExpr>) -> Option<&str> {
     match t? {
@@ -786,7 +938,7 @@ fn is_tb_dut_wire(s: &AstStmt) -> bool {
     root.name == "_tb" && name.name == "dut" && v.name == "dut"
 }
 
-fn time_literal_to_ps(s: &str) -> Result<i64, String> {
+pub(crate) fn time_literal_to_ps(s: &str) -> Result<i64, String> {
     let digits: String = s
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '_')
@@ -867,6 +1019,25 @@ pub(crate) struct LowerCtx {
     /// Snapshot of the program's transactor schemas, for method
     /// validation at call sites.
     pub transactors: Vec<TransactorSchema>,
+    /// File-scope named integer constants: `const` declarations plus
+    /// enum variant names (variant index, first definition wins —
+    /// v1's `enum_variants` rule). Substituted as literals at use
+    /// sites; locals shadow (lookup order: local, then const — same
+    /// effective shadowing as v1's C++ scoping).
+    pub consts: HashMap<String, u64>,
+    /// Scalar testbench field names (`TestbenchSchema::scalar_fields`),
+    /// for `_tb.<field>` access lowering.
+    pub tb_scalar_fields: HashSet<String>,
+    /// Testbench helper methods (`function`/`hookable` declared inside
+    /// the bound testbench), CFG-inlined at `_tb.<m>(...)` call sites
+    /// like impure helpers — v1 emits them as `[&]`-capturing lambdas
+    /// whose waits tick the same scheduler.
+    pub tb_methods: HashMap<String, HookableMethod>,
+    /// Test-scope let names (hoisted into the run function). Used for
+    /// a precise rejection when the check phase references one — run
+    /// and check are separate IR functions, so v1's shared-capture
+    /// scoping is not representable.
+    pub test_scope_lets: HashSet<String>,
 }
 
 pub(crate) struct LoopFrame {
@@ -925,6 +1096,16 @@ pub(crate) struct FuncBuilder<'a> {
     /// clock-qualified waits and timed `wait until` — are rejected
     /// here, as are nested transactor calls.
     pub(crate) in_transactor_method: bool,
+    /// True while lowering a Check-kind function — used for the
+    /// precise test-scope-let rejection (see `LowerCtx::
+    /// test_scope_lets`).
+    pub(crate) in_check: bool,
+    /// Best-effort bit widths of locals with an explicit scalar type
+    /// annotation (`let s64 : uint<64> = ...`). Consulted only by the
+    /// width-method receiver inference (v1's `let_widths`); the
+    /// declared `TypedLocal::ty` deliberately stays `Unknown` (see
+    /// docs/tbir-mvp.md divergence 4).
+    pub(crate) let_widths: HashMap<LocalId, u32>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -938,6 +1119,7 @@ fn lower_function<'a>(
     helpers: &'a helpers::HelperRegistry<'a>,
 ) -> Result<TbFunction, LowerError> {
     let mut b = FuncBuilder::new(ctx, helpers);
+    b.in_check = kind == FunctionKind::Check;
     for s in stmts {
         b.lower_stmt(s)?;
     }
@@ -967,6 +1149,8 @@ impl<'a> FuncBuilder<'a> {
             in_pure_helper: false,
             in_fmt_args: false,
             in_transactor_method: false,
+            in_check: false,
+            let_widths: HashMap::new(),
         }
     }
 }
@@ -1172,6 +1356,8 @@ fn remap_terminator(t: &mut Terminator, remap: &[BlockId]) {
             m(b);
         }
         Terminator::WaitCycles(_, _, b) => m(b),
+        Terminator::WaitCyclesSync(_, b) => m(b),
+        Terminator::WaitTimePs(_, b) => m(b),
         Terminator::WaitUntil { succ, .. } => m(succ),
         Terminator::WaitUntilTimeout {
             on_fire,

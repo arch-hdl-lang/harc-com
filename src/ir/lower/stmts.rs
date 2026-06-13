@@ -2,7 +2,7 @@
 //! §"Statements within a run / check / transactor body").
 
 use super::{FuncBuilder, LowerError, unsupported};
-use crate::ast::{CallArg, ExprKind, Stmt as AstStmt, StmtKind, TypeExpr};
+use crate::ast::{BuiltinTy, CallArg, ExprKind, Stmt as AstStmt, StmtKind, TypeArg, TypeExpr};
 use crate::ir::{Expr, FileLogLevel, FmtArg, FmtArgs, IrType, LogLevel, Stmt, Terminator};
 
 impl FuncBuilder<'_> {
@@ -41,6 +41,32 @@ impl FuncBuilder<'_> {
             StmtKind::Wait {
                 duration, clock, ..
             } => {
+                // Wall-clock wait (`wait 80ns`): resolved to
+                // picoseconds at lowering, suspended via the inline
+                // `eval_clocks_until(now_ps + N)` form (v1's emission
+                // for a Time duration). Needs the multi-clock
+                // scheduler — a clockless test has no absolute time
+                // (v1 emits uncompilable C++ there; the IR rejects).
+                if let ExprKind::Time(s) = &*duration.kind {
+                    if clock.is_some() {
+                        return Err(unsupported(
+                            "`wait <time> on <clock>`",
+                            "clock-qualified waits take a cycle count",
+                        ));
+                    }
+                    if self.ctx.clock_names.is_empty() {
+                        return Err(unsupported(
+                            "wall-clock `wait <time>` in a clockless test",
+                            "declare a `clock` — absolute time comes from the \
+                             multi-clock scheduler",
+                        ));
+                    }
+                    let ps = super::time_literal_to_ps(s).map_err(LowerError::Invalid)?;
+                    let next = self.new_block();
+                    self.terminate(Terminator::WaitTimePs(ps, next));
+                    self.start_block(next);
+                    return Ok(());
+                }
                 // `wait N cycles [on <clock>]`. The clock qualifier
                 // resolves against the test's declared clocks HERE —
                 // v1 deferred the unknown-clock error to emission; the
@@ -77,7 +103,14 @@ impl FuncBuilder<'_> {
                 };
                 let n = self.lower_expr_no_ports(duration)?;
                 let next = self.new_block();
-                self.terminate(Terminator::WaitCycles(n, clock, next));
+                // Plain waits inside an inlined helper / testbench-
+                // method body take v1's synchronous lambda path (no
+                // coroutine yield) — see `Terminator::WaitCyclesSync`.
+                if clock.is_none() && !self.inline_frames.is_empty() {
+                    self.terminate(Terminator::WaitCyclesSync(n, next));
+                } else {
+                    self.terminate(Terminator::WaitCycles(n, clock, next));
+                }
                 self.start_block(next);
                 Ok(())
             }
@@ -159,6 +192,15 @@ impl FuncBuilder<'_> {
                 // `axil.w.send(...)` / `axil.r.recv()` handshakes.
                 if self.try_lower_bus_call(e, super::bus::BusCallDest::Discard)? {
                     return Ok(());
+                }
+                // Testbench helper method call (`_tb.reset()`), CFG-
+                // inlined like an impure helper; statement position
+                // discards the (usually void) result.
+                if let ExprKind::Call { callee, args } = &*e.kind {
+                    if let Some(m) = self.tb_method_call_name(callee) {
+                        self.lower_tb_method_call(&m, args)?;
+                        return Ok(());
+                    }
                 }
                 // `cov.report()` (post-desugar `_tb.cov.report()`) on a
                 // covergroup-typed testbench field → CovReport.
@@ -256,15 +298,25 @@ impl FuncBuilder<'_> {
                 "",
             ));
         };
+        // Explicit scalar bit-width of the declaration, tracked on
+        // every path for the width-method receiver inference (v1's
+        // `let_widths` seeds from typed lets regardless of RHS shape).
+        let declared_width = l.ty.as_ref().and_then(typed_let_width);
         // Direct DUT-read form: `let x = dut.port` → DutRead(x, port).
         if let Some(port) = self.as_port_ref(value)? {
             let id = self.declare(&l.name.name);
+            if let Some(w) = declared_width {
+                self.let_widths.insert(id, w);
+            }
             self.push(Stmt::DutRead(id, port));
             return Ok(());
         }
         // Bus-bound signal read (`let x = axil.r.data`) — same shape.
         if let Some(port) = self.as_bus_port_ref(value)? {
             let id = self.declare(&l.name.name);
+            if let Some(w) = declared_width {
+                self.let_widths.insert(id, w);
+            }
             self.push(Stmt::DutRead(id, port));
             return Ok(());
         }
@@ -290,8 +342,15 @@ impl FuncBuilder<'_> {
                 return Ok(());
             }
         }
+        // Testbench method call RHS: `let x = _tb.m(...)`, CFG-inlined.
+        if self.try_lower_tb_method_let(&l.name.name, value)? {
+            return Ok(());
+        }
         let e = self.lower_expr_no_ports(value)?;
         let id = self.declare(&l.name.name);
+        if let Some(w) = declared_width {
+            self.let_widths.insert(id, w);
+        }
         self.push(Stmt::Assign(id, e));
         Ok(())
     }
@@ -310,6 +369,18 @@ impl FuncBuilder<'_> {
         if let Some(port) = self.as_bus_port_ref(target)? {
             let e = self.lower_expr(value)?;
             self.push(Stmt::DutWrite(port, e));
+            return Ok(());
+        }
+        // Constant-lane DUT port write: `dut.lane_id_in[1] = 9`.
+        if let Some(port) = self.as_lane_port_ref(target)? {
+            let e = self.lower_expr(value)?;
+            self.push(Stmt::DutWrite(port, e));
+            return Ok(());
+        }
+        // Scalar testbench field write: `_tb.expected = 3`.
+        if let Some(field) = self.as_tb_scalar_field(target) {
+            let e = self.lower_expr_no_ports(value)?;
+            self.push(Stmt::TbFieldWrite { field, value: e });
             return Ok(());
         }
         if self.lower_transactor_dut_bind(target, value)? {
@@ -364,6 +435,14 @@ impl FuncBuilder<'_> {
                 }
                 self.push(Stmt::Assign(local, e));
                 return Ok(());
+            }
+            if self.in_check && self.ctx.test_scope_lets.contains(&id.name) {
+                return Err(unsupported(
+                    &format!("test-scope `let {}` referenced in the check phase", id.name),
+                    "test-scope lets lower as run-function locals; run and check are \
+                     separate functions in the IR, so v1's shared-capture scoping is \
+                     not representable",
+                ));
             }
             return Err(unsupported(
                 &format!("assignment to unknown name `{}`", id.name),
@@ -583,6 +662,7 @@ impl FuncBuilder<'_> {
             .unwrap_or_default();
 
         let base = match sev.as_str() {
+            "debug" => FileLogLevel::Debug,
             "info" => FileLogLevel::Info,
             "warn" => FileLogLevel::Warn,
             "error" => FileLogLevel::Error,
@@ -590,13 +670,14 @@ impl FuncBuilder<'_> {
             other => {
                 return Err(unsupported(
                     &format!("log severity `{other}`"),
-                    "supported: info, warn, error, fatal",
+                    "supported: debug, info, warn, error, fatal",
                 ));
             }
         };
         let level = match file {
             Some(path) => LogLevel::File { path, level: base },
             None => match base {
+                FileLogLevel::Debug => LogLevel::Debug,
                 FileLogLevel::Info => LogLevel::Info,
                 FileLogLevel::Warn => LogLevel::Warn,
                 FileLogLevel::Error => LogLevel::Error,
@@ -609,6 +690,26 @@ impl FuncBuilder<'_> {
             args: fmt_args,
         });
         Ok(())
+    }
+
+    /// `let x = _tb.m(...)` — testbench method call RHS, CFG-inlined.
+    /// Returns `true` when the RHS was such a call (declared `x` holds
+    /// the inlined return value).
+    pub(crate) fn try_lower_tb_method_let(
+        &mut self,
+        name: &str,
+        value: &crate::ast::Expr,
+    ) -> Result<bool, LowerError> {
+        let ExprKind::Call { callee, args } = &*value.kind else {
+            return Ok(false);
+        };
+        let Some(m) = self.tb_method_call_name(callee) else {
+            return Ok(false);
+        };
+        let v = self.lower_tb_method_call(&m, args)?;
+        let id = self.declare(name);
+        self.push(Stmt::Assign(id, v));
+        Ok(true)
     }
 
     /// Lower an interpolated message string into pre-parsed `FmtArgs`,
@@ -638,5 +739,31 @@ impl FuncBuilder<'_> {
             });
         }
         Ok(FmtArgs { fmt, args })
+    }
+}
+
+/// Explicit bit width of a typed scalar `let` annotation
+/// (`let s64 : uint<64> = ...`), for the width-method receiver
+/// inference. Mirrors v1's `let_widths` seeding: explicit widths only.
+fn typed_let_width(t: &TypeExpr) -> Option<u32> {
+    let TypeExpr::Builtin { name, args, .. } = t else {
+        return None;
+    };
+    if !matches!(
+        name,
+        BuiltinTy::UInt
+            | BuiltinTy::UIntCap
+            | BuiltinTy::SInt
+            | BuiltinTy::SIntCap
+            | BuiltinTy::Bits
+    ) {
+        return None;
+    }
+    match args.first()? {
+        TypeArg::Expr(e) => match &*e.kind {
+            ExprKind::Int(s) => s.replace('_', "").parse::<u32>().ok(),
+            _ => None,
+        },
+        _ => None,
     }
 }

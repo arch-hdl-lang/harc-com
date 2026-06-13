@@ -1,0 +1,81 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 AsyncFifoTb { dut: AsyncBridge }
+  test AsyncFifoTest tb=tb0 run=fn0 check=- clock=wr_clk@5000ps(FastDomain) clock=rd_clk@20000ps(SlowDomain)
+
+fn fn0 run_AsyncFifoTest [kind=Run, owner=tb0]
+  locals:
+    %0 i : unknown
+    %1 i_2 : unknown
+    %2 got : unknown
+    %3 want : unknown
+  entry = b0
+
+  b0:
+    Log(info, "starting AsyncBridge multi-clock test")
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.push_valid, 0)
+    DutWrite(dut.push_data, 0)
+    DutWrite(dut.pop_ready, 0)
+    -> WaitTimePs(80000, b1)
+
+  b1:
+    DutWrite(dut.rst, 0)
+    -> WaitTimePs(40000, b2)
+
+  b2:
+    Log(info, "pushing 8 items on wr_clk")
+    Assign(%i, 0)
+    -> Jump(b3)
+
+  b3:
+    -> Branch((%i < 8), b4, b6)
+
+  b4:
+    DutWrite(dut.push_valid, 1)
+    DutWrite(dut.push_data, (%i + 1))
+    -> WaitTimePs(5000, b7)
+
+  b5:
+    Assign(%i, (%i + 1))
+    -> Jump(b3)
+
+  b6:
+    DutWrite(dut.push_valid, 0)
+    Log(debug, "letting CDC synchronizers settle")
+    -> WaitTimePs(200000, b8)
+
+  b7:
+    -> Jump(b5)
+
+  b8:
+    Log(info, "popping 8 items on rd_clk")
+    Assign(%i_2, 0)
+    -> Jump(b9)
+
+  b9:
+    -> Branch((%i_2 < 8), b10, b12)
+
+  b10:
+    AssertCheck { cond: dut.pop_valid, on_fail: "pop_valid low on item %lld", %i_2 }
+    DutRead(%got, dut.pop_data)
+    Assign(%want, (%i_2 + 1))
+    Log(file("async_fifo.log", info), "pop[%lld] got=%08llx want=%08llx", %i_2, %got, %want)
+    AssertCheck { cond: (%got == %want), on_fail: "data mismatch at pop[%lld]: got %lld, want %lld", %i_2, %got, %want }
+    DutWrite(dut.pop_ready, 1)
+    -> WaitTimePs(20000, b13)
+
+  b11:
+    Assign(%i_2, (%i_2 + 1))
+    -> Jump(b9)
+
+  b12:
+    Log(info, "PASS: 8/8 items round-tripped through async FIFO")
+    -> Return
+
+  b13:
+    DutWrite(dut.pop_ready, 0)
+    -> Jump(b11)

@@ -1,0 +1,87 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 CounterTb { dut: Top }
+  testbench tb1 CounterTb { dut: Top }
+  test TestbenchEnableToggle tb=tb0 run=fn0 check=-
+  test TestbenchSmoke tb=tb1 run=fn1 check=-
+
+fn fn0 run_TestbenchEnableToggle [kind=Run, owner=tb0]
+  locals:
+    %0 __t0 : unknown
+    %1 __t1 : unknown
+    %2 n : unknown
+    %3 frozen : unknown
+  entry = b0
+
+  b0:
+    Assign(%__t0, 0)
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.en, 0)
+    -> WaitCyclesSync(2, b2)
+
+  b1:
+    Assign(%__t1, 0)
+    Assign(%n, 3)
+    DutWrite(dut.en, 1)
+    -> WaitCyclesSync(%n, b5)
+
+  b2:
+    DutWrite(dut.rst, 0)
+    -> WaitCyclesSync(1, b3)
+
+  b3:
+    -> Jump(b1)
+
+  b4:
+    -> WaitCycles(3, b6)
+
+  b5:
+    DutWrite(dut.en, 0)
+    -> Jump(b4)
+
+  b6:
+    DutRead(%frozen, dut.count_out)
+    -> WaitCycles(5, b7)
+
+  b7:
+    AssertCheck { cond: (dut.count_out == %frozen), on_fail: "toggle: count moved while en=0" }
+    Log(info, "PASS: enable-toggle reuses CounterTb helpers")
+    -> Return
+
+fn fn1 run_TestbenchSmoke [kind=Run, owner=tb1]
+  locals:
+    %0 __t0 : unknown
+    %1 __t1 : unknown
+    %2 n : unknown
+  entry = b0
+
+  b0:
+    Assign(%__t0, 0)
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.en, 0)
+    -> WaitCyclesSync(2, b2)
+
+  b1:
+    Assign(%__t1, 0)
+    Assign(%n, 5)
+    DutWrite(dut.en, 1)
+    -> WaitCyclesSync(%n, b5)
+
+  b2:
+    DutWrite(dut.rst, 0)
+    -> WaitCyclesSync(1, b3)
+
+  b3:
+    -> Jump(b1)
+
+  b4:
+    AssertCheck { cond: (dut.count_out == 5), on_fail: "smoke: count_out=%lld, expected 5", dut.count_out }
+    Log(info, "PASS: testbench-shared reset + bump")
+    -> Return
+
+  b5:
+    DutWrite(dut.en, 0)
+    -> Jump(b4)

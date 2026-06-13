@@ -1,0 +1,64 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 WidthMethodsTb { dut: Top }
+  test WidthMethodsTest tb=tb0 run=fn0 check=-
+
+fn fn0 run_WidthMethodsTest [kind=Run, owner=tb0]
+  locals:
+    %0 s64 : unknown
+    %1 t32 : unknown
+    %2 t16 : unknown
+    %3 t8 : unknown
+    %4 v8 : unknown
+    %5 z16 : unknown
+    %6 z32 : unknown
+    %7 s8 : unknown
+    %8 se16 : unknown
+    %9 se32 : unknown
+    %10 p8 : unknown
+    %11 pe16 : unknown
+    %12 pe32 : unknown
+    %13 wide : unknown
+    %14 r16 : unknown
+    %15 r32 : unknown
+    %16 big : unknown
+    %17 chained : unknown
+  entry = b0
+
+  b0:
+    Assign(%s64, 1311768467463790320)
+    Assign(%t32, %s64.trunc<32 from 64>())
+    Assign(%t16, %s64.trunc<16 from 64>())
+    Assign(%t8, %s64.trunc<8 from 64>())
+    AssertCheck { cond: (%t32 == 2596069104), on_fail: "trunc<32>: got 0x%08llx", %t32 }
+    AssertCheck { cond: (%t16 == 57072), on_fail: "trunc<16>: got 0x%04llx", %t16 }
+    AssertCheck { cond: (%t8 == 240), on_fail: "trunc<8>:  got 0x%02llx", %t8 }
+    Assign(%v8, 171)
+    Assign(%z16, %v8.zext<16 from 8>())
+    Assign(%z32, %v8.zext<32 from 8>())
+    AssertCheck { cond: (%z16 == 171), on_fail: "zext<16>: got 0x%04llx", %z16 }
+    AssertCheck { cond: (%z32 == 171), on_fail: "zext<32>: got 0x%08llx", %z32 }
+    Assign(%s8, 255)
+    Assign(%se16, %s8.sext<16 from 8>())
+    Assign(%se32, %s8.sext<32 from 8>())
+    AssertCheck { cond: (%se16 == 65535), on_fail: "sext<16> of 0xFF: got 0x%04llx", %se16 }
+    AssertCheck { cond: (%se32 == 4294967295), on_fail: "sext<32> of 0xFF: got 0x%08llx", %se32 }
+    Assign(%p8, 127)
+    Assign(%pe16, %p8.sext<16 from 8>())
+    Assign(%pe32, %p8.sext<32 from 8>())
+    AssertCheck { cond: (%pe16 == 127), on_fail: "sext<16> of 0x7F: got 0x%04llx", %pe16 }
+    AssertCheck { cond: (%pe32 == 127), on_fail: "sext<32> of 0x7F: got 0x%08llx", %pe32 }
+    Assign(%wide, 3735928559)
+    Assign(%r16, %wide.resize<16 from 32>())
+    Assign(%r32, %wide.resize<32 from 32>())
+    AssertCheck { cond: (%r16 == 48879), on_fail: "resize<16> narrow: got 0x%04llx", %r16 }
+    AssertCheck { cond: (%r32 == 3735928559), on_fail: "resize<32> same: got 0x%08llx", %r32 }
+    Assign(%big, 244837814094590.trunc<32 from 48>())
+    AssertCheck { cond: (%big == 3203386110), on_fail: "anon-cast trunc<32>: got 0x%08llx", %big }
+    Assign(%chained, %s8.sext<16 from 8>().trunc<8 from 16>())
+    AssertCheck { cond: (%chained == 255), on_fail: "chained sext<16>.trunc<8>: got 0x%02llx", %chained }
+    Log(info, "PASS: trunc/zext/sext/resize all match the software model")
+    -> Return

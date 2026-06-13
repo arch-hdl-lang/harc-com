@@ -22,6 +22,15 @@ impl Display for TbProgram {
             for (field, cov) in &tb.cov_fields {
                 write!(f, " cov {field}=cg{}", cov.0)?;
             }
+            for sf in &tb.scalar_fields {
+                write!(
+                    f,
+                    " field {}:{}={}",
+                    sf.name,
+                    type_str(&sf.ty),
+                    sf.default
+                )?;
+            }
             for b in &tb.bus_bindings {
                 write!(f, " bus {}={}", b.field, b.bus)?;
                 if !b.methods.is_empty() {
@@ -214,6 +223,9 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
             local_str(func, *local),
             expr_str(func, value)
         ),
+        Stmt::TbFieldWrite { field, value } => {
+            format!("TbFieldWrite(_tb.{field}, {})", expr_str(func, value))
+        }
         Stmt::Log { level, args } => {
             format!("Log({}, {})", level_str(level), fmt_args_str(func, args))
         }
@@ -254,6 +266,10 @@ fn term_str(func: &TbFunction, t: &Terminator) -> String {
             Some(c) => format!("WaitCycles({} on {}, b{})", expr_str(func, e), c.name, b.0),
             None => format!("WaitCycles({}, b{})", expr_str(func, e), b.0),
         },
+        Terminator::WaitCyclesSync(e, b) => {
+            format!("WaitCyclesSync({}, b{})", expr_str(func, e), b.0)
+        }
+        Terminator::WaitTimePs(ps, b) => format!("WaitTimePs({ps}, b{})", b.0),
         Terminator::WaitUntil { preds, mode, succ } => format!(
             "WaitUntil {{ {} [{}], b{} }}",
             preds_str(func, preds),
@@ -308,12 +324,14 @@ fn bin_value_str(v: &CovBinValue) -> String {
 
 fn level_str(l: &LogLevel) -> String {
     match l {
+        LogLevel::Debug => "debug".to_string(),
         LogLevel::Info => "info".to_string(),
         LogLevel::Warn => "warn".to_string(),
         LogLevel::Error => "error".to_string(),
         LogLevel::Fatal => "fatal".to_string(),
         LogLevel::File { path, level } => {
             let lv = match level {
+                FileLogLevel::Debug => "debug",
                 FileLogLevel::Info => "info",
                 FileLogLevel::Warn => "warn",
                 FileLogLevel::Error => "error",
@@ -342,6 +360,9 @@ fn local_str(func: &TbFunction, l: LocalId) -> String {
 
 fn port_str(p: &PortRef) -> String {
     let mut out = format!("{}.{}", p.testbench_field, p.port_path.join("."));
+    if let Some(lane) = p.lane {
+        out.push_str(&format!("[{lane}]"));
+    }
     match p.access {
         PortAccess::Port => {}
         PortAccess::Probe => out.push_str(" (probe)"),
@@ -353,11 +374,21 @@ fn port_str(p: &PortRef) -> String {
 pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
     match e {
         Expr::Literal { value, .. } => format!("{value}"),
+        Expr::WideLiteral(words) => {
+            // MSB-first hex dump of the word list (deterministic,
+            // reparse-free — the IR has no surface syntax).
+            let mut s = String::from("0x");
+            for w in words.iter().rev() {
+                s.push_str(&format!("{w:08x}"));
+            }
+            s
+        }
         Expr::Local(l) => local_str(func, *l),
         Expr::Port(p) => port_str(p),
         Expr::RecordField { local, field } => {
             format!("{}.{field}", local_str(func, *local))
         }
+        Expr::TbField(field) => format!("_tb.{field}"),
         Expr::Binary(op, a, b) => format!(
             "({} {} {})",
             expr_str(func, a),
@@ -371,6 +402,23 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
             expr_str(func, t),
             expr_str(func, e)
         ),
+        Expr::WidthCast {
+            kind,
+            width,
+            src_width,
+            inner,
+        } => {
+            let k = match kind {
+                WidthCastKind::Trunc => "trunc",
+                WidthCastKind::Zext => "zext",
+                WidthCastKind::Sext => "sext",
+                WidthCastKind::Resize => "resize",
+            };
+            let sw = src_width
+                .map(|w| format!(" from {w}"))
+                .unwrap_or_default();
+            format!("{}.{k}<{width}{sw}>()", expr_str(func, inner))
+        }
         Expr::CovBin { inst, point, bin } => {
             format!("CovBin({}.cg{}, {point}, {bin})", inst.tb_field, inst.covgroup.0)
         }

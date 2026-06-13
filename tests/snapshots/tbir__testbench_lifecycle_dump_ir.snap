@@ -1,0 +1,79 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 CounterLifecycleTb { dut: Top } field expected:uint<32>=0
+  testbench tb1 CounterLifecycleTb { dut: Top } field expected:uint<32>=0
+  test LifecycleBumpFive tb=tb0 run=fn0 check=fn1
+  test LifecycleBumpThree tb=tb1 run=fn2 check=fn3
+
+fn fn0 run_LifecycleBumpFive [kind=Run, owner=tb0]
+  locals:
+    %0 __t0 : unknown
+  entry = b0
+
+  b0:
+    Assign(%__t0, 0)
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.en, 0)
+    -> WaitCyclesSync(2, b2)
+
+  b1:
+    DutWrite(dut.en, 1)
+    -> WaitCycles(5, b4)
+
+  b2:
+    DutWrite(dut.rst, 0)
+    -> WaitCyclesSync(1, b3)
+
+  b3:
+    -> Jump(b1)
+
+  b4:
+    DutWrite(dut.en, 0)
+    TbFieldWrite(_tb.expected, 5)
+    -> Return
+
+fn fn1 check_LifecycleBumpFive [kind=Check, owner=tb0]
+  entry = b0
+
+  b0:
+    AssertCheck { cond: (dut.count_out == _tb.expected), on_fail: "shared final check: count_out=%lld, expected=%lld", dut.count_out, _tb.expected }
+    Log(info, "shared final check passed")
+    -> Return
+
+fn fn2 run_LifecycleBumpThree [kind=Run, owner=tb1]
+  locals:
+    %0 __t0 : unknown
+  entry = b0
+
+  b0:
+    Assign(%__t0, 0)
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.en, 0)
+    -> WaitCyclesSync(2, b2)
+
+  b1:
+    DutWrite(dut.en, 1)
+    -> WaitCycles(3, b4)
+
+  b2:
+    DutWrite(dut.rst, 0)
+    -> WaitCyclesSync(1, b3)
+
+  b3:
+    -> Jump(b1)
+
+  b4:
+    DutWrite(dut.en, 0)
+    TbFieldWrite(_tb.expected, 3)
+    -> Return
+
+fn fn3 check_LifecycleBumpThree [kind=Check, owner=tb1]
+  entry = b0
+
+  b0:
+    AssertCheck { cond: (dut.count_out == _tb.expected), on_fail: "shared final check: count_out=%lld, expected=%lld", dut.count_out, _tb.expected }
+    Log(info, "shared final check passed")
+    -> Return

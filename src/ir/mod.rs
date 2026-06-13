@@ -209,6 +209,11 @@ pub struct TestbenchSchema {
     pub dut_type: String,
     /// Covergroup-typed testbench fields (field name, covgroup).
     pub cov_fields: Vec<(String, CovgroupId)>,
+    /// Scalar (integer/bool) testbench fields, in declaration order.
+    /// These are run/check-shared host state living on the emitted
+    /// `_tb` struct (v1's component-struct members), read via
+    /// `Expr::TbField` and written via `Stmt::TbFieldWrite`.
+    pub scalar_fields: Vec<TbScalarFieldSchema>,
     /// Test-scope bus bindings (`let <field> : <Bus> = bind dut`), in
     /// declaration order. Carried on the schema (like `cov_fields`)
     /// because `CallTarget::TransactorMethod { bus_field, .. }` call
@@ -225,6 +230,17 @@ pub struct TestbenchSchema {
     /// schema was synthesized for a classic-form test. Codegen skips
     /// the `_tb` struct + wire statement for synthetic testbenches.
     pub synthetic: bool,
+}
+
+/// One scalar testbench field (`expected : uint<32> default 0`).
+/// Emitted as a member of the `_tb` struct with v1's C-type mapping
+/// (bool → `bool`, signed → `int64_t`, unsigned → `uint64_t`).
+#[derive(Debug, Clone)]
+pub struct TbScalarFieldSchema {
+    pub name: String,
+    pub ty: IrType,
+    /// Declared `default <lit>` value, or 0 (v1's fallback).
+    pub default: u64,
 }
 
 /// One test-scope bus binding (`let axil : BusAxiLite = bind dut`).
@@ -344,6 +360,10 @@ pub enum Stmt {
         field: String,
         value: Expr,
     },
+    /// `_tb.<field> = value` on a scalar testbench field (run/check-
+    /// shared host state — see `TestbenchSchema::scalar_fields`). The
+    /// value is port-hoisted like `Assign`.
+    TbFieldWrite { field: String, value: Expr },
     Log { level: LogLevel, args: FmtArgs },
     AssertCheck { cond: Expr, on_fail: FmtArgs },
     CovReport(CovgroupInstance),
@@ -378,6 +398,9 @@ pub enum Stmt {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogLevel {
+    /// `log(debug, ...)` — printed with a DEBUG tag; no test-result
+    /// effect (v1 passes any severity ident through uppercased).
+    Debug,
     Info,
     Warn,
     Error,
@@ -389,6 +412,7 @@ pub enum LogLevel {
 /// Severity inside a `logf` file sink (no nested `File`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileLogLevel {
+    Debug,
     Info,
     Warn,
     Error,
@@ -431,6 +455,21 @@ pub enum Terminator {
     /// of the named clock, with all other clocks ticking at their
     /// natural rate.
     WaitCycles(Expr, Option<WaitClock>, BlockId),
+    /// A `wait N cycles` that originated inside an inlined helper /
+    /// testbench-method body. v1 emits those bodies as plain lambdas
+    /// whose waits run the synchronous `for (...) tick()` path — no
+    /// coroutine yield — so a helpers-only test body completes inside
+    /// `sched.bootstrap()`. The tbir backend mirrors that exactly
+    /// (`tick()` advances the clock and runs the checkers inline);
+    /// emitting `co_await` here instead leaves a observable trace
+    /// delta in the final `sim_end` clock attribution.
+    WaitCyclesSync(Expr, BlockId),
+    /// Wall-clock wait (`wait 80ns`), duration resolved to picoseconds
+    /// at lowering. Mirrors v1's inline `eval_clocks_until(now_ps + N)`
+    /// emission (no coroutine yield, no checker pass) — only valid in
+    /// tests with declared clocks (lowering enforces this; v1 emits
+    /// uncompilable C++ for the clockless case).
+    WaitTimePs(i64, BlockId),
     WaitUntil {
         preds: Vec<PredSrc>,
         mode: WaitMode,
@@ -477,11 +516,21 @@ pub enum WaitMode {
 #[derive(Debug, Clone)]
 pub enum Expr {
     Literal { value: u64, ty: IrType },
+    /// An integer literal wider than 64 bits, as LSB-first 32-bit
+    /// words (always > 2 words). General expression emission mirrors
+    /// v1's `c_value_literal` (`_harc_u128` composite up to 128 bits,
+    /// `harc_rt::HarcWide<N>` above); `DutWrite` values and `==`/`!=`
+    /// against a port route through `harc_assign_words_checked` /
+    /// `harc_eq_words` at emission, exactly like v1's special cases.
+    WideLiteral(Vec<u32>),
     Local(LocalId),
     Port(PortRef),
     /// `t.field` read on a record-typed local. Host state, not DUT
     /// state — allowed in every expression position a `Local` is.
     RecordField { local: LocalId, field: String },
+    /// `_tb.<field>` read on a scalar testbench field. Host state —
+    /// allowed in every expression position a `Local` is.
+    TbField(String),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Unary(UnOp, Box<Expr>),
     /// `cond ? a : b`. Both backends emit the C++ ternary; port reads
@@ -491,12 +540,32 @@ pub enum Expr {
     /// selecting — port reads are side-effect-free, so this is
     /// observably identical to v1's lazy C++ ternary.
     Ternary(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// Width-method intrinsic (`.trunc<N>()` / `.zext<N>()` /
+    /// `.sext<N>()` / `.resize<N>()`), width ≤ 64 in the lowered
+    /// subset. `src_width` is the best-effort receiver width inferred
+    /// at lowering (typed `let`, `as uint<W>` cast, nested width
+    /// method, literal) — it selects v1's emission shape for
+    /// `sext`/`resize` and `None` selects v1's unknown-width fallback.
+    WidthCast {
+        kind: WidthCastKind,
+        width: u32,
+        src_width: Option<u32>,
+        inner: Box<Expr>,
+    },
     CovBin {
         inst: CovgroupInstance,
         point: String,
         bin: String,
     },
     Call(CallTarget, Vec<Expr>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WidthCastKind {
+    Trunc,
+    Zext,
+    Sext,
+    Resize,
 }
 
 #[derive(Debug, Clone)]
@@ -547,6 +616,13 @@ pub struct PortRef {
     pub direction: Option<PortDirection>,
     pub width: Option<u32>,
     pub access: PortAccess,
+    /// Constant lane index for `dut.<port>[i]` accesses (only literal
+    /// indices are in the lowered subset). Emission routes lanes of
+    /// packed multi-lane ports (the `--sv` `vec_lane_widths` table)
+    /// through `harc_rt::harc_vec_lane_{read,write}<W>`, and true
+    /// unpacked-array ports through a raw C++ subscript — the same
+    /// split as v1's `dut_packed_lane`.
+    pub lane: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -660,6 +736,8 @@ impl Terminator {
             Terminator::Jump(b) => vec![*b],
             Terminator::Branch(_, t, f) => vec![*t, *f],
             Terminator::WaitCycles(_, _, b) => vec![*b],
+            Terminator::WaitCyclesSync(_, b) => vec![*b],
+            Terminator::WaitTimePs(_, b) => vec![*b],
             Terminator::WaitUntil { succ, .. } => vec![*succ],
             Terminator::WaitUntilTimeout {
                 on_fire,

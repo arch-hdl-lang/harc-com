@@ -129,6 +129,7 @@ fn lower_point_target(
                             direction: None,
                             width: None,
                             access: PortAccess::Port,
+                            lane: None,
                         });
                     }
                 }

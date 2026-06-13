@@ -546,5 +546,6 @@ fn bus_port(bind: &str, tail: &[&str]) -> PortRef {
         direction: None,
         width: None,
         access: PortAccess::Port,
+        lane: None,
     }
 }

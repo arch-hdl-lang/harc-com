@@ -1,0 +1,1288 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 LinklistBasicTb { dut: TaskQueue }
+  test LinklistBasicTest tb=tb0 run=fn0 check=- clock=clk@10000ps(SysDomain)
+
+fn fn0 run_LinklistBasicTest [kind=Run, owner=tb0]
+  locals:
+    %0 __t0 : unknown
+    %1 __t1 : unknown
+    %2 __t2 : unknown
+    %3 __t3 : unknown
+    %4 __t4 : unknown
+    %5 h : unknown
+    %6 h_2 : unknown
+    %7 __t5 : unknown
+    %8 handle : unknown
+    %9 __t6 : unknown
+    %10 __t7 : unknown
+    %11 data : unknown
+    %12 __t8 : unknown
+    %13 __t9 : unknown
+    %14 h_3 : unknown
+    %15 h2 : unknown
+    %16 __t10 : unknown
+    %17 __t11 : unknown
+    %18 __t12 : unknown
+    %19 d : unknown
+    %20 v3 : unknown
+    %21 __t13 : unknown
+    %22 __t14 : unknown
+    %23 data_2 : unknown
+    %24 __t15 : unknown
+    %25 __t16 : unknown
+    %26 h_4 : unknown
+    %27 __t17 : unknown
+    %28 data_3 : unknown
+    %29 __t18 : unknown
+    %30 __t19 : unknown
+    %31 h_5 : unknown
+    %32 __t20 : unknown
+    %33 data_4 : unknown
+    %34 __t21 : unknown
+    %35 __t22 : unknown
+    %36 h_6 : unknown
+    %37 __t23 : unknown
+    %38 data_5 : unknown
+    %39 __t24 : unknown
+    %40 __t25 : unknown
+    %41 h_7 : unknown
+    %42 __t26 : unknown
+    %43 __t27 : unknown
+    %44 __t28 : unknown
+    %45 d_2 : unknown
+    %46 __t29 : unknown
+    %47 __t30 : unknown
+    %48 __t31 : unknown
+    %49 d_3 : unknown
+    %50 __t32 : unknown
+    %51 __t33 : unknown
+    %52 __t34 : unknown
+    %53 d_4 : unknown
+    %54 __t35 : unknown
+    %55 __t36 : unknown
+    %56 __t37 : unknown
+    %57 d_5 : unknown
+    %58 __t38 : unknown
+    %59 i : unknown
+    %60 __t39 : unknown
+    %61 data_6 : unknown
+    %62 __t40 : unknown
+    %63 __t41 : unknown
+    %64 h_8 : unknown
+    %65 i_2 : unknown
+    %66 want : unknown
+    %67 __t42 : unknown
+    %68 __t43 : unknown
+    %69 __t44 : unknown
+    %70 d_6 : unknown
+    %71 got : unknown
+    %72 __t45 : unknown
+    %73 __t46 : unknown
+    %74 data_7 : unknown
+    %75 __t47 : unknown
+    %76 __t48 : unknown
+    %77 h_9 : unknown
+    %78 h6 : unknown
+    %79 __t49 : unknown
+    %80 handle_2 : unknown
+    %81 __t50 : unknown
+    %82 __t51 : unknown
+    %83 data_8 : unknown
+    %84 r1 : unknown
+    %85 __t52 : unknown
+    %86 handle_3 : unknown
+    %87 data_9 : unknown
+    %88 __t53 : unknown
+    %89 handle_4 : unknown
+    %90 __t54 : unknown
+    %91 __t55 : unknown
+    %92 data_10 : unknown
+    %93 r2 : unknown
+    %94 __t56 : unknown
+    %95 __t57 : unknown
+    %96 __t58 : unknown
+    %97 d_7 : unknown
+    %98 __t59 : unknown
+    %99 __t60 : unknown
+    %100 __t61 : unknown
+    %101 __t62 : unknown
+    %102 h_10 : unknown
+    %103 a0 : unknown
+    %104 __t63 : unknown
+    %105 __t64 : unknown
+    %106 __t65 : unknown
+    %107 h_11 : unknown
+    %108 a1 : unknown
+    %109 __t66 : unknown
+    %110 __t67 : unknown
+    %111 __t68 : unknown
+    %112 h_12 : unknown
+    %113 a2 : unknown
+    %114 __t69 : unknown
+    %115 __t70 : unknown
+    %116 __t71 : unknown
+    %117 h_13 : unknown
+    %118 a3 : unknown
+    %119 __t72 : unknown
+    %120 __t73 : unknown
+    %121 __t74 : unknown
+    %122 h_14 : unknown
+    %123 a4 : unknown
+    %124 __t75 : unknown
+    %125 __t76 : unknown
+    %126 __t77 : unknown
+    %127 h_15 : unknown
+    %128 a5 : unknown
+    %129 __t78 : unknown
+    %130 __t79 : unknown
+    %131 __t80 : unknown
+    %132 h_16 : unknown
+    %133 a6 : unknown
+    %134 __t81 : unknown
+    %135 __t82 : unknown
+    %136 __t83 : unknown
+    %137 h_17 : unknown
+    %138 a7 : unknown
+    %139 __t84 : unknown
+    %140 handle_5 : unknown
+    %141 __t85 : unknown
+    %142 handle_6 : unknown
+    %143 __t86 : unknown
+    %144 handle_7 : unknown
+    %145 __t87 : unknown
+    %146 handle_8 : unknown
+    %147 __t88 : unknown
+    %148 handle_9 : unknown
+    %149 __t89 : unknown
+    %150 handle_10 : unknown
+    %151 __t90 : unknown
+    %152 handle_11 : unknown
+    %153 __t91 : unknown
+    %154 handle_12 : unknown
+    %155 __t92 : unknown
+    %156 __t93 : unknown
+    %157 data_11 : unknown
+    %158 __t94 : unknown
+    %159 __t95 : unknown
+    %160 h_18 : unknown
+    %161 __t96 : unknown
+    %162 data_12 : unknown
+    %163 __t97 : unknown
+    %164 __t98 : unknown
+    %165 h_19 : unknown
+    %166 __t99 : unknown
+    %167 data_13 : unknown
+    %168 __t100 : unknown
+    %169 __t101 : unknown
+    %170 h_20 : unknown
+    %171 __t102 : unknown
+    %172 __t103 : unknown
+    %173 __t104 : unknown
+    %174 d_8 : unknown
+    %175 __t105 : unknown
+    %176 data_14 : unknown
+    %177 __t106 : unknown
+    %178 __t107 : unknown
+    %179 h_21 : unknown
+    %180 __t108 : unknown
+    %181 data_15 : unknown
+    %182 __t109 : unknown
+    %183 __t110 : unknown
+    %184 h_22 : unknown
+    %185 __t111 : unknown
+    %186 __t112 : unknown
+    %187 __t113 : unknown
+    %188 d_9 : unknown
+    %189 __t114 : unknown
+    %190 __t115 : unknown
+    %191 __t116 : unknown
+    %192 d_10 : unknown
+    %193 __t117 : unknown
+    %194 __t118 : unknown
+    %195 __t119 : unknown
+    %196 d_11 : unknown
+    %197 __t120 : unknown
+    %198 __t121 : unknown
+    %199 __t122 : unknown
+    %200 d_12 : unknown
+  entry = b0
+
+  b0:
+    Assign(%__t0, 0)
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.alloc_req_valid, 0)
+    DutWrite(dut.free_req_valid, 0)
+    DutWrite(dut.free_req_handle, 0)
+    DutWrite(dut.insert_tail_req_valid, 0)
+    DutWrite(dut.insert_tail_req_data, 0)
+    DutWrite(dut.delete_head_req_valid, 0)
+    DutWrite(dut.read_data_req_valid, 0)
+    DutWrite(dut.read_data_req_handle, 0)
+    DutWrite(dut.write_data_req_valid, 0)
+    DutWrite(dut.write_data_req_handle, 0)
+    DutWrite(dut.write_data_req_data, 0)
+    -> WaitCyclesSync(2, b2)
+
+  b1:
+    AssertCheck { cond: (dut.empty == 1), on_fail: "empty=%lld after reset, expected 1", dut.empty }
+    AssertCheck { cond: (dut.full == 0), on_fail: "full=%lld after reset, expected 0", dut.full }
+    AssertCheck { cond: (dut.length == 0), on_fail: "length=%lld after reset, expected 0", dut.length }
+    AssertCheck { cond: (dut.alloc_req_ready == 1), on_fail: "alloc_req_ready=%lld after reset, expected 1", dut.alloc_req_ready }
+    Log(info, "PASS: initial state")
+    Assign(%__t1, 0)
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.alloc_req_valid, 0)
+    DutWrite(dut.free_req_valid, 0)
+    DutWrite(dut.free_req_handle, 0)
+    DutWrite(dut.insert_tail_req_valid, 0)
+    DutWrite(dut.insert_tail_req_data, 0)
+    DutWrite(dut.delete_head_req_valid, 0)
+    DutWrite(dut.read_data_req_valid, 0)
+    DutWrite(dut.read_data_req_handle, 0)
+    DutWrite(dut.write_data_req_valid, 0)
+    DutWrite(dut.write_data_req_handle, 0)
+    DutWrite(dut.write_data_req_data, 0)
+    -> WaitCyclesSync(2, b4)
+
+  b2:
+    DutWrite(dut.rst, 0)
+    -> Jump(b1)
+
+  b3:
+    Assign(%__t2, 0)
+    DutWrite(dut.alloc_req_valid, 1)
+    -> WaitCyclesSync(1, b6)
+
+  b4:
+    DutWrite(dut.rst, 0)
+    -> Jump(b3)
+
+  b5:
+    Assign(%h_2, %__t2)
+    AssertCheck { cond: (%h_2 != 255), on_fail: "alloc returned no handle" }
+    AssertCheck { cond: (dut.length == 1), on_fail: "length=%lld after alloc, expected 1", dut.length }
+    AssertCheck { cond: (dut.empty == 0), on_fail: "empty after alloc" }
+    Assign(%__t5, 0)
+    Assign(%handle, %h_2)
+    DutWrite(dut.free_req_valid, 1)
+    DutWrite(dut.free_req_handle, %handle)
+    -> WaitCyclesSync(1, b9)
+
+  b6:
+    DutWrite(dut.alloc_req_valid, 0)
+    DutRead(%__t3, dut.alloc_resp_valid)
+    DutRead(%__t4, dut.alloc_resp_handle)
+    Assign(%h, (%__t3 ? %__t4 : 255))
+    -> WaitCyclesSync(1, b7)
+
+  b7:
+    Assign(%__t2, %h)
+    -> Jump(b5)
+
+  b8:
+    AssertCheck { cond: (dut.empty == 1), on_fail: "empty=%lld after free, expected 1", dut.empty }
+    Log(info, "PASS: alloc + free")
+    Assign(%__t6, 0)
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.alloc_req_valid, 0)
+    DutWrite(dut.free_req_valid, 0)
+    DutWrite(dut.free_req_handle, 0)
+    DutWrite(dut.insert_tail_req_valid, 0)
+    DutWrite(dut.insert_tail_req_data, 0)
+    DutWrite(dut.delete_head_req_valid, 0)
+    DutWrite(dut.read_data_req_valid, 0)
+    DutWrite(dut.read_data_req_handle, 0)
+    DutWrite(dut.write_data_req_valid, 0)
+    DutWrite(dut.write_data_req_handle, 0)
+    DutWrite(dut.write_data_req_data, 0)
+    -> WaitCyclesSync(2, b12)
+
+  b9:
+    DutWrite(dut.free_req_valid, 0)
+    DutWrite(dut.free_req_handle, 0)
+    -> WaitCyclesSync(1, b10)
+
+  b10:
+    -> Jump(b8)
+
+  b11:
+    Assign(%__t7, 0)
+    Assign(%data, 2882400052)
+    DutWrite(dut.insert_tail_req_valid, 1)
+    DutWrite(dut.insert_tail_req_data, %data)
+    -> WaitCyclesSync(1, b14)
+
+  b12:
+    DutWrite(dut.rst, 0)
+    -> Jump(b11)
+
+  b13:
+    Assign(%h2, %__t7)
+    AssertCheck { cond: (%h2 != 255), on_fail: "insert_tail got no handle" }
+    AssertCheck { cond: (dut.length == 1), on_fail: "length after insert" }
+    Assign(%__t10, 0)
+    DutWrite(dut.delete_head_req_valid, 1)
+    -> WaitCyclesSync(1, b18)
+
+  b14:
+    DutWrite(dut.insert_tail_req_valid, 0)
+    DutWrite(dut.insert_tail_req_data, 0)
+    -> WaitCyclesSync(1, b15)
+
+  b15:
+    DutRead(%__t8, dut.insert_tail_resp_valid)
+    DutRead(%__t9, dut.insert_tail_resp_handle)
+    Assign(%h_3, (%__t8 ? %__t9 : 255))
+    -> WaitCyclesSync(1, b16)
+
+  b16:
+    Assign(%__t7, %h_3)
+    -> Jump(b13)
+
+  b17:
+    Assign(%v3, %__t10)
+    AssertCheck { cond: (%v3 == 2882400052), on_fail: "delete_head got=%08llx, expected 0xABCD1234", %v3 }
+    AssertCheck { cond: (dut.empty == 1), on_fail: "empty after delete" }
+    Log(info, "PASS: insert + delete single")
+    Assign(%__t13, 0)
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.alloc_req_valid, 0)
+    DutWrite(dut.free_req_valid, 0)
+    DutWrite(dut.free_req_handle, 0)
+    DutWrite(dut.insert_tail_req_valid, 0)
+    DutWrite(dut.insert_tail_req_data, 0)
+    DutWrite(dut.delete_head_req_valid, 0)
+    DutWrite(dut.read_data_req_valid, 0)
+    DutWrite(dut.read_data_req_handle, 0)
+    DutWrite(dut.write_data_req_valid, 0)
+    DutWrite(dut.write_data_req_handle, 0)
+    DutWrite(dut.write_data_req_data, 0)
+    -> WaitCyclesSync(2, b22)
+
+  b18:
+    DutWrite(dut.delete_head_req_valid, 0)
+    -> WaitCyclesSync(1, b19)
+
+  b19:
+    DutRead(%__t11, dut.delete_head_resp_valid)
+    DutRead(%__t12, dut.delete_head_resp_data)
+    Assign(%d, (%__t11 ? %__t12 : 57005))
+    -> WaitCyclesSync(1, b20)
+
+  b20:
+    Assign(%__t10, %d)
+    -> Jump(b17)
+
+  b21:
+    Assign(%__t14, 0)
+    Assign(%data_2, 10)
+    DutWrite(dut.insert_tail_req_valid, 1)
+    DutWrite(dut.insert_tail_req_data, %data_2)
+    -> WaitCyclesSync(1, b24)
+
+  b22:
+    DutWrite(dut.rst, 0)
+    -> Jump(b21)
+
+  b23:
+    Assign(%__t17, 0)
+    Assign(%data_3, 20)
+    DutWrite(dut.insert_tail_req_valid, 1)
+    DutWrite(dut.insert_tail_req_data, %data_3)
+    -> WaitCyclesSync(1, b28)
+
+  b24:
+    DutWrite(dut.insert_tail_req_valid, 0)
+    DutWrite(dut.insert_tail_req_data, 0)
+    -> WaitCyclesSync(1, b25)
+
+  b25:
+    DutRead(%__t15, dut.insert_tail_resp_valid)
+    DutRead(%__t16, dut.insert_tail_resp_handle)
+    Assign(%h_4, (%__t15 ? %__t16 : 255))
+    -> WaitCyclesSync(1, b26)
+
+  b26:
+    Assign(%__t14, %h_4)
+    -> Jump(b23)
+
+  b27:
+    Assign(%__t20, 0)
+    Assign(%data_4, 30)
+    DutWrite(dut.insert_tail_req_valid, 1)
+    DutWrite(dut.insert_tail_req_data, %data_4)
+    -> WaitCyclesSync(1, b32)
+
+  b28:
+    DutWrite(dut.insert_tail_req_valid, 0)
+    DutWrite(dut.insert_tail_req_data, 0)
+    -> WaitCyclesSync(1, b29)
+
+  b29:
+    DutRead(%__t18, dut.insert_tail_resp_valid)
+    DutRead(%__t19, dut.insert_tail_resp_handle)
+    Assign(%h_5, (%__t18 ? %__t19 : 255))
+    -> WaitCyclesSync(1, b30)
+
+  b30:
+    Assign(%__t17, %h_5)
+    -> Jump(b27)
+
+  b31:
+    Assign(%__t23, 0)
+    Assign(%data_5, 40)
+    DutWrite(dut.insert_tail_req_valid, 1)
+    DutWrite(dut.insert_tail_req_data, %data_5)
+    -> WaitCyclesSync(1, b36)
+
+  b32:
+    DutWrite(dut.insert_tail_req_valid, 0)
+    DutWrite(dut.insert_tail_req_data, 0)
+    -> WaitCyclesSync(1, b33)
+
+  b33:
+    DutRead(%__t21, dut.insert_tail_resp_valid)
+    DutRead(%__t22, dut.insert_tail_resp_handle)
+    Assign(%h_6, (%__t21 ? %__t22 : 255))
+    -> WaitCyclesSync(1, b34)
+
+  b34:
+    Assign(%__t20, %h_6)
+    -> Jump(b31)
+
+  b35:
+    AssertCheck { cond: (dut.length == 4), on_fail: "length=%lld after 4 inserts", dut.length }
+    Assign(%__t26, 0)
+    DutWrite(dut.delete_head_req_valid, 1)
+    -> WaitCyclesSync(1, b40)
+
+  b36:
+    DutWrite(dut.insert_tail_req_valid, 0)
+    DutWrite(dut.insert_tail_req_data, 0)
+    -> WaitCyclesSync(1, b37)
+
+  b37:
+    DutRead(%__t24, dut.insert_tail_resp_valid)
+    DutRead(%__t25, dut.insert_tail_resp_handle)
+    Assign(%h_7, (%__t24 ? %__t25 : 255))
+    -> WaitCyclesSync(1, b38)
+
+  b38:
+    Assign(%__t23, %h_7)
+    -> Jump(b35)
+
+  b39:
+    AssertCheck { cond: (%__t26 == 10), on_fail: "FIFO[0]" }
+    Assign(%__t29, 0)
+    DutWrite(dut.delete_head_req_valid, 1)
+    -> WaitCyclesSync(1, b44)
+
+  b40:
+    DutWrite(dut.delete_head_req_valid, 0)
+    -> WaitCyclesSync(1, b41)
+
+  b41:
+    DutRead(%__t27, dut.delete_head_resp_valid)
+    DutRead(%__t28, dut.delete_head_resp_data)
+    Assign(%d_2, (%__t27 ? %__t28 : 57005))
+    -> WaitCyclesSync(1, b42)
+
+  b42:
+    Assign(%__t26, %d_2)
+    -> Jump(b39)
+
+  b43:
+    AssertCheck { cond: (%__t29 == 20), on_fail: "FIFO[1]" }
+    Assign(%__t32, 0)
+    DutWrite(dut.delete_head_req_valid, 1)
+    -> WaitCyclesSync(1, b48)
+
+  b44:
+    DutWrite(dut.delete_head_req_valid, 0)
+    -> WaitCyclesSync(1, b45)
+
+  b45:
+    DutRead(%__t30, dut.delete_head_resp_valid)
+    DutRead(%__t31, dut.delete_head_resp_data)
+    Assign(%d_3, (%__t30 ? %__t31 : 57005))
+    -> WaitCyclesSync(1, b46)
+
+  b46:
+    Assign(%__t29, %d_3)
+    -> Jump(b43)
+
+  b47:
+    AssertCheck { cond: (%__t32 == 30), on_fail: "FIFO[2]" }
+    Assign(%__t35, 0)
+    DutWrite(dut.delete_head_req_valid, 1)
+    -> WaitCyclesSync(1, b52)
+
+  b48:
+    DutWrite(dut.delete_head_req_valid, 0)
+    -> WaitCyclesSync(1, b49)
+
+  b49:
+    DutRead(%__t33, dut.delete_head_resp_valid)
+    DutRead(%__t34, dut.delete_head_resp_data)
+    Assign(%d_4, (%__t33 ? %__t34 : 57005))
+    -> WaitCyclesSync(1, b50)
+
+  b50:
+    Assign(%__t32, %d_4)
+    -> Jump(b47)
+
+  b51:
+    AssertCheck { cond: (%__t35 == 40), on_fail: "FIFO[3]" }
+    AssertCheck { cond: (dut.empty == 1), on_fail: "empty after 4-drain" }
+    Log(info, "PASS: FIFO order across 4 inserts")
+    Assign(%__t38, 0)
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.alloc_req_valid, 0)
+    DutWrite(dut.free_req_valid, 0)
+    DutWrite(dut.free_req_handle, 0)
+    DutWrite(dut.insert_tail_req_valid, 0)
+    DutWrite(dut.insert_tail_req_data, 0)
+    DutWrite(dut.delete_head_req_valid, 0)
+    DutWrite(dut.read_data_req_valid, 0)
+    DutWrite(dut.read_data_req_handle, 0)
+    DutWrite(dut.write_data_req_valid, 0)
+    DutWrite(dut.write_data_req_handle, 0)
+    DutWrite(dut.write_data_req_data, 0)
+    -> WaitCyclesSync(2, b56)
+
+  b52:
+    DutWrite(dut.delete_head_req_valid, 0)
+    -> WaitCyclesSync(1, b53)
+
+  b53:
+    DutRead(%__t36, dut.delete_head_resp_valid)
+    DutRead(%__t37, dut.delete_head_resp_data)
+    Assign(%d_5, (%__t36 ? %__t37 : 57005))
+    -> WaitCyclesSync(1, b54)
+
+  b54:
+    Assign(%__t35, %d_5)
+    -> Jump(b51)
+
+  b55:
+    Assign(%i, 0)
+    -> Jump(b57)
+
+  b56:
+    DutWrite(dut.rst, 0)
+    -> Jump(b55)
+
+  b57:
+    -> Branch((%i < 8), b58, b60)
+
+  b58:
+    Assign(%__t39, 0)
+    Assign(%data_6, (256 + %i))
+    DutWrite(dut.insert_tail_req_valid, 1)
+    DutWrite(dut.insert_tail_req_data, %data_6)
+    -> WaitCyclesSync(1, b62)
+
+  b59:
+    Assign(%i, (%i + 1))
+    -> Jump(b57)
+
+  b60:
+    AssertCheck { cond: (dut.full == 1), on_fail: "full after 8 inserts" }
+    AssertCheck { cond: (dut.length == 8), on_fail: "length=%lld, expected 8", dut.length }
+    AssertCheck { cond: (dut.insert_tail_req_ready == 0), on_fail: "insert_tail_req_ready should be 0 when full" }
+    Assign(%i_2, 0)
+    -> Jump(b65)
+
+  b61:
+    -> Jump(b59)
+
+  b62:
+    DutWrite(dut.insert_tail_req_valid, 0)
+    DutWrite(dut.insert_tail_req_data, 0)
+    -> WaitCyclesSync(1, b63)
+
+  b63:
+    DutRead(%__t40, dut.insert_tail_resp_valid)
+    DutRead(%__t41, dut.insert_tail_resp_handle)
+    Assign(%h_8, (%__t40 ? %__t41 : 255))
+    -> WaitCyclesSync(1, b64)
+
+  b64:
+    Assign(%__t39, %h_8)
+    -> Jump(b61)
+
+  b65:
+    -> Branch((%i_2 < 8), b66, b68)
+
+  b66:
+    Assign(%want, (256 + %i_2))
+    Assign(%__t42, 0)
+    DutWrite(dut.delete_head_req_valid, 1)
+    -> WaitCyclesSync(1, b70)
+
+  b67:
+    Assign(%i_2, (%i_2 + 1))
+    -> Jump(b65)
+
+  b68:
+    AssertCheck { cond: (dut.empty == 1), on_fail: "empty after full drain" }
+    Log(info, "PASS: fill to capacity + ordered drain")
+    Assign(%__t45, 0)
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.alloc_req_valid, 0)
+    DutWrite(dut.free_req_valid, 0)
+    DutWrite(dut.free_req_handle, 0)
+    DutWrite(dut.insert_tail_req_valid, 0)
+    DutWrite(dut.insert_tail_req_data, 0)
+    DutWrite(dut.delete_head_req_valid, 0)
+    DutWrite(dut.read_data_req_valid, 0)
+    DutWrite(dut.read_data_req_handle, 0)
+    DutWrite(dut.write_data_req_valid, 0)
+    DutWrite(dut.write_data_req_handle, 0)
+    DutWrite(dut.write_data_req_data, 0)
+    -> WaitCyclesSync(2, b74)
+
+  b69:
+    Assign(%got, %__t42)
+    AssertCheck { cond: (%got == %want), on_fail: "drain[%lld]: got=%08llx expected=%08llx", %i_2, %got, %want }
+    -> Jump(b67)
+
+  b70:
+    DutWrite(dut.delete_head_req_valid, 0)
+    -> WaitCyclesSync(1, b71)
+
+  b71:
+    DutRead(%__t43, dut.delete_head_resp_valid)
+    DutRead(%__t44, dut.delete_head_resp_data)
+    Assign(%d_6, (%__t43 ? %__t44 : 57005))
+    -> WaitCyclesSync(1, b72)
+
+  b72:
+    Assign(%__t42, %d_6)
+    -> Jump(b69)
+
+  b73:
+    Assign(%__t46, 0)
+    Assign(%data_7, 3735928559)
+    DutWrite(dut.insert_tail_req_valid, 1)
+    DutWrite(dut.insert_tail_req_data, %data_7)
+    -> WaitCyclesSync(1, b76)
+
+  b74:
+    DutWrite(dut.rst, 0)
+    -> Jump(b73)
+
+  b75:
+    Assign(%h6, %__t46)
+    Assign(%__t49, 0)
+    Assign(%handle_2, %h6)
+    DutWrite(dut.read_data_req_valid, 1)
+    DutWrite(dut.read_data_req_handle, %handle_2)
+    -> WaitCyclesSync(1, b80)
+
+  b76:
+    DutWrite(dut.insert_tail_req_valid, 0)
+    DutWrite(dut.insert_tail_req_data, 0)
+    -> WaitCyclesSync(1, b77)
+
+  b77:
+    DutRead(%__t47, dut.insert_tail_resp_valid)
+    DutRead(%__t48, dut.insert_tail_resp_handle)
+    Assign(%h_9, (%__t47 ? %__t48 : 255))
+    -> WaitCyclesSync(1, b78)
+
+  b78:
+    Assign(%__t46, %h_9)
+    -> Jump(b75)
+
+  b79:
+    Assign(%r1, %__t49)
+    AssertCheck { cond: (%r1 == 3735928559), on_fail: "read_data initial: got=%08llx, expected 0xDEADBEEF", %r1 }
+    Assign(%__t52, 0)
+    Assign(%handle_3, %h6)
+    Assign(%data_9, 3405691582)
+    DutWrite(dut.write_data_req_valid, 1)
+    DutWrite(dut.write_data_req_handle, %handle_3)
+    DutWrite(dut.write_data_req_data, %data_9)
+    -> WaitCyclesSync(1, b83)
+
+  b80:
+    DutRead(%__t50, dut.read_data_resp_valid)
+    DutRead(%__t51, dut.read_data_resp_data)
+    Assign(%data_8, (%__t50 ? %__t51 : 57005))
+    DutWrite(dut.read_data_req_valid, 0)
+    DutWrite(dut.read_data_req_handle, 0)
+    -> WaitCyclesSync(1, b81)
+
+  b81:
+    Assign(%__t49, %data_8)
+    -> Jump(b79)
+
+  b82:
+    Assign(%__t53, 0)
+    Assign(%handle_4, %h6)
+    DutWrite(dut.read_data_req_valid, 1)
+    DutWrite(dut.read_data_req_handle, %handle_4)
+    -> WaitCyclesSync(1, b86)
+
+  b83:
+    DutWrite(dut.write_data_req_valid, 0)
+    DutWrite(dut.write_data_req_handle, 0)
+    DutWrite(dut.write_data_req_data, 0)
+    -> WaitCyclesSync(1, b84)
+
+  b84:
+    -> Jump(b82)
+
+  b85:
+    Assign(%r2, %__t53)
+    AssertCheck { cond: (%r2 == 3405691582), on_fail: "read_data after write: got=%08llx, expected 0xCAFEBABE", %r2 }
+    Assign(%__t56, 0)
+    DutWrite(dut.delete_head_req_valid, 1)
+    -> WaitCyclesSync(1, b89)
+
+  b86:
+    DutRead(%__t54, dut.read_data_resp_valid)
+    DutRead(%__t55, dut.read_data_resp_data)
+    Assign(%data_10, (%__t54 ? %__t55 : 57005))
+    DutWrite(dut.read_data_req_valid, 0)
+    DutWrite(dut.read_data_req_handle, 0)
+    -> WaitCyclesSync(1, b87)
+
+  b87:
+    Assign(%__t53, %data_10)
+    -> Jump(b85)
+
+  b88:
+    Log(info, "PASS: read/write data")
+    Assign(%__t59, 0)
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.alloc_req_valid, 0)
+    DutWrite(dut.free_req_valid, 0)
+    DutWrite(dut.free_req_handle, 0)
+    DutWrite(dut.insert_tail_req_valid, 0)
+    DutWrite(dut.insert_tail_req_data, 0)
+    DutWrite(dut.delete_head_req_valid, 0)
+    DutWrite(dut.read_data_req_valid, 0)
+    DutWrite(dut.read_data_req_handle, 0)
+    DutWrite(dut.write_data_req_valid, 0)
+    DutWrite(dut.write_data_req_handle, 0)
+    DutWrite(dut.write_data_req_data, 0)
+    -> WaitCyclesSync(2, b93)
+
+  b89:
+    DutWrite(dut.delete_head_req_valid, 0)
+    -> WaitCyclesSync(1, b90)
+
+  b90:
+    DutRead(%__t57, dut.delete_head_resp_valid)
+    DutRead(%__t58, dut.delete_head_resp_data)
+    Assign(%d_7, (%__t57 ? %__t58 : 57005))
+    -> WaitCyclesSync(1, b91)
+
+  b91:
+    Assign(%__t56, %d_7)
+    -> Jump(b88)
+
+  b92:
+    Assign(%__t60, 0)
+    DutWrite(dut.alloc_req_valid, 1)
+    -> WaitCyclesSync(1, b95)
+
+  b93:
+    DutWrite(dut.rst, 0)
+    -> Jump(b92)
+
+  b94:
+    Assign(%a0, %__t60)
+    Assign(%__t63, 0)
+    DutWrite(dut.alloc_req_valid, 1)
+    -> WaitCyclesSync(1, b98)
+
+  b95:
+    DutWrite(dut.alloc_req_valid, 0)
+    DutRead(%__t61, dut.alloc_resp_valid)
+    DutRead(%__t62, dut.alloc_resp_handle)
+    Assign(%h_10, (%__t61 ? %__t62 : 255))
+    -> WaitCyclesSync(1, b96)
+
+  b96:
+    Assign(%__t60, %h_10)
+    -> Jump(b94)
+
+  b97:
+    Assign(%a1, %__t63)
+    Assign(%__t66, 0)
+    DutWrite(dut.alloc_req_valid, 1)
+    -> WaitCyclesSync(1, b101)
+
+  b98:
+    DutWrite(dut.alloc_req_valid, 0)
+    DutRead(%__t64, dut.alloc_resp_valid)
+    DutRead(%__t65, dut.alloc_resp_handle)
+    Assign(%h_11, (%__t64 ? %__t65 : 255))
+    -> WaitCyclesSync(1, b99)
+
+  b99:
+    Assign(%__t63, %h_11)
+    -> Jump(b97)
+
+  b100:
+    Assign(%a2, %__t66)
+    Assign(%__t69, 0)
+    DutWrite(dut.alloc_req_valid, 1)
+    -> WaitCyclesSync(1, b104)
+
+  b101:
+    DutWrite(dut.alloc_req_valid, 0)
+    DutRead(%__t67, dut.alloc_resp_valid)
+    DutRead(%__t68, dut.alloc_resp_handle)
+    Assign(%h_12, (%__t67 ? %__t68 : 255))
+    -> WaitCyclesSync(1, b102)
+
+  b102:
+    Assign(%__t66, %h_12)
+    -> Jump(b100)
+
+  b103:
+    Assign(%a3, %__t69)
+    Assign(%__t72, 0)
+    DutWrite(dut.alloc_req_valid, 1)
+    -> WaitCyclesSync(1, b107)
+
+  b104:
+    DutWrite(dut.alloc_req_valid, 0)
+    DutRead(%__t70, dut.alloc_resp_valid)
+    DutRead(%__t71, dut.alloc_resp_handle)
+    Assign(%h_13, (%__t70 ? %__t71 : 255))
+    -> WaitCyclesSync(1, b105)
+
+  b105:
+    Assign(%__t69, %h_13)
+    -> Jump(b103)
+
+  b106:
+    Assign(%a4, %__t72)
+    Assign(%__t75, 0)
+    DutWrite(dut.alloc_req_valid, 1)
+    -> WaitCyclesSync(1, b110)
+
+  b107:
+    DutWrite(dut.alloc_req_valid, 0)
+    DutRead(%__t73, dut.alloc_resp_valid)
+    DutRead(%__t74, dut.alloc_resp_handle)
+    Assign(%h_14, (%__t73 ? %__t74 : 255))
+    -> WaitCyclesSync(1, b108)
+
+  b108:
+    Assign(%__t72, %h_14)
+    -> Jump(b106)
+
+  b109:
+    Assign(%a5, %__t75)
+    Assign(%__t78, 0)
+    DutWrite(dut.alloc_req_valid, 1)
+    -> WaitCyclesSync(1, b113)
+
+  b110:
+    DutWrite(dut.alloc_req_valid, 0)
+    DutRead(%__t76, dut.alloc_resp_valid)
+    DutRead(%__t77, dut.alloc_resp_handle)
+    Assign(%h_15, (%__t76 ? %__t77 : 255))
+    -> WaitCyclesSync(1, b111)
+
+  b111:
+    Assign(%__t75, %h_15)
+    -> Jump(b109)
+
+  b112:
+    Assign(%a6, %__t78)
+    Assign(%__t81, 0)
+    DutWrite(dut.alloc_req_valid, 1)
+    -> WaitCyclesSync(1, b116)
+
+  b113:
+    DutWrite(dut.alloc_req_valid, 0)
+    DutRead(%__t79, dut.alloc_resp_valid)
+    DutRead(%__t80, dut.alloc_resp_handle)
+    Assign(%h_16, (%__t79 ? %__t80 : 255))
+    -> WaitCyclesSync(1, b114)
+
+  b114:
+    Assign(%__t78, %h_16)
+    -> Jump(b112)
+
+  b115:
+    Assign(%a7, %__t81)
+    AssertCheck { cond: (dut.alloc_req_ready == 0), on_fail: "alloc_req_ready should be 0 with no free slots" }
+    AssertCheck { cond: (dut.length == 8), on_fail: "length=%lld when all allocated", dut.length }
+    Assign(%__t84, 0)
+    Assign(%handle_5, %a0)
+    DutWrite(dut.free_req_valid, 1)
+    DutWrite(dut.free_req_handle, %handle_5)
+    -> WaitCyclesSync(1, b119)
+
+  b116:
+    DutWrite(dut.alloc_req_valid, 0)
+    DutRead(%__t82, dut.alloc_resp_valid)
+    DutRead(%__t83, dut.alloc_resp_handle)
+    Assign(%h_17, (%__t82 ? %__t83 : 255))
+    -> WaitCyclesSync(1, b117)
+
+  b117:
+    Assign(%__t81, %h_17)
+    -> Jump(b115)
+
+  b118:
+    Assign(%__t85, 0)
+    Assign(%handle_6, %a1)
+    DutWrite(dut.free_req_valid, 1)
+    DutWrite(dut.free_req_handle, %handle_6)
+    -> WaitCyclesSync(1, b122)
+
+  b119:
+    DutWrite(dut.free_req_valid, 0)
+    DutWrite(dut.free_req_handle, 0)
+    -> WaitCyclesSync(1, b120)
+
+  b120:
+    -> Jump(b118)
+
+  b121:
+    Assign(%__t86, 0)
+    Assign(%handle_7, %a2)
+    DutWrite(dut.free_req_valid, 1)
+    DutWrite(dut.free_req_handle, %handle_7)
+    -> WaitCyclesSync(1, b125)
+
+  b122:
+    DutWrite(dut.free_req_valid, 0)
+    DutWrite(dut.free_req_handle, 0)
+    -> WaitCyclesSync(1, b123)
+
+  b123:
+    -> Jump(b121)
+
+  b124:
+    Assign(%__t87, 0)
+    Assign(%handle_8, %a3)
+    DutWrite(dut.free_req_valid, 1)
+    DutWrite(dut.free_req_handle, %handle_8)
+    -> WaitCyclesSync(1, b128)
+
+  b125:
+    DutWrite(dut.free_req_valid, 0)
+    DutWrite(dut.free_req_handle, 0)
+    -> WaitCyclesSync(1, b126)
+
+  b126:
+    -> Jump(b124)
+
+  b127:
+    Assign(%__t88, 0)
+    Assign(%handle_9, %a4)
+    DutWrite(dut.free_req_valid, 1)
+    DutWrite(dut.free_req_handle, %handle_9)
+    -> WaitCyclesSync(1, b131)
+
+  b128:
+    DutWrite(dut.free_req_valid, 0)
+    DutWrite(dut.free_req_handle, 0)
+    -> WaitCyclesSync(1, b129)
+
+  b129:
+    -> Jump(b127)
+
+  b130:
+    Assign(%__t89, 0)
+    Assign(%handle_10, %a5)
+    DutWrite(dut.free_req_valid, 1)
+    DutWrite(dut.free_req_handle, %handle_10)
+    -> WaitCyclesSync(1, b134)
+
+  b131:
+    DutWrite(dut.free_req_valid, 0)
+    DutWrite(dut.free_req_handle, 0)
+    -> WaitCyclesSync(1, b132)
+
+  b132:
+    -> Jump(b130)
+
+  b133:
+    Assign(%__t90, 0)
+    Assign(%handle_11, %a6)
+    DutWrite(dut.free_req_valid, 1)
+    DutWrite(dut.free_req_handle, %handle_11)
+    -> WaitCyclesSync(1, b137)
+
+  b134:
+    DutWrite(dut.free_req_valid, 0)
+    DutWrite(dut.free_req_handle, 0)
+    -> WaitCyclesSync(1, b135)
+
+  b135:
+    -> Jump(b133)
+
+  b136:
+    Assign(%__t91, 0)
+    Assign(%handle_12, %a7)
+    DutWrite(dut.free_req_valid, 1)
+    DutWrite(dut.free_req_handle, %handle_12)
+    -> WaitCyclesSync(1, b140)
+
+  b137:
+    DutWrite(dut.free_req_valid, 0)
+    DutWrite(dut.free_req_handle, 0)
+    -> WaitCyclesSync(1, b138)
+
+  b138:
+    -> Jump(b136)
+
+  b139:
+    AssertCheck { cond: (dut.alloc_req_ready == 1), on_fail: "alloc_req_ready should restore to 1 after frees" }
+    Log(info, "PASS: alloc/free cycle")
+    Assign(%__t92, 0)
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.alloc_req_valid, 0)
+    DutWrite(dut.free_req_valid, 0)
+    DutWrite(dut.free_req_handle, 0)
+    DutWrite(dut.insert_tail_req_valid, 0)
+    DutWrite(dut.insert_tail_req_data, 0)
+    DutWrite(dut.delete_head_req_valid, 0)
+    DutWrite(dut.read_data_req_valid, 0)
+    DutWrite(dut.read_data_req_handle, 0)
+    DutWrite(dut.write_data_req_valid, 0)
+    DutWrite(dut.write_data_req_handle, 0)
+    DutWrite(dut.write_data_req_data, 0)
+    -> WaitCyclesSync(2, b143)
+
+  b140:
+    DutWrite(dut.free_req_valid, 0)
+    DutWrite(dut.free_req_handle, 0)
+    -> WaitCyclesSync(1, b141)
+
+  b141:
+    -> Jump(b139)
+
+  b142:
+    Assign(%__t93, 0)
+    Assign(%data_11, 1)
+    DutWrite(dut.insert_tail_req_valid, 1)
+    DutWrite(dut.insert_tail_req_data, %data_11)
+    -> WaitCyclesSync(1, b145)
+
+  b143:
+    DutWrite(dut.rst, 0)
+    -> Jump(b142)
+
+  b144:
+    Assign(%__t96, 0)
+    Assign(%data_12, 2)
+    DutWrite(dut.insert_tail_req_valid, 1)
+    DutWrite(dut.insert_tail_req_data, %data_12)
+    -> WaitCyclesSync(1, b149)
+
+  b145:
+    DutWrite(dut.insert_tail_req_valid, 0)
+    DutWrite(dut.insert_tail_req_data, 0)
+    -> WaitCyclesSync(1, b146)
+
+  b146:
+    DutRead(%__t94, dut.insert_tail_resp_valid)
+    DutRead(%__t95, dut.insert_tail_resp_handle)
+    Assign(%h_18, (%__t94 ? %__t95 : 255))
+    -> WaitCyclesSync(1, b147)
+
+  b147:
+    Assign(%__t93, %h_18)
+    -> Jump(b144)
+
+  b148:
+    Assign(%__t99, 0)
+    Assign(%data_13, 3)
+    DutWrite(dut.insert_tail_req_valid, 1)
+    DutWrite(dut.insert_tail_req_data, %data_13)
+    -> WaitCyclesSync(1, b153)
+
+  b149:
+    DutWrite(dut.insert_tail_req_valid, 0)
+    DutWrite(dut.insert_tail_req_data, 0)
+    -> WaitCyclesSync(1, b150)
+
+  b150:
+    DutRead(%__t97, dut.insert_tail_resp_valid)
+    DutRead(%__t98, dut.insert_tail_resp_handle)
+    Assign(%h_19, (%__t97 ? %__t98 : 255))
+    -> WaitCyclesSync(1, b151)
+
+  b151:
+    Assign(%__t96, %h_19)
+    -> Jump(b148)
+
+  b152:
+    Assign(%__t102, 0)
+    DutWrite(dut.delete_head_req_valid, 1)
+    -> WaitCyclesSync(1, b157)
+
+  b153:
+    DutWrite(dut.insert_tail_req_valid, 0)
+    DutWrite(dut.insert_tail_req_data, 0)
+    -> WaitCyclesSync(1, b154)
+
+  b154:
+    DutRead(%__t100, dut.insert_tail_resp_valid)
+    DutRead(%__t101, dut.insert_tail_resp_handle)
+    Assign(%h_20, (%__t100 ? %__t101 : 255))
+    -> WaitCyclesSync(1, b155)
+
+  b155:
+    Assign(%__t99, %h_20)
+    -> Jump(b152)
+
+  b156:
+    AssertCheck { cond: (%__t102 == 1), on_fail: "interleaved[0]" }
+    Assign(%__t105, 0)
+    Assign(%data_14, 4)
+    DutWrite(dut.insert_tail_req_valid, 1)
+    DutWrite(dut.insert_tail_req_data, %data_14)
+    -> WaitCyclesSync(1, b161)
+
+  b157:
+    DutWrite(dut.delete_head_req_valid, 0)
+    -> WaitCyclesSync(1, b158)
+
+  b158:
+    DutRead(%__t103, dut.delete_head_resp_valid)
+    DutRead(%__t104, dut.delete_head_resp_data)
+    Assign(%d_8, (%__t103 ? %__t104 : 57005))
+    -> WaitCyclesSync(1, b159)
+
+  b159:
+    Assign(%__t102, %d_8)
+    -> Jump(b156)
+
+  b160:
+    Assign(%__t108, 0)
+    Assign(%data_15, 5)
+    DutWrite(dut.insert_tail_req_valid, 1)
+    DutWrite(dut.insert_tail_req_data, %data_15)
+    -> WaitCyclesSync(1, b165)
+
+  b161:
+    DutWrite(dut.insert_tail_req_valid, 0)
+    DutWrite(dut.insert_tail_req_data, 0)
+    -> WaitCyclesSync(1, b162)
+
+  b162:
+    DutRead(%__t106, dut.insert_tail_resp_valid)
+    DutRead(%__t107, dut.insert_tail_resp_handle)
+    Assign(%h_21, (%__t106 ? %__t107 : 255))
+    -> WaitCyclesSync(1, b163)
+
+  b163:
+    Assign(%__t105, %h_21)
+    -> Jump(b160)
+
+  b164:
+    Assign(%__t111, 0)
+    DutWrite(dut.delete_head_req_valid, 1)
+    -> WaitCyclesSync(1, b169)
+
+  b165:
+    DutWrite(dut.insert_tail_req_valid, 0)
+    DutWrite(dut.insert_tail_req_data, 0)
+    -> WaitCyclesSync(1, b166)
+
+  b166:
+    DutRead(%__t109, dut.insert_tail_resp_valid)
+    DutRead(%__t110, dut.insert_tail_resp_handle)
+    Assign(%h_22, (%__t109 ? %__t110 : 255))
+    -> WaitCyclesSync(1, b167)
+
+  b167:
+    Assign(%__t108, %h_22)
+    -> Jump(b164)
+
+  b168:
+    AssertCheck { cond: (%__t111 == 2), on_fail: "interleaved[1]" }
+    Assign(%__t114, 0)
+    DutWrite(dut.delete_head_req_valid, 1)
+    -> WaitCyclesSync(1, b173)
+
+  b169:
+    DutWrite(dut.delete_head_req_valid, 0)
+    -> WaitCyclesSync(1, b170)
+
+  b170:
+    DutRead(%__t112, dut.delete_head_resp_valid)
+    DutRead(%__t113, dut.delete_head_resp_data)
+    Assign(%d_9, (%__t112 ? %__t113 : 57005))
+    -> WaitCyclesSync(1, b171)
+
+  b171:
+    Assign(%__t111, %d_9)
+    -> Jump(b168)
+
+  b172:
+    AssertCheck { cond: (%__t114 == 3), on_fail: "interleaved[2]" }
+    Assign(%__t117, 0)
+    DutWrite(dut.delete_head_req_valid, 1)
+    -> WaitCyclesSync(1, b177)
+
+  b173:
+    DutWrite(dut.delete_head_req_valid, 0)
+    -> WaitCyclesSync(1, b174)
+
+  b174:
+    DutRead(%__t115, dut.delete_head_resp_valid)
+    DutRead(%__t116, dut.delete_head_resp_data)
+    Assign(%d_10, (%__t115 ? %__t116 : 57005))
+    -> WaitCyclesSync(1, b175)
+
+  b175:
+    Assign(%__t114, %d_10)
+    -> Jump(b172)
+
+  b176:
+    AssertCheck { cond: (%__t117 == 4), on_fail: "interleaved[3]" }
+    Assign(%__t120, 0)
+    DutWrite(dut.delete_head_req_valid, 1)
+    -> WaitCyclesSync(1, b181)
+
+  b177:
+    DutWrite(dut.delete_head_req_valid, 0)
+    -> WaitCyclesSync(1, b178)
+
+  b178:
+    DutRead(%__t118, dut.delete_head_resp_valid)
+    DutRead(%__t119, dut.delete_head_resp_data)
+    Assign(%d_11, (%__t118 ? %__t119 : 57005))
+    -> WaitCyclesSync(1, b179)
+
+  b179:
+    Assign(%__t117, %d_11)
+    -> Jump(b176)
+
+  b180:
+    AssertCheck { cond: (%__t120 == 5), on_fail: "interleaved[4]" }
+    AssertCheck { cond: (dut.empty == 1), on_fail: "empty after interleaved" }
+    Log(info, "PASS: interleaved insert/delete")
+    -> Return
+
+  b181:
+    DutWrite(dut.delete_head_req_valid, 0)
+    -> WaitCyclesSync(1, b182)
+
+  b182:
+    DutRead(%__t121, dut.delete_head_resp_valid)
+    DutRead(%__t122, dut.delete_head_resp_data)
+    Assign(%d_12, (%__t121 ? %__t122 : 57005))
+    -> WaitCyclesSync(1, b183)
+
+  b183:
+    Assign(%__t120, %d_12)
+    -> Jump(b180)

@@ -7,6 +7,10 @@ Amended the same day by the `transaction` slice — see the resolved
 `transactor` slice (resolved group + residual map below; 8 fixtures
 registered, plus one newly-lowerable-but-divergent fixture recorded
 under the singleton table).
+singleton-blocker batch (see the resolved singleton table below: 11
+new registry rows across 9 fixtures; `mshr_cocotb_test` moved to the
+`transactor` group and `keep_constraints_test` to the
+`randomize` seam).
 
 **This file is a snapshot, not a source of truth.** The registry
 (`tests/tbir_equiv_fixtures.txt`) is the source of truth for what is
@@ -94,6 +98,10 @@ several constructs (bus + scoreboard + sequencer + events); the
 counts will keep shifting as those slices land. The 2 transactor-
 specific residuals (`axilite_hooks_test`, `aes_cipher_top_test`) stay
 with this construct's owner.
+
+*+ `mshr_cocotb_test` (moved here 2026-06-12 by the singleton batch:
+its former `const` blocker is resolved, the next blocker is its
+`MshrXactor` transactor).*
 
 ### `transaction` construct — RESOLVED 2026-06-12 (transaction slice)
 
@@ -190,29 +198,39 @@ both constructs are needed.)
 
 `probe_basic_test`, `probe_force_test`, `testbench_probe_dut_test`
 
-### Method call `.reset(...)` — 2 fixtures (1 file)
+### Method call `.reset(...)` — 2 fixtures (1 file) — **RESOLVED 2026-06-12**
 
-> TB-IR lowering does not support method call `.reset(...)` yet
+> ~~TB-IR lowering does not support method call `.reset(...)` yet~~
 
 `testbench_basic_test` (both `--test` structs: `TestbenchSmoke`,
-`TestbenchEnableToggle`)
+`TestbenchEnableToggle`) — testbench helper methods
+(`function`/`hookable` declared in the bound testbench) now CFG-inline
+at `_tb.<m>(...)` call sites like impure helpers. Both structs pass
+the equivalence pair and are registered (via the schema-v3
+`test_struct` column).
 
-### Testbench field with non-named type — 2 fixtures (1 file)
+### Testbench field with non-named type — 2 fixtures (1 file) — **RESOLVED 2026-06-12**
 
-> TB-IR lowering does not support testbench field `expected` with a
-> non-named type yet
+> ~~TB-IR lowering does not support testbench field `expected` with a
+> non-named type yet~~
 
 `testbench_lifecycle_test` (both `--test` structs:
-`LifecycleBumpThree`, `LifecycleBumpFive`)
+`LifecycleBumpThree`, `LifecycleBumpFive`) — scalar
+(uint/sint/bits/bool, ≤ 64-bit) testbench fields now lower as
+run/check-shared `_tb`-struct members
+(`TestbenchSchema::scalar_fields`, `Expr::TbField` /
+`Stmt::TbFieldWrite`). Both structs registered.
 
-### Wide (>64-bit) integer literals — 2 fixtures
+### Wide (>64-bit) integer literals — 2 fixtures — **RESOLVED 2026-06-12**
 
-> TB-IR lowering does not support integer literal yet (`0x...` is not a
-> plain literal)
+> ~~TB-IR lowering does not support integer literal yet (`0x...` is not
+> a plain literal)~~
 
-`wide_reg_test`
-(`0x0123456789abcdef_fedcba9876543210_aabbccddeeff0011_2233445566778899`),
-`sha256_test` (512-bit message-block literal)
+`wide_reg_test` (256-bit), `sha256_test` (512-bit message block) —
+hex literals wider than 64 bits lower to `Expr::WideLiteral` word
+lists; emission mirrors v1 (`_harc_u128` composite ≤ 128 bits,
+`HarcWide<N>` above, `harc_assign_words_checked` /
+`harc_eq_words` at the assign / `==` / `!=` sites). Both registered.
 
 ### Singleton blockers — 1 fixture each (10 total)
 
@@ -228,6 +246,20 @@ both constructs are needed.)
 | `mshr_cocotb_test` | TB-IR lowering does not support the `const` construct yet |
 | `packed_vec_lane_test` | TB-IR lowering does not support assignment to a non-port, non-local target yet |
 | `if_wait_for_in_then_test` | TB-IR lowering does not support test-scope `let done_pulses` yet (only `let dut : <Type>` is lowered at test scope) |
+Status after the singleton-blocker batch (2026-06-12):
+
+| Fixture | Was blocked on | Outcome |
+|---|---|---|
+| `pipe_reg_test` | `property` construct | **Skipped** — SVA-shaped, belongs to its own slice |
+| `width_methods_test` | `.trunc(...)` method call | **RESOLVED + registered** — `.trunc/.zext/.sext/.resize` lower to `Expr::WidthCast` (≤ 64-bit, v1's mask/cast/shift-fill shapes + direction checks); scalar `as uint<W>` casts lower as width relabels |
+| `keep_constraints_test` | `enum` construct | **enum RESOLVED; deeper blocker** — enums lower as named integer constants (variant index, first definition wins) and enum-typed transaction fields as scalar indices; the fixture now stops at statement-level `randomize` (constraint-IR seam) |
+| `extern_fn_ref_test` | `extern fn` construct | **Skipped** — needs `--ref-src` end-to-end; deferred with the registry plumbing already in place |
+| `async_fifo_test` | time literals in expression position | **RESOLVED + registered** — `wait 80ns` lowers to `Terminator::WaitTimePs` (ps resolved at lowering; v1's inline `eval_clocks_until(now_ps + N)`); `log(debug, ...)` severity also landed here |
+| `dma_engine_test` | `scoreboard` construct | **Skipped** — wave-4 construct |
+| `linklist_basic_test` | ternary expressions | **RESOLVED + registered** — `Expr::Ternary` emits the C++ `?:`; also forced the `WaitCyclesSync` terminator (waits inlined from helper bodies take v1's synchronous `tick()` path, fixing a `sim_end` clock-attribution trace delta) |
+| `mshr_cocotb_test` | `const` construct | **const RESOLVED; deeper blocker** — file-scope `const` (integer-literal initializers) substitutes at use sites; the fixture now stops at the `transactor` construct (moved to that group) |
+| `packed_vec_lane_test` | assignment to a non-port, non-local target | **RESOLVED + registered** — constant-lane `dut.<port>[i]` reads/writes lower via `PortRef::lane`; emission splits packed lanes (`harc_vec_lane_*<W>` via the `--sv` lane table) from unpacked-array subscripts, like v1 |
+| `if_wait_for_in_then_test` | test-scope `let done_pulses` | **RESOLVED + registered** — plain test-scope lets hoist to the head of the run function (v1 hoists to `main` scope before the coroutine); a check-phase reference is a precise rejection (run/check are separate IR functions, so v1's shared-capture scoping is not representable) |
 
 ## Registry-schema gap (not a lowering gap) — **RESOLVED 2026-06-12**
 
@@ -271,7 +303,13 @@ no schema v4 needed.
    (incl. the schema-blocked `synchronizer_basic_test`).~~ **DONE
    2026-06-12** — all six fixtures registered.
 4. **`struct`** (4, two of which also need `bus`).
-5. Singletons opportunistically — `.reset(...)`, non-named testbench
+5. ~~Singletons opportunistically — `.reset(...)`, non-named testbench
    field types, wide literals, `property`, `enum`, `const`,
    `extern fn`, `scoreboard`, ternary, probes, time-literal exprs,
-   non-port assignment targets, test-scope `let`.
+   non-port assignment targets, test-scope `let`.~~ **DONE
+   2026-06-12** (singleton-blocker batch) — 11 rows registered
+   (9 fixtures, incl. both `--test` structs of the two testbench
+   files); residuals: `pipe_reg_test` (property slice),
+   `extern_fn_ref_test` (extern fn), `dma_engine_test` (scoreboard),
+   `keep_constraints_test` (randomize seam), `mshr_cocotb_test`
+   (transactor), probes (own group above).
