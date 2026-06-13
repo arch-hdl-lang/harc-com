@@ -521,25 +521,55 @@ fn lower_bound_target_transactor(
                 "transactor `{tname}` declares target thread `bus.{mname}` more than once"
             )));
         }
-        // The bus must declare a matching `tlm_method`, and it must be
-        // `blocking` in this subset.
+        // The bus must declare a matching `tlm_method`. Both `blocking`
+        // (single in-order responder coroutine) and `out_of_order tags N`
+        // (N-lane dispatcher/lane/arbiter topology) are SERVED here; for
+        // the latter we fold and range-check the literal tag count, which
+        // emission threads into the multi-lane actor generation.
         let Some(method) = bus.tlm_methods.iter().find(|m| m.name.name == mname) else {
             return Err(LowerError::Invalid(format!(
                 "transactor `{tname}` target thread `bus.{mname}`: bus `{bus_name}` has no \
                  `tlm_method {mname}`"
             )));
         };
-        if method.mode.name != "blocking" {
-            return Err(unsupported(
-                &format!(
-                    "transactor `{tname}` target thread `bus.{mname}` serving a `{}` method",
-                    method.mode.name
-                ),
-                "initiator-side `out_of_order` forks (`let x = fork mem.read_ooo(...)` + \
-                 `join_all`) ARE lowered; target-side `out_of_order tags N` RESPONDER lanes \
-                 (hidden tag wires + multi-lane response routing) are a follow-up slice",
-            ));
-        }
+        let ooo_tags = match method.mode.name.as_str() {
+            "blocking" => None,
+            "out_of_order" => {
+                // The bus-level parser already requires `tags N` on an
+                // `out_of_order` method, but re-check defensively.
+                let Some(tags_expr) = method.out_of_order_tags.as_ref() else {
+                    return Err(LowerError::Invalid(format!(
+                        "transactor `{tname}` target thread `bus.{mname}`: `out_of_order` \
+                         method has no `tags N` count"
+                    )));
+                };
+                let Some(n) = super::exprs::parse_int_literal_expr(tags_expr) else {
+                    return Err(unsupported(
+                        &format!(
+                            "transactor `{tname}` target thread `bus.{mname}`: \
+                             `out_of_order tags <N>` requires a literal tag count for \
+                             responder-lane lowering"
+                        ),
+                        "use an integer literal (`out_of_order tags 2`)",
+                    ));
+                };
+                if n == 0 || n > 64 {
+                    return Err(LowerError::Invalid(format!(
+                        "transactor `{tname}` target thread `bus.{mname}`: supports \
+                         1..64 out_of_order target tags, got {n}"
+                    )));
+                }
+                Some(n)
+            }
+            other => {
+                return Err(unsupported(
+                    &format!(
+                        "transactor `{tname}` target thread `bus.{mname}` serving a `{other}` method"
+                    ),
+                    "target-side TLM responders support `blocking` and `out_of_order tags N`",
+                ));
+            }
+        };
         if th.params.len() != method.args.len() {
             return Err(LowerError::Invalid(format!(
                 "transactor `{tname}` target thread `bus.{mname}`: expected {} arg(s), got {}",
@@ -593,6 +623,7 @@ fn lower_bound_target_transactor(
             function: fid,
             args: method.args.iter().map(|(n, _)| n.name.clone()).collect(),
             has_ret,
+            ooo_tags,
         });
         funcs.push(f);
     }

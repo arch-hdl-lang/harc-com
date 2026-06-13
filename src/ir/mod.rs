@@ -300,6 +300,18 @@ pub struct TargetTlmMethodSchema {
     /// True for value-returning methods (`-> T`): the responder drives
     /// a `<bus>_<method>_rsp_data` wire after the body returns.
     pub has_ret: bool,
+    /// `None` for a `blocking` `tlm_method` (single in-order responder
+    /// coroutine, issue-order `req_tag`/`rsp_tag` unused). `Some(N)` for
+    /// an `out_of_order tags N` method: emission generates the multi-lane
+    /// RESPONDER topology mirroring v1's `emit_bound_tagged_tlm_target_actors`
+    /// — a per-tag dispatcher (combinational `req_ready` accept + lane
+    /// hand-off), N concurrent lane coroutines (each runs the responder
+    /// body), and an arbiter routing each lane's response back on the
+    /// hidden `req_tag`/`rsp_tag` wires. The lowered body `function` is
+    /// identical to the blocking form; only the surrounding actor
+    /// topology differs. The folded count is range-checked at lowering
+    /// (1..=64), matching v1.
+    pub ooo_tags: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
