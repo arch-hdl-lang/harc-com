@@ -702,6 +702,16 @@ pub struct TestbenchSchema {
     /// locals (v1's `AnalysisEnv env;`), so `connect` push_backs and
     /// method calls work against the run function's `env`.
     pub component_fields: Vec<ComponentFieldBinding>,
+    /// Unbound DUT-poking transactor instances that carry persistent
+    /// scalar state fields (`drv : SeqXactor active` where `SeqXactor`
+    /// has a `last_read : uint<32>` field), in declaration order. Each
+    /// names an entry in `transactor_fields`; emission generates a
+    /// per-instance state struct (mirroring the bound-to target form's
+    /// `target_state_struct_inst`) that the method lambdas and the
+    /// run/check coroutine share by `[&]` capture. Stateless unbound
+    /// transactors (no state fields) are absent here — their methods are
+    /// pure DUT-poking lambdas with no per-instance struct.
+    pub unbound_state_actors: Vec<(String, TransactorId)>,
     /// True when no `testbench` declaration existed in source and this
     /// schema was synthesized for a classic-form test. Codegen skips
     /// the `_tb` struct + wire statement for synthetic testbenches.

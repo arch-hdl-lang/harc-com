@@ -1,0 +1,127 @@
+// Self-proving fixture for transactor SCALAR STATE FIELDS on the
+// unbound DUT-poking transactor form (TB-IR divergence 10).
+//
+// Before this slice, the unbound transactor only carried its single
+// module-typed DUT handle; any extra scalar field (`last_first :
+// uint<4>`) was rejected with "TB-IR lowering does not support
+// transactor `X` state field ... yet". This fixture exercises the
+// newly-materialized per-instance state:
+//
+//   * a hookable method WRITES a state field by bare name
+//     (`last_first = dut.search_first`) — lowered to a
+//     `TransactorStateWrite` whose instance is filled at bind time;
+//   * a hookable method READS a state field by bare name
+//     (`if last_any == 1 ...`) — lowered to `TransactorState`;
+//   * the test READS the field back as `xact.last_first` /
+//     `xact.last_any` — the test-scope `as_transactor_state` path,
+//     resolving through the same per-instance struct.
+//
+// The state struct is shared by `[&]` capture across the method
+// lambdas and the run coroutine, exactly like the bound-to target
+// transactor's responder state. Both C++ codegens (v1 + tbir) must
+// agree on every read-back and the same final verdict.
+//
+// DUT: Mshr_Addr_Cam_Dual (dual-write CAM). The transactor inserts
+// keys via the existing write ports, then `probe(key)` drives a
+// combinational search and stashes the result into state.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor CamStateXactor
+    dut : Mshr_Addr_Cam_Dual
+
+    // Persistent per-instance scalar state. `last_first` records the
+    // index returned by the most-recent probe; `last_any` records
+    // whether that probe hit; `probe_count` counts probes (proves a
+    // state read+write accumulator inside a method body).
+    last_first  : uint<4>  default 0
+    last_any    : bool     default false
+    probe_count : uint<32> default 0
+
+    when active
+        // Insert (idx, key) via write port 1, single cycle.
+        hookable insert(idx: uint<4>, key: uint<8>)
+            dut.write_valid = 1
+            dut.write_idx = idx
+            dut.write_key = key
+            dut.write_set = true
+            dut.write2_valid = 0
+            wait 1 cycle
+            dut.write_valid = 0
+            dut.write2_valid = 0
+        end insert
+
+        // Drive a combinational search and STASH the result into
+        // persistent state. Reads + writes state fields by bare name.
+        hookable do_probe(key: uint<8>)
+            dut.search_key = key
+            wait 1 cycle
+            // Bare-name state writes — TransactorStateWrite.
+            last_first = dut.search_first
+            last_any = dut.search_any
+            // Bare-name state read + write — TransactorState read,
+            // TransactorStateWrite of the incremented value.
+            probe_count = probe_count + 1
+        end do_probe
+
+        // Reset pulse.
+        hookable reset_dut()
+            dut.rst = 1
+            dut.write_valid = 0
+            dut.write2_valid = 0
+            wait 2 cycles
+            dut.rst = 0
+            wait 1 cycle
+        end reset_dut
+    end when
+end transactor CamStateXactor
+
+testbench TransactorStateFieldTb
+    dut  : Mshr_Addr_Cam_Dual
+    xact : CamStateXactor active
+end testbench TransactorStateFieldTb
+
+impl TransactorStateFieldTest for TransactorStateFieldTb
+    clock clk = SysDomain
+
+    run
+        log(info, "transactor scalar state-field round-trip (unbound BFM)")
+        xact.dut = dut
+
+        xact.reset_dut()
+        wait 1 cycle
+
+        // Insert (idx 3, key 0x2A) and (idx 9, key 0x5C).
+        xact.insert(3, 42)     // 0x2A
+        xact.insert(9, 92)     // 0x5C
+
+        // Probe a hit at idx 3.
+        xact.do_probe(42)
+        // Read state back from the test scope.
+        assert xact.last_any == 1
+            else fail("probe(0x2A): last_any=${xact.last_any}, expected 1")
+        assert xact.last_first == 3
+            else fail("probe(0x2A): last_first=${xact.last_first}, expected 3")
+
+        // Probe a hit at idx 9.
+        xact.do_probe(92)
+        assert xact.last_any == 1
+            else fail("probe(0x5C): last_any=${xact.last_any}, expected 1")
+        assert xact.last_first == 9
+            else fail("probe(0x5C): last_first=${xact.last_first}, expected 9")
+
+        // Probe a miss (key never inserted).
+        xact.do_probe(255)        // 0xFF
+        assert xact.last_any == 0
+            else fail("probe(0xFF): last_any=${xact.last_any}, expected 0 (miss)")
+
+        // The probe counter accumulated across three probes — proves
+        // a state read+write accumulator inside the method body.
+        assert xact.probe_count == 3
+            else fail("probe_count=${xact.probe_count}, expected 3")
+
+        log(info, "PASS: state fields round-tripped (last_first, last_any, probe_count)")
+    end run
+end impl TransactorStateFieldTest

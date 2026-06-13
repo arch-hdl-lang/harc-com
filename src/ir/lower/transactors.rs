@@ -25,9 +25,15 @@
 //! `wait until` (whose v1 sync shapes are out of this slice) are
 //! rejected inside method bodies.
 //!
-//! Everything outside the subset — `bound to <BusType>`, generics,
-//! event ports, scalar state fields, `on` handlers, TLM target
-//! threads, watchdogs — is an explicit `Unsupported`.
+//! Persistent scalar state fields (`last_read : uint<32> default 0`)
+//! materialize on a per-instance state struct, exactly like the
+//! bound-to target form: method bodies read/write them by bare name and
+//! the test reads them back as `<instance>.<field>`. The DUT-poking BFM
+//! still requires exactly one module-typed DUT handle field.
+//!
+//! Everything outside the subset — `bound to <BusType>` (initiator side),
+//! generics, event ports, `on` handlers, TLM target threads, watchdogs —
+//! is an explicit `Unsupported`.
 
 use super::{FuncBuilder, LowerCtx, LowerError, helpers, unsupported};
 use crate::ast::{
@@ -104,6 +110,14 @@ pub(crate) fn lower_transactor(
     // field), so active-only placement carries no behavior here.
     let mut dut: Option<(String, String)> = None; // (field, module type)
     let mut methods_ast: Vec<&HookableMethod> = Vec::new();
+    // Persistent scalar state fields (`last_read : uint<32> default 0`)
+    // materialize on a per-instance state struct, exactly like the
+    // bound-to target form. Method bodies read/write them by bare name
+    // (routed to `TransactorState`/`TransactorStateWrite` via the
+    // builder's `target_state_fields` set); the test reads them back as
+    // `<instance>.<field>`.
+    let mut state_fields: Vec<TbScalarFieldSchema> = Vec::new();
+    let mut state_names: HashSet<String> = HashSet::new();
     let all_items = t
         .items
         .iter()
@@ -118,38 +132,50 @@ pub(crate) fn lower_transactor(
                         "event-driven transactors await the event slice",
                     ));
                 }
-                let TypeExpr::Named { name, .. } = &f.ty else {
-                    return Err(unsupported(
-                        &format!("transactor `{tname}` state field `{fname}`"),
-                        "only one module-typed (DUT handle) field is lowered",
-                    ));
-                };
-                let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
-                if record_ctx.record_ids.contains_key(simple) {
-                    return Err(unsupported(
-                        &format!(
-                            "transactor `{tname}` field `{fname}` of transaction type `{simple}`"
-                        ),
-                        "",
-                    ));
+                // A `Named` type is either the module-typed DUT handle or
+                // a (rejected) transaction-typed field. A `Builtin`
+                // scalar type (`uint<N>`/`sint<N>`/`bool`) is persistent
+                // state.
+                if let TypeExpr::Named { name, .. } = &f.ty {
+                    let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+                    if record_ctx.record_ids.contains_key(simple) {
+                        return Err(unsupported(
+                            &format!(
+                                "transactor `{tname}` field `{fname}` of transaction type `{simple}`"
+                            ),
+                            "",
+                        ));
+                    }
+                    if f.default.is_some() {
+                        return Err(unsupported(
+                            &format!("transactor `{tname}` field `{fname}` with a default value"),
+                            "",
+                        ));
+                    }
+                    if dut.is_some() {
+                        return Err(unsupported(
+                            &format!(
+                                "transactor `{tname}` with more than one module-typed field \
+                                 (`{}`, `{fname}`)",
+                                dut.as_ref().unwrap().0
+                            ),
+                            "",
+                        ));
+                    }
+                    dut = Some((fname.clone(), simple.to_string()));
+                } else {
+                    // Scalar persistent state field — reuse the bound-to
+                    // target state-field lowering (scalar ≤64-bit type,
+                    // plain-literal default).
+                    let sf = lower_state_field(tname, f)?;
+                    if !state_names.insert(sf.name.clone()) {
+                        return Err(LowerError::Invalid(format!(
+                            "transactor `{tname}` declares state field `{}` more than once",
+                            sf.name
+                        )));
+                    }
+                    state_fields.push(sf);
                 }
-                if f.default.is_some() {
-                    return Err(unsupported(
-                        &format!("transactor `{tname}` field `{fname}` with a default value"),
-                        "",
-                    ));
-                }
-                if dut.is_some() {
-                    return Err(unsupported(
-                        &format!(
-                            "transactor `{tname}` with more than one module-typed field \
-                             (`{}`, `{fname}`)",
-                            dut.as_ref().unwrap().0
-                        ),
-                        "",
-                    ));
-                }
-                dut = Some((fname.clone(), simple.to_string()));
             }
             ComponentItem::Hookable(h) => methods_ast.push(h),
             ComponentItem::OnHandler(_) => {
@@ -195,7 +221,7 @@ pub(crate) fn lower_transactor(
         dut_type,
         methods: Vec::new(),
         bound_bus: None,
-        state_fields: Vec::new(),
+        state_fields,
         target_methods: Vec::new(),
     };
     // Method bodies resolve DUT accesses against the transactor's own
@@ -253,6 +279,12 @@ pub(crate) fn lower_transactor(
         let fid = FunctionId(next_fn.0 + funcs.len() as u32);
         let mut b = FuncBuilder::new(&method_ctx, helper_registry, constraint_sites);
         b.in_transactor_method = true;
+        // Bare-name reads/writes of a state field route to
+        // `TransactorState`/`TransactorStateWrite` with an empty instance
+        // placeholder, filled at test-binding time (same as the bound-to
+        // target form). Method params shadow state names (declared below,
+        // looked up first), so this is safe to set up front.
+        b.target_state_fields = state_names.clone();
         let mut params = Vec::with_capacity(h.params.len());
         for p in &h.params {
             check_scalar_ty(tname, mname, &format!("parameter `{}`", p.name.name), p.ty.as_ref())?;

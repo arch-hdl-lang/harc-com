@@ -111,8 +111,9 @@ Residual first-blocker map for the other 16 (re-run of
 | `bus` (3) | `axilite_regs_full_test`, `bind_remap_test`, `transactor_parse_test` |
 | `regblock` (7) | `regblock_basic_test`, `regblock_fields_test`, `regblock_access_test`, `regblock_bitbash_test`, `regblock_addrmap_test`, `regblock_alias_test`, `regblock_record_test` — **regblock slice landed 2026-06-12; the bus-bound `via` helper landed 2026-06-13 (initiator-side BFM). `regblock_access_test` now fully lowers and is registered; the other six advance to deeper regblock residuals — see the `regblock` construct group below.** |
 | `scoreboard` (2) | `analysis_sink_connect_test`, `axilite_env_test` |
-| ~~`tseq` (2)~~ → deeper | `axilite_seqdrv_test`, `transactor_active_test` — **tseq slice landed 2026-06-13; both lower their `tseq` now and advance to deeper residuals — `axilite_seqdrv_test` → transactor state field, `transactor_active_test` → bound-to transactor event field — see the `tseq` construct group below** |
-| transactor state fields (1) | `axilite_hooks_test` — "transactor `HookXactor` state field `last_read`" (scalar state on the transactor; needs instance-state materialization) |
+| ~~`tseq` (2)~~ → deeper | `axilite_seqdrv_test`, `transactor_active_test` — **tseq slice landed 2026-06-13; both lower their `tseq` now, and the transactor-state-field slice (2026-06-13) advanced `axilite_seqdrv_test` past its state field too — both now stop at an event field: `axilite_seqdrv_test` → `req : in event<RegOp>` (event-driven unbound transactor), `transactor_active_test` → bound-to transactor event field — see the `tseq` construct group below** |
+| ~~transactor state fields (1)~~ → deeper | `axilite_hooks_test` — **transactor-state-field slice landed 2026-06-13; the `last_read` state field now lowers, advancing to the next blocker: a record-typed (transaction) method param `send(t: RegOp)` + statement-level pre/post hooks** |
+| transactor state fields (self-proving) | `transactor_state_field_test` — **REGISTERED 2026-06-13** (`cam_dual_basic.sv`, pass): scalar state on the unbound DUT-poking transactor, written + read in method bodies and read back at test scope; trace-diff clean v1↔tbir |
 | >64-bit method params (1) | `aes_cipher_top_test` — "transactor method `AesXactor.load_block` parameter `key` wider than 64 bits (uint<128>)" (the tbir value model is u64) |
 
 As with the `transaction` slice, most of the moved fixtures stack
@@ -327,7 +328,7 @@ dump-ir`, 2026-06-13):
 | Next blocker | Fixtures |
 |---|---|
 | `agent` construct + `on <ev>` event handlers | `heartbeat_idle_test`, `wait_until_quiesce_test`, `watchdog_quiesce_test`, `watchdog_trip_diagnostic_test`, `env_quiesced_phase_test` (also need `phase`, `idle(N)`/`quiesced(N)` predicates, watchdog) |
-| ~~`sequencer` construct~~ → ~~`tseq`~~ → now **transactor state field / agent-mode** | `axilite_connect_test`, `transactor_agent_mode_test`, `transactor_env_mode_test` — **`sequencer` lowers (sequencer slice) and `tseq` lowers (tseq slice, 2026-06-13)**; each now stops at a transactor **state field** (`axilite_connect_test`) or a transactor with **>1 module-typed field** (the agent/env pair), and the agent/env pair additionally stack mode-inheritance + cycle-trigger `on dut.x && dut.y` handlers — see the `tseq` construct group |
+| ~~`sequencer`~~ → ~~`tseq`~~ → ~~state field~~ → now **event field / agent-mode** | `axilite_connect_test`, `transactor_agent_mode_test`, `transactor_env_mode_test` — **`sequencer` lowers (sequencer slice), `tseq` lowers (tseq slice), and transactor scalar STATE fields lower (state-field slice, 2026-06-13)**; each now stops at the NEXT tier: `axilite_connect_test` → `req : in event<RegOp>` directional field (event-driven unbound transactor); the agent/env pair → a transactor with **>1 module-typed field** (`dut` + `sb`, agent-mode DUT-handle inheritance), additionally stacking mode-inheritance + cycle-trigger `on dut.x && dut.y` handlers — see the `tseq` construct group |
 | ~~`tseq` construct~~ → bound-to transactor | `axilite_bound_mon_test` — **`tseq` slice landed**; now stops at a bound-to transactor **state field** (the bound-monitor/responder state, divergence 10/13) |
 | ~~`tseq` + `randomize`~~ → sub-component field | `axilite_env_test` — **its `tseq` + `randomize(t)` now lower (tseq slice)**; now stops at an env **sub-component field** type (a deeper env-composition feature, not tseq) |
 
@@ -438,14 +439,24 @@ helpers), a `tseq RandomRegs(5)` of random writes/reads through the
 seed 1; both need Z3.
 
 The remaining corpus tseq fixtures lower their tseq now but reject one
-level deeper. Residual first-blocker map (re-run of `harc dump-ir`,
-2026-06-13):
+level deeper. After the transactor-state-field slice (2026-06-13) the
+state-field blocker is gone for the unbound forms; residual first-blocker
+map (re-run of `harc dump-ir`, 2026-06-13):
 
 | Next blocker | Fixtures |
 |---|---|
-| transactor **state field** (`last_read : uint<32>` — per-instance state, divergence 10) | `axilite_connect_test`, `axilite_seqdrv_test` |
-| transactor with **>1 module-typed field** (agent-mode DUT-handle inheritance) | `transactor_agent_mode_test`, `transactor_env_mode_test` |
+| transactor **event field** (`req : in event<RegOp>` — the event-driven unbound transactor / sequencer→transactor.req form) | `axilite_connect_test`, `axilite_seqdrv_test` |
+| transactor with **>1 module-typed field** (`dut` + `sb` — agent-mode DUT-handle inheritance) | `transactor_agent_mode_test`, `transactor_env_mode_test` |
 | `tseq` construct (data-stream tseq with no record element — needs the scalar/non-record element seam) | `axilite_bound_mon_test` |
+
+The transactor-state-field slice (divergence 10) materialized scalar
+STATE fields on the UNBOUND DUT-poking transactor (per-instance state
+struct, written/read in method bodies + read back at test scope). It is
+proven by the self-proving `transactor_state_field_test` and advanced
+`axilite_seqdrv_test`/`axilite_connect_test` past their state field to
+the event-field blocker above. Still deferred: state on the *bound-to
+initiator* BFM, *event-driven* transactor state, the `_last_in/out_cycle`
+heartbeat stamps (idle predicates), and statement-level pre/post hooks.
 
 `axilite_connect_test` additionally binds its `env : AxilEnv` as a
 **testbench field** (the binding slice above) and stacks env→agent→driver
@@ -671,8 +682,11 @@ no schema v4 needed.
    **BOTH DONE 2026-06-12** — `transaction` slice (see its resolved
    group), then `transactor` slice (8 fixtures registered; the
    predicted first-blocker churn happened — see its residual map.
-   Transactor-specific follow-ups still owed: scalar state fields on
-   transactors and >64-bit method params). The `transactor` slice
+   Transactor-specific follow-ups: scalar state fields on UNBOUND
+   transactors **DONE 2026-06-13** (state-field slice — divergence 10,
+   self-proving `transactor_state_field_test` registered); still owed:
+   event-driven / bound-initiator transactor state, and >64-bit method
+   params). The `transactor` slice
    also unlocks 10 of the TLM-family fixtures (see the bus group's
    residual map).
 2. ~~**`bus`** (15 fixtures): unlocks the entire TLM family.~~

@@ -1749,6 +1749,79 @@ fn lower_test(
         });
     }
 
+    // Resolve persistent state for the unbound DUT-poking transactor
+    // instances (`drv : SeqXactor active` where `SeqXactor` declares a
+    // `last_read : uint<32>` field). Same machinery as the bound-to
+    // target form: register the per-instance state map (for test-scope
+    // `drv.last_read` reads) and fill the instance into the method
+    // bodies' `TransactorState`/`TransactorStateWrite` placeholders. The
+    // method bodies are shared per transactor TYPE, so the subset is one
+    // STATEFUL instance per type per file — a second instance would
+    // clobber the first's filled instance name; reject it loudly.
+    let mut unbound_state_actors: Vec<(String, ir::TransactorId)> = Vec::new();
+    // Tracks which stateful transactor TYPES already have an instance.
+    // The method bodies (and per-instance state map) are shared per
+    // type, so the subset allows one stateful instance per type: a
+    // second instance of the same type would clobber the first's filled
+    // method-body instance name. Tracked independently of whether the
+    // type has methods (a method-less stateful transactor still has one
+    // shared per-instance struct in scope).
+    let mut stateful_type_seen: HashMap<u32, String> = HashMap::new();
+    for (field, xid) in &transactor_fields {
+        let xschema = &prog.transactors[xid.index()];
+        // Bound-to target instances are handled above (they appear in
+        // `target_state`, not `transactor_fields`); a stateless unbound
+        // transactor has no per-instance struct.
+        if xschema.bound_bus.is_some() || xschema.state_fields.is_empty() {
+            continue;
+        }
+        let xname = xschema.name.clone();
+        if let Some(prev) = stateful_type_seen.get(&xid.0) {
+            return Err(unsupported(
+                &format!(
+                    "stateful unbound transactor `{xname}` instantiated more than once \
+                     (`{prev}`, `{field}`)"
+                ),
+                "the unbound state-field subset shares one method body per transactor \
+                 type; multiple stateful instances need per-instance bodies",
+            ));
+        }
+        stateful_type_seen.insert(xid.0, field.clone());
+        if target_state.contains_key(field) {
+            return Err(LowerError::Invalid(format!(
+                "name `{field}` is both a stateful transactor instance and a target-TLM \
+                 responder in test `{}`",
+                t.name.name
+            )));
+        }
+        target_state.insert(
+            field.clone(),
+            xschema.state_fields.iter().map(|f| f.name.clone()).collect(),
+        );
+        // Fill the instance into the (type-shared) method bodies'
+        // `TransactorState`/`TransactorStateWrite` placeholders. With the
+        // per-type uniqueness guarded above, this can only ever fill with
+        // a single instance name, but `fill_transactor_state_instance`
+        // still cross-checks defensively.
+        let method_fns: Vec<usize> =
+            xschema.methods.iter().map(|m| m.function.index()).collect();
+        for fidx in method_fns {
+            if let Err(prev) =
+                fill_transactor_state_instance(&mut prog.functions[fidx], field)
+            {
+                return Err(unsupported(
+                    &format!(
+                        "stateful unbound transactor `{xname}` instantiated more than once \
+                         (`{prev}`, `{field}`)"
+                    ),
+                    "the unbound state-field subset shares one method body per transactor \
+                     type; multiple stateful instances need per-instance bodies",
+                ));
+            }
+        }
+        unbound_state_actors.push((field.clone(), *xid));
+    }
+
     let tb_id = TestbenchId(prog.testbenches.len() as u32);
     prog.testbenches.push(TestbenchSchema {
         name: tb_schema_name,
@@ -1762,6 +1835,7 @@ fn lower_test(
         regblock_bindings: regblock_binding_schemas,
         target_tlm_actors,
         component_fields: component_field_bindings,
+        unbound_state_actors,
         synthetic,
     });
 
