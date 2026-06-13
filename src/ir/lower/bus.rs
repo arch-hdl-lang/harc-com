@@ -52,12 +52,58 @@ pub(super) fn lower_bus_binding(
     if !l.probes.is_empty() {
         return Err(unsupported("probe declarations on a bus binding", ""));
     }
-    if !l.bind_remap.is_empty() {
+    // `bind ... with { ch.sig: "port", ... }` signal remaps. Each path
+    // must be exactly `<channel>.<signal>` (2 segments), mirroring v1's
+    // `bind_remap` → `bus_remap` translation; the resulting
+    // `(channel, signal) → port` table overrides the
+    // `<field>_<channel>_<signal>` flat-name convention at wire
+    // emission. Sorted by key for deterministic dump-ir output.
+    //
+    // Subset: only `tlm_method` wire emission (`emit_transactor_call` /
+    // `emit_target_actor`) routes through the remap's `wire_name`. A
+    // handshake-channel access (`bus.<ch>.send`/`recv`/`<ch>.<sig>`)
+    // lowers to a `PortRef` whose flat name is joined by the backend
+    // with `_`, bypassing the remap — so a remap on a bus that declares
+    // handshake channels would silently mis-name those wires. Reject it
+    // precisely rather than mis-lower (the handshake-remap path is a
+    // follow-up slice).
+    if !l.bind_remap.is_empty() && !decl.handshakes.is_empty() {
         return Err(unsupported(
-            "bus bind signal remaps (`bind ... with { ... }`)",
-            "",
+            &format!(
+                "bus bind signal remaps (`bind ... with {{ ... }}`) on bus `{}` \
+                 with handshake channels",
+                decl.name.name
+            ),
+            "remaps are honored for `tlm_method`-only buses; handshake-channel \
+             signal remaps are a follow-up slice",
         ));
     }
+    let mut remap: Vec<((String, String), String)> = Vec::new();
+    for entry in &l.bind_remap {
+        if entry.path.len() != 2 {
+            return Err(LowerError::Invalid(format!(
+                "bind {bind} with: signal path `{}` must be exactly \
+                 `<channel>.<signal>` (2 segments, got {})",
+                entry
+                    .path
+                    .iter()
+                    .map(|i| i.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("."),
+                entry.path.len()
+            )));
+        }
+        let key = (entry.path[0].name.clone(), entry.path[1].name.clone());
+        // v1 stores remaps in a HashMap (last write wins on a duplicate
+        // `(channel, signal)` key); mirror that — replace an existing
+        // entry rather than shadowing it with a first-wins linear scan.
+        if let Some(existing) = remap.iter_mut().find(|(k, _)| *k == key) {
+            existing.1 = entry.port.clone();
+        } else {
+            remap.push((key, entry.port.clone()));
+        }
+    }
+    remap.sort();
     if let Some(TypeExpr::Named { generics, .. }) = l.ty.as_ref() {
         if !generics.is_empty() {
             return Err(unsupported(
@@ -108,6 +154,7 @@ pub(super) fn lower_bus_binding(
             field: bind.clone(),
             bus: decl.name.name.clone(),
             methods,
+            remap,
         },
         decl.clone(),
     ))

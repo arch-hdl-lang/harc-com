@@ -120,3 +120,6 @@ axilite_seqdrv_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 event_driven_transactor_test | Top | top_counter.sv | top_counter.arch | pass
 transactor_agent_mode_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 transactor_env_mode_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
+dma_engine_tlm_target_test | DmaEngineTlmMem | dma_engine_tlm_mem.sv dma_engine.sv | - | pass
+dma_engine_tlm_mem_model_test | DmaEngineTlmMem | dma_engine_tlm_mem.sv dma_engine.sv | - | pass
+tlm_bind_remap_test | TlmMemory | TlmMemory.sv | - | pass

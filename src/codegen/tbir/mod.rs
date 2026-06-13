@@ -575,7 +575,7 @@ fn emit_test(
         runtime::target_state_struct_inst(out, schema, &actor.instance);
     }
     for actor in &tb.target_tlm_actors {
-        func::emit_target_actor(out, prog, actor, 1)?;
+        func::emit_target_actor(out, prog, actor, &tb.bus_bindings, 1)?;
     }
 
     // Composite-component method lambdas — one `<Comp>_<method>` per

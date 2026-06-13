@@ -259,15 +259,39 @@ next blocker; exact `Unsupported` message in parentheses):
 |---|---|
 | `fork`/`join_all` TLM issue (needs `Terminator::Fork` + `ForkArmKind::BusMethodCall`) | `tlm_method_bus_test`, `tlm_target_fork_forwarding_test`, `tlm_pairing_arch_target_test`* ("`fork` bus-method calls") |
 | `out_of_order tags N` target threads (hidden tag wires + multi-lane response router) | `tlm_target_ooo_lanes_test`, `tlm_pairing_arch_initiator_test` ("serving a `out_of_order` method") |
-| `bind ... with { ... }` signal remaps | `dma_engine_tlm_target_test`, `dma_engine_tlm_mem_model_test` ("bus bind signal remaps") |
 | nested transactor/method call inside a responder body (forwarding to another target) | `tlm_target_forwarding_test` ("transactor/method call `.read(...)`") |
+| **(resolved 2026-06-13)** `bind ... with { ... }` signal remaps | ~~`dma_engine_tlm_target_test`, `dma_engine_tlm_mem_model_test`~~ — see the bus-bind-remap section below |
 | **(resolved 2026-06-13)** initiator-side bus-bound BFM (`hookable` bodies driving handshake channels) | ~~`regblock_*`~~ — see the initiator-side BFM section below |
 
 The fork group's blocking-call halves already lower; the OOO group needs
-the tagged responder lanes; the remap group needs custom wire naming;
-the forwarding fixture needs nested call edges inside a responder. The
-regblock `via` helpers are the *initiator-side* BFM, lowered by the
-separate slice below.
+the tagged responder lanes; the forwarding fixture needs nested call
+edges inside a responder. The regblock `via` helpers are the
+*initiator-side* BFM, lowered by the separate slice below.
+
+### bus `bind ... with { ... }` signal remaps — RESOLVED 2026-06-13
+
+> ~~`bind ... with { ch.sig: "port" }` signal remaps~~
+
+A bus binding may override the `<field>_<channel>_<signal>` flat-name
+convention per signal: `let mem : Bus = bind dut with { read.addr:
+"mem_read_addr", ... }`. `BusBindingSchema` now carries a sorted
+`remap: Vec<((channel, signal), port)>` plus a `wire_name(channel,
+signal)` resolver (mirrors v1's `bus_remap` / `bus_signal_name`).
+`lower_bus_binding` validates each path is exactly `<channel>.<signal>`
+(2 segments; malformed → hard `Invalid` error) and records it instead of
+rejecting. Both TLM wire-emission sites — `emit_transactor_call` (the
+test-scope blocking call edge) and `emit_target_actor` (the target
+responder, now passed the test's `bus_bindings`) — route through
+`wire_name`, so the override governs both directions. **No new IR
+variants.**
+
+**Registered** (3, each passes the v1-vs-tbir equivalence pair,
+trace-diff clean): `tlm_bind_remap_test` (self-proving — binds with name
+`m` so the convention would drive nonexistent `m_read_*`; every entry
+remaps to the real `mem_read_*`/`mem_poke_*` port), `dma_engine_tlm_target_test`,
+`dma_engine_tlm_mem_model_test` (corpus — blocking target responders
+rejected only for the explicit `bind ... with`). See docs/tbir-mvp.md
+bus-bind-remap slice.
 
 ### initiator-side bus-bound BFM — RESOLVED 2026-06-13
 
@@ -297,10 +321,14 @@ now lower their `via` helper but stop at deeper regblock residuals (see
 the `regblock` construct group above).
 
 **Out of subset** (precise rejections): per-instance BFM state fields,
-`out_of_order` channels, `fork`-issue, `bind ... with { ... }` remaps,
-nested transactor calls inside a BFM body, multiple bound instances of
-one BFM type per file. `tlm_pairing_arch_initiator_test` is a TLM-
-initiator fixture but stops earlier on `out_of_order tags N`.
+`out_of_order` channels, `fork`-issue, nested transactor calls inside a
+BFM body, multiple bound instances of one BFM type per file. A
+`bind ... with { ... }` remap on a *handshake-channel* bus (which an
+initiator BFM is, e.g. BusAxiLite) is rejected: the bus-bind-remap slice
+honors remaps only on `tlm_method`-only buses, since handshake-channel
+access bypasses `wire_name` (`bind_remap_test` exercises exactly this and
+stays rejected). `tlm_pairing_arch_initiator_test` is a TLM-initiator
+fixture but stops earlier on `out_of_order tags N`.
 
 \* `tlm_pairing_arch_target_test` still does not reach the equivalence
 stage (fork-blocked), so the known local-only Verilator

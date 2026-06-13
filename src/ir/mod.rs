@@ -850,6 +850,29 @@ pub struct BusBindingSchema {
     pub bus: String,
     /// `tlm_method` declarations on the bus, in declaration order.
     pub methods: Vec<TlmMethodSchema>,
+    /// Per-signal flat-name overrides from `bind ... with { ch.sig:
+    /// "port", ... }` (v1's `bus_remap`). Each entry is `((channel,
+    /// signal), flat_port_name)`; for a `tlm_method` the channel is the
+    /// method name and the signal is a protocol wire (`req_valid`,
+    /// `addr`, `rsp_data`, ...). Unmapped signals fall back to the
+    /// `<field>_<channel>_<signal>` convention. Sorted by key for
+    /// deterministic dump-ir / snapshot output.
+    pub remap: Vec<((String, String), String)>,
+}
+
+impl BusBindingSchema {
+    /// Resolve the flat DUT port name for `<channel>.<signal>` on this
+    /// binding: the `bind ... with` override if present, else the
+    /// `<field>_<channel>_<signal>` convention (mirrors v1's
+    /// `bus_signal_name`).
+    pub fn wire_name(&self, channel: &str, signal: &str) -> String {
+        for ((ch, sig), port) in &self.remap {
+            if ch == channel && sig == signal {
+                return port.clone();
+            }
+        }
+        format!("{}_{channel}_{signal}", self.field)
+    }
 }
 
 /// One `tlm_method` on a bound bus — the call-edge metadata emission

@@ -795,17 +795,20 @@ fn emit_transactor_call(
     let pad = INDENT.repeat(depth);
     let func = cx.func;
     let names = cx.names;
-    let schema = bindings
-        .iter()
-        .find(|b| b.field == bus_field)
-        .and_then(|b| b.methods.iter().find(|m| m.name == method))
-        .ok_or_else(|| {
-            EmitError(format!(
-                "tbir: unresolved transactor call `{bus_field}.{method}` in {} — \
-                 verifier should have rejected it",
-                func.name
-            ))
-        })?;
+    let binding = bindings.iter().find(|b| b.field == bus_field).ok_or_else(|| {
+        EmitError(format!(
+            "tbir: unresolved transactor call `{bus_field}.{method}` in {} — \
+             verifier should have rejected it",
+            func.name
+        ))
+    })?;
+    let schema = binding.methods.iter().find(|m| m.name == method).ok_or_else(|| {
+        EmitError(format!(
+            "tbir: unresolved transactor call `{bus_field}.{method}` in {} — \
+             verifier should have rejected it",
+            func.name
+        ))
+    })?;
     if schema.args.len() != args.len() {
         return Err(EmitError(format!(
             "tbir: `{bus_field}.{method}` arity drift ({} schema vs {} call args) in {}",
@@ -814,7 +817,10 @@ fn emit_transactor_call(
             func.name
         )));
     }
-    let wire = |sig: &str| format!("dut->{bus_field}_{method}_{sig}");
+    // `bind ... with { method.sig: "port" }` remaps override the
+    // `<field>_<method>_<sig>` flat-name convention (mirrors v1's
+    // `bus_signal_name`).
+    let wire = |sig: &str| format!("dut->{}", binding.wire_name(method, sig));
     let budget_wait = |out: &mut String, sig: &str| {
         writeln!(
             out,
@@ -1301,11 +1307,16 @@ pub(super) fn emit_target_actor(
     out: &mut String,
     prog: &TbProgram,
     actor: &crate::ir::TargetTlmActorSchema,
+    bindings: &[BusBindingSchema],
     depth: usize,
 ) -> Result<(), EmitError> {
     let schema = prog.transactor(actor.transactor);
     let instance = &actor.instance;
     let bus_field = &actor.bus_field;
+    // The serving binding carries any `bind ... with { ... }` remap
+    // table; absent one (no test-scope binding), the responder falls
+    // back to the `<field>_<method>_<sig>` convention.
+    let binding = bindings.iter().find(|b| b.field == *bus_field);
     let pad = INDENT.repeat(depth);
     let pad1 = INDENT.repeat(depth + 1);
     let pad2 = INDENT.repeat(depth + 2);
@@ -1316,7 +1327,10 @@ pub(super) fn emit_target_actor(
         let names = cpp_local_names(func);
         let empty_lanes = HashMap::new();
         let cx = ECx { func, names: &names, lanes: &empty_lanes, self_subst: None };
-        let wire = |sig: &str| format!("dut->{bus_field}_{method}_{sig}");
+        let wire = |sig: &str| match binding {
+            Some(b) => format!("dut->{}", b.wire_name(method, sig)),
+            None => format!("dut->{bus_field}_{method}_{sig}"),
+        };
         let slot_var = format!("_{instance}_{method}_target_slot");
         let trace_event = |out: &mut String, phase: &str, d: usize| {
             writeln!(

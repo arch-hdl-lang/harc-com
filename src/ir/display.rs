@@ -49,6 +49,15 @@ impl Display for TbProgram {
                         .join(" ");
                     write!(f, "[{ms}]")?;
                 }
+                if !b.remap.is_empty() {
+                    let rs = b
+                        .remap
+                        .iter()
+                        .map(|((ch, sig), port)| format!("{ch}.{sig}={port}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    write!(f, " with{{{rs}}}")?;
+                }
             }
             for (field, x) in &tb.transactor_fields {
                 write!(f, " xactor {field}=x{}", x.0)?;

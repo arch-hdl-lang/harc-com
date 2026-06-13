@@ -2701,10 +2701,11 @@ end impl ExprTest
     );
 }
 
-/// `bind ... with { ... }` signal remaps are emission-side metadata the
-/// IR does not carry yet — rejected at the bind site.
+/// `bind ... with { ... }` signal remaps now lower: the binding's
+/// `remap` table records the `(channel, signal) → port` override so the
+/// wire emission resolves through it (mirrors v1's `bus_remap`).
 #[test]
-fn bus_bind_remap_is_unsupported() {
+fn bus_bind_remap_lowers() {
     let src = r#"
 bus RemapBus
     tlm_method read(addr: uint<8>) -> uint<32>: blocking;
@@ -2723,9 +2724,46 @@ impl RemapTest for RemapTb
     end run
 end impl RemapTest
 "#;
+    let prog = lower_src(src).expect("lowers");
+    let binding = &prog.testbenches[0].bus_bindings[0];
+    assert_eq!(
+        binding.remap,
+        vec![(("read".to_string(), "req_valid".to_string()), "mem_read_req_valid".to_string())]
+    );
+    // The override resolves; an unmapped signal falls back to the
+    // `<field>_<channel>_<signal>` convention.
+    assert_eq!(binding.wire_name("read", "req_valid"), "mem_read_req_valid");
+    assert_eq!(binding.wire_name("read", "addr"), "mem_read_addr");
+}
+
+/// A remap path must be exactly `<channel>.<signal>` (2 segments) —
+/// a single- or 3+-segment path is a hard lowering error, matching
+/// v1's `bind ... with` translation.
+#[test]
+fn bus_bind_remap_malformed_path_is_invalid() {
+    let src = r#"
+bus RemapBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus RemapBus
+
+testbench RemapTb
+    dut : TlmMemory
+end testbench RemapTb
+
+impl RemapTest for RemapTb
+    let mem : RemapBus = bind dut with {
+        read.req.valid: "mem_read_req_valid"
+    }
+    run
+        let x = mem.read(5)
+    end run
+end impl RemapTest
+"#;
     let err = lower_src(src).unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("bus bind signal remaps"), "{msg}");
+    assert!(
+        matches!(err, lower::LowerError::Invalid(ref m) if m.contains("must be exactly")),
+        "{err:?}"
+    );
 }
 
 /// Unknown channel signals are hard errors with v1's diagnostic text
@@ -2887,6 +2925,39 @@ fn tlm_target_thread_if_emitted_cpp_snapshot() {
         "tlm_target_thread_if_emitted_cpp",
         emit_fixture_cpp("tlm_target_thread_if_test.harc")
     );
+}
+
+/// `bind ... with { method.sig: "port" }` signal remaps survive
+/// lowering: the binding line carries the sorted `(channel, signal) →
+/// port` table. The fixture binds with name `m`, so the
+/// `<field>_<channel>_<signal>` convention would produce `m_read_*` —
+/// every entry remaps to the real `mem_read_*` port, so the table is
+/// load-bearing, not an identity no-op.
+#[test]
+fn bus_bind_remap_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("tlm_bind_remap_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let text = format!("{prog}");
+    assert!(
+        text.contains(" with{poke.addr=mem_poke_addr")
+            && text.contains("read.addr=mem_read_addr"),
+        "bind remap table (sorted by key) must ride the binding line:\n{text}"
+    );
+    insta::assert_snapshot!("bus_bind_remap_dump_ir", text);
+}
+
+/// Locks the emitted C++ for the remapped blocking call edges: every
+/// req/rsp wire resolves through the `bind ... with` override to
+/// `dut->mem_read_*` / `dut->mem_poke_*` — the `m_read_*` convention
+/// names never appear, proving the remap rewrites the wire emission.
+#[test]
+fn bus_bind_remap_emitted_cpp_snapshot() {
+    let cpp = emit_fixture_cpp("tlm_bind_remap_test.harc");
+    assert!(
+        cpp.contains("dut->mem_read_req_valid") && !cpp.contains("dut->m_read_req_valid"),
+        "remapped wires must override the convention name:\n{cpp}"
+    );
+    insta::assert_snapshot!("bus_bind_remap_emitted_cpp", cpp);
 }
 
 /// Transactor-call seam rule, verifier side: the call edge is pinned

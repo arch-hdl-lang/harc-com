@@ -1,0 +1,38 @@
+---
+source: tests/tbir.rs
+assertion_line: 2946
+expression: text
+---
+tb-ir program
+  testbench tb0 TlmBindRemapTb { dut: TlmMemory } bus m=TlmRemapBus[read(addr)->r poke(addr,data)] with{poke.addr=mem_poke_addr poke.data=mem_poke_data poke.req_ready=mem_poke_req_ready poke.req_valid=mem_poke_req_valid poke.rsp_ready=mem_poke_rsp_ready poke.rsp_valid=mem_poke_rsp_valid read.addr=mem_read_addr read.req_ready=mem_read_req_ready read.req_valid=mem_read_req_valid read.rsp_data=mem_read_rsp_data read.rsp_ready=mem_read_rsp_ready read.rsp_valid=mem_read_rsp_valid}
+  test TlmBindRemapTest tb=tb0 run=fn0 check=-
+
+fn fn0 run_TlmBindRemapTest [kind=Run, owner=tb0]
+  locals:
+    %0 initial : unknown
+    %1 __t0 : unknown
+    %2 updated : unknown
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.mem_read_req_valid, 0)
+    DutWrite(dut.mem_read_rsp_ready, 0)
+    DutWrite(dut.mem_read_ooo_req_valid, 0)
+    DutWrite(dut.mem_read_ooo_rsp_ready, 0)
+    DutWrite(dut.mem_poke_req_valid, 0)
+    DutWrite(dut.mem_poke_rsp_ready, 0)
+    -> WaitCycles(2, b1)
+
+  b1:
+    DutWrite(dut.rst, 0)
+    -> WaitCycles(1, b2)
+
+  b2:
+    Assign(%initial, m.read(5))
+    AssertCheck { cond: (%initial == 261), on_fail: "initial read got 0x%08llx, expected 0x00000105", %initial }
+    Assign(%__t0, m.poke(8, 3405691582))
+    Assign(%updated, m.read(8))
+    AssertCheck { cond: (%updated == 3405691582), on_fail: "updated read got 0x%08llx, expected 0xCAFEBABE", %updated }
+    Log(info, "ALL TESTS PASSED - tlm_bind_remap_test")
+    -> Return
