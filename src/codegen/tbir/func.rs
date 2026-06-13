@@ -22,7 +22,7 @@
 
 use super::expr::{
     ECx, comp_base_cpp, escape_c, expr_cpp, fmt_arg_cpp, helper_cpp_name, lane_width, port_read,
-    port_signal, wide_words_over_128,
+    port_signal, probe_read_accessor, wide_words_over_128,
 };
 use crate::codegen::cpp_tb::EmitError;
 use crate::ir::{
@@ -82,10 +82,11 @@ pub(super) fn emit_function(
     bindings: &[BusBindingSchema],
     lanes: &HashMap<String, u32>,
     randomize_snippets: &[String],
+    dut_type: &str,
     depth: usize,
 ) -> Result<(), EmitError> {
     let names = cpp_local_names(func);
-    let cx = ECx { func, names: &names, lanes, self_subst: None };
+    let cx = ECx { func, names: &names, lanes, self_subst: None, dut_type };
     let pad = INDENT.repeat(depth);
     let pad1 = INDENT.repeat(depth + 1);
     let pad2 = INDENT.repeat(depth + 2);
@@ -265,13 +266,15 @@ pub(super) fn emit_tseq(
     depth: usize,
 ) -> Result<(), EmitError> {
     let names = cpp_local_names(func);
-    // tseq bodies hold no packed-lane DUT access (no DUT at all).
+    // tseq bodies hold no packed-lane DUT access (no DUT at all), so no
+    // probe access either (`dut_type` unused → `""`).
     let empty_lanes = HashMap::new();
     let cx = ECx {
         func,
         names: &names,
         lanes: &empty_lanes,
         self_subst: None,
+        dut_type: "",
     };
     let nparams = func.params.len();
     let pad = INDENT.repeat(depth);
@@ -414,9 +417,10 @@ pub(super) fn emit_helper_prototype(out: &mut String, func: &TbFunction) {
 /// loop-switch local model.
 pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Result<(), EmitError> {
     let names = cpp_local_names(func);
-    // Pure helpers are scalar-only: no DUT access, so no lane table.
+    // Pure helpers are scalar-only: no DUT access, so no lane table and
+    // no probe access (`dut_type` unused → `""`).
     let empty_lanes = HashMap::new();
-    let cx = ECx { func, names: &names, lanes: &empty_lanes, self_subst: None };
+    let cx = ECx { func, names: &names, lanes: &empty_lanes, self_subst: None, dut_type: "" };
     let nparams = func.params.len();
 
     let ret_ty = if func.ret.is_some() { "uint64_t" } else { "void" };
@@ -581,8 +585,19 @@ fn emit_stmt(
             let e = expr_cpp(cx, value)?;
             writeln!(out, "{pad}{instance}.{field} = {e};").ok();
         }
+        Stmt::DutWrite(p, e) if matches!(p.access, crate::ir::PortAccess::Force) => {
+            // `dut.<force_probe> = expr` → the two-store drv+en pair the
+            // bound SV stub picks up to procedurally force the target
+            // (docs/probe-signals.md §4.1; v1's `emit_signal_assignment`
+            // force-probe arm). The read-side mangled accessor is the
+            // base; `_drv`/`_en` derive by suffix.
+            let base = probe_read_accessor(cx.dut_type, p);
+            let val = expr_cpp(cx, e)?;
+            writeln!(out, "{pad}dut->rootp->{base}_drv = {val};").ok();
+            writeln!(out, "{pad}dut->rootp->{base}_en = 1;").ok();
+        }
         Stmt::DutWrite(p, e) => {
-            let sig = port_signal(p);
+            let sig = port_signal(cx, p);
             match p.lane {
                 // Packed multi-lane port: bit-deposit through the
                 // runtime helper; unpacked-array port: raw subscript
@@ -632,6 +647,13 @@ fn emit_stmt(
         Stmt::DutRead(l, p) => {
             let name = &names[l.index()];
             writeln!(out, "{pad}{name} = {};", port_read(cx, p)).ok();
+        }
+        Stmt::ProbeRelease(p) => {
+            // `release dut.<force_probe>` → clear the enable wire so the
+            // bound SV stub releases its procedural force (v1's `release`
+            // → `<mangled>_en = 0`). Lowering guaranteed `access == Force`.
+            let base = probe_read_accessor(cx.dut_type, p);
+            writeln!(out, "{pad}dut->rootp->{base}_en = 0;").ok();
         }
         Stmt::Log { level, args } => {
             let (sev, file) = match level {
@@ -946,11 +968,15 @@ pub(super) fn emit_method(
     // with packed Vec lanes); an empty table falls back to raw
     // subscripts, matching v1 for that case.
     let empty_lanes = HashMap::new();
+    // Method bodies access the bound DUT (`schema.dut_type`); probes are
+    // never declared on a transactor DUT (lowering rejects it), but pass
+    // the real type so any `PortAccess` would mangle correctly.
     let cx = ECx {
         func,
         names: &names,
         lanes: &empty_lanes,
         self_subst: None,
+        dut_type: &schema.dut_type,
     };
     let nparams = func.params.len();
     let pad = INDENT.repeat(depth);
@@ -1172,11 +1198,13 @@ pub(super) fn clause_expr_cpp(
     let func = prog.function(function);
     let names = cpp_local_names(func);
     let empty_lanes = HashMap::new();
+    // Component clause exprs read component fields, not DUT probes.
     let cx = ECx {
         func,
         names: &names,
         lanes: &empty_lanes,
         self_subst: Some(instance),
+        dut_type: "",
     };
     expr_cpp(&cx, e)
 }
@@ -1194,11 +1222,13 @@ fn emit_component_fn_lambda(
     let func = prog.function(function);
     let names = cpp_local_names(func);
     let empty_lanes = HashMap::new();
+    // Component method/on-handler bodies are host-side; no DUT probes.
     let cx = ECx {
         func,
         names: &names,
         lanes: &empty_lanes,
         self_subst: None,
+        dut_type: "",
     };
     let nparams = func.params.len();
     let pad = INDENT.repeat(depth);
@@ -1326,7 +1356,8 @@ pub(super) fn emit_target_actor(
         let func = prog.function(tm.function);
         let names = cpp_local_names(func);
         let empty_lanes = HashMap::new();
-        let cx = ECx { func, names: &names, lanes: &empty_lanes, self_subst: None };
+        // Target-TLM responder bodies are wire-protocol only; no probes.
+        let cx = ECx { func, names: &names, lanes: &empty_lanes, self_subst: None, dut_type: "" };
         let wire = |sig: &str| match binding {
             Some(b) => format!("dut->{}", b.wire_name(method, sig)),
             None => format!("dut->{bus_field}_{method}_{sig}"),

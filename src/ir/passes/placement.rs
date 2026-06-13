@@ -263,6 +263,14 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 host_service_only = false;
                 touch(&mut accesses, port.access);
             }
+            Stmt::ProbeRelease(port) => {
+                // `release dut.<probe>` drives the force-enable wire — a
+                // pin-side op against a `Force` access point, no value
+                // expr.
+                has_pin_stmt = true;
+                host_service_only = false;
+                touch(&mut accesses, port.access);
+            }
             Stmt::Assign(_, e) => {
                 host_service_only = false;
                 visit_expr(e, &mut accesses, &mut transactor);

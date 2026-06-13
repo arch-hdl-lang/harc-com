@@ -1,0 +1,54 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 ProbeForceTb { dut: CpuPipe }
+  test ProbeForceTest tb=tb0 run=fn0 check=-
+
+fn fn0 run_ProbeForceTest [kind=Run, owner=tb0]
+  entry = b0
+
+  b0:
+    Log(info, "CpuPipe probe force/release fault-injection test")
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.imem_valid, 1)
+    DutWrite(dut.imem_data, 0)
+    DutWrite(dut.rs1_data, 100)
+    DutWrite(dut.rs2_data, 200)
+    DutWrite(dut.branch_taken, 0)
+    DutWrite(dut.branch_target, 0)
+    -> WaitCycles(2, b1)
+
+  b1:
+    DutWrite(dut.rst, 0)
+    -> WaitCycles(1, b2)
+
+  b2:
+    DutWrite(dut.imem_data, 96)
+    -> WaitCycles(1, b3)
+
+  b3:
+    DutWrite(dut.imem_data, 0)
+    -> WaitCycles(1, b4)
+
+  b4:
+    AssertCheck { cond: (dut.alu_a (probe) == 100), on_fail: "natural alu_a: expected 100, got %lld", dut.alu_a (probe) }
+    DutWrite(dut.inject_rs1 (force), 3735928559)
+    -> WaitCycles(1, b5)
+
+  b5:
+    AssertCheck { cond: (dut.alu_a (probe) == 3735928559), on_fail: "forced alu_a: expected 0xDEADBEEF, got 0x%08llx", dut.alu_a (probe) }
+    ProbeRelease(dut.inject_rs1 (force))
+    DutWrite(dut.rs1_data, 42)
+    DutWrite(dut.imem_data, 96)
+    -> WaitCycles(1, b6)
+
+  b6:
+    DutWrite(dut.imem_data, 0)
+    -> WaitCycles(1, b7)
+
+  b7:
+    AssertCheck { cond: (dut.alu_a (probe) == 42), on_fail: "after release alu_a: expected 42, got %lld", dut.alu_a (probe) }
+    Log(info, "PASS: probe force injected 0xDEADBEEF, release restored natural flow")
+    -> Return

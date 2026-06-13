@@ -988,6 +988,14 @@ pub enum Stmt {
     Assign(LocalId, Expr),
     DutWrite(PortRef, Expr),
     DutRead(LocalId, PortRef),
+    /// `release dut.<probe>` — clear the active SV procedural force on a
+    /// `probe force` signal so the DUT signal returns to its natural
+    /// value. The `PortRef` carries `access: PortAccess::Force` and the
+    /// probe name in `port_path`; emission clears the `_en` enable wire
+    /// (mirrors v1's `release` → `<mangled>_en = 0`). Only valid for a
+    /// force-capable probe (lowering rejects `release` on a read-only
+    /// probe or an ordinary port).
+    ProbeRelease(PortRef),
     /// (Re-)default-construct a record-typed local at its `let` site.
     /// Emitted as an explicit assignment (not just the hoisted
     /// declaration's initializer) because v1 declares the struct at

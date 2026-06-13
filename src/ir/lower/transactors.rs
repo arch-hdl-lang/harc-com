@@ -264,6 +264,8 @@ pub(crate) fn lower_transactor(
         txn_keeps: HashMap::new(),
         randomize_problem_ids: HashMap::new(),
     tseqs: HashMap::new(),
+        // Transactor-context lowering never resolves test-scope probes.
+    probes: HashMap::new(),
     };
 
     let mut funcs = Vec::new();
@@ -470,6 +472,8 @@ fn lower_bound_target_transactor(
         txn_keeps: HashMap::new(),
         randomize_problem_ids: HashMap::new(),
     tseqs: HashMap::new(),
+        // Transactor-context lowering never resolves test-scope probes.
+    probes: HashMap::new(),
     };
 
     let mut funcs = Vec::new();
@@ -750,6 +754,8 @@ fn lower_bound_initiator_transactor(
         txn_keeps: HashMap::new(),
         randomize_problem_ids: HashMap::new(),
     tseqs: HashMap::new(),
+        // Transactor-context lowering never resolves test-scope probes.
+    probes: HashMap::new(),
     };
 
     let mut funcs = Vec::new();

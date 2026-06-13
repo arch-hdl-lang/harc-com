@@ -183,7 +183,7 @@ impl FuncBuilder<'_> {
             StmtKind::Emit { name, args, .. } => self.lower_emit(name, args),
             StmtKind::Yield(e) => self.lower_yield(e),
             StmtKind::Apply(_) => Err(unsupported("`apply`", "")),
-            StmtKind::Release(_) => Err(unsupported("probe `release`", "")),
+            StmtKind::Release(e) => self.lower_release(e),
             StmtKind::Assume(_) => Err(unsupported("`assume`", "")),
             StmtKind::Cover(_) => Err(unsupported("`cover`", "")),
             StmtKind::Expr(e) => {
@@ -481,6 +481,17 @@ impl FuncBuilder<'_> {
         value: &crate::ast::Expr,
     ) -> Result<(), LowerError> {
         if let Some(port) = self.as_port_ref(target)? {
+            // Writing a read-only `probe` is a hard error: only a
+            // `probe force` declaration opts into the SV procedural-force
+            // write path. Point the user at the `force` modifier (mirrors
+            // v1's `emit_signal_assignment` read-only-probe rejection).
+            if matches!(port.access, crate::ir::PortAccess::Probe) {
+                return Err(LowerError::Invalid(format!(
+                    "write to `dut.{}`: read-only probe — declare with \
+                     `probe force` to enable fault injection",
+                    port.port_path.join("."),
+                )));
+            }
             let e = self.lower_expr(value)?; // ports allowed in DutWrite values
             self.push(Stmt::DutWrite(port, e));
             return Ok(());
@@ -674,6 +685,37 @@ impl FuncBuilder<'_> {
             }
         }
         Err(unsupported("assignment to a non-port, non-local target", ""))
+    }
+
+    /// `release dut.<probe>` — disable an active SV procedural force on a
+    /// `probe force` signal so the DUT signal returns to its natural
+    /// value. Lowers to a `ProbeRelease(PortRef)`; the PortRef must
+    /// resolve to a `Force` probe (releasing a read-only probe or an
+    /// ordinary port is a hard error). Mirrors v1's `release` lowering
+    /// (`<mangled>_en = 0`).
+    fn lower_release(&mut self, target: &crate::ast::Expr) -> Result<(), LowerError> {
+        let Some(port) = self.as_port_ref(target)? else {
+            return Err(unsupported(
+                "`release` of a non-DUT target",
+                "`release` applies only to a `probe force` signal on the DUT",
+            ));
+        };
+        match port.access {
+            crate::ir::PortAccess::Force => {
+                self.push(Stmt::ProbeRelease(port));
+                Ok(())
+            }
+            crate::ir::PortAccess::Probe => Err(LowerError::Invalid(format!(
+                "`release dut.{}`: read-only probe — only a `probe force` \
+                 signal can be released",
+                port.port_path.join("."),
+            ))),
+            crate::ir::PortAccess::Port => Err(LowerError::Invalid(format!(
+                "`release dut.{}`: not a probe — `release` applies only to a \
+                 `probe force` signal",
+                port.port_path.join("."),
+            ))),
+        }
     }
 
     /// Recognize a scoreboard queue method access `sb.<queue>.<method>`

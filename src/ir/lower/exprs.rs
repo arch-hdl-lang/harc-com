@@ -528,12 +528,30 @@ impl FuncBuilder<'_> {
                             ));
                         }
                         segments.reverse();
+                        // A single-segment `dut.<name>` whose name was
+                        // declared as a `probe` on `let dut` is a DUT-
+                        // internal access, not a top-level port: it lowers
+                        // to a `Probe` (read-only) or `Force` (force-
+                        // capable) `PortRef` so the tbir backend routes it
+                        // through the SV bind-stub accessor. Ordinary ports
+                        // keep `Port`. See docs/probe-signals.md.
+                        let (access, width) = match self.ctx.probes.get(&segments[0]) {
+                            Some(meta) => {
+                                let access = if meta.force {
+                                    PortAccess::Force
+                                } else {
+                                    PortAccess::Probe
+                                };
+                                (access, meta.width)
+                            }
+                            None => (PortAccess::Port, None),
+                        };
                         return Ok(Some(PortRef {
                             testbench_field: self.ctx.dut_field.clone(),
                             port_path: segments,
                             direction: None,
-                            width: None,
-                            access: PortAccess::Port,
+                            width,
+                            access,
                             lane: None,
                         }));
                     }
