@@ -438,6 +438,21 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             _ => None,
         })
         .collect();
+    // Reactive monitor / checker transactors (cycle-trigger / periodic
+    // `on` handlers, no `in event` consumer pipe). These route to the
+    // composite-component table AND accept a `passive` instance mode (the
+    // observation half is always-on, with no `when active` registration to
+    // suppress). A subset of `event_driven_transactor_names`.
+    let reactive_monitor_names: HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Transactor(t) if components::transactor_is_reactive_monitor(t) => {
+                Some(t.name.name.clone())
+            }
+            _ => None,
+        })
+        .collect();
 
     // File-level construct gate: anything outside the MVP subset is an
     // explicit Unsupported, never silently dropped.
@@ -528,6 +543,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                         &scoreboard_ids,
                         &component_type_names,
                         &event_driven_transactor_names,
+                        &reactive_monitor_names,
                     )?;
                 } else if matches!(
                     c.kind,
@@ -991,6 +1007,7 @@ fn validate_testbench_component(
     scoreboard_ids: &HashMap<String, ScoreboardId>,
     component_type_names: &HashSet<String>,
     event_driven_transactor_names: &HashSet<String>,
+    reactive_monitor_names: &HashSet<String>,
 ) -> Result<(), LowerError> {
     for ci in &c.items {
         match ci {
@@ -998,6 +1015,16 @@ fn validate_testbench_component(
                 if let TypeExpr::Named { name, mode, .. } = &f.ty {
                     let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
                     if covgroup_ids.contains_key(simple) {
+                        continue;
+                    }
+                    // A reactive monitor / checker transactor field (`mon :
+                    // MemXactor passive`) routes to a `ComponentSchema`;
+                    // its always-on cycle-trigger / periodic handlers
+                    // register regardless of mode, so BOTH `active` and
+                    // `passive` are accepted (and an unannotated instance
+                    // defaults to the observation-only behavior). Checked
+                    // before the event-driven gate (a monitor is a subset).
+                    if reactive_monitor_names.contains(simple) {
                         continue;
                     }
                     // An event-driven transactor field (`drv : SeqXactor

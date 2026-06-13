@@ -142,6 +142,36 @@ transactor surface itself.
 its former `const` blocker is resolved, the next blocker is its
 `MshrXactor` transactor).*
 
+### transactor-composition cluster — PARTIALLY RESOLVED (2026-06-13)
+
+Four corpus fixtures stack variations of event-driven / passive /
+multi-field / `post_eval` transactor composition. The shared routing
+mechanism (`transactor_is_component`) was broadened so a **reactive
+monitor / checker** transactor — cycle-trigger (`on dut.<sig>`,
+`on <expr> level`) and/or periodic (`on <N> cycles`) handlers with NO
+`in event` consumer pipe — routes to the composite-component table (it
+already lowers those handler shapes against an optional `dut` handle +
+scoreboard subs). A reactive-monitor instance accepts (and ignores) an
+`active`/`passive` mode at the field site (`transactor_is_reactive_monitor`
+→ the `reactive_monitor_names` gate): its handlers are always-on,
+registered regardless of mode, so a `passive` instance is valid — unlike
+an `in event` consumer whose `on req` registration needs `active`. The
+prior silent mis-lowering of a named `queue<Record>` element as an unsigned
+scalar (the `_ => false` fall-through in component-field lowering) was also
+fixed — it is now a precise rejection (`queue_elem_signedness`).
+
+| Fixture | Status | First blocker |
+|---|---|---|
+| `dma_engine_test` | **REGISTERED 2026-06-13** (`dma_engine.sv`, pass; trace-diff clean v1↔tbir) | (resolved) a PASSIVE reactive-monitor transactor (`mon : MemXactor passive`, `on dut.<v> && dut.<r>` observers + `on dut.<v> level` combinational memory model) + an `active` DUT-poking APB BFM |
+| `scoreboard_typed_queue_test` | deferred | `queue<CheckerError>` (record-payload queue) on a method-bearing scoreboard component — needs the component-queue-op + record-element seam (push/pop of a struct on a component `Queue` field; today only `queue<scalar ≤ 64 bits>` lowers). Also stacks `on 1 cycles phase post_eval`. Rejected precisely. |
+| `post_eval_provider_test` | deferred | function-library transactor (`ProtocolModel`, methods only, no DUT handle) used as a sub-field + component-as-method-argument (`sb.observe(addr, model)` passes a transactor instance and dispatches `model.predict_read(...)` on the param) + `on ... phase post_eval`. Needs the function-library-as-sub-field + component-arg + post_eval-phase seams. |
+| `axilite_env_test` | deferred | env-of-method-transactor: `env AxilEnv { drv : AxilXactor }` holds a DUT-poking hookable BFM as a Sub, with nested `env.drv.<method>` dispatch + `env.drv.dut = dut` bind through the env. The DUT-poking BFM lowers as a `TransactorSchema` (not a `ComponentSchema`), so it is not resolvable as an env Sub field; needs env Sub-of-transactor resolution + nested method/DUT-bind routing. |
+
+The `dma_engine` unlock landed the reactive-monitor routing; the other
+three each stack one or more further seams (struct queues + post_eval /
+function-library-as-sub-field + component-arg + post_eval / env-of-BFM) and
+stay rejected precisely.
+
 ### `regblock` construct — PARTIALLY RESOLVED (regblock slice 2026-06-12; bus-bound BFM + residuals + field-level/addrmap 2026-06-13)
 
 The `regblock` register-level frontdoor subset now lowers (synthetic

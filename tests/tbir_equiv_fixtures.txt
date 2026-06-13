@@ -155,3 +155,4 @@ axilite_hooks_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 regblock_record_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 regblock_record_recursion_test | AxiLiteRegs | AxiLiteRegs.sv | - | fail
 aes_cipher_top_test | AesCipherTop | aes_cipher_top.sv aes_key_expand_128.sv xtime.sv | - | pass
+dma_engine_test | DmaEngine | dma_engine.sv | - | pass
