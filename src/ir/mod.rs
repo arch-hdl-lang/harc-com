@@ -533,6 +533,19 @@ pub struct CycleTriggerHandlerSchema {
     /// Lowered handler body (`kind: ComponentMethod`, zero params — `self`
     /// only).
     pub function: FunctionId,
+    /// `Some(channel)` when this cycle-trigger handler is the desugared
+    /// form of an `on bus.<ch>.handshake(arg)` passive bus-monitor handler
+    /// on a `bound to <Bus>` transactor (v1's `emit_bound_monitor_actors`).
+    /// The synthesized `trigger` is the channel's `valid && ready` (rising
+    /// edge); the body's lowered preamble captures the channel payload into
+    /// the handler's `arg` local (+ per-field aliases) so `arg`/`arg.<f>`
+    /// reads resolve, then runs the user body (`sb.<q>.push(arg.<f>)`).
+    /// `None` for an agent-mode `on <bool-expr>` cycle-trigger (which reads
+    /// `dut.<sig>` directly). The placeholder bus prefix in the trigger +
+    /// body is filled with the real binding name at test-binding time, like
+    /// the bound-bus driver. Always-on: present on BOTH active and passive
+    /// instances (the observation half, unaffected by `when active` mode).
+    pub monitor_channel: Option<String>,
 }
 
 /// Edge mode for a cycle-trigger handler — mirrors `ast::EdgeMode` in the

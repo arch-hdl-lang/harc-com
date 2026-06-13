@@ -134,3 +134,6 @@ mshr_cocotb_test | cache_mshr | cache_mshr.sv | - | pass
 transactor_bound_initiator_state_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 tlm_method_bus_test | TlmMemory | TlmMemory.sv | - | pass
 transactor_active_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
+transactor_passive_only_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
+axilite_bound_mon_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
+axilite_multi_payload_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass

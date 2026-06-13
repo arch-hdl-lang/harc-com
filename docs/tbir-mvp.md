@@ -41,6 +41,7 @@ checked against the code at the cited location.
 | bus-bind-remap slice (2026-06-13) | **`bind ... with { ch.sig: "port", ... }` bus signal remaps** (`src/ir/lower/bus.rs`, `src/codegen/tbir/func.rs`, `src/ir/{mod,display}.rs`). Mirrors v1's `bind_remap → bus_remap → bus_signal_name`: `BusBindingSchema` gains a `remap: Vec<((channel, signal), port)>` (sorted by key for deterministic dump-ir) plus a `wire_name(channel, signal)` resolver that returns the override if present else the `<field>_<channel>_<signal>` convention. `lower_bus_binding` no longer rejects `bind_remap` — it validates each path is exactly `<channel>.<signal>` (2 segments, malformed is a hard `Invalid` error) and records it. The two `wire` closures in `emit_transactor_call` (initiator call edge) and `emit_target_actor` (target responder, which now also receives `&tb.bus_bindings`) route through `wire_name`, so both TLM directions honor the override. For a `tlm_method` the channel is the method name and the signal is a protocol wire (`req_valid`/`addr`/`rsp_data`/...). No new IR variants, no statement/expr forms. Fixtures (all trace-diff clean v1↔tbir at seed 1): `tlm_bind_remap_test` (self-proving — binds with name `m` so the convention would drive nonexistent `m_read_*`; every entry remaps to the real `mem_read_*`/`mem_poke_*` port, proving the table is load-bearing), `dma_engine_tlm_target_test` + `dma_engine_tlm_mem_model_test` (corpus — blocking target responders that were rejected only for the explicit `bind ... with`). **Still rejected** (residual map): `fork`/`join_all` TLM issue (`tlm_method_bus_test`, `tlm_target_fork_forwarding_test`, `tlm_pairing_arch_target_test`), `out_of_order tags N` target lanes (`tlm_target_ooo_lanes_test`, `tlm_pairing_arch_initiator_test`), and nested responder forwarding (`tlm_target_forwarding_test`) — each a distinct deeper slice. |
 | initiator-side fork/join_all TLM slice (2026-06-13) | **`let x = fork bus.<method>(args)` + `join_all` over bus `tlm_method`s — initiator-side concurrent issue** (`src/ir/lower/{bus,stmts,mod}.rs`, `src/ir/{mod,display,verify,passes/placement}.rs`, `src/codegen/tbir/{mod,func}.rs`). Mirrors v1's `try_emit_bus_tlm_fork` / `emit_tlm_join_all`: a `fork` issues ONLY the request side (drive arg wires + optional `req_tag`, raise `req_valid`, 16-cycle budget-wait `req_ready`, tick, drop `req_valid`); the response is captured at the next `join_all`. New IR: `Stmt::TlmFork(TlmForkDesc)` (request issue) + `Stmt::TlmJoinAll(Vec<TlmForkDesc>)` (drain), where `TlmForkDesc` is self-contained (`bus_field`, `method`, `args`, `dest`, `has_ret`, `tag`) so the join statement carries its own descriptors — no cross-statement lowering replay in the backend. Tag allocation is per-`(bus_field, method)` monotonic on the builder (v1's `next_tlm_fork_tag`): a `blocking` method gets `tag: None` (issue-order FIFO drain — `emit_ordered_tlm_join_all`: per fork, raise `rsp_ready`, 64-cycle budget-wait `rsp_valid`, capture `rsp_data`, tick, drop); an `out_of_order tags N` method gets `tag: Some(n)` (tag-routed drain — `emit_tagged_tlm_join_all`: poll every lane per tick, accept any `rsp_tag`-matching not-yet-seen fork, 256-cycle budget — so tag 1 can land before tag 0). The pending-fork accumulator survives `WaitCycles` between blocks (it is builder-state, not block-state), so a fork in one block + `wait` + a second fork + `join_all` in the next block lowers correctly. `lower_function::finish` rejects a dangling `fork` with no matching `join_all`; `lower_tlm_join_all` rejects a mixed tagged/untagged barrier (the two routing strategies can't share a join). The verifier routes both statements through `check_bus_call_edge` (Run/Check only, binding resolves on the owner tb, method exists, arg arity + no-inline-port purity); the def/use pass defines `dest` at the fork site (v1's `T x = {};` zero-init), placement classifies both as the TLM seam (`has_transactor_call` → TimingTolerant, Tier-1). Fixture: `tlm_method_bus_test` (`TlmMemory.sv`, pass) — blocking `read`/`poke` + two `out_of_order` `read_ooo` forks joined together; trace-diff clean v1↔tbir at seed 1. **Still rejected** (residual map): (a) a `fork` INSIDE a transactor responder body (target re-issuing a downstream TLM call — fork-forwarding: `tlm_target_fork_forwarding_test`, `tlm_target_forwarding_test`) — needs the responder to be both target+initiator with a request arbiter/response router; (b) target-side `out_of_order tags N` RESPONDER lanes (`tlm_target_ooo_lanes_test`, `tlm_pairing_arch_initiator_test`) — hidden tag wires + multi-lane response router; (c) `tlm_pairing_arch_target_test` (ARCH DUT) LOWERS and is v1↔tbir trace-diff clean, but its auto-emitted `_auto_tlm_*_req_stable` TLM SVA `$fatal`s under **local Verilator 5.048** for both codegens identically — a known local-only artifact, NOT registered. |
 | agent-mode + cycle-trigger slice (2026-06-13) | **agent-mode multi-DUT-handle transactor + cycle-trigger `on <expr>` monitor handlers + agent/env `connect` bridges** (`src/ir/lower/{components,stmts,mod}.rs`, `src/codegen/tbir/{mod,func,expr}.rs`). Three pieces, each unlocking the `transactor_agent_mode_test`/`transactor_env_mode_test` corpus fixtures: (1) **cycle-trigger handlers** — new `ComponentSchema::cycle_handlers: Vec<CycleTriggerHandlerSchema>` (`trigger` predicate expr + `CycleEdge { Rising \| Falling \| Level }` + zero-arg body `function`). An `on <bool-expr> ... end on` handler (distinguished from `on <ev>(arg)` by `is_event_subscription` — a `Call` whose callee names a self `event` field is a subscription; anything else is a cycle-trigger) lowers to a zero-arg `ComponentMethod` body + its trigger predicate (lowered self-relatively, so `dut.<sig>` reads route to the DUT handle and bare field reads resolve self-relative). Pass-1 reserves FunctionIds methods→event-on-handlers→periodic→cycle-trigger→watchdog (monotonic). The tbir backend installs one per-instance `_checkers` closure per cycle-handler (recursing into sub-components), gated on a uniquely-named `static` prev-state for edge detection (mirrors v1's `emit_cycle_trigger`). It is the always-on OBSERVER half — present on BOTH active and passive instances. (2) **self-relative sub-scoreboard poke** — `sb.writes = sb.writes + 1` inside a transactor body, where `sb` is a `ScoreboardSub` field of the self component: `scoreboard_root` (`stmts.rs`) now resolves a `ScoreboardSub` receiver of `self_component` to a `self`-rooted `nested_path`, and the tbir `ScoreboardOp`/`ScoreboardQuery` emission re-roots `self` at the running instance via `self_subst`. The component method ctx (`mod.rs`) now carries the `scoreboards` table so the scalar-field validation succeeds. (3) **agent + nested-env `connect` bridges** — `connect` edges are now resolved for `Agent` decls (not only `Env`), and the tbir backend recurses through `Sub` fields to install a nested sub-component's bridges (`emit_nested_connects`), so an env→agent→drv `sequencer.dispatched -> drv.req` bridge wires at `<env>.<agent>` scope. Plus: a sequencer's `hookable dispatch(txns: TSeq<Record>)` param now types as `RecordSeq` (`method_param_ir_type` resolves the `TSeq<RegOp>` element against `record_ids`, handling both `TypeArg::Type(Named)` and the bare-ident `TypeArg::Expr` parse), so `for t in txns` iterates it and the C++ param renders `std::vector<Record>`. The `active`/`passive` mode on a composite-component test-scope `let` (`let act : AxilAgent active`) is accepted (and ignored, matching v1 — the fixtures' passive correctness comes from the test never dispatching the passive sequencer, not from hard `when active` elision). Fixtures: `transactor_agent_mode_test` + `transactor_env_mode_test` (`AxiLiteRegs.sv`, pass) — same agent/env decl reused active + passive, active drives 5 AXI round-trips via sequencer→connect→`on req(t)`, both transactors' cycle-trigger observers tally 5 writes + 5 reads off the shared DUT; trace-diff clean v1↔tbir at seed 1. **Divergence**: hard `when active` body elision on a passive instance is NOT implemented (v1 doesn't elide for these fixtures either; the body is structurally present but never stimulated on passive). A `post_eval`-phased or hooked cycle-trigger is rejected precisely (checker phase only). |
+| bound-to monitor slice (2026-06-13) | **bound-to event-driven transactor's passive MONITOR surface — `on bus.<ch>.handshake(arg)` observers + `sb` ScoreboardSub feed + a `passive` bound instance** (`src/ir/lower/{components,mod}.rs`, `src/ir/{mod,display}.rs`). The deferred passive half of the bound-to-agent cluster (PR #391 landed the DRIVER half). An `on bus.<ch>.handshake(arg)` handler on a `bound to <Bus>` transactor desugars into a `CycleTriggerHandlerSchema` with a new `monitor_channel: Some(<ch>)` flag: the synthesized trigger is the channel's `<ch>.valid && <ch>.ready` (rising edge), and the body preamble captures the channel payload into the handler's `arg` local — first payload signal aliases `arg` (scalar `sb.q.push(arg)`), every signal also a per-field alias in `recv_payloads` (so `beat.data`/`beat.resp` resolve, like a `recv()` capture) — then the user body feeds the sub-scoreboard. `lower_monitor_handshake_body` reads the channel payload from the bound `BusDecl` (placeholder-prefixed in the per-component body ctx). **No new actor IR / no new tbir codegen** — reuses the agent-mode cycle-trigger `_checkers` machinery; the monitor triggers live on the schema, so a new `fill_initiator_bus_prefix_expr` (sharing the `fill_visit_*` walkers factored out of `fill_initiator_bus_prefix`) fills their placeholder bus prefix. A `passive` bound instance is now accepted when the transactor declares monitor handlers (pure-driver-no-monitor passive still rejected — inert); both modes register the always-on monitors, `active` adds the `on req` driver. **Divergence**: v1 emits a per-channel coroutine ACTOR (`emit_bound_monitor_actors`); the IR uses a rising-edge cycle-trigger instead — observably equivalent for single-beat valid/ready handshakes (the lowered subset; they'd diverge only for a multi-cycle held handshake, out of subset). Fixtures: `transactor_passive_only_test` (pure monitor), `axilite_bound_mon_test` (active driver + passive monitor concurrent), `axilite_multi_payload_test` (multi-payload `beat.data`/`beat.resp`) — all `AxiLiteRegs.sv`, pass, trace-diff clean v1↔tbir at seed 1. Closes the bound-to-agent cluster. |
 | probe/force slice (2026-06-13) | **DUT-internal signal access via declared probes (read) and force points (write)** (`src/ir/{mod,lower/{mod,stmts,exprs},passes/placement,verify,display}.rs`, `src/codegen/tbir/{mod,runtime,func,expr}.rs`). Makes the long-reserved `PortAccess::Probe`/`Force` real (was always `Port`, divergence 1). A `probe <name> : <T> at <path>` / `probe force <name> : <T> at <path>` on `let dut` (classic OR testbench-owned, the impl-for desugar preserves probes) is collected into `LowerCtx::probes` (name → `{force, width}`); a single-segment `dut.<name>` whose name is a probe lowers `as_port_ref` to a `PortRef` with `access = Probe`/`Force` + the declared scalar width. New IR: `Stmt::ProbeRelease(PortRef)` for `release dut.<probe>`. Lowering enforces the access discipline: writing a read-only probe, or `release`-ing a non-force probe / ordinary port, is a precise hard error. The tbir backend mirrors v1's `Emitter::probes`: a `Probe`/`Force` read routes through `dut->rootp-><DutType>__DOT__harc_probes__DOT__<name>` (the SV bind-stub accessor, `expr::port_signal`/`probe_read_accessor`); a `Force` write emits the `_drv = expr; _en = 1;` pair (`func.rs`); `ProbeRelease` emits `_en = 0;`. The preamble pulls in `V<DutType>___024root.h` when any probe is used (`program_has_probes`, gated like v1's `aggregated_probes`). The SV stub (`__harc_probe_<DutType>.sv`) is emitted by the shared `emit_probe_stub_if_needed` path — identical for both codegens. Fixtures (all `cpu_pipeline.sv`, pass, trace-diff clean v1↔tbir at seed 1): `probe_basic_test` (3 read-only probes hoisting `alu0.{a,b,result}`), `probe_force_test` (read probe + `probe force` write/release fault-injection), `testbench_probe_dut_test` (testbench-OWNED probed DUT + `function reset()`, regression for the impl-for desugar). **Subset / divergence**: probe types must be scalar (`uint<N>`/`sint<N>`/`bits<N>`/`bit`/`bool` — the SV stub only surfaces scalar logic); an aggregate probe type is rejected precisely. Multi-segment probe paths (`at alu0.a`) are stored verbatim in the stub `at`-target and validated by Verilator, NOT harc (mirrors v1; docs/probe-signals.md §4.4). Probing inside an ARCH-compiled DUT (`--dut`) is out of scope — these fixtures self-skip the arch-DUT sweep (`-` in the registry, no `.arch` sibling). |
 
 ### Construct subset
@@ -230,8 +231,10 @@ Everything else —
 statement/terminator form lowers in #372) and method-body `randomize`,
 `agent`/`event`, bus-bound/event-driven transactors (an UNBOUND
 DUT-poking transactor's scalar STATE fields now lower — see divergence
-10; bound-initiator and event-driven state still don't), passive
-instances, scoreboard *methods* / event-driven
+10; bound-initiator and event-driven state still don't; a `passive`
+bound event-driven transactor instance with `on bus.<ch>.handshake`
+monitor handlers now lowers — see the bound-to monitor slice),
+scoreboard *methods* / event-driven
 `on`/`connect` wiring / `queue<Struct>` payloads (the data-only
 scoreboard subset lowers — see below), the block-form `fork ... and ...
 join` statement (initiator-side `let x = fork bus.method(...)` +
@@ -1472,16 +1475,62 @@ reason. Code locations are authoritative.
       `xact.<state>` reads per-instance scalar state.
     - *Fixture.* `transactor_active_test` (`AxiLiteRegs.sv`, pass,
       trace-diff clean v1↔tbir at seed 1; registered).
-    - *Out of subset* (still rejected, precisely): the passive
-      handshake-MONITOR half (`on bus.<ch>.handshake(arg)` observers
-      sampling valid&&ready per channel into a sub-scoreboard — needs v1's
-      `emit_bound_monitor_actors` coroutine topology + a `ScoreboardSub`
-      field on a bound transactor) and a `passive` bound event-driven
-      instance. `lower_component_schema` names the monitor slice in its
-      rejection. Blocks `axilite_bound_mon_test`,
-      `axilite_multi_payload_test`, `transactor_passive_only_test`, and
-      (at `harc sim`) `transactor_parse_test` — the last is check-only, so
-      `harc check` passes.
+    - *Follow-up (now landed — see divergence 22): the passive
+      handshake-MONITOR half.*
+
+22. **Bound-to event-driven monitor (2026-06-13).** The deferred passive
+    half of divergence 21: a `transactor X bound to <Bus>`'s always-on
+    `on bus.<ch>.handshake(arg)` observer handlers + `sb` ScoreboardSub
+    field, and a `passive` bound instance. The full UVM-style monitor over
+    a bound bus (`emit_bound_monitor_actors` in v1).
+    - *Desugaring (no new actor IR).* An `on bus.<ch>.handshake(arg)`
+      handler lowers into a `CycleTriggerHandlerSchema` carrying a new
+      `monitor_channel: Some(<ch>)`. The trigger is the channel's
+      `<ch>.valid && <ch>.ready` (synthesized, rising edge); the body
+      preamble captures the channel payload into the handler's `arg` local
+      — the first payload signal aliases `arg` itself (so a scalar
+      `sb.q.push(arg)` push sees it, matching v1's implicit-conversion-to-
+      first-field), and every payload signal also lands in a per-field
+      alias recorded in `recv_payloads` (so `arg.<field>` reads, e.g.
+      `beat.data`/`beat.resp`, resolve, exactly like a `let r =
+      bus.<ch>.recv()` capture) — then the user body runs and feeds the
+      sub-scoreboard. `lower_monitor_handshake_body` (`lower/components.rs`)
+      reads the channel payload from the bound `BusDecl` (visible under the
+      placeholder prefix in the per-component body ctx). Reuses the entire
+      existing cycle-trigger `_checkers` machinery in the tbir backend — no
+      new codegen path. `ComponentFieldKind::ScoreboardSub` (the `sb`
+      field) already existed (agent-mode + scoreboard-sub slices).
+    - *Test binding.* A `passive` bound instance is now accepted when the
+      transactor declares monitor handlers (a pure-driver transactor with
+      no monitor half is still rejected — a passive instance would be
+      inert). Both `active` and `passive` instances register the always-on
+      monitor cycle-handlers; the `active` instance additionally fires its
+      `on req` driver on `emit`. The synthesized monitor triggers live on
+      the schema (rendered standalone in the per-instance `_checkers`
+      closure), so a new `fill_initiator_bus_prefix_expr` fills their
+      placeholder bus prefix with the real binding name alongside the body
+      fill (the `fill_visit_*` walkers were factored out of
+      `fill_initiator_bus_prefix` and shared).
+    - *Divergence from v1.* v1 emits a per-channel coroutine ACTOR
+      (`co_await wait_until(valid && ready)`, capture, run body,
+      `co_await wait_cycles(1)`); the IR uses a rising-edge cycle-trigger
+      `_checkers` closure instead. Observably equivalent for the lowered
+      subset — single-beat valid/ready handshakes (valid && ready high for
+      exactly one cycle per beat, as AXI-Lite drives them): both fire once
+      per handshake. They could diverge only for a multi-cycle held
+      handshake (a sustained burst with valid && ready high across several
+      cycles), where v1's actor would fire once per cycle (minus the 1-cycle
+      skip) while the rising edge fires once per 0→1 transition; such held
+      handshakes are not in the lowered subset.
+    - *Fixtures.* `transactor_passive_only_test` (pure monitor, no driver),
+      `axilite_bound_mon_test` (active driver + passive monitor,
+      concurrent), `axilite_multi_payload_test` (multi-payload
+      `beat.data`/`beat.resp` capture on the observation side) — all
+      `AxiLiteRegs.sv`, pass, trace-diff clean v1↔tbir at seed 1;
+      registered.
+    - *Out of subset* (still rejected, precisely): a non-bound component
+      carrying handshake-monitor handlers (nothing to observe), and a
+      bound transactor with a module-typed DUT handle (it drives the bus).
 
 Minor, same spirit: `IndexVec` is a plain `Vec` plus typed id structs;
 the design's `AssertFail` enum collapsed into a single
