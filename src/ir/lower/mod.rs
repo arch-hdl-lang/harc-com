@@ -669,12 +669,14 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             )?;
         prog.components.push(schema);
     }
-    // Pass 1b: resolve `connect` edges (env components only), now that
-    // every component schema (fields + methods) exists.
+    // Pass 1b: resolve `connect` edges (env + agent components — both carry
+    // a `connect` block wiring their sub-components), now that every
+    // component schema (fields + methods) exists. An agent's
+    // `sequencer.dispatched -> drv.req` bridge is the canonical case.
     let comp_snapshot = prog.components.clone();
     for (i, src) in comp_sources.iter().enumerate() {
-        if let components::CompSource::Env(env) = src {
-            let connects = components::resolve_connects(env, &comp_snapshot[i], &comp_snapshot)?;
+        if let components::CompSource::Env(decl) | components::CompSource::Agent(decl) = src {
+            let connects = components::resolve_connects(decl, &comp_snapshot[i], &comp_snapshot)?;
             prog.components[i].connects = connects;
         }
     }
@@ -696,7 +698,11 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         transactor_fields: HashMap::new(),
         transactors: Vec::new(),
         scoreboard_fields: HashMap::new(),
-        scoreboards: Vec::new(),
+        // A transactor body that pokes its own sub-scoreboard (`sb.writes =
+        // ...` inside a cycle-trigger / on-handler) validates the scalar
+        // field against the scoreboard schema, so the table must be visible
+        // here even though method bodies are not bound at testbench scope.
+        scoreboards: prog.scoreboards.clone(),
         consts: consts.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_methods: HashMap::new(),
@@ -740,6 +746,17 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             .zip(bodies.periodic_periods)
         {
             ph.period = period;
+        }
+        debug_assert_eq!(
+            bodies.cycle_triggers.len(),
+            prog.components[i].cycle_handlers.len()
+        );
+        for (ch, trigger) in prog.components[i]
+            .cycle_handlers
+            .iter_mut()
+            .zip(bodies.cycle_triggers)
+        {
+            ch.trigger = trigger;
         }
         if let (Some(ws), Some((period, max_idle))) =
             (prog.components[i].watchdog.as_mut(), bodies.watchdog_clauses)

@@ -199,6 +199,11 @@ pub(crate) fn lower_component_schema(
     // split so each reserves its FunctionId in the right contiguous block.
     let mut on_asts: Vec<&crate::ast::OnHandler> = Vec::new();
     let mut periodic_asts: Vec<&crate::ast::OnHandler> = Vec::new();
+    // Cycle-trigger handlers (`on <bool-expr> ... end on`) — the monitor
+    // half. Distinguished from event-subscription `on ev(arg)` by the
+    // trigger expression shape (a non-`Call`, or a `Call` whose callee is
+    // not a self-event field). Resolved after the field loop.
+    let mut cycle_asts: Vec<&crate::ast::OnHandler> = Vec::new();
     // At most one `watchdog` per component (the second is rejected).
     let mut watchdog_ast: Option<&crate::ast::WatchdogDecl> = None;
     // An event-driven transactor may carry a module-typed DUT handle field
@@ -287,20 +292,28 @@ pub(crate) fn lower_component_schema(
         }
     }
 
-    // Resolve on-handlers: each must be an `on <event>(arg)` subscription
-    // to a self `event<scalar>` field. Cycle-trigger / periodic / hook /
-    // bus-handshake handler forms are deferred (later slices). The body
-    // FunctionId is reserved here; the body lowers in pass 2.
+    // Resolve on-handlers. Two non-periodic shapes coexist:
+    //   * `on <event>(arg)` — a self-event subscription (the driver half).
+    //   * `on <bool-expr>` — a cycle-trigger monitor (the observer half).
+    // A handler is event-subscription iff its trigger is a `Call` whose
+    // callee names a self `event<...>` field; anything else (a bare bool
+    // expr, or a `Call` on a non-event identifier) is a cycle-trigger.
+    // The first form reserves a FunctionId here; cycle-triggers reserve
+    // theirs AFTER the periodic block (kept contiguous for pass 2).
     let mut on_handlers: Vec<crate::ir::OnHandlerSchema> = Vec::new();
     for h in &on_asts {
-        let (event, arg_payload) = resolve_on_handler_event(name, h, &fields)?;
-        let fid = FunctionId(*next_fn);
-        *next_fn += 1;
-        on_handlers.push(crate::ir::OnHandlerSchema {
-            event,
-            arg_payload,
-            function: fid,
-        });
+        if is_event_subscription(h, &fields) {
+            let (event, arg_payload) = resolve_on_handler_event(name, h, &fields)?;
+            let fid = FunctionId(*next_fn);
+            *next_fn += 1;
+            on_handlers.push(crate::ir::OnHandlerSchema {
+                event,
+                arg_payload,
+                function: fid,
+            });
+        } else {
+            cycle_asts.push(h);
+        }
     }
 
     // Periodic handlers (`on <N> cycles`). Reserved AFTER the event
@@ -315,6 +328,23 @@ pub(crate) fn lower_component_schema(
         *next_fn += 1;
         periodic_handlers.push(crate::ir::PeriodicHandlerSchema {
             period: crate::ir::Expr::CycleCount, // placeholder; pass 2 fills it
+            function: fid,
+        });
+    }
+
+    // Cycle-trigger handlers (`on <bool-expr>`). Reserved AFTER periodic
+    // and BEFORE the watchdog so the FunctionId blocks stay contiguous in
+    // pass-2 declaration order (methods → event on-handlers → periodic →
+    // cycle-trigger → watchdog). The trigger predicate lowers in pass 2
+    // (it reads DUT/component fields); pass 1 records a placeholder.
+    let mut cycle_handlers: Vec<crate::ir::CycleTriggerHandlerSchema> = Vec::new();
+    for h in &cycle_asts {
+        validate_cycle_handler(name, h)?;
+        let fid = FunctionId(*next_fn);
+        *next_fn += 1;
+        cycle_handlers.push(crate::ir::CycleTriggerHandlerSchema {
+            trigger: crate::ir::Expr::CycleCount, // placeholder; pass 2 fills it
+            edge: edge_to_ir(h.edge),
             function: fid,
         });
     }
@@ -345,8 +375,54 @@ pub(crate) fn lower_component_schema(
         connects: Vec::new(),
         on_handlers,
         periodic_handlers,
+        cycle_handlers,
         watchdog,
     })
+}
+
+/// True when `h` is an `on <event>(arg)` self-event subscription: its
+/// trigger is a `Call` whose callee is a bare identifier naming a self
+/// `event<...>` field. Everything else (a bare bool predicate, a `Call`
+/// on a non-event name) is a cycle-trigger monitor handler.
+fn is_event_subscription(h: &crate::ast::OnHandler, fields: &[ComponentFieldSchema]) -> bool {
+    let ExprKind::Call { callee, .. } = &*h.event.kind else {
+        return false;
+    };
+    let ExprKind::Ident(id) = &*callee.kind else {
+        return false;
+    };
+    fields
+        .iter()
+        .any(|f| f.name == id.name && matches!(f.kind, ComponentFieldKind::Event { .. }))
+}
+
+/// Map the AST edge mode onto the IR cycle-edge enum.
+fn edge_to_ir(e: crate::ast::EdgeMode) -> crate::ir::CycleEdge {
+    match e {
+        crate::ast::EdgeMode::Rising => crate::ir::CycleEdge::Rising,
+        crate::ast::EdgeMode::Falling => crate::ir::CycleEdge::Falling,
+        crate::ast::EdgeMode::Level => crate::ir::CycleEdge::Level,
+    }
+}
+
+/// Validate an `on <bool-expr> ... end on` cycle-trigger handler: no
+/// `pre`/`post` hook side, and (in this subset) the default `Checker`
+/// phase. A `post_eval`-phased cycle-trigger is the reactive monitor form
+/// handled elsewhere; only the checker phase is lowered here.
+fn validate_cycle_handler(comp: &str, h: &crate::ast::OnHandler) -> Result<(), LowerError> {
+    if h.hook.is_some() {
+        return Err(unsupported(
+            &format!("a `pre`/`post` hook on a cycle-trigger `on` handler on `{comp}`"),
+            "cycle-trigger handlers take no hook side",
+        ));
+    }
+    if !matches!(h.phase, crate::ast::OnPhase::Checker) {
+        return Err(unsupported(
+            &format!("a non-default-phase cycle-trigger `on` handler on `{comp}`"),
+            "only the default (checker) phase is lowered for cycle-trigger handlers",
+        ));
+    }
+    Ok(())
 }
 
 /// Validate an `on <N> cycles ... end on` periodic handler: it must carry
@@ -575,6 +651,9 @@ pub(crate) struct ComponentBodies {
     pub funcs: Vec<TbFunction>,
     /// Resolved `period` expr for each periodic handler, in schema order.
     pub periodic_periods: Vec<crate::ir::Expr>,
+    /// Resolved `trigger` expr for each cycle-trigger handler, in schema
+    /// order.
+    pub cycle_triggers: Vec<crate::ir::Expr>,
     /// Resolved `(period, max_idle)` watchdog clauses (`None` per clause
     /// when the source omitted it). `None` overall when no watchdog.
     pub watchdog_clauses: Option<(Option<crate::ir::Expr>, Option<crate::ir::Expr>)>,
@@ -601,14 +680,22 @@ pub(crate) fn lower_component_bodies(
         CompSource::Transactor(t) => (&t.items, t.when_active.as_deref()),
     };
     // Pass 1 reserved FunctionIds METHODS-first, then EVENT ON-HANDLERS,
-    // then PERIODIC HANDLERS, then the WATCHDOG body (see
-    // `lower_component_schema`). `prog.functions` is indexed by
-    // FunctionId, so the returned bodies MUST come out in that same
-    // FunctionId order — NOT source-declaration order. Ordered sub-passes
-    // guarantee monotonic ids.
+    // then PERIODIC HANDLERS, then CYCLE-TRIGGER HANDLERS, then the
+    // WATCHDOG body (see `lower_component_schema`). `prog.functions` is
+    // indexed by FunctionId, so the returned bodies MUST come out in that
+    // same FunctionId order — NOT source-declaration order. Ordered
+    // sub-passes guarantee monotonic ids.
     let mut funcs = Vec::with_capacity(
-        schema.methods.len() + schema.on_handlers.len() + schema.periodic_handlers.len() + 1,
+        schema.methods.len()
+            + schema.on_handlers.len()
+            + schema.periodic_handlers.len()
+            + schema.cycle_handlers.len()
+            + 1,
     );
+    // The component's full field set, used to re-classify each `on`
+    // handler in pass 2 exactly as pass 1 did (event-subscription vs
+    // cycle-trigger), so the FunctionId blocks line up.
+    let fields = &schema.fields;
     let mut method_idx = 0usize;
     for it in items.iter().chain(when_active.into_iter().flatten()) {
         if let ComponentItem::Hookable(h) = it {
@@ -622,7 +709,7 @@ pub(crate) fn lower_component_bodies(
         // Only EVENT-subscription handlers live in `schema.on_handlers`;
         // periodic (`on N cycles`) handlers are a separate block.
         if let ComponentItem::OnHandler(h) = it {
-            if h.periodic {
+            if h.periodic || !is_event_subscription(h, fields) {
                 continue;
             }
             let oh = &schema.on_handlers[on_idx];
@@ -648,6 +735,24 @@ pub(crate) fn lower_component_bodies(
             periodic_periods.push(period);
         }
     }
+    // Cycle-trigger handlers: lower the zero-arg body AND the trigger
+    // predicate (which reads DUT signals + component fields, so it lowers
+    // in the same self-component context).
+    let mut cycle_triggers = Vec::with_capacity(schema.cycle_handlers.len());
+    let mut cyc_idx = 0usize;
+    for it in items.iter().chain(when_active.into_iter().flatten()) {
+        if let ComponentItem::OnHandler(h) = it {
+            if h.periodic || is_event_subscription(h, fields) {
+                continue;
+            }
+            let ch = &schema.cycle_handlers[cyc_idx];
+            cyc_idx += 1;
+            let (body, trigger) =
+                lower_cycle_body(h, ch.function, cid, ctx, helpers, constraint_sites)?;
+            funcs.push(body);
+            cycle_triggers.push(trigger);
+        }
+    }
     // Watchdog body + clauses (at most one). A `disabled` watchdog left no
     // schema entry, so skip it here too.
     let mut watchdog_clauses = None;
@@ -668,8 +773,44 @@ pub(crate) fn lower_component_bodies(
     Ok(ComponentBodies {
         funcs,
         periodic_periods,
+        cycle_triggers,
         watchdog_clauses,
     })
+}
+
+/// Lower an `on <bool-expr> ... end on` cycle-trigger body as a zero-param
+/// `ComponentMethod` (`self` only) and lower its trigger predicate in the
+/// same self-component context. Returns `(body, trigger_expr)`. The
+/// trigger reads DUT signals (`dut.<sig>`) and/or component fields; it is
+/// rendered standalone in the per-instance `_checkers` closure.
+fn lower_cycle_body(
+    h: &crate::ast::OnHandler,
+    fid: FunctionId,
+    cid: ComponentId,
+    ctx: &LowerCtx,
+    helpers: &helpers::HelperRegistry<'_>,
+    constraint_sites: &std::cell::RefCell<Vec<crate::ir::ConstraintSite>>,
+) -> Result<(TbFunction, crate::ir::Expr), LowerError> {
+    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    b.self_component = Some(cid);
+    // `lower_expr` (NOT `_no_ports`): the trigger renders standalone in the
+    // per-instance `_checkers` closure, never appended to this body, so it
+    // must not hoist a port read into a body-only temp local (that local
+    // would dangle in the checker). DUT port reads render inline via the
+    // checker's test-scope `dut` pointer; field reads resolve self-
+    // relatively and re-root at the instance path at emission.
+    let trigger = b.lower_expr(&h.event)?;
+    b.lower_block_stmts(&h.body)?;
+    if !b.is_terminated() {
+        b.terminate(Terminator::Return);
+    }
+    let f = b.finish(
+        fid,
+        format!("comp_cycle_{}", fid.0),
+        FunctionKind::ComponentMethod { component: cid },
+        None,
+    )?;
+    Ok((f, trigger))
 }
 
 /// Lower an `on <N> cycles ... end on` periodic-handler body as a zero-
@@ -805,6 +946,43 @@ fn on_handler_arg_name(h: &crate::ast::OnHandler) -> String {
     "_v".to_string()
 }
 
+/// IR type of a hookable-method parameter. Extends `helpers::ir_type_of`
+/// (scalars only) with the `TSeq<Record>` form: a sequencer's
+/// `hookable dispatch(txns: TSeq<RegOp>)` binds `txns` as a `RecordSeq`
+/// local so `for t in txns` lowers to the counted-loop-over-sequence form
+/// (same typing a `let txns = SomeTseq(...)` local would get). A
+/// `TSeq<scalar>` or unresolved element falls back to `Unknown`.
+fn method_param_ir_type(ty: Option<&TypeExpr>, ctx: &LowerCtx) -> IrType {
+    if let Some(TypeExpr::Builtin {
+        name: BuiltinTy::TSeq,
+        args,
+        ..
+    }) = ty
+    {
+        // The element type-arg of `TSeq<RegOp>`. A bare `RegOp` identifier
+        // parses as `TypeArg::Expr(Ident)` (the parser only treats builtin
+        // keywords as `TypeArg::Type`); a `TypeArg::Type(Named)` also
+        // occurs via the fragment parser. Resolve both shapes.
+        let elem_name: Option<&str> = match args.first() {
+            Some(TypeArg::Type(TypeExpr::Named { name, .. })) => {
+                name.segments.last().map(|s| s.name.as_str())
+            }
+            Some(TypeArg::Expr(e)) => match &*e.kind {
+                ExprKind::Ident(id) => Some(id.name.as_str()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(simple) = elem_name {
+            if let Some(rid) = ctx.record_ids.get(simple) {
+                return IrType::RecordSeq(*rid);
+            }
+        }
+        return IrType::Unknown;
+    }
+    helpers::ir_type_of(ty)
+}
+
 fn lower_method_body(
     h: &HookableMethod,
     fid: FunctionId,
@@ -820,7 +998,7 @@ fn lower_method_body(
     // transactor method body.
     let mut params = Vec::with_capacity(h.params.len());
     for p in &h.params {
-        let ty = helpers::ir_type_of(p.ty.as_ref());
+        let ty = method_param_ir_type(p.ty.as_ref(), ctx);
         let local = b.declare(&p.name.name);
         b.set_local_type(local, ty.clone());
         if let Some(t) = &p.ty {

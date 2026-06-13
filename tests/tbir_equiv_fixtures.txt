@@ -116,3 +116,5 @@ env_quiesced_phase_test | Top | top_counter.sv | - | pass
 transactor_state_field_test | Mshr_Addr_Cam_Dual | cam_dual_basic.sv | - | pass
 axilite_seqdrv_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 event_driven_transactor_test | Top | top_counter.sv | top_counter.arch | pass
+transactor_agent_mode_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
+transactor_env_mode_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass

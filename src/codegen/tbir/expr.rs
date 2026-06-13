@@ -121,7 +121,16 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             use crate::ir::ScoreboardQuery;
             // `None` → testbench field (`_tb.<field>`); `Some(path)` →
             // env-nested data scoreboard, accessed by the run-scope path.
+            // A `self`-rooted path re-roots at the running instance via
+            // `self_subst` (self-relative sub-scoreboard read in a body).
             let base = match nested_path {
+                Some(p) if p.first().map(String::as_str) == Some("self") => {
+                    let root = cx.self_subst.unwrap_or("self");
+                    std::iter::once(root.to_string())
+                        .chain(p.iter().skip(1).cloned())
+                        .collect::<Vec<_>>()
+                        .join(".")
+                }
                 Some(p) => p.join("."),
                 None => format!("_tb.{field}"),
             };

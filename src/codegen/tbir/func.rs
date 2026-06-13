@@ -690,7 +690,17 @@ fn emit_stmt(
             use crate::ir::ScoreboardOp;
             // `None` → testbench field (`_tb.<field>`); `Some(path)` →
             // env-nested data scoreboard, accessed by the run-scope path.
+            // A `self`-rooted path is a self-relative sub-scoreboard inside
+            // a component body — re-root `self` at the running instance via
+            // `self_subst` (the cycle-trigger / on-handler poke form).
             let base = match nested_path {
+                Some(p) if p.first().map(String::as_str) == Some("self") => {
+                    let root = cx.self_subst.unwrap_or("self");
+                    std::iter::once(root.to_string())
+                        .chain(p.iter().skip(1).cloned())
+                        .collect::<Vec<_>>()
+                        .join(".")
+                }
                 Some(p) => p.join("."),
                 None => format!("_tb.{field}"),
             };
@@ -1093,6 +1103,30 @@ pub(super) fn periodic_handler_lambda_name(
     format!("{}_periodic_h{}", comp.name, ph.function.0)
 }
 
+/// Emit a component's cycle-trigger handler body as a free
+/// `<Comp>_cycle_h<fid>(<Comp>& self)` lambda (zero params besides
+/// `self`), mirroring the periodic-handler lambda shape. The trigger
+/// predicate + edge gating live in the per-instance `_checkers` closure
+/// (see `mod::emit_lifecycle_checkers`).
+pub(super) fn emit_component_cycle_handler(
+    out: &mut String,
+    prog: &TbProgram,
+    comp: &crate::ir::ComponentSchema,
+    ch: &crate::ir::CycleTriggerHandlerSchema,
+    depth: usize,
+) -> Result<(), EmitError> {
+    let lambda = cycle_handler_lambda_name(comp, ch);
+    emit_component_fn_lambda(out, prog, comp, ch.function, &lambda, depth)
+}
+
+/// The free-lambda name for a cycle-trigger handler (`<Comp>_cycle_h<fid>`).
+pub(super) fn cycle_handler_lambda_name(
+    comp: &crate::ir::ComponentSchema,
+    ch: &crate::ir::CycleTriggerHandlerSchema,
+) -> String {
+    format!("{}_cycle_h{}", comp.name, ch.function.0)
+}
+
 /// Emit a component's `watchdog` body as a free
 /// `<Comp>_watchdog<fid>(<Comp>& self)` lambda (zero params besides
 /// `self`). Only the user body runs here; the idle check + period gating
@@ -1174,6 +1208,10 @@ fn emit_component_fn_lambda(
     for (i, n) in names[..nparams].iter().enumerate() {
         let pty = match func.locals[i].ty {
             IrType::Record(r) => prog.records[r.index()].name.clone(),
+            // A transaction-sequence param (a sequencer's
+            // `hookable dispatch(txns: TSeq<RegOp>)`) is taken by value as
+            // `std::vector<Record>`, matching the tseq generator's return.
+            IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
             _ => "uint64_t".to_string(),
         };
         params.push(format!("{pty} {n}"));

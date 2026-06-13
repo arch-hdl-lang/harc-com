@@ -449,6 +449,17 @@ pub struct ComponentSchema {
     /// stamp. The body is lowered as a zero-arg `ComponentMethod`
     /// function (`self` only); bare field reads resolve self-relatively.
     pub periodic_handlers: Vec<PeriodicHandlerSchema>,
+    /// `on <bool-expr> ... end on` cycle-trigger handlers (monitor /
+    /// observer half of an agent-mode transactor). Each fires its body
+    /// once per primary-clock cycle that the trigger predicate satisfies
+    /// the requested edge mode (rising/falling/level), dispatched from a
+    /// `_checkers` closure with per-instance static prev-state. The body
+    /// is lowered as a zero-arg `ComponentMethod` function (`self` only);
+    /// bare field reads resolve self-relatively, `dut.<sig>` reads resolve
+    /// to the DUT handle, and `sb.<f>` writes resolve to the sub-scoreboard.
+    /// Always-on: present on BOTH active and passive instances (it is the
+    /// observation half, unaffected by `when active` mode elision).
+    pub cycle_handlers: Vec<CycleTriggerHandlerSchema>,
     /// `watchdog ... end watchdog` lifecycle directive (spec §8.6), at
     /// most one per component. `None` when the component declares none (or
     /// declares `watchdog disabled` — opt-out suppresses all codegen).
@@ -472,6 +483,34 @@ pub struct PeriodicHandlerSchema {
     /// Lowered handler body (`kind: ComponentMethod`, zero params — `self`
     /// only). Bare field names resolve self-relatively.
     pub function: FunctionId,
+}
+
+/// One `on <bool-expr> ... end on` cycle-trigger handler (spec §7.x
+/// monitor form). The trigger predicate is evaluated every primary-clock
+/// cycle in a `_checkers` closure; the body fires when the predicate
+/// satisfies the handler's edge mode. Mirrors v1's `emit_cycle_trigger`.
+#[derive(Debug, Clone)]
+pub struct CycleTriggerHandlerSchema {
+    /// The boolean trigger predicate, lowered in the component's
+    /// `SelfField` context (so `dut.<sig>` reads route to the DUT handle
+    /// and bare field reads resolve self-relatively). Rendered standalone
+    /// inside the per-instance `_checkers` closure.
+    pub trigger: Expr,
+    /// Edge mode: `Rising` (0→1, default), `Falling` (1→0), or `Level`
+    /// (every cycle the predicate holds).
+    pub edge: CycleEdge,
+    /// Lowered handler body (`kind: ComponentMethod`, zero params — `self`
+    /// only).
+    pub function: FunctionId,
+}
+
+/// Edge mode for a cycle-trigger handler — mirrors `ast::EdgeMode` in the
+/// IR so the codegen needn't reach back into the AST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CycleEdge {
+    Rising,
+    Falling,
+    Level,
 }
 
 /// A `watchdog ... end watchdog` directive (spec §8.6). At most one per

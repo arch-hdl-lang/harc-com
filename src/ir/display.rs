@@ -222,6 +222,19 @@ impl Display for TbProgram {
                     ph.function.0
                 )?;
             }
+            for ch in &c.cycle_handlers {
+                let edge = match ch.edge {
+                    crate::ir::CycleEdge::Rising => "rising",
+                    crate::ir::CycleEdge::Falling => "falling",
+                    crate::ir::CycleEdge::Level => "level",
+                };
+                writeln!(
+                    f,
+                    "    on {} ({edge}) = fn{}",
+                    expr_str_for_component(self, ch.function, &ch.trigger),
+                    ch.function.0
+                )?;
+            }
             if let Some(w) = &c.watchdog {
                 let period = w
                     .period
