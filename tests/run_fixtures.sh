@@ -124,6 +124,7 @@ cov_cross_bins_test     | Top            | top_counter.sv         |
 wait_any_of_test        | Top            | top_counter.sv         |
 transaction_basic_test  | Top            | top_counter.sv         |
 tlm_method_blocking_bus_test | TlmMemory | TlmMemory.sv           |
+lz4_decomp_test         | Lz4Decomp      | lz4_decomp.sv          |
 EOF
 
 PASS=0

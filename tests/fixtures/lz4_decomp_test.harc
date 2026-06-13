@@ -1,0 +1,145 @@
+// HARC testbench for arch-com/examples/lz4_decomp.arch.
+//
+// LZ4 block decompressor — AXI4-Stream byte-wide interface.
+// Three test vectors:
+//   Test 1: 3 pure literals, no match section
+//   Test 2: 3 literals + 5-byte match (offset=3) + termination token
+//   Test 3: 1 literal + 4-byte RLE match (offset=1) + termination token
+//
+// Helper functions handle AXI4-Stream handshaking: lz4_send drives
+// in_valid/in_data/in_last and polls in_ready; lz4_recv polls out_valid
+// (out_ready held high throughout).  Sends and receives are interleaved
+// to avoid single-threaded deadlock — the DUT never needs both input and
+// output simultaneously within one processing phase.
+
+function lz4_reset(dut: Lz4Decomp)
+    dut.rst       = 1
+    dut.in_valid  = 0
+    dut.in_data   = 0
+    dut.in_last   = 0
+    dut.out_ready = 1
+    wait 4 cycles
+    dut.rst = 0
+    wait 2 cycles
+end function lz4_reset
+
+// Drive one compressed byte with AXI4-Stream handshake.
+// Polls in_ready up to 300 cycles before asserting failure.
+function lz4_send(dut: Lz4Decomp, data: uint<8>, last: uint<1>)
+    dut.in_valid = 1
+    dut.in_data  = data
+    dut.in_last  = last
+    let w = 0
+    while dut.in_ready == 0 && w < 300
+        wait 1 cycle
+        w = w + 1
+    end while
+    assert dut.in_ready == 1
+        else fail("lz4_send: in_ready timeout (data=0x${data:02x})")
+    wait 1 cycle
+    dut.in_valid = 0
+    dut.in_last  = 0
+end function lz4_send
+
+// Collect one decompressed byte with AXI4-Stream handshake.
+// out_ready is held high by lz4_reset; polls out_valid up to 300 cycles.
+function lz4_recv(dut: Lz4Decomp) -> uint<8>
+    let w = 0
+    while dut.out_valid == 0 && w < 300
+        wait 1 cycle
+        w = w + 1
+    end while
+    assert dut.out_valid == 1
+        else fail("lz4_recv: out_valid timeout")
+    let b = dut.out_data
+    wait 1 cycle
+    return b
+end function lz4_recv
+
+testbench Lz4DecompTb
+    dut : Lz4Decomp
+end testbench Lz4DecompTb
+
+impl Lz4DecompTest for Lz4DecompTb
+    run
+        log(info, "LZ4 block decompressor — 3 test vectors")
+
+        // ── Test 1: 3 pure literals, no match ────────────────────────────────
+        // Compressed stream: 0x30 0x61 0x62 0x63(last)
+        // Token 0x30 → lit_hi=3, mat_lo=0; last sequence so no match section.
+        // Expected decompressed: 0x61 0x62 0x63
+        lz4_reset(dut)
+        lz4_send(dut, 0x30, 0)
+        lz4_send(dut, 0x61, 0)
+        let b0 = lz4_recv(dut)
+        lz4_send(dut, 0x62, 0)
+        let b1 = lz4_recv(dut)
+        lz4_send(dut, 0x63, 1)
+        let b2 = lz4_recv(dut)
+
+        assert b0 == 0x61 else fail("T1[0]: got=0x${b0:02x} want=0x61")
+        assert b1 == 0x62 else fail("T1[1]: got=0x${b1:02x} want=0x62")
+        assert b2 == 0x63 else fail("T1[2]: got=0x${b2:02x} want=0x63")
+        log(info, "Test 1 PASS: 3 literal bytes correct")
+
+        // ── Test 2: 3 literals + 5-byte match (offset=3) + end token ─────────
+        // Compressed stream: 0x31 'A' 'B' 'C' 0x03 0x00 0x00(last)
+        // Token 0x31 → lit_hi=3, mat_lo=1 → match_len = 1+4 = 5, offset = 3.
+        // History after literals: [A,B,C] at indices 0,1,2; rd_ptr = 3-3 = 0.
+        // Match copies A,B,C,A,B (circular, 5 bytes).
+        // Expected: A B C A B C A B  (0x41..0x42 × 4 pattern)
+        lz4_reset(dut)
+        lz4_send(dut, 0x31, 0)
+        lz4_send(dut, 0x41, 0)
+        let t2b0 = lz4_recv(dut)
+        lz4_send(dut, 0x42, 0)
+        let t2b1 = lz4_recv(dut)
+        lz4_send(dut, 0x43, 0)
+        let t2b2 = lz4_recv(dut)
+        lz4_send(dut, 0x03, 0)
+        lz4_send(dut, 0x00, 0)
+        let t2b3 = lz4_recv(dut)
+        let t2b4 = lz4_recv(dut)
+        let t2b5 = lz4_recv(dut)
+        let t2b6 = lz4_recv(dut)
+        let t2b7 = lz4_recv(dut)
+        lz4_send(dut, 0x00, 1)
+
+        assert t2b0 == 0x41 else fail("T2[0]: got=0x${t2b0:02x} want=0x41")
+        assert t2b1 == 0x42 else fail("T2[1]: got=0x${t2b1:02x} want=0x42")
+        assert t2b2 == 0x43 else fail("T2[2]: got=0x${t2b2:02x} want=0x43")
+        assert t2b3 == 0x41 else fail("T2[3]: got=0x${t2b3:02x} want=0x41")
+        assert t2b4 == 0x42 else fail("T2[4]: got=0x${t2b4:02x} want=0x42")
+        assert t2b5 == 0x43 else fail("T2[5]: got=0x${t2b5:02x} want=0x43")
+        assert t2b6 == 0x41 else fail("T2[6]: got=0x${t2b6:02x} want=0x41")
+        assert t2b7 == 0x42 else fail("T2[7]: got=0x${t2b7:02x} want=0x42")
+        log(info, "Test 2 PASS: literal+match copy correct")
+
+        // ── Test 3: 1 literal + 4-byte RLE (offset=1) + end token ────────────
+        // Compressed stream: 0x10 0xFF 0x01 0x00 0x00(last)
+        // Token 0x10 → lit_hi=1, mat_lo=0 → match_len = 0+4 = 4, offset = 1.
+        // History after literal: [0xFF] at index 0; rd_ptr = 1-1 = 0.
+        // Offset=1 copies the last written byte repeatedly (RLE).
+        // Expected: 0xFF × 5
+        lz4_reset(dut)
+        lz4_send(dut, 0x10, 0)
+        lz4_send(dut, 0xFF, 0)
+        let t3b0 = lz4_recv(dut)
+        lz4_send(dut, 0x01, 0)
+        lz4_send(dut, 0x00, 0)
+        let t3b1 = lz4_recv(dut)
+        let t3b2 = lz4_recv(dut)
+        let t3b3 = lz4_recv(dut)
+        let t3b4 = lz4_recv(dut)
+        lz4_send(dut, 0x00, 1)
+
+        assert t3b0 == 0xFF else fail("T3[0]: got=0x${t3b0:02x} want=0xff")
+        assert t3b1 == 0xFF else fail("T3[1]: got=0x${t3b1:02x} want=0xff")
+        assert t3b2 == 0xFF else fail("T3[2]: got=0x${t3b2:02x} want=0xff")
+        assert t3b3 == 0xFF else fail("T3[3]: got=0x${t3b3:02x} want=0xff")
+        assert t3b4 == 0xFF else fail("T3[4]: got=0x${t3b4:02x} want=0xff")
+        log(info, "Test 3 PASS: RLE match (offset=1) correct")
+
+        log(info, "ALL 3 SUB-TESTS PASSED — LZ4 block decompressor")
+    end run
+end impl Lz4DecompTest
