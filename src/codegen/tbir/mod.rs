@@ -73,7 +73,12 @@ pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<Stri
         crate::codegen::cpp_tb::emit_randomize_snippets(file, opts, &prog.constraint_sites, 5)?;
 
     let mut out = String::new();
-    runtime::preamble(&mut out, &dut_type, &test_names, &problem_table_cpp);
+    // Probe reads/forces dereference `dut->rootp->...`, which needs the
+    // root struct's full definition (`V<Top>___024root.h`) — the `rootp`
+    // member in `V<Top>.h` is only a forward-declared pointer. Mirrors
+    // v1's `aggregated_probes` include gate. See docs/probe-signals.md.
+    let has_probes = program_has_probes(&prog);
+    runtime::preamble(&mut out, &dut_type, &test_names, &problem_table_cpp, has_probes);
 
     // Transaction value-record structs, in declaration order. Mirrors
     // v1's `emit_record_struct` shape (field defaults as member
@@ -163,6 +168,68 @@ pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<Stri
 
     runtime::dispatcher(&mut out, &test_names);
     Ok(out)
+}
+
+/// Does any function in the program access a DUT-internal probe (a
+/// `PortRef` whose access class is `Probe`/`Force`)? Drives the
+/// `V<Top>___024root.h` include in the preamble — required for the
+/// `dut->rootp->...` probe accessor to compile. Probe reads can sit
+/// inline in expression position (assert conditions, format args, RHS),
+/// so this walks both statement-level `PortRef`s and the expression
+/// trees those statements carry.
+fn program_has_probes(prog: &TbProgram) -> bool {
+    prog.functions
+        .iter()
+        .any(|f| f.blocks.iter().any(|b| b.stmts.iter().any(stmt_has_probe)))
+}
+
+fn port_is_probe(p: &ir::PortRef) -> bool {
+    !matches!(p.access, ir::PortAccess::Port)
+}
+
+fn expr_has_probe(e: &ir::Expr) -> bool {
+    use ir::Expr::*;
+    match e {
+        Port(p) => port_is_probe(p),
+        Binary(_, a, b) => expr_has_probe(a) || expr_has_probe(b),
+        Unary(_, a) => expr_has_probe(a),
+        Ternary(c, a, b) => expr_has_probe(c) || expr_has_probe(a) || expr_has_probe(b),
+        WidthCast { inner, .. } => expr_has_probe(inner),
+        Call(_, args) => args.iter().any(expr_has_probe),
+        ComponentIdle { n, .. } => expr_has_probe(n),
+        _ => false,
+    }
+}
+
+fn fmt_has_probe(args: &ir::FmtArgs) -> bool {
+    args.args.iter().any(|a| expr_has_probe(&a.expr))
+}
+
+fn stmt_has_probe(s: &ir::Stmt) -> bool {
+    use ir::Stmt::*;
+    match s {
+        DutWrite(p, e) => port_is_probe(p) || expr_has_probe(e),
+        DutRead(_, p) | ProbeRelease(p) => port_is_probe(p),
+        Assign(_, e)
+        | RecordFieldWrite { value: e, .. }
+        | TbFieldWrite { value: e, .. }
+        | TransactorStateWrite { value: e, .. }
+        | ComponentFieldWrite { value: e, .. }
+        | TransactorCall { call: e, .. } => expr_has_probe(e),
+        AssertCheck { cond, on_fail } => expr_has_probe(cond) || fmt_has_probe(on_fail),
+        Log { args, .. } => fmt_has_probe(args),
+        FailDiag { guard, args } => {
+            guard.as_ref().is_some_and(expr_has_probe) || fmt_has_probe(args)
+        }
+        ScoreboardOp { op, .. } => match op {
+            ir::ScoreboardOp::QueuePush { value, .. }
+            | ir::ScoreboardOp::ScalarWrite { value, .. } => expr_has_probe(value),
+            ir::ScoreboardOp::QueuePop { .. } => false,
+        },
+        ComponentEmit { args, .. } | ComponentCall { args, .. } => args.iter().any(expr_has_probe),
+        SeqPush { value, .. } => expr_has_probe(value),
+        RecordInit(_, _) | CovReport(_) => false,
+    }
 }
 
 /// One transaction value-record struct. Field C types follow v1's
@@ -647,6 +714,7 @@ fn emit_test(
         &tb.bus_bindings,
         &opts.vec_lane_widths,
         randomize_snippets,
+        dut_type,
         2,
     )?;
     if let Some(check) = test.check {
@@ -658,6 +726,7 @@ fn emit_test(
             &tb.bus_bindings,
             &opts.vec_lane_widths,
             randomize_snippets,
+            dut_type,
             2,
         )?;
     }

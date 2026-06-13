@@ -536,6 +536,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         txn_keeps: HashMap::new(),
         randomize_problem_ids: HashMap::new(),
         tseqs: HashMap::new(),
+        // Pure helpers never access the DUT (probes are test-scope only).
+        probes: HashMap::new(),
     };
     for it in &file.items {
         let Item::Function(fd) = it else { continue };
@@ -584,6 +586,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         txn_keeps: txn_keeps.clone(),
         randomize_problem_ids: randomize_problem_ids.clone(),
         tseqs: tseq_records.clone(),
+        // tseq generator bodies never access the DUT.
+        probes: HashMap::new(),
     };
     for it in &file.items {
         let Item::Tseq(decl) = it else { continue };
@@ -720,6 +724,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         randomize_problem_ids: HashMap::new(),
         // Component methods cannot call a tseq generator (test-scope only).
         tseqs: HashMap::new(),
+        // Component/transactor method bodies access the bound DUT but
+        // never test-scope probes (probes live on `let dut`).
+        probes: HashMap::new(),
     };
     let mut method_funcs: Vec<TbFunction> = Vec::new();
     for (i, src) in comp_sources.iter().enumerate() {
@@ -1031,6 +1038,10 @@ fn lower_test(
     }
 
     let mut dut_type: Option<String> = None;
+    // DUT-internal probe declarations on `let dut` (name → metadata).
+    // Threaded into `LowerCtx::probes` so `dut.<probe>` accesses lower to
+    // a `Probe`/`Force` `PortRef`. See docs/probe-signals.md.
+    let mut probes: HashMap<String, ProbeMeta> = HashMap::new();
     let mut clocks: Vec<&ClockDecl> = Vec::new();
     let mut scope: Option<&ScopeDecl> = None;
     let mut bare_stmts: Vec<&AstStmt> = Vec::new();
@@ -1081,11 +1092,38 @@ fn lower_test(
     for it in &t.items {
         match it {
             TestItem::Let(l) if l.name.name == "dut" => {
-                if !l.probes.is_empty() {
-                    return Err(unsupported("probe declarations on `let dut`", ""));
-                }
                 if !l.bind_remap.is_empty() {
                     return Err(unsupported("bind remaps on `let dut`", ""));
+                }
+                // Collect DUT-internal probe declarations. Each becomes a
+                // `Probe`/`Force` access class in `LowerCtx::probes`,
+                // consulted when lowering `dut.<probe>` reads/writes and
+                // `release dut.<probe>`. The probe type must be a scalar
+                // (uint<N>/sint<N>/bits<N>/bit/bool) — the SV bind stub
+                // only surfaces scalar logic; reject aggregates precisely
+                // (v1's `sv_type_decl` errors at SV-emit time).
+                for p in &l.probes {
+                    let width = probe_scalar_width(&p.ty).ok_or_else(|| {
+                        unsupported(
+                            &format!(
+                                "probe `{}` of non-scalar type",
+                                p.name.name
+                            ),
+                            "probe types must be uint<N>/sint<N>/bits<N>/bit/bool",
+                        )
+                    })?;
+                    if probes
+                        .insert(
+                            p.name.name.clone(),
+                            ProbeMeta { force: p.force, width: Some(width) },
+                        )
+                        .is_some()
+                    {
+                        return Err(LowerError::Invalid(format!(
+                            "duplicate probe `{}` on `let dut`",
+                            p.name.name
+                        )));
+                    }
                 }
                 let simple = match l.ty.as_ref() {
                     Some(TypeExpr::Named { name, .. }) => {
@@ -2035,6 +2073,7 @@ fn lower_test(
         txn_keeps: txn_keeps.clone(),
         randomize_problem_ids: randomize_problem_ids.clone(),
         tseqs: tseq_records.clone(),
+        probes: probes.clone(),
     };
 
     // Synthesized auto-sampler functions, one per covergroup field, in
@@ -2248,6 +2287,29 @@ pub(crate) fn time_literal_to_ps(s: &str) -> Result<i64, String> {
     n.checked_mul(factor).ok_or_else(overflow)
 }
 
+/// Bit width of a probe's scalar type. Probes surface a single SV
+/// `logic`/`logic [W-1:0]` through the bind stub, so only scalar types
+/// are accepted: `uint<N>`/`sint<N>`/`bits<N>` (width = N), `bit`/`bool`
+/// (width = 1). Returns `None` for any aggregate / named type. Mirrors
+/// `crate::codegen::sv_stub::sv_type_decl`'s accepted set.
+fn probe_scalar_width(t: &TypeExpr) -> Option<u32> {
+    let TypeExpr::Builtin { name, args, .. } = t else {
+        return None;
+    };
+    use crate::ast::BuiltinTy;
+    match name {
+        BuiltinTy::Bit | BuiltinTy::Bool | BuiltinTy::BoolLower => Some(1),
+        BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits => match args.first()? {
+            crate::ast::TypeArg::Expr(e) => match &*e.kind {
+                ExprKind::Int(s) => s.replace('_', "").parse::<u32>().ok(),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 // ── Function builder ─────────────────────────────────────────────────
 
 /// Per-test lowering context shared by all of the test's functions.
@@ -2365,6 +2427,23 @@ pub(crate) struct LowerCtx {
     /// types the local as `IrType::RecordSeq(record)`, and a `for t in
     /// txns` over such a local lowers to a counted loop over `txns`.
     pub tseqs: HashMap<String, RecordId>,
+    /// DUT-internal `probe` declarations on `let dut` (probe name →
+    /// metadata). A `dut.<name>` access whose head is the DUT and whose
+    /// segment is a probe name lowers to a `PortRef` with
+    /// `access = Probe` (read-only) or `Force` (force-capable) instead of
+    /// the default `Port`. Empty for probe-less tests and every non-test
+    /// context (helpers, methods). See docs/probe-signals.md.
+    pub probes: HashMap<String, ProbeMeta>,
+}
+
+/// Lowered metadata for one `probe` / `probe force` declaration on
+/// `let dut`. `force` selects `PortAccess::Force` (write-capable via the
+/// SV procedural-force stub) vs `PortAccess::Probe` (read-only);
+/// `width` is the declared probe type's bit width (for the `PortRef`).
+#[derive(Debug, Clone)]
+pub(crate) struct ProbeMeta {
+    pub force: bool,
+    pub width: Option<u32>,
 }
 
 pub(crate) struct LoopFrame {
@@ -2852,9 +2931,10 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 // (transactor-method randomize / tseq is out of subset),
                 // so the yielded value holds no transactor-state node.
                 ir::Stmt::SeqPush { value, .. } => in_expr(value),
-                ir::Stmt::DutRead(_, _) | ir::Stmt::RecordInit(_, _) | ir::Stmt::CovReport(_) => {
-                    None
-                }
+                ir::Stmt::DutRead(_, _)
+                | ir::Stmt::RecordInit(_, _)
+                | ir::Stmt::CovReport(_)
+                | ir::Stmt::ProbeRelease(_) => None,
             };
             if found.is_some() {
                 return found;
@@ -2982,7 +3062,10 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                     }
                 }
                 ir::Stmt::SeqPush { value, .. } => fill_expr(value, instance),
-                ir::Stmt::DutRead(_, _) | ir::Stmt::RecordInit(_, _) | ir::Stmt::CovReport(_) => {}
+                ir::Stmt::DutRead(_, _)
+                | ir::Stmt::RecordInit(_, _)
+                | ir::Stmt::CovReport(_)
+                | ir::Stmt::ProbeRelease(_) => {}
             }
         }
         fill_term(&mut block.terminator, instance);
@@ -3093,7 +3176,7 @@ fn fill_initiator_bus_prefix(func: &mut TbFunction, binding: &str) -> Result<(),
                         visit_port(p, placeholder, binding, rewrite, &mut conflict);
                         visit_expr(e, placeholder, binding, rewrite, &mut conflict);
                     }
-                    Stmt::DutRead(_, p) => {
+                    Stmt::DutRead(_, p) | Stmt::ProbeRelease(p) => {
                         visit_port(p, placeholder, binding, rewrite, &mut conflict)
                     }
                     Stmt::Assign(_, e)

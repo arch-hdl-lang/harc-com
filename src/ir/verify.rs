@@ -517,6 +517,9 @@ impl Checker<'_> {
                 }
                 Stmt::DutWrite(_, e) => self.check_expr(e, true, "DutWrite value"),
                 Stmt::DutRead(l, _) => self.check_local(*l),
+                // `release dut.<probe>` carries no value and no local;
+                // the PortRef's access class is validated at lowering.
+                Stmt::ProbeRelease(_) => {}
                 Stmt::RecordInit(l, r) => {
                     self.check_local(*l);
                     if r.index() >= self.prog.records.len()
@@ -1203,6 +1206,7 @@ fn check_def_before_use(
                     }
                 }
                 Stmt::CovReport(_) => {}
+                Stmt::ProbeRelease(_) => {}
                 Stmt::FailDiag { guard, args } => {
                     if let Some(g) = guard {
                         check_e(g, &defined, errs);

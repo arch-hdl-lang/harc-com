@@ -112,6 +112,73 @@ fn rom_lut_dump_ir_snapshot() {
     insta::assert_snapshot!("rom_lut_dump_ir", format!("{prog}"));
 }
 
+/// Locks the dump-ir text for the probe/force fixture: read-only
+/// `(probe)` PortRefs in assert conditions/format args, a `(force)`
+/// `DutWrite`, and a `ProbeRelease`. Guards the `PortAccess` flow added
+/// by the probe/force slice (was always `Port`).
+#[test]
+fn probe_force_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("probe_force_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("probe_force_dump_ir", format!("{prog}"));
+}
+
+/// A testbench-OWNED probed DUT (probes declared inside the `testbench`
+/// block, not the `impl`) must still flow probes through the impl-for
+/// desugar. Regression for issue #204 on the tbir path.
+#[test]
+fn testbench_owned_probes_lower() {
+    let prog = lower_src(&fixture("testbench_probe_dut_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let txt = format!("{prog}");
+    assert!(txt.contains("dut.inject_rs1 (force)"), "{txt}");
+    assert!(txt.contains("dut.alu_a (probe)"), "{txt}");
+    assert!(txt.contains("ProbeRelease(dut.inject_rs1 (force))"), "{txt}");
+}
+
+/// Writing a read-only `probe` is a hard error (not a `--codegen v1`
+/// fallback): only `probe force` opts into the SV procedural-force path.
+#[test]
+fn write_to_readonly_probe_is_rejected() {
+    let src = r#"testbench T
+end testbench T
+
+impl Tst for T
+    let dut : CpuPipe
+        probe alu_a : uint<32> at alu0.a
+    end let dut
+    run
+        dut.alu_a = 5
+    end run
+end impl Tst"#;
+    let err = lower_src(src).expect_err("read-only probe write must be rejected");
+    let msg = err.to_string();
+    assert!(matches!(err, lower::LowerError::Invalid(_)), "{err:?}");
+    assert!(msg.contains("read-only probe"), "{msg}");
+    assert!(msg.contains("probe force"), "{msg}");
+}
+
+/// `release` of a read-only probe is a hard error — only a force probe
+/// can be released.
+#[test]
+fn release_of_readonly_probe_is_rejected() {
+    let src = r#"testbench T
+end testbench T
+
+impl Tst for T
+    let dut : CpuPipe
+        probe alu_a : uint<32> at alu0.a
+    end let dut
+    run
+        release dut.alu_a
+    end run
+end impl Tst"#;
+    let err = lower_src(src).expect_err("release of read-only probe must be rejected");
+    let msg = err.to_string();
+    assert!(matches!(err, lower::LowerError::Invalid(_)), "{err:?}");
+    assert!(msg.contains("read-only probe"), "{msg}");
+}
+
 // ── Emitted-C++ snapshots — the emission surface for the original
 //    five fixtures of the equivalence matrix
 //    (tests/tbir_equiv_fixtures.txt). Full files,

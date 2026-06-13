@@ -39,6 +39,12 @@ nested run-scope path via `ScoreboardOp`/`ScoreboardQuery`'s new
 every leaf sub-component), and named `phase` (call sites inlined). The
 heartbeat/quiesce cluster is now FULLY UNLOCKED — `env_quiesced_phase_test`
 is registered, trace-diff clean v1↔tbir at seed 1.
+Amended again 2026-06-13 by the **probe/force slice**: DUT-internal
+signal access via declared probes (read) and force points (write) — the
+long-reserved `PortAccess::Probe`/`Force` is now real (was always `Port`;
+see tbir-mvp.md divergence 1). `probe_basic_test`, `probe_force_test`,
+and `testbench_probe_dut_test` (all `cpu_pipeline.sv`) are registered,
+trace-diff clean v1↔tbir at seed 1. See the **probe/force group** below.
 
 **This file is a snapshot, not a source of truth.** The registry
 (`tests/tbir_equiv_fixtures.txt`) is the source of truth for what is
@@ -679,11 +685,28 @@ fields + struct-returning `tlm_method`). As predicted in the
 suggested-sequencing note, `struct` alone unlocks no corpus fixture
 because each one is a deeper construct stack.
 
-### Probe declarations on `let dut` — 3 fixtures
+### Probe declarations on `let dut` — 3 fixtures — **RESOLVED 2026-06-13 (probe/force slice)**
 
-> TB-IR lowering does not support probe declarations on `let dut` yet
+> ~~TB-IR lowering does not support probe declarations on `let dut` yet~~
 
-`probe_basic_test`, `probe_force_test`, `testbench_probe_dut_test`
+All three fixtures now fully lower and are registered, trace-diff clean
+v1↔tbir at seed 1:
+
+| Fixture | What it exercises |
+|---|---|
+| `probe_basic_test` | three read-only `probe`s hoisting `alu0.{a,b,result}`; `dut.<probe>` reads route through the SV bind-stub accessor |
+| `probe_force_test` | a read `probe` + a `probe force` (write/`release` fault-injection): force writes lower to the `_drv`/`_en` pair, `release` clears `_en` |
+| `testbench_probe_dut_test` | a testbench-OWNED probed DUT + a `function reset()` (regression #204 for the impl-for desugar preserving probes) |
+
+Implementation: `PortAccess::Probe`/`Force` now flows out of lowering
+(was always `Port`); `Stmt::ProbeRelease`; lowering enforces
+Probe-read-only / Force-write-only; the tbir backend mirrors v1's
+`Emitter::probes` (`dut->rootp-><DutType>__DOT__harc_probes__DOT__<name>`,
+`_drv`/`_en` writes, `V<DutType>___024root.h` include). The SV bind stub
+(`__harc_probe_<DutType>.sv`) is shared by both codegens. See
+tbir-mvp.md divergence 1 and docs/probe-signals.md. **Subset**: scalar
+probe types only; multi-segment `at`-paths are Verilator-validated, not
+harc-validated; `--dut` (ARCH-compiled DUT) probing is out of scope.
 
 ### Method call `.reset(...)` — 2 fixtures (1 file) — **RESOLVED 2026-06-12**
 

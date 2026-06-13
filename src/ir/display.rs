@@ -367,6 +367,7 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         Stmt::Assign(l, e) => format!("Assign({}, {})", local_str(func, *l), expr_str(func, e)),
         Stmt::DutWrite(p, e) => format!("DutWrite({}, {})", port_str(p), expr_str(func, e)),
         Stmt::DutRead(l, p) => format!("DutRead({}, {})", local_str(func, *l), port_str(p)),
+        Stmt::ProbeRelease(p) => format!("ProbeRelease({})", port_str(p)),
         Stmt::RecordInit(l, r) => format!("RecordInit({}, r{})", local_str(func, *l), r.0),
         Stmt::RecordFieldWrite { local, field, value } => format!(
             "RecordFieldWrite({}.{field}, {})",

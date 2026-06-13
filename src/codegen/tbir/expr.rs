@@ -14,6 +14,14 @@ pub(super) struct ECx<'a> {
     pub func: &'a TbFunction,
     pub names: &'a [String],
     pub lanes: &'a HashMap<String, u32>,
+    /// Simple name of the DUT type (`CpuPipe`). Used to form the
+    /// Verilator-mangled probe accessor `dut->rootp-><DutType>__DOT__
+    /// harc_probes__DOT__<name>` for `PortAccess::Probe`/`Force` reads
+    /// and writes. Empty (`""`) in contexts that can never host a probe
+    /// access (pure helpers, tseqs, transactor methods, component
+    /// lambdas — probes are test-scope only); the probe-accessor path is
+    /// structurally unreachable there.
+    pub dut_type: &'a str,
     /// When `Some`, a `ComponentField`/`ComponentIdle` with a `SelfField`
     /// base renders against this instance path instead of the literal
     /// `self`. Used when a watchdog/periodic clause expr (lowered in the
@@ -49,12 +57,31 @@ pub(super) fn escape_c(s: &str) -> String {
 /// same convention the v1 backend uses for bus-bundle members. The
 /// bare signal, with no lane applied (lane handling is per call site:
 /// reads via `port_read`, writes in `func.rs`).
-pub(super) fn port_signal(p: &PortRef) -> String {
-    format!("dut->{}", p.port_path.join("_"))
+///
+/// For a `PortAccess::Probe`/`Force` reference, the signal is NOT a
+/// top-level DUT port but a DUT-internal value surfaced through the SV
+/// `bind` stub: it routes through `dut->rootp-><DutType>__DOT__
+/// harc_probes__DOT__<name>` (the read-side accessor; force probes
+/// additionally carry `_drv`/`_en` siblings handled in `func.rs`).
+/// Mirrors v1's `Emitter::probes` lowering. See docs/probe-signals.md.
+pub(super) fn port_signal(cx: &ECx<'_>, p: &PortRef) -> String {
+    match p.access {
+        crate::ir::PortAccess::Port => format!("dut->{}", p.port_path.join("_")),
+        crate::ir::PortAccess::Probe | crate::ir::PortAccess::Force => {
+            format!("dut->rootp->{}", probe_read_accessor(cx.dut_type, p))
+        }
+    }
+}
+
+/// Verilator-mangled read-side accessor for a probe (`<DutType>__DOT__
+/// harc_probes__DOT__<name>`). `name` is the single-segment probe name
+/// in `port_path`. Matches `crate::codegen::sv_stub::mangled_accessor`.
+pub(super) fn probe_read_accessor(dut_type: &str, p: &PortRef) -> String {
+    crate::codegen::sv_stub::mangled_accessor(dut_type, &p.port_path.join("_"))
 }
 
 pub(super) fn port_read(cx: &ECx<'_>, p: &PortRef) -> String {
-    let sig = port_signal(p);
+    let sig = port_signal(cx, p);
     match p.lane {
         None => format!("harc_rt::harc_read({sig})"),
         // Packed multi-lane port: bit-extract through the runtime
@@ -337,7 +364,7 @@ fn wide_eq_cpp(
     // (prefer treating rhs as the literal, like v1).
     let sig_side = if rhs_words.is_some() { lhs } else { rhs };
     let sig = match sig_side {
-        Expr::Port(p) if p.lane.is_none() => port_signal(p),
+        Expr::Port(p) if p.lane.is_none() => port_signal(cx, p),
         other => expr_cpp(cx, other)?,
     };
     let list = words
