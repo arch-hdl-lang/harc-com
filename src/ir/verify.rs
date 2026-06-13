@@ -97,6 +97,14 @@ pub enum VerifyError {
         local: LocalId,
         field: String,
     },
+    /// A `TbField`/`TbFieldWrite` names a scalar field the owning
+    /// testbench schema does not declare (or the function has no
+    /// owning testbench at all — helpers cannot touch TB state).
+    BadTbField {
+        func: FunctionId,
+        block: BlockId,
+        field: String,
+    },
     /// Port-position rule: `Expr::Port` outside an allowed position.
     PortInDisallowedPosition {
         func: FunctionId,
@@ -188,6 +196,12 @@ impl std::fmt::Display for VerifyError {
                 f,
                 "fn{}: b{} accesses field `{field}` on local %{} (not a record-typed local or no such field)",
                 func.0, block.0, local.0
+            ),
+            VerifyError::BadTbField { func, block, field } => write!(
+                f,
+                "fn{}: b{} accesses testbench scalar field `{field}` that the owning \
+                 testbench does not declare",
+                func.0, block.0
             ),
             VerifyError::PortInDisallowedPosition {
                 func,
@@ -494,6 +508,10 @@ impl Checker<'_> {
                     self.check_record_field(*local, field);
                     self.check_expr(value, false, "RecordFieldWrite value");
                 }
+                Stmt::TbFieldWrite { field, value } => {
+                    self.check_tb_field(field);
+                    self.check_expr(value, false, "TbFieldWrite value");
+                }
                 Stmt::Log { args, .. } => self.check_fmt_args(args),
                 Stmt::AssertCheck { cond, on_fail } => {
                     self.check_expr(cond, true, "AssertCheck cond");
@@ -517,6 +535,10 @@ impl Checker<'_> {
         match &b.terminator {
             Terminator::Branch(c, _, _) => self.check_expr(c, false, "Branch cond"),
             Terminator::WaitCycles(e, _, _) => self.check_expr(e, false, "WaitCycles count"),
+            Terminator::WaitCyclesSync(e, _) => {
+                self.check_expr(e, false, "WaitCycles count")
+            }
+            Terminator::WaitTimePs(..) => {}
             Terminator::WaitUntil { preds, .. } => {
                 for p in preds {
                     self.check_expr(&p.expr, true, "WaitUntil pred");
@@ -545,6 +567,22 @@ impl Checker<'_> {
                 func: self.fid,
                 block: self.bid,
                 local: l,
+            });
+        }
+    }
+
+    /// The owning testbench must declare scalar field `field`.
+    fn check_tb_field(&mut self, field: &str) {
+        let ok = self
+            .func
+            .owner
+            .and_then(|tb| self.prog.testbenches.get(tb.index()))
+            .is_some_and(|tb| tb.scalar_fields.iter().any(|f| f.name == field));
+        if !ok {
+            self.errs.push(VerifyError::BadTbField {
+                func: self.fid,
+                block: self.bid,
+                field: field.to_string(),
             });
         }
     }
@@ -644,8 +682,9 @@ impl Checker<'_> {
 
     fn check_expr(&mut self, e: &Expr, ports_ok: bool, context: &'static str) {
         match e {
-            Expr::Literal { .. } => {}
+            Expr::Literal { .. } | Expr::WideLiteral(_) => {}
             Expr::Local(l) => self.check_local(*l),
+            Expr::TbField(field) => self.check_tb_field(field),
             Expr::Port(_) => {
                 if !ports_ok {
                     self.errs.push(VerifyError::PortInDisallowedPosition {
@@ -660,14 +699,15 @@ impl Checker<'_> {
                 self.check_expr(b, ports_ok, context);
             }
             Expr::Unary(_, a) => self.check_expr(a, ports_ok, context),
+            Expr::Ternary(c, t, e2) => {
+                self.check_expr(c, ports_ok, context);
+                self.check_expr(t, ports_ok, context);
+                self.check_expr(e2, ports_ok, context);
+            }
+            Expr::WidthCast { inner, .. } => self.check_expr(inner, ports_ok, context),
             Expr::RecordField { local, field } => {
                 self.check_local(*local);
                 self.check_record_field(*local, field);
-            }
-            Expr::Ternary(c, t, e) => {
-                self.check_expr(c, ports_ok, context);
-                self.check_expr(t, ports_ok, context);
-                self.check_expr(e, ports_ok, context);
             }
             Expr::CovBin { inst, .. } => self.check_covgroup(inst.covgroup),
             Expr::Call(target, args) => {
@@ -901,6 +941,7 @@ fn check_def_before_use(
                     }
                     check_e(value, &defined, errs);
                 }
+                Stmt::TbFieldWrite { value, .. } => check_e(value, &defined, errs),
                 Stmt::DutWrite(_, e) => check_e(e, &defined, errs),
                 Stmt::TransactorCall { dest, call } => {
                     check_e(call, &defined, errs);
@@ -935,6 +976,8 @@ fn check_def_before_use(
         match &b.terminator {
             Terminator::Branch(c, _, _) => check_e(c, &defined, errs),
             Terminator::WaitCycles(e, _, _) => check_e(e, &defined, errs),
+            Terminator::WaitCyclesSync(e, _) => check_e(e, &defined, errs),
+            Terminator::WaitTimePs(..) => {}
             Terminator::WaitUntil { preds, .. } => {
                 for p in preds {
                     check_e(&p.expr, &defined, errs);
@@ -958,7 +1001,7 @@ fn check_def_before_use(
 
 fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
     match e {
-        Expr::Literal { .. } | Expr::Port(_) => {}
+        Expr::Literal { .. } | Expr::WideLiteral(_) | Expr::Port(_) | Expr::TbField(_) => {}
         Expr::Local(l) => f(*l),
         Expr::RecordField { local, .. } => f(*local),
         Expr::Binary(_, a, b) => {
@@ -971,6 +1014,7 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
             for_each_local(t, f);
             for_each_local(e, f);
         }
+        Expr::WidthCast { inner, .. } => for_each_local(inner, f),
         Expr::CovBin { .. } => {}
         Expr::Call(_, args) => {
             for a in args {

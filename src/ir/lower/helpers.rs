@@ -274,6 +274,138 @@ impl FuncBuilder<'_> {
         Ok(Expr::Local(dest))
     }
 
+    /// `Some(method)` when `callee` is a call target of the form
+    /// `_tb.<m>` for a testbench helper method (`function`/`hookable`
+    /// declared in the bound testbench).
+    pub(crate) fn tb_method_call_name(&self, callee: &AstExpr) -> Option<String> {
+        let tb_field = self.ctx.tb_field.as_deref()?;
+        let ExprKind::Field { target, name } = &*callee.kind else {
+            return None;
+        };
+        let ExprKind::Ident(root) = &*target.kind else {
+            return None;
+        };
+        (root.name == tb_field && self.ctx.tb_methods.contains_key(&name.name))
+            .then(|| name.name.clone())
+    }
+
+    /// CFG-inline a testbench helper method call (`_tb.reset()`,
+    /// `_tb.bump(5)`). Same shape as the impure-helper inline: params
+    /// become fresh caller locals, the body lowers into the caller's
+    /// blocks under an `InlineFrame` (so the body sees only its own
+    /// scopes — plus the DUT, which a testbench method touches through
+    /// the shared `dut` field, resolved by `is_dut_name` exactly as in
+    /// the test body). v1 emits these as `[&]`-capturing lambdas whose
+    /// `wait`s tick the same scheduler, so the inlined CFG's cycle
+    /// behavior is identical.
+    pub(crate) fn lower_tb_method_call(
+        &mut self,
+        name: &str,
+        args: &[CallArg],
+    ) -> Result<Expr, LowerError> {
+        let decl = self
+            .ctx
+            .tb_methods
+            .get(name)
+            .expect("caller checked tb_methods membership");
+        if args.len() != decl.params.len() {
+            return Err(LowerError::Invalid(format!(
+                "testbench method `{name}` takes {} argument(s), call passes {}",
+                decl.params.len(),
+                args.len()
+            )));
+        }
+        if self.in_fmt_args {
+            return Err(unsupported(
+                &format!("testbench method call `{name}(...)` inside a message"),
+                "log/fail messages evaluate lazily; hoist the call into a `let` first",
+            ));
+        }
+        let frame_name = format!("_tb.{name}");
+        if self.inline_frames.iter().any(|f| f.name == frame_name) {
+            return Err(unsupported(
+                "recursive testbench methods",
+                format!("`{name}` is already being inlined"),
+            ));
+        }
+
+        let mut arg_exprs = Vec::with_capacity(args.len());
+        for a in args {
+            match a {
+                CallArg::Expr(e) => arg_exprs.push(e),
+                CallArg::Named { .. } => {
+                    return Err(unsupported(
+                        &format!("named arguments in testbench method call `{name}(...)`"),
+                        "",
+                    ));
+                }
+            }
+        }
+        enum Bound {
+            Dut,
+            Val(Expr),
+        }
+        let mut bound = Vec::with_capacity(arg_exprs.len());
+        for (p, e) in decl.params.iter().zip(&arg_exprs) {
+            if is_dut_ident(self, e) {
+                bound.push(Bound::Dut);
+            } else if matches!(p.ty, Some(TypeExpr::Named { .. })) {
+                return Err(unsupported(
+                    &format!(
+                        "testbench method parameter `{}` of module type with a non-DUT argument",
+                        p.name.name
+                    ),
+                    "",
+                ));
+            } else {
+                bound.push(Bound::Val(self.lower_expr_no_ports(e)?));
+            }
+        }
+
+        let dest = self.fresh_temp();
+        self.push(Stmt::Assign(
+            dest,
+            Expr::Literal {
+                value: 0,
+                ty: IrType::Unknown,
+            },
+        ));
+        let cont = self.new_block();
+
+        let mut dut_aliases = HashSet::new();
+        for (p, b) in decl.params.iter().zip(&bound) {
+            if matches!(b, Bound::Dut) {
+                dut_aliases.insert(p.name.name.clone());
+            }
+        }
+        self.inline_frames.push(InlineFrame {
+            name: frame_name,
+            dut_aliases,
+            ret_dest: dest,
+            ret_cont: cont,
+            scope_floor: self.scope_depth(),
+            loop_floor: self.loop_stack.len(),
+        });
+        self.push_scope();
+        for (p, b) in decl.params.iter().zip(bound) {
+            if let Bound::Val(e) = b {
+                let id = self.declare(&p.name.name);
+                self.push(Stmt::Assign(id, e));
+            }
+        }
+
+        let body = decl.body.clone();
+        self.lower_block_stmts(&body)?;
+        if !self.is_terminated() {
+            self.terminate(Terminator::Jump(cont));
+        }
+
+        self.pop_scope();
+        self.inline_frames.pop();
+        self.start_block(cont);
+        Ok(Expr::Local(dest))
+    }
+
     /// `return` lowering for helper contexts. Returns `false` when not
     /// in a helper context (caller handles run/check semantics).
     pub(crate) fn lower_helper_return(
@@ -425,6 +557,18 @@ fn scan_expr(e: &AstExpr, s: &mut Scan) {
         }
         ExprKind::Paren(inner) => scan_expr(inner, s),
         ExprKind::Unary { expr, .. } => scan_expr(expr, s),
+        // Ternaries are pure scalar selection — lowered to
+        // `Expr::Ternary`, emitted as the C++ `?:` even in file-scope
+        // pure-helper functions.
+        ExprKind::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            scan_expr(cond, s);
+            scan_expr(then_branch, s);
+            scan_expr(else_branch, s);
+        }
         ExprKind::Binary { op, lhs, rhs } => {
             // Temporal / membership operators are outside the lowered
             // expression subset; classify impure so the precise error

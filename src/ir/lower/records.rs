@@ -12,14 +12,18 @@
 //!
 //! Out-of-scope shapes are explicit `Unsupported` rejections, never
 //! silent drops: `when` subtype blocks, non-scalar field types
-//! (nested records, enums, lists, vecs), widths above 64 bits, and
-//! non-literal field defaults.
+//! (nested records, lists, vecs), widths above 64 bits, and
+//! non-literal field defaults. Enum-typed fields lower as scalar
+//! variant indices (v1's `int64_t` member shape).
 
 use super::{LowerError, unsupported};
 use crate::ast::{BuiltinTy, ExprKind, TransactionDecl, TxnBodyItem, TypeArg, TypeExpr};
 use crate::ir::{IrType, RecordFieldSchema, RecordSchema};
 
-pub(crate) fn lower_transaction(t: &TransactionDecl) -> Result<RecordSchema, LowerError> {
+pub(crate) fn lower_transaction(
+    t: &TransactionDecl,
+    enum_names: &std::collections::HashSet<String>,
+) -> Result<RecordSchema, LowerError> {
     let txn = &t.name.name;
     if !t.params.is_empty() {
         return Err(unsupported(
@@ -38,7 +42,7 @@ pub(crate) fn lower_transaction(t: &TransactionDecl) -> Result<RecordSchema, Low
                         "transaction `{txn}` declares field `{fname}` more than once"
                     )));
                 }
-                let ty = field_ir_type(&f.ty).ok_or_else(|| {
+                let ty = field_ir_type(&f.ty, enum_names).ok_or_else(|| {
                     unsupported(
                         &format!("transaction field `{txn}.{fname}` with a non-scalar type"),
                         "only uint/sint/bits/bool/bit fields up to 64 bits are lowered",
@@ -104,8 +108,17 @@ pub(crate) fn lower_transaction(t: &TransactionDecl) -> Result<RecordSchema, Low
 /// choices for the ≤64-bit subset: uint/bits/int → unsigned, sint →
 /// signed, bool/bit → bool. `None` for anything this slice does not
 /// lower (nested records, enums, lists, vecs, >64-bit widths).
-fn field_ir_type(t: &TypeExpr) -> Option<IrType> {
+fn field_ir_type(t: &TypeExpr, enum_names: &std::collections::HashSet<String>) -> Option<IrType> {
     let TypeExpr::Builtin { name, args, .. } = t else {
+        // Enum-typed field: v1 lowers it to an `int64_t` struct member
+        // holding the variant index (`txn_field_c_type` Named → int64_t),
+        // so the IR mirrors it as an unwidthed SInt scalar.
+        if let TypeExpr::Named { name, .. } = t {
+            let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+            if enum_names.contains(simple) {
+                return Some(IrType::SInt(None));
+            }
+        }
         return None;
     };
     let width = match args.first() {

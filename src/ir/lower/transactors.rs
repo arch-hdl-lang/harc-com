@@ -35,7 +35,7 @@ use crate::ir::{
     FunctionId, FunctionKind, TbFunction, Terminator, TransactorId, TransactorMethodSchema,
     TransactorSchema, TypedParam,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Lower one `transactor` declaration into a schema plus one
 /// `TbFunction` per method. `next_fn` is the id the FIRST method
@@ -178,6 +178,12 @@ pub(crate) fn lower_transactor(
         bus_bindings: HashMap::new(),
         transactor_fields: HashMap::new(),
         transactors: Vec::new(),
+        // Method bodies see file-scope consts; they have no testbench,
+        // so no scalar fields, helper methods, or test-scope lets.
+        consts: record_ctx.consts.clone(),
+        tb_scalar_fields: HashSet::new(),
+        tb_methods: HashMap::new(),
+        test_scope_lets: HashSet::new(),
     };
 
     let mut funcs = Vec::new();

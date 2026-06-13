@@ -20,12 +20,17 @@
 //! to the same `co_await harc_rt::wait_cycles(_slot, ...)` suspension
 //! v1 uses — identical scheduler interaction, identical cycle timing.
 
-use super::expr::{escape_c, expr_cpp, fmt_arg_cpp, helper_cpp_name, port_lvalue, port_read};
+use super::expr::{
+    ECx, escape_c, expr_cpp, fmt_arg_cpp, helper_cpp_name, lane_width, port_read, port_signal,
+    wide_words_over_128,
+};
 use crate::codegen::cpp_tb::EmitError;
 use crate::ir::{
-    BusBindingSchema, CallTarget, Expr, FileLogLevel, FmtArgs, IrType, LogLevel, PredSrc, Stmt,
-    TbFunction, TbProgram, Terminator, TransactorMethodSchema, TransactorSchema, WaitMode,
+    BusBindingSchema, CallTarget, Expr, FileLogLevel, FmtArgs, IrType, LogLevel, PredSrc,
+    RecordSchema, Stmt, TbFunction, TbProgram, Terminator, TransactorMethodSchema,
+    TransactorSchema, WaitMode,
 };
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 const INDENT: &str = "    ";
@@ -72,10 +77,13 @@ pub(super) fn emit_function(
     out: &mut String,
     prog: &TbProgram,
     func: &TbFunction,
+    records: &[RecordSchema],
     bindings: &[BusBindingSchema],
+    lanes: &HashMap<String, u32>,
     depth: usize,
 ) -> Result<(), EmitError> {
     let names = cpp_local_names(func);
+    let cx = ECx { func, names: &names, lanes };
     let pad = INDENT.repeat(depth);
     let pad1 = INDENT.repeat(depth + 1);
     let pad2 = INDENT.repeat(depth + 2);
@@ -90,19 +98,19 @@ pub(super) fn emit_function(
     for (bi, block) in func.blocks.iter().enumerate() {
         writeln!(out, "{pad2}case {bi}: {{").ok();
         for s in &block.stmts {
-            emit_stmt(out, prog, func, &names, bindings, s, depth + 3)?;
+            emit_stmt(out, prog, &cx, records, bindings, s, depth + 3)?;
         }
         match &block.terminator {
             Terminator::Jump(b) => {
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::Branch(c, t, f) => {
-                let cond = expr_cpp(func, &names, c)?;
+                let cond = expr_cpp(&cx, c)?;
                 writeln!(out, "{pad3}if ({cond}) {{ __bb = {}; }} else {{ __bb = {}; }}", t.0, f.0)
                     .ok();
             }
             Terminator::WaitCycles(n, clock, b) => {
-                let n = expr_cpp(func, &names, n)?;
+                let n = expr_cpp(&cx, n)?;
                 match clock {
                     None => {
                         writeln!(
@@ -146,18 +154,33 @@ pub(super) fn emit_function(
                 }
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
+            Terminator::WaitCyclesSync(n, b) => {
+                // v1's non-coroutine wait path (helper / testbench-
+                // method lambda bodies): synchronous tick loop, no
+                // scheduler yield.
+                let n = expr_cpp(&cx, n)?;
+                writeln!(out, "{pad3}for (int _w = 0; _w < {n}; _w++) tick();").ok();
+                writeln!(out, "{pad3}__bb = {};", b.0).ok();
+            }
+            Terminator::WaitTimePs(ps, b) => {
+                // Wall-clock wait — v1's inline emission for a Time
+                // duration: advance absolute time, no coroutine yield,
+                // no checker pass.
+                writeln!(out, "{pad3}eval_clocks_until(now_ps + {ps});").ok();
+                writeln!(out, "{pad3}__bb = {};", b.0).ok();
+            }
             Terminator::Return => {
                 writeln!(out, "{pad3}__done = true;").ok();
             }
             Terminator::Fatal(args) => {
-                emit_log_call(out, func, &names, "FATAL", None, args, depth + 3)?;
+                emit_log_call(out, &cx, "FATAL", None, args, depth + 3)?;
                 writeln!(out, "{pad3}errors++; _fatal = true;").ok();
                 writeln!(out, "{pad3}__done = true;").ok();
             }
             Terminator::WaitUntil { preds, mode, succ } => {
                 // Mirrors v1's untimed coroutine path: one awaiter,
                 // predicate re-evaluated by the scheduler each cycle.
-                let cond = preds_cpp(func, &names, preds, *mode)?;
+                let cond = preds_cpp(&cx, preds, *mode)?;
                 writeln!(
                     out,
                     "{pad3}co_await harc_rt::wait_until(_slot, [&]{{ return {cond}; }});"
@@ -178,8 +201,8 @@ pub(super) fn emit_function(
                 // `errors` exactly once per timed-out wait; that bump
                 // rides the timeout edge here so the `on_timeout`
                 // block carries only the diagnostic text (FailDiag).
-                let cond = preds_cpp(func, &names, preds, *mode)?;
-                let n = expr_cpp(func, &names, cycles)?;
+                let cond = preds_cpp(&cx, preds, *mode)?;
+                let n = expr_cpp(&cx, cycles)?;
                 writeln!(out, "{pad3}int64_t _wu_budget = (int64_t)({n});").ok();
                 writeln!(
                     out,
@@ -231,6 +254,9 @@ pub(super) fn emit_helper_prototype(out: &mut String, func: &TbFunction) {
 /// loop-switch local model.
 pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Result<(), EmitError> {
     let names = cpp_local_names(func);
+    // Pure helpers are scalar-only: no DUT access, so no lane table.
+    let empty_lanes = HashMap::new();
+    let cx = ECx { func, names: &names, lanes: &empty_lanes };
     let nparams = func.params.len();
 
     let ret_ty = if func.ret.is_some() { "uint64_t" } else { "void" };
@@ -254,7 +280,7 @@ pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Resul
             match s {
                 Stmt::Assign(l, e) => {
                     let name = &names[l.index()];
-                    let e = expr_cpp(func, &names, e)?;
+                    let e = expr_cpp(&cx, e)?;
                     writeln!(out, "{pad3}{name} = {e};").ok();
                 }
                 other => {
@@ -271,7 +297,7 @@ pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Resul
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::Branch(c, t, f) => {
-                let cond = expr_cpp(func, &names, c)?;
+                let cond = expr_cpp(&cx, c)?;
                 writeln!(out, "{pad3}if ({cond}) {{ __bb = {}; }} else {{ __bb = {}; }}", t.0, f.0)
                     .ok();
             }
@@ -306,13 +332,15 @@ pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Resul
 fn emit_stmt(
     out: &mut String,
     prog: &TbProgram,
-    func: &TbFunction,
-    names: &[String],
+    cx: &ECx<'_>,
+    records: &[RecordSchema],
     bindings: &[BusBindingSchema],
     s: &Stmt,
     depth: usize,
 ) -> Result<(), EmitError> {
     let pad = INDENT.repeat(depth);
+    let func = cx.func;
+    let names = cx.names;
     match s {
         Stmt::Assign(l, e) => {
             // TransactorMethod call edge — the IR carries only the
@@ -321,16 +349,16 @@ fn emit_stmt(
             // edge to exactly this position).
             if let Expr::Call(CallTarget::TransactorMethod { bus_field, method }, args) = e {
                 return emit_transactor_call(
-                    out, func, names, bindings, *l, bus_field, method, args, depth,
+                    out, cx, bindings, *l, bus_field, method, args, depth,
                 );
             }
             let name = &names[l.index()];
-            let e = expr_cpp(func, names, e)?;
+            let e = expr_cpp(cx, e)?;
             writeln!(out, "{pad}{name} = {e};").ok();
         }
         Stmt::RecordInit(l, r) => {
             let name = &names[l.index()];
-            let rec = prog.records.get(r.index()).ok_or_else(|| {
+            let rec = records.get(r.index()).ok_or_else(|| {
                 EmitError(format!(
                     "tbir: RecordInit of `{name}` in {} references missing record r{}",
                     func.name, r.0
@@ -368,7 +396,7 @@ fn emit_stmt(
                 })?;
             let mut rendered = Vec::with_capacity(args.len());
             for a in args {
-                rendered.push(expr_cpp(func, names, a)?);
+                rendered.push(expr_cpp(cx, a)?);
             }
             let invoke = format!("{xname}_{method}({})", rendered.join(", "));
             match dest {
@@ -382,25 +410,75 @@ fn emit_stmt(
         }
         Stmt::RecordFieldWrite { local, field, value } => {
             let name = &names[local.index()];
-            let e = expr_cpp(func, names, value)?;
+            let e = expr_cpp(cx, value)?;
             writeln!(out, "{pad}{name}.{field} = {e};").ok();
         }
+        Stmt::TbFieldWrite { field, value } => {
+            let e = expr_cpp(cx, value)?;
+            writeln!(out, "{pad}_tb.{field} = {e};").ok();
+        }
         Stmt::DutWrite(p, e) => {
-            let e = expr_cpp(func, names, e)?;
-            writeln!(out, "{pad}harc_rt::harc_assign({}, {e});", port_lvalue(p)).ok();
+            let sig = port_signal(p);
+            match p.lane {
+                // Packed multi-lane port: bit-deposit through the
+                // runtime helper; unpacked-array port: raw subscript
+                // (v1's emit_signal_assignment split).
+                Some(lane) => {
+                    let e = expr_cpp(cx, e)?;
+                    match lane_width(cx, p) {
+                        Some(w) => {
+                            writeln!(
+                                out,
+                                "{pad}harc_rt::harc_vec_lane_write<{w}>({sig}, \
+                                 (std::size_t)({lane}), {e});"
+                            )
+                            .ok();
+                        }
+                        None => {
+                            writeln!(out, "{pad}{sig}[{lane}] = {e};").ok();
+                        }
+                    }
+                }
+                None => {
+                    // > 128-bit literal into a wide signal: word-list
+                    // path through the checked helper, parameterized
+                    // by the words the value actually needs (v1).
+                    if let Some(words) = wide_words_over_128(e) {
+                        let req = words
+                            .iter()
+                            .rposition(|w| *w != 0)
+                            .map_or(1, |i| i + 1);
+                        let list = words
+                            .iter()
+                            .map(|w| format!("0x{w:x}u"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        writeln!(
+                            out,
+                            "{pad}harc_rt::harc_assign_words_checked<{req}>({sig}, {{{list}}});"
+                        )
+                        .ok();
+                    } else {
+                        let e = expr_cpp(cx, e)?;
+                        writeln!(out, "{pad}harc_rt::harc_assign({sig}, {e});").ok();
+                    }
+                }
+            }
         }
         Stmt::DutRead(l, p) => {
             let name = &names[l.index()];
-            writeln!(out, "{pad}{name} = {};", port_read(p)).ok();
+            writeln!(out, "{pad}{name} = {};", port_read(cx, p)).ok();
         }
         Stmt::Log { level, args } => {
             let (sev, file) = match level {
+                LogLevel::Debug => ("DEBUG", None),
                 LogLevel::Info => ("INFO", None),
                 LogLevel::Warn => ("WARN", None),
                 LogLevel::Error => ("ERROR", None),
                 LogLevel::Fatal => ("FATAL", None),
                 LogLevel::File { path, level } => (
                     match level {
+                        FileLogLevel::Debug => "DEBUG",
                         FileLogLevel::Info => "INFO",
                         FileLogLevel::Warn => "WARN",
                         FileLogLevel::Error => "ERROR",
@@ -409,7 +487,7 @@ fn emit_stmt(
                     Some(path.as_str()),
                 ),
             };
-            emit_log_call(out, func, names, sev, file, args, depth)?;
+            emit_log_call(out, cx, sev, file, args, depth)?;
             // Spec §7.7 test-result semantics (mirrors v1's emit_log).
             match sev {
                 "ERROR" => {
@@ -422,9 +500,9 @@ fn emit_stmt(
             }
         }
         Stmt::AssertCheck { cond, on_fail } => {
-            let cond = expr_cpp(func, names, cond)?;
+            let cond = expr_cpp(cx, cond)?;
             writeln!(out, "{pad}if (!({cond})) {{").ok();
-            emit_log_call(out, func, names, "FAIL", None, on_fail, depth + 1)?;
+            emit_log_call(out, cx, "FAIL", None, on_fail, depth + 1)?;
             writeln!(out, "{pad}{INDENT}errors++;").ok();
             writeln!(out, "{pad}}}").ok();
         }
@@ -437,12 +515,12 @@ fn emit_stmt(
             // No errors++ — the WaitUntilTimeout terminator already
             // bumped it once on the timeout edge.
             Some(g) => {
-                let g = expr_cpp(func, names, g)?;
+                let g = expr_cpp(cx, g)?;
                 writeln!(out, "{pad}if (!({g})) {{").ok();
-                emit_log_call(out, func, names, "FAIL", None, args, depth + 1)?;
+                emit_log_call(out, cx, "FAIL", None, args, depth + 1)?;
                 writeln!(out, "{pad}}}").ok();
             }
-            None => emit_log_call(out, func, names, "FAIL", None, args, depth)?,
+            None => emit_log_call(out, cx, "FAIL", None, args, depth)?,
         },
     }
     Ok(())
@@ -460,8 +538,7 @@ fn emit_stmt(
 #[allow(clippy::too_many_arguments)]
 fn emit_transactor_call(
     out: &mut String,
-    func: &TbFunction,
-    names: &[String],
+    cx: &ECx<'_>,
     bindings: &[BusBindingSchema],
     dest: crate::ir::LocalId,
     bus_field: &str,
@@ -470,6 +547,8 @@ fn emit_transactor_call(
     depth: usize,
 ) -> Result<(), EmitError> {
     let pad = INDENT.repeat(depth);
+    let func = cx.func;
+    let names = cx.names;
     let schema = bindings
         .iter()
         .find(|b| b.field == bus_field)
@@ -511,7 +590,7 @@ fn emit_transactor_call(
 
     writeln!(out, "{pad}// bus.{method} tlm_method").ok();
     for (arg_name, arg) in schema.args.iter().zip(args.iter()) {
-        let v = expr_cpp(func, names, arg)?;
+        let v = expr_cpp(cx, arg)?;
         writeln!(out, "{pad}harc_rt::harc_assign({}, {v});", wire(arg_name)).ok();
     }
     trace_event(out, "request");
@@ -596,6 +675,16 @@ pub(super) fn emit_method(
 ) -> Result<(), EmitError> {
     let func = prog.function(m.function);
     let names = cpp_local_names(func);
+    // Method bodies poke the DUT directly but carry no `--sv` packed-
+    // lane table of their own (no fixture combines transactor methods
+    // with packed Vec lanes); an empty table falls back to raw
+    // subscripts, matching v1 for that case.
+    let empty_lanes = HashMap::new();
+    let cx = ECx {
+        func,
+        names: &names,
+        lanes: &empty_lanes,
+    };
     let nparams = func.params.len();
     let pad = INDENT.repeat(depth);
     let pad1 = INDENT.repeat(depth + 1);
@@ -624,20 +713,20 @@ pub(super) fn emit_method(
             // Method bodies have no testbench bus-binding scope — a
             // bus-bound call edge in here is a lowering bug and errors
             // inside `emit_stmt` (empty binding table).
-            emit_stmt(out, prog, func, &names, &[], s, depth + 3)?;
+            emit_stmt(out, prog, &cx, &[], &[], s, depth + 3)?;
         }
         match &block.terminator {
             Terminator::Jump(b) => {
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::Branch(c, t, f) => {
-                let cond = expr_cpp(func, &names, c)?;
+                let cond = expr_cpp(&cx, c)?;
                 writeln!(out, "{pad3}if ({cond}) {{ __bb = {}; }} else {{ __bb = {}; }}", t.0, f.0)
                     .ok();
             }
             Terminator::WaitCycles(n, None, b) => {
                 // v1's synchronous wait: one tick() per cycle.
-                let n = expr_cpp(func, &names, n)?;
+                let n = expr_cpp(&cx, n)?;
                 writeln!(
                     out,
                     "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) tick();"
@@ -647,7 +736,7 @@ pub(super) fn emit_method(
             }
             Terminator::WaitUntil { preds, mode, succ } => {
                 // v1's synchronous polling loop.
-                let cond = preds_cpp(func, &names, preds, *mode)?;
+                let cond = preds_cpp(&cx, preds, *mode)?;
                 writeln!(out, "{pad3}while (!({cond})) tick();").ok();
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
@@ -660,6 +749,8 @@ pub(super) fn emit_method(
                 }
             },
             other @ (Terminator::WaitCycles(_, Some(_), _)
+            | Terminator::WaitCyclesSync(_, _)
+            | Terminator::WaitTimePs(_, _)
             | Terminator::WaitUntilTimeout { .. }
             | Terminator::Fatal(_)) => {
                 // Lowering rejects these inside method bodies (or, for
@@ -688,19 +779,18 @@ pub(super) fn emit_method(
 /// emits bare; multiple emit as a parenthesized `&&` chain (`all of`)
 /// or `||` chain (`any of`).
 fn preds_cpp(
-    func: &TbFunction,
-    names: &[String],
+    cx: &ECx<'_>,
     preds: &[PredSrc],
     mode: WaitMode,
 ) -> Result<String, EmitError> {
     if preds.is_empty() {
         return Err(EmitError(format!(
             "tbir: wait-until terminator with no predicates in {} — lowering bug",
-            func.name
+            cx.func.name
         )));
     }
     if preds.len() == 1 {
-        return expr_cpp(func, names, &preds[0].expr);
+        return expr_cpp(cx, &preds[0].expr);
     }
     let joiner = match mode {
         WaitMode::Single | WaitMode::AllOf => " && ",
@@ -708,7 +798,7 @@ fn preds_cpp(
     };
     let parts = preds
         .iter()
-        .map(|p| expr_cpp(func, names, &p.expr))
+        .map(|p| expr_cpp(cx, &p.expr))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(parts
         .iter()
@@ -722,8 +812,7 @@ fn preds_cpp(
 /// matches byte-for-byte.
 fn emit_log_call(
     out: &mut String,
-    func: &TbFunction,
-    names: &[String],
+    cx: &ECx<'_>,
     sev: &str,
     file: Option<&str>,
     args: &FmtArgs,
@@ -745,7 +834,7 @@ fn emit_log_call(
         }
     }
     for a in &args.args {
-        let rendered = fmt_arg_cpp(func, names, a)?;
+        let rendered = fmt_arg_cpp(cx, a)?;
         write!(out, ", {rendered}").ok();
     }
     writeln!(out, ");").ok();

@@ -87,6 +87,34 @@ lowering): a bus binding → the entire Assign RHS, expanded by the
 tbir backend into v1's req/rsp wire protocol; a transactor field →
 the `Stmt::TransactorCall` payload, emitted as a direct
 `<Type>_<method>` lambda call. Everything else —
+call edge, never inlined at the IR level. The **singleton-blocker
+batch** (2026-06-12) added: ternary `?:` (`Expr::Ternary`, emitted as
+the lazy C++ conditional), wall-clock waits (`wait 80ns` →
+`Terminator::WaitTimePs`, picoseconds resolved at lowering; clocked
+tests only), the `debug` log severity, hex integer literals wider
+than 64 bits (`Expr::WideLiteral` word lists; v1's `_harc_u128` /
+`HarcWide<N>` / `harc_assign_words_checked` / `harc_eq_words`
+emission shapes), file-scope `const` declarations and `enum` variant
+names (substituted as integer literals at use sites; enum-typed
+transaction fields lower as scalar variant indices), plain test-scope
+`let`s (hoisted to the head of the run function; check-phase
+references are precisely rejected — see the divergence note below),
+constant-lane DUT port access (`dut.<port>[i]` with a literal/const
+index → `PortRef::lane`; emission splits packed lanes through
+`harc_rt::harc_vec_lane_*<W>` from unpacked-array subscripts via the
+`--sv` lane table, like v1), testbench helper methods
+(`function`/`hookable` in the bound testbench, CFG-inlined at
+`_tb.<m>(...)` call sites like impure helpers), scalar testbench
+fields (`expected : uint<32> default 0` →
+`TestbenchSchema::scalar_fields`, read/written through
+`Expr::TbField` / `Stmt::TbFieldWrite` as run/check-shared `_tb`
+members), width-method intrinsics (`.trunc<N>()` / `.zext<N>()` /
+`.sext<N>()` / `.resize<N>()` with N ≤ 64 → `Expr::WidthCast`,
+mirroring v1's mask/cast/shift-fill emission and direction checks,
+with v1's best-effort receiver-width inference from typed lets /
+casts / chained methods / literals), and scalar `as uint<W>`-family
+casts (≤ 64-bit width relabels — value-identity in the uint64 local
+model, exactly v1's same-storage C cast). Everything else —
 `randomize` (awaits the constraint-IR `ConstraintRef` seam),
 `agent`/`event`, bus-bound/event-driven transactors, transactor state
 fields, passive instances, scoreboards, `fork` (including
@@ -401,6 +429,43 @@ reason. Code locations are authoritative.
     edge stamps `"clk"`. Verdicts and all other events are identical;
     the fixture stays **unregistered** until the trace-diff
     normalization (or v1's pre-loop stamp) is reconciled.
+10. **Singleton-batch notes (2026-06-12).**
+    - *`Terminator::WaitCyclesSync`* — a `wait N cycles` that
+      originated inside an inlined helper / testbench-method body
+      emits as v1's synchronous `for (...) tick()` loop, not
+      `co_await`. v1 emits helper bodies as plain lambdas whose waits
+      never yield, so a helpers-only test body completes inside
+      `sched.bootstrap()`; emitting `co_await` instead left a real
+      trace delta (the final `sim_end` event's clock attribution) on
+      `linklist_basic_test`. Cycle counts and checker observations
+      are identical either way; the sync form mirrors v1's execution
+      structure exactly.
+    - *Test-scope `let`s* lower as run-function locals initialized at
+      entry. v1 hoists them to `main` scope and the run/check
+      coroutine captures them by reference — shared state across
+      phases. The IR's run and check are separate functions, so a
+      check-phase reference to a test-scope let is an explicit
+      `Unsupported` (never a silent zero); run/check-shared state is
+      what testbench scalar fields are for.
+    - *Ternary port hoisting*: in positions where ports must hoist
+      (e.g. `let` RHS), both arms' DUT reads hoist eagerly, while
+      v1's C++ `?:` reads the taken arm only. DUT port reads are
+      side-effect-free and untraced, so the difference is
+      unobservable; in port-allowed positions (assert conditions,
+      format args, wait predicates) the ternary emits as `?:` with
+      inline reads, byte-equivalent to v1.
+    - *`const` initializers* are restricted to plain integer literals
+      (v1 forwards arbitrary exprs into a C++ `constexpr`); wider
+      shapes are explicit rejections until needed.
+    - *Width methods* cover the ≤ 64-bit subset only (the tbir
+      expression model is u64); > 64-bit targets are explicit
+      rejections. `zext` on an unknown-width receiver is a plain
+      cast — v1's exact shape, including its documented
+      "assume the receiver already fits" looseness.
+    - *Lane indices* must be compile-time constants (literal, paren,
+      or `const`/enum name). v1 accepts arbitrary index expressions;
+      a variable index is an explicit rejection until a fixture
+      needs it.
 
 Minor, same spirit: `IndexVec` is a plain `Vec` plus typed id structs;
 the design's `AssertFail` enum collapsed into a single

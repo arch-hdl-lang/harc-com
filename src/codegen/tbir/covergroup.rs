@@ -8,7 +8,7 @@
 //! runtime-observable (log lines + check-phase asserts), so both must
 //! match v1 exactly for the trace-equivalence gate.
 
-use super::expr::port_read;
+use super::expr::port_signal;
 use crate::ir::{CovBinValue, CoverPointSchema, CovgroupSchema};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -142,6 +142,12 @@ fn cross_bin_labels(cross: &DeclaredCross<'_>) -> Vec<(usize, String)> {
 /// `emit_bin_membership` semantics: `Eq` is `_v == x`, `Range` is the
 /// inclusive `_v >= lo && _v <= hi` (open bounds drop their side; a
 /// fully open range is `true`), members `||`-joined.
+/// Covergroup sample-point read. Cover targets are direct DUT ports
+/// (no lanes), so this stays the plain `harc_read` wrap.
+fn cover_target_read(p: &crate::ir::PortRef) -> String {
+    format!("harc_rt::harc_read({})", port_signal(p))
+}
+
 fn bin_membership(values: &[CovBinValue]) -> String {
     if values.is_empty() {
         return "(false)".to_string();
@@ -328,7 +334,7 @@ pub(super) fn sampler_registration(out: &mut String, schema: &CovgroupSchema, in
         writeln!(
             out,
             "{pad3}uint64_t _v = (uint64_t)({});",
-            port_read(&p.target)
+            cover_target_read(&p.target)
         )
         .ok();
         for (bin_idx, b) in p.bins.iter().enumerate() {

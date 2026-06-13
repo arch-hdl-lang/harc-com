@@ -838,13 +838,14 @@ fn helper_categorization_pure_vs_impure() {
     assert_eq!(helper_fns[0].name, "double_it");
     assert!(helper_fns[0].ret.is_some(), "pure helper carries a ret slot");
 
-    // The run body inlined read_addr (WaitCycles from the helper body)
-    // and calls double_it by name.
+    // The run body inlined read_addr (WaitCyclesSync from the helper
+    // body — inlined waits take v1's synchronous lambda path) and
+    // calls double_it by name.
     let run = prog.function(prog.tests[0].run);
     let waits = run
         .blocks
         .iter()
-        .filter(|b| matches!(b.terminator, ir::Terminator::WaitCycles(..)))
+        .filter(|b| matches!(b.terminator, ir::Terminator::WaitCyclesSync(..)))
         .count();
     assert_eq!(waits, 2, "one inlined wait per read_addr call:\n{run}");
     let calls_double_it = run.blocks.iter().any(|b| {
@@ -977,7 +978,8 @@ end test BreakTest
 
 /// tbir emission for the helper mix: the pure helper becomes a
 /// file-scope C++ function; the impure helper's wait shows up as a
-/// co_await in the run coroutine (CFG-inlined, not a call).
+/// synchronous tick loop in the run coroutine (CFG-inlined, not a
+/// call — and sync, not co_await, mirroring v1's lambda-body waits).
 #[test]
 fn tbir_emit_helper_mix() {
     let prog = lower_src(HELPER_MIX_SRC).expect("lowers");
@@ -987,7 +989,7 @@ fn tbir_emit_helper_mix() {
         "static uint64_t harc_helper_double_it(uint64_t x);",
         "static uint64_t harc_helper_double_it(uint64_t x) {",
         "harc_helper_double_it(__t",
-        "co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));",
+        "for (int _w = 0; _w < 1; _w++) tick();",
     ] {
         assert!(cpp.contains(marker), "missing marker `{marker}` in:\n{cpp}");
     }
@@ -1214,6 +1216,7 @@ fn verifier_catches_bad_successor_and_use_before_def() {
                 direction: None,
                 width: None,
                 access: ir::PortAccess::Port,
+                lane: None,
             },
             ir::Expr::Local(ghost),
         ),
@@ -1242,6 +1245,7 @@ fn verifier_rejects_port_in_assign_value() {
             direction: None,
             width: None,
             access: ir::PortAccess::Port,
+            lane: None,
         }),
     ));
     let errs = verify::verify_program(&broken).unwrap_err();
@@ -2411,4 +2415,88 @@ end impl ShTest
         msg.contains("assignment to a non-port, non-local target"),
         "shadowed name must not resolve to the DUT: {msg}"
     );
+}
+
+// ── Singleton-blocker batch (ternary, time/wide literals, const/enum,
+//    test-scope lets, indexed lanes, testbench methods/fields, width
+//    methods): one dump-ir snapshot per newly-registered fixture. ────
+
+/// Ternary expressions inside CFG-inlined impure helpers, plus the
+/// `WaitCyclesSync` terminator (v1's synchronous helper-lambda waits).
+#[test]
+fn linklist_basic_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("linklist_basic_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("linklist_basic_dump_ir", format!("{prog}"));
+}
+
+/// Wall-clock waits (`wait 80ns` → `WaitTimePs`) and the `debug` log
+/// severity, under the two-clock scheduler.
+#[test]
+fn async_fifo_dump_ir_snapshot() {
+    let prog = lower_fixtures(&["async_fifo_test.harc", "async_fifo_domains.harc"])
+        .expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("async_fifo_dump_ir", format!("{prog}"));
+}
+
+/// 256-bit literals: `WideLiteral` word lists in DutWrite values and
+/// `==`/`!=` assert conditions.
+#[test]
+fn wide_reg_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("wide_reg_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("wide_reg_dump_ir", format!("{prog}"));
+}
+
+/// 512-bit message-block literals + `while !dut.done` header re-reads.
+#[test]
+fn sha256_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("sha256_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("sha256_dump_ir", format!("{prog}"));
+}
+
+/// Test-scope `let`s hoisted to the head of the run function.
+#[test]
+fn if_wait_for_in_then_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("if_wait_for_in_then_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("if_wait_for_in_then_dump_ir", format!("{prog}"));
+}
+
+/// Constant-lane DUT port access (`dut.<port>[i]` reads and writes,
+/// `PortRef::lane`) across packed and unpacked port shapes.
+#[test]
+fn packed_vec_lane_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("packed_vec_lane_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("packed_vec_lane_dump_ir", format!("{prog}"));
+}
+
+/// Testbench helper methods (`_tb.reset()` / `_tb.bump(n)`) CFG-
+/// inlined into two `--test`-selectable tests.
+#[test]
+fn testbench_basic_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("testbench_basic_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("testbench_basic_dump_ir", format!("{prog}"));
+}
+
+/// Scalar testbench fields (`expected : uint<32> default 0`):
+/// `TbFieldWrite` in run, `TbField` reads in the shared check phase.
+#[test]
+fn testbench_lifecycle_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("testbench_lifecycle_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("testbench_lifecycle_dump_ir", format!("{prog}"));
+}
+
+/// Width-method intrinsics (`.trunc/.zext/.sext/.resize`) with
+/// receiver widths from typed lets, casts, and chained methods.
+#[test]
+fn width_methods_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("width_methods_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("width_methods_dump_ir", format!("{prog}"));
 }

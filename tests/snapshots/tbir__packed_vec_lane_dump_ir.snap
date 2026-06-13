@@ -1,0 +1,47 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 PackedVecLaneTb { dut: PackedVecLane }
+  test PackedVecLaneTest tb=tb0 run=fn0 check=-
+
+fn fn0 run_PackedVecLaneTest [kind=Run, owner=tb0]
+  entry = b0
+
+  b0:
+    Log(info, "packed Vec<Bus> lane-access regression")
+    DutWrite(dut.rst, 1)
+    -> WaitCycles(1, b1)
+
+  b1:
+    DutWrite(dut.rst, 0)
+    DutWrite(dut.lane_valid_in[0], 1)
+    DutWrite(dut.lane_valid_in[1], 0)
+    DutWrite(dut.lane_valid_in[2], 1)
+    DutWrite(dut.lane_id_in[0], 3)
+    DutWrite(dut.lane_id_in[1], 9)
+    DutWrite(dut.lane_id_in[2], 17)
+    DutWrite(dut.lane_data_in[0], 286331153)
+    DutWrite(dut.lane_data_in[1], 572662306)
+    DutWrite(dut.lane_data_in[2], 858993459)
+    DutWrite(dut.pass_uvec_in[0], 64)
+    DutWrite(dut.pass_uvec_in[1], 80)
+    DutWrite(dut.pass_uvec_in[2], 96)
+    -> WaitCycles(1, b2)
+
+  b2:
+    AssertCheck { cond: (dut.lane_valid_out[0] == 1), on_fail: "lane_valid[0] = 1 (got %lld)", dut.lane_valid_out[0] }
+    AssertCheck { cond: (dut.lane_valid_out[1] == 0), on_fail: "lane_valid[1] = 0 (got %lld)", dut.lane_valid_out[1] }
+    AssertCheck { cond: (dut.lane_valid_out[2] == 1), on_fail: "lane_valid[2] = 1 (got %lld)", dut.lane_valid_out[2] }
+    AssertCheck { cond: (dut.lane_id_out[0] == 4), on_fail: "lane_id[0] = 4 (got %lld)", dut.lane_id_out[0] }
+    AssertCheck { cond: (dut.lane_id_out[1] == 10), on_fail: "lane_id[1] = 10 (got %lld)", dut.lane_id_out[1] }
+    AssertCheck { cond: (dut.lane_id_out[2] == 18), on_fail: "lane_id[2] = 18 (got %lld)", dut.lane_id_out[2] }
+    AssertCheck { cond: (dut.lane_data_out[0] == 286331153), on_fail: "lane_data[0] = 0x11111111 (got 0x%08llx)", dut.lane_data_out[0] }
+    AssertCheck { cond: (dut.lane_data_out[1] == 572662307), on_fail: "lane_data[1] = 0x22222223 (got 0x%08llx)", dut.lane_data_out[1] }
+    AssertCheck { cond: (dut.lane_data_out[2] == 858993461), on_fail: "lane_data[2] = 0x33333335 (got 0x%08llx)", dut.lane_data_out[2] }
+    AssertCheck { cond: (dut.pass_uvec_out[0] == 66), on_fail: "pass_uvec[0] = 0x42 (got 0x%02llx)", dut.pass_uvec_out[0] }
+    AssertCheck { cond: (dut.pass_uvec_out[1] == 82), on_fail: "pass_uvec[1] = 0x52 (got 0x%02llx)", dut.pass_uvec_out[1] }
+    AssertCheck { cond: (dut.pass_uvec_out[2] == 98), on_fail: "pass_uvec[2] = 0x62 (got 0x%02llx)", dut.pass_uvec_out[2] }
+    Log(info, "PASS: packed Vec<Bus> lanes + unpacked array index correctly on --sv")
+    -> Return

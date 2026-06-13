@@ -4,21 +4,31 @@
 //! else `lower_expr_no_ports` hoists DUT reads into `DutRead` temps.
 
 use super::{FuncBuilder, LowerError, unsupported};
-use crate::ast::{BinaryOp, Expr as AstExpr, ExprKind, UnaryOp};
-use crate::ir::{BinOp, Expr, IrType, PortAccess, PortRef, Stmt, UnOp};
+use crate::ast::{
+    BinaryOp, BuiltinTy, CallArg, Expr as AstExpr, ExprKind, TypeArg, TypeExpr, UnaryOp,
+};
+use crate::ir::{BinOp, Expr, IrType, PortAccess, PortRef, Stmt, UnOp, WidthCastKind};
 
 impl FuncBuilder<'_> {
     /// Lower with `Expr::Port` allowed in the result.
     pub(crate) fn lower_expr(&mut self, e: &AstExpr) -> Result<Expr, LowerError> {
         match &*e.kind {
             ExprKind::Int(s) => {
-                let value = parse_int_literal(s).ok_or_else(|| {
-                    unsupported("integer literal", format!("`{s}` is not a plain literal"))
-                })?;
-                Ok(Expr::Literal {
-                    value,
-                    ty: IrType::Unknown,
-                })
+                if let Some(value) = parse_int_literal(s) {
+                    return Ok(Expr::Literal {
+                        value,
+                        ty: IrType::Unknown,
+                    });
+                }
+                // Hex literals wider than 64 bits lower to LSB-first
+                // 32-bit word lists (v1's `c_wide_lit_words` shape).
+                if let Some(words) = parse_wide_hex_literal(s) {
+                    return Ok(Expr::WideLiteral(words));
+                }
+                Err(unsupported(
+                    "integer literal",
+                    format!("`{s}` is not a plain literal"),
+                ))
             }
             ExprKind::Bool(b) => Ok(Expr::Literal {
                 value: *b as u64,
@@ -34,6 +44,23 @@ impl FuncBuilder<'_> {
                         "DUT access must name a port (`dut.<port>`)",
                     ));
                 }
+                // File-scope `const` / enum-variant substitution
+                // (locals shadow — checked above; v1's constexpr /
+                // variant-index emission is value-identical).
+                if let Some(v) = self.ctx.consts.get(&id.name) {
+                    return Ok(Expr::Literal {
+                        value: *v,
+                        ty: IrType::Unknown,
+                    });
+                }
+                if self.in_check && self.ctx.test_scope_lets.contains(&id.name) {
+                    return Err(unsupported(
+                        &format!("test-scope `let {}` referenced in the check phase", id.name),
+                        "test-scope lets lower as run-function locals; run and check are \
+                         separate functions in the IR, so v1's shared-capture scoping is \
+                         not representable",
+                    ));
+                }
                 Err(unsupported(
                     &format!("the unresolved name `{}`", id.name),
                     "",
@@ -45,6 +72,10 @@ impl FuncBuilder<'_> {
                 }
                 if let Some(cov_bin) = self.as_cov_bin(e)? {
                     return Ok(cov_bin);
+                }
+                // Scalar testbench field read (`_tb.expected`).
+                if let Some(field) = self.as_tb_scalar_field(e) {
+                    return Ok(Expr::TbField(field));
                 }
                 // `t.field` read on a record-typed local.
                 if let ExprKind::Ident(root) = &*target.kind {
@@ -91,6 +122,12 @@ impl FuncBuilder<'_> {
                 then_branch,
                 else_branch,
             } => {
+                // Lowered to the IR ternary, emitted as the C++ `?:`
+                // operator — the not-taken arm stays lazily skipped,
+                // exactly v1's emission. (Port reads hoisted out of a
+                // ternary by `lower_expr_no_ports` become eager, but a
+                // DUT port read is side-effect-free and untraced, so
+                // the difference is unobservable.)
                 let c = self.lower_expr(cond)?;
                 let t = self.lower_expr(then_branch)?;
                 let e = self.lower_expr(else_branch)?;
@@ -104,7 +141,17 @@ impl FuncBuilder<'_> {
                         }
                         format!("helper call `{}(...)`", id.name)
                     }
-                    ExprKind::Field { name, .. } => {
+                    ExprKind::Field { target, name } => {
+                        // Width-method intrinsics: `.trunc<N>()` /
+                        // `.zext<N>()` / `.sext<N>()` / `.resize<N>()`.
+                        if let Some(kind) = width_cast_kind(&name.name) {
+                            return self.lower_width_method(kind, &name.name, target, args);
+                        }
+                        // Testbench helper method call (`_tb.reset()`),
+                        // CFG-inlined like an impure helper.
+                        if let Some(m) = self.tb_method_call_name(callee) {
+                            return self.lower_tb_method_call(&m, args);
+                        }
                         // Bus calls (tlm_method / send / recv) suspend,
                         // so they are statement-level only — `let x =
                         // bus.m(...)` and `x = bus.m(...)` lower via
@@ -154,8 +201,32 @@ impl FuncBuilder<'_> {
                 "out-of-order TLM issue/join_all lanes are not lowered yet",
             )),
             ExprKind::Randomize { .. } => Err(unsupported("`randomize` expressions", "")),
-            ExprKind::Cast { .. } => Err(unsupported("`as` casts", "")),
-            ExprKind::Index { .. } => Err(unsupported("index expressions", "")),
+            ExprKind::Cast { expr, ty } => {
+                // `e as uint<W>` / `as sint<W>` / `as bits<W>` (W ≤ 64)
+                // is a width relabel: v1 emits `((uint64_t)(e))` (the
+                // C type for every width ≤ 64 is the same 64-bit
+                // integer), so the value is unchanged in the IR's
+                // uint64 local model. The annotation still feeds the
+                // width-method receiver inference (done on the AST at
+                // the call site). Anything else stays rejected.
+                if cast_relabel_width(ty).is_some() {
+                    return self.lower_expr(expr);
+                }
+                Err(unsupported(
+                    "`as` casts outside scalar uint/sint/bits (≤ 64 bits)",
+                    "",
+                ))
+            }
+            ExprKind::Index { .. } => {
+                // Constant-lane DUT port access: `dut.<port>[<const>]`.
+                if let Some(port) = self.as_lane_port_ref(e)? {
+                    return Ok(Expr::Port(port));
+                }
+                Err(unsupported(
+                    "index expressions",
+                    "only `dut.<port>[<constant>]` lane accesses are lowered",
+                ))
+            }
             ExprKind::BitSlice { .. } => Err(unsupported("bit-slice expressions", "")),
             ExprKind::String(_) => Err(unsupported(
                 "string values in expression position",
@@ -214,13 +285,29 @@ impl FuncBuilder<'_> {
                 let e = self.hoist_ports(*e);
                 Expr::Ternary(Box::new(c), Box::new(t), Box::new(e))
             }
+            Expr::WidthCast {
+                kind,
+                width,
+                src_width,
+                inner,
+            } => {
+                let inner = self.hoist_ports(*inner);
+                Expr::WidthCast {
+                    kind,
+                    width,
+                    src_width,
+                    inner: Box::new(inner),
+                }
+            }
             Expr::Call(t, args) => {
                 let args = args.into_iter().map(|a| self.hoist_ports(a)).collect();
                 Expr::Call(t, args)
             }
             other @ (Expr::Literal { .. }
+            | Expr::WideLiteral(_)
             | Expr::Local(_)
             | Expr::RecordField { .. }
+            | Expr::TbField(_)
             | Expr::CovBin { .. }) => other,
         }
     }
@@ -268,14 +355,17 @@ impl FuncBuilder<'_> {
                             direction: None,
                             width: None,
                             access: PortAccess::Port,
+                            lane: None,
                         }));
                     }
                     if Some(root.name.as_str()) == self.ctx.tb_field.as_deref()
                         && !segments.is_empty()
                     {
-                        // Covergroup-field paths (`_tb.cov...`) are not
+                        // Covergroup-field paths (`_tb.cov...`) and
+                        // scalar-field paths (`_tb.expected`) are not
                         // ports — `lower_expr` resolves them as
-                        // `Expr::CovBin` via `as_cov_bin`. Transactor-
+                        // `Expr::CovBin` via `as_cov_bin`; `Expr::TbField`
+                        // via the testbench-field path. Transactor-
                         // field paths (`_tb.xact...`) are call/bind
                         // surfaces handled by their statement forms.
                         if self.ctx.cov_fields.contains_key(segments.last().unwrap())
@@ -283,6 +373,11 @@ impl FuncBuilder<'_> {
                                 .ctx
                                 .transactor_fields
                                 .contains_key(segments.last().unwrap())
+                        {
+                            return Ok(None);
+                        }
+                        if segments.len() == 1
+                            && self.ctx.tb_scalar_fields.contains(&segments[0])
                         {
                             return Ok(None);
                         }
@@ -415,6 +510,204 @@ impl FuncBuilder<'_> {
             }
         }
     }
+    /// `Some(field)` when the expression is a one-segment access to a
+    /// scalar testbench field: `_tb.expected`.
+    pub(crate) fn as_tb_scalar_field(&self, e: &AstExpr) -> Option<String> {
+        let tb_field = self.ctx.tb_field.as_deref()?;
+        let ExprKind::Field { target, name } = &*e.kind else {
+            return None;
+        };
+        let ExprKind::Ident(root) = &*target.kind else {
+            return None;
+        };
+        (root.name == tb_field && self.ctx.tb_scalar_fields.contains(&name.name))
+            .then(|| name.name.clone())
+    }
+
+    /// `Some(PortRef)` (with `lane`) when the expression is a
+    /// constant-index lane access on a direct DUT port:
+    /// `dut.<port>[<const>]`. The index must reduce to an integer
+    /// literal (directly, through parens, or via a `const`/enum name)
+    /// — non-constant lane indices are an explicit rejection at the
+    /// caller.
+    pub(crate) fn as_lane_port_ref(
+        &mut self,
+        e: &AstExpr,
+    ) -> Result<Option<PortRef>, LowerError> {
+        let ExprKind::Index { target, index } = &*e.kind else {
+            return Ok(None);
+        };
+        let Some(mut port) = self.as_port_ref(target)? else {
+            return Ok(None);
+        };
+        let Some(lane) = self.const_eval_index(index) else {
+            return Err(unsupported(
+                "a non-constant lane index on a DUT port",
+                "only `dut.<port>[<integer constant>]` is lowered",
+            ));
+        };
+        port.lane = Some(lane);
+        Ok(Some(port))
+    }
+
+    /// Constant-evaluate a lane index: integer literal, parenthesized
+    /// literal, or a `const`/enum-variant name.
+    fn const_eval_index(&self, e: &AstExpr) -> Option<u64> {
+        match &*e.kind {
+            ExprKind::Int(s) => parse_int_literal(s),
+            ExprKind::Paren(inner) => self.const_eval_index(inner),
+            ExprKind::Ident(id) if self.lookup(&id.name).is_none() => {
+                self.ctx.consts.get(&id.name).copied()
+            }
+            _ => None,
+        }
+    }
+
+    /// Lower a width-method intrinsic call (`recv.trunc<N>()`, ...).
+    /// Mirrors v1's `try_emit_width_method`: constant width required,
+    /// zero-width rejected, direction checked against the best-effort
+    /// receiver width, ≤ 64-bit subset only (wide receivers are not in
+    /// the IR's expression model yet).
+    fn lower_width_method(
+        &mut self,
+        kind: WidthCastKind,
+        kind_name: &str,
+        target: &AstExpr,
+        args: &[CallArg],
+    ) -> Result<Expr, LowerError> {
+        let width_expr = match args.first() {
+            Some(CallArg::Expr(e)) if args.len() == 1 => e,
+            _ => {
+                return Err(LowerError::Invalid(format!(
+                    "`.{kind_name}<N>()` requires a constant width argument"
+                )));
+            }
+        };
+        let Some(width) = const_eval_width(width_expr) else {
+            return Err(LowerError::Invalid(format!(
+                "`.{kind_name}<N>()` requires a constant integer width"
+            )));
+        };
+        if width == 0 {
+            return Err(LowerError::Invalid(format!(
+                "`.{kind_name}<{width}>()`: width must be greater than zero"
+            )));
+        }
+        if width > 64 {
+            return Err(unsupported(
+                &format!("`.{kind_name}<{width}>()` with a width above 64 bits"),
+                "the TB-IR expression model is 64-bit",
+            ));
+        }
+        // Best-effort receiver-width inference (v1's
+        // `infer_expr_width_best_effort`) for the direction check and
+        // the sext shift-fill shape.
+        let src_width = self.infer_expr_width(target);
+        if let Some(sw) = src_width {
+            match kind {
+                WidthCastKind::Trunc if width >= sw => {
+                    return Err(LowerError::Invalid(format!(
+                        "`.trunc<{width}>()` on a {sw}-bit value: width must be strictly \
+                         less than the source width (otherwise it's a no-op or \
+                         wrong-direction). Use `.zext<{width}>()` to widen, or remove \
+                         the cast if you meant a no-op."
+                    )));
+                }
+                WidthCastKind::Zext | WidthCastKind::Sext if width < sw => {
+                    return Err(LowerError::Invalid(format!(
+                        "`.{kind_name}<{width}>()` on a {sw}-bit value: width must be \
+                         ≥ the source width (otherwise it narrows, wrong direction). \
+                         Use `.trunc<{width}>()` to narrow."
+                    )));
+                }
+                _ => {}
+            }
+        }
+        let inner = self.lower_expr(target)?;
+        Ok(Expr::WidthCast {
+            kind,
+            width,
+            src_width,
+            inner: Box::new(inner),
+        })
+    }
+
+    /// Best-effort receiver bit-width (v1's
+    /// `infer_expr_width_best_effort`): parens recurse, `as uint<W>`
+    /// casts give W, nested width methods give their target width,
+    /// bare literals give their minimum unsigned width, and locals
+    /// resolve through the typed-`let` width table.
+    fn infer_expr_width(&self, e: &AstExpr) -> Option<u32> {
+        match &*e.kind {
+            ExprKind::Paren(inner) => self.infer_expr_width(inner),
+            ExprKind::Cast { ty, .. } => cast_relabel_width(ty),
+            ExprKind::Call { callee, args } => {
+                if let ExprKind::Field { name, .. } = &*callee.kind {
+                    if width_cast_kind(&name.name).is_some() {
+                        if let Some(CallArg::Expr(w)) = args.first() {
+                            return const_eval_width(w);
+                        }
+                    }
+                }
+                None
+            }
+            ExprKind::Int(s) => {
+                let v = parse_int_literal(s)?;
+                Some(if v == 0 { 1 } else { 64 - v.leading_zeros() })
+            }
+            ExprKind::Ident(id) => {
+                let local = self.lookup(&id.name)?;
+                self.let_widths.get(&local).copied()
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Width-method name → `WidthCastKind`.
+pub(crate) fn width_cast_kind(name: &str) -> Option<WidthCastKind> {
+    match name {
+        "trunc" => Some(WidthCastKind::Trunc),
+        "zext" => Some(WidthCastKind::Zext),
+        "sext" => Some(WidthCastKind::Sext),
+        "resize" => Some(WidthCastKind::Resize),
+        _ => None,
+    }
+}
+
+/// `Some(W)` when the cast target is a scalar `uint<W>`/`sint<W>`/
+/// `bits<W>` relabel with W ≤ 64 (v1 lowers these to a same-storage
+/// C cast — value-identity in the IR's uint64 model). Width-less
+/// scalar casts give 64.
+pub(crate) fn cast_relabel_width(ty: &TypeExpr) -> Option<u32> {
+    let TypeExpr::Builtin { name, args, .. } = ty else {
+        return None;
+    };
+    if !matches!(
+        name,
+        BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::SInt | BuiltinTy::SIntCap | BuiltinTy::Bits
+    ) {
+        return None;
+    }
+    let width = match args.first() {
+        Some(TypeArg::Expr(e)) => match &*e.kind {
+            ExprKind::Int(s) => s.replace('_', "").parse::<u32>().ok()?,
+            _ => return None,
+        },
+        Some(_) => return None,
+        None => 64,
+    };
+    (width > 0 && width <= 64).then_some(width)
+}
+
+/// Constant width argument of a width method (v1's `eval_const_width`:
+/// integer literal, possibly parenthesized).
+fn const_eval_width(e: &AstExpr) -> Option<u32> {
+    match &*e.kind {
+        ExprKind::Paren(inner) => const_eval_width(inner),
+        ExprKind::Int(s) => parse_int_literal(s).and_then(|v| u32::try_from(v).ok()),
+        _ => None,
+    }
 }
 
 fn lower_bin_op(op: BinaryOp) -> Result<BinOp, LowerError> {
@@ -448,6 +741,28 @@ fn lower_bin_op(op: BinaryOp) -> Result<BinOp, LowerError> {
             return Err(unsupported("`in`/`inside` membership operators", ""));
         }
     })
+}
+
+/// Parse a hex literal wider than 64 bits (> 16 hex digits) into
+/// LSB-first 32-bit words — v1's `c_wide_lit_words` decomposition,
+/// extended down to the 65..=128-bit range (v1 covers that range with
+/// a `_harc_u128` composite; the tbir emitter reconstructs the same
+/// composite from the words). Returns `None` for non-hex or ≤ 64-bit
+/// literals (those take the plain `Expr::Literal` path).
+pub(crate) fn parse_wide_hex_literal(s: &str) -> Option<Vec<u32>> {
+    let t = s.replace('_', "");
+    let hex = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X"))?;
+    if hex.len() <= 16 || hex.chars().any(|c| !c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut words = Vec::with_capacity(hex.len().div_ceil(8));
+    let mut remaining = hex.len();
+    while remaining > 0 {
+        let start = remaining.saturating_sub(8);
+        words.push(u32::from_str_radix(&hex[start..remaining], 16).ok()?);
+        remaining = start;
+    }
+    Some(words)
 }
 
 /// Parse a plain integer literal (decimal / 0x / 0b / 0o, `_`

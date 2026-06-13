@@ -44,7 +44,7 @@ fn fn1 run_RomLutTest [kind=Run, owner=tb0]
     Assign(%addr, 0)
     DutWrite(dut.rd_addr, %addr)
     DutWrite(dut.rd_en, 1)
-    -> WaitCycles(1, b3)
+    -> WaitCyclesSync(1, b3)
 
   b2:
     AssertCheck { cond: (%__t0 == 0), on_fail: "addr 0: got 0x%02llx", dut.rd_data }
@@ -52,7 +52,7 @@ fn fn1 run_RomLutTest [kind=Run, owner=tb0]
     Assign(%addr_2, 1)
     DutWrite(dut.rd_addr, %addr_2)
     DutWrite(dut.rd_en, 1)
-    -> WaitCycles(1, b5)
+    -> WaitCyclesSync(1, b5)
 
   b3:
     DutRead(%__t0, dut.rd_data)
@@ -64,7 +64,7 @@ fn fn1 run_RomLutTest [kind=Run, owner=tb0]
     Assign(%addr_3, 2)
     DutWrite(dut.rd_addr, %addr_3)
     DutWrite(dut.rd_en, 1)
-    -> WaitCycles(1, b7)
+    -> WaitCyclesSync(1, b7)
 
   b5:
     DutRead(%__t1, dut.rd_data)
@@ -76,7 +76,7 @@ fn fn1 run_RomLutTest [kind=Run, owner=tb0]
     Assign(%addr_4, 3)
     DutWrite(dut.rd_addr, %addr_4)
     DutWrite(dut.rd_en, 1)
-    -> WaitCycles(1, b9)
+    -> WaitCyclesSync(1, b9)
 
   b7:
     DutRead(%__t2, dut.rd_data)
@@ -88,7 +88,7 @@ fn fn1 run_RomLutTest [kind=Run, owner=tb0]
     Assign(%addr_5, 4)
     DutWrite(dut.rd_addr, %addr_5)
     DutWrite(dut.rd_en, 1)
-    -> WaitCycles(1, b11)
+    -> WaitCyclesSync(1, b11)
 
   b9:
     DutRead(%__t3, dut.rd_data)
@@ -100,7 +100,7 @@ fn fn1 run_RomLutTest [kind=Run, owner=tb0]
     Assign(%addr_6, 5)
     DutWrite(dut.rd_addr, %addr_6)
     DutWrite(dut.rd_en, 1)
-    -> WaitCycles(1, b13)
+    -> WaitCyclesSync(1, b13)
 
   b11:
     DutRead(%__t4, dut.rd_data)
@@ -112,7 +112,7 @@ fn fn1 run_RomLutTest [kind=Run, owner=tb0]
     Assign(%addr_7, 6)
     DutWrite(dut.rd_addr, %addr_7)
     DutWrite(dut.rd_en, 1)
-    -> WaitCycles(1, b15)
+    -> WaitCyclesSync(1, b15)
 
   b13:
     DutRead(%__t5, dut.rd_data)
@@ -124,7 +124,7 @@ fn fn1 run_RomLutTest [kind=Run, owner=tb0]
     Assign(%addr_8, 7)
     DutWrite(dut.rd_addr, %addr_8)
     DutWrite(dut.rd_en, 1)
-    -> WaitCycles(1, b17)
+    -> WaitCyclesSync(1, b17)
 
   b15:
     DutRead(%__t6, dut.rd_data)

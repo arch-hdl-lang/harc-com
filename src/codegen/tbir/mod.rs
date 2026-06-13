@@ -94,13 +94,13 @@ pub fn emit(prog: &TbProgram, opts: &EmitOpts) -> Result<String, EmitError> {
                 .iter()
                 .map(|(f, cg)| (f.clone(), prog.covgroups[cg.index()].name.clone()))
                 .collect();
-            runtime::tb_struct(&mut out, &tb.name, &dut_type, &cov_fields);
+            runtime::tb_struct(&mut out, &tb.name, &dut_type, &cov_fields, &tb.scalar_fields);
         }
     }
     runtime::context_struct(&mut out, &dut_type);
 
     for t in &prog.tests {
-        emit_test(&mut out, prog, t, &dut_type)?;
+        emit_test(&mut out, prog, t, &dut_type, opts)?;
     }
 
     runtime::dispatcher(&mut out, &test_names);
@@ -159,6 +159,7 @@ fn emit_test(
     prog: &TbProgram,
     test: &ir::TestSchema,
     dut_type: &str,
+    opts: &EmitOpts,
 ) -> Result<(), EmitError> {
     let tb = prog.testbench(test.testbench);
     let clocked = !test.clocks.is_empty();
@@ -236,9 +237,25 @@ fn emit_test(
     if !tb.synthetic {
         writeln!(out, "{INDENT}{INDENT}_tb.dut = dut;").ok();
     }
-    func::emit_function(out, prog, prog.function(test.run), &tb.bus_bindings, 2)?;
+    func::emit_function(
+        out,
+        prog,
+        prog.function(test.run),
+        &prog.records,
+        &tb.bus_bindings,
+        &opts.vec_lane_widths,
+        2,
+    )?;
     if let Some(check) = test.check {
-        func::emit_function(out, prog, prog.function(check), &tb.bus_bindings, 2)?;
+        func::emit_function(
+            out,
+            prog,
+            prog.function(check),
+            &prog.records,
+            &tb.bus_bindings,
+            &opts.vec_lane_widths,
+            2,
+        )?;
     }
     writeln!(out, "{INDENT}{INDENT}co_return;").ok();
     writeln!(out, "{INDENT}}}(&_run_slot);").ok();

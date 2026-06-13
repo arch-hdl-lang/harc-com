@@ -1,0 +1,88 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 IfWaitForInThenTb { dut: M }
+  test IfWaitForInThenTest tb=tb0 run=fn0 check=-
+
+fn fn0 run_IfWaitForInThenTest [kind=Run, owner=tb0]
+  locals:
+    %0 done_pulses : unknown
+    %1 prev_done : unknown
+    %2 cycles_since_last_done : unknown
+    %3 c : unknown
+    %4 __t0 : unknown
+    %5 __t1 : unknown
+  entry = b0
+
+  b0:
+    Assign(%done_pulses, 0)
+    Assign(%prev_done, 0)
+    Assign(%cycles_since_last_done, 0)
+    Log(info, "if_wait_for_in_then sim")
+    DutWrite(dut.rst, 0)
+    DutWrite(dut.go, 0)
+    DutWrite(dut.doit, 0)
+    DutWrite(dut.ack, 0)
+    DutWrite(dut.burst, 4)
+    -> WaitCycles(2, b1)
+
+  b1:
+    DutWrite(dut.rst, 1)
+    -> WaitCycles(1, b2)
+
+  b2:
+    DutWrite(dut.go, 1)
+    DutWrite(dut.doit, 1)
+    -> WaitCycles(1, b3)
+
+  b3:
+    DutWrite(dut.go, 0)
+    Assign(%c, 0)
+    -> Jump(b4)
+
+  b4:
+    -> Branch((%c < 100), b5, b7)
+
+  b5:
+    -> Branch(((%c % 3) == 0), b9, b10)
+
+  b6:
+    Assign(%c, (%c + 1))
+    -> Jump(b4)
+
+  b7:
+    Log(info, "done_pulses=%lld (expected 4)", %done_pulses)
+    AssertCheck { cond: (%done_pulses == 4), on_fail: "for-loop did not iterate the expected number of times: got %lld, expected 4", %done_pulses }
+    Log(info, "PASS: for-loop iterated %lld times correctly", %done_pulses)
+    -> Return
+
+  b8:
+    -> WaitCycles(1, b11)
+
+  b9:
+    DutWrite(dut.ack, 1)
+    -> Jump(b8)
+
+  b10:
+    DutWrite(dut.ack, 0)
+    -> Jump(b8)
+
+  b11:
+    DutRead(%__t0, dut.done)
+    -> Branch(((%__t0 == 1) && (%prev_done == 0)), b13, b14)
+
+  b12:
+    DutRead(%__t1, dut.done)
+    Assign(%prev_done, %__t1)
+    -> Jump(b6)
+
+  b13:
+    Assign(%done_pulses, (%done_pulses + 1))
+    Assign(%cycles_since_last_done, 0)
+    -> Jump(b12)
+
+  b14:
+    Assign(%cycles_since_last_done, (%cycles_since_last_done + 1))
+    -> Jump(b12)

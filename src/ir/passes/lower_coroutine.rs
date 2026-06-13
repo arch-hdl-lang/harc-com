@@ -87,6 +87,8 @@ pub enum Trigger {
     /// the FSM shape is identical, so the pass treats both forms the
     /// same and the qualifier surfaces only in the rendered trigger.
     CyclesElapsed(Expr, Option<WaitClock>),
+    /// `WaitTimePs(ps)` elapsed (wall-clock wait).
+    TimeElapsedPs(i64),
     /// `WaitUntil` / `WaitUntilTimeout` predicate(s) became true.
     PredsHold { preds: Vec<PredSrc>, mode: WaitMode },
     /// `WaitUntilTimeout` cycle budget expired first.
@@ -166,7 +168,10 @@ pub fn run(prog: &TbProgram) -> Result<CoroutineMetadata, LowerCoroutineError> {
 /// non-suspending kinds).
 fn resume_successors(t: &Terminator) -> Vec<BlockId> {
     match t {
-        Terminator::WaitCycles(_, _, succ) | Terminator::WaitUntil { succ, .. } => vec![*succ],
+        Terminator::WaitCycles(_, _, succ)
+        | Terminator::WaitCyclesSync(_, succ)
+        | Terminator::WaitTimePs(_, succ)
+        | Terminator::WaitUntil { succ, .. } => vec![*succ],
         Terminator::WaitUntilTimeout {
             on_fire,
             on_timeout,
@@ -267,6 +272,18 @@ fn collapse(
             from,
             guard: guard.clone(),
             trigger: Trigger::CyclesElapsed(cycles.clone(), clock.clone()),
+            to: state_at(*succ),
+        }),
+        Terminator::WaitCyclesSync(cycles, succ) => out.push(Transition {
+            from,
+            guard: guard.clone(),
+            trigger: Trigger::CyclesElapsed(cycles.clone(), None),
+            to: state_at(*succ),
+        }),
+        Terminator::WaitTimePs(ps, succ) => out.push(Transition {
+            from,
+            guard: guard.clone(),
+            trigger: Trigger::TimeElapsedPs(*ps),
             to: state_at(*succ),
         }),
         Terminator::WaitUntil { preds, mode, succ } => out.push(Transition {
@@ -378,6 +395,7 @@ fn trigger_str(func: &TbFunction, t: &Trigger) -> String {
             Some(c) => format!("wait_cycles({} on {})", expr_str(func, e), c.name),
             None => format!("wait_cycles({})", expr_str(func, e)),
         },
+        Trigger::TimeElapsedPs(ps) => format!("wait_time({ps}ps)"),
         Trigger::PredsHold { preds, mode } => {
             let ps: Vec<String> = preds.iter().map(|p| expr_str(func, &p.expr)).collect();
             format!("preds({}) [{}]", ps.join(", "), mode_str(mode))

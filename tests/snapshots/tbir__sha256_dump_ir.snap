@@ -1,0 +1,82 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 Sha256Tb { dut: Sha256 }
+  test Sha256Test tb=tb0 run=fn0 check=- clock=clk@10000ps(SysDomain)
+
+fn fn0 run_Sha256Test [kind=Run, owner=tb0]
+  locals:
+    %0 t1 : unknown
+    %1 __t0 : unknown
+    %2 t2 : unknown
+    %3 __t1 : unknown
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.start, 0)
+    DutWrite(dut.msg, 0)
+    -> WaitCycles(3, b1)
+
+  b1:
+    DutWrite(dut.rst, 0)
+    -> WaitCycles(1, b2)
+
+  b2:
+    DutWrite(dut.msg, 0x00000018000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000061626380)
+    DutWrite(dut.start, 1)
+    -> WaitCycles(1, b3)
+
+  b3:
+    DutWrite(dut.start, 0)
+    Assign(%t1, 0)
+    -> Jump(b4)
+
+  b4:
+    DutRead(%__t0, dut.done)
+    -> Branch((!%__t0 && (%t1 < 100)), b5, b6)
+
+  b5:
+    -> WaitCycles(1, b7)
+
+  b6:
+    AssertCheck { cond: dut.done, on_fail: "SHA-256(abc): done not asserted within 100 cycles" }
+    AssertCheck { cond: (dut.digest == 0xf20015adb410ff6196177a9cb00361a35dae2223414140de8f01cfeaba7816bf), on_fail: "SHA-256(abc): digest mismatch" }
+    -> WaitCycles(1, b8)
+
+  b7:
+    Assign(%t1, (%t1 + 1))
+    -> Jump(b4)
+
+  b8:
+    Log(info, "PASS: SHA-256(abc)")
+    DutWrite(dut.msg, 2147483648)
+    DutWrite(dut.start, 1)
+    -> WaitCycles(1, b9)
+
+  b9:
+    DutWrite(dut.start, 0)
+    Assign(%t2, 0)
+    -> Jump(b10)
+
+  b10:
+    DutRead(%__t1, dut.done)
+    -> Branch((!%__t1 && (%t2 < 100)), b11, b12)
+
+  b11:
+    -> WaitCycles(1, b13)
+
+  b12:
+    AssertCheck { cond: dut.done, on_fail: "SHA-256(empty): done not asserted within 100 cycles" }
+    AssertCheck { cond: (dut.digest == 0x7852b855a495991b649b934c27ae41e4996fb9249afbf4c898fc1c14e3b0c442), on_fail: "SHA-256(empty): digest mismatch" }
+    -> WaitCycles(1, b14)
+
+  b13:
+    Assign(%t2, (%t2 + 1))
+    -> Jump(b10)
+
+  b14:
+    Log(info, "PASS: SHA-256(empty)")
+    -> Return
