@@ -1,0 +1,60 @@
+// Bus `bind ... with { ... }` signal-remap test — the TB-IR remap
+// subset.
+//
+// Self-proving the remap does real work: the binding name is `m`, so
+// the `<field>_<channel>_<signal>` convention would drive `m_read_*` /
+// `m_poke_*` — wires that do NOT exist on the TlmMemory DUT. Every
+// signal is remapped to the canonical `mem_read_*` / `mem_poke_*` port
+// it actually carries, so the blocking call edges only resolve because
+// the remap table overrides the convention. Both emitters must honor
+// the same override and reach an identical verdict + trace.
+
+bus TlmRemapBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+    tlm_method poke(addr: uint<8>, data: uint<32>): blocking;
+end bus TlmRemapBus
+
+testbench TlmBindRemapTb
+    dut : TlmMemory
+end testbench TlmBindRemapTb
+
+impl TlmBindRemapTest for TlmBindRemapTb
+    let m : TlmRemapBus = bind dut with {
+        read.req_valid: "mem_read_req_valid",
+        read.req_ready: "mem_read_req_ready",
+        read.addr: "mem_read_addr",
+        read.rsp_valid: "mem_read_rsp_valid",
+        read.rsp_ready: "mem_read_rsp_ready",
+        read.rsp_data: "mem_read_rsp_data",
+        poke.req_valid: "mem_poke_req_valid",
+        poke.req_ready: "mem_poke_req_ready",
+        poke.addr: "mem_poke_addr",
+        poke.data: "mem_poke_data",
+        poke.rsp_valid: "mem_poke_rsp_valid",
+        poke.rsp_ready: "mem_poke_rsp_ready"
+    }
+
+    run
+        dut.rst = 1
+        dut.mem_read_req_valid = 0
+        dut.mem_read_rsp_ready = 0
+        dut.mem_read_ooo_req_valid = 0
+        dut.mem_read_ooo_rsp_ready = 0
+        dut.mem_poke_req_valid = 0
+        dut.mem_poke_rsp_ready = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        let initial = m.read(5)
+        assert initial == 261
+            else fail("initial read got 0x${initial:08x}, expected 0x00000105")
+
+        m.poke(8, 3405691582)
+        let updated = m.read(8)
+        assert updated == 3405691582
+            else fail("updated read got 0x${updated:08x}, expected 0xCAFEBABE")
+
+        log(info, "ALL TESTS PASSED - tlm_bind_remap_test")
+    end run
+end impl TlmBindRemapTest
