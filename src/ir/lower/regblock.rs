@@ -820,6 +820,24 @@ impl super::FuncBuilder<'_> {
         let v = self.lower_expr_no_ports(call_arg(&args[1]))?;
         let mask = if reg.width >= 64 { u64::MAX } else { (1u64 << reg.width) - 1 };
         let masked = bin(BinOp::BitAnd, v, lit(mask));
+        // When the binding has any per-register `on regs.REG` write
+        // callback, route through `RecordWriteCb` (recursion-depth guard +
+        // callback dispatch) — even for a register without its OWN callback,
+        // so its mirror write is depth-counted consistently with v1 (which
+        // wraps the whole decode chain in one guard). A binding with no
+        // callbacks keeps the plain mirror write (prior behavior).
+        if let Some(cbs) = self.ctx.regblock_callbacks.get(&binding) {
+            let callback = cbs.iter().find(|(r, _)| *r == reg.name).map(|(_, f)| *f);
+            self.push(Stmt::RecordWriteCb {
+                local: mirror,
+                binding: binding.clone(),
+                field: reg.name.clone(),
+                offset: reg.offset,
+                value: masked,
+                callback,
+            });
+            return Ok(true);
+        }
         self.push(Stmt::RecordFieldWrite {
             local: mirror,
             field: reg.name.clone(),

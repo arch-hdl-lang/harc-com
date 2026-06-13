@@ -252,6 +252,8 @@ pub(crate) fn lower_transactor(
         // so no scalar fields, helper methods, or test-scope lets.
         consts: record_ctx.consts.clone(),
         tb_scalar_fields: HashSet::new(),
+        promoted_tb_lets: HashSet::new(),
+        regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
         regblock_bindings: HashMap::new(),
@@ -323,6 +325,8 @@ pub(crate) fn lower_transactor(
             function: fid,
             n_params: f.params.len(),
             has_ret: f.ret.is_some(),
+            pre_hooks: Vec::new(),
+            post_hooks: Vec::new(),
         });
         funcs.push(f);
     }
@@ -486,6 +490,8 @@ fn lower_bound_target_transactor(
         scoreboards: Vec::new(),
         consts: record_ctx.consts.clone(),
         tb_scalar_fields: HashSet::new(),
+        promoted_tb_lets: HashSet::new(),
+        regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
         regblock_bindings: HashMap::new(),
@@ -867,6 +873,8 @@ fn lower_bound_initiator_transactor(
         scoreboards: Vec::new(),
         consts: record_ctx.consts.clone(),
         tb_scalar_fields: HashSet::new(),
+        promoted_tb_lets: HashSet::new(),
+        regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
         regblock_bindings: HashMap::new(),
@@ -939,6 +947,8 @@ fn lower_bound_initiator_transactor(
             function: fid,
             n_params: f.params.len(),
             has_ret: f.ret.is_some(),
+            pre_hooks: Vec::new(),
+            post_hooks: Vec::new(),
         });
         funcs.push(f);
     }

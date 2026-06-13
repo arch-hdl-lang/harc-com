@@ -91,6 +91,22 @@ pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<Stri
         record_struct(&mut out, r);
     }
 
+    // RAL per-register write-callback recursion-depth limit — emitted once
+    // when any testbench registers `on regs.REG` callbacks (mirrors v1's
+    // `#ifndef HARC_RAL_CB_MAX_DEPTH` block). Guards a callback that
+    // re-enters `record_write` from blowing the host stack.
+    if prog
+        .testbenches
+        .iter()
+        .any(|tb| tb.regblock_bindings.iter().any(|b| !b.callbacks.is_empty()))
+    {
+        out.push_str(
+            "#ifndef HARC_RAL_CB_MAX_DEPTH\n\
+             static constexpr uint32_t HARC_RAL_CB_MAX_DEPTH = 16;\n\
+             #endif\n",
+        );
+    }
+
     // Scoreboard structs (data-only host-state records — they never name
     // a TB or DUT type), before the testbench structs that hold them.
     for sb in &prog.scoreboards {
@@ -219,6 +235,7 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
         DutRead(_, p) | ProbeRelease(p) => port_is_probe(p),
         Assign(_, e)
         | RecordFieldWrite { value: e, .. }
+        | RecordWriteCb { value: e, .. }
         | TbFieldWrite { value: e, .. }
         | TransactorStateWrite { value: e, .. }
         | ComponentFieldWrite { value: e, .. }
@@ -743,6 +760,21 @@ fn emit_test(
     if !tb.synthetic {
         writeln!(out, "{INDENT}{} _tb;", tb.name).ok();
     }
+    // Closure-hook regblock mirrors: a binding with `on regs.REG` write
+    // callbacks holds its mirror struct + recursion-depth counter as
+    // SHARED test-scope state (declared once, captured by `[&]`), so the
+    // run coroutine and every callback lambda hit the same cell. The
+    // per-function mirror locals (Run + callbacks) are name-matched to
+    // these and skipped at declaration time. Plain regblock bindings keep
+    // their run-local mirror (no callbacks → no sharing needed).
+    for b in &tb.regblock_bindings {
+        if b.callbacks.is_empty() {
+            continue;
+        }
+        let mirror_ty = &prog.records[prog.regblocks[b.regblock.index()].record.index()].name;
+        writeln!(out, "{INDENT}{mirror_ty} {}{{}};", b.field).ok();
+        writeln!(out, "{INDENT}uint32_t {}_cb_depth = 0;", b.field).ok();
+    }
     // Covergroup auto-sampler registration, in testbench-field
     // declaration order — the same `_checkers` slot v1 uses, so
     // sampling happens at the identical point in the cycle. Lowering
@@ -805,6 +837,18 @@ fn emit_test(
     for (instance, xid) in &tb.unbound_state_actors {
         let schema = prog.transactor(*xid);
         runtime::target_state_struct_inst(out, schema, instance);
+    }
+    // Closure-hook bodies (`on <obj>.<method> pre/post` method hooks and
+    // `on regs.REG` per-register write callbacks) — emitted as free
+    // `[&]`-capturing lambdas BEFORE the transactor method lambdas and the
+    // run coroutine, so both the firing method (`emit_method` pre/post
+    // fan-out) and the `record_write` dispatch see them. They capture the
+    // shared `_tb` host struct + transactor-state structs + regblock
+    // mirror by reference — the host-state-promotion mechanism.
+    for f in &prog.functions {
+        if matches!(f.kind, ir::FunctionKind::TestHook) && f.owner == Some(test.testbench) {
+            func::emit_test_hook(out, prog, f, dut_type, 1)?;
+        }
     }
     let mut emitted_xactors = HashSet::new();
     for (_, xid) in &tb.transactor_fields {

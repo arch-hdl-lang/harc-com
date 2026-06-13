@@ -68,6 +68,9 @@ impl Display for TbProgram {
                     " regblock {}=rb{} via {}",
                     b.field, b.regblock.0, b.helper_field
                 )?;
+                for (reg, fid) in &b.callbacks {
+                    write!(f, " [on {reg}=fn{}]", fid.0)?;
+                }
             }
             writeln!(f)?;
         }
@@ -135,9 +138,18 @@ impl Display for TbProgram {
                 writeln!(f, "    state {} = {}", sf.name, sf.default)?;
             }
             for m in &x.methods {
+                let hooks = if m.pre_hooks.is_empty() && m.post_hooks.is_empty() {
+                    String::new()
+                } else {
+                    let pre: Vec<String> =
+                        m.pre_hooks.iter().map(|h| format!("fn{}", h.0)).collect();
+                    let post: Vec<String> =
+                        m.post_hooks.iter().map(|h| format!("fn{}", h.0)).collect();
+                    format!(" [pre={}] [post={}]", pre.join(","), post.join(","))
+                };
                 writeln!(
                     f,
-                    "    method {}({} arg{}){} = fn{}",
+                    "    method {}({} arg{}){} = fn{}{hooks}",
                     m.name,
                     m.n_params,
                     if m.n_params == 1 { "" } else { "s" },
@@ -372,6 +384,7 @@ fn kind_str(k: &FunctionKind) -> String {
             format!("ComponentMethod(c{})", component.0)
         }
         FunctionKind::Tseq { record } => format!("Tseq(r{})", record.0),
+        FunctionKind::TestHook => "TestHook".to_string(),
     }
 }
 
@@ -402,6 +415,17 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
             };
             format!(
                 "RecordFieldWrite({}.{field}{idx}, {})",
+                local_str(func, *local),
+                expr_str(func, value)
+            )
+        }
+        Stmt::RecordWriteCb { local, binding, field, offset, value, callback } => {
+            let cb = match callback {
+                Some(fid) => format!(", cb=fn{}", fid.0),
+                None => String::new(),
+            };
+            format!(
+                "RecordWriteCb({}.{field}@0x{offset:x}, {}, depth={binding}_cb_depth{cb})",
                 local_str(func, *local),
                 expr_str(func, value)
             )

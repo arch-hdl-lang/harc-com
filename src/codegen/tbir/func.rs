@@ -30,7 +30,7 @@ use crate::ir::{
     RecordSchema, Stmt, TbFunction, TbProgram, Terminator, TransactorMethodSchema,
     TransactorSchema, WaitMode,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 const INDENT: &str = "    ";
@@ -523,6 +523,13 @@ fn emit_stmt(
         }
         Stmt::RecordInit(l, r) => {
             let name = &names[l.index()];
+            // A shared (callback-bearing) mirror is default-constructed
+            // once at test scope; re-initializing it on Run entry would be
+            // a redundant reset (and on any other entry, a state wipe), so
+            // skip the RecordInit for it.
+            if shared_mirror_names(prog, func).contains(name) {
+                return Ok(());
+            }
             let rec = records.get(r.index()).ok_or_else(|| {
                 EmitError(format!(
                     "tbir: RecordInit of `{name}` in {} references missing record r{}",
@@ -586,6 +593,38 @@ fn emit_stmt(
                     writeln!(out, "{pad}{name}.{field} = {e};").ok();
                 }
             }
+        }
+        Stmt::RecordWriteCb { local, binding, field, offset, value, callback } => {
+            // Passive RAL `record_write` with a per-register write callback
+            // registered on the binding: mirror update wrapped in the
+            // recursion-depth guard, then the callback fires with the
+            // observed value. Mirrors v1's `try_emit_record_write`
+            // (`<binding>_cb_depth` / `HARC_RAL_CB_MAX_DEPTH`); the FATAL
+            // message uses the const-decoded `at addr 0x..` to match v1.
+            let name = &names[local.index()];
+            let v = expr_cpp(cx, value)?;
+            writeln!(out, "{pad}{{").ok();
+            let p1 = INDENT.repeat(depth + 1);
+            let p2 = INDENT.repeat(depth + 2);
+            writeln!(
+                out,
+                "{p1}if ({binding}_cb_depth >= HARC_RAL_CB_MAX_DEPTH) {{ \
+                 sim_log_line(\"FATAL\", \"RAL record_write callback recursion exceeded \
+                 HARC_RAL_CB_MAX_DEPTH (%u) on binding `{binding}` at addr 0x%llx\", \
+                 (unsigned)HARC_RAL_CB_MAX_DEPTH, (unsigned long long){offset}ull); \
+                 errors++; _fatal = true; }} else {{"
+            )
+            .ok();
+            writeln!(out, "{p2}{binding}_cb_depth++;").ok();
+            writeln!(out, "{p2}uint64_t _rec_data = (uint64_t)({v});").ok();
+            writeln!(out, "{p2}{name}.{field} = _rec_data;").ok();
+            if let Some(fid) = callback {
+                let cb_name = &prog.function(*fid).name;
+                writeln!(out, "{p2}{cb_name}(_rec_data);").ok();
+            }
+            writeln!(out, "{p2}{binding}_cb_depth--;").ok();
+            writeln!(out, "{p1}}}").ok();
+            writeln!(out, "{pad}}}").ok();
         }
         Stmt::TbFieldWrite { field, value } => {
             let e = expr_cpp(cx, value)?;
@@ -1164,6 +1203,25 @@ fn emit_transactor_call(
 /// as default-constructed structs; the `RecordInit` at the source
 /// `let` site re-runs the field defaults (v1 declares at the let
 /// site, so loop iterations re-default-construct).
+/// Names of regblock mirror locals that are SHARED test-scope host state
+/// (their binding declares `on regs.REG` write callbacks). These are
+/// declared + default-constructed ONCE at test scope and captured by
+/// `[&]`, so every function that touches them (Run + callbacks) must
+/// reference that one cell by name — never re-declare or re-init it.
+pub(super) fn shared_mirror_names(prog: &TbProgram, func: &TbFunction) -> HashSet<String> {
+    let mut out = HashSet::new();
+    if let Some(o) = func.owner {
+        if let Some(tb) = prog.testbenches.get(o.index()) {
+            for b in &tb.regblock_bindings {
+                if !b.callbacks.is_empty() {
+                    out.insert(b.field.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 fn declare_locals(
     out: &mut String,
     prog: &TbProgram,
@@ -1173,7 +1231,14 @@ fn declare_locals(
     depth: usize,
 ) -> Result<(), EmitError> {
     let pad = INDENT.repeat(depth);
+    let shared = shared_mirror_names(prog, func);
     for (l, n) in func.locals.iter().zip(names).skip(skip) {
+        // A shared (callback-bearing) mirror is declared once at test
+        // scope; skip its per-function declaration so it resolves to the
+        // captured test-scope struct.
+        if shared.contains(n) {
+            continue;
+        }
         match l.ty {
             IrType::Record(r) => {
                 let rec = prog.records.get(r.index()).ok_or_else(|| {
@@ -1271,6 +1336,13 @@ pub(super) fn emit_method(
     )
     .ok();
     declare_locals(out, prog, func, &names, nparams, depth + 1)?;
+    // Pre-hooks (`on <obj>.<method> pre`) fire BEFORE the body, with the
+    // same args the method received (mirrors v1's `<Type>_<method>_pre`
+    // fan-out loop). The hook lambdas are emitted just before this method.
+    let hook_args = names[..nparams].join(", ");
+    for fid in &m.pre_hooks {
+        writeln!(out, "{pad1}{}({hook_args});", prog.function(*fid).name).ok();
+    }
     writeln!(out, "{pad1}int __bb = {};", func.entry.0).ok();
     writeln!(out, "{pad1}while (true) {{").ok();
     writeln!(out, "{pad2}switch (__bb) {{").ok();
@@ -1309,14 +1381,26 @@ pub(super) fn emit_method(
                 writeln!(out, "{pad3}while (!({cond})) tick();").ok();
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
-            Terminator::Return => match func.ret {
-                Some(r) => {
-                    writeln!(out, "{pad3}return {};", names[r.index()]).ok();
+            Terminator::Return => {
+                // Post-hooks (`on <obj>.<method> post`) fire AFTER the
+                // body, before returning — with the same args (mirrors
+                // v1's `<Type>_<method>_post` fan-out at the lambda end).
+                // v1 places the fan-out at the body's natural end, so an
+                // early `return` skips it; in this subset hooked methods
+                // are void and fall through to a single terminal Return,
+                // so firing at every void return matches v1 exactly.
+                for fid in &m.post_hooks {
+                    writeln!(out, "{pad3}{}({hook_args});", prog.function(*fid).name).ok();
                 }
-                None => {
-                    writeln!(out, "{pad3}return;").ok();
+                match func.ret {
+                    Some(r) => {
+                        writeln!(out, "{pad3}return {};", names[r.index()]).ok();
+                    }
+                    None => {
+                        writeln!(out, "{pad3}return;").ok();
+                    }
                 }
-            },
+            }
             other @ (Terminator::WaitCycles(_, Some(_), _)
             | Terminator::WaitCyclesSync(_, _)
             | Terminator::WaitTimePs(_, _)
@@ -2204,5 +2288,109 @@ fn emit_log_call(
         write!(out, ", {rendered}").ok();
     }
     writeln!(out, ");").ok();
+    Ok(())
+}
+
+/// Emit one closure-hook body (`FunctionKind::TestHook`) as a free
+/// `[&]`-capturing lambda named by `func.name`. Structurally identical to
+/// a transactor method (synchronous loop-switch, `tick()`-based waits)
+/// since a hook fires inside the synchronous method call / `record_write`
+/// dispatch, not the run coroutine. The body resolves the shared `_tb`
+/// host struct, the firing transactor's state, and the regblock mirror
+/// (all `[&]`-captured) — v1's reference-capturing hook closure.
+pub(super) fn emit_test_hook(
+    out: &mut String,
+    prog: &TbProgram,
+    func: &TbFunction,
+    dut_type: &str,
+    depth: usize,
+) -> Result<(), EmitError> {
+    let names = cpp_local_names(func);
+    let empty_lanes = HashMap::new();
+    let cx = ECx {
+        func,
+        names: &names,
+        lanes: &empty_lanes,
+        self_subst: None,
+        dut_type,
+        trace_component: "",
+    };
+    let nparams = func.params.len();
+    let pad = INDENT.repeat(depth);
+    let pad1 = INDENT.repeat(depth + 1);
+    let pad2 = INDENT.repeat(depth + 2);
+    let pad3 = INDENT.repeat(depth + 3);
+
+    // Hooks are void in this subset; a value-returning hook is never
+    // produced by lowering (the firing site discards any result).
+    let param_ty = |i: usize| match func.locals[i].ty {
+        IrType::Record(r) => prog.records[r.index()].name.clone(),
+        IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
+        _ => "uint64_t".to_string(),
+    };
+    let params = names[..nparams]
+        .iter()
+        .enumerate()
+        .map(|(i, n)| format!("{} {n}", param_ty(i)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // A per-register `on regs.REG` write callback can re-enter
+    // `record_write` and thus call ITSELF — a direct `auto` lambda cannot
+    // reference its own deduced type in its initializer, so hooks are
+    // declared as a forward `std::function` slot, then assigned (mirrors
+    // v1's `std::function` callback holder). Method pre/post hooks never
+    // self-recurse but use the same shape uniformly.
+    let sig_params = (0..nparams).map(param_ty).collect::<Vec<_>>().join(", ");
+    writeln!(out, "{pad}std::function<void({sig_params})> {};", func.name).ok();
+    writeln!(out, "{pad}{} = [&]({params}) -> void {{", func.name).ok();
+    declare_locals(out, prog, func, &names, nparams, depth + 1)?;
+    writeln!(out, "{pad1}int __bb = {};", func.entry.0).ok();
+    writeln!(out, "{pad1}while (true) {{").ok();
+    writeln!(out, "{pad2}switch (__bb) {{").ok();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        writeln!(out, "{pad2}case {bi}: {{").ok();
+        for s in &block.stmts {
+            emit_stmt(out, prog, &cx, &prog.records, &[], s, depth + 3)?;
+        }
+        match &block.terminator {
+            Terminator::Jump(b) => {
+                writeln!(out, "{pad3}__bb = {};", b.0).ok();
+            }
+            Terminator::Branch(c, t, f) => {
+                let cond = expr_cpp(&cx, c)?;
+                writeln!(out, "{pad3}if ({cond}) {{ __bb = {}; }} else {{ __bb = {}; }}", t.0, f.0)
+                    .ok();
+            }
+            Terminator::WaitCycles(n, None, b) => {
+                let n = expr_cpp(&cx, n)?;
+                writeln!(
+                    out,
+                    "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) tick();"
+                )
+                .ok();
+                writeln!(out, "{pad3}__bb = {};", b.0).ok();
+            }
+            Terminator::WaitUntil { preds, mode, succ } => {
+                let cond = preds_cpp(&cx, preds, *mode)?;
+                writeln!(out, "{pad3}while (!({cond})) tick();").ok();
+                writeln!(out, "{pad3}__bb = {};", succ.0).ok();
+            }
+            Terminator::Return => {
+                writeln!(out, "{pad3}return;").ok();
+            }
+            other => {
+                return Err(EmitError(format!(
+                    "tbir: closure-hook `{}` contains terminator {other:?} — lowering gate failed",
+                    func.name
+                )));
+            }
+        }
+        writeln!(out, "{pad3}break;").ok();
+        writeln!(out, "{pad2}}}").ok();
+    }
+    writeln!(out, "{pad2}default: return;").ok();
+    writeln!(out, "{pad2}}}").ok(); // switch
+    writeln!(out, "{pad1}}}").ok(); // while
+    writeln!(out, "{pad}}};").ok(); // lambda
     Ok(())
 }

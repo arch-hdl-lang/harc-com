@@ -121,20 +121,21 @@ Residual first-blocker map for the other 16 (re-run of
 | Moved to group | Fixtures |
 |---|---|
 | `bus` (2) | `bind_remap_test`, `transactor_parse_test` — **`axilite_regs_full_test` REGISTERED 2026-06-13 by the expression-position-call slice: `helper.read(addr)` in assert/bitwise expression positions now hoists into a preceding `Stmt::TransactorCall`; `AxiLiteRegs.sv`, pass, trace-diff clean v1↔tbir** |
-| `regblock` (8) | `regblock_basic_test`, `regblock_fields_test`, `regblock_access_test`, `regblock_bitbash_test`, `regblock_addrmap_test`, `regblock_alias_test`, `regblock_record_api_test`, `regblock_record_test` — **regblock slice landed 2026-06-12; bus-bound `via` helper (initiator-side BFM) + the regblock-residuals slice (register read in assert/format → `Expr::RegRead`; `bitbash(regs)`) + the field-level/addrmap slice (`regs.REG.FIELD` masked RMW; `addrmap` 3-/4-level access; `alias of`) landed 2026-06-13. The passive `record_write`/`record_read` API (constant-address decode → masked mirror op, no bus) also landed 2026-06-13 — proven by the self-authored `regblock_record_api_test`. SEVEN fixtures now fully lower and are registered; only the callback-bearing `record_test`/`record_recursion_test` remain residual (the per-register `on regs.REG` write callback is a `[&]`-capturing closure over run-scope state, as deep as `axilite_hooks`) — see the `regblock` construct group below.** |
+| `regblock` (9) | `regblock_basic_test`, `regblock_fields_test`, `regblock_access_test`, `regblock_bitbash_test`, `regblock_addrmap_test`, `regblock_alias_test`, `regblock_record_api_test`, `regblock_record_test`, `regblock_record_recursion_test` — **regblock slice landed 2026-06-12; bus-bound `via` helper (initiator-side BFM) + the regblock-residuals slice (register read in assert/format → `Expr::RegRead`; `bitbash(regs)`) + the field-level/addrmap slice (`regs.REG.FIELD` masked RMW; `addrmap` 3-/4-level access; `alias of`) landed 2026-06-13. The passive `record_write`/`record_read` API (constant-address decode → masked mirror op, no bus) landed 2026-06-13. The per-register `on regs.REG` write callback landed 2026-06-13 (closure-hook cluster, divergence 20): `record_write` → `Stmt::RecordWriteCb` (mirror + recursion guard + callback dispatch) via host-state promotion (shared mirror + `cb_depth` at test scope). ALL NINE regblock fixtures now lower and are registered (`record_recursion_test` is a negative `fail` fixture — the depth-16 guard FATALs identically under both codegens) — see the `regblock` construct group below.** |
 | `scoreboard` (2) | `analysis_sink_connect_test`, `axilite_env_test` |
 | ~~`tseq` (2)~~ → deeper | `axilite_seqdrv_test`, `transactor_active_test` — **tseq slice landed 2026-06-13; both lower their `tseq` now, and the transactor-state-field slice (2026-06-13) advanced `axilite_seqdrv_test` past its state field too — both now stop at an event field: `axilite_seqdrv_test` → `req : in event<RegOp>` (event-driven unbound transactor), `transactor_active_test` → bound-to transactor event field — see the `tseq` construct group below** |
-| ~~transactor state fields~~ → ~~record param~~ → pre/post hooks (1) | `axilite_hooks_test` — **the record-typed method param `send(t: RegOp)` now lowers (record-param slice 2026-06-13); the SOLE remaining blocker is the test-scope `on drv.send pre/post` method hooks: "a test-scope `on <obj>.<method> pre/post` method hook" (the hook body is a `[&]`-capturing closure mutating test-scope `let`s by reference — the function-per-CFG IR cannot express a closure lexically nested in the run coroutine capturing its locals; v1 emits it as raw C++)** |
+| ~~transactor state fields~~ → ~~record param~~ → ~~pre/post hooks~~ (resolved) | `axilite_hooks_test` — **REGISTERED 2026-06-13 (closure-hook cluster, divergence 20, pass): the test-scope `on drv.send pre/post` method hooks now lower via host-state promotion (captured test-scope `let`s → `_tb` scalar fields; hook bodies → `FunctionKind::TestHook` functions back-patched onto `TransactorMethodSchema::pre_hooks`/`post_hooks`, fired around the body in `emit_method`); trace-diff clean v1↔tbir at seed 1** |
 | transactor state fields (self-proving) | `transactor_state_field_test` — **REGISTERED 2026-06-13** (`cam_dual_basic.sv`, pass): scalar state on the unbound DUT-poking transactor, written + read in method bodies and read back at test scope; trace-diff clean v1↔tbir |
 | record-typed method params (self-proving) | `transactor_record_param_test` — **REGISTERED 2026-06-13** (`top_counter.sv`, pass): a `run_for(cmd: RunCmd)` method takes a `transaction` record by value, reads `cmd.ticks` in the body; trace-diff clean v1↔tbir |
 | >64-bit method params (1) | `aes_cipher_top_test` — "transactor method `AesXactor.load_block` parameter `key` wider than 64 bits (uint<128>)" (the tbir value model is u64; needs the wide-value method ABI) |
 
 As with the `transaction` slice, most of the moved fixtures stack
 several constructs (bus + scoreboard + sequencer + events); the
-counts will keep shifting as those slices land. The 2 transactor-
-specific residuals (`axilite_hooks_test` — now narrowed to pre/post
-method hooks only; `aes_cipher_top_test` — >64-bit param) stay
-with this construct's owner.
+counts will keep shifting as those slices land. With the closure-hook
+cluster landed (`axilite_hooks_test` now passes), the sole remaining
+transactor-specific residual is `aes_cipher_top_test` (>64-bit param —
+needs the wide-value method ABI), which stays with this construct's
+owner.
 
 *+ `mshr_cocotb_test` (moved here 2026-06-12 by the singleton batch:
 its former `const` blocker is resolved, the next blocker is its
@@ -190,26 +191,27 @@ the field-level/addrmap slice):
 | **(resolved)** field-level decomposition (`field <name> : <ty> @ <bit>` + `regs.REG.FIELD`) | `regblock_fields_test`, `regblock_addrmap_test` — now lower (masked RMW + shifted extract; no new IR; registered, pass) |
 | **(resolved)** `addrmap` construct (chip-level composition) + `alias of` | `regblock_addrmap_test`, `regblock_alias_test` — now lower (per-instance shifted-offset mirror locals; alias shares the target's cell; registered, pass) |
 | **(resolved)** passive `record_write`/`record_read` API | `regblock_record_api_test` — now lowers (constant-address decode → masked mirror op, no bus; self-authored, registered, pass) |
-| per-register `on regs.REG` write callback | `regblock_record_test`, `regblock_record_recursion_test` |
+| **(resolved)** per-register `on regs.REG` write callback | `regblock_record_test`, `regblock_record_recursion_test` — now lower (closure-hook cluster, divergence 20: `Stmt::RecordWriteCb` + `FunctionKind::TestHook` via host-state promotion; registered, `pass`/`fail`) |
 
 The blocker reported is whichever out-of-subset construct lowering hits
-first in file order. Now SEVEN regblock fixtures fully lower and are
-registered (`pass`, trace-diff clean): `regblock_access_test` (reads all
-`let`-bound), `regblock_basic_test` (register reads in assert conditions
-/ `${...}` format args — divergence 12, `Expr::RegRead`),
-`regblock_bitbash_test` (`bitbash(regs)` walk-all + `assert errors == 0`
-via `Expr::ErrorCount`), `regblock_fields_test` (field-level
-decomposition), `regblock_addrmap_test` (`addrmap` 3-/4-level access),
-`regblock_alias_test` (`alias of`), and `regblock_record_api_test` (the
-passive `record_write`/`record_read` API). The only remaining residual
-is a precise `Unsupported` rejection, never mis-lowered: the
-callback-bearing `record_test`/`record_recursion_test` need the
-per-register `on regs.REG` write callback — a `[&]`-capturing closure
-over run-scope state (the mirror cell, the callbacks holder, the
-`cb_depth` counter) fired from inside `record_write`, which the
-function-per-CFG IR cannot express (the same blocker as the
-`axilite_hooks` pre/post method hooks; `regblock::detect_regblock_residual`
-names it before the generic bare/scope mixing error).
+first in file order. ALL NINE regblock fixtures now fully lower and are
+registered: `regblock_access_test` (reads all `let`-bound),
+`regblock_basic_test` (register reads in assert conditions / `${...}`
+format args — divergence 12, `Expr::RegRead`), `regblock_bitbash_test`
+(`bitbash(regs)` walk-all + `assert errors == 0` via `Expr::ErrorCount`),
+`regblock_fields_test` (field-level decomposition),
+`regblock_addrmap_test` (`addrmap` 3-/4-level access),
+`regblock_alias_test` (`alias of`), `regblock_record_api_test` (the
+passive `record_write`/`record_read` API), `regblock_record_test`
+(passive record + per-register write callback deriving MM2S_LEN), and the
+negative `regblock_record_recursion_test` (a self-write callback trips
+the depth-16 recursion guard FATAL identically under both codegens). The
+callback is the closure-hook cluster (divergence 20): `record_write`
+lowers to `Stmt::RecordWriteCb` (mirror update + per-binding
+recursion-depth guard + callback dispatch) and the callback body to a
+`FunctionKind::TestHook` function; host-state promotion moves the shared
+mirror + `<binding>_cb_depth` to test scope so the run coroutine and the
+callback (which may re-enter `record_write`) share the same cell.
 
 ### `transaction` construct — RESOLVED 2026-06-12 (transaction slice)
 

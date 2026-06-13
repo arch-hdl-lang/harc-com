@@ -82,6 +82,15 @@ impl FuncBuilder<'_> {
                 if let Some(ce) = self.as_component_field_read(e)? {
                     return Ok(ce);
                 }
+                // Closure-hook host-state promotion: a test-scope `let`
+                // captured by an `on <obj>.<method> pre/post` hook was
+                // promoted to a `_tb` scalar field. A bare ident in that
+                // set (locals shadow — checked above) reads the shared
+                // `_tb` cell. This is the read counterpart to the
+                // `TbFieldWrite` produced for a promoted-let assignment.
+                if self.ctx.promoted_tb_lets.contains(&id.name) {
+                    return Ok(Expr::TbField(id.name.clone()));
+                }
                 if self.in_check && self.ctx.test_scope_lets.contains(&id.name) {
                     return Err(unsupported(
                         &format!("test-scope `let {}` referenced in the check phase", id.name),

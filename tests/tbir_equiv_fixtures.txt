@@ -151,3 +151,6 @@ regblock_record_api_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 tlm_pairing_arch_burst_target_test | TlmPairingArchBurstTarget | TlmPairingArchBurstTarget.sv | - | pass
 tlm_pairing_arch_burst_initiator_test | TlmPairingArchBurstInitiator | TlmPairingArchBurstInitiator.sv | - | pass
 bind_remap_test | axil_amba | axil_amba.sv | - | pass
+axilite_hooks_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
+regblock_record_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
+regblock_record_recursion_test | AxiLiteRegs | AxiLiteRegs.sv | - | fail

@@ -299,6 +299,15 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 }
                 visit_expr(value, &mut accesses, &mut transactor);
             }
+            Stmt::RecordWriteCb { value, .. } => {
+                // Passive RAL record_write + per-register callback dispatch:
+                // host-side mirror update plus a callback call that itself
+                // only touches mirror state (the callback may re-enter
+                // record_write, guarded by a depth counter). No pin access of
+                // its own; the masked value may carry inline reads.
+                host_service_only = false;
+                visit_expr(value, &mut accesses, &mut transactor);
+            }
             Stmt::TransactorCall { call, .. } => {
                 host_service_only = false;
                 visit_expr(call, &mut accesses, &mut transactor);
