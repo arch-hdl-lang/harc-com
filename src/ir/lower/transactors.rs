@@ -1000,28 +1000,67 @@ fn lower_state_field(tname: &str, f: &ComponentField) -> Result<TbScalarFieldSch
     Ok(TbScalarFieldSchema { name: fname.clone(), ty, default })
 }
 
-/// Method params and returns must be scalar (bool / uint / sint) and
-/// at most 64 bits wide — the tbir value model is `uint64_t`. v1 lowers
-/// wider widths through `_harc_u128` / `VlWide`, which this slice does
-/// not mirror; the rejection names the offending site.
+/// Method returns and TLM bus-target args must be scalar (bool / uint /
+/// sint) and at most 64 bits wide — the tbir value model is `uint64_t`.
+/// v1 lowers wider widths through `_harc_u128` / `VlWide`; this slice
+/// only mirrors that for *active-method value params* (see
+/// [`check_method_param_ty`]), so every other site stays ≤64 bits. The
+/// rejection names the offending site.
 fn check_scalar_ty(
     tname: &str,
     mname: &str,
     what: &str,
     ty: Option<&TypeExpr>,
 ) -> Result<(), LowerError> {
+    check_scalar_ty_max(tname, mname, what, ty, 64)
+}
+
+/// Active-method value param: the tbir wide-value ABI mirrors v1's
+/// `_harc_u128` model for a `uint<N>`/`sint<N>` param up to 128 bits — the
+/// method body moves the value to a wide DUT port / compares it, with no
+/// host-side arithmetic that the `__uint128_t` C++ type cannot express.
+/// Wider than 128 bits (v1's `HarcWide<N>`) is out of subset — wide
+/// register-array values + their ABI are a larger slice — and rejected
+/// precisely.
+fn check_method_param_ty(
+    tname: &str,
+    mname: &str,
+    what: &str,
+    ty: Option<&TypeExpr>,
+) -> Result<(), LowerError> {
+    check_scalar_ty_max(tname, mname, what, ty, 128)
+}
+
+/// Shared scalar-type gate parameterized by the maximum allowed bit width
+/// (`max_w`). A width arg above `max_w` is rejected; a non-scalar type is
+/// rejected; widthless / classifiable scalars pass.
+fn check_scalar_ty_max(
+    tname: &str,
+    mname: &str,
+    what: &str,
+    ty: Option<&TypeExpr>,
+    max_w: u32,
+) -> Result<(), LowerError> {
     let site = || format!("transactor method `{tname}.{mname}` {what}");
     match ty {
         None => Ok(()),
         Some(TypeExpr::Builtin { args, .. }) => {
-            // Width arg, when present, must fit the u64 value model.
+            // Width arg, when present, must fit the value model for this site.
             if let Some(TypeArg::Expr(e)) = args.first() {
                 if let crate::ast::ExprKind::Int(s) = &*e.kind {
                     if let Ok(w) = s.replace('_', "").parse::<u32>() {
-                        if w > 64 {
+                        if w > max_w {
+                            let hint = if max_w == 64 {
+                                "the tbir value model is 64-bit".to_string()
+                            } else {
+                                format!(
+                                    "the tbir wide-value method ABI mirrors v1's \
+                                     `_harc_u128` model up to {max_w} bits"
+                                )
+                            };
                             return Err(unsupported(
-                                &format!("{} wider than 64 bits (uint<{w}>)", site()),
-                                "the tbir value model is 64-bit",
+                                &format!("{} wider than {max_w} bits (uint<{w}>)", site()),
+                                &hint,
                             ));
                         }
                     }
@@ -1053,8 +1092,9 @@ fn record_id_of_type(ctx: &super::LowerCtx, t: &TypeExpr) -> Option<ir::RecordId
 /// declared `transaction`/`struct` lowers to `IrType::Record` (passed
 /// by value — the method body binds the record param and reads its
 /// fields, mirroring v1's by-value struct param). Everything else goes
-/// through `check_scalar_ty` and lowers as a scalar (`uint<N>`/`sint<N>`/
-/// `bool`, ≤64 bits) — a wider width or other non-scalar type is rejected
+/// through `check_method_param_ty` and lowers as a scalar (`uint<N>`/
+/// `sint<N>`/`bool`); widths up to 128 bits flow through the wide-value
+/// ABI (`_harc_u128`), a wider width or other non-scalar type is rejected
 /// precisely there. The `Vec`-of-record / nested-record cases are not
 /// reachable: a record param is a flat value-record, exactly as v1 emits.
 fn method_param_ir_type(
@@ -1069,7 +1109,7 @@ fn method_param_ir_type(
             return Ok(IrType::Record(rid));
         }
     }
-    check_scalar_ty(
+    check_method_param_ty(
         tname,
         mname,
         &format!("parameter `{}`", p.name.name),

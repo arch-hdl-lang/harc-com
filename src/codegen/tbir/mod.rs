@@ -272,6 +272,23 @@ fn field_scalar_cty(ty: &ir::IrType) -> &'static str {
     }
 }
 
+/// C++ storage type for a loop-switch local / method param. Every scalar
+/// ≤64 bits widens to `uint64_t` (the established tbir value model — even
+/// `bool`/`sint` locals are u64-backed here, distinct from v1's narrower
+/// per-type choice, which is value-identical in the loop-switch model). A
+/// 65..128-bit `uint`/`sint` uses v1's `_harc_u128` (`__uint128_t`) — the
+/// wide-value method-param ABI. Wider-than-128 widths (v1's `HarcWide<N>`)
+/// are out of the tbir subset — lowering rejects them at the method-param
+/// gate — so they never reach here; defensively they fall back to the
+/// 128-bit type. Aggregate types (`Record`/`RecordSeq`) are handled by
+/// their own declaration sites, never this helper.
+pub(super) fn local_scalar_cty(ty: &ir::IrType) -> &'static str {
+    match ty {
+        ir::IrType::UInt(Some(w)) | ir::IrType::SInt(Some(w)) if *w > 64 => "_harc_u128",
+        _ => "uint64_t",
+    }
+}
+
 /// Packed-bit width of a record field's scalar (or Vec element) type —
 /// the declared width (`Bool` → 1). Mirrors v1's `packed_width` for the
 /// scalar leaves the record subset lowers. `None` for a widthless

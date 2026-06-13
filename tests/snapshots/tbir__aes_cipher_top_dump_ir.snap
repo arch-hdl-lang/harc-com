@@ -1,0 +1,103 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 AesCipherTopTb { dut: AesCipherTop } xactor xact=x0
+  test AesCipherTopTest tb=tb0 run=fn3 check=-
+  transactor x0 AesXactor { dut: AesCipherTop }
+    method reset_dut(0 args) = fn0
+    method load_block(2 args) = fn1
+    method wait_for_done(0 args) = fn2
+
+fn fn0 AesXactor_reset_dut [kind=TransactorBody(x0)]
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.ld, 0)
+    DutWrite(dut.key, 0)
+    DutWrite(dut.text_in, 0)
+    -> WaitCycles(2, b1)
+
+  b1:
+    DutWrite(dut.rst, 0)
+    -> WaitCycles(1, b2)
+
+  b2:
+    -> Return
+
+fn fn1 AesXactor_load_block [kind=TransactorBody(x0)]
+  params:
+    key : uint<128>
+    text_in : uint<128>
+  locals:
+    %0 key : uint<128>
+    %1 text_in : uint<128>
+  entry = b0
+
+  b0:
+    DutWrite(dut.key, %key)
+    DutWrite(dut.text_in, %text_in)
+    DutWrite(dut.ld, 1)
+    -> WaitCycles(1, b1)
+
+  b1:
+    DutWrite(dut.ld, 0)
+    -> Return
+
+fn fn2 AesXactor_wait_for_done [kind=TransactorBody(x0)]
+  locals:
+    %0 _anon : unknown
+    %1 __t0 : unknown
+  entry = b0
+
+  b0:
+    Assign(%_anon, 0)
+    -> Jump(b1)
+
+  b1:
+    -> Branch((%_anon < 14), b2, b4)
+
+  b2:
+    DutRead(%__t0, dut.done)
+    -> Branch((%__t0 == 0), b6, b7)
+
+  b3:
+    Assign(%_anon, (%_anon + 1))
+    -> Jump(b1)
+
+  b4:
+    -> Return
+
+  b5:
+    -> Jump(b3)
+
+  b6:
+    -> WaitCycles(1, b8)
+
+  b7:
+    -> Jump(b5)
+
+  b8:
+    -> Jump(b5)
+
+fn fn3 run_AesCipherTopTest [kind=Run, owner=tb0]
+  entry = b0
+
+  b0:
+    Log(info, "AES-128 encryption test (FIPS-197 + zero vector)")
+    TransactorCall(xact.reset_dut())
+    TransactorCall(xact.load_block(0x000102030405060708090a0b0c0d0e0f, 0x00112233445566778899aabbccddeeff))
+    TransactorCall(xact.wait_for_done())
+    AssertCheck { cond: (dut.done == 1), on_fail: "Test 1: done never asserted within 14 cycles" }
+    AssertCheck { cond: (dut.text_out == 0x69c4e0d86a7b0430d8cdb78070b4c55a), on_fail: "Test 1: text_out=0x%s, expected 0x69c4e0d86a7b0430d8cdb78070b4c55a", dut.text_out (wide-hex) }
+    Log(info, "Test 1 PASS: ciphertext = 69c4e0d8_6a7b0430_d8cdb780_70b4c55a")
+    TransactorCall(xact.reset_dut())
+    TransactorCall(xact.load_block(0, 0))
+    TransactorCall(xact.wait_for_done())
+    AssertCheck { cond: (dut.done == 1), on_fail: "Test 2: done never asserted within 14 cycles" }
+    AssertCheck { cond: (dut.text_out == 0x66e94bd4ef8a2c3b884cfa59ca342b2e), on_fail: "Test 2: text_out=0x%s, expected 0x66e94bd4ef8a2c3b884cfa59ca342b2e", dut.text_out (wide-hex) }
+    Log(info, "Test 2 PASS: ciphertext = 66e94bd4_ef8a2c3b_884cfa59_ca342b2e")
+    Log(info, "ALL 2 SUB-TESTS PASSED Ã¢Â\u{80}Â\u{94} AES-128 cipher")
+    -> Return

@@ -1260,8 +1260,12 @@ fn declare_locals(
                 })?;
                 writeln!(out, "{pad}std::vector<{}> {n}{{}}; (void){n};", rec.name).ok();
             }
-            _ => {
-                writeln!(out, "{pad}uint64_t {n} = 0; (void){n};").ok();
+            // Scalar local. Wide (>64-bit) `uint`/`sint` locals — e.g. a
+            // wide method param hoisted as the first N locals — take v1's
+            // `_harc_u128` storage; everything else widens to uint64_t.
+            ref ty => {
+                let cty = super::local_scalar_cty(ty);
+                writeln!(out, "{pad}{cty} {n} = 0; (void){n};").ok();
             }
         }
     }
@@ -1318,14 +1322,16 @@ pub(super) fn emit_method(
     let ret_ty = if func.ret.is_some() { "uint64_t" } else { "void" };
     // A record-typed param (`send(t: RegOp)`) is taken by value as the
     // record struct — the body binds it and reads its fields, mirroring
-    // v1's by-value struct param; every scalar param widens to uint64_t.
+    // v1's by-value struct param. A scalar param widens to uint64_t, or
+    // to v1's `_harc_u128` wide-value type for a >64-bit `uint`/`sint`
+    // (the wide-value method ABI — the body moves it to a wide DUT port).
     let params = names[..nparams]
         .iter()
         .enumerate()
         .map(|(i, n)| match func.locals[i].ty {
             IrType::Record(r) => format!("{} {n}", prog.records[r.index()].name),
             IrType::RecordSeq(r) => format!("std::vector<{}> {n}", prog.records[r.index()].name),
-            _ => format!("uint64_t {n}"),
+            ref ty => format!("{} {n}", super::local_scalar_cty(ty)),
         })
         .collect::<Vec<_>>()
         .join(", ");

@@ -127,15 +127,16 @@ Residual first-blocker map for the other 16 (re-run of
 | ~~transactor state fields~~ → ~~record param~~ → ~~pre/post hooks~~ (resolved) | `axilite_hooks_test` — **REGISTERED 2026-06-13 (closure-hook cluster, divergence 20, pass): the test-scope `on drv.send pre/post` method hooks now lower via host-state promotion (captured test-scope `let`s → `_tb` scalar fields; hook bodies → `FunctionKind::TestHook` functions back-patched onto `TransactorMethodSchema::pre_hooks`/`post_hooks`, fired around the body in `emit_method`); trace-diff clean v1↔tbir at seed 1** |
 | transactor state fields (self-proving) | `transactor_state_field_test` — **REGISTERED 2026-06-13** (`cam_dual_basic.sv`, pass): scalar state on the unbound DUT-poking transactor, written + read in method bodies and read back at test scope; trace-diff clean v1↔tbir |
 | record-typed method params (self-proving) | `transactor_record_param_test` — **REGISTERED 2026-06-13** (`top_counter.sv`, pass): a `run_for(cmd: RunCmd)` method takes a `transaction` record by value, reads `cmd.ticks` in the body; trace-diff clean v1↔tbir |
-| >64-bit method params (1) | `aes_cipher_top_test` — "transactor method `AesXactor.load_block` parameter `key` wider than 64 bits (uint<128>)" (the tbir value model is u64; needs the wide-value method ABI) |
+| >64-bit method params (self-proving) | `aes_cipher_top_test` — **REGISTERED 2026-06-13** (`aes_cipher_top.sv aes_key_expand_128.sv xtime.sv`, pass) by the wide-value method-param ABI slice: a `uint<128>` value param (`load_block(key, text_in)`) now lowers as a wide-typed local and renders as v1's `_harc_u128`; the body moves it whole-signal to the 128-bit DUT port and compares the 128-bit `text_out`. A param wider than 128 bits (v1's `HarcWide<N>`) stays rejected. Trace-diff clean v1↔tbir at seed 1. |
 
 As with the `transaction` slice, most of the moved fixtures stack
 several constructs (bus + scoreboard + sequencer + events); the
 counts will keep shifting as those slices land. With the closure-hook
-cluster landed (`axilite_hooks_test` now passes), the sole remaining
-transactor-specific residual is `aes_cipher_top_test` (>64-bit param —
-needs the wide-value method ABI), which stays with this construct's
-owner.
+cluster and the wide-value method-param ABI slice landed, every
+transactor-construct corpus fixture in this group that lowers is now
+registered; the residual transactor-cluster fixtures are blocked on
+OTHER constructs (`bus`/`scoreboard`/event-driven forms), not on the
+transactor surface itself.
 
 *+ `mshr_cocotb_test` (moved here 2026-06-12 by the singleton batch:
 its former `const` blocker is resolved, the next blocker is its
@@ -960,9 +961,11 @@ no schema v4 needed.
    predicted first-blocker churn happened — see its residual map.
    Transactor-specific follow-ups: scalar state fields on UNBOUND
    transactors **DONE 2026-06-13** (state-field slice — divergence 10,
-   self-proving `transactor_state_field_test` registered); still owed:
-   event-driven / bound-initiator transactor state, and >64-bit method
-   params). The `transactor` slice
+   self-proving `transactor_state_field_test` registered); >64-bit method
+   params **DONE 2026-06-13** (wide-value method-param ABI slice — a
+   `uint<N>`/`sint<N>` value param up to 128 bits renders as `_harc_u128`;
+   `aes_cipher_top_test` registered); still owed: event-driven /
+   bound-initiator transactor state). The `transactor` slice
    also unlocks 10 of the TLM-family fixtures (see the bus group's
    residual map).
 2. ~~**`bus`** (15 fixtures): unlocks the entire TLM family.~~
