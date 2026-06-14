@@ -255,8 +255,12 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // component local (`env.sb.count`). Both name plain by-value C++
         // struct members (v1's `emit_component_struct` shape).
         Expr::ComponentField { base, field } => {
-            format!("{}.{field}", comp_base_cpp_subst(base, cx.self_subst))
+            format!("{}.{field}", comp_base_cpp_subst_cx(cx, base))
         }
+        // A whole composite-component value passed by value as a method
+        // arg (`sb.observe(addr, model)` reads `model` here). Render the
+        // receiver — a plain C++ struct value, copied at the call.
+        Expr::ComponentValue { base } => comp_base_cpp_subst_cx(cx, base),
         // Composite-component `queue<T>` size()/empty() read — mirrors the
         // `ScoreboardQuery` queue reads but resolves the receiver via the
         // component base (self-relative or test-scope path).
@@ -532,6 +536,14 @@ pub(super) fn comp_base_cpp(base: &crate::ir::ComponentBase) -> String {
 /// `SelfField` base as the instance path `inst` instead of `self` — for
 /// clause exprs lowered self-relatively but emitted in a `_checkers`
 /// closure that has no `self` (watchdog/periodic period + max_idle).
+///
+/// A `ComponentBase::Local` only ever arises inside a method body (a
+/// component-typed parameter receiver), where the cx-aware
+/// [`comp_base_cpp_subst_cx`] is used to render it via the local-name
+/// table. This name-less variant therefore never sees a `Local` and
+/// renders it to a deliberately-invalid sentinel rather than threading a
+/// names table everywhere — the call paths that can produce a `Local`
+/// base all route through the cx-aware variant.
 pub(super) fn comp_base_cpp_subst(
     base: &crate::ir::ComponentBase,
     self_subst: Option<&str>,
@@ -555,5 +567,25 @@ pub(super) fn comp_base_cpp_subst(
                 .join(".")
         }
         crate::ir::ComponentBase::Path(path) => path.join("."),
+        // Unreachable: a `Local` base requires the local-name table; every
+        // emission site that can produce one uses `comp_base_cpp_subst_cx`.
+        crate::ir::ComponentBase::Local(l) => {
+            format!("/*BUG:component-local l{} without names*/", l.0)
+        }
+    }
+}
+
+/// cx-aware component-base resolver: handles `ComponentBase::Local` by
+/// rendering the parameter local's C++ name, and delegates every other
+/// base shape to the name-less [`comp_base_cpp_subst`] (carrying the
+/// `self_subst` from the emission context).
+pub(super) fn comp_base_cpp_subst_cx(cx: &ECx<'_>, base: &crate::ir::ComponentBase) -> String {
+    match base {
+        crate::ir::ComponentBase::Local(l) => cx
+            .names
+            .get(l.index())
+            .cloned()
+            .unwrap_or_else(|| format!("/*BUG:l{}*/", l.0)),
+        other => comp_base_cpp_subst(other, cx.self_subst),
     }
 }

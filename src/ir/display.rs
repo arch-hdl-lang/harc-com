@@ -407,6 +407,7 @@ fn type_str(t: &IrType) -> String {
         IrType::Bool => "bool".to_string(),
         IrType::Record(r) => format!("record(r{})", r.0),
         IrType::RecordSeq(r) => format!("seq(r{})", r.0),
+        IrType::Component(c) => format!("component(c{})", c.0),
         IrType::Unknown => "unknown".to_string(),
     }
 }
@@ -549,6 +550,7 @@ fn comp_base_str(base: &crate::ir::ComponentBase) -> String {
     match base {
         ComponentBase::SelfField => "self".to_string(),
         ComponentBase::Path(path) => path.join("."),
+        ComponentBase::Local(l) => format!("local(l{})", l.0),
     }
 }
 
@@ -757,6 +759,9 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         }
         Expr::ComponentField { base, field } => {
             format!("{}.{field}", comp_base_str(base))
+        }
+        Expr::ComponentValue { base } => {
+            format!("ComponentValue({})", comp_base_str(base))
         }
         Expr::ComponentQueueQuery { base, query } => {
             format!("ComponentQueueQuery({}.{})", comp_base_str(base), sb_query_str(query))

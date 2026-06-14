@@ -500,6 +500,7 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
         | Expr::TransactorState { .. }
         | Expr::ScoreboardQuery { .. }
         | Expr::ComponentField { .. }
+        | Expr::ComponentValue { .. }
         | Expr::ComponentQueueQuery { .. }
         | Expr::SeqLen(_)
         | Expr::CovBin { .. } => {}

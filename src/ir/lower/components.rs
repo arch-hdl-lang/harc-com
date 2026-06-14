@@ -114,6 +114,15 @@ pub(crate) fn transactor_is_component(t: &TransactorDecl, env_held: bool) -> boo
     if has_on_handler || has_periodic_handler {
         return true;
     }
+    // Function-library transactor: pure methods, no DUT handle, no event,
+    // no `on`. It lowers as a by-value struct with free-function methods
+    // (mirroring v1's empty-struct + `<Comp>_<method>` lambdas), held as a
+    // sub-field / test field and dispatched on. The DUT-poking
+    // `TransactorSchema` path requires a DUT handle, so a handle-less
+    // method-only transactor routes here instead.
+    if transactor_is_function_library(t) {
+        return true;
+    }
     // Purely structural DUT-poking BFM: `hookable` methods + a
     // module-typed DUT handle, no `on`/event/bound. The dedicated
     // `TransactorSchema` path lowers it as a top-level testbench field
@@ -174,6 +183,40 @@ pub(crate) fn transactor_is_dut_poking_bfm(t: &TransactorDecl, env_held: bool) -
     // Exactly the shape `transactor_is_component`'s trailing arm admits:
     // hookable BFM + DUT handle, no event/on/periodic, env-held.
     has_hookable && has_module_field && !has_event && !has_on_handler
+}
+
+/// True when a transactor is a *function library*: it carries at least one
+/// `function`/`hookable` method but NO module-typed DUT handle, NO event
+/// field, and NO `on`/periodic handler. Such a transactor holds no
+/// per-instance behavior beyond its pure methods, so it lowers to a
+/// component (by-value struct + free-function methods) rather than the
+/// DUT-poking `TransactorSchema` (which structurally needs a DUT handle).
+pub(crate) fn transactor_is_function_library(t: &TransactorDecl) -> bool {
+    if t.bound_to.is_some() || !t.params.is_empty() {
+        return false;
+    }
+    let mut has_method = false;
+    for it in t.items.iter().chain(t.when_active.iter().flatten()) {
+        match it {
+            ComponentItem::Hookable(_) => has_method = true,
+            ComponentItem::Field(f) => {
+                if is_event_field(f) || matches!(&f.ty, TypeExpr::Named { .. }) {
+                    // An event pipe or a module/transaction-typed field
+                    // means this is not a pure function library.
+                    return false;
+                }
+                // A scalar state field is allowed (persistent component
+                // state alongside the pure methods).
+            }
+            ComponentItem::OnHandler(_)
+            | ComponentItem::TargetTlmThread(_)
+            | ComponentItem::Watchdog(_)
+            | ComponentItem::Connect(_)
+            | ComponentItem::Lifecycle(..)
+            | ComponentItem::Apply(_) => return false,
+        }
+    }
+    has_method
 }
 
 /// True when a transactor is an *event-driven consumer* — it has an
@@ -1351,6 +1394,20 @@ fn method_param_ir_type(ty: Option<&TypeExpr>, ctx: &LowerCtx) -> IrType {
         }
         return IrType::Unknown;
     }
+    // A component-typed parameter (`observe(addr, model: ProtocolModel)`):
+    // resolve the component name against the program's component table so
+    // method calls on it dispatch through `ComponentBase::Local`.
+    if let Some(TypeExpr::Named { name, .. }) = ty {
+        let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+        if let Some(cid) = ctx
+            .components
+            .iter()
+            .position(|c| c.name == simple)
+            .map(|i| ComponentId(i as u32))
+        {
+            return IrType::Component(cid);
+        }
+    }
     helpers::ir_type_of(ty)
 }
 
@@ -1382,8 +1439,17 @@ fn lower_method_body(
             ty,
         });
     }
-    if h.return_ty.is_some() {
+    if let Some(rt) = &h.return_ty {
         let ret = b.declare("__ret");
+        // A record-returning method (`-> ReadResponse`) types its `__ret`
+        // slot as the record so codegen declares it as the struct (and the
+        // lambda's return type resolves to the record name).
+        if let TypeExpr::Named { name, .. } = rt {
+            let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+            if let Some(&rid) = ctx.record_ids.get(simple) {
+                b.set_local_type(ret, IrType::Record(rid));
+            }
+        }
         b.helper_ret = Some(ret);
     }
     b.lower_block_stmts(&h.body)?;
@@ -1851,6 +1917,35 @@ impl super::FuncBuilder<'_> {
                 }
             }
         }
+        // Component-typed parameter call: `model.predict_read(addr)` inside
+        // a method body, where `model` is a method PARAM local of type
+        // `IrType::Component(cid)`. Dispatch through `ComponentBase::Local`
+        // (the receiver is the local itself, passed by value). Checked
+        // before the self sub-component arm — a param is a real local, so
+        // that arm's `lookup(...).is_none()` guard would skip it.
+        if let ExprKind::Field { target, name: method } = &*callee.kind {
+            if let ExprKind::Ident(recv) = &*target.kind {
+                if let Some(local) = self.lookup(&recv.name) {
+                    if let Some(cid) = self.component_of_local(local) {
+                        let comp = &self.ctx.components[cid.index()];
+                        if comp.method(&method.name).is_none() {
+                            return Err(unsupported(
+                                &format!(
+                                    "component `{}` has no method `{}` (on parameter `{}`)",
+                                    comp.name, method.name, recv.name
+                                ),
+                                "",
+                            ));
+                        }
+                        return Ok(Some((
+                            ComponentBase::Local(local),
+                            cid,
+                            method.name.clone(),
+                        )));
+                    }
+                }
+            }
+        }
         // Self-relative sub-component call: `sb.record_error(...)` inside a
         // transactor/component body, where `sb` is a self sub-component
         // field (a `Sub` to a method-bearing component). The receiver is a
@@ -2057,6 +2152,14 @@ impl super::FuncBuilder<'_> {
                 })?;
                 self.resolve_component_recv(head_cid, &path[1..])?
             }
+            // A component-typed method-param local never owns a queue
+            // field access (only method dispatch reaches a `Local` base).
+            ComponentBase::Local(_) => {
+                return Err(unsupported(
+                    &format!("a queue `{queue}` on a component-typed parameter"),
+                    "",
+                ));
+            }
         };
         let comp = &self.ctx.components[cid.index()];
         match comp.field(queue).map(|f| &f.kind) {
@@ -2223,6 +2326,62 @@ impl super::FuncBuilder<'_> {
                         return Ok(Some(IrExpr::ComponentField {
                             base: ComponentBase::Path(recv.to_vec()),
                             field,
+                        }));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resolve a whole composite-component value READ as an
+    /// `Expr::ComponentValue` — the receiver passed by value as a method
+    /// argument (`sb.observe(addr, model)` reads `model`). Two shapes:
+    ///   * bare `model` inside a method/handler body — a self `Sub`
+    ///     sub-component field → `base = Path(["self","model"])`;
+    ///   * a test-scope path `env.model` whose terminal is a `Sub` field →
+    ///     `base = Path(["env","model"])`.
+    /// A component-typed PARAM local (`IrType::Component`) is handled
+    /// separately at ident resolution (it is a `Local` base, not a field).
+    pub(crate) fn as_component_value_read(
+        &self,
+        e: &AstExpr,
+    ) -> Result<Option<IrExpr>, LowerError> {
+        if let ExprKind::Ident(id) = &*e.kind {
+            if self.lookup(&id.name).is_none() {
+                if let Some(cid) = self.self_component {
+                    let comp = &self.ctx.components[cid.index()];
+                    if matches!(
+                        comp.field(&id.name).map(|f| &f.kind),
+                        Some(ComponentFieldKind::Sub { .. })
+                    ) {
+                        return Ok(Some(IrExpr::ComponentValue {
+                            base: ComponentBase::Path(vec![
+                                "self".to_string(),
+                                id.name.clone(),
+                            ]),
+                        }));
+                    }
+                }
+            }
+        }
+        if let Some(path) = dotted_path(e) {
+            let path = self.strip_tb_prefix(&path);
+            if path.len() >= 2 {
+                if let Some(&head_cid) = self.ctx.component_fields.get(&path[0]) {
+                    let (recv, field) = path.split_at(path.len() - 1);
+                    let field = field[0].clone();
+                    if self.recv_is_scoreboard_sub(head_cid, &recv[1..]) {
+                        return Ok(None);
+                    }
+                    let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
+                    let comp = &self.ctx.components[cid.index()];
+                    if matches!(
+                        comp.field(&field).map(|f| &f.kind),
+                        Some(ComponentFieldKind::Sub { .. })
+                    ) {
+                        return Ok(Some(IrExpr::ComponentValue {
+                            base: ComponentBase::Path(path.to_vec()),
                         }));
                     }
                 }

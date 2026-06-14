@@ -1,0 +1,207 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 PostEvalProviderTb { dut: PostEvalProvider }
+  test PostEvalProviderTest tb=tb0 run=fn3 check=-
+  record r0 ReadResponse
+    matched : uint<1>
+    data : uint<32>
+    resp : uint<2>
+    last : uint<1>
+  component c0 ProtocolModel (transactor)
+    method predict_read(1 arg) -> ret = fn0
+  component c1 ResponseScoreboard (scoreboard)
+    field seen_count : scalar = 0
+    field last_expected : scalar = 0
+    method observe(2 args) = fn1
+  component c2 BusResponder (transactor)
+    field dut : dut PostEvalProvider
+    field model : sub c0
+    field sb : sub c1
+    field pending : scalar = 0
+    field visible : scalar = 0
+    field pending_data : scalar = 0
+    field queued : scalar = 0
+    field queued_data : scalar = 0
+    on 1 cycles phase post_eval = fn2
+
+fn fn0 comp_method_0 [kind=ComponentMethod(c0)]
+  params:
+    addr : uint<8>
+  locals:
+    %0 addr : uint<8>
+    %1 __ret : record(r0)
+    %2 r : record(r0)
+  ret = %__ret
+  entry = b0
+
+  b0:
+    RecordInit(%r, r0)
+    RecordFieldWrite(%r.matched, 1)
+    RecordFieldWrite(%r.resp, 0)
+    RecordFieldWrite(%r.last, 1)
+    RecordFieldWrite(%r.data, 0)
+    -> Branch((%addr == 16), b2, b3)
+
+  b1:
+    Assign(%__ret, %r)
+    -> Return
+
+  b2:
+    RecordFieldWrite(%r.data, 286326800)
+    -> Jump(b1)
+
+  b3:
+    -> Branch((%addr == 32), b4, b5)
+
+  b4:
+    RecordFieldWrite(%r.data, 572653600)
+    -> Jump(b1)
+
+  b5:
+    -> Branch((%addr == 48), b6, b7)
+
+  b6:
+    RecordFieldWrite(%r.data, 858980400)
+    -> Jump(b1)
+
+  b7:
+    RecordFieldWrite(%r.matched, 0)
+    RecordFieldWrite(%r.resp, 1)
+    -> Jump(b1)
+
+fn fn1 comp_method_1 [kind=ComponentMethod(c1)]
+  params:
+    addr : uint<8>
+    model : component(c0)
+  locals:
+    %0 addr : uint<8>
+    %1 model : component(c0)
+    %2 r : record(r0)
+  entry = b0
+
+  b0:
+    ComponentCall(%r = local(l1).c0::predict_read([%addr]))
+    AssertCheck { cond: (%r.matched != 0), on_fail: "scoreboard saw unexpected addr 0x%02llx", %addr }
+    ComponentFieldWrite(self.seen_count, (self.seen_count + 1))
+    ComponentFieldWrite(self.last_expected, %r.data)
+    -> Return
+
+fn fn2 comp_periodic_2 [kind=ComponentMethod(c2)]
+  locals:
+    %0 __t0 : unknown
+    %1 __t1 : unknown
+    %2 __t2 : unknown
+    %3 r : record(r0)
+    %4 __t3 : unknown
+  entry = b0
+
+  b0:
+    -> Branch((self.pending != 0), b2, b3)
+
+  b1:
+    DutRead(%__t0, dut.rsp_ready)
+    -> Branch((((self.visible != 0) && (self.pending != 0)) && (%__t0 != 0)), b5, b6)
+
+  b2:
+    DutWrite(dut.rsp_valid, 1)
+    DutWrite(dut.rsp_data, self.pending_data)
+    ComponentFieldWrite(self.visible, 1)
+    -> Jump(b1)
+
+  b3:
+    DutWrite(dut.rsp_valid, 0)
+    -> Jump(b1)
+
+  b4:
+    DutRead(%__t1, dut.req_valid)
+    -> Branch((%__t1 != 0), b8, b9)
+
+  b5:
+    ComponentFieldWrite(self.pending, 0)
+    ComponentFieldWrite(self.visible, 0)
+    DutWrite(dut.rsp_valid, 0)
+    -> Jump(b4)
+
+  b6:
+    -> Jump(b4)
+
+  b7:
+    -> Branch(((self.pending == 0) && (self.queued != 0)), b14, b15)
+
+  b8:
+    DutRead(%__t2, dut.req_addr)
+    ComponentCall(%r = self.model.c0::predict_read([%__t2]))
+    AssertCheck { cond: (%r.matched != 0), on_fail: "unexpected read addr=0x%02llx", dut.req_addr }
+    DutRead(%__t3, dut.req_addr)
+    ComponentCall(self.sb.c1::observe([%__t3, ComponentValue(self.model)]))
+    -> Branch((self.pending == 0), b11, b12)
+
+  b9:
+    -> Jump(b7)
+
+  b10:
+    -> Jump(b7)
+
+  b11:
+    ComponentFieldWrite(self.pending_data, %r.data)
+    ComponentFieldWrite(self.pending, 1)
+    ComponentFieldWrite(self.visible, 0)
+    DutWrite(dut.rsp_valid, 1)
+    DutWrite(dut.rsp_data, %r.data)
+    -> Jump(b10)
+
+  b12:
+    AssertCheck { cond: (self.queued == 0), on_fail: "responder queue overflow" }
+    ComponentFieldWrite(self.queued, 1)
+    ComponentFieldWrite(self.queued_data, %r.data)
+    -> Jump(b10)
+
+  b13:
+    -> Return
+
+  b14:
+    ComponentFieldWrite(self.pending_data, self.queued_data)
+    ComponentFieldWrite(self.pending, 1)
+    ComponentFieldWrite(self.visible, 0)
+    ComponentFieldWrite(self.queued, 0)
+    DutWrite(dut.rsp_valid, 1)
+    DutWrite(dut.rsp_data, self.queued_data)
+    -> Jump(b13)
+
+  b15:
+    -> Jump(b13)
+
+fn fn3 run_PostEvalProviderTest [kind=Run, owner=tb0]
+  locals:
+    %0 __t0 : unknown
+  entry = b0
+
+  b0:
+    ComponentSubAssign(responder.model = model)
+    ComponentSubAssign(responder.sb = sb)
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.rsp_valid, 0)
+    DutWrite(dut.rsp_data, 0)
+    -> WaitCycles(2, b1)
+
+  b1:
+    DutWrite(dut.rst, 0)
+    Assign(%__t0, 20)
+    -> WaitUntilTimeout { (dut.done == 1) [single], cycles: %__t0, fire: b2, timeout: b3 }
+
+  b2:
+    AssertCheck { cond: (dut.accepted_count == 3), on_fail: "accepted %lld, expected 3", dut.accepted_count }
+    AssertCheck { cond: (dut.duplicate_count == 0), on_fail: "duplicate responses %lld, expected 0", dut.duplicate_count }
+    AssertCheck { cond: (dut.last_data == 858980400), on_fail: "last data 0x%08llx, expected 0x33330030", dut.last_data }
+    AssertCheck { cond: (responder.sb.seen_count == 3), on_fail: "scoreboard saw %lld, expected 3", responder.sb.seen_count }
+    AssertCheck { cond: (responder.sb.last_expected == 858980400), on_fail: "scoreboard expected 0x%08llx, expected 0x33330030", responder.sb.last_expected }
+    Log(info, "ALL TESTS PASSED - post_eval_provider_test")
+    -> Return
+
+  b3:
+    FailDiag { "post_eval provider DUT did not finish" }
+    FailDiag { unless: (dut.done == 1), "  not yet true: dut.done == 1" }
+    -> Jump(b2)

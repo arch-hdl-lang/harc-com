@@ -418,7 +418,48 @@ impl FuncBuilder<'_> {
                         "pure helpers emit as scalar-only file-scope functions",
                     ));
                 }
-                if l.value.is_some() {
+                // `let r : ReadResponse = model.predict_read(addr)` — a
+                // record-typed local bound from a component-method call that
+                // returns that record. The dest local is record-typed and
+                // the call carries it (v1's `ReadResponse r =
+                // <Comp>_<method>(...)`). Any other initializer shape stays
+                // rejected (field-by-field assignment is the only other
+                // supported form).
+                if let Some(value) = &l.value {
+                    if let ExprKind::Call { callee, args } = &*value.kind {
+                        if let Some((base, component, method)) =
+                            self.as_component_method_call(callee)?
+                        {
+                            let comp = &self.ctx.components[component.index()];
+                            let m = comp.method(&method).ok_or_else(|| {
+                                unsupported(
+                                    &format!("component `{}` has no method `{method}`", comp.name),
+                                    "",
+                                )
+                            })?;
+                            if !m.has_ret {
+                                return Err(unsupported(
+                                    &format!(
+                                        "`let {} : {simple} = {}.{method}(...)` — method \
+                                         `{method}` returns no value",
+                                        l.name.name, comp.name
+                                    ),
+                                    "",
+                                ));
+                            }
+                            let lowered = self.lower_component_call_args(args)?;
+                            let id = self.declare(&l.name.name);
+                            self.set_local_type(id, IrType::Record(rid));
+                            self.push(Stmt::ComponentCall {
+                                base,
+                                component,
+                                method,
+                                args: lowered,
+                                dest: Some(id),
+                            });
+                            return Ok(());
+                        }
+                    }
                     return Err(unsupported(
                         &format!("`let {} : {simple} = ...` with an initializer", l.name.name),
                         "transaction locals default-construct; assign fields individually",

@@ -192,7 +192,7 @@ test-scope-`let` sites.
 |---|---|---|
 | `dma_engine_test` | **REGISTERED 2026-06-13** (`dma_engine.sv`, pass; trace-diff clean v1↔tbir) | (resolved) a PASSIVE reactive-monitor transactor (`mon : MemXactor passive`, `on dut.<v> && dut.<r>` observers + `on dut.<v> level` combinational memory model) + an `active` DUT-poking APB BFM |
 | `scoreboard_typed_queue_test` | **REGISTERED 2026-06-13** (`scoreboard_typed_queue.sv`, pass; trace-diff clean v1↔tbir) | (resolved) `queue<CheckerError>` (record-element queue) on a method-bearing scoreboard component + the component-queue-op seam (`ComponentQueuePush`/`Pop`/`QueueQuery` push/pop/size of a struct on a component `Queue` field) + self-relative `sb.record_error(...)` sub-component method call + `checker.sb = sb` whole-value copy (`ComponentSubAssign`) + `on 1 cycles phase post_eval` (the shared `HandlerPhase::PostEval` seam → `_post_eval_services`) |
-| `post_eval_provider_test` | deferred | function-library transactor (`ProtocolModel`, methods only, no DUT handle) used as a sub-field + component-as-method-argument (`sb.observe(addr, model)` passes a transactor instance and dispatches `model.predict_read(...)` on the param) + `on ... phase post_eval`. Needs the function-library-as-sub-field + component-arg + post_eval-phase seams. |
+| `post_eval_provider_test` | **REGISTERED 2026-06-13** (`post_eval_provider.sv`, pass; trace-diff clean v1↔tbir) | (resolved) function-library transactor (`ProtocolModel`, pure methods only, no DUT/event/`on`) routed to a `ComponentSchema` (by-value struct + free-function methods) and held as a sub-field / testbench field + a component-typed method parameter (`observe(addr, model: ProtocolModel)` → `IrType::Component`) dispatched on (`model.predict_read(addr)` → `ComponentBase::Local`) + a component passed by value as a method arg (`sb.observe(addr, model)` → `Expr::ComponentValue`) + a record-returning method bound by `let r : ReadResponse = model.predict_read(...)` (record-typed `ComponentCall` dest) + `on 1 cycles phase post_eval` (reuses the shared `HandlerPhase::PostEval` → `_post_eval_services` seam) |
 | `axilite_env_test` | **REGISTERED 2026-06-13** (`AxiLiteRegs.sv`, pass; trace-diff clean v1↔tbir) | (resolved) env-of-method-transactor: `env AxilEnv { drv : AxilXactor active; sb : AxilSb }` holds a DUT-poking hookable BFM as a `Sub`, with nested `env.drv.<method>(...)` dispatch + `env.drv.dut = dut` bind + `env.sb.expected.push/pop` scalar-queue access through the env. The env-of-DUT-poking-transactor slice routes the BFM to the composite-component table (see the cluster intro above). |
 
 The `dma_engine` unlock landed the reactive-monitor routing.
@@ -207,10 +207,19 @@ general `HandlerPhase` concept (`Checker` → `_checkers`, `PostEval` →
 `_post_eval_services`) carried on `PeriodicHandlerSchema.phase`. The
 `axilite_env_test` unlock (2026-06-13) landed the env-of-DUT-poking-BFM
 routing (a hookable BFM with a `dut` handle routes to the composite-
-component table when held as an `env`/`agent` sub-field). The one
-remaining fixture, `post_eval_provider_test`, stacks further seams
-(function-library-as-sub-field + component-as-method-argument; it reuses
-the `phase post_eval` seam) and stays rejected precisely.
+component table when held as an `env`/`agent` sub-field).
+`post_eval_provider_test` (2026-06-13) then landed the **function-library
+transactor + component-arg dispatch** seams: a DUT/event/`on`-less,
+method-only transactor (`transactor_is_function_library`) routes to a
+`ComponentSchema` (a by-value struct + `<Comp>_<method>` free functions,
+exactly v1's empty-struct shape); a component-typed method parameter
+(`IrType::Component`) is taken by value and dispatched on via
+`ComponentBase::Local` (`model.predict_read(addr)`); a component value is
+passed as a method argument with `Expr::ComponentValue` (`sb.observe(addr,
+model)`); and a record-returning component method binds into a record-typed
+`ComponentCall` dest (`let r : ReadResponse = model.predict_read(...)`).
+It reuses the `phase post_eval` seam unchanged. With this, the entire
+transactor-composition cluster is resolved — no fixtures remain deferred.
 
 ### `regblock` construct — PARTIALLY RESOLVED (regblock slice 2026-06-12; bus-bound BFM + residuals + field-level/addrmap 2026-06-13)
 

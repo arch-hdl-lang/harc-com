@@ -82,6 +82,12 @@ impl FuncBuilder<'_> {
                 if let Some(ce) = self.as_component_field_read(e)? {
                     return Ok(ce);
                 }
+                // Whole composite-component value read — a self sub-component
+                // field passed by value as a method arg (`sb.observe(addr,
+                // model)`). Locals shadow (checked above).
+                if let Some(cv) = self.as_component_value_read(e)? {
+                    return Ok(cv);
+                }
                 // Closure-hook host-state promotion: a test-scope `let`
                 // captured by an `on <obj>.<method> pre/post` hook was
                 // promoted to a `_tb` scalar field. A bare ident in that
@@ -560,6 +566,8 @@ impl FuncBuilder<'_> {
             | Expr::ScoreboardQuery { .. }
             // Component fields are host state — no DUT port inside.
             | Expr::ComponentField { .. }
+            // A by-value component arg is host state — no DUT port inside.
+            | Expr::ComponentValue { .. }
             // Component-queue size/empty reads are host state — no port.
             | Expr::ComponentQueueQuery { .. }
             // Sequence length is host state — no DUT port inside.

@@ -514,6 +514,22 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         })
         .collect();
 
+    // Function-library transactors (pure methods, no DUT/event/`on`). They
+    // route to a `ComponentSchema` and, being transactors, tolerate an
+    // `active`/`passive` mode at a binding site — the mode is inert (a
+    // function library has no `when active` registration to gate), so any
+    // mode (or none) is accepted, exactly as a reactive monitor is.
+    let function_library_names: HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Transactor(t) if components::transactor_is_function_library(t) => {
+                Some(t.name.name.clone())
+            }
+            _ => None,
+        })
+        .collect();
+
     // File-level construct gate: anything outside the MVP subset is an
     // explicit Unsupported, never silently dropped.
     for it in &file.items {
@@ -605,6 +621,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                         &event_driven_transactor_names,
                         &reactive_monitor_names,
                         &dut_poking_bfm_names,
+                        &function_library_names,
                     )?;
                 } else if matches!(
                     c.kind,
@@ -1071,6 +1088,7 @@ fn validate_testbench_component(
     event_driven_transactor_names: &HashSet<String>,
     reactive_monitor_names: &HashSet<String>,
     dut_poking_bfm_names: &HashSet<String>,
+    function_library_names: &HashSet<String>,
 ) -> Result<(), LowerError> {
     for ci in &c.items {
         match ci {
@@ -1088,6 +1106,16 @@ fn validate_testbench_component(
                     // defaults to the observation-only behavior). Checked
                     // before the event-driven gate (a monitor is a subset).
                     if reactive_monitor_names.contains(simple) {
+                        continue;
+                    }
+                    // A function-library transactor field (`model :
+                    // ProtocolModel active`) routes to a `ComponentSchema`
+                    // but is still a transactor: it tolerates an
+                    // `active`/`passive` mode (inert — no `when active`
+                    // registration to gate), so any mode (or none) is
+                    // accepted. Checked before the composite-component gate,
+                    // which otherwise rejects a mode on a component field.
+                    if function_library_names.contains(simple) {
                         continue;
                     }
                     // An event-driven transactor field (`drv : SeqXactor
@@ -4043,6 +4071,15 @@ impl FuncBuilder<'_> {
         }
     }
 
+    /// `Some(component)` when the local is a component value
+    /// (a component-typed method parameter, `IrType::Component`).
+    pub(crate) fn component_of_local(&self, l: LocalId) -> Option<ir::ComponentId> {
+        match self.locals[l.index()].ty {
+            IrType::Component(c) => Some(c),
+            _ => None,
+        }
+    }
+
     /// `Some(record)` when the local is a transaction-sequence
     /// (`let txns = SomeTseq(...)`, typed `RecordSeq`).
     pub(crate) fn seq_of_local(&self, l: LocalId) -> Option<ir::RecordId> {
@@ -4282,6 +4319,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             | ir::Expr::RecordField { index: None, .. }
             | ir::Expr::TbField(_)
             | ir::Expr::ComponentField { .. }
+            | ir::Expr::ComponentValue { .. }
             | ir::Expr::ScoreboardQuery { .. }
             | ir::Expr::ComponentQueueQuery { .. }
             | ir::Expr::SeqLen(_)
@@ -4492,6 +4530,7 @@ fn fill_visit_expr(
         | Expr::TbField(_)
         | Expr::TransactorState { .. }
         | Expr::ComponentField { .. }
+        | Expr::ComponentValue { .. }
         | Expr::ScoreboardQuery { .. }
         | Expr::ComponentQueueQuery { .. }
         | Expr::SeqLen(_)
