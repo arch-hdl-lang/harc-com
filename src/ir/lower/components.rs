@@ -58,12 +58,20 @@ pub(crate) fn scoreboard_is_component(c: &ComponentDecl) -> bool {
 ///     bound bus's wires on the test DUT.
 /// A `bound to` target responder (`thread bus.<m>(...)` bodies, no event
 /// field) is excluded — it stays on the separate TLM responder path.
-pub(crate) fn transactor_is_component(t: &TransactorDecl) -> bool {
+/// `env_held` is true when this transactor type is referenced as a
+/// by-value sub-component field of some `env`/`agent` declaration in the
+/// file. It only matters for the purely-structural DUT-poking BFM (the
+/// trailing arm): such a BFM defaults to the dedicated `TransactorSchema`
+/// path (its standalone testbench-field placement), and routes to the
+/// composite-component table ONLY when an env must hold it by value — see
+/// the trailing arm's comment.
+pub(crate) fn transactor_is_component(t: &TransactorDecl, env_held: bool) -> bool {
     let mut has_event = false;
     let mut has_in_event = false;
     let mut has_on_handler = false;
     let mut has_periodic_handler = false;
     let mut has_module_field = false;
+    let mut has_hookable = false;
     for it in t.items.iter().chain(t.when_active.iter().flatten()) {
         match it {
             ComponentItem::Field(f) => {
@@ -78,6 +86,7 @@ pub(crate) fn transactor_is_component(t: &TransactorDecl) -> bool {
             }
             ComponentItem::OnHandler(h) if !h.periodic => has_on_handler = true,
             ComponentItem::OnHandler(_) => has_periodic_handler = true,
+            ComponentItem::Hookable(_) => has_hookable = true,
             _ => {}
         }
     }
@@ -101,11 +110,70 @@ pub(crate) fn transactor_is_component(t: &TransactorDecl) -> bool {
     // cycle-trigger (`on dut.<sig>`, `on <expr> level`) or periodic
     // (`on <N> cycles`) handler. The component path already lowers these
     // handler shapes (against an optional `dut` handle + scoreboard/sub
-    // fields); they reach it here even without an event pipe. A purely
-    // structural transactor with only hookable methods and a DUT handle
-    // (no `on` at all) stays on the dedicated DUT-poking `TransactorSchema`
-    // path.
-    has_on_handler || has_periodic_handler
+    // fields); they reach it here even without an event pipe.
+    if has_on_handler || has_periodic_handler {
+        return true;
+    }
+    // Purely structural DUT-poking BFM: `hookable` methods + a
+    // module-typed DUT handle, no `on`/event/bound. The dedicated
+    // `TransactorSchema` path lowers it as a top-level testbench field
+    // (its method lambdas capture one specific instance), and that is its
+    // DEFAULT routing — the unit/contract tests and every standalone
+    // fixture rely on it staying a `TransactorSchema`. It routes to the
+    // composite-component table ONLY when an `env`/`agent` must hold it by
+    // value as a sub-component field (`env AxilEnv { drv : AxilXactor }`):
+    // then it must be a `ComponentSchema` so the env can hold it by value
+    // and `env.drv.<method>(...)` / `env.drv.dut = dut` resolve through the
+    // component sub-component machinery. v1 emits both placements
+    // identically (a struct with a `dut` handle + `<Type>_<method>(<Type>&
+    // self, ...)` free-function lambdas), which is exactly the
+    // component-method shape — so routing the env-held form here is
+    // v1-faithful.
+    //
+    // The arms above already excluded every `on`/event/bound shape, so
+    // `has_on_handler`/`has_periodic_handler` are both false here. We
+    // still require `has_hookable && !has_event` so this stays EXACTLY in
+    // lockstep with `transactor_is_dut_poking_bfm` (the classifier that
+    // feeds the `active`-mode gate).
+    env_held && has_hookable && has_module_field && !has_event
+}
+
+/// True when a transactor routes to the COMPONENT path purely as a
+/// **DUT-poking hookable BFM** — `hookable` methods + exactly the
+/// module-typed DUT handle, with NO `on`/event handler and no `bound to`,
+/// AND it is `env_held` (referenced as an env/agent sub-component field).
+/// Exactly the transactor `transactor_is_component`'s trailing arm admits.
+/// Such a transactor is a transactor at every binding site (its methods
+/// live under `when active`), so it requires an explicit `active` mode
+/// just like an event-driven consumer — even though it lowers to a
+/// `ComponentSchema`. A `passive` instance has no methods at all. Feeds
+/// the `dut_poking_bfm_names` `active`-mode gate; a NON-env-held BFM stays
+/// a `TransactorSchema` whose mode is handled by the `transactor_ids` gate.
+pub(crate) fn transactor_is_dut_poking_bfm(t: &TransactorDecl, env_held: bool) -> bool {
+    if !env_held || t.bound_to.is_some() {
+        return false;
+    }
+    let mut has_module_field = false;
+    let mut has_event = false;
+    let mut has_on_handler = false;
+    let mut has_hookable = false;
+    for it in t.items.iter().chain(t.when_active.iter().flatten()) {
+        match it {
+            ComponentItem::Field(f) => {
+                if is_event_field(f) {
+                    has_event = true;
+                } else if matches!(&f.ty, TypeExpr::Named { .. }) {
+                    has_module_field = true;
+                }
+            }
+            ComponentItem::OnHandler(_) => has_on_handler = true,
+            ComponentItem::Hookable(_) => has_hookable = true,
+            _ => {}
+        }
+    }
+    // Exactly the shape `transactor_is_component`'s trailing arm admits:
+    // hookable BFM + DUT handle, no event/on/periodic, env-held.
+    has_hookable && has_module_field && !has_event && !has_on_handler
 }
 
 /// True when a transactor is an *event-driven consumer* — it has an

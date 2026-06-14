@@ -342,6 +342,49 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // at each call site during body lowering.
     let helper_registry = helpers::HelperRegistry::build(&file)?;
 
+    // Type names referenced as a by-value sub-component FIELD of some
+    // `env`/`agent` declaration. A purely-structural DUT-poking BFM
+    // transactor routes to the composite-component table ONLY when it
+    // appears here (an env must hold it by value); standalone it stays a
+    // `TransactorSchema`. (Other component-routed transactor shapes —
+    // event-driven / reactive-monitor — route regardless of placement, so
+    // this set only changes the BFM trailing arm of
+    // `transactor_is_component`.) Computed once and reused at every
+    // `transactor_is_component(t, env_held)` site below.
+    let env_held_type_names: HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            // NB: a `testbench` parses as `Item::Env` with
+            // `ComponentKind::Testbench` — exclude it. A testbench FIELD
+            // (`xt : Xt active`) is a top-level instance binding, NOT an
+            // env holding the transactor by value; the BFM there stays a
+            // `TransactorSchema`. Only true `env`/`agent` sub-fields force
+            // the component routing.
+            Item::Env(c)
+                if matches!(
+                    c.kind,
+                    crate::ast::ComponentKind::Env | crate::ast::ComponentKind::Agent
+                ) =>
+            {
+                Some(c)
+            }
+            Item::Agent(c) => Some(c),
+            _ => None,
+        })
+        .flat_map(|c| c.items.iter())
+        .filter_map(|ci| match ci {
+            crate::ast::ComponentItem::Field(f) => match &f.ty {
+                TypeExpr::Named { name, .. } => {
+                    name.segments.last().map(|s| s.name.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let env_held = |t: &crate::ast::TransactorDecl| env_held_type_names.contains(&t.name.name);
+
     // Transactor names, for the file gate + testbench-field validation
     // (schemas lower after pure helpers so FunctionIds line up).
     let mut transactor_ids: HashMap<String, TransactorId> = HashMap::new();
@@ -351,7 +394,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             // A pure analysis-source transactor (event port + no DUT
             // field) routes to the composite-component table instead of
             // the DUT-poking `TransactorSchema` (classified below).
-            if components::transactor_is_component(t) {
+            if components::transactor_is_component(t, env_held(t)) {
                 continue;
             }
             if transactor_ids
@@ -408,7 +451,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             Item::Scoreboard(c) if components::scoreboard_is_component(c) => {
                 Some(c.name.name.clone())
             }
-            Item::Transactor(t) if components::transactor_is_component(t) => {
+            Item::Transactor(t) if components::transactor_is_component(t, env_held(t)) => {
                 Some(t.name.name.clone())
             }
             Item::Env(c) if matches!(c.kind, crate::ast::ComponentKind::Env) => {
@@ -448,6 +491,23 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         .iter()
         .filter_map(|it| match it {
             Item::Transactor(t) if components::transactor_is_reactive_monitor(t) => {
+                Some(t.name.name.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    // DUT-poking hookable BFM transactors (hookable methods + a DUT
+    // handle, no `on`/event/bound). They route to a `ComponentSchema`
+    // (so an `env` can hold one by value as a sub-component) but remain
+    // transactors at a binding site: their methods live under `when
+    // active`, so an instance requires an explicit `active` mode (same as
+    // `event_driven_transactor_names`; a `passive` instance has no
+    // methods). A disjoint subset of `component_type_names`.
+    let dut_poking_bfm_names: HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Transactor(t) if components::transactor_is_dut_poking_bfm(t, env_held(t)) => {
                 Some(t.name.name.clone())
             }
             _ => None,
@@ -544,6 +604,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                         &component_type_names,
                         &event_driven_transactor_names,
                         &reactive_monitor_names,
+                        &dut_poking_bfm_names,
                     )?;
                 } else if matches!(
                     c.kind,
@@ -745,7 +806,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // are rejected here rather than dropped.
     for it in &file.items {
         let Item::Transactor(t) = it else { continue };
-        if components::transactor_is_component(t) {
+        if components::transactor_is_component(t, env_held(t)) {
             continue;
         }
         let id = TransactorId(prog.transactors.len() as u32);
@@ -782,7 +843,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             Item::Scoreboard(c) if components::scoreboard_is_component(c) => {
                 (&c.name.name, components::CompSource::Scoreboard(c))
             }
-            Item::Transactor(t) if components::transactor_is_component(t) => {
+            Item::Transactor(t) if components::transactor_is_component(t, env_held(t)) => {
                 (&t.name.name, components::CompSource::Transactor(t))
             }
             Item::Env(c) if matches!(c.kind, crate::ast::ComponentKind::Env) => {
@@ -980,6 +1041,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &randomize_problem_ids,
             &tseq_records,
             &constraint_sites,
+            &dut_poking_bfm_names,
             &mut prog,
         )?;
     }
@@ -1008,6 +1070,7 @@ fn validate_testbench_component(
     component_type_names: &HashSet<String>,
     event_driven_transactor_names: &HashSet<String>,
     reactive_monitor_names: &HashSet<String>,
+    dut_poking_bfm_names: &HashSet<String>,
 ) -> Result<(), LowerError> {
     for ci in &c.items {
         match ci {
@@ -1050,6 +1113,42 @@ fn validate_testbench_component(
                                 return Err(unsupported(
                                     &format!(
                                         "an event-driven transactor field `{}.{} : {simple}` \
+                                         without an `active`/`passive` mode",
+                                        c.name.name, f.name.name
+                                    ),
+                                    "annotate the instance `active`",
+                                ));
+                            }
+                        }
+                    }
+                    // A DUT-poking hookable BFM transactor field (`drv :
+                    // CounterDriver active`). It routes to a
+                    // `ComponentSchema` (so an env can hold one by value)
+                    // but is still a transactor: its methods live under
+                    // `when active`, so it requires an explicit `active`
+                    // mode — exactly like the event-driven gate above. A
+                    // `passive` instance structurally lacks every method.
+                    // Checked before the composite-component gate (which
+                    // rejects any mode), since a BFM IS in
+                    // `component_type_names`.
+                    if dut_poking_bfm_names.contains(simple) {
+                        match mode {
+                            Some(TransactorMode::Active) => continue,
+                            Some(TransactorMode::Passive) => {
+                                return Err(unsupported(
+                                    &format!(
+                                        "a passive DUT-poking transactor field `{}.{} : \
+                                         {simple} passive`",
+                                        c.name.name, f.name.name
+                                    ),
+                                    "methods inside `when active` do not exist on a passive \
+                                     instance",
+                                ));
+                            }
+                            None => {
+                                return Err(unsupported(
+                                    &format!(
+                                        "a DUT-poking transactor field `{}.{} : {simple}` \
                                          without an `active`/`passive` mode",
                                         c.name.name, f.name.name
                                     ),
@@ -1221,6 +1320,7 @@ fn lower_test(
     randomize_problem_ids: &HashMap<(usize, usize), u32>,
     tseq_records: &HashMap<String, RecordId>,
     constraint_sites: &RefCell<Vec<ConstraintSite>>,
+    dut_poking_bfm_names: &HashSet<String>,
     prog: &mut TbProgram,
 ) -> Result<(), LowerError> {
     if !t.params.is_empty() {
@@ -1670,6 +1770,38 @@ fn lower_test(
                     ));
                 }
                 let simple = type_simple_name(l.ty.as_ref()).unwrap();
+                // A DUT-poking hookable BFM transactor routes to a
+                // `ComponentSchema`, so it lands in this component-let
+                // branch — but it is still a transactor: its methods live
+                // under `when active`, so a test-scope `let drv : X active`
+                // requires an explicit `active` mode (a `passive` instance
+                // has no methods). A genuine composite component (env /
+                // agent / scoreboard / sequencer) takes no mode.
+                if dut_poking_bfm_names.contains(simple) {
+                    match l.ty.as_ref() {
+                        Some(TypeExpr::Named { mode: Some(TransactorMode::Active), .. }) => {}
+                        Some(TypeExpr::Named { mode: Some(TransactorMode::Passive), .. }) => {
+                            return Err(unsupported(
+                                &format!(
+                                    "passive DUT-poking transactor instance `let {} : \
+                                     {simple} passive`",
+                                    l.name.name
+                                ),
+                                "methods inside `when active` do not exist on a passive instance",
+                            ));
+                        }
+                        _ => {
+                            return Err(unsupported(
+                                &format!(
+                                    "DUT-poking transactor instance `let {} : {simple}` without \
+                                     an `active`/`passive` mode",
+                                    l.name.name
+                                ),
+                                "annotate the instance `active`",
+                            ));
+                        }
+                    }
+                }
                 let cid = component_ids[simple];
                 test_scope_components.push((l.name.name.clone(), cid));
             }
