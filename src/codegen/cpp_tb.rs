@@ -8439,7 +8439,6 @@ impl Emitter {
         }
 
         let req_valid = self.bus_signal_name(&sig_prefix, &method.name.name, "req_valid");
-        let req_ready = self.bus_signal_name(&sig_prefix, &method.name.name, "req_ready");
         let req_tag = self.bus_signal_name(&sig_prefix, &method.name.name, "req_tag");
         let tag = if method.mode.name == "out_of_order" {
             let key = (sig_prefix.clone(), method.name.name.clone());
@@ -8491,17 +8490,25 @@ impl Emitter {
         self.pad(depth);
         writeln!(self.out, "{root}->{req_valid} = 1;").ok();
         self.pad(depth);
+        // Present the request (valid + tag + payload) for exactly the
+        // acceptance cycle, then deassert. An out-of-order target accepts
+        // combinationally — `req_ready` is high while the addressed tag's
+        // slot is idle and drops the same posedge the request is latched.
+        // We must NOT spin on `req_ready` before advancing: at this point
+        // the DUT mirror has not re-evaluated with the just-written
+        // `req_tag`, so `req_ready` still reflects the *previous* tag
+        // (whose slot may now be busy) — a stale 0 that would send the
+        // initiator into a multi-cycle hold, leaving `req_valid` asserted
+        // through a `valid && !ready` window and dropping it while the
+        // slot is busy. That trips the DUT's `_auto_tlm_*_req_stable`
+        // handshake assertion (a real protocol violation, not a false
+        // positive). Advancing exactly one cycle spans the accept edge
+        // with the new tag/payload held stable; deasserting the next
+        // cycle keeps the request out of any stalled window. (The
+        // response is collected later at join_all.)
         if self.in_coroutine {
-            writeln!(self.out, "{{ int _b = 16; while (!{root}->{req_ready} && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}").ok();
-            self.pad(depth);
             writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
         } else {
-            writeln!(
-                self.out,
-                "{{ int _b = 16; while (!{root}->{req_ready} && _b > 0) {{ tick(); _b--; }} }}"
-            )
-            .ok();
-            self.pad(depth);
             writeln!(self.out, "tick();").ok();
         }
         self.pad(depth);
