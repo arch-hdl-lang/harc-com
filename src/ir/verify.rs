@@ -950,6 +950,14 @@ impl Checker<'_> {
             // Component host state — resolved at lowering against the
             // component schema; no local/port dependency to verify here.
             Expr::ComponentField { .. } => {}
+            // A by-value component passed as a method arg. A `Local` base
+            // is a method-param local (verify it is defined); a
+            // `SelfField`/`Path` base is resolved at lowering.
+            Expr::ComponentValue { base } => {
+                if let crate::ir::ComponentBase::Local(l) = base {
+                    self.check_local(*l);
+                }
+            }
             // Component-queue size/empty read — host state resolved at
             // lowering against the component schema; nothing to verify.
             Expr::ComponentQueueQuery { .. } => {}
@@ -1152,7 +1160,9 @@ fn check_def_before_use(
                 Stmt::ScoreboardOp {
                     op: crate::ir::ScoreboardOp::QueuePop { dest: l, .. },
                     ..
-                } => {
+                }
+                | Stmt::ComponentCall { dest: Some(l), .. }
+                | Stmt::ComponentQueuePop { dest: l, .. } => {
                     if l.index() < d.len() {
                         d[l.index()] = true;
                     }
@@ -1396,6 +1406,11 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
         | Expr::ComponentField { .. }
         | Expr::ScoreboardQuery { .. }
         | Expr::ComponentQueueQuery { .. } => {}
+        Expr::ComponentValue { base } => {
+            if let crate::ir::ComponentBase::Local(l) = base {
+                f(*l);
+            }
+        }
         Expr::Local(l) => f(*l),
         Expr::RecordField { local, index, .. } => {
             f(*local);

@@ -21,8 +21,8 @@
 //! v1 uses — identical scheduler interaction, identical cycle timing.
 
 use super::expr::{
-    ECx, comp_base_cpp, escape_c, expr_cpp, fmt_arg_cpp, helper_cpp_name, lane_width, port_read,
-    port_signal, probe_read_accessor, wide_words_over_128,
+    ECx, comp_base_cpp, comp_base_cpp_subst_cx, escape_c, expr_cpp, fmt_arg_cpp, helper_cpp_name,
+    lane_width, port_read, port_signal, probe_read_accessor, wide_words_over_128,
 };
 use crate::codegen::cpp_tb::EmitError;
 use crate::ir::{
@@ -818,7 +818,7 @@ fn emit_stmt(
                     func.name, component.0
                 ))
             })?;
-            let mut rendered = vec![comp_base_cpp(base)];
+            let mut rendered = vec![comp_base_cpp_subst_cx(cx, base)];
             for a in args {
                 rendered.push(expr_cpp(cx, a)?);
             }
@@ -1629,10 +1629,19 @@ fn emit_component_fn_lambda(
     let pad2 = INDENT.repeat(depth + 2);
     let pad3 = INDENT.repeat(depth + 3);
 
-    let ret_ty = if func.ret.is_some() { "uint64_t" } else { "void" };
+    // A record-returning method (`function predict_read(...) ->
+    // ReadResponse`) returns the record struct by value; a scalar return
+    // widens to uint64_t; no return is `void`.
+    let ret_ty = match func.ret.map(|r| &func.locals[r.index()].ty) {
+        Some(IrType::Record(r)) => prog.records[r.index()].name.clone(),
+        Some(_) => "uint64_t".to_string(),
+        None => "void".to_string(),
+    };
     // The receiver `self`, then one parameter per declared param — a
     // record param (`on in_ev(t)` with `event<TinyTxn>`) is taken by
-    // value as the record struct; every other param widens to uint64_t.
+    // value as the record struct; a component-typed param (`observe(addr,
+    // model: ProtocolModel)`) by value as the component struct; every
+    // other param widens to uint64_t.
     let mut params = vec![format!("{}& self", comp.name)];
     for (i, n) in names[..nparams].iter().enumerate() {
         let pty = match func.locals[i].ty {
@@ -1641,6 +1650,7 @@ fn emit_component_fn_lambda(
             // `hookable dispatch(txns: TSeq<RegOp>)`) is taken by value as
             // `std::vector<Record>`, matching the tseq generator's return.
             IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
+            IrType::Component(c) => prog.components[c.index()].name.clone(),
             _ => "uint64_t".to_string(),
         };
         params.push(format!("{pty} {n}"));
@@ -1705,8 +1715,11 @@ fn emit_component_fn_lambda(
         writeln!(out, "{pad3}break;").ok();
         writeln!(out, "{pad2}}}").ok();
     }
+    // The unreachable switch default returns a value-initialized result —
+    // `{}` covers both a record struct and a scalar (zero), matching the
+    // `default: return 0;` for scalars while compiling for a record return.
     match func.ret {
-        Some(_) => writeln!(out, "{pad2}default: return 0;").ok(),
+        Some(_) => writeln!(out, "{pad2}default: return {{}};").ok(),
         None => writeln!(out, "{pad2}default: return;").ok(),
     };
     writeln!(out, "{pad2}}}").ok(); // switch

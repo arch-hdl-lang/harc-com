@@ -1104,6 +1104,13 @@ pub enum IrType {
     /// consumed by `for t in <seq>` iteration (`Expr::SeqLen` +
     /// `Expr::SeqIndex`).
     RecordSeq(RecordId),
+    /// A composite-component value local — a method parameter typed by a
+    /// component name (`observe(addr: uint<8>, model: ProtocolModel)`).
+    /// Taken by value as the component's C++ struct; method calls on it
+    /// (`model.predict_read(addr)`) dispatch through `ComponentBase::Local`.
+    /// Only ever a parameter local in this subset — never a `let` body
+    /// local — so it has no value-construction or randomize support.
+    Component(ComponentId),
     Unknown,
 }
 
@@ -1384,6 +1391,10 @@ pub enum ComponentBase {
     /// segment is the test field; the rest are nested sub-component
     /// fields. Emitted as `env.source` (dot-joined, all by-value).
     Path(Vec<String>),
+    /// A component-typed method-parameter local (`model` in
+    /// `observe(addr, model: ProtocolModel)`). The receiver is the local
+    /// itself, passed by value. Emitted as the local's C++ name.
+    Local(LocalId),
 }
 
 /// A scoreboard mutation. The design doc pins this as a tagged enum
@@ -1582,6 +1593,13 @@ pub enum Expr {
     /// scoreboard-style ops which are out of subset for components in v0;
     /// events are written via `connect`/`emit` only).
     ComponentField { base: ComponentBase, field: String },
+    /// A whole composite-component value, passed by value as a method
+    /// argument: `sb.observe(addr, model)` reads `model` here, where the
+    /// callee parameter is component-typed. `base` resolves the receiver
+    /// (a `self` sub-component field, or a test-scope component path).
+    /// Emitted as the C++ struct value at `base` (a by-value copy at the
+    /// call), mirroring v1's `ResponseScoreboard_observe(..., model)`.
+    ComponentValue { base: ComponentBase },
     /// A value-producing read on a composite-component `queue<T>` field:
     /// `<base>.<queue>.size()` / `.empty()`. Host state — allowed wherever
     /// a `Local` is. `.pop()` is NOT here (it mutates) — it lowers to

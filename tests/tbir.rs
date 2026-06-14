@@ -4524,3 +4524,20 @@ fn scoreboard_typed_queue_dump_ir_snapshot() {
     verify::verify_program(&prog).expect("verifies");
     insta::assert_snapshot!("scoreboard_typed_queue_dump_ir", format!("{prog}"));
 }
+
+/// `post_eval_provider_test` — the composite cluster: a function-library
+/// transactor (`ProtocolModel`: a pure `predict_read(addr) ->
+/// ReadResponse` method, no DUT/event/`on`) held as a sub-field and a
+/// testbench field, a component-typed method parameter (`observe(addr,
+/// model: ProtocolModel)`) dispatched on (`model.predict_read(addr)`), a
+/// component passed by value as a method arg (`sb.observe(addr, model)`),
+/// a record-returning method bound by `let r : ReadResponse =
+/// model.predict_read(...)`, and an `on 1 cycles phase post_eval` handler.
+/// Locks: `IrType::Component` params, `ComponentBase::Local` dispatch,
+/// `Expr::ComponentValue` args, record-typed `ComponentCall` dest.
+#[test]
+fn post_eval_provider_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("post_eval_provider_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("post_eval_provider_dump_ir", format!("{prog}"));
+}
