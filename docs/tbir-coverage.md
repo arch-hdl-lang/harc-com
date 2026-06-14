@@ -50,28 +50,37 @@ trace-diff clean v1↔tbir at seed 1. See the **probe/force group** below.
 
 The TB-IR (`--codegen tbir`) backend now covers the **entire admissible
 HARC fixture corpus**. The registry (`tests/tbir_equiv_fixtures.txt`)
-holds **119 rows**, every one passing under BOTH `--codegen v1` and
+holds **120 rows**, every one passing under BOTH `--codegen v1` and
 `--codegen tbir` with `harc trace-diff` clean at seed 1
-(`tests/run_tbir_equiv.sh` = 118 fixture-pairs + the registry-only
+(`tests/run_tbir_equiv.sh` = 119 fixture-pairs + the registry-only
 `fatal_path_test` deliberate-failure row). The closing wave (#401–#405)
 landed the last constructs: the wide-value (>64-bit) method ABI
 (`aes_cipher`), the transactor-composition cluster (reactive-monitor
 routing / `dma_engine`; `queue<Record>` + `phase post_eval` /
 `scoreboard_typed_queue`; env-of-DUT-poking-BFM / `axilite_env`;
 function-library transactor + component-arg dispatch /
-`post_eval_provider`).
+`post_eval_provider`); and finally `tlm_pairing_arch_target_test`, after
+the OOO TLM-initiator handshake fix below.
 
 **`LowerError::Unsupported` is empty for every fixture that can be
-equivalence-gated.** Two categories of fixture remain outside the
-registry, by construction — not coverage gaps:
+equivalence-gated.** The previously-excluded `tlm_pairing_arch_target_test`
+is now registered and passes under both codegens (incl. the ARCH-native
+sweep). Its DUT-side `_auto_tlm_*_req_stable` SVA was **not** the bug — it
+is the standard, correct AXI-style handshake-stability rule. The real
+defect was in HARC's own OOO TLM *initiator* BFM: at a `fork`-issue it
+sampled `req_ready` *before* the DUT mirror re-evaluated with the just-
+written `req_tag`, reading a stale `0` (the previous tag's now-busy slot)
+and entering a multi-cycle hold that left `req_valid` asserted through a
+`valid && !ready` window, then dropped it while the slot was busy — a real
+handshake violation the SVA correctly caught. Fixed in
+`src/codegen/{cpp_tb.rs,tbir/func.rs}` (present the request for exactly the
+acceptance cycle, then deassert); arch-com issue #588 closed as
+not-an-arch-bug. The TB-IR lowering was always correct.
 
-1. **`tlm_pairing_arch_target_test` — excluded (arch-com DUT bug, not a
-   TB-IR gap).** Its auto-emitted DUT-side `_auto_tlm_*_req_stable` SVA
-   over-asserts on back-to-back tagged forks and `$fatal`s under any
-   simulator (not a local-version artifact). Tracked as an arch-com
-   issue; the TB-IR lowering itself is correct.
+One category of fixture remains outside the registry, by construction —
+not a coverage gap:
 
-2. **Six non-equivalence-gateable single-file fixtures (triaged
+- **Six non-equivalence-gateable single-file fixtures (triaged
    2026-06-13).** The equivalence gate requires a fixture to pass under
    `--codegen v1` too; these cannot, so they are out of scope:
 
@@ -401,7 +410,7 @@ next blocker; exact `Unsupported` message in parentheses):
 | **(resolved 2026-06-13)** initiator-side `fork`/`join_all` TLM issue | ~~`tlm_method_bus_test`~~ (registered, pass) — see the initiator-side fork/join_all section below |
 | **(resolved 2026-06-13)** a `fork`/blocking call INSIDE a transactor responder body (nested forwarding — target re-issuing a downstream TLM call) | ~~`tlm_target_forwarding_test`, `tlm_target_fork_forwarding_test`~~ (both registered, pass) — see the nested-forwarding section below |
 | **(resolved 2026-06-13)** target-side `out_of_order tags N` RESPONDER threads (hidden tag wires + multi-lane response router) | ~~`tlm_target_ooo_lanes_test`, `tlm_pairing_arch_initiator_test`~~ (both registered, pass) — see the OOO-responder lanes section below |
-| **(equivalence-proven, gate-blocked)** `tlm_pairing_arch_target_test` | LOWERS + v1↔tbir trace-diff clean, but its ARCH-DUT auto-emitted `_auto_tlm_*_req_stable` TLM SVA `$fatal`s under local Verilator 5.048 for BOTH codegens identically — known local-only artifact, NOT registered |
+| **(resolved 2026-06-14)** `tlm_pairing_arch_target_test` | registered, pass (v1==tbir, incl. ARCH-native sweep). Its `_auto_tlm_*_req_stable` SVA was correct; the real bug was the OOO TLM initiator holding `req_valid` past acceptance — fixed in `src/codegen/{cpp_tb.rs,tbir/func.rs}`. See the OOO-initiator-handshake note below; arch-com #588 closed as not-an-arch-bug. |
 | **(resolved 2026-06-13)** `bind ... with { ... }` signal remaps | ~~`dma_engine_tlm_target_test`, `dma_engine_tlm_mem_model_test`~~ — see the bus-bind-remap section below |
 | **(resolved 2026-06-13)** initiator-side bus-bound BFM (`hookable` bodies driving handshake channels) | ~~`regblock_*`~~ — see the initiator-side BFM section below |
 
@@ -473,8 +482,29 @@ v1-vs-tbir equivalence pair, trace-diff clean):
 over an OOO downstream bus). See docs/tbir-mvp.md, the nested-forwarding
 slice. A responder SERVING an `out_of_order tags N` method (the
 OOO-responder LANE form — distinct from forwarding) is now resolved too;
-see the OOO-responder lanes section above. **Still gate-blocked** (not a
-lowering gap): the known-artifact `tlm_pairing_arch_target_test`.
+see the OOO-responder lanes section above. The last TLM holdout,
+`tlm_pairing_arch_target_test`, is now registered and passing after the
+OOO-initiator-handshake fix (see the note below); arch-com #588 closed as
+not-an-arch-bug (the SVA was correct).
+
+### OOO TLM initiator handshake — RESOLVED 2026-06-14
+
+`tlm_pairing_arch_target_test` had lowered and trace-diffed clean for a
+while but `$fatal`ed under Verilator on the ARCH DUT's auto-emitted
+`_auto_tlm_mem_read_ooo_req_stable` SVA. Root cause was **not** the
+assertion (a correct AXI-style handshake-stability rule) but HARC's own
+OOO TLM *initiator* BFM: at a `fork`-issue the emitted C++ sampled
+`req_ready` *before* the DUT mirror re-evaluated with the just-written
+`req_tag`, so it read a stale `0` (the previous tag pointing at a now-busy
+slot) and span its bounded wait loop — leaving `req_valid` asserted for
+~30 cycles through a `valid && !ready` window, then dropping it while the
+slot was still busy. That deassertion-while-stalled is a genuine handshake
+violation, which the SVA correctly flagged. Fix: present the request
+(valid + tag + payload) for exactly the acceptance cycle, then deassert —
+in both emitters (`src/codegen/cpp_tb.rs::try_emit_bus_tlm_fork` and
+`src/codegen/tbir/func.rs::emit_tlm_fork`). Verified: the fixture now
+passes under Verilator (SVA intact) for both `--codegen v1` and `tbir`,
+and under the ARCH-native sim sweep.
 
 ### initiator-side `fork`/`join_all` TLM issue — RESOLVED 2026-06-13
 
@@ -573,14 +603,14 @@ fixture pairing an ARCH OOO initiator with HARC `blocking` +
 `out_of_order tags 2` RESPONDERS) is now fully lowered and registered —
 see the OOO-responder lanes section above.
 
-\* `tlm_pairing_arch_target_test` now LOWERS through the initiator-side
-fork/join_all slice and is v1↔tbir trace-diff clean, but its ARCH-DUT
-auto-emitted `_auto_tlm_mem_read_ooo_req_stable` TLM SVA `$fatal`s under
-local Verilator 5.048 for BOTH codegens identically (the known local-only
-5.048-vs-CI-5.034 SVA verdict issue). It is NOT registered — the local
-equivalence gate cannot be satisfied — but the equivalence itself is
-proven (identical verdict + clean trace-diff). It should pass on CI's
-Verilator; register it there once confirmed.
+\* `tlm_pairing_arch_target_test` is now REGISTERED and passing (v1==tbir,
+clean trace-diff, incl. ARCH-native sweep). It had `$fatal`ed on the ARCH
+DUT's `_auto_tlm_mem_read_ooo_req_stable` SVA — but that assertion was
+correct; the bug was the OOO TLM initiator deasserting `req_valid` while
+the request was still stalled (it sampled a stale `req_ready` at fork-issue
+and over-held `valid`). Fixed in both emitters — see the "OOO TLM initiator
+handshake — RESOLVED 2026-06-14" note above. arch-com #588 closed as
+not-an-arch-bug.
 
 ### `wait N cycles on <clock>` — 5 fixtures — **RESOLVED 2026-06-12**
 
