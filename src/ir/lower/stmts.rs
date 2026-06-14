@@ -282,6 +282,37 @@ impl FuncBuilder<'_> {
                         ));
                     }
                 }
+                // Statement-position component-queue op:
+                // `errors.push(e)` (self) / `checker.sb.errors.push(e)`
+                // (path). `.pop()` in statement position is rejected (its
+                // value must be bound), mirroring the scoreboard form.
+                if let ExprKind::Call { callee, args } = &*e.kind {
+                    if let Some((base, queue, method)) = self.as_component_queue_call(callee)? {
+                        if method == "push" {
+                            let [CallArg::Expr(arg)] = args.as_slice() else {
+                                return Err(LowerError::Invalid(format!(
+                                    "component `{queue}.push` takes exactly one positional argument"
+                                )));
+                            };
+                            let value = self.lower_expr_no_ports(arg)?;
+                            self.push(Stmt::ComponentQueuePush { base, queue, value });
+                            return Ok(());
+                        }
+                        if method == "pop" {
+                            return Err(unsupported(
+                                &format!("a discarded `{queue}.pop()`"),
+                                "bind the popped value: `let v = <recv>.{queue}.pop()`",
+                            ));
+                        }
+                        return Err(unsupported(
+                            &format!(
+                                "component queue method `{queue}.{method}(...)` in statement \
+                                 position"
+                            ),
+                            "",
+                        ));
+                    }
+                }
                 // Statement-position component method call:
                 // `env.source.publish(3)` — call for effect, result (if
                 // any) discarded.
@@ -347,6 +378,33 @@ impl FuncBuilder<'_> {
         }
         if l.bind {
             return Err(unsupported("`= bind ...` declarations", ""));
+        }
+        // `let v = <recv>.<queue>.pop()` on a composite-component queue —
+        // pop the front into a new local. Checked before the record-typed
+        // / scalar let-RHS forms: a record-element pop is `let err :
+        // CheckerError = ...pop()` (a record-typed let WITH an initializer,
+        // which the record-local block below rejects). The popped local's
+        // type comes from the queue element (record id from the field, or a
+        // scalar width from the optional `let` annotation).
+        if let Some(call) = pop_call_callee(&l.value) {
+            if let Some((base, queue, method)) = self.as_component_queue_call(call)? {
+                if method == "pop" {
+                    let elem = self.component_queue_elem(&base, &queue)?;
+                    let id = self.declare(&l.name.name);
+                    match elem {
+                        crate::ir::QueueElem::Record(rid) => {
+                            self.set_local_type(id, IrType::Record(rid));
+                        }
+                        crate::ir::QueueElem::Scalar { .. } => {
+                            if let Some(w) = l.ty.as_ref().and_then(typed_let_width) {
+                                self.let_widths.insert(id, w);
+                            }
+                        }
+                    }
+                    self.push(Stmt::ComponentQueuePop { base, queue, dest: id });
+                    return Ok(());
+                }
+            }
         }
         // Record-typed local: `let t : TxnType` default-constructs (v1
         // declares the struct at the let site, so field defaults re-run
@@ -582,6 +640,14 @@ impl FuncBuilder<'_> {
         // copy is cosmetic; v1 emits `_tb.drv.dut = dut;` with no
         // observable effect on a well-formed program.
         if self.lower_component_dut_bind(target, value)? {
+            return Ok(());
+        }
+        // Composite-component whole-value copy of a sub-component:
+        // `checker.sb = sb` / `responder.model = model`. The LHS terminal
+        // field is a `Sub` component field; the RHS is a test-scope
+        // component value. Checked before the scalar-field write (whose
+        // resolver would reject the non-scalar `Sub` field).
+        if self.lower_component_sub_assign(target, value)? {
             return Ok(());
         }
         // Composite-component scalar field write — self-relative inside a
@@ -1450,6 +1516,16 @@ impl FuncBuilder<'_> {
             });
         }
         Ok(FmtArgs { fmt, args })
+    }
+}
+
+/// The `callee` of a `let ... = <callee>(...)` initializer when the RHS is
+/// a call (the shape a `.pop()` access takes), or `None`.
+fn pop_call_callee(value: &Option<crate::ast::Expr>) -> Option<&crate::ast::Expr> {
+    let v = value.as_ref()?;
+    match &*v.kind {
+        ExprKind::Call { callee, .. } => Some(callee),
+        _ => None,
     }
 }
 

@@ -364,6 +364,21 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 host_service_only = false;
                 visit_expr(value, &mut accesses, &mut transactor);
             }
+            Stmt::ComponentQueuePush { value, .. } => {
+                // Host state on a component `queue<T>` field — no pin access
+                // of its own; the pushed value may carry inline reads.
+                host_service_only = false;
+                visit_expr(value, &mut accesses, &mut transactor);
+            }
+            Stmt::ComponentQueuePop { .. } => {
+                // Pop into a host local — pure host state, no value expr.
+                host_service_only = false;
+            }
+            Stmt::ComponentSubAssign { .. } => {
+                // Whole sub-component value copy — pure host state, no pin
+                // access and no inline-readable value expr.
+                host_service_only = false;
+            }
             Stmt::TlmFork(desc) => {
                 // A `fork bus.m(...)` request issue is the TLM seam, like a
                 // blocking transactor call: timing-tolerant at the call
@@ -485,6 +500,7 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
         | Expr::TransactorState { .. }
         | Expr::ScoreboardQuery { .. }
         | Expr::ComponentField { .. }
+        | Expr::ComponentQueueQuery { .. }
         | Expr::SeqLen(_)
         | Expr::CovBin { .. } => {}
     }

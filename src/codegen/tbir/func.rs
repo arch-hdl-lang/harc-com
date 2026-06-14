@@ -832,6 +832,31 @@ fn emit_stmt(
                 }
             }
         }
+        // `<recv>.<queue>.push(value)` on a composite-component `queue<T>`
+        // field — `self.errors.push(err)` inside a method body, or
+        // `checker.sb.errors.push(e)` from the test. Mirrors v1's
+        // `HarcQueue::push`.
+        Stmt::ComponentQueuePush { base, queue, value } => {
+            let e = expr_cpp(cx, value)?;
+            writeln!(out, "{pad}{}.{queue}.push({e});", comp_base_cpp(base)).ok();
+        }
+        // `let v = <recv>.<queue>.pop()` — pop the queue front into a local.
+        Stmt::ComponentQueuePop { base, queue, dest } => {
+            let name = &names[dest.index()];
+            writeln!(out, "{pad}{name} = {}.{queue}.pop();", comp_base_cpp(base)).ok();
+        }
+        // `<dst>.<field> = <src>` — whole sub-component value copy
+        // (`checker.sb = sb`). A plain C++ struct copy of two run-scope
+        // component locals (v1's `_tb.checker.sb = _tb.sb;`).
+        Stmt::ComponentSubAssign { dst, field, src } => {
+            writeln!(
+                out,
+                "{pad}{}.{field} = {};",
+                comp_base_cpp(dst),
+                comp_base_cpp(src)
+            )
+            .ok();
+        }
         // `yield t` — append a record value to the sequence accumulator
         // (v1's `_result.push_back(t)`).
         Stmt::SeqPush { seq, value } => {

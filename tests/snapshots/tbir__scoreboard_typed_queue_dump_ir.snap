@@ -1,0 +1,95 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 Tb { dut: ScoreboardTypedQueue }
+  test ScoreboardTypedQueueTest tb=tb0 run=fn2 check=-
+  record r0 CheckerError
+    checker_id : uint<8>
+    code : uint<16>
+    got : uint<64>
+    expected : uint<64>
+  component c0 GlobalScoreboard (scoreboard)
+    field errors : queue<CheckerError>
+    method record_error(4 args) = fn0
+  component c1 Checker (transactor)
+    field dut : dut ScoreboardTypedQueue
+    field sb : sub c0
+    on 1 cycles phase post_eval = fn1
+
+fn fn0 comp_method_0 [kind=ComponentMethod(c0)]
+  params:
+    checker_id : uint<8>
+    code : uint<16>
+    got : uint<64>
+    expected : uint<64>
+  locals:
+    %0 checker_id : uint<8>
+    %1 code : uint<16>
+    %2 got : uint<64>
+    %3 expected : uint<64>
+    %4 err : record(r0)
+  entry = b0
+
+  b0:
+    RecordInit(%err, r0)
+    RecordFieldWrite(%err.checker_id, %checker_id)
+    RecordFieldWrite(%err.code, %code)
+    RecordFieldWrite(%err.got, %got)
+    RecordFieldWrite(%err.expected, %expected)
+    ComponentQueuePush(self.errors, %err)
+    -> Return
+
+fn fn1 comp_periodic_1 [kind=ComponentMethod(c1)]
+  locals:
+    %0 __t0 : unknown
+    %1 __t1 : unknown
+    %2 __t2 : unknown
+    %3 __t3 : unknown
+  entry = b0
+
+  b0:
+    DutRead(%__t0, dut.dut_value)
+    DutRead(%__t1, dut.expected_value)
+    -> Branch((%__t0 != %__t1), b2, b3)
+
+  b1:
+    -> Return
+
+  b2:
+    DutRead(%__t2, dut.dut_value)
+    DutRead(%__t3, dut.expected_value)
+    ComponentCall(self.sb.c0::record_error([1, 4097, %__t2, %__t3]))
+    -> Jump(b1)
+
+  b3:
+    -> Jump(b1)
+
+fn fn2 run_ScoreboardTypedQueueTest [kind=Run, owner=tb0]
+  locals:
+    %0 err : record(r0)
+  entry = b0
+
+  b0:
+    ComponentSubAssign(checker.sb = sb)
+    DutWrite(dut.rst_n, 1)
+    -> WaitCycles(2, b1)
+
+  b1:
+    -> Branch((ComponentQueueQuery(checker.sb.errors.size()) == 0), b3, b4)
+
+  b2:
+    -> Return
+
+  b3:
+    AssertCheck { cond: 0, on_fail: "expected typed scoreboard error" }
+    -> Jump(b2)
+
+  b4:
+    ComponentQueuePop(%err = checker.sb.errors.pop())
+    AssertCheck { cond: (%err.checker_id == 1), on_fail: "bad checker id" }
+    AssertCheck { cond: (%err.code == 4097), on_fail: "bad error code" }
+    AssertCheck { cond: (%err.got == 7), on_fail: "bad got value" }
+    AssertCheck { cond: (%err.expected == 9), on_fail: "bad expected value" }
+    -> Jump(b2)

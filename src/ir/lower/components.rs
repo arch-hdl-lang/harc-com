@@ -455,6 +455,7 @@ pub(crate) fn lower_component_schema(
         periodic_handlers.push(crate::ir::PeriodicHandlerSchema {
             period: crate::ir::Expr::CycleCount, // placeholder; pass 2 fills it
             function: fid,
+            phase: crate::ir::HandlerPhase::from_ast(h.phase),
         });
     }
 
@@ -614,10 +615,9 @@ fn validate_cycle_handler(comp: &str, h: &crate::ast::OnHandler) -> Result<(), L
 }
 
 /// Validate an `on <N> cycles ... end on` periodic handler: it must carry
-/// no `pre`/`post` hook side and (in this component subset) the default
-/// `Checker` phase. A `post_eval`-phased periodic handler is a transactor/
-/// monitor reactive form handled by the transactor lowering, not the
-/// agent-component path here.
+/// no `pre`/`post` hook side. Both the default `Checker` phase and the
+/// `phase post_eval` form lower (the phase selects the dispatch vector —
+/// `_checkers` vs `_post_eval_services`).
 fn validate_periodic_handler(
     comp: &str,
     h: &crate::ast::OnHandler,
@@ -626,12 +626,6 @@ fn validate_periodic_handler(
         return Err(unsupported(
             &format!("a `pre`/`post` hook on an `on <N> cycles` handler on `{comp}`"),
             "periodic handlers take no hook side",
-        ));
-    }
-    if !matches!(h.phase, crate::ast::OnPhase::Checker) {
-        return Err(unsupported(
-            &format!("a non-default-phase `on <N> cycles` handler on `{comp}`"),
-            "only the default (checker) phase is lowered for component periodic handlers",
         ));
     }
     Ok(())
@@ -755,22 +749,13 @@ fn lower_field(
                     "",
                 ));
             }
-            // The element type must be a scalar ≤ 64 bits in this subset. A
-            // `queue<Record>` element (`errors : queue<CheckerError>`) needs
-            // the component-queue-op + record-payload seam — reject it
-            // precisely rather than silently mis-lowering a named element as
-            // an unsigned scalar (the prior `_ => false` fall-through).
-            let signed = match queue_elem_signedness(args.first()) {
-                Some(s) => s,
-                None => {
-                    return Err(unsupported(
-                        &format!("a non-scalar queue element on `{comp}.{fname}`"),
-                        "only `queue<scalar ≤ 64 bits>` is lowered; a `queue<Record>` \
-                         element gates on the component-queue record-payload slice",
-                    ));
-                }
-            };
-            Ok(ComponentFieldKind::Queue { signed })
+            // The element is a scalar ≤ 64 bits or a value-record
+            // (`errors : queue<CheckerError>`). A record element lowers to a
+            // `harc_rt::HarcQueue<Rec>` and is manipulated through the
+            // component-queue ops; anything else (enum / Vec / >64-bit /
+            // unknown named type) is rejected precisely.
+            let elem = lower_queue_elem(comp, fname, args.first(), record_ids)?;
+            Ok(ComponentFieldKind::Queue { elem })
         }
         // Scalar counter, or a nested sub-component (`source :
         // AnalysisSource passive` / `sb : AnalysisSb`).
@@ -1518,29 +1503,66 @@ pub(crate) fn dotted_path(e: &crate::ast::Expr) -> Option<Vec<String>> {
     }
 }
 
-/// The signedness of a `queue<scalar>` component-field element, or `None`
-/// when the element is not a scalar ≤ 64 bits. A named element — a record
-/// (`queue<CheckerError>`) or an unknown type — returns `None` whether it
-/// parsed as `TypeArg::Type(Named)`, `TypeArg::Expr(Ident)`, or
-/// `TypeArg::Named`; the caller rejects it precisely. This must NOT
-/// silently fall through to "unsigned scalar" (the prior `_ => false`
-/// behavior, which mis-lowered a `queue<Record>` element as `uint64_t`).
-fn queue_elem_signedness(arg: Option<&TypeArg>) -> Option<bool> {
+/// Resolve the `<T>` inside a `queue<T>` component-field element to its
+/// `QueueElem`. Mirrors `lower_event_payload`:
+///   * a scalar (`uint<W>`/`sint<W>`/`bool` ≤ 64 bits) → `Scalar`;
+///   * a user-named `transaction`/`struct` → `Record` (carried by value).
+///
+/// A scalar element parses as `TypeArg::Type`; a user-named record element
+/// parses as a bare identifier (`TypeArg::Expr(Ident)`) or, in some
+/// positions, `TypeArg::Type(Named)`. A named type that is neither a
+/// scalar nor a known record (enum / Vec / nested / unknown) is rejected
+/// precisely.
+fn lower_queue_elem(
+    comp: &str,
+    fname: &str,
+    arg: Option<&TypeArg>,
+    record_ids: &HashMap<String, RecordId>,
+) -> Result<crate::ir::QueueElem, LowerError> {
+    use crate::ir::QueueElem;
+    let reject_named = |named: &str| -> LowerError {
+        unsupported(
+            &format!("a non-scalar queue element `{named}` on `{comp}.{fname}`"),
+            "only `queue<scalar ≤ 64 bits>` and `queue<transaction|struct>` elements \
+             are lowered; enum/Vec/nested elements gate on a later slice",
+        )
+    };
     match arg {
+        // Scalar element (`queue<uint<32>>`), or a single-segment named
+        // record the type-arg layer parsed as a Type.
         Some(TypeArg::Type(ty)) => {
-            // A named element (record or any other named type) is not a
-            // scalar — `scalar_ir_type` only resolves builtins, returning
-            // `None` for a `Named` type, so the match below rejects it.
+            if let Some(name) = type_arg_simple_name(ty) {
+                if let Some(rid) = record_ids.get(name) {
+                    return Ok(QueueElem::Record(*rid));
+                }
+            }
             match scalar_ir_type(ty) {
-                Some(IrType::SInt(_)) => Some(true),
-                Some(IrType::UInt(_)) | Some(IrType::Bool) => Some(false),
-                _ => None,
+                Some(IrType::SInt(_)) => Ok(QueueElem::Scalar { signed: true }),
+                Some(IrType::UInt(_)) | Some(IrType::Bool) => {
+                    Ok(QueueElem::Scalar { signed: false })
+                }
+                _ => Err(reject_named(type_arg_simple_name(ty).unwrap_or("<expr>"))),
             }
         }
-        // A bare-identifier (`queue<CheckerError>`) or keyword-style arg is
-        // never a scalar element in this subset.
-        Some(TypeArg::Expr(_)) | Some(TypeArg::Named { .. }) => None,
-        None => Some(false),
+        // `queue<CheckerError>` parses the element as a bare identifier.
+        Some(TypeArg::Expr(e)) => {
+            if let ExprKind::Ident(id) = &*e.kind {
+                if let Some(rid) = record_ids.get(&id.name) {
+                    return Ok(QueueElem::Record(*rid));
+                }
+                return Err(reject_named(&id.name));
+            }
+            Err(unsupported(
+                &format!("a non-identifier queue element on `{comp}.{fname}`"),
+                "only `queue<scalar ≤ 64 bits>` and `queue<transaction|struct>` elements \
+                 are lowered",
+            ))
+        }
+        Some(TypeArg::Named { name, .. }) => Err(reject_named(&name.name)),
+        None => Err(unsupported(
+            &format!("a `queue` with no element type on `{comp}.{fname}`"),
+            "declare the element type: `queue<uint<W>>` / `queue<Record>`",
+        )),
     }
 }
 
@@ -1761,7 +1783,221 @@ impl super::FuncBuilder<'_> {
                 }
             }
         }
+        // Self-relative sub-component call: `sb.record_error(...)` inside a
+        // transactor/component body, where `sb` is a self sub-component
+        // field (a `Sub` to a method-bearing component). The receiver is a
+        // `self`-rooted path the emitter re-roots at the running instance.
+        if let ExprKind::Field { target, name: method } = &*callee.kind {
+            if let ExprKind::Ident(sub) = &*target.kind {
+                if self.lookup(&sub.name).is_none() {
+                    if let Some(self_cid) = self.self_component {
+                        let comp = &self.ctx.components[self_cid.index()];
+                        if let Some(ComponentFieldKind::Sub { component }) =
+                            comp.field(&sub.name).map(|f| &f.kind)
+                        {
+                            let sub_comp = &self.ctx.components[component.index()];
+                            if sub_comp.method(&method.name).is_some() {
+                                return Ok(Some((
+                                    ComponentBase::Path(vec![
+                                        "self".to_string(),
+                                        sub.name.clone(),
+                                    ]),
+                                    *component,
+                                    method.name.clone(),
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Ok(None)
+    }
+
+    /// Resolve a `<recv>.<queue>.<method>(...)` access on a composite-
+    /// component `queue<T>` field. Two receiver shapes (mirroring the
+    /// scalar-field resolvers):
+    ///   * self-relative `errors.push(e)` inside a method body — `callee`
+    ///     is `Field { Ident(queue), method }` and `queue` names a queue
+    ///     field of `self_component`;
+    ///   * test-scope path `checker.sb.errors.pop()` — `callee` is
+    ///     `Field { <path>.<queue>, method }`, the head names a test-scope
+    ///     component local, and the resolved sub-component has a queue
+    ///     field `queue`.
+    /// Returns `(base, queue_field, method)` when it resolves; `None` when
+    /// the access is not a component-queue call (a different resolver may
+    /// claim it). A path that reaches a component but whose terminal field
+    /// is not a queue returns `None` too (so a method/scalar resolver can
+    /// claim it). A data-only scoreboard sub receiver is left for the
+    /// scoreboard handlers (`recv_is_scoreboard_sub`).
+    pub(crate) fn as_component_queue_call(
+        &self,
+        callee: &AstExpr,
+    ) -> Result<Option<(ComponentBase, String, String)>, LowerError> {
+        // callee = Field { target = <recv>.<queue>, name = method }. For
+        // `errors.push(e)` the target is `Ident(errors)`; for
+        // `checker.sb.errors.push(e)` it is the dotted `checker.sb.errors`.
+        let ExprKind::Field { target, name: method } = &*callee.kind else {
+            return Ok(None);
+        };
+        // Self-relative bare queue: `errors.push(e)` — target is an `Ident`
+        // naming a self queue field (not a shadowing local).
+        if let ExprKind::Ident(qid) = &*target.kind {
+            if self.lookup(&qid.name).is_none() {
+                if let Some(cid) = self.self_component {
+                    let comp = &self.ctx.components[cid.index()];
+                    if matches!(
+                        comp.field(&qid.name).map(|f| &f.kind),
+                        Some(ComponentFieldKind::Queue { .. })
+                    ) {
+                        return Ok(Some((
+                            ComponentBase::SelfField,
+                            qid.name.clone(),
+                            method.name.clone(),
+                        )));
+                    }
+                }
+            }
+            return Ok(None);
+        }
+        // Path form: `<head>.<subs...>.<queue>.<method>`.
+        let Some(path) = dotted_path(target) else {
+            return Ok(None);
+        };
+        let path = self.strip_tb_prefix(&path);
+        if path.len() < 2 {
+            return Ok(None);
+        }
+        let Some(&head_cid) = self.ctx.component_fields.get(&path[0]) else {
+            return Ok(None);
+        };
+        let (recv, queue) = path.split_at(path.len() - 1);
+        let queue = queue[0].clone();
+        // A receiver ending in a data-only scoreboard sub is a scoreboard
+        // queue op, not a component-queue op — let the scoreboard handlers
+        // claim it.
+        if self.recv_is_scoreboard_sub(head_cid, &recv[1..]) {
+            return Ok(None);
+        }
+        let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
+        let comp = &self.ctx.components[cid.index()];
+        if !matches!(
+            comp.field(&queue).map(|f| &f.kind),
+            Some(ComponentFieldKind::Queue { .. })
+        ) {
+            return Ok(None);
+        }
+        Ok(Some((
+            ComponentBase::Path(recv.to_vec()),
+            queue,
+            method.name.clone(),
+        )))
+    }
+
+    /// Lower a whole-component value copy of a test-scope sub-component:
+    /// `checker.sb = sb` / `responder.model = model`. Returns `true` when
+    /// consumed. The LHS is `<dst-path>.<sub-field>` where the terminal
+    /// field is a `Sub` component field; the RHS is a single-segment
+    /// test-scope component local (or `_tb`-prefixed) of the SAME component
+    /// type. Anything else returns `false` (a later resolver / the
+    /// scalar-field rejection claims it).
+    pub(crate) fn lower_component_sub_assign(
+        &mut self,
+        target: &AstExpr,
+        value: &AstExpr,
+    ) -> Result<bool, LowerError> {
+        let Some(path) = dotted_path(target) else {
+            return Ok(false);
+        };
+        let path = self.strip_tb_prefix(&path);
+        if path.len() < 2 {
+            return Ok(false);
+        }
+        let Some(&head_cid) = self.ctx.component_fields.get(&path[0]) else {
+            return Ok(false);
+        };
+        let (recv, field) = path.split_at(path.len() - 1);
+        let field = field[0].clone();
+        // A receiver ending in a data-only scoreboard sub is not a
+        // component sub-copy — let the scoreboard handlers claim it.
+        if self.recv_is_scoreboard_sub(head_cid, &recv[1..]) {
+            return Ok(false);
+        }
+        let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
+        let comp = &self.ctx.components[cid.index()];
+        let Some(ComponentFieldKind::Sub { component }) = comp.field(&field).map(|f| &f.kind) else {
+            return Ok(false);
+        };
+        let dst_sub = *component;
+        // RHS must be a test-scope component local of the same type.
+        let Some(src_path) = dotted_path(value) else {
+            return Ok(false);
+        };
+        let src_path = self.strip_tb_prefix(&src_path);
+        let Some(&src_cid) = src_path
+            .first()
+            .and_then(|h| self.ctx.component_fields.get(h))
+        else {
+            return Ok(false);
+        };
+        // Resolve through any further sub-path on the RHS (usually none).
+        let src_resolved = self.resolve_component_recv(src_cid, &src_path[1..])?;
+        if src_resolved != dst_sub {
+            return Err(unsupported(
+                &format!(
+                    "copying component `{}` into sub-component field `{}.{field}` of a \
+                     different type `{}`",
+                    self.ctx.components[src_resolved.index()].name,
+                    recv.join("."),
+                    self.ctx.components[dst_sub.index()].name
+                ),
+                "",
+            ));
+        }
+        self.push(IrStmt::ComponentSubAssign {
+            dst: ComponentBase::Path(recv.to_vec()),
+            field,
+            src: ComponentBase::Path(src_path.to_vec()),
+        });
+        Ok(true)
+    }
+
+    /// The `QueueElem` of the component `queue<T>` field reached by
+    /// `(base, queue)`. Resolves the owning component (the `self_component`
+    /// for `SelfField`, or the path receiver for `Path`) and reads the
+    /// field's element kind. Errors when the field is missing / not a queue
+    /// (the resolvers that produced `base` already validated it, so this is
+    /// defensive).
+    pub(crate) fn component_queue_elem(
+        &self,
+        base: &ComponentBase,
+        queue: &str,
+    ) -> Result<crate::ir::QueueElem, LowerError> {
+        let cid = match base {
+            ComponentBase::SelfField => self.self_component.ok_or_else(|| {
+                unsupported(
+                    &format!("a self-relative queue `{queue}` outside a component body"),
+                    "",
+                )
+            })?,
+            ComponentBase::Path(path) => {
+                let head_cid = *self.ctx.component_fields.get(&path[0]).ok_or_else(|| {
+                    unsupported(
+                        &format!("`{}` is not a component-typed test field", path[0]),
+                        "",
+                    )
+                })?;
+                self.resolve_component_recv(head_cid, &path[1..])?
+            }
+        };
+        let comp = &self.ctx.components[cid.index()];
+        match comp.field(queue).map(|f| &f.kind) {
+            Some(ComponentFieldKind::Queue { elem }) => Ok(*elem),
+            _ => Err(unsupported(
+                &format!("`{queue}` is not a queue field of `{}`", comp.name),
+                "",
+            )),
+        }
     }
 
     /// Resolve a component scalar-field assignment target: a bare

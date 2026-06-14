@@ -4510,3 +4510,17 @@ fn transactor_parse_dump_ir_snapshot() {
     verify::verify_program(&prog).expect("verifies");
     insta::assert_snapshot!("transactor_parse_dump_ir", format!("{prog}"));
 }
+
+/// `scoreboard_typed_queue_test` — a method-bearing `scoreboard` with a
+/// `queue<CheckerError>` (record element) plus an `on 1 cycles phase
+/// post_eval` periodic handler on a checker transactor. Locks: the
+/// `queue<Record>` component field, the `ComponentQueuePush`/`Pop`/
+/// `QueueQuery` ops, the self-relative `sb.record_error(...)`
+/// sub-component method call, the `checker.sb = sb` whole-value copy, and
+/// the periodic handler carrying `phase post_eval`.
+#[test]
+fn scoreboard_typed_queue_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("scoreboard_typed_queue_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("scoreboard_typed_queue_dump_ir", format!("{prog}"));
+}

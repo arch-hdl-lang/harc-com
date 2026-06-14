@@ -110,7 +110,7 @@ pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<Stri
     // Scoreboard structs (data-only host-state records — they never name
     // a TB or DUT type), before the testbench structs that hold them.
     for sb in &prog.scoreboards {
-        runtime::scoreboard_struct(&mut out, sb);
+        runtime::scoreboard_struct(&mut out, sb, &prog.records);
     }
 
     // Composite-component structs (env/agent cluster). A component holds
@@ -251,7 +251,8 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
             ir::ScoreboardOp::QueuePop { .. } => false,
         },
         ComponentEmit { args, .. } | ComponentCall { args, .. } => args.iter().any(expr_has_probe),
-        SeqPush { value, .. } => expr_has_probe(value),
+        SeqPush { value, .. } | ComponentQueuePush { value, .. } => expr_has_probe(value),
+        ComponentQueuePop { .. } | ComponentSubAssign { .. } => false,
         TlmFork(desc) => desc.args.iter().any(expr_has_probe),
         TlmJoinAll(pending) => pending.iter().any(|p| p.args.iter().any(expr_has_probe)),
         RecordInit(_, _) | CovReport(_) => false,
@@ -649,7 +650,8 @@ fn emit_lifecycle_checkers(
         let lambda = func::periodic_handler_lambda_name(comp, ph);
         let period = func::clause_expr_cpp(prog, ph.function, inst_path, &ph.period)?;
         let tag = format!("_per_{inst_tag}_{}", ph.function.0);
-        writeln!(out, "{INDENT}_checkers.push_back([&]() {{").ok();
+        let svc = ph.phase.service_vec();
+        writeln!(out, "{INDENT}{svc}.push_back([&]() {{").ok();
         writeln!(out, "{INDENT}{INDENT}static int64_t {tag}_last = 0;").ok();
         writeln!(out, "{INDENT}{INDENT}int64_t {tag}_period = (int64_t)({period});").ok();
         writeln!(

@@ -204,8 +204,14 @@ impl Display for TbProgram {
                     ComponentFieldKind::Scalar { default, .. } => {
                         format!("scalar = {default}")
                     }
-                    ComponentFieldKind::Queue { signed } => {
-                        format!("queue<{}>", if *signed { "sint" } else { "uint" })
+                    ComponentFieldKind::Queue { elem } => {
+                        use crate::ir::QueueElem;
+                        let inner = match elem {
+                            QueueElem::Scalar { signed: true } => "sint".to_string(),
+                            QueueElem::Scalar { signed: false } => "uint".to_string(),
+                            QueueElem::Record(r) => self.records[r.index()].name.clone(),
+                        };
+                        format!("queue<{inner}>")
                     }
                     ComponentFieldKind::Event { payload } => {
                         use crate::ir::EventPayload;
@@ -252,10 +258,14 @@ impl Display for TbProgram {
             }
             for ph in &c.periodic_handlers {
                 // Bodies print as their own `fn` blocks below; the
-                // summary line records the period source.
+                // summary line records the period source and phase.
+                let phase = match ph.phase {
+                    crate::ir::HandlerPhase::Checker => "",
+                    crate::ir::HandlerPhase::PostEval => " phase post_eval",
+                };
                 writeln!(
                     f,
-                    "    on {} cycles = fn{}",
+                    "    on {} cycles{phase} = fn{}",
                     expr_str_for_component(self, ph.function, &ph.period),
                     ph.function.0
                 )?;
@@ -487,6 +497,21 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
                 None => format!("ComponentCall({call})"),
             }
         }
+        Stmt::ComponentQueuePush { base, queue, value } => format!(
+            "ComponentQueuePush({}.{queue}, {})",
+            comp_base_str(base),
+            expr_str(func, value)
+        ),
+        Stmt::ComponentQueuePop { base, queue, dest } => format!(
+            "ComponentQueuePop({} = {}.{queue}.pop())",
+            local_str(func, *dest),
+            comp_base_str(base)
+        ),
+        Stmt::ComponentSubAssign { dst, field, src } => format!(
+            "ComponentSubAssign({}.{field} = {})",
+            comp_base_str(dst),
+            comp_base_str(src)
+        ),
         Stmt::SeqPush { seq, value } => format!(
             "SeqPush({}, {})",
             local_str(func, *seq),
@@ -732,6 +757,9 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         }
         Expr::ComponentField { base, field } => {
             format!("{}.{field}", comp_base_str(base))
+        }
+        Expr::ComponentQueueQuery { base, query } => {
+            format!("ComponentQueueQuery({}.{})", comp_base_str(base), sb_query_str(query))
         }
         Expr::ComponentIdle { base, kind, n } => {
             let m = match kind {
