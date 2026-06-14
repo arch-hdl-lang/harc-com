@@ -618,6 +618,18 @@ impl Checker<'_> {
                     // no-inline-port rule like any host-state assignment.
                     self.check_expr(value, false, "SeqPush value");
                 }
+                Stmt::ComponentQueuePush { value, .. } => {
+                    // Component-queue host state — the pushed value follows
+                    // the no-inline-port rule like any Assign value.
+                    self.check_expr(value, false, "ComponentQueuePush value");
+                }
+                Stmt::ComponentQueuePop { dest, .. } => {
+                    self.check_local(*dest);
+                }
+                // Whole sub-component value copy — receiver/source resolved
+                // at lowering against the component schema; nothing to
+                // verify structurally (no local/port dependency).
+                Stmt::ComponentSubAssign { .. } => {}
                 Stmt::TlmFork(desc) => {
                     if let Some(d) = desc.dest {
                         self.check_local(d);
@@ -938,6 +950,9 @@ impl Checker<'_> {
             // Component host state — resolved at lowering against the
             // component schema; no local/port dependency to verify here.
             Expr::ComponentField { .. } => {}
+            // Component-queue size/empty read — host state resolved at
+            // lowering against the component schema; nothing to verify.
+            Expr::ComponentQueueQuery { .. } => {}
             // Idle predicate: the base/kind are resolved at lowering; only
             // the threshold sub-expression carries verifiable structure.
             Expr::ComponentIdle { n, .. } => self.check_expr(n, ports_ok, context),
@@ -1300,6 +1315,16 @@ fn check_def_before_use(
                     }
                     check_e(value, &defined, errs);
                 }
+                Stmt::ComponentQueuePush { value, .. } => check_e(value, &defined, errs),
+                Stmt::ComponentQueuePop { dest, .. } => {
+                    // Pop defines the destination local.
+                    if dest.index() < defined.len() {
+                        defined[dest.index()] = true;
+                    }
+                }
+                // Whole sub-component copy — no local def/use (both ends
+                // are component values, not test locals).
+                Stmt::ComponentSubAssign { .. } => {}
                 Stmt::TlmFork(desc) => {
                     // Args read at the fork site; the dest is defined here
                     // (v1 declares + zero-inits `T x = {};` at the fork,
@@ -1369,7 +1394,8 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
         | Expr::TbField(_)
         | Expr::TransactorState { .. }
         | Expr::ComponentField { .. }
-        | Expr::ScoreboardQuery { .. } => {}
+        | Expr::ScoreboardQuery { .. }
+        | Expr::ComponentQueueQuery { .. } => {}
         Expr::Local(l) => f(*l),
         Expr::RecordField { local, index, .. } => {
             f(*local);

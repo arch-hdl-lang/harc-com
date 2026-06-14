@@ -257,6 +257,23 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         Expr::ComponentField { base, field } => {
             format!("{}.{field}", comp_base_cpp_subst(base, cx.self_subst))
         }
+        // Composite-component `queue<T>` size()/empty() read — mirrors the
+        // `ScoreboardQuery` queue reads but resolves the receiver via the
+        // component base (self-relative or test-scope path).
+        Expr::ComponentQueueQuery { base, query } => {
+            use crate::ir::ScoreboardQuery;
+            let recv = comp_base_cpp_subst(base, cx.self_subst);
+            match query {
+                // A scalar query never reaches a queue field — defensive.
+                ScoreboardQuery::Scalar { scalar } => format!("{recv}.{scalar}"),
+                ScoreboardQuery::QueueSize { queue } => {
+                    format!("((uint64_t){recv}.{queue}.size())")
+                }
+                ScoreboardQuery::QueueEmpty { queue } => {
+                    format!("{recv}.{queue}.empty()")
+                }
+            }
+        }
         // Heartbeat-idle predicate on a component instance — mirrors v1's
         // `emit_idle_predicate`: compares `cycle_count` minus the
         // `_last_in_cycle`/`_last_out_cycle` stamp against the threshold.
@@ -522,6 +539,20 @@ pub(super) fn comp_base_cpp_subst(
     match base {
         crate::ir::ComponentBase::SelfField => {
             self_subst.unwrap_or("self").to_string()
+        }
+        // A `self`-rooted path (`self.sb`) is a self-relative sub-component
+        // access lowered inside a component/handler body — re-root the
+        // `self` head at the running instance via `self_subst` (the
+        // periodic/cycle-handler poke form), exactly as `ScoreboardOp` does
+        // for a `self`-rooted scoreboard path.
+        crate::ir::ComponentBase::Path(path)
+            if path.first().map(String::as_str) == Some("self") =>
+        {
+            let root = self_subst.unwrap_or("self");
+            std::iter::once(root.to_string())
+                .chain(path.iter().skip(1).cloned())
+                .collect::<Vec<_>>()
+                .join(".")
         }
         crate::ir::ComponentBase::Path(path) => path.join("."),
     }

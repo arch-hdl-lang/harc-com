@@ -141,7 +141,9 @@ fn scoreboard_field_kind(t: &TypeExpr) -> Option<ScoreboardFieldKind> {
             IrType::UInt(_) | IrType::Bool => false,
             _ => return None,
         };
-        return Some(ScoreboardFieldKind::Queue { signed });
+        return Some(ScoreboardFieldKind::Queue {
+            elem: crate::ir::QueueElem::Scalar { signed },
+        });
     }
     let ty = scalar_ir_type(t)?;
     Some(ScoreboardFieldKind::Scalar { ty, default: 0 })

@@ -4090,7 +4090,9 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 // tseq bodies never appear in a bound-to responder body
                 // (transactor-method randomize / tseq is out of subset),
                 // so the yielded value holds no transactor-state node.
-                ir::Stmt::SeqPush { value, .. } => in_expr(value),
+                ir::Stmt::SeqPush { value, .. }
+                | ir::Stmt::ComponentQueuePush { value, .. } => in_expr(value),
+                ir::Stmt::ComponentQueuePop { .. } | ir::Stmt::ComponentSubAssign { .. } => None,
                 // Fork/join descriptors carry their request payload exprs;
                 // a responder body never forks, but scan for completeness.
                 ir::Stmt::TlmFork(desc) => desc.args.iter().find_map(in_expr),
@@ -4149,6 +4151,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             | ir::Expr::TbField(_)
             | ir::Expr::ComponentField { .. }
             | ir::Expr::ScoreboardQuery { .. }
+            | ir::Expr::ComponentQueueQuery { .. }
             | ir::Expr::SeqLen(_)
             | ir::Expr::RegRead { .. }
             | ir::Expr::CovBin { .. } => {}
@@ -4229,6 +4232,8 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                     }
                 }
                 ir::Stmt::SeqPush { value, .. } => fill_expr(value, instance),
+                ir::Stmt::ComponentQueuePush { value, .. } => fill_expr(value, instance),
+                ir::Stmt::ComponentQueuePop { .. } | ir::Stmt::ComponentSubAssign { .. } => {}
                 ir::Stmt::TlmFork(desc) => {
                     for a in &mut desc.args {
                         fill_expr(a, instance);
@@ -4356,6 +4361,7 @@ fn fill_visit_expr(
         | Expr::TransactorState { .. }
         | Expr::ComponentField { .. }
         | Expr::ScoreboardQuery { .. }
+        | Expr::ComponentQueueQuery { .. }
         | Expr::SeqLen(_)
         | Expr::RegRead { .. }
         | Expr::CovBin { .. } => {}
@@ -4451,9 +4457,11 @@ fn fill_initiator_bus_prefix(
                             visit_expr(a, placeholder, binding, remap, rewrite, &mut conflict);
                         }
                     }
-                    Stmt::SeqPush { value, .. } => {
+                    Stmt::SeqPush { value, .. }
+                    | Stmt::ComponentQueuePush { value, .. } => {
                         visit_expr(value, placeholder, binding, remap, rewrite, &mut conflict)
                     }
+                    Stmt::ComponentQueuePop { .. } | Stmt::ComponentSubAssign { .. } => {}
                     Stmt::TlmFork(desc) => {
                         for a in &mut desc.args {
                             visit_expr(a, placeholder, binding, remap, rewrite, &mut conflict);

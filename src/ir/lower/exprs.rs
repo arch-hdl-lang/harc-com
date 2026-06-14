@@ -289,6 +289,12 @@ impl FuncBuilder<'_> {
                         if let Some(q) = self.lower_scoreboard_query_call(callee, args)? {
                             return Ok(q);
                         }
+                        // Composite-component queue value-queries:
+                        // `checker.sb.errors.size()` / `.empty()`.
+                        // (`.pop()` mutates → statement-only; rejected here.)
+                        if let Some(q) = self.lower_component_queue_query(callee, args)? {
+                            return Ok(q);
+                        }
                         // Testbench helper method call (`_tb.reset()`),
                         // CFG-inlined like an impure helper.
                         if let Some(m) = self.tb_method_call_name(callee) {
@@ -554,6 +560,8 @@ impl FuncBuilder<'_> {
             | Expr::ScoreboardQuery { .. }
             // Component fields are host state — no DUT port inside.
             | Expr::ComponentField { .. }
+            // Component-queue size/empty reads are host state — no port.
+            | Expr::ComponentQueueQuery { .. }
             // Sequence length is host state — no DUT port inside.
             | Expr::SeqLen(_)
             // A register-level frontdoor read carries no DUT *port*
@@ -671,6 +679,47 @@ impl FuncBuilder<'_> {
         }
         self.scoreboard_queue_field(sb, &queue)?;
         Ok(Some(Expr::ScoreboardQuery { sb, field, query, nested_path }))
+    }
+
+    /// Lower `<recv>.<queue>.size()` / `.empty()` on a composite-component
+    /// `queue<T>` field into an `Expr::ComponentQueueQuery`, or `None` when
+    /// `callee` is not a component-queue method access. A `pop()` reaching
+    /// here (deeper than a `let`/assign RHS) is rejected — it mutates and
+    /// must be a statement. Mirrors `lower_scoreboard_query_call`.
+    fn lower_component_queue_query(
+        &self,
+        callee: &AstExpr,
+        args: &[crate::ast::CallArg],
+    ) -> Result<Option<Expr>, LowerError> {
+        let Some((base, queue, method)) = self.as_component_queue_call(callee)? else {
+            return Ok(None);
+        };
+        let query = match method.as_str() {
+            "size" => crate::ir::ScoreboardQuery::QueueSize {
+                queue: queue.clone(),
+            },
+            "empty" => crate::ir::ScoreboardQuery::QueueEmpty {
+                queue: queue.clone(),
+            },
+            "pop" => {
+                return Err(unsupported(
+                    &format!("component `{queue}.pop()` in a nested expression"),
+                    "bind it to its own `let` first — `pop` mutates the queue",
+                ));
+            }
+            other => {
+                return Err(unsupported(
+                    &format!("component queue method `{queue}.{other}(...)`"),
+                    "only `push`/`pop`/`size`/`empty` are lowered",
+                ));
+            }
+        };
+        if !args.is_empty() {
+            return Err(LowerError::Invalid(format!(
+                "component `{queue}.{method}()` takes no arguments"
+            )));
+        }
+        Ok(Some(Expr::ComponentQueueQuery { base, query }))
     }
 
     /// `Some(PortRef)` when the expression is a dotted access rooted at

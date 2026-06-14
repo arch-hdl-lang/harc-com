@@ -437,10 +437,24 @@ pub enum ScoreboardFieldKind {
     /// `writes : uint<32> default 0` — a scalar host counter. The
     /// `default` is the declared initializer literal (0 fallback, v1).
     Scalar { ty: IrType, default: u64 },
-    /// `expected : queue<uint<32>>` — a FIFO of a scalar element type
-    /// (≤ 64 bits; the lowered subset). `signed` selects the C element
-    /// type for diagnostics/printf width (`int64_t` vs `uint64_t`).
-    Queue { signed: bool },
+    /// `expected : queue<uint<32>>` / `errors : queue<CheckerError>` — a
+    /// FIFO whose element is a scalar ≤ 64 bits or a value-record.
+    Queue { elem: QueueElem },
+}
+
+/// The element type of a `queue<T>` field, mirroring `EventPayload`:
+/// a scalar ≤ 64 bits, or a value-record carried by struct. Shared by
+/// scoreboard and composite-component queue fields so both lower a
+/// `queue<Record>` element through one shape (`harc_rt::HarcQueue<Rec>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueElem {
+    /// `queue<uint<32>>` / `queue<sint<…>>` / `queue<bool>` — a scalar
+    /// ≤ 64 bits. `signed` selects the C element type (`int64_t` vs
+    /// `uint64_t`) and printf width.
+    Scalar { signed: bool },
+    /// `queue<CheckerError>` — a value-record element. `RecordId` indexes
+    /// `TbProgram::records`; the C++ element type is the record struct.
+    Record(RecordId),
 }
 
 impl ScoreboardSchema {
@@ -548,6 +562,11 @@ pub struct PeriodicHandlerSchema {
     /// Lowered handler body (`kind: ComponentMethod`, zero params — `self`
     /// only). Bare field names resolve self-relatively.
     pub function: FunctionId,
+    /// `phase` modifier (`on N cycles phase post_eval`). `Checker` (default)
+    /// dispatches from the per-cycle `_checkers` vector; `PostEval`
+    /// dispatches from `_post_eval_services` (after the DUT posedge eval, so
+    /// the body observes freshly-clocked DUT outputs in the same cycle).
+    pub phase: HandlerPhase,
 }
 
 /// One `on <bool-expr> ... end on` cycle-trigger handler (spec §7.x
@@ -589,6 +608,37 @@ pub enum CycleEdge {
     Rising,
     Falling,
     Level,
+}
+
+/// Scheduling phase for an `on` handler — mirrors `ast::OnPhase` in the IR
+/// so the codegen needn't reach back into the AST. `Checker` registers the
+/// handler in the per-cycle `_checkers` vector (run after the falling edge
+/// has re-settled comb logic); `PostEval` registers it in the
+/// `_post_eval_services` vector, run after the DUT posedge `eval` and
+/// before the run coroutine resumes — the seam that lets a checker observe
+/// freshly-clocked DUT outputs in the same cycle the test set its inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandlerPhase {
+    Checker,
+    PostEval,
+}
+
+impl HandlerPhase {
+    /// Lower from the AST `OnPhase`.
+    pub fn from_ast(p: crate::ast::OnPhase) -> Self {
+        match p {
+            crate::ast::OnPhase::Checker => HandlerPhase::Checker,
+            crate::ast::OnPhase::PostEval => HandlerPhase::PostEval,
+        }
+    }
+
+    /// The C++ dispatch vector this phase registers into.
+    pub fn service_vec(self) -> &'static str {
+        match self {
+            HandlerPhase::Checker => "_checkers",
+            HandlerPhase::PostEval => "_post_eval_services",
+        }
+    }
 }
 
 /// A `watchdog ... end watchdog` directive (spec §8.6). At most one per
@@ -657,12 +707,12 @@ pub struct ComponentFieldSchema {
 pub enum ComponentFieldKind {
     /// `count : uint<32> default 0` — a scalar host counter.
     Scalar { ty: IrType, default: u64 },
-    /// `expected : queue<uint<32>>` — a FIFO of a scalar element type
-    /// (≤ 64 bits; the lowered subset). `signed` selects the C element
-    /// type (`int64_t` vs `uint64_t`). A `queue<Record>` element is out of
-    /// the lowered subset (it needs the component-queue-op + record-payload
-    /// seam) — rejected precisely at field lowering.
-    Queue { signed: bool },
+    /// `expected : queue<uint<32>>` / `errors : queue<CheckerError>` — a
+    /// FIFO whose element is a scalar ≤ 64 bits or a value-record (`elem`
+    /// selects the C element type). Manipulated through the component-queue
+    /// ops (`Stmt::ComponentQueuePush`/`ComponentQueuePop`,
+    /// `Expr::ComponentQueueSize`).
+    Queue { elem: QueueElem },
     /// `observed : out event<uint<8>>` — an analysis port. Lowers to a
     /// `std::vector<std::function<void(<payload>)>>` member; `payload`
     /// selects the C payload type (scalar `uint64_t`/`int64_t` or a
@@ -1241,6 +1291,36 @@ pub enum Stmt {
         args: Vec<Expr>,
         dest: Option<LocalId>,
     },
+    /// `<base>.<queue>.push(value)` on a composite-component `queue<T>`
+    /// field. `base` selects the access form: `SelfField` (`errors.push(e)`
+    /// inside a scoreboard/component method body → `self.errors.push(e)`)
+    /// or `Path` (`checker.sb.errors.push(e)` from the test). The value is
+    /// port-hoisted like `ScoreboardOp::QueuePush`; a record value lowers
+    /// to a struct push. Emitted as `<recv>.<queue>.push(<value>);`.
+    ComponentQueuePush {
+        base: ComponentBase,
+        queue: String,
+        value: Expr,
+    },
+    /// `let v = <base>.<queue>.pop()` — pop the queue front into a local.
+    /// Always has a destination (a discarded pop is rejected at lowering,
+    /// matching the scoreboard form). Emitted as `<dest> = <recv>.<queue>.pop();`.
+    ComponentQueuePop {
+        base: ComponentBase,
+        queue: String,
+        dest: LocalId,
+    },
+    /// `<dst>.<field> = <src>` — a whole composite-component value copy of
+    /// a test-scope sub-component (`checker.sb = sb` / `responder.model =
+    /// model`). `dst` resolves the receiver holding the sub-component
+    /// field; `src` resolves the source component value (another test-scope
+    /// component). Emitted as `<dst>.<field> = <src>;` — a plain C++ struct
+    /// copy (mirrors v1's `_tb.checker.sb = _tb.sb;`).
+    ComponentSubAssign {
+        dst: ComponentBase,
+        field: String,
+        src: ComponentBase,
+    },
     /// `yield t` inside a `tseq` body — append a record value onto the
     /// sequence accumulator. `seq` is the function's `RecordSeq` `ret`
     /// local; `value` is `Expr::Local(record)` (the yielded record).
@@ -1502,6 +1582,16 @@ pub enum Expr {
     /// scoreboard-style ops which are out of subset for components in v0;
     /// events are written via `connect`/`emit` only).
     ComponentField { base: ComponentBase, field: String },
+    /// A value-producing read on a composite-component `queue<T>` field:
+    /// `<base>.<queue>.size()` / `.empty()`. Host state — allowed wherever
+    /// a `Local` is. `.pop()` is NOT here (it mutates) — it lowers to
+    /// `Stmt::ComponentQueuePop`. Mirrors `ScoreboardQuery` for the
+    /// method-bearing-scoreboard / component-field queue (`query` carries
+    /// the queue-field name via `QueueSize`/`QueueEmpty`).
+    ComponentQueueQuery {
+        base: ComponentBase,
+        query: ScoreboardQuery,
+    },
     /// A heartbeat-idle predicate on a component: `agent.idle_in(N)`,
     /// `agent.idle_out(N)`, or `agent.idle(N)` (= both). `base` resolves
     /// the component instance; `n` is the cycle-count threshold. Reads the

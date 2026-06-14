@@ -163,14 +163,23 @@ fixed — it is now a precise rejection (`queue_elem_signedness`).
 | Fixture | Status | First blocker |
 |---|---|---|
 | `dma_engine_test` | **REGISTERED 2026-06-13** (`dma_engine.sv`, pass; trace-diff clean v1↔tbir) | (resolved) a PASSIVE reactive-monitor transactor (`mon : MemXactor passive`, `on dut.<v> && dut.<r>` observers + `on dut.<v> level` combinational memory model) + an `active` DUT-poking APB BFM |
-| `scoreboard_typed_queue_test` | deferred | `queue<CheckerError>` (record-payload queue) on a method-bearing scoreboard component — needs the component-queue-op + record-element seam (push/pop of a struct on a component `Queue` field; today only `queue<scalar ≤ 64 bits>` lowers). Also stacks `on 1 cycles phase post_eval`. Rejected precisely. |
+| `scoreboard_typed_queue_test` | **REGISTERED 2026-06-13** (`scoreboard_typed_queue.sv`, pass; trace-diff clean v1↔tbir) | (resolved) `queue<CheckerError>` (record-element queue) on a method-bearing scoreboard component + the component-queue-op seam (`ComponentQueuePush`/`Pop`/`QueueQuery` push/pop/size of a struct on a component `Queue` field) + self-relative `sb.record_error(...)` sub-component method call + `checker.sb = sb` whole-value copy (`ComponentSubAssign`) + `on 1 cycles phase post_eval` (the shared `HandlerPhase::PostEval` seam → `_post_eval_services`) |
 | `post_eval_provider_test` | deferred | function-library transactor (`ProtocolModel`, methods only, no DUT handle) used as a sub-field + component-as-method-argument (`sb.observe(addr, model)` passes a transactor instance and dispatches `model.predict_read(...)` on the param) + `on ... phase post_eval`. Needs the function-library-as-sub-field + component-arg + post_eval-phase seams. |
 | `axilite_env_test` | deferred | env-of-method-transactor: `env AxilEnv { drv : AxilXactor }` holds a DUT-poking hookable BFM as a Sub, with nested `env.drv.<method>` dispatch + `env.drv.dut = dut` bind through the env. The DUT-poking BFM lowers as a `TransactorSchema` (not a `ComponentSchema`), so it is not resolvable as an env Sub field; needs env Sub-of-transactor resolution + nested method/DUT-bind routing. |
 
-The `dma_engine` unlock landed the reactive-monitor routing; the other
-three each stack one or more further seams (struct queues + post_eval /
-function-library-as-sub-field + component-arg + post_eval / env-of-BFM) and
-stay rejected precisely.
+The `dma_engine` unlock landed the reactive-monitor routing.
+`scoreboard_typed_queue_test` (2026-06-13) then landed the **component-
+queue + record-element + `phase post_eval`** seams: a `queue<Record>`
+component/scoreboard field (shared `QueueElem::{Scalar,Record}`), the
+component-queue ops (`ComponentQueuePush`/`ComponentQueuePop`/
+`ComponentQueueQuery`), a self-relative sub-component method call
+(`sb.record_error(...)` → a `self`-rooted `Path` base), a whole sub-
+component value copy (`ComponentSubAssign`, `checker.sb = sb`), and the
+general `HandlerPhase` concept (`Checker` → `_checkers`, `PostEval` →
+`_post_eval_services`) carried on `PeriodicHandlerSchema.phase`. The two
+remaining fixtures stack further seams (function-library-as-sub-field +
+component-arg [`post_eval_provider_test` reuses the `phase post_eval`
+seam] / env-of-BFM) and stay rejected precisely.
 
 ### `regblock` construct — PARTIALLY RESOLVED (regblock slice 2026-06-12; bus-bound BFM + residuals + field-level/addrmap 2026-06-13)
 

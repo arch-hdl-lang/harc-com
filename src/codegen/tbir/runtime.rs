@@ -147,7 +147,22 @@ pub(super) fn target_state_struct_inst(
     writeln!(out, "{INDENT}}} {instance};").ok();
 }
 
-pub(super) fn scoreboard_struct(out: &mut String, sb: &crate::ir::ScoreboardSchema) {
+/// The C++ element type for a `queue<T>` field. Mirrors `event_payload_cty`:
+/// a scalar widens to `uint64_t`/`int64_t`; a value-record element is the
+/// record struct (carried by value, matching v1's `HarcQueue<Rec>`).
+fn queue_elem_cty(elem: &crate::ir::QueueElem, records: &[crate::ir::RecordSchema]) -> String {
+    match elem {
+        crate::ir::QueueElem::Scalar { signed: true } => "int64_t".to_string(),
+        crate::ir::QueueElem::Scalar { signed: false } => "uint64_t".to_string(),
+        crate::ir::QueueElem::Record(r) => records[r.index()].name.clone(),
+    }
+}
+
+pub(super) fn scoreboard_struct(
+    out: &mut String,
+    sb: &crate::ir::ScoreboardSchema,
+    records: &[crate::ir::RecordSchema],
+) {
     writeln!(out, "struct {} {{", sb.name).ok();
     for f in &sb.fields {
         match &f.kind {
@@ -162,8 +177,8 @@ pub(super) fn scoreboard_struct(out: &mut String, sb: &crate::ir::ScoreboardSche
                 };
                 writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
             }
-            crate::ir::ScoreboardFieldKind::Queue { signed } => {
-                let elem = if *signed { "int64_t" } else { "uint64_t" };
+            crate::ir::ScoreboardFieldKind::Queue { elem } => {
+                let elem = queue_elem_cty(elem, records);
                 writeln!(out, "{INDENT}harc_rt::HarcQueue<{elem}> {};", f.name).ok();
             }
         }
@@ -218,8 +233,8 @@ pub(super) fn component_struct(
                 };
                 writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
             }
-            ComponentFieldKind::Queue { signed } => {
-                let elem = if *signed { "int64_t" } else { "uint64_t" };
+            ComponentFieldKind::Queue { elem } => {
+                let elem = queue_elem_cty(elem, records);
                 writeln!(out, "{INDENT}harc_rt::HarcQueue<{elem}> {};", f.name).ok();
             }
             ComponentFieldKind::Event { payload } => {
