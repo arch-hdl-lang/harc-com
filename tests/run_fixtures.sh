@@ -126,6 +126,7 @@ wait_any_of_test        | Top            | top_counter.sv         |
 transaction_basic_test  | Top            | top_counter.sv         |
 scoreboard_basic_test   | Top            | top_counter.sv         |
 tlm_method_blocking_bus_test | TlmMemory | TlmMemory.sv           |
+lz4_decomp_test          | Lz4BlockDecomp  | lz4_block_decomp.sv    |
 EOF
 
 PASS=0

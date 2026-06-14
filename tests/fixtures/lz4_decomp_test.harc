@@ -1,0 +1,223 @@
+// HARC testbench for Lz4BlockDecomp — LZ4 raw-block decompressor.
+//
+// Two test vectors:
+//
+//   Test 1: All-literal block — "ABCDE" (5 bytes)
+//     Compressed: [0x50, 0x41, 0x42, 0x43, 0x44, 0x45]
+//     Token 0x50: litlen=5, match_nibble=0.
+//     Expected output: A(65) B(66) C(67) D(68) E(69)
+//
+//   Test 2: Block with back-reference — "abcabcabc" (9 bytes)
+//     Compressed: [0x32, 0x61, 0x62, 0x63, 0x03, 0x00]
+//     Token 0x32: litlen=3, match_nibble=2 → match_len=6, offset=3
+//     Expected output: a b c a b c a b c
+//
+// === HARC Timing Model Notes ===
+// After `wait 1 cycle`, the coroutine sees state from eval_comb AFTER posedge.
+// For cut-through (combinational) outputs (out_data = in_data in ST_EMIT_LIT):
+//   - Assert out_data AFTER `wait 1 cycle` (keeps in_data stable through
+//     the posedge, second eval_comb reflects it).
+//   - EXCEPTION: the LAST literal in a run (lit_remain==1). After its posedge,
+//     state transitions away from ST_EMIT_LIT, so out_valid/out_data become 0.
+//     The last literal's output is not assertable from the coroutine; we verify
+//     it indirectly via the match copy results (history content).
+// For match copy outputs (out_data = history[copy_rd_ptr]):
+//   - Assert BEFORE each `wait 1 cycle` (current cycle's state visible since we
+//     entered ST_COPY_MATCH). After each wait the copy_rd_ptr increments.
+//   - out_last is visible BEFORE the final match tick (when match_remain==1 is
+//     latched into FFs after the penultimate tick).
+
+testbench Lz4BlockDecompTb
+    dut : Lz4BlockDecomp
+end testbench Lz4BlockDecompTb
+
+impl Lz4BlockDecompTest for Lz4BlockDecompTb
+    run
+        log(info, "LZ4 raw-block decompressor test (CAST LZ4SNP-D reference)")
+
+        // ── Reset ────────────────────────────────────────────────────────
+        dut.rst       = 1
+        dut.in_valid  = 0
+        dut.in_data   = 0
+        dut.in_last   = 0
+        dut.out_ready = 1
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // ── Test 1: All-literal "ABCDE" ──────────────────────────────────
+        // Token 0x50: litlen=5, match_nibble=0.
+        // Drive token byte; after tick state=ST_EMIT_LIT, lit_remain=5.
+        dut.in_data  = 80    // 0x50
+        dut.in_valid = 1
+        dut.in_last  = 0
+        wait 1 cycle         // state→ST_EMIT_LIT, lit_remain=5
+
+        // Literals 'A' through 'D': assert after each wait (non-last literals).
+        // out_data = in_data combinationally; after posedge, state stays ST_EMIT_LIT
+        // and in_data is still X → second eval_comb sees out_data=X.
+
+        dut.in_data = 65     // 'A'
+        wait 1 cycle         // lit_remain→4, state=ST_EMIT_LIT
+        assert dut.out_valid == 1
+            else fail("T1[A]: out_valid low")
+        assert dut.out_data == 65
+            else fail("T1[A]: out_data=${dut.out_data}, want 65")
+
+        dut.in_data = 66     // 'B'
+        wait 1 cycle         // lit_remain→3
+        assert dut.out_valid == 1
+            else fail("T1[B]: out_valid low")
+        assert dut.out_data == 66
+            else fail("T1[B]: out_data=${dut.out_data}, want 66")
+
+        dut.in_data = 67     // 'C'
+        wait 1 cycle         // lit_remain→2
+        assert dut.out_valid == 1
+            else fail("T1[C]: out_valid low")
+        assert dut.out_data == 67
+            else fail("T1[C]: out_data=${dut.out_data}, want 67")
+
+        dut.in_data = 68     // 'D'
+        wait 1 cycle         // lit_remain→1
+        assert dut.out_valid == 1
+            else fail("T1[D]: out_valid low")
+        assert dut.out_data == 68
+            else fail("T1[D]: out_data=${dut.out_data}, want 68")
+
+        // Literal 'E' (last literal, lit_remain==1, in_last=1).
+        // After posedge: state→ST_TOKEN, out_valid→false.
+        // Cannot assert out_data/out_last after this wait (covered by C++ TB).
+        // Instead verify state machine reached ST_TOKEN via in_ready.
+        dut.in_data = 69     // 'E'
+        dut.in_last = 1
+        wait 1 cycle         // lit_remain→0, state→ST_TOKEN (in_last set)
+        assert dut.in_ready == 1
+            else fail("T1 post-E: in_ready should be 1 in ST_TOKEN")
+        assert dut.out_valid == 0
+            else fail("T1 post-E: out_valid should be 0 in ST_TOKEN")
+
+        dut.in_last  = 0
+        dut.in_valid = 0
+
+        log(info, "Test 1 PASS: ABCDE decompressed correctly")
+
+        // ── Reset between tests ──────────────────────────────────────────
+        dut.rst      = 1
+        dut.in_valid = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // ── Test 2: "abcabcabc" with back-reference ───────────────────────
+        // Compressed: [0x32, 0x61, 0x62, 0x63, 0x03, 0x00]
+        // Token 0x32: litlen=3, match_nibble=2 → match_len=6, offset=3
+
+        dut.in_data  = 50    // 0x32
+        dut.in_valid = 1
+        dut.in_last  = 0
+        wait 1 cycle         // state→ST_EMIT_LIT, lit_remain=3
+
+        // Literal 'a' (97) — non-last (lit_remain=3, will be 2 after)
+        dut.in_data = 97
+        wait 1 cycle         // lit_remain→2
+        assert dut.out_valid == 1
+            else fail("T2[a]: out_valid low")
+        assert dut.out_data == 97
+            else fail("T2[a]: out_data=${dut.out_data}, want 97")
+
+        // Literal 'b' (98) — non-last (lit_remain=2, will be 1 after)
+        dut.in_data = 98
+        wait 1 cycle         // lit_remain→1
+        assert dut.out_valid == 1
+            else fail("T2[b]: out_valid low")
+        assert dut.out_data == 98
+            else fail("T2[b]: out_data=${dut.out_data}, want 98")
+
+        // Literal 'c' (99) — LAST literal (lit_remain=1, will become 0 → ST_OFF_LO).
+        // After posedge: state=ST_OFF_LO, out_valid=false. Cannot assert out_data.
+        // history[2]=99 is verified indirectly by match byte 2 (copy_rd_ptr=2→99).
+        dut.in_data = 99
+        wait 1 cycle         // lit_remain→0, state→ST_OFF_LO; history[2]=99 written
+        // Verify we're in ST_OFF_LO (in_ready=1, out_valid=0)
+        assert dut.in_ready == 1
+            else fail("T2 post-c: in_ready should be 1 in ST_OFF_LO")
+        assert dut.out_valid == 0
+            else fail("T2 post-c: out_valid should be 0 in ST_OFF_LO")
+
+        // Offset low byte (state: ST_OFF_LO → ST_OFF_HI).
+        dut.in_data = 3      // offset = 3
+        wait 1 cycle         // state→ST_OFF_HI, offset=3
+        assert dut.out_valid == 0
+            else fail("T2[off_hi]: out_valid should be 0 in ST_OFF_HI")
+
+        // Offset high byte — last compressed byte. match_nibble=2 ≠ 15 → ST_COPY_MATCH.
+        dut.in_data = 0
+        dut.in_last = 1
+        wait 1 cycle         // state→ST_COPY_MATCH, saw_last=1, match_remain=6, copy_rd_ptr=0
+        // After posedge: state=ST_COPY_MATCH, second eval_comb:
+        //   out_valid=true, out_data=history[0]=97, out_last=false (match_remain=6)
+
+        dut.in_valid = 0
+        dut.in_last  = 0
+
+        // ── Match copy phase: assert BEFORE each wait ─────────────────────
+        // State: ST_COPY_MATCH. out_valid=true, out_data=history[copy_rd_ptr].
+        // Pattern: assert current values, then wait (tick advances copy_rd_ptr).
+        //
+        // Entry: match_remain=6, copy_rd_ptr=0 → out_data=history[0]=97
+
+        assert dut.out_valid == 1
+            else fail("T2 match[0]: out_valid low")
+        assert dut.out_data == 97
+            else fail("T2 match[0]: want 97 (a), got ${dut.out_data}")
+        assert dut.out_last == 0
+            else fail("T2 match[0]: spurious out_last (match_remain=6)")
+        wait 1 cycle         // copy_rd_ptr→1, match_remain→5, history[3]=97
+
+        assert dut.out_valid == 1
+            else fail("T2 match[1]: out_valid low")
+        assert dut.out_data == 98
+            else fail("T2 match[1]: want 98 (b), got ${dut.out_data}")
+        assert dut.out_last == 0
+            else fail("T2 match[1]: spurious out_last (match_remain=5)")
+        wait 1 cycle         // copy_rd_ptr→2, match_remain→4, history[4]=98
+
+        assert dut.out_valid == 1
+            else fail("T2 match[2]: out_valid low")
+        assert dut.out_data == 99
+            else fail("T2 match[2]: want 99 (c), got ${dut.out_data}")
+        assert dut.out_last == 0
+            else fail("T2 match[2]: spurious out_last (match_remain=4)")
+        wait 1 cycle         // copy_rd_ptr→3, match_remain→3, history[5]=99
+
+        assert dut.out_valid == 1
+            else fail("T2 match[3]: out_valid low")
+        assert dut.out_data == 97
+            else fail("T2 match[3]: want 97 (a), got ${dut.out_data}")
+        assert dut.out_last == 0
+            else fail("T2 match[3]: spurious out_last (match_remain=3)")
+        wait 1 cycle         // copy_rd_ptr→4, match_remain→2, history[6]=97
+
+        assert dut.out_valid == 1
+            else fail("T2 match[4]: out_valid low")
+        assert dut.out_data == 98
+            else fail("T2 match[4]: want 98 (b), got ${dut.out_data}")
+        assert dut.out_last == 0
+            else fail("T2 match[4]: spurious out_last (match_remain=2)")
+        wait 1 cycle         // copy_rd_ptr→5, match_remain→1, history[7]=98
+        // After posedge: match_remain=1, second eval_comb:
+        //   out_data=history[5]=99, out_last=(saw_last=1 AND match_remain==1)=true
+
+        assert dut.out_valid == 1
+            else fail("T2 match[5]: out_valid low")
+        assert dut.out_data == 99
+            else fail("T2 match[5]: want 99 (c), got ${dut.out_data}")
+        assert dut.out_last == 1
+            else fail("T2 match[5]: out_last not asserted on final byte")
+        wait 1 cycle         // match_remain→0, state→ST_TOKEN
+
+        log(info, "Test 2 PASS: abcabcabc decompressed correctly")
+        log(info, "ALL TESTS PASSED")
+    end run
+end impl Lz4BlockDecompTest
