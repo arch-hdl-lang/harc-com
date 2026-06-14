@@ -122,7 +122,7 @@ Residual first-blocker map for the other 16 (re-run of
 |---|---|
 | `bus` (2) | `bind_remap_test`, `transactor_parse_test` — **`axilite_regs_full_test` REGISTERED 2026-06-13 by the expression-position-call slice: `helper.read(addr)` in assert/bitwise expression positions now hoists into a preceding `Stmt::TransactorCall`; `AxiLiteRegs.sv`, pass, trace-diff clean v1↔tbir** |
 | `regblock` (9) | `regblock_basic_test`, `regblock_fields_test`, `regblock_access_test`, `regblock_bitbash_test`, `regblock_addrmap_test`, `regblock_alias_test`, `regblock_record_api_test`, `regblock_record_test`, `regblock_record_recursion_test` — **regblock slice landed 2026-06-12; bus-bound `via` helper (initiator-side BFM) + the regblock-residuals slice (register read in assert/format → `Expr::RegRead`; `bitbash(regs)`) + the field-level/addrmap slice (`regs.REG.FIELD` masked RMW; `addrmap` 3-/4-level access; `alias of`) landed 2026-06-13. The passive `record_write`/`record_read` API (constant-address decode → masked mirror op, no bus) landed 2026-06-13. The per-register `on regs.REG` write callback landed 2026-06-13 (closure-hook cluster, divergence 20): `record_write` → `Stmt::RecordWriteCb` (mirror + recursion guard + callback dispatch) via host-state promotion (shared mirror + `cb_depth` at test scope). ALL NINE regblock fixtures now lower and are registered (`record_recursion_test` is a negative `fail` fixture — the depth-16 guard FATALs identically under both codegens) — see the `regblock` construct group below.** |
-| `scoreboard` (2) | `analysis_sink_connect_test`, `axilite_env_test` |
+| `scoreboard` (2) | `analysis_sink_connect_test` — **`axilite_env_test` REGISTERED 2026-06-13 by the env-of-DUT-poking-transactor slice (see the transactor-composition cluster below)** |
 | ~~`tseq` (2)~~ → deeper | `axilite_seqdrv_test`, `transactor_active_test` — **tseq slice landed 2026-06-13; both lower their `tseq` now, and the transactor-state-field slice (2026-06-13) advanced `axilite_seqdrv_test` past its state field too — both now stop at an event field: `axilite_seqdrv_test` → `req : in event<RegOp>` (event-driven unbound transactor), `transactor_active_test` → bound-to transactor event field — see the `tseq` construct group below** |
 | ~~transactor state fields~~ → ~~record param~~ → ~~pre/post hooks~~ (resolved) | `axilite_hooks_test` — **REGISTERED 2026-06-13 (closure-hook cluster, divergence 20, pass): the test-scope `on drv.send pre/post` method hooks now lower via host-state promotion (captured test-scope `let`s → `_tb` scalar fields; hook bodies → `FunctionKind::TestHook` functions back-patched onto `TransactorMethodSchema::pre_hooks`/`post_hooks`, fired around the body in `emit_method`); trace-diff clean v1↔tbir at seed 1** |
 | transactor state fields (self-proving) | `transactor_state_field_test` — **REGISTERED 2026-06-13** (`cam_dual_basic.sv`, pass): scalar state on the unbound DUT-poking transactor, written + read in method bodies and read back at test scope; trace-diff clean v1↔tbir |
@@ -160,12 +160,40 @@ prior silent mis-lowering of a named `queue<Record>` element as an unsigned
 scalar (the `_ => false` fall-through in component-field lowering) was also
 fixed — it is now a precise rejection (`queue_elem_signedness`).
 
+The **env-of-DUT-poking-transactor slice (2026-06-13)** broadened the
+routing one step further, but **per use-site**: a **purely structural
+DUT-poking hookable BFM** transactor — `hookable` methods + a module-typed
+`dut` handle, with NO `on`/event handler and no `bound to` — routes to the
+composite-component table ONLY when it is **env-held** (referenced as a
+by-value sub-component field of some `env`/`agent` decl). Standalone (a
+top-level testbench field or test-scope `let`) it stays on the dedicated
+`TransactorSchema` path — its long-standing default that the contract unit
+tests and every standalone fixture rely on. `transactor_is_component`
+gained an `env_held: bool` parameter (the trailing BFM arm is
+`env_held && has_hookable && has_module_field && !has_event`); the
+`env_held` set is computed once from every `env`/`agent` decl's `Named`
+field types (a `testbench` parses as `Item::Env` too, but is excluded — a
+testbench FIELD is a top-level binding, not an env holding the BFM by
+value). When env-held, an `env` holds the BFM by value as a `Sub` field
+(`env AxilEnv { drv : AxilXactor active; sb : AxilSb }`) and
+`env.drv.<method>(...)` / `env.drv.dut = dut` resolve through the existing
+component sub-component + DUT-bind machinery. v1 emits this BFM identically
+to a component (a struct with a `dut` handle + `<Type>_<method>(<Type>&
+self, ...)` free-function lambdas, `wait N cycles` → synchronous `tick()`
+loops), so the component-method emission is byte-faithful. Being a
+transactor, an env-held BFM still requires an explicit `active` mode at
+every binding site (a `passive` instance has no methods — every method
+lives under `when active`); a new `transactor_is_dut_poking_bfm(t,
+env_held)` classifier (true exactly for the env-held BFM) feeds the
+`dut_poking_bfm_names` gate that enforces this at the testbench-field and
+test-scope-`let` sites.
+
 | Fixture | Status | First blocker |
 |---|---|---|
 | `dma_engine_test` | **REGISTERED 2026-06-13** (`dma_engine.sv`, pass; trace-diff clean v1↔tbir) | (resolved) a PASSIVE reactive-monitor transactor (`mon : MemXactor passive`, `on dut.<v> && dut.<r>` observers + `on dut.<v> level` combinational memory model) + an `active` DUT-poking APB BFM |
 | `scoreboard_typed_queue_test` | **REGISTERED 2026-06-13** (`scoreboard_typed_queue.sv`, pass; trace-diff clean v1↔tbir) | (resolved) `queue<CheckerError>` (record-element queue) on a method-bearing scoreboard component + the component-queue-op seam (`ComponentQueuePush`/`Pop`/`QueueQuery` push/pop/size of a struct on a component `Queue` field) + self-relative `sb.record_error(...)` sub-component method call + `checker.sb = sb` whole-value copy (`ComponentSubAssign`) + `on 1 cycles phase post_eval` (the shared `HandlerPhase::PostEval` seam → `_post_eval_services`) |
 | `post_eval_provider_test` | deferred | function-library transactor (`ProtocolModel`, methods only, no DUT handle) used as a sub-field + component-as-method-argument (`sb.observe(addr, model)` passes a transactor instance and dispatches `model.predict_read(...)` on the param) + `on ... phase post_eval`. Needs the function-library-as-sub-field + component-arg + post_eval-phase seams. |
-| `axilite_env_test` | deferred | env-of-method-transactor: `env AxilEnv { drv : AxilXactor }` holds a DUT-poking hookable BFM as a Sub, with nested `env.drv.<method>` dispatch + `env.drv.dut = dut` bind through the env. The DUT-poking BFM lowers as a `TransactorSchema` (not a `ComponentSchema`), so it is not resolvable as an env Sub field; needs env Sub-of-transactor resolution + nested method/DUT-bind routing. |
+| `axilite_env_test` | **REGISTERED 2026-06-13** (`AxiLiteRegs.sv`, pass; trace-diff clean v1↔tbir) | (resolved) env-of-method-transactor: `env AxilEnv { drv : AxilXactor active; sb : AxilSb }` holds a DUT-poking hookable BFM as a `Sub`, with nested `env.drv.<method>(...)` dispatch + `env.drv.dut = dut` bind + `env.sb.expected.push/pop` scalar-queue access through the env. The env-of-DUT-poking-transactor slice routes the BFM to the composite-component table (see the cluster intro above). |
 
 The `dma_engine` unlock landed the reactive-monitor routing.
 `scoreboard_typed_queue_test` (2026-06-13) then landed the **component-
@@ -176,10 +204,13 @@ component-queue ops (`ComponentQueuePush`/`ComponentQueuePop`/
 (`sb.record_error(...)` → a `self`-rooted `Path` base), a whole sub-
 component value copy (`ComponentSubAssign`, `checker.sb = sb`), and the
 general `HandlerPhase` concept (`Checker` → `_checkers`, `PostEval` →
-`_post_eval_services`) carried on `PeriodicHandlerSchema.phase`. The two
-remaining fixtures stack further seams (function-library-as-sub-field +
-component-arg [`post_eval_provider_test` reuses the `phase post_eval`
-seam] / env-of-BFM) and stay rejected precisely.
+`_post_eval_services`) carried on `PeriodicHandlerSchema.phase`. The
+`axilite_env_test` unlock (2026-06-13) landed the env-of-DUT-poking-BFM
+routing (a hookable BFM with a `dut` handle routes to the composite-
+component table when held as an `env`/`agent` sub-field). The one
+remaining fixture, `post_eval_provider_test`, stacks further seams
+(function-library-as-sub-field + component-as-method-argument; it reuses
+the `phase post_eval` seam) and stays rejected precisely.
 
 ### `regblock` construct — PARTIALLY RESOLVED (regblock slice 2026-06-12; bus-bound BFM + residuals + field-level/addrmap 2026-06-13)
 
