@@ -24,13 +24,17 @@ enum CompileScope {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 enum CodegenKind {
-    /// Legacy direct AST → C++ emitter (`codegen/cpp_tb.rs`).
-    #[default]
+    /// Legacy direct AST → C++ emitter (`codegen/cpp_tb.rs`). Escape hatch
+    /// kept reachable via `--codegen v1` while the TB-IR pipeline soaks as
+    /// the default (phase 5); slated for removal in phase 6.
     V1,
-    /// Typed TB-IR pipeline: AST → IR (lower + verify) → C++
-    /// loop-switch emitter (`src/ir/` + `codegen/tbir/`). MVP subset;
-    /// unsupported constructs fail with a structured error naming the
-    /// construct.
+    /// Typed TB-IR pipeline: AST → IR (lower + verify) → C++ loop-switch
+    /// emitter (`src/ir/` + `codegen/tbir/`). The default backend: it
+    /// covers the full equivalence-proven fixture corpus
+    /// (`tests/tbir_equiv_fixtures.txt`), trace-identical to v1. A
+    /// construct outside its subset fails with a structured error naming
+    /// the construct and suggesting `--codegen v1`.
+    #[default]
     Tbir,
 }
 
