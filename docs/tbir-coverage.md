@@ -46,6 +46,44 @@ see tbir-mvp.md divergence 1). `probe_basic_test`, `probe_force_test`,
 and `testbench_probe_dut_test` (all `cpu_pipeline.sv`) are registered,
 trace-diff clean v1↔tbir at seed 1. See the **probe/force group** below.
 
+## ✅ COVERAGE COMPLETE (2026-06-13)
+
+The TB-IR (`--codegen tbir`) backend now covers the **entire admissible
+HARC fixture corpus**. The registry (`tests/tbir_equiv_fixtures.txt`)
+holds **119 rows**, every one passing under BOTH `--codegen v1` and
+`--codegen tbir` with `harc trace-diff` clean at seed 1
+(`tests/run_tbir_equiv.sh` = 118 fixture-pairs + the registry-only
+`fatal_path_test` deliberate-failure row). The closing wave (#401–#405)
+landed the last constructs: the wide-value (>64-bit) method ABI
+(`aes_cipher`), the transactor-composition cluster (reactive-monitor
+routing / `dma_engine`; `queue<Record>` + `phase post_eval` /
+`scoreboard_typed_queue`; env-of-DUT-poking-BFM / `axilite_env`;
+function-library transactor + component-arg dispatch /
+`post_eval_provider`).
+
+**`LowerError::Unsupported` is empty for every fixture that can be
+equivalence-gated.** Two categories of fixture remain outside the
+registry, by construction — not coverage gaps:
+
+1. **`tlm_pairing_arch_target_test` — excluded (arch-com DUT bug, not a
+   TB-IR gap).** Its auto-emitted DUT-side `_auto_tlm_*_req_stable` SVA
+   over-asserts on back-to-back tagged forks and `$fatal`s under any
+   simulator (not a local-version artifact). Tracked as an arch-com
+   issue; the TB-IR lowering itself is correct.
+
+2. **Six non-equivalence-gateable single-file fixtures (triaged
+   2026-06-13).** The equivalence gate requires a fixture to pass under
+   `--codegen v1` too; these cannot, so they are out of scope:
+
+   | fixture | why out of scope |
+   |---|---|
+   | `axi_agent` | repo-classified round-trip/z3 spec-sketch; unresolved imported enums, no `AxiSlave` DUT — cannot lower to a testbench |
+   | `axilite_cov_test` | `testbench` omits the `cov` member its `check` reads → v1 emits non-compiling C++; range-bin+cross ground already covered by `cov_cross_bins_test`. Kept as the moving `axilite_cov_fixture_still_unsupported` tracking marker. |
+   | `axilite_event_test` | `testbench` omits its `sb` member → not v1-runnable; event/scoreboard ground covered by `event_driven_transactor_test` / `scoreboard_basic_test` |
+   | `axilite_sb_test` | `testbench` omits its `sb` member → not v1-runnable; queue-scoreboard ground covered by `scoreboard_typed_queue_test` |
+   | `transactor_forward_ref_consumer_test` | `codegen.rs` struct-ordering unit-test fixture; v1 emits non-compilable C++ — no behavioral sim |
+   | `transactor_hookable_call_graph_edge_test` | `codegen.rs` call-edge ordering unit-test fixture; targets a `DummyDut` with no SV — no runnable sim |
+
 **This file is a snapshot, not a source of truth.** The registry
 (`tests/tbir_equiv_fixtures.txt`) is the source of truth for what is
 covered. Regenerate this report by re-running the sweep: for every
