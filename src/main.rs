@@ -2018,6 +2018,32 @@ fn cmd_sim(
     if let Some(s) = seed {
         cmd.env("HARC_SEED", s.to_string());
     }
+    // `arch sim` compiles the generated C++ testbench itself. When the TB
+    // uses the runtime constraint solver it `#include`s `harc_z3_rt.h`
+    // (→ `<z3++.h>`) and must link libz3 — but `arch sim` has no -I/-L
+    // flag and no knowledge of Z3. It DOES split `ARCH_OPT` into args of
+    // its single compile+link g++ invocation, so carry the Z3 include/lib
+    // flags through `ARCH_OPT` here. Gated on `uses_solver` so non-solver
+    // `--dut` runs neither require nor link Z3. (The `--sv` path supplies
+    // the same flags via Verilator's `-CFLAGS`/`-LDFLAGS`.) The "-O2 -flto"
+    // base mirrors `arch sim`'s own `ARCH_OPT` default so we don't drop its
+    // optimization flags when `ARCH_OPT` is unset; an env-set `ARCH_OPT` is
+    // preserved and extended.
+    if uses_solver {
+        ensure_z3_for_solver(&z3_paths)?;
+        if let (Some(inc), Some(lib)) = (&z3_paths.include_dir, &z3_paths.lib_dir) {
+            let base = std::env::var("ARCH_OPT").unwrap_or_else(|_| "-O2 -flto".to_string());
+            cmd.env(
+                "ARCH_OPT",
+                format!(
+                    "{base} -I{} -L{} -Wl,-rpath,{} -lz3",
+                    inc.display(),
+                    lib.display(),
+                    lib.display()
+                ),
+            );
+        }
+    }
     let status = cmd.status().into_diagnostic()?;
     if status.success() {
         eprintln!("sim.log written to {}", sim_log_path.display());
