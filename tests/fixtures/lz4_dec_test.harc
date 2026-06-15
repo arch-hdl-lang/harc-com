@@ -1,0 +1,243 @@
+// LZ4 block decompressor verification (Lz4BlockDec).
+//
+// HARC timing model — check-then-drive:
+//   After each posedge, out_data reflects NEW FSM state + OLD inputs (from
+//   the previous coroutine segment). So to observe out_data=X, drive in_data=X
+//   in segment N, wait 1 cycle, then CHECK out_data in segment N+1.
+//
+// CopyLit (out_data=in_data, combinational):
+//   First tick entering CopyLit shows the previous byte (token/ext byte), not
+//   the first literal — check out_valid only. Last CopyLit byte transitions FSM
+//   to DONE/ReadOffLo; its out_data is invisible in post-settle — verify via
+//   state transition (out_valid→0) instead.
+//
+// CopyMatch (out_data=hist_rd_data, registered RAM output):
+//   hist_rd_data is latched in the SAME eval_posedge that transitions
+//   IssueMRead→CopyMatch, so out_data is valid immediately in every CopyMatch
+//   tick — ALL match bytes are verifiable.
+
+testbench Lz4BlockDecTb
+    dut : Lz4BlockDec
+end testbench Lz4BlockDecTb
+
+impl Lz4BlockDecTest for Lz4BlockDecTb
+    run
+        // ── Reset: 3 cycles rst=1, then 1 settle cycle ───────────────────
+        dut.rst = 1
+        dut.in_valid = 0
+        dut.in_data = 0
+        dut.in_last = 0
+        dut.out_ready = 1
+        wait 3 cycles
+        dut.rst = 0
+        wait 1 cycle
+        // post-settle: ReadToken, in_valid=0 → out_valid=0
+
+        // ── Test 1: all-literal "AB" ──────────────────────────────────────
+        log(info, "Test 1: all-literal block AB")
+
+        // ReadToken: drive token 0x20 (lit_len=2, match=0).
+        // Old in_valid=0 → out_valid=0.
+        dut.in_valid = 1
+        dut.in_data = 0x20
+        dut.in_last = 0
+        assert dut.out_valid == 0 else fail("T1: ReadToken must not emit")
+        wait 1 cycle
+        // posedge: ReadToken→CopyLit(2); post-settle: CopyLit, old in_data=0x20
+
+        // CopyLit(2) entered. out_valid=1 (in_valid=1 old). out_data=0x20 (old token).
+        // Do NOT check out_data — drive 'A' for next cycle.
+        assert dut.out_valid == 1 else fail("T1: CopyLit entered, out_valid")
+        dut.in_data = 0x41
+        wait 1 cycle
+        // posedge: copy_cnt 2→1; post-settle: CopyLit(1), old in_data=0x41
+
+        // CopyLit(1). out_data='A'. Drive 'B' + in_last=1.
+        assert dut.out_valid == 1 else fail("T1: CopyLit(1) out_valid")
+        assert dut.out_data == 0x41 else fail("T1: out_data should be 0x41 A")
+        dut.in_data = 0x42
+        dut.in_last = 1
+        wait 1 cycle
+        // posedge: CopyLit(1,in_last=1)→DONE; 'B' output during this cycle (not checkable)
+
+        // DONE state: out_valid=0.
+        assert dut.out_valid == 0 else fail("T1: DONE out_valid should be 0")
+        dut.in_valid = 0
+        dut.in_last = 0
+        log(info, "Test 1 PASS")
+
+        // ── Reset for test 2 ──────────────────────────────────────────────
+        dut.rst = 1
+        wait 3 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // ── Test 2: "ABCDABCD" — 4 literals + 4-byte match back-ref ──────
+        // Compressed: [0x40, A, B, C, D, 0x04, 0x00, 0x00(in_last)]
+        //   token 0x40: lit_len=4, match_nibble=0 → match_len=0+4=4
+        log(info, "Test 2: literal+match ABCDABCD")
+
+        // ReadToken: token 0x40. Old in_valid=0 → out_valid=0.
+        dut.in_valid = 1
+        dut.in_data = 0x40
+        dut.in_last = 0
+        assert dut.out_valid == 0 else fail("T2: ReadToken no output")
+        wait 1 cycle
+        // posedge: ReadToken→CopyLit(4); post-settle: old in_data=0x40
+
+        // CopyLit(4) entered. out_data=0x40 (old token). Drive 'A'.
+        assert dut.out_valid == 1 else fail("T2: enter CopyLit out_valid")
+        dut.in_data = 0x41
+        wait 1 cycle
+        // posedge: copy_cnt 4→3; post-settle: out_data='A'
+
+        // CopyLit(3). Check 'A', drive 'B'.
+        assert dut.out_valid == 1 else fail("T2: CopyLit A out_valid")
+        assert dut.out_data == 0x41 else fail("T2: CopyLit A out_data")
+        dut.in_data = 0x42
+        wait 1 cycle
+        // posedge: copy_cnt 3→2; post-settle: out_data='B'
+
+        // CopyLit(2). Check 'B', drive 'C'.
+        assert dut.out_valid == 1 else fail("T2: CopyLit B out_valid")
+        assert dut.out_data == 0x42 else fail("T2: CopyLit B out_data")
+        dut.in_data = 0x43
+        wait 1 cycle
+        // posedge: copy_cnt 2→1; post-settle: out_data='C'
+
+        // CopyLit(1). Check 'C', drive 'D' (in_last=0, match follows).
+        assert dut.out_valid == 1 else fail("T2: CopyLit C out_valid")
+        assert dut.out_data == 0x43 else fail("T2: CopyLit C out_data")
+        dut.in_data = 0x44
+        dut.in_last = 0
+        wait 1 cycle
+        // posedge: CopyLit(1,in_last=0)→ReadOffLo; 'D' output (not checkable)
+
+        // ReadOffLo. out_valid=0. Drive offset_lo=0x04.
+        assert dut.out_valid == 0 else fail("T2: ReadOffLo no output")
+        dut.in_data = 0x04
+        wait 1 cycle
+        // posedge: ReadOffLo→ReadOffHi, off_lo_r=0x04
+
+        // ReadOffHi. out_valid=0. Drive offset_hi=0x00.
+        assert dut.out_valid == 0 else fail("T2: ReadOffHi no output")
+        dut.in_data = 0x00
+        wait 1 cycle
+        // posedge: ReadOffHi→IssueMRead, match_off=4, copy_cnt=4
+
+        // Match copy — no more compressed input needed.
+        dut.in_valid = 0
+
+        // IssueMRead[0]: hist_rd_addr=(4-4)=0. No output.
+        assert dut.out_valid == 0 else fail("T2: IssueMRead[0] no output")
+        wait 1 cycle
+        // posedge: hist latches mem[0]='A'; IssueMRead→CopyMatch(4)
+
+        // CopyMatch[0]: out_data='A'. hist_rd_data valid from same posedge.
+        assert dut.out_valid == 1 else fail("T2: CopyMatch[0] out_valid")
+        assert dut.out_data == 0x41 else fail("T2: CopyMatch[0] out_data A")
+        wait 1 cycle
+        // posedge: CopyMatch(4)→IssueMRead(3), write_ptr 4→5
+
+        // IssueMRead[1]: hist_rd_addr=(5-4)=1. No output.
+        assert dut.out_valid == 0 else fail("T2: IssueMRead[1] no output")
+        wait 1 cycle
+        // posedge: hist latches mem[1]='B'; IssueMRead→CopyMatch(3)
+
+        // CopyMatch[1]: out_data='B'.
+        assert dut.out_valid == 1 else fail("T2: CopyMatch[1] out_valid")
+        assert dut.out_data == 0x42 else fail("T2: CopyMatch[1] out_data B")
+        wait 1 cycle
+
+        // IssueMRead[2]: hist_rd_addr=(6-4)=2. No output.
+        assert dut.out_valid == 0 else fail("T2: IssueMRead[2] no output")
+        wait 1 cycle
+
+        // CopyMatch[2]: out_data='C'.
+        assert dut.out_valid == 1 else fail("T2: CopyMatch[2] out_valid")
+        assert dut.out_data == 0x43 else fail("T2: CopyMatch[2] out_data C")
+        wait 1 cycle
+
+        // IssueMRead[3]: hist_rd_addr=(7-4)=3. No output.
+        assert dut.out_valid == 0 else fail("T2: IssueMRead[3] no output")
+        wait 1 cycle
+        // posedge: hist latches mem[3]='D'; IssueMRead→CopyMatch(1)
+
+        // CopyMatch[3] (last match byte, copy_cnt=1): out_data='D'. Still CopyMatch
+        // post-settle — verifiable! Transition to ReadToken happens NEXT posedge.
+        assert dut.out_valid == 1 else fail("T2: CopyMatch[3] out_valid")
+        assert dut.out_data == 0x44 else fail("T2: CopyMatch[3] out_data D")
+        wait 1 cycle
+        // posedge: CopyMatch(1)+out_ready→ReadToken
+
+        // Terminal zero-literal last-sequence: token 0x00 with in_last=1.
+        dut.in_valid = 1
+        dut.in_data = 0x00
+        dut.in_last = 1
+        assert dut.out_valid == 0 else fail("T2: terminal ReadToken no output")
+        wait 1 cycle
+        // posedge: ReadToken(in_valid=1,in_last=1)→DONE
+
+        dut.in_valid = 0
+        dut.in_last = 0
+        log(info, "Test 2 PASS")
+
+        // ── Reset for test 3 ──────────────────────────────────────────────
+        dut.rst = 1
+        wait 3 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // ── Test 3: extended literal length (18 bytes A..R) ──────────────
+        // Token 0xF0 (lit_nibble=15) → ExtLitLen; extra byte 3 → CopyLit(18).
+        log(info, "Test 3: extended lit-len, 18 literals A..R")
+
+        // ReadToken: 0xF0, lit_nibble=15 → ExtLitLen. Old in_valid=0 → out_valid=0.
+        dut.in_valid = 1
+        dut.in_data = 0xF0
+        dut.in_last = 0
+        assert dut.out_valid == 0 else fail("T3: ReadToken no output")
+        wait 1 cycle
+        // posedge: ReadToken→ExtLitLen, lit_len_r=15
+
+        // ExtLitLen: extra byte 3 (< 255) → copy_cnt = 15+3 = 18 → CopyLit.
+        assert dut.out_valid == 0 else fail("T3: ExtLitLen no output")
+        dut.in_data = 3
+        wait 1 cycle
+        // posedge: ExtLitLen→CopyLit(18), copy_cnt_r=18
+
+        // CopyLit(18) entered. out_data=0x03 (old ext byte — do NOT check).
+        // Drive lit[0]='A' (0x41).
+        assert dut.out_valid == 1 else fail("T3: CopyLit entered out_valid")
+        dut.in_data = 0x41
+        dut.in_last = 0
+        wait 1 cycle
+        // posedge: copy_cnt 18→17; post-settle: out_data='A'
+
+        // Check lit[i-1], drive lit[i] for i=1..17 (verifies lit[0..16]).
+        for i in 1..17
+            let prev_byte = 0x40 + i
+            let next_byte = 0x41 + i
+            assert dut.out_valid == 1 else fail("T3: out_valid at i")
+            assert dut.out_data == prev_byte else fail("T3: out_data mismatch")
+            dut.in_data = next_byte
+            wait 1 cycle
+        end for
+        // After loop: copy_cnt=1; post-settle: out_data=lit[16]=0x51='Q'
+
+        // CopyLit(1): check lit[16]='Q', drive lit[17]='R'+in_last.
+        assert dut.out_valid == 1 else fail("T3: out_valid pre-last")
+        assert dut.out_data == 0x51 else fail("T3: out_data should be 0x51 Q")
+        dut.in_data = 0x52
+        dut.in_last = 1
+        wait 1 cycle
+        // posedge: CopyLit(1,in_last=1)→DONE; 'R' output (not checkable)
+
+        dut.in_valid = 0
+        dut.in_last = 0
+        assert dut.out_valid == 0 else fail("T3: DONE out_valid should be 0")
+        log(info, "Test 3 PASS")
+
+        log(info, "ALL TESTS PASSED")
+    end run
+end impl Lz4BlockDecTest

@@ -180,6 +180,64 @@ while IFS= read -r row; do
     run_one "$row"
 done <<<"$FIXTURES"
 
+# ── ARCH-source DUT fixtures (use --dut, require the arch binary) ──────────
+# Each row: <test_name> | <arch_src_dir> | <dut_files (space-separated)>
+# arch_src_dir is relative to ARCH_SRC_ROOT (default: ../arch-com).
+ARCH_BIN="${ARCH_BIN:-}"
+ARCH_SRC_ROOT="${ARCH_SRC_ROOT:-../arch-com}"
+if [ -z "$ARCH_BIN" ]; then
+    if [ -x "$ARCH_SRC_ROOT/target/release/arch" ]; then
+        ARCH_BIN="$ARCH_SRC_ROOT/target/release/arch"
+    elif command -v arch >/dev/null 2>&1; then
+        ARCH_BIN="arch"
+    fi
+fi
+
+read -r -d '' ARCH_FIXTURES <<'ARCHEOF' || true
+lz4_dec_test | examples/lz4_dec | PkgLz4.arch Lz4HistBuf.arch Lz4DecFsm.arch Lz4BlockDec.arch
+ARCHEOF
+
+run_one_arch() {
+    local row="$1"
+    IFS='|' read -r test arch_dir dut_files <<<"$row"
+    test="$(echo "$test" | xargs)"
+    arch_dir="$(echo "$arch_dir" | xargs)"
+    dut_files="$(echo "$dut_files" | xargs)"
+    [ -z "$test" ] && return 0
+
+    if [ -z "$ARCH_BIN" ]; then
+        echo "  SKIP  $test (no arch binary; set ARCH_BIN or build arch-com)"
+        return 0
+    fi
+
+    local dut_args=()
+    for f in $dut_files; do
+        dut_args+=("--dut" "$ARCH_SRC_ROOT/$arch_dir/$f")
+    done
+
+    rm -rf harc_sim_build
+    local out
+    out="$("$HARC" sim "${dut_args[@]}" "$FIX_DIR/$test.harc" \
+        --arch-bin "$ARCH_BIN" 2>&1)" || true
+
+    if echo "$out" | grep -q "ALL TESTS PASSED"; then
+        echo "  PASS  $test"
+        PASS=$((PASS + 1))
+    else
+        echo "  FAIL  $test"
+        echo "$out" | tail -20 | sed 's/^/      /'
+        FAIL=$((FAIL + 1))
+        FAILED_NAMES+=("$test")
+    fi
+}
+
+if [ -n "$ARCH_BIN" ] || [ -x "$ARCH_SRC_ROOT/target/release/arch" ]; then
+    echo "Running ARCH-source DUT fixtures (arch-bin: ${ARCH_BIN:-not found})..."
+    while IFS= read -r row; do
+        run_one_arch "$row"
+    done <<<"$ARCH_FIXTURES"
+fi
+
 echo
 echo "Result: $PASS passed, $FAIL failed"
 if [ $FAIL -gt 0 ]; then
