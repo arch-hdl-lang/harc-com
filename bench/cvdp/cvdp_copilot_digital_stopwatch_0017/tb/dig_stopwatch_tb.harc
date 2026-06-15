@@ -1,0 +1,76 @@
+// HARC stimulus bench for CVDP cid012 `cvdp_copilot_digital_stopwatch_0017`.
+//
+// The DUT's divider defaults to 50 MHz, so this bench uses force probes to
+// pulse the internal one-second signal and place seconds/minutes at rollover
+// boundaries without simulating tens of millions of cycles.
+
+testbench DigStopwatchTb
+    let dut : dig_stopwatch
+        probe force one_sec_force : bool at one_sec_pulse
+        probe force seconds_force : uint<6> at seconds
+        probe force minutes_force : uint<6> at minutes
+    end let dut
+end testbench DigStopwatchTb
+
+function pulse_second(dut: dig_stopwatch)
+    dut.one_sec_force = 0
+    wait 1ns
+    dut.one_sec_force = 1
+    wait 1ns
+    dut.one_sec_force = 0
+    wait 1ns
+end function pulse_second
+
+impl DigStopwatchTest for DigStopwatchTb
+    clock clk = 10ns
+
+    run
+        log(info, "dig_stopwatch: fast pulse, pause, rollover, and hour coverage")
+
+        dut.reset = 1
+        dut.start_stop = 0
+        dut.one_sec_force = 0
+        wait 3 cycles
+        dut.reset = 0
+        wait 1 cycle
+
+        // Cover divider start/stop branches on the real clocked divider.
+        dut.start_stop = 0
+        wait 2 cycles
+        dut.start_stop = 1
+        wait 4 cycles
+        dut.start_stop = 0
+        wait 2 cycles
+
+        dut.start_stop = 1
+        for _ in 0 .. 4
+            pulse_second(dut)
+        end for
+
+        // seconds == 59 rollover into minutes.
+        dut.seconds_force = 59
+        dut.minutes_force = 12
+        wait 1ns
+        release dut.seconds_force
+        release dut.minutes_force
+        pulse_second(dut)
+
+        // minutes == 59 rollover into hour.
+        dut.seconds_force = 59
+        dut.minutes_force = 59
+        wait 1ns
+        release dut.seconds_force
+        release dut.minutes_force
+        pulse_second(dut)
+
+        // Once hour is set, the guarded stopwatch update should hold.
+        pulse_second(dut)
+        dut.start_stop = 0
+        pulse_second(dut)
+
+        dut.reset = 1
+        wait 2 cycles
+        dut.reset = 0
+        log(info, "dig_stopwatch stimulus complete")
+    end run
+end impl DigStopwatchTest

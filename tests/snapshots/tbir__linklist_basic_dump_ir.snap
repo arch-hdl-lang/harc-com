@@ -10,202 +10,202 @@ fn fn0 run_LinklistBasicTest [kind=Run, owner=tb0]
   locals:
     %0 __t0 : unknown
     %1 __t1 : unknown
-    %2 __t2 : unknown
+    %2 __t2 : uint<32>
     %3 __t3 : unknown
     %4 __t4 : unknown
     %5 h : unknown
     %6 h_2 : unknown
     %7 __t5 : unknown
-    %8 handle : unknown
+    %8 handle : uint<32>
     %9 __t6 : unknown
-    %10 __t7 : unknown
-    %11 data : unknown
+    %10 __t7 : uint<32>
+    %11 data : uint<32>
     %12 __t8 : unknown
     %13 __t9 : unknown
     %14 h_3 : unknown
     %15 h2 : unknown
-    %16 __t10 : unknown
+    %16 __t10 : uint<32>
     %17 __t11 : unknown
     %18 __t12 : unknown
     %19 d : unknown
     %20 v3 : unknown
     %21 __t13 : unknown
-    %22 __t14 : unknown
-    %23 data_2 : unknown
+    %22 __t14 : uint<32>
+    %23 data_2 : uint<32>
     %24 __t15 : unknown
     %25 __t16 : unknown
     %26 h_4 : unknown
-    %27 __t17 : unknown
-    %28 data_3 : unknown
+    %27 __t17 : uint<32>
+    %28 data_3 : uint<32>
     %29 __t18 : unknown
     %30 __t19 : unknown
     %31 h_5 : unknown
-    %32 __t20 : unknown
-    %33 data_4 : unknown
+    %32 __t20 : uint<32>
+    %33 data_4 : uint<32>
     %34 __t21 : unknown
     %35 __t22 : unknown
     %36 h_6 : unknown
-    %37 __t23 : unknown
-    %38 data_5 : unknown
+    %37 __t23 : uint<32>
+    %38 data_5 : uint<32>
     %39 __t24 : unknown
     %40 __t25 : unknown
     %41 h_7 : unknown
-    %42 __t26 : unknown
+    %42 __t26 : uint<32>
     %43 __t27 : unknown
     %44 __t28 : unknown
     %45 d_2 : unknown
-    %46 __t29 : unknown
+    %46 __t29 : uint<32>
     %47 __t30 : unknown
     %48 __t31 : unknown
     %49 d_3 : unknown
-    %50 __t32 : unknown
+    %50 __t32 : uint<32>
     %51 __t33 : unknown
     %52 __t34 : unknown
     %53 d_4 : unknown
-    %54 __t35 : unknown
+    %54 __t35 : uint<32>
     %55 __t36 : unknown
     %56 __t37 : unknown
     %57 d_5 : unknown
     %58 __t38 : unknown
     %59 i : unknown
-    %60 __t39 : unknown
-    %61 data_6 : unknown
+    %60 __t39 : uint<32>
+    %61 data_6 : uint<32>
     %62 __t40 : unknown
     %63 __t41 : unknown
     %64 h_8 : unknown
     %65 i_2 : unknown
     %66 want : unknown
-    %67 __t42 : unknown
+    %67 __t42 : uint<32>
     %68 __t43 : unknown
     %69 __t44 : unknown
     %70 d_6 : unknown
     %71 got : unknown
     %72 __t45 : unknown
-    %73 __t46 : unknown
-    %74 data_7 : unknown
+    %73 __t46 : uint<32>
+    %74 data_7 : uint<32>
     %75 __t47 : unknown
     %76 __t48 : unknown
     %77 h_9 : unknown
     %78 h6 : unknown
-    %79 __t49 : unknown
-    %80 handle_2 : unknown
+    %79 __t49 : uint<32>
+    %80 handle_2 : uint<32>
     %81 __t50 : unknown
     %82 __t51 : unknown
     %83 data_8 : unknown
     %84 r1 : unknown
     %85 __t52 : unknown
-    %86 handle_3 : unknown
-    %87 data_9 : unknown
-    %88 __t53 : unknown
-    %89 handle_4 : unknown
+    %86 handle_3 : uint<32>
+    %87 data_9 : uint<32>
+    %88 __t53 : uint<32>
+    %89 handle_4 : uint<32>
     %90 __t54 : unknown
     %91 __t55 : unknown
     %92 data_10 : unknown
     %93 r2 : unknown
-    %94 __t56 : unknown
+    %94 __t56 : uint<32>
     %95 __t57 : unknown
     %96 __t58 : unknown
     %97 d_7 : unknown
     %98 __t59 : unknown
-    %99 __t60 : unknown
+    %99 __t60 : uint<32>
     %100 __t61 : unknown
     %101 __t62 : unknown
     %102 h_10 : unknown
     %103 a0 : unknown
-    %104 __t63 : unknown
+    %104 __t63 : uint<32>
     %105 __t64 : unknown
     %106 __t65 : unknown
     %107 h_11 : unknown
     %108 a1 : unknown
-    %109 __t66 : unknown
+    %109 __t66 : uint<32>
     %110 __t67 : unknown
     %111 __t68 : unknown
     %112 h_12 : unknown
     %113 a2 : unknown
-    %114 __t69 : unknown
+    %114 __t69 : uint<32>
     %115 __t70 : unknown
     %116 __t71 : unknown
     %117 h_13 : unknown
     %118 a3 : unknown
-    %119 __t72 : unknown
+    %119 __t72 : uint<32>
     %120 __t73 : unknown
     %121 __t74 : unknown
     %122 h_14 : unknown
     %123 a4 : unknown
-    %124 __t75 : unknown
+    %124 __t75 : uint<32>
     %125 __t76 : unknown
     %126 __t77 : unknown
     %127 h_15 : unknown
     %128 a5 : unknown
-    %129 __t78 : unknown
+    %129 __t78 : uint<32>
     %130 __t79 : unknown
     %131 __t80 : unknown
     %132 h_16 : unknown
     %133 a6 : unknown
-    %134 __t81 : unknown
+    %134 __t81 : uint<32>
     %135 __t82 : unknown
     %136 __t83 : unknown
     %137 h_17 : unknown
     %138 a7 : unknown
     %139 __t84 : unknown
-    %140 handle_5 : unknown
+    %140 handle_5 : uint<32>
     %141 __t85 : unknown
-    %142 handle_6 : unknown
+    %142 handle_6 : uint<32>
     %143 __t86 : unknown
-    %144 handle_7 : unknown
+    %144 handle_7 : uint<32>
     %145 __t87 : unknown
-    %146 handle_8 : unknown
+    %146 handle_8 : uint<32>
     %147 __t88 : unknown
-    %148 handle_9 : unknown
+    %148 handle_9 : uint<32>
     %149 __t89 : unknown
-    %150 handle_10 : unknown
+    %150 handle_10 : uint<32>
     %151 __t90 : unknown
-    %152 handle_11 : unknown
+    %152 handle_11 : uint<32>
     %153 __t91 : unknown
-    %154 handle_12 : unknown
+    %154 handle_12 : uint<32>
     %155 __t92 : unknown
-    %156 __t93 : unknown
-    %157 data_11 : unknown
+    %156 __t93 : uint<32>
+    %157 data_11 : uint<32>
     %158 __t94 : unknown
     %159 __t95 : unknown
     %160 h_18 : unknown
-    %161 __t96 : unknown
-    %162 data_12 : unknown
+    %161 __t96 : uint<32>
+    %162 data_12 : uint<32>
     %163 __t97 : unknown
     %164 __t98 : unknown
     %165 h_19 : unknown
-    %166 __t99 : unknown
-    %167 data_13 : unknown
+    %166 __t99 : uint<32>
+    %167 data_13 : uint<32>
     %168 __t100 : unknown
     %169 __t101 : unknown
     %170 h_20 : unknown
-    %171 __t102 : unknown
+    %171 __t102 : uint<32>
     %172 __t103 : unknown
     %173 __t104 : unknown
     %174 d_8 : unknown
-    %175 __t105 : unknown
-    %176 data_14 : unknown
+    %175 __t105 : uint<32>
+    %176 data_14 : uint<32>
     %177 __t106 : unknown
     %178 __t107 : unknown
     %179 h_21 : unknown
-    %180 __t108 : unknown
-    %181 data_15 : unknown
+    %180 __t108 : uint<32>
+    %181 data_15 : uint<32>
     %182 __t109 : unknown
     %183 __t110 : unknown
     %184 h_22 : unknown
-    %185 __t111 : unknown
+    %185 __t111 : uint<32>
     %186 __t112 : unknown
     %187 __t113 : unknown
     %188 d_9 : unknown
-    %189 __t114 : unknown
+    %189 __t114 : uint<32>
     %190 __t115 : unknown
     %191 __t116 : unknown
     %192 d_10 : unknown
-    %193 __t117 : unknown
+    %193 __t117 : uint<32>
     %194 __t118 : unknown
     %195 __t119 : unknown
     %196 d_11 : unknown
-    %197 __t120 : unknown
+    %197 __t120 : uint<32>
     %198 __t121 : unknown
     %199 __t122 : unknown
     %200 d_12 : unknown

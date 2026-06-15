@@ -22,8 +22,8 @@ mod records;
 mod regblock;
 mod scoreboards;
 mod stmts;
-mod tseqs;
 mod transactors;
+mod tseqs;
 
 use crate::ast::{
     AddrmapDecl, Block, BuiltinTy, BusDecl, ClockDecl, ComponentDecl, ComponentItem, ExprKind,
@@ -33,8 +33,8 @@ use crate::ast::{
 use crate::ir::{
     self, BasicBlock, BlockId, ClockSpec, ComponentSchema, ConstraintRef, ConstraintSite,
     CovgroupId, CovgroupSchema, FunctionId, FunctionKind, IrType, LocalId, RecordId, RecordSchema,
-    RegblockId, ScoreboardId, ScoreboardSchema, TbFunction, TbProgram, TestSchema, TestbenchId,
-    TestbenchSchema, Terminator, TransactorId, TransactorSchema, TypedLocal, TypedParam,
+    RegblockId, ScoreboardId, ScoreboardSchema, TbFunction, TbProgram, Terminator, TestSchema,
+    TestbenchId, TestbenchSchema, TransactorId, TransactorSchema, TypedLocal, TypedParam,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -51,10 +51,7 @@ impl std::fmt::Display for LowerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LowerError::Unsupported { construct, detail } => {
-                write!(
-                    f,
-                    "TB-IR lowering does not support {construct} yet"
-                )?;
+                write!(f, "TB-IR lowering does not support {construct} yet")?;
                 if !detail.is_empty() {
                     write!(f, " ({detail})")?;
                 }
@@ -185,7 +182,10 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             Item::Const(c) => {
                 let ExprKind::Int(s) = &*c.value.kind else {
                     return Err(unsupported(
-                        &format!("`const {}` with a non-integer-literal initializer", c.name.name),
+                        &format!(
+                            "`const {}` with a non-integer-literal initializer",
+                            c.name.name
+                        ),
                         "",
                     ));
                 };
@@ -375,9 +375,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         .flat_map(|c| c.items.iter())
         .filter_map(|ci| match ci {
             crate::ast::ComponentItem::Field(f) => match &f.ty {
-                TypeExpr::Named { name, .. } => {
-                    name.segments.last().map(|s| s.name.clone())
-                }
+                TypeExpr::Named { name, .. } => name.segments.last().map(|s| s.name.clone()),
                 _ => None,
             },
             _ => None,
@@ -426,7 +424,10 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             }
             let schema = scoreboards::lower_scoreboard(c)?;
             if scoreboard_ids
-                .insert(c.name.name.clone(), ScoreboardId(scoreboard_schemas.len() as u32))
+                .insert(
+                    c.name.name.clone(),
+                    ScoreboardId(scoreboard_schemas.len() as u32),
+                )
                 .is_some()
             {
                 return Err(LowerError::Invalid(format!(
@@ -764,7 +765,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             continue;
         }
         let id = FunctionId(prog.functions.len() as u32);
-        let f = helpers::lower_pure_helper(id, fd, &helper_registry, &helper_ctx, &constraint_sites)?;
+        let f =
+            helpers::lower_pure_helper(id, fd, &helper_registry, &helper_ctx, &constraint_sites)?;
         prog.functions.push(f);
     }
 
@@ -813,7 +815,14 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         let Item::Tseq(decl) = it else { continue };
         let record = tseq_records[&decl.name.name];
         let id = FunctionId(prog.functions.len() as u32);
-        let f = tseqs::lower_tseq(id, decl, record, &tseq_ctx, &helper_registry, &constraint_sites)?;
+        let f = tseqs::lower_tseq(
+            id,
+            decl,
+            record,
+            &tseq_ctx,
+            &helper_registry,
+            &constraint_sites,
+        )?;
         prog.functions.push(f);
     }
 
@@ -884,14 +893,13 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // count (after pure helpers + transactor methods).
     let mut next_fn = prog.functions.len() as u32;
     for src in &comp_sources {
-        let schema =
-            components::lower_component_schema(
-                src,
-                &component_ids,
-                &scoreboard_ids,
-                &record_ids,
-                &mut next_fn,
-            )?;
+        let schema = components::lower_component_schema(
+            src,
+            &component_ids,
+            &scoreboard_ids,
+            &record_ids,
+            &mut next_fn,
+        )?;
         prog.components.push(schema);
     }
     // Pass 1b: resolve `connect` edges (env + agent components — both carry
@@ -1018,9 +1026,10 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         {
             ch.trigger = trigger;
         }
-        if let (Some(ws), Some((period, max_idle))) =
-            (prog.components[i].watchdog.as_mut(), bodies.watchdog_clauses)
-        {
+        if let (Some(ws), Some((period, max_idle))) = (
+            prog.components[i].watchdog.as_mut(),
+            bodies.watchdog_clauses,
+        ) {
             ws.period = period;
             ws.max_idle = max_idle;
         }
@@ -1445,17 +1454,17 @@ fn lower_test(
                 for p in &l.probes {
                     let width = probe_scalar_width(&p.ty).ok_or_else(|| {
                         unsupported(
-                            &format!(
-                                "probe `{}` of non-scalar type",
-                                p.name.name
-                            ),
+                            &format!("probe `{}` of non-scalar type", p.name.name),
                             "probe types must be uint<N>/sint<N>/bits<N>/bit/bool",
                         )
                     })?;
                     if probes
                         .insert(
                             p.name.name.clone(),
-                            ProbeMeta { force: p.force, width: Some(width) },
+                            ProbeMeta {
+                                force: p.force,
+                                width: Some(width),
+                            },
                         )
                         .is_some()
                     {
@@ -1483,8 +1492,7 @@ fn lower_test(
             // Bus binding: `let axil : BusAxiLite = bind dut`.
             TestItem::Let(l)
                 if l.bind
-                    && type_simple_name(l.ty.as_ref())
-                        .is_some_and(|n| buses.contains_key(n)) =>
+                    && type_simple_name(l.ty.as_ref()).is_some_and(|n| buses.contains_key(n)) =>
             {
                 let bus_name = type_simple_name(l.ty.as_ref()).unwrap();
                 let decl = buses[bus_name];
@@ -1574,9 +1582,9 @@ fn lower_test(
             TestItem::Let(l)
                 if l.bind
                     && type_simple_name(l.ty.as_ref()).is_some_and(|n| {
-                        prog.transactors.iter().any(|x| {
-                            x.name == n && x.bound_bus.is_some() && !x.methods.is_empty()
-                        })
+                        prog.transactors
+                            .iter()
+                            .any(|x| x.name == n && x.bound_bus.is_some() && !x.methods.is_empty())
                     }) =>
             {
                 if !l.probes.is_empty() {
@@ -1596,7 +1604,10 @@ fn lower_test(
                 // The BFM host must be `active` — its methods are
                 // test-called (via the regblock frontdoor or directly).
                 match l.ty.as_ref() {
-                    Some(TypeExpr::Named { mode: Some(TransactorMode::Active), .. }) => {}
+                    Some(TypeExpr::Named {
+                        mode: Some(TransactorMode::Active),
+                        ..
+                    }) => {}
                     _ => {
                         return Err(unsupported(
                             &format!(
@@ -1622,7 +1633,10 @@ fn lower_test(
                     }
                 };
                 let xid = ir::TransactorId(
-                    prog.transactors.iter().position(|x| x.name == simple).unwrap() as u32,
+                    prog.transactors
+                        .iter()
+                        .position(|x| x.name == simple)
+                        .unwrap() as u32,
                 );
                 initiator_bfm_binds.push((l.name.name.clone(), xid, bus_field));
             }
@@ -1639,9 +1653,9 @@ fn lower_test(
             TestItem::Let(l)
                 if l.bind
                     && type_simple_name(l.ty.as_ref()).is_some_and(|n| {
-                        component_ids.get(n).is_some_and(|cid| {
-                            prog.components[cid.index()].bound_bus.is_some()
-                        })
+                        component_ids
+                            .get(n)
+                            .is_some_and(|cid| prog.components[cid.index()].bound_bus.is_some())
                     }) =>
             {
                 if !l.probes.is_empty() {
@@ -1672,8 +1686,14 @@ fn lower_test(
                 //     pure-driver transactor with no monitor half has nothing
                 //     for a passive instance to do).
                 match l.ty.as_ref() {
-                    Some(TypeExpr::Named { mode: Some(TransactorMode::Active), .. }) => {}
-                    Some(TypeExpr::Named { mode: Some(TransactorMode::Passive), .. }) => {
+                    Some(TypeExpr::Named {
+                        mode: Some(TransactorMode::Active),
+                        ..
+                    }) => {}
+                    Some(TypeExpr::Named {
+                        mode: Some(TransactorMode::Passive),
+                        ..
+                    }) => {
                         if !has_monitor {
                             return Err(unsupported(
                                 &format!(
@@ -1745,7 +1765,10 @@ fn lower_test(
                 // The responder host must be `passive` — its methods are
                 // request-served, never test-called.
                 match l.ty.as_ref() {
-                    Some(TypeExpr::Named { mode: Some(TransactorMode::Passive), .. }) => {}
+                    Some(TypeExpr::Named {
+                        mode: Some(TransactorMode::Passive),
+                        ..
+                    }) => {}
                     _ => {
                         return Err(unsupported(
                             &format!(
@@ -1771,7 +1794,10 @@ fn lower_test(
                     }
                 };
                 let xid = ir::TransactorId(
-                    prog.transactors.iter().position(|x| x.name == simple).unwrap() as u32,
+                    prog.transactors
+                        .iter()
+                        .position(|x| x.name == simple)
+                        .unwrap() as u32,
                 );
                 target_tlm_binds.push((l.name.name.clone(), xid, bus_field));
             }
@@ -1793,7 +1819,10 @@ fn lower_test(
                 }
                 if l.value.is_some() {
                     return Err(unsupported(
-                        &format!("component instance `let {}` with an initializer", l.name.name),
+                        &format!(
+                            "component instance `let {}` with an initializer",
+                            l.name.name
+                        ),
                         "components default-construct",
                     ));
                 }
@@ -1807,8 +1836,14 @@ fn lower_test(
                 // agent / scoreboard / sequencer) takes no mode.
                 if dut_poking_bfm_names.contains(simple) {
                     match l.ty.as_ref() {
-                        Some(TypeExpr::Named { mode: Some(TransactorMode::Active), .. }) => {}
-                        Some(TypeExpr::Named { mode: Some(TransactorMode::Passive), .. }) => {
+                        Some(TypeExpr::Named {
+                            mode: Some(TransactorMode::Active),
+                            ..
+                        }) => {}
+                        Some(TypeExpr::Named {
+                            mode: Some(TransactorMode::Passive),
+                            ..
+                        }) => {
                             return Err(unsupported(
                                 &format!(
                                     "passive DUT-poking transactor instance `let {} : \
@@ -1855,7 +1890,10 @@ fn lower_test(
                 }
                 if l.value.is_some() {
                     return Err(unsupported(
-                        &format!("transactor instance `let {}` with an initializer", l.name.name),
+                        &format!(
+                            "transactor instance `let {}` with an initializer",
+                            l.name.name
+                        ),
                         "transactor instances default-construct; bind the DUT with \
                          `{}.dut = dut` in the body",
                     ));
@@ -1865,8 +1903,14 @@ fn lower_test(
                 // testbench-field rule: every method lives in `when
                 // active`, so a passive instance has none).
                 match l.ty.as_ref() {
-                    Some(TypeExpr::Named { mode: Some(TransactorMode::Active), .. }) => {}
-                    Some(TypeExpr::Named { mode: Some(TransactorMode::Passive), .. }) => {
+                    Some(TypeExpr::Named {
+                        mode: Some(TransactorMode::Active),
+                        ..
+                    }) => {}
+                    Some(TypeExpr::Named {
+                        mode: Some(TransactorMode::Passive),
+                        ..
+                    }) => {
                         return Err(unsupported(
                             &format!(
                                 "passive transactor instance `let {} : {simple} passive`",
@@ -1887,7 +1931,10 @@ fn lower_test(
                     }
                 }
                 let xid = ir::TransactorId(
-                    prog.transactors.iter().position(|x| x.name == simple).unwrap() as u32,
+                    prog.transactors
+                        .iter()
+                        .position(|x| x.name == simple)
+                        .unwrap() as u32,
                 );
                 let xdut = &prog.transactors[xid.index()].dut_type;
                 if let Some(dt) = &dut_type {
@@ -1984,10 +2031,7 @@ fn lower_test(
     let mut clock_specs = Vec::new();
     for c in &clocks {
         let (period_ps, domain) = match &*c.period.kind {
-            ExprKind::Time(s) => (
-                time_literal_to_ps(s).map_err(LowerError::Invalid)?,
-                None,
-            ),
+            ExprKind::Time(s) => (time_literal_to_ps(s).map_err(LowerError::Invalid)?, None),
             ExprKind::Ident(id) => {
                 let p = domains.get(&id.name).ok_or_else(|| {
                     LowerError::Invalid(format!(
@@ -2013,7 +2057,9 @@ fn lower_test(
 
     // Testbench schema.
     let synthetic = tb_name.is_none();
-    let tb_schema_name = tb_name.clone().unwrap_or_else(|| format!("{}_tb", t.name.name));
+    let tb_schema_name = tb_name
+        .clone()
+        .unwrap_or_else(|| format!("{}_tb", t.name.name));
     if let Some(tbn) = &tb_name {
         // Validated at the file gate; double-check it resolved.
         if !components.contains_key(tbn) {
@@ -2187,8 +2233,7 @@ fn lower_test(
         // real binding name. The bodies are shared per type; a second
         // bind to a different binding name is rejected (one instance per
         // type per file).
-        let method_fns: Vec<usize> =
-            xschema.methods.iter().map(|m| m.function.index()).collect();
+        let method_fns: Vec<usize> = xschema.methods.iter().map(|m| m.function.index()).collect();
         let xname = xschema.name.clone();
         let remap = binding.remap.clone();
         for fidx in method_fns {
@@ -2253,7 +2298,9 @@ fn lower_test(
         let cname = cschema.name.clone();
         let remap = binding.remap.clone();
         for fidx in body_fns {
-            if let Err(prev) = fill_initiator_bus_prefix(&mut prog.functions[fidx], bus_field, &remap) {
+            if let Err(prev) =
+                fill_initiator_bus_prefix(&mut prog.functions[fidx], bus_field, &remap)
+            {
                 return Err(unsupported(
                     &format!(
                         "bound-to event-driven transactor `{cname}` bound to more than one bus \
@@ -2270,7 +2317,9 @@ fn lower_test(
         // so the body fill above does not reach them.
         for ch in prog.components[cid.index()].cycle_handlers.iter_mut() {
             if ch.monitor_channel.is_some() {
-                if let Err(prev) = fill_initiator_bus_prefix_expr(&mut ch.trigger, bus_field, &remap) {
+                if let Err(prev) =
+                    fill_initiator_bus_prefix_expr(&mut ch.trigger, bus_field, &remap)
+                {
                     return Err(unsupported(
                         &format!(
                             "bound-to event-driven transactor `{cname}` bound to more than one \
@@ -2425,8 +2474,7 @@ fn lower_test(
         .map(|(n, rbid)| (n.clone(), prog.regblocks[rbid.index()].registers.clone()))
         .collect();
     for (binding, amap_name, helper_field) in &addrmap_binds {
-        if regblock_bindings_map.contains_key(binding)
-            || addrmap_bindings_map.contains_key(binding)
+        if regblock_bindings_map.contains_key(binding) || addrmap_bindings_map.contains_key(binding)
         {
             return Err(LowerError::Invalid(format!(
                 "duplicate regblock/addrmap binding `{binding}` in test `{}`",
@@ -2523,7 +2571,11 @@ fn lower_test(
         // State map for test-scope `target.<field>` access.
         target_state.insert(
             instance.clone(),
-            xschema.state_fields.iter().map(|f| f.name.clone()).collect(),
+            xschema
+                .state_fields
+                .iter()
+                .map(|f| f.name.clone())
+                .collect(),
         );
         // Fill the instance into the responder bodies' state-access
         // placeholders. The responder `TbFunction`s are shared per
@@ -2532,13 +2584,14 @@ fn lower_test(
         // the first test's already-filled bodies. The subset is one
         // passive instance per bound transactor — reject the multi-
         // instance case loudly rather than silently mis-emit.
-        let methods: Vec<usize> =
-            xschema.target_methods.iter().map(|m| m.function.index()).collect();
+        let methods: Vec<usize> = xschema
+            .target_methods
+            .iter()
+            .map(|m| m.function.index())
+            .collect();
         let xname = xschema.name.clone();
         for fidx in methods {
-            if let Err(prev) =
-                fill_transactor_state_instance(&mut prog.functions[fidx], instance)
-            {
+            if let Err(prev) = fill_transactor_state_instance(&mut prog.functions[fidx], instance) {
                 return Err(unsupported(
                     &format!(
                         "bound-to transactor `{xname}` bound to more than one instance \
@@ -2607,19 +2660,20 @@ fn lower_test(
         }
         target_state.insert(
             field.clone(),
-            xschema.state_fields.iter().map(|f| f.name.clone()).collect(),
+            xschema
+                .state_fields
+                .iter()
+                .map(|f| f.name.clone())
+                .collect(),
         );
         // Fill the instance into the (type-shared) method bodies'
         // `TransactorState`/`TransactorStateWrite` placeholders. With the
         // per-type uniqueness guarded above, this can only ever fill with
         // a single instance name, but `fill_transactor_state_instance`
         // still cross-checks defensively.
-        let method_fns: Vec<usize> =
-            xschema.methods.iter().map(|m| m.function.index()).collect();
+        let method_fns: Vec<usize> = xschema.methods.iter().map(|m| m.function.index()).collect();
         for fidx in method_fns {
-            if let Err(prev) =
-                fill_transactor_state_instance(&mut prog.functions[fidx], field)
-            {
+            if let Err(prev) = fill_transactor_state_instance(&mut prog.functions[fidx], field) {
                 return Err(unsupported(
                     &format!(
                         "stateful transactor `{xname}` instantiated more than once \
@@ -2736,20 +2790,17 @@ fn lower_test(
             if !promoted_lets.contains(&l.name.name) {
                 continue;
             }
-            let ty = l
-                .ty
-                .as_ref()
-                .and_then(tb_scalar_field_ir_type)
-                .unwrap_or(IrType::UInt(None));
+            let ty =
+                l.ty.as_ref()
+                    .and_then(tb_scalar_field_ir_type)
+                    .unwrap_or(IrType::UInt(None));
             let default = match l.value.as_ref().map(|v| &*v.kind) {
-                Some(ExprKind::Int(s)) => {
-                    s.replace('_', "").parse::<u64>().map_err(|_| {
-                        LowerError::Invalid(format!(
-                            "promoted hook-captured `let {}` has a non-integer initializer",
-                            l.name.name
-                        ))
-                    })?
-                }
+                Some(ExprKind::Int(s)) => s.replace('_', "").parse::<u64>().map_err(|_| {
+                    LowerError::Invalid(format!(
+                        "promoted hook-captured `let {}` has a non-integer initializer",
+                        l.name.name
+                    ))
+                })?,
                 None => 0,
                 _ => {
                     return Err(unsupported(
@@ -2875,7 +2926,13 @@ fn lower_test(
         run_stmts = expanded_run;
         let mut expanded_check = Vec::with_capacity(check_stmts.len());
         for s in &check_stmts {
-            expand_phase_calls(s, &phases, &mut Vec::new(), &mut expanded_check, &t.name.name)?;
+            expand_phase_calls(
+                s,
+                &phases,
+                &mut Vec::new(),
+                &mut expanded_check,
+                &t.name.name,
+            )?;
         }
         check_stmts = expanded_check;
     }
@@ -2903,7 +2960,11 @@ fn lower_test(
 
     let ctx = LowerCtx {
         dut_field: "dut".to_string(),
-        tb_field: if synthetic { None } else { Some("_tb".to_string()) },
+        tb_field: if synthetic {
+            None
+        } else {
+            Some("_tb".to_string())
+        },
         cov_fields: cov_fields.iter().cloned().collect(),
         covgroups: prog.covgroups.clone(),
         clock_names: clock_specs.iter().map(|c| c.name.clone()).collect(),
@@ -3154,14 +3215,21 @@ fn collect_stmts<'a>(b: &'a Block, skip_tb_wire: bool, out: &mut Vec<&'a AstStmt
 /// event is either `_tb.<field>.<method>` (impl form) or `<field>.<method>`
 /// (classic form). Returns `None` for any other shape.
 fn resolve_method_hook_target(event: &crate::ast::Expr) -> Option<(String, String)> {
-    let ExprKind::Field { target, name: method } = &*event.kind else {
+    let ExprKind::Field {
+        target,
+        name: method,
+    } = &*event.kind
+    else {
         return None;
     };
     match &*target.kind {
         // Classic form: `<field>.<method>`.
         ExprKind::Ident(field) => Some((field.name.clone(), method.name.clone())),
         // Impl form: `_tb.<field>.<method>`.
-        ExprKind::Field { target: root, name: field } => {
+        ExprKind::Field {
+            target: root,
+            name: field,
+        } => {
             let ExprKind::Ident(root) = &*root.kind else {
                 return None;
             };
@@ -3326,7 +3394,11 @@ fn collect_idents_in_expr(e: &crate::ast::Expr, out: &mut HashSet<String>) {
             collect_idents_in_expr(expr, out)
         }
         ExprKind::Paren(inner) => collect_idents_in_expr(inner, out),
-        ExprKind::Ternary { cond, then_branch, else_branch } => {
+        ExprKind::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
             collect_idents_in_expr(cond, out);
             collect_idents_in_expr(then_branch, out);
             collect_idents_in_expr(else_branch, out);
@@ -4063,6 +4135,10 @@ impl FuncBuilder<'_> {
         self.locals[l.index()].ty = ty;
     }
 
+    pub(crate) fn local_type(&self, l: LocalId) -> &IrType {
+        &self.locals[l.index()].ty
+    }
+
     /// `Some(record)` when the local is record-typed (`let t : Txn`).
     pub(crate) fn record_of_local(&self, l: LocalId) -> Option<ir::RecordId> {
         match self.locals[l.index()].ty {
@@ -4217,6 +4293,7 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
             }
             ir::Expr::Binary(_, a, b) => in_expr(a).or_else(|| in_expr(b)),
             ir::Expr::Unary(_, a) | ir::Expr::WidthCast { inner: a, .. } => in_expr(a),
+            ir::Expr::BitSlice { target, .. } => in_expr(target),
             ir::Expr::Ternary(c, t, f) => in_expr(c).or_else(|| in_expr(t)).or_else(|| in_expr(f)),
             ir::Expr::Call(_, args) => args.iter().find_map(in_expr),
             // Component fields never carry a transactor-state instance.
@@ -4227,7 +4304,9 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
     for block in &func.blocks {
         for s in &block.stmts {
             let found = match s {
-                ir::Stmt::TransactorStateWrite { instance, value, .. } => {
+                ir::Stmt::TransactorStateWrite {
+                    instance, value, ..
+                } => {
                     if !instance.is_empty() {
                         Some(instance.clone())
                     } else {
@@ -4259,8 +4338,9 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 // tseq bodies never appear in a bound-to responder body
                 // (transactor-method randomize / tseq is out of subset),
                 // so the yielded value holds no transactor-state node.
-                ir::Stmt::SeqPush { value, .. }
-                | ir::Stmt::ComponentQueuePush { value, .. } => in_expr(value),
+                ir::Stmt::SeqPush { value, .. } | ir::Stmt::ComponentQueuePush { value, .. } => {
+                    in_expr(value)
+                }
                 ir::Stmt::ComponentQueuePop { .. } | ir::Stmt::ComponentSubAssign { .. } => None,
                 // Fork/join descriptors carry their request payload exprs;
                 // a responder body never forks, but scan for completeness.
@@ -4296,6 +4376,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 fill_expr(b, instance);
             }
             ir::Expr::Unary(_, a) => fill_expr(a, instance),
+            ir::Expr::BitSlice { target, .. } => fill_expr(target, instance),
             ir::Expr::Ternary(c, t, f) => {
                 fill_expr(c, instance);
                 fill_expr(t, instance);
@@ -4304,7 +4385,9 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             ir::Expr::WidthCast { inner, .. } => fill_expr(inner, instance),
             ir::Expr::ComponentIdle { n, .. } => fill_expr(n, instance),
             ir::Expr::SeqIndex { index, .. } => fill_expr(index, instance),
-            ir::Expr::RecordField { index: Some(idx), .. } => fill_expr(idx, instance),
+            ir::Expr::RecordField {
+                index: Some(idx), ..
+            } => fill_expr(idx, instance),
             ir::Expr::Call(_, args) => {
                 for a in args {
                     fill_expr(a, instance);
@@ -4361,7 +4444,9 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
     for block in &mut func.blocks {
         for s in &mut block.stmts {
             match s {
-                ir::Stmt::TransactorStateWrite { instance: i, value, .. } => {
+                ir::Stmt::TransactorStateWrite {
+                    instance: i, value, ..
+                } => {
                     debug_assert!(
                         i.is_empty() || i == instance,
                         "target-state-write instance already filled with a different name"
@@ -4501,6 +4586,7 @@ fn fill_visit_expr(
             fill_visit_expr(b, placeholder, binding, remap, rewrite, conflict);
         }
         Expr::Unary(_, a)
+        | Expr::BitSlice { target: a, .. }
         | Expr::WidthCast { inner: a, .. }
         | Expr::ComponentIdle { n: a, .. } => {
             fill_visit_expr(a, placeholder, binding, remap, rewrite, conflict)
@@ -4518,9 +4604,9 @@ fn fill_visit_expr(
         Expr::SeqIndex { index, .. } => {
             fill_visit_expr(index, placeholder, binding, remap, rewrite, conflict)
         }
-        Expr::RecordField { index: Some(idx), .. } => {
-            fill_visit_expr(idx, placeholder, binding, remap, rewrite, conflict)
-        }
+        Expr::RecordField {
+            index: Some(idx), ..
+        } => fill_visit_expr(idx, placeholder, binding, remap, rewrite, conflict),
         Expr::Literal { .. }
         | Expr::WideLiteral(_)
         | Expr::Local(_)
@@ -4605,12 +4691,26 @@ fn fill_initiator_bus_prefix(
                     Stmt::AssertCheck { cond, on_fail } => {
                         visit_expr(cond, placeholder, binding, remap, rewrite, &mut conflict);
                         for a in &mut on_fail.args {
-                            visit_expr(&mut a.expr, placeholder, binding, remap, rewrite, &mut conflict);
+                            visit_expr(
+                                &mut a.expr,
+                                placeholder,
+                                binding,
+                                remap,
+                                rewrite,
+                                &mut conflict,
+                            );
                         }
                     }
                     Stmt::Log { args, .. } | Stmt::FailDiag { args, .. } => {
                         for a in &mut args.args {
-                            visit_expr(&mut a.expr, placeholder, binding, remap, rewrite, &mut conflict);
+                            visit_expr(
+                                &mut a.expr,
+                                placeholder,
+                                binding,
+                                remap,
+                                rewrite,
+                                &mut conflict,
+                            );
                         }
                     }
                     Stmt::TransactorCall { call, .. } => {
@@ -4628,8 +4728,7 @@ fn fill_initiator_bus_prefix(
                             visit_expr(a, placeholder, binding, remap, rewrite, &mut conflict);
                         }
                     }
-                    Stmt::SeqPush { value, .. }
-                    | Stmt::ComponentQueuePush { value, .. } => {
+                    Stmt::SeqPush { value, .. } | Stmt::ComponentQueuePush { value, .. } => {
                         visit_expr(value, placeholder, binding, remap, rewrite, &mut conflict)
                     }
                     Stmt::ComponentQueuePop { .. } | Stmt::ComponentSubAssign { .. } => {}
@@ -4657,18 +4756,39 @@ fn fill_initiator_bus_prefix(
                 }
                 Terminator::WaitUntil { preds, .. } => {
                     for p in preds {
-                        visit_expr(&mut p.expr, placeholder, binding, remap, rewrite, &mut conflict);
+                        visit_expr(
+                            &mut p.expr,
+                            placeholder,
+                            binding,
+                            remap,
+                            rewrite,
+                            &mut conflict,
+                        );
                     }
                 }
                 Terminator::WaitUntilTimeout { preds, cycles, .. } => {
                     for p in preds {
-                        visit_expr(&mut p.expr, placeholder, binding, remap, rewrite, &mut conflict);
+                        visit_expr(
+                            &mut p.expr,
+                            placeholder,
+                            binding,
+                            remap,
+                            rewrite,
+                            &mut conflict,
+                        );
                     }
                     visit_expr(cycles, placeholder, binding, remap, rewrite, &mut conflict);
                 }
                 Terminator::Fatal(args) => {
                     for a in &mut args.args {
-                        visit_expr(&mut a.expr, placeholder, binding, remap, rewrite, &mut conflict);
+                        visit_expr(
+                            &mut a.expr,
+                            placeholder,
+                            binding,
+                            remap,
+                            rewrite,
+                            &mut conflict,
+                        );
                     }
                 }
                 Terminator::Randomize { .. }

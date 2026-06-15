@@ -1,6 +1,5 @@
 ---
 source: tests/tbir.rs
-assertion_line: 2292
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
@@ -17,7 +16,7 @@ fn fn0 TlmMemTarget_target_read [kind=TransactorBody(x0)]
   locals:
     %0 addr : uint<8>
     %1 __ret : unknown
-    %2 req_seq : unknown
+    %2 req_seq : uint<32>
     %3 i : unknown
   ret = %__ret
   entry = b0

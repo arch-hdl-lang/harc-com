@@ -465,6 +465,7 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
             visit_expr(b, accesses, transactor);
         }
         Expr::Unary(_, a) => visit_expr(a, accesses, transactor),
+        Expr::BitSlice { target, .. } => visit_expr(target, accesses, transactor),
         Expr::Ternary(c, t, e) => {
             visit_expr(c, accesses, transactor);
             visit_expr(t, accesses, transactor);
@@ -664,7 +665,13 @@ impl Display for PlacementTableDisplay<'_> {
                 writeln!(f, "  fn{} {}", fid.0, func.name)?;
                 last_fn = Some(*fid);
             }
-            writeln!(f, "    b{}: {}, {}", bid.0, tier_str(*tier), timing_str(*timing))?;
+            writeln!(
+                f,
+                "    b{}: {}, {}",
+                bid.0,
+                tier_str(*tier),
+                timing_str(*timing)
+            )?;
         }
         if self.table.diagnostics.is_empty() {
             writeln!(f, "  diagnostics: none")?;
@@ -854,7 +861,10 @@ mod tests {
         assert_eq!(msgs.len(), 3, "probe + force + cycle-exact: {msgs:?}");
         assert!(msgs[0].contains("probe signal"), "{msgs:?}");
         assert!(msgs[1].contains("force point"), "{msgs:?}");
-        assert!(msgs[2].contains("no cycle-locked execution site"), "{msgs:?}");
+        assert!(
+            msgs[2].contains("no cycle-locked execution site"),
+            "{msgs:?}"
+        );
     }
 
     #[test]

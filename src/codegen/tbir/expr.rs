@@ -122,22 +122,21 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // `cycle_count` (a captured `ctx.cycle_count` reference), matching
         // v1's bare-ident emission of `cycle_count`.
         Expr::CycleCount => "(uint64_t)cycle_count".to_string(),
-        // The framework error counter — emitted as the in-scope `errors`
-        // variable (a captured `ctx.errors` reference), matching v1's
-        // bare-ident emission of `errors`.
-        Expr::ErrorCount => "errors".to_string(),
+        // The framework error counter. Use the context member directly so
+        // source locals named `errors` cannot shadow assertion accounting.
+        Expr::ErrorCount => "ctx.errors".to_string(),
         Expr::WideLiteral(words) => wide_literal_cpp(words),
-        Expr::Local(l) => cx
-            .names
-            .get(l.index())
-            .cloned()
-            .ok_or_else(|| {
-                EmitError(format!("tbir: dangling local %{} in {}", l.0, cx.func.name))
-            })?,
+        Expr::Local(l) => cx.names.get(l.index()).cloned().ok_or_else(|| {
+            EmitError(format!("tbir: dangling local %{} in {}", l.0, cx.func.name))
+        })?,
         Expr::Port(p) => port_read(cx, p),
         // Record-field read on a record-typed local: `t.tag`. The
         // lowering validated the field against the schema.
-        Expr::RecordField { local, field, index } => {
+        Expr::RecordField {
+            local,
+            field,
+            index,
+        } => {
             let name = cx.names.get(local.index()).cloned().ok_or_else(|| {
                 EmitError(format!(
                     "tbir: dangling local %{} in {}",
@@ -159,7 +158,13 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // one expression (`(regs.NAME = <Helper>_read(off))`); WO serves
         // from the mirror cell. The `read` lambda is a plain C++ call —
         // not the bus wire protocol — so this is a legitimate value.
-        Expr::RegRead { mirror, helper_ty, field, offset, reads_bus } => {
+        Expr::RegRead {
+            mirror,
+            helper_ty,
+            field,
+            offset,
+            reads_bus,
+        } => {
             let name = cx.names.get(mirror.index()).cloned().ok_or_else(|| {
                 EmitError(format!(
                     "tbir: dangling mirror local %{} in {}",
@@ -183,7 +188,12 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // Scoreboard read on a `_tb` struct member (scoreboard fields
         // exist only on non-synthetic testbenches). Mirrors v1's direct
         // struct/queue access.
-        Expr::ScoreboardQuery { field, query, nested_path, .. } => {
+        Expr::ScoreboardQuery {
+            field,
+            query,
+            nested_path,
+            ..
+        } => {
             use crate::ir::ScoreboardQuery;
             // `None` → testbench field (`_tb.<field>`); `Some(path)` →
             // env-nested data scoreboard, accessed by the run-scope path.
@@ -224,7 +234,10 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             }
             let a = expr_cpp(cx, a)?;
             let b = expr_cpp(cx, b)?;
-            format!("({a} {} {b})", bin_op_cpp(*op))
+            match op {
+                BinOp::Shl | BinOp::Shr => format!("(((uint64_t)({a})) {} {b})", bin_op_cpp(*op)),
+                _ => format!("({a} {} {b})", bin_op_cpp(*op)),
+            }
         }
         Expr::Unary(op, a) => {
             let a = expr_cpp(cx, a)?;
@@ -237,6 +250,16 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             let t = expr_cpp(cx, t)?;
             let e2 = expr_cpp(cx, e2)?;
             format!("({c} ? {t} : {e2})")
+        }
+        Expr::BitSlice { target, hi, lo } => {
+            let t = expr_cpp(cx, target)?;
+            let width = hi - lo + 1;
+            let mask = if width >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << width) - 1
+            };
+            format!("(((uint64_t)({t}) >> {lo}) & 0x{mask:X}ULL)")
         }
         Expr::WidthCast {
             kind,
@@ -285,12 +308,12 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             let recv = comp_base_cpp_subst(base, cx.self_subst);
             let n = expr_cpp(cx, n)?;
             match kind {
-                crate::ir::IdleKind::In => format!(
-                    "(((uint64_t)cycle_count - {recv}._last_in_cycle) >= (uint64_t)({n}))"
-                ),
-                crate::ir::IdleKind::Out => format!(
-                    "(((uint64_t)cycle_count - {recv}._last_out_cycle) >= (uint64_t)({n}))"
-                ),
+                crate::ir::IdleKind::In => {
+                    format!("(((uint64_t)cycle_count - {recv}._last_in_cycle) >= (uint64_t)({n}))")
+                }
+                crate::ir::IdleKind::Out => {
+                    format!("(((uint64_t)cycle_count - {recv}._last_out_cycle) >= (uint64_t)({n}))")
+                }
                 crate::ir::IdleKind::Both => format!(
                     "((((uint64_t)cycle_count - {recv}._last_in_cycle) >= (uint64_t)({n})) \
                      && (((uint64_t)cycle_count - {recv}._last_out_cycle) >= (uint64_t)({n})))"
@@ -310,7 +333,10 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // `for t in <seq>` loop-variable copy.
         Expr::SeqIndex { seq, index } => {
             let name = cx.names.get(seq.index()).cloned().ok_or_else(|| {
-                EmitError(format!("tbir: dangling local %{} in {}", seq.0, cx.func.name))
+                EmitError(format!(
+                    "tbir: dangling local %{} in {}",
+                    seq.0, cx.func.name
+                ))
             })?;
             let idx = expr_cpp(cx, index)?;
             format!("{name}[{idx}]")
@@ -549,9 +575,7 @@ pub(super) fn comp_base_cpp_subst(
     self_subst: Option<&str>,
 ) -> String {
     match base {
-        crate::ir::ComponentBase::SelfField => {
-            self_subst.unwrap_or("self").to_string()
-        }
+        crate::ir::ComponentBase::SelfField => self_subst.unwrap_or("self").to_string(),
         // A `self`-rooted path (`self.sb`) is a self-relative sub-component
         // access lowered inside a component/handler body — re-root the
         // `self` head at the running instance via `self_subst` (the

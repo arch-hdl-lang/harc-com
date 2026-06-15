@@ -1,0 +1,77 @@
+// Covergroup expression targets against the counter DUT (`Top` from
+// top_counter_test). Locks the TBIR sampler subset used by CVDP benches:
+// direct DUT ports, bit slices, width methods, and packed binary expressions.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+covergroup ExprCov @(posedge dut.clk)
+    cp_low_nibble : cover dut.count_out[3:0]
+        bins
+            zero = {0}
+            mid = [1..14]
+            max = {15}
+        end bins
+    cp_activity : cover ((dut.en << 1) | (dut.count_out[0:0] == 1))
+        bins
+            idle_even = {0}
+            idle_odd = {1}
+            run_even = {2}
+            run_odd = {3}
+        end bins
+    cp_signed_nibble : cover dut.count_out[3:0].sext<8>()
+        bins
+            neg_one = {255}
+        end bins
+    cp_low_pair : cover dut.count_out[3:0].trunc<2>()
+        bins
+            zero = {0}
+            one = {1}
+            two = {2}
+            three = {3}
+        end bins
+    cross cp_low_nibble, cp_activity
+end covergroup ExprCov
+
+testbench CovExprTargetsTb
+    dut : Top
+    cov : ExprCov
+end testbench CovExprTargetsTb
+
+impl CovExprTargetsTest for CovExprTargetsTb
+    clock clk = SysDomain
+
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        dut.en = 1
+        wait until dut.count_out == 15 timeout 64 cycles
+            fail("counter did not reach 15")
+
+        dut.en = 0
+        wait 2 cycles
+        log(info, "PASS: expression-backed coverpoints sampled")
+    end run
+
+    check
+        cov.report()
+        assert cov.cp_low_nibble.zero > 0 else fail("low-nibble zero bin hole")
+        assert cov.cp_low_nibble.mid > 0 else fail("low-nibble mid bin hole")
+        assert cov.cp_low_nibble.max > 0 else fail("low-nibble max bin hole")
+        assert cov.cp_activity.idle_even > 0 else fail("idle-even bin hole")
+        assert cov.cp_activity.idle_odd > 0 else fail("idle-odd bin hole")
+        assert cov.cp_activity.run_even > 0 else fail("run-even bin hole")
+        assert cov.cp_activity.run_odd > 0 else fail("run-odd bin hole")
+        assert cov.cp_signed_nibble.neg_one > 0 else fail("signed-nibble sext bin hole")
+        assert cov.cp_low_pair.zero > 0 else fail("low-pair zero bin hole")
+        assert cov.cp_low_pair.one > 0 else fail("low-pair one bin hole")
+        assert cov.cp_low_pair.two > 0 else fail("low-pair two bin hole")
+        assert cov.cp_low_pair.three > 0 else fail("low-pair three bin hole")
+        log(info, "coverage assertions passed")
+    end check
+end impl CovExprTargetsTest

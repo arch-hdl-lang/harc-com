@@ -1,0 +1,41 @@
+// HARC stimulus bench for CVDP cid012 `cvdp_copilot_gcd_0028`.
+
+testbench GcdTb
+    dut : gcd_3_ip
+end testbench GcdTb
+
+function run_gcd(dut: gcd_3_ip, a: uint<32>, b: uint<32>, c: uint<32>)
+    dut.A = a
+    dut.B = b
+    dut.C = c
+    dut.go = 1
+    wait 2 cycles
+    dut.go = 0
+    wait 80 cycles
+end function run_gcd
+
+impl GcdTest for GcdTb
+    run
+        log(info, "gcd_3_ip: equal, greater, less, zero, and signed-bit operands")
+        dut.rst = 1
+        dut.go = 0
+        dut.A = 0
+        dut.B = 0
+        dut.C = 0
+        wait 4 cycles
+        dut.rst = 0
+
+        run_gcd(dut, 12, 18, 30)
+        run_gcd(dut, 21, 21, 21)
+        run_gcd(dut, 0, 9, 27)
+        run_gcd(dut, 9, 0, 27)
+        run_gcd(dut, 270, 192, 120)
+        run_gcd(dut, 0xFFFFFFF6, 0xFFFFFFEC, 30)
+        run_gcd(dut, 1071, 462, 21)
+
+        dut.rst = 1
+        wait 3 cycles
+        dut.rst = 0
+        log(info, "gcd_3_ip stimulus complete")
+    end run
+end impl GcdTest

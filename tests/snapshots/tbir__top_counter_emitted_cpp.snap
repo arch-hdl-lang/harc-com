@@ -197,7 +197,7 @@ int run_TopCounterTest(int argc, char** argv) {
                 case 1: {
                     if (!((harc_rt::harc_read(dut->count_out) == 0))) {
                         sim_log_line("FAIL", "after reset: count_out=%lld, expected 0", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->count_out)));
-                        errors++;
+                        ctx.errors++;
                     }
                     sim_log_line("INFO", "PASS: count=0 after reset");
                     harc_rt::harc_assign(dut->rst, 0);
@@ -231,7 +231,7 @@ int run_TopCounterTest(int argc, char** argv) {
                 case 6: {
                     if (!((harc_rt::harc_read(dut->count_out) == i))) {
                         sim_log_line("FAIL", "cycle %lld: count_out=%lld, expected %lld", harc_rt::harc_printf_ll(i), harc_rt::harc_printf_ll(harc_rt::harc_read(dut->count_out)), harc_rt::harc_printf_ll(i));
-                        errors++;
+                        ctx.errors++;
                     }
                     __bb = 4;
                     break;
@@ -260,7 +260,7 @@ int run_TopCounterTest(int argc, char** argv) {
                 case 11: {
                     if (!((harc_rt::harc_read(dut->count_out) == held))) {
                         sim_log_line("FAIL", "en=0: count changed from %lld to %lld", harc_rt::harc_printf_ll(held), harc_rt::harc_printf_ll(harc_rt::harc_read(dut->count_out)));
-                        errors++;
+                        ctx.errors++;
                     }
                     __bb = 9;
                     break;
@@ -290,7 +290,7 @@ int run_TopCounterTest(int argc, char** argv) {
                     expected = (held + i_2);
                     if (!((harc_rt::harc_read(dut->count_out) == expected))) {
                         sim_log_line("FAIL", "resume cycle %lld: count_out=%lld, expected %lld", harc_rt::harc_printf_ll(i_2), harc_rt::harc_printf_ll(harc_rt::harc_read(dut->count_out)), harc_rt::harc_printf_ll(expected));
-                        errors++;
+                        ctx.errors++;
                     }
                     __bb = 14;
                     break;
@@ -298,7 +298,7 @@ int run_TopCounterTest(int argc, char** argv) {
                 case 17: {
                     if (!((harc_rt::harc_read(dut->count_out) == 0))) {
                         sim_log_line("FAIL", "mid-count reset: count_out=%lld, expected 0", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->count_out)));
-                        errors++;
+                        ctx.errors++;
                     }
                     sim_log_line("INFO", "PASS: mid-count reset works");
                     __done = true;

@@ -237,11 +237,11 @@ int run_AgentOnHandlerTest(int argc, char** argv) {
                 case 6: {
                     if (!((tagger.seen == 3))) {
                         sim_log_line("FAIL", "expected 3 handled events, got %lld", harc_rt::harc_printf_ll(tagger.seen));
-                        errors++;
+                        ctx.errors++;
                     }
                     if (!((tagger.last == 3))) {
                         sim_log_line("FAIL", "expected last payload 3, got %lld", harc_rt::harc_printf_ll(tagger.last));
-                        errors++;
+                        ctx.errors++;
                     }
                     waited = 0;
                     __bb = 8;
@@ -263,7 +263,7 @@ int run_AgentOnHandlerTest(int argc, char** argv) {
                 case 10: {
                     if (!((((uint64_t)cycle_count - tagger._last_in_cycle) >= (uint64_t)(4)))) {
                         sim_log_line("FAIL", "agent never reported idle_in(4); waited=%lld", harc_rt::harc_printf_ll(waited));
-                        errors++;
+                        ctx.errors++;
                     }
                     sim_log_line("INFO", "PASS: agent handled %lld events, idle_in(4) after %lld cycles", harc_rt::harc_printf_ll(tagger.seen), harc_rt::harc_printf_ll(waited));
                     __done = true;

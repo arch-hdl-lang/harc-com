@@ -1,0 +1,61 @@
+// HARC stimulus bench for CVDP cid012 `cvdp_copilot_thermostat_0003`.
+
+testbench ThermostatTb
+    dut : thermostat_top
+end testbench ThermostatTb
+
+impl ThermostatTest for ThermostatTb
+    run
+        log(info, "thermostat: temperature state, disable, manual fan, and fault sweep")
+        dut.i_rst = 0
+        dut.i_enable = 0
+        dut.i_fault = 0
+        dut.i_clr = 0
+        dut.i_fan_on = 0
+        dut.i_temp_feedback = 0
+        wait 3 cycles
+        dut.i_rst = 1
+        wait 1 cycle
+
+        dut.i_enable = 1
+        for t in 0 .. 64
+            dut.i_temp_feedback = t
+            dut.i_fan_on = (t & 1) != 0
+            wait 1 cycle
+        end for
+
+        // Priority paths: full cold/hot, medium, low, ambient.
+        for t in 0 .. 8
+            if t == 0
+                dut.i_temp_feedback = 0x20
+            elsif t == 1
+                dut.i_temp_feedback = 0x01
+            elsif t == 2
+                dut.i_temp_feedback = 0x10
+            elsif t == 3
+                dut.i_temp_feedback = 0x02
+            elsif t == 4
+                dut.i_temp_feedback = 0x08
+            elsif t == 5
+                dut.i_temp_feedback = 0x04
+            else
+                dut.i_temp_feedback = 0
+            end if
+            wait 2 cycles
+        end for
+
+        dut.i_enable = 0
+        wait 2 cycles
+        dut.i_enable = 1
+        dut.i_fault = 1
+        wait 2 cycles
+        dut.i_fault = 0
+        dut.i_clr = 1
+        wait 1 cycle
+        dut.i_clr = 0
+        dut.i_rst = 0
+        wait 2 cycles
+        dut.i_rst = 1
+        log(info, "thermostat stimulus complete")
+    end run
+end impl ThermostatTest

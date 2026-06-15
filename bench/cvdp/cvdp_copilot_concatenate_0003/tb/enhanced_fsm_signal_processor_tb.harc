@@ -1,0 +1,72 @@
+// HARC stimulus bench for CVDP cid012 `cvdp_copilot_concatenate_0003`.
+
+testbench EnhancedFsmTb
+    dut : enhanced_fsm_signal_processor_top
+end testbench EnhancedFsmTb
+
+function drive_vecs(dut: enhanced_fsm_signal_processor_top, base: uint<5>)
+    dut.i_vector_1 = base
+    dut.i_vector_2 = base ^ 0x1F
+    dut.i_vector_3 = (base + 3) & 0x1F
+    dut.i_vector_4 = (base + 7) & 0x1F
+    dut.i_vector_5 = (base + 11) & 0x1F
+    dut.i_vector_6 = (base + 17) & 0x1F
+end function drive_vecs
+
+impl EnhancedFsmTest for EnhancedFsmTb
+    run
+        log(info, "enhanced_fsm_signal_processor: idle/process/ready/fault sweep")
+        dut.i_rst_n = 0
+        dut.i_enable = 0
+        dut.i_clear = 0
+        dut.i_ack = 0
+        dut.i_fault = 0
+        drive_vecs(dut, 0)
+        wait 3 cycles
+        dut.i_rst_n = 1
+        wait 1 cycle
+
+        for k in 0 .. 16
+            drive_vecs(dut, k)
+            dut.i_enable = 1
+            wait 1 cycle
+            dut.i_enable = 0
+            wait 2 cycles
+            dut.i_ack = 1
+            wait 1 cycle
+            dut.i_ack = 0
+            wait 1 cycle
+        end for
+
+        // Fault from IDLE, PROCESS, and READY, then clear.
+        dut.i_fault = 1
+        wait 2 cycles
+        dut.i_fault = 0
+        dut.i_clear = 1
+        wait 1 cycle
+        dut.i_clear = 0
+
+        dut.i_enable = 1
+        wait 1 cycle
+        dut.i_fault = 1
+        wait 2 cycles
+        dut.i_enable = 0
+        dut.i_fault = 0
+        dut.i_clear = 1
+        wait 1 cycle
+        dut.i_clear = 0
+
+        dut.i_enable = 1
+        wait 3 cycles
+        dut.i_fault = 1
+        wait 1 cycle
+        dut.i_fault = 0
+        dut.i_clear = 1
+        wait 1 cycle
+
+        dut.i_rst_n = 0
+        wait 2 cycles
+        dut.i_rst_n = 1
+        log(info, "enhanced_fsm_signal_processor stimulus complete")
+    end run
+end impl EnhancedFsmTest

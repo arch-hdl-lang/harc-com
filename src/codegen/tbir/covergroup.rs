@@ -8,8 +8,11 @@
 //! runtime-observable (log lines + check-phase asserts), so both must
 //! match v1 exactly for the trace-equivalence gate.
 
-use crate::ir::{CovBinValue, CoverPointSchema, CovgroupSchema};
-use std::collections::BTreeSet;
+use crate::codegen::cpp_tb::EmitError;
+use crate::ir::{
+    BinOp, CovBinValue, CoverPointSchema, CovgroupSchema, Expr, PortRef, UnOp, WidthCastKind,
+};
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 
 const INDENT: &str = "    ";
@@ -78,11 +81,8 @@ fn declared_crosses(schema: &CovgroupSchema) -> Vec<DeclaredCross<'_>> {
         .crosses
         .iter()
         .map(|c| {
-            let points: Vec<&CoverPointSchema> = c
-                .point_indices
-                .iter()
-                .map(|&i| &schema.points[i])
-                .collect();
+            let points: Vec<&CoverPointSchema> =
+                c.point_indices.iter().map(|&i| &schema.points[i]).collect();
             let names: Vec<&str> = points.iter().map(|p| p.name.as_str()).collect();
             DeclaredCross {
                 storage: format!("_cross_{}_{}", c.item_index, names.join("__")),
@@ -141,12 +141,142 @@ fn cross_bin_labels(cross: &DeclaredCross<'_>) -> Vec<(usize, String)> {
 /// `emit_bin_membership` semantics: `Eq` is `_v == x`, `Range` is the
 /// inclusive `_v >= lo && _v <= hi` (open bounds drop their side; a
 /// fully open range is `true`), members `||`-joined.
-/// Covergroup sample-point read. Cover targets are direct top-level DUT
-/// ports (no lanes, never a probe — a covergroup samples DUT boundary
-/// signals), so this stays the plain `harc_read` wrap over the flat
-/// `dut-><port>` reference.
-fn cover_target_read(p: &crate::ir::PortRef) -> String {
-    format!("harc_rt::harc_read(dut->{})", p.port_path.join("_"))
+fn cover_expr_cpp(e: &Expr, lanes: &HashMap<String, u32>) -> Result<String, EmitError> {
+    Ok(match e {
+        Expr::Literal { value, .. } => format!("{value}"),
+        Expr::Port(p) => {
+            let sig = cover_port_signal(p);
+            match p.lane {
+                None => format!("harc_rt::harc_read({sig})"),
+                Some(lane) => match cover_lane_width(lanes, p) {
+                    Some(w) => {
+                        format!("harc_rt::harc_vec_lane_read<{w}>({sig}, (std::size_t)({lane}))")
+                    }
+                    None => format!("{sig}[{lane}]"),
+                },
+            }
+        }
+        Expr::Binary(op, a, b) => {
+            let a = cover_expr_cpp(a, lanes)?;
+            let b = cover_expr_cpp(b, lanes)?;
+            format!("({a} {} {b})", cover_bin_op_cpp(*op))
+        }
+        Expr::Unary(op, a) => {
+            let a = cover_expr_cpp(a, lanes)?;
+            format!("{}({a})", cover_un_op_cpp(*op))
+        }
+        Expr::Ternary(c, t, f) => {
+            let c = cover_expr_cpp(c, lanes)?;
+            let t = cover_expr_cpp(t, lanes)?;
+            let f = cover_expr_cpp(f, lanes)?;
+            format!("({c} ? {t} : {f})")
+        }
+        Expr::BitSlice { target, hi, lo } => {
+            let t = cover_expr_cpp(target, lanes)?;
+            let width = hi - lo + 1;
+            let mask = if width >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << width) - 1
+            };
+            format!("(((uint64_t)({t}) >> {lo}) & 0x{mask:X}ULL)")
+        }
+        Expr::WidthCast {
+            kind,
+            width,
+            src_width,
+            inner,
+        } => cover_width_cast_cpp(*kind, *width, *src_width, inner, lanes)?,
+        other => {
+            return Err(EmitError(format!(
+                "tbir: covergroup target expression is outside the sampler subset: {other:?}"
+            )));
+        }
+    })
+}
+
+fn cover_port_signal(p: &PortRef) -> String {
+    format!("dut->{}", p.port_path.join("_"))
+}
+
+fn cover_lane_width(lanes: &HashMap<String, u32>, p: &PortRef) -> Option<u32> {
+    match p.port_path.as_slice() {
+        [name] => lanes.get(name).copied(),
+        _ => None,
+    }
+}
+
+fn cover_bin_op_cpp(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Mod => "%",
+        BinOp::Eq => "==",
+        BinOp::Ne => "!=",
+        BinOp::Lt => "<",
+        BinOp::Le => "<=",
+        BinOp::Gt => ">",
+        BinOp::Ge => ">=",
+        BinOp::And => "&&",
+        BinOp::Or => "||",
+        BinOp::BitAnd => "&",
+        BinOp::BitOr => "|",
+        BinOp::BitXor => "^",
+        BinOp::Shl => "<<",
+        BinOp::Shr => ">>",
+    }
+}
+
+fn cover_un_op_cpp(op: UnOp) -> &'static str {
+    match op {
+        UnOp::Neg => "-",
+        UnOp::Not => "!",
+        UnOp::BitNot => "~",
+    }
+}
+
+fn cover_width_cast_cpp(
+    kind: WidthCastKind,
+    width: u32,
+    src_width: Option<u32>,
+    inner: &Expr,
+    lanes: &HashMap<String, u32>,
+) -> Result<String, EmitError> {
+    let e = cover_expr_cpp(inner, lanes)?;
+    let mask = |w: u32| (1u64 << w) - 1;
+    let trunc_shape = |e: &str| {
+        if width == 64 {
+            format!("((uint64_t)({e}))")
+        } else {
+            format!("((uint64_t)((({e}) & 0x{:X}ULL)))", mask(width))
+        }
+    };
+    let plain_cast = |e: &str| format!("((uint64_t)({e}))");
+    Ok(match kind {
+        WidthCastKind::Trunc => trunc_shape(&e),
+        WidthCastKind::Zext => plain_cast(&e),
+        WidthCastKind::Sext => match src_width {
+            Some(sw) if sw < width => {
+                let shift = 64 - sw;
+                if width == 64 {
+                    format!("((uint64_t)(((int64_t)((uint64_t)({e}) << {shift})) >> {shift}))")
+                } else {
+                    format!(
+                        "((uint64_t)(((int64_t)((uint64_t)({e}) << {shift})) >> {shift}) & 0x{:X}ULL)",
+                        mask(width)
+                    )
+                }
+            }
+            _ => plain_cast(&e),
+        },
+        WidthCastKind::Resize => match src_width {
+            Some(sw) if width < sw => trunc_shape(&e),
+            Some(_) => plain_cast(&e),
+            None => trunc_shape(&e),
+        },
+    })
 }
 
 fn bin_membership(values: &[CovBinValue]) -> String {
@@ -212,7 +342,12 @@ pub(super) fn covgroup_struct(out: &mut String, schema: &CovgroupSchema) {
     .ok();
     for p in &schema.points {
         for b in &p.bins {
-            writeln!(out, "{INDENT}{INDENT}if ({}.{} > 0) _hit++;", p.name, b.name).ok();
+            writeln!(
+                out,
+                "{INDENT}{INDENT}if ({}.{} > 0) _hit++;",
+                p.name, b.name
+            )
+            .ok();
         }
     }
     writeln!(
@@ -316,7 +451,12 @@ pub(super) fn covgroup_struct(out: &mut String, schema: &CovgroupSchema) {
 /// registration point and body shape as v1's clock-sample path, so the
 /// per-cycle bin counts are identical. `instance` is the C++ lvalue of
 /// the covergroup instance (`_tb.cov`).
-pub(super) fn sampler_registration(out: &mut String, schema: &CovgroupSchema, instance: &str) {
+pub(super) fn sampler_registration(
+    out: &mut String,
+    schema: &CovgroupSchema,
+    instance: &str,
+    lanes: &HashMap<String, u32>,
+) -> Result<(), EmitError> {
     let crosses = auto_cross_pairs(schema);
     let declared = declared_crosses(schema);
     let any_cross = !crosses.is_empty() || !declared.is_empty();
@@ -327,17 +467,19 @@ pub(super) fn sampler_registration(out: &mut String, schema: &CovgroupSchema, in
     writeln!(out, "{pad1}_checkers.push_back([&]() {{").ok();
     if any_cross {
         for p in schema.points.iter().filter(|p| !p.bins.is_empty()) {
-            writeln!(out, "{pad2}bool _cg_hit_{}[{}] = {{}};", p.name, p.bins.len()).ok();
+            writeln!(
+                out,
+                "{pad2}bool _cg_hit_{}[{}] = {{}};",
+                p.name,
+                p.bins.len()
+            )
+            .ok();
         }
     }
     for p in &schema.points {
         writeln!(out, "{pad2}{{").ok();
-        writeln!(
-            out,
-            "{pad3}uint64_t _v = (uint64_t)({});",
-            cover_target_read(&p.target)
-        )
-        .ok();
+        let target = cover_expr_cpp(&p.target, lanes)?;
+        writeln!(out, "{pad3}uint64_t _v = (uint64_t)({});", target).ok();
         for (bin_idx, b) in p.bins.iter().enumerate() {
             let membership = bin_membership(&b.values);
             if !any_cross {
@@ -360,8 +502,18 @@ pub(super) fn sampler_registration(out: &mut String, schema: &CovgroupSchema, in
     }
     for &(ai, bi) in &crosses {
         let (a, b) = (&schema.points[ai], &schema.points[bi]);
-        writeln!(out, "{pad2}for (size_t _i = 0; _i < {}; ++_i) {{", a.bins.len()).ok();
-        writeln!(out, "{pad3}for (size_t _j = 0; _j < {}; ++_j) {{", b.bins.len()).ok();
+        writeln!(
+            out,
+            "{pad2}for (size_t _i = 0; _i < {}; ++_i) {{",
+            a.bins.len()
+        )
+        .ok();
+        writeln!(
+            out,
+            "{pad3}for (size_t _j = 0; _j < {}; ++_j) {{",
+            b.bins.len()
+        )
+        .ok();
         writeln!(
             out,
             "{pad4}if (_cg_hit_{}[_i] && _cg_hit_{}[_j]) {instance}._auto_cross_{}__{}[_i][_j]++;",
@@ -407,4 +559,5 @@ pub(super) fn sampler_registration(out: &mut String, schema: &CovgroupSchema, in
         }
     }
     writeln!(out, "{pad1}}});").ok();
+    Ok(())
 }

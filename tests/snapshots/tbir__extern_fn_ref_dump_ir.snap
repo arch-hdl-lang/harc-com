@@ -13,7 +13,7 @@ fn fn0 harc_crc8_step [kind=Helper]
   locals:
     %0 crc : uint<8>
     %1 byte : uint<8>
-    %2 __ret : unknown
+    %2 __ret : uint<8>
     %3 x : unknown
     %4 _anon : unknown
   ret = %__ret

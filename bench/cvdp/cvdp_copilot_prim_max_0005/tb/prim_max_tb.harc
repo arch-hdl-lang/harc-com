@@ -1,0 +1,37 @@
+// HARC stimulus bench for CVDP cid012 `cvdp_copilot_prim_max_0005`.
+
+testbench PrimMaxTb
+    dut : prim_max_find_top
+end testbench PrimMaxTb
+
+impl PrimMaxTest for PrimMaxTb
+    run
+        log(info, "prim_max_find: valid-mask and tree-comparison sweep")
+        dut.rst_ni = 0
+        dut.values_i = 0
+        dut.valid_i = 0
+        wait 3 cycles
+        dut.rst_ni = 1
+
+        dut.valid_i = 0
+        wait 4 cycles
+        dut.valid_i = 0xFF
+        dut.values_i = 0x0807060504030201
+        wait 5 cycles
+        dut.values_i = 0x0102030405060708
+        wait 5 cycles
+        dut.values_i = 0x8080808080808080
+        wait 5 cycles
+
+        for k in 0 .. 32
+            dut.valid_i = ((k * 37) ^ 0xA5) & 0xFF
+            dut.values_i = ((k * 0x0103070B0D111317) ^ 0x8040201008040201)
+            wait 2 cycles
+        end for
+
+        dut.rst_ni = 0
+        wait 2 cycles
+        dut.rst_ni = 1
+        log(info, "prim_max_find stimulus complete")
+    end run
+end impl PrimMaxTest

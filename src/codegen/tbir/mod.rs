@@ -57,8 +57,7 @@ pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<Stri
     let problem_table_cpp = if prog.constraint_sites.is_empty() {
         String::new()
     } else {
-        let solver_table =
-            crate::solver::problem_table::build_typed_solver_problem_table(file);
+        let solver_table = crate::solver::problem_table::build_typed_solver_problem_table(file);
         let runtime_table =
             crate::solver::runtime::RuntimeProblemTable::from_typed_solver_table(&solver_table);
         if runtime_table.problems.is_empty() {
@@ -78,7 +77,13 @@ pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<Stri
     // member in `V<Top>.h` is only a forward-declared pointer. Mirrors
     // v1's `aggregated_probes` include gate. See docs/probe-signals.md.
     let has_probes = program_has_probes(&prog);
-    runtime::preamble(&mut out, &dut_type, &test_names, &problem_table_cpp, has_probes);
+    runtime::preamble(
+        &mut out,
+        &dut_type,
+        &test_names,
+        &problem_table_cpp,
+        has_probes,
+    );
 
     // Transaction value-record structs, in declaration order. Mirrors
     // v1's `emit_record_struct` shape (field defaults as member
@@ -216,6 +221,7 @@ fn expr_has_probe(e: &ir::Expr) -> bool {
         Port(p) => port_is_probe(p),
         Binary(_, a, b) => expr_has_probe(a) || expr_has_probe(b),
         Unary(_, a) => expr_has_probe(a),
+        BitSlice { target, .. } => expr_has_probe(target),
         Ternary(c, a, b) => expr_has_probe(c) || expr_has_probe(a) || expr_has_probe(b),
         WidthCast { inner, .. } => expr_has_probe(inner),
         Call(_, args) => args.iter().any(expr_has_probe),
@@ -277,16 +283,19 @@ fn field_scalar_cty(ty: &ir::IrType) -> &'static str {
 /// ≤64 bits widens to `uint64_t` (the established tbir value model — even
 /// `bool`/`sint` locals are u64-backed here, distinct from v1's narrower
 /// per-type choice, which is value-identical in the loop-switch model). A
-/// 65..128-bit `uint`/`sint` uses v1's `_harc_u128` (`__uint128_t`) — the
-/// wide-value method-param ABI. Wider-than-128 widths (v1's `HarcWide<N>`)
-/// are out of the tbir subset — lowering rejects them at the method-param
-/// gate — so they never reach here; defensively they fall back to the
-/// 128-bit type. Aggregate types (`Record`/`RecordSeq`) are handled by
-/// their own declaration sites, never this helper.
-pub(super) fn local_scalar_cty(ty: &ir::IrType) -> &'static str {
+/// 65..128-bit `uint`/`sint` uses v1's `_harc_u128` (`__uint128_t`), while
+/// wider declared scalars use the shared `HarcWide<N>` runtime storage.
+/// Aggregate types (`Record`/`RecordSeq`) are handled by their own
+/// declaration sites, never this helper.
+pub(super) fn local_scalar_cty(ty: &ir::IrType) -> String {
     match ty {
-        ir::IrType::UInt(Some(w)) | ir::IrType::SInt(Some(w)) if *w > 64 => "_harc_u128",
-        _ => "uint64_t",
+        ir::IrType::UInt(Some(w)) | ir::IrType::SInt(Some(w)) if *w > 128 => {
+            format!("harc_rt::HarcWide<{}>", (*w as usize).div_ceil(32).max(1))
+        }
+        ir::IrType::UInt(Some(w)) | ir::IrType::SInt(Some(w)) if *w > 64 => {
+            "_harc_u128".to_string()
+        }
+        _ => "uint64_t".to_string(),
     }
 }
 
@@ -326,9 +335,12 @@ fn record_struct(out: &mut String, r: &ir::RecordSchema) {
             continue;
         }
         let init = match f.ty {
-            ir::IrType::Bool => {
-                if f.default.is_some_and(|d| d != 0) { "true" } else { "false" }.to_string()
+            ir::IrType::Bool => if f.default.is_some_and(|d| d != 0) {
+                "true"
+            } else {
+                "false"
             }
+            .to_string(),
             _ => f.default.unwrap_or(0).to_string(),
         };
         writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
@@ -383,7 +395,11 @@ fn record_pack_helpers(out: &mut String, r: &ir::RecordSchema) {
     let words = width.div_ceil(32).max(1);
 
     // harc_pack: LSB-first, reverse declaration order.
-    writeln!(out, "static harc_rt::HarcWide<{words}> harc_pack_{name}(const {name}& value) {{").ok();
+    writeln!(
+        out,
+        "static harc_rt::HarcWide<{words}> harc_pack_{name}(const {name}& value) {{"
+    )
+    .ok();
     writeln!(out, "{INDENT}harc_rt::HarcWide<{words}> _packed{{}};").ok();
     let mut offset = 0usize;
     for f in r.fields.iter().rev() {
@@ -413,10 +429,19 @@ fn record_pack_helpers(out: &mut String, r: &ir::RecordSchema) {
     writeln!(out, "}}").ok();
 
     // harc_unpack: struct-shaped pin fast-path, else bit layout.
-    writeln!(out, "template<typename Raw> static {name} harc_unpack_{name}(const Raw& raw) {{").ok();
+    writeln!(
+        out,
+        "template<typename Raw> static {name} harc_unpack_{name}(const Raw& raw) {{"
+    )
+    .ok();
     let raw_checks: Vec<String> = r.fields.iter().map(|f| format!("raw.{}", f.name)).collect();
     if !raw_checks.is_empty() {
-        writeln!(out, "{INDENT}if constexpr (requires {{ {}; }}) {{", raw_checks.join("; ")).ok();
+        writeln!(
+            out,
+            "{INDENT}if constexpr (requires {{ {}; }}) {{",
+            raw_checks.join("; ")
+        )
+        .ok();
         writeln!(out, "{0}{0}{name} value{{}};", INDENT).ok();
         for f in &r.fields {
             if let Some(n) = f.vec_len {
@@ -476,9 +501,16 @@ fn record_pack_helpers(out: &mut String, r: &ir::RecordSchema) {
     )
     .ok();
     if !raw_checks.is_empty() {
-        let sig_checks: Vec<String> =
-            raw_checks.iter().map(|s| s.replacen("raw.", "sig.", 1)).collect();
-        writeln!(out, "{INDENT}if constexpr (requires {{ {}; }}) {{", sig_checks.join("; ")).ok();
+        let sig_checks: Vec<String> = raw_checks
+            .iter()
+            .map(|s| s.replacen("raw.", "sig.", 1))
+            .collect();
+        writeln!(
+            out,
+            "{INDENT}if constexpr (requires {{ {}; }}) {{",
+            sig_checks.join("; ")
+        )
+        .ok();
         for f in &r.fields {
             if let Some(n) = f.vec_len {
                 for i in 0..n {
@@ -489,10 +521,19 @@ fn record_pack_helpers(out: &mut String, r: &ir::RecordSchema) {
             }
         }
         writeln!(out, "{INDENT}}} else {{").ok();
-        writeln!(out, "{0}{0}harc_rt::harc_assign(sig, harc_pack_{name}(value));", INDENT).ok();
+        writeln!(
+            out,
+            "{0}{0}harc_rt::harc_assign(sig, harc_pack_{name}(value));",
+            INDENT
+        )
+        .ok();
         writeln!(out, "{INDENT}}}").ok();
     } else {
-        writeln!(out, "{INDENT}harc_rt::harc_assign(sig, harc_pack_{name}(value));").ok();
+        writeln!(
+            out,
+            "{INDENT}harc_rt::harc_assign(sig, harc_pack_{name}(value));"
+        )
+        .ok();
     }
     writeln!(out, "}}").ok();
     writeln!(out).ok();
@@ -508,12 +549,7 @@ fn component_emit_order(prog: &TbProgram) -> Vec<usize> {
     let n = prog.components.len();
     let mut order = Vec::with_capacity(n);
     let mut visited = vec![false; n];
-    fn visit(
-        i: usize,
-        prog: &TbProgram,
-        visited: &mut [bool],
-        order: &mut Vec<usize>,
-    ) {
+    fn visit(i: usize, prog: &TbProgram, visited: &mut [bool], order: &mut Vec<usize>) {
         if visited[i] {
             return;
         }
@@ -536,7 +572,12 @@ fn component_emit_order(prog: &TbProgram) -> Vec<usize> {
 /// field of the instance reached by `inst_path`. The closure bumps the
 /// owning instance's `_last_in_cycle` activity stamp, then runs the
 /// handler body lambda — mirroring v1's `on`-subscriber registration.
-fn emit_on_handler_regs(out: &mut String, prog: &TbProgram, component: ir::ComponentId, inst_path: &str) {
+fn emit_on_handler_regs(
+    out: &mut String,
+    prog: &TbProgram,
+    component: ir::ComponentId,
+    inst_path: &str,
+) {
     let comp = &prog.components[component.index()];
     for oh in &comp.on_handlers {
         let lambda = func::on_handler_lambda_name(comp, oh);
@@ -653,13 +694,21 @@ fn emit_lifecycle_checkers(
         let svc = ph.phase.service_vec();
         writeln!(out, "{INDENT}{svc}.push_back([&]() {{").ok();
         writeln!(out, "{INDENT}{INDENT}static int64_t {tag}_last = 0;").ok();
-        writeln!(out, "{INDENT}{INDENT}int64_t {tag}_period = (int64_t)({period});").ok();
+        writeln!(
+            out,
+            "{INDENT}{INDENT}int64_t {tag}_period = (int64_t)({period});"
+        )
+        .ok();
         writeln!(
             out,
             "{INDENT}{INDENT}if ({tag}_period > 0 && (int64_t)cycle_count - {tag}_last >= {tag}_period) {{"
         )
         .ok();
-        writeln!(out, "{INDENT}{INDENT}{INDENT}{tag}_last = (int64_t)cycle_count;").ok();
+        writeln!(
+            out,
+            "{INDENT}{INDENT}{INDENT}{tag}_last = (int64_t)cycle_count;"
+        )
+        .ok();
         writeln!(out, "{INDENT}{INDENT}{INDENT}{lambda}({inst_path});").ok();
         writeln!(out, "{INDENT}{INDENT}}}").ok();
         writeln!(out, "{INDENT}}});").ok();
@@ -710,18 +759,26 @@ fn emit_lifecycle_checkers(
         let tag = format!("_wdog_{inst_tag}_{}", w.function.0);
         writeln!(out, "{INDENT}_checkers.push_back([&]() {{").ok();
         writeln!(out, "{INDENT}{INDENT}static int64_t {tag}_last = 0;").ok();
-        writeln!(out, "{INDENT}{INDENT}int64_t {tag}_period = (int64_t)({period});").ok();
+        writeln!(
+            out,
+            "{INDENT}{INDENT}int64_t {tag}_period = (int64_t)({period});"
+        )
+        .ok();
         writeln!(
             out,
             "{INDENT}{INDENT}if ({tag}_period > 0 && (int64_t)cycle_count - {tag}_last >= {tag}_period) {{"
         )
         .ok();
-        writeln!(out, "{INDENT}{INDENT}{INDENT}{tag}_last = (int64_t)cycle_count;").ok();
+        writeln!(
+            out,
+            "{INDENT}{INDENT}{INDENT}{tag}_last = (int64_t)cycle_count;"
+        )
+        .ok();
         // 1. User body (typically a heartbeat log).
         writeln!(out, "{INDENT}{INDENT}{INDENT}{lambda}({inst_path});").ok();
         // 2. Idle check — trips FAIL when BOTH activity stamps are
         //    `max_idle` cycles behind. Mirrors v1's emit_watchdog idle
-        //    block (errors++ on trip).
+        //    block (framework error-counter bump on trip).
         writeln!(
             out,
             "{INDENT}{INDENT}{INDENT}int64_t {tag}_max_idle = (int64_t)({max_idle});"
@@ -740,7 +797,7 @@ fn emit_lifecycle_checkers(
             comp.name
         )
         .ok();
-        writeln!(out, "{INDENT}{INDENT}{INDENT}{INDENT}errors++;").ok();
+        writeln!(out, "{INDENT}{INDENT}{INDENT}{INDENT}ctx.errors++;").ok();
         writeln!(out, "{INDENT}{INDENT}{INDENT}}}").ok();
         writeln!(out, "{INDENT}{INDENT}}}").ok();
         writeln!(out, "{INDENT}}});").ok();
@@ -829,7 +886,8 @@ fn emit_test(
             out,
             &prog.covgroups[cg.index()],
             &format!("_tb.{field}"),
-        );
+            &opts.vec_lane_widths,
+        )?;
     }
     // tseq generator lambdas — one `<Name>` per `tseq` declaration in the
     // file, declared before the run coroutine so its `[&]` capture sees

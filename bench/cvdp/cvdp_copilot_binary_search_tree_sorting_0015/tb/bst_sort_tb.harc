@@ -1,0 +1,37 @@
+// HARC stimulus bench for CVDP cid012 `cvdp_copilot_binary_search_tree_sorting_0015`.
+
+testbench BstSortTb
+    dut : binary_search_tree_sort
+end testbench BstSortTb
+
+function run_sort(dut: binary_search_tree_sort, data: uint<480>, cycles: uint<32>)
+    dut.data_in = data
+    dut.start = 1
+    wait 1 cycle
+    dut.start = 0
+    for _ in 0 .. cycles
+        wait 1 cycle
+    end for
+end function run_sort
+
+impl BstSortTest for BstSortTb
+    run
+        log(info, "binary_search_tree_sort: increasing/decreasing/duplicate tree sweeps")
+        dut.reset = 1
+        dut.start = 0
+        dut.data_in = 0
+        wait 4 cycles
+        dut.reset = 0
+        wait 1 cycle
+
+        run_sort(dut, 0x0000000f0000000e0000000d0000000c0000000b0000000a000000090000000800000007000000060000000500000004000000030000000200000001, 600)
+        run_sort(dut, 0x0000000100000002000000030000000400000005000000060000000700000008000000090000000a0000000b0000000c0000000d0000000e0000000f, 600)
+        run_sort(dut, 0x000000080000000800000008000000080000000800000008000000080000000800000008000000080000000800000008000000080000000800000008, 600)
+        run_sort(dut, 0x000000050000000100000009000000020000000f000000030000000e000000040000000d000000060000000c000000070000000b000000080000000a, 700)
+
+        dut.reset = 1
+        wait 3 cycles
+        dut.reset = 0
+        log(info, "binary_search_tree_sort stimulus complete")
+    end run
+end impl BstSortTest

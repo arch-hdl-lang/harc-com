@@ -246,7 +246,7 @@ int run_CamValueBasicTest(int argc, char** argv) {
                 case 2: {
                     if (!((harc_rt::harc_read(dut->search_any) == 0))) {
                         sim_log_line("FAIL", "empty: search_any=%lld, expected 0", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->search_any)));
-                        errors++;
+                        ctx.errors++;
                     }
                     sim_log_line("INFO", "PASS: empty CAM rejects all searches");
                     CamValueXactor_write(0, 256, 3735879680, 1);
@@ -260,15 +260,15 @@ int run_CamValueBasicTest(int argc, char** argv) {
                 case 3: {
                     if (!((harc_rt::harc_read(dut->search_any) == 1))) {
                         sim_log_line("FAIL", "key=0x100: search_any=%lld, expected 1", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->search_any)));
-                        errors++;
+                        ctx.errors++;
                     }
                     if (!((harc_rt::harc_read(dut->search_first) == 0))) {
                         sim_log_line("FAIL", "key=0x100: first=%lld, expected 0", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->search_first)));
-                        errors++;
+                        ctx.errors++;
                     }
                     if (!((harc_rt::harc_read(dut->read_value) == 3735879680))) {
                         sim_log_line("FAIL", "key=0x100: read_value=%lld, expected 0xDEAD0000", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->read_value)));
-                        errors++;
+                        ctx.errors++;
                     }
                     sim_log_line("INFO", "PASS: key=0x100 Ã¢ÂÂ idx 0, value 0xDEAD0000");
                     harc_rt::harc_assign(dut->search_key, 512);
@@ -279,15 +279,15 @@ int run_CamValueBasicTest(int argc, char** argv) {
                 case 4: {
                     if (!((harc_rt::harc_read(dut->search_any) == 1))) {
                         sim_log_line("FAIL", "key=0x200: search_any=%lld, expected 1", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->search_any)));
-                        errors++;
+                        ctx.errors++;
                     }
                     if (!((harc_rt::harc_read(dut->search_first) == 1))) {
                         sim_log_line("FAIL", "key=0x200: first=%lld, expected 1", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->search_first)));
-                        errors++;
+                        ctx.errors++;
                     }
                     if (!((harc_rt::harc_read(dut->read_value) == 3735879681))) {
                         sim_log_line("FAIL", "key=0x200: read_value=%lld, expected 0xDEAD0001", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->read_value)));
-                        errors++;
+                        ctx.errors++;
                     }
                     sim_log_line("INFO", "PASS: key=0x200 Ã¢ÂÂ idx 1, value 0xDEAD0001");
                     harc_rt::harc_assign(dut->search_key, 768);
@@ -298,15 +298,15 @@ int run_CamValueBasicTest(int argc, char** argv) {
                 case 5: {
                     if (!((harc_rt::harc_read(dut->search_any) == 1))) {
                         sim_log_line("FAIL", "key=0x300: search_any=%lld, expected 1", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->search_any)));
-                        errors++;
+                        ctx.errors++;
                     }
                     if (!((harc_rt::harc_read(dut->search_first) == 2))) {
                         sim_log_line("FAIL", "key=0x300: first=%lld, expected 2", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->search_first)));
-                        errors++;
+                        ctx.errors++;
                     }
                     if (!((harc_rt::harc_read(dut->read_value) == 3735879682))) {
                         sim_log_line("FAIL", "key=0x300: read_value=%lld, expected 0xDEAD0002", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->read_value)));
-                        errors++;
+                        ctx.errors++;
                     }
                     sim_log_line("INFO", "PASS: key=0x300 Ã¢ÂÂ idx 2, value 0xDEAD0002");
                     harc_rt::harc_assign(dut->search_key, 2457);
@@ -317,7 +317,7 @@ int run_CamValueBasicTest(int argc, char** argv) {
                 case 6: {
                     if (!((harc_rt::harc_read(dut->search_any) == 0))) {
                         sim_log_line("FAIL", "unknown key: search_any=%lld, expected 0", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->search_any)));
-                        errors++;
+                        ctx.errors++;
                     }
                     sim_log_line("INFO", "PASS: unknown key Ã¢ÂÂ search_any == 0");
                     CamValueXactor_write(1, 512, 3405939234, 1);
@@ -329,7 +329,7 @@ int run_CamValueBasicTest(int argc, char** argv) {
                 case 7: {
                     if (!((harc_rt::harc_read(dut->read_value) == 3405939234))) {
                         sim_log_line("FAIL", "update slot 1: read_value=%lld, expected 0xCAFE2222", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->read_value)));
-                        errors++;
+                        ctx.errors++;
                     }
                     sim_log_line("INFO", "PASS: update slot 1 value to 0xCAFE2222");
                     CamValueXactor_write(0, 0, 0, 0);
@@ -341,7 +341,7 @@ int run_CamValueBasicTest(int argc, char** argv) {
                 case 8: {
                     if (!((harc_rt::harc_read(dut->search_any) == 0))) {
                         sim_log_line("FAIL", "post-clear: key 0x100 search_any=%lld, expected 0", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->search_any)));
-                        errors++;
+                        ctx.errors++;
                     }
                     sim_log_line("INFO", "PASS: post-clear: key 0x100 misses");
                     CamValueXactor_reset_dut();
@@ -353,7 +353,7 @@ int run_CamValueBasicTest(int argc, char** argv) {
                 case 9: {
                     if (!((harc_rt::harc_read(dut->search_any) == 0))) {
                         sim_log_line("FAIL", "post-reset: search_any=%lld, expected 0", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->search_any)));
-                        errors++;
+                        ctx.errors++;
                     }
                     sim_log_line("INFO", "PASS: post-reset: empty");
                     __done = true;

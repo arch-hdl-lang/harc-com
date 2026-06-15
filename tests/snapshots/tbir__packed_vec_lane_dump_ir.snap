@@ -3,10 +3,19 @@ source: tests/tbir.rs
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
-  testbench tb0 PackedVecLaneTb { dut: PackedVecLane }
-  test PackedVecLaneTest tb=tb0 run=fn0 check=-
+  testbench tb0 PackedVecLaneTb { dut: PackedVecLane } cov cov=cg0
+  test PackedVecLaneTest tb=tb0 run=fn1 check=fn2
+  covgroup cg0 PackedVecLaneCov @posedge(dut.clk)
+    point cp_packed_id0 <- dut.lane_id_out[0]: id4={4}
+    point cp_unpacked0 <- dut.pass_uvec_out[0]: u42={66}
 
-fn fn0 run_PackedVecLaneTest [kind=Run, owner=tb0]
+fn fn0 sample_PackedVecLaneTest_cov [kind=SamplerAuto(cg0), owner=tb0]
+  entry = b0
+
+  b0:
+    -> Return
+
+fn fn1 run_PackedVecLaneTest [kind=Run, owner=tb0]
   entry = b0
 
   b0:
@@ -44,4 +53,13 @@ fn fn0 run_PackedVecLaneTest [kind=Run, owner=tb0]
     AssertCheck { cond: (dut.pass_uvec_out[1] == 82), on_fail: "pass_uvec[1] = 0x52 (got 0x%02llx)", dut.pass_uvec_out[1] }
     AssertCheck { cond: (dut.pass_uvec_out[2] == 98), on_fail: "pass_uvec[2] = 0x62 (got 0x%02llx)", dut.pass_uvec_out[2] }
     Log(info, "PASS: packed Vec<Bus> lanes + unpacked array index correctly on --sv")
+    -> Return
+
+fn fn2 check_PackedVecLaneTest [kind=Check, owner=tb0]
+  entry = b0
+
+  b0:
+    CovReport(cov.cg0)
+    AssertCheck { cond: (CovBin(cov.cg0, cp_packed_id0, id4) > 0), on_fail: "packed lane coverpoint did not sample lane_id_out[0] == 4" }
+    AssertCheck { cond: (CovBin(cov.cg0, cp_unpacked0, u42) > 0), on_fail: "unpacked array coverpoint did not sample pass_uvec_out[0] == 0x42" }
     -> Return

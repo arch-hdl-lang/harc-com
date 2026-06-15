@@ -6,11 +6,11 @@
 //! inclusive ranges, plus declared `cross` items over those points.
 //! Hook triggers stay `Unsupported` — never silently mis-lowered.
 
-use super::{LowerError, unsupported};
-use crate::ast::{CoverItem, CoverTrigger, CovergroupDecl, Expr as AstExpr, ExprKind};
+use super::{unsupported, LowerError};
+use crate::ast::{CoverItem, CoverTrigger, CovergroupDecl, Expr as AstExpr, ExprKind, UnaryOp};
 use crate::ir::{
     CovBinValue, CovTrigger, CoverBinSchema, CoverCrossSchema, CoverPointSchema, CovgroupSchema,
-    PortAccess, PortRef,
+    Expr, IrType, PortAccess, PortRef, UnOp, WidthCastKind,
 };
 
 pub(crate) fn lower_covergroup(g: &CovergroupDecl) -> Result<CovgroupSchema, LowerError> {
@@ -110,45 +110,294 @@ pub(crate) fn lower_covergroup(g: &CovergroupDecl) -> Result<CovgroupSchema, Low
     })
 }
 
-/// A cover-point target must be a direct DUT port read (`dut.<port>`).
-fn lower_point_target(
-    group: &str,
-    point: &str,
-    target: &AstExpr,
-) -> Result<PortRef, LowerError> {
+/// A cover-point target is a pure DUT-bound scalar expression. Keep this
+/// subset deliberately smaller than general expression lowering because
+/// covergroup schemas lower before test/run scopes exist: no locals,
+/// helper calls, regblock reads, or transactor edges.
+fn lower_point_target(group: &str, point: &str, target: &AstExpr) -> Result<Expr, LowerError> {
+    let unsupported_target = || {
+        unsupported(
+            &format!("covergroup `{group}` point `{point}` with an unsupported target expression"),
+            "supported: dut.<port>, dut.<port>[idx], expr[hi:lo], literals, unary/binary/ternary expressions",
+        )
+    };
+
+    fn lower_port(group: &str, point: &str, e: &AstExpr) -> Result<Option<PortRef>, LowerError> {
+        let mut cur = e;
+        let mut lane = None;
+        if let ExprKind::Index { target, index } = &*cur.kind {
+            lane = Some(cover_const_u64(group, point, index)?);
+            cur = target;
+        }
+        let mut segments: Vec<String> = Vec::new();
+        loop {
+            match &*cur.kind {
+                ExprKind::Paren(inner) => cur = inner,
+                ExprKind::Field { target: ft, name } => {
+                    segments.push(name.name.clone());
+                    cur = ft;
+                }
+                ExprKind::Ident(root) if root.name == "dut" && !segments.is_empty() => {
+                    if segments.len() > 1 {
+                        return Err(unsupported(
+                            &format!(
+                                "covergroup `{group}` point `{point}` with nested DUT port paths"
+                            ),
+                            "",
+                        ));
+                    }
+                    segments.reverse();
+                    return Ok(Some(PortRef {
+                        testbench_field: "dut".to_string(),
+                        port_path: segments,
+                        direction: None,
+                        width: None,
+                        access: PortAccess::Port,
+                        lane,
+                    }));
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+
+    if let Some(port) = lower_port(group, point, target)? {
+        return Ok(Expr::Port(port));
+    }
+
     let mut cur = target;
     loop {
         match &*cur.kind {
             ExprKind::Paren(inner) => cur = inner,
-            ExprKind::Field { target: ft, name } => {
-                if let ExprKind::Ident(root) = &*ft.kind {
-                    if root.name == "dut" {
-                        return Ok(PortRef {
-                            testbench_field: "dut".to_string(),
-                            port_path: vec![name.name.clone()],
-                            direction: None,
-                            width: None,
-                            access: PortAccess::Port,
-                            lane: None,
+            ExprKind::Int(s) => {
+                let value = super::exprs::parse_int_literal(s).ok_or_else(unsupported_target)?;
+                return Ok(Expr::Literal {
+                    value,
+                    ty: IrType::Unknown,
+                });
+            }
+            ExprKind::Bool(b) => {
+                return Ok(Expr::Literal {
+                    value: *b as u64,
+                    ty: IrType::Bool,
+                });
+            }
+            ExprKind::Unary { op, expr } => {
+                let inner = lower_point_target(group, point, expr)?;
+                let op = match op {
+                    UnaryOp::Neg => UnOp::Neg,
+                    UnaryOp::Not | UnaryOp::NotKw => UnOp::Not,
+                    UnaryOp::BitNot => UnOp::BitNot,
+                };
+                return Ok(Expr::Unary(op, Box::new(inner)));
+            }
+            ExprKind::Binary { op, lhs, rhs } => {
+                let op = super::exprs::lower_bin_op(*op)?;
+                let lhs = lower_point_target(group, point, lhs)?;
+                let rhs = lower_point_target(group, point, rhs)?;
+                return Ok(Expr::Binary(op, Box::new(lhs), Box::new(rhs)));
+            }
+            ExprKind::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                let cond = lower_point_target(group, point, cond)?;
+                let then_branch = lower_point_target(group, point, then_branch)?;
+                let else_branch = lower_point_target(group, point, else_branch)?;
+                return Ok(Expr::Ternary(
+                    Box::new(cond),
+                    Box::new(then_branch),
+                    Box::new(else_branch),
+                ));
+            }
+            ExprKind::BitSlice { target, hi, lo } => {
+                let hi = cover_const_u32(group, point, hi)?;
+                let lo = cover_const_u32(group, point, lo)?;
+                if hi < lo {
+                    return Err(LowerError::Invalid(format!(
+                        "covergroup `{group}` point `{point}` has invalid bit slice [{hi}:{lo}]"
+                    )));
+                }
+                let target = lower_point_target(group, point, target)?;
+                return Ok(Expr::BitSlice {
+                    target: Box::new(target),
+                    hi,
+                    lo,
+                });
+            }
+            ExprKind::Cast { expr, ty } => {
+                let width = cover_cast_width(group, point, ty)?.ok_or_else(unsupported_target)?;
+                let inner = lower_point_target(group, point, expr)?;
+                return Ok(Expr::WidthCast {
+                    kind: WidthCastKind::Resize,
+                    width,
+                    src_width: cover_infer_expr_width(group, point, expr)?,
+                    inner: Box::new(inner),
+                });
+            }
+            ExprKind::Call { callee, args } => {
+                if let ExprKind::Field { target: recv, name } = &*callee.kind {
+                    if matches!(name.name.as_str(), "trunc" | "zext" | "sext" | "resize") {
+                        // Width-method calls are parsed with the width as the first argument.
+                        let width_expr = match args.first() {
+                            Some(crate::ast::CallArg::Expr(e)) if args.len() == 1 => e,
+                            _ => return Err(unsupported_target()),
+                        };
+                        let width = cover_width_arg(group, point, &name.name, width_expr)?;
+                        let src_width = cover_infer_expr_width(group, point, recv)?;
+                        let inner = lower_point_target(group, point, recv)?;
+                        let kind = match name.name.as_str() {
+                            "trunc" => WidthCastKind::Trunc,
+                            "zext" => WidthCastKind::Zext,
+                            "sext" => WidthCastKind::Sext,
+                            "resize" => WidthCastKind::Resize,
+                            _ => unreachable!(),
+                        };
+                        if let Some(sw) = src_width {
+                            match kind {
+                                WidthCastKind::Trunc if width >= sw => {
+                                    return Err(LowerError::Invalid(format!(
+                                        "covergroup `{group}` point `{point}` `.trunc<{width}>()` on a {sw}-bit value: width must be strictly less than the source width"
+                                    )));
+                                }
+                                WidthCastKind::Zext | WidthCastKind::Sext if width < sw => {
+                                    return Err(LowerError::Invalid(format!(
+                                        "covergroup `{group}` point `{point}` `.{method}<{width}>()` on a {sw}-bit value: width must be >= the source width",
+                                        method = name.name
+                                    )));
+                                }
+                                _ => {}
+                            }
+                        }
+                        return Ok(Expr::WidthCast {
+                            kind,
+                            width,
+                            src_width,
+                            inner: Box::new(inner),
                         });
                     }
                 }
-                return Err(unsupported(
-                    &format!(
-                        "covergroup `{group}` point `{point}` with a non-`dut.<port>` target"
-                    ),
-                    "",
-                ));
+                return Err(unsupported_target());
             }
-            _ => {
-                return Err(unsupported(
-                    &format!(
-                        "covergroup `{group}` point `{point}` with a non-`dut.<port>` target"
-                    ),
-                    "",
-                ));
-            }
+            _ => return Err(unsupported_target()),
         }
+    }
+}
+
+fn cover_const_u64(group: &str, point: &str, e: &AstExpr) -> Result<u64, LowerError> {
+    match &*e.kind {
+        ExprKind::Paren(inner) => cover_const_u64(group, point, inner),
+        ExprKind::Int(s) => super::exprs::parse_int_literal(s).ok_or_else(|| {
+            unsupported(
+                &format!("covergroup `{group}` point `{point}` constant"),
+                format!("`{s}` is not a plain integer literal"),
+            )
+        }),
+        _ => Err(unsupported(
+            &format!("covergroup `{group}` point `{point}` non-constant index/slice bound"),
+            "",
+        )),
+    }
+}
+
+fn cover_const_u32(group: &str, point: &str, e: &AstExpr) -> Result<u32, LowerError> {
+    let v = cover_const_u64(group, point, e)?;
+    u32::try_from(v).map_err(|_| {
+        LowerError::Invalid(format!(
+            "covergroup `{group}` point `{point}` constant {v} does not fit in u32"
+        ))
+    })
+}
+
+fn cover_width_arg(group: &str, point: &str, method: &str, e: &AstExpr) -> Result<u32, LowerError> {
+    let width = cover_const_u32(group, point, e)?;
+    if width == 0 {
+        return Err(LowerError::Invalid(format!(
+            "covergroup `{group}` point `{point}` `.{method}<0>()`: width must be greater than zero"
+        )));
+    }
+    if width > 64 {
+        return Err(unsupported(
+            &format!("covergroup `{group}` point `{point}` `.{method}<{width}>()`"),
+            "the TB-IR covergroup expression model is 64-bit",
+        ));
+    }
+    Ok(width)
+}
+
+fn cover_cast_width(
+    group: &str,
+    point: &str,
+    ty: &crate::ast::TypeExpr,
+) -> Result<Option<u32>, LowerError> {
+    let width = match ty {
+        crate::ast::TypeExpr::Builtin {
+            name:
+                crate::ast::BuiltinTy::UInt | crate::ast::BuiltinTy::SInt | crate::ast::BuiltinTy::Bits,
+            args,
+            ..
+        } => match args.first() {
+            Some(crate::ast::TypeArg::Expr(e)) => Some(cover_const_u32(group, point, e)?),
+            Some(_) => None,
+            None => Some(64),
+        },
+        _ => None,
+    };
+    if let Some(width) = width {
+        if width == 0 {
+            return Err(LowerError::Invalid(format!(
+                "covergroup `{group}` point `{point}` cast width must be greater than zero"
+            )));
+        }
+        if width > 64 {
+            return Err(unsupported(
+                &format!("covergroup `{group}` point `{point}` cast to {width} bits"),
+                "the TB-IR covergroup expression model is 64-bit",
+            ));
+        }
+    }
+    Ok(width)
+}
+
+fn cover_infer_expr_width(
+    group: &str,
+    point: &str,
+    e: &AstExpr,
+) -> Result<Option<u32>, LowerError> {
+    match &*e.kind {
+        ExprKind::Paren(inner) => cover_infer_expr_width(group, point, inner),
+        ExprKind::BitSlice { hi, lo, .. } => {
+            let hi = cover_const_u32(group, point, hi)?;
+            let lo = cover_const_u32(group, point, lo)?;
+            if hi < lo {
+                return Err(LowerError::Invalid(format!(
+                    "covergroup `{group}` point `{point}` has invalid bit slice [{hi}:{lo}]"
+                )));
+            }
+            Ok(Some(hi - lo + 1))
+        }
+        ExprKind::Cast { ty, .. } => cover_cast_width(group, point, ty),
+        ExprKind::Call { callee, args } => {
+            if let ExprKind::Field { name, .. } = &*callee.kind {
+                if matches!(name.name.as_str(), "trunc" | "zext" | "sext" | "resize") {
+                    let width_expr = match args.first() {
+                        Some(crate::ast::CallArg::Expr(e)) if args.len() == 1 => e,
+                        _ => return Ok(None),
+                    };
+                    return Ok(Some(cover_width_arg(group, point, &name.name, width_expr)?));
+                }
+            }
+            Ok(None)
+        }
+        ExprKind::Int(s) => Ok(super::exprs::parse_int_literal(s).map(|v| {
+            if v == 0 {
+                1
+            } else {
+                64 - v.leading_zeros()
+            }
+        })),
+        _ => Ok(None),
     }
 }
 

@@ -14,10 +14,23 @@
 //   lane_id    : 5-bit lane  (2-D packed)
 //   lane_data  : 32-bit lane (2-D packed, 96b total → VlWide<3>)
 //   pass_uvec  : TRUE unpacked array — must stay array-indexed (not
-//                bit-extracted) on both backends.
+//                bit-extracted) on both backends. The covergroup below
+//                samples both shapes so sampler codegen is covered too.
+
+covergroup PackedVecLaneCov @(posedge dut.clk)
+    cp_packed_id0 : cover dut.lane_id_out[0]
+        bins
+            id4 = {4}
+        end bins
+    cp_unpacked0 : cover dut.pass_uvec_out[0]
+        bins
+            u42 = {0x42}
+        end bins
+end covergroup PackedVecLaneCov
 
 testbench PackedVecLaneTb
     dut : PackedVecLane
+    cov : PackedVecLaneCov
 end testbench PackedVecLaneTb
 
 impl PackedVecLaneTest for PackedVecLaneTb
@@ -81,4 +94,12 @@ impl PackedVecLaneTest for PackedVecLaneTb
 
         log(info, "PASS: packed Vec<Bus> lanes + unpacked array index correctly on --sv")
     end run
+
+    check
+        cov.report()
+        assert cov.cp_packed_id0.id4 > 0
+            else fail("packed lane coverpoint did not sample lane_id_out[0] == 4")
+        assert cov.cp_unpacked0.u42 > 0
+            else fail("unpacked array coverpoint did not sample pass_uvec_out[0] == 0x42")
+    end check
 end impl PackedVecLaneTest

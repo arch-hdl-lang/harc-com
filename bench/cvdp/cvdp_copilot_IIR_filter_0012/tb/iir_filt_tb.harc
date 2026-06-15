@@ -1,0 +1,54 @@
+// HARC stimulus bench for CVDP cid012 `cvdp_copilot_IIR_filter_0012`.
+//
+// Exercises reset, all filter_select cases including default, and signed
+// positive/negative input histories across the three parallel channels.
+
+testbench IirFiltTb
+    dut : iir_filt
+end testbench IirFiltTb
+
+impl IirFiltTest for IirFiltTb
+    run
+        log(info, "iir_filt: reset plus filter-select and signed-input sweep")
+
+        dut.reset = 1
+        dut.filter_select = 0
+        dut.in_1 = 0
+        dut.in_2 = 0
+        dut.in_3 = 0
+        wait 3 cycles
+        dut.reset = 0
+        wait 1 cycle
+
+        for sel in 0 .. 4
+            dut.filter_select = sel
+            for k in 0 .. 12
+                dut.in_1 = ((k * 17) - 80)
+                dut.in_2 = (90 - (k * 11))
+                dut.in_3 = ((k * k) - 48)
+                wait 1 cycle
+            end for
+        end for
+
+        // Toggle reset after nonzero delay-line contents have accumulated.
+        dut.reset = 1
+        wait 2 cycles
+        dut.reset = 0
+
+        // Endpoint and walking patterns hit sign and coefficient expression
+        // branches while the default filter_select zeros the outputs.
+        for sel in 0 .. 4
+            dut.filter_select = sel
+            dut.in_1 = 32767
+            dut.in_2 = -32768
+            dut.in_3 = 1
+            wait 1 cycle
+            dut.in_1 = -1
+            dut.in_2 = 0
+            dut.in_3 = 16384
+            wait 1 cycle
+        end for
+
+        log(info, "iir_filt stimulus complete")
+    end run
+end impl IirFiltTest

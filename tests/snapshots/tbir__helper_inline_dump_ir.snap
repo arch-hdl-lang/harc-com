@@ -11,7 +11,7 @@ fn fn0 double_it [kind=Helper]
     x : uint<8>
   locals:
     %0 x : uint<8>
-    %1 __ret : unknown
+    %1 __ret : uint<8>
   ret = %__ret
   entry = b0
 
@@ -21,10 +21,10 @@ fn fn0 double_it [kind=Helper]
 
 fn fn1 run_HelperMixTest [kind=Run, owner=tb0]
   locals:
-    %0 __t0 : unknown
-    %1 addr : unknown
-    %2 __t1 : unknown
-    %3 addr_2 : unknown
+    %0 __t0 : uint<8>
+    %1 addr : uint<3>
+    %2 __t1 : uint<8>
+    %3 addr_2 : uint<3>
     %4 d : unknown
   entry = b0
 

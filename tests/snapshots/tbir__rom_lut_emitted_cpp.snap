@@ -238,7 +238,7 @@ int run_RomLutTest(int argc, char** argv) {
                 case 2: {
                     if (!((__t0 == 0))) {
                         sim_log_line("FAIL", "addr 0: got 0x%02llx", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->rd_data)));
-                        errors++;
+                        ctx.errors++;
                     }
                     __t1 = 0;
                     addr_2 = 1;
@@ -256,7 +256,7 @@ int run_RomLutTest(int argc, char** argv) {
                 case 4: {
                     if (!((__t1 == 49))) {
                         sim_log_line("FAIL", "addr 1: got 0x%02llx", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->rd_data)));
-                        errors++;
+                        ctx.errors++;
                     }
                     __t2 = 0;
                     addr_3 = 2;
@@ -274,7 +274,7 @@ int run_RomLutTest(int argc, char** argv) {
                 case 6: {
                     if (!((__t2 == 90))) {
                         sim_log_line("FAIL", "addr 2: got 0x%02llx", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->rd_data)));
-                        errors++;
+                        ctx.errors++;
                     }
                     __t3 = 0;
                     addr_4 = 3;
@@ -292,7 +292,7 @@ int run_RomLutTest(int argc, char** argv) {
                 case 8: {
                     if (!((__t3 == 118))) {
                         sim_log_line("FAIL", "addr 3: got 0x%02llx", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->rd_data)));
-                        errors++;
+                        ctx.errors++;
                     }
                     __t4 = 0;
                     addr_5 = 4;
@@ -310,7 +310,7 @@ int run_RomLutTest(int argc, char** argv) {
                 case 10: {
                     if (!((__t4 == 127))) {
                         sim_log_line("FAIL", "addr 4: got 0x%02llx", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->rd_data)));
-                        errors++;
+                        ctx.errors++;
                     }
                     __t5 = 0;
                     addr_6 = 5;
@@ -328,7 +328,7 @@ int run_RomLutTest(int argc, char** argv) {
                 case 12: {
                     if (!((__t5 == 118))) {
                         sim_log_line("FAIL", "addr 5: got 0x%02llx", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->rd_data)));
-                        errors++;
+                        ctx.errors++;
                     }
                     __t6 = 0;
                     addr_7 = 6;
@@ -346,7 +346,7 @@ int run_RomLutTest(int argc, char** argv) {
                 case 14: {
                     if (!((__t6 == 90))) {
                         sim_log_line("FAIL", "addr 6: got 0x%02llx", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->rd_data)));
-                        errors++;
+                        ctx.errors++;
                     }
                     __t7 = 0;
                     addr_8 = 7;
@@ -364,7 +364,7 @@ int run_RomLutTest(int argc, char** argv) {
                 case 16: {
                     if (!((__t7 == 49))) {
                         sim_log_line("FAIL", "addr 7: got 0x%02llx", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->rd_data)));
-                        errors++;
+                        ctx.errors++;
                     }
                     sim_log_line("INFO", "PASS: 8 ROM entries match the inline-init pattern");
                     __done = true;
@@ -388,11 +388,11 @@ int run_RomLutTest(int argc, char** argv) {
                     _tb.cov.report();
                     if (!((_tb.cov.cp_addr.a0 > 0))) {
                         sim_log_line("FAIL", "addr 0 coverage hole");
-                        errors++;
+                        ctx.errors++;
                     }
                     if (!((_tb.cov.cp_addr.a7 > 0))) {
                         sim_log_line("FAIL", "addr 7 coverage hole");
-                        errors++;
+                        ctx.errors++;
                     }
                     __done = true;
                     break;

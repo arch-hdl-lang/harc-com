@@ -240,11 +240,11 @@ int run_BusArbiterTest(int argc, char** argv) {
                 case 2: {
                     if (!((harc_rt::harc_read(dut->grant_valid) == 1))) {
                         sim_log_line("FAIL", "single req0: grant_valid should be 1");
-                        errors++;
+                        ctx.errors++;
                     }
                     if (!((harc_rt::harc_read(dut->grant_requester) == 0))) {
                         sim_log_line("FAIL", "single req0: got grant_requester=%lld", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->grant_requester)));
-                        errors++;
+                        ctx.errors++;
                     }
                     sim_log_line("INFO", "PASS: single requester 0 granted");
                     harc_rt::harc_assign(dut->request_valid, 4);
@@ -255,11 +255,11 @@ int run_BusArbiterTest(int argc, char** argv) {
                 case 3: {
                     if (!((harc_rt::harc_read(dut->grant_valid) == 1))) {
                         sim_log_line("FAIL", "single req2: grant_valid should be 1");
-                        errors++;
+                        ctx.errors++;
                     }
                     if (!((harc_rt::harc_read(dut->grant_requester) == 2))) {
                         sim_log_line("FAIL", "single req2: got grant_requester=%lld", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->grant_requester)));
-                        errors++;
+                        ctx.errors++;
                     }
                     sim_log_line("INFO", "PASS: single requester 2 granted");
                     harc_rt::harc_assign(dut->request_valid, 0);
@@ -270,7 +270,7 @@ int run_BusArbiterTest(int argc, char** argv) {
                 case 4: {
                     if (!((harc_rt::harc_read(dut->grant_valid) == 0))) {
                         sim_log_line("FAIL", "no request: grant_valid should be 0");
-                        errors++;
+                        ctx.errors++;
                     }
                     sim_log_line("INFO", "PASS: no grant when no request");
                     __done = true;
@@ -289,19 +289,19 @@ int run_BusArbiterTest(int argc, char** argv) {
                     _tb.cov.report();
                     if (!((_tb.cov.cp_grant.r0 > 0))) {
                         sim_log_line("FAIL", "R0 grant coverage hole");
-                        errors++;
+                        ctx.errors++;
                     }
                     if (!((_tb.cov.cp_grant.r2 > 0))) {
                         sim_log_line("FAIL", "R2 grant coverage hole");
-                        errors++;
+                        ctx.errors++;
                     }
                     if (!((_tb.cov.cp_valid.granted > 0))) {
                         sim_log_line("FAIL", "granted coverage hole");
-                        errors++;
+                        ctx.errors++;
                     }
                     if (!((_tb.cov.cp_valid.no_request > 0))) {
                         sim_log_line("FAIL", "no-request coverage hole");
-                        errors++;
+                        ctx.errors++;
                     }
                     __done = true;
                     break;

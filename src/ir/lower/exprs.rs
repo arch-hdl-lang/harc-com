@@ -3,7 +3,7 @@
 //! args, DutRead/DutWrite operands, assert conditions) — everywhere
 //! else `lower_expr_no_ports` hoists DUT reads into `DutRead` temps.
 
-use super::{FuncBuilder, LowerError, unsupported};
+use super::{unsupported, FuncBuilder, LowerError};
 use crate::ast::{
     BinaryOp, BuiltinTy, CallArg, Expr as AstExpr, ExprKind, TypeArg, TypeExpr, UnaryOp,
 };
@@ -47,8 +47,8 @@ impl FuncBuilder<'_> {
                 }
                 // The framework error counter (`errors`), referenced from
                 // `assert errors == 0` / `${errors}` after a walk like
-                // `bitbash(regs)`. Locals shadow (checked above). v1 emits
-                // the in-scope `errors` variable.
+                // `bitbash(regs)`. Locals shadow (checked above), and
+                // codegen emits the framework counter directly.
                 if id.name == "errors" {
                     return Ok(Expr::ErrorCount);
                 }
@@ -398,10 +398,7 @@ impl FuncBuilder<'_> {
                 ))
             }
             ExprKind::BitSlice { .. } => Err(unsupported("bit-slice expressions", "")),
-            ExprKind::String(_) => Err(unsupported(
-                "string values in expression position",
-                "",
-            )),
+            ExprKind::String(_) => Err(unsupported("string values in expression position", "")),
             ExprKind::Float(_) => Err(unsupported("float literals", "")),
             ExprKind::Time(_) => Err(unsupported("time literals in expression position", "")),
             ExprKind::SystemCall { .. } => Err(unsupported("temporal system calls", "")),
@@ -481,26 +478,51 @@ impl FuncBuilder<'_> {
     }
 
     pub(crate) fn hoist_ports(&mut self, e: Expr) -> Expr {
+        self.hoist_ports_with_hint(e, None)
+    }
+
+    fn hoist_ports_with_hint(&mut self, e: Expr, hint: Option<IrType>) -> Expr {
         match e {
             Expr::Port(p) => {
                 let t = self.fresh_temp();
+                if let Some(ty) = port_temp_type(&p, hint.as_ref()) {
+                    self.set_local_type(t, ty);
+                }
                 self.push(Stmt::DutRead(t, p));
                 Expr::Local(t)
             }
             Expr::Binary(op, a, b) => {
-                let a = self.hoist_ports(*a);
-                let b = self.hoist_ports(*b);
+                let a_hint = if matches!(op, BinOp::Eq | BinOp::Ne) {
+                    self.expr_type(&b)
+                } else {
+                    None
+                };
+                let b_hint = if matches!(op, BinOp::Eq | BinOp::Ne) {
+                    self.expr_type(&a)
+                } else {
+                    None
+                };
+                let a = self.hoist_ports_with_hint(*a, a_hint);
+                let b = self.hoist_ports_with_hint(*b, b_hint);
                 Expr::Binary(op, Box::new(a), Box::new(b))
             }
             Expr::Unary(op, a) => {
-                let a = self.hoist_ports(*a);
+                let a = self.hoist_ports_with_hint(*a, None);
                 Expr::Unary(op, Box::new(a))
             }
             Expr::Ternary(c, t, e) => {
-                let c = self.hoist_ports(*c);
-                let t = self.hoist_ports(*t);
-                let e = self.hoist_ports(*e);
+                let c = self.hoist_ports_with_hint(*c, None);
+                let t = self.hoist_ports_with_hint(*t, None);
+                let e = self.hoist_ports_with_hint(*e, None);
                 Expr::Ternary(Box::new(c), Box::new(t), Box::new(e))
+            }
+            Expr::BitSlice { target, hi, lo } => {
+                let target = self.hoist_ports_with_hint(*target, None);
+                Expr::BitSlice {
+                    target: Box::new(target),
+                    hi,
+                    lo,
+                }
             }
             Expr::WidthCast {
                 kind,
@@ -508,7 +530,7 @@ impl FuncBuilder<'_> {
                 src_width,
                 inner,
             } => {
-                let inner = self.hoist_ports(*inner);
+                let inner = self.hoist_ports_with_hint(*inner, None);
                 Expr::WidthCast {
                     kind,
                     width,
@@ -517,7 +539,10 @@ impl FuncBuilder<'_> {
                 }
             }
             Expr::Call(t, args) => {
-                let args = args.into_iter().map(|a| self.hoist_ports(a)).collect();
+                let args = args
+                    .into_iter()
+                    .map(|a| self.hoist_ports_with_hint(a, None))
+                    .collect();
                 // A value-bearing transactor-method call in expression
                 // position: pull the call edge into its own
                 // `Stmt::TransactorCall { dest: Some(temp), .. }` (the
@@ -530,7 +555,7 @@ impl FuncBuilder<'_> {
                 self.hoist_transactor_edge(Expr::Call(t, args))
             }
             Expr::ComponentIdle { base, kind, n } => {
-                let n = self.hoist_ports(*n);
+                let n = self.hoist_ports_with_hint(*n, None);
                 Expr::ComponentIdle {
                     base,
                     kind,
@@ -538,7 +563,7 @@ impl FuncBuilder<'_> {
                 }
             }
             Expr::SeqIndex { seq, index } => {
-                let index = self.hoist_ports(*index);
+                let index = self.hoist_ports_with_hint(*index, None);
                 Expr::SeqIndex {
                     seq,
                     index: Box::new(index),
@@ -548,7 +573,7 @@ impl FuncBuilder<'_> {
             // which may hold a DUT port; hoist into it. A scalar
             // RecordField (index `None`) is the no-op host-state value.
             Expr::RecordField { local, field, index: Some(index) } => {
-                let index = self.hoist_ports(*index);
+                let index = self.hoist_ports_with_hint(*index, None);
                 Expr::RecordField { local, field, index: Some(Box::new(index)) }
             }
             other @ (Expr::Literal { .. }
@@ -580,6 +605,34 @@ impl FuncBuilder<'_> {
         }
     }
 
+    fn expr_type(&self, e: &Expr) -> Option<IrType> {
+        match e {
+            Expr::Literal { ty, .. } => Some(ty.clone()),
+            Expr::WideLiteral(words) => Some(IrType::UInt(Some(wide_literal_bits(words)))),
+            Expr::Local(l) => Some(self.local_type(*l).clone()),
+            Expr::Port(p) => p.width.map(|w| IrType::UInt(Some(w))),
+            Expr::Binary(op, a, b) => match op {
+                BinOp::Eq
+                | BinOp::Ne
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge
+                | BinOp::And
+                | BinOp::Or => Some(IrType::Bool),
+                _ => self.expr_type(a).or_else(|| self.expr_type(b)),
+            },
+            Expr::Unary(_, inner) => self.expr_type(inner),
+            Expr::Ternary(_, t, e) => self.expr_type(t).or_else(|| self.expr_type(e)),
+            Expr::BitSlice { hi, lo, .. } => Some(IrType::UInt(Some(hi - lo + 1))),
+            Expr::WidthCast { kind, width, .. } => Some(match kind {
+                WidthCastKind::Sext => IrType::SInt(Some(*width)),
+                _ => IrType::UInt(Some(*width)),
+            }),
+            _ => None,
+        }
+    }
+
     /// If `e` is a value-bearing `CallTarget::TransactorMethod` edge,
     /// pull it into a fresh `Stmt::TransactorCall { dest: Some(temp), .. }`
     /// and return `Expr::Local(temp)`; otherwise return `e` unchanged.
@@ -589,9 +642,15 @@ impl FuncBuilder<'_> {
     /// internal `tick()` runs at the hoist point (source order, because the
     /// callers traverse left-to-right).
     fn hoist_transactor_edge(&mut self, e: Expr) -> Expr {
-        if matches!(&e, Expr::Call(crate::ir::CallTarget::TransactorMethod { .. }, _)) {
+        if matches!(
+            &e,
+            Expr::Call(crate::ir::CallTarget::TransactorMethod { .. }, _)
+        ) {
             let temp = self.fresh_temp();
-            self.push(Stmt::TransactorCall { dest: Some(temp), call: e });
+            self.push(Stmt::TransactorCall {
+                dest: Some(temp),
+                call: e,
+            });
             Expr::Local(temp)
         } else {
             e
@@ -626,20 +685,48 @@ impl FuncBuilder<'_> {
                 let f = self.hoist_transactor_calls(*f);
                 Expr::Ternary(Box::new(c), Box::new(t), Box::new(f))
             }
-            Expr::WidthCast { kind, width, src_width, inner } => {
+            Expr::BitSlice { target, hi, lo } => {
+                let target = self.hoist_transactor_calls(*target);
+                Expr::BitSlice {
+                    target: Box::new(target),
+                    hi,
+                    lo,
+                }
+            }
+            Expr::WidthCast {
+                kind,
+                width,
+                src_width,
+                inner,
+            } => {
                 let inner = self.hoist_transactor_calls(*inner);
-                Expr::WidthCast { kind, width, src_width, inner: Box::new(inner) }
+                Expr::WidthCast {
+                    kind,
+                    width,
+                    src_width,
+                    inner: Box::new(inner),
+                }
             }
             Expr::ComponentIdle { base, kind, n } => {
                 let n = self.hoist_transactor_calls(*n);
-                Expr::ComponentIdle { base, kind, n: Box::new(n) }
+                Expr::ComponentIdle {
+                    base,
+                    kind,
+                    n: Box::new(n),
+                }
             }
             Expr::SeqIndex { seq, index } => {
                 let index = self.hoist_transactor_calls(*index);
-                Expr::SeqIndex { seq, index: Box::new(index) }
+                Expr::SeqIndex {
+                    seq,
+                    index: Box::new(index),
+                }
             }
             Expr::Call(t, args) => {
-                let args = args.into_iter().map(|a| self.hoist_transactor_calls(a)).collect();
+                let args = args
+                    .into_iter()
+                    .map(|a| self.hoist_transactor_calls(a))
+                    .collect();
                 self.hoist_transactor_edge(Expr::Call(t, args))
             }
             other => other,
@@ -686,7 +773,12 @@ impl FuncBuilder<'_> {
             )));
         }
         self.scoreboard_queue_field(sb, &queue)?;
-        Ok(Some(Expr::ScoreboardQuery { sb, field, query, nested_path }))
+        Ok(Some(Expr::ScoreboardQuery {
+            sb,
+            field,
+            query,
+            nested_path,
+        }))
     }
 
     /// Lower `<recv>.<queue>.size()` / `.empty()` on a composite-component
@@ -761,10 +853,7 @@ impl FuncBuilder<'_> {
                             // `dut.bus.sig` flattening conventions are
                             // backend-specific (bus binds, Vec<Bus>);
                             // not verified for tbir yet.
-                            return Err(unsupported(
-                                "nested DUT port paths (`dut.a.b`)",
-                                "",
-                            ));
+                            return Err(unsupported("nested DUT port paths (`dut.a.b`)", ""));
                         }
                         segments.reverse();
                         // A single-segment `dut.<name>` whose name was
@@ -818,7 +907,11 @@ impl FuncBuilder<'_> {
                         // the scoreboard op/query forms. The root field
                         // (the segment after `_tb`) is the scoreboard
                         // instance name.
-                        if self.ctx.scoreboard_fields.contains_key(segments.last().unwrap()) {
+                        if self
+                            .ctx
+                            .scoreboard_fields
+                            .contains_key(segments.last().unwrap())
+                        {
                             return Ok(None);
                         }
                         // Composite-component field paths (`_tb.prod`,
@@ -836,9 +929,7 @@ impl FuncBuilder<'_> {
                         {
                             return Ok(None);
                         }
-                        if segments.len() == 1
-                            && self.ctx.tb_scalar_fields.contains(&segments[0])
-                        {
+                        if segments.len() == 1 && self.ctx.tb_scalar_fields.contains(&segments[0]) {
                             return Ok(None);
                         }
                         return Err(unsupported(
@@ -1010,7 +1101,10 @@ impl FuncBuilder<'_> {
         //     is the middle segment.
         let instance = match &*target.kind {
             ExprKind::Ident(root) => root.name.clone(),
-            ExprKind::Field { target: inner, name: mid } => {
+            ExprKind::Field {
+                target: inner,
+                name: mid,
+            } => {
                 let ExprKind::Ident(root) = &*inner.kind else {
                     return None;
                 };
@@ -1033,10 +1127,7 @@ impl FuncBuilder<'_> {
     /// literal (directly, through parens, or via a `const`/enum name)
     /// — non-constant lane indices are an explicit rejection at the
     /// caller.
-    pub(crate) fn as_lane_port_ref(
-        &mut self,
-        e: &AstExpr,
-    ) -> Result<Option<PortRef>, LowerError> {
+    pub(crate) fn as_lane_port_ref(&mut self, e: &AstExpr) -> Result<Option<PortRef>, LowerError> {
         let ExprKind::Index { target, index } = &*e.kind else {
             return Ok(None);
         };
@@ -1179,8 +1270,10 @@ pub(crate) fn width_cast_kind(name: &str) -> Option<WidthCastKind> {
 }
 
 /// `Some(W)` when the cast target is a scalar `uint<W>`/`sint<W>`/
-/// `bits<W>` relabel with W ≤ 64 (v1 lowers these to a same-storage
-/// C cast — value-identity in the IR's uint64 model). Width-less
+/// `bits<W>` relabel with W ≤ 128. The 65..128 form is accepted for
+/// wide-local/port construction where the surrounding expression or
+/// destination carries `_harc_u128` storage; it remains a relabel in the
+/// IR expression tree. Width-less
 /// scalar casts give 64.
 pub(crate) fn cast_relabel_width(ty: &TypeExpr) -> Option<u32> {
     let TypeExpr::Builtin { name, args, .. } = ty else {
@@ -1188,7 +1281,11 @@ pub(crate) fn cast_relabel_width(ty: &TypeExpr) -> Option<u32> {
     };
     if !matches!(
         name,
-        BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::SInt | BuiltinTy::SIntCap | BuiltinTy::Bits
+        BuiltinTy::UInt
+            | BuiltinTy::UIntCap
+            | BuiltinTy::SInt
+            | BuiltinTy::SIntCap
+            | BuiltinTy::Bits
     ) {
         return None;
     }
@@ -1200,7 +1297,7 @@ pub(crate) fn cast_relabel_width(ty: &TypeExpr) -> Option<u32> {
         Some(_) => return None,
         None => 64,
     };
-    (width > 0 && width <= 64).then_some(width)
+    (width > 0 && width <= 128).then_some(width)
 }
 
 /// Constant width argument of a width method (v1's `eval_const_width`:
@@ -1213,7 +1310,7 @@ fn const_eval_width(e: &AstExpr) -> Option<u32> {
     }
 }
 
-fn lower_bin_op(op: BinaryOp) -> Result<BinOp, LowerError> {
+pub(crate) fn lower_bin_op(op: BinaryOp) -> Result<BinOp, LowerError> {
     Ok(match op {
         BinaryOp::Add => BinOp::Add,
         BinaryOp::Sub => BinOp::Sub,
@@ -1278,6 +1375,26 @@ pub(crate) fn parse_int_literal_expr(e: &crate::ast::Expr) -> Option<u64> {
         crate::ast::ExprKind::Paren(inner) => parse_int_literal_expr(inner),
         _ => None,
     }
+}
+
+fn port_temp_type(p: &PortRef, hint: Option<&IrType>) -> Option<IrType> {
+    if let Some(w) = p.width {
+        return Some(IrType::UInt(Some(w)));
+    }
+    match hint {
+        Some(IrType::UInt(Some(w)) | IrType::SInt(Some(w))) if *w > 64 => {
+            Some(IrType::UInt(Some(*w)))
+        }
+        Some(IrType::Bool) => Some(IrType::Bool),
+        _ => None,
+    }
+}
+
+fn wide_literal_bits(words: &[u32]) -> u32 {
+    let Some((idx, word)) = words.iter().enumerate().rev().find(|(_, w)| **w != 0) else {
+        return 1;
+    };
+    (idx as u32) * 32 + (32 - word.leading_zeros())
 }
 
 /// Parse a plain integer literal (decimal / 0x / 0b / 0o, `_`

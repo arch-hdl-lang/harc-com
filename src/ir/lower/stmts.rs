@@ -1,7 +1,7 @@
 //! Statement lowering — one IR form per AST construct (design doc
 //! §"Statements within a run / check / transactor body").
 
-use super::{FuncBuilder, LowerError, unsupported};
+use super::{unsupported, FuncBuilder, LowerError};
 use crate::ast::{BuiltinTy, CallArg, ExprKind, Stmt as AstStmt, StmtKind, TypeArg, TypeExpr};
 use crate::ir::{Expr, FileLogLevel, FmtArg, FmtArgs, IrType, LogLevel, Stmt, Terminator};
 
@@ -30,9 +30,7 @@ impl FuncBuilder<'_> {
             StmtKind::Continue { .. } => {
                 let floor = self.inline_frames.last().map_or(0, |f| f.loop_floor);
                 let Some(frame) = self.loop_stack.get(floor..).and_then(|s| s.last()) else {
-                    return Err(LowerError::Invalid(
-                        "`continue` outside a loop".to_string(),
-                    ));
+                    return Err(LowerError::Invalid("`continue` outside a loop".to_string()));
                 };
                 self.terminate(Terminator::Jump(frame.continue_to));
                 Ok(())
@@ -80,8 +78,7 @@ impl FuncBuilder<'_> {
                 }
                 let clock = match clock {
                     Some(c) => {
-                        let Some(index) =
-                            self.ctx.clock_names.iter().position(|n| n == &c.name)
+                        let Some(index) = self.ctx.clock_names.iter().position(|n| n == &c.name)
                         else {
                             let declared = if self.ctx.clock_names.is_empty() {
                                 "none".to_string()
@@ -276,8 +273,10 @@ impl FuncBuilder<'_> {
                             ));
                         }
                         return Err(unsupported(
-                            &format!("scoreboard queue method `{field}.{queue}.{method}(...)` in \
-                                      statement position"),
+                            &format!(
+                                "scoreboard queue method `{field}.{queue}.{method}(...)` in \
+                                      statement position"
+                            ),
                             "",
                         ));
                     }
@@ -401,7 +400,11 @@ impl FuncBuilder<'_> {
                             }
                         }
                     }
-                    self.push(Stmt::ComponentQueuePop { base, queue, dest: id });
+                    self.push(Stmt::ComponentQueuePop {
+                        base,
+                        queue,
+                        dest: id,
+                    });
                     return Ok(());
                 }
             }
@@ -414,7 +417,10 @@ impl FuncBuilder<'_> {
             if let Some(&rid) = self.ctx.record_ids.get(simple) {
                 if self.in_pure_helper {
                     return Err(unsupported(
-                        &format!("transaction-typed local `let {}` in a pure helper function", l.name.name),
+                        &format!(
+                            "transaction-typed local `let {}` in a pure helper function",
+                            l.name.name
+                        ),
                         "pure helpers emit as scalar-only file-scope functions",
                     ));
                 }
@@ -481,11 +487,15 @@ impl FuncBuilder<'_> {
         // every path for the width-method receiver inference (v1's
         // `let_widths` seeds from typed lets regardless of RHS shape).
         let declared_width = l.ty.as_ref().and_then(typed_let_width);
+        let declared_scalar_ty = l.ty.as_ref().and_then(typed_let_ir_type);
         // Direct DUT-read form: `let x = dut.port` → DutRead(x, port).
         if let Some(port) = self.as_port_ref(value)? {
             let id = self.declare(&l.name.name);
             if let Some(w) = declared_width {
                 self.let_widths.insert(id, w);
+            }
+            if let Some(ty) = declared_scalar_ty.clone() {
+                self.set_local_type(id, ty);
             }
             self.push(Stmt::DutRead(id, port));
             return Ok(());
@@ -496,26 +506,23 @@ impl FuncBuilder<'_> {
             if let Some(w) = declared_width {
                 self.let_widths.insert(id, w);
             }
+            if let Some(ty) = declared_scalar_ty.clone() {
+                self.set_local_type(id, ty);
+            }
             self.push(Stmt::DutRead(id, port));
             return Ok(());
         }
         // `let x = fork bus.<method>(a)` — issue the request now, defer
         // the response capture to the next `join_all`. Checked before the
         // plain bus call (a `ForkCall` RHS is never a plain `Call`).
-        if self.try_lower_tlm_fork(
-            value,
-            super::bus::BusCallDest::Declare(&l.name.name),
-        )? {
+        if self.try_lower_tlm_fork(value, super::bus::BusCallDest::Declare(&l.name.name))? {
             return Ok(());
         }
         // Bus call RHS: `let x = mem.read(a)` (TransactorMethod call
         // edge) or `let x = axil.r.recv()` (CFG-inlined handshake).
         // Checked before transactor fields: the namespaces are
         // disjoint (collision rejected at testbench construction).
-        if self.try_lower_bus_call(
-            value,
-            super::bus::BusCallDest::Declare(&l.name.name),
-        )? {
+        if self.try_lower_bus_call(value, super::bus::BusCallDest::Declare(&l.name.name))? {
             return Ok(());
         }
         // `let v = sb.q.pop()` — pop the queue front into a new local.
@@ -523,6 +530,9 @@ impl FuncBuilder<'_> {
             let id = self.declare(&l.name.name);
             if let Some(w) = declared_width {
                 self.let_widths.insert(id, w);
+            }
+            if let Some(ty) = declared_scalar_ty.clone() {
+                self.set_local_type(id, ty);
             }
             self.push(Stmt::ScoreboardOp {
                 sb,
@@ -569,6 +579,9 @@ impl FuncBuilder<'_> {
                 if let Some(w) = declared_width {
                     self.let_widths.insert(id, w);
                 }
+                if let Some(ty) = declared_scalar_ty.clone() {
+                    self.set_local_type(id, ty);
+                }
                 self.push(Stmt::ComponentCall {
                     base,
                     component,
@@ -607,6 +620,9 @@ impl FuncBuilder<'_> {
         let id = self.declare(&l.name.name);
         if let Some(w) = declared_width {
             self.let_widths.insert(id, w);
+        }
+        if let Some(ty) = declared_scalar_ty {
+            self.set_local_type(id, ty);
         }
         self.push(Stmt::Assign(id, e));
         Ok(())
@@ -662,7 +678,10 @@ impl FuncBuilder<'_> {
         if let crate::ast::ExprKind::Ident(id) = &*target.kind {
             if self.ctx.promoted_tb_lets.contains(&id.name) && self.lookup(&id.name).is_none() {
                 let e = self.lower_expr_no_ports(value)?;
-                self.push(Stmt::TbFieldWrite { field: id.name.clone(), value: e });
+                self.push(Stmt::TbFieldWrite {
+                    field: id.name.clone(),
+                    value: e,
+                });
                 return Ok(());
             }
         }
@@ -670,7 +689,11 @@ impl FuncBuilder<'_> {
         // state field: `target.read_count = 0`.
         if let Some((instance, field)) = self.as_transactor_state(target) {
             let e = self.lower_expr_no_ports(value)?;
-            self.push(Stmt::TransactorStateWrite { instance, field, value: e });
+            self.push(Stmt::TransactorStateWrite {
+                instance,
+                field,
+                value: e,
+            });
             return Ok(());
         }
         // Event-driven transactor DUT bind (`drv.dut = dut` /
@@ -696,7 +719,11 @@ impl FuncBuilder<'_> {
         // component local (`env.sb.errors = ...`).
         if let Some((base, field)) = self.as_component_field_target(target)? {
             let e = self.lower_expr_no_ports(value)?;
-            self.push(Stmt::ComponentFieldWrite { base, field, value: e });
+            self.push(Stmt::ComponentFieldWrite {
+                base,
+                field,
+                value: e,
+            });
             return Ok(());
         }
         // Scoreboard scalar-counter write: `sb.writes = sb.writes + 1`
@@ -904,7 +931,10 @@ impl FuncBuilder<'_> {
                 }
             }
         }
-        Err(unsupported("assignment to a non-port, non-local target", ""))
+        Err(unsupported(
+            "assignment to a non-port, non-local target",
+            "",
+        ))
     }
 
     /// `release dut.<probe>` — disable an active SV procedural force on a
@@ -948,11 +978,25 @@ impl FuncBuilder<'_> {
     pub(crate) fn as_scoreboard_queue_call(
         &self,
         callee: &crate::ast::Expr,
-    ) -> Option<(crate::ir::ScoreboardId, String, String, String, Option<Vec<String>>)> {
-        let ExprKind::Field { target, name: method } = &*callee.kind else {
+    ) -> Option<(
+        crate::ir::ScoreboardId,
+        String,
+        String,
+        String,
+        Option<Vec<String>>,
+    )> {
+        let ExprKind::Field {
+            target,
+            name: method,
+        } = &*callee.kind
+        else {
             return None;
         };
-        let ExprKind::Field { target: sb_t, name: queue } = &*target.kind else {
+        let ExprKind::Field {
+            target: sb_t,
+            name: queue,
+        } = &*target.kind
+        else {
             return None;
         };
         let (sb, field, nested) = self.scoreboard_root(sb_t)?;
@@ -1219,11 +1263,18 @@ impl FuncBuilder<'_> {
     ) -> Result<bool, LowerError> {
         // target = `_tb.<xfield>.<sub>` (testbench-field instance) or
         // `<xfield>.<sub>` (test-scope-let instance, bare name).
-        let ExprKind::Field { target: mid, name: sub } = &*target.kind else {
+        let ExprKind::Field {
+            target: mid,
+            name: sub,
+        } = &*target.kind
+        else {
             return Ok(false);
         };
         let xfield_name = match &*mid.kind {
-            ExprKind::Field { target: root_expr, name: xfield } => {
+            ExprKind::Field {
+                target: root_expr,
+                name: xfield,
+            } => {
                 let ExprKind::Ident(root) = &*root_expr.kind else {
                     return Ok(false);
                 };
@@ -1244,10 +1295,7 @@ impl FuncBuilder<'_> {
         let schema = &self.ctx.transactors[xid.index()];
         if sub.name != schema.dut_field {
             return Err(unsupported(
-                &format!(
-                    "assignment to transactor field `{}.{}`",
-                    xfield, sub.name
-                ),
+                &format!("assignment to transactor field `{}.{}`", xfield, sub.name),
                 "only the module-typed DUT bind is lowered",
             ));
         }
@@ -1359,7 +1407,10 @@ impl FuncBuilder<'_> {
             };
             lowered.push(self.lower_expr_no_ports(e)?);
         }
-        Ok(Expr::Call(crate::ir::CallTarget::Tseq(name.to_string()), lowered))
+        Ok(Expr::Call(
+            crate::ir::CallTarget::Tseq(name.to_string()),
+            lowered,
+        ))
     }
 
     /// `yield t` inside a `tseq` body — append a record value onto the
@@ -1592,6 +1643,29 @@ fn typed_let_width(t: &TypeExpr) -> Option<u32> {
             ExprKind::Int(s) => s.replace('_', "").parse::<u32>().ok(),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+fn typed_let_ir_type(t: &TypeExpr) -> Option<IrType> {
+    let TypeExpr::Builtin { name, args, .. } = t else {
+        return None;
+    };
+    let width = match args.first() {
+        Some(TypeArg::Expr(e)) => match &*e.kind {
+            ExprKind::Int(s) => Some(s.replace('_', "").parse::<u32>().ok()?),
+            _ => return None,
+        },
+        Some(_) => return None,
+        None => None,
+    };
+    if width.is_some_and(|w| w == 0) {
+        return None;
+    }
+    match name {
+        BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => Some(IrType::UInt(width)),
+        BuiltinTy::SInt | BuiltinTy::SIntCap => Some(IrType::SInt(width)),
+        BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => Some(IrType::Bool),
         _ => None,
     }
 }
