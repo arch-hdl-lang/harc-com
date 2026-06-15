@@ -8,9 +8,9 @@ tb-ir program
 
 fn fn0 run_IfWaitForInThenTest [kind=Run, owner=tb0]
   locals:
-    %0 done_pulses : unknown
-    %1 prev_done : unknown
-    %2 cycles_since_last_done : unknown
+    %0 done_pulses : uint<32>
+    %1 prev_done : uint<32>
+    %2 cycles_since_last_done : uint<32>
     %3 c : unknown
     %4 __t0 : unknown
     %5 __t1 : unknown

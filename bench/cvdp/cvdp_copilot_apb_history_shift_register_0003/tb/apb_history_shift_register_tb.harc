@@ -144,7 +144,7 @@ function pulse_history(dut: APBGlobalHistoryRegister_top)
     dut.history_shift_valid = 0
     wait 1ns
     dut.history_shift_valid = 1
-    wait 1ns
+    wait 1 cycle on clk
     dut.history_shift_valid = 0
     wait 1ns
 end function pulse_history

@@ -1,0 +1,78 @@
+// HARC stimulus bench for CVDP cid012 `cvdp_copilot_hebbian_rule_0020`.
+
+testbench HebbianTb
+    let dut : hebb_gates
+        probe force present_state_force : uint<4> at present_state
+        probe force iteration_force : uint<3> at iteration
+        probe force x1_force : sint<4> at x1
+        probe force x2_force : sint<4> at x2
+        probe force delta_w1_force : sint<4> at delta_w1
+        probe force delta_w2_force : sint<4> at delta_w2
+        probe force delta_b_force : sint<4> at delta_b
+        probe force w1_reg_force : sint<4> at w1_reg
+        probe force w2_reg_force : sint<4> at w2_reg
+        probe force bias_reg_force : sint<4> at bias_reg
+        probe force target_force : sint<2> at target
+    end let dut
+end testbench HebbianTb
+
+impl HebbianTest for HebbianTb
+    run
+        dut.present_state_force = 0
+        dut.iteration_force = 0
+        dut.x1_force = 0
+        dut.x2_force = 0
+        dut.delta_w1_force = 0
+        dut.delta_w2_force = 0
+        dut.delta_b_force = 0
+        dut.w1_reg_force = 0
+        dut.w2_reg_force = 0
+        dut.bias_reg_force = 0
+        dut.target_force = 0
+        log(info, "hebb_gates: state, target table, and signed input sweep")
+        dut.rst = 0
+        dut.start = 0
+        dut.target_select = 0
+        dut.gate_select = 0
+        dut.a = 0
+        dut.b = 0
+        wait 3 cycles
+        dut.rst = 1
+
+        for st in 0 .. 11
+            dut.present_state_force = st
+            for iter in 0 .. 5
+                dut.iteration_force = iter
+                for gate in 0 .. 4
+                    dut.gate_select = gate
+                    dut.target_select = iter & 3
+                    dut.start = (iter & 1) != 0
+                    dut.a = gate - 2
+                    dut.b = 2 - iter
+                    dut.x1_force = gate - 2
+                    dut.x2_force = 2 - iter
+                    dut.target_force = (iter & 3) - 1
+                    dut.delta_w1_force = gate - 1
+                    dut.delta_w2_force = iter - 2
+                    dut.delta_b_force = (iter & 3) - 1
+                    dut.w1_reg_force = gate
+                    dut.w2_reg_force = iter
+                    dut.bias_reg_force = gate - iter
+                    wait 1 cycle
+                end for
+            end for
+        end for
+
+        release dut.present_state_force
+        release dut.iteration_force
+        dut.rst = 0
+        wait 2 cycles
+        dut.rst = 1
+        dut.start = 1
+        for _ in 0 .. 24
+            wait 1 cycle
+        end for
+        dut.start = 0
+        log(info, "hebb_gates stimulus complete")
+    end run
+end impl HebbianTest

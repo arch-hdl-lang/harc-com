@@ -220,11 +220,11 @@ int run_SequencerConnectTest(int argc, char** argv) {
                     CountSeq_dispatch(env.sqr, 5);
                     if (!((env.sb.count == 5))) {
                         sim_log_line("FAIL", "sequencer dispatched %lld items, expected 5", harc_rt::harc_printf_ll(env.sb.count));
-                        errors++;
+                        ctx.errors++;
                     }
                     if (!((env.sb.sum == 10))) {
                         sim_log_line("FAIL", "sequencer item sum=%lld, expected 10", harc_rt::harc_printf_ll(env.sb.sum));
-                        errors++;
+                        ctx.errors++;
                     }
                     sim_log_line("INFO", "PASS: sequencer dispatch stream connected to scoreboard sink");
                     __done = true;

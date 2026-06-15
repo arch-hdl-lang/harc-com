@@ -16,22 +16,22 @@ fn fn0 sample_RomLutTest_cov [kind=SamplerAuto(cg0), owner=tb0]
 
 fn fn1 run_RomLutTest [kind=Run, owner=tb0]
   locals:
-    %0 __t0 : unknown
-    %1 addr : unknown
-    %2 __t1 : unknown
-    %3 addr_2 : unknown
-    %4 __t2 : unknown
-    %5 addr_3 : unknown
-    %6 __t3 : unknown
-    %7 addr_4 : unknown
-    %8 __t4 : unknown
-    %9 addr_5 : unknown
-    %10 __t5 : unknown
-    %11 addr_6 : unknown
-    %12 __t6 : unknown
-    %13 addr_7 : unknown
-    %14 __t7 : unknown
-    %15 addr_8 : unknown
+    %0 __t0 : uint<8>
+    %1 addr : uint<3>
+    %2 __t1 : uint<8>
+    %3 addr_2 : uint<3>
+    %4 __t2 : uint<8>
+    %5 addr_3 : uint<3>
+    %6 __t3 : uint<8>
+    %7 addr_4 : uint<3>
+    %8 __t4 : uint<8>
+    %9 addr_5 : uint<3>
+    %10 __t5 : uint<8>
+    %11 addr_6 : uint<3>
+    %12 __t6 : uint<8>
+    %13 addr_7 : uint<3>
+    %14 __t7 : uint<8>
+    %15 addr_8 : uint<3>
   entry = b0
 
   b0:

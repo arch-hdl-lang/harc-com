@@ -23,13 +23,7 @@ impl Display for TbProgram {
                 write!(f, " cov {field}=cg{}", cov.0)?;
             }
             for sf in &tb.scalar_fields {
-                write!(
-                    f,
-                    " field {}:{}={}",
-                    sf.name,
-                    type_str(&sf.ty),
-                    sf.default
-                )?;
+                write!(f, " field {}:{}={}", sf.name, type_str(&sf.ty), sf.default)?;
             }
             for b in &tb.bus_bindings {
                 write!(f, " bus {}={}", b.field, b.bus)?;
@@ -316,7 +310,7 @@ impl Display for TbProgram {
             };
             writeln!(f, "  covgroup cg{} {} {}", i, cg.name, trig)?;
             for p in &cg.points {
-                write!(f, "    point {} <- {}:", p.name, port_str(&p.target))?;
+                write!(f, "    point {} <- {}:", p.name, cover_expr_str(&p.target))?;
                 for b in &p.bins {
                     let vals = b
                         .values
@@ -348,7 +342,13 @@ impl Display for TbProgram {
 
 impl Display for TbFunction {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "fn fn{} {} [kind={}", self.id.0, self.name, kind_str(&self.kind))?;
+        write!(
+            f,
+            "fn fn{} {} [kind={}",
+            self.id.0,
+            self.name,
+            kind_str(&self.kind)
+        )?;
         if let Some(owner) = self.owner {
             write!(f, ", owner=tb{}", owner.0)?;
         }
@@ -419,7 +419,12 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         Stmt::DutRead(l, p) => format!("DutRead({}, {})", local_str(func, *l), port_str(p)),
         Stmt::ProbeRelease(p) => format!("ProbeRelease({})", port_str(p)),
         Stmt::RecordInit(l, r) => format!("RecordInit({}, r{})", local_str(func, *l), r.0),
-        Stmt::RecordFieldWrite { local, field, index, value } => {
+        Stmt::RecordFieldWrite {
+            local,
+            field,
+            index,
+            value,
+        } => {
             let idx = match index {
                 Some(i) => format!("[{}]", expr_str(func, i)),
                 None => String::new(),
@@ -430,7 +435,14 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
                 expr_str(func, value)
             )
         }
-        Stmt::RecordWriteCb { local, binding, field, offset, value, callback } => {
+        Stmt::RecordWriteCb {
+            local,
+            binding,
+            field,
+            offset,
+            value,
+            callback,
+        } => {
             let cb = match callback {
                 Some(fid) => format!(", cb=fn{}", fid.0),
                 None => String::new(),
@@ -444,8 +456,15 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         Stmt::TbFieldWrite { field, value } => {
             format!("TbFieldWrite(_tb.{field}, {})", expr_str(func, value))
         }
-        Stmt::TransactorStateWrite { instance, field, value } => {
-            format!("TransactorStateWrite({instance}.{field}, {})", expr_str(func, value))
+        Stmt::TransactorStateWrite {
+            instance,
+            field,
+            value,
+        } => {
+            format!(
+                "TransactorStateWrite({instance}.{field}, {})",
+                expr_str(func, value)
+            )
         }
         Stmt::Log { level, args } => {
             format!("Log({}, {})", level_str(level), fmt_args_str(func, args))
@@ -474,7 +493,12 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
             ),
             None => format!("FailDiag {{ {} }}", fmt_args_str(func, args)),
         },
-        Stmt::ScoreboardOp { sb, field, op, nested_path } => {
+        Stmt::ScoreboardOp {
+            sb,
+            field,
+            op,
+            nested_path,
+        } => {
             let access = match nested_path {
                 Some(p) => p.join("."),
                 None => format!("sb{}.{field}", sb.0),
@@ -488,11 +512,26 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         ),
         Stmt::ComponentEmit { base, event, args } => {
             let a: Vec<String> = args.iter().map(|e| expr_str(func, e)).collect();
-            format!("ComponentEmit({}.{event}, [{}])", comp_base_str(base), a.join(", "))
+            format!(
+                "ComponentEmit({}.{event}, [{}])",
+                comp_base_str(base),
+                a.join(", ")
+            )
         }
-        Stmt::ComponentCall { base, component, method, args, dest } => {
+        Stmt::ComponentCall {
+            base,
+            component,
+            method,
+            args,
+            dest,
+        } => {
             let a: Vec<String> = args.iter().map(|e| expr_str(func, e)).collect();
-            let call = format!("{}.c{}::{method}([{}])", comp_base_str(base), component.0, a.join(", "));
+            let call = format!(
+                "{}.c{}::{method}([{}])",
+                comp_base_str(base),
+                component.0,
+                a.join(", ")
+            );
             match dest {
                 Some(d) => format!("ComponentCall({} = {call})", local_str(func, *d)),
                 None => format!("ComponentCall({call})"),
@@ -520,8 +559,7 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         ),
         Stmt::TlmFork(desc) => format!("TlmFork({})", tlm_fork_desc_str(func, desc)),
         Stmt::TlmJoinAll(pending) => {
-            let descs: Vec<String> =
-                pending.iter().map(|d| tlm_fork_desc_str(func, d)).collect();
+            let descs: Vec<String> = pending.iter().map(|d| tlm_fork_desc_str(func, d)).collect();
             format!("TlmJoinAll([{}])", descs.join(", "))
         }
     }
@@ -731,14 +769,24 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         }
         Expr::Local(l) => local_str(func, *l),
         Expr::Port(p) => port_str(p),
-        Expr::RecordField { local, field, index } => {
+        Expr::RecordField {
+            local,
+            field,
+            index,
+        } => {
             let idx = match index {
                 Some(i) => format!("[{}]", expr_str(func, i)),
                 None => String::new(),
             };
             format!("{}.{field}{idx}", local_str(func, *local))
         }
-        Expr::RegRead { mirror, helper_ty, field, offset, reads_bus } => {
+        Expr::RegRead {
+            mirror,
+            helper_ty,
+            field,
+            offset,
+            reads_bus,
+        } => {
             if *reads_bus {
                 format!(
                     "RegRead({}.{field} = {helper_ty}.read({offset}))",
@@ -750,7 +798,12 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         }
         Expr::TbField(field) => format!("_tb.{field}"),
         Expr::TransactorState { instance, field } => format!("{instance}.{field}"),
-        Expr::ScoreboardQuery { sb, field, query, nested_path } => {
+        Expr::ScoreboardQuery {
+            sb,
+            field,
+            query,
+            nested_path,
+        } => {
             let access = match nested_path {
                 Some(p) => p.join("."),
                 None => format!("sb{}.{field}", sb.0),
@@ -764,7 +817,11 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
             format!("ComponentValue({})", comp_base_str(base))
         }
         Expr::ComponentQueueQuery { base, query } => {
-            format!("ComponentQueueQuery({}.{})", comp_base_str(base), sb_query_str(query))
+            format!(
+                "ComponentQueueQuery({}.{})",
+                comp_base_str(base),
+                sb_query_str(query)
+            )
         }
         Expr::ComponentIdle { base, kind, n } => {
             let m = match kind {
@@ -787,6 +844,9 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
             expr_str(func, t),
             expr_str(func, e)
         ),
+        Expr::BitSlice { target, hi, lo } => {
+            format!("{}[{hi}:{lo}]", expr_str(func, target))
+        }
         Expr::WidthCast {
             kind,
             width,
@@ -799,17 +859,22 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
                 WidthCastKind::Sext => "sext",
                 WidthCastKind::Resize => "resize",
             };
-            let sw = src_width
-                .map(|w| format!(" from {w}"))
-                .unwrap_or_default();
+            let sw = src_width.map(|w| format!(" from {w}")).unwrap_or_default();
             format!("{}.{k}<{width}{sw}>()", expr_str(func, inner))
         }
         Expr::CovBin { inst, point, bin } => {
-            format!("CovBin({}.cg{}, {point}, {bin})", inst.tb_field, inst.covgroup.0)
+            format!(
+                "CovBin({}.cg{}, {point}, {bin})",
+                inst.tb_field, inst.covgroup.0
+            )
         }
         Expr::SeqLen(l) => format!("SeqLen({})", local_str(func, *l)),
         Expr::SeqIndex { seq, index } => {
-            format!("SeqIndex({}, {})", local_str(func, *seq), expr_str(func, index))
+            format!(
+                "SeqIndex({}, {})",
+                local_str(func, *seq),
+                expr_str(func, index)
+            )
         }
         Expr::Call(target, args) => {
             let t = match target {
@@ -828,6 +893,43 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
                 .join(", ");
             format!("{t}({a})")
         }
+    }
+}
+
+fn cover_expr_str(e: &Expr) -> String {
+    match e {
+        Expr::Literal { value, .. } => value.to_string(),
+        Expr::Port(p) => port_str(p),
+        Expr::Binary(op, a, b) => {
+            format!(
+                "({} {} {})",
+                cover_expr_str(a),
+                bin_op_str(*op),
+                cover_expr_str(b)
+            )
+        }
+        Expr::Unary(op, a) => format!("{}{}", un_op_str(*op), cover_expr_str(a)),
+        Expr::Ternary(c, t, f) => {
+            format!(
+                "({} ? {} : {})",
+                cover_expr_str(c),
+                cover_expr_str(t),
+                cover_expr_str(f)
+            )
+        }
+        Expr::BitSlice { target, hi, lo } => format!("{}[{hi}:{lo}]", cover_expr_str(target)),
+        Expr::WidthCast {
+            kind, width, inner, ..
+        } => {
+            let k = match kind {
+                WidthCastKind::Trunc => "trunc",
+                WidthCastKind::Zext => "zext",
+                WidthCastKind::Sext => "sext",
+                WidthCastKind::Resize => "resize",
+            };
+            format!("{}.{k}<{width}>()", cover_expr_str(inner))
+        }
+        other => format!("{other:?}"),
     }
 }
 

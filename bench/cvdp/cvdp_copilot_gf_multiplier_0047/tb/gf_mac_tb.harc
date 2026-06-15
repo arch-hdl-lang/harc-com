@@ -1,0 +1,62 @@
+// HARC stimulus bench for CVDP cid012 `cvdp_copilot_gf_multiplier_0047`.
+//
+// Exercises reset, enable, pass-through muxing, and byte-lane GF multiply
+// reduction across endpoint, walking, and pseudo-random 32-bit operands.
+
+testbench GfMacTb
+    dut : gf_mac_top
+end testbench GfMacTb
+
+impl GfMacTest for GfMacTb
+    run
+        log(info, "gf_mac: reset/enable/pass-through and byte-lane operand sweep")
+
+        dut.reset = 1
+        dut.enable = 0
+        dut.pass_through = 0
+        dut.a = 0
+        dut.b = 0
+        wait 2 cycles
+
+        dut.reset = 0
+        wait 1 cycle
+
+        // Disabled path.
+        dut.enable = 0
+        dut.a = 0xFFFFFFFF
+        dut.b = 0x01020408
+        wait 1 cycle
+
+        // Pass-through path.
+        dut.enable = 1
+        dut.pass_through = 1
+        for k in 0 .. 8
+            dut.a = (1 << (k * 4))
+            dut.b = 0xA5A5A5A5
+            wait 1 cycle
+        end for
+
+        // GF reduction path.
+        dut.pass_through = 0
+        dut.a = 0
+        dut.b = 0
+        wait 1 cycle
+        dut.a = 0xFFFFFFFF
+        dut.b = 0xFFFFFFFF
+        wait 1 cycle
+        dut.a = 0x01020304
+        dut.b = 0x10204080
+        wait 1 cycle
+
+        for k in 0 .. 32
+            dut.a = ((k * 0x1020305) ^ 0xA5A5A5A5)
+            dut.b = ((k * 0x01010111) ^ 0x5A5A5A5A)
+            wait 1 cycle
+        end for
+
+        dut.reset = 1
+        wait 1 cycle
+        dut.reset = 0
+        log(info, "gf_mac stimulus complete")
+    end run
+end impl GfMacTest

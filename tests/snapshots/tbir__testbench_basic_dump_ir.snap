@@ -12,7 +12,7 @@ fn fn0 run_TestbenchEnableToggle [kind=Run, owner=tb0]
   locals:
     %0 __t0 : unknown
     %1 __t1 : unknown
-    %2 n : unknown
+    %2 n : uint<32>
     %3 frozen : unknown
   entry = b0
 
@@ -55,7 +55,7 @@ fn fn1 run_TestbenchSmoke [kind=Run, owner=tb1]
   locals:
     %0 __t0 : unknown
     %1 __t1 : unknown
-    %2 n : unknown
+    %2 n : uint<32>
   entry = b0
 
   b0:

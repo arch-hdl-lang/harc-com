@@ -1,0 +1,115 @@
+// HARC stimulus bench for CVDP cid012 `cvdp_copilot_perceptron_0018`.
+//
+// Walks the microcode sequencer under all gate/target selections while
+// sweeping signed inputs, threshold polarity, and learning-rate enable.
+
+testbench PerceptronTb
+    let dut : perceptron_gates
+        probe force train_action_force : uint<4> at train_action
+        probe force next_addr_force : uint<4> at next_addr
+        probe force input_index_force : uint<3> at input_index
+        probe force y_in_force : sint<4> at y_in
+        probe force y_force : sint<4> at y
+        probe force target_force : sint<4> at target
+        probe force prev_wt1_force : sint<4> at prev_wt1_update
+        probe force prev_wt2_force : sint<4> at prev_wt2_update
+        probe force wt1_force : sint<4> at wt1_update
+        probe force wt2_force : sint<4> at wt2_update
+    end let dut
+end testbench PerceptronTb
+
+impl PerceptronTest for PerceptronTb
+    run
+        dut.train_action_force = 0
+        dut.next_addr_force = 0
+        dut.input_index_force = 0
+        dut.y_in_force = 0
+        dut.y_force = 0
+        dut.target_force = 0
+        dut.prev_wt1_force = 0
+        dut.prev_wt2_force = 0
+        dut.wt1_force = 0
+        dut.wt2_force = 0
+        log(info, "perceptron_gates: microcode, target table, and signed stimulus sweep")
+
+        dut.rst_n = 0
+        dut.x1 = 0
+        dut.x2 = 0
+        dut.learning_rate = 0
+        dut.threshold = 0
+        dut.gate_select = 0
+        dut.target_select = 0
+        wait 4 cycles
+        dut.rst_n = 1
+        wait 1 cycle
+
+        for action in 0 .. 6
+            dut.train_action_force = action
+            dut.next_addr_force = action
+            for gate in 0 .. 4
+                dut.gate_select = gate
+                for target in 0 .. 2
+                    dut.target_select = target
+                    for idx in 0 .. 5
+                        dut.input_index_force = idx
+                        dut.learning_rate = (idx & 1) != 0
+                        dut.threshold = (idx - 2)
+                        dut.x1 = ((idx * 3) - 6)
+                        dut.x2 = (5 - (idx * 2))
+                        wait 1 cycle
+                    end for
+                end for
+            end for
+        end for
+
+        // Directed internal decision sweeps. These hit the comparison sides
+        // that are otherwise hidden behind the self-referential combinational
+        // microcode model under Verilator.
+        dut.train_action_force = 1
+        dut.threshold = 2
+        dut.y_in_force = 7
+        wait 1 cycle
+        dut.y_in_force = 0
+        wait 1 cycle
+        dut.y_in_force = -7
+        wait 1 cycle
+
+        dut.train_action_force = 3
+        dut.y_force = 1
+        dut.target_force = 1
+        wait 1 cycle
+        dut.y_force = -1
+        dut.target_force = 1
+        wait 1 cycle
+
+        dut.train_action_force = 4
+        dut.input_index_force = 3
+        dut.prev_wt1_force = 2
+        dut.wt1_force = 2
+        dut.prev_wt2_force = -1
+        dut.wt2_force = -1
+        wait 1 cycle
+        dut.prev_wt1_force = 2
+        dut.wt1_force = 3
+        dut.prev_wt2_force = -1
+        dut.wt2_force = 0
+        wait 1 cycle
+
+        release dut.train_action_force
+        release dut.next_addr_force
+        release dut.input_index_force
+        release dut.y_in_force
+        release dut.y_force
+        release dut.target_force
+        release dut.prev_wt1_force
+        release dut.prev_wt2_force
+        release dut.wt1_force
+        release dut.wt2_force
+        dut.rst_n = 0
+        wait 2 cycles
+        dut.rst_n = 1
+        wait 4 cycles
+
+        log(info, "perceptron_gates stimulus complete")
+    end run
+end impl PerceptronTest

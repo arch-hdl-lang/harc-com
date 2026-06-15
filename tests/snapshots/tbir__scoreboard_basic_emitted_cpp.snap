@@ -208,7 +208,7 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
                 case 1: {
                     if (!((harc_rt::harc_read(dut->count_out) == 0))) {
                         sim_log_line("FAIL", "after reset: count_out=%lld, expected 0", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->count_out)));
-                        errors++;
+                        ctx.errors++;
                     }
                     harc_rt::harc_assign(dut->rst, 0);
                     total = 0;
@@ -238,7 +238,7 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
                 case 5: {
                     if (!(_tb.sb.expected.empty())) {
                         sim_log_line("FAIL", "queue not drained: %lld value(s) left", harc_rt::harc_printf_ll(((uint64_t)_tb.sb.expected.size())));
-                        errors++;
+                        ctx.errors++;
                     }
                     __done = true;
                     break;
@@ -273,7 +273,7 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
                     got = harc_rt::harc_read(dut->count_out);
                     if (!((got == want))) {
                         sim_log_line("FAIL", "run[%lld]: count_out=%lld, expected %lld", harc_rt::harc_printf_ll(i), harc_rt::harc_printf_ll(got), harc_rt::harc_printf_ll(want));
-                        errors++;
+                        ctx.errors++;
                     }
                     sim_log_line("INFO", "run[%lld] bump=%lld count_out=%lld matched expected=%lld", harc_rt::harc_printf_ll(i), harc_rt::harc_printf_ll(bump), harc_rt::harc_printf_ll(got), harc_rt::harc_printf_ll(want));
                     __bb = 4;
@@ -291,15 +291,15 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
                 case 0: {
                     if (!((((uint64_t)_tb.sb.expected.size()) == 0))) {
                         sim_log_line("FAIL", "scoreboard left %lld expected value(s)", harc_rt::harc_printf_ll(((uint64_t)_tb.sb.expected.size())));
-                        errors++;
+                        ctx.errors++;
                     }
                     if (!((_tb.sb.writes == _tb.sb.reads))) {
                         sim_log_line("FAIL", "counter drift: writes=%lld reads=%lld", harc_rt::harc_printf_ll(_tb.sb.writes), harc_rt::harc_printf_ll(_tb.sb.reads));
-                        errors++;
+                        ctx.errors++;
                     }
                     if (!((_tb.sb.writes == 3))) {
                         sim_log_line("FAIL", "expected 3 writes, got %lld", harc_rt::harc_printf_ll(_tb.sb.writes));
-                        errors++;
+                        ctx.errors++;
                     }
                     sim_log_line("INFO", "PASS: scoreboard drained, %lld reads matched %lld writes", harc_rt::harc_printf_ll(_tb.sb.reads), harc_rt::harc_printf_ll(_tb.sb.writes));
                     __done = true;

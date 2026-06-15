@@ -46,9 +46,14 @@ fn lower_fixtures(names: &[&str]) -> Result<ir::TbProgram, lower::LowerError> {
 /// mirroring the CLI's `resolve_use_imports` (which `lower_src` /
 /// `lower_fixtures` do not perform). Only the parsed bus items survive
 /// `merge_for_sim`, like the CLI path.
-fn lower_with_stdlib_bus(fixture_name: &str, bus_file: &str) -> Result<ir::TbProgram, lower::LowerError> {
+fn lower_with_stdlib_bus(
+    fixture_name: &str,
+    bus_file: &str,
+) -> Result<ir::TbProgram, lower::LowerError> {
     let fix = parse_source(&fixture(fixture_name)).expect("fixture parses");
-    let bus_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("stdlib").join(bus_file);
+    let bus_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("stdlib")
+        .join(bus_file);
     let bus_src = std::fs::read_to_string(&bus_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", bus_path.display()));
     let bus = parse_source(&bus_src).expect("stdlib bus parses");
@@ -133,7 +138,10 @@ fn testbench_owned_probes_lower() {
     let txt = format!("{prog}");
     assert!(txt.contains("dut.inject_rs1 (force)"), "{txt}");
     assert!(txt.contains("dut.alu_a (probe)"), "{txt}");
-    assert!(txt.contains("ProbeRelease(dut.inject_rs1 (force))"), "{txt}");
+    assert!(
+        txt.contains("ProbeRelease(dut.inject_rs1 (force))"),
+        "{txt}"
+    );
 }
 
 /// Writing a read-only `probe` is a hard error (not a `--codegen v1`
@@ -219,10 +227,7 @@ fn wait_until_counter_emitted_cpp_snapshot() {
 
 #[test]
 fn rom_lut_emitted_cpp_snapshot() {
-    insta::assert_snapshot!(
-        "rom_lut_emitted_cpp",
-        emit_fixture_cpp("rom_lut_test.harc")
-    );
+    insta::assert_snapshot!("rom_lut_emitted_cpp", emit_fixture_cpp("rom_lut_test.harc"));
 }
 
 /// Locks the dump-ir text for the file-log fixture: `logf` statements
@@ -263,14 +268,14 @@ fn event_driven_transactor_fixture_lowers() {
         .iter()
         .find(|c| c.name == "SeqXactor")
         .expect("SeqXactor component");
-    assert!(comp.fields.iter().any(|f| matches!(
-        f.kind,
-        ir::ComponentFieldKind::Dut { .. }
-    )));
-    assert!(comp.fields.iter().any(|f| matches!(
-        f.kind,
-        ir::ComponentFieldKind::Event { .. }
-    )));
+    assert!(comp
+        .fields
+        .iter()
+        .any(|f| matches!(f.kind, ir::ComponentFieldKind::Dut { .. })));
+    assert!(comp
+        .fields
+        .iter()
+        .any(|f| matches!(f.kind, ir::ComponentFieldKind::Event { .. })));
     assert_eq!(comp.on_handlers.len(), 1);
 }
 
@@ -283,8 +288,8 @@ fn event_driven_transactor_fixture_lowers() {
 /// axil` fills the placeholder bus prefix with the real binding name.
 #[test]
 fn bound_event_driven_transactor_lowers() {
-    let prog = lower_with_stdlib_bus("transactor_active_test.harc", "BusAxiLite.arch")
-        .expect("lowers");
+    let prog =
+        lower_with_stdlib_bus("transactor_active_test.harc", "BusAxiLite.arch").expect("lowers");
     verify::verify_program(&prog).expect("verifies");
     let comp = prog
         .components
@@ -294,18 +299,18 @@ fn bound_event_driven_transactor_lowers() {
     // Bound to a bus, with an `in event` input pipe + one `on` handler,
     // a scalar state field, and NO private DUT handle (drives the bus).
     assert_eq!(comp.bound_bus.as_deref(), Some("BusAxiLite"));
-    assert!(comp.fields.iter().any(|f| matches!(
-        f.kind,
-        ir::ComponentFieldKind::Event { .. }
-    )));
-    assert!(comp.fields.iter().any(|f| matches!(
-        f.kind,
-        ir::ComponentFieldKind::Scalar { .. }
-    )));
-    assert!(!comp.fields.iter().any(|f| matches!(
-        f.kind,
-        ir::ComponentFieldKind::Dut { .. }
-    )));
+    assert!(comp
+        .fields
+        .iter()
+        .any(|f| matches!(f.kind, ir::ComponentFieldKind::Event { .. })));
+    assert!(comp
+        .fields
+        .iter()
+        .any(|f| matches!(f.kind, ir::ComponentFieldKind::Scalar { .. })));
+    assert!(!comp
+        .fields
+        .iter()
+        .any(|f| matches!(f.kind, ir::ComponentFieldKind::Dut { .. })));
     assert_eq!(comp.on_handlers.len(), 1);
 }
 
@@ -435,7 +440,10 @@ fn tseq_basic_fixture_lowers() {
         .find(|f| matches!(f.kind, ir::FunctionKind::Tseq { .. }))
         .expect("a FunctionKind::Tseq function is present");
     assert!(
-        matches!(tseq_fn.ret.map(|r| &tseq_fn.local(r).ty), Some(ir::IrType::RecordSeq(_))),
+        matches!(
+            tseq_fn.ret.map(|r| &tseq_fn.local(r).ty),
+            Some(ir::IrType::RecordSeq(_))
+        ),
         "the tseq `ret` accumulator is RecordSeq-typed"
     );
     let has_seq_push = tseq_fn
@@ -454,19 +462,30 @@ fn tseq_basic_fixture_lowers() {
     // a Tseq call edge, and a SeqLen/SeqIndex iteration.
     let run = prog.function(prog.tests[0].run);
     assert!(
-        run.locals.iter().any(|l| matches!(l.ty, ir::IrType::RecordSeq(_))),
+        run.locals
+            .iter()
+            .any(|l| matches!(l.ty, ir::IrType::RecordSeq(_))),
         "the materialized sequence local is RecordSeq-typed"
     );
     let has_tseq_call = run.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
-        matches!(s, ir::Stmt::Assign(_, ir::Expr::Call(ir::CallTarget::Tseq(_), _)))
+        matches!(
+            s,
+            ir::Stmt::Assign(_, ir::Expr::Call(ir::CallTarget::Tseq(_), _))
+        )
     });
-    assert!(has_tseq_call, "`let txns = Gen(5)` is a CallTarget::Tseq edge");
+    assert!(
+        has_tseq_call,
+        "`let txns = Gen(5)` is a CallTarget::Tseq edge"
+    );
     let has_seq_index = run
         .blocks
         .iter()
         .flat_map(|b| &b.stmts)
         .any(|s| matches!(s, ir::Stmt::Assign(_, ir::Expr::SeqIndex { .. })));
-    assert!(has_seq_index, "`for t in txns` binds t to seq[i] via SeqIndex");
+    assert!(
+        has_seq_index,
+        "`for t in txns` binds t to seq[i] via SeqIndex"
+    );
 }
 
 /// `wait_until_quiesce` composes an `agent`, binds it as a TESTBENCH
@@ -656,7 +675,10 @@ end test WaitAnyTimeoutTest
     verify::verify_program(&prog).expect("verifies");
     let f = prog.function(prog.tests[0].run);
     let ir::Terminator::WaitUntilTimeout {
-        mode, on_timeout, on_fire, ..
+        mode,
+        on_timeout,
+        on_fire,
+        ..
     } = &f.blocks[0].terminator
     else {
         panic!("expected WaitUntilTimeout terminator:\n{f}");
@@ -966,6 +988,39 @@ end test RandTest
     assert!(
         cpp.contains("trace.randomize("),
         "randomize trace event emitted"
+    );
+}
+
+/// Retargeting a reused v1 randomize snippet must rename only the
+/// randomized object, not record-field members with the same spelling.
+#[test]
+fn randomize_snippet_retarget_preserves_record_field_names() {
+    let src = r#"
+transaction Req
+    errors : uint<8>
+    keep errors in [1..3]
+end transaction Req
+
+test RandNameCollisionTest
+    let dut : Top
+    run
+        let errors : Req
+        randomize(errors)
+        assert errors.errors >= 1
+    end run
+end test RandNameCollisionTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
+    assert!(
+        cpp.contains("_u_errors.errors"),
+        "object local is sanitized while record field name is preserved:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("_u_errors._u_errors"),
+        "retargeting must not rewrite member names:\n{cpp}"
     );
 }
 
@@ -1329,9 +1384,10 @@ end test StructTest
     // The body carries RecordInit + a RecordFieldWrite for `p.count`.
     let run = prog.function(prog.tests[0].run);
     assert!(
-        run.blocks
+        run.blocks.iter().any(|b| b
+            .stmts
             .iter()
-            .any(|b| b.stmts.iter().any(|s| matches!(s, ir::Stmt::RecordInit(..)))),
+            .any(|s| matches!(s, ir::Stmt::RecordInit(..)))),
         "struct local default-constructs via RecordInit:\n{run}"
     );
 }
@@ -1362,7 +1418,10 @@ end test StructVecTest
 "#;
     let prog = lower_src(src).expect("Vec struct field lowers");
     let dump = format!("{prog}");
-    assert!(dump.contains("data : Vec<uint<32>, 4>"), "names the Vec field: {dump}");
+    assert!(
+        dump.contains("data : Vec<uint<32>, 4>"),
+        "names the Vec field: {dump}"
+    );
     assert!(
         dump.contains("RecordFieldWrite(%r.data[0]"),
         "indexed element write: {dump}"
@@ -1448,7 +1507,10 @@ end test HoistTest
     assert!(
         matches!(
             &b.stmts[2],
-            ir::Stmt::RecordFieldWrite { value: ir::Expr::Local(_), .. }
+            ir::Stmt::RecordFieldWrite {
+                value: ir::Expr::Local(_),
+                ..
+            }
         ),
         "field write consumes the hoisted temp:\n{run}"
     );
@@ -1651,7 +1713,10 @@ fn helper_categorization_pure_vs_impure() {
         .collect();
     assert_eq!(helper_fns.len(), 1, "only the pure helper is standalone");
     assert_eq!(helper_fns[0].name, "double_it");
-    assert!(helper_fns[0].ret.is_some(), "pure helper carries a ret slot");
+    assert!(
+        helper_fns[0].ret.is_some(),
+        "pure helper carries a ret slot"
+    );
 
     // The run body inlined read_addr (WaitCyclesSync from the helper
     // body — inlined waits take v1's synchronous lambda path) and
@@ -1842,7 +1907,10 @@ fn wait_on_clock_lowers_with_clock_qualifier() {
         panic!("expected clock-qualified WaitCycles terminator:\n{f}");
     };
     assert_eq!(clock.name, "aux_clk");
-    assert_eq!(clock.index, 1, "declaration-order index into TestSchema::clocks");
+    assert_eq!(
+        clock.index, 1,
+        "declaration-order index into TestSchema::clocks"
+    );
     assert!(
         format!("{f}").contains("WaitCycles(2 on aux_clk, b1)"),
         "display names the clock:\n{f}"
@@ -1875,7 +1943,10 @@ end test WaitBadClockTest
         "unknown clock is Invalid, not Unsupported: {err:?}"
     );
     let msg = err.to_string();
-    assert!(msg.contains("no clock named `nope`"), "names the clock: {msg}");
+    assert!(
+        msg.contains("no clock named `nope`"),
+        "names the clock: {msg}"
+    );
     assert!(
         msg.contains("declared clocks: clk, aux_clk"),
         "lists the declared clocks: {msg}"
@@ -1899,7 +1970,8 @@ fn verifier_catches_bad_wait_clock() {
     }
     let errs = verify::verify_program(&broken).unwrap_err();
     assert!(
-        errs.iter().any(|e| e.to_string().contains("only 2 clock(s) are declared")),
+        errs.iter()
+            .any(|e| e.to_string().contains("only 2 clock(s) are declared")),
         "{errs:?}"
     );
 
@@ -1911,7 +1983,8 @@ fn verifier_catches_bad_wait_clock() {
     }
     let errs = verify::verify_program(&broken).unwrap_err();
     assert!(
-        errs.iter().any(|e| e.to_string().contains("that slot is `clk`")),
+        errs.iter()
+            .any(|e| e.to_string().contains("that slot is `clk`")),
         "{errs:?}"
     );
 }
@@ -1934,7 +2007,10 @@ fn tbir_emit_wait_on_clock_inline_loop() {
         "eval_clocks_until(_next);",
         "} for (auto& _c : _checkers) _c(); }",
     ] {
-        assert!(cpp.contains(marker), "missing wait-on-clock marker `{marker}` in:\n{cpp}");
+        assert!(
+            cpp.contains(marker),
+            "missing wait-on-clock marker `{marker}` in:\n{cpp}"
+        );
     }
     assert!(
         !cpp.contains("co_await harc_rt::wait_cycles"),
@@ -2182,7 +2258,10 @@ end impl CovTest
     assert_eq!(cg.points.len(), 1);
     let p = &cg.points[0];
     assert_eq!(p.name, "cp_mode");
-    assert_eq!(p.target.port_path, vec!["mode".to_string()]);
+    match &p.target {
+        ir::Expr::Port(port) => assert_eq!(port.port_path, vec!["mode".to_string()]),
+        other => panic!("expected port-backed coverpoint target, got {other:?}"),
+    }
     use ir::CovBinValue::Eq;
     let bins: Vec<(&str, &[ir::CovBinValue])> = p
         .bins
@@ -2249,10 +2328,133 @@ end impl CovTest
     assert_eq!(
         bins,
         vec![
-            ("closed", &[Range { lo: Some(4), hi: Some(9) }][..]),
-            ("openlow", &[Range { lo: None, hi: Some(3) }][..]),
-            ("mixed", &[Range { lo: Some(1), hi: Some(3) }, Eq(7)][..]),
+            (
+                "closed",
+                &[Range {
+                    lo: Some(4),
+                    hi: Some(9)
+                }][..]
+            ),
+            (
+                "openlow",
+                &[Range {
+                    lo: None,
+                    hi: Some(3)
+                }][..]
+            ),
+            (
+                "mixed",
+                &[
+                    Range {
+                        lo: Some(1),
+                        hi: Some(3)
+                    },
+                    Eq(7)
+                ][..]
+            ),
         ]
+    );
+}
+
+/// Width-method coverpoint targets carry source widths when they can be
+/// inferred, so signed extension samples the same values as ordinary
+/// TBIR expressions.
+#[test]
+fn covergroup_width_methods_lower_with_source_width() {
+    let src = r#"
+covergroup Cov @(posedge dut.clk)
+    cp_signed : cover dut.mode[3:0].sext<8>()
+        bins
+            neg_one = {255}
+        end bins
+end covergroup Cov
+
+testbench Tb
+    dut : Top
+    cov : Cov
+end testbench Tb
+
+impl CovTest for Tb
+    run
+        wait 1 cycle
+    end run
+end impl CovTest
+"#;
+    let prog = lower_src(src).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let target = &prog.covgroups[0].points[0].target;
+    let ir::Expr::WidthCast {
+        kind,
+        width,
+        src_width,
+        ..
+    } = target
+    else {
+        panic!("expected WidthCast target, got {target:?}");
+    };
+    assert_eq!(*kind, ir::WidthCastKind::Sext);
+    assert_eq!(*width, 8);
+    assert_eq!(*src_width, Some(4));
+}
+
+/// Covergroup width-method targets use the same basic guardrails as the
+/// ordinary TBIR expression path: no zero widths, no >64-bit widths, and
+/// no wrong-direction casts when the source width is known.
+#[test]
+fn covergroup_width_methods_reject_bad_widths() {
+    let src_zero = r#"
+covergroup Cov @(posedge dut.clk)
+    cp_bad : cover dut.mode[3:0].trunc<0>()
+end covergroup Cov
+
+test BadWidthZero
+    let dut : Top
+    let cov : Cov
+    run
+        wait 1 cycle
+    end run
+end test
+"#;
+    let err = lower_src(src_zero).unwrap_err();
+    assert!(
+        err.to_string().contains("width must be greater than zero"),
+        "{err}"
+    );
+
+    let src_wide = r#"
+covergroup Cov @(posedge dut.clk)
+    cp_bad : cover dut.mode[3:0].zext<65>()
+end covergroup Cov
+
+test BadWidthWide
+    let dut : Top
+    let cov : Cov
+    run
+        wait 1 cycle
+    end run
+end test
+"#;
+    let err = lower_src(src_wide).unwrap_err();
+    assert_unsupported(&err);
+
+    let src_wrong_direction = r#"
+covergroup Cov @(posedge dut.clk)
+    cp_bad : cover dut.mode[3:0].zext<2>()
+end covergroup Cov
+
+test BadWidthDirection
+    let dut : Top
+    let cov : Cov
+    run
+        wait 1 cycle
+    end run
+end test
+"#;
+    let err = lower_src(src_wrong_direction).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("width must be >= the source width"),
+        "{err}"
     );
 }
 
@@ -2537,8 +2739,14 @@ fn placement_leaves_ir_untouched_and_is_deterministic() {
     let prog = lower_src(&fixture("top_counter_test.harc")).expect("lowers");
     let before = format!("{prog}");
     let profile = placement::TargetProfile::single_site();
-    let a = format!("{}", placement::run(&prog, &profile).display(&prog, &profile));
-    let b = format!("{}", placement::run(&prog, &profile).display(&prog, &profile));
+    let a = format!(
+        "{}",
+        placement::run(&prog, &profile).display(&prog, &profile)
+    );
+    let b = format!(
+        "{}",
+        placement::run(&prog, &profile).display(&prog, &profile)
+    );
     assert_eq!(a, b, "rendering must be byte-stable");
     assert_eq!(before, format!("{prog}"), "pass must not perturb the IR");
 }
@@ -2711,7 +2919,10 @@ end impl MixTest
 "#;
     let err = lower_src(src).unwrap_err();
     let msg = format!("{err:?}");
-    assert!(msg.contains("mix tagged") && msg.contains("untagged"), "{msg}");
+    assert!(
+        msg.contains("mix tagged") && msg.contains("untagged"),
+        "{msg}"
+    );
 }
 
 /// A direct (non-fork) call of an `out_of_order` method is rejected by
@@ -2793,7 +3004,10 @@ fn transactor_methods_lower_to_functions_and_call_edges() {
 
     assert_eq!(prog.transactors.len(), 1);
     let x = &prog.transactors[0];
-    assert_eq!((x.name.as_str(), x.dut_field.as_str(), x.dut_type.as_str()), ("Xt", "dut", "Top"));
+    assert_eq!(
+        (x.name.as_str(), x.dut_field.as_str(), x.dut_type.as_str()),
+        ("Xt", "dut", "Top")
+    );
     assert_eq!(x.methods.len(), 2);
     let pulse = x.method("pulse").expect("pulse");
     let readv = x.method("readv").expect("readv");
@@ -2803,7 +3017,9 @@ fn transactor_methods_lower_to_functions_and_call_edges() {
     let pf = prog.function(pulse.function);
     assert_eq!(
         pf.kind,
-        ir::FunctionKind::TransactorBody { transactor: ir::TransactorId(0) }
+        ir::FunctionKind::TransactorBody {
+            transactor: ir::TransactorId(0)
+        }
     );
     assert_eq!(pf.params.len(), 1);
     assert_eq!(pf.locals[0].name, "n");
@@ -2820,7 +3036,10 @@ fn transactor_methods_lower_to_functions_and_call_edges() {
 
     // The testbench schema records the instance field.
     let tb = prog.testbench(prog.tests[0].testbench);
-    assert_eq!(tb.transactor_fields, vec![("xt".to_string(), ir::TransactorId(0))]);
+    assert_eq!(
+        tb.transactor_fields,
+        vec![("xt".to_string(), ir::TransactorId(0))]
+    );
 
     // Run body: the bind is erased; the calls are TransactorCall stmts.
     let run = prog.function(prog.tests[0].run);
@@ -2831,13 +3050,20 @@ fn transactor_methods_lower_to_functions_and_call_edges() {
         .filter(|s| matches!(s, ir::Stmt::TransactorCall { .. }))
         .collect();
     assert_eq!(calls.len(), 2, "two call edges:\n{run}");
-    let ir::Stmt::TransactorCall { dest: d0, call: c0 } = calls[0] else { unreachable!() };
+    let ir::Stmt::TransactorCall { dest: d0, call: c0 } = calls[0] else {
+        unreachable!()
+    };
     assert!(d0.is_none(), "statement call discards");
     let ir::Expr::Call(ir::CallTarget::TransactorMethod { bus_field, method }, args) = c0 else {
         panic!("call edge payload: {c0:?}");
     };
-    assert_eq!((bus_field.as_str(), method.as_str(), args.len()), ("xt", "pulse", 1));
-    let ir::Stmt::TransactorCall { dest: d1, .. } = calls[1] else { unreachable!() };
+    assert_eq!(
+        (bus_field.as_str(), method.as_str(), args.len()),
+        ("xt", "pulse", 1)
+    );
+    let ir::Stmt::TransactorCall { dest: d1, .. } = calls[1] else {
+        unreachable!()
+    };
     assert!(d1.is_some(), "let call binds the result");
 }
 
@@ -2892,12 +3118,19 @@ fn transactor_call_in_expression_position_hoisted() {
             )
         })
         .collect();
-    assert_eq!(binds.len(), 1, "readv() hoisted into a result-binding TransactorCall:\n{run}");
+    assert_eq!(
+        binds.len(),
+        1,
+        "readv() hoisted into a result-binding TransactorCall:\n{run}"
+    );
     // No bare TransactorMethod call edge survives nested in an Assign.
     for s in run.blocks.iter().flat_map(|b| &b.stmts) {
         if let ir::Stmt::Assign(_, e) = s {
             assert!(
-                !matches!(e, ir::Expr::Call(ir::CallTarget::TransactorMethod { .. }, _)),
+                !matches!(
+                    e,
+                    ir::Expr::Call(ir::CallTarget::TransactorMethod { .. }, _)
+                ),
                 "no bare transactor call edge as an Assign RHS"
             );
         }
@@ -2955,10 +3188,18 @@ end impl DrvTest
     assert_eq!(m.n_params, 1);
     let mf = prog.function(m.function);
     assert_eq!(mf.params.len(), 1);
-    assert_eq!(mf.params[0].ty, ir::IrType::Record(rid), "param is by-value record");
+    assert_eq!(
+        mf.params[0].ty,
+        ir::IrType::Record(rid),
+        "param is by-value record"
+    );
     // The first local mirrors the record param (TB-IR convention) and is
     // record-typed; the body reads `cmd.ticks` (visible in the IR text).
-    assert_eq!(mf.locals[0].ty, ir::IrType::Record(rid), "param local is the record");
+    assert_eq!(
+        mf.locals[0].ty,
+        ir::IrType::Record(rid),
+        "param local is the record"
+    );
     assert!(
         format!("{mf}").contains("%cmd.ticks"),
         "run_for body reads cmd.ticks:\n{mf}"
@@ -2971,7 +3212,10 @@ end impl DrvTest
             call: ir::Expr::Call(ir::CallTarget::TransactorMethod { method, .. }, args), ..
         } if method == "run_for" && matches!(args.as_slice(), [ir::Expr::Local(_)]))
     });
-    assert!(arg_is_local, "run_for call passes the record local by value:\n{run}");
+    assert!(
+        arg_is_local,
+        "run_for call passes the record local by value:\n{run}"
+    );
 }
 
 /// ...and not inside lazily-evaluated log/fail messages either.
@@ -3010,7 +3254,8 @@ fn transactor_call_resolution_is_checked() {
     let err = lower_src(&arity).unwrap_err();
     assert!(matches!(err, lower::LowerError::Invalid(_)), "{err:?}");
     assert!(
-        err.to_string().contains("takes 1 argument(s), call passes 2"),
+        err.to_string()
+            .contains("takes 1 argument(s), call passes 2"),
         "{err}"
     );
 
@@ -3110,7 +3355,10 @@ end impl RemapTest
     let binding = &prog.testbenches[0].bus_bindings[0];
     assert_eq!(
         binding.remap,
-        vec![(("read".to_string(), "req_valid".to_string()), "mem_read_req_valid".to_string())]
+        vec![(
+            ("read".to_string(), "req_valid".to_string()),
+            "mem_read_req_valid".to_string()
+        )]
     );
     // The override resolves; an unmapped signal falls back to the
     // `<field>_<channel>_<signal>` convention.
@@ -3198,8 +3446,7 @@ end impl HsTest
 /// channel access. Every mapped wire resolves to the AMBA name.
 #[test]
 fn bind_remap_dump_ir_snapshot() {
-    let prog =
-        lower_with_stdlib_bus("bind_remap_test.harc", "BusAxiLite.arch").expect("lowers");
+    let prog = lower_with_stdlib_bus("bind_remap_test.harc", "BusAxiLite.arch").expect("lowers");
     verify::verify_program(&prog).expect("verifies");
     insta::assert_snapshot!("bind_remap_dump_ir", format!("{prog}"));
 }
@@ -3277,7 +3524,10 @@ fn tlm_target_state_fields_lower() {
             ir::Stmt::TransactorStateWrite { instance, .. } if instance == "target"
         )
     });
-    assert!(filled, "responder body must carry instance-filled state writes");
+    assert!(
+        filled,
+        "responder body must carry instance-filled state writes"
+    );
 }
 
 /// Nested forwarding: a bound-to responder re-issues a downstream
@@ -3302,7 +3552,10 @@ fn tlm_target_nested_forwarding_lowers() {
             )) if bus_field == "back" && method == "read"
         )
     });
-    assert!(has_downstream, "responder body must carry the downstream back.read edge");
+    assert!(
+        has_downstream,
+        "responder body must carry the downstream back.read edge"
+    );
 }
 
 /// Fork-forwarding: a responder issues two downstream `fork
@@ -3316,8 +3569,14 @@ fn tlm_target_fork_forwarding_lowers() {
     let x = &prog.transactors[0];
     let body = prog.function(x.target_methods[0].function);
     let stmts: Vec<&ir::Stmt> = body.blocks.iter().flat_map(|b| &b.stmts).collect();
-    let forks = stmts.iter().filter(|s| matches!(s, ir::Stmt::TlmFork(_))).count();
-    let joins = stmts.iter().filter(|s| matches!(s, ir::Stmt::TlmJoinAll(_))).count();
+    let forks = stmts
+        .iter()
+        .filter(|s| matches!(s, ir::Stmt::TlmFork(_)))
+        .count();
+    let joins = stmts
+        .iter()
+        .filter(|s| matches!(s, ir::Stmt::TlmJoinAll(_)))
+        .count();
     assert_eq!(forks, 2, "responder body must carry two downstream forks");
     assert_eq!(joins, 1, "responder body must carry one join_all");
 }
@@ -3337,10 +3596,18 @@ fn tlm_target_ooo_responder_lowers() {
         .iter()
         .find(|m| m.name == "read_ooo")
         .expect("read_ooo responder present");
-    assert_eq!(ooo.ooo_tags, Some(2), "read_ooo carries `out_of_order tags 2`");
+    assert_eq!(
+        ooo.ooo_tags,
+        Some(2),
+        "read_ooo carries `out_of_order tags 2`"
+    );
     // The blocking responders stay single-lane (no tag count).
     for m in x.target_methods.iter().filter(|m| m.name != "read_ooo") {
-        assert_eq!(m.ooo_tags, None, "blocking responder `{}` has no tags", m.name);
+        assert_eq!(
+            m.ooo_tags, None,
+            "blocking responder `{}` has no tags",
+            m.name
+        );
     }
 }
 
@@ -3469,8 +3736,7 @@ fn bus_bind_remap_dump_ir_snapshot() {
     verify::verify_program(&prog).expect("verifies");
     let text = format!("{prog}");
     assert!(
-        text.contains(" with{poke.addr=mem_poke_addr")
-            && text.contains("read.addr=mem_read_addr"),
+        text.contains(" with{poke.addr=mem_poke_addr") && text.contains("read.addr=mem_read_addr"),
         "bind remap table (sorted by key) must ride the binding line:\n{text}"
     );
     insta::assert_snapshot!("bus_bind_remap_dump_ir", text);
@@ -3502,7 +3768,10 @@ fn verifier_pins_transactor_call_seam() {
     let find_call = |f: &ir::TbFunction| -> (usize, usize) {
         for (bi, b) in f.blocks.iter().enumerate() {
             for (si, s) in b.stmts.iter().enumerate() {
-                if let ir::Stmt::Assign(_, ir::Expr::Call(ir::CallTarget::TransactorMethod { .. }, _)) = s
+                if let ir::Stmt::Assign(
+                    _,
+                    ir::Expr::Call(ir::CallTarget::TransactorMethod { .. }, _),
+                ) = s
                 {
                     return (bi, si);
                 }
@@ -3613,7 +3882,10 @@ fn placement_classifies_transactor_call_block_timing_tolerant() {
             b.stmts.iter().any(|s| {
                 matches!(
                     s,
-                    ir::Stmt::Assign(_, ir::Expr::Call(ir::CallTarget::TransactorMethod { .. }, _))
+                    ir::Stmt::Assign(
+                        _,
+                        ir::Expr::Call(ir::CallTarget::TransactorMethod { .. }, _)
+                    )
                 )
             })
         })
@@ -3672,7 +3944,10 @@ end impl EvTest
     // A second stateful instance of the same type is rejected precisely
     // (the method bodies are shared per type; one stateful instance per
     // type in this subset).
-    let two_src = state_src.replace("    ev  : Ev active", "    ev  : Ev active\n    ev2 : Ev active");
+    let two_src = state_src.replace(
+        "    ev  : Ev active",
+        "    ev  : Ev active\n    ev2 : Ev active",
+    );
     let msg = assert_unsupported(&lower_src(&two_src).unwrap_err());
     assert!(msg.contains("instantiated more than once"), "{msg}");
 
@@ -3810,8 +4085,8 @@ fn linklist_basic_dump_ir_snapshot() {
 /// severity, under the two-clock scheduler.
 #[test]
 fn async_fifo_dump_ir_snapshot() {
-    let prog = lower_fixtures(&["async_fifo_test.harc", "async_fifo_domains.harc"])
-        .expect("lowers");
+    let prog =
+        lower_fixtures(&["async_fifo_test.harc", "async_fifo_domains.harc"]).expect("lowers");
     verify::verify_program(&prog).expect("verifies");
     insta::assert_snapshot!("async_fifo_dump_ir", format!("{prog}"));
 }
@@ -3843,7 +4118,11 @@ fn aes_cipher_top_dump_ir_snapshot() {
         "first param lowers to uint<128>",
     );
     // `LocalId(i)` mirrors the i-th param (TB-IR convention).
-    assert_eq!(f.locals[0].ty, ir::IrType::UInt(Some(128)), "param local is wide");
+    assert_eq!(
+        f.locals[0].ty,
+        ir::IrType::UInt(Some(128)),
+        "param local is wide"
+    );
     insta::assert_snapshot!("aes_cipher_top_dump_ir", format!("{prog}"));
 }
 
@@ -4185,7 +4464,10 @@ end impl Test
             }
         })
     });
-    assert!(has_regread, "expected a bus-reading RegRead in the assert condition");
+    assert!(
+        has_regread,
+        "expected a bus-reading RegRead in the assert condition"
+    );
 }
 
 /// The corpus `regblock_basic_test` fixture — initiator-side BFM `via`
@@ -4228,7 +4510,10 @@ fn regblock_basic_corpus_lowers_with_register_read_in_assert() {
             }
         }
     }
-    assert!(cond_reads >= 3, "expected ≥3 assert-cond RegReads, got {cond_reads}");
+    assert!(
+        cond_reads >= 3,
+        "expected ≥3 assert-cond RegReads, got {cond_reads}"
+    );
     assert!(
         fail_arg_reads >= 3,
         "expected ≥3 fail-message RegReads, got {fail_arg_reads}"
@@ -4281,8 +4566,16 @@ fn bound_initiator_transactor_with_state_lowers() {
         .find(|x| x.name == "AxilHelper")
         .expect("AxilHelper transactor lowered");
     assert_eq!(helper.bound_bus.as_deref(), Some("BusAxiLite"));
-    let names: Vec<&str> = helper.state_fields.iter().map(|f| f.name.as_str()).collect();
-    assert_eq!(names, vec!["last_read", "read_count"], "state fields on schema");
+    let names: Vec<&str> = helper
+        .state_fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["last_read", "read_count"],
+        "state fields on schema"
+    );
 
     // The stateful bound-initiator instance is recorded for per-instance
     // state materialization (the same table the unbound form uses).
@@ -4305,7 +4598,10 @@ fn bound_initiator_transactor_with_state_lowers() {
         .flat_map(|b| &b.stmts)
         .filter(|s| matches!(s, ir::Stmt::TransactorStateWrite { instance, .. } if instance == "helper"))
         .count();
-    assert_eq!(state_writes, 2, "two instance-filled state writes in read body");
+    assert_eq!(
+        state_writes, 2,
+        "two instance-filled state writes in read body"
+    );
 }
 
 /// The corpus `regblock_bitbash_test` fixture — `bitbash(regs)` over a
@@ -4332,7 +4628,10 @@ fn regblock_bitbash_corpus_lowers() {
         .flat_map(|b| &b.stmts)
         .filter(|s| matches!(s, ir::Stmt::TransactorCall { dest: None, .. }))
         .count();
-    assert_eq!(writes, 6, "expected 6 bitbash write call edges (3 RW × 2 patterns)");
+    assert_eq!(
+        writes, 6,
+        "expected 6 bitbash write call edges (3 RW × 2 patterns)"
+    );
     // The `errors == 0` check resolves the framework counter.
     let has_errcount = run.blocks.iter().any(|b| {
         b.stmts.iter().any(|s| {
@@ -4350,7 +4649,10 @@ fn regblock_bitbash_corpus_lowers() {
             }
         })
     });
-    assert!(has_errcount, "expected an `errors == 0` AssertCheck (ErrorCount)");
+    assert!(
+        has_errcount,
+        "expected an `errors == 0` AssertCheck (ErrorCount)"
+    );
 }
 
 /// The corpus `regblock_record_test` fixture carries a per-register
@@ -4415,8 +4717,14 @@ fn regblock_fields_corpus_lowers() {
     let dump = format!("{prog}");
     // Masked RMW on the whole-register mirror `DMACR`, plus an inline
     // RegRead for the bus-reading field extracts.
-    assert!(dump.contains("DMACR ="), "expected mirror RMW of DMACR: {dump}");
-    assert!(dump.contains("RegRead"), "expected an inline field RegRead: {dump}");
+    assert!(
+        dump.contains("DMACR ="),
+        "expected mirror RMW of DMACR: {dump}"
+    );
+    assert!(
+        dump.contains("RegRead"),
+        "expected an inline field RegRead: {dump}"
+    );
 }
 
 /// The corpus `regblock_addrmap_test` fixture — two `DmaChan` instances
@@ -4505,8 +4813,8 @@ fn extern_fn_ref_dump_ir_snapshot() {
 /// unblocked.
 #[test]
 fn transactor_parse_dump_ir_snapshot() {
-    let prog = lower_with_stdlib_bus("transactor_parse_test.harc", "BusAxiLite.arch")
-        .expect("lowers");
+    let prog =
+        lower_with_stdlib_bus("transactor_parse_test.harc", "BusAxiLite.arch").expect("lowers");
     verify::verify_program(&prog).expect("verifies");
     insta::assert_snapshot!("transactor_parse_dump_ir", format!("{prog}"));
 }

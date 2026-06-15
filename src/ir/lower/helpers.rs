@@ -31,7 +31,7 @@
 //! frame stack (belt and suspenders for call edges the conservative
 //! scanner might miss inside unrecognized constructs).
 
-use super::{FuncBuilder, InlineFrame, LowerCtx, LowerError, unsupported};
+use super::{exprs::width_cast_kind, unsupported, FuncBuilder, InlineFrame, LowerCtx, LowerError};
 use crate::ast::{
     Block, BuiltinTy, CallArg, Expr as AstExpr, ExprKind, FunctionDecl, Item, SourceFile,
     Stmt as AstStmt, StmtKind, TypeArg, TypeExpr,
@@ -142,6 +142,7 @@ pub(crate) fn lower_pure_helper<'a>(
     }
     if decl.return_ty.is_some() {
         let ret = b.declare("__ret");
+        b.set_local_type(ret, ir_type_of(decl.return_ty.as_ref()));
         b.helper_ret = Some(ret);
     }
     b.lower_block_stmts(&decl.body)?;
@@ -235,6 +236,9 @@ impl FuncBuilder<'_> {
         // Result slot, default-initialized so paths that fall off the
         // helper's end still define it.
         let dest = self.fresh_temp();
+        if decl.return_ty.is_some() {
+            self.set_local_type(dest, ir_type_of(decl.return_ty.as_ref()));
+        }
         self.push(Stmt::Assign(
             dest,
             Expr::Literal {
@@ -262,6 +266,7 @@ impl FuncBuilder<'_> {
         for (p, b) in decl.params.iter().zip(bound) {
             if let Bound::Val(e) = b {
                 let id = self.declare(&p.name.name);
+                self.set_local_type(id, ir_type_of(p.ty.as_ref()));
                 self.push(Stmt::Assign(id, e));
             }
         }
@@ -393,6 +398,9 @@ impl FuncBuilder<'_> {
         }
 
         let dest = self.fresh_temp();
+        if decl.return_ty.is_some() {
+            self.set_local_type(dest, ir_type_of(decl.return_ty.as_ref()));
+        }
         self.push(Stmt::Assign(
             dest,
             Expr::Literal {
@@ -420,6 +428,7 @@ impl FuncBuilder<'_> {
         for (p, b) in decl.params.iter().zip(bound) {
             if let Bound::Val(e) = b {
                 let id = self.declare(&p.name.name);
+                self.set_local_type(id, ir_type_of(p.ty.as_ref()));
                 self.push(Stmt::Assign(id, e));
             }
         }
@@ -631,6 +640,9 @@ fn scan_expr(e: &AstExpr, s: &mut Scan) {
         ExprKind::Call { callee, args } => {
             match &*callee.kind {
                 ExprKind::Ident(id) => s.callees.push(id.name.clone()),
+                ExprKind::Field { target, name } if width_cast_kind(&name.name).is_some() => {
+                    scan_expr(target, s);
+                }
                 _ => s.impure = true,
             }
             for a in args {
@@ -643,6 +655,7 @@ fn scan_expr(e: &AstExpr, s: &mut Scan) {
                 }
             }
         }
+        ExprKind::Cast { expr, .. } => scan_expr(expr, s),
         // Field accesses are potential DUT port accesses (`d.rd_data`
         // through a DUT-typed param); anything else unrecognized is
         // conservatively impure — call-site lowering reports precisely.

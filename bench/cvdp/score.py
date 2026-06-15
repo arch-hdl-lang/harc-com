@@ -47,7 +47,7 @@ Outputs to stdout:
 
 from __future__ import annotations
 from dataclasses import dataclass
-import json, os, subprocess, sys, shutil
+import argparse, json, os, subprocess, sys, shutil
 from pathlib import Path
 
 
@@ -124,6 +124,28 @@ COVERAGE_WAIVERS: dict[str, list[CoverageWaiver]] = {
             "current_disparity is reset and assigned only RD_MINUS/RD_PLUS, so the enum case default is unreachable",
         ),
     ],
+    "cvdp_copilot_gf_multiplier_0047": [
+        CoverageWaiver(
+            "gf_mac.sv",
+            49,
+            54,
+            "WIDTH defaults to 32, so WIDTH_VALID is structurally true and WIDTH_VALID==0 points are unreachable",
+        ),
+    ],
+    "cvdp_copilot_gcd_0028": [
+        CoverageWaiver(
+            "gcd_top.sv",
+            179,
+            180,
+            "SIGNED_EN defaults to 1, so the unsigned datapath side of the load ternaries is unreachable",
+        ),
+        CoverageWaiver(
+            "gcd_top.sv",
+            220,
+            225,
+            "SIGNED_EN defaults to 1, so the unsigned comparison branch is unreachable",
+        ),
+    ],
     "cvdp_copilot_nbit_swizzling_0009": [
         CoverageWaiver(
             "nbit_swizzling.sv",
@@ -138,6 +160,20 @@ COVERAGE_WAIVERS: dict[str, list[CoverageWaiver]] = {
             120,
             120,
             "outer !i_enable and i_fault priority branches make those inner IDLE-condition subterms unreachable",
+        ),
+    ],
+    "cvdp_copilot_vending_machine_0006": [
+        CoverageWaiver(
+            "vending_machine.sv",
+            130,
+            130,
+            "item_selected is an unsigned 3-bit signal, so item_selected >= 0 is structurally true",
+        ),
+        CoverageWaiver(
+            "vending_machine.sv",
+            210,
+            210,
+            "the preceding coins_accumulated == 0 branch makes the false side of coins_accumulated > 0 unreachable",
         ),
     ],
 }
@@ -267,7 +303,14 @@ def parse_verilator_dat_control(
     return {source_file: (hit, total) for source_file, (hit, total) in out.items()}
 
 
-def score(problem_dir: Path) -> int:
+def score(
+    problem_dir: Path,
+    *,
+    codegen: str | None = None,
+    record_trace: Path | None = None,
+    json_out: Path | None = None,
+    outdir_override: Path | None = None,
+) -> int:
     meta = json.loads((problem_dir / "meta.json").read_text())
     problem_id = meta.get("id", problem_dir.name)
     top = meta["top_module"]
@@ -305,8 +348,8 @@ def score(problem_dir: Path) -> int:
     print(f"[score] DUT-of-record: {dut_sv.name}")
     print(f"[score] coverage target: ≥{target}%")
 
-    outdir = problem_dir / "build"
-    outdir.mkdir(exist_ok=True)
+    outdir = outdir_override or (problem_dir / "build")
+    outdir.mkdir(parents=True, exist_ok=True)
     control_file, coverage_waivers = write_verilator_control_file(problem_id, dut_sv, outdir)
     if control_file:
         print(f"[score] Verilator coverage control: {control_file}")
@@ -324,6 +367,10 @@ def score(problem_dir: Path) -> int:
         cmd += ["--sv", str(s)]
     cmd += [str(harc_files[0])]
     cmd += ["--top", top, "--coverage", "--outdir", str(outdir)]
+    if codegen:
+        cmd += ["--codegen", codegen]
+    if record_trace:
+        cmd += ["--record-trace", str(record_trace)]
     print(f"[score] $ {' '.join(cmd)}")
     r = subprocess.run(cmd, capture_output=True, text=True)
     (outdir / "harc_sim.stdout").write_text(r.stdout)
@@ -420,14 +467,74 @@ def score(problem_dir: Path) -> int:
               f"({score_hit}/{score_total})  line {dut_line_pct:.2f}% "
               f"({dut_line_hit}/{dut_line_total})  threshold ≥{target}%"
               f"{ceiling_note}")
-    return 0 if passed else 1
+    rc = 0 if passed else 1
+    if json_out:
+        json_out.parent.mkdir(parents=True, exist_ok=True)
+        json_out.write_text(
+            json.dumps(
+                {
+                    "problem": problem_dir.name,
+                    "codegen": codegen or "default",
+                    "top_module": top,
+                    "dut_module": dut_module,
+                    "dut_file": dut_sv.name,
+                    "target": target,
+                    "verdict": verdict,
+                    "score_label": score_label,
+                    "score_pct": score_pct,
+                    "score_hit": score_hit,
+                    "score_total": score_total,
+                    "line_pct": dut_line_pct,
+                    "line_hit": dut_line_hit,
+                    "line_total": dut_line_total,
+                    "control_pct": dut_br_pct if dut_br_total else None,
+                    "control_hit": dut_br_hit,
+                    "control_total": dut_br_total,
+                    "returncode": rc,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+    return rc
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2:
-        print(f"usage: {argv[0]} <problem_dir>", file=sys.stderr)
-        return 2
-    return score(Path(argv[1]).resolve())
+    ap = argparse.ArgumentParser()
+    ap.add_argument("problem_dir", help="CVDP problem directory")
+    ap.add_argument(
+        "--codegen",
+        choices=["v1", "tbir"],
+        default=None,
+        help="HARC C++ backend to use (default: harc default)",
+    )
+    ap.add_argument(
+        "--record-trace",
+        type=Path,
+        default=None,
+        help="write semantic JSONL trace to this path",
+    )
+    ap.add_argument(
+        "--json",
+        type=Path,
+        default=None,
+        help="write machine-readable score summary to this path",
+    )
+    ap.add_argument(
+        "--outdir",
+        type=Path,
+        default=None,
+        help="simulation/scoring output directory (default: <problem>/build)",
+    )
+    args = ap.parse_args(argv[1:])
+    return score(
+        Path(args.problem_dir).resolve(),
+        codegen=args.codegen,
+        record_trace=args.record_trace,
+        json_out=args.json,
+        outdir_override=args.outdir,
+    )
 
 
 if __name__ == "__main__":

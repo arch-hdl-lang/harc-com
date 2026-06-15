@@ -1,0 +1,110 @@
+// HARC stimulus bench for CVDP cid012 `cvdp_copilot_vending_machine_0006`.
+
+testbench VendingMachineTb
+    dut : vending_machine
+end testbench VendingMachineTb
+
+function idle_inputs(dut: vending_machine)
+    dut.item_button = 0
+    dut.item_selected = 0
+    dut.coin_input = 0
+    dut.cancel = 0
+end function idle_inputs
+
+function buy_item(dut: vending_machine, item: uint<3>, c0: uint<4>, c1: uint<4>, c2: uint<4>)
+    dut.item_button = 1
+    dut.item_selected = item
+    dut.coin_input = 0
+    dut.cancel = 0
+    wait 1 cycle
+    dut.item_button = 0
+    wait 1 cycle
+    dut.coin_input = c0
+    wait 1 cycle
+    dut.coin_input = c1
+    wait 1 cycle
+    dut.coin_input = c2
+    wait 4 cycles
+    idle_inputs(dut)
+    wait 1 cycle
+end function buy_item
+
+impl VendingMachineTest for VendingMachineTb
+    run
+        log(info, "vending_machine: purchase, change, cancel, invalid coin, invalid item")
+        dut.rst = 1
+        idle_inputs(dut)
+        wait 3 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        buy_item(dut, 1, 5, 0, 0)
+        buy_item(dut, 2, 5, 5, 0)
+        buy_item(dut, 2, 1, 2, 10)
+        buy_item(dut, 3, 10, 5, 0)
+        buy_item(dut, 4, 10, 10, 5)
+
+        // Overpay for change.
+        buy_item(dut, 1, 10, 0, 0)
+
+        // Coin before item selection -> return money/error path.
+        dut.coin_input = 5
+        wait 2 cycles
+        idle_inputs(dut)
+        wait 1 cycle
+
+        // Invalid item and invalid coin.
+        dut.item_button = 1
+        dut.item_selected = 7
+        wait 1 cycle
+        dut.item_button = 0
+        dut.coin_input = 3
+        wait 3 cycles
+        idle_inputs(dut)
+
+        // Invalid coin while a valid item is under-paid, so the coin-valid
+        // branch itself takes the invalid side.
+        dut.item_button = 1
+        dut.item_selected = 4
+        wait 1 cycle
+        dut.item_button = 0
+        wait 1 cycle
+        dut.coin_input = 3
+        wait 2 cycles
+        idle_inputs(dut)
+
+        // Cancel during selection and payment.
+        dut.item_button = 1
+        dut.item_selected = 2
+        wait 1 cycle
+        dut.item_button = 0
+        dut.cancel = 1
+        wait 2 cycles
+        idle_inputs(dut)
+
+        dut.item_button = 1
+        dut.item_selected = 3
+        wait 1 cycle
+        dut.item_button = 0
+        dut.coin_input = 5
+        wait 1 cycle
+        dut.cancel = 1
+        wait 2 cycles
+        idle_inputs(dut)
+
+        // Cancel after accumulating money to cover RETURN_MONEY with coins.
+        dut.item_button = 1
+        dut.item_selected = 4
+        wait 1 cycle
+        dut.item_button = 0
+        dut.coin_input = 10
+        wait 1 cycle
+        dut.cancel = 1
+        wait 3 cycles
+
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+        log(info, "vending_machine stimulus complete")
+    end run
+end impl VendingMachineTest

@@ -1,0 +1,44 @@
+// HARC stimulus bench for CVDP cid012 `cvdp_copilot_microcode_sequencer_0028`.
+
+testbench MicrocodeSequencerTb
+    dut : microcode_sequencer
+end testbench MicrocodeSequencerTb
+
+impl MicrocodeSequencerTest for MicrocodeSequencerTb
+    run
+        log(info, "microcode_sequencer: instruction decoder and datapath sweep")
+        dut.c_n_in = 0
+        dut.c_inc_in = 0
+        dut.r_en = 0
+        dut.cc = 0
+        dut.ien = 1
+        dut.d_in = 0
+        dut.instr_in = 0
+        dut.oen = 0
+        wait 4 cycles
+
+        for instr in 0 .. 32
+            for cc in 0 .. 2
+                dut.instr_in = instr
+                dut.cc = cc != 0
+                dut.ien = 0
+                dut.r_en = (instr & 1) != 0
+                dut.oen = (instr & 2) != 0
+                dut.c_n_in = (instr & 4) != 0
+                dut.c_inc_in = (instr & 8) != 0
+                dut.d_in = instr & 0xF
+                wait 2 cycles
+            end for
+        end for
+
+        // Instruction-enable override case.
+        dut.ien = 1
+        for instr in 0 .. 32
+            dut.instr_in = instr
+            dut.d_in = instr ^ 0xF
+            wait 1 cycle
+        end for
+
+        log(info, "microcode_sequencer stimulus complete")
+    end run
+end impl MicrocodeSequencerTest

@@ -1036,20 +1036,26 @@ pub struct TlmMethodSchema {
 pub enum FunctionKind {
     Run,
     Check,
-    SamplerAuto { covgroup: CovgroupId },
+    SamplerAuto {
+        covgroup: CovgroupId,
+    },
     Helper,
     /// One transactor method body (design doc §"Function-kind
     /// handling": one `TbFunction` per method). `params` are the
     /// method's declared parameters; the owning transactor and the
     /// method name live in `TbProgram::transactors[transactor]`.
-    TransactorBody { transactor: TransactorId },
+    TransactorBody {
+        transactor: TransactorId,
+    },
     /// One composite-component method body (env/agent cluster). `params`
     /// are the method's declared parameters; bodies address fields self-
     /// relatively via `ComponentBase::SelfField`. The owning component +
     /// method name live in `TbProgram::components[component]`. Emitted as
     /// a `<Comp>_<method>(<Comp>& self, args)` free lambda (v1's
     /// `emit_component_method` shape).
-    ComponentMethod { component: ComponentId },
+    ComponentMethod {
+        component: ComponentId,
+    },
     /// One `tseq` declaration body — a transaction-sequence generator.
     /// `record` is the element record type (`TSeq<Record>`); the
     /// function's `ret` slot holds the `IrType::RecordSeq(record)`
@@ -1058,7 +1064,9 @@ pub enum FunctionKind {
     /// lambda returning `std::vector<Record>` (v1's `emit_tseq` shape).
     /// Called via `CallTarget::Tseq` from a test-scope `let txns =
     /// Name(args)`.
-    Tseq { record: RecordId },
+    Tseq {
+        record: RecordId,
+    },
     /// A test-scope closure-hook body — either an `on <obj>.<method>
     /// pre/post` method hook or an `on regs.REG` per-register write
     /// callback. Lowered with the firing context's surface (the method's
@@ -1179,13 +1187,14 @@ pub enum Stmt {
     /// the single target register, so the mirror update is a `RecordFieldWrite`
     /// in disguise (same `local`/`field`/masked `value`); the addition is the
     /// recursion-depth guard + callback dispatch. Emission mirrors v1's
-    /// `try_emit_record_write`: bump `<binding>_cb_depth`, FATAL+`errors++`
-    /// past `HARC_RAL_CB_MAX_DEPTH`, else write the mirror cell and (when
-    /// `callback` is `Some`) call the callback with the observed value, then
-    /// un-bump. A `record_write` whose register has NO callback but whose
-    /// BINDING has callbacks on OTHER registers still routes here (carrying
-    /// `callback: None`) so its mirror write is depth-counted consistently
-    /// (matches v1, which wraps the whole decode chain in one guard).
+    /// `try_emit_record_write`: bump `<binding>_cb_depth`, emit FATAL and bump
+    /// the framework error counter past `HARC_RAL_CB_MAX_DEPTH`, else write
+    /// the mirror cell and (when `callback` is `Some`) call the callback with
+    /// the observed value, then un-bump. A `record_write` whose register has NO
+    /// callback but whose BINDING has callbacks on OTHER registers still
+    /// routes here (carrying `callback: None`) so its mirror write is
+    /// depth-counted consistently (matches v1, which wraps the whole decode
+    /// chain in one guard).
     RecordWriteCb {
         /// Mirror record local (the `<Block>_Mirror` instance).
         local: LocalId,
@@ -1205,7 +1214,10 @@ pub enum Stmt {
     /// `_tb.<field> = value` on a scalar testbench field (run/check-
     /// shared host state — see `TestbenchSchema::scalar_fields`). The
     /// value is port-hoisted like `Assign`.
-    TbFieldWrite { field: String, value: Expr },
+    TbFieldWrite {
+        field: String,
+        value: Expr,
+    },
     /// `read_count = read_count + 1` inside a target-responder body
     /// (or `target.read_count = ...` from the test): write a bound-to
     /// target transactor's persistent state field. `instance` names the
@@ -1217,8 +1229,14 @@ pub enum Stmt {
         field: String,
         value: Expr,
     },
-    Log { level: LogLevel, args: FmtArgs },
-    AssertCheck { cond: Expr, on_fail: FmtArgs },
+    Log {
+        level: LogLevel,
+        args: FmtArgs,
+    },
+    AssertCheck {
+        cond: Expr,
+        on_fail: FmtArgs,
+    },
     CovReport(CovgroupInstance),
     /// A sequence→transactor method call — the Tier-1/Tier-0 placement
     /// seam. `call` is ALWAYS `Expr::Call(CallTarget::TransactorMethod
@@ -1246,7 +1264,10 @@ pub enum Stmt {
     /// per-sub-predicate "not yet true:" breakdown); `guard: None`
     /// prints unconditionally (the header line). Lives only in
     /// `on_timeout` successor blocks.
-    FailDiag { guard: Option<Expr>, args: FmtArgs },
+    FailDiag {
+        guard: Option<Expr>,
+        args: FmtArgs,
+    },
     /// A statement-position scoreboard mutation on a scoreboard-typed
     /// testbench field (`sb.expected.push(x)`, `sb.writes = ...`). The
     /// design doc's `Stmt::ScoreboardOp(ScoreboardId, ScoreboardOp)`,
@@ -1332,7 +1353,10 @@ pub enum Stmt {
     /// sequence accumulator. `seq` is the function's `RecordSeq` `ret`
     /// local; `value` is `Expr::Local(record)` (the yielded record).
     /// Emitted as `<seq>.push_back(<value>);` (v1's `_result.push_back`).
-    SeqPush { seq: LocalId, value: Expr },
+    SeqPush {
+        seq: LocalId,
+        value: Expr,
+    },
     /// `let x = fork bus.<method>(args)` — issue the REQUEST side of a
     /// bus-bound `tlm_method` call now, deferring the response capture to
     /// the next `Stmt::TlmJoinAll` (v1's `try_emit_bus_tlm_fork`). The
@@ -1422,7 +1446,10 @@ pub enum LogLevel {
     Error,
     Fatal,
     /// `logf("file", level, ...)` — write to a named file sink.
-    File { path: String, level: FileLogLevel },
+    File {
+        path: String,
+        level: FileLogLevel,
+    },
 }
 
 /// Severity inside a `logf` file sink (no nested `File`).
@@ -1544,7 +1571,10 @@ pub enum WaitMode {
 
 #[derive(Debug, Clone)]
 pub enum Expr {
-    Literal { value: u64, ty: IrType },
+    Literal {
+        value: u64,
+        ty: IrType,
+    },
     /// An integer literal wider than 64 bits, as LSB-first 32-bit
     /// words (always > 2 words). General expression emission mirrors
     /// v1's `c_value_literal` (`_harc_u128` composite up to 128 bits,
@@ -1558,7 +1588,11 @@ pub enum Expr {
     /// state — allowed in every expression position a `Local` is.
     /// `index: Some(e)` reads a `Vec<T, N>` field element (`rec.data[e]`,
     /// emitted as `local.field[e]`); `None` reads a scalar field.
-    RecordField { local: LocalId, field: String, index: Option<Box<Expr>> },
+    RecordField {
+        local: LocalId,
+        field: String,
+        index: Option<Box<Expr>>,
+    },
     /// `_tb.<field>` read on a scalar testbench field. Host state —
     /// allowed in every expression position a `Local` is.
     TbField(String),
@@ -1568,7 +1602,10 @@ pub enum Expr {
     /// instance name (e.g. `target`); emission produces
     /// `<instance>.<field>` against the generated per-instance struct.
     /// Host state — allowed in every position a `Local` is.
-    TransactorState { instance: String, field: String },
+    TransactorState {
+        instance: String,
+        field: String,
+    },
     /// A value-producing scoreboard read on a scoreboard-typed testbench
     /// field: `sb.writes` (scalar), `sb.expected.size()`,
     /// `sb.expected.empty()`. Host state — allowed wherever a `Local`
@@ -1592,14 +1629,19 @@ pub enum Expr {
     /// `Local` is. Queue/event fields are never read this way (queues use
     /// scoreboard-style ops which are out of subset for components in v0;
     /// events are written via `connect`/`emit` only).
-    ComponentField { base: ComponentBase, field: String },
+    ComponentField {
+        base: ComponentBase,
+        field: String,
+    },
     /// A whole composite-component value, passed by value as a method
     /// argument: `sb.observe(addr, model)` reads `model` here, where the
     /// callee parameter is component-typed. `base` resolves the receiver
     /// (a `self` sub-component field, or a test-scope component path).
     /// Emitted as the C++ struct value at `base` (a by-value copy at the
     /// call), mirroring v1's `ResponseScoreboard_observe(..., model)`.
-    ComponentValue { base: ComponentBase },
+    ComponentValue {
+        base: ComponentBase,
+    },
     /// A value-producing read on a composite-component `queue<T>` field:
     /// `<base>.<queue>.size()` / `.empty()`. Host state — allowed wherever
     /// a `Local` is. `.pop()` is NOT here (it mutates) — it lowers to
@@ -1630,10 +1672,11 @@ pub enum Expr {
     CycleCount,
     /// The framework error counter (`errors`). A bare `errors` ident
     /// resolves here — it is a framework-provided counter (bumped by
-    /// `AssertCheck`/`Log(error|fatal)`), not a user local. Both
-    /// backends emit the in-scope `errors` variable; allowed wherever a
-    /// `Local` is. Canonical use: `assert errors == 0` after a
-    /// compile-time-unrolled walk like `bitbash(regs)`. int-valued.
+    /// `AssertCheck`/`Log(error|fatal)`), not a user local. Codegen
+    /// emits the framework counter directly so user locals named
+    /// `errors` cannot shadow failure accounting. Canonical use:
+    /// `assert errors == 0` after a compile-time-unrolled walk like
+    /// `bitbash(regs)`. int-valued.
     ErrorCount,
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Unary(UnOp, Box<Expr>),
@@ -1644,6 +1687,14 @@ pub enum Expr {
     /// selecting — port reads are side-effect-free, so this is
     /// observably identical to v1's lazy C++ ternary.
     Ternary(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// Constant bit slice `expr[hi:lo]` over a scalar expression. The
+    /// lowered subset requires literal bounds with `hi >= lo` and emits
+    /// a right-shift plus mask, mirroring v1's scalar slice behavior.
+    BitSlice {
+        target: Box<Expr>,
+        hi: u32,
+        lo: u32,
+    },
     /// Width-method intrinsic (`.trunc<N>()` / `.zext<N>()` /
     /// `.sext<N>()` / `.resize<N>()`), width ≤ 64 in the lowered
     /// subset. `src_width` is the best-effort receiver width inferred
@@ -1669,7 +1720,10 @@ pub enum Expr {
     /// local. Record-valued (allowed wherever a record `Local` is —
     /// notably the `Stmt::Assign` that binds the `for t in <seq>` loop
     /// variable). Emitted as `<seq>[<index>]`.
-    SeqIndex { seq: LocalId, index: Box<Expr> },
+    SeqIndex {
+        seq: LocalId,
+        index: Box<Expr>,
+    },
     Call(CallTarget, Vec<Expr>),
     /// A register-level frontdoor READ on a regblock binding in a
     /// general expression position — `regs.NAME` outside `let`-RHS
@@ -1743,7 +1797,10 @@ pub enum CallTarget {
     /// the user-provided `extern "C"` definition; the forward
     /// declaration is emitted file-scope by `emit_extern_fn_decls`.
     ExternFn(String),
-    TransactorMethod { bus_field: String, method: String },
+    TransactorMethod {
+        bus_field: String,
+        method: String,
+    },
     /// Call a `tseq` generator by name — `let txns = RandomTxns(5)`.
     /// Resolves to the `FunctionKind::Tseq` function of that name; the
     /// result is an `IrType::RecordSeq` assigned into a test-scope local.
@@ -1840,11 +1897,12 @@ pub enum CovTrigger {
 #[derive(Debug, Clone)]
 pub struct CoverPointSchema {
     pub name: String,
-    /// Sampled DUT signal (`cover dut.empty` → port `empty`). Lowering
-    /// restricts targets to direct DUT port reads; the design doc's
-    /// free-form `target: String` is structured here so emission never
-    /// re-parses signal names.
-    pub target: PortRef,
+    /// Sampled expression. The shipped TBIR subset accepts pure DUT
+    /// boundary expressions: direct ports, constant lanes/slices,
+    /// literals, and scalar unary/binary/ternary expressions over those
+    /// leaves. Test-scope locals and helper calls remain out of scope for
+    /// auto-samplers.
+    pub target: Expr,
     pub bins: Vec<CoverBinSchema>,
 }
 

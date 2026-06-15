@@ -1,0 +1,47 @@
+// HARC stimulus bench for CVDP cid012 `cvdp_copilot_gaussian_rounding_div_0014`.
+
+testbench DividerTb
+    dut : divider
+end testbench DividerTb
+
+function run_div(dut: divider, dividend: uint<32>, divisor: uint<32>)
+    dut.dividend = dividend
+    dut.divisor = divisor
+    dut.start = 1
+    wait 1 cycle
+    dut.start = 0
+    wait 40 cycles
+end function run_div
+
+impl DividerTest for DividerTb
+    run
+        log(info, "divider: non-restoring division operation sweep")
+        dut.rst_n = 0
+        dut.start = 0
+        dut.dividend = 0
+        dut.divisor = 1
+        wait 3 cycles
+        dut.rst_n = 1
+
+        run_div(dut, 0, 1)
+        run_div(dut, 1, 1)
+        run_div(dut, 7, 3)
+        run_div(dut, 32, 5)
+        run_div(dut, 0xFFFFFFFF, 0x0000FFFF)
+        run_div(dut, 0x80000000, 3)
+        run_div(dut, 123456789, 97)
+
+        // Hold start high through DONE, then release to IDLE.
+        dut.dividend = 55
+        dut.divisor = 6
+        dut.start = 1
+        wait 42 cycles
+        dut.start = 0
+        wait 3 cycles
+
+        dut.rst_n = 0
+        wait 2 cycles
+        dut.rst_n = 1
+        log(info, "divider stimulus complete")
+    end run
+end impl DividerTest

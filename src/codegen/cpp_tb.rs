@@ -760,10 +760,7 @@ pub fn emit_randomize_snippets(
         e.errors.clear();
         e.emit_randomize_for_site(site, depth);
         if let Some(err) = e.errors.first() {
-            return Err(EmitError(format!(
-                "tbir randomize({}): {err}",
-                site.record
-            )));
+            return Err(EmitError(format!("tbir randomize({}): {err}", site.record)));
         }
         out.push(std::mem::take(&mut e.out));
     }
@@ -5233,7 +5230,11 @@ impl Emitter {
     /// validation, the same solver-policy-field check, and routes to the
     /// same unconstrained-PRNG-shell or `emit_constraint_solver_block`
     /// path — producing byte-identical output to v1 for the site.
-    pub(crate) fn emit_randomize_for_site(&mut self, site: &crate::ir::ConstraintSite, depth: usize) {
+    pub(crate) fn emit_randomize_for_site(
+        &mut self,
+        site: &crate::ir::ConstraintSite,
+        depth: usize,
+    ) {
         let ty = site.record.clone();
         let target = &site.target;
         let combined = &site.constraints;
@@ -5281,7 +5282,7 @@ impl Emitter {
         }
         writeln!(self.out, ");").ok();
         self.pad(depth + 1);
-        writeln!(self.out, "errors++;").ok();
+        writeln!(self.out, "ctx.errors++;").ok();
         self.pad(depth);
         writeln!(self.out, "}}").ok();
     }
@@ -5521,7 +5522,7 @@ impl Emitter {
                     }
                 }
                 self.pad(depth + 2);
-                writeln!(self.out, "errors++;").ok();
+                writeln!(self.out, "ctx.errors++;").ok();
                 self.pad(depth + 1);
                 writeln!(self.out, "}}").ok();
                 self.pad(depth);
@@ -5626,7 +5627,7 @@ impl Emitter {
                 .ok();
                 if severity == "FAIL" {
                     self.pad(depth + 2);
-                    writeln!(self.out, "errors++;").ok();
+                    writeln!(self.out, "ctx.errors++;").ok();
                 }
                 self.pad(depth + 1);
                 writeln!(self.out, "}}").ok();
@@ -5654,7 +5655,7 @@ impl Emitter {
                 .ok();
                 if severity == "FAIL" {
                     self.pad(depth + 2);
-                    writeln!(self.out, "errors++;").ok();
+                    writeln!(self.out, "ctx.errors++;").ok();
                 }
                 self.pad(depth + 1);
                 writeln!(self.out, "}}").ok();
@@ -5674,7 +5675,7 @@ impl Emitter {
                 .ok();
                 if severity == "FAIL" {
                     self.pad(depth + 2);
-                    writeln!(self.out, "errors++;").ok();
+                    writeln!(self.out, "ctx.errors++;").ok();
                 }
                 self.pad(depth + 1);
                 writeln!(self.out, "}}").ok();
@@ -6694,7 +6695,7 @@ impl Emitter {
                 self.pad(depth + 2);
                 writeln!(
                     self.out,
-                    "if (!_tlm_returned) {{ sim_log_line(\"FAIL\", \"target TLM thread bus.{} completed without return\"); errors++; }}",
+                    "if (!_tlm_returned) {{ sim_log_line(\"FAIL\", \"target TLM thread bus.{} completed without return\"); ctx.errors++; }}",
                     method.name.name
                 )
                 .ok();
@@ -7053,7 +7054,7 @@ impl Emitter {
                 self.pad(depth + 2);
                 writeln!(
                     self.out,
-                    "if (!_tlm_returned) {{ sim_log_line(\"FAIL\", \"target TLM thread bus.{} completed without return\"); errors++; }}",
+                    "if (!_tlm_returned) {{ sim_log_line(\"FAIL\", \"target TLM thread bus.{} completed without return\"); ctx.errors++; }}",
                     method.name.name
                 )
                 .ok();
@@ -9112,6 +9113,7 @@ impl Emitter {
     /// check in that case). Recognized shapes:
     ///   - Parenthesized expression → recurse into inner.
     ///   - `<expr> as uint<W>` / `<expr> as sint<W>` → W.
+    ///   - `<expr>[hi:lo]` → `hi - lo + 1` for constant bounds.
     ///   - `<expr>.trunc<W>()` / `.zext<W>()` / `.sext<W>()` / `.resize<W>()`
     ///     → W (the prior width-method's target width).
     ///   - Bare integer literal → minimum unsigned bit-width of the
@@ -9128,6 +9130,11 @@ impl Emitter {
                 } => type_arg_width(args).map(|w| w as u32),
                 _ => None,
             },
+            ExprKind::BitSlice { hi, lo, .. } => {
+                let hi = eval_const_width(hi)?;
+                let lo = eval_const_width(lo)?;
+                (hi >= lo).then_some(hi - lo + 1)
+            }
             ExprKind::Call { callee, args } => {
                 if let ExprKind::Field { name, .. } = &*callee.kind {
                     if Emitter::is_width_method_name(&name.name) {
@@ -10309,7 +10316,7 @@ impl Emitter {
         )
         .ok();
         self.pad(depth + 2);
-        writeln!(self.out, "errors++;").ok();
+        writeln!(self.out, "ctx.errors++;").ok();
         self.pad(depth + 1);
         writeln!(self.out, "}}").ok();
 
@@ -13143,7 +13150,7 @@ impl Emitter {
                 )
                 .ok();
                 self.pad(list_depth + 1);
-                writeln!(self.out, "errors++;").ok();
+                writeln!(self.out, "ctx.errors++;").ok();
                 self.pad(list_depth);
                 writeln!(self.out, "}}").ok();
                 self.pad(list_depth);
@@ -13197,7 +13204,7 @@ impl Emitter {
                         )
                         .ok();
                         self.pad(list_depth + 2);
-                        writeln!(self.out, "errors++;").ok();
+                        writeln!(self.out, "ctx.errors++;").ok();
                         self.pad(list_depth + 1);
                         writeln!(self.out, "}}").ok();
                         self.pad(list_depth + 1);
@@ -13286,7 +13293,7 @@ impl Emitter {
                 )
                 .ok();
                 self.pad(scalar_depth + 1);
-                writeln!(self.out, "errors++;").ok();
+                writeln!(self.out, "ctx.errors++;").ok();
                 self.pad(scalar_depth);
                 writeln!(self.out, "}}").ok();
                 self.pad(scalar_depth);
@@ -13400,7 +13407,7 @@ impl Emitter {
             .ok();
         }
         self.pad(depth + 2);
-        writeln!(self.out, "errors++;").ok();
+        writeln!(self.out, "ctx.errors++;").ok();
         self.pad(depth + 2);
         writeln!(self.out, "return _harc_rt_status;").ok();
         self.pad(depth + 1);
@@ -14458,11 +14465,11 @@ impl Emitter {
         match sev.as_str() {
             "ERROR" => {
                 self.pad(depth);
-                writeln!(self.out, "errors++;").ok();
+                writeln!(self.out, "ctx.errors++;").ok();
             }
             "FATAL" => {
                 self.pad(depth);
-                writeln!(self.out, "errors++; _fatal = true;").ok();
+                writeln!(self.out, "ctx.errors++; _fatal = true;").ok();
             }
             _ => {}
         }
@@ -14840,7 +14847,7 @@ impl Emitter {
                 }
                 writeln!(self.out, ");").ok();
                 self.pad(depth);
-                writeln!(self.out, "errors++;").ok();
+                writeln!(self.out, "ctx.errors++;").ok();
             }
             StmtKind::Assume(v) => {
                 if let Some(expr) = &v.expr {
@@ -15930,7 +15937,7 @@ impl Emitter {
                 writeln!(self.out,
                     "sim_log_line(\"FAIL\", \"bitbash {regname} {pat_label}: wrote 0x%llx, got 0x%llx\", (long long)_bb_pat, (long long)_bb_got);").ok();
                 self.pad(depth + 2);
-                writeln!(self.out, "errors++;").ok();
+                writeln!(self.out, "ctx.errors++;").ok();
                 self.pad(depth + 1);
                 writeln!(self.out, "}}").ok();
                 self.pad(depth);
@@ -16006,7 +16013,7 @@ impl Emitter {
         self.pad(depth + 1);
         writeln!(
             self.out,
-            "if ({regs_var}_cb_depth >= HARC_RAL_CB_MAX_DEPTH) {{ sim_log_line(\"FATAL\", \"RAL record_write callback recursion exceeded HARC_RAL_CB_MAX_DEPTH (%u) on binding `{regs_var}` at addr 0x%llx\", (unsigned)HARC_RAL_CB_MAX_DEPTH, (unsigned long long)_rec_addr); errors++; _fatal = true; }} else {{",
+            "if ({regs_var}_cb_depth >= HARC_RAL_CB_MAX_DEPTH) {{ sim_log_line(\"FATAL\", \"RAL record_write callback recursion exceeded HARC_RAL_CB_MAX_DEPTH (%u) on binding `{regs_var}` at addr 0x%llx\", (unsigned)HARC_RAL_CB_MAX_DEPTH, (unsigned long long)_rec_addr); ctx.errors++; _fatal = true; }} else {{",
         )
         .ok();
         self.pad(depth + 2);

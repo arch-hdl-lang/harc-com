@@ -1,0 +1,59 @@
+// HARC stimulus bench for CVDP cid012 `cvdp_copilot_restoring_division_0034`.
+
+testbench RestoringDivision34Tb
+    let dut : restoring_division
+        probe force present_state_force : uint<1> at present_state
+        probe force next_count_force : uint<3> at next_count
+        probe force count_force : uint<3> at count
+        probe force valid_force : bool at valid
+    end let dut
+end testbench RestoringDivision34Tb
+
+function run_div6_ext(dut: restoring_division, dividend: uint<6>, divisor: uint<6>)
+    dut.dividend = dividend
+    dut.divisor = divisor
+    dut.start = 1
+    wait 1 cycle
+    dut.start = 0
+    wait 12 cycles
+end function run_div6_ext
+
+impl RestoringDivision34Test for RestoringDivision34Tb
+    run
+        log(info, "restoring_division_0034: special cases and iterative division sweep")
+        dut.present_state_force = 0
+        dut.next_count_force = 0
+        dut.count_force = 0
+        dut.valid_force = 0
+        dut.rst = 0
+        dut.start = 0
+        dut.dividend = 0
+        dut.divisor = 1
+        wait 3 cycles
+        dut.rst = 1
+
+        run_div6_ext(dut, 12, 0)
+        run_div6_ext(dut, 0, 5)
+        run_div6_ext(dut, 5, 9)
+        for d in 1 .. 18
+            run_div6_ext(dut, (d * 5) & 0x3F, ((d & 7) + 1))
+        end for
+        for c in 0 .. 8
+            dut.present_state_force = 1
+            dut.next_count_force = c
+            dut.count_force = c
+            dut.valid_force = c == 7
+            dut.dividend = (c * 5) & 0x3F
+            dut.divisor = ((c & 7) + 1)
+            dut.start = 1
+            wait 1 cycle
+        end for
+        run_div6_ext(dut, 63, 1)
+        run_div6_ext(dut, 63, 63)
+
+        dut.rst = 0
+        wait 2 cycles
+        dut.rst = 1
+        log(info, "restoring_division_0034 stimulus complete")
+    end run
+end impl RestoringDivision34Test

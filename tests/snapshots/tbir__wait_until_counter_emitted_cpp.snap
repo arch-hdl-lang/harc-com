@@ -194,7 +194,7 @@ int run_WaitUntilCounterTest(int argc, char** argv) {
                 case 1: {
                     if (!((harc_rt::harc_read(dut->count_out) == 0))) {
                         sim_log_line("FAIL", "after reset: count_out=%lld, expected 0", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->count_out)));
-                        errors++;
+                        ctx.errors++;
                     }
                     harc_rt::harc_assign(dut->rst, 0);
                     harc_rt::harc_assign(dut->en, 1);
@@ -202,19 +202,19 @@ int run_WaitUntilCounterTest(int argc, char** argv) {
                     __t0 = 100;
                     int64_t _wu_budget = (int64_t)(__t0);
                     bool _wu_satisfied = co_await harc_rt::wait_until_timeout(_slot, [&]{ return (harc_rt::harc_read(dut->count_out) == 8); }, (uint32_t)_wu_budget);
-                    if (_wu_satisfied) { __bb = 2; } else { errors++; __bb = 3; }
+                    if (_wu_satisfied) { __bb = 2; } else { ctx.errors++; __bb = 3; }
                     break;
                 }
                 case 2: {
                     if (!((harc_rt::harc_read(dut->count_out) == 8))) {
                         sim_log_line("FAIL", "after wait: count_out=%lld, expected 8", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->count_out)));
-                        errors++;
+                        ctx.errors++;
                     }
                     sim_log_line("INFO", "PASS: count reached 8 (count_out=%lld)", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->count_out)));
                     __t1 = 100;
                     int64_t _wu_budget = (int64_t)(__t1);
                     bool _wu_satisfied = co_await harc_rt::wait_until_timeout(_slot, [&]{ return ((harc_rt::harc_read(dut->count_out) >= 12)) && ((harc_rt::harc_read(dut->en) == 1)); }, (uint32_t)_wu_budget);
-                    if (_wu_satisfied) { __bb = 4; } else { errors++; __bb = 5; }
+                    if (_wu_satisfied) { __bb = 4; } else { ctx.errors++; __bb = 5; }
                     break;
                 }
                 case 3: {
@@ -228,7 +228,7 @@ int run_WaitUntilCounterTest(int argc, char** argv) {
                 case 4: {
                     if (!((harc_rt::harc_read(dut->count_out) >= 12))) {
                         sim_log_line("FAIL", "after all-of wait: count_out=%lld, expected >= 12", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->count_out)));
-                        errors++;
+                        ctx.errors++;
                     }
                     sim_log_line("INFO", "PASS: all-of wait quiesced at count_out=%lld", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->count_out)));
                     __done = true;

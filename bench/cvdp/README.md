@@ -1,4 +1,4 @@
-# CVDP × HARC verification benchmark — Phase 2b-pilot
+# CVDP × HARC verification benchmark — Phase 2b-complete / TBIR validation
 
 A HARC-flavored re-implementation of NVIDIA's CVDP cid012 (testbench-generation)
 scoring loop, using Verilator semantic control coverage in place of Cadence IMC. The
@@ -52,7 +52,7 @@ bench/cvdp/
     │   ├── <dut>.sv                           ← CVDP-provided DUT, unmodified
     │   └── <dut>_top.sv                       ← (auto-generated) clocked wrapper, when needed
     ├── tb/
-    │   └── (empty until a HARC TB is authored)
+    │   └── <bench>.harc                       ← authored HARC TB
     └── build/                                 ← scorer output (gitignored)
 ```
 
@@ -99,7 +99,7 @@ Both TBs cover the semantic control points. The thin TB no longer rejects under
 the corrected metric because its weaker exploration only shows up in toggle
 coverage, which is intentionally excluded from control scoring.
 
-## Phase 2a: full cid012 set extracted (this PR)
+## Phase 2a: full cid012 set extracted
 
 Pulled all 67 cid012 problems from
 [`nvidia/cvdp-benchmark-dataset`](https://huggingface.co/datasets/nvidia/cvdp-benchmark-dataset)
@@ -133,7 +133,13 @@ All three are net-additive to the existing 50-fixture sweep
 ## Phase 2b: authored HARC TB scoreboard (semantic control metric)
 
 All TBs are authored from `prompt.txt` + `dut/<dut>.sv`; the gold SV TBs are
-not materialized on disk. Scores below use the current scorer behavior:
+not materialized on disk. All 67 extracted cid012 problems now have authored
+HARC TBs; the two `cid012_gf_multiplier*` sanity cases remain alongside them.
+The historical score table below records the first 52 authored cases. The
+TBIR validation lane in the next section is the current corpus-level regression
+view across all 69 authored problem directories.
+
+Scores below use the current scorer behavior:
 
 - line coverage comes from LCOV `DA` rows emitted by `verilator_coverage --write-info`;
 - control coverage comes from raw Verilator `coverage.dat` records with `page=v_branch/...`
@@ -204,9 +210,9 @@ then removes known structural holes from Verilator's denominator before scoring.
 
 ### Net scoreboard
 
-**52/52 PASS, 0/52 FAIL** under the semantic control metric plus explicit `.vlt`
-structural waivers. The false failures caused by toggle-as-BRDA accounting are
-removed from the scoreboard:
+**52/52 PASS, 0/52 FAIL** for the original authored tranche under the semantic
+control metric plus explicit `.vlt` structural waivers. The false failures caused
+by toggle-as-BRDA accounting are removed from the scoreboard:
 
 - `adc_data_rotate_0009`: old LCOV-BRDA branch was 85.29%; semantic control is 100.00%.
 - `afi_ptr_0004`: old LCOV-BRDA branch was ~58%; semantic control is 100.00%.
@@ -228,9 +234,102 @@ problem parameters or by source type width:
 - `matrix_multiplier_0022`: default `COL_A=4` makes `MODIFIED_COL_A=4` and
   `HALF_MODIFIED_COL_A=2`, so the generated padding and half-width guard
   expressions have structurally constant subterms.
+- `gf_multiplier_0047`: default `WIDTH=32` makes `WIDTH_VALID` structurally true.
+- `gcd_0028`: default `SIGNED_EN=1` makes the unsigned datapath and comparison
+  branches unreachable.
 - `nbit_swizzling_0009`: 2-bit `sel` covers every explicit case item, making `default` unreachable.
 - `simple_spi_0003`: outer `!i_enable` and `i_fault` priority branches make
   the corresponding subterms of the nested IDLE-state condition unreachable.
+- `vending_machine_0006`: unsigned `item_selected >= 0` is structurally true,
+  and the preceding zero-coins branch makes one subterm of `coins_accumulated > 0`
+  unreachable.
+
+### Phase 2b completion: missing CVDP TBs
+
+The missing authored-TB gap is now closed for these 17 problems:
+
+- `IIR_filter_0012`
+- `binary_search_tree_sorting_0015`
+- `concatenate_0003`
+- `digital_stopwatch_0017`
+- `gaussian_rounding_div_0014`
+- `gcd_0028`
+- `gf_multiplier_0047`
+- `hebbian_rule_0020`
+- `hill_cipher_0012`
+- `microcode_sequencer_0028`
+- `perceptron_0018`
+- `prim_max_0005`
+- `restoring_division_0006`
+- `restoring_division_0034`
+- `secure_read_write_register_bank_0006`
+- `thermostat_0003`
+- `vending_machine_0006`
+
+Validation command:
+
+```bash
+bench/cvdp/suite.py --compare-codegens \
+  --problem cvdp_copilot_IIR_filter_0012 \
+  --problem cvdp_copilot_binary_search_tree_sorting_0015 \
+  --problem cvdp_copilot_concatenate_0003 \
+  --problem cvdp_copilot_digital_stopwatch_0017 \
+  --problem cvdp_copilot_gaussian_rounding_div_0014 \
+  --problem cvdp_copilot_gcd_0028 \
+  --problem cvdp_copilot_gf_multiplier_0047 \
+  --problem cvdp_copilot_hebbian_rule_0020 \
+  --problem cvdp_copilot_hill_cipher_0012 \
+  --problem cvdp_copilot_microcode_sequencer_0028 \
+  --problem cvdp_copilot_perceptron_0018 \
+  --problem cvdp_copilot_prim_max_0005 \
+  --problem cvdp_copilot_restoring_division_0006 \
+  --problem cvdp_copilot_restoring_division_0034 \
+  --problem cvdp_copilot_secure_read_write_register_bank_0006 \
+  --problem cvdp_copilot_thermostat_0003 \
+  --problem cvdp_copilot_vending_machine_0006
+```
+
+Result: **17 pass, 0 fail, 17 total**. Each case passes both `--codegen v1`
+and `--codegen tbir`, and `harc trace-diff` reports no semantic trace mismatch.
+
+### TBIR validation plan and current status
+
+`bench/cvdp/suite.py` is the corpus regression driver. It runs each authored
+problem through `score.py`, records semantic JSONL traces, and can compare the
+v1 and TBIR backends with `harc trace-diff`.
+
+Primary TBIR regression:
+
+```bash
+bench/cvdp/suite.py --compare-codegens
+```
+
+Per-problem iteration:
+
+```bash
+bench/cvdp/suite.py --compare-codegens --problem cvdp_copilot_gray_to_binary_0014
+bench/cvdp/score.py bench/cvdp/<problem-dir> --codegen tbir
+```
+
+By default, the compare lane requires both codegens to reach the same verdict and
+return code, then requires a clean semantic trace diff. Exact line/control counter
+parity is available with `--strict-score`; it is intentionally opt-in because
+backend lowering changes can perturb coverage counters while preserving TB
+behavior. Check-phase assertions, including coverage-hole assertions, are hard
+failures in both backends and increment the framework error counter.
+
+Current full-corpus result: **69 pass, 0 fail, 69 total**. The comparison lane
+is green for every authored CVDP problem:
+
+```bash
+bench/cvdp/suite.py --compare-codegens --out /tmp/cvdp_full_assert_hard
+```
+
+The closing TBIR slices covered expression-backed coverpoints, pure helper
+calls inside formatted messages, typed/wide scalar locals and compares, reused
+randomize snippets with shadowed locals, and the runtime mismatches exposed by
+`MSHR_0003`, `apb_history_shift_register_0003`,
+`binary_search_tree_sorting_0030`, and `single_cycle_arbiter_0004`.
 
 ### Latest auto-coverage stress findings
 
@@ -282,11 +381,11 @@ problem parameters or by source type width:
   AHB wait states, data-phase stalls, and idle/busy/nonseq transfer states.
   This validates HARC's ARCH-shaped multi-clock model on a CVDP bus bridge.
 - `apb_history_shift_register_0003` uses generated `clk` for APB CSR traffic
-  and short wall-time pulses on the event-like `history_shift_valid` input to
-  cover no-op, normal prediction, misprediction-priority restore, full/empty
-  history flags, invalid-address errors, and clock-gated APB no-update cases.
-  This validates mixed generated-clock plus event-edge stimulus without adding
-  a second artificial clock domain.
+  and holds the event-like `history_shift_valid` pulse through a generated-clock
+  sample so check-phase coverage-hole assertions observe the shift bin. It
+  covers no-op, normal prediction, misprediction-priority restore, full/empty
+  history flags, invalid-address errors, and clock-gated APB no-update cases
+  without adding a second artificial clock domain.
 - `events_to_apb_0021` uses directed A/B/C event pulses, simultaneous-priority
   queues, APB wait states, timeout abort, covergroup crosses, and unique
   randomized APB payloads to validate event-to-bus sequencing. The TB exposed
@@ -318,8 +417,9 @@ problem parameters or by source type width:
   clock is run through HARC's default Verilator `--no-timing` path, so the TB
   checks reset/control behavior and records observed receive data rather than
   using event-delay-dependent serial reconstruction as a pass/fail oracle.
-- `restoring_division_0006` is currently not an authored scoreboard case because
-  the DUT does not converge in Verilator at cycle 0, before testbench stimulus.
+- `restoring_division_0006` and `restoring_division_0034` use force probes for
+  the DUT state/count/valid internals to drive the FSM through representative
+  divide transactions despite the source's cycle-0 convergence hazard.
 
 ### Metric caveats
 
@@ -344,27 +444,12 @@ this control score.
   driving DUT ports. This caught and now guards against truncating C++ local
   lowering for explicitly typed wide integer lets.
 
-## Phase 2b-scale (next, NOT in this PR)
+## Phase 2c-analysis / TBIR backlog
 
-Author HARC TBs for the remaining unscored cid012 problems. Realistic
-budget: many sessions. Strategy:
-
-  1. **Group by topology**: process combinational batches together
-     (they're mostly the same pattern: exhaustive sweep + software
-     model), then sequential, then multi-clock.
-  2. **Cap iteration per problem**: 2-3 score-and-iterate cycles
-     before moving on. If a problem stays at ceiling-below-target
-     after exhaustive testing, mark as `unreachable_ceiling` in
-     meta.json and skip further work — those are Phase 2c-analysis
-     fodder, not Phase 2b-scale work.
-  3. **Track patterns**: any HARC language-surface friction that
-     comes up consistently (e.g. missing operators, awkward idioms)
-     becomes a separate "HARC TB ergonomics" workstream.
-
-## Phase 2c-analysis (after 2b-scale)
-
-  - Aggregate Pass@1 across all 67 problems
+  - Aggregate Pass@1 across all 69 authored problems
   - Distinguish "TB-failed" vs "metric-ceiling" failures
+  - Keep the TBIR comparison lane as the corpus regression gate while Phase 2c
+    focuses on score/ceiling analysis rather than backend feature gaps
   - Decide on response: keep strict reporting + caveat about ceiling
     incompatibility, OR build a ceiling-relative threshold (run an
     exhaustive TB first to determine each DUT's reachable max, then
@@ -409,4 +494,7 @@ python3 bench/cvdp/smoke.py
 
 # Author a HARC TB: drop a .harc file into <problem-dir>/tb/, then score
 python3 bench/cvdp/score.py bench/cvdp/<problem-dir>
+
+# Run the authored corpus through the TBIR comparison lane
+bench/cvdp/suite.py --compare-codegens
 ```

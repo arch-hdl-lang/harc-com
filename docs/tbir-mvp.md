@@ -346,7 +346,8 @@ subset. A `watchdog` becomes a zero-arg `ComponentMethod` body (the
 heartbeat statements) plus a `WatchdogSchema` (`period`/`max_idle` clause
 exprs); the tbir backend installs a per-instance `_checkers` closure that
 gates on a `static` last-fire stamp, runs the body, then the idle check
-(`_last_in_cycle`/`_last_out_cycle` ≥ `max_idle` ⇒ `FAIL` + `errors++`).
+(`_last_in_cycle`/`_last_out_cycle` ≥ `max_idle` ⇒ `FAIL` + framework
+error-counter bump).
 An `on <N> cycles` handler lowers the same way (period-gated checker, no
 idle check). `Expr::CycleCount` carries the framework `cycle_count` for
 `${cycle_count}` diagnostics. New fixtures `watchdog_quiesce_test` (pass,
@@ -549,24 +550,17 @@ reason. Code locations are authoritative.
    shape is precisely what lets it skip `lower_coroutine` (no
    relooping needed — `co_await` inside a `switch` is legal C++20).
 
-4. **All locals hoist as `uint64_t`.** `src/codegen/tbir/func.rs`
-   declares every IR local as `uint64_t <name> = 0;` at function top
-   (hoisting is forced by the loop-switch — a local must survive
-   across `case` arms). v1 emits declared-width C types for typed
-   lets (`local_value_c_type`: `uint<75>` → `_harc_u128`, narrow
-   widths → narrow C types) and `int64_t` for untyped integer lets.
-   Two observable deltas follow: (a) a typed narrow local that
-   overflows its declared width truncates on assignment under v1 but
-   not under tbir — **narrowing semantics differ**; (b) untyped lets
-   holding negative intermediates are signed under v1, unsigned under
-   tbir. None of the five fixtures exercises either case, so the
-   behavioral gate cannot see this; it is a known, latent divergence.
-   Fix path: `IrType` already carries `UInt(Option<u32>)` /
-   `SInt(Option<u32>)`; lowering currently leaves locals
-   `IrType::Unknown`. Populating widths at lowering (from `let`
-   type annotations, as v1's `let_widths` pass does) and emitting
-   width-faithful types — or masking at `Assign` — closes it without
-   IR shape changes.
+4. **Typed scalar locals preserve declared storage width.** Earlier
+   MVP snapshots hoisted every IR local as `uint64_t` because the
+   loop-switch backend needs locals to survive across `case` arms. The
+   current lowering seeds `IrType` for explicitly typed scalar `let`s
+   and helper parameters/returns, and the tbir backend emits
+   width-faithful storage for them: `uint64_t` through 64 bits,
+   `_harc_u128` for 65..128 bits, and `HarcWide<N>` beyond that. This
+   keeps CVDP-style packed constants such as `uint<240>` tree vectors
+   intact. Untyped integer lets still use the tbir scalar value model,
+   so sign-sensitive untyped intermediates remain a residual area to
+   cover with focused fixtures if they become observable.
 
 5. **Invariant 8 amended in the verifier.** The design's literal text:
    "No block is empty unless its terminator is `Return` or `Jump`."
@@ -1319,7 +1313,7 @@ reason. Code locations are authoritative.
       each cycle, fires the body when due, then runs the idle check
       (`(cycle_count - _last_in_cycle) >= max_idle` AND likewise
       `_last_out_cycle` ⇒ `sim_log_line("FAIL", "watchdog: <Comp> has been
-      idle for >= %lld cycles", …)` + `errors++`). The period/max_idle
+      idle for >= %lld cycles", …)` + framework error-counter bump). The period/max_idle
       exprs render against the instance path via a new `ECx::self_subst`
       (`SelfField` → instance, since the `_checkers` closure has no `self`
       in scope). **Implementation divergence from v1 only:** v1 emits the
@@ -1327,7 +1321,7 @@ reason. Code locations are authoritative.
       in the checker via a `field_subs`-rewritten period; tbir emits the
       idle check + period gating in the checker (the lowered body holds
       only the user statements). Behavior is identical — same FAIL text,
-      same firing cycles, same `errors++` — verified by trace-diff.
+      same firing cycles, same error-counter bump — verified by trace-diff.
     - *Fixtures* (all `top_counter.sv`, trace-diff clean v1↔tbir at
       seed 1): `watchdog_quiesce_test` (agent + watchdog over a
       record-payload event; never trips — `pass`),
@@ -1411,9 +1405,11 @@ reason. Code locations are authoritative.
       position) does not apply. The inline form fires exactly one bus read
       per textual occurrence — matching v1's read-count semantics (eager
       in conditions, lazy in fail messages, which both backends emit inside
-      the `if (!cond)` branch). Also `Expr::ErrorCount` — a bare `errors`
-      ident (the framework error counter, bumped by `AssertCheck`/error
-      logs), for the trailing `assert errors == 0` after a `bitbash` walk.
+      the `if (!cond)` branch). Also `Expr::ErrorCount` — a bare HARC
+      `errors` ident resolves to the framework error counter (bumped by
+      `AssertCheck`/error logs), for the trailing `assert errors == 0`
+      after a `bitbash` walk. Codegen emits the framework counter directly
+      so a user-local `errors` cannot shadow failure accounting.
     - *`bitbash(regs)`.* Lowered (`try_lower_bitbash`, `regblock.rs`) by
       compile-time unrolling — NO new statement form. For each RW register
       and each pattern (all-ones masked to width, then zero):

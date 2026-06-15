@@ -389,7 +389,11 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             errs.append(&mut e);
         }
     }
-    if errs.is_empty() { Ok(()) } else { Err(errs) }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs)
+    }
 }
 
 pub fn verify_function(prog: &TbProgram, func: &TbFunction) -> Result<(), Vec<VerifyError>> {
@@ -468,7 +472,11 @@ pub fn verify_function(prog: &TbProgram, func: &TbFunction) -> Result<(), Vec<Ve
     // path from entry before its first read. Params count as defined.
     check_def_before_use(func, fid, &reachable, &mut errs);
 
-    if errs.is_empty() { Ok(()) } else { Err(errs) }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs)
+    }
 }
 
 struct Checker<'a> {
@@ -502,7 +510,7 @@ impl Checker<'_> {
                         if let Some(actual) = expr_type(self.func, e) {
                             if *expected != IrType::Unknown
                                 && actual != IrType::Unknown
-                                && *expected != actual
+                                && !assign_compatible(expected, &actual)
                             {
                                 self.errs.push(VerifyError::TypeMismatch {
                                     func: self.fid,
@@ -536,7 +544,12 @@ impl Checker<'_> {
                         });
                     }
                 }
-                Stmt::RecordFieldWrite { local, field, index, value } => {
+                Stmt::RecordFieldWrite {
+                    local,
+                    field,
+                    index,
+                    value,
+                } => {
                     self.check_local(*local);
                     self.check_record_field(*local, field);
                     if let Some(idx) = index {
@@ -544,7 +557,12 @@ impl Checker<'_> {
                     }
                     self.check_expr(value, false, "RecordFieldWrite value");
                 }
-                Stmt::RecordWriteCb { local, field, value, .. } => {
+                Stmt::RecordWriteCb {
+                    local,
+                    field,
+                    value,
+                    ..
+                } => {
                     self.check_local(*local);
                     self.check_record_field(*local, field);
                     self.check_expr(value, false, "RecordWriteCb value");
@@ -577,7 +595,12 @@ impl Checker<'_> {
                     }
                     self.check_fmt_args(args);
                 }
-                Stmt::ScoreboardOp { sb, field, op, nested_path } => {
+                Stmt::ScoreboardOp {
+                    sb,
+                    field,
+                    op,
+                    nested_path,
+                } => {
                     self.check_scoreboard(*sb, field, nested_path.is_some());
                     match op {
                         crate::ir::ScoreboardOp::QueuePush { queue, value } => {
@@ -653,9 +676,7 @@ impl Checker<'_> {
         match &b.terminator {
             Terminator::Branch(c, _, _) => self.check_expr(c, false, "Branch cond"),
             Terminator::WaitCycles(e, _, _) => self.check_expr(e, false, "WaitCycles count"),
-            Terminator::WaitCyclesSync(e, _) => {
-                self.check_expr(e, false, "WaitCycles count")
-            }
+            Terminator::WaitCyclesSync(e, _) => self.check_expr(e, false, "WaitCycles count"),
             Terminator::WaitTimePs(..) => {}
             Terminator::WaitUntil { preds, .. } => {
                 for p in preds {
@@ -681,10 +702,7 @@ impl Checker<'_> {
                         self.errs.push(VerifyError::DanglingConstraintRef {
                             func: self.fid,
                             block: self.bid,
-                            detail: format!(
-                                "target local `{}` is not record-typed",
-                                l.name
-                            ),
+                            detail: format!("target local `{}` is not record-typed", l.name),
                         });
                     }
                 }
@@ -838,8 +856,9 @@ impl Checker<'_> {
             detail,
         };
         let Expr::Call(CallTarget::TransactorMethod { bus_field, method }, args) = call else {
-            self.errs
-                .push(bad("payload is not a TransactorMethod call edge".to_string()));
+            self.errs.push(bad(
+                "payload is not a TransactorMethod call edge".to_string()
+            ));
             return;
         };
         for a in args {
@@ -856,11 +875,7 @@ impl Checker<'_> {
                 .push(bad(format!("owner tb{} does not resolve", owner.0)));
             return;
         };
-        let Some((_, xid)) = tb
-            .transactor_fields
-            .iter()
-            .find(|(f, _)| f == bus_field)
-        else {
+        let Some((_, xid)) = tb.transactor_fields.iter().find(|(f, _)| f == bus_field) else {
             if tb.bus_bindings.iter().any(|b| &b.field == bus_field) {
                 self.errs.push(bad(format!(
                     "`{bus_field}.{method}` names a bus binding but rides a \
@@ -924,13 +939,18 @@ impl Checker<'_> {
                 self.check_expr(b, ports_ok, context);
             }
             Expr::Unary(_, a) => self.check_expr(a, ports_ok, context),
+            Expr::BitSlice { target, .. } => self.check_expr(target, ports_ok, context),
             Expr::Ternary(c, t, e2) => {
                 self.check_expr(c, ports_ok, context);
                 self.check_expr(t, ports_ok, context);
                 self.check_expr(e2, ports_ok, context);
             }
             Expr::WidthCast { inner, .. } => self.check_expr(inner, ports_ok, context),
-            Expr::RecordField { local, field, index } => {
+            Expr::RecordField {
+                local,
+                field,
+                index,
+            } => {
                 self.check_local(*local);
                 self.check_record_field(*local, field);
                 if let Some(idx) = index {
@@ -964,7 +984,12 @@ impl Checker<'_> {
             // Idle predicate: the base/kind are resolved at lowering; only
             // the threshold sub-expression carries verifiable structure.
             Expr::ComponentIdle { n, .. } => self.check_expr(n, ports_ok, context),
-            Expr::ScoreboardQuery { sb, field, query, nested_path } => {
+            Expr::ScoreboardQuery {
+                sb,
+                field,
+                query,
+                nested_path,
+            } => {
                 self.check_scoreboard(*sb, field, nested_path.is_some());
                 match query {
                     crate::ir::ScoreboardQuery::Scalar { scalar } => {
@@ -1096,9 +1121,34 @@ impl Checker<'_> {
 fn expr_type(func: &TbFunction, e: &Expr) -> Option<IrType> {
     match e {
         Expr::Literal { ty, .. } => Some(ty.clone()),
+        Expr::WideLiteral(words) => Some(IrType::UInt(Some(wide_literal_bits(words)))),
         Expr::Local(l) => func.locals.get(l.index()).map(|t| t.ty.clone()),
+        Expr::BitSlice { hi, lo, .. } => Some(IrType::UInt(Some(hi - lo + 1))),
+        Expr::WidthCast { kind, width, .. } => Some(match kind {
+            crate::ir::WidthCastKind::Sext => IrType::SInt(Some(*width)),
+            _ => IrType::UInt(Some(*width)),
+        }),
         _ => None,
     }
+}
+
+fn assign_compatible(expected: &IrType, actual: &IrType) -> bool {
+    if expected == actual {
+        return true;
+    }
+    match (expected, actual) {
+        (IrType::UInt(Some(ew)), IrType::UInt(Some(aw)))
+        | (IrType::SInt(Some(ew)), IrType::SInt(Some(aw))) => aw <= ew,
+        (IrType::UInt(Some(ew)), IrType::Bool) | (IrType::SInt(Some(ew)), IrType::Bool) => *ew >= 1,
+        _ => false,
+    }
+}
+
+fn wide_literal_bits(words: &[u32]) -> u32 {
+    let Some((idx, word)) = words.iter().enumerate().rev().find(|(_, w)| **w != 0) else {
+        return 1;
+    };
+    (idx as u32) * 32 + (32 - word.leading_zeros())
 }
 
 /// Invariant 4 — iterative forward dataflow over "definitely defined"
@@ -1195,7 +1245,11 @@ fn check_def_before_use(
                         acc[i] = acc[i] && out[i];
                     }
                 }
-                if !any { vec![false; nlocals] } else { acc }
+                if !any {
+                    vec![false; nlocals]
+                } else {
+                    acc
+                }
             };
             if new_in != ins[bi] {
                 ins[bi] = new_in;
@@ -1427,6 +1481,7 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
             for_each_local(b, f);
         }
         Expr::Unary(_, a) => for_each_local(a, f),
+        Expr::BitSlice { target, .. } => for_each_local(target, f),
         Expr::Ternary(c, t, e) => {
             for_each_local(c, f);
             for_each_local(t, f);

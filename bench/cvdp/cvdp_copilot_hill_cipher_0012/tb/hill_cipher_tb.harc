@@ -1,0 +1,51 @@
+// HARC stimulus bench for CVDP cid012 `cvdp_copilot_hill_cipher_0012`.
+//
+// Pulses start through the IDLE/COMPUTE/COMPUTE_MOD/DONE FSM for varied
+// plaintext/key matrices, plus reset and idle no-start cycles.
+
+testbench HillCipherTb
+    dut : hill_cipher
+end testbench HillCipherTb
+
+function run_block(dut: hill_cipher, text: uint<15>, key: uint<45>)
+    dut.plaintext = text
+    dut.key = key
+    dut.start = 1
+    wait 1 cycle
+    dut.start = 0
+    wait 5 cycles
+end function run_block
+
+impl HillCipherTest for HillCipherTb
+    run
+        log(info, "hill_cipher: FSM start/done and matrix input sweep")
+
+        dut.reset = 1
+        dut.start = 0
+        dut.plaintext = 0
+        dut.key = 0
+        wait 3 cycles
+        dut.reset = 0
+        wait 2 cycles
+
+        // Idle cycles with start low.
+        wait 3 cycles
+
+        run_block(dut, 0, 0)
+        run_block(dut, 0x4210, 0x000108421)
+        run_block(dut, 0x7FFF, 0x1FFFFFFFFFFF)
+        run_block(dut, 0x1234, 0x010842108421)
+        run_block(dut, 0x6B5A, 0x07C1F07C1F0)
+
+        for k in 0 .. 16
+            let text : uint<15> = ((k * 997) & 0x7FFF)
+            let key : uint<45> = ((k * 0x111111111) & 0x1FFFFFFFFFFF)
+            run_block(dut, text, key)
+        end for
+
+        dut.reset = 1
+        wait 2 cycles
+        dut.reset = 0
+        log(info, "hill_cipher stimulus complete")
+    end run
+end impl HillCipherTest
