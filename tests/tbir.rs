@@ -2792,6 +2792,20 @@ fn tlm_blocking_bus_emitted_cpp_snapshot() {
     );
 }
 
+/// Locks the emitted C++ for a blocking RHS-fork TLM issue: unlike the OOO
+/// path, the request side must still wait for `req_ready` before the trailing
+/// accept-edge tick and `req_valid` deassert.
+#[test]
+fn tlm_blocking_fork_bus_emitted_cpp_snapshot() {
+    let text = emit_fixture_cpp("tlm_method_blocking_fork_bus_test.harc");
+    assert!(
+        text.contains("while (!dut->mem_read_req_ready && _b > 0)")
+            && text.contains("// join_all bus.read response"),
+        "blocking fork must preserve the req_ready wait path:\n{text}"
+    );
+    insta::assert_snapshot!("tlm_blocking_fork_bus_emitted_cpp", text);
+}
+
 const SEND_RECV_SRC: &str = r#"
 bus PingBus
     handshake_channel tx: send kind: valid_ready
