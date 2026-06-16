@@ -1,0 +1,19 @@
+fsm Lz4Ctrl
+  port clk: in Clock<SysDomain>;
+  port rst: in Reset<Sync>;
+  port in_valid: in Bool;
+  port in_ready: out Bool comb_dep_on();
+  port in_data: in UInt<8>;
+  port in_last: in Bool;
+  port out_valid: out Bool comb_dep_on();
+  port out_ready: in Bool;
+  port out_data: out UInt<8> comb_dep_on(hist_rd_rdata);
+  port out_last: out Bool comb_dep_on();
+  port busy: out Bool comb_dep_on();
+  port hist_rd_en: out Bool comb_dep_on();
+  port hist_rd_addr: out UInt<16> comb_dep_on();
+  port hist_rd_rdata: in UInt<8>;
+  port hist_wr_en: out Bool comb_dep_on(in_valid, out_ready);
+  port hist_wr_addr: out UInt<16> comb_dep_on();
+  port hist_wr_wdata: out UInt<8> comb_dep_on(hist_rd_rdata, in_data);
+end fsm Lz4Ctrl

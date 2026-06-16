@@ -161,3 +161,4 @@ dma_engine_test | DmaEngine | dma_engine.sv | - | pass
 scoreboard_typed_queue_test | ScoreboardTypedQueue | scoreboard_typed_queue.sv | - | pass
 axilite_env_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 post_eval_provider_test | PostEvalProvider | post_eval_provider.sv | - | pass
+lz4_decomp_test | Lz4Decomp | Lz4Decomp.sv HistRam.sv Lz4Ctrl.sv | Lz4Decomp.arch | pass

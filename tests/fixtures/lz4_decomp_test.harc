@@ -1,0 +1,144 @@
+// LZ4 block decompressor HARC testbench.
+//
+// DUT: Lz4Decomp (arch-com/tests/lz4_decomp/)
+//   Integrates Lz4Ctrl (11-state FSM) + HistRam (64KB history buffer).
+//   AXI-S byte-stream in (compressed) → AXI-S byte-stream out (decompressed).
+//   out_last is asserted on the final decompressed byte of each block.
+//
+// Test 1: pure_literals — token(0x50) LL=5 + 5 literal bytes.
+//   Compressed (6 bytes): 0x50 0x01 0x02 0x03 0x04 0x05
+//   in_last on last literal (0x05). out_last on last output byte (0x05).
+//
+// Test 2: literals_plus_match — 4 literals + 4-byte match copy.
+//   Compressed (7 bytes): 0x40 0x11 0x22 0x33 0x44 0x04 0x00
+//   Token 0x40 → LL=4, MB=0 → match_len=4. Offset LE16 = 4 → copies from
+//   history position 0.  in_last on offset_hi (0x00); last_r is set before
+//   any match byte is emitted, so MatSend asserts out_last on byte 8.
+//
+// Protocol notes
+// ──────────────
+//   lz4_send  : polls in_ready (absorbs routing cycles like TkDec with no
+//               I/O), then drives the byte and advances one cycle.
+//   lz4_recv  : polls out_valid (absorbs MatRdIssue's 1-cycle latency),
+//               verifies out_data (and optionally out_last), advances one
+//               cycle to consume the handshake (out_ready=1 is permanent).
+//   The two helpers alternate cleanly because LitCons (in_ready=1) and
+//   LitSend (out_valid=1) are adjacent non-overlapping states.
+
+domain SysDomain
+  freq_mhz: 200
+end domain SysDomain
+
+// Drive one compressed byte. Polls in_ready until the DUT is accepting
+// input; the while loop absorbs idle routing cycles (e.g. TkDec, MatRdIssue).
+function lz4_send(dut: Lz4Decomp, data: uint<8>, is_last: uint<8>)
+    let w = 0
+    while dut.in_ready == 0 && w < 200
+        wait 1 cycle
+        w = w + 1
+    end while
+    assert dut.in_ready == 1
+        else fail("lz4_send: in_ready stuck low after ${w} cycles (data=0x${data:02x})")
+    dut.in_data  = data
+    dut.in_last  = is_last
+    dut.in_valid = 1
+    wait 1 cycle
+    dut.in_valid = 0
+    dut.in_last  = 0
+end function lz4_send
+
+// Capture one decompressed output byte. Polls out_valid to absorb 1-cycle
+// RAM-read latency in MatRdIssue; verifies data value. When check_last=1,
+// also asserts out_last. Advances one cycle to consume the AXI-S handshake
+// (out_ready is held permanently at 1 by the testbench).
+function lz4_recv(dut: Lz4Decomp, expected: uint<8>, check_last: uint<8>)
+    let w = 0
+    while dut.out_valid == 0 && w < 200
+        wait 1 cycle
+        w = w + 1
+    end while
+    assert dut.out_valid == 1
+        else fail("lz4_recv: out_valid stuck low after ${w} cycles (expected=0x${expected:02x})")
+    assert dut.out_data == expected
+        else fail("lz4_recv: out_data=0x${dut.out_data:02x}, expected=0x${expected:02x}")
+    if check_last == 1
+        assert dut.out_last == 1
+            else fail("lz4_recv: out_last not set on last byte (data=0x${dut.out_data:02x})")
+    end if
+    wait 1 cycle
+end function lz4_recv
+
+testbench Lz4DecompTb
+    dut : Lz4Decomp
+end testbench Lz4DecompTb
+
+impl Lz4DecompTest for Lz4DecompTb
+    run
+        // ── Reset ─────────────────────────────────────────────────────
+        dut.rst       = 1
+        dut.in_valid  = 0
+        dut.in_data   = 0
+        dut.in_last   = 0
+        dut.out_ready = 1
+        wait 4 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // ── Test 1: pure_literals ──────────────────────────────────────
+        // Compressed: 0x50  0x01  0x02  0x03  0x04  0x05
+        // Token 0x50 → LL=5, MB=0 (no match). Expected: [0x01..0x05].
+        log(info, "=== Test 1: pure_literals ===")
+
+        lz4_send(dut, 0x50, 0)     // token (LL=5)
+        // DUT: TkWait → TkDec → LitCons. lz4_send absorbs TkDec.
+        lz4_send(dut, 0x01, 0)
+        lz4_recv(dut, 0x01, 0)
+        lz4_send(dut, 0x02, 0)
+        lz4_recv(dut, 0x02, 0)
+        lz4_send(dut, 0x03, 0)
+        lz4_recv(dut, 0x03, 0)
+        lz4_send(dut, 0x04, 0)
+        lz4_recv(dut, 0x04, 0)
+        lz4_send(dut, 0x05, 1)     // last compressed byte
+        lz4_recv(dut, 0x05, 1)     // out_last must be set here
+
+        log(info, "PASS: pure_literals — 5/5 bytes correct, out_last seen")
+
+        // ── Reset between tests ────────────────────────────────────────
+        dut.rst = 1
+        wait 4 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // ── Test 2: literals_plus_match ────────────────────────────────
+        // Compressed: 0x40  0x11  0x22  0x33  0x44  0x04  0x00
+        // Token 0x40 → LL=4, MB=0 → match_len=4.
+        // Offset LE16: 0x0004 → copies 4 bytes from history[0..3].
+        // in_last on offset_hi (0x00): last_r=1 before match output,
+        // so MatSend asserts out_last on the 4th (final) match byte.
+        log(info, "=== Test 2: literals_plus_match ===")
+
+        lz4_send(dut, 0x40, 0)     // token (LL=4, MB=0)
+        // 4 literal bytes: each sends to LitCons, receives from LitSend.
+        lz4_send(dut, 0x11, 0)
+        lz4_recv(dut, 0x11, 0)
+        lz4_send(dut, 0x22, 0)
+        lz4_recv(dut, 0x22, 0)
+        lz4_send(dut, 0x33, 0)
+        lz4_recv(dut, 0x33, 0)
+        lz4_send(dut, 0x44, 0)
+        lz4_recv(dut, 0x44, 0)     // out_last=0 (last_r still false)
+        // Offset bytes: consumed in OffLoWait and OffHiWait.
+        lz4_send(dut, 0x04, 0)     // offset low
+        lz4_send(dut, 0x00, 1)     // offset high (last compressed byte)
+        // DUT: MatRdIssue (1 cycle latency) then MatSend ×4.
+        lz4_recv(dut, 0x11, 0)     // match byte 1
+        lz4_recv(dut, 0x22, 0)     // match byte 2
+        lz4_recv(dut, 0x33, 0)     // match byte 3
+        lz4_recv(dut, 0x44, 1)     // match byte 4 — out_last must be set
+
+        log(info, "PASS: literals_plus_match — 8/8 bytes correct, out_last seen")
+
+        log(info, "ALL TESTS PASSED")
+    end run
+end impl Lz4DecompTest

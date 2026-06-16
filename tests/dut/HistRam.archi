@@ -1,0 +1,5 @@
+ram HistRam
+  kind simple_dual;
+  latency 1;
+  port clk: in Clock<SysDomain>;
+end ram HistRam
