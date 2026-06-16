@@ -115,13 +115,13 @@ enum Cmd {
         /// binary; `test` requires `--test` and compiles only that test.
         #[arg(long, value_enum, default_value_t = CompileScope::Suite)]
         compile_scope: CompileScope,
-        /// C++ emitter selection. `v1` (default) is the legacy direct
-        /// AST → C++ path; `tbir` routes through the typed TB-IR
-        /// (lower → verify → emit). `tbir` covers the MVP statement
-        /// subset and rejects everything else with a structured error.
-        /// Not combinable with `--mt`, `--cpp-split tests`, or
-        /// `--check-backends`.
-        #[arg(long, value_enum, default_value_t = CodegenKind::V1)]
+        /// C++ emitter selection. `tbir` is the default typed TB-IR
+        /// pipeline (lower → verify → emit); `v1` remains the legacy
+        /// direct AST → C++ escape hatch. `tbir` covers the MVP
+        /// statement subset and rejects everything else with a
+        /// structured error. Not combinable with `--mt`, `--cpp-split
+        /// tests`, or `--check-backends`.
+        #[arg(long, value_enum, default_value_t = CodegenKind::Tbir)]
         codegen: CodegenKind,
         /// Split generated C++ output. `tests` writes one dispatcher plus
         /// grouped C++ translation units for the tests so Verilator can
@@ -2032,19 +2032,15 @@ fn cmd_sim(
     // the same flags via Verilator's `-CFLAGS`/`-LDFLAGS`.) The "-O2 -flto"
     // base mirrors `arch sim`'s own `ARCH_OPT` default so we don't drop its
     // optimization flags when `ARCH_OPT` is unset; an env-set `ARCH_OPT` is
-    // preserved and extended.
+    // preserved and extended. On GNU linkers, force `-lz3` live even though
+    // `arch sim` places `ARCH_OPT` before the generated objects.
     if uses_solver {
         ensure_z3_for_solver(&z3_paths)?;
         if let (Some(inc), Some(lib)) = (&z3_paths.include_dir, &z3_paths.lib_dir) {
             let base = std::env::var("ARCH_OPT").unwrap_or_else(|_| "-O2 -flto".to_string());
             cmd.env(
                 "ARCH_OPT",
-                format!(
-                    "{base} -I{} -L{} -Wl,-rpath,{} -lz3",
-                    inc.display(),
-                    lib.display(),
-                    lib.display()
-                ),
+                arch_opt_with_solver_z3(&base, inc, lib, cfg!(target_os = "linux")),
             );
         }
     }
@@ -2201,6 +2197,20 @@ fn cmd_sim_check_backends(
             sv_trace.display()
         ))
     }
+}
+
+fn arch_opt_with_solver_z3(base: &str, inc: &Path, lib: &Path, force_no_as_needed: bool) -> String {
+    let z3_link = if force_no_as_needed {
+        "-Wl,--no-as-needed -lz3 -Wl,--as-needed"
+    } else {
+        "-lz3"
+    };
+    format!(
+        "{base} -I{} -L{} -Wl,-rpath,{} {z3_link}",
+        inc.display(),
+        lib.display(),
+        lib.display()
+    )
 }
 
 #[cfg(test)]
@@ -2456,5 +2466,51 @@ mod tests {
         "#;
         let path = PathBuf::from("narrow_ok.harc");
         validate_check_backend_codegen_limitations(&path, src).unwrap();
+    }
+
+    #[test]
+    fn sim_cli_defaults_to_tbir_codegen() {
+        let cli = Cli::parse_from(["harc", "sim", "--dut", "dut.arch", "tb.harc"]);
+        let Cmd::Sim { codegen, .. } = cli.cmd else {
+            panic!("expected sim command");
+        };
+        assert_eq!(codegen, CodegenKind::Tbir);
+    }
+
+    #[test]
+    fn sim_cli_keeps_explicit_v1_override() {
+        let cli = Cli::parse_from([
+            "harc",
+            "sim",
+            "--dut",
+            "dut.arch",
+            "--codegen",
+            "v1",
+            "tb.harc",
+        ]);
+        let Cmd::Sim { codegen, .. } = cli.cmd else {
+            panic!("expected sim command");
+        };
+        assert_eq!(codegen, CodegenKind::V1);
+    }
+
+    #[test]
+    fn arch_opt_solver_flags_force_live_z3_when_requested() {
+        let inc = Path::new("/opt/z3/include");
+        let lib = Path::new("/opt/z3/lib");
+        let flags = arch_opt_with_solver_z3("-O2 -flto", inc, lib, true);
+        assert!(flags.contains("-Wl,--no-as-needed -lz3 -Wl,--as-needed"));
+        assert!(flags.contains("-I/opt/z3/include"));
+        assert!(flags.contains("-L/opt/z3/lib"));
+        assert!(flags.contains("-Wl,-rpath,/opt/z3/lib"));
+    }
+
+    #[test]
+    fn arch_opt_solver_flags_keep_plain_link_on_non_gnu_path() {
+        let inc = Path::new("/opt/z3/include");
+        let lib = Path::new("/opt/z3/lib");
+        let flags = arch_opt_with_solver_z3("-O2 -flto", inc, lib, false);
+        assert!(flags.ends_with(" -lz3"));
+        assert!(!flags.contains("--no-as-needed"));
     }
 }
