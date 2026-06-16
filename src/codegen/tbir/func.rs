@@ -1152,20 +1152,33 @@ fn emit_tlm_fork(
         tag_arg.as_deref(),
     );
     writeln!(out, "{pad}{} = 1;", wire("req_valid")).ok();
-    // Present the request (valid + tag + payload) for exactly the
-    // acceptance cycle, then deassert. An out-of-order target accepts
-    // combinationally — `req_ready` is high while the addressed tag's slot
-    // is idle and drops the same posedge the request is latched. We must
-    // NOT spin on `req_ready` before advancing: the DUT mirror has not
-    // re-evaluated with the just-written `req_tag`, so `req_ready` still
-    // reflects the *previous* tag (a now-busy slot) — a stale 0 that would
-    // hold `req_valid` asserted through a `valid && !ready` window and drop
-    // it while the slot is busy, tripping the DUT's `_auto_tlm_*_req_stable`
-    // handshake assertion. Advancing exactly one cycle spans the accept
-    // edge with the new tag/payload held stable; deasserting the next cycle
-    // keeps the request out of any stalled window. (Mirrors v1's
-    // `try_emit_bus_tlm_fork`; response drained at join_all.)
-    writeln!(out, "{pad}co_await harc_rt::wait_cycles(_slot, 1);").ok();
+    if desc.tag.is_some() {
+        // Present the request (valid + tag + payload) for exactly the
+        // acceptance cycle, then deassert. An out-of-order target accepts
+        // combinationally — `req_ready` is high while the addressed tag's slot
+        // is idle and drops the same posedge the request is latched. We must
+        // NOT spin on `req_ready` before advancing: the DUT mirror has not
+        // re-evaluated with the just-written `req_tag`, so `req_ready` still
+        // reflects the *previous* tag (a now-busy slot) — a stale 0 that would
+        // hold `req_valid` asserted through a `valid && !ready` window and drop
+        // it while the slot is busy, tripping the DUT's `_auto_tlm_*_req_stable`
+        // handshake assertion. Advancing exactly one cycle spans the accept
+        // edge with the new tag/payload held stable; deasserting the next cycle
+        // keeps the request out of any stalled window. (Mirrors v1's
+        // `try_emit_bus_tlm_fork`; response drained at join_all.)
+        writeln!(out, "{pad}co_await harc_rt::wait_cycles(_slot, 1);").ok();
+    } else {
+        // Blocking forks still need the legacy ready-wait: unlike tagged OOO
+        // lanes, a blocking target may legitimately hold req_ready low for
+        // multiple cycles before accepting the request.
+        writeln!(
+            out,
+            "{pad}{{ int _b = 16; while (!{} && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}",
+            wire("req_ready")
+        )
+        .ok();
+        writeln!(out, "{pad}co_await harc_rt::wait_cycles(_slot, 1);").ok();
+    }
     writeln!(out, "{pad}{} = 0;", wire("req_valid")).ok();
     Ok(())
 }

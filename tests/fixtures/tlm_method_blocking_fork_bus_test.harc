@@ -1,0 +1,39 @@
+// Blocking-only RHS-fork bus `tlm_method` test.
+//
+// Unlike tagged `out_of_order` forks, a blocking target may hold
+// `req_ready` low for multiple cycles before acceptance, so the emitted
+// request side must retain the legacy ready-wait before dropping
+// `req_valid`.
+
+bus TlmMemBlockingForkBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmMemBlockingForkBus
+
+testbench TlmMethodBlockingForkBusTb
+    dut : TlmMemory
+end testbench TlmMethodBlockingForkBusTb
+
+impl TlmMethodBlockingForkBusTest for TlmMethodBlockingForkBusTb
+    let mem : TlmMemBlockingForkBus = bind dut
+
+    run
+        dut.rst = 1
+        dut.mem_read_req_valid = 0
+        dut.mem_read_rsp_ready = 0
+        dut.mem_read_ooo_req_valid = 0
+        dut.mem_read_ooo_rsp_ready = 0
+        dut.mem_poke_req_valid = 0
+        dut.mem_poke_rsp_ready = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        let forked = fork mem.read(5)
+        join_all
+
+        assert forked == 261
+            else fail("forked blocking read got 0x${forked:08x}, expected 0x00000105")
+
+        log(info, "PASS: blocking fork bus tlm_method read")
+    end run
+end impl TlmMethodBlockingForkBusTest
