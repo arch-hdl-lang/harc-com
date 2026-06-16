@@ -115,14 +115,14 @@ enum Cmd {
         /// binary; `test` requires `--test` and compiles only that test.
         #[arg(long, value_enum, default_value_t = CompileScope::Suite)]
         compile_scope: CompileScope,
-        /// C++ emitter selection. `tbir` is the default typed TB-IR
-        /// pipeline (lower → verify → emit); `v1` remains the legacy
-        /// direct AST → C++ escape hatch. `tbir` covers the MVP
-        /// statement subset and rejects everything else with a
-        /// structured error. Not combinable with `--mt`, `--cpp-split
-        /// tests`, or `--check-backends`.
-        #[arg(long, value_enum, default_value_t = CodegenKind::Tbir)]
-        codegen: CodegenKind,
+        /// C++ emitter selection. Defaults to `tbir` for normal sim/build
+        /// and to `v1` for `--check-backends` until that mode supports
+        /// TB-IR. `v1` remains the legacy direct AST → C++ escape hatch.
+        /// `tbir` covers the MVP statement subset and rejects everything
+        /// else with a structured error. Not combinable with `--mt`,
+        /// `--cpp-split tests`, or `--check-backends`.
+        #[arg(long, value_enum)]
+        codegen: Option<CodegenKind>,
         /// Split generated C++ output. `tests` writes one dispatcher plus
         /// grouped C++ translation units for the tests so Verilator can
         /// compile generated HARC test objects independently.
@@ -448,6 +448,7 @@ fn main() -> Result<()> {
                     include_dir: z3_include_dir.clone(),
                     lib_dir: z3_lib_dir.clone(),
                 };
+                let codegen = effective_codegen(codegen, check_backends);
                 if check_backends && codegen == CodegenKind::Tbir {
                     return Err(miette::miette!(
                         "--check-backends is not supported with --codegen tbir yet; \
@@ -2199,6 +2200,14 @@ fn cmd_sim_check_backends(
     }
 }
 
+fn effective_codegen(codegen: Option<CodegenKind>, check_backends: bool) -> CodegenKind {
+    codegen.unwrap_or(if check_backends {
+        CodegenKind::V1
+    } else {
+        CodegenKind::Tbir
+    })
+}
+
 fn arch_opt_with_solver_z3(base: &str, inc: &Path, lib: &Path, force_no_as_needed: bool) -> String {
     let z3_link = if force_no_as_needed {
         "-Wl,--no-as-needed -lz3 -Wl,--as-needed"
@@ -2474,7 +2483,25 @@ mod tests {
         let Cmd::Sim { codegen, .. } = cli.cmd else {
             panic!("expected sim command");
         };
-        assert_eq!(codegen, CodegenKind::Tbir);
+        assert_eq!(effective_codegen(codegen, false), CodegenKind::Tbir);
+    }
+
+    #[test]
+    fn sim_cli_check_backends_defaults_to_v1_codegen() {
+        let cli = Cli::parse_from([
+            "harc",
+            "sim",
+            "--check-backends",
+            "--dut",
+            "dut.arch",
+            "--sv",
+            "dut.sv",
+            "tb.harc",
+        ]);
+        let Cmd::Sim { codegen, .. } = cli.cmd else {
+            panic!("expected sim command");
+        };
+        assert_eq!(effective_codegen(codegen, true), CodegenKind::V1);
     }
 
     #[test]
@@ -2491,7 +2518,27 @@ mod tests {
         let Cmd::Sim { codegen, .. } = cli.cmd else {
             panic!("expected sim command");
         };
-        assert_eq!(codegen, CodegenKind::V1);
+        assert_eq!(effective_codegen(codegen, false), CodegenKind::V1);
+    }
+
+    #[test]
+    fn sim_cli_preserves_explicit_tbir_for_check_backends_guard() {
+        let cli = Cli::parse_from([
+            "harc",
+            "sim",
+            "--check-backends",
+            "--dut",
+            "dut.arch",
+            "--sv",
+            "dut.sv",
+            "--codegen",
+            "tbir",
+            "tb.harc",
+        ]);
+        let Cmd::Sim { codegen, .. } = cli.cmd else {
+            panic!("expected sim command");
+        };
+        assert_eq!(effective_codegen(codegen, true), CodegenKind::Tbir);
     }
 
     #[test]
