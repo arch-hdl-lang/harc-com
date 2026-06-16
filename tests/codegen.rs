@@ -129,6 +129,31 @@ end test T"#,
 }
 
 #[test]
+fn blocking_fork_tlm_method_keeps_req_ready_wait() {
+    let parsed = parse_source(
+        r#"bus B
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus B
+
+test T
+    let dut : SomeDut
+    let b : B = bind dut
+    run
+        let later = fork b.read(4)
+        join_all
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("while (!dut->b_read_req_ready && _b > 0)")
+            && cpp.contains("// join_all bus.read response"),
+        "blocking fork must preserve the req_ready wait path:\n{cpp}"
+    );
+}
+
+#[test]
 fn runtime_random_problem_table_emits_without_switching_solver_path() {
     let src = r#"
 transaction Req
