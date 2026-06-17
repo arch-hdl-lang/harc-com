@@ -70,46 +70,45 @@ end covergroup EncCov
 testbench Encoder8b10bTb
     dut : encoder_8b10b_top
     cov : EncCov
+
+    function reset_encoder()
+        dut.reset_in = 1
+        dut.control_in = 0
+        dut.disparity_data_in = 0
+        dut.encoder_in = 0
+        wait 3 cycles
+        assert dut.encoder_out == 0 else fail("reset: encoder_out expected zero")
+        dut.reset_in = 0
+        wait 1 cycle
+    end function reset_encoder
+    function drive_symbol(symbol: uint<8>, control: bool, rd: bool)
+        dut.encoder_in = symbol
+        dut.control_in = control
+        dut.disparity_data_in = rd
+        wait 2 cycles
+    end function drive_symbol
 end testbench Encoder8b10bTb
-
-function reset_encoder(dut: encoder_8b10b_top)
-    dut.reset_in = 1
-    dut.control_in = 0
-    dut.disparity_data_in = 0
-    dut.encoder_in = 0
-    wait 3 cycles
-    assert dut.encoder_out == 0 else fail("reset: encoder_out expected zero")
-    dut.reset_in = 0
-    wait 1 cycle
-end function reset_encoder
-
-function drive_symbol(dut: encoder_8b10b_top, symbol: uint<8>, control: bool, rd: bool)
-    dut.encoder_in = symbol
-    dut.control_in = control
-    dut.disparity_data_in = rd
-    wait 2 cycles
-end function drive_symbol
 
 impl Encoder8b10bTest for Encoder8b10bTb
     run
         log(info, "encoder_8b10b: exhaustive data, control symbols, disparity, and unique random traffic")
 
-        reset_encoder(dut)
+        reset_encoder()
 
         // Valid control symbols, repeated with enough cycles to toggle the
         // control-path running-disparity FSM.
-        drive_symbol(dut, 0x1C, true, false)
-        drive_symbol(dut, 0x3C, true, false)
-        drive_symbol(dut, 0x5C, true, false)
-        drive_symbol(dut, 0x7C, true, false)
-        drive_symbol(dut, 0x9C, true, false)
-        drive_symbol(dut, 0xBC, true, false)
-        drive_symbol(dut, 0xDC, true, false)
-        drive_symbol(dut, 0xFC, true, false)
-        drive_symbol(dut, 0xF7, true, false)
-        drive_symbol(dut, 0xFB, true, false)
-        drive_symbol(dut, 0xFD, true, false)
-        drive_symbol(dut, 0xFE, true, false)
+        drive_symbol(0x1C, true, false)
+        drive_symbol(0x3C, true, false)
+        drive_symbol(0x5C, true, false)
+        drive_symbol(0x7C, true, false)
+        drive_symbol(0x9C, true, false)
+        drive_symbol(0xBC, true, false)
+        drive_symbol(0xDC, true, false)
+        drive_symbol(0xFC, true, false)
+        drive_symbol(0xF7, true, false)
+        drive_symbol(0xFB, true, false)
+        drive_symbol(0xFD, true, false)
+        drive_symbol(0xFE, true, false)
         // Target the control running-disparity no-toggle branch while already
         // in RD_PLUS. Single-cycle staging matters because the control path
         // evaluates the previously registered symbol.
@@ -120,43 +119,43 @@ impl Encoder8b10bTest for Encoder8b10bTb
         dut.encoder_in = 0x1C
         dut.control_in = 1
         wait 2 cycles
-        drive_symbol(dut, 0x1C, true, false)
-        drive_symbol(dut, 0x3C, true, false)
+        drive_symbol(0x1C, true, false)
+        drive_symbol(0x3C, true, false)
 
         // Invalid control symbols hit the default control-code branch.
-        drive_symbol(dut, 0x00, true, false)
-        drive_symbol(dut, 0x55, true, false)
-        drive_symbol(dut, 0xAA, true, false)
-        drive_symbol(dut, 0xFF, true, false)
+        drive_symbol(0x00, true, false)
+        drive_symbol(0x55, true, false)
+        drive_symbol(0xAA, true, false)
+        drive_symbol(0xFF, true, false)
 
         // Exhaustive data symbols under both running-disparity inputs.
         for v in 0 .. 256
-            drive_symbol(dut, v.trunc<8>(), false, false)
+            drive_symbol(v.trunc<8>(), false, false)
         end for
         for v in 0 .. 256
-            drive_symbol(dut, v.trunc<8>(), false, true)
+            drive_symbol(v.trunc<8>(), false, true)
         end for
 
         // Back-to-back mode transitions.
-        drive_symbol(dut, 0x1C, true, false)
-        drive_symbol(dut, 0x00, false, false)
-        drive_symbol(dut, 0xFE, true, false)
-        drive_symbol(dut, 0xFF, false, true)
+        drive_symbol(0x1C, true, false)
+        drive_symbol(0x00, false, false)
+        drive_symbol(0xFE, true, false)
+        drive_symbol(0xFF, false, true)
 
         // Solver-randomized symbols. Both unconstrained traffic and relation-
         // constrained control symbols exercise current randomize/relation paths.
         for _ in 0 .. 48
             let s : EncStim
             randomize(s)
-            drive_symbol(dut, s.symbol, s.control, s.rd)
+            drive_symbol(s.symbol, s.control, s.rd)
         end for
         for _ in 0 .. 16
             let k : EncStim
             randomize(k) with IsControlSymbol(k) end randomize
-            drive_symbol(dut, k.symbol, true, false)
+            drive_symbol(k.symbol, true, false)
         end for
 
-        reset_encoder(dut)
+        reset_encoder()
         log(info, "ALL TESTS PASSED - encoder_8b10b")
     end run
 

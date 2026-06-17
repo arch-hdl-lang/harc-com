@@ -1199,9 +1199,7 @@ fn cmd_dump_ir(files: Vec<PathBuf>, pass: Option<String>, profile: Option<String
     let target_profile = match (&dump_pass, profile.as_deref()) {
         (_, None) => TargetProfile::single_site(),
         (DumpPass::Placement, Some(name)) => TargetProfile::by_name(name).ok_or_else(|| {
-            miette::miette!(
-                "unknown profile `{name}` (built-ins: single-site, split-strict)"
-            )
+            miette::miette!("unknown profile `{name}` (built-ins: single-site, split-strict)")
         })?,
         (_, Some(_)) => {
             return Err(miette::miette!(
@@ -1250,11 +1248,7 @@ fn cmd_trace_diff(a: &Path, b: &Path) -> Result<()> {
     let divergences =
         harc::check_backends::diff_traces(a, b).map_err(|e| miette::miette!("{}", e))?;
     if divergences.is_empty() {
-        println!(
-            "traces match: {} == {}",
-            a.display(),
-            b.display()
-        );
+        println!("traces match: {} == {}", a.display(), b.display());
         return Ok(());
     }
     eprintln!(
@@ -1693,12 +1687,6 @@ fn cmd_sim(
                 "--mt is not supported with --codegen tbir yet; re-run with --codegen v1"
             ));
         }
-        if cpp_split == CppSplit::Tests {
-            return Err(miette::miette!(
-                "--cpp-split tests is not supported with --codegen tbir yet; \
-                 re-run with --codegen v1"
-            ));
-        }
     }
 
     // Parse every input file, then fold `extend test T` blocks into their
@@ -1784,8 +1772,7 @@ fn cmd_sim(
                     let prog = harc::ir::lower::lower_program(&codegen_source)
                         .map_err(|e| miette::miette!("{}", e))?;
                     harc::ir::verify::verify_program(&prog).map_err(|errs| {
-                        let lines: Vec<String> =
-                            errs.iter().map(|e| format!("  - {e}")).collect();
+                        let lines: Vec<String> = errs.iter().map(|e| format!("  - {e}")).collect();
                         miette::miette!(
                             "internal error: TB-IR failed verification after lowering:\n{}",
                             lines.join("\n")
@@ -1815,13 +1802,34 @@ fn cmd_sim(
             cpp_paths.push(cpp_path);
         }
         CppSplit::Tests => {
-            let split = harc::codegen::cpp_tb::emit_split_tests_with_file_prefix(
-                &codegen_source,
-                emit_opts,
-                &format!("{stem}__"),
-                cpp_split_group_size,
-            )
-            .map_err(|e| miette::miette!("{}", e))?;
+            let split = match codegen {
+                CodegenKind::V1 => harc::codegen::cpp_tb::emit_split_tests_with_file_prefix(
+                    &codegen_source,
+                    emit_opts,
+                    &format!("{stem}__"),
+                    cpp_split_group_size,
+                )
+                .map_err(|e| miette::miette!("{}", e))?,
+                CodegenKind::Tbir => {
+                    let prog = harc::ir::lower::lower_program(&codegen_source)
+                        .map_err(|e| miette::miette!("{}", e))?;
+                    harc::ir::verify::verify_program(&prog).map_err(|errs| {
+                        let lines: Vec<String> = errs.iter().map(|e| format!("  - {e}")).collect();
+                        miette::miette!(
+                            "internal error: TB-IR failed verification after lowering:\n{}",
+                            lines.join("\n")
+                        )
+                    })?;
+                    harc::codegen::tbir::emit_split_tests_with_file_prefix(
+                        &prog,
+                        &codegen_source,
+                        emit_opts,
+                        &format!("{stem}__"),
+                        cpp_split_group_size,
+                    )
+                    .map_err(|e| miette::miette!("{}", e))?
+                }
+            };
             for generated in split.files {
                 let cpp_path = outdir.join(generated.filename);
                 let cpp_changed = write_if_changed(&cpp_path, generated.contents.as_bytes())?;

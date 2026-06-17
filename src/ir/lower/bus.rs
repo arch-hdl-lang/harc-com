@@ -19,13 +19,11 @@
 //!   Run/Check functions only). Backends expand the edge themselves;
 //!   the tbir backend mirrors v1's req/rsp wire protocol.
 
-use super::{FuncBuilder, LowerError, unsupported};
+use super::{unsupported, FuncBuilder, LowerError};
 use crate::ast::{
     BusDecl, CallArg, Expr as AstExpr, ExprKind, HandshakeChannel, LetStmt, TlmMethod, TypeExpr,
 };
-use crate::ir::{
-    self, BinOp, Expr, IrType, PortAccess, PortRef, Stmt, Terminator, UnOp,
-};
+use crate::ir::{self, BinOp, Expr, IrType, PortAccess, PortRef, Stmt, Terminator, UnOp};
 
 /// Where a bus call's produced value goes. Only the two positions v1
 /// supports exist: `let`-RHS and statement position (`x = bus.m(...)`
@@ -182,10 +180,7 @@ impl FuncBuilder<'_> {
     /// `<bind>_<ch>_<sig>`. Unknown signals/channels are hard errors
     /// with v1's diagnostic text — v1 surfaces them as codegen errors;
     /// the IR rejects at lowering.
-    pub(crate) fn as_bus_port_ref(
-        &self,
-        e: &AstExpr,
-    ) -> Result<Option<PortRef>, LowerError> {
+    pub(crate) fn as_bus_port_ref(&self, e: &AstExpr) -> Result<Option<PortRef>, LowerError> {
         let ExprKind::Field { target, name } = &*e.kind else {
             return Ok(None);
         };
@@ -462,8 +457,7 @@ impl FuncBuilder<'_> {
         match dest {
             BusCallDest::Declare(name) => {
                 let id = self.declare(name);
-                let first_port =
-                    self.bus_channel_port(bind, &h.name.name, &h.payload[0].name.name);
+                let first_port = self.bus_channel_port(bind, &h.name.name, &h.payload[0].name.name);
                 self.push(Stmt::DutRead(id, first_port));
                 let mut fields = Vec::with_capacity(h.payload.len());
                 // The first field aliases the bound local itself.
@@ -587,7 +581,11 @@ impl FuncBuilder<'_> {
                 "only `fork <bus>.<method>(args)` is lowered",
             ));
         };
-        let ExprKind::Field { target, name: method } = &*callee.kind else {
+        let ExprKind::Field {
+            target,
+            name: method,
+        } = &*callee.kind
+        else {
             return Err(unsupported(
                 "`fork` RHS that is not `<bus>.<method>(args)`",
                 "",

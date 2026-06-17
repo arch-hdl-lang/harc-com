@@ -13,84 +13,83 @@ end transaction PingPongStim
 
 testbench PingPongTb
     dut : ping_pong_buffer
+
+    function reset_ping_pong()
+        dut.rst_n = 0
+        dut.write_enable = 0
+        dut.read_enable = 0
+        dut.data_in = 0
+        wait 3 cycles
+        assert dut.buffer_empty == 1 else fail("reset: buffer_empty expected high")
+        assert dut.buffer_full == 0 else fail("reset: buffer_full expected low")
+        assert dut.buffer_select == 0 else fail("reset: buffer_select expected zero")
+        dut.rst_n = 1
+        wait 1 cycle
+    end function reset_ping_pong
+    function step_ping_pong(data: uint<8>, wr: bool, rd: bool)
+        dut.data_in = data
+        dut.write_enable = wr
+        dut.read_enable = rd
+        wait 1 cycle
+    end function step_ping_pong
 end testbench PingPongTb
-
-function reset_ping_pong(dut: ping_pong_buffer)
-    dut.rst_n = 0
-    dut.write_enable = 0
-    dut.read_enable = 0
-    dut.data_in = 0
-    wait 3 cycles
-    assert dut.buffer_empty == 1 else fail("reset: buffer_empty expected high")
-    assert dut.buffer_full == 0 else fail("reset: buffer_full expected low")
-    assert dut.buffer_select == 0 else fail("reset: buffer_select expected zero")
-    dut.rst_n = 1
-    wait 1 cycle
-end function reset_ping_pong
-
-function step_ping_pong(dut: ping_pong_buffer, data: uint<8>, wr: bool, rd: bool)
-    dut.data_in = data
-    dut.write_enable = wr
-    dut.read_enable = rd
-    wait 1 cycle
-end function step_ping_pong
 
 impl PingPongTest for PingPongTb
     run
         log(info, "ping_pong_buffer: write/read/full/empty/select coverage")
 
-        reset_ping_pong(dut)
+        reset_ping_pong()
 
         // Read while empty and idle branches.
-        step_ping_pong(dut, 0, false, true)
-        step_ping_pong(dut, 0, false, false)
+        step_ping_pong(0, false, true)
+        step_ping_pong(0, false, false)
 
         // A few writes, then reads from non-empty state.
         for i in 0 .. 16
-            step_ping_pong(dut, i.trunc<8>(), true, false)
+            step_ping_pong(i.trunc<8>(), true, false)
         end for
         assert dut.buffer_empty == 0 else fail("after writes: expected non-empty")
         for i in 0 .. 8
-            step_ping_pong(dut, (0x80 + i).trunc<8>(), false, true)
+            step_ping_pong((0x80 + i).trunc<8>(), false, true)
         end for
 
         // Mixed traffic, including both enables asserted.
         for i in 0 .. 40
-            step_ping_pong(dut, (0x20 + i).trunc<8>(), (i & 1) == 0, (i & 3) == 0)
-            step_ping_pong(dut, (0x60 + i).trunc<8>(), true, true)
+            step_ping_pong((0x20 + i).trunc<8>(), (i & 1) == 0, (i & 3) == 0)
+            step_ping_pong((0x60 + i).trunc<8>(), true, true)
         end for
 
         // Fill enough to wrap write_ptr and assert full/path guards.
         dut.read_enable = 0
         for i in 0 .. 270
-            step_ping_pong(dut, i.trunc<8>(), true, false)
+            step_ping_pong(i.trunc<8>(), true, false)
         end for
 
         // Drain enough to wrap read_ptr and toggle buffer_select.
         dut.write_enable = 0
         for _ in 0 .. 270
-            step_ping_pong(dut, 0, false, true)
+            step_ping_pong(0, false, true)
         end for
 
         // Repeat a full fill/drain after buffer_select has toggled once so
         // the `!buffer_select` expression itself is observed both ways.
         dut.read_enable = 0
         for i in 0 .. 270
-            step_ping_pong(dut, (0x40 + i).trunc<8>(), true, false)
+            step_ping_pong((0x40 + i).trunc<8>(), true, false)
         end for
         dut.write_enable = 0
         for _ in 0 .. 270
-            step_ping_pong(dut, 0, false, true)
+            step_ping_pong(0, false, true)
         end for
 
         // Randomized post-wrap traffic to revisit both memory banks.
         for _ in 0 .. 64
             let s : PingPongStim
             randomize(s)
-            step_ping_pong(dut, s.data, s.write, s.read)
+            step_ping_pong(s.data, s.write, s.read)
         end for
 
-        reset_ping_pong(dut)
+        reset_ping_pong()
         log(info, "ALL TESTS PASSED - ping_pong_buffer")
     end run
 end impl PingPongTest

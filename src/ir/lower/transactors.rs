@@ -35,10 +35,10 @@
 //! generics, event ports, `on` handlers, TLM target threads, watchdogs —
 //! is an explicit `Unsupported`.
 
-use super::{FuncBuilder, LowerCtx, LowerError, helpers, unsupported};
+use super::{helpers, unsupported, FuncBuilder, LowerCtx, LowerError};
 use crate::ast::{
-    BusDecl, ComponentField, ComponentItem, HookableMethod, Param, TargetTlmThread,
-    TransactorDecl, TypeArg, TypeExpr,
+    BusDecl, ComponentField, ComponentItem, HookableMethod, Param, TargetTlmThread, TransactorDecl,
+    TypeArg, TypeExpr,
 };
 use crate::ir::{
     self, ConstraintSite, FunctionId, FunctionKind, IrType, TargetTlmMethodSchema, TbFunction,
@@ -120,10 +120,7 @@ pub(crate) fn lower_transactor(
     // `<instance>.<field>`.
     let mut state_fields: Vec<TbScalarFieldSchema> = Vec::new();
     let mut state_names: HashSet<String> = HashSet::new();
-    let all_items = t
-        .items
-        .iter()
-        .chain(t.when_active.iter().flatten());
+    let all_items = t.items.iter().chain(t.when_active.iter().flatten());
     for ci in all_items {
         match ci {
             ComponentItem::Field(f) => {
@@ -270,9 +267,9 @@ pub(crate) fn lower_transactor(
         // (the nullptr-descriptor fallback, matching v1).
         txn_keeps: HashMap::new(),
         randomize_problem_ids: HashMap::new(),
-    tseqs: HashMap::new(),
+        tseqs: HashMap::new(),
         // Transactor-context lowering never resolves test-scope probes.
-    probes: HashMap::new(),
+        probes: HashMap::new(),
         extern_fns: record_ctx.extern_fns.clone(),
     };
 
@@ -366,7 +363,10 @@ fn lower_bound_target_transactor(
                     "",
                 ));
             }
-            name.segments.last().map(|s| s.name.clone()).unwrap_or_default()
+            name.segments
+                .last()
+                .map(|s| s.name.clone())
+                .unwrap_or_default()
         }
         _ => {
             return Err(unsupported(
@@ -419,7 +419,10 @@ fn lower_bound_target_transactor(
                 ));
             }
             ComponentItem::Watchdog(_) => {
-                return Err(unsupported(&format!("bound-to transactor `{tname}` watchdogs"), ""));
+                return Err(unsupported(
+                    &format!("bound-to transactor `{tname}` watchdogs"),
+                    "",
+                ));
             }
             ComponentItem::Connect(_) => {
                 return Err(unsupported(
@@ -437,7 +440,9 @@ fn lower_bound_target_transactor(
     }
     if threads_ast.is_empty() {
         return Err(unsupported(
-            &format!("bound-to transactor `{tname}` without any `thread bus.<method>(...)` responder"),
+            &format!(
+                "bound-to transactor `{tname}` without any `thread bus.<method>(...)` responder"
+            ),
             "a target-side TLM transactor must serve at least one bus method",
         ));
     }
@@ -506,9 +511,9 @@ fn lower_bound_target_transactor(
         // problem table; a `randomize` here lowers with no problem-id.
         txn_keeps: HashMap::new(),
         randomize_problem_ids: HashMap::new(),
-    tseqs: HashMap::new(),
+        tseqs: HashMap::new(),
         // Transactor-context lowering never resolves test-scope probes.
-    probes: HashMap::new(),
+        probes: HashMap::new(),
         extern_fns: record_ctx.extern_fns.clone(),
     };
 
@@ -588,10 +593,20 @@ fn lower_bound_target_transactor(
             )));
         }
         for (p, name) in th.params.iter().zip(method.args.iter()) {
-            check_scalar_ty(tname, mname, &format!("parameter `{}`", p.name.name), p.ty.as_ref())?;
+            check_scalar_ty(
+                tname,
+                mname,
+                &format!("parameter `{}`", p.name.name),
+                p.ty.as_ref(),
+            )?;
             // Cross-check the declared widths fit the u64 value model via
             // the bus method's declared arg type too.
-            check_scalar_ty(tname, mname, &format!("argument `{}`", name.0.name), Some(&name.1))?;
+            check_scalar_ty(
+                tname,
+                mname,
+                &format!("argument `{}`", name.0.name),
+                Some(&name.1),
+            )?;
         }
         // The return type may be a record (`-> HarcBurstResp32x4`): the
         // responder builds it field-wise and the backend packs it onto
@@ -616,7 +631,10 @@ fn lower_bound_target_transactor(
             let ty = helpers::ir_type_of(p.ty.as_ref());
             let local = b.declare(&p.name.name);
             b.set_local_type(local, ty.clone());
-            params.push(TypedParam { name: p.name.name.clone(), ty });
+            params.push(TypedParam {
+                name: p.name.name.clone(),
+                ty,
+            });
         }
         let has_ret = method.ret.is_some();
         if has_ret {
@@ -636,7 +654,9 @@ fn lower_bound_target_transactor(
         let mut f = b.finish(
             fid,
             format!("{tname}_target_{mname}"),
-            FunctionKind::TransactorBody { transactor: TransactorId(0) },
+            FunctionKind::TransactorBody {
+                transactor: TransactorId(0),
+            },
             None,
         )?;
         // The transactor id is fixed up by the caller's push order; the
@@ -721,7 +741,10 @@ fn lower_bound_initiator_transactor(
                     "",
                 ));
             }
-            name.segments.last().map(|s| s.name.clone()).unwrap_or_default()
+            name.segments
+                .last()
+                .map(|s| s.name.clone())
+                .unwrap_or_default()
         }
         _ => {
             return Err(unsupported(
@@ -887,9 +910,9 @@ fn lower_bound_initiator_transactor(
         component_fields: HashMap::new(),
         txn_keeps: HashMap::new(),
         randomize_problem_ids: HashMap::new(),
-    tseqs: HashMap::new(),
+        tseqs: HashMap::new(),
         // Transactor-context lowering never resolves test-scope probes.
-    probes: HashMap::new(),
+        probes: HashMap::new(),
         extern_fns: record_ctx.extern_fns.clone(),
     };
 
@@ -978,14 +1001,14 @@ fn lower_state_field(tname: &str, f: &ComponentField) -> Result<TbScalarFieldSch
     let default = match &f.default {
         None => 0,
         Some(d) => match &*d.kind {
-            crate::ast::ExprKind::Int(s) => super::exprs::parse_int_literal(s).ok_or_else(|| {
-                unsupported(
-                    &format!(
-                        "bound-to transactor `{tname}` state field `{fname} default {s}`"
-                    ),
-                    "default must be a plain integer literal",
-                )
-            })?,
+            crate::ast::ExprKind::Int(s) => {
+                super::exprs::parse_int_literal(s).ok_or_else(|| {
+                    unsupported(
+                        &format!("bound-to transactor `{tname}` state field `{fname} default {s}`"),
+                        "default must be a plain integer literal",
+                    )
+                })?
+            }
             crate::ast::ExprKind::Bool(bv) => *bv as u64,
             _ => {
                 return Err(unsupported(
@@ -997,7 +1020,11 @@ fn lower_state_field(tname: &str, f: &ComponentField) -> Result<TbScalarFieldSch
             }
         },
     };
-    Ok(TbScalarFieldSchema { name: fname.clone(), ty, default })
+    Ok(TbScalarFieldSchema {
+        name: fname.clone(),
+        ty,
+        default,
+    })
 }
 
 /// Method returns and TLM bus-target args must be scalar (bool / uint /

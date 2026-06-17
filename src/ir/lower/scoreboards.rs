@@ -21,10 +21,8 @@
 //!     `queue<SomeStruct>` — needs the record-payload-in-queue seam);
 //!   - non-scalar / >64-bit scalar fields.
 
-use super::{LowerError, unsupported};
-use crate::ast::{
-    BuiltinTy, ComponentDecl, ComponentItem, ExprKind, TypeArg, TypeExpr,
-};
+use super::{unsupported, LowerError};
+use crate::ast::{BuiltinTy, ComponentDecl, ComponentItem, ExprKind, TypeArg, TypeExpr};
 use crate::ir::{IrType, ScoreboardFieldKind, ScoreboardFieldSchema, ScoreboardSchema};
 
 pub(crate) fn lower_scoreboard(c: &ComponentDecl) -> Result<ScoreboardSchema, LowerError> {

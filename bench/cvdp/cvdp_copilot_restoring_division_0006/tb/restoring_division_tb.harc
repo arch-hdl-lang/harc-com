@@ -7,16 +7,16 @@ testbench RestoringDivisionTb
         probe force count_force : uint<3> at count
         probe force valid_force : bool at valid
     end let dut
-end testbench RestoringDivisionTb
 
-function run_div6(dut: restoring_division, dividend: uint<6>, divisor: uint<6>)
-    dut.dividend = dividend
-    dut.divisor = divisor
-    dut.start = 1
-    wait 1 cycle
-    dut.start = 0
-    wait 12 cycles
-end function run_div6
+    function run_div6(dividend: uint<6>, divisor: uint<6>)
+        dut.dividend = dividend
+        dut.divisor = divisor
+        dut.start = 1
+        wait 1 cycle
+        dut.start = 0
+        wait 12 cycles
+    end function run_div6
+end testbench RestoringDivisionTb
 
 impl RestoringDivisionTest for RestoringDivisionTb
     run
@@ -33,7 +33,7 @@ impl RestoringDivisionTest for RestoringDivisionTb
         dut.rst = 1
 
         for d in 0 .. 16
-            run_div6(dut, (d * 3) & 0x3F, ((d & 7) + 1))
+            run_div6((d * 3) & 0x3F, ((d & 7) + 1))
         end for
         for c in 0 .. 8
             dut.present_state_force = 1
@@ -45,9 +45,9 @@ impl RestoringDivisionTest for RestoringDivisionTb
             dut.start = 1
             wait 1 cycle
         end for
-        run_div6(dut, 63, 1)
-        run_div6(dut, 63, 63)
-        run_div6(dut, 5, 9)
+        run_div6(63, 1)
+        run_div6(63, 63)
+        run_div6(5, 9)
 
         dut.rst = 0
         wait 2 cycles

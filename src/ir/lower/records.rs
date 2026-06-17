@@ -16,8 +16,10 @@
 //! non-literal field defaults. Enum-typed fields lower as scalar
 //! variant indices (v1's `int64_t` member shape).
 
-use super::{LowerError, unsupported};
-use crate::ast::{BuiltinTy, ExprKind, Field, StructDecl, TransactionDecl, TxnBodyItem, TypeArg, TypeExpr};
+use super::{unsupported, LowerError};
+use crate::ast::{
+    BuiltinTy, ExprKind, Field, StructDecl, TransactionDecl, TxnBodyItem, TypeArg, TypeExpr,
+};
 use crate::ir::{IrType, RecordFieldSchema, RecordSchema};
 
 pub(crate) fn lower_transaction(
@@ -201,7 +203,12 @@ fn fixed_vec_field(
     t: &TypeExpr,
     enum_names: &std::collections::HashSet<String>,
 ) -> Option<(IrType, usize)> {
-    let TypeExpr::Builtin { name: BuiltinTy::Vec, args, .. } = t else {
+    let TypeExpr::Builtin {
+        name: BuiltinTy::Vec,
+        args,
+        ..
+    } = t
+    else {
         return None;
     };
     let elem = match args.first()? {

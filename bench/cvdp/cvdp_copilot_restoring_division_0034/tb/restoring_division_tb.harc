@@ -7,16 +7,16 @@ testbench RestoringDivision34Tb
         probe force count_force : uint<3> at count
         probe force valid_force : bool at valid
     end let dut
-end testbench RestoringDivision34Tb
 
-function run_div6_ext(dut: restoring_division, dividend: uint<6>, divisor: uint<6>)
-    dut.dividend = dividend
-    dut.divisor = divisor
-    dut.start = 1
-    wait 1 cycle
-    dut.start = 0
-    wait 12 cycles
-end function run_div6_ext
+    function run_div6_ext(dividend: uint<6>, divisor: uint<6>)
+        dut.dividend = dividend
+        dut.divisor = divisor
+        dut.start = 1
+        wait 1 cycle
+        dut.start = 0
+        wait 12 cycles
+    end function run_div6_ext
+end testbench RestoringDivision34Tb
 
 impl RestoringDivision34Test for RestoringDivision34Tb
     run
@@ -32,11 +32,11 @@ impl RestoringDivision34Test for RestoringDivision34Tb
         wait 3 cycles
         dut.rst = 1
 
-        run_div6_ext(dut, 12, 0)
-        run_div6_ext(dut, 0, 5)
-        run_div6_ext(dut, 5, 9)
+        run_div6_ext(12, 0)
+        run_div6_ext(0, 5)
+        run_div6_ext(5, 9)
         for d in 1 .. 18
-            run_div6_ext(dut, (d * 5) & 0x3F, ((d & 7) + 1))
+            run_div6_ext((d * 5) & 0x3F, ((d & 7) + 1))
         end for
         for c in 0 .. 8
             dut.present_state_force = 1
@@ -48,8 +48,8 @@ impl RestoringDivision34Test for RestoringDivision34Tb
             dut.start = 1
             wait 1 cycle
         end for
-        run_div6_ext(dut, 63, 1)
-        run_div6_ext(dut, 63, 63)
+        run_div6_ext(63, 1)
+        run_div6_ext(63, 63)
 
         dut.rst = 0
         wait 2 cycles

@@ -1,12 +1,15 @@
 ---
 source: tests/tbir.rs
+assertion_line: 4174
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
   testbench tb0 CounterTb { dut: Top }
   testbench tb1 CounterTb { dut: Top }
+  testbench tb2 CounterTb { dut: Top }
   test TestbenchEnableToggle tb=tb0 run=fn0 check=-
-  test TestbenchSmoke tb=tb1 run=fn1 check=-
+  test TestbenchMethodCallsMethod tb=tb1 run=fn1 check=-
+  test TestbenchSmoke tb=tb2 run=fn2 check=-
 
 fn fn0 run_TestbenchEnableToggle [kind=Run, owner=tb0]
   locals:
@@ -51,7 +54,61 @@ fn fn0 run_TestbenchEnableToggle [kind=Run, owner=tb0]
     Log(info, "PASS: enable-toggle reuses CounterTb helpers")
     -> Return
 
-fn fn1 run_TestbenchSmoke [kind=Run, owner=tb1]
+fn fn1 run_TestbenchMethodCallsMethod [kind=Run, owner=tb1]
+  locals:
+    %0 __t0 : unknown
+    %1 __t1 : unknown
+    %2 n : uint<32>
+    %3 __t2 : unknown
+    %4 n_2 : uint<32>
+    %5 __t3 : unknown
+    %6 n_3 : uint<32>
+  entry = b0
+
+  b0:
+    Assign(%__t0, 0)
+    DutWrite(dut.rst, 1)
+    DutWrite(dut.en, 0)
+    -> WaitCyclesSync(2, b2)
+
+  b1:
+    Assign(%__t1, 0)
+    Assign(%n, 2)
+    Assign(%__t2, 0)
+    Assign(%n_2, %n)
+    DutWrite(dut.en, 1)
+    -> WaitCyclesSync(%n_2, b6)
+
+  b2:
+    DutWrite(dut.rst, 0)
+    -> WaitCyclesSync(1, b3)
+
+  b3:
+    -> Jump(b1)
+
+  b4:
+    AssertCheck { cond: (dut.count_out == 4), on_fail: "method-call-method: count_out=%lld, expected 4", dut.count_out }
+    Log(info, "PASS: testbench method can call sibling method")
+    -> Return
+
+  b5:
+    Assign(%__t3, 0)
+    Assign(%n_3, %n)
+    DutWrite(dut.en, 1)
+    -> WaitCyclesSync(%n_3, b8)
+
+  b6:
+    DutWrite(dut.en, 0)
+    -> Jump(b5)
+
+  b7:
+    -> Jump(b4)
+
+  b8:
+    DutWrite(dut.en, 0)
+    -> Jump(b7)
+
+fn fn2 run_TestbenchSmoke [kind=Run, owner=tb2]
   locals:
     %0 __t0 : unknown
     %1 __t1 : unknown

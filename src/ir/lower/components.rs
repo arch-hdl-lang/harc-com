@@ -20,15 +20,15 @@
 //! `bound to` source transactors, and non-scalar event payloads. Those
 //! gate on the agent/sequencer/event slices.
 
-use super::{FuncBuilder, LowerCtx, LowerError, helpers, unsupported};
+use super::{helpers, unsupported, FuncBuilder, LowerCtx, LowerError};
 use crate::ast::{
     BuiltinTy, ComponentDecl, ComponentField, ComponentItem, ConnectEdge, Direction, ExprKind,
     HookableMethod, TransactorDecl, TypeArg, TypeExpr,
 };
 use crate::ir::{
-    ComponentFieldKind, ComponentFieldSchema, ComponentId, ComponentKindTag,
-    ComponentMethodSchema, ComponentSchema, ConnectEdgeSchema, EventPayload, FunctionId,
-    FunctionKind, IrType, RecordId, ScoreboardId, TbFunction, Terminator, TypedParam,
+    ComponentFieldKind, ComponentFieldSchema, ComponentId, ComponentKindTag, ComponentMethodSchema,
+    ComponentSchema, ConnectEdgeSchema, EventPayload, FunctionId, FunctionKind, IrType, RecordId,
+    ScoreboardId, TbFunction, Terminator, TypedParam,
 };
 use std::collections::HashMap;
 
@@ -232,8 +232,7 @@ pub(crate) fn transactor_is_event_driven(t: &TransactorDecl) -> bool {
     for it in t.items.iter().chain(t.when_active.iter().flatten()) {
         match it {
             ComponentItem::Field(f)
-                if is_event_field(f)
-                    && matches!(f.direction, Some(crate::ast::Direction::In)) =>
+                if is_event_field(f) && matches!(f.direction, Some(crate::ast::Direction::In)) =>
             {
                 has_in_event = true;
             }
@@ -258,8 +257,7 @@ pub(crate) fn transactor_is_reactive_monitor(t: &TransactorDecl) -> bool {
     for it in t.items.iter().chain(t.when_active.iter().flatten()) {
         match it {
             ComponentItem::Field(f)
-                if is_event_field(f)
-                    && matches!(f.direction, Some(crate::ast::Direction::In)) =>
+                if is_event_field(f) && matches!(f.direction, Some(crate::ast::Direction::In)) =>
             {
                 has_in_event = true;
             }
@@ -317,12 +315,8 @@ pub(crate) fn lower_component_schema(
     ) = match src {
         CompSource::Env(c) => (&c.name.name, ComponentKindTag::Env, &c.items, None),
         CompSource::Agent(c) => (&c.name.name, ComponentKindTag::Agent, &c.items, None),
-        CompSource::Sequencer(c) => {
-            (&c.name.name, ComponentKindTag::Sequencer, &c.items, None)
-        }
-        CompSource::Scoreboard(c) => {
-            (&c.name.name, ComponentKindTag::Scoreboard, &c.items, None)
-        }
+        CompSource::Sequencer(c) => (&c.name.name, ComponentKindTag::Sequencer, &c.items, None),
+        CompSource::Scoreboard(c) => (&c.name.name, ComponentKindTag::Scoreboard, &c.items, None),
         CompSource::Transactor(t) => (
             &t.name.name,
             ComponentKindTag::Transactor,
@@ -346,7 +340,9 @@ pub(crate) fn lower_component_schema(
         }
         if let Some(bt) = t.bound_to.as_ref() {
             match bt {
-                TypeExpr::Named { name: bn, generics, .. } => {
+                TypeExpr::Named {
+                    name: bn, generics, ..
+                } => {
                     if !generics.is_empty() {
                         return Err(unsupported(
                             &format!(
@@ -357,7 +353,10 @@ pub(crate) fn lower_component_schema(
                         ));
                     }
                     bound_bus = Some(
-                        bn.segments.last().map(|s| s.name.clone()).unwrap_or_default(),
+                        bn.segments
+                            .last()
+                            .map(|s| s.name.clone())
+                            .unwrap_or_default(),
                     );
                 }
                 _ => {
@@ -653,7 +652,11 @@ fn is_bus_handshake_monitor(h: &crate::ast::OnHandler) -> bool {
     let ExprKind::Call { callee, .. } = &*h.event.kind else {
         return false;
     };
-    let ExprKind::Field { target, name: method } = &*callee.kind else {
+    let ExprKind::Field {
+        target,
+        name: method,
+    } = &*callee.kind
+    else {
         return false;
     };
     if method.name != "handshake" {
@@ -671,7 +674,11 @@ fn bus_handshake_monitor_channel(h: &crate::ast::OnHandler) -> Option<String> {
         return None;
     };
     // callee = `<bus>.<ch>.handshake`; its target is `<bus>.<ch>`.
-    let ExprKind::Field { target, name: method } = &*callee.kind else {
+    let ExprKind::Field {
+        target,
+        name: method,
+    } = &*callee.kind
+    else {
         return None;
     };
     if method.name != "handshake" {
@@ -729,10 +736,7 @@ fn validate_cycle_handler(comp: &str, h: &crate::ast::OnHandler) -> Result<(), L
 /// no `pre`/`post` hook side. Both the default `Checker` phase and the
 /// `phase post_eval` form lower (the phase selects the dispatch vector —
 /// `_checkers` vs `_post_eval_services`).
-fn validate_periodic_handler(
-    comp: &str,
-    h: &crate::ast::OnHandler,
-) -> Result<(), LowerError> {
+fn validate_periodic_handler(comp: &str, h: &crate::ast::OnHandler) -> Result<(), LowerError> {
     if h.hook.is_some() {
         return Err(unsupported(
             &format!("a `pre`/`post` hook on an `on <N> cycles` handler on `{comp}`"),
@@ -987,7 +991,14 @@ pub(crate) fn lower_component_bodies(
         if let ComponentItem::Hookable(h) = it {
             let m = &schema.methods[method_idx];
             method_idx += 1;
-            funcs.push(lower_method_body(h, m.function, cid, ctx, helpers, constraint_sites)?);
+            funcs.push(lower_method_body(
+                h,
+                m.function,
+                cid,
+                ctx,
+                helpers,
+                constraint_sites,
+            )?);
         }
     }
     let mut on_idx = 0usize;
@@ -1000,7 +1011,14 @@ pub(crate) fn lower_component_bodies(
             }
             let oh = &schema.on_handlers[on_idx];
             on_idx += 1;
-            funcs.push(lower_on_handler_body(h, oh, cid, ctx, helpers, constraint_sites)?);
+            funcs.push(lower_on_handler_body(
+                h,
+                oh,
+                cid,
+                ctx,
+                helpers,
+                constraint_sites,
+            )?);
         }
     }
     // Periodic handlers: lower the zero-arg body AND the period expr (the
@@ -1329,10 +1347,7 @@ fn lower_on_handler_body(
     };
     let local = b.declare(&arg_name);
     b.set_local_type(local, ty.clone());
-    let params = vec![TypedParam {
-        name: arg_name,
-        ty,
-    }];
+    let params = vec![TypedParam { name: arg_name, ty }];
     b.lower_block_stmts(&h.body)?;
     if !b.is_terminated() {
         b.terminate(Terminator::Return);
@@ -1513,7 +1528,10 @@ fn resolve_one_connect(
     // port on the source sub-component).
     if from.len() < 2 {
         return Err(unsupported(
-            &format!("a `connect` source `{}` without an event field", from.join(".")),
+            &format!(
+                "a `connect` source `{}` without an event field",
+                from.join(".")
+            ),
             "",
         ));
     }
@@ -1740,9 +1758,7 @@ fn lower_event_payload(
                 Some(IrType::UInt(_)) | Some(IrType::Bool) => {
                     Ok(EventPayload::Scalar { signed: false })
                 }
-                _ => Err(reject_named(
-                    type_arg_simple_name(ty).unwrap_or("<expr>"),
-                )),
+                _ => Err(reject_named(type_arg_simple_name(ty).unwrap_or("<expr>"))),
             }
         }
         // `event<TinyTxn>` parses the payload as a bare identifier.
@@ -1923,7 +1939,11 @@ impl super::FuncBuilder<'_> {
         // (the receiver is the local itself, passed by value). Checked
         // before the self sub-component arm — a param is a real local, so
         // that arm's `lookup(...).is_none()` guard would skip it.
-        if let ExprKind::Field { target, name: method } = &*callee.kind {
+        if let ExprKind::Field {
+            target,
+            name: method,
+        } = &*callee.kind
+        {
             if let ExprKind::Ident(recv) = &*target.kind {
                 if let Some(local) = self.lookup(&recv.name) {
                     if let Some(cid) = self.component_of_local(local) {
@@ -1950,7 +1970,11 @@ impl super::FuncBuilder<'_> {
         // transactor/component body, where `sb` is a self sub-component
         // field (a `Sub` to a method-bearing component). The receiver is a
         // `self`-rooted path the emitter re-roots at the running instance.
-        if let ExprKind::Field { target, name: method } = &*callee.kind {
+        if let ExprKind::Field {
+            target,
+            name: method,
+        } = &*callee.kind
+        {
             if let ExprKind::Ident(sub) = &*target.kind {
                 if self.lookup(&sub.name).is_none() {
                     if let Some(self_cid) = self.self_component {
@@ -1961,10 +1985,7 @@ impl super::FuncBuilder<'_> {
                             let sub_comp = &self.ctx.components[component.index()];
                             if sub_comp.method(&method.name).is_some() {
                                 return Ok(Some((
-                                    ComponentBase::Path(vec![
-                                        "self".to_string(),
-                                        sub.name.clone(),
-                                    ]),
+                                    ComponentBase::Path(vec!["self".to_string(), sub.name.clone()]),
                                     *component,
                                     method.name.clone(),
                                 )));
@@ -2000,7 +2021,11 @@ impl super::FuncBuilder<'_> {
         // callee = Field { target = <recv>.<queue>, name = method }. For
         // `errors.push(e)` the target is `Ident(errors)`; for
         // `checker.sb.errors.push(e)` it is the dotted `checker.sb.errors`.
-        let ExprKind::Field { target, name: method } = &*callee.kind else {
+        let ExprKind::Field {
+            target,
+            name: method,
+        } = &*callee.kind
+        else {
             return Ok(None);
         };
         // Self-relative bare queue: `errors.push(e)` — target is an `Ident`
@@ -2088,7 +2113,8 @@ impl super::FuncBuilder<'_> {
         }
         let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
         let comp = &self.ctx.components[cid.index()];
-        let Some(ComponentFieldKind::Sub { component }) = comp.field(&field).map(|f| &f.kind) else {
+        let Some(ComponentFieldKind::Sub { component }) = comp.field(&field).map(|f| &f.kind)
+        else {
             return Ok(false);
         };
         let dst_sub = *component;
@@ -2356,10 +2382,7 @@ impl super::FuncBuilder<'_> {
                         Some(ComponentFieldKind::Sub { .. })
                     ) {
                         return Ok(Some(IrExpr::ComponentValue {
-                            base: ComponentBase::Path(vec![
-                                "self".to_string(),
-                                id.name.clone(),
-                            ]),
+                            base: ComponentBase::Path(vec!["self".to_string(), id.name.clone()]),
                         }));
                     }
                 }
@@ -2445,7 +2468,10 @@ impl super::FuncBuilder<'_> {
         let mut out = Vec::with_capacity(args.len());
         for a in args {
             let CallArg::Expr(e) = a else {
-                return Err(unsupported("named arguments in a component method call", ""));
+                return Err(unsupported(
+                    "named arguments in a component method call",
+                    "",
+                ));
             };
             out.push(self.lower_expr_no_ports(e)?);
         }
@@ -2639,9 +2665,9 @@ impl super::FuncBuilder<'_> {
             kind: crate::ir::IdleKind::Both,
             n: Box::new(n.clone()),
         });
-        let first = terms.next().expect(
-            "collect_quiesce_leaves always yields at least the receiver as a leaf",
-        );
+        let first = terms
+            .next()
+            .expect("collect_quiesce_leaves always yields at least the receiver as a leaf");
         let conj = terms.fold(first, |acc, t| {
             IrExpr::Binary(crate::ir::BinOp::And, Box::new(acc), Box::new(t))
         });

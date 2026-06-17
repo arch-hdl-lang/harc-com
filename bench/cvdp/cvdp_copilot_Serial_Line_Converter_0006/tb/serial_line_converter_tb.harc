@@ -50,58 +50,56 @@ end covergroup SerialLineCov
 testbench SerialLineConverterTb
     dut : serial_line_code_converter
     cov : SerialLineCov
+
+    function reset_converter()
+        dut.reset_n = 0
+        dut.serial_in = 0
+        dut.mode = 0
+        wait 4 cycles
+        assert dut.serial_out == 0 else fail("reset: serial_out high")
+        dut.reset_n = 1
+        wait 2 cycles
+    end function reset_converter
+    function drive_bit(bit_value: bool)
+        dut.serial_in = bit_value
+        wait 1 cycle
+    end function drive_bit
+    function drive_pattern(mode: uint<3>, pattern: uint<8>)
+        dut.mode = mode
+
+        for bit in 0 .. 8
+            drive_bit((((pattern >> bit) & 1) == 1))
+        end for
+
+        // Keep the mode selected long enough for CLK_DIV=16 to produce clk_pulse,
+        // which is required to exercise RZ and scrambled-mode divider behavior.
+        for bit in 0 .. 20
+            drive_bit(((bit & 1) == 1))
+        end for
+    end function drive_pattern
 end testbench SerialLineConverterTb
-
-function reset_converter(dut: serial_line_code_converter)
-    dut.reset_n = 0
-    dut.serial_in = 0
-    dut.mode = 0
-    wait 4 cycles
-    assert dut.serial_out == 0 else fail("reset: serial_out high")
-    dut.reset_n = 1
-    wait 2 cycles
-end function reset_converter
-
-function drive_bit(dut: serial_line_code_converter, bit_value: bool)
-    dut.serial_in = bit_value
-    wait 1 cycle
-end function drive_bit
-
-function drive_pattern(dut: serial_line_code_converter, mode: uint<3>, pattern: uint<8>)
-    dut.mode = mode
-
-    for bit in 0 .. 8
-        drive_bit(dut, (((pattern >> bit) & 1) == 1))
-    end for
-
-    // Keep the mode selected long enough for CLK_DIV=16 to produce clk_pulse,
-    // which is required to exercise RZ and scrambled-mode divider behavior.
-    for bit in 0 .. 20
-        drive_bit(dut, ((bit & 1) == 1))
-    end for
-end function drive_pattern
 
 impl SerialLineConverterTest for SerialLineConverterTb
     run
         log(info, "serial_line_converter: mode sweep plus unique randomized patterns")
 
-        reset_converter(dut)
+        reset_converter()
 
         for mode in 0 .. 8
-            drive_pattern(dut, mode, 0x00)
-            drive_pattern(dut, mode, 0xFF)
-            drive_pattern(dut, mode, 0xAA)
-            drive_pattern(dut, mode, 0x55)
-            drive_pattern(dut, mode, ((1 as uint<8>) << mode).trunc<8>())
+            drive_pattern(mode, 0x00)
+            drive_pattern(mode, 0xFF)
+            drive_pattern(mode, 0xAA)
+            drive_pattern(mode, 0x55)
+            drive_pattern(mode, ((1 as uint<8>) << mode).trunc<8>())
         end for
 
         for _ in 0 .. 16
             let s : SerialStim
             randomize(s)
-            drive_pattern(dut, s.mode, s.pattern)
+            drive_pattern(s.mode, s.pattern)
         end for
 
-        reset_converter(dut)
+        reset_converter()
         log(info, "ALL TESTS PASSED - serial_line_converter")
     end run
 

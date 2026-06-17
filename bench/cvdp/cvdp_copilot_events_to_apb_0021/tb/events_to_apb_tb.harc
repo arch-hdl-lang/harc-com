@@ -79,133 +79,119 @@ end covergroup EventsApbCov
 testbench EventsToApbTb
     dut : apb_controller
     cov : EventsApbCov
+
+    function reset_ctrl()
+        dut.reset_n = 0
+        dut.select_a_i = 0
+        dut.select_b_i = 0
+        dut.select_c_i = 0
+        dut.addr_a_i = 0
+        dut.data_a_i = 0
+        dut.addr_b_i = 0
+        dut.data_b_i = 0
+        dut.addr_c_i = 0
+        dut.data_c_i = 0
+        dut.apb_pready_i = 1
+        wait 3 cycles on clk
+        assert dut.apb_psel_o == 0 else fail("reset: psel high")
+        assert dut.apb_penable_o == 0 else fail("reset: penable high")
+        assert dut.apb_pwrite_o == 0 else fail("reset: pwrite high")
+        assert dut.apb_paddr_o == 0 else fail("reset: paddr nonzero")
+        assert dut.apb_pwdata_o == 0 else fail("reset: pwdata nonzero")
+        dut.reset_n = 1
+        wait 1 cycle on clk
+    end function reset_ctrl
+    function set_payloads(addr_a: uint<32>, data_a: uint<32>, addr_b: uint<32>, data_b: uint<32>, addr_c: uint<32>, data_c: uint<32>)
+        dut.addr_a_i = addr_a
+        dut.data_a_i = data_a
+        dut.addr_b_i = addr_b
+        dut.data_b_i = data_b
+        dut.addr_c_i = addr_c
+        dut.data_c_i = data_c
+    end function set_payloads
+    function pulse_events(a: bool, b: bool, c: bool)
+        dut.select_a_i = a
+        dut.select_b_i = b
+        dut.select_c_i = c
+        wait 1 cycle on clk
+        dut.select_a_i = 0
+        dut.select_b_i = 0
+        dut.select_c_i = 0
+        wait 1 cycle on clk
+    end function pulse_events
+    function wait_for_setup(limit: uint<8>) -> uint<1>
+        for _ in 0 .. limit
+            if dut.apb_psel_o == 1 and dut.apb_penable_o == 0
+                return 0
+            end if
+            wait 1 cycle on clk
+        end for
+        log(error, "timeout waiting for APB SETUP")
+        return 1
+    end function wait_for_setup
+    function wait_for_idle(limit: uint<8>) -> uint<1>
+        for _ in 0 .. limit
+            if dut.apb_psel_o == 0 and dut.apb_penable_o == 0
+                return 0
+            end if
+            wait 1 cycle on clk
+        end for
+        log(error, "timeout waiting for APB idle")
+        return 1
+    end function wait_for_idle
+    function expect_setup(want_addr: uint<32>, want_data: uint<32>) -> uint<1>
+        if wait_for_setup(12) != 0
+            return 1
+        end if
+        if dut.apb_pwrite_o != 1
+            log(error, "SETUP pwrite low")
+            return 1
+        end if
+        if dut.apb_paddr_o != want_addr
+            log(error, "SETUP addr=${dut.apb_paddr_o:08x} expected=${want_addr:08x}")
+            return 1
+        end if
+        if dut.apb_pwdata_o != want_data
+            log(error, "SETUP data=${dut.apb_pwdata_o:08x} expected=${want_data:08x}")
+            return 1
+        end if
+        return 0
+    end function expect_setup
+    function complete_current(ready_delay: uint<5>) -> uint<1>
+        dut.apb_pready_i = 0
+        wait 1 cycle on clk
+        for _ in 0 .. ready_delay
+            dut.apb_pready_i = 0
+            wait 1 cycle on clk
+            if dut.apb_penable_o == 1 and dut.apb_psel_o == 1
+                // Expected ACCESS stall.
+            end if
+        end for
+        dut.apb_pready_i = 1
+        wait 1 cycle on clk
+        return wait_for_idle(8)
+    end function complete_current
+    function trigger_and_complete(a: bool, b: bool, c: bool, want_addr: uint<32>, want_data: uint<32>, ready_delay: uint<5>) -> uint<1>
+        pulse_events(a, b, c)
+        if expect_setup(want_addr, want_data) != 0
+            return 1
+        end if
+        return complete_current(ready_delay)
+    end function trigger_and_complete
+    function timeout_current(want_addr: uint<32>, want_data: uint<32>) -> uint<1>
+        if expect_setup(want_addr, want_data) != 0
+            return 1
+        end if
+        dut.apb_pready_i = 0
+        wait 18 cycles on clk
+        dut.apb_pready_i = 1
+        return wait_for_idle(8)
+    end function timeout_current
 end testbench EventsToApbTb
 
 function make_addr(tag: uint<8>, index: uint<8>) -> uint<32>
     return ((tag as uint<32>) << 8) | ((index as uint<32>) << 2)
 end function make_addr
-
-function reset_ctrl(dut: apb_controller)
-    dut.reset_n = 0
-    dut.select_a_i = 0
-    dut.select_b_i = 0
-    dut.select_c_i = 0
-    dut.addr_a_i = 0
-    dut.data_a_i = 0
-    dut.addr_b_i = 0
-    dut.data_b_i = 0
-    dut.addr_c_i = 0
-    dut.data_c_i = 0
-    dut.apb_pready_i = 1
-    wait 3 cycles on clk
-    assert dut.apb_psel_o == 0 else fail("reset: psel high")
-    assert dut.apb_penable_o == 0 else fail("reset: penable high")
-    assert dut.apb_pwrite_o == 0 else fail("reset: pwrite high")
-    assert dut.apb_paddr_o == 0 else fail("reset: paddr nonzero")
-    assert dut.apb_pwdata_o == 0 else fail("reset: pwdata nonzero")
-    dut.reset_n = 1
-    wait 1 cycle on clk
-end function reset_ctrl
-
-function set_payloads(dut: apb_controller,
-                       addr_a: uint<32>, data_a: uint<32>,
-                       addr_b: uint<32>, data_b: uint<32>,
-                       addr_c: uint<32>, data_c: uint<32>)
-    dut.addr_a_i = addr_a
-    dut.data_a_i = data_a
-    dut.addr_b_i = addr_b
-    dut.data_b_i = data_b
-    dut.addr_c_i = addr_c
-    dut.data_c_i = data_c
-end function set_payloads
-
-function pulse_events(dut: apb_controller, a: bool, b: bool, c: bool)
-    dut.select_a_i = a
-    dut.select_b_i = b
-    dut.select_c_i = c
-    wait 1 cycle on clk
-    dut.select_a_i = 0
-    dut.select_b_i = 0
-    dut.select_c_i = 0
-    wait 1 cycle on clk
-end function pulse_events
-
-function wait_for_setup(dut: apb_controller, limit: uint<8>) -> uint<1>
-    for _ in 0 .. limit
-        if dut.apb_psel_o == 1 and dut.apb_penable_o == 0
-            return 0
-        end if
-        wait 1 cycle on clk
-    end for
-    log(error, "timeout waiting for APB SETUP")
-    return 1
-end function wait_for_setup
-
-function wait_for_idle(dut: apb_controller, limit: uint<8>) -> uint<1>
-    for _ in 0 .. limit
-        if dut.apb_psel_o == 0 and dut.apb_penable_o == 0
-            return 0
-        end if
-        wait 1 cycle on clk
-    end for
-    log(error, "timeout waiting for APB idle")
-    return 1
-end function wait_for_idle
-
-function expect_setup(dut: apb_controller, want_addr: uint<32>, want_data: uint<32>) -> uint<1>
-    if wait_for_setup(dut, 12) != 0
-        return 1
-    end if
-    if dut.apb_pwrite_o != 1
-        log(error, "SETUP pwrite low")
-        return 1
-    end if
-    if dut.apb_paddr_o != want_addr
-        log(error, "SETUP addr=${dut.apb_paddr_o:08x} expected=${want_addr:08x}")
-        return 1
-    end if
-    if dut.apb_pwdata_o != want_data
-        log(error, "SETUP data=${dut.apb_pwdata_o:08x} expected=${want_data:08x}")
-        return 1
-    end if
-    return 0
-end function expect_setup
-
-function complete_current(dut: apb_controller, ready_delay: uint<5>) -> uint<1>
-    dut.apb_pready_i = 0
-    wait 1 cycle on clk
-    for _ in 0 .. ready_delay
-        dut.apb_pready_i = 0
-        wait 1 cycle on clk
-        if dut.apb_penable_o == 1 and dut.apb_psel_o == 1
-            // Expected ACCESS stall.
-        end if
-    end for
-    dut.apb_pready_i = 1
-    wait 1 cycle on clk
-    return wait_for_idle(dut, 8)
-end function complete_current
-
-function trigger_and_complete(dut: apb_controller,
-                              a: bool, b: bool, c: bool,
-                              want_addr: uint<32>, want_data: uint<32>,
-                              ready_delay: uint<5>) -> uint<1>
-    pulse_events(dut, a, b, c)
-    if expect_setup(dut, want_addr, want_data) != 0
-        return 1
-    end if
-    return complete_current(dut, ready_delay)
-end function trigger_and_complete
-
-function timeout_current(dut: apb_controller, want_addr: uint<32>, want_data: uint<32>) -> uint<1>
-    if expect_setup(dut, want_addr, want_data) != 0
-        return 1
-    end if
-    dut.apb_pready_i = 0
-    wait 18 cycles on clk
-    dut.apb_pready_i = 1
-    return wait_for_idle(dut, 8)
-end function timeout_current
 
 impl EventsToApbTest for EventsToApbTb
     clock clk = 10ns
@@ -213,41 +199,39 @@ impl EventsToApbTest for EventsToApbTb
     run
         log(info, "events_to_apb: priority, queue, wait-state, timeout, and randomized event stimulus")
 
-        reset_ctrl(dut)
+        reset_ctrl()
         let errors : uint<32> = 0
 
-        set_payloads(dut,
-            0x00000010, 0x11111111,
+        set_payloads(0x00000010, 0x11111111,
             0x00000020, 0x22222222,
             0x00000030, 0x33333333)
 
-        errors = errors + trigger_and_complete(dut, true, false, false, 0x00000010, 0x11111111, 0)
-        errors = errors + trigger_and_complete(dut, false, true, false, 0x00000020, 0x22222222, 2)
-        errors = errors + trigger_and_complete(dut, false, false, true, 0x00000030, 0x33333333, 1)
+        errors = errors + trigger_and_complete(true, false, false, 0x00000010, 0x11111111, 0)
+        errors = errors + trigger_and_complete(false, true, false, 0x00000020, 0x22222222, 2)
+        errors = errors + trigger_and_complete(false, false, true, 0x00000030, 0x33333333, 1)
 
         // Simultaneous events choose A first, then queued B, then queued C.
-        pulse_events(dut, true, true, true)
-        errors = errors + expect_setup(dut, 0x00000010, 0x11111111)
-        errors = errors + complete_current(dut, 0)
-        errors = errors + expect_setup(dut, 0x00000020, 0x22222222)
-        errors = errors + complete_current(dut, 0)
-        errors = errors + expect_setup(dut, 0x00000030, 0x33333333)
-        errors = errors + complete_current(dut, 0)
+        pulse_events(true, true, true)
+        errors = errors + expect_setup(0x00000010, 0x11111111)
+        errors = errors + complete_current(0)
+        errors = errors + expect_setup(0x00000020, 0x22222222)
+        errors = errors + complete_current(0)
+        errors = errors + expect_setup(0x00000030, 0x33333333)
+        errors = errors + complete_current(0)
 
         // BC simultaneous chooses B first, then C.
-        pulse_events(dut, false, true, true)
-        errors = errors + expect_setup(dut, 0x00000020, 0x22222222)
-        errors = errors + complete_current(dut, 3)
-        errors = errors + expect_setup(dut, 0x00000030, 0x33333333)
-        errors = errors + complete_current(dut, 0)
+        pulse_events(false, true, true)
+        errors = errors + expect_setup(0x00000020, 0x22222222)
+        errors = errors + complete_current(3)
+        errors = errors + expect_setup(0x00000030, 0x33333333)
+        errors = errors + complete_current(0)
 
         // Timeout abort while in ACCESS.
-        set_payloads(dut,
-            0x00000040, 0x44444444,
+        set_payloads(0x00000040, 0x44444444,
             0x00000020, 0x22222222,
             0x00000030, 0x33333333)
-        pulse_events(dut, true, false, false)
-        errors = errors + timeout_current(dut, 0x00000040, 0x44444444)
+        pulse_events(true, false, false)
+        errors = errors + timeout_current(0x00000040, 0x44444444)
 
         // Randomized payloads for event A. Use one event at a time so the
         // data/addr checker remains simple while the solver still varies
@@ -256,11 +240,11 @@ impl EventsToApbTest for EventsToApbTb
             let s : ApbEventStim
             randomize(s)
             let addr : uint<32> = make_addr(s.tag, s.index)
-            set_payloads(dut, addr, s.data, 0x00000020, 0x22222222, 0x00000030, 0x33333333)
-            errors = errors + trigger_and_complete(dut, true, false, false, addr, s.data, 0)
+            set_payloads(addr, s.data, 0x00000020, 0x22222222, 0x00000030, 0x33333333)
+            errors = errors + trigger_and_complete(true, false, false, addr, s.data, 0)
         end for
 
-        reset_ctrl(dut)
+        reset_ctrl()
         assert errors == 0 else fail("events_to_apb produced ${errors} protocol errors")
         log(info, "ALL TESTS PASSED - events_to_apb")
     end run

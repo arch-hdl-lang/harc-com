@@ -263,6 +263,14 @@ impl FuncBuilder<'_> {
             ExprKind::Call { callee, args } => {
                 let what = match &*callee.kind {
                     ExprKind::Ident(id) => {
+                        if self
+                            .inline_frames
+                            .iter()
+                            .any(|f| f.name.starts_with("_tb."))
+                            && self.ctx.tb_methods.contains_key(&id.name)
+                        {
+                            return self.lower_tb_method_call(&id.name, args);
+                        }
                         if self.helpers.contains(&id.name) {
                             return self.lower_helper_call(&id.name, args);
                         }
