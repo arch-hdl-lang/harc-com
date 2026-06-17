@@ -21,7 +21,7 @@ HARC's bet is that you can get UVM's language affordances (transactions, constra
 
 ## Status
 
-Pre-1.0. Stimulus → observation → scoreboard → properties/coverage → reference-model comparison → watchdog termination are all usable end-to-end. 86 fixtures pass against real Verilator-compiled SystemVerilog DUTs in CI. The ARCH cosim path (`--dut`) shares the same C++ TB emission and runs alongside `arch sim` for ARCH-authored DUTs.
+Pre-1.0. Stimulus → observation → scoreboard → properties/coverage → reference-model comparison → watchdog termination are all usable end-to-end. 103 fixtures pass against real Verilator-compiled SystemVerilog DUTs in CI. The ARCH cosim path (`--dut`) shares the same C++ TB emission and runs alongside `arch sim` for ARCH-authored DUTs.
 
 ## Install
 
@@ -172,7 +172,7 @@ graph LR
     style EmulPlatform stroke-dasharray: 5 5
 ```
 
-One `harc sim` invocation drives the v0 path (solid): it parses the `.harc` source (folding any sibling `extend test T` files), emits a single C++ testbench via the default TB-IR codegen (`codegen/tbir/`; pass `--codegen v1` for the legacy direct-AST `cpp_tb` emitter), then chains through either Verilator (`--sv`) or `arch sim` (`--dut`) to compile the DUT alongside the TB, the runtime header, and any `--ref-src` reference models. The resulting binary self-tests at run time, exits zero on `ALL TESTS PASSED`, and writes per-test logs + an optional coverage database. CI runs [`tests/run_fixtures.sh`](tests/run_fixtures.sh) which does this for all 86 fixtures.
+One `harc sim` invocation drives the v0 path (solid): it parses the `.harc` source (folding any sibling `extend test T` files), emits a single C++ testbench via the default TB-IR codegen (`codegen/tbir/`; pass `--codegen v1` for the legacy direct-AST `cpp_tb` emitter), then chains through either Verilator (`--sv`) or `arch sim` (`--dut`) to compile the DUT alongside the TB, the runtime header, and any `--ref-src` reference models. The resulting binary self-tests at run time, exits zero on `ALL TESTS PASSED`, and writes per-test logs + an optional coverage database. CI runs [`tests/run_fixtures.sh`](tests/run_fixtures.sh) which does this for all 103 fixtures.
 
 The dashed paths share the same parser + AST + IR; they branch at codegen by emitting a different target representation. Spec §10 documents the contracts (what survives the transpile cleanly, what's lossy) and the lowering tables. None of the three ship in v0 — the diagram exists so the reader can see where the language is going, not what it does today.
 
@@ -302,7 +302,7 @@ spec.md                   Language reference
 
 ```sh
 cargo test --release          # cargo tests (lib + codegen + round-trip)
-./tests/run_fixtures.sh       # 86 fixtures end-to-end via Verilator
+./tests/run_fixtures.sh       # 103 fixtures end-to-end via Verilator
 ./tests/run_arch_dut_fixtures.sh  # optional ARCH --dut co-sim fixtures
 ```
 
