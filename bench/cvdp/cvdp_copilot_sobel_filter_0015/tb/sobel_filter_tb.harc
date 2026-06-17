@@ -51,97 +51,88 @@ end covergroup SobelCov
 testbench SobelTb
     dut : sobel_filter
     cov : SobelCov
-end testbench SobelTb
 
-function reset_sobel(dut: sobel_filter)
-    dut.rst_n = 0
-    dut.valid_in = 0
-    dut.pixel_in = 0
-    wait 3 cycles on clk
-    assert dut.valid_out == 0 else fail("reset: valid_out high")
-    assert dut.edge_out == 0 else fail("reset: edge_out nonzero")
-    dut.rst_n = 1
-    wait 2 cycles on clk
-end function reset_sobel
-
-function drive_pixel(dut: sobel_filter, pixel: uint<8>)
-    dut.pixel_in = pixel
-    dut.valid_in = 1
-    wait 1 cycle on clk
-end function drive_pixel
-
-function end_window(dut: sobel_filter)
-    dut.valid_in = 0
-    dut.pixel_in = 0
-    wait 2 cycles on clk
-end function end_window
-
-function drive_window(dut: sobel_filter,
-                      p0: uint<8>, p1: uint<8>, p2: uint<8>,
-                      p3: uint<8>, p4: uint<8>, p5: uint<8>,
-                      p6: uint<8>, p7: uint<8>, p8: uint<8>,
-                      expected_edge: uint<8>) -> uint<1>
-    drive_pixel(dut, p0)
-    drive_pixel(dut, p1)
-    drive_pixel(dut, p2)
-    drive_pixel(dut, p3)
-    drive_pixel(dut, p4)
-    drive_pixel(dut, p5)
-    drive_pixel(dut, p6)
-    drive_pixel(dut, p7)
-    drive_pixel(dut, p8)
-
-    if dut.valid_out != 1
-        log(error, "window did not assert valid_out")
-        end_window(dut)
-        return 1
-    end if
-    if dut.edge_out != expected_edge
-        log(error, "window edge_out=${dut.edge_out}, expected=${expected_edge}")
-        end_window(dut)
-        return 1
-    end if
-    end_window(dut)
-    return 0
-end function drive_window
-
-function drive_midstream_gap(dut: sobel_filter) -> uint<1>
-    drive_pixel(dut, 10)
-    drive_pixel(dut, 20)
-    drive_pixel(dut, 30)
-    drive_pixel(dut, 40)
-    dut.valid_in = 0
-    wait 2 cycles on clk
-    drive_pixel(dut, 50)
-    drive_pixel(dut, 60)
-    drive_pixel(dut, 70)
-    drive_pixel(dut, 80)
-    drive_pixel(dut, 90)
-    if dut.valid_out != 0
-        log(error, "valid gap failed to reset Sobel pixel count")
-        end_window(dut)
-        return 1
-    end if
-    end_window(dut)
-    return 0
-end function drive_midstream_gap
-
-function drive_midstream_reset(dut: sobel_filter) -> uint<1>
-    drive_pixel(dut, 255)
-    drive_pixel(dut, 128)
-    drive_pixel(dut, 0)
-    dut.rst_n = 0
-    wait 2 cycles on clk
-    if dut.valid_out != 0 or dut.edge_out != 0
-        log(error, "midstream reset did not clear outputs")
+    function reset_sobel()
+        dut.rst_n = 0
+        dut.valid_in = 0
+        dut.pixel_in = 0
+        wait 3 cycles on clk
+        assert dut.valid_out == 0 else fail("reset: valid_out high")
+        assert dut.edge_out == 0 else fail("reset: edge_out nonzero")
         dut.rst_n = 1
-        end_window(dut)
-        return 1
-    end if
-    dut.rst_n = 1
-    end_window(dut)
-    return 0
-end function drive_midstream_reset
+        wait 2 cycles on clk
+    end function reset_sobel
+    function drive_pixel(pixel: uint<8>)
+        dut.pixel_in = pixel
+        dut.valid_in = 1
+        wait 1 cycle on clk
+    end function drive_pixel
+    function end_window()
+        dut.valid_in = 0
+        dut.pixel_in = 0
+        wait 2 cycles on clk
+    end function end_window
+    function drive_window(p0: uint<8>, p1: uint<8>, p2: uint<8>, p3: uint<8>, p4: uint<8>, p5: uint<8>, p6: uint<8>, p7: uint<8>, p8: uint<8>, expected_edge: uint<8>) -> uint<1>
+        drive_pixel(p0)
+        drive_pixel(p1)
+        drive_pixel(p2)
+        drive_pixel(p3)
+        drive_pixel(p4)
+        drive_pixel(p5)
+        drive_pixel(p6)
+        drive_pixel(p7)
+        drive_pixel(p8)
+
+        if dut.valid_out != 1
+            log(error, "window did not assert valid_out")
+            end_window()
+            return 1
+        end if
+        if dut.edge_out != expected_edge
+            log(error, "window edge_out=${dut.edge_out}, expected=${expected_edge}")
+            end_window()
+            return 1
+        end if
+        end_window()
+        return 0
+    end function drive_window
+    function drive_midstream_gap() -> uint<1>
+        drive_pixel(10)
+        drive_pixel(20)
+        drive_pixel(30)
+        drive_pixel(40)
+        dut.valid_in = 0
+        wait 2 cycles on clk
+        drive_pixel(50)
+        drive_pixel(60)
+        drive_pixel(70)
+        drive_pixel(80)
+        drive_pixel(90)
+        if dut.valid_out != 0
+            log(error, "valid gap failed to reset Sobel pixel count")
+            end_window()
+            return 1
+        end if
+        end_window()
+        return 0
+    end function drive_midstream_gap
+    function drive_midstream_reset() -> uint<1>
+        drive_pixel(255)
+        drive_pixel(128)
+        drive_pixel(0)
+        dut.rst_n = 0
+        wait 2 cycles on clk
+        if dut.valid_out != 0 or dut.edge_out != 0
+            log(error, "midstream reset did not clear outputs")
+            dut.rst_n = 1
+            end_window()
+            return 1
+        end if
+        dut.rst_n = 1
+        end_window()
+        return 0
+    end function drive_midstream_reset
+end testbench SobelTb
 
 impl SobelTest for SobelTb
     clock clk = 10ns
@@ -149,33 +140,33 @@ impl SobelTest for SobelTb
     run
         log(info, "sobel_filter: directed 3x3 windows, valid gaps, reset, and randomized pixels")
 
-        reset_sobel(dut)
+        reset_sobel()
         let errors : uint<32> = 0
 
-        errors = errors + drive_midstream_gap(dut)
-        errors = errors + drive_midstream_reset(dut)
+        errors = errors + drive_midstream_gap()
+        errors = errors + drive_midstream_reset()
 
         // Uniform no-edge windows.
-        errors = errors + drive_window(dut, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-        errors = errors + drive_window(dut, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0)
+        errors = errors + drive_window(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        errors = errors + drive_window(255, 255, 255, 255, 255, 255, 255, 255, 255, 0)
 
         // Edge windows chosen to hit positive/negative Gx and Gy absolute-value paths.
-        errors = errors + drive_window(dut, 0, 0, 0, 0, 128, 255, 0, 128, 255, 255)
-        errors = errors + drive_window(dut, 255, 128, 0, 255, 128, 0, 255, 128, 0, 255)
-        errors = errors + drive_window(dut, 255, 255, 255, 0, 0, 0, 0, 0, 0, 255)
-        errors = errors + drive_window(dut, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255)
+        errors = errors + drive_window(0, 0, 0, 0, 128, 255, 0, 128, 255, 255)
+        errors = errors + drive_window(255, 128, 0, 255, 128, 0, 255, 128, 0, 255)
+        errors = errors + drive_window(255, 255, 255, 0, 0, 0, 0, 0, 0, 255)
+        errors = errors + drive_window(0, 0, 0, 0, 0, 0, 255, 255, 255, 255)
 
         // Small perturbation below threshold.
-        errors = errors + drive_window(dut, 10, 10, 10, 10, 11, 10, 10, 10, 10, 0)
+        errors = errors + drive_window(10, 10, 10, 10, 11, 10, 10, 10, 10, 0)
 
         for _ in 0 .. 12
             let s : PixelStim
             randomize(s)
-            drive_pixel(dut, s.pixel)
+            drive_pixel(s.pixel)
         end for
-        end_window(dut)
+        end_window()
 
-        reset_sobel(dut)
+        reset_sobel()
         assert errors == 0 else fail("sobel_filter produced ${errors} errors")
         log(info, "ALL TESTS PASSED - sobel_filter")
     end run

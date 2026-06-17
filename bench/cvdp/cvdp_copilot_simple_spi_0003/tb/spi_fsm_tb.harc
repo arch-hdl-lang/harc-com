@@ -71,124 +71,122 @@ end covergroup SpiCov
 testbench SpiFsmTb
     dut : spi_fsm_top
     cov : SpiCov
-end testbench SpiFsmTb
 
-function reset_spi(dut: spi_fsm_top)
-    dut.i_rst_b = 0
-    dut.i_data_in = 0
-    dut.i_enable = 0
-    dut.i_fault = 0
-    dut.i_clear = 0
-    wait 3 cycles
-    assert dut.o_fsm_state == 0 else fail("reset: state expected IDLE")
-    assert dut.o_bits_left == 16 else fail("reset: bits_left expected 16")
-    dut.i_rst_b = 1
-    wait 1 cycle
-end function reset_spi
-
-function run_full_transfer(dut: spi_fsm_top, data: uint<16>)
-    dut.i_data_in = data
-    dut.i_enable = 1
-    dut.i_fault = 0
-    dut.i_clear = 0
-
-    let saw_transmit : bool = false
-    let saw_toggle : bool = false
-    let saw_done : bool = false
-    for _ in 0 .. 40
-        if dut.o_fsm_state == 1
-            saw_transmit = true
-        end if
-        if dut.o_fsm_state == 2
-            saw_toggle = true
-        end if
-        if dut.o_done == 1
-            saw_done = true
-        end if
-        wait 1 cycle
-    end for
-
-    dut.i_enable = 0
-    wait 2 cycles
-    dut.i_enable = 1
-    wait 1 cycle
-end function run_full_transfer
-
-function interrupt_transfer(dut: spi_fsm_top, data: uint<16>, at_cycle: uint<5>, fault: bool, clear: bool)
-    dut.i_data_in = data
-    dut.i_enable = 1
-    dut.i_fault = 0
-    dut.i_clear = 0
-    wait 1 cycle
-
-    for _ in 0 .. at_cycle
-        wait 1 cycle
-    end for
-
-    if fault
-        dut.i_fault = 1
-        wait 2 cycles
-        assert dut.o_fsm_state == 3 else fail("fault interrupt: expected ERROR state")
+    function reset_spi()
+        dut.i_rst_b = 0
+        dut.i_data_in = 0
+        dut.i_enable = 0
         dut.i_fault = 0
         dut.i_clear = 0
+        wait 3 cycles
+        assert dut.o_fsm_state == 0 else fail("reset: state expected IDLE")
+        assert dut.o_bits_left == 16 else fail("reset: bits_left expected 16")
+        dut.i_rst_b = 1
         wait 1 cycle
-        dut.i_clear = 1
-        wait 1 cycle
-        dut.i_clear = 0
-        wait 1 cycle
-        dut.i_fault = 1
-        dut.i_clear = 1
-        wait 1 cycle
+    end function reset_spi
+    function run_full_transfer(data: uint<16>)
+        dut.i_data_in = data
+        dut.i_enable = 1
         dut.i_fault = 0
         dut.i_clear = 0
-        wait 1 cycle
-    elsif clear
-        dut.i_clear = 1
-        wait 1 cycle
-        dut.i_clear = 0
-        wait 1 cycle
-    else
+
+        let saw_transmit : bool = false
+        let saw_toggle : bool = false
+        let saw_done : bool = false
+        for _ in 0 .. 40
+            if dut.o_fsm_state == 1
+                saw_transmit = true
+            end if
+            if dut.o_fsm_state == 2
+                saw_toggle = true
+            end if
+            if dut.o_done == 1
+                saw_done = true
+            end if
+            wait 1 cycle
+        end for
+
         dut.i_enable = 0
         wait 2 cycles
         dut.i_enable = 1
         wait 1 cycle
-    end if
-end function interrupt_transfer
+    end function run_full_transfer
+    function interrupt_transfer(data: uint<16>, at_cycle: uint<5>, fault: bool, clear: bool)
+        dut.i_data_in = data
+        dut.i_enable = 1
+        dut.i_fault = 0
+        dut.i_clear = 0
+        wait 1 cycle
+
+        for _ in 0 .. at_cycle
+            wait 1 cycle
+        end for
+
+        if fault
+            dut.i_fault = 1
+            wait 2 cycles
+            assert dut.o_fsm_state == 3 else fail("fault interrupt: expected ERROR state")
+            dut.i_fault = 0
+            dut.i_clear = 0
+            wait 1 cycle
+            dut.i_clear = 1
+            wait 1 cycle
+            dut.i_clear = 0
+            wait 1 cycle
+            dut.i_fault = 1
+            dut.i_clear = 1
+            wait 1 cycle
+            dut.i_fault = 0
+            dut.i_clear = 0
+            wait 1 cycle
+        elsif clear
+            dut.i_clear = 1
+            wait 1 cycle
+            dut.i_clear = 0
+            wait 1 cycle
+        else
+            dut.i_enable = 0
+            wait 2 cycles
+            dut.i_enable = 1
+            wait 1 cycle
+        end if
+    end function interrupt_transfer
+end testbench SpiFsmTb
 
 impl SpiFsmTest for SpiFsmTb
     run
         log(info, "spi_fsm: transmission, interrupts, fault recovery, and unique random payloads")
 
-        reset_spi(dut)
+        reset_spi()
 
-        run_full_transfer(dut, 0x0000)
-        run_full_transfer(dut, 0xFFFF)
-        run_full_transfer(dut, 0x8000)
-        run_full_transfer(dut, 0x0001)
-        run_full_transfer(dut, 0xAAAA)
-        run_full_transfer(dut, 0x5555)
+        run_full_transfer(0x0000)
+        run_full_transfer(0xFFFF)
+        run_full_transfer(0x8000)
+        run_full_transfer(0x0001)
+        run_full_transfer(0xAAAA)
+        run_full_transfer(0x5555)
 
-        interrupt_transfer(dut, 0x1234, 4, false, false)
-        interrupt_transfer(dut, 0xCAFE, 6, false, true)
-        interrupt_transfer(dut, 0xBEEF, 8, true, false)
+        interrupt_transfer(0x1234, 4, false, false)
+        interrupt_transfer(0xCAFE, 6, false, true)
+        interrupt_transfer(0xBEEF, 8, true, false)
 
         for bit in 0 .. 16
             let data : uint<16> = ((1 as uint<16>) << bit).trunc<16>()
-            run_full_transfer(dut, data)
-            run_full_transfer(dut, (0xFFFF ^ data).trunc<16>())
+            run_full_transfer(data)
+            run_full_transfer((0xFFFF ^ data).trunc<16>())
         end for
 
         for _ in 0 .. 24
             let s : SpiStim
             randomize(s)
             if s.fault or s.clear
-                interrupt_transfer(dut, s.data, s.interrupt_at, s.fault, s.clear)
+                interrupt_transfer(s.data, s.interrupt_at, s.fault, s.clear)
             else
-                run_full_transfer(dut, s.data)
+                run_full_transfer(s.data)
             end if
         end for
 
-        reset_spi(dut)
+        reset_spi()
         log(info, "ALL TESTS PASSED - spi_fsm")
     end run
 

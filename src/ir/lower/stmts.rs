@@ -342,6 +342,15 @@ impl FuncBuilder<'_> {
                 let what = match &*e.kind {
                     ExprKind::Call { callee, args } => match &*callee.kind {
                         ExprKind::Ident(id) => {
+                            if self
+                                .inline_frames
+                                .iter()
+                                .any(|f| f.name.starts_with("_tb."))
+                                && self.ctx.tb_methods.contains_key(&id.name)
+                            {
+                                self.lower_tb_method_call(&id.name, args)?;
+                                return Ok(());
+                            }
                             if self.helpers.contains(&id.name) {
                                 // Statement-position helper call: lower
                                 // for effect, discard the value. Impure

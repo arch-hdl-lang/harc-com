@@ -100,65 +100,62 @@ covergroup ApbDspCov @(posedge dut.clk)
     cross cp_handshake, cp_error
 end covergroup ApbDspCov
 
-function apb_idle(dut: apb_dsp_unit_top)
-    dut.pselx = 0
-    dut.penable = 0
-    dut.pwrite = 0
-    dut.paddr = 0
-    dut.pwdata = 0
-    wait 1 cycle
-end function apb_idle
-
-function apb_write(dut: apb_dsp_unit_top, addr: uint<10>, data: uint<8>)
-    dut.paddr = addr
-    dut.pwdata = data
-    dut.pwrite = 1
-    dut.pselx = 1
-    dut.penable = 0
-    wait 1 cycle
-    dut.penable = 1
-    wait 1 cycle
-    assert dut.pready == 1
-        else fail("apb_write addr=0x${addr:03x}: pready was not asserted")
-    dut.pselx = 0
-    dut.penable = 0
-    dut.pwrite = 0
-    wait 1 cycle
-end function apb_write
-
-function apb_read(dut: apb_dsp_unit_top, addr: uint<10>) -> uint<8>
-    dut.paddr = addr
-    dut.pwdata = 0
-    dut.pwrite = 0
-    dut.pselx = 1
-    dut.penable = 0
-    wait 1 cycle
-    dut.penable = 1
-    wait 1 cycle
-    assert dut.pready == 1
-        else fail("apb_read addr=0x${addr:03x}: pready was not asserted")
-    let val = dut.prdata
-    dut.pselx = 0
-    dut.penable = 0
-    wait 1 cycle
-    return val
-end function apb_read
-
-function sram_store(dut: apb_dsp_unit_top, addr: uint<8>, data: uint<8>)
-    apb_write(dut, 2, 3)
-    apb_write(dut, 3, addr)
-    apb_write(dut, 4, data)
-    dut.sram_valid = 0
-    wait 1 cycle
-    dut.sram_valid = 1
-    wait 1 cycle
-    dut.sram_valid = 0
-    wait 1 cycle
-end function sram_store
-
 testbench ApbDspTb
     dut : apb_dsp_unit_top
     cov : ApbDspCov
+
+    function apb_idle()
+        dut.pselx = 0
+        dut.penable = 0
+        dut.pwrite = 0
+        dut.paddr = 0
+        dut.pwdata = 0
+        wait 1 cycle
+    end function apb_idle
+    function apb_write(addr: uint<10>, data: uint<8>)
+        dut.paddr = addr
+        dut.pwdata = data
+        dut.pwrite = 1
+        dut.pselx = 1
+        dut.penable = 0
+        wait 1 cycle
+        dut.penable = 1
+        wait 1 cycle
+        assert dut.pready == 1
+            else fail("apb_write addr=0x${addr:03x}: pready was not asserted")
+        dut.pselx = 0
+        dut.penable = 0
+        dut.pwrite = 0
+        wait 1 cycle
+    end function apb_write
+    function apb_read(addr: uint<10>) -> uint<8>
+        dut.paddr = addr
+        dut.pwdata = 0
+        dut.pwrite = 0
+        dut.pselx = 1
+        dut.penable = 0
+        wait 1 cycle
+        dut.penable = 1
+        wait 1 cycle
+        assert dut.pready == 1
+            else fail("apb_read addr=0x${addr:03x}: pready was not asserted")
+        let val = dut.prdata
+        dut.pselx = 0
+        dut.penable = 0
+        wait 1 cycle
+        return val
+    end function apb_read
+    function sram_store(addr: uint<8>, data: uint<8>)
+        apb_write(2, 3)
+        apb_write(3, addr)
+        apb_write(4, data)
+        dut.sram_valid = 0
+        wait 1 cycle
+        dut.sram_valid = 1
+        wait 1 cycle
+        dut.sram_valid = 0
+        wait 1 cycle
+    end function sram_store
 end testbench ApbDspTb
 
 impl ApbDspTest for ApbDspTb
@@ -179,23 +176,23 @@ impl ApbDspTest for ApbDspTb
         dut.presetn = 1
         wait 1 cycle
 
-        apb_write(dut, 0, 0x00)
-        apb_write(dut, 1, 0xFF)
-        apb_write(dut, 2, 0x00)
-        apb_write(dut, 3, 0x55)
-        apb_write(dut, 4, 0xAA)
-        assert apb_read(dut, 0) == 0x00 else fail("CSR0 readback mismatch")
-        assert apb_read(dut, 1) == 0xFF else fail("CSR1 readback mismatch")
-        assert apb_read(dut, 2) == 0x00 else fail("CSR2 readback mismatch")
-        assert apb_read(dut, 3) == 0x55 else fail("CSR3 readback mismatch")
-        assert apb_read(dut, 4) == 0xAA else fail("CSR4 readback mismatch")
+        apb_write(0, 0x00)
+        apb_write(1, 0xFF)
+        apb_write(2, 0x00)
+        apb_write(3, 0x55)
+        apb_write(4, 0xAA)
+        assert apb_read(0) == 0x00 else fail("CSR0 readback mismatch")
+        assert apb_read(1) == 0xFF else fail("CSR1 readback mismatch")
+        assert apb_read(2) == 0x00 else fail("CSR2 readback mismatch")
+        assert apb_read(3) == 0x55 else fail("CSR3 readback mismatch")
+        assert apb_read(4) == 0xAA else fail("CSR4 readback mismatch")
 
-        apb_write(dut, 0, 0xFF)
-        apb_write(dut, 1, 0x00)
-        apb_write(dut, 2, 0x07)
-        apb_write(dut, 3, 0x00)
-        apb_write(dut, 4, 0xFF)
-        assert apb_read(dut, 2) == 0x07 else fail("invalid mode CSR readback mismatch")
+        apb_write(0, 0xFF)
+        apb_write(1, 0x00)
+        apb_write(2, 0x07)
+        apb_write(3, 0x00)
+        apb_write(4, 0xFF)
+        assert apb_read(2) == 0x07 else fail("invalid mode CSR readback mismatch")
 
         dut.paddr = 0
         dut.pwdata = 0x33
@@ -208,10 +205,10 @@ impl ApbDspTest for ApbDspTb
         wait 1 cycle
         dut.penable = 0
         wait 1 cycle
-        assert apb_read(dut, 0) == 0xFF
+        assert apb_read(0) == 0xFF
             else fail("malformed handshake unexpectedly changed operand_1")
 
-        apb_write(dut, 2, 0)
+        apb_write(2, 0)
         dut.paddr = 0x3FF
         dut.pwrite = 0
         dut.pselx = 1
@@ -237,41 +234,41 @@ impl ApbDspTest for ApbDspTb
         wait 1 cycle
         assert dut.pslverr == 1
             else fail("invalid CSR write did not raise pslverr")
-        apb_idle(dut)
+        apb_idle()
 
-        sram_store(dut, 0x10, 0x12)
-        sram_store(dut, 0x11, 0x34)
-        sram_store(dut, 0xFE, 0xFF)
-        apb_write(dut, 2, 3)
-        assert apb_read(dut, 0x10) == 0x12
+        sram_store(0x10, 0x12)
+        sram_store(0x11, 0x34)
+        sram_store(0xFE, 0xFF)
+        apb_write(2, 3)
+        assert apb_read(0x10) == 0x12
             else fail("memory read @0x10 mismatch in write mode")
-        assert apb_read(dut, 0x11) == 0x34
+        assert apb_read(0x11) == 0x34
             else fail("memory read @0x11 mismatch in write mode")
 
-        apb_write(dut, 0, 0x10)
-        apb_write(dut, 1, 0x11)
-        apb_write(dut, 2, 1)
+        apb_write(0, 0x10)
+        apb_write(1, 0x11)
+        apb_write(2, 1)
         wait 2 cycles
-        assert apb_read(dut, 5) == 0x46
+        assert apb_read(5) == 0x46
             else fail("addition result mismatch")
 
-        apb_write(dut, 0, 0xFE)
-        apb_write(dut, 1, 0x11)
-        apb_write(dut, 2, 1)
+        apb_write(0, 0xFE)
+        apb_write(1, 0x11)
+        apb_write(2, 1)
         wait 2 cycles
-        assert apb_read(dut, 5) == 0x33
+        assert apb_read(5) == 0x33
             else fail("overflow addition result mismatch")
 
-        apb_write(dut, 0, 0x10)
-        apb_write(dut, 1, 0x11)
-        apb_write(dut, 2, 2)
+        apb_write(0, 0x10)
+        apb_write(1, 0x11)
+        apb_write(2, 2)
         wait 2 cycles
-        assert apb_read(dut, 5) == 0xA8
+        assert apb_read(5) == 0xA8
             else fail("multiplication result mismatch")
 
-        apb_write(dut, 2, 0)
+        apb_write(2, 0)
         wait 2 cycles
-        assert apb_read(dut, 5) == 0xA8
+        assert apb_read(5) == 0xA8
             else fail("disabled mode changed result unexpectedly")
 
         dut.presetn = 0
@@ -281,13 +278,13 @@ impl ApbDspTest for ApbDspTb
         assert dut.prdata == 0 else fail("mid-reset: prdata expected 0")
         dut.presetn = 1
         wait 1 cycle
-        assert apb_read(dut, 0) == 0 else fail("post-reset CSR0 not cleared")
-        assert apb_read(dut, 1) == 0 else fail("post-reset CSR1 not cleared")
-        assert apb_read(dut, 2) == 0 else fail("post-reset CSR2 not cleared")
+        assert apb_read(0) == 0 else fail("post-reset CSR0 not cleared")
+        assert apb_read(1) == 0 else fail("post-reset CSR1 not cleared")
+        assert apb_read(2) == 0 else fail("post-reset CSR2 not cleared")
 
-        sram_store(dut, 0xFF, 0x7E)
-        apb_write(dut, 2, 3)
-        assert apb_read(dut, 0xFF) == 0x7E
+        sram_store(0xFF, 0x7E)
+        apb_write(2, 3)
+        assert apb_read(0xFF) == 0x7E
             else fail("memory read @0xff mismatch")
 
         for k in 0 .. 24
@@ -298,11 +295,11 @@ impl ApbDspTest for ApbDspTb
                 t.mode in [0..3]
             end randomize
 
-            apb_write(dut, 2, t.mode)
+            apb_write(2, t.mode)
             if t.write == 1
-                apb_write(dut, t.addr, t.data)
+                apb_write(t.addr, t.data)
             else
-                let rv = apb_read(dut, t.addr)
+                let rv = apb_read(t.addr)
                 assert dut.pslverr == 0
                     else fail("legal random read k=${k} addr=0x${t.addr:03x} raised pslverr")
             end if
@@ -316,7 +313,7 @@ impl ApbDspTest for ApbDspTb
                 t.mode in [0..2]
             end randomize
 
-            apb_write(dut, 2, t.mode)
+            apb_write(2, t.mode)
             dut.paddr = t.addr
             dut.pwdata = t.data
             dut.pwrite = t.write
@@ -327,7 +324,7 @@ impl ApbDspTest for ApbDspTb
             wait 1 cycle
             assert dut.pslverr == 1
                 else fail("invalid random APB k=${k} addr=0x${t.addr:03x} did not raise pslverr")
-            apb_idle(dut)
+            apb_idle()
         end for
 
         for k in 0 .. 12
@@ -347,22 +344,22 @@ impl ApbDspTest for ApbDspTb
         end for
 
         for m in 0 .. 8
-            apb_write(dut, 2, m as uint<8>)
+            apb_write(2, m as uint<8>)
             wait 1 cycle
         end for
 
         // Toggle high bits of r_enable and pulse sram_valid while not in
         // MODE_WRITE to cover the no-write side of the SRAM-valid block.
-        apb_write(dut, 2, 0xF8)
+        apb_write(2, 0xF8)
         dut.sram_valid = 0
         wait 1 cycle
         dut.sram_valid = 1
         wait 1 cycle
         dut.sram_valid = 0
         wait 1 cycle
-        apb_write(dut, 2, 0xFF)
+        apb_write(2, 0xFF)
         wait 1 cycle
-        apb_write(dut, 2, 0)
+        apb_write(2, 0)
         wait 1 cycle
 
         log(info, "ALL TESTS PASSED - apb_dsp_unit")

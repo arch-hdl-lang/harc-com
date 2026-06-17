@@ -117,77 +117,73 @@ end covergroup SramCov
 testbench SramFdTb
     dut : cvdp_sram_fd
     cov : SramCov
+
+    function drive_idle()
+        dut.ce = 1
+        dut.a_we = 0
+        dut.a_oe = 0
+        dut.a_addr = 0
+        dut.a_wdata = 0
+        dut.b_we = 0
+        dut.b_oe = 0
+        dut.b_addr = 0
+        dut.b_wdata = 0
+    end function drive_idle
+    function write_a(addr: uint<4>, data: uint<8>)
+        dut.ce = 1
+        dut.a_we = 1
+        dut.a_oe = 0
+        dut.a_addr = addr
+        dut.a_wdata = data
+        dut.b_we = 0
+        dut.b_oe = 0
+        wait 1 cycle
+        dut.a_we = 0
+    end function write_a
+    function write_b(addr: uint<4>, data: uint<8>)
+        dut.ce = 1
+        dut.a_we = 0
+        dut.a_oe = 0
+        dut.b_we = 1
+        dut.b_oe = 0
+        dut.b_addr = addr
+        dut.b_wdata = data
+        wait 1 cycle
+        dut.b_we = 0
+    end function write_b
+    function read_a(addr: uint<4>) -> uint<8>
+        dut.ce = 1
+        dut.a_we = 0
+        dut.a_oe = 1
+        dut.a_addr = addr
+        dut.b_we = 0
+        dut.b_oe = 0
+        wait 1 cycle
+        dut.a_oe = 0
+        return dut.a_rdata
+    end function read_a
+    function read_b(addr: uint<4>) -> uint<8>
+        dut.ce = 1
+        dut.a_we = 0
+        dut.a_oe = 0
+        dut.b_we = 0
+        dut.b_oe = 1
+        dut.b_addr = addr
+        wait 1 cycle
+        dut.b_oe = 0
+        return dut.b_rdata
+    end function read_b
 end testbench SramFdTb
 
 function init_data(addr: uint<4>) -> uint<8>
     return ((addr as uint<8>) * 17 + 3).trunc<8>()
 end function init_data
 
-function drive_idle(dut: cvdp_sram_fd)
-    dut.ce = 1
-    dut.a_we = 0
-    dut.a_oe = 0
-    dut.a_addr = 0
-    dut.a_wdata = 0
-    dut.b_we = 0
-    dut.b_oe = 0
-    dut.b_addr = 0
-    dut.b_wdata = 0
-end function drive_idle
-
-function write_a(dut: cvdp_sram_fd, addr: uint<4>, data: uint<8>)
-    dut.ce = 1
-    dut.a_we = 1
-    dut.a_oe = 0
-    dut.a_addr = addr
-    dut.a_wdata = data
-    dut.b_we = 0
-    dut.b_oe = 0
-    wait 1 cycle
-    dut.a_we = 0
-end function write_a
-
-function write_b(dut: cvdp_sram_fd, addr: uint<4>, data: uint<8>)
-    dut.ce = 1
-    dut.a_we = 0
-    dut.a_oe = 0
-    dut.b_we = 1
-    dut.b_oe = 0
-    dut.b_addr = addr
-    dut.b_wdata = data
-    wait 1 cycle
-    dut.b_we = 0
-end function write_b
-
-function read_a(dut: cvdp_sram_fd, addr: uint<4>) -> uint<8>
-    dut.ce = 1
-    dut.a_we = 0
-    dut.a_oe = 1
-    dut.a_addr = addr
-    dut.b_we = 0
-    dut.b_oe = 0
-    wait 1 cycle
-    dut.a_oe = 0
-    return dut.a_rdata
-end function read_a
-
-function read_b(dut: cvdp_sram_fd, addr: uint<4>) -> uint<8>
-    dut.ce = 1
-    dut.a_we = 0
-    dut.a_oe = 0
-    dut.b_we = 0
-    dut.b_oe = 1
-    dut.b_addr = addr
-    wait 1 cycle
-    dut.b_oe = 0
-    return dut.b_rdata
-end function read_b
-
 impl SramFdTest for SramFdTb
     run
         log(info, "cvdp_sram_fd: dual-port SRAM read/write/collision coverage")
 
-        drive_idle(dut)
+        drive_idle()
         dut.ce = 0
         wait 2 cycles
         assert dut.a_rdata == 0 else fail("ce=0 baseline: a_rdata=0x${dut.a_rdata:02x}, expected 0")
@@ -209,16 +205,16 @@ impl SramFdTest for SramFdTb
             dut.b_wdata = init_data(b)
             wait 1 cycle
         end for
-        drive_idle(dut)
+        drive_idle()
         wait 1 cycle
 
         // Single-port write/read on each port, including boundaries.
-        write_a(dut, 0, 0xA5)
-        assert read_a(dut, 0) == 0xA5
+        write_a(0, 0xA5)
+        assert read_a(0) == 0xA5
             else fail("port A boundary read @0: got 0x${dut.a_rdata:02x}, expected 0xA5")
 
-        write_b(dut, 15, 0x5A)
-        assert read_b(dut, 15) == 0x5A
+        write_b(15, 0x5A)
+        assert read_b(15) == 0x5A
             else fail("port B boundary read @15: got 0x${dut.b_rdata:02x}, expected 0x5A")
 
         // Dual reads: same address should produce matching data on both ports.
@@ -257,14 +253,14 @@ impl SramFdTest for SramFdTb
         wait 1 cycle
         dut.a_we = 0
         dut.b_we = 0
-        assert read_b(dut, 1) == 0x11
+        assert read_b(1) == 0x11
             else fail("dual write readback B@1: got 0x${dut.b_rdata:02x}, expected 0x11")
-        assert read_a(dut, 14) == 0xEE
+        assert read_a(14) == 0xEE
             else fail("dual write readback A@14: got 0x${dut.a_rdata:02x}, expected 0xEE")
 
         // Same-port read/write collision is read-first: old data is observed,
         // then the new data is visible on a later read.
-        write_a(dut, 2, 0x22)
+        write_a(2, 0x22)
         dut.ce = 1
         dut.a_we = 1
         dut.a_oe = 1
@@ -281,7 +277,7 @@ impl SramFdTest for SramFdTb
         assert dut.a_rdata == 0x99
             else fail("same-port A post-write: got 0x${dut.a_rdata:02x}, expected new 0x99")
 
-        write_b(dut, 13, 0x33)
+        write_b(13, 0x33)
         dut.b_we = 1
         dut.b_oe = 1
         dut.b_addr = 13
@@ -298,7 +294,7 @@ impl SramFdTest for SramFdTb
             else fail("same-port B post-write: got 0x${dut.b_rdata:02x}, expected new 0x77")
 
         // Cross-port same-address read/write collisions are also read-first.
-        write_a(dut, 4, 0x44)
+        write_a(4, 0x44)
         dut.ce = 1
         dut.a_we = 1
         dut.a_oe = 0
@@ -315,7 +311,7 @@ impl SramFdTest for SramFdTb
         assert dut.b_rdata == 0xC4
             else fail("A-write/B-read post-write: got 0x${dut.b_rdata:02x}, expected new 0xC4")
 
-        write_b(dut, 5, 0x55)
+        write_b(5, 0x55)
         dut.a_we = 0
         dut.a_oe = 1
         dut.a_addr = 5
@@ -346,9 +342,9 @@ impl SramFdTest for SramFdTb
             else fail("ce=0 active A controls: got 0x${dut.a_rdata:02x}, expected 0")
         assert dut.b_rdata == 0
             else fail("ce=0 active B controls: got 0x${dut.b_rdata:02x}, expected 0")
-        assert read_a(dut, 6) == init_data(6)
+        assert read_a(6) == init_data(6)
             else fail("ce=0 write ignored A@6: got 0x${dut.a_rdata:02x}, expected 0x${init_data(6):02x}")
-        assert read_b(dut, 7) == init_data(7)
+        assert read_b(7) == init_data(7)
             else fail("ce=0 write ignored B@7: got 0x${dut.b_rdata:02x}, expected 0x${init_data(7):02x}")
 
         // ce enabled with no op should retain the previous read outputs.
@@ -388,13 +384,13 @@ impl SramFdTest for SramFdTb
         // Verilator instruments the unpacked memory array per element and
         // data bit. Force every RAM bit through 0 and 1 with legal writes.
         for addr in 0 .. 16
-            write_a(dut, addr as uint<4>, 0x00)
+            write_a(addr as uint<4>, 0x00)
         end for
         for addr in 0 .. 16
-            write_b(dut, addr as uint<4>, 0xFF)
+            write_b(addr as uint<4>, 0xFF)
         end for
         for addr in 0 .. 16
-            write_a(dut, addr as uint<4>, init_data(addr as uint<4>))
+            write_a(addr as uint<4>, init_data(addr as uint<4>))
         end for
 
         // Constrained-random legal accesses. The first three loops force
@@ -449,7 +445,7 @@ impl SramFdTest for SramFdTb
                 else fail("random legal constraint violated: dual write same addr ${dut.a_addr}")
         end for
 
-        drive_idle(dut)
+        drive_idle()
         wait 1 cycle
         log(info, "ALL TESTS PASSED - cvdp_sram_fd")
     end run

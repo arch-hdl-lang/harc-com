@@ -39,7 +39,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use crate::ast::{BuiltinTy, ExprKind, SourceFile, Item, TseqDecl, TypeArg, TypeExpr};
+use crate::ast::{BuiltinTy, ExprKind, Item, SourceFile, TseqDecl, TypeArg, TypeExpr};
 use crate::ir::{
     ConstraintSite, FunctionId, FunctionKind, IrType, RecordId, TbFunction, Terminator, TypedParam,
 };
@@ -88,7 +88,10 @@ pub(crate) fn collect_tseq_records(
         let Item::Tseq(decl) = it else { continue };
         let Some(elem) = tseq_element_name(decl) else {
             return Err(unsupported(
-                &format!("`tseq {}` without a `-> TSeq<Record>` return type", decl.name.name),
+                &format!(
+                    "`tseq {}` without a `-> TSeq<Record>` return type",
+                    decl.name.name
+                ),
                 "a tseq must yield a declared `transaction`/`struct` record element type",
             ));
         };
@@ -147,7 +150,12 @@ pub(crate) fn lower_tseq<'a>(
     // `yield` outside any tseq would have errored at lowering; here every
     // SeqPush is anchored to `acc`. The terminator returns `acc` (the
     // backend emits `return __result;` for a Tseq function).
-    let mut f = b.finish(id, decl.name.name.clone(), FunctionKind::Tseq { record }, None)?;
+    let mut f = b.finish(
+        id,
+        decl.name.name.clone(),
+        FunctionKind::Tseq { record },
+        None,
+    )?;
     f.params = params;
     f.ret = Some(acc);
     Ok(f)

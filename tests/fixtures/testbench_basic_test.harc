@@ -36,6 +36,13 @@ testbench CounterTb
         wait n cycles
         dut.en = 0
     end function bump
+
+    // Regression for TBIR lowering of sibling method calls while an
+    // enclosing testbench method is already being inlined.
+    function bump_twice(n : uint<32>)
+        bump(n)
+        bump(n)
+    end function bump_twice
 end testbench CounterTb
 
 // `impl <name> for <Tb>` (docs/test-ergonomics.md §3.3) binds a test
@@ -72,3 +79,13 @@ impl TestbenchEnableToggle for CounterTb
         log(info, "PASS: enable-toggle reuses CounterTb helpers")
     end run
 end impl TestbenchEnableToggle
+
+impl TestbenchMethodCallsMethod for CounterTb
+    run
+        reset()
+        bump_twice(2)
+        assert dut.count_out == 4
+            else fail("method-call-method: count_out=${dut.count_out}, expected 4")
+        log(info, "PASS: testbench method can call sibling method")
+    end run
+end impl TestbenchMethodCallsMethod

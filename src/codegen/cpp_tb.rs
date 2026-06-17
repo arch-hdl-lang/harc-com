@@ -575,7 +575,7 @@ fn validate_split_tests_share_dut(
     Ok(())
 }
 
-fn sanitize_file_component(name: &str) -> String {
+pub(crate) fn sanitize_file_component(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for ch in name.chars() {
         if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {

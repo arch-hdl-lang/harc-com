@@ -2,17 +2,17 @@
 
 testbench GcdTb
     dut : gcd_3_ip
-end testbench GcdTb
 
-function run_gcd(dut: gcd_3_ip, a: uint<32>, b: uint<32>, c: uint<32>)
-    dut.A = a
-    dut.B = b
-    dut.C = c
-    dut.go = 1
-    wait 2 cycles
-    dut.go = 0
-    wait 80 cycles
-end function run_gcd
+    function run_gcd(a: uint<32>, b: uint<32>, c: uint<32>)
+        dut.A = a
+        dut.B = b
+        dut.C = c
+        dut.go = 1
+        wait 2 cycles
+        dut.go = 0
+        wait 80 cycles
+    end function run_gcd
+end testbench GcdTb
 
 impl GcdTest for GcdTb
     run
@@ -25,13 +25,13 @@ impl GcdTest for GcdTb
         wait 4 cycles
         dut.rst = 0
 
-        run_gcd(dut, 12, 18, 30)
-        run_gcd(dut, 21, 21, 21)
-        run_gcd(dut, 0, 9, 27)
-        run_gcd(dut, 9, 0, 27)
-        run_gcd(dut, 270, 192, 120)
-        run_gcd(dut, 0xFFFFFFF6, 0xFFFFFFEC, 30)
-        run_gcd(dut, 1071, 462, 21)
+        run_gcd(12, 18, 30)
+        run_gcd(21, 21, 21)
+        run_gcd(0, 9, 27)
+        run_gcd(9, 0, 27)
+        run_gcd(270, 192, 120)
+        run_gcd(0xFFFFFFF6, 0xFFFFFFEC, 30)
+        run_gcd(1071, 462, 21)
 
         dut.rst = 1
         wait 3 cycles

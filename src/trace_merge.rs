@@ -163,7 +163,10 @@ fn parse_trace_events(trace_text: &str) -> Result<Vec<SemanticEvent>> {
     Ok(out)
 }
 
-fn merge_trace_into_vcd(vcd_text: &str, events: &[SemanticEvent]) -> Result<(String, StringTables)> {
+fn merge_trace_into_vcd(
+    vcd_text: &str,
+    events: &[SemanticEvent],
+) -> Result<(String, StringTables)> {
     let lines: Vec<&str> = vcd_text.lines().collect();
     let Some(enddefs_idx) = lines
         .iter()
@@ -177,7 +180,10 @@ fn merge_trace_into_vcd(vcd_text: &str, events: &[SemanticEvent]) -> Result<(Str
     let mut id_gen = VcdIdGen::new(existing_ids);
     let mut by_time: BTreeMap<u64, Vec<SemanticEvent>> = BTreeMap::new();
     for event in events {
-        by_time.entry(event.vcd_time).or_default().push(event.clone());
+        by_time
+            .entry(event.vcd_time)
+            .or_default()
+            .push(event.clone());
     }
     let lane_count = by_time.values().map(Vec::len).max().unwrap_or(1).max(1);
     let signal_ids: Vec<_> = (0..lane_count)
@@ -220,12 +226,7 @@ fn merge_trace_into_vcd(vcd_text: &str, events: &[SemanticEvent]) -> Result<(Str
             while pending_idx < pending_times.len() && pending_times[pending_idx] < time {
                 let event_time = pending_times[pending_idx];
                 out.push_str(&format!("#{event_time}\n"));
-                emit_events_at_time(
-                    &mut out,
-                    &signal_ids,
-                    &by_time[&event_time],
-                    &mut maps,
-                );
+                emit_events_at_time(&mut out, &signal_ids, &by_time[&event_time], &mut maps);
                 active = true;
                 pending_idx += 1;
             }
@@ -258,12 +259,7 @@ fn merge_trace_into_vcd(vcd_text: &str, events: &[SemanticEvent]) -> Result<(Str
             ));
         }
         out.push_str(&format!("#{event_time}\n"));
-        emit_events_at_time(
-            &mut out,
-            &signal_ids,
-            &by_time[&event_time],
-            &mut maps,
-        );
+        emit_events_at_time(&mut out, &signal_ids, &by_time[&event_time], &mut maps);
         active = true;
         last_time = event_time;
         pending_idx += 1;
@@ -295,7 +291,10 @@ fn emit_semantic_header(out: &mut String, signal_ids: &[SignalIds], maps: &Strin
             "$var integer 32 {} event{lane}_type $end\n",
             ids.event_type
         ));
-        out.push_str(&format!("$var integer 64 {} event{lane}_seq $end\n", ids.seq));
+        out.push_str(&format!(
+            "$var integer 64 {} event{lane}_seq $end\n",
+            ids.seq
+        ));
         out.push_str(&format!(
             "$var integer 32 {} event{lane}_cycle $end\n",
             ids.cycle
@@ -332,7 +331,10 @@ fn emit_semantic_header(out: &mut String, signal_ids: &[SignalIds], maps: &Strin
             "$var wire 1 {} event{lane}_tag_valid $end\n",
             ids.tag_valid
         ));
-        out.push_str(&format!("$var integer 64 {} event{lane}_tag $end\n", ids.tag));
+        out.push_str(&format!(
+            "$var integer 64 {} event{lane}_tag $end\n",
+            ids.tag
+        ));
         out.push_str(&format!(
             "$var integer 32 {} event{lane}_label_id $end\n",
             ids.label_id
@@ -351,7 +353,12 @@ fn emit_events_at_time(
     for (lane, event) in events.iter().enumerate() {
         let ids = &signal_ids[lane];
         let tag_valid = event.tag.is_some();
-        emit_int(out, &ids.event_type, maps.event_type.id(&event.typ) as u64, 32);
+        emit_int(
+            out,
+            &ids.event_type,
+            maps.event_type.id(&event.typ) as u64,
+            32,
+        );
         emit_int(out, &ids.seq, event.seq, 64);
         emit_int(out, &ids.cycle, event.cycle, 32);
         emit_int(out, &ids.clock_id, maps.clock.id(&event.clock) as u64, 32);
@@ -363,7 +370,12 @@ fn emit_events_at_time(
             32,
         );
         emit_int(out, &ids.bus_id, maps.bus.id(&event.bus) as u64, 32);
-        emit_int(out, &ids.method_id, maps.method.id(&event.method) as u64, 32);
+        emit_int(
+            out,
+            &ids.method_id,
+            maps.method.id(&event.method) as u64,
+            32,
+        );
         emit_int(out, &ids.phase_id, maps.phase.id(&event.phase) as u64, 32);
         emit_int(
             out,
@@ -449,11 +461,7 @@ fn render_json_table(out: &mut String, name: &str, table: &IdTable, first: bool)
             out.push(',');
         }
         first_entry = false;
-        out.push_str(&format!(
-            "\n    \"{}\": \"{}\"",
-            id,
-            json_escape(value)
-        ));
+        out.push_str(&format!("\n    \"{}\": \"{}\"", id, json_escape(value)));
     }
     if !table.ids.is_empty() {
         out.push('\n');
@@ -594,10 +602,7 @@ fn parse_json_object_top(input: &str) -> std::result::Result<HashMap<String, Jso
     }
 }
 
-fn parse_json_value(
-    bytes: &[u8],
-    i: usize,
-) -> std::result::Result<(JsonValue, usize), String> {
+fn parse_json_value(bytes: &[u8], i: usize) -> std::result::Result<(JsonValue, usize), String> {
     match bytes.get(i) {
         Some(b'"') => {
             let (s, next) = parse_json_string(bytes, i)?;
@@ -679,7 +684,9 @@ fn parse_json_string(bytes: &[u8], mut i: usize) -> std::result::Result<(String,
 }
 
 fn skip_json_container(bytes: &[u8], mut i: usize) -> std::result::Result<usize, String> {
-    let opener = *bytes.get(i).ok_or_else(|| "missing container".to_string())?;
+    let opener = *bytes
+        .get(i)
+        .ok_or_else(|| "missing container".to_string())?;
     let closer = if opener == b'{' { b'}' } else { b']' };
     let mut depth = 0usize;
     while let Some(&b) = bytes.get(i) {

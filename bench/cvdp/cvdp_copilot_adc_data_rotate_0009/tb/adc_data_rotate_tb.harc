@@ -43,6 +43,18 @@ end covergroup RotateCov
 testbench AdcRotateTb
     dut : adc_data_rotate_top
     cov : RotateCov
+
+    function drive_rotate(data: uint<8>, shift: uint<4>, dir: bool)
+        dut.i_rst_n = 1
+        dut.i_adc_data_in = data
+        dut.i_shift_count = shift
+        dut.i_shift_direction = dir
+        wait 1 cycle
+        assert dut.o_operation_status == 1
+            else fail("operation_status did not assert")
+        assert dut.o_processed_data == rot8(data, shift, dir)
+            else fail("rotate data=0x${data:02x} shift=${shift} dir=${dir}: got 0x${dut.o_processed_data:02x}, expected 0x${rot8(data, shift, dir):02x}")
+    end function drive_rotate
 end testbench AdcRotateTb
 
 function rot8(data: uint<8>, shift: uint<4>, dir: bool) -> uint<8>
@@ -53,18 +65,6 @@ function rot8(data: uint<8>, shift: uint<4>, dir: bool) -> uint<8>
         return (((data << s) | (data >> (8 - s))).trunc<8>())
     end if
 end function rot8
-
-function drive_rotate(dut: adc_data_rotate_top, data: uint<8>, shift: uint<4>, dir: bool)
-    dut.i_rst_n = 1
-    dut.i_adc_data_in = data
-    dut.i_shift_count = shift
-    dut.i_shift_direction = dir
-    wait 1 cycle
-    assert dut.o_operation_status == 1
-        else fail("operation_status did not assert")
-    assert dut.o_processed_data == rot8(data, shift, dir)
-        else fail("rotate data=0x${data:02x} shift=${shift} dir=${dir}: got 0x${dut.o_processed_data:02x}, expected 0x${rot8(data, shift, dir):02x}")
-end function drive_rotate
 
 impl AdcRotateTest for AdcRotateTb
     run
@@ -81,28 +81,28 @@ impl AdcRotateTest for AdcRotateTb
         wait 1 cycle
 
         for dir in 0 .. 2
-            drive_rotate(dut, 0x00, 0, dir == 1)
-            drive_rotate(dut, 0xFF, 0, dir == 1)
-            drive_rotate(dut, 0xAA, 0, dir == 1)
-            drive_rotate(dut, 0x55, 0, dir == 1)
-            drive_rotate(dut, 0x81, 1, dir == 1)
-            drive_rotate(dut, 0x18, 3, dir == 1)
-            drive_rotate(dut, 0xC3, 4, dir == 1)
-            drive_rotate(dut, 0x3C, 7, dir == 1)
-            drive_rotate(dut, 0xA5, 8, dir == 1)
-            drive_rotate(dut, 0x5A, 15, dir == 1)
+            drive_rotate(0x00, 0, dir == 1)
+            drive_rotate(0xFF, 0, dir == 1)
+            drive_rotate(0xAA, 0, dir == 1)
+            drive_rotate(0x55, 0, dir == 1)
+            drive_rotate(0x81, 1, dir == 1)
+            drive_rotate(0x18, 3, dir == 1)
+            drive_rotate(0xC3, 4, dir == 1)
+            drive_rotate(0x3C, 7, dir == 1)
+            drive_rotate(0xA5, 8, dir == 1)
+            drive_rotate(0x5A, 15, dir == 1)
         end for
 
         for bit in 0 .. 8
             let data : uint<8> = ((1 as uint<8>) << bit).trunc<8>()
-            drive_rotate(dut, data, bit as uint<4>, false)
-            drive_rotate(dut, (0xFF ^ data).trunc<8>(), (15 - bit) as uint<4>, true)
+            drive_rotate(data, bit as uint<4>, false)
+            drive_rotate((0xFF ^ data).trunc<8>(), (15 - bit) as uint<4>, true)
         end for
 
         for k in 0 .. 32
             let s : RotateStim
             randomize(s)
-            drive_rotate(dut, s.data, s.shift, s.dir)
+            drive_rotate(s.data, s.shift, s.dir)
         end for
 
         dut.i_rst_n = 0

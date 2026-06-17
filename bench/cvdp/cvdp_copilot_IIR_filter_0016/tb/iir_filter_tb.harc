@@ -11,61 +11,60 @@ end transaction IirSample
 
 testbench IirFilterTb
     dut : iir_filter
+
+    function reset_iir()
+        dut.rst = 1
+        dut.x = 0
+        wait 3 cycles
+        assert dut.y == 0 else fail("reset: y expected zero")
+        dut.rst = 0
+        wait 1 cycle
+    end function reset_iir
+    function drive_iir(x: sint<16>)
+        dut.x = x
+        wait 1 cycle
+    end function drive_iir
 end testbench IirFilterTb
-
-function reset_iir(dut: iir_filter)
-    dut.rst = 1
-    dut.x = 0
-    wait 3 cycles
-    assert dut.y == 0 else fail("reset: y expected zero")
-    dut.rst = 0
-    wait 1 cycle
-end function reset_iir
-
-function drive_iir(dut: iir_filter, x: sint<16>)
-    dut.x = x
-    wait 1 cycle
-end function drive_iir
 
 impl IirFilterTest for IirFilterTb
     run
         log(info, "iir_filter: reset, impulse, step, alternating, and unique signed samples")
 
-        reset_iir(dut)
+        reset_iir()
 
         // Impulse and settling tail.
-        drive_iir(dut, 16000)
+        drive_iir(16000)
         for _ in 0 .. 10
-            drive_iir(dut, 0)
+            drive_iir(0)
         end for
 
         // Positive and negative steps.
         for _ in 0 .. 12
-            drive_iir(dut, 1000)
+            drive_iir(1000)
         end for
         for _ in 0 .. 12
-            drive_iir(dut, -1000)
+            drive_iir(-1000)
         end for
 
         // Endpoints and walking-ish signed values.
-        drive_iir(dut, 32767)
-        drive_iir(dut, -32768)
-        drive_iir(dut, 1)
-        drive_iir(dut, -1)
+        drive_iir(32767)
+        drive_iir(-32768)
+        drive_iir(1)
+        drive_iir(-1)
         for bit in 0 .. 14
             let v : sint<16> = (1 as sint<16>) << bit
-            drive_iir(dut, v)
-            drive_iir(dut, -v)
+            drive_iir(v)
+            drive_iir(-v)
         end for
 
         // Solver-backed unique samples for additional history states.
         for _ in 0 .. 48
             let s : IirSample
             randomize(s)
-            drive_iir(dut, s.sample)
+            drive_iir(s.sample)
         end for
 
-        reset_iir(dut)
+        reset_iir()
         log(info, "ALL TESTS PASSED - iir_filter")
     end run
 end impl IirFilterTest

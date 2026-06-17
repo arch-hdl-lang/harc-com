@@ -60,78 +60,77 @@ end covergroup TrafficCov
 testbench TrafficControllerTb
     dut : traffic_controller_fsm_top
     cov : TrafficCov
+
+    function drive_traffic(vehicle: bool, short_timer: bool, long_timer: bool)
+        dut.i_vehicle_sensor_input = vehicle
+        dut.i_short_timer = short_timer
+        dut.i_long_timer = long_timer
+        wait 1 cycle
+    end function drive_traffic
+    function reset_traffic()
+        dut.i_rst_b = 0
+        dut.i_vehicle_sensor_input = 0
+        dut.i_short_timer = 0
+        dut.i_long_timer = 0
+        wait 3 cycles
+        assert dut.o_main == 0 else fail("reset: main lights not off")
+        assert dut.o_side == 0 else fail("reset: side lights not off")
+        assert dut.o_short_trigger == 0 else fail("reset: short trigger high")
+        assert dut.o_long_trigger == 0 else fail("reset: long trigger high")
+        dut.i_rst_b = 1
+        wait 1 cycle
+    end function reset_traffic
 end testbench TrafficControllerTb
-
-function drive_traffic(dut: traffic_controller_fsm_top, vehicle: bool, short_timer: bool, long_timer: bool)
-    dut.i_vehicle_sensor_input = vehicle
-    dut.i_short_timer = short_timer
-    dut.i_long_timer = long_timer
-    wait 1 cycle
-end function drive_traffic
-
-function reset_traffic(dut: traffic_controller_fsm_top)
-    dut.i_rst_b = 0
-    dut.i_vehicle_sensor_input = 0
-    dut.i_short_timer = 0
-    dut.i_long_timer = 0
-    wait 3 cycles
-    assert dut.o_main == 0 else fail("reset: main lights not off")
-    assert dut.o_side == 0 else fail("reset: side lights not off")
-    assert dut.o_short_trigger == 0 else fail("reset: short trigger high")
-    assert dut.o_long_trigger == 0 else fail("reset: long trigger high")
-    dut.i_rst_b = 1
-    wait 1 cycle
-end function reset_traffic
 
 impl TrafficControllerTest for TrafficControllerTb
     run
         log(info, "traffic_controller: directed FSM hold and transition stimulus")
 
-        reset_traffic(dut)
+        reset_traffic()
 
         // S1 hold cases: not both vehicle and long timer.
-        drive_traffic(dut, false, false, false)
-        drive_traffic(dut, true, false, false)
-        drive_traffic(dut, false, false, true)
+        drive_traffic(false, false, false)
+        drive_traffic(true, false, false)
+        drive_traffic(false, false, true)
 
         // S1 -> S2.
-        drive_traffic(dut, true, false, true)
-        drive_traffic(dut, false, false, false)
+        drive_traffic(true, false, true)
+        drive_traffic(false, false, false)
 
         // S2 hold, then S2 -> S3.
-        drive_traffic(dut, false, false, false)
-        drive_traffic(dut, true, false, true)
-        drive_traffic(dut, true, true, false)
-        drive_traffic(dut, true, false, false)
+        drive_traffic(false, false, false)
+        drive_traffic(true, false, true)
+        drive_traffic(true, true, false)
+        drive_traffic(true, false, false)
 
         // S3 hold when vehicle present and long timer low.
-        drive_traffic(dut, true, false, false)
-        drive_traffic(dut, true, false, false)
+        drive_traffic(true, false, false)
+        drive_traffic(true, false, false)
 
         // S3 -> S4 via no vehicle.
-        drive_traffic(dut, false, false, false)
-        drive_traffic(dut, false, false, false)
+        drive_traffic(false, false, false)
+        drive_traffic(false, false, false)
 
         // S4 hold, then S4 -> S1.
-        drive_traffic(dut, false, false, false)
-        drive_traffic(dut, false, true, false)
-        drive_traffic(dut, false, false, false)
+        drive_traffic(false, false, false)
+        drive_traffic(false, true, false)
+        drive_traffic(false, false, false)
 
         // Run the alternate S3 -> S4 branch via long timer.
-        drive_traffic(dut, true, false, true)   // S1 -> S2
-        drive_traffic(dut, false, true, false)  // S2 -> S3
-        drive_traffic(dut, true, false, true)   // S3 -> S4 by long_timer
-        drive_traffic(dut, false, true, false)  // S4 -> S1
+        drive_traffic(true, false, true)   // S1 -> S2
+        drive_traffic(false, true, false)  // S2 -> S3
+        drive_traffic(true, false, true)   // S3 -> S4 by long_timer
+        drive_traffic(false, true, false)  // S4 -> S1
 
         // Held timer pulses.
-        drive_traffic(dut, true, false, true)
-        drive_traffic(dut, true, false, true)
-        drive_traffic(dut, true, true, true)
-        drive_traffic(dut, true, true, true)
-        drive_traffic(dut, false, false, false)
+        drive_traffic(true, false, true)
+        drive_traffic(true, false, true)
+        drive_traffic(true, true, true)
+        drive_traffic(true, true, true)
+        drive_traffic(false, false, false)
 
         // Mid-run async reset.
-        reset_traffic(dut)
+        reset_traffic()
 
         assert cov.cp_main.green > 0 else fail("coverage hole: main green")
         assert cov.cp_main.yellow > 0 else fail("coverage hole: main yellow")

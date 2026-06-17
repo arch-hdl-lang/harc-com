@@ -2,30 +2,28 @@
 
 testbench SecureRegisterBankTb
     dut : secure_read_write_register_bank_top
+
+    function pulse()
+        dut.i_capture_pulse = 0
+        wait 1 cycle
+        dut.i_capture_pulse = 1
+        wait 1 cycle
+        dut.i_capture_pulse = 0
+        wait 1 cycle
+    end function pulse
+    function write_reg(addr: uint<8>, data: uint<8>)
+        dut.i_addr = addr
+        dut.i_data_in = data
+        dut.i_read_write_enable = 0
+        pulse()
+    end function write_reg
+    function read_reg(addr: uint<8>)
+        dut.i_addr = addr
+        dut.i_data_in = 0
+        dut.i_read_write_enable = 1
+        pulse()
+    end function read_reg
 end testbench SecureRegisterBankTb
-
-function pulse(dut: secure_read_write_register_bank_top)
-    dut.i_capture_pulse = 0
-    wait 1 cycle
-    dut.i_capture_pulse = 1
-    wait 1 cycle
-    dut.i_capture_pulse = 0
-    wait 1 cycle
-end function pulse
-
-function write_reg(dut: secure_read_write_register_bank_top, addr: uint<8>, data: uint<8>)
-    dut.i_addr = addr
-    dut.i_data_in = data
-    dut.i_read_write_enable = 0
-    pulse(dut)
-end function write_reg
-
-function read_reg(dut: secure_read_write_register_bank_top, addr: uint<8>)
-    dut.i_addr = addr
-    dut.i_data_in = 0
-    dut.i_read_write_enable = 1
-    pulse(dut)
-end function read_reg
 
 impl SecureRegisterBankTest for SecureRegisterBankTb
     run
@@ -38,45 +36,45 @@ impl SecureRegisterBankTest for SecureRegisterBankTb
         wait 3 cycles
         dut.i_rst_n = 1
 
-        read_reg(dut, 2)
-        write_reg(dut, 0, 0xAB)
-        write_reg(dut, 2, 0x55)  // wrong step-two address relocks
-        write_reg(dut, 0, 0xAB)
-        write_reg(dut, 1, 0xCD)
+        read_reg(2)
+        write_reg(0, 0xAB)
+        write_reg(2, 0x55)  // wrong step-two address relocks
+        write_reg(0, 0xAB)
+        write_reg(1, 0xCD)
 
         for k in 2 .. 18
-            write_reg(dut, k, (k * 13) & 0xFF)
-            read_reg(dut, k)
+            write_reg(k, (k * 13) & 0xFF)
+            read_reg(k)
         end for
-        read_reg(dut, 0)
-        read_reg(dut, 1)
+        read_reg(0)
+        read_reg(1)
 
         // Incorrect code on restricted address while unlocked relocks.
-        write_reg(dut, 0, 0x00)
-        read_reg(dut, 2)
+        write_reg(0, 0x00)
+        read_reg(2)
 
         // Unlock again and relock through the address-1 side of the OR.
-        write_reg(dut, 0, 0xAB)
-        write_reg(dut, 1, 0xCD)
-        write_reg(dut, 1, 0x00)
+        write_reg(0, 0xAB)
+        write_reg(1, 0xCD)
+        write_reg(1, 0x00)
 
         // Unlock again and exercise read-enable cases with matching unlock
         // data still on the bus; these cover the short-circuit subterms in
         // the relock expression while i_read_write_enable is high.
-        write_reg(dut, 0, 0xAB)
-        write_reg(dut, 1, 0xCD)
+        write_reg(0, 0xAB)
+        write_reg(1, 0xCD)
         dut.i_addr = 1
         dut.i_data_in = 0xCD
         dut.i_read_write_enable = 1
-        pulse(dut)
+        pulse()
         dut.i_addr = 0
         dut.i_data_in = 0xAB
         dut.i_read_write_enable = 1
-        pulse(dut)
+        pulse()
 
         // Touch high address.
-        write_reg(dut, 0xFF, 0x5A)
-        read_reg(dut, 0xFF)
+        write_reg(0xFF, 0x5A)
+        read_reg(0xFF)
 
         dut.i_rst_n = 0
         wait 2 cycles

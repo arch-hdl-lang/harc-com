@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 
-use super::{LowerError, unsupported};
+use super::{unsupported, LowerError};
 use crate::ast::{AddrmapDecl, ExprKind};
 use crate::ir::{Expr, RecordId, RegRegisterSchema};
 

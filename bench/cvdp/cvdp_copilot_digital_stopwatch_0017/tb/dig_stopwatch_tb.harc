@@ -10,16 +10,16 @@ testbench DigStopwatchTb
         probe force seconds_force : uint<6> at seconds
         probe force minutes_force : uint<6> at minutes
     end let dut
-end testbench DigStopwatchTb
 
-function pulse_second(dut: dig_stopwatch)
-    dut.one_sec_force = 0
-    wait 1ns
-    dut.one_sec_force = 1
-    wait 1ns
-    dut.one_sec_force = 0
-    wait 1ns
-end function pulse_second
+    function pulse_second()
+        dut.one_sec_force = 0
+        wait 1ns
+        dut.one_sec_force = 1
+        wait 1ns
+        dut.one_sec_force = 0
+        wait 1ns
+    end function pulse_second
+end testbench DigStopwatchTb
 
 impl DigStopwatchTest for DigStopwatchTb
     clock clk = 10ns
@@ -44,7 +44,7 @@ impl DigStopwatchTest for DigStopwatchTb
 
         dut.start_stop = 1
         for _ in 0 .. 4
-            pulse_second(dut)
+            pulse_second()
         end for
 
         // seconds == 59 rollover into minutes.
@@ -53,7 +53,7 @@ impl DigStopwatchTest for DigStopwatchTb
         wait 1ns
         release dut.seconds_force
         release dut.minutes_force
-        pulse_second(dut)
+        pulse_second()
 
         // minutes == 59 rollover into hour.
         dut.seconds_force = 59
@@ -61,12 +61,12 @@ impl DigStopwatchTest for DigStopwatchTb
         wait 1ns
         release dut.seconds_force
         release dut.minutes_force
-        pulse_second(dut)
+        pulse_second()
 
         // Once hour is set, the guarded stopwatch update should hold.
-        pulse_second(dut)
+        pulse_second()
         dut.start_stop = 0
-        pulse_second(dut)
+        pulse_second()
 
         dut.reset = 1
         wait 2 cycles

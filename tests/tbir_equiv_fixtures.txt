@@ -90,6 +90,7 @@ packed_vec_lane_test | PackedVecLane | packed_vec_lane.sv | - | pass
 width_methods_test | Top | top_counter.sv | - | pass
 testbench_basic_test | Top | top_counter.sv | - | pass | - | - | TestbenchSmoke
 testbench_basic_test | Top | top_counter.sv | - | pass | - | - | TestbenchEnableToggle
+testbench_basic_test | Top | top_counter.sv | - | pass | - | - | TestbenchMethodCallsMethod
 testbench_lifecycle_test | Top | top_counter.sv | - | pass | - | - | LifecycleBumpThree
 testbench_lifecycle_test | Top | top_counter.sv | - | pass | - | - | LifecycleBumpFive
 scoreboard_basic_test | Top | top_counter.sv | - | pass

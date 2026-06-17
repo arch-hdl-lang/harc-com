@@ -76,6 +76,139 @@ end covergroup WbAhbCov
 testbench WbAhbBridgeTb
     dut : wishbone_to_ahb_bridge_top
     cov : WbAhbCov
+
+    function reset_bridge()
+        dut.rst_i = 1
+        dut.hreset_n = 0
+        dut.cyc_i = 0
+        dut.stb_i = 0
+        dut.sel_i = 0
+        dut.we_i = 0
+        dut.addr_i = 0
+        dut.data_i = 0
+        dut.hrdata = 0
+        dut.hresp = 0
+        dut.hready = 1
+        wait 2 cycles on hclk
+        assert dut.ack_o == 0 else fail("reset: ack_o high")
+        assert dut.hburst == 0 else fail("reset: hburst not SINGLE")
+        dut.hreset_n = 1
+        dut.rst_i = 0
+        wait 1 cycle on hclk
+    end function reset_bridge
+    function idle_bridge()
+        dut.cyc_i = 0
+        dut.stb_i = 0
+        dut.we_i = 0
+        dut.hready = 1
+        wait 1 cycle on hclk
+    end function idle_bridge
+    function busy_cycle()
+        dut.cyc_i = 1
+        dut.stb_i = 0
+        dut.hready = 1
+        wait 1 cycle on hclk
+        assert dut.htrans == 1 else fail("busy cycle: htrans expected BUSY")
+        idle_bridge()
+    end function busy_cycle
+    function address_phase_expr_sweep()
+        // Exercise false subterms of the AHB data-phase entry condition while
+        // `ahb_data_phase` is known low. These are not distinct bus transactions,
+        // but Verilator records them as expression coverage on the condition.
+        dut.sel_i = 15
+        dut.addr_i = 0x00000020
+        dut.data_i = 0x2468ACE0
+        dut.hrdata = 0
+        dut.we_i = 0
+
+        dut.cyc_i = 1
+        dut.stb_i = 1
+        dut.hready = 0
+        wait 1 cycle on hclk
+
+        dut.cyc_i = 0
+        dut.stb_i = 1
+        dut.hready = 1
+        wait 1 cycle on hclk
+
+        dut.cyc_i = 1
+        dut.stb_i = 0
+        dut.hready = 1
+        wait 1 cycle on hclk
+
+        idle_bridge()
+    end function address_phase_expr_sweep
+    function stalled_data_phase()
+        dut.cyc_i = 1
+        dut.stb_i = 1
+        dut.we_i = 0
+        dut.sel_i = 15
+        dut.addr_i = 0x00000040
+        dut.data_i = 0
+        dut.hrdata = 0x01234567
+        dut.hready = 1
+        wait 1 cycle on hclk
+
+        dut.hready = 0
+        wait 1 cycle on hclk
+        assert dut.ack_o == 0 else fail("stalled data phase: ack high")
+
+        dut.hready = 1
+        wait 1 cycle on hclk
+        idle_bridge()
+    end function stalled_data_phase
+    function transfer(sel: uint<4>, write: bool, addr: uint<32>, data: uint<32>, hrdata: uint<32>, wait_cycles: uint<4>) -> uint<1>
+        dut.cyc_i = 1
+        dut.stb_i = 1
+        dut.we_i = write
+        dut.sel_i = sel
+        dut.addr_i = addr
+        dut.data_i = data
+        dut.hrdata = hrdata
+        dut.hresp = 0
+
+        for _ in 0 .. wait_cycles
+            dut.hready = 0
+            wait 1 cycle on hclk
+            if dut.ack_o != 0
+                log(error, "wait-state transfer acked early sel=${sel:x} addr=${addr:8x}")
+                return 1
+            end if
+        end for
+
+        dut.hready = 1
+        wait 1 cycle on hclk
+
+        let want_addr : uint<32> = aligned_addr(addr, sel)
+        let want_size : uint<3> = expected_size(sel)
+        if dut.haddr != want_addr
+            log(error, "haddr=${dut.haddr:8x} expected=${want_addr:8x} sel=${sel:x}")
+            return 1
+        end if
+        if dut.hsize != want_size
+            log(error, "hsize=${dut.hsize} expected=${want_size} sel=${sel:x}")
+            return 1
+        end if
+        if dut.hwrite != write
+            log(error, "hwrite mismatch sel=${sel:x}")
+            return 1
+        end if
+        if dut.ack_o != 1
+            log(error, "transfer did not ack sel=${sel:x} addr=${addr:8x}")
+            return 1
+        end if
+        if not write
+            let expected : uint<32> = expected_read_data(sel, hrdata)
+            if dut.data_o != expected
+                log(error, "data_o=${dut.data_o:8x} expected=${expected:8x} sel=${sel:x}")
+                return 1
+            end if
+        end if
+
+        wait 1 cycle on hclk
+        idle_bridge()
+        return 0
+    end function transfer
 end testbench WbAhbBridgeTb
 
 function make_addr(tag: uint<8>, index: uint<6>) -> uint<32>
@@ -127,144 +260,6 @@ function expected_read_data(sel: uint<4>, hrdata: uint<32>) -> uint<32>
     end if
 end function expected_read_data
 
-function reset_bridge(dut: wishbone_to_ahb_bridge_top)
-    dut.rst_i = 1
-    dut.hreset_n = 0
-    dut.cyc_i = 0
-    dut.stb_i = 0
-    dut.sel_i = 0
-    dut.we_i = 0
-    dut.addr_i = 0
-    dut.data_i = 0
-    dut.hrdata = 0
-    dut.hresp = 0
-    dut.hready = 1
-    wait 2 cycles on hclk
-    assert dut.ack_o == 0 else fail("reset: ack_o high")
-    assert dut.hburst == 0 else fail("reset: hburst not SINGLE")
-    dut.hreset_n = 1
-    dut.rst_i = 0
-    wait 1 cycle on hclk
-end function reset_bridge
-
-function idle_bridge(dut: wishbone_to_ahb_bridge_top)
-    dut.cyc_i = 0
-    dut.stb_i = 0
-    dut.we_i = 0
-    dut.hready = 1
-    wait 1 cycle on hclk
-end function idle_bridge
-
-function busy_cycle(dut: wishbone_to_ahb_bridge_top)
-    dut.cyc_i = 1
-    dut.stb_i = 0
-    dut.hready = 1
-    wait 1 cycle on hclk
-    assert dut.htrans == 1 else fail("busy cycle: htrans expected BUSY")
-    idle_bridge(dut)
-end function busy_cycle
-
-function address_phase_expr_sweep(dut: wishbone_to_ahb_bridge_top)
-    // Exercise false subterms of the AHB data-phase entry condition while
-    // `ahb_data_phase` is known low. These are not distinct bus transactions,
-    // but Verilator records them as expression coverage on the condition.
-    dut.sel_i = 15
-    dut.addr_i = 0x00000020
-    dut.data_i = 0x2468ACE0
-    dut.hrdata = 0
-    dut.we_i = 0
-
-    dut.cyc_i = 1
-    dut.stb_i = 1
-    dut.hready = 0
-    wait 1 cycle on hclk
-
-    dut.cyc_i = 0
-    dut.stb_i = 1
-    dut.hready = 1
-    wait 1 cycle on hclk
-
-    dut.cyc_i = 1
-    dut.stb_i = 0
-    dut.hready = 1
-    wait 1 cycle on hclk
-
-    idle_bridge(dut)
-end function address_phase_expr_sweep
-
-function stalled_data_phase(dut: wishbone_to_ahb_bridge_top)
-    dut.cyc_i = 1
-    dut.stb_i = 1
-    dut.we_i = 0
-    dut.sel_i = 15
-    dut.addr_i = 0x00000040
-    dut.data_i = 0
-    dut.hrdata = 0x01234567
-    dut.hready = 1
-    wait 1 cycle on hclk
-
-    dut.hready = 0
-    wait 1 cycle on hclk
-    assert dut.ack_o == 0 else fail("stalled data phase: ack high")
-
-    dut.hready = 1
-    wait 1 cycle on hclk
-    idle_bridge(dut)
-end function stalled_data_phase
-
-function transfer(dut: wishbone_to_ahb_bridge_top, sel: uint<4>, write: bool, addr: uint<32>, data: uint<32>, hrdata: uint<32>, wait_cycles: uint<4>) -> uint<1>
-    dut.cyc_i = 1
-    dut.stb_i = 1
-    dut.we_i = write
-    dut.sel_i = sel
-    dut.addr_i = addr
-    dut.data_i = data
-    dut.hrdata = hrdata
-    dut.hresp = 0
-
-    for _ in 0 .. wait_cycles
-        dut.hready = 0
-        wait 1 cycle on hclk
-        if dut.ack_o != 0
-            log(error, "wait-state transfer acked early sel=${sel:x} addr=${addr:8x}")
-            return 1
-        end if
-    end for
-
-    dut.hready = 1
-    wait 1 cycle on hclk
-
-    let want_addr : uint<32> = aligned_addr(addr, sel)
-    let want_size : uint<3> = expected_size(sel)
-    if dut.haddr != want_addr
-        log(error, "haddr=${dut.haddr:8x} expected=${want_addr:8x} sel=${sel:x}")
-        return 1
-    end if
-    if dut.hsize != want_size
-        log(error, "hsize=${dut.hsize} expected=${want_size} sel=${sel:x}")
-        return 1
-    end if
-    if dut.hwrite != write
-        log(error, "hwrite mismatch sel=${sel:x}")
-        return 1
-    end if
-    if dut.ack_o != 1
-        log(error, "transfer did not ack sel=${sel:x} addr=${addr:8x}")
-        return 1
-    end if
-    if not write
-        let expected : uint<32> = expected_read_data(sel, hrdata)
-        if dut.data_o != expected
-            log(error, "data_o=${dut.data_o:8x} expected=${expected:8x} sel=${sel:x}")
-            return 1
-        end if
-    end if
-
-    wait 1 cycle on hclk
-    idle_bridge(dut)
-    return 0
-end function transfer
-
 impl WbAhbBridgeTest for WbAhbBridgeTb
     clock clk = 10ns
     clock hclk = 7ns
@@ -272,31 +267,31 @@ impl WbAhbBridgeTest for WbAhbBridgeTb
     run
         log(info, "wb2ahb: generated AHB clock, select decoding, wait states, and randomized requests")
 
-        reset_bridge(dut)
+        reset_bridge()
         let errors : uint<32> = 0
 
-        address_phase_expr_sweep(dut)
-        stalled_data_phase(dut)
-        busy_cycle(dut)
+        address_phase_expr_sweep()
+        stalled_data_phase()
+        busy_cycle()
 
-        errors = errors + transfer(dut, 1, false, 0x00000000, 0x11223344, 0xA1B2C3D4, 0)
-        errors = errors + transfer(dut, 2, true, 0x00000000, 0x01020304, 0x00000000, 1)
-        errors = errors + transfer(dut, 4, false, 0x00000000, 0x55667788, 0x0A0B0C0D, 2)
-        errors = errors + transfer(dut, 8, true, 0x00000000, 0xFFEEDDCC, 0x00000000, 0)
-        errors = errors + transfer(dut, 3, false, 0x00000010, 0x12345678, 0x11112222, 1)
-        errors = errors + transfer(dut, 12, true, 0x00000010, 0x89ABCDEF, 0x00000000, 2)
-        errors = errors + transfer(dut, 15, false, 0xFFFFFFFC, 0xCAFEBABE, 0xDEADBEEF, 0)
-        errors = errors + transfer(dut, 0, true, 0x00000003, 0x13579BDF, 0x00000000, 1)
+        errors = errors + transfer(1, false, 0x00000000, 0x11223344, 0xA1B2C3D4, 0)
+        errors = errors + transfer(2, true, 0x00000000, 0x01020304, 0x00000000, 1)
+        errors = errors + transfer(4, false, 0x00000000, 0x55667788, 0x0A0B0C0D, 2)
+        errors = errors + transfer(8, true, 0x00000000, 0xFFEEDDCC, 0x00000000, 0)
+        errors = errors + transfer(3, false, 0x00000010, 0x12345678, 0x11112222, 1)
+        errors = errors + transfer(12, true, 0x00000010, 0x89ABCDEF, 0x00000000, 2)
+        errors = errors + transfer(15, false, 0xFFFFFFFC, 0xCAFEBABE, 0xDEADBEEF, 0)
+        errors = errors + transfer(0, true, 0x00000003, 0x13579BDF, 0x00000000, 1)
 
         for _ in 0 .. 16
             let s : WbAhbStim
             randomize(s)
             let addr : uint<32> = make_addr(s.tag, s.index)
             let sel : uint<4> = 15
-            errors = errors + transfer(dut, sel, s.write, addr, s.data, s.data ^ 0xA5A5A5A5, 0)
+            errors = errors + transfer(sel, s.write, addr, s.data, s.data ^ 0xA5A5A5A5, 0)
         end for
 
-        reset_bridge(dut)
+        reset_bridge()
         assert errors == 0 else fail("wb2ahb produced ${errors} protocol errors")
         log(info, "ALL TESTS PASSED - wb2ahb")
     end run

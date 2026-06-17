@@ -75,124 +75,120 @@ end covergroup CsrApbCov
 testbench CsrApbTb
     dut : csr_apb_interface_top
     cov : CsrApbCov
+
+    function apb_idle()
+        dut.pselx = 0
+        dut.penable = 0
+        dut.pwrite = 0
+        dut.paddr = 0
+        dut.pwdata = 0
+        wait 1 cycle
+    end function apb_idle
+    function reset_csr()
+        dut.presetn = 0
+        dut.paddr = 0
+        dut.pselx = 0
+        dut.penable = 0
+        dut.pwrite = 0
+        dut.pwdata = 0
+        wait 3 cycles
+        assert dut.pready == 0 else fail("reset: pready expected low")
+        assert dut.pslverr == 0 else fail("reset: pslverr expected low")
+        assert dut.prdata == 0 else fail("reset: prdata expected zero")
+        dut.presetn = 1
+        wait 1 cycle
+    end function reset_csr
+    function apb_write(addr: uint<32>, data: uint<32>)
+        dut.paddr = addr
+        dut.pwdata = data
+        dut.pwrite = 1
+        dut.pselx = 1
+        dut.penable = 0
+        wait 1 cycle
+        dut.penable = 1
+        wait 2 cycles
+        assert dut.pready == 1 else fail("apb_write addr=0x${addr:08x}: pready low")
+        apb_idle()
+    end function apb_write
+    function apb_read(addr: uint<32>) -> uint<32>
+        dut.paddr = addr
+        dut.pwdata = 0
+        dut.pwrite = 0
+        dut.pselx = 1
+        dut.penable = 0
+        wait 1 cycle
+        dut.penable = 1
+        wait 2 cycles
+        assert dut.pready == 1 else fail("apb_read addr=0x${addr:08x}: pready low")
+        let val = dut.prdata
+        apb_idle()
+        return val
+    end function apb_read
+    function malformed_apb(addr: uint<32>, data: uint<32>, write: bool)
+        dut.paddr = addr
+        dut.pwdata = data
+        dut.pwrite = write
+        dut.pselx = 0
+        dut.penable = 1
+        wait 1 cycle
+        dut.penable = 0
+        wait 1 cycle
+
+        dut.pselx = 1
+        dut.penable = 0
+        wait 2 cycles
+        apb_idle()
+    end function malformed_apb
 end testbench CsrApbTb
-
-function apb_idle(dut: csr_apb_interface_top)
-    dut.pselx = 0
-    dut.penable = 0
-    dut.pwrite = 0
-    dut.paddr = 0
-    dut.pwdata = 0
-    wait 1 cycle
-end function apb_idle
-
-function reset_csr(dut: csr_apb_interface_top)
-    dut.presetn = 0
-    dut.paddr = 0
-    dut.pselx = 0
-    dut.penable = 0
-    dut.pwrite = 0
-    dut.pwdata = 0
-    wait 3 cycles
-    assert dut.pready == 0 else fail("reset: pready expected low")
-    assert dut.pslverr == 0 else fail("reset: pslverr expected low")
-    assert dut.prdata == 0 else fail("reset: prdata expected zero")
-    dut.presetn = 1
-    wait 1 cycle
-end function reset_csr
-
-function apb_write(dut: csr_apb_interface_top, addr: uint<32>, data: uint<32>)
-    dut.paddr = addr
-    dut.pwdata = data
-    dut.pwrite = 1
-    dut.pselx = 1
-    dut.penable = 0
-    wait 1 cycle
-    dut.penable = 1
-    wait 2 cycles
-    assert dut.pready == 1 else fail("apb_write addr=0x${addr:08x}: pready low")
-    apb_idle(dut)
-end function apb_write
-
-function apb_read(dut: csr_apb_interface_top, addr: uint<32>) -> uint<32>
-    dut.paddr = addr
-    dut.pwdata = 0
-    dut.pwrite = 0
-    dut.pselx = 1
-    dut.penable = 0
-    wait 1 cycle
-    dut.penable = 1
-    wait 2 cycles
-    assert dut.pready == 1 else fail("apb_read addr=0x${addr:08x}: pready low")
-    let val = dut.prdata
-    apb_idle(dut)
-    return val
-end function apb_read
-
-function malformed_apb(dut: csr_apb_interface_top, addr: uint<32>, data: uint<32>, write: bool)
-    dut.paddr = addr
-    dut.pwdata = data
-    dut.pwrite = write
-    dut.pselx = 0
-    dut.penable = 1
-    wait 1 cycle
-    dut.penable = 0
-    wait 1 cycle
-
-    dut.pselx = 1
-    dut.penable = 0
-    wait 2 cycles
-    apb_idle(dut)
-end function malformed_apb
 
 impl CsrApbTest for CsrApbTb
     run
         log(info, "csr_apb_interface: APB CSR directed and randomized stimulus")
 
-        reset_csr(dut)
+        reset_csr()
 
-        apb_write(dut, 16, 0x00000000)
-        assert apb_read(dut, 16) == 0x00000000 else fail("DATA_REG zero readback mismatch")
-        apb_write(dut, 16, 0xFFFFFFFF)
-        assert apb_read(dut, 16) == 0xFFFFFFFF else fail("DATA_REG ones readback mismatch")
-        apb_write(dut, 16, 0x12345678)
-        assert apb_read(dut, 16) == 0x12345678 else fail("DATA_REG pattern readback mismatch")
+        apb_write(16, 0x00000000)
+        assert apb_read(16) == 0x00000000 else fail("DATA_REG zero readback mismatch")
+        apb_write(16, 0xFFFFFFFF)
+        assert apb_read(16) == 0xFFFFFFFF else fail("DATA_REG ones readback mismatch")
+        apb_write(16, 0x12345678)
+        assert apb_read(16) == 0x12345678 else fail("DATA_REG pattern readback mismatch")
 
-        apb_write(dut, 20, 0x00000000)
-        let _control_zero = apb_read(dut, 20)
-        apb_write(dut, 20, 0xFFFFFFFF)
-        let _control_ones = apb_read(dut, 20)
+        apb_write(20, 0x00000000)
+        let _control_zero = apb_read(20)
+        apb_write(20, 0xFFFFFFFF)
+        let _control_ones = apb_read(20)
 
-        apb_write(dut, 24, 0x00000000)
-        let _int_zero = apb_read(dut, 24)
-        apb_write(dut, 24, 0xFFFFFFFF)
-        let _int_ones = apb_read(dut, 24)
+        apb_write(24, 0x00000000)
+        let _int_zero = apb_read(24)
+        apb_write(24, 0xFFFFFFFF)
+        let _int_ones = apb_read(24)
 
-        apb_write(dut, 32, 0xDEADBEEF)
+        apb_write(32, 0xDEADBEEF)
         assert dut.pslverr == 1 else fail("invalid write did not set pslverr")
-        let _bad_read = apb_read(dut, 32)
+        let _bad_read = apb_read(32)
         assert dut.pslverr == 1 else fail("invalid read did not set pslverr")
 
-        malformed_apb(dut, 16, 0xAAAAAAAA, true)
-        malformed_apb(dut, 20, 0x55555555, false)
+        malformed_apb(16, 0xAAAAAAAA, true)
+        malformed_apb(20, 0x55555555, false)
 
-        reset_csr(dut)
+        reset_csr()
 
         for bit in 0 .. 32
             let data : uint<32> = ((1 as uint<32>) << bit).trunc<32>()
-            apb_write(dut, 16, data)
-            let _rd = apb_read(dut, 16)
-            apb_write(dut, 16, (0xFFFFFFFF ^ data).trunc<32>())
-            let _rz = apb_read(dut, 16)
+            apb_write(16, data)
+            let _rd = apb_read(16)
+            apb_write(16, (0xFFFFFFFF ^ data).trunc<32>())
+            let _rz = apb_read(16)
         end for
 
         for _ in 0 .. 48
             let t : CsrApbStim
             randomize(t)
             if t.write
-                apb_write(dut, t.addr, t.data)
+                apb_write(t.addr, t.data)
             else
-                let _v = apb_read(dut, t.addr)
+                let _v = apb_read(t.addr)
             end if
         end for
 
@@ -200,7 +196,7 @@ impl CsrApbTest for CsrApbTb
         for _ in 0 .. 8
             let bad : CsrApbStim
             randomize(bad) with InvalidCsr(bad) end randomize
-            apb_write(dut, bad.addr, bad.data)
+            apb_write(bad.addr, bad.data)
         end for
 
         log(info, "ALL TESTS PASSED - csr_apb_interface")

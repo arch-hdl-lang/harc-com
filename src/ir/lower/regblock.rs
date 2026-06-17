@@ -41,7 +41,7 @@
 //!     `on regs.REG` write callbacks (see `detect_regblock_residual`),
 //!   * `addrmap` composition (incl. `alias of`).
 
-use super::{LowerError, unsupported};
+use super::{unsupported, LowerError};
 use crate::ast::{CallArg, ExprKind, RegAccess as AstRegAccess, RegblockDecl};
 use crate::ir::{
     self, BinOp, Expr, FmtArg, FmtArgs, IrType, RecordFieldSchema, RecordId, RecordSchema,
@@ -103,9 +103,7 @@ pub(crate) fn lower_regblock(
             let bit_width = field_bit_width(&fld.ty);
             if bit_width == 0 {
                 return Err(unsupported(
-                    &format!(
-                        "regblock `{name}` register `{rname}` field `{fname}` of zero width"
-                    ),
+                    &format!("regblock `{name}` register `{rname}` field `{fname}` of zero width"),
                     "",
                 ));
             }
@@ -136,7 +134,9 @@ pub(crate) fn lower_regblock(
                 ExprKind::Bool(b) => Some(*b as u64),
                 _ => {
                     return Err(unsupported(
-                        &format!("a non-literal reset value on regblock `{name}` register `{rname}`"),
+                        &format!(
+                            "a non-literal reset value on regblock `{name}` register `{rname}`"
+                        ),
                         "",
                     ));
                 }
@@ -211,11 +211,7 @@ fn lower_access(a: AstRegAccess) -> RegAccess {
 /// Fold a register's `@ <addr>` offset to a constant. Only plain integer
 /// literals are lowered (v1 const-folds arbitrary expressions; the
 /// corpus uses literals exclusively).
-fn fold_offset(
-    block: &str,
-    reg: &str,
-    e: &crate::ast::Expr,
-) -> Result<u64, LowerError> {
+fn fold_offset(block: &str, reg: &str, e: &crate::ast::Expr) -> Result<u64, LowerError> {
     match &*e.kind {
         ExprKind::Int(s) => super::exprs::parse_int_literal(s).ok_or_else(|| {
             unsupported(
@@ -361,11 +357,7 @@ impl super::FuncBuilder<'_> {
             cur,
             Expr::Unary(UnOp::BitNot, Box::new(lit(mask << pos))),
         );
-        let inserted = bin(
-            BinOp::Shl,
-            bin(BinOp::BitAnd, v, lit(mask)),
-            lit(pos),
-        );
+        let inserted = bin(BinOp::Shl, bin(BinOp::BitAnd, v, lit(mask)), lit(pos));
         let new_word = bin(BinOp::BitOr, cleared, inserted);
         self.push(Stmt::RecordFieldWrite {
             local: mirror,
@@ -510,10 +502,7 @@ impl super::FuncBuilder<'_> {
     /// skipped (RO can't accept the write; WO reads are mirror-only) —
     /// matching v1's `try_emit_bitbash`. Returns `Ok(false)` when `e` is
     /// not a `bitbash(<regblock-binding>)` call.
-    pub(crate) fn try_lower_bitbash(
-        &mut self,
-        e: &crate::ast::Expr,
-    ) -> Result<bool, LowerError> {
+    pub(crate) fn try_lower_bitbash(&mut self, e: &crate::ast::Expr) -> Result<bool, LowerError> {
         let ExprKind::Call { callee, args } = &*e.kind else {
             return Ok(false);
         };
@@ -558,13 +547,23 @@ impl super::FuncBuilder<'_> {
             };
             for (pat_label, pat) in [("ones", mask), ("zero", 0u64)] {
                 // Helper.write(off, pat)
-                let wcall =
-                    self.regblock_call(&bctx.helper_field, "write", vec![lit(reg.offset), lit(pat)])?;
-                self.push(Stmt::TransactorCall { dest: None, call: wcall });
+                let wcall = self.regblock_call(
+                    &bctx.helper_field,
+                    "write",
+                    vec![lit(reg.offset), lit(pat)],
+                )?;
+                self.push(Stmt::TransactorCall {
+                    dest: None,
+                    call: wcall,
+                });
                 // got = Helper.read(off)
-                let rcall = self.regblock_call(&bctx.helper_field, "read", vec![lit(reg.offset)])?;
+                let rcall =
+                    self.regblock_call(&bctx.helper_field, "read", vec![lit(reg.offset)])?;
                 let got = self.fresh_temp();
-                self.push(Stmt::TransactorCall { dest: Some(got), call: rcall });
+                self.push(Stmt::TransactorCall {
+                    dest: Some(got),
+                    call: rcall,
+                });
                 // assert got == pat else fail("bitbash REG label: wrote 0x.., got 0x..")
                 let cond = Expr::Binary(BinOp::Eq, Box::new(Expr::Local(got)), Box::new(lit(pat)));
                 // v1's exact message: `bitbash <reg> <label>: wrote
@@ -573,13 +572,16 @@ impl super::FuncBuilder<'_> {
                 // long-long ABI v1's `(long long)` cast also uses, so
                 // the rendered text is byte-identical across backends.
                 let on_fail = FmtArgs {
-                    fmt: format!(
-                        "bitbash {} {pat_label}: wrote 0x%llx, got 0x%llx",
-                        reg.name
-                    ),
+                    fmt: format!("bitbash {} {pat_label}: wrote 0x%llx, got 0x%llx", reg.name),
                     args: vec![
-                        FmtArg { expr: lit(pat), wide_hex: None },
-                        FmtArg { expr: Expr::Local(got), wide_hex: None },
+                        FmtArg {
+                            expr: lit(pat),
+                            wide_hex: None,
+                        },
+                        FmtArg {
+                            expr: Expr::Local(got),
+                            wide_hex: None,
+                        },
                     ],
                 };
                 self.push(Stmt::AssertCheck { cond, on_fail });
@@ -723,7 +725,6 @@ impl super::FuncBuilder<'_> {
         self.regblock_helper_type(helper_field, method, arity)
     }
 
-
     /// Resolve a regblock `via` helper field to its transactor TYPE name,
     /// validating the named method exists at `arity`. Shared by the
     /// statement call-edge path and the expression-position `RegRead`.
@@ -761,10 +762,7 @@ impl super::FuncBuilder<'_> {
     /// unknown register, or a deeper chain (`regs.REG.FIELD` — field
     /// access, out of subset), is rejected by the callers that need it;
     /// here we only recognize the in-subset register shape.
-    pub(crate) fn as_regblock_register(
-        &self,
-        e: &crate::ast::Expr,
-    ) -> Option<(String, String)> {
+    pub(crate) fn as_regblock_register(&self, e: &crate::ast::Expr) -> Option<(String, String)> {
         let ExprKind::Field { target, name } = &*e.kind else {
             return None;
         };
@@ -818,7 +816,11 @@ impl super::FuncBuilder<'_> {
         // (v1 stores `data & mask`), so a `record_read` of the same
         // address reflects the truncated cell.
         let v = self.lower_expr_no_ports(call_arg(&args[1]))?;
-        let mask = if reg.width >= 64 { u64::MAX } else { (1u64 << reg.width) - 1 };
+        let mask = if reg.width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << reg.width) - 1
+        };
         let masked = bin(BinOp::BitAnd, v, lit(mask));
         // When the binding has any per-register `on regs.REG` write
         // callback, route through `RecordWriteCb` (recursion-depth guard +

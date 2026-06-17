@@ -52,19 +52,19 @@ end covergroup BitDiffCov
 testbench BitDifferenceCounterTb
     dut : Bit_Difference_Counter_top
     cov : BitDiffCov
-end testbench BitDifferenceCounterTb
 
-function apply_and_check(dut: Bit_Difference_Counter_top, a: uint<3>, b: uint<3>) -> uint<1>
-    dut.input_A = a
-    dut.input_B = b
-    wait 1 cycle
-    let expected = hamming3(a, b)
-    if dut.bit_difference_count != expected
-        log(error, "MISMATCH A=${a:1x} B=${b:1x} got=${dut.bit_difference_count} expected=${expected}")
-        return 1
-    end if
-    return 0
-end function apply_and_check
+    function apply_and_check(a: uint<3>, b: uint<3>) -> uint<1>
+        dut.input_A = a
+        dut.input_B = b
+        wait 1 cycle
+        let expected = hamming3(a, b)
+        if dut.bit_difference_count != expected
+            log(error, "MISMATCH A=${a:1x} B=${b:1x} got=${dut.bit_difference_count} expected=${expected}")
+            return 1
+        end if
+        return 0
+    end function apply_and_check
+end testbench BitDifferenceCounterTb
 
 impl BitDifferenceCounterTest for BitDifferenceCounterTb
     run
@@ -79,7 +79,7 @@ impl BitDifferenceCounterTest for BitDifferenceCounterTb
         // Exhaustive input-space sweep: 64 combinations, all distances 0..3.
         for a in 0 .. 8
             for b in 0 .. 8
-                errors = errors + apply_and_check(dut, a, b)
+                errors = errors + apply_and_check(a, b)
             end for
         end for
 
@@ -91,7 +91,7 @@ impl BitDifferenceCounterTest for BitDifferenceCounterTb
                 s.diff != 0
             end randomize
             let b : uint<3> = s.a ^ s.diff
-            errors = errors + apply_and_check(dut, s.a, b)
+            errors = errors + apply_and_check(s.a, b)
         end for
 
         assert errors == 0

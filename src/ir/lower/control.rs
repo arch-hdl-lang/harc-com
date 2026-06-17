@@ -2,7 +2,7 @@
 //! until` into the block shapes specified in docs/tb-ir-design.md
 //! §"Control flow".
 
-use super::{FuncBuilder, LoopFrame, LowerError, unsupported};
+use super::{unsupported, FuncBuilder, LoopFrame, LowerError};
 use crate::ast::{
     Block, Expr as AstExpr, ExprKind, ForStmt, IfStmt, RepeatStmt, WaitTimeout, WaitUntilMode,
 };
@@ -14,7 +14,13 @@ use crate::ir::{
 impl FuncBuilder<'_> {
     pub(crate) fn lower_if(&mut self, i: &IfStmt) -> Result<(), LowerError> {
         let merge = self.new_block();
-        self.lower_if_arm(&i.cond, &i.then_block, &i.elsifs, i.else_block.as_ref(), merge)?;
+        self.lower_if_arm(
+            &i.cond,
+            &i.then_block,
+            &i.elsifs,
+            i.else_block.as_ref(),
+            merge,
+        )?;
         self.start_block(merge);
         Ok(())
     }
@@ -93,11 +99,7 @@ impl FuncBuilder<'_> {
         let hi_ir = self.lower_expr_no_ports(hi)?;
         let hi_operand = self.stash_if_impure(hi_ir);
 
-        let cond = Expr::Binary(
-            BinOp::Lt,
-            Box::new(Expr::Local(var)),
-            Box::new(hi_operand),
-        );
+        let cond = Expr::Binary(BinOp::Lt, Box::new(Expr::Local(var)), Box::new(hi_operand));
         let step = Stmt::Assign(
             var,
             Expr::Binary(

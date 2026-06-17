@@ -24,9 +24,10 @@
 //! This file drives the real CLI end to end:
 //!   1. `--cpp-split tests` at the default group size (6 tests → 2 shards
 //!      + dispatcher) must build, link, and dispatch every test by name.
-//!   2. `--cpp-split-group-size 1` (the per-test header/`.inc`-factoring
-//!      path, which the default group size never exercises) must also
-//!      build, link, and dispatch.
+//!   2. `--cpp-split-group-size 1` (the per-test shard path, which the
+//!      default group size never exercises) must also build, link, and
+//!      dispatch.
+//! Both checks run under v1 and TBIR codegen.
 //!
 //! The DUT and multi-test testbench are written into the temp dir by the
 //! test itself: the inputs are trivial and are most legible sitting next to
@@ -76,12 +77,29 @@ module SplitAdder(input logic [7:0] a, input logic [7:0] b, output logic [8:0] s
 endmodule
 ";
 
+const MIXED_DUT_SV: &str = "\
+module SplitX(output logic done);
+  always_comb done = 1'b1;
+endmodule
+
+module SplitY(output logic done);
+  always_comb done = 1'b1;
+endmodule
+";
+
 /// Six independent tests in the classic `test … let dut … run … end`
 /// form the split path keys on. Each checks a distinct sum so a
 /// mis-dispatch (running the wrong `run_<Test>`) would surface as an
 /// assertion failure, not a false pass.
 fn adder_tb() -> String {
-    let cases = [(1u32, 2, 3), (10, 20, 30), (100, 50, 150), (5, 5, 10), (7, 8, 15), (200, 55, 255)];
+    let cases = [
+        (1u32, 2, 3),
+        (10, 20, 30),
+        (100, 50, 150),
+        (5, 5, 10),
+        (7, 8, 15),
+        (200, 55, 255),
+    ];
     let mut s = String::new();
     for (name, (a, b, sum)) in TEST_NAMES.iter().zip(cases) {
         s.push_str(&format!(
@@ -91,9 +109,34 @@ fn adder_tb() -> String {
     s
 }
 
+fn mixed_dut_tb() -> String {
+    "\
+test UsesX
+    let dut : SplitX
+    run
+        wait 1 cycle
+    end run
+end test UsesX
+
+test UsesY
+    let dut : SplitY
+    run
+        wait 1 cycle
+    end run
+end test UsesY
+"
+    .to_string()
+}
+
 /// Run `harc sim --sv … --cpp-split tests [--cpp-split-group-size N]` and
 /// return (success, combined-output, binary-path).
-fn run_split_build(outdir: &Path, sv: &Path, tb: &Path, group_size: Option<u32>) -> (bool, String) {
+fn run_split_build(
+    outdir: &Path,
+    sv: &Path,
+    tb: &Path,
+    codegen: &str,
+    group_size: Option<u32>,
+) -> (bool, String) {
     let mut cmd = Command::new(harc_bin());
     cmd.arg("sim")
         .arg("--sv")
@@ -101,6 +144,8 @@ fn run_split_build(outdir: &Path, sv: &Path, tb: &Path, group_size: Option<u32>)
         .arg(tb)
         .arg("--top")
         .arg("SplitAdder")
+        .arg("--codegen")
+        .arg(codegen)
         .arg("--cpp-split")
         .arg("tests")
         .arg("--outdir")
@@ -109,6 +154,39 @@ fn run_split_build(outdir: &Path, sv: &Path, tb: &Path, group_size: Option<u32>)
         cmd.arg("--cpp-split-group-size").arg(n.to_string());
     }
     let out = cmd.output().expect("spawn harc sim");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    (
+        out.status.success(),
+        format!("--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"),
+    )
+}
+
+fn run_split_emit_only(
+    outdir: &Path,
+    sv: &Path,
+    tb: &Path,
+    codegen: &str,
+    group_size: Option<u32>,
+) -> (bool, String) {
+    let mut cmd = Command::new(harc_bin());
+    cmd.arg("sim")
+        .arg("--sv")
+        .arg(sv)
+        .arg(tb)
+        .arg("--top")
+        .arg("SplitX")
+        .arg("--codegen")
+        .arg(codegen)
+        .arg("--cpp-split")
+        .arg("tests")
+        .arg("--emit-only")
+        .arg("--outdir")
+        .arg(outdir);
+    if let Some(n) = group_size {
+        cmd.arg("--cpp-split-group-size").arg(n.to_string());
+    }
+    let out = cmd.output().expect("spawn harc sim --emit-only");
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     (
@@ -180,22 +258,56 @@ fn split_build_links_and_dispatches_e2e() {
     std::fs::write(&sv, ADDER_SV).expect("write DUT");
     std::fs::write(&tb, adder_tb()).expect("write TB");
 
-    // 1. Default group size (4): 6 tests → 2 shards + dispatcher. This is
-    //    the path that links more than one shard TU together.
-    let out_default = fresh_outdir("default");
-    let (ok, log) = run_split_build(&out_default, &sv, &tb, None);
-    assert!(ok, "default-group split build failed:\n{log}");
-    assert_each_test_dispatches(&out_default, "group=default");
+    let mut outdirs = Vec::new();
+    for codegen in ["v1", "tbir"] {
+        // 1. Default group size (4): 6 tests → 2 shards + dispatcher. This is
+        //    the path that links more than one shard TU together.
+        let out_default = fresh_outdir(&format!("{codegen}_default"));
+        let (ok, log) = run_split_build(&out_default, &sv, &tb, codegen, None);
+        assert!(ok, "{codegen} default-group split build failed:\n{log}");
+        assert_each_test_dispatches(&out_default, &format!("{codegen} group=default"));
+        outdirs.push(out_default);
 
-    // 2. group_size = 1: the per-test header/`.inc`-factoring path. The
-    //    default group size never reaches this branch, so it is the least
-    //    exercised and most intricate (common-prefix/suffix string slicing).
-    let out_g1 = fresh_outdir("g1");
-    let (ok, log) = run_split_build(&out_g1, &sv, &tb, Some(1));
-    assert!(ok, "group_size=1 split build failed:\n{log}");
-    assert_each_test_dispatches(&out_g1, "group=1");
+        // 2. group_size = 1: the per-test shard path. The default group size
+        //    never reaches this branch.
+        let out_g1 = fresh_outdir(&format!("{codegen}_g1"));
+        let (ok, log) = run_split_build(&out_g1, &sv, &tb, codegen, Some(1));
+        assert!(ok, "{codegen} group_size=1 split build failed:\n{log}");
+        assert_each_test_dispatches(&out_g1, &format!("{codegen} group=1"));
+        outdirs.push(out_g1);
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(&out_default);
-    let _ = std::fs::remove_dir_all(&out_g1);
+    for outdir in outdirs {
+        let _ = std::fs::remove_dir_all(outdir);
+    }
+}
+
+#[test]
+fn split_build_rejects_mixed_dut_before_sharding() {
+    let dir = fresh_outdir("mixed_inputs");
+    let sv = dir.join("MixedSplitDuts.sv");
+    let tb = dir.join("mixed_split_tb.harc");
+    std::fs::write(&sv, MIXED_DUT_SV).expect("write mixed DUTs");
+    std::fs::write(&tb, mixed_dut_tb()).expect("write mixed-DUT TB");
+
+    let mut outdirs = Vec::new();
+    for codegen in ["v1", "tbir"] {
+        let outdir = fresh_outdir(&format!("{codegen}_mixed_g1"));
+        let (ok, log) = run_split_emit_only(&outdir, &sv, &tb, codegen, Some(1));
+        assert!(
+            !ok,
+            "{codegen} split emit unexpectedly accepted mixed-DUT tests:\n{log}"
+        );
+        assert!(
+            log.contains("multi-DUT") && log.contains("SplitX") && log.contains("SplitY"),
+            "{codegen} mixed-DUT split error should name both DUTs; got:\n{log}"
+        );
+        outdirs.push(outdir);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+    for outdir in outdirs {
+        let _ = std::fs::remove_dir_all(outdir);
+    }
 }

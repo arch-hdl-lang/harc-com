@@ -226,9 +226,7 @@ fn tlm_call_pulse_times(merged_vcd: &str) -> Vec<u64> {
 fn trace_merge_blocking_and_ooo_tags_e2e() {
     // VCD path requires Verilator >= 5.036; see src/main.rs:1167 — older versions need bare `--trace`.
     match detect_verilator_version() {
-        Some((maj, min))
-            if (maj, min) < (MIN_VERILATOR_MAJOR, MIN_VERILATOR_MINOR) =>
-        {
+        Some((maj, min)) if (maj, min) < (MIN_VERILATOR_MAJOR, MIN_VERILATOR_MINOR) => {
             eprintln!(
                 "SKIP trace_merge_blocking_and_ooo_tags_e2e: detected Verilator \
                  {maj}.{min:03}, need >= {MIN_VERILATOR_MAJOR}.{MIN_VERILATOR_MINOR:03}. \
@@ -310,8 +308,7 @@ fn trace_merge_blocking_and_ooo_tags_e2e() {
         "merged VCD missing event0_valid lane"
     );
     assert!(
-        merged.contains("$comment HARC_TRACE_MAP event_type")
-            && merged.contains("tlm_call"),
+        merged.contains("$comment HARC_TRACE_MAP event_type") && merged.contains("tlm_call"),
         "merged VCD missing HARC_TRACE_MAP event_type ... tlm_call entry"
     );
 

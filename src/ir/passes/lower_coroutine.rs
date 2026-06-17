@@ -30,8 +30,8 @@
 //! helpers emit as plain call-by-value functions, never as coroutines.
 
 use super::super::{
-    BlockId, Expr, FunctionId, FunctionKind, PredSrc, TbFunction, TbProgram, Terminator,
-    WaitClock, WaitMode,
+    BlockId, Expr, FunctionId, FunctionKind, PredSrc, TbFunction, TbProgram, Terminator, WaitClock,
+    WaitMode,
 };
 use crate::ir::display::{expr_str, mode_str};
 use std::collections::BTreeMap;
@@ -97,7 +97,9 @@ pub enum Trigger {
     /// split backend the constraint solve runs at the host service tier
     /// (or a pre-solved replay table), then control resumes; the
     /// `ConstraintRef` names the solve site.
-    Solved { constraints: crate::ir::ConstraintRef },
+    Solved {
+        constraints: crate::ir::ConstraintRef,
+    },
     /// `Return` reached — coroutine finished.
     Done,
     /// `Fatal` reached — simulation aborts.
@@ -387,14 +389,24 @@ impl Display for CoroutineMetadataDisplay<'_> {
                     Some(s) => format!("s{}", s.0),
                     None => "end".to_string(),
                 };
-                write!(f, "    s{} -> {} on {}", t.from.0, to, trigger_str(func, &t.trigger))?;
+                write!(
+                    f,
+                    "    s{} -> {} on {}",
+                    t.from.0,
+                    to,
+                    trigger_str(func, &t.trigger)
+                )?;
                 if !t.guard.is_empty() {
                     let terms: Vec<String> = t
                         .guard
                         .iter()
                         .map(|g| {
                             let c = expr_str(func, &g.cond);
-                            if g.taken { c } else { format!("!{c}") }
+                            if g.taken {
+                                c
+                            } else {
+                                format!("!{c}")
+                            }
                         })
                         .collect();
                     write!(f, " if {}", terms.join(" && "))?;

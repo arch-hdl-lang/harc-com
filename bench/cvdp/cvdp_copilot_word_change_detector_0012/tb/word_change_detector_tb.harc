@@ -13,68 +13,67 @@ end transaction WordStim
 
 testbench WordChangeTb
     dut : Word_Change_Pulse
+
+    function reset_word_change()
+        dut.reset = 1
+        dut.enable = 0
+        dut.latch_pattern = 0
+        dut.data_in = 0
+        dut.mask = 0
+        dut.match_pattern = 0
+        wait 3 cycles
+        assert dut.word_change_pulse == 0 else fail("reset: word_change_pulse high")
+        assert dut.pattern_match_pulse == 0 else fail("reset: pattern_match_pulse high")
+        assert dut.latched_pattern == 0 else fail("reset: latched_pattern nonzero")
+        dut.reset = 0
+        wait 1 cycle
+    end function reset_word_change
+    function step_word_change(data: uint<8>, mask: uint<8>, pattern: uint<8>, enable: bool, latch: bool)
+        dut.data_in = data
+        dut.mask = mask
+        dut.match_pattern = pattern
+        dut.enable = enable
+        dut.latch_pattern = latch
+        wait 1 cycle
+    end function step_word_change
 end testbench WordChangeTb
-
-function reset_word_change(dut: Word_Change_Pulse)
-    dut.reset = 1
-    dut.enable = 0
-    dut.latch_pattern = 0
-    dut.data_in = 0
-    dut.mask = 0
-    dut.match_pattern = 0
-    wait 3 cycles
-    assert dut.word_change_pulse == 0 else fail("reset: word_change_pulse high")
-    assert dut.pattern_match_pulse == 0 else fail("reset: pattern_match_pulse high")
-    assert dut.latched_pattern == 0 else fail("reset: latched_pattern nonzero")
-    dut.reset = 0
-    wait 1 cycle
-end function reset_word_change
-
-function step_word_change(dut: Word_Change_Pulse, data: uint<8>, mask: uint<8>, pattern: uint<8>, enable: bool, latch: bool)
-    dut.data_in = data
-    dut.mask = mask
-    dut.match_pattern = pattern
-    dut.enable = enable
-    dut.latch_pattern = latch
-    wait 1 cycle
-end function step_word_change
 
 impl WordChangeTest for WordChangeTb
     run
         log(info, "word_change_detector: mask, latch, match, enable, and bit toggles")
 
-        reset_word_change(dut)
+        reset_word_change()
 
         // Disabled path clears all registered outputs.
-        step_word_change(dut, 0xAA, 0xFF, 0xAA, false, true)
+        step_word_change(0xAA, 0xFF, 0xAA, false, true)
         assert dut.latched_pattern == 0 else fail("disabled latch should not update")
         assert dut.word_change_pulse == 0 else fail("disabled word_change_pulse high")
 
         // Latch a pattern, then hold it while changing match_pattern input.
-        step_word_change(dut, 0x00, 0xFF, 0xA5, true, true)
+        step_word_change(0x00, 0xFF, 0xA5, true, true)
         wait 1 cycle
         assert dut.latched_pattern == 0xA5 else fail("pattern did not latch")
-        step_word_change(dut, 0xA5, 0xFF, 0x00, true, false)
+        step_word_change(0xA5, 0xFF, 0x00, true, false)
         wait 2 cycles
         assert dut.pattern_match_pulse == 1 else fail("expected pattern match pulse")
 
         // Unmasked changes.
-        step_word_change(dut, 0x5A, 0xFF, 0xA5, true, false)
+        step_word_change(0x5A, 0xFF, 0xA5, true, false)
         wait 1 cycle
         assert dut.word_change_pulse == 1 else fail("expected unmasked word change")
 
         // Masked-off changes should clear the word-change path.
-        step_word_change(dut, 0xA5, 0x00, 0xA5, true, false)
+        step_word_change(0xA5, 0x00, 0xA5, true, false)
         wait 1 cycle
         assert dut.word_change_pulse == 0 else fail("masked-off change should not pulse")
 
         // Toggle every bit with a single-bit mask, then with walking-zero masks.
         for bit in 0 .. 8
             let one : uint<8> = (1 as uint<8>) << bit
-            step_word_change(dut, one, one, one, true, true)
-            step_word_change(dut, 0, one, one, true, false)
+            step_word_change(one, one, one, true, true)
+            step_word_change(0, one, one, true, false)
             wait 1 cycle
-            step_word_change(dut, one, (0xFF ^ one).trunc<8>(), one, true, false)
+            step_word_change(one, (0xFF ^ one).trunc<8>(), one, true, false)
             wait 1 cycle
         end for
 
@@ -86,14 +85,14 @@ impl WordChangeTest for WordChangeTb
                 s.mask != 0
                 s.pattern == s.data
             end randomize
-            step_word_change(dut, s.data, s.mask, s.pattern, true, true)
+            step_word_change(s.data, s.mask, s.pattern, true, true)
             wait 1 cycle
-            step_word_change(dut, s.data, s.mask, 0, true, false)
+            step_word_change(s.data, s.mask, 0, true, false)
             wait 1 cycle
         end for
 
         // Return through reset once more for async reset coverage.
-        reset_word_change(dut)
+        reset_word_change()
         log(info, "ALL TESTS PASSED - word_change_detector")
     end run
 end impl WordChangeTest

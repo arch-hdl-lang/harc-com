@@ -99,106 +99,101 @@ end covergroup EndianCov
 testbench EndianSwapperTb
     dut : endian_swapper
     cov : EndianCov
-end testbench EndianSwapperTb
 
-function reset_endian(dut: endian_swapper)
-    dut.reset_n = 0
-    dut.stream_in_data = 0
-    dut.stream_in_empty = 0
-    dut.stream_in_valid = 0
-    dut.stream_in_startofpacket = 0
-    dut.stream_in_endofpacket = 0
-    dut.stream_out_ready = 0
-    dut.csr_address = 0
-    dut.csr_read = 0
-    dut.csr_write = 0
-    dut.csr_writedata = 0
-    wait 4 cycles
-    dut.reset_n = 1
-    wait 2 cycles
-end function reset_endian
-
-function csr_idle(dut: endian_swapper)
-    dut.csr_read = 0
-    dut.csr_write = 0
-    dut.csr_address = 0
-    dut.csr_writedata = 0
-    wait 1 cycle
-end function csr_idle
-
-function csr_write(dut: endian_swapper, addr: uint<2>, data: uint<32>)
-    dut.csr_address = addr
-    dut.csr_writedata = data
-    dut.csr_read = 0
-    dut.csr_write = 1
-    wait 1 cycle
-    csr_idle(dut)
-end function csr_write
-
-function csr_read(dut: endian_swapper, addr: uint<2>) -> uint<32>
-    dut.csr_address = addr
-    dut.csr_read = 1
-    dut.csr_write = 0
-    wait 1 cycle
-    let val = dut.csr_readdata
-    csr_idle(dut)
-    return val
-end function csr_read
-
-function stream_idle(dut: endian_swapper)
-    dut.stream_in_valid = 0
-    dut.stream_in_startofpacket = 0
-    dut.stream_in_endofpacket = 0
-    wait 1 cycle
-end function stream_idle
-
-function send_word(dut: endian_swapper, data: uint<64>, empty: uint<3>, sop: bool, eop: bool, ready_gap: uint<3>)
-    dut.stream_in_data = data
-    dut.stream_in_empty = empty
-    dut.stream_in_startofpacket = sop
-    dut.stream_in_endofpacket = eop
-    dut.stream_in_valid = 1
-    for _ in 0 .. ready_gap
+    function reset_endian()
+        dut.reset_n = 0
+        dut.stream_in_data = 0
+        dut.stream_in_empty = 0
+        dut.stream_in_valid = 0
+        dut.stream_in_startofpacket = 0
+        dut.stream_in_endofpacket = 0
         dut.stream_out_ready = 0
+        dut.csr_address = 0
+        dut.csr_read = 0
+        dut.csr_write = 0
+        dut.csr_writedata = 0
+        wait 4 cycles
+        dut.reset_n = 1
+        wait 2 cycles
+    end function reset_endian
+    function csr_idle()
+        dut.csr_read = 0
+        dut.csr_write = 0
+        dut.csr_address = 0
+        dut.csr_writedata = 0
         wait 1 cycle
-    end for
-    dut.stream_out_ready = 1
-    wait 2 cycles
-    stream_idle(dut)
-    wait 1 cycle
-end function send_word
+    end function csr_idle
+    function csr_write(addr: uint<2>, data: uint<32>)
+        dut.csr_address = addr
+        dut.csr_writedata = data
+        dut.csr_read = 0
+        dut.csr_write = 1
+        wait 1 cycle
+        csr_idle()
+    end function csr_write
+    function csr_read(addr: uint<2>) -> uint<32>
+        dut.csr_address = addr
+        dut.csr_read = 1
+        dut.csr_write = 0
+        wait 1 cycle
+        let val = dut.csr_readdata
+        csr_idle()
+        return val
+    end function csr_read
+    function stream_idle()
+        dut.stream_in_valid = 0
+        dut.stream_in_startofpacket = 0
+        dut.stream_in_endofpacket = 0
+        wait 1 cycle
+    end function stream_idle
+    function send_word(data: uint<64>, empty: uint<3>, sop: bool, eop: bool, ready_gap: uint<3>)
+        dut.stream_in_data = data
+        dut.stream_in_empty = empty
+        dut.stream_in_startofpacket = sop
+        dut.stream_in_endofpacket = eop
+        dut.stream_in_valid = 1
+        for _ in 0 .. ready_gap
+            dut.stream_out_ready = 0
+            wait 1 cycle
+        end for
+        dut.stream_out_ready = 1
+        wait 2 cycles
+        stream_idle()
+        wait 1 cycle
+    end function send_word
+end testbench EndianSwapperTb
 
 impl EndianSwapperTest for EndianSwapperTb
     run
         log(info, "endian_swapper: CSR, packet, backpressure, and 64-bit auto coverage")
 
-        reset_endian(dut)
+        reset_endian()
 
         // CSR setup and readback stimulus.
-        let _c0 = csr_read(dut, 0)
-        let _pc0 = csr_read(dut, 1)
-        let _bad2 = csr_read(dut, 2)
-        csr_write(dut, 0, 0)
-        csr_write(dut, 0, 1)
-        csr_write(dut, 1, 0xFFFFFFFF)
+        let _c0 = csr_read(0)
+        let _pc0 = csr_read(1)
+        let _bad2 = csr_read(2)
+        csr_write(0, 0)
+        csr_write(0, 1)
+        csr_write(1, 0xFFFFFFFF)
         dut.csr_read = 1
         dut.csr_write = 1
         dut.csr_address = 3
         dut.csr_writedata = 0xAAAAAAAA
         wait 1 cycle
-        csr_idle(dut)
+        csr_idle()
 
         // Directed packets with and without byte swapping.
-        csr_write(dut, 0, 0)
-        send_word(dut, 0x0000000000000000, 0, true, true, 0)
-        send_word(dut, 0xFFFFFFFFFFFFFFFF, 7, true, true, 1)
-        send_word(dut, 0x0102030405060708, 0, true, false, 2)
-        send_word(dut, 0x8877665544332211, 3, false, true, 0)
+        csr_write(0, 0)
+        send_word(0x0000000000000000, 0, true, true, 0)
+        send_word(0xFFFFFFFFFFFFFFFF, 7, true, true, 1)
+        send_word(0x0102030405060708, 0, true, false, 2)
+        send_word(0x8877665544332211, 3, false, true, 0)
 
-        csr_write(dut, 0, 1)
-        send_word(dut, 0x0123456789ABCDEF, 0, true, true, 3)
-        send_word(dut, 0x8000000000000000, 1, true, false, 4)
-        send_word(dut, 0x0000000000000001, 7, false, true, 1)
+        csr_write(0, 1)
+        send_word(0x0123456789ABCDEF, 0, true, true, 3)
+        send_word(0x8000000000000000, 1, true, false, 4)
+        send_word(0x0000000000000001, 7, false, true, 1)
 
         // Fill both buffer slots while output is stalled, then drain.
         dut.stream_out_ready = 0
@@ -214,22 +209,22 @@ impl EndianSwapperTest for EndianSwapperTb
         wait 2 cycles
         dut.stream_out_ready = 1
         wait 4 cycles
-        stream_idle(dut)
+        stream_idle()
 
         for bit in 0 .. 64
             let data : uint<64> = ((1 as uint<64>) << bit).trunc<64>()
-            send_word(dut, data, (bit % 8) as uint<3>, bit == 0, bit == 63, (bit % 4) as uint<3>)
-            send_word(dut, (0xFFFFFFFFFFFFFFFF ^ data).trunc<64>(), (7 - (bit % 8)) as uint<3>, bit == 63, bit == 0, (bit % 3) as uint<3>)
+            send_word(data, (bit % 8) as uint<3>, bit == 0, bit == 63, (bit % 4) as uint<3>)
+            send_word((0xFFFFFFFFFFFFFFFF ^ data).trunc<64>(), (7 - (bit % 8)) as uint<3>, bit == 63, bit == 0, (bit % 3) as uint<3>)
         end for
 
         for _ in 0 .. 48
             let s : StreamStim
             randomize(s)
             let data : uint<64> = (((s.hi as uint<64>) << 32) | (s.lo as uint<64>))
-            send_word(dut, data, s.empty, s.sop, s.eop, s.ready_gap)
+            send_word(data, s.empty, s.sop, s.eop, s.ready_gap)
         end for
 
-        let _pc1 = csr_read(dut, 1)
+        let _pc1 = csr_read(1)
 
         log(info, "ALL TESTS PASSED - endian_swapper")
     end run

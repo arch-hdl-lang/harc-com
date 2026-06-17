@@ -166,7 +166,11 @@ fn normalize_one(line: &str) -> NormalizedLine {
         out = strip_field(&out, "dut_backend");
         out = strip_field(&out, "tool");
     }
-    NormalizedLine { normalized: out, cycle, event_type }
+    NormalizedLine {
+        normalized: out,
+        cycle,
+        event_type,
+    }
 }
 
 /// Remove the JSON field `"<name>":<value>` from a flat object's text
@@ -380,7 +384,10 @@ mod tests {
         let a = r#"{"type":"meta","schema_version":1,"tool":"harc","seed":1,"dut_backend":"arch","top":"T","test":"t"}"#;
         let s = r#"{"type":"meta","schema_version":1,"tool":"harc","seed":1,"dut_backend":"verilator","top":"T","test":"t"}"#;
         let divs = diff_trace_strings(a, s).unwrap();
-        assert!(divs.is_empty(), "meta dut_backend mismatch must be ignored, got: {divs:?}");
+        assert!(
+            divs.is_empty(),
+            "meta dut_backend mismatch must be ignored, got: {divs:?}"
+        );
     }
 
     #[test]

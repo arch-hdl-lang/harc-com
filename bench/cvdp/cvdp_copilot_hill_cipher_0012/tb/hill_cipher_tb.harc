@@ -5,16 +5,16 @@
 
 testbench HillCipherTb
     dut : hill_cipher
-end testbench HillCipherTb
 
-function run_block(dut: hill_cipher, text: uint<15>, key: uint<45>)
-    dut.plaintext = text
-    dut.key = key
-    dut.start = 1
-    wait 1 cycle
-    dut.start = 0
-    wait 5 cycles
-end function run_block
+    function run_block(text: uint<15>, key: uint<45>)
+        dut.plaintext = text
+        dut.key = key
+        dut.start = 1
+        wait 1 cycle
+        dut.start = 0
+        wait 5 cycles
+    end function run_block
+end testbench HillCipherTb
 
 impl HillCipherTest for HillCipherTb
     run
@@ -31,16 +31,16 @@ impl HillCipherTest for HillCipherTb
         // Idle cycles with start low.
         wait 3 cycles
 
-        run_block(dut, 0, 0)
-        run_block(dut, 0x4210, 0x000108421)
-        run_block(dut, 0x7FFF, 0x1FFFFFFFFFFF)
-        run_block(dut, 0x1234, 0x010842108421)
-        run_block(dut, 0x6B5A, 0x07C1F07C1F0)
+        run_block(0, 0)
+        run_block(0x4210, 0x000108421)
+        run_block(0x7FFF, 0x1FFFFFFFFFFF)
+        run_block(0x1234, 0x010842108421)
+        run_block(0x6B5A, 0x07C1F07C1F0)
 
         for k in 0 .. 16
             let text : uint<15> = ((k * 997) & 0x7FFF)
             let key : uint<45> = ((k * 0x111111111) & 0x1FFFFFFFFFFF)
-            run_block(dut, text, key)
+            run_block(text, key)
         end for
 
         dut.reset = 1

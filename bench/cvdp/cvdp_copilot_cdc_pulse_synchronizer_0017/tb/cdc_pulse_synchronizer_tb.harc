@@ -6,65 +6,62 @@
 
 testbench CdcPulseTb
     dut : cdc_pulse_synchronizer_top
+
+    function settle_cdc()
+        wait 1 cycle
+    end function settle_cdc
+    function src_tick(pulse: bool)
+        dut.src_pulse = pulse
+        dut.src_clock = 0
+        settle_cdc()
+        dut.src_clock = 1
+        settle_cdc()
+        dut.src_clock = 0
+        dut.src_pulse = 0
+        settle_cdc()
+    end function src_tick
+    function des_tick()
+        dut.des_clock = 0
+        settle_cdc()
+        dut.des_clock = 1
+        settle_cdc()
+        dut.des_clock = 0
+        settle_cdc()
+    end function des_tick
+    function reset_cdc()
+        dut.rst_in = 1
+        dut.src_clock = 0
+        dut.des_clock = 0
+        dut.src_pulse = 0
+        settle_cdc()
+        src_tick(false)
+        des_tick()
+        assert dut.des_pulse == 0 else fail("reset: des_pulse high")
+        dut.rst_in = 0
+        settle_cdc()
+    end function reset_cdc
 end testbench CdcPulseTb
-
-function settle_cdc(dut: cdc_pulse_synchronizer_top)
-    wait 1 cycle
-end function settle_cdc
-
-function src_tick(dut: cdc_pulse_synchronizer_top, pulse: bool)
-    dut.src_pulse = pulse
-    dut.src_clock = 0
-    settle_cdc(dut)
-    dut.src_clock = 1
-    settle_cdc(dut)
-    dut.src_clock = 0
-    dut.src_pulse = 0
-    settle_cdc(dut)
-end function src_tick
-
-function des_tick(dut: cdc_pulse_synchronizer_top)
-    dut.des_clock = 0
-    settle_cdc(dut)
-    dut.des_clock = 1
-    settle_cdc(dut)
-    dut.des_clock = 0
-    settle_cdc(dut)
-end function des_tick
-
-function reset_cdc(dut: cdc_pulse_synchronizer_top)
-    dut.rst_in = 1
-    dut.src_clock = 0
-    dut.des_clock = 0
-    dut.src_pulse = 0
-    settle_cdc(dut)
-    src_tick(dut, false)
-    des_tick(dut)
-    assert dut.des_pulse == 0 else fail("reset: des_pulse high")
-    dut.rst_in = 0
-    settle_cdc(dut)
-end function reset_cdc
 
 impl CdcPulseTest for CdcPulseTb
     run
         log(info, "cdc_pulse_synchronizer: reset, source toggles, destination sync pulse")
 
-        reset_cdc(dut)
+        reset_cdc()
 
         // No-pulse source ticks should hold the toggle flop.
         for _ in 0 .. 4
-            src_tick(dut, false)
-            des_tick(dut)
+            src_tick(false)
+            des_tick()
             assert dut.des_pulse == 0 else fail("unexpected des_pulse without source pulse")
         end for
 
         // Drive several source pulses. The destination pulse appears after
         // enough destination-domain ticks for the synchronizer chain.
         for _ in 0 .. 8
-            src_tick(dut, true)
+            src_tick(true)
             let saw : bool = false
             for _ in 0 .. 6
-                des_tick(dut)
+                des_tick()
                 if dut.des_pulse == 1
                     saw = true
                 end if
@@ -73,7 +70,7 @@ impl CdcPulseTest for CdcPulseTb
         end for
 
         // Reset after activity to revisit async reset on all flops.
-        reset_cdc(dut)
+        reset_cdc()
         log(info, "ALL TESTS PASSED - cdc_pulse_synchronizer")
     end run
 end impl CdcPulseTest

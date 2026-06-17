@@ -69,26 +69,25 @@ end covergroup SkidCov
 testbench SkidRegisterTb
     dut : skid_register
     cov : SkidCov
+
+    function reset_skid()
+        dut.rst = 1
+        dut.up_bus = 0
+        dut.up_val = 0
+        dut.dn_rdy = 0
+        wait 3 cycles
+        assert dut.up_rdy == 1 else fail("reset: up_rdy expected high")
+        assert dut.dn_val == 0 else fail("reset: dn_val expected low")
+        dut.rst = 0
+        wait 1 cycle
+    end function reset_skid
+    function drive_skid(data: uint<32>, up_valid: bool, dn_ready: bool)
+        dut.up_bus = data
+        dut.up_val = up_valid
+        dut.dn_rdy = dn_ready
+        wait 1 cycle
+    end function drive_skid
 end testbench SkidRegisterTb
-
-function reset_skid(dut: skid_register)
-    dut.rst = 1
-    dut.up_bus = 0
-    dut.up_val = 0
-    dut.dn_rdy = 0
-    wait 3 cycles
-    assert dut.up_rdy == 1 else fail("reset: up_rdy expected high")
-    assert dut.dn_val == 0 else fail("reset: dn_val expected low")
-    dut.rst = 0
-    wait 1 cycle
-end function reset_skid
-
-function drive_skid(dut: skid_register, data: uint<32>, up_valid: bool, dn_ready: bool)
-    dut.up_bus = data
-    dut.up_val = up_valid
-    dut.dn_rdy = dn_ready
-    wait 1 cycle
-end function drive_skid
 
 impl SkidRegisterTest for SkidRegisterTb
     let pipe : SkidPipe = bind dut with {
@@ -103,20 +102,20 @@ impl SkidRegisterTest for SkidRegisterTb
     run
         log(info, "skid_register: backpressure, flush, restart, and unique random traffic")
 
-        reset_skid(dut)
+        reset_skid()
 
         // Continuous no-backpressure streaming.
-        drive_skid(dut, 0x00000000, true, true)
-        drive_skid(dut, 0xFFFFFFFF, true, true)
-        drive_skid(dut, 0x80000000, true, true)
-        drive_skid(dut, 0x00000001, true, true)
-        drive_skid(dut, 0xAAAAAAAA, true, true)
-        drive_skid(dut, 0x55555555, true, true)
+        drive_skid(0x00000000, true, true)
+        drive_skid(0xFFFFFFFF, true, true)
+        drive_skid(0x80000000, true, true)
+        drive_skid(0x00000001, true, true)
+        drive_skid(0xAAAAAAAA, true, true)
+        drive_skid(0x55555555, true, true)
 
         for bit in 0 .. 32
             let one : uint<32> = (1 as uint<32>) << bit
-            drive_skid(dut, one, true, true)
-            drive_skid(dut, (0xFFFFFFFF ^ one).trunc<32>(), true, true)
+            drive_skid(one, true, true)
+            drive_skid((0xFFFFFFFF ^ one).trunc<32>(), true, true)
         end for
 
         // Full downstream backpressure while upstream keeps asserting valid.
@@ -149,8 +148,8 @@ impl SkidRegisterTest for SkidRegisterTb
 
         // Stall/restart pulses and invalid bubbles.
         for i in 0 .. 16
-            drive_skid(dut, (0x2000 + i).trunc<32>(), true, (i & 1) == 0)
-            drive_skid(dut, (0x3000 + i).trunc<32>(), false, (i & 2) == 0)
+            drive_skid((0x2000 + i).trunc<32>(), true, (i & 1) == 0)
+            drive_skid((0x3000 + i).trunc<32>(), false, (i & 2) == 0)
         end for
 
         // Solver-backed traffic. This exercises unique recycling and natural
@@ -158,7 +157,7 @@ impl SkidRegisterTest for SkidRegisterTb
         for _ in 0 .. 72
             let s : SkidStim
             randomize(s)
-            drive_skid(dut, s.data, s.up_valid, s.dn_ready)
+            drive_skid(s.data, s.up_valid, s.dn_ready)
         end for
 
         // End ready with a drained pipeline.
@@ -166,7 +165,7 @@ impl SkidRegisterTest for SkidRegisterTb
         dut.dn_rdy = 1
         wait 10 cycles
 
-        reset_skid(dut)
+        reset_skid()
         log(info, "ALL TESTS PASSED - skid_register")
     end run
 
