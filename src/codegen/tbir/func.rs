@@ -781,6 +781,35 @@ fn emit_stmt(
                 }
             }
         }
+        Stmt::TransactorSelfCall { dest, call } => {
+            let Expr::Call(
+                CallTarget::TransactorSelfMethod {
+                    transactor,
+                    method,
+                },
+                args,
+            ) = call
+            else {
+                return Err(EmitError(format!(
+                    "tbir: TransactorSelfCall in {} carries a non-self-call payload \
+                     (verifier invariant violated)",
+                    func.name
+                )));
+            };
+            let mut rendered = Vec::with_capacity(args.len());
+            for a in args {
+                rendered.push(expr_cpp(cx, a)?);
+            }
+            let invoke = format!("{transactor}_{method}({})", rendered.join(", "));
+            match dest {
+                Some(d) => {
+                    writeln!(out, "{pad}{} = {invoke};", &names[d.index()]).ok();
+                }
+                None => {
+                    writeln!(out, "{pad}{invoke};").ok();
+                }
+            }
+        }
         Stmt::RecordFieldWrite {
             local,
             field,
@@ -1589,6 +1618,37 @@ fn declare_locals(
     Ok(())
 }
 
+pub(super) fn declare_method_slot(
+    out: &mut String,
+    prog: &TbProgram,
+    schema: &TransactorSchema,
+    m: &TransactorMethodSchema,
+    depth: usize,
+) -> Result<(), EmitError> {
+    let func = prog.function(m.function);
+    let ret_ty = if func.ret.is_some() {
+        "uint64_t"
+    } else {
+        "void"
+    };
+    let params = (0..func.params.len())
+        .map(|i| match func.locals[i].ty {
+            IrType::Record(r) => prog.records[r.index()].name.clone(),
+            IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
+            ref ty => super::local_scalar_cty(ty).to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let pad = INDENT.repeat(depth);
+    writeln!(
+        out,
+        "{pad}std::function<{ret_ty}({params})> {}_{};",
+        schema.name, m.name
+    )
+    .ok();
+    Ok(())
+}
+
 /// Emit one transactor method body as a `[&]`-capturing lambda named
 /// `<Transactor>_<method>` — the same naming and synchronous-call
 /// contract as v1's hookable lambdas, with the body as a loop-switch.
@@ -1658,7 +1718,7 @@ pub(super) fn emit_method(
         .join(", ");
     writeln!(
         out,
-        "{pad}auto {}_{} = [&]({params}) -> {ret_ty} {{",
+        "{pad}{}_{} = [&]({params}) -> {ret_ty} {{",
         schema.name, m.name
     )
     .ok();

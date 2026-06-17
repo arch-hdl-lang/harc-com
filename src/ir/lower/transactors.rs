@@ -274,18 +274,27 @@ pub(crate) fn lower_transactor(
     };
 
     let mut funcs = Vec::new();
-    for h in methods_ast {
-        let mname = &h.name.name;
-        if schema.method(mname).is_some() {
+    let mut sibling_methods = HashMap::new();
+    for h in &methods_ast {
+        let mname = h.name.name.clone();
+        if sibling_methods
+            .insert(mname.clone(), (h.params.len(), h.return_ty.is_some()))
+            .is_some()
+        {
             return Err(LowerError::Invalid(format!(
                 "transactor `{tname}` declares method `{mname}` more than once"
             )));
         }
+    }
+    for h in methods_ast {
+        let mname = &h.name.name;
         check_scalar_ty(tname, mname, "return type", h.return_ty.as_ref())?;
 
         let fid = FunctionId(next_fn.0 + funcs.len() as u32);
         let mut b = FuncBuilder::new(&method_ctx, helper_registry, constraint_sites);
         b.in_transactor_method = true;
+        b.self_transactor = Some(tname.clone());
+        b.self_transactor_methods = sibling_methods.clone();
         // Bare-name reads/writes of a state field route to
         // `TransactorState`/`TransactorStateWrite` with an empty instance
         // placeholder, filled at test-binding time (same as the bound-to

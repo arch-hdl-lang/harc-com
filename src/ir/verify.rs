@@ -589,6 +589,12 @@ impl Checker<'_> {
                     }
                     self.check_transactor_call(call);
                 }
+                Stmt::TransactorSelfCall { dest, call } => {
+                    if let Some(d) = dest {
+                        self.check_local(*d);
+                    }
+                    self.check_transactor_self_call(*dest, call);
+                }
                 Stmt::FailDiag { guard, args } => {
                     if let Some(g) = guard {
                         self.check_expr(g, true, "FailDiag guard");
@@ -1029,10 +1035,94 @@ impl Checker<'_> {
                         ),
                     });
                 }
+                if let CallTarget::TransactorSelfMethod {
+                    transactor,
+                    method,
+                } = target
+                {
+                    self.errs.push(VerifyError::BadTransactorCall {
+                        func: self.fid,
+                        block: self.bid,
+                        detail: format!(
+                            "`{transactor}.{method}` sibling call in a disallowed position \
+                             ({context}) — lowering must hoist it into a \
+                             Stmt::TransactorSelfCall"
+                        ),
+                    });
+                }
                 for a in args {
                     self.check_expr(a, ports_ok, context);
                 }
             }
+        }
+    }
+
+    /// Validate one sibling method call inside a DUT-poking transactor
+    /// method body. These calls are synchronous lambda calls, not
+    /// testbench-field call edges, so they are only legal in a
+    /// `TransactorBody` and resolve against that body's transactor
+    /// schema.
+    fn check_transactor_self_call(&mut self, dest: Option<LocalId>, call: &Expr) {
+        let (fid, bid) = (self.fid, self.bid);
+        let bad = move |detail: String| VerifyError::BadTransactorCall {
+            func: fid,
+            block: bid,
+            detail,
+        };
+        let Expr::Call(
+            CallTarget::TransactorSelfMethod {
+                transactor,
+                method,
+            },
+            args,
+        ) = call
+        else {
+            self.errs.push(bad(
+                "payload is not a TransactorSelfMethod call".to_string(),
+            ));
+            return;
+        };
+        for a in args {
+            self.check_expr(a, false, "TransactorSelfCall arg");
+        }
+        let FunctionKind::TransactorBody { transactor: xid } = self.func.kind else {
+            self.errs.push(bad(format!(
+                "`{transactor}.{method}` sibling call outside a transactor method body"
+            )));
+            return;
+        };
+        let Some(schema) = self.prog.transactors.get(xid.index()) else {
+            self.errs
+                .push(bad(format!("transactor t{} does not resolve", xid.0)));
+            return;
+        };
+        if schema.name != *transactor {
+            self.errs.push(bad(format!(
+                "sibling call names transactor `{transactor}` from `{}` body",
+                schema.name
+            )));
+            return;
+        }
+        let Some(m) = schema.method(method) else {
+            self.errs.push(bad(format!(
+                "transactor `{}` has no sibling method `{method}`",
+                schema.name
+            )));
+            return;
+        };
+        if args.len() != m.n_params {
+            self.errs.push(bad(format!(
+                "transactor method `{}.{method}` takes {} argument(s), call passes {}",
+                schema.name,
+                m.n_params,
+                args.len()
+            )));
+        }
+        if dest.is_some() && !m.has_ret {
+            self.errs.push(bad(format!(
+                "void transactor method `{}.{method}` captured into a destination",
+                schema.name
+            )));
         }
     }
 
@@ -1207,6 +1297,11 @@ fn check_def_before_use(
                         d[l.index()] = true;
                     }
                 }
+                Stmt::TransactorSelfCall { dest: Some(l), .. } => {
+                    if l.index() < d.len() {
+                        d[l.index()] = true;
+                    }
+                }
                 Stmt::ScoreboardOp {
                     op: crate::ir::ScoreboardOp::QueuePop { dest: l, .. },
                     ..
@@ -1310,6 +1405,14 @@ fn check_def_before_use(
                 Stmt::TransactorStateWrite { value, .. } => check_e(value, &defined, errs),
                 Stmt::DutWrite(_, e) => check_e(e, &defined, errs),
                 Stmt::TransactorCall { dest, call } => {
+                    check_e(call, &defined, errs);
+                    if let Some(l) = dest {
+                        if l.index() < defined.len() {
+                            defined[l.index()] = true;
+                        }
+                    }
+                }
+                Stmt::TransactorSelfCall { dest, call } => {
                     check_e(call, &defined, errs);
                     if let Some(l) = dest {
                         if l.index() < defined.len() {

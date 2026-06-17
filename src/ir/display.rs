@@ -485,6 +485,14 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
             ),
             None => format!("TransactorCall({})", expr_str(func, call)),
         },
+        Stmt::TransactorSelfCall { dest, call } => match dest {
+            Some(d) => format!(
+                "TransactorSelfCall({} = {})",
+                local_str(func, *d),
+                expr_str(func, call)
+            ),
+            None => format!("TransactorSelfCall({})", expr_str(func, call)),
+        },
         Stmt::FailDiag { guard, args } => match guard {
             Some(g) => format!(
                 "FailDiag {{ unless: {}, {} }}",
@@ -883,6 +891,12 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
                 CallTarget::ExternFn(n) => format!("extern:{n}"),
                 CallTarget::TransactorMethod { bus_field, method } => {
                     format!("{bus_field}.{method}")
+                }
+                CallTarget::TransactorSelfMethod {
+                    transactor,
+                    method,
+                } => {
+                    format!("self:{transactor}.{method}")
                 }
                 CallTarget::Tseq(n) => format!("tseq:{n}"),
             };
