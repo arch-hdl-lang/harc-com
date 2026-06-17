@@ -2200,11 +2200,12 @@ pub(super) fn emit_target_actor(
             continue;
         }
 
+        let slot_fn_var = format!("{slot_var}_fn");
         writeln!(out, "{pad}harc_rt::ThreadSlot {slot_var};").ok();
         writeln!(out, "{pad}sched.slots.push_back(&{slot_var});").ok();
         writeln!(
             out,
-            "{pad}{slot_var}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+            "{pad}auto {slot_fn_var} = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
         )
         .ok();
         writeln!(out, "{pad1}{} = 0;", wire("req_ready")).ok();
@@ -2302,7 +2303,8 @@ pub(super) fn emit_target_actor(
         .ok();
         writeln!(out, "{pad1}}}").ok(); // while(true)
         writeln!(out, "{pad1}co_return;").ok();
-        writeln!(out, "{pad}}}(&{slot_var});").ok();
+        writeln!(out, "{pad}}};").ok();
+        writeln!(out, "{pad}{slot_var}.thread = {slot_fn_var}(&{slot_var});").ok();
     }
     Ok(())
 }
@@ -2499,11 +2501,12 @@ fn emit_tagged_target_actors(
     writeln!(out, "{pad}}});").ok();
 
     // --- (3) Dispatcher coroutine. ---
+    let dispatcher_fn_var = format!("{dispatcher_slot}_fn");
     writeln!(out, "{pad}harc_rt::ThreadSlot {dispatcher_slot};").ok();
     writeln!(out, "{pad}sched.slots.push_back(&{dispatcher_slot});").ok();
     writeln!(
         out,
-        "{pad}{dispatcher_slot}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+        "{pad}auto {dispatcher_fn_var} = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
     )
     .ok();
     writeln!(out, "{pad1}{} = 0;", wire("req_ready")).ok();
@@ -2545,17 +2548,19 @@ fn emit_tagged_target_actors(
     writeln!(out, "{pad2}co_await harc_rt::wait_cycles(_slot, 1);").ok();
     writeln!(out, "{pad1}}}").ok();
     writeln!(out, "{pad1}co_return;").ok();
-    writeln!(out, "{pad}}}(&{dispatcher_slot});").ok();
+    writeln!(out, "{pad}}};").ok();
+    writeln!(out, "{pad}{dispatcher_slot}.thread = {dispatcher_fn_var}(&{dispatcher_slot});").ok();
 
     // --- (4) Lane coroutines. ---
     let nparams = func.params.len();
     for lane in 0..tag_count {
         let lane_slot = format!("{prefix}_lane{lane}_slot");
+        let lane_fn_var = format!("{lane_slot}_fn");
         writeln!(out, "{pad}harc_rt::ThreadSlot {lane_slot};").ok();
         writeln!(out, "{pad}sched.slots.push_back(&{lane_slot});").ok();
         writeln!(
             out,
-            "{pad}{lane_slot}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+            "{pad}auto {lane_fn_var} = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
         )
         .ok();
         writeln!(out, "{pad1}while (true) {{").ok();
@@ -2603,15 +2608,17 @@ fn emit_tagged_target_actors(
         writeln!(out, "{pad2}{lane_busy}[{lane}].store(false);").ok();
         writeln!(out, "{pad1}}}").ok();
         writeln!(out, "{pad1}co_return;").ok();
-        writeln!(out, "{pad}}}(&{lane_slot});").ok();
+        writeln!(out, "{pad}}};").ok();
+        writeln!(out, "{pad}{lane_slot}.thread = {lane_fn_var}(&{lane_slot});").ok();
     }
 
     // --- (5) Arbiter coroutine. ---
+    let arbiter_fn_var = format!("{arbiter_slot}_fn");
     writeln!(out, "{pad}harc_rt::ThreadSlot {arbiter_slot};").ok();
     writeln!(out, "{pad}sched.slots.push_back(&{arbiter_slot});").ok();
     writeln!(
         out,
-        "{pad}{arbiter_slot}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+        "{pad}auto {arbiter_fn_var} = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
     )
     .ok();
     writeln!(out, "{pad1}{} = 0;", wire("rsp_valid")).ok();
@@ -2663,7 +2670,8 @@ fn emit_tagged_target_actors(
     writeln!(out, "{pad2}}}").ok();
     writeln!(out, "{pad1}}}").ok();
     writeln!(out, "{pad1}co_return;").ok();
-    writeln!(out, "{pad}}}(&{arbiter_slot});").ok();
+    writeln!(out, "{pad}}};").ok();
+    writeln!(out, "{pad}{arbiter_slot}.thread = {arbiter_fn_var}(&{arbiter_slot});").ok();
     Ok(())
 }
 

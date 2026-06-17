@@ -1095,7 +1095,7 @@ fn emit_test(
     writeln!(out, "{INDENT}sched.slots.push_back(&_run_slot);").ok();
     writeln!(
         out,
-        "{INDENT}_run_slot.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+        "{INDENT}auto _run_slot_fn = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
     )
     .ok();
     if !tb.synthetic {
@@ -1126,7 +1126,8 @@ fn emit_test(
         )?;
     }
     writeln!(out, "{INDENT}{INDENT}co_return;").ok();
-    writeln!(out, "{INDENT}}}(&_run_slot);").ok();
+    writeln!(out, "{INDENT}}};").ok();
+    writeln!(out, "{INDENT}_run_slot.thread = _run_slot_fn(&_run_slot);").ok();
 
     runtime::drive_loop(out, clocked);
     runtime::run_epilogue(out);

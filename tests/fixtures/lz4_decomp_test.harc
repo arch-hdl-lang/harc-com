@@ -1,0 +1,242 @@
+// HARC verification of arch-com/examples/lz4_decomp.arch — LZ4 block
+// decompressor (CAST LZ4SNP-D equivalent).
+//
+// The DUT exposes an AXI-Stream byte-wide input (compressed) and output
+// (decompressed). `done` goes high (combinationally from the DONE state)
+// after the last output byte is accepted. `error` goes high on a zero
+// match offset (illegal per LZ4 spec).
+//
+// Three test sequences:
+//
+//   Test 1 — all-literal block "HELLO"
+//     Compressed : [0x50, 0x48, 0x45, 0x4C, 0x4C, 0x4F]  (in_last on 0x4F)
+//     Token 0x50 : lit_len=5, match_nibble=0 → straight to LIT_COPY
+//     Output     : H E L L O (combinational passthrough, one byte per cycle)
+//
+//   Test 2 — one match copy: "AAAAAA" (6 A's)
+//     Sequence 1 : 1 literal 'A', match offset=1 len=4 → 4 more A's
+//     Sequence 2 : 1 literal 'A' (last, no match)
+//     Compressed : [0x10, 0x41, 0x01, 0x00, 0x10, 0x41]  (in_last on last 0x41)
+//     Output     : A A A A A A (1 literal + 4 match + 1 literal)
+//
+//   Test 3 — zero offset → error
+//     Compressed : [0x00, 0x00, 0x00]  (token, off_lo=0, off_hi=0)
+//     Expected   : error=1, done=0
+
+transactor Lz4Xactor
+    dut : Lz4Decomp
+
+    when active
+        hookable reset_dut()
+            dut.rst       = 1
+            dut.in_valid  = 0
+            dut.in_data   = 0
+            dut.in_last   = 0
+            dut.out_ready = 0
+            wait 2 cycles
+            dut.rst = 0
+            wait 1 cycle
+        end reset_dut
+    end when
+end transactor Lz4Xactor
+
+testbench Lz4DecompTb
+    dut  : Lz4Decomp
+    xact : Lz4Xactor active
+end testbench Lz4DecompTb
+
+impl Lz4DecompTest for Lz4DecompTb
+    run
+        xact.dut = dut
+
+        // ── Test 1: all-literal "HELLO" ──────────────────────────────────────
+        xact.reset_dut()
+        dut.out_ready = 1
+
+        // Token byte 0x50 (lit_len=5, match_nibble=0): no output
+        dut.in_valid = 1
+        dut.in_data  = 0x50
+        dut.in_last  = 0
+        assert dut.out_valid == 0
+            else fail("T1: token — unexpected out_valid=1")
+        wait 1 cycle                // → state LIT_COPY
+        dut.in_valid = 0
+
+        // Literal 'H' = 0x48: out_valid=1 combinationally (passthrough)
+        dut.in_valid = 1
+        dut.in_data  = 0x48
+        dut.in_last  = 0
+        assert dut.out_valid == 1
+            else fail("T1: H — expected out_valid=1")
+        wait 1 cycle
+        assert dut.out_data == 0x48
+            else fail("T1: H — got 0x${dut.out_data:02x} expected 0x48")
+        dut.in_valid = 0
+
+        // Literal 'E' = 0x45
+        dut.in_valid = 1
+        dut.in_data  = 0x45
+        dut.in_last  = 0
+        assert dut.out_valid == 1
+            else fail("T1: E — expected out_valid=1")
+        wait 1 cycle
+        assert dut.out_data == 0x45
+            else fail("T1: E — got 0x${dut.out_data:02x} expected 0x45")
+        dut.in_valid = 0
+
+        // Literal 'L' = 0x4C (first)
+        dut.in_valid = 1
+        dut.in_data  = 0x4C
+        dut.in_last  = 0
+        assert dut.out_valid == 1
+            else fail("T1: L[0] — expected out_valid=1")
+        wait 1 cycle
+        assert dut.out_data == 0x4C
+            else fail("T1: L[0] — got 0x${dut.out_data:02x} expected 0x4C")
+        dut.in_valid = 0
+
+        // Literal 'L' = 0x4C (second)
+        dut.in_valid = 1
+        dut.in_data  = 0x4C
+        dut.in_last  = 0
+        assert dut.out_valid == 1
+            else fail("T1: L[1] — expected out_valid=1")
+        wait 1 cycle
+        assert dut.out_data == 0x4C
+            else fail("T1: L[1] — got 0x${dut.out_data:02x} expected 0x4C")
+        dut.in_valid = 0
+
+        // Literal 'O' = 0x4F — last byte of compressed stream
+        dut.in_valid = 1
+        dut.in_data  = 0x4F
+        dut.in_last  = 1
+        assert dut.out_valid == 1
+            else fail("T1: O — expected out_valid=1")
+        wait 1 cycle                // → state DONE (in_last seen in LIT_COPY)
+        assert dut.out_data == 0x4F
+            else fail("T1: O — got 0x${dut.out_data:02x} expected 0x4F")
+        dut.in_valid = 0
+        dut.in_last  = 0
+
+        assert dut.done  == 1
+            else fail("T1: expected done=1 after 'HELLO'")
+        assert dut.error == 0
+            else fail("T1: unexpected error=1")
+        log(info, "Test 1 PASS: all-literal 'HELLO' decompressed correctly")
+
+        // ── Test 2: match copy "AAAAAA" (6 × 0x41) ──────────────────────────
+        // Compressed stream: [0x10, 0x41, 0x01, 0x00, 0x10, 0x41]
+        //   Seq 1 token 0x10: lit_len=1, match_nibble=0 → match_len=4
+        //   Lit  'A' (0x41), offset lo=0x01, offset hi=0x00 → offset=1
+        //   → 4 match copies of 'A' (self-referential, offset 1)
+        //   Seq 2 token 0x10: lit_len=1, match_nibble=0
+        //   Lit  'A' (0x41) with in_last=1 → DONE
+        xact.reset_dut()
+        dut.out_ready = 1
+
+        // Seq 1 token (no output)
+        dut.in_valid = 1
+        dut.in_data  = 0x10
+        dut.in_last  = 0
+        wait 1 cycle                // → LIT_COPY
+        dut.in_valid = 0
+
+        // Literal 'A' — passthrough output
+        dut.in_valid = 1
+        dut.in_data  = 0x41
+        dut.in_last  = 0
+        assert dut.out_valid == 1
+            else fail("T2: lit A — expected out_valid=1")
+        wait 1 cycle                // → OFF_LO (lit_cnt was 1)
+        assert dut.out_data == 0x41
+            else fail("T2: lit A — got 0x${dut.out_data:02x} expected 0x41")
+        dut.in_valid = 0
+
+        // Offset low byte = 0x01
+        dut.in_valid = 1
+        dut.in_data  = 0x01
+        dut.in_last  = 0
+        wait 1 cycle                // → OFF_HI
+        dut.in_valid = 0
+
+        // Offset high byte = 0x00 → offset=1; match_nibble_r=0 ≠ 0xF → MATCH_RD
+        dut.in_valid = 1
+        dut.in_data  = 0x00
+        dut.in_last  = 0
+        wait 1 cycle                // → MATCH_RD
+        dut.in_valid = 0
+
+        // 4 match-copy iterations; each takes 2 cycles:
+        //   cycle 1: MATCH_RD — hist_rd_en=1 asserted, no output
+        //   cycle 2: MATCH_WAIT — hist_rd_data valid, out_valid=1, out_fire consumes
+        for _ in 0 .. 4
+            wait 1 cycle            // MATCH_RD → MATCH_WAIT
+            assert dut.out_valid == 1
+                else fail("T2: match byte — expected out_valid=1")
+            assert dut.out_data == 0x41
+                else fail("T2: match byte — got 0x${dut.out_data:02x} expected 0x41 ('A')")
+            wait 1 cycle            // MATCH_WAIT → MATCH_RD (or TOKEN when last)
+        end for
+        // Now back in TOKEN state
+
+        // Seq 2 token (no output)
+        dut.in_valid = 1
+        dut.in_data  = 0x10
+        dut.in_last  = 0
+        wait 1 cycle                // → LIT_COPY
+        dut.in_valid = 0
+
+        // Last literal 'A' with in_last=1 → DONE
+        dut.in_valid = 1
+        dut.in_data  = 0x41
+        dut.in_last  = 1
+        assert dut.out_valid == 1
+            else fail("T2: last A — expected out_valid=1")
+        wait 1 cycle                // → DONE
+        assert dut.out_data == 0x41
+            else fail("T2: last A — got 0x${dut.out_data:02x} expected 0x41")
+        dut.in_valid = 0
+        dut.in_last  = 0
+
+        assert dut.done  == 1
+            else fail("T2: expected done=1 after 'AAAAAA'")
+        assert dut.error == 0
+            else fail("T2: unexpected error=1")
+        log(info, "Test 2 PASS: match-copy 'AAAAAA' decompressed correctly")
+
+        // ── Test 3: zero offset → error ───────────────────────────────────────
+        // Token 0x00 → 0 literals → OFF_LO → off_lo=0x00 → OFF_HI → offset=0 → ERROR
+        xact.reset_dut()
+        dut.out_ready = 1
+
+        // Token 0x00: lit_len=0, match_nibble=0 — skip LIT_COPY, go to OFF_LO
+        dut.in_valid = 1
+        dut.in_data  = 0x00
+        dut.in_last  = 0
+        wait 1 cycle                // → OFF_LO
+        dut.in_valid = 0
+
+        // Offset low = 0x00
+        dut.in_valid = 1
+        dut.in_data  = 0x00
+        dut.in_last  = 0
+        wait 1 cycle                // → OFF_HI
+        dut.in_valid = 0
+
+        // Offset high = 0x00 → offset={0x00,0x00}=0 → ERROR state
+        dut.in_valid = 1
+        dut.in_data  = 0x00
+        dut.in_last  = 1
+        wait 1 cycle                // → ERROR
+        dut.in_valid = 0
+        dut.in_last  = 0
+
+        assert dut.error == 1
+            else fail("T3: expected error=1 for zero offset, got ${dut.error}")
+        assert dut.done  == 0
+            else fail("T3: expected done=0 in error state, got ${dut.done}")
+        log(info, "Test 3 PASS: zero offset correctly flagged as error")
+
+        log(info, "ALL TESTS PASSED — Lz4Decomp LZ4 block decompressor verified")
+    end run
+end impl Lz4DecompTest
