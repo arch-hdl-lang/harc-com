@@ -351,6 +351,12 @@ impl FuncBuilder<'_> {
                                 self.lower_tb_method_call(&id.name, args)?;
                                 return Ok(());
                             }
+                            if let Some(call) =
+                                self.lower_transactor_self_call(&id.name, args, false)?
+                            {
+                                self.push(Stmt::TransactorSelfCall { dest: None, call });
+                                return Ok(());
+                            }
                             if self.helpers.contains(&id.name) {
                                 // Statement-position helper call: lower
                                 // for effect, discard the value. Impure
@@ -1257,6 +1263,67 @@ impl FuncBuilder<'_> {
         )))
     }
 
+    /// Lower a bare sibling method call inside a DUT-poking transactor
+    /// method body: `idle()` / `readv()`. This is distinct from
+    /// `xact.idle()` at testbench scope: no testbench field is involved,
+    /// and emission calls the sibling method lambda directly.
+    pub(crate) fn lower_transactor_self_call(
+        &mut self,
+        name: &str,
+        args: &[CallArg],
+        need_ret: bool,
+    ) -> Result<Option<Expr>, LowerError> {
+        if !self.in_transactor_method {
+            return Ok(None);
+        }
+        let Some(transactor) = self.self_transactor.clone() else {
+            return Ok(None);
+        };
+        let Some(&(n_params, has_ret)) = self.self_transactor_methods.get(name) else {
+            return Ok(None);
+        };
+        if self.in_fmt_args {
+            return Err(unsupported(
+                &format!("transactor sibling method call `{name}(...)` inside a message"),
+                "log/fail messages evaluate lazily; hoist the call into a `let` first",
+            ));
+        }
+        if args.len() != n_params {
+            return Err(LowerError::Invalid(format!(
+                "transactor method `{transactor}.{name}` takes {n_params} argument(s), call passes {}",
+                args.len()
+            )));
+        }
+        if need_ret && !has_ret {
+            return Err(LowerError::Invalid(format!(
+                "transactor method `{transactor}.{name}` returns no value"
+            )));
+        }
+        let mut lowered = Vec::with_capacity(args.len());
+        for a in args {
+            let e = match a {
+                CallArg::Expr(e) => e,
+                CallArg::Named { .. } => {
+                    return Err(unsupported(
+                        &format!(
+                            "named arguments in transactor sibling method call \
+                             `{transactor}.{name}(...)`"
+                        ),
+                        "",
+                    ));
+                }
+            };
+            lowered.push(self.lower_expr_no_ports(e)?);
+        }
+        Ok(Some(Expr::Call(
+            crate::ir::CallTarget::TransactorSelfMethod {
+                transactor,
+                method: name.to_string(),
+            },
+            lowered,
+        )))
+    }
+
     /// `_tb.<xfield>.<dut_field> = dut` — the instance's DUT bind.
     /// Validated, then erased: the IR's single-DUT model makes the
     /// bind static (the method bodies' `PortRef`s already resolve to
@@ -1292,7 +1359,11 @@ impl FuncBuilder<'_> {
                 }
                 xfield.name.clone()
             }
-            ExprKind::Ident(id) if self.ctx.bare_transactor_fields.contains(&id.name) => {
+            ExprKind::Ident(id)
+                if self.lookup(&id.name).is_none()
+                    && (self.ctx.bare_transactor_fields.contains(&id.name)
+                        || self.ctx.transactor_fields.contains_key(&id.name)) =>
+            {
                 id.name.clone()
             }
             _ => return Ok(false),

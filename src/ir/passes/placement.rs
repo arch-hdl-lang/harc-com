@@ -312,6 +312,10 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 host_service_only = false;
                 visit_expr(call, &mut accesses, &mut transactor);
             }
+            Stmt::TransactorSelfCall { call, .. } => {
+                host_service_only = false;
+                visit_expr(call, &mut accesses, &mut transactor);
+            }
             Stmt::TbFieldWrite { value, .. } => {
                 // Host state on the _tb struct — no pin access of its
                 // own; the value expression may carry inline reads.

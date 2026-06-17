@@ -100,191 +100,206 @@ covergroup ApbDspCov @(posedge dut.clk)
     cross cp_handshake, cp_error
 end covergroup ApbDspCov
 
+transactor ApbDspBusXactor
+    dut : apb_dsp_unit_top
+
+    when active
+        hookable idle()
+            dut.pselx = 0
+            dut.penable = 0
+            dut.pwrite = 0
+            dut.paddr = 0
+            dut.pwdata = 0
+            wait 1 cycle
+        end idle
+
+        hookable reset_dut()
+            dut.presetn = 0
+            dut.paddr = 0
+            dut.pselx = 0
+            dut.penable = 0
+            dut.pwrite = 0
+            dut.pwdata = 0
+            dut.sram_valid = 0
+            wait 3 cycles
+            assert dut.pready == 0 else fail("reset: pready expected 0")
+            assert dut.pslverr == 0 else fail("reset: pslverr expected 0")
+            assert dut.prdata == 0 else fail("reset: prdata expected 0")
+            dut.presetn = 1
+            wait 1 cycle
+        end reset_dut
+
+        hookable mid_reset()
+            dut.presetn = 0
+            wait 2 cycles
+            assert dut.pready == 0 else fail("mid-reset: pready expected 0")
+            assert dut.pslverr == 0 else fail("mid-reset: pslverr expected 0")
+            assert dut.prdata == 0 else fail("mid-reset: prdata expected 0")
+            dut.presetn = 1
+            wait 1 cycle
+        end mid_reset
+
+        hookable write(addr: uint<10>, data: uint<8>)
+            dut.paddr = addr
+            dut.pwdata = data
+            dut.pwrite = 1
+            dut.pselx = 1
+            dut.penable = 0
+            wait 1 cycle
+            dut.penable = 1
+            wait 1 cycle
+            assert dut.pready == 1
+                else fail("apb_write addr=0x${addr:03x}: pready was not asserted")
+            dut.pselx = 0
+            dut.penable = 0
+            dut.pwrite = 0
+            wait 1 cycle
+        end write
+
+        hookable read(addr: uint<10>) -> uint<8>
+            dut.paddr = addr
+            dut.pwdata = 0
+            dut.pwrite = 0
+            dut.pselx = 1
+            dut.penable = 0
+            wait 1 cycle
+            dut.penable = 1
+            wait 1 cycle
+            assert dut.pready == 1
+                else fail("apb_read addr=0x${addr:03x}: pready was not asserted")
+            let val = dut.prdata
+            dut.pselx = 0
+            dut.penable = 0
+            wait 1 cycle
+            return val
+        end read
+
+        hookable raw_cycle(addr: uint<10>, data: uint<8>, write_en: uint<1>, sel: uint<1>, enable: uint<1>)
+            dut.paddr = addr
+            dut.pwdata = data
+            dut.pwrite = write_en
+            dut.pselx = sel
+            dut.penable = enable
+            wait 1 cycle
+        end raw_cycle
+
+        hookable invalid_access(addr: uint<10>, data: uint<8>, write_en: uint<1>)
+            raw_cycle(addr, data, write_en, 1, 0)
+            raw_cycle(addr, data, write_en, 1, 1)
+            assert dut.pslverr == 1
+                else fail("invalid APB addr=0x${addr:03x} did not raise pslverr")
+            idle()
+        end invalid_access
+
+        hookable store_sram(addr: uint<8>, data: uint<8>)
+            write(2, 3)
+            write(3, addr)
+            write(4, data)
+            pulse_sram_valid()
+        end store_sram
+
+        hookable pulse_sram_valid()
+            dut.sram_valid = 0
+            wait 1 cycle
+            dut.sram_valid = 1
+            wait 1 cycle
+            dut.sram_valid = 0
+            wait 1 cycle
+        end pulse_sram_valid
+    end when
+end transactor ApbDspBusXactor
+
 testbench ApbDspTb
     dut : apb_dsp_unit_top
     cov : ApbDspCov
-
-    function apb_idle()
-        dut.pselx = 0
-        dut.penable = 0
-        dut.pwrite = 0
-        dut.paddr = 0
-        dut.pwdata = 0
-        wait 1 cycle
-    end function apb_idle
-    function apb_write(addr: uint<10>, data: uint<8>)
-        dut.paddr = addr
-        dut.pwdata = data
-        dut.pwrite = 1
-        dut.pselx = 1
-        dut.penable = 0
-        wait 1 cycle
-        dut.penable = 1
-        wait 1 cycle
-        assert dut.pready == 1
-            else fail("apb_write addr=0x${addr:03x}: pready was not asserted")
-        dut.pselx = 0
-        dut.penable = 0
-        dut.pwrite = 0
-        wait 1 cycle
-    end function apb_write
-    function apb_read(addr: uint<10>) -> uint<8>
-        dut.paddr = addr
-        dut.pwdata = 0
-        dut.pwrite = 0
-        dut.pselx = 1
-        dut.penable = 0
-        wait 1 cycle
-        dut.penable = 1
-        wait 1 cycle
-        assert dut.pready == 1
-            else fail("apb_read addr=0x${addr:03x}: pready was not asserted")
-        let val = dut.prdata
-        dut.pselx = 0
-        dut.penable = 0
-        wait 1 cycle
-        return val
-    end function apb_read
-    function sram_store(addr: uint<8>, data: uint<8>)
-        apb_write(2, 3)
-        apb_write(3, addr)
-        apb_write(4, data)
-        dut.sram_valid = 0
-        wait 1 cycle
-        dut.sram_valid = 1
-        wait 1 cycle
-        dut.sram_valid = 0
-        wait 1 cycle
-    end function sram_store
+    bus : ApbDspBusXactor active
 end testbench ApbDspTb
 
 impl ApbDspTest for ApbDspTb
     run
         log(info, "apb_dsp_unit: APB CSR, SRAM, arithmetic, constraints, and coverage")
 
-        dut.presetn = 0
-        dut.paddr = 0
-        dut.pselx = 0
-        dut.penable = 0
-        dut.pwrite = 0
-        dut.pwdata = 0
-        dut.sram_valid = 0
-        wait 3 cycles
-        assert dut.pready == 0 else fail("reset: pready expected 0")
-        assert dut.pslverr == 0 else fail("reset: pslverr expected 0")
-        assert dut.prdata == 0 else fail("reset: prdata expected 0")
-        dut.presetn = 1
-        wait 1 cycle
+        bus.dut = dut
+        bus.reset_dut()
 
-        apb_write(0, 0x00)
-        apb_write(1, 0xFF)
-        apb_write(2, 0x00)
-        apb_write(3, 0x55)
-        apb_write(4, 0xAA)
-        assert apb_read(0) == 0x00 else fail("CSR0 readback mismatch")
-        assert apb_read(1) == 0xFF else fail("CSR1 readback mismatch")
-        assert apb_read(2) == 0x00 else fail("CSR2 readback mismatch")
-        assert apb_read(3) == 0x55 else fail("CSR3 readback mismatch")
-        assert apb_read(4) == 0xAA else fail("CSR4 readback mismatch")
+        bus.write(0, 0x00)
+        bus.write(1, 0xFF)
+        bus.write(2, 0x00)
+        bus.write(3, 0x55)
+        bus.write(4, 0xAA)
+        assert bus.read(0) == 0x00 else fail("CSR0 readback mismatch")
+        assert bus.read(1) == 0xFF else fail("CSR1 readback mismatch")
+        assert bus.read(2) == 0x00 else fail("CSR2 readback mismatch")
+        assert bus.read(3) == 0x55 else fail("CSR3 readback mismatch")
+        assert bus.read(4) == 0xAA else fail("CSR4 readback mismatch")
 
-        apb_write(0, 0xFF)
-        apb_write(1, 0x00)
-        apb_write(2, 0x07)
-        apb_write(3, 0x00)
-        apb_write(4, 0xFF)
-        assert apb_read(2) == 0x07 else fail("invalid mode CSR readback mismatch")
+        bus.write(0, 0xFF)
+        bus.write(1, 0x00)
+        bus.write(2, 0x07)
+        bus.write(3, 0x00)
+        bus.write(4, 0xFF)
+        assert bus.read(2) == 0x07 else fail("invalid mode CSR readback mismatch")
 
-        dut.paddr = 0
-        dut.pwdata = 0x33
-        dut.pwrite = 1
-        dut.pselx = 1
-        dut.penable = 0
-        wait 1 cycle
-        dut.pselx = 0
-        dut.penable = 1
-        wait 1 cycle
-        dut.penable = 0
-        wait 1 cycle
-        assert apb_read(0) == 0xFF
+        bus.raw_cycle(0, 0x33, 1, 1, 0)
+        bus.raw_cycle(0, 0x33, 1, 0, 1)
+        bus.raw_cycle(0, 0x33, 1, 0, 0)
+        assert bus.read(0) == 0xFF
             else fail("malformed handshake unexpectedly changed operand_1")
 
-        apb_write(2, 0)
-        dut.paddr = 0x3FF
-        dut.pwrite = 0
-        dut.pselx = 1
-        dut.penable = 0
-        wait 1 cycle
-        dut.penable = 1
-        wait 1 cycle
+        bus.write(2, 0)
+        bus.raw_cycle(0x3FF, 0, 0, 1, 0)
+        bus.raw_cycle(0x3FF, 0, 0, 1, 1)
         assert dut.pslverr == 1
             else fail("invalid CSR read did not raise pslverr")
-        dut.pselx = 0
-        dut.penable = 0
-        wait 1 cycle
+        bus.raw_cycle(0x3FF, 0, 0, 0, 0)
         assert dut.pslverr == 0
             else fail("pslverr did not clear after invalid CSR access")
 
-        dut.paddr = 0x200
-        dut.pwdata = 0x44
-        dut.pwrite = 1
-        dut.pselx = 1
-        dut.penable = 0
-        wait 1 cycle
-        dut.penable = 1
-        wait 1 cycle
-        assert dut.pslverr == 1
-            else fail("invalid CSR write did not raise pslverr")
-        apb_idle()
+        bus.invalid_access(0x200, 0x44, 1)
 
-        sram_store(0x10, 0x12)
-        sram_store(0x11, 0x34)
-        sram_store(0xFE, 0xFF)
-        apb_write(2, 3)
-        assert apb_read(0x10) == 0x12
+        bus.store_sram(0x10, 0x12)
+        bus.store_sram(0x11, 0x34)
+        bus.store_sram(0xFE, 0xFF)
+        bus.write(2, 3)
+        assert bus.read(0x10) == 0x12
             else fail("memory read @0x10 mismatch in write mode")
-        assert apb_read(0x11) == 0x34
+        assert bus.read(0x11) == 0x34
             else fail("memory read @0x11 mismatch in write mode")
 
-        apb_write(0, 0x10)
-        apb_write(1, 0x11)
-        apb_write(2, 1)
+        bus.write(0, 0x10)
+        bus.write(1, 0x11)
+        bus.write(2, 1)
         wait 2 cycles
-        assert apb_read(5) == 0x46
+        assert bus.read(5) == 0x46
             else fail("addition result mismatch")
 
-        apb_write(0, 0xFE)
-        apb_write(1, 0x11)
-        apb_write(2, 1)
+        bus.write(0, 0xFE)
+        bus.write(1, 0x11)
+        bus.write(2, 1)
         wait 2 cycles
-        assert apb_read(5) == 0x33
+        assert bus.read(5) == 0x33
             else fail("overflow addition result mismatch")
 
-        apb_write(0, 0x10)
-        apb_write(1, 0x11)
-        apb_write(2, 2)
+        bus.write(0, 0x10)
+        bus.write(1, 0x11)
+        bus.write(2, 2)
         wait 2 cycles
-        assert apb_read(5) == 0xA8
+        assert bus.read(5) == 0xA8
             else fail("multiplication result mismatch")
 
-        apb_write(2, 0)
+        bus.write(2, 0)
         wait 2 cycles
-        assert apb_read(5) == 0xA8
+        assert bus.read(5) == 0xA8
             else fail("disabled mode changed result unexpectedly")
 
-        dut.presetn = 0
-        wait 2 cycles
-        assert dut.pready == 0 else fail("mid-reset: pready expected 0")
-        assert dut.pslverr == 0 else fail("mid-reset: pslverr expected 0")
-        assert dut.prdata == 0 else fail("mid-reset: prdata expected 0")
-        dut.presetn = 1
-        wait 1 cycle
-        assert apb_read(0) == 0 else fail("post-reset CSR0 not cleared")
-        assert apb_read(1) == 0 else fail("post-reset CSR1 not cleared")
-        assert apb_read(2) == 0 else fail("post-reset CSR2 not cleared")
+        bus.mid_reset()
+        assert bus.read(0) == 0 else fail("post-reset CSR0 not cleared")
+        assert bus.read(1) == 0 else fail("post-reset CSR1 not cleared")
+        assert bus.read(2) == 0 else fail("post-reset CSR2 not cleared")
 
-        sram_store(0xFF, 0x7E)
-        apb_write(2, 3)
-        assert apb_read(0xFF) == 0x7E
+        bus.store_sram(0xFF, 0x7E)
+        bus.write(2, 3)
+        assert bus.read(0xFF) == 0x7E
             else fail("memory read @0xff mismatch")
 
         for k in 0 .. 24
@@ -295,11 +310,11 @@ impl ApbDspTest for ApbDspTb
                 t.mode in [0..3]
             end randomize
 
-            apb_write(2, t.mode)
+            bus.write(2, t.mode)
             if t.write == 1
-                apb_write(t.addr, t.data)
+                bus.write(t.addr, t.data)
             else
-                let rv = apb_read(t.addr)
+                let rv = bus.read(t.addr)
                 assert dut.pslverr == 0
                     else fail("legal random read k=${k} addr=0x${t.addr:03x} raised pslverr")
             end if
@@ -313,18 +328,8 @@ impl ApbDspTest for ApbDspTb
                 t.mode in [0..2]
             end randomize
 
-            apb_write(2, t.mode)
-            dut.paddr = t.addr
-            dut.pwdata = t.data
-            dut.pwrite = t.write
-            dut.pselx = 1
-            dut.penable = 0
-            wait 1 cycle
-            dut.penable = 1
-            wait 1 cycle
-            assert dut.pslverr == 1
-                else fail("invalid random APB k=${k} addr=0x${t.addr:03x} did not raise pslverr")
-            apb_idle()
+            bus.write(2, t.mode)
+            bus.invalid_access(t.addr, t.data, t.write)
         end for
 
         for k in 0 .. 12
@@ -333,33 +338,23 @@ impl ApbDspTest for ApbDspTb
                 t.sel == 0 || t.enable == 0
             end randomize
 
-            dut.paddr = t.addr
-            dut.pwdata = t.data
-            dut.pwrite = t.write
-            dut.pselx = t.sel
-            dut.penable = t.enable
-            wait 1 cycle
+            bus.raw_cycle(t.addr, t.data, t.write, t.sel, t.enable)
             assert dut.pslverr == 0
                 else fail("malformed random APB k=${k} raised pslverr without apb_valid")
         end for
 
         for m in 0 .. 8
-            apb_write(2, m as uint<8>)
+            bus.write(2, m as uint<8>)
             wait 1 cycle
         end for
 
         // Toggle high bits of r_enable and pulse sram_valid while not in
         // MODE_WRITE to cover the no-write side of the SRAM-valid block.
-        apb_write(2, 0xF8)
-        dut.sram_valid = 0
+        bus.write(2, 0xF8)
+        bus.pulse_sram_valid()
+        bus.write(2, 0xFF)
         wait 1 cycle
-        dut.sram_valid = 1
-        wait 1 cycle
-        dut.sram_valid = 0
-        wait 1 cycle
-        apb_write(2, 0xFF)
-        wait 1 cycle
-        apb_write(2, 0)
+        bus.write(2, 0)
         wait 1 cycle
 
         log(info, "ALL TESTS PASSED - apb_dsp_unit")

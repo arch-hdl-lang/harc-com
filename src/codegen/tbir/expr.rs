@@ -369,8 +369,11 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                     return Err(EmitError(format!(
                         "tbir: transactor call edge `{bus_field}.{method}` in expression \
                          position — verifier pins it to Assign-RHS / TransactorCall \
-                         (lowering/pass bug)"
+                        (lowering/pass bug)"
                     )));
+                }
+                CallTarget::TransactorSelfMethod { transactor, method } => {
+                    format!("{transactor}_{method}")
                 }
             };
             let mut rendered = Vec::with_capacity(args.len());

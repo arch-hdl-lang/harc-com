@@ -1255,6 +1255,14 @@ pub enum Stmt {
         dest: Option<LocalId>,
         call: Expr,
     },
+    /// Method-body-only sibling call on the current DUT-poking
+    /// transactor. Carries the same optional result slot as
+    /// `TransactorCall`, but resolves through the enclosing
+    /// `FunctionKind::TransactorBody` instead of a testbench field.
+    TransactorSelfCall {
+        dest: Option<LocalId>,
+        call: Expr,
+    },
     /// One `wait until … timeout` failure-diagnostic line: a
     /// `sim_log_line("FAIL", …)` that does NOT bump the error counter
     /// (v1 bumps `errors` exactly once per timed-out wait — that bump
@@ -1799,6 +1807,15 @@ pub enum CallTarget {
     ExternFn(String),
     TransactorMethod {
         bus_field: String,
+        method: String,
+    },
+    /// Synchronous call from one method of a DUT-poking transactor to
+    /// another method on the same transactor type. Unlike
+    /// `TransactorMethod`, this is not a testbench-field call edge; it
+    /// emits as a direct `<Transactor>_<method>(args...)` call inside the
+    /// enclosing transactor method lambda.
+    TransactorSelfMethod {
+        transactor: String,
         method: String,
     },
     /// Call a `tseq` generator by name — `let txns = RandomTxns(5)`.

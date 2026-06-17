@@ -331,7 +331,8 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
         | TbFieldWrite { value: e, .. }
         | TransactorStateWrite { value: e, .. }
         | ComponentFieldWrite { value: e, .. }
-        | TransactorCall { call: e, .. } => expr_has_probe(e),
+        | TransactorCall { call: e, .. }
+        | TransactorSelfCall { call: e, .. } => expr_has_probe(e),
         AssertCheck { cond, on_fail } => expr_has_probe(cond) || fmt_has_probe(on_fail),
         Log { args, .. } => fmt_has_probe(args),
         FailDiag { guard, args } => {
@@ -1019,6 +1020,9 @@ fn emit_test(
             continue;
         }
         let schema = prog.transactor(*xid);
+        for m in &schema.methods {
+            func::declare_method_slot(out, prog, schema, m, 1)?;
+        }
         for m in &schema.methods {
             func::emit_method(out, prog, schema, m, 1)?;
         }

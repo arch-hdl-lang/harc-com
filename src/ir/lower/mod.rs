@@ -3774,8 +3774,15 @@ pub(crate) struct FuncBuilder<'a> {
     /// synchronous hookable semantics (waits emit as `tick()` loops),
     /// so the constructs whose sync emission is out of this slice —
     /// clock-qualified waits and timed `wait until` — are rejected
-    /// here, as are nested transactor calls.
+    /// here.
     pub(crate) in_transactor_method: bool,
+    /// Name of the DUT-poking transactor whose method body is currently
+    /// being lowered. Used to resolve bare sibling method calls like
+    /// `idle()` inside `write()`.
+    pub(crate) self_transactor: Option<String>,
+    /// Full sibling method signature table for the current transactor,
+    /// including methods declared later in source order.
+    pub(crate) self_transactor_methods: HashMap<String, (usize, bool)>,
     /// State fields visible to a bound-to target-responder body
     /// (`thread bus.<m>(...)`). A bare ident that hits this set lowers
     /// to `ir::Expr::TransactorState`/`ir::Stmt::TransactorStateWrite` with an
@@ -3987,6 +3994,8 @@ impl<'a> FuncBuilder<'a> {
             in_pure_helper: false,
             in_fmt_args: false,
             in_transactor_method: false,
+            self_transactor: None,
+            self_transactor_methods: HashMap::new(),
             target_state_fields: HashSet::new(),
             in_check: false,
             let_widths: HashMap::new(),
@@ -4323,7 +4332,8 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 ir::Stmt::Log { args, .. } | ir::Stmt::FailDiag { args, .. } => {
                     args.args.iter().find_map(|a| in_expr(&a.expr))
                 }
-                ir::Stmt::TransactorCall { call, .. } => in_expr(call),
+                ir::Stmt::TransactorCall { call, .. }
+                | ir::Stmt::TransactorSelfCall { call, .. } => in_expr(call),
                 ir::Stmt::ScoreboardOp { op, .. } => match op {
                     ir::ScoreboardOp::QueuePush { value, .. }
                     | ir::ScoreboardOp::ScalarWrite { value, .. } => in_expr(value),
@@ -4469,7 +4479,8 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                         fill_expr(&mut a.expr, instance);
                     }
                 }
-                ir::Stmt::TransactorCall { call, .. } => fill_expr(call, instance),
+                ir::Stmt::TransactorCall { call, .. }
+                | ir::Stmt::TransactorSelfCall { call, .. } => fill_expr(call, instance),
                 ir::Stmt::ScoreboardOp { op, .. } => match op {
                     ir::ScoreboardOp::QueuePush { value, .. }
                     | ir::ScoreboardOp::ScalarWrite { value, .. } => fill_expr(value, instance),
@@ -4713,7 +4724,8 @@ fn fill_initiator_bus_prefix(
                             );
                         }
                     }
-                    Stmt::TransactorCall { call, .. } => {
+                    Stmt::TransactorCall { call, .. }
+                    | Stmt::TransactorSelfCall { call, .. } => {
                         visit_expr(call, placeholder, binding, remap, rewrite, &mut conflict)
                     }
                     Stmt::ScoreboardOp { op, .. } => match op {

@@ -271,6 +271,11 @@ impl FuncBuilder<'_> {
                         {
                             return self.lower_tb_method_call(&id.name, args);
                         }
+                        if let Some(call) =
+                            self.lower_transactor_self_call(&id.name, args, true)?
+                        {
+                            return Ok(call);
+                        }
                         if self.helpers.contains(&id.name) {
                             return self.lower_helper_call(&id.name, args);
                         }
@@ -650,18 +655,24 @@ impl FuncBuilder<'_> {
     /// internal `tick()` runs at the hoist point (source order, because the
     /// callers traverse left-to-right).
     fn hoist_transactor_edge(&mut self, e: Expr) -> Expr {
-        if matches!(
-            &e,
-            Expr::Call(crate::ir::CallTarget::TransactorMethod { .. }, _)
-        ) {
-            let temp = self.fresh_temp();
-            self.push(Stmt::TransactorCall {
-                dest: Some(temp),
-                call: e,
-            });
-            Expr::Local(temp)
-        } else {
-            e
+        match &e {
+            Expr::Call(crate::ir::CallTarget::TransactorMethod { .. }, _) => {
+                let temp = self.fresh_temp();
+                self.push(Stmt::TransactorCall {
+                    dest: Some(temp),
+                    call: e,
+                });
+                Expr::Local(temp)
+            }
+            Expr::Call(crate::ir::CallTarget::TransactorSelfMethod { .. }, _) => {
+                let temp = self.fresh_temp();
+                self.push(Stmt::TransactorSelfCall {
+                    dest: Some(temp),
+                    call: e,
+                });
+                Expr::Local(temp)
+            }
+            _ => e,
         }
     }
 
@@ -988,7 +999,11 @@ impl FuncBuilder<'_> {
                 }
                 field.name.clone()
             }
-            ExprKind::Ident(id) if self.ctx.bare_transactor_fields.contains(&id.name) => {
+            ExprKind::Ident(id)
+                if self.lookup(&id.name).is_none()
+                    && (self.ctx.bare_transactor_fields.contains(&id.name)
+                        || self.ctx.transactor_fields.contains_key(&id.name)) =>
+            {
                 id.name.clone()
             }
             _ => return Ok(None),
@@ -1420,14 +1435,18 @@ pub(crate) fn parse_int_literal(s: &str) -> Option<u64> {
     }
 }
 
-/// True when `e` contains a (nested) `CallTarget::TransactorMethod` call
-/// edge anywhere. Used to reject a transactor method call in positions
-/// that cannot hoist it into a preceding `Stmt::TransactorCall` — notably
-/// a `wait until` predicate, which the scheduler re-evaluates every cycle
-/// (a per-cycle call would be nonsensical).
+/// True when `e` contains a (nested) transactor call edge anywhere. Used
+/// to reject a transactor method call in positions that cannot hoist it
+/// into a preceding call statement — notably a `wait until` predicate,
+/// which the scheduler re-evaluates every cycle (a per-cycle call would
+/// be nonsensical).
 pub(crate) fn expr_has_transactor_edge(e: &Expr) -> bool {
     match e {
-        Expr::Call(crate::ir::CallTarget::TransactorMethod { .. }, _) => true,
+        Expr::Call(
+            crate::ir::CallTarget::TransactorMethod { .. }
+            | crate::ir::CallTarget::TransactorSelfMethod { .. },
+            _,
+        ) => true,
         Expr::Call(_, args) => args.iter().any(expr_has_transactor_edge),
         Expr::Binary(_, a, b) => expr_has_transactor_edge(a) || expr_has_transactor_edge(b),
         Expr::Unary(_, a) => expr_has_transactor_edge(a),

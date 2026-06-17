@@ -3081,6 +3081,188 @@ fn transactor_methods_lower_to_functions_and_call_edges() {
     assert!(d1.is_some(), "let call binds the result");
 }
 
+#[test]
+fn transactor_method_bare_sibling_calls_lower_to_self_calls() {
+    let src = r#"
+transactor Xt
+    dut : Top
+
+    when active
+        hookable idle()
+            dut.en = 0
+            wait 1 cycle
+        end idle
+
+        hookable readv() -> uint<32>
+            let v = dut.value
+            return v
+        end readv
+
+        hookable pulse()
+            dut.en = 1
+            wait 1 cycle
+            idle()
+        end pulse
+
+        hookable read_twice() -> uint<32>
+            let a = readv()
+            let b = readv()
+            return a + b
+        end read_twice
+    end when
+end transactor Xt
+
+testbench XtTb
+    dut : Top
+    xt  : Xt active
+end testbench XtTb
+
+impl XtNestedCallTest for XtTb
+    run
+        xt.dut = dut
+        xt.pulse()
+        let v = xt.read_twice()
+        assert v == 0 else fail("v=${v}")
+    end run
+end impl XtNestedCallTest
+"#;
+    let prog = lower_src(src).expect("nested transactor sibling calls lower");
+    verify::verify_program(&prog).expect("verifies");
+
+    let x = &prog.transactors[0];
+    let pulse = prog.function(x.method("pulse").expect("pulse").function);
+    assert!(
+        pulse.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+            matches!(
+                s,
+                ir::Stmt::TransactorSelfCall {
+                    dest: None,
+                    call: ir::Expr::Call(
+                        ir::CallTarget::TransactorSelfMethod { method, .. },
+                        _
+                    )
+                } if method == "idle"
+            )
+        }),
+        "pulse should dispatch idle() through a TransactorSelfCall:\n{pulse}"
+    );
+
+    let read_twice = prog.function(x.method("read_twice").expect("read_twice").function);
+    let readv_calls = read_twice
+        .blocks
+        .iter()
+        .flat_map(|b| &b.stmts)
+        .filter(|s| {
+            matches!(
+                s,
+                ir::Stmt::TransactorSelfCall {
+                    dest: Some(_),
+                    call: ir::Expr::Call(
+                        ir::CallTarget::TransactorSelfMethod { method, .. },
+                        _
+                    )
+                } if method == "readv"
+            )
+        })
+        .count();
+    assert_eq!(
+        readv_calls, 2,
+        "read_twice should hoist value-returning readv() sibling calls:\n{read_twice}"
+    );
+}
+
+#[test]
+fn transactor_self_call_in_wait_until_predicate_is_rejected() {
+    let src = r#"
+transactor Xt
+    dut : Top
+
+    when active
+        hookable ready() -> uint<1>
+            return 1
+        end ready
+
+        hookable wait_ready()
+            wait until ready()
+        end wait_ready
+    end when
+end transactor Xt
+
+testbench XtTb
+    dut : Top
+    xt  : Xt active
+end testbench XtTb
+
+impl XtWaitUntilSelfCallTest for XtTb
+    run
+        xt.dut = dut
+        xt.wait_ready()
+    end run
+end impl XtWaitUntilSelfCallTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("transactor method call inside a `wait until` predicate"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn testbench_helper_wrapper_can_call_active_transactor_method() {
+    let src = r#"
+transactor Xt
+    dut : Top
+
+    when active
+        hookable pulse(n: uint<32>)
+            for _ in 0 .. n
+                dut.en = 1
+                wait 1 cycle
+                dut.en = 0
+                wait 1 cycle
+            end for
+        end pulse
+    end when
+end transactor Xt
+
+testbench XtTb
+    dut : Top
+    xt  : Xt active
+
+    function apply_pulse(n: uint<32>)
+        xt.pulse(n)
+    end apply_pulse
+end testbench XtTb
+
+impl XtHelperWrapperTest for XtTb
+    run
+        xt.dut = dut
+        apply_pulse(2)
+    end run
+end impl XtHelperWrapperTest
+"#;
+    let prog = lower_src(src).expect("testbench wrapper lowers");
+    verify::verify_program(&prog).expect("verifies");
+
+    let run = prog.function(prog.tests[0].run);
+    assert!(
+        run.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+            matches!(
+                s,
+                ir::Stmt::TransactorCall {
+                    dest: None,
+                    call: ir::Expr::Call(
+                        ir::CallTarget::TransactorMethod { bus_field, method },
+                        _
+                    )
+                } if bus_field == "xt" && method == "pulse"
+            )
+        }),
+        "inlined testbench helper should keep xt.pulse() as a TransactorCall:\n{run}"
+    );
+}
+
 /// Locks the dump-ir text for the smallest corpus transactor fixture:
 /// the transactor table, `TransactorBody` functions with mirrored
 /// params, erased DUT bind, and TransactorCall statements.
