@@ -1202,8 +1202,13 @@ fn emit_tlm_fork(
         // multiple cycles before accepting the request.
         writeln!(
             out,
-            "{pad}{{ int _b = 16; while (!{} && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}",
-            wire("req_ready")
+            "{pad}{}",
+            crate::codegen::bounded_handshake_wait(
+                &wire("req_ready"),
+                crate::codegen::TLM_WAIT_BOUND,
+                "co_await harc_rt::wait_cycles(_slot, 1)",
+                &format!("TLM {}.{} fork request", desc.bus_field, desc.method),
+            )
         )
         .ok();
         writeln!(out, "{pad}co_await harc_rt::wait_cycles(_slot, 1);").ok();
@@ -1258,8 +1263,13 @@ fn emit_ordered_tlm_join_all(
         writeln!(out, "{pad}{} = 1;", wire("rsp_ready")).ok();
         writeln!(
             out,
-            "{pad}{{ int _b = 64; while (!{} && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}",
-            wire("rsp_valid")
+            "{pad}{}",
+            crate::codegen::bounded_handshake_wait(
+                &wire("rsp_valid"),
+                crate::codegen::TLM_JOIN_DRAIN_BOUND,
+                "co_await harc_rt::wait_cycles(_slot, 1)",
+                &format!("TLM {}.{} fork response", p.bus_field, p.method),
+            )
         )
         .ok();
         if let (Some(dest), true) = (p.dest, p.has_ret) {
@@ -1496,12 +1506,16 @@ fn emit_transactor_call(
     // `<field>_<method>_<sig>` flat-name convention (mirrors v1's
     // `bus_signal_name`).
     let wire = |sig: &str| format!("dut->{}", binding.wire_name(method, sig));
-    let budget_wait = |out: &mut String, sig: &str| {
+    let budget_wait = |out: &mut String, sig: &str, label: &str| {
         writeln!(
             out,
-            "{pad}{{ int _b = 16; while (!{} && _b > 0) {{ co_await \
-             harc_rt::wait_cycles(_slot, 1); _b--; }} }}",
-            wire(sig)
+            "{pad}{}",
+            crate::codegen::bounded_handshake_wait(
+                &wire(sig),
+                crate::codegen::TLM_WAIT_BOUND,
+                "co_await harc_rt::wait_cycles(_slot, 1)",
+                label,
+            )
         )
         .ok();
     };
@@ -1523,11 +1537,19 @@ fn emit_transactor_call(
     }
     trace_event(out, "request");
     writeln!(out, "{pad}{} = 1;", wire("req_valid")).ok();
-    budget_wait(out, "req_ready");
+    budget_wait(
+        out,
+        "req_ready",
+        &format!("TLM {bus_field}.{method} request"),
+    );
     writeln!(out, "{pad}co_await harc_rt::wait_cycles(_slot, 1);").ok();
     writeln!(out, "{pad}{} = 0;", wire("req_valid")).ok();
     writeln!(out, "{pad}{} = 1;", wire("rsp_ready")).ok();
-    budget_wait(out, "rsp_valid");
+    budget_wait(
+        out,
+        "rsp_valid",
+        &format!("TLM {bus_field}.{method} response"),
+    );
     trace_event(out, "response");
     if schema.has_ret {
         // Capture BEFORE the trailing tick — rsp_data is valid in the

@@ -1,0 +1,37 @@
+// TLM handshake wait-timeout diagnostic e2e fixture (harc-com#416).
+//
+// Bound to `tests/dut/TlmStallMemory.sv`, whose `read` target never asserts
+// `req_ready`/`rsp_valid`. The single blocking read below therefore exhausts
+// both of its bounded handshake waits. Before #416 those loops fell through
+// silently and the test reported only a confusing downstream wrong value;
+// now each expiry emits `sim_log_line("FAIL", "... timed out after 16 cycles
+// ...")` and bumps the error count, so the run fails loudly at the cause.
+//
+// Exercised by both backends (`--codegen v1` and the default `tbir`) in
+// tests/tlm_wait_timeout_e2e.rs.
+
+bus TlmStallBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmStallBus
+
+testbench TlmStallTimeoutTb
+    dut : TlmStallMemory
+end testbench TlmStallTimeoutTb
+
+impl TlmStallTimeoutTest for TlmStallTimeoutTb
+    let mem : TlmStallBus = bind dut
+
+    run
+        dut.rst = 1
+        dut.mem_read_req_valid = 0
+        dut.mem_read_rsp_ready = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // The stall DUT never accepts: this blocking read's req_ready and
+        // rsp_valid waits both time out and emit the FAIL diagnostic.
+        let v = mem.read(5)
+        log(info, "stall read returned 0x${v:08x} (a timeout FAIL is expected above)")
+    end run
+end impl TlmStallTimeoutTest

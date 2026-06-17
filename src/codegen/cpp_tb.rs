@@ -8304,35 +8304,42 @@ impl Emitter {
         );
         self.pad(depth);
         writeln!(self.out, "{root}->{req_valid} = 1;").ok();
-        self.pad(depth);
-        if self.in_coroutine {
-            writeln!(self.out, "{{ int _b = 16; while (!{root}->{req_ready} && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}").ok();
-            self.pad(depth);
-            writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
+        let advance = if self.in_coroutine {
+            "co_await harc_rt::wait_cycles(_slot, 1)"
         } else {
-            writeln!(
-                self.out,
-                "{{ int _b = 16; while (!{root}->{req_ready} && _b > 0) {{ tick(); _b--; }} }}"
+            "tick()"
+        };
+        self.pad(depth);
+        writeln!(
+            self.out,
+            "{}",
+            crate::codegen::bounded_handshake_wait(
+                &format!("{root}->{req_ready}"),
+                crate::codegen::TLM_WAIT_BOUND,
+                advance,
+                &format!("TLM {}.{} request", id.name, method.name.name),
             )
-            .ok();
-            self.pad(depth);
-            writeln!(self.out, "tick();").ok();
-        }
+        )
+        .ok();
+        self.pad(depth);
+        writeln!(self.out, "{advance};").ok();
         self.pad(depth);
         writeln!(self.out, "{root}->{req_valid} = 0;").ok();
 
         self.pad(depth);
         writeln!(self.out, "{root}->{rsp_ready} = 1;").ok();
         self.pad(depth);
-        if self.in_coroutine {
-            writeln!(self.out, "{{ int _b = 16; while (!{root}->{rsp_valid} && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}").ok();
-        } else {
-            writeln!(
-                self.out,
-                "{{ int _b = 16; while (!{root}->{rsp_valid} && _b > 0) {{ tick(); _b--; }} }}"
+        writeln!(
+            self.out,
+            "{}",
+            crate::codegen::bounded_handshake_wait(
+                &format!("{root}->{rsp_valid}"),
+                crate::codegen::TLM_WAIT_BOUND,
+                advance,
+                &format!("TLM {}.{} response", id.name, method.name.name),
             )
-            .ok();
-        }
+        )
+        .ok();
         self.emit_tlm_call_trace_event(
             &component,
             &id.name,
@@ -8518,19 +8525,26 @@ impl Emitter {
             // Blocking forks still need the legacy ready-wait: unlike tagged
             // OOO lanes, a blocking target may legitimately hold req_ready low
             // for multiple cycles before accepting the request.
-            if self.in_coroutine {
-                writeln!(self.out, "{{ int _b = 16; while (!{root}->{req_ready} && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}").ok();
-                self.pad(depth);
-                writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
+            let advance = if self.in_coroutine {
+                "co_await harc_rt::wait_cycles(_slot, 1)"
             } else {
-                writeln!(
-                    self.out,
-                    "{{ int _b = 16; while (!{root}->{req_ready} && _b > 0) {{ tick(); _b--; }} }}"
+                "tick()"
+            };
+            // `self.pad(depth)` already emitted above (shared with the OOO
+            // branch), so the loop line is not re-padded.
+            writeln!(
+                self.out,
+                "{}",
+                crate::codegen::bounded_handshake_wait(
+                    &format!("{root}->{req_ready}"),
+                    crate::codegen::TLM_WAIT_BOUND,
+                    advance,
+                    &format!("TLM {}.{} fork request", id.name, method.name.name),
                 )
-                .ok();
-                self.pad(depth);
-                writeln!(self.out, "tick();").ok();
-            }
+            )
+            .ok();
+            self.pad(depth);
+            writeln!(self.out, "{advance};").ok();
         }
         self.pad(depth);
         writeln!(self.out, "{root}->{req_valid} = 0;").ok();
@@ -8573,16 +8587,21 @@ impl Emitter {
             self.pad(depth);
             writeln!(self.out, "{}->{} = 1;", p.root, rsp_ready).ok();
             self.pad(depth);
-            if self.in_coroutine {
-                writeln!(self.out, "{{ int _b = 64; while (!{}->{} && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}", p.root, rsp_valid).ok();
-            } else {
-                writeln!(
-                    self.out,
-                    "{{ int _b = 64; while (!{}->{} && _b > 0) {{ tick(); _b--; }} }}",
-                    p.root, rsp_valid
+            writeln!(
+                self.out,
+                "{}",
+                crate::codegen::bounded_handshake_wait(
+                    &format!("{}->{}", p.root, rsp_valid),
+                    crate::codegen::TLM_JOIN_DRAIN_BOUND,
+                    if self.in_coroutine {
+                        "co_await harc_rt::wait_cycles(_slot, 1)"
+                    } else {
+                        "tick()"
+                    },
+                    &format!("TLM {}.{} fork response", p.bus, p.method),
                 )
-                .ok();
-            }
+            )
+            .ok();
             if let Some(var) = &p.ret_var {
                 let read_expr = p
                     .ret_ty
@@ -8780,19 +8799,28 @@ impl Emitter {
                 }
                 self.pad(depth);
                 writeln!(self.out, "{root}->{valid_port} = 1;").ok();
-                self.pad(depth);
-                if self.in_coroutine {
-                    // Coroutine path: yield until ready=1 (bounded). The
-                    // bound matches the sync 16-cycle budget so a stuck
-                    // DUT still terminates the test rather than hanging.
-                    writeln!(self.out, "{{ int _b = 16; while (!{root}->{ready_port} && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}").ok();
-                    self.pad(depth);
-                    writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
+                // Wait until ready=1 (bounded). The bound matches the sync
+                // 16-cycle budget so a stuck DUT terminates the test (now
+                // with a FAIL diagnostic) rather than hanging.
+                let advance = if self.in_coroutine {
+                    "co_await harc_rt::wait_cycles(_slot, 1)"
                 } else {
-                    writeln!(self.out, "{{ int _b = 16; while (!{root}->{ready_port} && _b > 0) {{ tick(); _b--; }} }}").ok();
-                    self.pad(depth);
-                    writeln!(self.out, "tick();").ok();
-                }
+                    "tick()"
+                };
+                self.pad(depth);
+                writeln!(
+                    self.out,
+                    "{}",
+                    crate::codegen::bounded_handshake_wait(
+                        &format!("{root}->{ready_port}"),
+                        crate::codegen::TLM_WAIT_BOUND,
+                        advance,
+                        &format!("handshake {}.send ready", ch.name),
+                    )
+                )
+                .ok();
+                self.pad(depth);
+                writeln!(self.out, "{advance};").ok();
                 self.pad(depth);
                 writeln!(self.out, "{root}->{valid_port} = 0;").ok();
                 // Activity tracking (spec §7.x): a completed
@@ -8835,11 +8863,21 @@ impl Emitter {
                 self.pad(depth);
                 writeln!(self.out, "{root}->{ready_port} = 1;").ok();
                 self.pad(depth);
-                if self.in_coroutine {
-                    writeln!(self.out, "{{ int _b = 16; while (!{root}->{valid_port} && _b > 0) {{ co_await harc_rt::wait_cycles(_slot, 1); _b--; }} }}").ok();
-                } else {
-                    writeln!(self.out, "{{ int _b = 16; while (!{root}->{valid_port} && _b > 0) {{ tick(); _b--; }} }}").ok();
-                }
+                writeln!(
+                    self.out,
+                    "{}",
+                    crate::codegen::bounded_handshake_wait(
+                        &format!("{root}->{valid_port}"),
+                        crate::codegen::TLM_WAIT_BOUND,
+                        if self.in_coroutine {
+                            "co_await harc_rt::wait_cycles(_slot, 1)"
+                        } else {
+                            "tick()"
+                        },
+                        &format!("handshake {}.recv valid", ch.name),
+                    )
+                )
+                .ok();
                 // Capture BEFORE the trailing tick: the destination signals
                 // are valid in the same cycle as `valid` is high.
                 if let Some(name) = let_name {

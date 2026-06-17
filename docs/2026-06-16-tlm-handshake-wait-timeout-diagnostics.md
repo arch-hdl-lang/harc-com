@@ -1,7 +1,7 @@
 # HARC: TLM/handshake BFM wait loops fall through silently on timeout
 
 **Date:** 2026-06-16
-**Status:** Observation / enhancement proposal — codegen quality, no language-surface change
+**Status:** ✅ Implemented (2026-06-17) — see *Resolution* at the end. Codegen quality, no language-surface change.
 **Related:** harc-com#413 (blocking TLM fork ready-wait), harc-com#407 (OOO initiator handshake), harc-com#414
 
 ---
@@ -107,3 +107,35 @@ end-to-end coverage it currently lacks — today `tlm_method_blocking_fork_bus_t
 is only snapshot-tested, and `TlmMemory.sv` drives `req_ready` high whenever no
 response is pending, so a single uncontended fork never exercises the multi-cycle
 wait that #413 fixed.
+
+## Resolution (2026-06-17)
+
+Implemented as proposed, codegen-only, with the design points settled as follows:
+
+- **Severity: hard-`FAIL`.** Each expiry emits
+  `sim_log_line("FAIL", "<label> timed out after N cycles (<signal> stuck low)")`
+  and bumps `ctx.errors`, so a stalled DUT fails the run at its cause. No
+  warn-only escape hatch in this cut — a stuck handshake is a real bug.
+- **Bounds promoted to named constants** in `src/codegen/mod.rs`:
+  `TLM_WAIT_BOUND = 16` (request / `send` ready / `recv` valid / non-fork
+  response) and `TLM_JOIN_DRAIN_BOUND = 64` (the `join_all` forked-response
+  drain). A `--tlm-wait-bound` CLI knob was **not** added — it is user surface
+  and no fixture needs it yet; the named constants are the right first step and
+  keep the change purely internal. Re-open if a legitimately slow model needs a
+  larger budget without editing the source.
+- **One shared helper**, `codegen::bounded_handshake_wait(signal, bound, advance,
+  label)`, now backs all 15 former copy-paste sites across both emitters
+  (`cpp_tb.rs` v1 and `tbir/func.rs`), so the two stay in lockstep. `advance` is
+  `"co_await harc_rt::wait_cycles(_slot, 1)"` in a coroutine or `"tick()"`
+  straight-line; `label` carries the source-level bus/channel name while the
+  message also prints the actual stuck wire.
+
+**Verification.** The happy path is byte-identical apart from the `if (_b == 0 …)`
+tail (three emitted-C++ snapshots regenerated). The full Verilator fixture suite
+(`tests/run_fixtures.sh`, 103 fixtures) and `trace_merge_blocking_and_ooo_tags_e2e`
+stay green. The follow-up stall test landed as
+`tests/tlm_wait_timeout_e2e.rs` + `tests/dut/TlmStallMemory.sv` +
+`tests/fixtures/tlm_stall_timeout_test.harc`: a `read` target that never asserts
+`req_ready`/`rsp_valid`, run under **both** `--codegen v1` and `tbir`, asserting
+the FAIL diagnostic fires and the run exits non-zero. Confirmed under Verilator
+5.048 — request times out at cycle 19, response at 36, run reports `2 TESTS FAILED`.
