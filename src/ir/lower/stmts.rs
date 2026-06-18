@@ -1400,7 +1400,8 @@ impl FuncBuilder<'_> {
         let Some(transactor) = self.self_transactor.clone() else {
             return Ok(None);
         };
-        let Some(&(n_params, has_ret)) = self.self_transactor_methods.get(name) else {
+        let Some(&(n_params, has_ret, callee_active_only)) = self.self_transactor_methods.get(name)
+        else {
             return Ok(None);
         };
         if self.in_fmt_args {
@@ -1419,6 +1420,22 @@ impl FuncBuilder<'_> {
             return Err(LowerError::Invalid(format!(
                 "transactor method `{transactor}.{name}` returns no value"
             )));
+        }
+        if callee_active_only && !self.self_transactor_method_active_only {
+            let caller = self
+                .current_body_name
+                .as_deref()
+                .unwrap_or("<current method>");
+            return Err(unsupported(
+                &format!(
+                    "transactor sibling method call `{name}(...)` from always-on method \
+                     `{caller}`",
+                ),
+                &format!(
+                    "`{name}` is declared inside `when active`; move `{caller}` into `when active`, \
+                     or call `{name}` only from active-only code",
+                ),
+            ));
         }
         let mut lowered = Vec::with_capacity(args.len());
         for a in args {

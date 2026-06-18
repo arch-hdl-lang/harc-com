@@ -3894,7 +3894,14 @@ pub(crate) struct FuncBuilder<'a> {
     pub(crate) self_transactor: Option<String>,
     /// Full sibling method signature table for the current transactor,
     /// including methods declared later in source order.
-    pub(crate) self_transactor_methods: HashMap<String, (usize, bool)>,
+    pub(crate) self_transactor_methods: HashMap<String, (usize, bool, bool)>,
+    /// True while lowering a transactor method declared under
+    /// `when active`. Used to reject an always-on method that would
+    /// backdoor-call an active-only sibling.
+    pub(crate) self_transactor_method_active_only: bool,
+    /// Name of the function/method body currently being lowered when a
+    /// diagnostic wants to cite it directly.
+    pub(crate) current_body_name: Option<String>,
     /// State fields visible to a bound-to target-responder body
     /// (`thread bus.<m>(...)`). A bare ident that hits this set lowers
     /// to `ir::Expr::TransactorState`/`ir::Stmt::TransactorStateWrite` with an
@@ -4108,6 +4115,8 @@ impl<'a> FuncBuilder<'a> {
             in_transactor_method: false,
             self_transactor: None,
             self_transactor_methods: HashMap::new(),
+            self_transactor_method_active_only: false,
+            current_body_name: None,
             target_state_fields: HashSet::new(),
             in_check: false,
             let_widths: HashMap::new(),
