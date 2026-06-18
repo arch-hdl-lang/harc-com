@@ -110,24 +110,14 @@ pub(super) fn lower_bus_binding(
             ));
         }
     }
-    // Param-gated signals need the effective param env (bus defaults +
-    // bind generics + DUT-port override) that only the emission-side
-    // `EmitOpts` carries; reject rather than evaluate gates against
-    // defaults alone and silently diverge from `arch build`'s port set.
-    let gated = decl
-        .signals
-        .iter()
-        .chain(decl.handshakes.iter().flat_map(|h| h.payload.iter()))
-        .any(|s| s.gate.is_some());
-    if gated {
-        return Err(unsupported(
-            &format!(
-                "binding bus `{}` with `generate_if`-gated signals",
-                decl.name.name
-            ),
-            "",
-        ));
-    }
+    // `generate_if`-gated signals are NOT evaluated here: lowering has no
+    // param env (only the emission-side `EmitOpts` carries the DUT-port
+    // override that selects which gated channels `arch build` flattened).
+    // The owned `BusDecl` returned below keeps every signal's `gate`
+    // expression intact, and the tbir emitter (which has `EmitOpts` + the
+    // `SourceFile`) evaluates each *accessed* signal's gate against the
+    // effective env, mirroring v1's `bus_signal_present` / gated-OFF error.
+    // See `src/codegen/tbir/mod.rs::check_gated_bus_access`.
 
     let methods = decl
         .tlm_methods

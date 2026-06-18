@@ -37,6 +37,14 @@ pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<Stri
     // All tests in one binary share the DUT type (same v0 rule as v1).
     let dut_type = validate_tests_share_dut(prog, "one binary")?;
 
+    // `generate_if`-gated bus signals: lowering kept every binding's gates
+    // intact but could not evaluate them (no param env). Resolve each
+    // ACCESSED bus-bound signal's gate against the effective param env now
+    // (the emitter has `EmitOpts` + the `SourceFile`), erroring on a
+    // gated-OFF access exactly as v1's `bus_signal_present` / gated-OFF
+    // diagnostic does. A gated-OFF signal that is never accessed is silent.
+    check_gated_bus_access(prog, file, opts)?;
+
     let test_names: Vec<String> = prog.tests.iter().map(|t| t.name.clone()).collect();
 
     // Constraint-solver wiring (randomize sites). The runtime problem
@@ -349,6 +357,245 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
         TlmFork(desc) => desc.args.iter().any(expr_has_probe),
         TlmJoinAll(pending) => pending.iter().any(|p| p.args.iter().any(expr_has_probe)),
         RecordInit(_, _) | CovReport(_) => false,
+    }
+}
+
+/// Per-bind effective `generate_if` param env, mirroring v1's
+/// `bus_param_envs` population (`cpp_tb.rs` ~2200): bus defaults overlaid
+/// with the bind-site generic (`let s : BusRw<...> = bind dut`) and then
+/// the DUT-port override (`port s: target BusRw<WRITE=0>`, sourced into
+/// `opts.dut_bus_port_overrides`). The bind name equals the DUT port name
+/// by convention, so the override map is keyed by the bind name.
+struct GatedBus<'a> {
+    decl: &'a crate::ast::BusDecl,
+    env: std::collections::HashMap<String, i64>,
+}
+
+/// Error out if any function ACCESSES a `generate_if`-gated bus signal
+/// that is gated OFF under its bind's effective param env. Mirrors v1's
+/// access-site behavior: lowering carries the gates, emission decides
+/// presence against the override-applied env so the tbir port set matches
+/// `arch build`'s flattened port set for the same DUT override. Ungated
+/// signals, and gated-ON signals, resolve normally; a gated-OFF signal
+/// that is never accessed is silent (it simply never reaches a PortRef).
+fn check_gated_bus_access(
+    prog: &TbProgram,
+    file: &SourceFile,
+    opts: &EmitOpts,
+) -> Result<(), EmitError> {
+    use crate::ast::{BusDecl, Item, TestItem, TypeExpr};
+
+    // Bus declarations in the file, by simple name (inline or `use`-imported).
+    let mut buses: std::collections::HashMap<&str, &BusDecl> = std::collections::HashMap::new();
+    for it in &file.items {
+        if let Item::Bus(b) = it {
+            buses.insert(b.name.name.as_str(), b);
+        }
+    }
+    // Bind-site type expr per bind name, for the bind-site generic layer
+    // (`let s : BusRw<...> = bind dut`). Recovered from the file's test
+    // lets — lowering does not carry the bind `TypeExpr`. First binding
+    // name wins on a cross-test collision (matches v1's downstream-bind
+    // pre-scan), which is irrelevant in practice since binds are per-test.
+    let mut bind_ty: std::collections::HashMap<&str, &TypeExpr> = std::collections::HashMap::new();
+    for it in &file.items {
+        if let Item::Test(t) = it {
+            for ti in &t.items {
+                if let TestItem::Let(l) = ti {
+                    if l.bind {
+                        if let Some(ty) = l.ty.as_ref() {
+                            bind_ty.entry(l.name.name.as_str()).or_insert(ty);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // bind-name -> (BusDecl, effective env). Drawn from every testbench's
+    // `bus_bindings` (the binding's `field` is the bind name == flat signal
+    // prefix == DUT port name). Buses with no gated signals at all are
+    // skipped — they can never produce a gated-OFF access.
+    let mut gated: std::collections::HashMap<String, GatedBus<'_>> = std::collections::HashMap::new();
+    for tb in &prog.testbenches {
+        for b in &tb.bus_bindings {
+            if gated.contains_key(&b.field) {
+                continue;
+            }
+            let Some(&decl) = buses.get(b.bus.as_str()) else {
+                continue;
+            };
+            // Only plain bus signals are gate-checked (mirroring v1's
+            // `bus_signal_present`), so a bus whose only gates sit on
+            // handshake payloads needs no env built.
+            if !decl.signals.iter().any(|s| s.gate.is_some()) {
+                continue;
+            }
+            let env = crate::codegen::cpp_tb::bus_param_env_with_port_override(
+                decl,
+                bind_ty.get(b.field.as_str()).copied(),
+                opts.dut_bus_port_overrides.get(&b.field),
+            );
+            gated.insert(b.field.clone(), GatedBus { decl, env });
+        }
+    }
+    if gated.is_empty() {
+        return Ok(());
+    }
+
+    // Walk every PortRef the program accesses; collect gated-OFF errors.
+    let mut errors: Vec<String> = Vec::new();
+    let mut check = |p: &ir::PortRef| {
+        if let Some(err) = gated_off_error(p, &gated) {
+            if !errors.contains(&err) {
+                errors.push(err);
+            }
+        }
+    };
+    for f in &prog.functions {
+        for blk in &f.blocks {
+            for s in &blk.stmts {
+                for_each_port_in_stmt(s, &mut check);
+            }
+            for_each_port_in_term(&blk.terminator, &mut check);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(EmitError(errors.join("\n")))
+    }
+}
+
+/// `Some(message)` when PortRef `p` is rooted at a gated bus bind and
+/// names a PLAIN bus signal that is gated OFF under that bind's effective
+/// env. `None` otherwise. The message text mirrors v1's gated-OFF
+/// diagnostic verbatim.
+///
+/// Scope deliberately matches v1's `bus_signal_present` exactly: only the
+/// 2-segment `[bind, plain-signal]` form is gate-checked. v1 resolves
+/// handshake-channel access (`[bind, ch, sig]` and the pre-flattened
+/// `[bind, ch_sig]` form) WITHOUT a gate check — see
+/// `try_emit_bus_field_access` (`cpp_tb.rs` ~9255+), where the handshake
+/// branches return the port unconditionally. Mirroring that here keeps
+/// the tbir backend from rejecting an access v1 accepts. A 1-segment
+/// remapped path (`bind...with`) is likewise not gate-checked by v1.
+fn gated_off_error(
+    p: &ir::PortRef,
+    gated: &std::collections::HashMap<String, GatedBus<'_>>,
+) -> Option<String> {
+    if !matches!(p.access, ir::PortAccess::Port) {
+        return None;
+    }
+    let [bind, sig] = p.port_path.as_slice() else {
+        return None;
+    };
+    let g = gated.get(bind)?;
+    let s = g.decl.signals.iter().find(|s| &s.name.name == sig)?;
+    if crate::codegen::cpp_tb::gate_passes(s.gate.as_ref(), &g.env) {
+        return None;
+    }
+    Some(format!(
+        "bus `{}` (binding `{}`) signal `{}` is gated OFF by its \
+         `generate_if` condition under the bind's params — `arch build` \
+         omits this port, so the testbench must not access it",
+        g.decl.name.name, bind, sig,
+    ))
+}
+
+/// Invoke `f` on every `PortRef` reachable from statement `s` (the
+/// statement's own port operands and any port reads nested in its
+/// expression trees). Parallels `stmt_has_probe`'s traversal, collecting
+/// instead of testing.
+fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
+    use ir::Stmt::*;
+    match s {
+        DutWrite(p, e) => {
+            f(p);
+            for_each_port_in_expr(e, f);
+        }
+        DutRead(_, p) | ProbeRelease(p) => f(p),
+        Assign(_, e)
+        | RecordFieldWrite { value: e, .. }
+        | RecordWriteCb { value: e, .. }
+        | TbFieldWrite { value: e, .. }
+        | TransactorStateWrite { value: e, .. }
+        | ComponentFieldWrite { value: e, .. }
+        | TransactorCall { call: e, .. }
+        | TransactorSelfCall { call: e, .. } => for_each_port_in_expr(e, f),
+        AssertCheck { cond, on_fail } => {
+            for_each_port_in_expr(cond, f);
+            for_each_port_in_fmt(on_fail, f);
+        }
+        Log { args, .. } => for_each_port_in_fmt(args, f),
+        FailDiag { guard, args } => {
+            if let Some(g) = guard {
+                for_each_port_in_expr(g, f);
+            }
+            for_each_port_in_fmt(args, f);
+        }
+        ScoreboardOp { op, .. } => match op {
+            ir::ScoreboardOp::QueuePush { value, .. }
+            | ir::ScoreboardOp::ScalarWrite { value, .. } => for_each_port_in_expr(value, f),
+            ir::ScoreboardOp::QueuePop { .. } => {}
+        },
+        ComponentEmit { args, .. } | ComponentCall { args, .. } => {
+            args.iter().for_each(|a| for_each_port_in_expr(a, f))
+        }
+        SeqPush { value, .. } | ComponentQueuePush { value, .. } => for_each_port_in_expr(value, f),
+        ComponentQueuePop { .. } | ComponentSubAssign { .. } => {}
+        TlmFork(desc) => desc.args.iter().for_each(|a| for_each_port_in_expr(a, f)),
+        TlmJoinAll(pending) => pending
+            .iter()
+            .for_each(|p| p.args.iter().for_each(|a| for_each_port_in_expr(a, f))),
+        RecordInit(_, _) | CovReport(_) => {}
+    }
+}
+
+/// Invoke `f` on every `PortRef` in a block terminator's expression
+/// operands (`Branch`/`WaitCycles`/`WaitUntil` conditions can read a bus
+/// signal).
+fn for_each_port_in_term(t: &ir::Terminator, f: &mut impl FnMut(&ir::PortRef)) {
+    use ir::Terminator::*;
+    match t {
+        Branch(e, _, _)
+        | WaitCycles(e, _, _)
+        | WaitCyclesSync(e, _) => for_each_port_in_expr(e, f),
+        WaitUntil { preds, .. } => preds.iter().for_each(|p| for_each_port_in_expr(&p.expr, f)),
+        WaitUntilTimeout { preds, cycles, .. } => {
+            preds.iter().for_each(|p| for_each_port_in_expr(&p.expr, f));
+            for_each_port_in_expr(cycles, f);
+        }
+        Fatal(args) => for_each_port_in_fmt(args, f),
+        Jump(_) | WaitTimePs(_, _) | Randomize { .. } | Return => {}
+    }
+}
+
+fn for_each_port_in_fmt(args: &ir::FmtArgs, f: &mut impl FnMut(&ir::PortRef)) {
+    args.args.iter().for_each(|a| for_each_port_in_expr(&a.expr, f));
+}
+
+/// Invoke `f` on every `PortRef` in an expression tree. Parallels
+/// `expr_has_probe`'s structural traversal.
+fn for_each_port_in_expr(e: &ir::Expr, f: &mut impl FnMut(&ir::PortRef)) {
+    use ir::Expr::*;
+    match e {
+        Port(p) => f(p),
+        Binary(_, a, b) => {
+            for_each_port_in_expr(a, f);
+            for_each_port_in_expr(b, f);
+        }
+        Unary(_, a) => for_each_port_in_expr(a, f),
+        BitSlice { target, .. } => for_each_port_in_expr(target, f),
+        Ternary(c, a, b) => {
+            for_each_port_in_expr(c, f);
+            for_each_port_in_expr(a, f);
+            for_each_port_in_expr(b, f);
+        }
+        WidthCast { inner, .. } => for_each_port_in_expr(inner, f),
+        Call(_, args) => args.iter().for_each(|a| for_each_port_in_expr(a, f)),
+        ComponentIdle { n, .. } => for_each_port_in_expr(n, f),
+        _ => {}
     }
 }
 

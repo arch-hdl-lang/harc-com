@@ -2883,7 +2883,7 @@ fn bus_param_env(
 /// with `arch build` rather than with a stale TB restatement. Overrides that
 /// can't be folded are simply not inserted, leaving the gate conservatively
 /// PRESENT (same fallback as `gate_passes`).
-fn bus_param_env_with_port_override(
+pub(crate) fn bus_param_env_with_port_override(
     bus: &BusDecl,
     bind_ty: Option<&TypeExpr>,
     port_override: Option<&std::collections::HashMap<String, i64>>,
@@ -3086,7 +3086,7 @@ fn is_simple_ident(s: &str) -> bool {
 /// pre-fix behavior had, so we never regress a working corpus design into a
 /// missing-port error. The common ARCH forms (`generate_if READ`,
 /// `generate_if WRITE`, `generate_if READ > 0`) all fold.
-fn gate_passes(gate: Option<&Expr>, env: &std::collections::HashMap<String, i64>) -> bool {
+pub(crate) fn gate_passes(gate: Option<&Expr>, env: &std::collections::HashMap<String, i64>) -> bool {
     match gate {
         None => true,
         Some(cond) => match eval_const_i64(cond, env) {
