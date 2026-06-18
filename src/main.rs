@@ -448,13 +448,7 @@ fn main() -> Result<()> {
                     include_dir: z3_include_dir.clone(),
                     lib_dir: z3_lib_dir.clone(),
                 };
-                let codegen = effective_codegen(codegen, check_backends);
-                if check_backends && codegen == CodegenKind::Tbir {
-                    return Err(miette::miette!(
-                        "--check-backends is not supported with --codegen tbir yet; \
-                         re-run with --codegen v1"
-                    ));
-                }
+                let codegen = effective_codegen(codegen);
                 if check_backends {
                     cmd_sim_check_backends(
                         files.clone(),
@@ -472,6 +466,7 @@ fn main() -> Result<()> {
                         z3_opts,
                         rebuild,
                         wave_opts,
+                        codegen,
                     )
                 } else {
                     cmd_sim(
@@ -2101,12 +2096,17 @@ fn cmd_sim_check_backends(
     z3_opts: Z3PathOpts,
     rebuild: bool,
     waves: WaveOpts,
+    codegen: CodegenKind,
 ) -> Result<()> {
     if dut.is_empty() || sv.is_empty() {
         return Err(miette::miette!(
             "--check-backends requires BOTH --dut <file.arch> and --sv <file.sv>"
         ));
     }
+    // Both backends emit the testbench through the SAME codegen so the diff
+    // isolates DUT-backend divergence (ARCH sim vs Verilator), not emitter
+    // differences. Defaults to the global default (tbir); `--codegen v1`
+    // remains selectable for A/B during the v1 deprecation soak.
 
     // Resolve outdir up front so both runs land under the same place and the
     // two trace files sit side-by-side for the diff.
@@ -2139,7 +2139,7 @@ fn cmd_sim_check_backends(
         top.clone(),
         test.clone(),
         CompileScope::Suite,
-        CodegenKind::V1,
+        codegen,
         CppSplit::Off,
         1,
         Some(arch_outdir.clone()),
@@ -2165,7 +2165,7 @@ fn cmd_sim_check_backends(
         top.clone(),
         test.clone(),
         CompileScope::Suite,
-        CodegenKind::V1,
+        codegen,
         CppSplit::Off,
         1,
         Some(sv_outdir.clone()),
@@ -2208,12 +2208,11 @@ fn cmd_sim_check_backends(
     }
 }
 
-fn effective_codegen(codegen: Option<CodegenKind>, check_backends: bool) -> CodegenKind {
-    codegen.unwrap_or(if check_backends {
-        CodegenKind::V1
-    } else {
-        CodegenKind::Tbir
-    })
+fn effective_codegen(codegen: Option<CodegenKind>) -> CodegenKind {
+    // Every path — including `--check-backends`, which used to force v1 —
+    // now defaults to the TB-IR backend. An explicit `--codegen v1` still
+    // selects v1 for A/B during the v1 deprecation soak.
+    codegen.unwrap_or_default()
 }
 
 fn arch_opt_with_solver_z3(base: &str, inc: &Path, lib: &Path, force_no_as_needed: bool) -> String {
@@ -2491,11 +2490,11 @@ mod tests {
         let Cmd::Sim { codegen, .. } = cli.cmd else {
             panic!("expected sim command");
         };
-        assert_eq!(effective_codegen(codegen, false), CodegenKind::Tbir);
+        assert_eq!(effective_codegen(codegen), CodegenKind::Tbir);
     }
 
     #[test]
-    fn sim_cli_check_backends_defaults_to_v1_codegen() {
+    fn sim_cli_check_backends_defaults_to_tbir_codegen() {
         let cli = Cli::parse_from([
             "harc",
             "sim",
@@ -2509,7 +2508,7 @@ mod tests {
         let Cmd::Sim { codegen, .. } = cli.cmd else {
             panic!("expected sim command");
         };
-        assert_eq!(effective_codegen(codegen, true), CodegenKind::V1);
+        assert_eq!(effective_codegen(codegen), CodegenKind::Tbir);
     }
 
     #[test]
@@ -2526,11 +2525,11 @@ mod tests {
         let Cmd::Sim { codegen, .. } = cli.cmd else {
             panic!("expected sim command");
         };
-        assert_eq!(effective_codegen(codegen, false), CodegenKind::V1);
+        assert_eq!(effective_codegen(codegen), CodegenKind::V1);
     }
 
     #[test]
-    fn sim_cli_preserves_explicit_tbir_for_check_backends_guard() {
+    fn sim_cli_check_backends_honors_explicit_tbir() {
         let cli = Cli::parse_from([
             "harc",
             "sim",
@@ -2546,7 +2545,7 @@ mod tests {
         let Cmd::Sim { codegen, .. } = cli.cmd else {
             panic!("expected sim command");
         };
-        assert_eq!(effective_codegen(codegen, true), CodegenKind::Tbir);
+        assert_eq!(effective_codegen(codegen), CodegenKind::Tbir);
     }
 
     #[test]

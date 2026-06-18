@@ -41,10 +41,11 @@ while IFS='|' read -r name top duts test srcdir; do
   for f in $duts; do dut_args+=(--dut "$srcdir/$f"); sv_inputs+=("$srcdir/$f"); done
   echo "=== check-backends: $name (top $top) ==="
   "$ARCH" build "${sv_inputs[@]}" -o "$TMP/$name.sv" || { echo "  FAIL: arch build"; fail=1; continue; }
-  # `--check-backends` is a v1↔arch-sim cross-check; the TB-IR backend is
-  # not wired into it yet, so pin `--codegen v1` explicitly (the global
-  # default is now tbir — phase 5).
-  out="$("$HARC" sim --check-backends --codegen v1 --arch-bin "$ARCH" "${dut_args[@]}" \
+  # `--check-backends` now runs through the default (TB-IR) backend, like
+  # every other path; it emits the same TB for both the ARCH-sim and
+  # Verilator runs and asserts their traces match. (`--codegen v1` is still
+  # selectable for A/B during the v1 deprecation soak.)
+  out="$("$HARC" sim --check-backends --arch-bin "$ARCH" "${dut_args[@]}" \
         --sv "$TMP/$name.sv" --top "$top" "$srcdir/$test" 2>&1)"
   if echo "$out" | grep -q "traces match across backends"; then
     echo "  PASS: traces match"
