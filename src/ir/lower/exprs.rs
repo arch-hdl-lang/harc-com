@@ -410,7 +410,27 @@ impl FuncBuilder<'_> {
                      `<rec>.<vecfield>[i]` element reads are lowered",
                 ))
             }
-            ExprKind::BitSlice { .. } => Err(unsupported("bit-slice expressions", "")),
+            ExprKind::BitSlice { target, hi, lo } => {
+                // Constant scalar bit-slice `x[hi:lo]` with literal bounds
+                // → IR `BitSlice` (right-shift + mask), mirroring v1's
+                // scalar slice. A variable part-select (`x[s +: W]` with a
+                // non-const offset) does not fold and stays out of subset.
+                match (parse_int_literal_expr(hi), parse_int_literal_expr(lo)) {
+                    (Some(h), Some(l)) if h >= l => {
+                        match (u32::try_from(h), u32::try_from(l)) {
+                            (Ok(hi), Ok(lo)) => {
+                                let target = Box::new(self.lower_expr(target)?);
+                                Ok(Expr::BitSlice { target, hi, lo })
+                            }
+                            _ => Err(unsupported("bit-slice bounds above 2^32", "")),
+                        }
+                    }
+                    _ => Err(unsupported(
+                        "bit-slice expressions with non-constant or hi<lo bounds",
+                        "only literal `x[hi:lo]` bounds with hi >= lo are lowered",
+                    )),
+                }
+            }
             ExprKind::String(_) => Err(unsupported("string values in expression position", "")),
             ExprKind::Float(_) => Err(unsupported("float literals", "")),
             ExprKind::Time(_) => Err(unsupported("time literals in expression position", "")),

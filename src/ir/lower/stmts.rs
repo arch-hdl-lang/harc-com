@@ -493,9 +493,29 @@ impl FuncBuilder<'_> {
             }
         }
         let Some(value) = &l.value else {
+            // Uninitialized scalar `let x: uint<N>;` — the declare-then-
+            // assign-in-loop idiom. The local is hoisted as `<cty> x = 0;`
+            // by `declare_locals` (v1 emits `int64_t x = 0;`), so we just
+            // register the typed local; later `=` assignments fill it.
+            // Requires a declared scalar type to size it; an untyped
+            // `let x;` with no initializer cannot be sized → rejected.
+            // (Uninitialized records are handled by the record arm above.)
+            if let Some(ty) = l.ty.as_ref().and_then(typed_let_ir_type) {
+                let id = self.declare(&l.name.name);
+                if let Some(w) = l.ty.as_ref().and_then(typed_let_width) {
+                    self.let_widths.insert(id, w);
+                }
+                self.set_local_type(id, ty.clone());
+                // Explicit zero-init definition: matches v1's `<cty> x = 0;`
+                // and gives the verifier's dominance check a definition that
+                // dominates every later read of the declared-then-assigned
+                // local.
+                self.push(Stmt::Assign(id, Expr::Literal { value: 0, ty }));
+                return Ok(());
+            }
             return Err(unsupported(
-                &format!("uninitialized `let {}`", l.name.name),
-                "",
+                &format!("uninitialized `let {}` without a scalar type", l.name.name),
+                "declare it with a scalar type (`let x: uint<N>;`) or give an initializer",
             ));
         };
         // Explicit scalar bit-width of the declaration, tracked on

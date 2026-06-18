@@ -595,10 +595,12 @@ event-driven-transactor group). The hookable-BFM path itself still rejects
 `out_of_order` channels, `fork`-issue, nested transactor calls inside a
 BFM body, multiple bound instances of one BFM type per file. A
 `bind ... with { ... }` remap on a *handshake-channel* bus (which an
-initiator BFM is, e.g. BusAxiLite) is rejected: the bus-bind-remap slice
-honors remaps only on `tlm_method`-only buses, since handshake-channel
-access bypasses `wire_name` (`bind_remap_test` exercises exactly this and
-stays rejected). `tlm_pairing_arch_initiator_test` (a TLM-initiator
+initiator BFM is, e.g. BusAxiLite) **now lowers** (the earlier note that
+it "stays rejected" was stale): `fill_visit_port` (`src/ir/lower/mod.rs`)
+applies remaps to 3-segment handshake paths, and `bind_remap_test` is
+registered and passing (tests `bus_bind_remap_handshake_channel_lowers`
++ the `bind_remap` dump-ir snapshot). `tlm_pairing_arch_initiator_test`
+(a TLM-initiator
 fixture pairing an ARCH OOO initiator with HARC `blocking` +
 `out_of_order tags 2` RESPONDERS) is now fully lowered and registered —
 see the OOO-responder lanes section above.
