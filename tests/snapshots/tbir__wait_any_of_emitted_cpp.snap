@@ -175,7 +175,7 @@ int run_WaitAnyOfTest(int argc, char** argv) {
     WaitAnyOfTb _tb;
     harc_rt::ThreadSlot _run_slot;
     sched.slots.push_back(&_run_slot);
-    _run_slot.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
+    auto _run_body = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
         _tb.dut = dut;
         { // run_WaitAnyOfTest (TB-IR loop-switch)
             uint64_t __t0 = 0; (void)__t0;
@@ -185,7 +185,9 @@ int run_WaitAnyOfTest(int argc, char** argv) {
                 switch (__bb) {
                 case 0: {
                     harc_rt::harc_assign(dut->rst, 1);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->en, 0);
+                    dut->eval_comb();
                     co_await harc_rt::wait_cycles(_slot, (uint32_t)(3));
                     __bb = 1;
                     break;
@@ -196,7 +198,9 @@ int run_WaitAnyOfTest(int argc, char** argv) {
                         ctx.errors++;
                     }
                     harc_rt::harc_assign(dut->rst, 0);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->en, 1);
+                    dut->eval_comb();
                     sim_log_line("INFO", "released reset, counting");
                     co_await harc_rt::wait_until(_slot, [&]{ return ((harc_rt::harc_read(dut->count_out) == 200)) || ((harc_rt::harc_read(dut->count_out) == 6)); });
                     __bb = 2;
@@ -234,7 +238,8 @@ int run_WaitAnyOfTest(int argc, char** argv) {
             }
         }
         co_return;
-    }(&_run_slot);
+    };
+    _run_slot.thread = _run_body(&_run_slot);
 
     // Resume each coroutine once so initial-setup statements run
     // before the first clock edge. Single-threaded — workers

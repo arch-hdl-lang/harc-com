@@ -1,0 +1,230 @@
+// HARC testbench for arch-com/examples/lz4_decomp.arch
+//
+// LZ4 block decompressor — three tests exercising all FSM states:
+//
+//  1. Pure literals   "Hello"       (5 bytes, token+literals only)
+//  2. Literals+match  "AABBAABB"    (4 lit + 4-byte match offset=4)
+//  3. Run-length      16 A's         (4 lit + 12-byte match offset=1)
+//
+// TIMING MODEL
+// ------------
+// out_ready is held HIGH throughout each test so the output side never
+// stalls.  Assertions on output bytes are made BEFORE `wait 1 cycle`:
+//
+//   In S_LIT:   out_valid = in_valid  (combinational pass-through)
+//               out_data  = in_data
+//   → drive in_valid + in_data, read out_data, THEN wait 1 cycle.
+//
+//   In S_MATCH: out_valid = 1 always  (history-read is async / latency 0)
+//               out_data  = hist[rd_ptr]
+//   → after each wait 1 cycle (which consumed the previous match byte
+//     and advanced rd_ptr), read out_data for the next match byte.
+//
+// LZ4 compressed byte layouts (block format, no frame header):
+//
+//   Test 1 — "Hello" (5 bytes, last sequence: literals only)
+//     Token  0x50  (lit_nibble=5, match_nibble=0)
+//     Literals: 0x48 0x65 0x6C 0x6C 0x6F
+//     in_last on 0x6F.   Total: 6 compressed bytes.
+//
+//   Test 2 — "AABBAABB" (8 bytes)
+//     Seq 1: token=0x40 (lit4, match_nibble=0→match_len=4),
+//            lits 0x41 0x41 0x42 0x42, offset LE 0x04 0x00.
+//     in_last on 0x00.   Total: 7 compressed bytes.
+//
+//   Test 3 — 16 A's
+//     Seq 1: token=0x48 (lit4, match_nibble=8→match_len=12),
+//            lits 0x41 0x41 0x41 0x41, offset LE 0x01 0x00.
+//     Offset=1: each match byte copies the last-written 'A'.
+//     in_last on 0x00.   Total: 7 compressed bytes.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench Lz4DecompTb
+    dut : Lz4Decomp
+end testbench Lz4DecompTb
+
+impl Lz4DecompTest for Lz4DecompTb
+    clock clk = SysDomain    // 100 MHz
+
+    run
+        // ── Common setup ──────────────────────────────────────────────────
+        // out_ready=1 for the entire run — we always accept output.
+        // This makes in_ready=1 in S_LIT (since in_ready = out_ready there),
+        // so literals flow through without stalling.
+        dut.out_ready = 1
+
+        // ── Test 1: "Hello" (pure literals) ──────────────────────────────
+        dut.rst       = 1
+        dut.in_valid  = 0
+        dut.in_data   = 0
+        dut.in_last   = 0
+        wait 3 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        log(info, "=== Test 1: 'Hello' (pure literals) ===")
+
+        // Send token 0x50 (lit_nibble=5, match_nibble=0).
+        // State: S_TOKEN → after clock edge → S_LIT, lit_len=5.
+        dut.in_valid = 1
+        dut.in_data  = 0x50
+        wait 1 cycle
+        // Now in S_LIT.  in_ready = out_ready = 1.
+
+        // Literals: out_valid = in_valid, out_data = in_data (comb).
+        // Check BEFORE wait 1 cycle (combinational read).
+        dut.in_data = 0x48   // 'H'
+        assert dut.out_valid == 1 else fail("T1: out_valid low for 'H'")
+        assert dut.out_data  == 0x48 else fail("T1 byte 0: expected 'H'=0x48, got=${dut.out_data:02x}")
+        wait 1 cycle   // lit_len 5→4
+
+        dut.in_data = 0x65   // 'e'
+        assert dut.out_data == 0x65 else fail("T1 byte 1: expected 'e'=0x65, got=${dut.out_data:02x}")
+        wait 1 cycle   // lit_len 4→3
+
+        dut.in_data = 0x6C   // 'l'
+        assert dut.out_data == 0x6C else fail("T1 byte 2: expected 'l'=0x6C, got=${dut.out_data:02x}")
+        wait 1 cycle   // lit_len 3→2
+
+        dut.in_data = 0x6C   // 'l'
+        assert dut.out_data == 0x6C else fail("T1 byte 3: expected 'l'=0x6C, got=${dut.out_data:02x}")
+        wait 1 cycle   // lit_len 2→1
+
+        // Last literal: assert in_last to signal end-of-block.
+        dut.in_data  = 0x6F   // 'o'
+        dut.in_last  = 1
+        assert dut.out_data == 0x6F else fail("T1 byte 4: expected 'o'=0x6F, got=${dut.out_data:02x}")
+        wait 1 cycle   // lit_len 1→0, last_flag set → S_DONE
+
+        dut.in_valid = 0
+        dut.in_last  = 0
+
+        // done should be 1 now (S_DONE is terminal, combinational done=1).
+        assert dut.done == 1 else fail("T1: done not asserted after last literal")
+        log(info, "PASS: Test 1 — 'Hello' decompressed correctly")
+
+        // ── Test 2: "AABBAABB" (4 literals + 4-byte match) ───────────────
+        dut.rst      = 1
+        dut.in_valid = 0
+        dut.in_data  = 0
+        dut.in_last  = 0
+        wait 3 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        log(info, "=== Test 2: 'AABBAABB' (literals + match) ===")
+
+        // Token 0x40: lit_nibble=4, match_nibble=0 → match_len=4.
+        dut.in_valid = 1
+        dut.in_data  = 0x40
+        wait 1 cycle   // → S_LIT, lit_len=4, match_nibble_r=0
+
+        // 4 literal bytes: A A B B.
+        dut.in_data = 0x41   // 'A'
+        assert dut.out_data == 0x41 else fail("T2 lit 0: expected 'A'=0x41, got=${dut.out_data:02x}")
+        wait 1 cycle   // lit 4→3
+
+        dut.in_data = 0x41   // 'A'
+        assert dut.out_data == 0x41 else fail("T2 lit 1: expected 'A'=0x41, got=${dut.out_data:02x}")
+        wait 1 cycle   // lit 3→2
+
+        dut.in_data = 0x42   // 'B'
+        assert dut.out_data == 0x42 else fail("T2 lit 2: expected 'B'=0x42, got=${dut.out_data:02x}")
+        wait 1 cycle   // lit 2→1
+
+        dut.in_data = 0x42   // 'B' (last literal before offset)
+        assert dut.out_data == 0x42 else fail("T2 lit 3: expected 'B'=0x42, got=${dut.out_data:02x}")
+        wait 1 cycle   // lit 1→0 → S_OFFLO; wr_ptr=4
+
+        // Match offset LE 0x04 0x00 (offset=4, copy back 4 bytes = "AABB").
+        dut.in_data = 0x04   // offset low
+        wait 1 cycle   // → S_OFFHI, off_lo=4
+
+        dut.in_data = 0x00   // offset high (in_last=1 → last input byte)
+        dut.in_last = 1
+        wait 1 cycle   // → S_MATCH; rd_ptr=0, match_len=4, last_flag=1
+
+        dut.in_valid = 0
+        dut.in_last  = 0
+
+        // Match bytes: history = [A, A, B, B] at indices 0..3.
+        // After each wait 1 cycle the previous byte was consumed and
+        // rd_ptr has already incremented; out_data reflects the NEXT byte.
+        assert dut.out_data == 0x41 else fail("T2 match 0: expected 'A'=0x41, got=${dut.out_data:02x}")
+        wait 1 cycle   // rd_ptr 0→1, wr_ptr 4→5, match_len 4→3
+
+        assert dut.out_data == 0x41 else fail("T2 match 1: expected 'A'=0x41, got=${dut.out_data:02x}")
+        wait 1 cycle   // rd_ptr 1→2, wr_ptr 5→6, match_len 3→2
+
+        assert dut.out_data == 0x42 else fail("T2 match 2: expected 'B'=0x42, got=${dut.out_data:02x}")
+        wait 1 cycle   // rd_ptr 2→3, wr_ptr 6→7, match_len 2→1
+
+        assert dut.out_data == 0x42 else fail("T2 match 3: expected 'B'=0x42, got=${dut.out_data:02x}")
+        wait 1 cycle   // rd_ptr 3→4, wr_ptr 7→8, match_len 1→0 → S_DONE
+
+        assert dut.done == 1 else fail("T2: done not asserted after match")
+        log(info, "PASS: Test 2 — 'AABBAABB' decompressed correctly")
+
+        // ── Test 3: 16 A's (offset=1 self-referential match) ─────────────
+        dut.rst      = 1
+        dut.in_valid = 0
+        dut.in_data  = 0
+        dut.in_last  = 0
+        wait 3 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        log(info, "=== Test 3: 16 A's (run-length via offset=1 match) ===")
+
+        // Token 0x48: lit_nibble=4, match_nibble=8 → match_len=12.
+        dut.in_valid = 1
+        dut.in_data  = 0x48
+        wait 1 cycle   // → S_LIT, lit_len=4, match_nibble_r=8
+
+        // 4 literal 'A' bytes.
+        dut.in_data = 0x41
+        assert dut.out_data == 0x41 else fail("T3 lit 0: expected 'A'")
+        wait 1 cycle
+
+        dut.in_data = 0x41
+        assert dut.out_data == 0x41 else fail("T3 lit 1: expected 'A'")
+        wait 1 cycle
+
+        dut.in_data = 0x41
+        assert dut.out_data == 0x41 else fail("T3 lit 2: expected 'A'")
+        wait 1 cycle
+
+        dut.in_data = 0x41
+        assert dut.out_data == 0x41 else fail("T3 lit 3: expected 'A'")
+        wait 1 cycle   // → S_OFFLO; wr_ptr=4
+
+        // Match offset LE 0x01 0x00 (offset=1).
+        dut.in_data = 0x01   // offset low
+        wait 1 cycle   // → S_OFFHI, off_lo=1
+
+        dut.in_data = 0x00   // offset high
+        dut.in_last = 1
+        wait 1 cycle   // → S_MATCH; rd_ptr=4-1=3, match_len=12, last_flag=1
+
+        dut.in_valid = 0
+        dut.in_last  = 0
+
+        // 12 match bytes, each should be 'A' (0x41).
+        // Offset=1: rd_ptr stays 1 behind wr_ptr, so every read sees the
+        // most recently written 'A', which was itself copied from an 'A'.
+        for i in 0 .. 12
+            assert dut.out_data == 0x41
+                else fail("T3 match ${i}: expected 'A'=0x41, got=${dut.out_data:02x}")
+            wait 1 cycle
+        end for
+        // After loop: match_len reached 0 → S_DONE.
+
+        assert dut.done == 1 else fail("T3: done not asserted after 12 match bytes")
+        log(info, "PASS: Test 3 — 16 A's decompressed correctly")
+
+        log(info, "ALL TESTS PASSED")
+    end run
+end impl Lz4DecompTest

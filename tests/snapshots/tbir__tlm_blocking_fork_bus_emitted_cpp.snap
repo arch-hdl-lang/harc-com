@@ -148,7 +148,7 @@ int run_TlmMethodBlockingForkBusTest(int argc, char** argv) {
     TlmMethodBlockingForkBusTb _tb;
     harc_rt::ThreadSlot _run_slot;
     sched.slots.push_back(&_run_slot);
-    _run_slot.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
+    auto _run_body = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
         _tb.dut = dut;
         { // run_TlmMethodBlockingForkBusTest (TB-IR loop-switch)
             uint64_t forked = 0; (void)forked;
@@ -158,18 +158,26 @@ int run_TlmMethodBlockingForkBusTest(int argc, char** argv) {
                 switch (__bb) {
                 case 0: {
                     harc_rt::harc_assign(dut->rst, 1);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->mem_read_req_valid, 0);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->mem_read_rsp_ready, 0);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->mem_read_ooo_req_valid, 0);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->mem_read_ooo_rsp_ready, 0);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->mem_poke_req_valid, 0);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->mem_poke_rsp_ready, 0);
+                    dut->eval_comb();
                     co_await harc_rt::wait_cycles(_slot, (uint32_t)(2));
                     __bb = 1;
                     break;
                 }
                 case 1: {
                     harc_rt::harc_assign(dut->rst, 0);
+                    dut->eval_comb();
                     co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
                     __bb = 2;
                     break;
@@ -202,7 +210,8 @@ int run_TlmMethodBlockingForkBusTest(int argc, char** argv) {
             }
         }
         co_return;
-    }(&_run_slot);
+    };
+    _run_slot.thread = _run_body(&_run_slot);
 
     // Resume each coroutine once so initial-setup statements run
     // before the first clock edge. Single-threaded — workers

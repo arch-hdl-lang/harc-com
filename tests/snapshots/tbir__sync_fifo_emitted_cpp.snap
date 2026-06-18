@@ -204,7 +204,7 @@ int run_SyncFifoTest(int argc, char** argv) {
     });
     harc_rt::ThreadSlot _run_slot;
     sched.slots.push_back(&_run_slot);
-    _run_slot.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
+    auto _run_body = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
         _tb.dut = dut;
         { // run_SyncFifoTest (TB-IR loop-switch)
             uint64_t i = 0; (void)i;
@@ -216,9 +216,13 @@ int run_SyncFifoTest(int argc, char** argv) {
                 switch (__bb) {
                 case 0: {
                     harc_rt::harc_assign(dut->rst, 1);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->push_valid, 0);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->pop_ready, 0);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->push_data, 0);
+                    dut->eval_comb();
                     co_await harc_rt::wait_cycles(_slot, (uint32_t)(2));
                     __bb = 1;
                     break;
@@ -234,6 +238,7 @@ int run_SyncFifoTest(int argc, char** argv) {
                     }
                     sim_log_line("INFO", "PASS: reset Ã¢ÂÂ empty FIFO");
                     harc_rt::harc_assign(dut->rst, 0);
+                    dut->eval_comb();
                     i = 0;
                     __bb = 2;
                     break;
@@ -244,8 +249,11 @@ int run_SyncFifoTest(int argc, char** argv) {
                 }
                 case 3: {
                     harc_rt::harc_assign(dut->push_valid, 1);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->push_data, (i + 1));
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->pop_ready, 0);
+                    dut->eval_comb();
                     if (!((harc_rt::harc_read(dut->push_ready) == 1))) {
                         sim_log_line("FAIL", "FIFO unexpectedly full at push %lld", harc_rt::harc_printf_ll(i));
                         ctx.errors++;
@@ -261,6 +269,7 @@ int run_SyncFifoTest(int argc, char** argv) {
                 }
                 case 5: {
                     harc_rt::harc_assign(dut->push_valid, 0);
+                    dut->eval_comb();
                     co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
                     __bb = 7;
                     break;
@@ -289,6 +298,7 @@ int run_SyncFifoTest(int argc, char** argv) {
                 }
                 case 9: {
                     harc_rt::harc_assign(dut->pop_ready, 1);
+                    dut->eval_comb();
                     if (!((harc_rt::harc_read(dut->pop_valid) == 1))) {
                         sim_log_line("FAIL", "pop_valid unexpectedly low at pop %lld", harc_rt::harc_printf_ll(i_2));
                         ctx.errors++;
@@ -309,6 +319,7 @@ int run_SyncFifoTest(int argc, char** argv) {
                 }
                 case 11: {
                     harc_rt::harc_assign(dut->pop_ready, 0);
+                    dut->eval_comb();
                     co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
                     __bb = 13;
                     break;
@@ -353,7 +364,8 @@ int run_SyncFifoTest(int argc, char** argv) {
             }
         }
         co_return;
-    }(&_run_slot);
+    };
+    _run_slot.thread = _run_body(&_run_slot);
 
     // Resume each coroutine once so initial-setup statements run
     // before the first clock edge. Single-threaded — workers

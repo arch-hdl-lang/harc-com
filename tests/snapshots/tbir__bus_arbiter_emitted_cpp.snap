@@ -216,7 +216,7 @@ int run_BusArbiterTest(int argc, char** argv) {
     });
     harc_rt::ThreadSlot _run_slot;
     sched.slots.push_back(&_run_slot);
-    _run_slot.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
+    auto _run_body = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
         _tb.dut = dut;
         { // run_BusArbiterTest (TB-IR loop-switch)
             int __bb = 0;
@@ -225,14 +225,18 @@ int run_BusArbiterTest(int argc, char** argv) {
                 switch (__bb) {
                 case 0: {
                     harc_rt::harc_assign(dut->rst, 1);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->request_valid, 0);
+                    dut->eval_comb();
                     co_await harc_rt::wait_cycles(_slot, (uint32_t)(2));
                     __bb = 1;
                     break;
                 }
                 case 1: {
                     harc_rt::harc_assign(dut->rst, 0);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->request_valid, 1);
+                    dut->eval_comb();
                     co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
                     __bb = 2;
                     break;
@@ -248,6 +252,7 @@ int run_BusArbiterTest(int argc, char** argv) {
                     }
                     sim_log_line("INFO", "PASS: single requester 0 granted");
                     harc_rt::harc_assign(dut->request_valid, 4);
+                    dut->eval_comb();
                     co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
                     __bb = 3;
                     break;
@@ -263,6 +268,7 @@ int run_BusArbiterTest(int argc, char** argv) {
                     }
                     sim_log_line("INFO", "PASS: single requester 2 granted");
                     harc_rt::harc_assign(dut->request_valid, 0);
+                    dut->eval_comb();
                     co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
                     __bb = 4;
                     break;
@@ -311,7 +317,8 @@ int run_BusArbiterTest(int argc, char** argv) {
             }
         }
         co_return;
-    }(&_run_slot);
+    };
+    _run_slot.thread = _run_body(&_run_slot);
 
     // Resume each coroutine once so initial-setup statements run
     // before the first clock edge. Single-threaded — workers

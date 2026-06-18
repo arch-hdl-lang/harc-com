@@ -230,7 +230,7 @@ int run_TlmTargetThreadIfTest(int argc, char** argv) {
     }(&_target_read_target_slot);
     harc_rt::ThreadSlot _run_slot;
     sched.slots.push_back(&_run_slot);
-    _run_slot.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
+    auto _run_body = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
         _tb.dut = dut;
         { // run_TlmTargetThreadIfTest (TB-IR loop-switch)
             uint64_t __t0 = 0; (void)__t0;
@@ -240,12 +240,14 @@ int run_TlmTargetThreadIfTest(int argc, char** argv) {
                 switch (__bb) {
                 case 0: {
                     harc_rt::harc_assign(dut->rst, 1);
+                    dut->eval_comb();
                     co_await harc_rt::wait_cycles(_slot, (uint32_t)(2));
                     __bb = 1;
                     break;
                 }
                 case 1: {
                     harc_rt::harc_assign(dut->rst, 0);
+                    dut->eval_comb();
                     __t0 = 80;
                     int64_t _wu_budget = (int64_t)(__t0);
                     bool _wu_satisfied = co_await harc_rt::wait_until_timeout(_slot, [&]{ return (harc_rt::harc_read(dut->done) == 1); }, (uint32_t)_wu_budget);
@@ -286,7 +288,8 @@ int run_TlmTargetThreadIfTest(int argc, char** argv) {
             }
         }
         co_return;
-    }(&_run_slot);
+    };
+    _run_slot.thread = _run_body(&_run_slot);
 
     // Resume each coroutine once so initial-setup statements run
     // before the first clock edge. Single-threaded — workers

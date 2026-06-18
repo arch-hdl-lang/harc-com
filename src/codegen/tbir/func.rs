@@ -890,6 +890,10 @@ fn emit_stmt(
             let val = expr_cpp(cx, e)?;
             writeln!(out, "{pad}dut->rootp->{base}_drv = {val};").ok();
             writeln!(out, "{pad}dut->rootp->{base}_en = 1;").ok();
+            // Propagate the forced value through comb so same-segment reads
+            // see the updated output immediately (matches RTL semantics where
+            // a driven input combinationally flows to outputs).
+            writeln!(out, "{pad}dut->eval_comb();").ok();
         }
         Stmt::DutWrite(p, e) => {
             let sig = port_signal(cx, p);
@@ -935,6 +939,10 @@ fn emit_stmt(
                     }
                 }
             }
+            // Re-evaluate combinational logic so reads within the same
+            // basic block see the updated output immediately (same-cycle
+            // comb pass-through semantics of HARC's timing model).
+            writeln!(out, "{pad}dut->eval_comb();").ok();
         }
         Stmt::DutRead(l, p) => {
             let name = &names[l.index()];

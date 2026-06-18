@@ -196,7 +196,7 @@ int run_RomLutTest(int argc, char** argv) {
     });
     harc_rt::ThreadSlot _run_slot;
     sched.slots.push_back(&_run_slot);
-    _run_slot.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
+    auto _run_body = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
         _tb.dut = dut;
         { // run_RomLutTest (TB-IR loop-switch)
             uint64_t __t0 = 0; (void)__t0;
@@ -221,7 +221,9 @@ int run_RomLutTest(int argc, char** argv) {
                 switch (__bb) {
                 case 0: {
                     harc_rt::harc_assign(dut->rd_addr, 0);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->rd_en, 0);
+                    dut->eval_comb();
                     co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
                     __bb = 1;
                     break;
@@ -230,7 +232,9 @@ int run_RomLutTest(int argc, char** argv) {
                     __t0 = 0;
                     addr = 0;
                     harc_rt::harc_assign(dut->rd_addr, addr);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->rd_en, 1);
+                    dut->eval_comb();
                     for (int _w = 0; _w < 1; _w++) tick();
                     __bb = 3;
                     break;
@@ -243,7 +247,9 @@ int run_RomLutTest(int argc, char** argv) {
                     __t1 = 0;
                     addr_2 = 1;
                     harc_rt::harc_assign(dut->rd_addr, addr_2);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->rd_en, 1);
+                    dut->eval_comb();
                     for (int _w = 0; _w < 1; _w++) tick();
                     __bb = 5;
                     break;
@@ -261,7 +267,9 @@ int run_RomLutTest(int argc, char** argv) {
                     __t2 = 0;
                     addr_3 = 2;
                     harc_rt::harc_assign(dut->rd_addr, addr_3);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->rd_en, 1);
+                    dut->eval_comb();
                     for (int _w = 0; _w < 1; _w++) tick();
                     __bb = 7;
                     break;
@@ -279,7 +287,9 @@ int run_RomLutTest(int argc, char** argv) {
                     __t3 = 0;
                     addr_4 = 3;
                     harc_rt::harc_assign(dut->rd_addr, addr_4);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->rd_en, 1);
+                    dut->eval_comb();
                     for (int _w = 0; _w < 1; _w++) tick();
                     __bb = 9;
                     break;
@@ -297,7 +307,9 @@ int run_RomLutTest(int argc, char** argv) {
                     __t4 = 0;
                     addr_5 = 4;
                     harc_rt::harc_assign(dut->rd_addr, addr_5);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->rd_en, 1);
+                    dut->eval_comb();
                     for (int _w = 0; _w < 1; _w++) tick();
                     __bb = 11;
                     break;
@@ -315,7 +327,9 @@ int run_RomLutTest(int argc, char** argv) {
                     __t5 = 0;
                     addr_6 = 5;
                     harc_rt::harc_assign(dut->rd_addr, addr_6);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->rd_en, 1);
+                    dut->eval_comb();
                     for (int _w = 0; _w < 1; _w++) tick();
                     __bb = 13;
                     break;
@@ -333,7 +347,9 @@ int run_RomLutTest(int argc, char** argv) {
                     __t6 = 0;
                     addr_7 = 6;
                     harc_rt::harc_assign(dut->rd_addr, addr_7);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->rd_en, 1);
+                    dut->eval_comb();
                     for (int _w = 0; _w < 1; _w++) tick();
                     __bb = 15;
                     break;
@@ -351,7 +367,9 @@ int run_RomLutTest(int argc, char** argv) {
                     __t7 = 0;
                     addr_8 = 7;
                     harc_rt::harc_assign(dut->rd_addr, addr_8);
+                    dut->eval_comb();
                     harc_rt::harc_assign(dut->rd_en, 1);
+                    dut->eval_comb();
                     for (int _w = 0; _w < 1; _w++) tick();
                     __bb = 17;
                     break;
@@ -402,7 +420,8 @@ int run_RomLutTest(int argc, char** argv) {
             }
         }
         co_return;
-    }(&_run_slot);
+    };
+    _run_slot.thread = _run_body(&_run_slot);
 
     // Resume each coroutine once so initial-setup statements run
     // before the first clock edge. Single-threaded — workers

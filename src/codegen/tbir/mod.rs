@@ -1340,9 +1340,13 @@ fn emit_test(
 
     writeln!(out, "{INDENT}harc_rt::ThreadSlot _run_slot;").ok();
     writeln!(out, "{INDENT}sched.slots.push_back(&_run_slot);").ok();
+    // Named variable (not IIFE) so the closure object lives for the entire
+    // duration of the test function. The coroutine frame stores `this` =
+    // address of the closure; an IIFE temporary would go out of scope
+    // immediately and leave a dangling pointer in the coroutine frame.
     writeln!(
         out,
-        "{INDENT}_run_slot.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+        "{INDENT}auto _run_body = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
     )
     .ok();
     if !tb.synthetic {
@@ -1373,7 +1377,8 @@ fn emit_test(
         )?;
     }
     writeln!(out, "{INDENT}{INDENT}co_return;").ok();
-    writeln!(out, "{INDENT}}}(&_run_slot);").ok();
+    writeln!(out, "{INDENT}}};").ok();
+    writeln!(out, "{INDENT}_run_slot.thread = _run_body(&_run_slot);").ok();
 
     runtime::drive_loop(out, clocked);
     runtime::run_epilogue(out);

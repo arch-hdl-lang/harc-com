@@ -2371,9 +2371,13 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         // since the test is over.
         writeln!(e.out, "{INDENT}harc_rt::ThreadSlot _run_slot;").ok();
         writeln!(e.out, "{INDENT}sched.slots.push_back(&_run_slot);").ok();
+        // Named variable (not IIFE) so the closure object lives for the entire
+        // duration of the test function. The coroutine frame stores `this` =
+        // address of the closure; an IIFE temporary would go out of scope
+        // immediately and leave a dangling pointer in the coroutine frame.
         writeln!(
             e.out,
-            "{INDENT}_run_slot.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+            "{INDENT}auto _run_body = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
         )
         .ok();
 
@@ -2401,7 +2405,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         e.in_coroutine = false;
 
         writeln!(e.out, "{INDENT}{INDENT}co_return;").ok();
-        writeln!(e.out, "{INDENT}}}(&_run_slot);").ok();
+        writeln!(e.out, "{INDENT}}};").ok();
+        writeln!(e.out, "{INDENT}_run_slot.thread = _run_body(&_run_slot);").ok();
         writeln!(e.out, "").ok();
 
         // `actor_threads` is populated only when `--mt` is set (cooperative
