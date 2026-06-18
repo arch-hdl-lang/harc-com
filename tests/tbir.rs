@@ -3208,6 +3208,143 @@ end impl XtWaitUntilSelfCallTest
     );
 }
 
+/// A transactor method that calls itself lowers to a synchronous
+/// self-recursive `std::function` lambda, which overflows the C++ stack
+/// at runtime. Lowering must reject the cycle with a clear diagnostic
+/// rather than emit a crashing binary.
+#[test]
+fn transactor_method_direct_self_recursion_is_rejected() {
+    let src = r#"
+transactor Xt
+    dut : Top
+
+    when active
+        hookable idle()
+            dut.en = 0
+            wait 1 cycle
+            idle()
+        end idle
+    end when
+end transactor Xt
+
+testbench XtTb
+    dut : Top
+    xt  : Xt active
+end testbench XtTb
+
+impl XtSelfRecursionTest for XtTb
+    run
+        xt.dut = dut
+        xt.idle()
+    end run
+end impl XtSelfRecursionTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)),
+        "expected LowerError::Invalid for self-recursion: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("recursive method-call cycle") && msg.contains("idle -> idle"),
+        "diagnostic should name the cycle: {msg}"
+    );
+}
+
+/// Mutual recursion between two transactor methods (`a -> b -> a`) is
+/// the same hazard as direct self-recursion and must also be rejected,
+/// with the full cycle rendered in the diagnostic.
+#[test]
+fn transactor_method_mutual_recursion_is_rejected() {
+    let src = r#"
+transactor Xt
+    dut : Top
+
+    when active
+        hookable ping()
+            dut.en = 1
+            wait 1 cycle
+            pong()
+        end ping
+
+        hookable pong()
+            dut.en = 0
+            wait 1 cycle
+            ping()
+        end pong
+    end when
+end transactor Xt
+
+testbench XtTb
+    dut : Top
+    xt  : Xt active
+end testbench XtTb
+
+impl XtMutualRecursionTest for XtTb
+    run
+        xt.dut = dut
+        xt.ping()
+    end run
+end impl XtMutualRecursionTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)),
+        "expected LowerError::Invalid for mutual recursion: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("recursive method-call cycle")
+            && msg.contains("ping")
+            && msg.contains("pong"),
+        "diagnostic should render the ping/pong cycle: {msg}"
+    );
+}
+
+/// A non-recursive sibling-call chain (`a -> b -> c`, no back-edge) must
+/// still lower cleanly — the cycle guard must not over-reject legitimate
+/// transactor-method composition.
+#[test]
+fn transactor_method_acyclic_sibling_chain_is_accepted() {
+    let src = r#"
+transactor Xt
+    dut : Top
+
+    when active
+        hookable low()
+            dut.en = 0
+            wait 1 cycle
+        end low
+
+        hookable mid()
+            dut.en = 1
+            wait 1 cycle
+            low()
+        end mid
+
+        hookable high()
+            dut.en = 1
+            mid()
+        end high
+    end when
+end transactor Xt
+
+testbench XtTb
+    dut : Top
+    xt  : Xt active
+end testbench XtTb
+
+impl XtAcyclicChainTest for XtTb
+    run
+        xt.dut = dut
+        xt.high()
+    end run
+end impl XtAcyclicChainTest
+"#;
+    let prog = lower_src(src).expect("acyclic sibling chain lowers");
+    verify::verify_program(&prog).expect("verifies");
+}
+
 #[test]
 fn testbench_helper_wrapper_can_call_active_transactor_method() {
     let src = r#"
