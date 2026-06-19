@@ -727,11 +727,20 @@ impl FuncBuilder<'_> {
         // record-typed RHS opts in here).
         let record_ty =
             self.expr_type(&e).filter(|t| matches!(t, IrType::Record(_)));
+        // Untyped wide-scalar RHS (`let t96 = s128.trunc<96>()`): when the
+        // RHS infers to a >64-bit `uint`/`sint`, propagate that width so the
+        // local declares as `_harc_u128` (`local_scalar_cty`) rather than
+        // silently clamping to `uint64_t`. Mirrors v1's `auto t96 = ...`,
+        // whose deduced type is `_harc_u128`. ≤64-bit RHS keeps the existing
+        // `uint64_t` default untouched.
+        let wide_scalar_ty = self.expr_type(&e).filter(|t| {
+            matches!(t, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 64)
+        });
         let id = self.declare(&l.name.name);
         if let Some(w) = declared_width {
             self.let_widths.insert(id, w);
         }
-        if let Some(ty) = record_ty.or(declared_scalar_ty) {
+        if let Some(ty) = record_ty.or(declared_scalar_ty).or(wide_scalar_ty) {
             self.set_local_type(id, ty);
         }
         self.push(Stmt::Assign(id, e));
