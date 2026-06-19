@@ -581,6 +581,11 @@ fn for_each_port_in_expr(e: &ir::Expr, f: &mut impl FnMut(&ir::PortRef)) {
     use ir::Expr::*;
     match e {
         Port(p) => f(p),
+        RecordField { index, .. } => {
+            if let Some(i) = index {
+                for_each_port_in_expr(i, f);
+            }
+        }
         Binary(_, a, b) => {
             for_each_port_in_expr(a, f);
             for_each_port_in_expr(b, f);
@@ -593,6 +598,7 @@ fn for_each_port_in_expr(e: &ir::Expr, f: &mut impl FnMut(&ir::PortRef)) {
             for_each_port_in_expr(b, f);
         }
         WidthCast { inner, .. } => for_each_port_in_expr(inner, f),
+        SeqIndex { index, .. } => for_each_port_in_expr(index, f),
         Call(_, args) => args.iter().for_each(|a| for_each_port_in_expr(a, f)),
         ComponentIdle { n, .. } => for_each_port_in_expr(n, f),
         _ => {}

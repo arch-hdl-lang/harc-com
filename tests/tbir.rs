@@ -4112,6 +4112,48 @@ end impl RemapTest
     assert_eq!(binding.wire_name("read", "addr"), "mem_read_addr");
 }
 
+/// Regression for PR #424: the gated-bus access scan must recurse into
+/// indexed aggregate reads too, not just top-level expressions. Without
+/// this, a gated-OFF plain bus signal used as a `Vec` index slips
+/// through emit-time validation and the generated C++ references a DUT
+/// port `arch build` omitted.
+#[test]
+fn gated_bus_access_in_record_index_is_rejected() {
+    let src = r#"
+bus GatedIdxBus
+    param EN: const = 0;
+    generate_if EN
+        idx: in uint<8>;
+    end generate_if
+end bus GatedIdxBus
+
+transaction Packet
+    data : Vec<uint<8>, 4>
+end transaction Packet
+
+testbench GateTb
+    dut : Top
+end testbench GateTb
+
+impl GatedIdxTest for GateTb
+    let b : GatedIdxBus = bind dut
+    run
+        let p : Packet
+        let v = p.data[b.idx]
+        assert v == 0 else fail("v=${v}")
+    end run
+end impl GatedIdxTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let err = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).unwrap_err();
+    assert!(
+        err.to_string().contains("signal `idx` is gated OFF"),
+        "expected gated-OFF diagnostic for nested record index: {err}"
+    );
+}
+
 /// A remap path must be exactly `<channel>.<signal>` (2 segments) —
 /// a single- or 3+-segment path is a hard lowering error, matching
 /// v1's `bind ... with` translation.
