@@ -1019,25 +1019,19 @@ impl FuncBuilder<'_> {
                 if let Some(local) = self.lookup(&root.name) {
                     if let Some(rid) = self.record_of_local(local) {
                         let schema = &self.ctx.records[rid.index()];
-                        let Some(fld) = schema.field(&name.name) else {
+                        if schema.field(&name.name).is_none() {
                             return Err(LowerError::Invalid(format!(
                                 "transaction `{}` has no field `{}`",
                                 schema.name, name.name
                             )));
-                        };
-                        // A whole-`Vec` field write (`rec.data = ...`)
-                        // would need an array-copy value, which this
-                        // subset has no expression for; only element
-                        // writes (handled above) are lowered.
-                        if fld.vec_len.is_some() {
-                            return Err(unsupported(
-                                &format!(
-                                    "a whole-`Vec` write of record field `{}.{}`",
-                                    schema.name, name.name
-                                ),
-                                "assign the field element-wise (`{rec}.{field}[i] = ...`)",
-                            ));
                         }
+                        // A whole-`Vec` field write (`rec.data = other.data`)
+                        // lowers to `Stmt::RecordFieldWrite { index: None }`
+                        // — the tbir backend renders it as `name.field = e`,
+                        // a plain `std::array` copy, mirroring v1's C++
+                        // member assignment. The RHS is a whole-`Vec` read
+                        // (another record's field), lowered above. (Element
+                        // writes `rec.data[i] = v` are handled earlier.)
                         let e = self.lower_expr_no_ports(value)?;
                         self.push(Stmt::RecordFieldWrite {
                             local,

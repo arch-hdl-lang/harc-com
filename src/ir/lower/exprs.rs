@@ -196,24 +196,18 @@ impl FuncBuilder<'_> {
                     if let Some(local) = self.lookup(&root.name) {
                         if let Some(rid) = self.record_of_local(local) {
                             let schema = &self.ctx.records[rid.index()];
-                            let Some(fld) = schema.field(&name.name) else {
+                            if schema.field(&name.name).is_none() {
                                 return Err(LowerError::Invalid(format!(
                                     "transaction `{}` has no field `{}`",
                                     schema.name, name.name
                                 )));
-                            };
-                            // A whole-`Vec` field read has no scalar
-                            // value; only element access (`rec.data[i]`,
-                            // handled in the `Index` arm) is lowered.
-                            if fld.vec_len.is_some() {
-                                return Err(unsupported(
-                                    &format!(
-                                        "a whole-`Vec` read of record field `{}.{}`",
-                                        schema.name, name.name
-                                    ),
-                                    "index the field element-wise (`{rec}.{field}[i]`)",
-                                ));
                             }
+                            // A whole-`Vec` field read (`rec.data`) lowers
+                            // to `Expr::RecordField { index: None }` — the
+                            // tbir backend renders it as `name.field`, the
+                            // whole `std::array` member, mirroring v1's
+                            // plain C++ member access. (Element access
+                            // `rec.data[i]` is handled in the `Index` arm.)
                             return Ok(Expr::RecordField {
                                 local,
                                 field: name.name.clone(),
