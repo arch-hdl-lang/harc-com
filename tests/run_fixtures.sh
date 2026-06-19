@@ -41,6 +41,7 @@ wait_until_counter_test | Top            | top_counter.sv         |
 after_cycles_test       | Top            | top_counter.sv         |
 watchdog_quiesce_test   | Top            | top_counter.sv         |
 agent_periodic_test     | Top            | top_counter.sv         |
+component_method_randomize_test | Top     | top_counter.sv         |
 env_quiesced_phase_test | Top            | top_counter.sv         |
 testbench_basic_test    | Top            | top_counter.sv         | | | TestbenchSmoke
 testbench_basic_test    | Top            | top_counter.sv         | | | TestbenchEnableToggle

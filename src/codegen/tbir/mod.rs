@@ -1303,7 +1303,7 @@ fn emit_test(
             func::declare_method_slot(out, prog, schema, m, 1)?;
         }
         for m in &schema.methods {
-            func::emit_method(out, prog, schema, m, 1)?;
+            func::emit_method(out, prog, schema, m, randomize_snippets, 1)?;
         }
     }
     // Bound-to target-side TLM responder instances: one per-instance
@@ -1327,19 +1327,19 @@ fn emit_test(
     for ci in component_emit_order(prog) {
         let comp = &prog.components[ci];
         for m in &comp.methods {
-            func::emit_component_method(out, prog, comp, m, 1)?;
+            func::emit_component_method(out, prog, comp, m, randomize_snippets, 1)?;
         }
         for oh in &comp.on_handlers {
-            func::emit_component_on_handler(out, prog, comp, oh, 1)?;
+            func::emit_component_on_handler(out, prog, comp, oh, randomize_snippets, 1)?;
         }
         for ph in &comp.periodic_handlers {
-            func::emit_component_periodic_handler(out, prog, comp, ph, 1)?;
+            func::emit_component_periodic_handler(out, prog, comp, ph, randomize_snippets, 1)?;
         }
         for ch in &comp.cycle_handlers {
-            func::emit_component_cycle_handler(out, prog, comp, ch, 1)?;
+            func::emit_component_cycle_handler(out, prog, comp, ch, randomize_snippets, 1)?;
         }
         if let Some(w) = &comp.watchdog {
-            func::emit_component_watchdog(out, prog, comp, w, 1)?;
+            func::emit_component_watchdog(out, prog, comp, w, randomize_snippets, 1)?;
         }
     }
     // Composite-component test-scope instances (`let env : AnalysisEnv`):

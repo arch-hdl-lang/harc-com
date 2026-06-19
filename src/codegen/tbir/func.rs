@@ -1696,6 +1696,7 @@ pub(super) fn emit_method(
     prog: &TbProgram,
     schema: &TransactorSchema,
     m: &TransactorMethodSchema,
+    randomize_snippets: &[String],
     depth: usize,
 ) -> Result<(), EmitError> {
     let func = prog.function(m.function);
@@ -1818,17 +1819,38 @@ pub(super) fn emit_method(
                     }
                 }
             }
+            Terminator::Randomize {
+                target,
+                constraints,
+                succ,
+            } => {
+                // Same Z3-solve splice as the test/tseq paths: a method
+                // body's `randomize(t)` lowers to a `ConstraintSite` in
+                // the shared table, so its snippet is already built by
+                // `cpp_tb::emit_randomize_snippets`. Method-body sites
+                // carry no problem-id (the constraint-IR problem table
+                // only catalogs test/tseq spans, in BOTH codegens), so
+                // the snippet uses v1's nullptr-descriptor solve path —
+                // identical bytes to v1's method-body emission.
+                let snippet =
+                    randomize_snippet_for(prog, &names, *target, *constraints, randomize_snippets)
+                        .ok_or_else(|| {
+                            EmitError(format!(
+                                "tbir: Randomize in method {} references missing constraint \
+                                 snippet c{}",
+                                func.name, constraints.0
+                            ))
+                        })?;
+                out.push_str(&snippet);
+                writeln!(out, "{pad3}__bb = {};", succ.0).ok();
+            }
             other @ (Terminator::WaitCycles(_, Some(_), _)
             | Terminator::WaitCyclesSync(_, _)
             | Terminator::WaitTimePs(_, _)
             | Terminator::WaitUntilTimeout { .. }
-            | Terminator::Randomize { .. }
             | Terminator::Fatal(_)) => {
                 // Lowering rejects these inside method bodies (or, for
-                // Fatal, never produces the terminator at all). A
-                // `randomize` in a method body is out of subset — the
-                // constraint-IR problem table only catalogs test/tseq
-                // sites, so a method-body solve has no problem-id.
+                // Fatal, never produces the terminator at all).
                 return Err(EmitError(format!(
                     "tbir: transactor method `{}` contains terminator {other:?} — \
                      lowering gate failed",
@@ -1861,10 +1883,11 @@ pub(super) fn emit_component_method(
     prog: &TbProgram,
     comp: &crate::ir::ComponentSchema,
     m: &crate::ir::ComponentMethodSchema,
+    randomize_snippets: &[String],
     depth: usize,
 ) -> Result<(), EmitError> {
     let lambda = format!("{}_{}", comp.name, m.name);
-    emit_component_fn_lambda(out, prog, comp, m.function, &lambda, depth)
+    emit_component_fn_lambda(out, prog, comp, m.function, &lambda, randomize_snippets, depth)
 }
 
 /// Emit one `on <ev>(arg)` handler body as a free
@@ -1876,10 +1899,11 @@ pub(super) fn emit_component_on_handler(
     prog: &TbProgram,
     comp: &crate::ir::ComponentSchema,
     oh: &crate::ir::OnHandlerSchema,
+    randomize_snippets: &[String],
     depth: usize,
 ) -> Result<(), EmitError> {
     let lambda = on_handler_lambda_name(comp, oh);
-    emit_component_fn_lambda(out, prog, comp, oh.function, &lambda, depth)
+    emit_component_fn_lambda(out, prog, comp, oh.function, &lambda, randomize_snippets, depth)
 }
 
 /// The free-lambda name for an on-handler (`<Comp>_on_h<fid>`).
@@ -1898,10 +1922,11 @@ pub(super) fn emit_component_periodic_handler(
     prog: &TbProgram,
     comp: &crate::ir::ComponentSchema,
     ph: &crate::ir::PeriodicHandlerSchema,
+    randomize_snippets: &[String],
     depth: usize,
 ) -> Result<(), EmitError> {
     let lambda = periodic_handler_lambda_name(comp, ph);
-    emit_component_fn_lambda(out, prog, comp, ph.function, &lambda, depth)
+    emit_component_fn_lambda(out, prog, comp, ph.function, &lambda, randomize_snippets, depth)
 }
 
 /// The free-lambda name for a periodic handler (`<Comp>_periodic_h<fid>`).
@@ -1922,10 +1947,11 @@ pub(super) fn emit_component_cycle_handler(
     prog: &TbProgram,
     comp: &crate::ir::ComponentSchema,
     ch: &crate::ir::CycleTriggerHandlerSchema,
+    randomize_snippets: &[String],
     depth: usize,
 ) -> Result<(), EmitError> {
     let lambda = cycle_handler_lambda_name(comp, ch);
-    emit_component_fn_lambda(out, prog, comp, ch.function, &lambda, depth)
+    emit_component_fn_lambda(out, prog, comp, ch.function, &lambda, randomize_snippets, depth)
 }
 
 /// The free-lambda name for a cycle-trigger handler (`<Comp>_cycle_h<fid>`).
@@ -1947,10 +1973,11 @@ pub(super) fn emit_component_watchdog(
     prog: &TbProgram,
     comp: &crate::ir::ComponentSchema,
     w: &crate::ir::WatchdogSchema,
+    randomize_snippets: &[String],
     depth: usize,
 ) -> Result<(), EmitError> {
     let lambda = watchdog_lambda_name(comp, w);
-    emit_component_fn_lambda(out, prog, comp, w.function, &lambda, depth)
+    emit_component_fn_lambda(out, prog, comp, w.function, &lambda, randomize_snippets, depth)
 }
 
 /// The free-lambda name for a watchdog body (`<Comp>_watchdog<fid>`).
@@ -1995,6 +2022,7 @@ fn emit_component_fn_lambda(
     comp: &crate::ir::ComponentSchema,
     function: crate::ir::FunctionId,
     lambda: &str,
+    randomize_snippets: &[String],
     depth: usize,
 ) -> Result<(), EmitError> {
     let func = prog.function(function);
@@ -2089,11 +2117,35 @@ fn emit_component_fn_lambda(
                     writeln!(out, "{pad3}return;").ok();
                 }
             },
+            Terminator::Randomize {
+                target,
+                constraints,
+                succ,
+            } => {
+                // Same Z3-solve splice as the test/tseq/transactor-method
+                // paths: a component method or `on`-handler body that
+                // calls `randomize(t)` lowers to a shared `ConstraintSite`,
+                // so its snippet is already built by
+                // `cpp_tb::emit_randomize_snippets`. Method-body sites
+                // carry no problem-id in either codegen, so the snippet
+                // uses v1's nullptr-descriptor solve path — identical
+                // bytes to v1's component-body emission.
+                let snippet =
+                    randomize_snippet_for(prog, &names, *target, *constraints, randomize_snippets)
+                        .ok_or_else(|| {
+                            EmitError(format!(
+                                "tbir: Randomize in component body {} references missing \
+                                 constraint snippet c{}",
+                                func.name, constraints.0
+                            ))
+                        })?;
+                out.push_str(&snippet);
+                writeln!(out, "{pad3}__bb = {};", succ.0).ok();
+            }
             other @ (Terminator::WaitCycles(_, Some(_), _)
             | Terminator::WaitCyclesSync(_, _)
             | Terminator::WaitTimePs(_, _)
             | Terminator::WaitUntilTimeout { .. }
-            | Terminator::Randomize { .. }
             | Terminator::Fatal(_)) => {
                 return Err(EmitError(format!(
                     "tbir: component method `{}` contains terminator {other:?} — \
