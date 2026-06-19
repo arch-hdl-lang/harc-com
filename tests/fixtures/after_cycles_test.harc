@@ -1,0 +1,57 @@
+// `after N cycles ... end after` — the §7.4 suspend primitive with a
+// body — against the counter DUT (`Top` from top_counter_test). The
+// block waits N cycles, THEN runs its body; this fixture pins the exact
+// post-wait cycle so v1 and tbir must agree on the wait count.
+//
+// Timing: after reset is released with en=1, the counter increments
+// once per rising edge. Each `after K cycles` advances K cycles and the
+// body then observes the count at that point. Because the same source
+// drives both `--codegen v1` and `--codegen tbir`, the equivalence
+// harness trace-diffs the two and the wait counts must match exactly.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench AfterCyclesTb
+    dut : Top
+end testbench AfterCyclesTb
+
+impl AfterCyclesTest for AfterCyclesTb
+    clock clk = SysDomain        // 100 MHz
+
+    run
+        // Reset for 3 cycles, then start counting.
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        assert dut.count_out == 0
+            else fail("after reset: count_out=${dut.count_out}, expected 0")
+        dut.rst = 0
+        dut.en = 1
+        log(info, "released reset, counting")
+
+        // Wait 3 cycles, then the body observes count_out == 3.
+        after 3 cycles
+            assert dut.count_out == 3
+                else fail("after 3 cycles: count_out=${dut.count_out}, expected 3")
+            log(info, "PASS: after 3 cycles, count_out=${dut.count_out}")
+        end after
+
+        // A second block: 4 more cycles -> count_out == 7. The body may
+        // contain multiple statements, executed in order after the wait.
+        after 4 cycles
+            assert dut.count_out == 7
+                else fail("after 4 more cycles: count_out=${dut.count_out}, expected 7")
+            dut.en = 0
+            log(info, "PASS: after 4 more cycles, count_out=${dut.count_out}")
+        end after
+
+        // Disable held above; one more wait must leave the count frozen.
+        after 2 cycles
+            assert dut.count_out == 7
+                else fail("with en=0: count_out=${dut.count_out}, expected 7 (frozen)")
+            log(info, "PASS: count frozen at ${dut.count_out} with en=0")
+        end after
+    end run
+end impl AfterCyclesTest

@@ -70,46 +70,7 @@ impl FuncBuilder<'_> {
                 // v1 deferred the unknown-clock error to emission; the
                 // IR pipeline rejects it at lowering with the same
                 // message shape plus the declared-clock list.
-                if self.in_transactor_method && clock.is_some() {
-                    return Err(unsupported(
-                        "`wait N cycles on <clock>` inside a transactor method",
-                        "method bodies run synchronously and know no test clocks",
-                    ));
-                }
-                let clock = match clock {
-                    Some(c) => {
-                        let Some(index) = self.ctx.clock_names.iter().position(|n| n == &c.name)
-                        else {
-                            let declared = if self.ctx.clock_names.is_empty() {
-                                "none".to_string()
-                            } else {
-                                self.ctx.clock_names.join(", ")
-                            };
-                            return Err(LowerError::Invalid(format!(
-                                "wait ... on {}: no clock named `{}` declared in this \
-                                 test (declared clocks: {declared})",
-                                c.name, c.name
-                            )));
-                        };
-                        Some(crate::ir::WaitClock {
-                            name: c.name.clone(),
-                            index,
-                        })
-                    }
-                    None => None,
-                };
-                let n = self.lower_expr_no_ports(duration)?;
-                let next = self.new_block();
-                // Plain waits inside an inlined helper / testbench-
-                // method body take v1's synchronous lambda path (no
-                // coroutine yield) — see `Terminator::WaitCyclesSync`.
-                if clock.is_none() && !self.inline_frames.is_empty() {
-                    self.terminate(Terminator::WaitCyclesSync(n, next));
-                } else {
-                    self.terminate(Terminator::WaitCycles(n, clock, next));
-                }
-                self.start_block(next);
-                Ok(())
+                self.lower_wait_cycles(duration, clock.as_ref())
             }
             StmtKind::Return(None) => {
                 if self.lower_helper_return(None)? {
@@ -165,8 +126,17 @@ impl FuncBuilder<'_> {
                 timeout,
                 ..
             } => self.lower_wait_until(*mode, conditions, timeout.as_ref()),
+            // `after N cycles ... end after` — suspend N cycles, then run
+            // the body (§7.4 suspend primitive). Mirrors v1: the cycle wait
+            // uses the exact same coroutine/sync split as a clockless
+            // `wait N cycles`, after which the body statements execute. The
+            // duration is a cycle count (no wall-clock `Time` form here —
+            // v1's `after` emit never special-cased a time literal).
+            StmtKind::After { duration, body, .. } => {
+                self.lower_wait_cycles(duration, None)?;
+                self.lower_block_stmts(body)
+            }
             // ── Explicit unsupported stubs (MVP) ────────────────────
-            StmtKind::After { .. } => Err(unsupported("`after N cycles` blocks", "")),
             StmtKind::Randomize {
                 blocking,
                 target,
@@ -384,6 +354,58 @@ impl FuncBuilder<'_> {
                 Err(unsupported(&what, ""))
             }
         }
+    }
+
+    /// Lower a cycle-count wait — `wait N cycles [on <clock>]` and the
+    /// suspend prefix of `after N cycles ... end after`. The clock
+    /// qualifier resolves against the test's declared clocks HERE — v1
+    /// deferred the unknown-clock error to emission; the IR pipeline
+    /// rejects it at lowering with the same message shape plus the
+    /// declared-clock list.
+    fn lower_wait_cycles(
+        &mut self,
+        duration: &crate::ast::Expr,
+        clock: Option<&crate::ast::Ident>,
+    ) -> Result<(), LowerError> {
+        if self.in_transactor_method && clock.is_some() {
+            return Err(unsupported(
+                "`wait N cycles on <clock>` inside a transactor method",
+                "method bodies run synchronously and know no test clocks",
+            ));
+        }
+        let clock = match clock {
+            Some(c) => {
+                let Some(index) = self.ctx.clock_names.iter().position(|n| n == &c.name) else {
+                    let declared = if self.ctx.clock_names.is_empty() {
+                        "none".to_string()
+                    } else {
+                        self.ctx.clock_names.join(", ")
+                    };
+                    return Err(LowerError::Invalid(format!(
+                        "wait ... on {}: no clock named `{}` declared in this \
+                         test (declared clocks: {declared})",
+                        c.name, c.name
+                    )));
+                };
+                Some(crate::ir::WaitClock {
+                    name: c.name.clone(),
+                    index,
+                })
+            }
+            None => None,
+        };
+        let n = self.lower_expr_no_ports(duration)?;
+        let next = self.new_block();
+        // Plain waits inside an inlined helper / testbench-method body
+        // take v1's synchronous lambda path (no coroutine yield) — see
+        // `Terminator::WaitCyclesSync`.
+        if clock.is_none() && !self.inline_frames.is_empty() {
+            self.terminate(Terminator::WaitCyclesSync(n, next));
+        } else {
+            self.terminate(Terminator::WaitCycles(n, clock, next));
+        }
+        self.start_block(next);
+        Ok(())
     }
 
     fn lower_let(&mut self, l: &crate::ast::LetStmt) -> Result<(), LowerError> {
