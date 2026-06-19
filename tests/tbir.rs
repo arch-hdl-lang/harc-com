@@ -3329,6 +3329,45 @@ end impl XtNestedCallTest
 }
 
 #[test]
+fn transactor_always_on_self_call_to_active_only_sibling_is_rejected() {
+    let src = r#"
+transactor Xt
+    dut : Top
+
+    hookable outer()
+        active_only()
+    end outer
+
+    when active
+        hookable active_only()
+            dut.en = 1
+        end active_only
+    end when
+end transactor Xt
+
+testbench XtTb
+    dut : Top
+    xt  : Xt active
+end testbench XtTb
+
+impl XtPassiveBackdoorTest for XtTb
+    run
+        xt.dut = dut
+        xt.outer()
+    end run
+end impl XtPassiveBackdoorTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("active_only")
+            && msg.contains("when active")
+            && msg.contains("outer"),
+        "{msg}"
+    );
+}
+
+#[test]
 fn transactor_self_call_in_wait_until_predicate_is_rejected() {
     let src = r#"
 transactor Xt

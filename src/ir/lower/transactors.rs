@@ -107,11 +107,11 @@ pub(crate) fn lower_transactor(
 
     // Walk always-on items then the `when active` body — the same
     // flattening v1's `synth_component_from_transactor` performs with
-    // include_active = true. All methods require an `active` instance
-    // in this subset (passive instances are rejected at the testbench
-    // field), so active-only placement carries no behavior here.
+    // include_active = true. We still preserve whether a method came
+    // from `when active`, because an always-on sibling must not
+    // backdoor-call an active-only one.
     let mut dut: Option<(String, String)> = None; // (field, module type)
-    let mut methods_ast: Vec<&HookableMethod> = Vec::new();
+    let mut methods_ast: Vec<(&HookableMethod, bool)> = Vec::new();
     // Persistent scalar state fields (`last_read : uint<32> default 0`)
     // materialize on a per-instance state struct, exactly like the
     // bound-to target form. Method bodies read/write them by bare name
@@ -120,9 +120,9 @@ pub(crate) fn lower_transactor(
     // `<instance>.<field>`.
     let mut state_fields: Vec<TbScalarFieldSchema> = Vec::new();
     let mut state_names: HashSet<String> = HashSet::new();
-    let all_items = t.items.iter().chain(t.when_active.iter().flatten());
-    for ci in all_items {
+    for ci in &t.items {
         match ci {
+            ComponentItem::Hookable(h) => methods_ast.push((h, false)),
             ComponentItem::Field(f) => {
                 let fname = &f.name.name;
                 if f.direction.is_some() {
@@ -131,10 +131,6 @@ pub(crate) fn lower_transactor(
                         "event-driven transactors await the event slice",
                     ));
                 }
-                // A `Named` type is either the module-typed DUT handle or
-                // a (rejected) transaction-typed field. A `Builtin`
-                // scalar type (`uint<N>`/`sint<N>`/`bool`) is persistent
-                // state.
                 if let TypeExpr::Named { name, .. } = &f.ty {
                     let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
                     if record_ctx.record_ids.contains_key(simple) {
@@ -163,9 +159,6 @@ pub(crate) fn lower_transactor(
                     }
                     dut = Some((fname.clone(), simple.to_string()));
                 } else {
-                    // Scalar persistent state field — reuse the bound-to
-                    // target state-field lowering (scalar ≤64-bit type,
-                    // plain-literal default).
                     let sf = lower_state_field(tname, f)?;
                     if !state_names.insert(sf.name.clone()) {
                         return Err(LowerError::Invalid(format!(
@@ -176,7 +169,84 @@ pub(crate) fn lower_transactor(
                     state_fields.push(sf);
                 }
             }
-            ComponentItem::Hookable(h) => methods_ast.push(h),
+            ComponentItem::OnHandler(_) => {
+                return Err(unsupported(
+                    &format!("transactor `{tname}` `on` handlers"),
+                    "event-driven transactors await the event slice",
+                ));
+            }
+            ComponentItem::TargetTlmThread(_) => {
+                return Err(unsupported(
+                    &format!("transactor `{tname}` TLM target threads"),
+                    "",
+                ));
+            }
+            ComponentItem::Watchdog(_) => {
+                return Err(unsupported(&format!("transactor `{tname}` watchdogs"), ""));
+            }
+            ComponentItem::Connect(_) => {
+                return Err(unsupported(
+                    &format!("transactor `{tname}` connect blocks"),
+                    "",
+                ));
+            }
+            ComponentItem::Lifecycle(..) | ComponentItem::Apply(_) => {
+                return Err(unsupported(
+                    &format!("transactor `{tname}` lifecycle/apply items"),
+                    "",
+                ));
+            }
+        }
+    }
+    for ci in t.when_active.iter().flatten() {
+        match ci {
+            ComponentItem::Field(f) => {
+                let fname = &f.name.name;
+                if f.direction.is_some() {
+                    return Err(unsupported(
+                        &format!("transactor `{tname}` event/directional field `{fname}`"),
+                        "event-driven transactors await the event slice",
+                    ));
+                }
+                if let TypeExpr::Named { name, .. } = &f.ty {
+                    let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+                    if record_ctx.record_ids.contains_key(simple) {
+                        return Err(unsupported(
+                            &format!(
+                                "transactor `{tname}` field `{fname}` of transaction type `{simple}`"
+                            ),
+                            "",
+                        ));
+                    }
+                    if f.default.is_some() {
+                        return Err(unsupported(
+                            &format!("transactor `{tname}` field `{fname}` with a default value"),
+                            "",
+                        ));
+                    }
+                    if dut.is_some() {
+                        return Err(unsupported(
+                            &format!(
+                                "transactor `{tname}` with more than one module-typed field \
+                                 (`{}`, `{fname}`)",
+                                dut.as_ref().unwrap().0
+                            ),
+                            "",
+                        ));
+                    }
+                    dut = Some((fname.clone(), simple.to_string()));
+                } else {
+                    let sf = lower_state_field(tname, f)?;
+                    if !state_names.insert(sf.name.clone()) {
+                        return Err(LowerError::Invalid(format!(
+                            "transactor `{tname}` declares state field `{}` more than once",
+                            sf.name
+                        )));
+                    }
+                    state_fields.push(sf);
+                }
+            }
+            ComponentItem::Hookable(h) => methods_ast.push((h, true)),
             ComponentItem::OnHandler(_) => {
                 return Err(unsupported(
                     &format!("transactor `{tname}` `on` handlers"),
@@ -275,10 +345,13 @@ pub(crate) fn lower_transactor(
 
     let mut funcs = Vec::new();
     let mut sibling_methods = HashMap::new();
-    for h in &methods_ast {
+    for (h, active_only) in &methods_ast {
         let mname = h.name.name.clone();
         if sibling_methods
-            .insert(mname.clone(), (h.params.len(), h.return_ty.is_some()))
+            .insert(
+                mname.clone(),
+                (h.params.len(), h.return_ty.is_some(), *active_only),
+            )
             .is_some()
         {
             return Err(LowerError::Invalid(format!(
@@ -286,7 +359,7 @@ pub(crate) fn lower_transactor(
             )));
         }
     }
-    for h in methods_ast {
+    for (h, active_only) in methods_ast {
         let mname = &h.name.name;
         check_scalar_ty(tname, mname, "return type", h.return_ty.as_ref())?;
 
@@ -295,6 +368,8 @@ pub(crate) fn lower_transactor(
         b.in_transactor_method = true;
         b.self_transactor = Some(tname.clone());
         b.self_transactor_methods = sibling_methods.clone();
+        b.self_transactor_method_active_only = active_only;
+        b.current_body_name = Some(mname.clone());
         // Bare-name reads/writes of a state field route to
         // `TransactorState`/`TransactorStateWrite` with an empty instance
         // placeholder, filled at test-binding time (same as the bound-to
@@ -771,7 +846,7 @@ fn lower_bound_initiator_transactor(
     // Walk always-on + `when active` items: collect the hookable
     // methods and persistent scalar state fields; reject every
     // out-of-subset item shape precisely.
-    let mut methods_ast: Vec<&HookableMethod> = Vec::new();
+    let mut methods_ast: Vec<(&HookableMethod, bool)> = Vec::new();
     // Persistent scalar state fields (`last_read : uint<32> default 0`)
     // materialize on a per-instance state struct, exactly like the
     // bound-to target and unbound DUT-poking forms. Method bodies
@@ -782,10 +857,9 @@ fn lower_bound_initiator_transactor(
     // test-binding time, alongside the bus prefix.
     let mut state_fields: Vec<TbScalarFieldSchema> = Vec::new();
     let mut state_names: HashSet<String> = HashSet::new();
-    let all_items = t.items.iter().chain(t.when_active.iter().flatten());
-    for ci in all_items {
+    for ci in &t.items {
         match ci {
-            ComponentItem::Hookable(h) => methods_ast.push(h),
+            ComponentItem::Hookable(h) => methods_ast.push((h, false)),
             ComponentItem::Field(f) => {
                 // An event/directional field (`req : in event<T>`) on a
                 // bound-to transactor is the event-driven driver form —
@@ -809,6 +883,74 @@ fn lower_bound_initiator_transactor(
                 // `bool` ≤64 bits with a plain-literal default). Reuse the
                 // bound-to target state-field lowering; reject module/
                 // transaction-typed and non-scalar fields inside it.
+                let sf = lower_state_field(tname, f)?;
+                if !state_names.insert(sf.name.clone()) {
+                    return Err(LowerError::Invalid(format!(
+                        "initiator-side bound-to transactor `{tname}` declares state field \
+                         `{}` more than once",
+                        sf.name
+                    )));
+                }
+                state_fields.push(sf);
+            }
+            ComponentItem::TargetTlmThread(th) => {
+                return Err(unsupported(
+                    &format!(
+                        "initiator-side bound-to transactor `{tname}` mixing a `thread {}` \
+                         responder with `hookable` initiator methods",
+                        th.method
+                            .segments
+                            .iter()
+                            .map(|s| s.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".")
+                    ),
+                    "a transactor is either an initiator BFM (hookable methods) or a \
+                     target responder (thread bus.<m> bodies), not both",
+                ));
+            }
+            ComponentItem::OnHandler(_) => {
+                return Err(unsupported(
+                    &format!("initiator-side bound-to transactor `{tname}` `on` handlers"),
+                    "event-driven transactors await the event slice",
+                ));
+            }
+            ComponentItem::Watchdog(_) => {
+                return Err(unsupported(
+                    &format!("initiator-side bound-to transactor `{tname}` watchdogs"),
+                    "",
+                ));
+            }
+            ComponentItem::Connect(_) => {
+                return Err(unsupported(
+                    &format!("initiator-side bound-to transactor `{tname}` connect blocks"),
+                    "",
+                ));
+            }
+            ComponentItem::Lifecycle(..) | ComponentItem::Apply(_) => {
+                return Err(unsupported(
+                    &format!("initiator-side bound-to transactor `{tname}` lifecycle/apply items"),
+                    "",
+                ));
+            }
+        }
+    }
+    for ci in t.when_active.iter().flatten() {
+        match ci {
+            ComponentItem::Hookable(h) => methods_ast.push((h, true)),
+            ComponentItem::Field(f) => {
+                if f.direction.is_some() {
+                    return Err(unsupported(
+                        &format!(
+                            "initiator-side bound-to transactor `{tname}` event/directional \
+                             field `{}`",
+                            f.name.name
+                        ),
+                        "event-driven bound-to transactors (`in event<T>` + `on <ev>` driving \
+                         the bound bus) are a follow-up slice; only `hookable`-method BFMs \
+                         with scalar state are lowered",
+                    ));
+                }
                 let sf = lower_state_field(tname, f)?;
                 if !state_names.insert(sf.name.clone()) {
                     return Err(LowerError::Invalid(format!(
@@ -926,18 +1068,32 @@ fn lower_bound_initiator_transactor(
     };
 
     let mut funcs = Vec::new();
-    for h in methods_ast {
-        let mname = &h.name.name;
-        if schema.method(mname).is_some() {
+    let mut sibling_methods = HashMap::new();
+    for (h, active_only) in &methods_ast {
+        let mname = h.name.name.clone();
+        if sibling_methods
+            .insert(
+                mname.clone(),
+                (h.params.len(), h.return_ty.is_some(), *active_only),
+            )
+            .is_some()
+        {
             return Err(LowerError::Invalid(format!(
                 "transactor `{tname}` declares method `{mname}` more than once"
             )));
         }
+    }
+    for (h, active_only) in methods_ast {
+        let mname = &h.name.name;
         check_scalar_ty(tname, mname, "return type", h.return_ty.as_ref())?;
 
         let fid = FunctionId(next_fn.0 + funcs.len() as u32);
         let mut b = FuncBuilder::new(&method_ctx, helper_registry, constraint_sites);
         b.in_transactor_method = true;
+        b.self_transactor = Some(tname.clone());
+        b.self_transactor_methods = sibling_methods.clone();
+        b.self_transactor_method_active_only = active_only;
+        b.current_body_name = Some(mname.clone());
         // Bare-name reads/writes of a state field route to
         // `TransactorState`/`TransactorStateWrite` with an empty instance
         // placeholder, filled at test-binding time (same as the unbound
