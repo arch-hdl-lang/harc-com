@@ -1,0 +1,64 @@
+// E2E proof for the bind-site generic bus override on a `= bind dut` site.
+//
+// DUT module BusRwBind declares `port s: target BusRw<WRITE=0>`, so `arch
+// build` flattens `s` WITHOUT the WRITE-gated aw/w channels (READ-only port
+// set: s_ar_*, s_r_*). This testbench states the SAME override at the BIND
+// SITE — `let s : BusRw<WRITE=0> = bind dut` — rather than sourcing it from
+// the DUT `.archi`. The bind-site generic layers onto the bus param env
+// (defaults WRITE=1 < bind generic WRITE=0), so harc models the same READ-
+// only port set as the SV backend and the two agree.
+//
+// Accessing only the enabled READ channel; a WRITE-channel access (e.g.
+// `s.aw_valid`) would be rejected by check_gated_bus_access as gated OFF.
+
+// Bus declaration inlined so harc knows the channel/signal set (matches
+// BusRw.arch). Its `generate_if WRITE` / `generate_if READ` gates are what
+// the bind-site generic (`<WRITE=0>`) selects against.
+bus BusRw
+  param ADDR_W: const = 32;
+  param DATA_W: const = 32;
+  param READ:  const = 1;
+  param WRITE: const = 1;
+  generate_if WRITE
+    aw_valid: out Bool;
+    aw_ready: in  Bool;
+    aw_addr:  out UInt<ADDR_W>;
+    w_valid:  out Bool;
+    w_ready:  in  Bool;
+    w_data:   out UInt<DATA_W>;
+  end generate_if
+  generate_if READ
+    ar_valid: out Bool;
+    ar_ready: in  Bool;
+    ar_addr:  out UInt<ADDR_W>;
+    r_valid:  in  Bool;
+    r_ready:  out Bool;
+    r_data:   in  UInt<DATA_W>;
+  end generate_if
+end bus BusRw
+
+testbench BusRwBindTb
+    dut : BusRwBind
+end testbench BusRwBindTb
+
+impl BusRwBindTest for BusRwBindTb
+    let s : BusRw<WRITE=0> = bind dut
+
+    run
+        dut.rst = 0
+        s.ar_valid = 0
+        s.r_ready  = 1
+        wait 2 cycles
+        dut.rst = 1
+        wait 1 cycle
+
+        // Drive the read-address channel; check the comb response.
+        s.ar_addr  = 42
+        s.ar_valid = 1
+        wait 1 cycle
+        assert dut.busy == 1 else fail("busy should be high when ar_valid")
+        assert s.r_valid == 1 else fail("r_valid should mirror ar_valid")
+        s.ar_valid = 0
+        wait 2 cycles
+    end run
+end impl BusRwBindTest
