@@ -1,0 +1,41 @@
+// Constant bit-slice expressions `x[hi:lo]` and the uninitialized scalar
+// `let x: uint<N>;` (declare-then-assign) idiom. Both lower under tbir
+// now (previously rejected; v1 always supported them). This fixture is
+// self-checking and trace-equivalent under `--codegen v1` and `tbir`.
+
+testbench BitsliceUninitTb
+    dut : Top
+end testbench BitsliceUninitTb
+
+impl BitsliceUninitTest for BitsliceUninitTb
+    run
+        // ── constant bit-slice `x[hi:lo]` ──────────────────────────
+        let v : uint<32> = 0xDEADBEEF
+        let lo8  = v[7:0]
+        let byte1 = v[15:8]
+        let hi8  = v[31:24]
+        let bit3 = v[3:3]
+        assert lo8 == 0xEF   else fail("v[7:0]: 0x${lo8:02x}")
+        assert byte1 == 0xBE else fail("v[15:8]: 0x${byte1:02x}")
+        assert hi8 == 0xDE   else fail("v[31:24]: 0x${hi8:02x}")
+        assert bit3 == 1     else fail("v[3:3]: ${bit3}")
+
+        // ── uninitialized scalar let, relying on zero-init ─────────
+        // `acc` is declared without an initializer; it must start at 0
+        // (v1 emits `int64_t acc = 0;`, tbir hoists `uint64_t acc = 0;`).
+        let acc : uint<32>
+        for i in 0 .. 7
+            acc = acc + 1
+        end for
+        assert acc == 7 else fail("acc (7 iters over 0..7 from zero-init): ${acc}")
+
+        // Declared-then-conditionally-assigned scalar.
+        let flag : uint<8>
+        if acc == 7
+            flag = 0xAA
+        end if
+        assert flag == 0xAA else fail("flag: 0x${flag:02x}")
+
+        log(info, "PASS: bit-slice + uninitialized-let lower and match v1")
+    end run
+end impl BitsliceUninitTest
