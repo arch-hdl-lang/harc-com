@@ -18,8 +18,9 @@
 //!
 //! In the TB-IR this maps to:
 //!
-//! - one `TbFunction` (`FunctionKind::Tseq { record }`) whose `ret` slot
-//!   is an `IrType::RecordSeq(record)` accumulator. `yield t` is a
+//! - one `TbFunction` (`FunctionKind::Tseq { elem }`) whose `ret` slot
+//!   is an `IrType::RecordSeq`/`IrType::Seq` accumulator (per element).
+//!   `yield t` is a
 //!   `Stmt::SeqPush { seq: ret, value: t }`; `randomize(t)` reuses the
 //!   already-merged constraint-IR seam (`Terminator::Randomize`) exactly
 //!   as in a test body — the solver problem table already catalogs tseq
@@ -30,35 +31,32 @@
 //!   `FuncBuilder::lower_for`), binding `t` to `seq[i]` per iteration
 //!   (`Expr::SeqIndex`) over `0 .. seq.size()` (`Expr::SeqLen`).
 //!
+//! A `TSeq<scalar>` element (`TSeq<uint<N>>`/`TSeq<sint<N>>`/`TSeq<bool>`)
+//! lowers the same way with an `IrType::Seq(scalar)` accumulator — `yield e`
+//! pushes a scalar value, `for x in <seq>` binds `x` to a scalar.
+//!
 //! Out of subset (precise rejection, never mis-lowered): a tseq whose
-//! `TSeq<T>` element `T` is not a declared `transaction`/`struct`
-//! record (the IR's sequence element model is a value-record), a tseq
-//! body using a construct the test-body lowering does not support, and
-//! `yield` outside a tseq body.
+//! `TSeq<T>` element `T` is neither a declared `transaction`/`struct`
+//! record nor a primitive scalar, a tseq body using a construct the
+//! test-body lowering does not support, and `yield` outside a tseq body.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::ast::{BuiltinTy, ExprKind, Item, SourceFile, TseqDecl, TypeArg, TypeExpr};
 use crate::ir::{
-    ConstraintSite, FunctionId, FunctionKind, IrType, RecordId, TbFunction, Terminator, TypedParam,
+    ConstraintSite, FunctionId, FunctionKind, IrType, RecordId, TbFunction, Terminator, TseqElem,
+    TypedParam,
 };
 
 use super::helpers::{ir_type_of, HelperRegistry};
 use super::{unsupported, FuncBuilder, LowerCtx, LowerError};
 
-/// The element record name of a `tseq`'s `-> TSeq<Record>` return type,
-/// or `None` when the declaration is not a record-element sequence
-/// (no return type, a non-`TSeq` return, or a `TSeq<scalar>`).
-pub(crate) fn tseq_element_name(decl: &TseqDecl) -> Option<String> {
-    let TypeExpr::Builtin {
-        name: BuiltinTy::TSeq,
-        args,
-        ..
-    } = decl.return_ty.as_ref()?
-    else {
-        return None;
-    };
+/// The element name of a `tseq`'s `-> TSeq<T>` return type when `T` is a
+/// single identifier (record element). `None` for a missing/non-`TSeq`
+/// return, a `TSeq<scalar>` (a `Builtin` inner type), or a named generic.
+fn tseq_element_name(decl: &TseqDecl) -> Option<String> {
+    let args = tseq_args(decl)?;
     match args.first()? {
         TypeArg::Type(inner) => match inner {
             TypeExpr::Named { name, .. } => name.segments.last().map(|s| s.name.clone()),
@@ -74,34 +72,69 @@ pub(crate) fn tseq_element_name(decl: &TseqDecl) -> Option<String> {
     }
 }
 
-/// Build the `tseq name → element RecordId` map, validating each
-/// declaration up front. A `tseq` whose element type is not a declared
-/// record is an explicit `Unsupported` (the IR sequence-element model is
-/// a value-record), so it is rejected here rather than dropped or
-/// mis-lowered.
+/// The scalar element `IrType` of a `tseq`'s `-> TSeq<scalar>` return when
+/// the inner type is a primitive builtin (`uint<N>`/`sint<N>`/`bool`/…).
+/// `None` for a non-builtin inner (record element) or a non-`TSeq` return.
+fn tseq_scalar_element(decl: &TseqDecl) -> Option<IrType> {
+    let args = tseq_args(decl)?;
+    let TypeArg::Type(inner) = args.first()? else {
+        return None;
+    };
+    match ir_type_of(Some(inner)) {
+        // `ir_type_of` returns `Unknown` for a `Named` (record) inner —
+        // those are handled by the record-element path, not here.
+        ty @ (IrType::UInt(_) | IrType::SInt(_) | IrType::Bool) => Some(ty),
+        _ => None,
+    }
+}
+
+/// The `args` list of a well-formed `-> TSeq<...>` return type, or `None`.
+fn tseq_args(decl: &TseqDecl) -> Option<&[TypeArg]> {
+    match decl.return_ty.as_ref()? {
+        TypeExpr::Builtin {
+            name: BuiltinTy::TSeq,
+            args,
+            ..
+        } => Some(args),
+        _ => None,
+    }
+}
+
+/// Build the `tseq name → element type` map, validating each declaration
+/// up front. A `tseq`'s element is either a declared record (`TSeq<Record>`,
+/// → `TseqElem::Record`) or a primitive scalar (`TSeq<uint<N>>`, →
+/// `TseqElem::Scalar`); both render as `std::vector<T>`. A `tseq` with no
+/// `TSeq<...>` return, or a `TSeq<Name>` whose `Name` is not a declared
+/// record, is an explicit `Unsupported` — rejected here, never mis-lowered.
 pub(crate) fn collect_tseq_records(
     file: &SourceFile,
     record_ids: &HashMap<String, RecordId>,
-) -> Result<HashMap<String, RecordId>, LowerError> {
+) -> Result<HashMap<String, TseqElem>, LowerError> {
     let mut out = HashMap::new();
     for it in &file.items {
         let Item::Tseq(decl) = it else { continue };
-        let Some(elem) = tseq_element_name(decl) else {
+        let elem = if let Some(scalar) = tseq_scalar_element(decl) {
+            TseqElem::Scalar(scalar)
+        } else if let Some(name) = tseq_element_name(decl) {
+            let Some(&rid) = record_ids.get(&name) else {
+                return Err(unsupported(
+                    &format!("`tseq {}` element type `{name}`", decl.name.name),
+                    "only declared `transaction`/`struct` records and primitive scalars \
+                     (`uint<N>`/`sint<N>`/`bool`) are lowered as tseq element types",
+                ));
+            };
+            TseqElem::Record(rid)
+        } else {
             return Err(unsupported(
                 &format!(
-                    "`tseq {}` without a `-> TSeq<Record>` return type",
+                    "`tseq {}` without a `-> TSeq<T>` return type",
                     decl.name.name
                 ),
-                "a tseq must yield a declared `transaction`/`struct` record element type",
+                "a tseq must yield a declared `transaction`/`struct` record or a primitive \
+                 scalar (`uint<N>`/`sint<N>`/`bool`) element type",
             ));
         };
-        let Some(&rid) = record_ids.get(&elem) else {
-            return Err(unsupported(
-                &format!("`tseq {}` element type `{elem}`", decl.name.name),
-                "only declared `transaction`/`struct` record element types are lowered",
-            ));
-        };
-        if out.insert(decl.name.name.clone(), rid).is_some() {
+        if out.insert(decl.name.name.clone(), elem).is_some() {
             return Err(LowerError::Invalid(format!(
                 "duplicate tseq declaration `{}`",
                 decl.name.name
@@ -113,12 +146,12 @@ pub(crate) fn collect_tseq_records(
 
 /// Lower one `tseq` declaration into a `TbFunction` (kind `Tseq`).
 /// Locals `0..params.len()` mirror the params (verifier convention); the
-/// `ret` slot is the `RecordSeq` accumulator that `yield`/`SeqPush`
-/// appends to and `Terminator::Return` returns.
+/// `ret` slot is the `RecordSeq`/`Seq` accumulator (per `elem`) that
+/// `yield`/`SeqPush` appends to and `Terminator::Return` returns.
 pub(crate) fn lower_tseq<'a>(
     id: FunctionId,
     decl: &TseqDecl,
-    record: RecordId,
+    elem: TseqElem,
     ctx: &'a LowerCtx,
     helpers: &'a HelperRegistry<'a>,
     constraint_sites: &'a RefCell<Vec<ConstraintSite>>,
@@ -136,11 +169,11 @@ pub(crate) fn lower_tseq<'a>(
         });
     }
     // The sequence accumulator — the function's return value. Marked
-    // `RecordSeq` so `yield`/`SeqPush` and the backend's
-    // `std::vector<Record>` declaration both resolve, and so the verifier
-    // treats it as live from entry (always default-constructed).
+    // `RecordSeq`/`Seq` (per element) so `yield`/`SeqPush` and the
+    // backend's `std::vector<T>` declaration both resolve, and so the
+    // verifier treats it as live from entry (always default-constructed).
     let acc = b.declare("__result");
-    b.set_local_type(acc, IrType::RecordSeq(record));
+    b.set_local_type(acc, elem.seq_type());
     b.set_tseq_result(acc);
 
     b.lower_block_stmts(&decl.body)?;
@@ -153,7 +186,7 @@ pub(crate) fn lower_tseq<'a>(
     let mut f = b.finish(
         id,
         decl.name.name.clone(),
-        FunctionKind::Tseq { record },
+        FunctionKind::Tseq { elem },
         None,
     )?;
     f.params = params;

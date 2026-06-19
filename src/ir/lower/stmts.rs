@@ -651,10 +651,11 @@ impl FuncBuilder<'_> {
         // name and a transactor field are disjoint namespaces).
         if let ExprKind::Call { callee, args } = &*value.kind {
             if let ExprKind::Ident(name) = &*callee.kind {
-                if let Some(&record) = self.ctx.tseqs.get(&name.name) {
+                if let Some(elem) = self.ctx.tseqs.get(&name.name) {
+                    let seq_ty = elem.seq_type();
                     let call = self.lower_tseq_call(&name.name, args)?;
                     let id = self.declare(&l.name.name);
-                    self.set_local_type(id, IrType::RecordSeq(record));
+                    self.set_local_type(id, seq_ty);
                     self.push(Stmt::Assign(id, call));
                     return Ok(());
                 }
@@ -1640,12 +1641,16 @@ impl FuncBuilder<'_> {
         ))
     }
 
-    /// `yield t` inside a `tseq` body — append a record value onto the
-    /// sequence accumulator. The accumulator is the tseq function's `ret`
-    /// local (set by `tseqs::lower_tseq` via `set_tseq_result`); the
-    /// yielded value must be a record local whose type matches the
-    /// accumulator's element record (v1 emits `_result.push_back(t)`,
-    /// which would fail to compile on a type mismatch).
+    /// `yield e` inside a `tseq` body — append a value onto the sequence
+    /// accumulator. The accumulator is the tseq function's `ret` local (set
+    /// by `tseqs::lower_tseq` via `set_tseq_result`); v1 emits
+    /// `_result.push_back(<e>)`.
+    ///
+    /// For a `RecordSeq` accumulator the yielded value must be a record
+    /// local whose type matches the accumulator's element record (a
+    /// type mismatch would fail to compile in v1's `push_back`). For a
+    /// scalar `Seq` accumulator any scalar expression is yielded (lowered
+    /// like a `let`-RHS scalar; DUT reads hoisted into the current block).
     fn lower_yield(&mut self, value: &crate::ast::Expr) -> Result<(), LowerError> {
         let Some(seq) = self.tseq_result else {
             // Mirrors v1's "`yield` outside a `tseq` body" diagnostic.
@@ -1656,39 +1661,52 @@ impl FuncBuilder<'_> {
         };
         let elem = self
             .seq_of_local(seq)
-            .expect("tseq accumulator is always RecordSeq-typed");
-        // The yielded value must be a bare record-typed local of the
-        // element type — the only thing `push_back` accepts.
-        let ExprKind::Ident(id) = &*value.kind else {
-            return Err(unsupported(
-                "`yield` of a non-identifier value",
-                "yield a record-typed local declared with `let t : <Transaction>`",
-            ));
-        };
-        let Some(local) = self.lookup(&id.name) else {
-            return Err(LowerError::Invalid(format!(
-                "yield {0}: `{0}` is not in scope",
-                id.name
-            )));
-        };
-        match self.record_of_local(local) {
-            Some(rid) if rid == elem => {}
-            _ => {
-                return Err(unsupported(
-                    &format!(
-                        "`yield {}` whose value is not a `{}` record local",
-                        id.name,
-                        self.ctx.records[elem.index()].name
-                    ),
-                    "yield a same-typed transaction local",
-                ));
+            .expect("tseq accumulator is always RecordSeq/Seq-typed");
+        match elem {
+            // Scalar-element sequence: yield any scalar expression.
+            IrType::UInt(_) | IrType::SInt(_) | IrType::Bool | IrType::Unknown => {
+                let v = self.lower_expr_no_ports(value)?;
+                self.push(Stmt::SeqPush { seq, value: v });
+                Ok(())
             }
+            // Record-element sequence: yield a bare same-typed record local
+            // — the only thing `push_back` accepts.
+            IrType::Record(elem_rid) => {
+                let ExprKind::Ident(id) = &*value.kind else {
+                    return Err(unsupported(
+                        "`yield` of a non-identifier value",
+                        "yield a record-typed local declared with `let t : <Transaction>`",
+                    ));
+                };
+                let Some(local) = self.lookup(&id.name) else {
+                    return Err(LowerError::Invalid(format!(
+                        "yield {0}: `{0}` is not in scope",
+                        id.name
+                    )));
+                };
+                match self.record_of_local(local) {
+                    Some(rid) if rid == elem_rid => {}
+                    _ => {
+                        return Err(unsupported(
+                            &format!(
+                                "`yield {}` whose value is not a `{}` record local",
+                                id.name,
+                                self.ctx.records[elem_rid.index()].name
+                            ),
+                            "yield a same-typed transaction local",
+                        ));
+                    }
+                }
+                self.push(Stmt::SeqPush {
+                    seq,
+                    value: Expr::Local(local),
+                });
+                Ok(())
+            }
+            other => Err(LowerError::Invalid(format!(
+                "tseq accumulator has unexpected element type {other:?} (lowering bug)"
+            ))),
         }
-        self.push(Stmt::SeqPush {
-            seq,
-            value: Expr::Local(local),
-        });
-        Ok(())
     }
 
     fn lower_assert(&mut self, v: &crate::ast::Verify) -> Result<(), LowerError> {

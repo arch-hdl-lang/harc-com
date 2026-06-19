@@ -34,7 +34,7 @@ use crate::ir::{
     self, BasicBlock, BlockId, ClockSpec, ComponentSchema, ConstraintRef, ConstraintSite,
     CovgroupId, CovgroupSchema, FunctionId, FunctionKind, IrType, LocalId, RecordId, RecordSchema,
     RegblockId, ScoreboardId, ScoreboardSchema, TbFunction, TbProgram, Terminator, TestSchema,
-    TestbenchId, TestbenchSchema, TransactorId, TransactorSchema, TypedLocal, TypedParam,
+    TestbenchId, TestbenchSchema, TransactorId, TransactorSchema, TseqElem, TypedLocal, TypedParam,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -813,12 +813,12 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     };
     for it in &file.items {
         let Item::Tseq(decl) = it else { continue };
-        let record = tseq_records[&decl.name.name];
+        let elem = tseq_records[&decl.name.name].clone();
         let id = FunctionId(prog.functions.len() as u32);
         let f = tseqs::lower_tseq(
             id,
             decl,
-            record,
+            elem,
             &tseq_ctx,
             &helper_registry,
             &constraint_sites,
@@ -1467,7 +1467,7 @@ fn lower_test(
     helpers: &helpers::HelperRegistry<'_>,
     txn_keeps: &HashMap<String, Vec<crate::ast::Expr>>,
     randomize_problem_ids: &HashMap<(usize, usize), u32>,
-    tseq_records: &HashMap<String, RecordId>,
+    tseq_records: &HashMap<String, TseqElem>,
     constraint_sites: &RefCell<Vec<ConstraintSite>>,
     dut_poking_bfm_names: &HashSet<String>,
     prog: &mut TbProgram,
@@ -3799,11 +3799,12 @@ pub(crate) struct LowerCtx {
     /// site, keyed exactly like v1's `runtime_randomize_problem_ids`.
     /// `None` at a site means no Z3-ready problem (lower/backend error).
     pub randomize_problem_ids: HashMap<(usize, usize), u32>,
-    /// `tseq` name → element record type. A `let txns = Name(args)` whose
-    /// callee is in this map lowers to a `CallTarget::Tseq` whose result
-    /// types the local as `IrType::RecordSeq(record)`, and a `for t in
-    /// txns` over such a local lowers to a counted loop over `txns`.
-    pub tseqs: HashMap<String, RecordId>,
+    /// `tseq` name → element type (`TseqElem::Record`/`TseqElem::Scalar`).
+    /// A `let txns = Name(args)` whose callee is in this map lowers to a
+    /// `CallTarget::Tseq` whose result types the local as the element's
+    /// `RecordSeq`/`Seq` (`TseqElem::seq_type`), and a `for t in txns` over
+    /// such a local lowers to a counted loop over `txns`.
+    pub tseqs: HashMap<String, TseqElem>,
     /// DUT-internal `probe` declarations on `let dut` (probe name →
     /// metadata). A `dut.<name>` access whose head is the DUT and whose
     /// segment is a probe name lowers to a `PortRef` with
@@ -4286,11 +4287,14 @@ impl FuncBuilder<'_> {
         }
     }
 
-    /// `Some(record)` when the local is a transaction-sequence
-    /// (`let txns = SomeTseq(...)`, typed `RecordSeq`).
-    pub(crate) fn seq_of_local(&self, l: LocalId) -> Option<ir::RecordId> {
-        match self.locals[l.index()].ty {
-            IrType::RecordSeq(r) => Some(r),
+    /// `Some(element type)` when the local is a transaction-sequence
+    /// (`let txns = SomeTseq(...)`, typed `RecordSeq`/`Seq`). The element
+    /// type is what a `for x in <seq>` loop variable binds to: a record
+    /// (`IrType::Record`) for a `RecordSeq`, or the boxed scalar for a `Seq`.
+    pub(crate) fn seq_of_local(&self, l: LocalId) -> Option<IrType> {
+        match &self.locals[l.index()].ty {
+            IrType::RecordSeq(r) => Some(IrType::Record(*r)),
+            IrType::Seq(elem) => Some((**elem).clone()),
             _ => None,
         }
     }

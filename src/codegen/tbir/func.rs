@@ -449,27 +449,32 @@ pub(super) fn emit_tseq(
     let pad2 = INDENT.repeat(depth + 2);
     let pad3 = INDENT.repeat(depth + 3);
 
-    // The element record name (for the `std::vector<Record>` return type).
-    let IrType::RecordSeq(rid) = func
+    // The element C++ type (for the `std::vector<T>` return type) — a
+    // record name for a `RecordSeq` accumulator, or the scalar C++ type
+    // for a `Seq` accumulator.
+    let acc_ty = func
         .ret
         .map(|r| func.local(r).ty.clone())
-        .unwrap_or(IrType::Unknown)
-    else {
-        return Err(EmitError(format!(
-            "tbir: tseq `{}` has no RecordSeq return accumulator (lowering bug)",
-            func.name
-        )));
+        .unwrap_or(IrType::Unknown);
+    let elem = match &acc_ty {
+        IrType::RecordSeq(rid) => records
+            .get(rid.index())
+            .ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: tseq `{}` references missing element record r{}",
+                    func.name, rid.0
+                ))
+            })?
+            .name
+            .clone(),
+        IrType::Seq(scalar) => super::local_scalar_cty(scalar).to_string(),
+        _ => {
+            return Err(EmitError(format!(
+                "tbir: tseq `{}` has no RecordSeq/Seq return accumulator (lowering bug)",
+                func.name
+            )));
+        }
     };
-    let elem = records
-        .get(rid.index())
-        .ok_or_else(|| {
-            EmitError(format!(
-                "tbir: tseq `{}` references missing element record r{}",
-                func.name, rid.0
-            ))
-        })?
-        .name
-        .clone();
 
     let params = names[..nparams]
         .iter()
@@ -1631,6 +1636,13 @@ fn declare_locals(
                     ))
                 })?;
                 writeln!(out, "{pad}std::vector<{}> {n}{{}}; (void){n};", rec.name).ok();
+            }
+            // A scalar-element transaction-sequence local —
+            // `std::vector<T>` over the scalar C++ type. v1's tseq scalar
+            // accumulator / call-result shape.
+            IrType::Seq(ref scalar) => {
+                let cty = super::local_scalar_cty(scalar);
+                writeln!(out, "{pad}std::vector<{cty}> {n}{{}}; (void){n};").ok();
             }
             // Scalar local. Wide (>64-bit) `uint`/`sint` locals — e.g. a
             // wide method param hoisted as the first N locals — take v1's
