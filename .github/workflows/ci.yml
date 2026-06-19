@@ -117,7 +117,7 @@ jobs:
         # for the full rationale.
         run: |
           sudo apt-get update
-          sudo apt-get install -y libz3-dev clang \
+          sudo apt-get install -y libz3-dev clang ccache \
                                   git make autoconf flex bison g++ help2man perl python3 \
                                   numactl perl-doc libfl2 libfl-dev zlib1g zlib1g-dev
 
@@ -152,6 +152,42 @@ jobs:
           echo "/opt/verilator/bin" >> "$GITHUB_PATH"
           /opt/verilator/bin/verilator --version
 
+      # ccache: the fixture jobs do ~370 verilator+clang compiles, and
+      # most share object code — the verilated runtime is identical across
+      # every fixture, shared DUTs (e.g. top_counter.sv drives ~20
+      # fixtures) recompile identically, and the equivalence harness
+      # compiles each DUT twice (once per codegen). ccache turns those
+      # into cache hits within a run and across runs.
+      #
+      # HARC_CXX=clang++ is forwarded into the verilator makefile as a
+      # bare `CXX=clang++` (a multi-word `ccache clang++` would break
+      # make's command-line var parse — `clang++` would be read as a
+      # goal). So instead of wrapping the compiler in the var, we
+      # masquerade: a PATH dir whose `clang++` is a symlink to ccache,
+      # placed ahead of the real clang++. `make` resolves `clang++` to
+      # the symlink, ccache identifies the real compiler one hop further
+      # down PATH and caches it.
+      - name: Set up ccache (masquerade clang++)
+        run: |
+          mkdir -p "$HOME/.ccache-bin"
+          ln -sf "$(command -v ccache)" "$HOME/.ccache-bin/clang++"
+          ln -sf "$(command -v ccache)" "$HOME/.ccache-bin/clang"
+          echo "$HOME/.ccache-bin" >> "$GITHUB_PATH"
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=1G" >> "$GITHUB_ENV"
+          # Normalize the per-fixture absolute build paths (all under the
+          # workspace) so the shared verilated runtime and same-DUT object
+          # files hit across fixtures, not just on identical re-runs.
+          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          echo "CCACHE_SLOPPINESS=time_macros" >> "$GITHUB_ENV"
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-sim-${{ github.run_id }}
+          restore-keys: ccache-sim-
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -164,6 +200,9 @@ jobs:
 
       - name: Build harc
         run: cargo build --release --bin harc
+
+      - name: ccache zero stats
+        run: ccache -z
 
       - name: Run all fixtures end-to-end
         env:
@@ -188,6 +227,10 @@ jobs:
         env:
           HARC_CXX: clang++
         run: ./tests/run_tbir_equiv.sh
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
 
   check-backends:
     # sim<->SV equivalence net: run representative arch-com designs under
@@ -222,7 +265,7 @@ jobs:
       - name: Install Z3 + clang
         run: |
           sudo apt-get update
-          sudo apt-get install -y libz3-dev clang \
+          sudo apt-get install -y libz3-dev clang ccache \
                                   git make autoconf flex bison g++ help2man perl python3 \
                                   numactl perl-doc libfl2 libfl-dev zlib1g zlib1g-dev
 

@@ -34,19 +34,31 @@ FIX_DIR="tests/fixtures"
 REGISTRY="tests/tbir_equiv_fixtures.txt"
 SEED="${SEED:-1}"
 OUT="${TBIR_EQUIV_OUT:-harc_tbir_equiv_build}"
+# Parallelism: each row is up to 4 verilator+clang compiles (v1/tbir ×
+# sv/arch-dut), dominated by compilation, not simulation. Fan out across
+# cores; override with JOBS=N, default to the online CPU count. Each row
+# already writes to its own $OUT/<test> subtree, so workers never collide.
+JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 
 if [ ! -x "$HARC" ]; then
     echo "Building harc..."
     cargo build --release --bin harc
 fi
 
+# Absolute HARC so re-exec'd workers resolve the same binary.
+case "$HARC" in
+    /*) ;;
+    *) HARC="$PWD/$HARC" ;;
+esac
+
 if [ ! -f "$REGISTRY" ]; then
     echo "error: registry $REGISTRY not found (run from the repo root)" >&2
     exit 1
 fi
 
-rm -rf "$OUT"
-mkdir -p "$OUT"
+# NOTE: the shared $OUT tree is wiped only in the MAIN path below, never
+# in a worker — a worker that re-cleaned $OUT would delete its siblings'
+# build dirs. See the `__worker` dispatch.
 
 PASS=0
 FAIL=0
@@ -150,8 +162,7 @@ run_one() {
     if [ -z "$top" ] || [ -z "$sv" ] || [ -z "$arch_dut" ] \
         || { [ "$expect" != "pass" ] && [ "$expect" != "fail" ]; }; then
         echo "  FAIL  $test (malformed registry row: '$row')"
-        FAIL=$((FAIL + 1))
-        FAILED_NAMES+=("$test")
+        echo "__STATUS__ FAIL $test"
         return 0
     fi
 
@@ -171,39 +182,83 @@ run_one() {
     local label="$test${test_struct:+ [$test_struct]}"
     local pair_dir="$OUT/$test${test_struct:+__$test_struct}"
     if ! run_pair "$label" "$pair_dir" sv "$top" "${sv_files[@]}"; then
-        FAIL=$((FAIL + 1))
-        FAILED_NAMES+=("$label")
+        echo "__STATUS__ FAIL $label"
         return 0
     fi
     echo "  PASS  $label (v1 == tbir, expect=$expect)"
-    PASS=$((PASS + 1))
+    echo "__STATUS__ PASS $label"
 
     # Optional ARCH-native-DUT sweep. Only when ARCH_BIN is set AND the
     # row names an arch_dut source; skip silently otherwise.
     if [ -n "${ARCH_BIN:-}" ] && [ -x "${ARCH_BIN:-}" ] && [ "$arch_dut" != "-" ]; then
         if [ ! -f "$DUT_DIR/$arch_dut" ]; then
             echo "  FAIL  $label [arch-dut] (registry arch_dut '$arch_dut' not found in $DUT_DIR)"
-            FAIL=$((FAIL + 1))
-            FAILED_NAMES+=("$label [arch-dut]")
+            echo "__STATUS__ FAIL $label [arch-dut]"
             return 0
         fi
         if ! run_pair "$label [arch-dut]" "${pair_dir}__arch_dut" dut "$top" "$DUT_DIR/$arch_dut"; then
-            FAIL=$((FAIL + 1))
-            FAILED_NAMES+=("$label [arch-dut]")
+            echo "__STATUS__ FAIL $label [arch-dut]"
             return 0
         fi
         echo "  PASS  $label [arch-dut] (v1 == tbir, expect=$expect)"
-        PASS=$((PASS + 1))
+        echo "__STATUS__ PASS $label [arch-dut]"
     fi
 }
 
-echo "Running ${PWD}/$REGISTRY v1-vs-tbir equivalence fixtures (seed $SEED)..."
+# Hidden re-exec entry point: `run_tbir_equiv.sh __worker <row>`.
+# Lets the parent fan out one process per registry row via xargs -P.
+if [ "${1:-}" = "__worker" ]; then
+    run_one "$2"
+    exit 0
+fi
+
+# Main path only: wipe the shared build tree once, before fan-out.
+rm -rf "$OUT"
+mkdir -p "$OUT"
+
+echo "Running ${PWD}/$REGISTRY v1-vs-tbir equivalence fixtures (seed $SEED, JOBS=$JOBS)..."
+
+# Materialize cleaned rows to numbered files so workers can be addressed
+# by index without quoting the pipe-delimited row through xargs.
+RESDIR="$(mktemp -d "${TMPDIR:-/tmp}/harc_tbir_equiv.XXXXXX")"
+trap 'rm -rf "$RESDIR"' EXIT
+n=0
 while IFS= read -r row; do
-    # Strip comments; skip blank lines.
     row="${row%%#*}"
     [ -z "$(echo "$row" | xargs)" ] && continue
-    run_one "$row"
+    printf '%s\n' "$row" >"$RESDIR/$n.row"
+    n=$((n + 1))
 done < "$REGISTRY"
+
+# Fan out one worker per row, JOBS at a time. Each worker's stdout is
+# captured to <idx>.log so aggregated output is ordered, not interleaved.
+export HARC DUT_DIR FIX_DIR REGISTRY SEED OUT ARCH_BIN
+seq 0 $((n - 1)) | xargs -P "$JOBS" -I {} bash -c '
+    idx="$1"; resdir="$2"; self="$3"
+    bash "$self" __worker "$(cat "$resdir/$idx.row")" \
+        >"$resdir/$idx.log" 2>&1
+' _ {} "$RESDIR" "$0"
+
+PASS=0
+FAIL=0
+FAILED_NAMES=()
+for ((i = 0; i < n; i++)); do
+    [ -f "$RESDIR/$i.log" ] && grep -v '^__STATUS__ ' "$RESDIR/$i.log"
+    # A row can emit multiple status lines (--sv pair + [arch-dut] pair).
+    local_seen=0
+    while IFS= read -r status; do
+        local_seen=1
+        case "$status" in
+            "__STATUS__ PASS "*) PASS=$((PASS + 1)) ;;
+            "__STATUS__ FAIL "*) FAIL=$((FAIL + 1)); FAILED_NAMES+=("${status#__STATUS__ FAIL }") ;;
+        esac
+    done < <(grep '^__STATUS__ ' "$RESDIR/$i.log" 2>/dev/null)
+    if [ "$local_seen" -eq 0 ]; then
+        name="$(head -1 "$RESDIR/$i.row" 2>/dev/null | cut -d'|' -f1 | xargs)"
+        echo "  FAIL  ${name:-<row $i>} (worker produced no verdict)"
+        FAIL=$((FAIL + 1)); FAILED_NAMES+=("${name:-<row $i>}")
+    fi
+done
 
 echo
 echo "Result: $PASS passed, $FAIL failed"
