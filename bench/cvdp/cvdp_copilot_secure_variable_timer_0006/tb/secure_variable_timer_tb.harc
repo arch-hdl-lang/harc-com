@@ -132,7 +132,7 @@ impl SecureVariableTimerTest for SecureVariableTimerTb
         dut.i_ack = 0
         wait 2 cycles
 
-        for _ in 0 .. 6
+        for _ in 0 .. 5
             let s : TimerStim
             randomize(s)
             reset_timer()

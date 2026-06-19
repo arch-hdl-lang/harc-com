@@ -167,7 +167,7 @@ testbench WbAhbBridgeTb
         dut.hrdata = hrdata
         dut.hresp = 0
 
-        for _ in 0 .. wait_cycles
+        for _ in 1 .. wait_cycles
             dut.hready = 0
             wait 1 cycle on hclk
             if dut.ack_o != 0
@@ -283,7 +283,7 @@ impl WbAhbBridgeTest for WbAhbBridgeTb
         errors = errors + transfer(15, false, 0xFFFFFFFC, 0xCAFEBABE, 0xDEADBEEF, 0)
         errors = errors + transfer(0, true, 0x00000003, 0x13579BDF, 0x00000000, 1)
 
-        for _ in 0 .. 16
+        for _ in 0 .. 15
             let s : WbAhbStim
             randomize(s)
             let addr : uint<32> = make_addr(s.tag, s.index)

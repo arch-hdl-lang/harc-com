@@ -42,7 +42,7 @@ impl SecureRegisterBankTest for SecureRegisterBankTb
         write_reg(0, 0xAB)
         write_reg(1, 0xCD)
 
-        for k in 2 .. 18
+        for k in 2 .. 17
             write_reg(k, (k * 13) & 0xFF)
             read_reg(k)
         end for

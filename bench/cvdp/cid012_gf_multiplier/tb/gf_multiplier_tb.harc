@@ -22,7 +22,7 @@
 function gf_mul_ref(a: uint<4>, b: uint<4>) -> uint<4>
     let acc : uint<5> = 0
     let mc  : uint<5> = a              // multiplicand, room for bit 4
-    for i in 0 .. 4
+    for i in 0 .. 3
         if ((b >> i) & 1) == 1
             acc = acc ^ (mc & 0xf)     // XOR low 4 bits in
         end if
@@ -50,8 +50,8 @@ impl GfMultiplierTest for GfMultiplierTestTb
         wait 1 cycle
 
         let errors : uint<32> = 0
-        for a in 0 .. 16
-            for b in 0 .. 16
+        for a in 0 .. 15
+            for b in 0 .. 15
                 dut.A = a
                 dut.B = b
                 wait 1 cycle

@@ -42,7 +42,7 @@ transactor BufMgrXactor
         // After reset, the free-list SRAM seeds itself over 16 cycles.
         // Spin (up to 100 cycles, like C++) until init_done rises.
         hookable wait_init()
-            for _ in 0 .. 100
+            for _ in 0 .. 99
                 if dut.init_done == 0
                     wait 1 cycle
                 end if
@@ -74,7 +74,7 @@ transactor BufMgrXactor
         hookable idle_n(n: uint<32>)
             dut.enqueue_valid = 0
             dut.dequeue_valid = 0
-            for _ in 0 .. n
+            for _ in 1 .. n
                 wait 1 cycle
             end for
         end idle_n
@@ -183,7 +183,7 @@ impl BufMgrSmTest for BufMgrSmTb
         assert dut.free_count_out == 12
             else fail("Test 4: free_count=${dut.free_count_out} expected 12 after 4 enqueues")
 
-        for i in 0 .. 4
+        for i in 0 .. 3
             let vi = xact.dequeue_one(3)
             let expected = 0xA0 + i
             assert vi == expected

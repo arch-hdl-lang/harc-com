@@ -8,7 +8,7 @@ testbench BstSortTb
         dut.start = 1
         wait 1 cycle
         dut.start = 0
-        for _ in 0 .. cycles
+        for _ in 1 .. cycles
             wait 1 cycle
         end for
     end function run_sort

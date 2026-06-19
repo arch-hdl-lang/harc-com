@@ -9,7 +9,7 @@ end transaction Uint64UniqueStim
 test Uint64UniqueRandomizeTest
     let dut : DummyDut
     run
-        for i in 0 .. 34
+        for i in 0 .. 33
             let s : Uint64UniqueStim
             randomize(s)
         end for

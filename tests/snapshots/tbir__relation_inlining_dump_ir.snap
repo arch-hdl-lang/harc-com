@@ -29,7 +29,7 @@ fn fn0 run_RelationInliningTest [kind=Run, owner=tb0]
     -> Jump(b3)
 
   b3:
-    -> Branch((%i < 20), b4, b6)
+    -> Branch((%i <= 19), b4, b6)
 
   b4:
     RecordInit(%r, r0)

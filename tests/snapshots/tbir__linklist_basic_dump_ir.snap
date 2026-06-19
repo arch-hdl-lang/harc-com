@@ -577,7 +577,7 @@ fn fn0 run_LinklistBasicTest [kind=Run, owner=tb0]
     -> Jump(b55)
 
   b57:
-    -> Branch((%i < 8), b58, b60)
+    -> Branch((%i <= 7), b58, b60)
 
   b58:
     Assign(%__t39, 0)
@@ -616,7 +616,7 @@ fn fn0 run_LinklistBasicTest [kind=Run, owner=tb0]
     -> Jump(b61)
 
   b65:
-    -> Branch((%i_2 < 8), b66, b68)
+    -> Branch((%i_2 <= 7), b66, b68)
 
   b66:
     Assign(%want, (256 + %i_2))

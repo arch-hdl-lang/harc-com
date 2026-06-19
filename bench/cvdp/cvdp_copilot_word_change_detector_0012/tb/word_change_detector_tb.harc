@@ -68,7 +68,7 @@ impl WordChangeTest for WordChangeTb
         assert dut.word_change_pulse == 0 else fail("masked-off change should not pulse")
 
         // Toggle every bit with a single-bit mask, then with walking-zero masks.
-        for bit in 0 .. 8
+        for bit in 0 .. 7
             let one : uint<8> = (1 as uint<8>) << bit
             step_word_change(one, one, one, true, true)
             step_word_change(0, one, one, true, false)
@@ -79,7 +79,7 @@ impl WordChangeTest for WordChangeTb
 
         // Solver-backed variation: keep nonzero mask and relate pattern/data
         // so we naturally hit match and mismatch windows.
-        for _ in 0 .. 32
+        for _ in 0 .. 31
             let s : WordStim
             randomize(s) with
                 s.mask != 0

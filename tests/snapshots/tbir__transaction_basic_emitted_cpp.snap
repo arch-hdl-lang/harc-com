@@ -254,7 +254,7 @@ int run_TransactionBasicTest(int argc, char** argv) {
                     break;
                 }
                 case 2: {
-                    if ((i < 3)) { __bb = 3; } else { __bb = 5; }
+                    if ((i <= 2)) { __bb = 3; } else { __bb = 5; }
                     break;
                 }
                 case 3: {
@@ -291,7 +291,7 @@ int run_TransactionBasicTest(int argc, char** argv) {
                     break;
                 }
                 case 6: {
-                    _anon = 0;
+                    _anon = 1;
                     __t0 = cmd.ticks;
                     __bb = 9;
                     break;
@@ -306,7 +306,7 @@ int run_TransactionBasicTest(int argc, char** argv) {
                     break;
                 }
                 case 9: {
-                    if ((_anon < __t0)) { __bb = 10; } else { __bb = 12; }
+                    if ((_anon <= __t0)) { __bb = 10; } else { __bb = 12; }
                     break;
                 }
                 case 10: {

@@ -34,7 +34,7 @@ impl PtrSyncTest for PtrSyncTb
             else fail("after reset: data_out=${dut.data_out}, expected 0")
 
         // Sequential 0..15 through the 2-stage chain.
-        for v in 0 .. 16
+        for v in 0 .. 15
             dut.data_in = v
             wait 2 cycles on dst_clk
             assert dut.data_out == v

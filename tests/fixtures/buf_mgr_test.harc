@@ -95,7 +95,7 @@ transactor BufMgrXactor
         hookable idle(n: uint<32>)
             dut.enqueue_valid = 0
             dut.dequeue_valid = 0
-            for _ in 0 .. n
+            for _ in 1 .. n
                 wait 1 cycle
             end for
         end idle
@@ -197,7 +197,7 @@ impl BufMgrTest for BufMgrTb
         xact.enqueue(5, 0xA3)
         xact.idle(6)
 
-        for i in 0 .. 4
+        for i in 0 .. 3
             let v4 = xact.dequeue(5)
             let expect4 = 0xA0 + i
             assert v4 == expect4

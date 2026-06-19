@@ -44,7 +44,7 @@ fn fn1 run_HeartbeatIdleTest [kind=Run, owner=tb0]
     -> Jump(b3)
 
   b3:
-    -> Branch((%i < 3), b4, b6)
+    -> Branch((%i <= 2), b4, b6)
 
   b4:
     RecordInit(%t, r0)

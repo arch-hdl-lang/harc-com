@@ -67,13 +67,13 @@ testbench SerialLineConverterTb
     function drive_pattern(mode: uint<3>, pattern: uint<8>)
         dut.mode = mode
 
-        for bit in 0 .. 8
+        for bit in 0 .. 7
             drive_bit((((pattern >> bit) & 1) == 1))
         end for
 
         // Keep the mode selected long enough for CLK_DIV=16 to produce clk_pulse,
         // which is required to exercise RZ and scrambled-mode divider behavior.
-        for bit in 0 .. 20
+        for bit in 0 .. 19
             drive_bit(((bit & 1) == 1))
         end for
     end function drive_pattern
@@ -85,7 +85,7 @@ impl SerialLineConverterTest for SerialLineConverterTb
 
         reset_converter()
 
-        for mode in 0 .. 8
+        for mode in 0 .. 7
             drive_pattern(mode, 0x00)
             drive_pattern(mode, 0xFF)
             drive_pattern(mode, 0xAA)
@@ -93,7 +93,7 @@ impl SerialLineConverterTest for SerialLineConverterTb
             drive_pattern(mode, ((1 as uint<8>) << mode).trunc<8>())
         end for
 
-        for _ in 0 .. 16
+        for _ in 0 .. 15
             let s : SerialStim
             randomize(s)
             drive_pattern(s.mode, s.pattern)

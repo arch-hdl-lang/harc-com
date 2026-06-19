@@ -174,7 +174,7 @@ impl CsrApbTest for CsrApbTb
 
         reset_csr()
 
-        for bit in 0 .. 32
+        for bit in 0 .. 31
             let data : uint<32> = ((1 as uint<32>) << bit).trunc<32>()
             apb_write(16, data)
             let _rd = apb_read(16)
@@ -182,7 +182,7 @@ impl CsrApbTest for CsrApbTb
             let _rz = apb_read(16)
         end for
 
-        for _ in 0 .. 48
+        for _ in 0 .. 47
             let t : CsrApbStim
             randomize(t)
             if t.write
@@ -193,7 +193,7 @@ impl CsrApbTest for CsrApbTb
         end for
 
         // Force a few invalid randomized-style accesses with relation inlining.
-        for _ in 0 .. 8
+        for _ in 0 .. 7
             let bad : CsrApbStim
             randomize(bad) with InvalidCsr(bad) end randomize
             apb_write(bad.addr, bad.data)

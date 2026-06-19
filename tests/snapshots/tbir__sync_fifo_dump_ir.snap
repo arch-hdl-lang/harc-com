@@ -38,7 +38,7 @@ fn fn1 run_SyncFifoTest [kind=Run, owner=tb0]
     -> Jump(b2)
 
   b2:
-    -> Branch((%i < 16), b3, b5)
+    -> Branch((%i <= 15), b3, b5)
 
   b3:
     DutWrite(dut.push_valid, 1)
@@ -66,7 +66,7 @@ fn fn1 run_SyncFifoTest [kind=Run, owner=tb0]
     -> Jump(b8)
 
   b8:
-    -> Branch((%i_2 < 16), b9, b11)
+    -> Branch((%i_2 <= 15), b9, b11)
 
   b9:
     DutWrite(dut.pop_ready, 1)

@@ -30,7 +30,7 @@ fn fn0 run_ScoreboardBasicTest [kind=Run, owner=tb0]
     -> Jump(b2)
 
   b2:
-    -> Branch((%i < 3), b3, b5)
+    -> Branch((%i <= 2), b3, b5)
 
   b3:
     Assign(%bump, (%i + 1))
@@ -38,7 +38,7 @@ fn fn0 run_ScoreboardBasicTest [kind=Run, owner=tb0]
     ScoreboardOp(sb0.sb, expected.push(%total))
     ScoreboardOp(sb0.sb, writes = (ScoreboardQuery(sb0.sb.writes) + 1))
     DutWrite(dut.en, 1)
-    Assign(%_anon, 0)
+    Assign(%_anon, 1)
     -> Jump(b6)
 
   b4:
@@ -50,7 +50,7 @@ fn fn0 run_ScoreboardBasicTest [kind=Run, owner=tb0]
     -> Return
 
   b6:
-    -> Branch((%_anon < %bump), b7, b9)
+    -> Branch((%_anon <= %bump), b7, b9)
 
   b7:
     -> WaitCycles(1, b10)

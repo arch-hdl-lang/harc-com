@@ -207,7 +207,7 @@ impl GenericCounterTest for GenericCounterTestTb
         dut.rst_in = 0
         dut.enable_in = 1
         dut.mode_in = 2  // MODULO_256 - uses ref_modulo branches
-        for v in 0 .. 8
+        for v in 0 .. 7
             dut.ref_modulo = 1 << v   // single-bit walking-1: 0x01,0x02,0x04,...,0x80
             wait 1 cycle
         end for
@@ -216,7 +216,7 @@ impl GenericCounterTest for GenericCounterTestTb
         dut.ref_modulo = 0x00
         wait 1 cycle
         // Now toggle every bit of mode_in via walking-1
-        for m in 0 .. 8
+        for m in 0 .. 7
             dut.mode_in = m
             wait 1 cycle
         end for
@@ -225,7 +225,7 @@ impl GenericCounterTest for GenericCounterTestTb
         // in CounterStim feed HARC's auto-coverage preference machinery,
         // while the explicit covergroup records actual sampled mode,
         // enable, ref_modulo, and mode x enable combinations.
-        for k in 0 .. 32
+        for k in 0 .. 31
             let s : CounterStim
             randomize(s)
             dut.mode_in = s.mode
@@ -245,7 +245,7 @@ impl GenericCounterTest for GenericCounterTestTb
         // -> 0x7F -> 0x3F -> 0x1F -> 0x0F -> 0x07 -> 0x03 -> 0x01 -> 0x00),
         // ensuring every bit of o_count toggles both 0->1 and 1->0.
         dut.mode_in = 3  // JOHNSON
-        for _ in 0 .. 18
+        for _ in 0 .. 17
             wait 1 cycle
         end for
 

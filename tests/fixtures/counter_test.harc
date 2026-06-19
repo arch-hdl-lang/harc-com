@@ -20,7 +20,7 @@ impl CounterTest for WrapCounterTb
         dut.rst = 0
 
         // Count from 0 to 15.
-        for i in 0 .. 16
+        for i in 0 .. 15
             assert dut.value == i else fail("count mismatch")
             if i == 15
                 assert dut.at_max else fail("at_max should be 1 at 15")

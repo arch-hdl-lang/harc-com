@@ -91,7 +91,7 @@ impl RingTokenTest for RingTokenTb
 
         // ── Continue walking with has_data_to_send=0 to cover the else ─
         dut.has_data_to_send = 0
-        for k in 0 .. 8
+        for k in 0 .. 7
             dut.data_in = (k & 0xF).trunc<4>()
             wait 1 cycle
             assert dut.data_out == 0
@@ -99,7 +99,7 @@ impl RingTokenTest for RingTokenTb
         end for
 
         // ── Vary has_data_to_send & data_in patterns across the bus ─
-        for k in 0 .. 16
+        for k in 0 .. 15
             dut.data_in = (k & 0xF).trunc<4>()
             dut.has_data_to_send = ((k >> 1) & 1).trunc<1>()
             wait 1 cycle
@@ -138,7 +138,7 @@ impl RingTokenTest for RingTokenTb
             else fail("re-reset NODE3: data_out=0x${dut.data_out:01x}, expected 0")
 
         // ── data_in variations on the forwarding cycle (drive each bit) ─
-        for k in 0 .. 4
+        for k in 0 .. 3
             dut.rst = 1
             wait 2 cycles
             dut.rst = 0

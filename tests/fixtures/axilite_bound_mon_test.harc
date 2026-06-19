@@ -65,7 +65,7 @@ transactor AxilXactor bound to BusAxiLite
 end transactor AxilXactor
 
 tseq RandomTxns(n: int) -> TSeq<RegOp>
-    for _ in 0 .. n
+    for _ in 1 .. n
         let t : RegOp
         randomize(t)
         t.addr = 24

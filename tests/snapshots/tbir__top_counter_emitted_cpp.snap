@@ -207,7 +207,7 @@ int run_TopCounterTest(int argc, char** argv) {
                     break;
                 }
                 case 2: {
-                    if ((i < 11)) { __bb = 3; } else { __bb = 5; }
+                    if ((i <= 10)) { __bb = 3; } else { __bb = 5; }
                     break;
                 }
                 case 3: {
@@ -237,7 +237,7 @@ int run_TopCounterTest(int argc, char** argv) {
                     break;
                 }
                 case 7: {
-                    if ((_anon < 5)) { __bb = 8; } else { __bb = 10; }
+                    if ((_anon <= 4)) { __bb = 8; } else { __bb = 10; }
                     break;
                 }
                 case 8: {
@@ -266,7 +266,7 @@ int run_TopCounterTest(int argc, char** argv) {
                     break;
                 }
                 case 12: {
-                    if ((i_2 < 6)) { __bb = 13; } else { __bb = 15; }
+                    if ((i_2 <= 5)) { __bb = 13; } else { __bb = 15; }
                     break;
                 }
                 case 13: {

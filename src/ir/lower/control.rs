@@ -99,7 +99,14 @@ impl FuncBuilder<'_> {
         let hi_ir = self.lower_expr_no_ports(hi)?;
         let hi_operand = self.stash_if_impure(hi_ir);
 
-        let cond = Expr::Binary(BinOp::Lt, Box::new(Expr::Local(var)), Box::new(hi_operand));
+        // `for i in lo .. hi` is INCLUSIVE of `hi` (`lo, lo+1, …, hi`),
+        // matching ARCH's `lo..hi` range semantics so the two co-authored
+        // languages agree on the most basic loop construct. The header
+        // therefore tests `i <= hi`, not `i < hi`. (The `for t in <seq>`
+        // path below keeps its `i < seq.size()` half-open counter — that
+        // iterates the element indices `0 … size-1`, unrelated to the
+        // user-facing numeric range.)
+        let cond = Expr::Binary(BinOp::Le, Box::new(Expr::Local(var)), Box::new(hi_operand));
         let step = Stmt::Assign(
             var,
             Expr::Binary(

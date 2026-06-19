@@ -58,7 +58,7 @@ transactor AxilXactor bound to BusAxiLite
 end transactor AxilXactor
 
 tseq RandomTxns(n: int) -> TSeq<RegOp>
-    for _ in 0 .. n
+    for _ in 1 .. n
         let t : RegOp
         randomize(t)
         t.addr = 24
@@ -117,7 +117,7 @@ impl AxiLiteMultiPayloadTest for AxiLiteMultiPayloadTb
             else fail("expected 5 r_resp observations, got ${mon.sb.r_resp.size()}")
 
         // Drain the resp queue; every entry should be 0 (OKAY).
-        for _ in 0 .. 5
+        for _ in 0 .. 4
             let r = mon.sb.r_resp.pop()
             assert r == 0
                 else fail("passive observer saw non-OKAY resp: ${r}")

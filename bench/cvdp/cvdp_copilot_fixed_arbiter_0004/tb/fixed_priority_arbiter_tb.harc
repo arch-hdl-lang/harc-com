@@ -15,7 +15,7 @@
 // Software reference: priority-encode req's lowest set bit into a
 // one-hot grant. Returns 0 when req is all-zero.
 function priority_grant(req: uint<8>) -> uint<8>
-    for i in 0 .. 8
+    for i in 0 .. 7
         if ((req >> i) & 1) == 1
             return 1 << i
         end if
@@ -42,7 +42,7 @@ impl FixedPriorityArbiterTest for FixedPriorityArbiterTestTb
 
         // ── Exhaustive sweep ─────────────────────────────────────
         let errors : uint<32> = 0
-        for r in 0 .. 256
+        for r in 0 .. 255
             dut.req = r
             wait 1 cycle
             let expected = priority_grant(r)

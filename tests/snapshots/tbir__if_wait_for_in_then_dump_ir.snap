@@ -43,7 +43,7 @@ fn fn0 run_IfWaitForInThenTest [kind=Run, owner=tb0]
     -> Jump(b4)
 
   b4:
-    -> Branch((%c < 100), b5, b7)
+    -> Branch((%c <= 99), b5, b7)
 
   b5:
     -> Branch(((%c % 3) == 0), b9, b10)

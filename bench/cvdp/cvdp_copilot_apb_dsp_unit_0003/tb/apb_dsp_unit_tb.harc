@@ -302,7 +302,7 @@ impl ApbDspTest for ApbDspTb
         assert bus.read(0xFF) == 0x7E
             else fail("memory read @0xff mismatch")
 
-        for k in 0 .. 24
+        for k in 0 .. 23
             let t : ApbStim
             randomize(t) with
                 LegalCsr(t)
@@ -320,7 +320,7 @@ impl ApbDspTest for ApbDspTb
             end if
         end for
 
-        for k in 0 .. 16
+        for k in 0 .. 15
             let t : ApbStim
             randomize(t) with
                 InvalidCsr(t)
@@ -332,7 +332,7 @@ impl ApbDspTest for ApbDspTb
             bus.invalid_access(t.addr, t.data, t.write)
         end for
 
-        for k in 0 .. 12
+        for k in 0 .. 11
             let t : ApbStim
             randomize(t) with
                 t.sel == 0 || t.enable == 0
@@ -343,7 +343,7 @@ impl ApbDspTest for ApbDspTb
                 else fail("malformed random APB k=${k} raised pslverr without apb_valid")
         end for
 
-        for m in 0 .. 8
+        for m in 0 .. 7
             bus.write(2, m as uint<8>)
             wait 1 cycle
         end for

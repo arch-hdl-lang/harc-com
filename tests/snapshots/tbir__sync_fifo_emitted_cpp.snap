@@ -239,7 +239,7 @@ int run_SyncFifoTest(int argc, char** argv) {
                     break;
                 }
                 case 2: {
-                    if ((i < 16)) { __bb = 3; } else { __bb = 5; }
+                    if ((i <= 15)) { __bb = 3; } else { __bb = 5; }
                     break;
                 }
                 case 3: {
@@ -284,7 +284,7 @@ int run_SyncFifoTest(int argc, char** argv) {
                     break;
                 }
                 case 8: {
-                    if ((i_2 < 16)) { __bb = 9; } else { __bb = 11; }
+                    if ((i_2 <= 15)) { __bb = 9; } else { __bb = 11; }
                     break;
                 }
                 case 9: {

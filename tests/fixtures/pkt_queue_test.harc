@@ -72,7 +72,7 @@ impl PacketQueueTest for PacketQueueTb
         log(info, "PASS: single push/pop round-trip")
 
         // Fill to DEPTH=8 then check full.
-        for i in 0 .. 8
+        for i in 0 .. 7
             pq_push(dut, 256 + i)         // 0x100 + i
         end for
         assert dut.full   == 1 else fail("full should be 1 after 8 pushes")
@@ -80,7 +80,7 @@ impl PacketQueueTest for PacketQueueTb
         log(info, "PASS: queue full after 8 pushes")
 
         // Drain and verify FIFO order.
-        for i in 0 .. 8
+        for i in 0 .. 7
             let got = pq_pop(dut)
             let want = 256 + i
             assert got == want

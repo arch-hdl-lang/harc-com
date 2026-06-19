@@ -20,9 +20,9 @@ impl IirFiltTest for IirFiltTb
         dut.reset = 0
         wait 1 cycle
 
-        for sel in 0 .. 4
+        for sel in 0 .. 3
             dut.filter_select = sel
-            for k in 0 .. 12
+            for k in 0 .. 11
                 dut.in_1 = ((k * 17) - 80)
                 dut.in_2 = (90 - (k * 11))
                 dut.in_3 = ((k * k) - 48)
@@ -37,7 +37,7 @@ impl IirFiltTest for IirFiltTb
 
         // Endpoint and walking patterns hit sign and coefficient expression
         // branches while the default filter_select zeros the outputs.
-        for sel in 0 .. 4
+        for sel in 0 .. 3
             dut.filter_select = sel
             dut.in_1 = 32767
             dut.in_2 = -32768

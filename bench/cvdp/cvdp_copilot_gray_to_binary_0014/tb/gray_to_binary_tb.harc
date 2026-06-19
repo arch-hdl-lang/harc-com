@@ -26,7 +26,7 @@ impl GrayToBinaryTest for GrayToBinaryTestTb
         wait 1 cycle
 
         let errors : uint<32> = 0
-        for g in 0 .. 16
+        for g in 0 .. 15
             dut.gray_in = g
             wait 1 cycle
             let expected = gray_to_binary_ref(g)

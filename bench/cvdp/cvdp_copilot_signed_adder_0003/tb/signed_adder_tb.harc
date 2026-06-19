@@ -228,7 +228,7 @@ impl SignedAdderTest for SignedAdderTb
         wait 1 cycle
 
         // ── A few add/sub completions to toggle remaining operand bits ─
-        for k in 0 .. 8
+        for k in 0 .. 7
             let pat : uint<8> = (1 as uint<8>) << k
             dut.i_operand_a = pat
             dut.i_operand_b = (0xFF as uint<8>) ^ pat
@@ -256,7 +256,7 @@ impl SignedAdderTest for SignedAdderTb
         // ── Targeted sub completions with varied bit patterns to
         //    toggle every bit of reg_operand_a / reg_operand_b /
         //    result on the subtract-overflow path (line 73).
-        for k in 0 .. 8
+        for k in 0 .. 7
             let pat_a : uint<8> = (1 as uint<8>) << k
             // a = walking-1, b = walking-1 shifted by 1 → distinct
             // operand bits, varied result bit pattern
@@ -284,7 +284,7 @@ impl SignedAdderTest for SignedAdderTb
         end for
 
         // Random-ish subs hitting both sign combinations
-        for k in 0 .. 16
+        for k in 0 .. 15
             let av : uint<8> = ((k * 23) & 0xFF) as uint<8>
             let bv : uint<8> = ((k * 41 + 7) & 0xFF) as uint<8>
             dut.i_operand_a = av

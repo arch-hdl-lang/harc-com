@@ -121,7 +121,7 @@ testbench ApbDspOpTb
         pclk_tick()
     end function apb_enable_only
     function dsp_wait(n: uint<8>)
-        for _ in 0 .. n
+        for _ in 1 .. n
             wait 1 cycle
         end for
     end function dsp_wait
@@ -219,7 +219,7 @@ impl ApbDspOpTest for ApbDspOpTb
         assert dut.PSLVERR == 1 else fail("invalid DSP write-back address did not raise PSLVERR")
         apb_idle()
 
-        for bit in 0 .. 16
+        for bit in 0 .. 15
             let one : uint<32> = ((1 as uint<32>) << bit).trunc<32>()
             sram_write(bit as uint<32>, one)
             sram_write((31 - bit) as uint<32>, (0xFFFFFFFF ^ one).trunc<32>())
@@ -227,7 +227,7 @@ impl ApbDspOpTest for ApbDspOpTb
         sram_write(32, 0x80000000)
         sram_write(33, 0x7FFFFFFF)
 
-        for k in 0 .. 32
+        for k in 0 .. 31
             let t : ApbDspOpStim
             randomize(t) with ValidApbAddr(t) end randomize
             if t.write
@@ -237,7 +237,7 @@ impl ApbDspOpTest for ApbDspOpTb
             end if
         end for
 
-        for k in 0 .. 34
+        for k in 0 .. 33
             let t : ApbDspOpStim
             randomize(t) with
                 t.addr == 20
@@ -245,7 +245,7 @@ impl ApbDspOpTest for ApbDspOpTb
             apb_write(20, t.data)
         end for
 
-        for addr in 0 .. 7
+        for addr in 0 .. 6
             let reg_addr : uint<8> = (addr * 4) as uint<8>
             apb_enable_only(reg_addr, 0xFFFFFFFF, true)
             apb_enable_only(reg_addr, 0, false)

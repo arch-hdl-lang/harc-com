@@ -80,7 +80,7 @@ impl AdcRotateTest for AdcRotateTb
         dut.i_rst_n = 1
         wait 1 cycle
 
-        for dir in 0 .. 2
+        for dir in 0 .. 1
             drive_rotate(0x00, 0, dir == 1)
             drive_rotate(0xFF, 0, dir == 1)
             drive_rotate(0xAA, 0, dir == 1)
@@ -93,13 +93,13 @@ impl AdcRotateTest for AdcRotateTb
             drive_rotate(0x5A, 15, dir == 1)
         end for
 
-        for bit in 0 .. 8
+        for bit in 0 .. 7
             let data : uint<8> = ((1 as uint<8>) << bit).trunc<8>()
             drive_rotate(data, bit as uint<4>, false)
             drive_rotate((0xFF ^ data).trunc<8>(), (15 - bit) as uint<4>, true)
         end for
 
-        for k in 0 .. 32
+        for k in 0 .. 31
             let s : RotateStim
             randomize(s)
             drive_rotate(s.data, s.shift, s.dir)

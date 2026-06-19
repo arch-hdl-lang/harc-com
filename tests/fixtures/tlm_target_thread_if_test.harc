@@ -17,7 +17,7 @@ transactor TlmMemTarget bound to TlmMemBus
         let req_seq : uint<32> = read_count
         read_count = read_count + 1
         prep_acc = 0
-        for i in 0 .. 4
+        for i in 0 .. 3
             prep_acc = prep_acc + addr + i
         end for
         wait 1 cycle

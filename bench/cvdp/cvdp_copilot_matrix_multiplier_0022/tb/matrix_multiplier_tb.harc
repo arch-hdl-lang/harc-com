@@ -73,7 +73,7 @@ testbench MatrixMultiplierTb
         wait 2 cycles on clk
     end function reset_matrix
     function wait_for_valid(limit: uint<8>) -> uint<1>
-        for _ in 0 .. limit
+        for _ in 1 .. limit
             if dut.valid_out == 1
                 return 0
             end if
@@ -203,7 +203,7 @@ impl MatrixMultiplierTest for MatrixMultiplierTb
             else fail("forked matrix product 1 low64=0x${pipe1:016x}, expected 0x000100004000100004")
         wait 2 cycles on clk
 
-        for _ in 0 .. 8
+        for _ in 0 .. 7
             let s : MatrixStim
             randomize(s)
             let a : uint<128> = 0x01010101010101010101010101010101

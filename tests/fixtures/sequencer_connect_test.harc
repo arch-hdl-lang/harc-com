@@ -22,7 +22,7 @@ sequencer CountSeq
     // Generate `n` items (value == index) and emit each on `dispatched`.
     // Literal-range loop only — no TSeq iteration in this subset.
     hookable dispatch(n: uint<8>)
-        for i in 0 .. n
+        for i in 0 .. n - 1
             emit dispatched(i)
         end for
     end dispatch

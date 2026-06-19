@@ -35,7 +35,7 @@ impl ClkDivCounterTest for ClkDivCounterTb
 
         // After N more fast cycles the counter is at (N+2)/2 with
         // integer division — odd N holds, even N increments.
-        for i in 1 .. 9
+        for i in 1 .. 8
             wait 1 cycle
             let expected = (i + 2) / 2
             assert dut.count == expected

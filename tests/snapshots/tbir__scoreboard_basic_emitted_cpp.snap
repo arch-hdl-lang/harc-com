@@ -217,7 +217,7 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
                     break;
                 }
                 case 2: {
-                    if ((i < 3)) { __bb = 3; } else { __bb = 5; }
+                    if ((i <= 2)) { __bb = 3; } else { __bb = 5; }
                     break;
                 }
                 case 3: {
@@ -226,7 +226,7 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
                     _tb.sb.expected.push(total);
                     _tb.sb.writes = (_tb.sb.writes + 1);
                     harc_rt::harc_assign(dut->en, 1);
-                    _anon = 0;
+                    _anon = 1;
                     __bb = 6;
                     break;
                 }
@@ -244,7 +244,7 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
                     break;
                 }
                 case 6: {
-                    if ((_anon < bump)) { __bb = 7; } else { __bb = 9; }
+                    if ((_anon <= bump)) { __bb = 7; } else { __bb = 9; }
                     break;
                 }
                 case 7: {

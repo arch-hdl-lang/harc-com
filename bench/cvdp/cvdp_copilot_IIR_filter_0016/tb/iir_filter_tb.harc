@@ -34,15 +34,15 @@ impl IirFilterTest for IirFilterTb
 
         // Impulse and settling tail.
         drive_iir(16000)
-        for _ in 0 .. 10
+        for _ in 0 .. 9
             drive_iir(0)
         end for
 
         // Positive and negative steps.
-        for _ in 0 .. 12
+        for _ in 0 .. 11
             drive_iir(1000)
         end for
-        for _ in 0 .. 12
+        for _ in 0 .. 11
             drive_iir(-1000)
         end for
 
@@ -51,14 +51,14 @@ impl IirFilterTest for IirFilterTb
         drive_iir(-32768)
         drive_iir(1)
         drive_iir(-1)
-        for bit in 0 .. 14
+        for bit in 0 .. 13
             let v : sint<16> = (1 as sint<16>) << bit
             drive_iir(v)
             drive_iir(-v)
         end for
 
         // Solver-backed unique samples for additional history states.
-        for _ in 0 .. 48
+        for _ in 0 .. 47
             let s : IirSample
             randomize(s)
             drive_iir(s.sample)

@@ -19,7 +19,7 @@ end testbench HammingRxTb
 impl HammingRxTest for HammingRxTb
     run
         log(info, "hamming_code_receiver: exhaustive 8-bit sweep")
-        for i in 0 .. 256
+        for i in 0 .. 255
             dut.data_in = i
             wait 1 cycle
             let b0 = (i >> 0) & 1

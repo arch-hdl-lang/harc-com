@@ -134,12 +134,12 @@ impl AfiPtrTest for AfiPtrTb
         dut.reset = 0
         wait 1 cycle
 
-        for slot in 0 .. 8
+        for slot in 0 .. 7
             let len : uint<27> = ((slot + 1) * 17) as uint<27>
             write_len(slot as uint<3>, len)
         end for
 
-        for bit in 0 .. 16
+        for bit in 0 .. 15
             let one : uint<27> = ((1 as uint<27>) << bit).trunc<27>()
             write_len((bit % 8) as uint<3>, one)
             write_len(((bit + 4) % 8) as uint<3>, (0x7FFFFFF ^ one).trunc<27>())
@@ -157,8 +157,8 @@ impl AfiPtrTest for AfiPtrTb
         reset_mask(8)
         reset_mask(15)
 
-        for ch in 0 .. 4
-            for inc in 0 .. 4
+        for ch in 0 .. 3
+            for inc in 0 .. 3
                 let busy : uint<4> = ((1 as uint<4>) << ch).trunc<4>()
                 update_ptr(ch as uint<2>, inc as uint<2>, busy, true)
             end for
@@ -167,7 +167,7 @@ impl AfiPtrTest for AfiPtrTb
         update_ptr(0, 3, 0, false)
         update_ptr(1, 3, 15, false)
 
-        for k in 0 .. 40
+        for k in 0 .. 39
             let s : AfiStim
             randomize(s)
             write_len(s.len_slot, s.len)

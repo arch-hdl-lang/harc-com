@@ -56,7 +56,7 @@ impl TbFieldAgentTest for TbFieldAgentTb
 
         // Drive 3 transactions spaced 2 cycles apart. Each `emit` fans
         // out to the agent's `on in_ev` handler synchronously.
-        for i in 0 .. 3
+        for i in 0 .. 2
             emit tagger.in_ev(i + 1)
             wait 2 cycles
         end for

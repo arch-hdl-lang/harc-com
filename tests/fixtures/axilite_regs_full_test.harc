@@ -107,7 +107,7 @@ impl AxiLiteRegsFullTest for AxiLiteRegsFullTb
         axil.w.valid = 1
 
         let start_seen = 0
-        for _ in 0 .. 10
+        for _ in 0 .. 9
             wait 1 cycle
             if dut.mm2s_start
                 start_seen = 1
@@ -218,7 +218,7 @@ impl AxiLiteRegsFullTest for AxiLiteRegsFullTb
         axil.w.valid = 1
 
         let sg_start_seen = 0
-        for _ in 0 .. 10
+        for _ in 0 .. 9
             wait 1 cycle
             if dut.mm2s_sg_start
                 sg_start_seen = 1

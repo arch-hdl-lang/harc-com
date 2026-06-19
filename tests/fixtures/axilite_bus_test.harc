@@ -84,7 +84,7 @@ impl AxiLiteBusTest for AxiLiteBusTb
         let saw = 0
         axil.ar.addr = 24
         axil.ar.valid = 1
-        for _ in 0 .. 10
+        for _ in 0 .. 9
             wait 1 cycle
             if axil.r.valid
                 if saw == 0

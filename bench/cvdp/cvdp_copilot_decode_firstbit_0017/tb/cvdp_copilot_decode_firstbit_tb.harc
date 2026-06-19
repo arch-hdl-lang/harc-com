@@ -50,7 +50,7 @@ impl FirstBitTest for FirstBitTestTb
         // to drain, then check. (Not pipelined-densely, but correct.)
         dut.In_Valid = 1
         let errors : uint<32> = 0
-        for i in 0 .. 32
+        for i in 0 .. 31
             dut.In_Data = 1 << i
             wait 4 cycles
             if dut.Out_Found != 1
@@ -106,7 +106,7 @@ impl FirstBitTest for FirstBitTestTb
         // ── Toggle-sweep tail: walking-0 + a few mixed patterns to
         // hit every bit-direction transition on In_Data. Walking-1
         // already did most; this completes the picture.
-        for i in 0 .. 32
+        for i in 0 .. 31
             dut.In_Data = ((1 as uint<32>) << i) ^ 0xFFFFFFFF   // walking-0
             wait 1 cycle
         end for

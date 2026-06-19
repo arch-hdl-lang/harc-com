@@ -45,45 +45,45 @@ impl PingPongTest for PingPongTb
         step_ping_pong(0, false, false)
 
         // A few writes, then reads from non-empty state.
-        for i in 0 .. 16
+        for i in 0 .. 15
             step_ping_pong(i.trunc<8>(), true, false)
         end for
         assert dut.buffer_empty == 0 else fail("after writes: expected non-empty")
-        for i in 0 .. 8
+        for i in 0 .. 7
             step_ping_pong((0x80 + i).trunc<8>(), false, true)
         end for
 
         // Mixed traffic, including both enables asserted.
-        for i in 0 .. 40
+        for i in 0 .. 39
             step_ping_pong((0x20 + i).trunc<8>(), (i & 1) == 0, (i & 3) == 0)
             step_ping_pong((0x60 + i).trunc<8>(), true, true)
         end for
 
         // Fill enough to wrap write_ptr and assert full/path guards.
         dut.read_enable = 0
-        for i in 0 .. 270
+        for i in 0 .. 269
             step_ping_pong(i.trunc<8>(), true, false)
         end for
 
         // Drain enough to wrap read_ptr and toggle buffer_select.
         dut.write_enable = 0
-        for _ in 0 .. 270
+        for _ in 0 .. 269
             step_ping_pong(0, false, true)
         end for
 
         // Repeat a full fill/drain after buffer_select has toggled once so
         // the `!buffer_select` expression itself is observed both ways.
         dut.read_enable = 0
-        for i in 0 .. 270
+        for i in 0 .. 269
             step_ping_pong((0x40 + i).trunc<8>(), true, false)
         end for
         dut.write_enable = 0
-        for _ in 0 .. 270
+        for _ in 0 .. 269
             step_ping_pong(0, false, true)
         end for
 
         // Randomized post-wrap traffic to revisit both memory banks.
-        for _ in 0 .. 64
+        for _ in 0 .. 63
             let s : PingPongStim
             randomize(s)
             step_ping_pong(s.data, s.write, s.read)

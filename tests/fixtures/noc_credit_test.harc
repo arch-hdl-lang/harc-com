@@ -40,7 +40,7 @@ transactor NocCreditXactor
         hookable run_window(gen: uint<8>, pop: uint<8>, cycles: uint<32>)
             dut.gen_pressure = gen
             dut.pop_pressure = pop
-            for _ in 0 .. cycles
+            for _ in 1 .. cycles
                 wait 1 cycle
             end for
         end run_window

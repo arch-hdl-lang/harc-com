@@ -57,7 +57,7 @@ impl EventSyncTest for EventSyncTb
         log(info, "PASS: second pulse propagated correctly")
 
         // ── Test 3: idle → no spurious pulses ─────────────────────────
-        for _ in 0 .. 5
+        for _ in 0 .. 4
             wait 1 cycle on src_clk
             assert dut.data_out == 0
                 else fail("spurious data_out=${dut.data_out} during idle")

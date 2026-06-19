@@ -94,7 +94,7 @@ transactor SpiDriver
             let saw_transmit : bool = false
             let saw_toggle : bool = false
             let saw_done : bool = false
-            for _ in 0 .. 40
+            for _ in 0 .. 39
                 if dut.o_fsm_state == 1
                     saw_transmit = true
                 end if
@@ -120,7 +120,7 @@ transactor SpiDriver
             dut.i_clear = 0
             wait 1 cycle
 
-            for _ in 0 .. at_cycle
+            for _ in 1 .. at_cycle
                 wait 1 cycle
             end for
 
@@ -180,13 +180,13 @@ impl SpiFsmTest for SpiFsmTb
         drv.interrupt_transfer(0xCAFE, 6, false, true)
         drv.interrupt_transfer(0xBEEF, 8, true, false)
 
-        for bit in 0 .. 16
+        for bit in 0 .. 15
             let data : uint<16> = ((1 as uint<16>) << bit).trunc<16>()
             drv.full_transfer(data)
             drv.full_transfer((0xFFFF ^ data).trunc<16>())
         end for
 
-        for _ in 0 .. 24
+        for _ in 0 .. 23
             let s : SpiStim
             randomize(s)
             if s.fault or s.clear

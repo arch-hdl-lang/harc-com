@@ -25,7 +25,7 @@ fn fn0 harc_crc8_step [kind=Helper]
     -> Jump(b1)
 
   b1:
-    -> Branch((%_anon < 8), b2, b4)
+    -> Branch((%_anon <= 7), b2, b4)
 
   b2:
     -> Branch(((%x & 128) != 0), b6, b7)
@@ -73,7 +73,7 @@ fn fn1 run_ExternFnRefTest [kind=Run, owner=tb0]
     -> Jump(b3)
 
   b3:
-    -> Branch((%i < 16), b4, b6)
+    -> Branch((%i <= 15), b4, b6)
 
   b4:
     Assign(%b, (((%i * 17) + 42) & 255))

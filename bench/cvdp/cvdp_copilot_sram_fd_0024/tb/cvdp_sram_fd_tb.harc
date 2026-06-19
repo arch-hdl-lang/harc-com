@@ -192,7 +192,7 @@ impl SramFdTest for SramFdTb
         // Initialize the whole 16-entry address space two locations per
         // cycle using legal simultaneous writes to different addresses.
         dut.ce = 1
-        for i in 0 .. 8
+        for i in 0 .. 7
             let a : uint<4> = i as uint<4>
             let b : uint<4> = (i + 8) as uint<4>
             dut.a_we = 1
@@ -365,7 +365,7 @@ impl SramFdTest for SramFdTb
         dut.ce = 1
         dut.a_oe = 0
         dut.b_oe = 0
-        for bit in 0 .. 8
+        for bit in 0 .. 7
             dut.a_we = 1
             dut.b_we = 1
             dut.a_addr = bit as uint<4>
@@ -383,13 +383,13 @@ impl SramFdTest for SramFdTb
 
         // Verilator instruments the unpacked memory array per element and
         // data bit. Force every RAM bit through 0 and 1 with legal writes.
-        for addr in 0 .. 16
+        for addr in 0 .. 15
             write_a(addr as uint<4>, 0x00)
         end for
-        for addr in 0 .. 16
+        for addr in 0 .. 15
             write_b(addr as uint<4>, 0xFF)
         end for
-        for addr in 0 .. 16
+        for addr in 0 .. 15
             write_a(addr as uint<4>, init_data(addr as uint<4>))
         end for
 
@@ -397,7 +397,7 @@ impl SramFdTest for SramFdTb
         // same-address collisions, different-address dual writes, and
         // general legal traffic, respectively. Transaction field ranges
         // feed HARC's auto-coverage preferences; covergroups sample pins.
-        for k in 0 .. 12
+        for k in 0 .. 11
             let t : SramTxn
             randomize(t) with CrossPortCollision(t) end randomize
             dut.ce = t.ce
@@ -412,7 +412,7 @@ impl SramFdTest for SramFdTb
             wait 1 cycle
         end for
 
-        for k in 0 .. 12
+        for k in 0 .. 11
             let t : SramTxn
             randomize(t) with LegalDualWrite(t) end randomize
             dut.ce = t.ce
@@ -427,7 +427,7 @@ impl SramFdTest for SramFdTb
             wait 1 cycle
         end for
 
-        for k in 0 .. 32
+        for k in 0 .. 31
             let t : SramTxn
             randomize(t)
             dut.ce = t.ce

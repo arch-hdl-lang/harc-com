@@ -23,7 +23,7 @@ impl PrimMaxTest for PrimMaxTb
         dut.values_i = 0x8080808080808080
         wait 5 cycles
 
-        for k in 0 .. 32
+        for k in 0 .. 31
             dut.valid_i = ((k * 37) ^ 0xA5) & 0xFF
             dut.values_i = ((k * 0x0103070B0D111317) ^ 0x8040201008040201)
             wait 2 cycles

@@ -52,7 +52,7 @@ end testbench ArbiterTb
 function expected_gnt(req: uint<32>) -> uint<32>
     let g : uint<32> = 0
     let seen : uint<1> = 0
-    for i in 0 .. 32
+    for i in 0 .. 31
         let bit = ((req >> i) & 1).trunc<1>()
         if (bit == 1) and (seen == 0)
             g = g | ((1 as uint<32>) << i)
@@ -80,7 +80,7 @@ impl ArbiterTest for ArbiterTb
             else fail("no-req: gnt_o=0x${dut.gnt_o:08x}, expected 0")
 
         // Single-bit walking-1 sweep across every bit.
-        for k in 0 .. 32
+        for k in 0 .. 31
             let r : uint<32> = (1 as uint<32>) << k
             dut.req_i = r
             wait 1 cycle
@@ -90,7 +90,7 @@ impl ArbiterTest for ArbiterTb
         end for
 
         // Walking-1 starting from MSB downward to toggle high bits 1->0.
-        for k in 0 .. 32
+        for k in 0 .. 31
             let r : uint<32> = (1 as uint<32>) << (31 - k)
             dut.req_i = r
             wait 1 cycle
@@ -174,7 +174,7 @@ impl ArbiterTest for ArbiterTb
             else fail("p4=0x99: gnt=0x${dut.gnt_o:08x}")
 
         // Sequential walk: shift a request bit one cycle at a time.
-        for k in 0 .. 32
+        for k in 0 .. 31
             dut.req_i = ((1 as uint<32>) << k) | ((1 as uint<32>) << ((k + 5) % 32))
             wait 1 cycle
             assert dut.gnt_o == expected_gnt(dut.req_i)
@@ -186,7 +186,7 @@ impl ArbiterTest for ArbiterTb
         // unique policy routes through the solver path, while still
         // checking the fixed-priority model. The all-zero request is a
         // legal arbiter input and remains part of the randomized space.
-        for k in 0 .. 50
+        for k in 0 .. 49
             let t : ArbReq
             randomize(t)
             dut.req_i = t.req

@@ -38,7 +38,7 @@ impl AsyncResetTest for AsyncResetTestTb
         // After one cycle from reset release, cnt_q decrements from
         // 0x1F to 0x1E. Track expected manually.
         let expected_cnt : uint<5> = 0x1F
-        for _ in 0 .. 32
+        for _ in 0 .. 31
             wait 1 cycle
             if expected_cnt > 0
                 expected_cnt = expected_cnt - 1

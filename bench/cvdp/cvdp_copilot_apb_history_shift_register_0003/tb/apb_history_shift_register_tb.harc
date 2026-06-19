@@ -229,7 +229,7 @@ impl ApbHistoryTest for ApbHistoryTb
 
         // Solver-backed random control/train combinations, including priority
         // cases where both predict_valid and train_mispredicted may be set.
-        for _ in 0 .. 16
+        for _ in 0 .. 15
             let s : HistoryStim
             randomize(s)
             apb_write(1, s.train, false)

@@ -35,7 +35,7 @@ impl TrafficLightTest for TrafficLightTb
         dut.rst = 0
 
         // Red holds while timer != 0.
-        for _ in 0 .. 3
+        for _ in 0 .. 2
             tick_timer(dut, 1)
         end for
         assert dut.red == 1 && dut.yellow == 0 && dut.green == 0
@@ -50,7 +50,7 @@ impl TrafficLightTest for TrafficLightTb
         log(info, "PASS: Red → Green")
 
         // Green holds.
-        for _ in 0 .. 3
+        for _ in 0 .. 2
             tick_timer(dut, 1)
         end for
         assert dut.red == 0 && dut.yellow == 0 && dut.green == 1

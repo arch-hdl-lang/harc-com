@@ -1,6 +1,5 @@
 ---
 source: tests/tbir.rs
-assertion_line: 1480
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
@@ -61,7 +60,7 @@ fn fn0 run_AxiLiteBusTest [kind=Run, owner=tb0]
     -> Jump(b5)
 
   b5:
-    -> Branch((%_anon < 10), b6, b8)
+    -> Branch((%_anon <= 9), b6, b8)
 
   b6:
     -> WaitCycles(1, b9)

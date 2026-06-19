@@ -43,7 +43,7 @@ impl DigStopwatchTest for DigStopwatchTb
         wait 2 cycles
 
         dut.start_stop = 1
-        for _ in 0 .. 4
+        for _ in 0 .. 3
             pulse_second()
         end for
 

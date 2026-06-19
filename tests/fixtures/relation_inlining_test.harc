@@ -60,7 +60,7 @@ impl RelationInliningTest for RelationInliningTb
         // satisfying all three simultaneously. The asserts mirror
         // the constraints — they'd fail if any of the three weren't
         // enforced.
-        for i in 0 .. 20
+        for i in 0 .. 19
             let r : Req
             randomize(r) with BoundedAndHigh(r) end randomize
 

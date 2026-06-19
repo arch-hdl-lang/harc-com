@@ -21,7 +21,7 @@ end testbench ManchesterTb
 
 function encode8(d: uint<8>) -> uint<16>
     let r : uint<16> = 0
-    for i in 0 .. 8
+    for i in 0 .. 7
         let bit = ((d >> i) & 1).trunc<1>()
         if bit == 1
             r = r | ((1 as uint<16>) << (2 * i))
@@ -65,7 +65,7 @@ impl ManchesterTest for ManchesterTb
 
         // ── Encoder: exhaustive 256-input sweep ─────────────────
         dut.enc_valid_in = 1
-        for k in 0 .. 256
+        for k in 0 .. 255
             dut.enc_data_in = k
             wait 1 cycle
             let exp = encode8(k as uint<8>)
@@ -86,7 +86,7 @@ impl ManchesterTest for ManchesterTb
 
         // ── Decoder: valid codewords (encode-then-decode round-trip) ─
         dut.dec_valid_in = 1
-        for k in 0 .. 256
+        for k in 0 .. 255
             let codeword = encode8(k as uint<8>)
             dut.dec_data_in = codeword
             wait 1 cycle

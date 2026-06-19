@@ -57,7 +57,7 @@ fn fn2 AesXactor_wait_for_done [kind=TransactorBody(x0)]
     -> Jump(b1)
 
   b1:
-    -> Branch((%_anon < 14), b2, b4)
+    -> Branch((%_anon <= 13), b2, b4)
 
   b2:
     DutRead(%__t0, dut.done)
