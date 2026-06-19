@@ -4139,8 +4139,7 @@ impl GatedIdxTest for GateTb
     let b : GatedIdxBus = bind dut
     run
         let p : Packet
-        let v = p.data[b.idx]
-        assert v == 0 else fail("v=${v}")
+        assert p.data[b.idx] == 0 else fail("bad")
     end run
 end impl GatedIdxTest
 "#;
@@ -4151,6 +4150,55 @@ end impl GatedIdxTest
     assert!(
         err.to_string().contains("signal `idx` is gated OFF"),
         "expected gated-OFF diagnostic for nested record index: {err}"
+    );
+}
+
+/// `SeqIndex` is currently produced by internal `for t in <tseq>` lowering,
+/// whose generated index is a local counter. This direct IR regression keeps
+/// the emit-side traversal honest if future lowering allows a richer index.
+#[test]
+fn gated_bus_access_in_seq_index_is_rejected() {
+    let src = r#"
+bus GatedIdxBus
+    param EN: const = 0;
+    generate_if EN
+        idx: in uint<8>;
+    end generate_if
+end bus GatedIdxBus
+
+testbench GateTb
+    dut : Top
+end testbench GateTb
+
+impl GatedSeqIdxTest for GateTb
+    let b : GatedIdxBus = bind dut
+    run
+        wait 1 cycle
+    end run
+end impl GatedSeqIdxTest
+"#;
+    let merged = merged_src(src);
+    let mut prog = lower::lower_program(&merged).expect("lowers");
+    let run = prog.tests[0].run;
+    let run_fn = &mut prog.functions[run.index()];
+    run_fn.blocks[0].stmts.push(ir::Stmt::Assign(
+        ir::LocalId(0),
+        ir::Expr::SeqIndex {
+            seq: ir::LocalId(0),
+            index: Box::new(ir::Expr::Port(ir::PortRef {
+                testbench_field: "dut".to_string(),
+                port_path: vec!["b".to_string(), "idx".to_string()],
+                direction: None,
+                width: None,
+                access: ir::PortAccess::Port,
+                lane: None,
+            })),
+        },
+    ));
+    let err = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).unwrap_err();
+    assert!(
+        err.to_string().contains("signal `idx` is gated OFF"),
+        "expected gated-OFF diagnostic for nested seq index: {err}"
     );
 }
 
