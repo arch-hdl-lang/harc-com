@@ -1,0 +1,57 @@
+// Record-typed `let` copy: `let t2 : Txn = t1`. v1 emits a by-value
+// C++ struct copy (`Txn t2 = t1;`); tbir previously rejected the
+// initialized record `let`. Each copy must be an independent snapshot —
+// mutating the copy leaves the source untouched. Self-checking;
+// trace-equivalent under `--codegen v1` and `--codegen tbir`.
+//
+// Note: only the *typed* copy form (`let t2 : Txn = t1`) is in the
+// equivalence subset. The untyped bare form (`let t3 = t1`) cannot be
+// trace-equivalent because v1 mis-declares it as `int64_t t3 = t1;`
+// (does not compile for a struct); tbir handles it, but there is no v1
+// reference to diff against, so it is exercised only by lowering tests.
+//
+// The DUT (`Top`, the counter) is irrelevant — it ticks in the
+// background while the test exercises host-side record copies. Reused
+// only because it's already in the Verilator regression.
+
+transaction Txn
+    a : uint<8>  default 0
+    b : uint<16> default 0
+end transaction Txn
+
+testbench RecordLetCopyTb
+    dut : Top
+end testbench RecordLetCopyTb
+
+impl RecordLetCopyTest for RecordLetCopyTb
+    run
+        // Build a source record.
+        let t1 : Txn
+        t1.a = 0x11
+        t1.b = 0x2222
+
+        // ── typed copy `let t2 : Txn = t1` ─────────────────────────
+        let t2 : Txn = t1
+        assert t2.a == 0x11   else fail("t2.a after copy: 0x${t2.a:02x}")
+        assert t2.b == 0x2222 else fail("t2.b after copy: 0x${t2.b:04x}")
+
+        // Mutate the copy; the source must be untouched (by-value).
+        t2.a = 0xAA
+        t2.b = 0xBBBB
+        assert t2.a == 0xAA   else fail("t2.a after mutate: 0x${t2.a:02x}")
+        assert t1.a == 0x11   else fail("t1.a aliased by t2 mutate: 0x${t1.a:02x}")
+        assert t1.b == 0x2222 else fail("t1.b aliased by t2 mutate: 0x${t1.b:04x}")
+
+        // ── second typed copy `let t3 : Txn = t2` (copy of a copy) ─
+        let t3 : Txn = t2
+        assert t3.a == 0xAA   else fail("t3.a after copy: 0x${t3.a:02x}")
+        assert t3.b == 0xBBBB else fail("t3.b after copy: 0x${t3.b:04x}")
+
+        // Mutate t3; t2 (its source) must be untouched.
+        t3.a = 0x33
+        assert t3.a == 0x33   else fail("t3.a after mutate: 0x${t3.a:02x}")
+        assert t2.a == 0xAA   else fail("t2.a aliased by t3 mutate: 0x${t2.a:02x}")
+
+        log(info, "PASS: record-typed let copy is by-value under v1 and tbir")
+    end run
+end impl RecordLetCopyTest

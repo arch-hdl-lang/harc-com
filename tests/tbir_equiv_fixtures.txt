@@ -89,6 +89,7 @@ if_wait_for_in_then_test | M | if_wait_for_in_then.sv | - | pass
 packed_vec_lane_test | PackedVecLane | packed_vec_lane.sv | - | pass
 width_methods_test | Top | top_counter.sv | - | pass
 bitslice_uninit_test | Top | top_counter.sv | - | pass
+record_let_copy_test | Top | top_counter.sv | - | pass
 testbench_basic_test | Top | top_counter.sv | - | pass | - | - | TestbenchSmoke
 testbench_basic_test | Top | top_counter.sv | - | pass | - | - | TestbenchEnableToggle
 testbench_basic_test | Top | top_counter.sv | - | pass | - | - | TestbenchMethodCallsMethod

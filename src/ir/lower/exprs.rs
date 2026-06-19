@@ -638,7 +638,7 @@ impl FuncBuilder<'_> {
         }
     }
 
-    fn expr_type(&self, e: &Expr) -> Option<IrType> {
+    pub(crate) fn expr_type(&self, e: &Expr) -> Option<IrType> {
         match e {
             Expr::Literal { ty, .. } => Some(ty.clone()),
             Expr::WideLiteral(words) => Some(IrType::UInt(Some(wide_literal_bits(words)))),
