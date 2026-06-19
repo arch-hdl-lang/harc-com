@@ -71,6 +71,16 @@ fn emit_fixture_cpp(name: &str) -> String {
     tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits")
 }
 
+/// Lower + verify + emit one inline source string through the tbir
+/// backend (the in-process analogue of `emit_fixture_cpp`, for focused
+/// codegen-shape assertions that do not warrant a registry fixture).
+fn emit_cpp_src(src: &str) -> String {
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits")
+}
+
 /// The negative-test contract: every out-of-subset fixture must produce
 /// `LowerError::Unsupported` whose rendered message names the offending
 /// construct and points the user at `--codegen v1`.
@@ -3397,6 +3407,223 @@ end impl XtHelperWrapperTest
             )
         }),
         "inlined testbench helper should keep xt.pulse() as a TransactorCall:\n{run}"
+    );
+}
+
+/// Emitted-C++ shape for nested transactor sibling calls. The committed
+/// `cam_value_basic` snapshot only locks the `auto`→`std::function`
+/// predeclaration in isolation (no actual sibling call); this asserts
+/// the generated code for (a) a FORWARD sibling call (`first()` calls
+/// `second()`, declared later) and (b) a VALUE-returning sibling call
+/// (`use_readv()` calls `readv() -> uint<32>`). The forward case only
+/// compiles because every method is predeclared as a `std::function`
+/// slot BEFORE any lambda is assigned — assert that ordering directly.
+#[test]
+fn transactor_sibling_calls_emit_synchronous_predeclared_invocations() {
+    let src = r#"
+transactor Xt
+    dut : Top
+
+    when active
+        hookable first()
+            dut.en = 1
+            second()
+        end first
+
+        hookable second()
+            dut.en = 0
+            wait 1 cycle
+        end second
+
+        hookable readv() -> uint<32>
+            let v = dut.value
+            return v
+        end readv
+
+        hookable use_readv() -> uint<32>
+            let a = readv()
+            return a
+        end use_readv
+    end when
+end transactor Xt
+
+testbench XtTb
+    dut : Top
+    xt  : Xt active
+end testbench XtTb
+
+impl XtSiblingEmitTest for XtTb
+    run
+        xt.dut = dut
+        xt.first()
+        let r = xt.use_readv()
+        assert r == 0 else fail("r=${r}")
+    end run
+end impl XtSiblingEmitTest
+"#;
+    let cpp = emit_cpp_src(src);
+
+    // Each method is predeclared as a typed std::function slot.
+    let void_slot = "std::function<void()> Xt_second";
+    let ret_slot = "std::function<uint64_t()> Xt_readv";
+    assert!(
+        cpp.contains(void_slot),
+        "expected predeclared void slot `{void_slot}`:\n{cpp}"
+    );
+    assert!(
+        cpp.contains(ret_slot),
+        "expected predeclared uint64_t slot `{ret_slot}`:\n{cpp}"
+    );
+
+    // Forward-reference soundness: the callee's slot is declared before
+    // the *caller's* lambda is assigned (otherwise `Xt_second();` inside
+    // `first` would reference an as-yet-undeclared name).
+    let second_decl = cpp.find(void_slot).expect("second slot present");
+    let first_assign = cpp.find("Xt_first = [&]").expect("first lambda assigned");
+    assert!(
+        second_decl < first_assign,
+        "callee slot must be declared before the caller lambda is assigned"
+    );
+
+    // Sibling calls emit as direct synchronous invocations.
+    assert!(
+        cpp.contains("Xt_second();"),
+        "forward sibling call should emit `Xt_second();`:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("Xt_readv("),
+        "value-returning sibling call should invoke `Xt_readv(...)`:\n{cpp}"
+    );
+}
+
+/// A sibling call with the wrong argument count is rejected at lowering
+/// (`check_transactor_self_call` mirrors the same check at verify time,
+/// but lowering fires first).
+#[test]
+fn transactor_sibling_call_arity_mismatch_is_rejected() {
+    let src = r#"
+transactor Xt
+    dut : Top
+
+    when active
+        hookable inner(n: uint<8>)
+            dut.x = n
+            wait 1 cycle
+        end inner
+
+        hookable outer()
+            inner()
+        end outer
+    end when
+end transactor Xt
+
+testbench XtTb
+    dut : Top
+    xt  : Xt active
+end testbench XtTb
+
+impl XtArityTest for XtTb
+    run
+        xt.dut = dut
+        xt.outer()
+    end run
+end impl XtArityTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)),
+        "expected LowerError::Invalid for arity mismatch: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("takes 1 argument(s), call passes 0"),
+        "diagnostic should name the arity mismatch: {msg}"
+    );
+}
+
+/// Capturing the result of a void sibling method into a `let` is
+/// rejected at lowering (the value-position lowering passes
+/// `need_ret = true`; a void method has no value to bind).
+#[test]
+fn transactor_sibling_call_void_method_in_value_position_is_rejected() {
+    let src = r#"
+transactor Xt
+    dut : Top
+
+    when active
+        hookable act()
+            dut.x = 1
+            wait 1 cycle
+        end act
+
+        hookable bad() -> uint<32>
+            let v = act()
+            return v
+        end bad
+    end when
+end transactor Xt
+
+testbench XtTb
+    dut : Top
+    xt  : Xt active
+end testbench XtTb
+
+impl XtVoidValueTest for XtTb
+    run
+        xt.dut = dut
+        let r = xt.bad()
+        assert r == 0 else fail("r=${r}")
+    end run
+end impl XtVoidValueTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)),
+        "expected LowerError::Invalid for void-in-value: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("returns no value"),
+        "diagnostic should say the method returns no value: {err}"
+    );
+}
+
+/// Named arguments in a sibling call are out of the TB-IR subset and
+/// rejected precisely at lowering.
+#[test]
+fn transactor_sibling_call_named_argument_is_rejected() {
+    let src = r#"
+transactor Xt
+    dut : Top
+
+    when active
+        hookable inner(n: uint<8>)
+            dut.x = n
+            wait 1 cycle
+        end inner
+
+        hookable outer()
+            inner(n = 5)
+        end outer
+    end when
+end transactor Xt
+
+testbench XtTb
+    dut : Top
+    xt  : Xt active
+end testbench XtTb
+
+impl XtNamedArgTest for XtTb
+    run
+        xt.dut = dut
+        xt.outer()
+    end run
+end impl XtNamedArgTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("named arguments in transactor sibling method call"),
+        "diagnostic should name the named-argument rejection: {msg}"
     );
 }
 
