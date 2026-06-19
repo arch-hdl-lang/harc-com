@@ -38,10 +38,13 @@ pub(crate) enum BusCallDest<'a> {
 /// Validate one test-scope bus binding and produce its schema plus an
 /// owned copy of the declaration for the per-test lowering context.
 /// The subset gate lives here: features whose v1 lowering depends on
-/// information the IR pipeline does not model yet (bind remaps, bind-
-/// site generics, `generate_if`-gated signals — the latter two need
-/// the DUT-port param-override layering from `EmitOpts`) are rejected
-/// with precise messages instead of silently mis-lowering.
+/// information the IR pipeline does not model yet are rejected with
+/// precise messages instead of silently mis-lowering. Bind-site generics
+/// (`Bus<P=...>`) and `generate_if`-gated signals are NOT rejected: the
+/// owned `BusDecl` carries the gates through, and the tbir emitter applies
+/// the DUT-port param-override layering (defaults < bind generic < DUT-port
+/// override) to decide gated-signal presence at the access site, matching
+/// `arch build`'s flattened port set.
 pub(super) fn lower_bus_binding(
     l: &LetStmt,
     decl: &BusDecl,
@@ -93,14 +96,16 @@ pub(super) fn lower_bus_binding(
         }
     }
     remap.sort();
-    if let Some(TypeExpr::Named { generics, .. }) = l.ty.as_ref() {
-        if !generics.is_empty() {
-            return Err(unsupported(
-                "bus bind-site generic overrides (`Bus#(P=...)`)",
-                "",
-            ));
-        }
-    }
+    // Bind-site generic overrides (`let s : Bus<WRITE=0> = bind dut`) are
+    // NOT rejected and NOT evaluated here: lowering has no param env. The
+    // binding lowers through carrying every signal's `gate` expression
+    // intact (the owned `BusDecl` returned below), and the tbir emitter —
+    // which has `EmitOpts` + the `SourceFile` — recovers the bind-site
+    // `TypeExpr` from the test let, layers it into the effective env
+    // (`bus_param_env_with_port_override`: defaults < bind generic < DUT-
+    // port override), and rejects only an ACCESS to a signal gated OFF
+    // under that env. This mirrors v1's `bus_param_env` / `bus_signal_present`
+    // exactly. See `src/codegen/tbir/mod.rs::check_gated_bus_access`.
     match l.value.as_ref().map(|v| &*v.kind) {
         Some(ExprKind::Ident(id)) if id.name == "dut" => {}
         _ => {
