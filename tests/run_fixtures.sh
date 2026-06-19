@@ -53,6 +53,7 @@ width_methods_test      | Top            | top_counter.sv         |
 wide_cast_test          | Top            | top_counter.sv         |
 bitslice_uninit_test    | Top            | top_counter.sv         |
 record_let_copy_test    | Top            | top_counter.sv         |
+record_vec_field_copy_test | Top         | top_counter.sv         |
 keep_constraints_test   | Top            | top_counter.sv         |
 extern_fn_ref_test      | Top            | top_counter.sv         |     | extern_fn_ref.cpp
 relation_inlining_test  | Top            | top_counter.sv         |

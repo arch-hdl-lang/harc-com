@@ -250,7 +250,11 @@ transaction, struct, or regblock resolves ambiguously through
 `record_ids`, so the collision is rejected, not shadowed. A
 `Vec<scalar, N>` field DOES lower (a `std::array<T, N>` member with
 indexed `rec.data[i]` element access — the struct `Vec`-field slice,
-2026-06-13; it unblocked the `tlm_pairing_arch_burst_*` fixtures). Out of
+2026-06-13; it unblocked the `tlm_pairing_arch_burst_*` fixtures). A
+whole-`Vec` field read/write (`dst.data = src.data`) also lowers now
+(`Expr::RecordField` / `Stmt::RecordFieldWrite` with `index: None` →
+v1's plain `std::array` member copy — the whole-Vec-field slice,
+2026-06-19, `record_vec_field_copy_test`). Out of
 subset and rejected at the field/decl, never mis-lowered: a widthless /
 nested / list `Vec` element type, other non-scalar / >64-bit fields
 (nested structs), non-literal defaults, and
@@ -1530,9 +1534,13 @@ reason. Code locations are authoritative.
       (HARC target builds the record field-wise + packs it) — both `pass`,
       trace-diff clean v1↔tbir at seed 1.
     - *Out of subset* (still rejected, precisely): a non-constant
-      `record_*` address; a widthless / nested / list `Vec` element type;
-      a whole-`Vec` field read/write. (The per-register `on regs.REG`
-      write callback, previously listed here, now lowers — divergence 20.)
+      `record_*` address; a widthless / nested / list `Vec` element type.
+      (The whole-`Vec` field read/write, previously listed here, now
+      lowers — `Expr::RecordField` / `Stmt::RecordFieldWrite` with
+      `index: None` mirror v1's plain `std::array` member copy, no new IR;
+      `record_vec_field_copy_test`, 2026-06-19. The per-register
+      `on regs.REG` write callback, also previously listed here, lowers as
+      of divergence 20.)
 
 21. **Bound-to event-driven driver (2026-06-13).** Composes the
     event-driven-transactor consumer (divergence 11, unbound) with the

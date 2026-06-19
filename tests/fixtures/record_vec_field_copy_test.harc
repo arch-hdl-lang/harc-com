@@ -1,0 +1,74 @@
+// Whole-`Vec` record-field read/write: `dst.data = src.data` where
+// `data` is a `Vec<T, N>` record field. v1 emits a plain C++
+// `std::array` member copy (`dst.data = src.data;`); tbir previously
+// rejected BOTH the whole-field read (RHS) and the whole-field write
+// (LHS), allowing only element access (`rec.data[i]`). This fixture
+// proves the whole-field copy lowers and is trace-equivalent under
+// `--codegen v1` and `--codegen tbir`.
+//
+// The copy must be by-value: mutating one record's array element leaves
+// the other untouched (std::array has value semantics in C++).
+//
+// The DUT (`Top`, the counter) is irrelevant — it ticks in the
+// background while the test exercises host-side record array copies.
+// Reused only because it's already in the Verilator regression.
+
+// A `struct` (not a `transaction`): the whole-`Vec` copy lowers through
+// the same `RecordField` / `RecordFieldWrite` path either way. `struct`
+// is the canonical home for a `Vec` record field (cf. the
+// `tlm_pairing_arch_burst_*` fixtures) — a `transaction` Vec field would
+// additionally pull the array into the randomize/constraint solver,
+// which is a separate (unrelated) gap.
+struct Bundle
+    tag  : uint<8> default 0
+    data : Vec<uint<32>, 4>
+end struct Bundle
+
+testbench RecordVecFieldCopyTb
+    dut : Top
+end testbench RecordVecFieldCopyTb
+
+impl RecordVecFieldCopyTest for RecordVecFieldCopyTb
+    run
+        // Build a source record element-wise.
+        let src : Bundle
+        src.tag = 0x5A
+        src.data[0] = 0x11111111
+        src.data[1] = 0x22222222
+        src.data[2] = 0x33333333
+        src.data[3] = 0x44444444
+
+        // ── whole-`Vec` field copy: `dst.data = src.data` ──────────
+        // RHS is a whole-`Vec` READ, LHS a whole-`Vec` WRITE.
+        let dst : Bundle
+        dst.tag = 0x7E
+        dst.data = src.data
+
+        // The whole array landed element-for-element.
+        assert dst.data[0] == 0x11111111 else fail("dst.data[0]: 0x${dst.data[0]:08x}")
+        assert dst.data[1] == 0x22222222 else fail("dst.data[1]: 0x${dst.data[1]:08x}")
+        assert dst.data[2] == 0x33333333 else fail("dst.data[2]: 0x${dst.data[2]:08x}")
+        assert dst.data[3] == 0x44444444 else fail("dst.data[3]: 0x${dst.data[3]:08x}")
+
+        // The scalar field was NOT overwritten by the array copy.
+        assert dst.tag == 0x7E else fail("dst.tag clobbered: 0x${dst.tag:02x}")
+
+        // ── by-value: mutate dst's array, src must be untouched ─────
+        dst.data[0] = 0xDEADBEEF
+        assert dst.data[0] == 0xDEADBEEF else fail("dst.data[0] after mutate: 0x${dst.data[0]:08x}")
+        assert src.data[0] == 0x11111111 else fail("src.data[0] aliased by dst mutate: 0x${src.data[0]:08x}")
+
+        // ── round-trip: copy dst's (now-mutated) array back to a 3rd ─
+        let third : Bundle
+        third.data = dst.data
+        assert third.data[0] == 0xDEADBEEF else fail("third.data[0]: 0x${third.data[0]:08x}")
+        assert third.data[3] == 0x44444444 else fail("third.data[3]: 0x${third.data[3]:08x}")
+
+        // Mutate src after the copies; both dst and third stay put.
+        src.data[3] = 0x99999999
+        assert dst.data[3]   == 0x44444444 else fail("dst.data[3] aliased by src mutate: 0x${dst.data[3]:08x}")
+        assert third.data[3] == 0x44444444 else fail("third.data[3] aliased by src mutate: 0x${third.data[3]:08x}")
+
+        log(info, "PASS: whole-Vec record-field copy is by-value under v1 and tbir")
+    end run
+end impl RecordVecFieldCopyTest
