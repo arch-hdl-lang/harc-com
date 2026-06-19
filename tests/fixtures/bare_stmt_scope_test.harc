@@ -1,0 +1,49 @@
+// A bare statement (a console `log(...)`) sitting at test scope
+// alongside a `run` block — exercises the TB-IR's bare-statement /
+// `scope`-block coexistence path. Previously tbir rejected this with
+// "mixing bare statements with a `scope`/`run` block in one test";
+// v1 has always emitted both into one coroutine in test-item order
+// (bare stmts first — the parser appends the synthetic scope last —
+// then the run body). The IR now routes pre-scope bare statements to
+// the front of the run function, matching v1's ordering, so both
+// emitters produce the same semantic trace.
+//
+// Caution mirrored from audit #425: a bare `cover` mixed with a scope
+// stays rejected (v1 emits non-compiling C++ for that one), so this
+// fixture deliberately uses a bare `log`, not a bare `cover`.
+//
+// DUT is `Top` (the counter from top_counter_test), used as a
+// background clock source. Registry row: expect=pass.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+test BareStmtScopeTest
+    let dut : Top
+
+    clock clk = SysDomain        // 100 MHz
+
+    // Bare statement at test scope, before the `run` block. In item
+    // order this runs first (before the run body's first wait).
+    log(info, "bare log before run: starting BareStmtScopeTest")
+
+    run
+        // Reset for 3 cycles.
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        assert dut.count_out == 0
+            else fail("after reset: count_out=${dut.count_out}, expected 0")
+
+        // Count 1..4.
+        dut.rst = 0
+        dut.en = 1
+        for i in 1 .. 4
+            wait 1 cycle
+            assert dut.count_out == i
+                else fail("cycle ${i}: count_out=${dut.count_out}, expected ${i}")
+        end for
+        log(info, "PASS: counted to ${dut.count_out} after bare-log + run")
+    end run
+end test BareStmtScopeTest

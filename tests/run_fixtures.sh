@@ -39,6 +39,7 @@ analysis_sink_connect_test | Top         | top_counter.sv         |
 wait_until_quiesce_test | Top            | top_counter.sv         |
 wait_until_counter_test | Top            | top_counter.sv         |
 after_cycles_test       | Top            | top_counter.sv         |
+bare_stmt_scope_test    | Top            | top_counter.sv         |
 watchdog_quiesce_test   | Top            | top_counter.sv         |
 agent_periodic_test     | Top            | top_counter.sv         |
 env_quiesced_phase_test | Top            | top_counter.sv         |
