@@ -73,6 +73,30 @@ ir_id!(
     ConstraintRef
 );
 
+/// The element type of a `tseq`'s `-> TSeq<T>` return sequence. Carried
+/// in the lowering `tseqs` map so the consumer site (`let xs = Some(...)`)
+/// can type the receiving local: a record element becomes `RecordSeq`, a
+/// scalar element becomes `Seq(scalar)`. v1 renders both as `std::vector<T>`
+/// — the only difference is the element C++ type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TseqElem {
+    /// `TSeq<Record>` — element is a declared `transaction`/`struct`.
+    Record(RecordId),
+    /// `TSeq<scalar>` — element is a `UInt`/`SInt`/`Bool` (`IrType`).
+    Scalar(IrType),
+}
+
+impl TseqElem {
+    /// The accumulator/result `IrType` a tseq of this element produces
+    /// (`RecordSeq` for a record element, `Seq` for a scalar element).
+    pub fn seq_type(&self) -> IrType {
+        match self {
+            TseqElem::Record(r) => IrType::RecordSeq(*r),
+            TseqElem::Scalar(t) => IrType::Seq(Box::new(t.clone())),
+        }
+    }
+}
+
 /// Whole-program IR for one merged HARC source file (post
 /// `merge_for_sim` + impl-for desugaring).
 #[derive(Debug, Clone, Default)]
@@ -1065,15 +1089,15 @@ pub enum FunctionKind {
         component: ComponentId,
     },
     /// One `tseq` declaration body — a transaction-sequence generator.
-    /// `record` is the element record type (`TSeq<Record>`); the
-    /// function's `ret` slot holds the `IrType::RecordSeq(record)`
-    /// accumulator, each `yield` pushes onto it (`Stmt::SeqPush`), and
-    /// `Terminator::Return` returns it. Emitted as a `[&]`-capturing
-    /// lambda returning `std::vector<Record>` (v1's `emit_tseq` shape).
-    /// Called via `CallTarget::Tseq` from a test-scope `let txns =
-    /// Name(args)`.
+    /// `elem` is the element type (`TSeq<Record>` → `TseqElem::Record`,
+    /// `TSeq<scalar>` → `TseqElem::Scalar`); the function's `ret` slot
+    /// holds the matching `RecordSeq`/`Seq` accumulator, each `yield`
+    /// pushes onto it (`Stmt::SeqPush`), and `Terminator::Return` returns
+    /// it. Emitted as a `[&]`-capturing lambda returning `std::vector<T>`
+    /// (v1's `emit_tseq` shape). Called via `CallTarget::Tseq` from a
+    /// test-scope `let txns = Name(args)`.
     Tseq {
-        record: RecordId,
+        elem: TseqElem,
     },
     /// A test-scope closure-hook body — either an `on <obj>.<method>
     /// pre/post` method hook or an `on regs.REG` per-register write
@@ -1120,6 +1144,15 @@ pub enum IrType {
     /// consumed by `for t in <seq>` iteration (`Expr::SeqLen` +
     /// `Expr::SeqIndex`).
     RecordSeq(RecordId),
+    /// A scalar-element transaction-sequence local (`let xs = SomeTseq(...)`
+    /// declared `-> TSeq<uint<N>>`). Emitted as `std::vector<T>` where `T`
+    /// is the boxed scalar element's C++ scalar type — the scalar analogue
+    /// of `RecordSeq`. Built by a `FunctionKind::Tseq` body (each `yield e`
+    /// is a `Stmt::SeqPush` of a scalar value), consumed by `for x in <seq>`
+    /// iteration (`Expr::SeqLen` + `Expr::SeqIndex`, both element-agnostic).
+    /// The boxed element is always a scalar (`UInt`/`SInt`/`Bool`); a record
+    /// element uses `RecordSeq` instead.
+    Seq(Box<IrType>),
     /// A composite-component value local — a method parameter typed by a
     /// component name (`observe(addr: uint<8>, model: ProtocolModel)`).
     /// Taken by value as the component's C++ struct; method calls on it

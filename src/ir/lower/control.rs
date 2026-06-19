@@ -6,7 +6,6 @@ use super::{unsupported, FuncBuilder, LoopFrame, LowerError};
 use crate::ast::{
     Block, Expr as AstExpr, ExprKind, ForStmt, IfStmt, RepeatStmt, WaitTimeout, WaitUntilMode,
 };
-use crate::ir;
 use crate::ir::{
     BinOp, BlockId, Expr, FmtArg, FmtArgs, IrType, LocalId, PredSrc, Stmt, Terminator, WaitMode,
 };
@@ -73,8 +72,8 @@ impl FuncBuilder<'_> {
         // `for (auto& t : txns)` range-for.
         if let ExprKind::Ident(id) = &*f.iter.kind {
             if let Some(seq) = self.lookup(&id.name) {
-                if let Some(elem) = self.seq_of_local(seq) {
-                    return self.lower_for_in_seq(f, seq, elem);
+                if let Some(elem_ty) = self.seq_of_local(seq) {
+                    return self.lower_for_in_seq(f, seq, elem_ty);
                 }
             }
         }
@@ -123,18 +122,19 @@ impl FuncBuilder<'_> {
         Ok(())
     }
 
-    /// `for t in <seq>` over a `RecordSeq` local. Lowers to a counted
+    /// `for t in <seq>` over a `RecordSeq`/`Seq` local. Lowers to a counted
     /// loop `for (i = 0; i < seq.size(); i++)` whose body first copies
-    /// `seq[i]` into the record-typed loop variable `t`, then runs the
-    /// user body. The whole-record copy (`Assign(t, SeqIndex{..})`) is
-    /// the IR's record-assignment form (v1 binds `t` by `auto&`; a copy
+    /// `seq[i]` into the `elem`-typed loop variable `t`, then runs the
+    /// user body. The whole-element copy (`Assign(t, SeqIndex{..})`) is
+    /// the IR's element-assignment form (v1 binds `t` by `auto&`; a copy
     /// is observably identical for read-only iteration, and the IR has
-    /// no by-reference local model).
+    /// no by-reference local model). `elem` is the element `IrType`:
+    /// `IrType::Record` for a `RecordSeq`, or the boxed scalar for a `Seq`.
     fn lower_for_in_seq(
         &mut self,
         f: &ForStmt,
         seq: LocalId,
-        elem: ir::RecordId,
+        elem: IrType,
     ) -> Result<(), LowerError> {
         self.push_scope();
         // Hidden counter, initialized once outside the loop.
@@ -162,11 +162,11 @@ impl FuncBuilder<'_> {
                 }),
             ),
         );
-        // The loop variable is a record local copied from `seq[i]` at the
-        // top of each iteration. Declared inside the loop scope so each
-        // iteration's read sees the fresh element (and `_` is anonymized).
+        // The loop variable is an element-typed local copied from `seq[i]`
+        // at the top of each iteration. Declared inside the loop scope so
+        // each iteration's read sees the fresh element (and `_` is anonymized).
         let var = self.declare(&f.var.name);
-        self.set_local_type(var, IrType::Record(elem));
+        self.set_local_type(var, elem);
         let bind = Stmt::Assign(
             var,
             Expr::SeqIndex {

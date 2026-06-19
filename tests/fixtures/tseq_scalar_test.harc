@@ -1,0 +1,66 @@
+// Self-proving demo of a `tseq` with a SCALAR element type
+// (`-> TSeq<uint<N>>`), the scalar analogue of `tseq_basic_test`.
+//
+// Exercises the scalar tseq surface:
+//   - a `tseq Squares(n) -> TSeq<uint<16>>` declaration with a parameter,
+//   - a `for i in 1 .. n` loop body that computes a scalar and `yield`s it
+//     directly (no `let t : Record` — a scalar expression is yielded),
+//   - a test-scope `let xs = Squares(4)` call (the sequence is
+//     materialized once),
+//   - TWO `for x in xs` iterations over the SAME materialized sequence
+//     (the second proves the result is a reusable value, not a one-shot
+//     stream), asserting the yielded scalars.
+//
+// The DUT is unused (no pins driven); `Top` is chosen for its clock,
+// like tseq_basic_test. No randomize ⇒ fully deterministic.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+// Generator: yields i*i for i in 1..n inclusive (1, 4, 9, ...). Proves a
+// scalar expression composes inside a tseq body and is `yield`ed directly.
+tseq Squares(n: int) -> TSeq<uint<16>>
+    for i in 1 .. n
+        yield i * i
+    end for
+end tseq Squares
+
+testbench TseqScalarTb
+    dut : Top
+end testbench TseqScalarTb
+
+impl TseqScalarTest for TseqScalarTb
+    clock clk = SysDomain
+
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Materialize the scalar sequence once: [1, 4, 9, 16].
+        let xs = Squares(4)
+
+        // First pass: count items and accumulate the sum (1+4+9+16 = 30).
+        let count = 0
+        let sum = 0
+        for x in xs
+            count = count + 1
+            sum = sum + x
+        end for
+        assert count == 4 else fail("expected 4 generated scalars, saw ${count}")
+        assert sum == 30 else fail("expected sum 30 (1+4+9+16), saw ${sum}")
+
+        // Second pass over the SAME materialized sequence — proves the
+        // tseq result is a reusable value, not a consumed stream.
+        let sum2 = 0
+        for x in xs
+            sum2 = sum2 + x
+        end for
+        assert sum2 == 30 else fail("second pass sum mismatch: ${sum2}")
+
+        log(info, "PASS: tseq Squares(4) — scalar element yield + reusable for-iteration")
+    end run
+end impl TseqScalarTest

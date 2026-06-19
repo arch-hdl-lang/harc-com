@@ -393,7 +393,10 @@ fn kind_str(k: &FunctionKind) -> String {
         FunctionKind::ComponentMethod { component } => {
             format!("ComponentMethod(c{})", component.0)
         }
-        FunctionKind::Tseq { record } => format!("Tseq(r{})", record.0),
+        FunctionKind::Tseq { elem } => match elem {
+            crate::ir::TseqElem::Record(r) => format!("Tseq(r{})", r.0),
+            crate::ir::TseqElem::Scalar(t) => format!("Tseq({})", type_str(t)),
+        },
         FunctionKind::TestHook => "TestHook".to_string(),
     }
 }
@@ -407,6 +410,7 @@ fn type_str(t: &IrType) -> String {
         IrType::Bool => "bool".to_string(),
         IrType::Record(r) => format!("record(r{})", r.0),
         IrType::RecordSeq(r) => format!("seq(r{})", r.0),
+        IrType::Seq(t) => format!("seq({})", type_str(t)),
         IrType::Component(c) => format!("component(c{})", c.0),
         IrType::Unknown => "unknown".to_string(),
     }

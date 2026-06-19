@@ -1269,7 +1269,7 @@ fn check_def_before_use(
     // defined so the `yield`/`SeqPush` accumulator read never trips
     // use-before-def.
     for (i, l) in func.locals.iter().enumerate() {
-        if matches!(l.ty, IrType::RecordSeq(_)) {
+        if matches!(l.ty, IrType::RecordSeq(_) | IrType::Seq(_)) {
             entry_in[i] = true;
         }
     }
