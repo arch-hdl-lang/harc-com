@@ -1857,7 +1857,7 @@ pub enum UnOp {
 /// Structured handle to a DUT signal. Codegen never re-parses port
 /// names. Direction/width are `Option` because the MVP lowering does
 /// not consult a DUT port table yet.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct PortRef {
     /// Test-scope field holding the DUT (`"dut"`).
     pub testbench_field: String,
@@ -1866,13 +1866,26 @@ pub struct PortRef {
     pub direction: Option<PortDirection>,
     pub width: Option<u32>,
     pub access: PortAccess,
-    /// Constant lane index for `dut.<port>[i]` accesses (only literal
-    /// indices are in the lowered subset). Emission routes lanes of
-    /// packed multi-lane ports (the `--sv` `vec_lane_widths` table)
-    /// through `harc_rt::harc_vec_lane_{read,write}<W>`, and true
-    /// unpacked-array ports through a raw C++ subscript — the same
-    /// split as v1's `dut_packed_lane`.
-    pub lane: Option<u64>,
+    /// Lane index for `dut.<port>[i]` accesses. Both constant and
+    /// variable (runtime-evaluated) indices are in the lowered subset.
+    /// Emission routes lanes of packed multi-lane ports (the `--sv`
+    /// `vec_lane_widths` table) through
+    /// `harc_rt::harc_vec_lane_{read,write}<W>`, and true unpacked-array
+    /// ports through a raw C++ subscript — the same split as v1's
+    /// `dut_packed_lane` (which also accepts an arbitrary index expr).
+    pub lane: Option<LaneIndex>,
+}
+
+/// Lane index on a `dut.<port>[i]` access. v1 carries the raw `&Expr`
+/// and re-renders it; the IR distinguishes a folded constant (kept as a
+/// plain integer so the constant-lane fixtures are byte-identical to v1)
+/// from a runtime expression that is lowered like any other value.
+#[derive(Debug, Clone)]
+pub enum LaneIndex {
+    /// Constant-folded literal/`const`/enum index: `dut.<port>[2]`.
+    Const(u64),
+    /// Runtime-evaluated index expression: `dut.<port>[i]`.
+    Var(Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

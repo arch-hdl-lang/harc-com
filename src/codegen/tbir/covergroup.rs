@@ -146,14 +146,33 @@ fn cover_expr_cpp(e: &Expr, lanes: &HashMap<String, u32>) -> Result<String, Emit
         Expr::Literal { value, .. } => format!("{value}"),
         Expr::Port(p) => {
             let sig = cover_port_signal(p);
-            match p.lane {
+            match &p.lane {
                 None => format!("harc_rt::harc_read({sig})"),
-                Some(lane) => match cover_lane_width(lanes, p) {
-                    Some(w) => {
-                        format!("harc_rt::harc_vec_lane_read<{w}>({sig}, (std::size_t)({lane}))")
+                Some(lane) => {
+                    // Covergroup lane indices are constant-only (the
+                    // schema lowers before any runtime scope; see
+                    // `lower_covergroups`), so a `Var` index never
+                    // reaches here. Render a constant directly; surface a
+                    // precise codegen error if a runtime index ever does.
+                    let idx = match lane {
+                        crate::ir::LaneIndex::Const(c) => c.to_string(),
+                        crate::ir::LaneIndex::Var(_) => {
+                            return Err(EmitError(
+                                "tbir: covergroup point with a runtime lane \
+                                 index — only constant lanes are in subset"
+                                    .to_string(),
+                            ))
+                        }
+                    };
+                    match cover_lane_width(lanes, p) {
+                        Some(w) => {
+                            format!(
+                                "harc_rt::harc_vec_lane_read<{w}>({sig}, (std::size_t)({idx}))"
+                            )
+                        }
+                        None => format!("{sig}[{idx}]"),
                     }
-                    None => format!("{sig}[{lane}]"),
-                },
+                }
             }
         }
         Expr::Binary(op, a, b) => {

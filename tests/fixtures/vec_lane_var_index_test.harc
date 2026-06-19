@@ -1,0 +1,64 @@
+// Regression test for a VARIABLE (runtime) lane index on a DUT vec
+// port: `dut.<port>[i]` where `i` is a loop variable, not a constant.
+//
+// The constant-index case is covered by packed_vec_lane_test. This
+// fixture exercises the same four flattened-port shapes through a
+// `for i in 0 .. N` loop on BOTH the write side (`dut.<port>[i] = ...`)
+// and the read side (`dut.<port>[i]` in assertions), proving the lane
+// index lowers as a runtime expression that bit-extracts / bit-deposits
+// per lane (packed shapes) or array-indexes (the true unpacked shape) on
+// both C++ emitters.
+//
+// DUT: tests/dut/packed_vec_lane.sv (top `PackedVecLane`, N=3, W=5),
+// shared with packed_vec_lane_test:
+//   lane_valid : 1-bit lane  (single packed dim)
+//   lane_id    : 5-bit lane  (2-D packed) — out == in + 1
+//   lane_data  : 32-bit lane (2-D packed, 96b total → VlWide<3>)
+//                — out == in + lane_index
+//   pass_uvec  : TRUE unpacked array — out == in + 2; must stay
+//                array-indexed (not bit-extracted) on both backends.
+
+testbench VecLaneVarIndexTb
+    dut : PackedVecLane
+end testbench VecLaneVarIndexTb
+
+impl VecLaneVarIndexTest for VecLaneVarIndexTb
+    run
+        log(info, "variable lane-index access on packed/unpacked Vec ports")
+
+        dut.rst = 1
+        wait 1 cycle
+        dut.rst = 0
+
+        // Drive every lane through a runtime-indexed write. Each lane
+        // gets a distinct value derived from the loop variable so a
+        // per-lane addressing bug shows up as a wrong read-back.
+        for i in 0 .. 2
+            dut.lane_valid_in[i] = i & 1
+            dut.lane_id_in[i]    = i + 1
+            dut.lane_data_in[i]  = 0x10 + i
+            dut.pass_uvec_in[i]  = 0x20 + i
+        end for
+
+        wait 1 cycle
+
+        // Read back through a runtime-indexed access and check the DUT's
+        // per-port transform held for every lane.
+        for i in 0 .. 2
+            // 1-bit lane: out == in.
+            assert dut.lane_valid_out[i] == (i & 1)
+                else fail("lane_valid[${i}] = ${i & 1} (got ${dut.lane_valid_out[i]})")
+            // 5-bit lane: out == in + 1.
+            assert dut.lane_id_out[i] == (i + 2)
+                else fail("lane_id[${i}] = ${i + 2} (got ${dut.lane_id_out[i]})")
+            // 32-bit lane (VlWide path): out == in + lane_index.
+            assert dut.lane_data_out[i] == (0x10 + i + i)
+                else fail("lane_data[${i}] = ${0x10 + i + i} (got ${dut.lane_data_out[i]})")
+            // unpacked array: out == in + 2, stays array-indexed.
+            assert dut.pass_uvec_out[i] == (0x20 + i + 2)
+                else fail("pass_uvec[${i}] = ${0x20 + i + 2} (got ${dut.pass_uvec_out[i]})")
+        end for
+
+        log(info, "PASS: variable lane-index read/write on all four port shapes")
+    end run
+end impl VecLaneVarIndexTest

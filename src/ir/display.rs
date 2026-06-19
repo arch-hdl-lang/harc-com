@@ -415,9 +415,9 @@ fn type_str(t: &IrType) -> String {
 fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
     match s {
         Stmt::Assign(l, e) => format!("Assign({}, {})", local_str(func, *l), expr_str(func, e)),
-        Stmt::DutWrite(p, e) => format!("DutWrite({}, {})", port_str(p), expr_str(func, e)),
-        Stmt::DutRead(l, p) => format!("DutRead({}, {})", local_str(func, *l), port_str(p)),
-        Stmt::ProbeRelease(p) => format!("ProbeRelease({})", port_str(p)),
+        Stmt::DutWrite(p, e) => format!("DutWrite({}, {})", port_str(Some(func), p), expr_str(func, e)),
+        Stmt::DutRead(l, p) => format!("DutRead({}, {})", local_str(func, *l), port_str(Some(func), p)),
+        Stmt::ProbeRelease(p) => format!("ProbeRelease({})", port_str(Some(func), p)),
         Stmt::RecordInit(l, r) => format!("RecordInit({}, r{})", local_str(func, *l), r.0),
         Stmt::RecordFieldWrite {
             local,
@@ -736,10 +736,15 @@ fn local_str(func: &TbFunction, l: LocalId) -> String {
     format!("%{}", func.local(l).name)
 }
 
-fn port_str(p: &PortRef) -> String {
+fn port_str(func: Option<&TbFunction>, p: &PortRef) -> String {
     let mut out = format!("{}.{}", p.testbench_field, p.port_path.join("."));
-    if let Some(lane) = p.lane {
-        out.push_str(&format!("[{lane}]"));
+    match &p.lane {
+        None => {}
+        Some(crate::ir::LaneIndex::Const(c)) => out.push_str(&format!("[{c}]")),
+        Some(crate::ir::LaneIndex::Var(e)) => {
+            let idx = func.map_or_else(|| "?".to_string(), |f| expr_str(f, e));
+            out.push_str(&format!("[{idx}]"));
+        }
     }
     match p.access {
         PortAccess::Port => {}
@@ -776,7 +781,7 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
             s
         }
         Expr::Local(l) => local_str(func, *l),
-        Expr::Port(p) => port_str(p),
+        Expr::Port(p) => port_str(Some(func), p),
         Expr::RecordField {
             local,
             field,
@@ -913,7 +918,9 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
 fn cover_expr_str(e: &Expr) -> String {
     match e {
         Expr::Literal { value, .. } => value.to_string(),
-        Expr::Port(p) => port_str(p),
+        // Covergroup lane indices are constant-only (no runtime scope at
+        // schema-lower time), so `port_str` needs no function context.
+        Expr::Port(p) => port_str(None, p),
         Expr::Binary(op, a, b) => {
             format!(
                 "({} {} {})",
