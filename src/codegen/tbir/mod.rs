@@ -1057,6 +1057,32 @@ fn emit_lifecycle_checkers(
         let trigger = func::clause_expr_cpp(prog, ch.function, inst_path, &ch.trigger)?;
         let tag = format!("_cyc_{inst_tag}_{}", ch.function.0);
         writeln!(out, "{INDENT}_checkers.push_back([&]() {{").ok();
+        if ch.monitor_channel.is_some() {
+            // Bound-bus handshake monitor (v1's `emit_bound_monitor_actors`).
+            // v1 lowers it as a coroutine: `while (true) { co_await
+            // wait_until(valid && ready); <capture+body>; co_await
+            // wait_cycles(1); }`. Because the post-body `wait_cycles(1)`
+            // re-parks in `wait_until` (which never resumes same-tick), v1
+            // captures one beat, then SKIPS exactly the next cycle before
+            // re-arming — so a continuously-held handshake samples every
+            // OTHER cycle (e.g. held over cycles 5,6,7 → beats at 5 and 7),
+            // NOT every cycle (Level) and NOT only the rising edge.
+            //
+            // The `_checkers` pass runs once per primary cycle at the same
+            // phase the monitor coroutine would resume (`sched.tick()` then
+            // checkers), so the cadence is reproduced exactly with a
+            // fire-then-cooldown latch: fire when the predicate holds, then
+            // consume the following cycle as the `wait_cycles(1)` re-arm.
+            writeln!(out, "{INDENT}{INDENT}static bool {tag}_cool = false;").ok();
+            writeln!(out, "{INDENT}{INDENT}if ({tag}_cool) {{").ok();
+            writeln!(out, "{INDENT}{INDENT}{INDENT}{tag}_cool = false;").ok();
+            writeln!(out, "{INDENT}{INDENT}}} else if ((bool)({trigger})) {{").ok();
+            writeln!(out, "{INDENT}{INDENT}{INDENT}{lambda}({inst_path});").ok();
+            writeln!(out, "{INDENT}{INDENT}{INDENT}{tag}_cool = true;").ok();
+            writeln!(out, "{INDENT}{INDENT}}}").ok();
+            writeln!(out, "{INDENT}}});").ok();
+            continue;
+        }
         match ch.edge {
             ir::CycleEdge::Level => {
                 writeln!(out, "{INDENT}{INDENT}if ((bool)({trigger})) {{").ok();
