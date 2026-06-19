@@ -1484,6 +1484,15 @@ fn lower_test(
     let mut clocks: Vec<&ClockDecl> = Vec::new();
     let mut scope: Option<&ScopeDecl> = None;
     let mut bare_stmts: Vec<&AstStmt> = Vec::new();
+    // Count of bare statements collected *before* the `scope` block was
+    // seen, in test-item order. v1 emits the whole test (bare stmts +
+    // scope phases) into one coroutine in source order, so a bare
+    // statement that precedes the `scope` runs before setup/run, and one
+    // that follows it runs after teardown. The run/check IR split (Run =
+    // setup+run, Check = check+teardown, emitted back-to-back) preserves
+    // that ordering by routing the pre-scope bare stmts to the front of
+    // the run list and the post-scope ones to the tail of the check list.
+    let mut n_bare_before_scope: usize = 0;
     // Test-scope `on <obj>.<method> pre/post` method hooks, in source
     // order. Resolved to a transactor field + method and lowered as
     // `FunctionKind::TestHook` bodies once the test ctx is built.
@@ -2082,6 +2091,8 @@ fn lower_test(
                     return Err(unsupported("multiple `scope` blocks in one test", ""));
                 }
                 scope = Some(s);
+                // Everything in `bare_stmts` so far precedes the scope.
+                n_bare_before_scope = bare_stmts.len();
             }
             TestItem::Stmt(s) => {
                 // Test-scope pre/post method hook (`on drv.send pre ...
@@ -2966,6 +2977,13 @@ fn lower_test(
     let mut run_stmts: Vec<&AstStmt> = test_let_stmts.iter().collect();
     let n_hoisted_lets = run_stmts.len();
     let mut check_stmts: Vec<&AstStmt> = Vec::new();
+    // Bare statements that precede the `scope` block run before its
+    // setup/run (matching v1's single-coroutine item-order emission);
+    // those that follow it run after teardown.
+    let (bare_before_scope, bare_after_scope) = bare_stmts.split_at(n_bare_before_scope);
+    if scope.is_some() {
+        run_stmts.extend(bare_before_scope.iter().copied());
+    }
     if let Some(s) = scope {
         if let Some(b) = &s.setup {
             collect_stmts(b, !synthetic, &mut run_stmts);
@@ -2979,6 +2997,7 @@ fn lower_test(
         if let Some(b) = &s.teardown {
             collect_stmts(b, false, &mut check_stmts);
         }
+        check_stmts.extend(bare_after_scope.iter().copied());
     }
     // Precise rejection for the per-register `on regs.REG ... end on`
     // write callback residual at test scope. This is out of the TB-IR
@@ -3009,16 +3028,32 @@ fn lower_test(
         }
     }
     if scope.is_some() && !bare_stmts.is_empty() {
-        // v1 interleaves bare statements with scope blocks in item
-        // order; the IR's run/check split cannot represent that
-        // ordering yet, so reject rather than silently reorder.
-        return Err(unsupported(
-            "mixing bare statements with a `scope`/`run` block in one test",
-            "",
-        ));
+        // A bare `cover` mixed with a `scope` block stays rejected: v1
+        // itself emits non-compiling C++ for that case (its `_cov_*_hits`
+        // counter is declared inside the per-scope cover-summary block,
+        // so a bare cover references an out-of-scope symbol). There is no
+        // correct v1 behavior to mirror, so refuse rather than emit
+        // something that diverges. General bare statements (e.g. a bare
+        // `log(...)`) are routed by item order above and are fine.
+        if bare_stmts
+            .iter()
+            .any(|s| matches!(&s.kind, StmtKind::Cover(_)))
+        {
+            return Err(unsupported(
+                "mixing a bare `cover` statement with a `scope`/`run` block in one test",
+                "move the `cover` into the scope's `check` block (a bare cover \
+                 alongside a scope has no well-defined lowering — v1 emits \
+                 non-compiling C++ for it)",
+            ));
+        }
+        // Other bare statements were already routed into the run/check
+        // lists by item order (pre-scope → run front, post-scope → check
+        // tail); nothing more to append here.
+    } else {
+        // No scope: every bare statement is the run body, in order.
+        run_stmts.extend(bare_stmts.iter().copied());
     }
-    run_stmts.extend(bare_stmts.iter().copied());
-    if run_stmts.len() == n_hoisted_lets {
+    if run_stmts.len() == n_hoisted_lets && check_stmts.is_empty() {
         return Err(LowerError::Invalid(format!(
             "test `{}` has no body — add a `scope sim`, `run`, or bare statements",
             t.name.name

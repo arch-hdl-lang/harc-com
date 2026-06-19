@@ -46,6 +46,7 @@ sync_fifo_test | TxQueue | sync_fifo.sv | sync_fifo.arch | pass
 bus_arbiter_test | BusArbiter | bus_arbiter.sv | bus_arbiter.arch | pass
 wait_until_counter_test | Top | top_counter.sv | top_counter.arch | pass
 after_cycles_test | Top | top_counter.sv | top_counter.arch | pass
+bare_stmt_scope_test | Top | top_counter.sv | top_counter.arch | pass
 rom_lut_test | RomLut | rom_lut.sv | rom_lut.arch | pass
 log_paths_test | Top | top_counter.sv | top_counter.arch | pass
 fatal_path_test | Top | top_counter.sv | top_counter.arch | fail
