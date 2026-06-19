@@ -1905,6 +1905,12 @@ fn typed_let_ir_type(t: &TypeExpr) -> Option<IrType> {
         BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => Some(IrType::UInt(width)),
         BuiltinTy::SInt | BuiltinTy::SIntCap => Some(IrType::SInt(width)),
         BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => Some(IrType::Bool),
+        // `let t : time` → `uint64_t` (v1's `c_type_for(Time)`); the RHS
+        // time literal lowers to a bare `Expr::Literal` of its numeric
+        // prefix (`100ns` -> 100). (String has no v1-supported local
+        // surface — see the `ExprKind::String` arm in lower/exprs.rs —
+        // so it is intentionally absent here.)
+        BuiltinTy::Time => Some(IrType::UInt(Some(64))),
         _ => None,
     }
 }
