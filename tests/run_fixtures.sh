@@ -127,6 +127,7 @@ cov_cross_bins_test     | Top            | top_counter.sv         |
 wait_any_of_test        | Top            | top_counter.sv         |
 transaction_basic_test  | Top            | top_counter.sv         |
 scoreboard_basic_test   | Top            | top_counter.sv         |
+scoreboard_data_queue_struct_test | Top   | top_counter.sv         |
 tlm_method_blocking_bus_test | TlmMemory | TlmMemory.sv           |
 EOF
 

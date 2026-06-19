@@ -1277,10 +1277,13 @@ end impl T
     );
 }
 
-/// A `queue<Struct>` element type is out of the scalar-only subset:
-/// rejected at the field, not mis-lowered.
+/// A `queue<Struct>` element on a plain data-only scoreboard lowers to a
+/// record-element queue (`QueueElem::Record`), mirroring v1's
+/// `HarcQueue<Struct>` — reusing the same record-queue seam as the
+/// composite-component path. push/pop/size of the struct element work,
+/// and a `let s : Pkt = sb.q.pop()` types the popped local as the record.
 #[test]
-fn scoreboard_struct_queue_is_rejected() {
+fn scoreboard_struct_queue_lowers_to_record_element() {
     let src = r#"
 struct Pkt
     a : uint<8>
@@ -1297,15 +1300,34 @@ end testbench Tb
 
 impl T for Tb
     run
-        assert sb.q.empty() else fail("x")
+        let p : Pkt
+        p.a = 7
+        sb.q.push(p)
+        assert sb.q.size() == 1 else fail("x")
+        let got : Pkt = sb.q.pop()
+        assert got.a == 7 else fail("y")
+        assert sb.q.empty() else fail("z")
     end run
 end impl T
 "#;
-    let err = lower_src(src).expect_err("queue<struct> must be rejected");
-    assert!(
-        format!("{err}").contains("scoreboard field"),
-        "unexpected error: {err}"
-    );
+    let prog = lower_src(src).expect("queue<struct> on a data-only scoreboard lowers");
+    verify::verify_program(&prog).expect("verifies");
+    // The scoreboard stays on the data-only `ScoreboardSchema` path (a
+    // method-less board never routes to the composite-component table),
+    // and its queue field carries a record element (not a scalar
+    // fallback), mirroring v1's `HarcQueue<Pkt>`.
+    let sb = prog
+        .scoreboards
+        .iter()
+        .find(|s| s.name == "Sb")
+        .expect("data-only scoreboard `Sb` is present");
+    let q = sb.field("q").expect("queue field `q`");
+    match &q.kind {
+        ir::ScoreboardFieldKind::Queue {
+            elem: ir::QueueElem::Record(_),
+        } => {}
+        other => panic!("expected a record-element queue, got {other:?}"),
+    }
 }
 
 /// A record let inside a loop re-runs the defaults each iteration:

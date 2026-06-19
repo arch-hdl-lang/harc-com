@@ -424,6 +424,40 @@ impl FuncBuilder<'_> {
                 }
             }
         }
+        // `let v = sb.q.pop()` on a data-only scoreboard queue — pop the
+        // front into a new local. Checked here (before the record-typed /
+        // scalar let-RHS forms) for the same reason as the component-queue
+        // pop above: a record-element pop is `let s : Sample = ...pop()`
+        // (a record-typed let WITH an initializer, which the record-local
+        // block below would otherwise reject). The popped local's type
+        // comes from the queue element — the record id for a value-record
+        // element, or a scalar width from the optional `let` annotation.
+        if let Some(value) = &l.value {
+            if let Some((sb, field, queue, nested_path)) = self.as_scoreboard_pop(value)? {
+                let elem = self.scoreboard_queue_elem(sb, &queue)?;
+                let id = self.declare(&l.name.name);
+                match elem {
+                    crate::ir::QueueElem::Record(rid) => {
+                        self.set_local_type(id, IrType::Record(rid));
+                    }
+                    crate::ir::QueueElem::Scalar { .. } => {
+                        if let Some(w) = l.ty.as_ref().and_then(typed_let_width) {
+                            self.let_widths.insert(id, w);
+                        }
+                        if let Some(ty) = l.ty.as_ref().and_then(typed_let_ir_type) {
+                            self.set_local_type(id, ty);
+                        }
+                    }
+                }
+                self.push(Stmt::ScoreboardOp {
+                    sb,
+                    field,
+                    op: crate::ir::ScoreboardOp::QueuePop { queue, dest: id },
+                    nested_path,
+                });
+                return Ok(());
+            }
+        }
         // Record-typed local: `let t : TxnType` default-constructs (v1
         // declares the struct at the let site, so field defaults re-run
         // on every loop iteration — RecordInit mirrors that).
@@ -560,23 +594,11 @@ impl FuncBuilder<'_> {
         if self.try_lower_bus_call(value, super::bus::BusCallDest::Declare(&l.name.name))? {
             return Ok(());
         }
-        // `let v = sb.q.pop()` — pop the queue front into a new local.
-        if let Some((sb, field, queue, nested_path)) = self.as_scoreboard_pop(value)? {
-            let id = self.declare(&l.name.name);
-            if let Some(w) = declared_width {
-                self.let_widths.insert(id, w);
-            }
-            if let Some(ty) = declared_scalar_ty.clone() {
-                self.set_local_type(id, ty);
-            }
-            self.push(Stmt::ScoreboardOp {
-                sb,
-                field,
-                op: crate::ir::ScoreboardOp::QueuePop { queue, dest: id },
-                nested_path,
-            });
-            return Ok(());
-        }
+        // (A `let v = sb.q.pop()` scoreboard-queue pop is handled earlier,
+        // before the record-typed-local block, so a record-element pop
+        // `let s : Sample = sb.q.pop()` is recognized as a pop rather than
+        // rejected as a record-typed let with an initializer — mirrors the
+        // composite-component pop placement.)
         // `let txns = RandomTxns(5)` — a tseq generator call. The result
         // is an `IrType::RecordSeq` assigned into a fresh test-scope local;
         // the call edge is a `CallTarget::Tseq` whose args lower like any
@@ -1184,6 +1206,32 @@ impl FuncBuilder<'_> {
                 crate::ir::ScoreboardFieldKind::Queue { .. } => Err(LowerError::Invalid(format!(
                     "scoreboard `{}` field `{field}` is a queue, not a scalar — assign via \
                      `push`/`pop`",
+                    schema.name
+                ))),
+            },
+            None => Err(LowerError::Invalid(format!(
+                "scoreboard `{}` has no field `{field}`",
+                schema.name
+            ))),
+        }
+    }
+
+    /// The `QueueElem` of scoreboard `sb`'s queue field `<field>`, so a
+    /// record-element `pop()` can type its destination local as the record
+    /// (mirrors the composite-component path's `component_queue_elem`).
+    /// Errors identically to `scoreboard_queue_field` for a non-queue /
+    /// missing field.
+    pub(crate) fn scoreboard_queue_elem(
+        &self,
+        sb: crate::ir::ScoreboardId,
+        field: &str,
+    ) -> Result<crate::ir::QueueElem, LowerError> {
+        let schema = &self.ctx.scoreboards[sb.index()];
+        match schema.field(field) {
+            Some(f) => match &f.kind {
+                crate::ir::ScoreboardFieldKind::Queue { elem } => Ok(*elem),
+                crate::ir::ScoreboardFieldKind::Scalar { .. } => Err(LowerError::Invalid(format!(
+                    "scoreboard `{}` field `{field}` is a scalar, not a queue",
                     schema.name
                 ))),
             },

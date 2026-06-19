@@ -422,7 +422,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             if components::scoreboard_is_component(c) {
                 continue;
             }
-            let schema = scoreboards::lower_scoreboard(c)?;
+            let schema = scoreboards::lower_scoreboard(c, &record_ids)?;
             if scoreboard_ids
                 .insert(
                     c.name.name.clone(),
