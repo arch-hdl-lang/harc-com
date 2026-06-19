@@ -1,0 +1,102 @@
+// `scoreboard` data-only host-state record whose queue field carries a
+// VALUE-RECORD element (`queue<Sample>`), not just a scalar. This is the
+// back-port of the component-path record-queue seam (`QueueElem::Record`)
+// onto the plain data-only `ScoreboardSchema` path: v1 emits
+// `harc_rt::HarcQueue<Sample>` for such a field (`scoreboard_field_c_type`
+// → `payload_type_for_arg`), and this fixture exercises push/pop/size of a
+// struct element on a plain data-only board bound as a testbench field.
+//
+// Exercises, against the counter DUT (`Top` from top_counter_test):
+//   1. Declaration: a `queue<Sample>` field (struct element) plus a scalar
+//      counter, bound as a testbench field.
+//   2. Queue ops: `sb.samples.push(s)` (statement, struct value), `let s =
+//      sb.samples.pop()` (let-RHS, popped local typed as the record so its
+//      fields resolve), `sb.samples.size()` / `.empty()` (value queries).
+//   3. Struct field access on a popped record (`s.run_idx`, `s.count`).
+//
+// Uses only the v1-supported surface, so the same file passes under
+// `--codegen v1` and `--codegen tbir`; the equivalence harness trace-diffs
+// the two.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+struct Sample
+    run_idx : uint<32>
+    count   : uint<32>
+end struct Sample
+
+scoreboard SampleSb
+    samples : queue<Sample>
+    writes  : uint<32> default 0
+    reads   : uint<32> default 0
+end scoreboard SampleSb
+
+testbench ScoreboardDataQueueStructTb
+    dut : Top
+    sb  : SampleSb
+end testbench ScoreboardDataQueueStructTb
+
+impl ScoreboardDataQueueStructTest for ScoreboardDataQueueStructTb
+    clock clk = SysDomain        // 100 MHz
+
+    run
+        log(info, "scoreboard data queue<struct>: record-element queue on counter DUT")
+
+        // Reset for 3 cycles.
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        assert dut.count_out == 0
+            else fail("after reset: count_out=${dut.count_out}, expected 0")
+        dut.rst = 0
+
+        // Three runs; run i enables the counter for (i+1) more cycles.
+        // Each run records a `Sample{run_idx, count}` snapshot, pushed
+        // before advancing and popped back / verified after.
+        let total = 0
+        for i in 0 .. 3
+            let bump = i + 1               // 1, 2, 3 cycles of en
+            total = total + bump
+
+            let s : Sample
+            s.run_idx = i
+            s.count = total
+            sb.samples.push(s)
+            sb.writes = sb.writes + 1
+
+            dut.en = 1
+            for _ in 0 .. bump
+                wait 1 cycle
+            end for
+            dut.en = 0
+            wait 1 cycle                   // let the last count settle
+
+            let want : Sample = sb.samples.pop()
+            sb.reads = sb.reads + 1
+            let got = dut.count_out
+            assert want.run_idx == i
+                else fail("run[${i}]: popped run_idx=${want.run_idx}, expected ${i}")
+            assert got == want.count
+                else fail("run[${i}]: count_out=${got}, expected ${want.count}")
+            log(info, "run[${i}] count_out=${got} matched sample count=${want.count}")
+        end for
+
+        // Queue must be drained at the end of run.
+        assert sb.samples.empty()
+            else fail("queue not drained: ${sb.samples.size()} sample(s) left")
+    end run
+
+    // End-of-test invariants — auto-fire after `run`. The scoreboard
+    // lives on the shared `_tb` struct, so check sees run's mutations.
+    check
+        assert sb.samples.size() == 0
+            else fail("scoreboard left ${sb.samples.size()} sample(s)")
+        assert sb.writes == sb.reads
+            else fail("counter drift: writes=${sb.writes} reads=${sb.reads}")
+        assert sb.writes == 3
+            else fail("expected 3 writes, got ${sb.writes}")
+        log(info, "PASS: scoreboard drained, ${sb.reads} reads matched ${sb.writes} writes")
+    end check
+end impl ScoreboardDataQueueStructTest

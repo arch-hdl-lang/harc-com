@@ -1665,7 +1665,7 @@ pub(crate) fn dotted_path(e: &crate::ast::Expr) -> Option<Vec<String>> {
 /// positions, `TypeArg::Type(Named)`. A named type that is neither a
 /// scalar nor a known record (enum / Vec / nested / unknown) is rejected
 /// precisely.
-fn lower_queue_elem(
+pub(crate) fn lower_queue_elem(
     comp: &str,
     fname: &str,
     arg: Option<&TypeArg>,

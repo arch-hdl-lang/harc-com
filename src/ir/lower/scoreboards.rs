@@ -23,9 +23,13 @@
 
 use super::{unsupported, LowerError};
 use crate::ast::{BuiltinTy, ComponentDecl, ComponentItem, ExprKind, TypeArg, TypeExpr};
-use crate::ir::{IrType, ScoreboardFieldKind, ScoreboardFieldSchema, ScoreboardSchema};
+use crate::ir::{IrType, RecordId, ScoreboardFieldKind, ScoreboardFieldSchema, ScoreboardSchema};
+use std::collections::HashMap;
 
-pub(crate) fn lower_scoreboard(c: &ComponentDecl) -> Result<ScoreboardSchema, LowerError> {
+pub(crate) fn lower_scoreboard(
+    c: &ComponentDecl,
+    record_ids: &HashMap<String, RecordId>,
+) -> Result<ScoreboardSchema, LowerError> {
     let sb = &c.name.name;
     if !c.params.is_empty() {
         return Err(unsupported(&format!("parameters on scoreboard `{sb}`"), ""));
@@ -58,13 +62,7 @@ pub(crate) fn lower_scoreboard(c: &ComponentDecl) -> Result<ScoreboardSchema, Lo
                         "scoreboard `{sb}` declares field `{fname}` more than once"
                     )));
                 }
-                let kind = scoreboard_field_kind(&f.ty).ok_or_else(|| {
-                    unsupported(
-                        &format!("scoreboard field `{sb}.{fname}` of an unsupported type"),
-                        "only scalar uint/sint/bits/bool fields up to 64 bits and \
-                         `queue<T>` of such a scalar element type are lowered",
-                    )
-                })?;
+                let kind = scoreboard_field_kind(sb, fname, &f.ty, record_ids)?;
                 let kind = match kind {
                     ScoreboardFieldKind::Scalar { ty, .. } => {
                         let default = scalar_default(&f.default, sb, fname)?;
@@ -120,31 +118,37 @@ pub(crate) fn lower_scoreboard(c: &ComponentDecl) -> Result<ScoreboardSchema, Lo
 
 /// Classify a scoreboard field type. Scalar fields mirror v1's
 /// `scoreboard_field_c_type` → `txn_field_c_type` choices; `queue<T>`
-/// maps to `harc_rt::HarcQueue<T>` when `T` is a scalar ≤ 64 bits.
-/// `None` for anything out of the lowered subset.
-fn scoreboard_field_kind(t: &TypeExpr) -> Option<ScoreboardFieldKind> {
-    let TypeExpr::Builtin { name, args, .. } = t else {
-        return None;
-    };
-    if matches!(name, BuiltinTy::Queue) {
-        // Element type must be a scalar ≤ 64 bits in this subset.
-        let elem = match args.first() {
-            Some(TypeArg::Type(ty)) => ty.clone(),
-            // `queue<uint<32>>` can parse the inner as a type-arg-expr in
-            // some positions; only the explicit `Type` form is in scope.
-            _ => return None,
-        };
-        let signed = match scalar_ir_type(&elem)? {
-            IrType::SInt(_) => true,
-            IrType::UInt(_) | IrType::Bool => false,
-            _ => return None,
-        };
-        return Some(ScoreboardFieldKind::Queue {
-            elem: crate::ir::QueueElem::Scalar { signed },
-        });
+/// maps to `harc_rt::HarcQueue<T>` when `T` is a scalar ≤ 64 bits or a
+/// value-record (transaction/struct), mirroring v1's `HarcQueue<Struct>`.
+/// The record-element resolution reuses the composite-component path's
+/// `lower_queue_elem` so both queue seams agree on the `QueueElem` shape.
+/// Errors (not `None`) so the record/enum rejection messages are precise.
+fn scoreboard_field_kind(
+    sb: &str,
+    fname: &str,
+    t: &TypeExpr,
+    record_ids: &HashMap<String, RecordId>,
+) -> Result<ScoreboardFieldKind, LowerError> {
+    if let TypeExpr::Builtin {
+        name: BuiltinTy::Queue,
+        args,
+        ..
+    } = t
+    {
+        // Scalar ≤ 64 bits or a value-record element — resolved through the
+        // shared component-path helper (don't fork the record-queue seam).
+        let elem = super::components::lower_queue_elem(sb, fname, args.first(), record_ids)?;
+        return Ok(ScoreboardFieldKind::Queue { elem });
     }
-    let ty = scalar_ir_type(t)?;
-    Some(ScoreboardFieldKind::Scalar { ty, default: 0 })
+    let ty = scalar_ir_type(t).ok_or_else(|| {
+        unsupported(
+            &format!("scoreboard field `{sb}.{fname}` of an unsupported type"),
+            "only scalar uint/sint/bits/bool fields up to 64 bits and \
+             `queue<T>` of such a scalar element type or a `queue<transaction|struct>` \
+             are lowered",
+        )
+    })?;
+    Ok(ScoreboardFieldKind::Scalar { ty, default: 0 })
 }
 
 /// Scalar field-type mapping, mirroring v1's `txn_field_c_type` choices
