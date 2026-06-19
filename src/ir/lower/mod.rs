@@ -2901,6 +2901,42 @@ fn lower_test(
         }
         resolved_reg_cbs.push((binding, reg, h));
     }
+    // Check-phase host-state promotion: a test-scope `let` that is read
+    // (bare) in the `check`/`teardown` body. v1 hoists every test-scope
+    // let to `main`-scope so run AND check capture it by reference; the
+    // IR splits run and check into separate functions, so a let written
+    // in run and read in check needs a shared cell. Promote it to the
+    // SAME `_tb` scalar host field the closure-hook path uses (reads →
+    // `Expr::TbField`, writes → `Stmt::TbFieldWrite`), so the value
+    // persists across the run→check boundary inside the shared `_tb`
+    // struct — trace-equivalent, since a `_tb` field write emits no
+    // observable trace event, exactly like a v1 shared-scope local
+    // mutation. The constant-initializer requirement (enforced below) is
+    // a precise narrowing of v1: a non-constant-init check-read let is
+    // rejected loudly rather than miscompiled.
+    if let Some(s) = scope {
+        let mut check_reads = HashSet::new();
+        if let Some(b) = &s.check {
+            collect_idents_in_block(b, &mut check_reads);
+        }
+        if let Some(b) = &s.teardown {
+            collect_idents_in_block(b, &mut check_reads);
+        }
+        // A `let` declared inside the check/teardown body shadows a
+        // same-named test-scope let, so it must not promote the outer one.
+        let mut check_locals = HashSet::new();
+        if let Some(b) = &s.check {
+            collect_local_decls_in_block(b, &mut check_locals);
+        }
+        if let Some(b) = &s.teardown {
+            collect_local_decls_in_block(b, &mut check_locals);
+        }
+        for name in &check_reads {
+            if test_let_names.contains(name) && !check_locals.contains(name) {
+                promoted_lets.insert(name.clone());
+            }
+        }
+    }
     // Promote each captured let: drop its `let` declaration (it becomes a
     // `_tb` field with a default) and register it as a scalar host field.
     // The init must be a compile-time constant (the field's `default`);
@@ -2920,7 +2956,7 @@ fn lower_test(
             let default = match l.value.as_ref().map(|v| &*v.kind) {
                 Some(ExprKind::Int(s)) => s.replace('_', "").parse::<u64>().map_err(|_| {
                     LowerError::Invalid(format!(
-                        "promoted hook-captured `let {}` has a non-integer initializer",
+                        "promoted `let {}` has a non-integer initializer",
                         l.name.name
                     ))
                 })?,
@@ -2928,11 +2964,12 @@ fn lower_test(
                 _ => {
                     return Err(unsupported(
                         &format!(
-                            "a hook-captured `let {}` with a non-constant initializer",
+                            "a promoted test-scope `let {}` with a non-constant initializer",
                             l.name.name
                         ),
-                        "a closure-hook-captured test-scope let is promoted to a `_tb` host \
-                         field whose default must be a compile-time constant",
+                        "a test-scope let captured by a closure hook OR read in the check phase \
+                         is promoted to a `_tb` host field whose default must be a compile-time \
+                         constant; assign the computed value in the run body instead",
                     ));
                 }
             };

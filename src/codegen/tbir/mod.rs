@@ -24,6 +24,21 @@ use std::fmt::Write as _;
 
 const INDENT: &str = "    ";
 
+/// Whether a testbench needs a `_tb` host struct emitted (and a `_tb`
+/// instance declared in each owning test). Non-synthetic testbenches
+/// always do — they own the DUT handle plus cov/scoreboard/transactor
+/// state. A SYNTHETIC testbench (classic `test` form, no `testbench`
+/// binding) normally has none, but it acquires one when it carries
+/// promoted scalar fields: a test-scope `let` written in `run` and read
+/// in `check` is promoted to a `_tb` scalar field so its value persists
+/// across the run→check boundary (the two phases lower to separate IR
+/// functions). The promoted field is the only `_tb` member used in that
+/// case — the unused `dut` handle stays a nullptr (synthetic tests use a
+/// bare `dut` local).
+fn needs_tb_struct(tb: &ir::TestbenchSchema) -> bool {
+    !tb.synthetic || !tb.scalar_fields.is_empty()
+}
+
 pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<String, EmitError> {
     if opts.mt {
         return Err(EmitError(
@@ -162,10 +177,17 @@ pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<Stri
     // nothing when the program declares no extern fns.
     crate::codegen::cpp_tb::emit_extern_fn_decls(&mut out, file);
 
-    // One struct per unique non-synthetic testbench.
+    // One struct per unique testbench that needs a `_tb` host struct.
+    // Non-synthetic testbenches always get one. A SYNTHETIC testbench
+    // (classic `test` form, no `testbench` binding) normally has no
+    // `_tb` — but it still needs one when it carries promoted scalar
+    // fields: a test-scope `let` written in `run` and read in `check`
+    // is promoted to a `_tb` field so it persists across the run→check
+    // boundary (run and check are separate IR functions). See
+    // `needs_tb_struct`.
     let mut seen = HashSet::new();
     for tb in &prog.testbenches {
-        if !tb.synthetic && seen.insert(tb.name.clone()) {
+        if needs_tb_struct(tb) && seen.insert(tb.name.clone()) {
             let cov_fields: Vec<(String, String)> = tb
                 .cov_fields
                 .iter()
@@ -1199,7 +1221,7 @@ fn emit_test(
     }
     runtime::log_helpers_and_seed(out);
 
-    if !tb.synthetic {
+    if needs_tb_struct(tb) {
         writeln!(out, "{INDENT}{} _tb;", tb.name).ok();
     }
     // Closure-hook regblock mirrors: a binding with `on regs.REG` write

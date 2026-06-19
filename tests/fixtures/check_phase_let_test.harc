@@ -1,0 +1,73 @@
+// Test-scope `let` written in `run` and read in the `check` phase.
+//
+// v1 hoists every test-scope let to `main`-scope, so run AND check
+// capture it by reference. TB-IR splits run and check into separate IR
+// functions; a test-scope let written in run and read in check is
+// auto-promoted to a `_tb` scalar host field (the same host-state
+// promotion the closure-hook path uses) so the value persists across
+// the run→check boundary inside the shared `_tb` struct. The promotion
+// is trace-equivalent: a `_tb` field write emits no observable trace
+// event, exactly like a v1 shared-scope local mutation, so
+// `harc trace-diff` sees no divergence between the two codegens.
+//
+// Pattern exercised here: `expected_total` is a TEST-SCOPE let with a
+// constant initializer (0, which becomes the `_tb` field default). It is
+// accumulated in the run loop (each `expected_total = ...` lowers to a
+// `_tb` field write), then read back in the check phase and reconciled
+// against the DUT's final count.
+//
+// `for i in 0 .. 2` is INCLUSIVE (#430): three iterations, i = 0,1,2.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+test CheckPhaseLetTest
+    let dut : Top
+    let expected_total = 0      // test-scope let: written in run, read in check
+
+    clock clk = SysDomain       // 100 MHz
+
+    run
+        log(info, "check-phase let: accumulate in run, reconcile in check")
+
+        // Reset for 3 cycles, then start from a known zero.
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        assert dut.count_out == 0
+            else fail("after reset: count_out=${dut.count_out}, expected 0")
+        dut.rst = 0
+
+        // Three bursts of counting. Each burst i enables the counter for
+        // (i+1) cycles and adds that many to the running expected total.
+        // `expected_total` is the test-scope let: read+write here lower
+        // to `_tb` field accesses after promotion.
+        for i in 0 .. 2
+            let bump = i + 1               // 1, 2, 3 cycles of en
+            expected_total = expected_total + bump
+
+            dut.en = 1
+            for _ in 1 .. bump
+                wait 1 cycle
+            end for
+            dut.en = 0
+            wait 1 cycle                   // let the last count settle
+        end for
+
+        // Running total so far: 1 + 2 + 3 = 6 increments.
+        assert dut.count_out == expected_total
+            else fail("end of run: count_out=${dut.count_out}, expected ${expected_total}")
+        log(info, "end of run: count_out=${dut.count_out}, expected_total=${expected_total}")
+    end run
+
+    // The check phase reads `expected_total` written during run — it
+    // lives on the shared `_tb` struct after promotion.
+    check
+        assert expected_total == 6
+            else fail("expected_total drift: got ${expected_total}, want 6")
+        assert dut.count_out == expected_total
+            else fail("check: count_out=${dut.count_out} != expected_total=${expected_total}")
+        log(info, "PASS: check phase read expected_total=${expected_total}")
+    end check
+end test CheckPhaseLetTest
