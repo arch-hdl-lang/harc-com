@@ -1,0 +1,83 @@
+// Audit #425 (LOW): `randomize(t)` inside a COMPONENT method body.
+//
+// v1 emits randomize in any block; the TB-IR emitter previously gated
+// `Terminator::Randomize` out of transactor/component method bodies and
+// failed the lowering gate ("component method `comp_on_0` contains
+// terminator Randomize ... lowering gate failed"). The fix routes a
+// method-body Randomize through the same Z3-solve splice the test/tseq
+// paths use — the snippet is already built by
+// `cpp_tb::emit_randomize_snippets` from the shared constraint-site
+// table, so it is byte-identical to v1's method-body emission.
+//
+// An `agent`'s `on in_ev` handler is a component method body. Here it
+// runs a CONSTRAINED `randomize(t) with ... end randomize`: Z3 solves
+// the constraint deterministically from the seed, so the chosen value
+// is identical under both codegens (an unconstrained randomize would
+// diverge on the raw RNG draw). The handler stores the solved value;
+// the test asserts it satisfies the constraint, giving a reproducible
+// verdict and byte-matching v1/tbir traces.
+//
+// The DUT is `Top` (the counter from top_counter_test) used purely as a
+// background clock source — the agent logic runs host-side.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction RegOp
+    addr  : uint<8>  with [range(0, 64)]
+    value : uint<32>
+end transaction RegOp
+
+agent Randomizer
+    in_ev : event<uint<8>>
+    seen  : uint<32> default 0
+    last  : uint<32> default 0
+
+    // Component method body hosting a constrained randomize — the
+    // construct audit #425 reported as rejected by tbir.
+    on in_ev(t)
+        let r : RegOp
+        randomize(r) with
+            r.value > 1000
+            r.value < 2000
+            r.addr == 24
+        end randomize
+        seen = seen + 1
+        last = r.value
+    end on
+end agent Randomizer
+
+test ComponentMethodRandomizeTest
+    let dut : Top
+    let rz  : Randomizer
+
+    clock clk = SysDomain
+
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Fire the handler 3 times; each call randomizes a transaction
+        // inside the component method body.
+        for i in 0 .. 2
+            emit rz.in_ev(i + 1)
+            wait 2 cycles
+        end for
+
+        assert rz.seen == 3
+            else fail("expected 3 handled events, got ${rz.seen}")
+
+        // The constraint is Z3-solved, so `last` is deterministic and
+        // bounded. Assert the constraint held.
+        assert rz.last > 1000
+            else fail("method-body randomize: value=${rz.last} not > 1000")
+        assert rz.last < 2000
+            else fail("method-body randomize: value=${rz.last} not < 2000")
+
+        log(info, "PASS: component method-body randomize solved value=${rz.last}")
+    end run
+end test ComponentMethodRandomizeTest
