@@ -1,0 +1,79 @@
+// Bound-monitor cadence over a MULTI-CYCLE-HELD valid/ready handshake.
+//
+// The `stream_burst` DUT holds `s_valid` high for several consecutive
+// cycles (ready tied high), emitting a distinct incrementing payload on
+// each accepted beat. A passive transactor observes the `s` channel via
+// `on bus.s.handshake(d)` and pushes every captured payload into a
+// scoreboard queue.
+//
+// This distinguishes v1's bound-monitor coroutine cadence
+// (`wait_until(valid && ready)` + `wait_cycles(1)`, which samples every
+// OTHER cycle of a continuously-held handshake) from a naive rising-edge
+// checker (one beat) or a level checker (every beat). The captured
+// payloads — both their count and their values — must match between the
+// v1 and tbir codegens (enforced by the trace-diff in run_tbir_equiv).
+
+bus BusStream
+  handshake_channel s: receive kind: valid_ready
+    data: UInt<8>;
+  end handshake_channel s
+end bus BusStream
+
+scoreboard StreamSb
+    seen : queue<uint<8>>     // observed payloads on bus.s
+end scoreboard StreamSb
+
+transactor StreamMon bound to BusStream
+    sb : StreamSb
+
+    // Passive observation half — fires per the bound-monitor cadence on
+    // each valid+ready cycle of the `s` channel.
+    on bus.s.handshake(d)
+        sb.seen.push(d)
+    end on
+end transactor StreamMon
+
+testbench StreamBurstTb
+    dut : stream_burst
+end testbench StreamBurstTb
+
+impl StreamBurstMonTest for StreamBurstTb
+    let strm : BusStream = bind dut
+    let mon  : StreamMon passive = bind strm
+
+    run
+        log(info, "stream_burst bound-monitor cadence test")
+
+        // Reset, ready held high so every valid cycle is an accepted beat.
+        dut.rst = 1
+        strm.s.ready = 1
+        wait 2 cycles
+        dut.rst = 0
+
+        // Let the burst run to completion and settle.
+        wait 12 cycles
+
+        // The burst holds strm_s_valid high for 5 consecutive accepted
+        // beats. v1's monitor coroutine samples every OTHER held cycle:
+        // it captures one beat, then the post-body `wait_cycles(1)` re-arm
+        // (re-parking in `wait_until`, which never resumes same-tick)
+        // consumes the next cycle. So it captures 3 of the 5 beats. With
+        // the DUT's per-cycle payload increment and the checker phase, the
+        // captured values are 1, 2, 4. The tbir checker reproduces the
+        // SAME fire-then-cooldown cadence, so count AND values match v1 —
+        // a naive rising-edge checker would capture only beat 1 (size 1)
+        // and a naive level checker would capture all 5 (1..5), both of
+        // which DIVERGE from v1.
+        assert mon.sb.seen.size() == 3
+            else fail("expected 3 observed beats, got ${mon.sb.seen.size()}")
+
+        let b0 = mon.sb.seen.pop()
+        let b1 = mon.sb.seen.pop()
+        let b2 = mon.sb.seen.pop()
+        assert b0 == 1 else fail("beat[0] expected 1, got ${b0}")
+        assert b1 == 2 else fail("beat[1] expected 2, got ${b1}")
+        assert b2 == 4 else fail("beat[2] expected 4, got ${b2}")
+
+        log(info, "PASS: bound monitor captured every-other beat (1,2,4)")
+    end run
+end impl StreamBurstMonTest

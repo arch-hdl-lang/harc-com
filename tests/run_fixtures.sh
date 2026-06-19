@@ -71,6 +71,7 @@ axilite_bus_test        | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_bus_extern_test | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_bus_send_test   | AxiLiteRegs    | AxiLiteRegs.sv         |
 axilite_bound_mon_test  | AxiLiteRegs    | AxiLiteRegs.sv         |
+stream_burst_mon_test   | stream_burst   | stream_burst.sv        |
 axilite_multi_payload_test | AxiLiteRegs | AxiLiteRegs.sv         |
 axilite_regs_full_test  | AxiLiteRegs    | AxiLiteRegs.sv         |
 regblock_basic_test     | AxiLiteRegs    | AxiLiteRegs.sv         |

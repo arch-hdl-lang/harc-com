@@ -90,12 +90,16 @@ pub(crate) fn transactor_is_component(t: &TransactorDecl, env_held: bool) -> boo
             _ => {}
         }
     }
-    // A `bound to` transactor routes here ONLY when it is event-driven (an
-    // `in event` + a subscribing `on` handler). A `bound to` transactor
-    // with no event field (a hookable-method initiator BFM or a `thread
-    // bus.<m>` target responder) stays on the dedicated transactor path.
+    // A `bound to` transactor routes here when it carries a non-periodic
+    // `on` handler — either an event-driven driver (`in event` + a
+    // subscribing `on ev(arg)`) or a PASSIVE bus monitor (`on
+    // bus.<ch>.handshake(arg)` with no event/driver half). A `bound to`
+    // transactor with NO `on` handler (a hookable-method initiator BFM or
+    // a `thread bus.<m>` target responder — both structurally distinct
+    // item kinds, `Hookable` / `TargetTlmThread`, never `OnHandler`) stays
+    // on the dedicated transactor path.
     if t.bound_to.is_some() {
-        return has_in_event && has_on_handler;
+        return has_on_handler;
     }
     // Pure analysis source: events, no DUT.
     if has_event && !has_module_field {

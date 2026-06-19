@@ -598,6 +598,14 @@ pub struct CycleTriggerHandlerSchema {
     /// body is filled with the real binding name at test-binding time, like
     /// the bound-bus driver. Always-on: present on BOTH active and passive
     /// instances (the observation half, unaffected by `when active` mode).
+    ///
+    /// Sampling cadence differs from the plain `edge` modes: v1 lowers a
+    /// bound monitor as a `wait_until(valid && ready)` + `wait_cycles(1)`
+    /// coroutine loop, so a continuously-held handshake samples every OTHER
+    /// cycle (one beat, then the `wait_cycles(1)` re-arm consumes the next).
+    /// The tbir `_checkers` emission reproduces this with a fire-then-cooldown
+    /// latch (see `mod::emit_lifecycle_checkers`), NOT the `edge` field — for
+    /// a monitor channel the stored `edge` (`Rising`) is vestigial.
     pub monitor_channel: Option<String>,
 }
 
