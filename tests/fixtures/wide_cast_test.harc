@@ -1,0 +1,67 @@
+// Wide width-method casts in the 65..128-bit range — the `_harc_u128`
+// model. Companion to `width_methods_test.harc` (which covers ≤ 64-bit
+// only). Exercises `.trunc<N>()` / `.zext<N>()` / `.sext<N>()` /
+// `.resize<N>()` where N lands in 65..128, so both the source value and
+// the result are carried as v1's `_harc_u128` (`__uint128_t`).
+//
+// Each cast is checked against a hand-computed `uint<128>` constant via
+// whole-value `==` (lowers to `_harc_u128` equality). The TB-IR and v1
+// C++ emitters must produce identical verdicts and identical traces.
+//
+// >128-bit casts (the `HarcWide<N>` word-array model) are intentionally
+// NOT exercised here — they remain unsupported in TB-IR lowering.
+
+testbench WideCastTb
+    dut : Top
+end testbench WideCastTb
+
+impl WideCastTest for WideCastTb
+    run
+        // ── trunc: 128-bit source narrowed into the 65..128 range ──────
+        // 128-bit source: high 64 = 0xFEDCBA9876543210,
+        //                 low  64 = 0x0123456789ABCDEF.
+        let s128 : uint<128> = 0xFEDCBA9876543210_0123456789ABCDEF
+        // trunc<96>: keep the low 96 bits (drop the top 32 = 0xFEDCBA98).
+        let t96 = s128.trunc<96>()
+        assert t96 == 0x76543210_0123456789ABCDEF
+            else fail("trunc<96>: low64=0x${t96:016x}")
+
+        // ── zext: 64-bit source zero-extended into the 65..128 range ───
+        let v64 : uint<64> = 0xDEADBEEFCAFEF00D
+        let z128 = v64.zext<128>()
+        assert z128 == 0x00000000000000000_DEADBEEFCAFEF00D
+            else fail("zext<128>: low64=0x${z128:016x}")
+
+        // ── sext: MSB-set 64-bit source sign-extended past 64 bits ─────
+        // 0xFF..FF (all ones, MSB set) → sign-extends to all-ones 128.
+        let s64 : uint<64> = 0xFFFFFFFFFFFFFFFF
+        let se128 = s64.sext<128>()
+        assert se128 == 0xFFFFFFFFFFFFFFFF_FFFFFFFFFFFFFFFF
+            else fail("sext<128> of all-ones: low64=0x${se128:016x}")
+
+        // Positive 64-bit source (MSB clear) → no high-bit fill.
+        let p64 : uint<64> = 0x7FFFFFFFFFFFFFFF
+        let pe128 = p64.sext<128>()
+        assert pe128 == 0x00000000000000000_7FFFFFFFFFFFFFFF
+            else fail("sext<128> of positive: low64=0x${pe128:016x}")
+
+        // ── resize: direction-agnostic into the 65..128 range ──────────
+        // Widen a 64-bit value (plain cast, zero high bits).
+        let r128 = v64.resize<128>()
+        assert r128 == 0x00000000000000000_DEADBEEFCAFEF00D
+            else fail("resize<128> widen: low64=0x${r128:016x}")
+
+        // Narrow a 128-bit value down to 96 bits (mask).
+        let rn96 = s128.resize<96>()
+        assert rn96 == 0x76543210_0123456789ABCDEF
+            else fail("resize<96> narrow: low64=0x${rn96:016x}")
+
+        // ── chained: wide cast feeding a narrow cast ───────────────────
+        // sext<128> of all-ones, then trunc<8> back down to a byte.
+        let chained = (s64.sext<128>()).trunc<8>()
+        assert chained == 0xFF
+            else fail("chained sext<128>.trunc<8>: got 0x${chained:02x}")
+
+        log(info, "PASS: 65..128-bit trunc/zext/sext/resize match the software model")
+    end run
+end impl WideCastTest

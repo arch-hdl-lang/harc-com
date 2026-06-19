@@ -450,13 +450,18 @@ fn wide_eq_cpp(
     }))
 }
 
-/// Width-method emission, ≤ 64-bit subset of v1's
-/// `try_emit_width_method` (lowering rejects wider). All casts target
-/// `uint64_t` (v1's `cpp_uint_for_width` for every width ≤ 64), so:
-/// trunc masks (plain cast at width 64), zext is a plain cast, sext
-/// shift-fills when the source width is known and smaller (plain cast
-/// otherwise), resize narrows with a mask and widens with a plain
-/// cast (mask-narrow when the source width is unknown).
+/// Width-method emission, ≤ 128-bit subset of v1's
+/// `try_emit_width_method` (lowering rejects >128-bit `HarcWide<N>`
+/// casts). Casts ≤ 64 bits target `uint64_t`; 65..128-bit casts target
+/// v1's `_harc_u128` (`cpp_uint_for_width(width)` returns `_harc_u128`
+/// for that range). Per kind:
+/// - trunc: ≤64 masks (plain cast at width 64), 65..128 routes through
+///   `harc_rt::harc_trunc_u128((_harc_u128)e, width)`.
+/// - zext: plain cast to the width's C type (`uint64_t` or `_harc_u128`).
+/// - sext: shift-fills (≤64) / `harc_rt::harc_sext_u128` (65..128) when
+///   the source width is known and smaller; plain cast otherwise.
+/// - resize: narrows via trunc-shape, widens via plain cast (mask-narrow
+///   when the source width is unknown).
 fn width_cast_cpp(
     cx: &ECx<'_>,
     kind: WidthCastKind,
@@ -465,29 +470,39 @@ fn width_cast_cpp(
     inner: &Expr,
 ) -> Result<String, EmitError> {
     let e = expr_cpp(cx, inner)?;
+    // The destination C type, mirroring v1's `cpp_uint_for_width`:
+    // `_harc_u128` for 65..128-bit casts, `uint64_t` otherwise.
+    let c_unsigned = if width > 64 { "_harc_u128" } else { "uint64_t" };
     let mask = |w: u32| (1u64 << w) - 1;
+    // Narrow-to-`width` shape (v1's trunc / resize-narrow path).
     let trunc_shape = |e: &str| {
-        if width == 64 {
+        if width > 64 {
+            format!("harc_rt::harc_trunc_u128((_harc_u128)({e}), {width})")
+        } else if width == 64 {
             format!("((uint64_t)({e}))")
         } else {
             format!("((uint64_t)((({e}) & 0x{:X}ULL)))", mask(width))
         }
     };
-    let plain_cast = |e: &str| format!("((uint64_t)({e}))");
+    let plain_cast = |e: &str| format!("(({c_unsigned})({e}))");
     Ok(match kind {
         WidthCastKind::Trunc => trunc_shape(&e),
         WidthCastKind::Zext => plain_cast(&e),
         WidthCastKind::Sext => match src_width {
             Some(sw) if sw < width => {
-                let shift = 64 - sw;
-                if width == 64 {
-                    format!("((uint64_t)(((int64_t)((uint64_t)({e}) << {shift})) >> {shift}))")
+                if width > 64 {
+                    format!("harc_rt::harc_sext_u128((_harc_u128)({e}), {sw}, {width})")
                 } else {
-                    format!(
-                        "((uint64_t)(((int64_t)((uint64_t)({e}) << {shift})) >> {shift}) \
-                         & 0x{:X}ULL)",
-                        mask(width)
-                    )
+                    let shift = 64 - sw;
+                    if width == 64 {
+                        format!("((uint64_t)(((int64_t)((uint64_t)({e}) << {shift})) >> {shift}))")
+                    } else {
+                        format!(
+                            "((uint64_t)(((int64_t)((uint64_t)({e}) << {shift})) >> {shift}) \
+                             & 0x{:X}ULL)",
+                            mask(width)
+                        )
+                    }
                 }
             }
             _ => plain_cast(&e),

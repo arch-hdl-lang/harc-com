@@ -1122,7 +1122,7 @@ fn validate_check_backend_codegen_limitations(path: &PathBuf, src: &str) -> Resu
             let span = tokens[window_start + 1].span.merge(tokens[close_idx].span);
             let err = harc::diagnostics::CompileError::unsupported_syntax(
                 &format!("C++ backend cannot lower `.{method}<N>()` with a non-constant width"),
-                "supported width-method forms for `harc check` and C++ codegen use a literal width in 1..=64",
+                "supported width-method forms for `harc check` and C++ codegen use a literal width in 1..=128",
                 span,
             );
             return Err(Report::new(err).with_source_code(NamedSource::new(
@@ -1130,11 +1130,11 @@ fn validate_check_backend_codegen_limitations(path: &PathBuf, src: &str) -> Resu
                 src.to_string(),
             )));
         };
-        if width == 0 || width > 64 {
+        if width == 0 || width > 128 {
             let span = tokens[window_start + 1].span.merge(tokens[close_idx].span);
             let err = harc::diagnostics::CompileError::unsupported_syntax(
                 &format!("C++ backend cannot lower `.{method}<{width}>()`"),
-                "supported resize widths for this backend are 1..=64; split the value into <=64-bit limbs or use an extern helper",
+                "supported resize widths for this backend are 1..=128 (65..128 use the `_harc_u128` model); split a >128-bit value into <=128-bit limbs or use an extern helper",
                 span,
             );
             return Err(Report::new(err).with_source_code(NamedSource::new(
@@ -2456,17 +2456,19 @@ mod tests {
 
     #[test]
     fn check_reports_backend_unsupported_wide_resize() {
+        // >128-bit casts use the `HarcWide<N>` word-array model, which the
+        // C++ backends don't lower yet — these must still be rejected.
         let src = r#"
-            function wide_zext_128_repro(a: uint<48>, b: uint<16>) -> uint<64>
-                let product : uint<128> = a.zext<128>() * b.zext<128>()
-                return product.trunc<64>()
-            end function wide_zext_128_repro
+            function wide_zext_256_repro(a: uint<48>, b: uint<16>) -> uint<128>
+                let product : uint<256> = a.zext<256>() * b.zext<256>()
+                return product.trunc<128>()
+            end function wide_zext_256_repro
         "#;
-        let path = PathBuf::from("wide_zext_128_repro.harc");
+        let path = PathBuf::from("wide_zext_256_repro.harc");
         let err = validate_check_backend_codegen_limitations(&path, src).unwrap_err();
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("C++ backend cannot lower `.zext<128>()`")
+            msg.contains("C++ backend cannot lower `.zext<256>()`")
                 && msg.contains("supported resize widths"),
             "expected backend unsupported-width diagnostic; got:\n{msg}"
         );
@@ -2481,6 +2483,22 @@ mod tests {
             end function narrow_ok
         "#;
         let path = PathBuf::from("narrow_ok.harc");
+        validate_check_backend_codegen_limitations(&path, src).unwrap();
+    }
+
+    #[test]
+    fn check_accepts_65_to_128_bit_resize_widths() {
+        // 65..128-bit casts now flow through the `_harc_u128` model in
+        // both the v1 and TB-IR C++ backends, so the check-phase gate
+        // must accept them.
+        let src = r#"
+            function wide_ok(a: uint<64>) -> uint<128>
+                let widened : uint<128> = a.zext<128>()
+                let narrowed : uint<96> = widened.trunc<96>()
+                return narrowed.sext<128>()
+            end function wide_ok
+        "#;
+        let path = PathBuf::from("wide_ok.harc");
         validate_check_backend_codegen_limitations(&path, src).unwrap();
     }
 
