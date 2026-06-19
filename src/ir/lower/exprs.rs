@@ -426,9 +426,43 @@ impl FuncBuilder<'_> {
                     )),
                 }
             }
+            // A bare string literal in expression position has no
+            // v1-supported landing surface: v1's `local_value_c_type` for a
+            // `let s : String` routes through `record_field_c_type ->
+            // txn_field_c_type`, which lacks a `BuiltinTy::String` case and
+            // falls through to `uint64_t` — emitting `uint64_t s = "...";`,
+            // a C++ compile error. (The `const char*` mapping in
+            // `c_type_for` only applies to method *params*, never lets.)
+            // And `${s}` interpolation always emits `%lld` +
+            // `harc_printf_ll`, which also fails for a pointer. Since v1
+            // cannot compile ANY string-valued local, lowering it in tbir
+            // would diverge from v1 rather than mirror it — keep it out of
+            // subset until v1 grows a real string-local surface (audit #425
+            // deferral). String *interpolation* (`${...}`) and `log`/`logf`
+            // format strings are separate statement-level paths that work.
             ExprKind::String(_) => Err(unsupported("string values in expression position", "")),
             ExprKind::Float(_) => Err(unsupported("float literals", "")),
-            ExprKind::Time(_) => Err(unsupported("time literals in expression position", "")),
+            ExprKind::Time(s) => {
+                // Bare `time` value in expression position (`let t : time =
+                // 100ns`). v1's `emit_expr_with_arrow` emits the leading
+                // numeric portion verbatim (no unit conversion) and types
+                // the local `uint64_t`. Mirror that exactly: take the digit/
+                // underscore prefix, strip underscores, parse as u64. (This
+                // is NOT the `wait <dur>` path, which converts to ps via
+                // `time_literal_to_ps` — a different surface.)
+                let digits: String = s
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '_')
+                    .filter(|c| *c != '_')
+                    .collect();
+                let value = digits.parse::<u64>().map_err(|_| {
+                    unsupported("time literal with no leading numeric value", "")
+                })?;
+                Ok(Expr::Literal {
+                    value,
+                    ty: IrType::UInt(Some(64)),
+                })
+            }
             ExprKind::SystemCall { .. } => Err(unsupported("temporal system calls", "")),
             ExprKind::StructLit { .. } => Err(unsupported("struct literals", "")),
             ExprKind::SetLit(_) => Err(unsupported("set literals", "")),

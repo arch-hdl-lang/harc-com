@@ -40,6 +40,7 @@ wait_until_quiesce_test | Top            | top_counter.sv         |
 wait_until_counter_test | Top            | top_counter.sv         |
 after_cycles_test       | Top            | top_counter.sv         |
 bare_stmt_scope_test    | Top            | top_counter.sv         |
+time_literal_test       | Top            | top_counter.sv         |
 watchdog_quiesce_test   | Top            | top_counter.sv         |
 agent_periodic_test     | Top            | top_counter.sv         |
 component_method_randomize_test | Top     | top_counter.sv         |

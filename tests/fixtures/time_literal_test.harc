@@ -1,0 +1,58 @@
+// Bare `time` literal in expression position (TB-IR audit #425 LOW gap).
+// `let t : time = 100ns` is a documented surface (spec.md, "type time":
+// `let t: time = 100ns`). In EXPRESSION position v1's
+// `emit_expr_with_arrow` emits the leading numeric prefix verbatim with
+// NO unit conversion (`100ns` -> `100`) and types the local `uint64_t`
+// (v1's `c_type_for(BuiltinTy::Time)`). TB-IR previously rejected this as
+// "time literals in expression position"; this fixture pins that both
+// backends now AGREE on the emitted value.
+//
+// NOTE: this is the EXPRESSION-position surface, distinct from the
+// `wait <dur>` path — that one converts the time to ps via
+// `time_literal_to_ps`. A `let : time` is a bare integer host local.
+//
+// Deferred (NOT exercised here): bare STRING literals — v1 has no
+// working string-local C++ surface (`let s : String` emits
+// `uint64_t s = "...";`, a compile error), so lowering one in tbir would
+// diverge from v1 rather than mirror it. And FLOAT literals — there is
+// no `float`/`real` builtin type, so a float value has no type-clean
+// local (an untyped `let x = 1.5` truncates to int64_t in v1). Both stay
+// out of subset until v1 grows a real surface for them.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench TimeLiteralTb
+    dut : Top
+end testbench TimeLiteralTb
+
+impl TimeLiteralTest for TimeLiteralTb
+    clock clk = SysDomain        // 100 MHz
+
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+
+        // Bare time literal in let-RHS expression position. v1 types the
+        // local `uint64_t` and emits the numeric prefix (100), so this is
+        // an ordinary integer host local from here on.
+        let deadline : time = 100ns
+        assert deadline == 100
+            else fail("time literal: deadline=${deadline}, expected 100")
+        log(info, "deadline=${deadline}")
+
+        // Use the time-derived integer in real arithmetic so the lowered
+        // value participates in an expression (not just a dead local).
+        let half : uint<32> = (deadline / 2).trunc<32>()
+        assert half == 50
+            else fail("half deadline: half=${half}, expected 50")
+        log(info, "half=${half}")
+
+        dut.en = 1
+        wait 1 cycle
+        log(info, "PASS: deadline=${deadline}, half=${half}")
+    end run
+end impl TimeLiteralTest
