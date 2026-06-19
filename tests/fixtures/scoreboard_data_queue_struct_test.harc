@@ -56,7 +56,7 @@ impl ScoreboardDataQueueStructTest for ScoreboardDataQueueStructTb
         // Each run records a `Sample{run_idx, count}` snapshot, pushed
         // before advancing and popped back / verified after.
         let total = 0
-        for i in 0 .. 3
+        for i in 0 .. 2                    // inclusive range → 3 runs (i = 0,1,2)
             let bump = i + 1               // 1, 2, 3 cycles of en
             total = total + bump
 
@@ -67,7 +67,7 @@ impl ScoreboardDataQueueStructTest for ScoreboardDataQueueStructTb
             sb.writes = sb.writes + 1
 
             dut.en = 1
-            for _ in 0 .. bump
+            for _ in 0 .. bump - 1         // inclusive range → `bump` cycles of en
                 wait 1 cycle
             end for
             dut.en = 0
