@@ -1078,7 +1078,119 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         ));
     }
     prog.constraint_sites = constraint_sites.into_inner();
+    reject_recursive_transactor_methods(&prog)?;
     Ok(prog)
+}
+
+/// Reject recursive transactor-method call cycles.
+///
+/// A sibling call (`m()` inside another method of the same DUT-poking
+/// transactor) lowers to a `Stmt::TransactorSelfCall` and emits as a
+/// *synchronous* `<Transactor>_<method>(args)` invocation inside the
+/// enclosing method's `std::function` lambda (see `codegen::tbir::func`,
+/// "v1 hookables run synchronously — their waits advance the clock
+/// directly instead of yielding to the scheduler"). A direct (`a -> a`)
+/// or mutual (`a -> b -> a`) cycle therefore has no base case: each call
+/// pushes a new C++ stack frame, so the program recurses one frame per
+/// simulated cycle until the stack overflows — a runtime segfault with
+/// no diagnostic.
+///
+/// The legacy v1 emitter declares method lambdas with `auto`, so a
+/// self-reference fails to compile at the C++ level (a name used in its
+/// own initializer has an incomplete type). The TB-IR emitter
+/// predeclares each method as a `std::function` slot before assigning
+/// the lambda (so forward sibling references compile) — which also lets
+/// a recursive cycle compile cleanly and then crash. Catch the cycle
+/// here, at lowering, mirroring the phase-call recursion guard in
+/// `expand_phase_calls`.
+fn reject_recursive_transactor_methods(prog: &TbProgram) -> Result<(), LowerError> {
+    for x in &prog.transactors {
+        let names: Vec<&str> = x.methods.iter().map(|m| m.name.as_str()).collect();
+        // Adjacency by method index: method -> sibling methods it calls.
+        // Unknown callees (already rejected upstream by
+        // `verify::check_transactor_self_call`) are skipped here.
+        let adj: Vec<Vec<usize>> = x
+            .methods
+            .iter()
+            .map(|m| {
+                sibling_callees(prog.function(m.function))
+                    .iter()
+                    .filter_map(|callee| names.iter().position(|&n| n == callee))
+                    .collect()
+            })
+            .collect();
+        // DFS with white/gray/black coloring; a gray back-edge is a cycle.
+        let mut color = vec![0u8; names.len()];
+        let mut path: Vec<usize> = Vec::new();
+        for start in 0..names.len() {
+            if color[start] != 0 {
+                continue;
+            }
+            if let Some(cycle) = find_method_cycle(start, &adj, &mut color, &mut path) {
+                let rendered = cycle
+                    .iter()
+                    .map(|&i| names[i])
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+                return Err(LowerError::Invalid(format!(
+                    "transactor `{}` has a recursive method-call cycle: {rendered}; \
+                     transactor methods lower to synchronous calls and cannot recurse \
+                     (it would overflow the C++ stack at runtime)",
+                    x.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Sibling-method names called from a transactor-method body. Every
+/// sibling call is hoisted to a top-level `Stmt::TransactorSelfCall`
+/// (see `hoist_transactor_edge`), so scanning block statements is
+/// sufficient — no nested-expression walk is needed.
+fn sibling_callees(func: &TbFunction) -> Vec<String> {
+    let mut out = Vec::new();
+    for b in &func.blocks {
+        for s in &b.stmts {
+            if let ir::Stmt::TransactorSelfCall { call, .. } = s {
+                if let ir::Expr::Call(ir::CallTarget::TransactorSelfMethod { method, .. }, _) = call
+                {
+                    out.push(method.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// DFS back-edge search. On a cycle, returns the node indices on the
+/// cycle with the closing node repeated at the end (e.g. `[a, b, a]`,
+/// or `[a, a]` for a direct self-call), so the caller can render the
+/// loop. Method counts per transactor are tiny, so recursion is fine.
+fn find_method_cycle(
+    node: usize,
+    adj: &[Vec<usize>],
+    color: &mut [u8],
+    path: &mut Vec<usize>,
+) -> Option<Vec<usize>> {
+    color[node] = 1; // gray (on the current DFS path)
+    path.push(node);
+    for &next in &adj[node] {
+        if color[next] == 1 {
+            let pos = path.iter().position(|&p| p == next).unwrap();
+            let mut cyc = path[pos..].to_vec();
+            cyc.push(next);
+            return Some(cyc);
+        }
+        if color[next] == 0 {
+            if let Some(c) = find_method_cycle(next, adj, color, path) {
+                return Some(c);
+            }
+        }
+    }
+    path.pop();
+    color[node] = 2; // black (fully explored)
+    None
 }
 
 /// MVP testbench-component validation: every field must be the DUT
