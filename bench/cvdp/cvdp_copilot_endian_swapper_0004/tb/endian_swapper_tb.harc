@@ -152,7 +152,7 @@ testbench EndianSwapperTb
         dut.stream_in_startofpacket = sop
         dut.stream_in_endofpacket = eop
         dut.stream_in_valid = 1
-        for _ in 0 .. ready_gap
+        for _ in 1 .. ready_gap
             dut.stream_out_ready = 0
             wait 1 cycle
         end for
@@ -211,13 +211,13 @@ impl EndianSwapperTest for EndianSwapperTb
         wait 4 cycles
         stream_idle()
 
-        for bit in 0 .. 64
+        for bit in 0 .. 63
             let data : uint<64> = ((1 as uint<64>) << bit).trunc<64>()
             send_word(data, (bit % 8) as uint<3>, bit == 0, bit == 63, (bit % 4) as uint<3>)
             send_word((0xFFFFFFFFFFFFFFFF ^ data).trunc<64>(), (7 - (bit % 8)) as uint<3>, bit == 63, bit == 0, (bit % 3) as uint<3>)
         end for
 
-        for _ in 0 .. 48
+        for _ in 0 .. 47
             let s : StreamStim
             randomize(s)
             let data : uint<64> = (((s.hi as uint<64>) << 32) | (s.lo as uint<64>))

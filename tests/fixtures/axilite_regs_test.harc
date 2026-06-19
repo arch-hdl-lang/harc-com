@@ -25,7 +25,7 @@ function axil_read(dut: AxiLiteRegs, addr: uint<8>) -> uint<32>
     // Walk a fixed-cycle budget; on the first observed r_valid, capture
     // the data and immediately deassert AR so the slave doesn't see a
     // sustained AR-valid and start a NEW transaction next cycle.
-    for _ in 0 .. 10
+    for _ in 0 .. 9
         wait 1 cycle
         if dut.axil_r_valid
             if saw == 0

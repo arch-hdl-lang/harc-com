@@ -17,8 +17,8 @@ impl MicrocodeSequencerTest for MicrocodeSequencerTb
         dut.oen = 0
         wait 4 cycles
 
-        for instr in 0 .. 32
-            for cc in 0 .. 2
+        for instr in 0 .. 31
+            for cc in 0 .. 1
                 dut.instr_in = instr
                 dut.cc = cc != 0
                 dut.ien = 0
@@ -33,7 +33,7 @@ impl MicrocodeSequencerTest for MicrocodeSequencerTb
 
         // Instruction-enable override case.
         dut.ien = 1
-        for instr in 0 .. 32
+        for instr in 0 .. 31
             dut.instr_in = instr
             dut.d_in = instr ^ 0xF
             wait 1 cycle

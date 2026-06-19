@@ -283,7 +283,7 @@ int run_WatchdogQuiesceTest(int argc, char** argv) {
                     break;
                 }
                 case 3: {
-                    if ((i < 20)) { __bb = 4; } else { __bb = 6; }
+                    if ((i <= 19)) { __bb = 4; } else { __bb = 6; }
                     break;
                 }
                 case 4: {

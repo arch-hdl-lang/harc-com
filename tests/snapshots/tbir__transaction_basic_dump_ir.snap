@@ -36,7 +36,7 @@ fn fn0 run_TransactionBasicTest [kind=Run, owner=tb0]
     -> Jump(b2)
 
   b2:
-    -> Branch((%i < 3), b3, b5)
+    -> Branch((%i <= 2), b3, b5)
 
   b3:
     RecordInit(%cmd, r0)
@@ -59,7 +59,7 @@ fn fn0 run_TransactionBasicTest [kind=Run, owner=tb0]
     -> WaitCycles(2, b14)
 
   b6:
-    Assign(%_anon, 0)
+    Assign(%_anon, 1)
     Assign(%__t0, %cmd.ticks)
     -> Jump(b9)
 
@@ -71,7 +71,7 @@ fn fn0 run_TransactionBasicTest [kind=Run, owner=tb0]
     -> Jump(b6)
 
   b9:
-    -> Branch((%_anon < %__t0), b10, b12)
+    -> Branch((%_anon <= %__t0), b10, b12)
 
   b10:
     -> WaitCycles(1, b13)

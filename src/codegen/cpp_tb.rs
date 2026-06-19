@@ -6400,7 +6400,10 @@ impl Emitter {
                 {
                     write!(self.out, "for (int64_t {var} = ").ok();
                     self.emit_expr(lo);
-                    write!(self.out, "; {var} < ").ok();
+                    // `for i in lo .. hi` is INCLUSIVE of `hi` (matches ARCH);
+                    // emit `<=`, not `<`. Keep in lockstep with the tbir
+                    // lowering in `ir::lower::control::lower_for`.
+                    write!(self.out, "; {var} <= ").ok();
                     self.emit_expr(hi);
                     writeln!(self.out, "; {var}++) {{").ok();
                     self.emit_target_tlm_body(&f.body, rsp_var, returned_var, depth + 1);
@@ -14687,9 +14690,12 @@ impl Emitter {
                 } = &*f.iter.kind
                 {
                     // `for i in lo .. hi` — emit as an indexed C++ for loop.
+                    // The range is INCLUSIVE of `hi` (matches ARCH), so the
+                    // bound is `<=`, not `<`. Keep in lockstep with the tbir
+                    // lowering in `ir::lower::control::lower_for`.
                     write!(self.out, "for (int64_t {var} = ").ok();
                     self.emit_expr(lo);
-                    write!(self.out, "; {var} < ").ok();
+                    write!(self.out, "; {var} <= ").ok();
                     self.emit_expr(hi);
                     writeln!(self.out, "; {var}++) {{").ok();
                     self.emit_block(&f.body, depth + 1);

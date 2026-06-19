@@ -135,7 +135,7 @@ transactor ApbResponderXactor
         end expect_reset_outputs
 
         hookable wait_for_setup(limit: uint<8>) -> uint<1>
-            for _ in 0 .. limit
+            for _ in 1 .. limit
                 if dut.apb_psel_o == 1 and dut.apb_penable_o == 0
                     return 0
                 end if
@@ -146,7 +146,7 @@ transactor ApbResponderXactor
         end wait_for_setup
 
         hookable wait_for_idle(limit: uint<8>) -> uint<1>
-            for _ in 0 .. limit
+            for _ in 1 .. limit
                 if dut.apb_psel_o == 0 and dut.apb_penable_o == 0
                     return 0
                 end if
@@ -179,7 +179,7 @@ transactor ApbResponderXactor
         hookable complete_current(ready_delay: uint<5>) -> uint<1>
             dut.apb_pready_i = 0
             wait 1 cycle
-            for _ in 0 .. ready_delay
+            for _ in 1 .. ready_delay
                 dut.apb_pready_i = 0
                 wait 1 cycle
                 if dut.apb_penable_o == 1 and dut.apb_psel_o == 1
@@ -293,7 +293,7 @@ impl EventsToApbTest for EventsToApbTb
         // Randomized payloads for event A. Use one event at a time so the
         // data/addr checker remains simple while the solver still varies
         // 32-bit APB payloads.
-        for _ in 0 .. 12
+        for _ in 0 .. 11
             let s : ApbEventStim
             randomize(s)
             let addr : uint<32> = make_addr(s.tag, s.index)

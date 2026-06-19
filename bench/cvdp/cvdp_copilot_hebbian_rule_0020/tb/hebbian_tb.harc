@@ -39,11 +39,11 @@ impl HebbianTest for HebbianTb
         wait 3 cycles
         dut.rst = 1
 
-        for st in 0 .. 11
+        for st in 0 .. 10
             dut.present_state_force = st
-            for iter in 0 .. 5
+            for iter in 0 .. 4
                 dut.iteration_force = iter
-                for gate in 0 .. 4
+                for gate in 0 .. 3
                     dut.gate_select = gate
                     dut.target_select = iter & 3
                     dut.start = (iter & 1) != 0
@@ -69,7 +69,7 @@ impl HebbianTest for HebbianTb
         wait 2 cycles
         dut.rst = 1
         dut.start = 1
-        for _ in 0 .. 24
+        for _ in 0 .. 23
             wait 1 cycle
         end for
         dut.start = 0

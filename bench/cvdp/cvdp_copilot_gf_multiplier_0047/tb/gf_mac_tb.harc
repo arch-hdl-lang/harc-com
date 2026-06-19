@@ -30,7 +30,7 @@ impl GfMacTest for GfMacTb
         // Pass-through path.
         dut.enable = 1
         dut.pass_through = 1
-        for k in 0 .. 8
+        for k in 0 .. 7
             dut.a = (1 << (k * 4))
             dut.b = 0xA5A5A5A5
             wait 1 cycle
@@ -48,7 +48,7 @@ impl GfMacTest for GfMacTb
         dut.b = 0x10204080
         wait 1 cycle
 
-        for k in 0 .. 32
+        for k in 0 .. 31
             dut.a = ((k * 0x1020305) ^ 0xA5A5A5A5)
             dut.b = ((k * 0x01010111) ^ 0x5A5A5A5A)
             wait 1 cycle

@@ -14,7 +14,7 @@ end transaction DiffStim
 function hamming3(a: uint<3>, b: uint<3>) -> uint<2>
     let x : uint<3> = a ^ b
     let c : uint<2> = 0
-    for bit in 0 .. 3
+    for bit in 0 .. 2
         if (((x >> bit) & 1) == 1)
             c = c + 1
         end if
@@ -77,15 +77,15 @@ impl BitDifferenceCounterTest for BitDifferenceCounterTb
         let errors : uint<32> = 0
 
         // Exhaustive input-space sweep: 64 combinations, all distances 0..3.
-        for a in 0 .. 8
-            for b in 0 .. 8
+        for a in 0 .. 7
+            for b in 0 .. 7
                 errors = errors + apply_and_check(a, b)
             end for
         end for
 
         // Solver-backed variation. `diff` is XORed into `a`, so nonzero
         // masks naturally force one-, two-, and three-bit differences.
-        for _ in 0 .. 20
+        for _ in 0 .. 19
             let s : DiffStim
             randomize(s) with
                 s.diff != 0

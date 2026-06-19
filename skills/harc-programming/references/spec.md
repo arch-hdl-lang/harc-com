@@ -211,12 +211,12 @@ New language features must preserve this property. The check is mechanical: for 
 ```
 let _ = consume(1)
 
-for _ in 0 .. 10
-    wait 1 cycle             // common idiom: just spin N cycles
+for _ in 1 .. 10
+    wait 1 cycle             // common idiom: just spin N cycles (here, 10)
 end for
 ```
 
-A bare `wait N cycles` (§7.4) is the cleaner form when the loop body is *only* the wait. Use a real loop variable name (`for i in 0..N`) when the body actually consumes the index; use `_` when the body does not. Borrowed from Rust and Python.
+A bare `wait N cycles` (§7.4) is the cleaner form when the loop body is *only* the wait. Use a real loop variable name (`for i in 0 .. N`) when the body actually consumes the index; use `_` when the body does not. **The range is inclusive of both endpoints** — `for i in 0 .. N` runs `i = 0, 1, …, N` (that is `N + 1` iterations), matching ARCH's `..` so the two co-authored languages agree. This differs from Rust/Python's half-open `range`. To spin exactly `N` times with an unused index, write `for _ in 1 .. N` (or prefer `wait N cycles`); to walk the `N` zero-based indices of an `N`-element structure, write `for i in 0 .. N - 1`.
 
 **Ternary `cond ? then : else`.** A C/SystemVerilog-style conditional expression. Right-associative; precedence is just above implication (`|->`, `|=>`) and below every other operator, so `a + b ? x : y` parses as `(a + b) ? x : y` and `a ? b : c ? d : e` parses as `a ? b : (c ? d : e)`. There is no `if`-as-expression in HARC; for value selection inside an expression context, use ternary.
 
@@ -831,7 +831,7 @@ end transaction AxiTxn
 
 // Normal regression: uses the intrinsic distribution
 tseq Regression(n: int) -> TSeq<AxiTxn>
-    for _ in 0 .. n
+    for _ in 1 .. n
         let t: AxiTxn
         randomize(t)                                // 90% size=6, 10% spread across 0..5
         yield t
@@ -840,7 +840,7 @@ end tseq Regression
 
 // Targeted: hit unaligned cases harder
 tseq UnalignedStress(n: int) -> TSeq<AxiTxn>
-    for _ in 0 .. n
+    for _ in 1 .. n
         let t: AxiTxn
         randomize(t) with
             t.size dist { [0..2] :/ 100 }            // override: small sizes only
@@ -878,7 +878,7 @@ Z3 by default; Bitwuzla available for pure-bitvector workloads (per April-13). S
 
 ```
 tseq RandomWrites(n: int) -> TSeq<AxiWrite>
-    for _ in 0 .. n
+    for _ in 1 .. n
         let t: AxiWrite
         randomize(t) with AxiBurstLegal(t)   // queued; solver runs off-cycle
         yield t                              // implicit await on the result
@@ -1213,7 +1213,7 @@ Compiles to one coroutine per branch with explicit suspend points at each cycle 
 
 **Loops.** Four loop forms cover the common cases:
 
-- `for i in lo .. hi ... end for` — bounded count; `i` available in the body, or `_` when unused.
+- `for i in lo .. hi ... end for` — bounded count, **inclusive of both `lo` and `hi`** (`i = lo, lo+1, …, hi`, i.e. `hi - lo + 1` iterations), matching ARCH's `..`; `i` available in the body, or `_` when unused. (To repeat exactly `N` times, `for _ in 1 .. N` or `repeat N`; to index an `N`-element structure, `for i in 0 .. N - 1`.)
 - `repeat <expr> ... end repeat` — fixed iteration count; no induction variable.
 - `while <cond> ... end while` — pre-tested loop; the body re-checks `cond` on each iteration.
 - `loop ... end loop` — infinite; exit via `break` (typically inside an `if`).
@@ -1755,7 +1755,7 @@ transactor MemTarget bound to BurstMem
         let req_seq : uint<32> = read_count
         read_count = read_count + 1
         prep_acc = 0
-        for i in 0 .. len
+        for i in 0 .. len - 1
             prep_acc = prep_acc + addr + i
             if prep_acc > 1024
                 return prep_acc
@@ -1847,7 +1847,7 @@ transactor AxiXactor#(P: AxiParams) bound to AxiBus#(P)
 
         on req(t)
             bus.aw.send(t.addr, t.len, t.burst, t.id)
-            for beat in 0 .. t.len
+            for beat in 0 .. t.len - 1
                 bus.w.send(t.data[beat], t.strb[beat], beat == t.len - 1)
             end for
         end on
@@ -1996,7 +1996,7 @@ If you find yourself writing the same three lines (`let seq : ...; let xact : ..
 
 ```
 tseq RandomWrites(n: int) -> TSeq<AxiWrite>
-    for _ in 0 .. n
+    for _ in 1 .. n
         let t: AxiWrite
         randomize(t) with AxiBurstLegal(t)
         yield t
@@ -2527,7 +2527,7 @@ end transaction AxiTxn
 
 // --- Test sequence (every field random by default; constraint inherited from AxiTxn)
 tseq RandomTxns(n: int) -> TSeq<AxiTxn>
-    for _ in 0 .. n
+    for _ in 1 .. n
         let t: AxiTxn
         randomize(t)                    // queued; off-cycle solver
         yield t

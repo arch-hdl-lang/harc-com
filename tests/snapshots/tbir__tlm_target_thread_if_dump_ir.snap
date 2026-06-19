@@ -29,7 +29,7 @@ fn fn0 TlmMemTarget_target_read [kind=TransactorBody(x0)]
     -> Jump(b1)
 
   b1:
-    -> Branch((%i < 4), b2, b4)
+    -> Branch((%i <= 3), b2, b4)
 
   b2:
     TransactorStateWrite(target.prep_acc, ((target.prep_acc + %addr) + %i))

@@ -17,13 +17,13 @@ function swizzle_model(d: uint<64>, sel: uint<2>) -> uint<64>
     let result : uint<64> = 0
     if sel == 0
         // Reverse all 64 bits
-        for i in 0 .. 64
+        for i in 0 .. 63
             let src = (d >> (63 - i)) & 1
             result = result | (src << i)
         end for
     elsif sel == 1
         // Two halves of 32 bits each, reverse within each
-        for i in 0 .. 32
+        for i in 0 .. 31
             let lo_src = (d >> (31 - i)) & 1
             let hi_src = (d >> (63 - i)) & 1
             result = result | (lo_src << i)
@@ -31,7 +31,7 @@ function swizzle_model(d: uint<64>, sel: uint<2>) -> uint<64>
         end for
     elsif sel == 2
         // Four chunks of 16 bits each
-        for i in 0 .. 16
+        for i in 0 .. 15
             let q0 = (d >> (15 - i)) & 1
             let q1 = (d >> (31 - i)) & 1
             let q2 = (d >> (47 - i)) & 1
@@ -43,7 +43,7 @@ function swizzle_model(d: uint<64>, sel: uint<2>) -> uint<64>
         end for
     else
         // sel == 3: eight chunks of 8 bits each
-        for i in 0 .. 8
+        for i in 0 .. 7
             let e0 = (d >> (7  - i)) & 1
             let e1 = (d >> (15 - i)) & 1
             let e2 = (d >> (23 - i)) & 1
@@ -82,7 +82,7 @@ impl NbitSwizzlingTest for NbitSwizzlingTb
 
         // For each sel value, drive a battery of patterns that toggles
         // every input bit through both edges.
-        for s in 0 .. 4
+        for s in 0 .. 3
             dut.sel = s as uint<2>
 
             // Pattern 1: all zeros (every bit starts low)
@@ -91,7 +91,7 @@ impl NbitSwizzlingTest for NbitSwizzlingTb
             let r = check_one(0 as uint<64>, s as uint<2>, dut.data_out)
 
             // Pattern 2: walking-1 across all 64 bits
-            for k in 0 .. 64
+            for k in 0 .. 63
                 let pat : uint<64> = (1 as uint<64>) << k
                 dut.data_in = pat
                 wait 1 cycle

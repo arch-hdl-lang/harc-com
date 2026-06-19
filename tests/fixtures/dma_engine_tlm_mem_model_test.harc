@@ -32,7 +32,7 @@ transactor DmaMemModelTarget bound to DmaMemTlmBus
         prep_acc = 0
 
         let latency : uint<32> = (addr & 1) + 1
-        for i in 0 .. latency
+        for i in 0 .. latency - 1
             prep_acc = prep_acc + i
         end for
 

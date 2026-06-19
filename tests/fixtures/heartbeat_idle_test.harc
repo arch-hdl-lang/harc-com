@@ -63,7 +63,7 @@ impl HeartbeatIdleTest for HeartbeatIdleTb
         wait 1 cycle
 
         // Emit 3 transactions spaced 3 cycles apart.
-        for i in 0 .. 3
+        for i in 0 .. 2
             let t : TinyTxn
             t.tag = i
             emit prod.in_ev(t)

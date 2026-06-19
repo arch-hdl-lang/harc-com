@@ -112,7 +112,7 @@ impl BranchPredictTest for BranchPredictTb
             else fail("C.B funct3=111: taken=${dut.predict_branch_taken_o}, expected 1")
 
         // ── Drive PC + register_addr through many bit positions ──
-        for k in 0 .. 32
+        for k in 0 .. 31
             dut.fetch_rdata_i = 0x000000EF as uint<32>  // JAL
             dut.fetch_pc_i = (1 as uint<32>) << k
             dut.register_addr_i = (1 as uint<32>) << ((k + 7) % 32)
@@ -122,20 +122,20 @@ impl BranchPredictTest for BranchPredictTb
         // Drive fetch_rdata_i through varied bit positions
         // (uses each immediate field) — without asserting; mainly to
         // toggle each bit of imm_{jal,jalr,b,cj,cb}_type and branch_imm.
-        for k in 0 .. 32
+        for k in 0 .. 31
             let r : uint<32> = ((1 as uint<32>) << k) | (0x000000EF as uint<32>)
             dut.fetch_rdata_i = r
             wait 1 cycle
         end for
 
         // C.J / C.B with varied middle bits
-        for k in 0 .. 16
+        for k in 0 .. 15
             let r : uint<32> = (((k as uint<32>) << 2) | 0x0000A001 as uint<32>).trunc<32>()
             dut.fetch_rdata_i = r
             wait 1 cycle
         end for
 
-        for k in 0 .. 16
+        for k in 0 .. 15
             let r : uint<32> = (((k as uint<32>) << 2) | 0x0000C001 as uint<32>).trunc<32>()
             dut.fetch_rdata_i = r
             wait 1 cycle

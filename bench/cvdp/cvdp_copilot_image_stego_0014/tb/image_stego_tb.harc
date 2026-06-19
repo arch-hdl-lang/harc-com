@@ -23,7 +23,7 @@ end testbench ImageStegoTb
 // Software model
 function parity32(d: uint<16>) -> uint<1>
     let p : uint<1> = 0
-    for k in 0 .. 16
+    for k in 0 .. 15
         p = p ^ ((d >> k) & 1).trunc<1>()
     end for
     return p
@@ -32,7 +32,7 @@ end function parity32
 function model_img(img: uint<32>, dat: uint<16>, bp: uint<3>, key: uint<8>, msk: uint<4>) -> uint<32>
     let enc : uint<16> = dat ^ ((key as uint<16>) | ((key as uint<16>) << 8))
     let out : uint<32> = img
-    for i in 0 .. 4
+    for i in 0 .. 3
         let mbit = ((msk >> i) & 1).trunc<1>()
         if mbit == 1
             let pix : uint<8> = ((img >> (i * 8)) & 0xFF).trunc<8>()
@@ -62,7 +62,7 @@ end function model_img
 
 function popcount4(m: uint<4>) -> uint<3>
     let c : uint<3> = 0
-    for k in 0 .. 4
+    for k in 0 .. 3
         c = c + ((m >> k) & 1).trunc<3>()
     end for
     return c
@@ -90,7 +90,7 @@ impl ImageStegoTest for ImageStegoTb
             else fail("mask=0 parity: error_out=${dut.error_out}, expected ${par_exp}")
 
         // ── Case 2: bpp ∈ {0,1,2,3} with full mask=0xF ──────────
-        for bp in 0 .. 4
+        for bp in 0 .. 3
             dut.img_in = 0xA5B4C3D2
             dut.data_in = 0x789A
             dut.bpp = bp as uint<3>
@@ -109,7 +109,7 @@ impl ImageStegoTest for ImageStegoTb
 
         // ── Case 3: bpp ∈ {4,5,6,7} → default branch, count stays 0,
         //            embedding_done=11 because mask!=0 and no embed.
-        for bp in 4 .. 8
+        for bp in 4 .. 7
             dut.img_in = 0x11223344
             dut.data_in = 0x0F0F
             dut.bpp = bp as uint<3>
@@ -125,7 +125,7 @@ impl ImageStegoTest for ImageStegoTb
         end for
 
         // ── Case 4: partial masks (every 4-bit mask combination) ─
-        for m in 1 .. 16
+        for m in 1 .. 15
             dut.img_in = 0x01234567
             dut.data_in = 0xCAFE
             dut.bpp = 1
@@ -159,7 +159,7 @@ impl ImageStegoTest for ImageStegoTb
             else fail("even-parity: error_out=${dut.error_out}, expected 0")
 
         // ── Case 6: varied (img, data, key) randomisation ───────
-        for k in 0 .. 16
+        for k in 0 .. 15
             let im : uint<32> = (((k * 2654435761) ^ 0x13579BDF) & 0xFFFFFFFF).trunc<32>()
             let da : uint<16> = ((k * 0x9E37) & 0xFFFF).trunc<16>()
             let key : uint<8> = ((k * 31 + 7) & 0xFF).trunc<8>()

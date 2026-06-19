@@ -18,14 +18,14 @@ impl ThermostatTest for ThermostatTb
         wait 1 cycle
 
         dut.i_enable = 1
-        for t in 0 .. 64
+        for t in 0 .. 63
             dut.i_temp_feedback = t
             dut.i_fan_on = (t & 1) != 0
             wait 1 cycle
         end for
 
         // Priority paths: full cold/hot, medium, low, ambient.
-        for t in 0 .. 8
+        for t in 0 .. 7
             if t == 0
                 dut.i_temp_feedback = 0x20
             elsif t == 1

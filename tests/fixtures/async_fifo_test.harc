@@ -30,7 +30,7 @@ impl AsyncFifoTest for AsyncFifoTb
 
         // ── Push 8 items on wr_clk (fast side) ────────────────────────
         log(info, "pushing 8 items on wr_clk")
-        for i in 0 .. 8
+        for i in 0 .. 7
             dut.push_valid = 1
             dut.push_data = i + 1
             wait 5ns
@@ -48,7 +48,7 @@ impl AsyncFifoTest for AsyncFifoTb
         // causes us to read item 1 instead of item 0 (the FIFO has
         // already advanced).
         log(info, "popping 8 items on rd_clk")
-        for i in 0 .. 8
+        for i in 0 .. 7
             assert dut.pop_valid else fail("pop_valid low on item ${i}")
             let got = dut.pop_data
             let want = i + 1

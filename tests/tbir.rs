@@ -3510,7 +3510,7 @@ transactor Xt
 
     when active
         hookable pulse(n: uint<32>)
-            for _ in 0 .. n
+            for _ in 1 .. n
                 dut.en = 1
                 wait 1 cycle
                 dut.en = 0
@@ -3862,7 +3862,7 @@ transactor Drv
     when active
         hookable run_for(cmd: RunCmd)
             dut.en = 1
-            for _ in 0 .. cmd.ticks
+            for _ in 1 .. cmd.ticks
                 wait 1 cycle
             end for
             dut.en = 0

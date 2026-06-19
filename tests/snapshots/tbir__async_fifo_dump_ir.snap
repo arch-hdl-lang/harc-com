@@ -32,7 +32,7 @@ fn fn0 run_AsyncFifoTest [kind=Run, owner=tb0]
     -> Jump(b3)
 
   b3:
-    -> Branch((%i < 8), b4, b6)
+    -> Branch((%i <= 7), b4, b6)
 
   b4:
     DutWrite(dut.push_valid, 1)
@@ -57,7 +57,7 @@ fn fn0 run_AsyncFifoTest [kind=Run, owner=tb0]
     -> Jump(b9)
 
   b9:
-    -> Branch((%i_2 < 8), b10, b12)
+    -> Branch((%i_2 <= 7), b10, b12)
 
   b10:
     AssertCheck { cond: dut.pop_valid, on_fail: "pop_valid low on item %lld", %i_2 }

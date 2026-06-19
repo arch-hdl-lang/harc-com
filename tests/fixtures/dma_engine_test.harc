@@ -135,7 +135,7 @@ impl DmaEngineTest for DmaEngineTb
         // ── Run transfer ─────────────────────────────────────────
         // Watch for IRQ; bail out as soon as it fires.
         let irq_seen = 0
-        for _ in 0 .. 50
+        for _ in 0 .. 49
             wait 1 cycle
             if dut.irq
                 irq_seen = 1
@@ -153,7 +153,7 @@ impl DmaEngineTest for DmaEngineTb
         assert mon.sb_ref.write_data.size() == 4
             else fail("expected 4 write-data observations")
 
-        for i in 0 .. 4
+        for i in 0 .. 3
             let exp_rd_addr = 4096 + i        // SRC + i
             let exp_wr_addr = 8192 + i        // DST + i
             let exp_wr_data = 4096 + i        // echoed from earlier read

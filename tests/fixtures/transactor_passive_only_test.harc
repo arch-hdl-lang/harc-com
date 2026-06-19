@@ -106,7 +106,7 @@ impl TransactorPassiveOnlyTest for TransactorPassiveOnlyTb
         // the active half would have generated — the passive
         // observer's handshake handlers fire on every bus.<ch>
         // valid+ready event, regardless of who drove the bus.
-        for i in 0 .. 3
+        for i in 0 .. 2
             axil.aw.addr = 24
             axil.aw.valid = 1
             axil.w.send(1000 + i, 15)

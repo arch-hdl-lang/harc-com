@@ -50,7 +50,7 @@ impl KeepConstraintsTest for KeepConstraintsTb
         // the full keep set. Before the §4 fix, len would typically
         // exceed 16 and addr would not be 4-aligned and color could
         // be RED — any one of those would fail.
-        for i in 0 .. 30
+        for i in 0 .. 29
             let t : Req
             randomize(t)
 

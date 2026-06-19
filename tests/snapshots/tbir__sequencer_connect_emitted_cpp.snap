@@ -161,16 +161,18 @@ int run_SequencerConnectTest(int argc, char** argv) {
     harc_rt::ThreadScheduler sched;
     auto CountSeq_dispatch = [&](CountSeq& self, uint64_t n) -> void {
         uint64_t i = 0; (void)i;
+        uint64_t __t0 = 0; (void)__t0;
         int __bb = 0;
         while (true) {
             switch (__bb) {
             case 0: {
                 i = 0;
+                __t0 = (n - 1);
                 __bb = 1;
                 break;
             }
             case 1: {
-                if ((i < n)) { __bb = 2; } else { __bb = 4; }
+                if ((i <= __t0)) { __bb = 2; } else { __bb = 4; }
                 break;
             }
             case 2: {

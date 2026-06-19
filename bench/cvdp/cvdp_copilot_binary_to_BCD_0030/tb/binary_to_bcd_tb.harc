@@ -29,7 +29,7 @@ impl BinaryToBcdTest for BinaryToBcdTestTb
         wait 1 cycle
 
         let errors : uint<32> = 0
-        for n in 0 .. 256
+        for n in 0 .. 255
             dut.binary_in = n
             wait 1 cycle
             let expected = bcd_ref(n)

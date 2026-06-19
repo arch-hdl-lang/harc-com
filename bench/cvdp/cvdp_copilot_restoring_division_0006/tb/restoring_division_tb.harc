@@ -32,10 +32,10 @@ impl RestoringDivisionTest for RestoringDivisionTb
         wait 3 cycles
         dut.rst = 1
 
-        for d in 0 .. 16
+        for d in 0 .. 15
             run_div6((d * 3) & 0x3F, ((d & 7) + 1))
         end for
-        for c in 0 .. 8
+        for c in 0 .. 7
             dut.present_state_force = 1
             dut.next_count_force = c
             dut.count_force = c

@@ -50,7 +50,7 @@ sequencer PulseSeq
     dispatched : out event<uint<8>>
 
     hookable dispatch(n: uint<8>)
-        for i in 0 .. n
+        for i in 0 .. n - 1
             emit dispatched(i)
         end for
     end dispatch

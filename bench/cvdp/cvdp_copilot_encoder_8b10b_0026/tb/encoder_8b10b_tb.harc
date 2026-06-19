@@ -129,10 +129,10 @@ impl Encoder8b10bTest for Encoder8b10bTb
         drive_symbol(0xFF, true, false)
 
         // Exhaustive data symbols under both running-disparity inputs.
-        for v in 0 .. 256
+        for v in 0 .. 255
             drive_symbol(v.trunc<8>(), false, false)
         end for
-        for v in 0 .. 256
+        for v in 0 .. 255
             drive_symbol(v.trunc<8>(), false, true)
         end for
 
@@ -144,12 +144,12 @@ impl Encoder8b10bTest for Encoder8b10bTb
 
         // Solver-randomized symbols. Both unconstrained traffic and relation-
         // constrained control symbols exercise current randomize/relation paths.
-        for _ in 0 .. 48
+        for _ in 0 .. 47
             let s : EncStim
             randomize(s)
             drive_symbol(s.symbol, s.control, s.rd)
         end for
-        for _ in 0 .. 16
+        for _ in 0 .. 15
             let k : EncStim
             randomize(k) with IsControlSymbol(k) end randomize
             drive_symbol(k.symbol, true, false)

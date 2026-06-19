@@ -115,7 +115,7 @@ testbench DdmCacheTb
         dut.mem_dout = mem_data
         dut.cpu_strobe = 1
 
-        for _ in 0 .. ready_delay
+        for _ in 1 .. ready_delay
             dut.mem_ready = 0
             wait 1 cycle
             if dut.cpu_ready != 0
@@ -176,7 +176,7 @@ testbench DdmCacheTb
         dut.mem_dout = 0
         dut.cpu_strobe = 1
 
-        for _ in 0 .. ready_delay
+        for _ in 1 .. ready_delay
             dut.mem_ready = 0
             wait 1 cycle
             if dut.cpu_ready != 0
@@ -249,7 +249,7 @@ impl DdmCacheTest for DdmCacheTb
 
         // Solver-backed variation across tags, indexes, data, read/write, and
         // cached/uncached controls.
-        for _ in 0 .. 24
+        for _ in 0 .. 23
             let s : CacheStim
             randomize(s)
             let addr : uint<32> = make_addr(s.tag, s.index)

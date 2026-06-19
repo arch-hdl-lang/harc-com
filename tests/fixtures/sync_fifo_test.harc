@@ -37,7 +37,7 @@ impl SyncFifoTest for SyncFifoTb
         dut.rst = 0
 
         // Push 16 items (fill to capacity).
-        for i in 0 .. 16
+        for i in 0 .. 15
             dut.push_valid = 1
             dut.push_data = i + 1
             dut.pop_ready = 0
@@ -55,7 +55,7 @@ impl SyncFifoTest for SyncFifoTb
         log(info, "PASS: FIFO full after 16 pushes")
 
         // Pop all 16 items and verify FIFO order.
-        for i in 0 .. 16
+        for i in 0 .. 15
             dut.pop_ready = 1
             assert dut.pop_valid == 1
                 else fail("pop_valid unexpectedly low at pop ${i}")

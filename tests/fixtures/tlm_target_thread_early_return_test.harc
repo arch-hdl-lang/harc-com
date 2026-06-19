@@ -16,7 +16,8 @@ transactor TlmMemTarget bound to TlmMemBus
         let req_seq : uint<32> = read_count
         read_count = read_count + 1
         prep_acc = 0
-        for i in 0 .. len
+        // len >= 1 for this test (DUT issues looping reads); inclusive range needs len-1
+        for i in 0 .. len - 1
             prep_acc = prep_acc + addr + i
             if addr < 8
                 if i == 2

@@ -65,7 +65,7 @@ testbench SyncSerialTb
         wait 3 cycles on clk
     end function reset_serial
     function wait_done(limit: uint<8>) -> uint<1>
-        for _ in 0 .. limit
+        for _ in 1 .. limit
             if dut.done == 1
                 return 0
             end if
@@ -151,7 +151,7 @@ impl SyncSerialTest for SyncSerialTb
 
         errors = errors + reset_mid_transfer()
 
-        for _ in 0 .. 8
+        for _ in 0 .. 7
             let s : SerialStim
             randomize(s)
             reset_serial()

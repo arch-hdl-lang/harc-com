@@ -37,7 +37,7 @@ impl HillCipherTest for HillCipherTb
         run_block(0x1234, 0x010842108421)
         run_block(0x6B5A, 0x07C1F07C1F0)
 
-        for k in 0 .. 16
+        for k in 0 .. 15
             let text : uint<15> = ((k * 997) & 0x7FFF)
             let key : uint<45> = ((k * 0x111111111) & 0x1FFFFFFFFFFF)
             run_block(text, key)

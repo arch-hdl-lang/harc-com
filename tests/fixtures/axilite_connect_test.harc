@@ -71,7 +71,7 @@ transactor AxilXactor
             let saw = 0
             dut.axil_ar_addr = t.addr
             dut.axil_ar_valid = 1
-            for _ in 0 .. 10
+            for _ in 0 .. 9
                 wait 1 cycle
                 if dut.axil_r_valid
                     if saw == 0
@@ -104,7 +104,7 @@ env AxilEnv
 end env AxilEnv
 
 tseq RandomTxns(n: int) -> TSeq<RegOp>
-    for _ in 0 .. n
+    for _ in 1 .. n
         let t : RegOp
         randomize(t)
         t.addr = 24

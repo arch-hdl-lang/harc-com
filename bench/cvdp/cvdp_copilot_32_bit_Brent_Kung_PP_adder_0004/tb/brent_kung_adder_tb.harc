@@ -23,7 +23,7 @@ impl BrentKungAdderTest for BrentKungAdderTb
         log(info, "brent_kung_adder: directed corners + random sweep")
 
         // ── Walking-1 patterns (a=b=walk-1, cin=0; then a=walk1, b=~walk1, cin=1) ─
-        for k in 0 .. 32
+        for k in 0 .. 31
             let pat : uint<32> = (1 as uint<32>) << k
             dut.a = pat
             dut.b = pat
@@ -111,7 +111,7 @@ impl BrentKungAdderTest for BrentKungAdderTb
             else fail("AA+55+1: sum=0x${dut.sum:08x}")
 
         // ── Random sweep ────────────────────────────────────────
-        for i in 0 .. 150
+        for i in 0 .. 149
             let t : AddPair
             randomize(t)
             dut.a = t.a

@@ -272,7 +272,7 @@ int run_EnvQuiescedPhaseTest(int argc, char** argv) {
                     break;
                 }
                 case 3: {
-                    if ((i < 3)) { __bb = 4; } else { __bb = 6; }
+                    if ((i <= 2)) { __bb = 4; } else { __bb = 6; }
                     break;
                 }
                 case 4: {

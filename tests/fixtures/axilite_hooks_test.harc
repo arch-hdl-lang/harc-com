@@ -39,7 +39,7 @@ transactor HookXactor
             let saw = 0
             dut.axil_ar_addr = t.addr
             dut.axil_ar_valid = 1
-            for _ in 0 .. 10
+            for _ in 0 .. 9
                 wait 1 cycle
                 if dut.axil_r_valid
                     if saw == 0
@@ -115,7 +115,7 @@ impl AxiLiteHooksTest for AxiLiteHooksTb
         // then the post-hook. Counters should land at 4/4 with
         // post_value_sum equal to the sum of all sent payloads.
         let total = 0
-        for i in 0 .. 4
+        for i in 0 .. 3
             let t : RegOp
             t.addr = 24
             t.value = (i + 1) * 1000000

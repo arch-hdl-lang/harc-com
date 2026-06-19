@@ -103,7 +103,7 @@ impl MshrCocotbTest for MshrCocotbTb
         dut.allocate_valid = 1
         let cycles = 0
         // Bound: 2 * MSHR_SIZE is plenty.
-        for _ in 0 .. 64
+        for _ in 0 .. 63
             if dut.allocate_ready == 1
                 wait 1 cycle
                 cycles = cycles + 1
@@ -124,7 +124,7 @@ impl MshrCocotbTest for MshrCocotbTb
         dut.allocate_valid = 1
         dut.allocate_addr = 66           // 0x42
         dut.finalize_valid = 0
-        for i in 0 .. MSHR_SIZE
+        for i in 0 .. MSHR_SIZE - 1
             dut.allocate_rw = i & 1
             dut.allocate_data = i * 17
             wait 1 cycle

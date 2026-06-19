@@ -150,14 +150,14 @@ impl LinklistBasicTest for LinklistBasicTb
 
         // ── Test 5: fill to DEPTH=8 ───────────────────────────────
         reset_dut(dut)
-        for i in 0 .. 8
+        for i in 0 .. 7
             insert_tail_one(dut, 256 + i)        // 0x100 + i
         end for
         assert dut.full == 1 else fail("full after 8 inserts")
         assert dut.length == 8 else fail("length=${dut.length}, expected 8")
         assert dut.insert_tail_req_ready == 0
             else fail("insert_tail_req_ready should be 0 when full")
-        for i in 0 .. 8
+        for i in 0 .. 7
             let want = 256 + i
             let got = delete_head_one(dut)
             assert got == want

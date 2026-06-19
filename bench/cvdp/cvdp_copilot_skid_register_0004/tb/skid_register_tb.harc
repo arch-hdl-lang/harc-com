@@ -112,7 +112,7 @@ impl SkidRegisterTest for SkidRegisterTb
         drive_skid(0xAAAAAAAA, true, true)
         drive_skid(0x55555555, true, true)
 
-        for bit in 0 .. 32
+        for bit in 0 .. 31
             let one : uint<32> = (1 as uint<32>) << bit
             drive_skid(one, true, true)
             drive_skid((0xFFFFFFFF ^ one).trunc<32>(), true, true)
@@ -120,7 +120,7 @@ impl SkidRegisterTest for SkidRegisterTb
 
         // Full downstream backpressure while upstream keeps asserting valid.
         dut.dn_rdy = 0
-        for i in 0 .. 24
+        for i in 0 .. 23
             dut.up_val = 1
             dut.up_bus = (0x1000 + i).trunc<32>()
             wait 1 cycle
@@ -147,14 +147,14 @@ impl SkidRegisterTest for SkidRegisterTb
         wait 2 cycles
 
         // Stall/restart pulses and invalid bubbles.
-        for i in 0 .. 16
+        for i in 0 .. 15
             drive_skid((0x2000 + i).trunc<32>(), true, (i & 1) == 0)
             drive_skid((0x3000 + i).trunc<32>(), false, (i & 2) == 0)
         end for
 
         // Solver-backed traffic. This exercises unique recycling and natural
         // auto-coverage endpoints for a 32-bit data field.
-        for _ in 0 .. 72
+        for _ in 0 .. 71
             let s : SkidStim
             randomize(s)
             drive_skid(s.data, s.up_valid, s.dn_ready)

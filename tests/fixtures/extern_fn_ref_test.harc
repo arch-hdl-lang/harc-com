@@ -32,7 +32,7 @@ extern function ref_crc8_step(crc: uint<8>, byte: uint<8>) -> uint<8>
 // so the fixture passes regardless of what `Top` does.
 function harc_crc8_step(crc: uint<8>, byte: uint<8>) -> uint<8>
     let x = crc ^ byte
-    for _ in 0 .. 8
+    for _ in 0 .. 7
         if (x & 0x80) != 0
             x = ((x << 1) ^ 0x07) & 0xFF
         else
@@ -61,7 +61,7 @@ impl ExternFnRefTest for ExternFnRefTb
         // surface immediately and identify the diverging byte.
         let crc_ref = 0xFF
         let crc_harc = 0xFF
-        for i in 0 .. 16
+        for i in 0 .. 15
             let b = (i * 17 + 42) & 0xFF
             crc_ref = ref_crc8_step(crc_ref, b)
             crc_harc = harc_crc8_step(crc_harc, b)

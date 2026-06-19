@@ -30,7 +30,7 @@ impl LogPathsTest for LogPathsTb
         // Count 1..4, streaming each step to the per-file log.
         dut.rst = 0
         dut.en = 1
-        for i in 1 .. 5
+        for i in 1 .. 4
             wait 1 cycle
             assert dut.count_out == i
                 else fail("cycle ${i}: count_out=${dut.count_out}, expected ${i}")

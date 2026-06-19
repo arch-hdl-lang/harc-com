@@ -50,7 +50,7 @@ impl TransactionBasicTest for TxnBasicTb
         // Three commands; each enables the counter for cmd.ticks
         // cycles (2, 3, 4) and checks the running total.
         let total = 0
-        for i in 0 .. 3
+        for i in 0 .. 2
             let cmd : CountCmd
             assert cmd.ticks == 2
                 else fail("cmd[${i}]: default ticks=${cmd.ticks}, expected 2")
@@ -66,7 +66,7 @@ impl TransactionBasicTest for TxnBasicTb
             if cmd.flag
                 dut.en = 1
             end if
-            for _ in 0 .. cmd.ticks
+            for _ in 1 .. cmd.ticks
                 wait 1 cycle
             end for
 

@@ -91,7 +91,7 @@ testbench BstSearchTb
         dut.search_key = search_key
     end function load_tree
     function wait_for_result(limit: uint<8>) -> uint<1>
-        for _ in 0 .. limit
+        for _ in 1 .. limit
             if dut.complete_found == 1 or dut.search_invalid == 1
                 return 0
             end if
@@ -189,7 +189,7 @@ impl BstSearchTest for BstSearchTb
         errors = errors + run_search(0, keys_single, left_null, right_null, 41, false, 31)
         errors = errors + run_search(31, keys_empty, left_null, right_null, 8, false, 31)
 
-        for _ in 0 .. 8
+        for _ in 0 .. 7
             let s : SearchStim
             randomize(s)
             errors = errors + run_search(0, keys_bal, left_bal, right_bal, s.key, false, 31)

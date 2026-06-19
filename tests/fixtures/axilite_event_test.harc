@@ -57,7 +57,7 @@ impl AxiLiteEventTest for AxiLiteEventTb
         wait 1 cycle
 
         // ── 5 random write/read pairs through events ─────────────────
-        for i in 0 .. 5
+        for i in 0 .. 4
             let t : RegOp
             randomize(t)
             // Pin addr to MM2S_SA so each write actually round-trips.

@@ -54,7 +54,7 @@ impl AxiLiteConstraintTest for AxiLiteConstraintTb
         // The solution space is large; Z3's soft preferences (one per
         // field, target = harc_rng_next()) yield a diverse stream of
         // satisfying assignments across iterations.
-        for i in 0 .. 4
+        for i in 0 .. 3
             let p : RegPair
             randomize(p) with
                 p.addr == 24

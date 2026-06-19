@@ -84,7 +84,7 @@ impl CellularAutomataTest for CellularAutomataTb
 
         // ── 64-step free evolution ────────────────────────────
         let model : uint<16> = 0xACE1 as uint<16>
-        for i in 0 .. 64
+        for i in 0 .. 63
             let next_expected = ca_step(model)
             wait 1 cycle
             assert dut.CA_out == next_expected
@@ -101,7 +101,7 @@ impl CellularAutomataTest for CellularAutomataTb
         dut.reset = 0
 
         model = 0x5A5A as uint<16>
-        for i in 0 .. 64
+        for i in 0 .. 63
             let nx = ca_step(model)
             wait 1 cycle
             assert dut.CA_out == nx
@@ -128,7 +128,7 @@ impl CellularAutomataTest for CellularAutomataTb
             else fail("all-ones seed: CA_out=0x${dut.CA_out:04x}, expected 0xFFFF")
         dut.reset = 0
         model = 0xFFFF as uint<16>
-        for i in 0 .. 16
+        for i in 0 .. 15
             let nx = ca_step(model)
             wait 1 cycle
             assert dut.CA_out == nx

@@ -168,7 +168,7 @@ impl SecureRWTest for SecureRWTb
         wait 1 cycle
 
         // -- Multiple authorized writes + reads with varied data --
-        for k in 0 .. 16
+        for k in 0 .. 15
             let av : uint<8> = ((k * 17 + 3) & 0xFF) as uint<8>
             let dv : uint<8> = ((k * 53 + 7) & 0xFF) as uint<8>
             dut.i_addr = av
@@ -193,7 +193,7 @@ impl SecureRWTest for SecureRWTb
         end for
 
         // -- Alternating good/bad keys to toggle key_match & error -
-        for k in 0 .. 8
+        for k in 0 .. 7
             // Bad key
             dut.i_key_in = (0xAA ^ ((1 as uint<8>) << k)).trunc<8>()
             dut.i_read_write_enable = 1
@@ -268,7 +268,7 @@ impl SecureRWTest for SecureRWTb
         // and bad-key reads/writes have deterministic output behavior;
         // good-key reads may observe previously unwritten memory, so
         // only the error flag is checked for those.
-        for k in 0 .. 32
+        for k in 0 .. 31
             let s : SecureBusStim
             randomize(s)
             dut.i_addr = s.addr

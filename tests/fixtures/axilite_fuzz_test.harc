@@ -15,7 +15,7 @@ end transaction RegData
 // Stimulus generator: yields N randomized RegData values. The run-block
 // iterates the resulting `std::vector<RegData>` with `for t in txns`.
 tseq RandomRegs(n: int) -> TSeq<RegData>
-    for _ in 0 .. n
+    for _ in 1 .. n
         let t : RegData
         randomize(t)
         yield t

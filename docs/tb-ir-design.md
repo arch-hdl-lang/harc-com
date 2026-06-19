@@ -438,7 +438,7 @@ below are mechanical; each AST construct has exactly one IR form.
 | `wait until cond timeout N fail("msg")` | terminator `WaitUntilTimeout { pred, cycles, on_fire: next_block, on_timeout: synthesized_block_with_fail }`. |
 | `randomize(t) with <body>` | (a) constraint-IR layer lowers `<body>` to a `ConstraintRef`. (b) terminator `Randomize { target: local_of(t), constraints, succ: next_block }`. |
 | `if c then A elsif c2 then B else C` | recursive `Branch` chain. Each arm's body lives in its own block; arms reconverge by `Jump`-ing to a common `next_block`. |
-| `for i in lo..hi <body>` | header block tests `i < hi`; body block ends with `Jump(header)`; exit block is `next_block`. Loop counter is a synthesized `LocalId`. |
+| `for i in lo..hi <body>` | header block tests `i <= hi` (the range is **inclusive** of `hi`, matching ARCH); body block ends with `Jump(header)`; exit block is `next_block`. Loop counter is a synthesized `LocalId`. |
 | `while cond <body>` | same shape with the `cond` expression in the header block's `Branch`. |
 | `fork A and B and C join_all` | terminator `Fork { arms: [arm(A), arm(B), arm(C)], join: next_block }`. Each arm's body becomes a fresh entry block that ends with `Jump(__arm_done)` where `__arm_done` is a synthetic block that records arm completion and `Jump`s back to a join-coordination block. |
 | `return` (implicit at end of `run`) | terminator `Return`. |
@@ -721,7 +721,7 @@ Source — `tests/fixtures/axilite_constraint_test.harc` lines 38-56
 (elided):
 
 ```harc
-for i in 0 .. 4
+for i in 0 .. 3
     let p : RegPair
     randomize(p) with
         p.addr == 24

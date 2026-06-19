@@ -25,7 +25,7 @@ fn fn0 run_LogPathsTest [kind=Run, owner=tb0]
     -> Jump(b2)
 
   b2:
-    -> Branch((%i < 5), b3, b5)
+    -> Branch((%i <= 4), b3, b5)
 
   b3:
     -> WaitCycles(1, b6)

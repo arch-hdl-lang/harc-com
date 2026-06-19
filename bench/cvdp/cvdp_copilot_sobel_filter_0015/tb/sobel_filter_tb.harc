@@ -159,7 +159,7 @@ impl SobelTest for SobelTb
         // Small perturbation below threshold.
         errors = errors + drive_window(10, 10, 10, 10, 11, 10, 10, 10, 10, 0)
 
-        for _ in 0 .. 12
+        for _ in 0 .. 11
             let s : PixelStim
             randomize(s)
             drive_pixel(s.pixel)

@@ -182,7 +182,7 @@ int run_TlmTargetThreadIfTest(int argc, char** argv) {
                         break;
                     }
                     case 1: {
-                        if ((i < 4)) { __bb = 2; } else { __bb = 4; }
+                        if ((i <= 3)) { __bb = 2; } else { __bb = 4; }
                         break;
                     }
                     case 2: {

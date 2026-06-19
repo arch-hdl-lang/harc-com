@@ -45,7 +45,7 @@ impl IfWaitForInThenTest for IfWaitForInThenTb
         // Strobe ack every third cycle and count `done` rising
         // edges. The expected count is `burst = 4`. Bound the loop
         // at 100 cycles so a stuck DUT doesn't hang the sim.
-        for c in 0 .. 100
+        for c in 0 .. 99
             if c % 3 == 0
                 dut.ack = 1
             else

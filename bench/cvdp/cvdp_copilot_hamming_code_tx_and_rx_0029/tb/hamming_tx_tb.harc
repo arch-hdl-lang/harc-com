@@ -22,7 +22,7 @@ end testbench HammingTxTb
 impl HammingTxTest for HammingTxTb
     run
         log(info, "hamming_code_tx_for_4bit: exhaustive 4-bit sweep")
-        for i in 0 .. 16
+        for i in 0 .. 15
             dut.data_in = i
             wait 1 cycle
             let d0 = (i >> 0) & 1

@@ -35,8 +35,8 @@ impl BcdAdderTest for BcdAdderTestTb
         wait 1 cycle
 
         let errors : uint<32> = 0
-        for a in 0 .. 10
-            for b in 0 .. 10
+        for a in 0 .. 9
+            for b in 0 .. 9
                 dut.a = a
                 dut.b = b
                 wait 1 cycle

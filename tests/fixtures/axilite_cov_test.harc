@@ -67,7 +67,7 @@ impl AxiLiteCovTest for AxiLiteCovTb
         axil_write(dut, 0, 1)                 // DMACR.RS
         axil_write(dut, 40, 16)               // LENGTH = 16 (tiny)
 
-        for i in 0 .. 3
+        for i in 0 .. 2
             let t : RegData
             randomize(t)
             axil_write(dut, 24, t.value)

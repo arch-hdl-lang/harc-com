@@ -107,7 +107,7 @@ end function slot_bit
 function lowest_free(valid_mask: uint<32>) -> uint<5>
     let idx : uint<5> = 0
     let found : bool = false
-    for i in 0 .. 32
+    for i in 0 .. 31
         let bit = ((valid_mask >> i) & 1).trunc<1>()
         if (found == false) and (bit == 0)
             idx = i as uint<5>
@@ -120,7 +120,7 @@ end function lowest_free
 function first_valid(valid_mask: uint<32>) -> uint<5>
     let idx : uint<5> = 0
     let found : bool = false
-    for i in 0 .. 32
+    for i in 0 .. 31
         let bit = ((valid_mask >> i) & 1).trunc<1>()
         if (found == false) and (bit == 1)
             idx = i as uint<5>
@@ -132,7 +132,7 @@ end function first_valid
 
 function valid_count(valid_mask: uint<32>) -> uint<6>
     let n : uint<6> = 0
-    for i in 0 .. 32
+    for i in 0 .. 31
         n = n + (((valid_mask >> i) & 1).trunc<1>() as uint<6>)
     end for
     return n
@@ -173,7 +173,7 @@ impl CacheMshrTest for CacheMshrTb
         // Same-line chain: first allocation is a miss-line insert, later
         // allocations on the fixed line must report pending on the following
         // cycle and populate the previous-entry link path.
-        for k in 0 .. 32
+        for k in 0 .. 31
             let a : MshrAlloc
             randomize(a) with
                 a.addr == 341
@@ -234,7 +234,7 @@ impl CacheMshrTest for CacheMshrTb
 
         // Drain back to empty using only allocated slots.
         dut.allocate_valid = 0
-        for k in 0 .. 32
+        for k in 0 .. 31
             let fid = first_valid(valid_mask)
             dut.finalize_valid = 1
             dut.finalize_id = fid
@@ -276,8 +276,8 @@ impl CacheMshrTest for CacheMshrTb
 
         // Explicitly write every is_write_table bit as read, then write, so
         // all per-entry RW storage sees both values independent of solver luck.
-        for pass in 0 .. 2
-            for k in 0 .. 32
+        for pass in 0 .. 1
+            for k in 0 .. 31
                 let a : MshrAlloc
                 randomize(a)
                 let exp_id = lowest_free(valid_mask)
@@ -293,7 +293,7 @@ impl CacheMshrTest for CacheMshrTb
             end for
 
             dut.allocate_valid = 0
-            for k in 0 .. 32
+            for k in 0 .. 31
                 let fid = first_valid(valid_mask)
                 dut.finalize_valid = 1
                 dut.finalize_id = fid
@@ -307,7 +307,7 @@ impl CacheMshrTest for CacheMshrTb
         // Fill all 32 entries with unique-ish lines. This reaches full and
         // covers allocate_ready deassertion without violating valid-only-when-
         // ready sequencing.
-        for k in 0 .. 32
+        for k in 0 .. 31
             let a : MshrAlloc
             let unique_line : uint<10> = ((k * 29 + 7) & 1023) as uint<10>
             randomize(a)
@@ -376,7 +376,7 @@ impl CacheMshrTest for CacheMshrTb
 
         // Drain every slot, alternating finalize_id regions for coverage.
         dut.allocate_valid = 0
-        for k in 0 .. 32
+        for k in 0 .. 31
             let fid = first_valid(valid_mask)
             dut.finalize_valid = 1
             dut.finalize_id = fid
@@ -393,7 +393,7 @@ impl CacheMshrTest for CacheMshrTb
         // Randomized legal-ish stress. Constraints generate payload, address,
         // and control preferences; local state chooses whether requested
         // operations are legal in the current cycle.
-        for k in 0 .. 96
+        for k in 0 .. 95
             let ctl : MshrRandCtl
             let a : MshrAlloc
             randomize(ctl)
@@ -433,7 +433,7 @@ impl CacheMshrTest for CacheMshrTb
 
         // Final drain leaves the DUT empty for a clean end-of-test state.
         dut.allocate_valid = 0
-        for k in 0 .. 32
+        for k in 0 .. 31
             if valid_mask != 0
                 let fid = first_valid(valid_mask)
                 dut.finalize_valid = 1

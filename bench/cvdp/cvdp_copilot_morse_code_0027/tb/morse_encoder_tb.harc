@@ -180,7 +180,7 @@ end function model_morse
 impl MorseEncoderTest for MorseEncoderTb
     run
         log(info, "morse_encoder: full 0..256 ASCII sweep")
-        for c in 0 .. 256
+        for c in 0 .. 255
             dut.ascii_in = c
             wait 1 cycle
             let exp = model_morse(c as uint<8>)

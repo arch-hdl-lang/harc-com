@@ -33,7 +33,7 @@ end transaction Req
 // fixed sentinel after solving (proves a post-randomize field write
 // inside a tseq body composes with the constraint seam).
 tseq Gen(n: int) -> TSeq<Req>
-    for _ in 0 .. n
+    for _ in 1 .. n
         let t : Req
         randomize(t)
         t.addr = 64

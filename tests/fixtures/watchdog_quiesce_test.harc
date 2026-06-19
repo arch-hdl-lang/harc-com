@@ -59,7 +59,7 @@ impl WatchdogQuiesceTest for WatchdogQuiesceTb
         // Emit 20 transactions spaced 3 cycles apart (= 60 cycles total).
         // Well above the watchdog's 500-cycle period (one heartbeat
         // log expected mid-run, none during the busy phase).
-        for i in 0 .. 20
+        for i in 0 .. 19
             let t : TinyTxn
             t.tag = i
             emit prod.in_ev(t)

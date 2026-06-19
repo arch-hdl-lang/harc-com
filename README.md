@@ -81,7 +81,7 @@ test SyncFifoTest
         dut.rst = 0
 
         // Push 16 items (fill to capacity).
-        for i in 0 .. 16
+        for i in 0 .. 15
             dut.push_valid = 1
             dut.push_data = i + 1
             wait 1 cycle
@@ -91,7 +91,7 @@ test SyncFifoTest
         assert dut.full == 1 else fail("FIFO should be full after 16 pushes")
 
         // Pop all 16 items and verify FIFO order.
-        for i in 0 .. 16
+        for i in 0 .. 15
             dut.pop_ready = 1
             let expected = i + 1
             assert dut.pop_data == expected

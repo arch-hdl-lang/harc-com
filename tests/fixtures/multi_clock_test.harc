@@ -24,7 +24,7 @@ impl MultiClockSyncTest for MultiClockSyncTb
         // ── fast_count increments once per fast_clk cycle ──────────────
         // We're at fast_count == 0 right after reset deasserts. Walk
         // 10 fast cycles, checking the count after each.
-        for i in 1 .. 11
+        for i in 1 .. 10
             wait 1 cycle on fast_clk
             assert dut.fast_count == i
                 else fail("fast_count after ${i} fast cycles: got ${dut.fast_count}, expected ${i}")

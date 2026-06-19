@@ -21,7 +21,7 @@ function model_rx(data_in: uint<8>) -> uint<4>
     let p0 : uint<1> = 0
     let p1 : uint<1> = 0
     let p2 : uint<1> = 0
-    for i in 1 .. 8
+    for i in 1 .. 7
         let bit = ((data_in >> i) & 1).trunc<1>()
         if (i & 1) != 0
             p0 = p0 ^ bit
@@ -58,7 +58,7 @@ end function model_rx
 impl HammingRxTest for HammingRxTb
     run
         log(info, "hamming_rx: exhaustive 256-codeword sweep")
-        for c in 0 .. 256
+        for c in 0 .. 255
             dut.data_in = c
             wait 1 cycle
             let exp = model_rx(c as uint<8>)

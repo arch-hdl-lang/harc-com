@@ -43,14 +43,14 @@ impl PerceptronTest for PerceptronTb
         dut.rst_n = 1
         wait 1 cycle
 
-        for action in 0 .. 6
+        for action in 0 .. 5
             dut.train_action_force = action
             dut.next_addr_force = action
-            for gate in 0 .. 4
+            for gate in 0 .. 3
                 dut.gate_select = gate
-                for target in 0 .. 2
+                for target in 0 .. 1
                     dut.target_select = target
-                    for idx in 0 .. 5
+                    for idx in 0 .. 4
                         dut.input_index_force = idx
                         dut.learning_rate = (idx & 1) != 0
                         dut.threshold = (idx - 2)
