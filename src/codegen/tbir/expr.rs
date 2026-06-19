@@ -89,19 +89,36 @@ pub(super) fn probe_read_accessor(dut_type: &str, p: &PortRef) -> String {
     crate::codegen::sv_stub::mangled_accessor(dut_type, &p.port_path.join("_"))
 }
 
-pub(super) fn port_read(cx: &ECx<'_>, p: &PortRef) -> String {
+pub(super) fn port_read(cx: &ECx<'_>, p: &PortRef) -> Result<String, EmitError> {
     let sig = port_signal(cx, p);
-    match p.lane {
+    Ok(match &p.lane {
         None => format!("harc_rt::harc_read({sig})"),
         // Packed multi-lane port: bit-extract through the runtime
         // helper. True unpacked-array port: raw subscript (correct on
         // both backends; v1 emits the same, with no harc_read wrap).
-        Some(lane) => match lane_width(cx, p) {
-            Some(w) => {
-                format!("harc_rt::harc_vec_lane_read<{w}>({sig}, (std::size_t)({lane}))")
+        // The lane index is a constant literal or a runtime expression —
+        // v1's `dut_packed_lane` re-renders an arbitrary `&Expr` here.
+        Some(lane) => {
+            let idx = lane_index_cpp(cx, lane)?;
+            match lane_width(cx, p) {
+                Some(w) => {
+                    format!("harc_rt::harc_vec_lane_read<{w}>({sig}, (std::size_t)({idx}))")
+                }
+                None => format!("{sig}[{idx}]"),
             }
-            None => format!("{sig}[{lane}]"),
-        },
+        }
+    })
+}
+
+/// Render a lane index: a constant folds to its literal, a runtime index
+/// lowers like any other IR value expression.
+pub(super) fn lane_index_cpp(
+    cx: &ECx<'_>,
+    lane: &crate::ir::LaneIndex,
+) -> Result<String, EmitError> {
+    match lane {
+        crate::ir::LaneIndex::Const(c) => Ok(c.to_string()),
+        crate::ir::LaneIndex::Var(e) => expr_cpp(cx, e),
     }
 }
 
@@ -129,7 +146,7 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         Expr::Local(l) => cx.names.get(l.index()).cloned().ok_or_else(|| {
             EmitError(format!("tbir: dangling local %{} in {}", l.0, cx.func.name))
         })?,
-        Expr::Port(p) => port_read(cx, p),
+        Expr::Port(p) => port_read(cx, p)?,
         // Record-field read on a record-typed local: `t.tag`. The
         // lowering validated the field against the schema.
         Expr::RecordField {

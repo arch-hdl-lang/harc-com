@@ -22,7 +22,8 @@
 
 use super::expr::{
     comp_base_cpp, comp_base_cpp_subst_cx, escape_c, expr_cpp, fmt_arg_cpp, helper_cpp_name,
-    lane_width, port_read, port_signal, probe_read_accessor, wide_words_over_128, ECx,
+    lane_index_cpp, lane_width, port_read, port_signal, probe_read_accessor, wide_words_over_128,
+    ECx,
 };
 use crate::ast::ExprKind;
 use crate::codegen::cpp_tb::EmitError;
@@ -893,23 +894,26 @@ fn emit_stmt(
         }
         Stmt::DutWrite(p, e) => {
             let sig = port_signal(cx, p);
-            match p.lane {
+            match &p.lane {
                 // Packed multi-lane port: bit-deposit through the
                 // runtime helper; unpacked-array port: raw subscript
-                // (v1's emit_signal_assignment split).
+                // (v1's emit_signal_assignment split). The lane index is
+                // a constant or a runtime expression — v1 re-renders an
+                // arbitrary `&Expr` here.
                 Some(lane) => {
+                    let idx = lane_index_cpp(cx, lane)?;
                     let e = expr_cpp(cx, e)?;
                     match lane_width(cx, p) {
                         Some(w) => {
                             writeln!(
                                 out,
                                 "{pad}harc_rt::harc_vec_lane_write<{w}>({sig}, \
-                                 (std::size_t)({lane}), {e});"
+                                 (std::size_t)({idx}), {e});"
                             )
                             .ok();
                         }
                         None => {
-                            writeln!(out, "{pad}{sig}[{lane}] = {e};").ok();
+                            writeln!(out, "{pad}{sig}[{idx}] = {e};").ok();
                         }
                     }
                 }
@@ -938,7 +942,7 @@ fn emit_stmt(
         }
         Stmt::DutRead(l, p) => {
             let name = &names[l.index()];
-            writeln!(out, "{pad}{name} = {};", port_read(cx, p)).ok();
+            writeln!(out, "{pad}{name} = {};", port_read(cx, p)?).ok();
         }
         Stmt::ProbeRelease(p) => {
             // `release dut.<force_probe>` → clear the enable wire so the

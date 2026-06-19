@@ -88,6 +88,7 @@ wide_reg_test | WideReg | wide_reg.sv | - | pass
 sha256_test | Sha256 | sha256.sv | - | pass
 if_wait_for_in_then_test | M | if_wait_for_in_then.sv | - | pass
 packed_vec_lane_test | PackedVecLane | packed_vec_lane.sv | - | pass
+vec_lane_var_index_test | PackedVecLane | packed_vec_lane.sv | - | pass
 width_methods_test | Top | top_counter.sv | - | pass
 wide_cast_test | Top | top_counter.sv | - | pass
 bitslice_uninit_test | Top | top_counter.sv | - | pass

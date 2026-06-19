@@ -126,7 +126,13 @@ fn lower_point_target(group: &str, point: &str, target: &AstExpr) -> Result<Expr
         let mut cur = e;
         let mut lane = None;
         if let ExprKind::Index { target, index } = &*cur.kind {
-            lane = Some(cover_const_u64(group, point, index)?);
+            // Covergroup schemas lower before any test/run scope exists,
+            // so a lane index has no runtime locals to reference: only a
+            // constant is in subset (`cover_const_u64` rejects anything
+            // else). Kept as `LaneIndex::Const`.
+            lane = Some(crate::ir::LaneIndex::Const(cover_const_u64(
+                group, point, index,
+            )?));
             cur = target;
         }
         let mut segments: Vec<String> = Vec::new();

@@ -400,13 +400,14 @@ impl FuncBuilder<'_> {
                 if let Some(rf) = self.lower_record_vec_index(target, index)? {
                     return Ok(rf);
                 }
-                // Constant-lane DUT port access: `dut.<port>[<const>]`.
+                // DUT port lane access: `dut.<port>[i]` (constant or
+                // runtime index).
                 if let Some(port) = self.as_lane_port_ref(e)? {
                     return Ok(Expr::Port(port));
                 }
                 Err(unsupported(
                     "index expressions",
-                    "only `dut.<port>[<constant>]` lane accesses and \
+                    "only `dut.<port>[i]` lane accesses and \
                      `<rec>.<vecfield>[i]` element reads are lowered",
                 ))
             }
@@ -1164,12 +1165,12 @@ impl FuncBuilder<'_> {
             .then(|| (instance, name.name.clone()))
     }
 
-    /// `Some(PortRef)` (with `lane`) when the expression is a
-    /// constant-index lane access on a direct DUT port:
-    /// `dut.<port>[<const>]`. The index must reduce to an integer
-    /// literal (directly, through parens, or via a `const`/enum name)
-    /// — non-constant lane indices are an explicit rejection at the
-    /// caller.
+    /// `Some(PortRef)` (with `lane`) when the expression is a lane
+    /// access on a direct DUT port: `dut.<port>[i]`. A constant index
+    /// (integer literal, through parens, or via a `const`/enum name)
+    /// folds to `LaneIndex::Const`; any other index expression is
+    /// lowered as a runtime value into `LaneIndex::Var`, mirroring v1's
+    /// `dut_packed_lane`, which re-renders an arbitrary `&Expr`.
     pub(crate) fn as_lane_port_ref(&mut self, e: &AstExpr) -> Result<Option<PortRef>, LowerError> {
         let ExprKind::Index { target, index } = &*e.kind else {
             return Ok(None);
@@ -1177,13 +1178,10 @@ impl FuncBuilder<'_> {
         let Some(mut port) = self.as_port_ref(target)? else {
             return Ok(None);
         };
-        let Some(lane) = self.const_eval_index(index) else {
-            return Err(unsupported(
-                "a non-constant lane index on a DUT port",
-                "only `dut.<port>[<integer constant>]` is lowered",
-            ));
-        };
-        port.lane = Some(lane);
+        port.lane = Some(match self.const_eval_index(index) {
+            Some(lane) => crate::ir::LaneIndex::Const(lane),
+            None => crate::ir::LaneIndex::Var(Box::new(self.lower_expr(index)?)),
+        });
         Ok(Some(port))
     }
 
