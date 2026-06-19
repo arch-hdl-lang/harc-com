@@ -481,9 +481,32 @@ impl FuncBuilder<'_> {
                             return Ok(());
                         }
                     }
+                    // `let t2 : Txn = t1` — a by-value copy from a
+                    // same-typed record local. v1 emits `Txn t2 = t1;`, a
+                    // C++ struct copy; we mirror it by declaring a record-
+                    // typed local and binding it with `Stmt::Assign`, which
+                    // the emitter renders as the same `name = t1;` copy.
+                    // This matches the discipline of the whole-record
+                    // assignment path (`u = t` in `lower_assign`): only a
+                    // same-typed record local copies; any other RHS stays a
+                    // precise rejection rather than a verifier TypeMismatch
+                    // or a C++ compile error.
+                    let e = self.lower_expr_no_ports(value)?;
+                    let same_record = matches!(&e, Expr::Local(src)
+                        if self.record_of_local(*src) == Some(rid));
+                    if same_record {
+                        let id = self.declare(&l.name.name);
+                        self.set_local_type(id, IrType::Record(rid));
+                        self.push(Stmt::Assign(id, e));
+                        return Ok(());
+                    }
                     return Err(unsupported(
-                        &format!("`let {} : {simple} = ...` with an initializer", l.name.name),
-                        "transaction locals default-construct; assign fields individually",
+                        &format!(
+                            "`let {} : {simple} = ...` with a non-`{simple}` initializer",
+                            l.name.name
+                        ),
+                        "transaction locals copy from a same-typed transaction local, or \
+                         default-construct and assign fields individually",
                     ));
                 }
                 let id = self.declare(&l.name.name);
@@ -652,11 +675,19 @@ impl FuncBuilder<'_> {
             return Ok(());
         }
         let e = self.lower_expr_no_ports(value)?;
+        // Record-valued RHS with no `: T` annotation — the bare copy form
+        // `let t2 = t1`. v1's untyped fallback would mis-declare it as
+        // `int64_t t2 = t1;` (broken for a struct); typing the dest as the
+        // source record makes the generic record-local declare + struct-copy
+        // `Stmt::Assign` carry it correctly. Scalars are untouched (only a
+        // record-typed RHS opts in here).
+        let record_ty =
+            self.expr_type(&e).filter(|t| matches!(t, IrType::Record(_)));
         let id = self.declare(&l.name.name);
         if let Some(w) = declared_width {
             self.let_widths.insert(id, w);
         }
-        if let Some(ty) = declared_scalar_ty {
+        if let Some(ty) = record_ty.or(declared_scalar_ty) {
             self.set_local_type(id, ty);
         }
         self.push(Stmt::Assign(id, e));

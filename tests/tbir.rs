@@ -1601,6 +1601,131 @@ end test BadCopyTest
     );
 }
 
+/// Record-typed `let` copy: `let t2 : Txn = t1` (and the untyped bare
+/// `let t3 = t1`) lower to a record-typed local bound by `Stmt::Assign`
+/// — v1's by-value C++ struct copy. A non-record initializer into a
+/// record-annotated local stays a precise lowering rejection.
+#[test]
+fn record_let_copy_lowers_by_value() {
+    // Typed copy `let t2 : Req = t1`.
+    let typed_src = r#"
+transaction Req
+    addr : uint<32> default 3
+end transaction Req
+
+test TypedCopyTest
+    let dut : Top
+    run
+        let t1 : Req
+        t1.addr = 9
+        let t2 : Req = t1
+        assert t2.addr == 9 else fail("copy lost addr=${t2.addr}")
+    end run
+end test TypedCopyTest
+"#;
+    let prog = lower_src(typed_src).expect("typed record let-copy lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let rid = match prog.records.iter().position(|r| r.name == "Req") {
+        Some(i) => ir::RecordId(i as u32),
+        None => panic!("Req record present"),
+    };
+    let run = prog.function(prog.tests[0].run);
+    // The copy is `Stmt::Assign(dest, Expr::Local(src))` where `dest` is
+    // a record-typed local — the generic record-local declare + struct
+    // copy carries it (no RecordInit at the copy site).
+    let copy_dest = run
+        .blocks
+        .iter()
+        .flat_map(|b| b.stmts.iter())
+        .find_map(|s| match s {
+            ir::Stmt::Assign(d, ir::Expr::Local(_)) => Some(*d),
+            _ => None,
+        })
+        .expect("a record-local copy Assign");
+    assert_eq!(
+        run.locals[copy_dest.index()].ty,
+        ir::IrType::Record(rid),
+        "copy dest local is record-typed"
+    );
+
+    // Untyped bare copy `let t3 = t1` — tbir types the dest from the
+    // source record (v1 would mis-declare it `int64_t`, so this form is
+    // tbir-only and exercised here rather than in the equivalence suite).
+    let untyped_src = r#"
+transaction Req
+    addr : uint<32> default 3
+end transaction Req
+
+test UntypedCopyTest
+    let dut : Top
+    run
+        let t1 : Req
+        t1.addr = 9
+        let t3 = t1
+        assert t3.addr == 9 else fail("copy lost addr=${t3.addr}")
+    end run
+end test UntypedCopyTest
+"#;
+    let prog = lower_src(untyped_src).expect("untyped record let-copy lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let run = prog.function(prog.tests[0].run);
+    assert!(
+        run.blocks.iter().flat_map(|b| b.stmts.iter()).any(|s| {
+            matches!(s, ir::Stmt::Assign(d, ir::Expr::Local(_))
+                if matches!(run.locals[d.index()].ty, ir::IrType::Record(_)))
+        }),
+        "untyped record copy dest is record-typed:\n{run}"
+    );
+
+    // A non-record initializer into a record-annotated local stays a
+    // precise rejection (no scalar-into-record type confusion).
+    let bad_src = r#"
+transaction Req
+    addr : uint<32>
+end transaction Req
+
+test BadLetCopyTest
+    let dut : Top
+    run
+        let t : Req = 7
+    end run
+end test BadLetCopyTest
+"#;
+    let err = lower_src(bad_src).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("non-`Req` initializer"),
+        "names the non-record-initializer rejection: {msg}"
+    );
+
+    // A copy from a *different* record type is rejected precisely (the
+    // dest is annotated `Req` but the source is `Other`) — not deferred
+    // to a verifier TypeMismatch or a C++ compile error.
+    let mismatch_src = r#"
+transaction Req
+    addr : uint<32>
+end transaction Req
+
+transaction Other
+    val : uint<32>
+end transaction Other
+
+test MismatchCopyTest
+    let dut : Top
+    run
+        let o : Other
+        let t : Req = o
+    end run
+end test MismatchCopyTest
+"#;
+    let err = lower_src(mismatch_src).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("non-`Req` initializer"),
+        "cross-type record copy rejected: {msg}"
+    );
+}
+
 /// `when` subtype blocks stay outside the lowered record shape.
 #[test]
 fn record_when_subtype_is_unsupported() {
