@@ -196,18 +196,33 @@ impl FuncBuilder<'_> {
                     if let Some(local) = self.lookup(&root.name) {
                         if let Some(rid) = self.record_of_local(local) {
                             let schema = &self.ctx.records[rid.index()];
-                            if schema.field(&name.name).is_none() {
+                            let Some(fld) = schema.field(&name.name) else {
                                 return Err(LowerError::Invalid(format!(
                                     "transaction `{}` has no field `{}`",
                                     schema.name, name.name
                                 )));
+                            };
+                            // A whole-`Vec` field read has no scalar value:
+                            // in any scalar/format/assert context the tbir
+                            // backend would emit the raw `std::array` member
+                            // into a position that expects an integer, which
+                            // miscompiles as a raw clang error rather than a
+                            // structured HARC diagnostic. Reject it here. The
+                            // ONLY sanctioned whole-`Vec` field use is a
+                            // `dst.field = src.field` array copy, which the
+                            // write arm (`stmts.rs`) special-cases without
+                            // routing the RHS through this read path. Element
+                            // access (`rec.data[i]`) is handled in the
+                            // `Index` arm.
+                            if fld.vec_len.is_some() {
+                                return Err(unsupported(
+                                    &format!(
+                                        "a whole-`Vec` read of record field `{}.{}`",
+                                        schema.name, name.name
+                                    ),
+                                    "index the field element-wise (`{rec}.{field}[i]`)",
+                                ));
                             }
-                            // A whole-`Vec` field read (`rec.data`) lowers
-                            // to `Expr::RecordField { index: None }` — the
-                            // tbir backend renders it as `name.field`, the
-                            // whole `std::array` member, mirroring v1's
-                            // plain C++ member access. (Element access
-                            // `rec.data[i]` is handled in the `Index` arm.)
                             return Ok(Expr::RecordField {
                                 local,
                                 field: name.name.clone(),
@@ -265,9 +280,7 @@ impl FuncBuilder<'_> {
                         {
                             return self.lower_tb_method_call(&id.name, args);
                         }
-                        if let Some(call) =
-                            self.lower_transactor_self_call(&id.name, args, true)?
-                        {
+                        if let Some(call) = self.lower_transactor_self_call(&id.name, args, true)? {
                             return Ok(call);
                         }
                         if self.helpers.contains(&id.name) {
@@ -411,15 +424,13 @@ impl FuncBuilder<'_> {
                 // scalar slice. A variable part-select (`x[s +: W]` with a
                 // non-const offset) does not fold and stays out of subset.
                 match (parse_int_literal_expr(hi), parse_int_literal_expr(lo)) {
-                    (Some(h), Some(l)) if h >= l => {
-                        match (u32::try_from(h), u32::try_from(l)) {
-                            (Ok(hi), Ok(lo)) => {
-                                let target = Box::new(self.lower_expr(target)?);
-                                Ok(Expr::BitSlice { target, hi, lo })
-                            }
-                            _ => Err(unsupported("bit-slice bounds above 2^32", "")),
+                    (Some(h), Some(l)) if h >= l => match (u32::try_from(h), u32::try_from(l)) {
+                        (Ok(hi), Ok(lo)) => {
+                            let target = Box::new(self.lower_expr(target)?);
+                            Ok(Expr::BitSlice { target, hi, lo })
                         }
-                    }
+                        _ => Err(unsupported("bit-slice bounds above 2^32", "")),
+                    },
                     _ => Err(unsupported(
                         "bit-slice expressions with non-constant or hi<lo bounds",
                         "only literal `x[hi:lo]` bounds with hi >= lo are lowered",
@@ -446,18 +457,27 @@ impl FuncBuilder<'_> {
                 // Bare `time` value in expression position (`let t : time =
                 // 100ns`). v1's `emit_expr_with_arrow` emits the leading
                 // numeric portion verbatim (no unit conversion) and types
-                // the local `uint64_t`. Mirror that exactly: take the digit/
-                // underscore prefix, strip underscores, parse as u64. (This
-                // is NOT the `wait <dur>` path, which converts to ps via
-                // `time_literal_to_ps` — a different surface.)
+                // the local `uint64_t`. We mirror that for the common case:
+                // take the digit/underscore prefix, strip underscores, parse
+                // as u64. (This is NOT the `wait <dur>` path, which converts
+                // to ps via `time_literal_to_ps` — a different surface.)
+                //
+                // INTENTIONAL DIVERGENCE from v1 (authorized 2026-06-19, see
+                // the "Time-literal digit separators" note in tbir-mvp.md):
+                // for a digit-separated literal like `1_000ns`, v1 emits the
+                // prefix verbatim — `uint64_t t = 1_000;` — which is a C++
+                // compile error (no `operator""_000`). We strip the `_` and
+                // lower `1000`, which is what the source plainly means. tbir
+                // is the more-correct backend here; v1's behavior is a legacy
+                // limitation, not a contract we preserve.
                 let digits: String = s
                     .chars()
                     .take_while(|c| c.is_ascii_digit() || *c == '_')
                     .filter(|c| *c != '_')
                     .collect();
-                let value = digits.parse::<u64>().map_err(|_| {
-                    unsupported("time literal with no leading numeric value", "")
-                })?;
+                let value = digits
+                    .parse::<u64>()
+                    .map_err(|_| unsupported("time literal with no leading numeric value", ""))?;
                 Ok(Expr::Literal {
                     value,
                     ty: IrType::UInt(Some(64)),

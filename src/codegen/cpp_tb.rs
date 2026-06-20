@@ -3110,7 +3110,10 @@ fn is_simple_ident(s: &str) -> bool {
 /// pre-fix behavior had, so we never regress a working corpus design into a
 /// missing-port error. The common ARCH forms (`generate_if READ`,
 /// `generate_if WRITE`, `generate_if READ > 0`) all fold.
-pub(crate) fn gate_passes(gate: Option<&Expr>, env: &std::collections::HashMap<String, i64>) -> bool {
+pub(crate) fn gate_passes(
+    gate: Option<&Expr>,
+    env: &std::collections::HashMap<String, i64>,
+) -> bool {
     match gate {
         None => true,
         Some(cond) => match eval_const_i64(cond, env) {

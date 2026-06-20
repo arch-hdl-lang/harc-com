@@ -1484,6 +1484,172 @@ end test StructVecTest
     assert!(msg.contains("non-scalar"), "names the reason: {msg}");
 }
 
+/// A whole-`Vec` record-field READ in scalar position (here a format
+/// arg) must be REJECTED with a structured diagnostic — NOT lowered into
+/// `harc_printf_ll(r.data)`, which miscompiles as a raw clang error
+/// ("cannot convert std::array to long long"). Regression guard for the
+/// over-broad rejection removal in #443.
+#[test]
+fn whole_vec_field_read_in_format_arg_is_rejected() {
+    let src = r#"
+struct Bundle
+    data : Vec<uint<32>, 4>
+end struct Bundle
+
+test WholeVecReadTest
+    let dut : Top
+    run
+        let r : Bundle
+        r.data[0] = 1
+        log(info, "${r.data}")
+    end run
+end test WholeVecReadTest
+"#;
+    let err = lower_src(src).expect_err("whole-Vec field read must be rejected");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("whole-`Vec` read of record field"),
+        "names the read: {msg}"
+    );
+    assert!(
+        msg.contains("Bundle.data"),
+        "names the offending field: {msg}"
+    );
+}
+
+/// A whole-`Vec` record-field READ compared in an `assert` must be
+/// rejected too (it only "worked" by luck before this guard).
+#[test]
+fn whole_vec_field_read_in_assert_is_rejected() {
+    let src = r#"
+struct Bundle
+    data : Vec<uint<32>, 4>
+end struct Bundle
+
+test WholeVecAssertTest
+    let dut : Top
+    run
+        let r : Bundle
+        r.data[0] = 1
+        assert r.data == r.data else fail("nope")
+    end run
+end test WholeVecAssertTest
+"#;
+    let err = lower_src(src).expect_err("whole-Vec field read in assert must be rejected");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("whole-`Vec` read of record field"),
+        "names the read: {msg}"
+    );
+}
+
+/// A scalar RHS assigned into a whole-`Vec` record field
+/// (`dst.data = 5`) must be REJECTED — NOT lowered into
+/// `dst.data = 5;`, which miscompiles ("no viable overloaded '='" on
+/// `std::array`). Only a matching-shape whole-`Vec` field read RHS is
+/// admissible.
+#[test]
+fn scalar_rhs_into_whole_vec_field_is_rejected() {
+    let src = r#"
+struct Bundle
+    data : Vec<uint<32>, 4>
+end struct Bundle
+
+test ScalarRhsTest
+    let dut : Top
+    run
+        let dst : Bundle
+        dst.data = 5
+    end run
+end test ScalarRhsTest
+"#;
+    let err = lower_src(src).expect_err("scalar RHS into whole-Vec field must be rejected");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("whole-`Vec` write of record field"),
+        "names the write: {msg}"
+    );
+    assert!(
+        msg.contains("non-matching RHS"),
+        "names the reason: {msg}"
+    );
+}
+
+/// A whole-`Vec` field copy whose RHS field has a MISMATCHED shape
+/// (different element width) must be rejected — the C++ `std::array`
+/// copy would be ill-typed.
+#[test]
+fn mismatched_shape_whole_vec_copy_is_rejected() {
+    let src = r#"
+struct Wide
+    data : Vec<uint<32>, 4>
+end struct Wide
+
+struct Narrow
+    data : Vec<uint<16>, 4>
+end struct Narrow
+
+test MismatchTest
+    let dut : Top
+    run
+        let w : Wide
+        let n : Narrow
+        n.data[0] = 1
+        w.data = n.data
+    end run
+end test MismatchTest
+"#;
+    let err = lower_src(src).expect_err("mismatched-shape whole-Vec copy must be rejected");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("non-matching RHS"),
+        "names the reason: {msg}"
+    );
+}
+
+/// The sanctioned whole-`Vec` field copy (`dst.data = src.data`, same
+/// element type and length) STILL lowers cleanly — the #443 feature is
+/// preserved. Lowers to a `RecordFieldWrite { index: None }` whose value
+/// is the matching whole-`Vec` `RecordField { index: None }` read.
+#[test]
+fn matching_whole_vec_field_copy_still_lowers() {
+    let src = r#"
+struct Bundle
+    data : Vec<uint<32>, 4>
+end struct Bundle
+
+test CopyTest
+    let dut : Top
+    run
+        let src : Bundle
+        let dst : Bundle
+        src.data[0] = 1
+        dst.data = src.data
+    end run
+end test CopyTest
+"#;
+    let prog = lower_src(src).expect("matching whole-Vec field copy lowers");
+    let found = prog
+        .functions
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.stmts)
+        .any(|s| {
+            matches!(
+                s,
+                ir::Stmt::RecordFieldWrite {
+                    index: None,
+                    value: ir::Expr::RecordField { index: None, .. },
+                    ..
+                }
+            )
+        });
+    assert!(
+        found,
+        "expected a whole-Vec RecordFieldWrite copy in the lowered body"
+    );
+}
+
 /// A `struct` and a `transaction` sharing a name would resolve
 /// ambiguously through `record_ids`; reject the collision.
 #[test]
@@ -3367,9 +3533,7 @@ end impl XtPassiveBackdoorTest
     let err = lower_src(src).unwrap_err();
     let msg = assert_unsupported(&err);
     assert!(
-        msg.contains("active_only")
-            && msg.contains("when active")
-            && msg.contains("outer"),
+        msg.contains("active_only") && msg.contains("when active") && msg.contains("outer"),
         "{msg}"
     );
 }
@@ -3497,9 +3661,7 @@ end impl XtMutualRecursionTest
     );
     let msg = err.to_string();
     assert!(
-        msg.contains("recursive method-call cycle")
-            && msg.contains("ping")
-            && msg.contains("pong"),
+        msg.contains("recursive method-call cycle") && msg.contains("ping") && msg.contains("pong"),
         "diagnostic should render the ping/pong cycle: {msg}"
     );
 }
@@ -5745,8 +5907,66 @@ end test ShadowPromote
     let prog = lower_src(src).expect("scope-aware promotion lets the outer read resolve");
     verify::verify_program(&prog).expect("verifies");
     let cpp = emit_cpp_src(src);
-    assert!(
-        cpp.contains("ShadowPromote"),
-        "emitted the test driver"
-    );
+    assert!(cpp.contains("ShadowPromote"), "emitted the test driver");
+}
+
+/// Issue #458 (same class as #452, closure-hook side): a test-scope `let`
+/// captured (bare, un-shadowed) by a method-hook body must still be promoted
+/// to a `_tb` host field even when an *unrelated nested* `let` of the same
+/// name shadows it elsewhere in the hook body. The old hook-promotion
+/// decision flattened every hook-body read and every hook-body decl into two
+/// order-free sets, so any nested same-named `let` suppressed promotion of
+/// the captured outer let — leaving the hook's bare read unresolved. The
+/// read-site lowering resolves an in-scope local first, so the inner shadow
+/// is handled without promotion; only the decision needed to be scope-aware.
+/// (Verified e2e: runs clean under both `--codegen v1` and tbir.)
+#[test]
+fn method_hook_let_promotes_despite_nested_shadow() {
+    let src = r#"
+transaction Op
+    value : uint<32>
+end transaction Op
+
+transactor Drv
+    dut : Top
+    when active
+        hookable send(t: Op)
+            dut.en = 1
+            wait 1 cycle
+            dut.en = 0
+        end send
+    end when
+end transactor Drv
+
+testbench HookShadowTb
+    dut : Top
+    drv : Drv active
+end testbench HookShadowTb
+
+impl HookLetShadowTest for HookShadowTb
+    let acc : uint<32> = 0
+
+    on drv.send post
+        acc = acc + t.value
+        if t.value == 7
+            let acc = 99
+            log(info, "inner acc=${acc}")
+        end if
+    end on
+
+    run
+        drv.dut = dut
+        let op : Op
+        op.value = 7
+        drv.send(op)
+        wait 1 cycle
+        assert acc == 7 else fail("acc=${acc}")
+    end run
+end impl HookLetShadowTest
+"#;
+    // Old behavior: the nested `let acc` suppressed promotion, so the hook's
+    // `acc` read failed to resolve (LowerError). With the scope-aware
+    // decision the outer `acc` is promoted and the hook lowers/verifies.
+    let prog = lower_src(src).expect("scope-aware hook promotion resolves the captured `acc`");
+    verify::verify_program(&prog).expect("verifies");
 }

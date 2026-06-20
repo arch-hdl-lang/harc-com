@@ -433,7 +433,8 @@ fn check_gated_bus_access(
     // `bus_bindings` (the binding's `field` is the bind name == flat signal
     // prefix == DUT port name). Buses with no gated signals at all are
     // skipped — they can never produce a gated-OFF access.
-    let mut gated: std::collections::HashMap<String, GatedBus<'_>> = std::collections::HashMap::new();
+    let mut gated: std::collections::HashMap<String, GatedBus<'_>> =
+        std::collections::HashMap::new();
     for tb in &prog.testbenches {
         for b in &tb.bus_bindings {
             if gated.contains_key(&b.field) {
@@ -532,8 +533,18 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
             for_each_port_in_expr(e, f);
         }
         DutRead(_, p) | ProbeRelease(p) => f(p),
+        // `RecordFieldWrite` carries an optional element `index` (`rec.f[i]
+        // = v`) — walk it too, so a gated DUT port nested in a write-index
+        // is scanned (#454). Today a write-index hoists to a `DutRead`, so
+        // this is defensive completeness; without it, any future inline
+        // write-index would silently escape the gated-port scan.
+        RecordFieldWrite { value, index, .. } => {
+            for_each_port_in_expr(value, f);
+            if let Some(idx) = index {
+                for_each_port_in_expr(idx, f);
+            }
+        }
         Assign(_, e)
-        | RecordFieldWrite { value: e, .. }
         | RecordWriteCb { value: e, .. }
         | TbFieldWrite { value: e, .. }
         | TransactorStateWrite { value: e, .. }
@@ -575,9 +586,7 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
 fn for_each_port_in_term(t: &ir::Terminator, f: &mut impl FnMut(&ir::PortRef)) {
     use ir::Terminator::*;
     match t {
-        Branch(e, _, _)
-        | WaitCycles(e, _, _)
-        | WaitCyclesSync(e, _) => for_each_port_in_expr(e, f),
+        Branch(e, _, _) | WaitCycles(e, _, _) | WaitCyclesSync(e, _) => for_each_port_in_expr(e, f),
         WaitUntil { preds, .. } => preds.iter().for_each(|p| for_each_port_in_expr(&p.expr, f)),
         WaitUntilTimeout { preds, cycles, .. } => {
             preds.iter().for_each(|p| for_each_port_in_expr(&p.expr, f));
@@ -589,7 +598,9 @@ fn for_each_port_in_term(t: &ir::Terminator, f: &mut impl FnMut(&ir::PortRef)) {
 }
 
 fn for_each_port_in_fmt(args: &ir::FmtArgs, f: &mut impl FnMut(&ir::PortRef)) {
-    args.args.iter().for_each(|a| for_each_port_in_expr(&a.expr, f));
+    args.args
+        .iter()
+        .for_each(|a| for_each_port_in_expr(&a.expr, f));
 }
 
 /// Invoke `f` on every `PortRef` in an expression tree. Parallels

@@ -1411,6 +1411,19 @@ fn method_param_ir_type(ty: Option<&TypeExpr>, ctx: &LowerCtx) -> IrType {
                 return IrType::RecordSeq(*rid);
             }
         }
+        // A scalar element (`TSeq<uint<N>>`/`<sint<N>>`/`<bool>`) parses as
+        // `TypeArg::Type(Builtin)` — not a record name — so type the param as
+        // `Seq(scalar)`, mirroring how `collect_tseq_records` types a
+        // scalar-element tseq result (#453). v1 renders both `RecordSeq` and
+        // `Seq` as `std::vector<T>`; only the element C++ type differs.
+        if let Some(TypeArg::Type(inner)) = args.first() {
+            match helpers::ir_type_of(Some(inner)) {
+                ty @ (IrType::UInt(_) | IrType::SInt(_) | IrType::Bool) => {
+                    return IrType::Seq(Box::new(ty));
+                }
+                _ => {}
+            }
+        }
         return IrType::Unknown;
     }
     // A component-typed parameter (`observe(addr, model: ProtocolModel)`):

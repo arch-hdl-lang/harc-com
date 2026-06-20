@@ -1043,11 +1043,7 @@ impl Checker<'_> {
                         ),
                     });
                 }
-                if let CallTarget::TransactorSelfMethod {
-                    transactor,
-                    method,
-                } = target
-                {
+                if let CallTarget::TransactorSelfMethod { transactor, method } = target {
                     self.errs.push(VerifyError::BadTransactorCall {
                         func: self.fid,
                         block: self.bid,
@@ -1077,17 +1073,9 @@ impl Checker<'_> {
             block: bid,
             detail,
         };
-        let Expr::Call(
-            CallTarget::TransactorSelfMethod {
-                transactor,
-                method,
-            },
-            args,
-        ) = call
-        else {
-            self.errs.push(bad(
-                "payload is not a TransactorSelfMethod call".to_string(),
-            ));
+        let Expr::Call(CallTarget::TransactorSelfMethod { transactor, method }, args) = call else {
+            self.errs
+                .push(bad("payload is not a TransactorSelfMethod call".to_string()));
             return;
         };
         for a in args {

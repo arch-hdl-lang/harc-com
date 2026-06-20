@@ -1,0 +1,68 @@
+// A `sequencer` whose hookable dispatch takes a SCALAR-element tseq as a
+// BY-VALUE parameter (`dispatch(xs: TSeq<uint<8>>)`) and iterates it with
+// `for x in xs`. The scalar analogue of the record-element sequencer
+// dispatch (axilite_connect_test's `dispatch(txns: TSeq<RegOp>)`).
+//
+// Before #453 the component-method param typer returned `IrType::Unknown`
+// for a scalar `TSeq<...>` param (→ `uint64_t`), so the param could not be
+// iterated — `for x in xs` was rejected. Now it types as `IrType::Seq`
+// (→ `std::vector<T>`), exactly like the record case types as `RecordSeq`.
+//
+// A `tseq` materializes the scalar stream; `env.sqr.dispatch(xs)` forwards
+// each element through a `connect` bridge into a scoreboard sink. The same
+// file passes under `--codegen v1` and `--codegen tbir`; the equivalence
+// harness trace-diffs the two.
+
+// Yields 10, 11, 12 (i + 10 for i in 0..2 inclusive).
+tseq Stream3() -> TSeq<uint<8>>
+    for i in 0 .. 2
+        yield i + 10
+    end for
+end tseq Stream3
+
+sequencer CountSeq
+    dispatched : out event<uint<8>>
+
+    // Scalar-element tseq param, iterated with `for x in xs` (#453).
+    hookable dispatch(xs: TSeq<uint<8>>)
+        for x in xs
+            emit dispatched(x)
+        end for
+    end dispatch
+end sequencer CountSeq
+
+scoreboard SeqSb
+    count : uint<32> default 0
+    sum   : uint<32> default 0
+
+    hookable sink(v: uint<8>)
+        count = count + 1
+        sum = sum + v
+    end sink
+end scoreboard SeqSb
+
+env SeqEnv
+    sqr : CountSeq
+    sb  : SeqSb
+
+    connect
+        sqr.dispatched -> sb.sink
+    end connect
+end env SeqEnv
+
+test SequencerTseqScalarParamTest
+    let dut : Top
+    let env : SeqEnv
+
+    run
+        let xs = Stream3()        // [10, 11, 12]
+        env.sqr.dispatch(xs)
+
+        assert env.sb.count == 3
+            else fail("dispatched ${env.sb.count} scalars, expected 3")
+        assert env.sb.sum == 33   // 10 + 11 + 12
+            else fail("scalar sum=${env.sb.sum}, expected 33")
+
+        log(info, "PASS: scalar TSeq sequencer-dispatch param iterated ${env.sb.count} items")
+    end run
+end test SequencerTseqScalarParamTest
