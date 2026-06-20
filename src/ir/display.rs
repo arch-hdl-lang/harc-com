@@ -434,8 +434,16 @@ fn type_str(t: &IrType) -> String {
 fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
     match s {
         Stmt::Assign(l, e) => format!("Assign({}, {})", local_str(func, *l), expr_str(func, e)),
-        Stmt::DutWrite(p, e) => format!("DutWrite({}, {})", port_str(Some(func), p), expr_str(func, e)),
-        Stmt::DutRead(l, p) => format!("DutRead({}, {})", local_str(func, *l), port_str(Some(func), p)),
+        Stmt::DutWrite(p, e) => format!(
+            "DutWrite({}, {})",
+            port_str(Some(func), p),
+            expr_str(func, e)
+        ),
+        Stmt::DutRead(l, p) => format!(
+            "DutRead({}, {})",
+            local_str(func, *l),
+            port_str(Some(func), p)
+        ),
         Stmt::ProbeRelease(p) => format!("ProbeRelease({})", port_str(Some(func), p)),
         Stmt::RecordInit(l, r) => format!("RecordInit({}, r{})", local_str(func, *l), r.0),
         Stmt::RecordFieldWrite {
@@ -924,10 +932,7 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
                 CallTarget::TransactorMethod { bus_field, method } => {
                     format!("{bus_field}.{method}")
                 }
-                CallTarget::TransactorSelfMethod {
-                    transactor,
-                    method,
-                } => {
+                CallTarget::TransactorSelfMethod { transactor, method } => {
                     format!("self:{transactor}.{method}")
                 }
                 CallTarget::Tseq(n) => format!("tseq:{n}"),

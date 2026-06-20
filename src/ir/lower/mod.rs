@@ -2869,17 +2869,21 @@ fn lower_test(
                 xschema.name
             )));
         }
-        // Captured run-scope lets referenced (bare) in the hook body,
-        // minus the hook's OWN locals (which shadow a same-named test let).
-        let mut captured = HashSet::new();
-        collect_idents_in_block(&h.body, &mut captured);
-        let mut hook_locals = HashSet::new();
-        collect_local_decls_in_block(&h.body, &mut hook_locals);
-        for name in &captured {
-            if test_let_names.contains(name) && !hook_locals.contains(name) {
-                promoted_lets.insert(name.clone());
+        // Promote a captured run-scope `let` read (bare, un-shadowed) in the
+        // hook body. Scope-aware (issue #458, same class as #452): an inner
+        // same-named `let` shadows only its own lexical scope — the read-site
+        // lowering resolves an in-scope local first — so a nested shadow must
+        // not suppress a genuine top-level capture. The hook also sees the
+        // firing method's args by the same names, so seed the scope with the
+        // method's param names (a test-let sharing a param name resolves to
+        // the param, not the promoted cell).
+        let mut hook_scope = HashSet::new();
+        if let Some(m) = xschema.method(&method) {
+            for p in &prog.function(m.function).params {
+                hook_scope.insert(p.name.clone());
             }
         }
+        collect_promotable_check_reads(&h.body, &test_let_names, &hook_scope, &mut promoted_lets);
         resolved_hooks.push((xid, method, *side, h));
     }
     // Resolve `on regs.REG` per-register write callbacks against the
@@ -2911,16 +2915,13 @@ fn lower_test(
             )));
         }
         // A callback body may capture run-scope lets too (host-state
-        // promotion, same as method hooks), minus its own locals.
-        let mut captured = HashSet::new();
-        collect_idents_in_block(&h.body, &mut captured);
-        let mut hook_locals = HashSet::new();
-        collect_local_decls_in_block(&h.body, &mut hook_locals);
-        for name in &captured {
-            if test_let_names.contains(name) && !hook_locals.contains(name) {
-                promoted_lets.insert(name.clone());
-            }
-        }
+        // promotion, same as method hooks). Scope-aware (issue #458): a
+        // nested same-named `let` must not suppress a genuine top-level
+        // capture. The callback sees a single `data` param (the observed
+        // write value), so seed the scope with it.
+        let mut cb_scope = HashSet::new();
+        cb_scope.insert("data".to_string());
+        collect_promotable_check_reads(&h.body, &test_let_names, &cb_scope, &mut promoted_lets);
         resolved_reg_cbs.push((binding, reg, h));
     }
     // Check-phase host-state promotion: a test-scope `let` that is read
@@ -3447,112 +3448,11 @@ fn resolve_method_hook_target(event: &crate::ast::Expr) -> Option<(String, Strin
     }
 }
 
-/// Collect every bare identifier name read anywhere in a block (used to
-/// find the test-scope `let`s a closure-hook body captures by reference).
-/// Over-approximates harmlessly: a name that is also a hook-body local
-/// or a method param is still a test-scope let only if it appears in
-/// `test_let_names` (checked by the caller), so a false positive there is
-/// impossible — the intersection with the let set is what promotes.
-fn collect_idents_in_block(b: &Block, out: &mut HashSet<String>) {
-    for s in &b.stmts {
-        collect_idents_in_stmt(s, out);
-    }
-}
-
-fn collect_idents_in_stmt(s: &AstStmt, out: &mut HashSet<String>) {
-    use crate::ast::CallArg;
-    match &s.kind {
-        StmtKind::Let(l) => {
-            if let Some(v) = &l.value {
-                collect_idents_in_expr(v, out);
-            }
-        }
-        StmtKind::Assign { target, value } | StmtKind::Send { target, value } => {
-            collect_idents_in_expr(target, out);
-            collect_idents_in_expr(value, out);
-        }
-        StmtKind::Expr(e) => collect_idents_in_expr(e, out),
-        StmtKind::For(f) => {
-            collect_idents_in_expr(&f.iter, out);
-            collect_idents_in_block(&f.body, out);
-        }
-        StmtKind::Repeat(r) => {
-            collect_idents_in_expr(&r.count, out);
-            collect_idents_in_block(&r.body, out);
-        }
-        StmtKind::Loop(b) => collect_idents_in_block(b, out),
-        StmtKind::While { cond, body, .. } => {
-            collect_idents_in_expr(cond, out);
-            collect_idents_in_block(body, out);
-        }
-        StmtKind::If(ifs) => {
-            collect_idents_in_expr(&ifs.cond, out);
-            collect_idents_in_block(&ifs.then_block, out);
-            for (c, b) in &ifs.elsifs {
-                collect_idents_in_expr(c, out);
-                collect_idents_in_block(b, out);
-            }
-            if let Some(b) = &ifs.else_block {
-                collect_idents_in_block(b, out);
-            }
-        }
-        StmtKind::On(h) => {
-            collect_idents_in_expr(&h.event, out);
-            collect_idents_in_block(&h.body, out);
-        }
-        StmtKind::Assert(v) | StmtKind::Assume(v) | StmtKind::Cover(v) => {
-            if let Some(e) = &v.expr {
-                collect_idents_in_expr(e, out);
-            }
-            if let Some(e) = &v.else_fail {
-                collect_idents_in_expr(e, out);
-            }
-        }
-        StmtKind::Log { args, .. } | StmtKind::LogF { args, .. } => {
-            for a in args {
-                match a {
-                    CallArg::Expr(e) | CallArg::Named { value: e, .. } => {
-                        collect_idents_in_expr(e, out)
-                    }
-                }
-            }
-        }
-        StmtKind::Return(opt) => {
-            if let Some(e) = opt {
-                collect_idents_in_expr(e, out);
-            }
-        }
-        StmtKind::Yield(e) | StmtKind::Release(e) => collect_idents_in_expr(e, out),
-        StmtKind::Wait { duration, .. } => collect_idents_in_expr(duration, out),
-        StmtKind::WaitUntil { conditions, .. } => {
-            for c in conditions {
-                collect_idents_in_expr(c, out);
-            }
-        }
-        // Remaining statement shapes never appear inside a closure-hook
-        // body in this subset (fork/parallel/schedule/select/after/
-        // randomize/emit). A future shape that does will simply not have
-        // its idents collected — promotion would then miss a capture and
-        // the hook lowering would reject the unresolved name precisely,
-        // never silently miscompile.
-        _ => {}
-    }
-}
-
-/// Names declared by `let` anywhere in a block (including nested
-/// blocks + loop induction vars). Used to subtract a hook body's OWN
-/// locals from its captured-ident set, so a hook-local that happens to
-/// share a name with a test-scope `let` is not mistakenly promoted.
-fn collect_local_decls_in_block(b: &Block, out: &mut HashSet<String>) {
-    for s in &b.stmts {
-        collect_local_decls_in_stmt(s, out);
-    }
-}
-
-/// Scope-aware companion to `collect_idents_in_block` for check-phase
-/// host-state promotion (issue #452). Collects the test-scope `let` names
-/// (those in `test_let_names`) that have at least one bare read in this
-/// block which is NOT lexically shadowed by an inner same-named `let`.
+/// Scope-aware reader-collection for check-phase / closure-hook
+/// host-state promotion (issues #452 and #458). Collects the test-scope
+/// `let` names (those in `test_let_names`) that have at least one bare read
+/// in this block which is NOT lexically shadowed by an inner same-named
+/// `let`.
 ///
 /// `in_scope` carries the names declared in enclosing scopes (and, for a
 /// nested block, the enclosing block's earlier decls); a fresh copy is
@@ -3560,11 +3460,11 @@ fn collect_local_decls_in_block(b: &Block, out: &mut HashSet<String>) {
 /// effect only for reads that follow it (point-of-declaration), e.g. the
 /// RHS of `let acc = acc + 1` still reads the outer `acc`.
 ///
-/// This is the read-collection counterpart to `collect_idents_in_block` —
-/// it mirrors that function's statement coverage exactly, but checks each
-/// read against the live scope rather than flattening every read and every
-/// decl into two order-free sets (which conflated a top-level outer read
-/// with an unrelated nested shadow).
+/// Statement coverage mirrors the AST read positions (the same set a flat
+/// ident-collector would visit), but each read is checked against the live
+/// scope rather than flattening every read and every decl into two
+/// order-free sets — the old approach conflated a top-level outer read with
+/// an unrelated nested shadow.
 fn collect_promotable_check_reads(
     b: &Block,
     test_let_names: &HashSet<String>,
@@ -3679,35 +3579,9 @@ fn collect_promotable_check_reads_in_stmt(
                 note_promotable_reads_in_expr(c, test_let_names, scope, out);
             }
         }
-        // Mirrors the `_ => {}` tail of `collect_idents_in_stmt`: any
-        // statement shape not handled there is not a promotion read site in
-        // this subset; a future shape that becomes one must be added to both.
-        _ => {}
-    }
-}
-
-fn collect_local_decls_in_stmt(s: &AstStmt, out: &mut HashSet<String>) {
-    match &s.kind {
-        StmtKind::Let(l) => {
-            out.insert(l.name.name.clone());
-        }
-        StmtKind::For(f) => {
-            out.insert(f.var.name.clone());
-            collect_local_decls_in_block(&f.body, out);
-        }
-        StmtKind::Repeat(r) => collect_local_decls_in_block(&r.body, out),
-        StmtKind::Loop(b) => collect_local_decls_in_block(b, out),
-        StmtKind::While { body, .. } => collect_local_decls_in_block(body, out),
-        StmtKind::If(ifs) => {
-            collect_local_decls_in_block(&ifs.then_block, out);
-            for (_, b) in &ifs.elsifs {
-                collect_local_decls_in_block(b, out);
-            }
-            if let Some(b) = &ifs.else_block {
-                collect_local_decls_in_block(b, out);
-            }
-        }
-        StmtKind::On(h) => collect_local_decls_in_block(&h.body, out),
+        // Any statement shape not handled above is not a promotion read
+        // site in this subset (fork/parallel/schedule/select/randomize/
+        // emit). A future shape that becomes one must be added here.
         _ => {}
     }
 }
@@ -5087,8 +4961,7 @@ fn fill_initiator_bus_prefix(
                             );
                         }
                     }
-                    Stmt::TransactorCall { call, .. }
-                    | Stmt::TransactorSelfCall { call, .. } => {
+                    Stmt::TransactorCall { call, .. } | Stmt::TransactorSelfCall { call, .. } => {
                         visit_expr(call, placeholder, binding, remap, rewrite, &mut conflict)
                     }
                     Stmt::ScoreboardOp { op, .. } => match op {

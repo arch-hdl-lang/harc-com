@@ -167,9 +167,7 @@ fn cover_expr_cpp(e: &Expr, lanes: &HashMap<String, u32>) -> Result<String, Emit
                     };
                     match cover_lane_width(lanes, p) {
                         Some(w) => {
-                            format!(
-                                "harc_rt::harc_vec_lane_read<{w}>({sig}, (std::size_t)({idx}))"
-                            )
+                            format!("harc_rt::harc_vec_lane_read<{w}>({sig}, (std::size_t)({idx}))")
                         }
                         None => format!("{sig}[{idx}]"),
                     }
