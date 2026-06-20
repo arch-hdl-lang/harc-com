@@ -1079,6 +1079,10 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     }
     prog.constraint_sites = constraint_sites.into_inner();
     reject_recursive_transactor_methods(&prog)?;
+    // Resolve hook-triggered covergroups (`covergroup G @(drv.send(t) post)`)
+    // now that transactor method tables exist; records the subscription
+    // on the target method's `cov_hook_subs`.
+    crate::ir::passes::covergroup_hooks::run(&mut prog)?;
     Ok(prog)
 }
 

@@ -19,11 +19,18 @@ pub(crate) fn lower_covergroup(g: &CovergroupDecl) -> Result<CovgroupSchema, Low
     // tick. Mirror that: `@(posedge dut.clk)` and a missing trigger
     // both lower to `PosedgeDutClk`; hook triggers are post-MVP.
     let trigger = match &g.trigger {
-        Some(CoverTrigger::Hook { .. }) => {
-            return Err(unsupported(
-                &format!("covergroup `{}` hook triggers", g.name.name),
-                "",
-            ));
+        Some(CoverTrigger::Hook { call, side }) => {
+            // Covergroup schemas lower before the testbench/transactor
+            // tables exist, so the hook target cannot be resolved here.
+            // Stash the receiver field-access path + method name; the
+            // `covergroup_hooks` pass resolves it once transactors are
+            // lowered (mirrors v1's late covergroup-hook registration).
+            let (receiver_path, method) = lower_hook_call(&g.name.name, call)?;
+            CovTrigger::Hook {
+                receiver_path,
+                method,
+                side: *side,
+            }
         }
         Some(CoverTrigger::Clock(_)) | None => CovTrigger::PosedgeDutClk,
     };
@@ -108,6 +115,53 @@ pub(crate) fn lower_covergroup(g: &CovergroupDecl) -> Result<CovgroupSchema, Low
         points,
         crosses,
     })
+}
+
+/// Extract `(receiver_path, method_name)` from a covergroup hook
+/// trigger call `recv.path.method(args)`. The args were already
+/// validated to be bare identifiers by the parser
+/// (`validate_cover_hook_trigger`); the receiver path is resolved later
+/// by the `covergroup_hooks` pass. Returns the field-access path
+/// leading to the method (e.g. `["drv"]` for `drv.send(t)`).
+fn lower_hook_call(group: &str, call: &AstExpr) -> Result<(Vec<String>, String), LowerError> {
+    let ExprKind::Call { callee, .. } = &*call.kind else {
+        return Err(unsupported(
+            &format!("covergroup `{group}` hook trigger must be a method call"),
+            "",
+        ));
+    };
+    let ExprKind::Field { target, name } = &*callee.kind else {
+        return Err(unsupported(
+            &format!("covergroup `{group}` hook trigger must be `<obj>.<method>(args)`"),
+            "",
+        ));
+    };
+    let method = name.name.clone();
+    let mut path: Vec<String> = Vec::new();
+    let mut cur: &AstExpr = target;
+    loop {
+        match &*cur.kind {
+            ExprKind::Paren(inner) => cur = inner,
+            ExprKind::Field { target: inner, name } => {
+                path.push(name.name.clone());
+                cur = inner;
+            }
+            ExprKind::Ident(id) => {
+                path.push(id.name.clone());
+                break;
+            }
+            _ => {
+                return Err(unsupported(
+                    &format!(
+                        "covergroup `{group}` hook trigger receiver must be a field-access path"
+                    ),
+                    "",
+                ))
+            }
+        }
+    }
+    path.reverse();
+    Ok((path, method))
 }
 
 /// A cover-point target is a pure DUT-bound scalar expression. Keep this

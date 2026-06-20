@@ -6,5 +6,6 @@
 //! either annotate the IR, mutate it, or return a side-table; every
 //! mutating pass must leave the program `verify`-clean.
 
+pub mod covergroup_hooks;
 pub mod lower_coroutine;
 pub mod placement;

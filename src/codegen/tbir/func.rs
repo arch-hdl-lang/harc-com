@@ -1769,6 +1769,28 @@ pub(super) fn emit_method(
     for fid in &m.pre_hooks {
         writeln!(out, "{pad1}{}({hook_args});", prog.function(*fid).name).ok();
     }
+    // Hook-vector fan-out for hook-triggered covergroups
+    // (`covergroup G @(drv.send(t) pre)`): fire the `<Type>_<method>_pre`
+    // subscribers before the body, with the method's args. The vector is
+    // only declared when `cov_hook_subs` is non-empty, so guard the
+    // fan-out the same way (v1's `emit_hook_vectors` + fan-out). `pre`
+    // and `post` subscribers are partitioned by side.
+    let has_pre_cov = m
+        .cov_hook_subs
+        .iter()
+        .any(|(_, s)| matches!(s, crate::ast::HookSide::Pre));
+    let has_post_cov = m
+        .cov_hook_subs
+        .iter()
+        .any(|(_, s)| matches!(s, crate::ast::HookSide::Post));
+    if has_pre_cov {
+        writeln!(
+            out,
+            "{pad1}for (auto& _h : {}_{}_pre) _h({hook_args});",
+            schema.name, m.name
+        )
+        .ok();
+    }
     writeln!(out, "{pad1}int __bb = {};", func.entry.0).ok();
     writeln!(out, "{pad1}while (true) {{").ok();
     writeln!(out, "{pad2}switch (__bb) {{").ok();
@@ -1821,6 +1843,16 @@ pub(super) fn emit_method(
                 // so firing at every void return matches v1 exactly.
                 for fid in &m.post_hooks {
                     writeln!(out, "{pad3}{}({hook_args});", prog.function(*fid).name).ok();
+                }
+                // Hook-vector fan-out for hook-triggered covergroups
+                // sampled on this method's `post` boundary.
+                if has_post_cov {
+                    writeln!(
+                        out,
+                        "{pad3}for (auto& _h : {}_{}_post) _h({hook_args});",
+                        schema.name, m.name
+                    )
+                    .ok();
                 }
                 match func.ret {
                     Some(r) => {

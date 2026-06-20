@@ -365,6 +365,15 @@ pub struct TransactorMethodSchema {
     /// Test-scope `on <obj>.<method> post` hook bodies — fired AFTER the
     /// body. See `pre_hooks`.
     pub post_hooks: Vec<FunctionId>,
+    /// Covergroup auto-samplers that subscribe to this method's pre/post
+    /// hook boundary (`covergroup G @(drv.send(t) post)`). Populated by
+    /// the `covergroup_hooks` pass after transactors are lowered. Each
+    /// entry names the covergroup to sample and which side fires it.
+    /// When non-empty, the tbir backend emits the `<Type>_<method>_pre`/
+    /// `_post` hook-vector spine and fans it out at the method body (v1's
+    /// `emit_hook_vectors` + fan-out), and the cov field registers its
+    /// sample closure onto that vector instead of `_checkers`.
+    pub cov_hook_subs: Vec<(CovgroupId, crate::ast::HookSide)>,
 }
 
 impl TransactorSchema {
@@ -1960,9 +1969,27 @@ pub struct CovgroupSchema {
     pub crosses: Vec<CoverCrossSchema>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CovTrigger {
     PosedgeDutClk,
+    /// Sample on a hookable transactor method's pre/post boundary instead
+    /// of per primary-clock tick: `covergroup G @(drv.send(t) post)`.
+    /// At lowering the target is UNRESOLVED — covergroup schemas lower
+    /// before the testbench/transactor tables exist, so only the
+    /// receiver field-access path and method name are stashed. The
+    /// `covergroup_hooks` pass resolves `receiver_path` against the
+    /// testbench's transactor fields after transactors are lowered and
+    /// fills in `method` on the matching `TransactorMethodSchema`'s
+    /// `cov_hook_subs`. Mirrors v1's late covergroup-hook registration.
+    Hook {
+        /// Field-access path of the call receiver, e.g. `["drv"]` for
+        /// `drv.send(...)`. Resolved by the late pass.
+        receiver_path: Vec<String>,
+        /// The hookable method name (`send`).
+        method: String,
+        /// `pre` fires before the method body, `post` after.
+        side: crate::ast::HookSide,
+    },
 }
 
 #[derive(Debug, Clone)]

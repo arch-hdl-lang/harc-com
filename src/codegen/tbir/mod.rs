@@ -1257,6 +1257,23 @@ fn emit_test(
         writeln!(out, "{INDENT}{mirror_ty} {}{{}};", b.field).ok();
         writeln!(out, "{INDENT}uint32_t {}_cb_depth = 0;", b.field).ok();
     }
+    // Hook-vector spine for hook-triggered covergroups
+    // (`covergroup G @(drv.send(t) post)`). One
+    // `std::vector<std::function<void(args)>> <Type>_<method>_pre/_post`
+    // per transactor method that any cov field subscribes to, declared
+    // here so both the cov sample-closure push (below) and the method
+    // fan-out (`emit_method`) reach the same vectors by `[&]` capture.
+    // Mirrors v1's `emit_hook_vectors`. Only methods used by THIS
+    // testbench's transactor fields are declared.
+    for (_field, xid) in &tb.transactor_fields {
+        let schema = prog.transactor(*xid);
+        for m in &schema.methods {
+            if m.cov_hook_subs.is_empty() {
+                continue;
+            }
+            covergroup::hook_vector_decls(out, prog, schema, m, INDENT)?;
+        }
+    }
     // Covergroup auto-sampler registration, in testbench-field
     // declaration order — the same `_checkers` slot v1 uses, so
     // sampling happens at the identical point in the cycle. Lowering
@@ -1288,12 +1305,46 @@ fn emit_test(
                 sampler.name, covgroup.0, cg.0
             )));
         }
-        covergroup::sampler_registration(
-            out,
-            &prog.covgroups[cg.index()],
-            &format!("_tb.{field}"),
-            &opts.vec_lane_widths,
-        )?;
+        let schema = &prog.covgroups[cg.index()];
+        match &schema.trigger {
+            ir::CovTrigger::PosedgeDutClk => {
+                covergroup::sampler_registration(
+                    out,
+                    schema,
+                    &format!("_tb.{field}"),
+                    &opts.vec_lane_widths,
+                )?;
+            }
+            ir::CovTrigger::Hook { method, side, .. } => {
+                // Resolve the target method (the `covergroup_hooks` pass
+                // already validated it) to learn its param signature, then
+                // push the sample closure onto `<Type>_<method>_<side>`.
+                let (xschema, mschema) = tb
+                    .transactor_fields
+                    .iter()
+                    .find_map(|(_f, xid)| {
+                        let xs = prog.transactor(*xid);
+                        xs.method(method).map(|m| (xs, m))
+                    })
+                    .ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: hook-triggered covergroup `{}` references method \
+                             `{method}` not found on any transactor field",
+                            schema.name
+                        ))
+                    })?;
+                covergroup::hook_sampler_registration(
+                    out,
+                    prog,
+                    schema,
+                    xschema,
+                    mschema,
+                    *side,
+                    &format!("_tb.{field}"),
+                    &opts.vec_lane_widths,
+                )?;
+            }
+        }
     }
     // tseq generator lambdas — one `<Name>` per `tseq` declaration in the
     // file, declared before the run coroutine so its `[&]` capture sees
