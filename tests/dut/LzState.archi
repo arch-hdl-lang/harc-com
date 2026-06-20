@@ -1,0 +1,9 @@
+enum LzState
+  TOKEN;
+  EXTRA_LL;
+  LITERAL;
+  OFFS_LO;
+  OFFS_HI;
+  EXTRA_ML;
+  COPY;
+end enum LzState

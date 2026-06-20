@@ -1,0 +1,12 @@
+module Lz4Decomp
+  port clk: in Clock<SysDomain>;
+  port rst: in Reset<Sync>;
+  port in_valid: in Bool;
+  port in_data: in UInt<8>;
+  port in_last: in Bool;
+  port in_ready: out Bool comb_dep_on(out_ready);
+  port out_valid: out Bool comb_dep_on(in_valid);
+  port out_data: out UInt<8> comb_dep_on(in_data);
+  port out_ready: in Bool;
+  port out_last: out Bool comb_dep_on(in_valid, out_ready);
+end module Lz4Decomp

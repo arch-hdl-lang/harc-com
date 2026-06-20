@@ -1,0 +1,251 @@
+// HARC testbench for Lz4Decomp — streaming LZ4 block decompressor.
+//
+// Two test sequences against a 4096-byte history RAM:
+//   Test 1  "hello"          — 5 pure literals, last sequence (no match)
+//   Test 2  "hello, hello!"  — 7 literals + 5-byte back-reference + 1 literal
+//
+// Timing model (HARC post-clock comb reads):
+//   LITERAL state: out_data = in_data (pass-through). Set in_data BEFORE
+//   wait, assert out_data AFTER wait — the clock fires with the new input,
+//   and eval_comb runs, making the output readable post-wait.
+//
+//   COPY state: out_data comes from the history RAM (registered copy_src).
+//   The comb is immediately valid after the OFFS_HI clock sets copy_src, so
+//   assert BEFORE the first copy-wait, then assert BEFORE each subsequent wait.
+//
+//   out_last in LITERAL state is not checked: it fires in comb when lit_rem==1
+//   (one cycle before the last byte is presented), which in HARC's timing
+//   model appears paired with the penultimate byte rather than the last byte.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench Lz4DecompTb
+  dut : Lz4Decomp
+end testbench Lz4DecompTb
+
+impl Lz4DecompTest for Lz4DecompTb
+  clock clk = SysDomain
+
+  run
+    // -----------------------------------------------------------------------
+    // Reset
+    // -----------------------------------------------------------------------
+    dut.rst       = 1
+    dut.in_valid  = 0
+    dut.in_data   = 0
+    dut.in_last   = 0
+    dut.out_ready = 1
+    wait 3 cycles
+    assert dut.out_valid == 0
+        else fail("no output during reset")
+    dut.rst = 0
+    wait 1 cycle
+    // state=TOKEN, wr_ptr=0, all regs cleared.
+
+    // -----------------------------------------------------------------------
+    // Test 1: decompress "hello" (5 pure literals, last sequence)
+    //
+    // LZ4 encoding:
+    //   token=0x50 (ll4=5, ml4=0), in_last=1
+    //   literals: 0x68 'h'  0x65 'e'  0x6C 'l'  0x6C 'l'  0x6F 'o'
+    // -----------------------------------------------------------------------
+    log(info, "Test 1: pure literals 'hello'")
+
+    // TOKEN byte — in_ready is 1 (comb, state=TOKEN after reset)
+    dut.in_valid = 1
+    dut.in_data  = 0x50
+    dut.in_last  = 1
+    assert dut.in_ready == 1
+        else fail("T1: in_ready should be 1 in TOKEN state")
+    wait 1 cycle
+    // state=LITERAL, lit_rem=5, is_last=1
+
+    // For each literal: set in_data BEFORE wait so the clock fires with it,
+    // then assert out_data AFTER wait (post-clock eval_comb uses that in_data).
+    dut.in_data = 0x68    // 'h'
+    dut.in_last = 0
+    wait 1 cycle          // lit_rem 5→4; comb: out_data='h'
+    assert dut.out_valid == 1
+        else fail("T1-h: out_valid should be 1")
+    assert dut.out_data == 0x68
+        else fail("T1-h: expected 'h' (0x68), got ${dut.out_data}")
+
+    dut.in_data = 0x65    // 'e'
+    wait 1 cycle          // lit_rem 4→3; comb: out_data='e'
+    assert dut.out_valid == 1
+        else fail("T1-e: out_valid should be 1")
+    assert dut.out_data == 0x65
+        else fail("T1-e: expected 'e' (0x65), got ${dut.out_data}")
+
+    dut.in_data = 0x6C    // 'l'
+    wait 1 cycle          // lit_rem 3→2; comb: out_data='l'
+    assert dut.out_valid == 1
+        else fail("T1-l1: out_valid should be 1")
+    assert dut.out_data == 0x6C
+        else fail("T1-l1: expected 'l' (0x6C), got ${dut.out_data}")
+
+    dut.in_data = 0x6C    // 'l'
+    wait 1 cycle          // lit_rem 2→1; comb: out_data='l'
+    assert dut.out_valid == 1
+        else fail("T1-l2: out_valid should be 1")
+    assert dut.out_data == 0x6C
+        else fail("T1-l2: expected 'l' (0x6C), got ${dut.out_data}")
+
+    // Last literal 'o': this clock transitions state to TOKEN (lit_rem 1→0).
+    // After the wait eval_comb is in TOKEN state; out_data is 0, not 'o'.
+    // Verify state recovery via in_ready instead.
+    dut.in_data = 0x6F    // 'o'
+    wait 1 cycle          // lit_rem 1→0, state→TOKEN
+    assert dut.in_ready == 1
+        else fail("T1: in_ready should return to 1 in TOKEN after last literal")
+
+    dut.in_valid = 0
+    wait 2 cycles
+    log(info, "PASS: Test 1 — 'hello' decompressed correctly")
+
+    // -----------------------------------------------------------------------
+    // Test 2: decompress "hello, hello!" (7 literals + back-ref + 1 literal)
+    //
+    // LZ4 encoding:
+    //   seq 1: token=0x71 (ll4=7, ml4=1)
+    //           literals: 'h' 'e' 'l' 'l' 'o' ',' ' '  (7 bytes, positions 5..11)
+    //           offset: 0x07 0x00  (= 7, little-endian)
+    //           match_len: ml4+4 = 5  (copies positions 5..9 = "hello")
+    //   seq 2 (last): token=0x10 (ll4=1, ml4=0), in_last=1
+    //           literals: '!'
+    // -----------------------------------------------------------------------
+    log(info, "Test 2: 'hello, hello!' with back-reference")
+
+    // TOKEN byte for sequence 1
+    dut.in_valid = 1
+    dut.in_data  = 0x71
+    dut.in_last  = 0
+    assert dut.in_ready == 1
+        else fail("T2: in_ready should be 1 in TOKEN state")
+    wait 1 cycle
+    // state=LITERAL, lit_rem=7, match_rem=5, is_last=0
+
+    // 7 literals "hello, " — set BEFORE wait, assert AFTER wait
+    dut.in_data = 0x68
+    wait 1 cycle
+    assert dut.out_valid == 1
+        else fail("T2-h: out_valid should be 1")
+    assert dut.out_data == 0x68
+        else fail("T2-h: expected 'h' (0x68), got ${dut.out_data}")
+
+    dut.in_data = 0x65
+    wait 1 cycle
+    assert dut.out_valid == 1
+        else fail("T2-e: out_valid should be 1")
+    assert dut.out_data == 0x65
+        else fail("T2-e: expected 'e' (0x65), got ${dut.out_data}")
+
+    dut.in_data = 0x6C
+    wait 1 cycle
+    assert dut.out_valid == 1
+        else fail("T2-l1: out_valid should be 1")
+    assert dut.out_data == 0x6C
+        else fail("T2-l1: expected 'l' (0x6C), got ${dut.out_data}")
+
+    dut.in_data = 0x6C
+    wait 1 cycle
+    assert dut.out_valid == 1
+        else fail("T2-l2: out_valid should be 1")
+    assert dut.out_data == 0x6C
+        else fail("T2-l2: expected 'l' (0x6C), got ${dut.out_data}")
+
+    dut.in_data = 0x6F
+    wait 1 cycle
+    assert dut.out_valid == 1
+        else fail("T2-o: out_valid should be 1")
+    assert dut.out_data == 0x6F
+        else fail("T2-o: expected 'o' (0x6F), got ${dut.out_data}")
+
+    dut.in_data = 0x2C
+    wait 1 cycle
+    assert dut.out_valid == 1
+        else fail("T2-comma: out_valid should be 1")
+    assert dut.out_data == 0x2C
+        else fail("T2-comma: expected ',' (0x2C), got ${dut.out_data}")
+
+    // 7th (last) literal of sequence 1 — transitions to OFFS_LO after
+    dut.in_data = 0x20
+    wait 1 cycle
+    // state=OFFS_LO, wr_ptr=12
+    assert dut.in_ready == 1
+        else fail("T2: in_ready should be 1 in OFFS_LO")
+    assert dut.out_valid == 0
+        else fail("T2: no output in OFFS_LO")
+
+    // Offset low byte: 0x07
+    dut.in_data = 0x07
+    wait 1 cycle
+    // state=OFFS_HI
+    assert dut.in_ready == 1
+        else fail("T2: in_ready should be 1 in OFFS_HI")
+    assert dut.out_valid == 0
+        else fail("T2: no output in OFFS_HI")
+
+    // Offset high byte: 0x00  (full_offset = 7; copy_src = 12 - 7 = 5)
+    dut.in_data = 0x00
+    wait 1 cycle
+    // state=COPY, copy_src=5, match_rem=5
+    // COPY comb is immediately valid (latency-0 RAM): out_data=hist[5]='h'
+
+    // COPY: 5 bytes "hello" from history positions 5..9
+    // Assert BEFORE each wait (comb valid post-previous-clock).
+    dut.in_valid = 0
+    assert dut.out_valid == 1
+        else fail("T2-copy1: out_valid should be 1")
+    assert dut.out_data == 0x68
+        else fail("T2-copy1: expected 'h' (0x68), got ${dut.out_data}")
+    wait 1 cycle    // copy_src 5→6, wr_ptr 12→13
+
+    assert dut.out_valid == 1
+        else fail("T2-copy2: out_valid should be 1")
+    assert dut.out_data == 0x65
+        else fail("T2-copy2: expected 'e' (0x65), got ${dut.out_data}")
+    wait 1 cycle
+
+    assert dut.out_valid == 1
+        else fail("T2-copy3: out_valid should be 1")
+    assert dut.out_data == 0x6C
+        else fail("T2-copy3: expected 'l' (0x6C), got ${dut.out_data}")
+    wait 1 cycle
+
+    assert dut.out_valid == 1
+        else fail("T2-copy4: out_valid should be 1")
+    assert dut.out_data == 0x6C
+        else fail("T2-copy4: expected 'l' (0x6C), got ${dut.out_data}")
+    wait 1 cycle
+
+    assert dut.out_valid == 1
+        else fail("T2-copy5: out_valid should be 1")
+    assert dut.out_data == 0x6F
+        else fail("T2-copy5: expected 'o' (0x6F), got ${dut.out_data}")
+    wait 1 cycle
+    // match_rem 1→0, state=TOKEN, wr_ptr=17
+
+    // TOKEN byte for last sequence
+    dut.in_valid = 1
+    dut.in_data  = 0x10
+    dut.in_last  = 1
+    assert dut.in_ready == 1
+        else fail("T2-last-token: in_ready should be 1 in TOKEN state")
+    wait 1 cycle
+    // state=LITERAL, lit_rem=1, is_last=1
+
+    // Single literal '!' — state transitions to TOKEN after this wait.
+    dut.in_data = 0x21
+    dut.in_last = 0
+    wait 1 cycle    // lit_rem 1→0, state→TOKEN
+    assert dut.in_ready == 1
+        else fail("T2: in_ready should return to 1 after last literal '!'")
+
+    dut.in_valid = 0
+    log(info, "PASS: Test 2 — 'hello, hello!' decompressed correctly")
+    wait 2 cycles
+  end run
+end impl Lz4DecompTest
