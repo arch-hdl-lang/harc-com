@@ -482,16 +482,121 @@ pub(super) fn log_helpers_and_seed(out: &mut String) {
     );
 }
 
-/// Bootstrap + main drive loop. `clocked` selects between the
-/// eval_clocks_until loop and the negedge/posedge loop, mirroring v1.
-pub(super) fn drive_loop(out: &mut String, clocked: bool) {
+/// Register an actor coroutine slot. Cooperative (`mt=false`) mode pushes
+/// the slot into the global `sched` (single-threaded round-robin). Under
+/// `--mt`, the actor gets a dedicated `harc_rt::ThreadScheduler` (declared
+/// here) running on its own OS worker thread; the `(sched, slot)` pair is
+/// recorded in `actor_threads` so the worker-spawn / barrier dance picks
+/// it up. Mirrors v1's per-slot scheduler split (`cpp_tb.rs:6178`,
+/// `6598`, multi-lane variants) verbatim — every actor slot becomes its
+/// own worker thread.
+pub(super) fn register_actor_slot(
+    out: &mut String,
+    mt: bool,
+    actor_threads: &mut Vec<(String, String)>,
+    sched_var: &str,
+    slot_var: &str,
+    depth: usize,
+) {
+    let pad = INDENT.repeat(depth);
+    if mt {
+        writeln!(out, "{pad}harc_rt::ThreadScheduler {sched_var};").ok();
+        writeln!(out, "{pad}harc_rt::ThreadSlot {slot_var};").ok();
+        writeln!(out, "{pad}{sched_var}.slots.push_back(&{slot_var});").ok();
+        actor_threads.push((sched_var.to_string(), slot_var.to_string()));
+    } else {
+        writeln!(out, "{pad}harc_rt::ThreadSlot {slot_var};").ok();
+        writeln!(out, "{pad}sched.slots.push_back(&{slot_var});").ok();
+    }
+}
+
+/// `--mt` worker-thread topology, emitted after the run-slot is set up and
+/// before the drive loop. Ports v1's `cpp_tb.rs:2440-2492` verbatim: a
+/// shutdown flag, two `N+1`-participant barriers (main + N workers), and
+/// one `std::thread` per actor running the dual-barrier loop
+/// `while(true){ start.wait(); if(shutdown) break; sched.tick(); end.wait(); }`.
+/// Each per-actor scheduler must already be `bootstrap()`-ed (single
+/// threaded) before the workers spin up. No-op when `actor_threads` is
+/// empty (cooperative mode / no actors).
+pub(super) fn mt_worker_setup(out: &mut String, actor_threads: &[(String, String)]) {
+    if actor_threads.is_empty() {
+        return;
+    }
+    let n = actor_threads.len();
+    writeln!(out, "{INDENT}// Phase 3a: per-actor OS threads with dual barrier sync.").ok();
+    writeln!(
+        out,
+        "{INDENT}// {n} actor(s) → {} barrier participants (main + workers).",
+        n + 1
+    )
+    .ok();
+    writeln!(out, "{INDENT}std::atomic<bool> _shutdown{{false}};").ok();
+    writeln!(out, "{INDENT}harc_rt::Barrier _start_barrier({});", n + 1).ok();
+    writeln!(out, "{INDENT}harc_rt::Barrier _end_barrier({});", n + 1).ok();
+    writeln!(out, "{INDENT}std::vector<std::thread> _workers;").ok();
+    for (sched_var, _) in actor_threads {
+        writeln!(out, "{INDENT}_workers.emplace_back([&]() {{").ok();
+        writeln!(out, "{INDENT}{INDENT}while (true) {{").ok();
+        writeln!(out, "{INDENT}{INDENT}{INDENT}_start_barrier.wait();").ok();
+        writeln!(
+            out,
+            "{INDENT}{INDENT}{INDENT}if (_shutdown.load(std::memory_order_acquire)) break;"
+        )
+        .ok();
+        writeln!(out, "{INDENT}{INDENT}{INDENT}{sched_var}.tick();").ok();
+        writeln!(out, "{INDENT}{INDENT}{INDENT}_end_barrier.wait();").ok();
+        writeln!(out, "{INDENT}{INDENT}}}").ok();
+        writeln!(out, "{INDENT}}});").ok();
+    }
+    writeln!(out).ok();
+}
+
+/// `--mt` shutdown sequence, emitted after the drive loop. Ports v1's
+/// `cpp_tb.rs:2672-2685`: workers are parked on `_start_barrier` awaiting
+/// their next iteration; set `_shutdown`, wake them through the start
+/// barrier so they observe the flag and break before reaching
+/// `_end_barrier`, then join. No-op in cooperative mode.
+pub(super) fn mt_worker_shutdown(out: &mut String, actor_threads: &[(String, String)]) {
+    if actor_threads.is_empty() {
+        return;
+    }
+    writeln!(out).ok();
+    writeln!(out, "{INDENT}_shutdown.store(true, std::memory_order_release);").ok();
+    writeln!(out, "{INDENT}_start_barrier.wait();").ok();
+    writeln!(out, "{INDENT}for (auto& _w : _workers) _w.join();").ok();
+}
+
+/// Bootstrap fan-out: resume the global scheduler, then each per-actor
+/// scheduler (`--mt`), all single-threaded — emitted BEFORE the worker
+/// threads spin up (`mt_worker_setup`) so every actor's initial-setup
+/// statements run race-free. Mirrors v1's `cpp_tb.rs:2417-2438`.
+pub(super) fn drive_bootstrap(out: &mut String, actor_threads: &[(String, String)]) {
     out.push_str(
         r#"
     // Resume each coroutine once so initial-setup statements run
     // before the first clock edge. Single-threaded — workers
     // haven't been spawned yet.
     sched.bootstrap();
+"#,
+    );
+    for (sched_var, _) in actor_threads {
+        writeln!(out, "{INDENT}{sched_var}.bootstrap();").ok();
+    }
+}
 
+/// Main drive loop. `clocked` selects between the eval_clocks_until loop
+/// and the negedge/posedge loop, mirroring v1. When `actor_threads` is
+/// non-empty (`--mt`), the loop fences the worker tick between
+/// `_start_barrier.wait()` / `_end_barrier.wait()` after `sched.tick()`
+/// and before the `_checkers` fan-out — so the run-coroutine's writes
+/// complete before workers wake, and the workers' DUT-input writes
+/// complete before the next eval (no shared-state race). Mirrors v1's
+/// barrier gating (`cpp_tb.rs:2621-2667`) verbatim. Bootstrap is emitted
+/// separately by `drive_bootstrap` (the worker spawn sits between).
+pub(super) fn drive_loop(out: &mut String, clocked: bool, actor_threads: &[(String, String)]) {
+    let mt = !actor_threads.is_empty();
+    out.push_str(
+        r#"
     // Drive the clock until the run coroutine completes.
     //
     // `wait N cycles` matches Verilog's `@(posedge clk)` semantic:
@@ -511,6 +616,22 @@ pub(super) fn drive_loop(out: &mut String, clocked: bool) {
     // one posedge that observes the just-set values.
 "#,
     );
+    if mt {
+        out.push_str(
+            r#"    //
+    // MT mode: workers run between tick() and the falling edge, gated by
+    // _start_barrier / _end_barrier. Run-coroutine writes complete BEFORE
+    // workers wake → no race on shared queues. Workers' DUT-input writes
+    // complete BEFORE the falling-edge eval → no race on signal state.
+"#,
+        );
+    }
+
+    let barrier_gate = if mt {
+        "        _start_barrier.wait();\n        _end_barrier.wait();\n"
+    } else {
+        ""
+    };
     if clocked {
         out.push_str(
             r#"    dut->eval();
@@ -519,7 +640,11 @@ pub(super) fn drive_loop(out: &mut String, clocked: bool) {
         long long _target = now_ps + clocks_[0].half_period_ps * 2;
         eval_clocks_until(_target);
         sched.tick();
-        for (auto& _c : _checkers) _c();
+"#,
+        );
+        out.push_str(barrier_gate);
+        out.push_str(
+            r#"        for (auto& _c : _checkers) _c();
     }
 "#,
         );
@@ -535,7 +660,11 @@ pub(super) fn drive_loop(out: &mut String, clocked: bool) {
         if (!_post_eval_services.empty()) dut->eval();
         if (!_post_eval_services.empty()) _harc_trace_dump_next("clk", (uint64_t)cycle_count);
         sched.tick();
-        _harc_eval_negedge(dut);
+"#,
+        );
+        out.push_str(barrier_gate);
+        out.push_str(
+            r#"        _harc_eval_negedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)cycle_count);
         for (auto& _c : _checkers) _c();
     }

@@ -40,11 +40,6 @@ fn needs_tb_struct(tb: &ir::TestbenchSchema) -> bool {
 }
 
 pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<String, EmitError> {
-    if opts.mt {
-        return Err(EmitError(
-            "--mt is not supported with --codegen tbir; re-run with --codegen v1".to_string(),
-        ));
-    }
     if prog.tests.is_empty() {
         return Err(EmitError("no `test` declaration found".to_string()));
     }
@@ -1084,7 +1079,6 @@ fn emit_lifecycle_checkers(
         let lambda = func::cycle_handler_lambda_name(comp, ch);
         let trigger = func::clause_expr_cpp(prog, ch.function, inst_path, &ch.trigger)?;
         let tag = format!("_cyc_{inst_tag}_{}", ch.function.0);
-        writeln!(out, "{INDENT}_checkers.push_back([&]() {{").ok();
         if ch.monitor_channel.is_some() {
             // Bound-bus handshake monitor (v1's `emit_bound_monitor_actors`).
             // v1 lowers it as a coroutine: `while (true) { co_await
@@ -1101,6 +1095,23 @@ fn emit_lifecycle_checkers(
             // checkers), so the cadence is reproduced exactly with a
             // fire-then-cooldown latch: fire when the predicate holds, then
             // consume the following cycle as the `wait_cycles(1)` re-arm.
+            //
+            // NOTE on `--mt`: the monitor stays a cooperative `_checkers`
+            // latch even under `--mt`, deliberately NOT a worker coroutine.
+            // v1 can run the monitor on its own OS thread only because v1
+            // ALSO re-lowers the active bound *driver* transactor into a
+            // queue-fed worker coroutine that yields (`co_await
+            // wait_cycles`) every cycle — so the handshake is established
+            // and observed inside the same barrier window. tbir keeps the
+            // driver in the run coroutine (synchronous `tick()` spins that
+            // never reach the main-loop barrier window), so a worker-thread
+            // monitor would miss every handshake. Re-lowering active
+            // transactors into actors is a separate, larger change (see
+            // issue #425 / the WS2 follow-up). Keeping the monitor as the
+            // `_checkers` latch is trace-correct under both `--mt` and the
+            // default — the latch already fires at the right phases on
+            // every `tick()`.
+            writeln!(out, "{INDENT}_checkers.push_back([&]() {{").ok();
             writeln!(out, "{INDENT}{INDENT}static bool {tag}_cool = false;").ok();
             writeln!(out, "{INDENT}{INDENT}if ({tag}_cool) {{").ok();
             writeln!(out, "{INDENT}{INDENT}{INDENT}{tag}_cool = false;").ok();
@@ -1111,6 +1122,7 @@ fn emit_lifecycle_checkers(
             writeln!(out, "{INDENT}}});").ok();
             continue;
         }
+        writeln!(out, "{INDENT}_checkers.push_back([&]() {{").ok();
         match ch.edge {
             ir::CycleEdge::Level => {
                 writeln!(out, "{INDENT}{INDENT}if ((bool)({trigger})) {{").ok();
@@ -1212,6 +1224,12 @@ fn emit_test(
 ) -> Result<(), EmitError> {
     let tb = prog.testbench(test.testbench);
     let clocked = !test.clocks.is_empty();
+    let mt = opts.mt;
+    // `(sched_var, slot_var)` pairs for actors that run on a dedicated
+    // OS worker thread under `--mt`. Empty in cooperative mode (actor
+    // slots go into the global `sched` instead). Collected as actors are
+    // emitted; consumed by the worker-spawn / barrier dance below.
+    let mut actor_threads: Vec<(String, String)> = Vec::new();
 
     runtime::run_prologue(out, &test.name, dut_type);
     if clocked {
@@ -1338,7 +1356,15 @@ fn emit_test(
         runtime::target_state_struct_inst(out, schema, &actor.instance);
     }
     for actor in &tb.target_tlm_actors {
-        func::emit_target_actor(out, prog, actor, &tb.bus_bindings, 1)?;
+        func::emit_target_actor(
+            out,
+            prog,
+            actor,
+            &tb.bus_bindings,
+            mt,
+            &mut actor_threads,
+            1,
+        )?;
     }
 
     // Composite-component method lambdas — one `<Comp>_<method>` per
@@ -1389,6 +1415,9 @@ fn emit_test(
         emit_on_handler_regs(out, prog, cf.component, &cf.field);
         // `on <N> cycles` periodic + `watchdog` lifecycle `_checkers`
         // closures, for this component and any nested sub-components.
+        // Bound-bus handshake monitors stay cooperative `_checkers`
+        // latches even under `--mt` (see the NOTE in
+        // `emit_lifecycle_checkers`), so no actor registration is needed.
         emit_lifecycle_checkers(out, prog, cf.component, &cf.field)?;
     }
 
@@ -1429,7 +1458,16 @@ fn emit_test(
     writeln!(out, "{INDENT}{INDENT}co_return;").ok();
     writeln!(out, "{INDENT}}}(&_run_slot);").ok();
 
-    runtime::drive_loop(out, clocked);
+    // Bootstrap (single-threaded) → spawn workers (`--mt` only) → drive
+    // loop → shutdown workers. Ordering is load-bearing: per-actor
+    // schedulers must be bootstrapped before their OS threads start, and
+    // the shutdown handshake must follow the loop. The worker-setup /
+    // shutdown emitters are no-ops when `actor_threads` is empty, so the
+    // cooperative single-thread output stays byte-identical to before.
+    runtime::drive_bootstrap(out, &actor_threads);
+    runtime::mt_worker_setup(out, &actor_threads);
+    runtime::drive_loop(out, clocked, &actor_threads);
+    runtime::mt_worker_shutdown(out, &actor_threads);
     runtime::run_epilogue(out);
     Ok(())
 }
