@@ -1770,6 +1770,21 @@ pub enum Expr {
         point: String,
         bin: String,
     },
+    /// `t.<field>` read on a hook-triggered covergroup's hook parameter.
+    /// Cover-target-only: a `covergroup G @(drv.send(t) post)` may sample
+    /// `cover t.burst`, where `t` is the hookable method's parameter (a
+    /// record/transaction value), not a DUT port. Covergroup schemas lower
+    /// before the transactor tables exist, so the parameter has no
+    /// resolvable `LocalId` yet — the parameter NAME (matching the hook
+    /// method's by-value closure arg) and the field are carried instead.
+    /// `index: Some(e)` reads a `Vec<T, N>` field element (`t.data[e]`).
+    /// Emitted by the tbir hook-sampler closure as `<param>.<field>`,
+    /// mirroring v1's `emit_expr` over the closure's by-value param.
+    CovHookParam {
+        param: String,
+        field: String,
+        index: Option<Box<Expr>>,
+    },
     /// `<seq>.size()` — element count of a `RecordSeq` local, used as the
     /// upper bound of a `for t in <seq>` loop. Lowers to `uint64_t`
     /// (emitted as `<seq>.size()`).
@@ -1987,6 +2002,11 @@ pub enum CovTrigger {
         receiver_path: Vec<String>,
         /// The hookable method name (`send`).
         method: String,
+        /// The hook trigger argument names (`["t"]` for `drv.send(t)`).
+        /// The `covergroup_hooks` pass validates these against the
+        /// resolved method's parameter names (v1's emit-time check) so a
+        /// `cover <param>.<field>` target binds a real closure arg.
+        param_names: Vec<String>,
         /// `pre` fires before the method body, `post` after.
         side: crate::ast::HookSide,
     },

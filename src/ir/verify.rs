@@ -973,6 +973,14 @@ impl Checker<'_> {
                 self.check_record_field(*mirror, field);
             }
             Expr::CovBin { inst, .. } => self.check_covgroup(inst.covgroup),
+            // A hook-param cover target carries the parameter NAME (no
+            // resolvable local before the transactor pass); only its
+            // optional index sub-expression needs checking.
+            Expr::CovHookParam { index, .. } => {
+                if let Some(i) = index {
+                    self.check_expr(i, ports_ok, context);
+                }
+            }
             // Component host state — resolved at lowering against the
             // component schema; no local/port dependency to verify here.
             Expr::ComponentField { .. } => {}
@@ -1593,6 +1601,11 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
         Expr::WidthCast { inner, .. } => for_each_local(inner, f),
         Expr::ComponentIdle { n, .. } => for_each_local(n, f),
         Expr::CovBin { .. } => {}
+        Expr::CovHookParam { index, .. } => {
+            if let Some(i) = index {
+                for_each_local(i, f);
+            }
+        }
         Expr::SeqLen(l) => f(*l),
         Expr::SeqIndex { seq, index } => {
             f(*seq);
