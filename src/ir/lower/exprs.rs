@@ -638,6 +638,10 @@ impl FuncBuilder<'_> {
                 let index = self.hoist_ports_with_hint(*index, None);
                 Expr::RecordField { local, field, index: Some(Box::new(index)) }
             }
+            Expr::CovHookParam { param, field, index: Some(index) } => {
+                let index = self.hoist_ports_with_hint(*index, None);
+                Expr::CovHookParam { param, field, index: Some(Box::new(index)) }
+            }
             other @ (Expr::Literal { .. }
             | Expr::WideLiteral(_)
             | Expr::Local(_)
@@ -646,6 +650,7 @@ impl FuncBuilder<'_> {
             | Expr::CycleCount
             | Expr::ErrorCount
             | Expr::RecordField { index: None, .. }
+            | Expr::CovHookParam { index: None, .. }
             | Expr::TbField(_)
             // Transactor-instance state is host state — no DUT port inside.
             | Expr::TransactorState { .. }

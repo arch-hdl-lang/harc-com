@@ -207,6 +207,22 @@ fn cover_expr_cpp(e: &Expr, lanes: &HashMap<String, u32>) -> Result<String, Emit
             src_width,
             inner,
         } => cover_width_cast_cpp(*kind, *width, *src_width, inner, lanes)?,
+        // Hook-param cover target (`cover t.burst` / `cover t.data[i]`):
+        // `param` is the hook-sampler closure's by-value argument, so the
+        // sample reads `param.field` directly — same shape as v1 emitting
+        // the field access over its by-value param. Only reachable from
+        // `hook_sampler_registration`, whose closure binds `param`.
+        Expr::CovHookParam {
+            param,
+            field,
+            index,
+        } => match index {
+            Some(idx) => {
+                let i = cover_expr_cpp(idx, lanes)?;
+                format!("{param}.{field}[{i}]")
+            }
+            None => format!("{param}.{field}"),
+        },
         other => {
             return Err(EmitError(format!(
                 "tbir: covergroup target expression is outside the sampler subset: {other:?}"

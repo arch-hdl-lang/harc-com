@@ -508,7 +508,8 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
         | Expr::ComponentValue { .. }
         | Expr::ComponentQueueQuery { .. }
         | Expr::SeqLen(_)
-        | Expr::CovBin { .. } => {}
+        | Expr::CovBin { .. }
+        | Expr::CovHookParam { .. } => {}
     }
 }
 

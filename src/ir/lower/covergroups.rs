@@ -18,6 +18,13 @@ pub(crate) fn lower_covergroup(g: &CovergroupDecl) -> Result<CovgroupSchema, Low
     // entirely — any non-hook covergroup samples once per primary-clock
     // tick. Mirror that: `@(posedge dut.clk)` and a missing trigger
     // both lower to `PosedgeDutClk`; hook triggers are post-MVP.
+    //
+    // For a hook trigger, also collect the trigger argument names (the
+    // bare idents `t` in `@(drv.send(t) post)`). A coverpoint target may
+    // sample `cover t.<field>` over the hook parameter, which lowers to a
+    // record-field read on the hook-method's by-value closure arg rather
+    // than a DUT port — `hook_params` is the in-scope set of such names.
+    let mut hook_params: Vec<String> = Vec::new();
     let trigger = match &g.trigger {
         Some(CoverTrigger::Hook { call, side }) => {
             // Covergroup schemas lower before the testbench/transactor
@@ -26,9 +33,11 @@ pub(crate) fn lower_covergroup(g: &CovergroupDecl) -> Result<CovgroupSchema, Low
             // `covergroup_hooks` pass resolves it once transactors are
             // lowered (mirrors v1's late covergroup-hook registration).
             let (receiver_path, method) = lower_hook_call(&g.name.name, call)?;
+            hook_params = hook_call_arg_names(&g.name.name, call)?;
             CovTrigger::Hook {
                 receiver_path,
                 method,
+                param_names: hook_params.clone(),
                 side: *side,
             }
         }
@@ -39,7 +48,7 @@ pub(crate) fn lower_covergroup(g: &CovergroupDecl) -> Result<CovgroupSchema, Low
     let mut points = Vec::new();
     for it in &g.items {
         if let CoverItem::Point(p) = it {
-            let target = lower_point_target(&g.name.name, &p.name.name, &p.target)?;
+            let target = lower_point_target(&g.name.name, &p.name.name, &p.target, &hook_params)?;
             let mut bins = Vec::new();
             for b in &p.bins {
                 bins.push(CoverBinSchema {
@@ -164,17 +173,119 @@ fn lower_hook_call(group: &str, call: &AstExpr) -> Result<(Vec<String>, String),
     Ok((path, method))
 }
 
+/// Collect the hook trigger argument names (`["t"]` for `drv.send(t)`).
+/// The parser's `validate_cover_hook_trigger` already guarantees the
+/// args are bare identifiers, so this is a straightforward extraction;
+/// any non-ident is a parser/lowering invariant break, surfaced as a
+/// clear unsupported error rather than silently dropped.
+fn hook_call_arg_names(group: &str, call: &AstExpr) -> Result<Vec<String>, LowerError> {
+    let ExprKind::Call { args, .. } = &*call.kind else {
+        return Err(unsupported(
+            &format!("covergroup `{group}` hook trigger must be a method call"),
+            "",
+        ));
+    };
+    let mut names = Vec::with_capacity(args.len());
+    for arg in args {
+        let crate::ast::CallArg::Expr(e) = arg else {
+            return Err(unsupported(
+                &format!("covergroup `{group}` hook trigger arguments must be identifiers"),
+                "",
+            ));
+        };
+        let ExprKind::Ident(id) = &*e.kind else {
+            return Err(unsupported(
+                &format!("covergroup `{group}` hook trigger arguments must be identifiers"),
+                "",
+            ));
+        };
+        names.push(id.name.clone());
+    }
+    Ok(names)
+}
+
+/// Recognize a hook-param cover target: `<param>.<field>` (scalar) or
+/// `<param>.<field>[const]` (a `Vec<T, N>` field element), where
+/// `<param>` is one of the covergroup hook trigger's argument names.
+/// Returns `Ok(None)` when the target is not rooted at a hook param so
+/// the caller falls through to DUT-port / literal lowering. A nested
+/// path (`t.a.b`) or a non-constant index is out of subset and errors.
+fn lower_hook_param_field(
+    group: &str,
+    point: &str,
+    target: &AstExpr,
+    hook_params: &[String],
+) -> Result<Option<Expr>, LowerError> {
+    if hook_params.is_empty() {
+        return Ok(None);
+    }
+    // Optional trailing `[const]` index over a record-field read.
+    let mut cur = target;
+    let mut index: Option<Box<Expr>> = None;
+    if let ExprKind::Index { target: t, index: i } = &*cur.kind {
+        // Covergroup schemas lower before any runtime scope, so a Vec
+        // lane index can only be a constant literal here (same rule as
+        // DUT-port lanes). Represent it as a constant `Expr::Literal`.
+        let v = cover_const_u64(group, point, i)?;
+        index = Some(Box::new(Expr::Literal {
+            value: v,
+            ty: IrType::Unknown,
+        }));
+        cur = t;
+    }
+    // Peel parens, then require exactly `<ident>.<field>`.
+    while let ExprKind::Paren(inner) = &*cur.kind {
+        cur = inner;
+    }
+    let ExprKind::Field { target: recv, name } = &*cur.kind else {
+        return Ok(None);
+    };
+    let mut rcur: &AstExpr = recv;
+    while let ExprKind::Paren(inner) = &*rcur.kind {
+        rcur = inner;
+    }
+    let ExprKind::Ident(id) = &*rcur.kind else {
+        // A deeper receiver path (`t.a.b`) is not in subset.
+        return Ok(None);
+    };
+    if !hook_params.iter().any(|p| p == &id.name) {
+        // Not a hook param — let DUT-port / literal lowering handle it.
+        return Ok(None);
+    }
+    Ok(Some(Expr::CovHookParam {
+        param: id.name.clone(),
+        field: name.name.clone(),
+        index,
+    }))
+}
+
 /// A cover-point target is a pure DUT-bound scalar expression. Keep this
 /// subset deliberately smaller than general expression lowering because
 /// covergroup schemas lower before test/run scopes exist: no locals,
 /// helper calls, regblock reads, or transactor edges.
-fn lower_point_target(group: &str, point: &str, target: &AstExpr) -> Result<Expr, LowerError> {
+fn lower_point_target(
+    group: &str,
+    point: &str,
+    target: &AstExpr,
+    hook_params: &[String],
+) -> Result<Expr, LowerError> {
     let unsupported_target = || {
         unsupported(
             &format!("covergroup `{group}` point `{point}` with an unsupported target expression"),
-            "supported: dut.<port>, dut.<port>[idx], expr[hi:lo], literals, unary/binary/ternary expressions",
+            "supported: dut.<port>, dut.<port>[idx], t.<field>, expr[hi:lo], literals, unary/binary/ternary expressions",
         )
     };
+
+    // A hook-param field read (`cover t.burst` / `cover t.data[idx]`): the
+    // receiver ident names a hook trigger parameter, so the target samples
+    // the hookable method's by-value argument record, not a DUT port. The
+    // hook param has no resolvable `LocalId` here (transactors lower
+    // later), so carry the param name + field; codegen renders it as the
+    // closure arg `param.field` (mirrors v1 emitting `t.burst` over the
+    // by-value closure param).
+    if let Some(hp) = lower_hook_param_field(group, point, target, hook_params)? {
+        return Ok(hp);
+    }
 
     fn lower_port(group: &str, point: &str, e: &AstExpr) -> Result<Option<PortRef>, LowerError> {
         let mut cur = e;
@@ -243,7 +354,7 @@ fn lower_point_target(group: &str, point: &str, target: &AstExpr) -> Result<Expr
                 });
             }
             ExprKind::Unary { op, expr } => {
-                let inner = lower_point_target(group, point, expr)?;
+                let inner = lower_point_target(group, point, expr, hook_params)?;
                 let op = match op {
                     UnaryOp::Neg => UnOp::Neg,
                     UnaryOp::Not | UnaryOp::NotKw => UnOp::Not,
@@ -253,8 +364,8 @@ fn lower_point_target(group: &str, point: &str, target: &AstExpr) -> Result<Expr
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 let op = super::exprs::lower_bin_op(*op)?;
-                let lhs = lower_point_target(group, point, lhs)?;
-                let rhs = lower_point_target(group, point, rhs)?;
+                let lhs = lower_point_target(group, point, lhs, hook_params)?;
+                let rhs = lower_point_target(group, point, rhs, hook_params)?;
                 return Ok(Expr::Binary(op, Box::new(lhs), Box::new(rhs)));
             }
             ExprKind::Ternary {
@@ -262,9 +373,9 @@ fn lower_point_target(group: &str, point: &str, target: &AstExpr) -> Result<Expr
                 then_branch,
                 else_branch,
             } => {
-                let cond = lower_point_target(group, point, cond)?;
-                let then_branch = lower_point_target(group, point, then_branch)?;
-                let else_branch = lower_point_target(group, point, else_branch)?;
+                let cond = lower_point_target(group, point, cond, hook_params)?;
+                let then_branch = lower_point_target(group, point, then_branch, hook_params)?;
+                let else_branch = lower_point_target(group, point, else_branch, hook_params)?;
                 return Ok(Expr::Ternary(
                     Box::new(cond),
                     Box::new(then_branch),
@@ -279,7 +390,7 @@ fn lower_point_target(group: &str, point: &str, target: &AstExpr) -> Result<Expr
                         "covergroup `{group}` point `{point}` has invalid bit slice [{hi}:{lo}]"
                     )));
                 }
-                let target = lower_point_target(group, point, target)?;
+                let target = lower_point_target(group, point, target, hook_params)?;
                 return Ok(Expr::BitSlice {
                     target: Box::new(target),
                     hi,
@@ -288,7 +399,7 @@ fn lower_point_target(group: &str, point: &str, target: &AstExpr) -> Result<Expr
             }
             ExprKind::Cast { expr, ty } => {
                 let width = cover_cast_width(group, point, ty)?.ok_or_else(unsupported_target)?;
-                let inner = lower_point_target(group, point, expr)?;
+                let inner = lower_point_target(group, point, expr, hook_params)?;
                 return Ok(Expr::WidthCast {
                     kind: WidthCastKind::Resize,
                     width,
@@ -306,7 +417,7 @@ fn lower_point_target(group: &str, point: &str, target: &AstExpr) -> Result<Expr
                         };
                         let width = cover_width_arg(group, point, &name.name, width_expr)?;
                         let src_width = cover_infer_expr_width(group, point, recv)?;
-                        let inner = lower_point_target(group, point, recv)?;
+                        let inner = lower_point_target(group, point, recv, hook_params)?;
                         let kind = match name.name.as_str() {
                             "trunc" => WidthCastKind::Trunc,
                             "zext" => WidthCastKind::Zext,

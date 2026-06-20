@@ -4599,6 +4599,9 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             ir::Expr::RecordField {
                 index: Some(idx), ..
             } => fill_expr(idx, instance),
+            ir::Expr::CovHookParam {
+                index: Some(idx), ..
+            } => fill_expr(idx, instance),
             ir::Expr::Call(_, args) => {
                 for a in args {
                     fill_expr(a, instance);
@@ -4611,6 +4614,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             | ir::Expr::ErrorCount
             | ir::Expr::Port(_)
             | ir::Expr::RecordField { index: None, .. }
+            | ir::Expr::CovHookParam { index: None, .. }
             | ir::Expr::TbField(_)
             | ir::Expr::ComponentField { .. }
             | ir::Expr::ComponentValue { .. }
@@ -4819,12 +4823,16 @@ fn fill_visit_expr(
         Expr::RecordField {
             index: Some(idx), ..
         } => fill_visit_expr(idx, placeholder, binding, remap, rewrite, conflict),
+        Expr::CovHookParam {
+            index: Some(idx), ..
+        } => fill_visit_expr(idx, placeholder, binding, remap, rewrite, conflict),
         Expr::Literal { .. }
         | Expr::WideLiteral(_)
         | Expr::Local(_)
         | Expr::CycleCount
         | Expr::ErrorCount
         | Expr::RecordField { index: None, .. }
+        | Expr::CovHookParam { index: None, .. }
         | Expr::TbField(_)
         | Expr::TransactorState { .. }
         | Expr::ComponentField { .. }
