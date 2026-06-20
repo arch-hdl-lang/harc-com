@@ -4,18 +4,17 @@
 //   Test 1  "hello"          — 5 pure literals, last sequence (no match)
 //   Test 2  "hello, hello!"  — 7 literals + 5-byte back-reference + 1 literal
 //
-// Timing model (HARC post-clock comb reads):
-//   LITERAL state: out_data = in_data (pass-through). Set in_data BEFORE
-//   wait, assert out_data AFTER wait — the clock fires with the new input,
-//   and eval_comb runs, making the output readable post-wait.
+// Timing model: outputs are REGISTERED (`pipe_reg<_,1>`), so a decompressed
+// byte appears one cycle after the input/state that produces it. The natural
+// pattern is therefore: set the inputs for a byte, `wait 1 cycle` to clock the
+// producing edge, then assert the registered output (out_valid / out_data /
+// out_last) which now reflects that edge. Because the output is latched,
+// out_last is directly observable on the final byte — unlike a combinational
+// pass-through, which only glitches it for a sub-cycle.
 //
-//   COPY state: out_data comes from the history RAM (registered copy_src).
-//   The comb is immediately valid after the OFFS_HI clock sets copy_src, so
-//   assert BEFORE the first copy-wait, then assert BEFORE each subsequent wait.
-//
-//   out_last in LITERAL state is not checked: it fires in comb when lit_rem==1
-//   (one cycle before the last byte is presented), which in HARC's timing
-//   model appears paired with the penultimate byte rather than the last byte.
+// in_last is asserted with the TOKEN byte of the last sequence (no match
+// follows that sequence, per LZ4 spec §2). out_ready is held high throughout,
+// so the design streams one byte per cycle with no back-pressure stalls.
 
 domain SysDomain
   freq_mhz: 100
@@ -62,57 +61,63 @@ impl Lz4DecompTest for Lz4DecompTb
     wait 1 cycle
     // state=LITERAL, lit_rem=5, is_last=1
 
-    // For each literal: set in_data BEFORE wait so the clock fires with it,
-    // then assert out_data AFTER wait (post-clock eval_comb uses that in_data).
+    // Each literal: set in_data BEFORE the wait that clocks it; the registered
+    // output reflects it AFTER the wait.
     dut.in_data = 0x68    // 'h'
     dut.in_last = 0
-    wait 1 cycle          // lit_rem 5→4; comb: out_data='h'
+    wait 1 cycle
     assert dut.out_valid == 1
         else fail("T1-h: out_valid should be 1")
     assert dut.out_data == 0x68
         else fail("T1-h: expected 'h' (0x68), got ${dut.out_data}")
+    assert dut.out_last == 0
+        else fail("T1-h: out_last should be 0")
 
     dut.in_data = 0x65    // 'e'
-    wait 1 cycle          // lit_rem 4→3; comb: out_data='e'
-    assert dut.out_valid == 1
-        else fail("T1-e: out_valid should be 1")
+    wait 1 cycle
     assert dut.out_data == 0x65
         else fail("T1-e: expected 'e' (0x65), got ${dut.out_data}")
 
     dut.in_data = 0x6C    // 'l'
-    wait 1 cycle          // lit_rem 3→2; comb: out_data='l'
-    assert dut.out_valid == 1
-        else fail("T1-l1: out_valid should be 1")
+    wait 1 cycle
     assert dut.out_data == 0x6C
         else fail("T1-l1: expected 'l' (0x6C), got ${dut.out_data}")
 
     dut.in_data = 0x6C    // 'l'
-    wait 1 cycle          // lit_rem 2→1; comb: out_data='l'
-    assert dut.out_valid == 1
-        else fail("T1-l2: out_valid should be 1")
+    wait 1 cycle
     assert dut.out_data == 0x6C
         else fail("T1-l2: expected 'l' (0x6C), got ${dut.out_data}")
 
-    // Last literal 'o': this clock transitions state to TOKEN (lit_rem 1→0).
-    // After the wait eval_comb is in TOKEN state; out_data is 0, not 'o'.
-    // Verify state recovery via in_ready instead.
+    // Last literal 'o' of the last sequence: out_last must latch high.
     dut.in_data = 0x6F    // 'o'
-    wait 1 cycle          // lit_rem 1→0, state→TOKEN
-    assert dut.in_ready == 1
-        else fail("T1: in_ready should return to 1 in TOKEN after last literal")
+    wait 1 cycle
+    assert dut.out_valid == 1
+        else fail("T1-o: out_valid should be 1")
+    assert dut.out_data == 0x6F
+        else fail("T1-o: expected 'o' (0x6F), got ${dut.out_data}")
+    assert dut.out_last == 1
+        else fail("T1-o: out_last should be 1 on last byte of block")
 
+    // Stream drains: out_valid clears once consumed with no new data.
     dut.in_valid = 0
-    wait 2 cycles
+    wait 1 cycle
+    assert dut.out_valid == 0
+        else fail("T1: out_valid should clear after stream drains")
+    assert dut.out_last == 0
+        else fail("T1: out_last should clear after stream drains")
+    wait 1 cycle
     log(info, "PASS: Test 1 — 'hello' decompressed correctly")
 
     // -----------------------------------------------------------------------
     // Test 2: decompress "hello, hello!" (7 literals + back-ref + 1 literal)
     //
+    // History continues from Test 1 (no reset): wr_ptr=5, mem[0..4]="hello".
+    //
     // LZ4 encoding:
     //   seq 1: token=0x71 (ll4=7, ml4=1)
-    //           literals: 'h' 'e' 'l' 'l' 'o' ',' ' '  (7 bytes, positions 5..11)
+    //           literals: 'h' 'e' 'l' 'l' 'o' ',' ' '  (7 bytes → mem[5..11])
     //           offset: 0x07 0x00  (= 7, little-endian)
-    //           match_len: ml4+4 = 5  (copies positions 5..9 = "hello")
+    //           match_len: ml4+4 = 5  (copy_src = wr_ptr(12) - 7 = 5 → "hello")
     //   seq 2 (last): token=0x10 (ll4=1, ml4=0), in_last=1
     //           literals: '!'
     // -----------------------------------------------------------------------
@@ -127,7 +132,7 @@ impl Lz4DecompTest for Lz4DecompTb
     wait 1 cycle
     // state=LITERAL, lit_rem=7, match_rem=5, is_last=0
 
-    // 7 literals "hello, " — set BEFORE wait, assert AFTER wait
+    // 7 literals "hello, " → history positions 5..11
     dut.in_data = 0x68
     wait 1 cycle
     assert dut.out_valid == 1
@@ -137,96 +142,81 @@ impl Lz4DecompTest for Lz4DecompTb
 
     dut.in_data = 0x65
     wait 1 cycle
-    assert dut.out_valid == 1
-        else fail("T2-e: out_valid should be 1")
     assert dut.out_data == 0x65
         else fail("T2-e: expected 'e' (0x65), got ${dut.out_data}")
 
     dut.in_data = 0x6C
     wait 1 cycle
-    assert dut.out_valid == 1
-        else fail("T2-l1: out_valid should be 1")
     assert dut.out_data == 0x6C
         else fail("T2-l1: expected 'l' (0x6C), got ${dut.out_data}")
 
     dut.in_data = 0x6C
     wait 1 cycle
-    assert dut.out_valid == 1
-        else fail("T2-l2: out_valid should be 1")
     assert dut.out_data == 0x6C
         else fail("T2-l2: expected 'l' (0x6C), got ${dut.out_data}")
 
     dut.in_data = 0x6F
     wait 1 cycle
-    assert dut.out_valid == 1
-        else fail("T2-o: out_valid should be 1")
     assert dut.out_data == 0x6F
         else fail("T2-o: expected 'o' (0x6F), got ${dut.out_data}")
 
-    dut.in_data = 0x2C
+    dut.in_data = 0x2C    // ','
     wait 1 cycle
-    assert dut.out_valid == 1
-        else fail("T2-comma: out_valid should be 1")
     assert dut.out_data == 0x2C
         else fail("T2-comma: expected ',' (0x2C), got ${dut.out_data}")
 
-    // 7th (last) literal of sequence 1 — transitions to OFFS_LO after
-    dut.in_data = 0x20
+    // 7th literal ' ' — transitions to OFFS_LO; not the block's last byte.
+    dut.in_data = 0x20    // ' '
     wait 1 cycle
+    assert dut.out_data == 0x20
+        else fail("T2-space: expected ' ' (0x20), got ${dut.out_data}")
+    assert dut.out_last == 0
+        else fail("T2-space: out_last should be 0 mid-stream")
     // state=OFFS_LO, wr_ptr=12
-    assert dut.in_ready == 1
-        else fail("T2: in_ready should be 1 in OFFS_LO")
-    assert dut.out_valid == 0
-        else fail("T2: no output in OFFS_LO")
 
     // Offset low byte: 0x07
     dut.in_data = 0x07
-    wait 1 cycle
-    // state=OFFS_HI
     assert dut.in_ready == 1
-        else fail("T2: in_ready should be 1 in OFFS_HI")
+        else fail("T2: in_ready should be 1 in OFFS_LO state")
+    wait 1 cycle
+    // offs_lo=0x07, state=OFFS_HI; output register drained.
     assert dut.out_valid == 0
-        else fail("T2: no output in OFFS_HI")
+        else fail("T2: no output during OFFS_LO/OFFS_HI")
 
     // Offset high byte: 0x00  (full_offset = 7; copy_src = 12 - 7 = 5)
     dut.in_data = 0x00
+    assert dut.in_ready == 1
+        else fail("T2: in_ready should be 1 in OFFS_HI state")
     wait 1 cycle
     // state=COPY, copy_src=5, match_rem=5
-    // COPY comb is immediately valid (latency-0 RAM): out_data=hist[5]='h'
 
-    // COPY: 5 bytes "hello" from history positions 5..9
-    // Assert BEFORE each wait (comb valid post-previous-clock).
+    // COPY: 5 bytes "hello" from history positions 5..9. Each byte is
+    // registered, so assert AFTER the wait that produces it.
     dut.in_valid = 0
+    wait 1 cycle
     assert dut.out_valid == 1
         else fail("T2-copy1: out_valid should be 1")
     assert dut.out_data == 0x68
         else fail("T2-copy1: expected 'h' (0x68), got ${dut.out_data}")
-    wait 1 cycle    // copy_src 5→6, wr_ptr 12→13
 
-    assert dut.out_valid == 1
-        else fail("T2-copy2: out_valid should be 1")
+    wait 1 cycle
     assert dut.out_data == 0x65
         else fail("T2-copy2: expected 'e' (0x65), got ${dut.out_data}")
-    wait 1 cycle
 
-    assert dut.out_valid == 1
-        else fail("T2-copy3: out_valid should be 1")
+    wait 1 cycle
     assert dut.out_data == 0x6C
         else fail("T2-copy3: expected 'l' (0x6C), got ${dut.out_data}")
-    wait 1 cycle
 
-    assert dut.out_valid == 1
-        else fail("T2-copy4: out_valid should be 1")
+    wait 1 cycle
     assert dut.out_data == 0x6C
         else fail("T2-copy4: expected 'l' (0x6C), got ${dut.out_data}")
-    wait 1 cycle
 
-    assert dut.out_valid == 1
-        else fail("T2-copy5: out_valid should be 1")
+    wait 1 cycle
     assert dut.out_data == 0x6F
         else fail("T2-copy5: expected 'o' (0x6F), got ${dut.out_data}")
-    wait 1 cycle
-    // match_rem 1→0, state=TOKEN, wr_ptr=17
+    assert dut.out_last == 0
+        else fail("T2-copy5: out_last should be 0 (copy is never last byte)")
+    // match_rem=0, state=TOKEN, wr_ptr=17
 
     // TOKEN byte for last sequence
     dut.in_valid = 1
@@ -237,14 +227,21 @@ impl Lz4DecompTest for Lz4DecompTb
     wait 1 cycle
     // state=LITERAL, lit_rem=1, is_last=1
 
-    // Single literal '!' — state transitions to TOKEN after this wait.
-    dut.in_data = 0x21
+    // Single literal '!' — final byte of the block, out_last latches high.
+    dut.in_data = 0x21    // '!'
     dut.in_last = 0
-    wait 1 cycle    // lit_rem 1→0, state→TOKEN
-    assert dut.in_ready == 1
-        else fail("T2: in_ready should return to 1 after last literal '!'")
+    wait 1 cycle
+    assert dut.out_valid == 1
+        else fail("T2-bang: out_valid should be 1")
+    assert dut.out_data == 0x21
+        else fail("T2-bang: expected '!' (0x21), got ${dut.out_data}")
+    assert dut.out_last == 1
+        else fail("T2-bang: out_last should be 1 on last byte of block")
 
     dut.in_valid = 0
+    wait 1 cycle
+    assert dut.out_valid == 0
+        else fail("T2: out_valid should clear after final drain")
     log(info, "PASS: Test 2 — 'hello, hello!' decompressed correctly")
     wait 2 cycles
   end run
