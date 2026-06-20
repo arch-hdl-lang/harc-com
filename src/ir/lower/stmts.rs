@@ -1021,19 +1021,89 @@ impl FuncBuilder<'_> {
                 if let Some(local) = self.lookup(&root.name) {
                     if let Some(rid) = self.record_of_local(local) {
                         let schema = &self.ctx.records[rid.index()];
-                        if schema.field(&name.name).is_none() {
+                        let Some(fld) = schema.field(&name.name) else {
                             return Err(LowerError::Invalid(format!(
                                 "transaction `{}` has no field `{}`",
                                 schema.name, name.name
                             )));
-                        }
-                        // A whole-`Vec` field write (`rec.data = other.data`)
+                        };
+                        // A whole-`Vec` field write (`dst.data = src.data`)
                         // lowers to `Stmt::RecordFieldWrite { index: None }`
                         // — the tbir backend renders it as `name.field = e`,
                         // a plain `std::array` copy, mirroring v1's C++
-                        // member assignment. The RHS is a whole-`Vec` read
-                        // (another record's field), lowered above. (Element
-                        // writes `rec.data[i] = v` are handled earlier.)
+                        // member assignment. The ONLY admissible RHS is a
+                        // whole-`Vec` read of a record field with a MATCHING
+                        // shape (same `vec_len`, same element type/width).
+                        // We do NOT route a Vec-target RHS through
+                        // `lower_expr_no_ports`, because the read arm
+                        // (correctly) rejects every whole-`Vec` field read —
+                        // including the matching one. Build the RHS
+                        // `Expr::RecordField { index: None }` directly here
+                        // after verifying the shape, and reject any other
+                        // RHS (scalar, mismatched-shape field, …) with a
+                        // structured diagnostic so the tbir backend never
+                        // emits a `std::array = <scalar>` miscompile.
+                        // (Element writes `rec.data[i] = v` are handled
+                        // earlier.)
+                        if let Some(dst_len) = fld.vec_len {
+                            let dst_field = name.name.clone();
+                            let dst_elem_ty = fld.ty.clone();
+                            let dst_rec = schema.name.clone();
+                            let mismatch = || {
+                                unsupported(
+                                    &format!(
+                                        "a whole-`Vec` write of record field `{dst_rec}.{dst_field}` \
+                                         with a non-matching RHS"
+                                    ),
+                                    "assign the field element-wise \
+                                     (`{rec}.{field}[i] = ...`)",
+                                )
+                            };
+                            // RHS must be `<rec>.<field>` (a bare whole-`Vec`
+                            // field read) — never an indexed element, call,
+                            // or scalar.
+                            let ExprKind::Field {
+                                target: rhs_ft,
+                                name: rhs_name,
+                            } = &*value.kind
+                            else {
+                                return Err(mismatch());
+                            };
+                            let ExprKind::Ident(rhs_root) = &*rhs_ft.kind else {
+                                return Err(mismatch());
+                            };
+                            let Some(rhs_local) = self.lookup(&rhs_root.name) else {
+                                return Err(mismatch());
+                            };
+                            let Some(rhs_rid) = self.record_of_local(rhs_local) else {
+                                return Err(mismatch());
+                            };
+                            let rhs_schema = &self.ctx.records[rhs_rid.index()];
+                            let Some(rhs_fld) = rhs_schema.field(&rhs_name.name) else {
+                                return Err(mismatch());
+                            };
+                            // Shape match: both Vec, same length, same
+                            // element type/width.
+                            if rhs_fld.vec_len != Some(dst_len)
+                                || rhs_fld.ty != dst_elem_ty
+                            {
+                                return Err(mismatch());
+                            }
+                            let rhs_field = rhs_name.name.clone();
+                            self.push(Stmt::RecordFieldWrite {
+                                local,
+                                field: dst_field,
+                                index: None,
+                                value: Expr::RecordField {
+                                    local: rhs_local,
+                                    field: rhs_field,
+                                    index: None,
+                                },
+                            });
+                            return Ok(());
+                        }
+                        // Scalar field write: RHS is an ordinary scalar
+                        // expression, lowered through the normal path.
                         let e = self.lower_expr_no_ports(value)?;
                         self.push(Stmt::RecordFieldWrite {
                             local,

@@ -196,18 +196,33 @@ impl FuncBuilder<'_> {
                     if let Some(local) = self.lookup(&root.name) {
                         if let Some(rid) = self.record_of_local(local) {
                             let schema = &self.ctx.records[rid.index()];
-                            if schema.field(&name.name).is_none() {
+                            let Some(fld) = schema.field(&name.name) else {
                                 return Err(LowerError::Invalid(format!(
                                     "transaction `{}` has no field `{}`",
                                     schema.name, name.name
                                 )));
+                            };
+                            // A whole-`Vec` field read has no scalar value:
+                            // in any scalar/format/assert context the tbir
+                            // backend would emit the raw `std::array` member
+                            // into a position that expects an integer, which
+                            // miscompiles as a raw clang error rather than a
+                            // structured HARC diagnostic. Reject it here. The
+                            // ONLY sanctioned whole-`Vec` field use is a
+                            // `dst.field = src.field` array copy, which the
+                            // write arm (`stmts.rs`) special-cases without
+                            // routing the RHS through this read path. Element
+                            // access (`rec.data[i]`) is handled in the
+                            // `Index` arm.
+                            if fld.vec_len.is_some() {
+                                return Err(unsupported(
+                                    &format!(
+                                        "a whole-`Vec` read of record field `{}.{}`",
+                                        schema.name, name.name
+                                    ),
+                                    "index the field element-wise (`{rec}.{field}[i]`)",
+                                ));
                             }
-                            // A whole-`Vec` field read (`rec.data`) lowers
-                            // to `Expr::RecordField { index: None }` — the
-                            // tbir backend renders it as `name.field`, the
-                            // whole `std::array` member, mirroring v1's
-                            // plain C++ member access. (Element access
-                            // `rec.data[i]` is handled in the `Index` arm.)
                             return Ok(Expr::RecordField {
                                 local,
                                 field: name.name.clone(),
