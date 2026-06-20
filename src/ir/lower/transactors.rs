@@ -1207,20 +1207,21 @@ fn check_scalar_ty(
     check_scalar_ty_max(tname, mname, what, ty, 64)
 }
 
-/// Active-method value param: the tbir wide-value ABI mirrors v1's
-/// `_harc_u128` model for a `uint<N>`/`sint<N>` param up to 128 bits — the
-/// method body moves the value to a wide DUT port / compares it, with no
-/// host-side arithmetic that the `__uint128_t` C++ type cannot express.
-/// Wider than 128 bits (v1's `HarcWide<N>`) is out of subset — wide
-/// register-array values + their ABI are a larger slice — and rejected
-/// precisely.
+/// Active-method value param: the tbir wide-value ABI mirrors v1's value
+/// model for any `uint<N>`/`sint<N>` param width — ≤64 bits is u64-backed,
+/// 65..128 bits use `_harc_u128` (`__uint128_t`), and `>128` bits use the
+/// shared `HarcWide<N>` word-array storage (`local_scalar_cty`). The method
+/// body moves the value to a wide DUT port / compares it / hex-formats it,
+/// all of which the runtime supports for every width, so no width ceiling
+/// applies here (`u32::MAX` = effectively unbounded). Non-scalar param types
+/// are still rejected precisely.
 fn check_method_param_ty(
     tname: &str,
     mname: &str,
     what: &str,
     ty: Option<&TypeExpr>,
 ) -> Result<(), LowerError> {
-    check_scalar_ty_max(tname, mname, what, ty, 128)
+    check_scalar_ty_max(tname, mname, what, ty, u32::MAX)
 }
 
 /// Shared scalar-type gate parameterized by the maximum allowed bit width
@@ -1285,10 +1286,11 @@ fn record_id_of_type(ctx: &super::LowerCtx, t: &TypeExpr) -> Option<ir::RecordId
 /// by value — the method body binds the record param and reads its
 /// fields, mirroring v1's by-value struct param). Everything else goes
 /// through `check_method_param_ty` and lowers as a scalar (`uint<N>`/
-/// `sint<N>`/`bool`); widths up to 128 bits flow through the wide-value
-/// ABI (`_harc_u128`), a wider width or other non-scalar type is rejected
-/// precisely there. The `Vec`-of-record / nested-record cases are not
-/// reachable: a record param is a flat value-record, exactly as v1 emits.
+/// `sint<N>`/`bool`); any width flows through the wide-value ABI (u64 /
+/// `_harc_u128` / `HarcWide<N>` per `local_scalar_cty`), and a non-scalar
+/// type is rejected precisely there. The `Vec`-of-record / nested-record
+/// cases are not reachable: a record param is a flat value-record, exactly
+/// as v1 emits.
 fn method_param_ir_type(
     tname: &str,
     mname: &str,
