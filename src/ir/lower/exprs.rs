@@ -457,10 +457,19 @@ impl FuncBuilder<'_> {
                 // Bare `time` value in expression position (`let t : time =
                 // 100ns`). v1's `emit_expr_with_arrow` emits the leading
                 // numeric portion verbatim (no unit conversion) and types
-                // the local `uint64_t`. Mirror that exactly: take the digit/
-                // underscore prefix, strip underscores, parse as u64. (This
-                // is NOT the `wait <dur>` path, which converts to ps via
-                // `time_literal_to_ps` — a different surface.)
+                // the local `uint64_t`. We mirror that for the common case:
+                // take the digit/underscore prefix, strip underscores, parse
+                // as u64. (This is NOT the `wait <dur>` path, which converts
+                // to ps via `time_literal_to_ps` — a different surface.)
+                //
+                // INTENTIONAL DIVERGENCE from v1 (authorized 2026-06-19, see
+                // the "Time-literal digit separators" note in tbir-mvp.md):
+                // for a digit-separated literal like `1_000ns`, v1 emits the
+                // prefix verbatim — `uint64_t t = 1_000;` — which is a C++
+                // compile error (no `operator""_000`). We strip the `_` and
+                // lower `1000`, which is what the source plainly means. tbir
+                // is the more-correct backend here; v1's behavior is a legacy
+                // limitation, not a contract we preserve.
                 let digits: String = s
                     .chars()
                     .take_while(|c| c.is_ascii_digit() || *c == '_')
