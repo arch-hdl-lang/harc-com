@@ -1484,6 +1484,172 @@ end test StructVecTest
     assert!(msg.contains("non-scalar"), "names the reason: {msg}");
 }
 
+/// A whole-`Vec` record-field READ in scalar position (here a format
+/// arg) must be REJECTED with a structured diagnostic — NOT lowered into
+/// `harc_printf_ll(r.data)`, which miscompiles as a raw clang error
+/// ("cannot convert std::array to long long"). Regression guard for the
+/// over-broad rejection removal in #443.
+#[test]
+fn whole_vec_field_read_in_format_arg_is_rejected() {
+    let src = r#"
+struct Bundle
+    data : Vec<uint<32>, 4>
+end struct Bundle
+
+test WholeVecReadTest
+    let dut : Top
+    run
+        let r : Bundle
+        r.data[0] = 1
+        log(info, "${r.data}")
+    end run
+end test WholeVecReadTest
+"#;
+    let err = lower_src(src).expect_err("whole-Vec field read must be rejected");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("whole-`Vec` read of record field"),
+        "names the read: {msg}"
+    );
+    assert!(
+        msg.contains("Bundle.data"),
+        "names the offending field: {msg}"
+    );
+}
+
+/// A whole-`Vec` record-field READ compared in an `assert` must be
+/// rejected too (it only "worked" by luck before this guard).
+#[test]
+fn whole_vec_field_read_in_assert_is_rejected() {
+    let src = r#"
+struct Bundle
+    data : Vec<uint<32>, 4>
+end struct Bundle
+
+test WholeVecAssertTest
+    let dut : Top
+    run
+        let r : Bundle
+        r.data[0] = 1
+        assert r.data == r.data else fail("nope")
+    end run
+end test WholeVecAssertTest
+"#;
+    let err = lower_src(src).expect_err("whole-Vec field read in assert must be rejected");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("whole-`Vec` read of record field"),
+        "names the read: {msg}"
+    );
+}
+
+/// A scalar RHS assigned into a whole-`Vec` record field
+/// (`dst.data = 5`) must be REJECTED — NOT lowered into
+/// `dst.data = 5;`, which miscompiles ("no viable overloaded '='" on
+/// `std::array`). Only a matching-shape whole-`Vec` field read RHS is
+/// admissible.
+#[test]
+fn scalar_rhs_into_whole_vec_field_is_rejected() {
+    let src = r#"
+struct Bundle
+    data : Vec<uint<32>, 4>
+end struct Bundle
+
+test ScalarRhsTest
+    let dut : Top
+    run
+        let dst : Bundle
+        dst.data = 5
+    end run
+end test ScalarRhsTest
+"#;
+    let err = lower_src(src).expect_err("scalar RHS into whole-Vec field must be rejected");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("whole-`Vec` write of record field"),
+        "names the write: {msg}"
+    );
+    assert!(
+        msg.contains("non-matching RHS"),
+        "names the reason: {msg}"
+    );
+}
+
+/// A whole-`Vec` field copy whose RHS field has a MISMATCHED shape
+/// (different element width) must be rejected — the C++ `std::array`
+/// copy would be ill-typed.
+#[test]
+fn mismatched_shape_whole_vec_copy_is_rejected() {
+    let src = r#"
+struct Wide
+    data : Vec<uint<32>, 4>
+end struct Wide
+
+struct Narrow
+    data : Vec<uint<16>, 4>
+end struct Narrow
+
+test MismatchTest
+    let dut : Top
+    run
+        let w : Wide
+        let n : Narrow
+        n.data[0] = 1
+        w.data = n.data
+    end run
+end test MismatchTest
+"#;
+    let err = lower_src(src).expect_err("mismatched-shape whole-Vec copy must be rejected");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("non-matching RHS"),
+        "names the reason: {msg}"
+    );
+}
+
+/// The sanctioned whole-`Vec` field copy (`dst.data = src.data`, same
+/// element type and length) STILL lowers cleanly — the #443 feature is
+/// preserved. Lowers to a `RecordFieldWrite { index: None }` whose value
+/// is the matching whole-`Vec` `RecordField { index: None }` read.
+#[test]
+fn matching_whole_vec_field_copy_still_lowers() {
+    let src = r#"
+struct Bundle
+    data : Vec<uint<32>, 4>
+end struct Bundle
+
+test CopyTest
+    let dut : Top
+    run
+        let src : Bundle
+        let dst : Bundle
+        src.data[0] = 1
+        dst.data = src.data
+    end run
+end test CopyTest
+"#;
+    let prog = lower_src(src).expect("matching whole-Vec field copy lowers");
+    let found = prog
+        .functions
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.stmts)
+        .any(|s| {
+            matches!(
+                s,
+                ir::Stmt::RecordFieldWrite {
+                    index: None,
+                    value: ir::Expr::RecordField { index: None, .. },
+                    ..
+                }
+            )
+        });
+    assert!(
+        found,
+        "expected a whole-Vec RecordFieldWrite copy in the lowered body"
+    );
+}
+
 /// A `struct` and a `transaction` sharing a name would resolve
 /// ambiguously through `record_ids`; reject the collision.
 #[test]
