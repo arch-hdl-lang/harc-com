@@ -310,11 +310,13 @@ impl Display for TbProgram {
                 CovTrigger::Hook {
                     receiver_path,
                     method,
+                    param_names,
                     side,
                 } => format!(
-                    "@({}.{}() {})",
+                    "@({}.{}({}) {})",
                     receiver_path.join("."),
                     method,
+                    param_names.join(", "),
                     match side {
                         crate::ast::HookSide::Pre => "pre",
                         crate::ast::HookSide::Post => "post",
@@ -898,6 +900,14 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
                 inst.tb_field, inst.covgroup.0
             )
         }
+        Expr::CovHookParam {
+            param,
+            field,
+            index,
+        } => match index {
+            Some(i) => format!("CovHookParam({param}.{field}[{}])", expr_str(func, i)),
+            None => format!("CovHookParam({param}.{field})"),
+        },
         Expr::SeqLen(l) => format!("SeqLen({})", local_str(func, *l)),
         Expr::SeqIndex { seq, index } => {
             format!(

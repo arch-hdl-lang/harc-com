@@ -290,6 +290,22 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         Expr::CovBin { inst, point, bin } => {
             format!("_tb.{}.{point}.{bin}", inst.tb_field)
         }
+        // Hook-param cover target (`cover t.burst`). The `param` name is
+        // the hookable method's by-value closure argument, so it renders as
+        // a plain member access — same shape as `RecordField`. This is only
+        // reached from the hook-sampler closure (see `cover_expr_cpp`); a
+        // general expression position never carries one.
+        Expr::CovHookParam {
+            param,
+            field,
+            index,
+        } => match index {
+            Some(idx) => {
+                let i = expr_cpp(cx, idx)?;
+                format!("{param}.{field}[{i}]")
+            }
+            None => format!("{param}.{field}"),
+        },
         // Composite-component scalar field read: self-relative inside a
         // method body (`self.count`) or a dotted path from a test-scope
         // component local (`env.sb.count`). Both name plain by-value C++

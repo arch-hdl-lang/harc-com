@@ -85,6 +85,7 @@ multi_clock_test | MultiClockSync | multi_clock.sv | - | pass | async_fifo_domai
 cov_cross_bins_test | Top | top_counter.sv | top_counter.arch | pass
 cov_expr_targets_test | Top | top_counter.sv | top_counter.arch | pass
 covergroup_hook_trigger_test | Top | top_counter.sv | - | pass
+covergroup_hook_param_test | Top | top_counter.sv | - | pass
 wait_any_of_test | Top | top_counter.sv | top_counter.arch | pass
 wait_any_of_timeout_test | Top | top_counter.sv | top_counter.arch | fail
 transaction_basic_test | Top | top_counter.sv | top_counter.arch | pass

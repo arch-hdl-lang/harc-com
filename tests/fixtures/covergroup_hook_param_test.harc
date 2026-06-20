@@ -1,0 +1,115 @@
+// Hook-PARAMETER covergroup (`covergroup G @(<hook_call> post)` with
+// `cover t.<field>`): the covergroup samples the hookable method's
+// transaction parameter `cmd` — NOT a DUT port — at the method's pre/post
+// boundary. This pins v1 parity for spec §6.2's hook-param coverpoints:
+// the sample closure takes the hook method's args by value, so a
+// coverpoint target `cover cmd.ticks` reads the record field on the
+// incoming argument.
+//
+// `CounterDriver.run_for(cmd: RunCmd)` pulses the counter DUT (`Top` from
+// top_counter_test) `en` for `cmd.ticks` cycles. The covergroup
+// `RunCmdCov @(drv.run_for(cmd) post)` samples `cmd.ticks` and
+// `cmd.expect` AFTER each call. With a fixed command schedule the hit
+// bins are fully determined and independent of the clock period.
+//
+// Uses only the v1-supported surface (record-by-value hook param +
+// hook-param coverpoints), so the same file passes under `--codegen v1`
+// and `--codegen tbir`; the equivalence harness trace-diffs the two.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction RunCmd
+    ticks  : uint<8>  default 1
+    expect : uint<32> default 0
+end transaction RunCmd
+
+covergroup RunCmdCov @(drv.run_for(cmd) post)
+    cp_ticks : cover cmd.ticks
+        bins
+            one  = {1}
+            pair = [2..3]
+        end bins
+    cp_expect : cover cmd.expect
+        bins
+            small = [1..3]
+            big   = [4..15]
+        end bins
+    cross cp_ticks, cp_expect
+end covergroup RunCmdCov
+
+transactor CounterDriver
+    dut : Top
+
+    when active
+        // Drive `en` high for `cmd.ticks` cycles, then drop it. Reads
+        // the record param `cmd` by value inside the body.
+        hookable run_for(cmd: RunCmd)
+            dut.en = 1
+            for _ in 1 .. cmd.ticks
+                wait 1 cycle
+            end for
+            dut.en = 0
+            wait 1 cycle
+        end run_for
+    end when
+end transactor CounterDriver
+
+testbench CovHookParamTb
+    dut : Top
+    drv : CounterDriver active
+    cov : RunCmdCov
+end testbench CovHookParamTb
+
+impl CovHookParamTest for CovHookParamTb
+    clock clk = SysDomain        // 100 MHz
+
+    run
+        log(info, "covergroup hook-param test")
+        drv.dut = dut
+
+        // Reset for 3 cycles.
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        assert dut.count_out == 0
+            else fail("after reset: count_out=${dut.count_out}, expected 0")
+        dut.rst = 0
+        wait 1 cycle
+
+        // Three commands of increasing length (1, 2, 3 ticks). Each
+        // bumps the running total; `run_for` consumes the record by
+        // value and pulses `en` for `cmd.ticks` cycles. The post-hook
+        // samples cmd.ticks / cmd.expect after each call:
+        //   cmd[0]: ticks=1 expect=1   (one  / small)
+        //   cmd[1]: ticks=2 expect=3   (pair / small)
+        //   cmd[2]: ticks=3 expect=6   (pair / big)
+        // So cp_ticks: one=1, pair=2; cp_expect: small=2, big=1.
+        let total = 0
+        for i in 0 .. 2
+            let cmd : RunCmd
+            cmd.ticks = cmd.ticks + i        // 1, 2, 3
+            total = total + cmd.ticks
+            cmd.expect = total
+
+            drv.run_for(cmd)
+
+            assert dut.count_out == cmd.expect
+                else fail("cmd[${i}]: count_out=${dut.count_out}, expected ${cmd.expect}")
+            log(info, "cmd[${i}] ticks=${cmd.ticks} expect=${cmd.expect}")
+        end for
+
+        wait 2 cycles
+        log(info, "PASS: hook-param covergroup sampled at each call")
+    end run
+
+    check
+        cov.report()
+        assert cov.cp_ticks.one == 1 else fail("ticks one bin")
+        assert cov.cp_ticks.pair == 2 else fail("ticks pair bin")
+        assert cov.cp_expect.small == 2 else fail("expect small bin")
+        assert cov.cp_expect.big == 1 else fail("expect big bin")
+        log(info, "coverage assertions passed")
+    end check
+end impl CovHookParamTest

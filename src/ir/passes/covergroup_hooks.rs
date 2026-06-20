@@ -35,6 +35,7 @@ pub fn run(prog: &mut TbProgram) -> Result<(), LowerError> {
         covgroup: CovgroupId,
         receiver_path: Vec<String>,
         method: String,
+        param_names: Vec<String>,
         side: crate::ast::HookSide,
         tb_index: usize,
         cov_field: String,
@@ -46,6 +47,7 @@ pub fn run(prog: &mut TbProgram) -> Result<(), LowerError> {
             if let CovTrigger::Hook {
                 receiver_path,
                 method,
+                param_names,
                 side,
             } = &schema.trigger
             {
@@ -53,6 +55,7 @@ pub fn run(prog: &mut TbProgram) -> Result<(), LowerError> {
                     covgroup: *cg,
                     receiver_path: receiver_path.clone(),
                     method: method.clone(),
+                    param_names: param_names.clone(),
                     side: *side,
                     tb_index,
                     cov_field: cov_field.clone(),
@@ -96,6 +99,32 @@ pub fn run(prog: &mut TbProgram) -> Result<(), LowerError> {
                 p.method, p.cov_field
             )));
         };
+        // Trigger argument names must match the hookable method's
+        // parameter names, in order — v1's emit-time check. This binds
+        // each `cover <param>.<field>` target to a real by-value closure
+        // argument (named after the method param) in the sampler.
+        let method_schema = &prog.transactors[xid.index()].methods[midx];
+        let func = prog.function(method_schema.function);
+        let method_params: Vec<&str> = func.params.iter().map(|p| p.name.as_str()).collect();
+        if p.param_names.len() != method_params.len() {
+            return Err(LowerError::Invalid(format!(
+                "covergroup `{cg_name}` hook trigger `{field}.{}` (cov field `{}`) expects {} \
+                 argument(s), got {}",
+                p.method,
+                p.cov_field,
+                method_params.len(),
+                p.param_names.len()
+            )));
+        }
+        for (arg, param) in p.param_names.iter().zip(method_params.iter()) {
+            if arg != param || arg == "_" {
+                return Err(LowerError::Invalid(format!(
+                    "covergroup `{cg_name}` hook trigger argument `{arg}` must match hook \
+                     parameter `{param}` on `{field}.{}` (cov field `{}`)",
+                    p.method, p.cov_field
+                )));
+            }
+        }
         prog.transactors[xid.index()].methods[midx]
             .cov_hook_subs
             .push((p.covgroup, p.side));
