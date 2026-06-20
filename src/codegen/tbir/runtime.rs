@@ -523,7 +523,11 @@ pub(super) fn mt_worker_setup(out: &mut String, actor_threads: &[(String, String
         return;
     }
     let n = actor_threads.len();
-    writeln!(out, "{INDENT}// Phase 3a: per-actor OS threads with dual barrier sync.").ok();
+    writeln!(
+        out,
+        "{INDENT}// Phase 3a: per-actor OS threads with dual barrier sync."
+    )
+    .ok();
     writeln!(
         out,
         "{INDENT}// {n} actor(s) → {} barrier participants (main + workers).",
@@ -561,7 +565,11 @@ pub(super) fn mt_worker_shutdown(out: &mut String, actor_threads: &[(String, Str
         return;
     }
     writeln!(out).ok();
-    writeln!(out, "{INDENT}_shutdown.store(true, std::memory_order_release);").ok();
+    writeln!(
+        out,
+        "{INDENT}_shutdown.store(true, std::memory_order_release);"
+    )
+    .ok();
     writeln!(out, "{INDENT}_start_barrier.wait();").ok();
     writeln!(out, "{INDENT}for (auto& _w : _workers) _w.join();").ok();
 }

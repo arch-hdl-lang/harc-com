@@ -788,13 +788,7 @@ fn emit_stmt(
             }
         }
         Stmt::TransactorSelfCall { dest, call } => {
-            let Expr::Call(
-                CallTarget::TransactorSelfMethod {
-                    transactor,
-                    method,
-                },
-                args,
-            ) = call
+            let Expr::Call(CallTarget::TransactorSelfMethod { transactor, method }, args) = call
             else {
                 return Err(EmitError(format!(
                     "tbir: TransactorSelfCall in {} carries a non-self-call payload \
@@ -1931,7 +1925,15 @@ pub(super) fn emit_component_method(
     depth: usize,
 ) -> Result<(), EmitError> {
     let lambda = format!("{}_{}", comp.name, m.name);
-    emit_component_fn_lambda(out, prog, comp, m.function, &lambda, randomize_snippets, depth)
+    emit_component_fn_lambda(
+        out,
+        prog,
+        comp,
+        m.function,
+        &lambda,
+        randomize_snippets,
+        depth,
+    )
 }
 
 /// Emit one `on <ev>(arg)` handler body as a free
@@ -1947,7 +1949,15 @@ pub(super) fn emit_component_on_handler(
     depth: usize,
 ) -> Result<(), EmitError> {
     let lambda = on_handler_lambda_name(comp, oh);
-    emit_component_fn_lambda(out, prog, comp, oh.function, &lambda, randomize_snippets, depth)
+    emit_component_fn_lambda(
+        out,
+        prog,
+        comp,
+        oh.function,
+        &lambda,
+        randomize_snippets,
+        depth,
+    )
 }
 
 /// The free-lambda name for an on-handler (`<Comp>_on_h<fid>`).
@@ -1970,7 +1980,15 @@ pub(super) fn emit_component_periodic_handler(
     depth: usize,
 ) -> Result<(), EmitError> {
     let lambda = periodic_handler_lambda_name(comp, ph);
-    emit_component_fn_lambda(out, prog, comp, ph.function, &lambda, randomize_snippets, depth)
+    emit_component_fn_lambda(
+        out,
+        prog,
+        comp,
+        ph.function,
+        &lambda,
+        randomize_snippets,
+        depth,
+    )
 }
 
 /// The free-lambda name for a periodic handler (`<Comp>_periodic_h<fid>`).
@@ -1995,7 +2013,15 @@ pub(super) fn emit_component_cycle_handler(
     depth: usize,
 ) -> Result<(), EmitError> {
     let lambda = cycle_handler_lambda_name(comp, ch);
-    emit_component_fn_lambda(out, prog, comp, ch.function, &lambda, randomize_snippets, depth)
+    emit_component_fn_lambda(
+        out,
+        prog,
+        comp,
+        ch.function,
+        &lambda,
+        randomize_snippets,
+        depth,
+    )
 }
 
 /// The free-lambda name for a cycle-trigger handler (`<Comp>_cycle_h<fid>`).
@@ -2021,7 +2047,15 @@ pub(super) fn emit_component_watchdog(
     depth: usize,
 ) -> Result<(), EmitError> {
     let lambda = watchdog_lambda_name(comp, w);
-    emit_component_fn_lambda(out, prog, comp, w.function, &lambda, randomize_snippets, depth)
+    emit_component_fn_lambda(
+        out,
+        prog,
+        comp,
+        w.function,
+        &lambda,
+        randomize_snippets,
+        depth,
+    )
 }
 
 /// The free-lambda name for a watchdog body (`<Comp>_watchdog<fid>`).

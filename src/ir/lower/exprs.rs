@@ -265,9 +265,7 @@ impl FuncBuilder<'_> {
                         {
                             return self.lower_tb_method_call(&id.name, args);
                         }
-                        if let Some(call) =
-                            self.lower_transactor_self_call(&id.name, args, true)?
-                        {
+                        if let Some(call) = self.lower_transactor_self_call(&id.name, args, true)? {
                             return Ok(call);
                         }
                         if self.helpers.contains(&id.name) {
@@ -411,15 +409,13 @@ impl FuncBuilder<'_> {
                 // scalar slice. A variable part-select (`x[s +: W]` with a
                 // non-const offset) does not fold and stays out of subset.
                 match (parse_int_literal_expr(hi), parse_int_literal_expr(lo)) {
-                    (Some(h), Some(l)) if h >= l => {
-                        match (u32::try_from(h), u32::try_from(l)) {
-                            (Ok(hi), Ok(lo)) => {
-                                let target = Box::new(self.lower_expr(target)?);
-                                Ok(Expr::BitSlice { target, hi, lo })
-                            }
-                            _ => Err(unsupported("bit-slice bounds above 2^32", "")),
+                    (Some(h), Some(l)) if h >= l => match (u32::try_from(h), u32::try_from(l)) {
+                        (Ok(hi), Ok(lo)) => {
+                            let target = Box::new(self.lower_expr(target)?);
+                            Ok(Expr::BitSlice { target, hi, lo })
                         }
-                    }
+                        _ => Err(unsupported("bit-slice bounds above 2^32", "")),
+                    },
                     _ => Err(unsupported(
                         "bit-slice expressions with non-constant or hi<lo bounds",
                         "only literal `x[hi:lo]` bounds with hi >= lo are lowered",
@@ -455,9 +451,9 @@ impl FuncBuilder<'_> {
                     .take_while(|c| c.is_ascii_digit() || *c == '_')
                     .filter(|c| *c != '_')
                     .collect();
-                let value = digits.parse::<u64>().map_err(|_| {
-                    unsupported("time literal with no leading numeric value", "")
-                })?;
+                let value = digits
+                    .parse::<u64>()
+                    .map_err(|_| unsupported("time literal with no leading numeric value", ""))?;
                 Ok(Expr::Literal {
                     value,
                     ty: IrType::UInt(Some(64)),

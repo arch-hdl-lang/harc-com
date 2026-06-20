@@ -142,7 +142,10 @@ fn lower_hook_call(group: &str, call: &AstExpr) -> Result<(Vec<String>, String),
     loop {
         match &*cur.kind {
             ExprKind::Paren(inner) => cur = inner,
-            ExprKind::Field { target: inner, name } => {
+            ExprKind::Field {
+                target: inner,
+                name,
+            } => {
                 path.push(name.name.clone());
                 cur = inner;
             }
