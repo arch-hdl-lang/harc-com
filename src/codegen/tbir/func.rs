@@ -1051,7 +1051,11 @@ fn emit_stmt(
         // inside a method body, or `env.sb.errors = ...` from the test.
         Stmt::ComponentFieldWrite { base, field, value } => {
             let e = expr_cpp(cx, value)?;
-            writeln!(out, "{pad}{}.{field} = {e};", comp_base_cpp(base)).ok();
+            // cx-aware so a `self.<field>` write re-roots at the running
+            // instance under `cx.self_subst` (the `--mt` active-driver worker
+            // coroutine has no `self` parameter). Byte-identical to the bare
+            // `comp_base_cpp` when `self_subst` is `None` (every prior site).
+            writeln!(out, "{pad}{}.{field} = {e};", comp_base_cpp_subst_cx(cx, base)).ok();
         }
         // `emit observed(v)` inside a method body: fan the args out to
         // every subscriber registered on `self.<event>`, then bump the
@@ -2505,6 +2509,120 @@ fn emit_responder_loop_switch(
     writeln!(out, "{pad_case}default: __done = true; break;").ok();
     writeln!(out, "{}}}", INDENT.repeat(depth + 1)).ok(); // switch
     writeln!(out, "{}}}", INDENT.repeat(depth)).ok(); // while
+    Ok(())
+}
+
+/// Re-lower an `active` bound event-driven transactor's `on <ev>(arg)`
+/// driver into a queue-fed worker-coroutine actor under `--mt`, mirroring
+/// v1's `try_emit_bound_driver_actor` (`cpp_tb.rs:7258-7513`). For each
+/// `on <ev>` handler the component declares:
+///
+///   1. a per-instance `std::deque<Payload> _<inst>_<ev>_q;` stimulus queue;
+///   2. a *pusher* subscriber `<inst>.<ev>.push_back([&](auto _t){
+///      _q.push_back(_t); });` — `emit <inst>.<ev>(t)` now ENQUEUES from
+///      the run coroutine instead of running the body inline;
+///   3. an actor `ThreadSlot` (its own `ThreadScheduler` under `--mt` via
+///      `register_actor_slot`); and
+///   4. a worker coroutine that loops `co_await wait_until(!_q.empty())`,
+///      pops the front transaction, bumps `_last_in_cycle`, then runs the
+///      handler body as a coroutine loop-switch (waits/bus handshakes lower
+///      to `co_await`, so the driver yields each cycle and shares the
+///      per-posedge barrier window with the bound monitor).
+///
+/// The cooperative-default path keeps the synchronous on-handler subscriber
+/// (`emit_on_handler_regs`) — this is emitted only when `mt` is true and
+/// the instance is an `active` bound driver, so default output is unchanged.
+pub(super) fn emit_active_bound_driver_actor(
+    out: &mut String,
+    prog: &TbProgram,
+    component: crate::ir::ComponentId,
+    inst_path: &str,
+    bindings: &[BusBindingSchema],
+    actor_threads: &mut Vec<(String, String)>,
+    depth: usize,
+) -> Result<(), EmitError> {
+    let comp = &prog.components[component.index()];
+    let inst_tag = inst_path.replace('.', "_");
+    let pad = INDENT.repeat(depth);
+    let pad1 = INDENT.repeat(depth + 1);
+    let pad2 = INDENT.repeat(depth + 2);
+    for oh in &comp.on_handlers {
+        let func = prog.function(oh.function);
+        let names = cpp_local_names(func);
+        let empty_lanes = HashMap::new();
+        // Driver bodies poke the bound bus's DUT wires (already prefix-filled
+        // at lowering) and forward downstream blocking TLM calls; no probes.
+        // `self_subst = inst_path` so a `self.<field>` access (`self.last_read
+        // = val`) resolves to the running instance (`drv.last_read`) — the
+        // worker coroutine has no `self` parameter, unlike the synchronous
+        // on-handler lambda.
+        let cx = ECx {
+            func,
+            names: &names,
+            lanes: &empty_lanes,
+            self_subst: Some(inst_path),
+            dut_type: "",
+            trace_component: inst_path,
+        };
+        let payload_ty = crate::codegen::tbir::runtime::event_payload_cty(
+            &oh.arg_payload,
+            &prog.records,
+        );
+        let queue_var = format!("_{inst_tag}_{}_q", oh.event);
+        let slot_var = format!("_{inst_tag}_{}_drv_slot", oh.event);
+        let sched_var = format!("_{inst_tag}_{}_drv_sched", oh.event);
+        // 1. Stimulus queue.
+        writeln!(out, "{pad}std::deque<{payload_ty}> {queue_var};").ok();
+        // 2. Pusher subscriber: `emit <inst>.<ev>(t)` enqueues.
+        writeln!(
+            out,
+            "{pad}{inst_path}.{}.push_back([&](auto _t) {{ {queue_var}.push_back(_t); }});",
+            oh.event
+        )
+        .ok();
+        // 3. Actor slot (own ThreadScheduler under --mt).
+        crate::codegen::tbir::runtime::register_actor_slot(
+            out,
+            true,
+            actor_threads,
+            &sched_var,
+            &slot_var,
+            depth,
+        );
+        // 4. Worker coroutine: pop a transaction, bump activity, run body.
+        writeln!(
+            out,
+            "{pad}{slot_var}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+        )
+        .ok();
+        writeln!(out, "{pad1}while (true) {{").ok();
+        writeln!(
+            out,
+            "{pad2}co_await harc_rt::wait_until(_slot, [&]{{ return !{queue_var}.empty(); }});"
+        )
+        .ok();
+        // The handler's single param local is the dequeued transaction.
+        let arg_name = &names[0];
+        let arg_decl_ty = match func.locals[0].ty {
+            IrType::Record(r) => prog.records[r.index()].name.clone(),
+            _ => "uint64_t".to_string(),
+        };
+        writeln!(out, "{pad2}{arg_decl_ty} {arg_name} = {queue_var}.front();").ok();
+        writeln!(out, "{pad2}{queue_var}.pop_front();").ok();
+        writeln!(
+            out,
+            "{pad2}{inst_path}._last_in_cycle = (uint64_t)cycle_count;"
+        )
+        .ok();
+        // Body as a coroutine loop-switch: param 0 (the txn) is declared
+        // above, so skip it; waits/bus handshakes `co_await` the slot.
+        writeln!(out, "{pad2}{{ // {} (TB-IR active-driver loop-switch)", func.name).ok();
+        emit_responder_loop_switch(out, prog, &cx, func, &names, 1, bindings, depth + 3)?;
+        writeln!(out, "{pad2}}}").ok();
+        writeln!(out, "{pad1}}}").ok(); // while(true)
+        writeln!(out, "{pad1}co_return;").ok();
+        writeln!(out, "{pad}}}(&{slot_var});").ok();
+    }
     Ok(())
 }
 

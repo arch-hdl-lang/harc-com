@@ -196,7 +196,10 @@ pub(super) fn scoreboard_struct(
 /// Mirrors v1's `payload_type_for_arg`: a scalar widens to
 /// `uint64_t`/`int64_t`; a value-record payload is the record struct
 /// (carried by value).
-fn event_payload_cty(p: &crate::ir::EventPayload, records: &[crate::ir::RecordSchema]) -> String {
+pub(super) fn event_payload_cty(
+    p: &crate::ir::EventPayload,
+    records: &[crate::ir::RecordSchema],
+) -> String {
     match p {
         crate::ir::EventPayload::Scalar { signed: true } => "int64_t".to_string(),
         crate::ir::EventPayload::Scalar { signed: false } => "uint64_t".to_string(),
