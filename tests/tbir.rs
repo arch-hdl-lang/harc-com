@@ -5698,3 +5698,55 @@ fn post_eval_provider_dump_ir_snapshot() {
     verify::verify_program(&prog).expect("verifies");
     insta::assert_snapshot!("post_eval_provider_dump_ir", format!("{prog}"));
 }
+
+/// Issue #452: a test-scope `let` read (un-shadowed) at the top level of the
+/// check phase must still be promoted to a `_tb` host field even when an
+/// *unrelated nested* `let` of the same name shadows it elsewhere in the
+/// check body. The old promotion decision flattened every check read and
+/// every check decl into two order-free sets, so any nested same-named decl
+/// suppressed promotion of the outer let — making the top-level read fail to
+/// resolve ("test-scope `let` referenced in the check phase"), a loud
+/// over-rejection of a pattern v1 accepts. The read-site lowering already
+/// resolves an in-scope local first, so the inner shadow's own reads are
+/// handled correctly without promotion; only the decision needed to become
+/// scope-aware. (Verified e2e: this pattern runs clean under both `--codegen
+/// v1` and the default tbir backend.)
+#[test]
+fn check_phase_let_promotes_despite_nested_shadow() {
+    let src = r#"
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+test ShadowPromote
+    let dut : Top
+    let expected_total = 0
+
+    clock clk = SysDomain
+
+    run
+        dut.en = 1
+        expected_total = expected_total + 1
+        wait 1 cycle
+    end run
+
+    check
+        assert expected_total == 1 else fail("outer ${expected_total}")
+        if expected_total == 1
+            let expected_total = 99
+            assert expected_total == 99 else fail("inner ${expected_total}")
+        end if
+    end check
+end test ShadowPromote
+"#;
+    // Old behavior: LowerError::Unsupported ("test-scope `let expected_total`
+    // referenced in the check phase"). With the scope-aware decision it
+    // lowers, verifies, and emits cleanly through the full tbir pipeline.
+    let prog = lower_src(src).expect("scope-aware promotion lets the outer read resolve");
+    verify::verify_program(&prog).expect("verifies");
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("ShadowPromote"),
+        "emitted the test driver"
+    );
+}
