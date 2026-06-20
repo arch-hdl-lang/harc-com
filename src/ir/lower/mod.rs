@@ -2919,26 +2919,25 @@ fn lower_test(
     // a precise narrowing of v1: a non-constant-init check-read let is
     // rejected loudly rather than miscompiled.
     if let Some(s) = scope {
-        let mut check_reads = HashSet::new();
+        // Promote a test-scope `let` when the check/teardown phase has at
+        // least one *un-shadowed* bare read of it. A same-named `let`
+        // declared inside the check body shadows the test-scope let only at
+        // read sites within that inner decl's lexical scope — and the
+        // read-site lowering (`exprs.rs`) already resolves an in-scope local
+        // before the promotion/rejection paths, so a per-site-shadowed read
+        // is handled correctly without any promotion. The decision must
+        // therefore be scope-aware: the old flat "any nested decl of this
+        // name suppresses promotion" rule over-rejected the common case of a
+        // top-level check read alongside an unrelated nested shadow (issue
+        // #452). Conversely we must NOT promote a name read only where it is
+        // shadowed, since promotion drops the run-scope let and would then
+        // require a compile-time-constant initializer.
+        let empty = HashSet::new();
         if let Some(b) = &s.check {
-            collect_idents_in_block(b, &mut check_reads);
+            collect_promotable_check_reads(b, &test_let_names, &empty, &mut promoted_lets);
         }
         if let Some(b) = &s.teardown {
-            collect_idents_in_block(b, &mut check_reads);
-        }
-        // A `let` declared inside the check/teardown body shadows a
-        // same-named test-scope let, so it must not promote the outer one.
-        let mut check_locals = HashSet::new();
-        if let Some(b) = &s.check {
-            collect_local_decls_in_block(b, &mut check_locals);
-        }
-        if let Some(b) = &s.teardown {
-            collect_local_decls_in_block(b, &mut check_locals);
-        }
-        for name in &check_reads {
-            if test_let_names.contains(name) && !check_locals.contains(name) {
-                promoted_lets.insert(name.clone());
-            }
+            collect_promotable_check_reads(b, &test_let_names, &empty, &mut promoted_lets);
         }
     }
     // Promote each captured let: drop its `let` declaration (it becomes a
@@ -3529,6 +3528,143 @@ fn collect_idents_in_stmt(s: &AstStmt, out: &mut HashSet<String>) {
 fn collect_local_decls_in_block(b: &Block, out: &mut HashSet<String>) {
     for s in &b.stmts {
         collect_local_decls_in_stmt(s, out);
+    }
+}
+
+/// Scope-aware companion to `collect_idents_in_block` for check-phase
+/// host-state promotion (issue #452). Collects the test-scope `let` names
+/// (those in `test_let_names`) that have at least one bare read in this
+/// block which is NOT lexically shadowed by an inner same-named `let`.
+///
+/// `in_scope` carries the names declared in enclosing scopes (and, for a
+/// nested block, the enclosing block's earlier decls); a fresh copy is
+/// extended as we walk this block's statements in order, so a `let` takes
+/// effect only for reads that follow it (point-of-declaration), e.g. the
+/// RHS of `let acc = acc + 1` still reads the outer `acc`.
+///
+/// This is the read-collection counterpart to `collect_idents_in_block` —
+/// it mirrors that function's statement coverage exactly, but checks each
+/// read against the live scope rather than flattening every read and every
+/// decl into two order-free sets (which conflated a top-level outer read
+/// with an unrelated nested shadow).
+fn collect_promotable_check_reads(
+    b: &Block,
+    test_let_names: &HashSet<String>,
+    in_scope: &HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    let mut scope = in_scope.clone();
+    for s in &b.stmts {
+        collect_promotable_check_reads_in_stmt(s, test_let_names, &mut scope, out);
+    }
+}
+
+/// Mark every test-scope `let` read in `e` that is not currently in scope.
+/// Within a single expression there are no binding forms, so all idents are
+/// reads evaluated in the same `scope`.
+fn note_promotable_reads_in_expr(
+    e: &crate::ast::Expr,
+    test_let_names: &HashSet<String>,
+    scope: &HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    let mut idents = HashSet::new();
+    collect_idents_in_expr(e, &mut idents);
+    for name in idents {
+        if test_let_names.contains(&name) && !scope.contains(&name) {
+            out.insert(name);
+        }
+    }
+}
+
+fn collect_promotable_check_reads_in_stmt(
+    s: &AstStmt,
+    test_let_names: &HashSet<String>,
+    scope: &mut HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    use crate::ast::CallArg;
+    match &s.kind {
+        StmtKind::Let(l) => {
+            // The initializer is evaluated before the new binding takes
+            // effect, so its reads still see the enclosing `scope`.
+            if let Some(v) = &l.value {
+                note_promotable_reads_in_expr(v, test_let_names, scope, out);
+            }
+            scope.insert(l.name.name.clone());
+        }
+        StmtKind::Assign { target, value } | StmtKind::Send { target, value } => {
+            note_promotable_reads_in_expr(target, test_let_names, scope, out);
+            note_promotable_reads_in_expr(value, test_let_names, scope, out);
+        }
+        StmtKind::Expr(e) => note_promotable_reads_in_expr(e, test_let_names, scope, out),
+        StmtKind::For(f) => {
+            note_promotable_reads_in_expr(&f.iter, test_let_names, scope, out);
+            let mut body_scope = scope.clone();
+            body_scope.insert(f.var.name.clone());
+            collect_promotable_check_reads(&f.body, test_let_names, &body_scope, out);
+        }
+        StmtKind::Repeat(r) => {
+            note_promotable_reads_in_expr(&r.count, test_let_names, scope, out);
+            collect_promotable_check_reads(&r.body, test_let_names, scope, out);
+        }
+        StmtKind::Loop(b) => collect_promotable_check_reads(b, test_let_names, scope, out),
+        StmtKind::While { cond, body, .. } => {
+            note_promotable_reads_in_expr(cond, test_let_names, scope, out);
+            collect_promotable_check_reads(body, test_let_names, scope, out);
+        }
+        StmtKind::If(ifs) => {
+            note_promotable_reads_in_expr(&ifs.cond, test_let_names, scope, out);
+            collect_promotable_check_reads(&ifs.then_block, test_let_names, scope, out);
+            for (c, b) in &ifs.elsifs {
+                note_promotable_reads_in_expr(c, test_let_names, scope, out);
+                collect_promotable_check_reads(b, test_let_names, scope, out);
+            }
+            if let Some(b) = &ifs.else_block {
+                collect_promotable_check_reads(b, test_let_names, scope, out);
+            }
+        }
+        StmtKind::On(h) => {
+            note_promotable_reads_in_expr(&h.event, test_let_names, scope, out);
+            collect_promotable_check_reads(&h.body, test_let_names, scope, out);
+        }
+        StmtKind::Assert(v) | StmtKind::Assume(v) | StmtKind::Cover(v) => {
+            if let Some(e) = &v.expr {
+                note_promotable_reads_in_expr(e, test_let_names, scope, out);
+            }
+            if let Some(e) = &v.else_fail {
+                note_promotable_reads_in_expr(e, test_let_names, scope, out);
+            }
+        }
+        StmtKind::Log { args, .. } | StmtKind::LogF { args, .. } => {
+            for a in args {
+                match a {
+                    CallArg::Expr(e) | CallArg::Named { value: e, .. } => {
+                        note_promotable_reads_in_expr(e, test_let_names, scope, out)
+                    }
+                }
+            }
+        }
+        StmtKind::Return(opt) => {
+            if let Some(e) = opt {
+                note_promotable_reads_in_expr(e, test_let_names, scope, out);
+            }
+        }
+        StmtKind::Yield(e) | StmtKind::Release(e) => {
+            note_promotable_reads_in_expr(e, test_let_names, scope, out)
+        }
+        StmtKind::Wait { duration, .. } => {
+            note_promotable_reads_in_expr(duration, test_let_names, scope, out)
+        }
+        StmtKind::WaitUntil { conditions, .. } => {
+            for c in conditions {
+                note_promotable_reads_in_expr(c, test_let_names, scope, out);
+            }
+        }
+        // Mirrors the `_ => {}` tail of `collect_idents_in_stmt`: any
+        // statement shape not handled there is not a promotion read site in
+        // this subset; a future shape that becomes one must be added to both.
+        _ => {}
     }
 }
 
