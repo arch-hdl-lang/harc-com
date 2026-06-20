@@ -972,6 +972,15 @@ pub struct ComponentFieldBinding {
     /// `connect` edges from the env declaration, resolved to paths. Empty
     /// for non-env components (only `env` carries a `connect` block).
     pub connects: Vec<ConnectEdgeSchema>,
+    /// `true` when this instance is an `active` mode bound event-driven
+    /// transactor (`let drv : AxilXactor active = bind axil`) — its
+    /// `when active` `on <ev>` driver fires on `emit <inst>.<ev>`. `false`
+    /// for a `passive` bound instance (monitor-only) and for every
+    /// non-transactor composite component (env/agent/scoreboard), which
+    /// take no mode. Used by the `--mt` codegen to decide which bound
+    /// instances re-lower their `on <ev>` driver into a queue-fed worker
+    /// coroutine actor; the cooperative-default path ignores it.
+    pub active: bool,
 }
 
 /// One bound-to target-side TLM responder instance (`let target :

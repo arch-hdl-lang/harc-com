@@ -934,22 +934,31 @@ fn emit_on_handler_regs(
     prog: &TbProgram,
     component: ir::ComponentId,
     inst_path: &str,
+    // When true, the top component's OWN `on <ev>` handlers are NOT
+    // registered as synchronous subscribers — they were re-lowered into a
+    // queue-fed worker-coroutine actor (`emit_active_bound_driver_actor`)
+    // under `--mt`, which replaces the synchronous driver. Nested
+    // sub-components are still registered normally. Always `false` on the
+    // cooperative-default path, so default output is unchanged.
+    skip_top_on_handlers: bool,
 ) {
     let comp = &prog.components[component.index()];
-    for oh in &comp.on_handlers {
-        let lambda = func::on_handler_lambda_name(comp, oh);
-        writeln!(
-            out,
-            "{INDENT}{inst_path}.{}.push_back([&](auto _t) {{ {inst_path}._last_in_cycle = (uint64_t)cycle_count; {lambda}({inst_path}, _t); }});",
-            oh.event
-        )
-        .ok();
+    if !skip_top_on_handlers {
+        for oh in &comp.on_handlers {
+            let lambda = func::on_handler_lambda_name(comp, oh);
+            writeln!(
+                out,
+                "{INDENT}{inst_path}.{}.push_back([&](auto _t) {{ {inst_path}._last_in_cycle = (uint64_t)cycle_count; {lambda}({inst_path}, _t); }});",
+                oh.event
+            )
+            .ok();
+        }
     }
     // Recurse into by-value sub-components (an env holding an agent).
     for f in &comp.fields {
         if let ir::ComponentFieldKind::Sub { component: sub } = &f.kind {
             let sub_path = format!("{inst_path}.{}", f.name);
-            emit_on_handler_regs(out, prog, *sub, &sub_path);
+            emit_on_handler_regs(out, prog, *sub, &sub_path, false);
         }
     }
 }
@@ -1458,12 +1467,52 @@ fn emit_test(
             emit_one_connect(out, prog, &cf.field, edge);
         }
         emit_nested_connects(out, prog, cf.component, &cf.field);
+        // An `active` bound event-driven transactor (`let drv : X active =
+        // bind axil`) re-lowers its `on <ev>` driver into a queue-fed
+        // worker-coroutine actor on its own `ThreadScheduler` under `--mt`,
+        // mirroring v1's `try_emit_bound_driver_actor`: a pusher subscriber
+        // makes `emit drv.req(t)` ENQUEUE (non-blocking), and a worker
+        // coroutine drains the queue and drives the bus, yielding
+        // (`co_await wait_cycles`) each cycle so it shares the per-posedge
+        // barrier window with the bound monitor — which is exactly what lets
+        // the cooperative `_checkers` monitor latch observe every handshake
+        // under `--mt` (the gap #448 deferred).
+        //
+        // The synchronous on-handler subscriber (`emit_on_handler_regs`) is
+        // SUPPRESSED for this instance under `--mt`: the worker coroutine IS
+        // the driver now. (v1 leaves a second synchronous subscriber
+        // registered too, but its `tick()`-spinning body would drive the bus
+        // a SECOND time, and the tbir cooperative `_checkers` monitor latch
+        // would then count each handshake twice — 10 writes instead of 5.
+        // v1's monitor is itself a worker coroutine whose `wait_cycles(1)`
+        // cadence happens to mask the redundant second drive; the tbir latch
+        // does not, so emitting both double-counts. Running the driver as the
+        // single concurrent worker is the correct execution model and yields
+        // the right per-codegen verdict.) Cooperative default emits neither
+        // queue nor worker and keeps the synchronous subscriber —
+        // byte-identical output.
+        let bound_drv = &prog.components[cf.component.index()];
+        let relower_driver =
+            mt && cf.active && bound_drv.bound_bus.is_some() && !bound_drv.on_handlers.is_empty();
+        if relower_driver {
+            func::emit_active_bound_driver_actor(
+                out,
+                prog,
+                cf.component,
+                &cf.field,
+                &tb.bus_bindings,
+                &mut actor_threads,
+                1,
+            )?;
+        }
         // `on <ev>(arg)` handler registrations, for this component and any
         // nested sub-components (an env holding an agent). Each subscribes
         // to the event field on its owning instance, bumps the instance's
         // `_last_in_cycle` activity stamp, then runs the handler body —
-        // mirroring v1's `on`-subscriber registration.
-        emit_on_handler_regs(out, prog, cf.component, &cf.field);
+        // mirroring v1's `on`-subscriber registration. Suppressed for the
+        // top component when its driver was re-lowered into a worker actor
+        // above (the worker replaces the synchronous driver under `--mt`).
+        emit_on_handler_regs(out, prog, cf.component, &cf.field, relower_driver);
         // `on <N> cycles` periodic + `watchdog` lifecycle `_checkers`
         // closures, for this component and any nested sub-components.
         // Bound-bus handshake monitors stay cooperative `_checkers`

@@ -1551,7 +1551,10 @@ fn lower_test(
     // filled with the real binding name (like the initiator-BFM path), and
     // the instance is registered as a component field. Validated after the
     // bus bindings are known.
-    let mut bound_event_component_binds: Vec<(String, ir::ComponentId, String)> = Vec::new();
+    // `(instance, component, bus_field, active)` — `active` distinguishes
+    // the `on <ev>` driver instance (re-lowered into a queue-fed worker
+    // coroutine under `--mt`) from a `passive` monitor-only instance.
+    let mut bound_event_component_binds: Vec<(String, ir::ComponentId, String, bool)> = Vec::new();
     // Test-scope `let`s (beyond `dut`/`_tb`/bus binds), hoisted to the
     // head of the run body in item order — v1 hoists them to `main`
     // scope before the coroutine, initialized once, and the coroutine
@@ -1810,11 +1813,11 @@ fn lower_test(
                 //     only when the transactor declares monitor handlers (a
                 //     pure-driver transactor with no monitor half has nothing
                 //     for a passive instance to do).
-                match l.ty.as_ref() {
+                let instance_active = match l.ty.as_ref() {
                     Some(TypeExpr::Named {
                         mode: Some(TransactorMode::Active),
                         ..
-                    }) => {}
+                    }) => true,
                     Some(TypeExpr::Named {
                         mode: Some(TransactorMode::Passive),
                         ..
@@ -1831,6 +1834,7 @@ fn lower_test(
                                  none, so a passive instance is inert — annotate it `active`",
                             ));
                         }
+                        false
                     }
                     _ => {
                         return Err(unsupported(
@@ -1842,7 +1846,7 @@ fn lower_test(
                             "annotate the instance `active` (driver) or `passive` (monitor)",
                         ));
                     }
-                }
+                };
                 // RHS must be a bare bus-binding identifier.
                 let bus_field = match l.value.as_ref().map(|v| &*v.kind) {
                     Some(ExprKind::Ident(id)) => id.name.clone(),
@@ -1857,7 +1861,12 @@ fn lower_test(
                     }
                 };
                 let cid = component_ids[simple];
-                bound_event_component_binds.push((l.name.name.clone(), cid, bus_field));
+                bound_event_component_binds.push((
+                    l.name.name.clone(),
+                    cid,
+                    bus_field,
+                    instance_active,
+                ));
             }
             // Bound-to target-side TLM responder: `let target : MemTarget
             // passive = bind <busbinding>`. The instance is a passive
@@ -2389,7 +2398,15 @@ fn lower_test(
     // The handler bodies are shared per component TYPE, so the subset is
     // one bound instance per type per file — a second bind to a different
     // binding would clobber the first's filled prefix, so reject it.
-    for (instance, cid, bus_field) in &bound_event_component_binds {
+    // Instance names of `active` bound event-driven transactors — their
+    // `on <ev>` driver re-lowers into a queue-fed worker coroutine under
+    // `--mt`. Carried onto each `ComponentFieldBinding` below.
+    let mut active_bound_instances: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for (instance, cid, bus_field, active) in &bound_event_component_binds {
+        if *active {
+            active_bound_instances.insert(instance.clone());
+        }
         // The bound bus binding must be a `let <bus_field> : <Bus> =
         // bind dut` declared in this test, of the component's bound bus.
         let Some(binding) = bus_bindings.iter().find(|b| &b.field == bus_field) else {
@@ -2483,6 +2500,7 @@ fn lower_test(
             field: field.clone(),
             component: *cid,
             connects: prog.components[cid.index()].connects.clone(),
+            active: active_bound_instances.contains(field),
         });
     }
 

@@ -45,9 +45,19 @@
 # This is inherent to the parallel model and affects v1 too — v1-mt is
 # itself run-to-run order-nondeterministic and differs from v1's own
 # cooperative trace. The actor-exercising rows — `tlm_target_thread_test`,
-# `axilite_bound_mon_test` (bound monitor), `tlm_target_ooo_lanes_test`
-# (OOO lanes), `tlm_pairing_arch_initiator_test` (multi same-bus actors)
-# — are the load-bearing ones for the MT sweep.
+# `axilite_bound_mon_test` (active bound DRIVER + bound monitor),
+# `tlm_target_ooo_lanes_test` (OOO lanes), `tlm_pairing_arch_initiator_test`
+# (multi same-bus actors) — are the load-bearing ones for the MT sweep.
+#
+# `axilite_bound_mon_test` additionally exercises the active-bound-driver
+# re-lowering (WS2b): under `--mt` an `active` bound transactor's `on <ev>`
+# driver becomes a queue-fed worker coroutine, so `emit drv.req(t)` enqueues
+# (non-blocking) and the driver drains the queue CONCURRENTLY with the run
+# coroutine + bound monitor — genuine actor parallelism. The driver + monitor
+# are two concurrent same-bus actors, so this row is firmly verdict-only:
+# tbir-mt's concurrent dispatch finishes earlier than the cooperative serial
+# `emit`-blocks-the-run-coroutine trace, an expected execution-model
+# difference, not a regression.
 # This file is APPEND-ONLY: each PR that brings a fixture into the TB-IR
 # subset (covergroups, helpers, wait-until, ...) adds its rows here in the
 # same PR. Merge conflicts resolve as the line union of both sides. Do not
