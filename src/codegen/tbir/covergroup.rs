@@ -10,7 +10,8 @@
 
 use crate::codegen::cpp_tb::EmitError;
 use crate::ir::{
-    BinOp, CovBinValue, CoverPointSchema, CovgroupSchema, Expr, PortRef, UnOp, WidthCastKind,
+    BinOp, CovBinValue, CoverPointSchema, CovgroupSchema, Expr, IrType, PortRef, TbProgram,
+    TransactorMethodSchema, TransactorSchema, UnOp, WidthCastKind,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
@@ -476,14 +477,30 @@ pub(super) fn sampler_registration(
     instance: &str,
     lanes: &HashMap<String, u32>,
 ) -> Result<(), EmitError> {
+    writeln!(out, "{INDENT}_checkers.push_back([&]() {{").ok();
+    sample_body(out, schema, instance, lanes, 2)?;
+    writeln!(out, "{INDENT}}});").ok();
+    Ok(())
+}
+
+/// Emit the per-point bin-membership tests + cross updates that make up
+/// one covergroup sample, at indentation `depth`. Shared by the clock
+/// (`_checkers`) and hook (`<Type>_<method>_<side>`) registration
+/// wrappers; the body is identical so the per-sample bin counts match
+/// regardless of trigger (byte-mirrors v1's `emit_covergroup_sample_body`).
+fn sample_body(
+    out: &mut String,
+    schema: &CovgroupSchema,
+    instance: &str,
+    lanes: &HashMap<String, u32>,
+    depth: usize,
+) -> Result<(), EmitError> {
     let crosses = auto_cross_pairs(schema);
     let declared = declared_crosses(schema);
     let any_cross = !crosses.is_empty() || !declared.is_empty();
-    let pad1 = INDENT;
-    let pad2 = INDENT.repeat(2);
-    let pad3 = INDENT.repeat(3);
-    let pad4 = INDENT.repeat(4);
-    writeln!(out, "{pad1}_checkers.push_back([&]() {{").ok();
+    let pad2 = INDENT.repeat(depth);
+    let pad3 = INDENT.repeat(depth + 1);
+    let pad4 = INDENT.repeat(depth + 2);
     if any_cross {
         for p in schema.points.iter().filter(|p| !p.bins.is_empty()) {
             writeln!(
@@ -546,7 +563,7 @@ pub(super) fn sampler_registration(
     // of bins hit in THIS sample (v1's nested `_i0.._iN` loops).
     for cross in &declared {
         for (idx, point) in cross.points.iter().enumerate() {
-            let pad = INDENT.repeat(2 + idx);
+            let pad = INDENT.repeat(depth + idx);
             writeln!(
                 out,
                 "{pad}for (size_t _i{idx} = 0; _i{idx} < {}; ++_i{idx}) {{",
@@ -554,8 +571,8 @@ pub(super) fn sampler_registration(
             )
             .ok();
         }
-        let pad_if = INDENT.repeat(2 + cross.points.len());
-        let pad_body = INDENT.repeat(3 + cross.points.len());
+        let pad_if = INDENT.repeat(depth + cross.points.len());
+        let pad_body = INDENT.repeat(depth + 1 + cross.points.len());
         let hit_cond = cross
             .points
             .iter()
@@ -573,10 +590,101 @@ pub(super) fn sampler_registration(
         .ok();
         writeln!(out, "{pad_if}}}").ok();
         for idx in (0..cross.points.len()).rev() {
-            let pad = INDENT.repeat(2 + idx);
+            let pad = INDENT.repeat(depth + idx);
             writeln!(out, "{pad}}}").ok();
         }
     }
-    writeln!(out, "{pad1}}});").ok();
     Ok(())
+}
+
+/// Emit the `<Type>_<method>_pre` and `<Type>_<method>_post` hook-vector
+/// declarations for one transactor method that has covergroup
+/// subscribers. Mirrors v1's `emit_hook_vectors`: a
+/// `std::vector<std::function<void(args)>>` per side, holding the sample
+/// closures. The method body fans these out at its pre/post boundary
+/// (`emit_method`). Param C-types match the method-lambda param shape.
+pub(super) fn hook_vector_decls(
+    out: &mut String,
+    prog: &TbProgram,
+    schema: &TransactorSchema,
+    m: &TransactorMethodSchema,
+    pad: &str,
+) -> Result<(), EmitError> {
+    let arg_csv = method_param_ctypes(prog, m).join(", ");
+    writeln!(
+        out,
+        "{pad}std::vector<std::function<void({arg_csv})>> {}_{}_pre;",
+        schema.name, m.name
+    )
+    .ok();
+    writeln!(
+        out,
+        "{pad}std::vector<std::function<void({arg_csv})>> {}_{}_post;",
+        schema.name, m.name
+    )
+    .ok();
+    Ok(())
+}
+
+/// Push one hook-triggered covergroup's sample closure onto the resolved
+/// method's `<Type>_<method>_<side>` hook vector — the trigger-specific
+/// analogue of `sampler_registration`. The closure takes the method's
+/// args (so the body could sample them; the shipped target subset reads
+/// DUT ports, identical to the clock sampler) and runs the same
+/// `sample_body`. Mirrors v1's `emit_covergroup_hook_sample_registration`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn hook_sampler_registration(
+    out: &mut String,
+    prog: &TbProgram,
+    schema: &CovgroupSchema,
+    xschema: &TransactorSchema,
+    m: &TransactorMethodSchema,
+    side: crate::ast::HookSide,
+    instance: &str,
+    lanes: &HashMap<String, u32>,
+) -> Result<(), EmitError> {
+    let side_str = match side {
+        crate::ast::HookSide::Pre => "pre",
+        crate::ast::HookSide::Post => "post",
+    };
+    // Param decls for the closure signature: `<cty> <name>` per method
+    // param, matching the hook-vector element type. Names come from the
+    // method's lowered locals (param slots are the leading locals).
+    let func = prog.function(m.function);
+    let arg_decls: Vec<String> = (0..m.n_params)
+        .map(|i| {
+            let cty = param_cty(prog, &func.locals[i].ty);
+            format!("{cty} {}", func.locals[i].name)
+        })
+        .collect();
+    writeln!(
+        out,
+        "{INDENT}{}_{}_{side_str}.push_back([&]({}) {{",
+        xschema.name,
+        m.name,
+        arg_decls.join(", ")
+    )
+    .ok();
+    sample_body(out, schema, instance, lanes, 2)?;
+    writeln!(out, "{INDENT}}});").ok();
+    Ok(())
+}
+
+/// C-type list for a method's params (the hook-vector signature),
+/// matching `emit_method`'s lambda param shape exactly.
+fn method_param_ctypes(prog: &TbProgram, m: &TransactorMethodSchema) -> Vec<String> {
+    let func = prog.function(m.function);
+    (0..m.n_params)
+        .map(|i| param_cty(prog, &func.locals[i].ty))
+        .collect()
+}
+
+/// One param's C-type, mirroring `emit_method`'s mapping (record by
+/// value, record-seq as `std::vector`, scalars via `local_scalar_cty`).
+fn param_cty(prog: &TbProgram, ty: &IrType) -> String {
+    match ty {
+        IrType::Record(r) => prog.records[r.index()].name.clone(),
+        IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
+        other => super::local_scalar_cty(other),
+    }
 }

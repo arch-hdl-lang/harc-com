@@ -1770,6 +1770,30 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                 e.pointer_vars.insert(l.name.name.clone());
             }
         }
+        // Seed `let_types` for the bound testbench's fields (impl-for
+        // form). After desugaring, a `testbench`-form test carries
+        // `let _tb : <TbType>` and its fields (`drv`, `cov`, ...) live on
+        // the `_tb` struct rather than as run-scope lets, so they never
+        // hit the `other_lets` loop above. Covergroup HOOK-trigger
+        // resolution (`covergroup G @(drv.method(t) post)`) resolves the
+        // receiver field via `let_types`, so without this seed it cannot
+        // find `drv` under the impl-for form (only the classic `test`
+        // form, where the fields ARE run-scope lets, worked). Field names
+        // are test-scoped; seeding them by their declared type lets the
+        // hook resolver reach the transactor/component method table.
+        if let Some(tb_ty) = e.let_types.get("_tb").cloned() {
+            if let Some(tb_comp) = e.components.get(&tb_ty).cloned() {
+                for ci in &tb_comp.items {
+                    if let ComponentItem::Field(f) = ci {
+                        if let Some(simple) = type_simple_name(Some(&f.ty)) {
+                            e.let_types
+                                .entry(f.name.name.clone())
+                                .or_insert_with(|| simple.to_string());
+                        }
+                    }
+                }
+            }
+        }
         e.clock_names = clocks.iter().map(|c| c.name.name.clone()).collect();
 
         writeln!(

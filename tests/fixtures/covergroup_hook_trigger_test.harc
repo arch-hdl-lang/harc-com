@@ -1,0 +1,88 @@
+// Hook-triggered covergroup (`covergroup G @(<hook_call> post)`):
+// the covergroup samples DUT ports at a hookable transactor method's
+// pre/post boundary instead of per primary-clock tick. This pins v1
+// parity for the hook-trigger form — the sample fires once per call,
+// not once per cycle, so the bin counts are deterministic and
+// independent of the clock period.
+//
+// `StepXactor.step(n)` drives the counter DUT (`Top` from
+// top_counter_test) forward by `n` enabled cycles. The covergroup
+// `StepCov @(drv.step(n) post)` samples `dut.count_out` AFTER each
+// step body completes, so it observes the post-step counter value.
+// With a fixed step schedule the hit bins are fully determined.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+covergroup StepCov @(drv.step(n) post)
+    cp_count : cover dut.count_out
+        bins
+            low  = [0..3]
+            mid  = [4..7]
+            high = [8..15]
+        end bins
+    cp_count_nibble : cover dut.count_out[3:0]
+        bins
+            zero = {0}
+            some = [1..15]
+        end bins
+    cross cp_count, cp_count_nibble
+end covergroup StepCov
+
+transactor StepXactor
+    dut : Top
+
+    when active
+        hookable step(n: uint<8>)
+            dut.en = 1
+            wait n cycles
+            dut.en = 0
+            wait 1 cycle
+        end step
+    end when
+end transactor StepXactor
+
+testbench CovHookTriggerTb
+    dut : Top
+    drv : StepXactor active
+    cov : StepCov
+end testbench CovHookTriggerTb
+
+impl CovHookTriggerTest for CovHookTriggerTb
+    clock clk = SysDomain
+
+    run
+        log(info, "covergroup hook-trigger test")
+        drv.dut = dut
+
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Three steps. The post-hook samples count_out after each:
+        //   after step(2): count_out == 2   (low / some / nibble!=0)
+        //   after step(3): count_out == 5   (mid / some)
+        //   after step(5): count_out == 10  (high / some)
+        // So cp_count: low=1, mid=1, high=1; cp_count_nibble: some=3.
+        drv.step(2)
+        drv.step(3)
+        drv.step(5)
+
+        wait 2 cycles
+        log(info, "PASS: hook-triggered covergroup sampled at each step")
+    end run
+
+    check
+        cov.report()
+        assert cov.cp_count.low > 0 else fail("count low bin hole")
+        assert cov.cp_count.mid > 0 else fail("count mid bin hole")
+        assert cov.cp_count.high > 0 else fail("count high bin hole")
+        assert cov.cp_count_nibble.some > 0 else fail("nibble some bin hole")
+        // Zero nibble is never sampled (post-step count is always > 0).
+        assert cov.cp_count_nibble.zero == 0 else fail("nibble zero unexpectedly hit")
+        log(info, "coverage assertions passed")
+    end check
+end impl CovHookTriggerTest

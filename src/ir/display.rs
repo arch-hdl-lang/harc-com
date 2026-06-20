@@ -305,8 +305,21 @@ impl Display for TbProgram {
             }
         }
         for (i, cg) in self.covgroups.iter().enumerate() {
-            let trig = match cg.trigger {
-                CovTrigger::PosedgeDutClk => "@posedge(dut.clk)",
+            let trig = match &cg.trigger {
+                CovTrigger::PosedgeDutClk => "@posedge(dut.clk)".to_string(),
+                CovTrigger::Hook {
+                    receiver_path,
+                    method,
+                    side,
+                } => format!(
+                    "@({}.{}() {})",
+                    receiver_path.join("."),
+                    method,
+                    match side {
+                        crate::ast::HookSide::Pre => "pre",
+                        crate::ast::HookSide::Post => "post",
+                    }
+                ),
             };
             writeln!(f, "  covgroup cg{} {} {}", i, cg.name, trig)?;
             for p in &cg.points {

@@ -408,6 +408,7 @@ pub(crate) fn lower_transactor(
             has_ret: f.ret.is_some(),
             pre_hooks: Vec::new(),
             post_hooks: Vec::new(),
+            cov_hook_subs: Vec::new(),
         });
         funcs.push(f);
     }
@@ -1137,6 +1138,7 @@ fn lower_bound_initiator_transactor(
             has_ret: f.ret.is_some(),
             pre_hooks: Vec::new(),
             post_hooks: Vec::new(),
+            cov_hook_subs: Vec::new(),
         });
         funcs.push(f);
     }
