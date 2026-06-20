@@ -34,6 +34,20 @@
 #
 # Lines starting with '#' and blank lines are ignored.
 #
+# `--mt` variant: `MT=1 ./tests/run_tbir_equiv.sh` re-runs every row with
+# `--mt` appended to BOTH sim invocations. The multi-thread actor model is
+# execution-model only and functionally correct, so the MT sweep asserts
+# the per-codegen VERDICT (each `pass` row prints ALL TESTS PASSED under
+# both v1-mt and tbir-mt; each `fail` row fails identically). It does NOT
+# trace-diff v1-mt vs tbir-mt: under `--mt` the intra-cycle trace EVENT
+# ORDER is nondeterministic whenever two concurrent same-bus actors fire
+# in the same barrier window (the winning OS thread decides ordering).
+# This is inherent to the parallel model and affects v1 too — v1-mt is
+# itself run-to-run order-nondeterministic and differs from v1's own
+# cooperative trace. The actor-exercising rows — `tlm_target_thread_test`,
+# `axilite_bound_mon_test` (bound monitor), `tlm_target_ooo_lanes_test`
+# (OOO lanes), `tlm_pairing_arch_initiator_test` (multi same-bus actors)
+# — are the load-bearing ones for the MT sweep.
 # This file is APPEND-ONLY: each PR that brings a fixture into the TB-IR
 # subset (covergroups, helpers, wait-until, ...) adds its rows here in the
 # same PR. Merge conflicts resolve as the line union of both sides. Do not
@@ -177,3 +191,4 @@ scoreboard_typed_queue_test | ScoreboardTypedQueue | scoreboard_typed_queue.sv |
 axilite_env_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 post_eval_provider_test | PostEvalProvider | post_eval_provider.sv | - | pass
 bus_bind_generic_test | BusRwBind | BusRwBind.sv | - | pass
+wide1024_tlm_test | wide1024_tlm | wide1024_tlm.sv | - | pass

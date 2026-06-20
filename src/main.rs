@@ -1676,13 +1676,6 @@ fn cmd_sim(
             "--cpp-split tests is currently supported only with --sv / Verilator builds"
         ));
     }
-    if codegen == CodegenKind::Tbir {
-        if mt {
-            return Err(miette::miette!(
-                "--mt is not supported with --codegen tbir yet; re-run with --codegen v1"
-            ));
-        }
-    }
 
     // Parse every input file, then fold `extend test T` blocks into their
     // matching base test before codegen.

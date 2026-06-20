@@ -543,6 +543,19 @@ impl FuncBuilder<'_> {
         self.hoist_ports_with_hint(e, None)
     }
 
+    /// Lower an expression with a width hint so a bare DUT-port read in
+    /// value position (e.g. a wide TLM method argument `wide.send(dut.payload)`)
+    /// hoists into a temp typed at the hint's width instead of the default
+    /// u64. Without the hint a `>64-bit` port read would silently truncate.
+    pub(crate) fn lower_expr_no_ports_hinted(
+        &mut self,
+        e: &AstExpr,
+        hint: Option<IrType>,
+    ) -> Result<Expr, LowerError> {
+        let ir = self.lower_expr(e)?;
+        Ok(self.hoist_ports_with_hint(ir, hint))
+    }
+
     fn hoist_ports_with_hint(&mut self, e: Expr, hint: Option<IrType>) -> Expr {
         match e {
             Expr::Port(p) => {

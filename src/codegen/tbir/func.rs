@@ -2232,6 +2232,8 @@ pub(super) fn emit_target_actor(
     prog: &TbProgram,
     actor: &crate::ir::TargetTlmActorSchema,
     bindings: &[BusBindingSchema],
+    mt: bool,
+    actor_threads: &mut Vec<(String, String)>,
     depth: usize,
 ) -> Result<(), EmitError> {
     let schema = prog.transactor(actor.transactor);
@@ -2267,6 +2269,7 @@ pub(super) fn emit_target_actor(
             None => format!("dut->{bus_field}_{method}_{sig}"),
         };
         let slot_var = format!("_{instance}_{method}_target_slot");
+        let sched_var = format!("_{instance}_{method}_target_sched");
         let trace_event = |out: &mut String, phase: &str, d: usize| {
             writeln!(
                 out,
@@ -2295,13 +2298,21 @@ pub(super) fn emit_target_actor(
                 &wire,
                 tag_count as usize,
                 bindings,
+                mt,
+                actor_threads,
                 depth,
             )?;
             continue;
         }
 
-        writeln!(out, "{pad}harc_rt::ThreadSlot {slot_var};").ok();
-        writeln!(out, "{pad}sched.slots.push_back(&{slot_var});").ok();
+        crate::codegen::tbir::runtime::register_actor_slot(
+            out,
+            mt,
+            actor_threads,
+            &sched_var,
+            &slot_var,
+            depth,
+        );
         writeln!(
             out,
             "{pad}{slot_var}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
@@ -2521,9 +2532,11 @@ fn emit_responder_loop_switch(
 ///     traces the `response` edge (with `_sel`), runs the rsp handshake,
 ///     clears the lane.
 ///
-/// The TB-IR sim path is single-threaded (no `--mt`), so every coroutine
-/// pushes onto the shared `sched`. Trace payloads (incl. the routed tag)
-/// match v1 byte-for-byte so `harc trace-diff` stays clean.
+/// In cooperative mode every coroutine pushes onto the shared `sched`;
+/// under `--mt` each (dispatcher, per-lane, arbiter) slot gets its own
+/// dedicated `ThreadScheduler` + OS worker thread, mirroring v1's
+/// multi-lane split (`cpp_tb.rs:6837-7129`). Trace payloads (incl. the
+/// routed tag) match v1 byte-for-byte so `harc trace-diff` stays clean.
 #[allow(clippy::too_many_arguments)]
 fn emit_tagged_target_actors(
     out: &mut String,
@@ -2536,6 +2549,8 @@ fn emit_tagged_target_actors(
     wire: &dyn Fn(&str) -> String,
     tag_count: usize,
     bindings: &[BusBindingSchema],
+    mt: bool,
+    actor_threads: &mut Vec<(String, String)>,
     depth: usize,
 ) -> Result<(), EmitError> {
     let method = &tm.name;
@@ -2546,7 +2561,9 @@ fn emit_tagged_target_actors(
     let lane_rsp_valid = format!("{prefix}_lane_rsp_valid");
     let lane_rsp_data = format!("{prefix}_lane_rsp_data");
     let dispatcher_slot = format!("{prefix}_dispatcher_slot");
+    let dispatcher_sched = format!("{prefix}_dispatcher_sched");
     let arbiter_slot = format!("{prefix}_arbiter_slot");
+    let arbiter_sched = format!("{prefix}_arbiter_sched");
 
     // --- (1) Per-tag shared state arrays. ---
     writeln!(
@@ -2599,8 +2616,14 @@ fn emit_tagged_target_actors(
     writeln!(out, "{pad}}});").ok();
 
     // --- (3) Dispatcher coroutine. ---
-    writeln!(out, "{pad}harc_rt::ThreadSlot {dispatcher_slot};").ok();
-    writeln!(out, "{pad}sched.slots.push_back(&{dispatcher_slot});").ok();
+    crate::codegen::tbir::runtime::register_actor_slot(
+        out,
+        mt,
+        actor_threads,
+        &dispatcher_sched,
+        &dispatcher_slot,
+        depth,
+    );
     writeln!(
         out,
         "{pad}{dispatcher_slot}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
@@ -2651,8 +2674,15 @@ fn emit_tagged_target_actors(
     let nparams = func.params.len();
     for lane in 0..tag_count {
         let lane_slot = format!("{prefix}_lane{lane}_slot");
-        writeln!(out, "{pad}harc_rt::ThreadSlot {lane_slot};").ok();
-        writeln!(out, "{pad}sched.slots.push_back(&{lane_slot});").ok();
+        let lane_sched = format!("{prefix}_lane{lane}_sched");
+        crate::codegen::tbir::runtime::register_actor_slot(
+            out,
+            mt,
+            actor_threads,
+            &lane_sched,
+            &lane_slot,
+            depth,
+        );
         writeln!(
             out,
             "{pad}{lane_slot}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
@@ -2707,8 +2737,14 @@ fn emit_tagged_target_actors(
     }
 
     // --- (5) Arbiter coroutine. ---
-    writeln!(out, "{pad}harc_rt::ThreadSlot {arbiter_slot};").ok();
-    writeln!(out, "{pad}sched.slots.push_back(&{arbiter_slot});").ok();
+    crate::codegen::tbir::runtime::register_actor_slot(
+        out,
+        mt,
+        actor_threads,
+        &arbiter_sched,
+        &arbiter_slot,
+        depth,
+    );
     writeln!(
         out,
         "{pad}{arbiter_slot}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"

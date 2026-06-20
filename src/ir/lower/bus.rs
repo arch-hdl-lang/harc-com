@@ -510,10 +510,16 @@ impl FuncBuilder<'_> {
         }
         // Args evaluate before any protocol activity; DUT reads hoist
         // into the current block (same cycle, same values as v1's
-        // inline arg emission — no tick in between).
+        // inline arg emission — no tick in between). The declared method
+        // arg type is passed as a width hint so a bare wide DUT-port read
+        // (`wide.send(dut.payload)` over a `uint<1024>` arg) hoists into a
+        // wide temp instead of truncating to u64 (`port_temp_type` only
+        // honors the hint for >64-bit widths, so narrow args are
+        // unaffected).
         let mut lowered = Vec::with_capacity(args.len());
-        for a in args {
-            lowered.push(self.lower_expr_no_ports(call_arg_expr(a))?);
+        for (a, (_, decl_ty)) in args.iter().zip(m.args.iter()) {
+            let hint = super::helpers::ir_type_of(Some(decl_ty));
+            lowered.push(self.lower_expr_no_ports_hinted(call_arg_expr(a), Some(hint))?);
         }
         let call = Expr::Call(
             crate::ir::CallTarget::TransactorMethod {
@@ -525,13 +531,18 @@ impl FuncBuilder<'_> {
         // A record-typed return (`-> SomeStruct`) makes the dest a
         // record local, so `dest.field` / `dest.vecfield[i]` reads
         // resolve and the backend captures via `harc_unpack_<R>`. A
-        // scalar return leaves the dest at its default scalar type.
+        // scalar return carries its declared `IrType` onto the dest so a
+        // wide (>64-bit) return (`-> uint<1024>`) declares the loop-switch
+        // local at the right width (`_harc_u128` / `HarcWide<N>`) instead
+        // of truncating to the default u64.
         let ret_record = m.ret.as_ref().and_then(|t| self.tlm_ret_record_id(t));
         match dest {
             BusCallDest::Declare(name) => {
                 let id = self.declare(name);
                 if let Some(rid) = ret_record {
                     self.set_local_type(id, crate::ir::IrType::Record(rid));
+                } else if let Some(ret) = m.ret.as_ref() {
+                    self.set_local_type(id, super::helpers::ir_type_of(Some(ret)));
                 }
                 self.push(Stmt::Assign(id, call));
             }

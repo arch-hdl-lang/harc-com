@@ -2840,18 +2840,25 @@ fn tbir_emit_declared_cross_contract() {
     );
 }
 
-/// `--mt` is rejected by the tbir emitter (also rejected upstream by
-/// the CLI; this locks the library-level contract).
+/// `--mt` is now accepted by the tbir emitter (multi-thread actor model,
+/// issue #425). For a program with no bound monitors / target actors the
+/// `--mt` output is byte-identical to the cooperative default — `--mt`
+/// only changes emission for programs that actually carry actors, so an
+/// actor-free testbench keeps the single-thread scaffolding.
 #[test]
-fn tbir_emit_rejects_mt() {
+fn tbir_accepts_mt() {
     let merged = merged_src(&fixture("top_counter_test.harc"));
     let prog = lower::lower_program(&merged).expect("lowers");
-    let opts = cpp_tb::EmitOpts {
+    let opts_mt = cpp_tb::EmitOpts {
         mt: true,
         ..Default::default()
     };
-    let err = tbir::emit(&prog, &merged, &opts).unwrap_err();
-    assert!(err.0.contains("--mt"), "{}", err.0);
+    let cpp_mt = tbir::emit(&prog, &merged, &opts_mt).expect("emits under --mt");
+    let cpp_default = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
+    assert_eq!(
+        cpp_mt, cpp_default,
+        "an actor-free program must emit identical C++ with and without --mt"
+    );
 }
 
 // ── placement pass snapshots — tier/timing annotation per block plus
@@ -4787,11 +4794,11 @@ end impl EvTest
     let msg = assert_unsupported(&lower_src(&two_src).unwrap_err());
     assert!(msg.contains("instantiated more than once"), "{msg}");
 
-    // A method value param wider than 128 bits is out of the wide-value
-    // method-ABI subset (v1's `HarcWide<N>` register-array model) and
-    // rejected precisely — the boundary above which `_harc_u128` no
-    // longer suffices. (`uint<128>` itself now lowers; see
-    // `aes_cipher_top_dump_ir_snapshot`.)
+    // A method value param wider than 128 bits now lowers via v1's
+    // `HarcWide<N>` register-array value model (`local_scalar_cty`): the
+    // param carries its declared `uint<256>` IrType so the backend
+    // declares the wide storage instead of truncating. (See
+    // `wide1024_tlm_test` for the end-to-end echo equivalence.)
     let wide_src = r#"
 transactor Wx
     dut : Top
@@ -4815,8 +4822,14 @@ impl WxTest for WxTb
     end run
 end impl WxTest
 "#;
-    let msg = assert_unsupported(&lower_src(wide_src).unwrap_err());
-    assert!(msg.contains("wider than 128 bits"), "{msg}");
+    let prog = lower_src(wide_src).expect("wide (>128b) method param lowers");
+    let big = &prog.functions[0];
+    assert_eq!(big.name, "Wx_big");
+    assert_eq!(
+        big.params[0].ty,
+        ir::IrType::UInt(Some(256)),
+        "wide method param carries its declared width",
+    );
 }
 
 /// Verifier net: a `TransactorMethod` call edge nested in expression
