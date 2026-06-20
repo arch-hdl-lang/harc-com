@@ -533,8 +533,18 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
             for_each_port_in_expr(e, f);
         }
         DutRead(_, p) | ProbeRelease(p) => f(p),
+        // `RecordFieldWrite` carries an optional element `index` (`rec.f[i]
+        // = v`) — walk it too, so a gated DUT port nested in a write-index
+        // is scanned (#454). Today a write-index hoists to a `DutRead`, so
+        // this is defensive completeness; without it, any future inline
+        // write-index would silently escape the gated-port scan.
+        RecordFieldWrite { value, index, .. } => {
+            for_each_port_in_expr(value, f);
+            if let Some(idx) = index {
+                for_each_port_in_expr(idx, f);
+            }
+        }
         Assign(_, e)
-        | RecordFieldWrite { value: e, .. }
         | RecordWriteCb { value: e, .. }
         | TbFieldWrite { value: e, .. }
         | TransactorStateWrite { value: e, .. }

@@ -1671,6 +1671,7 @@ pub(super) fn declare_method_slot(
         .map(|i| match func.locals[i].ty {
             IrType::Record(r) => prog.records[r.index()].name.clone(),
             IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
+            IrType::Seq(ref scalar) => format!("std::vector<{}>", super::local_scalar_cty(scalar)),
             ref ty => super::local_scalar_cty(ty).to_string(),
         })
         .collect::<Vec<_>>()
@@ -1749,6 +1750,7 @@ pub(super) fn emit_method(
         .map(|(i, n)| match func.locals[i].ty {
             IrType::Record(r) => format!("{} {n}", prog.records[r.index()].name),
             IrType::RecordSeq(r) => format!("std::vector<{}> {n}", prog.records[r.index()].name),
+            IrType::Seq(ref scalar) => format!("std::vector<{}> {n}", super::local_scalar_cty(scalar)),
             ref ty => format!("{} {n}", super::local_scalar_cty(ty)),
         })
         .collect::<Vec<_>>()
@@ -2146,6 +2148,9 @@ fn emit_component_fn_lambda(
             // `hookable dispatch(txns: TSeq<RegOp>)`) is taken by value as
             // `std::vector<Record>`, matching the tseq generator's return.
             IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
+            // The scalar-element analogue (`TSeq<uint<N>>`) — `std::vector<T>`
+            // over the scalar C++ type (#453).
+            IrType::Seq(ref scalar) => format!("std::vector<{}>", super::local_scalar_cty(scalar)),
             IrType::Component(c) => prog.components[c.index()].name.clone(),
             _ => "uint64_t".to_string(),
         };
@@ -3057,6 +3062,7 @@ pub(super) fn emit_test_hook(
     let param_ty = |i: usize| match func.locals[i].ty {
         IrType::Record(r) => prog.records[r.index()].name.clone(),
         IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
+        IrType::Seq(ref scalar) => format!("std::vector<{}>", super::local_scalar_cty(scalar)),
         _ => "uint64_t".to_string(),
     };
     let params = names[..nparams]
