@@ -1,6 +1,6 @@
 ---
 source: tests/tbir.rs
-assertion_line: 1496
+assertion_line: 2938
 expression: text
 ---
 tb-ir program
@@ -9,10 +9,10 @@ tb-ir program
 
 fn fn0 run_TlmMethodBlockingBusTest [kind=Run, owner=tb0]
   locals:
-    %0 initial : unknown
+    %0 initial : uint<32>
     %1 __t0 : unknown
-    %2 updated : unknown
-    %3 reread : unknown
+    %2 updated : uint<32>
+    %3 reread : uint<32>
   entry = b0
 
   b0:
