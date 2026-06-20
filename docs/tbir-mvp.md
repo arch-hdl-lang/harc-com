@@ -1706,6 +1706,20 @@ port-position rule covers the `PortRef` half), 14 and 16 (the v0
 front end does not type-check, so `IrType::Unknown` is the common
 case and only locally-determinable `Assign` types are compared).
 
+24. **Time-literal digit separators (2026-06-19, authorized divergence).**
+    A bare `time` value in expression position with a digit separator —
+    `let t : time = 1_000ns;` — lowers in tbir to the underscore-stripped
+    value `1000` (`ExprKind::Time` in `src/ir/lower/exprs.rs` strips `_`
+    before parsing). v1's `emit_expr_with_arrow` emits the prefix verbatim
+    (`uint64_t t = 1_000;`), which is a **C++ compile error** (no
+    `operator""_000`). This is an intentional, authorized divergence: tbir
+    is the more-correct backend (it lowers what the source plainly means);
+    v1's behavior is a legacy limitation, not a contract tbir preserves.
+    The equivalence harness's v1==tbir invariant does not apply to a
+    digit-separated time literal — no equivalence fixture uses one (v1
+    cannot compile it). Non-separated literals (`100ns` → `100`) still
+    mirror v1 exactly. See issue #451.
+
 ## Negative tests: where rejection actually fires
 
 As of #372 the randomize fixtures are no longer must-reject: both
