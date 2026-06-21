@@ -74,6 +74,7 @@ bare_stmt_scope_test | Top | top_counter.sv | top_counter.arch | pass
 time_literal_test | Top | top_counter.sv | top_counter.arch | pass
 rom_lut_test | RomLut | rom_lut.sv | rom_lut.arch | pass
 check_phase_let_test | Top | top_counter.sv | top_counter.arch | pass
+check_phase_shadow_let_test | Top | top_counter.sv | top_counter.arch | pass
 log_paths_test | Top | top_counter.sv | top_counter.arch | pass
 fatal_path_test | Top | top_counter.sv | top_counter.arch | fail
 rom_lut_inline_test | RomLut | rom_lut.sv | rom_lut.arch | pass

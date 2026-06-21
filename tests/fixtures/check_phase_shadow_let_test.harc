@@ -1,0 +1,40 @@
+// Test-scope `let` read in `check` while a nested branch declares a
+// same-named LOCAL. The local shadow must stay branch-local; it must not
+// suppress promotion of the outer test-scope let everywhere in the phase.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+test CheckPhaseShadowLetTest
+    let dut : Top
+    let expected_total = 0
+
+    clock clk = SysDomain
+
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        dut.rst = 0
+
+        expected_total = 3
+        dut.en = 1
+        wait 3 cycles
+        dut.en = 0
+        wait 1 cycle
+    end run
+
+    check
+        // The else-branch local shadows only INSIDE that branch. The
+        // outer test-scope `expected_total` still needs promotion for the
+        // condition and then-branch below.
+        if dut.count_out == expected_total
+            assert expected_total == 3
+                else fail("outer expected_total lost: got ${expected_total}, want 3")
+        else
+            let expected_total = 99
+            fail("unexpected count_out=${dut.count_out}; local expected_total=${expected_total}")
+        end if
+    end check
+end test CheckPhaseShadowLetTest
