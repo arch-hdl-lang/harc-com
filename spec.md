@@ -444,6 +444,23 @@ backed semantic retrieval is a planned upgrade (arch-com's plan §v2
 is the reference); the BM25 baseline already discriminates well
 across the kinds of error/diff text the HARC compiler produces.
 
+## 2.7 Compiler-native code graph — `harc graph`
+
+HARC may emit a compiler-native JSONL code graph for downstream
+tooling, review workflows, and agent context retrieval. This is a
+toolchain artifact, not language semantics: graph edges summarize the
+compiler's best-effort understanding of files, constructs, docs,
+DUTs, type uses, calls, checks/covers, bindings, and test references.
+
+The graph index is built explicitly with `harc graph index <paths...>`
+and defaults to `.harcgraph/` containing `files.jsonl`, `nodes.jsonl`,
+and `edges.jsonl`. Query subcommands operate on that directory:
+`harc graph query`, `tests-for`, `impact`, and `context`. `harc graph
+html` renders the index as a standalone searchable HTML viewer. Graph
+records are forward-compatible: tooling should ignore unknown JSON
+fields and tolerate unresolved `symbol:<name>` targets when a bare name
+is ambiguous or unavailable.
+
 ---
 
 ## 3. Type System Extensions

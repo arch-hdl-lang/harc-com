@@ -185,6 +185,12 @@ The dashed paths share the same parser + AST + IR; they branch at codegen by emi
 | `harc sim --dut <arch-source> [--top T] [--test N] <test-files…>` | Build the DUT through `arch sim` (uses ARCH's cpp simulation model), then run. |
 | `harc sim --sv <verilog-files…> [--top T] [--test N] <test-files…>` | Run Verilator on the SV directly, then run. |
 | `harc advise <query>` | Retrieve past error→fix pairs from the local learning store. |
+| `harc graph index <paths…> --out .harcgraph` | Build a compiler-native JSONL code graph over `.harc`, `.sv`, and `.arch` inputs. |
+| `harc graph query <query> --index .harcgraph` | Search graph nodes and edges by symbol, text, file, doc, or relationship kind. |
+| `harc graph tests-for <symbol> --index .harcgraph` | List tests that reference a DUT, type, or symbol. |
+| `harc graph impact <symbol> --index .harcgraph` | Return a bounded dependency/impact slice around a symbol. |
+| `harc graph context <task> --index .harcgraph` | Return compact graph context for a natural-language task. |
+| `harc graph html --index .harcgraph --out harc-graph.html` | Render the indexed graph as a standalone searchable HTML viewer. |
 
 Common `harc sim` flags:
 

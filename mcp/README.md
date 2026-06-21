@@ -55,6 +55,12 @@ allowed so bundled docs and fixtures remain available.
 | `harc_check` | Run `harc check` on `.harc` files |
 | `harc_sim_emit_only` | Run `harc sim --emit-only` against SV or ARCH DUT backends |
 | `harc_advise` | Query local HARC error-to-fix learning store |
+| `harc_graph_index` | Build the compiler-native JSONL graph index for HARC/DUT paths |
+| `harc_graph_query` | Search graph nodes and edges for a symbol or text query |
+| `harc_graph_context` | Return compact graph context for a task description |
+| `harc_graph_impact` | Return a bounded dependency/impact slice around a graph symbol |
+| `harc_graph_tests_for_dut` | List tests that reference a DUT, type, or symbol |
+| `harc_graph_examples_for` | Run `harc graph query` for feature or construct example searches |
 | `list_harc_files` | List `.harc` files under an allowed workspace root |
 
 ## Environment Variables
