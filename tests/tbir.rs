@@ -5180,6 +5180,41 @@ fn testbench_lifecycle_dump_ir_snapshot() {
     insta::assert_snapshot!("testbench_lifecycle_dump_ir", format!("{prog}"));
 }
 
+/// A classic-form test-scope `let` promoted for a check-phase read must
+/// accept a bool literal default, matching ordinary `_tb` scalar fields.
+#[test]
+fn check_phase_promoted_bool_let_emits_bool_tb_field() {
+    let src = r#"
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+test CheckPhaseBoolTest
+    let dut : Top
+    let seen : bool = false
+
+    clock clk = SysDomain
+
+    run
+        seen = true
+    end run
+
+    check
+        assert seen else fail("seen should persist")
+    end check
+end test CheckPhaseBoolTest
+"#;
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("bool seen = false;"),
+        "promoted bool let should emit a bool _tb field:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("_tb.seen = 1;"),
+        "run-phase write should lower to a _tb field write:\n{cpp}"
+    );
+}
+
 /// Width-method intrinsics (`.trunc/.zext/.sext/.resize`) with
 /// receiver widths from typed lets, casts, and chained methods.
 #[test]

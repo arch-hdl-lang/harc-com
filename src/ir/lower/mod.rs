@@ -2971,9 +2971,14 @@ fn lower_test(
             if !promoted_lets.contains(&l.name.name) {
                 continue;
             }
+            let inferred_ty = match l.value.as_ref().map(|v| &*v.kind) {
+                Some(ExprKind::Bool(_)) => Some(IrType::Bool),
+                _ => None,
+            };
             let ty =
                 l.ty.as_ref()
                     .and_then(tb_scalar_field_ir_type)
+                    .or(inferred_ty)
                     .unwrap_or(IrType::UInt(None));
             let default = match l.value.as_ref().map(|v| &*v.kind) {
                 Some(ExprKind::Int(s)) => s.replace('_', "").parse::<u64>().map_err(|_| {
@@ -2982,6 +2987,7 @@ fn lower_test(
                         l.name.name
                     ))
                 })?,
+                Some(ExprKind::Bool(b)) => *b as u64,
                 None => 0,
                 _ => {
                     return Err(unsupported(
