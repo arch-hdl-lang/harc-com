@@ -185,9 +185,14 @@ int run_TlmBindRemapTest(int argc, char** argv) {
                     co_await harc_rt::wait_cycles(_slot, 1);
                     dut->mem_read_req_valid = 0;
                     dut->mem_read_rsp_ready = 1;
-                    { int _b = 16; while (!dut->mem_read_rsp_valid && _b > 0) { co_await harc_rt::wait_cycles(_slot, 1); _b--; } if (_b == 0 && !dut->mem_read_rsp_valid) { sim_log_line("FAIL", "TLM m.read response timed out after 16 cycles (dut->mem_read_rsp_valid stuck low)"); ctx.errors++; } }
-                    trace.tlm_call(cycle_count, "", "m", "read", "response", "initiator");
-                    initial = harc_rt::harc_read(dut->mem_read_rsp_data);
+                    {
+                        bool _rsp_ok = true;
+                        { int _b = 16; while (!dut->mem_read_rsp_valid && _b > 0) { co_await harc_rt::wait_cycles(_slot, 1); _b--; } if (_b == 0 && !dut->mem_read_rsp_valid) { sim_log_line("FAIL", "TLM m.read response timed out after 16 cycles (dut->mem_read_rsp_valid stuck low)"); ctx.errors++; _rsp_ok = false; } }
+                        if (_rsp_ok) {
+                            trace.tlm_call(cycle_count, "", "m", "read", "response", "initiator");
+                            initial = harc_rt::harc_read(dut->mem_read_rsp_data);
+                        }
+                    }
                     co_await harc_rt::wait_cycles(_slot, 1);
                     dut->mem_read_rsp_ready = 0;
                     if (!((initial == 261))) {
@@ -203,8 +208,13 @@ int run_TlmBindRemapTest(int argc, char** argv) {
                     co_await harc_rt::wait_cycles(_slot, 1);
                     dut->mem_poke_req_valid = 0;
                     dut->mem_poke_rsp_ready = 1;
-                    { int _b = 16; while (!dut->mem_poke_rsp_valid && _b > 0) { co_await harc_rt::wait_cycles(_slot, 1); _b--; } if (_b == 0 && !dut->mem_poke_rsp_valid) { sim_log_line("FAIL", "TLM m.poke response timed out after 16 cycles (dut->mem_poke_rsp_valid stuck low)"); ctx.errors++; } }
-                    trace.tlm_call(cycle_count, "", "m", "poke", "response", "initiator");
+                    {
+                        bool _rsp_ok = true;
+                        { int _b = 16; while (!dut->mem_poke_rsp_valid && _b > 0) { co_await harc_rt::wait_cycles(_slot, 1); _b--; } if (_b == 0 && !dut->mem_poke_rsp_valid) { sim_log_line("FAIL", "TLM m.poke response timed out after 16 cycles (dut->mem_poke_rsp_valid stuck low)"); ctx.errors++; _rsp_ok = false; } }
+                        if (_rsp_ok) {
+                            trace.tlm_call(cycle_count, "", "m", "poke", "response", "initiator");
+                        }
+                    }
                     co_await harc_rt::wait_cycles(_slot, 1);
                     dut->mem_poke_rsp_ready = 0;
                     // bus.read tlm_method
@@ -215,9 +225,14 @@ int run_TlmBindRemapTest(int argc, char** argv) {
                     co_await harc_rt::wait_cycles(_slot, 1);
                     dut->mem_read_req_valid = 0;
                     dut->mem_read_rsp_ready = 1;
-                    { int _b = 16; while (!dut->mem_read_rsp_valid && _b > 0) { co_await harc_rt::wait_cycles(_slot, 1); _b--; } if (_b == 0 && !dut->mem_read_rsp_valid) { sim_log_line("FAIL", "TLM m.read response timed out after 16 cycles (dut->mem_read_rsp_valid stuck low)"); ctx.errors++; } }
-                    trace.tlm_call(cycle_count, "", "m", "read", "response", "initiator");
-                    updated = harc_rt::harc_read(dut->mem_read_rsp_data);
+                    {
+                        bool _rsp_ok = true;
+                        { int _b = 16; while (!dut->mem_read_rsp_valid && _b > 0) { co_await harc_rt::wait_cycles(_slot, 1); _b--; } if (_b == 0 && !dut->mem_read_rsp_valid) { sim_log_line("FAIL", "TLM m.read response timed out after 16 cycles (dut->mem_read_rsp_valid stuck low)"); ctx.errors++; _rsp_ok = false; } }
+                        if (_rsp_ok) {
+                            trace.tlm_call(cycle_count, "", "m", "read", "response", "initiator");
+                            updated = harc_rt::harc_read(dut->mem_read_rsp_data);
+                        }
+                    }
                     co_await harc_rt::wait_cycles(_slot, 1);
                     dut->mem_read_rsp_ready = 0;
                     if (!((updated == 3405691582))) {
