@@ -104,6 +104,11 @@ enum Cmd {
         /// controls. Forwarded to Verilator before the SV DUT files.
         #[arg(long)]
         vlt: Vec<PathBuf>,
+        /// DUT parameter override(s), repeatable as `--param NAME=VALUE`.
+        /// Lowered to Verilator `-GNAME=VALUE` on `--sv` and forwarded as
+        /// `arch sim --param NAME=VALUE` on `--dut`.
+        #[arg(long = "param")]
+        params: Vec<String>,
         /// SV top-module name (Verilator `--top-module`). Defaults to the
         /// type of `let dut : <Type>` in the HARC source.
         #[arg(long)]
@@ -476,6 +481,7 @@ fn main() -> Result<()> {
             dut,
             sv,
             vlt,
+            params,
             top,
             test,
             compile_scope,
@@ -532,6 +538,7 @@ fn main() -> Result<()> {
                         dut.clone(),
                         sv.clone(),
                         vlt.clone(),
+                        params.clone(),
                         top.clone(),
                         test.clone(),
                         outdir.clone(),
@@ -551,6 +558,7 @@ fn main() -> Result<()> {
                         dut.clone(),
                         sv.clone(),
                         vlt.clone(),
+                        params.clone(),
                         top.clone(),
                         test.clone(),
                         compile_scope,
@@ -732,6 +740,32 @@ struct Z3PathOpts {
 struct Z3Paths {
     include_dir: Option<PathBuf>,
     lib_dir: Option<PathBuf>,
+}
+
+fn validate_param_overrides(params: &[String]) -> Result<()> {
+    for param in params {
+        let Some((name, value)) = param.split_once('=') else {
+            return Err(miette::miette!(
+                "invalid --param {param:?}: expected NAME=VALUE"
+            ));
+        };
+        if name.is_empty() {
+            return Err(miette::miette!(
+                "invalid --param {param:?}: parameter name is empty"
+            ));
+        }
+        if value.is_empty() {
+            return Err(miette::miette!(
+                "invalid --param {param:?}: parameter value is empty"
+            ));
+        }
+        if name.chars().any(char::is_whitespace) {
+            return Err(miette::miette!(
+                "invalid --param {param:?}: parameter name must not contain whitespace"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn z3_include_dir(dir: &Path) -> Option<PathBuf> {
@@ -1498,6 +1532,7 @@ fn run_verilator(
     rebuild: bool,
     record_trace: Option<&PathBuf>,
     waves: &WaveOpts,
+    params: &[String],
 ) -> Result<()> {
     let mdir = outdir_abs.join("obj_dir");
     // Build-reuse path (Phase 1c). When `--rebuild` is unset and the
@@ -1601,6 +1636,9 @@ fn run_verilator(
     // override warnings, add `--public-flat-rw`, etc.
     for extra in &waves.verilator_args {
         args.push(extra.clone());
+    }
+    for param in params {
+        args.push(format!("-G{param}"));
     }
     if let Some(jobs) = waves.jobs {
         args.push("-j".into());
@@ -1784,6 +1822,7 @@ fn cmd_sim(
     dut: Vec<PathBuf>,
     sv: Vec<PathBuf>,
     vlt: Vec<PathBuf>,
+    params: Vec<String>,
     top: Option<String>,
     test: Option<String>,
     compile_scope: CompileScope,
@@ -1809,6 +1848,8 @@ fn cmd_sim(
     // On the plain `--dut` path this equals `dut`.
     dut_iface: Vec<PathBuf>,
 ) -> Result<()> {
+    validate_param_overrides(&params)?;
+
     if dut.is_empty() && sv.is_empty() {
         return Err(miette::miette!(
             "pass either --dut <file.arch> or --sv <file.sv>"
@@ -2090,6 +2131,7 @@ fn cmd_sim(
             rebuild,
             trace_abs.as_ref(),
             &waves,
+            &params,
         );
     }
 
@@ -2130,6 +2172,10 @@ fn cmd_sim(
     prefix_args.push("sim".into());
     for d in &dut_abs {
         prefix_args.push(d.display().to_string());
+    }
+    for param in &params {
+        prefix_args.push("--param".into());
+        prefix_args.push(param.clone());
     }
     prefix_args.push("--tb".into());
     let cpp_tb = cpp_abs
@@ -2227,6 +2273,7 @@ fn cmd_sim_check_backends(
     dut: Vec<PathBuf>,
     sv: Vec<PathBuf>,
     vlt: Vec<PathBuf>,
+    params: Vec<String>,
     top: Option<String>,
     test: Option<String>,
     outdir: Option<PathBuf>,
@@ -2278,6 +2325,7 @@ fn cmd_sim_check_backends(
         dut.clone(),
         Vec::new(),
         Vec::new(),
+        params.clone(),
         top.clone(),
         test.clone(),
         CompileScope::Suite,
@@ -2304,6 +2352,7 @@ fn cmd_sim_check_backends(
         Vec::new(),
         sv.clone(),
         vlt.clone(),
+        params.clone(),
         top.clone(),
         test.clone(),
         CompileScope::Suite,
@@ -2686,6 +2735,34 @@ mod tests {
             panic!("expected sim command");
         };
         assert_eq!(effective_codegen(codegen), CodegenKind::V1);
+    }
+
+    #[test]
+    fn sim_cli_accepts_repeated_param_overrides() {
+        let cli = Cli::parse_from([
+            "harc",
+            "sim",
+            "--dut",
+            "dut.arch",
+            "--param",
+            "CounterWidth=64",
+            "--param",
+            "ProvideValUpd=0",
+            "tb.harc",
+        ]);
+        let Cmd::Sim { params, .. } = cli.cmd else {
+            panic!("expected sim command");
+        };
+        assert_eq!(params, vec!["CounterWidth=64", "ProvideValUpd=0"]);
+        validate_param_overrides(&params).unwrap();
+    }
+
+    #[test]
+    fn sim_param_validation_rejects_malformed_overrides() {
+        assert!(validate_param_overrides(&["WIDTH".to_string()]).is_err());
+        assert!(validate_param_overrides(&["=32".to_string()]).is_err());
+        assert!(validate_param_overrides(&["WIDTH=".to_string()]).is_err());
+        assert!(validate_param_overrides(&["BAD NAME=1".to_string()]).is_err());
     }
 
     #[test]

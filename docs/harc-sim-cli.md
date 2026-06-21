@@ -65,6 +65,7 @@ harc sim --sv dut.sv suite.harc --top Top --cpp-split tests --cpp-split-group-si
 | `--dut <file.arch>` | ARCH DUT source file(s). Repeat for packages or shared definitions. Conflicts with `--sv` unless `--check-backends` is set. |
 | `--sv <file.sv>` | SystemVerilog DUT source file(s). Drives Verilator directly. Conflicts with `--dut` unless `--check-backends` is set. |
 | `--vlt <file.vlt>` | Verilator control file(s), such as waivers or coverage controls. Forwarded before SV DUT files. |
+| `--param NAME=VALUE` | DUT parameter override. Repeatable. Lowers to Verilator `-GNAME=VALUE` for `--sv` and `arch sim --param NAME=VALUE` for `--dut`. |
 | `--top <Top>` | SV top module name. Defaults to the type of `let dut : <Type>` in the HARC source. |
 | `--arch-bin <path>` | Path to the `arch` binary for the `--dut` path. Defaults to searching `$PATH`, then falling back to the sibling `../arch-com` checkout. |
 
@@ -146,4 +147,3 @@ and header parsing.
 
 For a single selected test, `--compile-scope test --test <name>` can be even
 simpler than split mode because it emits only that test's code.
-
