@@ -53,3 +53,21 @@ pub(crate) fn bounded_handshake_wait(
          ({signal} stuck low)\"); ctx.errors++; }} }}"
     )
 }
+
+/// Same timeout-diagnostic loop as [`bounded_handshake_wait`], but stores the
+/// success result in `ok_var` so callers can skip any capture/trace step that
+/// would otherwise consume invalid data after a timeout.
+pub(crate) fn bounded_handshake_wait_into(
+    signal: &str,
+    bound: u32,
+    advance: &str,
+    label: &str,
+    ok_var: &str,
+) -> String {
+    format!(
+        "{{ int _b = {bound}; while (!{signal} && _b > 0) {{ {advance}; _b--; }} \
+         if (_b == 0 && !{signal}) {{ \
+         sim_log_line(\"FAIL\", \"{label} timed out after {bound} cycles \
+         ({signal} stuck low)\"); ctx.errors++; {ok_var} = false; }} }}"
+    )
+}

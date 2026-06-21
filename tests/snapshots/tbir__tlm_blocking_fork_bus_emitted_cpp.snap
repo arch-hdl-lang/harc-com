@@ -184,9 +184,14 @@ int run_TlmMethodBlockingForkBusTest(int argc, char** argv) {
                     dut->mem_read_req_valid = 0;
                     // join_all bus.read response
                     dut->mem_read_rsp_ready = 1;
-                    { int _b = 64; while (!dut->mem_read_rsp_valid && _b > 0) { co_await harc_rt::wait_cycles(_slot, 1); _b--; } if (_b == 0 && !dut->mem_read_rsp_valid) { sim_log_line("FAIL", "TLM mem.read fork response timed out after 64 cycles (dut->mem_read_rsp_valid stuck low)"); ctx.errors++; } }
-                    forked = harc_rt::harc_read(dut->mem_read_rsp_data);
-                    trace.tlm_call(cycle_count, "", "mem", "read", "response", "initiator");
+                    {
+                        bool _rsp_ok = true;
+                        { int _b = 64; while (!dut->mem_read_rsp_valid && _b > 0) { co_await harc_rt::wait_cycles(_slot, 1); _b--; } if (_b == 0 && !dut->mem_read_rsp_valid) { sim_log_line("FAIL", "TLM mem.read fork response timed out after 64 cycles (dut->mem_read_rsp_valid stuck low)"); ctx.errors++; _rsp_ok = false; } }
+                        if (_rsp_ok) {
+                            forked = harc_rt::harc_read(dut->mem_read_rsp_data);
+                            trace.tlm_call(cycle_count, "", "mem", "read", "response", "initiator");
+                        }
+                    }
                     co_await harc_rt::wait_cycles(_slot, 1);
                     dut->mem_read_rsp_ready = 0;
                     if (!((forked == 261))) {

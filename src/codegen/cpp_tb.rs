@@ -8358,18 +8358,32 @@ impl Emitter {
 
         self.pad(depth);
         writeln!(self.out, "{root}->{rsp_ready} = 1;").ok();
+        if let Some(name) = let_name {
+            if let Some(ret) = &method.ret {
+                self.pad(depth);
+                let cty = self.record_field_c_type(ret);
+                writeln!(self.out, "{cty} {name} = {{}};").ok();
+            }
+        }
         self.pad(depth);
+        writeln!(self.out, "{{").ok();
+        self.pad(depth + 1);
+        writeln!(self.out, "bool _rsp_ok = true;").ok();
+        self.pad(depth + 1);
         writeln!(
             self.out,
             "{}",
-            crate::codegen::bounded_handshake_wait(
+            crate::codegen::bounded_handshake_wait_into(
                 &format!("{root}->{rsp_valid}"),
                 crate::codegen::TLM_WAIT_BOUND,
                 advance,
                 &format!("TLM {}.{} response", id.name, method.name.name),
+                "_rsp_ok",
             )
         )
         .ok();
+        self.pad(depth + 1);
+        writeln!(self.out, "if (_rsp_ok) {{").ok();
         self.emit_tlm_call_trace_event(
             &component,
             &id.name,
@@ -8377,16 +8391,19 @@ impl Emitter {
             "response",
             "initiator",
             None,
-            depth,
+            depth + 2,
         );
         if let Some(name) = let_name {
             if let Some(ret) = &method.ret {
-                self.pad(depth);
-                let cty = self.record_field_c_type(ret);
+                self.pad(depth + 2);
                 let read_expr = self.record_unpack_expr(ret, &format!("{root}->{rsp_data}"));
-                writeln!(self.out, "{cty} {name} = {read_expr};").ok();
+                writeln!(self.out, "{name} = {read_expr};").ok();
             }
         }
+        self.pad(depth + 1);
+        writeln!(self.out, "}}").ok();
+        self.pad(depth);
+        writeln!(self.out, "}}").ok();
         self.pad(depth);
         if self.in_coroutine {
             writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();
@@ -8617,10 +8634,14 @@ impl Emitter {
             self.pad(depth);
             writeln!(self.out, "{}->{} = 1;", p.root, rsp_ready).ok();
             self.pad(depth);
+            writeln!(self.out, "{{").ok();
+            self.pad(depth + 1);
+            writeln!(self.out, "bool _rsp_ok = true;").ok();
+            self.pad(depth + 1);
             writeln!(
                 self.out,
                 "{}",
-                crate::codegen::bounded_handshake_wait(
+                crate::codegen::bounded_handshake_wait_into(
                     &format!("{}->{}", p.root, rsp_valid),
                     crate::codegen::TLM_JOIN_DRAIN_BOUND,
                     if self.in_coroutine {
@@ -8629,16 +8650,19 @@ impl Emitter {
                         "tick()"
                     },
                     &format!("TLM {}.{} fork response", p.bus, p.method),
+                    "_rsp_ok",
                 )
             )
             .ok();
+            self.pad(depth + 1);
+            writeln!(self.out, "if (_rsp_ok) {{").ok();
             if let Some(var) = &p.ret_var {
                 let read_expr = p
                     .ret_ty
                     .as_ref()
                     .map(|ty| self.record_unpack_expr(ty, &format!("{}->{}", p.root, rsp_data)))
                     .unwrap_or_else(|| format!("harc_rt::harc_read({}->{})", p.root, rsp_data));
-                self.pad(depth);
+                self.pad(depth + 2);
                 writeln!(self.out, "{var} = {read_expr};").ok();
             }
             self.emit_tlm_call_trace_event(
@@ -8648,8 +8672,12 @@ impl Emitter {
                 "response",
                 "initiator",
                 None,
-                depth,
+                depth + 2,
             );
+            self.pad(depth + 1);
+            writeln!(self.out, "}}").ok();
+            self.pad(depth);
+            writeln!(self.out, "}}").ok();
             self.pad(depth);
             if self.in_coroutine {
                 writeln!(self.out, "co_await harc_rt::wait_cycles(_slot, 1);").ok();

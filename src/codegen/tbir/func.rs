@@ -1262,30 +1262,36 @@ fn emit_ordered_tlm_join_all(
     depth: usize,
 ) -> Result<(), EmitError> {
     let pad = INDENT.repeat(depth);
+    let pad1 = INDENT.repeat(depth + 1);
+    let pad2 = INDENT.repeat(depth + 2);
     let names = cx.names;
     for p in pending {
         let binding = resolve_binding(bindings, &p.bus_field, &p.method, cx.func)?;
         let wire = |sig: &str| format!("dut->{}", binding.wire_name(&p.method, sig));
         writeln!(out, "{pad}// join_all bus.{} response", p.method).ok();
         writeln!(out, "{pad}{} = 1;", wire("rsp_ready")).ok();
+        writeln!(out, "{pad}{{",).ok();
+        writeln!(out, "{pad1}bool _rsp_ok = true;").ok();
         writeln!(
             out,
-            "{pad}{}",
-            crate::codegen::bounded_handshake_wait(
+            "{pad1}{}",
+            crate::codegen::bounded_handshake_wait_into(
                 &wire("rsp_valid"),
                 crate::codegen::TLM_JOIN_DRAIN_BOUND,
                 "co_await harc_rt::wait_cycles(_slot, 1)",
                 &format!("TLM {}.{} fork response", p.bus_field, p.method),
+                "_rsp_ok",
             )
         )
         .ok();
+        writeln!(out, "{pad1}if (_rsp_ok) {{").ok();
         if let (Some(dest), true) = (p.dest, p.has_ret) {
             let capture = tlm_capture_expr(cx, records, dest, &wire("rsp_data"));
-            writeln!(out, "{pad}{} = {capture};", names[dest.index()]).ok();
+            writeln!(out, "{pad2}{} = {capture};", names[dest.index()]).ok();
         }
         emit_tlm_trace(
             out,
-            &pad,
+            &pad2,
             cx.trace_component,
             &p.bus_field,
             &p.method,
@@ -1293,6 +1299,8 @@ fn emit_ordered_tlm_join_all(
             "initiator",
             None,
         );
+        writeln!(out, "{pad1}}}").ok();
+        writeln!(out, "{pad}}}").ok();
         writeln!(out, "{pad}co_await harc_rt::wait_cycles(_slot, 1);").ok();
         writeln!(out, "{pad}{} = 0;", wire("rsp_ready")).ok();
     }
@@ -1478,6 +1486,8 @@ fn emit_transactor_call(
     depth: usize,
 ) -> Result<(), EmitError> {
     let pad = INDENT.repeat(depth);
+    let pad1 = INDENT.repeat(depth + 1);
+    let pad2 = INDENT.repeat(depth + 2);
     let func = cx.func;
     let names = cx.names;
     let binding = bindings
@@ -1552,12 +1562,29 @@ fn emit_transactor_call(
     writeln!(out, "{pad}co_await harc_rt::wait_cycles(_slot, 1);").ok();
     writeln!(out, "{pad}{} = 0;", wire("req_valid")).ok();
     writeln!(out, "{pad}{} = 1;", wire("rsp_ready")).ok();
-    budget_wait(
+    writeln!(out, "{pad}{{").ok();
+    writeln!(out, "{pad1}bool _rsp_ok = true;").ok();
+    writeln!(
         out,
-        "rsp_valid",
-        &format!("TLM {bus_field}.{method} response"),
-    );
-    trace_event(out, "response");
+        "{pad1}{}",
+        crate::codegen::bounded_handshake_wait_into(
+            &wire("rsp_valid"),
+            crate::codegen::TLM_WAIT_BOUND,
+            "co_await harc_rt::wait_cycles(_slot, 1)",
+            &format!("TLM {bus_field}.{method} response"),
+            "_rsp_ok",
+        )
+    )
+    .ok();
+    writeln!(out, "{pad1}if (_rsp_ok) {{").ok();
+    writeln!(
+        out,
+        "{pad2}trace.tlm_call(cycle_count, \"{}\", \"{}\", \"{}\", \"response\", \"initiator\");",
+        escape_c(cx.trace_component),
+        escape_c(bus_field),
+        escape_c(method)
+    )
+    .ok();
     if schema.has_ret {
         // Capture BEFORE the trailing tick — rsp_data is valid in the
         // same cycle as rsp_valid (mirrors v1; for result-less or
@@ -1565,8 +1592,10 @@ fn emit_transactor_call(
         // rsp handshake). A record-typed return is bit-unpacked from the
         // lowered response pin (v1's `record_unpack_expr`).
         let capture = tlm_capture_expr(cx, records, dest, &wire("rsp_data"));
-        writeln!(out, "{pad}{} = {capture};", names[dest.index()]).ok();
+        writeln!(out, "{pad2}{} = {capture};", names[dest.index()]).ok();
     }
+    writeln!(out, "{pad1}}}").ok();
+    writeln!(out, "{pad}}}").ok();
     writeln!(out, "{pad}co_await harc_rt::wait_cycles(_slot, 1);").ok();
     writeln!(out, "{pad}{} = 0;", wire("rsp_ready")).ok();
     Ok(())
