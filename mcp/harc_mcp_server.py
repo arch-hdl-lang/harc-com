@@ -377,6 +377,60 @@ def harc_advise(query: str, top: int = 3) -> str:
 
 
 @mcp.tool()
+def harc_graph_index(paths: list[str], out: str = ".harcgraph", timeout: int = 60) -> str:
+    """Build the compiler-native JSONL graph index for HARC/DUT paths."""
+    resolved_paths = [_resolve_safe(path) for path in paths]
+    out_path = _resolve_safe(out)
+    cmd = [HARC_BIN, "graph", "index", *[str(path) for path in resolved_paths], "--out", str(out_path)]
+    cwd = _owning_root(resolved_paths[0]) if resolved_paths else WORKSPACE_ROOTS[0]
+    return _run(cmd, timeout=timeout, cwd=cwd)
+
+
+@mcp.tool()
+def harc_graph_query(query: str, index: str = ".harcgraph", limit: int = 20, timeout: int = 30) -> str:
+    """Search graph nodes and edges for a symbol or text query."""
+    limit = max(1, min(limit, 80))
+    index_path = _resolve_safe(index)
+    return _run([HARC_BIN, "graph", "query", query, "--index", str(index_path), "--limit", str(limit)], timeout=timeout)
+
+
+@mcp.tool()
+def harc_graph_context(task: str, index: str = ".harcgraph", limit: int = 20, timeout: int = 30) -> str:
+    """Return a compact graph context slice for a task description."""
+    limit = max(1, min(limit, 80))
+    index_path = _resolve_safe(index)
+    return _run([HARC_BIN, "graph", "context", task, "--index", str(index_path), "--limit", str(limit)], timeout=timeout)
+
+
+@mcp.tool()
+def harc_graph_impact(symbol: str, index: str = ".harcgraph", depth: int = 2, limit: int = 40, timeout: int = 30) -> str:
+    """Return a bounded dependency/impact slice around a graph symbol."""
+    depth = max(1, min(depth, 8))
+    limit = max(1, min(limit, 120))
+    index_path = _resolve_safe(index)
+    return _run(
+        [HARC_BIN, "graph", "impact", symbol, "--index", str(index_path), "--depth", str(depth), "--limit", str(limit)],
+        timeout=timeout,
+    )
+
+
+@mcp.tool()
+def harc_graph_tests_for_dut(symbol: str, index: str = ".harcgraph", limit: int = 30, timeout: int = 30) -> str:
+    """List tests that reference a DUT, type, or symbol."""
+    limit = max(1, min(limit, 100))
+    index_path = _resolve_safe(index)
+    return _run([HARC_BIN, "graph", "tests-for", symbol, "--index", str(index_path), "--limit", str(limit)], timeout=timeout)
+
+
+@mcp.tool()
+def harc_graph_examples_for(query: str, index: str = ".harcgraph", limit: int = 20, timeout: int = 30) -> str:
+    """Find compact graph-backed examples for a feature or construct query."""
+    limit = max(1, min(limit, 80))
+    index_path = _resolve_safe(index)
+    return _run([HARC_BIN, "graph", "query", query, "--index", str(index_path), "--limit", str(limit)], timeout=timeout)
+
+
+@mcp.tool()
 def list_harc_files(directory: str = ".") -> str:
     """List `.harc` files under an allowed workspace directory."""
     resolved = _resolve_safe(directory)

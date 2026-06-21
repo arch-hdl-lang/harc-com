@@ -320,6 +320,11 @@ enum Cmd {
         #[arg(long)]
         map_out: Option<PathBuf>,
     },
+    /// Build and query a compiler-native JSONL code graph.
+    Graph {
+        #[command(subcommand)]
+        cmd: GraphCmd,
+    },
     // ── Learning store (sister to `arch advise` and friends, port of
     // arch-com/src/learn.rs). Every `harc check` / `harc sim` records
     // its failure→fix pairs into `~/.harc/learn/events.jsonl`; the
@@ -387,6 +392,78 @@ enum Cmd {
     // Future, mirroring ARCH:
     //   Build  — transpile to SystemVerilog + UVM (spec §10.2, phase 5)
     //   Formal — emit BTOR2 / SMT-LIB2 (spec §10.3, phase 4)
+}
+
+#[derive(Subcommand, Debug)]
+enum GraphCmd {
+    /// Index .harc source and DUT files/directories into JSONL files.
+    Index {
+        /// Input .harc/.sv/.arch files or directories.
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Output directory for files.jsonl, nodes.jsonl, and edges.jsonl.
+        #[arg(long, default_value = ".harcgraph")]
+        out: PathBuf,
+    },
+    /// Search graph nodes and edges for a symbol or text query.
+    Query {
+        /// Symbol or text query.
+        query: String,
+        /// Graph index directory.
+        #[arg(long, default_value = ".harcgraph")]
+        index: PathBuf,
+        /// Maximum result lines.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// List tests that reference a DUT, type, or symbol.
+    TestsFor {
+        /// DUT/type/symbol name.
+        symbol: String,
+        /// Graph index directory.
+        #[arg(long, default_value = ".harcgraph")]
+        index: PathBuf,
+        /// Maximum result lines.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Return a bounded dependency/impact slice around a symbol.
+    Impact {
+        /// Symbol name.
+        symbol: String,
+        /// Graph index directory.
+        #[arg(long, default_value = ".harcgraph")]
+        index: PathBuf,
+        /// Edge traversal depth.
+        #[arg(long, default_value_t = 2)]
+        depth: usize,
+        /// Maximum result lines.
+        #[arg(long, default_value_t = 40)]
+        limit: usize,
+    },
+    /// Return compact graph context for a task description.
+    Context {
+        /// Natural-language task description.
+        task: String,
+        /// Graph index directory.
+        #[arg(long, default_value = ".harcgraph")]
+        index: PathBuf,
+        /// Maximum result lines per section.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Render an indexed graph as a standalone clickable HTML file.
+    Html {
+        /// Input graph directory.
+        #[arg(long, default_value = ".harcgraph")]
+        index: PathBuf,
+        /// Output HTML file.
+        #[arg(long, default_value = "harc-graph.html")]
+        out: PathBuf,
+        /// Page title.
+        #[arg(long)]
+        title: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -510,6 +587,7 @@ fn main() -> Result<()> {
             out,
             map_out,
         } => trace_merge::cmd_trace_merge(&vcd, &trace, &out, map_out.as_deref()),
+        Cmd::Graph { cmd } => cmd_graph(cmd),
         Cmd::Advise {
             query,
             top,
@@ -549,6 +627,77 @@ fn main() -> Result<()> {
             } else {
                 eprintln!("Removed {removed} event(s); {kept} remain.");
             }
+            Ok(())
+        }
+    }
+}
+
+fn cmd_graph(cmd: GraphCmd) -> Result<()> {
+    match cmd {
+        GraphCmd::Index { paths, out } => {
+            let stats = harc::graph::index_paths(&paths, &out).into_diagnostic()?;
+            println!(
+                "indexed: {} file(s), {} node(s), {} edge(s), {} skipped -> {}",
+                stats.files,
+                stats.nodes,
+                stats.edges,
+                stats.skipped,
+                out.display()
+            );
+            Ok(())
+        }
+        GraphCmd::Query {
+            query,
+            index,
+            limit,
+        } => {
+            println!(
+                "{}",
+                harc::graph::query(&index, &query, limit).into_diagnostic()?
+            );
+            Ok(())
+        }
+        GraphCmd::TestsFor {
+            symbol,
+            index,
+            limit,
+        } => {
+            println!(
+                "{}",
+                harc::graph::tests_for(&index, &symbol, limit).into_diagnostic()?
+            );
+            Ok(())
+        }
+        GraphCmd::Impact {
+            symbol,
+            index,
+            depth,
+            limit,
+        } => {
+            println!(
+                "{}",
+                harc::graph::impact(&index, &symbol, depth, limit).into_diagnostic()?
+            );
+            Ok(())
+        }
+        GraphCmd::Context { task, index, limit } => {
+            println!(
+                "{}",
+                harc::graph::context(&index, &task, limit).into_diagnostic()?
+            );
+            Ok(())
+        }
+        GraphCmd::Html { index, out, title } => {
+            let graph = harc::graph::load_index(&index).into_diagnostic()?;
+            let title = title.as_deref().unwrap_or("HARC graph");
+            let html = harc::graph::render_html(&graph, title).into_diagnostic()?;
+            if let Some(parent) = out.parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent).into_diagnostic()?;
+                }
+            }
+            fs::write(&out, html).into_diagnostic()?;
+            eprintln!("Wrote {}", out.display());
             Ok(())
         }
     }
