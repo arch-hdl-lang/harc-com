@@ -56,6 +56,7 @@ after_cycles_test       | Top            | top_counter.sv         |
 bare_stmt_scope_test    | Top            | top_counter.sv         |
 time_literal_test       | Top            | top_counter.sv         |
 check_phase_let_test    | Top            | top_counter.sv         |
+check_phase_shadow_let_test | Top        | top_counter.sv         |
 watchdog_quiesce_test   | Top            | top_counter.sv         |
 agent_periodic_test     | Top            | top_counter.sv         |
 component_method_randomize_test | Top     | top_counter.sv         |
@@ -231,11 +232,12 @@ done <<<"$FIXTURES"
 # captured to <idx>.log so the aggregated output below is ordered and
 # never interleaved.
 export HARC DUT_DIR FIX_DIR BUILD_ROOT
-seq 0 $((n - 1)) | xargs -P "$JOBS" -I {} bash -c '
-    idx="$1"; resdir="$2"; self="$3"
-    bash "$self" __worker "$BUILD_ROOT/worker_$idx" "$(cat "$resdir/$idx.row")" \
-        >"$resdir/$idx.log" 2>&1
-' _ {} "$RESDIR" "$0"
+read -r -d '' WORKER_CMD <<'EOF' || true
+idx="$1"; resdir="$2"; self="$3"; build_root="$4"
+bash "$self" __worker "$build_root/worker_$idx" "$(cat "$resdir/$idx.row")" \
+    >"$resdir/$idx.log" 2>&1
+EOF
+seq 0 $((n - 1)) | xargs -P "$JOBS" -I {} bash -c "$WORKER_CMD" _ {} "$RESDIR" "$0" "$BUILD_ROOT"
 
 PASS=0
 FAIL=0
