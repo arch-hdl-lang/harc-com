@@ -1,0 +1,6 @@
+ram HistBuf
+  kind simple_dual;
+  latency 1;
+  param DEPTH: const = 4096;
+  port clk: in Clock<SysDomain>;
+end ram HistBuf

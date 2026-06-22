@@ -205,3 +205,4 @@ axilite_env_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 post_eval_provider_test | PostEvalProvider | post_eval_provider.sv | - | pass
 bus_bind_generic_test | BusRwBind | BusRwBind.sv | - | pass
 wide1024_tlm_test | wide1024_tlm | wide1024_tlm.sv | - | pass
+lz4_decomp_test | Lz4Decomp | Lz4Decomp.sv | Lz4Decomp.arch | pass

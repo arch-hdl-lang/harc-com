@@ -1,0 +1,367 @@
+// HARC testbench for Lz4Decomp — streaming LZ4 block decompressor.
+//
+// Two test sequences against a 4096-byte history RAM:
+//   Test 1  "hello"          — 5 pure literals, last sequence (no match)
+//   Test 2  "hello, hello!"  — 7 literals + 5-byte back-reference + 1 literal
+//
+// Timing model: outputs are REGISTERED (`pipe_reg<_,1>`), so a decompressed
+// byte appears one cycle after the input/state that produces it. The natural
+// pattern is therefore: set the inputs for a byte, `wait 1 cycle` to clock the
+// producing edge, then assert the registered output (out_valid / out_data /
+// out_last) which now reflects that edge. Because the output is latched,
+// out_last is directly observable on the final byte — unlike a combinational
+// pass-through, which only glitches it for a sub-cycle.
+//
+// in_last is asserted with the TOKEN byte of the last sequence (no match
+// follows that sequence, per LZ4 spec §2). out_ready is held high throughout,
+// so the design streams one byte per cycle with no back-pressure stalls.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench Lz4DecompTb
+  dut : Lz4Decomp
+end testbench Lz4DecompTb
+
+impl Lz4DecompTest for Lz4DecompTb
+  clock clk = SysDomain
+
+  run
+    // -----------------------------------------------------------------------
+    // Reset
+    // -----------------------------------------------------------------------
+    dut.rst       = 1
+    dut.in_valid  = 0
+    dut.in_data   = 0
+    dut.in_last   = 0
+    dut.out_ready = 1
+    wait 3 cycles
+    assert dut.out_valid == 0
+        else fail("no output during reset")
+    dut.rst = 0
+    wait 1 cycle
+    // state=TOKEN, wr_ptr=0, all regs cleared.
+
+    // -----------------------------------------------------------------------
+    // Test 1: decompress "hello" (5 pure literals, last sequence)
+    //
+    // LZ4 encoding:
+    //   token=0x50 (ll4=5, ml4=0), in_last=1
+    //   literals: 0x68 'h'  0x65 'e'  0x6C 'l'  0x6C 'l'  0x6F 'o'
+    // -----------------------------------------------------------------------
+    log(info, "Test 1: pure literals 'hello'")
+
+    // TOKEN byte — in_ready is 1 (comb, state=TOKEN after reset)
+    dut.in_valid = 1
+    dut.in_data  = 0x50
+    dut.in_last  = 1
+    assert dut.in_ready == 1
+        else fail("T1: in_ready should be 1 in TOKEN state")
+    wait 1 cycle
+    // state=LITERAL, lit_rem=5, is_last=1
+
+    // Each literal: set in_data BEFORE the wait that clocks it; the registered
+    // output reflects it AFTER the wait.
+    dut.in_data = 0x68    // 'h'
+    dut.in_last = 0
+    wait 1 cycle
+    assert dut.out_valid == 1
+        else fail("T1-h: out_valid should be 1")
+    assert dut.out_data == 0x68
+        else fail("T1-h: expected 'h' (0x68), got ${dut.out_data}")
+    assert dut.out_last == 0
+        else fail("T1-h: out_last should be 0")
+
+    dut.in_data = 0x65    // 'e'
+    wait 1 cycle
+    assert dut.out_data == 0x65
+        else fail("T1-e: expected 'e' (0x65), got ${dut.out_data}")
+
+    dut.in_data = 0x6C    // 'l'
+    wait 1 cycle
+    assert dut.out_data == 0x6C
+        else fail("T1-l1: expected 'l' (0x6C), got ${dut.out_data}")
+
+    dut.in_data = 0x6C    // 'l'
+    wait 1 cycle
+    assert dut.out_data == 0x6C
+        else fail("T1-l2: expected 'l' (0x6C), got ${dut.out_data}")
+
+    // Last literal 'o' of the last sequence: out_last must latch high.
+    dut.in_data = 0x6F    // 'o'
+    wait 1 cycle
+    assert dut.out_valid == 1
+        else fail("T1-o: out_valid should be 1")
+    assert dut.out_data == 0x6F
+        else fail("T1-o: expected 'o' (0x6F), got ${dut.out_data}")
+    assert dut.out_last == 1
+        else fail("T1-o: out_last should be 1 on last byte of block")
+
+    // Stream drains: out_valid clears once consumed with no new data.
+    dut.in_valid = 0
+    wait 1 cycle
+    assert dut.out_valid == 0
+        else fail("T1: out_valid should clear after stream drains")
+    assert dut.out_last == 0
+        else fail("T1: out_last should clear after stream drains")
+    wait 1 cycle
+    log(info, "PASS: Test 1 — 'hello' decompressed correctly")
+
+    // -----------------------------------------------------------------------
+    // Test 2: decompress "hello, hello!" (7 literals + back-ref + 1 literal)
+    //
+    // History continues from Test 1 (no reset): wr_ptr=5, mem[0..4]="hello".
+    //
+    // LZ4 encoding:
+    //   seq 1: token=0x71 (ll4=7, ml4=1)
+    //           literals: 'h' 'e' 'l' 'l' 'o' ',' ' '  (7 bytes → mem[5..11])
+    //           offset: 0x07 0x00  (= 7, little-endian)
+    //           match_len: ml4+4 = 5  (copy_src = wr_ptr(12) - 7 = 5 → "hello")
+    //   seq 2 (last): token=0x10 (ll4=1, ml4=0), in_last=1
+    //           literals: '!'
+    // -----------------------------------------------------------------------
+    log(info, "Test 2: 'hello, hello!' with back-reference")
+
+    // TOKEN byte for sequence 1
+    dut.in_valid = 1
+    dut.in_data  = 0x71
+    dut.in_last  = 0
+    assert dut.in_ready == 1
+        else fail("T2: in_ready should be 1 in TOKEN state")
+    wait 1 cycle
+    // state=LITERAL, lit_rem=7, match_rem=5, is_last=0
+
+    // 7 literals "hello, " → history positions 5..11
+    dut.in_data = 0x68
+    wait 1 cycle
+    assert dut.out_valid == 1
+        else fail("T2-h: out_valid should be 1")
+    assert dut.out_data == 0x68
+        else fail("T2-h: expected 'h' (0x68), got ${dut.out_data}")
+
+    dut.in_data = 0x65
+    wait 1 cycle
+    assert dut.out_data == 0x65
+        else fail("T2-e: expected 'e' (0x65), got ${dut.out_data}")
+
+    dut.in_data = 0x6C
+    wait 1 cycle
+    assert dut.out_data == 0x6C
+        else fail("T2-l1: expected 'l' (0x6C), got ${dut.out_data}")
+
+    dut.in_data = 0x6C
+    wait 1 cycle
+    assert dut.out_data == 0x6C
+        else fail("T2-l2: expected 'l' (0x6C), got ${dut.out_data}")
+
+    dut.in_data = 0x6F
+    wait 1 cycle
+    assert dut.out_data == 0x6F
+        else fail("T2-o: expected 'o' (0x6F), got ${dut.out_data}")
+
+    dut.in_data = 0x2C    // ','
+    wait 1 cycle
+    assert dut.out_data == 0x2C
+        else fail("T2-comma: expected ',' (0x2C), got ${dut.out_data}")
+
+    // 7th literal ' ' — transitions to OFFS_LO; not the block's last byte.
+    dut.in_data = 0x20    // ' '
+    wait 1 cycle
+    assert dut.out_data == 0x20
+        else fail("T2-space: expected ' ' (0x20), got ${dut.out_data}")
+    assert dut.out_last == 0
+        else fail("T2-space: out_last should be 0 mid-stream")
+    // state=OFFS_LO, wr_ptr=12
+
+    // Offset low byte: 0x07
+    dut.in_data = 0x07
+    assert dut.in_ready == 1
+        else fail("T2: in_ready should be 1 in OFFS_LO state")
+    wait 1 cycle
+    // offs_lo=0x07, state=OFFS_HI; output register drained.
+    assert dut.out_valid == 0
+        else fail("T2: no output during OFFS_LO/OFFS_HI")
+
+    // Offset high byte: 0x00  (full_offset = 7; copy_src = 12 - 7 = 5)
+    dut.in_data = 0x00
+    assert dut.in_ready == 1
+        else fail("T2: in_ready should be 1 in OFFS_HI state")
+    wait 1 cycle
+    // state=COPY, copy_src=5, match_rem=5
+
+    // Registered (latency-1 BRAM) read: COPY spends one "fill" cycle issuing
+    // the first read address before any byte is available. No output yet.
+    dut.in_valid = 0
+    wait 1 cycle
+    assert dut.out_valid == 0
+        else fail("T2: no output during COPY read-fill cycle")
+
+    // COPY: 5 bytes "hello" from history positions 5..9. Each byte is
+    // registered, so assert AFTER the wait that produces it.
+    wait 1 cycle
+    assert dut.out_valid == 1
+        else fail("T2-copy1: out_valid should be 1")
+    assert dut.out_data == 0x68
+        else fail("T2-copy1: expected 'h' (0x68), got ${dut.out_data}")
+
+    wait 1 cycle
+    assert dut.out_data == 0x65
+        else fail("T2-copy2: expected 'e' (0x65), got ${dut.out_data}")
+
+    wait 1 cycle
+    assert dut.out_data == 0x6C
+        else fail("T2-copy3: expected 'l' (0x6C), got ${dut.out_data}")
+
+    wait 1 cycle
+    assert dut.out_data == 0x6C
+        else fail("T2-copy4: expected 'l' (0x6C), got ${dut.out_data}")
+
+    wait 1 cycle
+    assert dut.out_data == 0x6F
+        else fail("T2-copy5: expected 'o' (0x6F), got ${dut.out_data}")
+    assert dut.out_last == 0
+        else fail("T2-copy5: out_last should be 0 (copy is never last byte)")
+    // match_rem=0, state=TOKEN, wr_ptr=17
+
+    // TOKEN byte for last sequence
+    dut.in_valid = 1
+    dut.in_data  = 0x10
+    dut.in_last  = 1
+    assert dut.in_ready == 1
+        else fail("T2-last-token: in_ready should be 1 in TOKEN state")
+    wait 1 cycle
+    // state=LITERAL, lit_rem=1, is_last=1
+
+    // Single literal '!' — final byte of the block, out_last latches high.
+    dut.in_data = 0x21    // '!'
+    dut.in_last = 0
+    wait 1 cycle
+    assert dut.out_valid == 1
+        else fail("T2-bang: out_valid should be 1")
+    assert dut.out_data == 0x21
+        else fail("T2-bang: expected '!' (0x21), got ${dut.out_data}")
+    assert dut.out_last == 1
+        else fail("T2-bang: out_last should be 1 on last byte of block")
+
+    dut.in_valid = 0
+    wait 1 cycle
+    assert dut.out_valid == 0
+        else fail("T2: out_valid should clear after final drain")
+    log(info, "PASS: Test 2 — 'hello, hello!' decompressed correctly")
+    wait 2 cycles
+
+    // -----------------------------------------------------------------------
+    // Test 3: RLE overlap — decompress "aaaaaaa!" (offset-1 run)
+    //
+    // This is the overlap case (offset < match_len) that exercises the
+    // write->read forwarding register: every copy byte reads the address
+    // written on the previous cycle, which the latency-1 block RAM has not
+    // yet committed (read-first), so fwd_data must bypass it.
+    //
+    // LZ4 encoding (after reset, wr_ptr=0):
+    //   seq 1: token=0x12 (ll4=1, ml4=2 → match_len=6)
+    //           literal: 'a'                       (mem[0])
+    //           offset: 0x01 0x00  (= 1)           (copy_src = 1-1 = 0)
+    //           → copies mem[0] forward 6x = "aaaaaa"
+    //   seq 2 (last): token=0x10 (ll4=1, ml4=0), in_last=1
+    //           literal: '!'
+    // -----------------------------------------------------------------------
+    log(info, "Test 3: RLE overlap 'aaaaaaa!' (offset-1)")
+
+    // Reset so history/pointers are predictable for the run.
+    dut.rst      = 1
+    dut.in_valid = 0
+    dut.in_data  = 0
+    dut.in_last  = 0
+    wait 3 cycles
+    dut.rst = 0
+    wait 1 cycle
+
+    // TOKEN: ll4=1, ml4=2 (match_len = 6)
+    dut.in_valid = 1
+    dut.in_data  = 0x12
+    dut.in_last  = 0
+    assert dut.in_ready == 1
+        else fail("T3: in_ready should be 1 in TOKEN state")
+    wait 1 cycle
+    // state=LITERAL, lit_rem=1, match_rem=6
+
+    // Single literal 'a' → mem[0]; transitions to OFFS_LO (not last sequence)
+    dut.in_data = 0x61
+    wait 1 cycle
+    assert dut.out_data == 0x61
+        else fail("T3-lit: expected 'a' (0x61), got ${dut.out_data}")
+    assert dut.out_last == 0
+        else fail("T3-lit: out_last should be 0 mid-stream")
+
+    // Offset = 1 (little-endian 0x01 0x00) → copy_src = wr_ptr(1) - 1 = 0
+    dut.in_data = 0x01
+    assert dut.in_ready == 1
+        else fail("T3: in_ready should be 1 in OFFS_LO state")
+    wait 1 cycle
+    dut.in_data = 0x00
+    assert dut.in_ready == 1
+        else fail("T3: in_ready should be 1 in OFFS_HI state")
+    wait 1 cycle
+    // state=COPY, copy_src=0, match_rem=6
+
+    // Read-fill cycle (no output yet)
+    dut.in_valid = 0
+    wait 1 cycle
+    assert dut.out_valid == 0
+        else fail("T3: no output during COPY read-fill cycle")
+
+    // 6 copied 'a' bytes — every one relies on write->read forwarding.
+    wait 1 cycle
+    assert dut.out_valid == 1
+        else fail("T3-copy1: out_valid should be 1")
+    assert dut.out_data == 0x61
+        else fail("T3-copy1: expected 'a' (0x61), got ${dut.out_data}")
+
+    wait 1 cycle
+    assert dut.out_data == 0x61
+        else fail("T3-copy2: forwarded 'a' (0x61) expected, got ${dut.out_data}")
+
+    wait 1 cycle
+    assert dut.out_data == 0x61
+        else fail("T3-copy3: forwarded 'a' (0x61) expected, got ${dut.out_data}")
+
+    wait 1 cycle
+    assert dut.out_data == 0x61
+        else fail("T3-copy4: forwarded 'a' (0x61) expected, got ${dut.out_data}")
+
+    wait 1 cycle
+    assert dut.out_data == 0x61
+        else fail("T3-copy5: forwarded 'a' (0x61) expected, got ${dut.out_data}")
+
+    wait 1 cycle
+    assert dut.out_data == 0x61
+        else fail("T3-copy6: forwarded 'a' (0x61) expected, got ${dut.out_data}")
+    // match_rem=0, state=TOKEN
+
+    // Last sequence: single literal '!'
+    dut.in_valid = 1
+    dut.in_data  = 0x10
+    dut.in_last  = 1
+    assert dut.in_ready == 1
+        else fail("T3-last-token: in_ready should be 1 in TOKEN state")
+    wait 1 cycle
+    // state=LITERAL, lit_rem=1, is_last=1
+
+    dut.in_data = 0x21
+    dut.in_last = 0
+    wait 1 cycle
+    assert dut.out_data == 0x21
+        else fail("T3-bang: expected '!' (0x21), got ${dut.out_data}")
+    assert dut.out_last == 1
+        else fail("T3-bang: out_last should be 1 on last byte of block")
+
+    dut.in_valid = 0
+    wait 1 cycle
+    assert dut.out_valid == 0
+        else fail("T3: out_valid should clear after final drain")
+    log(info, "PASS: Test 3 — RLE overlap 'aaaaaaa!' decompressed correctly")
+    wait 2 cycles
+  end run
+end impl Lz4DecompTest
