@@ -1536,7 +1536,7 @@ fn emit_test(
     writeln!(out, "{INDENT}sched.slots.push_back(&_run_slot);").ok();
     writeln!(
         out,
-        "{INDENT}_run_slot.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+        "{INDENT}auto _run_slot_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
     )
     .ok();
     if !tb.synthetic {
@@ -1567,7 +1567,8 @@ fn emit_test(
         )?;
     }
     writeln!(out, "{INDENT}{INDENT}co_return;").ok();
-    writeln!(out, "{INDENT}}}(&_run_slot);").ok();
+    writeln!(out, "{INDENT}}};").ok();
+    writeln!(out, "{INDENT}_run_slot.thread = _run_slot_lambda(&_run_slot);").ok();
 
     // Bootstrap (single-threaded) → spawn workers (`--mt` only) → drive
     // loop → shutdown workers. Ordering is load-bearing: per-actor

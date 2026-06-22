@@ -87,9 +87,9 @@ int run_TlmTargetThreadIfTest(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
     HarcTestContext ctx;
     ctx.dut = new VTlmReadInitiatorPair;
-    auto*& dut = ctx.dut;
+    auto* dut = ctx.dut;
 #if HARC_TRACE_ENABLED
-    auto*& tfp = ctx.tfp;
+    auto* tfp = ctx.tfp;
     auto& _wave_path = ctx._wave_path;
 #endif
     auto& _trace_time = ctx._trace_time;
@@ -154,7 +154,7 @@ int run_TlmTargetThreadIfTest(int argc, char** argv) {
     } target;
     harc_rt::ThreadSlot _target_read_target_slot;
     sched.slots.push_back(&_target_read_target_slot);
-    _target_read_target_slot.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
+    auto _target_read_target_slot_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
         dut->mem_read_req_ready = 0;
         dut->mem_read_rsp_valid = 0;
         while (true) {
@@ -227,10 +227,11 @@ int run_TlmTargetThreadIfTest(int argc, char** argv) {
             target._last_out_cycle = (uint64_t)cycle_count;
         }
         co_return;
-    }(&_target_read_target_slot);
+    };
+    _target_read_target_slot.thread = _target_read_target_slot_lambda(&_target_read_target_slot);
     harc_rt::ThreadSlot _run_slot;
     sched.slots.push_back(&_run_slot);
-    _run_slot.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
+    auto _run_slot_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
         _tb.dut = dut;
         { // run_TlmTargetThreadIfTest (TB-IR loop-switch)
             uint64_t __t0 = 0; (void)__t0;
@@ -286,7 +287,8 @@ int run_TlmTargetThreadIfTest(int argc, char** argv) {
             }
         }
         co_return;
-    }(&_run_slot);
+    };
+    _run_slot.thread = _run_slot_lambda(&_run_slot);
 
     // Resume each coroutine once so initial-setup statements run
     // before the first clock edge. Single-threaded — workers
