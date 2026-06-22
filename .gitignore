@@ -8,6 +8,7 @@
 Cargo.lock
 *.swp
 *.log
+/core
 .DS_Store
 .claude/
 .worktrees/

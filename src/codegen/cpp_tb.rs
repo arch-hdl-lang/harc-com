@@ -1198,12 +1198,14 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // for fast simulation.
     //
     // GCC has the same class of miscompile but `#pragma optimize`
-    // doesn't propagate through C++20 coroutine codegen there
-    // (`-O0`-pragma SEGVs trivial tests; `-O1`-pragma still SEGVs
-    // bound-actor tests). CI installs clang on Linux and sets
-    // `CXX=clang++` so this pragma applies on both platforms.
-    // Member-function refactor of the run / actor coroutines is
-    // the durable fix; this pragma is the v0 stop-gap.
+    // doesn't propagate through C++20 coroutine codegen there.
+    // The structural fix (2026-06-22): every coroutine is stored
+    // in a named lambda variable (`auto _foo_lambda = [&](){...};
+    // slot.thread = _foo_lambda(&slot);`) so the closure object
+    // lives for the full duration of `run_<Test>`, not as a
+    // temporary freed at the IIFE semicolon. This fixes GCC on
+    // Linux without requiring HARC_CXX=clang++. The pragma remains
+    // as a redundant defence for clang.
     writeln!(e.out, "#ifdef __clang__").ok();
     writeln!(e.out, "#pragma clang optimize off").ok();
     writeln!(e.out, "#endif").ok();
@@ -1805,9 +1807,9 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "{INDENT}Verilated::commandArgs(argc, argv);").ok();
         writeln!(e.out, "{INDENT}HarcTestContext ctx;").ok();
         writeln!(e.out, "{INDENT}ctx.dut = new V{dut_type};").ok();
-        writeln!(e.out, "{INDENT}auto*& dut = ctx.dut;").ok();
+        writeln!(e.out, "{INDENT}auto* dut = ctx.dut;").ok();
         writeln!(e.out, "#if HARC_TRACE_ENABLED").ok();
-        writeln!(e.out, "{INDENT}auto*& tfp = ctx.tfp;").ok();
+        writeln!(e.out, "{INDENT}auto* tfp = ctx.tfp;").ok();
         writeln!(e.out, "{INDENT}auto& _wave_path = ctx._wave_path;").ok();
         writeln!(e.out, "#endif").ok();
         writeln!(e.out, "{INDENT}auto& _trace_time = ctx._trace_time;").ok();
@@ -2397,7 +2399,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "{INDENT}sched.slots.push_back(&_run_slot);").ok();
         writeln!(
             e.out,
-            "{INDENT}_run_slot.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+            "{INDENT}auto _run_slot_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
         )
         .ok();
 
@@ -2425,7 +2427,8 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         e.in_coroutine = false;
 
         writeln!(e.out, "{INDENT}{INDENT}co_return;").ok();
-        writeln!(e.out, "{INDENT}}}(&_run_slot);").ok();
+        writeln!(e.out, "{INDENT}}};").ok();
+        writeln!(e.out, "{INDENT}_run_slot.thread = _run_slot_lambda(&_run_slot);").ok();
         writeln!(e.out, "").ok();
 
         // `actor_threads` is populated only when `--mt` is set (cooperative
@@ -6216,7 +6219,7 @@ impl Emitter {
                     self.pad(depth);
                     writeln!(
                         self.out,
-                        "{slot_var}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{",
+                        "auto {slot_var}_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{",
                     ).ok();
                     self.pad(depth + 1);
                     writeln!(self.out, "while (true) {{").ok();
@@ -6313,7 +6316,9 @@ impl Emitter {
                     self.pad(depth + 1);
                     writeln!(self.out, "co_return;").ok();
                     self.pad(depth);
-                    writeln!(self.out, "}}(&{slot_var});").ok();
+                    writeln!(self.out, "}};").ok();
+                    self.pad(depth);
+                    writeln!(self.out, "{slot_var}.thread = {slot_var}_lambda(&{slot_var});").ok();
                 } else {
                     sync_handlers.push(h);
                 }
@@ -6636,7 +6641,7 @@ impl Emitter {
             self.pad(depth);
             writeln!(
                 self.out,
-                "{slot_var}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{",
+                "auto {slot_var}_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{",
             )
             .ok();
             self.pad(depth + 1);
@@ -6806,7 +6811,9 @@ impl Emitter {
             self.pad(depth + 1);
             writeln!(self.out, "co_return;").ok();
             self.pad(depth);
-            writeln!(self.out, "}}(&{slot_var});").ok();
+            writeln!(self.out, "}};").ok();
+            self.pad(depth);
+            writeln!(self.out, "{slot_var}.thread = {slot_var}_lambda(&{slot_var});").ok();
         }
     }
 
@@ -6949,7 +6956,7 @@ impl Emitter {
         self.pad(depth);
         writeln!(
             self.out,
-            "{dispatcher_slot}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{",
+            "auto {dispatcher_slot}_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{",
         )
         .ok();
         self.pad(depth + 1);
@@ -7004,7 +7011,9 @@ impl Emitter {
         self.pad(depth + 1);
         writeln!(self.out, "co_return;").ok();
         self.pad(depth);
-        writeln!(self.out, "}}(&{dispatcher_slot});").ok();
+        writeln!(self.out, "}};").ok();
+        self.pad(depth);
+        writeln!(self.out, "{dispatcher_slot}.thread = {dispatcher_slot}_lambda(&{dispatcher_slot});").ok();
 
         for lane in 0..tag_count {
             let lane_slot = format!("{prefix}_lane{lane}_slot");
@@ -7026,7 +7035,7 @@ impl Emitter {
             self.pad(depth);
             writeln!(
                 self.out,
-                "{lane_slot}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{",
+                "auto {lane_slot}_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{",
             )
             .ok();
             self.pad(depth + 1);
@@ -7131,7 +7140,9 @@ impl Emitter {
             self.pad(depth + 1);
             writeln!(self.out, "co_return;").ok();
             self.pad(depth);
-            writeln!(self.out, "}}(&{lane_slot});").ok();
+            writeln!(self.out, "}};").ok();
+            self.pad(depth);
+            writeln!(self.out, "{lane_slot}.thread = {lane_slot}_lambda(&{lane_slot});").ok();
         }
 
         if self.mt {
@@ -7155,7 +7166,7 @@ impl Emitter {
         self.pad(depth);
         writeln!(
             self.out,
-            "{arbiter_slot}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{",
+            "auto {arbiter_slot}_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{",
         )
         .ok();
         self.pad(depth + 1);
@@ -7235,7 +7246,9 @@ impl Emitter {
         self.pad(depth + 1);
         writeln!(self.out, "co_return;").ok();
         self.pad(depth);
-        writeln!(self.out, "}}(&{arbiter_slot});").ok();
+        writeln!(self.out, "}};").ok();
+        self.pad(depth);
+        writeln!(self.out, "{arbiter_slot}.thread = {arbiter_slot}_lambda(&{arbiter_slot});").ok();
     }
 
     /// Phase 2b: if `comp` is a `bound to BusType` driver/agent with
@@ -7372,7 +7385,7 @@ impl Emitter {
         self.pad(depth);
         writeln!(
             self.out,
-            "{slot_var}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{",
+            "auto {slot_var}_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{",
         )
         .ok();
         self.pad(depth + 1);
@@ -7485,7 +7498,9 @@ impl Emitter {
         self.pad(depth + 1);
         writeln!(self.out, "co_return;").ok(); // unreachable but required
         self.pad(depth);
-        writeln!(self.out, "}}(&{slot_var});").ok();
+        writeln!(self.out, "}};").ok();
+        self.pad(depth);
+        writeln!(self.out, "{slot_var}.thread = {slot_var}_lambda(&{slot_var});").ok();
 
         // Other on-handlers (on different events) still register
         // sync — they don't go through the actor's queue and may

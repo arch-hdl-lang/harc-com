@@ -83,7 +83,7 @@ end test TraceTest
     assert!(cpp.contains("#include \"harc_trace_rt.h\""));
     assert!(cpp.contains("#include \"harc_log_rt.h\""));
     assert!(cpp.contains("struct HarcTestContext {"));
-    assert!(cpp.contains("auto*& dut = ctx.dut;"));
+    assert!(cpp.contains("auto* dut = ctx.dut;"));
     assert!(cpp.contains("auto& _checkers = ctx._checkers;"));
     assert!(cpp.contains("harc_rt::trace::HarcTraceWriter trace;"));
     assert!(cpp.contains("harc_rt::trace::harc_start_trace(trace, harc_rng.state, \"Top\", \"TraceTest\", cycle_count);"));
@@ -268,7 +268,7 @@ end test WaveTest
     // Setup is gated by `#if HARC_TRACE_ENABLED`; dump/log/teardown call
     // runtime macros that compile away in a non-waves build.
     assert!(cpp.contains("Verilated::traceEverOn(true);"));
-    assert!(cpp.contains("auto*& tfp = ctx.tfp;"));
+    assert!(cpp.contains("auto* tfp = ctx.tfp;"));
     assert!(cpp.contains("tfp = new HarcTraceC;"));
     assert!(cpp.contains(
         "harc_rt::log::harc_open_wave_trace(dut, tfp, harc_rt::log::harc_wave_default_name());"

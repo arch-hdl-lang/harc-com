@@ -337,9 +337,9 @@ pub(super) fn run_prologue(out: &mut String, test_name: &str, dut_type: &str) {
     writeln!(out, "{INDENT}HarcTestContext ctx;").ok();
     writeln!(out, "{INDENT}ctx.dut = new V{dut_type};").ok();
     out.push_str(
-        r#"    auto*& dut = ctx.dut;
+        r#"    auto* dut = ctx.dut;
 #if HARC_TRACE_ENABLED
-    auto*& tfp = ctx.tfp;
+    auto* tfp = ctx.tfp;
     auto& _wave_path = ctx._wave_path;
 #endif
     auto& _trace_time = ctx._trace_time;

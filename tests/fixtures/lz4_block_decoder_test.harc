@@ -1,0 +1,341 @@
+// HARC TB for arch-com/examples/lz4_block_decoder.arch — LZ4 block decompressor
+// analog to the CAST LZ4SNP-D IP.
+//
+// Mirrors arch-com/examples/lz4_block_decoder_tb.cpp: same four functional
+// scenarios expressed in HARC with correct one-cycle-behind sampling.
+//
+// Timing model (HARC): eval_clocks_until (rising + falling edge eval) runs
+// BEFORE sched.tick() resumes the coroutine. Input writes apply at the next
+// eval; reads reflect the most recent falling-edge result. Therefore:
+//
+//   LIT_COPY (pass-through): drive byte in segment N, read dut.out_data in
+//   segment N+1 after "wait 1 cycle" (one cycle behind). The last literal of
+//   each sequence triggers a state transition at posedge; its output is only
+//   valid during eval_comb BEFORE posedge and cannot be captured. Verified
+//   bytes: all except the last of each sequence.
+//
+//   MAT_COPY: outputs are valid immediately in the segment after the
+//   state-transition wait (eval already ran with MAT_COPY active).
+//
+//   done: combinational pulse occurring only during eval_comb before posedge;
+//   cleared by the post-posedge eval_comb. Never assert dut.done.
+
+domain SysDomain
+  freq_mhz: 200
+end domain SysDomain
+
+// ── Shared reset helper ───────────────────────────────────────────────────────
+function do_reset(dut: Lz4BlockDecoder)
+    dut.rst       = 1
+    dut.in_valid  = 0
+    dut.in_data   = 0
+    dut.in_last   = 0
+    dut.out_ready = 0
+    wait 3 cycles
+    dut.rst = 0
+    wait 1 cycle
+end function do_reset
+
+// ── Testbench declaration ─────────────────────────────────────────────────────
+testbench Lz4Tb
+    dut : Lz4BlockDecoder
+end testbench Lz4Tb
+
+impl Lz4BlockDecoderTest for Lz4Tb
+    clock clk = SysDomain
+
+    run
+        // ── Test 1: pure literals — "Hello" (5 bytes) ────────────────────────
+        //
+        // Compressed: token=0x50 (lit=5, ml=0) then H e l l o (in_last=1)
+        // Verified outputs: H e l l (4 of 5; 'o' triggers done at posedge,
+        // invisible post-posedge — block completion inferred from out_valid=0).
+        do_reset(dut)
+        dut.out_ready = 1
+
+        // Token byte: READ_TOKEN → LIT_COPY (no data output)
+        dut.in_valid = 1
+        dut.in_data  = 0x50
+        dut.in_last  = 0
+        wait 1 cycle
+        // Now: state=LIT_COPY lit_cnt=5; out_data=0x50 (token value, skip)
+
+        // Drive 'H'; output visible in next segment
+        dut.in_data = 0x48
+        wait 1 cycle
+        // Now: out_data=0x48 lit_cnt=4
+
+        // Drive 'e', check 'H'
+        dut.in_data = 0x65
+        assert dut.out_valid == 1
+            else fail("T1: out_valid=0 on 'H' check")
+        assert dut.out_data == 0x48
+            else fail("T1: expected 'H'(0x48), got ${dut.out_data}")
+        wait 1 cycle
+        // Now: out_data=0x65 lit_cnt=3
+
+        // Drive first 'l', check 'e'
+        dut.in_data = 0x6c
+        assert dut.out_valid == 1
+            else fail("T1: out_valid=0 on 'e' check")
+        assert dut.out_data == 0x65
+            else fail("T1: expected 'e'(0x65), got ${dut.out_data}")
+        wait 1 cycle
+        // Now: out_data=0x6c lit_cnt=2
+
+        // Drive second 'l', check first 'l'
+        dut.in_data = 0x6c
+        assert dut.out_valid == 1
+            else fail("T1: out_valid=0 on first-l check")
+        assert dut.out_data == 0x6c
+            else fail("T1: expected 'l'(0x6c), got ${dut.out_data}")
+        wait 1 cycle
+        // Now: out_data=0x6c lit_cnt=1
+
+        // Drive 'o' (in_last=1), check second 'l'
+        // After this wait: last_lit=1 → state→READ_TOKEN; 'o' invisible post-posedge
+        dut.in_data = 0x6f
+        dut.in_last = 1
+        assert dut.out_valid == 1
+            else fail("T1: out_valid=0 on second-l check")
+        assert dut.out_data == 0x6c
+            else fail("T1: expected 'l'(0x6c), got ${dut.out_data}")
+        wait 1 cycle
+
+        // Block complete: state=READ_TOKEN → out_valid=0
+        assert dut.out_valid == 0
+            else fail("T1: out_valid still set after block end")
+        assert dut.error == 0
+            else fail("T1: unexpected error")
+        dut.in_valid = 0
+        dut.in_last  = 0
+
+        log(info, "PASS: T1 pure literals — Hello")
+
+        // ── Test 2: match copy — "abcdabcdX" ─────────────────────────────────
+        //
+        // Seq 1: token=0x40 (lit=4 ml=0→match_len=4), lits: a b c d, off=0x0004
+        //        → match copy a b c d from history
+        // Seq 2: token=0x10 (lit=1), literal 'X' (in_last=1)
+        // Expected output: a b c d a b c d X
+        //
+        // Verified: literals a b c (not d — last literal triggers OFF_LO at
+        // posedge); all 4 match bytes a b c d; block completion (out_valid=0).
+        do_reset(dut)
+        dut.out_ready = 1
+
+        // Token 0x40: lit=4 ml=0
+        dut.in_valid = 1
+        dut.in_data  = 0x40
+        dut.in_last  = 0
+        wait 1 cycle
+        // state=LIT_COPY lit_cnt=4; out_data=0x40 (skip)
+
+        // Drive 'a'
+        dut.in_data = 0x61
+        wait 1 cycle
+        // out_data=0x61 lit_cnt=3
+
+        // Drive 'b', check 'a'
+        dut.in_data = 0x62
+        assert dut.out_valid == 1
+            else fail("T2: out_valid=0 on 'a' check")
+        assert dut.out_data == 0x61
+            else fail("T2: expected 'a'(0x61), got ${dut.out_data}")
+        wait 1 cycle
+        // out_data=0x62 lit_cnt=2
+
+        // Drive 'c', check 'b'
+        dut.in_data = 0x63
+        assert dut.out_valid == 1
+            else fail("T2: out_valid=0 on 'b' check")
+        assert dut.out_data == 0x62
+            else fail("T2: expected 'b'(0x62), got ${dut.out_data}")
+        wait 1 cycle
+        // out_data=0x63 lit_cnt=1
+
+        // Drive 'd', check 'c'. lit_cnt=1+not-last_lit → OFF_LO after posedge;
+        // 'd' output exists only in eval_comb before posedge, not capturable.
+        dut.in_data = 0x64
+        assert dut.out_valid == 1
+            else fail("T2: out_valid=0 on 'c' check")
+        assert dut.out_data == 0x63
+            else fail("T2: expected 'c'(0x63), got ${dut.out_data}")
+        wait 1 cycle
+        // state=OFF_LO; hist_buf[0..3]=a,b,c,d; wr_ptr=4
+
+        // Offset low byte = 0x04
+        dut.in_data = 0x04
+        wait 1 cycle   // → OFF_HI
+
+        // Offset high byte = 0x00 (offset=4, valid)
+        dut.in_data = 0x00
+        wait 1 cycle   // → MAT_COPY mat_cnt=4 mat_rd_ptr=0
+
+        // Match copy: 4 bytes a b c d. MAT_COPY outputs are valid immediately
+        // in the segment following the state-transition wait.
+        dut.in_valid = 0
+
+        assert dut.out_valid == 1
+            else fail("T2: out_valid=0 on match byte 0")
+        assert dut.out_data == 0x61
+            else fail("T2: match[0] expected 'a'(0x61), got ${dut.out_data}")
+        wait 1 cycle
+
+        assert dut.out_valid == 1
+            else fail("T2: out_valid=0 on match byte 1")
+        assert dut.out_data == 0x62
+            else fail("T2: match[1] expected 'b'(0x62), got ${dut.out_data}")
+        wait 1 cycle
+
+        assert dut.out_valid == 1
+            else fail("T2: out_valid=0 on match byte 2")
+        assert dut.out_data == 0x63
+            else fail("T2: match[2] expected 'c'(0x63), got ${dut.out_data}")
+        wait 1 cycle
+
+        assert dut.out_valid == 1
+            else fail("T2: out_valid=0 on match byte 3")
+        assert dut.out_data == 0x64
+            else fail("T2: match[3] expected 'd'(0x64), got ${dut.out_data}")
+        wait 1 cycle   // → READ_TOKEN
+
+        // Second token 0x10: lit=1 ml=0
+        dut.in_valid = 1
+        dut.in_data  = 0x10
+        wait 1 cycle   // → LIT_COPY lit_cnt=1; out_data=0x10 (skip)
+
+        // Drive 'X' (in_last=1). last_lit=1 → state→READ_TOKEN at posedge.
+        // 'X' output invisible post-posedge; block completion verified below.
+        dut.in_data = 0x58
+        dut.in_last = 1
+        wait 1 cycle
+
+        assert dut.out_valid == 0
+            else fail("T2: out_valid still set after block end")
+        assert dut.error == 0
+            else fail("T2: unexpected error")
+        dut.in_valid = 0
+        dut.in_last  = 0
+
+        log(info, "PASS: T2 match copy — abcdabcdX")
+
+        // ── Test 3: run-length match — "aaaaaz" ──────────────────────────────
+        //
+        // Seq 1: token=0x10 (lit=1 ml=0→match_len=4), literal 'a', offset=0x0001
+        //        → 4× run-length copy of 'a' (mat_rd_ptr always trails wr_ptr by 1)
+        // Seq 2: token=0x10 (lit=1), literal 'z' (in_last=1)
+        // Expected output: a a a a a z
+        //
+        // Single 'a' literal has lit_cnt=1+not-last_lit → OFF_LO immediately;
+        // its output is invisible post-posedge. Verified: 4 match copies of 'a'.
+        do_reset(dut)
+        dut.out_ready = 1
+
+        // Token 0x10: lit=1 ml=0
+        dut.in_valid = 1
+        dut.in_data  = 0x10
+        dut.in_last  = 0
+        wait 1 cycle
+        // state=LIT_COPY lit_cnt=1; out_data=0x10 (skip)
+
+        // Drive 'a'. lit_cnt=1 not-last_lit → state→OFF_LO; 'a' stored in hist_buf[0].
+        dut.in_data = 0x61
+        wait 1 cycle   // → OFF_LO; wr_ptr=1
+
+        // Offset low = 0x01
+        dut.in_data = 0x01
+        wait 1 cycle   // → OFF_HI
+
+        // Offset high = 0x00 (offset=1, valid)
+        dut.in_data = 0x00
+        wait 1 cycle   // → MAT_COPY mat_cnt=4 mat_rd_ptr=wr_ptr-1=0
+
+        // Match copy: 4 × 'a'. Each posedge writes the read 'a' to wr_ptr and
+        // advances both wr_ptr and mat_rd_ptr by 1 → always reads the most
+        // recently written 'a' (run-length expansion).
+        dut.in_valid = 0
+        let t3 = 0
+        while t3 < 4
+            assert dut.out_valid == 1
+                else fail("T3: out_valid=0 on match byte ${t3}")
+            assert dut.out_data == 0x61
+                else fail("T3: match[${t3}] expected 'a'(0x61), got ${dut.out_data}")
+            wait 1 cycle
+            t3 = t3 + 1
+        end while
+        // → READ_TOKEN
+
+        // Second token 0x10: lit=1 ml=0
+        dut.in_valid = 1
+        dut.in_data  = 0x10
+        wait 1 cycle   // → LIT_COPY lit_cnt=1
+
+        // Drive 'z' (in_last=1). last_lit=1 → state→READ_TOKEN at posedge.
+        dut.in_data = 0x7a
+        dut.in_last = 1
+        wait 1 cycle
+
+        assert dut.out_valid == 0
+            else fail("T3: out_valid still set after block end")
+        assert dut.error == 0
+            else fail("T3: unexpected error")
+        dut.in_valid = 0
+        dut.in_last  = 0
+
+        log(info, "PASS: T3 run-length match — aaaaaz")
+
+        // ── Test 4: error path — offset == 0 (invalid per LZ4 spec) ──────────
+        //
+        // Sequence: lit=1 ('x'), offset=0x0000 (illegal) → ERROR state.
+        // Error must persist; reset must clear it.
+        do_reset(dut)
+        dut.out_ready = 1
+
+        // Token 0x10: lit=1
+        dut.in_valid = 1
+        dut.in_data  = 0x10
+        dut.in_last  = 0
+        wait 1 cycle
+        // state=LIT_COPY lit_cnt=1
+
+        // Drive 'x'. out_valid=1 (state=LIT_COPY in_valid=1).
+        // lit_cnt=1 not-last_lit → OFF_LO after posedge.
+        dut.in_data = 0x78
+        assert dut.out_valid == 1
+            else fail("T4: out_valid=0 in LIT_COPY state")
+        wait 1 cycle   // → OFF_LO
+
+        // Offset low = 0x00
+        dut.in_data = 0x00
+        wait 1 cycle   // → OFF_HI offset_lo=0
+
+        // Offset high = 0x00 → full offset=0x0000 → ERROR state
+        dut.in_data = 0x00
+        dut.in_last = 1
+        wait 1 cycle   // → ERROR
+        dut.in_valid = 0
+        dut.in_last  = 0
+
+        assert dut.error == 1
+            else fail("T4: error=0 after offset==0; expected ERROR state")
+
+        // Error persists without reset
+        let t4 = 0
+        while t4 < 3
+            wait 1 cycle
+            assert dut.error == 1
+                else fail("T4: error cleared without reset at cycle ${t4}")
+            t4 = t4 + 1
+        end while
+
+        // Reset clears error
+        do_reset(dut)
+        assert dut.error == 0
+            else fail("T4: error persists after reset")
+
+        log(info, "PASS: T4 error path — offset==0 latches and clears")
+
+        log(info, "ALL TESTS PASSED")
+    end run
+end impl Lz4BlockDecoderTest

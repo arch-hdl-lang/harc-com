@@ -2387,7 +2387,7 @@ pub(super) fn emit_target_actor(
         );
         writeln!(
             out,
-            "{pad}{slot_var}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+            "{pad}auto {slot_var}_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
         )
         .ok();
         writeln!(out, "{pad1}{} = 0;", wire("req_ready")).ok();
@@ -2485,7 +2485,8 @@ pub(super) fn emit_target_actor(
         .ok();
         writeln!(out, "{pad1}}}").ok(); // while(true)
         writeln!(out, "{pad1}co_return;").ok();
-        writeln!(out, "{pad}}}(&{slot_var});").ok();
+        writeln!(out, "{pad}}};").ok();
+        writeln!(out, "{pad}{slot_var}.thread = {slot_var}_lambda(&{slot_var});").ok();
     }
     Ok(())
 }
@@ -2660,7 +2661,7 @@ pub(super) fn emit_active_bound_driver_actor(
         // 4. Worker coroutine: pop a transaction, bump activity, run body.
         writeln!(
             out,
-            "{pad}{slot_var}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+            "{pad}auto {slot_var}_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
         )
         .ok();
         writeln!(out, "{pad1}while (true) {{").ok();
@@ -2689,7 +2690,8 @@ pub(super) fn emit_active_bound_driver_actor(
         writeln!(out, "{pad2}}}").ok();
         writeln!(out, "{pad1}}}").ok(); // while(true)
         writeln!(out, "{pad1}co_return;").ok();
-        writeln!(out, "{pad}}}(&{slot_var});").ok();
+        writeln!(out, "{pad}}};").ok();
+        writeln!(out, "{pad}{slot_var}.thread = {slot_var}_lambda(&{slot_var});").ok();
     }
     Ok(())
 }
@@ -2812,7 +2814,7 @@ fn emit_tagged_target_actors(
     );
     writeln!(
         out,
-        "{pad}{dispatcher_slot}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+        "{pad}auto {dispatcher_slot}_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
     )
     .ok();
     writeln!(out, "{pad1}{} = 0;", wire("req_ready")).ok();
@@ -2854,7 +2856,8 @@ fn emit_tagged_target_actors(
     writeln!(out, "{pad2}co_await harc_rt::wait_cycles(_slot, 1);").ok();
     writeln!(out, "{pad1}}}").ok();
     writeln!(out, "{pad1}co_return;").ok();
-    writeln!(out, "{pad}}}(&{dispatcher_slot});").ok();
+    writeln!(out, "{pad}}};").ok();
+    writeln!(out, "{pad}{dispatcher_slot}.thread = {dispatcher_slot}_lambda(&{dispatcher_slot});").ok();
 
     // --- (4) Lane coroutines. ---
     let nparams = func.params.len();
@@ -2871,7 +2874,7 @@ fn emit_tagged_target_actors(
         );
         writeln!(
             out,
-            "{pad}{lane_slot}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+            "{pad}auto {lane_slot}_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
         )
         .ok();
         writeln!(out, "{pad1}while (true) {{").ok();
@@ -2919,7 +2922,8 @@ fn emit_tagged_target_actors(
         writeln!(out, "{pad2}{lane_busy}[{lane}].store(false);").ok();
         writeln!(out, "{pad1}}}").ok();
         writeln!(out, "{pad1}co_return;").ok();
-        writeln!(out, "{pad}}}(&{lane_slot});").ok();
+        writeln!(out, "{pad}}};").ok();
+        writeln!(out, "{pad}{lane_slot}.thread = {lane_slot}_lambda(&{lane_slot});").ok();
     }
 
     // --- (5) Arbiter coroutine. ---
@@ -2933,7 +2937,7 @@ fn emit_tagged_target_actors(
     );
     writeln!(
         out,
-        "{pad}{arbiter_slot}.thread = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+        "{pad}auto {arbiter_slot}_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
     )
     .ok();
     writeln!(out, "{pad1}{} = 0;", wire("rsp_valid")).ok();
@@ -2985,7 +2989,8 @@ fn emit_tagged_target_actors(
     writeln!(out, "{pad2}}}").ok();
     writeln!(out, "{pad1}}}").ok();
     writeln!(out, "{pad1}co_return;").ok();
-    writeln!(out, "{pad}}}(&{arbiter_slot});").ok();
+    writeln!(out, "{pad}}};").ok();
+    writeln!(out, "{pad}{arbiter_slot}.thread = {arbiter_slot}_lambda(&{arbiter_slot});").ok();
     Ok(())
 }
 

@@ -1663,24 +1663,19 @@ fn run_verilator(
         // generated DUT code (in separate .cpp files) keeps `-Os`
         // for fast simulation.
         //
-        // GCC has the same class of miscompile, but its
-        // `#pragma optimize` doesn't propagate correctly through
-        // C++20 coroutine codegen (`-O0`-pragma SEGVs trivial
-        // tests; `-O1`-pragma still SEGVs the bound-actor tests).
-        // CI sets `CXX=clang++-15` for the verilator build so the
-        // clang pragma applies on both platforms; see
-        // `.github/workflows/ci.yml`.
+        // GCC has the same class of miscompile. Named-lambda fix
+        // (2026-06-22): each coroutine is stored in a named local
+        // (`auto _foo_lambda = [&](){...}; slot.thread =
+        // _foo_lambda(&slot);`) so the closure lives for the full
+        // run_<Test> scope, not as a temporary freed at the IIFE
+        // semicolon. This makes GCC work without HARC_CXX=clang++.
+        // The `#pragma clang optimize off` stays as extra defence.
         "-MAKEFLAGS".into(),
         // `CXX=${HARC_CXX:-c++}` lets CI override the compiler
         // without changing harc-com source. On macOS, `c++` aliases
         // clang and the existing `#pragma clang optimize off` does
-        // its thing. On Linux GitHub runners, `c++` would alias
-        // g++ — and GCC's pragma-equivalent doesn't propagate
-        // through C++20 coroutine codegen — so CI sets
-        // `HARC_CXX=clang++` explicitly. Local Linux users without
-        // the env var get the system `c++` (g++ on most distros);
-        // they can `export HARC_CXX=clang++` if they want the
-        // clang fix.
+        // its thing. The named-lambda fix also covers GCC, so
+        // HARC_CXX=clang++ is no longer strictly required on Linux.
         format!(
             "CFG_CXXFLAGS_STD=-std=gnu++20 CXX={}",
             std::env::var("HARC_CXX").unwrap_or_else(|_| "c++".to_string())
