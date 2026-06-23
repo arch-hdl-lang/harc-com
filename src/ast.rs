@@ -1269,8 +1269,11 @@ pub enum UnaryOp {
 pub enum BinaryOp {
     // arithmetic
     Add,
+    AddWrap,
     Sub,
+    SubWrap,
     Mul,
+    MulWrap,
     Div,
     Mod,
     // comparison
