@@ -1422,9 +1422,9 @@ fn const_eval_width(e: &AstExpr) -> Option<u32> {
 
 pub(crate) fn lower_bin_op(op: BinaryOp) -> Result<BinOp, LowerError> {
     Ok(match op {
-        BinaryOp::Add => BinOp::Add,
-        BinaryOp::Sub => BinOp::Sub,
-        BinaryOp::Mul => BinOp::Mul,
+        BinaryOp::Add | BinaryOp::AddWrap => BinOp::Add,
+        BinaryOp::Sub | BinaryOp::SubWrap => BinOp::Sub,
+        BinaryOp::Mul | BinaryOp::MulWrap => BinOp::Mul,
         BinaryOp::Div => BinOp::Div,
         BinaryOp::Mod => BinOp::Mod,
         BinaryOp::Eq => BinOp::Eq,

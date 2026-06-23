@@ -3165,9 +3165,9 @@ fn eval_const_i64(e: &Expr, env: &std::collections::HashMap<String, i64>) -> Opt
             let b = eval_const_i64(rhs, env)?;
             let bool_i = |x: bool| Some(if x { 1 } else { 0 });
             match op {
-                BinaryOp::Add => Some(a.wrapping_add(b)),
-                BinaryOp::Sub => Some(a.wrapping_sub(b)),
-                BinaryOp::Mul => Some(a.wrapping_mul(b)),
+                BinaryOp::Add | BinaryOp::AddWrap => Some(a.wrapping_add(b)),
+                BinaryOp::Sub | BinaryOp::SubWrap => Some(a.wrapping_sub(b)),
+                BinaryOp::Mul | BinaryOp::MulWrap => Some(a.wrapping_mul(b)),
                 BinaryOp::Div => (b != 0).then(|| a / b),
                 BinaryOp::Mod => (b != 0).then(|| a % b),
                 BinaryOp::Shl => Some(a.wrapping_shl(b as u32)),
@@ -14204,9 +14204,9 @@ impl Emitter {
                 let signed = self.constraint_expr_is_signed(lhs, field_info)
                     || self.constraint_expr_is_signed(rhs, field_info);
                 let (sep, fname) = match op {
-                    Add => (" + ", None),
-                    Sub => (" - ", None),
-                    Mul => (" * ", None),
+                    Add | AddWrap => (" + ", None),
+                    Sub | SubWrap => (" - ", None),
+                    Mul | MulWrap => (" * ", None),
                     Div if signed => (" / ", None),
                     Div => ("", Some("udiv")),
                     Mod if signed => (" % ", None),
@@ -17986,9 +17986,9 @@ fn cpp_param_names(params: &[Param]) -> Vec<String> {
 fn c_binary_op(op: BinaryOp) -> &'static str {
     use BinaryOp::*;
     match op {
-        Add => "+",
-        Sub => "-",
-        Mul => "*",
+        Add | AddWrap => "+",
+        Sub | SubWrap => "-",
+        Mul | MulWrap => "*",
         Div => "/",
         Mod => "%",
         Eq => "==",

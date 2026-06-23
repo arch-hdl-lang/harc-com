@@ -408,10 +408,16 @@ pub enum TokenKind {
     Clog2,
 
     // ── Operators and punctuation ─────────────────────────────────────────────
+    #[token("+%")]
+    PlusPercent,
     #[token("+")]
     Plus,
+    #[token("-%")]
+    MinusPercent,
     #[token("-")]
     Minus,
+    #[token("*%")]
+    StarPercent,
     #[token("*")]
     Star,
     #[token("/")]
@@ -681,8 +687,11 @@ impl fmt::Display for TokenKind {
             PipeImpliesNext => write!(f, "|=>"),
             HashHash => write!(f, "##"),
             Clog2 => write!(f, "$clog2"),
+            PlusPercent => write!(f, "+%"),
             Plus => write!(f, "+"),
+            MinusPercent => write!(f, "-%"),
             Minus => write!(f, "-"),
+            StarPercent => write!(f, "*%"),
             Star => write!(f, "*"),
             Slash => write!(f, "/"),
             Percent => write!(f, "%"),
@@ -774,6 +783,14 @@ mod tests {
         assert_eq!(toks[1].kind, TokenKind::PipeImplies);
         assert_eq!(toks[3].kind, TokenKind::PipeImpliesNext);
         assert_eq!(toks[5].kind, TokenKind::HashHash);
+    }
+
+    #[test]
+    fn wrapping_arithmetic_operators_tokenize_as_single_tokens() {
+        let toks = tokenize("a +% b -% c *% d").unwrap();
+        assert_eq!(toks[1].kind, TokenKind::PlusPercent);
+        assert_eq!(toks[3].kind, TokenKind::MinusPercent);
+        assert_eq!(toks[5].kind, TokenKind::StarPercent);
     }
 
     #[test]

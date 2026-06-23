@@ -4716,9 +4716,12 @@ fn infix_bp(t: &TokenKind) -> Option<(u8, u8, InfixOp)> {
         TokenKind::Shl => (26, 27, B(Shl)),
         TokenKind::Shr => (26, 27, B(Shr)),
         // Additive
+        TokenKind::PlusPercent => (28, 29, B(AddWrap)),
         TokenKind::Plus => (28, 29, B(Add)),
+        TokenKind::MinusPercent => (28, 29, B(SubWrap)),
         TokenKind::Minus => (28, 29, B(Sub)),
         // Multiplicative
+        TokenKind::StarPercent => (30, 31, B(MulWrap)),
         TokenKind::Star => (30, 31, B(Mul)),
         TokenKind::Slash => (30, 31, B(Div)),
         TokenKind::Percent => (30, 31, B(Mod)),

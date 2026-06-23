@@ -59,6 +59,22 @@ end struct Header
 }
 
 #[test]
+fn wrapping_arithmetic_operators_round_trip() {
+    let src = r#"
+test WrapArithmeticOperators
+    let a : uint<8> = 255
+    let b : uint<8> = a +% 1
+    let c : uint<8> = b -% 1
+    let d : uint<8> = c *% 3
+end test WrapArithmeticOperators
+"#;
+    let printed = parse_print_reparse(src);
+    assert!(printed.contains("a +% 1"));
+    assert!(printed.contains("b -% 1"));
+    assert!(printed.contains("c *% 3"));
+}
+
+#[test]
 fn testbench_probe_dut_round_trip() {
     let src = include_str!("fixtures/testbench_probe_dut_test.harc");
     let printed = parse_print_reparse(src);

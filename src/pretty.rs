@@ -1812,8 +1812,11 @@ fn binary_op_str(op: BinaryOp) -> &'static str {
     use BinaryOp::*;
     match op {
         Add => "+",
+        AddWrap => "+%",
         Sub => "-",
+        SubWrap => "-%",
         Mul => "*",
+        MulWrap => "*%",
         Div => "/",
         Mod => "%",
         Eq => "==",

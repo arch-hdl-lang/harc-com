@@ -1511,9 +1511,9 @@ fn default_unsigned_width(value: u128) -> u32 {
 fn map_binary_op(op: AstBinaryOp) -> Option<CBinaryOp> {
     use AstBinaryOp::*;
     Some(match op {
-        Add => CBinaryOp::Add,
-        Sub => CBinaryOp::Sub,
-        Mul => CBinaryOp::Mul,
+        Add | AddWrap => CBinaryOp::Add,
+        Sub | SubWrap => CBinaryOp::Sub,
+        Mul | MulWrap => CBinaryOp::Mul,
         Div => CBinaryOp::Div,
         Mod => CBinaryOp::Mod,
         Eq => CBinaryOp::Eq,

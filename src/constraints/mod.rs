@@ -1319,9 +1319,9 @@ fn lower_unary_op(op: UnaryOp) -> ConstraintUnaryOp {
 
 fn lower_binary_op(op: BinaryOp) -> Option<ConstraintBinaryOp> {
     match op {
-        BinaryOp::Add => Some(ConstraintBinaryOp::Add),
-        BinaryOp::Sub => Some(ConstraintBinaryOp::Sub),
-        BinaryOp::Mul => Some(ConstraintBinaryOp::Mul),
+        BinaryOp::Add | BinaryOp::AddWrap => Some(ConstraintBinaryOp::Add),
+        BinaryOp::Sub | BinaryOp::SubWrap => Some(ConstraintBinaryOp::Sub),
+        BinaryOp::Mul | BinaryOp::MulWrap => Some(ConstraintBinaryOp::Mul),
         BinaryOp::Div => Some(ConstraintBinaryOp::Div),
         BinaryOp::Mod => Some(ConstraintBinaryOp::Mod),
         BinaryOp::Eq => Some(ConstraintBinaryOp::Eq),
