@@ -1,0 +1,185 @@
+// HARC testbench for Lz4Compressor (arch-com/tests/lz4/Lz4Compressor.arch).
+//
+// Verifies two scenarios:
+//
+//   1. No-match: 5-byte input "Hello" — compressor emits a single end-sequence
+//      (token 0x50 + 5 literal bytes = 6 bytes total).
+//
+//   2. Match: 8-byte input "ABCDABCD" — greedy scan finds the 4-byte match
+//      at position 4 (referencing position 0, offset=4).
+//      Emits: [0x40, A, B, C, D, 0x04, 0x00, 0x00] = 8 bytes.
+//
+// LZ4 block format:
+//   token[7:4] = lit_len (0xF = extended via extra byte)
+//   token[3:0] = match_len - 4 (0xF = extended)
+//   [optional extra lit-len bytes] [literal bytes] [2-byte LE offset] ...
+//   Last sequence has no match offset/length field.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+// Drive one byte into the input buffer (strobe ib_en for one cycle).
+function ib_write(dut: Lz4Compressor, addr: uint<4>, data: uint<8>)
+    dut.ib_en   = 1
+    dut.ib_addr = addr
+    dut.ib_data = data
+    wait 1 cycle
+    dut.ib_en   = 0
+end function ib_write
+
+// Read one byte from the output buffer (latency-1 RAM: drive addr, wait, sample).
+function ob_read(dut: Lz4Compressor, addr: uint<5>) -> uint<8>
+    dut.ob_en   = 1
+    dut.ob_addr = addr
+    wait 1 cycle
+    dut.ob_en   = 0
+    return dut.ob_data
+end function ob_read
+
+testbench Lz4Tb
+    dut : Lz4Compressor
+end testbench Lz4Tb
+
+impl Lz4CompressorTest for Lz4Tb
+    clock clk = SysDomain
+
+    run
+        // ── Initial reset ──────────────────────────────────────────────────
+        dut.rst     = 1
+        dut.ib_en   = 0
+        dut.ib_addr = 0
+        dut.ib_data = 0
+        dut.in_len  = 0
+        dut.start   = 0
+        dut.ob_en   = 0
+        dut.ob_addr = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // ═══════════════════════════════════════════════════════════════════
+        // Test 1: No-match — "Hello" (5 unique-quad bytes)
+        //   Expected output: [0x50, 0x48, 0x65, 0x6C, 0x6C, 0x6F]  (6 bytes)
+        //   0x50 = (5 literals) << 4; lower nibble = 0 (end-sequence, no match).
+        // ═══════════════════════════════════════════════════════════════════
+
+        ib_write(dut, 0, 72)   // 'H' = 0x48
+        ib_write(dut, 1, 101)  // 'e' = 0x65
+        ib_write(dut, 2, 108)  // 'l' = 0x6C
+        ib_write(dut, 3, 108)  // 'l' = 0x6C
+        ib_write(dut, 4, 111)  // 'o' = 0x6F
+
+        dut.in_len = 5
+        dut.start  = 1
+        wait 1 cycle
+        dut.start  = 0
+
+        wait until dut.done
+
+        assert dut.out_len == 6
+            else fail("test1 out_len=${dut.out_len}, expected 6")
+        log(info, "PASS test1: out_len correct")
+
+        wait 1 cycle   // allow done to deassert
+
+        // Hoist reads to avoid DUT calls inside fail() messages.
+        let t1b0 = ob_read(dut, 0)
+        assert t1b0 == 80
+            else fail("test1 ob[0]=${t1b0}, expected 80 (0x50 = end-seq 5-lit token)")
+        let t1b1 = ob_read(dut, 1)
+        assert t1b1 == 72
+            else fail("test1 ob[1]=${t1b1}, expected 72 ('H')")
+        let t1b2 = ob_read(dut, 2)
+        assert t1b2 == 101
+            else fail("test1 ob[2]=${t1b2}, expected 101 ('e')")
+        let t1b3 = ob_read(dut, 3)
+        assert t1b3 == 108
+            else fail("test1 ob[3]=${t1b3}, expected 108 ('l')")
+        let t1b4 = ob_read(dut, 4)
+        assert t1b4 == 108
+            else fail("test1 ob[4]=${t1b4}, expected 108 ('l')")
+        let t1b5 = ob_read(dut, 5)
+        assert t1b5 == 111
+            else fail("test1 ob[5]=${t1b5}, expected 111 ('o')")
+
+        log(info, "PASS test1: LZ4 end-sequence for 'Hello' verified")
+
+        // ═══════════════════════════════════════════════════════════════════
+        // Test 2: Match — "ABCDABCD" (8 bytes, 4-byte repeat at position 4)
+        //
+        //   Scan trace (greedy, first match):
+        //     pos=0: quad(A,B,C,D), htab[h]=0, mpos=0 not < 0  → no match; lit_count=1
+        //     pos=1: quad(B,C,D,A), mpos<1, ref(ABCD)≠(BCDA)   → no match; lit_count=2
+        //     pos=2: quad(C,D,A,B), mismatch                    → no match; lit_count=3
+        //     pos=3: quad(D,A,B,C), mismatch                    → no match; lit_count=4
+        //     pos=4: quad(A,B,C,D), htab[h]=0, mpos=0 < 4,
+        //            ref(ABCD)==(ABCD)                          → MATCH! match_at=4
+        //
+        //   Output bytes:
+        //     ob[0] = 0x40  seq-1 token: 4 lits, match_len-4=0
+        //     ob[1] = 0x41  'A'
+        //     ob[2] = 0x42  'B'
+        //     ob[3] = 0x43  'C'
+        //     ob[4] = 0x44  'D'
+        //     ob[5] = 0x04  offset lo (match_at − mpos_save = 4 − 0 = 4)
+        //     ob[6] = 0x00  offset hi
+        //     ob[7] = 0x00  end-seq token: 0 remaining literals
+        // ═══════════════════════════════════════════════════════════════════
+
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        ib_write(dut, 0, 65)   // 'A' = 0x41
+        ib_write(dut, 1, 66)   // 'B' = 0x42
+        ib_write(dut, 2, 67)   // 'C' = 0x43
+        ib_write(dut, 3, 68)   // 'D' = 0x44
+        ib_write(dut, 4, 65)   // 'A'
+        ib_write(dut, 5, 66)   // 'B'
+        ib_write(dut, 6, 67)   // 'C'
+        ib_write(dut, 7, 68)   // 'D'
+
+        dut.in_len = 8
+        dut.start  = 1
+        wait 1 cycle
+        dut.start  = 0
+
+        wait until dut.done
+
+        assert dut.out_len == 8
+            else fail("test2 out_len=${dut.out_len}, expected 8")
+        log(info, "PASS test2: out_len correct")
+
+        wait 1 cycle
+
+        let t2b0 = ob_read(dut, 0)
+        assert t2b0 == 64
+            else fail("test2 ob[0]=${t2b0}, expected 64 (0x40 = seq token: 4 lits)")
+        let t2b1 = ob_read(dut, 1)
+        assert t2b1 == 65
+            else fail("test2 ob[1]=${t2b1}, expected 65 ('A')")
+        let t2b2 = ob_read(dut, 2)
+        assert t2b2 == 66
+            else fail("test2 ob[2]=${t2b2}, expected 66 ('B')")
+        let t2b3 = ob_read(dut, 3)
+        assert t2b3 == 67
+            else fail("test2 ob[3]=${t2b3}, expected 67 ('C')")
+        let t2b4 = ob_read(dut, 4)
+        assert t2b4 == 68
+            else fail("test2 ob[4]=${t2b4}, expected 68 ('D')")
+        let t2b5 = ob_read(dut, 5)
+        assert t2b5 == 4
+            else fail("test2 ob[5]=${t2b5}, expected 4 (offset lo)")
+        let t2b6 = ob_read(dut, 6)
+        assert t2b6 == 0
+            else fail("test2 ob[6]=${t2b6}, expected 0 (offset hi)")
+        let t2b7 = ob_read(dut, 7)
+        assert t2b7 == 0
+            else fail("test2 ob[7]=${t2b7}, expected 0 (end-seq token: 0 lits)")
+
+        log(info, "PASS test2: LZ4 seq+end for 'ABCDABCD' verified")
+        log(info, "ALL TESTS PASSED")
+    end run
+end impl Lz4CompressorTest
