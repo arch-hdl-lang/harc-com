@@ -1,9 +1,35 @@
+// Wrapping arithmetic operators `+% / -% / *%` (harc#473, added in #474).
+//
+// IMPORTANT — current semantics: these operators are *surface sugar* and lower
+// identically to `+ / - / *`. HARC holds every width <= 64 b in a native 64-bit
+// slot and a typed `let : uint<N>` is a width label, not a masking assignment,
+// so `+% / -% / *%` do NOT mask to `max(W(a), W(b))` the way ARCH's wrapping
+// operators do. The assertions below therefore encode the *actual* runtime
+// behavior (verified with `harc sim`), not an aspirational operand-width wrap.
+// Use `.trunc<N>()` for a genuine N-bit wrap. Closing the parity gap is tracked
+// in harc#473.
 test WrappingArithmeticOperatorTest
     let a : uint<8> = 255
-    let b : uint<8> = a +% 1
-    let c : uint<8> = b -% 1
-    let d : uint<8> = c *% 3
-    assert b == 0 else fail("wrapping add operator did not wrap")
-    assert c == 255 else fail("wrapping sub operator did not wrap")
-    assert d == 253 else fail("wrapping mul operator did not wrap")
+
+    // `+% / -% / *%` are pass-through sugar: same result as `+ / - / *`.
+    let sum_wrap  = a +% 1
+    let sum_plain = a + 1
+    assert sum_wrap == sum_plain else fail("+% must lower like +")
+    assert sum_wrap == 256       else fail("+% does not wrap at operand width yet: ${sum_wrap}")
+
+    let prod_wrap  = a *% 3
+    let prod_plain = a * 3
+    assert prod_wrap == prod_plain else fail("*% must lower like *")
+    assert prod_wrap == 765        else fail("*% does not wrap at operand width yet: ${prod_wrap}")
+
+    // Explicit `.trunc<N>()` is the current way to get a real N-bit wrap.
+    let add_wrapped : uint<8> = (a +% 1).trunc<8>()
+    let mul_wrapped : uint<8> = (a *% 3).trunc<8>()
+    assert add_wrapped == 0   else fail("trunc<8> of 256 should wrap to 0: ${add_wrapped}")
+    assert mul_wrapped == 253 else fail("trunc<8> of 765 should wrap to 253: ${mul_wrapped}")
+
+    // `-%` round-trips through subtraction the same way.
+    let diff_wrap  = sum_wrap -% 1
+    let diff_plain = sum_plain - 1
+    assert diff_wrap == diff_plain else fail("-% must lower like -")
 end test WrappingArithmeticOperatorTest

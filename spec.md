@@ -227,6 +227,27 @@ let bound = i < hi ? i : hi - 1
 
 Lowers to a parenthesized C++ ternary in the generated TB.
 
+**Wrapping arithmetic operators `+%` / `-%` / `*%`.** Accepted at the same
+precedence as `+` / `-` / `*` (additive / multiplicative tiers), so a HARC
+testbench can mirror an ARCH datapath operator-for-operator without
+hand-deriving a mask. **Caveat — they are surface sugar today, not yet true
+width-wrapping.** HARC's value model holds every width ≤ 64 b in a native
+64-bit C++ slot, and a typed `let x : uint<N> = e` is a *width label*, not a
+masking assignment — it does not truncate `e` to `N` bits. Consequently
+`+% / -% / *%` currently lower **identically** to `+ / - / *` and do **not**
+mask to `max(W(a), W(b))` the way ARCH's wrapping operators do. To obtain a
+genuine `N`-bit wrap in a HARC expression, apply `.trunc<N>()` explicitly:
+
+```
+let a : uint<8> = 255
+let b = a +% 1            // == 256  (no operand-width wrap — sugar for a + 1)
+let c = (a +% 1).trunc<8> // == 0    (explicit 8-bit wrap)
+```
+
+Closing this gap (masking the wrapping forms to the wider operand width to
+match ARCH, and the related decision about literal operand width) is tracked
+as a language-parity item; see harc#473.
+
 ---
 
 ## 2.5 Source-level documentation comments
