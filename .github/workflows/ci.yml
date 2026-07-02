@@ -217,6 +217,15 @@ jobs:
           HARC_CXX: clang++
         run: ./tests/run_negative_fixtures.sh
 
+      - name: VCD dup-dump smoke test (issue #477)
+        # A clocked TB with an active `phase post_eval` service, run under
+        # VCD tracing, must not emit Verilator `previous dump at t=`
+        # warnings (duplicate same-timestamp dump). Reuses the Verilator
+        # install/cache and harc build above.
+        env:
+          HARC_CXX: clang++
+        run: ./tests/run_vcd_dump_smoke.sh
+
       - name: v1-vs-tbir codegen equivalence harness
         # Every registered fixture (tests/tbir_equiv_fixtures.txt) must
         # produce identical semantic traces under both C++ emitters
