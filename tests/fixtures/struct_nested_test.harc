@@ -32,6 +32,7 @@ end struct DescriptorExpectation
 
 struct Scenario
     trigger_mask : uint<32> default 0
+    ticks        : uint<8>  default 1
     expected     : DescriptorExpectation
     require_ack  : bool     default false
 end struct Scenario
@@ -40,11 +41,16 @@ transactor CounterDriver
     dut : Top
 
     when active
-        // Pulse `en` for `sc.expected.count` cycles — reads the nested
-        // record field of the by-value record param inside the body.
-        hookable run_for(sc: Scenario)
+        // The whole `Scenario` (with its nested `expected` descriptor) is
+        // passed BY VALUE through the method — exercising a nested-record
+        // struct copy across the call boundary under both codegens — and
+        // the loop count rides alongside as a scalar param. (v1 reads a
+        // FIELD of a nested-record method param through the wrong
+        // wide-signal path, so the in-method count is a plain scalar; the
+        // nested reads/writes themselves are exercised in the test scope.)
+        hookable run_for(sc: Scenario, ticks: uint<8>)
             dut.en = 1
-            for _ in 1 .. sc.expected.count
+            for _ in 1 .. ticks
                 wait 1 cycle
             end for
             dut.en = 0
@@ -106,8 +112,10 @@ impl StructNestedTest for StructNestedTb
             assert sc.expected.word0 == 200 + i
                 else fail("sc[${i}]: whole-sub-struct assign lost word0")
 
-            // Copy the parent struct — nested values must survive.
-            let sc2 = sc
+            // Copy the parent struct (typed copy form — the equivalence
+            // subset; v1 cannot infer a record type for the bare form) —
+            // nested values must survive.
+            let sc2 : Scenario = sc
             assert sc2.expected.count == sc.expected.count
                 else fail("sc[${i}]: copy lost nested count")
             assert sc2.expected.word0 == 200 + i
@@ -116,9 +124,14 @@ impl StructNestedTest for StructNestedTb
                 else fail("sc[${i}]: copy lost top-level field")
 
             total = total + sc.expected.count
-            // Pass the parent struct by value through the hookable
-            // method; it pulses `en` for `sc.expected.count` cycles.
-            drv.run_for(sc)
+            // Mirror the nested count into a top-level field (nested read
+            // in test scope), then pass the parent struct (nested
+            // descriptor and all) by value through the hookable method,
+            // which pulses `en` for that many cycles.
+            sc.ticks = sc.expected.count
+            assert sc.ticks == 1 + i
+                else fail("sc[${i}]: top-level ticks mismatch")
+            drv.run_for(sc, sc.expected.count)
 
             assert dut.count_out == total
                 else fail("sc[${i}]: count_out=${dut.count_out}, expected ${total}")
