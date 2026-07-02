@@ -1,0 +1,64 @@
+// Regression fixture for issue #477: a clocked testbench (a declared
+// `clock` selects the `now_ps` multi-clock scheduler) with an active
+// `phase post_eval` transactor service that drives a DUT-visible input.
+// Under VCD tracing this shape previously emitted two waveform dumps at
+// the same physical timestamp — one after the edge eval and one after the
+// post_eval service + follow-up eval — and Verilator ignored the second
+// with `previous dump at t=..., dump call ignored`, silently dropping the
+// settled post_eval state.
+//
+// `tests/run_vcd_dump_smoke.sh` runs this under `--waves --wave-format
+// vcd` and asserts (a) the test passes, (b) a non-empty VCD is produced,
+// and (c) no `previous dump at t=` warning is emitted.
+//
+// Uses the vendored `Top` counter DUT (top_counter.sv) so it needs no new
+// RTL. Combining a declared `clock` with an `active` transactor carrying
+// `on ... phase post_eval` is exactly the pair that populates
+// `_post_eval_services` on the clocked (`now_ps`) scheduler path.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+// An active transactor whose post_eval service drives a DUT-visible input
+// (`en`) every primary rising edge. This exercises the post-eval re-eval
+// + waveform-dump path that issue #477 covers: the service mutates DUT
+// state after the edge eval, so the runtime re-evaluates and must dump
+// the *settled* value exactly once per physical timestamp.
+transactor EnableDriver
+    dut : Top
+
+    when active
+        on 1 cycles phase post_eval
+            dut.en = 1
+        end on
+    end when
+end transactor EnableDriver
+
+testbench PostEvalVcdSmokeTb
+    dut    : Top
+    driver : EnableDriver active
+end testbench PostEvalVcdSmokeTb
+
+impl PostEvalVcdSmokeTest for PostEvalVcdSmokeTb
+    clock clk = SysDomain        // 100 MHz
+
+    run
+        driver.dut = dut
+
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        dut.rst = 0
+
+        // With `en` driven high by the post_eval service, the counter
+        // advances over the next several cycles.
+        for _ in 0 .. 7
+            wait 1 cycle
+        end for
+
+        assert dut.count_out != 0
+            else fail("post_eval-driven enable never advanced the counter")
+        log(info, "PASS: post_eval service drove DUT-visible state, count=${dut.count_out}")
+    end run
+end impl PostEvalVcdSmokeTest

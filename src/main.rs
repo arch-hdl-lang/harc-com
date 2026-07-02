@@ -1610,7 +1610,13 @@ fn run_verilator(
     // trace defines and would silently link against the new .cpp.
     if waves.waves {
         let trace_flag = match waves.format.as_str() {
-            "vcd" => "--trace-vcd",
+            // `--trace` (not `--trace-vcd`) is the portable spelling for
+            // VCD: it enables VCD tracing in every Verilator release,
+            // whereas `--trace-vcd` only exists in >= 5.036 and errors out
+            // on the pinned CI Verilator (5.034). Both map to the same
+            // `VerilatedVcdC` backend the emitted TB uses under
+            // `HARC_TRACE_VCD`.
+            "vcd" => "--trace",
             // Default plus the explicit `fst` selector.
             _ => "--trace-fst",
         };
