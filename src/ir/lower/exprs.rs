@@ -7,7 +7,23 @@ use super::{unsupported, FuncBuilder, LowerError};
 use crate::ast::{
     BinaryOp, BuiltinTy, CallArg, Expr as AstExpr, ExprKind, TypeArg, TypeExpr, UnaryOp,
 };
-use crate::ir::{BinOp, Expr, IrType, PortAccess, PortRef, Stmt, UnOp, WidthCastKind};
+use crate::ir::{BinOp, Expr, IrType, LocalId, PortAccess, PortRef, RecordId, Stmt, UnOp, WidthCastKind};
+
+/// Resolution of a (possibly nested) record field-access chain
+/// `ident.f1.f2...fn` rooted at a record-typed local. `field` is the
+/// first-level field (`f1`) on the local's record; `path` is the further
+/// nested field names (`f2..fn`); the leaf is the last of `[field] ++ path`.
+pub(crate) struct RecordFieldChain {
+    pub local: LocalId,
+    pub field: String,
+    pub path: Vec<String>,
+    /// `Some(N)` when the leaf is a `Vec<T, N>` field.
+    pub leaf_vec_len: Option<usize>,
+    /// The leaf field's element/scalar/record type.
+    pub leaf_ty: IrType,
+    /// Dotted `Rec.f1.f2` spelling for diagnostics.
+    pub dotted: String,
+}
 
 impl FuncBuilder<'_> {
     /// Lower with `Expr::Port` allowed in the result.
@@ -191,45 +207,33 @@ impl FuncBuilder<'_> {
                         }
                     }
                 }
-                // `t.field` read on a record-typed local.
-                if let ExprKind::Ident(root) = &*target.kind {
-                    if let Some(local) = self.lookup(&root.name) {
-                        if let Some(rid) = self.record_of_local(local) {
-                            let schema = &self.ctx.records[rid.index()];
-                            let Some(fld) = schema.field(&name.name) else {
-                                return Err(LowerError::Invalid(format!(
-                                    "transaction `{}` has no field `{}`",
-                                    schema.name, name.name
-                                )));
-                            };
-                            // A whole-`Vec` field read has no scalar value:
-                            // in any scalar/format/assert context the tbir
-                            // backend would emit the raw `std::array` member
-                            // into a position that expects an integer, which
-                            // miscompiles as a raw clang error rather than a
-                            // structured HARC diagnostic. Reject it here. The
-                            // ONLY sanctioned whole-`Vec` field use is a
-                            // `dst.field = src.field` array copy, which the
-                            // write arm (`stmts.rs`) special-cases without
-                            // routing the RHS through this read path. Element
-                            // access (`rec.data[i]`) is handled in the
-                            // `Index` arm.
-                            if fld.vec_len.is_some() {
-                                return Err(unsupported(
-                                    &format!(
-                                        "a whole-`Vec` read of record field `{}.{}`",
-                                        schema.name, name.name
-                                    ),
-                                    "index the field element-wise (`{rec}.{field}[i]`)",
-                                ));
-                            }
-                            return Ok(Expr::RecordField {
-                                local,
-                                field: name.name.clone(),
-                                index: None,
-                            });
-                        }
+                // `t.field` read on a record-typed local (and nested
+                // `t.a.b`). Resolve the field chain to its leaf schema.
+                if let Some(chain) = self.try_record_field_chain(e)? {
+                    // A whole-`Vec` leaf read has no scalar value: in any
+                    // scalar/format/assert context the tbir backend would
+                    // emit the raw `std::array` member into a position that
+                    // expects an integer, which miscompiles as a raw clang
+                    // error rather than a structured HARC diagnostic. Reject
+                    // it here. The ONLY sanctioned whole-`Vec` field use is a
+                    // `dst.field = src.field` array copy, which the write arm
+                    // (`stmts.rs`) special-cases without routing the RHS
+                    // through this read path. Element access (`rec.data[i]`)
+                    // is handled in the `Index` arm. A whole nested-record
+                    // leaf read (`let d = s.inner`) IS allowed — it yields
+                    // the nested struct value (emitted as `local.field.p…`).
+                    if chain.leaf_vec_len.is_some() {
+                        return Err(unsupported(
+                            &format!("a whole-`Vec` read of record field `{}`", chain.dotted),
+                            "index the field element-wise (`{rec}.{field}[i]`)",
+                        ));
                     }
+                    return Ok(Expr::RecordField {
+                        local: chain.local,
+                        field: chain.field,
+                        path: chain.path,
+                        index: None,
+                    });
                 }
                 // Bus-bound signal access (`<bind>.<sig>`, `<bind>.<ch>.<sig>`).
                 if let Some(port) = self.as_bus_port_ref(e)? {
@@ -505,49 +509,149 @@ impl FuncBuilder<'_> {
         }
     }
 
-    /// `rec.data[i]` — element read of a `Vec<T, N>` record field.
-    /// Returns `Some(Expr::RecordField { index })` when `target` is a
-    /// field access (`rec.data`) on a record-typed local whose field is
-    /// a `Vec`; `None` if `target` is not such an access (the caller
-    /// then tries the DUT-lane and rejection paths). A scalar field
-    /// indexed like an array is a hard error (a scalar has no elements).
+    /// Resolve an AST field-access chain `ident.f1.f2...fn` rooted at a
+    /// record-typed local into a [`RecordFieldChain`], descending through
+    /// nested `IrType::Record` fields to reach the leaf. Returns:
+    ///   - `Ok(None)` when `e` is not a field access rooted at an `Ident`
+    ///     bound to a record local (the caller falls through to the other
+    ///     lanes: DUT signal, scoreboard, recv payload, …);
+    ///   - `Err` when it IS such a chain but a component names no field, or
+    ///     a non-leaf component is not a nested record (so it cannot be
+    ///     descended into).
+    pub(crate) fn try_record_field_chain(
+        &self,
+        e: &AstExpr,
+    ) -> Result<Option<RecordFieldChain>, LowerError> {
+        // Flatten `a.b.c` → root `a`, segments `[b, c]` (outer-to-inner
+        // during the walk, reversed to declaration order after).
+        let mut segs: Vec<String> = Vec::new();
+        let mut cur = e;
+        let root = loop {
+            match &*cur.kind {
+                ExprKind::Field { target, name } => {
+                    segs.push(name.name.clone());
+                    cur = target;
+                }
+                ExprKind::Ident(root) => break root,
+                // Innermost target is not a bare ident (`f().x`, `a[i].x`,
+                // …): not a record-local chain this lane handles.
+                _ => return Ok(None),
+            }
+        };
+        if segs.is_empty() {
+            return Ok(None); // bare ident, no field access
+        }
+        segs.reverse();
+        let Some(local) = self.lookup(&root.name) else {
+            return Ok(None);
+        };
+        let Some(mut cur_rid) = self.record_of_local(local) else {
+            return Ok(None);
+        };
+        let mut dotted = self.ctx.records[cur_rid.index()].name.clone();
+        let last = segs.len() - 1;
+        let mut leaf_vec_len = None;
+        let mut leaf_ty = IrType::Bool; // overwritten at the leaf
+        for (i, seg) in segs.iter().enumerate() {
+            let schema = &self.ctx.records[cur_rid.index()];
+            let Some(fld) = schema.field(seg) else {
+                return Err(LowerError::Invalid(format!(
+                    "record `{}` has no field `{seg}`",
+                    schema.name
+                )));
+            };
+            dotted.push('.');
+            dotted.push_str(seg);
+            if i == last {
+                leaf_vec_len = fld.vec_len;
+                leaf_ty = fld.ty.clone();
+                break;
+            }
+            // A non-leaf component must be a nested record to descend into.
+            match fld.ty {
+                IrType::Record(next) if fld.vec_len.is_none() => cur_rid = next,
+                _ => {
+                    return Err(unsupported(
+                        &format!(
+                            "field `{}.{seg}` is not a nested record; cannot access `.{}`",
+                            schema.name,
+                            segs[i + 1]
+                        ),
+                        "only nested struct/transaction fields can be traversed further",
+                    ));
+                }
+            }
+        }
+        let field = segs[0].clone();
+        let path = segs[1..].to_vec();
+        Ok(Some(RecordFieldChain {
+            local,
+            field,
+            path,
+            leaf_vec_len,
+            leaf_ty,
+            dotted,
+        }))
+    }
+
+    /// `Some(rid)` when `e` is a *whole* record value (a record-typed local
+    /// or a whole nested-record field read, `index: None`). Used to validate
+    /// a whole-record field assignment (`o.a = d`).
+    pub(crate) fn record_id_of_expr(&self, e: &Expr) -> Option<RecordId> {
+        match e {
+            Expr::Local(l) => self.record_of_local(*l),
+            Expr::RecordField {
+                local,
+                field,
+                path,
+                index: None,
+            } => {
+                let mut cur = self.record_of_local(*local)?;
+                let segs: Vec<&String> = std::iter::once(field).chain(path.iter()).collect();
+                let last = segs.len() - 1;
+                for (i, seg) in segs.iter().enumerate() {
+                    let fld = self.ctx.records.get(cur.index())?.field(seg)?;
+                    match fld.ty {
+                        IrType::Record(r) if fld.vec_len.is_none() => {
+                            if i == last {
+                                return Some(r);
+                            }
+                            cur = r;
+                        }
+                        _ => return None,
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// `rec.data[i]` — element read of a `Vec<T, N>` record field, at any
+    /// nesting depth (`s.a.b[i]`). Returns `Some(Expr::RecordField { index })`
+    /// when `target` is a field-access chain on a record-typed local whose
+    /// leaf is a `Vec`; `None` if `target` is not such a chain (the caller
+    /// then tries the DUT-lane and rejection paths). A scalar leaf indexed
+    /// like an array is a hard error (a scalar has no elements).
     pub(crate) fn lower_record_vec_index(
         &mut self,
         target: &AstExpr,
         index: &AstExpr,
     ) -> Result<Option<Expr>, LowerError> {
-        let ExprKind::Field { target: ft, name } = &*target.kind else {
+        let Some(chain) = self.try_record_field_chain(target)? else {
             return Ok(None);
         };
-        let ExprKind::Ident(root) = &*ft.kind else {
-            return Ok(None);
-        };
-        let Some(local) = self.lookup(&root.name) else {
-            return Ok(None);
-        };
-        let Some(rid) = self.record_of_local(local) else {
-            return Ok(None);
-        };
-        let schema = &self.ctx.records[rid.index()];
-        let Some(fld) = schema.field(&name.name) else {
-            return Err(LowerError::Invalid(format!(
-                "transaction `{}` has no field `{}`",
-                schema.name, name.name
-            )));
-        };
-        if fld.vec_len.is_none() {
+        if chain.leaf_vec_len.is_none() {
             return Err(unsupported(
-                &format!(
-                    "indexing the scalar record field `{}.{}`",
-                    schema.name, name.name
-                ),
+                &format!("indexing the scalar record field `{}`", chain.dotted),
                 "only `Vec<T, N>` record fields are indexable",
             ));
         }
         let idx = self.lower_expr(index)?;
         Ok(Some(Expr::RecordField {
-            local,
-            field: name.name.clone(),
+            local: chain.local,
+            field: chain.field,
+            path: chain.path,
             index: Some(Box::new(idx)),
         }))
     }
@@ -667,9 +771,9 @@ impl FuncBuilder<'_> {
             // An indexed `Vec`-field read carries the index sub-expr,
             // which may hold a DUT port; hoist into it. A scalar
             // RecordField (index `None`) is the no-op host-state value.
-            Expr::RecordField { local, field, index: Some(index) } => {
+            Expr::RecordField { local, field, path, index: Some(index) } => {
                 let index = self.hoist_ports_with_hint(*index, None);
-                Expr::RecordField { local, field, index: Some(Box::new(index)) }
+                Expr::RecordField { local, field, path, index: Some(Box::new(index)) }
             }
             Expr::CovHookParam { param, field, index: Some(index) } => {
                 let index = self.hoist_ports_with_hint(*index, None);

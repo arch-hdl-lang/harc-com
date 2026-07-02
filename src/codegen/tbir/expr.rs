@@ -152,6 +152,7 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         Expr::RecordField {
             local,
             field,
+            path,
             index,
         } => {
             let name = cx.names.get(local.index()).cloned().ok_or_else(|| {
@@ -160,13 +161,17 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                     local.0, cx.func.name
                 ))
             })?;
+            // Nested field access descends through real C++ struct members
+            // (`name.a.b`), so a whole-record leaf read / copy / `==` all
+            // recurse natively.
+            let nested = path.iter().map(|p| format!(".{p}")).collect::<String>();
             match index {
-                // `rec.data[i]` — `std::array` element access.
+                // `rec.data[i]` (or `rec.a.b[i]`) — `std::array` element access.
                 Some(idx) => {
                     let i = expr_cpp(cx, idx)?;
-                    format!("{name}.{field}[{i}]")
+                    format!("{name}.{field}{nested}[{i}]")
                 }
-                None => format!("{name}.{field}"),
+                None => format!("{name}.{field}{nested}"),
             }
         }
         // Register-level frontdoor read in a general expression position

@@ -547,11 +547,12 @@ impl Checker<'_> {
                 Stmt::RecordFieldWrite {
                     local,
                     field,
+                    path,
                     index,
                     value,
                 } => {
                     self.check_local(*local);
-                    self.check_record_field(*local, field);
+                    self.check_record_field(*local, field, path);
                     if let Some(idx) = index {
                         self.check_expr(idx, false, "RecordFieldWrite index");
                     }
@@ -564,7 +565,7 @@ impl Checker<'_> {
                     ..
                 } => {
                     self.check_local(*local);
-                    self.check_record_field(*local, field);
+                    self.check_record_field(*local, field, &[]);
                     self.check_expr(value, false, "RecordWriteCb value");
                 }
                 Stmt::TbFieldWrite { field, value } => {
@@ -830,22 +831,44 @@ impl Checker<'_> {
     }
 
     /// `local` must be record-typed and its schema must declare `field`.
-    fn check_record_field(&mut self, local: LocalId, field: &str) {
-        let ok = self
-            .func
-            .locals
-            .get(local.index())
-            .and_then(|tl| match tl.ty {
-                IrType::Record(r) => self.prog.records.get(r.index()),
-                _ => None,
-            })
-            .is_some_and(|schema| schema.field(field).is_some());
-        if !ok {
+    fn check_record_field(&mut self, local: LocalId, field: &str, path: &[String]) {
+        // Resolve `field` then each `path` component against the nested
+        // record schemas: a non-leaf component must be a nested record to
+        // descend into; the leaf may be any field. Fails on an unknown
+        // field or a non-record intermediate.
+        let ok = (|| -> Option<()> {
+            let tl = self.func.locals.get(local.index())?;
+            let mut rid = match tl.ty {
+                IrType::Record(r) => r,
+                _ => return None,
+            };
+            let segs: Vec<&str> = std::iter::once(field)
+                .chain(path.iter().map(String::as_str))
+                .collect();
+            let last = segs.len() - 1;
+            for (i, seg) in segs.iter().enumerate() {
+                let fld = self.prog.records.get(rid.index())?.field(seg)?;
+                if i == last {
+                    return Some(());
+                }
+                match fld.ty {
+                    IrType::Record(r) if fld.vec_len.is_none() => rid = r,
+                    _ => return None,
+                }
+            }
+            Some(())
+        })();
+        if ok.is_none() {
+            let mut dotted = field.to_string();
+            for p in path {
+                dotted.push('.');
+                dotted.push_str(p);
+            }
             self.errs.push(VerifyError::BadRecordField {
                 func: self.fid,
                 block: self.bid,
                 local,
-                field: field.to_string(),
+                field: dotted,
             });
         }
     }
@@ -955,10 +978,11 @@ impl Checker<'_> {
             Expr::RecordField {
                 local,
                 field,
+                path,
                 index,
             } => {
                 self.check_local(*local);
-                self.check_record_field(*local, field);
+                self.check_record_field(*local, field, path);
                 if let Some(idx) = index {
                     self.check_expr(idx, ports_ok, context);
                 }
@@ -970,7 +994,7 @@ impl Checker<'_> {
             // nothing in the seam rule forbids it here.
             Expr::RegRead { mirror, field, .. } => {
                 self.check_local(*mirror);
-                self.check_record_field(*mirror, field);
+                self.check_record_field(*mirror, field, &[]);
             }
             Expr::CovBin { inst, .. } => self.check_covgroup(inst.covgroup),
             // A hook-param cover target carries the parameter NAME (no

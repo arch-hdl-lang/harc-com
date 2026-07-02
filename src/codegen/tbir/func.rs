@@ -813,19 +813,22 @@ fn emit_stmt(
         Stmt::RecordFieldWrite {
             local,
             field,
+            path,
             index,
             value,
         } => {
             let name = &names[local.index()];
             let e = expr_cpp(cx, value)?;
+            let nested = path.iter().map(|p| format!(".{p}")).collect::<String>();
             match index {
-                // `rec.data[i] = value` — `std::array` element store.
+                // `rec.data[i] = value` (or `rec.a.b[i] = value`) —
+                // `std::array` element store.
                 Some(idx) => {
                     let i = expr_cpp(cx, idx)?;
-                    writeln!(out, "{pad}{name}.{field}[{i}] = {e};").ok();
+                    writeln!(out, "{pad}{name}.{field}{nested}[{i}] = {e};").ok();
                 }
                 None => {
-                    writeln!(out, "{pad}{name}.{field} = {e};").ok();
+                    writeln!(out, "{pad}{name}.{field}{nested} = {e};").ok();
                 }
             }
         }

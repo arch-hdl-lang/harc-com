@@ -100,8 +100,11 @@ pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<Stri
     // every construct that could reach them (`randomize`, bus sends)
     // is rejected at lowering, so they would be dead text here. They
     // land with their constructs.
-    for r in &prog.records {
-        record_struct(&mut out, r);
+    // Emit in TOPOLOGICAL order (a record after every record it nests) so
+    // an inner struct's definition and `harc_pack_*` precede any outer
+    // struct that holds it by value — C++ needs the complete inner type.
+    for i in record_emit_order(&prog.records) {
+        record_struct(&mut out, &prog.records[i], &prog.records);
     }
 
     // RAL per-register write-callback recursion-depth limit — emitted once
@@ -667,34 +670,50 @@ pub(super) fn local_scalar_cty(ty: &ir::IrType) -> String {
     }
 }
 
-/// Packed-bit width of a record field's scalar (or Vec element) type —
-/// the declared width (`Bool` → 1). Mirrors v1's `packed_width` for the
-/// scalar leaves the record subset lowers. `None` for a widthless
-/// scalar (no defined layout); lowering already rejects those for Vec
-/// fields, and scalar fields never reach the pack helpers when any sum
-/// is undefined.
-fn field_packed_width(ty: &ir::IrType) -> Option<usize> {
+/// Packed-bit width of a record field's element type — the declared
+/// width (`Bool` → 1). Mirrors v1's `packed_width` for the scalar leaves
+/// the record subset lowers; a nested-record element recurses into the
+/// inner record's total width (v1 parity). `None` for a widthless scalar
+/// (no defined layout); lowering already rejects those for Vec fields,
+/// and scalar fields never reach the pack helpers when any sum is
+/// undefined. For a `Vec<T, N>` field this is the per-element width `T`;
+/// the caller multiplies by `N`.
+fn field_packed_width(ty: &ir::IrType, records: &[ir::RecordSchema]) -> Option<usize> {
     match ty {
         ir::IrType::Bool => Some(1),
         ir::IrType::UInt(w) | ir::IrType::SInt(w) => w.map(|w| w as usize),
+        ir::IrType::Record(rid) => {
+            record_packed_width(records.get(rid.index())?, records)
+        }
         _ => None,
     }
 }
 
 /// Total packed-bit width of a record (sum of every field's packed
-/// width; a `Vec<T, N>` field contributes `N * width(T)`). `None` when
-/// any field has no defined packed width — the pack helpers are then
-/// skipped, exactly as v1's `try_fold` over `packed_width` does.
-fn record_packed_width(r: &ir::RecordSchema) -> Option<usize> {
+/// width; a `Vec<T, N>` field contributes `N * width(T)`, a nested-record
+/// field its own total). `None` when any field has no defined packed
+/// width — the pack helpers are then skipped, exactly as v1's `try_fold`
+/// over `packed_width` does. Recursion terminates: lowering rejects
+/// record cycles (`check_no_record_cycles`).
+fn record_packed_width(r: &ir::RecordSchema, records: &[ir::RecordSchema]) -> Option<usize> {
     r.fields.iter().try_fold(0usize, |acc, f| {
-        let w = field_packed_width(&f.ty)?;
+        let w = field_packed_width(&f.ty, records)?;
         Some(acc + w * f.vec_len.unwrap_or(1))
     })
 }
 
-fn record_struct(out: &mut String, r: &ir::RecordSchema) {
+fn record_struct(out: &mut String, r: &ir::RecordSchema, records: &[ir::RecordSchema]) {
     writeln!(out, "struct {} {{", r.name).ok();
     for f in &r.fields {
+        // A nested-record field is a real C++ struct member (v1 parity):
+        // `<Inner> field{};` value-initializes it, so it picks up the inner
+        // struct's own member-initializer defaults. Copy / `==` / pack all
+        // recurse through the inner struct's own operators/helpers.
+        if let ir::IrType::Record(rid) = f.ty {
+            let inner = &records[rid.index()];
+            writeln!(out, "{INDENT}{} {}{{}};", inner.name, f.name).ok();
+            continue;
+        }
         let cty = field_scalar_cty(&f.ty);
         if let Some(n) = f.vec_len {
             // `Vec<T, N>` field → `std::array<T, N>` member, zero-filled
@@ -742,7 +761,118 @@ fn record_struct(out: &mut String, r: &ir::RecordSchema) {
     )
     .ok();
     writeln!(out).ok();
-    record_pack_helpers(out, r);
+    record_pack_helpers(out, r, records);
+}
+
+/// Packed-bit slot width of a whole field (per-element width times a
+/// `Vec` count, or a nested record's total). Used to advance the offset
+/// between top-level fields and between nested-record sub-fields.
+fn field_slot_width(f: &ir::RecordFieldSchema, records: &[ir::RecordSchema]) -> usize {
+    field_packed_width(&f.ty, records).unwrap_or(0) * f.vec_len.unwrap_or(1)
+}
+
+/// Emit `harc_wide_write_bits` calls that pack one field VALUE at bit
+/// `offset`, recursing through `Vec` elements and nested records so the
+/// bit layout is byte-identical to v1's `emit_pack_bits`: a nested record
+/// contributes its own fields (reverse declaration order) as a contiguous
+/// sub-blob at `offset`.
+fn emit_pack_field(
+    out: &mut String,
+    records: &[ir::RecordSchema],
+    ty: &ir::IrType,
+    vec_len: Option<usize>,
+    value_expr: &str,
+    offset: usize,
+) {
+    if let Some(n) = vec_len {
+        let elem_w = field_packed_width(ty, records).unwrap_or(0);
+        for i in 0..n {
+            emit_pack_field(
+                out,
+                records,
+                ty,
+                None,
+                &format!("{value_expr}[{i}]"),
+                offset + i * elem_w,
+            );
+        }
+        return;
+    }
+    if let ir::IrType::Record(rid) = ty {
+        let inner = &records[rid.index()];
+        let mut off = offset;
+        for f in inner.fields.iter().rev() {
+            emit_pack_field(
+                out,
+                records,
+                &f.ty,
+                f.vec_len,
+                &format!("{value_expr}.{}", f.name),
+                off,
+            );
+            off += field_slot_width(f, records);
+        }
+        return;
+    }
+    let w = field_packed_width(ty, records).unwrap_or(0);
+    writeln!(
+        out,
+        "{INDENT}harc_rt::harc_wide_write_bits(_packed, {offset}, {w}, {value_expr});"
+    )
+    .ok();
+}
+
+/// Emit assignments that unpack one field TARGET from bit `offset`,
+/// mirroring `emit_pack_field`'s layout (reverse-order nested-record
+/// sub-fields, `Vec` elements). Only reached in the bit-layout fallback
+/// of the (template) `harc_unpack_*`; concrete correctness for a real
+/// wire, and byte-identity with v1, follow from the shared offset walk.
+fn emit_unpack_field(
+    out: &mut String,
+    records: &[ir::RecordSchema],
+    ty: &ir::IrType,
+    vec_len: Option<usize>,
+    target_expr: &str,
+    offset: usize,
+) {
+    if let Some(n) = vec_len {
+        let elem_w = field_packed_width(ty, records).unwrap_or(0);
+        for i in 0..n {
+            emit_unpack_field(
+                out,
+                records,
+                ty,
+                None,
+                &format!("{target_expr}[{i}]"),
+                offset + i * elem_w,
+            );
+        }
+        return;
+    }
+    if let ir::IrType::Record(rid) = ty {
+        let inner = &records[rid.index()];
+        let mut off = offset;
+        for f in inner.fields.iter().rev() {
+            emit_unpack_field(
+                out,
+                records,
+                &f.ty,
+                f.vec_len,
+                &format!("{target_expr}.{}", f.name),
+                off,
+            );
+            off += field_slot_width(f, records);
+        }
+        return;
+    }
+    let w = field_packed_width(ty, records).unwrap_or(0);
+    let cty = field_scalar_cty(ty);
+    writeln!(
+        out,
+        "{INDENT}{target_expr} = ({cty})harc_rt::harc_bits(_packed, {hi}, {offset});",
+        hi = offset + w - 1
+    )
+    .ok();
 }
 
 /// Emit `harc_pack_<R>` / `harc_unpack_<R>` / `harc_drive_<R>` for a
@@ -755,14 +885,16 @@ fn record_struct(out: &mut String, r: &ir::RecordSchema) {
 /// a struct (Verilator packed struct), falling back to the bit layout
 /// for a flat wide wire. Skipped when the record has no defined packed
 /// width (a widthless scalar field) — exactly v1's `try_fold` guard.
-fn record_pack_helpers(out: &mut String, r: &ir::RecordSchema) {
-    let Some(width) = record_packed_width(r) else {
+fn record_pack_helpers(out: &mut String, r: &ir::RecordSchema, records: &[ir::RecordSchema]) {
+    let Some(width) = record_packed_width(r, records) else {
         return;
     };
     let name = &r.name;
     let words = width.div_ceil(32).max(1);
 
-    // harc_pack: LSB-first, reverse declaration order.
+    // harc_pack: LSB-first, reverse declaration order. A nested-record
+    // field packs its own sub-fields as a contiguous sub-blob (recursion in
+    // `emit_pack_field`), bit-identical to v1's `emit_pack_bits`.
     writeln!(
         out,
         "static harc_rt::HarcWide<{words}> harc_pack_{name}(const {name}& value) {{"
@@ -771,27 +903,15 @@ fn record_pack_helpers(out: &mut String, r: &ir::RecordSchema) {
     writeln!(out, "{INDENT}harc_rt::HarcWide<{words}> _packed{{}};").ok();
     let mut offset = 0usize;
     for f in r.fields.iter().rev() {
-        let w = field_packed_width(&f.ty).unwrap_or(0);
-        if let Some(n) = f.vec_len {
-            for i in 0..n {
-                writeln!(
-                    out,
-                    "{INDENT}harc_rt::harc_wide_write_bits(_packed, {off}, {w}, value.{fld}[{i}]);",
-                    off = offset + i * w,
-                    fld = f.name
-                )
-                .ok();
-            }
-            offset += w * n;
-        } else {
-            writeln!(
-                out,
-                "{INDENT}harc_rt::harc_wide_write_bits(_packed, {offset}, {w}, value.{fld});",
-                fld = f.name
-            )
-            .ok();
-            offset += w;
-        }
+        emit_pack_field(
+            out,
+            records,
+            &f.ty,
+            f.vec_len,
+            &format!("value.{}", f.name),
+            offset,
+        );
+        offset += field_slot_width(f, records);
     }
     writeln!(out, "{INDENT}return _packed;").ok();
     writeln!(out, "}}").ok();
@@ -831,30 +951,15 @@ fn record_pack_helpers(out: &mut String, r: &ir::RecordSchema) {
     writeln!(out, "{INDENT}{name} value{{}};").ok();
     let mut offset = 0usize;
     for f in r.fields.iter().rev() {
-        let w = field_packed_width(&f.ty).unwrap_or(0);
-        let cty = field_scalar_cty(&f.ty);
-        if let Some(n) = f.vec_len {
-            for i in 0..n {
-                let off = offset + i * w;
-                writeln!(
-                    out,
-                    "{INDENT}value.{fld}[{i}] = ({cty})harc_rt::harc_bits(_packed, {hi}, {off});",
-                    fld = f.name,
-                    hi = off + w - 1
-                )
-                .ok();
-            }
-            offset += w * n;
-        } else {
-            writeln!(
-                out,
-                "{INDENT}value.{fld} = ({cty})harc_rt::harc_bits(_packed, {hi}, {offset});",
-                fld = f.name,
-                hi = offset + w - 1
-            )
-            .ok();
-            offset += w;
-        }
+        emit_unpack_field(
+            out,
+            records,
+            &f.ty,
+            f.vec_len,
+            &format!("value.{}", f.name),
+            offset,
+        );
+        offset += field_slot_width(f, records);
     }
     writeln!(out, "{INDENT}return value;").ok();
     if !raw_checks.is_empty() {
@@ -913,6 +1018,35 @@ fn record_pack_helpers(out: &mut String, r: &ir::RecordSchema) {
 /// id order for determinism (mirrors v1's `topo_sort_component_indices`).
 /// The IR rejects sub-component cycles at lowering (a by-value cycle is
 /// not constructible), so the visited-set DFS terminates.
+/// Dependency order for record-struct emission: a record appears after
+/// every record it NESTS as a by-value field, so the inner struct's
+/// definition (and its `harc_pack_*`) precede the outer one — C++ requires
+/// a complete inner type before it can be a member. DFS post-order over
+/// `IrType::Record` field edges, in `RecordId` (declaration) order for
+/// determinism. Lowering rejects record cycles (`check_no_record_cycles`),
+/// so the visited-set DFS terminates.
+fn record_emit_order(records: &[ir::RecordSchema]) -> Vec<usize> {
+    let n = records.len();
+    let mut order = Vec::with_capacity(n);
+    let mut visited = vec![false; n];
+    fn visit(i: usize, records: &[ir::RecordSchema], visited: &mut [bool], order: &mut Vec<usize>) {
+        if visited[i] {
+            return;
+        }
+        visited[i] = true;
+        for f in &records[i].fields {
+            if let ir::IrType::Record(rid) = f.ty {
+                visit(rid.index(), records, visited, order);
+            }
+        }
+        order.push(i);
+    }
+    for i in 0..n {
+        visit(i, records, &mut visited, &mut order);
+    }
+    order
+}
+
 fn component_emit_order(prog: &TbProgram) -> Vec<usize> {
     let n = prog.components.len();
     let mut order = Vec::with_capacity(n);

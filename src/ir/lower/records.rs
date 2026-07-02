@@ -10,21 +10,28 @@
 //! nothing downstream may interpret these strings (see the
 //! `RecordSchema` doc in `src/ir/mod.rs`).
 //!
-//! Out-of-scope shapes are explicit `Unsupported` rejections, never
-//! silent drops: `when` subtype blocks, non-scalar field types
-//! (nested records, lists, vecs), widths above 64 bits, and
-//! non-literal field defaults. Enum-typed fields lower as scalar
-//! variant indices (v1's `int64_t` member shape).
+//! A field whose type names another transaction/struct lowers to a
+//! native nested record (`IrType::Record(rid)`, v1 parity) — copy,
+//! equality, and TLM packing recurse through the inner struct. Out-of-
+//! scope shapes are explicit `Unsupported` rejections, never silent
+//! drops: `when` subtype blocks, `Vec` of a non-scalar element,
+//! widthless-scalar leaves, string/object/dynamic leaves, widths above
+//! 64 bits, and non-literal field defaults. Recursive / mutually-
+//! recursive nested records are rejected (`check_no_record_cycles`).
+//! Enum-typed fields lower as scalar variant indices (v1's `int64_t`
+//! member shape).
 
 use super::{unsupported, LowerError};
 use crate::ast::{
     BuiltinTy, ExprKind, Field, StructDecl, TransactionDecl, TxnBodyItem, TypeArg, TypeExpr,
 };
-use crate::ir::{IrType, RecordFieldSchema, RecordSchema};
+use crate::ir::{IrType, RecordFieldSchema, RecordId, RecordSchema};
+use std::collections::HashMap;
 
 pub(crate) fn lower_transaction(
     t: &TransactionDecl,
     enum_names: &std::collections::HashSet<String>,
+    record_ids: &HashMap<String, RecordId>,
 ) -> Result<RecordSchema, LowerError> {
     let txn = &t.name.name;
     if !t.params.is_empty() {
@@ -38,7 +45,7 @@ pub(crate) fn lower_transaction(
     for item in &t.body {
         match item {
             TxnBodyItem::Field(f) => {
-                lower_record_field("transaction", txn, f, enum_names, &mut fields)?;
+                lower_record_field("transaction", txn, f, enum_names, record_ids, &mut fields)?;
             }
             TxnBodyItem::Keep(k) => {
                 keeps.push(crate::codegen::cpp_tb::expr_source_str(&k.expr));
@@ -75,6 +82,7 @@ pub(crate) fn lower_transaction(
 pub(crate) fn lower_struct(
     s: &StructDecl,
     enum_names: &std::collections::HashSet<String>,
+    record_ids: &HashMap<String, RecordId>,
 ) -> Result<RecordSchema, LowerError> {
     let sname = &s.name.name;
     let mut fields: Vec<RecordFieldSchema> = Vec::new();
@@ -85,7 +93,7 @@ pub(crate) fn lower_struct(
     // scanned solely to reject the non-field items a struct must not
     // carry in this subset.
     for f in &s.fields {
-        lower_record_field("struct", sname, f, enum_names, &mut fields)?;
+        lower_record_field("struct", sname, f, enum_names, record_ids, &mut fields)?;
     }
     for item in &s.body {
         match item {
@@ -121,6 +129,7 @@ fn lower_record_field(
     owner: &str,
     f: &Field,
     enum_names: &std::collections::HashSet<String>,
+    record_ids: &HashMap<String, RecordId>,
     fields: &mut Vec<RecordFieldSchema>,
 ) -> Result<(), LowerError> {
     let fname = &f.name.name;
@@ -128,6 +137,38 @@ fn lower_record_field(
         return Err(LowerError::Invalid(format!(
             "{kind} `{owner}` declares field `{fname}` more than once"
         )));
+    }
+    // A nested-record field: the field's type names another transaction or
+    // struct. Lower it to `IrType::Record(rid)` with `vec_len = None` — a
+    // real C++ struct member (v1 parity), so copy / `==` / pack recurse
+    // natively. A `default` on a record-typed field is meaningless (its zero
+    // value is its own member defaults), so reject one. Checked before the
+    // scalar gate so a `Named` record type is not misreported as
+    // "non-scalar". `Vec<Record, N>` stays out of scope: `fixed_vec_field`
+    // only accepts scalar elements, so a `Vec` of a record falls through to
+    // the scalar gate's rejection below.
+    if let Some(rid) = named_record_id(&f.ty, record_ids) {
+        if f.default.is_some() {
+            return Err(unsupported(
+                &format!("a `default` on the nested-record field `{owner}.{fname}`"),
+                "a record-typed field defaults to its own field defaults",
+            ));
+        }
+        let mut attr_src = Vec::with_capacity(f.attrs.len());
+        for a in &f.attrs {
+            let mut buf = String::new();
+            crate::pretty::print_attr(&mut buf, a);
+            attr_src.push(buf);
+        }
+        fields.push(RecordFieldSchema {
+            name: fname.clone(),
+            ty: IrType::Record(rid),
+            vec_len: None,
+            default: None,
+            non_random: f.non_random,
+            attr_src,
+        });
+        return Ok(());
     }
     // A `Vec<T, N>` field is the one aggregate this slice lowers: a
     // fixed-size array of a scalar element type (v1's `std::array<T, N>`
@@ -140,9 +181,14 @@ fn lower_record_field(
         None => {
             let scalar = field_ir_type(&f.ty, enum_names).ok_or_else(|| {
                 unsupported(
-                    &format!("{kind} field `{owner}.{fname}` with a non-scalar type"),
-                    "only uint/sint/bits/bool/bit scalar fields up to 64 bits and \
-                     fixed `Vec<T, N>` arrays of such scalars are lowered",
+                    &format!(
+                        "{kind} field `{owner}.{fname}` with an unsupported (non-scalar) \
+                         leaf type `{}`",
+                        type_expr_label(&f.ty)
+                    ),
+                    "only uint/sint/bits/bool/bit scalar fields up to 64 bits, fixed \
+                     `Vec<T, N>` arrays of such scalars, and nested struct/transaction \
+                     fields (whose leaves are themselves supported) are lowered",
                 )
             })?;
             (scalar, None)
@@ -273,4 +319,79 @@ fn field_ir_type(t: &TypeExpr, enum_names: &std::collections::HashSet<String>) -
         BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => Some(IrType::Bool),
         _ => None,
     }
+}
+
+/// `Some(rid)` when `t` is a bare `Named` type whose simple name is a known
+/// transaction or struct (a nested-record field type). Enum names live in a
+/// disjoint namespace, so a match here is unambiguously a record.
+fn named_record_id(t: &TypeExpr, record_ids: &HashMap<String, RecordId>) -> Option<RecordId> {
+    let TypeExpr::Named { name, .. } = t else {
+        return None;
+    };
+    let simple = name.segments.last().map(|s| s.name.as_str())?;
+    record_ids.get(simple).copied()
+}
+
+/// A short, human-readable label for a field's declared type, for the
+/// "unsupported leaf type" diagnostic. Best-effort: names the builtin/Named
+/// head so the message points at the offending type.
+fn type_expr_label(t: &TypeExpr) -> String {
+    match t {
+        TypeExpr::Named { name, .. } => name
+            .segments
+            .last()
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "<named>".to_string()),
+        TypeExpr::Builtin { name, .. } => format!("{name:?}"),
+    }
+}
+
+/// Reject recursive / mutually-recursive nested records. A record whose
+/// fields transitively reach itself would emit an infinite C++ struct
+/// (a by-value member cannot hold its own containing type), so this is a
+/// hard error rather than a codegen crash. DFS with a gray/black coloring
+/// over `IrType::Record` field edges.
+pub(crate) fn check_no_record_cycles(records: &[RecordSchema]) -> Result<(), LowerError> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Color {
+        White,
+        Gray,
+        Black,
+    }
+    let mut color = vec![Color::White; records.len()];
+    // Explicit stack DFS carrying the containing record for the diagnostic.
+    fn visit(
+        i: usize,
+        records: &[RecordSchema],
+        color: &mut [Color],
+    ) -> Result<(), LowerError> {
+        color[i] = Color::Gray;
+        for f in &records[i].fields {
+            if let IrType::Record(rid) = f.ty {
+                let j = rid.index();
+                match color.get(j).copied() {
+                    Some(Color::Gray) => {
+                        return Err(unsupported(
+                            &format!(
+                                "recursive nested record `{}` (field `{}` transitively \
+                                 contains `{}`)",
+                                records[i].name, f.name, records[j].name
+                            ),
+                            "a record cannot contain itself by value; break the cycle",
+                        ));
+                    }
+                    Some(Color::White) => visit(j, records, color)?,
+                    _ => {}
+                }
+            }
+        }
+        color[i] = Color::Black;
+        Ok(())
+    }
+    for i in 0..records.len() {
+        if color[i] == Color::White {
+            visit(i, records, &mut color)?;
+        }
+    }
+    Ok(())
 }
