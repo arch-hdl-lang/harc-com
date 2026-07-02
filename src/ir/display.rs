@@ -449,6 +449,7 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         Stmt::RecordFieldWrite {
             local,
             field,
+            path,
             index,
             value,
         } => {
@@ -456,8 +457,9 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
                 Some(i) => format!("[{}]", expr_str(func, i)),
                 None => String::new(),
             };
+            let nested = path.iter().map(|p| format!(".{p}")).collect::<String>();
             format!(
-                "RecordFieldWrite({}.{field}{idx}, {})",
+                "RecordFieldWrite({}.{field}{nested}{idx}, {})",
                 local_str(func, *local),
                 expr_str(func, value)
             )
@@ -812,13 +814,15 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         Expr::RecordField {
             local,
             field,
+            path,
             index,
         } => {
             let idx = match index {
                 Some(i) => format!("[{}]", expr_str(func, i)),
                 None => String::new(),
             };
-            format!("{}.{field}{idx}", local_str(func, *local))
+            let nested = path.iter().map(|p| format!(".{p}")).collect::<String>();
+            format!("{}.{field}{nested}{idx}", local_str(func, *local))
         }
         Expr::RegRead {
             mirror,

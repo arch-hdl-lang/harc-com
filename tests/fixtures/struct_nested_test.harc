@@ -1,0 +1,135 @@
+// Nested `struct` value-records — the fixture behind the TB-IR
+// backend's NATIVE nested-record lowering (issue #476). A struct field
+// whose type is another struct lowers to a real C++ struct member
+// (v1's `emit_record_struct` already emits nested structs natively), so
+// copy / equality / by-value method params all recurse through the
+// inner struct. Exercises, against the counter DUT (`Top` from
+// top_counter_test):
+//
+//   1. A nested struct field with scalar leaves (`Scenario.expected`,
+//      itself a `DescriptorExpectation`).
+//   2. Per-field nested writes and reads back through the parent
+//      (`sc.expected.count = x; assert sc.expected.count == x`), at two
+//      levels of nesting.
+//   3. Copying the parent struct and verifying the nested values
+//      survive (`let sc2 = sc; assert sc2.expected.count == ...`).
+//   4. Whole-sub-struct assignment (`sc.expected = d`).
+//   5. Passing the parent struct through a hookable transactor method
+//      by value (`drv.run_for(sc)` reads `sc.expected.count` inside).
+//
+// Uses only the v1-supported surface (native nested structs are valid
+// HARC), so the same file passes under `--codegen v1` and
+// `--codegen tbir`; the equivalence harness trace-diffs the two.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+struct DescriptorExpectation
+    count  : uint<8>  default 1
+    word0  : uint<32> default 0
+end struct DescriptorExpectation
+
+struct Scenario
+    trigger_mask : uint<32> default 0
+    expected     : DescriptorExpectation
+    require_ack  : bool     default false
+end struct Scenario
+
+transactor CounterDriver
+    dut : Top
+
+    when active
+        // Pulse `en` for `sc.expected.count` cycles — reads the nested
+        // record field of the by-value record param inside the body.
+        hookable run_for(sc: Scenario)
+            dut.en = 1
+            for _ in 1 .. sc.expected.count
+                wait 1 cycle
+            end for
+            dut.en = 0
+            wait 1 cycle
+        end run_for
+    end when
+end transactor CounterDriver
+
+testbench StructNestedTb
+    dut : Top
+    drv : CounterDriver active
+end testbench StructNestedTb
+
+impl StructNestedTest for StructNestedTb
+    clock clk = SysDomain        // 100 MHz
+
+    run
+        log(info, "nested-struct fixture")
+        drv.dut = dut
+
+        // Reset for 3 cycles.
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        assert dut.count_out == 0
+            else fail("after reset: count_out=${dut.count_out}, expected 0")
+        dut.rst = 0
+        wait 1 cycle
+
+        // Three scenarios of increasing length (1, 2, 3 ticks). Each
+        // builds a nested descriptor expectation, verifies the nested
+        // reads/writes/copies, then runs it through the hookable method.
+        let total = 0
+        for i in 0 .. 2
+            let sc : Scenario
+            // Nested defaults re-run on every construction.
+            assert sc.expected.count == 1
+                else fail("sc[${i}]: default nested count=${sc.expected.count}, expected 1")
+            assert sc.expected.word0 == 0
+                else fail("sc[${i}]: nested word0 not re-zeroed (${sc.expected.word0})")
+
+            // Per-field nested writes + read-back through the parent.
+            sc.expected.count = sc.expected.count + i      // 1, 2, 3
+            assert sc.expected.count == 1 + i
+                else fail("sc[${i}]: nested count write-read mismatch")
+            sc.expected.word0 = 100 + i
+            assert sc.expected.word0 == 100 + i
+                else fail("sc[${i}]: nested word0 write-read mismatch")
+            sc.trigger_mask = 5
+
+            // Whole-sub-struct assignment: build a descriptor and assign
+            // it to the nested field, then read the nested leaves back.
+            let d : DescriptorExpectation
+            d.count = sc.expected.count
+            d.word0 = 200 + i
+            sc.expected = d
+            assert sc.expected.count == 1 + i
+                else fail("sc[${i}]: whole-sub-struct assign lost count")
+            assert sc.expected.word0 == 200 + i
+                else fail("sc[${i}]: whole-sub-struct assign lost word0")
+
+            // Copy the parent struct — nested values must survive.
+            let sc2 = sc
+            assert sc2.expected.count == sc.expected.count
+                else fail("sc[${i}]: copy lost nested count")
+            assert sc2.expected.word0 == 200 + i
+                else fail("sc[${i}]: copy lost nested word0")
+            assert sc2.trigger_mask == 5
+                else fail("sc[${i}]: copy lost top-level field")
+
+            total = total + sc.expected.count
+            // Pass the parent struct by value through the hookable
+            // method; it pulses `en` for `sc.expected.count` cycles.
+            drv.run_for(sc)
+
+            assert dut.count_out == total
+                else fail("sc[${i}]: count_out=${dut.count_out}, expected ${total}")
+            log(info, "sc[${i}] count=${sc.expected.count} word0=${sc.expected.word0} -> ${dut.count_out}")
+        end for
+
+        // Hold: en=0 → count must stay at the last total.
+        dut.en = 0
+        wait 2 cycles
+        assert dut.count_out == total
+            else fail("hold: count_out=${dut.count_out}, expected ${total}")
+        log(info, "PASS: nested struct total=${total}")
+    end run
+end impl StructNestedTest

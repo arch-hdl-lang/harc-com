@@ -1233,10 +1233,19 @@ pub enum Stmt {
     /// `t.field = value` on a record-typed local. The value is
     /// port-hoisted like `Assign` (no inline DUT reads). `index: Some(e)`
     /// writes a `Vec<T, N>` field element (`rec.data[e] = value`); `None`
-    /// writes a scalar field.
+    /// writes a scalar (or whole-`Vec` / whole-nested-record) field.
+    ///
+    /// `path` carries zero or more FURTHER nested field names beneath the
+    /// first-level `field`, for a nested-struct write such as
+    /// `s.a.b = v` (`field = "a"`, `path = ["b"]`). The written leaf is
+    /// the last of `[field] ++ path`; `index` (when `Some`) indexes that
+    /// leaf's `Vec`. An empty `path` is the single-level write. A
+    /// whole-nested-record leaf assignment (`o.a = d`) carries a
+    /// record-valued `value`.
     RecordFieldWrite {
         local: LocalId,
         field: String,
+        path: Vec<String>,
         index: Option<Expr>,
         value: Expr,
     },
@@ -1654,10 +1663,18 @@ pub enum Expr {
     /// `t.field` read on a record-typed local. Host state, not DUT
     /// state — allowed in every expression position a `Local` is.
     /// `index: Some(e)` reads a `Vec<T, N>` field element (`rec.data[e]`,
-    /// emitted as `local.field[e]`); `None` reads a scalar field.
+    /// emitted as `local.field[e]`); `None` reads a scalar field (or a
+    /// whole nested-record field, `let d = s.inner`).
+    ///
+    /// `path` carries zero or more FURTHER nested field names beneath the
+    /// first-level `field`, for a nested-struct read such as `s.a.b`
+    /// (`field = "a"`, `path = ["b"]`). The read leaf is the last of
+    /// `[field] ++ path`; `index` (when `Some`) indexes that leaf's
+    /// `Vec`. An empty `path` is the single-level read.
     RecordField {
         local: LocalId,
         field: String,
+        path: Vec<String>,
         index: Option<Box<Expr>>,
     },
     /// `_tb.<field>` read on a scalar testbench field. Host state —

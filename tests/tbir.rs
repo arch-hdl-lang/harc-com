@@ -1484,6 +1484,38 @@ end test StructVecTest
     assert!(msg.contains("non-scalar"), "names the reason: {msg}");
 }
 
+/// A NESTED struct whose inner leaf is a genuinely unsupported type (a
+/// `Vec` with a widthless element — no defined packed width) is still
+/// rejected. Nested structs are now lowered, but only when every leaf is
+/// itself representable. The diagnostic must name the offending leaf
+/// (`Inner.bad`), not just say "non-scalar".
+#[test]
+fn nested_struct_with_unsupported_leaf_is_rejected() {
+    let src = r#"
+struct Inner
+    bad : Vec<uint, 4>
+end struct Inner
+
+struct Outer
+    inner : Inner
+end struct Outer
+
+test NestedBadLeafTest
+    let dut : Top
+    run
+        let o : Outer
+    end run
+end test NestedBadLeafTest
+"#;
+    let err = lower_src(src).expect_err("unsupported nested leaf must be rejected");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("Inner.bad"),
+        "names the offending leaf path: {msg}"
+    );
+    assert!(msg.contains("non-scalar"), "names the reason: {msg}");
+}
+
 /// A whole-`Vec` record-field READ in scalar position (here a format
 /// arg) must be REJECTED with a structured diagnostic — NOT lowered into
 /// `harc_printf_ll(r.data)`, which miscompiles as a raw clang error

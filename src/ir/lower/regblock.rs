@@ -292,6 +292,7 @@ impl super::FuncBuilder<'_> {
         self.push(Stmt::RecordFieldWrite {
             local: mirror,
             field: reg.name.clone(),
+            path: Vec::new(),
             index: None,
             value: v.clone(),
         });
@@ -349,6 +350,7 @@ impl super::FuncBuilder<'_> {
         let cur = Expr::RecordField {
             local: mirror,
             field: reg.name.clone(),
+            path: Vec::new(),
             index: None,
         };
         // (mirror.REG & ~(mask << pos)) | ((v & mask) << pos)
@@ -362,6 +364,7 @@ impl super::FuncBuilder<'_> {
         self.push(Stmt::RecordFieldWrite {
             local: mirror,
             field: reg.name.clone(),
+            path: Vec::new(),
             index: None,
             value: new_word,
         });
@@ -370,6 +373,7 @@ impl super::FuncBuilder<'_> {
             let word = Expr::RecordField {
                 local: mirror,
                 field: reg.name.clone(),
+                path: Vec::new(),
                 index: None,
             };
             let call = self.regblock_call(helper_field, "write", vec![lit(reg.offset), word])?;
@@ -427,6 +431,7 @@ impl super::FuncBuilder<'_> {
             Expr::RecordField {
                 local: mirror,
                 field: reg.name.clone(),
+                path: Vec::new(),
                 index: None,
             }
         };
@@ -644,6 +649,7 @@ impl super::FuncBuilder<'_> {
             self.push(Stmt::RecordFieldWrite {
                 local: mirror,
                 field: reg.name.clone(),
+                path: Vec::new(),
                 index: None,
                 value: Expr::Local(id),
             });
@@ -655,6 +661,7 @@ impl super::FuncBuilder<'_> {
                 Expr::RecordField {
                     local: mirror,
                     field: reg.name.clone(),
+                    path: Vec::new(),
                     index: None,
                 },
             ));
@@ -843,6 +850,7 @@ impl super::FuncBuilder<'_> {
         self.push(Stmt::RecordFieldWrite {
             local: mirror,
             field: reg.name.clone(),
+            path: Vec::new(),
             index: None,
             value: masked,
         });
@@ -883,6 +891,7 @@ impl super::FuncBuilder<'_> {
             Expr::RecordField {
                 local: mirror,
                 field: reg.name.clone(),
+                path: Vec::new(),
                 index: None,
             },
         ));

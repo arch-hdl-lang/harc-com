@@ -249,21 +249,21 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // for each), so unsupported transaction shapes are rejected here
     // rather than dropped.
     let mut record_ids: HashMap<String, RecordId> = HashMap::new();
-    let mut record_schemas: Vec<RecordSchema> = Vec::new();
+    // PRE-SCAN: assign a `RecordId` to every transaction (file order) then
+    // every struct (file order) BEFORE lowering any field body. A struct
+    // field may name another struct declared later (forward reference) or a
+    // transaction, so the full name→id map must exist before `field_ir_type`
+    // resolves a nested-record field type. Ids are stable: the second pass
+    // pushes schemas in exactly this order, so `RecordId(k)` indexes
+    // `record_schemas[k]`. A struct sharing a name with a transaction (or
+    // another struct) resolves ambiguously, so reject the collision.
+    let mut record_order: Vec<&Item> = Vec::new();
     for it in &file.items {
         if let Item::Transaction(t) = it {
-            let schema = records::lower_transaction(t, &enum_names)?;
-            record_ids.insert(t.name.name.clone(), RecordId(record_schemas.len() as u32));
-            record_schemas.push(schema);
+            record_ids.insert(t.name.name.clone(), RecordId(record_order.len() as u32));
+            record_order.push(it);
         }
     }
-    // `struct` declarations lower into the SAME records table — a struct is
-    // the shared value-record shape (v1's `emit_struct_record` routes
-    // through `emit_record_struct`, exactly as transactions do), so a
-    // `let r : S` resolves `S` via `record_ids` and every record-local op
-    // (`RecordInit` / `RecordFieldWrite` / `Expr::RecordField`) works for
-    // free. A name shared with a transaction would resolve ambiguously, so
-    // reject the collision rather than shadow.
     for it in &file.items {
         if let Item::Struct(s) = it {
             let name = &s.name.name;
@@ -272,11 +272,29 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                     "struct `{name}` collides with a transaction or struct of the same name"
                 )));
             }
-            let schema = records::lower_struct(s, &enum_names)?;
-            record_ids.insert(name.clone(), RecordId(record_schemas.len() as u32));
-            record_schemas.push(schema);
+            record_ids.insert(name.clone(), RecordId(record_order.len() as u32));
+            record_order.push(it);
         }
     }
+    // Second pass: lower each transaction/struct body's fields with the full
+    // `record_ids` map in scope, so a nested-record field type resolves to
+    // `IrType::Record(rid)` (native nested records — v1 parity). A struct is
+    // the shared value-record shape (v1's `emit_struct_record` routes through
+    // `emit_record_struct`, exactly as transactions do), so a `let r : S`
+    // resolves `S` via `record_ids` and every record-local op (`RecordInit`
+    // / `RecordFieldWrite` / `Expr::RecordField`) works for free.
+    let mut record_schemas: Vec<RecordSchema> = Vec::new();
+    for it in record_order {
+        let schema = match it {
+            Item::Transaction(t) => records::lower_transaction(t, &enum_names, &record_ids)?,
+            Item::Struct(s) => records::lower_struct(s, &enum_names, &record_ids)?,
+            _ => unreachable!("record_order holds only transactions and structs"),
+        };
+        record_schemas.push(schema);
+    }
+    // Reject recursive / mutually-recursive nested records: an outer struct
+    // that transitively contains itself would emit an infinite C++ struct.
+    records::check_no_record_cycles(&record_schemas)?;
     // Regblock schemas (`regblock` declarations), in file order. The
     // mirror is a synthetic value-record (one scalar field per
     // register), pushed into the records table right after the
