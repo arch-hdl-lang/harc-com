@@ -149,9 +149,15 @@ int run_TopCounterTest(int argc, char** argv) {
                 }
             }
             dut->eval();
-            _harc_trace_dump_at((uint64_t)now_ps, _last_edge_clock, _last_edge_cycle);
+            // Set the semantic trace timing for this edge *before* running
+            // post_eval services so any trace events they emit carry the
+            // correct time, but defer the waveform dump until after those
+            // services (and the follow-up eval) have settled DUT-visible
+            // state. VCD cannot represent two dumps at the same physical
+            // timestamp, so we dump exactly once per `now_ps` (issue #477).
+            trace.set_timing((uint64_t)now_ps, _last_edge_clock, _last_edge_cycle);
             if (_primary_rising) { for (auto& _svc : _post_eval_services) _svc(); if (!_post_eval_services.empty()) dut->eval(); }
-            if (_primary_rising && !_post_eval_services.empty()) _harc_trace_dump_at((uint64_t)now_ps, _last_edge_clock, _last_edge_cycle);
+            _harc_trace_dump_at((uint64_t)now_ps, _last_edge_clock, _last_edge_cycle);
         }
     };
 

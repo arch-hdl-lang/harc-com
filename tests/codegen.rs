@@ -2618,6 +2618,83 @@ end test T"#,
     );
 }
 
+/// Regression for issue #477. With a declared `clock` (the multi-clock
+/// scheduler / `now_ps` path) AND active `phase post_eval` services, the
+/// generated `eval_clocks_until` loop must dump the waveform exactly ONCE
+/// per physical timestamp. Previously it dumped at `now_ps`, ran the
+/// post_eval services + a follow-up `eval`, then dumped again at the same
+/// `now_ps`; Verilator's VCD tracer ignores the second dump and warns
+/// `previous dump at t=..., dump call ignored` (thousands of lines in long
+/// sims), and the *ignored* dump is the one carrying the settled post_eval
+/// state. The fix sets the semantic trace timing before post_eval and
+/// defers the single dump until after post_eval has settled DUT state.
+#[test]
+fn clocked_post_eval_dumps_waveform_once_per_timestamp() {
+    let src = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+test ClockedPostEvalTest
+    let dut : Top
+    clock clk = SysDomain
+    run
+        on 1 cycles phase post_eval
+            log(info, "service")
+        end on
+        wait 2 cycles
+    end run
+end test ClockedPostEvalTest"#;
+    let parsed = parse_source(src).unwrap();
+    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let cpp = cpp_tb::emit(&merged).expect("emit");
+
+    // Isolate the multi-clock scheduler body (declared `clock` => `now_ps`).
+    let start = cpp
+        .find("auto eval_clocks_until")
+        .expect("expected clocked scheduler for a declared `clock`");
+    let end = cpp[start..]
+        .find("auto tick =")
+        .map(|p| start + p)
+        .expect("expected `tick` lambda after the scheduler");
+    let body = &cpp[start..end];
+
+    // Exactly one physical-timestamp waveform dump inside the scheduler loop.
+    let dumps = body
+        .matches("_harc_trace_dump_at((uint64_t)now_ps")
+        .count();
+    assert_eq!(
+        dumps, 1,
+        "clocked + post_eval loop must dump the waveform once per timestamp (issue #477); \
+         found {dumps}:\n{body}"
+    );
+
+    // Semantic trace timing is set *before* the post_eval services run (so
+    // their trace events carry this edge's time) but the single dump is
+    // deferred until *after* the services + follow-up eval settle DUT state.
+    let set_timing = body
+        .find("trace.set_timing((uint64_t)now_ps")
+        .expect("expected set_timing before post_eval services");
+    let services = body
+        .find("for (auto& _svc : _post_eval_services) _svc();")
+        .expect("expected post_eval services in the loop");
+    let dump = body
+        .find("_harc_trace_dump_at((uint64_t)now_ps")
+        .expect("expected the deferred waveform dump");
+    assert!(
+        set_timing < services && services < dump,
+        "expected order set_timing -> post_eval services -> dump (issue #477); \
+         set_timing@{set_timing}, services@{services}, dump@{dump}\n{body}"
+    );
+
+    // The old duplicate-dump shape must be gone.
+    assert!(
+        !body.contains(
+            "if (_primary_rising && !_post_eval_services.empty()) _harc_trace_dump_at"
+        ),
+        "the duplicate same-timestamp dump must be removed (issue #477); got:\n{body}"
+    );
+}
+
 #[test]
 fn active_post_eval_handler_calls_component_field_method() {
     let parsed = parse_source(

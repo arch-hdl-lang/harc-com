@@ -2059,9 +2059,14 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}}}").ok();
             writeln!(e.out, "{INDENT}{INDENT}{INDENT}}}").ok();
             writeln!(e.out, "{INDENT}{INDENT}{INDENT}dut->eval();").ok();
+            // Set semantic trace timing for this edge *before* post_eval
+            // services (so their trace events carry the right time), but
+            // defer the waveform dump until after those services and the
+            // follow-up eval settle. VCD allows only one dump per physical
+            // timestamp, so we dump exactly once per `now_ps` (issue #477).
             writeln!(
                 e.out,
-                "{INDENT}{INDENT}{INDENT}_harc_trace_dump_at((uint64_t)now_ps, _last_edge_clock, _last_edge_cycle);"
+                "{INDENT}{INDENT}{INDENT}trace.set_timing((uint64_t)now_ps, _last_edge_clock, _last_edge_cycle);"
             )
             .ok();
             writeln!(
@@ -2071,7 +2076,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             .ok();
             writeln!(
                 e.out,
-                "{INDENT}{INDENT}{INDENT}if (_primary_rising && !_post_eval_services.empty()) _harc_trace_dump_at((uint64_t)now_ps, _last_edge_clock, _last_edge_cycle);"
+                "{INDENT}{INDENT}{INDENT}_harc_trace_dump_at((uint64_t)now_ps, _last_edge_clock, _last_edge_cycle);"
             )
             .ok();
             writeln!(e.out, "{INDENT}{INDENT}}}").ok();
