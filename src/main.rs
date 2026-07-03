@@ -209,7 +209,7 @@ enum Cmd {
         #[arg(long)]
         record_trace: Option<PathBuf>,
         /// Enable Verilator VCD/FST waveform dumping. Implies trace
-        /// codegen in the emitted C++ TB and `--trace-vcd` /
+        /// codegen in the emitted C++ TB and `--trace` /
         /// `--trace-fst` on the Verilator command. Default format is
         /// FST (smaller + faster for large regressions); override
         /// with `--wave-format vcd`. Wave file lands in `<outdir>`
