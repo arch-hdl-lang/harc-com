@@ -44,10 +44,14 @@ fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Minimum Verilator version that accepts `--trace-vcd`. Older versions
-/// only know bare `--trace`.
+/// Minimum Verilator major version. VCD dumping now goes through the
+/// portable `--trace` flag (accepted by every Verilator 5.x — see
+/// `--wave-format vcd` → `--trace` in src/main.rs), so there is no
+/// minor-version floor: any Verilator 5 can run this test. (Before
+/// #480 the compiler emitted `--trace-vcd`, which only exists on
+/// Verilator >= 5.036 and forced this test to skip on the pinned CI
+/// Verilator 5.034 — that gate is now obsolete.)
 const MIN_VERILATOR_MAJOR: u32 = 5;
-const MIN_VERILATOR_MINOR: u32 = 36;
 
 /// Shell out to `verilator --version` and parse a `(major, minor)` pair
 /// from output like `Verilator 5.034 2024-12-...`. Returns `None` if
@@ -224,22 +228,20 @@ fn tlm_call_pulse_times(merged_vcd: &str) -> Vec<u64> {
 /// single run.
 #[test]
 fn trace_merge_blocking_and_ooo_tags_e2e() {
-    // VCD path requires Verilator >= 5.036; see src/main.rs:1167 — older versions need bare `--trace`.
+    // VCD dumping uses the portable `--trace` flag (every Verilator 5.x),
+    // so this only needs Verilator present at v5+ — no minor-version floor.
     match detect_verilator_version() {
-        Some((maj, min)) if (maj, min) < (MIN_VERILATOR_MAJOR, MIN_VERILATOR_MINOR) => {
+        Some((maj, _min)) if maj < MIN_VERILATOR_MAJOR => {
             eprintln!(
                 "SKIP trace_merge_blocking_and_ooo_tags_e2e: detected Verilator \
-                 {maj}.{min:03}, need >= {MIN_VERILATOR_MAJOR}.{MIN_VERILATOR_MINOR:03}. \
-                 `harc sim --wave-format vcd` passes `--trace-vcd` to Verilator \
-                 (src/main.rs:1167), which only exists on Verilator >= 5.036."
+                 major {maj}, need >= {MIN_VERILATOR_MAJOR}."
             );
             return;
         }
         None => {
             eprintln!(
                 "SKIP trace_merge_blocking_and_ooo_tags_e2e: could not detect \
-                 Verilator version (need >= {MIN_VERILATOR_MAJOR}.{MIN_VERILATOR_MINOR:03}); \
-                 see src/main.rs:1167."
+                 Verilator (need >= {MIN_VERILATOR_MAJOR}.x)."
             );
             return;
         }
@@ -253,9 +255,8 @@ fn trace_merge_blocking_and_ooo_tags_e2e() {
     assert!(
         ok,
         "harc sim --waves --wave-format vcd --record-trace failed.\n{log}\n\
-         Note: requires Verilator new enough to accept `--trace-vcd` \
-         (5.036+). On older Verilators the compiler emits a flag the \
-         tool rejects."
+         Note: VCD dumping uses the portable `--trace` flag, so any \
+         Verilator 5.x should accept it."
     );
 
     // Locate the produced wave VCD. Default path is
