@@ -371,14 +371,21 @@ pub(crate) fn check_no_record_cycles(records: &[RecordSchema]) -> Result<(), Low
                 let j = rid.index();
                 match color.get(j).copied() {
                     Some(Color::Gray) => {
-                        return Err(unsupported(
-                            &format!(
-                                "recursive nested record `{}` (field `{}` transitively \
-                                 contains `{}`)",
-                                records[i].name, f.name, records[j].name
-                            ),
-                            "a record cannot contain itself by value; break the cycle",
-                        ));
+                        // Structurally invalid, NOT a TB-IR-subset gap: a
+                        // by-value recursive struct is an infinitely-sized
+                        // C++ type in every backend (v1 stack-overflows on
+                        // it). Use `Invalid` so the diagnostic does NOT
+                        // suggest `re-run with --codegen v1` — that path
+                        // crashes rather than accepting the program.
+                        return Err(LowerError::Invalid(format!(
+                            "recursive nested record `{}`: field `{}` \
+                             transitively contains `{}` by value — a record \
+                             cannot contain itself (the generated C++ struct \
+                             would be infinitely sized). Break the cycle \
+                             (e.g. use a handle/index instead of a by-value \
+                             field).",
+                            records[i].name, f.name, records[j].name
+                        )));
                     }
                     Some(Color::White) => visit(j, records, color)?,
                     _ => {}
