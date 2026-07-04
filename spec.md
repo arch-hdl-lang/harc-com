@@ -230,23 +230,35 @@ Lowers to a parenthesized C++ ternary in the generated TB.
 **Wrapping arithmetic operators `+%` / `-%` / `*%`.** Accepted at the same
 precedence as `+` / `-` / `*` (additive / multiplicative tiers), so a HARC
 testbench can mirror an ARCH datapath operator-for-operator without
-hand-deriving a mask. **Caveat — they are surface sugar today, not yet true
-width-wrapping.** HARC's value model holds every width ≤ 64 b in a native
-64-bit C++ slot, and a typed `let x : uint<N> = e` is a *width label*, not a
-masking assignment — it does not truncate `e` to `N` bits. Consequently
-`+% / -% / *%` currently lower **identically** to `+ / - / *` and do **not**
-mask to `max(W(a), W(b))` the way ARCH's wrapping operators do. To obtain a
-genuine `N`-bit wrap in a HARC expression, apply `.trunc<N>()` explicitly:
+hand-deriving a mask. `a OP% b` evaluates `a OP b` and then **masks the
+result to `max(W(a), W(b))` bits** — the wider operand's width, with no
+widening — matching ARCH's `AddWrap / SubWrap / MulWrap`. The mask is the
+unsigned low-`W` residue (`(a OP b) & ((1 << W) - 1)`); at `W = 64` it is a
+no-op, since 64 b already fills the value slot.
+
+*Operand width.* Each operand's width is taken from its static type: a typed
+local (`let x : uint<N>`), a cast (`x as uint<N>`), a width method
+(`.trunc<N>()` etc.), or an integer literal (self-sized to its minimum
+unsigned width, so `1` is 1 b and does not widen the result). **Both operand
+widths must be statically determinable.** If either is unknown the compiler
+raises a lowering error rather than silently skipping the wrap — a masked
+real bug (e.g. a scoreboard computing a value the DUT can never emit) is
+worse than a loud failure. A bare DUT-port read is width-erased in HARC (the
+DUT is a black box), so mask it through a cast: `(dut.count as uint<8>) +% 1`.
 
 ```
 let a : uint<8> = 255
-let b = a +% 1            // == 256  (no operand-width wrap — sugar for a + 1)
-let c = (a +% 1).trunc<8> // == 0    (explicit 8-bit wrap)
+let b : uint<8> = a +% 1       // == 0    (8-bit wrap: 256 & 0xFF)
+let c : uint<8> = a *% 3       // == 253  (765 & 0xFF)
+let d : uint<9>  = (a as uint<9>) + 1  // == 256  (plain `+` does not wrap)
 ```
 
-Closing this gap (masking the wrapping forms to the wider operand width to
-match ARCH, and the related decision about literal operand width) is tracked
-as a language-parity item; see harc#473.
+Signedness: the mask is the two's-complement low-`W` bit pattern; a `sint<N>`
+operand yields that residue as an unsigned value, so reinterpret with an
+explicit cast if a signed result is wanted. The wrap is applied by the
+default (TB-IR) backend; the legacy `--codegen v1` backend still treats these
+as pass-through sugar (`+ / - / *`) and is not being extended (it is being
+retired). See harc#473.
 
 ---
 

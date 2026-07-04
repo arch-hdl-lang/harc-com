@@ -97,6 +97,81 @@ fn assert_unsupported(err: &lower::LowerError) -> String {
     msg
 }
 
+/// harc#473: `+% / -% / *%` mask the result to `max(W(lhs), W(rhs))` bits.
+/// A typed `a : uint<8>` operand plus a literal masks at 8 b, so the emitted
+/// C++ carries the `& 0xFF` residue rather than the un-wrapped `a + 1`.
+/// (A typed `let : uint<8>` assignment does NOT itself mask — the residue is
+/// proof the wrap was applied.)
+#[test]
+fn wrapping_ops_mask_to_operand_width() {
+    let cpp = emit_cpp_src(
+        r#"test T
+    let dut : Top
+    run
+        let a : uint<8> = 255
+        let s : uint<8> = a +% 1
+        let p : uint<8> = a *% 3
+        assert s == 0 else fail("x")
+        assert p == 253 else fail("x")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("((a + 1)) & 0xFFULL"),
+        "expected 8-bit add-wrap mask `(a + 1) & 0xFF`; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("((a * 3)) & 0xFFULL"),
+        "expected 8-bit mul-wrap mask `(a * 3) & 0xFF`; got:\n{cpp}"
+    );
+}
+
+/// harc#473: the wrap width is `max(W(lhs), W(rhs))` — a literal is
+/// self-sized (minimum width) and does not widen the result, so `a +% 300`
+/// with `a : uint<8>` masks at 9 b (300 needs 9 bits), not 8.
+#[test]
+fn wrapping_op_width_is_max_of_operands() {
+    let cpp = emit_cpp_src(
+        r#"test T
+    let dut : Top
+    run
+        let a : uint<8> = 255
+        let w : uint<9> = a +% 300
+        assert w == 43 else fail("x")
+    end run
+end test T"#,
+    );
+    // 9-bit mask is 0x1FF; an 8-bit mask (0xFF) would be wrong here.
+    assert!(
+        cpp.contains("& 0x1FFULL"),
+        "expected a 9-bit wrap mask (max(8,9)) `& 0x1FF`; got:\n{cpp}"
+    );
+}
+
+/// harc#473: a wrapping op whose operand widths cannot be determined is a
+/// hard lowering error — never a silent no-wrap (an un-masked scoreboard
+/// value the DUT can never emit is worse than a loud failure). `dut.count_out`
+/// read into an untyped local is width-erased.
+#[test]
+fn wrapping_op_unknown_operand_width_is_rejected() {
+    let err = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let x = dut.count_out
+        let y : uint<8> = x +% x
+        assert y == 0 else fail("x")
+    end run
+end test T"#,
+    )
+    .expect_err("unknown-width wrapping operand must fail lowering");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("statically known bit-width"),
+        "expected a known-width lowering error for `x +% x`; got: {msg}"
+    );
+}
+
 /// Locks the dump-ir text for the tracer-bullet fixture: testbench /
 /// test schemas, block structure, port hoisting, loop shapes,
 /// interpolated format args.
