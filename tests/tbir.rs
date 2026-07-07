@@ -6003,6 +6003,86 @@ fn post_eval_provider_dump_ir_snapshot() {
     insta::assert_snapshot!("post_eval_provider_dump_ir", format!("{prog}"));
 }
 
+/// Issue #485: a `testbench`-scoped `on <N> cycles phase post_eval`
+/// periodic handler must lower under TB-IR (it was rejected before, with
+/// "TB-IR lowering does not support testbench item ... yet"). The body
+/// lowers to a flow-owned `TestHook` function registered as a periodic
+/// service on the testbench schema; the backend fires it once per cycle
+/// in the post_eval phase. Locks: the `periodic_services` schema entry
+/// (period 1, phase post_eval), and that the handler body — which touches
+/// testbench component instances directly and via a testbench helper
+/// method — lowers without the `--codegen v1` workaround.
+#[test]
+fn testbench_periodic_post_eval_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("testbench_periodic_post_eval_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let tb = &prog.testbenches[0];
+    assert_eq!(
+        tb.periodic_services.len(),
+        1,
+        "the testbench-scoped periodic handler registers one service"
+    );
+    let svc = &tb.periodic_services[0];
+    assert_eq!(svc.period, 1, "`on 1 cycles` → period 1");
+    assert_eq!(svc.phase, ir::HandlerPhase::PostEval, "`phase post_eval`");
+    // The service body is a flow-owned zero-param TestHook function.
+    let body = prog.function(svc.function);
+    assert!(matches!(body.kind, ir::FunctionKind::TestHook));
+    assert_eq!(body.owner, Some(ir::TestbenchId(0)));
+    assert!(body.params.is_empty(), "the handler body takes no params");
+    insta::assert_snapshot!("testbench_periodic_post_eval_dump_ir", format!("{prog}"));
+}
+
+/// Issue #485: the emitted C++ registers the testbench periodic handler as
+/// a `_post_eval_services` closure, gated on a per-service last-fire stamp
+/// (`cycle_count - last >= period`), firing the handler's free lambda. The
+/// body lambda is emitted AFTER the composite scoreboard instances +
+/// method lambdas it references (an ordering the early test-hook loop
+/// would otherwise get wrong).
+#[test]
+fn testbench_periodic_post_eval_emitted_cpp_snapshot() {
+    let cpp = emit_fixture_cpp("testbench_periodic_post_eval_test.harc");
+    assert!(
+        cpp.contains("_post_eval_services.push_back"),
+        "registers a post_eval service"
+    );
+    assert!(
+        cpp.contains("_tbper_"),
+        "uses the per-service last-fire stamp tag"
+    );
+    insta::assert_snapshot!("testbench_periodic_post_eval_emitted_cpp", cpp);
+}
+
+/// Issue #485 acceptance criterion 3: a testbench-scoped `on <bool-expr>`
+/// cycle-trigger handler (a NON-periodic on-handler) is still out of the
+/// subset, but the diagnostic must name the exact item kind rather than
+/// the old generic "testbench item". Only the periodic `on <N> cycles`
+/// form is lowered at testbench scope.
+#[test]
+fn testbench_cycle_trigger_on_handler_is_rejected() {
+    let src = r#"testbench TbCyc
+    dut : Top
+    hit : uint<32> default 0
+    on dut.count_out == 7
+        hit = hit + 1
+    end on
+end testbench TbCyc
+
+impl TbCycTest for TbCyc
+    run
+        dut.rst = 1
+        wait 3 cycles
+        log(info, "done")
+    end run
+end impl TbCycTest"#;
+    let err = lower_src(src).expect_err("a testbench cycle-trigger on-handler must be rejected");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("cycle-trigger") && msg.contains("testbench"),
+        "diagnostic must name the testbench on-handler kind, not the generic item: {msg}"
+    );
+}
+
 /// Issue #452: a test-scope `let` read (un-shadowed) at the top level of the
 /// check phase must still be promoted to a `_tb` host field even when an
 /// *unrelated nested* `let` of the same name shadows it elsewhere in the

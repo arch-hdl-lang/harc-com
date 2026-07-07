@@ -1429,10 +1429,45 @@ fn validate_testbench_component(
             // Helper methods are inert unless called; calls surface as
             // `Unsupported` at the call site during body lowering.
             ComponentItem::Hookable(_) => {}
+            // Testbench-scoped `on ... end on` handler (issue #485). The
+            // periodic form (`on <N> cycles [phase post_eval]`) lowers to
+            // a flow-owned service (see `lower_test`); the cycle-trigger
+            // (`on <bool-expr>`) and event-subscription (`on <ev>(arg)`)
+            // forms, and pre/post method hooks, are not yet lowered at
+            // testbench scope — reject them by their exact kind so the
+            // diagnostic points at the real gap.
+            ComponentItem::OnHandler(h) => {
+                if h.hook.is_some() {
+                    return Err(unsupported(
+                        &format!(
+                            "a testbench-scoped `on <obj>.<method>` pre/post method hook in `{}`",
+                            c.name.name
+                        ),
+                        "only periodic `on <N> cycles` handlers are lowered at testbench scope",
+                    ));
+                }
+                if !h.periodic {
+                    return Err(unsupported(
+                        &format!(
+                            "a testbench-scoped cycle-trigger / event `on` handler in `{}`",
+                            c.name.name
+                        ),
+                        "only periodic `on <N> cycles` handlers are lowered at testbench scope; \
+                         move a cycle-trigger / event handler onto a component field",
+                    ));
+                }
+                // A periodic handler is accepted; its period is validated
+                // (positive integer literal) when `lower_test` lowers it.
+            }
             _ => {
                 return Err(unsupported(
-                    &format!("testbench item in `{}`", c.name.name),
-                    "only fields and lifecycle phases are lowered",
+                    &format!(
+                        "a `{}` item in testbench `{}`",
+                        item_component_label(ci),
+                        c.name.name
+                    ),
+                    "only fields, lifecycle phases, helper methods, and periodic `on <N> cycles` \
+                     handlers are lowered at testbench scope",
                 ));
             }
         }
@@ -1469,6 +1504,21 @@ fn item_label(it: &Item) -> &'static str {
         Item::Transactor(_) => "transactor",
         Item::Regblock(_) => "regblock",
         Item::Addrmap(_) => "addrmap",
+    }
+}
+
+/// Human-readable kind for a `ComponentItem`, for testbench-scope
+/// diagnostics (issue #485).
+fn item_component_label(it: &ComponentItem) -> &'static str {
+    match it {
+        ComponentItem::Field(_) => "field",
+        ComponentItem::Connect(_) => "connect",
+        ComponentItem::OnHandler(_) => "on-handler",
+        ComponentItem::TargetTlmThread(_) => "target thread",
+        ComponentItem::Hookable(_) => "method",
+        ComponentItem::Lifecycle(..) => "lifecycle phase",
+        ComponentItem::Apply(_) => "apply",
+        ComponentItem::Watchdog(_) => "watchdog",
     }
 }
 
@@ -2233,6 +2283,12 @@ fn lower_test(
     let mut scoreboard_fields: Vec<(String, ScoreboardId)> = Vec::new();
     let mut scalar_fields: Vec<ir::TbScalarFieldSchema> = Vec::new();
     let mut tb_methods: HashMap<String, HookableMethod> = HashMap::new();
+    // Testbench-scoped `on <N> cycles [phase post_eval]` periodic
+    // handlers (issue #485). Collected here in declaration order; their
+    // bodies are lowered as flow-owned `TestHook` functions after the
+    // test ctx is built (alongside run/check), then registered on the
+    // testbench schema.
+    let mut tb_periodic_asts: Vec<&crate::ast::OnHandler> = Vec::new();
     if let Some(tbn) = &tb_name {
         if let Some(c) = components.get(tbn) {
             for ci in &c.items {
@@ -2324,8 +2380,33 @@ fn lower_test(
                         }
                     }
                     ComponentItem::Hookable(h) => {
-                        tb_methods.insert(h.name.name.clone(), h.clone());
+                        // Rewrite the method body's bare references to
+                        // testbench fields/siblings into `_tb.<name>` form,
+                        // the same shape the impl-for desugaring gives the
+                        // bound test body — so a helper that touches a
+                        // testbench field (`_tb.count = ...`) or calls a
+                        // sibling (`_tb.other()`) resolves when CFG-inlined
+                        // (issue #485). `dut` and the method's own params are
+                        // shadowed (left bare). A method touching only `dut`
+                        // (the pre-#485 corpus) is unaffected by the rewrite.
+                        let mut hm = h.clone();
+                        let params: HashSet<String> =
+                            h.params.iter().map(|p| p.name.name.clone()).collect();
+                        crate::codegen::cpp_tb::rewrite_testbench_scope_body(
+                            &mut hm.body,
+                            c,
+                            &params,
+                        );
+                        tb_methods.insert(h.name.name.clone(), hm);
                     }
+                    // Testbench-scoped periodic `on <N> cycles` handler
+                    // (issue #485). Validated by `validate_testbench_component`
+                    // to be the periodic form; collect it here for body
+                    // lowering below. Non-periodic testbench on-handlers are
+                    // rejected there, so anything reaching this arm that is
+                    // NOT periodic is a bug in the validator — skip it
+                    // defensively rather than mis-lower.
+                    ComponentItem::OnHandler(h) if h.periodic => tb_periodic_asts.push(h),
                     _ => {}
                 }
             }
@@ -3048,6 +3129,8 @@ fn lower_test(
         component_fields: component_field_bindings,
         unbound_state_actors,
         synthetic,
+        // Back-patched after the handler bodies are lowered (below).
+        periodic_services: Vec::new(),
     });
 
     // Assemble run/check statement lists. Mirrors v1: the coroutine
@@ -3368,6 +3451,54 @@ fn lower_test(
         b.callbacks.push((reg.clone(), cb_id));
     }
 
+    // Lower each testbench-scoped `on <N> cycles [phase post_eval]`
+    // periodic handler (issue #485). The body is a zero-arg
+    // `FunctionKind::TestHook` function (emitted as a free `[&]`-capturing
+    // lambda alongside method hooks); the backend registers it into the
+    // per-cycle `_checkers` / `_post_eval_services` vector with a
+    // last-fire stamp gated on `period`. The period must be a positive
+    // integer literal in this subset.
+    if !tb_periodic_asts.is_empty() {
+        // The testbench decl is needed to rewrite bare field/method refs
+        // in the handler body; re-fetch it (the item-walk borrow ended).
+        let tb_decl = tb_name
+            .as_ref()
+            .and_then(|tbn| components.get(tbn).copied())
+            .expect("tb_periodic_asts is only populated for an impl-bound testbench");
+        let mut periodic_services: Vec<ir::TbPeriodicServiceSchema> = Vec::new();
+        for h in &tb_periodic_asts {
+            let period = tb_periodic_literal(&h.event).ok_or_else(|| {
+                unsupported(
+                    &format!(
+                        "a testbench-scoped `on <N> cycles` handler in `{}` with a \
+                         non-literal period",
+                        t.name.name
+                    ),
+                    "the TB-IR backend requires a positive integer-literal cycle count \
+                     (e.g. `on 1 cycles`); a field-backed period is not yet lowered",
+                )
+            })?;
+            let fid = FunctionId(prog.functions.len() as u32);
+            let f = lower_tb_periodic_service_body(
+                fid,
+                format!("{}_tb_periodic_{}", t.name.name, fid.0),
+                Some(tb_id),
+                tb_decl,
+                h,
+                &ctx,
+                helpers,
+                constraint_sites,
+            )?;
+            prog.functions.push(f);
+            periodic_services.push(ir::TbPeriodicServiceSchema {
+                period,
+                function: fid,
+                phase: ir::HandlerPhase::from_ast(h.phase),
+            });
+        }
+        prog.testbenches[tb_id.index()].periodic_services = periodic_services;
+    }
+
     prog.tests.push(TestSchema {
         name: t.name.name.clone(),
         testbench: tb_id,
@@ -3377,6 +3508,15 @@ fn lower_test(
         clocks: clock_specs,
     });
     Ok(())
+}
+
+/// Parse the cycle count of a testbench-scoped `on <N> cycles` periodic
+/// handler (issue #485). The parser stashes the period expression in
+/// `OnHandler::event`; this subset requires a positive integer literal.
+/// Returns `None` for a non-literal or non-positive period.
+fn tb_periodic_literal(event: &crate::ast::Expr) -> Option<u64> {
+    let v = exprs::parse_int_literal_expr(event)?;
+    (v > 0).then_some(v)
 }
 
 /// Recognize a bare phase-call statement `<name>()` — `StmtKind::Expr`
@@ -4162,6 +4302,35 @@ fn lower_method_hook_body<'a>(
     let mut f = b.finish(id, name, FunctionKind::TestHook, owner)?;
     f.params = params.to_vec();
     Ok(f)
+}
+
+/// Lower one testbench-scoped `on <N> cycles ... end on` periodic-handler
+/// body (issue #485) as a zero-param `FunctionKind::TestHook` function.
+/// The body is first rewritten (bare testbench field/method references →
+/// `_tb.<name>`) so it resolves through the ordinary TEST-scope `ctx`
+/// exactly like the bound test body — `_tb.<field>` host state, `dut`
+/// pokes/reads, and `_tb.<m>()` helper inlining. The firing cadence
+/// (`period`) and the phase are recorded on the schema, not here; the
+/// registration closure the backend emits gates on `cycle_count`.
+#[allow(clippy::too_many_arguments)]
+fn lower_tb_periodic_service_body<'a>(
+    id: FunctionId,
+    name: String,
+    owner: Option<TestbenchId>,
+    tb: &ComponentDecl,
+    h: &crate::ast::OnHandler,
+    ctx: &'a LowerCtx,
+    helpers: &'a helpers::HelperRegistry<'a>,
+    constraint_sites: &'a RefCell<Vec<ConstraintSite>>,
+) -> Result<TbFunction, LowerError> {
+    let mut body = h.body.clone();
+    crate::codegen::cpp_tb::rewrite_testbench_scope_body(&mut body, tb, &HashSet::new());
+    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    b.lower_block_stmts(&body)?;
+    if !b.is_terminated() {
+        b.terminate(Terminator::Return);
+    }
+    b.finish(id, name, FunctionKind::TestHook, owner)
 }
 
 /// Lower one `on regs.REG` per-register write callback body as a
