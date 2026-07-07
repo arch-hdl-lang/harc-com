@@ -1368,6 +1368,48 @@ fn emit_lifecycle_checkers(
     Ok(())
 }
 
+/// Register each testbench-scoped `on <N> cycles [phase post_eval]`
+/// periodic service (issue #485). The handler body was already emitted as
+/// a free zero-arg `[&]`-capturing lambda (via the `emit_test_hook` loop),
+/// so this only installs the registration closure: a per-cycle
+/// `_checkers` / `_post_eval_services` push that fires the lambda once
+/// every `period` primary-clock cycles, gated on a static last-fire stamp.
+/// Flow-scope analogue of a component's periodic `emit_lifecycle_checkers`
+/// registration; the period is a compile-time literal in this subset.
+fn emit_tb_periodic_services(
+    out: &mut String,
+    prog: &TbProgram,
+    tb: &ir::TestbenchSchema,
+    dut_type: &str,
+) -> Result<(), EmitError> {
+    for svc in &tb.periodic_services {
+        // Emit the body lambda HERE (not in the early test-hook loop) so
+        // it sees the composite scoreboard/component instances + method
+        // lambdas declared just above.
+        func::emit_test_hook(out, prog, prog.function(svc.function), dut_type, 1)?;
+        let lambda = &prog.function(svc.function).name;
+        let tag = format!("_tbper_{}", svc.function.0);
+        let period = svc.period;
+        let vec = svc.phase.service_vec();
+        writeln!(out, "{INDENT}{vec}.push_back([&]() {{").ok();
+        writeln!(out, "{INDENT}{INDENT}static int64_t {tag}_last = 0;").ok();
+        writeln!(
+            out,
+            "{INDENT}{INDENT}if ((int64_t)cycle_count - {tag}_last >= {period}) {{"
+        )
+        .ok();
+        writeln!(
+            out,
+            "{INDENT}{INDENT}{INDENT}{tag}_last = (int64_t)cycle_count;"
+        )
+        .ok();
+        writeln!(out, "{INDENT}{INDENT}{INDENT}{lambda}();").ok();
+        writeln!(out, "{INDENT}{INDENT}}}").ok();
+        writeln!(out, "{INDENT}}});").ok();
+    }
+    Ok(())
+}
+
 fn emit_test(
     out: &mut String,
     prog: &TbProgram,
@@ -1533,8 +1575,19 @@ fn emit_test(
     // fan-out) and the `record_write` dispatch see them. They capture the
     // shared `_tb` host struct + transactor-state structs + regblock
     // mirror by reference — the host-state-promotion mechanism.
+    // Testbench-scoped periodic-service bodies (issue #485) are ALSO
+    // `TestHook` functions, but they read composite scoreboard/component
+    // instances + their method lambdas, which are declared LATER (just
+    // before the run coroutine). Emitting them here would reference those
+    // symbols before declaration, so skip them — `emit_tb_periodic_services`
+    // emits their body + registration together, after the decls.
+    let tb_service_fns: HashSet<ir::FunctionId> =
+        tb.periodic_services.iter().map(|s| s.function).collect();
     for f in &prog.functions {
-        if matches!(f.kind, ir::FunctionKind::TestHook) && f.owner == Some(test.testbench) {
+        if matches!(f.kind, ir::FunctionKind::TestHook)
+            && f.owner == Some(test.testbench)
+            && !tb_service_fns.contains(&f.id)
+        {
             func::emit_test_hook(out, prog, f, dut_type, 1)?;
         }
     }
@@ -1665,6 +1718,14 @@ fn emit_test(
         // `emit_lifecycle_checkers`), so no actor registration is needed.
         emit_lifecycle_checkers(out, prog, cf.component, &cf.field)?;
     }
+
+    // Testbench-scoped `on <N> cycles [phase post_eval]` periodic services
+    // (issue #485). Each registers a `_checkers` / `_post_eval_services`
+    // closure that fires the handler's free lambda (already emitted with
+    // the method hooks above) once every `period` primary-clock cycles,
+    // gated on a per-service last-fire stamp — the flow-scope analogue of
+    // a component's `emit_lifecycle_checkers` periodic registration.
+    emit_tb_periodic_services(out, prog, tb, dut_type)?;
 
     writeln!(out, "{INDENT}harc_rt::ThreadSlot _run_slot;").ok();
     writeln!(out, "{INDENT}sched.slots.push_back(&_run_slot);").ok();
