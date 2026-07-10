@@ -108,12 +108,12 @@ run_sim() {
         # error, Verilator failure). The trace-diff in run_pair then
         # asserts the failure was recorded identically under both
         # codegens.
-        if [ "$rc" -eq 0 ] || echo "$out" | grep -q "ALL TESTS PASSED"; then
+        if [ "$rc" -eq 0 ] || [[ "$out" == *"ALL TESTS PASSED"* ]]; then
             echo "  FAIL  $tag (sim --codegen $cg passed, but registry expects fail)"
             echo "$out" | tail -20 | sed 's/^/      /'
             return 1
         fi
-        if ! echo "$out" | grep -q "TESTS FAILED"; then
+        if [[ "$out" != *"TESTS FAILED"* ]]; then
             echo "  FAIL  $tag (sim --codegen $cg broke before reaching a test verdict)"
             echo "$out" | tail -20 | sed 's/^/      /'
             return 1
@@ -121,7 +121,7 @@ run_sim() {
         return 0
     fi
 
-    if ! echo "$out" | grep -q "ALL TESTS PASSED"; then
+    if [[ "$out" != *"ALL TESTS PASSED"* ]]; then
         echo "  FAIL  $tag (sim --codegen $cg did not pass)"
         echo "$out" | tail -20 | sed 's/^/      /'
         return 1
