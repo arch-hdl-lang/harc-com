@@ -272,6 +272,64 @@ end impl Tst"#;
     assert!(msg.contains("read-only probe"), "{msg}");
 }
 
+/// harc-com#493: a bus type named by `use` that never resolved (here,
+/// unconditionally — `lower_src` skips `resolve_use_imports`, so every
+/// `use` is "unresolved" from lowering's point of view) must not fall
+/// through to the generic "let with a bind" rejection when a test binds
+/// against it. The diagnostic should name the missing type and point at
+/// the failed `use`, not tell the user to remove the bind.
+#[test]
+fn unresolved_use_bind_gets_targeted_diagnostic() {
+    let src = r#"use MissingBus
+
+testbench T
+end testbench T
+
+impl Tst for T
+    let dut : SomeDut
+    let axil : MissingBus = bind dut
+    run
+    end run
+end impl Tst"#;
+    let err = lower_src(src).expect_err("bind against an unresolved `use` type must be rejected");
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)),
+        "must be LowerError::Invalid, not Unsupported (the type isn't out-of-subset, \
+         it's missing): {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("MissingBus"), "must name the missing type: {msg}");
+    assert!(
+        msg.contains("use MissingBus"),
+        "must point at the failed `use`: {msg}"
+    );
+    assert!(
+        !msg.contains("with probes or a bind"),
+        "must not fall back to the generic misleading message: {msg}"
+    );
+}
+
+/// Sibling of the above: a `use` that never resolves but is also never
+/// bound against must keep parsing exactly as before (non-goal in
+/// harc-com#493) — existing fixtures with a dangling `use arc.stdlib.X`
+/// line must not gain a new error.
+#[test]
+fn unused_unresolved_use_does_not_error() {
+    let src = r#"use MissingBus
+
+testbench T
+end testbench T
+
+impl Tst for T
+    let dut : SomeDut
+    run
+        let x : uint<8> = 1
+        assert x == 1 else fail("x")
+    end run
+end impl Tst"#;
+    lower_src(src).expect("an unused, never-resolved `use` must not error");
+}
+
 // ── Emitted-C++ snapshots — the emission surface for the original
 //    five fixtures of the equivalence matrix
 //    (tests/tbir_equiv_fixtures.txt). Full files,
