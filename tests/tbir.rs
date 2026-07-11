@@ -172,6 +172,64 @@ end test T"#,
     );
 }
 
+/// harc#473: `-%` masks like `+%`/`*%`. A typed `z : uint<8>` minus a
+/// literal masks the two's-complement residue at 8 b, so `0 -% 1` emits
+/// `(z - 1) & 0xFF` (== 255 at runtime), not the un-wrapped `z - 1`.
+/// (`+%`/`*%` are covered above; this locks the subtraction path, which is
+/// otherwise only exercised at runtime by the fixture.)
+#[test]
+fn wrapping_sub_op_masks_to_operand_width() {
+    let cpp = emit_cpp_src(
+        r#"test T
+    let dut : Top
+    run
+        let z : uint<8> = 0
+        let d : uint<8> = z -% 1
+        assert d == 255 else fail("x")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("((z - 1)) & 0xFFULL"),
+        "expected 8-bit sub-wrap mask `(z - 1) & 0xFF`; got:\n{cpp}"
+    );
+}
+
+/// harc#473: a wrapping op nested inside another (`(a +% b) *% c`) masks at
+/// *each* level's own operand width, not just the outermost. The inner
+/// `a +% b` lowers to its own `& 0xFF` and the outer `*% c` wraps that
+/// masked value again — so two independent 8-bit masks appear. This locks
+/// the recursive `Binary` arm of `infer_wrap_operand_width`, which reports a
+/// nested wrap's result width as `max(W(lhs), W(rhs))`; a single-level
+/// fixture cannot catch a regression in that composition.
+#[test]
+fn wrapping_ops_nest_masks_at_each_level() {
+    let cpp = emit_cpp_src(
+        r#"test T
+    let dut : Top
+    run
+        let a : uint<8> = 200
+        let b : uint<8> = 100
+        let c : uint<8> = 3
+        let r : uint<8> = (a +% b) *% c
+        assert r == 132 else fail("x")
+    end run
+end test T"#,
+    );
+    // Inner add-wrap masks at 8 b ...
+    assert!(
+        cpp.contains("((a + b)) & 0xFFULL"),
+        "expected inner add-wrap mask `(a + b) & 0xFF`; got:\n{cpp}"
+    );
+    // ... and the outer mul-wrap masks the already-masked value again, so at
+    // least two 8-bit masks are present in the emitted assignment.
+    let masks = cpp.matches("& 0xFFULL").count();
+    assert!(
+        masks >= 2,
+        "expected both nested wraps to mask at 8 b (>=2 `& 0xFF`); found {masks} in:\n{cpp}"
+    );
+}
+
 /// Locks the dump-ir text for the tracer-bullet fixture: testbench /
 /// test schemas, block structure, port hoisting, loop shapes,
 /// interpolated format args.
