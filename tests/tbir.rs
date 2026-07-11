@@ -1707,6 +1707,101 @@ end test NestedBadLeafTest
     assert!(msg.contains("non-scalar"), "names the reason: {msg}");
 }
 
+/// A self-referential by-value struct (`Node { next : Node }`) is
+/// STRUCTURALLY INVALID in every backend — the generated C++ struct is
+/// infinitely sized, and v1 codegen stack-overflows on it. So it must be
+/// rejected as `LowerError::Invalid` (NOT `Unsupported`), and the message
+/// must NOT suggest `--codegen v1` (that path crashes). Regression guard
+/// for the diagnostic-routing fix.
+#[test]
+fn self_recursive_record_is_rejected_as_invalid_not_v1_suggestion() {
+    let src = r#"
+struct Node
+    next : Node
+    val  : uint<8>
+end struct Node
+
+test SelfCycleTest
+    let dut : Top
+    run
+        let n : Node
+    end run
+end test SelfCycleTest
+"#;
+    let err = lower_src(src).expect_err("self-recursive record must be rejected");
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)),
+        "must be Invalid, not Unsupported: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("--codegen v1"),
+        "cyclic-record error must NOT suggest --codegen v1 (v1 crashes): {msg}"
+    );
+    assert!(msg.contains("Node"), "names the cyclic record: {msg}");
+}
+
+/// Mutual recursion (`A { b : B }`, `B { a : A }`) is likewise a
+/// by-value cycle and rejected as `Invalid`.
+#[test]
+fn mutually_recursive_records_are_rejected_as_invalid() {
+    let src = r#"
+struct A
+    b : B
+end struct A
+
+struct B
+    a : A
+end struct B
+
+test MutualCycleTest
+    let dut : Top
+    run
+        let x : A
+    end run
+end test MutualCycleTest
+"#;
+    let err = lower_src(src).expect_err("mutually-recursive records must be rejected");
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)),
+        "must be Invalid: {err:?}"
+    );
+    assert!(
+        !err.to_string().contains("--codegen v1"),
+        "cyclic-record error must NOT suggest --codegen v1: {err}"
+    );
+}
+
+/// A DIAMOND (shared but acyclic) nesting — `Outer { a : Mid, b : Mid }`
+/// where `Mid` is reached twice but the graph has no cycle — must NOT be
+/// false-rejected by the cycle check. This locks the gray/black DFS's
+/// handling of a Black (already-finished) node on a second visit.
+#[test]
+fn diamond_shared_record_is_accepted() {
+    let src = r#"
+struct Mid
+    x : uint<8>
+end struct Mid
+
+struct Outer
+    a : Mid
+    b : Mid
+end struct Outer
+
+test DiamondTest
+    let dut : Top
+    run
+        let o : Outer
+        o.a.x = 3
+        o.b.x = 4
+        assert o.a.x == 3 else fail("diamond a lost")
+        assert o.b.x == 4 else fail("diamond b lost")
+    end run
+end test DiamondTest
+"#;
+    lower_src(src).expect("diamond (shared acyclic) record must lower cleanly");
+}
+
 /// A whole-`Vec` record-field READ in scalar position (here a format
 /// arg) must be REJECTED with a structured diagnostic — NOT lowered into
 /// `harc_printf_ll(r.data)`, which miscompiles as a raw clang error
