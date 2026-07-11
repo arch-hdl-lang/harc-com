@@ -1676,10 +1676,7 @@ end test ScalarRhsTest
         msg.contains("whole-`Vec` write of record field"),
         "names the write: {msg}"
     );
-    assert!(
-        msg.contains("non-matching RHS"),
-        "names the reason: {msg}"
-    );
+    assert!(msg.contains("non-matching RHS"), "names the reason: {msg}");
 }
 
 /// A whole-`Vec` field copy whose RHS field has a MISMATCHED shape
@@ -1708,10 +1705,7 @@ end test MismatchTest
 "#;
     let err = lower_src(src).expect_err("mismatched-shape whole-Vec copy must be rejected");
     let msg = assert_unsupported(&err);
-    assert!(
-        msg.contains("non-matching RHS"),
-        "names the reason: {msg}"
-    );
+    assert!(msg.contains("non-matching RHS"), "names the reason: {msg}");
 }
 
 /// The sanctioned whole-`Vec` field copy (`dst.data = src.data`, same
@@ -4238,6 +4232,266 @@ end impl DrvTest
         arg_is_local,
         "run_for call passes the record local by value:\n{run}"
     );
+}
+
+/// Issue #494: a file-scope helper parameter typed as a declared
+/// transaction/struct is a by-value record, not a DUT/module handle. The
+/// helper is CFG-inlined because record field access is outside the pure
+/// scalar-helper subset, but the parameter local must still be
+/// `IrType::Record` so `cmd.value` lowers through the existing
+/// `RecordField` path instead of the old "module type with a non-DUT
+/// argument" rejection.
+#[test]
+fn file_helper_record_typed_param_lowers() {
+    let src = r#"
+transaction Cmd
+    value : uint<8> default 0
+end transaction Cmd
+
+function get_value(cmd: Cmd) -> uint<8>
+    return cmd.value
+end function get_value
+
+testbench HelperRecordParamTb
+    dut : Top
+end testbench HelperRecordParamTb
+
+impl HelperRecordParamTest for HelperRecordParamTb
+    run
+        let cmd : Cmd
+        cmd.value = 7
+        let got = get_value(cmd)
+        assert got == 7
+            else fail("got ${got}, expected 7")
+    end run
+end impl HelperRecordParamTest
+"#;
+    let prog = lower_src(src).expect("record-typed file helper param lowers");
+    verify::verify_program(&prog).expect("verifies");
+
+    let run = prog.function(prog.tests[0].run);
+    assert!(
+        run.locals
+            .iter()
+            .any(|l| l.name.starts_with("cmd_") && matches!(l.ty, ir::IrType::Record(_))),
+        "inlined helper declares a record-typed cmd parameter local:\n{run}"
+    );
+    assert!(
+        format!("{run}").contains("%cmd_2.value"),
+        "inlined helper reads the record field:\n{run}"
+    );
+}
+
+/// Issue #494: the same record-vs-module classification must apply to
+/// testbench helper methods. A `function observe(cmd: Cmd)` declared on a
+/// testbench receives `cmd` by value and can read `cmd.value` when inlined
+/// into a bound `impl` body.
+#[test]
+fn testbench_method_record_typed_param_lowers() {
+    let src = r#"
+transaction Cmd
+    value : uint<8> default 0
+end transaction Cmd
+
+testbench TbRecordMethod
+    dut : Top
+
+    function observe(cmd: Cmd) -> uint<8>
+        return cmd.value
+    end function observe
+end testbench TbRecordMethod
+
+impl TbRecordMethodTest for TbRecordMethod
+    run
+        let cmd : Cmd
+        cmd.value = 9
+        let got = observe(cmd)
+        assert got == 9
+            else fail("got ${got}, expected 9")
+    end run
+end impl TbRecordMethodTest
+"#;
+    let prog = lower_src(src).expect("record-typed testbench method param lowers");
+    verify::verify_program(&prog).expect("verifies");
+
+    let run = prog.function(prog.tests[0].run);
+    assert!(
+        run.locals
+            .iter()
+            .any(|l| l.name.starts_with("cmd_") && matches!(l.ty, ir::IrType::Record(_))),
+        "inlined testbench method declares a record-typed cmd parameter local:\n{run}"
+    );
+    assert!(
+        format!("{run}").contains("%cmd_2.value"),
+        "inlined testbench method reads the record field:\n{run}"
+    );
+}
+
+/// Issue #494: scoreboard/component methods use their own parameter
+/// classifier. A method such as `sink.observe(cmd: Cmd)` must bind `cmd`
+/// as a by-value record so the body can read `cmd.value`.
+#[test]
+fn scoreboard_method_record_typed_param_lowers() {
+    let src = r#"
+transaction Cmd
+    value : uint<8> default 0
+end transaction Cmd
+
+scoreboard Sink
+    seen : uint<8> default 0
+
+    function observe(cmd: Cmd)
+        seen = cmd.value
+    end function observe
+end scoreboard Sink
+
+testbench ScoreboardRecordParamTb
+    dut : Top
+    sink : Sink
+end testbench ScoreboardRecordParamTb
+
+impl ScoreboardRecordParamTest for ScoreboardRecordParamTb
+    run
+        let cmd : Cmd
+        cmd.value = 11
+        sink.observe(cmd)
+        assert sink.seen == 11
+            else fail("seen ${sink.seen}, expected 11")
+    end run
+end impl ScoreboardRecordParamTest
+"#;
+    let prog = lower_src(src).expect("record-typed scoreboard method param lowers");
+    verify::verify_program(&prog).expect("verifies");
+
+    let method = prog
+        .components
+        .iter()
+        .find(|c| c.name == "Sink")
+        .and_then(|c| c.method("observe"))
+        .expect("Sink.observe");
+    let func = prog.function(method.function);
+    assert_eq!(
+        func.params.first().map(|p| &p.ty),
+        Some(&ir::IrType::Record(ir::RecordId(0))),
+        "scoreboard method param is record-typed:\n{func}"
+    );
+    assert!(
+        format!("{func}").contains("%cmd.value"),
+        "scoreboard method reads the record field:\n{func}"
+    );
+}
+
+/// Issue #494 follow-up: inlined file helpers can return a record by value.
+/// The return temp must be `RecordInit`-initialized, not assigned scalar `0`.
+#[test]
+fn file_helper_record_typed_param_record_return_lowers() {
+    let src = r#"
+transaction Cmd
+    value : uint<8> default 0
+end transaction Cmd
+
+function id_cmd(cmd: Cmd) -> Cmd
+    return cmd
+end function id_cmd
+
+testbench HelperRecordReturnTb
+    dut : Top
+end testbench HelperRecordReturnTb
+
+impl HelperRecordReturnTest for HelperRecordReturnTb
+    run
+        let cmd : Cmd
+        cmd.value = 13
+        let got : Cmd = id_cmd(cmd)
+        assert got.value == 13
+            else fail("got ${got.value}, expected 13")
+    end run
+end impl HelperRecordReturnTest
+"#;
+    let prog = lower_src(src).expect("record-returning file helper lowers");
+    verify::verify_program(&prog).expect("verifies");
+
+    let run = prog.function(prog.tests[0].run);
+    assert_no_record_zero_assign(run);
+    assert!(
+        run.blocks
+            .iter()
+            .flat_map(|b| &b.stmts)
+            .any(|s| matches!(s, ir::Stmt::RecordInit(_, ir::RecordId(0)))),
+        "record-return temp is default-initialized with RecordInit:\n{run}"
+    );
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("__t0 = Cmd{};") && !cpp.contains("__t0 = 0;"),
+        "record-return helper must default-initialize the record temp, not scalar-zero it:\n{cpp}"
+    );
+}
+
+/// Issue #494 follow-up: inlined testbench methods can also return a
+/// record by value without scalar-zero initializing the record temp.
+#[test]
+fn testbench_method_record_typed_param_record_return_lowers() {
+    let src = r#"
+transaction Cmd
+    value : uint<8> default 0
+end transaction Cmd
+
+testbench TbRecordReturn
+    dut : Top
+
+    function id_cmd(cmd: Cmd) -> Cmd
+        return cmd
+    end function id_cmd
+end testbench TbRecordReturn
+
+impl TbRecordReturnTest for TbRecordReturn
+    run
+        let cmd : Cmd
+        cmd.value = 17
+        let got : Cmd = id_cmd(cmd)
+        assert got.value == 17
+            else fail("got ${got.value}, expected 17")
+    end run
+end impl TbRecordReturnTest
+"#;
+    let prog = lower_src(src).expect("record-returning testbench method lowers");
+    verify::verify_program(&prog).expect("verifies");
+
+    let run = prog.function(prog.tests[0].run);
+    assert_no_record_zero_assign(run);
+    assert!(
+        run.blocks
+            .iter()
+            .flat_map(|b| &b.stmts)
+            .any(|s| matches!(s, ir::Stmt::RecordInit(_, ir::RecordId(0)))),
+        "record-return temp is default-initialized with RecordInit:\n{run}"
+    );
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("__t0 = Cmd{};") && !cpp.contains("__t0 = 0;"),
+        "record-return testbench method must default-initialize the record temp, not scalar-zero it:\n{cpp}"
+    );
+}
+
+fn assert_no_record_zero_assign(func: &ir::TbFunction) {
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            if let ir::Stmt::Assign(
+                local,
+                ir::Expr::Literal {
+                    value: 0,
+                    ty: ir::IrType::Unknown,
+                },
+            ) = stmt
+            {
+                assert!(
+                    !matches!(func.locals[local.index()].ty, ir::IrType::Record(_)),
+                    "record-typed local `{}` must not be scalar-zero initialized:\n{func}",
+                    func.locals[local.index()].name
+                );
+            }
+        }
+    }
 }
 
 /// ...and not inside lazily-evaluated log/fail messages either.
