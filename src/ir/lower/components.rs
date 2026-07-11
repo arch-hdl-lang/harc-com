@@ -56,6 +56,11 @@ pub(crate) fn scoreboard_is_component(c: &ComponentDecl) -> bool {
 ///     instead of a private DUT handle. This is the bound consumer BFM:
 ///     `emit drv.req(t)` fires the handler synchronously, which drives the
 ///     bound bus's wires on the test DUT.
+///   * passive helper / monitor — hookable methods in the always-on body
+///     plus a DUT handle, but no `when active` body, event pipe, or `on`
+///     handler. This is the reusable passive monitor shape: methods read
+///     DUT pins or update monitor state and exist on both active and passive
+///     instances.
 /// A `bound to` target responder (`thread bus.<m>(...)` bodies, no event
 /// field) is excluded — it stays on the separate TLM responder path.
 /// `env_held` is true when this transactor type is referenced as a
@@ -127,6 +132,12 @@ pub(crate) fn transactor_is_component(t: &TransactorDecl, env_held: bool) -> boo
     if transactor_is_function_library(t) {
         return true;
     }
+    // Passive helper / monitor: DUT handle + always-on hookables, with no
+    // active-only body to elide. This must lower as a component so a
+    // `testbench` can hold `mon : Monitor passive` and call `mon.observe()`.
+    if transactor_is_passive_helper(t) {
+        return true;
+    }
     // Purely structural DUT-poking BFM: `hookable` methods + a
     // module-typed DUT handle, no `on`/event/bound. The dedicated
     // `TransactorSchema` path lowers it as a top-level testbench field
@@ -187,6 +198,39 @@ pub(crate) fn transactor_is_dut_poking_bfm(t: &TransactorDecl, env_held: bool) -
     // Exactly the shape `transactor_is_component`'s trailing arm admits:
     // hookable BFM + DUT handle, no event/on/periodic, env-held.
     has_hookable && has_module_field && !has_event && !has_on_handler
+}
+
+/// True when a transactor is a DUT-attached passive helper/monitor:
+/// always-on methods + a DUT handle, but no `when active` items, event
+/// pipe, `on` handler, bound bus, or parameters. Since no method is
+/// active-only, passive instances keep the same callable surface as active
+/// instances.
+pub(crate) fn transactor_is_passive_helper(t: &TransactorDecl) -> bool {
+    if t.bound_to.is_some() || !t.params.is_empty() || t.when_active.is_some() {
+        return false;
+    }
+    let mut has_module_field = false;
+    let mut has_method = false;
+    for it in &t.items {
+        match it {
+            ComponentItem::Hookable(_) => has_method = true,
+            ComponentItem::Field(f) => {
+                if is_event_field(f) {
+                    return false;
+                }
+                if matches!(&f.ty, TypeExpr::Named { .. }) {
+                    has_module_field = true;
+                }
+            }
+            ComponentItem::OnHandler(_)
+            | ComponentItem::TargetTlmThread(_)
+            | ComponentItem::Watchdog(_)
+            | ComponentItem::Connect(_)
+            | ComponentItem::Lifecycle(..)
+            | ComponentItem::Apply(_) => return false,
+        }
+    }
+    has_module_field && has_method
 }
 
 /// True when a transactor is a *function library*: it carries at least one
@@ -428,6 +472,10 @@ pub(crate) fn lower_component_schema(
             ComponentItem::Hookable(h) => {
                 let n_params = h.params.len();
                 let has_ret = h.return_ty.is_some();
+                let ret_ty = h
+                    .return_ty
+                    .as_ref()
+                    .map(|t| method_schema_ir_type(Some(t), ids, record_ids));
                 let fid = FunctionId(*next_fn);
                 *next_fn += 1;
                 methods.push(ComponentMethodSchema {
@@ -435,7 +483,9 @@ pub(crate) fn lower_component_schema(
                     function: fid,
                     n_params,
                     has_ret,
+                    ret_ty,
                     hookable: h.is_hookable,
+                    cov_hook_subs: Vec::new(),
                 });
             }
             // Connect blocks are resolved separately (env-binding stage).
@@ -1146,6 +1196,7 @@ fn monitor_bus_port(channel: &str, signal: &str) -> crate::ir::PortRef {
             channel.to_string(),
             signal.to_string(),
         ],
+        aggregate_path: false,
         direction: None,
         width: None,
         access: crate::ir::PortAccess::Port,
@@ -1441,6 +1492,9 @@ fn method_param_ir_type(ty: Option<&TypeExpr>, ctx: &LowerCtx) -> IrType {
     // method calls on it dispatch through `ComponentBase::Local`.
     if let Some(TypeExpr::Named { name, .. }) = ty {
         let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+        if let Some(rid) = ctx.record_ids.get(simple) {
+            return IrType::Record(*rid);
+        }
         if let Some(cid) = ctx
             .components
             .iter()
@@ -1448,6 +1502,54 @@ fn method_param_ir_type(ty: Option<&TypeExpr>, ctx: &LowerCtx) -> IrType {
             .map(|i| ComponentId(i as u32))
         {
             return IrType::Component(cid);
+        }
+    }
+    helpers::ir_type_of(ty)
+}
+
+fn method_schema_ir_type(
+    ty: Option<&TypeExpr>,
+    ids: &HashMap<String, ComponentId>,
+    record_ids: &HashMap<String, RecordId>,
+) -> IrType {
+    if let Some(TypeExpr::Builtin {
+        name: BuiltinTy::TSeq,
+        args,
+        ..
+    }) = ty
+    {
+        let elem_name: Option<&str> = match args.first() {
+            Some(TypeArg::Type(TypeExpr::Named { name, .. })) => {
+                name.segments.last().map(|s| s.name.as_str())
+            }
+            Some(TypeArg::Expr(e)) => match &*e.kind {
+                ExprKind::Ident(id) => Some(id.name.as_str()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(simple) = elem_name {
+            if let Some(rid) = record_ids.get(simple) {
+                return IrType::RecordSeq(*rid);
+            }
+        }
+        if let Some(TypeArg::Type(inner)) = args.first() {
+            match helpers::ir_type_of(Some(inner)) {
+                ty @ (IrType::UInt(_) | IrType::SInt(_) | IrType::Bool) => {
+                    return IrType::Seq(Box::new(ty));
+                }
+                _ => {}
+            }
+        }
+        return IrType::Unknown;
+    }
+    if let Some(TypeExpr::Named { name, .. }) = ty {
+        let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+        if let Some(rid) = record_ids.get(simple) {
+            return IrType::Record(*rid);
+        }
+        if let Some(cid) = ids.get(simple) {
+            return IrType::Component(*cid);
         }
     }
     helpers::ir_type_of(ty)
@@ -2245,17 +2347,31 @@ impl super::FuncBuilder<'_> {
         if path.len() < 2 {
             return Ok(false);
         }
-        let Some(&head_cid) = self.ctx.component_fields.get(&path[0]) else {
-            return Ok(false);
-        };
-        let (recv, field) = path.split_at(path.len() - 1);
+        let (head_cid, recv_prefix, tail): (ComponentId, Vec<String>, &[String]) =
+            if let Some(&head_cid) = self.ctx.component_fields.get(&path[0]) {
+                (head_cid, vec![path[0].clone()], &path[1..])
+            } else if let Some(self_cid) = self.self_component {
+                let comp = &self.ctx.components[self_cid.index()];
+                match comp.field(&path[0]).map(|f| &f.kind) {
+                    Some(ComponentFieldKind::Sub { component }) => (
+                        *component,
+                        vec!["self".to_string(), path[0].clone()],
+                        &path[1..],
+                    ),
+                    _ => return Ok(false),
+                }
+            } else {
+                return Ok(false);
+            };
+        let (_recv, field) = path.split_at(path.len() - 1);
         let field = &field[0];
         // A path through a data-only scoreboard sub-component is not a
         // `Dut`-handle bind — let the scoreboard handlers claim it.
-        if self.recv_is_scoreboard_sub(head_cid, &recv[1..]) {
+        let recv_tail_len = tail.len().saturating_sub(1);
+        if self.recv_is_scoreboard_sub(head_cid, &tail[..recv_tail_len]) {
             return Ok(false);
         }
-        let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
+        let cid = self.resolve_component_recv(head_cid, &tail[..recv_tail_len])?;
         let comp = &self.ctx.components[cid.index()];
         if !matches!(
             comp.field(field).map(|f| &f.kind),
@@ -2273,7 +2389,12 @@ impl super::FuncBuilder<'_> {
                 &format!(
                     "binding event-driven transactor DUT handle `{}` to something other \
                      than the test DUT",
-                    path.join(".")
+                    recv_prefix
+                        .iter()
+                        .chain(tail.iter())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(".")
                 ),
                 "",
             ));
@@ -2304,21 +2425,23 @@ impl super::FuncBuilder<'_> {
         if let Some(path) = dotted_path(target) {
             let path = self.strip_tb_prefix(&path);
             if path.len() >= 2 {
-                if let Some(&head_cid) = self.ctx.component_fields.get(&path[0]) {
-                    let (recv, field) = path.split_at(path.len() - 1);
+                if let Some((head_cid, base_head, tail)) = self.component_path_head(&path) {
+                    let (recv_tail, field) = tail.split_at(tail.len() - 1);
                     let field = field[0].clone();
                     // A receiver ending in a data-only scoreboard sub
                     // (`top.sb.<scalar>`) is NOT a component-field write —
                     // fall through so the scoreboard scalar-write path
                     // (`scoreboard_root`) handles it.
-                    if self.recv_is_scoreboard_sub(head_cid, &recv[1..]) {
+                    if self.recv_is_scoreboard_sub(head_cid, recv_tail) {
                         return Ok(None);
                     }
-                    let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
+                    let cid = self.resolve_component_recv(head_cid, recv_tail)?;
                     let comp = &self.ctx.components[cid.index()];
                     match comp.field(&field).map(|f| &f.kind) {
                         Some(ComponentFieldKind::Scalar { .. }) => {
-                            return Ok(Some((ComponentBase::Path(recv.to_vec()), field)));
+                            let mut base = base_head;
+                            base.extend_from_slice(recv_tail);
+                            return Ok(Some((ComponentBase::Path(base), field)));
                         }
                         _ => {
                             return Err(unsupported(
@@ -2361,23 +2484,25 @@ impl super::FuncBuilder<'_> {
         if let Some(path) = dotted_path(e) {
             let path = self.strip_tb_prefix(&path);
             if path.len() >= 2 {
-                if let Some(&head_cid) = self.ctx.component_fields.get(&path[0]) {
-                    let (recv, field) = path.split_at(path.len() - 1);
+                if let Some((head_cid, base_head, tail)) = self.component_path_head(&path) {
+                    let (recv_tail, field) = tail.split_at(tail.len() - 1);
                     let field = field[0].clone();
                     // A receiver ending in a data-only scoreboard sub
                     // (`top.sb.<scalar>`) is a scoreboard read, not a
                     // component-field read — fall through to `scoreboard_root`.
-                    if self.recv_is_scoreboard_sub(head_cid, &recv[1..]) {
+                    if self.recv_is_scoreboard_sub(head_cid, recv_tail) {
                         return Ok(None);
                     }
-                    let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
+                    let cid = self.resolve_component_recv(head_cid, recv_tail)?;
                     let comp = &self.ctx.components[cid.index()];
                     if matches!(
                         comp.field(&field).map(|f| &f.kind),
                         Some(ComponentFieldKind::Scalar { .. })
                     ) {
+                        let mut base = base_head;
+                        base.extend_from_slice(recv_tail);
                         return Ok(Some(IrExpr::ComponentField {
-                            base: ComponentBase::Path(recv.to_vec()),
+                            base: ComponentBase::Path(base),
                             field,
                         }));
                     }
@@ -2484,6 +2609,28 @@ impl super::FuncBuilder<'_> {
             }
         }
         Ok(cid)
+    }
+
+    /// Resolve the first segment of a component path. Test-scope paths
+    /// (`env.mon.x`) are rooted at `env`; self-relative method paths
+    /// (`mon.x` inside `testbench Env`) are rooted at `self.mon`.
+    fn component_path_head<'a>(
+        &self,
+        path: &'a [String],
+    ) -> Option<(ComponentId, Vec<String>, &'a [String])> {
+        if let Some(&head_cid) = self.ctx.component_fields.get(&path[0]) {
+            return Some((head_cid, vec![path[0].clone()], &path[1..]));
+        }
+        let self_cid = self.self_component?;
+        let comp = &self.ctx.components[self_cid.index()];
+        match comp.field(&path[0]).map(|f| &f.kind) {
+            Some(ComponentFieldKind::Sub { component }) => Some((
+                *component,
+                vec!["self".to_string(), path[0].clone()],
+                &path[1..],
+            )),
+            _ => None,
+        }
     }
 
     /// Lower the args of a component method call (port-hoisted, like any

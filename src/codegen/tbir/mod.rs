@@ -137,6 +137,7 @@ pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<Stri
     for ci in component_emit_order(prog) {
         runtime::component_struct(
             &mut out,
+            prog,
             &prog.components[ci],
             &prog.components,
             &prog.scoreboards,
@@ -144,11 +145,6 @@ pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<Stri
         );
     }
 
-    // Covergroup structs (leaf observables — they never name a TB or
-    // DUT type), then one struct per unique non-synthetic testbench.
-    for cg in &prog.covgroups {
-        covergroup::covgroup_struct(&mut out, cg);
-    }
     // Lowered pure helpers — file-scope C++ functions. Declaration
     // order is source order, which is not necessarily topological for
     // helper-to-helper calls, so prototypes go first.
@@ -163,17 +159,17 @@ pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<Stri
     if !helpers.is_empty() {
         writeln!(out).ok();
     }
+    crate::codegen::cpp_tb::emit_extern_fn_decls(&mut out, file);
+    // Covergroup structs are leaf observables, but hook-triggered sampler
+    // bodies may call pure helpers or extern reference functions, so their
+    // forward declarations must be visible before the struct definition.
+    for cg in &prog.covgroups {
+        covergroup::covgroup_struct(&mut out, cg);
+    }
     for h in &helpers {
         func::emit_helper_function(&mut out, h)?;
         writeln!(out).ok();
     }
-
-    // File-scope `extern "C" { … }` forward declarations for every
-    // `extern function name(...) -> ret` (spec §9). Shared with v1 so
-    // both codegens emit byte-identical declarations; the call sites
-    // resolve to `CallTarget::ExternFn` (raw symbol name). Writes
-    // nothing when the program declares no extern fns.
-    crate::codegen::cpp_tb::emit_extern_fn_decls(&mut out, file);
 
     // One struct per unique testbench that needs a `_tb` host struct.
     // Non-synthetic testbenches always get one. A SYNTHETIC testbench
@@ -682,9 +678,7 @@ fn field_packed_width(ty: &ir::IrType, records: &[ir::RecordSchema]) -> Option<u
     match ty {
         ir::IrType::Bool => Some(1),
         ir::IrType::UInt(w) | ir::IrType::SInt(w) => w.map(|w| w as usize),
-        ir::IrType::Record(rid) => {
-            record_packed_width(records.get(rid.index())?, records)
-        }
+        ir::IrType::Record(rid) => record_packed_width(records.get(rid.index())?, records),
         _ => None,
     }
 }
@@ -1438,6 +1432,15 @@ fn emit_test(
     if needs_tb_struct(tb) {
         writeln!(out, "{INDENT}{} _tb;", tb.name).ok();
     }
+    // Transaction/struct-typed testbench fields are shared host state.
+    // Lowering gives every owning function a synthetic record local of
+    // this name for record-field resolution, while codegen declares the
+    // actual object once here so helper/run/check/hook bodies capture the
+    // same C++ record by reference.
+    for (field, rid) in &tb.record_fields {
+        let rec_ty = &prog.records[rid.index()].name;
+        writeln!(out, "{INDENT}{rec_ty} {field}{{}};").ok();
+    }
     // Closure-hook regblock mirrors: a binding with `on regs.REG` write
     // callbacks holds its mirror struct + recursion-depth counter as
     // SHARED test-scope state (declared once, captured by `[&]`), so the
@@ -1453,6 +1456,16 @@ fn emit_test(
         writeln!(out, "{INDENT}{mirror_ty} {}{{}};", b.field).ok();
         writeln!(out, "{INDENT}uint32_t {}_cb_depth = 0;", b.field).ok();
     }
+    // Composite-component test-scope instances (`let env : AnalysisEnv`,
+    // `sb : ScoreboardWithMethods`) are shared by the run coroutine,
+    // hook-triggered covergroup sampler registration, connect closures,
+    // and lifecycle services. Declare them before covergroup hook
+    // registration so a trigger like `@(sb.observe(t) post)` can push
+    // onto `sb._harc_cov_observe_post`.
+    for cf in &tb.component_fields {
+        let cname = &prog.components[cf.component.index()].name;
+        writeln!(out, "{INDENT}{cname} {};", cf.field).ok();
+    }
     // Hook-vector spine for hook-triggered covergroups
     // (`covergroup G @(drv.send(t) post)`). One
     // `std::vector<std::function<void(args)>> <Type>_<method>_pre/_post`
@@ -1467,7 +1480,7 @@ fn emit_test(
             if m.cov_hook_subs.is_empty() {
                 continue;
             }
-            covergroup::hook_vector_decls(out, prog, schema, m, INDENT)?;
+            covergroup::transactor_hook_vector_decls(out, prog, schema, m, INDENT)?;
         }
     }
     // Covergroup auto-sampler registration, in testbench-field
@@ -1511,21 +1524,52 @@ fn emit_test(
                     &opts.vec_lane_widths,
                 )?;
             }
-            ir::CovTrigger::Hook { method, side, .. } => {
+            ir::CovTrigger::Hook {
+                receiver_path,
+                method,
+                side,
+                ..
+            } => {
                 // Resolve the target method (the `covergroup_hooks` pass
                 // already validated it) to learn its param signature, then
                 // push the sample closure onto `<Type>_<method>_<side>`.
-                let (xschema, mschema) = tb
+                let [receiver] = receiver_path.as_slice() else {
+                    return Err(EmitError(format!(
+                        "tbir: hook-triggered covergroup `{}` has nested receiver path `{}`",
+                        schema.name,
+                        receiver_path.join(".")
+                    )));
+                };
+                let target = tb
                     .transactor_fields
                     .iter()
-                    .find_map(|(_f, xid)| {
+                    .find_map(|(field, xid)| {
+                        if field != receiver {
+                            return None;
+                        }
                         let xs = prog.transactor(*xid);
-                        xs.method(method).map(|m| (xs, m))
+                        xs.method(method)
+                            .map(|m| (format!("{}_{}", xs.name, m.name), m.function, m.n_params))
+                    })
+                    .or_else(|| {
+                        tb.component_fields.iter().find_map(|binding| {
+                            if binding.field != *receiver {
+                                return None;
+                            }
+                            let comp = &prog.components[binding.component.index()];
+                            comp.method(method).map(|m| {
+                                (
+                                    format!("{}._harc_cov_{}", binding.field, m.name),
+                                    m.function,
+                                    m.n_params,
+                                )
+                            })
+                        })
                     })
                     .ok_or_else(|| {
                         EmitError(format!(
                             "tbir: hook-triggered covergroup `{}` references method \
-                             `{method}` not found on any transactor field",
+                             `{receiver}.{method}` not found on any transactor/component field",
                             schema.name
                         ))
                     })?;
@@ -1533,8 +1577,9 @@ fn emit_test(
                     out,
                     prog,
                     schema,
-                    xschema,
-                    mschema,
+                    target.0,
+                    target.1,
+                    target.2,
                     *side,
                     &format!("_tb.{field}"),
                     &opts.vec_lane_widths,
@@ -1648,15 +1693,10 @@ fn emit_test(
             func::emit_component_watchdog(out, prog, comp, w, randomize_snippets, 1)?;
         }
     }
-    // Composite-component test-scope instances (`let env : AnalysisEnv`):
-    // a default-constructed run-scope local, then its env `connect`
-    // push_backs (`<env>.<src_path>.<event>.push_back([&](auto _t){
-    // <SinkComp>_<method>(<env>.<sink_path>, _t); })`). Declared at test
-    // scope (before the coroutine) so run and check share the instance —
-    // v1's `AnalysisEnv env;` placement.
+    // Composite-component connection and lifecycle setup for the instances
+    // declared above. Keep this after component method lambdas so connect
+    // closures can call `<SinkComp>_<method>(...)`.
     for cf in &tb.component_fields {
-        let cname = &prog.components[cf.component.index()].name;
-        writeln!(out, "{INDENT}{cname} {};", cf.field).ok();
         // The top component's own `connect` edges (an env's source→sink, or
         // an agent instantiated directly at test scope), plus any nested
         // sub-component's connects (an env holding an agent whose own
@@ -1763,7 +1803,11 @@ fn emit_test(
     }
     writeln!(out, "{INDENT}{INDENT}co_return;").ok();
     writeln!(out, "{INDENT}}};").ok();
-    writeln!(out, "{INDENT}_run_slot.thread = _run_slot_lambda(&_run_slot);").ok();
+    writeln!(
+        out,
+        "{INDENT}_run_slot.thread = _run_slot_lambda(&_run_slot);"
+    )
+    .ok();
 
     // Bootstrap (single-threaded) → spawn workers (`--mt` only) → drive
     // loop → shutdown workers. Ordering is load-bearing: per-actor

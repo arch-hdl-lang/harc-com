@@ -536,12 +536,31 @@ fn lower_ident(ctx: &mut LowerCtx<'_>, name: &str, span: Span) -> CTypedExpr {
             span,
         );
     }
-    // 3. Bare field of the target record?
+    // 3. File-scope integer constant?
+    if let Some(text) = ctx.elab.consts.get(name) {
+        match parse_int_literal(text) {
+            Some(value) => {
+                return CTypedExpr::new(
+                    CExprKind::BvLit { value },
+                    CType::uint(default_unsigned_width(value)),
+                    span,
+                );
+            }
+            None => {
+                ctx.record_error(LowerError::IntParseFailed {
+                    source: text.clone(),
+                    span,
+                });
+                return ctx.bottom(span, CExprKind::BvLit { value: 0 });
+            }
+        }
+    }
+    // 4. Bare field of the target record?
     let path = FieldPath::single(name);
     if let Some(info) = ctx.env.lookup(&path) {
         return CTypedExpr::new(CExprKind::FieldRef(path), info.ty.clone(), span);
     }
-    // 4. Unresolved.
+    // 5. Unresolved.
     ctx.record_error(LowerError::UnresolvedIdent {
         name: name.to_string(),
         span,

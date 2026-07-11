@@ -636,10 +636,16 @@ fn build_randomize_emitter(file: &SourceFile, opts: &EmitOpts) -> Emitter {
     let mut enums: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut enum_variants: std::collections::HashMap<String, i64> =
         std::collections::HashMap::new();
+    let mut consts: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut relations: std::collections::HashMap<String, RelationDecl> =
         std::collections::HashMap::new();
     for it in &file.items {
         match it {
+            Item::Const(c) => {
+                if let ExprKind::Int(text) = &*c.value.kind {
+                    consts.insert(c.name.name.clone(), text.clone());
+                }
+            }
             Item::Enum(e) => {
                 enums.insert(e.name.name.clone(), e.variants.len());
                 enum_domains.insert(
@@ -712,6 +718,7 @@ fn build_randomize_emitter(file: &SourceFile, opts: &EmitOpts) -> Emitter {
         field_subs: std::collections::HashMap::new(),
         enums,
         enum_variants,
+        consts,
         properties: std::collections::HashMap::new(),
         prop_subs: std::collections::HashMap::new(),
         event_types: std::collections::HashMap::new(),
@@ -974,6 +981,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // signed values fit naturally; the solver widens at use site.
     let mut enum_variants: std::collections::HashMap<String, i64> =
         std::collections::HashMap::new();
+    let mut consts: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     // Relation declarations indexed by name (spec §4.2). At constraint-
     // emit time, any `Call(Ident(R), args)` whose name is in this map
     // is inlined: the formal parameters substitute into R's body and
@@ -983,8 +991,16 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     let mut relations: std::collections::HashMap<String, RelationDecl> =
         std::collections::HashMap::new();
     for it in &file.items {
-        if let Item::Relation(r) = it {
-            relations.insert(r.name.name.clone(), r.clone());
+        match it {
+            Item::Const(c) => {
+                if let ExprKind::Int(text) = &*c.value.kind {
+                    consts.insert(c.name.name.clone(), text.clone());
+                }
+            }
+            Item::Relation(r) => {
+                relations.insert(r.name.name.clone(), r.clone());
+            }
+            _ => {}
         }
     }
     for it in &file.items {
@@ -1143,6 +1159,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         record_fields,
         enums,
         enum_variants,
+        consts,
         properties,
         prop_subs: std::collections::HashMap::new(),
         event_types: std::collections::HashMap::new(),
@@ -2433,7 +2450,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
 
         writeln!(e.out, "{INDENT}{INDENT}co_return;").ok();
         writeln!(e.out, "{INDENT}}};").ok();
-        writeln!(e.out, "{INDENT}_run_slot.thread = _run_slot_lambda(&_run_slot);").ok();
+        writeln!(
+            e.out,
+            "{INDENT}_run_slot.thread = _run_slot_lambda(&_run_slot);"
+        )
+        .ok();
         writeln!(e.out, "").ok();
 
         // `actor_threads` is populated only when `--mt` is set (cooperative
@@ -4280,6 +4301,37 @@ fn unsigned_max_words(width: u32) -> Vec<u32> {
     words
 }
 
+fn solver_unsigned_mask_expr(width: u32) -> String {
+    let words = unsigned_max_words(width);
+    if words.len() <= 2 {
+        let lo = words.first().copied().unwrap_or(0) as u64;
+        let hi = words.get(1).copied().unwrap_or(0) as u64;
+        format!("(uint64_t)0x{:016x}ULL", lo | (hi << 32))
+    } else if words.len() <= 4 {
+        let mut terms = Vec::new();
+        for (idx, word) in words.iter().enumerate() {
+            if *word != 0 {
+                terms.push(format!("((_harc_u128)0x{word:08x}ULL << {})", idx * 32));
+            }
+        }
+        if terms.is_empty() {
+            "(_harc_u128)0".to_string()
+        } else {
+            format!("({})", terms.join(" | "))
+        }
+    } else {
+        format!(
+            "harc_rt::HarcWide<{}>({{{}}})",
+            words.len(),
+            words
+                .iter()
+                .map(|w| format!("0x{w:08x}u"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
 fn signed_min_words(width: u32) -> Vec<u32> {
     let mut words = vec![0u32; (width as usize).div_ceil(32).max(1)];
     let sign_bit = width.saturating_sub(1);
@@ -5036,6 +5088,9 @@ struct Emitter {
     /// constraint translator to resolve bare references to enum
     /// variants (e.g. `keep op != WRAP`) into their numeric encoding.
     enum_variants: std::collections::HashMap<String, i64>,
+    /// File-scope integer constants. Randomize constraints may reference
+    /// these by source name; emission lowers them to literal Z3 values.
+    consts: std::collections::HashMap<String, String>,
     /// Property name → body expression. Populated up-front from
     /// `Item::Property` declarations so `assert property NAME` can be
     /// resolved at the call site without a separate pass.
@@ -6323,7 +6378,11 @@ impl Emitter {
                     self.pad(depth);
                     writeln!(self.out, "}};").ok();
                     self.pad(depth);
-                    writeln!(self.out, "{slot_var}.thread = {slot_var}_lambda(&{slot_var});").ok();
+                    writeln!(
+                        self.out,
+                        "{slot_var}.thread = {slot_var}_lambda(&{slot_var});"
+                    )
+                    .ok();
                 } else {
                     sync_handlers.push(h);
                 }
@@ -6818,7 +6877,11 @@ impl Emitter {
             self.pad(depth);
             writeln!(self.out, "}};").ok();
             self.pad(depth);
-            writeln!(self.out, "{slot_var}.thread = {slot_var}_lambda(&{slot_var});").ok();
+            writeln!(
+                self.out,
+                "{slot_var}.thread = {slot_var}_lambda(&{slot_var});"
+            )
+            .ok();
         }
     }
 
@@ -7018,7 +7081,11 @@ impl Emitter {
         self.pad(depth);
         writeln!(self.out, "}};").ok();
         self.pad(depth);
-        writeln!(self.out, "{dispatcher_slot}.thread = {dispatcher_slot}_lambda(&{dispatcher_slot});").ok();
+        writeln!(
+            self.out,
+            "{dispatcher_slot}.thread = {dispatcher_slot}_lambda(&{dispatcher_slot});"
+        )
+        .ok();
 
         for lane in 0..tag_count {
             let lane_slot = format!("{prefix}_lane{lane}_slot");
@@ -7147,7 +7214,11 @@ impl Emitter {
             self.pad(depth);
             writeln!(self.out, "}};").ok();
             self.pad(depth);
-            writeln!(self.out, "{lane_slot}.thread = {lane_slot}_lambda(&{lane_slot});").ok();
+            writeln!(
+                self.out,
+                "{lane_slot}.thread = {lane_slot}_lambda(&{lane_slot});"
+            )
+            .ok();
         }
 
         if self.mt {
@@ -7253,7 +7324,11 @@ impl Emitter {
         self.pad(depth);
         writeln!(self.out, "}};").ok();
         self.pad(depth);
-        writeln!(self.out, "{arbiter_slot}.thread = {arbiter_slot}_lambda(&{arbiter_slot});").ok();
+        writeln!(
+            self.out,
+            "{arbiter_slot}.thread = {arbiter_slot}_lambda(&{arbiter_slot});"
+        )
+        .ok();
     }
 
     /// Phase 2b: if `comp` is a `bound to BusType` driver/agent with
@@ -7505,7 +7580,11 @@ impl Emitter {
         self.pad(depth);
         writeln!(self.out, "}};").ok();
         self.pad(depth);
-        writeln!(self.out, "{slot_var}.thread = {slot_var}_lambda(&{slot_var});").ok();
+        writeln!(
+            self.out,
+            "{slot_var}.thread = {slot_var}_lambda(&{slot_var});"
+        )
+        .ok();
 
         // Other on-handlers (on different events) still register
         // sync — they don't go through the actor's queue and may
@@ -12014,6 +12093,9 @@ impl Emitter {
     fn enum_variants_as_ints(&self, expr: &Expr) -> Expr {
         let span = expr.span;
         if let ExprKind::Ident(id) = &*expr.kind {
+            if let Some(text) = self.consts.get(&id.name) {
+                return Expr::new(ExprKind::Int(text.clone()), span);
+            }
             if let Some(idx) = self.enum_variants.get(&id.name).copied() {
                 return Expr::new(ExprKind::Int(idx.to_string()), span);
             }
@@ -13936,6 +14018,44 @@ impl Emitter {
         );
     }
 
+    fn emit_constraint_bit_slice_expr(
+        &mut self,
+        target: &Expr,
+        hi: usize,
+        lo: usize,
+        field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+        width: u32,
+        target_root: Option<&str>,
+        blocking: bool,
+        list_unroll_bounds: &std::collections::HashMap<String, usize>,
+    ) {
+        let slice_width = (hi - lo + 1) as u32;
+        let mask = solver_unsigned_mask_expr(slice_width);
+        write!(self.out, "(").ok();
+        if lo == 0 {
+            self.emit_constraint_expr_w(
+                target,
+                field_info,
+                width,
+                target_root,
+                blocking,
+                list_unroll_bounds,
+            );
+        } else {
+            write!(self.out, "z3::lshr(").ok();
+            self.emit_constraint_expr_w(
+                target,
+                field_info,
+                width,
+                target_root,
+                blocking,
+                list_unroll_bounds,
+            );
+            write!(self.out, ", _ctx.bv_val((uint64_t){lo}, {width}))").ok();
+        }
+        write!(self.out, " & harc_z3_bv_value(_ctx, {mask}, {width}))").ok();
+    }
+
     fn emit_constraint_expr_w(
         &mut self,
         e: &Expr,
@@ -13986,9 +14106,69 @@ impl Emitter {
                     write!(self.out, "_ctx.bool_val(true)").ok();
                     return;
                 }
+                if let Some(field) = expr_field_path(target, target_root) {
+                    if let Some(info) = field_info.get(&field) {
+                        if info.list.is_none() && info.width != 0 {
+                            let Some(i) = const_usize_expr(index) else {
+                                self.errors
+                                    .push("constraint bit-select index must be constant".into());
+                                write!(self.out, "_ctx.bool_val(true)").ok();
+                                return;
+                            };
+                            if i as u32 >= info.width {
+                                self.errors.push(format!(
+                                    "constraint bit-select index {i} out of range for field `{field}`"
+                                ));
+                                write!(self.out, "_ctx.bool_val(true)").ok();
+                                return;
+                            }
+                            self.emit_constraint_bit_slice_expr(
+                                target,
+                                i,
+                                i,
+                                field_info,
+                                width,
+                                target_root,
+                                blocking,
+                                list_unroll_bounds,
+                            );
+                            return;
+                        }
+                    }
+                }
                 self.errors
                     .push("constraint index expression not supported in v0 solver path".into());
                 write!(self.out, "_ctx.bool_val(true)").ok();
+            }
+            ExprKind::BitSlice { target, hi, lo } => {
+                let Some(hi) = const_usize_expr(hi) else {
+                    self.errors
+                        .push("constraint bit-slice high bound must be constant".into());
+                    write!(self.out, "_ctx.bool_val(true)").ok();
+                    return;
+                };
+                let Some(lo) = const_usize_expr(lo) else {
+                    self.errors
+                        .push("constraint bit-slice low bound must be constant".into());
+                    write!(self.out, "_ctx.bool_val(true)").ok();
+                    return;
+                };
+                if hi < lo {
+                    self.errors
+                        .push("constraint bit-slice high bound must be >= low bound".into());
+                    write!(self.out, "_ctx.bool_val(true)").ok();
+                    return;
+                }
+                self.emit_constraint_bit_slice_expr(
+                    target,
+                    hi,
+                    lo,
+                    field_info,
+                    width,
+                    target_root,
+                    blocking,
+                    list_unroll_bounds,
+                );
             }
             // `t.<name>` → _z_<name>. Strip the `t.` prefix.
             ExprKind::Field { .. } => {
@@ -14070,6 +14250,24 @@ impl Emitter {
                         write!(self.out, "_ctx.bool_val(true)").ok();
                     } else {
                         write!(self.out, "_z_{}", c_ident(&id.name)).ok();
+                    }
+                } else if let Some(text) = self.consts.get(&id.name).cloned() {
+                    if width <= 64 {
+                        write!(
+                            self.out,
+                            "_ctx.bv_val((uint64_t){}, {})",
+                            c_int_literal(&text),
+                            width
+                        )
+                        .ok();
+                    } else {
+                        write!(
+                            self.out,
+                            "harc_z3_bv_value(_ctx, {}, {})",
+                            c_int_literal(&text),
+                            width
+                        )
+                        .ok();
                     }
                 } else if let Some(idx) = self.enum_variants.get(&id.name).copied() {
                     if width <= 64 {
@@ -18265,6 +18463,8 @@ pub(crate) fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
         // Classify testbench fields.
         let mut dut_field: Option<ComponentField> = None;
         let mut field_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut field_types: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         let mut field_is_pointer: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         for ci in &tb.items {
@@ -18272,6 +18472,7 @@ pub(crate) fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
                 field_names.insert(f.name.name.clone());
                 if let TypeExpr::Named { name, .. } = &f.ty {
                     let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+                    field_types.insert(f.name.name.clone(), simple.to_string());
                     let is_harc = components.contains_key(simple)
                         || transactors.contains_key(simple)
                         || scoreboards.contains(simple)
@@ -18335,9 +18536,20 @@ pub(crate) fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
         let mut shadow: std::collections::HashSet<String> = std::collections::HashSet::new();
         shadow.insert("dut".into());
         shadow.insert("_tb".into());
+        let mut regblock_bindings: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for ti in &t.items {
             if let TestItem::Let(l) = ti {
                 shadow.insert(l.name.name.clone());
+                if l.bind {
+                    if let Some(TypeExpr::Named { name, .. }) = l.ty.as_ref() {
+                        if let Some(simple) = name.segments.last().map(|s| s.name.as_str()) {
+                            if regblocks.contains(simple) {
+                                regblock_bindings.insert(l.name.name.clone());
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -18356,6 +18568,9 @@ pub(crate) fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
                     &method_names,
                     &field_is_pointer,
                     &shadow,
+                    &field_types,
+                    &transactors,
+                    &regblock_bindings,
                 ),
                 TestItem::Scope(sc) => {
                     if let Some(b) = sc.run.as_mut() {
@@ -18365,6 +18580,9 @@ pub(crate) fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
                             &method_names,
                             &field_is_pointer,
                             &shadow,
+                            &field_types,
+                            &transactors,
+                            &regblock_bindings,
                         );
                     }
                     if let Some(b) = sc.setup.as_mut() {
@@ -18374,6 +18592,9 @@ pub(crate) fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
                             &method_names,
                             &field_is_pointer,
                             &shadow,
+                            &field_types,
+                            &transactors,
+                            &regblock_bindings,
                         );
                     }
                     if let Some(b) = sc.check.as_mut() {
@@ -18383,6 +18604,9 @@ pub(crate) fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
                             &method_names,
                             &field_is_pointer,
                             &shadow,
+                            &field_types,
+                            &transactors,
+                            &regblock_bindings,
                         );
                     }
                     if let Some(b) = sc.teardown.as_mut() {
@@ -18392,6 +18616,9 @@ pub(crate) fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
                             &method_names,
                             &field_is_pointer,
                             &shadow,
+                            &field_types,
+                            &transactors,
+                            &regblock_bindings,
                         );
                     }
                 }
@@ -18402,19 +18629,49 @@ pub(crate) fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
                         &method_names,
                         &field_is_pointer,
                         &shadow,
+                        &field_types,
+                        &transactors,
+                        &regblock_bindings,
                     );
                 }
                 _ => {}
             }
         }
         if let Some(b) = tb_lifecycle.setup.as_mut() {
-            rewrite_block_for_impl(b, &field_names, &method_names, &field_is_pointer, &shadow);
+            rewrite_block_for_impl(
+                b,
+                &field_names,
+                &method_names,
+                &field_is_pointer,
+                &shadow,
+                &field_types,
+                &transactors,
+                &regblock_bindings,
+            );
         }
         if let Some(b) = tb_lifecycle.check.as_mut() {
-            rewrite_block_for_impl(b, &field_names, &method_names, &field_is_pointer, &shadow);
+            rewrite_block_for_impl(
+                b,
+                &field_names,
+                &method_names,
+                &field_is_pointer,
+                &shadow,
+                &field_types,
+                &transactors,
+                &regblock_bindings,
+            );
         }
         if let Some(b) = tb_lifecycle.teardown.as_mut() {
-            rewrite_block_for_impl(b, &field_names, &method_names, &field_is_pointer, &shadow);
+            rewrite_block_for_impl(
+                b,
+                &field_names,
+                &method_names,
+                &field_is_pointer,
+                &shadow,
+                &field_types,
+                &transactors,
+                &regblock_bindings,
+            );
         }
 
         // Prepend synthesized lets. Order: `let dut : Top` (so the
@@ -18628,8 +18885,20 @@ fn rewrite_block_for_impl(
     methods: &std::collections::HashSet<String>,
     pointers: &std::collections::HashSet<String>,
     shadow: &std::collections::HashSet<String>,
+    field_types: &std::collections::HashMap<String, String>,
+    transactors: &std::collections::HashMap<String, TransactorDecl>,
+    regblock_bindings: &std::collections::HashSet<String>,
 ) {
-    rewrite_stmts_for_impl(&mut b.stmts, fields, methods, pointers, shadow);
+    rewrite_stmts_for_impl(
+        &mut b.stmts,
+        fields,
+        methods,
+        pointers,
+        shadow,
+        field_types,
+        transactors,
+        regblock_bindings,
+    );
 }
 
 /// Rewrite a testbench-scoped body (an `on ... end on` handler body or a
@@ -18665,7 +18934,19 @@ pub(crate) fn rewrite_testbench_scope_body(
     // The `pointers` set only affected a legacy DUT-deref path that the
     // expr rewriter no longer consults; pass an empty set.
     let pointers = std::collections::HashSet::new();
-    rewrite_block_for_impl(body, &fields, &methods, &pointers, &shadow);
+    let field_types = std::collections::HashMap::new();
+    let transactors = std::collections::HashMap::new();
+    let regblock_bindings = std::collections::HashSet::new();
+    rewrite_block_for_impl(
+        body,
+        &fields,
+        &methods,
+        &pointers,
+        &shadow,
+        &field_types,
+        &transactors,
+        &regblock_bindings,
+    );
 }
 
 /// Statement-list variant of `rewrite_block_for_impl`. Both the
@@ -18680,9 +18961,21 @@ fn rewrite_stmts_for_impl(
     methods: &std::collections::HashSet<String>,
     pointers: &std::collections::HashSet<String>,
     shadow: &std::collections::HashSet<String>,
+    field_types: &std::collections::HashMap<String, String>,
+    transactors: &std::collections::HashMap<String, TransactorDecl>,
+    regblock_bindings: &std::collections::HashSet<String>,
 ) {
     for s in stmts.iter_mut() {
-        rewrite_stmt_for_impl(s, fields, methods, pointers, shadow);
+        rewrite_stmt_for_impl(
+            s,
+            fields,
+            methods,
+            pointers,
+            shadow,
+            field_types,
+            transactors,
+            regblock_bindings,
+        );
     }
 }
 
@@ -18692,6 +18985,9 @@ fn rewrite_stmt_for_impl(
     methods: &std::collections::HashSet<String>,
     pointers: &std::collections::HashSet<String>,
     shadow: &std::collections::HashSet<String>,
+    field_types: &std::collections::HashMap<String, String>,
+    transactors: &std::collections::HashMap<String, TransactorDecl>,
+    regblock_bindings: &std::collections::HashSet<String>,
 ) {
     match &mut s.kind {
         StmtKind::Let(l) => {
@@ -18706,51 +19002,165 @@ fn rewrite_stmt_for_impl(
         StmtKind::Expr(e) => rewrite_expr_for_impl(e, fields, methods, pointers, shadow),
         StmtKind::For(f) => {
             rewrite_expr_for_impl(&mut f.iter, fields, methods, pointers, shadow);
-            rewrite_block_for_impl(&mut f.body, fields, methods, pointers, shadow);
+            rewrite_block_for_impl(
+                &mut f.body,
+                fields,
+                methods,
+                pointers,
+                shadow,
+                field_types,
+                transactors,
+                regblock_bindings,
+            );
         }
         StmtKind::Repeat(r) => {
             rewrite_expr_for_impl(&mut r.count, fields, methods, pointers, shadow);
-            rewrite_block_for_impl(&mut r.body, fields, methods, pointers, shadow);
+            rewrite_block_for_impl(
+                &mut r.body,
+                fields,
+                methods,
+                pointers,
+                shadow,
+                field_types,
+                transactors,
+                regblock_bindings,
+            );
         }
-        StmtKind::Loop(b) => rewrite_block_for_impl(b, fields, methods, pointers, shadow),
+        StmtKind::Loop(b) => rewrite_block_for_impl(
+            b,
+            fields,
+            methods,
+            pointers,
+            shadow,
+            field_types,
+            transactors,
+            regblock_bindings,
+        ),
         StmtKind::While { cond, body, .. } => {
             rewrite_expr_for_impl(cond, fields, methods, pointers, shadow);
-            rewrite_block_for_impl(body, fields, methods, pointers, shadow);
+            rewrite_block_for_impl(
+                body,
+                fields,
+                methods,
+                pointers,
+                shadow,
+                field_types,
+                transactors,
+                regblock_bindings,
+            );
         }
         StmtKind::If(ifs) => {
             rewrite_expr_for_impl(&mut ifs.cond, fields, methods, pointers, shadow);
-            rewrite_block_for_impl(&mut ifs.then_block, fields, methods, pointers, shadow);
+            rewrite_block_for_impl(
+                &mut ifs.then_block,
+                fields,
+                methods,
+                pointers,
+                shadow,
+                field_types,
+                transactors,
+                regblock_bindings,
+            );
             for (c, b) in ifs.elsifs.iter_mut() {
                 rewrite_expr_for_impl(c, fields, methods, pointers, shadow);
-                rewrite_block_for_impl(b, fields, methods, pointers, shadow);
+                rewrite_block_for_impl(
+                    b,
+                    fields,
+                    methods,
+                    pointers,
+                    shadow,
+                    field_types,
+                    transactors,
+                    regblock_bindings,
+                );
             }
             if let Some(b) = ifs.else_block.as_mut() {
-                rewrite_block_for_impl(b, fields, methods, pointers, shadow);
+                rewrite_block_for_impl(
+                    b,
+                    fields,
+                    methods,
+                    pointers,
+                    shadow,
+                    field_types,
+                    transactors,
+                    regblock_bindings,
+                );
             }
         }
         StmtKind::Fork(fk) => {
             for b in fk.branches.iter_mut() {
-                rewrite_block_for_impl(b, fields, methods, pointers, shadow);
+                rewrite_block_for_impl(
+                    b,
+                    fields,
+                    methods,
+                    pointers,
+                    shadow,
+                    field_types,
+                    transactors,
+                    regblock_bindings,
+                );
             }
         }
         StmtKind::Parallel(blocks) | StmtKind::Schedule(blocks) => {
             for b in blocks.iter_mut() {
-                rewrite_block_for_impl(b, fields, methods, pointers, shadow);
+                rewrite_block_for_impl(
+                    b,
+                    fields,
+                    methods,
+                    pointers,
+                    shadow,
+                    field_types,
+                    transactors,
+                    regblock_bindings,
+                );
             }
         }
         StmtKind::Select(arms) => {
             for a in arms.iter_mut() {
                 rewrite_expr_for_impl(&mut a.event, fields, methods, pointers, shadow);
-                rewrite_block_for_impl(&mut a.action, fields, methods, pointers, shadow);
+                rewrite_block_for_impl(
+                    &mut a.action,
+                    fields,
+                    methods,
+                    pointers,
+                    shadow,
+                    field_types,
+                    transactors,
+                    regblock_bindings,
+                );
             }
         }
         StmtKind::On(h) => {
+            let mut body_shadow = shadow.clone();
+            if let Some(params) =
+                impl_on_handler_param_names(h, field_types, transactors, regblock_bindings)
+            {
+                body_shadow.extend(params);
+            }
             rewrite_expr_for_impl(&mut h.event, fields, methods, pointers, shadow);
-            rewrite_block_for_impl(&mut h.body, fields, methods, pointers, shadow);
+            rewrite_block_for_impl(
+                &mut h.body,
+                fields,
+                methods,
+                pointers,
+                &body_shadow,
+                field_types,
+                transactors,
+                regblock_bindings,
+            );
         }
         StmtKind::After { duration, body, .. } => {
             rewrite_expr_for_impl(duration, fields, methods, pointers, shadow);
-            rewrite_block_for_impl(body, fields, methods, pointers, shadow);
+            rewrite_block_for_impl(
+                body,
+                fields,
+                methods,
+                pointers,
+                shadow,
+                field_types,
+                transactors,
+                regblock_bindings,
+            );
         }
         StmtKind::Wait { duration, .. } => {
             rewrite_expr_for_impl(duration, fields, methods, pointers, shadow);
@@ -18838,6 +19248,71 @@ fn rewrite_stmt_for_impl(
         | StmtKind::Break { .. }
         | StmtKind::Continue { .. } => {}
     }
+}
+
+fn impl_on_handler_param_names(
+    h: &OnHandler,
+    field_types: &std::collections::HashMap<String, String>,
+    transactors: &std::collections::HashMap<String, TransactorDecl>,
+    regblock_bindings: &std::collections::HashSet<String>,
+) -> Option<Vec<String>> {
+    if h.hook.is_some() {
+        let ExprKind::Field {
+            target,
+            name: method,
+        } = &*h.event.kind
+        else {
+            return None;
+        };
+        let field = match &*target.kind {
+            ExprKind::Ident(id) => id.name.as_str(),
+            ExprKind::Field { target, name } => {
+                let ExprKind::Ident(root) = &*target.kind else {
+                    return None;
+                };
+                if root.name != "_tb" {
+                    return None;
+                }
+                name.name.as_str()
+            }
+            _ => return None,
+        };
+        let transactor_ty = field_types.get(field)?;
+        let transactor = transactors.get(transactor_ty)?;
+        let method_decl = transactor
+            .items
+            .iter()
+            .chain(transactor.when_active.iter().flatten())
+            .find_map(|item| match item {
+                ComponentItem::Hookable(m) if m.name.name == method.name => Some(m),
+                _ => None,
+            })?;
+        return Some(
+            method_decl
+                .params
+                .iter()
+                .map(|p| p.name.name.clone())
+                .collect(),
+        );
+    }
+
+    // Per-register RAL callbacks (`on regs.REG`) see an implicit scalar
+    // parameter named `data`. Match the lowering collector's resolved
+    // subset by requiring the root ident to be a known test-scope
+    // regblock binding; ordinary cycle triggers like `on dut.ready`
+    // must not suppress testbench-field rewriting for a field named
+    // `data`.
+    if !h.periodic {
+        if let ExprKind::Field { target, .. } = &*h.event.kind {
+            if let ExprKind::Ident(binding) = &*target.kind {
+                if !regblock_bindings.contains(&binding.name) {
+                    return None;
+                }
+                return Some(vec!["data".to_string()]);
+            }
+        }
+    }
+    None
 }
 
 fn rewrite_expr_for_impl(

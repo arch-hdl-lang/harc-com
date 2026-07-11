@@ -223,9 +223,9 @@ impl FuncBuilder<'_> {
         for (p, e) in decl.params.iter().zip(&arg_exprs) {
             if is_dut_ident(self, e) {
                 bound.push(Bound::Dut);
-            } else if is_named_record_ty(p.ty.as_ref(), &self.ctx.record_ids) {
-                bound.push(Bound::Val(self.lower_expr_no_ports(e)?));
-            } else if matches!(p.ty, Some(TypeExpr::Named { .. })) {
+            } else if matches!(p.ty, Some(TypeExpr::Named { .. }))
+                && !matches!(ir_type_of_param(p.ty.as_ref(), self.ctx), IrType::Record(_))
+            {
                 return Err(unsupported(
                     &format!(
                         "helper parameter `{}` of module type with a non-DUT argument",
@@ -257,6 +257,7 @@ impl FuncBuilder<'_> {
         }
         self.inline_frames.push(InlineFrame {
             name: name.to_string(),
+            is_testbench_method: false,
             dut_aliases,
             ret_dest: dest,
             ret_cont: cont,
@@ -267,10 +268,7 @@ impl FuncBuilder<'_> {
         for (p, b) in decl.params.iter().zip(bound) {
             if let Bound::Val(e) = b {
                 let id = self.declare(&p.name.name);
-                self.set_local_type(
-                    id,
-                    ir_type_of_with_records(p.ty.as_ref(), &self.ctx.record_ids),
-                );
+                self.set_local_type(id, ir_type_of_param(p.ty.as_ref(), self.ctx));
                 self.push(Stmt::Assign(id, e));
             }
         }
@@ -388,9 +386,9 @@ impl FuncBuilder<'_> {
         for (p, e) in decl.params.iter().zip(&arg_exprs) {
             if is_dut_ident(self, e) {
                 bound.push(Bound::Dut);
-            } else if is_named_record_ty(p.ty.as_ref(), &self.ctx.record_ids) {
-                bound.push(Bound::Val(self.lower_expr_no_ports(e)?));
-            } else if matches!(p.ty, Some(TypeExpr::Named { .. })) {
+            } else if matches!(p.ty, Some(TypeExpr::Named { .. }))
+                && !matches!(ir_type_of_param(p.ty.as_ref(), self.ctx), IrType::Record(_))
+            {
                 return Err(unsupported(
                     &format!(
                         "testbench method parameter `{}` of module type with a non-DUT argument",
@@ -420,6 +418,7 @@ impl FuncBuilder<'_> {
         }
         self.inline_frames.push(InlineFrame {
             name: frame_name,
+            is_testbench_method: true,
             dut_aliases,
             ret_dest: dest,
             ret_cont: cont,
@@ -430,10 +429,7 @@ impl FuncBuilder<'_> {
         for (p, b) in decl.params.iter().zip(bound) {
             if let Bound::Val(e) = b {
                 let id = self.declare(&p.name.name);
-                self.set_local_type(
-                    id,
-                    ir_type_of_with_records(p.ty.as_ref(), &self.ctx.record_ids),
-                );
+                self.set_local_type(id, ir_type_of_param(p.ty.as_ref(), self.ctx));
                 self.push(Stmt::Assign(id, e));
             }
         }
@@ -536,10 +532,9 @@ pub(crate) fn ir_type_of_with_records(
     ir_type_of(ty)
 }
 
-fn is_named_record_ty(ty: Option<&TypeExpr>, record_ids: &HashMap<String, RecordId>) -> bool {
-    matches!(ir_type_of_with_records(ty, record_ids), IrType::Record(_))
+fn ir_type_of_param(ty: Option<&TypeExpr>, ctx: &super::LowerCtx) -> IrType {
+    ir_type_of_with_records(ty, &ctx.record_ids)
 }
-
 // ── Conservative purity / call-graph scan ───────────────────────────
 
 struct Scan {

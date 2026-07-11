@@ -931,6 +931,7 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
             Some(i) => format!("CovHookParam({param}.{field}[{}])", expr_str(func, i)),
             None => format!("CovHookParam({param}.{field})"),
         },
+        Expr::CovHookArg { param } => format!("CovHookArg({param})"),
         Expr::SeqLen(l) => format!("SeqLen({})", local_str(func, *l)),
         Expr::SeqIndex { seq, index } => {
             format!(
@@ -996,6 +997,35 @@ fn cover_expr_str(e: &Expr) -> String {
                 WidthCastKind::Resize => "resize",
             };
             format!("{}.{k}<{width}>()", cover_expr_str(inner))
+        }
+        Expr::CovHookArg { param } => param.clone(),
+        Expr::CovHookParam {
+            param,
+            field,
+            index,
+        } => match index {
+            Some(i) => format!("{param}.{field}[{}]", cover_expr_str(i)),
+            None => format!("{param}.{field}"),
+        },
+        Expr::Call(target, args) => {
+            let t = match target {
+                CallTarget::Helper(n) => n.clone(),
+                CallTarget::ExternFn(n) => format!("extern:{n}"),
+                CallTarget::Builtin(n) => format!("builtin:{n}"),
+                CallTarget::TransactorMethod { bus_field, method } => {
+                    format!("{bus_field}.{method}")
+                }
+                CallTarget::TransactorSelfMethod { transactor, method } => {
+                    format!("self:{transactor}.{method}")
+                }
+                CallTarget::Tseq(n) => format!("tseq:{n}"),
+            };
+            let a = args
+                .iter()
+                .map(cover_expr_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{t}({a})")
         }
         other => format!("{other:?}"),
     }

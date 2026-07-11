@@ -731,11 +731,10 @@ fn emit_stmt(
         }
         Stmt::RecordInit(l, r) => {
             let name = &names[l.index()];
-            // A shared (callback-bearing) mirror is default-constructed
-            // once at test scope; re-initializing it on Run entry would be
-            // a redundant reset (and on any other entry, a state wipe), so
-            // skip the RecordInit for it.
-            if shared_mirror_names(prog, func).contains(name) {
+            // Shared test-scope records are default-constructed once by
+            // the enclosing test. Re-initializing them inside run/check/
+            // hook bodies would wipe persistent host state.
+            if shared_record_names(prog, func).contains(name) {
                 return Ok(());
             }
             let rec = records.get(r.index()).ok_or_else(|| {
@@ -1052,7 +1051,12 @@ fn emit_stmt(
             // instance under `cx.self_subst` (the `--mt` active-driver worker
             // coroutine has no `self` parameter). Byte-identical to the bare
             // `comp_base_cpp` when `self_subst` is `None` (every prior site).
-            writeln!(out, "{pad}{}.{field} = {e};", comp_base_cpp_subst_cx(cx, base)).ok();
+            writeln!(
+                out,
+                "{pad}{}.{field} = {e};",
+                comp_base_cpp_subst_cx(cx, base)
+            )
+            .ok();
         }
         // `emit observed(v)` inside a method body: fan the args out to
         // every subscriber registered on `self.<event>`, then bump the
@@ -1610,15 +1614,23 @@ fn emit_transactor_call(
 /// as default-constructed structs; the `RecordInit` at the source
 /// `let` site re-runs the field defaults (v1 declares at the let
 /// site, so loop iterations re-default-construct).
-/// Names of regblock mirror locals that are SHARED test-scope host state
-/// (their binding declares `on regs.REG` write callbacks). These are
-/// declared + default-constructed ONCE at test scope and captured by
-/// `[&]`, so every function that touches them (Run + callbacks) must
-/// reference that one cell by name — never re-declare or re-init it.
+/// Names of record locals that are SHARED test-scope host state. This
+/// includes transaction/struct-typed testbench fields plus regblock
+/// mirrors whose binding declares `on regs.REG` write callbacks. These
+/// are declared + default-constructed ONCE at test scope and captured by
+/// `[&]`, so every function that touches them must reference that one
+/// cell by name — never re-declare or re-init it.
 pub(super) fn shared_mirror_names(prog: &TbProgram, func: &TbFunction) -> HashSet<String> {
+    shared_record_names(prog, func)
+}
+
+pub(super) fn shared_record_names(prog: &TbProgram, func: &TbFunction) -> HashSet<String> {
     let mut out = HashSet::new();
     if let Some(o) = func.owner {
         if let Some(tb) = prog.testbenches.get(o.index()) {
+            for (field, _) in &tb.record_fields {
+                out.insert(field.clone());
+            }
             for b in &tb.regblock_bindings {
                 if !b.callbacks.is_empty() {
                     out.insert(b.field.clone());
@@ -1638,11 +1650,11 @@ fn declare_locals(
     depth: usize,
 ) -> Result<(), EmitError> {
     let pad = INDENT.repeat(depth);
-    let shared = shared_mirror_names(prog, func);
+    let shared = shared_record_names(prog, func);
     for (l, n) in func.locals.iter().zip(names).skip(skip) {
-        // A shared (callback-bearing) mirror is declared once at test
-        // scope; skip its per-function declaration so it resolves to the
-        // captured test-scope struct.
+        // Shared test-scope record state is declared once by the enclosing
+        // test; skip its per-function declaration so references resolve to
+        // the captured object.
         if shared.contains(n) {
             continue;
         }
@@ -1782,7 +1794,9 @@ pub(super) fn emit_method(
         .map(|(i, n)| match func.locals[i].ty {
             IrType::Record(r) => format!("{} {n}", prog.records[r.index()].name),
             IrType::RecordSeq(r) => format!("std::vector<{}> {n}", prog.records[r.index()].name),
-            IrType::Seq(ref scalar) => format!("std::vector<{}> {n}", super::local_scalar_cty(scalar)),
+            IrType::Seq(ref scalar) => {
+                format!("std::vector<{}> {n}", super::local_scalar_cty(scalar))
+            }
             ref ty => format!("{} {n}", super::local_scalar_cty(ty)),
         })
         .collect::<Vec<_>>()
@@ -1865,6 +1879,13 @@ pub(super) fn emit_method(
                 writeln!(out, "{pad3}while (!({cond})) tick();").ok();
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
+            Terminator::WaitTimePs(ps, b) => {
+                // Wall-clock settle inside a synchronous method body:
+                // v1 advances absolute simulation time inline, and these
+                // lambdas capture `now_ps` / `eval_clocks_until` by reference.
+                writeln!(out, "{pad3}eval_clocks_until(now_ps + {ps});").ok();
+                writeln!(out, "{pad3}__bb = {};", b.0).ok();
+            }
             Terminator::Return => {
                 // Post-hooks (`on <obj>.<method> post`) fire AFTER the
                 // body, before returning — with the same args (mirrors
@@ -1922,7 +1943,6 @@ pub(super) fn emit_method(
             }
             other @ (Terminator::WaitCycles(_, Some(_), _)
             | Terminator::WaitCyclesSync(_, _)
-            | Terminator::WaitTimePs(_, _)
             | Terminator::WaitUntilTimeout { .. }
             | Terminator::Fatal(_)) => {
                 // Lowering rejects these inside method bodies (or, for
@@ -1969,6 +1989,10 @@ pub(super) fn emit_component_method(
         comp,
         m.function,
         &lambda,
+        Some(ComponentHookCtx {
+            method_name: &m.name,
+            cov_hook_subs: &m.cov_hook_subs,
+        }),
         randomize_snippets,
         depth,
     )
@@ -1993,6 +2017,7 @@ pub(super) fn emit_component_on_handler(
         comp,
         oh.function,
         &lambda,
+        None,
         randomize_snippets,
         depth,
     )
@@ -2024,6 +2049,7 @@ pub(super) fn emit_component_periodic_handler(
         comp,
         ph.function,
         &lambda,
+        None,
         randomize_snippets,
         depth,
     )
@@ -2057,6 +2083,7 @@ pub(super) fn emit_component_cycle_handler(
         comp,
         ch.function,
         &lambda,
+        None,
         randomize_snippets,
         depth,
     )
@@ -2091,6 +2118,7 @@ pub(super) fn emit_component_watchdog(
         comp,
         w.function,
         &lambda,
+        None,
         randomize_snippets,
         depth,
     )
@@ -2132,12 +2160,18 @@ pub(super) fn clause_expr_cpp(
 
 /// Shared lambda emission for component methods and on-handlers: a free
 /// `<lambda>(<Comp>& self, args...)` loop-switch over the lowered CFG.
+struct ComponentHookCtx<'a> {
+    method_name: &'a str,
+    cov_hook_subs: &'a [(crate::ir::CovgroupId, crate::ast::HookSide)],
+}
+
 fn emit_component_fn_lambda(
     out: &mut String,
     prog: &TbProgram,
     comp: &crate::ir::ComponentSchema,
     function: crate::ir::FunctionId,
     lambda: &str,
+    hook_ctx: Option<ComponentHookCtx<'_>>,
     randomize_snippets: &[String],
     depth: usize,
 ) -> Result<(), EmitError> {
@@ -2191,6 +2225,26 @@ fn emit_component_fn_lambda(
     let params = params.join(", ");
     writeln!(out, "{pad}auto {lambda} = [&]({params}) -> {ret_ty} {{").ok();
     declare_locals(out, prog, func, &names, nparams, depth + 1)?;
+    let hook_args = names[..nparams].join(", ");
+    let has_pre_cov = hook_ctx.as_ref().is_some_and(|ctx| {
+        ctx.cov_hook_subs
+            .iter()
+            .any(|(_, s)| matches!(s, crate::ast::HookSide::Pre))
+    });
+    let has_post_cov = hook_ctx.as_ref().is_some_and(|ctx| {
+        ctx.cov_hook_subs
+            .iter()
+            .any(|(_, s)| matches!(s, crate::ast::HookSide::Post))
+    });
+    if has_pre_cov {
+        let ctx = hook_ctx.as_ref().expect("pre hook context present");
+        writeln!(
+            out,
+            "{pad1}for (auto& _h : self._harc_cov_{}_pre) _h({hook_args});",
+            ctx.method_name
+        )
+        .ok();
+    }
     writeln!(out, "{pad1}int __bb = {};", func.entry.0).ok();
     writeln!(out, "{pad1}while (true) {{").ok();
     writeln!(out, "{pad2}switch (__bb) {{").ok();
@@ -2228,11 +2282,34 @@ fn emit_component_fn_lambda(
                 writeln!(out, "{pad3}while (!({cond})) tick();").ok();
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
+            Terminator::WaitTimePs(ps, b) => {
+                // Same wall-clock settle support as transactor methods.
+                writeln!(out, "{pad3}eval_clocks_until(now_ps + {ps});").ok();
+                writeln!(out, "{pad3}__bb = {};", b.0).ok();
+            }
             Terminator::Return => match func.ret {
                 Some(r) => {
+                    if has_post_cov {
+                        let ctx = hook_ctx.as_ref().expect("post hook context present");
+                        writeln!(
+                            out,
+                            "{pad3}for (auto& _h : self._harc_cov_{}_post) _h({hook_args});",
+                            ctx.method_name
+                        )
+                        .ok();
+                    }
                     writeln!(out, "{pad3}return {};", names[r.index()]).ok();
                 }
                 None => {
+                    if has_post_cov {
+                        let ctx = hook_ctx.as_ref().expect("post hook context present");
+                        writeln!(
+                            out,
+                            "{pad3}for (auto& _h : self._harc_cov_{}_post) _h({hook_args});",
+                            ctx.method_name
+                        )
+                        .ok();
+                    }
                     writeln!(out, "{pad3}return;").ok();
                 }
             },
@@ -2263,7 +2340,6 @@ fn emit_component_fn_lambda(
             }
             other @ (Terminator::WaitCycles(_, Some(_), _)
             | Terminator::WaitCyclesSync(_, _)
-            | Terminator::WaitTimePs(_, _)
             | Terminator::WaitUntilTimeout { .. }
             | Terminator::Fatal(_)) => {
                 return Err(EmitError(format!(
@@ -2489,7 +2565,11 @@ pub(super) fn emit_target_actor(
         writeln!(out, "{pad1}}}").ok(); // while(true)
         writeln!(out, "{pad1}co_return;").ok();
         writeln!(out, "{pad}}};").ok();
-        writeln!(out, "{pad}{slot_var}.thread = {slot_var}_lambda(&{slot_var});").ok();
+        writeln!(
+            out,
+            "{pad}{slot_var}.thread = {slot_var}_lambda(&{slot_var});"
+        )
+        .ok();
     }
     Ok(())
 }
@@ -2636,10 +2716,8 @@ pub(super) fn emit_active_bound_driver_actor(
             dut_type: "",
             trace_component: inst_path,
         };
-        let payload_ty = crate::codegen::tbir::runtime::event_payload_cty(
-            &oh.arg_payload,
-            &prog.records,
-        );
+        let payload_ty =
+            crate::codegen::tbir::runtime::event_payload_cty(&oh.arg_payload, &prog.records);
         let queue_var = format!("_{inst_tag}_{}_q", oh.event);
         let slot_var = format!("_{inst_tag}_{}_drv_slot", oh.event);
         let sched_var = format!("_{inst_tag}_{}_drv_sched", oh.event);
@@ -2688,13 +2766,22 @@ pub(super) fn emit_active_bound_driver_actor(
         .ok();
         // Body as a coroutine loop-switch: param 0 (the txn) is declared
         // above, so skip it; waits/bus handshakes `co_await` the slot.
-        writeln!(out, "{pad2}{{ // {} (TB-IR active-driver loop-switch)", func.name).ok();
+        writeln!(
+            out,
+            "{pad2}{{ // {} (TB-IR active-driver loop-switch)",
+            func.name
+        )
+        .ok();
         emit_responder_loop_switch(out, prog, &cx, func, &names, 1, bindings, depth + 3)?;
         writeln!(out, "{pad2}}}").ok();
         writeln!(out, "{pad1}}}").ok(); // while(true)
         writeln!(out, "{pad1}co_return;").ok();
         writeln!(out, "{pad}}};").ok();
-        writeln!(out, "{pad}{slot_var}.thread = {slot_var}_lambda(&{slot_var});").ok();
+        writeln!(
+            out,
+            "{pad}{slot_var}.thread = {slot_var}_lambda(&{slot_var});"
+        )
+        .ok();
     }
     Ok(())
 }
@@ -2860,7 +2947,11 @@ fn emit_tagged_target_actors(
     writeln!(out, "{pad1}}}").ok();
     writeln!(out, "{pad1}co_return;").ok();
     writeln!(out, "{pad}}};").ok();
-    writeln!(out, "{pad}{dispatcher_slot}.thread = {dispatcher_slot}_lambda(&{dispatcher_slot});").ok();
+    writeln!(
+        out,
+        "{pad}{dispatcher_slot}.thread = {dispatcher_slot}_lambda(&{dispatcher_slot});"
+    )
+    .ok();
 
     // --- (4) Lane coroutines. ---
     let nparams = func.params.len();
@@ -2926,7 +3017,11 @@ fn emit_tagged_target_actors(
         writeln!(out, "{pad1}}}").ok();
         writeln!(out, "{pad1}co_return;").ok();
         writeln!(out, "{pad}}};").ok();
-        writeln!(out, "{pad}{lane_slot}.thread = {lane_slot}_lambda(&{lane_slot});").ok();
+        writeln!(
+            out,
+            "{pad}{lane_slot}.thread = {lane_slot}_lambda(&{lane_slot});"
+        )
+        .ok();
     }
 
     // --- (5) Arbiter coroutine. ---
@@ -2993,7 +3088,11 @@ fn emit_tagged_target_actors(
     writeln!(out, "{pad1}}}").ok();
     writeln!(out, "{pad1}co_return;").ok();
     writeln!(out, "{pad}}};").ok();
-    writeln!(out, "{pad}{arbiter_slot}.thread = {arbiter_slot}_lambda(&{arbiter_slot});").ok();
+    writeln!(
+        out,
+        "{pad}{arbiter_slot}.thread = {arbiter_slot}_lambda(&{arbiter_slot});"
+    )
+    .ok();
     Ok(())
 }
 
@@ -3152,6 +3251,12 @@ pub(super) fn emit_test_hook(
                 let cond = preds_cpp(&cx, preds, *mode)?;
                 writeln!(out, "{pad3}while (!({cond})) tick();").ok();
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
+            }
+            Terminator::WaitTimePs(ps, b) => {
+                // Same wall-clock settle support as the method lambdas that
+                // invoke hooks: closure hooks capture scheduler time by reference.
+                writeln!(out, "{pad3}eval_clocks_until(now_ps + {ps});").ok();
+                writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::Return => {
                 writeln!(out, "{pad3}return;").ok();

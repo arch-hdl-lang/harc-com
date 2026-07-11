@@ -509,7 +509,8 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
         | Expr::ComponentQueueQuery { .. }
         | Expr::SeqLen(_)
         | Expr::CovBin { .. }
-        | Expr::CovHookParam { .. } => {}
+        | Expr::CovHookParam { .. }
+        | Expr::CovHookArg { .. } => {}
     }
 }
 
@@ -699,6 +700,7 @@ mod tests {
         PortRef {
             testbench_field: "dut".to_string(),
             port_path: vec!["p".to_string()],
+            aggregate_path: false,
             direction: None,
             width: None,
             access,

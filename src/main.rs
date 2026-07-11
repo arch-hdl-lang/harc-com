@@ -208,6 +208,12 @@ enum Cmd {
         /// events such as logs, failures, and randomization results.
         #[arg(long)]
         record_trace: Option<PathBuf>,
+        /// Write non-lossy functional coverage JSONL from covergroup report()
+        /// calls. The text report remains unchanged; this sidecar includes
+        /// every coverpoint bin and every declared/auto cross bin without the
+        /// stdout missing-bin cap.
+        #[arg(long)]
+        coverage_json: Option<PathBuf>,
         /// Enable Verilator VCD/FST waveform dumping. Implies trace
         /// codegen in the emitted C++ TB and `--trace` /
         /// `--trace-fst` on the Verilator command. Default format is
@@ -500,6 +506,7 @@ fn main() -> Result<()> {
             z3_lib_dir,
             rebuild,
             record_trace,
+            coverage_json,
             waves,
             wave_format,
             wave_file,
@@ -532,6 +539,11 @@ fn main() -> Result<()> {
                     lib_dir: z3_lib_dir.clone(),
                 };
                 let codegen = effective_codegen(codegen);
+                if check_backends && coverage_json.is_some() {
+                    return Err(miette::miette!(
+                        "--coverage-json is not supported with --check-backends"
+                    ));
+                }
                 if check_backends {
                     cmd_sim_check_backends(
                         files.clone(),
@@ -575,6 +587,7 @@ fn main() -> Result<()> {
                         z3_opts,
                         rebuild,
                         record_trace.clone(),
+                        coverage_json.clone(),
                         wave_opts,
                         // Plain `--dut`/`--sv` path: the DUT `.arch` inputs are
                         // the interface source for port-override ingestion.
@@ -1531,6 +1544,7 @@ fn run_verilator(
     test: Option<&str>,
     rebuild: bool,
     record_trace: Option<&PathBuf>,
+    coverage_json: Option<&PathBuf>,
     waves: &WaveOpts,
     params: &[String],
 ) -> Result<()> {
@@ -1761,6 +1775,9 @@ fn run_verilator(
     if let Some(path) = record_trace {
         cmd.env("HARC_TRACE", path);
     }
+    if let Some(path) = coverage_json {
+        cmd.env("HARC_COVERAGE_JSONL", path);
+    }
     if let Some(s) = seed {
         cmd.env("HARC_SEED", s.to_string());
     }
@@ -1840,6 +1857,7 @@ fn cmd_sim(
     z3_opts: Z3PathOpts,
     rebuild: bool,
     record_trace: Option<PathBuf>,
+    coverage_json: Option<PathBuf>,
     waves: WaveOpts,
     // DUT `.arch`/`.archi` interface files used ONLY to ingest port-level bus
     // param overrides (`port s: target BusRw<WRITE=0>`) for `generate_if`-gate
@@ -1850,6 +1868,12 @@ fn cmd_sim(
     dut_iface: Vec<PathBuf>,
 ) -> Result<()> {
     validate_param_overrides(&params)?;
+
+    if coverage_json.is_some() && codegen != CodegenKind::Tbir {
+        return Err(miette::miette!(
+            "--coverage-json requires the default TB-IR codegen path"
+        ));
+    }
 
     if dut.is_empty() && sv.is_empty() {
         return Err(miette::miette!(
@@ -1899,7 +1923,7 @@ fn cmd_sim(
         }
     };
 
-    let uses_solver = harc::codegen::cpp_tb::uses_constraint_solver(&codegen_source);
+    let mut uses_solver = harc::codegen::cpp_tb::uses_constraint_solver(&codegen_source);
     let z3_paths = resolve_z3_paths(&z3_opts);
 
     let outdir = outdir.unwrap_or_else(|| PathBuf::from("harc_sim_build"));
@@ -1950,6 +1974,7 @@ fn cmd_sim(
                 CodegenKind::Tbir => {
                     let prog = harc::ir::lower::lower_program(&codegen_source)
                         .map_err(|e| miette::miette!("{}", e))?;
+                    uses_solver |= !prog.constraint_sites.is_empty();
                     harc::ir::verify::verify_program(&prog).map_err(|errs| {
                         let lines: Vec<String> = errs.iter().map(|e| format!("  - {e}")).collect();
                         miette::miette!(
@@ -1992,6 +2017,7 @@ fn cmd_sim(
                 CodegenKind::Tbir => {
                     let prog = harc::ir::lower::lower_program(&codegen_source)
                         .map_err(|e| miette::miette!("{}", e))?;
+                    uses_solver |= !prog.constraint_sites.is_empty();
                     harc::ir::verify::verify_program(&prog).map_err(|errs| {
                         let lines: Vec<String> = errs.iter().map(|e| format!("  - {e}")).collect();
                         miette::miette!(
@@ -2079,6 +2105,15 @@ fn cmd_sim(
         .as_ref()
         .map(|p| absolutize_trace_path(p))
         .transpose()?;
+    let coverage_json_abs = coverage_json
+        .as_ref()
+        .map(|p| absolutize_trace_path(p))
+        .transpose()?;
+    if let Some(path) = &coverage_json_abs {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).into_diagnostic()?;
+        }
+    }
 
     if !sv.is_empty() {
         if uses_solver {
@@ -2131,6 +2166,7 @@ fn cmd_sim(
             test.as_deref(),
             rebuild,
             trace_abs.as_ref(),
+            coverage_json_abs.as_ref(),
             &waves,
             &params,
         );
@@ -2211,6 +2247,9 @@ fn cmd_sim(
         .env("HARC_DUT_BACKEND", "arch");
     if let Some(path) = &trace_abs {
         cmd.env("HARC_TRACE", path);
+    }
+    if let Some(path) = &coverage_json_abs {
+        cmd.env("HARC_COVERAGE_JSONL", path);
     }
     if let Some(s) = seed {
         cmd.env("HARC_SEED", s.to_string());
@@ -2343,6 +2382,7 @@ fn cmd_sim_check_backends(
         z3_opts.clone(),
         rebuild,
         Some(arch_trace.clone()),
+        None,
         waves.clone(),
         dut.clone(),
     )?;
@@ -2370,6 +2410,7 @@ fn cmd_sim_check_backends(
         z3_opts.clone(),
         rebuild,
         Some(sv_trace.clone()),
+        None,
         waves.clone(),
         // SV backend run: `dut` is intentionally empty (selects Verilator), but
         // the DUT `.arch` interface still supplies the port-level override so

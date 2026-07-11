@@ -23,6 +23,7 @@ pub struct ConstraintElaboration {
     pub structs: Vec<TxnSchema>,
     pub transactions: Vec<TxnSchema>,
     pub relations: Vec<RelationSchema>,
+    pub consts: BTreeMap<String, String>,
     pub errors: Vec<ElaborationError>,
 }
 
@@ -279,6 +280,7 @@ pub enum ConstraintBinaryOp {
 pub fn elaborate_constraints(file: &SourceFile) -> ConstraintElaboration {
     let enum_domains = collect_enum_domains(file);
     let enum_variants = collect_enum_variants(&enum_domains);
+    let consts = collect_integer_consts(file);
     let record_bodies = collect_record_bodies(file);
     let record_fields = collect_record_fields(file);
     let mut structs = Vec::new();
@@ -369,6 +371,7 @@ pub fn elaborate_constraints(file: &SourceFile) -> ConstraintElaboration {
         &mut transactions,
         &mut relations,
         &enum_variants,
+        &consts,
         &mut errors,
     );
 
@@ -376,8 +379,20 @@ pub fn elaborate_constraints(file: &SourceFile) -> ConstraintElaboration {
         structs,
         transactions,
         relations,
+        consts,
         errors,
     }
+}
+
+fn collect_integer_consts(file: &SourceFile) -> BTreeMap<String, String> {
+    let mut consts = BTreeMap::new();
+    for item in &file.items {
+        let Item::Const(c) = item else { continue };
+        if let ExprKind::Int(text) = &*c.value.kind {
+            consts.insert(c.name.name.clone(), text.clone());
+        }
+    }
+    consts
 }
 
 fn collect_record_bodies(file: &SourceFile) -> BTreeMap<String, Vec<TxnBodyItem>> {
@@ -908,6 +923,7 @@ fn validate_constraint_refs(
     transactions: &mut [TxnSchema],
     relations: &mut [RelationSchema],
     enum_variants: &BTreeMap<String, EnumVariantSchema>,
+    consts: &BTreeMap<String, String>,
     errors: &mut Vec<ElaborationError>,
 ) {
     let record_index: BTreeMap<String, TxnSchema> = structs
@@ -924,6 +940,7 @@ fn validate_constraint_refs(
             records: &record_index,
             relation_names: &relation_names,
             enum_variants,
+            consts,
         };
         for keep in &mut record.keeps {
             validate_clause_refs(keep, &ctx, errors);
@@ -938,6 +955,7 @@ fn validate_constraint_refs(
             records: &record_index,
             relation_names: &relation_names,
             enum_variants,
+            consts,
         };
         for keep in &mut txn.keeps {
             validate_clause_refs(keep, &ctx, errors);
@@ -957,6 +975,7 @@ fn validate_constraint_refs(
             records: &record_index,
             relation_names: &relation_names,
             enum_variants,
+            consts,
         };
         match &mut relation.body {
             RelationBodySchema::Block(clauses) => {
@@ -988,6 +1007,7 @@ struct RefValidationCtx<'a> {
     records: &'a BTreeMap<String, TxnSchema>,
     relation_names: &'a [String],
     enum_variants: &'a BTreeMap<String, EnumVariantSchema>,
+    consts: &'a BTreeMap<String, String>,
 }
 
 fn validate_clause_refs(
@@ -1028,6 +1048,9 @@ fn collect_constraint_refs_with_locals(
                 return;
             }
             if ctx.params.contains_key(name) {
+                return;
+            }
+            if ctx.consts.contains_key(name) {
                 return;
             }
             if let Some(field) = ctx.transaction.and_then(|txn| find_txn_field(txn, name)) {

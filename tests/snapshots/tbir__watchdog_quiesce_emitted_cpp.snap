@@ -217,6 +217,7 @@ int run_WatchdogQuiesceTest(int argc, char** argv) {
 
     harc_rt::ThreadScheduler sched;
     WatchdogQuiesceTb _tb;
+    Producer prod;
     auto Producer_on_h0 = [&](Producer& self, TinyTxn t) -> void {
         int __bb = 0;
         while (true) {
@@ -243,7 +244,6 @@ int run_WatchdogQuiesceTest(int argc, char** argv) {
             }
         }
     };
-    Producer prod;
     prod.in_ev.push_back([&](auto _t) { prod._last_in_cycle = (uint64_t)cycle_count; Producer_on_h0(prod, _t); });
     _checkers.push_back([&]() {
         static int64_t _wdog_prod_1_last = 0;

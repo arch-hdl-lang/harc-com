@@ -801,10 +801,15 @@ pub struct ComponentMethodSchema {
     pub function: FunctionId,
     pub n_params: usize,
     pub has_ret: bool,
+    /// Declared return type after lowering, when present.
+    pub ret_ty: Option<IrType>,
     /// True for `hookable` (emits pre/post hook vectors + fan-out);
     /// false for `function` (no hooks). Mirrors v1's
     /// `HookableMethod::is_hookable`.
     pub hookable: bool,
+    /// Covergroup auto-samplers that subscribe to this component method's
+    /// pre/post hook boundary (`covergroup G @(sb.observe(t) post)`).
+    pub cov_hook_subs: Vec<(CovgroupId, crate::ast::HookSide)>,
 }
 
 /// One `on <event>(arg) ... end on` handler on an agent (or other
@@ -909,6 +914,11 @@ pub struct TestbenchSchema {
     /// `_tb` struct (v1's component-struct members), read via
     /// `Expr::TbField` and written via `Stmt::TbFieldWrite`.
     pub scalar_fields: Vec<TbScalarFieldSchema>,
+    /// Transaction/struct-typed testbench fields, in declaration order.
+    /// These are run/helper/check-shared host records declared once at
+    /// test scope and referenced as synthetic record locals in each
+    /// owning function.
+    pub record_fields: Vec<(String, RecordId)>,
     /// Test-scope bus bindings (`let <field> : <Bus> = bind dut`), in
     /// declaration order. Carried on the schema (like `cov_fields`)
     /// because `CallTarget::TransactorMethod { bus_field, .. }` call
@@ -1841,6 +1851,14 @@ pub enum Expr {
         field: String,
         index: Option<Box<Expr>>,
     },
+    /// Bare hook parameter sampled by a hook-triggered covergroup:
+    /// `covergroup G @(sb.check(t, cycle_seen) post)` may use
+    /// `cover cycle_seen` or pass `cycle_seen` into a pure helper call.
+    /// Like `CovHookParam`, this is schema-lowered before method params
+    /// have `LocalId`s, so it carries the closure parameter name.
+    CovHookArg {
+        param: String,
+    },
     /// `<seq>.size()` — element count of a `RecordSeq` local, used as the
     /// upper bound of a `for t in <seq>` loop. Lowers to `uint64_t`
     /// (emitted as `<seq>.size()`).
@@ -1984,6 +2002,10 @@ pub struct PortRef {
     pub testbench_field: String,
     /// Dotted path below the DUT field (`["count_out"]`).
     pub port_path: Vec<String>,
+    /// True when multi-segment paths are aggregate member accesses
+    /// (`dut->exc_cause.irq_int`) rather than flattened bus-style
+    /// signal names (`dut->axi_aw_valid`).
+    pub aggregate_path: bool,
     pub direction: Option<PortDirection>,
     pub width: Option<u32>,
     pub access: PortAccess,

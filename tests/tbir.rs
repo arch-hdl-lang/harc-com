@@ -356,7 +356,10 @@ end impl Tst"#;
          it's missing): {err:?}"
     );
     let msg = err.to_string();
-    assert!(msg.contains("MissingBus"), "must name the missing type: {msg}");
+    assert!(
+        msg.contains("MissingBus"),
+        "must name the missing type: {msg}"
+    );
     assert!(
         msg.contains("use MissingBus"),
         "must point at the failed `use`: {msg}"
@@ -1222,6 +1225,44 @@ end test RandNameCollisionTest
     assert!(
         !cpp.contains("_u_errors._u_errors"),
         "retargeting must not rewrite member names:\n{cpp}"
+    );
+}
+
+#[test]
+fn randomize_constraints_resolve_file_scope_integer_consts() {
+    let src = r#"
+const MAX_KIND : uint<4> = 6
+const MAX_ERR : uint<3> = 2
+
+transaction Choice
+    cls  : uint<4>
+    err  : uint<3>
+end transaction Choice
+
+test RandConstConstraintTest
+    let dut : Top
+    run
+        let c : Choice
+        randomize(c) with
+            c.cls <= MAX_KIND
+            c.err <= MAX_ERR
+        end randomize
+        assert c.cls <= MAX_KIND
+        assert c.err <= MAX_ERR
+    end run
+end test RandConstConstraintTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
+    assert!(
+        cpp.contains("z3::ule(_z_cls, _ctx.bv_val((uint64_t)6"),
+        "randomize constraint should lower MAX_KIND to a literal:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("z3::ule(_z_err, _ctx.bv_val((uint64_t)2"),
+        "randomize constraint should lower MAX_ERR to a literal:\n{cpp}"
     );
 }
 
@@ -2741,6 +2782,7 @@ fn verifier_catches_bad_successor_and_use_before_def() {
             ir::PortRef {
                 testbench_field: "dut".to_string(),
                 port_path: vec!["en".to_string()],
+                aggregate_path: false,
                 direction: None,
                 width: None,
                 access: ir::PortAccess::Port,
@@ -2770,6 +2812,7 @@ fn verifier_rejects_port_in_assign_value() {
         ir::Expr::Port(ir::PortRef {
             testbench_field: "dut".to_string(),
             port_path: vec!["count_out".to_string()],
+            aggregate_path: false,
             direction: None,
             width: None,
             access: ir::PortAccess::Port,
@@ -2921,6 +2964,61 @@ end impl CovTest
         .filter(|f| matches!(f.kind, ir::FunctionKind::SamplerAuto { .. }))
         .collect();
     assert_eq!(samplers.len(), 1);
+}
+
+/// Bin specs may use file-scope consts and enum variants anywhere a literal
+/// value is accepted. This keeps default TBIR aligned with v1's constexpr-style
+/// covergroup bin emission.
+#[test]
+fn covergroup_bin_specs_lower_const_and_enum_values() {
+    let src = r#"
+const IDLE : uint<4> = 0
+const BUSY : uint<4> = 3
+
+enum Mode { RED, GREEN, BLUE }
+
+covergroup Cov @(posedge dut.clk)
+    cp_mode : cover dut.mode
+        bins
+            idle = {IDLE}
+            mix = {GREEN, BUSY}
+            range = [IDLE..BLUE]
+        end bins
+end covergroup Cov
+
+testbench Tb
+    dut : Top
+    cov : Cov
+end testbench Tb
+
+impl CovTest for Tb
+    run
+        wait 1 cycle
+    end run
+end impl CovTest
+"#;
+    let prog = lower_src(src).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    use ir::CovBinValue::{Eq, Range};
+    let bins: Vec<(&str, &[ir::CovBinValue])> = prog.covgroups[0].points[0]
+        .bins
+        .iter()
+        .map(|b| (b.name.as_str(), b.values.as_slice()))
+        .collect();
+    assert_eq!(
+        bins,
+        vec![
+            ("idle", &[Eq(0)][..]),
+            ("mix", &[Eq(1), Eq(3)][..]),
+            (
+                "range",
+                &[Range {
+                    lo: Some(0),
+                    hi: Some(2)
+                }][..]
+            ),
+        ]
+    );
 }
 
 /// Range bin specs lower to inclusive `CovBinValue::Range` entries:
@@ -3256,8 +3354,11 @@ fn tbir_emit_covergroup_contract() {
         "} cp_empty;",
         "uint64_t _auto_cross_cp_empty__cp_full[2][2] = {};",
         "harc_rt::log::harc_print_covergroup_summary(\"FifoCov\", _hit, _total);",
+        "harc_rt::log::harc_cov_json_summary(\"FifoCov\", _hit, _total);",
         "harc_rt::log::harc_print_covergroup_bin(\"cp_full\", \"no\", cp_full.no);",
+        "harc_rt::log::harc_cov_json_bin(\"FifoCov\", \"cp_full\", \"no\", cp_full.no);",
         "harc_rt::log::harc_print_covergroup_cross_summary(\"FifoCov\", \"auto_cross\", \"cp_empty x cp_full\", _cross_hit, 4);",
+        "harc_rt::log::harc_cov_json_cross_summary(\"FifoCov\", \"auto_cross\", \"cp_empty x cp_full\", _cross_hit, 4);",
         "FifoCov cov;",
         "_checkers.push_back([&]() {",
         "uint64_t _v = (uint64_t)(harc_rt::harc_read(dut->empty));",
@@ -3268,6 +3369,205 @@ fn tbir_emit_covergroup_contract() {
     ] {
         assert!(cpp.contains(marker), "missing covergroup marker `{marker}`");
     }
+}
+
+/// Hook-triggered covergroups may classify sampled hook arguments through a
+/// pure helper. This pins the default-TBIR path for `cover f(t.field, cycle)`,
+/// where `cycle` is a bare scalar hook parameter rather than a record field.
+#[test]
+fn covergroup_hook_target_pure_helper_call_lowers() {
+    let src = r#"
+transaction Txn
+    latency : uint<2>
+end transaction Txn
+
+function obs_latency(latency: uint<2>, cycle_seen: uint<8>) -> uint<3>
+    if cycle_seen < 3
+        return 0
+    end if
+    if latency == 1
+        return 1
+    end if
+    return 2
+end function obs_latency
+
+scoreboard Sb
+    hookable observe(t: Txn, cycle_seen: uint<8>)
+    end observe
+end scoreboard Sb
+
+covergroup ObsCov @(sb.observe(t, cycle_seen) post)
+    cp_obs : cover obs_latency(t.latency, cycle_seen)
+        bins
+            short = {0}
+            medium = {1}
+            long = {2}
+        end bins
+end covergroup ObsCov
+
+testbench Tb
+    dut : Top
+    sb  : Sb
+    sb2 : Sb
+    cov : ObsCov
+end testbench Tb
+
+impl HookHelperCovTest for Tb
+    run
+        wait 1 cycle
+    end run
+end impl HookHelperCovTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let dump = format!("{prog}");
+    assert!(
+        dump.contains("point cp_obs <- obs_latency(t.latency, cycle_seen):"),
+        "coverpoint should preserve helper call over record and bare hook args: {dump}"
+    );
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
+    assert!(
+        cpp.contains("uint64_t harc_helper_obs_latency(")
+            && cpp.contains(
+                "uint64_t _v = (uint64_t)(harc_helper_obs_latency(t.latency, cycle_seen));"
+            ),
+        "hook coverpoint helper call should emit in the sampler body: {cpp}"
+    );
+    assert!(
+        cpp.contains("std::vector<std::function<void(Txn, uint64_t)>> _harc_cov_observe_post;")
+            && cpp
+                .contains("sb._harc_cov_observe_post.push_back([&](Txn t, uint64_t cycle_seen) {")
+            && cpp.contains("for (auto& _h : self._harc_cov_observe_post) _h(t, cycle_seen);"),
+        "component hook coverage should use per-instance vectors inside the component struct: {cpp}"
+    );
+    assert!(
+        !cpp.contains("Sb_observe_post") && !cpp.contains("sb2._harc_cov_observe_post.push_back"),
+        "component hook coverage must not use type-shared vectors or register against sb2: {cpp}"
+    );
+    assert_eq!(
+        cpp.matches("_harc_cov_observe_post.push_back").count(),
+        1,
+        "only the explicitly named receiver field should receive a sampler registration: {cpp}"
+    );
+    let sb_decl = cpp.find("Sb sb;").expect("component instance declaration");
+    let hook_registration = cpp
+        .find("sb._harc_cov_observe_post.push_back")
+        .expect("component hook sampler registration");
+    assert!(
+        sb_decl < hook_registration,
+        "component instance must be declared before hook sampler registration: {cpp}"
+    );
+}
+
+#[test]
+fn covergroup_hook_target_rejects_bare_record_arg() {
+    let src = r#"
+transaction Txn
+    latency : uint<2>
+end transaction Txn
+
+scoreboard Sb
+    hookable observe(t: Txn)
+    end observe
+end scoreboard Sb
+
+covergroup BadCov @(sb.observe(t) post)
+    cp_bad : cover t
+        bins
+            any = {0}
+        end bins
+end covergroup BadCov
+
+testbench Tb
+    dut : Top
+    sb  : Sb
+    cov : BadCov
+end testbench Tb
+
+impl BadBareRecordHookArg for Tb
+    run
+        wait 1 cycle
+    end run
+end impl BadBareRecordHookArg
+"#;
+    let err = lower_src(src).expect_err("bare record hook arg must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("hook target must be scalar") && msg.contains("record `Txn`"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn covergroup_hook_target_rejects_helper_record_arg_mismatch() {
+    let src = r#"
+transaction Txn
+    latency : uint<2>
+end transaction Txn
+
+function classify(v: uint<2>) -> uint<2>
+    return v
+end function classify
+
+scoreboard Sb
+    hookable observe(t: Txn)
+    end observe
+end scoreboard Sb
+
+covergroup BadCov @(sb.observe(t) post)
+    cp_bad : cover classify(t)
+        bins
+            any = {0}
+        end bins
+end covergroup BadCov
+
+testbench Tb
+    dut : Top
+    sb  : Sb
+    cov : BadCov
+end testbench Tb
+
+impl BadHelperRecordArg for Tb
+    run
+        wait 1 cycle
+    end run
+end impl BadHelperRecordArg
+"#;
+    let err = lower_src(src).expect_err("record helper arg must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("helper `classify` argument 1 expects uint<2>, got record `Txn`"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn covergroup_point_rejects_extern_arity_mismatch() {
+    let src = r#"
+extern function classify(v: uint<2>) -> uint<2>
+
+covergroup BadCov
+    cp_bad : cover classify(dut.value, dut.other)
+        bins
+            any = {0}
+        end bins
+end covergroup BadCov
+
+test BadExternArity
+    let dut : Top
+    let cov : BadCov
+    run
+        wait 1 cycle
+    end run
+end test BadExternArity
+"#;
+    let err = lower_src(src).expect_err("extern coverpoint arity mismatch must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("extern function `classify` takes 1 argument(s), call passes 2"),
+        "{msg}"
+    );
 }
 
 /// Locks the dump-ir text for the declared-cross + range-bin fixture
@@ -3304,6 +3604,8 @@ fn tbir_emit_declared_cross_contract() {
         "if (((_v >= 0 && _v <= 3))) { _tb.cov.cp_count.low++; _cg_hit_cp_count[0] = true; }",
         "if (((_v >= 10 && _v <= 14) || (_v == 15))) { _tb.cov.cp_count.high++; _cg_hit_cp_count[2] = true; }",
         "harc_rt::log::harc_print_covergroup_cross_summary(\"CountCov\", \"cross\", \"cp_count x cp_en\", _cross_hit, 6);",
+        "harc_rt::log::harc_cov_json_cross_summary(\"CountCov\", \"cross\", \"cp_count x cp_en\", _cross_hit, 6);",
+        "harc_rt::log::harc_cov_json_cross_bin(\"CountCov\", \"cross\", \"cp_count x cp_en\", \"cp_count.low x cp_en.en0\", _cross_2_cp_count__cp_en[0]);",
         "harc_rt::log::harc_print_covergroup_missing_bin(\"cp_count.low x cp_en.en0\")",
         "harc_rt::log::harc_print_covergroup_more_missing(_cross_missing, 16, \"cross\");",
         "if (_cg_hit_cp_count[_i0] && _cg_hit_cp_en[_i1]) {",
@@ -3491,6 +3793,37 @@ fn bus_send_recv_dump_ir_snapshot() {
         "recv must capture the first payload signal before the tick:\n{text}"
     );
     insta::assert_snapshot!("bus_send_recv_dump_ir", text);
+}
+
+/// Struct-shaped DUT ports lower through the same multi-segment
+/// `PortRef` path as bus bindings. This keeps default TB-IR usable for
+/// ARCH modules with packed struct ports such as `exc_cause.irq_int`,
+/// without falling back to the retired v1 backend.
+#[test]
+fn nested_dut_struct_port_paths_lower() {
+    let src = r#"
+testbench NestedDutPortTb
+    dut : IfStageLike
+end testbench NestedDutPortTb
+
+impl NestedDutPortTest for NestedDutPortTb
+    run
+        dut.exc_cause.irq_int = 1
+        dut.exc_cause.lower_cause = 11
+        let got = dut.exc_cause.irq_ext
+        assert got == 0 else fail("got ${got}")
+    end run
+end impl NestedDutPortTest
+"#;
+    let prog = lower_src(src).expect("lowers nested DUT port paths");
+    verify::verify_program(&prog).expect("verifies");
+    let text = format!("{prog}");
+    assert!(
+        text.contains("DutWrite(dut.exc_cause.irq_int, 1)")
+            && text.contains("DutWrite(dut.exc_cause.lower_cause, 11)")
+            && text.contains("DutRead(%got, dut.exc_cause.irq_ext)"),
+        "nested DUT struct paths should remain visible in IR:\n{text}"
+    );
 }
 
 /// Initiator-side fork/join_all TLM issue lowers to `TlmFork` request
@@ -4163,6 +4496,172 @@ end impl XtSiblingEmitTest
     );
 }
 
+#[test]
+fn method_wall_clock_wait_emits_inline_settle() {
+    let src = r#"
+domain D
+  freq_mhz: 100
+end domain D
+
+transactor Driver
+    dut : Top
+    when active
+        hookable settle()
+            dut.en = dut.en
+            wait 1ps
+        end settle
+    end when
+end transactor Driver
+
+sequencer ComponentDriver
+    hookable settle()
+        wait 1ps
+    end settle
+end sequencer ComponentDriver
+
+testbench Tb
+    dut : Top
+    drv : Driver active
+    comp : ComponentDriver
+
+    function settle_tb()
+        wait 1ps
+    end function settle_tb
+end testbench Tb
+
+impl MethodWaitTimeTest for Tb
+    on drv.settle pre
+        wait 1ps
+    end on
+
+    clock clk = D
+    run
+        drv.dut = dut
+        drv.settle()
+        comp.settle()
+        settle_tb()
+    end run
+end impl MethodWaitTimeTest
+"#;
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.matches("eval_clocks_until(now_ps + 1);").count() >= 4,
+        "transactor, component, testbench, and hook methods should emit wall-clock settle waits:\n{cpp}"
+    );
+}
+
+#[test]
+fn clockless_test_reaching_method_wall_clock_wait_emits_time_runtime() {
+    let src = r#"
+sequencer ComponentDriver
+    hookable settle()
+        wait 1ps
+    end settle
+end sequencer ComponentDriver
+
+test ClocklessMethodWaitTest
+    let dut : Top
+    let comp : ComponentDriver
+    run
+        log(info, "component method is emitted even when unused")
+    end run
+end test ClocklessMethodWaitTest
+"#;
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("long long now_ps = 0;"),
+        "clockless tests with wall waits should emit absolute time state:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("auto eval_clocks_until = [&](long long t_ps)"),
+        "clockless tests with wall waits should emit a time-advance helper:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("eval_clocks_until(now_ps + 1);"),
+        "method-local wall wait should advance clockless absolute time:\n{cpp}"
+    );
+}
+
+#[test]
+fn clockless_test_emitting_transactor_method_wall_clock_wait_emits_time_runtime() {
+    let src = r#"
+transactor Driver
+    dut : Top
+    when active
+        hookable settle()
+            wait 1ps
+        end settle
+    end when
+end transactor Driver
+
+testbench Tb
+    dut : Top
+    drv : Driver active
+end testbench Tb
+
+impl ClocklessTransactorMethodEmitTest for Tb
+    run
+        log(info, "transactor method is emitted even when unused")
+    end run
+end impl ClocklessTransactorMethodEmitTest
+"#;
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("long long now_ps = 0;"),
+        "clockless transactor method waits should emit absolute time state:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("auto eval_clocks_until = [&](long long t_ps)"),
+        "clockless transactor method waits should emit a time-advance helper:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("eval_clocks_until(now_ps + 1);"),
+        "transactor method wall wait should advance clockless absolute time:\n{cpp}"
+    );
+}
+
+#[test]
+fn clockless_test_emitting_test_hook_wall_clock_wait_emits_time_runtime() {
+    let src = r#"
+transactor Driver
+    dut : Top
+    when active
+        hookable settle()
+            dut.en = dut.en
+        end settle
+    end when
+end transactor Driver
+
+testbench Tb
+    dut : Top
+    drv : Driver active
+end testbench Tb
+
+impl ClocklessTestHookEmitTest for Tb
+    on drv.settle pre
+        wait 1ps
+    end on
+
+    run
+        log(info, "hook is emitted even when method is unused")
+    end run
+end impl ClocklessTestHookEmitTest
+"#;
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("long long now_ps = 0;"),
+        "clockless hook waits should emit absolute time state:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("auto eval_clocks_until = [&](long long t_ps)"),
+        "clockless hook waits should emit a time-advance helper:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("eval_clocks_until(now_ps + 1);"),
+        "test hook wall wait should advance clockless absolute time:\n{cpp}"
+    );
+}
+
 /// A sibling call with the wrong argument count is rejected at lowering
 /// (`check_transactor_self_call` mirrors the same check at verify time,
 /// but lowering fires first).
@@ -4728,6 +5227,56 @@ fn transactor_instance_mode_rules() {
     assert!(msg.contains("without an `active`/`passive` mode"), "{msg}");
 }
 
+#[test]
+fn passive_dut_monitor_helper_field_lowers() {
+    let src = r#"
+transaction SampleTxn
+    check : bool default true
+end transaction SampleTxn
+
+transactor Mon
+    dut : Top
+    samples : uint<32> default 0
+    last : uint<32> default 0
+
+    hookable observe()
+        samples = samples + 1
+        last = dut.count
+    end observe
+end transactor Mon
+
+testbench MonTb
+    dut : Top
+    mon : Mon passive
+
+    function sample(t: SampleTxn)
+        mon.dut = dut
+        mon.observe()
+        assert t.check else fail("record param field did not lower")
+        assert mon.last == dut.count else fail("monitor sampled wrong value")
+    end function sample
+end testbench MonTb
+
+impl MonTest for MonTb
+    run
+        let t : SampleTxn
+        sample(t)
+        assert mon.samples == 1 else fail("monitor did not sample")
+    end run
+end impl MonTest
+"#;
+    let prog = lower_src(src).expect("passive monitor helper lowers");
+    verify::verify_program(&prog).expect("verifies");
+    assert!(
+        prog.transactors.is_empty(),
+        "passive monitor helper routes through component lowering"
+    );
+    assert!(
+        prog.components.iter().any(|c| c.name == "Mon"),
+        "monitor component schema exists"
+    );
+}
+
 /// Unknown methods and arity mismatches are hard lowering errors —
 /// v1 deferred both to C++ compile failures.
 #[test]
@@ -4929,6 +5478,7 @@ end impl GatedSeqIdxTest
             index: Box::new(ir::Expr::Port(ir::PortRef {
                 testbench_field: "dut".to_string(),
                 port_path: vec!["b".to_string(), "idx".to_string()],
+                aggregate_path: false,
                 direction: None,
                 width: None,
                 access: ir::PortAccess::Port,
@@ -5787,6 +6337,298 @@ end test CheckPhaseBoolTest
     );
 }
 
+/// Transaction-typed testbench fields are shared host record state. Each
+/// lowered run/check/helper body sees a synthetic record local for normal
+/// `RecordFieldWrite`/`RecordField` lowering, but TBIR C++ declares the
+/// object once at test scope so helper calls mutate one persistent value.
+#[test]
+fn testbench_transaction_field_lowers_shared_record_state() {
+    let src = r#"
+transaction Txn
+    value : uint<8> default 0
+    data : Vec<uint<8>, 2>
+end transaction Txn
+
+testbench Tb
+    dut : Top
+    cur : Txn
+
+    function seed(v: uint<8>)
+        cur.value = v
+        cur.data[0] = v
+        cur.data[1] = v + 1
+    end seed
+
+    function bump()
+        _tb.cur.value = cur.value + 1
+        _tb.cur.data[1] = _tb.cur.data[1] + 1
+    end bump
+
+    function mirror(t: Txn) -> uint<8>
+        return t.data[1]
+    end mirror
+
+    function check_mirror()
+        assert mirror(cur) == 8 else fail("bare cur data=${cur.data[1]}")
+    end check_mirror
+end testbench Tb
+
+impl TbRecordFieldTest for Tb
+    run
+        seed(6)
+        bump()
+        assert _tb.cur.value == 7 else fail("value=${cur.value}")
+        assert mirror(_tb.cur) == 8 else fail("data=${_tb.cur.data[1]}")
+        check_mirror()
+    end run
+end impl TbRecordFieldTest
+"#;
+    let prog = lower_src(src).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let run = prog.function(prog.tests[0].run);
+    let body = run
+        .blocks
+        .iter()
+        .map(|b| format!("{b:?}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        body.contains("RecordInit") && body.contains("RecordFieldWrite"),
+        "shared testbench record field should use ordinary record IR:\n{body}"
+    );
+
+    let cpp = emit_cpp_src(src);
+    assert_eq!(
+        cpp.matches("Txn cur{};").count(),
+        1,
+        "record field should be declared once at test scope:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("cur.value = v;") && cpp.contains("cur.value = (cur.value + 1);"),
+        "helpers should mutate the shared record object:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("t = cur;") && cpp.contains("__t2 = t.data[1];"),
+        "whole-record and indexed Vec reads should resolve through the shared record:\n{cpp}"
+    );
+}
+
+#[test]
+fn free_helper_does_not_capture_testbench_record_field() {
+    let src = r#"
+transaction Txn
+    value : uint<8> default 0
+end transaction Txn
+
+function illegal_capture(dut: Top) -> uint<8>
+    return cur.value
+end function illegal_capture
+
+testbench Tb
+    dut : Top
+    cur : Txn
+end testbench Tb
+
+impl TbRecordFreeHelperFenceTest for Tb
+    run
+        assert illegal_capture(dut) == 0 else fail("unexpected capture")
+    end run
+end impl TbRecordFreeHelperFenceTest
+"#;
+    let err = lower_src(src).expect_err("free helper must not capture testbench record field");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("field access on a non-DUT value ending in `.value`"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn nested_free_helper_does_not_call_testbench_method_by_bare_name() {
+    let src = r#"
+transaction Txn
+    value : uint<8> default 0
+end transaction Txn
+
+function illegal_call(dut: Top)
+    seed()
+end function illegal_call
+
+testbench Tb
+    dut : Top
+    cur : Txn
+
+    function seed()
+        cur.value = 1
+    end seed
+
+    function call_helper()
+        illegal_call(dut)
+    end call_helper
+end testbench Tb
+
+impl TbNestedHelperFenceTest for Tb
+    run
+        call_helper()
+    end run
+end impl TbNestedHelperFenceTest
+"#;
+    let err = lower_src(src).expect_err("free helper must not see sibling testbench methods");
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("helper call `seed(...)`"), "{msg}");
+}
+
+#[test]
+fn testbench_scalar_field_lowers_bare_captured_state() {
+    let src = r#"
+testbench Tb
+    dut : Top
+    count : uint<32> default 0
+
+    function bump()
+        count = count + 1
+    end bump
+end testbench Tb
+
+impl TbScalarFieldTest for Tb
+    run
+        bump()
+        assert count == 1 else fail("count=${count}")
+    end run
+end impl TbScalarFieldTest
+"#;
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("_tb.count = (_tb.count + 1);") && cpp.contains("if (!((_tb.count == 1)))"),
+        "bare scalar testbench field should lower through _tb host state:\n{cpp}"
+    );
+}
+
+#[test]
+fn free_helper_does_not_capture_testbench_scalar_field() {
+    let src = r#"
+function illegal_scalar_capture(dut: Top) -> uint<32>
+    return count
+end function illegal_scalar_capture
+
+testbench Tb
+    dut : Top
+    count : uint<32> default 0
+end testbench Tb
+
+impl TbScalarFreeHelperFenceTest for Tb
+    run
+        assert illegal_scalar_capture(dut) == 0 else fail("unexpected capture")
+    end run
+end impl TbScalarFreeHelperFenceTest
+"#;
+    let err = lower_src(src).expect_err("free helper must not capture scalar testbench field");
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("unresolved name `count`"), "{msg}");
+}
+
+/// Shared record fields must not disturb hook/callback parameter local
+/// ordering. If a parameter has the same source name as the shared field,
+/// bare `cur`/`data` resolves to the parameter while explicit `_tb.cur` /
+/// `_tb.data` resolves to the shared test-scope record.
+#[test]
+fn testbench_transaction_field_preserves_hook_parameter_order() {
+    let src = r#"
+transaction Txn
+    value : uint<8> default 0
+end transaction Txn
+
+transactor Driver
+    dut : Top
+    when active
+        hookable observe(cur: Txn)
+            dut.en = cur.value
+        end observe
+    end when
+end transactor Driver
+
+testbench Tb
+    dut : Top
+    drv : Driver active
+    cur : Txn
+end testbench Tb
+
+impl TbRecordHookShadowTest for Tb
+    on drv.observe pre
+        _tb.cur.value = cur.value + 1
+    end on
+
+    run
+        drv.dut = dut
+        _tb.cur.value = 3
+        drv.observe(_tb.cur)
+    end run
+end impl TbRecordHookShadowTest
+"#;
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("Driver_observe_pre = [&](Txn cur_2) -> void"),
+        "hook parameter should remain first and be renamed away from shared cur:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("cur.value = (cur_2.value + 1);"),
+        "_tb.cur should resolve to the shared record while bare cur resolves to the hook param:\n{cpp}"
+    );
+}
+
+#[test]
+fn testbench_transaction_field_preserves_reg_callback_parameter_order() {
+    let src = r#"
+transaction Txn
+    value : uint<32> default 0
+end transaction Txn
+
+transactor H
+    dut : Top
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            dut.en = 1
+        end write
+        hookable read(addr: uint<8>) -> uint<32>
+            return addr
+        end read
+    end when
+end transactor H
+
+regblock R via H width 32
+    register A @ 0x10 access rw
+end regblock R
+
+testbench Tb
+    dut : Top
+    data : Txn
+end testbench Tb
+
+impl TbRecordRegCbShadowTest for Tb
+    let h : H active
+    let regs : R = bind h
+
+    on regs.A
+        _tb.data.value = data
+    end on
+
+    run
+        h.dut = dut
+        regs.record_write(0x10, 9)
+    end run
+end impl TbRecordRegCbShadowTest
+"#;
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("TbRecordRegCbShadowTest_regs_A_cb = [&](uint64_t data_2) -> void"),
+        "reg callback parameter should remain first and be renamed away from shared data:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("data.value = data_2;"),
+        "_tb.data should resolve to shared record while bare data resolves to callback param:\n{cpp}"
+    );
+}
+
 /// Width-method intrinsics (`.trunc/.zext/.sext/.resize`) with
 /// receiver widths from typed lets, casts, and chained methods.
 #[test]
@@ -5794,6 +6636,26 @@ fn width_methods_dump_ir_snapshot() {
     let prog = lower_src(&fixture("width_methods_test.harc")).expect("lowers");
     verify::verify_program(&prog).expect("verifies");
     insta::assert_snapshot!("width_methods_dump_ir", format!("{prog}"));
+}
+
+#[test]
+fn bit_not_masks_to_fixed_uint_width() {
+    let cpp = emit_cpp_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let v : uint<32> = 0xffffffff
+        let n = ~v
+        log(info, "${n:08x}")
+    end run
+end impl T"#,
+    );
+    assert!(
+        cpp.contains("~(v)") && cpp.contains("0xFFFFFFFFULL"),
+        "expected uint<32> bit-not to be masked to 32 bits; got:\n{cpp}",
+    );
 }
 
 // ── regblock construct (register-level frontdoor subset) ─────────────
@@ -6547,7 +7409,300 @@ end impl TbCycTest"#;
         "diagnostic must name the testbench on-handler kind, not the generic item: {msg}"
     );
 }
+/// A value-returning component method call can assign into an existing
+/// record-typed local (`t = sqr.make(...)`). The `let t : Txn = ...`
+/// shape was already lowered as `Stmt::ComponentCall { dest: Some(t) }`;
+/// this locks the assignment form used by reusable sequencer APIs.
+#[test]
+fn component_record_method_assignment_to_existing_local() {
+    let src = r#"
+transaction Txn
+    value : uint<8> default 0
+end transaction Txn
 
+sequencer TxnSource
+    hookable make(v: uint<8>) -> Txn
+        let t : Txn
+        t.value = v
+        return t
+    end make
+end sequencer TxnSource
+
+testbench Tb
+    dut : Top
+    sqr : TxnSource
+end testbench Tb
+
+impl ComponentRecordAssignTest for Tb
+    run
+        let t : Txn
+        t = sqr.make(7)
+        assert t.value == 7 else fail("value=${t.value}")
+    end run
+end impl ComponentRecordAssignTest
+"#;
+    let prog = lower_src(src).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+
+    let run = prog.function(prog.tests[0].run);
+    let record_local = run
+        .locals
+        .iter()
+        .position(|l| l.name == "t")
+        .map(|idx| ir::LocalId(idx as u32))
+        .expect("record local t");
+    let saw_component_assign = run.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+        matches!(
+            s,
+            ir::Stmt::ComponentCall {
+                method,
+                dest: Some(dest),
+                ..
+            } if method == "make" && *dest == record_local
+        )
+    });
+    assert!(
+        saw_component_assign,
+        "assignment form should lower to ComponentCall dest=t:\n{run}"
+    );
+}
+
+#[test]
+fn component_method_assignment_allows_scalar_widening() {
+    let src = r#"
+sequencer ScalarSource
+    hookable tiny() -> uint<8>
+        return 7
+    end tiny
+end sequencer ScalarSource
+
+testbench Tb
+    dut : Top
+    sqr : ScalarSource
+end testbench Tb
+
+impl ComponentScalarWidenAssignTest for Tb
+    run
+        let w : uint<16>
+        w = sqr.tiny()
+        assert w == 7 else fail("value=${w}")
+    end run
+end impl ComponentScalarWidenAssignTest
+"#;
+    let prog = lower_src(src).expect("scalar-compatible method assignment lowers");
+    verify::verify_program(&prog).expect("verifies");
+}
+
+#[test]
+fn component_method_typed_let_allows_scalar_widening() {
+    let src = r#"
+sequencer ScalarSource
+    hookable tiny() -> uint<8>
+        return 7
+    end tiny
+end sequencer ScalarSource
+
+testbench Tb
+    dut : Top
+    sqr : ScalarSource
+end testbench Tb
+
+impl ComponentScalarWidenLetTest for Tb
+    run
+        let w : uint<16> = sqr.tiny()
+        assert w == 7 else fail("value=${w}")
+    end run
+end impl ComponentScalarWidenLetTest
+"#;
+    let prog = lower_src(src).expect("scalar-compatible method initializer lowers");
+    verify::verify_program(&prog).expect("verifies");
+}
+
+#[test]
+fn component_method_typed_let_rejects_scalar_narrowing() {
+    let src = r#"
+sequencer ScalarSource
+    hookable wide() -> uint<16>
+        return 257
+    end wide
+end sequencer ScalarSource
+
+testbench Tb
+    dut : Top
+    sqr : ScalarSource
+end testbench Tb
+
+impl ComponentScalarNarrowLetTest for Tb
+    run
+        let w : uint<8> = sqr.wide()
+    end run
+end impl ComponentScalarNarrowLetTest
+"#;
+    let err = lower_src(src).expect_err("narrowing method initializer must be rejected");
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("incompatible type"), "{msg}");
+}
+
+#[test]
+fn component_method_typed_let_rejects_record_to_scalar_local() {
+    let src = r#"
+transaction Txn
+    value : uint<8> default 0
+end transaction Txn
+
+sequencer TxnSource
+    hookable make() -> Txn
+        let t : Txn
+        t.value = 7
+        return t
+    end make
+end sequencer TxnSource
+
+testbench Tb
+    dut : Top
+    sqr : TxnSource
+end testbench Tb
+
+impl ComponentRecordToScalarLetTest for Tb
+    run
+        let w : uint<16> = sqr.make()
+    end run
+end impl ComponentRecordToScalarLetTest
+"#;
+    let err = lower_src(src).expect_err("record method result must not initialize scalar local");
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("incompatible type"), "{msg}");
+}
+
+#[test]
+fn component_method_assignment_rejects_scalar_to_record_local() {
+    let src = r#"
+transaction Txn
+    value : uint<8> default 0
+end transaction Txn
+
+sequencer TxnSource
+    hookable scalar() -> uint<8>
+        return 7
+    end scalar
+end sequencer TxnSource
+
+testbench Tb
+    dut : Top
+    sqr : TxnSource
+end testbench Tb
+
+impl ComponentScalarToRecordAssignTest for Tb
+    run
+        let t : Txn
+        t = sqr.scalar()
+    end run
+end impl ComponentScalarToRecordAssignTest
+"#;
+    let err = lower_src(src).expect_err("scalar method result must not assign to record local");
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("incompatible type"), "{msg}");
+}
+
+#[test]
+fn component_method_let_rejects_scalar_to_record_local() {
+    let src = r#"
+transaction Txn
+    value : uint<8> default 0
+end transaction Txn
+
+sequencer TxnSource
+    hookable scalar() -> uint<8>
+        return 7
+    end scalar
+end sequencer TxnSource
+
+testbench Tb
+    dut : Top
+    sqr : TxnSource
+end testbench Tb
+
+impl ComponentScalarToRecordLetTest for Tb
+    run
+        let t : Txn = sqr.scalar()
+    end run
+end impl ComponentScalarToRecordLetTest
+"#;
+    let err = lower_src(src).expect_err("scalar method result must not initialize record local");
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("incompatible type"), "{msg}");
+}
+
+#[test]
+fn component_method_assignment_rejects_wrong_record_local() {
+    let src = r#"
+transaction A
+    value : uint<8> default 0
+end transaction A
+
+transaction B
+    value : uint<8> default 0
+end transaction B
+
+sequencer TxnSource
+    hookable make_b() -> B
+        let t : B
+        t.value = 7
+        return t
+    end make_b
+end sequencer TxnSource
+
+testbench Tb
+    dut : Top
+    sqr : TxnSource
+end testbench Tb
+
+impl ComponentWrongRecordAssignTest for Tb
+    run
+        let t : A
+        t = sqr.make_b()
+    end run
+end impl ComponentWrongRecordAssignTest
+"#;
+    let err = lower_src(src).expect_err("wrong record method result must not assign");
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("incompatible type"), "{msg}");
+}
+
+#[test]
+fn component_method_let_rejects_wrong_record_local() {
+    let src = r#"
+transaction A
+    value : uint<8> default 0
+end transaction A
+
+transaction B
+    value : uint<8> default 0
+end transaction B
+
+sequencer TxnSource
+    hookable make_b() -> B
+        let t : B
+        t.value = 7
+        return t
+    end make_b
+end sequencer TxnSource
+
+testbench Tb
+    dut : Top
+    sqr : TxnSource
+end testbench Tb
+
+impl ComponentWrongRecordLetTest for Tb
+    run
+        let t : A = sqr.make_b()
+    end run
+end impl ComponentWrongRecordLetTest
+"#;
+    let err = lower_src(src).expect_err("wrong record method result must not initialize local");
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("incompatible type"), "{msg}");
+}
 /// Issue #452: a test-scope `let` read (un-shadowed) at the top level of the
 /// check phase must still be promoted to a `_tb` host field even when an
 /// *unrelated nested* `let` of the same name shadows it elsewhere in the

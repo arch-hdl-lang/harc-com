@@ -231,6 +231,7 @@ int run_EnvQuiescedPhaseTest(int argc, char** argv) {
 
     harc_rt::ThreadScheduler sched;
     EnvQuiescedPhaseTb _tb;
+    HeartbeatEnv top;
     auto Producer_on_h0 = [&](Producer& self, TinyTxn t) -> void {
         int __bb = 0;
         while (true) {
@@ -244,7 +245,6 @@ int run_EnvQuiescedPhaseTest(int argc, char** argv) {
             }
         }
     };
-    HeartbeatEnv top;
     top.prod.in_ev.push_back([&](auto _t) { top.prod._last_in_cycle = (uint64_t)cycle_count; Producer_on_h0(top.prod, _t); });
     harc_rt::ThreadSlot _run_slot;
     sched.slots.push_back(&_run_slot);

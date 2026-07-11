@@ -215,6 +215,7 @@ pub(super) fn event_payload_cty(
 /// the held type is already defined.
 pub(super) fn component_struct(
     out: &mut String,
+    prog: &crate::ir::TbProgram,
     c: &crate::ir::ComponentSchema,
     components: &[crate::ir::ComponentSchema],
     scoreboards: &[crate::ir::ScoreboardSchema],
@@ -265,12 +266,50 @@ pub(super) fn component_struct(
             }
         }
     }
+    for m in &c.methods {
+        if m.cov_hook_subs.is_empty() {
+            continue;
+        }
+        let arg_csv = component_method_param_ctypes(prog, m).join(", ");
+        writeln!(
+            out,
+            "{INDENT}std::vector<std::function<void({arg_csv})>> _harc_cov_{}_pre;",
+            m.name
+        )
+        .ok();
+        writeln!(
+            out,
+            "{INDENT}std::vector<std::function<void({arg_csv})>> _harc_cov_{}_post;",
+            m.name
+        )
+        .ok();
+    }
     // v1's activity-tracking heartbeat stamps (read by idle predicates,
     // bumped on emit/in/out; carried for trace + future agent slice).
     writeln!(out, "{INDENT}uint64_t _last_in_cycle = 0;").ok();
     writeln!(out, "{INDENT}uint64_t _last_out_cycle = 0;").ok();
     writeln!(out, "}};").ok();
     writeln!(out).ok();
+}
+
+fn component_method_param_ctypes(
+    prog: &crate::ir::TbProgram,
+    m: &crate::ir::ComponentMethodSchema,
+) -> Vec<String> {
+    let func = prog.function(m.function);
+    (0..m.n_params)
+        .map(|i| match func.locals[i].ty {
+            crate::ir::IrType::Record(r) => prog.records[r.index()].name.clone(),
+            crate::ir::IrType::RecordSeq(r) => {
+                format!("std::vector<{}>", prog.records[r.index()].name)
+            }
+            crate::ir::IrType::Seq(ref scalar) => {
+                format!("std::vector<{}>", super::local_scalar_cty(scalar))
+            }
+            crate::ir::IrType::Component(c) => prog.components[c.index()].name.clone(),
+            ref ty => super::local_scalar_cty(ty),
+        })
+        .collect()
 }
 
 pub(super) fn tb_struct(
@@ -455,17 +494,35 @@ pub(super) fn clocked_scheduler(out: &mut String, clocks: &[ClockSpec]) {
 }
 
 /// Single-clock backward-compat `tick` (no declared clocks).
+///
+/// Clockless tests historically only had synthetic cycle time via
+/// `tick()`. TB-IR also lowers wall-clock waits to
+/// `eval_clocks_until(now_ps + N)`, so provide a minimal absolute-time
+/// runtime here: wall waits settle the DUT at the requested picosecond
+/// timestamp, while normal cycle ticks keep `now_ps` synchronized to the
+/// trace timeline.
 pub(super) fn clockless_scheduler(out: &mut String) {
     out.push_str(
-        r#"    auto tick = [&]() {
+        r#"    long long now_ps = 0;
+    auto eval_clocks_until = [&](long long t_ps) {
+        if (t_ps <= now_ps) return;
+        now_ps = t_ps;
+        dut->eval();
+        _harc_trace_dump_at((uint64_t)now_ps, "", (uint64_t)cycle_count);
+        if (_trace_time <= (uint64_t)now_ps) _trace_time = (uint64_t)now_ps + 1;
+    };
+
+    auto tick = [&]() {
         _harc_eval_negedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)cycle_count);
+        now_ps = (long long)_trace_time;
         _harc_eval_posedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)(cycle_count + 1));
+        now_ps = (long long)_trace_time;
         cycle_count++;
         for (auto& _svc : _post_eval_services) _svc();
         if (!_post_eval_services.empty()) dut->eval();
-        if (!_post_eval_services.empty()) _harc_trace_dump_next("clk", (uint64_t)cycle_count);
+        if (!_post_eval_services.empty()) { _harc_trace_dump_next("clk", (uint64_t)cycle_count); now_ps = (long long)_trace_time; }
         for (auto& _c : _checkers) _c();
     };
 
@@ -669,13 +726,15 @@ pub(super) fn drive_loop(out: &mut String, clocked: bool, actor_threads: &[(Stri
         out.push_str(
             r#"    _harc_eval_negedge(dut);
     _harc_trace_dump_next("clk", (uint64_t)cycle_count);
+    now_ps = (long long)_trace_time;
     while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {
         _harc_eval_posedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)(cycle_count + 1));
+        now_ps = (long long)_trace_time;
         cycle_count++;
         for (auto& _svc : _post_eval_services) _svc();
         if (!_post_eval_services.empty()) dut->eval();
-        if (!_post_eval_services.empty()) _harc_trace_dump_next("clk", (uint64_t)cycle_count);
+        if (!_post_eval_services.empty()) { _harc_trace_dump_next("clk", (uint64_t)cycle_count); now_ps = (long long)_trace_time; }
         sched.tick();
 "#,
         );
@@ -683,6 +742,7 @@ pub(super) fn drive_loop(out: &mut String, clocked: bool, actor_threads: &[(Stri
         out.push_str(
             r#"        _harc_eval_negedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)cycle_count);
+        now_ps = (long long)_trace_time;
         for (auto& _c : _checkers) _c();
     }
 "#,

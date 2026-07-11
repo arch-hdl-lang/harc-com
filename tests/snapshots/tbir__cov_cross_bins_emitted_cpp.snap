@@ -80,21 +80,34 @@ struct CountCov {
         if (cp_en.en0 > 0) _hit++;
         if (cp_en.en1 > 0) _hit++;
         harc_rt::log::harc_print_covergroup_summary("CountCov", _hit, _total);
+        harc_rt::log::harc_cov_json_summary("CountCov", _hit, _total);
         harc_rt::log::harc_print_covergroup_bin("cp_count", "low", cp_count.low);
+        harc_rt::log::harc_cov_json_bin("CountCov", "cp_count", "low", cp_count.low);
         harc_rt::log::harc_print_covergroup_bin("cp_count", "mid", cp_count.mid);
+        harc_rt::log::harc_cov_json_bin("CountCov", "cp_count", "mid", cp_count.mid);
         harc_rt::log::harc_print_covergroup_bin("cp_count", "high", cp_count.high);
+        harc_rt::log::harc_cov_json_bin("CountCov", "cp_count", "high", cp_count.high);
         harc_rt::log::harc_print_covergroup_bin("cp_en", "en0", cp_en.en0);
+        harc_rt::log::harc_cov_json_bin("CountCov", "cp_en", "en0", cp_en.en0);
         harc_rt::log::harc_print_covergroup_bin("cp_en", "en1", cp_en.en1);
+        harc_rt::log::harc_cov_json_bin("CountCov", "cp_en", "en1", cp_en.en1);
         {
             uint64_t _cross_hit = 0;
             uint64_t _cross_missing = 0;
             for (size_t _i = 0; _i < 6; ++_i) if (_cross_2_cp_count__cp_en[_i] > 0) _cross_hit++;
             harc_rt::log::harc_print_covergroup_cross_summary("CountCov", "cross", "cp_count x cp_en", _cross_hit, 6);
+            harc_rt::log::harc_cov_json_cross_summary("CountCov", "cross", "cp_count x cp_en", _cross_hit, 6);
+            harc_rt::log::harc_cov_json_cross_bin("CountCov", "cross", "cp_count x cp_en", "cp_count.low x cp_en.en0", _cross_2_cp_count__cp_en[0]);
             if (_cross_2_cp_count__cp_en[0] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_count.low x cp_en.en0"); _cross_missing++; }
+            harc_rt::log::harc_cov_json_cross_bin("CountCov", "cross", "cp_count x cp_en", "cp_count.low x cp_en.en1", _cross_2_cp_count__cp_en[1]);
             if (_cross_2_cp_count__cp_en[1] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_count.low x cp_en.en1"); _cross_missing++; }
+            harc_rt::log::harc_cov_json_cross_bin("CountCov", "cross", "cp_count x cp_en", "cp_count.mid x cp_en.en0", _cross_2_cp_count__cp_en[2]);
             if (_cross_2_cp_count__cp_en[2] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_count.mid x cp_en.en0"); _cross_missing++; }
+            harc_rt::log::harc_cov_json_cross_bin("CountCov", "cross", "cp_count x cp_en", "cp_count.mid x cp_en.en1", _cross_2_cp_count__cp_en[3]);
             if (_cross_2_cp_count__cp_en[3] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_count.mid x cp_en.en1"); _cross_missing++; }
+            harc_rt::log::harc_cov_json_cross_bin("CountCov", "cross", "cp_count x cp_en", "cp_count.high x cp_en.en0", _cross_2_cp_count__cp_en[4]);
             if (_cross_2_cp_count__cp_en[4] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_count.high x cp_en.en0"); _cross_missing++; }
+            harc_rt::log::harc_cov_json_cross_bin("CountCov", "cross", "cp_count x cp_en", "cp_count.high x cp_en.en1", _cross_2_cp_count__cp_en[5]);
             if (_cross_2_cp_count__cp_en[5] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_count.high x cp_en.en1"); _cross_missing++; }
             harc_rt::log::harc_print_covergroup_more_missing(_cross_missing, 16, "cross");
         }
