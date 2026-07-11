@@ -18632,6 +18632,42 @@ fn rewrite_block_for_impl(
     rewrite_stmts_for_impl(&mut b.stmts, fields, methods, pointers, shadow);
 }
 
+/// Rewrite a testbench-scoped body (an `on ... end on` handler body or a
+/// testbench helper-method body) so bare references to the testbench's
+/// own fields/methods become `_tb.<name>`, matching the impl-for
+/// desugaring already applied to the bound test body. Used by the TB-IR
+/// lowering (issue #485): unlike v1 it has no testbench component to
+/// resolve bare names against, so it reuses this AST rewrite before
+/// lowering the body with the ordinary test-scope context. `extra_shadow`
+/// names (e.g. a helper method's own parameters, or the handler's own
+/// locals) are never rewritten; `dut` and `_tb` are always shadowed.
+pub(crate) fn rewrite_testbench_scope_body(
+    body: &mut Block,
+    tb: &ComponentDecl,
+    extra_shadow: &std::collections::HashSet<String>,
+) {
+    let mut fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut methods: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for ci in &tb.items {
+        match ci {
+            ComponentItem::Field(f) => {
+                fields.insert(f.name.name.clone());
+            }
+            ComponentItem::Hookable(h) => {
+                methods.insert(h.name.name.clone());
+            }
+            _ => {}
+        }
+    }
+    let mut shadow: std::collections::HashSet<String> =
+        ["dut".to_string(), "_tb".to_string()].into_iter().collect();
+    shadow.extend(extra_shadow.iter().cloned());
+    // The `pointers` set only affected a legacy DUT-deref path that the
+    // expr rewriter no longer consults; pass an empty set.
+    let pointers = std::collections::HashSet::new();
+    rewrite_block_for_impl(body, &fields, &methods, &pointers, &shadow);
+}
+
 /// Statement-list variant of `rewrite_block_for_impl`. Both the
 /// scoped form (per-`Block` walk) and the bare-statement form
 /// (`impl ... for Tb` with a flat `Stmt` list, no `setup`/`run`/
