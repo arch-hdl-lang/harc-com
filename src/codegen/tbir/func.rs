@@ -1614,16 +1614,13 @@ fn emit_transactor_call(
 /// as default-constructed structs; the `RecordInit` at the source
 /// `let` site re-runs the field defaults (v1 declares at the let
 /// site, so loop iterations re-default-construct).
+///
 /// Names of record locals that are SHARED test-scope host state. This
 /// includes transaction/struct-typed testbench fields plus regblock
 /// mirrors whose binding declares `on regs.REG` write callbacks. These
 /// are declared + default-constructed ONCE at test scope and captured by
 /// `[&]`, so every function that touches them must reference that one
 /// cell by name — never re-declare or re-init it.
-pub(super) fn shared_mirror_names(prog: &TbProgram, func: &TbFunction) -> HashSet<String> {
-    shared_record_names(prog, func)
-}
-
 pub(super) fn shared_record_names(prog: &TbProgram, func: &TbFunction) -> HashSet<String> {
     let mut out = HashSet::new();
     if let Some(o) = func.owner {
