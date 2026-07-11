@@ -37,7 +37,7 @@ use crate::ast::{
     Stmt as AstStmt, StmtKind, TypeArg, TypeExpr,
 };
 use crate::ir::{
-    CallTarget, ConstraintSite, Expr, FunctionId, FunctionKind, IrType, Stmt, TbFunction,
+    CallTarget, ConstraintSite, Expr, FunctionId, FunctionKind, IrType, RecordId, Stmt, TbFunction,
     Terminator, TypedParam,
 };
 use std::cell::RefCell;
@@ -132,7 +132,7 @@ pub(crate) fn lower_pure_helper<'a>(
     b.in_pure_helper = true;
     let mut params = Vec::with_capacity(decl.params.len());
     for p in &decl.params {
-        let ty = ir_type_of(p.ty.as_ref());
+        let ty = ir_type_of_with_records(p.ty.as_ref(), &ctx.record_ids);
         let local = b.declare(&p.name.name);
         b.set_local_type(local, ty.clone());
         params.push(TypedParam {
@@ -142,7 +142,10 @@ pub(crate) fn lower_pure_helper<'a>(
     }
     if decl.return_ty.is_some() {
         let ret = b.declare("__ret");
-        b.set_local_type(ret, ir_type_of(decl.return_ty.as_ref()));
+        b.set_local_type(
+            ret,
+            ir_type_of_with_records(decl.return_ty.as_ref(), &ctx.record_ids),
+        );
         b.helper_ret = Some(ret);
     }
     b.lower_block_stmts(&decl.body)?;
@@ -220,6 +223,8 @@ impl FuncBuilder<'_> {
         for (p, e) in decl.params.iter().zip(&arg_exprs) {
             if is_dut_ident(self, e) {
                 bound.push(Bound::Dut);
+            } else if is_named_record_ty(p.ty.as_ref(), &self.ctx.record_ids) {
+                bound.push(Bound::Val(self.lower_expr_no_ports(e)?));
             } else if matches!(p.ty, Some(TypeExpr::Named { .. })) {
                 return Err(unsupported(
                     &format!(
@@ -236,16 +241,12 @@ impl FuncBuilder<'_> {
         // Result slot, default-initialized so paths that fall off the
         // helper's end still define it.
         let dest = self.fresh_temp();
+        let mut ret_ty = IrType::Unknown;
         if decl.return_ty.is_some() {
-            self.set_local_type(dest, ir_type_of(decl.return_ty.as_ref()));
+            ret_ty = ir_type_of_with_records(decl.return_ty.as_ref(), &self.ctx.record_ids);
+            self.set_local_type(dest, ret_ty.clone());
         }
-        self.push(Stmt::Assign(
-            dest,
-            Expr::Literal {
-                value: 0,
-                ty: IrType::Unknown,
-            },
-        ));
+        self.push_return_default(dest, &ret_ty);
         let cont = self.new_block();
 
         let mut dut_aliases = HashSet::new();
@@ -266,7 +267,10 @@ impl FuncBuilder<'_> {
         for (p, b) in decl.params.iter().zip(bound) {
             if let Bound::Val(e) = b {
                 let id = self.declare(&p.name.name);
-                self.set_local_type(id, ir_type_of(p.ty.as_ref()));
+                self.set_local_type(
+                    id,
+                    ir_type_of_with_records(p.ty.as_ref(), &self.ctx.record_ids),
+                );
                 self.push(Stmt::Assign(id, e));
             }
         }
@@ -384,6 +388,8 @@ impl FuncBuilder<'_> {
         for (p, e) in decl.params.iter().zip(&arg_exprs) {
             if is_dut_ident(self, e) {
                 bound.push(Bound::Dut);
+            } else if is_named_record_ty(p.ty.as_ref(), &self.ctx.record_ids) {
+                bound.push(Bound::Val(self.lower_expr_no_ports(e)?));
             } else if matches!(p.ty, Some(TypeExpr::Named { .. })) {
                 return Err(unsupported(
                     &format!(
@@ -398,16 +404,12 @@ impl FuncBuilder<'_> {
         }
 
         let dest = self.fresh_temp();
+        let mut ret_ty = IrType::Unknown;
         if decl.return_ty.is_some() {
-            self.set_local_type(dest, ir_type_of(decl.return_ty.as_ref()));
+            ret_ty = ir_type_of_with_records(decl.return_ty.as_ref(), &self.ctx.record_ids);
+            self.set_local_type(dest, ret_ty.clone());
         }
-        self.push(Stmt::Assign(
-            dest,
-            Expr::Literal {
-                value: 0,
-                ty: IrType::Unknown,
-            },
-        ));
+        self.push_return_default(dest, &ret_ty);
         let cont = self.new_block();
 
         let mut dut_aliases = HashSet::new();
@@ -428,7 +430,10 @@ impl FuncBuilder<'_> {
         for (p, b) in decl.params.iter().zip(bound) {
             if let Bound::Val(e) = b {
                 let id = self.declare(&p.name.name);
-                self.set_local_type(id, ir_type_of(p.ty.as_ref()));
+                self.set_local_type(
+                    id,
+                    ir_type_of_with_records(p.ty.as_ref(), &self.ctx.record_ids),
+                );
                 self.push(Stmt::Assign(id, e));
             }
         }
@@ -474,6 +479,20 @@ impl FuncBuilder<'_> {
         }
         Ok(false)
     }
+
+    fn push_return_default(&mut self, dest: crate::ir::LocalId, ty: &IrType) {
+        if let IrType::Record(rid) = ty {
+            self.push(Stmt::RecordInit(dest, *rid));
+        } else {
+            self.push(Stmt::Assign(
+                dest,
+                Expr::Literal {
+                    value: 0,
+                    ty: IrType::Unknown,
+                },
+            ));
+        }
+    }
 }
 
 fn is_dut_ident(b: &FuncBuilder<'_>, e: &AstExpr) -> bool {
@@ -501,6 +520,24 @@ pub(crate) fn ir_type_of(ty: Option<&TypeExpr>) -> IrType {
         BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => IrType::Bool,
         _ => IrType::Unknown,
     }
+}
+
+pub(crate) fn ir_type_of_with_records(
+    ty: Option<&TypeExpr>,
+    record_ids: &HashMap<String, RecordId>,
+) -> IrType {
+    if let Some(TypeExpr::Named { name, .. }) = ty {
+        if let Some(simple) = name.segments.last().map(|s| s.name.as_str()) {
+            if let Some(&rid) = record_ids.get(simple) {
+                return IrType::Record(rid);
+            }
+        }
+    }
+    ir_type_of(ty)
+}
+
+fn is_named_record_ty(ty: Option<&TypeExpr>, record_ids: &HashMap<String, RecordId>) -> bool {
+    matches!(ir_type_of_with_records(ty, record_ids), IrType::Record(_))
 }
 
 // ── Conservative purity / call-graph scan ───────────────────────────
