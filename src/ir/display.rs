@@ -66,6 +66,17 @@ impl Display for TbProgram {
                     write!(f, " [on {reg}=fn{}]", fid.0)?;
                 }
             }
+            for svc in &tb.periodic_services {
+                let phase = match svc.phase {
+                    crate::ir::HandlerPhase::Checker => "checker",
+                    crate::ir::HandlerPhase::PostEval => "post_eval",
+                };
+                write!(
+                    f,
+                    " periodic every {} cyc phase {phase} fn{}",
+                    svc.period, svc.function.0
+                )?;
+            }
             writeln!(f)?;
         }
         for t in &self.tests {

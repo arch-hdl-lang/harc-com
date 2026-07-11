@@ -960,6 +960,36 @@ pub struct TestbenchSchema {
     /// schema was synthesized for a classic-form test. Codegen skips
     /// the `_tb` struct + wire statement for synthetic testbenches.
     pub synthetic: bool,
+    /// Testbench-scoped `on <N> cycles [phase post_eval] ... end on`
+    /// periodic handlers (issue #485). v1 emits these through its
+    /// testbench-component path (registering into `_checkers` /
+    /// `_post_eval_services`); the TB-IR backend has no testbench
+    /// component, so the handler bodies lower to flow-owned
+    /// `FunctionKind::TestHook` functions and register here. Each fires
+    /// its body once every `period` primary-clock cycles at the recorded
+    /// phase. Empty for a testbench without periodic handlers.
+    pub periodic_services: Vec<TbPeriodicServiceSchema>,
+}
+
+/// One testbench-scoped `on <N> cycles ... end on` periodic handler
+/// (issue #485). Mirrors `PeriodicHandlerSchema` but at flow scope: the
+/// body is a flow-owned `FunctionKind::TestHook` function (`_tb`/`dut`
+/// captured by reference, no `self`), registered into the per-cycle
+/// `_checkers` / `_post_eval_services` vector by the run coroutine's
+/// setup. The period is a compile-time integer literal (`on 1 cycles`);
+/// a field-backed period is rejected at lowering with a clear message.
+#[derive(Debug, Clone)]
+pub struct TbPeriodicServiceSchema {
+    /// Firing period in primary-clock cycles (a positive literal).
+    pub period: u64,
+    /// Lowered handler body (`kind: TestHook`, zero params). Field reads
+    /// resolve to `Expr::TbField`, DUT reads to the shared `dut` handle,
+    /// testbench-method calls inline like `_tb.<m>()`.
+    pub function: FunctionId,
+    /// `phase` modifier (`on N cycles phase post_eval`). `Checker`
+    /// (default) registers into `_checkers`; `PostEval` into
+    /// `_post_eval_services`.
+    pub phase: HandlerPhase,
 }
 
 /// One composite-component test field binding (`let env : AnalysisEnv`).

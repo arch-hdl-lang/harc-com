@@ -1,0 +1,100 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 TbReactive { dut: ScoreboardTypedQueue } periodic every 1 cyc phase post_eval fn3
+  test TbReactivePostEval tb=tb0 run=fn2 check=-
+  record r0 Sample
+    got : uint<64>
+    exp : uint<64>
+  component c0 Collector (scoreboard)
+    field samples : queue<Sample>
+    method push_sample(2 args) = fn0
+  component c1 Auditor (scoreboard)
+    field mismatches : scalar = 0
+    field last_got : scalar = 0
+    method audit(2 args) = fn1
+
+fn fn0 comp_method_0 [kind=ComponentMethod(c0)]
+  params:
+    g : uint<64>
+    e : uint<64>
+  locals:
+    %0 g : uint<64>
+    %1 e : uint<64>
+    %2 s : record(r0)
+  entry = b0
+
+  b0:
+    RecordInit(%s, r0)
+    RecordFieldWrite(%s.got, %g)
+    RecordFieldWrite(%s.exp, %e)
+    ComponentQueuePush(self.samples, %s)
+    -> Return
+
+fn fn1 comp_method_1 [kind=ComponentMethod(c1)]
+  params:
+    g : uint<64>
+    e : uint<64>
+  locals:
+    %0 g : uint<64>
+    %1 e : uint<64>
+  entry = b0
+
+  b0:
+    ComponentFieldWrite(self.last_got, %g)
+    -> Branch((%g != %e), b2, b3)
+
+  b1:
+    -> Return
+
+  b2:
+    ComponentFieldWrite(self.mismatches, (self.mismatches + 1))
+    -> Jump(b1)
+
+  b3:
+    -> Jump(b1)
+
+fn fn2 run_TbReactivePostEval [kind=Run, owner=tb0]
+  entry = b0
+
+  b0:
+    DutWrite(dut.rst_n, 1)
+    -> WaitCycles(5, b1)
+
+  b1:
+    AssertCheck { cond: (auditor.mismatches >= 1), on_fail: "expected at least one mismatch, got %lld", auditor.mismatches }
+    AssertCheck { cond: (auditor.last_got == 7), on_fail: "last sampled dut_value=%lld, expected 7", auditor.last_got }
+    AssertCheck { cond: (ComponentQueueQuery(collector.samples.size()) == 0), on_fail: "collector queue not drained: %lld", ComponentQueueQuery(collector.samples.size()) }
+    Log(info, "ALL TESTS PASSED - testbench_periodic_post_eval")
+    -> Return
+
+fn fn3 TbReactivePostEval_tb_periodic_3 [kind=TestHook, owner=tb0]
+  locals:
+    %0 __t0 : unknown
+    %1 __t1 : unknown
+    %2 __t2 : unknown
+    %3 s : record(r0)
+  entry = b0
+
+  b0:
+    DutRead(%__t0, dut.dut_value)
+    DutRead(%__t1, dut.expected_value)
+    ComponentCall(collector.c0::push_sample([%__t0, %__t1]))
+    Assign(%__t2, 0)
+    -> Jump(b2)
+
+  b1:
+    -> Return
+
+  b2:
+    -> Branch((ComponentQueueQuery(collector.samples.size()) != 0), b3, b4)
+
+  b3:
+    ComponentQueuePop(%s = collector.samples.pop())
+    ComponentCall(auditor.c1::audit([%s.got, %s.exp]))
+    -> Jump(b2)
+
+  b4:
+    -> Jump(b1)

@@ -1,0 +1,84 @@
+// Testbench-scoped `on <N> cycles phase post_eval` periodic handler
+// (issue #485). Before this fixture the TB-IR backend rejected a periodic
+// handler declared directly in a `testbench` body ("TB-IR lowering does
+// not support testbench item ... yet"), forcing `--codegen v1`. The
+// handler now lowers to a flow-owned post_eval service under both
+// backends, so the two must trace-diff clean.
+//
+// Shape mirrors the issue's reactive-DV pattern: a testbench-level
+// post_eval handler drains observations from one component (`collector`)
+// and forwards them to a checker (`auditor`) every cycle, via a shared
+// testbench helper method (`drain_samples`). This keeps the checker glue
+// out of the test body — the reuse win the periodic handler exists for.
+
+struct Sample
+    got : uint<64>
+    exp : uint<64>
+end struct Sample
+
+// Producer-side observation queue.
+scoreboard Collector
+    samples : queue<Sample>
+
+    function push_sample(g : uint<64>, e : uint<64>)
+        let s : Sample
+        s.got = g
+        s.exp = e
+        samples.push(s)
+    end push_sample
+end scoreboard Collector
+
+// Consumer-side checker: counts mismatches between sampled DUT outputs.
+scoreboard Auditor
+    mismatches : uint<32> default 0
+    last_got : uint<64> default 0
+
+    function audit(g : uint<64>, e : uint<64>)
+        last_got = g
+        if g != e
+            mismatches = mismatches + 1
+        end if
+    end audit
+end scoreboard Auditor
+
+testbench TbReactive
+    dut : ScoreboardTypedQueue
+    collector : Collector
+    auditor : Auditor
+
+    // Testbench helper: forward every queued observation to the checker.
+    // Exercises helper-method access to testbench component instances from
+    // within the periodic handler (issue #485 acceptance criterion).
+    function drain_samples()
+        while collector.samples.size() != 0
+            let s : Sample = collector.samples.pop()
+            auditor.audit(s.got, s.exp)
+        end while
+    end function drain_samples
+
+    // Runs after the DUT posedge eval each cycle: sample the freshly
+    // clocked outputs, then drain them into the checker.
+    on 1 cycles phase post_eval
+        collector.push_sample(dut.dut_value, dut.expected_value)
+        drain_samples()
+    end on
+end testbench TbReactive
+
+impl TbReactivePostEval for TbReactive
+    run
+        dut.rst_n = 1
+        wait 5 cycles
+
+        // The DUT drives dut_value=7, expected_value=9 every cycle out of
+        // reset, so the post_eval handler observes a mismatch on each firing.
+        assert auditor.mismatches >= 1
+            else fail("expected at least one mismatch, got ${auditor.mismatches}")
+        assert auditor.last_got == 7
+            else fail("last sampled dut_value=${auditor.last_got}, expected 7")
+        // The queue is fully drained each cycle by the helper.
+        assert collector.samples.size() == 0
+            else fail("collector queue not drained: ${collector.samples.size()}")
+
+        log(info, "ALL TESTS PASSED - testbench_periodic_post_eval")
+    end run
+end impl TbReactivePostEval
