@@ -204,6 +204,7 @@ aes_cipher_top_test | AesCipherTop | aes_cipher_top.sv aes_key_expand_128.sv xti
 dma_engine_test | DmaEngine | dma_engine.sv | - | pass
 scoreboard_typed_queue_test | ScoreboardTypedQueue | scoreboard_typed_queue.sv | - | pass
 testbench_periodic_post_eval_test | ScoreboardTypedQueue | scoreboard_typed_queue.sv | - | pass
+testbench_periodic_period2_test | ScoreboardTypedQueue | scoreboard_typed_queue.sv | - | pass
 axilite_env_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 post_eval_provider_test | PostEvalProvider | post_eval_provider.sv | - | pass
 bus_bind_generic_test | BusRwBind | BusRwBind.sv | - | pass

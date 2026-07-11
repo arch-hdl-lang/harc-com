@@ -1,0 +1,60 @@
+// Testbench-scoped `on <N> cycles` periodic handler with a period > 1
+// (hardens issue #485 / PR #488). The shipped `#485` fixture only
+// exercised `on 1 cycles`, where the backend's per-service last-fire
+// gating (`cycle_count - last >= period`) is trivially "every cycle" and
+// the `phase` choice is moot. This fixture pins the non-trivial cadence:
+// two handlers with DIFFERENT periods (2 and 3) and DIFFERENT phases
+// (default Checker vs `post_eval`) must fire the SAME number of times
+// under `--codegen v1` and `--codegen tbir` — the v1↔tbir trace-diff
+// equivalence gate (tests/tbir_equiv_fixtures.txt) enforces that, and the
+// asserts below pin the absolute cadence both backends agree on.
+
+scoreboard Cadence
+    fast : uint<32> default 0   // fired by the period-2 handler
+    slow : uint<32> default 0   // fired by the period-3 handler
+
+    function tick_fast()
+        fast = fast + 1
+    end tick_fast
+
+    function tick_slow()
+        slow = slow + 1
+    end tick_slow
+end scoreboard Cadence
+
+testbench TbPeriodGt1
+    dut : ScoreboardTypedQueue
+    cad : Cadence
+
+    // Default (Checker) phase, period 2.
+    on 2 cycles
+        cad.tick_fast()
+    end on
+
+    // post_eval phase, period 3.
+    on 3 cycles phase post_eval
+        cad.tick_slow()
+    end on
+end testbench TbPeriodGt1
+
+impl TbPeriodGt1Run for TbPeriodGt1
+    run
+        dut.rst_n = 1
+        wait 10 cycles
+
+        // Cadence pinned from the shipped gating (`>= period`, last-fire
+        // stamp starting at 0). Over a 10-cycle window the period-2
+        // Checker-phase handler fires 4 times and the period-3 post_eval
+        // handler fires 3 times — the phase changes where in the cycle the
+        // gate is sampled, so the cadences are not simply `floor(10/period)`
+        // and the period-2 (Checker) count (4) differs from a period-2
+        // post_eval count (5). Both backends must agree on these exact
+        // counts; the v1↔tbir trace-diff gate cross-checks the same run.
+        assert cad.fast == 4
+            else fail("period-2 handler fired ${cad.fast} times, expected 4")
+        assert cad.slow == 3
+            else fail("period-3 handler fired ${cad.slow} times, expected 3")
+
+        log(info, "ALL TESTS PASSED - testbench_periodic_period2")
+    end run
+end impl TbPeriodGt1Run

@@ -114,6 +114,7 @@ transactor_env_mode_test | AxiLiteRegs     | AxiLiteRegs.sv         |
 post_eval_provider_test | PostEvalProvider | post_eval_provider.sv |
 scoreboard_typed_queue_test | ScoreboardTypedQueue | scoreboard_typed_queue.sv |
 testbench_periodic_post_eval_test | ScoreboardTypedQueue | scoreboard_typed_queue.sv |
+testbench_periodic_period2_test | ScoreboardTypedQueue | scoreboard_typed_queue.sv |
 tlm_method_bus_test   | TlmMemory      | TlmMemory.sv           |
 tlm_target_thread_test | TlmReadInitiator | TlmReadInitiator.sv  |
 tlm_target_thread_if_test | TlmReadInitiatorPair | TlmReadInitiatorPair.sv |
