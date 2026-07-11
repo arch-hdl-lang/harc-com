@@ -1,8 +1,8 @@
 # HARC: unresolved `use BusName;` imports silently no-op, then surface as a misleading "let with a bind" error
 
 **Date:** 2026-07-10
-**Status:** Proposal — not yet implemented.
-**Related:** GitHub issue harc-com#TBD (filed alongside this doc)
+**Status:** ✅ Implemented (2026-07-11) — see *Resolution* at the end.
+**Related:** harc-com#493
 
 ---
 
@@ -132,3 +132,48 @@ for step 2.
 issues and HARC's `use`-import path for gaps in expressiveness/tooling; a
 GitHub search for prior reports of this behavior (silent no-op / misleading
 bind error) found none.*
+
+---
+
+## Resolution
+
+Implemented per the proposed scope (steps 1–2 only; step 3's default-on
+warning was left out as explicitly optional/opt-out-able and not required by
+the acceptance criteria):
+
+- `lower_program` (`src/ir/lower/mod.rs`) now computes
+  `unresolved_use_names: HashSet<String>` right after building the `buses`
+  map — every name targeted by a top-level `use` that isn't in `buses`
+  (`use` can only ever bring in `Item::Bus` items, so "not in `buses`" is a
+  sound "this use never resolved" signal).
+- Threaded as a new parameter into `lower_test`. The generic catch-all
+  `TestItem::Let` arm now special-cases a `.bind` whose type name is in that
+  set, returning a `LowerError::Invalid` that names the missing type and the
+  failed `use` instead of the old "let with a bind ... only plain lets are
+  lowered" message.
+- Two new tests in `tests/tbir.rs`:
+  `unresolved_use_bind_gets_targeted_diagnostic` (asserts the new message
+  fires, names the type, and does *not* contain the old misleading text) and
+  `unused_unresolved_use_does_not_error` (a `use` that's never bound against
+  still parses cleanly — the non-goal from the proposal).
+
+**Verification.** Full `cargo test --release` (all binaries) green, including
+the two new tests. Manually reproduced the exact before/after CLI behavior
+for a typo'd bus name (`use BusAxLite` vs. stdlib's `BusAxiLite`):
+
+```
+# before
+error: TB-IR lowering does not support test-scope `let axil` with probes or
+a bind yet (only plain `let <name> [: <Ty>] = <expr>` test-scope lets are
+lowered); re-run with `--codegen v1`
+
+# after
+error: test-scope `let axil : BusAxLite = bind ...` references type
+`BusAxLite`, but `use BusAxLite;` never resolved — no `BusAxLite.arch` or
+`BusAxLite.harc` was found in $HARC_LIB_PATH, <input dir>/stdlib/,
+./stdlib/, or ../arch-com/{stdlib,examples}/. Check the import name/path, or
+declare `bus BusAxLite ... end bus BusAxLite` locally.
+```
+
+Scope note: `--codegen v1` (`cpp_tb.rs`) was intentionally left untouched, as
+scoped in the original proposal's Non-goals.
