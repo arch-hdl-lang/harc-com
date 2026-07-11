@@ -2659,9 +2659,7 @@ end test ClockedPostEvalTest"#;
     let body = &cpp[start..end];
 
     // Exactly one physical-timestamp waveform dump inside the scheduler loop.
-    let dumps = body
-        .matches("_harc_trace_dump_at((uint64_t)now_ps")
-        .count();
+    let dumps = body.matches("_harc_trace_dump_at((uint64_t)now_ps").count();
     assert_eq!(
         dumps, 1,
         "clocked + post_eval loop must dump the waveform once per timestamp (issue #477); \
@@ -2688,9 +2686,7 @@ end test ClockedPostEvalTest"#;
 
     // The old duplicate-dump shape must be gone.
     assert!(
-        !body.contains(
-            "if (_primary_rising && !_post_eval_services.empty()) _harc_trace_dump_at"
-        ),
+        !body.contains("if (_primary_rising && !_post_eval_services.empty()) _harc_trace_dump_at"),
         "the duplicate same-timestamp dump must be removed (issue #477); got:\n{body}"
     );
 }
@@ -4189,6 +4185,64 @@ end test UniqueConstrainedTest"#,
             && !cpp.contains("static std::vector")
             && !cpp.contains("[unique] policy: no repeat until exhausted"),
         "constraints mentioning a unique field should suppress unique history while preserving seeded sampling; got:\n{cpp}",
+    );
+}
+
+#[test]
+fn randomize_with_bit_slice_constraints_emit_solver_masks() {
+    let parsed = parse_source(
+        r#"transaction Choice
+    word : uint<32>
+    addr : uint<32>
+end transaction Choice
+
+test BitSliceRandomizeTest
+    let dut : DummyDut
+    run
+        let c : Choice
+        randomize(c) with
+            c.word[1:0] == 3
+            c.addr[0] == 0
+        end randomize
+    end run
+end test BitSliceRandomizeTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("(_z_word & harc_z3_bv_value(_ctx, (uint64_t)0x0000000000000003ULL, 64))")
+            && cpp.contains(
+                "(_z_addr & harc_z3_bv_value(_ctx, (uint64_t)0x0000000000000001ULL, 64))"
+            )
+            && !cpp.contains("constraint expression not supported in v0 solver path"),
+        "bit-slice constraints should lower to solver-width masks; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn randomize_with_wide_bit_slice_constraint_emits_wide_mask() {
+    let parsed = parse_source(
+        r#"transaction WideChoice
+    word : uint<128>
+end transaction WideChoice
+
+test WideBitSliceRandomizeTest
+    let dut : DummyDut
+    run
+        let c : WideChoice
+        randomize(c) with
+            c.word[95:0] == 0
+        end randomize
+    end run
+end test WideBitSliceRandomizeTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("((_harc_u128)0xffffffffULL << 64)")
+            && cpp.contains("& harc_z3_bv_value(_ctx,")
+            && !cpp.contains("constraint expression not supported in v0 solver path"),
+        "wide bit-slice constraints should preserve mask bits above 64; got:\n{cpp}"
     );
 }
 

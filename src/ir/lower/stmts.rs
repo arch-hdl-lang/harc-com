@@ -41,10 +41,9 @@ impl FuncBuilder<'_> {
             } => {
                 // Wall-clock wait (`wait 80ns`): resolved to
                 // picoseconds at lowering, suspended via the inline
-                // `eval_clocks_until(now_ps + N)` form (v1's emission
-                // for a Time duration). Needs the multi-clock
-                // scheduler — a clockless test has no absolute time
-                // (v1 emits uncompilable C++ there; the IR rejects).
+                // `eval_clocks_until(now_ps + N)` form. Only
+                // test-scoped bodies may use it because emitted helpers
+                // must capture the surrounding scheduler runtime.
                 if let ExprKind::Time(s) = &*duration.kind {
                     if clock.is_some() {
                         return Err(unsupported(
@@ -52,11 +51,11 @@ impl FuncBuilder<'_> {
                             "clock-qualified waits take a cycle count",
                         ));
                     }
-                    if self.ctx.clock_names.is_empty() {
+                    if !self.ctx.allow_scheduler_time_waits {
                         return Err(unsupported(
-                            "wall-clock `wait <time>` in a clockless test",
-                            "declare a `clock` — absolute time comes from the \
-                             multi-clock scheduler",
+                            "wall-clock `wait <time>` in this context",
+                            "only test-scoped run/check, hook, component, and \
+                             transactor method bodies can capture scheduler time",
                         ));
                     }
                     let ps = super::time_literal_to_ps(s).map_err(LowerError::Invalid)?;
@@ -312,10 +311,7 @@ impl FuncBuilder<'_> {
                 let what = match &*e.kind {
                     ExprKind::Call { callee, args } => match &*callee.kind {
                         ExprKind::Ident(id) => {
-                            if self
-                                .inline_frames
-                                .iter()
-                                .any(|f| f.name.starts_with("_tb."))
+                            if self.in_testbench_method_frame()
                                 && self.ctx.tb_methods.contains_key(&id.name)
                             {
                                 self.lower_tb_method_call(&id.name, args)?;
@@ -524,6 +520,12 @@ impl FuncBuilder<'_> {
                                     "",
                                 ));
                             }
+                            self.check_component_method_result_assignable(
+                                m,
+                                IrType::Record(rid),
+                                &method,
+                                &l.name.name,
+                            )?;
                             let lowered = self.lower_component_call_args(args)?;
                             let id = self.declare(&l.name.name);
                             self.set_local_type(id, IrType::Record(rid));
@@ -677,6 +679,30 @@ impl FuncBuilder<'_> {
         // method call into a fresh local.
         if let ExprKind::Call { callee, args } = &*value.kind {
             if let Some((base, component, method)) = self.as_component_method_call(callee)? {
+                let comp = &self.ctx.components[component.index()];
+                let m = comp.method(&method).ok_or_else(|| {
+                    unsupported(
+                        &format!("component `{}` has no method `{method}`", comp.name),
+                        "",
+                    )
+                })?;
+                if !m.has_ret {
+                    return Err(unsupported(
+                        &format!(
+                            "`let {} = {}.{method}(...)` — method `{method}` returns no value",
+                            l.name.name, comp.name
+                        ),
+                        "",
+                    ));
+                }
+                if let Some(expected) = declared_scalar_ty.clone() {
+                    self.check_component_method_result_assignable(
+                        m,
+                        expected,
+                        &method,
+                        &l.name.name,
+                    )?;
+                }
                 let lowered = self.lower_component_call_args(args)?;
                 let id = self.declare(&l.name.name);
                 if let Some(w) = declared_width {
@@ -749,6 +775,26 @@ impl FuncBuilder<'_> {
         Ok(())
     }
 
+    fn check_component_method_result_assignable(
+        &self,
+        method_schema: &crate::ir::ComponentMethodSchema,
+        expected: IrType,
+        method: &str,
+        local: &str,
+    ) -> Result<(), LowerError> {
+        if let Some(actual) = method_schema.ret_ty.clone() {
+            if !component_method_result_compatible(&expected, &actual) {
+                return Err(unsupported(
+                    &format!(
+                        "assignment of `{method}` result to local `{local}` with incompatible type"
+                    ),
+                    format!("expected {expected:?}, method returns {actual:?}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn lower_assign(
         &mut self,
         target: &crate::ast::Expr,
@@ -791,19 +837,16 @@ impl FuncBuilder<'_> {
             self.push(Stmt::TbFieldWrite { field, value: e });
             return Ok(());
         }
-        // Closure-hook host-state promotion: a bare ident assignment to a
-        // promoted test-scope let (`pre_count = pre_count + 1`) writes the
-        // shared `_tb` host cell. Locals shadow (a real local of the same
-        // name would have resolved earlier in this fn); only a promoted
-        // name with no shadowing local reaches here.
+        // Scalar testbench host state (`expected_checks = ...`) and
+        // promoted test-scope lets write the shared `_tb` cell. Locals
+        // shadow; free helpers stay fenced by the capture-scope helper.
         if let crate::ast::ExprKind::Ident(id) = &*target.kind {
-            if self.ctx.promoted_tb_lets.contains(&id.name) && self.lookup(&id.name).is_none() {
-                let e = self.lower_expr_no_ports(value)?;
-                self.push(Stmt::TbFieldWrite {
-                    field: id.name.clone(),
-                    value: e,
-                });
-                return Ok(());
+            if self.lookup(&id.name).is_none() {
+                if let Some(field) = self.tb_scalar_field_in_capture_scope(&id.name) {
+                    let e = self.lower_expr_no_ports(value)?;
+                    self.push(Stmt::TbFieldWrite { field, value: e });
+                    return Ok(());
+                }
             }
         }
         // Test-scope write of a bound-to target responder's persistent
@@ -927,6 +970,47 @@ impl FuncBuilder<'_> {
                         self.push(Stmt::TransactorCall {
                             dest: Some(local),
                             call,
+                        });
+                        return Ok(());
+                    }
+                }
+                // `v = env.source.next()` / `t = sqr.make_txn()` —
+                // value-returning component method call into an existing
+                // local. This mirrors the already-supported `let v =
+                // env.source.next()` lowering, but preserves the destination
+                // local's established scalar/record type.
+                if let ExprKind::Call { callee, args } = &*value.kind {
+                    if let Some((base, component, method)) =
+                        self.as_component_method_call(callee)?
+                    {
+                        let comp = &self.ctx.components[component.index()];
+                        let m = comp.method(&method).ok_or_else(|| {
+                            unsupported(
+                                &format!("component `{}` has no method `{method}`", comp.name),
+                                "",
+                            )
+                        })?;
+                        if !m.has_ret {
+                            return Err(unsupported(
+                                &format!(
+                                    "assignment from `{}.{method}(...)` — method \
+                                     `{method}` returns no value",
+                                    comp.name
+                                ),
+                                "",
+                            ));
+                        }
+                        let expected = self.local_type(local).clone();
+                        self.check_component_method_result_assignable(
+                            m, expected, &method, &id.name,
+                        )?;
+                        let lowered = self.lower_component_call_args(args)?;
+                        self.push(Stmt::ComponentCall {
+                            base,
+                            component,
+                            method,
+                            args: lowered,
+                            dest: Some(local),
                         });
                         return Ok(());
                     }
@@ -1960,5 +2044,20 @@ fn typed_let_ir_type(t: &TypeExpr) -> Option<IrType> {
         // so it is intentionally absent here.)
         BuiltinTy::Time => Some(IrType::UInt(Some(64))),
         _ => None,
+    }
+}
+
+fn component_method_result_compatible(expected: &IrType, actual: &IrType) -> bool {
+    if matches!(expected, IrType::Unknown) || matches!(actual, IrType::Unknown) {
+        return true;
+    }
+    if expected == actual {
+        return true;
+    }
+    match (expected, actual) {
+        (IrType::UInt(Some(ew)), IrType::UInt(Some(aw)))
+        | (IrType::SInt(Some(ew)), IrType::SInt(Some(aw))) => aw <= ew,
+        (IrType::UInt(Some(ew)), IrType::Bool) | (IrType::SInt(Some(ew)), IrType::Bool) => *ew >= 1,
+        _ => false,
     }
 }

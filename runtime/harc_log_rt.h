@@ -202,6 +202,115 @@ inline void harc_print_covergroup_more_missing(
     }
 }
 
+inline FILE* harc_coverage_json_file() {
+    static FILE* f = nullptr;
+    static bool initialized = false;
+    if (initialized) return f;
+    initialized = true;
+    const char* path = std::getenv("HARC_COVERAGE_JSONL");
+    if (!path || !*path) path = std::getenv("HARC_COVERAGE_JSON");
+    if (!path || !*path) return nullptr;
+    f = std::fopen(path, "w");
+    return f;
+}
+
+inline void harc_json_string(FILE* f, const char* value) {
+    std::fputc('"', f);
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(value ? value : "");
+    while (*p) {
+        unsigned char c = *p++;
+        switch (c) {
+            case '"': std::fputs("\\\"", f); break;
+            case '\\': std::fputs("\\\\", f); break;
+            case '\b': std::fputs("\\b", f); break;
+            case '\f': std::fputs("\\f", f); break;
+            case '\n': std::fputs("\\n", f); break;
+            case '\r': std::fputs("\\r", f); break;
+            case '\t': std::fputs("\\t", f); break;
+            default:
+                if (c < 0x20) {
+                    std::fprintf(f, "\\u%04x", static_cast<unsigned>(c));
+                } else {
+                    std::fputc(c, f);
+                }
+                break;
+        }
+    }
+    std::fputc('"', f);
+}
+
+inline void harc_cov_json_summary(const char* group, uint64_t hit, uint64_t total) {
+    FILE* f = harc_coverage_json_file();
+    if (!f) return;
+    std::fputs("{\"type\":\"covergroup\",\"group\":", f);
+    harc_json_string(f, group);
+    std::fprintf(
+        f,
+        ",\"hit\":%llu,\"total\":%llu}\n",
+        static_cast<unsigned long long>(hit),
+        static_cast<unsigned long long>(total));
+    std::fflush(f);
+}
+
+inline void harc_cov_json_bin(
+    const char* group,
+    const char* point,
+    const char* bin,
+    uint64_t hits) {
+    FILE* f = harc_coverage_json_file();
+    if (!f) return;
+    std::fputs("{\"type\":\"coverpoint_bin\",\"group\":", f);
+    harc_json_string(f, group);
+    std::fputs(",\"point\":", f);
+    harc_json_string(f, point);
+    std::fputs(",\"bin\":", f);
+    harc_json_string(f, bin);
+    std::fprintf(f, ",\"hits\":%llu}\n", static_cast<unsigned long long>(hits));
+    std::fflush(f);
+}
+
+inline void harc_cov_json_cross_summary(
+    const char* group,
+    const char* kind,
+    const char* label,
+    uint64_t hit,
+    uint64_t total) {
+    FILE* f = harc_coverage_json_file();
+    if (!f) return;
+    std::fputs("{\"type\":\"cross\",\"group\":", f);
+    harc_json_string(f, group);
+    std::fputs(",\"kind\":", f);
+    harc_json_string(f, kind);
+    std::fputs(",\"label\":", f);
+    harc_json_string(f, label);
+    std::fprintf(
+        f,
+        ",\"hit\":%llu,\"total\":%llu}\n",
+        static_cast<unsigned long long>(hit),
+        static_cast<unsigned long long>(total));
+    std::fflush(f);
+}
+
+inline void harc_cov_json_cross_bin(
+    const char* group,
+    const char* kind,
+    const char* label,
+    const char* bin,
+    uint64_t hits) {
+    FILE* f = harc_coverage_json_file();
+    if (!f) return;
+    std::fputs("{\"type\":\"cross_bin\",\"group\":", f);
+    harc_json_string(f, group);
+    std::fputs(",\"kind\":", f);
+    harc_json_string(f, kind);
+    std::fputs(",\"label\":", f);
+    harc_json_string(f, label);
+    std::fputs(",\"bin\":", f);
+    harc_json_string(f, bin);
+    std::fprintf(f, ",\"hits\":%llu}\n", static_cast<unsigned long long>(hits));
+    std::fflush(f);
+}
+
 struct HarcLogFiles {
     std::unordered_map<std::string, FILE*> files;
 

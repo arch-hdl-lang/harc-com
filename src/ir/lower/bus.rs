@@ -774,6 +774,7 @@ fn bus_port(bind: &str, tail: &[&str]) -> PortRef {
     PortRef {
         testbench_field: "dut".to_string(),
         port_path,
+        aggregate_path: false,
         direction: None,
         width: None,
         access: PortAccess::Port,
@@ -788,6 +789,7 @@ pub(crate) fn bus_port_flat(flat: &str) -> PortRef {
     PortRef {
         testbench_field: "dut".to_string(),
         port_path: vec![flat.to_string()],
+        aggregate_path: false,
         direction: None,
         width: None,
         access: PortAccess::Port,

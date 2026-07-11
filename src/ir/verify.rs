@@ -1005,6 +1005,7 @@ impl Checker<'_> {
                     self.check_expr(i, ports_ok, context);
                 }
             }
+            Expr::CovHookArg { .. } => {}
             // Component host state — resolved at lowering against the
             // component schema; no local/port dependency to verify here.
             Expr::ComponentField { .. } => {}
@@ -1261,6 +1262,49 @@ fn wide_literal_bits(words: &[u32]) -> u32 {
     (idx as u32) * 32 + (32 - word.leading_zeros())
 }
 
+fn bit_words(nbits: usize) -> usize {
+    nbits.div_ceil(64)
+}
+
+fn full_bits(nbits: usize) -> Vec<u64> {
+    let words = bit_words(nbits);
+    let mut bits = vec![!0u64; words];
+    let rem = nbits % 64;
+    if rem != 0 {
+        if let Some(last) = bits.last_mut() {
+            *last = (1u64 << rem) - 1;
+        }
+    }
+    bits
+}
+
+fn zero_bits(nbits: usize) -> Vec<u64> {
+    vec![0u64; bit_words(nbits)]
+}
+
+fn bit_get(bits: &[u64], idx: usize) -> bool {
+    bits.get(idx / 64)
+        .is_some_and(|word| (word & (1u64 << (idx % 64))) != 0)
+}
+
+fn bit_set(bits: &mut [u64], idx: usize) {
+    if let Some(word) = bits.get_mut(idx / 64) {
+        *word |= 1u64 << (idx % 64);
+    }
+}
+
+fn bit_or_assign(dst: &mut [u64], src: &[u64]) {
+    for (d, s) in dst.iter_mut().zip(src.iter()) {
+        *d |= *s;
+    }
+}
+
+fn bit_and_assign(dst: &mut [u64], src: &[u64]) {
+    for (d, s) in dst.iter_mut().zip(src.iter()) {
+        *d &= *s;
+    }
+}
+
 /// Invariant 4 — iterative forward dataflow over "definitely defined"
 /// local sets. `defined_in[b]` = intersection of predecessors' outs;
 /// a read inside the block must be covered by the running defined set.
@@ -1275,13 +1319,12 @@ fn check_def_before_use(
     if nblocks == 0 {
         return;
     }
-    // Bitsets as Vec<bool> — function sizes are tiny.
-    let full = vec![true; nlocals];
+    let full = full_bits(nlocals);
     // Params count as defined at entry: by convention the first
     // `params.len()` locals mirror the function's parameters.
-    let mut entry_in = vec![false; nlocals];
-    for slot in entry_in.iter_mut().take(func.params.len()) {
-        *slot = true;
+    let mut entry_in = zero_bits(nlocals);
+    for i in 0..func.params.len().min(nlocals) {
+        bit_set(&mut entry_in, i);
     }
     // A `RecordSeq` accumulator (the tseq `ret` slot) is always
     // default-constructed by the backend at function top — `declare_locals`
@@ -1290,10 +1333,10 @@ fn check_def_before_use(
     // use-before-def.
     for (i, l) in func.locals.iter().enumerate() {
         if matches!(l.ty, IrType::RecordSeq(_) | IrType::Seq(_)) {
-            entry_in[i] = true;
+            bit_set(&mut entry_in, i);
         }
     }
-    let mut ins: Vec<Vec<bool>> = vec![full.clone(); nblocks];
+    let mut ins: Vec<Vec<u64>> = vec![full.clone(); nblocks];
     ins[func.entry.index()] = entry_in.clone();
 
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nblocks];
@@ -1303,24 +1346,18 @@ fn check_def_before_use(
         }
     }
 
-    let gen_kill = |b: &BasicBlock, start: &[bool]| -> Vec<bool> {
-        let mut d = start.to_vec();
+    let mut gens = vec![zero_bits(nlocals); nblocks];
+    for (bi, b) in func.blocks.iter().enumerate() {
         for s in &b.stmts {
             match s {
                 Stmt::Assign(l, _) | Stmt::DutRead(l, _) | Stmt::RecordInit(l, _) => {
-                    if l.index() < d.len() {
-                        d[l.index()] = true;
-                    }
+                    bit_set(&mut gens[bi], l.index());
                 }
                 Stmt::TransactorCall { dest: Some(l), .. } => {
-                    if l.index() < d.len() {
-                        d[l.index()] = true;
-                    }
+                    bit_set(&mut gens[bi], l.index());
                 }
                 Stmt::TransactorSelfCall { dest: Some(l), .. } => {
-                    if l.index() < d.len() {
-                        d[l.index()] = true;
-                    }
+                    bit_set(&mut gens[bi], l.index());
                 }
                 Stmt::ScoreboardOp {
                     op: crate::ir::ScoreboardOp::QueuePop { dest: l, .. },
@@ -1328,15 +1365,12 @@ fn check_def_before_use(
                 }
                 | Stmt::ComponentCall { dest: Some(l), .. }
                 | Stmt::ComponentQueuePop { dest: l, .. } => {
-                    if l.index() < d.len() {
-                        d[l.index()] = true;
-                    }
+                    bit_set(&mut gens[bi], l.index());
                 }
                 _ => {}
             }
         }
-        d
-    };
+    }
 
     // Fixpoint.
     loop {
@@ -1349,19 +1383,19 @@ fn check_def_before_use(
                 entry_in.clone()
             } else {
                 let mut acc = full.clone();
+                let mut out = zero_bits(nlocals);
                 let mut any = false;
                 for &p in &preds[bi] {
                     if !reachable[p] {
                         continue;
                     }
                     any = true;
-                    let out = gen_kill(&func.blocks[p], &ins[p]);
-                    for i in 0..nlocals {
-                        acc[i] = acc[i] && out[i];
-                    }
+                    out.clone_from(&ins[p]);
+                    bit_or_assign(&mut out, &gens[p]);
+                    bit_and_assign(&mut acc, &out);
                 }
                 if !any {
-                    vec![false; nlocals]
+                    zero_bits(nlocals)
                 } else {
                     acc
                 }
@@ -1384,9 +1418,9 @@ fn check_def_before_use(
         }
         let bid = BlockId(bi as u32);
         let mut defined = ins[bi].clone();
-        let check_e = |e: &Expr, defined: &[bool], errs: &mut Vec<VerifyError>| {
+        let check_e = |e: &Expr, defined: &[u64], errs: &mut Vec<VerifyError>| {
             for_each_local(e, &mut |l| {
-                if l.index() < defined.len() && !defined[l.index()] {
+                if l.index() < nlocals && !bit_get(defined, l.index()) {
                     errs.push(VerifyError::LocalUseBeforeDef {
                         func: fid,
                         block: bid,
@@ -1399,20 +1433,16 @@ fn check_def_before_use(
             match s {
                 Stmt::Assign(l, e) => {
                     check_e(e, &defined, errs);
-                    if l.index() < defined.len() {
-                        defined[l.index()] = true;
-                    }
+                    bit_set(&mut defined, l.index());
                 }
                 Stmt::DutRead(l, _) | Stmt::RecordInit(l, _) => {
-                    if l.index() < defined.len() {
-                        defined[l.index()] = true;
-                    }
+                    bit_set(&mut defined, l.index());
                 }
                 Stmt::RecordFieldWrite { local, value, .. }
                 | Stmt::RecordWriteCb { local, value, .. } => {
                     // Writing a field READS the record local (it must
                     // be initialized first — RecordInit defines it).
-                    if local.index() < defined.len() && !defined[local.index()] {
+                    if local.index() < nlocals && !bit_get(&defined, local.index()) {
                         errs.push(VerifyError::LocalUseBeforeDef {
                             func: fid,
                             block: bid,
@@ -1427,17 +1457,13 @@ fn check_def_before_use(
                 Stmt::TransactorCall { dest, call } => {
                     check_e(call, &defined, errs);
                     if let Some(l) = dest {
-                        if l.index() < defined.len() {
-                            defined[l.index()] = true;
-                        }
+                        bit_set(&mut defined, l.index());
                     }
                 }
                 Stmt::TransactorSelfCall { dest, call } => {
                     check_e(call, &defined, errs);
                     if let Some(l) = dest {
-                        if l.index() < defined.len() {
-                            defined[l.index()] = true;
-                        }
+                        bit_set(&mut defined, l.index());
                     }
                 }
                 Stmt::Log { args, .. } => {
@@ -1469,9 +1495,7 @@ fn check_def_before_use(
                         check_e(value, &defined, errs)
                     }
                     crate::ir::ScoreboardOp::QueuePop { dest, .. } => {
-                        if dest.index() < defined.len() {
-                            defined[dest.index()] = true;
-                        }
+                        bit_set(&mut defined, dest.index());
                     }
                 },
                 Stmt::ComponentFieldWrite { value, .. } => check_e(value, &defined, errs),
@@ -1485,15 +1509,13 @@ fn check_def_before_use(
                         check_e(a, &defined, errs);
                     }
                     if let Some(l) = dest {
-                        if l.index() < defined.len() {
-                            defined[l.index()] = true;
-                        }
+                        bit_set(&mut defined, l.index());
                     }
                 }
                 Stmt::SeqPush { seq, value } => {
                     // `yield t` reads both the accumulator (defined at the
                     // tseq function entry) and the yielded value.
-                    if seq.index() < defined.len() && !defined[seq.index()] {
+                    if seq.index() < nlocals && !bit_get(&defined, seq.index()) {
                         errs.push(VerifyError::LocalUseBeforeDef {
                             func: fid,
                             block: bid,
@@ -1505,9 +1527,7 @@ fn check_def_before_use(
                 Stmt::ComponentQueuePush { value, .. } => check_e(value, &defined, errs),
                 Stmt::ComponentQueuePop { dest, .. } => {
                     // Pop defines the destination local.
-                    if dest.index() < defined.len() {
-                        defined[dest.index()] = true;
-                    }
+                    bit_set(&mut defined, dest.index());
                 }
                 // Whole sub-component copy — no local def/use (both ends
                 // are component values, not test locals).
@@ -1521,17 +1541,13 @@ fn check_def_before_use(
                         check_e(a, &defined, errs);
                     }
                     if let Some(l) = desc.dest {
-                        if l.index() < defined.len() {
-                            defined[l.index()] = true;
-                        }
+                        bit_set(&mut defined, l.index());
                     }
                 }
                 Stmt::TlmJoinAll(pending) => {
                     for p in pending {
                         if let Some(l) = p.dest {
-                            if l.index() < defined.len() {
-                                defined[l.index()] = true;
-                            }
+                            bit_set(&mut defined, l.index());
                         }
                     }
                 }
@@ -1562,9 +1578,7 @@ fn check_def_before_use(
                 // The solver writes the record fields back into `target`;
                 // it is a def, not a use (the record local was already
                 // defined at its `let` RecordInit site).
-                if target.index() < defined.len() {
-                    defined[target.index()] = true;
-                }
+                bit_set(&mut defined, target.index());
             }
             Terminator::Jump(_) | Terminator::Return => {}
         }
@@ -1582,7 +1596,8 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
         | Expr::TransactorState { .. }
         | Expr::ComponentField { .. }
         | Expr::ScoreboardQuery { .. }
-        | Expr::ComponentQueueQuery { .. } => {}
+        | Expr::ComponentQueueQuery { .. }
+        | Expr::CovHookArg { .. } => {}
         Expr::ComponentValue { base } => {
             if let crate::ir::ComponentBase::Local(l) = base {
                 f(*l);

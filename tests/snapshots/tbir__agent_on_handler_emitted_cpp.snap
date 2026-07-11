@@ -180,6 +180,7 @@ int run_AgentOnHandlerTest(int argc, char** argv) {
     sim_log_line("INFO", "seed=%llu", (long long)harc_rng.state);
 
     harc_rt::ThreadScheduler sched;
+    Tagger tagger;
     auto Tagger_on_h0 = [&](Tagger& self, uint64_t t) -> void {
         int __bb = 0;
         while (true) {
@@ -194,7 +195,6 @@ int run_AgentOnHandlerTest(int argc, char** argv) {
             }
         }
     };
-    Tagger tagger;
     tagger.in_ev.push_back([&](auto _t) { tagger._last_in_cycle = (uint64_t)cycle_count; Tagger_on_h0(tagger, _t); });
     harc_rt::ThreadSlot _run_slot;
     sched.slots.push_back(&_run_slot);

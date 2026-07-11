@@ -231,14 +231,15 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // forward declarations are emitted by `emit_extern_fn_decls`. Shared
     // across every lowering context (an extern fn is a pure scalar C
     // call, callable wherever a pure helper is).
-    let extern_fns: HashSet<String> = file
+    let extern_fn_decls: HashMap<String, &crate::ast::ExternFnDecl> = file
         .items
         .iter()
         .filter_map(|it| match it {
-            Item::ExternFn(f) => Some(f.name.name.clone()),
+            Item::ExternFn(f) => Some((f.name.name.clone(), f)),
             _ => None,
         })
         .collect();
+    let extern_fns: HashSet<String> = extern_fn_decls.keys().cloned().collect();
 
     // Enum names, so transaction fields of enum type lower as scalars
     // (v1 flattens them to `int64_t` members with index values).
@@ -251,6 +252,11 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         })
         .collect();
 
+    // Helper functions: categorize pure vs impure, reject recursion.
+    // Covergroup schemas need this early so hook-triggered coverpoints can
+    // sample pure helper calls over hook parameters.
+    let helper_registry = helpers::HelperRegistry::build(&file)?;
+
     // Covergroup schemas, in file order. All declarations lower (even
     // unreferenced ones — v1 emits a struct for each), so unsupported
     // covergroup features are rejected here rather than dropped.
@@ -258,7 +264,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     let mut covgroups: Vec<CovgroupSchema> = Vec::new();
     for it in &file.items {
         if let Item::Covergroup(g) = it {
-            let schema = covergroups::lower_covergroup(g)?;
+            let schema =
+                covergroups::lower_covergroup(g, &helper_registry, &extern_fn_decls, &consts)?;
             covgroup_ids.insert(g.name.name.clone(), CovgroupId(covgroups.len() as u32));
             covgroups.push(schema);
         }
@@ -373,11 +380,6 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // every `LowerCtx` so a `let txns = Name(...)` resolves the call edge
     // and a `for t in txns` resolves the iteration.
     let tseq_records = tseqs::collect_tseq_records(&file, &record_ids)?;
-
-    // Helper functions: categorize pure vs impure, reject recursion.
-    // Pure helpers lower eagerly below; impure helpers are CFG-inlined
-    // at each call site during body lowering.
-    let helper_registry = helpers::HelperRegistry::build(&file)?;
 
     // Type names referenced as a by-value sub-component FIELD of some
     // `env`/`agent` declaration. A purely-structural DUT-poking BFM
@@ -567,6 +569,19 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             _ => None,
         })
         .collect();
+    // DUT-attached passive helper / monitor transactors. Their hookables
+    // live in the always-on body rather than `when active`, so `passive`
+    // instances keep the same callable monitor surface.
+    let passive_helper_names: HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Transactor(t) if components::transactor_is_passive_helper(t) => {
+                Some(t.name.name.clone())
+            }
+            _ => None,
+        })
+        .collect();
 
     // File-level construct gate: anything outside the MVP subset is an
     // explicit Unsupported, never silently dropped.
@@ -660,6 +675,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                         &reactive_monitor_names,
                         &dut_poking_bfm_names,
                         &function_library_names,
+                        &passive_helper_names,
                     )?;
                 } else if matches!(
                     c.kind,
@@ -753,6 +769,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         cov_fields: HashMap::new(),
         covgroups: Vec::new(),
         clock_names: Vec::new(),
+        allow_scheduler_time_waits: false,
         record_ids: record_ids.clone(),
         records: prog.records.clone(),
         // Deliberately empty: bus bindings and transactor fields are
@@ -768,6 +785,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         scoreboards: Vec::new(),
         consts: consts.clone(),
         tb_scalar_fields: HashSet::new(),
+        tb_record_fields: Vec::new(),
         promoted_tb_lets: HashSet::new(),
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
@@ -819,6 +837,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         cov_fields: HashMap::new(),
         covgroups: Vec::new(),
         clock_names: Vec::new(),
+        allow_scheduler_time_waits: false,
         record_ids: record_ids.clone(),
         records: prog.records.clone(),
         bus_bindings: HashMap::new(),
@@ -829,6 +848,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         scoreboards: Vec::new(),
         consts: consts.clone(),
         tb_scalar_fields: HashSet::new(),
+        tb_record_fields: Vec::new(),
         promoted_tb_lets: HashSet::new(),
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
@@ -962,6 +982,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         cov_fields: HashMap::new(),
         covgroups: Vec::new(),
         clock_names: Vec::new(),
+        allow_scheduler_time_waits: true,
         record_ids: record_ids.clone(),
         records: prog.records.clone(),
         bus_bindings: HashMap::new(),
@@ -976,6 +997,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         scoreboards: prog.scoreboards.clone(),
         consts: consts.clone(),
         tb_scalar_fields: HashSet::new(),
+        tb_record_fields: Vec::new(),
         promoted_tb_lets: HashSet::new(),
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
@@ -1252,6 +1274,7 @@ fn validate_testbench_component(
     reactive_monitor_names: &HashSet<String>,
     dut_poking_bfm_names: &HashSet<String>,
     function_library_names: &HashSet<String>,
+    passive_helper_names: &HashSet<String>,
 ) -> Result<(), LowerError> {
     for ci in &c.items {
         match ci {
@@ -1279,6 +1302,12 @@ fn validate_testbench_component(
                     // accepted. Checked before the composite-component gate,
                     // which otherwise rejects a mode on a component field.
                     if function_library_names.contains(simple) {
+                        continue;
+                    }
+                    // A passive helper / monitor transactor has a DUT
+                    // handle but no `when active` body, so its always-on
+                    // hookables exist on passive instances.
+                    if passive_helper_names.contains(simple) {
                         continue;
                     }
                     // An event-driven transactor field (`drv : SeqXactor
@@ -1408,17 +1437,13 @@ fn validate_testbench_component(
                             }
                         }
                     }
-                    // Without this gate a transaction-typed field would
-                    // fall through to the "assume DUT module type" arm
-                    // and mis-lower.
+                    // Transaction/struct-typed testbench fields are
+                    // shared host record state; validation only accepts
+                    // the field type here. The concrete field list is
+                    // collected in `lower_test`, where the per-testbench
+                    // schema is available.
                     if record_ids.contains_key(simple) {
-                        return Err(unsupported(
-                            &format!(
-                                "testbench field `{}` of transaction type `{}`",
-                                f.name.name, simple
-                            ),
-                            "",
-                        ));
+                        continue;
                     }
                     // env/agent component types are accepted by the
                     // `component_type_names` gate above; the only remaining
@@ -2322,6 +2347,7 @@ fn lower_test(
     let mut transactor_fields: Vec<(String, TransactorId)> = Vec::new();
     let mut scoreboard_fields: Vec<(String, ScoreboardId)> = Vec::new();
     let mut scalar_fields: Vec<ir::TbScalarFieldSchema> = Vec::new();
+    let mut record_fields: Vec<(String, RecordId)> = Vec::new();
     let mut tb_methods: HashMap<String, HookableMethod> = HashMap::new();
     // Testbench-scoped `on <N> cycles [phase post_eval]` periodic
     // handlers (issue #485). Collected here in declaration order; their
@@ -2367,6 +2393,9 @@ fn lower_test(
                                     ));
                                 }
                                 transactor_fields.push((f.name.name.clone(), xid));
+                            }
+                            if let Some(&rid) = record_ids.get(simple) {
+                                record_fields.push((f.name.name.clone(), rid));
                             }
                             // Composite-component testbench field (`prod :
                             // Producer` / `top : HeartbeatEnv`). Routes to
@@ -3161,6 +3190,7 @@ fn lower_test(
         dut_type,
         cov_fields: cov_fields.clone(),
         scalar_fields: scalar_fields.clone(),
+        record_fields: record_fields.clone(),
         bus_bindings: bus_bindings.clone(),
         transactor_fields: transactor_fields.clone(),
         scoreboard_fields: scoreboard_fields.clone(),
@@ -3321,6 +3351,7 @@ fn lower_test(
         cov_fields: cov_fields.iter().cloned().collect(),
         covgroups: prog.covgroups.clone(),
         clock_names: clock_specs.iter().map(|c| c.name.clone()).collect(),
+        allow_scheduler_time_waits: true,
         record_ids: record_ids.clone(),
         records: prog.records.clone(),
         bus_bindings: bus_binding_decls,
@@ -3335,6 +3366,7 @@ fn lower_test(
         scoreboards: prog.scoreboards.clone(),
         consts: consts.clone(),
         tb_scalar_fields: scalar_fields.iter().map(|f| f.name.clone()).collect(),
+        tb_record_fields: record_fields.clone(),
         promoted_tb_lets: promoted_lets.clone(),
         regblock_callbacks: regblock_callbacks.clone(),
         tb_methods,
@@ -3974,6 +4006,10 @@ pub(crate) struct LowerCtx {
     /// never contain a wait — waits make a helper impure, so it is
     /// CFG-inlined under the calling test's context instead).
     pub clock_names: Vec<String>,
+    /// Method bodies are lowered before binding to a concrete test clock
+    /// list, but TBIR emits them as lambdas inside the scheduled test body
+    /// where `now_ps` and `eval_clocks_until` are available.
+    pub allow_scheduler_time_waits: bool,
     /// Transaction record names → ids, for `let t : TxnType`
     /// resolution (the IR mirror of v1's `transactions` set seeding
     /// let-type resolution).
@@ -4024,6 +4060,12 @@ pub(crate) struct LowerCtx {
     /// Scalar testbench field names (`TestbenchSchema::scalar_fields`),
     /// for `_tb.<field>` access lowering.
     pub tb_scalar_fields: HashSet<String>,
+    /// Transaction/struct-typed testbench field names and record ids.
+    /// Each owning function declares a synthetic record local with the
+    /// same name so existing record-field lowering and verification apply;
+    /// the backend skips that local declaration/init and binds the name
+    /// to one shared test-scope C++ object instead.
+    pub tb_record_fields: Vec<(String, RecordId)>,
     /// Test-scope `let` names PROMOTED to `_tb` scalar host fields
     /// because a closure-hook body (`on <obj>.<method> pre/post`)
     /// captures them by reference (host-state promotion). A bare ident
@@ -4154,6 +4196,9 @@ pub(crate) struct LoopFrame {
 pub(crate) struct InlineFrame {
     /// Helper name, for recursion detection.
     pub(crate) name: String,
+    /// True for `_tb.<method>` frames. Unlike free helpers, testbench
+    /// methods capture testbench-owned host state.
+    pub(crate) is_testbench_method: bool,
     /// Param names bound to the caller's DUT — `as_port_ref` resolves
     /// `<alias>.<port>` exactly like `dut.<port>`.
     pub(crate) dut_aliases: HashSet<String>,
@@ -4181,6 +4226,13 @@ pub(crate) struct FuncBuilder<'a> {
     pub(crate) loop_stack: Vec<LoopFrame>,
     temp_counter: u32,
     pub(crate) inline_frames: Vec<InlineFrame>,
+    /// Synthetic locals for transaction/struct-typed testbench fields.
+    /// These are declared in every owning function so record-field IR can
+    /// type-check, but codegen binds the names to shared test-scope C++
+    /// objects. Kept separate from ordinary lexical scopes so `_tb.cur`
+    /// can still name the field when a method parameter/local shadows
+    /// bare `cur`.
+    tb_record_locals: HashMap<String, LocalId>,
     /// Return slot when lowering a standalone pure-helper body.
     pub(crate) helper_ret: Option<LocalId>,
     /// True while lowering a standalone pure-helper body — record
@@ -4281,6 +4333,7 @@ fn lower_function<'a>(
 ) -> Result<TbFunction, LowerError> {
     let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
     b.in_check = kind == FunctionKind::Check;
+    declare_tb_record_fields(&mut b, ctx);
     // Regblock mirror locals: declared + default-constructed (to their
     // reset values) at the head of the Run function, mirroring v1's
     // single `<Name>_Mirror regs;` declaration at the hoisted-let site.
@@ -4331,10 +4384,12 @@ fn lower_method_hook_body<'a>(
     constraint_sites: &'a RefCell<Vec<ConstraintSite>>,
 ) -> Result<TbFunction, LowerError> {
     let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    reserve_tb_record_names(&mut b, ctx);
     for p in params {
         let local = b.declare(&p.name);
         b.set_local_type(local, p.ty.clone());
     }
+    declare_tb_record_fields(&mut b, ctx);
     b.lower_block_stmts(body)?;
     if !b.is_terminated() {
         b.terminate(Terminator::Return);
@@ -4393,10 +4448,12 @@ fn lower_reg_cb_body<'a>(
     constraint_sites: &'a RefCell<Vec<ConstraintSite>>,
 ) -> Result<TbFunction, LowerError> {
     let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    reserve_tb_record_names(&mut b, ctx);
     // The callback param `data` — the observed write value. Declared
     // FIRST so it is param index 0.
     let data = b.declare("data");
     b.set_local_type(data, IrType::UInt(None));
+    declare_tb_record_fields(&mut b, ctx);
     // Regblock + addrmap mirror locals, same as the Run function — the
     // callback body's `record_write`/`record_read` resolve through them,
     // and the RecordInit defines the local for the def/use verifier. The
@@ -4427,6 +4484,19 @@ fn lower_reg_cb_body<'a>(
     Ok(f)
 }
 
+fn declare_tb_record_fields(b: &mut FuncBuilder<'_>, ctx: &LowerCtx) {
+    for (name, rec) in &ctx.tb_record_fields {
+        let id = b.declare_tb_record_field(name, *rec);
+        b.push(ir::Stmt::RecordInit(id, *rec));
+    }
+}
+
+fn reserve_tb_record_names(b: &mut FuncBuilder<'_>, ctx: &LowerCtx) {
+    for (name, _) in &ctx.tb_record_fields {
+        b.reserve_local_name(name);
+    }
+}
+
 impl<'a> FuncBuilder<'a> {
     pub(crate) fn new(
         ctx: &'a LowerCtx,
@@ -4447,6 +4517,7 @@ impl<'a> FuncBuilder<'a> {
             loop_stack: Vec::new(),
             temp_counter: 0,
             inline_frames: Vec::new(),
+            tb_record_locals: HashMap::new(),
             helper_ret: None,
             in_pure_helper: false,
             in_fmt_args: false,
@@ -4566,6 +4637,27 @@ impl FuncBuilder<'_> {
         id
     }
 
+    pub(crate) fn declare_tb_record_field(&mut self, source_name: &str, rec: RecordId) -> LocalId {
+        self.local_names.insert(source_name.to_string());
+        let id = LocalId(self.locals.len() as u32);
+        self.locals.push(TypedLocal {
+            name: source_name.to_string(),
+            ty: IrType::Record(rec),
+        });
+        if self.lookup(source_name).is_none() {
+            self.scopes
+                .last_mut()
+                .expect("scope stack never empty")
+                .insert(source_name.to_string(), id);
+        }
+        self.tb_record_locals.insert(source_name.to_string(), id);
+        id
+    }
+
+    pub(crate) fn reserve_local_name(&mut self, source_name: &str) {
+        self.local_names.insert(source_name.to_string());
+    }
+
     pub(crate) fn fresh_temp(&mut self) -> LocalId {
         let name = loop {
             let candidate = format!("__t{}", self.temp_counter);
@@ -4597,6 +4689,40 @@ impl FuncBuilder<'_> {
             }
         }
         None
+    }
+
+    /// Lookup for transaction/struct-typed testbench fields captured by
+    /// `_tb.<method>` bodies. Ordinary `lookup` intentionally fences
+    /// inlined helper bodies from caller locals; testbench record fields
+    /// are different because they are declared as shared test-scope host
+    /// state and must remain visible inside captured testbench methods.
+    /// A local declared inside the method body still shadows BARE access
+    /// because callers try `lookup` first, while `_tb.<field>` uses this
+    /// table directly.
+    pub(crate) fn lookup_tb_record_field(&self, name: &str) -> Option<LocalId> {
+        self.tb_record_locals.get(name).copied()
+    }
+
+    pub(crate) fn in_testbench_method_frame(&self) -> bool {
+        self.inline_frames
+            .last()
+            .map_or(false, |f| f.is_testbench_method)
+    }
+
+    /// Lookup shared transaction/struct-typed testbench fields only from
+    /// contexts that model v1's testbench capture: the run/check/hook body
+    /// itself, or an inlined `_tb.<method>` body. Free helpers remain
+    /// fenced from caller/testbench locals.
+    pub(crate) fn lookup_tb_record_field_in_capture_scope(&self, name: &str) -> Option<LocalId> {
+        let can_capture = self.inline_frames.is_empty() || self.in_testbench_method_frame();
+        can_capture
+            .then(|| self.lookup_tb_record_field(name))
+            .flatten()
+    }
+
+    pub(crate) fn tb_scalar_field_in_capture_scope(&self, name: &str) -> Option<String> {
+        let can_capture = self.inline_frames.is_empty() || self.in_testbench_method_frame();
+        (can_capture && self.ctx.tb_scalar_fields.contains(name)).then(|| name.to_string())
     }
 
     pub(crate) fn set_local_type(&mut self, l: LocalId, ty: IrType) {
@@ -4876,6 +5002,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             | ir::Expr::Port(_)
             | ir::Expr::RecordField { index: None, .. }
             | ir::Expr::CovHookParam { index: None, .. }
+            | ir::Expr::CovHookArg { .. }
             | ir::Expr::TbField(_)
             | ir::Expr::ComponentField { .. }
             | ir::Expr::ComponentValue { .. }
@@ -5094,6 +5221,7 @@ fn fill_visit_expr(
         | Expr::ErrorCount
         | Expr::RecordField { index: None, .. }
         | Expr::CovHookParam { index: None, .. }
+        | Expr::CovHookArg { .. }
         | Expr::TbField(_)
         | Expr::TransactorState { .. }
         | Expr::ComponentField { .. }

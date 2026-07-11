@@ -171,15 +171,26 @@ int run_TbReactivePostEval(int argc, char** argv) {
     HARC_RT_LOG_WAVE_FILE(log_ctx.sim_log, _wave_path);
 
 
+    long long now_ps = 0;
+    auto eval_clocks_until = [&](long long t_ps) {
+        if (t_ps <= now_ps) return;
+        now_ps = t_ps;
+        dut->eval();
+        _harc_trace_dump_at((uint64_t)now_ps, "", (uint64_t)cycle_count);
+        if (_trace_time <= (uint64_t)now_ps) _trace_time = (uint64_t)now_ps + 1;
+    };
+
     auto tick = [&]() {
         _harc_eval_negedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)cycle_count);
+        now_ps = (long long)_trace_time;
         _harc_eval_posedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)(cycle_count + 1));
+        now_ps = (long long)_trace_time;
         cycle_count++;
         for (auto& _svc : _post_eval_services) _svc();
         if (!_post_eval_services.empty()) dut->eval();
-        if (!_post_eval_services.empty()) _harc_trace_dump_next("clk", (uint64_t)cycle_count);
+        if (!_post_eval_services.empty()) { _harc_trace_dump_next("clk", (uint64_t)cycle_count); now_ps = (long long)_trace_time; }
         for (auto& _c : _checkers) _c();
     };
 
@@ -195,6 +206,8 @@ int run_TbReactivePostEval(int argc, char** argv) {
 
     harc_rt::ThreadScheduler sched;
     TbReactive _tb;
+    Collector collector;
+    Auditor auditor;
     auto Collector_push_sample = [&](Collector& self, uint64_t g, uint64_t e) -> void {
         Sample s{}; (void)s;
         int __bb = 0;
@@ -238,8 +251,6 @@ int run_TbReactivePostEval(int argc, char** argv) {
             }
         }
     };
-    Collector collector;
-    Auditor auditor;
     std::function<void()> TbReactivePostEval_tb_periodic_3;
     TbReactivePostEval_tb_periodic_3 = [&]() -> void {
         uint64_t __t0 = 0; (void)__t0;
@@ -350,16 +361,19 @@ int run_TbReactivePostEval(int argc, char** argv) {
     // one posedge that observes the just-set values.
     _harc_eval_negedge(dut);
     _harc_trace_dump_next("clk", (uint64_t)cycle_count);
+    now_ps = (long long)_trace_time;
     while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {
         _harc_eval_posedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)(cycle_count + 1));
+        now_ps = (long long)_trace_time;
         cycle_count++;
         for (auto& _svc : _post_eval_services) _svc();
         if (!_post_eval_services.empty()) dut->eval();
-        if (!_post_eval_services.empty()) _harc_trace_dump_next("clk", (uint64_t)cycle_count);
+        if (!_post_eval_services.empty()) { _harc_trace_dump_next("clk", (uint64_t)cycle_count); now_ps = (long long)_trace_time; }
         sched.tick();
         _harc_eval_negedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)cycle_count);
+        now_ps = (long long)_trace_time;
         for (auto& _c : _checkers) _c();
     }
 

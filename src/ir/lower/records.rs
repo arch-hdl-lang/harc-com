@@ -360,11 +360,7 @@ pub(crate) fn check_no_record_cycles(records: &[RecordSchema]) -> Result<(), Low
     }
     let mut color = vec![Color::White; records.len()];
     // Explicit stack DFS carrying the containing record for the diagnostic.
-    fn visit(
-        i: usize,
-        records: &[RecordSchema],
-        color: &mut [Color],
-    ) -> Result<(), LowerError> {
+    fn visit(i: usize, records: &[RecordSchema], color: &mut [Color]) -> Result<(), LowerError> {
         color[i] = Color::Gray;
         for f in &records[i].fields {
             if let IrType::Record(rid) = f.ty {

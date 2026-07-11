@@ -82,24 +82,40 @@ struct ArbCov {
         if (cp_valid.granted > 0) _hit++;
         if (cp_valid.no_request > 0) _hit++;
         harc_rt::log::harc_print_covergroup_summary("ArbCov", _hit, _total);
+        harc_rt::log::harc_cov_json_summary("ArbCov", _hit, _total);
         harc_rt::log::harc_print_covergroup_bin("cp_grant", "r0", cp_grant.r0);
+        harc_rt::log::harc_cov_json_bin("ArbCov", "cp_grant", "r0", cp_grant.r0);
         harc_rt::log::harc_print_covergroup_bin("cp_grant", "r1", cp_grant.r1);
+        harc_rt::log::harc_cov_json_bin("ArbCov", "cp_grant", "r1", cp_grant.r1);
         harc_rt::log::harc_print_covergroup_bin("cp_grant", "r2", cp_grant.r2);
+        harc_rt::log::harc_cov_json_bin("ArbCov", "cp_grant", "r2", cp_grant.r2);
         harc_rt::log::harc_print_covergroup_bin("cp_grant", "r3", cp_grant.r3);
+        harc_rt::log::harc_cov_json_bin("ArbCov", "cp_grant", "r3", cp_grant.r3);
         harc_rt::log::harc_print_covergroup_bin("cp_valid", "granted", cp_valid.granted);
+        harc_rt::log::harc_cov_json_bin("ArbCov", "cp_valid", "granted", cp_valid.granted);
         harc_rt::log::harc_print_covergroup_bin("cp_valid", "no_request", cp_valid.no_request);
+        harc_rt::log::harc_cov_json_bin("ArbCov", "cp_valid", "no_request", cp_valid.no_request);
         {
             uint64_t _cross_hit = 0;
             uint64_t _cross_missing = 0;
             for (size_t _i = 0; _i < 4; ++_i) for (size_t _j = 0; _j < 2; ++_j) if (_auto_cross_cp_grant__cp_valid[_i][_j] > 0) _cross_hit++;
             harc_rt::log::harc_print_covergroup_cross_summary("ArbCov", "auto_cross", "cp_grant x cp_valid", _cross_hit, 8);
+            harc_rt::log::harc_cov_json_cross_summary("ArbCov", "auto_cross", "cp_grant x cp_valid", _cross_hit, 8);
+            harc_rt::log::harc_cov_json_cross_bin("ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r0 x cp_valid.granted", _auto_cross_cp_grant__cp_valid[0][0]);
             if (_auto_cross_cp_grant__cp_valid[0][0] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_grant.r0 x cp_valid.granted"); _cross_missing++; }
+            harc_rt::log::harc_cov_json_cross_bin("ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r0 x cp_valid.no_request", _auto_cross_cp_grant__cp_valid[0][1]);
             if (_auto_cross_cp_grant__cp_valid[0][1] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_grant.r0 x cp_valid.no_request"); _cross_missing++; }
+            harc_rt::log::harc_cov_json_cross_bin("ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r1 x cp_valid.granted", _auto_cross_cp_grant__cp_valid[1][0]);
             if (_auto_cross_cp_grant__cp_valid[1][0] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_grant.r1 x cp_valid.granted"); _cross_missing++; }
+            harc_rt::log::harc_cov_json_cross_bin("ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r1 x cp_valid.no_request", _auto_cross_cp_grant__cp_valid[1][1]);
             if (_auto_cross_cp_grant__cp_valid[1][1] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_grant.r1 x cp_valid.no_request"); _cross_missing++; }
+            harc_rt::log::harc_cov_json_cross_bin("ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r2 x cp_valid.granted", _auto_cross_cp_grant__cp_valid[2][0]);
             if (_auto_cross_cp_grant__cp_valid[2][0] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_grant.r2 x cp_valid.granted"); _cross_missing++; }
+            harc_rt::log::harc_cov_json_cross_bin("ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r2 x cp_valid.no_request", _auto_cross_cp_grant__cp_valid[2][1]);
             if (_auto_cross_cp_grant__cp_valid[2][1] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_grant.r2 x cp_valid.no_request"); _cross_missing++; }
+            harc_rt::log::harc_cov_json_cross_bin("ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r3 x cp_valid.granted", _auto_cross_cp_grant__cp_valid[3][0]);
             if (_auto_cross_cp_grant__cp_valid[3][0] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_grant.r3 x cp_valid.granted"); _cross_missing++; }
+            harc_rt::log::harc_cov_json_cross_bin("ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r3 x cp_valid.no_request", _auto_cross_cp_grant__cp_valid[3][1]);
             if (_auto_cross_cp_grant__cp_valid[3][1] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_grant.r3 x cp_valid.no_request"); _cross_missing++; }
             harc_rt::log::harc_print_covergroup_more_missing(_cross_missing, 16, "auto-cross");
         }
@@ -169,15 +185,26 @@ int run_BusArbiterTest(int argc, char** argv) {
     HARC_RT_LOG_WAVE_FILE(log_ctx.sim_log, _wave_path);
 
 
+    long long now_ps = 0;
+    auto eval_clocks_until = [&](long long t_ps) {
+        if (t_ps <= now_ps) return;
+        now_ps = t_ps;
+        dut->eval();
+        _harc_trace_dump_at((uint64_t)now_ps, "", (uint64_t)cycle_count);
+        if (_trace_time <= (uint64_t)now_ps) _trace_time = (uint64_t)now_ps + 1;
+    };
+
     auto tick = [&]() {
         _harc_eval_negedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)cycle_count);
+        now_ps = (long long)_trace_time;
         _harc_eval_posedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)(cycle_count + 1));
+        now_ps = (long long)_trace_time;
         cycle_count++;
         for (auto& _svc : _post_eval_services) _svc();
         if (!_post_eval_services.empty()) dut->eval();
-        if (!_post_eval_services.empty()) _harc_trace_dump_next("clk", (uint64_t)cycle_count);
+        if (!_post_eval_services.empty()) { _harc_trace_dump_next("clk", (uint64_t)cycle_count); now_ps = (long long)_trace_time; }
         for (auto& _c : _checkers) _c();
     };
 
@@ -338,16 +365,19 @@ int run_BusArbiterTest(int argc, char** argv) {
     // one posedge that observes the just-set values.
     _harc_eval_negedge(dut);
     _harc_trace_dump_next("clk", (uint64_t)cycle_count);
+    now_ps = (long long)_trace_time;
     while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {
         _harc_eval_posedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)(cycle_count + 1));
+        now_ps = (long long)_trace_time;
         cycle_count++;
         for (auto& _svc : _post_eval_services) _svc();
         if (!_post_eval_services.empty()) dut->eval();
-        if (!_post_eval_services.empty()) _harc_trace_dump_next("clk", (uint64_t)cycle_count);
+        if (!_post_eval_services.empty()) { _harc_trace_dump_next("clk", (uint64_t)cycle_count); now_ps = (long long)_trace_time; }
         sched.tick();
         _harc_eval_negedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)cycle_count);
+        now_ps = (long long)_trace_time;
         for (auto& _c : _checkers) _c();
     }
 

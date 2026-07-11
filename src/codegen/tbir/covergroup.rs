@@ -10,8 +10,8 @@
 
 use crate::codegen::cpp_tb::EmitError;
 use crate::ir::{
-    BinOp, CovBinValue, CoverPointSchema, CovgroupSchema, Expr, IrType, PortRef, TbProgram,
-    TransactorMethodSchema, TransactorSchema, UnOp, WidthCastKind,
+    BinOp, CallTarget, CovBinValue, CoverPointSchema, CovgroupSchema, Expr, FunctionId, IrType,
+    PortRef, TbProgram, TransactorMethodSchema, TransactorSchema, UnOp, WidthCastKind,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
@@ -221,6 +221,23 @@ fn cover_expr_cpp(e: &Expr, lanes: &HashMap<String, u32>) -> Result<String, Emit
             }
             None => format!("{param}.{field}"),
         },
+        Expr::CovHookArg { param } => param.clone(),
+        Expr::Call(target, args) => {
+            let name = match target {
+                CallTarget::Helper(n) => super::expr::helper_cpp_name(n),
+                CallTarget::ExternFn(n) => n.clone(),
+                other => {
+                    return Err(EmitError(format!(
+                        "tbir: covergroup target call is outside the sampler subset: {other:?}"
+                    )))
+                }
+            };
+            let mut rendered = Vec::with_capacity(args.len());
+            for arg in args {
+                rendered.push(cover_expr_cpp(arg, lanes)?);
+            }
+            format!("{name}({})", rendered.join(", "))
+        }
         other => {
             return Err(EmitError(format!(
                 "tbir: covergroup target expression is outside the sampler subset: {other:?}"
@@ -390,12 +407,24 @@ pub(super) fn covgroup_struct(out: &mut String, schema: &CovgroupSchema) {
         schema.name
     )
     .ok();
+    writeln!(
+        out,
+        "{INDENT}{INDENT}harc_rt::log::harc_cov_json_summary(\"{}\", _hit, _total);",
+        schema.name
+    )
+    .ok();
     for p in &schema.points {
         for b in &p.bins {
             writeln!(
                 out,
                 "{INDENT}{INDENT}harc_rt::log::harc_print_covergroup_bin(\"{0}\", \"{1}\", {0}.{1});",
                 p.name, b.name
+            )
+            .ok();
+            writeln!(
+                out,
+                "{INDENT}{INDENT}harc_rt::log::harc_cov_json_bin(\"{}\", \"{}\", \"{}\", {}.{});",
+                schema.name, p.name, b.name, p.name, b.name
             )
             .ok();
         }
@@ -419,7 +448,19 @@ pub(super) fn covgroup_struct(out: &mut String, schema: &CovgroupSchema) {
             schema.name, cross.label, cross.total_bins
         )
         .ok();
+        writeln!(
+            out,
+            "{pad3}harc_rt::log::harc_cov_json_cross_summary(\"{}\", \"cross\", \"{}\", _cross_hit, {});",
+            schema.name, cross.label, cross.total_bins
+        )
+        .ok();
         for (idx, label) in cross_bin_labels(cross) {
+            writeln!(
+                out,
+                "{pad3}harc_rt::log::harc_cov_json_cross_bin(\"{}\", \"cross\", \"{}\", \"{}\", {}[{idx}]);",
+                schema.name, cross.label, label, cross.storage
+            )
+            .ok();
             writeln!(
                 out,
                 "{pad3}if ({}[{idx}] == 0) {{ if (_cross_missing < {CROSS_MISSING_DETAIL_LIMIT}) harc_rt::log::harc_print_covergroup_missing_bin(\"{label}\"); _cross_missing++; }}",
@@ -459,8 +500,23 @@ pub(super) fn covgroup_struct(out: &mut String, schema: &CovgroupSchema) {
             a.bins.len() * b.bins.len()
         )
         .ok();
+        writeln!(
+            out,
+            "{pad3}harc_rt::log::harc_cov_json_cross_summary(\"{}\", \"auto_cross\", \"{} x {}\", _cross_hit, {});",
+            schema.name,
+            a.name,
+            b.name,
+            a.bins.len() * b.bins.len()
+        )
+        .ok();
         for (i, ab) in a.bins.iter().enumerate() {
             for (j, bb) in b.bins.iter().enumerate() {
+                writeln!(
+                    out,
+                    "{pad3}harc_rt::log::harc_cov_json_cross_bin(\"{}\", \"auto_cross\", \"{} x {}\", \"{}.{} x {}.{}\", _auto_cross_{}__{}[{}][{}]);",
+                    schema.name, a.name, b.name, a.name, ab.name, b.name, bb.name, a.name, b.name, i, j
+                )
+                .ok();
                 writeln!(
                     out,
                     "{pad3}if (_auto_cross_{}__{}[{}][{}] == 0) {{ if (_cross_missing < {CROSS_MISSING_DETAIL_LIMIT}) harc_rt::log::harc_print_covergroup_missing_bin(\"{}.{} x {}.{}\"); _cross_missing++; }}",
@@ -620,24 +676,44 @@ fn sample_body(
 pub(super) fn hook_vector_decls(
     out: &mut String,
     prog: &TbProgram,
-    schema: &TransactorSchema,
-    m: &TransactorMethodSchema,
+    owner_name: &str,
+    method_name: &str,
+    function: FunctionId,
+    n_params: usize,
     pad: &str,
 ) -> Result<(), EmitError> {
-    let arg_csv = method_param_ctypes(prog, m).join(", ");
+    let arg_csv = method_param_ctypes(prog, function, n_params).join(", ");
     writeln!(
         out,
         "{pad}std::vector<std::function<void({arg_csv})>> {}_{}_pre;",
-        schema.name, m.name
+        owner_name, method_name
     )
     .ok();
     writeln!(
         out,
         "{pad}std::vector<std::function<void({arg_csv})>> {}_{}_post;",
-        schema.name, m.name
+        owner_name, method_name
     )
     .ok();
     Ok(())
+}
+
+pub(super) fn transactor_hook_vector_decls(
+    out: &mut String,
+    prog: &TbProgram,
+    schema: &TransactorSchema,
+    m: &TransactorMethodSchema,
+    pad: &str,
+) -> Result<(), EmitError> {
+    hook_vector_decls(
+        out,
+        prog,
+        &schema.name,
+        &m.name,
+        m.function,
+        m.n_params,
+        pad,
+    )
 }
 
 /// Push one hook-triggered covergroup's sample closure onto the resolved
@@ -651,8 +727,9 @@ pub(super) fn hook_sampler_registration(
     out: &mut String,
     prog: &TbProgram,
     schema: &CovgroupSchema,
-    xschema: &TransactorSchema,
-    m: &TransactorMethodSchema,
+    vector_base: String,
+    function: FunctionId,
+    n_params: usize,
     side: crate::ast::HookSide,
     instance: &str,
     lanes: &HashMap<String, u32>,
@@ -664,8 +741,8 @@ pub(super) fn hook_sampler_registration(
     // Param decls for the closure signature: `<cty> <name>` per method
     // param, matching the hook-vector element type. Names come from the
     // method's lowered locals (param slots are the leading locals).
-    let func = prog.function(m.function);
-    let arg_decls: Vec<String> = (0..m.n_params)
+    let func = prog.function(function);
+    let arg_decls: Vec<String> = (0..n_params)
         .map(|i| {
             let cty = param_cty(prog, &func.locals[i].ty);
             format!("{cty} {}", func.locals[i].name)
@@ -673,9 +750,7 @@ pub(super) fn hook_sampler_registration(
         .collect();
     writeln!(
         out,
-        "{INDENT}{}_{}_{side_str}.push_back([&]({}) {{",
-        xschema.name,
-        m.name,
+        "{INDENT}{vector_base}_{side_str}.push_back([&]({}) {{",
         arg_decls.join(", ")
     )
     .ok();
@@ -686,9 +761,9 @@ pub(super) fn hook_sampler_registration(
 
 /// C-type list for a method's params (the hook-vector signature),
 /// matching `emit_method`'s lambda param shape exactly.
-fn method_param_ctypes(prog: &TbProgram, m: &TransactorMethodSchema) -> Vec<String> {
-    let func = prog.function(m.function);
-    (0..m.n_params)
+fn method_param_ctypes(prog: &TbProgram, function: FunctionId, n_params: usize) -> Vec<String> {
+    let func = prog.function(function);
+    (0..n_params)
         .map(|i| param_cty(prog, &func.locals[i].ty))
         .collect()
 }

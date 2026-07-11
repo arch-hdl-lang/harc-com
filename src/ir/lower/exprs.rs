@@ -7,7 +7,9 @@ use super::{unsupported, FuncBuilder, LowerError};
 use crate::ast::{
     BinaryOp, BuiltinTy, CallArg, Expr as AstExpr, ExprKind, TypeArg, TypeExpr, UnaryOp,
 };
-use crate::ir::{BinOp, Expr, IrType, LocalId, PortAccess, PortRef, RecordId, Stmt, UnOp, WidthCastKind};
+use crate::ir::{
+    BinOp, Expr, IrType, LocalId, PortAccess, PortRef, RecordId, Stmt, UnOp, WidthCastKind,
+};
 
 /// Resolution of a (possibly nested) record field-access chain
 /// `ident.f1.f2...fn` rooted at a record-typed local. `field` is the
@@ -53,6 +55,17 @@ impl FuncBuilder<'_> {
             ExprKind::Ident(id) => {
                 if let Some(local) = self.lookup(&id.name) {
                     return Ok(Expr::Local(local));
+                }
+                // Whole transaction/struct-typed testbench field read
+                // (`cur`) from an inlined testbench method. Ordinary
+                // lookup is intentionally fenced at inline-helper
+                // boundaries, but shared testbench record state must remain
+                // visible so calls like `drv.drive(cur)` pass the persistent
+                // record object rather than looking for a caller local.
+                if let Some(local) = self.lookup_tb_record_field_in_capture_scope(&id.name) {
+                    if self.record_of_local(local).is_some() {
+                        return Ok(Expr::Local(local));
+                    }
                 }
                 // The framework cycle counter (`cycle_count`), conventionally
                 // referenced from `${cycle_count}` in a watchdog/log
@@ -104,14 +117,12 @@ impl FuncBuilder<'_> {
                 if let Some(cv) = self.as_component_value_read(e)? {
                     return Ok(cv);
                 }
-                // Closure-hook host-state promotion: a test-scope `let`
-                // captured by an `on <obj>.<method> pre/post` hook was
-                // promoted to a `_tb` scalar field. A bare ident in that
-                // set (locals shadow — checked above) reads the shared
-                // `_tb` cell. This is the read counterpart to the
-                // `TbFieldWrite` produced for a promoted-let assignment.
-                if self.ctx.promoted_tb_lets.contains(&id.name) {
-                    return Ok(Expr::TbField(id.name.clone()));
+                // Scalar testbench host state (`expected_checks`) and
+                // promoted test-scope lets live on `_tb`. Bare access is
+                // allowed only from the test/check/hook body itself or from
+                // an inlined `_tb.<method>` frame; free helpers stay fenced.
+                if let Some(field) = self.tb_scalar_field_in_capture_scope(&id.name) {
+                    return Ok(Expr::TbField(field));
                 }
                 if self.in_check && self.ctx.test_scope_lets.contains(&id.name) {
                     return Err(unsupported(
@@ -136,6 +147,16 @@ impl FuncBuilder<'_> {
                 // Scalar testbench field read (`_tb.expected`).
                 if let Some(field) = self.as_tb_scalar_field(e) {
                     return Ok(Expr::TbField(field));
+                }
+                // Whole transaction/struct-typed testbench field read
+                // (`_tb.cur`) — used when passing shared record state to
+                // helpers, monitors, or scoreboards. Field-level reads
+                // (`_tb.cur.value`) are handled below by the record-field
+                // path.
+                if let Some(local) = self.record_target_local(e) {
+                    if self.record_of_local(local).is_some() {
+                        return Ok(Expr::Local(local));
+                    }
                 }
                 // Test-scope read of a bound-to target responder's
                 // persistent state (`target.read_count`).
@@ -239,7 +260,10 @@ impl FuncBuilder<'_> {
                 if let Some(port) = self.as_bus_port_ref(e)? {
                     return Ok(Expr::Port(port));
                 }
-                Err(unsupported("field access on a non-DUT value", ""))
+                Err(unsupported(
+                    &format!("field access on a non-DUT value ending in `.{}`", name.name),
+                    "",
+                ))
             }
             ExprKind::Paren(inner) => self.lower_expr(inner),
             ExprKind::Unary { op, expr } => {
@@ -262,7 +286,10 @@ impl FuncBuilder<'_> {
                 // widening). The mask is a `WidthCast::Trunc`, which codegen
                 // lowers to `(expr) & ((1<<W)-1)`. Non-wrapping ops pass
                 // through unchanged.
-                if matches!(op, BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap) {
+                if matches!(
+                    op,
+                    BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap
+                ) {
                     return self.wrap_to_operand_width(*op, lhs, rhs, inner);
                 }
                 Ok(inner)
@@ -286,10 +313,7 @@ impl FuncBuilder<'_> {
             ExprKind::Call { callee, args } => {
                 let what = match &*callee.kind {
                     ExprKind::Ident(id) => {
-                        if self
-                            .inline_frames
-                            .iter()
-                            .any(|f| f.name.starts_with("_tb."))
+                        if self.in_testbench_method_frame()
                             && self.ctx.tb_methods.contains_key(&id.name)
                         {
                             return self.lower_tb_method_call(&id.name, args);
@@ -552,17 +576,37 @@ impl FuncBuilder<'_> {
             return Ok(None); // bare ident, no field access
         }
         segs.reverse();
-        let Some(local) = self.lookup(&root.name) else {
+        let mut field_start = 0usize;
+        let local = if let Some(local) = self.lookup(&root.name) {
+            local
+        } else if let Some(tb_field) = self.ctx.tb_field.as_deref() {
+            if root.name == tb_field {
+                let Some(tb_record) = segs.first() else {
+                    return Ok(None);
+                };
+                let Some(local) = self.lookup_tb_record_field_in_capture_scope(tb_record) else {
+                    return Ok(None);
+                };
+                field_start = 1;
+                local
+            } else {
+                return Ok(None);
+            }
+        } else {
             return Ok(None);
         };
         let Some(mut cur_rid) = self.record_of_local(local) else {
             return Ok(None);
         };
+        if field_start >= segs.len() {
+            return Ok(None);
+        }
         let mut dotted = self.ctx.records[cur_rid.index()].name.clone();
-        let last = segs.len() - 1;
+        let fields = &segs[field_start..];
+        let last = fields.len() - 1;
         let mut leaf_vec_len = None;
         let mut leaf_ty = IrType::Bool; // overwritten at the leaf
-        for (i, seg) in segs.iter().enumerate() {
+        for (i, seg) in fields.iter().enumerate() {
             let schema = &self.ctx.records[cur_rid.index()];
             let Some(fld) = schema.field(seg) else {
                 return Err(LowerError::Invalid(format!(
@@ -585,15 +629,15 @@ impl FuncBuilder<'_> {
                         &format!(
                             "field `{}.{seg}` is not a nested record; cannot access `.{}`",
                             schema.name,
-                            segs[i + 1]
+                            fields[i + 1]
                         ),
                         "only nested struct/transaction fields can be traversed further",
                     ));
                 }
             }
         }
-        let field = segs[0].clone();
-        let path = segs[1..].to_vec();
+        let field = fields[0].clone();
+        let path = fields[1..].to_vec();
         Ok(Some(RecordFieldChain {
             local,
             field,
@@ -798,6 +842,7 @@ impl FuncBuilder<'_> {
             | Expr::ErrorCount
             | Expr::RecordField { index: None, .. }
             | Expr::CovHookParam { index: None, .. }
+            | Expr::CovHookArg { .. }
             | Expr::TbField(_)
             // Transactor-instance state is host state — no DUT port inside.
             | Expr::TransactorState { .. }
@@ -1069,12 +1114,6 @@ impl FuncBuilder<'_> {
                         if segments.is_empty() {
                             return Ok(None);
                         }
-                        if segments.len() > 1 {
-                            // `dut.bus.sig` flattening conventions are
-                            // backend-specific (bus binds, Vec<Bus>);
-                            // not verified for tbir yet.
-                            return Err(unsupported("nested DUT port paths (`dut.a.b`)", ""));
-                        }
                         segments.reverse();
                         // A single-segment `dut.<name>` whose name was
                         // declared as a `probe` on `let dut` is a DUT-
@@ -1097,6 +1136,7 @@ impl FuncBuilder<'_> {
                         return Ok(Some(PortRef {
                             testbench_field: self.ctx.dut_field.clone(),
                             port_path: segments,
+                            aggregate_path: true,
                             direction: None,
                             width,
                             access,
@@ -1150,6 +1190,23 @@ impl FuncBuilder<'_> {
                             return Ok(None);
                         }
                         if segments.len() == 1 && self.ctx.tb_scalar_fields.contains(&segments[0]) {
+                            return Ok(None);
+                        }
+                        if self
+                            .ctx
+                            .tb_record_fields
+                            .iter()
+                            .any(|(field, _)| field == segments.last().unwrap())
+                        {
+                            return Ok(None);
+                        }
+                        if segments.len() == 1
+                            && self
+                                .ctx
+                                .tb_record_fields
+                                .iter()
+                                .any(|(field, _)| field == &segments[0])
+                        {
                             return Ok(None);
                         }
                         return Err(unsupported(
@@ -1304,6 +1361,38 @@ impl FuncBuilder<'_> {
         };
         (root.name == tb_field && self.ctx.tb_scalar_fields.contains(&name.name))
             .then(|| name.name.clone())
+    }
+
+    /// Resolve a record-field target root. Supports both bare record
+    /// locals (`cur.value`) and desugared testbench record fields
+    /// (`_tb.cur.value`), where `cur` is a synthetic local declared at
+    /// function entry but emitted as shared test-scope state.
+    pub(crate) fn record_target_local(&self, target: &AstExpr) -> Option<crate::ir::LocalId> {
+        match &*target.kind {
+            ExprKind::Ident(root) => self
+                .lookup(&root.name)
+                .or_else(|| self.lookup_tb_record_field_in_capture_scope(&root.name)),
+            ExprKind::Field { target, name } => {
+                let tb_field = self.ctx.tb_field.as_deref()?;
+                let ExprKind::Ident(root) = &*target.kind else {
+                    return None;
+                };
+                if root.name != tb_field {
+                    return None;
+                }
+                if !self
+                    .ctx
+                    .tb_record_fields
+                    .iter()
+                    .any(|(field, _)| field == &name.name)
+                {
+                    return None;
+                }
+                self.lookup_tb_record_field_in_capture_scope(&name.name)
+            }
+            ExprKind::Paren(inner) => self.record_target_local(inner),
+            _ => None,
+        }
     }
 
     /// `Some((instance, field))` when the expression is a test-scope
@@ -1741,6 +1830,9 @@ pub(crate) fn expr_has_transactor_edge(e: &Expr) -> bool {
         Expr::WidthCast { inner, .. } => expr_has_transactor_edge(inner),
         Expr::ComponentIdle { n, .. } => expr_has_transactor_edge(n),
         Expr::SeqIndex { index, .. } => expr_has_transactor_edge(index),
+        Expr::CovHookParam {
+            index: Some(index), ..
+        } => expr_has_transactor_edge(index),
         _ => false,
     }
 }

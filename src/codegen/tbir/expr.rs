@@ -75,7 +75,10 @@ pub(super) fn escape_c(s: &str) -> String {
 /// Mirrors v1's `Emitter::probes` lowering. See docs/probe-signals.md.
 pub(super) fn port_signal(cx: &ECx<'_>, p: &PortRef) -> String {
     match p.access {
-        crate::ir::PortAccess::Port => format!("dut->{}", p.port_path.join("_")),
+        crate::ir::PortAccess::Port => {
+            let sep = if p.aggregate_path { "." } else { "_" };
+            format!("dut->{}", p.port_path.join(sep))
+        }
         crate::ir::PortAccess::Probe | crate::ir::PortAccess::Force => {
             format!("dut->rootp->{}", probe_read_accessor(cx.dut_type, p))
         }
@@ -262,8 +265,12 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             }
         }
         Expr::Unary(op, a) => {
+            let width = expr_static_width(cx, a);
             let a = expr_cpp(cx, a)?;
-            format!("{}({a})", un_op_cpp(*op))
+            match op {
+                UnOp::BitNot => bit_not_cpp(&a, width),
+                _ => format!("{}({a})", un_op_cpp(*op)),
+            }
         }
         Expr::Ternary(c, t, e2) => {
             // v1 wraps the whole conditional in parens so it cannot
@@ -311,6 +318,7 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             }
             None => format!("{param}.{field}"),
         },
+        Expr::CovHookArg { param } => param.clone(),
         // Composite-component scalar field read: self-relative inside a
         // method body (`self.count`) or a dotted path from a test-scope
         // component local (`env.sb.count`). Both name plain by-value C++
@@ -604,6 +612,55 @@ fn un_op_cpp(op: UnOp) -> &'static str {
         UnOp::Neg => "-",
         UnOp::Not => "!",
         UnOp::BitNot => "~",
+    }
+}
+
+fn bit_not_cpp(e: &str, width: Option<u32>) -> String {
+    match width {
+        Some(w) if w < 64 => {
+            let mask = (1u64 << w) - 1;
+            format!("((uint64_t)((~({e}) & 0x{mask:X}ULL)))")
+        }
+        Some(64) | None => format!("~({e})"),
+        Some(w) if w <= 128 => format!("harc_rt::harc_trunc_u128((~((_harc_u128)({e}))), {w})"),
+        Some(w) => format!("harc_rt::harc_wide_mask_bits(~({e}), {w})"),
+    }
+}
+
+fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
+    match e {
+        Expr::Literal { ty, .. } => ir_type_width(ty),
+        Expr::Local(id) => cx
+            .func
+            .locals
+            .get(id.0 as usize)
+            .and_then(|l| ir_type_width(&l.ty)),
+        Expr::Port(p) => p.width,
+        Expr::Binary(op, a, b) => match op {
+            BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::And
+            | BinOp::Or => Some(1),
+            _ => expr_static_width(cx, a).or_else(|| expr_static_width(cx, b)),
+        },
+        Expr::Unary(_, inner) => expr_static_width(cx, inner),
+        Expr::Ternary(_, t, f) => expr_static_width(cx, t).or_else(|| expr_static_width(cx, f)),
+        Expr::BitSlice { hi, lo, .. } => Some(hi - lo + 1),
+        Expr::WidthCast { width, .. } => Some(*width),
+        Expr::CycleCount => Some(64),
+        _ => None,
+    }
+}
+
+fn ir_type_width(ty: &crate::ir::IrType) -> Option<u32> {
+    match ty {
+        crate::ir::IrType::UInt(w) | crate::ir::IrType::SInt(w) => *w,
+        crate::ir::IrType::Bool => Some(1),
+        _ => None,
     }
 }
 
