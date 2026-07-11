@@ -786,7 +786,6 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         consts: consts.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_record_fields: Vec::new(),
-        promoted_tb_lets: HashSet::new(),
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
@@ -849,7 +848,6 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         consts: consts.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_record_fields: Vec::new(),
-        promoted_tb_lets: HashSet::new(),
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
@@ -998,7 +996,6 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         consts: consts.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_record_fields: Vec::new(),
-        promoted_tb_lets: HashSet::new(),
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
@@ -3367,7 +3364,6 @@ fn lower_test(
         consts: consts.clone(),
         tb_scalar_fields: scalar_fields.iter().map(|f| f.name.clone()).collect(),
         tb_record_fields: record_fields.clone(),
-        promoted_tb_lets: promoted_lets.clone(),
         regblock_callbacks: regblock_callbacks.clone(),
         tb_methods,
         test_scope_lets: test_let_names,
@@ -4066,17 +4062,6 @@ pub(crate) struct LowerCtx {
     /// the backend skips that local declaration/init and binds the name
     /// to one shared test-scope C++ object instead.
     pub tb_record_fields: Vec<(String, RecordId)>,
-    /// Test-scope `let` names PROMOTED to `_tb` scalar host fields
-    /// because a closure-hook body (`on <obj>.<method> pre/post`)
-    /// captures them by reference (host-state promotion). A bare ident
-    /// in this set resolves to `Expr::TbField`/`Stmt::TbFieldWrite`
-    /// (NOT a run-function local) so the run coroutine and the hook
-    /// function share the same `_tb` cell — the mechanism that lets the
-    /// function-per-CFG IR express v1's `[&]`-capturing hook closure.
-    /// These names are also present in `tb_scalar_fields` (the `_tb.X`
-    /// access path); the separate set drives bare-ident resolution since
-    /// the impl-form desugarer leaves test-scope lets unqualified.
-    pub promoted_tb_lets: HashSet<String>,
     /// Per-register `on regs.REG` write callbacks, keyed by regblock
     /// binding name → `(register, callback-FunctionId)`. Consulted by
     /// `try_lower_record_write`: when a `record_write` targets a binding
