@@ -131,6 +131,25 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             buses.insert(b.name.name.clone(), b);
         }
     }
+    // Names requested via `use Name;` that never resolved to a live `bus`
+    // declaration — either the search in `resolve_use_imports` (main.rs)
+    // found no `Name.arch`/`Name.harc`, or `use` targeted something that
+    // was never a bus. `use` can only ever bring in `Item::Bus` items (see
+    // `resolve_use_imports`'s doc comment), so "not in `buses`" is a
+    // reliable "this use never resolved" signal. Threaded into
+    // `lower_test` so a downstream `let x: Name = bind ...` can name the
+    // failed import directly instead of falling through to the generic
+    // "let with a bind" rejection (see issue #493).
+    let mut unresolved_use_names: HashSet<String> = HashSet::new();
+    for it in &file.items {
+        if let Item::Use(u) = it {
+            if let Some(last) = u.path.segments.last() {
+                if !buses.contains_key(&last.name) {
+                    unresolved_use_names.insert(last.name.clone());
+                }
+            }
+        }
+    }
     let used_tbs: HashSet<&String> = tb_of_test.values().collect();
 
     // Pre-scan of test-scope bus bindings (`let <name> : <Bus> = bind
@@ -1078,6 +1097,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &regblock_ids,
             &addrmap_decls,
             &buses,
+            &unresolved_use_names,
             &consts,
             &extern_fns,
             &helper_registry,
@@ -1534,6 +1554,7 @@ fn lower_test(
     regblock_ids: &HashMap<String, RegblockId>,
     addrmap_decls: &HashMap<String, &AddrmapDecl>,
     buses: &HashMap<String, &BusDecl>,
+    unresolved_use_names: &HashSet<String>,
     consts: &HashMap<String, u64>,
     extern_fns: &HashSet<String>,
     helpers: &helpers::HelperRegistry<'_>,
@@ -2155,6 +2176,25 @@ fn lower_test(
             }
             TestItem::Let(l) => {
                 if !l.probes.is_empty() || l.bind {
+                    // A bind whose type name matches a `use` that never
+                    // resolved gets a targeted diagnostic instead of the
+                    // generic "let with a bind" rejection below — the type
+                    // is not unsupported, it's simply missing (see #493).
+                    if l.bind {
+                        if let Some(name) = type_simple_name(l.ty.as_ref()) {
+                            if unresolved_use_names.contains(name) {
+                                return Err(LowerError::Invalid(format!(
+                                    "test-scope `let {} : {name} = bind ...` references type \
+                                     `{name}`, but `use {name};` never resolved — no \
+                                     `{name}.arch` or `{name}.harc` was found in \
+                                     $HARC_LIB_PATH, <input dir>/stdlib/, ./stdlib/, or \
+                                     ../arch-com/{{stdlib,examples}}/. Check the import name/path, \
+                                     or declare `bus {name} ... end bus {name}` locally.",
+                                    l.name.name
+                                )));
+                            }
+                        }
+                    }
                     return Err(unsupported(
                         &format!("test-scope `let {}` with probes or a bind", l.name.name),
                         "only plain `let <name> [: <Ty>] = <expr>` test-scope lets are lowered",

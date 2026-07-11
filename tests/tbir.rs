@@ -172,6 +172,64 @@ end test T"#,
     );
 }
 
+/// harc#473: `-%` masks like `+%`/`*%`. A typed `z : uint<8>` minus a
+/// literal masks the two's-complement residue at 8 b, so `0 -% 1` emits
+/// `(z - 1) & 0xFF` (== 255 at runtime), not the un-wrapped `z - 1`.
+/// (`+%`/`*%` are covered above; this locks the subtraction path, which is
+/// otherwise only exercised at runtime by the fixture.)
+#[test]
+fn wrapping_sub_op_masks_to_operand_width() {
+    let cpp = emit_cpp_src(
+        r#"test T
+    let dut : Top
+    run
+        let z : uint<8> = 0
+        let d : uint<8> = z -% 1
+        assert d == 255 else fail("x")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("((z - 1)) & 0xFFULL"),
+        "expected 8-bit sub-wrap mask `(z - 1) & 0xFF`; got:\n{cpp}"
+    );
+}
+
+/// harc#473: a wrapping op nested inside another (`(a +% b) *% c`) masks at
+/// *each* level's own operand width, not just the outermost. The inner
+/// `a +% b` lowers to its own `& 0xFF` and the outer `*% c` wraps that
+/// masked value again — so two independent 8-bit masks appear. This locks
+/// the recursive `Binary` arm of `infer_wrap_operand_width`, which reports a
+/// nested wrap's result width as `max(W(lhs), W(rhs))`; a single-level
+/// fixture cannot catch a regression in that composition.
+#[test]
+fn wrapping_ops_nest_masks_at_each_level() {
+    let cpp = emit_cpp_src(
+        r#"test T
+    let dut : Top
+    run
+        let a : uint<8> = 200
+        let b : uint<8> = 100
+        let c : uint<8> = 3
+        let r : uint<8> = (a +% b) *% c
+        assert r == 132 else fail("x")
+    end run
+end test T"#,
+    );
+    // Inner add-wrap masks at 8 b ...
+    assert!(
+        cpp.contains("((a + b)) & 0xFFULL"),
+        "expected inner add-wrap mask `(a + b) & 0xFF`; got:\n{cpp}"
+    );
+    // ... and the outer mul-wrap masks the already-masked value again, so at
+    // least two 8-bit masks are present in the emitted assignment.
+    let masks = cpp.matches("& 0xFFULL").count();
+    assert!(
+        masks >= 2,
+        "expected both nested wraps to mask at 8 b (>=2 `& 0xFF`); found {masks} in:\n{cpp}"
+    );
+}
+
 /// Locks the dump-ir text for the tracer-bullet fixture: testbench /
 /// test schemas, block structure, port hoisting, loop shapes,
 /// interpolated format args.
@@ -270,6 +328,64 @@ end impl Tst"#;
     let msg = err.to_string();
     assert!(matches!(err, lower::LowerError::Invalid(_)), "{err:?}");
     assert!(msg.contains("read-only probe"), "{msg}");
+}
+
+/// harc-com#493: a bus type named by `use` that never resolved (here,
+/// unconditionally — `lower_src` skips `resolve_use_imports`, so every
+/// `use` is "unresolved" from lowering's point of view) must not fall
+/// through to the generic "let with a bind" rejection when a test binds
+/// against it. The diagnostic should name the missing type and point at
+/// the failed `use`, not tell the user to remove the bind.
+#[test]
+fn unresolved_use_bind_gets_targeted_diagnostic() {
+    let src = r#"use MissingBus
+
+testbench T
+end testbench T
+
+impl Tst for T
+    let dut : SomeDut
+    let axil : MissingBus = bind dut
+    run
+    end run
+end impl Tst"#;
+    let err = lower_src(src).expect_err("bind against an unresolved `use` type must be rejected");
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)),
+        "must be LowerError::Invalid, not Unsupported (the type isn't out-of-subset, \
+         it's missing): {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("MissingBus"), "must name the missing type: {msg}");
+    assert!(
+        msg.contains("use MissingBus"),
+        "must point at the failed `use`: {msg}"
+    );
+    assert!(
+        !msg.contains("with probes or a bind"),
+        "must not fall back to the generic misleading message: {msg}"
+    );
+}
+
+/// Sibling of the above: a `use` that never resolves but is also never
+/// bound against must keep parsing exactly as before (non-goal in
+/// harc-com#493) — existing fixtures with a dangling `use arc.stdlib.X`
+/// line must not gain a new error.
+#[test]
+fn unused_unresolved_use_does_not_error() {
+    let src = r#"use MissingBus
+
+testbench T
+end testbench T
+
+impl Tst for T
+    let dut : SomeDut
+    run
+        let x : uint<8> = 1
+        assert x == 1 else fail("x")
+    end run
+end impl Tst"#;
+    lower_src(src).expect("an unused, never-resolved `use` must not error");
 }
 
 // ── Emitted-C++ snapshots — the emission surface for the original
@@ -1591,6 +1707,101 @@ end test NestedBadLeafTest
     assert!(msg.contains("non-scalar"), "names the reason: {msg}");
 }
 
+/// A self-referential by-value struct (`Node { next : Node }`) is
+/// STRUCTURALLY INVALID in every backend — the generated C++ struct is
+/// infinitely sized, and v1 codegen stack-overflows on it. So it must be
+/// rejected as `LowerError::Invalid` (NOT `Unsupported`), and the message
+/// must NOT suggest `--codegen v1` (that path crashes). Regression guard
+/// for the diagnostic-routing fix.
+#[test]
+fn self_recursive_record_is_rejected_as_invalid_not_v1_suggestion() {
+    let src = r#"
+struct Node
+    next : Node
+    val  : uint<8>
+end struct Node
+
+test SelfCycleTest
+    let dut : Top
+    run
+        let n : Node
+    end run
+end test SelfCycleTest
+"#;
+    let err = lower_src(src).expect_err("self-recursive record must be rejected");
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)),
+        "must be Invalid, not Unsupported: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("--codegen v1"),
+        "cyclic-record error must NOT suggest --codegen v1 (v1 crashes): {msg}"
+    );
+    assert!(msg.contains("Node"), "names the cyclic record: {msg}");
+}
+
+/// Mutual recursion (`A { b : B }`, `B { a : A }`) is likewise a
+/// by-value cycle and rejected as `Invalid`.
+#[test]
+fn mutually_recursive_records_are_rejected_as_invalid() {
+    let src = r#"
+struct A
+    b : B
+end struct A
+
+struct B
+    a : A
+end struct B
+
+test MutualCycleTest
+    let dut : Top
+    run
+        let x : A
+    end run
+end test MutualCycleTest
+"#;
+    let err = lower_src(src).expect_err("mutually-recursive records must be rejected");
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)),
+        "must be Invalid: {err:?}"
+    );
+    assert!(
+        !err.to_string().contains("--codegen v1"),
+        "cyclic-record error must NOT suggest --codegen v1: {err}"
+    );
+}
+
+/// A DIAMOND (shared but acyclic) nesting — `Outer { a : Mid, b : Mid }`
+/// where `Mid` is reached twice but the graph has no cycle — must NOT be
+/// false-rejected by the cycle check. This locks the gray/black DFS's
+/// handling of a Black (already-finished) node on a second visit.
+#[test]
+fn diamond_shared_record_is_accepted() {
+    let src = r#"
+struct Mid
+    x : uint<8>
+end struct Mid
+
+struct Outer
+    a : Mid
+    b : Mid
+end struct Outer
+
+test DiamondTest
+    let dut : Top
+    run
+        let o : Outer
+        o.a.x = 3
+        o.b.x = 4
+        assert o.a.x == 3 else fail("diamond a lost")
+        assert o.b.x == 4 else fail("diamond b lost")
+    end run
+end test DiamondTest
+"#;
+    lower_src(src).expect("diamond (shared acyclic) record must lower cleanly");
+}
+
 /// A whole-`Vec` record-field READ in scalar position (here a format
 /// arg) must be REJECTED with a structured diagnostic — NOT lowered into
 /// `harc_printf_ll(r.data)`, which miscompiles as a raw clang error
@@ -1676,10 +1887,7 @@ end test ScalarRhsTest
         msg.contains("whole-`Vec` write of record field"),
         "names the write: {msg}"
     );
-    assert!(
-        msg.contains("non-matching RHS"),
-        "names the reason: {msg}"
-    );
+    assert!(msg.contains("non-matching RHS"), "names the reason: {msg}");
 }
 
 /// A whole-`Vec` field copy whose RHS field has a MISMATCHED shape
@@ -1708,10 +1916,7 @@ end test MismatchTest
 "#;
     let err = lower_src(src).expect_err("mismatched-shape whole-Vec copy must be rejected");
     let msg = assert_unsupported(&err);
-    assert!(
-        msg.contains("non-matching RHS"),
-        "names the reason: {msg}"
-    );
+    assert!(msg.contains("non-matching RHS"), "names the reason: {msg}");
 }
 
 /// The sanctioned whole-`Vec` field copy (`dst.data = src.data`, same
@@ -4238,6 +4443,266 @@ end impl DrvTest
         arg_is_local,
         "run_for call passes the record local by value:\n{run}"
     );
+}
+
+/// Issue #494: a file-scope helper parameter typed as a declared
+/// transaction/struct is a by-value record, not a DUT/module handle. The
+/// helper is CFG-inlined because record field access is outside the pure
+/// scalar-helper subset, but the parameter local must still be
+/// `IrType::Record` so `cmd.value` lowers through the existing
+/// `RecordField` path instead of the old "module type with a non-DUT
+/// argument" rejection.
+#[test]
+fn file_helper_record_typed_param_lowers() {
+    let src = r#"
+transaction Cmd
+    value : uint<8> default 0
+end transaction Cmd
+
+function get_value(cmd: Cmd) -> uint<8>
+    return cmd.value
+end function get_value
+
+testbench HelperRecordParamTb
+    dut : Top
+end testbench HelperRecordParamTb
+
+impl HelperRecordParamTest for HelperRecordParamTb
+    run
+        let cmd : Cmd
+        cmd.value = 7
+        let got = get_value(cmd)
+        assert got == 7
+            else fail("got ${got}, expected 7")
+    end run
+end impl HelperRecordParamTest
+"#;
+    let prog = lower_src(src).expect("record-typed file helper param lowers");
+    verify::verify_program(&prog).expect("verifies");
+
+    let run = prog.function(prog.tests[0].run);
+    assert!(
+        run.locals
+            .iter()
+            .any(|l| l.name.starts_with("cmd_") && matches!(l.ty, ir::IrType::Record(_))),
+        "inlined helper declares a record-typed cmd parameter local:\n{run}"
+    );
+    assert!(
+        format!("{run}").contains("%cmd_2.value"),
+        "inlined helper reads the record field:\n{run}"
+    );
+}
+
+/// Issue #494: the same record-vs-module classification must apply to
+/// testbench helper methods. A `function observe(cmd: Cmd)` declared on a
+/// testbench receives `cmd` by value and can read `cmd.value` when inlined
+/// into a bound `impl` body.
+#[test]
+fn testbench_method_record_typed_param_lowers() {
+    let src = r#"
+transaction Cmd
+    value : uint<8> default 0
+end transaction Cmd
+
+testbench TbRecordMethod
+    dut : Top
+
+    function observe(cmd: Cmd) -> uint<8>
+        return cmd.value
+    end function observe
+end testbench TbRecordMethod
+
+impl TbRecordMethodTest for TbRecordMethod
+    run
+        let cmd : Cmd
+        cmd.value = 9
+        let got = observe(cmd)
+        assert got == 9
+            else fail("got ${got}, expected 9")
+    end run
+end impl TbRecordMethodTest
+"#;
+    let prog = lower_src(src).expect("record-typed testbench method param lowers");
+    verify::verify_program(&prog).expect("verifies");
+
+    let run = prog.function(prog.tests[0].run);
+    assert!(
+        run.locals
+            .iter()
+            .any(|l| l.name.starts_with("cmd_") && matches!(l.ty, ir::IrType::Record(_))),
+        "inlined testbench method declares a record-typed cmd parameter local:\n{run}"
+    );
+    assert!(
+        format!("{run}").contains("%cmd_2.value"),
+        "inlined testbench method reads the record field:\n{run}"
+    );
+}
+
+/// Issue #494: scoreboard/component methods use their own parameter
+/// classifier. A method such as `sink.observe(cmd: Cmd)` must bind `cmd`
+/// as a by-value record so the body can read `cmd.value`.
+#[test]
+fn scoreboard_method_record_typed_param_lowers() {
+    let src = r#"
+transaction Cmd
+    value : uint<8> default 0
+end transaction Cmd
+
+scoreboard Sink
+    seen : uint<8> default 0
+
+    function observe(cmd: Cmd)
+        seen = cmd.value
+    end function observe
+end scoreboard Sink
+
+testbench ScoreboardRecordParamTb
+    dut : Top
+    sink : Sink
+end testbench ScoreboardRecordParamTb
+
+impl ScoreboardRecordParamTest for ScoreboardRecordParamTb
+    run
+        let cmd : Cmd
+        cmd.value = 11
+        sink.observe(cmd)
+        assert sink.seen == 11
+            else fail("seen ${sink.seen}, expected 11")
+    end run
+end impl ScoreboardRecordParamTest
+"#;
+    let prog = lower_src(src).expect("record-typed scoreboard method param lowers");
+    verify::verify_program(&prog).expect("verifies");
+
+    let method = prog
+        .components
+        .iter()
+        .find(|c| c.name == "Sink")
+        .and_then(|c| c.method("observe"))
+        .expect("Sink.observe");
+    let func = prog.function(method.function);
+    assert_eq!(
+        func.params.first().map(|p| &p.ty),
+        Some(&ir::IrType::Record(ir::RecordId(0))),
+        "scoreboard method param is record-typed:\n{func}"
+    );
+    assert!(
+        format!("{func}").contains("%cmd.value"),
+        "scoreboard method reads the record field:\n{func}"
+    );
+}
+
+/// Issue #494 follow-up: inlined file helpers can return a record by value.
+/// The return temp must be `RecordInit`-initialized, not assigned scalar `0`.
+#[test]
+fn file_helper_record_typed_param_record_return_lowers() {
+    let src = r#"
+transaction Cmd
+    value : uint<8> default 0
+end transaction Cmd
+
+function id_cmd(cmd: Cmd) -> Cmd
+    return cmd
+end function id_cmd
+
+testbench HelperRecordReturnTb
+    dut : Top
+end testbench HelperRecordReturnTb
+
+impl HelperRecordReturnTest for HelperRecordReturnTb
+    run
+        let cmd : Cmd
+        cmd.value = 13
+        let got : Cmd = id_cmd(cmd)
+        assert got.value == 13
+            else fail("got ${got.value}, expected 13")
+    end run
+end impl HelperRecordReturnTest
+"#;
+    let prog = lower_src(src).expect("record-returning file helper lowers");
+    verify::verify_program(&prog).expect("verifies");
+
+    let run = prog.function(prog.tests[0].run);
+    assert_no_record_zero_assign(run);
+    assert!(
+        run.blocks
+            .iter()
+            .flat_map(|b| &b.stmts)
+            .any(|s| matches!(s, ir::Stmt::RecordInit(_, ir::RecordId(0)))),
+        "record-return temp is default-initialized with RecordInit:\n{run}"
+    );
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("__t0 = Cmd{};") && !cpp.contains("__t0 = 0;"),
+        "record-return helper must default-initialize the record temp, not scalar-zero it:\n{cpp}"
+    );
+}
+
+/// Issue #494 follow-up: inlined testbench methods can also return a
+/// record by value without scalar-zero initializing the record temp.
+#[test]
+fn testbench_method_record_typed_param_record_return_lowers() {
+    let src = r#"
+transaction Cmd
+    value : uint<8> default 0
+end transaction Cmd
+
+testbench TbRecordReturn
+    dut : Top
+
+    function id_cmd(cmd: Cmd) -> Cmd
+        return cmd
+    end function id_cmd
+end testbench TbRecordReturn
+
+impl TbRecordReturnTest for TbRecordReturn
+    run
+        let cmd : Cmd
+        cmd.value = 17
+        let got : Cmd = id_cmd(cmd)
+        assert got.value == 17
+            else fail("got ${got.value}, expected 17")
+    end run
+end impl TbRecordReturnTest
+"#;
+    let prog = lower_src(src).expect("record-returning testbench method lowers");
+    verify::verify_program(&prog).expect("verifies");
+
+    let run = prog.function(prog.tests[0].run);
+    assert_no_record_zero_assign(run);
+    assert!(
+        run.blocks
+            .iter()
+            .flat_map(|b| &b.stmts)
+            .any(|s| matches!(s, ir::Stmt::RecordInit(_, ir::RecordId(0)))),
+        "record-return temp is default-initialized with RecordInit:\n{run}"
+    );
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("__t0 = Cmd{};") && !cpp.contains("__t0 = 0;"),
+        "record-return testbench method must default-initialize the record temp, not scalar-zero it:\n{cpp}"
+    );
+}
+
+fn assert_no_record_zero_assign(func: &ir::TbFunction) {
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            if let ir::Stmt::Assign(
+                local,
+                ir::Expr::Literal {
+                    value: 0,
+                    ty: ir::IrType::Unknown,
+                },
+            ) = stmt
+            {
+                assert!(
+                    !matches!(func.locals[local.index()].ty, ir::IrType::Record(_)),
+                    "record-typed local `{}` must not be scalar-zero initialized:\n{func}",
+                    func.locals[local.index()].name
+                );
+            }
+        }
+    }
 }
 
 /// ...and not inside lazily-evaluated log/fail messages either.
