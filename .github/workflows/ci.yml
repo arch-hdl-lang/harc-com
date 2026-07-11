@@ -15,13 +15,13 @@ jobs:
     name: cargo test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Z3 (needed by harc's Z3 bindings at link time)
         run: sudo apt-get update && sudo apt-get install -y libz3-dev
 
       - name: Cache cargo registry + target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -43,13 +43,13 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-and-test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Z3
         run: sudo apt-get update && sudo apt-get install -y libz3-dev
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -104,7 +104,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-and-test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Z3 + clang
         # clang is needed because the emitted test `.cpp` uses
@@ -131,7 +131,7 @@ jobs:
       # so this only pays the build cost on cache miss.
       - name: Cache Verilator
         id: cache-verilator
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /opt/verilator
           key: verilator-v5.034-ubuntu-${{ runner.os }}
@@ -182,14 +182,14 @@ jobs:
           echo "CCACHE_SLOPPINESS=time_macros" >> "$GITHUB_ENV"
 
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.ccache
           key: ccache-sim-${{ github.run_id }}
           restore-keys: ccache-sim-
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -253,7 +253,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-and-test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Pin the ARCH compiler to a released version. The prebuilt binary is
       # installed below via cargo-dist (no slow source build); this sparse,
@@ -262,7 +262,7 @@ jobs:
       # Bump ARCH_VERSION (here + the installer step) to test against a newer
       # released arch.
       - name: Check out arch-com example designs (pinned, sparse)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: arch-hdl-lang/arch-com
           ref: v0.70.4
@@ -280,7 +280,7 @@ jobs:
 
       - name: Cache Verilator
         id: cache-verilator
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /opt/verilator
           key: verilator-v5.034-ubuntu-${{ runner.os }}
@@ -302,7 +302,7 @@ jobs:
           /opt/verilator/bin/verilator --version
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
