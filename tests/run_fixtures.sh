@@ -113,6 +113,7 @@ transactor_agent_mode_test | AxiLiteRegs   | AxiLiteRegs.sv         |
 transactor_env_mode_test | AxiLiteRegs     | AxiLiteRegs.sv         |
 post_eval_provider_test | PostEvalProvider | post_eval_provider.sv |
 scoreboard_typed_queue_test | ScoreboardTypedQueue | scoreboard_typed_queue.sv |
+testbench_periodic_post_eval_test | ScoreboardTypedQueue | scoreboard_typed_queue.sv |
 tlm_method_bus_test   | TlmMemory      | TlmMemory.sv           |
 tlm_target_thread_test | TlmReadInitiator | TlmReadInitiator.sv  |
 tlm_target_thread_if_test | TlmReadInitiatorPair | TlmReadInitiatorPair.sv |
@@ -153,6 +154,7 @@ sha256_test             | Sha256         | sha256.sv              |
 cov_cross_bins_test     | Top            | top_counter.sv         |
 wait_any_of_test        | Top            | top_counter.sv         |
 transaction_basic_test  | Top            | top_counter.sv         |
+wrapping_arithmetic_operator_test | Top   | top_counter.sv         |
 scoreboard_basic_test   | Top            | top_counter.sv         |
 scoreboard_data_queue_struct_test | Top   | top_counter.sv         |
 tlm_method_blocking_bus_test | TlmMemory | TlmMemory.sv           |

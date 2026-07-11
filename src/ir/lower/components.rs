@@ -1426,6 +1426,16 @@ fn method_param_ir_type(ty: Option<&TypeExpr>, ctx: &LowerCtx) -> IrType {
         }
         return IrType::Unknown;
     }
+    // A record-typed component/scoreboard method parameter
+    // (`observe(cmd: Cmd)`) is a by-value transaction/struct, not a
+    // component/module handle. Resolve it before the component-typed
+    // parameter path so the method body can read `cmd.field`.
+    if let Some(TypeExpr::Named { name, .. }) = ty {
+        let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+        if let Some(rid) = ctx.record_ids.get(simple) {
+            return IrType::Record(*rid);
+        }
+    }
     // A component-typed parameter (`observe(addr, model: ProtocolModel)`):
     // resolve the component name against the program's component table so
     // method calls on it dispatch through `ComponentBase::Local`.

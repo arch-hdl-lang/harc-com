@@ -255,7 +255,17 @@ impl FuncBuilder<'_> {
                 let ir_op = lower_bin_op(*op)?;
                 let l = self.lower_expr(lhs)?;
                 let r = self.lower_expr(rhs)?;
-                Ok(Expr::Binary(ir_op, Box::new(l), Box::new(r)))
+                let inner = Expr::Binary(ir_op, Box::new(l), Box::new(r));
+                // Wrapping arithmetic `+% -% *%` (harc#473): mask the result
+                // to `max(W(lhs), W(rhs))` bits, matching ARCH's
+                // `AddWrap/SubWrap/MulWrap` (result width = wider operand, no
+                // widening). The mask is a `WidthCast::Trunc`, which codegen
+                // lowers to `(expr) & ((1<<W)-1)`. Non-wrapping ops pass
+                // through unchanged.
+                if matches!(op, BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap) {
+                    return self.wrap_to_operand_width(*op, lhs, rhs, inner);
+                }
+                Ok(inner)
             }
             ExprKind::Ternary {
                 cond,
@@ -1438,6 +1448,88 @@ impl FuncBuilder<'_> {
             src_width,
             inner: Box::new(inner),
         })
+    }
+
+    /// Wrap a lowered `+% / -% / *%` result to `max(W(lhs), W(rhs))` bits
+    /// (harc#473). ARCH's wrapping operators take the wider operand's width
+    /// as the result width with no widening; the mask is emitted as a
+    /// `WidthCast::Trunc`, so codegen produces `(a OP b) & ((1<<W)-1)` for
+    /// `W < 64` (and a no-op cast at `W == 64`, since 64 b fills the slot).
+    ///
+    /// Both operand widths must be statically determinable — literals are
+    /// self-sized, typed locals / DUT ports / casts carry their width. If
+    /// either operand's width is unknown, lowering fails loudly rather than
+    /// silently degrading to the un-wrapped value (the exact hazard the
+    /// operator exists to prevent): a scoreboard mirroring a wrapping
+    /// datapath would otherwise compute values the DUT can never emit.
+    fn wrap_to_operand_width(
+        &self,
+        op: BinaryOp,
+        lhs: &AstExpr,
+        rhs: &AstExpr,
+        inner: Expr,
+    ) -> Result<Expr, LowerError> {
+        let sym = match op {
+            BinaryOp::AddWrap => "+%",
+            BinaryOp::SubWrap => "-%",
+            BinaryOp::MulWrap => "*%",
+            _ => "+%",
+        };
+        let wl = self.infer_wrap_operand_width(lhs);
+        let wr = self.infer_wrap_operand_width(rhs);
+        let (Some(wl), Some(wr)) = (wl, wr) else {
+            return Err(LowerError::Invalid(format!(
+                "wrapping operator `{sym}` needs both operands to have a statically \
+                 known bit-width so the wrap width `max(W(lhs), W(rhs))` is defined \
+                 (left is {}, right is {}). Give the operand(s) a scalar type \
+                 (`let x : uint<N>`), a cast (`x as uint<N>`), or a width method.",
+                if wl.is_some() { "known" } else { "unknown" },
+                if wr.is_some() { "known" } else { "unknown" },
+            )));
+        };
+        let width = wl.max(wr);
+        if width > 64 {
+            return Err(unsupported(
+                &format!("wrapping operator `{sym}` at width {width} (> 64 bits)"),
+                "wrapping arithmetic is lowered for operand widths up to 64 bits; \
+                 wider datapaths need the `HarcWide<N>` model, which is not wired \
+                 through the wrapping mask yet",
+            ));
+        }
+        // `width == 0` can't occur: every determinable width is >= 1.
+        Ok(Expr::WidthCast {
+            kind: WidthCastKind::Trunc,
+            width,
+            src_width: None,
+            inner: Box::new(inner),
+        })
+    }
+
+    /// Operand bit-width for a wrapping-op mask. Like `infer_expr_width`
+    /// but also resolves DUT/bus port reads (their declared width) and
+    /// composes through nested wrapping ops (`(a +% b) *% c`), so a wrap
+    /// chain masks at each step's own operand width. Kept separate from
+    /// `infer_expr_width` so the `.trunc<N>()` direction check it feeds is
+    /// unaffected.
+    fn infer_wrap_operand_width(&self, e: &AstExpr) -> Option<u32> {
+        match &*e.kind {
+            ExprKind::Paren(inner) => self.infer_wrap_operand_width(inner),
+            ExprKind::Binary { op, lhs, rhs }
+                if matches!(
+                    op,
+                    BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap
+                ) =>
+            {
+                let l = self.infer_wrap_operand_width(lhs)?;
+                let r = self.infer_wrap_operand_width(rhs)?;
+                Some(l.max(r))
+            }
+            // DUT port / bus-bound signal read carries its declared width.
+            ExprKind::Field { .. } => self.as_port_ref(e).ok().flatten().and_then(|p| p.width),
+            // Everything else shares the receiver-width inference (parens,
+            // casts, width methods, literals, typed locals).
+            _ => self.infer_expr_width(e),
+        }
     }
 
     /// Best-effort receiver bit-width (v1's
