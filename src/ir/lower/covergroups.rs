@@ -11,8 +11,8 @@ use crate::ast::{
     CoverItem, CoverTrigger, CovergroupDecl, Expr as AstExpr, ExprKind, ExternFnDecl, UnaryOp,
 };
 use crate::ir::{
-    CallTarget, CovBinValue, CovTrigger, CoverBinSchema, CoverCrossSchema, CoverPointSchema,
-    CovgroupSchema, Expr, IrType, PortAccess, PortRef, UnOp, WidthCastKind,
+    CallTarget, CovBinBound, CovBinValue, CovTrigger, CoverBinSchema, CoverCrossSchema,
+    CoverPointSchema, CovgroupSchema, Expr, IrType, PortAccess, PortRef, UnOp, WidthCastKind,
 };
 use std::collections::HashMap;
 
@@ -68,7 +68,15 @@ pub(crate) fn lower_covergroup(
             for b in &p.bins {
                 bins.push(CoverBinSchema {
                     name: b.name.name.clone(),
-                    values: lower_bin_values(&g.name.name, &b.name.name, &b.spec, consts)?,
+                    values: lower_bin_values(
+                        &g.name.name,
+                        &b.name.name,
+                        &b.spec,
+                        consts,
+                        &hook_params,
+                        helpers,
+                        extern_fns,
+                    )?,
                 });
             }
             points.push(CoverPointSchema {
@@ -719,16 +727,29 @@ pub(crate) fn lower_bin_values(
     bin: &str,
     spec: &AstExpr,
     consts: &HashMap<String, u64>,
+    hook_params: &[String],
+    helpers: &HelperRegistry<'_>,
+    extern_fns: &HashMap<String, &ExternFnDecl>,
 ) -> Result<Vec<CovBinValue>, LowerError> {
     match &*spec.kind {
         ExprKind::SetLit(items) => {
             let mut values = Vec::with_capacity(items.len());
             for it in items {
-                values.extend(lower_bin_values(group, bin, it, consts)?);
+                values.extend(lower_bin_values(
+                    group,
+                    bin,
+                    it,
+                    consts,
+                    hook_params,
+                    helpers,
+                    extern_fns,
+                )?);
             }
             Ok(values)
         }
-        ExprKind::Paren(inner) => lower_bin_values(group, bin, inner, consts),
+        ExprKind::Paren(inner) => {
+            lower_bin_values(group, bin, inner, consts, hook_params, helpers, extern_fns)
+        }
         ExprKind::Int(s) => {
             let v = parse_bound(group, bin, s)?;
             Ok(vec![CovBinValue::Eq(v)])
@@ -745,11 +766,11 @@ pub(crate) fn lower_bin_values(
         ExprKind::RangeLit { lo, hi } => {
             let lo = lo
                 .as_ref()
-                .map(|e| lower_bin_bound(group, bin, e, consts))
+                .map(|e| lower_bin_bound(group, bin, e, consts, hook_params, helpers, extern_fns))
                 .transpose()?;
             let hi = hi
                 .as_ref()
-                .map(|e| lower_bin_bound(group, bin, e, consts))
+                .map(|e| lower_bin_bound(group, bin, e, consts, hook_params, helpers, extern_fns))
                 .transpose()?;
             Ok(vec![CovBinValue::Range { lo, hi }])
         }
@@ -760,26 +781,41 @@ pub(crate) fn lower_bin_values(
     }
 }
 
-/// A range bound must reduce to a plain integer literal or file-scope const/enum variant.
+/// Lower a range bound. A plain integer literal or file-scope const/enum
+/// variant folds to `CovBinBound::Const` (unchanged fast path). A genuine
+/// runtime bound (a DUT port, hook param, or any expression over those)
+/// lowers via `lower_point_target` — the same sampler-subset expression
+/// lowerer used for point targets — to `CovBinBound::Runtime`, mirroring
+/// v1, which emits the raw bound expression per sample.
 fn lower_bin_bound(
     group: &str,
     bin: &str,
     e: &AstExpr,
     consts: &HashMap<String, u64>,
-) -> Result<u64, LowerError> {
+    hook_params: &[String],
+    helpers: &HelperRegistry<'_>,
+    extern_fns: &HashMap<String, &ExternFnDecl>,
+) -> Result<CovBinBound, LowerError> {
     match &*e.kind {
-        ExprKind::Paren(inner) => lower_bin_bound(group, bin, inner, consts),
-        ExprKind::Int(s) => parse_bound(group, bin, s),
-        ExprKind::Ident(id) => consts.get(&id.name).copied().ok_or_else(|| {
-            unsupported(
-                &format!("covergroup `{group}` bin `{bin}` with a non-constant range bound"),
-                format!("`{}` is not a file-scope const or enum variant", id.name),
-            )
-        }),
-        _ => Err(unsupported(
-            &format!("covergroup `{group}` bin `{bin}` with a non-constant range bound"),
-            "",
-        )),
+        ExprKind::Paren(inner) => {
+            lower_bin_bound(group, bin, inner, consts, hook_params, helpers, extern_fns)
+        }
+        ExprKind::Int(s) => Ok(CovBinBound::Const(parse_bound(group, bin, s)?)),
+        // A bare ident that names a file-scope const/enum variant folds to
+        // a constant (unchanged). Anything else falls through to the
+        // runtime-expression lowerer below.
+        ExprKind::Ident(id) if consts.contains_key(&id.name) => {
+            Ok(CovBinBound::Const(consts[&id.name]))
+        }
+        _ => {
+            // Reuse the point-target expression lowerer for the runtime
+            // case so the emitted per-sample bound matches v1 exactly
+            // (v1 renders the bound with the same `emit_expr` it uses for
+            // point targets). It rejects anything outside the sampler
+            // subset with a precise diagnostic.
+            let expr = lower_point_target(group, bin, e, hook_params, helpers, extern_fns)?;
+            Ok(CovBinBound::Runtime(expr))
+        }
     }
 }
 

@@ -97,6 +97,40 @@ fn assert_unsupported(err: &lower::LowerError) -> String {
     msg
 }
 
+/// A comparable projection of a covergroup bin value. `CovBinValue` no
+/// longer derives `PartialEq` (a runtime range bound carries an `Expr`,
+/// which is not comparable), so constant-bin tests compare this folded
+/// form: `Eq(x)` → `("eq", Some(x), None)`, a constant `Range` → its two
+/// optional bounds, and any runtime bound → `u64::MAX` sentinel so a
+/// stray non-constant fold is visible rather than silently dropped.
+fn bin_repr(v: &ir::CovBinValue) -> (&'static str, Option<u64>, Option<u64>) {
+    fn bound(b: &ir::CovBinBound) -> Option<u64> {
+        match b {
+            ir::CovBinBound::Const(x) => Some(*x),
+            ir::CovBinBound::Runtime(_) => Some(u64::MAX),
+        }
+    }
+    match v {
+        ir::CovBinValue::Eq(x) => ("eq", Some(*x), None),
+        ir::CovBinValue::Range { lo, hi } => (
+            "range",
+            lo.as_ref().and_then(bound),
+            hi.as_ref().and_then(bound),
+        ),
+    }
+}
+
+/// Project a point's bins to `(name, [(kind, lo, hi)])` for equality
+/// assertions against constant-bin expectations.
+fn bins_repr(
+    p: &ir::CoverPointSchema,
+) -> Vec<(&str, Vec<(&'static str, Option<u64>, Option<u64>)>)> {
+    p.bins
+        .iter()
+        .map(|b| (b.name.as_str(), b.values.iter().map(bin_repr).collect()))
+        .collect()
+}
+
 /// harc#473: `+% / -% / *%` mask the result to `max(W(lhs), W(rhs))` bits.
 /// A typed `a : uint<8>` operand plus a literal masks at 8 b, so the emitted
 /// C++ carries the `& 0xFF` residue rather than the un-wrapped `a + 1`.
@@ -2996,18 +3030,22 @@ end impl CovTest
         ir::Expr::Port(port) => assert_eq!(port.port_path, vec!["mode".to_string()]),
         other => panic!("expected port-backed coverpoint target, got {other:?}"),
     }
-    use ir::CovBinValue::Eq;
-    let bins: Vec<(&str, &[ir::CovBinValue])> = p
-        .bins
-        .iter()
-        .map(|b| (b.name.as_str(), b.values.as_slice()))
-        .collect();
     assert_eq!(
-        bins,
+        bins_repr(p),
         vec![
-            ("idle", &[Eq(0)][..]),
-            ("busy", &[Eq(1), Eq(2), Eq(3)][..]),
-            ("hexy", &[Eq(0x10), Eq(0b101)][..]),
+            ("idle", vec![("eq", Some(0), None)]),
+            (
+                "busy",
+                vec![
+                    ("eq", Some(1), None),
+                    ("eq", Some(2), None),
+                    ("eq", Some(3), None)
+                ]
+            ),
+            (
+                "hexy",
+                vec![("eq", Some(0x10), None), ("eq", Some(0b101), None)]
+            ),
         ]
     );
     // Testbench schema records the cov field; lowering synthesized one
@@ -3055,24 +3093,12 @@ end impl CovTest
 "#;
     let prog = lower_src(src).expect("lowers");
     verify::verify_program(&prog).expect("verifies");
-    use ir::CovBinValue::{Eq, Range};
-    let bins: Vec<(&str, &[ir::CovBinValue])> = prog.covgroups[0].points[0]
-        .bins
-        .iter()
-        .map(|b| (b.name.as_str(), b.values.as_slice()))
-        .collect();
     assert_eq!(
-        bins,
+        bins_repr(&prog.covgroups[0].points[0]),
         vec![
-            ("idle", &[Eq(0)][..]),
-            ("mix", &[Eq(1), Eq(3)][..]),
-            (
-                "range",
-                &[Range {
-                    lo: Some(0),
-                    hi: Some(2)
-                }][..]
-            ),
+            ("idle", vec![("eq", Some(0), None)]),
+            ("mix", vec![("eq", Some(1), None), ("eq", Some(3), None)]),
+            ("range", vec![("range", Some(0), Some(2))]),
         ]
     );
 }
@@ -3108,40 +3134,74 @@ end impl CovTest
 "#;
     let prog = lower_src(src).expect("lowers");
     verify::verify_program(&prog).expect("verifies");
-    use ir::CovBinValue::{Eq, Range};
-    let bins: Vec<(&str, &[ir::CovBinValue])> = prog.covgroups[0].points[0]
-        .bins
-        .iter()
-        .map(|b| (b.name.as_str(), b.values.as_slice()))
-        .collect();
     assert_eq!(
-        bins,
+        bins_repr(&prog.covgroups[0].points[0]),
         vec![
-            (
-                "closed",
-                &[Range {
-                    lo: Some(4),
-                    hi: Some(9)
-                }][..]
-            ),
-            (
-                "openlow",
-                &[Range {
-                    lo: None,
-                    hi: Some(3)
-                }][..]
-            ),
+            ("closed", vec![("range", Some(4), Some(9))]),
+            ("openlow", vec![("range", None, Some(3))]),
             (
                 "mixed",
-                &[
-                    Range {
-                        lo: Some(1),
-                        hi: Some(3)
-                    },
-                    Eq(7)
-                ][..]
+                vec![("range", Some(1), Some(3)), ("eq", Some(7), None)]
             ),
         ]
+    );
+}
+
+/// #494 P2c: a range bound may be a genuine RUNTIME expression (a DUT
+/// port, or an expression over one), not just a compile-time constant.
+/// Lowering keeps the constant fast path (`Const`) and carries the
+/// non-constant bound as a lowered `Expr` (`Runtime`); TBIR emission
+/// renders it with the same expression lowerer used for point targets,
+/// mirroring v1's per-sample `emit_expr(bound)`.
+#[test]
+fn covergroup_runtime_range_bounds_lower_and_emit() {
+    let prog = lower_src(&fixture("cov_runtime_bound_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let cp_count = &prog.covgroups[0].points[0];
+    assert_eq!(cp_count.name, "cp_count");
+    // `sel_lo = [dut.en .. 7]` — runtime LOW bound (Port), const HIGH bound.
+    let sel_lo = &cp_count.bins[0];
+    assert_eq!(sel_lo.name, "sel_lo");
+    match &sel_lo.values[0] {
+        ir::CovBinValue::Range { lo, hi } => {
+            assert!(
+                matches!(lo, Some(ir::CovBinBound::Runtime(ir::Expr::Port(_)))),
+                "sel_lo low bound must be a runtime port read, got {lo:?}"
+            );
+            assert!(
+                matches!(hi, Some(ir::CovBinBound::Const(7))),
+                "sel_lo high bound must fold to const 7, got {hi:?}"
+            );
+        }
+        other => panic!("sel_lo must be a Range, got {other:?}"),
+    }
+    // `sel_expr = [(dut.en + 4) .. 15]` — runtime LOW bound is a Binary
+    // over the port; HIGH folds to a constant.
+    let sel_expr = &cp_count.bins[1];
+    assert_eq!(sel_expr.name, "sel_expr");
+    match &sel_expr.values[0] {
+        ir::CovBinValue::Range { lo, hi } => {
+            assert!(
+                matches!(lo, Some(ir::CovBinBound::Runtime(ir::Expr::Binary(..)))),
+                "sel_expr low bound must be a runtime binary expr, got {lo:?}"
+            );
+            assert!(matches!(hi, Some(ir::CovBinBound::Const(15))));
+        }
+        other => panic!("sel_expr must be a Range, got {other:?}"),
+    }
+    // `const_hi = [8 .. 15]` stays fully constant (unchanged fast path).
+    assert_eq!(
+        bins_repr(cp_count)[2],
+        ("const_hi", vec![("range", Some(8), Some(15))])
+    );
+
+    // Emission: the runtime bound reads the DUT port at sample time. The
+    // `sel_lo` membership must compare `_v` against a live `dut->en` read,
+    // exactly as v1 emits it (byte-for-byte per the equivalence gate).
+    let cpp = emit_fixture_cpp("cov_runtime_bound_test.harc");
+    assert!(
+        cpp.contains("_v >= harc_rt::harc_read(dut->en)"),
+        "runtime `sel_lo` low bound must emit a live port read; got:\n{cpp}"
     );
 }
 
@@ -3247,10 +3307,11 @@ end test
     );
 }
 
-/// A range bound that is not a plain integer literal stays rejected
-/// (reject, never silently mis-lower).
+/// #494 P2c: a range bound that reads a DUT port (`[dut.lo..9]`) lowers
+/// to a runtime bound carrying the port `Expr`, matching v1 (which emits
+/// the raw bound per sample). Constant bounds keep folding.
 #[test]
-fn covergroup_non_literal_range_bound_unsupported() {
+fn covergroup_dut_port_range_bound_lowers_runtime() {
     let src = r#"
 covergroup Cov @(posedge dut.clk)
     cp_mode : cover dut.mode
@@ -3270,9 +3331,20 @@ impl CovTest for Tb
     end run
 end impl CovTest
 "#;
-    let err = lower_src(src).unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("range bound"), "names the bound: {msg}");
+    let prog = lower_src(src).expect("runtime range bound now lowers");
+    verify::verify_program(&prog).expect("verifies");
+    match &prog.covgroups[0].points[0].bins[0].values[0] {
+        ir::CovBinValue::Range { lo, hi } => {
+            match lo {
+                Some(ir::CovBinBound::Runtime(ir::Expr::Port(p))) => {
+                    assert_eq!(p.port_path, vec!["lo".to_string()]);
+                }
+                other => panic!("low bound must be a runtime port read, got {other:?}"),
+            }
+            assert!(matches!(hi, Some(ir::CovBinBound::Const(9))));
+        }
+        other => panic!("expected a Range bin, got {other:?}"),
+    }
 }
 
 /// The axilite_cov fixture (range bins + declared cross + randomize)
@@ -7568,7 +7640,10 @@ end impl TbCycTest"#;
     // The trigger predicate lowered into the service (not appended to the
     // body function), reading the DUT port.
     assert!(
-        matches!(&svc.trigger, harc::ir::Expr::Binary(harc::ir::BinOp::Eq, ..)),
+        matches!(
+            &svc.trigger,
+            harc::ir::Expr::Binary(harc::ir::BinOp::Eq, ..)
+        ),
         "the trigger is the lowered `dut.count_out == 7` predicate: {:?}",
         svc.trigger
     );

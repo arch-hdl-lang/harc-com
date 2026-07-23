@@ -1,0 +1,84 @@
+// Covergroup range bins whose bounds are RUNTIME expressions (not
+// compile-time constants) against the counter DUT (`Top` from
+// top_counter_test) — the fixture behind the TB-IR backend's
+// runtime-bin-bound lowering/emission (#494 P2c).
+//
+// `cp_count` mixes constant and runtime range bounds:
+//   - `sel_lo   = [dut.en .. 7]`        — runtime LOWER bound (DUT port)
+//   - `sel_expr = [(dut.en + 4) .. 15]` — runtime bound over a binary expr
+//   - `const_hi = [8 .. 15]`            — constant range (fast path)
+//   - `mixed    = {[dut.en .. 2], 15}`  — set mixing a runtime range + literal
+// Under `--codegen v1` the bound expression is emitted per-sample; the
+// tbir backend now mirrors that byte-for-byte, so the same file passes
+// under BOTH backends and the equivalence harness trace-diffs the two.
+//
+// Fully deterministic (no randomize): the counter walks 0->15 with `en`
+// toggled off at both ends. `dut.en` is 0 or 1, so:
+//   - sel_lo   catches count in [en..7]    — always hit (count sweeps 0..7)
+//   - sel_expr catches count in [en+4..15] — hit for the high end of the sweep
+//   - const_hi catches count in [8..15]    — hit during the 8..15 sweep
+//   - mixed    catches count in [en..2] or ==15 — always hit
+// Every bin is a guaranteed hit; the check phase asserts each is nonzero.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+covergroup RtBoundCov @(posedge dut.clk)
+    cp_count : cover dut.count_out
+        bins
+            sel_lo   = [dut.en .. 7]
+            sel_expr = [(dut.en + 4) .. 15]
+            const_hi = [8 .. 15]
+            mixed    = {[dut.en .. 2], 15}
+        end bins
+    cp_en : cover dut.en
+        bins
+            en0 = {0}
+            en1 = {1}
+        end bins
+end covergroup RtBoundCov
+
+testbench RtBoundTb
+    dut : Top
+    cov : RtBoundCov
+end testbench RtBoundTb
+
+impl CovRuntimeBoundTest for RtBoundTb
+    clock clk = SysDomain        // 100 MHz
+
+    run
+        // Reset, then idle two cycles with en=0.
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        assert dut.count_out == 0
+            else fail("after reset: count_out=${dut.count_out}, expected 0")
+        dut.rst = 0
+        wait 2 cycles
+
+        // Count 0->15 with en=1 -> samples every cp_count bin.
+        dut.en = 1
+        wait until dut.count_out == 15 timeout 100 cycles
+            fail("count never reached 15")
+        assert dut.count_out == 15
+            else fail("after wait: count_out=${dut.count_out}, expected 15")
+
+        // Hold at 15 with en=0 -> samples the top bins with en=0.
+        dut.en = 0
+        wait 2 cycles
+        log(info, "PASS: walked 0..15, en toggled at both ends")
+    end run
+
+    check
+        cov.report()
+
+        assert cov.cp_count.sel_lo   > 0 else fail("sel_lo runtime-bound bin hole")
+        assert cov.cp_count.sel_expr > 0 else fail("sel_expr runtime-bound bin hole")
+        assert cov.cp_count.const_hi > 0 else fail("const_hi constant-range bin hole")
+        assert cov.cp_count.mixed    > 0 else fail("mixed runtime+literal bin hole")
+        assert cov.cp_en.en0 > 0 else fail("en=0 bin hole")
+        assert cov.cp_en.en1 > 0 else fail("en=1 bin hole")
+        log(info, "ALL TESTS PASSED")
+    end check
+end impl CovRuntimeBoundTest
