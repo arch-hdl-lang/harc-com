@@ -54,6 +54,7 @@ analysis_sink_connect_test | Top         | top_counter.sv         |
 wait_until_quiesce_test | Top            | top_counter.sv         |
 wait_until_counter_test | Top            | top_counter.sv         |
 after_cycles_test       | Top            | top_counter.sv         |
+tb_on_expr_test         | Top            | top_counter.sv         |
 bare_stmt_scope_test    | Top            | top_counter.sv         |
 time_literal_test       | Top            | top_counter.sv         |
 check_phase_let_test    | Top            | top_counter.sv         |

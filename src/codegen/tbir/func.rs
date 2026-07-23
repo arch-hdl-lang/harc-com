@@ -2155,6 +2155,31 @@ pub(super) fn clause_expr_cpp(
     expr_cpp(&cx, e)
 }
 
+/// Render a testbench-scoped cycle-trigger predicate (issue #494 P2b) as
+/// standalone C++ text. Unlike `clause_expr_cpp` (component-self scope),
+/// this uses the TEST-scope ECx: `self_subst: None` and a real `dut_type`
+/// so `dut.<sig>` reads route to the shared `dut` handle and `_tb.<field>`
+/// reads resolve to the captured host struct — matching `emit_test_hook`.
+pub(super) fn tb_service_expr_cpp(
+    prog: &TbProgram,
+    function: crate::ir::FunctionId,
+    dut_type: &str,
+    e: &Expr,
+) -> Result<String, EmitError> {
+    let func = prog.function(function);
+    let names = cpp_local_names(func);
+    let empty_lanes = HashMap::new();
+    let cx = ECx {
+        func,
+        names: &names,
+        lanes: &empty_lanes,
+        self_subst: None,
+        dut_type,
+        trace_component: "",
+    };
+    expr_cpp(&cx, e)
+}
+
 /// Shared lambda emission for component methods and on-handlers: a free
 /// `<lambda>(<Comp>& self, args...)` loop-switch over the lowered CFG.
 struct ComponentHookCtx<'a> {

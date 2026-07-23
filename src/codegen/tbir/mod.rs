@@ -1404,6 +1404,50 @@ fn emit_tb_periodic_services(
     Ok(())
 }
 
+fn emit_tb_cycle_services(
+    out: &mut String,
+    prog: &TbProgram,
+    tb: &ir::TestbenchSchema,
+    dut_type: &str,
+) -> Result<(), EmitError> {
+    for svc in &tb.cycle_services {
+        // Emit the body lambda HERE (after the composite instances +
+        // method lambdas are declared, same as the periodic path) so a
+        // body reading those symbols resolves.
+        func::emit_test_hook(out, prog, prog.function(svc.function), dut_type, 1)?;
+        let lambda = &prog.function(svc.function).name;
+        let trigger = func::tb_service_expr_cpp(prog, svc.function, dut_type, &svc.trigger)?;
+        let tag = format!("_tbcyc_{}", svc.function.0);
+        let vec = svc.phase.service_vec();
+        // Re-evaluate the predicate every primary-clock cycle and fire the
+        // body per the recorded edge mode. Mirrors v1's `emit_cycle_trigger`
+        // and the transactor cycle-trigger closure in `emit_lifecycle_checkers`.
+        writeln!(out, "{INDENT}{vec}.push_back([&]() {{").ok();
+        match svc.edge {
+            ir::CycleEdge::Level => {
+                writeln!(out, "{INDENT}{INDENT}if ((bool)({trigger})) {{").ok();
+                writeln!(out, "{INDENT}{INDENT}{INDENT}{lambda}();").ok();
+                writeln!(out, "{INDENT}{INDENT}}}").ok();
+            }
+            ir::CycleEdge::Rising | ir::CycleEdge::Falling => {
+                writeln!(out, "{INDENT}{INDENT}static bool {tag}_prev = false;").ok();
+                writeln!(out, "{INDENT}{INDENT}bool {tag}_curr = (bool)({trigger});").ok();
+                let cond = match svc.edge {
+                    ir::CycleEdge::Rising => format!("!{tag}_prev && {tag}_curr"),
+                    ir::CycleEdge::Falling => format!("{tag}_prev && !{tag}_curr"),
+                    ir::CycleEdge::Level => unreachable!(),
+                };
+                writeln!(out, "{INDENT}{INDENT}if ({cond}) {{").ok();
+                writeln!(out, "{INDENT}{INDENT}{INDENT}{lambda}();").ok();
+                writeln!(out, "{INDENT}{INDENT}}}").ok();
+                writeln!(out, "{INDENT}{INDENT}{tag}_prev = {tag}_curr;").ok();
+            }
+        }
+        writeln!(out, "{INDENT}}});").ok();
+    }
+    Ok(())
+}
+
 fn emit_test(
     out: &mut String,
     prog: &TbProgram,
@@ -1626,8 +1670,12 @@ fn emit_test(
     // before the run coroutine). Emitting them here would reference those
     // symbols before declaration, so skip them — `emit_tb_periodic_services`
     // emits their body + registration together, after the decls.
-    let tb_service_fns: HashSet<ir::FunctionId> =
-        tb.periodic_services.iter().map(|s| s.function).collect();
+    let tb_service_fns: HashSet<ir::FunctionId> = tb
+        .periodic_services
+        .iter()
+        .map(|s| s.function)
+        .chain(tb.cycle_services.iter().map(|s| s.function))
+        .collect();
     for f in &prog.functions {
         if matches!(f.kind, ir::FunctionKind::TestHook)
             && f.owner == Some(test.testbench)
@@ -1766,6 +1814,7 @@ fn emit_test(
     // gated on a per-service last-fire stamp — the flow-scope analogue of
     // a component's `emit_lifecycle_checkers` periodic registration.
     emit_tb_periodic_services(out, prog, tb, dut_type)?;
+    emit_tb_cycle_services(out, prog, tb, dut_type)?;
 
     writeln!(out, "{INDENT}harc_rt::ThreadSlot _run_slot;").ok();
     writeln!(out, "{INDENT}sched.slots.push_back(&_run_slot);").ok();
