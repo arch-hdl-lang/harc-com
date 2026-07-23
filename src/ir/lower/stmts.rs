@@ -325,7 +325,8 @@ impl FuncBuilder<'_> {
                 // instance). `.pop()` in statement position is rejected.
                 if let ExprKind::Call { callee, args } = &*e.kind {
                     if let ExprKind::Field { target, name } = &*callee.kind {
-                        if let Some((instance, field, kind)) = self.as_transactor_state_any(target) {
+                        if let Some((instance, field, kind)) = self.as_transactor_state_any(target)
+                        {
                             if matches!(kind, crate::ir::StateFieldKind::Queue { .. }) {
                                 let method = name.name.clone();
                                 if method == "push" {
@@ -1419,7 +1420,10 @@ impl FuncBuilder<'_> {
     /// name shadows the field (matching the bare-read/-write order), and a
     /// scalar state field is NOT a queue call (returns `None` so the
     /// scalar path handles it).
-    pub(crate) fn as_state_queue_call(&self, callee: &crate::ast::Expr) -> Option<(String, String)> {
+    pub(crate) fn as_state_queue_call(
+        &self,
+        callee: &crate::ast::Expr,
+    ) -> Option<(String, String)> {
         let ExprKind::Field {
             target,
             name: method,

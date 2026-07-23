@@ -5754,8 +5754,14 @@ fn target_nonscalar_queue_state_lowers() {
             ir::Stmt::TransactorStateQueuePop { instance, .. } if instance == "responder"
         )
     });
-    assert!(has_push, "responder body must carry instance-filled state-queue push");
-    assert!(has_pop, "responder body must carry instance-filled state-queue pop");
+    assert!(
+        has_push,
+        "responder body must carry instance-filled state-queue push"
+    );
+    assert!(
+        has_pop,
+        "responder body must carry instance-filled state-queue pop"
+    );
 }
 
 /// #494 P0a: the C++ shape for non-scalar target-transactor state reuses

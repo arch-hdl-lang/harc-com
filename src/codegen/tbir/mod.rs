@@ -371,9 +371,9 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
         SeqPush { value, .. }
         | ComponentQueuePush { value, .. }
         | TransactorStateQueuePush { value, .. } => expr_has_probe(value),
-        ComponentQueuePop { .. }
-        | ComponentSubAssign { .. }
-        | TransactorStateQueuePop { .. } => false,
+        ComponentQueuePop { .. } | ComponentSubAssign { .. } | TransactorStateQueuePop { .. } => {
+            false
+        }
         TlmFork(desc) => desc.args.iter().any(expr_has_probe),
         TlmJoinAll(pending) => pending.iter().any(|p| p.args.iter().any(expr_has_probe)),
         RecordInit(_, _) | CovReport(_) => false,
@@ -576,9 +576,7 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
         SeqPush { value, .. }
         | ComponentQueuePush { value, .. }
         | TransactorStateQueuePush { value, .. } => for_each_port_in_expr(value, f),
-        ComponentQueuePop { .. }
-        | ComponentSubAssign { .. }
-        | TransactorStateQueuePop { .. } => {}
+        ComponentQueuePop { .. } | ComponentSubAssign { .. } | TransactorStateQueuePop { .. } => {}
         TlmFork(desc) => desc.args.iter().for_each(|a| for_each_port_in_expr(a, f)),
         TlmJoinAll(pending) => pending
             .iter()

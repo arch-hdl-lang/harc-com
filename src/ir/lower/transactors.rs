@@ -485,9 +485,9 @@ fn lower_bound_target_transactor(
             ComponentItem::Field(f) => {
                 let sf = lower_state_field(tname, f, &record_ctx.record_ids)?;
                 if state_names
-                        .insert(sf.name.clone(), sf.kind.clone())
-                        .is_some()
-                    {
+                    .insert(sf.name.clone(), sf.kind.clone())
+                    .is_some()
+                {
                     return Err(LowerError::Invalid(format!(
                         "transactor `{tname}` declares state field `{}` more than once",
                         sf.name
@@ -897,9 +897,9 @@ fn lower_bound_initiator_transactor(
                 // transaction-typed and non-scalar fields inside it.
                 let sf = lower_state_field(tname, f, &record_ctx.record_ids)?;
                 if state_names
-                        .insert(sf.name.clone(), sf.kind.clone())
-                        .is_some()
-                    {
+                    .insert(sf.name.clone(), sf.kind.clone())
+                    .is_some()
+                {
                     return Err(LowerError::Invalid(format!(
                         "initiator-side bound-to transactor `{tname}` declares state field \
                          `{}` more than once",
@@ -968,9 +968,9 @@ fn lower_bound_initiator_transactor(
                 }
                 let sf = lower_state_field(tname, f, &record_ctx.record_ids)?;
                 if state_names
-                        .insert(sf.name.clone(), sf.kind.clone())
-                        .is_some()
-                    {
+                    .insert(sf.name.clone(), sf.kind.clone())
+                    .is_some()
+                {
                     return Err(LowerError::Invalid(format!(
                         "initiator-side bound-to transactor `{tname}` declares state field \
                          `{}` more than once",
@@ -1201,12 +1201,13 @@ fn lower_state_field(
     {
         if f.default.is_some() {
             return Err(unsupported(
-                &format!("bound-to transactor `{tname}` queue state field `{fname}` with a default"),
+                &format!(
+                    "bound-to transactor `{tname}` queue state field `{fname}` with a default"
+                ),
                 "a `queue<T>` state field starts empty; drop the `default`",
             ));
         }
-        let elem =
-            super::components::lower_queue_elem(tname, fname, args.first(), record_ids)?;
+        let elem = super::components::lower_queue_elem(tname, fname, args.first(), record_ids)?;
         return Ok(StateFieldSchema {
             name: fname.clone(),
             kind: StateFieldKind::Queue { elem },
