@@ -578,6 +578,14 @@ impl Checker<'_> {
                     // just hold the value to the no-inline-port rule.
                     self.check_expr(value, false, "TransactorStateWrite value");
                 }
+                Stmt::TransactorStateQueuePush { value, .. } => {
+                    // Target-state queue host state — the pushed value
+                    // follows the no-inline-port rule like any Assign value.
+                    self.check_expr(value, false, "TransactorStateQueuePush value");
+                }
+                Stmt::TransactorStateQueuePop { dest, .. } => {
+                    self.check_local(*dest);
+                }
                 Stmt::Log { args, .. } => self.check_fmt_args(args),
                 Stmt::AssertCheck { cond, on_fail } => {
                     self.check_expr(cond, true, "AssertCheck cond");
@@ -954,6 +962,7 @@ impl Checker<'_> {
             // lowering against the bound instance; nothing to verify
             // structurally here (no local/port dependency).
             Expr::TransactorState { .. } => {}
+            Expr::TransactorStateQueueQuery { .. } => {}
             Expr::Port(_) => {
                 if !ports_ok {
                     self.errs.push(VerifyError::PortInDisallowedPosition {
@@ -1364,7 +1373,8 @@ fn check_def_before_use(
                     ..
                 }
                 | Stmt::ComponentCall { dest: Some(l), .. }
-                | Stmt::ComponentQueuePop { dest: l, .. } => {
+                | Stmt::ComponentQueuePop { dest: l, .. }
+                | Stmt::TransactorStateQueuePop { dest: l, .. } => {
                     bit_set(&mut gens[bi], l.index());
                 }
                 _ => {}
@@ -1453,6 +1463,11 @@ fn check_def_before_use(
                 }
                 Stmt::TbFieldWrite { value, .. } => check_e(value, &defined, errs),
                 Stmt::TransactorStateWrite { value, .. } => check_e(value, &defined, errs),
+                Stmt::TransactorStateQueuePush { value, .. } => check_e(value, &defined, errs),
+                Stmt::TransactorStateQueuePop { dest, .. } => {
+                    // Pop defines the destination local.
+                    bit_set(&mut defined, dest.index());
+                }
                 Stmt::DutWrite(_, e) => check_e(e, &defined, errs),
                 Stmt::TransactorCall { dest, call } => {
                     check_e(call, &defined, errs);
@@ -1594,6 +1609,7 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
         | Expr::Port(_)
         | Expr::TbField(_)
         | Expr::TransactorState { .. }
+        | Expr::TransactorStateQueueQuery { .. }
         | Expr::ComponentField { .. }
         | Expr::ScoreboardQuery { .. }
         | Expr::ComponentQueueQuery { .. }

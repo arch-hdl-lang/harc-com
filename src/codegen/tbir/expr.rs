@@ -210,6 +210,27 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // v1's `field_subs` substitution at the responder body and the
         // direct struct access at the test-scope read.
         Expr::TransactorState { instance, field } => format!("{instance}.{field}"),
+        // Bound-to target transactor `queue<T>` state field size/empty
+        // read — a `harc_rt::HarcQueue<T>` member of the per-instance
+        // struct. Mirrors the scoreboard/component queue-query shapes.
+        Expr::TransactorStateQueueQuery {
+            instance,
+            field,
+            query,
+        } => {
+            use crate::ir::ScoreboardQuery;
+            match query {
+                ScoreboardQuery::QueueSize { .. } => {
+                    format!("((uint64_t){instance}.{field}.size())")
+                }
+                ScoreboardQuery::QueueEmpty { .. } => {
+                    format!("{instance}.{field}.empty()")
+                }
+                // Scalar/pop never appear on a state-queue query (lowering
+                // routes them elsewhere); render defensively.
+                ScoreboardQuery::Scalar { .. } => format!("{instance}.{field}"),
+            }
+        }
         // Scoreboard read on a `_tb` struct member (scoreboard fields
         // exist only on non-synthetic testbenches). Mirrors v1's direct
         // struct/queue access.

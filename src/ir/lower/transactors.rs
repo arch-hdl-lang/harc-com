@@ -41,9 +41,9 @@ use crate::ast::{
     TypeArg, TypeExpr,
 };
 use crate::ir::{
-    self, ConstraintSite, FunctionId, FunctionKind, IrType, TargetTlmMethodSchema, TbFunction,
-    TbScalarFieldSchema, Terminator, TransactorId, TransactorMethodSchema, TransactorSchema,
-    TypedParam,
+    self, ConstraintSite, FunctionId, FunctionKind, IrType, StateFieldKind, StateFieldSchema,
+    TargetTlmMethodSchema, TbFunction, Terminator, TransactorId, TransactorMethodSchema,
+    TransactorSchema, TypedParam,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -118,8 +118,8 @@ pub(crate) fn lower_transactor(
     // (routed to `TransactorState`/`TransactorStateWrite` via the
     // builder's `target_state_fields` set); the test reads them back as
     // `<instance>.<field>`.
-    let mut state_fields: Vec<TbScalarFieldSchema> = Vec::new();
-    let mut state_names: HashSet<String> = HashSet::new();
+    let mut state_fields: Vec<StateFieldSchema> = Vec::new();
+    let mut state_names: HashMap<String, StateFieldKind> = HashMap::new();
     for ci in &t.items {
         match ci {
             ComponentItem::Hookable(h) => methods_ast.push((h, false)),
@@ -159,8 +159,11 @@ pub(crate) fn lower_transactor(
                     }
                     dut = Some((fname.clone(), simple.to_string()));
                 } else {
-                    let sf = lower_state_field(tname, f)?;
-                    if !state_names.insert(sf.name.clone()) {
+                    let sf = lower_state_field(tname, f, &record_ctx.record_ids)?;
+                    if state_names
+                        .insert(sf.name.clone(), sf.kind.clone())
+                        .is_some()
+                    {
                         return Err(LowerError::Invalid(format!(
                             "transactor `{tname}` declares state field `{}` more than once",
                             sf.name
@@ -236,8 +239,11 @@ pub(crate) fn lower_transactor(
                     }
                     dut = Some((fname.clone(), simple.to_string()));
                 } else {
-                    let sf = lower_state_field(tname, f)?;
-                    if !state_names.insert(sf.name.clone()) {
+                    let sf = lower_state_field(tname, f, &record_ctx.record_ids)?;
+                    if state_names
+                        .insert(sf.name.clone(), sf.kind.clone())
+                        .is_some()
+                    {
                         return Err(LowerError::Invalid(format!(
                             "transactor `{tname}` declares state field `{}` more than once",
                             sf.name
@@ -470,15 +476,18 @@ fn lower_bound_target_transactor(
     // Walk items (and the optional `when active` body, though target
     // responders live as always-on items): collect state fields and
     // target threads; reject the out-of-subset shapes precisely.
-    let mut state_fields: Vec<TbScalarFieldSchema> = Vec::new();
-    let mut state_names: HashSet<String> = HashSet::new();
+    let mut state_fields: Vec<StateFieldSchema> = Vec::new();
+    let mut state_names: HashMap<String, StateFieldKind> = HashMap::new();
     let mut threads_ast: Vec<&TargetTlmThread> = Vec::new();
     let all_items = t.items.iter().chain(t.when_active.iter().flatten());
     for ci in all_items {
         match ci {
             ComponentItem::Field(f) => {
-                let sf = lower_state_field(tname, f)?;
-                if !state_names.insert(sf.name.clone()) {
+                let sf = lower_state_field(tname, f, &record_ctx.record_ids)?;
+                if state_names
+                    .insert(sf.name.clone(), sf.kind.clone())
+                    .is_some()
+                {
                     return Err(LowerError::Invalid(format!(
                         "transactor `{tname}` declares state field `{}` more than once",
                         sf.name
@@ -858,8 +867,8 @@ fn lower_bound_initiator_transactor(
     // set); the test reads them back as `<instance>.<field>`. The
     // per-instance state map + body placeholders are filled at
     // test-binding time, alongside the bus prefix.
-    let mut state_fields: Vec<TbScalarFieldSchema> = Vec::new();
-    let mut state_names: HashSet<String> = HashSet::new();
+    let mut state_fields: Vec<StateFieldSchema> = Vec::new();
+    let mut state_names: HashMap<String, StateFieldKind> = HashMap::new();
     for ci in &t.items {
         match ci {
             ComponentItem::Hookable(h) => methods_ast.push((h, false)),
@@ -886,8 +895,11 @@ fn lower_bound_initiator_transactor(
                 // `bool` ≤64 bits with a plain-literal default). Reuse the
                 // bound-to target state-field lowering; reject module/
                 // transaction-typed and non-scalar fields inside it.
-                let sf = lower_state_field(tname, f)?;
-                if !state_names.insert(sf.name.clone()) {
+                let sf = lower_state_field(tname, f, &record_ctx.record_ids)?;
+                if state_names
+                    .insert(sf.name.clone(), sf.kind.clone())
+                    .is_some()
+                {
                     return Err(LowerError::Invalid(format!(
                         "initiator-side bound-to transactor `{tname}` declares state field \
                          `{}` more than once",
@@ -954,8 +966,11 @@ fn lower_bound_initiator_transactor(
                          with scalar state are lowered",
                     ));
                 }
-                let sf = lower_state_field(tname, f)?;
-                if !state_names.insert(sf.name.clone()) {
+                let sf = lower_state_field(tname, f, &record_ctx.record_ids)?;
+                if state_names
+                    .insert(sf.name.clone(), sf.kind.clone())
+                    .is_some()
+                {
                     return Err(LowerError::Invalid(format!(
                         "initiator-side bound-to transactor `{tname}` declares state field \
                          `{}` more than once",
@@ -1149,12 +1164,24 @@ fn lower_bound_initiator_transactor(
     Ok((schema, funcs))
 }
 
-/// Lower one persistent scalar state field of a bound-to target
-/// transactor (`read_count : uint<32> default 0`). Must be a scalar
-/// ≤64-bit type with a plain-integer/bool default (or no default → 0);
-/// event/directional fields, module/transaction-typed fields, and
-/// `guard`/`reset` clauses are out of subset.
-fn lower_state_field(tname: &str, f: &ComponentField) -> Result<TbScalarFieldSchema, LowerError> {
+/// Lower one persistent state field of a bound-to target transactor.
+/// Two kinds are lowered, reusing the same machinery scoreboards and
+/// composite components already carry:
+///   * a scalar `≤64`-bit counter/latch (`read_count : uint<32> default
+///     0`) with a plain-integer/bool default (or no default → 0);
+///   * a typed FIFO `queue<scalar ≤ 64 bits>` / `queue<Record>`
+///     (`pending : queue<uint<32>>` / `queue<Beat>`), whose element type
+///     resolves through the shared `lower_queue_elem` seam.
+/// Event/directional fields, module/transaction-typed fields, a `default`
+/// on a queue field, and `guard`/`reset` clauses are out of subset.
+///
+/// `record_ids` resolves `queue<Record>` element names (empty for the
+/// unbound DUT-poking form's ctx, which then only admits scalar queues).
+fn lower_state_field(
+    tname: &str,
+    f: &ComponentField,
+    record_ids: &std::collections::HashMap<String, crate::ir::RecordId>,
+) -> Result<StateFieldSchema, LowerError> {
     let fname = &f.name.name;
     if f.direction.is_some() {
         return Err(unsupported(
@@ -1162,10 +1189,35 @@ fn lower_state_field(tname: &str, f: &ComponentField) -> Result<TbScalarFieldSch
             "",
         ));
     }
+    // A `queue<T>` state field → the shared queue-element machinery
+    // (scalar ≤ 64 bits or a value-record), reused verbatim from the
+    // scoreboard/component queue seam so all three lower `queue<Record>`
+    // through the identical `harc_rt::HarcQueue<Rec>` shape.
+    if let TypeExpr::Builtin {
+        name: crate::ast::BuiltinTy::Queue,
+        args,
+        ..
+    } = &f.ty
+    {
+        if f.default.is_some() {
+            return Err(unsupported(
+                &format!(
+                    "bound-to transactor `{tname}` queue state field `{fname}` with a default"
+                ),
+                "a `queue<T>` state field starts empty; drop the `default`",
+            ));
+        }
+        let elem = super::components::lower_queue_elem(tname, fname, args.first(), record_ids)?;
+        return Ok(StateFieldSchema {
+            name: fname.clone(),
+            kind: StateFieldKind::Queue { elem },
+        });
+    }
     let Some(ty) = super::tb_scalar_field_ir_type(&f.ty) else {
         return Err(unsupported(
             &format!("bound-to transactor `{tname}` state field `{fname}` with a non-scalar type"),
-            "target-transactor state must be a scalar `uint<N>`/`sint<N>`/`bool` (≤64 bits)",
+            "target-transactor state must be a scalar `uint<N>`/`sint<N>`/`bool` (≤64 bits) \
+             or a `queue<scalar ≤ 64 bits>` / `queue<Record>`",
         ));
     };
     let default = match &f.default {
@@ -1190,10 +1242,9 @@ fn lower_state_field(tname: &str, f: &ComponentField) -> Result<TbScalarFieldSch
             }
         },
     };
-    Ok(TbScalarFieldSchema {
+    Ok(StateFieldSchema {
         name: fname.clone(),
-        ty,
-        default,
+        kind: StateFieldKind::Scalar { ty, default },
     })
 }
 

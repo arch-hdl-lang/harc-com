@@ -2929,7 +2929,8 @@ fn lower_test(
     // responder bodies' `TransactorState` placeholders (lowered with an
     // empty instance at transactor-decl time, before the bind was known).
     let mut target_tlm_actors: Vec<ir::TargetTlmActorSchema> = Vec::new();
-    let mut target_state: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut target_state: HashMap<String, HashMap<String, crate::ir::StateFieldKind>> =
+        HashMap::new();
     for (instance, xid, bus_field) in &target_tlm_binds {
         if target_state.contains_key(instance) {
             return Err(LowerError::Invalid(format!(
@@ -2962,7 +2963,7 @@ fn lower_test(
             xschema
                 .state_fields
                 .iter()
-                .map(|f| f.name.clone())
+                .map(|f| (f.name.clone(), f.kind.clone()))
                 .collect(),
         );
         // Fill the instance into the responder bodies' state-access
@@ -3051,7 +3052,7 @@ fn lower_test(
             xschema
                 .state_fields
                 .iter()
-                .map(|f| f.name.clone())
+                .map(|f| (f.name.clone(), f.kind.clone()))
                 .collect(),
         );
         // Fill the instance into the (type-shared) method bodies'
@@ -4225,11 +4226,13 @@ pub(crate) struct LowerCtx {
     /// both shapes. A subset of `transactor_fields` keys.
     pub bare_transactor_fields: HashSet<String>,
     /// Bound-to target-transactor instances → their persistent state
-    /// field names. Populated at test binding for `passive` instances of
-    /// `transactor X bound to <Bus>` transactors. Resolves test-scope
-    /// reads/writes `target.<field>` to `ir::Expr::TransactorState` /
-    /// `ir::Stmt::TransactorStateWrite`. Empty everywhere else.
-    pub target_state: HashMap<String, HashSet<String>>,
+    /// fields (name → kind). Populated at test binding for `passive`
+    /// instances of `transactor X bound to <Bus>` transactors. Resolves
+    /// test-scope reads/writes `target.<field>` to `ir::Expr::
+    /// TransactorState` / `ir::Stmt::TransactorStateWrite` (scalar) and
+    /// `target.<queue>.size()`/`.empty()`/`.pop()`/`.push()` to the
+    /// state-queue ops. Empty everywhere else.
+    pub target_state: HashMap<String, HashMap<String, crate::ir::StateFieldKind>>,
     /// Snapshot of the program's component schemas, for path/field/method
     /// resolution at access sites.
     pub components: Vec<ComponentSchema>,
@@ -4364,12 +4367,16 @@ pub(crate) struct FuncBuilder<'a> {
     /// diagnostic wants to cite it directly.
     pub(crate) current_body_name: Option<String>,
     /// State fields visible to a bound-to target-responder body
-    /// (`thread bus.<m>(...)`). A bare ident that hits this set lowers
-    /// to `ir::Expr::TransactorState`/`ir::Stmt::TransactorStateWrite` with an
-    /// empty `instance` placeholder; the test-binding stage fills the
-    /// instance once the passive transactor field is resolved. Empty in
-    /// every non-responder context, so the resolution path is inert.
-    pub(crate) target_state_fields: HashSet<String>,
+    /// (`thread bus.<m>(...)`), mapping each field name to its kind
+    /// (scalar / queue). A bare ident that hits this map lowers to the
+    /// matching state op — a scalar reads/writes `ir::Expr::
+    /// TransactorState`/`ir::Stmt::TransactorStateWrite`; a `queue<T>`
+    /// field routes `.push`/`.pop`/`.size`/`.empty` to the state-queue
+    /// ops — all with an empty `instance` placeholder that the test-
+    /// binding stage fills once the passive transactor field is resolved.
+    /// Empty in every non-responder context, so the resolution path is
+    /// inert.
+    pub(crate) target_state_fields: HashMap<String, crate::ir::StateFieldKind>,
     /// True while lowering a Check-kind function — used for the
     /// precise test-scope-let rejection (see `LowerCtx::
     /// test_scope_lets`).
@@ -4678,7 +4685,7 @@ impl<'a> FuncBuilder<'a> {
             self_transactor_methods: HashMap::new(),
             self_transactor_method_active_only: false,
             current_body_name: None,
-            target_state_fields: HashSet::new(),
+            target_state_fields: HashMap::new(),
             in_check: false,
             let_widths: HashMap::new(),
             self_component: None,
@@ -5037,7 +5044,10 @@ fn fill_transactor_state_instance(func: &mut TbFunction, instance: &str) -> Resu
 fn existing_state_instance(func: &TbFunction) -> Option<String> {
     fn in_expr(e: &ir::Expr) -> Option<String> {
         match e {
-            ir::Expr::TransactorState { instance, .. } if !instance.is_empty() => {
+            ir::Expr::TransactorState { instance, .. }
+            | ir::Expr::TransactorStateQueueQuery { instance, .. }
+                if !instance.is_empty() =>
+            {
                 Some(instance.clone())
             }
             ir::Expr::Binary(_, a, b) => in_expr(a).or_else(|| in_expr(b)),
@@ -5061,6 +5071,18 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                     } else {
                         in_expr(value)
                     }
+                }
+                ir::Stmt::TransactorStateQueuePush {
+                    instance, value, ..
+                } => {
+                    if !instance.is_empty() {
+                        Some(instance.clone())
+                    } else {
+                        in_expr(value)
+                    }
+                }
+                ir::Stmt::TransactorStateQueuePop { instance, .. } => {
+                    (!instance.is_empty()).then(|| instance.clone())
                 }
                 ir::Stmt::Assign(_, e) | ir::Stmt::DutWrite(_, e) => in_expr(e),
                 ir::Stmt::RecordFieldWrite { value, .. }
@@ -5114,7 +5136,8 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
 fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &str) {
     fn fill_expr(e: &mut ir::Expr, instance: &str) {
         match e {
-            ir::Expr::TransactorState { instance: i, .. } => {
+            ir::Expr::TransactorState { instance: i, .. }
+            | ir::Expr::TransactorStateQueueQuery { instance: i, .. } => {
                 debug_assert!(
                     i.is_empty() || i == instance,
                     "target-state instance already filled with a different name"
@@ -5201,6 +5224,9 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             match s {
                 ir::Stmt::TransactorStateWrite {
                     instance: i, value, ..
+                }
+                | ir::Stmt::TransactorStateQueuePush {
+                    instance: i, value, ..
                 } => {
                     debug_assert!(
                         i.is_empty() || i == instance,
@@ -5208,6 +5234,13 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                     );
                     *i = instance.to_string();
                     fill_expr(value, instance);
+                }
+                ir::Stmt::TransactorStateQueuePop { instance: i, .. } => {
+                    debug_assert!(
+                        i.is_empty() || i == instance,
+                        "target-state-pop instance already filled with a different name"
+                    );
+                    *i = instance.to_string();
                 }
                 ir::Stmt::Assign(_, e) | ir::Stmt::DutWrite(_, e) => fill_expr(e, instance),
                 ir::Stmt::RecordFieldWrite { value, .. }
@@ -5376,6 +5409,7 @@ fn fill_visit_expr(
         | Expr::CovHookArg { .. }
         | Expr::TbField(_)
         | Expr::TransactorState { .. }
+        | Expr::TransactorStateQueueQuery { .. }
         | Expr::ComponentField { .. }
         | Expr::ComponentValue { .. }
         | Expr::ScoreboardQuery { .. }
@@ -5489,10 +5523,14 @@ fn fill_initiator_bus_prefix(
                             visit_expr(a, placeholder, binding, remap, rewrite, &mut conflict);
                         }
                     }
-                    Stmt::SeqPush { value, .. } | Stmt::ComponentQueuePush { value, .. } => {
+                    Stmt::SeqPush { value, .. }
+                    | Stmt::ComponentQueuePush { value, .. }
+                    | Stmt::TransactorStateQueuePush { value, .. } => {
                         visit_expr(value, placeholder, binding, remap, rewrite, &mut conflict)
                     }
-                    Stmt::ComponentQueuePop { .. } | Stmt::ComponentSubAssign { .. } => {}
+                    Stmt::ComponentQueuePop { .. }
+                    | Stmt::ComponentSubAssign { .. }
+                    | Stmt::TransactorStateQueuePop { .. } => {}
                     Stmt::TlmFork(desc) => {
                         for a in &mut desc.args {
                             visit_expr(a, placeholder, binding, remap, rewrite, &mut conflict);

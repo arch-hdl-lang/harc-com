@@ -1,0 +1,95 @@
+// Self-proving bound-to TARGET transactor whose persistent state is
+// NON-SCALAR: a `queue<Record>` and a `queue<uint<8>>`.
+//
+// Before this slice, a bound-to / target transactor's persistent state
+// had to be a scalar `uint<N>`/`sint<N>`/`bool` (<= 64 bits) under
+// `--codegen tbir` — `lower_state_field` rejected any non-scalar type
+// with "state field ... with a non-scalar type ... re-run with --codegen
+// v1". This fixture closes that gap by reusing the scoreboard/component
+// `queue<T>` machinery (`harc_rt::HarcQueue<T>`, value-record elements)
+// for target-transactor state.
+//
+// The SV DUT (`TlmReadInitiator`) is the initiator: it issues exactly one
+// `mem.read(0x05)` through the ARCH-compatible req/rsp wires. The HARC
+// `MemoryResponder bound to TlmMemBus` implements the target-side method
+// body with `thread bus.read(...)`. Inside the responder body it:
+//   * pushes a `Beat` RECORD (addr + data) onto the `pending` queue;
+//   * pushes the raw addr onto a scalar `log_addrs` queue;
+//   * reads the queue depth with `.size()` and `.empty()`;
+//   * pops the record back off `pending` and returns its `data` field.
+// After the DUT reports done, the test inspects the TEST-SCOPE queue
+// state (`responder.log_addrs.size()`, `.pop()`) — proving the per-
+// instance state struct is shared between the responder body and the
+// test, exactly like the scalar bound-target form.
+//
+// Both C++ emitters (`--codegen v1` and `--codegen tbir`) must agree:
+// same verdict + zero trace-diff divergences.
+
+struct Beat
+    addr : uint<8>
+    data : uint<32>
+end struct Beat
+
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmMemBus
+
+transactor MemoryResponder bound to TlmMemBus
+    // Persistent NON-SCALAR state: a record queue and a scalar queue.
+    pending   : queue<Beat>
+    log_addrs : queue<uint<8>>
+
+    thread bus.read(addr: uint<8>)
+        wait 1 cycle
+        // Build a Beat record for this request and queue it.
+        let b : Beat
+        b.addr = addr
+        b.data = 256 + addr
+        pending.push(b)
+        // Log the raw address on the scalar queue.
+        log_addrs.push(addr)
+        // Queue-state reads inside the responder body.
+        assert pending.size() == 1
+            else fail("responder: pending.size()=${pending.size()}, expected 1")
+        assert pending.empty() == 0
+            else fail("responder: pending unexpectedly empty")
+        // Pop the record back and return its data field.
+        let out : Beat = pending.pop()
+        assert pending.empty() == 1
+            else fail("responder: pending not empty after pop")
+        return out.data
+    end thread
+end transactor MemoryResponder
+
+testbench TargetNonscalarStateTb
+    dut : TlmReadInitiator
+end testbench TargetNonscalarStateTb
+
+impl TargetNonscalarStateTest for TargetNonscalarStateTb
+    let mem : TlmMemBus = bind dut
+    let responder : MemoryResponder passive = bind mem
+
+    run
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+
+        // The DUT reads addr 0x05; the responder returns 256 + 5 = 261.
+        wait until dut.done == 1 timeout 40 cycles fail("DUT initiator did not receive HARC target response")
+        assert dut.result == 261
+            else fail("target TLM response mismatch got=0x${dut.result:08x}, expected 0x00000105")
+
+        // The scalar log queue captured exactly the one served address.
+        assert responder.log_addrs.size() == 1
+            else fail("log_addrs.size()=${responder.log_addrs.size()}, expected 1")
+        assert responder.log_addrs.empty() == 0
+            else fail("log_addrs unexpectedly empty")
+        let logged = responder.log_addrs.pop()
+        assert logged == 5
+            else fail("logged addr=${logged}, expected 0x05")
+        assert responder.log_addrs.empty() == 1
+            else fail("log_addrs not empty after pop")
+
+        log(info, "PASS: non-scalar (queue<Record>+queue<scalar>) target-transactor state round-tripped")
+    end run
+end impl TargetNonscalarStateTest

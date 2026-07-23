@@ -284,6 +284,85 @@ impl FuncBuilder<'_> {
                         ));
                     }
                 }
+                // Statement-position bound-to target-responder queue
+                // state-field op: `pending.push(x)` (bare field name).
+                // `.pop()` in statement position is rejected (its value
+                // must be bound), mirroring the component form.
+                if let ExprKind::Call { callee, args } = &*e.kind {
+                    if let Some((field, method)) = self.as_state_queue_call(callee) {
+                        if method == "push" {
+                            let [CallArg::Expr(arg)] = args.as_slice() else {
+                                return Err(LowerError::Invalid(format!(
+                                    "target-state `{field}.push` takes exactly one positional \
+                                     argument"
+                                )));
+                            };
+                            let value = self.lower_expr_no_ports(arg)?;
+                            self.push(Stmt::TransactorStateQueuePush {
+                                instance: String::new(),
+                                field,
+                                value,
+                            });
+                            return Ok(());
+                        }
+                        if method == "pop" {
+                            return Err(unsupported(
+                                &format!("a discarded target-state `{field}.pop()`"),
+                                "bind the popped value: `let v = {field}.pop()`",
+                            ));
+                        }
+                        return Err(unsupported(
+                            &format!(
+                                "target-state queue method `{field}.{method}(...)` in statement \
+                                 position"
+                            ),
+                            "only `push`/`pop`/`size`/`empty` are lowered",
+                        ));
+                    }
+                }
+                // Statement-position TEST-SCOPE target-responder queue
+                // state op: `target.pending.push(x)` (fully resolved
+                // instance). `.pop()` in statement position is rejected.
+                if let ExprKind::Call { callee, args } = &*e.kind {
+                    if let ExprKind::Field { target, name } = &*callee.kind {
+                        if let Some((instance, field, kind)) = self.as_transactor_state_any(target)
+                        {
+                            if matches!(kind, crate::ir::StateFieldKind::Queue { .. }) {
+                                let method = name.name.clone();
+                                if method == "push" {
+                                    let [CallArg::Expr(arg)] = args.as_slice() else {
+                                        return Err(LowerError::Invalid(format!(
+                                            "target-state `{instance}.{field}.push` takes exactly \
+                                             one positional argument"
+                                        )));
+                                    };
+                                    let value = self.lower_expr_no_ports(arg)?;
+                                    self.push(Stmt::TransactorStateQueuePush {
+                                        instance,
+                                        field,
+                                        value,
+                                    });
+                                    return Ok(());
+                                }
+                                if method == "pop" {
+                                    return Err(unsupported(
+                                        &format!(
+                                            "a discarded target-state `{instance}.{field}.pop()`"
+                                        ),
+                                        "bind the popped value: `let v = {field}.pop()`",
+                                    ));
+                                }
+                                return Err(unsupported(
+                                    &format!(
+                                        "target-state queue method `{instance}.{field}.{method}\
+                                         (...)` in statement position"
+                                    ),
+                                    "only `push`/`pop`/`size`/`empty` are lowered",
+                                ));
+                            }
+                        }
+                    }
+                }
                 // Statement-position component method call:
                 // `env.source.publish(3)` — call for effect, result (if
                 // any) discarded.
@@ -477,6 +556,76 @@ impl FuncBuilder<'_> {
                     nested_path,
                 });
                 return Ok(());
+            }
+        }
+        // `let v = pending.pop()` on a bound-to target-responder queue
+        // state field (bare field name). Same ordering rationale as the
+        // component/scoreboard pops above: a record-element pop is a
+        // record-typed let WITH an initializer. The popped local's type
+        // comes from the queue element.
+        if let Some(call) = pop_call_callee(&l.value) {
+            if let Some((field, method)) = self.as_state_queue_call(call) {
+                if method == "pop" {
+                    let crate::ir::StateFieldKind::Queue { elem } =
+                        self.target_state_fields[&field].clone()
+                    else {
+                        // as_state_queue_call already gated on Queue kind.
+                        unreachable!("state-queue pop on a non-queue field");
+                    };
+                    let id = self.declare(&l.name.name);
+                    match elem {
+                        crate::ir::QueueElem::Record(rid) => {
+                            self.set_local_type(id, IrType::Record(rid));
+                        }
+                        crate::ir::QueueElem::Scalar { .. } => {
+                            if let Some(w) = l.ty.as_ref().and_then(typed_let_width) {
+                                self.let_widths.insert(id, w);
+                            }
+                            if let Some(ty) = l.ty.as_ref().and_then(typed_let_ir_type) {
+                                self.set_local_type(id, ty);
+                            }
+                        }
+                    }
+                    self.push(Stmt::TransactorStateQueuePop {
+                        instance: String::new(),
+                        field,
+                        dest: id,
+                    });
+                    return Ok(());
+                }
+            }
+        }
+        // `let v = target.pending.pop()` — TEST-SCOPE pop on a bound-to
+        // responder queue state field (fully resolved instance). Same
+        // ordering rationale as the responder-body state-queue pop above.
+        if let Some(call) = pop_call_callee(&l.value) {
+            if let ExprKind::Field { target, name } = &*call.kind {
+                if name.name == "pop" {
+                    if let Some((instance, field, kind)) = self.as_transactor_state_any(target) {
+                        if let crate::ir::StateFieldKind::Queue { elem } = kind {
+                            let id = self.declare(&l.name.name);
+                            match elem {
+                                crate::ir::QueueElem::Record(rid) => {
+                                    self.set_local_type(id, IrType::Record(rid));
+                                }
+                                crate::ir::QueueElem::Scalar { .. } => {
+                                    if let Some(w) = l.ty.as_ref().and_then(typed_let_width) {
+                                        self.let_widths.insert(id, w);
+                                    }
+                                    if let Some(ty) = l.ty.as_ref().and_then(typed_let_ir_type) {
+                                        self.set_local_type(id, ty);
+                                    }
+                                }
+                            }
+                            self.push(Stmt::TransactorStateQueuePop {
+                                instance,
+                                field,
+                                dest: id,
+                            });
+                            return Ok(());
+                        }
+                    }
+                }
             }
         }
         // Record-typed local: `let t : TxnType` default-constructs (v1
@@ -1043,14 +1192,26 @@ impl FuncBuilder<'_> {
             // Persistent state-field write inside a bound-to target
             // responder body (`read_count = read_count + 1`). The
             // instance is a placeholder filled at the test-binding stage.
-            if self.target_state_fields.contains(&id.name) {
-                let e = self.lower_expr_no_ports(value)?;
-                self.push(Stmt::TransactorStateWrite {
-                    instance: String::new(),
-                    field: id.name.clone(),
-                    value: e,
-                });
-                return Ok(());
+            // Only a scalar field is bare-assignable; a queue field is
+            // mutated via `.push`/`.pop` (rejected here).
+            if let Some(kind) = self.target_state_fields.get(&id.name) {
+                match kind {
+                    crate::ir::StateFieldKind::Scalar { .. } => {
+                        let e = self.lower_expr_no_ports(value)?;
+                        self.push(Stmt::TransactorStateWrite {
+                            instance: String::new(),
+                            field: id.name.clone(),
+                            value: e,
+                        });
+                        return Ok(());
+                    }
+                    crate::ir::StateFieldKind::Queue { .. } => {
+                        return Err(unsupported(
+                            &format!("bare assignment to the `queue` state field `{}`", id.name),
+                            "mutate a queue state field via `.push(x)` / `.pop()`",
+                        ));
+                    }
+                }
             }
             if self.in_check && self.ctx.test_scope_lets.contains(&id.name) {
                 return Err(unsupported(
@@ -1250,6 +1411,37 @@ impl FuncBuilder<'_> {
         };
         let (sb, field, nested) = self.scoreboard_root(sb_t)?;
         Some((sb, field, queue.name.clone(), method.name.clone(), nested))
+    }
+
+    /// Recognize a bound-to target-responder queue state-field method
+    /// access `<field>.<method>` (a bare field name inside a responder
+    /// body). Returns `(field, method)` when `<field>` is a `queue<T>`
+    /// state field of the transactor being lowered. A local of the same
+    /// name shadows the field (matching the bare-read/-write order), and a
+    /// scalar state field is NOT a queue call (returns `None` so the
+    /// scalar path handles it).
+    pub(crate) fn as_state_queue_call(
+        &self,
+        callee: &crate::ast::Expr,
+    ) -> Option<(String, String)> {
+        let ExprKind::Field {
+            target,
+            name: method,
+        } = &*callee.kind
+        else {
+            return None;
+        };
+        let ExprKind::Ident(id) = &*target.kind else {
+            return None;
+        };
+        if self.lookup(&id.name).is_some() {
+            return None;
+        }
+        matches!(
+            self.target_state_fields.get(&id.name),
+            Some(crate::ir::StateFieldKind::Queue { .. })
+        )
+        .then(|| (id.name.clone(), method.name.clone()))
     }
 
     /// Resolve a scoreboard-field access root. Three forms:
