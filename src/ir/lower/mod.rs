@@ -836,6 +836,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         bus_bindings: HashMap::new(),
         bus_remaps: HashMap::new(),
         transactor_fields: HashMap::new(),
+        passive_transactor_fields: HashSet::new(),
         transactors: Vec::new(),
         scoreboard_fields: HashMap::new(),
         scoreboards: Vec::new(),
@@ -898,6 +899,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         bus_bindings: HashMap::new(),
         bus_remaps: HashMap::new(),
         transactor_fields: HashMap::new(),
+        passive_transactor_fields: HashSet::new(),
         transactors: Vec::new(),
         scoreboard_fields: HashMap::new(),
         scoreboards: Vec::new(),
@@ -1042,6 +1044,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         bus_bindings: HashMap::new(),
         bus_remaps: HashMap::new(),
         transactor_fields: HashMap::new(),
+        passive_transactor_fields: HashSet::new(),
         transactors: Vec::new(),
         scoreboard_fields: HashMap::new(),
         // A transactor body that pokes its own sub-scoreboard (`sb.writes =
@@ -1463,21 +1466,20 @@ fn validate_testbench_component(
                     if transactor_ids.contains_key(simple) {
                         // Mode rules mirror v1: a mode-less transactor
                         // field has nothing to inherit from at testbench
-                        // scope, and a passive instance structurally
-                        // lacks its `when active` methods — every method
-                        // in this subset lives there.
+                        // scope. An `active` instance exposes its `when
+                        // active` methods; a `passive` instance exposes
+                        // only its passive surface — persistent state
+                        // fields (kept, with their `default` initializer)
+                        // and any always-on `on` handlers. The `when
+                        // active` methods structurally do not exist on a
+                        // passive instance (they are simply never callable
+                        // — a call site would fail to resolve), so v1
+                        // lowers a passive instance by keeping the state
+                        // and omitting the active methods (#494 P0a/P1b).
+                        // Multiple passive instances each get their own
+                        // per-instance state struct (see `lower_test`).
                         match mode {
-                            Some(TransactorMode::Active) => continue,
-                            Some(TransactorMode::Passive) => {
-                                return Err(unsupported(
-                                    &format!(
-                                        "passive transactor instance `{}.{} : {simple} passive`",
-                                        c.name.name, f.name.name
-                                    ),
-                                    "methods inside `when active` do not exist on a passive \
-                                     instance",
-                                ));
-                            }
+                            Some(TransactorMode::Active) | Some(TransactorMode::Passive) => continue,
                             None => {
                                 return Err(unsupported(
                                     &format!(
@@ -2404,6 +2406,16 @@ fn lower_test(
     // collected in the same walk.
     let mut cov_fields: Vec<(String, CovgroupId)> = Vec::new();
     let mut transactor_fields: Vec<(String, TransactorId)> = Vec::new();
+    // Testbench-field transactor instances declared `passive` (`a :
+    // Poker passive`). A passive instance exposes only its passive
+    // surface (persistent state + always-on `on` handlers); its `when
+    // active` methods are never callable, so the shared per-type method
+    // bodies are NOT filled with a passive instance name. That is what
+    // lets two passive instances of one stateful type coexist with
+    // independent state (#494 P0a/P1b) — the per-instance state struct is
+    // then the only per-instance piece. Keyed by field name (a subset of
+    // `transactor_fields` keys).
+    let mut passive_transactor_fields: HashSet<String> = HashSet::new();
     let mut scoreboard_fields: Vec<(String, ScoreboardId)> = Vec::new();
     let mut scalar_fields: Vec<ir::TbScalarFieldSchema> = Vec::new();
     let mut record_fields: Vec<(String, RecordId)> = Vec::new();
@@ -2424,7 +2436,7 @@ fn lower_test(
             for ci in &c.items {
                 match ci {
                     ComponentItem::Field(f) => {
-                        if let TypeExpr::Named { name, .. } = &f.ty {
+                        if let TypeExpr::Named { name, mode, .. } = &f.ty {
                             let simple =
                                 name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
                             if let Some(id) = covgroup_ids.get(simple) {
@@ -2457,6 +2469,9 @@ fn lower_test(
                                     ));
                                 }
                                 transactor_fields.push((f.name.name.clone(), xid));
+                                if matches!(mode, Some(TransactorMode::Passive)) {
+                                    passive_transactor_fields.insert(f.name.name.clone());
+                                }
                             }
                             if let Some(&rid) = record_ids.get(simple) {
                                 record_fields.push((f.name.name.clone(), rid));
@@ -3029,17 +3044,29 @@ fn lower_test(
             continue;
         }
         let xname = xschema.name.clone();
-        if let Some(prev) = stateful_type_seen.get(&xid.0) {
-            return Err(unsupported(
-                &format!(
-                    "stateful transactor `{xname}` instantiated more than once \
-                     (`{prev}`, `{field}`)"
-                ),
-                "the state-field subset shares one method body per transactor \
-                 type; multiple stateful instances need per-instance bodies",
-            ));
+        let is_passive = passive_transactor_fields.contains(field);
+        // A PASSIVE instance exposes only its per-instance state (and any
+        // always-on `on` handlers, lowered elsewhere); its `when active`
+        // methods are never callable, so the type-shared method bodies are
+        // NOT filled with a passive instance name. That leaves the
+        // per-instance state struct as the only per-instance piece, so
+        // multiple passive instances of one stateful type coexist with
+        // independent state and DO NOT trip the shared-body uniqueness
+        // guard. An ACTIVE instance still fills the shared bodies, so the
+        // one-active-stateful-instance-per-type constraint is unchanged.
+        if !is_passive {
+            if let Some(prev) = stateful_type_seen.get(&xid.0) {
+                return Err(unsupported(
+                    &format!(
+                        "stateful transactor `{xname}` instantiated more than once \
+                         (`{prev}`, `{field}`)"
+                    ),
+                    "the state-field subset shares one method body per transactor \
+                     type; multiple stateful instances need per-instance bodies",
+                ));
+            }
+            stateful_type_seen.insert(xid.0, field.clone());
         }
-        stateful_type_seen.insert(xid.0, field.clone());
         if target_state.contains_key(field) {
             return Err(LowerError::Invalid(format!(
                 "name `{field}` is both a stateful transactor instance and a target-TLM \
@@ -3056,21 +3083,28 @@ fn lower_test(
                 .collect(),
         );
         // Fill the instance into the (type-shared) method bodies'
-        // `TransactorState`/`TransactorStateWrite` placeholders. With the
-        // per-type uniqueness guarded above, this can only ever fill with
-        // a single instance name, but `fill_transactor_state_instance`
-        // still cross-checks defensively.
-        let method_fns: Vec<usize> = xschema.methods.iter().map(|m| m.function.index()).collect();
-        for fidx in method_fns {
-            if let Err(prev) = fill_transactor_state_instance(&mut prog.functions[fidx], field) {
-                return Err(unsupported(
-                    &format!(
-                        "stateful transactor `{xname}` instantiated more than once \
-                         (`{prev}`, `{field}`)"
-                    ),
-                    "the state-field subset shares one method body per transactor \
-                     type; multiple stateful instances need per-instance bodies",
-                ));
+        // `TransactorState`/`TransactorStateWrite` placeholders. Only for
+        // ACTIVE instances — a passive instance's `when active` methods
+        // are not callable, so filling would (a) be pointless and (b)
+        // clobber a same-type active instance's fill / trip the defensive
+        // cross-check on a second passive instance. With the per-type
+        // uniqueness guarded above for the active case, this can only ever
+        // fill with a single instance name, but
+        // `fill_transactor_state_instance` still cross-checks defensively.
+        if !is_passive {
+            let method_fns: Vec<usize> =
+                xschema.methods.iter().map(|m| m.function.index()).collect();
+            for fidx in method_fns {
+                if let Err(prev) = fill_transactor_state_instance(&mut prog.functions[fidx], field) {
+                    return Err(unsupported(
+                        &format!(
+                            "stateful transactor `{xname}` instantiated more than once \
+                             (`{prev}`, `{field}`)"
+                        ),
+                        "the state-field subset shares one method body per transactor \
+                         type; multiple stateful instances need per-instance bodies",
+                    ));
+                }
             }
         }
         unbound_state_actors.push((field.clone(), *xid));
@@ -3269,6 +3303,7 @@ fn lower_test(
         record_fields: record_fields.clone(),
         bus_bindings: bus_bindings.clone(),
         transactor_fields: transactor_fields.clone(),
+        passive_transactor_fields: passive_transactor_fields.clone(),
         scoreboard_fields: scoreboard_fields.clone(),
         regblock_bindings: regblock_binding_schemas,
         target_tlm_actors,
@@ -3438,6 +3473,7 @@ fn lower_test(
             .map(|b| (b.field.clone(), b.remap.clone()))
             .collect(),
         transactor_fields: transactor_fields.iter().cloned().collect(),
+        passive_transactor_fields: passive_transactor_fields.clone(),
         transactors: prog.transactors.clone(),
         scoreboard_fields: scoreboard_fields.iter().cloned().collect(),
         scoreboards: prog.scoreboards.clone(),
@@ -4152,6 +4188,11 @@ pub(crate) struct LowerCtx {
     /// testbench-schema construction). Empty for synthetic testbenches,
     /// helper contexts, and transactor method bodies.
     pub transactor_fields: HashMap<String, ir::TransactorId>,
+    /// The subset of `transactor_fields` declared `passive`. A call to an
+    /// active-only method (`when active`) on a passive instance is
+    /// rejected at the call site (a passive instance has no such method),
+    /// mirroring v1's "`<m>` is declared inside `when active`" diagnostic.
+    pub passive_transactor_fields: HashSet<String>,
     /// Snapshot of the program's transactor schemas, for method
     /// validation at call sites.
     pub transactors: Vec<TransactorSchema>,

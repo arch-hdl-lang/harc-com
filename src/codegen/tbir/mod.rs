@@ -1695,6 +1695,22 @@ fn emit_test(
         if !emitted_xactors.insert(*xid) {
             continue;
         }
+        // A transactor type instantiated ONLY as `passive` never has its
+        // `when active` method bodies filled with an instance name (the
+        // methods are not callable on a passive instance), so emitting
+        // them would produce uncompilable code with unfilled
+        // `TransactorState` placeholders. Skip the method lambdas for such
+        // a type; its per-instance state structs (and any always-on `on`
+        // handlers) are emitted elsewhere. A type with at least one active
+        // instance still emits its (filled) methods as before. (#494
+        // P0a/P1b)
+        let has_active_instance = tb
+            .transactor_fields
+            .iter()
+            .any(|(f, x)| x == xid && !tb.passive_transactor_fields.contains(f));
+        if !has_active_instance {
+            continue;
+        }
         let schema = prog.transactor(*xid);
         for m in &schema.methods {
             func::declare_method_slot(out, prog, schema, m, 1)?;

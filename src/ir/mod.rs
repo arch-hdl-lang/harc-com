@@ -354,6 +354,12 @@ pub struct TransactorMethodSchema {
     pub n_params: usize,
     /// True for `-> T` methods (the function carries a `ret` slot).
     pub has_ret: bool,
+    /// True when this method is declared inside the transactor's `when
+    /// active` block (as opposed to the always-on body). A method that is
+    /// active-only is NOT callable on a `passive` instance — the call site
+    /// rejects it (mirroring v1's "`<m>` is declared inside `when
+    /// active`" diagnostic). Always-on methods are callable on both.
+    pub active_only: bool,
     /// Test-scope `on <obj>.<method> pre` hook bodies, registration
     /// order. Each is a `FunctionKind::TransactorBody` function sharing
     /// the method's parameter signature (the hook sees the same args).
@@ -943,8 +949,16 @@ pub struct TestbenchSchema {
     /// here instead since bindings are per-test, not global.
     pub bus_bindings: Vec<BusBindingSchema>,
     /// Transactor-typed testbench fields (field name, transactor), in
-    /// declaration order. All instances are `active` in this subset.
+    /// declaration order.
     pub transactor_fields: Vec<(String, TransactorId)>,
+    /// The subset of `transactor_fields` declared `passive`. A passive
+    /// instance exposes only its passive surface — persistent state
+    /// fields (and any always-on `on` handlers) — never its `when active`
+    /// methods, so the type-shared method bodies are NOT filled with a
+    /// passive instance name. Codegen consults this so a transactor type
+    /// with ONLY passive instances emits no (unfilled, uncallable) method
+    /// lambdas (#494 P0a/P1b). Keyed by field name.
+    pub passive_transactor_fields: std::collections::HashSet<String>,
     /// Scoreboard-typed testbench fields (field name, scoreboard), in
     /// declaration order. Each lowers to a default-constructed member of
     /// the `_tb` struct (v1's by-value scoreboard instance).
