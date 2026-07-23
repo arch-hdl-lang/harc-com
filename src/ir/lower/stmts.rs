@@ -1676,6 +1676,18 @@ impl FuncBuilder<'_> {
         let m = schema
             .method(&method)
             .expect("as_transactor_call validated the method");
+        // A `when active` method is not callable on a `passive` instance —
+        // the method structurally does not exist there. Reject the call at
+        // lowering (mirroring v1's "`<m>` is declared inside `when active`"
+        // diagnostic) rather than emitting an unresolved method reference.
+        if m.active_only && ctx.passive_transactor_fields.contains(&tb_field) {
+            return Err(LowerError::Invalid(format!(
+                "method `{tb_field}.{method}(...)` is declared inside `when active` and is not \
+                 callable on the passive instance `{tb_field}`; bind the instance `active` to \
+                 call its `when active` methods, or move the method out of `when active` if it \
+                 should exist on passive instances"
+            )));
+        }
         if args.len() != m.n_params {
             return Err(LowerError::Invalid(format!(
                 "transactor method `{}.{method}` takes {} argument(s), call passes {}",

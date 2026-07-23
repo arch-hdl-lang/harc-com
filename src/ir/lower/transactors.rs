@@ -317,6 +317,7 @@ pub(crate) fn lower_transactor(
         bus_bindings: HashMap::new(),
         bus_remaps: HashMap::new(),
         transactor_fields: HashMap::new(),
+        passive_transactor_fields: std::collections::HashSet::new(),
         transactors: Vec::new(),
         // Method bodies see no scoreboards either — scoreboards are
         // test-scope testbench fields, structurally invisible here.
@@ -413,6 +414,7 @@ pub(crate) fn lower_transactor(
             function: fid,
             n_params: f.params.len(),
             has_ret: f.ret.is_some(),
+            active_only,
             pre_hooks: Vec::new(),
             post_hooks: Vec::new(),
             cov_hook_subs: Vec::new(),
@@ -586,6 +588,7 @@ fn lower_bound_target_transactor(
         // applied at bind time by `fill_initiator_bus_prefix`.
         bus_remaps: HashMap::new(),
         transactor_fields: HashMap::new(),
+        passive_transactor_fields: std::collections::HashSet::new(),
         transactors: Vec::new(),
         scoreboard_fields: HashMap::new(),
         scoreboards: Vec::new(),
@@ -1061,6 +1064,7 @@ fn lower_bound_initiator_transactor(
         // remaps are applied at bind time by `fill_initiator_bus_prefix`.
         bus_remaps: HashMap::new(),
         transactor_fields: HashMap::new(),
+        passive_transactor_fields: std::collections::HashSet::new(),
         transactors: Vec::new(),
         scoreboard_fields: HashMap::new(),
         scoreboards: Vec::new(),
@@ -1154,6 +1158,7 @@ fn lower_bound_initiator_transactor(
             function: fid,
             n_params: f.params.len(),
             has_ret: f.ret.is_some(),
+            active_only,
             pre_hooks: Vec::new(),
             post_hooks: Vec::new(),
             cov_hook_subs: Vec::new(),

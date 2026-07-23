@@ -1,0 +1,51 @@
+// #494 P0a/P1b — a stateful DUT-poking transactor (persistent `default`
+// state + a `when active` method, but no always-on `on` handler, so it
+// routes through the `transactor_ids` path rather than the reactive-
+// monitor component path) instantiated as TWO `passive` instances.
+//
+// A passive instance exposes only its passive surface: its persistent
+// state field (`tag`, with the `default` initializer preserved). Its
+// `when active` method (`poke`) is structurally not callable on a passive
+// instance, so it is correctly OMITTED — the run body never calls it, and
+// no method lambda is emitted for a type with only passive instances.
+// The two instances get independent per-instance state.
+//
+// Self-check: both instances start at their `default` (7) and stay there
+// (nothing pokes them), and they are independent. v1 and TB-IR must agree
+// (equivalence-gated); before the fix TB-IR rejected the passive binding.
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor Poker
+    dut : Top
+    tag : uint<32> default 7
+    when active
+        hookable poke()
+            dut.en = 1
+        end poke
+    end when
+end transactor Poker
+
+testbench Tb
+    dut : Top
+    a : Poker passive
+    b : Poker passive
+end testbench Tb
+
+impl PassiveMultiInstanceTest for Tb
+    clock clk = SysDomain
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        dut.en = 1
+        wait 10 cycles
+    end run
+    check
+        assert a.tag == b.tag else fail("independent instances diverged a=${a.tag} b=${b.tag}")
+        assert a.tag == 7 else fail("passive state default lost a=${a.tag}")
+        assert b.tag == 7 else fail("passive state default lost b=${b.tag}")
+    end check
+end impl PassiveMultiInstanceTest

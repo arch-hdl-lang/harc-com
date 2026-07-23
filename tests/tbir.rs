@@ -5341,18 +5341,82 @@ fn transactor_call_in_message_rejected() {
     assert!(msg.contains("inside a message"), "{msg}");
 }
 
-/// Mode rules at the instance field: passive instances structurally
-/// lack their `when active` methods; mode-less fields have nothing to
-/// inherit from at testbench scope.
+/// Mode rules at the instance field: a `passive` instance is accepted
+/// (its passive surface — persistent state + always-on handlers — is
+/// lowered; #494 P0a/P1b), but calling one of its `when active` methods
+/// on the passive instance is rejected at the call site as `Invalid`
+/// (the method structurally does not exist there). A mode-less field has
+/// nothing to inherit from at testbench scope, so it stays rejected.
 #[test]
 fn transactor_instance_mode_rules() {
+    // `XACTOR_SRC` calls `xt.pulse(...)` / `xt.readv()` — both `when
+    // active` methods — so a passive `xt` is rejected at the CALL site.
     let passive = XACTOR_SRC.replace("xt  : Xt active", "xt  : Xt passive");
-    let msg = assert_unsupported(&lower_src(&passive).unwrap_err());
-    assert!(msg.contains("passive transactor instance"), "{msg}");
+    let err = lower_src(&passive).unwrap_err();
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)),
+        "calling a `when active` method on a passive instance must be Invalid, \
+         not Unsupported: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("when active") && msg.contains("passive instance"),
+        "{msg}"
+    );
 
     let modeless = XACTOR_SRC.replace("xt  : Xt active", "xt  : Xt");
     let msg = assert_unsupported(&lower_src(&modeless).unwrap_err());
     assert!(msg.contains("without an `active`/`passive` mode"), "{msg}");
+}
+
+/// A `passive` instance whose `when active` methods are never CALLED is
+/// accepted, and its persistent state is lowered per-instance. This is
+/// the P0a/P1b gap: v1 accepts it, TB-IR previously rejected the binding
+/// outright.
+#[test]
+fn passive_transactor_instance_accepted_when_methods_uncalled() {
+    // Drop the `when active` method calls from the run body; keep the
+    // passive binding. The state-only passive surface must lower.
+    let src = r#"
+transactor Xp
+    dut : Top
+    tag : uint<32> default 5
+    when active
+        hookable poke()
+            dut.en = 1
+        end poke
+    end when
+end transactor Xp
+
+testbench XpTb
+    dut : Top
+    a : Xp passive
+    b : Xp passive
+end testbench XpTb
+
+impl XpTest for XpTb
+    run
+        dut.en = 1
+        wait 2 cycle
+    end run
+    check
+        assert a.tag == 5 else fail("a=${a.tag}")
+        assert b.tag == 5 else fail("b=${b.tag}")
+    end check
+end impl XpTest
+"#;
+    let prog = lower_src(src).expect("passive multi-instance lowers");
+    let tb = &prog.testbenches[0];
+    // Two passive instances, both recorded as passive.
+    assert_eq!(tb.transactor_fields.len(), 2, "two passive instances");
+    assert!(tb.passive_transactor_fields.contains("a"));
+    assert!(tb.passive_transactor_fields.contains("b"));
+    // Independent per-instance state structs (no shared-body clobber).
+    assert_eq!(
+        tb.unbound_state_actors.len(),
+        2,
+        "each passive instance gets its own state struct"
+    );
 }
 
 #[test]
