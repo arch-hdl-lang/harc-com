@@ -1218,11 +1218,43 @@ fn lower_state_field(
             kind: StateFieldKind::Queue { elem },
         });
     }
+    // A whole value-record state field (`last : Beat`) → the shared
+    // record machinery (`IrType::Record` / `RecordId`), reused verbatim
+    // from the `queue<Record>` / scoreboard / component record seam so
+    // the state struct carries a value-record member. Sub-fields are
+    // accessed via the state-record ops; the whole record round-trips
+    // through the scalar `TransactorState*` forms.
+    if let TypeExpr::Named { name, generics, .. } = &f.ty {
+        let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+        if let Some(&rid) = record_ids.get(simple) {
+            if !generics.is_empty() {
+                return Err(unsupported(
+                    &format!(
+                        "bound-to transactor `{tname}` record state field `{fname}` of a \
+                         generic-applied type"
+                    ),
+                    "",
+                ));
+            }
+            if f.default.is_some() {
+                return Err(unsupported(
+                    &format!(
+                        "bound-to transactor `{tname}` record state field `{fname}` with a default"
+                    ),
+                    "a record state field is default-constructed; drop the `default`",
+                ));
+            }
+            return Ok(StateFieldSchema {
+                name: fname.clone(),
+                kind: StateFieldKind::Record { record: rid },
+            });
+        }
+    }
     let Some(ty) = super::tb_scalar_field_ir_type(&f.ty) else {
         return Err(unsupported(
             &format!("bound-to transactor `{tname}` state field `{fname}` with a non-scalar type"),
-            "target-transactor state must be a scalar `uint<N>`/`sint<N>`/`bool` (≤64 bits) \
-             or a `queue<scalar ≤ 64 bits>` / `queue<Record>`",
+            "target-transactor state must be a scalar `uint<N>`/`sint<N>`/`bool` (≤64 bits), \
+             a whole value-record, or a `queue<scalar ≤ 64 bits>` / `queue<Record>`",
         ));
     };
     let default = match &f.default {

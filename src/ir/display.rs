@@ -152,6 +152,9 @@ impl Display for TbProgram {
                         };
                         writeln!(f, "    state {} : queue<{}>", sf.name, e)?;
                     }
+                    crate::ir::StateFieldKind::Record { record } => {
+                        writeln!(f, "    state {} : rec{}", sf.name, record.index())?;
+                    }
                 }
             }
             for m in &x.methods {
@@ -515,6 +518,18 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         } => {
             format!(
                 "TransactorStateWrite({instance}.{field}, {})",
+                expr_str(func, value)
+            )
+        }
+        Stmt::TransactorStateRecordFieldWrite {
+            instance,
+            field,
+            path,
+            value,
+        } => {
+            format!(
+                "TransactorStateRecordFieldWrite({instance}.{field}.{}, {})",
+                path.join("."),
                 expr_str(func, value)
             )
         }
@@ -891,6 +906,11 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         }
         Expr::TbField(field) => format!("_tb.{field}"),
         Expr::TransactorState { instance, field } => format!("{instance}.{field}"),
+        Expr::TransactorStateRecordField {
+            instance,
+            field,
+            path,
+        } => format!("{instance}.{field}.{}", path.join(".")),
         Expr::TransactorStateQueueQuery {
             instance,
             field,

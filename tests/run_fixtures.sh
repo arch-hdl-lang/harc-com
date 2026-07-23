@@ -122,6 +122,7 @@ tlm_method_bus_test   | TlmMemory      | TlmMemory.sv           |
 msg_suspending_call_test | TlmMemory   | TlmMemory.sv           |
 tlm_target_thread_test | TlmReadInitiator | TlmReadInitiator.sv  |
 target_nonscalar_state_test | TlmReadInitiator | TlmReadInitiator.sv |
+target_record_state_test | TlmReadInitiator | TlmReadInitiator.sv |
 tlm_target_thread_if_test | TlmReadInitiatorPair | TlmReadInitiatorPair.sv |
 tlm_target_thread_runtime_loop_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv |
 tlm_target_thread_early_return_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv |

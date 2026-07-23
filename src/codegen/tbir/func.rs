@@ -902,6 +902,18 @@ fn emit_stmt(
             let e = expr_cpp(cx, value)?;
             writeln!(out, "{pad}{recv}.{field} = {e};").ok();
         }
+        // `last.addr = addr` on a bound-to target transactor whole-record
+        // state field — a nested member of the value-record struct on the
+        // per-instance struct (`<instance>.<field>.<path…> = <value>`).
+        Stmt::TransactorStateRecordFieldWrite {
+            instance,
+            field,
+            path,
+            value,
+        } => {
+            let e = expr_cpp(cx, value)?;
+            writeln!(out, "{pad}{instance}.{field}.{} = {e};", path.join(".")).ok();
+        }
         // `pending.push(value)` on a bound-to target transactor `queue<T>`
         // state field — a `harc_rt::HarcQueue<T>` member of the per-
         // instance struct. Mirrors `ComponentQueuePush`.

@@ -578,6 +578,9 @@ impl Checker<'_> {
                     // just hold the value to the no-inline-port rule.
                     self.check_expr(value, false, "TransactorStateWrite value");
                 }
+                Stmt::TransactorStateRecordFieldWrite { value, .. } => {
+                    self.check_expr(value, false, "TransactorStateRecordFieldWrite value");
+                }
                 Stmt::TransactorStateQueuePush { value, .. } => {
                     // Target-state queue host state — the pushed value
                     // follows the no-inline-port rule like any Assign value.
@@ -962,6 +965,7 @@ impl Checker<'_> {
             // lowering against the bound instance; nothing to verify
             // structurally here (no local/port dependency).
             Expr::TransactorState { .. } => {}
+            Expr::TransactorStateRecordField { .. } => {}
             Expr::TransactorStateQueueQuery { .. } => {}
             Expr::Port(_) => {
                 if !ports_ok {
@@ -1463,6 +1467,9 @@ fn check_def_before_use(
                 }
                 Stmt::TbFieldWrite { value, .. } => check_e(value, &defined, errs),
                 Stmt::TransactorStateWrite { value, .. } => check_e(value, &defined, errs),
+                Stmt::TransactorStateRecordFieldWrite { value, .. } => {
+                    check_e(value, &defined, errs)
+                }
                 Stmt::TransactorStateQueuePush { value, .. } => check_e(value, &defined, errs),
                 Stmt::TransactorStateQueuePop { dest, .. } => {
                     // Pop defines the destination local.
@@ -1609,6 +1616,7 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
         | Expr::Port(_)
         | Expr::TbField(_)
         | Expr::TransactorState { .. }
+        | Expr::TransactorStateRecordField { .. }
         | Expr::TransactorStateQueueQuery { .. }
         | Expr::ComponentField { .. }
         | Expr::ScoreboardQuery { .. }

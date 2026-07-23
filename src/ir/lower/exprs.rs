@@ -27,6 +27,20 @@ pub(crate) struct RecordFieldChain {
     pub dotted: String,
 }
 
+/// Resolution of a subfield access onto a bound-to target responder's
+/// whole-record state field (`last.addr` / `responder.last.addr`).
+/// `instance` is the bound testbench-field instance (empty placeholder in
+/// a responder body, filled at test-binding); `field` is the record state
+/// field; `path` is the nested subfield chain (length ≥ 1).
+pub(crate) struct TransactorStateRecordChain {
+    pub instance: String,
+    pub field: String,
+    pub path: Vec<String>,
+    /// `Some(N)` when the leaf is a `Vec<T, N>` field (rejected: whole-Vec
+    /// state-record access is out of subset; index element-wise instead).
+    pub leaf_vec_len: Option<usize>,
+}
+
 impl FuncBuilder<'_> {
     /// Lower with `Expr::Port` allowed in the result.
     pub(crate) fn lower_expr(&mut self, e: &AstExpr) -> Result<Expr, LowerError> {
@@ -90,7 +104,12 @@ impl FuncBuilder<'_> {
                 // bare queue ident is rejected precisely.
                 if let Some(kind) = self.target_state_fields.get(&id.name) {
                     return match kind {
-                        crate::ir::StateFieldKind::Scalar { .. } => Ok(Expr::TransactorState {
+                        // A bare read of a scalar OR a whole-record state
+                        // field is `TransactorState` (`instance.<field>`);
+                        // for a record this is a by-value struct read
+                        // (copied into a `let`, pushed onto a queue, …).
+                        crate::ir::StateFieldKind::Scalar { .. }
+                        | crate::ir::StateFieldKind::Record { .. } => Ok(Expr::TransactorState {
                             instance: String::new(),
                             field: id.name.clone(),
                         }),
@@ -167,8 +186,31 @@ impl FuncBuilder<'_> {
                         return Ok(Expr::Local(local));
                     }
                 }
+                // Subfield read of a bound-to target responder's whole-
+                // record state field (`last.data` in a responder body /
+                // `responder.last.data` from the test). Checked before the
+                // whole-record `as_transactor_state` lane, which only fires
+                // when there is NO further subfield.
+                if let Some(chain) = self.as_transactor_state_record_field(e)? {
+                    if chain.leaf_vec_len.is_some() {
+                        return Err(unsupported(
+                            &format!(
+                                "a whole-`Vec` read of record state field `{}.{}`",
+                                chain.field,
+                                chain.path.join(".")
+                            ),
+                            "read a `Vec` record field element-wise (`{field}.{vec}[i]`)",
+                        ));
+                    }
+                    return Ok(Expr::TransactorStateRecordField {
+                        instance: chain.instance,
+                        field: chain.field,
+                        path: chain.path,
+                    });
+                }
                 // Test-scope read of a bound-to target responder's
-                // persistent state (`target.read_count`).
+                // persistent state (`target.read_count`, or a whole-record
+                // `target.last`).
                 if let Some((instance, field)) = self.as_transactor_state(e) {
                     return Ok(Expr::TransactorState { instance, field });
                 }
@@ -699,6 +741,51 @@ impl FuncBuilder<'_> {
                 }
                 None
             }
+            // A whole-record read of a target-transactor state field
+            // (`responder.last` / bare `last`) — resolve via the instance's
+            // (or the responder body's) state-field table.
+            Expr::TransactorState { instance, field } => {
+                let kind = if instance.is_empty() {
+                    self.target_state_fields.get(field)
+                } else {
+                    self.ctx.target_state.get(instance)?.get(field)
+                };
+                match kind {
+                    Some(crate::ir::StateFieldKind::Record { record }) => Some(*record),
+                    _ => None,
+                }
+            }
+            // A nested whole-record subfield read of a state record
+            // (`responder.last.inner`, where `inner` is itself a record).
+            Expr::TransactorStateRecordField {
+                instance,
+                field,
+                path,
+            } => {
+                let kind = if instance.is_empty() {
+                    self.target_state_fields.get(field)
+                } else {
+                    self.ctx.target_state.get(instance)?.get(field)
+                };
+                let Some(crate::ir::StateFieldKind::Record { record }) = kind else {
+                    return None;
+                };
+                let mut cur = *record;
+                let last = path.len().checked_sub(1)?;
+                for (i, seg) in path.iter().enumerate() {
+                    let fld = self.ctx.records.get(cur.index())?.field(seg)?;
+                    match fld.ty {
+                        IrType::Record(r) if fld.vec_len.is_none() => {
+                            if i == last {
+                                return Some(r);
+                            }
+                            cur = r;
+                        }
+                        _ => return None,
+                    }
+                }
+                None
+            }
             _ => None,
         }
     }
@@ -868,6 +955,8 @@ impl FuncBuilder<'_> {
             | Expr::TbField(_)
             // Transactor-instance state is host state — no DUT port inside.
             | Expr::TransactorState { .. }
+            // A record-state subfield read is host state — no DUT port inside.
+            | Expr::TransactorStateRecordField { .. }
             // Target-state queue size/empty reads are host state — no port.
             | Expr::TransactorStateQueueQuery { .. }
             // Scoreboard reads are host state — no DUT port inside.
@@ -1516,11 +1605,14 @@ impl FuncBuilder<'_> {
             _ => return None,
         };
         let fields = self.ctx.target_state.get(&instance)?;
-        // Only a SCALAR field is a bare `target.<field>` read; a queue
-        // field is read via `target.<queue>.size()`/`.empty()`/`.pop()`.
+        // A SCALAR field is a bare `target.<field>` read; a whole-record
+        // field is a `target.<field>` value read (by-value struct copy).
+        // A queue field is read via `.size()`/`.empty()`/`.pop()`, and a
+        // record SUBFIELD (`target.last.addr`) is handled by the earlier
+        // `as_transactor_state_record_field` lane, so both are excluded.
         matches!(
             fields.get(&name.name),
-            Some(crate::ir::StateFieldKind::Scalar { .. })
+            Some(crate::ir::StateFieldKind::Scalar { .. } | crate::ir::StateFieldKind::Record { .. })
         )
         .then(|| (instance, name.name.clone()))
     }
@@ -1611,6 +1703,124 @@ impl FuncBuilder<'_> {
         fields
             .get(&name.name)
             .map(|kind| (instance, name.name.clone(), kind.clone()))
+    }
+
+    /// Resolve an AST field-access chain onto a SUB-FIELD of a bound-to
+    /// target responder's whole-record state field. Handles all three
+    /// access shapes uniformly:
+    ///   * `last.addr` — a bare responder-body chain (the record field
+    ///     `last` is in `self.target_state_fields`; the instance is a
+    ///     placeholder filled at test-binding);
+    ///   * `responder.last.addr` — a test-scope `let`-bound responder;
+    ///   * `_tb.xact.last.addr` — an impl-form testbench transactor field.
+    /// Returns `Ok(None)` when the chain is not a record-state subfield
+    /// access (the caller falls through), or `Err` when it IS one but a
+    /// segment names no record field / a non-leaf is not a nested record.
+    /// The returned `path` is length ≥ 1 (a whole-record access, path
+    /// empty, is handled by the scalar `TransactorState` lane).
+    pub(crate) fn as_transactor_state_record_field(
+        &self,
+        e: &AstExpr,
+    ) -> Result<Option<TransactorStateRecordChain>, LowerError> {
+        let ExprKind::Field { .. } = &*e.kind else {
+            return Ok(None);
+        };
+        // Flatten `a.b.c…` → root ident + segments (declaration order).
+        let mut segs: Vec<String> = Vec::new();
+        let mut cur = e;
+        let root = loop {
+            match &*cur.kind {
+                ExprKind::Field { target, name } => {
+                    segs.push(name.name.clone());
+                    cur = target;
+                }
+                ExprKind::Ident(root) => break root,
+                _ => return Ok(None),
+            }
+        };
+        segs.reverse();
+        // Resolve (instance, state-field-name, remaining subfield segs).
+        // Bare responder-body form: root IS the record state field, so
+        // the instance is a placeholder. Otherwise root/`_tb`-prefix
+        // names the bound test-scope instance and its state field.
+        let (instance, state_field, sub) = if self.target_state_fields.contains_key(&root.name) {
+            // `last.addr` — root is the state field, segs are the subfields.
+            (String::new(), root.name.clone(), segs)
+        } else {
+            // Test-scope: `responder.last.addr` (instance=root) or
+            // `_tb.xact.last.addr` (instance=segs[0]).
+            let (instance, rest_start) =
+                if Some(root.name.as_str()) == self.ctx.tb_field.as_deref() {
+                    match segs.first() {
+                        Some(mid) => (mid.clone(), 1usize),
+                        None => return Ok(None),
+                    }
+                } else {
+                    (root.name.clone(), 0usize)
+                };
+            if !self.ctx.target_state.contains_key(&instance) {
+                return Ok(None);
+            }
+            let rest = &segs[rest_start..];
+            let Some(state_field) = rest.first() else {
+                return Ok(None);
+            };
+            (instance, state_field.clone(), rest[1..].to_vec())
+        };
+        // The named state field must exist and be a whole-record field.
+        let kind = if instance.is_empty() {
+            self.target_state_fields.get(&state_field)
+        } else {
+            match self.ctx.target_state.get(&instance) {
+                Some(fields) => fields.get(&state_field),
+                None => return Ok(None),
+            }
+        };
+        let Some(crate::ir::StateFieldKind::Record { record }) = kind else {
+            return Ok(None);
+        };
+        // A bare whole-record access (no subfield) is the scalar
+        // `TransactorState` lane's job, not this one.
+        if sub.is_empty() {
+            return Ok(None);
+        }
+        // Type-check the subfield chain against the record schema,
+        // descending through nested records to the leaf.
+        let mut cur_rid = *record;
+        let last = sub.len() - 1;
+        let mut leaf_vec_len = None;
+        for (i, seg) in sub.iter().enumerate() {
+            let schema = &self.ctx.records[cur_rid.index()];
+            let Some(fld) = schema.field(seg) else {
+                return Err(LowerError::Invalid(format!(
+                    "record `{}` has no field `{seg}`",
+                    schema.name
+                )));
+            };
+            if i == last {
+                leaf_vec_len = fld.vec_len;
+                break;
+            }
+            match fld.ty {
+                IrType::Record(next) if fld.vec_len.is_none() => cur_rid = next,
+                _ => {
+                    return Err(unsupported(
+                        &format!(
+                            "field `{}.{seg}` is not a nested record; cannot access `.{}`",
+                            schema.name,
+                            sub[i + 1]
+                        ),
+                        "only nested struct/transaction fields can be traversed further",
+                    ));
+                }
+            }
+        }
+        Ok(Some(TransactorStateRecordChain {
+            instance,
+            field: state_field,
+            path: sub,
+            leaf_vec_len,
+        }))
     }
 
     /// `Some(PortRef)` (with `lane`) when the expression is a lane

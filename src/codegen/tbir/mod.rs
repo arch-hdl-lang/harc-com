@@ -354,6 +354,7 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
         | RecordWriteCb { value: e, .. }
         | TbFieldWrite { value: e, .. }
         | TransactorStateWrite { value: e, .. }
+        | TransactorStateRecordFieldWrite { value: e, .. }
         | ComponentFieldWrite { value: e, .. }
         | TransactorCall { call: e, .. }
         | TransactorSelfCall { call: e, .. } => expr_has_probe(e),
@@ -551,6 +552,7 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
         | RecordWriteCb { value: e, .. }
         | TbFieldWrite { value: e, .. }
         | TransactorStateWrite { value: e, .. }
+        | TransactorStateRecordFieldWrite { value: e, .. }
         | ComponentFieldWrite { value: e, .. }
         | TransactorCall { call: e, .. }
         | TransactorSelfCall { call: e, .. } => for_each_port_in_expr(e, f),

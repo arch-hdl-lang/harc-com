@@ -193,6 +193,14 @@ fn emit_state_struct_body(
                 let elem = queue_elem_cty(elem, records);
                 writeln!(out, "{pad}harc_rt::HarcQueue<{elem}> {};", f.name).ok();
             }
+            // A whole value-record state member, carried by value (the
+            // record struct is emitted earlier at file scope). Default-
+            // constructed via the struct's own field initializers,
+            // mirroring the scoreboard/component record-member shape.
+            crate::ir::StateFieldKind::Record { record } => {
+                let rname = &records[record.index()].name;
+                writeln!(out, "{INDENT}{INDENT}{rname} {}{{}};", f.name).ok();
+            }
         }
     }
     // Activity stamps, mirroring v1's auto-injected component fields
