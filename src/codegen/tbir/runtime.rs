@@ -129,6 +129,53 @@ pub(super) fn target_state_struct_inst(
 ) {
     let ty = format!("_{}_{}_state", schema.name, instance);
     writeln!(out, "{INDENT}struct {ty} {{").ok();
+    emit_state_struct_body(out, schema, records, 2);
+    writeln!(out, "{INDENT}}} {instance};").ok();
+}
+
+/// The shared per-TYPE state struct name for the state-receiver method
+/// ABI (`_<Type>_state`). One such struct type serves every unbound
+/// active/passive instance of the type; each instance is its own variable
+/// of this type (`emit_unbound_state_var`), and the type-shared method
+/// lambda takes it by reference as `self_state` so one body drives any
+/// number of instances (#494 P1b).
+pub(super) fn unbound_state_struct_ty(schema: &crate::ir::TransactorSchema) -> String {
+    format!("_{}_state", schema.name)
+}
+
+/// Emit the shared per-TYPE state struct declaration for the state-receiver
+/// ABI. Emitted once per transactor type that has at least one unbound
+/// stateful instance in the test, before any instance variable or method
+/// lambda that references it.
+pub(super) fn unbound_state_struct_decl(
+    out: &mut String,
+    schema: &crate::ir::TransactorSchema,
+    records: &[crate::ir::RecordSchema],
+) {
+    let ty = unbound_state_struct_ty(schema);
+    writeln!(out, "{INDENT}struct {ty} {{").ok();
+    emit_state_struct_body(out, schema, records, 2);
+    writeln!(out, "{INDENT}}};").ok();
+}
+
+/// Emit one instance variable of the shared per-TYPE state struct
+/// (`_<Type>_state <instance>;`). Multiple instances of one type each get
+/// their own variable with independent default-initialized state.
+pub(super) fn unbound_state_var(out: &mut String, schema: &crate::ir::TransactorSchema, instance: &str) {
+    let ty = unbound_state_struct_ty(schema);
+    writeln!(out, "{INDENT}{ty} {instance};").ok();
+}
+
+/// The shared field layout of a per-instance transactor-state struct:
+/// declared scalar/queue state fields with their defaults, plus the two
+/// auto-injected activity-tracking heartbeat stamps.
+fn emit_state_struct_body(
+    out: &mut String,
+    schema: &crate::ir::TransactorSchema,
+    records: &[crate::ir::RecordSchema],
+    depth: usize,
+) {
+    let pad = INDENT.repeat(depth);
     for f in &schema.state_fields {
         match &f.kind {
             crate::ir::StateFieldKind::Scalar { ty, default } => {
@@ -140,24 +187,18 @@ pub(super) fn target_state_struct_inst(
                     crate::ir::IrType::SInt(_) => ("int64_t", default.to_string()),
                     _ => ("uint64_t", default.to_string()),
                 };
-                writeln!(out, "{INDENT}{INDENT}{cty} {} = {init};", f.name).ok();
+                writeln!(out, "{pad}{cty} {} = {init};", f.name).ok();
             }
             crate::ir::StateFieldKind::Queue { elem } => {
                 let elem = queue_elem_cty(elem, records);
-                writeln!(
-                    out,
-                    "{INDENT}{INDENT}harc_rt::HarcQueue<{elem}> {};",
-                    f.name
-                )
-                .ok();
+                writeln!(out, "{pad}harc_rt::HarcQueue<{elem}> {};", f.name).ok();
             }
         }
     }
     // Activity stamps, mirroring v1's auto-injected component fields
     // (`idle()`/`idle_in()`/`idle_out()` predicate backing).
-    writeln!(out, "{INDENT}{INDENT}uint64_t _last_in_cycle = 0;").ok();
-    writeln!(out, "{INDENT}{INDENT}uint64_t _last_out_cycle = 0;").ok();
-    writeln!(out, "{INDENT}}} {instance};").ok();
+    writeln!(out, "{pad}uint64_t _last_in_cycle = 0;").ok();
+    writeln!(out, "{pad}uint64_t _last_out_cycle = 0;").ok();
 }
 
 /// The C++ element type for a `queue<T>` field. Mirrors `event_payload_cty`:

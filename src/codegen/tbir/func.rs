@@ -241,6 +241,7 @@ pub(super) fn emit_function(
         self_subst: None,
         dut_type,
         trace_component: "",
+        state_receiver: None,
     };
     let pad = INDENT.repeat(depth);
     let pad1 = INDENT.repeat(depth + 1);
@@ -442,6 +443,7 @@ pub(super) fn emit_tseq(
         self_subst: None,
         dut_type: "",
         trace_component: "",
+        state_receiver: None,
     };
     let nparams = func.params.len();
     let pad = INDENT.repeat(depth);
@@ -616,6 +618,7 @@ pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Resul
         self_subst: None,
         dut_type: "",
         trace_component: "",
+        state_receiver: None,
     };
     let nparams = func.params.len();
 
@@ -756,14 +759,14 @@ fn emit_stmt(
             // Resolve the instance field to its transactor type via the
             // owner testbench — the lambda is named `<Type>_<method>`,
             // mirroring v1's hookable lambda naming.
-            let xname = func
+            let xschema = func
                 .owner
                 .and_then(|o| prog.testbenches.get(o.index()))
                 .and_then(|tb| {
                     tb.transactor_fields
                         .iter()
                         .find(|(f, _)| f == bus_field)
-                        .map(|(_, xid)| prog.transactor(*xid).name.as_str())
+                        .map(|(_, xid)| prog.transactor(*xid))
                 })
                 .ok_or_else(|| {
                     EmitError(format!(
@@ -772,7 +775,15 @@ fn emit_stmt(
                         func.name
                     ))
                 })?;
-            let mut rendered = Vec::with_capacity(args.len());
+            let xname = xschema.name.as_str();
+            let mut rendered = Vec::with_capacity(args.len() + 1);
+            // State-receiver ABI (#494 P1b): an unbound stateful
+            // transactor's method takes the calling instance's per-instance
+            // state struct by reference as the leading arg, so `a.go()` and
+            // `b.go()` mutate their own state through one shared body.
+            if uses_state_receiver(xschema) {
+                rendered.push(bus_field.clone());
+            }
             for a in args {
                 rendered.push(expr_cpp(cx, a)?);
             }
@@ -795,7 +806,15 @@ fn emit_stmt(
                     func.name
                 )));
             };
-            let mut rendered = Vec::with_capacity(args.len());
+            let mut rendered = Vec::with_capacity(args.len() + 1);
+            // Same-type self-call: forward the current state receiver so the
+            // callee mutates the SAME per-instance struct (#494 P1b). A
+            // self-call only appears inside a method body, and a stateful
+            // type's methods all carry `self_state`, so the presence of a
+            // receiver in scope tracks the callee's ABI exactly.
+            if let Some(recv) = cx.state_receiver {
+                rendered.push(recv.to_string());
+            }
             for a in args {
                 rendered.push(expr_cpp(cx, a)?);
             }
@@ -879,8 +898,9 @@ fn emit_stmt(
             field,
             value,
         } => {
+            let recv = super::expr::resolve_state_instance(cx, instance)?;
             let e = expr_cpp(cx, value)?;
-            writeln!(out, "{pad}{instance}.{field} = {e};").ok();
+            writeln!(out, "{pad}{recv}.{field} = {e};").ok();
         }
         // `pending.push(value)` on a bound-to target transactor `queue<T>`
         // state field — a `harc_rt::HarcQueue<T>` member of the per-
@@ -890,8 +910,9 @@ fn emit_stmt(
             field,
             value,
         } => {
+            let recv = super::expr::resolve_state_instance(cx, instance)?;
             let e = expr_cpp(cx, value)?;
-            writeln!(out, "{pad}{instance}.{field}.push({e});").ok();
+            writeln!(out, "{pad}{recv}.{field}.push({e});").ok();
         }
         // `let v = pending.pop()` — pop the state-queue front into a local.
         Stmt::TransactorStateQueuePop {
@@ -899,8 +920,9 @@ fn emit_stmt(
             field,
             dest,
         } => {
+            let recv = super::expr::resolve_state_instance(cx, instance)?;
             let name = &names[dest.index()];
-            writeln!(out, "{pad}{name} = {instance}.{field}.pop();").ok();
+            writeln!(out, "{pad}{name} = {recv}.{field}.pop();").ok();
         }
         Stmt::DutWrite(p, e) if matches!(p.access, crate::ir::PortAccess::Force) => {
             // `dut.<force_probe> = expr` → the two-store drv+en pair the
@@ -1715,6 +1737,20 @@ fn declare_locals(
     Ok(())
 }
 
+/// Whether a transactor type's methods use the per-instance state-receiver
+/// ABI (#494 P1b): the shared body takes a leading `<Type>_state&
+/// self_state` param and each call site passes its instance's struct.
+///
+/// True only for an UNBOUND stateful transactor — that is the form whose
+/// method bodies lowering leaves with empty-instance state placeholders so
+/// they resolve against the receiver. A bound-to initiator BFM instead
+/// bakes its (single) instance name into the shared body, so it keeps the
+/// plain arg-only signature even when it carries state; a stateless type
+/// has no per-instance struct at all.
+pub(super) fn uses_state_receiver(schema: &TransactorSchema) -> bool {
+    !schema.state_fields.is_empty() && schema.bound_bus.is_none()
+}
+
 pub(super) fn declare_method_slot(
     out: &mut String,
     prog: &TbProgram,
@@ -1728,15 +1764,20 @@ pub(super) fn declare_method_slot(
     } else {
         "void"
     };
-    let params = (0..func.params.len())
-        .map(|i| match func.locals[i].ty {
-            IrType::Record(r) => prog.records[r.index()].name.clone(),
-            IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
-            IrType::Seq(ref scalar) => format!("std::vector<{}>", super::local_scalar_cty(scalar)),
-            ref ty => super::local_scalar_cty(ty).to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
+    let mut param_tys: Vec<String> = Vec::new();
+    // State-receiver ABI (#494 P1b): an unbound stateful transactor's
+    // method takes its per-instance state struct by reference as the
+    // leading param, so one shared body serves any number of instances.
+    if uses_state_receiver(schema) {
+        param_tys.push(format!("{}&", super::runtime::unbound_state_struct_ty(schema)));
+    }
+    param_tys.extend((0..func.params.len()).map(|i| match func.locals[i].ty {
+        IrType::Record(r) => prog.records[r.index()].name.clone(),
+        IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
+        IrType::Seq(ref scalar) => format!("std::vector<{}>", super::local_scalar_cty(scalar)),
+        ref ty => super::local_scalar_cty(ty).to_string(),
+    }));
+    let params = param_tys.join(", ");
     let pad = INDENT.repeat(depth);
     writeln!(
         out,
@@ -1781,6 +1822,13 @@ pub(super) fn emit_method(
     // Method bodies access the bound DUT (`schema.dut_type`); probes are
     // never declared on a transactor DUT (lowering rejects it), but pass
     // the real type so any `PortAccess` would mangle correctly.
+    // State-receiver ABI (#494 P1b): an unbound stateful transactor's
+    // shared method body reads/writes its per-instance state through
+    // `self_state`, the struct the caller passes by reference.
+    // Empty-instance state nodes in the body resolve against it. A bound-to
+    // initiator BFM keeps its baked-in instance name (non-empty), so no
+    // receiver.
+    let has_state = uses_state_receiver(schema);
     let cx = ECx {
         func,
         names: &names,
@@ -1788,6 +1836,7 @@ pub(super) fn emit_method(
         self_subst: None,
         dut_type: &schema.dut_type,
         trace_component: "",
+        state_receiver: has_state.then_some("self_state"),
     };
     let nparams = func.params.len();
     let pad = INDENT.repeat(depth);
@@ -1805,19 +1854,24 @@ pub(super) fn emit_method(
     // v1's by-value struct param. A scalar param widens to uint64_t, or
     // to v1's `_harc_u128` wide-value type for a >64-bit `uint`/`sint`
     // (the wide-value method ABI — the body moves it to a wide DUT port).
-    let params = names[..nparams]
-        .iter()
-        .enumerate()
-        .map(|(i, n)| match func.locals[i].ty {
+    let mut param_list: Vec<String> = Vec::new();
+    if has_state {
+        param_list.push(format!(
+            "{}& self_state",
+            super::runtime::unbound_state_struct_ty(schema)
+        ));
+    }
+    param_list.extend(names[..nparams].iter().enumerate().map(|(i, n)| {
+        match func.locals[i].ty {
             IrType::Record(r) => format!("{} {n}", prog.records[r.index()].name),
             IrType::RecordSeq(r) => format!("std::vector<{}> {n}", prog.records[r.index()].name),
             IrType::Seq(ref scalar) => {
                 format!("std::vector<{}> {n}", super::local_scalar_cty(scalar))
             }
             ref ty => format!("{} {n}", super::local_scalar_cty(ty)),
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
+        }
+    }));
+    let params = param_list.join(", ");
     writeln!(
         out,
         "{pad}{}_{} = [&]({params}) -> {ret_ty} {{",
@@ -2171,6 +2225,7 @@ pub(super) fn clause_expr_cpp(
         self_subst: Some(instance),
         dut_type: "",
         trace_component: "",
+        state_receiver: None,
     };
     expr_cpp(&cx, e)
 }
@@ -2196,6 +2251,7 @@ pub(super) fn tb_service_expr_cpp(
         self_subst: None,
         dut_type,
         trace_component: "",
+        state_receiver: None,
     };
     expr_cpp(&cx, e)
 }
@@ -2228,6 +2284,7 @@ fn emit_component_fn_lambda(
         self_subst: None,
         dut_type: "",
         trace_component: "",
+        state_receiver: None,
     };
     let nparams = func.params.len();
     let pad = INDENT.repeat(depth);
@@ -2456,6 +2513,7 @@ pub(super) fn emit_target_actor(
             self_subst: None,
             dut_type: "",
             trace_component: instance,
+            state_receiver: None,
         };
         let wire = |sig: &str| match binding {
             Some(b) => format!("dut->{}", b.wire_name(method, sig)),
@@ -2757,6 +2815,7 @@ pub(super) fn emit_active_bound_driver_actor(
             self_subst: Some(inst_path),
             dut_type: "",
             trace_component: inst_path,
+            state_receiver: None,
         };
         let payload_ty =
             crate::codegen::tbir::runtime::event_payload_cty(&oh.arg_payload, &prog.records);
@@ -3228,6 +3287,7 @@ pub(super) fn emit_test_hook(
         self_subst: None,
         dut_type,
         trace_component: "",
+        state_receiver: None,
     };
     let nparams = func.params.len();
     let pad = INDENT.repeat(depth);
