@@ -323,6 +323,7 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 visit_expr(value, &mut accesses, &mut transactor);
             }
             Stmt::TransactorStateWrite { value, .. }
+            | Stmt::TransactorStateRecordFieldWrite { value, .. }
             | Stmt::TransactorStateQueuePush { value, .. } => {
                 // Host state on a transactor-instance struct — no pin
                 // access of its own; the value may carry inline reads.
@@ -508,6 +509,7 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
         | Expr::RecordField { .. }
         | Expr::TbField(_)
         | Expr::TransactorState { .. }
+        | Expr::TransactorStateRecordField { .. }
         | Expr::TransactorStateQueueQuery { .. }
         | Expr::ScoreboardQuery { .. }
         | Expr::ComponentField { .. }

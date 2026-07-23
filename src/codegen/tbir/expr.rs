@@ -241,6 +241,19 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         Expr::TransactorState { instance, field } => {
             format!("{}.{field}", resolve_state_instance(cx, instance)?)
         }
+        // Bound-to target transactor whole-record state SUBFIELD read —
+        // a nested member of the value-record struct on the per-instance
+        // struct (`<instance>.<field>.<path…>`). Routed through the same
+        // state-receiver resolver as scalar/queue state.
+        Expr::TransactorStateRecordField {
+            instance,
+            field,
+            path,
+        } => format!(
+            "{}.{field}.{}",
+            resolve_state_instance(cx, instance)?,
+            path.join(".")
+        ),
         // Bound-to target transactor `queue<T>` state field size/empty
         // read — a `harc_rt::HarcQueue<T>` member of the per-instance
         // struct. Mirrors the scoreboard/component queue-query shapes.

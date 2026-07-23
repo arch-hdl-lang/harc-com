@@ -5936,6 +5936,130 @@ fn target_nonscalar_queue_state_emits_harcqueue() {
     );
 }
 
+/// #494 P0a follow-up: a WHOLE value-record target-transactor state field
+/// (`last : Beat`) lowers to `StateFieldKind::Record`, and its subfield
+/// read/write ops are instance-filled to the bound `responder` actor.
+#[test]
+fn target_record_state_lowers() {
+    let prog = lower_src(&fixture("target_record_state_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let x = &prog.transactors[0];
+    assert_eq!(x.bound_bus.as_deref(), Some("TlmMemBus"));
+    // One whole-record state field.
+    let names: Vec<&str> = x.state_fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["last"]);
+    assert!(matches!(
+        &x.state_fields[0].kind,
+        ir::StateFieldKind::Record { .. }
+    ));
+    // The responder body's record-subfield writes are instance-filled to
+    // the bound `responder` actor (placeholder resolved at test bind).
+    let body = prog.function(x.target_methods[0].function);
+    let subfield_writes: Vec<String> = body
+        .blocks
+        .iter()
+        .flat_map(|b| &b.stmts)
+        .filter_map(|s| match s {
+            ir::Stmt::TransactorStateRecordFieldWrite {
+                instance,
+                field,
+                path,
+                ..
+            } if instance == "responder" && field == "last" => Some(path.join(".")),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        subfield_writes,
+        ["addr", "data"],
+        "responder body must carry instance-filled record-subfield writes"
+    );
+    // And a subfield READ (`last.data`) instance-filled likewise (the
+    // returned value / the in-body asserts).
+    let has_subfield_read = body
+        .blocks
+        .iter()
+        .any(|b| block_has_state_record_field_read(b, "responder", "last"));
+    assert!(
+        has_subfield_read,
+        "responder body must carry an instance-filled record-subfield read"
+    );
+}
+
+/// True when any expression reachable from `block` is a
+/// `TransactorStateRecordField` read on `<instance>.<field>`.
+fn block_has_state_record_field_read(
+    block: &ir::BasicBlock,
+    instance: &str,
+    field: &str,
+) -> bool {
+    fn in_expr(e: &ir::Expr, instance: &str, field: &str) -> bool {
+        match e {
+            ir::Expr::TransactorStateRecordField {
+                instance: i,
+                field: f,
+                ..
+            } => i == instance && f == field,
+            ir::Expr::Binary(_, a, b) => {
+                in_expr(a, instance, field) || in_expr(b, instance, field)
+            }
+            ir::Expr::Unary(_, a)
+            | ir::Expr::WidthCast { inner: a, .. }
+            | ir::Expr::BitSlice { target: a, .. } => in_expr(a, instance, field),
+            ir::Expr::Ternary(c, t, f) => {
+                in_expr(c, instance, field)
+                    || in_expr(t, instance, field)
+                    || in_expr(f, instance, field)
+            }
+            ir::Expr::Call(_, args) => args.iter().any(|a| in_expr(a, instance, field)),
+            _ => false,
+        }
+    }
+    // The returned subfield (`return last.data`) lowers to an `Assign`
+    // into the `__ret` temp, so the statement scan covers it; the asserts
+    // read subfields too. `Terminator::Return` carries no expression.
+    block.stmts.iter().any(|s| match s {
+        ir::Stmt::Assign(_, e)
+        | ir::Stmt::TransactorStateWrite { value: e, .. }
+        | ir::Stmt::TransactorStateRecordFieldWrite { value: e, .. } => in_expr(e, instance, field),
+        ir::Stmt::AssertCheck { cond, on_fail } => {
+            in_expr(cond, instance, field)
+                || on_fail.args.iter().any(|a| in_expr(&a.expr, instance, field))
+        }
+        _ => false,
+    })
+}
+
+/// #494 P0a follow-up: the C++ shape for a whole-record target-transactor
+/// state field carries the record struct BY VALUE (`Beat last{};`), and
+/// subfield read/write emit `<instance>.<field>.<sub>` — no `HarcQueue`,
+/// no `VBeat*` (the v1 miscompile this feature routes around).
+#[test]
+fn target_record_state_emits_value_record() {
+    let cpp = emit_fixture_cpp("target_record_state_test.harc");
+    assert!(
+        cpp.contains("Beat last{};"),
+        "whole-record state member emitted by value; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("responder.last.addr = "),
+        "record-subfield write; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("responder.last.data = "),
+        "record-subfield write; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("responder.last.data"),
+        "record-subfield read; got:\n{cpp}"
+    );
+    // Guard against the v1 miscompile shape leaking into tbir.
+    assert!(
+        !cpp.contains("VBeat"),
+        "tbir must not emit the v1 `VBeat*` shape; got:\n{cpp}"
+    );
+}
+
 /// Nested forwarding: a bound-to responder re-issues a downstream
 /// blocking TLM call (`let raw = back.read(addr)`) against a test-scope
 /// bus binding. The pre-scanned downstream binding makes `back` resolve

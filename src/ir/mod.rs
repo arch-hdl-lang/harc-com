@@ -1154,6 +1154,14 @@ pub enum StateFieldKind {
     /// through the state-queue ops (`Stmt::TransactorStateQueuePush`/
     /// `TransactorStateQueuePop`, `Expr::TransactorStateQueueQuery`).
     Queue { elem: QueueElem },
+    /// `last : Beat` — a whole value-record held as persistent state.
+    /// `RecordId` indexes `TbProgram::records`; the C++ member is the
+    /// record struct by value (mirroring the scoreboard/component record
+    /// machinery). Fields are read/written through the state-record ops
+    /// (`Expr::TransactorStateRecordField`, `Stmt::TransactorStateRecord`-
+    /// `FieldWrite`); the whole record is read/copied through the scalar
+    /// `Expr::TransactorState` / `Stmt::TransactorStateWrite` forms.
+    Record { record: RecordId },
 }
 
 /// One test-scope bus binding (`let axil : BusAxiLite = bind dut`).
@@ -1422,6 +1430,22 @@ pub enum Stmt {
     TransactorStateWrite {
         instance: String,
         field: String,
+        value: Expr,
+    },
+    /// `last.addr = addr` inside a target-responder body (or
+    /// `responder.last.addr = ...` from the test): write a SUB-FIELD of a
+    /// bound-to target transactor's persistent whole-record state field.
+    /// `instance` names the bound testbench-field instance (placeholder in
+    /// a method body, filled at test-binding), `field` the record state
+    /// field, `path` the nested field chain to the written leaf (length ≥
+    /// 1; e.g. `["addr"]`, or `["a","b"]` for a nested struct). Emission
+    /// produces `<instance>.<field>.<path…> = <value>`. The value is
+    /// port-hoisted like `Assign`. Mirrors `Stmt::RecordFieldWrite` but
+    /// against the per-instance state struct instead of a `LocalId`.
+    TransactorStateRecordFieldWrite {
+        instance: String,
+        field: String,
+        path: Vec<String>,
         value: Expr,
     },
     /// `pending.push(x)` inside a target-responder body (or
@@ -1837,6 +1861,20 @@ pub enum Expr {
     TransactorState {
         instance: String,
         field: String,
+    },
+    /// A read of a SUB-FIELD of a bound-to target transactor's persistent
+    /// whole-record state field: `last.data` in a responder body, or
+    /// `responder.last.data` from the test. `instance` names the bound
+    /// testbench-field instance (placeholder in a method body, filled at
+    /// test-binding), `field` the record state field, `path` the nested
+    /// field chain to the read leaf (length ≥ 1). Emission produces
+    /// `<instance>.<field>.<path…>`. Host state — allowed wherever a
+    /// `Local` is. Mirrors `Expr::RecordField` but against the per-
+    /// instance state struct instead of a `LocalId`.
+    TransactorStateRecordField {
+        instance: String,
+        field: String,
+        path: Vec<String>,
     },
     /// A value-producing read on a bound-to target transactor's
     /// persistent `queue<T>` state field: `pending.size()` /

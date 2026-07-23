@@ -1001,8 +1001,34 @@ impl FuncBuilder<'_> {
                 }
             }
         }
+        // Subfield write of a bound-to target responder's whole-record
+        // state field: `last.addr = addr` (responder body) /
+        // `responder.last.addr = ...` (test). Checked before the whole-
+        // record `as_transactor_state` write lane, which only fires when
+        // there is no further subfield.
+        if let Some(chain) = self.as_transactor_state_record_field(target)? {
+            if chain.leaf_vec_len.is_some() {
+                return Err(unsupported(
+                    &format!(
+                        "a whole-`Vec` write of record state field `{}.{}`",
+                        chain.field,
+                        chain.path.join(".")
+                    ),
+                    "assign a `Vec` record field element-wise (`{field}.{vec}[i] = ...`)",
+                ));
+            }
+            let e = self.lower_expr_no_ports(value)?;
+            self.push(Stmt::TransactorStateRecordFieldWrite {
+                instance: chain.instance,
+                field: chain.field,
+                path: chain.path,
+                value: e,
+            });
+            return Ok(());
+        }
         // Test-scope write of a bound-to target responder's persistent
-        // state field: `target.read_count = 0`.
+        // state field: `target.read_count = 0` (scalar) or a whole-record
+        // copy `target.last = <same-typed record>`.
         if let Some((instance, field)) = self.as_transactor_state(target) {
             let e = self.lower_expr_no_ports(value)?;
             self.push(Stmt::TransactorStateWrite {
@@ -1194,10 +1220,35 @@ impl FuncBuilder<'_> {
             // instance is a placeholder filled at the test-binding stage.
             // Only a scalar field is bare-assignable; a queue field is
             // mutated via `.push`/`.pop` (rejected here).
-            if let Some(kind) = self.target_state_fields.get(&id.name) {
+            if let Some(kind) = self.target_state_fields.get(&id.name).cloned() {
                 match kind {
                     crate::ir::StateFieldKind::Scalar { .. } => {
                         let e = self.lower_expr_no_ports(value)?;
+                        self.push(Stmt::TransactorStateWrite {
+                            instance: String::new(),
+                            field: id.name.clone(),
+                            value: e,
+                        });
+                        return Ok(());
+                    }
+                    // Bare whole-record copy (`last = beat`): the RHS must
+                    // be a value of the SAME record type (a same-typed
+                    // record local or a whole nested-record read). Emits a
+                    // C++ struct copy via `TransactorStateWrite`. Reject any
+                    // other RHS rather than emit a bad assignment.
+                    crate::ir::StateFieldKind::Record { record } => {
+                        let e = self.lower_expr_no_ports(value)?;
+                        if self.record_id_of_expr(&e) != Some(record) {
+                            return Err(unsupported(
+                                &format!(
+                                    "a whole-record write of state field `{}` with a \
+                                     non-matching RHS",
+                                    id.name
+                                ),
+                                "assign a value of the same record type, or set the record \
+                                 fields individually (`{field}.<sub> = ...`)",
+                            ));
+                        }
                         self.push(Stmt::TransactorStateWrite {
                             instance: String::new(),
                             field: id.name.clone(),

@@ -1,0 +1,87 @@
+// Self-proving bound-to TARGET transactor whose persistent state is a
+// WHOLE VALUE-RECORD (not a `queue<Record>`, not a scalar): `last : Beat`.
+//
+// Before this slice, a bound-to / target transactor's persistent state
+// could be a scalar (`uint<N>`/`sint<N>`/`bool` <= 64 bits), a `queue<T>`
+// (#504), but NOT a whole record — `lower_state_field` rejected any other
+// non-scalar type with "state field ... with a non-scalar type". This
+// fixture closes that gap by reusing the same record machinery
+// (`IrType::Record` / `RecordId`) that `queue<Record>` and the
+// scoreboard/component record locals already use, for a whole-record
+// state field carried by value on the per-instance state struct.
+//
+// The SV DUT (`TlmReadInitiator`) is the initiator: it issues exactly one
+// `mem.read(0x05)` through the ARCH-compatible req/rsp wires. The HARC
+// `MemoryResponder bound to TlmMemBus` implements the target-side method
+// body with `thread bus.read(...)`. Inside the responder body it:
+//   * writes the whole-record state field's SUBFIELDS (`last.addr`,
+//     `last.data`) from the request;
+//   * reads a subfield back (`last.data`) to build the response;
+//   * asserts the mirror subfields hold the expected values.
+// After the DUT reports done, the test inspects the TEST-SCOPE record
+// state (`responder.last.addr`, `responder.last.data`) — proving the
+// per-instance value-record state struct is shared between the responder
+// body and the test, exactly like the scalar / queue bound-target forms.
+//
+// This feature is tbir-only: `--codegen v1` MISCOMPILES it (emits
+// `error: unknown type name 'VBeat'`), so it is verified here under the
+// default tbir backend via run_fixtures.sh, NOT the v1 equivalence
+// harness (tbir_equiv_fixtures.txt).
+
+struct Beat
+    addr : uint<8>
+    data : uint<32>
+end struct Beat
+
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmMemBus
+
+transactor MemoryResponder bound to TlmMemBus
+    // Persistent WHOLE-RECORD state (not a queue, not a scalar).
+    last : Beat
+
+    thread bus.read(addr: uint<8>)
+        wait 1 cycle
+        // Write the whole-record state field's subfields for this request.
+        last.addr = addr
+        last.data = 256 + addr
+        // Read subfields back inside the responder body.
+        assert last.addr == addr
+            else fail("responder: last.addr=${last.addr}, expected ${addr}")
+        assert last.data == 256 + addr
+            else fail("responder: last.data=${last.data}, expected ${256 + addr}")
+        // Return the whole-record subfield.
+        return last.data
+    end thread
+end transactor MemoryResponder
+
+testbench TargetRecordStateTb
+    dut : TlmReadInitiator
+end testbench TargetRecordStateTb
+
+impl TargetRecordStateTest for TargetRecordStateTb
+    let mem : TlmMemBus = bind dut
+    let responder : MemoryResponder passive = bind mem
+
+    run
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+
+        // The DUT reads addr 0x05; the responder returns 256 + 5 = 261.
+        wait until dut.done == 1 timeout 40 cycles fail("DUT initiator did not receive HARC target response")
+        assert dut.result == 261
+            else fail("target TLM response mismatch got=0x${dut.result:08x}, expected 0x00000105")
+
+        // The whole-record state captured the served request. Inspect its
+        // subfields from test scope — proving the responder body and the
+        // test share the one per-instance value-record struct.
+        assert responder.last.addr == 5
+            else fail("responder.last.addr=${responder.last.addr}, expected 0x05")
+        assert responder.last.data == 261
+            else fail("responder.last.data=${responder.last.data}, expected 261")
+
+        log(info, "PASS: whole-record target-transactor state round-tripped")
+    end run
+end impl TargetRecordStateTest

@@ -5066,6 +5066,7 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
     fn in_expr(e: &ir::Expr) -> Option<String> {
         match e {
             ir::Expr::TransactorState { instance, .. }
+            | ir::Expr::TransactorStateRecordField { instance, .. }
             | ir::Expr::TransactorStateQueueQuery { instance, .. }
                 if !instance.is_empty() =>
             {
@@ -5085,6 +5086,9 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
         for s in &block.stmts {
             let found = match s {
                 ir::Stmt::TransactorStateWrite {
+                    instance, value, ..
+                }
+                | ir::Stmt::TransactorStateRecordFieldWrite {
                     instance, value, ..
                 } => {
                     if !instance.is_empty() {
@@ -5158,6 +5162,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
     fn fill_expr(e: &mut ir::Expr, instance: &str) {
         match e {
             ir::Expr::TransactorState { instance: i, .. }
+            | ir::Expr::TransactorStateRecordField { instance: i, .. }
             | ir::Expr::TransactorStateQueueQuery { instance: i, .. } => {
                 debug_assert!(
                     i.is_empty() || i == instance,
@@ -5244,6 +5249,9 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
         for s in &mut block.stmts {
             match s {
                 ir::Stmt::TransactorStateWrite {
+                    instance: i, value, ..
+                }
+                | ir::Stmt::TransactorStateRecordFieldWrite {
                     instance: i, value, ..
                 }
                 | ir::Stmt::TransactorStateQueuePush {
@@ -5430,6 +5438,7 @@ fn fill_visit_expr(
         | Expr::CovHookArg { .. }
         | Expr::TbField(_)
         | Expr::TransactorState { .. }
+        | Expr::TransactorStateRecordField { .. }
         | Expr::TransactorStateQueueQuery { .. }
         | Expr::ComponentField { .. }
         | Expr::ComponentValue { .. }
@@ -5501,6 +5510,7 @@ fn fill_initiator_bus_prefix(
                     | Stmt::RecordWriteCb { value: e, .. }
                     | Stmt::TbFieldWrite { value: e, .. }
                     | Stmt::TransactorStateWrite { value: e, .. }
+                    | Stmt::TransactorStateRecordFieldWrite { value: e, .. }
                     | Stmt::ComponentFieldWrite { value: e, .. } => {
                         visit_expr(e, placeholder, binding, remap, rewrite, &mut conflict)
                     }
