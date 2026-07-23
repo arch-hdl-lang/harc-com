@@ -1,0 +1,25 @@
+// Regression fixture for #494 P2a: file-scope `const` initializers that
+// are constant EXPRESSIONS (not just plain integer literals) must fold
+// identically under both `--codegen v1` and `--codegen tbir`. Exercises
+// shifted masks, an OR of two earlier consts, and an arithmetic form.
+// DUT `Top` (top_counter.sv) is only along for the ride so the harness
+// has something to elaborate.
+
+const SEEN_FIRST  : uint<64> = 1 << 0
+const SEEN_SECOND : uint<64> = 1 << 1
+const SEEN_BOTH   : uint<64> = SEEN_FIRST | SEEN_SECOND
+const WIDTH_MASK  : uint<32> = (1 << 8) - 1
+
+testbench ConstExprInitTb
+    dut : Top
+end testbench ConstExprInitTb
+
+impl ConstExprInitTest for ConstExprInitTb
+    run
+        assert SEEN_FIRST == 1 else fail("first=${SEEN_FIRST}")
+        assert SEEN_SECOND == 2 else fail("second=${SEEN_SECOND}")
+        assert SEEN_BOTH == 3 else fail("both=${SEEN_BOTH}")
+        assert WIDTH_MASK == 255 else fail("mask=${WIDTH_MASK}")
+        wait 1 cycle
+    end run
+end impl ConstExprInitTest
