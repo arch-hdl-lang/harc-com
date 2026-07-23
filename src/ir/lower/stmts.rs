@@ -2,7 +2,10 @@
 //! §"Statements within a run / check / transactor body").
 
 use super::{unsupported, FuncBuilder, LowerError};
-use crate::ast::{BuiltinTy, CallArg, ExprKind, Stmt as AstStmt, StmtKind, TypeArg, TypeExpr};
+use crate::ast::{
+    BuiltinTy, CallArg, Expr as AstExpr, ExprKind, Ident, Stmt as AstStmt, StmtKind, TypeArg,
+    TypeExpr,
+};
 use crate::ir::{Expr, FileLogLevel, FmtArg, FmtArgs, IrType, LogLevel, Stmt, Terminator};
 
 impl FuncBuilder<'_> {
@@ -1869,8 +1872,11 @@ impl FuncBuilder<'_> {
     }
 
     fn lower_fail_msg(&mut self, msg: &crate::ast::Expr) -> Result<FmtArgs, LowerError> {
+        // A bare `fail(...)` statement lowers to an always-failing
+        // `AssertCheck`, so its message is unconditionally evaluated —
+        // CFG-inlined calls may be hoisted (matches v1's inline eval).
         match &*msg.kind {
-            ExprKind::String(s) => self.lower_fmt(s),
+            ExprKind::String(s) => self.lower_fmt_hoisting(s),
             _ => Err(unsupported("non-string-literal `fail(...)` message", "")),
         }
     }
@@ -1924,7 +1930,7 @@ impl FuncBuilder<'_> {
                 FileLogLevel::Fatal => LogLevel::Fatal,
             },
         };
-        let fmt_args = self.lower_fmt(&msg)?;
+        let fmt_args = self.lower_fmt_hoisting(&msg)?;
         self.push(Stmt::Log {
             level,
             args: fmt_args,
@@ -1955,16 +1961,51 @@ impl FuncBuilder<'_> {
     /// Lower an interpolated message string into pre-parsed `FmtArgs`,
     /// reusing v1's `process_interp` so format tokens (and therefore
     /// runtime log/trace text) are byte-identical across backends.
+    ///
+    /// Used by conditionally-evaluated messages (an assert's `else
+    /// fail(...)`, a timeout header) — CFG-inlined calls stay rejected
+    /// there, because eagerly hoisting them ahead of the check would run
+    /// the inlined body even when the message is never emitted.
     pub(crate) fn lower_fmt(&mut self, msg: &str) -> Result<FmtArgs, LowerError> {
+        self.lower_fmt_impl(msg, false)
+    }
+
+    /// `lower_fmt` for UNCONDITIONALLY-evaluated messages (`log(...)`, a
+    /// bare `fail(...)`): every interpolation is evaluated exactly once at
+    /// the statement, so a CFG-inlined call can be hoisted ahead of it
+    /// with identical observable order/count.
+    pub(crate) fn lower_fmt_hoisting(&mut self, msg: &str) -> Result<FmtArgs, LowerError> {
+        self.lower_fmt_impl(msg, true)
+    }
+
+    fn lower_fmt_impl(&mut self, msg: &str, hoist: bool) -> Result<FmtArgs, LowerError> {
         let (fmt, caps) = crate::codegen::cpp_tb::process_interp(msg);
         let mut args = Vec::with_capacity(caps.len());
         for c in caps {
-            let parsed = crate::parser::parse_expr_fragment(&c.expr).map_err(|_| {
+            let mut parsed = crate::parser::parse_expr_fragment(&c.expr).map_err(|_| {
                 unsupported(
                     "string interpolation",
                     format!("`${{{}}}` does not parse as an expression", c.expr),
                 )
             })?;
+            // A message interpolation lowers lazily (the captured expr is
+            // re-evaluated at the log/failure site), so a CFG-inlined call
+            // — an impure helper or a testbench method — cannot live inside
+            // it. For an UNCONDITIONALLY-evaluated message, v1 evaluates
+            // each `${...}` exactly once, in place, at the message point;
+            // mirror that by eagerly HOISTING every such call into a fresh
+            // temp before the statement, then referencing the temp in the
+            // format arg. Hoisting preserves the evaluation-count-of-one
+            // and the left-to-right capture order, so the runtime trace is
+            // identical to v1's inline form.
+            //
+            // Bus/TLM calls suspend mid-message and are structurally
+            // unhoistable (their `wait`s would land between hoist and log);
+            // those keep the reject in `lower_expr`/`try_lower_bus_call`.
+            if hoist {
+                self.hoist_fmt_calls(&mut parsed)?;
+            }
+
             // Ports are allowed in format args, but DUT/sync-touching
             // helper calls are not — messages evaluate lazily at the
             // log/failure site, and an inlined CFG cannot.
@@ -1979,6 +2020,137 @@ impl FuncBuilder<'_> {
             });
         }
         Ok(FmtArgs { fmt, args })
+    }
+
+    /// Eagerly hoist CFG-inlined calls out of one message-interpolation
+    /// AST expression, in place. Any call that would be rejected inside a
+    /// `${...}` (an impure/DUT-touching file-scope helper, or a testbench
+    /// method) is lowered NOW — outside `in_fmt_args`, so its inlined CFG
+    /// lands as ordinary statements before the message — assigned to a
+    /// fresh unique `__msg_tmpN` local, and the call node is replaced by an
+    /// `Ident(__msg_tmpN)` so the later fmt-arg lowering just reads the
+    /// temp. Recurses depth-first, left-to-right (argument/operand order),
+    /// and does NOT descend into a call once it has been hoisted whole.
+    /// Pure helpers and width-cast intrinsics lower fine inside a message,
+    /// so they are left in place (only their sub-expressions are visited,
+    /// in case an impure call is nested as an argument).
+    fn hoist_fmt_calls(&mut self, e: &mut AstExpr) -> Result<(), LowerError> {
+        if self.fmt_call_needs_hoist(e) {
+            // Hoist the whole call once. Lower it in normal (non-fmt-args)
+            // context so the impure/tb-method inline emits its statements
+            // into the current block ahead of the message.
+            let call = std::mem::replace(
+                e,
+                AstExpr::new(ExprKind::Bool(false), e.span),
+            );
+            let span = call.span;
+            let lowered = self.lower_expr(&call)?;
+            let ty = self.expr_type(&lowered).unwrap_or(IrType::Unknown);
+            // Use a source name that is unique BEFORE `declare` sees it, so
+            // `declare` stores it verbatim (no dedup suffix) and scope-keys
+            // it under that exact name — the fmt-arg `Ident` below then
+            // resolves to precisely this local via `lookup`.
+            let name = self.fresh_msg_tmp_name();
+            let tmp = self.declare(&name);
+            self.set_local_type(tmp, ty);
+            self.push(Stmt::Assign(tmp, lowered));
+            *e = AstExpr::new(ExprKind::Ident(Ident { name, span }), span);
+            return Ok(());
+        }
+        // Not a hoisted call itself — descend into children in source
+        // (left-to-right) order to catch impure calls nested inside pure
+        // calls, operators, casts, etc.
+        for child in fmt_expr_children_mut(e) {
+            self.hoist_fmt_calls(child)?;
+        }
+        Ok(())
+    }
+
+    /// A `__msg_tmpN` source name guaranteed unique against every local
+    /// declared so far, so `declare` keeps it verbatim (the `Ident` that
+    /// references it must match the scope key exactly).
+    fn fresh_msg_tmp_name(&mut self) -> String {
+        loop {
+            let candidate = format!("__msg_tmp{}", self.temp_counter);
+            self.temp_counter += 1;
+            if !self.local_names.contains(&candidate) {
+                break candidate;
+            }
+        }
+    }
+
+    /// A `Call` expression that must be hoisted out of a message: one that
+    /// CFG-inlines (impure/DUT-touching file-scope helper, or a testbench
+    /// method) and therefore cannot lower inside a lazily-evaluated
+    /// `${...}`. Pure helpers, extern fns, width-cast intrinsics, and
+    /// value-query method calls lower fine in place, so they return false.
+    /// Bus/TLM and transactor calls are deliberately NOT hoisted here:
+    /// they can suspend, so they stay statement-only and keep their own
+    /// rejects.
+    fn fmt_call_needs_hoist(&self, e: &AstExpr) -> bool {
+        let ExprKind::Call { callee, .. } = &*e.kind else {
+            return false;
+        };
+        match &*callee.kind {
+            // `f(...)` — an impure file-scope helper CFG-inlines; a pure
+            // helper or extern fn does not.
+            ExprKind::Ident(id) => self
+                .helpers
+                .get(&id.name)
+                .map_or(false, |entry| !entry.pure),
+            // `_tb.m(...)` — a testbench method always CFG-inlines.
+            ExprKind::Field { .. } => self.tb_method_call_name(callee).is_some(),
+            _ => false,
+        }
+    }
+}
+
+/// Children of an AST expression to visit when hoisting message calls,
+/// in source (left-to-right) evaluation order. Deliberately does NOT
+/// descend into a `Call`'s own subtree — the caller decides per-node
+/// whether to hoist the whole call (and stop) or recurse into it.
+fn fmt_expr_children_mut(e: &mut AstExpr) -> Vec<&mut AstExpr> {
+    match &mut *e.kind {
+        ExprKind::Paren(inner)
+        | ExprKind::Unary { expr: inner, .. }
+        | ExprKind::Cast { expr: inner, .. } => vec![inner],
+        ExprKind::Field { target, .. } | ExprKind::Index { target, .. } => vec![target],
+        // Short-circuiting logical operators evaluate the RHS only
+        // conditionally (v1 emits `&&`/`||`, which C++ short-circuits), so
+        // a call in the RHS must NOT be hoisted unconditionally — descend
+        // into the always-evaluated LHS only and leave any RHS call in
+        // place to hit the existing lazy-message reject. Bitwise `&`/`|`
+        // always evaluate both operands, so both are safe to visit.
+        ExprKind::Binary { op, lhs, rhs } => {
+            use crate::ast::BinaryOp as B;
+            if matches!(op, B::AndAnd | B::OrOr | B::AndKw | B::OrKw) {
+                vec![lhs]
+            } else {
+                vec![lhs, rhs]
+            }
+        }
+        ExprKind::BitSlice { target, hi, lo } => vec![target, hi, lo],
+        // A ternary evaluates only the taken branch, so only the always-
+        // evaluated condition is safe to hoist from; a call in either
+        // branch stays in place (and hits the lazy-message reject). (In
+        // practice `process_interp` splits on `:`, so a `?:` inside a
+        // `${...}` rarely survives parsing at all — this is belt-and-
+        // suspenders for the forms that do.)
+        ExprKind::Ternary { cond, .. } => vec![cond],
+        // A pure call: descend into its arguments so an impure call nested
+        // as an argument still hoists. (An impure call is caught by
+        // `fmt_call_needs_hoist` before we ever recurse into it.)
+        ExprKind::Call { callee, args } => {
+            let mut v = vec![callee];
+            for a in args {
+                let (CallArg::Expr(inner) | CallArg::Named { value: inner, .. }) = a;
+                v.push(inner);
+            }
+            v
+        }
+        // Leaves and forms that never contain a hoistable call in a
+        // message position.
+        _ => Vec::new(),
     }
 }
 

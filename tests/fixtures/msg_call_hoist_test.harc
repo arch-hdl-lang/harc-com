@@ -1,0 +1,84 @@
+// TB-IR parity fixture for #494 P2d: a function/method call inside a
+// `log(...)`/`fail(...)` message interpolation (`${...}`) must be
+// auto-hoisted, not rejected. v1 evaluates each `${...}` exactly once,
+// in place, at the message point; the tbir backend now hoists the call
+// into a fresh temp just before the (unconditionally-evaluated) message
+// statement, so both backends produce identical traces.
+//
+// Exercises:
+//   - a testbench-method call inside a `log` message,
+//   - an impure (DUT-reading) file-scope-helper call inside a `log`
+//     message,
+//   - two calls in one message (left-to-right order),
+//   - a file-scope-helper call inside a `fail` message on a genuinely
+//     failing path that is never taken (guarded by an always-true `if`),
+//     so the message lowers (and hoists) but never fires.
+// Every assert passes → the run ends with ALL TESTS PASSED behavior.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+// Pure file-scope helper — scalar math only, lowers to a plain C++
+// function. (Pure helpers already lower fine in a message; hoisting is a
+// no-op for them, but they must keep working.)
+function inc(x: uint<8>) -> uint<8>
+    return x + 1
+end function inc
+
+// Impure file-scope helper — reads the DUT, so it CFG-inlines at each
+// call site and MUST be hoisted out of a message interpolation.
+function cur_plus(dut: Top, extra: uint<8>) -> uint<8>
+    return dut.count_out + extra
+end function cur_plus
+
+testbench MsgCallHoistTb
+    dut : Top
+    // Testbench method — CFG-inlined, must be hoisted out of a message.
+    function dbl(x: uint<8>) -> uint<8>
+        return x + x
+    end dbl
+end testbench MsgCallHoistTb
+
+impl MsgCallHoistTest for MsgCallHoistTb
+    clock clk = SysDomain
+
+    run
+        // Reset then enable the counter for a few cycles.
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        dut.rst = 0
+        dut.en = 1
+        wait 4 cycles
+        dut.en = 0
+        wait 1 cycle
+
+        let v : uint<8> = 3
+
+        // (1) testbench-method call in a log message.
+        log(info, "dbl=${dbl(v)}")
+        assert dbl(v) == 6 else fail("dbl mismatch")
+
+        // (2) impure (DUT-reading) file-scope-helper call in a log
+        //     message. count_out == 4 after 4 enabled cycles, so
+        //     cur_plus(dut, 0) == 4.
+        log(info, "count=${cur_plus(dut, 0)}")
+        assert cur_plus(dut, 0) == 4 else fail("count mismatch")
+
+        // (3) two calls in one message — left-to-right order.
+        log(info, "dbl=${dbl(v)} inc=${inc(v)}")
+        assert dbl(v) == 6 else fail("dbl order mismatch")
+        assert inc(v) == 4 else fail("inc order mismatch")
+
+        // (4) a call inside a `fail` message on a path that never runs
+        //     (the guard is always false). The message still lowers +
+        //     hoists; it just never fires.
+        if v > 100
+            fail("unreachable: cur_plus=${cur_plus(dut, 1)}")
+        end if
+
+        log(info, "ALL TESTS PASSED")
+        wait 1 cycle
+    end run
+end impl MsgCallHoistTest
