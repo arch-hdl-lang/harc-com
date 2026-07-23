@@ -1739,6 +1739,12 @@ impl FuncBuilder<'_> {
             }
         };
         segs.reverse();
+        // A local shadows a same-named state field / instance (the
+        // established convention throughout this lowerer). Fall through
+        // to the record-local field-chain lane in that case.
+        if self.lookup(&root.name).is_some() {
+            return Ok(None);
+        }
         // Resolve (instance, state-field-name, remaining subfield segs).
         // Bare responder-body form: root IS the record state field, so
         // the instance is a placeholder. Otherwise root/`_tb`-prefix
