@@ -172,6 +172,62 @@ end test T"#,
     );
 }
 
+/// #494 P2a: file-scope `const` initializers that are constant
+/// EXPRESSIONS (not just plain integer literals) fold to a `u64` at
+/// lowering and substitute as that literal at use sites — the same value
+/// v1's C++ constexpr would compute. Earlier consts are visible to later
+/// ones (`SEEN_BOTH` references `SEEN_FIRST`/`SEEN_SECOND`).
+#[test]
+fn const_expression_initializers_fold() {
+    let cpp = emit_cpp_src(
+        r#"const SEEN_FIRST  : uint<64> = 1 << 0
+const SEEN_SECOND : uint<64> = 1 << 1
+const SEEN_BOTH   : uint<64> = SEEN_FIRST | SEEN_SECOND
+const WIDTH_MASK  : uint<32> = (1 << 8) - 1
+
+test T
+    let dut : Top
+    run
+        assert SEEN_FIRST == 1 else fail("x")
+        assert SEEN_SECOND == 2 else fail("x")
+        assert SEEN_BOTH == 3 else fail("x")
+        assert WIDTH_MASK == 255 else fail("x")
+    end run
+end test T"#,
+    );
+    // Each const use substitutes as its folded literal, so the assert
+    // condition reduces to a literal-vs-literal comparison.
+    for lit in ["1 == 1", "2 == 2", "3 == 3", "255 == 255"] {
+        assert!(
+            cpp.contains(lit),
+            "expected folded const comparison `{lit}`; got:\n{cpp}"
+        );
+    }
+}
+
+/// #494 P2a: a `const` initializer that is NOT a compile-time integer
+/// constant (here, a reference to an undefined name) is rejected with a
+/// structured `Unsupported` error — never silently accepted.
+#[test]
+fn const_non_constant_initializer_is_rejected() {
+    let err = lower_src(
+        r#"const BAD : uint<32> = NOT_A_CONST + 1
+
+test T
+    let dut : Top
+    run
+        assert BAD == 0 else fail("x")
+    end run
+end test T"#,
+    )
+    .expect_err("non-constant const initializer must fail lowering");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("const BAD"),
+        "rejection must name the offending const `BAD`; got: {msg}"
+    );
+}
+
 /// harc#473: `-%` masks like `+%`/`*%`. A typed `z : uint<8>` minus a
 /// literal masks the two's-complement residue at 8 b, so `0 -% 1` emits
 /// `(z - 1) & 0xFF` (== 255 at runtime), not the un-wrapped `z - 1`.

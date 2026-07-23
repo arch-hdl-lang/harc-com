@@ -47,6 +47,7 @@ pipe_reg_test           | PipeRegTest    | pipe_reg_test.sv       |
 single_port_ram_test    | SimpleMem      | single_port_ram.sv     |
 int_regs_test           | IntRegs        | int_regs.sv            |
 top_counter_test        | Top            | top_counter.sv         |
+const_expr_init_test    | Top            | top_counter.sv         |
 log_paths_test          | Top            | top_counter.sv         |
 heartbeat_idle_test     | Top            | top_counter.sv         |
 analysis_sink_connect_test | Top         | top_counter.sv         |

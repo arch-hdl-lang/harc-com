@@ -71,6 +71,65 @@ pub(crate) fn unsupported(construct: &str, detail: impl Into<String>) -> LowerEr
     }
 }
 
+/// Const-fold a file-scope `const` initializer expression to a `u64`,
+/// resolving identifiers against `consts` (earlier `const` values and
+/// enum-variant indices, both in source order). Arithmetic uses
+/// wrapping 64-bit semantics to match v1's C++ `constexpr` evaluation
+/// of the same expression forwarded to the compiler. Returns `None`
+/// (rather than a placeholder) when the expression is not a compile-
+/// time integer constant, so the caller can emit a structured
+/// rejection. Supports: integer literals, booleans, identifiers
+/// (const/enum names), parentheses, unary `-`/`~`/`!`/`not`, and the
+/// binary arithmetic (`+ - * / %`, incl. wrapping variants), shift
+/// (`<< >>`), bitwise (`& | ^`), comparison, and logical operators.
+fn fold_const_u64(e: &crate::ast::Expr, consts: &HashMap<String, u64>) -> Option<u64> {
+    use crate::ast::{BinaryOp, UnaryOp};
+    match &*e.kind {
+        ExprKind::Paren(inner) => fold_const_u64(inner, consts),
+        ExprKind::Int(s) => exprs::parse_int_literal(s),
+        ExprKind::Bool(b) => Some(*b as u64),
+        ExprKind::Ident(id) => consts.get(&id.name).copied(),
+        ExprKind::Unary { op, expr } => {
+            let v = fold_const_u64(expr, consts)?;
+            Some(match op {
+                UnaryOp::Neg => v.wrapping_neg(),
+                UnaryOp::Not | UnaryOp::NotKw => (v == 0) as u64,
+                UnaryOp::BitNot => !v,
+            })
+        }
+        ExprKind::Binary { op, lhs, rhs } => {
+            let a = fold_const_u64(lhs, consts)?;
+            let b = fold_const_u64(rhs, consts)?;
+            let bi = |x: bool| Some(x as u64);
+            match op {
+                BinaryOp::Add | BinaryOp::AddWrap => Some(a.wrapping_add(b)),
+                BinaryOp::Sub | BinaryOp::SubWrap => Some(a.wrapping_sub(b)),
+                BinaryOp::Mul | BinaryOp::MulWrap => Some(a.wrapping_mul(b)),
+                // Divide/mod by zero is not a compile-time constant.
+                BinaryOp::Div => (b != 0).then(|| a.wrapping_div(b)),
+                BinaryOp::Mod => (b != 0).then(|| a.wrapping_rem(b)),
+                // Shift amount masked to 6 bits (C++ UB is >= width, but
+                // v1 forwards the raw expr; the corpus stays in range).
+                BinaryOp::Shl => Some(a.wrapping_shl(b as u32)),
+                BinaryOp::Shr => Some(a.wrapping_shr(b as u32)),
+                BinaryOp::BitAnd => Some(a & b),
+                BinaryOp::BitOr => Some(a | b),
+                BinaryOp::BitXor => Some(a ^ b),
+                BinaryOp::Eq => bi(a == b),
+                BinaryOp::Ne => bi(a != b),
+                BinaryOp::Lt => bi(a < b),
+                BinaryOp::Le => bi(a <= b),
+                BinaryOp::Gt => bi(a > b),
+                BinaryOp::Ge => bi(a >= b),
+                BinaryOp::AndAnd | BinaryOp::AndKw => bi(a != 0 && b != 0),
+                BinaryOp::OrOr | BinaryOp::OrKw => bi(a != 0 || b != 0),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Lower a merged source file (post `merge_for_sim`) into a verified-
 /// shape `TbProgram`. Callers should run `verify::verify_program` on
 /// the result before emission.
@@ -188,30 +247,27 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         }
     }
 
-    // File-scope named integer constants: `const NAME : Ty = <lit>`
+    // File-scope named integer constants: `const NAME : Ty = <expr>`
     // (v1: `static constexpr <cty> NAME = <expr>;`) and `enum Color {
     // RED, ... }` variant names (v1: variant index, first definition
     // wins). Both substitute as plain integer literals at use sites —
-    // observably identical to v1's constexpr/index emission. `const`
-    // initializers outside plain integer literals are rejected (v1
-    // forwards arbitrary exprs to C++; the IR subset keeps literals).
+    // observably identical to v1's constexpr/index emission. The
+    // initializer expression is const-folded to a `u64` with wrapping
+    // `uint64_t` semantics matching v1's C++ constexpr evaluation; it
+    // may reference earlier `const` names and enum-variant names (both
+    // live in the same `consts` map, processed in source order). Any
+    // initializer that does not fold to a compile-time constant is
+    // rejected structurally rather than silently accepted.
     let mut consts: HashMap<String, u64> = HashMap::new();
     for it in &file.items {
         match it {
             Item::Const(c) => {
-                let ExprKind::Int(s) = &*c.value.kind else {
+                let Some(v) = fold_const_u64(&c.value, &consts) else {
                     return Err(unsupported(
-                        &format!(
-                            "`const {}` with a non-integer-literal initializer",
-                            c.name.name
-                        ),
-                        "",
-                    ));
-                };
-                let Some(v) = exprs::parse_int_literal(s) else {
-                    return Err(unsupported(
-                        &format!("`const {}` initializer `{s}`", c.name.name),
-                        "not a plain integer literal",
+                        &format!("`const {}` initializer", c.name.name),
+                        "does not fold to a compile-time integer constant (only \
+                         integer literals, earlier `const`/enum-variant names, \
+                         and the arithmetic/bitwise/shift operators are supported)",
                     ));
                 };
                 consts.insert(c.name.name.clone(), v);
