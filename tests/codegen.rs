@@ -5383,7 +5383,17 @@ fn all_fixtures_emit_cleanly() {
                     // arc.stdlib.BusAxi4. Standalone emit-sweep
                     // can't resolve them; the real `harc sim`
                     // invocation imports them via `use`.
-                    || msg.contains("constraint references unknown name");
+                    || msg.contains("constraint references unknown name")
+                    // A suspending bus/TLM method call inside a `log`/`fail`
+                    // message interpolation is a TB-IR-only capability
+                    // (#494 P2d follow-up): the legacy v1 emitter cannot
+                    // resolve a bus-method call in a message and fails with
+                    // "bus ... has no signal or channel named <method>".
+                    // These fixtures are exercised via the default (tbir)
+                    // backend in tests/run_fixtures.sh; the v1 emit sweep
+                    // legitimately can't emit them.
+                    || (msg.contains("has no signal or channel named")
+                        && name.starts_with("msg_suspending_call"));
                 if !benign {
                     failures.push(format!("[emit] {name}: {msg}"));
                 }

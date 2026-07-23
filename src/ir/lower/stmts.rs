@@ -2239,6 +2239,17 @@ impl FuncBuilder<'_> {
     /// so they are left in place (only their sub-expressions are visited,
     /// in case an impure call is nested as an argument).
     fn hoist_fmt_calls(&mut self, e: &mut AstExpr) -> Result<(), LowerError> {
+        // A suspending bus/TLM (or transactor) method call inside an
+        // unconditionally-evaluated message: hoist it through the
+        // statement-position lowering (which drives the protocol and lands
+        // the `wait`/suspend before the message), then read the resolved
+        // value in the fmt arg. This is exactly the manual rewrite the
+        // former reject diagnostic suggested. Checked before the
+        // impure-helper hoist so a bus/transactor call is never routed
+        // through `lower_expr` (which rejects it in expression position).
+        if self.hoist_fmt_suspending_call(e)? {
+            return Ok(());
+        }
         if self.fmt_call_needs_hoist(e) {
             // Hoist the whole call once. Lower it in normal (non-fmt-args)
             // context so the impure/tb-method inline emits its statements
@@ -2268,6 +2279,67 @@ impl FuncBuilder<'_> {
             self.hoist_fmt_calls(child)?;
         }
         Ok(())
+    }
+
+    /// If `e` is a SUSPENDING call — a bus/TLM `tlm_method` call
+    /// (`mem.read(a)`) or a transactor method call (`xact.read(a)`) — hoist
+    /// it out of an unconditionally-evaluated message: lower it through its
+    /// statement-position path (which drives the protocol / method body,
+    /// including the wait/suspend) into a fresh `__msg_tmpN` local, and
+    /// replace the call node with `Ident(__msg_tmpN)` so the later fmt-arg
+    /// lowering just reads the resolved value. Returns `Ok(true)` when the
+    /// node was such a call and was hoisted; `Ok(false)` otherwise (the
+    /// caller falls through to the impure-helper hoist / child recursion).
+    ///
+    /// Only reached from `hoist_fmt_calls`, which runs exclusively for
+    /// UNCONDITIONALLY-evaluated messages and only descends into
+    /// always-evaluated operands (`fmt_expr_children_mut` skips
+    /// short-circuit `&&`/`||` RHS and ternary branches), so hoisting here
+    /// never changes the source-level evaluation count/order — a suspending
+    /// call in a lazy/conditional position still reaches the reject in
+    /// `lower_expr`.
+    fn hoist_fmt_suspending_call(&mut self, e: &mut AstExpr) -> Result<bool, LowerError> {
+        let ExprKind::Call { callee, .. } = &*e.kind else {
+            return Ok(false);
+        };
+        // A bus channel `send`/`recv` handshake (`axil.r.recv()`) can also
+        // suspend, but it is void or captures only a scalar and has no
+        // in-message surface in v1's reject shape; the `tlm_method` call
+        // edge (`bind.method(...)`) and the transactor method call are the
+        // two value-bearing suspending forms rejected inside a message.
+        let is_bus_tlm = matches!(&*callee.kind, ExprKind::Field { target, .. }
+            if matches!(&*target.kind, ExprKind::Ident(id)
+                if self.ctx.bus_bindings.contains_key(&id.name)));
+        let is_transactor = self.as_transactor_call(callee)?.is_some();
+        if !is_bus_tlm && !is_transactor {
+            return Ok(false);
+        }
+        let span = e.span;
+        let name = self.fresh_msg_tmp_name();
+        if is_bus_tlm {
+            // Route through the statement-position bus-call lowering with a
+            // `Declare` destination: it declares `name`, drives the req/rsp
+            // handshake, and binds the response into that local — the same
+            // lowering as `let name = bind.method(...)`.
+            let lowered = self.try_lower_bus_call(e, super::bus::BusCallDest::Declare(&name))?;
+            debug_assert!(lowered, "bus tlm_method call failed to lower after classification");
+        } else {
+            // Transactor method call edge with a result destination — the
+            // same lowering as `let name = xact.method(...)`.
+            let ExprKind::Call { callee, args } = &*e.kind else {
+                unreachable!("classified as a call above");
+            };
+            let call = self
+                .lower_transactor_call(callee, args, true)?
+                .expect("transactor call failed to lower after classification");
+            let id = self.declare(&name);
+            self.push(Stmt::TransactorCall {
+                dest: Some(id),
+                call,
+            });
+        }
+        *e = AstExpr::new(ExprKind::Ident(Ident { name, span }), span);
+        Ok(true)
     }
 
     /// A `__msg_tmpN` source name guaranteed unique against every local
