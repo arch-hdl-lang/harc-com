@@ -1,0 +1,59 @@
+// #494 P1b — TWO ACTIVE instances of one stateful DUT-poking transactor
+// type, each with independent per-instance state.
+//
+// The type carries a persistent scalar state field (`calls`, with its
+// `default` initializer) and a `when active` method that increments its
+// OWN state and pokes the DUT. Both instances are `active`, so both call
+// their method — through one type-shared method body that resolves state
+// against an explicit per-instance state receiver (`self_state`). Each
+// call site (`a.go()` / `b.go()`) passes its own instance's state struct,
+// so the two instances mutate independent state.
+//
+// The instances are driven at DIFFERENT points in `run` (a.go twice, then
+// b.go once) so no two instances write `dut.en` in the same cycle —
+// behavior is well-defined. Self-check: `a.calls == 2 && b.calls == 1`.
+//
+// tbir-only: legacy `--codegen v1` SEGFAULTS on this (it bakes one
+// instance name into the single per-type method body, so a second active
+// instance clobbers the first). Registered in run_fixtures.sh (default
+// tbir backend), NOT in tbir_equiv_fixtures.txt — v1 cannot be a baseline.
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor Drv
+    dut : Top
+    calls : uint<32> default 0
+    when active
+        hookable go()
+            calls = calls + 1
+            dut.en = 1
+        end go
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    a : Drv active
+    b : Drv active
+end testbench Tb
+
+impl MultiActiveInstanceTest for Tb
+    clock clk = SysDomain
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        a.go()
+        wait 1 cycle
+        a.go()
+        wait 1 cycle
+        b.go()
+        wait 2 cycles
+    end run
+    check
+        assert a.calls == 2 else fail("a.calls=${a.calls}, expected 2")
+        assert b.calls == 1 else fail("b.calls=${b.calls}, expected 1")
+    end check
+end impl MultiActiveInstanceTest

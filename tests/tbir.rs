@@ -6347,15 +6347,23 @@ end impl EvTest
         "stateful instance recorded for per-instance materialization",
     );
 
-    // A second stateful instance of the same type is rejected precisely
-    // (the method bodies are shared per type; one stateful instance per
-    // type in this subset).
+    // A second ACTIVE stateful instance of the same type now lowers
+    // (#494 P1b): the state-receiver ABI serves any number of instances
+    // from one shared method body, so both instances are recorded for
+    // per-instance state materialization.
     let two_src = state_src.replace(
         "    ev  : Ev active",
         "    ev  : Ev active\n    ev2 : Ev active",
     );
-    let msg = assert_unsupported(&lower_src(&two_src).unwrap_err());
-    assert!(msg.contains("instantiated more than once"), "{msg}");
+    let prog = lower_src(&two_src).expect("two active stateful instances lower");
+    assert_eq!(
+        prog.testbenches[0].unbound_state_actors,
+        vec![
+            ("ev".to_string(), ir::TransactorId(0)),
+            ("ev2".to_string(), ir::TransactorId(0)),
+        ],
+        "both active stateful instances recorded for per-instance materialization",
+    );
 
     // A method value param wider than 128 bits now lowers via v1's
     // `HarcWide<N>` register-array value model (`local_scalar_cty`): the

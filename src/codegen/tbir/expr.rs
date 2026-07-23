@@ -37,6 +37,13 @@ pub(super) struct ECx<'a> {
     /// records. Most ECx sites can never host such an edge and leave it
     /// `""`.
     pub trace_component: &'a str,
+    /// State-receiver name (#494 P1b) for empty-instance
+    /// `TransactorState`/`TransactorStateWrite` nodes inside a type-shared
+    /// stateful-transactor method body. `Some("self_state")` while
+    /// emitting such a body so `self.<field>` renders against the
+    /// per-instance struct the caller passed by reference; `None`
+    /// everywhere else (an empty instance is then a lowering/pass bug).
+    pub state_receiver: Option<&'a str>,
 }
 
 /// C++ symbol for a lowered pure-helper function. Prefixed so a HARC
@@ -134,6 +141,28 @@ pub(super) fn lane_width(cx: &ECx<'_>, p: &PortRef) -> Option<u32> {
     }
 }
 
+/// Resolve the C++ receiver for a transactor-state access. A non-empty
+/// `instance` is a fully-bound test-scope read (`a.calls`) and renders as
+/// itself. An EMPTY instance is a type-shared method-body placeholder
+/// (#494 P1b) and renders against the per-call state receiver
+/// (`self_state`); reaching an empty instance with no receiver in scope
+/// means a lowering/pass bug left a placeholder unbound.
+pub(super) fn resolve_state_instance<'a>(
+    cx: &ECx<'a>,
+    instance: &'a str,
+) -> Result<&'a str, EmitError> {
+    if !instance.is_empty() {
+        return Ok(instance);
+    }
+    cx.state_receiver.ok_or_else(|| {
+        EmitError(format!(
+            "tbir: empty-instance transactor-state access in {} with no state receiver \
+             in scope (unfilled placeholder — lowering/pass bug)",
+            cx.func.name
+        ))
+    })
+}
+
 /// Render an IR expression.
 pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
     Ok(match e {
@@ -209,7 +238,9 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // generated per-instance struct (`<instance>.<field>`), matching
         // v1's `field_subs` substitution at the responder body and the
         // direct struct access at the test-scope read.
-        Expr::TransactorState { instance, field } => format!("{instance}.{field}"),
+        Expr::TransactorState { instance, field } => {
+            format!("{}.{field}", resolve_state_instance(cx, instance)?)
+        }
         // Bound-to target transactor `queue<T>` state field size/empty
         // read — a `harc_rt::HarcQueue<T>` member of the per-instance
         // struct. Mirrors the scoreboard/component queue-query shapes.
@@ -219,6 +250,7 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             query,
         } => {
             use crate::ir::ScoreboardQuery;
+            let instance = resolve_state_instance(cx, instance)?;
             match query {
                 ScoreboardQuery::QueueSize { .. } => {
                     format!("((uint64_t){instance}.{field}.size())")

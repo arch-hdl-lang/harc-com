@@ -1651,17 +1651,25 @@ fn emit_test(
     // run coroutine so its `[&]` capture sees them (v1 emission order).
     // Two fields of the same transactor type share one lambda set: the
     // subset carries no per-instance state (the DUT bind is static).
-    // Per-instance state structs for the unbound DUT-poking transactors
-    // that carry persistent scalar state (`drv.last_read`). Declared
-    // BEFORE the method lambdas so the lambdas' `[&]` capture binds the
-    // instance struct the method bodies write (`drv.last_read = ...`) and
-    // the run/check coroutine reads. Same per-instance struct shape as
-    // the bound-to target form. The subset is one stateful instance per
-    // transactor type (enforced at lowering), so the type-shared method
-    // lambda references exactly this one instance.
+    // Per-instance state for the unbound DUT-poking transactors that carry
+    // persistent state (`drv.last_read`). Declared BEFORE the method
+    // lambdas so the lambdas' `[&]` capture binds the instance structs
+    // (passed in as `self_state`) and the run/check coroutine reads them.
+    //
+    // State-receiver ABI (#494 P1b): one SHARED `_<Type>_state` struct type
+    // per transactor type, then one instance VARIABLE per instance. The
+    // type-shared method lambda takes the receiver by reference, so any
+    // number of active instances of one type coexist with independent
+    // state (`Drv_go(a)` and `Drv_go(b)` mutate `a`/`b` separately).
+    let mut emitted_state_ty = HashSet::new();
+    for (_, xid) in &tb.unbound_state_actors {
+        if !emitted_state_ty.insert(*xid) {
+            continue;
+        }
+        runtime::unbound_state_struct_decl(out, prog.transactor(*xid), &prog.records);
+    }
     for (instance, xid) in &tb.unbound_state_actors {
-        let schema = prog.transactor(*xid);
-        runtime::target_state_struct_inst(out, schema, instance, &prog.records);
+        runtime::unbound_state_var(out, prog.transactor(*xid), instance);
     }
     // Closure-hook bodies (`on <obj>.<method> pre/post` method hooks and
     // `on regs.REG` per-register write callbacks) — emitted as free

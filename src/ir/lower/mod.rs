@@ -3015,22 +3015,24 @@ fn lower_test(
 
     // Resolve persistent state for the unbound DUT-poking transactor
     // instances (`drv : SeqXactor active` where `SeqXactor` declares a
-    // `last_read : uint<32>` field). Same machinery as the bound-to
-    // target form: register the per-instance state map (for test-scope
-    // `drv.last_read` reads) and fill the instance into the method
-    // bodies' `TransactorState`/`TransactorStateWrite` placeholders. The
-    // method bodies are shared per transactor TYPE, so the subset is one
-    // STATEFUL instance per type per file — a second instance would
-    // clobber the first's filled instance name; reject it loudly.
+    // `last_read : uint<32>` field). Same per-instance state map as the
+    // bound-to target form (for test-scope `drv.last_read` reads).
+    //
+    // Per-instance state uses an EXPLICIT STATE RECEIVER (#494 P1b): the
+    // type-shared method lambda takes a leading `<Type>_state& self_state`
+    // parameter and its `TransactorState`/`TransactorStateWrite` nodes
+    // stay as empty-instance placeholders — codegen renders an empty
+    // instance as `self_state.<field>`. Each call site passes the calling
+    // instance's own state struct (`Drv_go(a)` / `Drv_go(b)`), so one
+    // shared body serves any number of instances with independent state.
+    // This replaces the old fill-the-instance-name-into-the-body scheme,
+    // which shared one baked-in name per TYPE and therefore rejected a
+    // second active instance (a fill would clobber the first's name).
+    //
+    // Bound-to TARGET responders (`target_tlm_actors`, handled above) and
+    // bound-to INITIATOR BFMs keep their own name-fill path — see the
+    // fill loop below, gated on `bound_bus`.
     let mut unbound_state_actors: Vec<(String, ir::TransactorId)> = Vec::new();
-    // Tracks which stateful transactor TYPES already have an instance.
-    // The method bodies (and per-instance state map) are shared per
-    // type, so the subset allows one stateful instance per type: a
-    // second instance of the same type would clobber the first's filled
-    // method-body instance name. Tracked independently of whether the
-    // type has methods (a method-less stateful transactor still has one
-    // shared per-instance struct in scope).
-    let mut stateful_type_seen: HashMap<u32, String> = HashMap::new();
     for (field, xid) in &transactor_fields {
         let xschema = &prog.transactors[xid.index()];
         // Bound-to TARGET instances are handled above (they appear in
@@ -3045,28 +3047,7 @@ fn lower_test(
         }
         let xname = xschema.name.clone();
         let is_passive = passive_transactor_fields.contains(field);
-        // A PASSIVE instance exposes only its per-instance state (and any
-        // always-on `on` handlers, lowered elsewhere); its `when active`
-        // methods are never callable, so the type-shared method bodies are
-        // NOT filled with a passive instance name. That leaves the
-        // per-instance state struct as the only per-instance piece, so
-        // multiple passive instances of one stateful type coexist with
-        // independent state and DO NOT trip the shared-body uniqueness
-        // guard. An ACTIVE instance still fills the shared bodies, so the
-        // one-active-stateful-instance-per-type constraint is unchanged.
-        if !is_passive {
-            if let Some(prev) = stateful_type_seen.get(&xid.0) {
-                return Err(unsupported(
-                    &format!(
-                        "stateful transactor `{xname}` instantiated more than once \
-                         (`{prev}`, `{field}`)"
-                    ),
-                    "the state-field subset shares one method body per transactor \
-                     type; multiple stateful instances need per-instance bodies",
-                ));
-            }
-            stateful_type_seen.insert(xid.0, field.clone());
-        }
+        let is_bound = xschema.bound_bus.is_some();
         if target_state.contains_key(field) {
             return Err(LowerError::Invalid(format!(
                 "name `{field}` is both a stateful transactor instance and a target-TLM \
@@ -3082,27 +3063,26 @@ fn lower_test(
                 .map(|f| (f.name.clone(), f.kind.clone()))
                 .collect(),
         );
-        // Fill the instance into the (type-shared) method bodies'
-        // `TransactorState`/`TransactorStateWrite` placeholders. Only for
-        // ACTIVE instances — a passive instance's `when active` methods
-        // are not callable, so filling would (a) be pointless and (b)
-        // clobber a same-type active instance's fill / trip the defensive
-        // cross-check on a second passive instance. With the per-type
-        // uniqueness guarded above for the active case, this can only ever
-        // fill with a single instance name, but
-        // `fill_transactor_state_instance` still cross-checks defensively.
-        if !is_passive {
+        // Bound-to INITIATOR BFMs still bake the instance name into their
+        // (type-shared) method bodies — those bodies are not invoked
+        // through the state-receiver method lambdas, and a bound bus pins
+        // one instance per type. The unbound DUT-poking form leaves the
+        // placeholders EMPTY so codegen renders them against the per-call
+        // `self_state` receiver, letting multiple active instances of one
+        // type coexist (#494 P1b). A PASSIVE instance's `when active`
+        // methods are never callable, so its bodies are never filled and
+        // never receive a receiver either.
+        if is_bound && !is_passive {
             let method_fns: Vec<usize> =
                 xschema.methods.iter().map(|m| m.function.index()).collect();
             for fidx in method_fns {
                 if let Err(prev) = fill_transactor_state_instance(&mut prog.functions[fidx], field) {
                     return Err(unsupported(
                         &format!(
-                            "stateful transactor `{xname}` instantiated more than once \
-                             (`{prev}`, `{field}`)"
+                            "bound-to initiator transactor `{xname}` instantiated more than \
+                             once (`{prev}`, `{field}`)"
                         ),
-                        "the state-field subset shares one method body per transactor \
-                         type; multiple stateful instances need per-instance bodies",
+                        "a bound-to initiator BFM pins one instance per transactor type",
                     ));
                 }
             }
