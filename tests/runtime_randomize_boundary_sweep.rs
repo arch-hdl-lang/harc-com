@@ -145,4 +145,11 @@ fn benign_emit_error(msg: &str) -> bool {
         || msg.contains("no `domain") && msg.contains("declaration was found")
         || msg.contains("randomize(") && msg.contains("no `transaction")
         || msg.contains("constraint references unknown name")
+        // A suspending bus/TLM method call inside a `log`/`fail` message
+        // interpolation is a TB-IR-only capability (#494 P2d follow-up):
+        // the legacy v1 emitter cannot resolve a bus-method call in a
+        // message and fails with "bus ... has no signal or channel named
+        // <method>". Such fixtures are exercised via the default (tbir)
+        // backend in tests/run_fixtures.sh, not this v1 emit sweep.
+        || msg.contains("has no signal or channel named")
 }

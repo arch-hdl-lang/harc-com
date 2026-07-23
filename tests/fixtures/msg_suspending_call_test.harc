@@ -1,0 +1,68 @@
+// TB-IR fixture for #494 P2d follow-up: a SUSPENDING bus/TLM method call
+// inside an unconditionally-evaluated `log(...)`/`fail(...)` message
+// interpolation (`${...}`) must be auto-hoisted, not rejected.
+//
+// The earlier P2d fix hoisted NON-suspending helper/method calls out of a
+// message; a suspending call (a bus-bound `tlm_method`, which drives a
+// req/rsp handshake and waits for the response) was still rejected. The
+// tbir backend now hoists such a call through its statement-position
+// lowering — driving the protocol and landing the wait/suspend BEFORE the
+// message — into a fresh temp, then reads the resolved value in the fmt
+// arg. This is exactly the manual rewrite the former reject suggested.
+//
+// tbir-only: legacy `--codegen v1` cannot resolve a bus-method call in a
+// message interpolation at all (`bus ... has no signal or channel named
+// read`), so this fixture is NOT in tbir_equiv_fixtures.txt.
+//
+// The DUT (TlmMemory) initializes mem[addr] = 0x100 + addr, so
+// mem.read(5) == 0x105 == 261 and mem.read(8) == 0x108 == 264.
+// Every assert passes → the run ends with the passing verdict.
+
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+    tlm_method poke(addr: uint<8>, data: uint<32>): blocking;
+end bus TlmMemBus
+
+testbench MsgSuspendingCallTb
+    dut : TlmMemory
+end testbench MsgSuspendingCallTb
+
+impl MsgSuspendingCallTest for MsgSuspendingCallTb
+    let mem : TlmMemBus = bind dut
+
+    run
+        dut.rst = 1
+        dut.mem_read_req_valid = 0
+        dut.mem_read_rsp_ready = 0
+        dut.mem_read_ooo_req_valid = 0
+        dut.mem_read_ooo_rsp_ready = 0
+        dut.mem_poke_req_valid = 0
+        dut.mem_poke_rsp_ready = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // (1) A suspending TLM read INSIDE a `log` message. The call is
+        //     hoisted into a temp (driving the handshake + wait), then the
+        //     resolved value is interpolated. mem.read(5) == 261 == 0x105.
+        log(info, "read5=${mem.read(5)} (0x${mem.read(5):08x})")
+
+        // Prove correctness via the statement form: bind the same call and
+        // assert the value the message interpolation would have printed.
+        let r5 = mem.read(5)
+        assert r5 == 261
+            else fail("statement read got 0x${r5:08x}, expected 0x00000105")
+
+        // (2) Mutate a cell, then read it back inside a message, and assert
+        //     the statement-form value. Exercises hoisting a read whose
+        //     value depends on a prior suspending write.
+        mem.poke(8, 264)
+        log(info, "read8=${mem.read(8)}")
+        let r8 = mem.read(8)
+        assert r8 == 264
+            else fail("statement read8 got ${r8}, expected 264")
+
+        log(info, "ALL TESTS PASSED")
+        wait 1 cycle
+    end run
+end impl MsgSuspendingCallTest
