@@ -762,12 +762,18 @@ pub(crate) fn mode_str(m: &WaitMode) -> &'static str {
 }
 
 fn bin_value_str(v: &CovBinValue) -> String {
+    fn bound_str(b: &CovBinBound) -> String {
+        match b {
+            CovBinBound::Const(x) => x.to_string(),
+            CovBinBound::Runtime(e) => cover_expr_str(e),
+        }
+    }
     match v {
         CovBinValue::Eq(x) => x.to_string(),
         CovBinValue::Range { lo, hi } => format!(
             "[{}..{}]",
-            lo.map(|x| x.to_string()).unwrap_or_default(),
-            hi.map(|x| x.to_string()).unwrap_or_default()
+            lo.as_ref().map(bound_str).unwrap_or_default(),
+            hi.as_ref().map(bound_str).unwrap_or_default()
         ),
     }
 }

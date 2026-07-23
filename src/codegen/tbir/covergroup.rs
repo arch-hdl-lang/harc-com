@@ -10,8 +10,9 @@
 
 use crate::codegen::cpp_tb::EmitError;
 use crate::ir::{
-    BinOp, CallTarget, CovBinValue, CoverPointSchema, CovgroupSchema, Expr, FunctionId, IrType,
-    PortRef, TbProgram, TransactorMethodSchema, TransactorSchema, UnOp, WidthCastKind,
+    BinOp, CallTarget, CovBinBound, CovBinValue, CoverPointSchema, CovgroupSchema, Expr,
+    FunctionId, IrType, PortRef, TbProgram, TransactorMethodSchema, TransactorSchema, UnOp,
+    WidthCastKind,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
@@ -330,23 +331,36 @@ fn cover_width_cast_cpp(
     })
 }
 
-fn bin_membership(values: &[CovBinValue]) -> String {
+fn bin_membership(
+    values: &[CovBinValue],
+    lanes: &HashMap<String, u32>,
+) -> Result<String, EmitError> {
     if values.is_empty() {
-        return "(false)".to_string();
+        return Ok("(false)".to_string());
     }
-    let parts = values
-        .iter()
-        .map(|v| match v {
+    // Render one range bound. A constant folds inline; a runtime bound is
+    // emitted with the same expression lowerer used for point targets,
+    // matching v1's per-sample `emit_expr(bound)` byte-for-byte.
+    let bound = |b: &CovBinBound| -> Result<String, EmitError> {
+        match b {
+            CovBinBound::Const(x) => Ok(x.to_string()),
+            CovBinBound::Runtime(e) => cover_expr_cpp(e, lanes),
+        }
+    };
+    let mut parts = Vec::with_capacity(values.len());
+    for v in values {
+        let part = match v {
             CovBinValue::Eq(x) => format!("(_v == {x})"),
             CovBinValue::Range { lo, hi } => match (lo, hi) {
-                (Some(l), Some(h)) => format!("(_v >= {l} && _v <= {h})"),
-                (Some(l), None) => format!("(_v >= {l})"),
-                (None, Some(h)) => format!("(_v <= {h})"),
+                (Some(l), Some(h)) => format!("(_v >= {} && _v <= {})", bound(l)?, bound(h)?),
+                (Some(l), None) => format!("(_v >= {})", bound(l)?),
+                (None, Some(h)) => format!("(_v <= {})", bound(h)?),
                 (None, None) => "(true)".to_string(),
             },
-        })
-        .collect::<Vec<_>>();
-    format!("({})", parts.join(" || "))
+        };
+        parts.push(part);
+    }
+    Ok(format!("({})", parts.join(" || ")))
 }
 
 /// `struct <Name> { ... bin counters ... void report() const { ... } };`
@@ -587,7 +601,7 @@ fn sample_body(
         let target = cover_expr_cpp(&p.target, lanes)?;
         writeln!(out, "{pad3}uint64_t _v = (uint64_t)({});", target).ok();
         for (bin_idx, b) in p.bins.iter().enumerate() {
-            let membership = bin_membership(&b.values);
+            let membership = bin_membership(&b.values, lanes)?;
             if !any_cross {
                 writeln!(
                     out,

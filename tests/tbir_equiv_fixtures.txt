@@ -98,6 +98,7 @@ synchronizer_wide_test | DataSync | synchronizer_wide.sv | - | pass
 synchronizer_pulse_test | EventSync | synchronizer_pulse.sv | - | pass | synchronizer_pulse_domains.harc
 multi_clock_test | MultiClockSync | multi_clock.sv | - | pass | async_fifo_domains.harc
 cov_cross_bins_test | Top | top_counter.sv | top_counter.arch | pass
+cov_runtime_bound_test | Top | top_counter.sv | top_counter.arch | pass
 cov_expr_targets_test | Top | top_counter.sv | top_counter.arch | pass
 covergroup_hook_trigger_test | Top | top_counter.sv | - | pass
 covergroup_hook_param_test | Top | top_counter.sv | - | pass

@@ -2219,10 +2219,27 @@ pub struct CoverBinSchema {
 /// inclusive range (`[a..b]`, with either bound open). A bin spec like
 /// `{[1..3], 7}` lowers to `[Range{1,3}, Eq(7)]`. Range bounds are
 /// inclusive on both ends — v1's hit test is `_v >= lo && _v <= hi`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// A range bound is a [`CovBinBound`]: either a folded compile-time
+/// constant (`[1..3]`, `[LO..HI]` const names) or a genuine runtime
+/// expression (`[dut.en..7]`), matching v1, which emits the raw bound
+/// expression per-sample rather than requiring a constant.
+#[derive(Debug, Clone)]
 pub enum CovBinValue {
     Eq(u64),
-    Range { lo: Option<u64>, hi: Option<u64> },
+    Range {
+        lo: Option<CovBinBound>,
+        hi: Option<CovBinBound>,
+    },
+}
+
+/// A single covergroup bin range bound. Constant bounds fold at lowering
+/// (`Const`); non-constant bounds carry a lowered [`Expr`] evaluated at
+/// sample time (`Runtime`), mirroring v1's per-sample bound emission.
+#[derive(Debug, Clone)]
+pub enum CovBinBound {
+    Const(u64),
+    Runtime(Expr),
 }
 
 /// One declared `cross` item, resolved against the owning schema's
