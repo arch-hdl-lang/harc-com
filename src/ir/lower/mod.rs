@@ -1527,13 +1527,13 @@ fn validate_testbench_component(
             // Helper methods are inert unless called; calls surface as
             // `Unsupported` at the call site during body lowering.
             ComponentItem::Hookable(_) => {}
-            // Testbench-scoped `on ... end on` handler (issue #485). The
-            // periodic form (`on <N> cycles [phase post_eval]`) lowers to
-            // a flow-owned service (see `lower_test`); the cycle-trigger
-            // (`on <bool-expr>`) and event-subscription (`on <ev>(arg)`)
-            // forms, and pre/post method hooks, are not yet lowered at
-            // testbench scope — reject them by their exact kind so the
-            // diagnostic points at the real gap.
+            // Testbench-scoped `on ... end on` handler (issues #485, #494).
+            // The periodic form (`on <N> cycles [phase post_eval]`) and the
+            // cycle-trigger form (`on <bool-expr> [phase post_eval]`) both
+            // lower to flow-owned services (see `lower_test`). The
+            // event-subscription form (`on <ev>(arg)`) and pre/post method
+            // hooks are not lowered at testbench scope — reject them by
+            // their exact kind so the diagnostic points at the real gap.
             ComponentItem::OnHandler(h) => {
                 if h.hook.is_some() {
                     return Err(unsupported(
@@ -1541,21 +1541,27 @@ fn validate_testbench_component(
                             "a testbench-scoped `on <obj>.<method>` pre/post method hook in `{}`",
                             c.name.name
                         ),
-                        "only periodic `on <N> cycles` handlers are lowered at testbench scope",
+                        "only periodic `on <N> cycles` and cycle-trigger `on <bool-expr>` \
+                         handlers are lowered at testbench scope",
                     ));
                 }
-                if !h.periodic {
+                // An event-subscription / handshake-monitor form (`on
+                // ev(arg)`) is a `Call` trigger; testbench scope has no
+                // event fields to subscribe to, so reject it distinctly.
+                if !h.periodic && matches!(&*h.event.kind, ExprKind::Call { .. }) {
                     return Err(unsupported(
                         &format!(
-                            "a testbench-scoped cycle-trigger / event `on` handler in `{}`",
+                            "a testbench-scoped event / handshake-monitor `on` handler in `{}`",
                             c.name.name
                         ),
-                        "only periodic `on <N> cycles` handlers are lowered at testbench scope; \
-                         move a cycle-trigger / event handler onto a component field",
+                        "only periodic `on <N> cycles` and cycle-trigger `on <bool-expr>` \
+                         handlers are lowered at testbench scope; move an event / handshake \
+                         handler onto a component field",
                     ));
                 }
-                // A periodic handler is accepted; its period is validated
-                // (positive integer literal) when `lower_test` lowers it.
+                // A periodic handler (`on <N> cycles`) or a cycle-trigger
+                // handler (`on <bool-expr>`) is accepted; its period /
+                // predicate is validated when `lower_test` lowers it.
             }
             _ => {
                 return Err(unsupported(
@@ -2408,6 +2414,11 @@ fn lower_test(
     // test ctx is built (alongside run/check), then registered on the
     // testbench schema.
     let mut tb_periodic_asts: Vec<&crate::ast::OnHandler> = Vec::new();
+    // Testbench-scoped `on <bool-expr> [phase post_eval]` cycle-trigger
+    // handlers (issue #494 P2b). Same treatment as the periodic form: the
+    // body lowers to a flow-owned `TestHook` function and the predicate is
+    // re-evaluated every cycle in a registration closure.
+    let mut tb_cycle_asts: Vec<&crate::ast::OnHandler> = Vec::new();
     if let Some(tbn) = &tb_name {
         if let Some(c) = components.get(tbn) {
             for ci in &c.items {
@@ -2529,6 +2540,17 @@ fn lower_test(
                     // NOT periodic is a bug in the validator — skip it
                     // defensively rather than mis-lower.
                     ComponentItem::OnHandler(h) if h.periodic => tb_periodic_asts.push(h),
+                    // Testbench-scoped cycle-trigger `on <bool-expr>` handler
+                    // (issue #494 P2b). The validator accepts the non-
+                    // periodic, non-call (non-event/handshake), non-hook form;
+                    // collect it here for body + predicate lowering below.
+                    ComponentItem::OnHandler(h)
+                        if !h.periodic
+                            && h.hook.is_none()
+                            && !matches!(&*h.event.kind, ExprKind::Call { .. }) =>
+                    {
+                        tb_cycle_asts.push(h)
+                    }
                     _ => {}
                 }
             }
@@ -3254,6 +3276,7 @@ fn lower_test(
         synthetic,
         // Back-patched after the handler bodies are lowered (below).
         periodic_services: Vec::new(),
+        cycle_services: Vec::new(),
     });
 
     // Assemble run/check statement lists. Mirrors v1: the coroutine
@@ -3621,6 +3644,42 @@ fn lower_test(
             });
         }
         prog.testbenches[tb_id.index()].periodic_services = periodic_services;
+    }
+
+    // Lower each testbench-scoped `on <bool-expr> [phase post_eval]`
+    // cycle-trigger handler (issue #494 P2b). The body lowers to a zero-arg
+    // `FunctionKind::TestHook` function (like the periodic form); the
+    // trigger predicate lowers alongside it as a standalone `ir::Expr` that
+    // the backend re-evaluates every cycle in a `_checkers` /
+    // `_post_eval_services` registration closure, gated on the recorded
+    // edge mode. Mirrors v1's `emit_cycle_trigger`.
+    if !tb_cycle_asts.is_empty() {
+        let tb_decl = tb_name
+            .as_ref()
+            .and_then(|tbn| components.get(tbn).copied())
+            .expect("tb_cycle_asts is only populated for an impl-bound testbench");
+        let mut cycle_services: Vec<ir::TbCycleServiceSchema> = Vec::new();
+        for h in &tb_cycle_asts {
+            let fid = FunctionId(prog.functions.len() as u32);
+            let (f, trigger) = lower_tb_cycle_service_body(
+                fid,
+                format!("{}_tb_cycle_{}", t.name.name, fid.0),
+                Some(tb_id),
+                tb_decl,
+                h,
+                &ctx,
+                helpers,
+                constraint_sites,
+            )?;
+            prog.functions.push(f);
+            cycle_services.push(ir::TbCycleServiceSchema {
+                trigger,
+                edge: ir::CycleEdge::from_ast(h.edge),
+                function: fid,
+                phase: ir::HandlerPhase::from_ast(h.phase),
+            });
+        }
+        prog.testbenches[tb_id.index()].cycle_services = cycle_services;
     }
 
     prog.tests.push(TestSchema {
@@ -4467,6 +4526,58 @@ fn lower_tb_periodic_service_body<'a>(
         b.terminate(Terminator::Return);
     }
     b.finish(id, name, FunctionKind::TestHook, owner)
+}
+
+/// Lower one testbench-scoped `on <bool-expr> ... end on` cycle-trigger
+/// handler (issue #494 P2b) as a zero-param `FunctionKind::TestHook`
+/// function PLUS its standalone trigger predicate. Both the body and the
+/// trigger are first rewritten (bare testbench field/method refs →
+/// `_tb.<name>`) so they resolve through the ordinary TEST-scope `ctx`
+/// exactly like the bound test body — `_tb.<field>` host state and `dut`
+/// reads. The trigger uses `lower_expr` (NOT `_no_ports`): it renders
+/// standalone in the backend's registration closure, never appended to
+/// this body, so it must not hoist a port read into a body-only temp local
+/// (that local would dangle in the closure). The firing cadence (`edge`,
+/// `phase`) is recorded on the schema, not here.
+#[allow(clippy::too_many_arguments)]
+fn lower_tb_cycle_service_body<'a>(
+    id: FunctionId,
+    name: String,
+    owner: Option<TestbenchId>,
+    tb: &ComponentDecl,
+    h: &crate::ast::OnHandler,
+    ctx: &'a LowerCtx,
+    helpers: &'a helpers::HelperRegistry<'a>,
+    constraint_sites: &'a RefCell<Vec<ConstraintSite>>,
+) -> Result<(TbFunction, ir::Expr), LowerError> {
+    // Rewrite the trigger predicate the same way the body is rewritten:
+    // wrap it in a throwaway one-statement block so the shared
+    // `rewrite_testbench_scope_body` walker maps bare field refs to
+    // `_tb.<field>` and leaves `dut.<sig>` / `_tb` alone.
+    let mut trigger_expr = h.event.clone();
+    let mut trigger_wrapper = Block {
+        stmts: vec![crate::ast::Stmt {
+            kind: StmtKind::Expr(trigger_expr),
+            span: h.event.span,
+        }],
+        span: h.event.span,
+    };
+    crate::codegen::cpp_tb::rewrite_testbench_scope_body(&mut trigger_wrapper, tb, &HashSet::new());
+    let StmtKind::Expr(rewritten) = trigger_wrapper.stmts.remove(0).kind else {
+        unreachable!("trigger wrapper holds exactly the Expr statement we inserted");
+    };
+    trigger_expr = rewritten;
+
+    let mut body = h.body.clone();
+    crate::codegen::cpp_tb::rewrite_testbench_scope_body(&mut body, tb, &HashSet::new());
+    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    let trigger = b.lower_expr(&trigger_expr)?;
+    b.lower_block_stmts(&body)?;
+    if !b.is_terminated() {
+        b.terminate(Terminator::Return);
+    }
+    let f = b.finish(id, name, FunctionKind::TestHook, owner)?;
+    Ok((f, trigger))
 }
 
 /// Lower one `on regs.REG` per-register write callback body as a

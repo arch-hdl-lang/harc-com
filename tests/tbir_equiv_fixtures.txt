@@ -72,6 +72,7 @@ lz4_block_decoder_test | Lz4BlockDecoder | lz4_block_decoder.sv | lz4_block_deco
 bus_arbiter_test | BusArbiter | bus_arbiter.sv | bus_arbiter.arch | pass
 wait_until_counter_test | Top | top_counter.sv | top_counter.arch | pass
 after_cycles_test | Top | top_counter.sv | top_counter.arch | pass
+tb_on_expr_test | Top | top_counter.sv | top_counter.arch | pass
 bare_stmt_scope_test | Top | top_counter.sv | top_counter.arch | pass
 time_literal_test | Top | top_counter.sv | top_counter.arch | pass
 rom_lut_test | RomLut | rom_lut.sv | rom_lut.arch | pass

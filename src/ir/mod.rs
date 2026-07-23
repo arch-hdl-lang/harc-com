@@ -651,6 +651,17 @@ pub enum CycleEdge {
     Level,
 }
 
+impl CycleEdge {
+    /// Lower from the AST `EdgeMode`.
+    pub fn from_ast(e: crate::ast::EdgeMode) -> Self {
+        match e {
+            crate::ast::EdgeMode::Rising => CycleEdge::Rising,
+            crate::ast::EdgeMode::Falling => CycleEdge::Falling,
+            crate::ast::EdgeMode::Level => CycleEdge::Level,
+        }
+    }
+}
+
 /// Scheduling phase for an `on` handler — mirrors `ast::OnPhase` in the IR
 /// so the codegen needn't reach back into the AST. `Checker` registers the
 /// handler in the per-cycle `_checkers` vector (run after the falling edge
@@ -979,6 +990,15 @@ pub struct TestbenchSchema {
     /// its body once every `period` primary-clock cycles at the recorded
     /// phase. Empty for a testbench without periodic handlers.
     pub periodic_services: Vec<TbPeriodicServiceSchema>,
+    /// Testbench-scoped `on <bool-expr> ... end on` cycle-trigger handlers
+    /// (issue #494 P2b). v1 emits these through its testbench-component
+    /// path (`emit_cycle_trigger` registering into `_checkers`); the TB-IR
+    /// backend has no testbench component, so the handler bodies lower to
+    /// flow-owned `FunctionKind::TestHook` functions and register here.
+    /// Each re-evaluates its predicate every primary-clock cycle and fires
+    /// the body when the predicate satisfies the requested edge mode. Empty
+    /// for a testbench without cycle-trigger handlers.
+    pub cycle_services: Vec<TbCycleServiceSchema>,
 }
 
 /// One testbench-scoped `on <N> cycles ... end on` periodic handler
@@ -999,6 +1019,32 @@ pub struct TbPeriodicServiceSchema {
     /// `phase` modifier (`on N cycles phase post_eval`). `Checker`
     /// (default) registers into `_checkers`; `PostEval` into
     /// `_post_eval_services`.
+    pub phase: HandlerPhase,
+}
+
+/// One testbench-scoped `on <bool-expr> ... end on` cycle-trigger handler
+/// (issue #494 P2b). Mirrors `CycleTriggerHandlerSchema` but at flow
+/// scope: the body is a flow-owned `FunctionKind::TestHook` function
+/// (`_tb`/`dut` captured by reference, no `self`), registered into the
+/// per-cycle `_checkers` / `_post_eval_services` vector by the run
+/// coroutine's setup. The trigger predicate is evaluated standalone in the
+/// registration closure every primary-clock cycle; the body fires when the
+/// predicate satisfies `edge`.
+#[derive(Debug, Clone)]
+pub struct TbCycleServiceSchema {
+    /// The boolean trigger predicate, lowered in TEST scope (so `dut.<sig>`
+    /// reads route to the shared `dut` handle and bare field reads resolve
+    /// to `_tb.<field>`). Rendered standalone inside the registration
+    /// closure.
+    pub trigger: Expr,
+    /// Edge mode: `Rising` (0→1, default), `Falling` (1→0), or `Level`
+    /// (every cycle the predicate holds).
+    pub edge: CycleEdge,
+    /// Lowered handler body (`kind: TestHook`, zero params). Field reads
+    /// resolve to `Expr::TbField`, DUT reads to the shared `dut` handle.
+    pub function: FunctionId,
+    /// `phase` modifier (`on <expr> phase post_eval`). `Checker` (default)
+    /// registers into `_checkers`; `PostEval` into `_post_eval_services`.
     pub phase: HandlerPhase,
 }
 

@@ -7436,13 +7436,15 @@ fn testbench_periodic_post_eval_emitted_cpp_snapshot() {
     insta::assert_snapshot!("testbench_periodic_post_eval_emitted_cpp", cpp);
 }
 
-/// Issue #485 acceptance criterion 3: a testbench-scoped `on <bool-expr>`
-/// cycle-trigger handler (a NON-periodic on-handler) is still out of the
-/// subset, but the diagnostic must name the exact item kind rather than
-/// the old generic "testbench item". Only the periodic `on <N> cycles`
-/// form is lowered at testbench scope.
+/// Issue #494 P2b: a testbench-scoped `on <bool-expr>` cycle-trigger
+/// handler (a NON-periodic on-handler) now lowers to a flow-owned
+/// `TestHook` function plus a `TbCycleServiceSchema` carrying the trigger
+/// predicate + edge mode. Mirrors the periodic-service lowering, but the
+/// predicate is re-evaluated every cycle in the backend's registration
+/// closure. (Previously this form was rejected — issue #485 only lowered
+/// the periodic `on <N> cycles` form.)
 #[test]
-fn testbench_cycle_trigger_on_handler_is_rejected() {
+fn testbench_cycle_trigger_on_handler_lowers() {
     let src = r#"testbench TbCyc
     dut : Top
     hit : uint<32> default 0
@@ -7458,11 +7460,56 @@ impl TbCycTest for TbCyc
         log(info, "done")
     end run
 end impl TbCycTest"#;
-    let err = lower_src(src).expect_err("a testbench cycle-trigger on-handler must be rejected");
-    let msg = assert_unsupported(&err);
+    let prog = lower_src(src).expect("a testbench cycle-trigger on-handler must lower");
+    let tb = &prog.testbenches[0];
+    assert_eq!(
+        tb.cycle_services.len(),
+        1,
+        "one cycle-trigger service is recorded on the testbench schema"
+    );
+    let svc = &tb.cycle_services[0];
+    assert_eq!(
+        svc.edge,
+        harc::ir::CycleEdge::Rising,
+        "an `on <bool-expr>` handler defaults to the rising edge"
+    );
+    assert_eq!(
+        svc.phase,
+        harc::ir::HandlerPhase::Checker,
+        "default (no `phase post_eval`) is the Checker phase"
+    );
+    // The trigger predicate lowered into the service (not appended to the
+    // body function), reading the DUT port.
     assert!(
-        msg.contains("cycle-trigger") && msg.contains("testbench"),
-        "diagnostic must name the testbench on-handler kind, not the generic item: {msg}"
+        matches!(&svc.trigger, harc::ir::Expr::Binary(harc::ir::BinOp::Eq, ..)),
+        "the trigger is the lowered `dut.count_out == 7` predicate: {:?}",
+        svc.trigger
+    );
+    let body = prog.function(svc.function);
+    assert!(
+        matches!(body.kind, harc::ir::FunctionKind::TestHook),
+        "the handler body is a flow-owned TestHook function"
+    );
+}
+
+/// Issue #494 P2b: the emitted C++ for a testbench-scoped `on <bool-expr>`
+/// handler registers a per-cycle `_checkers` closure that re-evaluates the
+/// predicate and fires the body on the rising edge (matching v1's
+/// `emit_cycle_trigger`).
+#[test]
+fn testbench_cycle_trigger_on_handler_emitted_cpp() {
+    let cpp = emit_fixture_cpp("tb_on_expr_test.harc");
+    assert!(
+        cpp.contains("_checkers.push_back"),
+        "registers a per-cycle checker closure"
+    );
+    assert!(
+        cpp.contains("_tbcyc_"),
+        "uses the per-service cycle-trigger prev-state tag"
+    );
+    assert!(
+        cpp.contains("_prev") && cpp.contains("_curr"),
+        "renders the rising-edge prev/curr gate"
     );
 }
 /// A value-returning component method call can assign into an existing

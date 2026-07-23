@@ -1,0 +1,46 @@
+// Testbench-scoped `on <bool-expr>` cycle-trigger handler (issue #494 P2b).
+// v1 lowers this via its testbench-component `emit_cycle_trigger` path
+// (registering a `_checkers` closure that fires on the rising edge of the
+// predicate); the TB-IR backend has no testbench component, so the handler
+// body lowers to a flow-owned `TestHook` function and the predicate is
+// re-evaluated every primary-clock cycle in a registration closure gated on
+// the recorded edge mode. This fixture proves the two backends agree.
+//
+// The DUT is the shared `Top` counter (ports clk, rst, en, count_out). With
+// `en` held high after reset the counter walks 0,1,2,3,... one step per
+// cycle, so `count_out == 3` holds for exactly one cycle — the default
+// Rising edge mode fires the handler exactly once, bumping `seen` to 1.
+// A level-vs-edge divergence, or a different firing phase, would change the
+// count and the v1<->tbir trace-diff gate would catch it.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench TbOnExprTb
+    dut : Top
+    seen : uint<32> default 0
+
+    on dut.count_out == 3
+        seen = seen + 1
+    end on
+end testbench TbOnExprTb
+
+impl TbOnExprTest for TbOnExprTb
+    clock clk = SysDomain
+
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        dut.en = 1
+        wait 8 cycles
+    end run
+
+    check
+        assert seen == 1
+            else fail("expected exactly one rising-edge firing, seen=${seen}")
+        log(info, "PASS: tb_on_expr fired ${seen} time(s)")
+    end check
+end impl TbOnExprTest
