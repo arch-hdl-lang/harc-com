@@ -293,13 +293,16 @@ pub struct TransactorSchema {
     /// `dut_type` are unused (target transactors drive the bound bus's
     /// req/rsp wires on the DUT instance, not a private DUT handle).
     pub bound_bus: Option<String>,
-    /// Persistent scalar state fields (`read_count : uint<32> default
-    /// 0`) of a bound-to target transactor. They live on a generated
-    /// per-instance C++ struct (mirroring v1's component-instance
-    /// struct), readable/writable from the responder bodies and from
-    /// the test (`target.read_count`). Empty for the unbound BFM form
-    /// (whose state fields are still rejected in that path).
-    pub state_fields: Vec<TbScalarFieldSchema>,
+    /// Persistent state fields of a bound-to target transactor. They
+    /// live on a generated per-instance C++ struct (mirroring v1's
+    /// component-instance struct), readable/writable from the responder
+    /// bodies and from the test (`target.read_count`). A field is either
+    /// a scalar counter (`read_count : uint<32> default 0`) or a typed
+    /// FIFO queue (`pending : queue<Record>` / `queue<uint<32>>`),
+    /// reusing the scoreboard/component `QueueElem` machinery. Empty for
+    /// the unbound BFM form (whose state fields are still rejected in
+    /// that path).
+    pub state_fields: Vec<StateFieldSchema>,
     /// Target-side TLM responder threads (`thread bus.<method>(...)`),
     /// in declaration order. Each has one lowered `TbFunction` body
     /// whose state-field accesses reference `state_fields` by bare name;
@@ -1115,6 +1118,30 @@ pub struct TbScalarFieldSchema {
     pub default: u64,
 }
 
+/// One persistent state field of a bound-to target transactor. A field
+/// is either a scalar counter or a typed FIFO queue, reusing the same
+/// `QueueElem` machinery scoreboards/components already carry so both
+/// seams lower a `queue<Record>` element through the identical shape
+/// (`harc_rt::HarcQueue<Rec>`).
+#[derive(Debug, Clone)]
+pub struct StateFieldSchema {
+    pub name: String,
+    pub kind: StateFieldKind,
+}
+
+/// The kind of a target-transactor persistent state field.
+#[derive(Debug, Clone)]
+pub enum StateFieldKind {
+    /// `read_count : uint<32> default 0` — a scalar host counter/latch.
+    /// `default` is the declared initializer literal (0 fallback).
+    Scalar { ty: IrType, default: u64 },
+    /// `pending : queue<uint<32>>` / `pending : queue<Record>` — a FIFO
+    /// whose element is a scalar ≤ 64 bits or a value-record. Manipulated
+    /// through the state-queue ops (`Stmt::TransactorStateQueuePush`/
+    /// `TransactorStateQueuePop`, `Expr::TransactorStateQueueQuery`).
+    Queue { elem: QueueElem },
+}
+
 /// One test-scope bus binding (`let axil : BusAxiLite = bind dut`).
 /// The binding name doubles as the flat signal prefix on the DUT
 /// (`axil` → `axil_aw_valid`, `axil_read_req_valid`, ...), mirroring
@@ -1382,6 +1409,27 @@ pub enum Stmt {
         instance: String,
         field: String,
         value: Expr,
+    },
+    /// `pending.push(x)` inside a target-responder body (or
+    /// `target.pending.push(x)` from the test): push onto a bound-to
+    /// target transactor's persistent `queue<T>` state field. `instance`
+    /// names the bound testbench-field instance (placeholder in a method
+    /// body, filled at test-binding); emission produces
+    /// `<instance>.<field>.push(<value>)`. A record value lowers to a
+    /// struct push, mirroring `Stmt::ComponentQueuePush`.
+    TransactorStateQueuePush {
+        instance: String,
+        field: String,
+        value: Expr,
+    },
+    /// `let v = pending.pop()` — pop the state queue front into a local.
+    /// Always has a destination (a discarded pop is rejected at lowering,
+    /// matching the scoreboard/component forms). Emitted as
+    /// `<dest> = <instance>.<field>.pop();`.
+    TransactorStateQueuePop {
+        instance: String,
+        field: String,
+        dest: LocalId,
     },
     Log {
         level: LogLevel,
@@ -1775,6 +1823,19 @@ pub enum Expr {
     TransactorState {
         instance: String,
         field: String,
+    },
+    /// A value-producing read on a bound-to target transactor's
+    /// persistent `queue<T>` state field: `pending.size()` /
+    /// `pending.empty()`. Host state — allowed wherever a `Local` is.
+    /// `.pop()` is NOT here (it mutates) — it lowers to
+    /// `Stmt::TransactorStateQueuePop`. Mirrors `ScoreboardQuery` /
+    /// `ComponentQueueQuery` (`query` carries `QueueSize`/`QueueEmpty`).
+    /// `instance` names the bound testbench-field instance (placeholder
+    /// in a method body, filled at test-binding).
+    TransactorStateQueueQuery {
+        instance: String,
+        field: String,
+        query: ScoreboardQuery,
     },
     /// A value-producing scoreboard read on a scoreboard-typed testbench
     /// field: `sb.writes` (scalar), `sb.expected.size()`,

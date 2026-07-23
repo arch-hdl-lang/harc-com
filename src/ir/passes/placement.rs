@@ -322,11 +322,16 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 host_service_only = false;
                 visit_expr(value, &mut accesses, &mut transactor);
             }
-            Stmt::TransactorStateWrite { value, .. } => {
+            Stmt::TransactorStateWrite { value, .. }
+            | Stmt::TransactorStateQueuePush { value, .. } => {
                 // Host state on a transactor-instance struct — no pin
                 // access of its own; the value may carry inline reads.
                 host_service_only = false;
                 visit_expr(value, &mut accesses, &mut transactor);
+            }
+            Stmt::TransactorStateQueuePop { .. } => {
+                // Pop into a host local — pure host state, no value expr.
+                host_service_only = false;
             }
             Stmt::CovReport(_) => {}
             Stmt::ScoreboardOp { op, .. } => {
@@ -503,6 +508,7 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
         | Expr::RecordField { .. }
         | Expr::TbField(_)
         | Expr::TransactorState { .. }
+        | Expr::TransactorStateQueueQuery { .. }
         | Expr::ScoreboardQuery { .. }
         | Expr::ComponentField { .. }
         | Expr::ComponentValue { .. }

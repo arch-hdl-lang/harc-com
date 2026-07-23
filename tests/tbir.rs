@@ -5713,6 +5713,87 @@ fn tlm_target_state_fields_lower() {
     );
 }
 
+/// #494 P0a: a bound-to TARGET transactor may now carry NON-SCALAR
+/// persistent state — a `queue<Record>` and a `queue<scalar>`. The state
+/// fields lower as `StateFieldKind::Queue` reusing the scoreboard/
+/// component `QueueElem` machinery; the responder body's push/pop are
+/// instance-filled to the bound `responder` actor.
+#[test]
+fn target_nonscalar_queue_state_lowers() {
+    let prog = lower_src(&fixture("target_nonscalar_state_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let x = &prog.transactors[0];
+    assert_eq!(x.bound_bus.as_deref(), Some("TlmMemBus"));
+    // Two non-scalar state fields: a record queue and a scalar queue.
+    let names: Vec<&str> = x.state_fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["pending", "log_addrs"]);
+    assert!(matches!(
+        &x.state_fields[0].kind,
+        ir::StateFieldKind::Queue {
+            elem: ir::QueueElem::Record(_)
+        }
+    ));
+    assert!(matches!(
+        &x.state_fields[1].kind,
+        ir::StateFieldKind::Queue {
+            elem: ir::QueueElem::Scalar { signed: false }
+        }
+    ));
+    // The responder body's state-queue push/pop are instance-filled to
+    // the bound `responder` actor (placeholder resolved at test bind).
+    let body = prog.function(x.target_methods[0].function);
+    let has_push = body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+        matches!(
+            s,
+            ir::Stmt::TransactorStateQueuePush { instance, .. } if instance == "responder"
+        )
+    });
+    let has_pop = body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+        matches!(
+            s,
+            ir::Stmt::TransactorStateQueuePop { instance, .. } if instance == "responder"
+        )
+    });
+    assert!(has_push, "responder body must carry instance-filled state-queue push");
+    assert!(has_pop, "responder body must carry instance-filled state-queue pop");
+}
+
+/// #494 P0a: the C++ shape for non-scalar target-transactor state reuses
+/// the scoreboard/component queue machinery verbatim — the per-instance
+/// state struct carries `harc_rt::HarcQueue<Beat>` / `HarcQueue<uint64_t>`
+/// members, and push/pop/size/empty emit the same calls scoreboards do.
+#[test]
+fn target_nonscalar_queue_state_emits_harcqueue() {
+    let cpp = emit_fixture_cpp("target_nonscalar_state_test.harc");
+    // Per-instance state struct members are HarcQueue<T> — record element
+    // by struct name, scalar element widened to uint64_t.
+    assert!(
+        cpp.contains("harc_rt::HarcQueue<Beat> pending;"),
+        "record-queue state member; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("harc_rt::HarcQueue<uint64_t> log_addrs;"),
+        "scalar-queue state member; got:\n{cpp}"
+    );
+    // Push/pop/size on the per-instance struct member.
+    assert!(
+        cpp.contains("responder.pending.push("),
+        "record-queue push; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("responder.pending.pop()"),
+        "record-queue pop; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("(uint64_t)responder.log_addrs.size()"),
+        "size() cast to uint64; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("responder.log_addrs.pop()"),
+        "test-scope scalar-queue pop; got:\n{cpp}"
+    );
+}
+
 /// Nested forwarding: a bound-to responder re-issues a downstream
 /// blocking TLM call (`let raw = back.read(addr)`) against a test-scope
 /// bus binding. The pre-scanned downstream binding makes `back` resolve

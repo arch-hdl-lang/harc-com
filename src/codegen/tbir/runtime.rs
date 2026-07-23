@@ -125,19 +125,33 @@ pub(super) fn target_state_struct_inst(
     out: &mut String,
     schema: &crate::ir::TransactorSchema,
     instance: &str,
+    records: &[crate::ir::RecordSchema],
 ) {
     let ty = format!("_{}_{}_state", schema.name, instance);
     writeln!(out, "{INDENT}struct {ty} {{").ok();
     for f in &schema.state_fields {
-        let (cty, init) = match f.ty {
-            crate::ir::IrType::Bool => (
-                "bool",
-                if f.default != 0 { "true" } else { "false" }.to_string(),
-            ),
-            crate::ir::IrType::SInt(_) => ("int64_t", f.default.to_string()),
-            _ => ("uint64_t", f.default.to_string()),
-        };
-        writeln!(out, "{INDENT}{INDENT}{cty} {} = {init};", f.name).ok();
+        match &f.kind {
+            crate::ir::StateFieldKind::Scalar { ty, default } => {
+                let (cty, init) = match ty {
+                    crate::ir::IrType::Bool => (
+                        "bool",
+                        if *default != 0 { "true" } else { "false" }.to_string(),
+                    ),
+                    crate::ir::IrType::SInt(_) => ("int64_t", default.to_string()),
+                    _ => ("uint64_t", default.to_string()),
+                };
+                writeln!(out, "{INDENT}{INDENT}{cty} {} = {init};", f.name).ok();
+            }
+            crate::ir::StateFieldKind::Queue { elem } => {
+                let elem = queue_elem_cty(elem, records);
+                writeln!(
+                    out,
+                    "{INDENT}{INDENT}harc_rt::HarcQueue<{elem}> {};",
+                    f.name
+                )
+                .ok();
+            }
+        }
     }
     // Activity stamps, mirroring v1's auto-injected component fields
     // (`idle()`/`idle_in()`/`idle_out()` predicate backing).

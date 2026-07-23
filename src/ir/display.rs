@@ -140,7 +140,19 @@ impl Display for TbProgram {
                 }
             }
             for sf in &x.state_fields {
-                writeln!(f, "    state {} = {}", sf.name, sf.default)?;
+                match &sf.kind {
+                    crate::ir::StateFieldKind::Scalar { default, .. } => {
+                        writeln!(f, "    state {} = {}", sf.name, default)?;
+                    }
+                    crate::ir::StateFieldKind::Queue { elem } => {
+                        let e = match elem {
+                            crate::ir::QueueElem::Scalar { signed: true } => "sint".to_string(),
+                            crate::ir::QueueElem::Scalar { signed: false } => "uint".to_string(),
+                            crate::ir::QueueElem::Record(r) => format!("rec{}", r.index()),
+                        };
+                        writeln!(f, "    state {} : queue<{}>", sf.name, e)?;
+                    }
+                }
             }
             for m in &x.methods {
                 let hooks = if m.pre_hooks.is_empty() && m.post_hooks.is_empty() {
@@ -506,6 +518,26 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
                 expr_str(func, value)
             )
         }
+        Stmt::TransactorStateQueuePush {
+            instance,
+            field,
+            value,
+        } => {
+            format!(
+                "TransactorStateQueuePush({instance}.{field}, {})",
+                expr_str(func, value)
+            )
+        }
+        Stmt::TransactorStateQueuePop {
+            instance,
+            field,
+            dest,
+        } => {
+            format!(
+                "TransactorStateQueuePop({}, {instance}.{field})",
+                local_str(func, *dest)
+            )
+        }
         Stmt::Log { level, args } => {
             format!("Log({}, {})", level_str(level), fmt_args_str(func, args))
         }
@@ -853,6 +885,18 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         }
         Expr::TbField(field) => format!("_tb.{field}"),
         Expr::TransactorState { instance, field } => format!("{instance}.{field}"),
+        Expr::TransactorStateQueueQuery {
+            instance,
+            field,
+            query,
+        } => {
+            let q = match query {
+                crate::ir::ScoreboardQuery::QueueSize { .. } => "size",
+                crate::ir::ScoreboardQuery::QueueEmpty { .. } => "empty",
+                crate::ir::ScoreboardQuery::Scalar { .. } => "scalar",
+            };
+            format!("{instance}.{field}.{q}()")
+        }
         Expr::ScoreboardQuery {
             sb,
             field,

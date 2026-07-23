@@ -882,6 +882,26 @@ fn emit_stmt(
             let e = expr_cpp(cx, value)?;
             writeln!(out, "{pad}{instance}.{field} = {e};").ok();
         }
+        // `pending.push(value)` on a bound-to target transactor `queue<T>`
+        // state field — a `harc_rt::HarcQueue<T>` member of the per-
+        // instance struct. Mirrors `ComponentQueuePush`.
+        Stmt::TransactorStateQueuePush {
+            instance,
+            field,
+            value,
+        } => {
+            let e = expr_cpp(cx, value)?;
+            writeln!(out, "{pad}{instance}.{field}.push({e});").ok();
+        }
+        // `let v = pending.pop()` — pop the state-queue front into a local.
+        Stmt::TransactorStateQueuePop {
+            instance,
+            field,
+            dest,
+        } => {
+            let name = &names[dest.index()];
+            writeln!(out, "{pad}{name} = {instance}.{field}.pop();").ok();
+        }
         Stmt::DutWrite(p, e) if matches!(p.access, crate::ir::PortAccess::Force) => {
             // `dut.<force_probe> = expr` → the two-store drv+en pair the
             // bound SV stub picks up to procedurally force the target

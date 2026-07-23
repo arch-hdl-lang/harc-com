@@ -84,12 +84,21 @@ impl FuncBuilder<'_> {
                 // Persistent state field of a bound-to target responder
                 // body — a bare ident (locals shadow, checked above).
                 // `instance` is a placeholder; the test-binding stage
-                // fills it once the passive instance is resolved.
-                if self.target_state_fields.contains(&id.name) {
-                    return Ok(Expr::TransactorState {
-                        instance: String::new(),
-                        field: id.name.clone(),
-                    });
+                // fills it once the passive instance is resolved. A bare
+                // read is only valid for a SCALAR field; a queue field is
+                // read via its ops (`.size()`/`.empty()`/`.pop()`), so a
+                // bare queue ident is rejected precisely.
+                if let Some(kind) = self.target_state_fields.get(&id.name) {
+                    return match kind {
+                        crate::ir::StateFieldKind::Scalar { .. } => Ok(Expr::TransactorState {
+                            instance: String::new(),
+                            field: id.name.clone(),
+                        }),
+                        crate::ir::StateFieldKind::Queue { .. } => Err(unsupported(
+                            &format!("a bare read of the `queue` state field `{}`", id.name),
+                            "read a queue state field via `.size()` / `.empty()` / `.pop()`",
+                        )),
+                    };
                 }
                 if self.is_dut_name(&id.name) {
                     return Err(unsupported(
@@ -357,6 +366,19 @@ impl FuncBuilder<'_> {
                         // `checker.sb.errors.size()` / `.empty()`.
                         // (`.pop()` mutates → statement-only; rejected here.)
                         if let Some(q) = self.lower_component_queue_query(callee, args)? {
+                            return Ok(q);
+                        }
+                        // Bound-to target-responder queue state-field
+                        // value-queries: `pending.size()` / `.empty()`
+                        // (bare field name inside a responder body).
+                        // (`.pop()` mutates → statement-only; rejected here.)
+                        if let Some(q) = self.lower_state_queue_query(callee, args)? {
+                            return Ok(q);
+                        }
+                        // Test-scope target-responder queue state read:
+                        // `target.pending.size()` / `.empty()` (fully
+                        // resolved instance). (`.pop()` → statement-only.)
+                        if let Some(q) = self.lower_test_state_queue_query(callee, args)? {
                             return Ok(q);
                         }
                         // Testbench helper method call (`_tb.reset()`),
@@ -846,6 +868,8 @@ impl FuncBuilder<'_> {
             | Expr::TbField(_)
             // Transactor-instance state is host state — no DUT port inside.
             | Expr::TransactorState { .. }
+            // Target-state queue size/empty reads are host state — no port.
+            | Expr::TransactorStateQueueQuery { .. }
             // Scoreboard reads are host state — no DUT port inside.
             | Expr::ScoreboardQuery { .. }
             // Component fields are host state — no DUT port inside.
@@ -1085,6 +1109,69 @@ impl FuncBuilder<'_> {
             )));
         }
         Ok(Some(Expr::ComponentQueueQuery { base, query }))
+    }
+
+    /// Lower `<field>.size()` / `<field>.empty()` on a bound-to target
+    /// transactor's persistent `queue<T>` state field (a bare field name
+    /// inside a responder body) into an `Expr::TransactorStateQueueQuery`,
+    /// or `None` when `callee` is not a state-queue method access. The
+    /// `instance` is a placeholder filled at test-binding. A `pop()`
+    /// reaching here (deeper than a `let`/assign RHS) is rejected — it
+    /// mutates and must be a statement. Mirrors `lower_component_queue_query`.
+    fn lower_state_queue_query(
+        &self,
+        callee: &AstExpr,
+        args: &[crate::ast::CallArg],
+    ) -> Result<Option<Expr>, LowerError> {
+        let ExprKind::Field { target, name } = &*callee.kind else {
+            return Ok(None);
+        };
+        let ExprKind::Ident(id) = &*target.kind else {
+            return Ok(None);
+        };
+        // A local of the same name shadows the state field (matches the
+        // bare-read resolution order).
+        if self.lookup(&id.name).is_some() {
+            return Ok(None);
+        }
+        if !matches!(
+            self.target_state_fields.get(&id.name),
+            Some(crate::ir::StateFieldKind::Queue { .. })
+        ) {
+            return Ok(None);
+        }
+        let field = id.name.clone();
+        let method = name.name.clone();
+        let query = match method.as_str() {
+            "size" => crate::ir::ScoreboardQuery::QueueSize {
+                queue: field.clone(),
+            },
+            "empty" => crate::ir::ScoreboardQuery::QueueEmpty {
+                queue: field.clone(),
+            },
+            "pop" => {
+                return Err(unsupported(
+                    &format!("target-state `{field}.pop()` in a nested expression"),
+                    "bind it to its own `let` first — `pop` mutates the queue",
+                ));
+            }
+            other => {
+                return Err(unsupported(
+                    &format!("target-state queue method `{field}.{other}(...)`"),
+                    "only `push`/`pop`/`size`/`empty` are lowered",
+                ));
+            }
+        };
+        if !args.is_empty() {
+            return Err(LowerError::Invalid(format!(
+                "target-state `{field}.{method}()` takes no arguments"
+            )));
+        }
+        Ok(Some(Expr::TransactorStateQueueQuery {
+            instance: String::new(),
+            field,
+            query,
+        }))
     }
 
     /// `Some(PortRef)` when the expression is a dotted access rooted at
@@ -1429,9 +1516,101 @@ impl FuncBuilder<'_> {
             _ => return None,
         };
         let fields = self.ctx.target_state.get(&instance)?;
+        // Only a SCALAR field is a bare `target.<field>` read; a queue
+        // field is read via `target.<queue>.size()`/`.empty()`/`.pop()`.
+        matches!(
+            fields.get(&name.name),
+            Some(crate::ir::StateFieldKind::Scalar { .. })
+        )
+        .then(|| (instance, name.name.clone()))
+    }
+
+    /// Recognize a test-scope `target.<queue>.size()` / `.empty()` read
+    /// on a bound-to responder's persistent `queue<T>` state field (fully
+    /// resolved: `instance` is the bound test field). Returns the built
+    /// `Expr::TransactorStateQueueQuery`, or `None` for a non-matching
+    /// shape. A `.pop()` reaching here (nested deeper than a `let`/assign
+    /// RHS) is rejected — it mutates and must be a statement. Mirrors
+    /// `lower_scoreboard_query_call` for the test-scope target-state path.
+    pub(crate) fn lower_test_state_queue_query(
+        &self,
+        callee: &AstExpr,
+        args: &[crate::ast::CallArg],
+    ) -> Result<Option<Expr>, LowerError> {
+        let ExprKind::Field { target, name } = &*callee.kind else {
+            return Ok(None);
+        };
+        // `target.<queue>` (or `_tb.xact.<queue>`): reuse the state-root
+        // resolution — treat the receiver `target` as the state access `e`.
+        let Some((instance, field, kind)) = self.as_transactor_state_any(target) else {
+            return Ok(None);
+        };
+        if !matches!(kind, crate::ir::StateFieldKind::Queue { .. }) {
+            return Ok(None);
+        }
+        let method = name.name.clone();
+        let query = match method.as_str() {
+            "size" => crate::ir::ScoreboardQuery::QueueSize {
+                queue: field.clone(),
+            },
+            "empty" => crate::ir::ScoreboardQuery::QueueEmpty {
+                queue: field.clone(),
+            },
+            "pop" => {
+                return Err(unsupported(
+                    &format!("target-state `{instance}.{field}.pop()` in a nested expression"),
+                    "bind it to its own `let` first — `pop` mutates the queue",
+                ));
+            }
+            other => {
+                return Err(unsupported(
+                    &format!("target-state queue method `{instance}.{field}.{other}(...)`"),
+                    "only `push`/`pop`/`size`/`empty` are lowered",
+                ));
+            }
+        };
+        if !args.is_empty() {
+            return Err(LowerError::Invalid(format!(
+                "target-state `{instance}.{field}.{method}()` takes no arguments"
+            )));
+        }
+        Ok(Some(Expr::TransactorStateQueueQuery {
+            instance,
+            field,
+            query,
+        }))
+    }
+
+    /// Like `as_transactor_state` but returns the field KIND too and does
+    /// not filter on scalar-ness — the callers (`lower_test_state_queue_
+    /// query`, the statement-level test-scope push/pop) select the kind.
+    pub(crate) fn as_transactor_state_any(
+        &self,
+        e: &AstExpr,
+    ) -> Option<(String, String, crate::ir::StateFieldKind)> {
+        let ExprKind::Field { target, name } = &*e.kind else {
+            return None;
+        };
+        let instance = match &*target.kind {
+            ExprKind::Ident(root) => root.name.clone(),
+            ExprKind::Field {
+                target: inner,
+                name: mid,
+            } => {
+                let ExprKind::Ident(root) = &*inner.kind else {
+                    return None;
+                };
+                if Some(root.name.as_str()) != self.ctx.tb_field.as_deref() {
+                    return None;
+                }
+                mid.name.clone()
+            }
+            _ => return None,
+        };
+        let fields = self.ctx.target_state.get(&instance)?;
         fields
-            .contains(&name.name)
-            .then(|| (instance, name.name.clone()))
+            .get(&name.name)
+            .map(|kind| (instance, name.name.clone(), kind.clone()))
     }
 
     /// `Some(PortRef)` (with `lane`) when the expression is a lane

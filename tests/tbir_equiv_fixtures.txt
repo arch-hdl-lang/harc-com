@@ -139,6 +139,7 @@ regblock_subset_test | Top | top_counter.sv | - | pass
 struct_basic_test | Top | top_counter.sv | - | pass
 struct_nested_test | Top | top_counter.sv | - | pass
 tlm_target_thread_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
+target_nonscalar_state_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
 tlm_target_thread_if_test | TlmReadInitiatorPair | TlmReadInitiatorPair.sv | - | pass
 tlm_target_thread_runtime_loop_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv | - | pass
 tlm_target_thread_early_return_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv | - | pass

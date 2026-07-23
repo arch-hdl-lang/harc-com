@@ -368,8 +368,12 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
             ir::ScoreboardOp::QueuePop { .. } => false,
         },
         ComponentEmit { args, .. } | ComponentCall { args, .. } => args.iter().any(expr_has_probe),
-        SeqPush { value, .. } | ComponentQueuePush { value, .. } => expr_has_probe(value),
-        ComponentQueuePop { .. } | ComponentSubAssign { .. } => false,
+        SeqPush { value, .. }
+        | ComponentQueuePush { value, .. }
+        | TransactorStateQueuePush { value, .. } => expr_has_probe(value),
+        ComponentQueuePop { .. }
+        | ComponentSubAssign { .. }
+        | TransactorStateQueuePop { .. } => false,
         TlmFork(desc) => desc.args.iter().any(expr_has_probe),
         TlmJoinAll(pending) => pending.iter().any(|p| p.args.iter().any(expr_has_probe)),
         RecordInit(_, _) | CovReport(_) => false,
@@ -569,8 +573,12 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
         ComponentEmit { args, .. } | ComponentCall { args, .. } => {
             args.iter().for_each(|a| for_each_port_in_expr(a, f))
         }
-        SeqPush { value, .. } | ComponentQueuePush { value, .. } => for_each_port_in_expr(value, f),
-        ComponentQueuePop { .. } | ComponentSubAssign { .. } => {}
+        SeqPush { value, .. }
+        | ComponentQueuePush { value, .. }
+        | TransactorStateQueuePush { value, .. } => for_each_port_in_expr(value, f),
+        ComponentQueuePop { .. }
+        | ComponentSubAssign { .. }
+        | TransactorStateQueuePop { .. } => {}
         TlmFork(desc) => desc.args.iter().for_each(|a| for_each_port_in_expr(a, f)),
         TlmJoinAll(pending) => pending
             .iter()
@@ -1655,7 +1663,7 @@ fn emit_test(
     // lambda references exactly this one instance.
     for (instance, xid) in &tb.unbound_state_actors {
         let schema = prog.transactor(*xid);
-        runtime::target_state_struct_inst(out, schema, instance);
+        runtime::target_state_struct_inst(out, schema, instance, &prog.records);
     }
     // Closure-hook bodies (`on <obj>.<method> pre/post` method hooks and
     // `on regs.REG` per-register write callbacks) — emitted as free
@@ -1704,7 +1712,7 @@ fn emit_test(
     // background-coroutine actor per target method.
     for actor in &tb.target_tlm_actors {
         let schema = prog.transactor(actor.transactor);
-        runtime::target_state_struct_inst(out, schema, &actor.instance);
+        runtime::target_state_struct_inst(out, schema, &actor.instance, &prog.records);
     }
     for actor in &tb.target_tlm_actors {
         func::emit_target_actor(
