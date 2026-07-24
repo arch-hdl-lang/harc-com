@@ -51,6 +51,7 @@ pub const QUEUE_RT_HEADER: &str = include_str!("../../runtime/harc_queue_rt.h");
 pub const TRACE_RT_HEADER: &str = include_str!("../../runtime/harc_trace_rt.h");
 pub const LOG_RT_HEADER: &str = include_str!("../../runtime/harc_log_rt.h");
 pub const Z3_RT_HEADER: &str = include_str!("../../runtime/harc_z3_rt.h");
+pub const COSIM_RT_HEADER: &str = include_str!("../../runtime/harc_cosim_rt.h");
 
 const INDENT: &str = "    ";
 
@@ -370,6 +371,481 @@ pub struct EmitOpts {
     /// pre-existing conservative defaults-only behavior is unchanged.
     pub dut_bus_port_overrides:
         std::collections::HashMap<String, std::collections::HashMap<String, i64>>,
+    /// `harc sim --cosim dpi` (spec §10 DPI-C co-sim pilot). When set,
+    /// the emitted TB is a passive DPI-C runtime instead of a
+    /// self-driving binary: `run_<Test>` becomes a driver coroutine
+    /// that `co_yield`s time requests, `main()` is replaced by the
+    /// `harc_cosim_init` / `harc_cosim_step` entrypoints, and DUT port
+    /// access routes through the id-keyed accessor shim (see
+    /// `runtime/harc_cosim_rt.h`) rather than Verilated member access.
+    /// `None` (the default) leaves the direct-backend emission
+    /// byte-identical.
+    pub cosim: Option<CosimOpts>,
+}
+
+/// One DUT top-module port for co-sim accessor generation, discovered by
+/// `cosim_ports_from_sv`. `sig_id` positions are shared between the
+/// generated SV harness's accessor `case` tables and the TB shim's
+/// `SigProxy<ID>` members — both are generated from the same vector.
+#[derive(Debug, Clone)]
+pub struct CosimPort {
+    pub name: String,
+    pub width_bits: u32,
+    pub is_input: bool,
+}
+
+/// Options for `--cosim dpi` emission, shared by the TB emitter (shim +
+/// entrypoints) and the harness generator in `main.rs`.
+#[derive(Debug, Clone)]
+pub struct CosimOpts {
+    pub ports: Vec<CosimPort>,
+    /// Half period of the implicit TB clock in picoseconds. The direct
+    /// backend's clockless drive loop has no physical time; co-sim needs
+    /// one because the simulator owns a real timeline.
+    pub half_period_ps: u64,
+}
+
+/// Scan the `--sv` sources for the `--top` module and return its full
+/// port table (name, direction, total packed width). Same deliberately
+/// tolerant line-based scan as `vec_lane_widths_from_sv` — ANSI-style
+/// headers with foldable widths. Returns `None` when the top module
+/// isn't found in any source. Ports whose width can't be folded, or
+/// with unpacked (post-name) dimensions, are skipped — a TB referencing
+/// a skipped port fails C++ compilation with a missing-member error.
+pub fn cosim_ports_from_sv(
+    sv_sources: &[std::path::PathBuf],
+    top: &str,
+) -> Option<Vec<CosimPort>> {
+    for path in sv_sources {
+        let Ok(src) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if let Some(ports) = scan_sv_module_ports(&src, top) {
+            return Some(ports);
+        }
+    }
+    None
+}
+
+/// Core of `cosim_ports_from_sv` over one source string. Mirrors
+/// `scan_sv_module_lane_widths`' module discovery, but:
+///   - folds parameter values with a richer const evaluator
+///     (`+ - * / ( )` and `$clog2`), so `localparam int W = $clog2(N)`
+///     chains resolve;
+///   - resolves `typedef logic [..] Name;` and `parameter type Name =
+///     logic [..]` so typedef'd ports get a width;
+///   - scans port declarations only inside the ANSI header (module line
+///     to the header-closing `);`), so `function` arguments deeper in
+///     the body are not mistaken for ports (with a whole-body fallback
+///     for non-ANSI headers).
+fn scan_sv_module_ports(src: &str, top: &str) -> Option<Vec<CosimPort>> {
+    let lines: Vec<&str> = src.lines().collect();
+    let start = lines.iter().position(|l| {
+        let t = l.trim_start();
+        if let Some(rest) = t.strip_prefix("module ") {
+            rest.trim_start().strip_prefix(top).is_some_and(|after| {
+                after
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+            })
+        } else {
+            false
+        }
+    })?;
+    let body = &lines[start..];
+    let end_rel = body
+        .iter()
+        .position(|l| l.trim_start().starts_with("endmodule"))
+        .unwrap_or(body.len());
+    let body = &body[..end_rel];
+
+    // ANSI header extent: everything up to (and including) the first
+    // line whose code content contains the header-closing `);`.
+    let header_end = body
+        .iter()
+        .position(|l| l.contains(");"))
+        .map(|i| i + 1)
+        .unwrap_or(body.len());
+
+    // Pass 1: parameters and type widths, over the WHOLE FILE — file-
+    // scope typedefs above the module are legal and used by the DUT
+    // corpus. Struct typedefs can span lines, so track an open
+    // `typedef struct packed { ... }` block and sum its member widths.
+    let mut params: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut typedefs: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut struct_accum: Option<u64> = None;
+    for l in &lines {
+        let t = l.trim();
+        if let Some(acc) = struct_accum {
+            if let Some(rest) = t.strip_prefix('}') {
+                let name: String = rest
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() && acc > 0 {
+                    typedefs.insert(name, acc.min(u32::MAX as u64) as u32);
+                }
+                struct_accum = None;
+            } else if let Some((_, w)) = sv_typedef_width(t, &params) {
+                struct_accum = Some(acc + w as u64);
+            } else {
+                // Unparseable member — poison the accumulated width so
+                // the struct never gets a wrong size.
+                struct_accum = Some(0);
+            }
+            continue;
+        }
+        if t.starts_with("typedef struct packed") {
+            struct_accum = Some(0);
+            continue;
+        }
+        // `typedef logic [hi:lo]... Name;`
+        if let Some(rest) = t.strip_prefix("typedef ") {
+            if let Some((name, w)) = sv_typedef_width(rest, &params) {
+                typedefs.insert(name, w);
+            }
+            continue;
+        }
+        for kw in [
+            "parameter type ",
+            "localparam type ",
+            "parameter int ",
+            "parameter ",
+            "localparam int ",
+            "localparam ",
+        ] {
+            let Some(rest) = t.strip_prefix(kw) else {
+                continue;
+            };
+            let Some(eq) = rest.find('=') else { break };
+            let name = rest[..eq].trim();
+            let name = name
+                .split_whitespace()
+                .last()
+                .unwrap_or(name)
+                .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
+            let mut val = rest[eq + 1..].trim();
+            // Values end at the parameter-list comma or statement end.
+            if let Some(cut) = val.find([',', ';']) {
+                val = &val[..cut];
+            }
+            let val = val.trim();
+            if kw.contains("type") {
+                // `parameter type DATA = logic [32-1:0]` — record like a
+                // typedef.
+                if let Some((_, w)) = sv_typedef_width(&format!("{} {name};", rest[eq + 1..].trim()), &params)
+                {
+                    typedefs.insert(name.to_string(), w);
+                }
+            } else {
+                // The last parameter before the header's `) (` can carry
+                // the closing paren on the same line — retry with it
+                // stripped when the raw text doesn't evaluate.
+                let v = eval_sv_const_expr(val, &params).or_else(|| {
+                    eval_sv_const_expr(val.trim_end_matches(')'), &params)
+                });
+                if let Some(v) = v {
+                    params.insert(name.to_string(), v);
+                }
+            }
+            break;
+        }
+    }
+
+    // Pass 2: port declarations (header first, whole body as fallback).
+    let scan_ports = |range: &[&str]| -> Vec<CosimPort> {
+        let mut out = Vec::new();
+        for l in range {
+            let t = l.trim();
+            let (is_input, after_dir) = if let Some(r) = t.strip_prefix("input ") {
+                (true, r)
+            } else if let Some(r) = t.strip_prefix("output ") {
+                (false, r)
+            } else {
+                continue; // `inout` and non-port lines are skipped
+            };
+            let mut rest = after_dir.trim();
+            for q in ["logic", "wire", "reg", "bit", "signed", "unsigned"] {
+                if let Some(r) = rest.strip_prefix(q) {
+                    if r.starts_with(|c: char| c.is_whitespace() || c == '[') {
+                        rest = r.trim_start();
+                    }
+                }
+            }
+            // A leading identifier after qualifier stripping is either
+            // the port name itself (`input clk,`) or a user type
+            // (`input DATA name`). It is a type only when another
+            // identifier follows (past any packed dims): resolve it
+            // through the typedef table, or skip the port when the
+            // type's width is unknown.
+            let mut type_width: Option<u32> = None;
+            if rest.starts_with(|c: char| c.is_alphabetic() || c == '_') {
+                let tok: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                let after_tok = rest[tok.len()..].trim_start();
+                let mut peek = after_tok;
+                while peek.starts_with('[') {
+                    match peek.find(']') {
+                        Some(c) => peek = peek[c + 1..].trim_start(),
+                        None => break,
+                    }
+                }
+                if peek.starts_with(|c: char| c.is_alphabetic() || c == '_') {
+                    match typedefs.get(&tok) {
+                        Some(&w) => {
+                            type_width = Some(w);
+                            rest = after_tok;
+                        }
+                        None => continue,
+                    }
+                }
+            }
+            let mut width: u64 = type_width.unwrap_or(1) as u64;
+            let mut cur = rest;
+            let mut foldable = true;
+            while cur.starts_with('[') {
+                let Some(close) = cur.find(']') else {
+                    foldable = false;
+                    break;
+                };
+                match sv_const_range_width(&cur[1..close], &params) {
+                    Some(w) => width = width.saturating_mul(w as u64),
+                    None => foldable = false,
+                }
+                cur = cur[close + 1..].trim_start();
+            }
+            if !foldable {
+                continue;
+            }
+            let name: String = cur
+                .trim()
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            let after_name = cur[name.len()..].trim_start();
+            // Unpacked (post-name) dimension, or a second identifier
+            // (unresolved `<Type> <name>` shape): skip — the accessor
+            // ABI can't represent it. A TB referencing the port fails
+            // with a clear missing-member error.
+            if after_name.starts_with('[')
+                || after_name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphabetic() || c == '_')
+            {
+                continue;
+            }
+            out.push(CosimPort {
+                name,
+                width_bits: width.min(u32::MAX as u64) as u32,
+                is_input,
+            });
+        }
+        out
+    };
+
+    let mut out = scan_ports(&body[..header_end]);
+    if out.is_empty() {
+        out = scan_ports(body);
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// `logic [hi:lo]... Name` (the tail of a typedef or a `parameter type`
+/// value) → `(Name, total packed width)`.
+fn sv_typedef_width(
+    decl: &str,
+    params: &std::collections::HashMap<String, i64>,
+) -> Option<(String, u32)> {
+    let mut rest = decl.trim();
+    let mut saw_base = false;
+    for q in ["logic", "wire", "reg", "bit", "signed", "unsigned"] {
+        if let Some(r) = rest.strip_prefix(q) {
+            if r.starts_with(|c: char| c.is_whitespace() || c == '[') || r.starts_with(';') {
+                rest = r.trim_start();
+                saw_base = true;
+            }
+        }
+    }
+    if !saw_base {
+        return None;
+    }
+    let mut width: u64 = 1;
+    while rest.starts_with('[') {
+        let close = rest.find(']')?;
+        width = width.saturating_mul(sv_const_range_width(&rest[1..close], params)? as u64);
+        rest = rest[close + 1..].trim_start();
+    }
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, width.min(u32::MAX as u64) as u32))
+}
+
+/// `[hi:lo]` width via the richer const evaluator.
+fn sv_const_range_width(
+    range: &str,
+    params: &std::collections::HashMap<String, i64>,
+) -> Option<u32> {
+    let (hi_s, lo_s) = range.split_once(':')?;
+    let hi = eval_sv_const_expr(hi_s.trim(), params)?;
+    let lo = eval_sv_const_expr(lo_s.trim(), params)?;
+    if hi < lo {
+        return None;
+    }
+    Some((hi - lo + 1) as u32)
+}
+
+/// Small recursive-descent evaluator for SV constant expressions in
+/// module headers: integers, parameter names, `+ - * /`, parentheses,
+/// and `$clog2(...)`. Anything else folds to `None` (the port is then
+/// skipped, never mis-sized).
+fn eval_sv_const_expr(e: &str, params: &std::collections::HashMap<String, i64>) -> Option<i64> {
+    struct P<'a> {
+        s: &'a [u8],
+        i: usize,
+        params: &'a std::collections::HashMap<String, i64>,
+    }
+    impl<'a> P<'a> {
+        fn ws(&mut self) {
+            while self.i < self.s.len() && self.s[self.i].is_ascii_whitespace() {
+                self.i += 1;
+            }
+        }
+        fn expr(&mut self) -> Option<i64> {
+            let mut v = self.term()?;
+            loop {
+                self.ws();
+                match self.s.get(self.i) {
+                    Some(b'+') => {
+                        self.i += 1;
+                        v += self.term()?;
+                    }
+                    Some(b'-') => {
+                        self.i += 1;
+                        v -= self.term()?;
+                    }
+                    _ => return Some(v),
+                }
+            }
+        }
+        fn term(&mut self) -> Option<i64> {
+            let mut v = self.atom()?;
+            loop {
+                self.ws();
+                match self.s.get(self.i) {
+                    Some(b'*') => {
+                        self.i += 1;
+                        v *= self.atom()?;
+                    }
+                    Some(b'/') => {
+                        self.i += 1;
+                        let d = self.atom()?;
+                        if d == 0 {
+                            return None;
+                        }
+                        v /= d;
+                    }
+                    _ => return Some(v),
+                }
+            }
+        }
+        fn atom(&mut self) -> Option<i64> {
+            self.ws();
+            match self.s.get(self.i)? {
+                b'(' => {
+                    self.i += 1;
+                    let v = self.expr()?;
+                    self.ws();
+                    if self.s.get(self.i) != Some(&b')') {
+                        return None;
+                    }
+                    self.i += 1;
+                    Some(v)
+                }
+                b'-' => {
+                    self.i += 1;
+                    Some(-self.atom()?)
+                }
+                b'$' => {
+                    let rest = &self.s[self.i..];
+                    if !rest.starts_with(b"$clog2") {
+                        return None;
+                    }
+                    self.i += 6;
+                    self.ws();
+                    if self.s.get(self.i) != Some(&b'(') {
+                        return None;
+                    }
+                    self.i += 1;
+                    let v = self.expr()?;
+                    self.ws();
+                    if self.s.get(self.i) != Some(&b')') {
+                        return None;
+                    }
+                    self.i += 1;
+                    if v <= 0 {
+                        return Some(0);
+                    }
+                    Some(64 - ((v - 1) as u64).leading_zeros() as i64)
+                }
+                c if c.is_ascii_digit() => {
+                    let mut v: i64 = 0;
+                    while let Some(c) = self.s.get(self.i) {
+                        if c.is_ascii_digit() {
+                            v = v.checked_mul(10)?.checked_add((c - b'0') as i64)?;
+                            self.i += 1;
+                        } else if *c == b'\'' {
+                            // Sized literal (`32'h...`): too rare in
+                            // header widths to justify parsing.
+                            return None;
+                        } else {
+                            break;
+                        }
+                    }
+                    Some(v)
+                }
+                c if c.is_ascii_alphabetic() || *c == b'_' => {
+                    let start = self.i;
+                    while let Some(c) = self.s.get(self.i) {
+                        if c.is_ascii_alphanumeric() || *c == b'_' {
+                            self.i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    let name = std::str::from_utf8(&self.s[start..self.i]).ok()?;
+                    self.params.get(name).copied()
+                }
+                _ => None,
+            }
+        }
+    }
+    let mut p = P {
+        s: e.as_bytes(),
+        i: 0,
+        params,
+    };
+    let v = p.expr()?;
+    p.ws();
+    if p.i != p.s.len() {
+        return None;
+    }
+    Some(v)
 }
 
 #[derive(Debug, Clone)]

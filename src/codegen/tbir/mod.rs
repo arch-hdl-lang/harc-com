@@ -85,12 +85,30 @@ pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<Stri
     // member in `V<Top>.h` is only a forward-declared pointer. Mirrors
     // v1's `aggregated_probes` include gate. See docs/probe-signals.md.
     let has_probes = program_has_probes(&prog);
+    if opts.cosim.is_some() {
+        if has_probes {
+            return Err(EmitError(
+                "--cosim dpi does not support probe signals yet (probes need \
+                 `dut->rootp->` hierarchical access into the Verilated model, \
+                 which lives inside the simulator on the co-sim path)"
+                    .into(),
+            ));
+        }
+        if opts.mt {
+            return Err(EmitError(
+                "--cosim dpi does not support --mt yet (actor worker threads \
+                 would call into simulator-owned state outside a DPI entrypoint)"
+                    .into(),
+            ));
+        }
+    }
     runtime::preamble(
         &mut out,
         &dut_type,
         &test_names,
         &problem_table_cpp,
         has_probes,
+        opts.cosim.as_ref(),
     );
 
     // Transaction value-record structs, in declaration order. Mirrors
@@ -208,7 +226,15 @@ pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<Stri
         emit_test(&mut out, prog, t, &dut_type, opts, &randomize_snippets)?;
     }
 
-    runtime::dispatcher(&mut out, &test_names);
+    if opts.cosim.is_some() {
+        runtime::cosim_entrypoints(
+            &mut out,
+            &test_names,
+            opts.cosim.as_ref().map(|c| c.half_period_ps).unwrap_or(5000),
+        );
+    } else {
+        runtime::dispatcher(&mut out, &test_names);
+    }
     Ok(out)
 }
 
@@ -228,6 +254,14 @@ pub fn emit_split_tests_with_file_prefix(
     let group_size = group_size.max(1);
     if prog.tests.is_empty() {
         return Err(EmitError("no `test` declaration found".into()));
+    }
+    if opts.cosim.is_some() {
+        return Err(EmitError(
+            "--cosim dpi does not support split-test builds yet (the split \
+             dispatcher links against per-shard `main()` functions; co-sim \
+             emission replaces `main()` with DPI entrypoints)"
+                .into(),
+        ));
     }
     validate_tests_share_dut(prog, "one split binary")?;
 
@@ -1466,6 +1500,14 @@ fn emit_test(
 ) -> Result<(), EmitError> {
     let tb = prog.testbench(test.testbench);
     let clocked = !test.clocks.is_empty();
+    let cosim = opts.cosim.is_some();
+    // Declared clocks work under co-sim without a dedicated lowering:
+    // the clocked scheduler's `dut-><clk> = level` writes go through the
+    // DPI setter (real SV edges) and its `dut->eval()` calls map to
+    // bridge settles, so the simulator sees the correct edge SEQUENCE.
+    // Physical time is compressed (1 ps per edge instead of the declared
+    // period) — fine for cycle-based tests; delay-dependent DUTs need
+    // the future timing-faithful clocked lowering.
     let mt = opts.mt;
     // `(sched_var, slot_var)` pairs for actors that run on a dedicated
     // OS worker thread under `--mt`. Empty in cooperative mode (actor
@@ -1473,7 +1515,7 @@ fn emit_test(
     // emitted; consumed by the worker-spawn / barrier dance below.
     let mut actor_threads: Vec<(String, String)> = Vec::new();
 
-    runtime::run_prologue(out, &test.name, dut_type);
+    runtime::run_prologue(out, &test.name, dut_type, cosim);
     if clocked {
         runtime::clocked_scheduler(out, &test.clocks);
     } else {
@@ -1900,6 +1942,6 @@ fn emit_test(
     runtime::mt_worker_setup(out, &actor_threads);
     runtime::drive_loop(out, clocked, &actor_threads);
     runtime::mt_worker_shutdown(out, &actor_threads);
-    runtime::run_epilogue(out);
+    runtime::run_epilogue(out, cosim);
     Ok(())
 }

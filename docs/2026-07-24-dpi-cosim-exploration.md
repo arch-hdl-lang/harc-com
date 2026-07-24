@@ -1,7 +1,10 @@
 # DPI-C co-sim with HDL simulators: exploration + working spike (Verilator, Icarus)
 
 **Date:** 2026-07-24
-**Status:** 🔬 Exploration — working spike in `spikes/dpi-cosim/`, no compiler integration yet.
+**Status:** ✅ Implemented (same day) — `harc sim --sv ... --cosim dpi` ships the
+backend; see *Implementation* at the end. The hand-written spike in
+`spikes/dpi-cosim/` remains as the contract's minimal reproduction (and the
+only Icarus/VPI demonstration).
 **Related:** spec §10 "Verilator DPI-C co-sim pilot" / "Commercial-simulator co-sim" (spec.md:2527–2542)
 
 ---
@@ -250,3 +253,104 @@ HARC_COSIM_DEBUG=1 ./spikes/dpi-cosim/run_verilator.sh        # per-cycle signal
 
 Both scripts exit nonzero unless the sim prints `ALL TESTS PASSED`
 (same marker `tests/run_fixtures.sh` asserts).
+
+---
+
+## Implementation (landed 2026-07-24): `harc sim --sv ... --cosim dpi`
+
+The proposed integration above was implemented the same day, with one
+significant architecture change discovered during regression bring-up.
+
+### What shipped
+
+- **CLI:** `--cosim dpi` on `harc sim` (requires `--sv`; rejects `--waves`,
+  `--coverage`, `--mt`, `--cpp-split tests`, `--check-backends`, and probe
+  tests with targeted diagnostics).
+- **Port discovery** (`cosim_ports_from_sv`, `src/codegen/cpp_tb.rs`): a
+  tolerant scan of the `--top` module's ANSI header — direction + total
+  packed width per port. Folds parameter/localparam chains with a small
+  const-expression evaluator (`+ - * / ( )`, `$clog2`), resolves
+  `typedef logic [..] T` / `typedef struct packed {…} T` /
+  `parameter type T = …` widths, and is bounded to the header so
+  `function` arguments in the body are never mistaken for ports.
+- **Generated SV harness** (`HarcCosimTop.sv`, emitted per build):
+  instantiates the DUT, exports id-keyed accessors (`harc_sv_get/set`
+  for ≤64-bit ports, `harc_sv_get_word/set_word` 32-bit-word accessors
+  for wider ones), and runs a single timed master process implementing
+  the step protocol (`advance N ps` / `settle 1 ps` / done). `timescale
+  1ps/1ps` with integer delays — a coarser unit rounded the 1 ps settle
+  to a ZERO delay, freezing sim time and collapsing every clock edge
+  into one timestep.
+- **DUT shim** (emitted in the TB preamble): a struct named `V<Top>` whose
+  members are `SigProxy<ID>` / `WideSigProxy<ID, NWORDS>`
+  (`runtime/harc_cosim_rt.h`), so every `dut-><port>` access site in the
+  existing TB-IR emission compiles unchanged. Proxy writes land as SV
+  variable assignments inside the exported accessor — the simulator
+  schedules re-evaluation itself, which is what raw `--public-flat-rw`
+  pokes get wrong. `dut->eval()` maps to a 1 ps settle.
+- **Build/run:** `run_verilator` swaps `--cc --exe --build` +
+  `--no-timing` for `--binary --timing` with the harness as top;
+  test selection flows through `HARC_TEST` (Verilator owns argv).
+- **Runner:** `tests/run_cosim_fixtures.sh` — the full fixture table
+  through the co-sim backend via `HARC_SIM_EXTRA_ARGS="--cosim dpi"`.
+
+### The architecture change: thread bridge, not driver coroutine
+
+The exploration proposed emitting the drive loop as a C++20 coroutine
+that `co_yield`s time requests. That worked for simple fixtures but
+cannot cover HARC's synchronous cycle-advance paths: helper functions
+containing `wait`, and blocking TLM/bus calls, lower to plain functions
+that call `tick()` — a position a coroutine cannot yield from. (First
+seen as `rom_lut_test` reading all-zero data: its `read_addr` helper
+advanced HARC cycles while simulator time stood still.)
+
+The shipped design runs `run_<Test>` unchanged on a dedicated OS thread
+under a **strict handshake** (`Bridge` in `runtime/harc_cosim_rt.h`):
+exactly one of {simulator thread, TB thread} is ever runnable, and the
+simulator thread is parked inside the `harc_cosim_step` DPI import the
+entire time the TB runs — every TB-side access to simulator state still
+happens inside a DPI entrypoint by delegation, honoring spec §10's
+no-concurrent-access intent. "Yield to simulator" is now a plain
+blocking call, legal from any emission context, so the direct backend's
+entire synchronous machinery (helpers, TLM targets, transactor methods,
+RAL) works under co-sim without emission changes. Verilator-specific
+detail: the export trampolines resolve context/scope through
+thread-locals, so the bridge captures `Verilated::threadContextp()` +
+`svGetScope()` in `harc_cosim_init` and installs them on the TB thread.
+
+Declared clocks needed no dedicated lowering: the clocked scheduler's
+`dut-><clk> = level` writes are real SV edges through the DPI setter and
+its `dut->eval()` calls are settles, so the simulator sees the correct
+edge *sequence* — with time compressed (1 ps per edge instead of the
+declared period). Fine for cycle-based tests; delay-dependent DUTs need
+a future timing-faithful clocked lowering.
+
+### Regression results (Verilator 5.034, clang, this container)
+
+| Suite | Result |
+|---|---|
+| Direct backend (`tests/run_fixtures.sh`) | **130 / 130** — unchanged by the integration |
+| Co-sim backend (`tests/run_cosim_fixtures.sh`) | **125 / 130** |
+| `cargo test --release` | green (default-mode emission byte-identical) |
+
+The 5 co-sim failures are the two documented v0 gaps:
+
+- `probe_basic_test`, `probe_force_test`, `testbench_probe_dut_test` —
+  probes need hierarchical access into the Verilated model, which lives
+  inside the simulator on this path (rejected with a diagnostic).
+- `packed_vec_lane_test`, `vec_lane_var_index_test` — true SystemVerilog
+  *unpacked-array* ports (`input logic [7:0] p [N]`); the scalar/word
+  accessor ABI has no element representation yet (skipped by the port
+  scanner; the TB fails with a missing-member error naming the port).
+
+Everything else — TLM targets/initiators, blocking bus calls, RAL
+regblocks, transactors, scoreboards, covergroups, watchdogs, multi-clock
+tests, randomize/Z3, 128-bit+ wide ports, extern-fn reference models —
+passes through the co-sim backend with observable results matching the
+direct backend.
+
+### Cost
+
+The sync_fifo 1M-cycle soak (spike numbers, same contract): co-sim is
+~0.5× the direct backend on a boundary-heavy workload — the direct
+backend remains the default fast path, exactly as spec §10 intends.
