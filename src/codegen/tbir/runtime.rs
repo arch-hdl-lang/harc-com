@@ -34,7 +34,9 @@ pub(super) fn preamble(
     // only forward-declared in `V<Top>.h`, so pull in the root struct's
     // full definition. Gated on probe use (mirrors v1's
     // `aggregated_probes` include gate). See docs/probe-signals.md.
-    if has_probes {
+    // In co-sim mode the shim provides its own `rootp` of probe
+    // accessor proxies — no Verilated root header exists to include.
+    if has_probes && cosim.is_none() {
         writeln!(out, "#include \"V{dut_type}___024root.h\"").ok();
     }
     out.push_str(
@@ -192,6 +194,37 @@ fn cosim_dut_shim(out: &mut String, dut_type: &str, co: &crate::codegen::cpp_tb:
             p.name
         )
         .ok();
+    }
+    // Probe accessors: the emission reads probes as
+    // `dut->rootp-><Verilator-mangled name>` (and writes the `_drv` /
+    // `_en` siblings for force probes) — provide a `rootp` whose members
+    // carry exactly those names, backed by accessor proxies keyed to the
+    // harness's hierarchical references into the bound probe stub.
+    if !co.probes.is_empty() {
+        writeln!(out, "{INDENT}struct _HarcCosimRoot {{").ok();
+        for (probe, (read_id, force_ids)) in co.probes.iter().zip(co.probe_ids()) {
+            let mangled = crate::codegen::sv_stub::mangled_accessor(dut_type, &probe.name);
+            writeln!(
+                out,
+                "{INDENT}{INDENT}harc_rt::cosim::SigProxy<{read_id}> {mangled};"
+            )
+            .ok();
+            if let Some((drv_id, en_id)) = force_ids {
+                writeln!(
+                    out,
+                    "{INDENT}{INDENT}harc_rt::cosim::SigProxy<{drv_id}> {mangled}_drv;"
+                )
+                .ok();
+                writeln!(
+                    out,
+                    "{INDENT}{INDENT}harc_rt::cosim::SigProxy<{en_id}> {mangled}_en;"
+                )
+                .ok();
+            }
+        }
+        writeln!(out, "{INDENT}}};").ok();
+        writeln!(out, "{INDENT}_HarcCosimRoot _harc_root;").ok();
+        writeln!(out, "{INDENT}_HarcCosimRoot* rootp = &_harc_root;").ok();
     }
     // eval() maps to a 1 ps bridge settle: the direct backend calls it
     // after mid-cycle drives (post-eval services, blocking-call loops)

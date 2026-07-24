@@ -137,10 +137,13 @@ simulator-owned-time contract expected from commercial-simulator
 backends (and it schedules DUT-internal `#delay`s, which the direct
 path's `--no-timing` elides).
 
-v0 limitations: no probes, no `--mt`, no `--waves`/`--coverage` (these
-belong to the simulator on this path), no `--cpp-split tests`.
-Unpacked-array ports are supported for a single unpacked dimension with
-≤ 64-bit elements. Run the fixture suite through it with
+v0 limitations: no `--mt`, no `--waves`/`--coverage` (these belong to
+the simulator on this path), no `--cpp-split tests`. Probes (including
+`probe force`) work through the same bound SV stub as the direct
+backend; unpacked-array ports are supported for a single unpacked
+dimension with ≤ 64-bit elements; ports and probes are limited to
+≤ 64-bit scalars except packed ports, which may be arbitrarily wide.
+Run the fixture suite through it with
 `tests/run_cosim_fixtures.sh`. Design notes and support matrix:
 `docs/2026-07-24-dpi-cosim-exploration.md`.
 

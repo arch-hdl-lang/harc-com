@@ -330,14 +330,18 @@ a future timing-faithful clocked lowering.
 | Suite | Result |
 |---|---|
 | Direct backend (`tests/run_fixtures.sh`) | **130 / 130** — unchanged by the integration |
-| Co-sim backend (`tests/run_cosim_fixtures.sh`) | **127 / 130** |
+| Co-sim backend (`tests/run_cosim_fixtures.sh`) | **130 / 130** — full fixture parity |
 | `cargo test --release` | green (default-mode emission byte-identical) |
 
-The 3 co-sim failures are the one remaining documented v0 gap:
-
-- `probe_basic_test`, `probe_force_test`, `testbench_probe_dut_test` —
-  probes need hierarchical access into the Verilated model, which lives
-  inside the simulator on this path (rejected with a diagnostic).
+Probes (read-only AND force) work through the same bound
+`__harc_probe_<T>` SV stub the direct backend uses: the stub is plain
+DUT-side SV, so `bind` works identically in the co-sim build, and the
+harness reaches its signals hierarchically (`dut.harc_probes.<name>`,
+plus `<name>_drv`/`<name>_en` for force). On the TB side the shim grows
+a `rootp` member whose fields carry the exact Verilator-mangled names
+the emission generates (`<T>__DOT__harc_probes__DOT__<name>`), each an
+accessor proxy — so probe reads, force writes, and `release` compile
+unchanged. Probes wider than 64 bits are rejected with a diagnostic.
 
 Unpacked-array ports (`input logic [7:0] p [N]`, single dimension,
 elements ≤ 64 bits) are supported through a third accessor pair

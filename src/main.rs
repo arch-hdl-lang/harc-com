@@ -1602,6 +1602,15 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
         }
         let _ = writeln!(s, "      {id}: return longint'({});", p.name);
     }
+    // Probe reads: the bound stub instance's read-side alias,
+    // hierarchically (`bind <Top> __harc_probe_<Top> harc_probes ()`).
+    for (probe, (read_id, _)) in co.probes.iter().zip(co.probe_ids()) {
+        let _ = writeln!(
+            s,
+            "      {read_id}: return longint'(dut.harc_probes.{});",
+            probe.name
+        );
+    }
     let _ = writeln!(s, "      default: return 0;");
     let _ = writeln!(s, "    endcase");
     let _ = writeln!(s, "  endfunction");
@@ -1619,6 +1628,24 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
         } else {
             let _ = writeln!(s, "      {id}: {} = value[{}:0];", p.name, p.width_bits - 1);
         }
+    }
+    // Force-probe drive/enable writes into the bound stub; its
+    // always_comb applies/releases the SV `force` on the target.
+    for (probe, (_, force_ids)) in co.probes.iter().zip(co.probe_ids()) {
+        let Some((drv_id, en_id)) = force_ids else {
+            continue;
+        };
+        if probe.width_bits == 1 {
+            let _ = writeln!(s, "      {drv_id}: dut.harc_probes.{}_drv = value[0];", probe.name);
+        } else {
+            let _ = writeln!(
+                s,
+                "      {drv_id}: dut.harc_probes.{}_drv = value[{}:0];",
+                probe.name,
+                probe.width_bits - 1
+            );
+        }
+        let _ = writeln!(s, "      {en_id}: dut.harc_probes.{}_en = value[0];", probe.name);
     }
     let _ = writeln!(s, "      default: ;");
     let _ = writeln!(s, "    endcase");
@@ -2260,8 +2287,31 @@ fn cmd_sim(
                     top_for_scan
                 )
             })?;
+        // Probes route through the same bound SV stub as the direct
+        // backend; the harness reaches its signals hierarchically. Only
+        // the accessor width is constrained (<= 64 bits, like ports).
+        let mut probes = Vec::new();
+        if let Some((_, probe_decls)) = harc::codegen::cpp_tb::dut_probes(&codegen_source) {
+            for pr in &probe_decls {
+                let width = harc::codegen::sv_stub::probe_width_bits(&pr.ty).unwrap_or(1);
+                if width > 64 {
+                    return Err(miette::miette!(
+                        "--cosim dpi: probe `{}` is {} bits wide; probes wider than \
+                         64 bits are not supported yet on the co-sim path",
+                        pr.name.name,
+                        width
+                    ));
+                }
+                probes.push(harc::codegen::cpp_tb::CosimProbe {
+                    name: pr.name.name.clone(),
+                    width_bits: width,
+                    force: pr.force,
+                });
+            }
+        }
         Some(harc::codegen::cpp_tb::CosimOpts {
             ports,
+            probes,
             // 5 ns half period (100 MHz) — arbitrary but stable; HARC test
             // semantics are cycle-based, not wall-time-based.
             half_period_ps: 5000,

@@ -86,14 +86,6 @@ pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<Stri
     // v1's `aggregated_probes` include gate. See docs/probe-signals.md.
     let has_probes = program_has_probes(&prog);
     if opts.cosim.is_some() {
-        if has_probes {
-            return Err(EmitError(
-                "--cosim dpi does not support probe signals yet (probes need \
-                 `dut->rootp->` hierarchical access into the Verilated model, \
-                 which lives inside the simulator on the co-sim path)"
-                    .into(),
-            ));
-        }
         if opts.mt {
             return Err(EmitError(
                 "--cosim dpi does not support --mt yet (actor worker threads \

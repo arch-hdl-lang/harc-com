@@ -399,15 +399,54 @@ pub struct CosimPort {
     pub unpacked_elems: Option<u32>,
 }
 
+/// One `probe` declaration routed through the co-sim accessors. The
+/// probe's signals live in the bound `__harc_probe_<T>` stub (the same
+/// stub the direct backend uses); the harness reaches them
+/// hierarchically as `dut.harc_probes.<name>` and, for force probes,
+/// `dut.harc_probes.<name>_drv` / `<name>_en`.
+#[derive(Debug, Clone)]
+pub struct CosimProbe {
+    pub name: String,
+    pub width_bits: u32,
+    pub force: bool,
+}
+
 /// Options for `--cosim dpi` emission, shared by the TB emitter (shim +
 /// entrypoints) and the harness generator in `main.rs`.
 #[derive(Debug, Clone)]
 pub struct CosimOpts {
     pub ports: Vec<CosimPort>,
+    pub probes: Vec<CosimProbe>,
     /// Half period of the implicit TB clock in picoseconds. The direct
     /// backend's clockless drive loop has no physical time; co-sim needs
     /// one because the simulator owns a real timeline.
     pub half_period_ps: u64,
+}
+
+impl CosimOpts {
+    /// Accessor ids for each probe, continuing after the port ids —
+    /// `(read_id, Some((drv_id, en_id)))` for force probes. The harness
+    /// case tables and the shim's `rootp` proxy members are both
+    /// generated from this one assignment so they can never skew.
+    pub fn probe_ids(&self) -> Vec<(usize, Option<(usize, usize)>)> {
+        let mut next = self.ports.len();
+        self.probes
+            .iter()
+            .map(|p| {
+                let read = next;
+                next += 1;
+                let force = if p.force {
+                    let drv = next;
+                    let en = next + 1;
+                    next += 2;
+                    Some((drv, en))
+                } else {
+                    None
+                };
+                (read, force)
+            })
+            .collect()
+    }
 }
 
 /// Scan the `--sv` sources for the `--top` module and return its full
