@@ -4483,6 +4483,59 @@ end impl XtAcyclicChainTest
     verify::verify_program(&prog).expect("verifies");
 }
 
+/// Env-held DUT-poking BFMs route through the component path rather than
+/// `TbProgram::transactors`, but their bare sibling calls still lower to
+/// synchronous `TransactorSelfCall`s. The recursion guard must therefore
+/// cover componentized transactors too.
+#[test]
+fn env_held_transactor_method_mutual_recursion_is_rejected() {
+    let src = r#"
+transactor Xt
+    dut : Top
+
+    when active
+        hookable ping()
+            dut.en = 1
+            wait 1 cycle
+            pong()
+        end ping
+
+        hookable pong()
+            dut.en = 0
+            wait 1 cycle
+            ping()
+        end pong
+    end when
+end transactor Xt
+
+env E
+    drv : Xt active
+end env E
+
+testbench Tb
+    dut : Top
+    env : E
+end testbench Tb
+
+impl Repro for Tb
+    run
+        env.drv.dut = dut
+        env.drv.ping()
+    end run
+end impl Repro
+"#;
+    let err = lower_src(src).unwrap_err();
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)),
+        "expected LowerError::Invalid for env-held mutual recursion: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("recursive method-call cycle") && msg.contains("ping") && msg.contains("pong"),
+        "diagnostic should render the env-held ping/pong cycle: {msg}"
+    );
+}
+
 #[test]
 fn testbench_helper_wrapper_can_call_active_transactor_method() {
     let src = r#"
