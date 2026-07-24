@@ -471,19 +471,27 @@ pub fn cosim_ports_from_sv(
     None
 }
 
-/// Core of `cosim_ports_from_sv` over one source string. Mirrors
-/// `scan_sv_module_lane_widths`' module discovery, but:
-///   - folds parameter values with a richer const evaluator
-///     (`+ - * / ( )` and `$clog2`), so `localparam int W = $clog2(N)`
-///     chains resolve;
-///   - resolves `typedef logic [..] Name;` and `parameter type Name =
-///     logic [..]` so typedef'd ports get a width;
-///   - scans port declarations only inside the ANSI header (module line
-///     to the header-closing `);`), so `function` arguments deeper in
-///     the body are not mistaken for ports (with a whole-body fallback
-///     for non-ANSI headers).
+/// Core of `cosim_ports_from_sv` over one source string:
+///   - comment-strips each line (`//` tails and single-line `/* */`
+///     spans) before any matching, so commented-out text can neither
+///     declare ports nor fake the header-closing `);`;
+///   - collects `parameter`/`localparam` values ONLY within the top
+///     module's extent (a helper module in the same file re-declaring
+///     the same parameter name must not re-size the top's ports);
+///     typedefs are collected file-wide (file-scope typedefs above the
+///     module are legal and used by the DUT corpus);
+///   - folds values with a small const evaluator (`+ - * / ( )`,
+///     `$clog2`), handles multiple declarators per line
+///     (`parameter W = 8, D = 16`), resolves `typedef logic [..] T` /
+///     `typedef struct packed {…} T` / `parameter type T = …`;
+///   - scans port declarations only inside the ANSI header (module
+///     line to the header-closing `);`), with a whole-body fallback
+///     for non-ANSI headers, and reports every skipped
+///     `input`/`output` line on stderr — a silently absent port is the
+///     failure mode this scanner must never have.
 fn scan_sv_module_ports(src: &str, top: &str) -> Option<Vec<CosimPort>> {
-    let lines: Vec<&str> = src.lines().collect();
+    let raw_lines: Vec<&str> = src.lines().collect();
+    let lines: Vec<String> = raw_lines.iter().map(|l| strip_sv_line_comments(l)).collect();
     let start = lines.iter().position(|l| {
         let t = l.trim_start();
         if let Some(rest) = t.strip_prefix("module ") {
@@ -497,27 +505,87 @@ fn scan_sv_module_ports(src: &str, top: &str) -> Option<Vec<CosimPort>> {
             false
         }
     })?;
-    let body = &lines[start..];
-    let end_rel = body
+    let body_end = lines[start..]
         .iter()
         .position(|l| l.trim_start().starts_with("endmodule"))
-        .unwrap_or(body.len());
-    let body = &body[..end_rel];
+        .map(|i| start + i)
+        .unwrap_or(lines.len());
+    let body = &lines[start..body_end];
 
     // ANSI header extent: everything up to (and including) the first
-    // line whose code content contains the header-closing `);`.
+    // line whose (comment-stripped) content contains the closing `);`.
     let header_end = body
         .iter()
         .position(|l| l.contains(");"))
         .map(|i| i + 1)
         .unwrap_or(body.len());
 
-    // Pass 1: parameters and type widths, over the WHOLE FILE — file-
-    // scope typedefs above the module are legal and used by the DUT
-    // corpus. Struct typedefs can span lines, so track an open
-    // `typedef struct packed { ... }` block and sum its member widths.
+    // Pass 1a (top module extent only): parameters. `parameter type`
+    // goes to the typedef table; everything else through the const
+    // evaluator, one or more declarators per line.
     let mut params: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut typedefs: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for l in body {
+        let t = l.trim();
+        for kw in [
+            "parameter type ",
+            "localparam type ",
+            "parameter int ",
+            "parameter ",
+            "localparam int ",
+            "localparam ",
+        ] {
+            let Some(rest) = t.strip_prefix(kw) else {
+                continue;
+            };
+            if kw.contains("type") {
+                if let Some(eq) = rest.find('=') {
+                    let name = rest[..eq].trim();
+                    let name = name
+                        .split_whitespace()
+                        .last()
+                        .unwrap_or(name)
+                        .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                    if let Some((_, w)) =
+                        sv_typedef_width(&format!("{} {name};", rest[eq + 1..].trim()), &params)
+                    {
+                        typedefs.insert(name.to_string(), w);
+                    }
+                }
+            } else {
+                // One or more `NAME = <expr>` declarators, comma-
+                // separated at paren depth zero.
+                for decl in split_sv_top_level_commas(rest) {
+                    let Some(eq) = decl.find('=') else { continue };
+                    let name = decl[..eq].trim();
+                    let name = name
+                        .split_whitespace()
+                        .last()
+                        .unwrap_or(name)
+                        .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                    let mut val = decl[eq + 1..].trim();
+                    if let Some(cut) = val.find(';') {
+                        val = &val[..cut];
+                    }
+                    let val = val.trim();
+                    // The last parameter before the header's `) (` can
+                    // carry the closing paren on the same line — retry
+                    // with it stripped when the raw text doesn't
+                    // evaluate.
+                    let v = eval_sv_const_expr(val, &params).or_else(|| {
+                        eval_sv_const_expr(val.trim_end_matches(')'), &params)
+                    });
+                    if let Some(v) = v {
+                        params.insert(name.to_string(), v);
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    // Pass 1b (whole file): typedefs, including multi-line
+    // `typedef struct packed { ... } Name;` blocks (member widths sum).
     let mut struct_accum: Option<u64> = None;
     for l in &lines {
         let t = l.trim();
@@ -545,62 +613,20 @@ fn scan_sv_module_ports(src: &str, top: &str) -> Option<Vec<CosimPort>> {
             struct_accum = Some(0);
             continue;
         }
-        // `typedef logic [hi:lo]... Name;`
         if let Some(rest) = t.strip_prefix("typedef ") {
             if let Some((name, w)) = sv_typedef_width(rest, &params) {
                 typedefs.insert(name, w);
             }
-            continue;
-        }
-        for kw in [
-            "parameter type ",
-            "localparam type ",
-            "parameter int ",
-            "parameter ",
-            "localparam int ",
-            "localparam ",
-        ] {
-            let Some(rest) = t.strip_prefix(kw) else {
-                continue;
-            };
-            let Some(eq) = rest.find('=') else { break };
-            let name = rest[..eq].trim();
-            let name = name
-                .split_whitespace()
-                .last()
-                .unwrap_or(name)
-                .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
-            let mut val = rest[eq + 1..].trim();
-            // Values end at the parameter-list comma or statement end.
-            if let Some(cut) = val.find([',', ';']) {
-                val = &val[..cut];
-            }
-            let val = val.trim();
-            if kw.contains("type") {
-                // `parameter type DATA = logic [32-1:0]` — record like a
-                // typedef.
-                if let Some((_, w)) = sv_typedef_width(&format!("{} {name};", rest[eq + 1..].trim()), &params)
-                {
-                    typedefs.insert(name.to_string(), w);
-                }
-            } else {
-                // The last parameter before the header's `) (` can carry
-                // the closing paren on the same line — retry with it
-                // stripped when the raw text doesn't evaluate.
-                let v = eval_sv_const_expr(val, &params).or_else(|| {
-                    eval_sv_const_expr(val.trim_end_matches(')'), &params)
-                });
-                if let Some(v) = v {
-                    params.insert(name.to_string(), v);
-                }
-            }
-            break;
         }
     }
 
     // Pass 2: port declarations (header first, whole body as fallback).
-    let scan_ports = |range: &[&str]| -> Vec<CosimPort> {
+    // Every `input`/`output` line that yields no port is recorded — a
+    // silently absent port surfaces later only as a confusing
+    // missing-member C++ error (or not at all).
+    let scan_ports = |range: &[String]| -> (Vec<CosimPort>, Vec<String>) {
         let mut out = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
         for l in range {
             let t = l.trim();
             let (is_input, after_dir) = if let Some(r) = t.strip_prefix("input ") {
@@ -608,22 +634,53 @@ fn scan_sv_module_ports(src: &str, top: &str) -> Option<Vec<CosimPort>> {
             } else if let Some(r) = t.strip_prefix("output ") {
                 (false, r)
             } else {
-                continue; // `inout` and non-port lines are skipped
+                if t.starts_with("inout ") {
+                    skipped.push(format!("inout port unsupported: `{t}`"));
+                }
+                continue; // non-port line
             };
+            // Strip net/var/base-type qualifiers to a fixpoint so
+            // `input wire logic x` and `output var logic y` parse. A
+            // sized builtin base type contributes a default width.
             let mut rest = after_dir.trim();
-            for q in ["logic", "wire", "reg", "bit", "signed", "unsigned"] {
-                if let Some(r) = rest.strip_prefix(q) {
-                    if r.starts_with(|c: char| c.is_whitespace() || c == '[') {
-                        rest = r.trim_start();
+            let mut base_width: Option<u32> = None;
+            loop {
+                let mut stripped_any = false;
+                for (q, w) in [
+                    ("logic", Some(1u32)),
+                    ("wire", Some(1)),
+                    ("reg", Some(1)),
+                    ("bit", Some(1)),
+                    ("var", None),
+                    ("signed", None),
+                    ("unsigned", None),
+                    ("integer", Some(32)),
+                    ("int", Some(32)),
+                    ("longint", Some(64)),
+                    ("shortint", Some(16)),
+                    ("byte", Some(8)),
+                ] {
+                    if let Some(r) = rest.strip_prefix(q) {
+                        if r.starts_with(|c: char| c.is_whitespace() || c == '[')
+                            || r.is_empty()
+                        {
+                            if let Some(w) = w {
+                                base_width = Some(base_width.map_or(w, |b| b.max(w)));
+                            }
+                            rest = r.trim_start();
+                            stripped_any = true;
+                        }
                     }
                 }
+                if !stripped_any {
+                    break;
+                }
             }
-            // A leading identifier after qualifier stripping is either
-            // the port name itself (`input clk,`) or a user type
-            // (`input DATA name`). It is a type only when another
-            // identifier follows (past any packed dims): resolve it
-            // through the typedef table, or skip the port when the
-            // type's width is unknown.
+            // A leading identifier now is either the port name itself
+            // (`input clk,`) or a user type (`input DATA name`). It is
+            // a type only when another identifier follows (past any
+            // packed dims): resolve it through the typedef table, or
+            // skip the port when the type's width is unknown.
             let mut type_width: Option<u32> = None;
             if rest.starts_with(|c: char| c.is_alphabetic() || c == '_') {
                 let tok: String = rest
@@ -644,11 +701,22 @@ fn scan_sv_module_ports(src: &str, top: &str) -> Option<Vec<CosimPort>> {
                             type_width = Some(w);
                             rest = after_tok;
                         }
-                        None => continue,
+                        None => {
+                            skipped.push(format!(
+                                "unresolved port type `{tok}`: `{t}`"
+                            ));
+                            continue;
+                        }
                     }
                 }
             }
-            let mut width: u64 = type_width.unwrap_or(1) as u64;
+            // Total width = base width (typedef, sized builtin, or the
+            // 1-bit scalar default) × the product of packed dims. For
+            // the common `logic [hi:lo]` shape that is 1 × (hi-lo+1);
+            // for a typedef'd port with dims it is the typedef width
+            // per lane × lane count.
+            let base: u64 = type_width.or(base_width).unwrap_or(1) as u64;
+            let mut dims_product: u64 = 1;
             let mut cur = rest;
             let mut foldable = true;
             while cur.starts_with('[') {
@@ -657,75 +725,143 @@ fn scan_sv_module_ports(src: &str, top: &str) -> Option<Vec<CosimPort>> {
                     break;
                 };
                 match sv_const_range_width(&cur[1..close], &params) {
-                    Some(w) => width = width.saturating_mul(w as u64),
+                    Some(w) => dims_product = dims_product.saturating_mul(w as u64),
                     None => foldable = false,
                 }
                 cur = cur[close + 1..].trim_start();
             }
             if !foldable {
+                skipped.push(format!("unfoldable port width: `{t}`"));
                 continue;
             }
-            let name: String = cur
-                .trim()
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            if name.is_empty() {
-                continue;
-            }
-            let after_name = cur[name.len()..].trim_start();
-            // A second identifier (unresolved `<Type> <name>` shape):
-            // skip — a TB referencing the port fails with a clear
-            // missing-member error.
-            if after_name
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_alphabetic() || c == '_')
-            {
-                continue;
-            }
-            // Post-name dimension: a true unpacked-array port. One
-            // dimension with <= 64-bit elements is supported through
-            // the element accessors (`[N]` and `[lo:hi]` size forms);
-            // anything else is skipped.
-            let mut unpacked_elems = None;
-            if after_name.starts_with('[') {
-                let Some(close) = after_name.find(']') else {
-                    continue;
-                };
-                let dim = &after_name[1..close];
-                let elems = match dim.split_once(':') {
-                    Some(_) => sv_const_range_width(dim, &params),
-                    None => eval_sv_const_expr(dim.trim(), &params)
-                        .and_then(|v| u32::try_from(v).ok()),
-                };
-                let Some(elems) = elems else { continue };
-                if elems == 0
-                    || width > 64
-                    || after_name[close + 1..].trim_start().starts_with('[')
-                {
+            let width: u64 = base.saturating_mul(dims_product);
+            // One or more comma-separated names, each with an optional
+            // unpacked dimension (`input logic a, b, c` / `... x [N]`).
+            for name_decl in split_sv_top_level_commas(cur) {
+                let nd = name_decl
+                    .trim()
+                    .trim_end_matches([';', ')'])
+                    .trim();
+                if nd.is_empty() {
                     continue;
                 }
-                unpacked_elems = Some(elems);
+                let name: String = nd
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if name.is_empty() || !nd.starts_with(|c: char| c.is_alphabetic() || c == '_')
+                {
+                    skipped.push(format!("unparsed port declarator `{nd}` in: `{t}`"));
+                    continue;
+                }
+                let after_name = nd[name.len()..].trim_start();
+                let mut unpacked_elems = None;
+                if after_name.starts_with('[') {
+                    // Single unpacked dimension, `[N]` or `[a:b]`
+                    // (either order), elements <= 64 bits.
+                    let Some(close) = after_name.find(']') else {
+                        skipped.push(format!("unterminated unpacked dim: `{t}`"));
+                        continue;
+                    };
+                    let dim = &after_name[1..close];
+                    let elems = match dim.split_once(':') {
+                        Some(_) => sv_const_range_width(dim, &params),
+                        None => eval_sv_const_expr(dim.trim(), &params)
+                            .and_then(|v| u32::try_from(v).ok()),
+                    };
+                    let Some(elems) = elems else {
+                        skipped.push(format!("unfoldable unpacked dim `{dim}`: `{t}`"));
+                        continue;
+                    };
+                    if elems == 0
+                        || width > 64
+                        || after_name[close + 1..].trim_start().starts_with('[')
+                    {
+                        skipped.push(format!(
+                            "unsupported unpacked-array shape (multi-dim or >64-bit \
+                             elements): `{t}`"
+                        ));
+                        continue;
+                    }
+                    unpacked_elems = Some(elems);
+                } else if !after_name.is_empty() {
+                    skipped.push(format!("unparsed port declarator tail `{after_name}`: `{t}`"));
+                    continue;
+                }
+                out.push(CosimPort {
+                    name,
+                    width_bits: width.min(u32::MAX as u64) as u32,
+                    is_input,
+                    unpacked_elems,
+                });
             }
-            out.push(CosimPort {
-                name,
-                width_bits: width.min(u32::MAX as u64) as u32,
-                is_input,
-                unpacked_elems,
-            });
         }
-        out
+        (out, skipped)
     };
 
-    let mut out = scan_ports(&body[..header_end]);
+    let (mut out, mut skipped) = scan_ports(&body[..header_end]);
     if out.is_empty() {
-        out = scan_ports(body);
+        (out, skipped) = scan_ports(body);
     }
     if out.is_empty() {
         return None;
     }
+    // A silently absent port is this scanner's worst failure mode:
+    // surface every skip loudly on stderr (the TB may still build if it
+    // never touches the port; if it does, the C++ error names it).
+    for w in &skipped {
+        eprintln!("harc: --cosim dpi: module `{top}`: skipped port — {w}");
+    }
     Some(out)
+}
+
+/// Strip `//` line comments and single-line `/* ... */` block comments.
+/// A block comment left OPEN on the line truncates the line at the
+/// opener (the continuation is unparseable line-by-line anyway; the
+/// affected declarations then skip loudly rather than mis-parse).
+fn strip_sv_line_comments(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+            break;
+        }
+        if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+            match line[i + 2..].find("*/") {
+                Some(close) => {
+                    out.push(' ');
+                    i = i + 2 + close + 2;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Split on commas at paren/bracket depth zero — used for
+/// multi-declarator parameter lines and multi-name port declarations.
+fn split_sv_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth <= 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
 }
 
 /// `logic [hi:lo]... Name` (the tail of a typedef or a `parameter type`
@@ -768,13 +904,12 @@ fn sv_const_range_width(
     range: &str,
     params: &std::collections::HashMap<String, i64>,
 ) -> Option<u32> {
-    let (hi_s, lo_s) = range.split_once(':')?;
-    let hi = eval_sv_const_expr(hi_s.trim(), params)?;
-    let lo = eval_sv_const_expr(lo_s.trim(), params)?;
-    if hi < lo {
-        return None;
-    }
-    Some((hi - lo + 1) as u32)
+    let (a_s, b_s) = range.split_once(':')?;
+    let a = eval_sv_const_expr(a_s.trim(), params)?;
+    let b = eval_sv_const_expr(b_s.trim(), params)?;
+    // Order-agnostic: `[7:0]` and `[0:7]` are both 8 wide (ascending
+    // ranges are the common style for unpacked dims).
+    Some((a - b).unsigned_abs().saturating_add(1).min(u32::MAX as u64) as u32)
 }
 
 /// Small recursive-descent evaluator for SV constant expressions in

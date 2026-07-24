@@ -392,6 +392,62 @@ tests, randomize/Z3, 128-bit+ wide ports, extern-fn reference models —
 passes through the co-sim backend with observable results matching the
 direct backend.
 
+### Post-merge independent review: fixes landed
+
+An independent review pass over the merged backend confirmed the
+architecture (bridge synchronization, id-table integrity, time
+bookkeeping) and surfaced a set of real defects in the textual layers,
+all fixed in the follow-up change:
+
+- **Accessor argument shadowing** (was silent data corruption): the
+  generated accessor functions' arguments are now `_harc_`-prefixed —
+  previously a DUT port named `value`/`sig_id`/`word`/`idx` was
+  shadowed by the same-named function argument and every drive of it
+  silently vanished.
+- **Parameter scoping** (was silent mis-sizing): `parameter`/
+  `localparam` values are now collected only within the top module's
+  extent, so a helper module in the same file re-declaring the same
+  parameter name can no longer re-size the top's ports. Typedefs stay
+  file-wide (file-scope typedefs are legal and used).
+- **DUT-initiated `$finish`** (was `std::terminate`/SIGABRT): the
+  bridge singleton is intentionally leaked (a static destructor was
+  destroying a joinable `std::thread` when the TB thread was still
+  parked), and the harness gained a `final` block calling
+  `harc_cosim_shutdown()`, which reports "simulation ended outside
+  HARC control" and exits 97 when the test had not completed.
+- **Scanner hardening**: lines are comment-stripped before matching;
+  qualifiers strip to a fixpoint (`input wire logic x`); sized builtin
+  types (`int`, `integer`, `byte`, `shortint`, `longint`) get widths;
+  multi-name declarations (`input logic a, b, c`) and multi-declarator
+  parameter lines (`parameter W = 8, D = 16`) parse fully; ranges are
+  order-agnostic (`[0:15]` unpacked style); and — most importantly —
+  **every skipped `input`/`output` line is now reported on stderr**
+  instead of producing a silently absent port.
+- **Signed wide outputs**: the word-accessor getter masks the
+  word-rounded wire's pad bits on the top word, so a `signed` >64-bit
+  output no longer sign-extends garbage into the words the TB reads.
+- **`--param` is rejected** under `--cosim dpi` (previously the `-G`
+  override silently targeted the parameterless harness while accessor
+  widths were folded from defaults).
+- The **failure half of the protocol is now CI-covered**:
+  `tests/run_cosim_negative_fixtures.sh` runs the negative-fixture
+  table through co-sim (RC_DONE_FAIL → `$fatal` → nonzero exit) as a
+  step in the `run-cosim-fixtures` job.
+- The `harc_read`/`harc_vec_lane_write` proxy branches now key on an
+  explicit `harc_is_accessor_proxy` trait instead of
+  `is_convertible_v<Sig, uint64_t>` (which `HarcWide` also satisfies —
+  a latent truncation), and `harc_eq_words`/`harc_assign_words` gained
+  `static_assert(N > 0)` guards.
+
+**Known portability assumption (unverified):** the bridge calls DPI
+exports from a dedicated OS thread after installing Verilator's
+thread-local context/scope (`Verilated::threadContextp` +
+`svSetScope`). That is verified Verilator behavior, not an IEEE DPI
+guarantee — whether VCS/Xcelium/Questa tolerate export calls from a
+thread that is not the simulator kernel thread is an open question the
+commercial-backend work must answer (cocotb's bridge suggests the
+model is workable, but it routes through GPI rather than raw exports).
+
 ### Cost
 
 The sync_fifo 1M-cycle soak (spike numbers, same contract): co-sim is
