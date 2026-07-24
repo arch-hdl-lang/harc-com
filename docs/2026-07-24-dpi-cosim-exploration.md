@@ -293,6 +293,10 @@ significant architecture change discovered during regression bring-up.
   test selection flows through `HARC_TEST` (Verilator owns argv).
 - **Runner:** `tests/run_cosim_fixtures.sh` — the full fixture table
   through the co-sim backend via `HARC_SIM_EXTRA_ARGS="--cosim dpi"`.
+  CI runs it as a required gate (the `run-cosim-fixtures` job in
+  `.github/workflows/ci.yml`, mirroring `run-fixtures`' Verilator 5.034
+  + clang + ccache setup), so full parity with the direct backend is a
+  standing invariant, not a snapshot.
 
 ### The architecture change: thread bridge, not driver coroutine
 

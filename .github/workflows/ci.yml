@@ -241,6 +241,100 @@ jobs:
         if: always()
         run: ccache -s
 
+  run-cosim-fixtures:
+    # Same fixture table as run-fixtures, through the `--cosim dpi`
+    # backend (spec §10 simulator-owned-time DPI-C co-sim): generated
+    # HarcCosimTop.sv harness owns the clock, the TB runs as a passive
+    # DPI-C runtime on the thread bridge, and DUT access crosses the
+    # boundary through generated typed accessors. Full parity with the
+    # direct backend (130/130) is the standing invariant — this job is
+    # the gate that keeps the co-sim contract from rotting. Mirrors
+    # run-fixtures' setup and reuses its Verilator/ccache/cargo caches.
+    name: harc sim fixtures (cosim dpi)
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Z3 + clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libz3-dev clang ccache \
+                                  git make autoconf flex bison g++ help2man perl python3 \
+                                  numactl perl-doc libfl2 libfl-dev zlib1g zlib1g-dev
+
+      - name: Cache Verilator
+        id: cache-verilator
+        uses: actions/cache@v6
+        with:
+          path: /opt/verilator
+          key: verilator-v5.034-ubuntu-${{ runner.os }}
+
+      - name: Build Verilator from source (cache miss)
+        if: steps.cache-verilator.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --branch v5.034 --depth 1 https://github.com/verilator/verilator.git /tmp/verilator-src
+          cd /tmp/verilator-src
+          autoconf
+          ./configure --prefix=/opt/verilator
+          make -j"$(nproc)"
+          sudo make install
+
+      - name: Add Verilator to PATH
+        run: |
+          echo "/opt/verilator/bin" >> "$GITHUB_PATH"
+          /opt/verilator/bin/verilator --version
+
+      - name: Set up ccache (masquerade clang++)
+        # Same masquerade as run-fixtures (see the rationale there).
+        # Co-sim builds share less object code with the direct builds
+        # (`--binary --timing` vs `--cc --no-timing`) but the verilated
+        # runtime and per-DUT model objects still hit across fixtures.
+        run: |
+          mkdir -p "$HOME/.ccache-bin"
+          ln -sf "$(command -v ccache)" "$HOME/.ccache-bin/clang++"
+          ln -sf "$(command -v ccache)" "$HOME/.ccache-bin/clang"
+          echo "$HOME/.ccache-bin" >> "$GITHUB_PATH"
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=1G" >> "$GITHUB_ENV"
+          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          echo "CCACHE_SLOPPINESS=time_macros" >> "$GITHUB_ENV"
+
+      - name: Cache ccache
+        uses: actions/cache@v6
+        with:
+          path: ~/.ccache
+          key: ccache-cosim-${{ github.run_id }}
+          restore-keys: |
+            ccache-cosim-
+            ccache-sim-
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build harc
+        run: cargo build --release --bin harc
+
+      - name: ccache zero stats
+        run: ccache -z
+
+      - name: Run all fixtures through --cosim dpi
+        env:
+          HARC_CXX: clang++
+        run: ./tests/run_cosim_fixtures.sh
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
+
   check-backends:
     # sim<->SV equivalence net: run representative arch-com designs under
     # BOTH backends (ARCH native sim via --dut, Verilator via --sv) with
