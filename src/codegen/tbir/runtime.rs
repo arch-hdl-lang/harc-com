@@ -162,6 +162,18 @@ fn cosim_dut_shim(out: &mut String, dut_type: &str, co: &crate::codegen::cpp_tb:
     writeln!(out, "// HarcCosimTop.sv accessor case tables.").ok();
     writeln!(out, "struct V{dut_type} {{").ok();
     for (id, p) in co.ports.iter().enumerate() {
+        if let Some(n) = p.unpacked_elems {
+            // Unpacked-array port: element-indexed proxy; raw-subscript
+            // access sites (`dut->p[i]`) go through the element
+            // accessors.
+            writeln!(
+                out,
+                "{INDENT}harc_rt::cosim::UnpackedSigProxy<{id}, {n}> {};",
+                p.name
+            )
+            .ok();
+            continue;
+        }
         if p.width_bits > 64 {
             // Wide port: word-indexed proxy shaped like VlWide<N> (the
             // wide helpers derive the word count from sizeof).

@@ -138,8 +138,9 @@ backends (and it schedules DUT-internal `#delay`s, which the direct
 path's `--no-timing` elides).
 
 v0 limitations: no probes, no `--mt`, no `--waves`/`--coverage` (these
-belong to the simulator on this path), no `--cpp-split tests`, no
-unpacked-array ports. Run the fixture suite through it with
+belong to the simulator on this path), no `--cpp-split tests`.
+Unpacked-array ports are supported for a single unpacked dimension with
+≤ 64-bit elements. Run the fixture suite through it with
 `tests/run_cosim_fixtures.sh`. Design notes and support matrix:
 `docs/2026-07-24-dpi-cosim-exploration.md`.
 

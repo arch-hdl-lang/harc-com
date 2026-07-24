@@ -330,18 +330,22 @@ a future timing-faithful clocked lowering.
 | Suite | Result |
 |---|---|
 | Direct backend (`tests/run_fixtures.sh`) | **130 / 130** — unchanged by the integration |
-| Co-sim backend (`tests/run_cosim_fixtures.sh`) | **125 / 130** |
+| Co-sim backend (`tests/run_cosim_fixtures.sh`) | **127 / 130** |
 | `cargo test --release` | green (default-mode emission byte-identical) |
 
-The 5 co-sim failures are the two documented v0 gaps:
+The 3 co-sim failures are the one remaining documented v0 gap:
 
 - `probe_basic_test`, `probe_force_test`, `testbench_probe_dut_test` —
   probes need hierarchical access into the Verilated model, which lives
   inside the simulator on this path (rejected with a diagnostic).
-- `packed_vec_lane_test`, `vec_lane_var_index_test` — true SystemVerilog
-  *unpacked-array* ports (`input logic [7:0] p [N]`); the scalar/word
-  accessor ABI has no element representation yet (skipped by the port
-  scanner; the TB fails with a missing-member error naming the port).
+
+Unpacked-array ports (`input logic [7:0] p [N]`, single dimension,
+elements ≤ 64 bits) are supported through a third accessor pair
+(`harc_sv_get_elem` / `harc_sv_set_elem`) and an element-indexed
+`UnpackedSigProxy` in the shim — the TB-IR emission for these ports is a
+raw subscript on both the read and write side, so a temporary element
+ref with a conversion operator and an assignment operator covers every
+access site.
 
 Everything else — TLM targets/initiators, blocking bus calls, RAL
 regblocks, transactors, scoreboards, covergroups, watchdogs, multi-clock

@@ -49,6 +49,10 @@ void harc_sv_set(int sig_id, long long value);
 // word order, which the wide helpers in harc_thread_rt.h assume).
 long long harc_sv_get_word(int sig_id, int word);
 void harc_sv_set_word(int sig_id, int word, long long value);
+// Element accessors for unpacked-array ports (`input logic [W-1:0]
+// p [N]`): element `idx` of port `sig_id`, elements <= 64 bits.
+long long harc_sv_get_elem(int sig_id, int idx);
+void harc_sv_set_elem(int sig_id, int idx, long long value);
 }
 
 namespace harc_rt {
@@ -206,6 +210,33 @@ struct WideSigProxy {
     uint32_t _shape[NWORDS];
     WideWordRef operator[](std::size_t i) const {
         return WideWordRef{ID, static_cast<int>(i)};
+    }
+};
+
+// One element of an unpacked-array port, returned by
+// UnpackedSigProxy::operator[]. The TB-IR emission for unpacked ports
+// is a raw subscript on both sides (`dut->p[i]` in expressions,
+// `dut->p[i] = e;` as a statement), so a conversion operator plus an
+// assignment operator — both callable on temporaries — cover every
+// access site.
+struct UnpackedElemRef {
+    int id;
+    int idx;
+    operator uint64_t() const {
+        return static_cast<uint64_t>(harc_sv_get_elem(id, idx));
+    }
+    UnpackedElemRef& operator=(uint64_t v) {
+        harc_sv_set_elem(id, idx, static_cast<long long>(v));
+        return *this;
+    }
+};
+
+// An unpacked-array DUT port (`input logic [W-1:0] p [NELEMS]`),
+// element width <= 64 bits.
+template <int ID, int NELEMS>
+struct UnpackedSigProxy {
+    UnpackedElemRef operator[](std::size_t i) const {
+        return UnpackedElemRef{ID, static_cast<int>(i)};
     }
 };
 

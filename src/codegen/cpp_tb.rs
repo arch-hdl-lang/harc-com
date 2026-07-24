@@ -390,8 +390,13 @@ pub struct EmitOpts {
 #[derive(Debug, Clone)]
 pub struct CosimPort {
     pub name: String,
+    /// Total packed width; for unpacked-array ports, the ELEMENT width.
     pub width_bits: u32,
     pub is_input: bool,
+    /// `Some(N)` for an unpacked-array port `p [N]` (single unpacked
+    /// dimension, element width <= 64). Access goes through the
+    /// element accessors instead of the scalar/word ones.
+    pub unpacked_elems: Option<u32>,
 }
 
 /// Options for `--cosim dpi` emission, shared by the TB emitter (shim +
@@ -630,22 +635,45 @@ fn scan_sv_module_ports(src: &str, top: &str) -> Option<Vec<CosimPort>> {
                 continue;
             }
             let after_name = cur[name.len()..].trim_start();
-            // Unpacked (post-name) dimension, or a second identifier
-            // (unresolved `<Type> <name>` shape): skip — the accessor
-            // ABI can't represent it. A TB referencing the port fails
-            // with a clear missing-member error.
-            if after_name.starts_with('[')
-                || after_name
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_alphabetic() || c == '_')
+            // A second identifier (unresolved `<Type> <name>` shape):
+            // skip — a TB referencing the port fails with a clear
+            // missing-member error.
+            if after_name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphabetic() || c == '_')
             {
                 continue;
+            }
+            // Post-name dimension: a true unpacked-array port. One
+            // dimension with <= 64-bit elements is supported through
+            // the element accessors (`[N]` and `[lo:hi]` size forms);
+            // anything else is skipped.
+            let mut unpacked_elems = None;
+            if after_name.starts_with('[') {
+                let Some(close) = after_name.find(']') else {
+                    continue;
+                };
+                let dim = &after_name[1..close];
+                let elems = match dim.split_once(':') {
+                    Some(_) => sv_const_range_width(dim, &params),
+                    None => eval_sv_const_expr(dim.trim(), &params)
+                        .and_then(|v| u32::try_from(v).ok()),
+                };
+                let Some(elems) = elems else { continue };
+                if elems == 0
+                    || width > 64
+                    || after_name[close + 1..].trim_start().starts_with('[')
+                {
+                    continue;
+                }
+                unpacked_elems = Some(elems);
             }
             out.push(CosimPort {
                 name,
                 width_bits: width.min(u32::MAX as u64) as u32,
                 is_input,
+                unpacked_elems,
             });
         }
         out

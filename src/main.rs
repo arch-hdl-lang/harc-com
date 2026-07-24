@@ -1551,7 +1551,13 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
     let _ = writeln!(s);
     let _ = writeln!(s, "module HarcCosimTop;");
     for p in &co.ports {
-        if p.width_bits == 1 {
+        if let Some(n) = p.unpacked_elems {
+            if p.width_bits == 1 {
+                let _ = writeln!(s, "  logic {} [{n}];", p.name);
+            } else {
+                let _ = writeln!(s, "  logic [{}:0] {} [{n}];", p.width_bits - 1, p.name);
+            }
+        } else if p.width_bits == 1 {
             let _ = writeln!(s, "  logic {};", p.name);
         } else if p.width_bits > 64 {
             // Wide ports get a word-rounded wire so the variable-base
@@ -1580,7 +1586,9 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
          \x20 export \"DPI-C\" function harc_sv_get;\n\
          \x20 export \"DPI-C\" function harc_sv_set;\n\
          \x20 export \"DPI-C\" function harc_sv_get_word;\n\
-         \x20 export \"DPI-C\" function harc_sv_set_word;\n\n",
+         \x20 export \"DPI-C\" function harc_sv_set_word;\n\
+         \x20 export \"DPI-C\" function harc_sv_get_elem;\n\
+         \x20 export \"DPI-C\" function harc_sv_set_elem;\n\n",
     );
     // Typed accessors, id order == `CosimOpts::ports` order == the TB
     // shim's `SigProxy<ID>` parameters. >64-bit ports are omitted from
@@ -1589,7 +1597,7 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
     let _ = writeln!(s, "  function longint harc_sv_get(input int sig_id);");
     let _ = writeln!(s, "    case (sig_id)");
     for (id, p) in co.ports.iter().enumerate() {
-        if p.width_bits > 64 {
+        if p.width_bits > 64 || p.unpacked_elems.is_some() {
             continue;
         }
         let _ = writeln!(s, "      {id}: return longint'({});", p.name);
@@ -1603,7 +1611,7 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
     for (id, p) in co.ports.iter().enumerate() {
         // Outputs are read-only from the TB; the shim's proxy write would
         // be a codegen bug, so just omit them (falls to default).
-        if p.width_bits > 64 || !p.is_input {
+        if p.width_bits > 64 || !p.is_input || p.unpacked_elems.is_some() {
             continue;
         }
         if p.width_bits == 1 {
@@ -1625,7 +1633,7 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
     );
     let _ = writeln!(s, "    case (sig_id)");
     for (id, p) in co.ports.iter().enumerate() {
-        if p.width_bits <= 64 {
+        if p.width_bits <= 64 || p.unpacked_elems.is_some() {
             continue;
         }
         let _ = writeln!(s, "      {id}: return longint'({}[word * 32 +: 32]);", p.name);
@@ -1640,10 +1648,45 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
     );
     let _ = writeln!(s, "    case (sig_id)");
     for (id, p) in co.ports.iter().enumerate() {
-        if p.width_bits <= 64 || !p.is_input {
+        if p.width_bits <= 64 || !p.is_input || p.unpacked_elems.is_some() {
             continue;
         }
         let _ = writeln!(s, "      {id}: {}[word * 32 +: 32] = value[31:0];", p.name);
+    }
+    let _ = writeln!(s, "      default: ;");
+    let _ = writeln!(s, "    endcase");
+    let _ = writeln!(s, "  endfunction");
+    let _ = writeln!(s);
+    // Element accessors for unpacked-array ports.
+    let _ = writeln!(
+        s,
+        "  function longint harc_sv_get_elem(input int sig_id, input int idx);"
+    );
+    let _ = writeln!(s, "    case (sig_id)");
+    for (id, p) in co.ports.iter().enumerate() {
+        if p.unpacked_elems.is_none() {
+            continue;
+        }
+        let _ = writeln!(s, "      {id}: return longint'({}[idx]);", p.name);
+    }
+    let _ = writeln!(s, "      default: return 0;");
+    let _ = writeln!(s, "    endcase");
+    let _ = writeln!(s, "  endfunction");
+    let _ = writeln!(s);
+    let _ = writeln!(
+        s,
+        "  function void harc_sv_set_elem(input int sig_id, input int idx, input longint value);"
+    );
+    let _ = writeln!(s, "    case (sig_id)");
+    for (id, p) in co.ports.iter().enumerate() {
+        if p.unpacked_elems.is_none() || !p.is_input {
+            continue;
+        }
+        if p.width_bits == 1 {
+            let _ = writeln!(s, "      {id}: {}[idx] = value[0];", p.name);
+        } else {
+            let _ = writeln!(s, "      {id}: {}[idx] = value[{}:0];", p.name, p.width_bits - 1);
+        }
     }
     let _ = writeln!(s, "      default: ;");
     let _ = writeln!(s, "    endcase");
