@@ -457,6 +457,11 @@ template<typename Sig>
 inline auto harc_read(const Sig& sig) {
     if constexpr (std::is_arithmetic_v<Sig>) {
         return static_cast<_harc_u128>(sig);
+    } else if constexpr (std::is_convertible_v<Sig, uint64_t>) {
+        // Class-typed scalar reads — the co-sim accessor proxy
+        // (harc_cosim_rt.h SigProxy) converts to uint64_t; anything
+        // convertible is a <= 64-bit scalar, not a word-array wide.
+        return static_cast<_harc_u128>(static_cast<uint64_t>(sig));
     } else {
         constexpr std::size_t N = sizeof(Sig) / sizeof(uint32_t);
         HarcWide<N> v;
@@ -603,7 +608,14 @@ inline void harc_vec_lane_write(Sig& sig, std::size_t lane, Val val) {
         const _harc_u128 ins =
             (static_cast<_harc_u128>(static_cast<uint64_t>(val)) & harc_mask_u128(W)) << shift;
         const _harc_u128 cur = static_cast<_harc_u128>(sig);
-        sig = static_cast<Bare>((cur & ~field_mask) | ins);
+        if constexpr (!std::is_arithmetic_v<Bare> && std::is_convertible_v<Bare, uint64_t>) {
+            // Class-typed scalar port (co-sim accessor proxy): assign
+            // through its uint64_t path — proxies only exist for <=64-bit
+            // ports, so the truncation is exact.
+            sig = static_cast<uint64_t>((cur & ~field_mask) | ins);
+        } else {
+            sig = static_cast<Bare>((cur & ~field_mask) | ins);
+        }
     }
 }
 

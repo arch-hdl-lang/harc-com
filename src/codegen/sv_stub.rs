@@ -170,6 +170,25 @@ pub fn emit_stub(dut_type: &str, probes: &[Probe]) -> Result<String, String> {
     Ok(out)
 }
 
+/// Bit width of a probe's declared HARC type (`uint<N>`/`sint<N>`/
+/// `bits<N>` → N; `bit`/`bool` → 1). `None` for unsupported types —
+/// `sv_type_decl` rejects those with a proper diagnostic at stub
+/// emission, so co-sim callers can treat `None` as already-reported.
+pub fn probe_width_bits(ty: &TypeExpr) -> Option<u32> {
+    match ty {
+        TypeExpr::Builtin { name, args, .. } => match name {
+            BuiltinTy::Bit | BuiltinTy::Bool | BuiltinTy::BoolLower => Some(1),
+            BuiltinTy::UInt
+            | BuiltinTy::SInt
+            | BuiltinTy::Bits
+            | BuiltinTy::UIntCap
+            | BuiltinTy::SIntCap => args.first().and_then(int_arg),
+            _ => None,
+        },
+        TypeExpr::Named { .. } => None,
+    }
+}
+
 /// Mangled C++ accessor for a probe signal under `dut->rootp->...`.
 /// Matches the Verilator 5.x encoding for instance/signal paths:
 /// `<TopModule>__DOT__harc_probes__DOT__<signal>`.

@@ -124,6 +124,29 @@ checks CLI flags first, then `HARC_Z3_INCLUDE_DIR` / `HARC_Z3_LIB_DIR`, then
 When changing waveform settings after a previous non-wave build, pass
 `--rebuild` so Verilator does not reuse objects compiled without trace flags.
 
+## Simulator-owned-time co-simulation (`--cosim dpi`)
+
+`harc sim --sv <dut.sv> <test.harc> --cosim dpi` builds the spec §10
+DPI-C co-sim pilot instead of the direct drive loop: a generated
+`HarcCosimTop.sv` harness instantiates the DUT, owns the clock in a
+timed master process (Verilator `--binary --timing`), and calls the TB
+through `harc_cosim_init` / `harc_cosim_step` DPI imports; DUT port
+access crosses the boundary through generated typed accessors. The
+direct backend remains the fast path — co-sim exists to validate the
+simulator-owned-time contract expected from commercial-simulator
+backends (and it schedules DUT-internal `#delay`s, which the direct
+path's `--no-timing` elides).
+
+v0 limitations: no `--mt`, no `--waves`/`--coverage` (these belong to
+the simulator on this path), no `--cpp-split tests`. Probes (including
+`probe force`) work through the same bound SV stub as the direct
+backend; unpacked-array ports are supported for a single unpacked
+dimension with ≤ 64-bit elements; ports and probes are limited to
+≤ 64-bit scalars except packed ports, which may be arbitrarily wide.
+Run the fixture suite through it with
+`tests/run_cosim_fixtures.sh`. Design notes and support matrix:
+`docs/2026-07-24-dpi-cosim-exploration.md`.
+
 ## Backend comparison
 
 | Option | Meaning |

@@ -208,7 +208,11 @@ run_one() {
     # `${ref_args[@]:-}` tolerates an empty array under `set -u` (most
     # fixtures don't pass any --ref-src). `--outdir` keeps each worker's
     # verilator build isolated so parallel runs never collide.
-    out="$("$HARC" sim "${sv_args[@]}" ${ref_args[@]+"${ref_args[@]}"} "${harc_files[@]}" --top "$top" ${test_args[@]+"${test_args[@]}"} --outdir "$outdir" 2>&1)" || true
+    # HARC_SIM_EXTRA_ARGS: optional extra `harc sim` flags, e.g.
+    # `--cosim dpi` (see tests/run_cosim_fixtures.sh). Word-split on
+    # purpose.
+    # shellcheck disable=SC2086
+    out="$("$HARC" sim "${sv_args[@]}" ${ref_args[@]+"${ref_args[@]}"} "${harc_files[@]}" --top "$top" ${test_args[@]+"${test_args[@]}"} --outdir "$outdir" ${HARC_SIM_EXTRA_ARGS:-} 2>&1)" || true
 
     if echo "$out" | grep -q "ALL TESTS PASSED"; then
         echo "  PASS  $test"
@@ -243,7 +247,7 @@ done <<<"$FIXTURES"
 # Fan out: one worker per row, JOBS at a time. Each worker's stdout is
 # captured to <idx>.log so the aggregated output below is ordered and
 # never interleaved.
-export HARC DUT_DIR FIX_DIR BUILD_ROOT
+export HARC DUT_DIR FIX_DIR BUILD_ROOT HARC_SIM_EXTRA_ARGS
 read -r -d '' WORKER_CMD <<'EOF' || true
 idx="$1"; resdir="$2"; self="$3"; build_root="$4"
 bash "$self" __worker "$build_root/worker_$idx" "$(cat "$resdir/$idx.row")" \
