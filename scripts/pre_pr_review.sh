@@ -109,6 +109,7 @@ head_sha="$(git rev-parse HEAD)"
 safe_branch="$(printf '%s' "$branch" | tr '/: ' '___')"
 marker_dir="$(git rev-parse --git-path pre-pr-reviews)"
 marker="${marker_dir}/${safe_branch}.review"
+merge_base="$(git merge-base "${base_ref}" HEAD 2>/dev/null || true)"
 
 mkdir -p "$marker_dir"
 
@@ -146,6 +147,7 @@ EOF
     printf 'branch=%s\n' "$branch"
     printf 'head=%s\n' "$head_sha"
     printf 'base=%s\n' "$base_ref"
+    printf 'merge_base=%s\n' "$merge_base"
     printf 'reviewer_kind=%s\n' "$reviewer_kind"
     printf 'reviewer=%s\n' "$reviewer"
     printf 'reviewed_at_utc=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -184,6 +186,25 @@ pre-pr-review: marker is stale for ${branch}.
 
 Run a fresh code-review pass, then:
   scripts/pre_pr_review.sh mark --reviewer-kind separate-agent --reviewer <agent-or-thread-id>
+EOF
+  exit 1
+fi
+
+reviewed_merge_base="$(marker_field merge_base "$marker")"
+if [[ "$reviewed_merge_base" != "$merge_base" ]]; then
+  cat >&2 <<EOF
+pre-pr-review: marker was recorded against a different base for ${branch}.
+  reviewed merge-base: ${reviewed_merge_base:-<none>}
+  current  merge-base: ${merge_base:-<none>}
+  check base ref      : ${base_ref}
+
+The base branch has advanced (or the branch was rebased), so the reviewed
+diff no longer matches what would be merged. Run a fresh code-review pass
+against:
+  git diff ${base_ref}...HEAD
+
+Then refresh the marker:
+  scripts/pre_pr_review.sh mark ${base_ref} --reviewer-kind separate-agent --reviewer <agent-or-thread-id>
 EOF
   exit 1
 fi
