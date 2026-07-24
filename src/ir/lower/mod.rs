@@ -1225,58 +1225,98 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
 /// `expand_phase_calls`.
 fn reject_recursive_transactor_methods(prog: &TbProgram) -> Result<(), LowerError> {
     for x in &prog.transactors {
-        let names: Vec<&str> = x.methods.iter().map(|m| m.name.as_str()).collect();
-        // Adjacency by method index: method -> sibling methods it calls.
-        // Unknown callees (already rejected upstream by
-        // `verify::check_transactor_self_call`) are skipped here.
-        let adj: Vec<Vec<usize>> = x
+        let methods: Vec<(&str, FunctionId)> = x
             .methods
             .iter()
-            .map(|m| {
-                sibling_callees(prog.function(m.function))
-                    .iter()
-                    .filter_map(|callee| names.iter().position(|&n| n == callee))
-                    .collect()
-            })
+            .map(|m| (m.name.as_str(), m.function))
             .collect();
-        // DFS with white/gray/black coloring; a gray back-edge is a cycle.
-        let mut color = vec![0u8; names.len()];
-        let mut path: Vec<usize> = Vec::new();
-        for start in 0..names.len() {
-            if color[start] != 0 {
-                continue;
-            }
-            if let Some(cycle) = find_method_cycle(start, &adj, &mut color, &mut path) {
-                let rendered = cycle
-                    .iter()
-                    .map(|&i| names[i])
-                    .collect::<Vec<_>>()
-                    .join(" -> ");
-                return Err(LowerError::Invalid(format!(
-                    "transactor `{}` has a recursive method-call cycle: {rendered}; \
-                     transactor methods lower to synchronous calls and cannot recurse \
-                     (it would overflow the C++ stack at runtime)",
-                    x.name
-                )));
-            }
+        reject_recursive_method_cycle_set(prog, &x.name, &methods)?;
+    }
+    // Env-held / function-library transactors route through the component
+    // path, where sibling method calls appear as `ComponentCall {
+    // base: SelfField, .. }`. Walk those method sets too, or a recursive
+    // `env.drv.ping()` chain slips past the guard and recreates the
+    // original stack-overflow-at-runtime bug.
+    for c in &prog.components {
+        let methods: Vec<(&str, FunctionId)> = c
+            .methods
+            .iter()
+            .map(|m| (m.name.as_str(), m.function))
+            .collect();
+        if methods
+            .iter()
+            .any(|(_, f)| !sibling_callees(prog.function(*f)).is_empty())
+        {
+            reject_recursive_method_cycle_set(prog, &c.name, &methods)?;
         }
     }
     Ok(())
 }
 
-/// Sibling-method names called from a transactor-method body. Every
-/// sibling call is hoisted to a top-level `Stmt::TransactorSelfCall`
-/// (see `hoist_transactor_edge`), so scanning block statements is
-/// sufficient — no nested-expression walk is needed.
+fn reject_recursive_method_cycle_set(
+    prog: &TbProgram,
+    owner_name: &str,
+    methods: &[(&str, FunctionId)],
+) -> Result<(), LowerError> {
+    let names: Vec<&str> = methods.iter().map(|(name, _)| *name).collect();
+    // Adjacency by method index: method -> sibling methods it calls.
+    // Unknown callees (already rejected upstream by
+    // `verify::check_transactor_self_call`) are skipped here.
+    let adj: Vec<Vec<usize>> = methods
+        .iter()
+        .map(|(_, f)| {
+            sibling_callees(prog.function(*f))
+                .iter()
+                .filter_map(|callee| names.iter().position(|&n| n == callee))
+                .collect()
+        })
+        .collect();
+    // DFS with white/gray/black coloring; a gray back-edge is a cycle.
+    let mut color = vec![0u8; names.len()];
+    let mut path: Vec<usize> = Vec::new();
+    for start in 0..names.len() {
+        if color[start] != 0 {
+            continue;
+        }
+        if let Some(cycle) = find_method_cycle(start, &adj, &mut color, &mut path) {
+            let rendered = cycle
+                .iter()
+                .map(|&i| names[i])
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            return Err(LowerError::Invalid(format!(
+                "transactor `{owner_name}` has a recursive method-call cycle: {rendered}; \
+                 transactor methods lower to synchronous calls and cannot recurse \
+                 (it would overflow the C++ stack at runtime)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Sibling-method names called from a method body. DUT-poking transactor
+/// methods use `Stmt::TransactorSelfCall`; component-path transactors use
+/// `Stmt::ComponentCall { base: SelfField, .. }`. Both are synchronous
+/// sibling-call edges, so scanning block statements is sufficient — no
+/// nested-expression walk is needed.
 fn sibling_callees(func: &TbFunction) -> Vec<String> {
     let mut out = Vec::new();
     for b in &func.blocks {
         for s in &b.stmts {
-            if let ir::Stmt::TransactorSelfCall { call, .. } = s {
-                if let ir::Expr::Call(ir::CallTarget::TransactorSelfMethod { method, .. }, _) = call
-                {
-                    out.push(method.clone());
+            match s {
+                ir::Stmt::TransactorSelfCall { call, .. } => {
+                    if let ir::Expr::Call(ir::CallTarget::TransactorSelfMethod { method, .. }, _) =
+                        call
+                    {
+                        out.push(method.clone());
+                    }
                 }
+                ir::Stmt::ComponentCall {
+                    base: ir::ComponentBase::SelfField,
+                    method,
+                    ..
+                } => out.push(method.clone()),
+                _ => {}
             }
         }
     }
