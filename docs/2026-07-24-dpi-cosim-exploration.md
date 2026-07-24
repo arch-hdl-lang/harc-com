@@ -278,9 +278,10 @@ significant architecture change discovered during regression bring-up.
   for ≤64-bit ports, `harc_sv_get_word/set_word` 32-bit-word accessors
   for wider ones), and runs a single timed master process implementing
   the step protocol (`advance N ps` / `settle 1 ps` / done). `timescale
-  1ps/1ps` with integer delays — a coarser unit rounded the 1 ps settle
-  to a ZERO delay, freezing sim time and collapsing every clock edge
-  into one timestep.
+  1ps/1ps` with integer delays, so no real-number conversion exists
+  anywhere in the timing path (see the correction note below — an
+  earlier revision wrongly blamed a coarser timescale for a bug that
+  was actually the driver-coroutine architecture).
 - **DUT shim** (emitted in the TB preamble): a struct named `V<Top>` whose
   members are `SigProxy<ID>` / `WideSigProxy<ID, NWORDS>`
   (`runtime/harc_cosim_rt.h`), so every `dut-><port>` access site in the
@@ -328,6 +329,36 @@ its `dut->eval()` calls are settles, so the simulator sees the correct
 edge *sequence* — with time compressed (1 ps per edge instead of the
 declared period). Fine for cycle-based tests; delay-dependent DUTs need
 a future timing-faithful clocked lowering.
+
+### Correction: the "frozen time" diagnosis was wrong
+
+An earlier revision of this section (and the message of the commit that
+landed the backend) claimed the harness must use `timescale 1ps/1ps` because a
+coarser unit "rounded the 1 ps settle to a ZERO delay, freezing
+simulation time". That mechanism is **false**, on two counts — verified
+after the fact with minimal repros on the same Verilator builds:
+
+- Verilator handles fractional real delays correctly. In a `1ns/1ps`
+  module, `#0.001` advances exactly 1 ps and `#(rc * 0.001)` is exact
+  (`V3Timing` scales by the timeunit as a double and rounds at the
+  declared precision — `RTOIROUNDS(MULD(value, 1000.0))` in the pass
+  dump). Today's backend passes fixtures unmodified with a 1ns/1ps
+  fractional-delay harness.
+- The "frozen" observation was a display artifact: IEEE `$time` (and
+  `%0t`, which the `$monitor` debugging used) returns time **rounded to
+  the module's timeUNIT** — so a 1ns-unit harness reports sub-ns
+  progress as no progress. `$realtime` shows the clock advancing
+  normally.
+
+The failure attributed to the timescale (rom_lut reading all-zero data)
+was in fact the driver-coroutine architecture's inability to yield from
+synchronous helper paths — fixed by the thread bridge in the section
+above, which landed immediately after the timescale change and was the
+actual fix. The native-1ps integer-delay harness is retained anyway: it
+is the simplest form that cannot drift (no real conversion in the
+timing path) and it keeps `$time`-based output aligned with the
+protocol's ps ticks — but it is a robustness choice, not a workaround
+for a simulator bug.
 
 ### Regression results (Verilator 5.034, clang, this container)
 
