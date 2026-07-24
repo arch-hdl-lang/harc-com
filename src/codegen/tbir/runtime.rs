@@ -970,7 +970,6 @@ pub(super) fn run_epilogue(out: &mut String, cosim: bool) {
 
 "#,
     );
-    let _ = cosim;
     out.push_str(
         "    return harc_rt::log::harc_finish_sim_run(log_ctx, trace, cycle_count, errors);\n}\n\n",
     );
@@ -1058,6 +1057,24 @@ extern "C" long long harc_cosim_step() {
     auto& _b = harc_rt::cosim::bridge();
     if (!_b.body) return harc_rt::cosim::RC_DONE_FAIL;
     return _b.run_until_request();
+}
+
+// Called from the harness's `final` block on every simulation end.
+// Detects ends the HARC runtime did not drive — most commonly a
+// DUT-initiated $finish — which would otherwise exit 0 with no test
+// summary while the TB thread is still parked on the bridge.
+extern "C" void harc_cosim_shutdown() {
+    auto& _b = harc_rt::cosim::bridge();
+    if (_b.done || !_b.started) return;
+    std::fflush(stdout);
+    std::fprintf(stderr,
+                 "FATAL: simulation ended outside HARC control (DUT-initiated "
+                 "$finish/$stop?) before the test completed\n");
+    std::fflush(stderr);
+    // The TB thread is parked on the bridge and can never finish;
+    // exit hard with a distinct status so callers see a failure, not
+    // a silent zero-exit with no summary.
+    std::_Exit(97);
 }
 "#,
     );

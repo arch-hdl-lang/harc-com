@@ -48,9 +48,13 @@ run_one() {
     local sv_args=()
     for f in $sv; do sv_args+=("--sv" "$DUT_DIR/$f"); done
 
-    rm -rf harc_sim_build
+    rm -rf "${NEG_BUILD_ROOT:-harc_sim_build}"
     local out
-    out="$("$HARC" sim "${sv_args[@]}" "$FIX_DIR/$test.harc" --top "$top" 2>&1)" || true
+    # HARC_SIM_EXTRA_ARGS: optional extra `harc sim` flags (e.g.
+    # `--cosim dpi` from run_cosim_negative_fixtures.sh). Word-split on
+    # purpose.
+    # shellcheck disable=SC2086
+    out="$("$HARC" sim "${sv_args[@]}" "$FIX_DIR/$test.harc" --top "$top" --outdir "${NEG_BUILD_ROOT:-harc_sim_build}" ${HARC_SIM_EXTRA_ARGS:-} 2>&1)" || true
 
     local has_expected=0
     local has_passed=0

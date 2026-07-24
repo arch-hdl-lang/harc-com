@@ -138,7 +138,7 @@ backends (and it schedules DUT-internal `#delay`s, which the direct
 path's `--no-timing` elides).
 
 v0 limitations: no `--mt`, no `--waves`/`--coverage` (these belong to
-the simulator on this path), no `--cpp-split tests`. Probes (including
+the simulator on this path), no `--cpp-split tests`, no `--param`. Probes (including
 `probe force`) work through the same bound SV stub as the direct
 backend; unpacked-array ports are supported for a single unpacked
 dimension with ≤ 64-bit elements; ports and probes are limited to

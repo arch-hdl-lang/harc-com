@@ -166,8 +166,15 @@ struct Bridge {
 };
 
 inline Bridge& bridge() {
-    static Bridge b;
-    return b;
+    // Intentionally leaked: if the simulation ends while the TB thread
+    // is parked in yield_to_sim (e.g. a DUT-initiated $finish), a
+    // static Bridge's destructor would destroy a joinable std::thread
+    // and std::terminate the process — SIGABRT instead of a
+    // diagnosable result. Leaking the singleton makes every exit path
+    // safe; the normal pass/fail path still joins the TB thread in
+    // run_until_request.
+    static Bridge* b = new Bridge;
+    return *b;
 }
 
 // One DUT port in the generated shim struct. Reads and writes forward to
@@ -241,4 +248,12 @@ struct UnpackedSigProxy {
 };
 
 } // namespace cosim
+
+// Scalar accessor proxies are <= 64-bit scalars for the signal helpers
+// in harc_thread_rt.h (harc_read / harc_vec_lane_write). Wide and
+// unpacked proxies are deliberately NOT marked: they go through the
+// word-array / raw-subscript paths.
+template <int ID>
+struct harc_is_accessor_proxy<cosim::SigProxy<ID>> : std::true_type {};
+
 } // namespace harc_rt

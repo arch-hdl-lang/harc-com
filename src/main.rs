@@ -265,12 +265,13 @@ enum Cmd {
         /// `HarcCosimTop.sv` harness instantiates the DUT, owns the
         /// clock via a timed master process, and calls the TB through
         /// `harc_cosim_init` / `harc_cosim_step`; DUT port access
-        /// crosses the boundary through generated typed accessors.
-        /// Requires `--sv`. v0 limitations: implicit single clock
-        /// only (no declared `clock` ports), no probes, no `--mt`,
-        /// no `--waves`/`--coverage` (waves/coverage belong to the
-        /// simulator on this path), no split builds, and ports wider
-        /// than 64 bits are not accessible. See
+        /// crosses the boundary through generated typed accessors
+        /// (scalar, 32-bit-word for wide ports, element for
+        /// unpacked-array ports; probes route through the bound probe
+        /// stub). Requires `--sv`. v0 limitations: no `--mt`, no
+        /// `--waves`/`--coverage` (they belong to the simulator on
+        /// this path), no `--param`, no split builds; probes and
+        /// unpacked-array elements are limited to 64 bits. See
         /// docs/2026-07-24-dpi-cosim-exploration.md.
         #[arg(long, value_parser = ["dpi"])]
         cosim: Option<String>,
@@ -1587,6 +1588,7 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
     s.push_str(
         "  import \"DPI-C\" context function void harc_cosim_init();\n\
          \x20 import \"DPI-C\" context function longint harc_cosim_step();\n\
+         \x20 import \"DPI-C\" function void harc_cosim_shutdown();\n\
          \n\
          \x20 export \"DPI-C\" function harc_sv_get;\n\
          \x20 export \"DPI-C\" function harc_sv_set;\n\
@@ -1596,11 +1598,12 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
          \x20 export \"DPI-C\" function harc_sv_set_elem;\n\n",
     );
     // Typed accessors, id order == `CosimOpts::ports` order == the TB
-    // shim's `SigProxy<ID>` parameters. >64-bit ports are omitted from
-    // both tables (the shim omits the member, so no TB call site can
-    // produce their ids).
-    let _ = writeln!(s, "  function longint harc_sv_get(input int sig_id);");
-    let _ = writeln!(s, "    case (sig_id)");
+    // shim's proxy parameters. Scalar (<= 64-bit packed) ports live in
+    // these two tables; wider ports use the word accessors and
+    // unpacked-array ports the element accessors below, with the same
+    // shared id space.
+    let _ = writeln!(s, "  function longint harc_sv_get(input int _harc_sig_id);");
+    let _ = writeln!(s, "    case (_harc_sig_id)");
     for (id, p) in co.ports.iter().enumerate() {
         if p.width_bits > 64 || p.unpacked_elems.is_some() {
             continue;
@@ -1620,8 +1623,8 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
     let _ = writeln!(s, "    endcase");
     let _ = writeln!(s, "  endfunction");
     let _ = writeln!(s);
-    let _ = writeln!(s, "  function void harc_sv_set(input int sig_id, input longint value);");
-    let _ = writeln!(s, "    case (sig_id)");
+    let _ = writeln!(s, "  function void harc_sv_set(input int _harc_sig_id, input longint _harc_value);");
+    let _ = writeln!(s, "    case (_harc_sig_id)");
     for (id, p) in co.ports.iter().enumerate() {
         // Outputs are read-only from the TB; the shim's proxy write would
         // be a codegen bug, so just omit them (falls to default).
@@ -1629,9 +1632,9 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
             continue;
         }
         if p.width_bits == 1 {
-            let _ = writeln!(s, "      {id}: {} = value[0];", p.name);
+            let _ = writeln!(s, "      {id}: {} = _harc_value[0];", p.name);
         } else {
-            let _ = writeln!(s, "      {id}: {} = value[{}:0];", p.name, p.width_bits - 1);
+            let _ = writeln!(s, "      {id}: {} = _harc_value[{}:0];", p.name, p.width_bits - 1);
         }
     }
     // Force-probe drive/enable writes into the bound stub; its
@@ -1641,16 +1644,16 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
             continue;
         };
         if probe.width_bits == 1 {
-            let _ = writeln!(s, "      {drv_id}: dut.harc_probes.{}_drv = value[0];", probe.name);
+            let _ = writeln!(s, "      {drv_id}: dut.harc_probes.{}_drv = _harc_value[0];", probe.name);
         } else {
             let _ = writeln!(
                 s,
-                "      {drv_id}: dut.harc_probes.{}_drv = value[{}:0];",
+                "      {drv_id}: dut.harc_probes.{}_drv = _harc_value[{}:0];",
                 probe.name,
                 probe.width_bits - 1
             );
         }
-        let _ = writeln!(s, "      {en_id}: dut.harc_probes.{}_en = value[0];", probe.name);
+        let _ = writeln!(s, "      {en_id}: dut.harc_probes.{}_en = _harc_value[0];", probe.name);
     }
     let _ = writeln!(s, "      default: ;");
     let _ = writeln!(s, "    endcase");
@@ -1661,14 +1664,33 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
     // word-rounded, so `word * 32 +: 32` stays in range.
     let _ = writeln!(
         s,
-        "  function longint harc_sv_get_word(input int sig_id, input int word);"
+        "  function longint harc_sv_get_word(input int _harc_sig_id, input int _harc_word);"
     );
-    let _ = writeln!(s, "    case (sig_id)");
+    let _ = writeln!(s, "    case (_harc_sig_id)");
     for (id, p) in co.ports.iter().enumerate() {
         if p.width_bits <= 64 || p.unpacked_elems.is_some() {
             continue;
         }
-        let _ = writeln!(s, "      {id}: return longint'({}[word * 32 +: 32]);", p.name);
+        if p.width_bits % 32 != 0 {
+            // The wire is word-rounded; a signed wide OUTPUT sign-
+            // extends into the pad bits at the port connection, so the
+            // top word masks down to the port's real bits (matching
+            // the direct backend's zero-filled VlWide top word).
+            let top_word = p.width_bits / 32;
+            let mask = (1u64 << (p.width_bits % 32)) - 1;
+            let _ = writeln!(
+                s,
+                "      {id}: return (_harc_word == {top_word}) ?                  longint'({name}[{base} +: 32] & 32'h{mask:x}) :                  longint'({name}[_harc_word * 32 +: 32]);",
+                name = p.name,
+                base = top_word * 32,
+            );
+        } else {
+            let _ = writeln!(
+                s,
+                "      {id}: return longint'({}[_harc_word * 32 +: 32]);",
+                p.name
+            );
+        }
     }
     let _ = writeln!(s, "      default: return 0;");
     let _ = writeln!(s, "    endcase");
@@ -1676,14 +1698,14 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
     let _ = writeln!(s);
     let _ = writeln!(
         s,
-        "  function void harc_sv_set_word(input int sig_id, input int word, input longint value);"
+        "  function void harc_sv_set_word(input int _harc_sig_id, input int _harc_word, input longint _harc_value);"
     );
-    let _ = writeln!(s, "    case (sig_id)");
+    let _ = writeln!(s, "    case (_harc_sig_id)");
     for (id, p) in co.ports.iter().enumerate() {
         if p.width_bits <= 64 || !p.is_input || p.unpacked_elems.is_some() {
             continue;
         }
-        let _ = writeln!(s, "      {id}: {}[word * 32 +: 32] = value[31:0];", p.name);
+        let _ = writeln!(s, "      {id}: {}[_harc_word * 32 +: 32] = _harc_value[31:0];", p.name);
     }
     let _ = writeln!(s, "      default: ;");
     let _ = writeln!(s, "    endcase");
@@ -1692,14 +1714,14 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
     // Element accessors for unpacked-array ports.
     let _ = writeln!(
         s,
-        "  function longint harc_sv_get_elem(input int sig_id, input int idx);"
+        "  function longint harc_sv_get_elem(input int _harc_sig_id, input int _harc_idx);"
     );
-    let _ = writeln!(s, "    case (sig_id)");
+    let _ = writeln!(s, "    case (_harc_sig_id)");
     for (id, p) in co.ports.iter().enumerate() {
         if p.unpacked_elems.is_none() {
             continue;
         }
-        let _ = writeln!(s, "      {id}: return longint'({}[idx]);", p.name);
+        let _ = writeln!(s, "      {id}: return longint'({}[_harc_idx]);", p.name);
     }
     let _ = writeln!(s, "      default: return 0;");
     let _ = writeln!(s, "    endcase");
@@ -1707,17 +1729,17 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
     let _ = writeln!(s);
     let _ = writeln!(
         s,
-        "  function void harc_sv_set_elem(input int sig_id, input int idx, input longint value);"
+        "  function void harc_sv_set_elem(input int _harc_sig_id, input int _harc_idx, input longint _harc_value);"
     );
-    let _ = writeln!(s, "    case (sig_id)");
+    let _ = writeln!(s, "    case (_harc_sig_id)");
     for (id, p) in co.ports.iter().enumerate() {
         if p.unpacked_elems.is_none() || !p.is_input {
             continue;
         }
         if p.width_bits == 1 {
-            let _ = writeln!(s, "      {id}: {}[idx] = value[0];", p.name);
+            let _ = writeln!(s, "      {id}: {}[_harc_idx] = _harc_value[0];", p.name);
         } else {
-            let _ = writeln!(s, "      {id}: {}[idx] = value[{}:0];", p.name, p.width_bits - 1);
+            let _ = writeln!(s, "      {id}: {}[_harc_idx] = _harc_value[{}:0];", p.name, p.width_bits - 1);
         }
     }
     let _ = writeln!(s, "      default: ;");
@@ -1756,6 +1778,15 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
         #(_harc_rc);
       end
     end
+  end
+
+  // Runs on every simulation end, including a DUT-initiated $finish
+  // the HARC runtime never sees. harc_cosim_shutdown() reports (and
+  // exits nonzero) when the test had not finished — without this, an
+  // early $finish would end the process with exit 0 and no test
+  // summary, indistinguishable from silence.
+  final begin
+    harc_cosim_shutdown();
   end
 
 endmodule
@@ -2181,6 +2212,14 @@ fn cmd_sim(
         }
         if mt {
             return Err(miette::miette!("--cosim dpi does not support --mt yet"));
+        }
+        if !params.is_empty() {
+            return Err(miette::miette!(
+                "--cosim dpi does not support --param yet: the -G override \
+                 would target the generated HarcCosimTop harness (which has \
+                 no parameters), and the accessor widths are folded from the \
+                 DUT's default parameter values"
+            ));
         }
     }
 

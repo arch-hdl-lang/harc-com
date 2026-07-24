@@ -134,6 +134,18 @@ inline constexpr bool is_harc_wide_v = is_harc_wide<std::remove_cv_t<std::remove
 template<typename T> struct harc_wide_words;
 template<std::size_t N> struct harc_wide_words<HarcWide<N>> { static constexpr std::size_t value = N; };
 
+// Marker trait for co-sim accessor proxies (harc_cosim_rt.h
+// specializes it). Used instead of `is_convertible_v<Sig, uint64_t>`
+// in the signal helpers: convertibility is broader than "proxy" —
+// HarcWide itself converts to uint64_t, and keying the scalar-read
+// path on convertibility would silently truncate a future wide call
+// site.
+template<typename T> struct harc_is_accessor_proxy : std::false_type {};
+template<typename T>
+inline constexpr bool harc_is_accessor_proxy_v =
+    harc_is_accessor_proxy<std::remove_cv_t<std::remove_reference_t<T>>>::value;
+
+
 template<typename T>
 inline long long harc_printf_ll(const T& v) {
     if constexpr (is_harc_wide_v<T>) {
@@ -457,10 +469,9 @@ template<typename Sig>
 inline auto harc_read(const Sig& sig) {
     if constexpr (std::is_arithmetic_v<Sig>) {
         return static_cast<_harc_u128>(sig);
-    } else if constexpr (std::is_convertible_v<Sig, uint64_t>) {
-        // Class-typed scalar reads — the co-sim accessor proxy
-        // (harc_cosim_rt.h SigProxy) converts to uint64_t; anything
-        // convertible is a <= 64-bit scalar, not a word-array wide.
+    } else if constexpr (harc_is_accessor_proxy_v<Sig>) {
+        // Co-sim accessor proxy (harc_cosim_rt.h SigProxy): a <= 64-bit
+        // scalar behind a DPI accessor, not a word-array wide.
         return static_cast<_harc_u128>(static_cast<uint64_t>(sig));
     } else {
         constexpr std::size_t N = sizeof(Sig) / sizeof(uint32_t);
@@ -608,10 +619,10 @@ inline void harc_vec_lane_write(Sig& sig, std::size_t lane, Val val) {
         const _harc_u128 ins =
             (static_cast<_harc_u128>(static_cast<uint64_t>(val)) & harc_mask_u128(W)) << shift;
         const _harc_u128 cur = static_cast<_harc_u128>(sig);
-        if constexpr (!std::is_arithmetic_v<Bare> && std::is_convertible_v<Bare, uint64_t>) {
-            // Class-typed scalar port (co-sim accessor proxy): assign
-            // through its uint64_t path — proxies only exist for <=64-bit
-            // ports, so the truncation is exact.
+        if constexpr (harc_is_accessor_proxy_v<Bare>) {
+            // Co-sim accessor proxy: assign through its uint64_t path —
+            // scalar proxies only exist for <=64-bit ports, so the
+            // truncation is exact.
             sig = static_cast<uint64_t>((cur & ~field_mask) | ins);
         } else {
             sig = static_cast<Bare>((cur & ~field_mask) | ins);
@@ -766,6 +777,7 @@ inline bool harc_eq_words(const Sig& sig, std::initializer_list<uint32_t> words)
         return static_cast<uint64_t>(sig) == expected;
     } else {
         constexpr std::size_t N = sizeof(Sig) / sizeof(uint32_t);
+        static_assert(N > 0, "harc_eq_words: signal type has no word representation");
         std::size_t i = 0;
         for (auto w : words) {
             uint32_t s = (i < N) ? static_cast<uint32_t>(sig[i]) : 0u;

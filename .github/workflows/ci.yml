@@ -331,6 +331,14 @@ jobs:
           HARC_CXX: clang++
         run: ./tests/run_cosim_fixtures.sh
 
+      - name: Run negative fixtures through --cosim dpi (expects $fatal path)
+        # Exercises the failure half of the co-sim protocol —
+        # RC_DONE_FAIL -> $fatal -> nonzero exit — which the all-green
+        # parity sweep never touches.
+        env:
+          HARC_CXX: clang++
+        run: ./tests/run_cosim_negative_fixtures.sh
+
       - name: ccache stats
         if: always()
         run: ccache -s
