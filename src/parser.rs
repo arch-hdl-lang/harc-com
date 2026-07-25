@@ -3295,7 +3295,7 @@ impl Parser {
                 if self.check(TokenKind::With) {
                     self.advance();
                     while !self.check_end_keyword() {
-                        with_body.push(self.parse_constraint_expr()?);
+                        with_body.push(self.parse_randomize_constraint_expr()?);
                     }
                     self.expect_end_anon(TokenKind::Randomize)?;
                 }
@@ -3317,7 +3317,7 @@ impl Parser {
                 if self.check(TokenKind::With) {
                     self.advance();
                     while !self.check_end_keyword() {
-                        with_body.push(self.parse_constraint_expr()?);
+                        with_body.push(self.parse_randomize_constraint_expr()?);
                     }
                     self.expect_end_anon(TokenKind::Randomize)?;
                 }
@@ -3789,6 +3789,25 @@ impl Parser {
             return self.parse_foreach_constraint_expr();
         }
         self.parse_expr()
+    }
+
+    fn parse_randomize_constraint_expr(&mut self) -> Result<Expr, CompileError> {
+        if self.check_ident("soft") {
+            let start = self.advance().unwrap().span;
+            let expr = self.parse_constraint_expr()?;
+            let weight = if self.check(TokenKind::Weight) {
+                self.advance();
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            let end = weight.as_ref().map(|w| w.span).unwrap_or(expr.span);
+            return Ok(Expr::new(
+                ExprKind::SoftConstraint(SoftConstraint { expr, weight }),
+                start.merge(end),
+            ));
+        }
+        self.parse_constraint_expr()
     }
 
     fn parse_foreach_constraint_expr(&mut self) -> Result<Expr, CompileError> {
@@ -4480,7 +4499,7 @@ impl Parser {
                 if self.check(TokenKind::With) {
                     self.advance();
                     while !self.check_end_keyword() {
-                        with_body.push(self.parse_constraint_expr()?);
+                        with_body.push(self.parse_randomize_constraint_expr()?);
                     }
                     self.expect_end_anon(TokenKind::Randomize)?;
                 }

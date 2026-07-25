@@ -18,6 +18,7 @@ pub struct RuntimeProblemDescriptor {
     pub origin: String,
     pub fields: Vec<RuntimeFieldDescriptor>,
     pub constraints: Vec<RuntimeConstraintDescriptor>,
+    pub soft_constraints: Vec<RuntimeSoftConstraintDescriptor>,
     pub solve_order: Vec<String>,
 }
 
@@ -53,6 +54,14 @@ pub struct RuntimeConstraintDescriptor {
     pub assertion_name: String,
     pub origin: String,
     pub expr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSoftConstraintDescriptor {
+    pub assertion_name: String,
+    pub origin: String,
+    pub expr: String,
+    pub weight: u32,
 }
 
 impl RuntimeProblemTable {
@@ -175,6 +184,17 @@ impl RuntimeProblemDescriptor {
             })
             .collect();
 
+        let soft_constraints = problem
+            .soft_constraints
+            .iter()
+            .map(|clause| RuntimeSoftConstraintDescriptor {
+                assertion_name: clause.assertion_name.clone(),
+                origin: format!("{:?}", clause.origin),
+                expr: clause.expr.to_string(),
+                weight: clause.weight,
+            })
+            .collect();
+
         let solve_order = problem
             .solve_order
             .as_ref()
@@ -186,6 +206,7 @@ impl RuntimeProblemDescriptor {
             origin: problem.origin.to_string(),
             fields,
             constraints,
+            soft_constraints,
             solve_order,
         }
     }
@@ -207,6 +228,12 @@ impl RuntimeProblemDescriptor {
             out.push_str(&format!(
                 "  constraint {} {} {}\n",
                 constraint.assertion_name, constraint.origin, constraint.expr
+            ));
+        }
+        for constraint in &self.soft_constraints {
+            out.push_str(&format!(
+                "  soft_constraint {} weight={} {} {}\n",
+                constraint.assertion_name, constraint.weight, constraint.origin, constraint.expr
             ));
         }
         if !self.solve_order.is_empty() {

@@ -92,6 +92,15 @@ constraints. The implementation may use rejection sampling, randomized solver
 objectives, or a hybrid strategy, but the chosen behavior must be documented
 and stable under a seed.
 
+`soft <constraint> [weight <positive-int>]` inside `randomize(t) with ...` is a
+best-effort overlay on top of existing hard constraints. Transaction `keep`
+clauses, field/domain constraints, and ordinary `with` body clauses are asserted
+first and must remain satisfiable on their own. Soft clauses are then attempted
+in descending weight order, preserving source order for equal weights; a soft
+clause that conflicts with already-accepted hard/soft clauses is dropped without
+making the randomize call fail. Soft weights are compile-time positive integer
+literals so the attempt order is deterministic and seed-independent.
+
 Current v1 codegen uses deterministic seeded candidate preferences for ordinary
 solver-backed randomization. Those preferences are added on a temporary solver
 stack and dropped if they conflict with hard user constraints, so a sampled

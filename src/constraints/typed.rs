@@ -490,8 +490,31 @@ fn origin_short(o: &ConstraintOrigin) -> String {
             format!("keep@{transaction}")
         }
         ConstraintOrigin::RandomizeWith { .. } => "randomize_with".to_string(),
+        ConstraintOrigin::RandomizeSoft { weight, .. } => format!("soft@w{weight}"),
         ConstraintOrigin::RelationExpansion { relation, .. } => format!("rel@{relation}"),
         ConstraintOrigin::FieldAttribute { field, attr, .. } => format!("attr[{attr}]@{field}"),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CTypedSoftClause {
+    pub origin: ConstraintOrigin,
+    /// Must be `CType::Bool`.  Verifier enforces.
+    pub expr: CTypedExpr,
+    pub assertion_name: String,
+    pub weight: u32,
+}
+
+impl fmt::Display for CTypedSoftClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "[{}] soft weight {} {} := {}",
+            self.assertion_name,
+            self.weight,
+            origin_short(&self.origin),
+            self.expr
+        )
     }
 }
 
@@ -559,6 +582,7 @@ pub struct CTypedProblem {
     pub origin: ProblemOrigin,
     pub env: FieldEnv,
     pub constraints: Vec<CTypedClause>,
+    pub soft_constraints: Vec<CTypedSoftClause>,
     /// `solve_order(a, b, c)` — fields are fixed in this order during
     /// solving; ordinary unconstrained fields sample after the last
     /// fixed field.  `None` = no user-specified order; runtime picks.
@@ -574,6 +598,9 @@ impl fmt::Display for CTypedProblem {
         }
         for c in &self.constraints {
             writeln!(f, "  clause {c}")?;
+        }
+        for c in &self.soft_constraints {
+            writeln!(f, "  soft {c}")?;
         }
         if let Some(order) = &self.solve_order {
             let order_str: Vec<String> = order.iter().map(|p| p.dotted()).collect();
@@ -748,6 +775,7 @@ mod tests {
             },
             env,
             constraints: vec![clause],
+            soft_constraints: vec![],
             solve_order: Some(vec![
                 FieldPath::of("p", "addr"),
                 FieldPath::of("p", "value"),

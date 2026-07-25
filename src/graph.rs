@@ -1538,6 +1538,12 @@ fn index_expr(builder: &mut GraphBuilder, owner: &str, expr: &Expr, file: &Parse
                 index_expr(builder, owner, e, file);
             }
         }
+        ExprKind::SoftConstraint(sc) => {
+            index_expr(builder, owner, &sc.expr, file);
+            if let Some(weight) = &sc.weight {
+                index_expr(builder, owner, weight, file);
+            }
+        }
         ExprKind::Randomize {
             target, with_body, ..
         } => {

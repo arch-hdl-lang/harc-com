@@ -437,7 +437,19 @@ fn collect_expr(
                 collect_expr(expr, env, context, out);
             }
         }
-        ExprKind::DistDirective { target, .. } => collect_expr(target, env, context, out),
+        ExprKind::SoftConstraint(sc) => {
+            collect_expr(&sc.expr, env, context, out);
+            if let Some(weight) = &sc.weight {
+                collect_expr(weight, env, context, out);
+            }
+        }
+        ExprKind::DistDirective { target, entries } => {
+            collect_expr(target, env, context, out);
+            for entry in entries {
+                collect_expr(&entry.value, env, context, out);
+                collect_expr(&entry.weight, env, context, out);
+            }
+        }
         ExprKind::NamedArg { value, .. } => collect_expr(value, env, context, out),
         ExprKind::StructLit { fields, .. } => {
             for field in fields {

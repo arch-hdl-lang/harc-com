@@ -108,6 +108,8 @@ pub enum LowerError {
     DisallowedInConstraint { what: &'static str, span: Span },
     /// Failed to parse an integer literal (malformed source).
     IntParseFailed { source: String, span: Span },
+    /// Soft constraint weights must be compile-time positive integers.
+    BadSoftWeight { span: Span },
 }
 
 // ─── Lowering context ───────────────────────────────────────────────
@@ -176,6 +178,7 @@ pub fn lower_problem(
     ctx.env.enums = collect_enum_entries(elab);
 
     let mut clauses = Vec::new();
+    let mut soft_clauses = Vec::new();
     let mut solve_order: Option<Vec<FieldPath>> = None;
 
     // 1. Transaction-level `keep` clauses.
@@ -207,6 +210,31 @@ pub fn lower_problem(
             }
             if let ExprKind::SolveOrder { args } = &*expr.kind {
                 merge_solve_order_directive(&mut ctx, args, &mut solve_order, expr.span);
+                continue;
+            }
+            if let ExprKind::SoftConstraint(sc) = &*expr.kind {
+                let weight = soft_weight_u32(&mut ctx, sc.weight.as_ref());
+                for (origin, expr_ast) in expand_top_level_clause(
+                    &mut ctx,
+                    &sc.expr,
+                    ConstraintOrigin::RandomizeSoft {
+                        span: expr.span,
+                        weight,
+                    },
+                    &mut Vec::new(),
+                ) {
+                    if ctx.at_error_cap() {
+                        break;
+                    }
+                    let lowered = lower_top_clause(&mut ctx, &expr_ast);
+                    let assertion_name = mint_clause_name(&mut ctx, &expr_ast);
+                    soft_clauses.push(CTypedSoftClause {
+                        origin,
+                        expr: lowered,
+                        assertion_name,
+                        weight,
+                    });
+                }
                 continue;
             }
             for (origin, expr_ast) in expand_top_level_clause(
@@ -265,6 +293,7 @@ pub fn lower_problem(
         origin,
         env: ctx.env,
         constraints: clauses,
+        soft_constraints: soft_clauses,
         solve_order,
     };
 
@@ -1518,6 +1547,23 @@ fn parse_int_literal(text: &str) -> Option<u128> {
     u128::from_str_radix(body, radix).ok()
 }
 
+fn soft_weight_u32(ctx: &mut LowerCtx<'_>, weight: Option<&Expr>) -> u32 {
+    let Some(weight) = weight else {
+        return 1;
+    };
+    let ExprKind::Int(text) = &*weight.kind else {
+        ctx.record_error(LowerError::BadSoftWeight { span: weight.span });
+        return 1;
+    };
+    match parse_int_literal(text).and_then(|v| u32::try_from(v).ok()) {
+        Some(0) | None => {
+            ctx.record_error(LowerError::BadSoftWeight { span: weight.span });
+            1
+        }
+        Some(v) => v,
+    }
+}
+
 fn default_unsigned_width(value: u128) -> u32 {
     // Smallest unsigned width that fits.  Clamped to at least 1.
     if value == 0 {
@@ -1949,6 +1995,22 @@ mod tests {
         )
     }
 
+    fn lower_with_exprs(src: &str, body_exprs: &[Expr]) -> Result<CTypedProblem, Vec<LowerError>> {
+        let elab = elaborate(src);
+        let txn = elab
+            .transactions
+            .first()
+            .expect("test source must declare a transaction")
+            .clone();
+        lower_problem(
+            &elab,
+            &txn,
+            Some(body_exprs),
+            Span::default(),
+            ConstraintProblemId(0),
+        )
+    }
+
     fn lower_bare_txn(src: &str) -> Result<CTypedProblem, Vec<LowerError>> {
         let elab = elaborate(src);
         let txn = elab
@@ -1979,6 +2041,57 @@ end transaction RegPair
             display.contains("==") && display.contains("24:u8"),
             "got: {display}"
         );
+    }
+
+    #[test]
+    fn lowers_soft_randomize_constraint_separately_from_hard_clauses() {
+        let src = r#"
+transaction Packet
+  addr : uint<8>
+end transaction Packet
+"#;
+        let hard = parse_expr_fragment("p.addr != 0").expect("hard expr");
+        let soft_expr = parse_expr_fragment("p.addr == 24").expect("soft expr");
+        let weight = parse_expr_fragment("5").expect("weight");
+        let soft = Expr::new(
+            ExprKind::SoftConstraint(crate::ast::SoftConstraint {
+                expr: soft_expr,
+                weight: Some(weight),
+            }),
+            Span::default(),
+        );
+
+        let problem = lower_with_exprs(src, &[hard, soft]).expect("soft lowering should succeed");
+        assert_eq!(problem.constraints.len(), 1);
+        assert_eq!(problem.soft_constraints.len(), 1);
+        assert_eq!(problem.soft_constraints[0].weight, 5);
+        assert!(matches!(
+            problem.soft_constraints[0].origin,
+            ConstraintOrigin::RandomizeSoft { weight: 5, .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_non_literal_soft_weight() {
+        let src = r#"
+transaction Packet
+  addr : uint<8>
+end transaction Packet
+"#;
+        let soft_expr = parse_expr_fragment("p.addr == 24").expect("soft expr");
+        let weight = parse_expr_fragment("p.addr").expect("weight");
+        let soft = Expr::new(
+            ExprKind::SoftConstraint(crate::ast::SoftConstraint {
+                expr: soft_expr,
+                weight: Some(weight),
+            }),
+            Span::default(),
+        );
+
+        let err = lower_with_exprs(src, &[soft]).expect_err("non-literal weight should fail");
+        assert!(err
+            .iter()
+            .any(|e| matches!(e, LowerError::BadSoftWeight { .. })));
     }
 
     #[test]

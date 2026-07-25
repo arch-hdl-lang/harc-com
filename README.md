@@ -208,7 +208,7 @@ See [`docs/harc-sim-cli.md`](docs/harc-sim-cli.md) for the complete `harc sim` o
 
 Use `harc trace-merge --vcd wave.vcd --trace trace.jsonl --out merged.vcd` to overlay semantic trace events into a signal VCD. The merged VCD adds a synthetic `harc_semantic` scope with event lanes and embeds string-ID mappings as VCD comments; pass `--map-out trace-map.json` for the same mappings as a JSON sidecar. See [`docs/semantic-trace.md`](docs/semantic-trace.md) for status and follow-on TODOs.
 
-Z3 is required for constraint-randomized tests (`randomize(t) with ...` and transaction `keep` constraints). System installs are auto-detected, and custom installs can be selected with a root prefix or explicit include/lib directories:
+Z3 is required for constraint-randomized tests (`randomize(t) with ...` and transaction `keep` constraints). A `randomize` body may add best-effort overlays with `soft <constraint> [weight <positive-int>]`; hard `keep` and ordinary `with` constraints remain mandatory, and conflicting soft clauses are dropped in descending weight order. System installs are auto-detected, and custom installs can be selected with a root prefix or explicit include/lib directories:
 
 ```sh
 HARC_Z3_ROOT=/path/to/z3 harc sim --sv dut.sv test.harc --top Top
@@ -232,6 +232,7 @@ The resolver checks CLI flags first, then `HARC_Z3_INCLUDE_DIR` / `HARC_Z3_LIB_D
 | `axilite_bus_send_test.harc` | `AxiLiteRegs.sv` | typed bus binding + `bus.<ch>.send/recv` |
 | `axilite_bound_mon_test.harc` | `AxiLiteRegs.sv` | bound monitor (`on bus.<ch>.handshake(t)`) |
 | `axilite_constraint_test.harc` | `AxiLiteRegs.sv` | `randomize(t) with …` through Z3 |
+| `soft_constraint_randomize_test.harc` | `top_counter.sv` | weighted soft `randomize(t) with` overlays |
 | `dma_engine_tlm_target_test.harc` | `dma_engine_tlm_mem.sv` + `dma_engine.sv` | target responder TLM memory BFM serving an SV DMA initiator |
 | `dma_engine_tlm_mem_model_test.harc` | `dma_engine_tlm_mem.sv` + `dma_engine.sv` | stateful target-side TLM memory model with final copied-data checks |
 | `tlm_target_forwarding_test.harc` | `TlmForwardingTop.sv` | target responder forwarding a request to a second TLM method |

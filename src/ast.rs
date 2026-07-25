@@ -408,6 +408,16 @@ pub struct DistEntry {
     pub weight: Expr,
 }
 
+/// `soft <expr> [weight <expr>]` — a best-effort randomize-with overlay.
+/// Hard transaction `keep` clauses and ordinary randomize constraints remain
+/// mandatory; soft clauses are tried in descending weight and dropped only when
+/// they conflict with already-accepted hard/soft clauses.
+#[derive(Debug, Clone)]
+pub struct SoftConstraint {
+    pub expr: Expr,
+    pub weight: Option<Expr>,
+}
+
 // ── Relation (§4) ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -1196,6 +1206,8 @@ pub enum ExprKind {
         target: Expr,
         with_body: Vec<Expr>,
     },
+    /// `soft <expr> [weight <expr>]` directive form inside `randomize ... with`.
+    SoftConstraint(SoftConstraint),
     /// `dist <expr> { ... }` directive form inside `randomize ... with`.
     DistDirective {
         target: Expr,

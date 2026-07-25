@@ -109,6 +109,33 @@ fn build_z3_problem(problem: &CTypedProblem) -> Result<Z3Problem, SolverBuildErr
         });
     }
 
+    // NOTE: `assert-soft` is MaxSMT — Z3 maximizes the *total* weight of
+    // satisfied soft clauses. That is NOT the semantics documented in
+    // `docs/constraint-system-plan.md`, which the `cpp_tb.rs` runtime
+    // implements: soft clauses attempted in strict descending-weight order,
+    // each dropped if it conflicts with what has already been accepted.
+    // The two disagree whenever several lighter clauses outweigh a heavier
+    // one they collectively conflict with — e.g. soft A(10) conflicting with
+    // B(6) AND C(6): descending-weight keeps A, MaxSMT keeps B+C.
+    //
+    // This is latent, not shipped: this module is a text-rendering scaffold
+    // (see the module docs) and does not drive any simulation. Before this
+    // backend is promoted to the runtime path, either switch to a
+    // lexicographic encoding (descending weight groups) or amend the spec —
+    // do not let the two paths silently diverge.
+    for clause in &problem.soft_constraints {
+        let expr = lower_expr(problem, &clause.expr)?;
+        let name = z3_assertion_name(&clause.assertion_name);
+        smt.push_str(&format!(
+            "(assert-soft {expr} :weight {} :id {name})\n",
+            clause.weight
+        ));
+        assertions.push(Z3Assertion {
+            name,
+            origin: clause.origin.clone(),
+        });
+    }
+
     if let Some(order) = &problem.solve_order {
         let order = order
             .iter()
@@ -379,6 +406,7 @@ mod tests {
                 expr,
                 assertion_name: "c.keep/0".to_string(),
             }],
+            soft_constraints: vec![],
             solve_order: None,
         }
     }
