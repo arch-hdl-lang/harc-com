@@ -32,6 +32,11 @@ case "$HARC" in
     *) HARC="$PWD/$HARC" ;;
 esac
 
+# This table is the ONLY thing that decides what runs — fixtures are not
+# auto-discovered from tests/fixtures/. A new fixture without a row here is
+# silently never executed, so tests/check_fixture_registration.sh enforces that
+# every DUT-driving fixture is reachable from some runner.
+#
 # Each row: <test_name> <top_module> <sv_files> <extra_harc_files> <ref_src> <test_struct>
 # Fields are pipe-separated. SV files are relative to DUT_DIR; HARC files
 # are relative to FIX_DIR. Multiple files within a field are space-
