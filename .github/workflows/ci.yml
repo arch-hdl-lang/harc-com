@@ -45,6 +45,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: fixture registration
+        # A fixture with a DUT that no runner references never executes, and
+        # the omission is invisible — CI stays green. See #514.
+        run: ./tests/check_fixture_registration.sh
+
       - name: Install Z3
         run: sudo apt-get update && sudo apt-get install -y libz3-dev
 

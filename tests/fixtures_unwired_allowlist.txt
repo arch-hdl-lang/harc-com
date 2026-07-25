@@ -1,0 +1,11 @@
+# Fixtures that declare a DUT but are intentionally not reachable from any
+# runner. Checked by tests/check_fixture_registration.sh.
+#
+# Format:  <fixture_name> # <reason>
+#
+# A reason is mandatory. Prefer wiring the fixture into tests/run_fixtures.sh
+# over adding a line here — an entry means the fixture gets no sim coverage.
+# Entries are also checked for staleness: once a fixture becomes wired, its
+# line here must be removed.
+
+uint64_unique_randomize_test # references a `DummyDut` that is not vendored in tests/dut/; needs a DUT before it can run — see issue #515
