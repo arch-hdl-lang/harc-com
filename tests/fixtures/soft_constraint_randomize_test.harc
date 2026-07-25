@@ -1,0 +1,45 @@
+// Soft randomize constraints are best-effort overlays: hard `keep` and
+// randomize-with clauses remain mandatory, while soft clauses are tried in
+// descending weight and dropped when they conflict.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction SoftReq
+    value : uint<8>
+
+    keep value < 8
+end transaction SoftReq
+
+test SoftConstraintRandomizeTest
+    let dut : Top
+
+    clock clk = SysDomain
+
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        let preferred : SoftReq
+        randomize(preferred) with
+            soft preferred.value == 3 weight 10
+            soft preferred.value == 9 weight 1
+        end randomize
+        assert preferred.value == 3
+            else fail("expected satisfiable higher-weight soft value 3, got ${preferred.value}")
+
+        let hard_wins : SoftReq
+        randomize(hard_wins) with
+            hard_wins.value == 2
+            soft hard_wins.value == 7 weight 100
+        end randomize
+        assert hard_wins.value == 2
+            else fail("hard constraint lost to soft constraint, value=${hard_wins.value}")
+
+        log(info, "PASS: soft randomize constraints obey hard constraints and weights")
+    end run
+end test SoftConstraintRandomizeTest

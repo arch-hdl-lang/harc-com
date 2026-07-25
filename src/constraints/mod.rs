@@ -143,6 +143,10 @@ pub enum ConstraintOrigin {
     RandomizeWith {
         span: Span,
     },
+    RandomizeSoft {
+        span: Span,
+        weight: u32,
+    },
     RelationExpansion {
         relation: String,
         span: Span,

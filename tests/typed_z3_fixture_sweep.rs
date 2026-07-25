@@ -55,7 +55,7 @@ fn typed_z3_backend_builds_for_clean_fixture_lowers() {
                     );
                     assert_eq!(
                         z3.assertions.len(),
-                        typed.constraints.len(),
+                        typed.constraints.len() + typed.soft_constraints.len(),
                         "assertion origin map lost clauses for {} {}",
                         path.display(),
                         source_label(&entry.source)

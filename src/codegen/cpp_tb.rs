@@ -5440,6 +5440,12 @@ fn collect_randomize_target_field_refs(
                 collect_randomize_target_field_refs(arg, field_info, target_root, out);
             }
         }
+        ExprKind::SoftConstraint(sc) => {
+            collect_randomize_target_field_refs(&sc.expr, field_info, target_root, out);
+            if let Some(weight) = &sc.weight {
+                collect_randomize_target_field_refs(weight, field_info, target_root, out);
+            }
+        }
         ExprKind::DistDirective { target, entries } => {
             collect_randomize_target_field_refs(target, field_info, target_root, out);
             for entry in entries {
@@ -12119,6 +12125,24 @@ impl Emitter {
                     );
                 }
             }
+            ExprKind::SoftConstraint(sc) => {
+                self.validate_randomize_constraint_dependencies(
+                    ty,
+                    &sc.expr,
+                    field_info,
+                    target_root,
+                    blocking,
+                );
+                if let Some(weight) = &sc.weight {
+                    self.validate_randomize_constraint_dependencies(
+                        ty,
+                        weight,
+                        field_info,
+                        target_root,
+                        blocking,
+                    );
+                }
+            }
             ExprKind::SystemCall { args, .. } | ExprKind::SolveOrder { args } => {
                 for e in args {
                     self.validate_randomize_constraint_dependencies(
@@ -12591,6 +12615,13 @@ impl Emitter {
                 iter: self.expand_relation_subtree(iter),
                 body: self.expand_relation_calls(body),
             },
+            ExprKind::SoftConstraint(sc) => ExprKind::SoftConstraint(SoftConstraint {
+                expr: self.expand_relation_subtree(&sc.expr),
+                weight: sc
+                    .weight
+                    .as_ref()
+                    .map(|weight| self.expand_relation_subtree(weight)),
+            }),
             ExprKind::Cast { expr, ty } => ExprKind::Cast {
                 expr: self.expand_relation_subtree(expr),
                 ty: ty.clone(),
@@ -12697,6 +12728,13 @@ impl Emitter {
                 expr: self.enum_variants_as_ints(expr),
                 set: self.enum_variants_as_ints(set),
             },
+            ExprKind::SoftConstraint(sc) => ExprKind::SoftConstraint(SoftConstraint {
+                expr: self.enum_variants_as_ints(&sc.expr),
+                weight: sc
+                    .weight
+                    .as_ref()
+                    .map(|weight| self.enum_variants_as_ints(weight)),
+            }),
             ExprKind::SetLit(items) => ExprKind::SetLit(
                 items
                     .iter()
@@ -12751,8 +12789,43 @@ impl Emitter {
             std::collections::HashMap::new();
         let mut solve_order_directives: Vec<Vec<String>> = Vec::new();
         let mut hard_constraints: Vec<&Expr> = Vec::new();
+        let mut soft_constraints: Vec<(&Expr, u32)> = Vec::new();
         for c in with_body {
             match &*c.kind {
+                ExprKind::SoftConstraint(sc) => {
+                    if matches!(
+                        &*sc.expr.kind,
+                        ExprKind::DistDirective { .. } | ExprKind::SolveOrder { .. }
+                    ) {
+                        self.errors.push(format!(
+                            "randomize({ty}) with `soft`: expected a boolean constraint expression"
+                        ));
+                        continue;
+                    }
+                    let weight = match sc
+                        .weight
+                        .as_ref()
+                        .map_or(Some(1), |weight| fold_int_literal(weight))
+                        .and_then(|weight| u32::try_from(weight).ok())
+                    {
+                        Some(0) | None => {
+                            self.errors.push(format!(
+                                "randomize({ty}) with `soft`: weight must be a positive integer literal"
+                            ));
+                            1
+                        }
+                        Some(weight) => weight,
+                    };
+                    self.validate_randomize_constraint_dependencies(
+                        ty,
+                        &sc.expr,
+                        &field_info,
+                        target_root,
+                        blocking,
+                    );
+                    soft_constraints.push((&sc.expr, weight));
+                    continue;
+                }
                 ExprKind::DistDirective { target, entries } => {
                     if let Some(field) =
                         randomize_target_field_name(target, &field_info, target_root)
@@ -13299,6 +13372,64 @@ impl Emitter {
                 fields.join(", ")
             )
             .ok();
+        }
+        let mut ordered_soft_constraints: Vec<(usize, &Expr, u32)> = soft_constraints
+            .iter()
+            .enumerate()
+            .map(|(idx, (expr, weight))| (idx, *expr, *weight))
+            .collect();
+        ordered_soft_constraints.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        for (idx, c, weight) in ordered_soft_constraints {
+            self.pad(depth + 1);
+            writeln!(
+                self.out,
+                "_s.push();   // soft constraint weight {}: {}",
+                weight,
+                escape_c(&expr_source_str(c))
+            )
+            .ok();
+            if let ExprKind::ForEachConstraint { var, iter, body } = &*c.kind {
+                self.emit_foreach_constraint_clauses(
+                    ty,
+                    var,
+                    iter,
+                    body,
+                    &field_info,
+                    target_root,
+                    blocking,
+                    &list_unroll_bounds,
+                    solver_width,
+                    depth + 1,
+                );
+            } else {
+                self.pad(depth + 1);
+                write!(self.out, "_s.add(").ok();
+                self.emit_constraint_expr_with_list_bounds(
+                    c,
+                    &field_info,
+                    solver_width,
+                    target_root,
+                    blocking,
+                    &list_unroll_bounds,
+                );
+                writeln!(self.out, ");").ok();
+            }
+            self.pad(depth + 1);
+            writeln!(self.out, "auto _soft_r_{idx} = _s.check();").ok();
+            self.pad(depth + 1);
+            writeln!(self.out, "if (_soft_r_{idx} != z3::sat) {{").ok();
+            self.pad(depth + 2);
+            writeln!(self.out, "_s.pop();").ok();
+            self.pad(depth + 2);
+            writeln!(
+                self.out,
+                "sim_log_line(\"INFO\", \"randomize(t) with: dropped unsatisfiable soft constraint `{}` (weight {})\");",
+                escape_c(&expr_source_str(c)),
+                weight
+            )
+            .ok();
+            self.pad(depth + 1);
+            writeln!(self.out, "}}").ok();
         }
 
         // Detect fields the user has equality-pinned (e.g. `t.addr == 24`).
@@ -19996,6 +20127,12 @@ fn rewrite_expr_for_impl(
             inner_shadow.insert(var.name.clone());
             for x in body.iter_mut() {
                 rewrite_expr_for_impl(x, fields, methods, _pointers, &inner_shadow);
+            }
+        }
+        ExprKind::SoftConstraint(sc) => {
+            rewrite_expr_for_impl(&mut sc.expr, fields, methods, _pointers, shadow);
+            if let Some(weight) = sc.weight.as_mut() {
+                rewrite_expr_for_impl(weight, fields, methods, _pointers, shadow);
             }
         }
         ExprKind::DistDirective { target, .. } => {

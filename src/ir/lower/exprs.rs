@@ -601,6 +601,7 @@ impl FuncBuilder<'_> {
             ExprKind::NamedArg { .. } => Err(unsupported("named arguments", "")),
             ExprKind::CoverArrow { .. } => Err(unsupported("cover-sequence patterns", "")),
             ExprKind::SolveOrder { .. } => Err(unsupported("`solve_order`", "")),
+            ExprKind::SoftConstraint(_) => Err(unsupported("`soft` constraints", "")),
             ExprKind::ForEachConstraint { .. } => {
                 Err(unsupported("constraint `for` comprehensions", ""))
             }

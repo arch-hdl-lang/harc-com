@@ -1292,7 +1292,7 @@ fn print_stmt(out: &mut String, s: &Stmt, depth: usize) {
             if !with_body.is_empty() {
                 writeln!(out, " with").ok();
                 for e in with_body {
-                    print_constraint_expr(out, e, depth + 1);
+                    print_randomize_constraint_expr(out, e, depth + 1);
                 }
                 pad(out, depth);
                 writeln!(out, "end randomize").ok();
@@ -1654,9 +1654,17 @@ pub fn print_expr(out: &mut String, e: &Expr) {
                     if i > 0 {
                         write!(out, "; ").ok();
                     }
-                    print_expr(out, e);
+                    print_randomize_constraint_inline(out, e);
                 }
                 write!(out, " end randomize").ok();
+            }
+        }
+        ExprKind::SoftConstraint(sc) => {
+            write!(out, "soft ").ok();
+            print_expr(out, &sc.expr);
+            if let Some(weight) = &sc.weight {
+                write!(out, " weight ").ok();
+                print_expr(out, weight);
             }
         }
         ExprKind::DistDirective { target, entries } => {
@@ -1752,6 +1760,36 @@ fn print_constraint_expr(out: &mut String, e: &Expr, depth: usize) {
             print_expr(out, e);
             writeln!(out).ok();
         }
+    }
+}
+
+fn print_randomize_constraint_expr(out: &mut String, e: &Expr, depth: usize) {
+    match &*e.kind {
+        ExprKind::SoftConstraint(sc) => {
+            pad(out, depth);
+            write!(out, "soft ").ok();
+            print_expr(out, &sc.expr);
+            if let Some(weight) = &sc.weight {
+                write!(out, " weight ").ok();
+                print_expr(out, weight);
+            }
+            writeln!(out).ok();
+        }
+        _ => print_constraint_expr(out, e, depth),
+    }
+}
+
+fn print_randomize_constraint_inline(out: &mut String, e: &Expr) {
+    match &*e.kind {
+        ExprKind::SoftConstraint(sc) => {
+            write!(out, "soft ").ok();
+            print_expr(out, &sc.expr);
+            if let Some(weight) = &sc.weight {
+                write!(out, " weight ").ok();
+                print_expr(out, weight);
+            }
+        }
+        _ => print_expr(out, e),
     }
 }
 

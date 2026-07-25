@@ -137,19 +137,11 @@ impl<'a> Verifier<'a> {
         }
 
         for clause in &self.problem.constraints {
-            if clause.assertion_name.is_empty() {
-                self.push(VerifyError::EmptyAssertionName {
-                    span: clause.expr.span,
-                });
-            }
-            self.verify_expr(&clause.expr);
-            if clause.expr.ty != CType::Bool {
-                self.push(VerifyError::ClauseNotBool {
-                    assertion_name: clause.assertion_name.clone(),
-                    found: clause.expr.ty.clone(),
-                    span: clause.expr.span,
-                });
-            }
+            self.verify_clause(&clause.assertion_name, &clause.expr);
+        }
+
+        for clause in &self.problem.soft_constraints {
+            self.verify_clause(&clause.assertion_name, &clause.expr);
         }
 
         if let Some(order) = &self.problem.solve_order {
@@ -269,6 +261,20 @@ impl<'a> Verifier<'a> {
                 self.expect_type("forall body", CType::Bool, body);
                 self.expect_type("forall result", CType::Bool, expr);
             }
+        }
+    }
+
+    fn verify_clause(&mut self, assertion_name: &str, expr: &CTypedExpr) {
+        if assertion_name.is_empty() {
+            self.push(VerifyError::EmptyAssertionName { span: expr.span });
+        }
+        self.verify_expr(expr);
+        if expr.ty != CType::Bool {
+            self.push(VerifyError::ClauseNotBool {
+                assertion_name: assertion_name.to_string(),
+                found: expr.ty.clone(),
+                span: expr.span,
+            });
         }
     }
 
@@ -720,6 +726,7 @@ mod tests {
             },
             env,
             constraints: vec![bool_clause(expr)],
+            soft_constraints: vec![],
             solve_order: None,
         }
     }
