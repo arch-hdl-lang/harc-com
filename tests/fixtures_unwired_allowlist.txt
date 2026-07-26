@@ -8,4 +8,3 @@
 # Entries are also checked for staleness: once a fixture becomes wired, its
 # line here must be removed.
 
-uint64_unique_randomize_test # references a `DummyDut` that is not vendored in tests/dut/; needs a DUT before it can run — see issue #515
