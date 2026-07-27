@@ -64,7 +64,12 @@ impl Uint64UniqueRandomizeTest for Uint64UniqueTb
 
         for i in 0 .. 33
             let s : Uint64UniqueStim
-            randomize(s)
+            // Force the exercised model value into the upper half so this
+            // extraction regression is deterministic rather than depending
+            // on one unconstrained draw landing above 2^32.
+            randomize(s) with
+                s.data[63:32] != 0
+            end randomize
             obs.observe(s)
         end for
     end run
