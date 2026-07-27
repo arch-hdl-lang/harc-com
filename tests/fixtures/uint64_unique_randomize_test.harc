@@ -1,17 +1,78 @@
 // Regression fixture for issue #167: uint<64> fields with [unique] should
 // keep their high auto-coverage endpoints without relying on Z3's asserting
 // get_numeral_uint64() extraction path.
+//
+// The structural half of this regression lives in
+// tests/codegen.rs::uint64_unique_randomize_uses_checked_model_extraction,
+// which asserts the *shape* of the emitted C++. That cannot catch a bug in
+// the extraction helper itself (`harc_z3_bv_low_u64` in
+// runtime/harc_z3_rt.h) — the emitted call site reads identically either
+// way. This fixture is the behavioral half: it runs the emitted code against
+// a real Z3 and asserts that values above 2^32 actually come back.
+//
+// The teeth are in `cp_high_half`. Truncating the extraction to 32 bits —
+// the #167 bug class — leaves every drawn value in the `zero` bin, so the
+// `nonzero` assertion below fails. Verified by mutating harc_z3_bv_low_u64.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
 
 transaction Uint64UniqueStim
     data : uint<64> with [unique within test]
 end transaction Uint64UniqueStim
 
-test Uint64UniqueRandomizeTest
-    let dut : DummyDut
+// Sample the randomized value at each `observe` call. Covering the high
+// half directly asserts that model extraction preserves bits 63..32.
+covergroup Uint64Cov @(obs.observe(s) post)
+    cp_high_half : cover s.data[63:32]
+        bins
+            zero    = {0}
+            nonzero = [1..4294967295]
+        end bins
+end covergroup Uint64Cov
+
+transactor StimObserver
+    dut : Top
+
+    when active
+        // Pure observation point — exists so the covergroup has a hook to
+        // sample the randomized transaction on.
+        hookable observe(s: Uint64UniqueStim)
+            wait 1 cycle
+        end observe
+    end when
+end transactor StimObserver
+
+testbench Uint64UniqueTb
+    dut : Top
+    obs : StimObserver active
+    cov : Uint64Cov
+end testbench Uint64UniqueTb
+
+impl Uint64UniqueRandomizeTest for Uint64UniqueTb
+    clock clk = SysDomain
+
     run
+        obs.dut = dut
+
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
         for i in 0 .. 33
             let s : Uint64UniqueStim
             randomize(s)
+            obs.observe(s)
         end for
     end run
-end test Uint64UniqueRandomizeTest
+
+    check
+        cov.report()
+        assert cov.cp_high_half.nonzero > 0
+            else fail("uint<64> randomize never produced a value above 2^32: model extraction is truncating the high half (issue #167)")
+        log(info, "PASS: uint<64> unique randomize preserves the high half")
+    end check
+end impl Uint64UniqueRandomizeTest

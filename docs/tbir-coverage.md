@@ -932,7 +932,6 @@ yet unlock — each stops at a DIFFERENT construct's gate, not randomize):
 |---|---|
 | scoreboard `.push(...)` method (per-instance state — out of the data-only scoreboard subset) | `axilite_sb_test` |
 | `tseq` construct | `axilite_fuzz_test` |
-| no SV DUT in the corpus (`let dut : DummyDut`; lowers + emits both codegens, but the equivalence harness needs a Verilator-buildable DUT) | `uint64_unique_randomize_test` |
 
 Also residual within the construct itself (precise rejections, not in
 these fixtures): the `randomize` **expression** form (`let v =
