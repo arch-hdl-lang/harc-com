@@ -20,12 +20,14 @@ end domain SysDomain
 
 transaction Uint64UniqueStim
     data : uint<64> with [unique within test]
+    sample : uint<64>
 end transaction Uint64UniqueStim
 
-// Sample the randomized value at each `observe` call. Covering the high
-// half directly asserts that model extraction preserves bits 63..32.
+// Sample the randomized value at each `observe` call. Covering the sample's
+// high half directly asserts that model extraction preserves bits 63..32;
+// `data` remains unconstrained so its `[unique]` history path stays active.
 covergroup Uint64Cov @(obs.observe(s) post)
-    cp_high_half : cover s.data[63:32]
+    cp_high_half : cover s.sample[63:32]
         bins
             zero    = {0}
             nonzero = [1..4294967295]
@@ -64,11 +66,11 @@ impl Uint64UniqueRandomizeTest for Uint64UniqueTb
 
         for i in 0 .. 33
             let s : Uint64UniqueStim
-            // Force the exercised model value into the upper half so this
-            // extraction regression is deterministic rather than depending
-            // on one unconstrained draw landing above 2^32.
+            // Force the sample into the upper half so this extraction
+            // regression is deterministic without constraining the separate
+            // `[unique]` field under test.
             randomize(s) with
-                s.data[63:32] != 0
+                s.sample[63:32] != 0
             end randomize
             obs.observe(s)
         end for

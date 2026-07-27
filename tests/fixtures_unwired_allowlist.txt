@@ -7,4 +7,3 @@
 # over adding a line here — an entry means the fixture gets no sim coverage.
 # Entries are also checked for staleness: once a fixture becomes wired, its
 # line here must be removed.
-
