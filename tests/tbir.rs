@@ -351,6 +351,8 @@ test T
         assert NEG_DIV == 0 - 3 else fail("x")
         assert NEG_MOD == 0 - 1 else fail("x")
         assert (NEG_ONE >> 1) == NEG_ONE else fail("direct-shr")
+        assert ((NEG_ONE as uint<8>) >> 1) == 9223372036854775807 else fail("cast-shr")
+        assert (NEG_ONE.sext<64>() >> 1) == NEG_ONE else fail("sext-shr")
     end run
 end test T"#,
     );
@@ -360,8 +362,34 @@ end test T"#,
         "sint consts must retain their signed value at use sites; got:\n{cpp}"
     );
     assert!(
-        cpp.contains("((int64_t)") && cpp.contains(">> 1"),
+        cpp.contains("((int64_t)(((int64_t)(-1)))) >> 1"),
         "signed const use sites must use arithmetic right shift; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("((uint64_t)(((uint64_t)(((int64_t)(-1)))))) >> 1"),
+        "uint relabel casts must use logical right shift; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("((int64_t)(((int64_t)(((int64_t)(-1)))))) >> 1"),
+        "sext results must use arithmetic right shift; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn const_sint64_min_emits_a_signed_literal() {
+    let cpp = emit_cpp_src(
+        r#"const MIN : sint<64> = -9223372036854775808
+
+test T
+    let dut : Top
+    run
+        assert MIN < 0 else fail("min")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("-9223372036854775807LL - 1"),
+        "sint<64> minimum must be emitted without an unsigned literal; got:\n{cpp}"
     );
 }
 

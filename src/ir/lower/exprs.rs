@@ -498,7 +498,22 @@ impl FuncBuilder<'_> {
                 // width-method receiver inference (done on the AST at
                 // the call site). Anything else stays rejected.
                 if cast_relabel_width(ty).is_some() {
-                    return self.lower_expr(expr);
+                    let width = cast_relabel_width(ty).expect("checked above");
+                    let kind = match ty {
+                        TypeExpr::Builtin {
+                            name: BuiltinTy::SInt | BuiltinTy::SIntCap,
+                            ..
+                        } => WidthCastKind::Sext,
+                        _ => WidthCastKind::Zext,
+                    };
+                    let src_width = self.infer_expr_width(expr);
+                    let inner = self.lower_expr(expr)?;
+                    return Ok(Expr::WidthCast {
+                        kind,
+                        width,
+                        src_width,
+                        inner: Box::new(inner),
+                    });
                 }
                 Err(unsupported(
                     "`as` casts outside scalar uint/sint/bits (≤ 64 bits)",

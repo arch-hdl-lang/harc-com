@@ -167,10 +167,10 @@ pub(super) fn resolve_state_instance<'a>(
 pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
     Ok(match e {
         Expr::Literal { value, ty } => match ty {
-            crate::ir::IrType::SInt(None) => format!("((int64_t)({}))", *value as i64),
+            crate::ir::IrType::SInt(_) => signed_literal_cpp(*value),
             // Keep unsigned file-scope constants at uint64_t rank so C++
             // applies the same usual-arithmetic conversions as v1.
-            crate::ir::IrType::UInt(None) => format!("((uint64_t)({value}))"),
+            crate::ir::IrType::UInt(_) => format!("((uint64_t)({value}))"),
             _ => format!("{value}"),
         },
         // The framework-provided cycle counter — emitted as the in-scope
@@ -628,6 +628,7 @@ fn width_cast_cpp(
                     }
                 }
             }
+            _ if width <= 64 => format!("((int64_t)({e}))"),
             _ => plain_cast(&e),
         },
         WidthCastKind::Resize => match src_width {
@@ -745,6 +746,7 @@ fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
         Expr::Ternary(_, then_expr, else_expr) => {
             expr_is_signed(cx, then_expr) && expr_is_signed(cx, else_expr)
         }
+        Expr::WidthCast { kind, .. } => matches!(kind, WidthCastKind::Sext),
         Expr::Binary(op, lhs, rhs) => match op {
             BinOp::Shl | BinOp::Shr => expr_is_signed(cx, lhs),
             BinOp::Div | BinOp::Mod => expr_is_signed(cx, lhs) && expr_is_signed(cx, rhs),
@@ -759,6 +761,15 @@ fn ir_type_width(ty: &crate::ir::IrType) -> Option<u32> {
         crate::ir::IrType::UInt(w) | crate::ir::IrType::SInt(w) => *w,
         crate::ir::IrType::Bool => Some(1),
         _ => None,
+    }
+}
+
+fn signed_literal_cpp(value: u64) -> String {
+    let value = value as i64;
+    if value == i64::MIN {
+        "((int64_t)(-9223372036854775807LL - 1))".to_string()
+    } else {
+        format!("((int64_t)({value}))")
     }
 }
 
