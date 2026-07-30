@@ -568,8 +568,16 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
         // is scanned (#454). Today a write-index hoists to a `DutRead`, so
         // this is defensive completeness; without it, any future inline
         // write-index would silently escape the gated-port scan.
-        RecordFieldWrite { value, index, .. } => {
+        RecordFieldWrite {
+            value,
+            mid_indices,
+            index,
+            ..
+        } => {
             for_each_port_in_expr(value, f);
+            for (_, idx) in mid_indices {
+                for_each_port_in_expr(idx, f);
+            }
             if let Some(idx) = index {
                 for_each_port_in_expr(idx, f);
             }
@@ -642,7 +650,12 @@ fn for_each_port_in_expr(e: &ir::Expr, f: &mut impl FnMut(&ir::PortRef)) {
     use ir::Expr::*;
     match e {
         Port(p) => f(p),
-        RecordField { index, .. } => {
+        RecordField {
+            mid_indices, index, ..
+        } => {
+            for (_, i) in mid_indices {
+                for_each_port_in_expr(i, f);
+            }
             if let Some(i) = index {
                 for_each_port_in_expr(i, f);
             }
@@ -736,10 +749,23 @@ fn record_struct(out: &mut String, r: &ir::RecordSchema, records: &[ir::RecordSc
         // A nested-record field is a real C++ struct member (v1 parity):
         // `<Inner> field{};` value-initializes it, so it picks up the inner
         // struct's own member-initializer defaults. Copy / `==` / pack all
-        // recurse through the inner struct's own operators/helpers.
+        // recurse through the inner struct's own operators/helpers. A
+        // `Vec<Record, N>` field is `std::array<Inner, N>` whose `= {}`
+        // value-initializes every element (each runs the inner struct's
+        // member defaults) — `record_emit_order` already placed `Inner`
+        // before this struct.
         if let ir::IrType::Record(rid) = f.ty {
             let inner = &records[rid.index()];
-            writeln!(out, "{INDENT}{} {}{{}};", inner.name, f.name).ok();
+            if let Some(n) = f.vec_len {
+                writeln!(
+                    out,
+                    "{INDENT}std::array<{}, {n}> {} = {{}};",
+                    inner.name, f.name
+                )
+                .ok();
+            } else {
+                writeln!(out, "{INDENT}{} {}{{}};", inner.name, f.name).ok();
+            }
             continue;
         }
         let cty = field_scalar_cty(&f.ty);

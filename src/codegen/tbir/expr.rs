@@ -191,6 +191,7 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             local,
             field,
             path,
+            mid_indices,
             index,
         } => {
             let name = cx.names.get(local.index()).cloned().ok_or_else(|| {
@@ -199,18 +200,7 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                     local.0, cx.func.name
                 ))
             })?;
-            // Nested field access descends through real C++ struct members
-            // (`name.a.b`), so a whole-record leaf read / copy / `==` all
-            // recurse natively.
-            let nested = path.iter().map(|p| format!(".{p}")).collect::<String>();
-            match index {
-                // `rec.data[i]` (or `rec.a.b[i]`) — `std::array` element access.
-                Some(idx) => {
-                    let i = expr_cpp(cx, idx)?;
-                    format!("{name}.{field}{nested}[{i}]")
-                }
-                None => format!("{name}.{field}{nested}"),
-            }
+            record_access_cpp(cx, &name, field, path, mid_indices, index.as_deref())?
         }
         // Register-level frontdoor read in a general expression position
         // (assert condition / format arg). v1's inline assignment-
@@ -891,4 +881,43 @@ pub(super) fn comp_base_cpp_subst_cx(cx: &ECx<'_>, base: &crate::ir::ComponentBa
             .unwrap_or_else(|| format!("/*BUG:l{}*/", l.0)),
         other => comp_base_cpp_subst(other, cx.self_subst),
     }
+}
+
+/// Render a record-field access chain as a C++ member path:
+/// `base.field[.path…]`, inserting a `[idx]` element selection after any
+/// segment carrying a mid-chain `Vec<Record, N>` index and after the leaf
+/// when `index` is `Some` (a `Vec` element read/write). Shared by the
+/// `Expr::RecordField` read and `Stmt::RecordFieldWrite` store emission,
+/// so both sides render one chain shape (`tbl.entries[i].tag`).
+pub(super) fn record_access_cpp(
+    cx: &ECx<'_>,
+    base: &str,
+    field: &str,
+    path: &[String],
+    mid_indices: &[(usize, crate::ir::Expr)],
+    index: Option<&crate::ir::Expr>,
+) -> Result<String, EmitError> {
+    let mut s = format!("{base}.{field}");
+    for (pos, seg) in std::iter::once(None)
+        .chain(path.iter().map(Some))
+        .enumerate()
+    {
+        if let Some(seg) = seg {
+            s.push('.');
+            s.push_str(seg);
+        }
+        for (_, idx) in mid_indices.iter().filter(|(p, _)| *p == pos) {
+            let i = expr_cpp(cx, idx)?;
+            s.push('[');
+            s.push_str(&i);
+            s.push(']');
+        }
+    }
+    if let Some(idx) = index {
+        let i = expr_cpp(cx, idx)?;
+        s.push('[');
+        s.push_str(&i);
+        s.push(']');
+    }
+    Ok(s)
 }

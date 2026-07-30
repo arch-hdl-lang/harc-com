@@ -12,12 +12,16 @@
 //!
 //! A field whose type names another transaction/struct lowers to a
 //! native nested record (`IrType::Record(rid)`, v1 parity) — copy,
-//! equality, and TLM packing recurse through the inner struct. Out-of-
-//! scope shapes are explicit `Unsupported` rejections, never silent
-//! drops: `when` subtype blocks, `Vec` of a non-scalar element,
-//! widthless-scalar leaves, string/object/dynamic leaves, widths above
-//! 64 bits, and non-literal field defaults. Recursive / mutually-
-//! recursive nested records are rejected (`check_no_record_cycles`).
+//! equality, and TLM packing recurse through the inner struct. A
+//! `Vec<T, N>` field lowers when `T` is a supported scalar or a
+//! supported record (`IrType::Record` element + `vec_len`, v1's
+//! `std::array<T, N>` member). Out-of-scope shapes are explicit
+//! `Unsupported` rejections, never silent drops: `when` subtype blocks,
+//! `Vec` of any other element (enums, `Vec`-of-`Vec`, widthless
+//! scalars), widthless-scalar leaves, string/object/dynamic leaves,
+//! widths above 64 bits, and non-literal field defaults. Recursive /
+//! mutually-recursive nested records are rejected
+//! (`check_no_record_cycles`).
 //! Enum-typed fields lower as scalar variant indices (v1's `int64_t`
 //! member shape).
 
@@ -144,9 +148,9 @@ fn lower_record_field(
     // natively. A `default` on a record-typed field is meaningless (its zero
     // value is its own member defaults), so reject one. Checked before the
     // scalar gate so a `Named` record type is not misreported as
-    // "non-scalar". `Vec<Record, N>` stays out of scope: `fixed_vec_field`
-    // only accepts scalar elements, so a `Vec` of a record falls through to
-    // the scalar gate's rejection below.
+    // "non-scalar". `Vec<Record, N>` is handled by `fixed_vec_field` below
+    // (`IrType::Record` element + `vec_len = Some(N)`, v1's
+    // `std::array<Inner, N>` member).
     if let Some(rid) = named_record_id(&f.ty, record_ids) {
         if f.default.is_some() {
             return Err(unsupported(
@@ -171,12 +175,12 @@ fn lower_record_field(
         return Ok(());
     }
     // A `Vec<T, N>` field is the one aggregate this slice lowers: a
-    // fixed-size array of a scalar element type (v1's `std::array<T, N>`
-    // record member). `ty` then carries the *element* scalar type and
-    // `vec_len` the count; everything else (bit layout, C++ storage,
-    // access) is driven off those two. A non-scalar element type, a
-    // non-literal length, or a nested aggregate is still rejected.
-    let (ty, vec_len) = match fixed_vec_field(&f.ty, enum_names) {
+    // fixed-size array of a scalar OR record element type (v1's
+    // `std::array<T, N>` record member). `ty` then carries the *element*
+    // type and `vec_len` the count; everything else (bit layout, C++
+    // storage, access) is driven off those two. An unsupported element
+    // type, a non-literal length, or a `Vec`-of-`Vec` is still rejected.
+    let (ty, vec_len) = match fixed_vec_field(&f.ty, enum_names, record_ids) {
         Some((elem_ty, len)) => (elem_ty, Some(len)),
         None => {
             let scalar = field_ir_type(&f.ty, enum_names).ok_or_else(|| {
@@ -187,7 +191,8 @@ fn lower_record_field(
                         type_expr_label(&f.ty)
                     ),
                     "only uint/sint/bits/bool/bit scalar fields up to 64 bits, fixed \
-                     `Vec<T, N>` arrays of such scalars, and nested struct/transaction \
+                     `Vec<T, N>` arrays of such scalars or of supported \
+                     struct/transaction records, and nested struct/transaction \
                      fields (whose leaves are themselves supported) are lowered",
                 )
             })?;
@@ -237,17 +242,22 @@ fn lower_record_field(
     Ok(())
 }
 
-/// Recognize a `Vec<T, N>` field whose element `T` is a scalar this
-/// slice can lower, returning `(element IrType, N)`. `None` for any
-/// non-`Vec` type, a non-literal length, or a non-scalar / nested
-/// element type (those fall through to the scalar gate and its
-/// rejection). The element width lives in the returned `IrType`; it
-/// drives both the C++ storage type and the packed-bit layout, so a
-/// `Vec` element with no explicit width (which would have no defined
-/// packed width) is rejected here.
+/// Recognize a `Vec<T, N>` field whose element `T` this slice can
+/// lower — a supported scalar, or a transaction/struct record (whose
+/// own fields were validated when IT lowered) — returning
+/// `(element IrType, N)`. `None` for any non-`Vec` type, a non-literal
+/// length, or an unsupported element type (those fall through to the
+/// scalar gate and its rejection). A scalar element's width lives in
+/// the returned `IrType`; it drives both the C++ storage type and the
+/// packed-bit layout, so a `Vec` element with no explicit width (which
+/// would have no defined packed width) is rejected here. A record
+/// element (`Vec<Record, N>`, v1's `std::array<Inner, N>` member)
+/// returns `IrType::Record(rid)`; its layout recurses through the
+/// element record's own schema.
 fn fixed_vec_field(
     t: &TypeExpr,
     enum_names: &std::collections::HashSet<String>,
+    record_ids: &HashMap<String, RecordId>,
 ) -> Option<(IrType, usize)> {
     let TypeExpr::Builtin {
         name: BuiltinTy::Vec,
@@ -256,10 +266,6 @@ fn fixed_vec_field(
     } = t
     else {
         return None;
-    };
-    let elem = match args.first()? {
-        TypeArg::Type(ty) => ty,
-        _ => return None,
     };
     let len = match args.get(1)? {
         TypeArg::Expr(e) => match &*e.kind {
@@ -271,6 +277,31 @@ fn fixed_vec_field(
     if len == 0 {
         return None;
     }
+    // `Vec<Record, N>`: a fixed array of a nested transaction/struct.
+    // The element record's own lowering already validated every leaf
+    // (an unsupported leaf failed THERE, naming its `Inner.field` path),
+    // so a resolved record id is sufficient here. Checked before the
+    // scalar mapping — record names are not scalars. NOTE the parser's
+    // type-arg heuristic: a bare named element (`Vec<Entry, 4>`) parses
+    // as `TypeArg::Expr(Ident)` (only builtin heads parse as
+    // `TypeArg::Type`), so a record element is matched in BOTH shapes.
+    let elem = match args.first()? {
+        TypeArg::Type(ty) => {
+            if let Some(rid) = named_record_id(ty, record_ids) {
+                return Some((IrType::Record(rid), len));
+            }
+            ty
+        }
+        TypeArg::Expr(e) => {
+            if let ExprKind::Ident(id) = &*e.kind {
+                if let Some(&rid) = record_ids.get(id.name.as_str()) {
+                    return Some((IrType::Record(rid), len));
+                }
+            }
+            return None;
+        }
+        _ => return None,
+    };
     let elem_ty = field_ir_type(elem, enum_names)?;
     // The packed layout needs a defined element width. A widthless
     // scalar (`uint` with no `<N>`) maps to `IrType::UInt(None)`, which

@@ -292,8 +292,16 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
             Stmt::RecordInit(_, _) => {
                 host_service_only = false;
             }
-            Stmt::RecordFieldWrite { index, value, .. } => {
+            Stmt::RecordFieldWrite {
+                mid_indices,
+                index,
+                value,
+                ..
+            } => {
                 host_service_only = false;
+                for (_, idx) in mid_indices {
+                    visit_expr(idx, &mut accesses, &mut transactor);
+                }
                 if let Some(idx) = index {
                     visit_expr(idx, &mut accesses, &mut transactor);
                 }
@@ -501,12 +509,24 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
                 *transactor = true;
             }
         }
+        // Host-state record read; its element-index sub-exprs may carry
+        // DUT reads (a port-typed index in a wait predicate), so visit
+        // them like any other value position.
+        Expr::RecordField {
+            mid_indices, index, ..
+        } => {
+            for (_, idx) in mid_indices {
+                visit_expr(idx, accesses, transactor);
+            }
+            if let Some(idx) = index {
+                visit_expr(idx, accesses, transactor);
+            }
+        }
         Expr::Literal { .. }
         | Expr::WideLiteral(_)
         | Expr::Local(_)
         | Expr::CycleCount
         | Expr::ErrorCount
-        | Expr::RecordField { .. }
         | Expr::TbField(_)
         | Expr::TransactorState { .. }
         | Expr::TransactorStateRecordField { .. }

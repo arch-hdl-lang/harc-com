@@ -129,6 +129,7 @@ wide_cast_test | Top | top_counter.sv | - | pass
 bitslice_uninit_test | Top | top_counter.sv | - | pass
 record_let_copy_test | Top | top_counter.sv | - | pass
 record_vec_field_copy_test | Top | top_counter.sv | - | pass
+vec_of_struct_field_test | Top | top_counter.sv | - | pass
 testbench_basic_test | Top | top_counter.sv | - | pass | - | - | TestbenchSmoke
 testbench_basic_test | Top | top_counter.sv | - | pass | - | - | TestbenchEnableToggle
 testbench_basic_test | Top | top_counter.sv | - | pass | - | - | TestbenchMethodCallsMethod

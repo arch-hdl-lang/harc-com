@@ -2326,6 +2326,246 @@ end test NestedBadLeafTest
     assert!(msg.contains("non-scalar"), "names the reason: {msg}");
 }
 
+/// A fixed `Vec<Record, N>` struct field lowers (harc#522): the schema
+/// carries the element record with the vec length, and an UNUSED
+/// compatible declaration must not block an otherwise unrelated test.
+#[test]
+fn struct_vec_of_record_field_lowers_unused() {
+    let src = r#"
+struct Entry
+    tag : uint<8>
+    value : uint<32>
+end struct Entry
+
+struct EntryTable
+    entries : Vec<Entry, 4>
+end struct EntryTable
+
+test VecOfStructUnusedTest
+    let dut : Top
+    run
+        log(info, "Vec-of-struct declaration compiled")
+    end run
+end test VecOfStructUnusedTest
+"#;
+    let prog = lower_src(src).expect("unused Vec<Record, N> declaration lowers");
+    let dump = format!("{prog}");
+    assert!(
+        dump.contains("entries : Vec<record(r0), 4>"),
+        "schema carries the record-element Vec field: {dump}"
+    );
+}
+
+/// Element-selected field access on a `Vec<Record, N>` field
+/// (`tbl.entries[i].tag`) lowers on both the write and the read side,
+/// carrying the mid-chain element index (harc#522).
+#[test]
+fn vec_of_record_element_field_access_lowers() {
+    let src = r#"
+struct Entry
+    tag : uint<8>
+    value : uint<32>
+end struct Entry
+
+struct EntryTable
+    entries : Vec<Entry, 4>
+end struct EntryTable
+
+test VecOfStructAccessTest
+    let dut : Top
+    run
+        let tbl : EntryTable
+        tbl.entries[1].tag = 0x5A
+        tbl.entries[1].value = 1234
+        let v = tbl.entries[1].value
+        assert v == 1234 else fail("value: ${v}")
+        assert tbl.entries[1].tag == 0x5A else fail("tag")
+        assert tbl.entries[0].tag == 0 else fail("default tag")
+    end run
+end test VecOfStructAccessTest
+"#;
+    let prog = lower_src(src).expect("entries[i].field access lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let dump = format!("{prog}");
+    assert!(
+        dump.contains("RecordFieldWrite(%tbl.entries[1].tag, 90)"),
+        "mid-indexed element field write: {dump}"
+    );
+    assert!(
+        dump.contains("%tbl.entries[1].value"),
+        "mid-indexed element field read: {dump}"
+    );
+}
+
+/// Whole-element copies (`tbl.entries[i] = e`, `let e : Entry =
+/// tbl.entries[i]`) and the whole-vector copy (`b.entries = a.entries`)
+/// preserve record value semantics (harc#522).
+#[test]
+fn vec_of_record_element_and_whole_vector_copies_lower() {
+    let src = r#"
+struct Entry
+    tag : uint<8>
+    value : uint<32>
+end struct Entry
+
+struct EntryTable
+    entries : Vec<Entry, 4>
+end struct EntryTable
+
+test VecOfStructCopyTest
+    let dut : Top
+    run
+        let a : EntryTable
+        let e : Entry
+        e.tag = 7
+        e.value = 42
+        a.entries[2] = e
+        let e2 : Entry = a.entries[2]
+        assert e2.value == 42 else fail("element copy out")
+        let b : EntryTable
+        b.entries = a.entries
+        assert b.entries[2].tag == 7 else fail("whole-vector copy")
+    end run
+end test VecOfStructCopyTest
+"#;
+    let prog = lower_src(src).expect("element and whole-vector copies lower");
+    verify::verify_program(&prog).expect("verifies");
+    let dump = format!("{prog}");
+    assert!(
+        dump.contains("RecordFieldWrite(%a.entries[2], %e)"),
+        "whole-element store: {dump}"
+    );
+    assert!(
+        dump.contains("RecordFieldWrite(%b.entries, %a.entries)"),
+        "whole-vector copy: {dump}"
+    );
+}
+
+/// The tbir C++ emission for a `Vec<Record, N>` field: an
+/// `std::array<Entry, N>` member (value-initialized so element defaults
+/// run), and direct member-chain element access (`tbl.entries[1].tag`).
+#[test]
+fn vec_of_record_field_cpp_shape() {
+    let src = r#"
+struct Entry
+    tag : uint<8>
+    value : uint<32>
+end struct Entry
+
+struct EntryTable
+    entries : Vec<Entry, 4>
+end struct EntryTable
+
+test VecOfStructCppTest
+    let dut : Top
+    run
+        let tbl : EntryTable
+        tbl.entries[1].tag = 90
+        let v = tbl.entries[1].tag
+        assert v == 90 else fail("tag")
+    end run
+end test VecOfStructCppTest
+"#;
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("std::array<Entry, 4> entries = {};"),
+        "record-element array member: {cpp}"
+    );
+    assert!(
+        cpp.contains("tbl.entries[1].tag = 90;"),
+        "direct element field store: {cpp}"
+    );
+}
+
+/// A `Vec<Record, N>` whose element record contains a genuinely
+/// unsupported leaf is rejected via the ELEMENT record's own lowering,
+/// and the diagnostic names the complete offending leaf path
+/// (`Inner.bad`), not the vector field (harc#522 acceptance).
+#[test]
+fn vec_of_record_with_unsupported_leaf_names_leaf_path() {
+    let src = r#"
+struct Inner
+    bad : Vec<uint, 4>
+end struct Inner
+
+struct Outer
+    entries : Vec<Inner, 2>
+end struct Outer
+
+test VecOfBadRecordTest
+    let dut : Top
+    run
+        let o : Outer
+    end run
+end test VecOfBadRecordTest
+"#;
+    let err = lower_src(src).expect_err("unsupported element leaf must be rejected");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("Inner.bad"),
+        "names the offending leaf path: {msg}"
+    );
+}
+
+/// Traversing a `Vec<Record, N>` field WITHOUT an element index
+/// (`tbl.entries.tag`) is rejected with a message that points at
+/// element selection, not silently mis-lowered.
+#[test]
+fn vec_of_record_traversal_without_index_is_rejected() {
+    let src = r#"
+struct Entry
+    tag : uint<8>
+end struct Entry
+
+struct EntryTable
+    entries : Vec<Entry, 4>
+end struct EntryTable
+
+test VecOfStructNoIndexTest
+    let dut : Top
+    run
+        let tbl : EntryTable
+        tbl.entries.tag = 1
+    end run
+end test VecOfStructNoIndexTest
+"#;
+    let err = lower_src(src).expect_err("un-indexed Vec traversal must be rejected");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("without an element index"),
+        "names the missing index: {msg}"
+    );
+}
+
+/// An element store with a non-matching RHS (`tbl.entries[i] = 5`) is
+/// rejected precisely — never emitted as `Entry = <scalar>`.
+#[test]
+fn vec_of_record_element_write_with_scalar_rhs_is_rejected() {
+    let src = r#"
+struct Entry
+    tag : uint<8>
+end struct Entry
+
+struct EntryTable
+    entries : Vec<Entry, 4>
+end struct EntryTable
+
+test VecOfStructBadElemWriteTest
+    let dut : Top
+    run
+        let tbl : EntryTable
+        tbl.entries[0] = 5
+    end run
+end test VecOfStructBadElemWriteTest
+"#;
+    let err = lower_src(src).expect_err("scalar RHS on a record element must be rejected");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("element write") && msg.contains("non-`Entry` RHS"),
+        "names the shape mismatch: {msg}"
+    );
+}
+
 /// A self-referential by-value struct (`Node { next : Node }`) is
 /// STRUCTURALLY INVALID in every backend — the generated C++ struct is
 /// infinitely sized, and v1 codegen stack-overflows on it. So it must be
@@ -2358,6 +2598,173 @@ end test SelfCycleTest
         "cyclic-record error must NOT suggest --codegen v1 (v1 crashes): {msg}"
     );
     assert!(msg.contains("Node"), "names the cyclic record: {msg}");
+}
+
+/// TWO mid-chain element selections in one access chain
+/// (`outer[i].entries[j].tag` — a `Vec<Table, N>` whose element record
+/// itself holds a `Vec<Entry, M>`): the position-tagged `mid_indices`
+/// machinery is generic over chain depth, and emission interleaves each
+/// `[idx]` after its own segment (harc#522 review follow-up).
+#[test]
+fn vec_of_record_double_mid_index_chain_lowers() {
+    let src = r#"
+struct Entry
+    tag : uint<8>
+end struct Entry
+
+struct Table
+    entries : Vec<Entry, 4>
+end struct Table
+
+struct Bank
+    tables : Vec<Table, 2>
+end struct Bank
+
+test DoubleMidIndexTest
+    let dut : Top
+    run
+        let bank : Bank
+        bank.tables[1].entries[2].tag = 0x77
+        let v = bank.tables[1].entries[2].tag
+        assert v == 0x77 else fail("tag: 0x${v:02x}")
+        assert bank.tables[0].entries[2].tag == 0 else fail("neighbor table clobbered")
+        assert bank.tables[1].entries[3].tag == 0 else fail("neighbor entry clobbered")
+    end run
+end test DoubleMidIndexTest
+"#;
+    let prog = lower_src(src).expect("double-mid-index chain lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let dump = format!("{prog}");
+    assert!(
+        dump.contains("RecordFieldWrite(%bank.tables[1].entries[2].tag, 119)"),
+        "both mid indices render at their own segments: {dump}"
+    );
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("bank.tables[1].entries[2].tag = 119;"),
+        "direct double-indexed member chain in C++: {cpp}"
+    );
+}
+
+/// Element access rooted at a TESTBENCH record field (`tbl.entries[i].tag`
+/// inside an impl-form body, desugared to `_tb.tbl…`): the chain resolver's
+/// `field_start` offset must not shift the mid-index position (harc#522).
+#[test]
+fn vec_of_record_access_through_testbench_field_lowers() {
+    let src = r#"
+struct Entry
+    tag : uint<8>
+end struct Entry
+
+struct EntryTable
+    entries : Vec<Entry, 4>
+end struct EntryTable
+
+testbench VecTbFieldTb
+    dut : Top
+    tbl : EntryTable
+end testbench VecTbFieldTb
+
+impl VecTbFieldTest for VecTbFieldTb
+    run
+        tbl.entries[1].tag = 42
+        assert tbl.entries[1].tag == 42 else fail("tb-field element access")
+    end run
+end impl VecTbFieldTest
+"#;
+    let prog = lower_src(src).expect("testbench-field-rooted element access lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let dump = format!("{prog}");
+    assert!(
+        dump.contains(".entries[1].tag, 42"),
+        "mid-indexed write through the tb record field: {dump}"
+    );
+}
+
+/// A LITERAL element index that is statically out of range is rejected at
+/// lowering as `Invalid` (both backends would otherwise emit `std::array`
+/// UB — v1 included, so the message must NOT suggest `--codegen v1`).
+/// Covers all three index sites: leaf read, leaf write, and a mid-chain
+/// `Vec<Record, N>` selection. A runtime index stays unchecked (runtime
+/// range behavior is the backends', as before).
+#[test]
+fn literal_out_of_range_vec_index_is_rejected() {
+    let cases = [
+        // Leaf read on a scalar-element Vec.
+        (
+            "let v = tbl.entries[0].data[2]",
+            "EntryTable.entries.data",
+        ),
+        // Leaf write on a scalar-element Vec.
+        ("tbl.entries[0].data[9] = 1", "EntryTable.entries.data"),
+        // Mid-chain selection on the record-element Vec.
+        ("tbl.entries[4].tag = 1", "EntryTable.entries"),
+    ];
+    for (stmt, dotted) in cases {
+        let src = format!(
+            r#"
+struct Entry
+    tag  : uint<8>
+    data : Vec<uint<16>, 2>
+end struct Entry
+
+struct EntryTable
+    entries : Vec<Entry, 4>
+end struct EntryTable
+
+test OobIndexTest
+    let dut : Top
+    run
+        let tbl : EntryTable
+        {stmt}
+    end run
+end test OobIndexTest
+"#
+        );
+        let err = lower_src(&src).expect_err("literal OOB index must be rejected");
+        assert!(
+            matches!(err, lower::LowerError::Invalid(_)),
+            "must be Invalid, not Unsupported ({stmt}): {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("out of range") && msg.contains(dotted),
+            "names the range violation and field ({stmt}): {msg}"
+        );
+        assert!(
+            !msg.contains("--codegen v1"),
+            "OOB error must NOT suggest --codegen v1 (v1 is UB there): {msg}"
+        );
+    }
+}
+
+/// A record containing a `Vec` of ITSELF (`Node { kids : Vec<Node, 2> }`)
+/// is the same infinitely-sized by-value cycle through the array member —
+/// the cycle check follows record-element `Vec` edges too (harc#522).
+#[test]
+fn vec_of_self_record_is_rejected_as_invalid() {
+    let src = r#"
+struct Node
+    kids : Vec<Node, 2>
+    val  : uint<8>
+end struct Node
+
+test VecSelfCycleTest
+    let dut : Top
+    run
+        let n : Node
+    end run
+end test VecSelfCycleTest
+"#;
+    let err = lower_src(src).expect_err("Vec-of-self record must be rejected");
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)),
+        "must be Invalid, not Unsupported: {err:?}"
+    );
+    assert!(
+        !err.to_string().contains("--codegen v1"),
+        "cyclic-record error must NOT suggest --codegen v1: {err}"
+    );
 }
 
 /// Mutual recursion (`A { b : B }`, `B { a : A }`) is likewise a

@@ -548,11 +548,17 @@ impl Checker<'_> {
                     local,
                     field,
                     path,
+                    mid_indices,
                     index,
                     value,
                 } => {
                     self.check_local(*local);
-                    self.check_record_field(*local, field, path);
+                    let mid_positions: Vec<usize> =
+                        mid_indices.iter().map(|(p, _)| *p).collect();
+                    self.check_record_field(*local, field, path, &mid_positions);
+                    for (_, idx) in mid_indices {
+                        self.check_expr(idx, false, "RecordFieldWrite mid index");
+                    }
                     if let Some(idx) = index {
                         self.check_expr(idx, false, "RecordFieldWrite index");
                     }
@@ -565,7 +571,7 @@ impl Checker<'_> {
                     ..
                 } => {
                     self.check_local(*local);
-                    self.check_record_field(*local, field, &[]);
+                    self.check_record_field(*local, field, &[], &[]);
                     self.check_expr(value, false, "RecordWriteCb value");
                 }
                 Stmt::TbFieldWrite { field, value } => {
@@ -842,11 +848,21 @@ impl Checker<'_> {
     }
 
     /// `local` must be record-typed and its schema must declare `field`.
-    fn check_record_field(&mut self, local: LocalId, field: &str, path: &[String]) {
+    /// `mid_positions` lists the segments (positions in `[field] ++ path`)
+    /// that carry a `Vec<Record, N>` element selection.
+    fn check_record_field(
+        &mut self,
+        local: LocalId,
+        field: &str,
+        path: &[String],
+        mid_positions: &[usize],
+    ) {
         // Resolve `field` then each `path` component against the nested
-        // record schemas: a non-leaf component must be a nested record to
-        // descend into; the leaf may be any field. Fails on an unknown
-        // field or a non-record intermediate.
+        // record schemas: a non-leaf component must reach a nested record
+        // to descend into — a plain nested-record field (unindexed), or
+        // one element of a `Vec<Record, N>` field (indexed); the leaf may
+        // be any field but never carries a mid index. Fails on an unknown
+        // field, a non-record intermediate, or an index/`Vec` mismatch.
         let ok = (|| -> Option<()> {
             let tl = self.func.locals.get(local.index())?;
             let mut rid = match tl.ty {
@@ -859,11 +875,12 @@ impl Checker<'_> {
             let last = segs.len() - 1;
             for (i, seg) in segs.iter().enumerate() {
                 let fld = self.prog.records.get(rid.index())?.field(seg)?;
+                let indexed = mid_positions.contains(&i);
                 if i == last {
-                    return Some(());
+                    return (!indexed).then_some(());
                 }
                 match fld.ty {
-                    IrType::Record(r) if fld.vec_len.is_none() => rid = r,
+                    IrType::Record(r) if fld.vec_len.is_none() == !indexed => rid = r,
                     _ => return None,
                 }
             }
@@ -992,10 +1009,15 @@ impl Checker<'_> {
                 local,
                 field,
                 path,
+                mid_indices,
                 index,
             } => {
                 self.check_local(*local);
-                self.check_record_field(*local, field, path);
+                let mid_positions: Vec<usize> = mid_indices.iter().map(|(p, _)| *p).collect();
+                self.check_record_field(*local, field, path, &mid_positions);
+                for (_, idx) in mid_indices {
+                    self.check_expr(idx, ports_ok, context);
+                }
                 if let Some(idx) = index {
                     self.check_expr(idx, ports_ok, context);
                 }
@@ -1007,7 +1029,7 @@ impl Checker<'_> {
             // nothing in the seam rule forbids it here.
             Expr::RegRead { mirror, field, .. } => {
                 self.check_local(*mirror);
-                self.check_record_field(*mirror, field, &[]);
+                self.check_record_field(*mirror, field, &[], &[]);
             }
             Expr::CovBin { inst, .. } => self.check_covgroup(inst.covgroup),
             // A hook-param cover target carries the parameter NAME (no
@@ -1639,8 +1661,16 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
             }
         }
         Expr::Local(l) => f(*l),
-        Expr::RecordField { local, index, .. } => {
+        Expr::RecordField {
+            local,
+            mid_indices,
+            index,
+            ..
+        } => {
             f(*local);
+            for (_, idx) in mid_indices {
+                for_each_local(idx, f);
+            }
             if let Some(idx) = index {
                 for_each_local(idx, f);
             }

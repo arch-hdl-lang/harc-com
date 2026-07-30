@@ -832,23 +832,19 @@ fn emit_stmt(
             local,
             field,
             path,
+            mid_indices,
             index,
             value,
         } => {
+            // `rec.a.b = value`, `rec.data[i] = value` (`std::array`
+            // element store), or a mid-chain element write
+            // (`tbl.entries[i].tag = value`) — one shared chain renderer
+            // with the `Expr::RecordField` read side.
             let name = &names[local.index()];
             let e = expr_cpp(cx, value)?;
-            let nested = path.iter().map(|p| format!(".{p}")).collect::<String>();
-            match index {
-                // `rec.data[i] = value` (or `rec.a.b[i] = value`) —
-                // `std::array` element store.
-                Some(idx) => {
-                    let i = expr_cpp(cx, idx)?;
-                    writeln!(out, "{pad}{name}.{field}{nested}[{i}] = {e};").ok();
-                }
-                None => {
-                    writeln!(out, "{pad}{name}.{field}{nested} = {e};").ok();
-                }
-            }
+            let dst =
+                super::expr::record_access_cpp(cx, name, field, path, mid_indices, index.as_ref())?;
+            writeln!(out, "{pad}{dst} = {e};").ok();
         }
         Stmt::RecordWriteCb {
             local,

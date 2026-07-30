@@ -692,18 +692,20 @@ impl FuncBuilder<'_> {
                         }
                     }
                     // `let t2 : Txn = t1` — a by-value copy from a
-                    // same-typed record local. v1 emits `Txn t2 = t1;`, a
-                    // C++ struct copy; we mirror it by declaring a record-
-                    // typed local and binding it with `Stmt::Assign`, which
-                    // the emitter renders as the same `name = t1;` copy.
-                    // This matches the discipline of the whole-record
+                    // same-typed record value: a record local, a whole
+                    // nested-record field read (`s.inner`), or one
+                    // `Vec<Record, N>` element (`tbl.entries[i]`). v1
+                    // emits `Txn t2 = <rhs>;`, a C++ struct copy; we
+                    // mirror it by declaring a record-typed local and
+                    // binding it with `Stmt::Assign`, which the emitter
+                    // renders as the same `name = <rhs>;` copy. This
+                    // matches the discipline of the whole-record
                     // assignment path (`u = t` in `lower_assign`): only a
-                    // same-typed record local copies; any other RHS stays a
-                    // precise rejection rather than a verifier TypeMismatch
-                    // or a C++ compile error.
+                    // same-typed record value copies; any other RHS stays
+                    // a precise rejection rather than a verifier
+                    // TypeMismatch or a C++ compile error.
                     let e = self.lower_expr_no_ports(value)?;
-                    let same_record = matches!(&e, Expr::Local(src)
-                        if self.record_of_local(*src) == Some(rid));
+                    let same_record = self.record_id_of_expr(&e) == Some(rid);
                     if same_record {
                         let id = self.declare(&l.name.name);
                         self.set_local_type(id, IrType::Record(rid));
@@ -1195,14 +1197,13 @@ impl FuncBuilder<'_> {
                 }
                 let e = self.lower_expr_no_ports(value)?;
                 // Whole-record assignment: only a same-typed record
-                // local copies (`t = u` — C++ struct assignment in
-                // both backends). Anything else would otherwise
-                // surface as a verifier TypeMismatch (the internal-
-                // bug channel) or a C++ compile error.
+                // value copies (`t = u`, `t = s.inner`, or a
+                // `t = tbl.entries[i]` element read — C++ struct
+                // assignment in both backends). Anything else would
+                // otherwise surface as a verifier TypeMismatch (the
+                // internal-bug channel) or a C++ compile error.
                 if let Some(rid) = self.record_of_local(local) {
-                    let same = matches!(&e, Expr::Local(src)
-                        if self.record_of_local(*src) == Some(rid));
-                    if !same {
+                    if self.record_id_of_expr(&e) != Some(rid) {
                         return Err(unsupported(
                             &format!(
                                 "assignment of a non-`{}` value to transaction local `{}`",
@@ -1289,11 +1290,36 @@ impl FuncBuilder<'_> {
                     ));
                 }
                 let idx = self.lower_expr_no_ports(index)?;
+                super::exprs::check_literal_vec_index_bounds(
+                    &chain.dotted,
+                    &idx,
+                    chain.leaf_vec_len.unwrap_or(0),
+                )?;
                 let e = self.lower_expr_no_ports(value)?;
+                // A `Vec<Record, N>` element store (`tbl.entries[i] = e`)
+                // is a C++ struct copy: the RHS must be a whole record
+                // value of the MATCHING element type (a same-typed record
+                // local, a nested-record field read, or another element
+                // read). Reject any other RHS rather than emit
+                // `Entry = <scalar>` / a mismatched struct assignment.
+                if let IrType::Record(elem_rid) = chain.leaf_ty {
+                    if self.record_id_of_expr(&e) != Some(elem_rid) {
+                        return Err(unsupported(
+                            &format!(
+                                "an element write of `Vec` record field `{}` with a \
+                                 non-`{}` RHS",
+                                chain.dotted, self.ctx.records[elem_rid.index()].name
+                            ),
+                            "assign a value of the element's record type, or set the \
+                             element's fields individually",
+                        ));
+                    }
+                }
                 self.push(Stmt::RecordFieldWrite {
                     local: chain.local,
                     field: chain.field,
                     path: chain.path,
+                    mid_indices: chain.mid_indices,
                     index: Some(idx),
                     value: e,
                 });
@@ -1341,11 +1367,13 @@ impl FuncBuilder<'_> {
                         local: chain.local,
                         field: chain.field,
                         path: chain.path,
+                        mid_indices: chain.mid_indices,
                         index: None,
                         value: Expr::RecordField {
                             local: rhs.local,
                             field: rhs.field,
                             path: rhs.path,
+                            mid_indices: rhs.mid_indices,
                             index: None,
                         },
                     });
@@ -1374,6 +1402,7 @@ impl FuncBuilder<'_> {
                         local: chain.local,
                         field: chain.field,
                         path: chain.path,
+                        mid_indices: chain.mid_indices,
                         index: None,
                         value: rhs,
                     });
@@ -1386,6 +1415,7 @@ impl FuncBuilder<'_> {
                     local: chain.local,
                     field: chain.field,
                     path: chain.path,
+                    mid_indices: chain.mid_indices,
                     index: None,
                     value: e,
                 });
