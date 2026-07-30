@@ -565,16 +565,17 @@ end test T"#,
 fn signed_wide_right_shift_is_rejected_in_tbir() {
     let err = emit_cpp_src_result(
         r#"test T
-    let dut : Top
+        let dut : Top
     run
         let wide : sint<128> = 0
         assert (wide >> 1) == 0 else fail("wide-shr")
+        assert ((wide + 1) >> 1) == 0 else fail("wide-nested-shr")
     end run
 end test T"#,
     )
     .expect_err("TB-IR must not silently truncate signed shifts above 64 bits");
     assert!(
-        err.contains("signed right shift above 64 bits"),
+        err.contains("right shift above 64 bits"),
         "wide signed shift must have a targeted diagnostic; got: {err}"
     );
 }

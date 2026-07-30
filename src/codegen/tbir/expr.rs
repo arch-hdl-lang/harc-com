@@ -333,16 +333,16 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             let a_width = expr_static_width(cx, a);
             let a = expr_cpp(cx, a)?;
             let b = expr_cpp(cx, b)?;
+            if matches!(op, BinOp::Shr) && a_width.is_some_and(|width| width > 64) {
+                return Err(EmitError(
+                    "right shift above 64 bits is not supported by the TB-IR C++ value model; \
+                     use --codegen v1 for wide shifts"
+                        .to_string(),
+                ));
+            }
             match op {
                 BinOp::Shl => format!("(((uint64_t)({a})) << {b})"),
                 BinOp::Shr if a_signed => {
-                    if a_width.is_some_and(|width| width > 64) {
-                        return Err(EmitError(
-                            "signed right shift above 64 bits is not supported by the TB-IR C++ \
-                             value model; use --codegen v1 for sint widths above 64"
-                                .to_string(),
-                        ));
-                    }
                     format!("(((int64_t)({a})) >> {b})")
                 }
                 BinOp::Shr => format!("(((uint64_t)({a})) >> {b})"),
