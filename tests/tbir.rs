@@ -2112,6 +2112,41 @@ end test SelfCycleTest
     assert!(msg.contains("Node"), "names the cyclic record: {msg}");
 }
 
+/// Element access rooted at a TESTBENCH record field (`tbl.entries[i].tag`
+/// inside an impl-form body, desugared to `_tb.tbl…`): the chain resolver's
+/// `field_start` offset must not shift the mid-index position (harc#522).
+#[test]
+fn vec_of_record_access_through_testbench_field_lowers() {
+    let src = r#"
+struct Entry
+    tag : uint<8>
+end struct Entry
+
+struct EntryTable
+    entries : Vec<Entry, 4>
+end struct EntryTable
+
+testbench VecTbFieldTb
+    dut : Top
+    tbl : EntryTable
+end testbench VecTbFieldTb
+
+impl VecTbFieldTest for VecTbFieldTb
+    run
+        tbl.entries[1].tag = 42
+        assert tbl.entries[1].tag == 42 else fail("tb-field element access")
+    end run
+end impl VecTbFieldTest
+"#;
+    let prog = lower_src(src).expect("testbench-field-rooted element access lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let dump = format!("{prog}");
+    assert!(
+        dump.contains(".entries[1].tag, 42"),
+        "mid-indexed write through the tb record field: {dump}"
+    );
+}
+
 /// A record containing a `Vec` of ITSELF (`Node { kids : Vec<Node, 2> }`)
 /// is the same infinitely-sized by-value cycle through the array member —
 /// the cycle check follows record-element `Vec` edges too (harc#522).

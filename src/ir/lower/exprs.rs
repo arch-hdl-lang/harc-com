@@ -655,12 +655,13 @@ impl FuncBuilder<'_> {
                 }
                 ExprKind::Index { target, index } => {
                     if pending_index.is_some() {
-                        // `a.b[i][j].c` — no field shape supports a
-                        // second dimension (`Vec` of `Vec` never lowers).
-                        return Err(unsupported(
-                            "multi-dimensional indexing of a record field",
-                            "`Vec` record fields have a single element index",
-                        ));
+                        // `a.b[i][j].c` — no record-field shape has a
+                        // second dimension (`Vec` of `Vec` never lowers
+                        // as a field type). The root is not resolved yet,
+                        // so fall through rather than claim a shape that
+                        // may belong to another lane; the caller's
+                        // rejection names the unsupported access.
+                        return Ok(None);
                     }
                     if segs.is_empty() {
                         // Outermost node is an `Index` (`tbl.entries[i]`
