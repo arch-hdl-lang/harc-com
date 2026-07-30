@@ -476,16 +476,13 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
             local,
             field,
             path,
+            mid_indices,
             index,
             value,
         } => {
-            let idx = match index {
-                Some(i) => format!("[{}]", expr_str(func, i)),
-                None => String::new(),
-            };
-            let nested = path.iter().map(|p| format!(".{p}")).collect::<String>();
+            let chain = record_chain_str(func, field, path, mid_indices, index.as_ref());
             format!(
-                "RecordFieldWrite({}.{field}{nested}{idx}, {})",
+                "RecordFieldWrite({}.{chain}, {})",
                 local_str(func, *local),
                 expr_str(func, value)
             )
@@ -829,6 +826,35 @@ fn local_str(func: &TbFunction, l: LocalId) -> String {
     format!("%{}", func.local(l).name)
 }
 
+/// Render a record-field chain `field[.path…]` with its element
+/// selections: a `[idx]` after any mid-chain `Vec<Record, N>` segment
+/// (`entries[%i].tag`) and after the leaf when `index` is `Some`.
+fn record_chain_str(
+    func: &TbFunction,
+    field: &str,
+    path: &[String],
+    mid_indices: &[(usize, Expr)],
+    index: Option<&Expr>,
+) -> String {
+    let mut out = String::from(field);
+    for (pos, seg) in std::iter::once(None)
+        .chain(path.iter().map(Some))
+        .enumerate()
+    {
+        if let Some(seg) = seg {
+            out.push('.');
+            out.push_str(seg);
+        }
+        for (_, idx) in mid_indices.iter().filter(|(p, _)| *p == pos) {
+            out.push_str(&format!("[{}]", expr_str(func, idx)));
+        }
+    }
+    if let Some(idx) = index {
+        out.push_str(&format!("[{}]", expr_str(func, idx)));
+    }
+    out
+}
+
 fn port_str(func: Option<&TbFunction>, p: &PortRef) -> String {
     let mut out = format!("{}.{}", p.testbench_field, p.port_path.join("."));
     match &p.lane {
@@ -879,14 +905,11 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
             local,
             field,
             path,
+            mid_indices,
             index,
         } => {
-            let idx = match index {
-                Some(i) => format!("[{}]", expr_str(func, i)),
-                None => String::new(),
-            };
-            let nested = path.iter().map(|p| format!(".{p}")).collect::<String>();
-            format!("{}.{field}{nested}{idx}", local_str(func, *local))
+            let chain = record_chain_str(func, field, path, mid_indices, index.as_deref());
+            format!("{}.{chain}", local_str(func, *local))
         }
         Expr::RegRead {
             mirror,

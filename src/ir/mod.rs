@@ -418,10 +418,12 @@ pub struct RecordFieldSchema {
     pub name: String,
     /// Field element type. For a scalar field this is the field's own
     /// scalar type; for a `Vec<T, N>` field (`vec_len = Some(N)`) it is
-    /// the *element* scalar type `T` (its width drives both the C++
-    /// storage type and the packed-bit layout). Lowering rejects field
-    /// element types that are not scalar uint/sint/bits/bool/bit ≤ 64
-    /// bits (nested records, enums, lists).
+    /// the *element* type `T` — a scalar (its width drives both the C++
+    /// storage type and the packed-bit layout) or a nested record
+    /// (`IrType::Record`, v1's `std::array<Inner, N>` member; every leaf
+    /// of the element record is itself schema-supported). Lowering
+    /// rejects field element types outside that set (enums, lists,
+    /// widthless scalars).
     pub ty: IrType,
     /// `Some(N)` when the field is a fixed-size `Vec<T, N>` aggregate
     /// (v1's `std::array<T, N>` record member); `None` for a scalar
@@ -1377,10 +1379,18 @@ pub enum Stmt {
     /// leaf's `Vec`. An empty `path` is the single-level write. A
     /// whole-nested-record leaf assignment (`o.a = d`) carries a
     /// record-valued `value`.
+    ///
+    /// `mid_indices` carries element selections on NON-leaf `Vec<Record, N>`
+    /// segments (`tbl.entries[i].tag = v`): each `(pos, idx)` indexes the
+    /// segment at `pos` in `[field] ++ path` (so `pos` is strictly less
+    /// than the leaf position), and the chain then descends into the
+    /// element record. Positions are strictly increasing. Empty for every
+    /// chain with no record-vector traversal.
     RecordFieldWrite {
         local: LocalId,
         field: String,
         path: Vec<String>,
+        mid_indices: Vec<(usize, Expr)>,
         index: Option<Expr>,
         value: Expr,
     },
@@ -1842,11 +1852,19 @@ pub enum Expr {
     /// first-level `field`, for a nested-struct read such as `s.a.b`
     /// (`field = "a"`, `path = ["b"]`). The read leaf is the last of
     /// `[field] ++ path`; `index` (when `Some`) indexes that leaf's
-    /// `Vec`. An empty `path` is the single-level read.
+    /// `Vec`.  An empty `path` is the single-level read.
+    ///
+    /// `mid_indices` carries element selections on NON-leaf `Vec<Record, N>`
+    /// segments (`tbl.entries[i].tag`): each `(pos, idx)` indexes the
+    /// segment at `pos` in `[field] ++ path` (so `pos` is strictly less
+    /// than the leaf position), and the chain then descends into the
+    /// element record. Positions are strictly increasing. Empty for every
+    /// chain with no record-vector traversal.
     RecordField {
         local: LocalId,
         field: String,
         path: Vec<String>,
+        mid_indices: Vec<(usize, Expr)>,
         index: Option<Box<Expr>>,
     },
     /// `_tb.<field>` read on a scalar testbench field. Host state —

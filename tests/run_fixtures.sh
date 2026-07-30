@@ -79,6 +79,7 @@ wide_cast_test          | Top            | top_counter.sv         |
 bitslice_uninit_test    | Top            | top_counter.sv         |
 record_let_copy_test    | Top            | top_counter.sv         |
 record_vec_field_copy_test | Top         | top_counter.sv         |
+vec_of_struct_field_test | Top           | top_counter.sv         |
 keep_constraints_test   | Top            | top_counter.sv         |
 soft_constraint_randomize_test | Top      | top_counter.sv         |
 uint64_unique_randomize_test | Top        | top_counter.sv         |

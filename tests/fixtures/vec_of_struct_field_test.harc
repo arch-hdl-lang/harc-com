@@ -1,0 +1,107 @@
+// `Vec<Record, N>` record fields (harc#522): a fixed array whose element
+// type is a struct with supported leaves. v1 has always emitted this as a
+// `std::array<Entry, N>` member; tbir previously rejected the type
+// declaration outright — even unused. This fixture proves, under BOTH
+// codegens (trace-equivalent):
+//
+//   - an UNUSED compatible `Vec<Record, N>` declaration does not block an
+//     unrelated test from lowering (`SpareTable` below is never touched);
+//   - element field write/read (`tbl.entries[i].tag`), including through
+//     an element's own `Vec<scalar, M>` field (`entries[i].data[j]` —
+//     one mid-chain element selection plus a leaf index);
+//   - whole-element copy in and out (`tbl.entries[i] = e`,
+//     `let e : Entry = tbl.entries[i]`) with record value semantics;
+//   - whole-vector copy (`b.entries = a.entries`), by value on both
+//     sides — mutating either afterwards leaves the other untouched;
+//   - deterministic default initialization: a fresh table's elements run
+//     the element record's field defaults (`tag default 0xA5`, zeroed
+//     `value`/`data`).
+//
+// The DUT (`Top`, the counter) is irrelevant — it ticks in the background
+// while the test exercises host-side record-array state. Reused because
+// it's already in the Verilator regression.
+
+struct Entry
+    tag   : uint<8> default 0xA5
+    value : uint<32>
+    data  : Vec<uint<16>, 2>
+end struct Entry
+
+struct EntryTable
+    entries : Vec<Entry, 4>
+end struct EntryTable
+
+// Never instantiated: an unused compatible declaration must not block
+// lowering (the issue's minimal repro shape).
+struct SpareTable
+    spares : Vec<Entry, 3>
+end struct SpareTable
+
+testbench VecOfStructFieldTb
+    dut : Top
+end testbench VecOfStructFieldTb
+
+impl VecOfStructFieldTest for VecOfStructFieldTb
+    run
+        // ── default initialization ──────────────────────────────────
+        // Every element of a fresh table runs Entry's own defaults.
+        let tbl : EntryTable
+        assert tbl.entries[0].tag == 0xA5 else fail("default tag[0]: 0x${tbl.entries[0].tag:02x}")
+        assert tbl.entries[3].tag == 0xA5 else fail("default tag[3]: 0x${tbl.entries[3].tag:02x}")
+        assert tbl.entries[2].value == 0 else fail("default value[2]: ${tbl.entries[2].value}")
+        assert tbl.entries[1].data[1] == 0 else fail("default data[1][1]: ${tbl.entries[1].data[1]}")
+
+        // ── element field write / read (`entries[i].field`) ─────────
+        tbl.entries[1].tag = 0x5A
+        tbl.entries[1].value = 0x11223344
+        tbl.entries[1].data[0] = 0xBEEF
+        tbl.entries[1].data[1] = 0xCAFE
+        assert tbl.entries[1].tag == 0x5A else fail("tag[1]: 0x${tbl.entries[1].tag:02x}")
+        assert tbl.entries[1].value == 0x11223344 else fail("value[1]: 0x${tbl.entries[1].value:08x}")
+        assert tbl.entries[1].data[0] == 0xBEEF else fail("data[1][0]: 0x${tbl.entries[1].data[0]:04x}")
+        assert tbl.entries[1].data[1] == 0xCAFE else fail("data[1][1]: 0x${tbl.entries[1].data[1]:04x}")
+        // Neighbors untouched by the element writes.
+        assert tbl.entries[0].value == 0 else fail("value[0] clobbered: ${tbl.entries[0].value}")
+        assert tbl.entries[2].tag == 0xA5 else fail("tag[2] clobbered: 0x${tbl.entries[2].tag:02x}")
+
+        // A runtime (non-literal) element index reads the same slot.
+        let i = 1
+        assert tbl.entries[i].value == 0x11223344 else fail("entries[i]: 0x${tbl.entries[i].value:08x}")
+
+        // ── whole-element copy IN (`entries[i] = e`) ────────────────
+        let e : Entry
+        e.tag = 7
+        e.value = 42
+        e.data[0] = 100
+        tbl.entries[2] = e
+        assert tbl.entries[2].tag == 7 else fail("copied tag[2]: ${tbl.entries[2].tag}")
+        assert tbl.entries[2].value == 42 else fail("copied value[2]: ${tbl.entries[2].value}")
+        assert tbl.entries[2].data[0] == 100 else fail("copied data[2][0]: ${tbl.entries[2].data[0]}")
+        // By value: mutating the source local afterwards leaves the
+        // stored element untouched.
+        e.value = 43
+        assert tbl.entries[2].value == 42 else fail("element aliased by source mutate: ${tbl.entries[2].value}")
+
+        // ── whole-element copy OUT (`let e2 : Entry = entries[i]`) ──
+        let e2 : Entry = tbl.entries[1]
+        assert e2.tag == 0x5A else fail("e2.tag: 0x${e2.tag:02x}")
+        assert e2.data[1] == 0xCAFE else fail("e2.data[1]: 0x${e2.data[1]:04x}")
+        // By value: mutating the copy leaves the table untouched.
+        e2.value = 1
+        assert tbl.entries[1].value == 0x11223344 else fail("table aliased by copy mutate: 0x${tbl.entries[1].value:08x}")
+
+        // ── whole-vector copy (`b.entries = a.entries`) ─────────────
+        let snap : EntryTable
+        snap.entries = tbl.entries
+        assert snap.entries[1].value == 0x11223344 else fail("snap value[1]: 0x${snap.entries[1].value:08x}")
+        assert snap.entries[2].tag == 7 else fail("snap tag[2]: ${snap.entries[2].tag}")
+        assert snap.entries[0].tag == 0xA5 else fail("snap tag[0]: 0x${snap.entries[0].tag:02x}")
+        // By value in both directions.
+        snap.entries[1].value = 9
+        assert tbl.entries[1].value == 0x11223344 else fail("tbl aliased by snap mutate: 0x${tbl.entries[1].value:08x}")
+        tbl.entries[2].tag = 8
+        assert snap.entries[2].tag == 7 else fail("snap aliased by tbl mutate: ${snap.entries[2].tag}")
+
+        log(info, "PASS: Vec-of-record fields lower with value semantics under v1 and tbir")
+    end run
+end impl VecOfStructFieldTest

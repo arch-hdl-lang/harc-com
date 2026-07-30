@@ -5225,8 +5225,15 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             ir::Expr::ComponentIdle { n, .. } => fill_expr(n, instance),
             ir::Expr::SeqIndex { index, .. } => fill_expr(index, instance),
             ir::Expr::RecordField {
-                index: Some(idx), ..
-            } => fill_expr(idx, instance),
+                mid_indices, index, ..
+            } => {
+                for (_, idx) in mid_indices {
+                    fill_expr(idx, instance);
+                }
+                if let Some(idx) = index {
+                    fill_expr(idx, instance);
+                }
+            }
             ir::Expr::CovHookParam {
                 index: Some(idx), ..
             } => fill_expr(idx, instance),
@@ -5241,7 +5248,6 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             | ir::Expr::CycleCount
             | ir::Expr::ErrorCount
             | ir::Expr::Port(_)
-            | ir::Expr::RecordField { index: None, .. }
             | ir::Expr::CovHookParam { index: None, .. }
             | ir::Expr::CovHookArg { .. }
             | ir::Expr::TbField(_)
@@ -5463,8 +5469,15 @@ fn fill_visit_expr(
             fill_visit_expr(index, placeholder, binding, remap, rewrite, conflict)
         }
         Expr::RecordField {
-            index: Some(idx), ..
-        } => fill_visit_expr(idx, placeholder, binding, remap, rewrite, conflict),
+            mid_indices, index, ..
+        } => {
+            for (_, idx) in mid_indices {
+                fill_visit_expr(idx, placeholder, binding, remap, rewrite, conflict);
+            }
+            if let Some(idx) = index {
+                fill_visit_expr(idx, placeholder, binding, remap, rewrite, conflict);
+            }
+        }
         Expr::CovHookParam {
             index: Some(idx), ..
         } => fill_visit_expr(idx, placeholder, binding, remap, rewrite, conflict),
@@ -5473,7 +5486,6 @@ fn fill_visit_expr(
         | Expr::Local(_)
         | Expr::CycleCount
         | Expr::ErrorCount
-        | Expr::RecordField { index: None, .. }
         | Expr::CovHookParam { index: None, .. }
         | Expr::CovHookArg { .. }
         | Expr::TbField(_)

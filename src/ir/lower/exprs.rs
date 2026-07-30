@@ -19,6 +19,12 @@ pub(crate) struct RecordFieldChain {
     pub local: LocalId,
     pub field: String,
     pub path: Vec<String>,
+    /// Element selections on NON-leaf `Vec<Record, N>` segments
+    /// (`tbl.entries[i].tag`): `(pos, idx)` indexes the segment at `pos`
+    /// in `[field] ++ path` and descends into the element record. The
+    /// leaf's own index (an OUTERMOST `[i]`) is peeled by the caller and
+    /// never appears here, so every `pos` is strictly below the leaf.
+    pub mid_indices: Vec<(usize, Expr)>,
     /// `Some(N)` when the leaf is a `Vec<T, N>` field.
     pub leaf_vec_len: Option<usize>,
     /// The leaf field's element/scalar/record type.
@@ -304,6 +310,7 @@ impl FuncBuilder<'_> {
                         local: chain.local,
                         field: chain.field,
                         path: chain.path,
+                        mid_indices: chain.mid_indices,
                         index: None,
                     });
                 }
@@ -610,30 +617,72 @@ impl FuncBuilder<'_> {
 
     /// Resolve an AST field-access chain `ident.f1.f2...fn` rooted at a
     /// record-typed local into a [`RecordFieldChain`], descending through
-    /// nested `IrType::Record` fields to reach the leaf. Returns:
+    /// nested `IrType::Record` fields to reach the leaf. A NON-leaf
+    /// segment may carry an element selection on a `Vec<Record, N>` field
+    /// (`tbl.entries[i].tag`, at any depth) — collected into
+    /// `mid_indices`; the descent then continues through the element
+    /// record. Returns:
     ///   - `Ok(None)` when `e` is not a field access rooted at an `Ident`
     ///     bound to a record local (the caller falls through to the other
     ///     lanes: DUT signal, scoreboard, recv payload, …);
     ///   - `Err` when it IS such a chain but a component names no field, or
     ///     a non-leaf component is not a nested record (so it cannot be
-    ///     descended into).
+    ///     descended into), or an element selection sits on a non-`Vec`
+    ///     field / a `Vec` of records is traversed without one.
     pub(crate) fn try_record_field_chain(
-        &self,
+        &mut self,
         e: &AstExpr,
     ) -> Result<Option<RecordFieldChain>, LowerError> {
         // Flatten `a.b.c` → root `a`, segments `[b, c]` (outer-to-inner
-        // during the walk, reversed to declaration order after).
+        // during the walk, reversed to declaration order after). An
+        // `Index` node between segments records a pending element
+        // selection that attaches to the NEXT (inner) `Field` segment:
+        // in `tbl.entries[i].tag` the walk sees `.tag`, then `[i]`, then
+        // `.entries` — so `[i]` belongs to `entries`.
         let mut segs: Vec<String> = Vec::new();
+        // `(push-order seg position, index AST)` per element selection.
+        let mut raw_indices: Vec<(usize, &AstExpr)> = Vec::new();
+        let mut pending_index: Option<&AstExpr> = None;
         let mut cur = e;
         let root = loop {
             match &*cur.kind {
                 ExprKind::Field { target, name } => {
+                    if let Some(idx) = pending_index.take() {
+                        raw_indices.push((segs.len(), idx));
+                    }
                     segs.push(name.name.clone());
                     cur = target;
                 }
-                ExprKind::Ident(root) => break root,
-                // Innermost target is not a bare ident (`f().x`, `a[i].x`,
-                // …): not a record-local chain this lane handles.
+                ExprKind::Index { target, index } => {
+                    if pending_index.is_some() {
+                        // `a.b[i][j].c` — no field shape supports a
+                        // second dimension (`Vec` of `Vec` never lowers).
+                        return Err(unsupported(
+                            "multi-dimensional indexing of a record field",
+                            "`Vec` record fields have a single element index",
+                        ));
+                    }
+                    if segs.is_empty() {
+                        // Outermost node is an `Index` (`tbl.entries[i]`
+                        // as a whole) — the element read/write lanes peel
+                        // it before calling here; any other indexed
+                        // non-field shape is not this lane's chain.
+                        return Ok(None);
+                    }
+                    pending_index = Some(index);
+                    cur = target;
+                }
+                ExprKind::Ident(root) => {
+                    if pending_index.is_some() {
+                        // `ident[i].f` — the root local itself is indexed;
+                        // not a record-field chain (lane ports and seq
+                        // element reads route elsewhere).
+                        return Ok(None);
+                    }
+                    break root;
+                }
+                // Innermost target is not a bare ident (`f().x`, …):
+                // not a record-local chain this lane handles.
                 _ => return Ok(None),
             }
         };
@@ -666,6 +715,27 @@ impl FuncBuilder<'_> {
         if field_start >= segs.len() {
             return Ok(None);
         }
+        // Convert element selections from push-order to declaration-order
+        // positions relative to `fields`. An index landing BELOW
+        // `field_start` selects on the record local itself (`_tb.cur[i]…`)
+        // — not this lane's chain. Checked for every entry before any
+        // index lowers, so the fall-through leaves no hoisted temps.
+        let total = segs.len();
+        if raw_indices
+            .iter()
+            .any(|(p, _)| total - 1 - p < field_start)
+        {
+            return Ok(None);
+        }
+        // Lower the index expressions left-to-right (chain order — the
+        // walk collected them inner-to-outer), so hoisted statements keep
+        // source order.
+        let mut mid_indices: Vec<(usize, Expr)> = Vec::with_capacity(raw_indices.len());
+        for (raw_pos, idx_ast) in raw_indices.iter().rev() {
+            let pos = (total - 1 - raw_pos) - field_start;
+            let idx = self.lower_expr(idx_ast)?;
+            mid_indices.push((pos, idx));
+        }
         let mut dotted = self.ctx.records[cur_rid.index()].name.clone();
         let fields = &segs[field_start..];
         let last = fields.len() - 1;
@@ -682,13 +752,47 @@ impl FuncBuilder<'_> {
             dotted.push('.');
             dotted.push_str(seg);
             if i == last {
+                // The walk attaches an index to the segment BELOW it, so
+                // the leaf never carries a mid index (an outermost `[i]`
+                // is peeled by the element read/write lanes).
                 leaf_vec_len = fld.vec_len;
                 leaf_ty = fld.ty.clone();
                 break;
             }
-            // A non-leaf component must be a nested record to descend into.
+            let indexed = mid_indices.iter().any(|(p, _)| *p == i);
+            // A non-leaf component must reach a nested record to descend
+            // into: either a plain nested-record field, or one element of
+            // a `Vec<Record, N>` field selected by `[i]`.
             match fld.ty {
-                IrType::Record(next) if fld.vec_len.is_none() => cur_rid = next,
+                IrType::Record(next) if fld.vec_len.is_none() && !indexed => cur_rid = next,
+                IrType::Record(next) if fld.vec_len.is_some() && indexed => cur_rid = next,
+                _ if indexed && fld.vec_len.is_none() => {
+                    return Err(unsupported(
+                        &format!("indexing the non-`Vec` record field `{dotted}`"),
+                        "only `Vec<T, N>` record fields are indexable",
+                    ));
+                }
+                _ if indexed => {
+                    return Err(unsupported(
+                        &format!(
+                            "field access `.{}` on an element of `{dotted}`, \
+                             whose elements are scalars",
+                            fields[i + 1]
+                        ),
+                        "only `Vec` fields with struct/transaction elements can be \
+                         traversed further",
+                    ));
+                }
+                IrType::Record(_) if fld.vec_len.is_some() => {
+                    return Err(unsupported(
+                        &format!(
+                            "traversing the `Vec` record field `{dotted}` without an \
+                             element index; cannot access `.{}`",
+                            fields[i + 1]
+                        ),
+                        format!("select one element first (`{seg}[i].{}`)", fields[i + 1]),
+                    ));
+                }
                 _ => {
                     return Err(unsupported(
                         &format!(
@@ -707,15 +811,17 @@ impl FuncBuilder<'_> {
             local,
             field,
             path,
+            mid_indices,
             leaf_vec_len,
             leaf_ty,
             dotted,
         }))
     }
 
-    /// `Some(rid)` when `e` is a *whole* record value (a record-typed local
-    /// or a whole nested-record field read, `index: None`). Used to validate
-    /// a whole-record field assignment (`o.a = d`).
+    /// `Some(rid)` when `e` is a *whole* record value (a record-typed local,
+    /// a whole nested-record field read, or one `Vec<Record, N>` element —
+    /// `tbl.entries[i]`). Used to validate a whole-record field assignment
+    /// (`o.a = d`) and record-typed `let`/copy RHS shapes.
     pub(crate) fn record_id_of_expr(&self, e: &Expr) -> Option<RecordId> {
         match e {
             Expr::Local(l) => self.record_of_local(*l),
@@ -723,15 +829,25 @@ impl FuncBuilder<'_> {
                 local,
                 field,
                 path,
-                index: None,
+                mid_indices,
+                index,
             } => {
                 let mut cur = self.record_of_local(*local)?;
                 let segs: Vec<&String> = std::iter::once(field).chain(path.iter()).collect();
                 let last = segs.len() - 1;
                 for (i, seg) in segs.iter().enumerate() {
                     let fld = self.ctx.records.get(cur.index())?.field(seg)?;
+                    let indexed = if i == last {
+                        index.is_some()
+                    } else {
+                        mid_indices.iter().any(|(p, _)| *p == i)
+                    };
+                    // A record value at each step: a plain nested-record
+                    // field, or one indexed `Vec<Record, N>` element. A
+                    // whole (unindexed) `Vec` leaf is an array, not a
+                    // record value.
                     match fld.ty {
-                        IrType::Record(r) if fld.vec_len.is_none() => {
+                        IrType::Record(r) if fld.vec_len.is_none() == !indexed => {
                             if i == last {
                                 return Some(r);
                             }
@@ -816,6 +932,7 @@ impl FuncBuilder<'_> {
             local: chain.local,
             field: chain.field,
             path: chain.path,
+            mid_indices: chain.mid_indices,
             index: Some(Box::new(idx)),
         }))
     }
@@ -932,12 +1049,30 @@ impl FuncBuilder<'_> {
                     index: Box::new(index),
                 }
             }
-            // An indexed `Vec`-field read carries the index sub-expr,
-            // which may hold a DUT port; hoist into it. A scalar
-            // RecordField (index `None`) is the no-op host-state value.
-            Expr::RecordField { local, field, path, index: Some(index) } => {
-                let index = self.hoist_ports_with_hint(*index, None);
-                Expr::RecordField { local, field, path, index: Some(Box::new(index)) }
+            // An indexed `Vec`-field read carries index sub-exprs (the
+            // leaf `[i]` and any mid-chain `entries[i].…` selections),
+            // which may hold DUT ports; hoist into each. A plain scalar
+            // RecordField (no indices) is the no-op host-state value.
+            Expr::RecordField {
+                local,
+                field,
+                path,
+                mid_indices,
+                index,
+            } if index.is_some() || !mid_indices.is_empty() => {
+                let mid_indices = mid_indices
+                    .into_iter()
+                    .map(|(p, idx)| (p, self.hoist_ports_with_hint(idx, None)))
+                    .collect();
+                let index =
+                    index.map(|idx| Box::new(self.hoist_ports_with_hint(*idx, None)));
+                Expr::RecordField {
+                    local,
+                    field,
+                    path,
+                    mid_indices,
+                    index,
+                }
             }
             Expr::CovHookParam { param, field, index: Some(index) } => {
                 let index = self.hoist_ports_with_hint(*index, None);
@@ -950,7 +1085,9 @@ impl FuncBuilder<'_> {
             // values, no DUT port.
             | Expr::CycleCount
             | Expr::ErrorCount
-            | Expr::RecordField { index: None, .. }
+            // Index-free RecordFields only — the guarded arm above
+            // consumed every index-carrying shape.
+            | Expr::RecordField { .. }
             | Expr::CovHookParam { index: None, .. }
             | Expr::CovHookArg { .. }
             | Expr::TbField(_)
@@ -1002,6 +1139,37 @@ impl FuncBuilder<'_> {
                 WidthCastKind::Sext => IrType::SInt(Some(*width)),
                 _ => IrType::UInt(Some(*width)),
             }),
+            // A record-field chain types as its leaf: the leaf field's own
+            // scalar/record type, or the element type when the leaf `Vec`
+            // is indexed. A whole (unindexed) `Vec` leaf is an array — it
+            // has no expression-value type here. This is what types an
+            // untyped `let e = tbl.entries[i]` as the element record.
+            Expr::RecordField {
+                local,
+                field,
+                path,
+                mid_indices,
+                index,
+            } => {
+                let mut cur = self.record_of_local(*local)?;
+                let segs: Vec<&String> = std::iter::once(field).chain(path.iter()).collect();
+                let last = segs.len() - 1;
+                for (i, seg) in segs.iter().enumerate() {
+                    let fld = self.ctx.records.get(cur.index())?.field(seg)?;
+                    if i == last {
+                        return match (fld.vec_len, index.is_some()) {
+                            (Some(_), true) | (None, false) => Some(fld.ty.clone()),
+                            _ => None,
+                        };
+                    }
+                    let indexed = mid_indices.iter().any(|(p, _)| *p == i);
+                    match fld.ty {
+                        IrType::Record(r) if fld.vec_len.is_none() == !indexed => cur = r,
+                        _ => return None,
+                    }
+                }
+                None
+            }
             _ => None,
         }
     }
