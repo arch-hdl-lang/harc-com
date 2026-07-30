@@ -81,6 +81,13 @@ fn emit_cpp_src(src: &str) -> String {
     tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits")
 }
 
+fn emit_cpp_src_result(src: &str) -> Result<String, String> {
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).map_err(|e| e.to_string())?;
+    verify::verify_program(&prog).map_err(|e| format!("{e:?}"))?;
+    tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).map_err(|e| e.to_string())
+}
+
 /// The negative-test contract: every out-of-subset fixture must produce
 /// `LowerError::Unsupported` whose rendered message names the offending
 /// construct and points the user at `--codegen v1`.
@@ -93,6 +100,23 @@ fn assert_unsupported(err: &lower::LowerError) -> String {
     assert!(
         msg.contains("--codegen v1"),
         "unsupported error must suggest --codegen v1: {msg}"
+    );
+    msg
+}
+
+/// #521 diagnostics contract: an illegal constant evaluation (division
+/// by zero, width violation, cyclic reference, ...) is a program error
+/// under every backend, so it surfaces as `LowerError::Invalid` with a
+/// precise message — and must NOT point the user at `--codegen v1`.
+fn assert_invalid(err: &lower::LowerError) -> String {
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)),
+        "must be LowerError::Invalid: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("--codegen v1"),
+        "invalid-program error must not suggest --codegen v1: {msg}"
     );
     msg
 }
@@ -231,7 +255,12 @@ end test T"#,
     );
     // Each const use substitutes as its folded literal, so the assert
     // condition reduces to a literal-vs-literal comparison.
-    for lit in ["1 == 1", "2 == 2", "3 == 3", "255 == 255"] {
+    for lit in [
+        "((uint64_t)(1)) == 1",
+        "((uint64_t)(2)) == 2",
+        "((uint64_t)(3)) == 3",
+        "((uint64_t)(255)) == 255",
+    ] {
         assert!(
             cpp.contains(lit),
             "expected folded const comparison `{lit}`; got:\n{cpp}"
@@ -239,13 +268,60 @@ end test T"#,
     }
 }
 
-/// #494 P2a: a `const` initializer that is NOT a compile-time integer
-/// constant (here, a reference to an undefined name) is rejected with a
-/// structured `Unsupported` error — never silently accepted.
+/// #494 P2a / #521: a `const` initializer referencing an undefined name
+/// is rejected with a precise `Invalid` diagnostic naming both the
+/// const and the unknown reference — never silently accepted.
 #[test]
-fn const_non_constant_initializer_is_rejected() {
+fn const_unknown_reference_is_rejected() {
     let err = lower_src(
         r#"const BAD : uint<32> = NOT_A_CONST + 1
+
+test T
+    let dut : Top
+    run
+        assert BAD == 0 else fail("x")
+    end run
+end test T"#,
+    )
+    .expect_err("non-constant const initializer must fail lowering");
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("const BAD") && msg.contains("NOT_A_CONST"),
+        "rejection must name the offending const and the unknown name; got: {msg}"
+    );
+}
+
+/// #521: the wrapping `+% -% *%` operators are outside the const
+/// subset — their §2.4 mask needs static operand widths, which the
+/// 64-bit fold does not model. Folding them as plain ops would
+/// silently change their meaning, so they reject structurally.
+#[test]
+fn const_wrap_operator_is_unsupported() {
+    let err = lower_src(
+        r#"const BAD : uint<8> = 255 +% 1
+
+test T
+    let dut : Top
+    run
+        assert BAD == 0 else fail("x")
+    end run
+end test T"#,
+    )
+    .expect_err("wrap-op const initializer must fail lowering");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("const BAD") && msg.contains("+% -% *%"),
+        "wrap-op rejection must name the const and the operators; got: {msg}"
+    );
+}
+
+/// #521: a construct outside the constant-expression subset (here, a
+/// call) still gets the structured `Unsupported` rejection that
+/// suggests `--codegen v1`.
+#[test]
+fn const_out_of_subset_initializer_is_unsupported() {
+    let err = lower_src(
+        r#"const BAD : uint<32> = some_call()
 
 test T
     let dut : Top
@@ -259,6 +335,280 @@ end test T"#,
     assert!(
         msg.contains("const BAD"),
         "rejection must name the offending const `BAD`; got: {msg}"
+    );
+}
+
+/// #521: signed constants fold with the declared signedness — `>>` on a
+/// `sint` const is an arithmetic shift and `/` truncates toward zero,
+/// matching v1's `int64_t` constexpr evaluation. The stored bit
+/// pattern substitutes at use sites, so `-1 >> 1 == -1` (not
+/// `0x7FFF...`), and `-7 / 2 == -3` (not a huge unsigned quotient).
+#[test]
+fn const_signed_semantics_fold() {
+    let cpp = emit_cpp_src(
+        r#"const NEG_ONE : sint<8>  = -1
+const NEG_SHR : sint<8>  = NEG_ONE >> 1
+const NEG_DIV : sint<32> = (0 - 7) / 2
+const NEG_MOD : sint<32> = (0 - 7) % 2
+
+test T
+    let dut : Top
+    run
+        assert NEG_SHR == NEG_ONE else fail("x")
+        assert NEG_DIV == 0 - 3 else fail("x")
+        assert NEG_MOD == 0 - 1 else fail("x")
+        assert (NEG_ONE >> 1) == NEG_ONE else fail("direct-shr")
+        assert ((NEG_ONE + 0) >> 1) == NEG_ONE else fail("nested-shr")
+        assert ((NEG_ONE as uint<8>) >> 1) == 9223372036854775807 else fail("cast-shr")
+        assert (NEG_ONE.sext<64>() >> 1) == NEG_ONE else fail("sext-shr")
+    end run
+end test T"#,
+    );
+    // -1 (as a 64-bit pattern) survives the arithmetic shift.
+    assert!(
+        cpp.contains("(((int64_t)(-1)) == ((int64_t)(-1)))"),
+        "sint consts must retain their signed value at use sites; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("((int64_t)(((int64_t)(-1)))) >> 1"),
+        "signed const use sites must use arithmetic right shift; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("((uint64_t)(((uint64_t)(((int64_t)(-1)))))) >> 1"),
+        "uint relabel casts must use logical right shift; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("((int64_t)(((int64_t)(((int64_t)(-1)))))) >> 1"),
+        "sext results must use arithmetic right shift; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("((int64_t)((((int64_t)(-1)) + 0))) >> 1"),
+        "signed nested arithmetic must use arithmetic right shift; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn const_sint64_min_emits_a_signed_literal() {
+    let cpp = emit_cpp_src(
+        r#"const MIN : sint<64> = -9223372036854775808
+
+test T
+    let dut : Top
+    run
+        assert MIN < 0 else fail("min")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("-9223372036854775807LL - 1"),
+        "sint<64> minimum must be emitted without an unsigned literal; got:\n{cpp}"
+    );
+}
+
+/// Unsigned constants must retain uint64_t rank at use sites. Otherwise
+/// `sint`/`uint` mixed expressions lose C++'s usual-arithmetic conversion.
+#[test]
+fn const_mixed_signedness_use_preserves_usual_arithmetic_conversion() {
+    let cpp = emit_cpp_src(
+        r#"const NEG : sint<8> = -1
+const ONE : uint<8> = 1
+
+test T
+    let dut : Top
+    run
+        assert !(NEG < ONE) else fail("mixed")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("((int64_t)(-1)) < ((uint64_t)(1))"),
+        "mixed signed/unsigned consts must retain C++ conversion rank; got:\n{cpp}"
+    );
+}
+
+/// #521: the folded value must fit the declared width — out-of-range
+/// initializers are a precise compile-time error, not a silent
+/// truncation (which would diverge from v1's 64-bit storage) and not a
+/// silent wrong value (which would make the declared width a lie).
+#[test]
+fn const_width_violation_is_rejected() {
+    for (src_ty, init, needle) in [
+        ("uint<8>", "0x1FF", "does not fit `uint<8>`"),
+        ("uint<32>", "~0", "does not fit `uint<32>`"),
+        ("uint<32>", "0 - 1", "negative values cannot initialize"),
+        ("sint<8>", "128", "does not fit `sint<8>`"),
+        ("sint<8>", "0 - 129", "does not fit `sint<8>`"),
+    ] {
+        let err = lower_src(&format!(
+            r#"const BAD : {src_ty} = {init}
+
+test T
+    let dut : Top
+    run
+        assert BAD == 0 else fail("x")
+    end run
+end test T"#
+        ))
+        .expect_err("width-violating const must fail lowering");
+        let msg = assert_invalid(&err);
+        assert!(
+            msg.contains("const BAD") && msg.contains(needle),
+            "width rejection for `{src_ty} = {init}` must contain `{needle}`; got: {msg}"
+        );
+    }
+}
+
+/// #521: integer literals evaluate in the 64-bit domain (HARC fixed-
+/// width semantics), NOT as C++ 32-bit `int`. `1 << 31` is the bit-31
+/// mask (0x80000000), and shift amounts 32..=63 and intermediate sums
+/// above `INT_MAX` are well-defined. v1 mis-handles all three (C++20
+/// sign-extends `1 << 31` to 0xFFFFFFFF80000000; the other two are
+/// constexpr-UB compile errors in the emitted C++), so this corner is
+/// locked here rather than in the v1-equivalence fixture.
+#[test]
+fn const_literals_are_64_bit() {
+    let cpp = emit_cpp_src(
+        r#"const BIT31 : uint<32> = 1 << 31
+const BIT40 : uint<64> = 1 << 40
+const BIG   : uint<64> = 2000000000 + 2000000000
+
+test T
+    let dut : Top
+    run
+        assert BIT31 == 0x80000000 else fail("x")
+        assert BIT40 == 0x10000000000 else fail("x")
+        assert BIG == 4000000000 else fail("x")
+    end run
+end test T"#,
+    );
+    for v in ["2147483648", "1099511627776", "4000000000"] {
+        assert!(
+            cpp.contains(v),
+            "64-bit literal fold must produce {v}; got:\n{cpp}"
+        );
+    }
+}
+
+/// #521: boundary values on the declared width are accepted exactly.
+#[test]
+fn const_width_boundaries_fold() {
+    let cpp = emit_cpp_src(
+        r#"const U8_MAX  : uint<8>  = (1 << 8) - 1
+const S8_MAX  : sint<8>  = 127
+const S8_MIN  : sint<8>  = 0 - 128
+const U63     : uint<63> = (1 << 63) - 1
+const ALL_ONES : uint<64> = ~0
+
+test T
+    let dut : Top
+    run
+        assert U8_MAX == 255 else fail("x")
+        assert S8_MAX == 127 else fail("x")
+        assert S8_MIN + 128 == 0 else fail("x")
+        assert U63 == 9223372036854775807 else fail("x")
+        assert ALL_ONES == ~0 else fail("x")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("255") && cpp.contains("9223372036854775807"),
+        "boundary consts must fold to their exact values; got:\n{cpp}"
+    );
+}
+
+/// #521: illegal evaluations get precise diagnostics naming the const
+/// and the failure: division/modulo by zero, out-of-range or negative
+/// shift amounts, and self-referencing (cyclic) definitions.
+#[test]
+fn const_invalid_evaluations_are_rejected() {
+    for (init, needle) in [
+        ("1 / 0", "division by zero"),
+        ("1 % 0", "modulo by zero"),
+        ("1 / (BASE - BASE)", "division by zero"),
+        ("1 << 64", "shift amount 64 is out of range"),
+        ("1 >> 200", "shift amount 200 is out of range"),
+        ("1 << (0 - 1)", "negative shift amount (-1)"),
+        ("BAD + 1", "references itself"),
+    ] {
+        let err = lower_src(&format!(
+            r#"const BASE : uint<32> = 4
+const BAD : uint<32> = {init}
+
+test T
+    let dut : Top
+    run
+        assert BAD == 0 else fail("x")
+    end run
+end test T"#
+        ))
+        .expect_err("invalid const evaluation must fail lowering");
+        let msg = assert_invalid(&err);
+        assert!(
+            msg.contains("const BAD") && msg.contains(needle),
+            "diagnostic for `{init}` must contain `{needle}`; got: {msg}"
+        );
+    }
+}
+
+/// #521: `as uint<W>` / `as sint<W>` relabel casts fold — the value is
+/// unchanged (matching the runtime relabel lowering and v1's 64-bit C
+/// cast) and the signedness follows the cast target, so a negative
+/// pattern can be moved into an unsigned const explicitly.
+#[test]
+fn const_relabel_cast_folds() {
+    let cpp = emit_cpp_src(
+        r#"const ALL : uint<64> = (0 - 1) as uint<64>
+const BACK : sint<8> = (255 as sint<64>) >> 8
+
+test T
+    let dut : Top
+    run
+        assert ALL == ~0 else fail("x")
+        assert BACK == 0 else fail("x")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("18446744073709551615"),
+        "relabel-cast const must keep the bit pattern; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn signed_relabel_cast_preserves_narrow_source_value() {
+    let cpp = emit_cpp_src(
+        r#"test T
+    let dut : Top
+    run
+        let byte : uint<8> = 255
+        let signed : sint<64> = byte as sint<64>
+        assert signed == 255 else fail("relabel")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("= ((int64_t)(byte));"),
+        "as sint<64> must relabel without sign-extending a narrow source; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn signed_wide_right_shift_is_rejected_in_tbir() {
+    let err = emit_cpp_src_result(
+        r#"test T
+        let dut : Top
+    run
+        let wide : sint<128> = 0
+        assert (wide >> 1) == 0 else fail("wide-shr")
+        assert ((wide + 1) >> 1) == 0 else fail("wide-nested-shr")
+        assert ((1 + wide) >> 1) == 0 else fail("wide-rhs-shr")
+    end run
+end test T"#,
+    )
+    .expect_err("TB-IR must not silently truncate signed shifts above 64 bits");
+    assert!(
+        err.contains("right shift above 64 bits"),
+        "wide signed shift must have a targeted diagnostic; got: {err}"
     );
 }
 

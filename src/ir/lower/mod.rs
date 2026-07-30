@@ -43,7 +43,9 @@ use std::collections::{HashMap, HashSet};
 pub enum LowerError {
     /// The construct is outside the TB-IR MVP subset.
     Unsupported { construct: String, detail: String },
-    /// Structurally invalid input (would also fail v1 codegen).
+    /// Structurally invalid input — a program error under every
+    /// backend (v1 either rejects it too or silently mis-evaluates
+    /// it), never a TB-IR subset gap, so no `--codegen v1` suggestion.
     Invalid(String),
 }
 
@@ -71,62 +73,365 @@ pub(crate) fn unsupported(construct: &str, detail: impl Into<String>) -> LowerEr
     }
 }
 
-/// Const-fold a file-scope `const` initializer expression to a `u64`,
-/// resolving identifiers against `consts` (earlier `const` values and
-/// enum-variant indices, both in source order). Arithmetic uses
-/// wrapping 64-bit semantics to match v1's C++ `constexpr` evaluation
-/// of the same expression forwarded to the compiler. Returns `None`
-/// (rather than a placeholder) when the expression is not a compile-
-/// time integer constant, so the caller can emit a structured
-/// rejection. Supports: integer literals, booleans, identifiers
-/// (const/enum names), parentheses, unary `-`/`~`/`!`/`not`, and the
-/// binary arithmetic (`+ - * / %`, incl. wrapping variants), shift
-/// (`<< >>`), bitwise (`& | ^`), comparison, and logical operators.
-fn fold_const_u64(e: &crate::ast::Expr, consts: &HashMap<String, u64>) -> Option<u64> {
-    use crate::ast::{BinaryOp, UnaryOp};
+/// A folded file-scope constant: 64-bit two's-complement bit pattern
+/// plus the signedness later expressions must evaluate it under. The
+/// signedness is the *declared* type's (`sint<N>` → signed), matching
+/// v1, which stores every ≤64-bit const as `uint64_t`/`int64_t` per
+/// `c_type_for` — the bit pattern is backend-identical and signedness
+/// only changes the value of `>>`, `/`, `%`, and ordered comparisons.
+#[derive(Clone, Copy)]
+struct ConstVal {
+    bits: u64,
+    signed: bool,
+}
+
+impl ConstVal {
+    fn as_i64(self) -> i64 {
+        self.bits as i64
+    }
+    fn is_negative(self) -> bool {
+        self.signed && (self.bits as i64) < 0
+    }
+}
+
+/// A const-initializer fold failure (issue #521): `Unsupported` is a
+/// construct outside the constant-expression subset (surfaced as
+/// `LowerError::Unsupported`, which suggests `--codegen v1`), while
+/// `Invalid` is a well-formed constant expression whose evaluation is
+/// illegal — division by zero, an out-of-range shift, an unknown or
+/// cyclic constant reference, a value that violates the declared
+/// width. Those are program errors under every backend (v1 would hit
+/// C++ UB or silently mis-evaluate), so they surface as
+/// `LowerError::Invalid` with a precise diagnostic instead.
+enum ConstFoldErr {
+    Unsupported(String),
+    Invalid(String),
+}
+
+use ConstFoldErr::Invalid as FoldInvalid;
+
+/// Const-fold a file-scope `const` initializer expression, resolving
+/// identifiers against `consts` (earlier `const` values and enum-
+/// variant indices, both in source order; `self_name` is the constant
+/// being defined, for cycle diagnostics). Evaluation is 64-bit two's-
+/// complement with per-node signedness — integer literals are 64-bit
+/// (HARC semantics; unlike C++'s 32-bit `int` literals), references
+/// carry their declared signedness, and a binary op is signed only
+/// when both operands are (C++'s usual-arithmetic-conversion rule at
+/// rank 64, which is what v1's emitted `constexpr` initializers
+/// evaluate under). Supports: integer literals, booleans, identifiers
+/// (const/enum names), parentheses, `as uint/sint/bits<≤64>` relabel
+/// casts, unary `-`/`~`/`!`/`not`, and the binary arithmetic
+/// (`+ - * / %`), shift (`<< >>`), bitwise (`& | ^`), comparison, and
+/// logical operators. The wrapping `+% -% *%` spellings are rejected —
+/// their §2.4 mask depends on static operand widths the fold does not
+/// model.
+fn fold_const(
+    e: &crate::ast::Expr,
+    consts: &HashMap<String, ConstVal>,
+    self_name: &str,
+) -> Result<ConstVal, ConstFoldErr> {
+    use crate::ast::{BinaryOp, TypeExpr, UnaryOp};
+    let boolean = |x: bool| {
+        // Comparison / logical results promote like C++ `bool` → `int`.
+        Ok(ConstVal {
+            bits: x as u64,
+            signed: true,
+        })
+    };
     match &*e.kind {
-        ExprKind::Paren(inner) => fold_const_u64(inner, consts),
-        ExprKind::Int(s) => exprs::parse_int_literal(s),
-        ExprKind::Bool(b) => Some(*b as u64),
-        ExprKind::Ident(id) => consts.get(&id.name).copied(),
-        ExprKind::Unary { op, expr } => {
-            let v = fold_const_u64(expr, consts)?;
-            Some(match op {
-                UnaryOp::Neg => v.wrapping_neg(),
-                UnaryOp::Not | UnaryOp::NotKw => (v == 0) as u64,
-                UnaryOp::BitNot => !v,
+        ExprKind::Paren(inner) => fold_const(inner, consts, self_name),
+        ExprKind::Int(s) => match exprs::parse_int_literal(s) {
+            // Decimal literals above i64::MAX are unsigned, like C++.
+            Some(v) => Ok(ConstVal {
+                bits: v,
+                signed: v <= i64::MAX as u64,
+            }),
+            None => Err(ConstFoldErr::Unsupported(format!(
+                "the integer literal `{s}` does not fit the 64-bit constant-evaluation domain"
+            ))),
+        },
+        ExprKind::Bool(b) => boolean(*b),
+        ExprKind::Ident(id) => match consts.get(&id.name) {
+            Some(v) => Ok(*v),
+            None if id.name == self_name => Err(FoldInvalid(format!(
+                "references itself — `const {self_name}` is a dependency cycle",
+            ))),
+            None => Err(FoldInvalid(format!(
+                "references `{}`, which is not an earlier `const` or enum variant \
+                 (constants resolve in declaration order, so forward or cyclic \
+                 references cannot be evaluated)",
+                id.name
+            ))),
+        },
+        // `expr as uint<W>` / `as sint<W>` / `as bits<W>` (W ≤ 64) is a
+        // signedness relabel with the value unchanged — the same
+        // semantics the runtime lowering gives casts (`cast_relabel_width`)
+        // and v1's `((uint64_t)(expr))` emission at 64-bit rank.
+        ExprKind::Cast { expr, ty } => {
+            if exprs::cast_relabel_width(ty).is_none() {
+                return Err(ConstFoldErr::Unsupported(
+                    "`as` casts outside scalar uint/sint/bits (≤ 64 bits)".into(),
+                ));
+            }
+            let v = fold_const(expr, consts, self_name)?;
+            let signed = matches!(
+                ty,
+                TypeExpr::Builtin {
+                    name: crate::ast::BuiltinTy::SInt | crate::ast::BuiltinTy::SIntCap,
+                    ..
+                }
+            );
+            Ok(ConstVal {
+                bits: v.bits,
+                signed,
             })
         }
-        ExprKind::Binary { op, lhs, rhs } => {
-            let a = fold_const_u64(lhs, consts)?;
-            let b = fold_const_u64(rhs, consts)?;
-            let bi = |x: bool| Some(x as u64);
+        ExprKind::Unary { op, expr } => {
+            let v = fold_const(expr, consts, self_name)?;
             match op {
-                BinaryOp::Add | BinaryOp::AddWrap => Some(a.wrapping_add(b)),
-                BinaryOp::Sub | BinaryOp::SubWrap => Some(a.wrapping_sub(b)),
-                BinaryOp::Mul | BinaryOp::MulWrap => Some(a.wrapping_mul(b)),
-                // Divide/mod by zero is not a compile-time constant.
-                BinaryOp::Div => (b != 0).then(|| a.wrapping_div(b)),
-                BinaryOp::Mod => (b != 0).then(|| a.wrapping_rem(b)),
-                // Shift amount masked to 6 bits (C++ UB is >= width, but
-                // v1 forwards the raw expr; the corpus stays in range).
-                BinaryOp::Shl => Some(a.wrapping_shl(b as u32)),
-                BinaryOp::Shr => Some(a.wrapping_shr(b as u32)),
-                BinaryOp::BitAnd => Some(a & b),
-                BinaryOp::BitOr => Some(a | b),
-                BinaryOp::BitXor => Some(a ^ b),
-                BinaryOp::Eq => bi(a == b),
-                BinaryOp::Ne => bi(a != b),
-                BinaryOp::Lt => bi(a < b),
-                BinaryOp::Le => bi(a <= b),
-                BinaryOp::Gt => bi(a > b),
-                BinaryOp::Ge => bi(a >= b),
-                BinaryOp::AndAnd | BinaryOp::AndKw => bi(a != 0 && b != 0),
-                BinaryOp::OrOr | BinaryOp::OrKw => bi(a != 0 || b != 0),
-                _ => None,
+                UnaryOp::Neg => Ok(ConstVal {
+                    bits: v.bits.wrapping_neg(),
+                    // C++: negating an unsigned value stays unsigned.
+                    signed: v.signed,
+                }),
+                UnaryOp::Not | UnaryOp::NotKw => boolean(v.bits == 0),
+                UnaryOp::BitNot => Ok(ConstVal {
+                    bits: !v.bits,
+                    signed: v.signed,
+                }),
             }
         }
+        ExprKind::Binary { op, lhs, rhs } => {
+            let a = fold_const(lhs, consts, self_name)?;
+            let b = fold_const(rhs, consts, self_name)?;
+            // C++ usual arithmetic conversions at rank 64: the result
+            // (and the comparison/division domain) is signed only when
+            // both operands are.
+            let signed = a.signed && b.signed;
+            let arith = |bits: u64| Ok(ConstVal { bits, signed });
+            // Shift-amount validation shared by `<<`/`>>`. v1 forwards
+            // the raw expression to C++, where an out-of-range amount
+            // is UB — reject loudly instead of silently masking.
+            let shift_amount = |b: ConstVal| -> Result<u32, ConstFoldErr> {
+                if b.is_negative() {
+                    return Err(FoldInvalid(format!(
+                        "negative shift amount ({})",
+                        b.as_i64()
+                    )));
+                }
+                if b.bits >= 64 {
+                    return Err(FoldInvalid(format!(
+                        "shift amount {} is out of range (constant evaluation \
+                         is 64-bit; shift amounts must be 0..=63)",
+                        b.bits
+                    )));
+                }
+                Ok(b.bits as u32)
+            };
+            match op {
+                BinaryOp::Add => arith(a.bits.wrapping_add(b.bits)),
+                BinaryOp::Sub => arith(a.bits.wrapping_sub(b.bits)),
+                BinaryOp::Mul => arith(a.bits.wrapping_mul(b.bits)),
+                // `+% -% *%` mask to max(W(a), W(b)) per spec §2.4, and
+                // the 64-bit fold domain does not model per-operand
+                // widths — folding them as plain ops would silently
+                // change their meaning, so they stay out of the const
+                // subset until the fold tracks operand widths.
+                BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap => {
+                    Err(ConstFoldErr::Unsupported(
+                        "the wrapping `+% -% *%` operators in a constant expression \
+                         (their §2.4 mask needs static operand widths; use the plain \
+                         operator with an explicit `& ((1 << W) - 1)` mask)"
+                        .into(),
+                    ))
+                }
+                BinaryOp::Div | BinaryOp::Mod => {
+                    let is_div = matches!(op, BinaryOp::Div);
+                    let label = if is_div { "division" } else { "modulo" };
+                    if b.bits == 0 {
+                        return Err(FoldInvalid(format!("{label} by zero")));
+                    }
+                    if signed {
+                        if a.as_i64() == i64::MIN && b.as_i64() == -1 {
+                            return Err(FoldInvalid(format!(
+                                "signed {label} overflow ({} / -1 exceeds the \
+                                 64-bit constant-evaluation domain)",
+                                i64::MIN
+                            )));
+                        }
+                        let r = if is_div {
+                            a.as_i64().wrapping_div(b.as_i64())
+                        } else {
+                            a.as_i64().wrapping_rem(b.as_i64())
+                        };
+                        arith(r as u64)
+                    } else if is_div {
+                        arith(a.bits / b.bits)
+                    } else {
+                        arith(a.bits % b.bits)
+                    }
+                }
+                BinaryOp::Shl => {
+                    let n = shift_amount(b)?;
+                    // C++: the result's signedness is the (promoted)
+                    // left operand's, not the pair's.
+                    Ok(ConstVal {
+                        bits: a.bits << n,
+                        signed: a.signed,
+                    })
+                }
+                BinaryOp::Shr => {
+                    let n = shift_amount(b)?;
+                    let bits = if a.signed {
+                        // Arithmetic shift for signed operands — what
+                        // v1's `int64_t` constexpr evaluation does.
+                        (a.as_i64() >> n) as u64
+                    } else {
+                        a.bits >> n
+                    };
+                    Ok(ConstVal {
+                        bits,
+                        signed: a.signed,
+                    })
+                }
+                BinaryOp::BitAnd => arith(a.bits & b.bits),
+                BinaryOp::BitOr => arith(a.bits | b.bits),
+                BinaryOp::BitXor => arith(a.bits ^ b.bits),
+                BinaryOp::Eq => boolean(a.bits == b.bits),
+                BinaryOp::Ne => boolean(a.bits != b.bits),
+                BinaryOp::Lt => boolean(if signed {
+                    a.as_i64() < b.as_i64()
+                } else {
+                    a.bits < b.bits
+                }),
+                BinaryOp::Le => boolean(if signed {
+                    a.as_i64() <= b.as_i64()
+                } else {
+                    a.bits <= b.bits
+                }),
+                BinaryOp::Gt => boolean(if signed {
+                    a.as_i64() > b.as_i64()
+                } else {
+                    a.bits > b.bits
+                }),
+                BinaryOp::Ge => boolean(if signed {
+                    a.as_i64() >= b.as_i64()
+                } else {
+                    a.bits >= b.bits
+                }),
+                BinaryOp::AndAnd | BinaryOp::AndKw => boolean(a.bits != 0 && b.bits != 0),
+                BinaryOp::OrOr | BinaryOp::OrKw => boolean(a.bits != 0 || b.bits != 0),
+                _ => Err(ConstFoldErr::Unsupported(format!(
+                    "the `{op:?}` operator in a constant expression"
+                ))),
+            }
+        }
+        _ => Err(ConstFoldErr::Unsupported(
+            "does not fold to a compile-time integer constant (only integer \
+             literals, earlier `const`/enum-variant names, `as` relabel casts, \
+             and the arithmetic/bitwise/shift operators are supported)"
+            .into(),
+        )),
+    }
+}
+
+/// Check the folded value against the declared type and pin the
+/// stored signedness to the declaration (issue #521 acceptance
+/// criterion 2). Widths below 64 are *validated*, not truncated: v1
+/// stores every ≤64-bit const in a 64-bit C type, so silently masking
+/// here would diverge from the legacy backend, and silently keeping an
+/// out-of-range value would make the declared width a lie. A value
+/// that does not fit the declared `uint<W>` / `sint<W>` is a precise
+/// compile-time error instead. Widths ≥ 64 (and missing/unknown
+/// types) pass through unchecked — the 64-bit fold domain cannot
+/// overflow them.
+fn check_const_decl_type(
+    ty: Option<&crate::ast::TypeExpr>,
+    v: ConstVal,
+) -> Result<ConstVal, String> {
+    use crate::ast::{BuiltinTy, TypeArg, TypeExpr};
+    let Some(TypeExpr::Builtin { name, args, .. }) = ty else {
+        // Untyped `const NAME = expr` — v1 stores it as `int64_t`.
+        return Ok(ConstVal {
+            bits: v.bits,
+            signed: ty.is_none() || v.signed,
+        });
+    };
+    let width: Option<u32> = args.first().and_then(|a| match a {
+        TypeArg::Expr(e) => match &*e.kind {
+            ExprKind::Int(s) => s.replace('_', "").parse().ok(),
+            _ => None,
+        },
         _ => None,
+    });
+    match name {
+        BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {
+            if let Some(w) = width.filter(|w| (1..64).contains(w)) {
+                if v.is_negative() {
+                    return Err(format!(
+                        "value {} does not fit `{}<{w}>` — negative values \
+                         cannot initialize an unsigned constant (wrap \
+                         explicitly with a literal or `& ((1 << {w}) - 1)`)",
+                        v.as_i64(),
+                        type_keyword(name),
+                    ));
+                }
+                if v.bits >> w != 0 {
+                    return Err(format!(
+                        "value {} does not fit `{}<{w}>` (max {})",
+                        v.bits,
+                        type_keyword(name),
+                        (1u64 << w) - 1
+                    ));
+                }
+            }
+            Ok(ConstVal {
+                bits: v.bits,
+                signed: false,
+            })
+        }
+        BuiltinTy::SInt | BuiltinTy::SIntCap => {
+            if let Some(w) = width.filter(|w| (1..64).contains(w)) {
+                let s = v.bits as i64;
+                let min = -(1i64 << (w - 1));
+                let max = (1i64 << (w - 1)) - 1;
+                // An unsigned fold result above i64::MAX has no signed
+                // reading; report it via its bit value.
+                if !v.signed && v.bits > i64::MAX as u64 {
+                    return Err(format!(
+                        "value {} does not fit `sint<{w}>` (range {min}..={max})",
+                        v.bits
+                    ));
+                }
+                if s < min || s > max {
+                    return Err(format!(
+                        "value {s} does not fit `sint<{w}>` (range {min}..={max})"
+                    ));
+                }
+            }
+            Ok(ConstVal {
+                bits: v.bits,
+                signed: true,
+            })
+        }
+        BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => Ok(ConstVal {
+            // v1 emits `static constexpr bool` — C++ bool conversion.
+            bits: (v.bits != 0) as u64,
+            signed: true,
+        }),
+        _ => Ok(v),
+    }
+}
+
+/// Surface keyword for an unsigned builtin scalar, for diagnostics.
+fn type_keyword(name: &crate::ast::BuiltinTy) -> &'static str {
+    use crate::ast::BuiltinTy;
+    match name {
+        BuiltinTy::UIntCap => "UInt",
+        BuiltinTy::Bits => "bits",
+        BuiltinTy::Int => "int",
+        _ => "uint",
     }
 }
 
@@ -252,36 +557,64 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // RED, ... }` variant names (v1: variant index, first definition
     // wins). Both substitute as plain integer literals at use sites —
     // observably identical to v1's constexpr/index emission. The
-    // initializer expression is const-folded to a `u64` with wrapping
-    // `uint64_t` semantics matching v1's C++ constexpr evaluation; it
-    // may reference earlier `const` names and enum-variant names (both
-    // live in the same `consts` map, processed in source order). Any
-    // initializer that does not fold to a compile-time constant is
-    // rejected structurally rather than silently accepted.
-    let mut consts: HashMap<String, u64> = HashMap::new();
+    // initializer expression is const-folded in the 64-bit two's-
+    // complement domain with declared-type signedness (issue #521; see
+    // `fold_const`), validated against the declared width, and may
+    // reference earlier `const` names and enum-variant names (both
+    // live in the same map, processed in source order). An initializer
+    // outside the constant-expression subset is rejected structurally;
+    // an illegal evaluation (division by zero, out-of-range shift,
+    // unknown/cyclic reference, width violation) gets a precise
+    // `Invalid` diagnostic.
+    let mut const_vals: HashMap<String, ConstVal> = HashMap::new();
     for it in &file.items {
         match it {
             Item::Const(c) => {
-                let Some(v) = fold_const_u64(&c.value, &consts) else {
-                    return Err(unsupported(
-                        &format!("`const {}` initializer", c.name.name),
-                        "does not fold to a compile-time integer constant (only \
-                         integer literals, earlier `const`/enum-variant names, \
-                         and the arithmetic/bitwise/shift operators are supported)",
-                    ));
+                let folded = fold_const(&c.value, &const_vals, &c.name.name).and_then(|v| {
+                    check_const_decl_type(c.ty.as_ref(), v).map_err(FoldInvalid)
+                });
+                let v = match folded {
+                    Ok(v) => v,
+                    Err(ConstFoldErr::Unsupported(detail)) => {
+                        return Err(unsupported(
+                            &format!("`const {}` initializer", c.name.name),
+                            detail,
+                        ));
+                    }
+                    Err(ConstFoldErr::Invalid(detail)) => {
+                        return Err(LowerError::Invalid(format!(
+                            "`const {}` initializer: {detail}",
+                            c.name.name
+                        )));
+                    }
                 };
-                consts.insert(c.name.name.clone(), v);
+                const_vals.insert(c.name.name.clone(), v);
             }
             Item::Enum(e) => {
                 for (i, v) in e.variants.iter().enumerate() {
                     // First definition wins across enums — v1's
-                    // `enum_variants.entry(..).or_insert(i)`.
-                    consts.entry(v.name.clone()).or_insert(i as u64);
+                    // `enum_variants.entry(..).or_insert(i)`. Variant
+                    // indices are small non-negative values; v1 emits
+                    // them as plain (signed) `int` literals.
+                    const_vals.entry(v.name.clone()).or_insert(ConstVal {
+                        bits: i as u64,
+                        signed: true,
+                    });
                 }
             }
             _ => {}
         }
     }
+    // The lowering contexts only need the substituted bit pattern —
+    // use sites emit the 64-bit literal either way.
+    let consts: HashMap<String, u64> = const_vals
+        .iter()
+        .map(|(k, v)| (k.clone(), v.bits))
+        .collect();
+    let const_signed: HashMap<String, bool> = const_vals
+        .iter()
+        .map(|(k, v)| (k.clone(), v.signed))
+        .collect();
     // `extern function name(...) -> ret` (spec §9) names — calls to
     // these lower to `CallTarget::ExternFn`; the file-scope `extern "C"`
     // forward declarations are emitted by `emit_extern_fn_decls`. Shared
@@ -841,6 +1174,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         scoreboard_fields: HashMap::new(),
         scoreboards: Vec::new(),
         consts: consts.clone(),
+        const_signed: const_signed.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
@@ -904,6 +1238,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         scoreboard_fields: HashMap::new(),
         scoreboards: Vec::new(),
         consts: consts.clone(),
+        const_signed: const_signed.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
@@ -1053,6 +1388,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         // here even though method bodies are not bound at testbench scope.
         scoreboards: prog.scoreboards.clone(),
         consts: consts.clone(),
+        const_signed: const_signed.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
@@ -1177,6 +1513,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &buses,
             &unresolved_use_names,
             &consts,
+            &const_signed,
             &extern_fns,
             &helper_registry,
             &txn_keeps,
@@ -1682,6 +2019,7 @@ fn lower_test(
     buses: &HashMap<String, &BusDecl>,
     unresolved_use_names: &HashSet<String>,
     consts: &HashMap<String, u64>,
+    const_signed: &HashMap<String, bool>,
     extern_fns: &HashSet<String>,
     helpers: &helpers::HelperRegistry<'_>,
     txn_keeps: &HashMap<String, Vec<crate::ast::Expr>>,
@@ -3498,6 +3836,7 @@ fn lower_test(
         scoreboard_fields: scoreboard_fields.iter().cloned().collect(),
         scoreboards: prog.scoreboards.clone(),
         consts: consts.clone(),
+        const_signed: const_signed.clone(),
         tb_scalar_fields: scalar_fields.iter().map(|f| f.name.clone()).collect(),
         tb_record_fields: record_fields.clone(),
         regblock_callbacks: regblock_callbacks.clone(),
@@ -4230,6 +4569,10 @@ pub(crate) struct LowerCtx {
     /// sites; locals shadow (lookup order: local, then const — same
     /// effective shadowing as v1's C++ scoping).
     pub consts: HashMap<String, u64>,
+    /// Signedness of file-scope constants, retained alongside the
+    /// substituted bit patterns so TB-IR preserves signed operators at
+    /// use sites (`const NEG : sint<8> = -1; NEG >> 1`).
+    pub const_signed: HashMap<String, bool>,
     /// Scalar testbench field names (`TestbenchSchema::scalar_fields`),
     /// for `_tb.<field>` access lowering.
     pub tb_scalar_fields: HashSet<String>,
