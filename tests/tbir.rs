@@ -351,6 +351,7 @@ test T
         assert NEG_DIV == 0 - 3 else fail("x")
         assert NEG_MOD == 0 - 1 else fail("x")
         assert (NEG_ONE >> 1) == NEG_ONE else fail("direct-shr")
+        assert ((NEG_ONE + 0) >> 1) == NEG_ONE else fail("nested-shr")
         assert ((NEG_ONE as uint<8>) >> 1) == 9223372036854775807 else fail("cast-shr")
         assert (NEG_ONE.sext<64>() >> 1) == NEG_ONE else fail("sext-shr")
     end run
@@ -372,6 +373,10 @@ end test T"#,
     assert!(
         cpp.contains("((int64_t)(((int64_t)(((int64_t)(-1)))))) >> 1"),
         "sext results must use arithmetic right shift; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("((int64_t)((((int64_t)(-1)) + 0))) >> 1"),
+        "signed nested arithmetic must use arithmetic right shift; got:\n{cpp}"
     );
 }
 

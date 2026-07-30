@@ -736,7 +736,15 @@ fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
 
 fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
     match e {
-        Expr::Literal { ty, .. } => matches!(ty, crate::ir::IrType::SInt(_)),
+        Expr::Literal { value, ty } => {
+            matches!(ty, crate::ir::IrType::SInt(_))
+                // Untyped literals are emitted as ordinary C++ integer
+                // literals. Values that fit signed int64_t therefore
+                // participate in signed usual-arithmetic conversions when
+                // combined with a signed expression (for example
+                // `(signed_value + 0) >> 1`).
+                || matches!(ty, crate::ir::IrType::Unknown) && *value <= i64::MAX as u64
+        }
         Expr::Local(id) => cx
             .func
             .locals
