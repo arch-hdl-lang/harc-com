@@ -131,7 +131,11 @@ impl FuncBuilder<'_> {
                 if let Some(v) = self.ctx.consts.get(&id.name) {
                     return Ok(Expr::Literal {
                         value: *v,
-                        ty: IrType::Unknown,
+                        ty: if self.ctx.const_signed.get(&id.name).copied().unwrap_or(false) {
+                            IrType::SInt(None)
+                        } else {
+                            IrType::Unknown
+                        },
                     });
                 }
                 // Self-relative component field read inside a method body

@@ -166,7 +166,10 @@ pub(super) fn resolve_state_instance<'a>(
 /// Render an IR expression.
 pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
     Ok(match e {
-        Expr::Literal { value, .. } => format!("{value}"),
+        Expr::Literal { value, ty } => match ty {
+            crate::ir::IrType::SInt(_) => format!("{}", *value as i64),
+            _ => format!("{value}"),
+        },
         // The framework-provided cycle counter — emitted as the in-scope
         // `cycle_count` (a captured `ctx.cycle_count` reference), matching
         // v1's bare-ident emission of `cycle_count`.
@@ -323,10 +326,15 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                     return Ok(s);
                 }
             }
+            let a_signed = expr_is_signed(cx, a);
             let a = expr_cpp(cx, a)?;
             let b = expr_cpp(cx, b)?;
             match op {
-                BinOp::Shl | BinOp::Shr => format!("(((uint64_t)({a})) {} {b})", bin_op_cpp(*op)),
+                BinOp::Shl => format!("(((uint64_t)({a})) << {b})"),
+                BinOp::Shr if a_signed => {
+                    format!("(((int64_t)({a})) >> {b})")
+                }
+                BinOp::Shr => format!("(((uint64_t)({a})) >> {b})"),
                 _ => format!("({a} {} {b})", bin_op_cpp(*op)),
             }
         }
@@ -719,6 +727,27 @@ fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
         Expr::WidthCast { width, .. } => Some(*width),
         Expr::CycleCount => Some(64),
         _ => None,
+    }
+}
+
+fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
+    match e {
+        Expr::Literal { ty, .. } => matches!(ty, crate::ir::IrType::SInt(_)),
+        Expr::Local(id) => cx
+            .func
+            .locals
+            .get(id.0 as usize)
+            .is_some_and(|l| matches!(l.ty, crate::ir::IrType::SInt(_))),
+        Expr::Unary(_, inner) => expr_is_signed(cx, inner),
+        Expr::Ternary(_, then_expr, else_expr) => {
+            expr_is_signed(cx, then_expr) && expr_is_signed(cx, else_expr)
+        }
+        Expr::Binary(op, lhs, rhs) => match op {
+            BinOp::Shl | BinOp::Shr => expr_is_signed(cx, lhs),
+            BinOp::Div | BinOp::Mod => expr_is_signed(cx, lhs) && expr_is_signed(cx, rhs),
+            _ => expr_is_signed(cx, lhs) && expr_is_signed(cx, rhs),
+        },
+        _ => false,
     }
 }
 

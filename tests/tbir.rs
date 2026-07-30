@@ -345,14 +345,18 @@ test T
         assert NEG_SHR == NEG_ONE else fail("x")
         assert NEG_DIV == 0 - 3 else fail("x")
         assert NEG_MOD == 0 - 1 else fail("x")
+        assert (NEG_ONE >> 1) == NEG_ONE else fail("direct-shr")
     end run
 end test T"#,
     );
     // -1 (as a 64-bit pattern) survives the arithmetic shift.
     assert!(
-        cpp.contains("18446744073709551615ULL == 18446744073709551615ULL")
-            || cpp.contains("18446744073709551615 == 18446744073709551615"),
-        "sint >> must be arithmetic; got:\n{cpp}"
+        cpp.contains("(-1 == -1)"),
+        "sint consts must retain their signed value at use sites; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("((int64_t)(-1)) >> 1"),
+        "signed const use sites must use arithmetic right shift; got:\n{cpp}"
     );
 }
 

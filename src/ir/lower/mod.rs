@@ -611,6 +611,10 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         .iter()
         .map(|(k, v)| (k.clone(), v.bits))
         .collect();
+    let const_signed: HashMap<String, bool> = const_vals
+        .iter()
+        .map(|(k, v)| (k.clone(), v.signed))
+        .collect();
     // `extern function name(...) -> ret` (spec §9) names — calls to
     // these lower to `CallTarget::ExternFn`; the file-scope `extern "C"`
     // forward declarations are emitted by `emit_extern_fn_decls`. Shared
@@ -1170,6 +1174,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         scoreboard_fields: HashMap::new(),
         scoreboards: Vec::new(),
         consts: consts.clone(),
+        const_signed: const_signed.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
@@ -1233,6 +1238,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         scoreboard_fields: HashMap::new(),
         scoreboards: Vec::new(),
         consts: consts.clone(),
+        const_signed: const_signed.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
@@ -1382,6 +1388,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         // here even though method bodies are not bound at testbench scope.
         scoreboards: prog.scoreboards.clone(),
         consts: consts.clone(),
+        const_signed: const_signed.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
@@ -1506,6 +1513,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &buses,
             &unresolved_use_names,
             &consts,
+            &const_signed,
             &extern_fns,
             &helper_registry,
             &txn_keeps,
@@ -2011,6 +2019,7 @@ fn lower_test(
     buses: &HashMap<String, &BusDecl>,
     unresolved_use_names: &HashSet<String>,
     consts: &HashMap<String, u64>,
+    const_signed: &HashMap<String, bool>,
     extern_fns: &HashSet<String>,
     helpers: &helpers::HelperRegistry<'_>,
     txn_keeps: &HashMap<String, Vec<crate::ast::Expr>>,
@@ -3827,6 +3836,7 @@ fn lower_test(
         scoreboard_fields: scoreboard_fields.iter().cloned().collect(),
         scoreboards: prog.scoreboards.clone(),
         consts: consts.clone(),
+        const_signed: const_signed.clone(),
         tb_scalar_fields: scalar_fields.iter().map(|f| f.name.clone()).collect(),
         tb_record_fields: record_fields.clone(),
         regblock_callbacks: regblock_callbacks.clone(),
@@ -4559,6 +4569,10 @@ pub(crate) struct LowerCtx {
     /// sites; locals shadow (lookup order: local, then const — same
     /// effective shadowing as v1's C++ scoping).
     pub consts: HashMap<String, u64>,
+    /// Signedness of file-scope constants, retained alongside the
+    /// substituted bit patterns so TB-IR preserves signed operators at
+    /// use sites (`const NEG : sint<8> = -1; NEG >> 1`).
+    pub const_signed: HashMap<String, bool>,
     /// Scalar testbench field names (`TestbenchSchema::scalar_fields`),
     /// for `_tb.<field>` access lowering.
     pub tb_scalar_fields: HashSet<String>,
