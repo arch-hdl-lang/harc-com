@@ -130,6 +130,10 @@ bitslice_uninit_test | Top | top_counter.sv | - | pass
 record_let_copy_test | Top | top_counter.sv | - | pass
 record_vec_field_copy_test | Top | top_counter.sv | - | pass
 vec_of_struct_field_test | Top | top_counter.sv | - | pass
+vec_record_field_test | Top | top_counter.sv | - | pass
+vec_record_decl_only_test | Top | top_counter.sv | - | pass
+queue_state_hookable_test | Top | top_counter.sv | - | pass
+record_return_helper_test | Top | top_counter.sv | - | pass
 testbench_basic_test | Top | top_counter.sv | - | pass | - | - | TestbenchSmoke
 testbench_basic_test | Top | top_counter.sv | - | pass | - | - | TestbenchEnableToggle
 testbench_basic_test | Top | top_counter.sv | - | pass | - | - | TestbenchMethodCallsMethod

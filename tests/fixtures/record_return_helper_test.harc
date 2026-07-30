@@ -1,0 +1,50 @@
+// Issue #523 blocker-3 reproducer: a testbench helper method returning a
+// record, bound through every required destination shape — direct `let`
+// initialization, later whole-record assignment to a declared local, and
+// forwarding a returned value through another compatible helper. The
+// snapshot the issue was filed against dropped the record result type on
+// the inlined call destination ("`let result : Result = ...` with a
+// non-`Result` initializer"); this fixture pins the fixed behavior.
+
+struct Result
+    value : uint<8>
+end struct Result
+
+testbench RecordReturnTb
+    dut : Top
+
+    function make_result(value: uint<8>) -> Result
+        let result : Result
+        result.value = value
+        return result
+    end make_result
+
+    function bump(r: Result) -> Result
+        let out : Result
+        out.value = r.value + 1
+        return out
+    end bump
+end testbench RecordReturnTb
+
+impl RecordReturnTest for RecordReturnTb
+    run
+        // Direct initialization from the helper's record return.
+        let result : Result = make_result(7)
+        assert result.value == 7 else fail("record return mismatch: ${result.value}")
+
+        // Later whole-record assignment to a declared record local.
+        let later : Result
+        later = make_result(9)
+        assert later.value == 9 else fail("late assign mismatch: ${later.value}")
+
+        // Pass a returned record to a compatible record parameter.
+        let bumped : Result = bump(result)
+        assert bumped.value == 8 else fail("record param mismatch: ${bumped.value}")
+
+        // Forward a helper return through another helper.
+        let chained : Result = bump(make_result(20))
+        assert chained.value == 21 else fail("chained return mismatch: ${chained.value}")
+
+        log(info, "record returns ok ${result.value} ${later.value} ${bumped.value} ${chained.value}")
+    end run
+end impl RecordReturnTest

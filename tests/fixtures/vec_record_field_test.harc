@@ -1,0 +1,95 @@
+// `Vec<Record, N>` struct fields end to end (issue #523 blocker 1).
+//
+// A fixed vector of records is `std::array<Inner, N>` at the C++ level
+// (spec "C++ carriers"); TB-IR previously rejected the field outright
+// ("unsupported (non-scalar) leaf type `Vec`"), and v1 silently
+// miscompiled it to a `uint64_t` member because the parser delivers the
+// bare-named element (`Vec<Entry, 4>`) as a value expression, which the
+// `Vec<T, N>` recognizers didn't resolve. This fixture pins the full
+// required surface on both codegens:
+//   - deterministic default initialization (elements run the element
+//     record's member defaults);
+//   - constant- and runtime-index element field reads and writes
+//     (`t.entries[i].tag`, an INTERIOR chain index in TB-IR);
+//   - whole-element copies in both directions, by value;
+//   - whole-vector copies between records, by value;
+//   - whole-record copies carrying the array;
+//   - an interior index deeper in a nested chain
+//     (`o.table.entries[i].value`).
+//
+// The DUT (`Top`, the counter) is irrelevant — it ticks in the
+// background while the test exercises host-side record state. Reused
+// because it's already in the Verilator regression.
+
+struct Entry
+    tag : uint<8> default 3
+    value : uint<32>
+end struct Entry
+
+struct EntryTable
+    entries : Vec<Entry, 4>
+    count : uint<8>
+end struct EntryTable
+
+struct Outer
+    table : EntryTable
+    id : uint<4>
+end struct Outer
+
+testbench VecRecordFieldTb
+    dut : Top
+end testbench VecRecordFieldTb
+
+impl VecRecordFieldTest for VecRecordFieldTb
+    run
+        // ── deterministic default init ──────────────────────────────
+        // A fresh record's array elements are value-initialized, so each
+        // element runs `Entry`'s own member defaults.
+        let table : EntryTable
+        assert table.entries[0].tag == 3 else fail("default tag[0]: ${table.entries[0].tag}")
+        assert table.entries[3].tag == 3 else fail("default tag[3]: ${table.entries[3].tag}")
+        assert table.entries[3].value == 0 else fail("default value[3]: ${table.entries[3].value}")
+
+        // ── constant-index element field writes ─────────────────────
+        table.entries[0].tag = 5
+        table.entries[1].value = 77
+
+        // ── runtime-index element field write + read ────────────────
+        let i : uint<8> = 2
+        table.entries[i].tag = 9
+        assert table.entries[2].tag == 9 else fail("runtime-index write: ${table.entries[2].tag}")
+        assert table.entries[i].tag == 9 else fail("runtime-index read: ${table.entries[i].tag}")
+
+        // ── whole-element copies, by value, both directions ─────────
+        let e : Entry
+        e.tag = 8
+        e.value = 44
+        table.entries[3] = e
+        e.value = 55
+        assert table.entries[3].value == 44 else fail("element store aliased: ${table.entries[3].value}")
+        let copy : Entry = table.entries[3]
+        table.entries[3].value = 66
+        assert copy.value == 44 else fail("element load aliased: ${copy.value}")
+        assert copy.tag == 8 else fail("element load tag: ${copy.tag}")
+
+        // ── whole-vector copy between records, by value ─────────────
+        let t2 : EntryTable
+        t2.entries = table.entries
+        assert t2.entries[1].value == 77 else fail("vec copy: ${t2.entries[1].value}")
+        t2.entries[1].value = 99
+        assert table.entries[1].value == 77 else fail("vec copy aliased: ${table.entries[1].value}")
+
+        // ── whole-record copy carries the array ─────────────────────
+        let t3 : EntryTable = table
+        assert t3.entries[0].tag == 5 else fail("record copy: ${t3.entries[0].tag}")
+        assert t3.entries[3].value == 66 else fail("record copy: ${t3.entries[3].value}")
+
+        // ── interior index deeper in a nested chain ─────────────────
+        let o : Outer
+        o.table.entries[i].value = 123
+        assert o.table.entries[2].value == 123 else fail("nested chain: ${o.table.entries[2].value}")
+        assert o.table.entries[i].value == 123 else fail("nested chain read: ${o.table.entries[i].value}")
+
+        log(info, "vec-record fields ok tag0=${table.entries[0].tag} nested=${o.table.entries[i].value}")
+    end run
+end impl VecRecordFieldTest

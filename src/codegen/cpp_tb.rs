@@ -11430,7 +11430,13 @@ impl Emitter {
     /// transactors / covergroups are excluded — they're held by-value.
     fn is_dut_pointer_field_type(&self, t: &TypeExpr) -> bool {
         if let Some(name) = type_simple_name(Some(t)) {
+            // Every known value-shaped Named type is excluded; only an
+            // unrecognized Named type (the DUT module) is pointer-shaped.
+            // `structs` matters: a struct-typed method param is a by-value
+            // record exactly like a transaction-typed one — classifying it
+            // as a pointer emitted `r->field` on a by-value `Result r`.
             return !self.transactions.contains(name)
+                && !self.structs.contains(name)
                 && !self.scoreboards.contains(name)
                 && !self.covergroups.contains_key(name)
                 && !self.components.contains_key(name)
