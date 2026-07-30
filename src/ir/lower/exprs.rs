@@ -766,7 +766,16 @@ impl FuncBuilder<'_> {
             // a `Vec<Record, N>` field selected by `[i]`.
             match fld.ty {
                 IrType::Record(next) if fld.vec_len.is_none() && !indexed => cur_rid = next,
-                IrType::Record(next) if fld.vec_len.is_some() && indexed => cur_rid = next,
+                IrType::Record(next) if fld.vec_len.is_some() && indexed => {
+                    if let Some((_, idx)) = mid_indices.iter().find(|(p, _)| *p == i) {
+                        check_literal_vec_index_bounds(
+                            &dotted,
+                            idx,
+                            fld.vec_len.unwrap_or(0),
+                        )?;
+                    }
+                    cur_rid = next;
+                }
                 _ if indexed && fld.vec_len.is_none() => {
                     return Err(unsupported(
                         &format!("indexing the non-`Vec` record field `{dotted}`"),
@@ -929,6 +938,7 @@ impl FuncBuilder<'_> {
             ));
         }
         let idx = self.lower_expr(index)?;
+        check_literal_vec_index_bounds(&chain.dotted, &idx, chain.leaf_vec_len.unwrap_or(0))?;
         Ok(Some(Expr::RecordField {
             local: chain.local,
             field: chain.field,
@@ -2335,6 +2345,31 @@ pub(crate) fn parse_int_literal_expr(e: &crate::ast::Expr) -> Option<u64> {
         crate::ast::ExprKind::Paren(inner) => parse_int_literal_expr(inner),
         _ => None,
     }
+}
+
+/// Reject a LITERAL `Vec` element index that is statically out of range
+/// (`tbl.entries[9]` on a `Vec<T, 4>` field). Without this, the access
+/// lowers cleanly and both backends emit `std::array` UB at runtime (v1's
+/// textual emission has the same hole), so this is `Invalid` — a
+/// statically wrong program, NOT a subset gap — and must NOT suggest
+/// `--codegen v1`. A non-literal index passes through unchanged (runtime
+/// range behavior is the backends', as before).
+pub(crate) fn check_literal_vec_index_bounds(
+    dotted: &str,
+    idx: &Expr,
+    len: usize,
+) -> Result<(), LowerError> {
+    let Expr::Literal { value, .. } = idx else {
+        return Ok(());
+    };
+    if (*value as u128) < len as u128 {
+        return Ok(());
+    }
+    Err(LowerError::Invalid(format!(
+        "element index {value} is out of range for `Vec` record field \
+         `{dotted}` of length {len} (valid indices are 0..={})",
+        len.saturating_sub(1)
+    )))
 }
 
 fn port_temp_type(p: &PortRef, hint: Option<&IrType>) -> Option<IrType> {

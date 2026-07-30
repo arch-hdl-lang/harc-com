@@ -2193,6 +2193,63 @@ end impl VecTbFieldTest
     );
 }
 
+/// A LITERAL element index that is statically out of range is rejected at
+/// lowering as `Invalid` (both backends would otherwise emit `std::array`
+/// UB — v1 included, so the message must NOT suggest `--codegen v1`).
+/// Covers all three index sites: leaf read, leaf write, and a mid-chain
+/// `Vec<Record, N>` selection. A runtime index stays unchecked (runtime
+/// range behavior is the backends', as before).
+#[test]
+fn literal_out_of_range_vec_index_is_rejected() {
+    let cases = [
+        // Leaf read on a scalar-element Vec.
+        (
+            "let v = tbl.entries[0].data[2]",
+            "EntryTable.entries.data",
+        ),
+        // Leaf write on a scalar-element Vec.
+        ("tbl.entries[0].data[9] = 1", "EntryTable.entries.data"),
+        // Mid-chain selection on the record-element Vec.
+        ("tbl.entries[4].tag = 1", "EntryTable.entries"),
+    ];
+    for (stmt, dotted) in cases {
+        let src = format!(
+            r#"
+struct Entry
+    tag  : uint<8>
+    data : Vec<uint<16>, 2>
+end struct Entry
+
+struct EntryTable
+    entries : Vec<Entry, 4>
+end struct EntryTable
+
+test OobIndexTest
+    let dut : Top
+    run
+        let tbl : EntryTable
+        {stmt}
+    end run
+end test OobIndexTest
+"#
+        );
+        let err = lower_src(&src).expect_err("literal OOB index must be rejected");
+        assert!(
+            matches!(err, lower::LowerError::Invalid(_)),
+            "must be Invalid, not Unsupported ({stmt}): {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("out of range") && msg.contains(dotted),
+            "names the range violation and field ({stmt}): {msg}"
+        );
+        assert!(
+            !msg.contains("--codegen v1"),
+            "OOB error must NOT suggest --codegen v1 (v1 is UB there): {msg}"
+        );
+    }
+}
+
 /// A record containing a `Vec` of ITSELF (`Node { kids : Vec<Node, 2> }`)
 /// is the same infinitely-sized by-value cycle through the array member —
 /// the cycle check follows record-element `Vec` edges too (harc#522).

@@ -1290,6 +1290,11 @@ impl FuncBuilder<'_> {
                     ));
                 }
                 let idx = self.lower_expr_no_ports(index)?;
+                super::exprs::check_literal_vec_index_bounds(
+                    &chain.dotted,
+                    &idx,
+                    chain.leaf_vec_len.unwrap_or(0),
+                )?;
                 let e = self.lower_expr_no_ports(value)?;
                 // A `Vec<Record, N>` element store (`tbl.entries[i] = e`)
                 // is a C++ struct copy: the RHS must be a whole record
