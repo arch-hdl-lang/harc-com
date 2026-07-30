@@ -37,10 +37,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Names of the six tests emitted into the testbench below. Six tests at
+/// Names of the tests emitted into the testbench below. Seven tests at
 /// the default group size of 4 yields two shards, so the default path
-/// genuinely links more than one shard TU.
-const TEST_NAMES: [&str; 6] = ["T1", "T2", "T3", "T4", "T5", "T6"];
+/// genuinely links more than one shard TU. `T7VecRecord` carries a
+/// `Vec<Record, N>` struct field plus indexed element access — the
+/// issue-523 blocker shape whose mere presence in the suite used to
+/// abort whole-program TB-IR lowering and emit ZERO shards.
+const TEST_NAMES: [&str; 7] = ["T1", "T2", "T3", "T4", "T5", "T6", "T7VecRecord"];
 
 fn harc_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_harc"))
@@ -100,12 +103,31 @@ fn adder_tb() -> String {
         (7, 8, 15),
         (200, 55, 255),
     ];
-    let mut s = String::new();
+    // File-scope record decls shared by the whole suite. `Vec<SplitEntry,
+    // 4>` is the issue-523 blocker-1 construct: whole-program lowering
+    // must accept it for ANY shard to emit, and `T7VecRecord` exercises
+    // the indexed element accesses inside a sharded test body.
+    let mut s = String::from(
+        "struct SplitEntry\n    tag : uint<8>\n    value : uint<32>\nend struct SplitEntry\n\n\
+         struct SplitTable\n    entries : Vec<SplitEntry, 4>\nend struct SplitTable\n\n",
+    );
     for (name, (a, b, sum)) in TEST_NAMES.iter().zip(cases) {
         s.push_str(&format!(
             "test {name}\n    let dut : SplitAdder\n    run\n        dut.a = {a}\n        dut.b = {b}\n        wait 1 cycle\n        assert dut.sum == {sum}\n    end run\nend test {name}\n"
         ));
     }
+    s.push_str(
+        "test T7VecRecord\n    let dut : SplitAdder\n    run\n        \
+         let table : SplitTable\n        \
+         table.entries[0].tag = 5\n        \
+         let i : uint<8> = 3\n        \
+         table.entries[i].value = 77\n        \
+         let e : SplitEntry = table.entries[i]\n        \
+         assert e.value == 77\n        \
+         assert table.entries[0].tag == 5\n        \
+         dut.a = 1\n        dut.b = 2\n        wait 1 cycle\n        \
+         assert dut.sum == 3\n    end run\nend test T7VecRecord\n",
+    );
     s
 }
 
@@ -148,6 +170,10 @@ fn run_split_build(
         .arg(codegen)
         .arg("--cpp-split")
         .arg("tests")
+        // `--jobs 2` reaches Verilator as `-j 2`, so independent shard
+        // translation units compile concurrently (issue-523 acceptance).
+        .arg("--jobs")
+        .arg("2")
         .arg("--outdir")
         .arg(outdir);
     if let Some(n) = group_size {

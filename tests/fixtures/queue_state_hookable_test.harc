@@ -1,0 +1,37 @@
+// Issue #523 blocker-2 reproducer: non-scalar (queue) persistent state
+// on an active transactor mutated through a `hookable` method, plus the
+// test-scope queue surface (`size` / `empty` / `pop`). The snapshot the
+// issue was filed against rejected the `pending` field outright ("state
+// field ... with a non-scalar type"); the #494 work made it lower — this
+// fixture pins the exact reproducer shape with observable teeth.
+
+transactor PendingModel
+    dut : Top
+    pending : queue<uint<8>>
+
+    when active
+        hookable enqueue(value: uint<8>)
+            pending.push(value)
+        end enqueue
+    end when
+end transactor PendingModel
+
+testbench QueueStateTb
+    dut : Top
+    model : PendingModel active
+end testbench QueueStateTb
+
+impl QueueStateTest for QueueStateTb
+    run
+        model.dut = dut
+        model.enqueue(7)
+        model.enqueue(9)
+        assert model.pending.size() == 2 else fail("size after 2 pushes: ${model.pending.size()}")
+        let a : uint<8> = model.pending.pop()
+        assert a == 7 else fail("fifo order: popped ${a}")
+        let b : uint<8> = model.pending.pop()
+        assert b == 9 else fail("fifo order: popped ${b}")
+        assert model.pending.empty() else fail("queue not drained: ${model.pending.size()}")
+        log(info, "queue state ok a=${a} b=${b}")
+    end run
+end impl QueueStateTest

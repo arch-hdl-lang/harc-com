@@ -1,0 +1,26 @@
+// Issue #523 blocker-1 reproducer, verbatim shape: a `Vec<Record, N>`
+// struct field that the test never touches. Before the fix, TB-IR
+// whole-program lowering rejected the DECLARATION itself ("unsupported
+// (non-scalar) leaf type `Vec`"), so under `--cpp-split tests` a single
+// unused declaration produced zero C++ outputs and blocked every shard.
+// The fixture pins that a suite carrying the declaration lowers and runs
+// even when no test reads or writes the field.
+
+struct Entry
+    tag : uint<8>
+    value : uint<32>
+end struct Entry
+
+struct EntryTable
+    entries : Vec<Entry, 4>
+end struct EntryTable
+
+testbench VecRecordTb
+    dut : Top
+end testbench VecRecordTb
+
+impl VecRecordTest for VecRecordTb
+    run
+        log(info, "Vec<Record, N> declaration compiled")
+    end run
+end impl VecRecordTest
