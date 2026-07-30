@@ -134,7 +134,7 @@ impl FuncBuilder<'_> {
                         ty: if self.ctx.const_signed.get(&id.name).copied().unwrap_or(false) {
                             IrType::SInt(None)
                         } else {
-                            IrType::Unknown
+                            IrType::UInt(None)
                         },
                     });
                 }

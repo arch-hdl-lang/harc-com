@@ -167,7 +167,10 @@ pub(super) fn resolve_state_instance<'a>(
 pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
     Ok(match e {
         Expr::Literal { value, ty } => match ty {
-            crate::ir::IrType::SInt(_) => format!("{}", *value as i64),
+            crate::ir::IrType::SInt(None) => format!("((int64_t)({}))", *value as i64),
+            // Keep unsigned file-scope constants at uint64_t rank so C++
+            // applies the same usual-arithmetic conversions as v1.
+            crate::ir::IrType::UInt(None) => format!("((uint64_t)({value}))"),
             _ => format!("{value}"),
         },
         // The framework-provided cycle counter — emitted as the in-scope

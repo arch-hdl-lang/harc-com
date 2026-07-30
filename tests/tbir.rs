@@ -248,7 +248,12 @@ end test T"#,
     );
     // Each const use substitutes as its folded literal, so the assert
     // condition reduces to a literal-vs-literal comparison.
-    for lit in ["1 == 1", "2 == 2", "3 == 3", "255 == 255"] {
+    for lit in [
+        "((uint64_t)(1)) == 1",
+        "((uint64_t)(2)) == 2",
+        "((uint64_t)(3)) == 3",
+        "((uint64_t)(255)) == 255",
+    ] {
         assert!(
             cpp.contains(lit),
             "expected folded const comparison `{lit}`; got:\n{cpp}"
@@ -351,12 +356,33 @@ end test T"#,
     );
     // -1 (as a 64-bit pattern) survives the arithmetic shift.
     assert!(
-        cpp.contains("(-1 == -1)"),
+        cpp.contains("(((int64_t)(-1)) == ((int64_t)(-1)))"),
         "sint consts must retain their signed value at use sites; got:\n{cpp}"
     );
     assert!(
-        cpp.contains("((int64_t)(-1)) >> 1"),
+        cpp.contains("((int64_t)") && cpp.contains(">> 1"),
         "signed const use sites must use arithmetic right shift; got:\n{cpp}"
+    );
+}
+
+/// Unsigned constants must retain uint64_t rank at use sites. Otherwise
+/// `sint`/`uint` mixed expressions lose C++'s usual-arithmetic conversion.
+#[test]
+fn const_mixed_signedness_use_preserves_usual_arithmetic_conversion() {
+    let cpp = emit_cpp_src(
+        r#"const NEG : sint<8> = -1
+const ONE : uint<8> = 1
+
+test T
+    let dut : Top
+    run
+        assert !(NEG < ONE) else fail("mixed")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("((int64_t)(-1)) < ((uint64_t)(1))"),
+        "mixed signed/unsigned consts must retain C++ conversion rank; got:\n{cpp}"
     );
 }
 
