@@ -388,6 +388,37 @@ end test T"#
     }
 }
 
+/// #521: integer literals evaluate in the 64-bit domain (HARC fixed-
+/// width semantics), NOT as C++ 32-bit `int`. `1 << 31` is the bit-31
+/// mask (0x80000000), and shift amounts 32..=63 and intermediate sums
+/// above `INT_MAX` are well-defined. v1 mis-handles all three (C++20
+/// sign-extends `1 << 31` to 0xFFFFFFFF80000000; the other two are
+/// constexpr-UB compile errors in the emitted C++), so this corner is
+/// locked here rather than in the v1-equivalence fixture.
+#[test]
+fn const_literals_are_64_bit() {
+    let cpp = emit_cpp_src(
+        r#"const BIT31 : uint<32> = 1 << 31
+const BIT40 : uint<64> = 1 << 40
+const BIG   : uint<64> = 2000000000 + 2000000000
+
+test T
+    let dut : Top
+    run
+        assert BIT31 == 0x80000000 else fail("x")
+        assert BIT40 == 0x10000000000 else fail("x")
+        assert BIG == 4000000000 else fail("x")
+    end run
+end test T"#,
+    );
+    for v in ["2147483648", "1099511627776", "4000000000"] {
+        assert!(
+            cpp.contains(v),
+            "64-bit literal fold must produce {v}; got:\n{cpp}"
+        );
+    }
+}
+
 /// #521: boundary values on the declared width are accepted exactly.
 #[test]
 fn const_width_boundaries_fold() {
