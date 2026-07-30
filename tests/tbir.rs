@@ -2112,6 +2112,52 @@ end test SelfCycleTest
     assert!(msg.contains("Node"), "names the cyclic record: {msg}");
 }
 
+/// TWO mid-chain element selections in one access chain
+/// (`outer[i].entries[j].tag` — a `Vec<Table, N>` whose element record
+/// itself holds a `Vec<Entry, M>`): the position-tagged `mid_indices`
+/// machinery is generic over chain depth, and emission interleaves each
+/// `[idx]` after its own segment (harc#522 review follow-up).
+#[test]
+fn vec_of_record_double_mid_index_chain_lowers() {
+    let src = r#"
+struct Entry
+    tag : uint<8>
+end struct Entry
+
+struct Table
+    entries : Vec<Entry, 4>
+end struct Table
+
+struct Bank
+    tables : Vec<Table, 2>
+end struct Bank
+
+test DoubleMidIndexTest
+    let dut : Top
+    run
+        let bank : Bank
+        bank.tables[1].entries[2].tag = 0x77
+        let v = bank.tables[1].entries[2].tag
+        assert v == 0x77 else fail("tag: 0x${v:02x}")
+        assert bank.tables[0].entries[2].tag == 0 else fail("neighbor table clobbered")
+        assert bank.tables[1].entries[3].tag == 0 else fail("neighbor entry clobbered")
+    end run
+end test DoubleMidIndexTest
+"#;
+    let prog = lower_src(src).expect("double-mid-index chain lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let dump = format!("{prog}");
+    assert!(
+        dump.contains("RecordFieldWrite(%bank.tables[1].entries[2].tag, 119)"),
+        "both mid indices render at their own segments: {dump}"
+    );
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("bank.tables[1].entries[2].tag = 119;"),
+        "direct double-indexed member chain in C++: {cpp}"
+    );
+}
+
 /// Element access rooted at a TESTBENCH record field (`tbl.entries[i].tag`
 /// inside an impl-form body, desugared to `_tb.tbl…`): the chain resolver's
 /// `field_start` offset must not shift the mid-index position (harc#522).
