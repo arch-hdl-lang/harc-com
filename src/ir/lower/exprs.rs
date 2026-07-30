@@ -506,7 +506,17 @@ impl FuncBuilder<'_> {
                         } => WidthCastKind::Sext,
                         _ => WidthCastKind::Zext,
                     };
-                    let src_width = self.infer_expr_width(expr);
+                    // An explicit `as sint<W>` is a signedness relabel, not
+                    // a sign extension: it must preserve the 64-bit value
+                    // even when the source expression has a narrower
+                    // declared width. Keep the target width as the source
+                    // width metadata so TBIR can select signed operators
+                    // without applying a value-changing extension.
+                    let src_width = if matches!(kind, WidthCastKind::Sext) {
+                        Some(width)
+                    } else {
+                        self.infer_expr_width(expr)
+                    };
                     let inner = self.lower_expr(expr)?;
                     return Ok(Expr::WidthCast {
                         kind,

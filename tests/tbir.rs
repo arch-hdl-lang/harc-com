@@ -531,6 +531,24 @@ end test T"#,
     );
 }
 
+#[test]
+fn signed_relabel_cast_preserves_narrow_source_value() {
+    let cpp = emit_cpp_src(
+        r#"test T
+    let dut : Top
+    run
+        let byte : uint<8> = 255
+        let signed : sint<64> = byte as sint<64>
+        assert signed == 255 else fail("relabel")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("= ((int64_t)(byte));"),
+        "as sint<64> must relabel without sign-extending a narrow source; got:\n{cpp}"
+    );
+}
+
 /// harc#473: `-%` masks like `+%`/`*%`. A typed `z : uint<8>` minus a
 /// literal masks the two's-complement residue at 8 b, so `0 -% 1` emits
 /// `(z - 1) & 0xFF` (== 255 at runtime), not the un-wrapped `z - 1`.
