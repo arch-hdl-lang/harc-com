@@ -918,11 +918,23 @@ impl FuncBuilder<'_> {
         let wide_scalar_ty = self
             .expr_type(&e)
             .filter(|t| matches!(t, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 64));
+        // Untyped signed-scalar RHS (`let d = NEG` where NEG is a `sint`
+        // const): v1's `auto` deduces `int64_t` from the signed
+        // expression, so the local must carry signedness or `d >> 1` /
+        // `d / 2` silently go unsigned (#524 adversarial-review finding
+        // 6). A declared type still wins via the `.or` chain below.
+        let signed_scalar_ty = self
+            .expr_type(&e)
+            .filter(|t| matches!(t, IrType::SInt(None)) || matches!(t, IrType::SInt(Some(w)) if *w <= 64));
         let id = self.declare(&l.name.name);
         if let Some(w) = declared_width {
             self.let_widths.insert(id, w);
         }
-        if let Some(ty) = record_ty.or(declared_scalar_ty).or(wide_scalar_ty) {
+        if let Some(ty) = record_ty
+            .or(declared_scalar_ty)
+            .or(wide_scalar_ty)
+            .or(signed_scalar_ty)
+        {
             self.set_local_type(id, ty);
         }
         self.push(Stmt::Assign(id, e));

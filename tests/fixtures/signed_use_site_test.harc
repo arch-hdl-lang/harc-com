@@ -1,0 +1,39 @@
+// Regression fixture for #524 adversarial-review finding 6: signed
+// values must keep their signedness at USE sites under both codegens —
+// not just in const-initializer folding (#521). Exercises the three
+// shapes that diverged under TB-IR's u64-backed local model: a `sint`
+// record field (arithmetic `>>`), an explicitly `sint`-typed local
+// (signed `/`, `%`, ordered comparison), and an untyped `let` of a
+// signed constant (v1's `auto` deduces int64_t; TB-IR now infers the
+// signedness from the RHS). DUT `Top` (top_counter.sv) is only along
+// for the ride so the harness has something to elaborate.
+
+const NEG : sint<8> = -1
+
+struct Sample
+    bias : sint<8>
+end struct Sample
+
+testbench SignedUseSiteTb
+    dut : Top
+end testbench SignedUseSiteTb
+
+impl SignedUseSiteTest for SignedUseSiteTb
+    run
+        let s : Sample
+        s.bias = 0 - 8
+        assert (s.bias >> 1) == 0 - 4 else fail("fieldshr=${s.bias >> 1}")
+        assert (s.bias / 2) == 0 - 4 else fail("fielddiv=${s.bias / 2}")
+
+        let t : sint<8> = 0 - 8
+        assert (t / 2) == 0 - 4 else fail("tdiv=${t / 2}")
+        assert (t % 3) == 0 - 2 else fail("tmod=${t % 3}")
+        assert (t >> 1) == 0 - 4 else fail("tshr=${t >> 1}")
+        assert t < 0 else fail("tcmp")
+
+        let d = NEG
+        assert (d >> 1) == NEG else fail("dshr=${d >> 1}")
+        assert (d / 2) == 0 else fail("ddiv=${d / 2}")
+        wait 1 cycle
+    end run
+end impl SignedUseSiteTest

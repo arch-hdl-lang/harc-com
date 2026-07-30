@@ -1,6 +1,5 @@
 ---
 source: tests/tbir.rs
-assertion_line: 7371
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
@@ -17,11 +16,11 @@ fn fn0 run_WidthMethodsTest [kind=Run, owner=tb0]
     %5 z16 : unknown
     %6 z32 : unknown
     %7 s8 : uint<8>
-    %8 se16 : unknown
-    %9 se32 : unknown
+    %8 se16 : sint<16>
+    %9 se32 : sint<32>
     %10 p8 : uint<8>
-    %11 pe16 : unknown
-    %12 pe32 : unknown
+    %11 pe16 : sint<16>
+    %12 pe32 : sint<32>
     %13 wide : uint<32>
     %14 r16 : unknown
     %15 r32 : unknown

@@ -53,6 +53,7 @@ single_port_ram_test    | SimpleMem      | single_port_ram.sv     |
 int_regs_test           | IntRegs        | int_regs.sv            |
 top_counter_test        | Top            | top_counter.sv         |
 const_expr_init_test    | Top            | top_counter.sv         |
+signed_use_site_test    | Top            | top_counter.sv         |
 msg_call_hoist_test     | Top            | top_counter.sv         |
 log_paths_test          | Top            | top_counter.sv         |
 heartbeat_idle_test     | Top            | top_counter.sv         |

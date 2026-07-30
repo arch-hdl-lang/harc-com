@@ -693,14 +693,17 @@ fn field_scalar_cty(ty: &ir::IrType) -> &'static str {
     }
 }
 
-/// C++ storage type for a loop-switch local / method param. Every scalar
-/// ≤64 bits widens to `uint64_t` (the established tbir value model — even
-/// `bool`/`sint` locals are u64-backed here, distinct from v1's narrower
-/// per-type choice, which is value-identical in the loop-switch model). A
-/// 65..128-bit `uint`/`sint` uses v1's `_harc_u128` (`__uint128_t`), while
-/// wider declared scalars use the shared `HarcWide<N>` runtime storage.
-/// Aggregate types (`Record`/`RecordSeq`) are handled by their own
-/// declaration sites, never this helper.
+/// C++ storage type for a loop-switch local / method param. Unsigned and
+/// unknown scalars ≤64 bits widen to `uint64_t`; a `sint` ≤64 bits is
+/// `int64_t`, matching v1's `c_type_for`, so signed division, modulo,
+/// comparisons, and usual-arithmetic conversions come out identical to
+/// the legacy backend (u64-backing signed locals was NOT value-identical:
+/// `s / 2` and `s < 0` on a negative `sint<8>` local diverged — #524
+/// adversarial-review finding 6). A 65..128-bit `uint`/`sint` uses v1's
+/// `_harc_u128` (`__uint128_t`), while wider declared scalars use the
+/// shared `HarcWide<N>` runtime storage. Aggregate types
+/// (`Record`/`RecordSeq`) are handled by their own declaration sites,
+/// never this helper.
 pub(super) fn local_scalar_cty(ty: &ir::IrType) -> String {
     match ty {
         ir::IrType::UInt(Some(w)) | ir::IrType::SInt(Some(w)) if *w > 128 => {
@@ -709,6 +712,7 @@ pub(super) fn local_scalar_cty(ty: &ir::IrType) -> String {
         ir::IrType::UInt(Some(w)) | ir::IrType::SInt(Some(w)) if *w > 64 => {
             "_harc_u128".to_string()
         }
+        ir::IrType::SInt(_) => "int64_t".to_string(),
         _ => "uint64_t".to_string(),
     }
 }

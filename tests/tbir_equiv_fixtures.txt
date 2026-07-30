@@ -67,6 +67,7 @@
 
 top_counter_test | Top | top_counter.sv | top_counter.arch | pass
 const_expr_init_test | Top | top_counter.sv | top_counter.arch | pass
+signed_use_site_test | Top | top_counter.sv | top_counter.arch | pass
 msg_call_hoist_test | Top | top_counter.sv | top_counter.arch | pass
 sync_fifo_test | TxQueue | sync_fifo.sv | sync_fifo.arch | pass
 lz4_block_decoder_test | Lz4BlockDecoder | lz4_block_decoder.sv | lz4_block_decoder.arch | pass
