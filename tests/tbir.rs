@@ -81,6 +81,13 @@ fn emit_cpp_src(src: &str) -> String {
     tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits")
 }
 
+fn emit_cpp_src_result(src: &str) -> Result<String, String> {
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).map_err(|e| e.to_string())?;
+    verify::verify_program(&prog).map_err(|e| format!("{e:?}"))?;
+    tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).map_err(|e| e.to_string())
+}
+
 /// The negative-test contract: every out-of-subset fixture must produce
 /// `LowerError::Unsupported` whose rendered message names the offending
 /// construct and points the user at `--codegen v1`.
@@ -248,7 +255,12 @@ end test T"#,
     );
     // Each const use substitutes as its folded literal, so the assert
     // condition reduces to a literal-vs-literal comparison.
-    for lit in ["1 == 1", "2 == 2", "3 == 3", "255 == 255"] {
+    for lit in [
+        "((uint64_t)(1)) == 1",
+        "((uint64_t)(2)) == 2",
+        "((uint64_t)(3)) == 3",
+        "((uint64_t)(255)) == 255",
+    ] {
         assert!(
             cpp.contains(lit),
             "expected folded const comparison `{lit}`; got:\n{cpp}"
@@ -345,14 +357,72 @@ test T
         assert NEG_SHR == NEG_ONE else fail("x")
         assert NEG_DIV == 0 - 3 else fail("x")
         assert NEG_MOD == 0 - 1 else fail("x")
+        assert (NEG_ONE >> 1) == NEG_ONE else fail("direct-shr")
+        assert ((NEG_ONE + 0) >> 1) == NEG_ONE else fail("nested-shr")
+        assert ((NEG_ONE as uint<8>) >> 1) == 9223372036854775807 else fail("cast-shr")
+        assert (NEG_ONE.sext<64>() >> 1) == NEG_ONE else fail("sext-shr")
     end run
 end test T"#,
     );
     // -1 (as a 64-bit pattern) survives the arithmetic shift.
     assert!(
-        cpp.contains("18446744073709551615ULL == 18446744073709551615ULL")
-            || cpp.contains("18446744073709551615 == 18446744073709551615"),
-        "sint >> must be arithmetic; got:\n{cpp}"
+        cpp.contains("(((int64_t)(-1)) == ((int64_t)(-1)))"),
+        "sint consts must retain their signed value at use sites; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("((int64_t)(((int64_t)(-1)))) >> 1"),
+        "signed const use sites must use arithmetic right shift; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("((uint64_t)(((uint64_t)(((int64_t)(-1)))))) >> 1"),
+        "uint relabel casts must use logical right shift; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("((int64_t)(((int64_t)(((int64_t)(-1)))))) >> 1"),
+        "sext results must use arithmetic right shift; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("((int64_t)((((int64_t)(-1)) + 0))) >> 1"),
+        "signed nested arithmetic must use arithmetic right shift; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn const_sint64_min_emits_a_signed_literal() {
+    let cpp = emit_cpp_src(
+        r#"const MIN : sint<64> = -9223372036854775808
+
+test T
+    let dut : Top
+    run
+        assert MIN < 0 else fail("min")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("-9223372036854775807LL - 1"),
+        "sint<64> minimum must be emitted without an unsigned literal; got:\n{cpp}"
+    );
+}
+
+/// Unsigned constants must retain uint64_t rank at use sites. Otherwise
+/// `sint`/`uint` mixed expressions lose C++'s usual-arithmetic conversion.
+#[test]
+fn const_mixed_signedness_use_preserves_usual_arithmetic_conversion() {
+    let cpp = emit_cpp_src(
+        r#"const NEG : sint<8> = -1
+const ONE : uint<8> = 1
+
+test T
+    let dut : Top
+    run
+        assert !(NEG < ONE) else fail("mixed")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("((int64_t)(-1)) < ((uint64_t)(1))"),
+        "mixed signed/unsigned consts must retain C++ conversion rank; got:\n{cpp}"
     );
 }
 
@@ -501,6 +571,44 @@ end test T"#,
     assert!(
         cpp.contains("18446744073709551615"),
         "relabel-cast const must keep the bit pattern; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn signed_relabel_cast_preserves_narrow_source_value() {
+    let cpp = emit_cpp_src(
+        r#"test T
+    let dut : Top
+    run
+        let byte : uint<8> = 255
+        let signed : sint<64> = byte as sint<64>
+        assert signed == 255 else fail("relabel")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("= ((int64_t)(byte));"),
+        "as sint<64> must relabel without sign-extending a narrow source; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn signed_wide_right_shift_is_rejected_in_tbir() {
+    let err = emit_cpp_src_result(
+        r#"test T
+        let dut : Top
+    run
+        let wide : sint<128> = 0
+        assert (wide >> 1) == 0 else fail("wide-shr")
+        assert ((wide + 1) >> 1) == 0 else fail("wide-nested-shr")
+        assert ((1 + wide) >> 1) == 0 else fail("wide-rhs-shr")
+    end run
+end test T"#,
+    )
+    .expect_err("TB-IR must not silently truncate signed shifts above 64 bits");
+    assert!(
+        err.contains("right shift above 64 bits"),
+        "wide signed shift must have a targeted diagnostic; got: {err}"
     );
 }
 

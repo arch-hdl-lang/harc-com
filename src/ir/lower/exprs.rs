@@ -131,7 +131,11 @@ impl FuncBuilder<'_> {
                 if let Some(v) = self.ctx.consts.get(&id.name) {
                     return Ok(Expr::Literal {
                         value: *v,
-                        ty: IrType::Unknown,
+                        ty: if self.ctx.const_signed.get(&id.name).copied().unwrap_or(false) {
+                            IrType::SInt(None)
+                        } else {
+                            IrType::UInt(None)
+                        },
                     });
                 }
                 // Self-relative component field read inside a method body
@@ -494,7 +498,32 @@ impl FuncBuilder<'_> {
                 // width-method receiver inference (done on the AST at
                 // the call site). Anything else stays rejected.
                 if cast_relabel_width(ty).is_some() {
-                    return self.lower_expr(expr);
+                    let width = cast_relabel_width(ty).expect("checked above");
+                    let kind = match ty {
+                        TypeExpr::Builtin {
+                            name: BuiltinTy::SInt | BuiltinTy::SIntCap,
+                            ..
+                        } => WidthCastKind::Sext,
+                        _ => WidthCastKind::Zext,
+                    };
+                    // An explicit `as sint<W>` is a signedness relabel, not
+                    // a sign extension: it must preserve the 64-bit value
+                    // even when the source expression has a narrower
+                    // declared width. Keep the target width as the source
+                    // width metadata so TBIR can select signed operators
+                    // without applying a value-changing extension.
+                    let src_width = if matches!(kind, WidthCastKind::Sext) {
+                        Some(width)
+                    } else {
+                        self.infer_expr_width(expr)
+                    };
+                    let inner = self.lower_expr(expr)?;
+                    return Ok(Expr::WidthCast {
+                        kind,
+                        width,
+                        src_width,
+                        inner: Box::new(inner),
+                    });
                 }
                 Err(unsupported(
                     "`as` casts outside scalar uint/sint/bits (≤ 64 bits)",

@@ -166,7 +166,13 @@ pub(super) fn resolve_state_instance<'a>(
 /// Render an IR expression.
 pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
     Ok(match e {
-        Expr::Literal { value, .. } => format!("{value}"),
+        Expr::Literal { value, ty } => match ty {
+            crate::ir::IrType::SInt(_) => signed_literal_cpp(*value),
+            // Keep unsigned file-scope constants at uint64_t rank so C++
+            // applies the same usual-arithmetic conversions as v1.
+            crate::ir::IrType::UInt(_) => format!("((uint64_t)({value}))"),
+            _ => format!("{value}"),
+        },
         // The framework-provided cycle counter — emitted as the in-scope
         // `cycle_count` (a captured `ctx.cycle_count` reference), matching
         // v1's bare-ident emission of `cycle_count`.
@@ -323,10 +329,23 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                     return Ok(s);
                 }
             }
+            let a_signed = expr_is_signed(cx, a);
+            let a_width = expr_shift_width(cx, a);
             let a = expr_cpp(cx, a)?;
             let b = expr_cpp(cx, b)?;
+            if matches!(op, BinOp::Shr) && a_width.is_some_and(|width| width > 64) {
+                return Err(EmitError(
+                    "right shift above 64 bits is not supported by the TB-IR C++ value model; \
+                     use --codegen v1 for wide shifts"
+                        .to_string(),
+                ));
+            }
             match op {
-                BinOp::Shl | BinOp::Shr => format!("(((uint64_t)({a})) {} {b})", bin_op_cpp(*op)),
+                BinOp::Shl => format!("(((uint64_t)({a})) << {b})"),
+                BinOp::Shr if a_signed => {
+                    format!("(((int64_t)({a})) >> {b})")
+                }
+                BinOp::Shr => format!("(((uint64_t)({a})) >> {b})"),
                 _ => format!("({a} {} {b})", bin_op_cpp(*op)),
             }
         }
@@ -617,6 +636,7 @@ fn width_cast_cpp(
                     }
                 }
             }
+            _ if width <= 64 => format!("((int64_t)({e}))"),
             _ => plain_cast(&e),
         },
         WidthCastKind::Resize => match src_width {
@@ -722,11 +742,67 @@ fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
     }
 }
 
+/// Conservative width propagation for shift operands. Unlike the ordinary
+/// expression-width helper, this takes the maximum known operand/branch
+/// width so a wide value cannot hide behind a narrow sibling and reach the
+/// TB-IR emitter's 64-bit shift implementation.
+fn expr_shift_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
+    match e {
+        Expr::WideLiteral(words) => words.len().checked_mul(32).map(|w| w as u32),
+        Expr::Binary(_, lhs, rhs) => expr_shift_width(cx, lhs).max(expr_shift_width(cx, rhs)),
+        Expr::Ternary(_, then_expr, else_expr) => {
+            expr_shift_width(cx, then_expr).max(expr_shift_width(cx, else_expr))
+        }
+        Expr::Unary(_, inner) => expr_shift_width(cx, inner),
+        Expr::BitSlice { hi, lo, .. } => Some(hi - lo + 1),
+        _ => expr_static_width(cx, e),
+    }
+}
+
+fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
+    match e {
+        Expr::Literal { value, ty } => {
+            matches!(ty, crate::ir::IrType::SInt(_))
+                // Untyped literals are emitted as ordinary C++ integer
+                // literals. Values that fit signed int64_t therefore
+                // participate in signed usual-arithmetic conversions when
+                // combined with a signed expression (for example
+                // `(signed_value + 0) >> 1`).
+                || matches!(ty, crate::ir::IrType::Unknown) && *value <= i64::MAX as u64
+        }
+        Expr::Local(id) => cx
+            .func
+            .locals
+            .get(id.0 as usize)
+            .is_some_and(|l| matches!(l.ty, crate::ir::IrType::SInt(_))),
+        Expr::Unary(_, inner) => expr_is_signed(cx, inner),
+        Expr::Ternary(_, then_expr, else_expr) => {
+            expr_is_signed(cx, then_expr) && expr_is_signed(cx, else_expr)
+        }
+        Expr::WidthCast { kind, .. } => matches!(kind, WidthCastKind::Sext),
+        Expr::Binary(op, lhs, rhs) => match op {
+            BinOp::Shl | BinOp::Shr => expr_is_signed(cx, lhs),
+            BinOp::Div | BinOp::Mod => expr_is_signed(cx, lhs) && expr_is_signed(cx, rhs),
+            _ => expr_is_signed(cx, lhs) && expr_is_signed(cx, rhs),
+        },
+        _ => false,
+    }
+}
+
 fn ir_type_width(ty: &crate::ir::IrType) -> Option<u32> {
     match ty {
         crate::ir::IrType::UInt(w) | crate::ir::IrType::SInt(w) => *w,
         crate::ir::IrType::Bool => Some(1),
         _ => None,
+    }
+}
+
+fn signed_literal_cpp(value: u64) -> String {
+    let value = value as i64;
+    if value == i64::MIN {
+        "((int64_t)(-9223372036854775807LL - 1))".to_string()
+    } else {
+        format!("((int64_t)({value}))")
     }
 }
 
